@@ -82,7 +82,7 @@ curl -X PUT -H "Authorization: Bearer $KEY" -H 'content-type: application/json' 
 
 - 跨租户：一律 404，与"不存在"不可区分。
 - 同租户跨用户：带用户身份时，读写别人的会话是 404。
-- 不带用户身份的请求（比如后台列表）只能做租户级只读操作，不能启动 turn。
+- 所有 session 级读写都必须带用户身份；没有用户身份时，只有带 `admin` scope 的 service key 才能查看租户级 session 列表或 usage 汇总，不能启动 turn。租户策略、API key、agent 定义和 BYOK 写操作同样要求 `admin` scope。
 
 ## 需要你提供的信息
 

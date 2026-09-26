@@ -1,6 +1,6 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> 状态：**待评审**。本文是调研阶段（`docs/research/01–07`）的综合结论与设计提案。§13 列出需要你拍板的决策，每条都给了默认值；未收到反馈时按默认值进入开发。
+> 状态：**已采用的 2026-09-22 架构基线**。本文保留调研阶段（`docs/research/01–07`）形成设计时的目标态与原始缺口；核心决策已经实施并经过后续评审。当前实现范围、验证结果和剩余事项以 `docs/PROGRESS.md` 的顶部快照及最后一节为准。
 
 ---
 
@@ -393,6 +393,8 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 
 ## 10. 技术栈与 monorepo
 
+> 以下是 v0.1 的**目标态目录树**，不是当前文件清单。当前实际目录见仓库根 `README.md`；例如租约实现现位于 `packages/store/src/redis/`，MCP、skills、hooks、生成 SDK 和 Kubernetes 清单仍属于后续里程碑。
+
 ```
 agent-service/
 ├── apps/
@@ -444,7 +446,7 @@ agent-service/
 
 ---
 
-## 13. 需要你确认的决策（默认值加粗）
+## 13. 决策记录（最初默认值加粗）
 
 | # | 决策 | 选项 | 默认 | 影响 |
 |---|---|---|---|---|
@@ -457,11 +459,13 @@ agent-service/
 | 7 | 本地基础设施 | **brew 装 Redis + 已有 MySQL 8.0** · 安装 Docker/OrbStack 用 compose | brew | 本机没有 Docker；两种都会写 compose 文件供他人使用 |
 | 8 | 现有基础设施对齐 | K8s？MQ（Kafka/RocketMQ）？RDS 类型（MySQL/TiDB）？Redis 规模？ | 按 MySQL + Redis + Kafka 假设 | 影响 M4 与 deploy/ |
 
-不反馈即按默认值进入 M1。
+这些默认值已作为 M1/M2 的实现起点；身份鉴权后来扩展为 `trusted_caller` 与 `end_user_token` 两种租户级模式，定稿见 `docs/design/01-identity-and-auth.md`。其余决策的当前状态以代码和 `docs/PROGRESS.md` 为准。
 
 ---
 
-## 14. 已知缺口（v0.1 未覆盖，M1 期间以独立文档补齐）
+## 14. 原始缺口清单（v0.1 设计时快照）
+
+> 本节保留设计形成时的缺口，不能直接当作当前待办；其中多项已实现或调整。当前剩余事项以 `docs/PROGRESS.md` 最后一节为准。
 
 | # | 缺口 | 补齐方式 | 时机 |
 |---|---|---|---|

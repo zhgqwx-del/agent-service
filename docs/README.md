@@ -2,7 +2,7 @@
 
 ## design/
 - `01-identity-and-auth.md` — **身份与鉴权定稿**：service key 与端用户身份的区别、为什么 runner 必须自己验证、`trusted_caller` 与 `end_user_token` 两种模式的配置与取舍。
-- `00-architecture.md` — **总体架构方案 v0.1（待评审）**：结论、服务拆分、分布式一致性、对外协议、runner 内部、扩展性、存储、容量、技术栈、里程碑、待决策项。
+- `00-architecture.md` — **总体架构方案 v0.1（已采用的设计基线）**：结论、服务拆分、分布式一致性、对外协议、runner 内部、扩展性、存储、容量、技术栈与里程碑；实时完成度以 `PROGRESS.md` 为准。
 
 ## research/（调研阶段产出，2026-09-22）
 | 文件 | 内容 |

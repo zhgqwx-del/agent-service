@@ -6,8 +6,9 @@
 
 - **M0 调研**：完成。
 - **M1 单节点 runner MVP**：核心运行链路已实现，包括摘要级压缩、usage 查询、端用户鉴权和 API key scope；原始里程碑中的 OpenAPI/生成 SDK、完整数据生命周期仍待完成。
-- **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain 与真实多进程接管测试已实现；当前阶段目标是本地与 CI 可重复验证，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
-- **M3 扩展性**（MCP、skills、hooks）、**M4 生产化**（配额、可观测性、限流）：未开始。
+- **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain 与真实多进程接管测试已实现并通过自动验收；当前处于冻结前收尾，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
+- **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
+- **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
 
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
@@ -95,11 +96,14 @@ curl -sN -X POST "localhost:8787/v1/sessions/sess_.../turns?exclude=usage/update
 
 ```
 apps/agent-runner      Hono HTTP + SSE；鉴权；幂等；路由 → SessionHost
+apps/agent-router      无状态路由；owner 目录、一致性哈希、SSE 透传与安全重路由
 packages/protocol      资源 / 事件 / 错误 schema（zod）
 packages/store         SessionStore / LeaseStore / EventBus / BlobStore 接口；memory、MySQL（fenced commit）、Redis（Lua 租约、Streams 热重放）实现；migrations/
 packages/core          AgentEngine 接口 + PiEngine（pi-agent-core 适配）；SessionHost（租约续期、write-ahead、审批门、安全阀、崩溃修复、事件序列化）；上下文装配；内置工具
 packages/providers     BYOK provider 配置 → pi Model；密钥加密；国内厂商 preset
+packages/testkit       假厂商与跨包测试夹具
 deploy/local           本机 redis / mysql 启停脚本
+scripts/               本地服务生命周期、验收、验证与维护入口
 spikes/pi-embed        pi 嵌入验证（保留作回归参考）
 docs/                  调研、设计
 ```
