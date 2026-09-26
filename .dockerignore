@@ -1,0 +1,15 @@
+# Never in the build context: secrets, history, and host-built artefacts.
+.env
+.env.*
+!.env.example
+.git
+.github
+node_modules
+**/node_modules
+**/dist
+**/.tsbuild
+coverage
+docs
+spikes
+*.log
+.DS_Store

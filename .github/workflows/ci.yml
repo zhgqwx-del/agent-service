@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Deterministic test constant, never a real key: the fake vendor stands in for the model provider.
+  SECRETS_MASTER_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: agent_service
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Reject committed credentials
+        run: node scripts/check-secrets.mjs
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (sources and tests)
+        run: pnpm typecheck
+
+      - name: Create test databases
+        run: |
+          mysql -h 127.0.0.1 -uroot -e "
+            CREATE DATABASE IF NOT EXISTS agent_service_test CHARACTER SET utf8mb4;
+            CREATE DATABASE IF NOT EXISTS agent_service_cluster CHARACTER SET utf8mb4;"
+
+      # Unit + store conformance (both backends) + HTTP + dialect tests against the fake vendor.
+      # Coverage thresholds live in vitest.config.ts and fail the job on a regression.
+      - name: Unit and integration tests
+        env:
+          AGENT_SERVICE_INTEGRATION: "1"
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+          REDIS_TEST_URL: redis://127.0.0.1:6379/1
+        run: pnpm vitest run --coverage --exclude 'test/cluster/**'
+
+      # The integration suite skips itself when the env var is missing, which would make a
+      # misconfigured job pass with half the tests silently absent.
+      - name: Assert the integration suite actually ran
+        run: node scripts/assert-suites-ran.mjs
+
+      - name: Cluster tests (real processes)
+        env:
+          AGENT_SERVICE_CLUSTER: "1"
+          CLUSTER_MYSQL_URL: mysql://root@127.0.0.1:3306/agent_service_cluster
+          CLUSTER_REDIS_URL: redis://127.0.0.1:6379/3
+        run: pnpm vitest run test/cluster
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+
+  # The production image is part of the contract, so it is built and started here. Every one of the
+  # Dockerfile defects found in review was invisible precisely because CI never did this.
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        app: [agent-runner, agent-router]
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: agent_service
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          build-args: APP=${{ matrix.app }}
+          tags: agent-service/${{ matrix.app }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A container that starts but is unreachable, or reports healthy on the wrong port, is the exact
+      # failure mode this step exists to catch.
+      - name: Run the container and reach it from outside
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.app }}" = "agent-runner" ]; then
+            docker run -d --name app --network host \
+              -e SECRETS_MASTER_KEY=$SECRETS_MASTER_KEY \
+              -e STORE=mysql -e MYSQL_URL=mysql://root@127.0.0.1:3306/agent_service \
+              -e REDIS_URL=redis://127.0.0.1:6379 \
+              -e ADMIN_BOOTSTRAP_TENANT=t_ci \
+              -e RUNNER_ADDR=127.0.0.1:8787 -e RUNNER_PORT=8787 \
+              agent-service/${{ matrix.app }}:ci
+            PORT=8787
+          else
+            docker run -d --name app --network host \
+              -e RUNNERS=http://127.0.0.1:8787 -e ROUTER_PORT=8080 \
+              agent-service/${{ matrix.app }}:ci
+            PORT=8080
+          fi
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then echo "reachable on $PORT"; break; fi
+            if [ "$i" = "60" ]; then echo "never became reachable"; docker logs app; exit 1; fi
+            sleep 1
+          done
+          # Docker's own healthcheck must agree, which is what catches a wrong port in HEALTHCHECK.
+          for i in $(seq 1 40); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' app)
+            [ "$status" = "healthy" ] && break
+            if [ "$i" = "40" ]; then echo "healthcheck says $status"; docker logs app; exit 1; fi
+            sleep 2
+          done
+          # And the runner must have applied its migrations from inside the image.
+          if [ "${{ matrix.app }}" = "agent-runner" ]; then
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0001_init.sql
+            # Exercise the production-safe one-time bootstrap path. Do not weaken the production
+            # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
+            CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)
+            if [ -z "$CI_KEY" ]; then echo "production admin bootstrap did not emit a key"; docker logs app; exit 1; fi
+            curl -fsS -X POST http://127.0.0.1:8787/v1/agents \
+              -H "Authorization: Bearer $CI_KEY" -H 'X-User-Id: u1' -H 'content-type: application/json' \
+              -d '{"name":"ci","instructions":"x","model":{"provider":"dashscope","model":"qwen-plus"}}' >/dev/null
+          fi
+          docker rm -f app

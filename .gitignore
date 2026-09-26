@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+**/.tsbuild/
+.env
+.env.*
+!.env.example
+coverage/
+.DS_Store
+spikes/*/node_modules/
+apps/*/dist/
+.local-run/

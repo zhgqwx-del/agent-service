@@ -1,0 +1,26 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/testkit"
+    },
+    {
+      "path": "packages/protocol"
+    },
+    {
+      "path": "packages/store"
+    },
+    {
+      "path": "packages/core"
+    },
+    {
+      "path": "packages/providers"
+    },
+    {
+      "path": "apps/agent-runner"
+    },
+    {
+      "path": "apps/agent-router"
+    }
+  ]
+}

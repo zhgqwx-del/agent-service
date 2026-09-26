@@ -1,0 +1,114 @@
+# agent-service
+
+分布式、多租户的 agent API 服务：无状态 `agent-router` + 有状态 `agent-runner`（类 `opencode serve`）。当前已实现会话/turn/SSE、BYOK、租约与 fencing、多节点路由和接管；MCP、skills、plugins/hooks 属于后续 M3。设计见 `docs/design/00-architecture.md`，调研见 `docs/research/`。
+
+## 状态
+
+- **M0 调研**：完成。
+- **M1 单节点 runner MVP**：核心运行链路已实现，包括摘要级压缩、usage 查询、端用户鉴权和 API key scope；原始里程碑中的 OpenAPI/生成 SDK、完整数据生命周期仍待完成。
+- **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain 与真实多进程接管测试已实现；当前阶段目标是本地与 CI 可重复验证，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
+- **M3 扩展性**（MCP、skills、hooks）、**M4 生产化**（配额、可观测性、限流）：未开始。
+
+测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
+
+## 本机运行
+
+```bash
+# 依赖：Node 24（fnm）、pnpm 12、MySQL 8（已有）、Redis（deploy/local/install 说明见 infra.sh 头部）
+pnpm install
+deploy/local/infra.sh start          # 启动 redis + mysql，建库 agent_service / agent_service_test
+cp .env.example .env                 # 填 API_KEY / API_BASE_URL / DEFAULT_MODEL（DashScope 兼容模式）
+
+# 单节点（MySQL + Redis）
+STORE=mysql REDIS_URL=redis://127.0.0.1:6379 pnpm dev:runner
+# 纯内存（不需要任何中间件）
+pnpm dev:runner
+```
+
+```bash
+# 手动验收（十个环节：鉴权/流式/重放/幂等/上下文/安全阀/隔离/BYOK）
+deploy/local/infra.sh start
+STORE=mysql REDIS_URL=redis://127.0.0.1:6379 pnpm dev:runner   # 另一个终端
+scripts/demo.sh
+
+# 测试（四层，前三层不需要任何 API key）
+pnpm test                                     # 单元 + 方言（假厂商）
+AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
+pnpm test:cluster                             # + 多进程集群：2~3 runner + 1 router，SIGKILL 租约持有者
+set -a; source .env; set +a; AGENT_SERVICE_REAL_E2E=1 pnpm vitest run packages/providers/test/e2e-qwen.test.ts
+pnpm typecheck
+
+# 生产构建（单文件，原生 node 启动，不依赖 tsx）
+pnpm build && pnpm build:check
+docker build --build-arg APP=agent-runner -t agent-runner .
+```
+
+也可以通过统一的本地运维入口完成生命周期与验证：
+
+```bash
+scripts/local-service.sh start
+scripts/local-service.sh status
+scripts/local-service.sh smoke
+scripts/local-service.sh acceptance   # 使用真实模型，会产生少量费用
+scripts/local-service.sh verify       # secret scan + typecheck + 集成 + coverage + cluster + 构建产物启动
+scripts/local-service.sh verify-real  # 仅在显式命令下读取 .env 的真实模型 key
+scripts/local-service.sh stop
+```
+
+详细配置与未来 staging/production 部署契约见 `docs/operations/local-and-deployment.md`。
+
+## 部署形态
+
+```
+客户端 → agent-router（无状态，N 副本）→ agent-runner（有状态，N 副本）
+                  ↓ 读 Redis 所有权目录            ↓ 租约 + fence
+              一致性哈希兜底                  MySQL / Redis / 对象存储
+```
+
+`agent-router` 只做三件事：按 sessionId 找到持有租约的 runner、把 SSE 原样透传、收到 runner 的 `409 + X-Owner` 后重路由一次。它没有业务状态，可随时重启。
+
+## API 速览（`apps/agent-runner`）
+
+鉴权两层：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（→ user）。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入。
+
+```bash
+H=(-H "Authorization: Bearer dev-key" -H "X-User-Id: u_42" -H "Content-Type: application/json")
+# agent 定义（版本化）
+curl -s -X POST localhost:8787/v1/agents "${H[@]}" -d '{"name":"assistant","instructions":"你是一个简洁的助手。","model":{"provider":"dashscope","model":"qwen3.8-max"},"tools":["current_time","web_fetch"],"limits":{"maxSteps":6}}'
+# session
+curl -s -X POST localhost:8787/v1/sessions "${H[@]}" -d '{"agentId":"agt_..."}'
+# turn（SSE；id: 为 seq，Last-Event-ID / ?after= 可续订；?exclude= 过滤事件）
+curl -sN -X POST "localhost:8787/v1/sessions/sess_.../turns?exclude=usage/updated" "${H[@]}" -H "Idempotency-Key: k1" -d '{"input":[{"type":"text","text":"现在几点？"}]}'
+# 非流式：{"stream":false} → 202 + turn；之后 GET .../events?after=<seq> 消费
+# 其他：GET .../items | .../turns | POST .../turns/{id}/interrupt | steer | tool-results（动态工具回填）
+#       GET/POST .../approvals/{id} {decision: accept|acceptForSession|decline|cancel}
+#       GET/PUT/DELETE /v1/providers/{id}（BYOK，apiKey 只写不读，AES-GCM 落库）  GET /v1/models  GET /v1/tools
+#       POST .../resume  GET /v1/capabilities  GET /healthz /readyz
+```
+
+事件类型与资源 schema 在 `packages/protocol/src/`（zod，单一真相）。
+
+## 目录
+
+```
+apps/agent-runner      Hono HTTP + SSE；鉴权；幂等；路由 → SessionHost
+packages/protocol      资源 / 事件 / 错误 schema（zod）
+packages/store         SessionStore / LeaseStore / EventBus / BlobStore 接口；memory、MySQL（fenced commit）、Redis（Lua 租约、Streams 热重放）实现；migrations/
+packages/core          AgentEngine 接口 + PiEngine（pi-agent-core 适配）；SessionHost（租约续期、write-ahead、审批门、安全阀、崩溃修复、事件序列化）；上下文装配；内置工具
+packages/providers     BYOK provider 配置 → pi Model；密钥加密；国内厂商 preset
+deploy/local           本机 redis / mysql 启停脚本
+spikes/pi-embed        pi 嵌入验证（保留作回归参考）
+docs/                  调研、设计
+```
+
+## 关键不变量（测试覆盖）
+
+- 同一 session 同时只有一个 writer：Redis 租约 + 单调 fence，MySQL 每次写入校验 `fence_token`，旧 owner 的写入被拒绝（`FenceError`）。
+- 持久化事件 per-session `seq` 严格连续；delta 事件只走总线不落库不占 seq。
+- 工具调用先落库（write-ahead）再执行；崩溃后按是否 `startedAtMs` 生成 `TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN` 交给模型。
+- 安全阀 `maxSteps / maxToolCalls / maxWallClockMs / maxCostCNY` 取 min，只能收紧。
+- 审批是持久化资源，有 `expiresAt`；`cancel` 记为 interrupted 而不是 declined。
+- 跨租户访问返回 404，与不存在不可区分；带 `X-User-Id` 时同租户内也不能读别人的会话。
+- 审批授权是服务端状态，客户端 metadata 改不动；BYOK 的 `baseUrl` 必须解析到公网地址。
+- 被抢占（fence 失效）或会话被删除时，turn 立即停止，不再调模型、不再执行工具。
+- 同一条流式消息的 item 只分配一次 seq，`?afterSeq=` 增量拉取不会漏掉最终回答。

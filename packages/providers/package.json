@@ -1,0 +1,24 @@
+{
+  "name": "@agent-service/providers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agent-service/core": "workspace:*",
+    "@agent-service/protocol": "workspace:*",
+    "@agent-service/store": "workspace:*",
+    "@earendil-works/pi-ai": "0.87.0"
+  },
+  "devDependencies": {
+    "@agent-service/testkit": "workspace:*"
+  }
+}

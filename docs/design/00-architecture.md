@@ -1,0 +1,475 @@
+# agent-router / agent-runner 架构方案（v0.1，2026-09-22）
+
+> 状态：**待评审**。本文是调研阶段（`docs/research/01–07`）的综合结论与设计提案。§13 列出需要你拍板的决策，每条都给了默认值；未收到反馈时按默认值进入开发。
+
+---
+
+## 0. 一页结论
+
+| 问题 | 结论 | 依据 |
+|---|---|---|
+| agent loop 用什么 | **内嵌 `@earendil-works/pi-ai` + `pi-agent-core`**（MIT），封在自研 `AgentEngine` 接口后面；保留自研 loop 作为第二实现 | research 04 §4、05 §4.2、01 §3.2 |
+| opencode / dsh / codex / openclaw / hermes 怎么用 | 都**不作为运行时依赖**。opencode 取 `packages/llm` 的方言修补与 v2 schema 设计；dsh 取 MCP 配置模型、`scrubbedParentEnv`、日志修补；codex 取 `thread/turn/item` 协议与审批枚举；openclaw 取 `tool-call-repair`、BYOK 配置形状、忙时输入四档；hermes 取 `/v1/runs` 语义、`skills_guard`、provider profile | research 03 §9、04 §4.1、05 §4、06 §6 |
+| 服务拆分 | **独立无状态 `agent-router` + 有状态 `agent-runner`**。前期方案的"对等转发"被否定：通用 harness 的 runner 负载曲线（内存/fd/子进程）与 router（连接/鉴权/限流）不同，且要对外开放 | research 02 §1.2(a) |
+| 一致性保证 | 路由只是效率优化；**正确性只由 runner 侧 Redis 租约 + fencing token 保证**（DB 写入带 `WHERE fence_token=?`） | research 02 §1.1、§3.3 |
+| 路由键 | `sessionId`，不是 `userId`；工作区放对象存储，runner 本地只做缓存 | research 02 §1.2(b) |
+| 对外协议 | HTTP + SSE；资源 `agents / sessions / turns / items / events / approvals`；每条持久化事件有 per-session 单调 `seq`；delta 不落库不占 seq；审批是一等资源且有 `expiresAt` | research 06 §6、07 结论 |
+| 存储 | MySQL（sessions/turns/items/events-milestone/approvals/配置）+ Redis（租约、所有权目录、Streams 热重放、配额）+ 对象存储（大输出/附件/工作区）。本地先单库 MySQL，schema 预留 `user_id` 分片键 | research 02 §4 |
+| 代码执行 / 沙箱 | **一期不提供** shell/文件工具。runner 分"轻池"（API 工具 + 远程 MCP，1,000 turn/进程）与"重池"（按 agent 配置起沙箱，走 exec-server 协议）；一期只建轻池，预留接口 | research 02 §5.3、06 §6.6 |
+| MCP | 必须支持；**远程 streamable-http 优先**，stdio 只在重池；按租户动态注册，SSRF/配额/命名空间自写 | research 01 §2 #8、partials/dsh-mcp |
+| Skills / Plugins | Skills 用 `SKILL.md` 标准，来源三级（平台/租户/用户），存 DB + 对象存储；Plugins 一期 = 平台部署的进程内 hook 包 + 租户级 webhook hook，**不在共享进程加载用户代码** | research 05 §4.1 #8/#9、01 §3.2 C6 |
+| BYOK | 租户级 provider 配置 CRUD，KMS 信封加密，per-request 注入 pi 的 `apiKey/headers/fetch`；全局 key 池 / 配额 / 熔断状态在 Redis | research 04 §4.3 #1、02 §1.2(f) |
+| 技术栈 | TypeScript / Node 24+，pnpm monorepo，Hono，mysql2 + drizzle，ioredis，zod-openapi | §10 |
+
+---
+
+## 1. 目标与约束
+
+来自需求简报的硬约束：
+
+1. 类 `opencode serve` 的后端 agent API，任意外部客户端可调用。
+2. 通用 harness 能力：MCP、skills、插件、BYOK。
+3. 生产分布式部署，20M+ DAU。
+4. 多用户多会话隔离；同一用户/会话的请求连续、一致。
+5. 独立路由服务 `agent-router`（无状态）+ `agent-runner`（有状态），历史入云端存储、可迁移。
+6. 模型以国内厂商为主（qwen / kimi / deepseek），OpenAI chat/completions 兼容。
+7. 允许嵌入开源 agent 作为 loop（router → runner → agent）。
+
+**非目标**（一期明确不做）：TUI/桌面端、多渠道（IM）接入、语音/ASR、产品级记忆层（前期方案 05 的三层记忆属于业务层，runner 只提供注入钩子）、自建推理。
+
+---
+
+## 2. 调研结论摘要
+
+七份报告在 `docs/research/`。结论按仓库：
+
+| 仓库 | 一句话 | 我们拿什么 |
+|---|---|---|
+| **pi**（0.87.0, MIT） | `pi-ai` / `pi-agent-core` 是真正的纯库：零 process 副作用，`Models` 是实例，每次调用可注入 `apiKey/headers/fetch`；deepseek/moonshot/qwen/zai/minimax 内置，`reasoning_content` 三种拼法 + 3 种 cache 字段都处理；`AgentHarness` 有可插拔 `Storage/SessionRepo` + conformance 测试。缺 MCP、缺步数/成本上限、不做租约；发版快且每版有 Breaking | **作为 loop + provider 层内嵌**，pin 精确版本 |
+| **deepseek-harness**（0.1.6-alpha, MIT） | 插件架构最彻底，loop 干净（并发池 10、durable inbox、日志修补），但凭据/身份/存储根全是进程级；`deepseek-official` 适配器**默认**上传 `x-deepseek-harness-user-id`、插件清单、完整会话日志；alpha、不接外部 PR | 只借设计：MCP 配置 schema 与工具命名规则、`scrubbedParentEnv`、`repair.ts`、`isConcurrencySafe(args)` |
+| **opencode**（v1.18.32, MIT） | v1 是 81K 行 + 99 依赖的单机应用，v2（`@opencode-ai/core/server/llm`）有更好的原语（`SessionInput` steer/queue、`ContextEpoch`、`EventV2` aggregate+seq、持久化 permission 表）但未接入 server。`private:true` 无发布物，Effect 4 beta。11 条多租户阻碍 | 只借设计：`packages/llm` 的方言修补、v2 schema、`SessionInput`、`ContextEpoch`、compaction 阈值、权限规则语义。**方案 A（容器化 opencode）保留为重池的候选后端** |
+| **codex**（Apache-2.0） | `WireApi` 仍只有 `Responses`，`"chat"` 被显式拒绝，国内模型接不上；但 `app-server-protocol`（164 请求 / 84 通知，thread→turn→item，UUIDv7，审批决策枚举，resume 重发未决审批）是最完整的服务端 agent 协议规格 | 协议类型定义逐字复制（保留 NOTICE）；`ThreadStore` trait 签名；exec-server 拆分 |
+| **openclaw**（MIT） | 2.47M 行，"一个 Gateway = 一个信任域"，多租户靠每租户一个容器；agent-core 是 pi 血统 | `packages/tool-call-repair`（国产模型把 tool call 当文本输出的修复）、`{baseUrl, apiKey, api, models[]}` BYOK 形状、steer/followup/collect/interrupt 四档、`activeWriterRunId` 写栅栏 |
+| **hermes-agent**（Python, MIT） | 825K 行，同步 loop + 10 线程池；但 `/v1/runs`（202 + SSE + stop/steer/approval + durable Idempotency-Key）几乎就是我们要的 API；`skills_guard` 安装前威胁扫描；声明式 `ProviderProfile` | `/v1/runs` 语义、`skills_guard` 正则表、provider profile 数据、`session_turn_leases` DDL |
+| **前期方案 + PoC** | 6,042 行 TS PoC，151 测试。可带走：事件信封与 seq 水位线、SSE 无损重放、`openai-compatible.ts`、`resilient.ts`、安全阀、`length` 丢弃 tool call、write-ahead + 崩溃恢复两码、压缩配对、前缀稳定化机制。**代码级缺陷**：租约从不续期、无 fencing token、runtime 不回收、历史只在内存、跨副本 250ms 轮询 | 带走上述模块的设计与测试，重写分布式部分 |
+
+四家共有的结构性事实（与产品无关）：全部是单用户进程拓扑，HOME 单例，无租户维度，无分布式所有权，无成本阀。**多租户、分布式、BYOK 三块在所有开源 harness 里都是零，必须自写。**
+
+---
+
+## 3. 总体架构
+
+```
+ 外部客户端（App / Web / 服务端调用 / opencode-compatible 客户端）
+        │  HTTPS  Authorization: Bearer <service api key>   X-User-Id / 端用户 JWT
+        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 接入层（现有 API Gateway / nginx / envoy）                                 │
+│   TLS · WAF · 全局限流 · SSE 直通（X-Accel-Buffering: no，idle ≥ 90s）      │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ agent-router（无状态，N 副本）                                              │
+│   1. 鉴权：service key → tenantId；端用户身份 → userId                      │
+│   2. 幂等：Idempotency-Key 预留（Redis）                                    │
+│   3. 定位：owner:{sessionId} → runnerAddr；无 owner → 一致性哈希 / 最少负载   │
+│   4. 反向代理（SSE 不缓冲）；runner 回 409 lease_conflict → 重查目录重路由一次 │
+│   5. 非 session 类请求（agents/providers/skills CRUD）直接打任意 runner      │
+│   只有连接态，没有业务态；可随时重启                                          │
+└──────────┬─────────────────────────┬────────────────────────────────────┘
+           │                         │
+┌──────────▼──────────┐   ┌──────────▼──────────┐   ┌──────────────────────┐
+│ agent-runner 轻池    │   │ agent-runner 重池    │   │ （可选）容器化 opencode │
+│ 无 shell/fs 工具     │   │ 按 agent 配置起沙箱   │   │ 作为重池的另一种后端    │
+│ API 工具 + 远程 MCP  │   │ exec-server 协议     │   │ 同一对外协议            │
+│ ~1,000 turn/进程     │   │ 独立容量、独立 SLO    │   │ 二期再评估              │
+└──────────┬──────────┘   └──────────┬──────────┘   └──────────────────────┘
+           │                         │
+           ▼ runner 内部
+┌─────────────────────────────────────────────────────────────────────────┐
+│ HTTP(Hono) → TenantContext → SessionHost（租约 + fencing + 单写者）        │
+│   → AgentEngine（pi adapter | native）→ ToolRuntime（内置 / MCP 桥 / 动态） │
+│   → ProviderGateway（BYOK 解析 · key 池 · 配额 · 熔断 · 方言）               │
+│   → EventLog（seq 分配 · 先落库再扇出）→ SSE writer                          │
+│   Hooks/Middleware（PreToolUse … Stop；租户策略；审计）                     │
+└──────┬───────────────────┬───────────────────┬──────────────────────────┘
+       ▼                   ▼                   ▼
+┌─────────────┐   ┌────────────────┐   ┌─────────────────┐   ┌───────────────┐
+│ MySQL        │   │ Redis           │   │ 对象存储 (OSS)   │   │ 模型厂商 API   │
+│ sessions     │   │ lease/fence     │   │ 大工具输出       │   │ deepseek/qwen │
+│ turns/items  │   │ owner 目录      │   │ 附件/工作区      │   │ kimi/zhipu…   │
+│ events(里程碑)│   │ Streams 热重放  │   │ 冷事件分区       │   │ 自建 vLLM     │
+│ approvals    │   │ 配额/key 池     │   └─────────────────┘   └───────────────┘
+│ agents/skills│   │ 幂等键          │
+│ provider cfg │   │ sharded pub/sub │
+│ usage_ledger │   └────────────────┘
+└─────────────┘
+```
+
+**服务边界**：
+
+| 服务 | 状态 | 扩缩容依据 | 一期 |
+|---|---|---|---|
+| agent-router | 无状态（仅 SSE 代理连接态） | 连接数 / QPS | 是 |
+| agent-runner（轻池） | turn 内有状态，turn 间无状态 | 并发 turn 数 × 内存 | 是 |
+| agent-runner（重池） | 同上 + 沙箱生命周期 | 沙箱数 | 否，预留接口 |
+| exec-server | 每会话/每租户沙箱 | 沙箱数 | 否，预留协议 |
+| llm-quota（逻辑组件） | 状态在 Redis | — | 作为 runner 内库实现 |
+
+---
+
+## 4. 有状态性与分布式一致性
+
+### 4.1 三层有状态性（沿用前期方案，结论不变）
+
+| 层次 | 要求 | 不满足的后果 |
+|---|---|---|
+| 一个 turn 之内 | **强制单所有者** | 两个 writer → seq 冲突、工具重复执行，数据损坏 |
+| 同 session 跨 turn | 优选亲和 | 只是变慢（上下文冷启动） |
+| 同用户跨 session | 不需要 | — |
+
+### 4.2 所有权与租约
+
+```
+Redis:
+  lease:{sessionId}   = {runnerId, fence, expiresAt}     SET NX PX，续期 Lua 脚本校验 runnerId
+  fence:{sessionId}   = 单调递增整数（INCR），每次成功抢占 +1
+  owner:{sessionId}   = runnerAddr（供 router 查询；TTL 略长于 lease）
+
+MySQL:
+  sessions.fence_token   = 最近一次成功写入的 fence
+  所有写入：UPDATE ... WHERE session_id=? AND fence_token<=?   （旧 fence 的写被拒绝）
+  events 追加：INSERT ... 前在同一事务内校验并推进 sessions.next_seq 与 fence
+```
+
+runner 处理 `POST /sessions/{id}/turns` 的顺序：
+
+1. 校验租户归属（不属于 → 404，不泄漏存在性）。
+2. 抢租约；失败 → `409 session_lease_conflict`，响应头 `X-Owner: <runnerAddr>`，router 重路由一次。
+3. 从 MySQL 装载 session 投影（最近 compaction 之后的 items），或命中本地热缓存（按 fence 校验）。
+4. 续期协程每 TTL/3 续一次；续期失败 → 立即 abort 当前 turn（fence 已失效，任何写入都会被 DB 拒绝）。
+5. turn 结束（`session.idle`）后租约保留一个短窗口（默认 60s）供下一 turn 命中亲和，之后释放并删 `owner`。
+6. runtime 空闲 N 分钟后从内存回收（修正 PoC 缺陷 #3）。
+
+### 4.3 故障场景
+
+| 场景 | 行为 |
+|---|---|
+| router 重启 | 客户端 SSE 断；客户端带 `Last-Event-ID` 重连到任意 router → 查 owner → 续订 |
+| runner 崩溃（turn 中） | 租约过期；下一请求由新 runner 抢占（fence+1）；`repairSession` 按 write-ahead 的 `tool.call.started` 把孤儿分为 `TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN`；turn 记为 `interrupted` 并发 `turn/completed{status:interrupted}` |
+| runner 发布/缩容 | drain：拒绝新 turn，等进行中 turn 到 **step 边界**做 checkpoint（items 已落库）后释放租约；超时则 abort |
+| 路由完全失效（随机落点） | 每次多一跳 + 上下文冷启动，**不会**出现双 writer |
+| 客户端断开 SSE | 不等于取消（沿用 AI SDK / hermes 语义）；turn 继续跑，事件进 Redis Stream，`?after=` 补齐；显式取消走 `POST .../interrupt` |
+| 审批等待期间 runner 重启 | 审批是 DB 资源（不是内存 Deferred）；resume 时按 codex 流程**重发未决审批**；超过 `expiresAt` 按策略自动 decline |
+
+### 4.4 事件扇出与重放
+
+- 每条**持久化**事件：`(session_id, seq)` 主键，先落 MySQL 再 `XADD` 到 `stream:{sessionId}`（Redis Streams，TTL 1h，MAXLEN 近似裁剪）。
+- **delta 类事件**（`item/agentMessage/delta`、`item/reasoning/delta`、`item/mcpToolCall/progress`）只进 Stream，不落库，不占 seq（SSE `id:` 沿用上一条持久化事件的 seq，客户端按 itemId 拼接）。
+- SSE 订阅：`?after=<seq>` 或 `Last-Event-ID` → 先从 MySQL 读 `> seq` 的里程碑事件，再切到 Stream tail；超过 1h 的断线只能拿到里程碑 + 最终文本，**写进协议**。
+- 20M DAU 中档下 Stream 消息量峰值 15–30 万 msg/s：Redis 按 sessionId 分片（Cluster + sharded pub/sub 或多实例哈希）；超过阈值时切 Kafka 按 sessionId 分区，接口不变。
+
+---
+
+## 5. 对外协议（agent-runner API v1）
+
+命名综合 codex（thread/turn/item）、opencode（session）、hermes（runs）。对外叫 **session**（与简报一致），内部结构就是 codex 的 thread。所有 id 用 UUIDv7。
+
+### 5.1 鉴权
+
+双层：`Authorization: Bearer <service_api_key>`（→ `tenantId`，服务级）+ `X-User-Id`（或租户配置的端用户 JWT，→ `userId`）。`principal = (tenantId, userId)` 贯穿所有存取；任何进程级缓存都按 principal 分片。
+
+### 5.2 资源与端点
+
+| 资源 | 端点 | 说明 |
+|---|---|---|
+| Agent 定义（版本化） | `POST/GET /v1/agents`，`GET/PUT /v1/agents/{id}`，`GET /v1/agents/{id}/versions` | `{name, instructions, model, tools[], mcpServers[], skills[], limits, approvalPolicy, sandbox}`；每次 PUT 生成新版本；session 引用 `agentId@version` |
+| Session | `POST /v1/sessions`，`GET /v1/sessions?cursor&limit&userId`，`GET /v1/sessions/{id}`，`DELETE`，`POST .../archive`，`POST .../fork`，`POST .../compact`，`POST .../resume` | `resume` 返回快照 + 游标 + 未决审批（codex 流程） |
+| Turn | `POST /v1/sessions/{id}/turns`（`stream=true` 直接 SSE；`false` 返回 202 + turnId），`GET .../turns`，`GET .../turns/{turnId}`，`POST .../turns/{turnId}/interrupt`，`POST .../turns/{turnId}/steer` | body `{input:[...], model?, limits?, busyPolicy: steer|reject}`；`Idempotency-Key` 建议必填 |
+| Item | `GET /v1/sessions/{id}/items?turnId&cursor`，`GET .../items/{itemId}/output`（大输出） | 完整消息历史（替代 opencode 的 `GET /session/:id/message`） |
+| Event 流 | `GET /v1/sessions/{id}/events?after=<seq>&exclude=item/reasoning/*` | SSE；`id: <seq>`；`Last-Event-ID` 等价 `after` |
+| 审批 | `GET /v1/sessions/{id}/approvals?pending=true`，`POST /v1/sessions/{id}/approvals/{approvalId}` `{decision}` | decision ∈ `accept | acceptForSession | decline | cancel`；资源含 `expiresAt`、`availableDecisions[]` |
+| Provider / 模型 | `GET /v1/providers`，`GET /v1/models`，`POST/PUT/DELETE /v1/providers/{id}`（租户 BYOK） | BYOK 配置形状见 §7.4 |
+| MCP | `POST/GET/DELETE /v1/mcp-servers`，`GET /v1/mcp-servers/{id}/tools`，`POST .../refresh` | 租户级或用户级；`transport: streamable-http | stdio(重池)` |
+| Skills | `POST/GET/DELETE /v1/skills`（上传 SKILL.md 包），`GET /v1/skills/{name}` | 来源三级：platform / tenant / user |
+| 工具 | `GET /v1/tools` | 当前 principal 可见的内置 + MCP + 动态工具目录 |
+| 用量 | `GET /v1/usage?sessionId|userId&from&to` | 来自 `usage_ledger` |
+| 全局 | `GET /healthz`，`GET /readyz`，`GET /metrics`，`GET /v1/capabilities`，`GET /openapi.json` | capabilities 声明而非版本猜测 |
+
+### 5.3 输入与信封
+
+```jsonc
+POST /v1/sessions/{id}/turns
+{
+  "input": [
+    {"type":"text","text":"..."},
+    {"type":"image","url":"oss://..."},
+    {"type":"skill","name":"..."},          // 显式 /skill 调用
+    {"type":"mention","name":"..."}
+  ],
+  "model": {"provider": "deepseek", "model": "deepseek-v4"},   // 可选对象，受 agent 定义与租户策略约束
+  "limits": {"maxSteps":20,"maxToolCalls":50,"maxWallClockMs":300000,"maxCostCNY":2},
+  "busyPolicy": "steer",
+  "dynamicTools": [ {"name":"...","description":"...","parameters":{...}} ],  // 客户端侧工具（codex item/tool/call）
+  "metadata": {}
+}
+```
+
+### 5.4 事件类型
+
+| 事件 | 持久化 | 说明 |
+|---|---|---|
+| `session/created` `session/status/changed` `session/compacted` | 是 | status ∈ `idle | active{waitingOnApproval|waitingOnUserInput} | error` |
+| `turn/started` `turn/completed{status: completed|interrupted|failed, stopReason}` | 是 | stopReason ∈ `end_turn | max_steps | max_tool_calls | max_cost | max_wall_clock | interrupted | error` |
+| `turn/steered` | 是 | steer 在 step 边界注入后发出 |
+| `item/started` `item/completed` | 是 | 携带完整 item 快照；type ∈ `userMessage | agentMessage | reasoning | toolCall | toolResult | mcpToolCall | dynamicToolCall | approvalRequest | contextCompaction | plan | subAgentActivity` |
+| `item/agentMessage/delta` `item/reasoning/delta` `item/toolCall/argsDelta` `item/mcpToolCall/progress` | **否** | 只进 Stream |
+| `approval/requested` `approval/resolved` | 是 | resume 时重发未决 `approval/requested`（id 不变） |
+| `usage/updated` | 是 | 每 step 一次，含 cache hit/miss 归一化字段 |
+| `hook/started` `hook/completed` | 可配 | 插件可观测 |
+| `warning` `error` | 是 | |
+| `heartbeat` | 否 | 10s，不占 seq |
+
+事件信封：`event: <type>`，`id: <seq>`，`data: {sessionId, turnId?, itemId?, emittedAtMs, ...}`。时间戳全部毫秒。
+
+### 5.5 错误码
+
+`400 invalid_request` · `401 unauthorized` · `404 not_found`（跨租户与不存在不可区分）· `409 session_busy`（busyPolicy=reject）· `409 session_lease_conflict`（内部，router 处理）· `409 idempotency_conflict` · `422 limits_exceeded` · `429 quota_exceeded{scope: tenant|user|provider}` · `502 provider_error{provider, retryable}` · `503 draining`。
+
+---
+
+## 6. agent-runner 内部设计
+
+### 6.1 AgentEngine 接口（harness adapter 边界）
+
+```ts
+interface AgentEngine {
+  runTurn(ctx: TurnContext, input: TurnInput, sink: EventSink): Promise<TurnResult>;
+  steer(turnId: string, input: TurnInput): Promise<void>;
+  interrupt(turnId: string): Promise<void>;
+}
+// TurnContext: principal, agentDef@version, history(items after last compaction),
+//              providerResolver(BYOK), toolRuntime, limits, abortSignal, hooks
+```
+
+两个实现跑同一套契约测试（前期方案 04 §6 的 `HarnessAdapter` 思路）：
+
+- **`PiEngine`（一期主线）**：路线 A —— `pi-agent-core` 的 `Agent` 类，`initialState.messages` 从我们的 store 装载，`subscribe` 转事件，`agent_end` 后落库；`streamFn` 包装 `models.streamSimple(model, ctx, {apiKey, headers, fetch, signal})` 注入 BYOK。二期评估切到 `AgentHarness` + 自研 `SessionRepo`（跑 pi 的 conformance 套件）。
+- **`NativeEngine`（二期）**：从 PoC `loop.ts` + openclaw agent-core 移植，作为 pi 断供/Breaking 时的退路。
+
+pi 要替换的缝（research 04 §4.3）：模型/凭据解析、会话存储、单写者租约（pi 明确不做）、`ExecutionEnv`（一期不挂）、MCP → `AgentTool` 桥、skills 从对象存储装载、`finishTurn` 实现步数/成本上限、`Context.abortSignal` 接取消、telemetry 接 OTel。
+
+### 6.2 上下文装配与前缀稳定
+
+- 不可变前缀区：`instructions(agent@version)` + 工具定义（按名排序、`stableStringify`）+ skills 目录 + 长期记忆注入槽；**`contextEpoch = hash(agentVersion, toolSetHash, mcpToolCatalogHash, skillCatalogHash)`**，任何一项变化 bump epoch，并在对话尾追加一条"XX 列表已变更"的消息而不是改前缀（opencode `SystemContext` 增量）。
+- 追加区：本 turn 消息 + 工具结果。
+- 指标 `agentrt_prompt_cache_hit_ratio{provider,tenant}` 上线第一天就有；CI 里跑前缀 sha256 回归测试。
+
+### 6.3 安全阀（内核不变量，策略只能收紧）
+
+`maxSteps`、`maxToolCalls`、`maxWallClockMs`、`maxCostCNY`、重复工具调用检测、`finish_reason=length` 丢弃**全部** tool call。取 `min(config, agentDef, request)`。触发后优雅终止：带 `partialText` 的 `turn/completed{status:completed, stopReason}`，session 回到 `idle`。
+
+### 6.4 压缩与崩溃恢复
+
+- 两级压缩：便宜级只清工具输出（保留配对、迟滞 >20k、保护 skill 输出）；摘要级作为 `contextCompaction` item 进历史；换模型前先用旧模型压缩；`cache.read + cache.write` 计入占用。
+- write-ahead：`toolCall` item 先落库再执行；恢复时 `TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN` 两码交给模型。
+- 并发工具：dispatch 可乱序、commit 按模型顺序；`isConcurrencySafe(args)` 按参数判并发。
+
+### 6.5 八条生产坑 → 回归测试
+
+research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换模型前压缩、崩溃三态、thinking 丢弃告警、并发 commit 顺序、取消先于清审批、两级压缩事务）全部做成 `packages/core` 的测试，作为 `AgentEngine` 契约的一部分，两种 engine 都要过。
+
+---
+
+## 7. 扩展性
+
+### 7.1 工具
+
+三类：**内置**（`web_fetch`、`http_request`（SSRF 白名单）、结构化数据工具；一期无 shell/fs）、**MCP 工具**（桥接）、**动态工具**（客户端在 turn 请求里声明，runner 发 `item/started{dynamicToolCall}` 后等待客户端 `POST .../items/{id}/result`，codex `item/tool/call` 反向委托）。工具可见性是 **session 的属性**（hermes 原则），由 agent 定义 + 租户策略 + 请求参数解析，不靠进程级缓存。
+
+### 7.2 MCP
+
+- 传输：`streamable-http`（主）、`stdio`（仅重池）。配置 schema 照 dsh：`{serverName, transport, url|command, headers|env, toolCallTimeoutMs, maxInstructionBytes, reconnect{...}, trust: full|untrusted}`。
+- 作用域：platform / tenant / user 三级注册；连接按 `(principal, serverId)` 池化 + TTL；工具名 `mcp__<server>__<tool>`，超 64 字符截断 + hash。
+- 自写清单：OAuth（回调落自己域名，`state` 编码 `(userId, serverId, nonce)`）、token KMS 信封加密 + 撤销级联、分布式刷新单飞、SSRF / 内网 CIDR / DNS rebinding 防护、per-user 配额熔断、工具目录 cache key 含 principal、第三方 tool description 的 prompt 注入标记、`untrusted` server 的写工具强制审批。
+
+### 7.3 Skills
+
+- 格式：`SKILL.md` frontmatter（`name`、`description`、`whenToUse`、`disable-model-invocation`、`user-invocable`、`metadata`、`dependencies.tools[]`(codex)）。
+- 来源与优先级：请求级 > user > tenant > platform；存 MySQL（元数据）+ 对象存储（包）；provider 接口照 dsh `SkillProvider{list, get}`。
+- 注入：目录消息（按摘要去重）+ `skill` 工具 + 输入项 `{type:"skill"}`；codex 的 token 预算截断。
+- 安装前跑 `skills_guard` 规则扫描（翻译 hermes 正则表）。
+- 资源物化（`scripts/`、`reference/`）只在重池有意义，一期不做。
+
+### 7.4 BYOK 与 Provider Gateway
+
+租户 provider 配置（openclaw 形状 + hermes quirk 字段化）：
+
+```jsonc
+{
+  "id": "my-deepseek",
+  "api": "openai-completions",
+  "baseUrl": "https://api.deepseek.com",
+  "apiKeyRef": "kms://tenant/xxx/keys/1",     // KMS 信封加密，永不回显
+  "models": [{"id":"deepseek-v4","contextWindow":128000,"input":["text"],"price":{...},
+              "compat":{"thinkingFormat":"reasoning_content","supportsJsonSchema":false}}],
+  "quota": {"rpm":600,"concurrency":50},
+  "fallback": ["platform-qwen"]
+}
+```
+
+- per-request 注入：解析 principal → provider 配置 → pi `apiKey/headers/fetch`；自定义 `fetch` 加出站代理、超时、审计、遥测剥离。
+- 平台 key 池：多 key 轮换（含 rate-limit reset 时间）、租户/用户/provider 三级配额、熔断，状态在 Redis；三层 failover（同模型有界重试 → 凭证轮换 → 模型链），failover 是 turn-local 并记录到 `usage/updated.runtime`。
+- 方言：pi-ai 已覆盖；`tool-call-repair`（openclaw）作为流后处理；假厂商探针（PoC 脚本）进 CI。
+
+### 7.5 Plugins / Hooks
+
+- Hook 名沿用 Claude Code / codex：`SessionStart | UserPromptSubmit | PreToolUse | PostToolUse | PermissionRequest | PreCompact | PostCompact | SubagentStart | SubagentStop | Stop | Interrupt`。
+- 两层：**observer hook**（只观察，有超时、fail-open）与 **middleware**（可改写 LLM 参数 / 工具参数 / 拦截，fail-closed），租户策略（配额、内容安全、审计、模型路由）用 middleware。
+- 一期插件形态：① 平台部署的进程内包（随 runner 发布）；② 租户级 **webhook hook**（HTTP 回调，带超时与签名）。**不在共享进程加载租户上传的代码**；需要的话二期在重池以隔离进程/容器承载。
+
+### 7.6 沙箱分层（一期只建轻池）
+
+| | 轻池 | 重池 |
+|---|---|---|
+| 工具 | API 工具 + 远程 MCP + 动态工具 | + shell / fs / stdio MCP |
+| 隔离 | 进程内租户上下文 | 每会话沙箱（exec-server 协议，`ExternalSandbox` 语义）或容器化 opencode |
+| 密度 | ~1,000 turn/进程 | 每沙箱一个 |
+| 审批策略 | `on-request` 默认 | `untrusted` 默认 + `read-only|workspace-write` 沙箱轴 |
+
+接口预留：`AgentDef.sandbox`、`environments[]`、exec-server 的 `process/* fs/* http/request` JSON-RPC 方法表（codex）。
+
+---
+
+## 8. 存储
+
+### 8.1 MySQL（一期单库，schema 预留分片）
+
+| 表 | 关键列 | 说明 |
+|---|---|---|
+| `tenants` / `api_keys` / `users` | | 鉴权 |
+| `agents` / `agent_versions` | `(tenant_id, agent_id, version)` | 定义快照，不可变 |
+| `sessions` | `session_id PK, tenant_id, user_id(分片键), agent_id, agent_version, status, fence_token, next_seq, last_compaction_seq, title, parent_session_id, archived_at` | 投影 |
+| `turns` | `turn_id PK, session_id, seq_start, seq_end, status, stop_reason, model, provider, usage(JSON), started_at_ms, completed_at_ms` | |
+| `items` | `item_id PK(UUIDv7), session_id, turn_id, seq, type, status, payload(JSON), output_ref(OSS)` | 完整消息历史 |
+| `events` | `(session_id, seq) PK, type, payload(JSON), emitted_at_ms` | 里程碑事件，`>90 天` 分区归档到 OSS |
+| `approvals` | `approval_id PK, session_id, turn_id, item_id, status, decision, expires_at, payload` | 一等资源 |
+| `provider_configs` | `(tenant_id, provider_id)`, `api_key_ciphertext, kms_key_id` | BYOK |
+| `mcp_servers` / `skills` / `skill_versions` | scope ∈ platform/tenant/user | |
+| `usage_ledger` | `(tenant_id, user_id, session_id, turn_id)`, tokens/cache/cost | 计费归因 |
+| `idempotency_keys` | `(tenant_id, key) PK, response_ref, expires_at` | |
+
+写路径：先 `events` + `items` 同事务（带 fence 校验）再扇出。`sessions.usage` 用原子 `SET usage = usage + ?`。
+
+### 8.2 Redis 键
+
+`lease:{sid}` `fence:{sid}` `owner:{sid}` `stream:{sid}` `idem:{tenant}:{key}` `quota:{scope}:{id}` `keypool:{provider}` `mcp:catalog:{principal}:{serverId}`。
+
+### 8.3 迁移路径
+
+本地 MySQL 单库 → 云 RDS（按 `user_id` 1,024 逻辑分片，先逻辑后物理）；单 Redis → Cluster；Streams → Kafka（按 sessionId 分区）；大字段从第一天走 OSS 引用。存储接口 `SessionStore` / `EventLog` / `BlobStore` 抽象，实现可替换。
+
+---
+
+## 9. 容量与成本（20M DAU，中档：3 turn/DAU/天，90s/turn）
+
+| 指标 | 值 |
+|---|---|
+| turn / 天 | 6,000 万 |
+| 峰值 QPS（×4） | ~2,800 |
+| 峰值并发 turn = 并发 SSE 下限 | ~25 万 |
+| 轻池 runner 进程 @1,000 turn/进程 | ~250 |
+| 里程碑事件 / 天 @10/turn | 6 亿（~180 GB/天 @300B） |
+| 若 delta 落库 | 900 GB/天 → **禁止** |
+| Redis Stream 峰值 | 15–30 万 msg/s → 分片 |
+| LLM 成本 / 月（单步、缓存 85%） | ~¥6.7M；agent 4× token 时 ~¥27M |
+
+直接后果：delta 不落库；厂商 RPM 配额是硬上限（需多 key + 多厂商 + 企业配额）；`prompt_cache_hit_ratio` 是头号成本指标；沙箱不能 per-session 默认开。
+
+---
+
+## 10. 技术栈与 monorepo
+
+```
+agent-service/
+├── apps/
+│   ├── agent-router/        # Hono；鉴权、幂等、所有权目录、SSE 反代
+│   └── agent-runner/        # Hono；SessionHost、engines、tools、providers、SSE
+├── packages/
+│   ├── protocol/            # zod schema + OpenAPI 生成 + 事件类型（codex 类型移植，含 NOTICE）
+│   ├── core/                # AgentEngine 接口、PiEngine、context assembly、safety、compaction、repair
+│   ├── store/               # SessionStore/EventLog/BlobStore 接口 + mysql/redis/memory 实现 + 迁移
+│   ├── lease/               # Redis 租约、fence、owner 目录（Lua 脚本）
+│   ├── providers/           # BYOK 解析、key 池、配额、方言探针、tool-call-repair
+│   ├── mcp/                 # MCP 客户端桥、注册表、SSRF 防护
+│   ├── skills/              # SKILL.md 解析、provider、skills_guard
+│   ├── hooks/               # hook/middleware 分派
+│   ├── sdk/                 # 由 OpenAPI 生成的 TS 客户端
+│   └── testkit/             # 假厂商（deepseek/dashscope 方言）、假 MCP server、契约测试
+├── deploy/                  # docker-compose(mysql+redis)、k8s 清单
+├── docs/                    # research/ design/ adr/
+└── pnpm-workspace.yaml
+```
+
+选型：TypeScript + Node 24 LTS（pi 是 TS；PoC 是 TS；团队栈未确认，见 §13）；pnpm；Hono + `@hono/zod-openapi`；`mysql2` + drizzle；`ioredis`；`@modelcontextprotocol/sdk`；vitest；OpenTelemetry。pi 用精确版本 pin 并 vendoring 打包。
+
+---
+
+## 11. 里程碑与验收
+
+| 里程碑 | 交付 | 验收（可自动化） |
+|---|---|---|
+| **M0 调研**（已完成） | `docs/research/01–07`、本文 | — |
+| **M1 单节点 runner MVP**（2–3 周） | 协议包 + OpenAPI；runner：sessions/turns/items/events/approvals；PiEngine；BYOK provider 配置；内置工具；MySQL+Redis 存储；安全阀；压缩；崩溃恢复；假厂商 | 端到端 SSE 一轮 ≥3 step + 工具；`?after=` 无重复无空洞；前缀 sha256 三请求一致；跨租户 404 不可区分；五条安全阀触发；八条生产坑测试通过；真实 deepseek/qwen key 探针通过 |
+| **M2 router + 多节点正确性**（1–2 周） | agent-router；租约 + fence + 续期 + drain；owner 目录；idempotency | **3 runner + 1 router 共享 MySQL/Redis，turn 中 kill 租约持有者：另一 runner 接管、事件无空洞、客户端补齐**；10 并发 writer 只 1 成功；旧 fence 写入被 DB 拒绝 |
+| **M3 扩展性**（2–3 周） | 远程 MCP 注册与桥接；skills 上传/注入/guard；hooks/middleware + webhook hook；动态工具反向委托 | MCP 工具在 turn 中被调用并落 item；skill 目录注入去重；hook 超时 fail-open/closed 行为；SSRF 用例被拒 |
+| **M4 生产化**（2–3 周） | 配额/key 池/熔断；OTel + 指标；压测（单进程并发 turn 上限实测）；Streams 分片；k8s 清单；重池/exec-server 设计评审 | 单 runner 1,000 并发 turn 压测报告；`prompt_cache_hit_ratio` 面板；混沌测试（Redis 抖动、厂商 5xx） |
+
+---
+
+## 12. 风险
+
+| 风险 | 对策 |
+|---|---|
+| pi 每版 Breaking、新贡献者 PR 自动关闭 | pin + vendoring；`AgentEngine` 边界；NativeEngine 退路；契约测试驱动升级 |
+| 国产厂商未文档化的流式行为 | 假厂商复刻方言进 CI；M1 就打真实 key 探针 |
+| 20M DAU 的厂商配额 | 早做企业配额谈判；多 key 池 + 多厂商从 M4 起 |
+| 前缀缓存在多租户下难保持 | `contextEpoch` 复合键 + 增量通知 + CI 回归 |
+| 审批/长 turn 与发布缩容冲突 | step 边界 checkpoint + drain；审批落库 + `expiresAt` |
+| 内容安全（国内上线硬要求） | 作为 middleware 插槽预留；输出侧分段送审会改流式主路径，需尽早定策略（见 §13） |
+| 多租户 MCP 的安全面 | §7.2 自写清单一期全部做；`untrusted` 默认 |
+
+---
+
+## 13. 需要你确认的决策（默认值加粗）
+
+| # | 决策 | 选项 | 默认 | 影响 |
+|---|---|---|---|---|
+| 1 | 技术栈 | **TypeScript/Node** · Go · Java | TS | 选 Go/Java 则 pi 复用路径不成立，loop/provider 全自研，M1 工期 ×2 |
+| 2 | agent loop | **内嵌 pi（Agent 类）+ AgentEngine 边界** · 纯自研 · 内嵌 dsh | pi | 见 §6.1 |
+| 3 | 一期是否提供代码执行（shell/fs 工具、沙箱） | **不提供，预留重池接口** · 提供（需要 exec-server + 容器编排） | 不提供 | 提供则 M1 后新增 2–4 周，容量模型改变 |
+| 4 | 鉴权模型 | **service key + X-User-Id** · 端用户 JWT 直连 · 两者都支持 | service key + X-User-Id | 影响 router 鉴权实现与 SDK |
+| 5 | 对外资源名 | **`sessions`** · `threads` | sessions | 只影响命名 |
+| 6 | 内容安全策略 | 全量后审 · 分段送审可回滚 · **一期只留 middleware 插槽** | 插槽 | 分段送审会改流式主路径 |
+| 7 | 本地基础设施 | **brew 装 Redis + 已有 MySQL 8.0** · 安装 Docker/OrbStack 用 compose | brew | 本机没有 Docker；两种都会写 compose 文件供他人使用 |
+| 8 | 现有基础设施对齐 | K8s？MQ（Kafka/RocketMQ）？RDS 类型（MySQL/TiDB）？Redis 规模？ | 按 MySQL + Redis + Kafka 假设 | 影响 M4 与 deploy/ |
+
+不反馈即按默认值进入 M1。
+
+---
+
+## 14. 已知缺口（v0.1 未覆盖，M1 期间以独立文档补齐）
+
+| # | 缺口 | 补齐方式 | 时机 |
+|---|---|---|---|
+| 1 | **pi 嵌入假设未实跑**：`Agent` 类装载历史、`streamFn` 注入 per-call apiKey、事件映射、abort 传播都来自读源码，没有运行验证 | M1 第一件事做 spike：`packages/core` 里写 PiEngine 最小版打真实 deepseek/qwen | M1 首周 |
+| 2 | 协议只有资源与事件清单，没有字段级 schema、错误信封、API 版本与兼容策略 | `packages/protocol` 用 zod 定义并生成 OpenAPI；`docs/design/01-protocol.md` | M1 |
+| 3 | 子 agent（task 工具）模型：子 session 的租约归属、事件如何投影到父 session、并发上限 | `docs/design/02-subagents.md`；一期子 agent 与父 session 同 runner 同租约 | M1 后期 |
+| 4 | 忙时输入（steer / queue / reject）的精确语义：steer 注入点、队列长度上限、与审批等待的交互 | 写进 01-protocol.md，参考 opencode `SessionInput` 与 openclaw 四档 | M1 |
+| 5 | 安全威胁模型：SSRF、prompt 注入、BYOK 密钥处理、动态工具结果信任边界、MCP `untrusted` | `docs/design/03-threat-model.md` | M3 前 |
+| 6 | 数据生命周期：会话/事件/附件保留期、用户删除（PIPL 个人信息删除权）、审计日志保留、导出 | `docs/design/04-data-lifecycle.md`；schema 预留 `deleted_at` 与归档任务 | M1 schema 定稿前 |
+| 7 | 可观测性规范：指标清单、trace 传播（W3C traceparent 从 router 到厂商请求）、结构化日志字段与脱敏级别（按租户配置） | `docs/design/05-observability.md` | M2 |
+| 8 | 限流与配额策略的具体层级与算法（租户 / 用户 / provider；令牌桶 vs 并发槽） | 写进 providers 包设计 | M4 |
+| 9 | 长期记忆注入钩子的接口形状（前缀区 / 追加区两个注入点 + epoch bump） | 作为 hooks 的一种 middleware 定义 | M3 |
+| 10 | 决策记录：本文的关键取舍尚未拆成 ADR | `docs/adr/0001-embed-pi.md` 等，随实现逐条补 | 持续 |
+| 11 | 本地无法验证的项：真实 OSS / KMS / Kafka / K8s drain / 厂商配额 | 全部藏在接口后并提供本地实现（文件 blob store、本地密钥加密、Redis Streams、进程 SIGTERM drain）；云上部署时只换实现与配置 | 部署前 |

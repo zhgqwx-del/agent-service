@@ -1,0 +1,31 @@
+{
+  "name": "@agent-service/runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/main.ts",
+  "scripts": {
+    "dev": "tsx watch --env-file=../../.env src/main.ts",
+    "start": "tsx --env-file=../../.env src/main.ts",
+    "build": "tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@agent-service/core": "workspace:*",
+    "@agent-service/protocol": "workspace:*",
+    "@agent-service/providers": "workspace:*",
+    "@agent-service/store": "workspace:*",
+    "@hono/node-server": "^2.1.1",
+    "hono": "^4.13.8",
+    "zod": "^3.24.4",
+    "@earendil-works/pi-agent-core": "0.87.0",
+    "@earendil-works/pi-ai": "0.87.0",
+    "typebox": "1.3.27",
+    "mysql2": "^3.24.4",
+    "ioredis": "^6.0.0",
+    "jose": "^6.2.12"
+  },
+  "devDependencies": {
+    "@agent-service/providers": "workspace:*"
+  }
+}

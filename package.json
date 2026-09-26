@@ -1,0 +1,44 @@
+{
+  "name": "agent-service",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "agent-router + agent-runner: a distributed, multi-tenant agent API service",
+  "engines": {
+    "node": ">=24",
+    "pnpm": ">=10"
+  },
+  "packageManager": "pnpm@12.5.1",
+  "scripts": {
+    "build": "node scripts/build-app.mjs agent-runner && node scripts/build-app.mjs agent-router",
+    "check:secrets": "node scripts/check-secrets.mjs",
+    "typecheck": "tsc -b tsconfig.json && tsc -p tsconfig.typecheck.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev:runner": "pnpm --filter @agent-service/runner dev",
+    "dev:router": "pnpm --filter @agent-service/router dev",
+    "infra": "deploy/local/infra.sh",
+    "local:start": "scripts/local-service.sh start",
+    "local:stop": "scripts/local-service.sh stop",
+    "local:restart": "scripts/local-service.sh restart",
+    "local:status": "scripts/local-service.sh status",
+    "local:logs": "scripts/local-service.sh logs",
+    "local:smoke": "scripts/local-service.sh smoke",
+    "local:acceptance": "scripts/local-service.sh acceptance",
+    "verify": "scripts/local-service.sh verify",
+    "verify:real": "scripts/local-service.sh verify-real",
+    "test:cluster": "AGENT_SERVICE_CLUSTER=1 vitest run test/cluster",
+    "build:check": "pnpm build && node scripts/check-dist-boot.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^4.1.11",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "@agent-service/testkit": "workspace:*",
+    "mysql2": "^3.24.4",
+    "ioredis": "^6.0.0",
+    "esbuild": "^0.28.2"
+  }
+}

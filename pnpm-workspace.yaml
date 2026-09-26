@@ -1,0 +1,17 @@
+packages:
+  - apps/*
+  - packages/*
+# CI/Corepack already installs the exact packageManager version. Avoid pnpm 12's standalone
+# self-manager mutating the project lockfile with a second package-manager dependency graph.
+pmOnFail: ignore
+allowBuilds:
+  # esbuild's postinstall selects/verifies the platform binary used by the production bundler.
+  esbuild: true
+  # These packages ship ready-to-run JavaScript. Their lifecycle hooks are not needed at runtime.
+  '@google/genai': false
+  protobufjs: false
+minimumReleaseAgeExclude:
+  - '@earendil-works/chord@0.87.0'
+  - '@earendil-works/pi-agent-core@0.87.0'
+  - '@earendil-works/pi-ai@0.87.0'
+  - '@earendil-works/pi-telemetry@0.87.0'

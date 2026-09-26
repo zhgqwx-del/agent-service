@@ -1,0 +1,21 @@
+# Local/CI infrastructure only (the services run from the host via pnpm dev:runner / dev:router).
+# On this machine deploy/local/infra.sh is used instead, because Docker is not installed.
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: agent_service
+    ports: ["3306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 5s
+      retries: 20
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+  redis:
+    image: redis:8
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 20

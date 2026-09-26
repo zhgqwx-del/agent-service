@@ -1,0 +1,13 @@
+// Typechecks everything, including tests, which the build projects deliberately exclude.
+// vitest only transpiles, so without this a test could reference an API that no longer exists.
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "types": ["node"]
+  },
+  "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "apps/*/src/**/*.ts", "apps/*/test/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"]
+}
