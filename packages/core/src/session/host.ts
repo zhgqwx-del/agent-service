@@ -21,10 +21,10 @@ import {
   type Turn,
   type Usage,
 } from "@agent-service/protocol";
-import type { CommitBatch, EventBus, EventListener, LeaseStore, SessionStore } from "@agent-service/store";
-import { FenceError, SessionGoneError } from "@agent-service/store";
+import type { CommitBatch, EventBus, EventListener, IdempotencyReceiptInput, LeaseStore, SessionStore } from "@agent-service/store";
+import { FenceError, IdempotencyMismatchError, IdempotencyPendingError, IdempotencyReplayError, SessionGoneError } from "@agent-service/store";
 import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineRun, EngineSink, ResolvedModel, Summariser } from "../engine/types.js";
-import { buildSystemPrompt, computeContextEpoch, type SkillSummary } from "../context/assemble.js";
+import { buildSystemPrompt, computeContextEpoch, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
 import { projectItems, pruneToolResults } from "../context/history.js";
 import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptTokens } from "../context/compact.js";
 import { newId } from "../ids.js";
@@ -47,6 +47,8 @@ export interface SkillSource {
 export interface BegunTurn {
   turn: Turn;
   session: Session;
+  /** true when this request replayed an already committed idempotency receipt */
+  replayed?: boolean;
   /** true when the input was folded into an already-running turn (busyPolicy=steer) */
   steered?: boolean;
   run: () => void;
@@ -67,6 +69,8 @@ export interface SessionHostConfig {
   /** cap on summary length */
   compactionMaxTokens?: number;
   hotReplayWindowMs?: number;
+  /** lifetime of a completed turn idempotency receipt */
+  idempotencyTtlMs?: number;
 }
 
 export interface SessionHostDeps {
@@ -120,6 +124,16 @@ interface ActiveTurn {
   resolveDone: () => void;
   /** per-session write chain: commits (and their publishes) are strictly ordered, so seq order == delivery order */
   chain: Promise<unknown>;
+  /** lifecycle gate: only reserved/running turns may admit new steer input */
+  phase: "reserved" | "running" | "settling" | "finishing" | "finished";
+  /** stop admitting new steer requests while already-admitted requests drain through steerChain */
+  closingRequested: boolean;
+  /** steer operations admitted before a step boundary; onStepEnd waits for this barrier */
+  steerChain: Promise<unknown>;
+  /** inputs accepted after turn/start was committed but before the engine was attached */
+  pendingSteers: ((InputPart & { type: "text" | "image" })[])[];
+  /** makes timeout/drain/lease-loss cleanup safe when more than one stop signal races */
+  finishPromise?: Promise<void>;
 }
 
 /**
@@ -140,6 +154,28 @@ interface LeaseGuard {
 interface CompactionResult {
   messages: ReturnType<typeof projectItems>["messages"];
   itemId: string;
+}
+
+/** Transport choice (`stream`) does not change the turn resource represented by an idempotency key. */
+function turnRequestHash(req: StartTurnRequest): string {
+  const { stream: _stream, ...resource } = req;
+  return sha256(stableStringify(resource));
+}
+
+/** Validate once for both a new turn and busyPolicy/public steer paths. */
+function executableInput(parts: InputPart[]): (InputPart & { type: "text" | "image" })[] {
+  const unsupported = parts.find((part) => part.type === "skill" || part.type === "mention");
+  if (unsupported) throw new ApiError("invalid_request", `input part "${unsupported.type}" is not supported yet (skills land in M3)`);
+  if (parts.some((part) => part.type === "image")) {
+    throw new ApiError("invalid_request", "image input is not supported yet: attachments need the blob store (M3)");
+  }
+  const input = parts.filter((part): part is InputPart & { type: "text" | "image" } => part.type === "text" || part.type === "image");
+  if (!input.some((part) => part.type === "text")) throw new ApiError("invalid_request", "input must contain at least one text part");
+  return input;
+}
+
+function isTurnClosing(state: ActiveTurn): boolean {
+  return state.phase === "finishing" || state.phase === "finished";
 }
 
 /**
@@ -173,6 +209,7 @@ export class SessionHost {
       contextBudgetRatio: c.contextBudgetRatio ?? 0.7,
       compactionKeepRatio: c.compactionKeepRatio ?? 0.5,
       compactionMaxTokens: c.compactionMaxTokens ?? 1_500,
+      idempotencyTtlMs: c.idempotencyTtlMs ?? 24 * 3_600_000,
     };
   }
 
@@ -425,39 +462,85 @@ export class SessionHost {
   }
 
   /** begin + run in one call. Convenience for non-streaming callers and tests. */
-  async startTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string } = {}): Promise<{ turn: Turn; session: Session; steered?: boolean }> {
+  async startTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string } = {}): Promise<{ turn: Turn; session: Session; steered?: boolean; replayed?: boolean }> {
     const begun = await this.beginTurn(principal, sessionId, req, opts);
     begun.run();
-    return { turn: begun.turn, session: begun.session, steered: begun.steered };
+    return { turn: begun.turn, session: begun.session, steered: begun.steered, replayed: begun.replayed };
+  }
+
+  private async lookupIdempotentTurn(session: Session, key: string, requestHash: string): Promise<Turn | undefined> {
+    let receipt;
+    try {
+      receipt = await this.deps.store.getIdempotencyKey(
+        { tenantId: session.tenantId, userId: session.userId, sessionId: session.id },
+        key,
+      );
+    } catch (err) {
+      if (err instanceof IdempotencyPendingError) {
+        throw new ApiError("idempotency_conflict", "this Idempotency-Key has a legacy request still in progress");
+      }
+      throw err;
+    }
+    if (!receipt) return undefined;
+    if (receipt.requestHash && receipt.requestHash !== requestHash) {
+      throw new ApiError("idempotency_conflict", "this Idempotency-Key was already used for a different request");
+    }
+    if (receipt.value.sessionId !== session.id) {
+      throw new ApiError("idempotency_conflict", "this Idempotency-Key was used for a different session");
+    }
+    const turn = await this.deps.store.getTurn(session.id, receipt.value.turnId);
+    if (!turn) throw new ApiError("idempotency_conflict", "the original turn is no longer available");
+    return turn;
   }
 
   private async beginTurnLocked(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string }): Promise<BegunTurn> {
-    if (this.draining) throw new ApiError("draining", "runner is draining");
     const session = await this.getSession(principal, sessionId);
+    const requestHash = opts.idempotencyKey ? turnRequestHash(req) : undefined;
+    const existing = opts.idempotencyKey
+      ? await this.lookupIdempotentTurn(session, opts.idempotencyKey, requestHash!)
+      : undefined;
+    const local = this.active.get(sessionId);
+    if (existing && (existing.status !== "inProgress" || local?.turn.id === existing.id)) {
+      return { turn: existing, session, replayed: true, run: noop };
+    }
+    const probingInProgressReplay = existing?.status === "inProgress" && !local;
+    if (this.draining && !probingInProgressReplay) throw new ApiError("draining", "runner is draining");
     const agent = await this.deps.store.getAgent(principal.tenantId, session.agentId, session.agentVersion);
     if (!agent) throw new ApiError("not_found", "agent version not found");
     const busyPolicy = req.busyPolicy ?? agent.busyPolicy;
+    const input = executableInput(req.input);
 
     // Busy handling: the truth is the session status in the store (survives restarts), the active map is our local view.
-    const local = this.active.get(sessionId);
     if (local) {
       if (busyPolicy === "steer") {
-        await this.steer(principal, sessionId, local.turn.id, { input: req.input });
+        const idempotency: IdempotencyReceiptInput | undefined = opts.idempotencyKey ? {
+          scope: { tenantId: session.tenantId, userId: session.userId, sessionId },
+          key: opts.idempotencyKey,
+          requestHash: requestHash!,
+          value: { turnId: local.turn.id, sessionId },
+          expiresAtMs: Date.now() + this.cfg.idempotencyTtlMs,
+        } : undefined;
+        await this.steerActive(local, req.input, input, idempotency);
         return { turn: local.turn, session, steered: true, run: noop };
       }
       throw new ApiError("session_busy", "a turn is in progress", { turnId: local.turn.id });
     }
 
-    // Fail loudly on input kinds the engine cannot carry yet, rather than dropping them silently.
-    const unsupported = req.input.find((p) => p.type === "skill" || p.type === "mention");
-    if (unsupported) throw new ApiError("invalid_request", `input part "${unsupported.type}" is not supported yet (skills land in M3)`);
-    if (req.input.some((p) => p.type === "image")) throw new ApiError("invalid_request", "image input is not supported yet: attachments need the blob store (M3)");
-    if (!req.input.some((p) => p.type === "text")) throw new ApiError("invalid_request", "input must contain at least one text part");
-
     // ---- single writer ----
     this.clearHold(sessionId);
     const lease = await this.deps.lease.acquire(sessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
-    if (!lease.ok) throw new ApiError("session_lease_conflict", "session owned by another runner", { ownerId: lease.ownerId, ownerAddr: lease.ownerAddr });
+    if (!lease.ok) {
+      // The first receipt read can race another runner's atomic turn-start commit. Re-read only after
+      // acquisition fails: a matching receipt now proves this request already owns a durable turn and
+      // is safe to replay; without one this remains an ordinary lease conflict.
+      const racedExisting = opts.idempotencyKey
+        ? await this.lookupIdempotentTurn(session, opts.idempotencyKey, requestHash!)
+        : undefined;
+      if (racedExisting) {
+        return { turn: racedExisting, session, replayed: true, run: noop };
+      }
+      throw new ApiError("session_lease_conflict", "session owned by another runner", { ownerId: lease.ownerId, ownerAddr: lease.ownerAddr });
+    }
     const fence = lease.fence;
     const leaseGuard = this.startLeaseGuard(sessionId);
 
@@ -466,12 +549,33 @@ export class SessionHost {
       // turn may have finished in between. Re-read before deciding anything about the session state.
       const fresh = await leaseGuard.wait(this.getSession(principal, sessionId));
       Object.assign(session, fresh);
+      const afterLeaseExisting = opts.idempotencyKey
+        ? await leaseGuard.wait(this.lookupIdempotentTurn(session, opts.idempotencyKey, requestHash!))
+        : undefined;
+      if (afterLeaseExisting) {
+        // A response can be lost after the atomic turn-start commit but before run(). If no runner is
+        // executing that durable in-progress turn, close it as interrupted before replaying it.
+        if (afterLeaseExisting.status === "inProgress") {
+          if (session.status.type !== "active" || session.status.turnId !== afterLeaseExisting.id) {
+            throw new ApiError("idempotency_conflict", "the idempotent turn is inconsistent with the session state");
+          }
+          leaseGuard.assertOwned();
+          await leaseGuard.wait(this.closeOrphanedTurn(session, fence, leaseGuard));
+        }
+        const replay = (await this.deps.store.getTurn(sessionId, afterLeaseExisting.id)) ?? afterLeaseExisting;
+        leaseGuard.stop();
+        await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+        return { turn: replay, session, replayed: true, run: noop };
+      }
+      // The receipt may have expired between the optimistic lookup and lease acquisition. A draining
+      // runner may repair/replay an existing durable turn, but must never fall through and create one.
+      if (this.draining) throw new ApiError("draining", "runner is draining");
       if (session.status.type === "active" && !this.active.has(sessionId)) {
         // A previous owner died mid-turn (or we restarted). Close the orphaned turn before starting a new one.
         leaseGuard.assertOwned();
         await leaseGuard.wait(this.closeOrphanedTurn(session, fence, leaseGuard));
       }
-      return await this.beginTurnInner(principal, session, agent, req, opts, fence, leaseGuard);
+      return await this.beginTurnInner(principal, session, agent, req, input, opts, fence, leaseGuard);
     } catch (err) {
       leaseGuard.stop();
       await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
@@ -484,12 +588,12 @@ export class SessionHost {
     session: Session,
     agent: AgentDefinition,
     req: StartTurnRequest,
+    input: (InputPart & { type: "text" | "image" })[],
     opts: { idempotencyKey?: string },
     fence: number,
     leaseGuard: LeaseGuard,
   ): Promise<BegunTurn> {
     const sessionId = session.id;
-    const input = req.input.filter((p): p is InputPart & { type: "text" | "image" } => p.type === "text" || p.type === "image");
 
     // ---- resolve model, tools, context ----
     const modelRef = { ...agent.model, ...(req.model ?? {}) };
@@ -514,7 +618,7 @@ export class SessionHost {
     }
     const budget = Math.floor(model.contextWindow * this.cfg.contextBudgetRatio);
     // Summary tier first: it changes which items are in play. Then cheap pruning on what remains.
-    const compacted = await this.maybeCompact(principal, session, fence, items, model, budget, leaseGuard);
+    const compacted = await this.maybeCompact(session, fence, items, model, budget, leaseGuard);
     const history = pruneToolResults(compacted?.messages ?? projected.messages, budget);
 
     // ---- persist turn start + user message ----
@@ -530,6 +634,7 @@ export class SessionHost {
       startedAtMs: now,
       idempotencyKey: opts.idempotencyKey,
       model: { provider: model.provider, model: model.model },
+      metadata: req.metadata,
     };
     const userItem: Item = { id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input };
     const state: ActiveTurn = {
@@ -539,12 +644,22 @@ export class SessionHost {
       autoApproved: new Set(session.autoApprovedTools),
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
+      phase: "reserved", closingRequested: false, steerChain: Promise.resolve(), pendingSteers: [],
     };
     state.done = new Promise((r) => (state.resolveDone = r));
+    // Preflight contains provider/store/summariser awaits, during which drain() may observe no active
+    // turn and finish. This final synchronous check + registration closes that race: after the check,
+    // drain cannot run until `active` contains this state.
+    if (this.draining) throw new ApiError("draining", "runner is draining");
     leaseGuard.attach(() => {
       this.log.error(`[session ${sessionId}] lease lost; runner no longer owns the session; aborting turn ${turn.id}`);
+      const wasReserved = state.phase === "reserved";
+      state.fenced = true;
+      state.closingRequested = true;
+      state.phase = "finishing";
       state.stopReason = "error";
       this.failPendingApprovals(state, "cancel");
+      if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
     });
     this.active.set(sessionId, state);
 
@@ -553,6 +668,13 @@ export class SessionHost {
       await this.commit(state, {
         turn,
         items: [userItem],
+        idempotency: opts.idempotencyKey ? {
+          scope: { tenantId: session.tenantId, userId: session.userId, sessionId },
+          key: opts.idempotencyKey,
+          requestHash: turnRequestHash(req),
+          value: { turnId: turn.id, sessionId },
+          expiresAtMs: now + this.cfg.idempotencyTtlMs,
+        } : undefined,
         events: [
           { type: "turn/started", sessionId, emittedAtMs: now, turn },
           ...(repairWarning ? [{ type: "warning" as const, sessionId, emittedAtMs: now, ...repairWarning }] : []),
@@ -564,20 +686,44 @@ export class SessionHost {
       leaseGuard.assertOwned();
     } catch (err) {
       this.active.delete(sessionId);
+      state.resolveDone();
+      if (err instanceof IdempotencyMismatchError) {
+        throw new ApiError("idempotency_conflict", "this Idempotency-Key was already used for a different request");
+      }
+      if (err instanceof IdempotencyPendingError) {
+        throw new ApiError("idempotency_conflict", "this Idempotency-Key has a legacy request still in progress");
+      }
+      if (err instanceof IdempotencyReplayError) {
+        const existingTurn = await this.deps.store.getTurn(sessionId, err.receipt.value.turnId);
+        if (!existingTurn) throw new ApiError("idempotency_conflict", "the original turn is no longer available");
+        leaseGuard.stop();
+        await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+        return { turn: existingTurn, session, replayed: true, run: noop };
+      }
       throw err;
     }
 
     // ---- wall clock ----
     state.wallClockTimer = setTimeout(() => {
       state.limitHit = "max_wall_clock";
-      state.abort.abort();
+      const wasReserved = state.phase === "reserved";
+      void (async () => {
+        // Linearise the timeout after every steer which was admitted before this callback. New
+        // requests are rejected immediately, while admitted ones still reach the engine/pending queue.
+        await this.settleAdmittedSteers(state);
+        if (state.phase === "finished") return;
+        state.phase = "finishing";
+        state.abort.abort();
+        // No engine exists yet to drive runEngine() into finishTurn(). Close the durable reservation
+        // ourselves so a caller that forgot/died before run() cannot renew this lease forever.
+        if (wasReserved) await this.finishTurn(state, { steps: 0, aborted: true });
+      })().catch((err) => this.log.error(`[session ${sessionId}] wall-clock cleanup failed`, err));
     }, limits.maxWallClockMs);
 
     // The engine starts only when the caller says so (see BegunTurn).
-    let started = false;
     const run = () => {
-      if (started) return;
-      started = true;
+      if (state.phase !== "reserved" || state.closingRequested) return;
+      state.phase = "running";
       void this.runEngine(principal, state, { systemPrompt, tools, history, input, model, limits });
     };
     return { turn, session, run };
@@ -592,7 +738,7 @@ export class SessionHost {
     const sink = this.makeSink(principal, state, p.tools);
     let result: Awaited<EngineRun["done"]>;
     try {
-      state.run = this.deps.engine.start(
+      const run = this.deps.engine.start(
         {
           systemPrompt: p.systemPrompt,
           tools: p.tools,
@@ -605,7 +751,11 @@ export class SessionHost {
         },
         sink,
       );
-      result = await state.run.done;
+      state.run = run;
+      // busyPolicy=steer can arrive in the intentional beginTurn()/run() gap used to attach SSE.
+      // Preserve write-ahead ordering, then feed every admitted input as soon as the engine exists.
+      for (const input of state.pendingSteers.splice(0)) run.steer(input);
+      result = await run.done;
     } catch (err) {
       result = { steps: state.step, aborted: state.abort.signal.aborted, error: err instanceof Error ? err.message : String(err) };
     }
@@ -620,6 +770,9 @@ export class SessionHost {
 
     return {
       onStepStart: (step) => {
+        // A next step can already have been scheduled when an interrupt/timeout closes admission.
+        // Never let that callback reopen the steer gate.
+        if (!state.closingRequested && state.phase !== "finishing" && state.phase !== "finished") state.phase = "running";
         state.step = step;
         state.turn.steps = step;
         state.agentItemId = undefined;
@@ -664,6 +817,9 @@ export class SessionHost {
 
       onAssistantMessage: async (msg) => {
         const now = Date.now();
+        if (msg.stopReason === "error" || msg.stopReason === "aborted" || (msg.stopReason === "length" && msg.toolCalls.length === 0)) {
+          state.closingRequested = true;
+        }
         const items: Item[] = [];
         const events: EventInput[] = [];
         if (msg.reasoning) {
@@ -691,18 +847,33 @@ export class SessionHost {
           events.push({ type: "item/started", sessionId, emittedAtMs: now, item });
         }
         // usage
-        state.stepUsage = msg.usage;
-        state.turn.usage = addUsage(state.turn.usage, msg.usage);
-        state.session.usage = addUsage(state.session.usage, msg.usage);
+        const nextTurnUsage = addUsage(state.turn.usage, msg.usage);
+        const nextSessionUsage = addUsage(state.session.usage, msg.usage);
+        const nextTurn = { ...state.turn, usage: nextTurnUsage };
+        if (state.limits.maxCostCNY && (nextTurnUsage.costCNY ?? 0) > state.limits.maxCostCNY) {
+          state.limitHit ??= "max_cost";
+          state.closingRequested = true;
+        }
+        if (msg.stopReason === "length" && msg.toolCalls.length === 0) state.limitHit ??= "max_output_tokens";
         events.push({
           type: "usage/updated", sessionId, emittedAtMs: now, turnId, step: state.step,
-          stepUsage: msg.usage, turnUsage: state.turn.usage, sessionUsage: state.session.usage,
+          stepUsage: msg.usage, turnUsage: nextTurnUsage, sessionUsage: nextSessionUsage,
           runtime: { provider: msg.provider, model: msg.model },
         });
-        if (state.limits.maxCostCNY && (state.turn.usage.costCNY ?? 0) > state.limits.maxCostCNY) state.limitHit ??= "max_cost";
-        if (msg.stopReason === "length" && msg.toolCalls.length === 0) state.limitHit ??= "max_output_tokens";
-        await this.commit(state, { items, events, turn: state.turn, sessionPatch: { usage: state.session.usage } });
-        void this.deps.store.appendUsage({ tenantId: principal.tenantId, userId: state.session.userId, sessionId, turnId, step: state.step, provider: msg.provider, model: msg.model, usage: msg.usage, createdAtMs: now }).catch(() => {});
+        await this.commit(state, {
+          items,
+          events,
+          turn: nextTurn,
+          usageEntries: [{ turnId, step: state.step, provider: msg.provider, model: msg.model, usage: msg.usage, createdAtMs: now }],
+          sessionPatch: { usage: nextSessionUsage },
+        });
+        state.stepUsage = msg.usage;
+        state.turn.usage = nextTurnUsage;
+        state.session.usage = nextSessionUsage;
+        // Pi does not invoke onStepEnd for provider errors/aborts. When this response closes the
+        // turn, drain every steer admitted before closingRequested was set before returning control
+        // to the engine, so those promises cannot succeed without engine delivery.
+        if (state.closingRequested) await state.steerChain;
       },
 
       beforeToolCall: async (call, msg) => this.gateToolCall(principal, state, toolByName.get(call.name), call, msg),
@@ -731,11 +902,24 @@ export class SessionHost {
       },
 
       onStepEnd: async (step) => {
-        if (state.fenced || state.limitHit) return "end";
-        if (step >= state.limits.maxSteps) {
-          state.limitHit = "max_steps";
+        if (state.fenced || isTurnClosing(state)) return "end";
+        if (state.closingRequested || state.limitHit) {
+          await state.steerChain;
           return "end";
         }
+        // Close admission before the engine decides whether it has another step. Every steer that
+        // was admitted while this step was running is in steerChain; waiting here guarantees its
+        // durable item is committed and engine.steer() is called before the loop checks its queue.
+        state.phase = "settling";
+        await state.steerChain;
+        if (state.fenced || state.closingRequested || state.limitHit || isTurnClosing(state)) return "end";
+        if (step >= state.limits.maxSteps) {
+          state.limitHit = "max_steps";
+          state.closingRequested = true;
+          return "end";
+        }
+        // Keep `settling` until the next onStepStart. If the engine naturally stops instead, no
+        // late request can persist a steer into a turn that has already gone idle.
         return "continue";
       },
     };
@@ -745,12 +929,16 @@ export class SessionHost {
   private async gateToolCall(principal: Principal, state: ActiveTurn, tool: RunnerTool | undefined, call: { id: string; name: string; args: unknown }, msg: AssistantStepResult): Promise<BeforeToolCallDecision> {
     const item = state.toolCallItems.get(call.id);
     if (state.fenced) return { allow: false, reason: "this runner no longer owns the session", interrupt: true };
-    if (state.limitHit) return { allow: false, reason: `turn stopped: ${state.limitHit}`, interrupt: true };
+    if (state.limitHit || state.closingRequested || state.phase === "finishing" || state.phase === "finished") {
+      return { allow: false, reason: `turn stopped: ${state.limitHit ?? "finishing"}`, interrupt: true };
+    }
     if (!tool) return { allow: false, reason: `unknown tool ${call.name}` };
     state.toolCalls += 1;
     state.turn.toolCalls = state.toolCalls;
     if (state.toolCalls > state.limits.maxToolCalls) {
       state.limitHit = "max_tool_calls";
+      state.closingRequested = true;
+      await state.steerChain;
       return { allow: false, reason: "tool call limit reached", interrupt: true };
     }
     const markStarted = async () => {
@@ -834,6 +1022,8 @@ export class SessionHost {
     if (item) item.status = "declined";
     if (decision === "cancel") {
       state.stopReason = "interrupted";
+      state.closingRequested = true;
+      await state.steerChain;
       return { allow: false, reason: "declined by user; turn interrupted", interrupt: true };
     }
     return { allow: false, reason: expired ? "approval expired" : "declined by user" };
@@ -868,7 +1058,13 @@ export class SessionHost {
     return (await this.deps.store.getApproval(sessionId, approvalId))!;
   }
 
-  async steer(principal: Principal, sessionId: string, turnId: string, req: { input: InputPart[]; expectedTurnId?: string }): Promise<void> {
+  async steer(
+    principal: Principal,
+    sessionId: string,
+    turnId: string,
+    req: { input: InputPart[]; expectedTurnId?: string },
+    idempotency?: IdempotencyReceiptInput,
+  ): Promise<void> {
     await this.getSession(principal, sessionId);
     const state = this.active.get(sessionId);
     if (!state || state.turn.id !== turnId) {
@@ -879,11 +1075,80 @@ export class SessionHost {
       throw new ApiError("not_found", "no active turn with that id on this runner");
     }
     if (req.expectedTurnId && req.expectedTurnId !== turnId) throw new ApiError("invalid_request", "expectedTurnId mismatch");
-    const input = req.input.filter((p): p is InputPart & { type: "text" | "image" } => p.type === "text" || p.type === "image");
-    const now = Date.now();
-    const item: Item = { id: newId("item"), sessionId, turnId, seq: 0, step: state.step, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input };
-    await this.commit(state, { items: [item], events: [{ type: "item/completed", sessionId, emittedAtMs: now, item }, { type: "turn/steered", sessionId, emittedAtMs: now, turnId, itemId: item.id }] });
-    state.run?.steer(input);
+    await this.steerActive(state, req.input, executableInput(req.input), idempotency);
+  }
+
+  /** Admit one steer against the exact ActiveTurn already selected by the caller. */
+  private async steerActive(
+    state: ActiveTurn,
+    originalInput: InputPart[],
+    input: (InputPart & { type: "text" | "image" })[],
+    idempotency?: IdempotencyReceiptInput,
+  ): Promise<void> {
+    const sessionId = state.session.id;
+    const turnId = state.turn.id;
+    if (this.active.get(sessionId) !== state || state.fenced || state.closingRequested || (state.phase !== "reserved" && state.phase !== "running")) {
+      throw new ApiError("session_busy", "the active turn is no longer accepting steer input", { turnId });
+    }
+
+    const operation = async () => {
+      // The operation was admitted before a step entered `settling`, so that phase is allowed here.
+      // A real stop/ownership change wins over an operation which has not reached its durable write.
+      if (this.active.get(sessionId) !== state || state.fenced || isTurnClosing(state)) {
+        throw new ApiError("session_busy", "the active turn is no longer accepting steer input", { turnId });
+      }
+      const now = Date.now();
+      const item: Item = {
+        id: newId("item"), sessionId, turnId, seq: 0, step: state.step, status: "completed",
+        createdAtMs: now, completedAtMs: now, type: "userMessage", content: originalInput,
+      };
+      try {
+        await this.commit(state, {
+          items: [item],
+          idempotency,
+          events: [
+            { type: "item/completed", sessionId, emittedAtMs: now, item },
+            { type: "turn/steered", sessionId, emittedAtMs: now, turnId, itemId: item.id },
+          ],
+        });
+      } catch (err) {
+        if (err instanceof IdempotencyMismatchError) {
+          throw new ApiError("idempotency_conflict", "this Idempotency-Key was already used for a different request");
+        }
+        if (err instanceof IdempotencyPendingError) {
+          throw new ApiError("idempotency_conflict", "this Idempotency-Key has a legacy request still in progress");
+        }
+        if (
+          err instanceof IdempotencyReplayError
+          && idempotency
+          && err.receipt.value.turnId === turnId
+          && (!err.receipt.requestHash || err.receipt.requestHash === idempotency.requestHash)
+        ) return;
+        throw err;
+      }
+      // A stop request closes admission synchronously but must drain operations already admitted.
+      // Only ownership/storage failure may prevent delivery, and that must reject this request rather
+      // than return a false success after its user item was committed.
+      if (this.active.get(sessionId) !== state || state.fenced || isTurnClosing(state)) {
+        throw new ApiError(
+          state.fenced ? "session_lease_conflict" : "session_busy",
+          "the accepted steer could not be delivered because the turn lost ownership",
+          { turnId },
+        );
+      }
+      if (state.run) state.run.steer(input);
+      else state.pendingSteers.push(input);
+    };
+
+    const admitted = state.steerChain.then(operation, operation);
+    state.steerChain = admitted.catch(() => {});
+    await admitted;
+  }
+
+  /** Close admission synchronously, then wait for every operation already linked into steerChain. */
+  private async settleAdmittedSteers(state: ActiveTurn): Promise<void> {
+    state.closingRequested = true;
+    await state.steerChain;
   }
 
   async interrupt(principal: Principal, sessionId: string, turnId: string): Promise<Turn> {
@@ -895,11 +1160,16 @@ export class SessionHost {
       if (t.status !== "inProgress") return t;
       throw new ApiError("session_lease_conflict", "turn is owned by another runner", await this.ownerDetails(sessionId));
     }
+    const wasReserved = state.phase === "reserved";
     state.stopReason = "interrupted";
+    await this.settleAdmittedSteers(state);
+    if (state.phase === "finished") return (await this.deps.store.getTurn(sessionId, turnId)) ?? state.turn;
+    state.phase = "finishing";
     // Cancel (not decline) pending approvals first, so history records a user interrupt rather than
     // a refusal, then abort. Bounded wait: a wedged engine must not hang the HTTP request.
     this.failPendingApprovals(state, "cancel");
     state.abort.abort();
+    if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch((err) => this.log.error(`[session ${sessionId}] pre-run interrupt cleanup failed`, err));
     await Promise.race([state.done, new Promise((r) => setTimeout(r, 10_000))]);
     return (await this.deps.store.getTurn(sessionId, turnId)) ?? state.turn;
   }
@@ -927,7 +1197,6 @@ export class SessionHost {
    * undefined when nothing was done.
    */
   private async maybeCompact(
-    principal: Principal,
     session: Session,
     fence: number,
     items: Item[],
@@ -938,6 +1207,7 @@ export class SessionHost {
     if (!this.deps.summariser) return undefined;
     const plan = planCompaction(items, { budgetTokens, keepRatio: this.cfg.compactionKeepRatio });
     if (!plan) return undefined;
+    const surfaceLastSeq = session.lastSeq;
     let summary: Awaited<ReturnType<Summariser["summarise"]>>;
     try {
       const work = this.deps.summariser.summarise({
@@ -964,26 +1234,26 @@ export class SessionHost {
       replacesUpToSeq: plan.keepFromSeq - 1, summary: text, usageSnapshot: usage,
     };
     leaseGuard?.assertOwned();
-    const itemCommit = await this.deps.store.commit({
-      sessionId: session.id, fence, items: [item],
-      events: [{ type: "item/completed", sessionId: session.id, emittedAtMs: now, item }],
-    });
-    await this.publishAll(session.id, itemCommit.events);
-    // The watermark is the first KEPT item, not the summary item: projecting from the summary would
-    // also drop the recent turns this plan deliberately preserved.
-    leaseGuard?.assertOwned();
+    const nextSessionUsage = addUsage(session.usage, usage);
+    // Summary item, both durable events, accounting and the projection watermark are one fenced
+    // transaction. A crash or takeover can therefore expose either the old surface or the complete
+    // new surface, never a summary item with a stale watermark.
     const compactCommit = await this.deps.store.commit({
-      sessionId: session.id, fence,
-      events: [{ type: "session/compacted", sessionId: session.id, emittedAtMs: now, itemId: item.id }],
-      sessionPatch: { lastCompactionSeq: plan.keepFromSeq },
+      sessionId: session.id, fence, expectedLastSeq: surfaceLastSeq, items: [item],
+      events: [
+        { type: "item/completed", sessionId: session.id, emittedAtMs: now, item },
+        { type: "session/compacted", sessionId: session.id, emittedAtMs: now, itemId: item.id },
+      ],
+      usageEntries: [{ turnId: item.turnId, step: 0, provider: model.provider, model: model.model, usage, createdAtMs: now }],
+      // The watermark is the first KEPT item, not the summary item: projecting from the summary would
+      // also drop the recent turns this plan deliberately preserved.
+      sessionPatch: { lastCompactionSeq: plan.keepFromSeq, usage: nextSessionUsage },
     });
     await this.publishAll(session.id, compactCommit.events);
     session.lastCompactionSeq = plan.keepFromSeq;
+    session.usage = nextSessionUsage;
     session.lastSeq = compactCommit.lastSeq;
     this.log.info(`[session ${session.id}] compacted ${plan.summarise.length} items (~${plan.droppedTokens} tokens) into a summary; keeping from seq ${plan.keepFromSeq}`);
-    void this.deps.store
-      .appendUsage({ tenantId: principal.tenantId, userId: session.userId, sessionId: session.id, turnId: item.turnId, step: 0, provider: model.provider, model: model.model, usage, createdAtMs: now })
-      .catch(() => {});
     // Re-project from the new watermark so the caller sees exactly what later turns will see.
     const keptWork = this.deps.store.listItems(session.id, { afterSeq: plan.keepFromSeq - 1, limit: MAX_PROJECTED_ITEMS, newestFirst: true });
     const kept = leaseGuard ? await leaseGuard.wait(keptWork) : await keptWork;
@@ -1012,7 +1282,7 @@ export class SessionHost {
       const model = await leaseGuard.wait(this.deps.providers.resolve(principal, agent.model));
       const items = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
       // force a cut by setting the budget below the current size
-      const result = await this.maybeCompact(principal, session, lease.fence, items, model, Math.floor(transcriptTokens(projectItems(items).messages) * 0.5), leaseGuard);
+      const result = await this.maybeCompact(session, lease.fence, items, model, Math.floor(transcriptTokens(projectItems(items).messages) * 0.5), leaseGuard);
       leaseGuard.assertOwned();
       return { compacted: !!result, summaryItemId: result?.itemId };
     } catch (err) {
@@ -1025,7 +1295,19 @@ export class SessionHost {
 
   // ---------------- finishing ----------------
 
-  private async finishTurn(state: ActiveTurn, result: Awaited<EngineRun["done"]>) {
+  private finishTurn(state: ActiveTurn, result: Awaited<EngineRun["done"]>): Promise<void> {
+    if (state.finishPromise) return state.finishPromise;
+    state.closingRequested = true;
+    const finishing = (async () => {
+      await state.steerChain;
+      state.phase = "finishing";
+      await this.finishTurnOnce(state, result);
+    })();
+    state.finishPromise = finishing;
+    return finishing;
+  }
+
+  private async finishTurnOnce(state: ActiveTurn, result: Awaited<EngineRun["done"]>) {
     const sessionId = state.session.id;
     clearTimeout(state.wallClockTimer);
     for (const [, p] of state.pendingApprovals) clearTimeout(p.timer);
@@ -1066,7 +1348,8 @@ export class SessionHost {
     if (state.fenced) {
       this.log.warn(`[session ${sessionId}] turn ${turn.id} ended while fenced out; the new owner will repair the row`);
       state.leaseGuard.stop();
-      this.active.delete(sessionId);
+      if (this.active.get(sessionId) === state) this.active.delete(sessionId);
+      state.phase = "finished";
       state.resolveDone();
       return;
     }
@@ -1082,12 +1365,12 @@ export class SessionHost {
         sessionPatch: { status: { type: "idle" }, usage: state.session.usage },
       });
       turn.seqEnd = r.lastSeq;
-      await this.commit(state, { turn }); // seqEnd is only known after the closing events got their seq
     } catch (err) {
       this.log.error(`[session ${sessionId}] could not persist turn end (${err instanceof Error ? err.message : err}); the next owner will repair`);
     } finally {
       state.leaseGuard.stop();
       if (this.active.get(sessionId) === state) this.active.delete(sessionId);
+      state.phase = "finished";
       state.resolveDone();
       this.scheduleRelease(sessionId);
     }
@@ -1161,7 +1444,15 @@ export class SessionHost {
         await this.publishAll(state.session.id, r.events);
         return r;
       } catch (err) {
-        this.onCommitError(state, err);
+        // These are a normal control-flow result of the atomic turn-start receipt check, not a
+        // storage failure and not evidence that this writer lost ownership.
+        if (
+          !(err instanceof IdempotencyReplayError)
+          && !(err instanceof IdempotencyMismatchError)
+          && !(err instanceof IdempotencyPendingError)
+        ) {
+          this.onCommitError(state, err);
+        }
         throw err;
       }
     };
@@ -1175,23 +1466,33 @@ export class SessionHost {
    * must stop: a stale owner that keeps stepping would execute tools twice and bill twice.
    */
   private onCommitError(state: ActiveTurn, err: unknown) {
+    const wasReserved = state.phase === "reserved";
     if (err instanceof SessionGoneError) {
       this.log.warn(`[session ${state.session.id}] session was deleted mid-turn; stopping turn ${state.turn.id}`);
       state.fenced = true; // same handling: stop writing, stop stepping
+      state.closingRequested = true;
+      state.phase = "finishing";
       state.stopReason = "error";
       state.abort.abort();
       this.failPendingApprovals(state, "cancel");
+      if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
       return;
     }
     if (err instanceof FenceError) {
       if (!state.fenced) this.log.error(`[session ${state.session.id}] fenced out (${err.message}); aborting turn ${state.turn.id}`);
-      state.fenced = true;
-      state.stopReason = "error";
-      state.abort.abort();
-      this.failPendingApprovals(state, "cancel");
     } else {
       this.log.error(`[session ${state.session.id}] commit failed`, err);
     }
+    // An unknown commit outcome is not safe to continue past: executing another model/tool step can
+    // double bill or duplicate side effects. Leave the durable in-progress turn for the next owner to
+    // reconcile instead of trying to finish it from possibly dirty in-memory state.
+    state.fenced = true;
+    state.closingRequested = true;
+    state.phase = "finishing";
+    state.stopReason = "error";
+    state.abort.abort();
+    this.failPendingApprovals(state, "cancel");
+    if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
   }
 
   /** Resolve every waiting approval now. Used on abort, fence loss and drain. */
@@ -1212,12 +1513,31 @@ export class SessionHost {
   /** Stop accepting turns; wait for in-flight turns (up to `timeoutMs`), then abort the rest. */
   async drain(timeoutMs = 30_000) {
     this.draining = true;
+    // A reserved turn has no engine whose `done` promise could ever drive cleanup. Stop it before
+    // entering the grace period; running turns still receive the full graceful-drain window.
+    for (const [, state] of this.active) {
+      if (state.phase !== "reserved") continue;
+      state.stopReason = "interrupted";
+      state.closingRequested = true;
+      void (async () => {
+        await this.settleAdmittedSteers(state);
+        if (state.phase === "finished") return;
+        state.phase = "finishing";
+        state.abort.abort();
+        await this.finishTurn(state, { steps: 0, aborted: true });
+      })().catch((err) => this.log.error(`[session ${state.session.id}] pre-run drain cleanup failed`, err));
+    }
     const deadline = Date.now() + timeoutMs;
     while (this.active.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
     for (const [, s] of this.active) {
       s.stopReason = "interrupted";
-      this.failPendingApprovals(s, "cancel");
-      s.abort.abort();
+      void (async () => {
+        await this.settleAdmittedSteers(s);
+        if (s.phase === "finished") return;
+        s.phase = "finishing";
+        this.failPendingApprovals(s, "cancel");
+        s.abort.abort();
+      })().catch((err) => this.log.error(`[session ${s.session.id}] drain abort failed`, err));
     }
     await Promise.race([
       Promise.all([...this.active.values()].map((s) => s.done)),

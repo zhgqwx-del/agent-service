@@ -71,7 +71,7 @@
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ agent-router（无状态，N 副本）                                              │
 │   1. 鉴权：service key → tenantId；端用户身份 → userId                      │
-│   2. 幂等：Idempotency-Key 预留（Redis）                                    │
+│   2. 幂等：透传 Idempotency-Key；仅对带 key 的 turn POST 允许安全重路由   │
 │   3. 定位：owner:{sessionId} → runnerAddr；无 owner → 一致性哈希 / 最少负载   │
 │   4. 反向代理（SSE 不缓冲）；runner 回 409 lease_conflict → 重查目录重路由一次 │
 │   5. 非 session 类请求（agents/providers/skills CRUD）直接打任意 runner      │
@@ -100,9 +100,10 @@
 │ turns/items  │   │ owner 目录      │   │ 附件/工作区      │   │ kimi/zhipu…   │
 │ events(里程碑)│   │ Streams 热重放  │   │ 冷事件分区       │   │ 自建 vLLM     │
 │ approvals    │   │ 配额/key 池     │   └─────────────────┘   └───────────────┘
-│ agents/skills│   │ 幂等键          │
-│ provider cfg │   │ sharded pub/sub │
-│ usage_ledger │   └────────────────┘
+│ agents/skills│   │ sharded pub/sub │
+│ provider cfg │   └────────────────┘
+│ usage_ledger │
+│ idem receipts│
 └─────────────┘
 ```
 
@@ -144,12 +145,12 @@ MySQL:
 
 runner 处理 `POST /sessions/{id}/turns` 的顺序：
 
-1. 校验租户归属（不属于 → 404，不泄漏存在性）。
-2. 抢租约；失败 → `409 session_lease_conflict`，响应头 `X-Owner: <runnerAddr>`，router 重路由一次。
-3. 从 MySQL 装载 session 投影（最近 compaction 之后的 items），或命中本地热缓存（按 fence 校验）。
-4. 续期协程每 TTL/3 续一次；续期失败 → 立即 abort 当前 turn（fence 已失效，任何写入都会被 DB 拒绝）。
-5. turn 结束（`session.idle`）后租约保留一个短窗口（默认 60s）供下一 turn 命中亲和，之后释放并删 `owner`。
-6. runtime 空闲 N 分钟后从内存回收（修正 PoC 缺陷 #3）。
+1. 校验租户/用户归属（不属于 → 404，不泄漏存在性），并为解析后的 turn 请求计算语义 hash。
+2. 从 MySQL 查 completed receipt；同 key 异 hash → `409 idempotency_conflict`，可直接安全重放时返回原 turn。
+3. 抢租约；失败 → `409 session_lease_conflict`，响应头 `X-Owner: <runnerAddr>`，router 仅在 turn POST 带 `Idempotency-Key` 时重路由。
+4. 获得租约后立即启动 TTL/3 续期，重读 session 和 receipt，必要时修复孤儿 turn；续期失败立即 abort，之后任何写入都会被 fence 拒绝。
+5. 从 MySQL 装载最近 compaction 之后的 items，完成 model/tools/context preflight，再把 turn、首条 user item、events 和 completed receipt 放入同一个 fenced 事务；事务若检测到 legacy pending，则不写入任何数据并返回 `409 idempotency_conflict`。提交后才启动 engine。
+6. turn 结束（`session.idle`）后租约保留一个短窗口（默认 60s）供下一 turn 命中亲和，之后释放并删 `owner`。
 
 ### 4.3 故障场景
 
@@ -185,7 +186,7 @@ runner 处理 `POST /sessions/{id}/turns` 的顺序：
 |---|---|---|
 | Agent 定义（版本化） | `POST/GET /v1/agents`，`GET/PUT /v1/agents/{id}`，`GET /v1/agents/{id}/versions` | `{name, instructions, model, tools[], mcpServers[], skills[], limits, approvalPolicy, sandbox}`；每次 PUT 生成新版本；session 引用 `agentId@version` |
 | Session | `POST /v1/sessions`，`GET /v1/sessions?cursor&limit&userId`，`GET /v1/sessions/{id}`，`DELETE`，`POST .../archive`，`POST .../fork`，`POST .../compact`，`POST .../resume` | `resume` 返回快照 + 游标 + 未决审批（codex 流程） |
-| Turn | `POST /v1/sessions/{id}/turns`（`stream=true` 直接 SSE；`false` 返回 202 + turnId），`GET .../turns`，`GET .../turns/{turnId}`，`POST .../turns/{turnId}/interrupt`，`POST .../turns/{turnId}/steer` | body `{input:[...], model?, limits?, busyPolicy: steer|reject}`；`Idempotency-Key` 建议必填 |
+| Turn | `POST /v1/sessions/{id}/turns`（`stream=true` 直接 SSE；`false` 返回 202 + turnId），`GET .../turns`，`GET .../turns/{turnId}`，`POST .../turns/{turnId}/interrupt`，`POST .../turns/{turnId}/steer` | body `{input:[...], model?, limits?, busyPolicy: steer|reject}`；`Idempotency-Key` 建议必填，作用域是 tenant + user + session；服务端对解析后的请求语义取 hash（`stream` 仅影响传输，不参与 hash），同 key 异请求返回 `409 idempotency_conflict`；命中 completed receipt 时返回 `200 application/json {turn}` + `Idempotency-Replayed: true` |
 | Item | `GET /v1/sessions/{id}/items?turnId&cursor`，`GET .../items/{itemId}/output`（大输出） | 完整消息历史（替代 opencode 的 `GET /session/:id/message`） |
 | Event 流 | `GET /v1/sessions/{id}/events?after=<seq>&exclude=item/reasoning/*` | SSE；`id: <seq>`；`Last-Event-ID` 等价 `after` |
 | 审批 | `GET /v1/sessions/{id}/approvals?pending=true`，`POST /v1/sessions/{id}/approvals/{approvalId}` `{decision}` | decision ∈ `accept | acceptForSession | decline | cancel`；资源含 `expiresAt`、`availableDecisions[]` |
@@ -350,20 +351,22 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `tenants` / `api_keys` / `users` | | 鉴权 |
 | `agents` / `agent_versions` | `(tenant_id, agent_id, version)` | 定义快照，不可变 |
 | `sessions` | `session_id PK, tenant_id, user_id(分片键), agent_id, agent_version, status, fence_token, next_seq, last_compaction_seq, title, parent_session_id, archived_at` | 投影 |
-| `turns` | `turn_id PK, session_id, seq_start, seq_end, status, stop_reason, model, provider, usage(JSON), started_at_ms, completed_at_ms` | |
+| `turns` | `turn_id PK, session_id, seq_start, seq_end, status, stop_reason, model, provider, usage(JSON), metadata(JSON), started_at_ms, completed_at_ms` | turn 完整资源保存在 `body` JSON |
 | `items` | `item_id PK(UUIDv7), session_id, turn_id, seq, type, status, payload(JSON), output_ref(OSS)` | 完整消息历史 |
 | `events` | `(session_id, seq) PK, type, payload(JSON), emitted_at_ms` | 里程碑事件，`>90 天` 分区归档到 OSS |
 | `approvals` | `approval_id PK, session_id, turn_id, item_id, status, decision, expires_at, payload` | 一等资源 |
 | `provider_configs` | `(tenant_id, provider_id)`, `api_key_ciphertext, kms_key_id` | BYOK |
 | `mcp_servers` / `skills` / `skill_versions` | scope ∈ platform/tenant/user | |
-| `usage_ledger` | `(tenant_id, user_id, session_id, turn_id)`, tokens/cache/cost | 计费归因 |
-| `idempotency_keys` | `(tenant_id, key) PK, response_ref, expires_at` | |
+| `usage_ledger` | tenant/user/session/turn/step + tokens/cache/cost；`UNIQUE(session_id, turn_id, step)` | 每个最终 step 恰好一条，计费归因 |
+| `idempotency_keys` | `(tenant_id, user_id, session_id, key) PK, request_hash, response_ref, expires_at` | 新版只写 completed receipt；升级期可暂存 legacy pending |
 
-写路径：先 `events` + `items` 同事务（带 fence 校验）再扇出。`sessions.usage` 用原子 `SET usage = usage + ?`。
+写路径：`SessionStore.commit` 锁定 session 行，校验 fence（长操作再校验 `expectedLastSeq`），把 `events`、`items`、turn/approval、usage ledger、幂等 receipt 与 session 投影放进同一个 MySQL 事务；提交后才向 Redis 扇出。session/turn usage 是该单写者事务内的绝对聚合投影，ledger 是不可重复的明细真相。
+
+滚动升级兼容：迁移保留旧版 runner 写入的 legacy pending receipt；新版命中 pending 时返回 `409 idempotency_conflict`，不得接管或替换，以免旧 runner 随后执行 delayed complete 覆写新版结果。运维上必须先排空并下线全部旧 runner，确认不存在旧进程后，才可清理已过期 pending。新版自身不再创建 pending，只原子写入 completed receipt。
 
 ### 8.2 Redis 键
 
-`lease:{sid}` `fence:{sid}` `owner:{sid}` `stream:{sid}` `idem:{tenant}:{key}` `quota:{scope}:{id}` `keypool:{provider}` `mcp:catalog:{principal}:{serverId}`。
+`lease:{sid}` `fence:{sid}` `owner:{sid}` `stream:{sid}` `quota:{scope}:{id}` `keypool:{provider}` `mcp:catalog:{principal}:{serverId}`。幂等 completed receipt 是 MySQL 业务真相，不在 Redis 预留。
 
 ### 8.3 迁移路径
 
@@ -393,7 +396,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 ```
 agent-service/
 ├── apps/
-│   ├── agent-router/        # Hono；鉴权、幂等、所有权目录、SSE 反代
+│   ├── agent-router/        # Hono；鉴权、所有权目录、幂等 turn 安全重路由、SSE 反代
 │   └── agent-runner/        # Hono；SessionHost、engines、tools、providers、SSE
 ├── packages/
 │   ├── protocol/            # zod schema + OpenAPI 生成 + 事件类型（codex 类型移植，含 NOTICE）

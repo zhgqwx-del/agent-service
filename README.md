@@ -52,6 +52,7 @@ scripts/local-service.sh smoke
 scripts/local-service.sh acceptance   # 使用真实模型，会产生少量费用
 scripts/local-service.sh verify       # secret scan + typecheck + 集成 + coverage + cluster + 构建产物启动
 scripts/local-service.sh verify-real  # 仅在显式命令下读取 .env 的真实模型 key
+scripts/local-service.sh cleanup-idempotency --dry-run  # 检查/分批清理过期 completed receipt
 scripts/local-service.sh stop
 ```
 
@@ -80,6 +81,8 @@ curl -s -X POST localhost:8787/v1/sessions "${H[@]}" -d '{"agentId":"agt_..."}'
 # turn（SSE；id: 为 seq，Last-Event-ID / ?after= 可续订；?exclude= 过滤事件）
 curl -sN -X POST "localhost:8787/v1/sessions/sess_.../turns?exclude=usage/updated" "${H[@]}" -H "Idempotency-Key: k1" -d '{"input":[{"type":"text","text":"现在几点？"}]}'
 # 非流式：{"stream":false} → 202 + turn；之后 GET .../events?after=<seq> 消费
+# 幂等键按 tenant + user + session 隔离；同 key 异请求 → 409。stream 不参与请求 hash；重放命中时固定返回
+# 200 application/json {turn} + Idempotency-Replayed: true，需要事件流时用 GET .../events?after=<seq> 续订。
 # 其他：GET .../items | .../turns | POST .../turns/{id}/interrupt | steer | tool-results（动态工具回填）
 #       GET/POST .../approvals/{id} {decision: accept|acceptForSession|decline|cancel}
 #       GET/PUT/DELETE /v1/providers/{id}（BYOK，apiKey 只写不读，AES-GCM 落库）  GET /v1/models  GET /v1/tools

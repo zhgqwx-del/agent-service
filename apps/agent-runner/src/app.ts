@@ -247,29 +247,14 @@ export function createApp(deps: AppDeps) {
     if (idem) await deps.host.getSession(principal, sessionId);
     const req = await parse(StartTurnRequest, await json(c));
     const exclude = parseExclude(c.req.query("exclude"));
-    const idemScope = { tenantId: principal.tenantId, userId: principal.userId!, sessionId };
-    if (idem) {
-      const r = await deps.store.reserveIdempotencyKey(idemScope, idem, 24 * 3_600_000);
-      if (r.existing) {
-        if (!r.existing.turnId) throw new ApiError("idempotency_conflict", "a request with this key is still in progress");
-        if (r.existing.sessionId !== sessionId) throw new ApiError("idempotency_conflict", "this key was used for a different session");
-        const turn = await deps.store.getTurn(sessionId, r.existing.turnId);
-        if (!turn) throw new ApiError("idempotency_conflict", "the original turn is no longer available");
-        c.header("Idempotency-Replayed", "true");
-        return c.json({ turn }, 200);
-      }
-    }
 
     // Preflight runs BEFORE any stream is opened, so busy / lease / draining / provider failures are
     // real HTTP status codes instead of an error event inside a 200 response.
-    let begun;
-    try {
-      begun = await deps.host.beginTurn(principal, sessionId, req, { idempotencyKey: idem });
-    } catch (err) {
-      if (idem) await deps.store.releaseIdempotencyKey(idemScope, idem).catch(() => {});
-      throw err;
+    const begun = await deps.host.beginTurn(principal, sessionId, req, { idempotencyKey: idem });
+    if (begun.replayed) {
+      c.header("Idempotency-Replayed", "true");
+      return c.json({ turn: begun.turn }, 200);
     }
-    if (idem) await deps.store.completeIdempotencyKey(idemScope, idem, { turnId: begun.turn.id, sessionId });
 
     if (!req.stream) {
       begun.run();

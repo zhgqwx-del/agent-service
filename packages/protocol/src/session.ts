@@ -68,6 +68,8 @@ export const Turn = z.object({
   startedAtMs: z.number().int(),
   completedAtMs: z.number().int().optional(),
   idempotencyKey: z.string().optional(),
+  /** opaque client metadata attached to this turn resource */
+  metadata: z.record(z.unknown()).optional(),
 });
 export type Turn = z.infer<typeof Turn>;
 

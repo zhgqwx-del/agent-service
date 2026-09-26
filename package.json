@@ -27,6 +27,7 @@
     "local:acceptance": "scripts/local-service.sh acceptance",
     "verify": "scripts/local-service.sh verify",
     "verify:real": "scripts/local-service.sh verify-real",
+    "maintenance:cleanup-idempotency": "node scripts/cleanup-idempotency.mjs",
     "test:cluster": "AGENT_SERVICE_CLUSTER=1 vitest run test/cluster",
     "build:check": "pnpm build && node scripts/check-dist-boot.mjs"
   },

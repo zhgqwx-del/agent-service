@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { Event, EventInput, Item, Session, Turn } from "@agent-service/protocol";
 import { emptyUsage } from "@agent-service/protocol";
-import { FenceError, SessionGoneError, type EventBus, type LeaseStore, type SessionStore } from "../src/index.js";
+import {
+  FenceError,
+  IdempotencyMismatchError,
+  IdempotencyReplayError,
+  SessionGoneError,
+  SessionVersionError,
+  type EventBus,
+  type LeaseStore,
+  type SessionStore,
+} from "../src/index.js";
 
 const v7 = () => {
   // test-only uuidv7-ish generator (time prefix + random), matches idSchema regex
@@ -62,6 +71,78 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       await store.close();
     });
 
+    it("rejects a snapshot-derived batch when the session event surface changed", async () => {
+      const store = await make();
+      const s = mkSession();
+      await store.createSession(s);
+      await store.commit({ sessionId: s.id, fence: 1, events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 1 }] });
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 1,
+        expectedLastSeq: 0,
+        events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 2 }],
+        sessionPatch: { title: "stale" },
+      })).rejects.toBeInstanceOf(SessionVersionError);
+      expect(await store.readEvents(s.id, 0, 10)).toHaveLength(1);
+      expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
+      await store.close();
+    });
+
+    it("leaves no partial state when a batch payload cannot be serialized", async () => {
+      const store = await make();
+      const s = mkSession();
+      await store.createSession(s);
+      const details = {} as Record<string, unknown>;
+      Object.defineProperty(details, "invalid", {
+        enumerable: true,
+        get: () => { throw new Error("injected serialization failure"); },
+      });
+      const turn: Turn = {
+        id: newId("turn"), sessionId: s.id, status: "completed", seqStart: 1,
+        steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: 1,
+        completedAtMs: 2, stopReason: "end_turn",
+      };
+      const item: Item = {
+        id: newId("item"), sessionId: s.id, turnId: turn.id, seq: 0,
+        status: "completed", createdAtMs: 1, completedAtMs: 1, type: "toolResult",
+        toolCallId: "call-1", name: "broken", content: [], isError: false, details,
+      };
+      const scope = { tenantId: s.tenantId, userId: s.userId, sessionId: s.id };
+      const idemKey = `bad-${Math.random()}`;
+
+      const events: EventInput[] = [
+        { type: "session/created", sessionId: s.id, emittedAtMs: 1 },
+        { type: "item/completed", sessionId: s.id, emittedAtMs: 2, item },
+        { type: "turn/completed", sessionId: s.id, emittedAtMs: 2, turn, stopReason: "end_turn" },
+      ];
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 7,
+        turn,
+        items: [item],
+        usageEntries: [{ turnId: turn.id, step: 1, provider: "p", model: "m", usage: emptyUsage(), createdAtMs: 1 }],
+        idempotency: {
+          scope, key: idemKey, requestHash: "a".repeat(64),
+          value: { turnId: turn.id, sessionId: s.id }, expiresAtMs: Date.now() + 60_000,
+        },
+        events,
+        sessionPatch: { title: "must roll back" },
+      })).rejects.toThrow("injected serialization failure");
+
+      expect(item.seq).toBe(0);
+      expect(turn.seqEnd).toBeUndefined();
+      expect((events[1] as Extract<EventInput, { type: "item/completed" }>).item.seq).toBe(0);
+      expect((events[2] as Extract<EventInput, { type: "turn/completed" }>).turn.seqEnd).toBeUndefined();
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 0, fenceToken: 0 });
+      expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
+      expect(await store.readEvents(s.id, 0, 10)).toEqual([]);
+      expect(await store.getItem(s.id, item.id)).toBeNull();
+      expect(await store.getTurn(s.id, turn.id)).toBeNull();
+      expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data).toEqual([]);
+      expect(await store.getIdempotencyKey(scope, idemKey)).toBeNull();
+      await store.close();
+    });
+
     it("persists turns/items/approvals atomically with events and applies session patches", async () => {
       const store = await make();
       const s = mkSession();
@@ -90,9 +171,18 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const got = await store.getSession(s.tenantId, s.id);
       expect(got?.status.type).toBe("active");
       expect(got?.title).toBe("T");
-      // upsert path
-      await store.commit({ sessionId: s.id, fence: 1, turn: { ...turn, status: "completed", stopReason: "end_turn", completedAtMs: 2 } });
-      expect((await store.getTurn(s.id, turn.id))?.status).toBe("completed");
+      // upsert path: the store assigns seqEnd inside the same transaction as turn/completed.
+      const completed: Turn = { ...turn, status: "completed", stopReason: "end_turn", completedAtMs: 2 };
+      const completedEvent: EventInput = { type: "turn/completed", sessionId: s.id, emittedAtMs: 2, turn: completed, stopReason: "end_turn" };
+      const ended = await store.commit({
+        sessionId: s.id,
+        fence: 1,
+        turn: completed,
+        events: [completedEvent],
+      });
+      expect(completed.seqEnd).toBe(ended.lastSeq);
+      expect((completedEvent as Extract<EventInput, { type: "turn/completed" }>).turn.seqEnd).toBe(ended.lastSeq);
+      expect(await store.getTurn(s.id, turn.id)).toMatchObject({ status: "completed", seqEnd: ended.lastSeq });
       await store.close();
     });
 
@@ -163,29 +253,81 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       await store.close();
     });
 
-    it("idempotency keys reserve once and replay after completion", async () => {
+    it("commits idempotency receipts atomically with turn creation and rejects replay/mismatch without side effects", async () => {
       const store = await make();
+      const s = mkSession();
+      await store.createSession(s);
       const key = `k-${Math.random()}`;
-      const a = { tenantId: "t_a", userId: "u_a", sessionId: "sess_a" };
-      expect((await store.reserveIdempotencyKey(a, key, 60_000)).existing).toBeNull();
-      expect((await store.reserveIdempotencyKey(a, key, 60_000)).existing).toEqual({ turnId: "", sessionId: "" });
-      await store.completeIdempotencyKey(a, key, { turnId: "turn_x", sessionId: "sess_a" });
-      expect((await store.reserveIdempotencyKey(a, key, 60_000)).existing).toEqual({ turnId: "turn_x", sessionId: "sess_a" });
+      const scope = { tenantId: s.tenantId, userId: s.userId, sessionId: s.id };
+      const hash = "a".repeat(64);
+      const turn: Turn = {
+        id: newId("turn"), sessionId: s.id, status: "inProgress", seqStart: 1,
+        steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: Date.now(), idempotencyKey: key,
+      };
+      await store.commit({
+        sessionId: s.id,
+        fence: 1,
+        turn,
+        events: [{ type: "turn/started", sessionId: s.id, emittedAtMs: 1, turn }],
+        idempotency: { scope, key, requestHash: hash, value: { turnId: turn.id, sessionId: s.id }, expiresAtMs: Date.now() + 60_000 },
+      });
+      expect(await store.getIdempotencyKey(scope, key)).toMatchObject({ requestHash: hash, value: { turnId: turn.id, sessionId: s.id } });
 
-      // The same opaque key is independent for another tenant, user, session, or case-distinct user.
-      for (const scope of [
-        { ...a, tenantId: "t_b" },
-        { ...a, userId: "u_b" },
-        { ...a, userId: "U_A" },
-        { ...a, sessionId: "sess_b" },
-      ]) {
-        expect((await store.reserveIdempotencyKey(scope, key, 60_000)).existing).toBeNull();
-      }
-      // a failed request releases its reservation so the client may retry with the same key
-      const k2 = `k2-${Math.random()}`;
-      expect((await store.reserveIdempotencyKey(a, k2, 60_000)).existing).toBeNull();
-      await store.releaseIdempotencyKey(a, k2);
-      expect((await store.reserveIdempotencyKey(a, k2, 60_000)).existing).toBeNull();
+      const duplicate: Turn = { ...turn, id: newId("turn"), seqStart: 2 };
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 2,
+        turn: duplicate,
+        events: [{ type: "turn/started", sessionId: s.id, emittedAtMs: 2, turn: duplicate }],
+        sessionPatch: { title: "must roll back" },
+        idempotency: { scope, key, requestHash: hash, value: { turnId: duplicate.id, sessionId: s.id }, expiresAtMs: Date.now() + 60_000 },
+      })).rejects.toBeInstanceOf(IdempotencyReplayError);
+      expect(await store.getTurn(s.id, duplicate.id)).toBeNull();
+      expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
+      expect(await store.readEvents(s.id, 0, 100)).toHaveLength(1);
+
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 2,
+        idempotency: { scope, key, requestHash: "b".repeat(64), value: { turnId: duplicate.id, sessionId: s.id }, expiresAtMs: Date.now() + 60_000 },
+      })).rejects.toBeInstanceOf(IdempotencyMismatchError);
+      await store.close();
+    });
+
+    it("commits usage with its event/projection and rolls the whole batch back on a duplicate", async () => {
+      const store = await make();
+      const s = mkSession();
+      await store.createSession(s);
+      const turnId = newId("turn");
+      const usage = { ...emptyUsage(), inputTokens: 3, outputTokens: 2, totalTokens: 5 };
+      await store.commit({
+        sessionId: s.id,
+        fence: 1,
+        events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 1 }],
+        usageEntries: [{ turnId, step: 1, provider: "p", model: "m", usage, createdAtMs: 1 }],
+        sessionPatch: { title: "committed", usage },
+      });
+      expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({ steps: 1, usage: { totalTokens: 5 } });
+
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 2,
+        events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 2 }],
+        usageEntries: [{ turnId, step: 1, provider: "p", model: "m", usage, createdAtMs: 2 }],
+        sessionPatch: { title: "must roll back", usage: { ...usage, totalTokens: 10 } },
+      })).rejects.toThrow();
+
+      const after = await store.getSession(s.tenantId, s.id);
+      expect(after).toMatchObject({ title: "committed", lastSeq: 1, fenceToken: 1, usage: { totalTokens: 5 } });
+      expect(await store.readEvents(s.id, 0, 100)).toHaveLength(1);
+      expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({ steps: 1, usage: { totalTokens: 5 } });
+
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 0,
+        usageEntries: [{ turnId: newId("turn"), step: 1, provider: "p", model: "m", usage, createdAtMs: 3 }],
+      })).rejects.toBeInstanceOf(FenceError);
+      expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]?.steps).toBe(1);
       await store.close();
     });
 
@@ -221,9 +363,10 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       expect(await store.getProviderConfig(tenantLower, "ProviderCase")).toBeNull();
 
       for (const [providerId, modelId, turnId] of [["ProviderCase", "ModelCase", "TurnCase"], ["providercase", "modelcase", "turncase"]] as const) {
-        await store.appendUsage({
-          tenantId: tenantUpper, userId: "UserCase", sessionId: session.id, turnId, step: 1,
-          provider: providerId, model: modelId, usage: { ...emptyUsage(), totalTokens: 1 }, createdAtMs: Date.now(),
+        await store.commit({
+          sessionId: session.id,
+          fence: 1,
+          usageEntries: [{ turnId, step: 1, provider: providerId, model: modelId, usage: { ...emptyUsage(), totalTokens: 1 }, createdAtMs: Date.now() }],
         });
       }
       expect((await store.queryUsage(tenantUpper, { userId: "usercase", groupBy: "total", limit: 100 })).data).toEqual([]);

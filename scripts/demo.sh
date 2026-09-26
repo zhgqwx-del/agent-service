@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 手动验收脚本：把 agent-runner 的主要能力跑一遍并打印可读结果。
+# 手动验收脚本：通过 runner 或 router 把主要能力跑一遍并打印可读结果。
 #
 #   deploy/local/infra.sh start          # 先起 redis + mysql
 #   scripts/demo.sh                      # 全流程
@@ -26,13 +26,13 @@ jqp() { "$PY" -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
 
 # ---------- 0. 前置检查 ----------
 say "0. 前置检查"
-if ! curl -fsS "$BASE/healthz" >/dev/null 2>&1; then
-  bad "runner 未在 $BASE 运行。请在另一个终端执行："
+if ! curl -fsS "$BASE/readyz" >/dev/null 2>&1; then
+  bad "服务未在 $BASE ready。请在另一个终端执行："
   echo "      STORE=mysql REDIS_URL=redis://127.0.0.1:6379 pnpm dev:runner"
   echo "   （纯内存模式：pnpm dev:runner）"
   exit 1
 fi
-ok "runner 存活：$(curl -fsS "$BASE/healthz")"
+ok "服务就绪：$(curl -fsS "$BASE/readyz")"
 CAPS=$(curl -fsS "$BASE/v1/capabilities")
 ok "协议版本 $(echo "$CAPS" | jqp 'd["protocolVersion"]')，BYOK=$(echo "$CAPS" | jqp 'd["features"]["byok"]')"
 
@@ -89,7 +89,7 @@ ok "以上 id 均应 > $MID"
 
 # ---------- 6. 幂等 ----------
 say "6. 幂等重放（同一 Idempotency-Key）"
-RESP=$(curl -fsS -i -X POST "$BASE/v1/sessions/$SID/turns" "${H[@]}" -H "Idempotency-Key: demo-$SID-1" -d '{"input":[{"type":"text","text":"这条不该再跑一次"}],"stream":false}')
+RESP=$(curl -fsS -i -X POST "$BASE/v1/sessions/$SID/turns" "${H[@]}" -H "Idempotency-Key: demo-$SID-1" -d '{"input":[{"type":"text","text":"现在几点了？用一句话告诉我，并说明今天星期几。"}],"stream":false}')
 echo "$RESP" | grep -iE '^(HTTP|idempotency-replayed)' | sed 's/^/  /'
 echo "$RESP" | grep -qi 'idempotency-replayed: true' && ok "命中幂等，未重复执行" || bad "未命中幂等"
 

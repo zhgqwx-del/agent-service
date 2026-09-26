@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { Redis } from "ioredis";
 import mysql, { type RowDataPacket } from "mysql2/promise";
-import { MysqlSessionStore, RedisEventBus, RedisLeaseStore } from "../src/index.js";
-import { eventBusConformance, leaseStoreConformance, sessionStoreConformance } from "./conformance.js";
+import { IdempotencyPendingError, MysqlSessionStore, RedisEventBus, RedisLeaseStore } from "../src/index.js";
+import { eventBusConformance, leaseStoreConformance, mkSession, newId, sessionStoreConformance } from "./conformance.js";
 
 const MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const REDIS_URL = process.env.REDIS_TEST_URL ?? "redis://127.0.0.1:6379/1";
@@ -22,6 +22,51 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
   eventBusConformance("redis", async () => new RedisEventBus(REDIS_URL, { prefix: "test" }));
 
   describe("mysql migrations", () => {
+    it.each([
+      ["unexpired", 60_000],
+      ["expired", -60_000],
+    ])("does not replace an %s legacy pending idempotency row", async (_label, expiryOffsetMs) => {
+      const store = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 2 });
+      const conn = await mysql.createConnection(MYSQL_URL);
+      const session = mkSession();
+      const key = `legacy-${newId("key")}`;
+      const expiresAt = Date.now() + expiryOffsetMs;
+      try {
+        await store.createSession(session);
+        await conn.query(
+          "INSERT INTO idempotency_keys (tenant_id, user_id, session_id, idem_key, request_hash, value, expires_at_ms) VALUES (?,?,?,?,NULL,NULL,?)",
+          [session.tenantId, session.userId, session.id, key, expiresAt],
+        );
+        const scope = { tenantId: session.tenantId, userId: session.userId, sessionId: session.id };
+
+        await expect(store.commit({
+          sessionId: session.id,
+          fence: 1,
+          events: [{ type: "session/created", sessionId: session.id, emittedAtMs: 1 }],
+          sessionPatch: { title: "must not commit" },
+          idempotency: {
+            scope,
+            key,
+            requestHash: "a".repeat(64),
+            value: { sessionId: session.id, turnId: newId("turn") },
+            expiresAtMs: Date.now() + 60_000,
+          },
+        })).rejects.toBeInstanceOf(IdempotencyPendingError);
+
+        const [pending] = await conn.query<(RowDataPacket & { value: unknown; request_hash: string | null; expires_at_ms: number })[]>(
+          "SELECT value, request_hash, expires_at_ms FROM idempotency_keys WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=?",
+          [session.tenantId, session.userId, session.id, key],
+        );
+        expect(pending[0]).toMatchObject({ value: null, request_hash: null, expires_at_ms: expiresAt });
+        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 0, lastSeq: 0 });
+        expect((await store.getSession(session.tenantId, session.id))?.title).toBeUndefined();
+        expect(await store.readEvents(session.id, 0, 10)).toEqual([]);
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
     it("uses case-sensitive collations for every ownership and logical-id column", async () => {
       const store = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 2 });
       const conn = await mysql.createConnection(MYSQL_URL);
@@ -55,6 +100,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             ORDER BY seq_in_index`,
         );
         expect(pk.map((r) => r.column_name)).toEqual(["tenant_id", "user_id", "session_id", "idem_key"]);
+        expect(byColumn.get("idempotency_keys.request_hash")).toBe("utf8mb4_0900_as_cs");
+
+        const [usageIdentity] = await conn.query<(RowDataPacket & { column_name: string; non_unique: number })[]>(
+          `SELECT COLUMN_NAME AS column_name, NON_UNIQUE AS non_unique
+             FROM information_schema.statistics
+            WHERE table_schema = DATABASE() AND table_name = 'usage_ledger' AND index_name = 'uk_usage_session_turn_step'
+            ORDER BY seq_in_index`,
+        );
+        expect(usageIdentity.map((r) => r.column_name)).toEqual(["session_id", "turn_id", "step"]);
+        expect(usageIdentity.every((r) => Number(r.non_unique) === 0)).toBe(true);
+
+        const [expiryIndex] = await conn.query<(RowDataPacket & { column_name: string })[]>(
+          `SELECT COLUMN_NAME AS column_name
+             FROM information_schema.statistics
+            WHERE table_schema = DATABASE() AND table_name = 'idempotency_keys' AND index_name = 'idx_idempotency_expires'
+            ORDER BY seq_in_index`,
+        );
+        expect(expiryIndex.map((r) => r.column_name)).toEqual(["expires_at_ms"]);
       } finally {
         await conn.end();
         await store.close();

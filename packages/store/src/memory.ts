@@ -15,13 +15,21 @@ import type {
 import { DEFAULT_AUTH_POLICY, DEFAULT_SCOPES, addUsage, emptyUsage } from "@agent-service/protocol";
 import {
   FenceError,
+  IdempotencyMismatchError,
+  IdempotencyPendingError,
+  IdempotencyReplayError,
   SessionGoneError,
+  SessionVersionError,
   assignItemSeqs,
+  assignTurnSeqEnd,
+  backfillAssignedSequences,
   type BlobStore,
   type CommitBatch,
   type CommitResult,
   type EventBus,
   type EventListener,
+  type IdempotencyReceipt,
+  type IdempotencyReceiptValue,
   type IdempotencyScope,
   type LeaseAcquireResult,
   type LeaseConflict,
@@ -53,7 +61,7 @@ export class MemorySessionStore implements SessionStore {
   events = new Map<string, PersistedEvent[]>();
   providers = new Map<string, { config: ProviderConfig; secret?: { ciphertext: Buffer; keyId: string } }>();
   apiKeys = new Map<string, { tenantId: string; keyId: string; scopes: ApiKeyScope[]; createdAtMs?: number; revokedAtMs?: number }>();
-  idem = new Map<string, { value: { turnId: string; sessionId: string } | null; expiresAt: number }>();
+  idem = new Map<string, { value: IdempotencyReceiptValue | null; requestHash?: string; expiresAt: number }>();
   deleted = new Set<string>();
   tenants = new Map<string, TenantRecord>();
 
@@ -102,23 +110,78 @@ export class MemorySessionStore implements SessionStore {
     const s = this.sessions.get(batch.sessionId);
     if (!s || this.deleted.has(batch.sessionId)) throw new SessionGoneError(batch.sessionId);
     if (batch.fence < s.fenceToken) throw new FenceError(batch.sessionId, batch.fence, s.fenceToken);
-    s.fenceToken = batch.fence;
-    const log = this.events.get(batch.sessionId)!;
+    if (batch.expectedLastSeq !== undefined && batch.expectedLastSeq !== s.lastSeq) {
+      throw new SessionVersionError(batch.sessionId, batch.expectedLastSeq, s.lastSeq);
+    }
+
+    // Validate every fallible invariant before mutating any map. This gives the in-memory reference
+    // implementation the same all-or-nothing semantics as the MySQL transaction.
+    let idemMapKey: string | undefined;
+    if (batch.idempotency) {
+      const receipt = batch.idempotency;
+      if (receipt.scope.tenantId !== s.tenantId || receipt.scope.userId !== s.userId || receipt.scope.sessionId !== s.id) {
+        throw new Error("idempotency scope does not match the session");
+      }
+      idemMapKey = this.idempotencyMapKey(receipt.scope, receipt.key);
+      const cur = this.idem.get(idemMapKey);
+      // Never replace a legacy reservation, even after its nominal expiry. An old runner may resume
+      // and complete it with an unconditional update, corrupting a receipt written in its place.
+      if (cur?.value === null) throw new IdempotencyPendingError(cur.expiresAt);
+      if (cur && cur.expiresAt >= Date.now() && cur.value) {
+        const stored: IdempotencyReceipt = { requestHash: cur.requestHash, value: clone(cur.value), expiresAtMs: cur.expiresAt };
+        if (!stored.requestHash || stored.requestHash === receipt.requestHash) throw new IdempotencyReplayError(stored);
+        throw new IdempotencyMismatchError(stored);
+      }
+    }
+    const stagedUsage: UsageLedgerEntry[] = (batch.usageEntries ?? []).map((entry) => ({
+      ...clone(entry), tenantId: s.tenantId, userId: s.userId, sessionId: s.id,
+    }));
+    const usageKeys = new Set(this.usageLedger.map((entry) => JSON.stringify([entry.sessionId, entry.turnId, entry.step])));
+    for (const entry of stagedUsage) {
+      const key = JSON.stringify([entry.sessionId, entry.turnId, entry.step]);
+      if (usageKeys.has(key)) throw new Error(`duplicate usage entry for turn ${entry.turnId} step ${entry.step}`);
+      usageKeys.add(key);
+    }
+
     let seq = s.lastSeq;
     const out: PersistedEvent[] = [];
     for (const e of batch.events ?? []) {
       seq += 1;
       out.push({ ...e, seq } as PersistedEvent);
     }
-    assignItemSeqs(batch.items, out, seq);
-    for (const pe of out) log.push(clone(pe));
+
+    // `Item.args`, tool-result `details`, and session metadata are intentionally typed as unknown.
+    // Clone the entire write-set before changing persistent state so an uncloneable value cannot
+    // leave a partial event log (or advance the fence without advancing lastSeq).
+    const stagedEvents = out.map(clone);
+    const stagedItems = (batch.items ?? []).map(clone);
+    const stagedTurn = batch.turn ? clone(batch.turn) : undefined;
+    const stagedApprovals = (batch.approvals ?? []).map(clone);
+    const stagedIdempotencyValue = batch.idempotency ? clone(batch.idempotency.value) : undefined;
+    const stagedSessionPatch = batch.sessionPatch ? clone(batch.sessionPatch) : undefined;
+    assignItemSeqs(stagedItems, stagedEvents, seq);
+    assignTurnSeqEnd(stagedTurn, stagedEvents, seq);
+    const resultEvents = stagedEvents.map(clone);
+
+    s.fenceToken = batch.fence;
+    const log = this.events.get(batch.sessionId)!;
+    log.push(...stagedEvents);
     s.lastSeq = seq;
-    for (const it of batch.items ?? []) this.items.set(it.id, clone(it));
-    if (batch.turn) this.turns.set(batch.turn.id, clone(batch.turn));
-    for (const a of batch.approvals ?? []) this.approvals.set(a.id, clone(a));
-    if (batch.sessionPatch) Object.assign(s, clone(batch.sessionPatch));
+    for (const it of stagedItems) this.items.set(it.id, it);
+    if (stagedTurn) this.turns.set(stagedTurn.id, stagedTurn);
+    for (const a of stagedApprovals) this.approvals.set(a.id, a);
+    this.usageLedger.push(...stagedUsage);
+    if (batch.idempotency && idemMapKey && stagedIdempotencyValue) {
+      this.idem.set(idemMapKey, {
+        value: stagedIdempotencyValue,
+        requestHash: batch.idempotency.requestHash,
+        expiresAt: batch.idempotency.expiresAtMs,
+      });
+    }
+    if (stagedSessionPatch) Object.assign(s, stagedSessionPatch);
     s.updatedAtMs = Date.now();
-    return { events: out.map(clone), lastSeq: seq };
+    backfillAssignedSequences(batch, { items: stagedItems, turn: stagedTurn, events: stagedEvents });
+    return { events: resultEvents, lastSeq: seq };
   }
 
   async readEvents(sessionId: string, afterSeq: number, limit: number) {
@@ -208,10 +271,6 @@ export class MemorySessionStore implements SessionStore {
   }
 
   usageLedger: UsageLedgerEntry[] = [];
-  async appendUsage(entry: UsageLedgerEntry) {
-    this.usageLedger.push(clone(entry));
-  }
-
   async queryUsage(tenantId: string, q: UsageQuery) {
     const rows = this.usageLedger.filter(
       (e) =>
@@ -249,23 +308,11 @@ export class MemorySessionStore implements SessionStore {
     return JSON.stringify([scope.tenantId, scope.userId, scope.sessionId, key]);
   }
 
-  async reserveIdempotencyKey(scope: IdempotencyScope, key: string, ttlMs: number) {
+  async getIdempotencyKey(scope: IdempotencyScope, key: string): Promise<IdempotencyReceipt | null> {
     const k = this.idempotencyMapKey(scope, key);
     const cur = this.idem.get(k);
-    if (cur && cur.expiresAt > Date.now()) return { existing: cur.value ?? { turnId: "", sessionId: "" } };
-    this.idem.set(k, { value: null, expiresAt: Date.now() + ttlMs });
-    return { existing: null };
-  }
-  async releaseIdempotencyKey(scope: IdempotencyScope, key: string) {
-    const k = this.idempotencyMapKey(scope, key);
-    const cur = this.idem.get(k);
-    if (cur && cur.value === null) this.idem.delete(k);
-  }
-
-  async completeIdempotencyKey(scope: IdempotencyScope, key: string, value: { turnId: string; sessionId: string }) {
-    const k = this.idempotencyMapKey(scope, key);
-    const cur = this.idem.get(k);
-    if (cur) cur.value = value;
+    if (!cur || cur.expiresAt < Date.now() || !cur.value) return null;
+    return { requestHash: cur.requestHash, value: clone(cur.value), expiresAtMs: cur.expiresAt };
   }
 
   async close() {}

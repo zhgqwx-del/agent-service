@@ -163,8 +163,14 @@ verify_real() {
   AGENT_SERVICE_REAL_E2E=1 pnpm vitest run packages/providers/test/e2e-qwen.test.ts
 }
 
+cleanup_idempotency() {
+  require_tools
+  [ -n "${MYSQL_URL:-}" ] || die "MYSQL_URL is empty in .env/environment"
+  node scripts/cleanup-idempotency.mjs "$@"
+}
+
 usage() {
-  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-real|down"
+  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-real|cleanup-idempotency|down"
 }
 
 case "${1:-}" in
@@ -177,6 +183,7 @@ case "${1:-}" in
   acceptance) BASE="$ROUTER_URL" scripts/demo.sh ;;
   verify) verify ;;
   verify-real) verify_real ;;
+  cleanup-idempotency) shift; cleanup_idempotency "$@" ;;
   down) stop_apps; deploy/local/infra.sh stop ;;
   *) usage; exit 1 ;;
 esac

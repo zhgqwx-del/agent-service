@@ -4,7 +4,25 @@ import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import type { AgentDefinition, ApiKeyScope, Approval, Item, PersistedEvent, ProviderConfig, Session, TenantAuthPolicy, Turn, UsageQuery } from "@agent-service/protocol";
 import { DEFAULT_AUTH_POLICY, DEFAULT_SCOPES } from "@agent-service/protocol";
-import { FenceError, SessionGoneError, assignItemSeqs, type CommitBatch, type CommitResult, type Page, type ApiKeyRecord, type IdempotencyScope, type SessionStore, type TenantRecord, type UsageLedgerEntry } from "../types.js";
+import {
+  FenceError,
+  IdempotencyMismatchError,
+  IdempotencyPendingError,
+  IdempotencyReplayError,
+  SessionGoneError,
+  SessionVersionError,
+  assignItemSeqs,
+  assignTurnSeqEnd,
+  backfillAssignedSequences,
+  type ApiKeyRecord,
+  type CommitBatch,
+  type CommitResult,
+  type IdempotencyReceipt,
+  type IdempotencyScope,
+  type Page,
+  type SessionStore,
+  type TenantRecord,
+} from "../types.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -210,30 +228,96 @@ export class MysqlSessionStore implements SessionStore {
     try {
       await conn.beginTransaction();
       const [rows] = await conn.query<Row[]>(
-        "SELECT user_id, last_seq, fence_token, deleted_at_ms FROM sessions WHERE session_id=? FOR UPDATE",
+        "SELECT tenant_id, user_id, last_seq, fence_token, deleted_at_ms FROM sessions WHERE session_id=? FOR UPDATE",
         [batch.sessionId],
       );
       const head = rows[0];
       if (!head || head.deleted_at_ms != null) throw new SessionGoneError(batch.sessionId);
       const currentFence = Number(head.fence_token);
       if (batch.fence < currentFence) throw new FenceError(batch.sessionId, batch.fence, currentFence);
+      const currentLastSeq = Number(head.last_seq);
+      if (batch.expectedLastSeq !== undefined && batch.expectedLastSeq !== currentLastSeq) {
+        throw new SessionVersionError(batch.sessionId, batch.expectedLastSeq, currentLastSeq);
+      }
+      const tenantId = head.tenant_id as string;
       const userId = head.user_id as string;
-      let seq = Number(head.last_seq);
+
+      // A completed idempotency receipt and the first turn write share this transaction. There is no
+      // pending reservation: a process that dies during preflight therefore leaves nothing to poison
+      // retries. The locked session row serialises all conforming writers for this scope.
+      if (batch.idempotency) {
+        const receipt = batch.idempotency;
+        if (receipt.scope.tenantId !== tenantId || receipt.scope.userId !== userId || receipt.scope.sessionId !== batch.sessionId) {
+          throw new Error("idempotency scope does not match the locked session");
+        }
+        const keyParams = [tenantId, userId, batch.sessionId, receipt.key];
+        const [idemRows] = await conn.query<Row[]>(
+          "SELECT value, request_hash, expires_at_ms FROM idempotency_keys WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=? FOR UPDATE",
+          keyParams,
+        );
+        const existing = idemRows[0];
+        const now = Date.now();
+        // A legacy runner completes a reservation with an unconditional UPDATE by primary key. Do
+        // not replace even an expired pending row: that delayed UPDATE could otherwise overwrite the
+        // new completed receipt. Operations may delete pending rows after all legacy runners exit.
+        if (existing && existing.value == null) {
+          throw new IdempotencyPendingError(Number(existing.expires_at_ms));
+        }
+        if (existing && Number(existing.expires_at_ms) >= now && existing.value != null) {
+          const stored: IdempotencyReceipt = {
+            requestHash: existing.request_hash == null ? undefined : String(existing.request_hash),
+            value: parse(existing.value),
+            expiresAtMs: Number(existing.expires_at_ms),
+          };
+          if (!stored.requestHash || stored.requestHash === receipt.requestHash) throw new IdempotencyReplayError(stored);
+          throw new IdempotencyMismatchError(stored);
+        }
+        // New code never creates pending rows. An expired completed receipt is safe to replace.
+        if (existing) {
+          await conn.query(
+            "DELETE FROM idempotency_keys WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=?",
+            keyParams,
+          );
+        }
+      }
+
+      let seq = currentLastSeq;
       const events: PersistedEvent[] = [];
       for (const e of batch.events ?? []) {
         seq += 1;
-        events.push({ ...e, seq } as PersistedEvent);
+        const event = { ...e, seq } as PersistedEvent;
+        // Only sequence-bearing nested resources are mutated below. Copy those resource objects so
+        // a later SQL/serialization failure cannot leak an assigned seq into the caller's batch.
+        if (event.type === "item/started" || event.type === "item/completed") event.item = { ...event.item };
+        if (event.type === "turn/completed") event.turn = { ...event.turn };
+        events.push(event);
       }
-      assignItemSeqs(batch.items, events, seq);
+      const items = batch.items?.map((item) => ({ ...item }));
+      const turn = batch.turn ? { ...batch.turn } : undefined;
+      assignItemSeqs(items, events, seq);
+      assignTurnSeqEnd(turn, events, seq);
       if (events.length) {
         await conn.query(
           "INSERT INTO events (session_id, seq, user_id, type, body, emitted_at_ms) VALUES ?",
           [events.map((e) => [batch.sessionId, e.seq, userId, e.type, json(e), e.emittedAtMs])],
         );
       }
-      for (const it of batch.items ?? []) await upsertItem(conn, it, userId);
-      if (batch.turn) await upsertTurn(conn, batch.turn, userId);
+      for (const it of items ?? []) await upsertItem(conn, it, userId);
+      if (turn) await upsertTurn(conn, turn, userId);
       for (const a of batch.approvals ?? []) await upsertApproval(conn, a, userId);
+      if (batch.usageEntries?.length) {
+        await conn.query(
+          "INSERT INTO usage_ledger (tenant_id, user_id, session_id, turn_id, step, provider, model, usage_json, created_at_ms) VALUES ?",
+          [batch.usageEntries.map((e) => [tenantId, userId, batch.sessionId, e.turnId, e.step, e.provider, e.model, json(e.usage), e.createdAtMs])],
+        );
+      }
+      if (batch.idempotency) {
+        const receipt = batch.idempotency;
+        await conn.query(
+          "INSERT INTO idempotency_keys (tenant_id, user_id, session_id, idem_key, request_hash, value, expires_at_ms) VALUES (?,?,?,?,?,?,?)",
+          [tenantId, userId, batch.sessionId, receipt.key, receipt.requestHash, json(receipt.value), receipt.expiresAtMs],
+        );
+      }
 
       const sets = ["last_seq=?", "fence_token=?", "updated_at_ms=?"];
       const params: unknown[] = [seq, batch.fence, Date.now()];
@@ -251,6 +335,7 @@ export class MysqlSessionStore implements SessionStore {
       params.push(batch.sessionId);
       await conn.query(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id=?`, params);
       await conn.commit();
+      backfillAssignedSequences(batch, { items, turn, events });
       return { events, lastSeq: seq };
     } catch (err) {
       await conn.rollback().catch(() => {});
@@ -399,13 +484,6 @@ export class MysqlSessionStore implements SessionStore {
   }
 
   // ---------- usage ledger ----------
-  async appendUsage(e: UsageLedgerEntry) {
-    await this.pool.query(
-      "INSERT INTO usage_ledger (tenant_id, user_id, session_id, turn_id, step, provider, model, usage_json, created_at_ms) VALUES (?,?,?,?,?,?,?,?,?)",
-      [e.tenantId, e.userId, e.sessionId, e.turnId, e.step, e.provider, e.model, json(e.usage), e.createdAtMs],
-    );
-  }
-
   async queryUsage(tenantId: string, q: UsageQuery) {
     // Grouping keys are chosen from a fixed set, never interpolated from input.
     const keyExpr =
@@ -458,44 +536,18 @@ export class MysqlSessionStore implements SessionStore {
   }
 
   // ---------- idempotency ----------
-  async reserveIdempotencyKey(scope: IdempotencyScope, key: string, ttlMs: number) {
-    const now = Date.now();
-    const params = [scope.tenantId, scope.userId, scope.sessionId, key];
-    try {
-      await this.pool.query(
-        "INSERT INTO idempotency_keys (tenant_id, user_id, session_id, idem_key, value, expires_at_ms) VALUES (?,?,?,?,NULL,?)",
-        [...params, now + ttlMs],
-      );
-      return { existing: null };
-    } catch (err) {
-      if ((err as { code?: string }).code !== "ER_DUP_ENTRY") throw err;
-      const [rows] = await this.pool.query<Row[]>(
-        "SELECT value, expires_at_ms FROM idempotency_keys WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=?",
-        params,
-      );
-      const r = rows[0];
-      if (!r || Number(r.expires_at_ms) < now) {
-        await this.pool.query(
-          "REPLACE INTO idempotency_keys (tenant_id, user_id, session_id, idem_key, value, expires_at_ms) VALUES (?,?,?,?,NULL,?)",
-          [...params, now + ttlMs],
-        );
-        return { existing: null };
-      }
-      return { existing: r.value ? parse<{ turnId: string; sessionId: string }>(r.value) : { turnId: "", sessionId: "" } };
-    }
-  }
-  async releaseIdempotencyKey(scope: IdempotencyScope, key: string) {
-    await this.pool.query(
-      "DELETE FROM idempotency_keys WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=? AND value IS NULL",
+  async getIdempotencyKey(scope: IdempotencyScope, key: string): Promise<IdempotencyReceipt | null> {
+    const [rows] = await this.pool.query<Row[]>(
+      "SELECT value, request_hash, expires_at_ms FROM idempotency_keys WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=?",
       [scope.tenantId, scope.userId, scope.sessionId, key],
     );
-  }
-
-  async completeIdempotencyKey(scope: IdempotencyScope, key: string, value: { turnId: string; sessionId: string }) {
-    await this.pool.query(
-      "UPDATE idempotency_keys SET value=? WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=?",
-      [json(value), scope.tenantId, scope.userId, scope.sessionId, key],
-    );
+    const row = rows[0];
+    if (!row || row.value == null || Number(row.expires_at_ms) < Date.now()) return null;
+    return {
+      requestHash: row.request_hash == null ? undefined : String(row.request_hash),
+      value: parse(row.value),
+      expiresAtMs: Number(row.expires_at_ms),
+    };
   }
 
   async close() {

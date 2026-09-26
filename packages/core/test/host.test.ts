@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { ApiError, emptyUsage, type AgentDefinition, type Event, type Principal } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { addUsage, ApiError, emptyUsage, type AgentDefinition, type Event, type Principal, type Usage } from "@agent-service/protocol";
+import { IdempotencyPendingError, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, SessionVersionError, type CommitBatch } from "@agent-service/store";
 import {
   SessionHost,
   StaticToolRegistry,
   newId,
   projectItems,
+  sha256,
+  stableStringify,
   type ProviderResolver,
   type ResolvedModel,
   type RunnerTool,
@@ -46,6 +48,7 @@ afterEach(async () => {
 });
 
 interface SetupExtras {
+  store?: MemorySessionStore;
   lease?: MemoryLeaseStore;
   bus?: MemoryEventBus;
   providers?: ProviderResolver;
@@ -53,7 +56,7 @@ interface SetupExtras {
 }
 
 async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> = {}, cfg: Partial<SessionHostDeps["config"]> = {}, extras: SetupExtras = {}) {
-  const store = new MemorySessionStore();
+  const store = extras.store ?? new MemorySessionStore();
   const lease = extras.lease ?? new MemoryLeaseStore();
   const bus = extras.bus ?? new MemoryEventBus();
   const engine = new ScriptedEngine(script);
@@ -117,21 +120,129 @@ class DroppingEventBus extends MemoryEventBus {
   }
 }
 
+class RecordingStore extends MemorySessionStore {
+  commits: CommitBatch[] = [];
+
+  override async commit(batch: CommitBatch) {
+    this.commits.push(structuredClone(batch));
+    return super.commit(batch);
+  }
+}
+
+class FailingCompactionStore extends MemorySessionStore {
+  override async commit(batch: CommitBatch) {
+    if (batch.items?.some((item) => item.type === "contextCompaction")) throw new Error("injected compaction write failure");
+    return super.commit(batch);
+  }
+}
+
+class AmbiguousIdempotencyStore extends MemorySessionStore {
+  failOnce = true;
+
+  override async commit(batch: CommitBatch) {
+    const result = await super.commit(batch);
+    if (batch.idempotency && this.failOnce) {
+      this.failOnce = false;
+      throw new Error("injected lost commit acknowledgement");
+    }
+    return result;
+  }
+}
+
+class BlockingTurnEndStore extends MemorySessionStore {
+  private releaseEnd!: () => void;
+  readonly endGate = new Promise<void>((resolve) => { this.releaseEnd = resolve; });
+  private markEnding!: () => void;
+  readonly ending = new Promise<void>((resolve) => { this.markEnding = resolve; });
+
+  release() {
+    this.releaseEnd();
+  }
+
+  override async commit(batch: CommitBatch) {
+    if (batch.events?.some((event) => event.type === "turn/completed")) {
+      this.markEnding();
+      await this.endGate;
+    }
+    return super.commit(batch);
+  }
+}
+
+class BlockingSteerCommitStore extends MemorySessionStore {
+  private releaseSteer!: () => void;
+  private readonly steerGate = new Promise<void>((resolve) => { this.releaseSteer = resolve; });
+  private markSteerCommitted!: () => void;
+  readonly steerCommitted = new Promise<void>((resolve) => { this.markSteerCommitted = resolve; });
+
+  release() {
+    this.releaseSteer();
+  }
+
+  override async commit(batch: CommitBatch) {
+    const result = await super.commit(batch);
+    if (batch.events?.some((event) => event.type === "turn/steered")) {
+      this.markSteerCommitted();
+      await this.steerGate;
+    }
+    return result;
+  }
+}
+
+class PendingIdempotencyStore extends MemorySessionStore {
+  override async commit(batch: CommitBatch) {
+    if (batch.idempotency?.key === "legacy-pending") throw new IdempotencyPendingError(Date.now() + 60_000);
+    return super.commit(batch);
+  }
+}
+
+class GatedAgentLookupStore extends MemorySessionStore {
+  private shouldBlock = false;
+  private releaseLookup!: () => void;
+  private readonly lookupGate = new Promise<void>((resolve) => { this.releaseLookup = resolve; });
+  private markLookupBlocked!: () => void;
+  readonly lookupBlocked = new Promise<void>((resolve) => { this.markLookupBlocked = resolve; });
+
+  blockNextLookup() {
+    this.shouldBlock = true;
+  }
+
+  release() {
+    this.releaseLookup();
+  }
+
+  override async getAgent(tenantId: string, agentId: string, version?: number) {
+    if (this.shouldBlock) {
+      this.shouldBlock = false;
+      this.markLookupBlocked();
+      await this.lookupGate;
+    }
+    return super.getAgent(tenantId, agentId, version);
+  }
+}
+
 describe("SessionHost", () => {
   it("runs a multi-step turn: text → tool → final; events are contiguous and items replayable", async () => {
     const h = await setup([
       { text: "let me check", toolCalls: [{ name: "echo", args: { text: "a" } }, { name: "echo", args: { text: "b" } }] },
       { text: "done: a b" },
     ]);
-    const { turn } = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "hi" }], stream: true, metadata: {} });
+    const { turn } = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "hi" }], stream: true, metadata: { traceId: "trace-1" } });
     const s = await waitIdle(h);
     const t = (await h.store.getTurn(h.session.id, turn.id))!;
     expect(t.status).toBe("completed");
     expect(t.stopReason).toBe("end_turn");
     expect(t.steps).toBe(2);
     expect(t.toolCalls).toBe(2);
+    expect(t.metadata).toEqual({ traceId: "trace-1" });
     expect(t.usage.totalTokens).toBe(30);
     expect(s.usage.totalTokens).toBe(30);
+    expect(t.seqEnd).toBe(s.lastSeq);
+    expect(h.store.usageLedger).toHaveLength(2);
+    expect((await h.store.queryUsage(principal.tenantId, { sessionId: h.session.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({
+      turns: 1,
+      steps: 2,
+      usage: { totalTokens: 30 },
+    });
 
     const persisted = h.events.filter((e) => typeof (e as { seq?: number }).seq === "number").map((e) => (e as { seq: number }).seq);
     expect(persisted).toEqual(Array.from({ length: persisted.length }, (_, i) => i + 1));
@@ -286,13 +397,164 @@ describe("SessionHost", () => {
   it("steer persists the user message and busyPolicy=steer folds a second request into the running turn", async () => {
     const h = await setup([{ text: "thinking", toolCalls: [{ name: "slow", args: { text: "x" } }] }, { text: "final" }]);
     const first = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
-    const second = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "also this" }], stream: true, metadata: {} });
+    const steerRequest = { input: [{ type: "text" as const, text: "also this" }], stream: true, metadata: {} };
+    const second = await h.host.startTurn(principal, h.session.id, steerRequest, { idempotencyKey: "steer-once" });
     expect(second.steered).toBe(true);
     expect(second.turn.id).toBe(first.turn.id);
+    const replay = await h.host.startTurn(principal, h.session.id, steerRequest, { idempotencyKey: "steer-once" });
+    expect(replay.replayed).toBe(true);
+    expect(replay.turn.id).toBe(first.turn.id);
+    await expect(h.host.startTurn(
+      principal,
+      h.session.id,
+      { ...steerRequest, input: [{ type: "text", text: "different" }] },
+      { idempotencyKey: "steer-once" },
+    )).rejects.toMatchObject({ code: "idempotency_conflict" });
     await waitIdle(h);
     expect(h.engine.steers).toHaveLength(1);
     expect(h.events.some((e) => e.type === "turn/steered")).toBe(true);
     expect((await h.store.listItems(h.session.id, { limit: 100 })).filter((i) => i.type === "userMessage")).toHaveLength(2);
+  });
+
+  it("queues a steer accepted in the beginTurn/run gap and injects it once the engine attaches", async () => {
+    const h = await setup([{ text: "first" }, { text: "after steer" }]);
+    const first = await h.host.beginTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
+    const second = await h.host.startTurn(
+      principal,
+      h.session.id,
+      { input: [{ type: "text", text: "queued before run" }], stream: false, metadata: {} },
+      { idempotencyKey: "pre-run-steer" },
+    );
+
+    expect(second.steered).toBe(true);
+    expect(h.engine.received).toHaveLength(0);
+    expect(h.engine.steers).toHaveLength(0);
+    first.run();
+    await waitIdle(h);
+
+    expect(h.engine.steers).toEqual([[{ type: "text", text: "queued before run" }]]);
+    expect((await h.store.listItems(h.session.id, { limit: 100 })).filter((item) => item.type === "userMessage")).toHaveLength(2);
+  });
+
+  it("drains an admitted steer into the engine before interrupting the turn", async () => {
+    const store = new BlockingSteerCommitStore();
+    const h = await setup([
+      { text: "working", toolCalls: [{ name: "slow", args: { text: "x" } }] },
+      { text: "after steer" },
+    ], {}, {}, { store });
+    const first = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: false, metadata: {},
+    });
+    await waitFor(() => h.events.find((event) => event.type === "item/started" && event.item.type === "toolCall"));
+
+    const steer = h.host.startTurn(
+      principal,
+      h.session.id,
+      { input: [{ type: "text", text: "accepted before interrupt" }], stream: false, metadata: {} },
+      { idempotencyKey: "interrupt-barrier" },
+    );
+    await store.steerCommitted;
+    let interruptSettled = false;
+    const interrupt = h.host.interrupt(principal, h.session.id, first.turn.id).finally(() => { interruptSettled = true; });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(interruptSettled).toBe(false);
+    } finally {
+      store.release();
+    }
+
+    expect((await steer).steered).toBe(true);
+    const stopped = await interrupt;
+    expect(stopped.status).toBe("interrupted");
+    expect(h.engine.steers).toEqual([[{ type: "text", text: "accepted before interrupt" }]]);
+  });
+
+  it("maps a legacy pending idempotency row to conflict without fencing the healthy active turn", async () => {
+    const store = new PendingIdempotencyStore();
+    const h = await setup([
+      { text: "working", toolCalls: [{ name: "slow", args: { text: "x" } }] },
+      { text: "still healthy" },
+    ], {}, {}, { store });
+    const first = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: false, metadata: {},
+    });
+    await waitFor(() => h.events.find((event) => event.type === "item/started" && event.item.type === "toolCall"));
+
+    await expect(h.host.startTurn(
+      principal,
+      h.session.id,
+      { input: [{ type: "text", text: "must conflict" }], stream: false, metadata: {} },
+      { idempotencyKey: "legacy-pending" },
+    )).rejects.toMatchObject({ code: "idempotency_conflict" });
+
+    await waitIdle(h);
+    expect(await store.getTurn(h.session.id, first.turn.id)).toMatchObject({ status: "completed", stopReason: "end_turn" });
+    expect(h.engine.steers).toHaveLength(0);
+  });
+
+  it("closes a reserved turn at its wall-clock deadline even when run() is never called", async () => {
+    const h = await setup([{ text: "must not start" }], {}, { leaseHoldMs: 10 });
+    const begun = await h.host.beginTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: true, metadata: {}, limits: { maxWallClockMs: 50 },
+    });
+
+    const session = await waitIdle(h);
+    const turn = await h.store.getTurn(h.session.id, begun.turn.id);
+    expect(turn).toMatchObject({ status: "completed", stopReason: "max_wall_clock", steps: 0 });
+    expect(session.status.type).toBe("idle");
+    expect(h.engine.received).toHaveLength(0);
+    expect((h.host as unknown as { active: Map<string, unknown> }).active.size).toBe(0);
+    await waitFor(async () => ((await h.lease.getOwner(h.session.id)) === null ? true : undefined));
+  });
+
+  it("rejects late steer admission once turn completion has begun", async () => {
+    const store = new BlockingTurnEndStore();
+    const h = await setup([{ text: "done" }], {}, {}, { store });
+    const first = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: false, metadata: {} });
+    await store.ending;
+    try {
+      await expect(h.host.startTurn(
+        principal,
+        h.session.id,
+        { input: [{ type: "text", text: "too late" }], stream: false, metadata: {} },
+        { idempotencyKey: "late-steer" },
+      )).rejects.toMatchObject({ code: "session_busy" });
+      expect(await store.getIdempotencyKey(
+        { tenantId: principal.tenantId, userId: principal.userId!, sessionId: h.session.id },
+        "late-steer",
+      )).toBeNull();
+    } finally {
+      store.release();
+    }
+    await waitIdle(h);
+    expect((await store.listItems(h.session.id, { limit: 100 })).filter((item) => item.type === "userMessage")).toHaveLength(1);
+    expect((await store.getTurn(h.session.id, first.turn.id))?.status).toBe("completed");
+  });
+
+  it("validates unsupported input before busyPolicy=steer can persist an idempotency receipt", async () => {
+    const h = await setup([{ text: "thinking", delayMs: 200 }, { text: "after" }]);
+    await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: false, metadata: {} });
+
+    await expect(h.host.startTurn(
+      principal,
+      h.session.id,
+      { input: [{ type: "skill", name: "not-supported" }], stream: false, metadata: {} },
+      { idempotencyKey: "unsupported-steer" },
+    )).rejects.toMatchObject({ code: "invalid_request" });
+    expect(await h.store.getIdempotencyKey(
+      { tenantId: principal.tenantId, userId: principal.userId!, sessionId: h.session.id },
+      "unsupported-steer",
+    )).toBeNull();
+
+    const accepted = await h.host.startTurn(
+      principal,
+      h.session.id,
+      { input: [{ type: "text", text: "valid retry" }], stream: false, metadata: {} },
+      { idempotencyKey: "unsupported-steer" },
+    );
+    expect(accepted.steered).toBe(true);
+    await waitIdle(h);
+    expect(h.engine.steers).toEqual([[{ type: "text", text: "valid retry" }]]);
   });
 
   it("concurrent startTurn on the SAME runner must not create two turns", async () => {
@@ -311,6 +573,74 @@ describe("SessionHost", () => {
     expect((await h.store.listTurns(h.session.id, { limit: 10 })).data).toHaveLength(1);
     // one user message, not two
     expect((await h.store.listItems(h.session.id, { limit: 100 })).filter((i) => i.type === "userMessage")).toHaveLength(1);
+  });
+
+  it("replays and repairs the single durable turn when its atomic idempotency commit acknowledgement is lost", async () => {
+    const store = new AmbiguousIdempotencyStore();
+    const h = await setup([{ text: "must not run" }], {}, {}, { store });
+    const req = { input: [{ type: "text" as const, text: "go" }], stream: false, metadata: {} };
+
+    await expect(h.host.beginTurn(principal, h.session.id, req, { idempotencyKey: "lost-ack" })).rejects.toThrow("injected lost commit acknowledgement");
+    const replay = await h.host.beginTurn(principal, h.session.id, req, { idempotencyKey: "lost-ack" });
+
+    expect(replay.replayed).toBe(true);
+    expect(replay.turn.status).toBe("interrupted");
+    expect((await store.listTurns(h.session.id, { limit: 10 })).data).toHaveLength(1);
+    expect((await store.listItems(h.session.id, { limit: 100 })).filter((item) => item.type === "userMessage")).toHaveLength(1);
+  });
+
+  it("replays an in-progress idempotent turn while another runner owns its lease even when draining", async () => {
+    const store = new AmbiguousIdempotencyStore();
+    const h = await setup([{ text: "must not run" }], {}, {}, { store });
+    const req = { input: [{ type: "text" as const, text: "go" }], stream: false, metadata: {} };
+
+    await expect(h.host.beginTurn(principal, h.session.id, req, { idempotencyKey: "remote-in-progress" }))
+      .rejects.toThrow("injected lost commit acknowledgement");
+    const remote = await h.lease.acquire(h.session.id, "runner-2", "10.0.0.9:1", 60_000);
+    expect(remote.ok).toBe(true);
+    await h.host.drain(0);
+
+    const replay = await h.host.beginTurn(principal, h.session.id, req, { idempotencyKey: "remote-in-progress" });
+    expect(replay.replayed).toBe(true);
+    expect(replay.turn.status).toBe("inProgress");
+    expect(h.engine.received).toHaveLength(0);
+    expect((await h.lease.getOwner(h.session.id))?.ownerId).toBe("runner-2");
+  });
+
+  it("rechecks idempotency after lease conflict when another runner commits after the first lookup", async () => {
+    const store = new GatedAgentLookupStore();
+    const h = await setup([{ text: "must not run" }], {}, {}, { store });
+    const req = { input: [{ type: "text" as const, text: "go" }], stream: false, metadata: {} };
+    store.blockNextLookup();
+
+    const beginning = h.host.beginTurn(principal, h.session.id, req, { idempotencyKey: "raced-start" });
+    await store.lookupBlocked;
+    const remote = await h.lease.acquire(h.session.id, "runner-2", "10.0.0.9:1", 60_000);
+    expect(remote.ok).toBe(true);
+    const turn = {
+      id: newId("turn"), sessionId: h.session.id, status: "inProgress" as const,
+      seqStart: h.session.lastSeq + 1, steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: Date.now(),
+    };
+    const { stream: _stream, ...resource } = req;
+    await store.commit({
+      sessionId: h.session.id,
+      fence: (remote as { ok: true; fence: number }).fence,
+      turn,
+      idempotency: {
+        scope: { tenantId: principal.tenantId, userId: principal.userId!, sessionId: h.session.id },
+        key: "raced-start",
+        requestHash: sha256(stableStringify(resource)),
+        value: { turnId: turn.id, sessionId: h.session.id },
+        expiresAtMs: Date.now() + 60_000,
+      },
+      events: [{ type: "turn/started", sessionId: h.session.id, emittedAtMs: Date.now(), turn }],
+      sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } },
+    });
+    store.release();
+
+    const replay = await beginning;
+    expect(replay).toMatchObject({ replayed: true, turn: { id: turn.id, status: "inProgress" } });
+    expect(h.engine.received).toHaveLength(0);
   });
 
   it("concurrent startTurn with busyPolicy=steer folds the second into the first turn", async () => {
@@ -351,7 +681,34 @@ describe("SessionHost", () => {
     expect((await h.store.listTurns(h.session.id, { limit: 10 })).data).toHaveLength(0);
   });
 
+  it("does not register or commit a turn when drain finishes during provider preflight", async () => {
+    let markProviderStarted!: () => void;
+    let releaseProvider!: () => void;
+    const providerStarted = new Promise<void>((resolve) => { markProviderStarted = resolve; });
+    const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    const gatedProviders: ProviderResolver = {
+      resolve: async () => {
+        markProviderStarted();
+        await providerGate;
+        return fakeModel;
+      },
+    };
+    const h = await setup([{ text: "must not run" }], {}, {}, { providers: gatedProviders });
+    const beginning = h.host.beginTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: false, metadata: {},
+    });
+    await providerStarted;
+    await h.host.drain(0);
+    releaseProvider();
+
+    await expect(beginning).rejects.toMatchObject({ code: "draining" });
+    expect((await h.store.listTurns(h.session.id, { limit: 10 })).data).toHaveLength(0);
+    expect((h.host as unknown as { active: Map<string, unknown> }).active.size).toBe(0);
+    expect(await h.lease.getOwner(h.session.id)).toBeNull();
+  });
+
   it("serialises explicit compaction with turn start, renews it, publishes it, and returns the summary id", async () => {
+    const store = new RecordingStore();
     const lease = new CountingLeaseStore();
     let markSummaryStarted!: () => void;
     let releaseSummary!: () => void;
@@ -361,19 +718,22 @@ describe("SessionHost", () => {
     const summaryGate = new Promise<void>((resolve) => {
       releaseSummary = resolve;
     });
+    const summaryUsage: Usage = { ...emptyUsage(), inputTokens: 7, outputTokens: 3, totalTokens: 10, costCNY: 0.02 };
     const summariser: Summariser = {
       summarise: async () => {
         markSummaryStarted();
         await summaryGate;
-        return { text: "summary of earlier turns", usage: emptyUsage() };
+        return { text: "summary of earlier turns", usage: summaryUsage };
       },
     };
-    const h = await setup([{ text: "answer ".repeat(200) }], {}, { leaseTtlMs: 120 }, { lease, summariser });
+    const h = await setup([{ text: "answer ".repeat(200) }], {}, { leaseTtlMs: 120 }, { store, lease, summariser });
     for (let i = 0; i < 3; i++) {
       await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: `question ${i} ${"detail ".repeat(200)}` }], stream: true, metadata: {} });
       await waitIdle(h);
     }
+    const usageBeforeCompaction = (await store.getSession(principal.tenantId, h.session.id))!.usage;
     h.events.length = 0;
+    store.commits.length = 0;
 
     const compactPromise = h.host.compactSession(principal, h.session.id);
     await summaryStarted;
@@ -399,12 +759,76 @@ describe("SessionHost", () => {
     expect(compacted.summaryItemId).toEqual(expect.any(String));
     const summaryItem = (await h.store.listItems(h.session.id, { limit: 100 })).find((item) => item.id === compacted.summaryItemId);
     expect(summaryItem).toMatchObject({ type: "contextCompaction", summary: "summary of earlier turns" });
+    const atomicBatches = store.commits.filter((batch) => batch.items?.some((item) => item.id === compacted.summaryItemId));
+    expect(atomicBatches).toHaveLength(1);
+    expect(atomicBatches[0]?.events?.map((event) => event.type)).toEqual(["item/completed", "session/compacted"]);
+    expect(atomicBatches[0]?.sessionPatch?.lastCompactionSeq).toEqual(expect.any(Number));
+    expect(atomicBatches[0]?.sessionPatch?.usage).toEqual(addUsage(usageBeforeCompaction, summaryUsage));
+    expect(atomicBatches[0]?.usageEntries).toHaveLength(1);
+    expect(store.usageLedger.some((entry) => entry.turnId === summaryItem?.turnId && entry.step === 0)).toBe(true);
+    const usageAfterCompaction = (await store.getSession(principal.tenantId, h.session.id))!.usage;
+    expect(usageAfterCompaction).toEqual(addUsage(usageBeforeCompaction, summaryUsage));
+    expect((await store.queryUsage(principal.tenantId, { sessionId: h.session.id, groupBy: "total", limit: 10 })).data[0]?.usage).toEqual(usageAfterCompaction);
     await waitFor(() => (h.events.some((event) => event.type === "session/compacted" && event.itemId === compacted.summaryItemId) ? true : undefined));
     expect(h.events.some((event) => event.type === "item/completed" && event.item.id === compacted.summaryItemId)).toBe(true);
 
     const begun = await begunPromise;
     begun.run();
     await waitIdle(h);
+  });
+
+  it("leaves no summary, event, watermark, or usage when the atomic compaction write fails", async () => {
+    const store = new FailingCompactionStore();
+    const summariser: Summariser = { summarise: async () => ({ text: "must not persist", usage: { ...emptyUsage(), totalTokens: 7 } }) };
+    const h = await setup([{ text: "answer ".repeat(200) }], {}, {}, { store, summariser });
+    for (let i = 0; i < 3; i++) {
+      await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: `question ${i} ${"detail ".repeat(200)}` }], stream: true, metadata: {} });
+      await waitIdle(h);
+    }
+    const before = await store.getSession(principal.tenantId, h.session.id);
+    const beforeUsageRows = store.usageLedger.length;
+    const beforeEvents = await store.readEvents(h.session.id, 0, 1_000);
+
+    await expect(h.host.compactSession(principal, h.session.id)).rejects.toThrow("injected compaction write failure");
+
+    const after = await store.getSession(principal.tenantId, h.session.id);
+    expect(after?.lastCompactionSeq).toBe(before?.lastCompactionSeq);
+    expect(store.usageLedger).toHaveLength(beforeUsageRows);
+    expect((await store.listItems(h.session.id, { limit: 1_000 })).some((item) => item.type === "contextCompaction")).toBe(false);
+    expect(await store.readEvents(h.session.id, 0, 1_000)).toEqual(beforeEvents);
+  });
+
+  it("discards a prepared summary when the durable session surface changes during summarisation", async () => {
+    let markStarted!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const summariser: Summariser = {
+      summarise: async () => {
+        markStarted();
+        await gate;
+        return { text: "stale summary", usage: emptyUsage() };
+      },
+    };
+    const h = await setup([{ text: "answer ".repeat(200) }], {}, {}, { summariser });
+    for (let i = 0; i < 3; i++) {
+      await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: `question ${i} ${"detail ".repeat(200)}` }], stream: true, metadata: {} });
+      await waitIdle(h);
+    }
+
+    const compacting = h.host.compactSession(principal, h.session.id);
+    await started;
+    const current = (await h.store.getSession(principal.tenantId, h.session.id))!;
+    await h.store.commit({
+      sessionId: h.session.id,
+      fence: current.fenceToken,
+      events: [{ type: "warning", sessionId: h.session.id, emittedAtMs: Date.now(), code: "test_surface_change", message: "test" }],
+    });
+    release();
+
+    await expect(compacting).rejects.toBeInstanceOf(SessionVersionError);
+    expect((await h.store.listItems(h.session.id, { limit: 1_000 })).some((item) => item.type === "contextCompaction")).toBe(false);
+    expect((await h.store.readEvents(h.session.id, 0, 1_000)).some((event) => event.type === "session/compacted")).toBe(false);
   });
 
   it("busyPolicy=reject returns session_busy", async () => {
@@ -508,6 +932,28 @@ describe("SessionHost", () => {
     expect(turn?.status === "inProgress" || turn?.status === "failed").toBe(true);
   });
 
+  it("lets a running turn complete all steps inside the drain grace window", async () => {
+    const h = await setup([
+      { text: "step one", toolCalls: [{ name: "slow", args: { text: "x" } }] },
+      { text: "graceful final" },
+    ]);
+    const started = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: false, metadata: {},
+    });
+    await waitFor(() => h.events.find((event) => event.type === "item/started" && event.item.type === "toolCall"));
+
+    await h.host.drain(2_000);
+
+    expect(await h.store.getTurn(h.session.id, started.turn.id)).toMatchObject({
+      status: "completed",
+      stopReason: "end_turn",
+      steps: 2,
+    });
+    expect((await h.store.listItems(h.session.id, { limit: 100 })).some(
+      (item) => item.type === "agentMessage" && item.text === "graceful final",
+    )).toBe(true);
+  });
+
   it("drain() does not wait for a pending approval", async () => {
     // Regression: the approval promise ignored the abort signal, so drain blocked for approvalTtlMs.
     const h = await setup([{ text: "", toolCalls: [{ name: "danger", args: { text: "x" } }] }, { text: "after" }], {}, { approvalTtlMs: 60_000 });
@@ -562,10 +1008,10 @@ describe("SessionHost", () => {
   });
 });
 
-async function waitFor<T>(fn: () => T | undefined, timeoutMs = 3000): Promise<T> {
+async function waitFor<T>(fn: () => T | undefined | Promise<T | undefined>, timeoutMs = 3000): Promise<T> {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
-    const v = fn();
+    const v = await fn();
     if (v) return v;
     await new Promise((r) => setTimeout(r, 5));
   }

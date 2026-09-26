@@ -49,7 +49,12 @@ afterEach(async () => {
 async function makeApp() {
   const store = new MemorySessionStore();
   await store.createApiKey("t_dev", "k1", hashApiKey("dev-key"), ["runtime", "admin"]);
-  const providers = new ProviderService({ store, cipher: new LocalAesGcmCipher("33".repeat(32)), platform: [ProviderService.preset("dashscope", "x")] });
+  const providers = new ProviderService({
+    store,
+    cipher: new LocalAesGcmCipher("33".repeat(32)),
+    platform: [ProviderService.preset("dashscope", "x")],
+    assertBaseUrl: async () => {},
+  });
   const fake: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, apiKey: async () => "k" };
   const tools = new StaticToolRegistry(builtinTools);
   const host = new SessionHost({ store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), engine: new EchoEngine(), providers: { resolve: async () => fake }, tools, config: { runnerId: "r", runnerAddr: "x", leaseHoldMs: 10 } });
@@ -144,10 +149,24 @@ describe("agent-runner HTTP API", () => {
     expect(r1.status).toBe(202);
     const t1 = (await j<{ turn: { id: string } }>(r1)).turn;
     await new Promise((r) => setTimeout(r, 100));
-    const r2 = await call(`/v1/sessions/${session.id}/turns`, { method: "POST", headers: { "idempotency-key": "abc" }, body });
+    // `stream` is transport-only, so changing it must still replay the same resource as JSON.
+    const r2 = await call(`/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      headers: { "idempotency-key": "abc" },
+      body: JSON.stringify({ input: [{ type: "text", text: "hi" }], stream: true }),
+    });
     expect(r2.status).toBe(200);
     expect(r2.headers.get("idempotency-replayed")).toBe("true");
     expect((await j<{ turn: { id: string } }>(r2)).turn.id).toBe(t1.id);
+    const mismatch = await call(`/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      headers: { "idempotency-key": "abc" },
+      body: JSON.stringify({ input: [{ type: "text", text: "different" }], stream: false }),
+    });
+    expect(mismatch.status).toBe(409);
+    expect((await j<{ error: { code: string } }>(mismatch)).error.code).toBe("idempotency_conflict");
+    expect((await j<{ data: unknown[] }>(await call(`/v1/sessions/${session.id}/turns`))).data).toHaveLength(1);
+    expect((await j<{ data: unknown[] }>(await call(`/v1/sessions/${session.id}/items`))).data).toHaveLength(2);
     const turn = await j<{ status: string }>(await call(`/v1/sessions/${session.id}/turns/${t1.id}`));
     expect(turn.status).toBe("completed");
   });

@@ -53,6 +53,29 @@ export interface UsageLedgerEntry {
   createdAtMs: number;
 }
 
+/** A usage row written inside a session commit. Ownership is derived from the locked session row. */
+export type UsageLedgerWrite = Omit<UsageLedgerEntry, "tenantId" | "userId" | "sessionId">;
+
+export interface IdempotencyReceiptValue {
+  turnId: string;
+  sessionId: string;
+}
+
+export interface IdempotencyReceipt {
+  /** Legacy completed rows may not have a request hash. */
+  requestHash?: string;
+  value: IdempotencyReceiptValue;
+  expiresAtMs: number;
+}
+
+export interface IdempotencyReceiptInput {
+  scope: IdempotencyScope;
+  key: string;
+  requestHash: string;
+  value: IdempotencyReceiptValue;
+  expiresAtMs: number;
+}
+
 export interface Page<T> {
   data: T[];
   nextCursor: string | null;
@@ -66,10 +89,16 @@ export interface Page<T> {
 export interface CommitBatch {
   sessionId: string;
   fence: number;
+  /** Optional compare-and-swap guard for work prepared from a session snapshot (for example a summary). */
+  expectedLastSeq?: number;
   events?: EventInput[];
   items?: Item[];
   turn?: Turn;
   approvals?: Approval[];
+  /** Usage entries committed atomically with their milestone event and aggregate projections. */
+  usageEntries?: UsageLedgerWrite[];
+  /** A completed receipt committed atomically with the first durable write for an idempotent request. */
+  idempotency?: IdempotencyReceiptInput;
   sessionPatch?: Partial<Pick<Session, "status" | "title" | "usage" | "contextEpoch" | "metadata" | "archivedAtMs" | "autoApprovedTools" | "lastCompactionSeq">>;
 }
 
@@ -98,6 +127,53 @@ export function assignItemSeqs(items: Item[] | undefined, events: PersistedEvent
   }
 }
 
+/** A terminal turn and its closing events are one batch; make the durable end cursor part of it. */
+export function assignTurnSeqEnd(turn: Turn | undefined, events: PersistedEvent[], lastSeq: number): void {
+  if (!turn || turn.seqEnd !== undefined) return;
+  for (const event of events) {
+    if (event.type !== "turn/completed" || event.turn.id !== turn.id) continue;
+    turn.seqEnd = lastSeq;
+    event.turn.seqEnd = lastSeq;
+    return;
+  }
+}
+
+/**
+ * Preserve the historical caller-visible sequence assignment, but only after a commit succeeded.
+ * A caller may supply a frozen object or a throwing Proxy; persistence has already committed at this
+ * point, so best-effort backfill must never turn that success into an apparent failed transaction.
+ */
+export function backfillAssignedSequences(
+  original: Pick<CommitBatch, "items" | "turn" | "events">,
+  committed: { items?: Item[]; turn?: Turn; events: PersistedEvent[] },
+): void {
+  const set = (target: object, key: PropertyKey, value: unknown) => {
+    try {
+      Reflect.set(target, key, value);
+    } catch {
+      // The durable result is authoritative; caller-object backfill is only a compatibility aid.
+    }
+  };
+
+  for (const [index, item] of (original.items ?? []).entries()) {
+    const assigned = committed.items?.[index];
+    if (assigned) set(item, "seq", assigned.seq);
+  }
+  if (original.turn && committed.turn?.seqEnd !== undefined) set(original.turn, "seqEnd", committed.turn.seqEnd);
+
+  for (const [index, event] of (original.events ?? []).entries()) {
+    const assigned = committed.events[index];
+    if (!assigned) continue;
+    if ((event.type === "item/started" || event.type === "item/completed")
+      && (assigned.type === "item/started" || assigned.type === "item/completed")) {
+      set(event.item, "seq", assigned.item.seq);
+    }
+    if (event.type === "turn/completed" && assigned.type === "turn/completed" && assigned.turn.seqEnd !== undefined) {
+      set(event.turn, "seqEnd", assigned.turn.seqEnd);
+    }
+  }
+}
+
 /** The session no longer exists (deleted). Writes must stop rather than resurrect it. */
 export class SessionGoneError extends Error {
   constructor(public readonly sessionId: string) {
@@ -114,6 +190,46 @@ export class FenceError extends Error {
   ) {
     super(`stale fence ${fence} for session ${sessionId} (current ${currentFence})`);
     this.name = "FenceError";
+  }
+}
+
+/** A long-running operation prepared its write from a session surface that has since changed. */
+export class SessionVersionError extends Error {
+  constructor(
+    public readonly sessionId: string,
+    public readonly expectedLastSeq: number,
+    public readonly currentLastSeq: number,
+  ) {
+    super(`session ${sessionId} changed from seq ${expectedLastSeq} to ${currentLastSeq}`);
+    this.name = "SessionVersionError";
+  }
+}
+
+/** The same idempotency key already committed an equivalent request. No batch writes were applied. */
+export class IdempotencyReplayError extends Error {
+  constructor(public readonly receipt: IdempotencyReceipt) {
+    super(`idempotency key already committed turn ${receipt.value.turnId}`);
+    this.name = "IdempotencyReplayError";
+  }
+}
+
+/** The same idempotency key was reused for a semantically different request. */
+export class IdempotencyMismatchError extends Error {
+  constructor(public readonly receipt: IdempotencyReceipt) {
+    super("idempotency key was already used for a different request");
+    this.name = "IdempotencyMismatchError";
+  }
+}
+
+/**
+ * A pre-atomic runner reserved this key but has not completed it. New runners must not replace the
+ * row: the old runner's unconditional completion UPDATE could arrive later and overwrite the new
+ * receipt. Operations may clean these rows only after every legacy runner has exited.
+ */
+export class IdempotencyPendingError extends Error {
+  constructor(public readonly expiresAtMs: number) {
+    super("idempotency key has a legacy pending reservation");
+    this.name = "IdempotencyPendingError";
   }
 }
 
@@ -163,15 +279,11 @@ export interface SessionStore {
   setTenantAuth(tenantId: string, policy: TenantAuthPolicy, secret?: { ciphertext: Buffer; keyId: string } | null): Promise<void>;
 
   // ---- usage ledger ----
-  appendUsage(entry: UsageLedgerEntry): Promise<void>;
   queryUsage(tenantId: string, q: UsageQuery): Promise<{ data: UsageRollup[] }>;
 
   // ---- idempotency ----
-  /** returns existing record if the key was already used */
-  reserveIdempotencyKey(scope: IdempotencyScope, key: string, ttlMs: number): Promise<{ existing: { turnId: string; sessionId: string } | null }>;
-  completeIdempotencyKey(scope: IdempotencyScope, key: string, value: { turnId: string; sessionId: string }): Promise<void>;
-  /** drop a reservation whose request failed, so the caller may retry with the same key */
-  releaseIdempotencyKey(scope: IdempotencyScope, key: string): Promise<void>;
+  /** Completed receipts only; pending reservations are intentionally not part of the protocol. */
+  getIdempotencyKey(scope: IdempotencyScope, key: string): Promise<IdempotencyReceipt | null>;
 
   close(): Promise<void>;
 }
