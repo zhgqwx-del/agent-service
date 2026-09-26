@@ -69,6 +69,13 @@ jobs:
       - name: Assert the integration suite actually ran
         run: node scripts/assert-suites-ran.mjs
 
+      # This is an immutable 0007 schema snapshot, not a fresh-schema test. The dedicated command has
+      # no skip path: CI must create disposable databases, execute 0008, and report both scenarios.
+      - name: Historical MySQL migration 0007 to 0008
+        env:
+          MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:migrations
+
       - name: Cluster tests (real processes)
         env:
           AGENT_SERVICE_CLUSTER: "1"
@@ -155,7 +162,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0001_init.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0008_atomic_turn_writes.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

@@ -58,9 +58,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           [session.tenantId, session.userId, session.id, key],
         );
         expect(pending[0]).toMatchObject({ value: null, request_hash: null, expires_at_ms: expiresAt });
-        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 0, lastSeq: 0 });
+        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 0, lastSeq: 1 });
         expect((await store.getSession(session.tenantId, session.id))?.title).toBeUndefined();
-        expect(await store.readEvents(session.id, 0, 10)).toEqual([]);
+        expect(await store.readEvents(session.id, 0, 10)).toEqual([
+          { type: "session/created", sessionId: session.id, emittedAtMs: session.createdAtMs, seq: 1 },
+        ]);
       } finally {
         await conn.end();
         await store.close();

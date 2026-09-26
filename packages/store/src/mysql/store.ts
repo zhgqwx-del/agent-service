@@ -9,6 +9,7 @@ import {
   IdempotencyMismatchError,
   IdempotencyPendingError,
   IdempotencyReplayError,
+  SessionExistsError,
   SessionGoneError,
   SessionVersionError,
   assignItemSeqs,
@@ -181,16 +182,46 @@ export class MysqlSessionStore implements SessionStore {
   }
 
   // ---------- sessions ----------
-  async createSession(s: Session) {
-    await this.pool.query(
-      `INSERT INTO sessions (session_id, tenant_id, user_id, agent_id, agent_version, status, title, parent_session_id,
-         last_seq, fence_token, context_epoch, usage_json, auto_approved_tools, metadata, created_at_ms, updated_at_ms, archived_at_ms)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [
-        s.id, s.tenantId, s.userId, s.agentId, s.agentVersion, json(s.status), s.title ?? null, s.parentSessionId ?? null,
-        s.lastSeq, s.fenceToken, s.contextEpoch, json(s.usage), json(s.autoApprovedTools), json(s.metadata), s.createdAtMs, s.updatedAtMs, s.archivedAtMs ?? null,
-      ],
-    );
+  async createSession(s: Session): Promise<CommitResult> {
+    if (s.lastSeq !== 0) throw new Error("a new session must start at lastSeq 0");
+    if (s.fenceToken !== 0) throw new Error("a new session must start at fenceToken 0");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      try {
+        await conn.query(
+          `INSERT INTO sessions (session_id, tenant_id, user_id, agent_id, agent_version, status, title, parent_session_id,
+             last_seq, fence_token, context_epoch, usage_json, auto_approved_tools, metadata, created_at_ms, updated_at_ms, archived_at_ms)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            s.id, s.tenantId, s.userId, s.agentId, s.agentVersion, json(s.status), s.title ?? null, s.parentSessionId ?? null,
+            1, s.fenceToken, s.contextEpoch, json(s.usage), json(s.autoApprovedTools), json(s.metadata), s.createdAtMs, s.updatedAtMs, s.archivedAtMs ?? null,
+          ],
+        );
+      } catch (err) {
+        // Only a collision on the session row has SessionExists semantics. A later duplicate/error
+        // while inserting the event must retain its database identity for diagnosis after rollback.
+        if ((err as { code?: string }).code === "ER_DUP_ENTRY") throw new SessionExistsError(s.id);
+        throw err;
+      }
+      const event: PersistedEvent = {
+        type: "session/created",
+        sessionId: s.id,
+        emittedAtMs: s.createdAtMs,
+        seq: 1,
+      };
+      await conn.query(
+        "INSERT INTO events (session_id, seq, user_id, type, body, emitted_at_ms) VALUES (?,?,?,?,?,?)",
+        [s.id, event.seq, s.userId, event.type, json(event), event.emittedAtMs],
+      );
+      await conn.commit();
+      return { events: [event], lastSeq: 1 };
+    } catch (err) {
+      await conn.rollback().catch(() => {});
+      throw err;
+    } finally {
+      conn.release();
+    }
   }
   async getSession(tenantId: string, sessionId: string) {
     const [rows] = await this.pool.query<Row[]>(

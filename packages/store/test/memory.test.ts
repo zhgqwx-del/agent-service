@@ -35,9 +35,11 @@ describe("MemorySessionStore legacy idempotency compatibility", () => {
     })).rejects.toMatchObject({ name: "IdempotencyPendingError", expiresAtMs: expiresAt });
 
     expect(store.idem.get(mapKey)).toEqual({ value: null, expiresAt });
-    expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 0, lastSeq: 0 });
+    expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ fenceToken: 0, lastSeq: 1 });
     expect((await store.getSession(session.tenantId, session.id))?.title).toBeUndefined();
-    expect(await store.readEvents(session.id, 0, 10)).toEqual([]);
+    expect(await store.readEvents(session.id, 0, 10)).toEqual([
+      { type: "session/created", sessionId: session.id, emittedAtMs: session.createdAtMs, seq: 1 },
+    ]);
     await store.close();
   });
 

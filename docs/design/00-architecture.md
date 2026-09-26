@@ -360,7 +360,9 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `usage_ledger` | tenant/user/session/turn/step + tokens/cache/cost；`UNIQUE(session_id, turn_id, step)` | 每个最终 step 恰好一条，计费归因 |
 | `idempotency_keys` | `(tenant_id, user_id, session_id, key) PK, request_hash, response_ref, expires_at` | 新版只写 completed receipt；升级期可暂存 legacy pending |
 
-写路径：`SessionStore.commit` 锁定 session 行，校验 fence（长操作再校验 `expectedLastSeq`），把 `events`、`items`、turn/approval、usage ledger、幂等 receipt 与 session 投影放进同一个 MySQL 事务；提交后才向 Redis 扇出。session/turn usage 是该单写者事务内的绝对聚合投影，ledger 是不可重复的明细真相。
+创建路径：`SessionStore.createSession` 必须在一个原子操作中写入 session 与 `session/created(seq=1)`；MemoryStore 在发布状态前完成整个写集的 staging，MySQLStore 在同一 InnoDB 事务中插入两行。失败不得暴露孤立 session、事件空洞或部分游标。
+
+后续写路径：`SessionStore.commit` 锁定 session 行，校验 fence（长操作再校验 `expectedLastSeq`），把 `events`、`items`、turn/approval、usage ledger、幂等 receipt 与 session 投影放进同一个 MySQL 事务；提交后才向 Redis 扇出。session/turn usage 是该单写者事务内的绝对聚合投影，ledger 是不可重复的明细真相。
 
 滚动升级兼容：迁移保留旧版 runner 写入的 legacy pending receipt；新版命中 pending 时返回 `409 idempotency_conflict`，不得接管或替换，以免旧 runner 随后执行 delayed complete 覆写新版结果。运维上必须先排空并下线全部旧 runner，确认不存在旧进程后，才可清理已过期 pending。新版自身不再创建 pending，只原子写入 completed receipt。
 

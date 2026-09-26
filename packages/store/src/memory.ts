@@ -18,6 +18,7 @@ import {
   IdempotencyMismatchError,
   IdempotencyPendingError,
   IdempotencyReplayError,
+  SessionExistsError,
   SessionGoneError,
   SessionVersionError,
   assignItemSeqs,
@@ -84,9 +85,26 @@ export class MemorySessionStore implements SessionStore {
     return paginate([...latest.values()], (a) => a.id, opts.cursor, opts.limit, "desc");
   }
 
-  async createSession(session: Session) {
-    this.sessions.set(session.id, clone(session));
-    this.events.set(session.id, []);
+  async createSession(session: Session): Promise<CommitResult> {
+    if (session.lastSeq !== 0) throw new Error("a new session must start at lastSeq 0");
+    if (session.fenceToken !== 0) throw new Error("a new session must start at fenceToken 0");
+    if (this.sessions.has(session.id)) throw new SessionExistsError(session.id);
+
+    // Stage every fallible clone before publishing either map entry. Session metadata is open-ended
+    // and may contain an uncloneable/throwing value; such a failure must not leave a session without
+    // its creation event (or vice versa).
+    const stagedSession = clone(session);
+    const stagedEvent = clone<PersistedEvent>({
+      type: "session/created",
+      sessionId: session.id,
+      emittedAtMs: session.createdAtMs,
+      seq: 1,
+    });
+    stagedSession.lastSeq = 1;
+
+    this.sessions.set(session.id, stagedSession);
+    this.events.set(session.id, [stagedEvent]);
+    return { events: [clone(stagedEvent)], lastSeq: 1 };
   }
   async getSession(tenantId: string, sessionId: string) {
     const s = this.sessions.get(sessionId);

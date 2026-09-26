@@ -36,6 +36,8 @@ JOIN usage_ledger older
   ON BINARY newer.session_id = BINARY older.session_id
  AND BINARY newer.turn_id = BINARY older.turn_id
  AND newer.step = older.step
+ AND BINARY newer.tenant_id = BINARY older.tenant_id
+ AND BINARY newer.user_id = BINARY older.user_id
  AND BINARY newer.provider = BINARY older.provider
  AND BINARY newer.model = BINARY older.model
  AND newer.usage_json = older.usage_json

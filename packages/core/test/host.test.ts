@@ -221,6 +221,44 @@ class GatedAgentLookupStore extends MemorySessionStore {
 }
 
 describe("SessionHost", () => {
+  it("keeps parent-session links inside the target tenant and user", async () => {
+    const h = await setup([{ text: "unused" }]);
+    const delegatedParent = await h.host.createSession(principal, {
+      agentId: h.agent.id,
+      userId: "u_delegated",
+      metadata: {},
+    });
+    const delegatedChild = await h.host.createSession(principal, {
+      agentId: h.agent.id,
+      userId: "u_delegated",
+      parentSessionId: delegatedParent.id,
+      metadata: {},
+    });
+    expect(delegatedChild).toMatchObject({ userId: "u_delegated", parentSessionId: delegatedParent.id });
+
+    await expect(h.host.createSession(principal, {
+      agentId: h.agent.id,
+      userId: "u_delegated",
+      parentSessionId: h.session.id,
+      metadata: {},
+    })).rejects.toMatchObject({ code: "not_found" });
+
+    const foreignParent = {
+      ...delegatedParent,
+      id: newId("sess"),
+      tenantId: "t_foreign",
+      lastSeq: 0,
+      fenceToken: 0,
+    };
+    await h.store.createSession(foreignParent);
+    await expect(h.host.createSession(principal, {
+      agentId: h.agent.id,
+      userId: "u_delegated",
+      parentSessionId: foreignParent.id,
+      metadata: {},
+    })).rejects.toMatchObject({ code: "not_found" });
+  });
+
   it("runs a multi-step turn: text → tool → final; events are contiguous and items replayable", async () => {
     const h = await setup([
       { text: "let me check", toolCalls: [{ name: "echo", args: { text: "a" } }, { name: "echo", args: { text: "b" } }] },

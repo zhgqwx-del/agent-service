@@ -5,6 +5,7 @@ import {
   FenceError,
   IdempotencyMismatchError,
   IdempotencyReplayError,
+  SessionExistsError,
   SessionGoneError,
   SessionVersionError,
   type EventBus,
@@ -39,24 +40,98 @@ export const mkSession = (tenantId = "t_a", userId = "u_1"): Session => ({
 
 export function sessionStoreConformance(name: string, make: () => Promise<SessionStore>) {
   describe(`SessionStore conformance: ${name}`, () => {
+    it("atomically creates a session with exactly one seq-1 creation event", async () => {
+      const store = await make();
+      const s = mkSession("t_create", "u_create");
+      const result = await store.createSession(s);
+
+      expect(result).toEqual({
+        events: [{ type: "session/created", sessionId: s.id, emittedAtMs: s.createdAtMs, seq: 1 }],
+        lastSeq: 1,
+      });
+      expect(s.lastSeq).toBe(0); // persistence must not partially mutate the caller's object
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({
+        id: s.id,
+        tenantId: s.tenantId,
+        userId: s.userId,
+        lastSeq: 1,
+        fenceToken: 0,
+      });
+      expect(await store.readEvents(s.id, 0, 10)).toEqual(result.events);
+      await store.close();
+    });
+
+    it("leaves neither session nor event when session serialization fails", async () => {
+      const store = await make();
+      const metadata = {} as Record<string, unknown>;
+      Object.defineProperty(metadata, "invalid", {
+        enumerable: true,
+        get: () => { throw new Error("injected session serialization failure"); },
+      });
+      const s = { ...mkSession(), metadata };
+
+      await expect(store.createSession(s)).rejects.toThrow("injected session serialization failure");
+      expect(await store.getSession(s.tenantId, s.id)).toBeNull();
+      expect(await store.readEvents(s.id, 0, 10)).toEqual([]);
+      await store.close();
+    });
+
+    it("rejects non-pristine session cursors before creating any state", async () => {
+      const store = await make();
+      const advanced = { ...mkSession(), lastSeq: 2 };
+      const fenced = { ...mkSession(), fenceToken: 3 };
+
+      await expect(store.createSession(advanced)).rejects.toThrow("lastSeq 0");
+      await expect(store.createSession(fenced)).rejects.toThrow("fenceToken 0");
+      for (const session of [advanced, fenced]) {
+        expect(await store.getSession(session.tenantId, session.id)).toBeNull();
+        expect(await store.readEvents(session.id, 0, 10)).toEqual([]);
+      }
+      await store.close();
+    });
+
+    it("serializes concurrent creators so one owner wins without tenant/user state mixing", async () => {
+      const store = await make();
+      const first = mkSession("tenant_a", "user_a");
+      const second = { ...mkSession("tenant_b", "user_b"), id: first.id };
+      const outcomes = await Promise.allSettled([store.createSession(first), store.createSession(second)]);
+      const winner = outcomes.findIndex((outcome) => outcome.status === "fulfilled");
+      const loser = winner === 0 ? 1 : 0;
+
+      expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+      expect(outcomes[loser]).toMatchObject({ status: "rejected", reason: expect.any(SessionExistsError) });
+      const winningSession = [first, second][winner]!;
+      const losingSession = [first, second][loser]!;
+      expect(await store.getSession(winningSession.tenantId, first.id)).toMatchObject({
+        tenantId: winningSession.tenantId,
+        userId: winningSession.userId,
+        lastSeq: 1,
+      });
+      expect(await store.getSession(losingSession.tenantId, first.id)).toBeNull();
+      expect(await store.readEvents(first.id, 0, 10)).toEqual([
+        { type: "session/created", sessionId: first.id, emittedAtMs: winningSession.createdAtMs, seq: 1 },
+      ]);
+      await store.close();
+    });
+
     it("assigns contiguous seqs across commits and rejects stale fences", async () => {
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
       const ev = (type: "session/created"): EventInput => ({ type, sessionId: s.id, emittedAtMs: Date.now() });
       const r1 = await store.commit({ sessionId: s.id, fence: 1, events: [ev("session/created"), ev("session/created")] });
-      expect(r1.events.map((e) => e.seq)).toEqual([1, 2]);
+      expect(r1.events.map((e) => e.seq)).toEqual([2, 3]);
       const r2 = await store.commit({ sessionId: s.id, fence: 2, events: [ev("session/created")] });
-      expect(r2.events[0]!.seq).toBe(3);
+      expect(r2.events[0]!.seq).toBe(4);
       await expect(store.commit({ sessionId: s.id, fence: 1, events: [ev("session/created")] })).rejects.toBeInstanceOf(FenceError);
       // same fence is allowed (same owner keeps writing)
       const r3 = await store.commit({ sessionId: s.id, fence: 2, events: [ev("session/created")] });
-      expect(r3.events[0]!.seq).toBe(4);
+      expect(r3.events[0]!.seq).toBe(5);
       const all = await store.readEvents(s.id, 0, 100);
-      expect(all.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
-      expect((await store.readEvents(s.id, 2, 100)).map((e) => e.seq)).toEqual([3, 4]);
+      expect(all.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
+      expect((await store.readEvents(s.id, 2, 100)).map((e) => e.seq)).toEqual([3, 4, 5]);
       const got = await store.getSession(s.tenantId, s.id);
-      expect(got?.lastSeq).toBe(4);
+      expect(got?.lastSeq).toBe(5);
       expect(got?.fenceToken).toBe(2);
       await store.close();
     });
@@ -75,7 +150,6 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
-      await store.commit({ sessionId: s.id, fence: 1, events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 1 }] });
       await expect(store.commit({
         sessionId: s.id,
         fence: 1,
@@ -98,7 +172,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         get: () => { throw new Error("injected serialization failure"); },
       });
       const turn: Turn = {
-        id: newId("turn"), sessionId: s.id, status: "completed", seqStart: 1,
+        id: newId("turn"), sessionId: s.id, status: "completed", seqStart: 2,
         steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: 1,
         completedAtMs: 2, stopReason: "end_turn",
       };
@@ -133,9 +207,11 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       expect(turn.seqEnd).toBeUndefined();
       expect((events[1] as Extract<EventInput, { type: "item/completed" }>).item.seq).toBe(0);
       expect((events[2] as Extract<EventInput, { type: "turn/completed" }>).turn.seqEnd).toBeUndefined();
-      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 0, fenceToken: 0 });
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 1, fenceToken: 0 });
       expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
-      expect(await store.readEvents(s.id, 0, 10)).toEqual([]);
+      expect(await store.readEvents(s.id, 0, 10)).toEqual([
+        { type: "session/created", sessionId: s.id, emittedAtMs: s.createdAtMs, seq: 1 },
+      ]);
       expect(await store.getItem(s.id, item.id)).toBeNull();
       expect(await store.getTurn(s.id, turn.id)).toBeNull();
       expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data).toEqual([]);
@@ -151,7 +227,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         id: newId("turn"),
         sessionId: s.id,
         status: "inProgress",
-        seqStart: 1,
+        seqStart: 2,
         steps: 0,
         toolCalls: 0,
         usage: emptyUsage(),
@@ -162,7 +238,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         sessionId: s.id,
         fence: 1,
         turn,
-        items: [{ id: itemId, sessionId: s.id, turnId: turn.id, seq: 1, status: "completed", createdAtMs: 1, type: "userMessage", content: [{ type: "text", text: "hi" }] }],
+        items: [{ id: itemId, sessionId: s.id, turnId: turn.id, seq: 0, status: "completed", createdAtMs: 1, type: "userMessage", content: [{ type: "text", text: "hi" }] }],
         events: [{ type: "turn/started", sessionId: s.id, emittedAtMs: 1, turn }],
         sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] }, title: "T" },
       });
@@ -261,7 +337,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const scope = { tenantId: s.tenantId, userId: s.userId, sessionId: s.id };
       const hash = "a".repeat(64);
       const turn: Turn = {
-        id: newId("turn"), sessionId: s.id, status: "inProgress", seqStart: 1,
+        id: newId("turn"), sessionId: s.id, status: "inProgress", seqStart: 2,
         steps: 0, toolCalls: 0, usage: emptyUsage(), startedAtMs: Date.now(), idempotencyKey: key,
       };
       await store.commit({
@@ -273,7 +349,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       });
       expect(await store.getIdempotencyKey(scope, key)).toMatchObject({ requestHash: hash, value: { turnId: turn.id, sessionId: s.id } });
 
-      const duplicate: Turn = { ...turn, id: newId("turn"), seqStart: 2 };
+      const duplicate: Turn = { ...turn, id: newId("turn"), seqStart: 3 };
       await expect(store.commit({
         sessionId: s.id,
         fence: 2,
@@ -284,7 +360,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       })).rejects.toBeInstanceOf(IdempotencyReplayError);
       expect(await store.getTurn(s.id, duplicate.id)).toBeNull();
       expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
-      expect(await store.readEvents(s.id, 0, 100)).toHaveLength(1);
+      expect(await store.readEvents(s.id, 0, 100)).toHaveLength(2);
 
       await expect(store.commit({
         sessionId: s.id,
@@ -318,8 +394,8 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       })).rejects.toThrow();
 
       const after = await store.getSession(s.tenantId, s.id);
-      expect(after).toMatchObject({ title: "committed", lastSeq: 1, fenceToken: 1, usage: { totalTokens: 5 } });
-      expect(await store.readEvents(s.id, 0, 100)).toHaveLength(1);
+      expect(after).toMatchObject({ title: "committed", lastSeq: 2, fenceToken: 1, usage: { totalTokens: 5 } });
+      expect(await store.readEvents(s.id, 0, 100)).toHaveLength(2);
       expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({ steps: 1, usage: { totalTokens: 5 } });
 
       await expect(store.commit({

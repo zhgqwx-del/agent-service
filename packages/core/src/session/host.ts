@@ -218,6 +218,14 @@ export class SessionHost {
   async createSession(principal: Principal, req: CreateSessionRequest): Promise<Session> {
     const agent = await this.deps.store.getAgent(principal.tenantId, req.agentId, req.agentVersion);
     if (!agent) throw new ApiError("not_found", "agent not found");
+    const targetUserId = req.userId ?? principal.userId;
+    if (req.parentSessionId) {
+      const parent = await this.deps.store.getSession(principal.tenantId, req.parentSessionId);
+      // A trusted caller may create for another user, so compare the parent with the target user,
+      // not necessarily the authenticated caller. Cross-tenant/user and missing parents stay
+      // indistinguishable to avoid turning this relationship check into an existence oracle.
+      if (!parent || parent.userId !== targetUserId) throw new ApiError("not_found", "parent session not found");
+    }
     const tools = this.deps.tools.resolve(agent.tools);
     const skills = this.deps.skills ? await this.deps.skills.list(principal, agent.skills) : [];
     const systemPrompt = buildSystemPrompt(agent, skills);
@@ -225,7 +233,7 @@ export class SessionHost {
     const session: Session = {
       id: newId("sess"),
       tenantId: principal.tenantId,
-      userId: req.userId ?? principal.userId,
+      userId: targetUserId,
       agentId: agent.id,
       agentVersion: agent.version,
       status: { type: "idle" },
@@ -241,8 +249,7 @@ export class SessionHost {
       updatedAtMs: now,
       metadata: req.metadata ?? {},
     };
-    await this.deps.store.createSession(session);
-    const r = await this.deps.store.commit({ sessionId: session.id, fence: 0, events: [{ type: "session/created", sessionId: session.id, emittedAtMs: now }] });
+    const r = await this.deps.store.createSession(session);
     await this.publishAll(session.id, r.events);
     return { ...session, lastSeq: r.lastSeq };
   }

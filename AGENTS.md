@@ -13,9 +13,9 @@
 
 - M0 完成。
 - M1 核心运行范围完成；OpenAPI/生成 SDK 与完整数据生命周期仍未闭环。
-- M2 核心验收完成，处于冻结前收尾；尚未正式进入 M3。
+- M2 的本地/CI 代码范围已完成并正式冻结；尚未正式进入 M3，云上部署不属于本次冻结范围。
 - M3 的 MCP/skills/hooks 主体和 M4 的生产化主体尚未开始。
-- 当前优先债务是 session 创建与首条事件原子化、`0007 -> 0008` 历史升级夹具；随后补齐 M1 的契约与生命周期缺口，再正式进入 M3。
+- session 创建与首条事件原子化、`0007 -> 0008` 历史升级夹具已经收口；当前优先补齐 M1 的 OpenAPI/生成 SDK 与完整数据生命周期缺口，再正式进入 M3。
 
 ## 工作边界
 
@@ -27,6 +27,7 @@
 
 ```bash
 scripts/local-service.sh verify
+pnpm test:migrations
 scripts/local-service.sh verify-real
 scripts/local-service.sh acceptance
 ```

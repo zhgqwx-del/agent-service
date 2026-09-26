@@ -6,7 +6,7 @@
 
 - **M0 调研**：完成。
 - **M1 单节点 runner MVP**：核心运行链路已实现，包括摘要级压缩、usage 查询、端用户鉴权和 API key scope；原始里程碑中的 OpenAPI/生成 SDK、完整数据生命周期仍待完成。
-- **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain 与真实多进程接管测试已实现并通过自动验收；当前处于冻结前收尾，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
+- **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
 
@@ -35,6 +35,7 @@ scripts/demo.sh
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
+pnpm test:migrations                          # 固定 0007 历史库 → 0008 的真实 MySQL 升级夹具
 pnpm test:cluster                             # + 多进程集群：2~3 runner + 1 router，SIGKILL 租约持有者
 set -a; source .env; set +a; AGENT_SERVICE_REAL_E2E=1 pnpm vitest run packages/providers/test/e2e-qwen.test.ts
 pnpm typecheck
@@ -51,7 +52,7 @@ scripts/local-service.sh start
 scripts/local-service.sh status
 scripts/local-service.sh smoke
 scripts/local-service.sh acceptance   # 使用真实模型，会产生少量费用
-scripts/local-service.sh verify       # secret scan + typecheck + 集成 + coverage + cluster + 构建产物启动
+scripts/local-service.sh verify       # secret scan + typecheck + 集成/coverage + 历史迁移 + cluster + 构建产物启动
 scripts/local-service.sh verify-real  # 仅在显式命令下读取 .env 的真实模型 key
 scripts/local-service.sh cleanup-idempotency --dry-run  # 检查/分批清理过期 completed receipt
 scripts/local-service.sh stop
@@ -111,6 +112,7 @@ docs/                  调研、设计
 ## 关键不变量（测试覆盖）
 
 - 同一 session 同时只有一个 writer：Redis 租约 + 单调 fence，MySQL 每次写入校验 `fence_token`，旧 owner 的写入被拒绝（`FenceError`）。
+- session 行与首条 `session/created(seq=1)` 由 store 原子创建；序列化或数据库事件写入失败不会留下孤立 session、首事件空洞或部分游标。
 - 持久化事件 per-session `seq` 严格连续；delta 事件只走总线不落库不占 seq。
 - 工具调用先落库（write-ahead）再执行；崩溃后按是否 `startedAtMs` 生成 `TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN` 交给模型。
 - 安全阀 `maxSteps / maxToolCalls / maxWallClockMs / maxCostCNY` 取 min，只能收紧。

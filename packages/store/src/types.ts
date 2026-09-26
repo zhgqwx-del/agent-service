@@ -182,6 +182,14 @@ export class SessionGoneError extends Error {
   }
 }
 
+/** Session ids are globally unique; a concurrent creator must not replace the winner. */
+export class SessionExistsError extends Error {
+  constructor(public readonly sessionId: string) {
+    super(`session ${sessionId} already exists`);
+    this.name = "SessionExistsError";
+  }
+}
+
 export class FenceError extends Error {
   constructor(
     public readonly sessionId: string,
@@ -240,7 +248,11 @@ export interface SessionStore {
   listAgents(tenantId: string, opts: { cursor?: string; limit: number }): Promise<Page<AgentDefinition>>;
 
   // ---- sessions ----
-  createSession(session: Session): Promise<void>;
+  /**
+   * Atomically creates a pristine session and its mandatory `session/created` event. The input must
+   * have `lastSeq: 0` and `fenceToken: 0`; the stored session and returned cursor start at seq 1.
+   */
+  createSession(session: Session): Promise<CommitResult>;
   getSession(tenantId: string, sessionId: string): Promise<Session | null>;
   listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }): Promise<Page<Session>>;
   deleteSession(tenantId: string, sessionId: string): Promise<boolean>;
