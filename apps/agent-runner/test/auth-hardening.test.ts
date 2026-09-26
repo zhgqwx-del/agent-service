@@ -196,6 +196,82 @@ describe("tenant configuration needs an admin-scoped key", () => {
 });
 
 describe("policy validation happens before storage", () => {
+  it("lets an admin recover a legacy policy whose token header collides with Authorization", async () => {
+    const h = await makeApp();
+    const legacyPolicy: TenantAuthPolicy = {
+      mode: "end_user_token",
+      tokenHeader: "authorization",
+      verifier: {
+        kind: "jwt",
+        jwksUri: "https://auth.example/jwks.json",
+        hs256: false,
+        algorithms: ["RS256"],
+        issuer: "https://auth.example",
+        audience: "agent-api",
+        subjectClaim: "sub",
+        clockToleranceSec: 5,
+      },
+    };
+    // Simulate a row persisted before the shared header-name schema existed.
+    await h.store.setTenantAuth("t_h", legacyPolicy);
+
+    // Skipping end-user verification does not weaken service-key scope enforcement.
+    expect((await h.req("/v1/tenant/auth", {}, {}, "runtime-only")).status).toBe(403);
+    const current = await h.req("/v1/tenant/auth");
+    expect(current.status).toBe(200);
+    expect(((await current.json()) as { policy: TenantAuthPolicy }).policy).toEqual(legacyPolicy);
+
+    const repaired = await h.setPolicy({ mode: "trusted_caller" });
+    expect(repaired.status).toBe(200);
+    expect((await h.req("/v1/sessions", { method: "POST", body: JSON.stringify({ agentId: h.agent.id }) }, { "x-user-id": "u_recovered" })).status).toBe(201);
+  });
+
+  it("rejects reserved inbound token headers without locking the tenant and accepts a custom header", async () => {
+    const h = await makeApp();
+    const secret = "custom-header-hs256-secret-at-least-32-bytes";
+    const verifier: Extract<TenantAuthPolicy, { mode: "end_user_token" }>["verifier"] = {
+      kind: "jwt", hs256: true, algorithms: ["HS256"], subjectClaim: "sub", clockToleranceSec: 5,
+    };
+
+    for (const tokenHeader of [
+      "authorization",
+      "AUTHORIZATION",
+      "x-user-id",
+      "Host",
+      "content-length",
+      "connection",
+      "keep-alive",
+      "proxy-authenticate",
+      "proxy-authorization",
+      "proxy-connection",
+      "te",
+      "trailer",
+      "transfer-encoding",
+      "upgrade",
+    ]) {
+      const rejected = await h.setPolicy({ mode: "end_user_token", tokenHeader, verifier }, secret);
+      expect(rejected.status, tokenHeader).toBe(400);
+    }
+
+    // Failed validation happens before persistence, so the original trusted-caller policy still works.
+    const unchanged = (await (await h.req("/v1/tenant/auth")).json()) as { policy: TenantAuthPolicy };
+    expect(unchanged.policy).toEqual({ mode: "trusted_caller" });
+    expect((await h.req("/v1/sessions", { method: "POST", body: JSON.stringify({ agentId: h.agent.id }) }, { "x-user-id": "u1" })).status).toBe(201);
+
+    // A syntactically valid, non-reserved custom header remains supported, including mixed-case input.
+    expect((await h.setPolicy({ mode: "end_user_token", tokenHeader: "X-Tenant-End-User-Token", verifier }, secret)).status).toBe(200);
+    const token = await new SignJWT({ sub: "u_custom" })
+      .setProtectedHeader({ alg: "HS256" })
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(new TextEncoder().encode(secret));
+    expect((await h.req(
+      "/v1/sessions",
+      { method: "POST", body: JSON.stringify({ agentId: h.agent.id }) },
+      { "x-tenant-end-user-token": token },
+    )).status).toBe(201);
+  });
+
   it("refuses hs256 with no secret instead of bricking every route", async () => {
     const h = await makeApp();
     const bad = await h.setPolicy({ mode: "end_user_token", tokenHeader: "x-end-user-token", verifier: { kind: "jwt", hs256: true, algorithms: ["HS256"], subjectClaim: "sub", clockToleranceSec: 5 } });

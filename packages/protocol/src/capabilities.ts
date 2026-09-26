@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = "2026-09-22" as const;
+export const PROTOCOL_VERSION = "2026-09-26" as const;
 
 export const Capabilities = z.object({
   protocolVersion: z.literal(PROTOCOL_VERSION),

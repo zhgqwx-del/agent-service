@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { externalId, idSchema, Limits, StopReason, Usage } from "./common.js";
+import { externalId, idSchema, Limits, StopReason, Usage, UserId } from "./common.js";
 import { BusyPolicy, ModelRef } from "./agent.js";
 import { InputPart } from "./item.js";
 
@@ -17,6 +17,8 @@ export type SessionStatus = z.infer<typeof SessionStatus>;
 export const Session = z.object({
   id: idSchema("sess"),
   tenantId: externalId,
+  // Historical delegated creates could persist any externalId. New HTTP requests use UserId below,
+  // but responses remain able to represent those rows during a rolling upgrade.
   userId: externalId,
   agentId: idSchema("agt"),
   agentVersion: z.number().int().positive(),
@@ -79,7 +81,7 @@ export const CreateSessionRequest = z.object({
   agentId: idSchema("agt"),
   /** defaults to the latest version at creation time */
   agentVersion: z.number().int().positive().optional(),
-  userId: externalId.optional(),
+  userId: UserId.optional(),
   title: z.string().max(256).optional(),
   parentSessionId: idSchema("sess").optional(),
   metadata: z.record(z.unknown()).default({}),

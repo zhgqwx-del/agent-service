@@ -1,6 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
+import { PROTOCOL_VERSION } from "@agent-service/protocol";
 import { createRouterApp } from "../src/app.js";
 import type { RunnerRegistry, RunnerTarget } from "../src/registry.js";
 
@@ -66,6 +67,7 @@ function fakeRegistry(targets: string[], opts: { owner?: string; healthy?: (url:
       return healthy.length ? healthy[rr++ % healthy.length]!.url : undefined;
     },
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
+    routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
     start: () => {},
     close: async () => {},
@@ -267,11 +269,21 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: "2026-09-22", service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({ registry: fakeRegistry([a.url]), logger: silent });
     const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[] } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
+  });
+
+  it("does not publish capabilities from a runner on an older protocol contract", async () => {
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: "2026-09-22", service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const app = createRouterApp({ registry: fakeRegistry([a.url]), logger: silent });
+    const response = await app.request("/v1/capabilities");
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      error: { code: "draining", retryable: true },
+    });
   });
 });

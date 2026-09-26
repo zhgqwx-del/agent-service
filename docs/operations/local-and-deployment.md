@@ -19,9 +19,11 @@ scripts/local-service.sh down        # 停应用和本地基础设施
 验证入口：
 
 ```bash
-scripts/local-service.sh verify       # secret scan + typecheck + 集成/coverage + 历史迁移 + cluster + 构建产物启动
+scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 历史迁移 + cluster + SDK/应用构建产物
 scripts/local-service.sh verify-real  # 使用本机 .env，仅跑真实模型 E2E
 pnpm test:migrations                  # 独立真实 MySQL：固定 0007 历史库升级到 0008
+pnpm check:api                        # OpenAPI、运行时文档与生成 SDK 类型必须完全同步
+pnpm check:sdk                        # 编译 SDK、原生 Node import，并检查发布 tarball
 ```
 
 状态文件和日志写入 `.local-run/`，该目录不提交。`stop` 只发送 SIGTERM，让 runner drain；30 秒仍未退出时脚本会报错并保留现场，不会擅自 SIGKILL。
@@ -32,7 +34,7 @@ pnpm test:migrations                  # 独立真实 MySQL：固定 0007 历史�
 - `agent-runner`：每个实例必须有全局唯一 `RUNNER_ID`，并发布其它 router/runner 可访问的 `RUNNER_ADDR`。
 - MySQL：业务真相、事件、审批、配置和 usage ledger。生产迁移应作为独立 Job 执行，不能依赖所有 runner 同时自动迁移。
 - Redis：租约、fence counter、owner 目录和事件扇出。生产环境必须启用满足恢复目标的持久化/高可用方案，不能把它当可随意清空的缓存。
-- 对象存储：当前本地使用文件目录；附件和大输出进入生产范围时再替换为 OSS/S3 实现。
+- 对象存储：已有经过路径逃逸、静态 symlink、权限、损坏和并发测试的本地文件实现；key 采用跨平台无大小写歧义的小写 grammar，新写入返回版本化 ref，数据与 metadata 以覆盖 header/长度/正文的 SHA-256 单 envelope 经一次 rename 发布，目录/文件权限为 0700/0600，并可过渡读取/删除安全 key 范围内的旧 raw + sidecar 格式。该 root 必须由服务独占，因为 Node 没有可移植的 `openat/O_NOFOLLOW`，不能抵御有权同时替换目录项的恶意本机进程；本地 rename 也不等同于断电持久性承诺。它尚未接入 item/附件；接线前必须先完成 ownership manifest、outbox 与生命周期策略，生产再替换为 OSS/S3 实现。
 
 ## 环境配置原则
 
@@ -65,7 +67,13 @@ Router 必需配置：
 
 日常交付采用同一条 promotion 链：本地开发与 `verify` → CI 全部门禁 → 构建一次不可变镜像 → 按同一 image digest 部署 staging → 预发验收 → 同一 digest 灰度到 production。staging 与 production 不重新构建镜像，也不共享数据库、Redis、对象存储、密钥或 service key；环境差异只来自受控配置和 Secret。
 
-“本地完整”指当前已实现的 M1/M2 主链路可在真实 MySQL + Redis + router + runner 下运行，并可用假厂商做无费用日常回归、用显式 `.env` 门禁做真实模型验证。它不表示云依赖已经由本机替代：OpenAPI/SDK、完整数据生命周期、Blob/附件接线、M3 扩展和 M4 生产化仍按各自里程碑推进。
+改变公开 contract 的版本（包括 heartbeat 字段或 query 语义）采用 runner-first：先滚动 runner，排空并确认全部旧 runner 已退出，再验证所有新 runner 的 `/openapi.json` 版本一致，最后升级对外提供静态契约的 router。router 的健康探测同时校验 `/readyz` 与 `/v1/capabilities`：协议版本不匹配的 runner 不进入 hash ring，也不能通过 owner 重路由；没有兼容 runner 时 readiness/capabilities 返回 503。新旧 runner 混部窗口仍不能把新版 OpenAPI/SDK 宣告为 fleet 权威；若未来要求长期混部，必须另外设计按 capability/version 路由。
+
+当前已自动验证的发布物是两个独立的 Linux OCI 镜像：`agent-router` 与 `agent-runner` 各自构建、版本和部署，可以位于不同虚拟机或容器节点。“不可变镜像”指镜像内容在 local/CI 构建后由 digest 唯一确定，进入 staging/production 时不再重新编译或修改；不是 Windows/Linux 的虚拟机磁盘镜像。
+
+`pnpm build` 同时会为 router/runner 生成各自的单文件 ESM JavaScript bundle，可在装有 Node 24 和对应 production dependencies 的 Linux、macOS 或 Windows 主机运行，但它不是原生机器码二进制。目前 CI 对容器镜像和原生 Node bundle 都有启动门禁；生产默认推荐 OCI 镜像，因为依赖、Node 版本和文件布局也被一起冻结。若未来明确采用裸 VM，再增加带校验和的 bundle + production `node_modules` 发布包和 systemd 服务，不需要把两个服务合成一个二进制。
+
+“本地完整”指当前已实现的 M1/M2 主链路可在真实 MySQL + Redis + router + runner 下运行，并可用假厂商做无费用日常回归、用显式 `.env` 门禁做真实模型验证。它不表示云依赖已经由本机替代：完整数据生命周期、Blob/附件接线、M3 扩展和 M4 生产化仍按各自里程碑推进；OpenAPI/SDK 已纳入本地与 CI 门禁。
 
 当前 `MysqlSessionStore.connect()` 仍会自动执行迁移，适合 local/CI，但还不满足上文“生产迁移作为独立 Job”的目标。进入 staging 前必须拆出显式 migration 命令/Job，并让业务进程只做 schema 版本检查、禁止启动时自动 DDL；同时完成备份恢复与迁移失败后的人工审计/重试演练。
 

@@ -15,7 +15,9 @@ import { externalId } from "./common.js";
 export const JwtVerifier = z.object({
   kind: z.literal("jwt"),
   /** RFC 7517 key set URL. Preferred: no shared secret has to be stored. */
-  jwksUri: z.string().url().optional(),
+  jwksUri: z.string().url().optional().describe(
+    "Public HTTPS JWKS endpoint; production validation rejects plaintext and non-public destinations.",
+  ),
   /** HS256 with a shared secret held in the tenant's encrypted secret slot (no plaintext at rest). */
   hs256: z.boolean().default(false),
   algorithms: z.array(z.enum(["RS256", "RS384", "RS512", "ES256", "ES384", "PS256", "HS256"])).default(["RS256"]),
@@ -31,7 +33,9 @@ export type JwtVerifier = z.infer<typeof JwtVerifier>;
 export const IntrospectionVerifier = z.object({
   kind: z.literal("introspection"),
   /** RFC 7662-style endpoint, or any endpoint returning JSON with an active flag and a subject */
-  endpoint: z.string().url(),
+  endpoint: z.string().url().describe(
+    "Public HTTPS introspection endpoint; production validation rejects plaintext and non-public destinations.",
+  ),
   method: z.enum(["POST", "GET"]).default("POST"),
   /** header that carries the token being introspected when method=GET */
   tokenHeader: z.string().default("authorization"),
@@ -45,13 +49,45 @@ export const IntrospectionVerifier = z.object({
 });
 export type IntrospectionVerifier = z.infer<typeof IntrospectionVerifier>;
 
+/**
+ * Header names used to carry an inbound end-user token must not overlap with headers that establish
+ * service identity, assert user identity, or are owned by HTTP framing/proxy hops. Header names are
+ * case-insensitive, so the deny-list comparison must be as well.
+ *
+ * Keep this restriction on the inbound policy field only. `IntrospectionVerifier.tokenHeader` is an
+ * outbound header sent to the tenant's introspection service, where `Authorization` is intentional.
+ */
+const RESERVED_END_USER_TOKEN_HEADERS = new Set([
+  "authorization",
+  "connection",
+  "content-length",
+  "host",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "x-user-id",
+]);
+
+export const EndUserTokenHeaderName = z.string()
+  .regex(/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/, "must be a valid HTTP field name")
+  .refine((header) => !RESERVED_END_USER_TOKEN_HEADERS.has(header.toLowerCase()), {
+    message: "must not use a service identity, user identity, framing, or hop-by-hop header",
+  })
+  .describe("Non-reserved HTTP header carrying the inbound end-user token");
+export type EndUserTokenHeaderName = z.infer<typeof EndUserTokenHeaderName>;
+
 export const TenantAuthPolicy = z.discriminatedUnion("mode", [
   z.object({ mode: z.literal("trusted_caller") }),
   z.object({
     mode: z.literal("end_user_token"),
     verifier: z.discriminatedUnion("kind", [JwtVerifier, IntrospectionVerifier]),
     /** header carrying the end-user token; `Authorization` already carries the service key */
-    tokenHeader: z.string().default("x-end-user-token"),
+    tokenHeader: EndUserTokenHeaderName.default("x-end-user-token"),
   }),
 ]);
 export type TenantAuthPolicy = z.infer<typeof TenantAuthPolicy>;

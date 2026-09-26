@@ -29,12 +29,19 @@ export const idSchema = (prefix: IdPrefix) =>
     message: `expected ${prefix}_<uuidv7>`,
   });
 
-/** Free-form ids supplied by the caller (tenant ids, user ids, tool names). */
+/** Free-form ids supplied by the caller (for example tenant ids and tool names). */
 export const externalId = z.string().min(1).max(128);
+
+/**
+ * End-user ids become SQL values, Redis key material and log fields. Keep one unambiguous wire
+ * grammar across trusted headers, verified token subjects and delegated session creation.
+ */
+export const UserId = z.string().regex(/^[A-Za-z0-9._:@|-]{1,128}$/);
+export type UserId = z.infer<typeof UserId>;
 
 export const Principal = z.object({
   tenantId: externalId,
-  userId: externalId,
+  userId: UserId,
 });
 export type Principal = z.infer<typeof Principal>;
 
@@ -116,7 +123,7 @@ export const page = <T extends z.ZodTypeAny>(item: T) =>
   z.object({ data: z.array(item), nextCursor: z.string().nullable() });
 
 export const UsageQuery = z.object({
-  userId: externalId.optional(),
+  userId: UserId.optional(),
   sessionId: z.string().optional(),
   /** epoch ms, inclusive */
   from: z.coerce.number().int().optional(),

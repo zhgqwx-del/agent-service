@@ -1,13 +1,22 @@
 import { z } from "zod";
 import { externalId, idSchema, Usage } from "./common.js";
 
-/** Input parts accepted in a turn request and stored on a `userMessage` item. */
+export const TextInputPart = z.object({ type: z.literal("text"), text: z.string().min(1).max(100_000) });
+export const ImageInputPart = z.object({ type: z.literal("image"), url: z.string().url(), mimeType: z.string().optional() });
+export const SkillInputPart = z.object({
+  type: z.literal("skill"),
+  name: externalId,
+  args: z.string().optional(),
+});
+export const MentionInputPart = z.object({ type: z.literal("mention"), name: externalId });
+
+/** Full protocol vocabulary. Current HTTP turn inputs intentionally expose only TextInputPart. */
 export const InputPart = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("text"), text: z.string().min(1).max(100_000) }),
-  z.object({ type: z.literal("image"), url: z.string().url(), mimeType: z.string().optional() }),
+  TextInputPart,
+  ImageInputPart,
   /** explicit `/skill` invocation; the skill body is injected regardless of `disable-model-invocation` */
-  z.object({ type: z.literal("skill"), name: externalId, args: z.string().optional() }),
-  z.object({ type: z.literal("mention"), name: externalId }),
+  SkillInputPart,
+  MentionInputPart,
 ]);
 export type InputPart = z.infer<typeof InputPart>;
 

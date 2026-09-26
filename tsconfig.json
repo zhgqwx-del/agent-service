@@ -8,6 +8,9 @@
       "path": "packages/protocol"
     },
     {
+      "path": "packages/sdk"
+    },
+    {
       "path": "packages/store"
     },
     {

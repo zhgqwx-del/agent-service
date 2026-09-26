@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { PROTOCOL_VERSION, isCanonicalId, type Capabilities } from "@agent-service/protocol";
+import { Capabilities, OPENAPI_DOCUMENT, PROTOCOL_VERSION, isCanonicalId } from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
 
 export interface RouterAppDeps {
@@ -60,6 +60,9 @@ export function createRouterApp(deps: RouterAppDeps) {
   const maxBodyBytes = deps.maxBodyBytes ?? 1_000_000;
 
   app.get("/healthz", (c) => c.text("ok"));
+  // Serve the immutable contract locally. Forwarding this endpoint would make API discovery depend
+  // on fleet health and could expose a mixed-version runner's document during a rolling upgrade.
+  app.get("/openapi.json", (c) => c.json(OPENAPI_DOCUMENT));
   app.get("/readyz", (c) => {
     if (deps.ready && !deps.ready()) return c.text("draining", 503);
     const healthy = deps.registry.list().filter((t) => t.healthy).length;
@@ -72,18 +75,24 @@ export function createRouterApp(deps: RouterAppDeps) {
       try {
         const res = await fetch(`${target}/v1/capabilities`, { signal: AbortSignal.timeout(2_000) });
         if (res.ok) {
-          const caps = (await res.json()) as Capabilities;
-          return c.json({ ...caps, service: "agent-router" } satisfies Capabilities);
+          // A mixed or malformed runner must not make this router violate the contract it serves at
+          // /openapi.json. Deployment still drains old runners before promoting the new router.
+          const parsed = Capabilities.safeParse(await res.json());
+          if (parsed.success) {
+            return c.json({ ...parsed.data, service: "agent-router" } satisfies Capabilities);
+          }
         }
       } catch {
-        /* fall through to the static answer */
+        /* report unavailable below */
       }
     }
     return c.json({
-      protocolVersion: PROTOCOL_VERSION,
-      service: "agent-router",
-      features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 3_600_000 }, approvals: true, dynamicTools: true, mcp: [], skills: false, sandbox: ["none"], byok: true },
-    } satisfies Capabilities);
+      error: {
+        code: "draining",
+        message: `no healthy runner with protocol ${PROTOCOL_VERSION} is available`,
+        retryable: true,
+      },
+    }, 503);
   });
 
   /**
@@ -146,7 +155,7 @@ export function createRouterApp(deps: RouterAppDeps) {
       // The runner tells us who really owns this session; follow it exactly once.
       if (res.status === 409 && sessionId && reroutes < 1 && attempt < maxAttempts) {
         const owner = res.headers.get("x-owner");
-        const ownerUrl = owner ? deps.registry.toUrl(owner) : undefined;
+        const ownerUrl = owner ? deps.registry.routeableUrl(owner) : undefined;
         if (owner && !ownerUrl) log.warn(`[router] session ${sessionId}: owner "${owner}" is not a configured runner; check RUNNER_ADDR matches RUNNERS`);
         if (ownerUrl && !tried.has(ownerUrl)) {
           log.info(`[router] session ${sessionId}: re-routing to owner ${ownerUrl}`);

@@ -46,7 +46,7 @@ afterEach(async () => {
   for (const h of hosts.splice(0)) await h.drain(1_000).catch(() => {});
 });
 
-async function makeApp() {
+async function makeApp(heartbeatMs = 60_000) {
   const store = new MemorySessionStore();
   await store.createApiKey("t_dev", "k1", hashApiKey("dev-key"), ["runtime", "admin"]);
   const providers = new ProviderService({
@@ -60,7 +60,7 @@ async function makeApp() {
   const host = new SessionHost({ store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), engine: new EchoEngine(), providers: { resolve: async () => fake }, tools, config: { runnerId: "r", runnerAddr: "x", leaseHoldMs: 10 } });
   const cipher = new LocalAesGcmCipher("33".repeat(32));
   const app = createApp({
-    store, host, providers, tools, runnerId: "r", heartbeatMs: 60_000, maxBodyBytes: 1_000_000, ready: () => true,
+    store, host, providers, tools, runnerId: "r", heartbeatMs, maxBodyBytes: 1_000_000, ready: () => true,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
     assertPublicUrl: async () => {},
@@ -82,6 +82,87 @@ const parseSse = (text: string) =>
     });
 
 describe("agent-runner HTTP API", () => {
+  it("rejects M3-only agent declarations and turn inputs at the HTTP contract boundary", async () => {
+    const { call } = await makeApp();
+    const futureAgent = {
+      name: "future",
+      instructions: "",
+      model: { provider: "dashscope", model: "qwen-plus" },
+      skills: ["not-enabled"],
+    };
+    expect((await call("/v1/agents", { method: "POST", body: JSON.stringify(futureAgent) })).status).toBe(400);
+
+    const agent = await j<{ id: string }>(await call("/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "current", instructions: "", model: futureAgent.model }),
+    }));
+    const session = await j<{ id: string }>(await call("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.id }),
+    }));
+    for (const input of [
+      { type: "image", url: "https://example.test/image.png" },
+      { type: "skill", name: "future" },
+      { type: "mention", name: "future" },
+    ]) {
+      const response = await call(`/v1/sessions/${session.id}/turns`, {
+        method: "POST",
+        body: JSON.stringify({ input: [input], stream: false }),
+      });
+      expect(response.status).toBe(400);
+    }
+  });
+
+  it("uses the shared HTTP schemas for boolean and numeric query validation", async () => {
+    const { call } = await makeApp();
+    const agent = await j<{ id: string }>(await call("/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "queries", instructions: "", model: { provider: "dashscope", model: "qwen-plus" } }),
+    }));
+    const session = await j<{ id: string }>(await call("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.id }),
+    }));
+    expect((await call(`/v1/sessions/${session.id}/archive`, { method: "POST" })).status).toBe(200);
+
+    const hidden = await j<{ data: unknown[] }>(await call("/v1/sessions?includeArchived=false"));
+    const visible = await j<{ data: { id: string }[] }>(await call("/v1/sessions?includeArchived=true"));
+    expect(hidden.data).toEqual([]);
+    expect(visible.data.map(({ id }) => id)).toEqual([session.id]);
+    expect((await call("/v1/sessions?includeArchived=not-a-boolean")).status).toBe(400);
+    expect((await call(`/v1/agents/${agent.id}?version=not-a-number`)).status).toBe(400);
+    expect((await call(`/v1/sessions/${session.id}/events?after=not-a-number`)).status).toBe(400);
+    expect((await call(`/v1/providers/${"p".repeat(129)}`, {
+      method: "PUT",
+      body: JSON.stringify({}),
+    })).status).toBe(400);
+    expect((await call("/v1/tenant/api-keys/invalid%20key", { method: "DELETE" })).status).toBe(400);
+    expect((await call(`/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      headers: { "idempotency-key": "   " },
+      body: JSON.stringify({ input: [{ type: "text", text: "ignored" }], stream: false }),
+    })).status).toBe(400);
+  });
+
+  it("emits protocol-valid heartbeats with the subscribed session id", async () => {
+    const { call } = await makeApp(5);
+    const agent = await j<{ id: string }>(await call("/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "heartbeat", instructions: "", model: { provider: "dashscope", model: "qwen-plus" } }),
+    }));
+    const session = await j<{ id: string }>(await call("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.id }),
+    }));
+
+    const response = await call(`/v1/sessions/${session.id}/events?after=1`);
+    const reader = response.body!.getReader();
+    const { value } = await reader.read();
+    await reader.cancel();
+    const events = parseSse(new TextDecoder().decode(value ?? new Uint8Array()));
+    expect(events[0]).toMatchObject({ type: "heartbeat", sessionId: session.id });
+  });
+
   it("rejects missing/invalid auth and requires X-User-Id for user-scoped routes", async () => {
     const { app, call } = await makeApp();
     expect((await app.request("/v1/agents")).status).toBe(401);

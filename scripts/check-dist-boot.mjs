@@ -1,12 +1,14 @@
 // CI gate: both production bundles must boot under plain Node (without tsx), and the router must
 // discover and forward to the bundled runner.
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MASTER_KEY = "77".repeat(32); // deterministic test-only key
+const canonicalOpenApi = JSON.parse(await readFile(resolve(ROOT, "packages/protocol/openapi.json"), "utf8"));
 
 async function freePort() {
   return new Promise((resolvePort, reject) => {
@@ -62,6 +64,14 @@ async function waitHttp(url, label) {
   throw new Error(`${label} did not become ready at ${url} (${lastError})`);
 }
 
+async function assertOpenApi(url, label) {
+  const response = await waitHttp(url, label);
+  const actual = await response.json();
+  if (JSON.stringify(actual) !== JSON.stringify(canonicalOpenApi)) {
+    throw new Error(`${label} did not serve the canonical OpenAPI document`);
+  }
+}
+
 async function stop(proc) {
   if (!proc || proc.child.exitCode !== null) return;
   proc.child.kill("SIGTERM");
@@ -87,6 +97,7 @@ try {
     SHUTDOWN_GRACE_MS: "0",
   });
   await waitHttp(`http://127.0.0.1:${runnerPort}/readyz`, "bundled runner");
+  await assertOpenApi(`http://127.0.0.1:${runnerPort}/openapi.json`, "bundled runner OpenAPI");
 
   router = launch("router", "apps/agent-router/dist/main.js", {
     NODE_ENV: "test",
@@ -97,8 +108,14 @@ try {
     SHUTDOWN_GRACE_MS: "0",
   });
   await waitHttp(`http://127.0.0.1:${routerPort}/readyz`, "bundled router");
-  await waitHttp(`http://127.0.0.1:${routerPort}/v1/capabilities`, "router forwarding");
-  console.log("bundled runner and router started; readiness and forwarding passed");
+  await waitHttp(`http://127.0.0.1:${routerPort}/v1/capabilities`, "router protocol discovery");
+  const forwarded = await fetch(`http://127.0.0.1:${routerPort}/v1/agents`);
+  const forwardedBody = await forwarded.json();
+  if (forwarded.status !== 401 || forwardedBody?.error?.code !== "unauthorized") {
+    throw new Error("bundled router did not forward an authenticated API route to the runner");
+  }
+  await assertOpenApi(`http://127.0.0.1:${routerPort}/openapi.json`, "bundled router OpenAPI");
+  console.log("bundled runner and router started; readiness, forwarding, and OpenAPI passed");
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   for (const proc of [runner, router]) {

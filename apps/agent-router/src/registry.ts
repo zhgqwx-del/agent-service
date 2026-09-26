@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Redis } from "ioredis";
+import { Capabilities } from "@agent-service/protocol";
 
 /**
  * Where a session should go. Two sources, in priority order:
@@ -23,7 +24,7 @@ export interface RunnerRegistryOptions {
   runners: string[];
   redisUrl?: string;
   redisPrefix?: string;
-  /** how often to poll /readyz */
+  /** how often to poll readiness and protocol compatibility */
   healthIntervalMs?: number;
   /** virtual nodes per runner on the hash ring */
   virtualNodes?: number;
@@ -92,7 +93,7 @@ export class RunnerRegistry {
     if (!this.redis) return undefined;
     try {
       const addr = await this.redis.hget(`${this.opts.redisPrefix ?? "as"}:lease:{${sessionId}}`, "addr");
-      return addr ? this.toUrl(addr) : undefined;
+      return addr ? this.routeableUrl(addr) : undefined;
     } catch {
       return undefined; // the directory is a cache; losing it only costs an extra hop
     }
@@ -137,6 +138,12 @@ export class RunnerRegistry {
     return byPort.length === 1 ? byPort[0] : undefined;
   }
 
+  /** Resolve an advertised owner only when it passed both readiness and protocol probes. */
+  routeableUrl(addr: string): string | undefined {
+    const url = this.toUrl(addr);
+    return url && this.targets.get(url)?.healthy ? url : undefined;
+  }
+
   markFailure(url: string): void {
     const t = this.targets.get(url);
     if (!t) return;
@@ -148,9 +155,16 @@ export class RunnerRegistry {
     await Promise.all(
       [...this.targets.values()].map(async (t) => {
         try {
-          const res = await fetch(`${t.url}/readyz`, { signal: AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000) });
-          t.healthy = res.ok;
-          t.consecutiveFailures = res.ok ? 0 : t.consecutiveFailures + 1;
+          const signal = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
+          const ready = await fetch(`${t.url}/readyz`, { signal });
+          if (!ready.ok) throw new Error(`readiness returned ${ready.status}`);
+          const capabilities = await fetch(`${t.url}/v1/capabilities`, { signal });
+          const parsed = capabilities.ok ? Capabilities.safeParse(await capabilities.json()) : undefined;
+          if (!parsed?.success || parsed.data.service !== "agent-runner") {
+            throw new Error("runner protocol is incompatible");
+          }
+          t.healthy = true;
+          t.consecutiveFailures = 0;
         } catch {
           t.consecutiveFailures += 1;
           t.healthy = false;

@@ -12,7 +12,7 @@ import type { Event } from "@agent-service/protocol";
 export function sseResponse(
   c: Context,
   attach: (send: (e: Event) => void, close: () => void) => Promise<() => void>,
-  opts: { heartbeatMs: number },
+  opts: { heartbeatMs: number; sessionId: string },
 ) {
   c.header("X-Accel-Buffering", "no");
   c.header("Cache-Control", "no-cache");
@@ -50,7 +50,10 @@ export function sseResponse(
       close();
     });
     const hb = setInterval(() => {
-      if (accepting && !aborted) void stream.writeSSE({ event: "heartbeat", data: JSON.stringify({ type: "heartbeat", emittedAtMs: Date.now() }) }).catch(close);
+      if (accepting && !aborted) {
+        const event: Event = { type: "heartbeat", sessionId: opts.sessionId, emittedAtMs: Date.now() };
+        void stream.writeSSE({ event: event.type, data: JSON.stringify(event) }).catch(close);
+      }
     }, opts.heartbeatMs);
     try {
       const u = await attach(send, close);

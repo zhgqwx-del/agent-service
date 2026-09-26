@@ -6,16 +6,18 @@
 2. `docs/PROGRESS.md`：顶部当前快照和最后一节是进度事实来源。
 3. `docs/design/00-architecture.md`：架构基线与 M0–M4 定义。
 4. `docs/operations/local-and-deployment.md`：本地生命周期和未来部署契约。
+5. `docs/design/04-data-lifecycle.md`：删除、归档、usage 与 Blob 生命周期的当前设计门禁。
 
 `docs/review/` 与 `docs/research/` 是时间点快照；其中的旧测试数量、缺陷和“下一步”不能覆盖 `docs/PROGRESS.md` 的最新结论。
 
 ## 当前阶段
 
 - M0 完成。
-- M1 核心运行范围完成；OpenAPI/生成 SDK 与完整数据生命周期仍未闭环。
+- M1 核心运行范围、OpenAPI 3.1 与生成 TypeScript SDK 已完成；完整数据生命周期仍未闭环。
 - M2 的本地/CI 代码范围已完成并正式冻结；尚未正式进入 M3，云上部署不属于本次冻结范围。
 - M3 的 MCP/skills/hooks 主体和 M4 的生产化主体尚未开始。
-- session 创建与首条事件原子化、`0007 -> 0008` 历史升级夹具已经收口；当前优先补齐 M1 的 OpenAPI/生成 SDK 与完整数据生命周期缺口，再正式进入 M3。
+- session 创建与首条事件原子化、`0007 -> 0008` 历史升级夹具、OpenAPI/SDK 已收口；当前优先按 `docs/design/04-data-lifecycle.md` 确认并实现数据生命周期，完成后再正式进入 M3。
+- BlobStore 的跨平台 key、防损坏单-envelope 原子发布、旧安全格式读取/删除、私有权限、静态 symlink 防护和 memory 复制语义已有测试；filesystem root 必须由服务独占，且不承诺断电持久性。item/附件接线、ownership manifest、outbox 与 purge 尚未完成，不能宣称大输出生命周期已闭环。
 
 ## 工作边界
 
@@ -27,6 +29,8 @@
 
 ```bash
 scripts/local-service.sh verify
+pnpm check:api
+pnpm check:sdk
 pnpm test:migrations
 scripts/local-service.sh verify-real
 scripts/local-service.sh acceptance

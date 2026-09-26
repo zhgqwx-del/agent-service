@@ -133,16 +133,19 @@ smoke() {
   curl -fsS "$RUNNER_URL/readyz" >/dev/null
   curl -fsS "$ROUTER_URL/readyz" >/dev/null
   curl -fsS "$ROUTER_URL/v1/capabilities" >/dev/null
+  curl -fsS "$RUNNER_URL/openapi.json" >/dev/null
+  curl -fsS "$ROUTER_URL/openapi.json" >/dev/null
   local code
   code="$(curl -sS -o /dev/null -w '%{http_code}' "$ROUTER_URL/v1/agents")"
   [ "$code" = "401" ] || die "unauthenticated request returned $code, expected 401"
-  echo "smoke: health, readiness, router forwarding and auth rejection passed"
+  echo "smoke: health, readiness, OpenAPI, router forwarding and auth rejection passed"
 }
 
 verify() {
   require_tools
   deploy/local/infra.sh start
   pnpm run check:secrets
+  pnpm run check:api
   pnpm typecheck
   AGENT_SERVICE_INTEGRATION=1 \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \

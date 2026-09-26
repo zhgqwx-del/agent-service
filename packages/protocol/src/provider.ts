@@ -46,7 +46,9 @@ export const ProviderConfig = z.object({
   tenantId: externalId,
   name: z.string().max(128).optional(),
   api: z.enum(["openai-completions"]).default("openai-completions"),
-  baseUrl: z.string().url(),
+  baseUrl: z.string().url().describe(
+    "Public HTTP(S) provider endpoint. The runner resolves and rejects loopback, private, link-local, and otherwise non-public hosts before storing it.",
+  ),
   /** opaque reference to the encrypted secret; absent for keyless endpoints */
   apiKeyRef: z.string().optional(),
   headers: z.record(z.string()).default({}),

@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { Event, Item, mergeLimits, StartTurnRequest, idSchema } from "../src/index.js";
+import {
+  EndUserTokenHeaderName,
+  Event,
+  IntrospectionVerifier,
+  Item,
+  mergeLimits,
+  StartTurnRequest,
+  idSchema,
+} from "../src/index.js";
 
 describe("protocol schemas", () => {
   it("validates ids", () => {
@@ -33,5 +41,36 @@ describe("protocol schemas", () => {
 
   it("rejects unknown item types", () => {
     expect(Item.safeParse({ type: "nope" }).success).toBe(false);
+  });
+
+  it("accepts custom end-user token headers but rejects invalid or reserved HTTP headers", () => {
+    for (const valid of ["x-end-user-token", "X-Tenant-Auth", "end.user_token+v2"]) {
+      expect(EndUserTokenHeaderName.safeParse(valid).success, valid).toBe(true);
+    }
+    for (const reserved of [
+      "authorization",
+      "AUTHORIZATION",
+      "x-user-id",
+      "Host",
+      "content-length",
+      "connection",
+      "keep-alive",
+      "proxy-authenticate",
+      "proxy-authorization",
+      "proxy-connection",
+      "te",
+      "trailer",
+      "transfer-encoding",
+      "upgrade",
+    ]) {
+      expect(EndUserTokenHeaderName.safeParse(reserved).success, reserved).toBe(false);
+    }
+    for (const invalid of ["", "x token", "x:token", "x-token\nforwarded", "令牌"]) {
+      expect(EndUserTokenHeaderName.safeParse(invalid).success, JSON.stringify(invalid)).toBe(false);
+    }
+  });
+
+  it("keeps Authorization valid for the outbound introspection token header", () => {
+    expect(IntrospectionVerifier.parse({ kind: "introspection", endpoint: "https://auth.example/introspect" }).tokenHeader).toBe("authorization");
   });
 });

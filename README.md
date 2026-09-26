@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路已实现，包括摘要级压缩、usage 查询、端用户鉴权和 API key scope；原始里程碑中的 OpenAPI/生成 SDK、完整数据生命周期仍待完成。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI 3.1 和生成 TypeScript SDK 已实现；完整数据生命周期仍待按 `docs/design/04-data-lifecycle.md` 的策略门禁确认并实现。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -37,11 +37,13 @@ pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
 pnpm test:migrations                          # 固定 0007 历史库 → 0008 的真实 MySQL 升级夹具
 pnpm test:cluster                             # + 多进程集群：2~3 runner + 1 router，SIGKILL 租约持有者
+pnpm check:api                                # OpenAPI 与生成 SDK 漂移检查
+pnpm check:sdk                                # 编译 SDK、原生 Node import，并校验 pnpm pack 内容
 set -a; source .env; set +a; AGENT_SERVICE_REAL_E2E=1 pnpm vitest run packages/providers/test/e2e-qwen.test.ts
 pnpm typecheck
 
-# 生产构建（单文件，原生 node 启动，不依赖 tsx）
-pnpm build && pnpm build:check
+# 生产构建验证（SDK 发布包 + 两个应用的单文件 bundle，原生 node 启动，不依赖 tsx）
+pnpm build:check
 docker build --build-arg APP=agent-runner -t agent-runner .
 ```
 
@@ -52,7 +54,7 @@ scripts/local-service.sh start
 scripts/local-service.sh status
 scripts/local-service.sh smoke
 scripts/local-service.sh acceptance   # 使用真实模型，会产生少量费用
-scripts/local-service.sh verify       # secret scan + typecheck + 集成/coverage + 历史迁移 + cluster + 构建产物启动
+scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 历史迁移 + cluster + 构建产物启动
 scripts/local-service.sh verify-real  # 仅在显式命令下读取 .env 的真实模型 key
 scripts/local-service.sh cleanup-idempotency --dry-run  # 检查/分批清理过期 completed receipt
 scripts/local-service.sh stop
@@ -72,7 +74,7 @@ scripts/local-service.sh stop
 
 ## API 速览（`apps/agent-runner`）
 
-鉴权两层：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（→ user）。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入。
+鉴权两层：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（trusted caller）或 runner 验证的端用户 token。入站 token header 不能占用 service/user/framing/hop-by-hop 保留头；即使数据库中存在升级前的坏策略，admin service key 仍可通过 `/v1/tenant/auth` 修复。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入。
 
 ```bash
 H=(-H "Authorization: Bearer dev-key" -H "X-User-Id: u_42" -H "Content-Type: application/json")
@@ -88,10 +90,10 @@ curl -sN -X POST "localhost:8787/v1/sessions/sess_.../turns?exclude=usage/update
 # 其他：GET .../items | .../turns | POST .../turns/{id}/interrupt | steer | tool-results（动态工具回填）
 #       GET/POST .../approvals/{id} {decision: accept|acceptForSession|decline|cancel}
 #       GET/PUT/DELETE /v1/providers/{id}（BYOK，apiKey 只写不读，AES-GCM 落库）  GET /v1/models  GET /v1/tools
-#       POST .../resume  GET /v1/capabilities  GET /healthz /readyz
+#       POST .../resume  GET /v1/capabilities  GET /openapi.json  GET /healthz /readyz
 ```
 
-事件类型与资源 schema 在 `packages/protocol/src/`（zod，单一真相）。
+事件类型与资源 schema 在 `packages/protocol/src/`（zod，单一真相）。`pnpm generate:api` 由同一组 schema 确定性生成并提交 `packages/protocol/openapi.json`、运行时文档常量和 SDK route types；CI 的 `pnpm check:api` 会阻止手改或漏生成。`packages/sdk` 提供可编译/打包的 ESM TypeScript SDK、`openapi-fetch` 类型化客户端、`startTurnStream`、`subscribeSessionEvents` 和增量 SSE 解析器；`pnpm check:sdk` 从实际发布包入口验证消费者路径。
 
 ## 目录
 
@@ -99,6 +101,7 @@ curl -sN -X POST "localhost:8787/v1/sessions/sess_.../turns?exclude=usage/update
 apps/agent-runner      Hono HTTP + SSE；鉴权；幂等；路由 → SessionHost
 apps/agent-router      无状态路由；owner 目录、一致性哈希、SSE 透传与安全重路由
 packages/protocol      资源 / 事件 / 错误 schema（zod）
+packages/sdk           从 OpenAPI 生成的 TypeScript 路由类型、类型化客户端与 SSE 流式辅助函数
 packages/store         SessionStore / LeaseStore / EventBus / BlobStore 接口；memory、MySQL（fenced commit）、Redis（Lua 租约、Streams 热重放）实现；migrations/
 packages/core          AgentEngine 接口 + PiEngine（pi-agent-core 适配）；SessionHost（租约续期、write-ahead、审批门、安全阀、崩溃修复、事件序列化）；上下文装配；内置工具
 packages/providers     BYOK provider 配置 → pi Model；密钥加密；国内厂商 preset

@@ -71,10 +71,11 @@ export type LiveEvent = Exclude<Event, PersistedEvent>;
 export const isPersistedEvent = (e: Event): e is PersistedEvent => typeof (e as { seq?: unknown }).seq === "number";
 
 /** Event types a client may exclude on subscription (`?exclude=item/reasoning/delta,...`). */
-export const EXCLUDABLE_EVENT_TYPES: EventType[] = [
+export const EXCLUDABLE_EVENT_TYPES = [
   "item/reasoning/delta",
   "item/toolCall/argsDelta",
   "item/agentMessage/delta",
   "usage/updated",
   "heartbeat",
-];
+] as const satisfies readonly EventType[];
+export type ExcludableEventType = (typeof EXCLUDABLE_EVENT_TYPES)[number];

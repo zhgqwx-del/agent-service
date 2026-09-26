@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
-import { ApiError, DEFAULT_AUTH_POLICY, type ApiKeyScope, type Principal, type TenantAuthPolicy } from "@agent-service/protocol";
+import { ApiError, DEFAULT_AUTH_POLICY, UserId, type ApiKeyScope, type Principal, type TenantAuthPolicy } from "@agent-service/protocol";
 import type { SessionStore, TenantRecord } from "@agent-service/store";
 import { buildVerifier, type EndUserVerifier } from "./end-user-auth.js";
 
@@ -16,9 +16,6 @@ export interface AuthContext {
   /** true when the end user was proven, not merely asserted by the caller */
   userVerified: boolean;
 }
-
-/** End-user ids end up in log lines, Redis keys and SQL; keep them to an unambiguous charset. */
-const USER_ID_RE = /^[A-Za-z0-9._:@|-]{1,128}$/;
 
 /** Tokens are verified by a library; cap the size before handing anything to it. */
 const MAX_TOKEN_BYTES = 8 * 1024;
@@ -103,6 +100,7 @@ export function authMiddleware(deps: AuthDeps): MiddlewareHandler<AuthEnv> {
     if (!m) throw new ApiError("unauthorized", "missing service api key (Authorization: Bearer ...)");
     const rec = await deps.store.resolveApiKey(hashApiKey(m[1]!.trim()));
     if (!rec) throw new ApiError("unauthorized", "invalid api key");
+    const tenantConfigRoute = isTenantConfigRoute(c.req.path);
 
     let record: TenantRecord;
     let verifier: EndUserVerifier | undefined;
@@ -111,7 +109,7 @@ export function authMiddleware(deps: AuthDeps): MiddlewareHandler<AuthEnv> {
     } catch (err) {
       // A broken policy (e.g. hs256 with no secret) must not take the whole tenant down: the admin
       // routes still have to work so it can be repaired. Everything else is refused.
-      if (isTenantConfigRoute(c.req.path)) {
+      if (tenantConfigRoute) {
         record = { tenantId: rec.tenantId, authPolicy: DEFAULT_AUTH_POLICY, createdAtMs: 0 };
         c.set("authBroken", err instanceof Error ? err.message : String(err));
       } else {
@@ -119,17 +117,20 @@ export function authMiddleware(deps: AuthDeps): MiddlewareHandler<AuthEnv> {
       }
     }
 
-    const asserted = c.req.header("x-user-id")?.trim() || "";
-    if (asserted && !USER_ID_RE.test(asserted)) throw new ApiError("invalid_request", "X-User-Id must match [A-Za-z0-9._:@|-]{1,128}");
+    // Tenant-auth administration is the recovery path for every historical or malformed policy. Once
+    // the service key has resolved the tenant, do not let that policy interpret ambient request headers
+    // as an end-user token and lock an administrator out. The route handler still requires admin scope.
+    const asserted = tenantConfigRoute ? "" : c.req.header("x-user-id")?.trim() || "";
+    if (asserted && !UserId.safeParse(asserted).success) throw new ApiError("invalid_request", "X-User-Id must match [A-Za-z0-9._:@|-]{1,128}");
     let userId = "";
     let userVerified = false;
 
-    if (record.authPolicy.mode === "end_user_token" && verifier) {
+    if (!tenantConfigRoute && record.authPolicy.mode === "end_user_token" && verifier) {
       const token = c.req.header(record.authPolicy.tokenHeader)?.trim();
       if (token) {
         if (Buffer.byteLength(token) > MAX_TOKEN_BYTES) throw new ApiError("unauthorized", "end-user token is too large");
         const verified = await verifier.verify(token);
-        if (!USER_ID_RE.test(verified.userId)) throw new ApiError("unauthorized", "the verified end-user id has an unacceptable shape");
+        if (!UserId.safeParse(verified.userId).success) throw new ApiError("unauthorized", "the verified end-user id has an unacceptable shape");
         if (asserted && asserted !== verified.userId) throw new ApiError("forbidden", "X-User-Id does not match the verified end-user token");
         userId = verified.userId;
         userVerified = true;

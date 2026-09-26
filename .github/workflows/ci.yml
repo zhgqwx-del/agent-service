@@ -46,6 +46,9 @@ jobs:
         run: node scripts/check-secrets.mjs
       - run: pnpm install --frozen-lockfile
 
+      - name: Verify OpenAPI and generated SDK are current
+        run: pnpm run check:api
+
       - name: Typecheck (sources and tests)
         run: pnpm typecheck
 
@@ -82,6 +85,9 @@ jobs:
           CLUSTER_MYSQL_URL: mysql://root@127.0.0.1:3306/agent_service_cluster
           CLUSTER_REDIS_URL: redis://127.0.0.1:6379/3
         run: pnpm vitest run test/cluster
+
+      - name: Build distributable artifacts and boot plain Node bundles
+        run: pnpm run build:check
 
       - name: Upload coverage
         if: always()
@@ -153,6 +159,7 @@ jobs:
             if [ "$i" = "60" ]; then echo "never became reachable"; docker logs app; exit 1; fi
             sleep 1
           done
+          curl -fsS "http://127.0.0.1:$PORT/openapi.json" | grep -q '"openapi":"3.1.0"'
           # Docker's own healthcheck must agree, which is what catches a wrong port in HEALTHCHECK.
           for i in $(seq 1 40); do
             status=$(docker inspect -f '{{.State.Health.Status}}' app)

@@ -40,6 +40,7 @@ import {
   type TenantRecord,
   type UsageLedgerEntry,
 } from "./types.js";
+import { validateBlobKey } from "./blob/key.js";
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -407,15 +408,23 @@ export class MemoryEventBus implements EventBus {
 }
 
 export class MemoryBlobStore implements BlobStore {
-  blobs = new Map<string, { data: Buffer; contentType?: string }>();
+  private readonly blobs = new Map<string, { data: Buffer; contentType?: string }>();
+  private keyFromRef(ref: string) {
+    if (!ref.startsWith("mem://")) throw new Error("invalid memory blob reference");
+    const key = ref.slice("mem://".length);
+    validateBlobKey(key);
+    return key;
+  }
   async put(key: string, data: Buffer | string, contentType?: string) {
-    this.blobs.set(key, { data: Buffer.isBuffer(data) ? data : Buffer.from(data), contentType });
+    validateBlobKey(key);
+    this.blobs.set(key, { data: Buffer.from(data), contentType });
     return { ref: `mem://${key}` };
   }
   async get(ref: string) {
-    return this.blobs.get(ref.replace(/^mem:\/\//, "")) ?? null;
+    const blob = this.blobs.get(this.keyFromRef(ref));
+    return blob ? { ...blob, data: Buffer.from(blob.data) } : null;
   }
   async delete(ref: string) {
-    this.blobs.delete(ref.replace(/^mem:\/\//, ""));
+    this.blobs.delete(this.keyFromRef(ref));
   }
 }
