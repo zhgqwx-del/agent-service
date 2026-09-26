@@ -224,6 +224,24 @@ describe("SessionHost", () => {
     expect(ap.decision).toBe("decline");
   });
 
+  it("never executes an approval accepted after its deadline", async () => {
+    const h = await setup([{ text: "", toolCalls: [{ name: "danger", args: { text: "x" } }] }, { text: "after" }], {}, { approvalTtlMs: 200 });
+    await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
+    const event = await waitFor(() => h.events.find((e) => e.type === "approval/requested"));
+    const approval = (event as Extract<Event, { type: "approval/requested" }>).approval;
+
+    // Block the timer callback past the deadline, then race a nominal accept against it. The stored
+    // deadline remains authoritative even if the user callback reaches the microtask queue first.
+    while (Date.now() <= approval.expiresAtMs + 5) { /* deliberate event-loop stall */ }
+    const resolved = await h.host.resolveApproval(principal, h.session.id, approval.id, "accept");
+    expect(resolved).toMatchObject({ status: "expired", decision: "decline", decidedBy: "system:timeout" });
+
+    await waitIdle(h);
+    const items = await h.store.listItems(h.session.id, { limit: 100 });
+    expect(items.find((item) => item.type === "toolCall")).toMatchObject({ status: "declined" });
+    expect(items.find((item) => item.type === "toolResult")).toMatchObject({ isError: true });
+  });
+
   it("enforces maxSteps and maxToolCalls (policy can only tighten)", async () => {
     let h = await setup(Array.from({ length: 5 }, (_, i) => ({ text: `s${i}`, toolCalls: [{ name: "echo", args: { text: "x" } }] })), { limits: { maxSteps: 10 } });
     let r = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {}, limits: { maxSteps: 2 } });

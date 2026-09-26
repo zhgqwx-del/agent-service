@@ -785,17 +785,19 @@ export class SessionHost {
       sessionPatch: { status },
     });
 
-    const decision = await new Promise<ApprovalDecision>((resolve) => {
+    const resolution = await new Promise<{ decision: ApprovalDecision; timedOut: boolean }>((resolve) => {
       const timer = setTimeout(() => {
         state.pendingApprovals.delete(approval.id);
         state.abort.signal.removeEventListener("abort", onAbort);
-        resolve("decline");
+        // The timer firing is the authoritative timeout signal. Comparing Date.now() alone is racy:
+        // its millisecond clock can still read one tick before expiresAtMs on a loaded CI runner.
+        resolve({ decision: "decline", timedOut: true });
       }, this.cfg.approvalTtlMs);
       // Without this, drain()/interrupt()/fence-loss would block for the whole approval TTL.
       function onAbort() {
         clearTimeout(timer);
         state.pendingApprovals.delete(approval.id);
-        resolve("cancel");
+        resolve({ decision: "cancel", timedOut: false });
       }
       state.abort.signal.addEventListener("abort", onAbort, { once: true });
       state.pendingApprovals.set(approval.id, {
@@ -803,12 +805,15 @@ export class SessionHost {
         resolve: (d) => {
           clearTimeout(timer);
           state.abort.signal.removeEventListener("abort", onAbort);
-          resolve(d);
+          resolve({ decision: d, timedOut: false });
         },
       });
     });
     const resolvedAt = Date.now();
-    const expired = resolvedAt >= approval.expiresAtMs;
+    const expired = resolution.timedOut || resolvedAt >= approval.expiresAtMs;
+    // A user response that reaches the event loop after the deadline must never execute the tool,
+    // even when its callback wins the race with the delayed timeout callback.
+    const decision: ApprovalDecision = expired ? "decline" : resolution.decision;
     const finalApproval: Approval = { ...approval, status: expired ? "expired" : "resolved", decision, resolvedAtMs: resolvedAt, decidedBy: expired ? "system:timeout" : principal.userId };
     const doneItem: Item = { ...reqItem, status: decision === "accept" || decision === "acceptForSession" ? "completed" : "declined", completedAtMs: resolvedAt };
     const back = { type: "active" as const, turnId: state.turn.id, activeFlags: [] as ("waitingOnApproval" | "waitingOnUserInput")[] };

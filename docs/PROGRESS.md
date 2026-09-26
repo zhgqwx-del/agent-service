@@ -80,10 +80,11 @@
 3. Router：只重试真正实现幂等的 turn POST；`MAX_ATTEMPTS` 明确为总发送次数；header timeout 会取消底层 fetch；router/runner 请求体上限统一为 1 MB。
 4. 构建交付：修复损坏的 lockfile；Docker runtime 不再联网解析依赖；CI 构建并启动 runner/router 镜像；生产 runner identity/address 规则收紧。
 5. 运维测试：新增 `scripts/local-service.sh` 的 start/stop/restart/status/logs/smoke/acceptance/verify/verify-real；危险集群测试只允许测试库名和非零 Redis DB；真实模型测试改为显式开关；CI/本地 verify 增加凭据扫描且不打印命中值。
+6. Linux CI 回归：审批超时以 timer 触发作为权威信号，且到期后的迟到 `accept` 强制按拒绝处理，避免毫秒时钟竞态导致工具误执行；已补充回归测试。
 
 ### 实测结果
 
-- `scripts/local-service.sh verify`：类型检查通过；MySQL/Redis 集成套件 **189 passed / 1 skipped**；覆盖率 **78.55% statements / 67.32% branches / 75.44% functions / 83.28% lines**，全部高于门槛；集群套件 **8/8 passed**。
+- `scripts/local-service.sh verify`：类型检查通过；MySQL/Redis 集成套件 **190 passed / 1 skipped**；覆盖率 **78.56% statements / 67.39% branches / 75.44% functions / 83.28% lines**，全部高于门槛；集群套件 **8/8 passed**。
 - `pnpm run build:check`：runner/router bundle 均在原生 Node 下启动，readiness 和 router forwarding 通过。
 - 显式真实模型 E2E：**1/1 passed**。
 - `scripts/local-service.sh acceptance`：MySQL + Redis + router + runner + 真实模型的十阶段验收全部通过，包括 SSE、重放、幂等、上下文、安全阀、隔离、请求体限制与 BYOK。
