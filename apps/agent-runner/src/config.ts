@@ -36,6 +36,13 @@ const Env = z.object({
   BLOB_CLEANUP_POISON_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
   /** Durable user-erasure worker. Kept separate from request admission for drain/forward-fix. */
   ERASURE_WORKER_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /**
+   * One-way historical tombstone compensation worker. Enabling it participates in the v2 fleet
+   * barrier and may activate the durable cutover that rejects pre-0009 deletion writes.
+   */
+  LEGACY_TOMBSTONE_COMPENSATION_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** Base URL of the private router control plane; required only while this worker is enabled. */
   ERASURE_ROUTER_URL: z.string().trim().min(1).optional(),
   ERASURE_WORKER_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
@@ -44,6 +51,11 @@ const Env = z.object({
   ERASURE_WORKER_SESSION_PAGE_SIZE: z.coerce.number().int().min(1).max(200).default(100),
   ERASURE_WORKER_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
   ERASURE_WORKER_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
+  LEGACY_TOMBSTONE_COMPENSATION_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  LEGACY_TOMBSTONE_COMPENSATION_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+  LEGACY_TOMBSTONE_COMPENSATION_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(10),
+  LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** Bounded wait for a local provider/tool execution to acknowledge an erasure abort. */
   ERASURE_DRAIN_TIMEOUT_MS: z.coerce.number().int().min(1).max(28_000).default(10_000),
   /** End-to-end deadline; must exceed Host drain and the router's 15s upstream-header default. */
@@ -172,6 +184,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (c.ERASURE_WORKER_RETRY_MAX_MS < c.ERASURE_WORKER_RETRY_BASE_MS) {
     throw new Error("ERASURE_WORKER_RETRY_MAX_MS must be at least ERASURE_WORKER_RETRY_BASE_MS");
   }
+  if (
+    c.LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS
+      < c.LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS
+  ) {
+    throw new Error(
+      "LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS must be at least "
+        + "LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS",
+    );
+  }
   if (c.ERASURE_WORKER_REQUEST_TIMEOUT_MS <= c.ERASURE_DRAIN_TIMEOUT_MS + ERASURE_REQUEST_TIMEOUT_MARGIN_MS) {
     throw new Error(
       `ERASURE_WORKER_REQUEST_TIMEOUT_MS must be greater than ERASURE_DRAIN_TIMEOUT_MS + ${ERASURE_REQUEST_TIMEOUT_MARGIN_MS}ms`,
@@ -180,11 +201,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const erasureRouterUrl = c.ERASURE_ROUTER_URL === undefined
     ? undefined
     : validateErasureRouterUrl(c.ERASURE_ROUTER_URL);
-  if (c.ERASURE_WORKER_ENABLED && erasureRouterUrl === undefined) {
-    throw new Error("ERASURE_ROUTER_URL is required when ERASURE_WORKER_ENABLED=1");
+  if (
+    (c.ERASURE_WORKER_ENABLED || c.LEGACY_TOMBSTONE_COMPENSATION_ENABLED)
+    && erasureRouterUrl === undefined
+  ) {
+    throw new Error(
+      "ERASURE_ROUTER_URL is required when ERASURE_WORKER_ENABLED=1 or "
+        + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1",
+    );
   }
   if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.ERASURE_WORKER_ENABLED) {
     throw new Error("ERASURE_WORKER_ENABLED=1 is required before DATA_ERASURE_REQUESTS_ENABLED=1");
+  }
+  if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.LEGACY_TOMBSTONE_COMPENSATION_ENABLED) {
+    throw new Error(
+      "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1 is required before "
+        + "DATA_ERASURE_REQUESTS_ENABLED=1",
+    );
   }
   if (c.BLOB_ATTACHMENTS_ENABLED && !c.BLOB_CLEANUP_ENABLED) {
     throw new Error("BLOB_CLEANUP_ENABLED=1 is required before BLOB_ATTACHMENTS_ENABLED=1");

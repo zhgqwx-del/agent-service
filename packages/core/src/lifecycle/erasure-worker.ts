@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
   ErasureTombstoneIntegrityError,
+  LegacyTombstoneIntegrityFault,
+  LegacyTombstoneJobConflictError,
+  legacyTombstoneCompensationJobIdForSession,
   UsageIdentityConflictError,
   UsageLifecycleGenerationError,
   UsageReconciliationError,
@@ -15,6 +18,7 @@ import type {
   ErasureSessionPage,
   ErasureUsageReconciliationStore,
   ErasureWriteAuthorization,
+  LegacyTombstoneCompensationStore,
 } from "@agent-service/store";
 
 export type ErasureSessionExecutionFailureCode =
@@ -58,6 +62,8 @@ export interface ErasureWorkerDeps {
   jobs: ErasureJobStore;
   catalog: ErasureSessionCatalogStore;
   usage: ErasureUsageReconciliationStore;
+  /** Optional only for backward-compatible unit composition; production wiring always supplies it. */
+  legacyTombstones?: LegacyTombstoneCompensationStore;
   executor: ErasureSessionExecutor;
   /**
    * Fleet-wide activation barrier checked before every claim pass. It is required so a future
@@ -141,8 +147,10 @@ function executionFailureCode(error: unknown): ErasureSessionExecutionFailureCod
  * automatic retries: retrying the same claim cannot repair the conflicting facts and would hide a
  * policy/integrity incident behind an endless `temporary_failure` loop.
  */
-function isErasureUsageIntegrityConflict(error: unknown): boolean {
+function isErasureIntegrityConflict(error: unknown): boolean {
   return error instanceof ErasureTombstoneIntegrityError
+    || error instanceof LegacyTombstoneIntegrityFault
+    || error instanceof LegacyTombstoneJobConflictError
     || error instanceof UsageIdentityConflictError
     || error instanceof UsageLifecycleGenerationError
     || error instanceof UsageReconciliationError;
@@ -356,7 +364,7 @@ export class ErasureWorker {
     } catch (error) {
       if (error === RUN_STOPPED || signal?.aborted || error === CLAIM_LOST) return false;
       if (!(await heartbeat.current()) || signal?.aborted) return false;
-      if (isErasureUsageIntegrityConflict(error)) {
+      if (isErasureIntegrityConflict(error)) {
         return await this.block(
           claim.status,
           authority,
@@ -481,7 +489,14 @@ export class ErasureWorker {
           return await this.block("reconciling_usage", authority, heartbeat, "integrity_conflict", signal);
         }
         if (session.deletionGeneration === 0) {
-          return await this.block("reconciling_usage", authority, heartbeat, "legacy_blocked", signal);
+          return await this.deferLegacyTombstone(
+            claim,
+            authority,
+            userAuthority,
+            session.sessionId,
+            heartbeat,
+            signal,
+          );
         }
         if (session.tombstoneProofValid !== true) {
           return await this.block("reconciling_usage", authority, heartbeat, "integrity_conflict", signal);
@@ -514,7 +529,16 @@ export class ErasureWorker {
 
     const progress = await this.inspectProgress(userAuthority, "reconciling_usage", heartbeat, signal);
     if (progress.legacyGenerationZeroSessions > 0) {
-      return await this.block("reconciling_usage", authority, heartbeat, "legacy_blocked", signal);
+      if (!this.deps.legacyTombstones) {
+        return await this.block("reconciling_usage", authority, heartbeat, "legacy_blocked", signal);
+      }
+      return await this.retry(
+        claim,
+        authority,
+        heartbeat,
+        "legacy_compensation_pending",
+        signal,
+      );
     }
     if (
       progress.liveSessions > 0
@@ -608,11 +632,55 @@ export class ErasureWorker {
     });
   }
 
+  private async deferLegacyTombstone(
+    claim: ErasureJobClaim,
+    authority: ErasureJobAuthorization,
+    userAuthority: ErasureWriteAuthorization,
+    sessionId: string,
+    heartbeat: ClaimHeartbeat,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (!this.deps.legacyTombstones) {
+      return await this.block("reconciling_usage", authority, heartbeat, "legacy_blocked", signal);
+    }
+    await this.requireCurrent(heartbeat, signal);
+    const atMs = this.clock.now();
+    const job = await this.deps.legacyTombstones.scheduleLegacyTombstoneCompensation(
+      userAuthority,
+      {
+        jobId: legacyTombstoneCompensationJobIdForSession(sessionId),
+        sessionId,
+        atMs,
+        availableAtMs: atMs,
+      },
+    );
+    await this.requireCurrent(heartbeat, signal);
+    if (job.status === "terminal_incident") {
+      return await this.block(
+        "reconciling_usage",
+        authority,
+        heartbeat,
+        "integrity_conflict",
+        signal,
+      );
+    }
+    return await this.retry(
+      claim,
+      authority,
+      heartbeat,
+      "legacy_compensation_pending",
+      signal,
+    );
+  }
+
   private async retry(
     claim: ErasureJobClaim,
     authority: ErasureJobAuthorization,
     heartbeat: ClaimHeartbeat,
-    errorCode: ErasureSessionExecutionFailureCode,
+    errorCode: Extract<
+      ErasureJobErrorCode,
+      ErasureSessionExecutionFailureCode | "legacy_compensation_pending"
+    >,
     signal?: AbortSignal,
   ): Promise<boolean> {
     await this.requireCurrent(heartbeat, signal);

@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { emptyUsage, type Session } from "@agent-service/protocol";
 import {
   ErasureTombstoneIntegrityError,
+  LegacyTombstoneIntegrityFault,
+  LegacyTombstoneJobConflictError,
+  legacyTombstoneCompensationJobIdForSession,
   MemorySessionStore,
   UsageIdentityConflictError,
   UsageLifecycleGenerationError,
@@ -23,8 +26,11 @@ import type {
   ErasureSubjectProgress,
   ErasureUsageReconciliationInput,
   ErasureWriteAuthorization,
+  LegacyTombstoneCompensationJobRecord,
+  LegacyTombstoneCompensationStore,
   RenewErasureJobClaimOptions,
   RetryErasureJobOptions,
+  ScheduleLegacyTombstoneCompensationInput,
   TransitionErasureJobOptions,
   UsageReconciliationRecord,
 } from "@agent-service/store";
@@ -35,9 +41,9 @@ import {
   type ErasureSessionExecutor,
 } from "../src/index.js";
 
-const SESSION_1 = "sess_00000000-0000-4000-8000-000000000001";
-const SESSION_2 = "sess_00000000-0000-4000-8000-000000000002";
-const SESSION_3 = "sess_00000000-0000-4000-8000-000000000003";
+const SESSION_1 = "sess_00000000-0000-7000-8000-000000000001";
+const SESSION_2 = "sess_00000000-0000-7000-8000-000000000002";
+const SESSION_3 = "sess_00000000-0000-7000-8000-000000000003";
 
 function claim(
   status: ErasureJobClaim["status"],
@@ -194,6 +200,73 @@ class FakeUsage {
       checksum: "0".repeat(64),
     };
   }
+}
+
+interface LegacyScheduleCall {
+  authority: ErasureWriteAuthorization;
+  input: ScheduleLegacyTombstoneCompensationInput;
+}
+
+function legacyCompensationJob(
+  authority: ErasureWriteAuthorization,
+  input: ScheduleLegacyTombstoneCompensationInput,
+  status: "pending" | "terminal_incident" = "pending",
+): LegacyTombstoneCompensationJobRecord {
+  const common = {
+    jobId: input.jobId,
+    tenantId: authority.tenantId,
+    userId: authority.userId,
+    sessionId: input.sessionId,
+    sourceKind: "erasure_claim" as const,
+    sourceRequestId: authority.requestId,
+    sourceSubjectGeneration: authority.subjectGeneration,
+    sourceClaimAttempt: authority.claimAttempt,
+    sourceClaimTokenSha256: "0".repeat(64),
+    cutoverGeneration: 1 as const,
+    legacyDeletedAtMs: 900,
+    createdAtMs: input.atMs,
+    updatedAtMs: input.atMs,
+    attempts: 0,
+  };
+  return status === "pending"
+    ? { ...common, status, availableAtMs: input.availableAtMs }
+    : {
+        ...common,
+        status,
+        terminalAtMs: input.atMs,
+        terminalReasonCode: "proof_conflict",
+        terminalEvidenceSha256: "1".repeat(64),
+      };
+}
+
+function fakeLegacyTombstones(
+  scheduleHook?: (
+    authority: ErasureWriteAuthorization,
+    input: ScheduleLegacyTombstoneCompensationInput,
+  ) => Promise<LegacyTombstoneCompensationJobRecord> | LegacyTombstoneCompensationJobRecord,
+): { store: LegacyTombstoneCompensationStore; scheduleCalls: LegacyScheduleCall[] } {
+  const scheduleCalls: LegacyScheduleCall[] = [];
+  const store: LegacyTombstoneCompensationStore = {
+    getLegacyTombstoneCutover: async () => null,
+    activateLegacyTombstoneCutover: async (input) => ({
+      cutoverId: input.cutoverId,
+      generation: 1,
+      activatedByKeyId: input.actorKeyId,
+      activatedAtMs: input.atMs,
+    }),
+    scheduleLegacyTombstoneCompensation: async (authority, input) => {
+      scheduleCalls.push(structuredClone({ authority, input }));
+      return await scheduleHook?.(authority, input) ?? legacyCompensationJob(authority, input);
+    },
+    scheduleLegacyTombstoneCandidates: async () => [],
+    getLegacyTombstoneCompensationJob: async () => null,
+    listLegacyTombstoneCompensationAudits: async () => [],
+    claimLegacyTombstoneCompensations: async () => [],
+    renewLegacyTombstoneCompensation: async () => false,
+    retryLegacyTombstoneCompensation: async () => false,
+    completeLegacyTombstoneCompensation: async () => null,
+  };
+  return { store, scheduleCalls };
 }
 
 class FakeExecutor implements ErasureSessionExecutor {
@@ -552,6 +625,150 @@ describe("ErasureWorker phase boundaries", () => {
       toStatus: "blocked",
       errorCode: "legacy_blocked",
     });
+  });
+
+  it("schedules a targeted legacy compensation then retries with the bounded pending code", async () => {
+    const h = setup("reconciling_usage");
+    const legacy = fakeLegacyTombstones();
+    h.catalog.listHook = () => ({
+      data: [{ sessionId: SESSION_1, deleted: true, deletionGeneration: 0 }],
+    });
+    const worker = new ErasureWorker({
+      jobs: h.jobs,
+      catalog: h.catalog,
+      usage: h.usage,
+      legacyTombstones: legacy.store,
+      executor: h.executor,
+      canClaim: allowClaims,
+      clock: { now: () => 1_000 },
+    }, { retryBaseMs: 10 });
+
+    await expect(worker.processOnce()).resolves.toBe(1);
+
+    expect(legacy.scheduleCalls).toEqual([{
+      authority: {
+        requestId: "erase_00000000-0000-4000-8000-000000000001",
+        tenantId: "tenant-a",
+        userId: "user-a",
+        subjectGeneration: 1,
+        claimToken: "claim-1",
+        claimAttempt: 1,
+      },
+      input: {
+        jobId: legacyTombstoneCompensationJobIdForSession(SESSION_1),
+        sessionId: SESSION_1,
+        atMs: 1_000,
+        availableAtMs: 1_000,
+      },
+    }]);
+    expect(h.jobs.retryCalls).toEqual([expect.objectContaining({
+      options: {
+        failedAtMs: 1_000,
+        availableAtMs: 1_010,
+        errorCode: "legacy_compensation_pending",
+      },
+    })]);
+    expect(h.jobs.transitionCalls).toEqual([]);
+    expect(h.usage.calls).toEqual([]);
+  });
+
+  it("turns a terminal targeted legacy job into an integrity block", async () => {
+    const h = setup("reconciling_usage");
+    const legacy = fakeLegacyTombstones((authority, input) => (
+      legacyCompensationJob(authority, input, "terminal_incident")
+    ));
+    h.catalog.listHook = () => ({
+      data: [{ sessionId: SESSION_1, deleted: true, deletionGeneration: 0 }],
+    });
+    const worker = new ErasureWorker({
+      jobs: h.jobs,
+      catalog: h.catalog,
+      usage: h.usage,
+      legacyTombstones: legacy.store,
+      executor: h.executor,
+      canClaim: allowClaims,
+      clock: { now: () => 1_000 },
+    });
+
+    await expect(worker.processOnce()).resolves.toBe(1);
+
+    expect(legacy.scheduleCalls).toHaveLength(1);
+    expect(h.jobs.retryCalls).toEqual([]);
+    expect(h.jobs.transitionCalls).toEqual([expect.objectContaining({
+      options: expect.objectContaining({
+        fromStatus: "reconciling_usage",
+        toStatus: "blocked",
+        errorCode: "integrity_conflict",
+      }),
+    })]);
+    expect(h.usage.calls).toEqual([]);
+  });
+
+  it.each([
+    new LegacyTombstoneJobConflictError(),
+    new LegacyTombstoneIntegrityFault("proof_conflict"),
+  ])("blocks a deterministic targeted legacy scheduling fault (%s)", async (fault) => {
+    const h = setup("reconciling_usage");
+    const legacy = fakeLegacyTombstones(() => {
+      throw fault;
+    });
+    h.catalog.listHook = () => ({
+      data: [{ sessionId: SESSION_1, deleted: true, deletionGeneration: 0 }],
+    });
+    const worker = new ErasureWorker({
+      jobs: h.jobs,
+      catalog: h.catalog,
+      usage: h.usage,
+      legacyTombstones: legacy.store,
+      executor: h.executor,
+      canClaim: allowClaims,
+      clock: { now: () => 1_000 },
+    });
+
+    await expect(worker.processOnce()).resolves.toBe(1);
+
+    expect(h.jobs.retryCalls).toEqual([]);
+    expect(h.jobs.transitionCalls).toEqual([expect.objectContaining({
+      options: expect.objectContaining({
+        fromStatus: "reconciling_usage",
+        toStatus: "blocked",
+        errorCode: "integrity_conflict",
+      }),
+    })]);
+  });
+
+  it("does not acknowledge the erasure job when its claim is lost after targeted scheduling", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const h = setup("reconciling_usage");
+    h.jobs.renewHook = () => false;
+    const scheduled = deferred<LegacyTombstoneCompensationJobRecord>();
+    const legacy = fakeLegacyTombstones(() => scheduled.promise);
+    h.catalog.listHook = () => ({
+      data: [{ sessionId: SESSION_1, deleted: true, deletionGeneration: 0 }],
+    });
+    const worker = new ErasureWorker({
+      jobs: h.jobs,
+      catalog: h.catalog,
+      usage: h.usage,
+      legacyTombstones: legacy.store,
+      executor: h.executor,
+      canClaim: allowClaims,
+      clock: { now: () => Date.now() },
+    }, { leaseMs: 300 });
+
+    const run = worker.processOnce();
+    await flushMicrotasks();
+    expect(legacy.scheduleCalls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.jobs.renewCalls).toHaveLength(1);
+    const call = legacy.scheduleCalls[0]!;
+    scheduled.resolve(legacyCompensationJob(call.authority, call.input));
+
+    await expect(run).resolves.toBe(0);
+    expect(h.jobs.retryCalls).toEqual([]);
+    expect(h.jobs.transitionCalls).toEqual([]);
+    expect(h.usage.calls).toEqual([]);
   });
 
   it.each([undefined, false] as const)(

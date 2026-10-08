@@ -11,6 +11,7 @@ import {
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
   INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
   INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
+  INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH,
   INTERNAL_ROUTER_TOKEN_HEADER,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
@@ -169,6 +170,13 @@ describe("internal user-erasure routing", () => {
       headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
     })).status).toBe(404);
 
+    const legacyV1 = await capable.request(INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(legacyV1.status).toBe(404);
+    expect(legacyV1.headers.get(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER)).toBeNull();
+    expectPrivateLifecycleResponse(legacyV1);
+
     const ready = await capable.request(INTERNAL_ERASURE_JOB_CONTROL_READY_PATH, {
       headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
     });
@@ -176,6 +184,9 @@ describe("internal user-erasure routing", () => {
     expect(ready.headers.get(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER)).toBe(
       INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
     );
+    expect(INTERNAL_ERASURE_JOB_CONTROL_READY_PATH).toBe("/_internal/user-erasure-job-control-v2/ready");
+    expect(INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE).toBe("job-control-v2");
+    expect(ready.headers.get(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER)).not.toBe("quarantine-v1");
     expectPrivateLifecycleResponse(ready);
 
     const mixed = createRouterApp({
@@ -969,7 +980,7 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
       registry: fakeRegistry([a.url], { blobs: true, worker: true }),
       tombstoneEnabled: () => true,
@@ -1008,7 +1019,7 @@ describe("operational endpoints", () => {
         sessionLifecycle: ["archive", "unarchive"],
         blobAttachments: false,
         dataErasureRequests: true,
-        erasureJobControl: ["quarantine-v1"],
+        erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"],
         dynamicTools: true,
         mcp: [],
         skills: false,

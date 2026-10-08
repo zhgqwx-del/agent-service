@@ -4,6 +4,8 @@ import {
   ErasureRequest,
   ErasureRequestHeaders,
   ErasureRequestParams,
+  ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
+  ERASURE_JOB_CONTROL_QUARANTINE_V1,
   Capabilities,
   EndUserTokenHeaderName,
   Event,
@@ -149,6 +151,43 @@ describe("protocol schemas", () => {
     expect(parsed.features.dataErasureRequests).toBe(false);
     expect(parsed.features.userErasureWorker).toEqual([]);
     expect(parsed.features.erasureJobControl).toEqual([]);
+  });
+
+  it("accepts both cumulative erasure job-control capabilities while rejecting unknown control contracts", () => {
+    const features = {
+      streaming: true as const,
+      replay: { persistedEvents: true as const, hotWindowMs: 1 },
+      approvals: true as const,
+      sessionLifecycle: ["archive" as const],
+      blobAttachments: false,
+      dataErasureRequests: false,
+      userErasureWorker: [],
+      dynamicTools: true,
+      mcp: [],
+      skills: false,
+      sandbox: ["none" as const],
+      byok: true,
+    };
+    const controls = [
+      ERASURE_JOB_CONTROL_QUARANTINE_V1,
+      ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
+    ];
+    const parsed = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: { ...features, erasureJobControl: controls },
+    });
+    expect(parsed.features.erasureJobControl).toEqual(controls);
+    expect(Capabilities.safeParse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: { ...features, erasureJobControl: [ERASURE_JOB_CONTROL_QUARANTINE_V1] },
+    }).success).toBe(true);
+    expect(Capabilities.safeParse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: { ...features, erasureJobControl: [...controls, "future-control-v1"] },
+    }).success).toBe(false);
   });
 
   it("keeps the internal erasure drain contract claim-only and strict", () => {

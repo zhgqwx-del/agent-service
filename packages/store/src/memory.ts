@@ -204,6 +204,48 @@ import {
   type ErasureUsageReconciliationInput,
   type ErasureUsageReconciliationStore,
 } from "./erasure-usage.js";
+import {
+  LEGACY_TOMBSTONE_CUTOVER_ID,
+  LegacyTombstoneChildPendingError,
+  LegacyTombstoneCutoverConflictError,
+  LegacyTombstoneCutoverRequiredError,
+  LegacyTombstoneIntegrityFault,
+  LegacyTombstoneJobConflictError,
+  legacyTombstoneClaimTokenSha256,
+  legacyTombstoneCompensationAuthorizationMatches,
+  legacyTombstoneCompensationClaimFromRecord,
+  legacyTombstoneCompensationJobIdForSession,
+  legacyTombstoneSuccessEvidenceSha256,
+  legacyTombstoneTerminalIncidentEvidenceSha256,
+  legacyTombstoneUnsafeJobEnvelopeEvidenceSha256,
+  validateActivateLegacyTombstoneCutoverInput,
+  validateClaimLegacyTombstoneCompensationsOptions,
+  validateCompleteLegacyTombstoneCompensationOptions,
+  validateLegacyTombstoneCompensationAudit,
+  validateLegacyTombstoneCompensationAuthorization,
+  validateLegacyTombstoneCompensationJobRecord,
+  validateLegacyTombstoneCutoverRecord,
+  validateRenewLegacyTombstoneCompensationOptions,
+  validateRetryLegacyTombstoneCompensationOptions,
+  validateScheduleLegacyTombstoneCandidatesOptions,
+  validateScheduleLegacyTombstoneCompensationInput,
+  type ActivateLegacyTombstoneCutoverInput,
+  type ClaimLegacyTombstoneCompensationsOptions,
+  type CompleteLegacyTombstoneCompensationOptions,
+  type LegacyTombstoneCompensationAudit,
+  type LegacyTombstoneCompensationAuthorization,
+  type LegacyTombstoneCompensationClaim,
+  type LegacyTombstoneCompensationJobRecord,
+  type LegacyTombstoneCompensationResult,
+  type LegacyTombstoneCompensationStore,
+  type LegacyTombstoneCutoverRecord,
+  type LegacyTombstoneTerminalReasonCode,
+  type LegacyTombstoneUnsafeJobEnvelope,
+  type RenewLegacyTombstoneCompensationOptions,
+  type RetryLegacyTombstoneCompensationOptions,
+  type ScheduleLegacyTombstoneCandidatesOptions,
+  type ScheduleLegacyTombstoneCompensationInput,
+} from "./legacy-tombstone.js";
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -255,7 +297,7 @@ function validateUploadedBlobInput(input: MarkBlobUploadedInput): void {
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore {
   agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -282,6 +324,1137 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
   private nextErasureJobTerminalIncidentId = 1;
   private erasureIdempotency = new Map<string, string>();
+  legacyTombstoneCutovers = new Map<string, LegacyTombstoneCutoverRecord>();
+  legacyTombstoneCompensationJobs = new Map<string, LegacyTombstoneCompensationJobRecord>();
+  legacyTombstoneCompensationAudits = new Map<string, LegacyTombstoneCompensationAudit[]>();
+  private nextLegacyTombstoneAuditId = 1;
+
+  private activeLegacyTombstoneCutover(): LegacyTombstoneCutoverRecord {
+    const cutover = this.legacyTombstoneCutovers.get(LEGACY_TOMBSTONE_CUTOVER_ID);
+    if (!cutover) throw new LegacyTombstoneCutoverRequiredError();
+    validateLegacyTombstoneCutoverRecord(cutover);
+    return cutover;
+  }
+
+  async getLegacyTombstoneCutover(): Promise<LegacyTombstoneCutoverRecord | null> {
+    const cutover = this.legacyTombstoneCutovers.get(LEGACY_TOMBSTONE_CUTOVER_ID);
+    if (!cutover) return null;
+    validateLegacyTombstoneCutoverRecord(cutover);
+    return clone(cutover);
+  }
+
+  async activateLegacyTombstoneCutover(
+    input: ActivateLegacyTombstoneCutoverInput,
+  ): Promise<LegacyTombstoneCutoverRecord> {
+    const stagedInput = clone(input);
+    validateActivateLegacyTombstoneCutoverInput(stagedInput);
+    const existing = this.legacyTombstoneCutovers.get(LEGACY_TOMBSTONE_CUTOVER_ID);
+    if (existing) {
+      validateLegacyTombstoneCutoverRecord(existing);
+      if (
+        existing.activatedByKeyId === stagedInput.actorKeyId
+        && existing.activatedAtMs === stagedInput.atMs
+      ) return clone(existing);
+      throw new LegacyTombstoneCutoverConflictError();
+    }
+    const record = clone<LegacyTombstoneCutoverRecord>({
+      cutoverId: LEGACY_TOMBSTONE_CUTOVER_ID,
+      generation: 1,
+      activatedByKeyId: stagedInput.actorKeyId,
+      activatedAtMs: stagedInput.atMs,
+    });
+    validateLegacyTombstoneCutoverRecord(record);
+    this.legacyTombstoneCutovers.set(LEGACY_TOMBSTONE_CUTOVER_ID, record);
+    return clone(record);
+  }
+
+  private assertLegacyTombstoneCandidate(
+    sessionKey: string,
+    session: Session | undefined,
+    legacyDeletedAtMs?: number,
+  ): asserts session is Session {
+    if (
+      !session
+      || sessionKey !== session.id
+      || !SessionSchema.safeParse(session).success
+      || !Number.isSafeInteger(legacyDeletedAtMs)
+      || legacyDeletedAtMs! < 0
+      || legacyDeletedAtMs! < session.createdAtMs
+      || legacyDeletedAtMs! < session.updatedAtMs
+    ) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+    const marker = this.deleted.get(sessionKey);
+    if (
+      !marker
+      || marker.deletionGeneration !== 0
+      || marker.deletedAtMs !== legacyDeletedAtMs
+      || marker.purgeAfterMs !== undefined
+    ) throw new LegacyTombstoneIntegrityFault("proof_conflict");
+  }
+
+  private existingLegacyTombstoneJobForSession(
+    sessionId: string,
+  ): LegacyTombstoneCompensationJobRecord | undefined {
+    let existing: LegacyTombstoneCompensationJobRecord | undefined;
+    for (const record of this.legacyTombstoneCompensationJobs.values()) {
+      if (record.sessionId !== sessionId) continue;
+      if (this.legacyTombstoneJobHasTerminalAudit(record.jobId)) return record;
+      validateLegacyTombstoneCompensationJobRecord(record);
+      if (existing) throw new LegacyTombstoneJobConflictError();
+      existing = record;
+    }
+    return existing;
+  }
+
+  async scheduleLegacyTombstoneCompensation(
+    authorization: ErasureWriteAuthorization,
+    input: ScheduleLegacyTombstoneCompensationInput,
+  ): Promise<LegacyTombstoneCompensationJobRecord> {
+    this.activeLegacyTombstoneCutover();
+    const stagedAuthorization = clone(authorization);
+    const stagedInput = clone(input);
+    validateScheduleLegacyTombstoneCompensationInput(stagedInput);
+    this.assertErasureSessionAuthority(stagedAuthorization, ["reconciling_usage"], stagedInput.atMs);
+    const deterministicJobId = legacyTombstoneCompensationJobIdForSession(stagedInput.sessionId);
+    if (stagedInput.jobId !== deterministicJobId) throw new LegacyTombstoneJobConflictError();
+
+    const byJobId = this.legacyTombstoneCompensationJobs.get(stagedInput.jobId);
+    if (!byJobId && this.legacyTombstoneJobHasTerminalAudit(stagedInput.jobId)) {
+      // A content-free incident may deliberately have no owner-readable job projection because the
+      // historical candidate identity itself was unsafe. Never recreate worker authority over it.
+      throw new LegacyTombstoneJobConflictError();
+    }
+    const bySession = this.existingLegacyTombstoneJobForSession(stagedInput.sessionId);
+    const existing = byJobId ?? bySession;
+    if (existing) {
+      validateLegacyTombstoneCompensationJobRecord(existing);
+      if (
+        existing === byJobId
+        && existing === bySession
+        && existing.tenantId === stagedAuthorization.tenantId
+        && existing.userId === stagedAuthorization.userId
+        && existing.sessionId === stagedInput.sessionId
+        && (
+          existing.sourceKind === "maintenance"
+          || (
+            existing.sourceRequestId === stagedAuthorization.requestId
+            && existing.sourceSubjectGeneration === stagedAuthorization.subjectGeneration
+          )
+        )
+      ) return clone(existing);
+      throw new LegacyTombstoneJobConflictError();
+    }
+
+    const session = this.sessions.get(stagedInput.sessionId);
+    if (
+      !session
+      || session.tenantId !== stagedAuthorization.tenantId
+      || session.userId !== stagedAuthorization.userId
+    ) throw new SessionGoneError(stagedInput.sessionId);
+    const marker = this.deleted.get(stagedInput.sessionId);
+    this.assertLegacyTombstoneCandidate(stagedInput.sessionId, session, marker?.deletedAtMs);
+    if (stagedInput.atMs < marker!.deletedAtMs) {
+      throw new Error("legacy tombstone scheduling precedes the historical deletion");
+    }
+    const expectedSourceHash = legacyTombstoneClaimTokenSha256(stagedAuthorization.claimToken);
+
+    const record = clone<LegacyTombstoneCompensationJobRecord>({
+      jobId: stagedInput.jobId,
+      tenantId: session.tenantId,
+      userId: session.userId,
+      sessionId: session.id,
+      sourceKind: "erasure_claim",
+      sourceRequestId: stagedAuthorization.requestId,
+      sourceSubjectGeneration: stagedAuthorization.subjectGeneration,
+      sourceClaimAttempt: stagedAuthorization.claimAttempt,
+      sourceClaimTokenSha256: expectedSourceHash,
+      cutoverGeneration: 1,
+      legacyDeletedAtMs: marker!.deletedAtMs,
+      status: "pending",
+      createdAtMs: stagedInput.atMs,
+      updatedAtMs: stagedInput.atMs,
+      availableAtMs: stagedInput.availableAtMs,
+      attempts: 0,
+    });
+    validateLegacyTombstoneCompensationJobRecord(record);
+    const existed = this.legacyTombstoneCompensationJobs.has(record.jobId);
+    const previous = this.legacyTombstoneCompensationJobs.get(record.jobId);
+    try {
+      this.legacyTombstoneCompensationJobs.set(record.jobId, record);
+    } catch (error) {
+      restoreMapEntry(this.legacyTombstoneCompensationJobs, record.jobId, existed, previous);
+      throw error;
+    }
+    return clone(record);
+  }
+
+  private legacyTombstoneSessionDepth(sessionId: string): number {
+    let depth = 0;
+    let current = this.sessions.get(sessionId);
+    const visited = new Set<string>();
+    while (current?.parentSessionId !== undefined) {
+      if (visited.has(current.id) || current.parentSessionId === current.id) {
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      visited.add(current.id);
+      const parent = this.sessions.get(current.parentSessionId);
+      if (!parent) break;
+      current = parent;
+      depth += 1;
+    }
+    return depth;
+  }
+
+  private terminallyIsolateLegacyTombstoneCandidate(
+    sessionId: string,
+    session: Session | undefined,
+    rawDeletedAtMs: unknown,
+    options: ScheduleLegacyTombstoneCandidatesOptions,
+    reasonCode: Exclude<LegacyTombstoneTerminalReasonCode, "unsafe_job_envelope">,
+  ): void {
+    const canonicalSessionId = isCanonicalId("sess", sessionId);
+    const jobId = canonicalSessionId
+      ? legacyTombstoneCompensationJobIdForSession(sessionId)
+      : (() => {
+          const hex = createHash("sha256")
+            .update(JSON.stringify(["legacy-tombstone-compensation-job-v1", sessionId]))
+            .digest("hex")
+            .slice(0, 32)
+            .split("");
+          hex[12] = "4";
+          hex[16] = (["8", "9", "a", "b"] as const)[Number.parseInt(hex[16]!, 16) % 4]!;
+          const value = hex.join("");
+          return `ltc_${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+        })();
+    if (this.legacyTombstoneJobHasTerminalAudit(jobId)) return;
+    if (!Number.isSafeInteger(this.nextLegacyTombstoneAuditId) || this.nextLegacyTombstoneAuditId <= 0) {
+      throw new Error("legacy tombstone audit sequence is exhausted");
+    }
+    const candidateEvidence = createHash("sha256").update(JSON.stringify([
+      "legacy-tombstone-unsafe-candidate-v1",
+      sessionId,
+      String(session?.tenantId),
+      String(session?.userId),
+      String(rawDeletedAtMs),
+      String(session?.lastSeq),
+      reasonCode,
+    ])).digest("hex");
+    const incidentEvidence = createHash("sha256").update(JSON.stringify([
+      "legacy-tombstone-candidate-incident-v1",
+      jobId,
+      sessionId,
+      candidateEvidence,
+      reasonCode,
+      options.nowMs,
+    ])).digest("hex");
+    const incident = clone<LegacyTombstoneCompensationAudit>({
+      auditId: this.nextLegacyTombstoneAuditId,
+      jobId,
+      type: "legacy_tombstone/terminal_incident",
+      reasonCode,
+      evidenceSha256: incidentEvidence,
+      emittedAtMs: options.nowMs,
+    });
+    validateLegacyTombstoneCompensationAudit(incident);
+
+    let terminalJob: LegacyTombstoneCompensationJobRecord | undefined;
+    if (
+      canonicalSessionId
+      && session?.id === sessionId
+      && typeof session.tenantId === "string"
+      && session.tenantId.length > 0
+      && session.tenantId.length <= 128
+      && typeof session.userId === "string"
+      && session.userId.length > 0
+      && session.userId.length <= 128
+      && Number.isSafeInteger(rawDeletedAtMs)
+      && Number(rawDeletedAtMs) >= 0
+      && options.nowMs >= Number(rawDeletedAtMs)
+    ) {
+      terminalJob = clone({
+        jobId,
+        tenantId: session.tenantId,
+        userId: session.userId,
+        sessionId,
+        sourceKind: "maintenance" as const,
+        maintenanceActorKeyId: options.actorKeyId,
+        cutoverGeneration: 1 as const,
+        legacyDeletedAtMs: Number(rawDeletedAtMs),
+        status: "terminal_incident" as const,
+        createdAtMs: options.nowMs,
+        updatedAtMs: options.nowMs,
+        attempts: 0,
+        terminalAtMs: options.nowMs,
+        terminalReasonCode: reasonCode,
+        terminalEvidenceSha256: incidentEvidence,
+      });
+      validateLegacyTombstoneCompensationJobRecord(terminalJob);
+    }
+
+    const jobExisted = this.legacyTombstoneCompensationJobs.has(jobId);
+    const priorJob = this.legacyTombstoneCompensationJobs.get(jobId);
+    const auditsExisted = this.legacyTombstoneCompensationAudits.has(jobId);
+    const priorAudits = this.legacyTombstoneCompensationAudits.get(jobId);
+    try {
+      if (terminalJob) this.legacyTombstoneCompensationJobs.set(jobId, terminalJob);
+      this.legacyTombstoneCompensationAudits.set(jobId, [incident]);
+    } catch (error) {
+      restoreMapEntry(this.legacyTombstoneCompensationAudits, jobId, auditsExisted, priorAudits);
+      restoreMapEntry(this.legacyTombstoneCompensationJobs, jobId, jobExisted, priorJob);
+      throw error;
+    }
+    this.nextLegacyTombstoneAuditId += 1;
+  }
+
+  async scheduleLegacyTombstoneCandidates(
+    options: ScheduleLegacyTombstoneCandidatesOptions,
+  ): Promise<LegacyTombstoneCompensationJobRecord[]> {
+    const stagedOptions = clone(options);
+    validateScheduleLegacyTombstoneCandidatesOptions(stagedOptions);
+    const cutover = this.activeLegacyTombstoneCutover();
+    if (cutover.generation !== stagedOptions.cutoverGeneration) {
+      throw new LegacyTombstoneCutoverConflictError();
+    }
+
+    const candidates: Array<{ session: Session; deletedAtMs: number; depth: number }> = [];
+    for (const [sessionId, marker] of this.deleted) {
+      if (marker.deletionGeneration !== 0) continue;
+      const deterministicJobId = isCanonicalId("sess", sessionId)
+        ? legacyTombstoneCompensationJobIdForSession(sessionId)
+        : undefined;
+      if (
+        (deterministicJobId !== undefined && (
+          this.legacyTombstoneCompensationJobs.has(deterministicJobId)
+          || this.legacyTombstoneJobHasTerminalAudit(deterministicJobId)
+        ))
+        || [...this.legacyTombstoneCompensationJobs.values()].some(
+          (record) => String((record as unknown as { sessionId?: unknown }).sessionId) === sessionId,
+        )
+      ) continue;
+      const session = this.sessions.get(sessionId);
+      try {
+        this.assertLegacyTombstoneCandidate(sessionId, session, marker.deletedAtMs);
+        if (stagedOptions.nowMs < marker.deletedAtMs) {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+      } catch (error) {
+        if (!(error instanceof LegacyTombstoneIntegrityFault)) throw error;
+        this.terminallyIsolateLegacyTombstoneCandidate(
+          sessionId,
+          session,
+          marker.deletedAtMs,
+          stagedOptions,
+          error.reasonCode,
+        );
+        continue;
+      }
+      let depth = 0;
+      try {
+        depth = this.legacyTombstoneSessionDepth(sessionId);
+      } catch (error) {
+        if (!(error instanceof LegacyTombstoneIntegrityFault)) throw error;
+        // Persist a deterministic job even for a cyclic candidate. Completion owns the terminal
+        // incident transaction; silently omitting it here would make the cutover sweep incomplete.
+      }
+      candidates.push({
+        session,
+        deletedAtMs: marker.deletedAtMs,
+        depth,
+      });
+    }
+    candidates.sort((left, right) => (
+      right.depth - left.depth || left.session.id.localeCompare(right.session.id)
+    ));
+
+    const stagedJobs = candidates.slice(0, stagedOptions.limit).map(({ session, deletedAtMs }) => {
+      const record = clone<LegacyTombstoneCompensationJobRecord>({
+        jobId: legacyTombstoneCompensationJobIdForSession(session.id),
+        tenantId: session.tenantId,
+        userId: session.userId,
+        sessionId: session.id,
+        sourceKind: "maintenance",
+        maintenanceActorKeyId: stagedOptions.actorKeyId,
+        cutoverGeneration: 1,
+        legacyDeletedAtMs: deletedAtMs,
+        status: "pending",
+        createdAtMs: stagedOptions.nowMs,
+        updatedAtMs: stagedOptions.nowMs,
+        availableAtMs: stagedOptions.nowMs,
+        attempts: 0,
+      });
+      validateLegacyTombstoneCompensationJobRecord(record);
+      if (this.legacyTombstoneCompensationJobs.has(record.jobId)) {
+        throw new LegacyTombstoneJobConflictError();
+      }
+      return record;
+    });
+
+    const prior = stagedJobs.map((record) => ({
+      key: record.jobId,
+      existed: this.legacyTombstoneCompensationJobs.has(record.jobId),
+      value: this.legacyTombstoneCompensationJobs.get(record.jobId),
+    }));
+    try {
+      for (const record of stagedJobs) {
+        this.legacyTombstoneCompensationJobs.set(record.jobId, record);
+      }
+    } catch (error) {
+      for (const entry of prior.reverse()) {
+        restoreMapEntry(this.legacyTombstoneCompensationJobs, entry.key, entry.existed, entry.value);
+      }
+      throw error;
+    }
+    return stagedJobs.map(clone);
+  }
+
+  async getLegacyTombstoneCompensationJob(
+    tenantId: string,
+    userId: string,
+    jobId: string,
+  ): Promise<LegacyTombstoneCompensationJobRecord | null> {
+    const record = this.legacyTombstoneCompensationJobs.get(jobId);
+    if (!record || record.tenantId !== tenantId || record.userId !== userId) return null;
+    validateLegacyTombstoneCompensationJobRecord(record);
+    return clone(record);
+  }
+
+  async listLegacyTombstoneCompensationAudits(
+    jobId: string,
+  ): Promise<LegacyTombstoneCompensationAudit[]> {
+    const audits = clone(this.legacyTombstoneCompensationAudits.get(jobId) ?? []);
+    for (const audit of audits) validateLegacyTombstoneCompensationAudit(audit);
+    return audits;
+  }
+
+  private terminallyIsolateUnsafeLegacyTombstoneJob(
+    jobKey: string,
+    current: LegacyTombstoneCompensationJobRecord,
+    atMs: number,
+  ): void {
+    if ((this.legacyTombstoneCompensationAudits.get(jobKey) ?? []).some(
+      (audit) => audit.type === "legacy_tombstone/terminal_incident",
+    )) return;
+    if (!Number.isSafeInteger(this.nextLegacyTombstoneAuditId) || this.nextLegacyTombstoneAuditId <= 0) {
+      throw new Error("legacy tombstone audit sequence is exhausted");
+    }
+    const unsafe = current as unknown as Record<string, unknown>;
+    const envelope: LegacyTombstoneUnsafeJobEnvelope = {
+      locatorJobId: jobKey,
+      jobId: String(unsafe.jobId),
+      tenantId: String(unsafe.tenantId),
+      userId: String(unsafe.userId),
+      sessionId: String(unsafe.sessionId),
+      sourceRequestId: unsafe.sourceRequestId === undefined ? null : String(unsafe.sourceRequestId),
+      sourceKind: String(unsafe.sourceKind),
+      rawSourceSubjectGeneration: unsafe.sourceSubjectGeneration === undefined
+        ? null
+        : String(unsafe.sourceSubjectGeneration),
+      rawSourceClaimAttempt: unsafe.sourceClaimAttempt === undefined
+        ? null
+        : String(unsafe.sourceClaimAttempt),
+      sourceClaimTokenSha256: unsafe.sourceClaimTokenSha256 === undefined
+        ? null
+        : String(unsafe.sourceClaimTokenSha256),
+      maintenanceActorKeyId: unsafe.maintenanceActorKeyId === undefined
+        ? null
+        : String(unsafe.maintenanceActorKeyId),
+      rawCutoverGeneration: String(unsafe.cutoverGeneration),
+      rawLegacyDeletedAtMs: String(unsafe.legacyDeletedAtMs),
+      status: String(unsafe.status),
+      rawCreatedAtMs: String(unsafe.createdAtMs),
+      rawUpdatedAtMs: String(unsafe.updatedAtMs),
+      rawAvailableAtMs: unsafe.availableAtMs === undefined ? null : String(unsafe.availableAtMs),
+      rawAttempts: String(unsafe.attempts),
+      claimToken: unsafe.claimToken === undefined ? null : String(unsafe.claimToken),
+      rawLeaseUntilMs: unsafe.leaseUntilMs === undefined ? null : String(unsafe.leaseUntilMs),
+    };
+    const incident = clone<LegacyTombstoneCompensationAudit>({
+      auditId: this.nextLegacyTombstoneAuditId,
+      jobId: jobKey,
+      type: "legacy_tombstone/terminal_incident",
+      reasonCode: "unsafe_job_envelope",
+      evidenceSha256: legacyTombstoneUnsafeJobEnvelopeEvidenceSha256(envelope),
+      emittedAtMs: atMs,
+    });
+    validateLegacyTombstoneCompensationAudit(incident);
+    const existed = this.legacyTombstoneCompensationAudits.has(jobKey);
+    const previous = this.legacyTombstoneCompensationAudits.get(jobKey);
+    const staged = clone([...(previous ?? []), incident]);
+    try {
+      this.legacyTombstoneCompensationAudits.set(jobKey, staged);
+    } catch (error) {
+      restoreMapEntry(this.legacyTombstoneCompensationAudits, jobKey, existed, previous);
+      throw error;
+    }
+    this.nextLegacyTombstoneAuditId += 1;
+  }
+
+  private legacyTombstoneJobHasTerminalAudit(jobId: string): boolean {
+    return (this.legacyTombstoneCompensationAudits.get(jobId) ?? []).some((audit) => (
+      audit.type === "legacy_tombstone/terminal_incident"
+      || audit.type === "legacy_tombstone/compensated"
+    ));
+  }
+
+  async claimLegacyTombstoneCompensations(
+    options: ClaimLegacyTombstoneCompensationsOptions,
+  ): Promise<LegacyTombstoneCompensationClaim[]> {
+    const stagedOptions = clone(options);
+    const leaseUntilMs = validateClaimLegacyTombstoneCompensationsOptions(stagedOptions);
+    this.activeLegacyTombstoneCutover();
+    const candidates = [...this.legacyTombstoneCompensationJobs.entries()]
+      .filter(([jobKey, record]) => {
+        if (this.legacyTombstoneJobHasTerminalAudit(jobKey)) return false;
+        try {
+          if (jobKey !== record.jobId) return true;
+          validateLegacyTombstoneCompensationJobRecord(record);
+          return record.status === "pending"
+            && record.availableAtMs! <= stagedOptions.nowMs
+            && (record.claimToken === undefined || record.leaseUntilMs! <= stagedOptions.nowMs);
+        } catch {
+          return true;
+        }
+      })
+      .sort((left, right) => {
+        const leftAvailable = Number.isSafeInteger(left[1].availableAtMs) ? left[1].availableAtMs! : -1;
+        const rightAvailable = Number.isSafeInteger(right[1].availableAtMs) ? right[1].availableAtMs! : -1;
+        let depthOrder = 0;
+        try {
+          depthOrder = this.legacyTombstoneSessionDepth(right[1].sessionId)
+            - this.legacyTombstoneSessionDepth(left[1].sessionId);
+        } catch {
+          // Session-tree corruption is handled as a deterministic incident during completion. Job
+          // envelope corruption itself is isolated below without trusting this ordering hint.
+        }
+        return depthOrder || leftAvailable - rightAvailable || left[0].localeCompare(right[0]);
+      });
+
+    const claimed: LegacyTombstoneCompensationJobRecord[] = [];
+    for (const [jobKey, current] of candidates) {
+      if (claimed.length >= stagedOptions.limit) break;
+      try {
+        try {
+          if (jobKey !== current.jobId) throw new Error("job locator mismatch");
+          validateLegacyTombstoneCompensationJobRecord(current);
+        } catch {
+          this.terminallyIsolateUnsafeLegacyTombstoneJob(jobKey, current, stagedOptions.nowMs);
+          continue;
+        }
+        if (
+          current.status !== "pending"
+          || current.availableAtMs! > stagedOptions.nowMs
+          || (current.claimToken !== undefined && current.leaseUntilMs! > stagedOptions.nowMs)
+        ) continue;
+        if (current.attempts === Number.MAX_SAFE_INTEGER) {
+          this.terminallyIsolateUnsafeLegacyTombstoneJob(jobKey, current, stagedOptions.nowMs);
+          continue;
+        }
+        const next = clone<LegacyTombstoneCompensationJobRecord>({
+          ...current,
+          attempts: current.attempts + 1,
+          claimToken: stagedOptions.claimToken,
+          leaseUntilMs,
+        });
+        validateLegacyTombstoneCompensationJobRecord(next);
+        this.legacyTombstoneCompensationJobs.set(jobKey, next);
+        claimed.push(next);
+      } catch (error) {
+        if (claimed.length > 0) break;
+        throw error;
+      }
+    }
+    return claimed.map((record) => clone(legacyTombstoneCompensationClaimFromRecord(record)));
+  }
+
+  async renewLegacyTombstoneCompensation(
+    authorization: LegacyTombstoneCompensationAuthorization,
+    options: RenewLegacyTombstoneCompensationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateLegacyTombstoneCompensationAuthorization(stagedAuthorization);
+    const leaseUntilMs = validateRenewLegacyTombstoneCompensationOptions(stagedOptions);
+    this.activeLegacyTombstoneCutover();
+    const current = this.legacyTombstoneCompensationJobs.get(stagedAuthorization.jobId);
+    if (!current) return false;
+    if (
+      current.tenantId !== stagedAuthorization.tenantId
+      || current.userId !== stagedAuthorization.userId
+      || current.sessionId !== stagedAuthorization.sessionId
+    ) return false;
+    if (!legacyTombstoneCompensationAuthorizationMatches(current, stagedAuthorization, stagedOptions.nowMs)) {
+      return false;
+    }
+    const next = clone(current);
+    next.leaseUntilMs = Math.max(current.leaseUntilMs!, leaseUntilMs);
+    validateLegacyTombstoneCompensationJobRecord(next);
+    this.legacyTombstoneCompensationJobs.set(next.jobId, next);
+    return true;
+  }
+
+  async retryLegacyTombstoneCompensation(
+    authorization: LegacyTombstoneCompensationAuthorization,
+    options: RetryLegacyTombstoneCompensationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateLegacyTombstoneCompensationAuthorization(stagedAuthorization);
+    validateRetryLegacyTombstoneCompensationOptions(stagedOptions);
+    this.activeLegacyTombstoneCutover();
+    const current = this.legacyTombstoneCompensationJobs.get(stagedAuthorization.jobId);
+    if (!current) return false;
+    if (
+      current.tenantId !== stagedAuthorization.tenantId
+      || current.userId !== stagedAuthorization.userId
+      || current.sessionId !== stagedAuthorization.sessionId
+    ) return false;
+    if (!legacyTombstoneCompensationAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      stagedOptions.failedAtMs,
+    )) return false;
+    const next = clone(current);
+    next.updatedAtMs = Math.max(current.updatedAtMs, stagedOptions.failedAtMs);
+    next.availableAtMs = stagedOptions.availableAtMs;
+    next.lastErrorCode = stagedOptions.errorCode;
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+    validateLegacyTombstoneCompensationJobRecord(next);
+    this.legacyTombstoneCompensationJobs.set(next.jobId, next);
+    return true;
+  }
+
+  private legacyTombstoneTerminalIncident(
+    current: LegacyTombstoneCompensationJobRecord,
+    authorization: LegacyTombstoneCompensationAuthorization,
+    atMs: number,
+    reasonCode: Exclude<LegacyTombstoneTerminalReasonCode, "unsafe_job_envelope">,
+  ): LegacyTombstoneCompensationResult {
+    if (!Number.isSafeInteger(this.nextLegacyTombstoneAuditId) || this.nextLegacyTombstoneAuditId <= 0) {
+      throw new Error("legacy tombstone audit sequence is exhausted");
+    }
+    const emittedAtMs = Math.max(current.updatedAtMs, atMs);
+    const evidenceSha256 = legacyTombstoneTerminalIncidentEvidenceSha256({
+      jobId: current.jobId,
+      sessionId: current.sessionId,
+      cutoverGeneration: current.cutoverGeneration,
+      legacyDeletedAtMs: current.legacyDeletedAtMs,
+      claimAttempt: authorization.claimAttempt,
+      reasonCode,
+    });
+    const next = clone(current);
+    next.status = "terminal_incident";
+    next.updatedAtMs = emittedAtMs;
+    next.terminalAtMs = emittedAtMs;
+    next.terminalReasonCode = reasonCode;
+    next.terminalEvidenceSha256 = evidenceSha256;
+    delete next.availableAtMs;
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+    delete next.lastErrorCode;
+    validateLegacyTombstoneCompensationJobRecord(next);
+
+    const priorAudits = this.legacyTombstoneCompensationAudits.get(current.jobId);
+    if ((priorAudits ?? []).length > 0) {
+      throw new Error("legacy tombstone terminal audit identity already exists");
+    }
+    const incident = clone<LegacyTombstoneCompensationAudit>({
+      auditId: this.nextLegacyTombstoneAuditId,
+      jobId: current.jobId,
+      type: "legacy_tombstone/terminal_incident",
+      reasonCode,
+      evidenceSha256,
+      emittedAtMs,
+    });
+    validateLegacyTombstoneCompensationAudit(incident);
+
+    const jobExisted = this.legacyTombstoneCompensationJobs.has(current.jobId);
+    const priorJob = this.legacyTombstoneCompensationJobs.get(current.jobId);
+    const auditsExisted = this.legacyTombstoneCompensationAudits.has(current.jobId);
+    try {
+      this.legacyTombstoneCompensationJobs.set(current.jobId, next);
+      this.legacyTombstoneCompensationAudits.set(current.jobId, [incident]);
+    } catch (error) {
+      restoreMapEntry(
+        this.legacyTombstoneCompensationAudits,
+        current.jobId,
+        auditsExisted,
+        priorAudits,
+      );
+      restoreMapEntry(
+        this.legacyTombstoneCompensationJobs,
+        current.jobId,
+        jobExisted,
+        priorJob,
+      );
+      throw error;
+    }
+    this.nextLegacyTombstoneAuditId += 1;
+    return { outcome: "terminal_incident", jobId: current.jobId, reasonCode, evidenceSha256 };
+  }
+
+  private assertCompletedLegacyTombstoneCompensation(
+    job: LegacyTombstoneCompensationJobRecord,
+  ): LegacyTombstoneCompensationResult {
+    validateLegacyTombstoneCompensationJobRecord(job);
+    if (
+      job.status !== "completed"
+      || job.completedAtMs === undefined
+      || job.completedEventSeq === undefined
+      || job.completedClaimAttempt === undefined
+    ) throw new Error("legacy tombstone compensation is not completed");
+    const session = this.sessions.get(job.sessionId);
+    const marker = this.deleted.get(job.sessionId);
+    if (
+      !session
+      || session.id !== job.sessionId
+      || session.tenantId !== job.tenantId
+      || session.userId !== job.userId
+      || !marker
+      || marker.deletedAtMs !== job.legacyDeletedAtMs
+      || marker.deletionGeneration !== 1
+      || marker.purgeAfterMs !== undefined
+    ) throw new Error("completed legacy tombstone marker is corrupt");
+    this.assertExistingErasureTombstone(session, marker);
+    const terminal = this.events.get(job.sessionId)?.at(-1);
+    if (terminal?.type !== "session/deleted" || terminal.seq !== job.completedEventSeq) {
+      throw new Error("completed legacy tombstone terminal event is corrupt");
+    }
+    const audits = this.legacyTombstoneCompensationAudits.get(job.jobId) ?? [];
+    if (audits.length !== 1) throw new Error("completed legacy tombstone audit is corrupt");
+    const audit = audits[0]!;
+    validateLegacyTombstoneCompensationAudit(audit);
+    if (
+      audit.type !== "legacy_tombstone/compensated"
+      || audit.sessionId !== job.sessionId
+      || audit.cutoverGeneration !== job.cutoverGeneration
+      || audit.deletionGeneration !== 1
+      || audit.eventSeq !== job.completedEventSeq
+      || audit.claimAttempt !== job.completedClaimAttempt
+      || audit.emittedAtMs !== job.completedAtMs
+      || audit.evidenceSha256 !== legacyTombstoneSuccessEvidenceSha256({
+        jobId: job.jobId,
+        tenantId: job.tenantId,
+        userId: job.userId,
+        sessionId: job.sessionId,
+        cutoverGeneration: job.cutoverGeneration,
+        legacyDeletedAtMs: job.legacyDeletedAtMs,
+        deletionGeneration: 1,
+        eventSeq: job.completedEventSeq,
+        claimAttempt: job.completedClaimAttempt,
+        emittedAtMs: job.completedAtMs,
+      })
+    ) throw new Error("completed legacy tombstone audit is corrupt");
+    return {
+      outcome: "already_compensated",
+      sessionId: job.sessionId,
+      deletionGeneration: 1,
+      eventSeq: job.completedEventSeq,
+    };
+  }
+
+  private assertLegacyTombstoneChildrenResolved(parent: Session): void {
+    const ancestry = new Set<string>();
+    let current: Session | undefined = parent;
+    while (current) {
+      if (ancestry.has(current.id)) {
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      ancestry.add(current.id);
+      if (current.parentSessionId === undefined) break;
+      const ancestor = this.sessions.get(current.parentSessionId);
+      if (
+        !ancestor
+        || ancestor.id !== current.parentSessionId
+        || ancestor.tenantId !== parent.tenantId
+        || ancestor.userId !== parent.userId
+        || !SessionSchema.safeParse(ancestor).success
+      ) throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      current = ancestor;
+    }
+
+    for (const [childKey, child] of this.sessions) {
+      if (child.parentSessionId !== parent.id) continue;
+      if (
+        childKey !== child.id
+        || child.tenantId !== parent.tenantId
+        || child.userId !== parent.userId
+        || !SessionSchema.safeParse(child).success
+      ) {
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      const childMarker = this.deleted.get(child.id);
+      if (!childMarker) {
+        // A live child is not compensation work and can never become resolved through this queue.
+        // Treat the historical parent/child ordering violation as permanent integrity failure.
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      if (childMarker.deletionGeneration === 0) {
+        const expectedJobId = legacyTombstoneCompensationJobIdForSession(child.id);
+        const matchingJobs = [...this.legacyTombstoneCompensationJobs.entries()].filter(
+          ([jobKey, record]) => jobKey === expectedJobId || record.sessionId === child.id,
+        );
+        const expectedAudits = this.legacyTombstoneCompensationAudits.get(expectedJobId) ?? [];
+        if (matchingJobs.length === 0) {
+          if (expectedAudits.length === 0) {
+            throw new LegacyTombstoneChildPendingError(parent.id);
+          }
+          throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+        }
+        if (matchingJobs.length !== 1) {
+          throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+        }
+        const [jobKey, childJob] = matchingJobs[0]!;
+        const childAudits = this.legacyTombstoneCompensationAudits.get(jobKey) ?? [];
+        try {
+          validateLegacyTombstoneCompensationJobRecord(childJob);
+          if (
+            jobKey !== expectedJobId
+            || childJob.jobId !== expectedJobId
+            || childJob.sessionId !== child.id
+            || childJob.tenantId !== parent.tenantId
+            || childJob.userId !== parent.userId
+            || childJob.legacyDeletedAtMs !== childMarker.deletedAtMs
+          ) throw new Error("legacy child job binding mismatch");
+        } catch {
+          throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+        }
+        if (childJob.status === "pending" && childAudits.length === 0) {
+          throw new LegacyTombstoneChildPendingError(parent.id);
+        }
+        // A completed child cannot still have generation zero. A terminal/proof incident is also
+        // permanent, so retrying the parent as child_pending would create an infinite loop.
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      try {
+        this.assertExistingErasureTombstone(child, childMarker);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "DataCloneError") throw error;
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+    }
+  }
+
+  async completeLegacyTombstoneCompensation(
+    authorization: LegacyTombstoneCompensationAuthorization,
+    options: CompleteLegacyTombstoneCompensationOptions,
+  ): Promise<LegacyTombstoneCompensationResult | null> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateLegacyTombstoneCompensationAuthorization(stagedAuthorization);
+    validateCompleteLegacyTombstoneCompensationOptions(stagedOptions);
+    this.activeLegacyTombstoneCutover();
+    const current = this.legacyTombstoneCompensationJobs.get(stagedAuthorization.jobId);
+    if (!current) return null;
+    if (
+      current.tenantId !== stagedAuthorization.tenantId
+      || current.userId !== stagedAuthorization.userId
+      || current.sessionId !== stagedAuthorization.sessionId
+      || current.cutoverGeneration !== stagedAuthorization.cutoverGeneration
+    ) return null;
+    validateLegacyTombstoneCompensationJobRecord(current);
+    if (current.status === "completed") {
+      if (
+        current.completedClaimAttempt !== stagedAuthorization.claimAttempt
+        || current.completedClaimTokenSha256
+          !== legacyTombstoneClaimTokenSha256(stagedAuthorization.claimToken)
+      ) return null;
+      return this.assertCompletedLegacyTombstoneCompensation(current);
+    }
+    if (!legacyTombstoneCompensationAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      stagedOptions.completedAtMs,
+    )) return null;
+
+    try {
+      const session = this.sessions.get(current.sessionId);
+      if (
+        !session
+        || session.id !== current.sessionId
+        || session.tenantId !== current.tenantId
+        || session.userId !== current.userId
+      ) throw new LegacyTombstoneIntegrityFault("owner_binding_invalid");
+      const marker = this.deleted.get(current.sessionId);
+      this.assertLegacyTombstoneCandidate(current.sessionId, session, marker?.deletedAtMs);
+      if (marker!.deletedAtMs !== current.legacyDeletedAtMs) {
+        throw new LegacyTombstoneIntegrityFault("proof_conflict");
+      }
+      this.assertLegacyTombstoneChildrenResolved(session);
+      if (
+        this.usageReconciliations.has(this.usageReconciliationMapKey(current.sessionId, 1))
+        || this.lifecycleOutbox.has(this.lifecycleOutboxMapKey("session.tombstoned", current.sessionId, 1))
+        || this.lifecycleOutbox.has(this.lifecycleOutboxMapKey("session.purge", current.sessionId, 1))
+        || (this.legacyTombstoneCompensationAudits.get(current.jobId) ?? []).length > 0
+      ) throw new LegacyTombstoneIntegrityFault("proof_conflict");
+
+      const rawLog = this.events.get(current.sessionId);
+      if (!rawLog) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      // An uncloneable value is an unknown serialization failure, not evidence that may be turned
+      // into an irreversible incident. It must escape with the entire claimed job unchanged.
+      const stagedLog = clone(rawLog);
+      if (stagedLog.length !== session.lastSeq || stagedLog.some((event, index) => (
+        event.sessionId !== session.id
+        || event.seq !== index + 1
+        || !EventSchema.safeParse(event).success
+        || event.emittedAtMs > current.legacyDeletedAtMs
+        || event.type === "session/deleted"
+      ))) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+
+      const deletedAtMs = marker!.deletedAtMs;
+      const stagedSession = clone(session);
+      const pendingApprovals = [...this.approvals.values()].filter((approval) => (
+        approval.sessionId === session.id && approval.status === "pending"
+      ));
+      if (pendingApprovals.some((approval) => approval.createdAtMs > deletedAtMs)) {
+        throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      }
+
+      let approvalTerminals: ReturnType<MemorySessionStore["stageErasureApprovalTerminals"]>;
+      try {
+        approvalTerminals = this.stageErasureApprovalTerminals(session.id, deletedAtMs);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "DataCloneError") throw error;
+        throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      }
+      const eventInputs: EventInput[] = [...approvalTerminals.events];
+      let stagedTurn: Turn | undefined;
+      const terminalEventCount = eventInputs.length
+        + (stagedSession.status.type === "active" ? 3 : 1);
+      const terminalSeq = stagedSession.lastSeq + terminalEventCount;
+      if (
+        !Number.isSafeInteger(terminalSeq)
+        || terminalSeq <= stagedSession.lastSeq
+      ) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      if (stagedSession.status.type === "active") {
+        const turn = this.turns.get(stagedSession.status.turnId);
+        if (
+          !turn
+          || turn.id !== stagedSession.status.turnId
+          || turn.sessionId !== stagedSession.id
+          || turn.status !== "inProgress"
+          || turn.startedAtMs > deletedAtMs
+          || !TurnSchema.safeParse(turn).success
+        ) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        stagedTurn = clone({
+          ...turn,
+          status: "interrupted" as const,
+          stopReason: "interrupted" as const,
+          completedAtMs: deletedAtMs,
+          error: {
+            code: "legacy_tombstone_compensation",
+            message: "turn interrupted during legacy tombstone compensation",
+          },
+          seqEnd: terminalSeq - 1,
+        });
+        if (!TurnSchema.safeParse(stagedTurn).success) {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+        eventInputs.push(clone({
+          type: "turn/completed",
+          sessionId: session.id,
+          emittedAtMs: deletedAtMs,
+          turn: stagedTurn,
+          stopReason: "interrupted",
+        }));
+        eventInputs.push(clone({
+          type: "session/status/changed",
+          sessionId: session.id,
+          emittedAtMs: deletedAtMs,
+          status: { type: "idle" },
+        }));
+        stagedSession.status = { type: "idle" };
+      }
+      eventInputs.push(clone({
+        type: "session/deleted",
+        sessionId: session.id,
+        emittedAtMs: deletedAtMs,
+        deletionGeneration: 1,
+      }));
+      const stagedEvents = eventInputs.map((event, index) => clone({
+        ...event,
+        seq: stagedSession.lastSeq + index + 1,
+      } as PersistedEvent));
+      if (stagedEvents.some((event) => !EventSchema.safeParse(event).success)) {
+        throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      }
+      const terminal = stagedEvents.at(-1);
+      if (terminal?.type !== "session/deleted") {
+        throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      }
+      stagedSession.lastSeq = terminal.seq;
+      stagedSession.updatedAtMs = Math.max(session.updatedAtMs, stagedOptions.completedAtMs);
+      stagedSession.autoApprovedTools = [];
+      if (!SessionSchema.safeParse(stagedSession).success) {
+        throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      }
+      const nextLog = clone([...stagedLog, ...stagedEvents]);
+
+      if (
+        !Number.isSafeInteger(this.nextLifecycleOutboxId)
+        || this.nextLifecycleOutboxId <= 0
+        || this.nextLifecycleOutboxId > Number.MAX_SAFE_INTEGER - 2
+      ) throw new LegacyTombstoneIntegrityFault("proof_conflict");
+      if (!Number.isSafeInteger(this.nextLegacyTombstoneAuditId) || this.nextLegacyTombstoneAuditId <= 0) {
+        throw new LegacyTombstoneIntegrityFault("proof_conflict");
+      }
+      const completedAtMs = Math.max(current.updatedAtMs, stagedOptions.completedAtMs);
+      const outboxes = ([
+        {
+          outboxId: this.nextLifecycleOutboxId,
+          topic: "session.tombstoned",
+          aggregateId: session.id,
+          generation: 1,
+          payload: { sessionId: session.id, deletionGeneration: 1, eventSeq: terminal.seq },
+          availableAtMs: completedAtMs,
+          attempts: 0,
+          createdAtMs: completedAtMs,
+        },
+        {
+          outboxId: this.nextLifecycleOutboxId + 1,
+          topic: "session.purge",
+          aggregateId: session.id,
+          generation: 1,
+          payload: { sessionId: session.id, deletionGeneration: 1 },
+          attempts: 0,
+          createdAtMs: completedAtMs,
+        },
+      ] satisfies LifecycleOutboxRecord[]).map(clone);
+      const stagedOutboxes = outboxes.map((outbox) => {
+        assertLifecycleOutboxId(outbox.outboxId);
+        parseLifecycleOutboxEnvelope(outbox.topic, clone(outbox.payload));
+        const key = this.lifecycleOutboxMapKey(outbox.topic, session.id, 1);
+        if (
+          this.lifecycleOutbox.has(key)
+          || [...this.lifecycleOutbox.values()].some((candidate) => candidate.outboxId === outbox.outboxId)
+        ) throw new LegacyTombstoneIntegrityFault("proof_conflict");
+        return [key, outbox] as const;
+      });
+
+      const successEvidence = legacyTombstoneSuccessEvidenceSha256({
+        jobId: current.jobId,
+        tenantId: current.tenantId,
+        userId: current.userId,
+        sessionId: current.sessionId,
+        cutoverGeneration: 1,
+        legacyDeletedAtMs: current.legacyDeletedAtMs,
+        deletionGeneration: 1,
+        eventSeq: terminal.seq,
+        claimAttempt: stagedAuthorization.claimAttempt,
+        emittedAtMs: completedAtMs,
+      });
+      const audit = clone<LegacyTombstoneCompensationAudit>({
+        auditId: this.nextLegacyTombstoneAuditId,
+        jobId: current.jobId,
+        type: "legacy_tombstone/compensated",
+        sessionId: current.sessionId,
+        cutoverGeneration: 1,
+        deletionGeneration: 1,
+        eventSeq: terminal.seq,
+        claimAttempt: stagedAuthorization.claimAttempt,
+        evidenceSha256: successEvidence,
+        emittedAtMs: completedAtMs,
+      });
+      validateLegacyTombstoneCompensationAudit(audit);
+      const nextJob = clone(current);
+      nextJob.status = "completed";
+      nextJob.updatedAtMs = completedAtMs;
+      nextJob.completedAtMs = completedAtMs;
+      nextJob.completedEventSeq = terminal.seq;
+      nextJob.completedClaimAttempt = stagedAuthorization.claimAttempt;
+      nextJob.completedClaimTokenSha256 = legacyTombstoneClaimTokenSha256(
+        stagedAuthorization.claimToken,
+      );
+      delete nextJob.availableAtMs;
+      delete nextJob.claimToken;
+      delete nextJob.leaseUntilMs;
+      delete nextJob.lastErrorCode;
+      validateLegacyTombstoneCompensationJobRecord(nextJob);
+      const nextMarker = clone({ deletedAtMs, deletionGeneration: 1 });
+
+      const sessionExisted = this.sessions.has(session.id);
+      const priorSession = this.sessions.get(session.id);
+      const eventExisted = this.events.has(session.id);
+      const priorEvents = this.events.get(session.id);
+      const deletedExisted = this.deleted.has(session.id);
+      const priorDeleted = this.deleted.get(session.id);
+      const jobExisted = this.legacyTombstoneCompensationJobs.has(current.jobId);
+      const priorJob = this.legacyTombstoneCompensationJobs.get(current.jobId);
+      const auditExisted = this.legacyTombstoneCompensationAudits.has(current.jobId);
+      const priorAudits = this.legacyTombstoneCompensationAudits.get(current.jobId);
+      const turnExisted = stagedTurn === undefined ? false : this.turns.has(stagedTurn.id);
+      const priorTurn = stagedTurn === undefined ? undefined : this.turns.get(stagedTurn.id);
+      const approvalPrior = approvalTerminals.approvals.map((approval) => ({
+        id: approval.id,
+        existed: this.approvals.has(approval.id),
+        value: this.approvals.get(approval.id),
+      }));
+      const itemPrior = approvalTerminals.items.map((item) => ({
+        id: item.id,
+        existed: this.items.has(item.id),
+        value: this.items.get(item.id),
+      }));
+      const outboxPrior = stagedOutboxes.map(([key]) => ({
+        key,
+        existed: this.lifecycleOutbox.has(key),
+        value: this.lifecycleOutbox.get(key),
+      }));
+      try {
+        this.sessions.set(session.id, stagedSession);
+        if (stagedTurn) this.turns.set(stagedTurn.id, stagedTurn);
+        for (const approval of approvalTerminals.approvals) this.approvals.set(approval.id, approval);
+        for (const item of approvalTerminals.items) this.items.set(item.id, item);
+        this.events.set(session.id, nextLog);
+        this.deleted.set(session.id, nextMarker);
+        for (const [key, outbox] of stagedOutboxes) this.lifecycleOutbox.set(key, outbox);
+        this.legacyTombstoneCompensationAudits.set(current.jobId, [audit]);
+        this.legacyTombstoneCompensationJobs.set(current.jobId, nextJob);
+      } catch (error) {
+        restoreMapEntry(
+          this.legacyTombstoneCompensationJobs,
+          current.jobId,
+          jobExisted,
+          priorJob,
+        );
+        restoreMapEntry(
+          this.legacyTombstoneCompensationAudits,
+          current.jobId,
+          auditExisted,
+          priorAudits,
+        );
+        for (const entry of outboxPrior.reverse()) {
+          restoreMapEntry(this.lifecycleOutbox, entry.key, entry.existed, entry.value);
+        }
+        restoreMapEntry(this.deleted, session.id, deletedExisted, priorDeleted);
+        restoreMapEntry(this.events, session.id, eventExisted, priorEvents);
+        for (const entry of itemPrior.reverse()) {
+          restoreMapEntry(this.items, entry.id, entry.existed, entry.value);
+        }
+        for (const entry of approvalPrior.reverse()) {
+          restoreMapEntry(this.approvals, entry.id, entry.existed, entry.value);
+        }
+        if (stagedTurn) restoreMapEntry(this.turns, stagedTurn.id, turnExisted, priorTurn);
+        restoreMapEntry(this.sessions, session.id, sessionExisted, priorSession);
+        throw error;
+      }
+      this.nextLifecycleOutboxId += 2;
+      this.nextLegacyTombstoneAuditId += 1;
+      return {
+        outcome: "compensated",
+        sessionId: session.id,
+        deletionGeneration: 1,
+        eventSeq: terminal.seq,
+      };
+    } catch (error) {
+      if (error instanceof LegacyTombstoneChildPendingError) throw error;
+      if (!(error instanceof LegacyTombstoneIntegrityFault)) throw error;
+      return this.legacyTombstoneTerminalIncident(
+        current,
+        stagedAuthorization,
+        stagedOptions.completedAtMs,
+        error.reasonCode,
+      );
+    }
+  }
 
   private subjectRecord(
     tenantId: string,

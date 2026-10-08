@@ -135,10 +135,17 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:erasure-usage-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007, 0009, 0010, 0011
-      # and 0012 baselines are frozen SQL snapshots; the wrapper rejects any
-      # missing/skipped fixture, including the 0012 -> 0013 interrupted-DDL/replay matrix.
-      - name: Historical MySQL migrations (0007 through 0013, no skips)
+      # Generation-zero compensation crosses the irreversible cutover, queue authority and final
+      # tombstone publication boundaries. Keep a named no-skip proof for real InnoDB rollback/ABA.
+      - name: Legacy tombstone compensation real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:legacy-tombstone-mysql
+
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0013
+      # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
+      # missing/skipped fixture, including the 0013 -> 0014 cutover/trigger replay matrix.
+      - name: Historical MySQL migrations (0007 through 0014, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -235,7 +242,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0013_erasure_job_control.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0014_legacy_tombstone_compensation.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

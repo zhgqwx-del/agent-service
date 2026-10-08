@@ -1,4 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
@@ -9,6 +10,7 @@ import {
   DEFAULT_SCOPES,
   Event as EventSchema,
   Item as ItemSchema,
+  Session as SessionSchema,
   SessionStatus as SessionStatusSchema,
   Turn as TurnSchema,
   isCanonicalId,
@@ -186,6 +188,47 @@ import {
   type ErasureUsageReconciliationInput,
   type ErasureUsageReconciliationStore,
 } from "../erasure-usage.js";
+import {
+  LEGACY_TOMBSTONE_CUTOVER_ID,
+  LegacyTombstoneChildPendingError,
+  LegacyTombstoneCutoverConflictError,
+  LegacyTombstoneCutoverRequiredError,
+  LegacyTombstoneIntegrityFault,
+  LegacyTombstoneJobConflictError,
+  legacyTombstoneClaimTokenSha256,
+  legacyTombstoneCompensationAuthorizationMatches,
+  legacyTombstoneCompensationClaimFromRecord,
+  legacyTombstoneCompensationJobIdForSession,
+  legacyTombstoneSuccessEvidenceSha256,
+  legacyTombstoneTerminalIncidentEvidenceSha256,
+  legacyTombstoneUnsafeJobEnvelopeEvidenceSha256,
+  validateActivateLegacyTombstoneCutoverInput,
+  validateClaimLegacyTombstoneCompensationsOptions,
+  validateCompleteLegacyTombstoneCompensationOptions,
+  validateLegacyTombstoneCompensationAudit,
+  validateLegacyTombstoneCompensationAuthorization,
+  validateLegacyTombstoneCompensationJobRecord,
+  validateLegacyTombstoneCutoverRecord,
+  validateRenewLegacyTombstoneCompensationOptions,
+  validateRetryLegacyTombstoneCompensationOptions,
+  validateScheduleLegacyTombstoneCandidatesOptions,
+  validateScheduleLegacyTombstoneCompensationInput,
+  type ActivateLegacyTombstoneCutoverInput,
+  type ClaimLegacyTombstoneCompensationsOptions,
+  type CompleteLegacyTombstoneCompensationOptions,
+  type LegacyTombstoneCompensationAudit,
+  type LegacyTombstoneCompensationAuthorization,
+  type LegacyTombstoneCompensationClaim,
+  type LegacyTombstoneCompensationJobRecord,
+  type LegacyTombstoneCompensationResult,
+  type LegacyTombstoneCompensationStore,
+  type LegacyTombstoneCutoverRecord,
+  type LegacyTombstoneTerminalReasonCode,
+  type RenewLegacyTombstoneCompensationOptions,
+  type RetryLegacyTombstoneCompensationOptions,
+  type ScheduleLegacyTombstoneCandidatesOptions,
+  type ScheduleLegacyTombstoneCompensationInput,
+} from "../legacy-tombstone.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -216,6 +259,62 @@ const ERASURE_REQUEST_COLUMNS = `request_id, tenant_id, subject_kind, subject_id
   quarantine_reason_code, quarantine_evidence_sha256`;
 const ERASURE_CONTROL_EVENT_COLUMNS = `control_event_id, request_id, control_generation, event_type,
   phase, reason_code, action_code, actor_key_id, before_sha256, after_sha256, emitted_at_ms`;
+const LEGACY_TOMBSTONE_JOB_COLUMNS = `job_id, session_id, tenant_id, user_id, source_kind,
+  source_request_id, source_subject_generation, source_claim_attempt, source_claim_token_sha256,
+  maintenance_actor_key_id, source_deleted_at_ms, source_last_seq, candidate_sha256, status,
+  control_generation, available_at_ms, attempts, claim_token, lease_until_ms, last_error_code,
+  created_at_ms, updated_at_ms, completed_at_ms, completed_event_seq, completed_claim_attempt,
+  completed_claim_token_sha256, terminal_at_ms, terminal_reason_code, terminal_evidence_sha256`;
+const LEGACY_TOMBSTONE_EVENT_COLUMNS = `result_event_id, job_id, session_id, control_generation,
+  event_type, reason_code, actor_key_id, claim_attempt, source_deleted_at_ms,
+  target_deletion_generation, terminal_event_seq, before_sha256, after_sha256, emitted_at_ms`;
+const LEGACY_TOMBSTONE_JOB_EVIDENCE_FIELDS = [
+  "job_id",
+  "session_id",
+  "tenant_id",
+  "user_id",
+  "source_kind",
+  "source_request_id",
+  "source_subject_generation",
+  "source_claim_attempt",
+  "source_claim_token_sha256",
+  "maintenance_actor_key_id",
+  "source_deleted_at_ms",
+  "source_last_seq",
+  "candidate_sha256",
+  "status",
+  "control_generation",
+  "available_at_ms",
+  "attempts",
+  "claim_token",
+  "lease_until_ms",
+  "last_error_code",
+  "created_at_ms",
+  "updated_at_ms",
+  "completed_at_ms",
+  "completed_event_seq",
+  "completed_claim_attempt",
+  "completed_claim_token_sha256",
+  "terminal_at_ms",
+  "terminal_reason_code",
+  "terminal_evidence_sha256",
+] as const;
+const LEGACY_TOMBSTONE_EVENT_EVIDENCE_FIELDS = [
+  "result_event_id",
+  "job_id",
+  "session_id",
+  "control_generation",
+  "event_type",
+  "reason_code",
+  "actor_key_id",
+  "claim_attempt",
+  "source_deleted_at_ms",
+  "target_deletion_generation",
+  "terminal_event_seq",
+  "before_sha256",
+  "after_sha256",
+  "emitted_at_ms",
+] as const;
 const USAGE_OWNER_MATCH = "u.tenant_id=s.tenant_id AND u.user_id=s.user_id";
 const usageJsonNumber = (field: string) => (
   `CASE WHEN JSON_TYPE(JSON_EXTRACT(u.usage_json,'$.${field}')) IN ('INTEGER','DOUBLE','DECIMAL') `
@@ -258,6 +357,212 @@ interface ErasureClaimCandidate {
 type ErasureClaimCandidateResult =
   | { kind: "skipped" }
   | { kind: "consumed"; record?: ErasureRequestRecord };
+
+function legacyTombstoneSha256(domain: string, values: readonly unknown[]): string {
+  return createHash("sha256").update(JSON.stringify([domain, ...values])).digest("hex");
+}
+
+function legacyTombstoneCutoverEvidenceSha256(
+  actorKeyId: string,
+  activatedAtMs: number,
+): string {
+  return legacyTombstoneSha256("legacy-tombstone-cutover-v1", [
+    LEGACY_TOMBSTONE_CUTOVER_ID,
+    1,
+    actorKeyId,
+    activatedAtMs,
+  ]);
+}
+
+function legacyTombstoneCandidateSha256(input: {
+  sessionId: string;
+  tenantId: string;
+  userId: string;
+  deletedAtMs: number;
+  lastSeq: number;
+}): string {
+  return legacyTombstoneSha256("legacy-tombstone-candidate-v1", [
+    input.sessionId,
+    input.tenantId,
+    input.userId,
+    input.deletedAtMs,
+    input.lastSeq,
+  ]);
+}
+
+function legacyTombstoneRawField(row: Row, field: string): string | null {
+  return row[field] == null ? null : String(row[field]);
+}
+
+function legacyTombstoneMissingResultEvidenceSha256(row: Row, emittedAtMs: number): string {
+  return legacyTombstoneSha256("legacy-tombstone-missing-result-v1", [
+    ...LEGACY_TOMBSTONE_JOB_EVIDENCE_FIELDS.map((field) => legacyTombstoneRawField(row, field)),
+    "proof_conflict",
+    emittedAtMs,
+  ]);
+}
+
+function legacyTombstoneMismatchedResultEvidenceSha256(
+  row: Row,
+  resultRows: readonly Row[],
+): string {
+  return legacyTombstoneSha256("legacy-tombstone-mismatched-result-v1", [
+    ...LEGACY_TOMBSTONE_JOB_EVIDENCE_FIELDS.map((field) => legacyTombstoneRawField(row, field)),
+    resultRows.map((resultRow) => (
+      LEGACY_TOMBSTONE_EVENT_EVIDENCE_FIELDS.map((field) => (
+        legacyTombstoneRawField(resultRow, field)
+      ))
+    )),
+    "proof_conflict",
+  ]);
+}
+
+function legacyTombstoneJobIdForRawSession(sessionId: string): string {
+  try {
+    return legacyTombstoneCompensationJobIdForSession(sessionId);
+  } catch {
+    const hex = createHash("sha256")
+      .update(JSON.stringify(["legacy-tombstone-raw-job-v1", sessionId]))
+      .digest("hex")
+      .slice(0, 32)
+      .split("");
+    hex[12] = "4";
+    hex[16] = ["8", "9", "a", "b"][Number.parseInt(hex[16]!, 16) % 4]!;
+    const value = hex.join("");
+    return `ltc_${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+  }
+}
+
+function rowToLegacyTombstoneCompensationJob(row: Row): LegacyTombstoneCompensationJobRecord {
+  const common = {
+    jobId: String(row.job_id),
+    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
+    sessionId: String(row.session_id),
+    cutoverGeneration: Number(row.control_generation) as 1,
+    legacyDeletedAtMs: Number(row.source_deleted_at_ms),
+    status: String(row.status) as LegacyTombstoneCompensationJobRecord["status"],
+    createdAtMs: Number(row.created_at_ms),
+    updatedAtMs: Number(row.updated_at_ms),
+    ...(row.available_at_ms == null ? {} : { availableAtMs: Number(row.available_at_ms) }),
+    attempts: Number(row.attempts),
+    ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+    ...(row.lease_until_ms == null ? {} : { leaseUntilMs: Number(row.lease_until_ms) }),
+    ...(row.last_error_code == null
+      ? {}
+      : { lastErrorCode: String(row.last_error_code) as LegacyTombstoneCompensationJobRecord["lastErrorCode"] }),
+    ...(row.completed_at_ms == null ? {} : { completedAtMs: Number(row.completed_at_ms) }),
+    ...(row.completed_event_seq == null ? {} : { completedEventSeq: Number(row.completed_event_seq) }),
+    ...(row.completed_claim_attempt == null
+      ? {}
+      : { completedClaimAttempt: Number(row.completed_claim_attempt) }),
+    ...(row.completed_claim_token_sha256 == null
+      ? {}
+      : { completedClaimTokenSha256: String(row.completed_claim_token_sha256) }),
+    ...(row.terminal_at_ms == null ? {} : { terminalAtMs: Number(row.terminal_at_ms) }),
+    ...(row.terminal_reason_code == null
+      ? {}
+      : { terminalReasonCode: String(row.terminal_reason_code) as LegacyTombstoneTerminalReasonCode }),
+    ...(row.terminal_evidence_sha256 == null
+      ? {}
+      : { terminalEvidenceSha256: String(row.terminal_evidence_sha256) }),
+  };
+  const record: LegacyTombstoneCompensationJobRecord = row.source_kind === "maintenance"
+    ? {
+        ...common,
+        sourceKind: "maintenance",
+        maintenanceActorKeyId: String(row.maintenance_actor_key_id),
+      }
+    : {
+        ...common,
+        sourceKind: "erasure_claim",
+        sourceRequestId: String(row.source_request_id),
+        sourceSubjectGeneration: Number(row.source_subject_generation),
+        sourceClaimAttempt: Number(row.source_claim_attempt),
+        sourceClaimTokenSha256: String(row.source_claim_token_sha256),
+      };
+  validateLegacyTombstoneCompensationJobRecord(record);
+  return record;
+}
+
+function rowToLegacyTombstoneUnsafeEnvelope(row: Row) {
+  return {
+    locatorJobId: String(row.job_id),
+    jobId: String(row.job_id),
+    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
+    sessionId: String(row.session_id),
+    sourceRequestId: row.source_request_id == null ? null : String(row.source_request_id),
+    sourceKind: String(row.source_kind),
+    rawSourceSubjectGeneration: row.source_subject_generation == null
+      ? null
+      : String(row.source_subject_generation),
+    rawSourceClaimAttempt: row.source_claim_attempt == null ? null : String(row.source_claim_attempt),
+    sourceClaimTokenSha256: row.source_claim_token_sha256 == null
+      ? null
+      : String(row.source_claim_token_sha256),
+    maintenanceActorKeyId: row.maintenance_actor_key_id == null
+      ? null
+      : String(row.maintenance_actor_key_id),
+    rawCutoverGeneration: String(row.control_generation),
+    rawLegacyDeletedAtMs: String(row.source_deleted_at_ms),
+    status: String(row.status),
+    rawCreatedAtMs: String(row.created_at_ms),
+    rawUpdatedAtMs: String(row.updated_at_ms),
+    rawAvailableAtMs: row.available_at_ms == null ? null : String(row.available_at_ms),
+    rawAttempts: String(row.attempts),
+    claimToken: row.claim_token == null ? null : String(row.claim_token),
+    rawLeaseUntilMs: row.lease_until_ms == null ? null : String(row.lease_until_ms),
+  };
+}
+
+function rowToLegacyTombstoneAudit(row: Row): LegacyTombstoneCompensationAudit {
+  const base = {
+    auditId: Number(row.result_event_id),
+    jobId: String(row.job_id),
+    evidenceSha256: String(row.after_sha256 ?? row.before_sha256),
+    emittedAtMs: Number(row.emitted_at_ms),
+  };
+  const audit: LegacyTombstoneCompensationAudit = row.event_type === "legacy_tombstone/compensated"
+    ? {
+        ...base,
+        type: "legacy_tombstone/compensated",
+        sessionId: String(row.session_id),
+        cutoverGeneration: Number(row.control_generation) as 1,
+        deletionGeneration: Number(row.target_deletion_generation) as 1,
+        eventSeq: Number(row.terminal_event_seq),
+        claimAttempt: Number(row.claim_attempt),
+      }
+    : {
+        ...base,
+        type: "legacy_tombstone/terminal_incident",
+        reasonCode: String(row.reason_code) as LegacyTombstoneTerminalReasonCode,
+      };
+  validateLegacyTombstoneCompensationAudit(audit);
+  return audit;
+}
+
+function rowToLegacyTombstoneCutover(row: Row): LegacyTombstoneCutoverRecord | null {
+  const generation = Number(row.control_generation);
+  if (
+    generation === 0
+    && row.activated_at_ms == null
+    && row.actor_key_id == null
+    && row.evidence_sha256 == null
+  ) return null;
+  const record: LegacyTombstoneCutoverRecord = {
+    cutoverId: LEGACY_TOMBSTONE_CUTOVER_ID,
+    generation: generation as 1,
+    activatedByKeyId: String(row.actor_key_id),
+    activatedAtMs: Number(row.activated_at_ms),
+  };
+  validateLegacyTombstoneCutoverRecord(record);
+  if (
+    String(row.evidence_sha256)
+      !== legacyTombstoneCutoverEvidenceSha256(record.activatedByKeyId, record.activatedAtMs)
+  ) throw new Error("stored legacy tombstone cutover evidence is invalid");
+  return record;
+}
 
 /** Serialize a Session row. The projection columns are the source for filtering; `body` holds the rest. */
 function rowToSession(r: Row): Session {
@@ -878,7 +1183,8 @@ export class MysqlSessionStore implements
   ErasureJobMaintenanceStore,
   ErasureSessionStore,
   ErasureSessionCatalogStore,
-  ErasureUsageReconciliationStore
+  ErasureUsageReconciliationStore,
+  LegacyTombstoneCompensationStore
 {
   private constructor(private readonly pool: Pool) {}
 
@@ -965,6 +1271,1791 @@ export class MysqlSessionStore implements
       if (locked) {
         await conn.query("SELECT RELEASE_LOCK(CONCAT('agent-service:migrate:', LEFT(SHA2(DATABASE(), 256), 32)))").catch(() => {});
       }
+      conn.release();
+    }
+  }
+
+  // ---------- legacy generation-zero tombstone compensation ----------
+  private async readLegacyTombstoneCutover(
+    conn: PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<LegacyTombstoneCutoverRecord | null> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT control_generation, activated_at_ms, actor_key_id, evidence_sha256
+         FROM legacy_tombstone_cutover WHERE singleton_id=1 ${lock}`,
+    );
+    if (!rows[0]) throw new Error("legacy tombstone cutover singleton is missing");
+    return rowToLegacyTombstoneCutover(rows[0]);
+  }
+
+  private async requireActiveLegacyTombstoneCutover(
+    conn: PoolConnection,
+  ): Promise<LegacyTombstoneCutoverRecord> {
+    const record = await this.readLegacyTombstoneCutover(conn, "FOR SHARE");
+    if (!record) throw new LegacyTombstoneCutoverRequiredError();
+    return record;
+  }
+
+  async getLegacyTombstoneCutover(): Promise<LegacyTombstoneCutoverRecord | null> {
+    const conn = await this.pool.getConnection();
+    try {
+      return await this.readLegacyTombstoneCutover(conn);
+    } finally {
+      conn.release();
+    }
+  }
+
+  async activateLegacyTombstoneCutover(
+    input: ActivateLegacyTombstoneCutoverInput,
+  ): Promise<LegacyTombstoneCutoverRecord> {
+    const stagedInput = structuredClone(input);
+    validateActivateLegacyTombstoneCutoverInput(stagedInput);
+    const evidence = legacyTombstoneCutoverEvidenceSha256(
+      stagedInput.actorKeyId,
+      stagedInput.atMs,
+    );
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const existing = await this.readLegacyTombstoneCutover(conn, "FOR UPDATE");
+      if (existing) {
+        if (
+          existing.activatedByKeyId === stagedInput.actorKeyId
+          && existing.activatedAtMs === stagedInput.atMs
+        ) {
+          await conn.commit();
+          return existing;
+        }
+        throw new LegacyTombstoneCutoverConflictError();
+      }
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE legacy_tombstone_cutover
+            SET control_generation=1, activated_at_ms=?, actor_key_id=?, evidence_sha256=?
+          WHERE singleton_id=1 AND control_generation=0 AND activated_at_ms IS NULL
+            AND actor_key_id IS NULL AND evidence_sha256 IS NULL`,
+        [stagedInput.atMs, stagedInput.actorKeyId, evidence],
+      );
+      if (updated.affectedRows !== 1) throw new LegacyTombstoneCutoverConflictError();
+      const record = await this.readLegacyTombstoneCutover(conn);
+      if (!record) throw new Error("legacy tombstone cutover activation was not durable");
+      await conn.commit();
+      return record;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private legacyTombstoneCandidate(row: Row): {
+    session: Session;
+    deletedAtMs: number;
+    lastSeq: number;
+    candidateSha256: string;
+  } {
+    let session: Session;
+    try {
+      session = SessionSchema.parse(rowToSession(row));
+    } catch {
+      throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+    }
+    const deletedAtMs = Number(row.deleted_at_ms);
+    const lastSeq = Number(row.last_seq);
+    const generation = Number(row.deletion_generation);
+    if (
+      row.session_id !== session.id
+      || row.tenant_id !== session.tenantId
+      || row.user_id !== session.userId
+      || !Number.isSafeInteger(deletedAtMs)
+      || deletedAtMs < 0
+      || deletedAtMs < session.createdAtMs
+      || deletedAtMs < session.updatedAtMs
+      || !Number.isSafeInteger(lastSeq)
+      || lastSeq < 0
+      || session.lastSeq !== lastSeq
+      || generation !== 0
+      || row.purge_after_ms != null
+    ) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+    return {
+      session,
+      deletedAtMs,
+      lastSeq,
+      candidateSha256: legacyTombstoneCandidateSha256({
+        sessionId: session.id,
+        tenantId: session.tenantId,
+        userId: session.userId,
+        deletedAtMs,
+        lastSeq,
+      }),
+    };
+  }
+
+  private assertLegacyTombstoneJobCandidate(
+    row: Row,
+    candidate: ReturnType<MysqlSessionStore["legacyTombstoneCandidate"]>,
+  ): void {
+    if (
+      String(row.session_id) !== candidate.session.id
+      || String(row.tenant_id) !== candidate.session.tenantId
+      || String(row.user_id) !== candidate.session.userId
+      || Number(row.source_deleted_at_ms) !== candidate.deletedAtMs
+      || Number(row.source_last_seq) !== candidate.lastSeq
+      || String(row.candidate_sha256) !== candidate.candidateSha256
+    ) throw new LegacyTombstoneJobConflictError();
+  }
+
+  private async readLegacyTombstoneResultRows(
+    conn: PoolConnection,
+    jobId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<Row[]> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${LEGACY_TOMBSTONE_EVENT_COLUMNS}
+         FROM legacy_tombstone_compensation_events
+        WHERE job_id=? ORDER BY result_event_id ${lock}`,
+      [jobId],
+    );
+    return rows;
+  }
+
+  private legacyTombstoneResultMatchesJob(
+    jobRow: Row,
+    job: LegacyTombstoneCompensationJobRecord,
+    resultRows: readonly Row[],
+  ): boolean {
+    const resultRow = resultRows[0];
+    if (resultRows.length !== 1 || !resultRow || job.status === "pending") return false;
+    let audit: LegacyTombstoneCompensationAudit;
+    try {
+      audit = rowToLegacyTombstoneAudit(resultRow);
+    } catch {
+      return false;
+    }
+    const expectedActor = job.sourceKind === "maintenance" ? job.maintenanceActorKeyId : null;
+    const commonMatches = String(resultRow.job_id) === job.jobId
+      && String(resultRow.session_id) === job.sessionId
+      && Number(resultRow.control_generation) === 1
+      && (resultRow.actor_key_id == null ? null : String(resultRow.actor_key_id)) === expectedActor
+      && Number(resultRow.source_deleted_at_ms) === job.legacyDeletedAtMs
+      && String(resultRow.before_sha256) === String(jobRow.candidate_sha256);
+    if (!commonMatches) return false;
+
+    if (job.status === "completed") {
+      if (
+        job.completedAtMs === undefined
+        || job.completedEventSeq === undefined
+        || job.completedClaimAttempt === undefined
+      ) return false;
+      const evidence = legacyTombstoneSuccessEvidenceSha256({
+        jobId: job.jobId,
+        tenantId: job.tenantId,
+        userId: job.userId,
+        sessionId: job.sessionId,
+        cutoverGeneration: 1,
+        legacyDeletedAtMs: job.legacyDeletedAtMs,
+        deletionGeneration: 1,
+        eventSeq: job.completedEventSeq,
+        claimAttempt: job.completedClaimAttempt,
+        emittedAtMs: job.completedAtMs,
+      });
+      return audit.type === "legacy_tombstone/compensated"
+        && resultRow.reason_code == null
+        && Number(resultRow.claim_attempt) === job.completedClaimAttempt
+        && Number(resultRow.target_deletion_generation) === 1
+        && Number(resultRow.terminal_event_seq) === job.completedEventSeq
+        && String(resultRow.after_sha256) === evidence
+        && Number(resultRow.emitted_at_ms) === job.completedAtMs
+        && audit.evidenceSha256 === evidence;
+    }
+
+    if (
+      job.terminalAtMs === undefined
+      || job.terminalReasonCode === undefined
+      || job.terminalEvidenceSha256 === undefined
+    ) return false;
+    const expectedAttempt = job.attempts === 0 ? null : job.attempts;
+    return audit.type === "legacy_tombstone/terminal_incident"
+      && resultRow.event_type === "legacy_tombstone/terminal_incident"
+      && audit.reasonCode === job.terminalReasonCode
+      && (resultRow.claim_attempt == null ? null : Number(resultRow.claim_attempt)) === expectedAttempt
+      && resultRow.target_deletion_generation == null
+      && resultRow.terminal_event_seq == null
+      && String(resultRow.after_sha256) === job.terminalEvidenceSha256
+      && Number(resultRow.emitted_at_ms) === job.terminalAtMs
+      && audit.evidenceSha256 === job.terminalEvidenceSha256;
+  }
+
+  private projectLegacyTombstoneProofConflict(
+    jobRow: Row,
+    job: LegacyTombstoneCompensationJobRecord,
+    resultRows: readonly Row[],
+  ): LegacyTombstoneCompensationJobRecord {
+    let terminalAtMs = job.updatedAtMs;
+    let terminalEvidenceSha256: string;
+    const resultRow = resultRows.length === 1 ? resultRows[0] : undefined;
+    const resultAtMs = resultRow == null ? Number.NaN : Number(resultRow.emitted_at_ms);
+    const expectedActor = job.sourceKind === "maintenance" ? job.maintenanceActorKeyId : null;
+    const expectedAttempt = job.status === "completed"
+      ? job.completedClaimAttempt ?? null
+      : job.attempts === 0 ? null : job.attempts;
+    if (
+      resultRow
+      && job.status !== "pending"
+      && resultRow.event_type === "legacy_tombstone/terminal_incident"
+      && resultRow.reason_code === "proof_conflict"
+      && String(resultRow.job_id) === job.jobId
+      && String(resultRow.session_id) === job.sessionId
+      && Number(resultRow.control_generation) === 1
+      && (resultRow.actor_key_id == null ? null : String(resultRow.actor_key_id)) === expectedActor
+      && (resultRow.claim_attempt == null ? null : Number(resultRow.claim_attempt)) === expectedAttempt
+      && Number(resultRow.source_deleted_at_ms) === job.legacyDeletedAtMs
+      && resultRow.target_deletion_generation == null
+      && resultRow.terminal_event_seq == null
+      && String(resultRow.before_sha256) === String(jobRow.candidate_sha256)
+      && Number.isSafeInteger(resultAtMs)
+      && resultAtMs >= job.updatedAtMs
+      && String(resultRow.after_sha256)
+        === legacyTombstoneMissingResultEvidenceSha256(jobRow, resultAtMs)
+    ) {
+      terminalAtMs = resultAtMs;
+      terminalEvidenceSha256 = String(resultRow.after_sha256);
+    } else if (resultRows.length > 0) {
+      terminalEvidenceSha256 = legacyTombstoneMismatchedResultEvidenceSha256(jobRow, resultRows);
+    } else {
+      terminalEvidenceSha256 = legacyTombstoneMissingResultEvidenceSha256(jobRow, terminalAtMs);
+    }
+
+    const projected = structuredClone(job);
+    projected.status = "terminal_incident";
+    projected.updatedAtMs = Math.max(projected.updatedAtMs, terminalAtMs);
+    projected.terminalAtMs = terminalAtMs;
+    projected.terminalReasonCode = "proof_conflict";
+    projected.terminalEvidenceSha256 = terminalEvidenceSha256;
+    delete projected.availableAtMs;
+    delete projected.claimToken;
+    delete projected.leaseUntilMs;
+    delete projected.lastErrorCode;
+    delete projected.completedAtMs;
+    delete projected.completedEventSeq;
+    delete projected.completedClaimAttempt;
+    delete projected.completedClaimTokenSha256;
+    validateLegacyTombstoneCompensationJobRecord(projected);
+    return projected;
+  }
+
+  private projectUnsafeLegacyTombstoneJob(
+    jobRow: Row,
+    resultRows: readonly Row[],
+  ): LegacyTombstoneCompensationJobRecord | null {
+    const resultRow = resultRows.length === 1 ? resultRows[0] : undefined;
+    if (!resultRow) return null;
+    let audit: LegacyTombstoneCompensationAudit;
+    try {
+      audit = rowToLegacyTombstoneAudit(resultRow);
+    } catch {
+      return null;
+    }
+    const sourceKind = String(jobRow.source_kind);
+    const expectedActor = audit.type === "legacy_tombstone/terminal_incident"
+      && audit.reasonCode !== "unsafe_job_envelope"
+      && sourceKind === "maintenance"
+      ? String(jobRow.maintenance_actor_key_id)
+      : null;
+    if (
+      audit.type !== "legacy_tombstone/terminal_incident"
+      || resultRow.event_type !== "legacy_tombstone/terminal_incident"
+      || resultRow.reason_code !== audit.reasonCode
+      || String(resultRow.job_id) !== String(jobRow.job_id)
+      || String(resultRow.session_id) !== String(jobRow.session_id)
+      || Number(resultRow.control_generation) !== 1
+      || (resultRow.actor_key_id == null ? null : String(resultRow.actor_key_id)) !== expectedActor
+      || Number(resultRow.source_deleted_at_ms) !== Number(jobRow.source_deleted_at_ms)
+      || resultRow.target_deletion_generation != null
+      || resultRow.terminal_event_seq != null
+      || String(resultRow.after_sha256) !== audit.evidenceSha256
+      || !/^[0-9a-f]{64}$/.test(String(resultRow.before_sha256))
+      || Number(jobRow.control_generation) !== 1
+    ) return null;
+
+    const legacyDeletedAtMs = Number(jobRow.source_deleted_at_ms);
+    const rawCreatedAtMs = Number(jobRow.created_at_ms);
+    const rawUpdatedAtMs = Number(jobRow.updated_at_ms);
+    const attempts = Number(jobRow.attempts);
+    if (
+      !Number.isSafeInteger(legacyDeletedAtMs)
+      || legacyDeletedAtMs < 0
+      || !Number.isSafeInteger(rawCreatedAtMs)
+      || rawCreatedAtMs < 0
+      || !Number.isSafeInteger(rawUpdatedAtMs)
+      || rawUpdatedAtMs < 0
+      || !Number.isSafeInteger(attempts)
+      || attempts < 0
+    ) return null;
+    const createdAtMs = Math.max(rawCreatedAtMs, legacyDeletedAtMs);
+    const terminalAtMs = Math.max(createdAtMs, rawUpdatedAtMs, audit.emittedAtMs);
+    const common = {
+      jobId: String(jobRow.job_id),
+      tenantId: String(jobRow.tenant_id),
+      userId: String(jobRow.user_id),
+      sessionId: String(jobRow.session_id),
+      cutoverGeneration: 1 as const,
+      legacyDeletedAtMs,
+      status: "terminal_incident" as const,
+      createdAtMs,
+      updatedAtMs: terminalAtMs,
+      attempts,
+      terminalAtMs,
+      terminalReasonCode: audit.reasonCode,
+      terminalEvidenceSha256: audit.evidenceSha256,
+    };
+    const projected = sourceKind === "maintenance"
+      ? {
+          ...common,
+          sourceKind: "maintenance" as const,
+          maintenanceActorKeyId: String(jobRow.maintenance_actor_key_id),
+        }
+      : {
+          ...common,
+          sourceKind: "erasure_claim" as const,
+          sourceRequestId: String(jobRow.source_request_id),
+          sourceSubjectGeneration: Number(jobRow.source_subject_generation),
+          sourceClaimAttempt: Number(jobRow.source_claim_attempt),
+          sourceClaimTokenSha256: String(jobRow.source_claim_token_sha256),
+        };
+    try {
+      validateLegacyTombstoneCompensationJobRecord(projected);
+      return projected;
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveLegacyTombstoneJobResult(
+    jobRow: Row,
+    job: LegacyTombstoneCompensationJobRecord,
+    resultRows: readonly Row[],
+  ): LegacyTombstoneCompensationJobRecord {
+    if (
+      (job.status === "pending" && resultRows.length === 0)
+      || this.legacyTombstoneResultMatchesJob(jobRow, job, resultRows)
+    ) return job;
+    return this.projectLegacyTombstoneProofConflict(jobRow, job, resultRows);
+  }
+
+  private async appendLegacyTombstoneMissingResultIncident(
+    conn: PoolConnection,
+    jobRow: Row,
+    job: LegacyTombstoneCompensationJobRecord,
+    atMs: number,
+  ): Promise<void> {
+    const emittedAtMs = Math.max(job.updatedAtMs, atMs);
+    const evidence = legacyTombstoneMissingResultEvidenceSha256(jobRow, emittedAtMs);
+    const claimAttempt = job.status === "completed"
+      ? job.completedClaimAttempt ?? null
+      : job.attempts === 0 ? null : job.attempts;
+    await conn.query(
+      `INSERT INTO legacy_tombstone_compensation_events
+         (job_id, session_id, control_generation, event_type, reason_code, actor_key_id,
+          claim_attempt, source_deleted_at_ms, target_deletion_generation, terminal_event_seq,
+          before_sha256, after_sha256, emitted_at_ms)
+       VALUES (?, ?, 1, 'legacy_tombstone/terminal_incident', 'proof_conflict', ?, ?, ?,
+               NULL, NULL, ?, ?, ?)`,
+      [
+        job.jobId,
+        job.sessionId,
+        job.sourceKind === "maintenance" ? job.maintenanceActorKeyId : null,
+        claimAttempt,
+        job.legacyDeletedAtMs,
+        String(jobRow.candidate_sha256),
+        evidence,
+        emittedAtMs,
+      ],
+    );
+  }
+
+  async scheduleLegacyTombstoneCompensation(
+    authorization: ErasureWriteAuthorization,
+    input: ScheduleLegacyTombstoneCompensationInput,
+  ): Promise<LegacyTombstoneCompensationJobRecord> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedInput = structuredClone(input);
+    validateErasureWriteAuthorization(stagedAuthorization);
+    validateScheduleLegacyTombstoneCompensationInput(stagedInput);
+    if (stagedInput.jobId !== legacyTombstoneCompensationJobIdForSession(stagedInput.sessionId)) {
+      throw new LegacyTombstoneJobConflictError();
+    }
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.requireActiveLegacyTombstoneCutover(conn);
+      const [sessionRows] = await conn.query<Row[]>(
+        `SELECT s.* FROM sessions s FORCE INDEX (idx_sessions_tenant_user)
+          WHERE tenant_id=? AND user_id=? AND session_id=? FOR UPDATE`,
+        [stagedAuthorization.tenantId, stagedAuthorization.userId, stagedInput.sessionId],
+      );
+      await this.lockErasureSessionAuthority(
+        conn,
+        stagedAuthorization,
+        ["reconciling_usage"],
+        stagedInput.atMs,
+      );
+      if (!sessionRows[0]) throw new SessionGoneError(stagedInput.sessionId);
+
+      const [existingRows] = await conn.query<Row[]>(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+           FROM legacy_tombstone_compensation_jobs
+          WHERE job_id=? OR session_id=? ORDER BY job_id FOR UPDATE`,
+        [stagedInput.jobId, stagedInput.sessionId],
+      );
+      if (existingRows.length > 1) throw new LegacyTombstoneJobConflictError();
+      if (existingRows[0]) {
+        const existingRow = existingRows[0];
+        const resultRows = await this.readLegacyTombstoneResultRows(
+          conn,
+          String(existingRow.job_id),
+          "FOR SHARE",
+        );
+        let stored: LegacyTombstoneCompensationJobRecord;
+        let existing: LegacyTombstoneCompensationJobRecord;
+        try {
+          stored = rowToLegacyTombstoneCompensationJob(existingRow);
+          existing = this.resolveLegacyTombstoneJobResult(existingRow, stored, resultRows);
+        } catch {
+          const unsafeProjection = this.projectUnsafeLegacyTombstoneJob(existingRow, resultRows);
+          if (!unsafeProjection) throw new LegacyTombstoneJobConflictError();
+          stored = unsafeProjection;
+          existing = unsafeProjection;
+        }
+        const sameIdentity = stored.jobId === stagedInput.jobId
+          && stored.sessionId === stagedInput.sessionId
+          && stored.tenantId === stagedAuthorization.tenantId
+          && stored.userId === stagedAuthorization.userId
+          && sessionRows[0].session_id === stored.sessionId
+          && sessionRows[0].tenant_id === stored.tenantId
+          && sessionRows[0].user_id === stored.userId
+          && Number(sessionRows[0].deleted_at_ms) === stored.legacyDeletedAtMs
+          && (stored.sourceKind === "maintenance" || (
+            stored.sourceRequestId === stagedAuthorization.requestId
+            && stored.sourceSubjectGeneration === stagedAuthorization.subjectGeneration
+          ));
+        if (!sameIdentity) throw new LegacyTombstoneJobConflictError();
+        if (existing.status === "pending") {
+          const candidate = this.legacyTombstoneCandidate(sessionRows[0]);
+          this.assertLegacyTombstoneJobCandidate(existingRow, candidate);
+        } else if (
+          existing.status === "completed"
+          && Number(sessionRows[0].deletion_generation) !== 1
+        ) {
+          throw new LegacyTombstoneJobConflictError();
+        }
+        await conn.commit();
+        return existing;
+      }
+
+      const candidate = this.legacyTombstoneCandidate(sessionRows[0]);
+      if (stagedInput.atMs < candidate.deletedAtMs) {
+        throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      }
+
+      await conn.query(
+        `INSERT INTO legacy_tombstone_compensation_jobs
+           (job_id, session_id, tenant_id, user_id, source_kind, source_request_id,
+            source_subject_generation, source_claim_attempt, source_claim_token_sha256,
+            maintenance_actor_key_id, source_deleted_at_ms, source_last_seq, candidate_sha256,
+            status, control_generation, available_at_ms, attempts, claim_token, lease_until_ms,
+            last_error_code, created_at_ms, updated_at_ms)
+         VALUES (?, ?, ?, ?, 'erasure_claim', ?, ?, ?, ?, NULL, ?, ?, ?,
+                 'pending', 1, ?, 0, NULL, NULL, NULL, ?, ?)`,
+        [
+          stagedInput.jobId,
+          candidate.session.id,
+          candidate.session.tenantId,
+          candidate.session.userId,
+          stagedAuthorization.requestId,
+          stagedAuthorization.subjectGeneration,
+          stagedAuthorization.claimAttempt,
+          legacyTombstoneClaimTokenSha256(stagedAuthorization.claimToken),
+          candidate.deletedAtMs,
+          candidate.lastSeq,
+          candidate.candidateSha256,
+          stagedInput.availableAtMs,
+          stagedInput.atMs,
+          stagedInput.atMs,
+        ],
+      );
+      const [createdRows] = await conn.query<Row[]>(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+           FROM legacy_tombstone_compensation_jobs WHERE job_id=?`,
+        [stagedInput.jobId],
+      );
+      if (!createdRows[0]) throw new Error("legacy tombstone job was not created");
+      const created = rowToLegacyTombstoneCompensationJob(createdRows[0]);
+      await conn.commit();
+      return created;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async scheduleLegacyTombstoneCandidates(
+    options: ScheduleLegacyTombstoneCandidatesOptions,
+  ): Promise<LegacyTombstoneCompensationJobRecord[]> {
+    const stagedOptions = structuredClone(options);
+    validateScheduleLegacyTombstoneCandidatesOptions(stagedOptions);
+    const conn = await this.pool.getConnection();
+    let candidateIds: string[] = [];
+    try {
+      const cutover = await this.readLegacyTombstoneCutover(conn);
+      if (!cutover) throw new LegacyTombstoneCutoverRequiredError();
+      if (cutover.generation !== stagedOptions.cutoverGeneration) {
+        throw new LegacyTombstoneCutoverConflictError();
+      }
+      const [leafRows] = await conn.query<Row[]>(
+        `SELECT s.session_id
+           FROM sessions s FORCE INDEX (idx_sessions_legacy_tombstone_candidate)
+           LEFT JOIN legacy_tombstone_compensation_jobs j ON j.session_id=s.session_id
+          WHERE s.deletion_generation=0 AND s.deleted_at_ms IS NOT NULL AND j.session_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM sessions c
+               WHERE c.parent_session_id=s.session_id AND c.deletion_generation=0
+            )
+          ORDER BY s.session_id LIMIT ?`,
+        [stagedOptions.limit],
+      );
+      candidateIds = leafRows.map((row) => String(row.session_id));
+      if (candidateIds.length < stagedOptions.limit) {
+        const remaining = stagedOptions.limit - candidateIds.length;
+        const excluded = candidateIds.length
+          ? ` AND s.session_id NOT IN (${candidateIds.map(() => "?").join(",")})`
+          : "";
+        const [fallbackRows] = await conn.query<Row[]>(
+          `SELECT s.session_id
+             FROM sessions s FORCE INDEX (idx_sessions_legacy_tombstone_candidate)
+             LEFT JOIN legacy_tombstone_compensation_jobs j ON j.session_id=s.session_id
+            WHERE s.deletion_generation=0 AND s.deleted_at_ms IS NOT NULL AND j.session_id IS NULL
+              ${excluded}
+            ORDER BY s.session_id LIMIT ?`,
+          [...candidateIds, remaining],
+        );
+        candidateIds.push(...fallbackRows.map((row) => String(row.session_id)));
+      }
+    } finally {
+      conn.release();
+    }
+
+    const created: LegacyTombstoneCompensationJobRecord[] = [];
+    for (const sessionId of candidateIds) {
+      const record = await this.scheduleLegacyTombstoneCandidate(stagedOptions, sessionId);
+      if (record) created.push(record);
+    }
+    return created;
+  }
+
+  private async scheduleLegacyTombstoneCandidate(
+    options: ScheduleLegacyTombstoneCandidatesOptions,
+    sessionId: string,
+  ): Promise<LegacyTombstoneCompensationJobRecord | null> {
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const cutover = await this.requireActiveLegacyTombstoneCutover(conn);
+      if (cutover.generation !== options.cutoverGeneration) {
+        throw new LegacyTombstoneCutoverConflictError();
+      }
+      const [rows] = await conn.query<Row[]>(
+        "SELECT * FROM sessions WHERE session_id=? FOR UPDATE",
+        [sessionId],
+      );
+      if (!rows[0] || rows[0].deleted_at_ms == null || Number(rows[0].deletion_generation) !== 0) {
+        await conn.commit();
+        return null;
+      }
+      let candidate: ReturnType<MysqlSessionStore["legacyTombstoneCandidate"]>;
+      try {
+        candidate = this.legacyTombstoneCandidate(rows[0]);
+        if (options.nowMs < candidate.deletedAtMs) {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+      } catch (error) {
+        if (!(error instanceof LegacyTombstoneIntegrityFault)) throw error;
+        await this.terminallyIsolateLegacyTombstoneCandidate(conn, rows[0], options, error.reasonCode);
+        await conn.commit();
+        return null;
+      }
+      const jobId = legacyTombstoneCompensationJobIdForSession(candidate.session.id);
+      const [existing] = await conn.query<Row[]>(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+           FROM legacy_tombstone_compensation_jobs WHERE session_id=? OR job_id=? FOR UPDATE`,
+        [candidate.session.id, jobId],
+      );
+      if (existing.length > 1) throw new LegacyTombstoneJobConflictError();
+      if (existing[0]) {
+        await conn.commit();
+        return null;
+      }
+      await conn.query(
+        `INSERT INTO legacy_tombstone_compensation_jobs
+           (job_id, session_id, tenant_id, user_id, source_kind, source_request_id,
+            source_subject_generation, source_claim_attempt, source_claim_token_sha256,
+            maintenance_actor_key_id, source_deleted_at_ms, source_last_seq, candidate_sha256,
+            status, control_generation, available_at_ms, attempts, claim_token, lease_until_ms,
+            last_error_code, created_at_ms, updated_at_ms)
+         VALUES (?, ?, ?, ?, 'maintenance', NULL, NULL, NULL, NULL, ?, ?, ?, ?,
+                 'pending', 1, ?, 0, NULL, NULL, NULL, ?, ?)`,
+        [
+          jobId,
+          candidate.session.id,
+          candidate.session.tenantId,
+          candidate.session.userId,
+          options.actorKeyId,
+          candidate.deletedAtMs,
+          candidate.lastSeq,
+          candidate.candidateSha256,
+          options.nowMs,
+          options.nowMs,
+          options.nowMs,
+        ],
+      );
+      const [createdRows] = await conn.query<Row[]>(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+           FROM legacy_tombstone_compensation_jobs WHERE job_id=?`,
+        [jobId],
+      );
+      if (!createdRows[0]) throw new Error("legacy tombstone maintenance job was not created");
+      const record = rowToLegacyTombstoneCompensationJob(createdRows[0]);
+      await conn.commit();
+      return record;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private async terminallyIsolateLegacyTombstoneCandidate(
+    conn: PoolConnection,
+    row: Row,
+    options: ScheduleLegacyTombstoneCandidatesOptions,
+    reasonCode: Exclude<LegacyTombstoneTerminalReasonCode, "unsafe_job_envelope">,
+  ): Promise<void> {
+    const sessionId = String(row.session_id);
+    const jobId = legacyTombstoneJobIdForRawSession(sessionId);
+    const deletedAtRaw = String(row.deleted_at_ms);
+    const lastSeqRaw = String(row.last_seq);
+    const candidateEvidence = legacyTombstoneSha256("legacy-tombstone-unsafe-candidate-v1", [
+      sessionId,
+      String(row.tenant_id),
+      String(row.user_id),
+      deletedAtRaw,
+      lastSeqRaw,
+      reasonCode,
+    ]);
+    const [existingJobs] = await conn.query<Row[]>(
+      `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+         FROM legacy_tombstone_compensation_jobs
+        WHERE session_id=? OR job_id=? FOR UPDATE`,
+      [sessionId, jobId],
+    );
+    if (existingJobs.length > 1) throw new LegacyTombstoneJobConflictError();
+    const incidentJobId = existingJobs[0] ? String(existingJobs[0].job_id) : jobId;
+    const incidentEvidence = legacyTombstoneSha256("legacy-tombstone-candidate-incident-v1", [
+      incidentJobId,
+      sessionId,
+      candidateEvidence,
+      reasonCode,
+      options.nowMs,
+    ]);
+    if (existingJobs.length === 0) {
+      await conn.query(
+        `INSERT INTO legacy_tombstone_compensation_jobs
+         (job_id, session_id, tenant_id, user_id, source_kind, source_request_id,
+          source_subject_generation, source_claim_attempt, source_claim_token_sha256,
+          maintenance_actor_key_id, source_deleted_at_ms, source_last_seq, candidate_sha256,
+          status, control_generation, available_at_ms, attempts, claim_token, lease_until_ms,
+          last_error_code, created_at_ms, updated_at_ms, terminal_at_ms, terminal_reason_code,
+          terminal_evidence_sha256)
+       VALUES (?, ?, ?, ?, 'maintenance', NULL, NULL, NULL, NULL, ?, ?, ?, ?,
+                 'terminal_incident', 1, NULL, 0, NULL, NULL, NULL, ?, ?, ?, ?, ?)`,
+        [
+          jobId,
+          sessionId,
+          String(row.tenant_id),
+          String(row.user_id),
+          options.actorKeyId,
+          row.deleted_at_ms,
+          row.last_seq,
+          candidateEvidence,
+          options.nowMs,
+          options.nowMs,
+          options.nowMs,
+          reasonCode,
+          incidentEvidence,
+        ],
+      );
+    }
+    const resultRows = await this.readLegacyTombstoneResultRows(conn, incidentJobId, "FOR SHARE");
+    if (resultRows.length > 0) return;
+    await conn.query(
+      `INSERT INTO legacy_tombstone_compensation_events
+         (job_id, session_id, control_generation, event_type, reason_code, actor_key_id,
+          claim_attempt, source_deleted_at_ms, target_deletion_generation, terminal_event_seq,
+          before_sha256, after_sha256, emitted_at_ms)
+       VALUES (?, ?, 1, 'legacy_tombstone/terminal_incident', ?, ?, NULL, ?, NULL, NULL, ?, ?, ?)`,
+      [
+        incidentJobId,
+        sessionId,
+        reasonCode,
+        options.actorKeyId,
+        row.deleted_at_ms,
+        candidateEvidence,
+        incidentEvidence,
+        options.nowMs,
+      ],
+    );
+  }
+
+  async getLegacyTombstoneCompensationJob(
+    tenantId: string,
+    userId: string,
+    jobId: string,
+  ): Promise<LegacyTombstoneCompensationJobRecord | null> {
+    return await this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+           FROM legacy_tombstone_compensation_jobs
+          WHERE tenant_id=? AND user_id=? AND job_id=?`,
+        [tenantId, userId, jobId],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      const resultRows = await this.readLegacyTombstoneResultRows(conn, String(row.job_id));
+      try {
+        const job = rowToLegacyTombstoneCompensationJob(row);
+        return this.resolveLegacyTombstoneJobResult(row, job, resultRows);
+      } catch {
+        return this.projectUnsafeLegacyTombstoneJob(row, resultRows);
+      }
+    });
+  }
+
+  async listLegacyTombstoneCompensationAudits(
+    jobId: string,
+  ): Promise<LegacyTombstoneCompensationAudit[]> {
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT ${LEGACY_TOMBSTONE_EVENT_COLUMNS}
+         FROM legacy_tombstone_compensation_events
+        WHERE job_id=? ORDER BY result_event_id`,
+      [jobId],
+    );
+    return rows.map(rowToLegacyTombstoneAudit);
+  }
+
+  async claimLegacyTombstoneCompensations(
+    options: ClaimLegacyTombstoneCompensationsOptions,
+  ): Promise<LegacyTombstoneCompensationClaim[]> {
+    const stagedOptions = structuredClone(options);
+    const leaseUntilMs = validateClaimLegacyTombstoneCompensationsOptions(stagedOptions);
+    if (!(await this.getLegacyTombstoneCutover())) {
+      throw new LegacyTombstoneCutoverRequiredError();
+    }
+    const [candidateRows] = await this.pool.query<Row[]>(
+      `SELECT j.job_id
+         FROM legacy_tombstone_compensation_jobs j
+        WHERE NOT EXISTS (
+                SELECT 1 FROM legacy_tombstone_compensation_events e WHERE e.job_id=j.job_id
+              )
+          AND (
+            (j.status='pending' AND j.available_at_ms IS NOT NULL
+              AND j.available_at_ms<=?
+              AND (j.claim_token IS NULL OR (j.lease_until_ms IS NOT NULL AND j.lease_until_ms<=?)))
+            OR j.status<>'pending'
+            OR j.available_at_ms IS NULL
+            OR j.available_at_ms < 0
+            OR j.available_at_ms > 9007199254740991
+            OR (j.claim_token IS NULL AND j.lease_until_ms IS NOT NULL)
+            OR (j.claim_token IS NOT NULL AND j.lease_until_ms IS NULL)
+            OR j.lease_until_ms < 0
+            OR j.lease_until_ms > 9007199254740991
+          )
+        ORDER BY j.job_id LIMIT 100`,
+      [stagedOptions.nowMs, stagedOptions.nowMs],
+    );
+    const claims: LegacyTombstoneCompensationClaim[] = [];
+    for (const candidate of candidateRows) {
+      if (claims.length >= stagedOptions.limit) break;
+      const result = await this.claimLegacyTombstoneCandidate(
+        String(candidate.job_id),
+        stagedOptions,
+        leaseUntilMs,
+      );
+      if (result) claims.push(result);
+    }
+    return claims;
+  }
+
+  private async claimLegacyTombstoneCandidate(
+    jobId: string,
+    options: ClaimLegacyTombstoneCompensationsOptions,
+    leaseUntilMs: number,
+  ): Promise<LegacyTombstoneCompensationClaim | null> {
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.requireActiveLegacyTombstoneCutover(conn);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+           FROM legacy_tombstone_compensation_jobs WHERE job_id=? FOR UPDATE`,
+        [jobId],
+      );
+      const row = rows[0];
+      if (!row) {
+        await conn.commit();
+        return null;
+      }
+      const resultEvents = await this.readLegacyTombstoneResultRows(conn, jobId, "FOR SHARE");
+      if (resultEvents.length > 0) {
+        await conn.commit();
+        return null;
+      }
+      let record: LegacyTombstoneCompensationJobRecord;
+      try {
+        record = rowToLegacyTombstoneCompensationJob(row);
+      } catch {
+        await this.terminallyIsolateUnsafeLegacyTombstoneJob(conn, row, options.nowMs);
+        await conn.commit();
+        return null;
+      }
+      if (record.status !== "pending") {
+        await this.appendLegacyTombstoneMissingResultIncident(conn, row, record, options.nowMs);
+        await conn.commit();
+        return null;
+      }
+      if (
+        record.availableAtMs === undefined
+        || record.availableAtMs > options.nowMs
+        || (
+          record.claimToken !== undefined
+          && (record.leaseUntilMs === undefined || record.leaseUntilMs > options.nowMs)
+        )
+      ) {
+        await conn.commit();
+        return null;
+      }
+      const nextAttempts = record.attempts + 1;
+      if (!Number.isSafeInteger(nextAttempts) || nextAttempts <= 0) {
+        await this.terminallyIsolateUnsafeLegacyTombstoneJob(conn, row, options.nowMs);
+        await conn.commit();
+        return null;
+      }
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE legacy_tombstone_compensation_jobs
+            SET attempts=?, claim_token=?, lease_until_ms=?, last_error_code=NULL,
+                updated_at_ms=GREATEST(updated_at_ms, ?)
+          WHERE job_id=? AND status='pending'`,
+        [nextAttempts, options.claimToken, leaseUntilMs, options.nowMs, jobId],
+      );
+      if (updated.affectedRows !== 1) throw new Error("legacy tombstone claim changed while locked");
+      const [claimedRows] = await conn.query<Row[]>(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+           FROM legacy_tombstone_compensation_jobs WHERE job_id=?`,
+        [jobId],
+      );
+      if (!claimedRows[0]) throw new Error("legacy tombstone claim disappeared");
+      const claim = legacyTombstoneCompensationClaimFromRecord(
+        rowToLegacyTombstoneCompensationJob(claimedRows[0]),
+      );
+      await conn.commit();
+      return claim;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private async terminallyIsolateUnsafeLegacyTombstoneJob(
+    conn: PoolConnection,
+    row: Row,
+    emittedAtMs: number,
+  ): Promise<void> {
+    const envelope = rowToLegacyTombstoneUnsafeEnvelope(row);
+    const evidence = legacyTombstoneUnsafeJobEnvelopeEvidenceSha256(envelope);
+    // Do not normalize corrupt identity/generation/time fields. The append-only event revokes this
+    // locator from future claims while preserving the exact raw envelope under a one-way digest.
+    await conn.query(
+      `INSERT INTO legacy_tombstone_compensation_events
+         (job_id, session_id, control_generation, event_type, reason_code, actor_key_id,
+          claim_attempt, source_deleted_at_ms, target_deletion_generation, terminal_event_seq,
+          before_sha256, after_sha256, emitted_at_ms)
+       VALUES (?, ?, 1, 'legacy_tombstone/terminal_incident', 'unsafe_job_envelope', NULL,
+               NULL, ?, NULL, NULL, ?, ?, ?)`,
+      [
+        envelope.locatorJobId,
+        envelope.sessionId,
+        row.source_deleted_at_ms,
+        evidence,
+        evidence,
+        emittedAtMs,
+      ],
+    );
+  }
+
+  async renewLegacyTombstoneCompensation(
+    authorization: LegacyTombstoneCompensationAuthorization,
+    options: RenewLegacyTombstoneCompensationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedOptions = structuredClone(options);
+    validateLegacyTombstoneCompensationAuthorization(stagedAuthorization);
+    const leaseUntilMs = validateRenewLegacyTombstoneCompensationOptions(stagedOptions);
+    const [updated] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE legacy_tombstone_compensation_jobs j
+          SET lease_until_ms=GREATEST(lease_until_ms, ?),
+              updated_at_ms=GREATEST(updated_at_ms, ?)
+        WHERE j.job_id=? AND j.tenant_id=? AND j.user_id=? AND j.session_id=?
+          AND j.control_generation=1 AND j.status='pending'
+          AND j.claim_token=? AND j.attempts=? AND j.lease_until_ms>?
+          AND NOT EXISTS (
+            SELECT 1 FROM legacy_tombstone_compensation_events e WHERE e.job_id=j.job_id
+          )`,
+      [
+        leaseUntilMs,
+        stagedOptions.nowMs,
+        stagedAuthorization.jobId,
+        stagedAuthorization.tenantId,
+        stagedAuthorization.userId,
+        stagedAuthorization.sessionId,
+        stagedAuthorization.claimToken,
+        stagedAuthorization.claimAttempt,
+        stagedOptions.nowMs,
+      ],
+    );
+    return updated.affectedRows === 1;
+  }
+
+  async retryLegacyTombstoneCompensation(
+    authorization: LegacyTombstoneCompensationAuthorization,
+    options: RetryLegacyTombstoneCompensationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedOptions = structuredClone(options);
+    validateLegacyTombstoneCompensationAuthorization(stagedAuthorization);
+    validateRetryLegacyTombstoneCompensationOptions(stagedOptions);
+    const [updated] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE legacy_tombstone_compensation_jobs j
+          SET available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+              last_error_code=?, updated_at_ms=GREATEST(updated_at_ms, ?)
+        WHERE j.job_id=? AND j.tenant_id=? AND j.user_id=? AND j.session_id=?
+          AND j.control_generation=1 AND j.status='pending'
+          AND j.claim_token=? AND j.attempts=? AND j.lease_until_ms>?
+          AND ?>=j.created_at_ms
+          AND NOT EXISTS (
+            SELECT 1 FROM legacy_tombstone_compensation_events e WHERE e.job_id=j.job_id
+          )`,
+      [
+        stagedOptions.availableAtMs,
+        stagedOptions.errorCode,
+        stagedOptions.failedAtMs,
+        stagedAuthorization.jobId,
+        stagedAuthorization.tenantId,
+        stagedAuthorization.userId,
+        stagedAuthorization.sessionId,
+        stagedAuthorization.claimToken,
+        stagedAuthorization.claimAttempt,
+        stagedOptions.failedAtMs,
+        stagedOptions.availableAtMs,
+      ],
+    );
+    return updated.affectedRows === 1;
+  }
+
+  private async writeLegacyTombstoneTerminalIncident(
+    conn: PoolConnection,
+    jobRow: Row,
+    job: LegacyTombstoneCompensationJobRecord,
+    authorization: LegacyTombstoneCompensationAuthorization,
+    atMs: number,
+    reasonCode: Exclude<LegacyTombstoneTerminalReasonCode, "unsafe_job_envelope">,
+  ): Promise<LegacyTombstoneCompensationResult> {
+    const existingResults = await this.readLegacyTombstoneResultRows(conn, job.jobId, "FOR SHARE");
+    if (existingResults.length > 0) {
+      const projection = this.projectLegacyTombstoneProofConflict(
+        jobRow,
+        job,
+        existingResults,
+      );
+      return {
+        outcome: "terminal_incident",
+        jobId: projection.jobId,
+        reasonCode: "proof_conflict",
+        evidenceSha256: projection.terminalEvidenceSha256!,
+      };
+    }
+    const emittedAtMs = Math.max(job.updatedAtMs, atMs);
+    const evidence = legacyTombstoneTerminalIncidentEvidenceSha256({
+      jobId: job.jobId,
+      sessionId: job.sessionId,
+      cutoverGeneration: 1,
+      legacyDeletedAtMs: job.legacyDeletedAtMs,
+      claimAttempt: authorization.claimAttempt,
+      reasonCode,
+    });
+    const [inserted] = await conn.query<mysql.ResultSetHeader>(
+      `INSERT INTO legacy_tombstone_compensation_events
+         (job_id, session_id, control_generation, event_type, reason_code, actor_key_id,
+          claim_attempt, source_deleted_at_ms, target_deletion_generation, terminal_event_seq,
+          before_sha256, after_sha256, emitted_at_ms)
+       VALUES (?, ?, 1, 'legacy_tombstone/terminal_incident', ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+      [
+        job.jobId,
+        job.sessionId,
+        reasonCode,
+        job.sourceKind === "maintenance" ? job.maintenanceActorKeyId : null,
+        authorization.claimAttempt,
+        job.legacyDeletedAtMs,
+        String(jobRow.candidate_sha256),
+        evidence,
+        emittedAtMs,
+      ],
+    );
+    const [updated] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE legacy_tombstone_compensation_jobs
+          SET status='terminal_incident', available_at_ms=NULL, claim_token=NULL,
+              lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?, terminal_at_ms=?,
+              terminal_reason_code=?, terminal_evidence_sha256=?
+        WHERE job_id=? AND tenant_id=? AND user_id=? AND session_id=?
+          AND control_generation=1 AND status='pending' AND claim_token=? AND attempts=?`,
+      [
+        emittedAtMs,
+        emittedAtMs,
+        reasonCode,
+        evidence,
+        job.jobId,
+        job.tenantId,
+        job.userId,
+        job.sessionId,
+        authorization.claimToken,
+        authorization.claimAttempt,
+      ],
+    );
+    if (updated.affectedRows !== 1) {
+      throw new Error("legacy tombstone job changed while recording terminal incident");
+    }
+    const audit: LegacyTombstoneCompensationAudit = {
+      auditId: Number(inserted.insertId),
+      jobId: job.jobId,
+      type: "legacy_tombstone/terminal_incident",
+      reasonCode,
+      evidenceSha256: evidence,
+      emittedAtMs,
+    };
+    validateLegacyTombstoneCompensationAudit(audit);
+    return { outcome: "terminal_incident", jobId: job.jobId, reasonCode, evidenceSha256: evidence };
+  }
+
+  private async assertCompletedLegacyTombstoneCompensation(
+    conn: PoolConnection,
+    job: Extract<LegacyTombstoneCompensationJobRecord, { status: "completed" }> | LegacyTombstoneCompensationJobRecord,
+    jobRow: Row,
+    sessionRow: Row,
+  ): Promise<LegacyTombstoneCompensationResult> {
+    if (
+      job.status !== "completed"
+      || job.completedEventSeq === undefined
+      || job.completedClaimAttempt === undefined
+      || job.completedAtMs === undefined
+    ) throw new LegacyTombstoneIntegrityFault("proof_conflict");
+    const sourceLastSeq = Number(jobRow.source_last_seq);
+    if (
+      sessionRow.session_id !== job.sessionId
+      || sessionRow.tenant_id !== job.tenantId
+      || sessionRow.user_id !== job.userId
+      || Number(sessionRow.deleted_at_ms) !== job.legacyDeletedAtMs
+      || Number(sessionRow.deletion_generation) !== 1
+      || Number(sessionRow.last_seq) !== job.completedEventSeq
+      || !Number.isSafeInteger(sourceLastSeq)
+      || sourceLastSeq < 0
+      || sourceLastSeq >= job.completedEventSeq
+      || String(jobRow.candidate_sha256) !== legacyTombstoneCandidateSha256({
+        sessionId: job.sessionId,
+        tenantId: job.tenantId,
+        userId: job.userId,
+        deletedAtMs: job.legacyDeletedAtMs,
+        lastSeq: sourceLastSeq,
+      })
+    ) throw new LegacyTombstoneIntegrityFault("proof_conflict");
+    await this.assertExistingErasureSessionTombstone(
+      conn,
+      job.sessionId,
+      job.userId,
+      sessionRow.deleted_at_ms,
+      sessionRow.purge_after_ms,
+      sessionRow.last_seq,
+      sessionRow.deletion_generation,
+    );
+    const [auditRows] = await conn.query<Row[]>(
+      `SELECT result_event_id, job_id, session_id, control_generation, event_type, reason_code,
+              actor_key_id, claim_attempt, source_deleted_at_ms, target_deletion_generation,
+              terminal_event_seq, before_sha256, after_sha256, emitted_at_ms
+         FROM legacy_tombstone_compensation_events WHERE job_id=? FOR SHARE`,
+      [job.jobId],
+    );
+    const auditRow = auditRows[0];
+    if (auditRows.length !== 1 || !auditRow) {
+      throw new LegacyTombstoneIntegrityFault("proof_conflict");
+    }
+    if (!this.legacyTombstoneResultMatchesJob(jobRow, job, auditRows)) {
+      throw new LegacyTombstoneIntegrityFault("proof_conflict");
+    }
+    const audit = rowToLegacyTombstoneAudit(auditRow);
+    const expectedEvidence = legacyTombstoneSuccessEvidenceSha256({
+      jobId: job.jobId,
+      tenantId: job.tenantId,
+      userId: job.userId,
+      sessionId: job.sessionId,
+      cutoverGeneration: 1,
+      legacyDeletedAtMs: job.legacyDeletedAtMs,
+      deletionGeneration: 1,
+      eventSeq: job.completedEventSeq,
+      claimAttempt: job.completedClaimAttempt,
+      emittedAtMs: job.completedAtMs,
+    });
+    if (
+      audit.type !== "legacy_tombstone/compensated"
+      || audit.sessionId !== job.sessionId
+      || audit.eventSeq !== job.completedEventSeq
+      || audit.claimAttempt !== job.completedClaimAttempt
+      || audit.emittedAtMs !== job.completedAtMs
+      || audit.evidenceSha256 !== expectedEvidence
+    ) throw new LegacyTombstoneIntegrityFault("proof_conflict");
+    return {
+      outcome: "already_compensated",
+      sessionId: job.sessionId,
+      deletionGeneration: 1,
+      eventSeq: job.completedEventSeq,
+    };
+  }
+
+  private async assertLegacyTombstoneChildrenResolved(
+    conn: PoolConnection,
+    job: LegacyTombstoneCompensationJobRecord,
+  ): Promise<void> {
+    let ancestorRows: Row[];
+    try {
+      [ancestorRows] = await conn.query<Row[]>(
+        `WITH RECURSIVE ancestors (session_id, parent_session_id, tenant_id, user_id) AS (
+           SELECT session_id, parent_session_id, tenant_id, user_id
+             FROM sessions WHERE session_id=?
+           UNION DISTINCT
+           SELECT p.session_id, p.parent_session_id, p.tenant_id, p.user_id
+             FROM sessions p JOIN ancestors a ON p.session_id=a.parent_session_id
+         )
+         SELECT session_id, parent_session_id, tenant_id, user_id FROM ancestors`,
+        [job.sessionId],
+      );
+    } catch (error) {
+      if ((error as { code?: unknown }).code === "ER_CTE_MAX_RECURSION_DEPTH") {
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      throw error;
+    }
+    const ancestors = new Map(ancestorRows.map((row) => [String(row.session_id), row]));
+    let ancestor = ancestors.get(job.sessionId);
+    const visited = new Set<string>();
+    while (ancestor) {
+      const ancestorId = String(ancestor.session_id);
+      if (
+        visited.has(ancestorId)
+        || !isCanonicalId("sess", ancestorId)
+        || ancestor.tenant_id !== job.tenantId
+        || ancestor.user_id !== job.userId
+      ) throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      visited.add(ancestorId);
+      if (ancestor.parent_session_id == null) break;
+      const parentId = String(ancestor.parent_session_id);
+      if (!isCanonicalId("sess", parentId)) {
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      ancestor = ancestors.get(parentId);
+      if (!ancestor) throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+    }
+    if (!ancestor) throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+
+    const [children] = await conn.query<Row[]>(
+      "SELECT * FROM sessions WHERE parent_session_id=? ORDER BY session_id FOR SHARE",
+      [job.sessionId],
+    );
+    for (const child of children) {
+      const childSessionId = String(child.session_id);
+      if (
+        !isCanonicalId("sess", childSessionId)
+        || child.tenant_id !== job.tenantId
+        || child.user_id !== job.userId
+      ) throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      const generation = Number(child.deletion_generation);
+      if (child.deleted_at_ms == null) {
+        // A live child is not a compensation candidate, so the global legacy sweep can never make
+        // this dependency progress. Retrying the parent would be an infinite loop.
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      if (generation === 0) {
+        await this.assertLegacyTombstoneGenerationZeroChildPending(conn, job, child);
+      }
+      if (!Number.isSafeInteger(generation) || generation < 1) {
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      try {
+        await this.assertExistingErasureSessionTombstone(
+          conn,
+          childSessionId,
+          job.userId,
+          child.deleted_at_ms,
+          child.purge_after_ms,
+          child.last_seq,
+          child.deletion_generation,
+        );
+      } catch (error) {
+        if ((error as { code?: unknown })?.code) throw error;
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+    }
+  }
+
+  private async assertLegacyTombstoneGenerationZeroChildPending(
+    conn: PoolConnection,
+    parentJob: LegacyTombstoneCompensationJobRecord,
+    childRow: Row,
+  ): Promise<never> {
+    const childSessionId = String(childRow.session_id);
+    const expectedJobId = legacyTombstoneCompensationJobIdForSession(childSessionId);
+    // Include the deterministic job locator as well as the session locator. A corrupt cross-owner
+    // or hash-collision row must be surfaced as an invalid dependency, not hidden as "not scheduled".
+    const [jobRows] = await conn.query<Row[]>(
+      `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+         FROM legacy_tombstone_compensation_jobs
+        WHERE session_id=? OR job_id=? ORDER BY job_id FOR SHARE`,
+      [childSessionId, expectedJobId],
+    );
+    if (jobRows.length > 1) {
+      throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+    }
+
+    const relatedJobIds = new Set<string>([expectedJobId]);
+    if (jobRows[0]) relatedJobIds.add(String(jobRows[0].job_id));
+    const resultJobIds = [...relatedJobIds];
+    const [resultRows] = await conn.query<Row[]>(
+      `SELECT ${LEGACY_TOMBSTONE_EVENT_COLUMNS}
+         FROM legacy_tombstone_compensation_events
+        WHERE session_id=? OR job_id IN (${resultJobIds.map(() => "?").join(",")})
+        ORDER BY result_event_id FOR SHARE`,
+      [childSessionId, ...resultJobIds],
+    );
+
+    if (jobRows.length === 0) {
+      if (resultRows.length > 0) {
+        throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+      }
+      throw new LegacyTombstoneChildPendingError(parentJob.sessionId);
+    }
+    // A generation-zero child cannot have any durable result. A result means the child is terminal,
+    // proof-conflicted, unsafe, or claims completion while its session marker still contradicts it.
+    if (resultRows.length > 0) {
+      throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+    }
+
+    try {
+      const candidate = this.legacyTombstoneCandidate(childRow);
+      const childJob = rowToLegacyTombstoneCompensationJob(jobRows[0]!);
+      if (
+        childJob.jobId !== expectedJobId
+        || childJob.sessionId !== childSessionId
+        || childJob.tenantId !== parentJob.tenantId
+        || childJob.userId !== parentJob.userId
+        || childJob.status !== "pending"
+        || candidate.session.parentSessionId !== parentJob.sessionId
+      ) throw new LegacyTombstoneJobConflictError();
+      this.assertLegacyTombstoneJobCandidate(jobRows[0]!, candidate);
+    } catch {
+      throw new LegacyTombstoneIntegrityFault("child_dependency_invalid");
+    }
+    throw new LegacyTombstoneChildPendingError(parentJob.sessionId);
+  }
+
+  private async validateLegacyTombstoneEventLog(
+    conn: PoolConnection,
+    job: LegacyTombstoneCompensationJobRecord,
+    lastSeq: number,
+  ): Promise<void> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT session_id, seq, user_id, type, body, emitted_at_ms
+         FROM events WHERE session_id=? ORDER BY seq FOR SHARE`,
+      [job.sessionId],
+    );
+    if (rows.length !== lastSeq) {
+      throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+    }
+    for (const [index, row] of rows.entries()) {
+      let event: PersistedEvent;
+      try {
+        event = EventSchema.parse(parse<unknown>(row.body)) as PersistedEvent;
+      } catch {
+        throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+      }
+      if (
+        row.session_id !== job.sessionId
+        || row.user_id !== job.userId
+        || Number(row.seq) !== index + 1
+        || event.sessionId !== job.sessionId
+        || event.seq !== index + 1
+        || event.type !== row.type
+        || event.emittedAtMs !== Number(row.emitted_at_ms)
+        || event.emittedAtMs > job.legacyDeletedAtMs
+        || event.type === "session/deleted"
+      ) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+    }
+  }
+
+  async completeLegacyTombstoneCompensation(
+    authorization: LegacyTombstoneCompensationAuthorization,
+    options: CompleteLegacyTombstoneCompensationOptions,
+  ): Promise<LegacyTombstoneCompensationResult | null> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedOptions = structuredClone(options);
+    validateLegacyTombstoneCompensationAuthorization(stagedAuthorization);
+    validateCompleteLegacyTombstoneCompensationOptions(stagedOptions);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.requireActiveLegacyTombstoneCutover(conn);
+      const [sessionRows] = await conn.query<Row[]>(
+        `SELECT s.* FROM sessions s FORCE INDEX (idx_sessions_tenant_user)
+          WHERE tenant_id=? AND user_id=? AND session_id=? FOR UPDATE`,
+        [stagedAuthorization.tenantId, stagedAuthorization.userId, stagedAuthorization.sessionId],
+      );
+      const [jobRows] = await conn.query<Row[]>(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS}
+           FROM legacy_tombstone_compensation_jobs FORCE INDEX (idx_legacy_tombstone_compensation_jobs_owner)
+          WHERE tenant_id=? AND user_id=? AND session_id=? AND job_id=? FOR UPDATE`,
+        [
+          stagedAuthorization.tenantId,
+          stagedAuthorization.userId,
+          stagedAuthorization.sessionId,
+          stagedAuthorization.jobId,
+        ],
+      );
+      if (!jobRows[0]) {
+        await conn.commit();
+        return null;
+      }
+      const jobRow = jobRows[0];
+      const storedJob = rowToLegacyTombstoneCompensationJob(jobRow);
+      const resultRows = await this.readLegacyTombstoneResultRows(
+        conn,
+        storedJob.jobId,
+        "FOR SHARE",
+      );
+      const job = this.resolveLegacyTombstoneJobResult(jobRow, storedJob, resultRows);
+      if (job !== storedJob) {
+        await conn.commit();
+        return null;
+      }
+      if (job.status === "completed") {
+        if (
+          job.completedClaimAttempt !== stagedAuthorization.claimAttempt
+          || job.completedClaimTokenSha256
+            !== legacyTombstoneClaimTokenSha256(stagedAuthorization.claimToken)
+          || !sessionRows[0]
+        ) {
+          await conn.commit();
+          return null;
+        }
+        const result = await this.assertCompletedLegacyTombstoneCompensation(
+          conn,
+          job,
+          jobRow,
+          sessionRows[0],
+        );
+        await conn.commit();
+        return result;
+      }
+      if (job.status === "terminal_incident") {
+        await conn.commit();
+        return null;
+      }
+      if (!legacyTombstoneCompensationAuthorizationMatches(
+        job,
+        stagedAuthorization,
+        stagedOptions.completedAtMs,
+      )) {
+        await conn.commit();
+        return null;
+      }
+
+      await conn.query("SAVEPOINT legacy_tombstone_completion");
+      try {
+        const sessionRow = sessionRows[0];
+        if (!sessionRow) throw new LegacyTombstoneIntegrityFault("owner_binding_invalid");
+        const candidate = this.legacyTombstoneCandidate(sessionRow);
+        try {
+          this.assertLegacyTombstoneJobCandidate(jobRow, candidate);
+        } catch (error) {
+          if (error instanceof LegacyTombstoneJobConflictError) {
+            throw new LegacyTombstoneIntegrityFault("proof_conflict");
+          }
+          throw error;
+        }
+        await this.assertLegacyTombstoneChildrenResolved(conn, job);
+        await this.validateLegacyTombstoneEventLog(conn, job, candidate.lastSeq);
+        const [conflicts] = await conn.query<Row[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM lifecycle_outbox
+               WHERE aggregate_id=? AND generation=1) AS outbox_count,
+             (SELECT COUNT(*) FROM usage_reconciliations
+               WHERE session_id=? AND deletion_generation=1) AS reconciliation_count,
+             (SELECT COUNT(*) FROM legacy_tombstone_compensation_events
+               WHERE job_id=?) AS audit_count`,
+          [job.sessionId, job.sessionId, job.jobId],
+        );
+        if (
+          Number(conflicts[0]?.outbox_count) !== 0
+          || Number(conflicts[0]?.reconciliation_count) !== 0
+          || Number(conflicts[0]?.audit_count) !== 0
+        ) throw new LegacyTombstoneIntegrityFault("proof_conflict");
+
+        let status: Session["status"];
+        try {
+          status = SessionStatusSchema.parse(parse<unknown>(sessionRow.status));
+        } catch {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+        const [turnRows] = await conn.query<Row[]>(
+          `SELECT turn_id, session_id, user_id, status, body
+             FROM turns WHERE session_id=? AND status='inProgress' ORDER BY turn_id FOR UPDATE`,
+          [job.sessionId],
+        );
+        if (
+          (status.type === "active" && (
+            turnRows.length !== 1 || turnRows[0]?.turn_id !== status.turnId
+          ))
+          || (status.type !== "active" && turnRows.length !== 0)
+        ) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+
+        let activeTurn: Turn | undefined;
+        if (status.type === "active") {
+          try {
+            activeTurn = TurnSchema.parse(parse<unknown>(turnRows[0]!.body));
+          } catch {
+            throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+          }
+          if (
+            activeTurn.id !== status.turnId
+            || activeTurn.sessionId !== job.sessionId
+            || turnRows[0]!.session_id !== job.sessionId
+            || turnRows[0]!.user_id !== job.userId
+            || activeTurn.status !== "inProgress"
+            || activeTurn.startedAtMs > candidate.deletedAtMs
+          ) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+
+        let resolution: Awaited<ReturnType<MysqlSessionStore["lockErasureResolution"]>>;
+        try {
+          resolution = await this.lockErasureResolution(
+            conn,
+            job.sessionId,
+            job.userId,
+            candidate.deletedAtMs,
+          );
+        } catch (error) {
+          if ((error as { code?: unknown })?.code) throw error;
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+        if (resolution.approvals.some((approval) => approval.createdAtMs > candidate.deletedAtMs)) {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+
+        const eventInputs: EventInput[] = [];
+        for (const approval of resolution.approvals) {
+          eventInputs.push({
+            type: "approval/resolved",
+            sessionId: job.sessionId,
+            emittedAtMs: candidate.deletedAtMs,
+            approval,
+          });
+          const item = resolution.items.find((value) => (
+            value.type === "approvalRequest" && value.approvalId === approval.id
+          ));
+          if (!item) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+          eventInputs.push({
+            type: "item/completed",
+            sessionId: job.sessionId,
+            emittedAtMs: candidate.deletedAtMs,
+            item,
+          });
+        }
+
+        const terminalEventSeq = candidate.lastSeq
+          + eventInputs.length
+          + (activeTurn ? 3 : 1);
+        if (
+          !Number.isSafeInteger(terminalEventSeq)
+          || terminalEventSeq <= candidate.lastSeq
+        ) throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+
+        let terminalTurn: Turn | undefined;
+        if (activeTurn) {
+          try {
+            terminalTurn = TurnSchema.parse({
+              ...activeTurn,
+              status: "interrupted",
+              stopReason: "interrupted",
+              completedAtMs: candidate.deletedAtMs,
+              error: {
+                code: "legacy_tombstone_compensation",
+                message: "turn interrupted during legacy tombstone compensation",
+              },
+              seqEnd: terminalEventSeq - 1,
+            });
+          } catch {
+            throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+          }
+          eventInputs.push({
+            type: "turn/completed",
+            sessionId: job.sessionId,
+            emittedAtMs: candidate.deletedAtMs,
+            turn: terminalTurn,
+            stopReason: "interrupted",
+          });
+          eventInputs.push({
+            type: "session/status/changed",
+            sessionId: job.sessionId,
+            emittedAtMs: candidate.deletedAtMs,
+            status: { type: "idle" },
+          });
+        }
+        eventInputs.push({
+          type: "session/deleted",
+          sessionId: job.sessionId,
+          emittedAtMs: candidate.deletedAtMs,
+          deletionGeneration: 1,
+        });
+        let seq = candidate.lastSeq;
+        let events: PersistedEvent[];
+        try {
+          events = eventInputs.map((event) => (
+            EventSchema.parse({ ...event, seq: ++seq }) as PersistedEvent
+          ));
+        } catch {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+        const terminal = events.at(-1);
+        if (terminal?.type !== "session/deleted" || terminal.seq !== terminalEventSeq) {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+        const completedAtMs = Math.max(job.updatedAtMs, stagedOptions.completedAtMs);
+        let stagedSession: Session;
+        try {
+          stagedSession = SessionSchema.parse({
+            ...candidate.session,
+            ...(activeTurn ? { status: { type: "idle" as const } } : {}),
+            lastSeq: terminal.seq,
+            updatedAtMs: Math.max(candidate.session.updatedAtMs, completedAtMs),
+            autoApprovedTools: [],
+          });
+        } catch {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+        const successEvidence = legacyTombstoneSuccessEvidenceSha256({
+          jobId: job.jobId,
+          tenantId: job.tenantId,
+          userId: job.userId,
+          sessionId: job.sessionId,
+          cutoverGeneration: 1,
+          legacyDeletedAtMs: job.legacyDeletedAtMs,
+          deletionGeneration: 1,
+          eventSeq: terminal.seq,
+          claimAttempt: stagedAuthorization.claimAttempt,
+          emittedAtMs: completedAtMs,
+        });
+        let serializedEvents: string[];
+        let serializedItems: string[];
+        let serializedApprovals: string[];
+        let serializedTurn: string | undefined;
+        let tombstonedPayload: string;
+        let purgePayload: string;
+        try {
+          serializedEvents = events.map((event) => json(event));
+          serializedItems = resolution.items.map((item) => json(item));
+          serializedApprovals = resolution.approvals.map((approval) => json(approval));
+          serializedTurn = terminalTurn ? json(terminalTurn) : undefined;
+          tombstonedPayload = json({
+            sessionId: job.sessionId,
+            deletionGeneration: 1,
+            eventSeq: terminal.seq,
+          });
+          purgePayload = json({ sessionId: job.sessionId, deletionGeneration: 1 });
+        } catch {
+          throw new LegacyTombstoneIntegrityFault("session_integrity_conflict");
+        }
+
+        for (const [index, item] of resolution.items.entries()) {
+          const [updated] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE items SET status='declined', body=?, completed_at_ms=?
+              WHERE item_id=? AND session_id=? AND user_id=?
+                AND type='approvalRequest' AND status='inProgress'`,
+            [serializedItems[index], candidate.deletedAtMs, item.id, job.sessionId, job.userId],
+          );
+          if (updated.affectedRows !== 1) throw new Error("legacy approval item changed while locked");
+        }
+        for (const [index, approval] of resolution.approvals.entries()) {
+          const [updated] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE approvals SET status='expired', body=?
+              WHERE approval_id=? AND session_id=? AND user_id=? AND status='pending'`,
+            [serializedApprovals[index], approval.id, job.sessionId, job.userId],
+          );
+          if (updated.affectedRows !== 1) throw new Error("legacy approval changed while locked");
+        }
+        if (terminalTurn) {
+          const [updated] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE turns SET status='interrupted', stop_reason='interrupted', seq_end=?,
+                    body=?, completed_at_ms=?
+              WHERE turn_id=? AND session_id=? AND user_id=? AND status='inProgress'`,
+            [
+              terminalTurn.seqEnd,
+              serializedTurn,
+              candidate.deletedAtMs,
+              terminalTurn.id,
+              job.sessionId,
+              job.userId,
+            ],
+          );
+          if (updated.affectedRows !== 1) throw new Error("legacy active turn changed while locked");
+        }
+        await conn.query(
+          "INSERT INTO events (session_id, seq, user_id, type, body, emitted_at_ms) VALUES ?",
+          [events.map((event, index) => [
+            job.sessionId,
+            event.seq,
+            job.userId,
+            event.type,
+            serializedEvents[index],
+            event.emittedAtMs,
+          ])],
+        );
+        await conn.query(
+          `INSERT INTO lifecycle_outbox
+             (topic, aggregate_id, generation, payload, available_at_ms, attempts, created_at_ms)
+           VALUES ?`,
+          [[
+            ["session.tombstoned", job.sessionId, 1, tombstonedPayload, completedAtMs, 0, completedAtMs],
+            ["session.purge", job.sessionId, 1, purgePayload, null, 0, completedAtMs],
+          ]],
+        );
+        const [sessionUpdated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE sessions
+              SET status=?, last_seq=?, auto_approved_tools=?, updated_at_ms=?,
+                  purge_after_ms=NULL, deletion_generation=1
+            WHERE session_id=? AND tenant_id=? AND user_id=?
+              AND deleted_at_ms=? AND deletion_generation=0 AND last_seq=?`,
+          [
+            json(stagedSession.status),
+            terminal.seq,
+            json([]),
+            stagedSession.updatedAtMs,
+            job.sessionId,
+            job.tenantId,
+            job.userId,
+            candidate.deletedAtMs,
+            candidate.lastSeq,
+          ],
+        );
+        if (sessionUpdated.affectedRows !== 1) throw new Error("legacy session changed while locked");
+        const [auditInserted] = await conn.query<mysql.ResultSetHeader>(
+          `INSERT INTO legacy_tombstone_compensation_events
+             (job_id, session_id, control_generation, event_type, reason_code, actor_key_id,
+              claim_attempt, source_deleted_at_ms, target_deletion_generation, terminal_event_seq,
+              before_sha256, after_sha256, emitted_at_ms)
+           VALUES (?, ?, 1, 'legacy_tombstone/compensated', NULL, ?, ?, ?, 1, ?, ?, ?, ?)`,
+          [
+            job.jobId,
+            job.sessionId,
+            job.sourceKind === "maintenance" ? job.maintenanceActorKeyId : null,
+            stagedAuthorization.claimAttempt,
+            job.legacyDeletedAtMs,
+            terminal.seq,
+            String(jobRow.candidate_sha256),
+            successEvidence,
+            completedAtMs,
+          ],
+        );
+        const successAudit: LegacyTombstoneCompensationAudit = {
+          auditId: Number(auditInserted.insertId),
+          jobId: job.jobId,
+          type: "legacy_tombstone/compensated",
+          sessionId: job.sessionId,
+          cutoverGeneration: 1,
+          deletionGeneration: 1,
+          eventSeq: terminal.seq,
+          claimAttempt: stagedAuthorization.claimAttempt,
+          evidenceSha256: successEvidence,
+          emittedAtMs: completedAtMs,
+        };
+        validateLegacyTombstoneCompensationAudit(successAudit);
+        const [jobUpdated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE legacy_tombstone_compensation_jobs
+              SET status='completed', available_at_ms=NULL, claim_token=NULL,
+                  lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?, completed_at_ms=?,
+                  completed_event_seq=?, completed_claim_attempt=?, completed_claim_token_sha256=?
+            WHERE job_id=? AND tenant_id=? AND user_id=? AND session_id=?
+              AND control_generation=1 AND status='pending' AND claim_token=? AND attempts=?`,
+          [
+            completedAtMs,
+            completedAtMs,
+            terminal.seq,
+            stagedAuthorization.claimAttempt,
+            legacyTombstoneClaimTokenSha256(stagedAuthorization.claimToken),
+            job.jobId,
+            job.tenantId,
+            job.userId,
+            job.sessionId,
+            stagedAuthorization.claimToken,
+            stagedAuthorization.claimAttempt,
+          ],
+        );
+        if (jobUpdated.affectedRows !== 1) throw new Error("legacy tombstone job changed while completing");
+        await conn.commit();
+        return {
+          outcome: "compensated",
+          sessionId: job.sessionId,
+          deletionGeneration: 1,
+          eventSeq: terminal.seq,
+        };
+      } catch (error) {
+        if (error instanceof LegacyTombstoneChildPendingError) throw error;
+        if (!(error instanceof LegacyTombstoneIntegrityFault)) throw error;
+        // Keep terminal isolation atomic even if a future validation is accidentally placed after
+        // one of the content updates above. The incident must never commit a partial settlement.
+        await conn.query("ROLLBACK TO SAVEPOINT legacy_tombstone_completion");
+        const result = await this.writeLegacyTombstoneTerminalIncident(
+          conn,
+          jobRow,
+          job,
+          stagedAuthorization,
+          stagedOptions.completedAtMs,
+          error.reasonCode,
+        );
+        await conn.commit();
+        return result;
+      }
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
       conn.release();
     }
   }

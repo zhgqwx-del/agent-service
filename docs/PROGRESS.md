@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层，以及 admission 默认关闭的 durable user-erasure gate/queue/worker 已完成。`0013` 已把确定性 claim-stage poison逐候选隔离：安全envelope进入durable quarantine与generation/evidence CAS maintenance，identity/generation/time envelope损坏进入保留原值的append-only terminal incident；两者都撤销worker authority且不饿死邻居。滚动升级fleet barrier已接线；worker 可跨 runner drain、child-first tombstone、原子重验 tombstone proof并 reconcile usage，安全停在 `awaiting_purge_policy`。异步 export artifact/TTL、tenant erasure/key revocation、legacy generation `0` 补偿、canonical policy/legal-hold、policy-gated ready/session purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层，以及 admission 默认关闭的 durable user-erasure gate/queue/worker 已完成。`0013` 已把确定性 claim-stage poison逐候选隔离；`0014` 进一步以默认休眠的 write-once cutover、durable job/audit 和 runner 内嵌 worker闭环 pre-0009 `deletion_generation=0` tombstone 的可审计补偿。v2 私有 barrier 只有在全部 configured runner 同时声明 `quarantine-v1` 与 `legacy-tombstone-compensation-v1` 后放行；成功事务保留原删除时间，原子补齐 generation `1` terminal event、两条 lifecycle intent、append-only audit 与 job completion，但不会激活 purge 或删除内容。异步 export artifact/TTL、tenant erasure与 key/provider/auth secret撤销、canonical policy/legal-hold、policy-gated ready/session purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -361,3 +361,31 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - terminal quarantine/incident是fence耗尽或unsafe identity/generation/time envelope的永久安全停机点，不是普通可修复状态。incident只解决worker authority撤销、审计留痕和邻居进度，不会猜测owner或修复原行；当前需保全证据并forward-fix。专用事故迁移、指标/告警和受审计的operator workflow留在后续运维/M4收口，绝不能手工调小BIGINT、改写incident或补造event。
 - barrier ACK到数据库claim之间仍有极短TOCTOU，安全性依赖禁止版本回退；共享internal bearer token在云上还需私网ACL、TLS/mTLS、Secret轮换。真实固定N-1镜像mixed-version canary、production独立migration Job和运行时最小数据库权限也留待M4部署编排。
 - 下一独立切片先处理legacy generation `0`可审计补偿，再实现canonical policy/legal-hold和默认关闭的purge substrate；在真实共享对象存储、保留政策与恢复门禁确定前，不激活不可逆删除。
+
+## 2026-10-08（M1 数据生命周期：0014 legacy generation-zero tombstone 补偿）
+
+### 已完成
+
+1. 新增 dormant、expand-only 的 `0014_legacy_tombstone_compensation.sql`：write-once cutover singleton、每 session 一个 durable job、append-only result audit、candidate/claim indexes 与 session writer guards。应用 migration 本身不会激活 cutover、扫描/排队历史行、生成 event/outbox、改变 generation、开放 purge 或删除内容；migration marker 与 runtime activation 明确分离。
+2. cutover 激活与 session writer 通过 singleton 行锁线性化；提交后数据库拒绝新的 generation-zero tombstone 及不一致 marker。该边界不可 disable/down-migrate，激活后不能恢复 pre-`0014` writer，只能 forward-fix。router/runner job-control 提升为故意不兼容的 v2：全部 configured stable runner 必须同时声明 `quarantine-v1` 与 `legacy-tombstone-compensation-v1`，旧 v1 私有 endpoint 固定 404，旧 worker 不能在 rollout 期间继续 claim。
+3. Memory/MySQL 都实现 global maintenance 与 erasure-claim targeted scheduling、确定性 per-session job identity、attempt+token+lease 防 ABA、续租不缩短、retry、exact completed replay 和 content-free terminal incident。owner 路径始终 tenant/user scoped；全局扫描只属于内部 maintenance。unsafe envelope、缺失/冲突 result、损坏 session candidate 均逐候选隔离并继续健康邻居，未知数据库/传输故障仍整事务回滚后重试。
+4. 成功 completion 在同一 Memory 原子发布/MySQL 事务中固定结算残留 active turn 与 pending approval，保留原 `deletedAt`，追加连续 `session/deleted`，把 marker 推进到 generation `1`，写即时 `session.tombstoned` 与不可领取的 `session.purge` intent，追加成功 audit并完成 job。序列化、event/outbox/audit/session/job 任一步失败都不留下部分 seq、marker、intent 或 settlement。
+5. child-first 语义同时覆盖活性与永久故障：无 job 或合法 pending/no-result 的 generation-zero child保持可重试；已经 terminal/proof-conflict/unsafe 的 child、completed-marker矛盾、live direct child、跨 owner child和 ancestry cycle都会让 parent 原子进入 `child_dependency_invalid`，不会永久 `child_pending`。deterministic targeted scheduling fault由普通 erasure worker映射为 `blocked/integrity_conflict`，不会伪装成 transient retry。
+6. runner 内嵌 compensation worker 与普通 erasure worker分权但共用 v2 fleet barrier；产品配置默认关闭两个 worker与 admission，本地统一脚本显式开启两个 worker但仍默认关闭新 erasure admission。普通 worker遇到 generation-zero session会建立 targeted job并等待补偿，然后继续现有 usage proof/reconciliation；任一 terminal compensation会安全阻断 request，而不是猜测或删除内容。
+7. 固定 `mysql-0013.sql` 与真实 `mysql-0008-legacy-tombstones.sql` 历史夹具进入 no-skip manifest。独立 `0013→0014` 套件覆盖完整升级、0008历史 tombstone 经生产迁移链保留、partial DDL/marker-loss replay、错误 index/trigger 收敛、cutover/legacy writer 并发线性化和激活后 guards。命名的真实 MySQL runtime套件覆盖 global/targeted、claim/ABA、并发完成/响应丢失、active资源结算、audit失败整事务回滚、terminal replay、缺result poison、parent/child/owner/cycle与健康邻居进度。
+8. README、架构/生命周期设计、部署 runbook 和长期学习文档已同步本地启动、手动体验、router/runner职责、Node bundle与 Linux OCI image、CI实际构建门禁，以及 local→staging→production 同一 digest promotion 和 `0014` forward-only激活边界。SDK打包检查改用 pnpm 10/11/12 都接受的 config形式，本地与CI工具链不再因 `pack` flag差异分叉。
+
+### 本轮验证
+
+- `pnpm check:secrets`：通过，扫描 **243 files**；`pnpm check:api`、`pnpm typecheck`、`pnpm check:sdk` 与 `git diff --check` 通过，SDK真实 **18-file** package在隔离 consumer中完成 runtime import与TypeScript编译。
+- Memory/contract generation-zero专项 **30/30 passed**；core/router/runner/protocol相关定向回归通过。命名的真实 MySQL compensation套件 **13/13 passed**，required wrapper明确证明目标文件执行且没有 skip。
+- 固定七文件历史 MySQL migration suites **20/20 passed**；其中 `0013→0014` **5/5**，`0007→0008` 的相同 usage 合并、冲突阻断与 legacy pending receipt保留仍在同一必跑链中。
+- `scripts/local-service.sh verify`：主套件 **784 passed / 1 skipped**；覆盖率 **85.20% statements / 79.29% branches / 87.79% functions / 89.33% lines**；cluster **14/14 passed**；SDK package及 runner/router原生 Node bundle的启动、readiness、转发和 OpenAPI深比较通过。
+- 独立交叉 review从并发/ABA、事务回滚、滚动升级、安全隔离和测试有效性五个角度复核，当前 `0014` 范围无剩余 P0–P2。本轮不改变 provider dialect或真实厂商网络契约，因此没有重复运行收费的 `verify-real` 或 acceptance；最近真实模型 **1/1** 与十阶段 acceptance仍只作为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2本地/CI冻结结论不变，本轮仍属于 M1 数据生命周期，没有提前开始 M3。generation-zero补偿已收口，但 `awaiting_purge_policy` 仍不是擦除完成；M1还需 canonical policy/legal-hold与默认关闭的 purge substrate、异步 export artifact/download/TTL、tenant与 key/provider/auth secret撤销、completed proof和独立故障域 restore replay。
+- 下一独立切片先实现 canonical policy/legal-hold与不可领取的 purge policy substrate；在保留期、共享对象存储、备份恢复门禁和 operator事故流程明确前，不激活不可逆 ready Blob/session purge。随后完成 export、tenant/key撤销、completed proof与restore replay，再正式进入 M3。
+- `0014` cutover 激活后必须 forward-only。sticky barrier仍依赖实例稳定地址、排空旧 worker和禁止版本回退；尚无真实 N-1旧binary canary。正常 runtime不可生成但特权数据库损坏可制造同 session/不同jobId的 orphan result，当前作为 P3事故风险保全并留给受审计运维流程；Memory非canonical audit-only候选也只有 O(n)重扫的测试后端效率残余。append-only trigger不能防御持有DDL/TRUNCATE权限的主体，生产需独立 migration identity与最小 runtime权限。
+- 当前无云资源不阻止继续完成 local/CI代码范围，但不能据此宣称 staging/production已部署。Kubernetes、共享对象存储、KMS/Secret、域名/TLS、真实 IdP、MySQL/Redis拓扑、备份和容量参数仍等待真实环境后落地；CI当前只 build/load/start候选镜像，不推 registry、不签名也不执行 promotion。

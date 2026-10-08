@@ -177,6 +177,16 @@ describe("committed OpenAPI contract", () => {
     expect(document.components?.schemas?.Capabilities).toMatchObject({
       properties: {
         protocolVersion: { enum: ["2026-10-08"] },
+        features: {
+          properties: {
+            erasureJobControl: {
+              items: {
+                enum: ["quarantine-v1", "legacy-tombstone-compensation-v1"],
+              },
+              maxItems: 2,
+            },
+          },
+        },
       },
     });
   });

@@ -64,6 +64,7 @@ export const ERASURE_JOB_ERROR_CODES = [
   "legal_hold",
   "policy_unavailable",
   "legacy_blocked",
+  "legacy_compensation_pending",
 ] as const;
 export type ErasureJobErrorCode = (typeof ERASURE_JOB_ERROR_CODES)[number];
 const ERASURE_JOB_ERROR_CODE_SET = new Set<string>(ERASURE_JOB_ERROR_CODES);

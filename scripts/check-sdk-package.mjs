@@ -15,7 +15,7 @@ execFileSync(process.execPath, [resolve(ROOT, "scripts/build-sdk.mjs")], {
 
 const temp = await mkdtemp(resolve(tmpdir(), "agent-service-sdk-pack-"));
 try {
-  execFileSync("pnpm", ["pack", "--pack-destination", temp, "--ignore-scripts"], {
+  execFileSync("pnpm", ["pack", "--pack-destination", temp, "--config.ignore-scripts=true"], {
     cwd: SDK_ROOT,
     stdio: "pipe",
   });

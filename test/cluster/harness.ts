@@ -117,6 +117,11 @@ export interface ClusterOptions {
   dataErasureRequestsEnabled?: boolean;
   /** Runs the durable erasure worker without necessarily accepting new requests. */
   erasureWorkerEnabled?: boolean;
+  /**
+   * Runs the generation-zero compensation worker and advertises the v2 claim barrier contract.
+   * Defaults on for the whole configured fleet whenever erasure orchestration is requested.
+   */
+  legacyTombstoneCompensationEnabled?: boolean;
   /** Fast-test worker timing; production defaults remain owned by runner config. */
   erasureWorkerPollMs?: number;
   erasureWorkerLeaseMs?: number;
@@ -130,6 +135,8 @@ export interface ClusterOptions {
   erasureWorkerEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional deterministic admission placement; defaults to the cluster-wide admission gate. */
   dataErasureRequestsEnabledForRunner?: (runnerNumber: number) => boolean;
+  /** Optional mixed-rollout placement; a disabled configured target intentionally blocks v2 claims. */
+  legacyTombstoneCompensationEnabledForRunner?: (runnerNumber: number) => boolean;
 }
 
 /**
@@ -141,6 +148,12 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
   const count = opts.runners ?? 2;
   const erasureWorkerEnabled = opts.erasureWorkerEnabled === true
     || opts.dataErasureRequestsEnabled === true;
+  const legacyTombstoneCompensationEnabled = opts.legacyTombstoneCompensationEnabled
+    ?? (
+      erasureWorkerEnabled
+      || opts.erasureWorkerEnabledForRunner !== undefined
+      || opts.dataErasureRequestsEnabledForRunner !== undefined
+    );
   assertDisposableClusterTargets(MYSQL_URL, REDIS_URL, process.env.AGENT_SERVICE_ALLOW_DESTRUCTIVE_TEST_DB === "1");
 
   // fresh database each run so seq/fence assertions start from a known state
@@ -191,6 +204,10 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     INTERNAL_ROUTER_TOKEN,
     ERASURE_WORKER_ENABLED: (
       opts.erasureWorkerEnabledForRunner?.(runnerNumber) ?? erasureWorkerEnabled
+    ) ? "1" : "0",
+    LEGACY_TOMBSTONE_COMPENSATION_ENABLED: (
+      opts.legacyTombstoneCompensationEnabledForRunner?.(runnerNumber)
+        ?? legacyTombstoneCompensationEnabled
     ) ? "1" : "0",
     ERASURE_ROUTER_URL: routerUrl,
     DATA_ERASURE_REQUESTS_ENABLED: (

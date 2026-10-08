@@ -25,7 +25,7 @@ vi.mock("@hono/node-server", () => ({
   },
 }));
 
-import { ErasureWorker } from "@agent-service/core";
+import { ErasureWorker, LegacyTombstoneCompensationWorker } from "@agent-service/core";
 import { startRunner } from "../src/main.js";
 
 const MASTER_KEY = "88".repeat(32);
@@ -59,6 +59,7 @@ describe("runner main blob wiring", () => {
         },
       });
       expect(runner.erasureWorker).toBeUndefined();
+      expect(runner.legacyTombstoneCompensationWorker).toBeUndefined();
 
       await runner.close();
       expect(runner.server.listening).toBe(false);
@@ -80,6 +81,7 @@ describe("runner main blob wiring", () => {
       },
     }));
     const startSpy = vi.spyOn(ErasureWorker.prototype, "start");
+    const legacyStartSpy = vi.spyOn(LegacyTombstoneCompensationWorker.prototype, "start");
     let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
     try {
       runner = await startRunner({
@@ -88,39 +90,52 @@ describe("runner main blob wiring", () => {
         RUNNER_ADDR: "127.0.0.1:0",
         BLOB_DIR: blobDir,
         ERASURE_WORKER_ENABLED: "1",
+        LEGACY_TOMBSTONE_COMPENSATION_ENABLED: "1",
+        LEGACY_TOMBSTONE_COMPENSATION_POLL_MS: "60000",
         ERASURE_ROUTER_URL: "http://127.0.0.1:8080",
         ERASURE_WORKER_POLL_MS: "60000",
         DATA_ERASURE_REQUESTS_ENABLED: "1",
         INTERNAL_ROUTER_TOKEN: INTERNAL_TOKEN,
       });
       expect(startSpy).toHaveBeenCalledOnce();
+      expect(legacyStartSpy).toHaveBeenCalledOnce();
       expect(runner.erasureWorker).toBeInstanceOf(ErasureWorker);
+      expect(runner.legacyTombstoneCompensationWorker).toBeInstanceOf(
+        LegacyTombstoneCompensationWorker,
+      );
       const capabilityResponse = await runner.app.request("/v1/capabilities");
       expect(await capabilityResponse.json()).toMatchObject({
         features: {
           dataErasureRequests: true,
           userErasureWorker: ["drain-v1"],
-          erasureJobControl: ["quarantine-v1"],
+          erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"],
         },
       });
-      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledOnce());
-      const [input, init] = fetchSpy.mock.calls[0]!;
-      expect(String(input)).toBe(`http://127.0.0.1:8080${INTERNAL_ERASURE_JOB_CONTROL_READY_PATH}`);
-      expect(init?.method).toBe("GET");
-      expect(new Headers(init?.headers).get(INTERNAL_ROUTER_TOKEN_HEADER)).toBe(INTERNAL_TOKEN);
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(2));
+      for (const [input, init] of fetchSpy.mock.calls) {
+        expect(String(input)).toBe(`http://127.0.0.1:8080${INTERNAL_ERASURE_JOB_CONTROL_READY_PATH}`);
+        expect(init?.method).toBe("GET");
+        expect(new Headers(init?.headers).get(INTERNAL_ROUTER_TOKEN_HEADER)).toBe(INTERNAL_TOKEN);
+      }
 
       const stopSpy = vi.spyOn(runner.erasureWorker!, "stop");
+      const legacyStopSpy = vi.spyOn(runner.legacyTombstoneCompensationWorker!, "stop");
       const drainSpy = vi.spyOn(runner.host, "drain");
       await runner.close();
       expect(stopSpy).toHaveBeenCalledOnce();
+      expect(legacyStopSpy).toHaveBeenCalledOnce();
       expect(drainSpy).toHaveBeenCalledOnce();
       expect(stopSpy.mock.invocationCallOrder[0]).toBeLessThan(drainSpy.mock.invocationCallOrder[0]!);
-      expect(fetchSpy).toHaveBeenCalledOnce();
+      expect(legacyStopSpy.mock.invocationCallOrder[0]).toBeLessThan(
+        drainSpy.mock.invocationCallOrder[0]!,
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
       expect(runner.server.listening).toBe(false);
       runner = undefined;
     } finally {
       await runner?.close();
       startSpy.mockRestore();
+      legacyStartSpy.mockRestore();
       fetchSpy.mockRestore();
       log.mockRestore();
       await rm(blobDir, { recursive: true, force: true });

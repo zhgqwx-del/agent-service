@@ -73,7 +73,7 @@ afterEach(async () => {
 
 async function makeApp(
   heartbeatMs = 60_000,
-  lifecycle: { enabled?: boolean; attachStore?: boolean } = {},
+  lifecycle: { enabled?: boolean; attachStore?: boolean; legacyCompensation?: boolean } = {},
 ) {
   const store = new MemorySessionStore();
   await store.createApiKey("t_dev", "k1", hashApiKey("dev-key"), ["runtime", "admin"]);
@@ -91,6 +91,7 @@ async function makeApp(
     store, host, providers, tools, runnerId: "r", internalRouterToken: INTERNAL_ROUTER_TOKEN,
     heartbeatMs, maxBodyBytes: 1_000_000, ready: () => true,
     erasureRequestsEnabled: lifecycle.enabled,
+    legacyTombstoneCompensationEnabled: lifecycle.legacyCompensation,
     subjectLifecycle: lifecycle.attachStore ? store : undefined,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
@@ -227,7 +228,12 @@ describe("agent-runner HTTP API", () => {
   it("advertises erasure requests only when both the deployment gate and store boundary are present", async () => {
     const gateOnly = await makeApp(60_000, { enabled: true });
     const storeOnly = await makeApp(60_000, { attachStore: true });
-    const enabled = await makeApp(60_000, { enabled: true, attachStore: true });
+    const admissionWithoutCompensation = await makeApp(60_000, { enabled: true, attachStore: true });
+    const enabled = await makeApp(60_000, {
+      enabled: true,
+      attachStore: true,
+      legacyCompensation: true,
+    });
 
     expect(await (await gateOnly.app.request("/v1/capabilities")).json()).toMatchObject({
       features: { dataErasureRequests: false, userErasureWorker: [], erasureJobControl: [] },
@@ -240,11 +246,17 @@ describe("agent-runner HTTP API", () => {
         erasureJobControl: ["quarantine-v1"],
       },
     });
+    expect(await (await admissionWithoutCompensation.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        dataErasureRequests: false,
+        erasureJobControl: ["quarantine-v1"],
+      },
+    });
     expect(await (await enabled.app.request("/v1/capabilities")).json()).toMatchObject({
       features: {
         dataErasureRequests: true,
         userErasureWorker: ["drain-v1"],
-        erasureJobControl: ["quarantine-v1"],
+        erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"],
       },
     });
   });

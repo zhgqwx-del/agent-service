@@ -16,6 +16,7 @@ caller_redis_url="${REDIS_URL-}"
 caller_session_tombstone_enabled="${SESSION_TOMBSTONE_ENABLED-}"
 caller_data_erasure_requests_enabled="${DATA_ERASURE_REQUESTS_ENABLED-}"
 caller_erasure_worker_enabled="${ERASURE_WORKER_ENABLED-}"
+caller_legacy_tombstone_compensation_enabled="${LEGACY_TOMBSTONE_COMPENSATION_ENABLED-}"
 caller_erasure_router_url="${ERASURE_ROUTER_URL-}"
 caller_blob_dir="${BLOB_DIR-}"
 caller_blob_filesystem_single_runner="${BLOB_FILESYSTEM_SINGLE_RUNNER-}"
@@ -37,6 +38,7 @@ fi
 [ -n "$caller_session_tombstone_enabled" ] && SESSION_TOMBSTONE_ENABLED="$caller_session_tombstone_enabled"
 [ -n "$caller_data_erasure_requests_enabled" ] && DATA_ERASURE_REQUESTS_ENABLED="$caller_data_erasure_requests_enabled"
 [ -n "$caller_erasure_worker_enabled" ] && ERASURE_WORKER_ENABLED="$caller_erasure_worker_enabled"
+[ -n "$caller_legacy_tombstone_compensation_enabled" ] && LEGACY_TOMBSTONE_COMPENSATION_ENABLED="$caller_legacy_tombstone_compensation_enabled"
 [ -n "$caller_erasure_router_url" ] && ERASURE_ROUTER_URL="$caller_erasure_router_url"
 [ -n "$caller_blob_dir" ] && BLOB_DIR="$caller_blob_dir"
 [ -n "$caller_blob_filesystem_single_runner" ] && BLOB_FILESYSTEM_SINGLE_RUNNER="$caller_blob_filesystem_single_runner"
@@ -95,6 +97,7 @@ start_apps() {
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       ERASURE_WORKER_ENABLED="${ERASURE_WORKER_ENABLED:-1}" \
+      LEGACY_TOMBSTONE_COMPENSATION_ENABLED="${LEGACY_TOMBSTONE_COMPENSATION_ENABLED:-1}" \
       ERASURE_ROUTER_URL="${ERASURE_ROUTER_URL:-$ROUTER_URL}" \
       node --import tsx apps/agent-runner/src/main.ts </dev/null >"$RUNNER_LOG" 2>&1 &
     echo "$!" >"$RUNNER_PID_FILE"
@@ -199,6 +202,8 @@ verify() {
     pnpm run test:erasure-catalog-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:erasure-usage-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:legacy-tombstone-mysql
   AGENT_SERVICE_CLUSTER=1 \
     CLUSTER_MYSQL_URL="${CLUSTER_MYSQL_URL:-mysql://root@127.0.0.1:3306/agent_service_cluster}" \
     CLUSTER_REDIS_URL="${CLUSTER_REDIS_URL:-redis://127.0.0.1:6379/3}" \

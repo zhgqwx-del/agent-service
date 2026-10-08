@@ -1,8 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PROTOCOL_VERSION } from "@agent-service/protocol";
+import {
+  ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
+  ERASURE_JOB_CONTROL_QUARANTINE_V1,
+  PROTOCOL_VERSION,
+} from "@agent-service/protocol";
 import { RunnerRegistry } from "../src/registry.js";
 
 afterEach(() => vi.unstubAllGlobals());
+
+const JOB_CONTROL_V2 = [
+  ERASURE_JOB_CONTROL_QUARANTINE_V1,
+  ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
+] as const;
 
 describe("RunnerRegistry owner address mapping", () => {
   it("maps an exact advertised address when runners share the same port", async () => {
@@ -29,7 +38,7 @@ describe("RunnerRegistry owner address mapping", () => {
       blobAttachments = true,
       dataErasureRequests = true,
       userErasureWorker = ["drain-v1"],
-      erasureJobControl = ["quarantine-v1"],
+      erasureJobControl: readonly string[] = JOB_CONTROL_V2,
     ) => ({
       protocolVersion,
       service: "agent-runner",
@@ -101,11 +110,11 @@ describe("RunnerRegistry owner address mapping", () => {
   });
 
   it("does not ignore an unavailable configured legacy writer when activating erasure", async () => {
-    let legacyState: "down" | "legacy" | "upgraded" | "wrong-protocol" | "missing-endpoint"
+    let legacyState: "down" | "legacy" | "quarantine-only" | "compensation-only" | "upgraded" | "wrong-protocol" | "missing-endpoint"
       | "malformed" | "wrong-service" | "capability-transport" = "down";
     const capabilities = (
       dataErasureRequests: boolean,
-      erasureJobControl: boolean,
+      erasureJobControl: readonly string[],
       protocolVersion: string = PROTOCOL_VERSION,
       service: string = "agent-runner",
     ) => ({
@@ -119,7 +128,7 @@ describe("RunnerRegistry owner address mapping", () => {
         blobAttachments: true,
         dataErasureRequests,
         userErasureWorker: ["drain-v1"],
-        ...(erasureJobControl ? { erasureJobControl: ["quarantine-v1"] } : {}),
+        erasureJobControl,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -131,7 +140,7 @@ describe("RunnerRegistry owner address mapping", () => {
       const url = String(input);
       if (url.startsWith("http://current/readyz")) return new Response("ready");
       if (url.startsWith("http://current/v1/capabilities")) {
-        return Response.json(capabilities(true, true));
+        return Response.json(capabilities(true, JOB_CONTROL_V2));
       }
       if (url.startsWith("http://legacy/readyz")) {
         return legacyState === "down" ? new Response("down", { status: 503 }) : new Response("ready");
@@ -141,12 +150,21 @@ describe("RunnerRegistry owner address mapping", () => {
         if (legacyState === "missing-endpoint") return new Response("not found", { status: 404 });
         if (legacyState === "malformed") return new Response("not-json");
         if (legacyState === "wrong-protocol") {
-          return Response.json(capabilities(true, true, "2026-09-22"));
+          return Response.json(capabilities(true, JOB_CONTROL_V2, "2026-09-22"));
         }
         if (legacyState === "wrong-service") {
-          return Response.json(capabilities(true, true, PROTOCOL_VERSION, "agent-router"));
+          return Response.json(capabilities(true, JOB_CONTROL_V2, PROTOCOL_VERSION, "agent-router"));
         }
-        return Response.json(capabilities(true, legacyState === "upgraded"));
+        return Response.json(capabilities(
+          true,
+          legacyState === "upgraded"
+            ? JOB_CONTROL_V2
+            : legacyState === "quarantine-only"
+              ? [ERASURE_JOB_CONTROL_QUARANTINE_V1]
+              : legacyState === "compensation-only"
+                ? [ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1]
+                : [],
+        ));
       }
       return new Response("not found", { status: 404 });
     }));
@@ -171,6 +189,10 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.allConfiguredSupportDataErasureRequests()).toBe(true);
     expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
 
+    legacyState = "compensation-only";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+
     legacyState = "upgraded";
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.allHealthySupportDataErasureRequests()).toBe(true);
@@ -186,7 +208,7 @@ describe("RunnerRegistry owner address mapping", () => {
 
     // Rollback after activation is forbidden. If it nevertheless becomes observable, fail closed
     // again rather than treating the earlier capability observation as permanent authorization.
-    legacyState = "legacy";
+    legacyState = "quarantine-only";
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
 
@@ -227,7 +249,7 @@ describe("RunnerRegistry owner address mapping", () => {
             blobAttachments: true,
             dataErasureRequests: true,
             userErasureWorker: ["drain-v1"],
-            erasureJobControl: ["quarantine-v1"],
+            erasureJobControl: JOB_CONTROL_V2,
             dynamicTools: true,
             mcp: [],
             skills: false,

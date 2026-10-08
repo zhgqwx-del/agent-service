@@ -784,11 +784,12 @@ export const OPENAPI_DOCUMENT = {
                 "default": [],
                 "items": {
                   "enum": [
-                    "quarantine-v1"
+                    "quarantine-v1",
+                    "legacy-tombstone-compensation-v1"
                   ],
                   "type": "string"
                 },
-                "maxItems": 1,
+                "maxItems": 2,
                 "type": "array"
               },
               "mcp": {

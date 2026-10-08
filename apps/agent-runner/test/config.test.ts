@@ -23,6 +23,7 @@ describe("runner configuration", () => {
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
+    expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED).toBe(false);
     expect(cfg.ERASURE_ROUTER_URL).toBeUndefined();
     expect(cfg.ERASURE_WORKER_POLL_MS).toBe(1_000);
     expect(cfg.ERASURE_WORKER_LEASE_MS).toBe(30_000);
@@ -30,6 +31,11 @@ describe("runner configuration", () => {
     expect(cfg.ERASURE_WORKER_SESSION_PAGE_SIZE).toBe(100);
     expect(cfg.ERASURE_WORKER_RETRY_BASE_MS).toBe(1_000);
     expect(cfg.ERASURE_WORKER_RETRY_MAX_MS).toBe(60_000);
+    expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_POLL_MS).toBe(1_000);
+    expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_LEASE_MS).toBe(30_000);
+    expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_BATCH_SIZE).toBe(10);
+    expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS).toBe(1_000);
+    expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS).toBe(60_000);
     expect(cfg.ERASURE_DRAIN_TIMEOUT_MS).toBe(10_000);
     expect(cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS).toBe(20_000);
     expect(cfg.BLOB_MAX_BYTES).toBe(1_000_000);
@@ -45,17 +51,33 @@ describe("runner configuration", () => {
       SECRETS_MASTER_KEY: SECRET,
       ERASURE_WORKER_ENABLED: "1",
     })).toThrow(/ERASURE_ROUTER_URL is required/);
-    const enabled = loadConfig({
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      LEGACY_TOMBSTONE_COMPENSATION_ENABLED: "1",
+    })).toThrow(/ERASURE_ROUTER_URL is required/);
+    expect(() => loadConfig({
       SECRETS_MASTER_KEY: SECRET,
       DATA_ERASURE_REQUESTS_ENABLED: "1",
       ERASURE_WORKER_ENABLED: "1",
       ERASURE_ROUTER_URL: "http://127.0.0.1:8080/",
+    })).toThrow(/LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1 is required/);
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_ERASURE_REQUESTS_ENABLED: "1",
+      ERASURE_WORKER_ENABLED: "1",
+      LEGACY_TOMBSTONE_COMPENSATION_ENABLED: "1",
+      ERASURE_ROUTER_URL: "http://127.0.0.1:8080/",
     });
     expect(enabled.DATA_ERASURE_REQUESTS_ENABLED).toBe(true);
     expect(enabled.ERASURE_WORKER_ENABLED).toBe(true);
+    expect(enabled.LEGACY_TOMBSTONE_COMPENSATION_ENABLED).toBe(true);
     expect(enabled.ERASURE_ROUTER_URL).toBe("http://127.0.0.1:8080");
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_ERASURE_REQUESTS_ENABLED: "true" })).toThrow();
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, ERASURE_WORKER_ENABLED: "true" })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      LEGACY_TOMBSTONE_COMPENSATION_ENABLED: "true",
+    })).toThrow();
   });
 
   it("accepts only a credential-free http(s) router origin", () => {
@@ -107,6 +129,22 @@ describe("runner configuration", () => {
       ERASURE_WORKER_RETRY_BASE_MS: "2",
       ERASURE_WORKER_RETRY_MAX_MS: "1",
     })).toThrow(/ERASURE_WORKER_RETRY_MAX_MS/);
+  });
+
+  it("validates legacy tombstone compensation worker bounds and retry ordering", () => {
+    const base = {
+      SECRETS_MASTER_KEY: SECRET,
+      LEGACY_TOMBSTONE_COMPENSATION_ENABLED: "1",
+      ERASURE_ROUTER_URL: "http://router.internal:8080",
+    };
+    expect(() => loadConfig({ ...base, LEGACY_TOMBSTONE_COMPENSATION_POLL_MS: "0" })).toThrow();
+    expect(() => loadConfig({ ...base, LEGACY_TOMBSTONE_COMPENSATION_LEASE_MS: "99" })).toThrow();
+    expect(() => loadConfig({ ...base, LEGACY_TOMBSTONE_COMPENSATION_BATCH_SIZE: "101" })).toThrow();
+    expect(() => loadConfig({
+      ...base,
+      LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS: "2",
+      LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS: "1",
+    })).toThrow(/LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS/);
   });
 
   it("validates lifecycle outbox worker bounds", () => {

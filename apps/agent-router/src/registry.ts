@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { Redis } from "ioredis";
-import { Capabilities } from "@agent-service/protocol";
+import {
+  Capabilities,
+  ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
+  ERASURE_JOB_CONTROL_QUARANTINE_V1,
+} from "@agent-service/protocol";
 
 /**
  * Where a session should go. Two sources, in priority order:
@@ -45,9 +49,10 @@ export class RunnerRegistry {
   private readonly ring: { point: number; url: string }[] = [];
   /**
    * Sticky only across transient health loss inside this router process. A target enters the set
-   * after a successful quarantine-v1 probe and leaves it after any later successful legacy probe.
-   * This distinguishes an unobserved rollout target from a known-compatible runner that crashed:
-   * the former must block activation, while the latter must not deadlock erasure recovery.
+   * after one successful probe containing both the quarantine and legacy-compensation contracts,
+   * and leaves it after any later successful downgrade. This distinguishes an unobserved rollout
+   * target from a known-compatible runner that crashed: the former must block activation, while
+   * the latter must not deadlock erasure recovery.
    */
   private readonly erasureJobControlCompatible = new Set<string>();
   private readonly redis?: Redis;
@@ -214,11 +219,11 @@ export class RunnerRegistry {
   }
 
   /**
-   * Publishing a quarantine changes how every reader interprets an otherwise claimable request.
-   * Every configured target must first have been observed on quarantine-v1. Once observed, a
-   * transient crash does not close the worker barrier: otherwise the surviving worker could never
-   * recover that runner's live session lease. Rolling back an observed target to pre-0013 remains
-   * forbidden; a later successful legacy probe removes it from this set and closes the barrier.
+   * Publishing a quarantine or compensating a generation-zero tombstone changes durable state.
+   * Every configured target must first have been observed on both additive contracts. Once
+   * observed, a transient crash does not close the worker barrier: otherwise the surviving worker
+   * could never recover that runner's live session lease. A later successful downgrade removes the
+   * target from this set and closes the V2 barrier.
    */
   allConfiguredSupportErasureJobControl(): boolean {
     const configured = this.list();
@@ -296,7 +301,11 @@ export class RunnerRegistry {
             this.erasureJobControlCompatible.delete(t.url);
             throw new Error("runner protocol is incompatible");
           }
-          if (parsed.data.features.erasureJobControl.includes("quarantine-v1")) {
+          const jobControl = parsed.data.features.erasureJobControl;
+          if (
+            jobControl.includes(ERASURE_JOB_CONTROL_QUARANTINE_V1)
+            && jobControl.includes(ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1)
+          ) {
             this.erasureJobControlCompatible.add(t.url);
           } else {
             this.erasureJobControlCompatible.delete(t.url);

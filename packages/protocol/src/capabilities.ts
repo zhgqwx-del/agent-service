@@ -28,14 +28,24 @@ export const INTERNAL_ERASURE_DRAIN_ACK_HEADER = "x-agent-service-erasure-worker
 export const INTERNAL_ERASURE_DRAIN_ACK_VALUE = "drain-v1" as const;
 
 /**
- * A runner probes this router-only endpoint before it may claim a durable erasure job. The router
- * acknowledges only after this router process has successfully observed every configured stable
- * runner address on the additive 0013 quarantine/control contract. A later pure outage preserves
- * that observation for crash recovery; an explicit legacy/incompatible response revokes it.
+ * A runner probes this router-only endpoint before it may claim a durable erasure job. V2 is an
+ * intentionally incompatible acknowledgement boundary: a pre-compensation worker only knows the
+ * V1 path/value and therefore cannot keep claiming while generation-zero compensation rolls out.
+ * The router acknowledges V2 only after it has observed both additive control capabilities on
+ * every configured stable runner address.
  */
-export const INTERNAL_ERASURE_JOB_CONTROL_READY_PATH = "/_internal/user-erasure-job-control-v1/ready" as const;
+export const INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH = "/_internal/user-erasure-job-control-v1/ready" as const;
+export const INTERNAL_ERASURE_JOB_CONTROL_READY_PATH = "/_internal/user-erasure-job-control-v2/ready" as const;
 export const INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER = "x-agent-service-erasure-job-control" as const;
-export const INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE = "quarantine-v1" as const;
+export const INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE = "job-control-v2" as const;
+
+export const ERASURE_JOB_CONTROL_QUARANTINE_V1 = "quarantine-v1" as const;
+export const ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1 = "legacy-tombstone-compensation-v1" as const;
+export const ErasureJobControlCapability = z.enum([
+  ERASURE_JOB_CONTROL_QUARANTINE_V1,
+  ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
+]);
+export type ErasureJobControlCapability = z.infer<typeof ErasureJobControlCapability>;
 
 /**
  * Fixed, content-free signal from a runner whose old local execution is already fenced but has not
@@ -73,8 +83,8 @@ export const Capabilities = z.object({
      * durable jobs still need to drain a mixed owner fleet.
      */
     userErasureWorker: z.array(z.literal("drain-v1")).max(1).default([]),
-    /** Runner-to-router rollout signal; public routers deliberately project this as an empty list. */
-    erasureJobControl: z.array(z.literal("quarantine-v1")).max(1).default([]),
+    /** Runner-to-router rollout signals; public routers deliberately project these as an empty list. */
+    erasureJobControl: z.array(ErasureJobControlCapability).max(2).default([]),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

@@ -2,6 +2,7 @@ import { serve } from "@hono/node-server";
 import {
   BlobCleanupWorker,
   ErasureWorker,
+  LegacyTombstoneCompensationWorker,
   LifecycleOutboxDispatcher,
   PiEngine,
   PiSummariser,
@@ -28,6 +29,7 @@ import {
   type ErasureUsageReconciliationStore,
   type LeaseStore,
   type LifecycleOutboxStore,
+  type LegacyTombstoneCompensationStore,
   type SubjectLifecycleStore,
   type SessionStore,
   type UsageLifecycleStore,
@@ -47,6 +49,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & ErasureJobStore
     & ErasureSessionCatalogStore
     & ErasureUsageReconciliationStore
+    & LegacyTombstoneCompensationStore
     & UsageLifecycleStore
     & ErasureSessionStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({ url: cfg.MYSQL_URL })
@@ -122,7 +125,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     poisonMaxAttempts: cfg.BLOB_CLEANUP_POISON_MAX_ATTEMPTS,
   });
   if (cfg.BLOB_CLEANUP_ENABLED) blobCleanup.start();
-  const erasureExecutor = cfg.ERASURE_WORKER_ENABLED
+  const erasureExecutor = (cfg.ERASURE_WORKER_ENABLED || cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED)
     ? new RouterErasureSessionExecutor({
       routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
       internalToken: cfg.INTERNAL_ROUTER_TOKEN,
@@ -130,10 +133,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     })
     : undefined;
   const erasureWorker = erasureExecutor
+    && cfg.ERASURE_WORKER_ENABLED
     ? new ErasureWorker({
       jobs: store,
       catalog: store,
       usage: store,
+      legacyTombstones: store,
       executor: erasureExecutor,
       canClaim: () => erasureExecutor.canClaimErasureJobs(),
     }, {
@@ -145,6 +150,20 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       retryMaxMs: cfg.ERASURE_WORKER_RETRY_MAX_MS,
     })
     : undefined;
+  const legacyTombstoneCompensationWorker = erasureExecutor
+    && cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED
+    ? new LegacyTombstoneCompensationWorker({
+      store,
+      canClaim: () => erasureExecutor.canClaimErasureJobs(),
+    }, {
+      pollIntervalMs: cfg.LEGACY_TOMBSTONE_COMPENSATION_POLL_MS,
+      leaseMs: cfg.LEGACY_TOMBSTONE_COMPENSATION_LEASE_MS,
+      batchSize: cfg.LEGACY_TOMBSTONE_COMPENSATION_BATCH_SIZE,
+      retryBaseMs: cfg.LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS,
+      retryMaxMs: cfg.LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS,
+    })
+    : undefined;
+  legacyTombstoneCompensationWorker?.start();
   erasureWorker?.start();
 
   let ready = true;
@@ -156,6 +175,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     maxBodyBytes: cfg.MAX_BODY_BYTES,
     blobAttachmentsEnabled: cfg.BLOB_ATTACHMENTS_ENABLED,
     erasureRequestsEnabled: cfg.DATA_ERASURE_REQUESTS_ENABLED,
+    legacyTombstoneCompensationEnabled: cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED,
     subjectLifecycle: store,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
     ready: () => ready,
@@ -175,7 +195,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       // Stop accepting new connections while allowing existing requests/streams to finish during
       // the host drain. Stores stay available until workers and HTTP have both quiesced.
       const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
-      await erasureWorker?.stop();
+      // Revoke both queue authorities together. Stopping these sequentially would leave the
+      // second worker able to begin another claim while the first one waits for an in-flight pass.
+      await Promise.all([
+        erasureWorker?.stop(),
+        legacyTombstoneCompensationWorker?.stop(),
+      ]);
       await host.drain(30_000);
       await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
 
@@ -208,9 +233,10 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"}`);
   return {
-    app, server, host, lifecycleOutbox, blobCleanup, erasureWorker, blobs, blobStore, store, lease, bus, cfg,
+    app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
+    legacyTombstoneCompensationWorker, blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };
 }

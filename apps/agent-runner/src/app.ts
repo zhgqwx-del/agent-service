@@ -15,6 +15,8 @@ import {
   CreateSessionRequest,
   DynamicToolResultRequest,
   ErrorBody,
+  ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
+  ERASURE_JOB_CONTROL_QUARANTINE_V1,
   EXCLUDABLE_EVENT_TYPES,
   EventStreamHeaders,
   EventStreamQuery,
@@ -81,6 +83,8 @@ export interface AppDeps {
   maxBlobBytes?: number;
   /** Additive rollout gate; must stay off until every writer checks the durable subject gate. */
   erasureRequestsEnabled?: boolean;
+  /** Advertise the irreversible generation-zero compensation contract only while its worker runs. */
+  legacyTombstoneCompensationEnabled?: boolean;
   subjectLifecycle?: SubjectLifecycleStore;
   ready: () => boolean;
   /** decrypts a tenant's stored auth secret (HS256 key / introspection credential) */
@@ -147,9 +151,18 @@ export function createApp(deps: AppDeps) {
         approvals: true,
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         blobAttachments: deps.blobAttachmentsEnabled === true,
-        dataErasureRequests: deps.erasureRequestsEnabled === true && deps.subjectLifecycle !== undefined,
+        dataErasureRequests: deps.erasureRequestsEnabled === true
+          && deps.legacyTombstoneCompensationEnabled === true
+          && deps.subjectLifecycle !== undefined,
         userErasureWorker: deps.subjectLifecycle === undefined ? [] : ["drain-v1"],
-        erasureJobControl: deps.subjectLifecycle === undefined ? [] : ["quarantine-v1"],
+        erasureJobControl: deps.subjectLifecycle === undefined
+          ? []
+          : [
+              ERASURE_JOB_CONTROL_QUARANTINE_V1,
+              ...(deps.legacyTombstoneCompensationEnabled === true
+                ? [ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1]
+                : []),
+            ],
         dynamicTools: true,
         mcp: [],
         skills: false,

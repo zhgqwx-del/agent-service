@@ -39,6 +39,7 @@ const requiredTestFiles = [
   "packages/store/test/erasure-session.mysql.test.ts",
   "packages/store/test/erasure-catalog.mysql.test.ts",
   "packages/store/test/erasure-usage.mysql.test.ts",
+  "packages/store/test/legacy-tombstone-compensation.mysql.test.ts",
   "packages/core/test/erasure-worker.mysql.test.ts",
 ];
 for (const file of requiredTestFiles) {

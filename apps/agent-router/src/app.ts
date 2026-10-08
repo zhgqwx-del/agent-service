@@ -11,6 +11,7 @@ import {
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
   INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
   INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
+  INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
@@ -390,6 +391,8 @@ export function createRouterApp(deps: RouterAppDeps) {
       || url.pathname.startsWith(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/`)
       || url.pathname === INTERNAL_ERASURE_JOB_CONTROL_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_ERASURE_JOB_CONTROL_READY_PATH}/`)
+      || url.pathname === INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH
+      || url.pathname.startsWith(`${INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH}/`)
     ) {
       privateInternalHeaders(c);
       return c.json({ error: { code: "not_found", message: "not found" } }, 404);
