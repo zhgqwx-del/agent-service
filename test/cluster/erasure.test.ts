@@ -1,6 +1,12 @@
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  MysqlSessionStore,
+  newErasureRequestId,
+  userErasureRequestHash,
+} from "../../packages/store/src/index.js";
+import {
   api,
+  MYSQL_URL,
   openSse,
   queryDb,
   startCluster,
@@ -32,6 +38,10 @@ interface ErasureRow {
   claimed: number;
   available_at_ms: number | null;
   lease_until_ms: number | null;
+  control_generation: number;
+  quarantined_at_ms: number | null;
+  quarantine_reason_code: string | null;
+  quarantine_evidence_sha256: string | null;
 }
 
 const workerClusterOptions = {
@@ -51,9 +61,10 @@ const workerClusterOptions = {
   }),
 } as const;
 
-async function createAgent(base: string): Promise<string> {
+async function createAgent(base: string, userId = "u_cluster"): Promise<string> {
   const response = await api<{ id: string }>(base, "/v1/agents", {
     method: "POST",
+    headers: { "x-user-id": userId },
     body: JSON.stringify({
       name: "erasure-cluster",
       instructions: "be brief",
@@ -70,9 +81,11 @@ async function createSession(
   base: string,
   agentId: string,
   parentSessionId?: string,
+  userId = "u_cluster",
 ): Promise<SessionRef> {
   const response = await api<SessionRef>(base, "/v1/sessions", {
     method: "POST",
+    headers: { "x-user-id": userId },
     body: JSON.stringify({
       agentId,
       ...(parentSessionId === undefined ? {} : { parentSessionId }),
@@ -82,14 +95,36 @@ async function createSession(
   return response.body;
 }
 
-async function requestUserErasure(base: string, idempotencyKey: string): Promise<ErasureResponse> {
+async function requestUserErasure(
+  base: string,
+  idempotencyKey: string,
+  userId = "u_cluster",
+): Promise<ErasureResponse> {
   const response = await api<ErasureResponse>(base, "/v1/data-erasure-requests", {
     method: "POST",
-    headers: { "idempotency-key": idempotencyKey },
+    headers: { "idempotency-key": idempotencyKey, "x-user-id": userId },
   });
   expect(response.status).toBe(202);
   expect(response.body.status).toBe("gated");
   return response.body;
+}
+
+async function seedUserErasure(
+  store: MysqlSessionStore,
+  idempotencyKey: string,
+  userId: string,
+): Promise<ErasureResponse> {
+  const record = await store.requestUserErasure({
+    requestId: newErasureRequestId(),
+    tenantId: "t_cluster",
+    userId,
+    requestedByKeyId: "cluster-maintainer",
+    idempotencyKey,
+    requestHash: userErasureRequestHash("t_cluster", userId),
+    atMs: Date.now(),
+  });
+  expect(record.status).toBe("gated");
+  return { id: record.requestId, status: record.status };
 }
 
 async function waitForErasureRow(
@@ -101,12 +136,75 @@ async function waitForErasureRow(
   return waitFor(async () => {
     const [row] = await queryDb<ErasureRow>(
       `SELECT status, attempts, claim_token IS NOT NULL AS claimed,
-              available_at_ms, lease_until_ms
+              available_at_ms, lease_until_ms, control_generation, quarantined_at_ms,
+              quarantine_reason_code, quarantine_evidence_sha256
          FROM erasure_requests WHERE request_id=?`,
       [requestId],
     );
     return row && predicate(row) ? row : undefined;
   }, timeoutMs, label);
+}
+
+async function seedPolicyActivatedPurging(requestId: string): Promise<{
+  attempts: number;
+  claimToken: string;
+  leaseUntilMs: number;
+}> {
+  const [request] = await queryDb<{ generation: number; gated_at_ms: number }>(
+    "SELECT generation, gated_at_ms FROM erasure_requests WHERE request_id=?",
+    [requestId],
+  );
+  if (!request) throw new Error("purging seed request not found");
+  const generation = Number(request.generation);
+  const gatedAtMs = Number(request.gated_at_ms);
+  const policyVersion = "cluster-policy-v1";
+  const policyHash = "b".repeat(64);
+  const transitions = [
+    ["gated", "draining"],
+    ["draining", "tombstoning"],
+    ["tombstoning", "reconciling_usage"],
+    ["reconciling_usage", "awaiting_purge_policy"],
+    ["awaiting_purge_policy", "purging"],
+  ] as const;
+  for (const [index, [fromStatus, status]] of transitions.entries()) {
+    const carriesPolicy = status === "purging";
+    await queryDb(
+      `INSERT INTO erasure_audit_events
+         (request_id, seq, event_type, payload, emitted_at_ms)
+       VALUES (?, ?, 'erasure/status_changed', ?, ?)`,
+      [
+        requestId,
+        index + 2,
+        JSON.stringify({
+          fromStatus,
+          status,
+          generation,
+          ...(carriesPolicy ? { policyVersion, policyHash } : {}),
+        }),
+        gatedAtMs + index + 1,
+      ],
+    );
+  }
+  const attempts = 4;
+  const claimToken = "legacy-purge-worker";
+  const leaseUntilMs = Date.now() + 120_000;
+  await queryDb(
+    `UPDATE erasure_requests
+        SET status='purging', updated_at_ms=?, available_at_ms=?, attempts=?,
+            claim_token=?, lease_until_ms=?, policy_version=?, policy_hash=?
+      WHERE request_id=?`,
+    [
+      gatedAtMs + transitions.length,
+      gatedAtMs + transitions.length,
+      attempts,
+      claimToken,
+      leaseUntilMs,
+      policyVersion,
+      policyHash,
+      requestId,
+    ],
+  );
+  return { attempts, claimToken, leaseUntilMs };
 }
 
 async function expectSequentialEvents(sessionIds: string[]): Promise<void> {
@@ -125,6 +223,7 @@ async function expectFinalNonPurgeState(
   requestId: string,
   sessions: SessionRef[],
   statusBase: string,
+  userId = "u_cluster",
 ): Promise<void> {
   const final = await waitForErasureRow(
     requestId,
@@ -138,6 +237,7 @@ async function expectFinalNonPurgeState(
   const status = await api<ErasureResponse>(
     statusBase,
     `/v1/data-erasure-requests/${requestId}`,
+    { headers: { "x-user-id": userId } },
   );
   expect(status.status).toBe(200);
   expect(status.body).toMatchObject({ id: requestId, status: "awaiting_purge_policy" });
@@ -191,7 +291,9 @@ async function expectFinalNonPurgeState(
   await expectSequentialEvents(ids);
 
   for (const session of sessions) {
-    expect((await api(statusBase, `/v1/sessions/${session.id}`)).status).toBe(404);
+    expect((await api(statusBase, `/v1/sessions/${session.id}`, {
+      headers: { "x-user-id": userId },
+    })).status).toBe(404);
   }
 }
 
@@ -412,4 +514,287 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
     expect(reconciliation).toMatchObject({ status: "verified" });
     expect(Number(reconciliation?.row_count)).toBe(0);
   }, 120_000);
+
+  it("quarantines claim poison without starving its neighbor and resumes only through audited repair", async () => {
+    cluster = await startCluster({
+      ...workerClusterOptions,
+      erasureWorkerEnabledForRunner: (runnerNumber) => runnerNumber !== 2,
+      dataErasureRequestsEnabledForRunner: (runnerNumber) => runnerNumber === 1,
+      runnerEnv: (runnerNumber: number) => ({
+        ERASURE_WORKER_POLL_MS: runnerNumber === 2 ? "300000" : "200",
+      }),
+    });
+    const [workerRunner, lowFrequencyRunner] = cluster.runners;
+    workerRunner!.pause();
+
+    const poisonUser = "u_cluster_poison";
+    const validUser = "u_cluster_valid";
+    const purgingUser = "u_cluster_purging";
+    const poisonAgent = await createAgent(lowFrequencyRunner!.url, poisonUser);
+    const validAgent = await createAgent(lowFrequencyRunner!.url, validUser);
+    const poisonSession = await createSession(
+      lowFrequencyRunner!.url,
+      poisonAgent,
+      undefined,
+      poisonUser,
+    );
+    const validSession = await createSession(
+      lowFrequencyRunner!.url,
+      validAgent,
+      undefined,
+      validUser,
+    );
+
+    // runner-2 deliberately has neither admission nor a worker. Seed the jobs through the same
+    // real MySQL store contract used by runner HTTP after runner-1 is frozen, so no initial poll can
+    // race the controlled poison fixture while ordinary resources still came through runner HTTP.
+    const poisonIdempotency = "cluster-poison-sensitive-idempotency";
+    const seeder = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 1 });
+    let poison: ErasureResponse;
+    let valid: ErasureResponse;
+    let purging: ErasureResponse;
+    try {
+      poison = await seedUserErasure(seeder, poisonIdempotency, poisonUser);
+      valid = await seedUserErasure(seeder, "cluster-valid-neighbor", validUser);
+      purging = await seedUserErasure(seeder, "cluster-seeded-purging", purgingUser);
+    } finally {
+      await seeder.close();
+    }
+    const seededPurging = await seedPolicyActivatedPurging(purging.id);
+
+    // Corrupt only the oldest candidate's main audit. Explicit availability values make candidate
+    // ordering deterministic even if both HTTP requests share the same millisecond timestamp.
+    await queryDb(
+      `UPDATE erasure_requests
+          SET available_at_ms=CASE request_id WHEN ? THEN 1 WHEN ? THEN 2 END
+        WHERE request_id IN (?,?)`,
+      [poison.id, valid.id, poison.id, valid.id],
+    );
+    await queryDb("DELETE FROM erasure_audit_events WHERE request_id=?", [poison.id]);
+    const ordered = await queryDb<{ request_id: string }>(
+      `SELECT request_id FROM erasure_requests
+        WHERE request_id IN (?,?)
+        ORDER BY available_at_ms, request_id`,
+      [poison.id, valid.id],
+    );
+    expect(ordered.map((row) => row.request_id)).toEqual([poison.id, valid.id]);
+    const [missingAudit] = await queryDb<{ total: number }>(
+      "SELECT COUNT(*) total FROM erasure_audit_events WHERE request_id=?",
+      [poison.id],
+    );
+    expect(Number(missingAudit?.total)).toBe(0);
+
+    workerRunner!.resume();
+    const quarantined = await waitForErasureRow(
+      poison.id,
+      (row) => (
+        row.status === "gated"
+        && row.quarantined_at_ms !== null
+        && row.quarantine_reason_code === "audit_chain_invalid"
+      ),
+      "oldest poison is durably quarantined",
+    );
+    expect(Number(quarantined.control_generation)).toBe(1);
+    expect(Number(quarantined.attempts)).toBe(0);
+    expect(Number(quarantined.claimed)).toBe(0);
+    expect(quarantined.available_at_ms).toBeNull();
+    expect(quarantined.lease_until_ms).toBeNull();
+    expect(quarantined.quarantine_evidence_sha256).toMatch(/^[0-9a-f]{64}$/);
+
+    await expectFinalNonPurgeState(
+      valid.id,
+      [validSession],
+      lowFrequencyRunner!.url,
+      validUser,
+    );
+
+    const publicPoison = await api<Record<string, unknown>>(
+      lowFrequencyRunner!.url,
+      `/v1/data-erasure-requests/${poison.id}`,
+      { headers: { "x-user-id": poisonUser } },
+    );
+    expect(publicPoison.status).toBe(200);
+    expect(publicPoison.headers.get("cache-control")).toBe("no-store");
+    expect(publicPoison.body).toMatchObject({ id: poison.id, status: "blocked" });
+    expect(Object.keys(publicPoison.body).sort()).toEqual([
+      "createdAtMs", "generation", "id", "scope", "status", "updatedAtMs", "userId",
+    ]);
+    const publicJson = JSON.stringify(publicPoison.body);
+    expect(publicJson).not.toContain("audit_chain_invalid");
+    expect(publicJson).not.toContain(quarantined.quarantine_evidence_sha256!);
+
+    const firstControlEvents = await queryDb<{
+      control_generation: number;
+      event_type: string;
+      phase: string;
+      reason_code: string;
+      action_code: string | null;
+      actor_key_id: string | null;
+      before_sha256: string;
+      after_sha256: string | null;
+    }>(
+      `SELECT control_generation, event_type, phase, reason_code, action_code,
+              actor_key_id, before_sha256, after_sha256
+         FROM erasure_job_control_events
+        WHERE request_id=? ORDER BY control_event_id`,
+      [poison.id],
+    );
+    expect(firstControlEvents).toEqual([expect.objectContaining({
+      event_type: "erasure_job/quarantined",
+      phase: "gated",
+      reason_code: "audit_chain_invalid",
+      action_code: null,
+      actor_key_id: null,
+      before_sha256: quarantined.quarantine_evidence_sha256,
+      after_sha256: null,
+    })]);
+    expect(Number(firstControlEvents[0]?.control_generation)).toBe(1);
+    expect(JSON.stringify(firstControlEvents)).not.toContain(poisonIdempotency);
+    expect(JSON.stringify(firstControlEvents)).not.toContain(poisonUser);
+
+    // Freeze the original worker and give the replacement a visible probe job. Observing the probe
+    // advance proves the replacement really polled before we assert that active quarantine stayed
+    // unavailable without another attempt or duplicate control event.
+    workerRunner!.pause();
+    const restartSeeder = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 1 });
+    let restartProbe: ErasureResponse;
+    try {
+      restartProbe = await seedUserErasure(
+        restartSeeder,
+        "cluster-restart-worker-probe",
+        "u_cluster_restart_probe",
+      );
+    } finally {
+      await restartSeeder.close();
+    }
+    await cluster.addRunner();
+    await waitForErasureRow(
+      restartProbe.id,
+      (row) => row.status !== "gated" && Number(row.attempts) > 0,
+      "replacement worker completes a visible poll",
+    );
+    const afterNewWorker = await waitForErasureRow(
+      poison.id,
+      (row) => row.quarantined_at_ms !== null,
+      "quarantine remains after a new worker poll",
+    );
+    expect(Number(afterNewWorker.control_generation)).toBe(1);
+    expect(Number(afterNewWorker.attempts)).toBe(0);
+    const [controlCount] = await queryDb<{ total: number }>(
+      "SELECT COUNT(*) total FROM erasure_job_control_events WHERE request_id=?",
+      [poison.id],
+    );
+    expect(Number(controlCount?.total)).toBe(1);
+
+    const maintenance = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 1 });
+    try {
+      const identity = {
+        tenantId: "t_cluster",
+        subjectKind: "user" as const,
+        subjectId: poisonUser,
+        requestId: poison.id,
+        subjectGeneration: 1,
+      };
+      const inspection = await maintenance.inspectErasureJobIntervention(identity);
+      expect(inspection).toMatchObject({
+        requestId: poison.id,
+        phase: "gated",
+        controlGeneration: 1,
+        kind: "quarantine",
+        reasonCode: "audit_chain_invalid",
+        evidenceSha256: quarantined.quarantine_evidence_sha256,
+      });
+      expect(inspection?.allowedActions).toContain("restore_initial_gate_audit");
+      expect(await maintenance.repairAndResumeErasureJob({
+        ...identity,
+        expectedControlGeneration: inspection!.controlGeneration,
+        expectedEvidenceSha256: inspection!.evidenceSha256,
+        actorKeyId: "cluster-maintainer",
+        actionCode: "restore_initial_gate_audit",
+        atMs: Date.now(),
+      })).toBe(true);
+    } finally {
+      await maintenance.close();
+    }
+
+    await expectFinalNonPurgeState(
+      poison.id,
+      [poisonSession],
+      lowFrequencyRunner!.url,
+      poisonUser,
+    );
+    const repairedControlEvents = await queryDb<{
+      control_generation: number;
+      event_type: string;
+      reason_code: string;
+      action_code: string | null;
+      actor_key_id: string | null;
+      before_sha256: string;
+      after_sha256: string | null;
+    }>(
+      `SELECT control_generation, event_type, reason_code, action_code, actor_key_id,
+              before_sha256, after_sha256
+         FROM erasure_job_control_events
+        WHERE request_id=? ORDER BY control_event_id`,
+      [poison.id],
+    );
+    expect(repairedControlEvents).toHaveLength(2);
+    expect(repairedControlEvents[1]).toMatchObject({
+      event_type: "erasure_job/quarantine_repaired",
+      reason_code: "audit_chain_invalid",
+      action_code: "restore_initial_gate_audit",
+      actor_key_id: "cluster-maintainer",
+      before_sha256: quarantined.quarantine_evidence_sha256,
+    });
+    expect(Number(repairedControlEvents[1]?.control_generation)).toBe(2);
+    const controlJson = JSON.stringify(repairedControlEvents);
+    expect(controlJson).not.toContain(poisonIdempotency);
+    expect(controlJson).not.toContain(poisonUser);
+
+    // The ordinary worker neither adopts an old purging claim nor activates any session.purge
+    // intent. Both remain byte-for-byte authority boundaries while other jobs finish.
+    const [purgingAfter] = await queryDb<{
+      status: string;
+      attempts: number;
+      claim_token: string | null;
+      lease_until_ms: number | null;
+      quarantined_at_ms: number | null;
+    }>(
+      `SELECT status, attempts, claim_token, lease_until_ms, quarantined_at_ms
+         FROM erasure_requests WHERE request_id=?`,
+      [purging.id],
+    );
+    expect(purgingAfter).toMatchObject({
+      status: "purging",
+      claim_token: seededPurging.claimToken,
+      quarantined_at_ms: null,
+    });
+    expect(Number(purgingAfter?.attempts)).toBe(seededPurging.attempts);
+    expect(Number(purgingAfter?.lease_until_ms)).toBe(seededPurging.leaseUntilMs);
+    const purgeIntents = await queryDb<{
+      aggregate_id: string;
+      available_at_ms: number | null;
+      attempts: number;
+      claim_token: string | null;
+      lease_until_ms: number | null;
+      completed_at_ms: number | null;
+      dead_lettered_at_ms: number | null;
+    }>(
+      `SELECT aggregate_id, available_at_ms, attempts, claim_token, lease_until_ms,
+              completed_at_ms, dead_lettered_at_ms
+         FROM lifecycle_outbox
+        WHERE topic='session.purge' AND aggregate_id IN (?,?)
+        ORDER BY aggregate_id`,
+      [poisonSession.id, validSession.id],
+    );
+    expect(purgeIntents).toHaveLength(2);
+    expect(purgeIntents.every((intent) => (
+      intent.available_at_ms === null
+      && Number(intent.attempts) === 0
+      && intent.claim_token === null
+      && intent.lease_until_ms === null
+      && intent.completed_at_ms === null
+      && intent.dead_lettered_at_ms === null
+    ))).toBe(true);
+  }, 180_000);
 });

@@ -825,6 +825,8 @@ export type components = {
                 /** @default false */
                 readonly dataErasureRequests?: boolean;
                 readonly dynamicTools: boolean;
+                /** @default [] */
+                readonly erasureJobControl?: readonly "quarantine-v1"[];
                 readonly mcp: readonly ("streamable-http" | "stdio")[];
                 readonly replay: {
                     readonly hotWindowMs: number;

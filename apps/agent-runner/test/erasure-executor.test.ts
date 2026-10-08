@@ -3,6 +3,9 @@ import {
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_ACK_VALUE,
   INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
+  INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
   INTERNAL_ROUTER_TOKEN_HEADER,
 } from "@agent-service/protocol";
 import {
@@ -44,6 +47,22 @@ function responseDouble(status: number, acknowledged = false): ResponseDouble {
   };
 }
 
+function jobControlResponseDouble(status: number, acknowledgment?: string): ResponseDouble {
+  const cancel = vi.fn(async () => {});
+  return {
+    response: {
+      status,
+      headers: new Headers(
+        acknowledgment === undefined
+          ? {}
+          : { [INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER]: acknowledgment },
+      ),
+      body: { cancel },
+    } as unknown as Response,
+    cancel,
+  };
+}
+
 function executor(fetchImpl: typeof globalThis.fetch, requestTimeoutMs = 500): RouterErasureSessionExecutor {
   return new RouterErasureSessionExecutor({
     routerBaseUrl: "http://router.internal:8080/",
@@ -58,6 +77,56 @@ afterEach(() => {
 });
 
 describe("RouterErasureSessionExecutor", () => {
+  it("authorizes claims only from the fixed private readiness ACK", async () => {
+    const doubled = jobControlResponseDouble(204, INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE);
+    const fetchImpl = vi.fn<typeof globalThis.fetch>(async () => doubled.response);
+
+    await expect(executor(fetchImpl).canClaimErasureJobs()).resolves.toBe(true);
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const [input, init] = fetchImpl.mock.calls[0]!;
+    expect(String(input)).toBe(`http://router.internal:8080${INTERNAL_ERASURE_JOB_CONTROL_READY_PATH}`);
+    expect(init?.method).toBe("GET");
+    expect(init?.redirect).toBe("manual");
+    expect(init?.body).toBeUndefined();
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    const headers = new Headers(init?.headers);
+    expect([...headers.entries()]).toEqual([[INTERNAL_ROUTER_TOKEN_HEADER, TOKEN]]);
+    expect(doubled.cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [204, undefined],
+    [204, "wrong-version"],
+    [200, INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE],
+    [302, INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE],
+    [503, INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE],
+  ])("fails the claim probe closed for HTTP %i and ACK %s", async (status, acknowledgment) => {
+    const doubled = jobControlResponseDouble(status as number, acknowledgment as string | undefined);
+    const fetchImpl = vi.fn<typeof globalThis.fetch>(async () => doubled.response);
+
+    await expect(executor(fetchImpl).canClaimErasureJobs()).resolves.toBe(false);
+    expect(doubled.cancel).toHaveBeenCalledOnce();
+  });
+
+  it("bounds claim probes and hides transport failures", async () => {
+    const leaked = `http://router.internal ${TOKEN}`;
+    const rejectedFetch = vi.fn<typeof globalThis.fetch>(async () => {
+      throw new Error(leaked);
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(executor(rejectedFetch).canClaimErasureJobs()).resolves.toBe(false);
+
+    const hangingFetch = vi.fn<typeof globalThis.fetch>((_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    }));
+    await expect(executor(hangingFetch, 100).canClaimErasureJobs()).resolves.toBe(false);
+    expect(warn).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+  });
+
   it("sends only the strict claim envelope for both operations and requires the versioned ACK", async () => {
     const doubled = [responseDouble(204, true), responseDouble(204, true)];
     const responses = [...doubled];

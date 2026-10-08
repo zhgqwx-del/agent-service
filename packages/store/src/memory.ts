@@ -127,16 +127,33 @@ import {
 } from "./usage-lifecycle.js";
 import {
   ErasureIdempotencyMismatchError,
+  ErasureJobIntegrityFault,
   SubjectDeletingError,
+  assertErasureClaimToken,
+  classifyErasureJobRecordFault,
+  deriveBlockedErasureResumePhase,
+  erasureJobAllowedMaintenanceActions,
   erasureJobClaimFromRecord,
   erasureJobAuthorizationMatches,
+  erasureJobControlOutcomeSha256,
+  erasureJobInterventionEvidenceSha256,
+  erasureJobTerminalInterventionEvidenceSha256,
+  erasureJobUnsafeQuarantineEnvelopeEvidenceSha256,
   erasureWriteAuthorizationMatches,
+  hasSafeErasureRequestQuarantineEnvelope,
+  isErasureJobQuarantined,
   isClaimableErasureRequestStatus,
+  newErasureJobIntegrityFault,
   subjectLifecycleKey,
   validateClaimErasureJobsOptions,
   validateErasureJobAuthorization,
   validateErasureAuditChain,
+  validateErasureJobControlAudit,
+  validateErasureJobControlEvent,
+  validateErasureJobMaintenanceIdentity,
   validateErasureRequestRecord,
+  validateErasureRequestRecordForRead,
+  validateRepairAndResumeErasureJobInput,
   validateRequestUserErasureInput,
   validateRenewErasureJobClaimOptions,
   validateRetryErasureJobOptions,
@@ -144,13 +161,21 @@ import {
   type ClaimErasureJobsOptions,
   type DataSubjectKind,
   type ErasureAuditEvent,
+  type ErasureJobControlEvent,
+  type ErasureJobTerminalIncident,
+  type ErasureJobUnsafeQuarantineEnvelope,
   type ErasureJobAuthorization,
   type ErasureJobClaim,
+  type ErasureJobMaintenanceIdentity,
+  type ErasureJobMaintenanceStore,
   type ErasureJobStore,
+  type ErasureJobQuarantineReasonCode,
+  type ErasureJobInterventionInspection,
   type ErasureRequestRecord,
   type ErasureRequestStatus,
   type ErasureWriteAuthorization,
   type RequestUserErasureInput,
+  type RepairAndResumeErasureJobInput,
   type RetryErasureJobOptions,
   type RenewErasureJobClaimOptions,
   type SubjectLifecycleRecord,
@@ -181,6 +206,18 @@ import {
 } from "./erasure-usage.js";
 
 const clone = <T>(v: T): T => structuredClone(v);
+
+function restoreMapEntry<K, V>(
+  map: Map<K, V>,
+  key: K,
+  existed: boolean,
+  previous: V | undefined,
+): void {
+  // Call the intrinsic methods so fault-injection wrappers on an instance's `set` cannot prevent
+  // rollback of an otherwise durable-looking multi-map publication.
+  if (existed) Map.prototype.set.call(map, key, previous as V);
+  else Map.prototype.delete.call(map, key);
+}
 
 function paginate<T>(rows: T[], key: (r: T) => string, cursor: string | undefined, limit: number, dir: "asc" | "desc"): Page<T> {
   const sorted = [...rows].sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
@@ -218,7 +255,7 @@ function validateUploadedBlobInput(input: MarkBlobUploadedInput): void {
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore {
   agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -240,6 +277,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   subjectLifecycles = new Map<string, SubjectLifecycleRecord>();
   erasureRequests = new Map<string, ErasureRequestRecord>();
   erasureAuditEvents = new Map<string, ErasureAuditEvent[]>();
+  erasureJobControlEvents = new Map<string, ErasureJobControlEvent[]>();
+  private nextErasureJobControlEventId = 1;
+  erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
+  private nextErasureJobTerminalIncidentId = 1;
   private erasureIdempotency = new Map<string, string>();
 
   private subjectRecord(
@@ -337,6 +378,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (replayId) {
       const replay = this.erasureRequests.get(replayId);
       if (!replay) throw new Error("erasure idempotency index is corrupt");
+      if (
+        replay.tenantId !== input.tenantId
+        || replay.subjectKind !== "user"
+        || replay.subjectId !== input.userId
+        || replay.idempotencyKey !== input.idempotencyKey
+      ) throw new Error("erasure idempotency index is corrupt");
+      validateErasureRequestRecordForRead(replay);
       if (replay.requestHash !== input.requestHash) throw new ErasureIdempotencyMismatchError();
       return clone(replay);
     }
@@ -348,6 +396,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         ? this.erasureRequests.get(existingUser.activeRequestId)
         : undefined;
       if (!active) throw new SubjectDeletingError(input.tenantId, input.userId);
+      if (
+        active.tenantId !== input.tenantId
+        || active.subjectKind !== "user"
+        || active.subjectId !== input.userId
+        || active.generation !== existingUser.generation
+      ) throw new Error("subject lifecycle active request is corrupt");
+      validateErasureRequestRecordForRead(active);
       return clone(active);
     }
     if (this.erasureRequests.has(input.requestId)) {
@@ -384,6 +439,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       updatedAtMs: input.atMs,
       availableAtMs: input.atMs,
       attempts: 0,
+      controlGeneration: 0,
     });
     const stagedAudit = clone<ErasureAuditEvent>({
       requestId: input.requestId,
@@ -393,16 +449,31 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       emittedAtMs: input.atMs,
     });
 
-    if (stagedTenant) {
-      this.subjectLifecycles.set(
-        subjectLifecycleKey(input.tenantId, "tenant", input.tenantId),
-        stagedTenant,
-      );
+    const tenantKey = subjectLifecycleKey(input.tenantId, "tenant", input.tenantId);
+    const tenantExisted = this.subjectLifecycles.has(tenantKey);
+    const priorTenant = this.subjectLifecycles.get(tenantKey);
+    const userExisted = this.subjectLifecycles.has(userKey);
+    const priorUser = this.subjectLifecycles.get(userKey);
+    const requestExisted = this.erasureRequests.has(input.requestId);
+    const priorRequest = this.erasureRequests.get(input.requestId);
+    const auditExisted = this.erasureAuditEvents.has(input.requestId);
+    const priorAudit = this.erasureAuditEvents.get(input.requestId);
+    const idempotencyExisted = this.erasureIdempotency.has(idempotencyKey);
+    const priorIdempotency = this.erasureIdempotency.get(idempotencyKey);
+    try {
+      if (stagedTenant) this.subjectLifecycles.set(tenantKey, stagedTenant);
+      this.subjectLifecycles.set(userKey, stagedUser);
+      this.erasureRequests.set(input.requestId, stagedRequest);
+      this.erasureAuditEvents.set(input.requestId, [stagedAudit]);
+      this.erasureIdempotency.set(idempotencyKey, input.requestId);
+    } catch (error) {
+      restoreMapEntry(this.erasureIdempotency, idempotencyKey, idempotencyExisted, priorIdempotency);
+      restoreMapEntry(this.erasureAuditEvents, input.requestId, auditExisted, priorAudit);
+      restoreMapEntry(this.erasureRequests, input.requestId, requestExisted, priorRequest);
+      restoreMapEntry(this.subjectLifecycles, userKey, userExisted, priorUser);
+      restoreMapEntry(this.subjectLifecycles, tenantKey, tenantExisted, priorTenant);
+      throw error;
     }
-    this.subjectLifecycles.set(userKey, stagedUser);
-    this.erasureRequests.set(input.requestId, stagedRequest);
-    this.erasureAuditEvents.set(input.requestId, [stagedAudit]);
-    this.erasureIdempotency.set(idempotencyKey, input.requestId);
     return clone(stagedRequest);
   }
 
@@ -412,12 +483,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     requestId: string,
   ): Promise<ErasureRequestRecord | null> {
     const request = this.erasureRequests.get(requestId);
-    return request
-      && request.tenantId === tenantId
-      && request.subjectKind === "user"
-      && request.subjectId === userId
-      ? clone(request)
-      : null;
+    if (
+      !request
+      || request.tenantId !== tenantId
+      || request.subjectKind !== "user"
+      || request.subjectId !== userId
+    ) return null;
+    validateErasureRequestRecordForRead(request);
+    return clone(request);
   }
 
   async getSubjectLifecycle(
@@ -434,55 +507,339 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   private assertErasureJobIntegrity(record: ErasureRequestRecord): SubjectLifecycleRecord {
-    validateErasureRequestRecord(record);
+    const rowFault = classifyErasureJobRecordFault(record);
+    const audits = this.erasureAuditEvents.get(record.requestId);
+    const quarantineMarkerCount = [
+      record.quarantinedAtMs,
+      record.quarantineReasonCode,
+      record.quarantineEvidenceSha256,
+    ].filter((value) => value !== undefined).length;
+    const controlRecord = rowFault?.reasonCode === "queue_control_invalid"
+      && quarantineMarkerCount > 0
+      && quarantineMarkerCount < 3
+      ? (() => {
+          const normalized = clone(record);
+          delete normalized.quarantinedAtMs;
+          delete normalized.quarantineReasonCode;
+          delete normalized.quarantineEvidenceSha256;
+          return normalized;
+        })()
+      : record;
+    try {
+      validateErasureJobControlAudit(
+        controlRecord,
+        audits ?? [],
+        this.erasureJobControlEvents.get(record.requestId) ?? [],
+      );
+    } catch {
+      throw newErasureJobIntegrityFault(record, "control_audit_invalid");
+    }
+    if (rowFault) throw rowFault;
+    const tenant = this.subjectRecord(record.tenantId, "tenant", record.tenantId);
     const subject = this.subjectRecord(record.tenantId, record.subjectKind, record.subjectId);
     if (
-      !subject
+      !tenant
+      || (record.subjectKind === "user" && tenant.state !== "active")
+      || !subject
       || subject.state !== "deleting"
       || subject.generation !== record.generation
       || subject.activeRequestId !== record.requestId
-    ) throw new Error("erasure request does not match its active subject lifecycle");
-    const audits = this.erasureAuditEvents.get(record.requestId);
-    if (!audits) throw new Error("erasure request audit chain is corrupt");
-    validateErasureAuditChain(record, audits);
+    ) throw newErasureJobIntegrityFault(record, "subject_binding_invalid");
+    if (!audits) throw newErasureJobIntegrityFault(record, "audit_chain_invalid");
+    try {
+      validateErasureAuditChain(record, audits);
+    } catch {
+      throw newErasureJobIntegrityFault(record, "audit_chain_invalid");
+    }
     if (record.subjectKind === "user") {
       const key = JSON.stringify([record.tenantId, "user", record.subjectId, record.idempotencyKey]);
       if (this.erasureIdempotency.get(key) !== record.requestId) {
-        throw new Error("erasure request idempotency index is corrupt");
+        throw newErasureJobIntegrityFault(record, "idempotency_binding_invalid");
       }
     }
     return subject;
   }
 
+  private erasureJobParentAllowsAuthority(record: ErasureRequestRecord): boolean {
+    if (record.subjectKind === "tenant") return true;
+    return this.subjectRecord(record.tenantId, "tenant", record.tenantId)?.state === "active";
+  }
+
+  private erasureJobNeedsImmediateQueueIsolation(record: ErasureRequestRecord): boolean {
+    const quarantineMarkerCount = [
+      record.quarantinedAtMs,
+      record.quarantineReasonCode,
+      record.quarantineEvidenceSha256,
+    ].filter((value) => value !== undefined).length;
+    if (quarantineMarkerCount > 0 && quarantineMarkerCount < 3) return true;
+    if (record.controlGeneration === Number.MAX_SAFE_INTEGER) return true;
+    if (
+      record.availableAtMs === undefined
+      || !Number.isSafeInteger(record.availableAtMs)
+      || record.availableAtMs < 0
+    ) return true;
+    if ((record.claimToken === undefined) !== (record.leaseUntilMs === undefined)) return true;
+    try {
+      if (record.claimToken !== undefined) assertErasureClaimToken(record.claimToken);
+    } catch {
+      return true;
+    }
+    return record.leaseUntilMs !== undefined
+      && (!Number.isSafeInteger(record.leaseUntilMs) || record.leaseUntilMs < 0);
+  }
+
+  private quarantineErasureJob(
+    requestKey: string,
+    current: ErasureRequestRecord,
+    fault: ErasureJobIntegrityFault,
+    atMs: number,
+  ): void {
+    if (!isClaimableErasureRequestStatus(current.status) || isErasureJobQuarantined(current)) {
+      throw new Error("erasure job is not safely quarantineable");
+    }
+    if (
+      requestKey !== current.requestId
+      || !hasSafeErasureRequestQuarantineEnvelope(current)
+    ) {
+      this.terminallyIsolateUnsafeErasureJobEnvelope(requestKey, current, atMs);
+      return;
+    }
+    const occupiedSafeGenerations = new Set(
+      (this.erasureJobControlEvents.get(current.requestId) ?? [])
+        .map((event) => event.controlGeneration)
+        .filter((generation) => Number.isSafeInteger(generation) && generation > 0),
+    );
+    let controlGeneration = current.controlGeneration + 1;
+    while (Number.isSafeInteger(controlGeneration) && occupiedSafeGenerations.has(controlGeneration)) {
+      controlGeneration += 1;
+    }
+    if (!Number.isSafeInteger(controlGeneration) || controlGeneration <= 0) {
+      this.terminallyQuarantineErasureJob(current, atMs);
+      return;
+    }
+    const evidenceSha256 = erasureJobInterventionEvidenceSha256({
+      requestId: current.requestId,
+      controlGeneration,
+      phase: current.status,
+      kind: "quarantine",
+      reasonCode: fault.reasonCode,
+    });
+    const effectiveAtMs = Math.max(current.updatedAtMs, atMs);
+    const next = clone(current);
+    next.controlGeneration = controlGeneration;
+    next.quarantinedAtMs = effectiveAtMs;
+    next.quarantineReasonCode = fault.reasonCode;
+    next.quarantineEvidenceSha256 = evidenceSha256;
+    next.updatedAtMs = effectiveAtMs;
+    delete next.availableAtMs;
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+
+    const event = clone<ErasureJobControlEvent>({
+      controlEventId: this.nextErasureJobControlEventId,
+      requestId: current.requestId,
+      controlGeneration,
+      eventType: "erasure_job/quarantined",
+      phase: current.status,
+      reasonCode: fault.reasonCode,
+      beforeSha256: evidenceSha256,
+      emittedAtMs: effectiveAtMs,
+    });
+    validateErasureJobControlEvent(event);
+    const stagedEvents = [...(this.erasureJobControlEvents.get(current.requestId) ?? []), event];
+    this.publishErasureControlState(next, undefined, stagedEvents);
+    this.nextErasureJobControlEventId += 1;
+  }
+
+  private terminallyIsolateUnsafeErasureJobEnvelope(
+    requestKey: string,
+    current: ErasureRequestRecord,
+    atMs: number,
+  ): void {
+    if (!isClaimableErasureRequestStatus(current.status) || isErasureJobQuarantined(current)) {
+      throw new Error("erasure job is not terminally isolatable");
+    }
+    if (this.erasureJobTerminalIncidents.has(requestKey)) {
+      throw new Error("erasure terminal incident identity already exists");
+    }
+    if (
+      !Number.isSafeInteger(this.nextErasureJobTerminalIncidentId)
+      || this.nextErasureJobTerminalIncidentId <= 0
+    ) throw new Error("erasure terminal incident sequence is exhausted");
+
+    const rawEnvelope: ErasureJobUnsafeQuarantineEnvelope = {
+      // The map key is Memory's durable primary key. A forged record.requestId must not cause the
+      // poison row to be published under a second key while the original remains claimable.
+      locatorRequestId: requestKey,
+      requestId: String(current.requestId),
+      tenantId: String(current.tenantId),
+      subjectKind: String(current.subjectKind),
+      subjectId: String(current.subjectId),
+      rawGeneration: String(current.generation),
+      status: String(current.status),
+      rawCreatedAtMs: String(current.createdAtMs),
+      rawGatedAtMs: String(current.gatedAtMs),
+      rawUpdatedAtMs: String(current.updatedAtMs),
+      rawControlGeneration: String(current.controlGeneration),
+    };
+    const evidenceSha256 = erasureJobUnsafeQuarantineEnvelopeEvidenceSha256(rawEnvelope);
+    const next = clone(current);
+    // The incident, not a fabricated control event/fence, is the terminal audit. Preserve the raw
+    // fence exactly so isolation never hides or moves durable corruption in either direction.
+    next.controlGeneration = current.controlGeneration;
+    next.quarantinedAtMs = atMs;
+    next.quarantineReasonCode = "control_audit_invalid";
+    next.quarantineEvidenceSha256 = evidenceSha256;
+    delete next.availableAtMs;
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+
+    const incident = clone<ErasureJobTerminalIncident>({
+      terminalIncidentId: this.nextErasureJobTerminalIncidentId,
+      requestId: requestKey,
+      rawControlGeneration: rawEnvelope.rawControlGeneration,
+      reasonCode: "unsafe_quarantine_envelope",
+      evidenceSha256,
+      emittedAtMs: atMs,
+    });
+    const requestExisted = this.erasureRequests.has(requestKey);
+    const priorRequest = this.erasureRequests.get(requestKey);
+    const incidentExisted = this.erasureJobTerminalIncidents.has(requestKey);
+    const priorIncident = this.erasureJobTerminalIncidents.get(requestKey);
+    try {
+      this.erasureRequests.set(requestKey, next);
+      this.erasureJobTerminalIncidents.set(requestKey, incident);
+    } catch (error) {
+      restoreMapEntry(this.erasureRequests, requestKey, requestExisted, priorRequest);
+      restoreMapEntry(
+        this.erasureJobTerminalIncidents,
+        requestKey,
+        incidentExisted,
+        priorIncident,
+      );
+      throw error;
+    }
+    this.nextErasureJobTerminalIncidentId += 1;
+  }
+
+  /**
+   * Exhausting the safe-integer fence is an unrecoverable control-plane fault. Preserve the
+   * monotonic fence at MAX_SAFE, clear every worker credential, and deliberately emit no control
+   * event because no distinct representable generation remains for one.
+   */
+  private terminallyQuarantineErasureJob(
+    current: ErasureRequestRecord,
+    atMs: number,
+  ): void {
+    const controlGeneration = Number.MAX_SAFE_INTEGER;
+    if (current.controlGeneration > controlGeneration) {
+      throw new Error("erasure request control generation cannot be represented safely");
+    }
+    const effectiveAtMs = Math.max(current.updatedAtMs, atMs);
+    const next = clone(current);
+    next.controlGeneration = controlGeneration;
+    next.quarantinedAtMs = effectiveAtMs;
+    next.quarantineReasonCode = "control_audit_invalid";
+    next.quarantineEvidenceSha256 = erasureJobTerminalInterventionEvidenceSha256({
+      requestId: current.requestId,
+      rawControlGeneration: String(controlGeneration),
+      phase: current.status,
+      reasonCode: "control_audit_invalid",
+    });
+    next.updatedAtMs = effectiveAtMs;
+    delete next.availableAtMs;
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+    this.publishErasureControlState(
+      next,
+      undefined,
+      this.erasureJobControlEvents.get(current.requestId) ?? [],
+    );
+  }
+
+  private publishErasureControlState(
+    next: ErasureRequestRecord,
+    audits: ErasureAuditEvent[] | undefined,
+    controls: ErasureJobControlEvent[],
+  ): void {
+    const requestExisted = this.erasureRequests.has(next.requestId);
+    const priorRequest = this.erasureRequests.get(next.requestId);
+    const auditsExisted = this.erasureAuditEvents.has(next.requestId);
+    const priorAudits = this.erasureAuditEvents.get(next.requestId);
+    const controlsExisted = this.erasureJobControlEvents.has(next.requestId);
+    const priorControls = this.erasureJobControlEvents.get(next.requestId);
+    try {
+      this.erasureRequests.set(next.requestId, next);
+      if (audits !== undefined) this.erasureAuditEvents.set(next.requestId, audits);
+      this.erasureJobControlEvents.set(next.requestId, controls);
+    } catch (error) {
+      restoreMapEntry(this.erasureRequests, next.requestId, requestExisted, priorRequest);
+      restoreMapEntry(this.erasureAuditEvents, next.requestId, auditsExisted, priorAudits);
+      restoreMapEntry(this.erasureJobControlEvents, next.requestId, controlsExisted, priorControls);
+      throw error;
+    }
+  }
+
   async claimErasureJobs(options: ClaimErasureJobsOptions): Promise<ErasureJobClaim[]> {
     const leaseUntilMs = validateClaimErasureJobsOptions(options);
-    const candidates = [...this.erasureRequests.values()]
-      .filter((record) => (
+    const candidates = [...this.erasureRequests.entries()]
+      .filter(([, record]) => (
         isClaimableErasureRequestStatus(record.status)
-        && record.availableAtMs !== undefined
-        && record.availableAtMs <= options.nowMs
-        && (record.claimToken === undefined
-          || (record.leaseUntilMs !== undefined && record.leaseUntilMs <= options.nowMs))
+        && !isErasureJobQuarantined(record)
+        && (
+          this.erasureJobNeedsImmediateQueueIsolation(record)
+          || (
+            record.availableAtMs! <= options.nowMs
+            && (
+              record.claimToken === undefined
+              || record.leaseUntilMs! <= options.nowMs
+            )
+          )
+        )
       ))
       .sort((left, right) => (
-        left.availableAtMs! - right.availableAtMs!
-        || left.requestId.localeCompare(right.requestId)
+        (Number.isSafeInteger(left[1].availableAtMs) ? left[1].availableAtMs! : -1)
+        - (Number.isSafeInteger(right[1].availableAtMs) ? right[1].availableAtMs! : -1)
+        || left[0].localeCompare(right[0])
       ))
+      // A poisoned row consumes scan budget but is durably removed from subsequent polls. This
+      // keeps one invocation bounded while guaranteeing that its next neighbour is reachable.
       .slice(0, options.limit);
-    const staged = new Map<string, ErasureRequestRecord>();
-    for (const current of candidates) {
-      this.assertErasureJobIntegrity(current);
-      const next = clone<ErasureRequestRecord>({
-        ...current,
-        attempts: current.attempts + 1,
-        claimToken: options.claimToken,
-        leaseUntilMs,
-      });
-      validateErasureRequestRecord(next);
-      staged.set(next.requestId, next);
+    const claimed: ErasureRequestRecord[] = [];
+    for (const [requestKey, current] of candidates) {
+      if (claimed.length >= options.limit) break;
+      try {
+        if (
+          requestKey !== current.requestId
+          || !hasSafeErasureRequestQuarantineEnvelope(current)
+        ) {
+          this.terminallyIsolateUnsafeErasureJobEnvelope(requestKey, current, options.nowMs);
+          continue;
+        }
+        try {
+          this.assertErasureJobIntegrity(current);
+        } catch (error) {
+          if (!(error instanceof ErasureJobIntegrityFault)) throw error;
+          this.quarantineErasureJob(requestKey, current, error, options.nowMs);
+          continue;
+        }
+        const next = clone<ErasureRequestRecord>({
+          ...current,
+          attempts: current.attempts + 1,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+        });
+        validateErasureRequestRecord(next);
+        this.erasureRequests.set(next.requestId, next);
+        claimed.push(next);
+      } catch (error) {
+        // Claims are committed per row in Memory just as they are per transaction in MySQL.
+        // Once one is visible, do not turn a later unknown failure into a hidden successful lease.
+        if (claimed.length > 0) break;
+        throw error;
+      }
     }
-    for (const [requestId, record] of staged) this.erasureRequests.set(requestId, record);
-    return [...staged.values()].map((record) => clone(erasureJobClaimFromRecord(record)));
+    return claimed.map((record) => clone(erasureJobClaimFromRecord(record)));
   }
 
   async renewErasureJobClaim(
@@ -493,6 +850,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const leaseUntilMs = validateRenewErasureJobClaimOptions(options);
     const current = this.erasureRequests.get(authorization.requestId);
     if (!current) return false;
+    if (!this.erasureJobParentAllowsAuthority(current)) return false;
     this.assertErasureJobIntegrity(current);
     if (!erasureJobAuthorizationMatches(current, authorization, options.nowMs)) return false;
     const next = clone(current);
@@ -510,6 +868,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateTransitionErasureJobOptions(options);
     const current = this.erasureRequests.get(authorization.requestId);
     if (!current) return false;
+    if (!this.erasureJobParentAllowsAuthority(current)) return false;
     const subject = this.assertErasureJobIntegrity(current);
     if (
       current.status !== options.fromStatus
@@ -583,13 +942,24 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       delete nextSubject.activeRequestId;
     }
 
-    this.erasureRequests.set(next.requestId, next);
-    this.erasureAuditEvents.set(next.requestId, stagedAudits);
-    if (nextSubject) {
-      this.subjectLifecycles.set(
-        subjectLifecycleKey(nextSubject.tenantId, nextSubject.subjectKind, nextSubject.subjectId),
-        nextSubject,
-      );
+    const subjectKey = nextSubject
+      ? subjectLifecycleKey(nextSubject.tenantId, nextSubject.subjectKind, nextSubject.subjectId)
+      : undefined;
+    const requestExisted = this.erasureRequests.has(next.requestId);
+    const priorRequest = this.erasureRequests.get(next.requestId);
+    const auditExisted = this.erasureAuditEvents.has(next.requestId);
+    const priorAudits = this.erasureAuditEvents.get(next.requestId);
+    const subjectExisted = subjectKey === undefined ? false : this.subjectLifecycles.has(subjectKey);
+    const priorSubject = subjectKey === undefined ? undefined : this.subjectLifecycles.get(subjectKey);
+    try {
+      this.erasureRequests.set(next.requestId, next);
+      this.erasureAuditEvents.set(next.requestId, stagedAudits);
+      if (nextSubject && subjectKey) this.subjectLifecycles.set(subjectKey, nextSubject);
+    } catch (error) {
+      if (subjectKey) restoreMapEntry(this.subjectLifecycles, subjectKey, subjectExisted, priorSubject);
+      restoreMapEntry(this.erasureAuditEvents, next.requestId, auditExisted, priorAudits);
+      restoreMapEntry(this.erasureRequests, next.requestId, requestExisted, priorRequest);
+      throw error;
     }
     return true;
   }
@@ -602,6 +972,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateRetryErasureJobOptions(options);
     const current = this.erasureRequests.get(authorization.requestId);
     if (!current) return false;
+    if (!this.erasureJobParentAllowsAuthority(current)) return false;
     this.assertErasureJobIntegrity(current);
     if (!erasureJobAuthorizationMatches(current, authorization, options.failedAtMs)) return false;
     const next = clone(current);
@@ -612,6 +983,272 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     delete next.leaseUntilMs;
     validateErasureRequestRecord(next);
     this.erasureRequests.set(next.requestId, next);
+    return true;
+  }
+
+  private erasureMaintenanceRecord(
+    identity: ErasureJobMaintenanceIdentity,
+  ): ErasureRequestRecord | undefined {
+    const record = this.erasureRequests.get(identity.requestId);
+    return record
+      && record.tenantId === identity.tenantId
+      && record.subjectKind === identity.subjectKind
+      && record.subjectId === identity.subjectId
+      && record.generation === identity.subjectGeneration
+      ? record
+      : undefined;
+  }
+
+  async inspectErasureJobIntervention(
+    identity: ErasureJobMaintenanceIdentity,
+  ): Promise<ErasureJobInterventionInspection | null> {
+    validateErasureJobMaintenanceIdentity(identity);
+    const record = this.erasureMaintenanceRecord(identity);
+    if (!record) return null;
+    validateErasureRequestRecordForRead(record);
+    const audits = this.erasureAuditEvents.get(record.requestId) ?? [];
+    if (isErasureJobQuarantined(record)) {
+      try {
+        validateErasureJobControlAudit(
+          record,
+          audits,
+          this.erasureJobControlEvents.get(record.requestId) ?? [],
+        );
+      } catch (error) {
+        if (record.quarantineReasonCode !== "control_audit_invalid") throw error;
+      }
+      const reasonCode = record.quarantineReasonCode!;
+      const evidenceSha256 = record.quarantineEvidenceSha256!;
+      const expected = erasureJobInterventionEvidenceSha256({
+        requestId: record.requestId,
+        controlGeneration: record.controlGeneration,
+        phase: record.status,
+        kind: "quarantine",
+        reasonCode,
+      });
+      const terminalExpected = record.controlGeneration === Number.MAX_SAFE_INTEGER
+        && reasonCode === "control_audit_invalid"
+        ? erasureJobTerminalInterventionEvidenceSha256({
+            requestId: record.requestId,
+            rawControlGeneration: String(record.controlGeneration),
+            phase: record.status,
+            reasonCode,
+          })
+        : undefined;
+      if (expected !== evidenceSha256 && terminalExpected !== evidenceSha256) {
+        throw new Error("erasure quarantine evidence is corrupt");
+      }
+      return clone({
+        requestId: record.requestId,
+        phase: record.status,
+        controlGeneration: record.controlGeneration,
+        kind: "quarantine",
+        reasonCode,
+        evidenceSha256,
+        occurredAtMs: record.quarantinedAtMs!,
+        allowedActions: erasureJobAllowedMaintenanceActions(record, audits),
+      });
+    }
+    if (record.status !== "blocked") return null;
+    this.assertErasureJobIntegrity(record);
+    const reasonCode = record.lastErrorCode!;
+    const evidenceSha256 = erasureJobInterventionEvidenceSha256({
+      requestId: record.requestId,
+      controlGeneration: record.controlGeneration,
+      phase: record.status,
+      kind: "blocked",
+      reasonCode,
+    });
+    const allowedActions = erasureJobAllowedMaintenanceActions(record, audits);
+    let resumePhase: ErasureJobInterventionInspection["resumePhase"];
+    if (allowedActions.includes("resume_blocked")) {
+      resumePhase = deriveBlockedErasureResumePhase(record, audits);
+    }
+    return clone({
+      requestId: record.requestId,
+      phase: record.status,
+      controlGeneration: record.controlGeneration,
+      kind: "blocked",
+      reasonCode,
+      evidenceSha256,
+      occurredAtMs: audits.at(-1)!.emittedAtMs,
+      ...(resumePhase === undefined ? {} : { resumePhase }),
+      allowedActions,
+    });
+  }
+
+  async repairAndResumeErasureJob(input: RepairAndResumeErasureJobInput): Promise<boolean> {
+    validateRepairAndResumeErasureJobInput(input);
+    const current = this.erasureMaintenanceRecord(input);
+    if (!current || current.controlGeneration !== input.expectedControlGeneration) return false;
+    validateErasureRequestRecordForRead(current);
+
+    if (isErasureJobQuarantined(current)) {
+      const verifiedEvidenceSha256 = erasureJobInterventionEvidenceSha256({
+        requestId: current.requestId,
+        controlGeneration: current.controlGeneration,
+        phase: current.status,
+        kind: "quarantine",
+        reasonCode: current.quarantineReasonCode!,
+      });
+      if (
+        current.quarantineEvidenceSha256 !== verifiedEvidenceSha256
+        || input.expectedEvidenceSha256 !== verifiedEvidenceSha256
+        || input.actionCode === "resume_blocked"
+      ) return false;
+      const currentAudits = this.erasureAuditEvents.get(current.requestId) ?? [];
+      const allowedActions = erasureJobAllowedMaintenanceActions(current, currentAudits);
+      if (!allowedActions.includes(input.actionCode)) return false;
+      validateErasureJobControlAudit(
+        current,
+        currentAudits,
+        this.erasureJobControlEvents.get(current.requestId) ?? [],
+      );
+
+      const effectiveAtMs = Math.max(current.updatedAtMs, input.atMs);
+      const next = clone(current);
+      next.controlGeneration = current.controlGeneration + 1;
+      next.updatedAtMs = effectiveAtMs;
+      next.availableAtMs = effectiveAtMs;
+      delete next.claimToken;
+      delete next.leaseUntilMs;
+      delete next.quarantinedAtMs;
+      delete next.quarantineReasonCode;
+      delete next.quarantineEvidenceSha256;
+
+      let stagedAudits: ErasureAuditEvent[];
+      if (input.actionCode === "restore_initial_gate_audit") {
+        if (current.status !== "gated" || currentAudits.length !== 0) return false;
+        stagedAudits = [clone({
+          requestId: current.requestId,
+          seq: 1,
+          type: "erasure/gated",
+          payload: {
+            status: "gated",
+            subjectKind: current.subjectKind,
+            generation: current.generation,
+          },
+          emittedAtMs: current.gatedAtMs,
+        })];
+      } else {
+        stagedAudits = clone(currentAudits);
+      }
+
+      validateErasureRequestRecord(next);
+      validateErasureAuditChain(next, stagedAudits);
+      const tenant = this.subjectRecord(next.tenantId, "tenant", next.tenantId);
+      const subject = this.subjectRecord(next.tenantId, next.subjectKind, next.subjectId);
+      if (
+        !tenant
+        || (next.subjectKind === "user" && tenant.state !== "active")
+        || !subject
+        || subject.state !== "deleting"
+        || subject.generation !== next.generation
+        || subject.activeRequestId !== next.requestId
+      ) throw new Error("repaired erasure request does not match its subject lifecycle");
+      if (next.subjectKind === "user") {
+        const key = JSON.stringify([next.tenantId, "user", next.subjectId, next.idempotencyKey]);
+        if (this.erasureIdempotency.get(key) !== next.requestId) {
+          throw new Error("repaired erasure request idempotency binding is invalid");
+        }
+      }
+
+      const eventWithoutAfter = {
+        controlEventId: this.nextErasureJobControlEventId,
+        requestId: next.requestId,
+        controlGeneration: next.controlGeneration,
+        eventType: "erasure_job/quarantine_repaired",
+        phase: next.status,
+        reasonCode: current.quarantineReasonCode!,
+        actionCode: input.actionCode,
+        actorKeyId: input.actorKeyId,
+        beforeSha256: verifiedEvidenceSha256,
+        emittedAtMs: effectiveAtMs,
+      } satisfies Omit<ErasureJobControlEvent, "afterSha256">;
+      const event = clone<ErasureJobControlEvent>({
+        ...eventWithoutAfter,
+        afterSha256: erasureJobControlOutcomeSha256(eventWithoutAfter),
+      });
+      validateErasureJobControlEvent(event);
+      const stagedControlEvents = [
+        ...(this.erasureJobControlEvents.get(current.requestId) ?? []),
+        event,
+      ];
+      validateErasureJobControlAudit(next, stagedAudits, stagedControlEvents);
+
+      this.publishErasureControlState(next, stagedAudits, stagedControlEvents);
+      this.nextErasureJobControlEventId += 1;
+      return true;
+    }
+
+    if (current.status !== "blocked" || input.actionCode !== "resume_blocked") return false;
+    const currentAudits = this.erasureAuditEvents.get(current.requestId) ?? [];
+    this.assertErasureJobIntegrity(current);
+    const reasonCode = current.lastErrorCode!;
+    const evidenceSha256 = erasureJobInterventionEvidenceSha256({
+      requestId: current.requestId,
+      controlGeneration: current.controlGeneration,
+      phase: current.status,
+      kind: "blocked",
+      reasonCode,
+    });
+    if (evidenceSha256 !== input.expectedEvidenceSha256) return false;
+    if (!erasureJobAllowedMaintenanceActions(current, currentAudits).includes("resume_blocked")) {
+      return false;
+    }
+    const resumePhase = deriveBlockedErasureResumePhase(current, currentAudits);
+    const effectiveAtMs = Math.max(current.updatedAtMs, input.atMs);
+    const next = clone(current);
+    next.status = resumePhase;
+    next.controlGeneration = current.controlGeneration + 1;
+    next.updatedAtMs = effectiveAtMs;
+    next.availableAtMs = effectiveAtMs;
+    delete next.lastErrorCode;
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+    validateErasureRequestRecord(next);
+
+    const stagedAudits = clone(currentAudits);
+    stagedAudits.push(clone({
+      requestId: current.requestId,
+      seq: stagedAudits.length + 1,
+      type: "erasure/resumed",
+      payload: {
+        fromStatus: "blocked",
+        status: resumePhase,
+        generation: current.generation,
+        ...(next.policyVersion === undefined ? {} : { policyVersion: next.policyVersion }),
+        ...(next.policyHash === undefined ? {} : { policyHash: next.policyHash }),
+      },
+      emittedAtMs: effectiveAtMs,
+    }));
+    validateErasureAuditChain(next, stagedAudits);
+
+    const eventWithoutAfter = {
+      controlEventId: this.nextErasureJobControlEventId,
+      requestId: next.requestId,
+      controlGeneration: next.controlGeneration,
+      eventType: "erasure_job/blocked_resumed",
+      phase: resumePhase,
+      reasonCode,
+      actionCode: "resume_blocked",
+      actorKeyId: input.actorKeyId,
+      beforeSha256: evidenceSha256,
+      emittedAtMs: effectiveAtMs,
+    } satisfies Omit<ErasureJobControlEvent, "afterSha256">;
+    const event = clone<ErasureJobControlEvent>({
+      ...eventWithoutAfter,
+      afterSha256: erasureJobControlOutcomeSha256(eventWithoutAfter),
+    });
+    validateErasureJobControlEvent(event);
+    const stagedControlEvents = [
+      ...(this.erasureJobControlEvents.get(current.requestId) ?? []),
+      event,
+    ];
+    validateErasureJobControlAudit(next, stagedAudits, stagedControlEvents);
+
+    this.publishErasureControlState(next, stagedAudits, stagedControlEvents);
+    this.nextErasureJobControlEventId += 1;
     return true;
   }
 
@@ -1268,10 +1905,26 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       ? undefined
       : clone(this.activeSubjectRecord(session.tenantId, "user", session.userId, session.createdAtMs));
 
-    if (stagedTenant) this.subjectLifecycles.set(tenantKey, stagedTenant);
-    if (stagedUser) this.subjectLifecycles.set(userKey, stagedUser);
-    this.sessions.set(session.id, stagedSession);
-    this.events.set(session.id, [stagedEvent]);
+    const tenantExisted = this.subjectLifecycles.has(tenantKey);
+    const priorTenant = this.subjectLifecycles.get(tenantKey);
+    const userExisted = this.subjectLifecycles.has(userKey);
+    const priorUser = this.subjectLifecycles.get(userKey);
+    const sessionExisted = this.sessions.has(session.id);
+    const priorSession = this.sessions.get(session.id);
+    const eventsExisted = this.events.has(session.id);
+    const priorEvents = this.events.get(session.id);
+    try {
+      if (stagedTenant) this.subjectLifecycles.set(tenantKey, stagedTenant);
+      if (stagedUser) this.subjectLifecycles.set(userKey, stagedUser);
+      this.sessions.set(session.id, stagedSession);
+      this.events.set(session.id, [stagedEvent]);
+    } catch (error) {
+      restoreMapEntry(this.events, session.id, eventsExisted, priorEvents);
+      restoreMapEntry(this.sessions, session.id, sessionExisted, priorSession);
+      restoreMapEntry(this.subjectLifecycles, userKey, userExisted, priorUser);
+      restoreMapEntry(this.subjectLifecycles, tenantKey, tenantExisted, priorTenant);
+      throw error;
+    }
     return { events: [clone(stagedEvent)], lastSeq: 1 };
   }
   async getSession(tenantId: string, sessionId: string) {

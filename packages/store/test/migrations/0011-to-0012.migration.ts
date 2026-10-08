@@ -5,13 +5,18 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { MysqlSessionStore, newErasureRequestId } from "../../src/index.js";
+import {
+  MysqlSessionStore,
+  newErasureRequestId,
+  userErasureRequestHash,
+} from "../../src/index.js";
 
 const DEFAULT_MYSQL_URL = "mysql://root@127.0.0.1:3306/agent_service_test";
 const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_URL ?? DEFAULT_MYSQL_URL;
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = resolve(HERE, "../fixtures/mysql-0011.sql");
 const MIGRATION_PATH = resolve(HERE, "../../migrations/0012_erasure_job_queue.sql");
+const MIGRATION_0013_PATH = resolve(HERE, "../../migrations/0013_erasure_job_control.sql");
 
 type Row = RowDataPacket;
 type HistoricalStatus =
@@ -159,7 +164,7 @@ async function insertLegacyRequest(
       userId,
       status,
       `legacy-${status}-${suffix}`,
-      "a".repeat(64),
+      userErasureRequestHash(tenantId, userId),
       updatedAtMs,
       updatedAtMs,
       updatedAtMs,
@@ -217,6 +222,7 @@ describe("real MySQL historical upgrade: 0011 -> 0012", () => {
   let fixtureSql: string;
   let migrationStatements: string[];
   let only0012: string;
+  let only0013: string;
 
   beforeAll(async () => {
     baseUrl = assertDisposableMigrationTarget(BASE_URL);
@@ -230,12 +236,15 @@ describe("real MySQL historical upgrade: 0011 -> 0012", () => {
     expect(migrationStatements.length).toBeGreaterThan(30);
     only0012 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0012-"));
     await copyFile(MIGRATION_PATH, join(only0012, "0012_erasure_job_queue.sql"));
+    only0013 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0013-"));
+    await copyFile(MIGRATION_0013_PATH, join(only0013, "0013_erasure_job_control.sql"));
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 
   afterAll(async () => {
     await admin?.end();
     await rm(only0012, { recursive: true, force: true });
+    await rm(only0013, { recursive: true, force: true });
   });
 
   it("upgrades a frozen 0011 gated request and normalizes synthetic SQL-only state shapes", async () => {
@@ -364,8 +373,13 @@ describe("real MySQL historical upgrade: 0011 -> 0012", () => {
       );
       expect(purge[0]).toMatchObject({ available_at_ms: null, claim_token: null, lease_until_ms: null });
 
-      // Prove that the upgraded historical row is consumable through the current runtime, not just
-      // shaped correctly in information_schema. The earliest gated row is the only selected row.
+      // The checks above prove the frozen 0011 -> 0012 result. Apply the next expand migration
+      // before loading that row through the current runtime; new binaries require the additive
+      // quarantine columns even though this test remains focused on 0012 normalization.
+      await upgraded.close();
+      upgraded = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0013 });
+      // Prove that the historical row remains consumable after the forward-compatible expand.
+      // The earliest gated row is the only selected row.
       const runtimeClaims = await upgraded.claimErasureJobs({
         nowMs: 100,
         limit: 1,

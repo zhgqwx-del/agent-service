@@ -8,6 +8,9 @@ import {
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
   INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX,
   INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
+  INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
   INTERNAL_ROUTER_TOKEN_HEADER,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
@@ -83,6 +86,7 @@ function fakeRegistry(
     targetErasure?: boolean | (() => boolean);
     worker?: boolean;
     targetWorker?: boolean | ((url: string) => boolean);
+    jobControl?: boolean;
   } = {},
 ): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
@@ -117,6 +121,7 @@ function fakeRegistry(
         ? opts.targetWorker(url)
         : opts.targetWorker ?? opts.worker ?? false
     ),
+    allConfiguredSupportErasureJobControl: () => opts.jobControl ?? true,
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
     routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
@@ -143,6 +148,50 @@ function expectPrivateLifecycleResponse(response: Response): void {
 }
 
 describe("internal user-erasure routing", () => {
+  it("keeps the job-control readiness route private and ACKs only a homogeneous configured fleet", async () => {
+    const target = await upstream(() => ({ body: "{}" }));
+    const capable = createRouterApp({
+      registry: fakeRegistry([target.url], { jobControl: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    for (const headers of [
+      undefined,
+      { [INTERNAL_ROUTER_TOKEN_HEADER]: "wrong-internal-token-000000000000" },
+    ]) {
+      const hidden = await capable.request(INTERNAL_ERASURE_JOB_CONTROL_READY_PATH, { headers });
+      expect(hidden.status).toBe(404);
+      expect(hidden.headers.get(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER)).toBeNull();
+      expectPrivateLifecycleResponse(hidden);
+    }
+    expect((await capable.request(`${INTERNAL_ERASURE_JOB_CONTROL_READY_PATH}/extra`, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    })).status).toBe(404);
+
+    const ready = await capable.request(INTERNAL_ERASURE_JOB_CONTROL_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(ready.status).toBe(204);
+    expect(ready.headers.get(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER)).toBe(
+      INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
+    );
+    expectPrivateLifecycleResponse(ready);
+
+    const mixed = createRouterApp({
+      registry: fakeRegistry([target.url], { jobControl: false }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    const unavailable = await mixed.request(INTERNAL_ERASURE_JOB_CONTROL_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers.get(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER)).toBeNull();
+    expectPrivateLifecycleResponse(unavailable);
+    expect(target.requests).toEqual([]);
+  });
+
   it("authenticates before parsing identity or body and never forwards the runner-only path", async () => {
     const target = await upstream(() => ({ status: 204, body: "" }));
     const app = createRouterApp({
@@ -539,13 +588,18 @@ describe("request and response handling", () => {
     }));
     const request = { method: "POST", headers: { "idempotency-key": "erase-1" } } as const;
 
-    const disabled = createRouterApp({ registry: fakeRegistry([a.url], { erasure: true }), logger: silent });
+    const disabled = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
     const disabledResponse = await disabled.request("/v1/data-erasure-requests", request);
     expect(disabledResponse.status).toBe(503);
     expectPrivateLifecycleResponse(disabledResponse);
     const mixed = createRouterApp({
       registry: fakeRegistry([a.url], { erasure: false }),
       erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
     const mixedResponse = await mixed.request("/v1/data-erasure-requests", request);
@@ -554,6 +608,7 @@ describe("request and response handling", () => {
     const unavailableConfiguredTarget = createRouterApp({
       registry: fakeRegistry([a.url], { erasure: true, configuredErasure: false }),
       erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
     const unavailableResponse = await unavailableConfiguredTarget.request("/v1/data-erasure-requests", request);
@@ -562,6 +617,7 @@ describe("request and response handling", () => {
     const staleTarget = createRouterApp({
       registry: fakeRegistry([a.url], { erasure: true, targetErasure: false }),
       erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
     const staleTargetResponse = await staleTarget.request("/v1/data-erasure-requests", request);
@@ -571,6 +627,7 @@ describe("request and response handling", () => {
     const enabled = createRouterApp({
       registry: fakeRegistry([a.url], { erasure: true }),
       erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
     const enabledResponse = await enabled.request("/v1/data-erasure-requests", request);
@@ -588,6 +645,20 @@ describe("request and response handling", () => {
     );
     expect(mixedStatus.status).toBe(503);
     expectPrivateLifecycleResponse(mixedStatus);
+    const mixedControl = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true, jobControl: false }),
+      erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    const mixedControlPost = await mixedControl.request("/v1/data-erasure-requests", request);
+    expect(mixedControlPost.status).toBe(503);
+    expectPrivateLifecycleResponse(mixedControlPost);
+    const mixedControlStatus = await mixedControl.request(
+      "/v1/data-erasure-requests/erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+    );
+    expect(mixedControlStatus.status).toBe(503);
+    expectPrivateLifecycleResponse(mixedControlStatus);
     const staleStatus = await staleTarget.request(
       "/v1/data-erasure-requests/erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
     );
@@ -606,7 +677,11 @@ describe("request and response handling", () => {
       },
       body: '{"error":{"code":"not_found","message":"erasure request not found"}}',
     }));
-    const app = createRouterApp({ registry: fakeRegistry([a.url], { erasure: true }), logger: silent });
+    const app = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
 
     const response = await app.request(
       "/v1/data-erasure-requests/erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
@@ -627,6 +702,7 @@ describe("request and response handling", () => {
         targetErasure: () => targetCapable,
       }),
       erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
 
@@ -673,6 +749,7 @@ describe("failure handling", () => {
     const noRetry = createRouterApp({
       registry: fakeRegistry([dead, alive.url], { erasure: true }),
       erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
       maxAttempts: 2,
       logger: silent,
     });
@@ -682,6 +759,7 @@ describe("failure handling", () => {
     const retrying = createRouterApp({
       registry: fakeRegistry([dead, alive.url], { erasure: true }),
       erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
       maxAttempts: 2,
       logger: silent,
     });
@@ -891,7 +969,7 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
       registry: fakeRegistry([a.url], { blobs: true, worker: true }),
       tombstoneEnabled: () => true,
@@ -900,7 +978,7 @@ describe("operational endpoints", () => {
       internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
-    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[] } };
+    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[]; erasureJobControl: string[] } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
@@ -908,13 +986,14 @@ describe("operational endpoints", () => {
     expect(caps.features.blobAttachments).toBe(true);
     expect(caps.features.dataErasureRequests).toBe(true);
     expect(caps.features.userErasureWorker).toEqual(["drain-v1"]);
+    expect(caps.features.erasureJobControl).toEqual([]);
 
     const noToken = createRouterApp({
       registry: fakeRegistry([a.url], { worker: true }),
       logger: silent,
     });
     expect(await (await noToken.request("/v1/capabilities")).json()).toMatchObject({
-      features: { userErasureWorker: [] },
+      features: { userErasureWorker: [], erasureJobControl: [] },
     });
   });
 
@@ -929,6 +1008,7 @@ describe("operational endpoints", () => {
         sessionLifecycle: ["archive", "unarchive"],
         blobAttachments: false,
         dataErasureRequests: true,
+        erasureJobControl: ["quarantine-v1"],
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -948,10 +1028,21 @@ describe("operational endpoints", () => {
     const mixedFleet = createRouterApp({
       registry: fakeRegistry([a.url], { erasure: false }),
       erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
     expect(await (await mixedFleet.request("/v1/capabilities")).json()).toMatchObject({
       features: { dataErasureRequests: false },
+    });
+
+    const oldControlFleet = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true, jobControl: false }),
+      erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    expect(await (await oldControlFleet.request("/v1/capabilities")).json()).toMatchObject({
+      features: { dataErasureRequests: false, erasureJobControl: [] },
     });
   });
 

@@ -109,17 +109,34 @@ import {
 } from "../usage-lifecycle.js";
 import {
   CLAIMABLE_ERASURE_REQUEST_STATUSES,
+  ErasureJobIntegrityFault,
   ErasureIdempotencyMismatchError,
   SubjectDeletingError,
+  classifyErasureJobRecordFault,
+  deriveBlockedErasureResumePhase,
   erasureJobClaimFromRecord,
+  erasureJobAllowedMaintenanceActions,
   erasureJobAuthorizationMatches,
+  erasureJobControlOutcomeSha256,
+  erasureJobInterventionEvidenceSha256,
+  erasureJobTerminalInterventionEvidenceSha256,
+  erasureJobUnsafeQuarantineEnvelopeEvidenceSha256,
   erasureWriteAuthorizationMatches,
+  hasSafeErasureRequestQuarantineEnvelope,
+  isErasureJobQuarantined,
   isClaimableErasureRequestStatus,
+  newErasureJobIntegrityFault,
+  userErasureRequestHash,
   validateClaimErasureJobsOptions,
   validateErasureJobAuthorization,
   validateErasureAuditChain,
+  validateErasureJobControlAudit,
+  validateErasureJobControlEvent,
+  validateErasureJobMaintenanceIdentity,
   validateErasureRequestRecord,
+  validateErasureRequestRecordForRead,
   validateErasureWriteAuthorization,
+  validateRepairAndResumeErasureJobInput,
   validateRequestUserErasureInput,
   validateRenewErasureJobClaimOptions,
   validateRetryErasureJobOptions,
@@ -127,13 +144,19 @@ import {
   type ClaimErasureJobsOptions,
   type DataSubjectKind,
   type ErasureAuditEvent,
+  type ErasureJobControlEvent,
   type ErasureJobAuthorization,
   type ErasureJobClaim,
+  type ErasureJobInterventionInspection,
+  type ErasureJobMaintenanceIdentity,
+  type ErasureJobMaintenanceStore,
   type ErasureJobStore,
+  type ErasureJobUnsafeQuarantineEnvelope,
   type ErasureRequestRecord,
   type ErasureRequestStatus,
   type ErasureWriteAuthorization,
   type RequestUserErasureInput,
+  type RepairAndResumeErasureJobInput,
   type RetryErasureJobOptions,
   type RenewErasureJobClaimOptions,
   type SubjectLifecycleRecord,
@@ -189,7 +212,10 @@ const SUBJECT_LIFECYCLE_COLUMNS = `tenant_id, subject_kind, subject_id, state, g
 const ERASURE_REQUEST_COLUMNS = `request_id, tenant_id, subject_kind, subject_id, generation, status,
   requested_by_key_id, idempotency_key, request_hash, created_at_ms, gated_at_ms, updated_at_ms,
   completed_at_ms, counts_json, checksum, available_at_ms, attempts, claim_token, lease_until_ms,
-  last_error_code, policy_version, policy_hash`;
+  last_error_code, policy_version, policy_hash, control_generation, quarantined_at_ms,
+  quarantine_reason_code, quarantine_evidence_sha256`;
+const ERASURE_CONTROL_EVENT_COLUMNS = `control_event_id, request_id, control_generation, event_type,
+  phase, reason_code, action_code, actor_key_id, before_sha256, after_sha256, emitted_at_ms`;
 const USAGE_OWNER_MATCH = "u.tenant_id=s.tenant_id AND u.user_id=s.user_id";
 const usageJsonNumber = (field: string) => (
   `CASE WHEN JSON_TYPE(JSON_EXTRACT(u.usage_json,'$.${field}')) IN ('INTEGER','DOUBLE','DECIMAL') `
@@ -204,6 +230,34 @@ interface ExistingCommitResources {
   turnIds: Set<string>;
   approvalIds: Set<string>;
 }
+
+interface LockedErasureMaintenanceContext {
+  tenant?: SubjectLifecycleRecord;
+  subject?: SubjectLifecycleRecord;
+  record: ErasureRequestRecord;
+  rawControlGeneration: string;
+  auditRows: Row[];
+  controlRows: Row[];
+}
+
+interface DecodedErasureRequestEnvelope {
+  record: ErasureRequestRecord;
+  /** Exact unsigned BIGINT text, retained only inside the locked store path for CAS/evidence. */
+  rawControlGeneration: string;
+  controlGenerationSaturated: boolean;
+}
+
+interface ErasureClaimCandidate {
+  requestId: string;
+  tenantId: string;
+  subjectKind: DataSubjectKind;
+  subjectId: string;
+  subjectGeneration: number;
+}
+
+type ErasureClaimCandidateResult =
+  | { kind: "skipped" }
+  | { kind: "consumed"; record?: ErasureRequestRecord };
 
 /** Serialize a Session row. The projection columns are the source for filtering; `body` holds the rest. */
 function rowToSession(r: Row): Session {
@@ -489,18 +543,91 @@ function rowToSubjectLifecycle(row: Row): SubjectLifecycleRecord {
   };
 }
 
-function rowToErasureRequest(row: Row): ErasureRequestRecord {
+function mysqlControlGeneration(value: unknown): {
+  projected: number;
+  raw: string;
+  saturated: boolean;
+} {
+  let parsed: bigint;
+  if (typeof value === "number") {
+    // With supportBigNumbers enabled mysql2 returns unsafe BIGINTs as strings. Refuse a rounded
+    // number rather than use it for a durable compare-and-swap.
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("stored erasure request control generation is not an exact unsigned integer");
+    }
+    parsed = BigInt(value);
+  } else if (typeof value === "bigint") {
+    if (value < 0n) throw new Error("stored erasure request control generation is negative");
+    parsed = value;
+  } else if (typeof value === "string" && /^(?:0|[1-9][0-9]*)$/.test(value)) {
+    parsed = BigInt(value);
+  } else {
+    throw new Error("stored erasure request control generation is not an unsigned integer");
+  }
+  const maximum = BigInt(Number.MAX_SAFE_INTEGER);
+  const saturated = parsed >= maximum;
+  return {
+    projected: saturated ? Number.MAX_SAFE_INTEGER : Number(parsed),
+    raw: parsed.toString(),
+    saturated,
+  };
+}
+
+function mysqlExactIntegerText(value: unknown, label: string, unsigned = false): string {
+  let raw: string;
+  if (typeof value === "number") {
+    // mysql2 returns an unsafe BIGINT as a string with supportBigNumbers enabled. Treat an unsafe
+    // number as already rounded and therefore unusable for evidence or compare-and-swap.
+    if (!Number.isSafeInteger(value)) throw new Error(`${label} is not an exact integer`);
+    raw = String(value);
+  } else if (typeof value === "bigint") {
+    raw = value.toString();
+  } else if (typeof value === "string") {
+    raw = value;
+  } else {
+    throw new Error(`${label} is not an integer`);
+  }
+  const pattern = unsigned ? /^(?:0|[1-9][0-9]*)$/ : /^(?:0|-?[1-9][0-9]*)$/;
+  if (!pattern.test(raw)) throw new Error(`${label} is not a canonical integer`);
+  return raw;
+}
+
+function rawErasureRequestQuarantineEnvelope(row: Row): ErasureJobUnsafeQuarantineEnvelope {
+  const requestId = String(row.request_id);
+  return {
+    locatorRequestId: requestId,
+    requestId,
+    tenantId: String(row.tenant_id),
+    subjectKind: String(row.subject_kind),
+    subjectId: String(row.subject_id),
+    rawGeneration: mysqlExactIntegerText(row.generation, "stored erasure subject generation", true),
+    status: String(row.status),
+    rawCreatedAtMs: mysqlExactIntegerText(row.created_at_ms, "stored erasure creation timestamp"),
+    rawGatedAtMs: row.gated_at_ms == null
+      ? null
+      : mysqlExactIntegerText(row.gated_at_ms, "stored erasure gate timestamp"),
+    rawUpdatedAtMs: mysqlExactIntegerText(row.updated_at_ms, "stored erasure update timestamp"),
+    rawControlGeneration: mysqlExactIntegerText(
+      row.control_generation,
+      "stored erasure control generation",
+      true,
+    ),
+  };
+}
+
+/** Decode without accepting the row as valid authority. Claim uses this to classify poison. */
+function decodeErasureRequest(row: Row): DecodedErasureRequestEnvelope {
   const subjectKind = String(row.subject_kind) as DataSubjectKind;
   const status = String(row.status) as ErasureRequestStatus;
   const generation = Number(row.generation);
   const createdAtMs = Number(row.created_at_ms);
-  const gatedAtMs = Number(row.gated_at_ms);
+  // `gated_at_ms` is nullable in the historical schema. Never let JavaScript's
+  // Number(null) coercion turn a missing gate into epoch zero and grant worker authority.
+  const gatedAtMs = row.gated_at_ms == null ? Number.NaN : Number(row.gated_at_ms);
   const updatedAtMs = Number(row.updated_at_ms);
   const counts = row.counts_json == null ? undefined : parse<unknown>(row.counts_json);
-  if (counts !== undefined && (typeof counts !== "object" || counts === null || Array.isArray(counts))) {
-    throw new Error("stored erasure request counts are invalid");
-  }
   const completedAtMs = row.completed_at_ms == null ? undefined : Number(row.completed_at_ms);
+  const controlGeneration = mysqlControlGeneration(row.control_generation);
   const record: ErasureRequestRecord = {
     requestId: String(row.request_id),
     tenantId: String(row.tenant_id),
@@ -524,9 +651,118 @@ function rowToErasureRequest(row: Row): ErasureRequestRecord {
     ...(row.last_error_code == null ? {} : { lastErrorCode: String(row.last_error_code) as ErasureRequestRecord["lastErrorCode"] }),
     ...(row.policy_version == null ? {} : { policyVersion: String(row.policy_version) }),
     ...(row.policy_hash == null ? {} : { policyHash: String(row.policy_hash) }),
+    controlGeneration: controlGeneration.projected,
+    ...(row.quarantined_at_ms == null ? {} : { quarantinedAtMs: Number(row.quarantined_at_ms) }),
+    ...(row.quarantine_reason_code == null
+      ? {}
+      : { quarantineReasonCode: String(row.quarantine_reason_code) as ErasureRequestRecord["quarantineReasonCode"] }),
+    ...(row.quarantine_evidence_sha256 == null
+      ? {}
+      : { quarantineEvidenceSha256: String(row.quarantine_evidence_sha256) }),
   };
-  validateErasureRequestRecord(record);
+  return {
+    record,
+    rawControlGeneration: controlGeneration.raw,
+    controlGenerationSaturated: controlGeneration.saturated,
+  };
+}
+
+function rowToErasureRequest(row: Row): ErasureRequestRecord {
+  const { record } = decodeErasureRequest(row);
+  validateErasureRequestRecordForRead(record);
   return record;
+}
+
+function mysqlSafeInteger(value: unknown, label: string): number {
+  if (typeof value === "number") {
+    if (Number.isSafeInteger(value)) return value;
+    throw new Error(`${label} exceeds the JavaScript safe integer range`);
+  }
+  if (typeof value === "string" && /^(?:0|[1-9][0-9]*)$/.test(value)) {
+    const parsed = BigInt(value);
+    if (parsed <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(parsed);
+    throw new Error(`${label} exceeds the JavaScript safe integer range`);
+  }
+  throw new Error(`${label} is not a non-negative integer`);
+}
+
+function rowToErasureControlEvent(row: Row): ErasureJobControlEvent {
+  const event: ErasureJobControlEvent = {
+    controlEventId: mysqlSafeInteger(row.control_event_id, "stored erasure control event id"),
+    requestId: String(row.request_id),
+    controlGeneration: mysqlSafeInteger(
+      row.control_generation,
+      "stored erasure control generation",
+    ),
+    eventType: String(row.event_type) as ErasureJobControlEvent["eventType"],
+    phase: String(row.phase) as ErasureRequestStatus,
+    reasonCode: String(row.reason_code) as ErasureJobControlEvent["reasonCode"],
+    ...(row.action_code == null
+      ? {}
+      : { actionCode: String(row.action_code) as ErasureJobControlEvent["actionCode"] }),
+    ...(row.actor_key_id == null ? {} : { actorKeyId: String(row.actor_key_id) }),
+    beforeSha256: String(row.before_sha256),
+    ...(row.after_sha256 == null ? {} : { afterSha256: String(row.after_sha256) }),
+    emittedAtMs: Number(row.emitted_at_ms),
+  };
+  validateErasureJobControlEvent(event);
+  return event;
+}
+
+function rowsToErasureAuditEvents(rows: Row[]): ErasureAuditEvent[] {
+  return rows.map((row) => {
+    const payload = parse<unknown>(row.payload);
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      throw new Error("stored erasure audit payload is invalid");
+    }
+    return {
+      requestId: String(row.request_id),
+      seq: Number(row.seq),
+      type: String(row.event_type) as ErasureAuditEvent["type"],
+      payload: payload as Record<string, unknown>,
+      emittedAtMs: Number(row.emitted_at_ms),
+    };
+  });
+}
+
+/**
+ * The control chain still needs the bounded blocked/resumed fields when the main audit itself is
+ * poison. Decode each payload independently so an unrelated malformed event does not erase a
+ * valid historical resume pair; strict main-audit validation remains authoritative elsewhere.
+ */
+function rowsToErasureControlValidationAudits(rows: readonly Row[]): ErasureAuditEvent[] {
+  return rows.map((row) => {
+    let payload: Record<string, unknown> = {};
+    try {
+      const decoded = parse<unknown>(row.payload);
+      if (typeof decoded === "object" && decoded !== null && !Array.isArray(decoded)) {
+        payload = decoded as Record<string, unknown>;
+      }
+    } catch {
+      // Preserve only the content-free envelope. A resumed event with an undecodable payload will
+      // fail the combined validator instead of being silently paired.
+    }
+    return {
+      requestId: String(row.request_id),
+      seq: Number(row.seq),
+      type: String(row.event_type) as ErasureAuditEvent["type"],
+      payload,
+      emittedAtMs: Number(row.emitted_at_ms),
+    };
+  });
+}
+
+function deterministicIntegrity<T>(
+  record: ErasureRequestRecord,
+  reasonCode: Parameters<typeof newErasureJobIntegrityFault>[1],
+  operation: () => T,
+): T {
+  try {
+    return operation();
+  } catch (error) {
+    if (error instanceof ErasureJobIntegrityFault) throw error;
+    throw newErasureJobIntegrityFault(record, reasonCode);
+  }
 }
 
 function rowToErasureSessionRef(row: Row): ErasureSessionRef {
@@ -639,6 +875,7 @@ export class MysqlSessionStore implements
   UsageLifecycleStore,
   SubjectLifecycleStore,
   ErasureJobStore,
+  ErasureJobMaintenanceStore,
   ErasureSessionStore,
   ErasureSessionCatalogStore,
   ErasureUsageReconciliationStore
@@ -891,6 +1128,7 @@ export class MysqlSessionStore implements
         updatedAtMs: input.atMs,
         availableAtMs: input.atMs,
         attempts: 0,
+        controlGeneration: 0,
       };
       await conn.query(
         `INSERT INTO erasure_requests
@@ -990,7 +1228,13 @@ export class MysqlSessionStore implements
       const seq = Number(row.seq);
       const emittedAtMs = Number(row.emitted_at_ms);
       if (
-        !["erasure/gated", "erasure/status_changed", "erasure/blocked", "erasure/completed"].includes(type)
+        ![
+          "erasure/gated",
+          "erasure/status_changed",
+          "erasure/blocked",
+          "erasure/resumed",
+          "erasure/completed",
+        ].includes(type)
         || typeof payload !== "object"
         || payload === null
         || Array.isArray(payload)
@@ -1014,8 +1258,14 @@ export class MysqlSessionStore implements
     record: ErasureRequestRecord,
     lock: "FOR SHARE" | "FOR UPDATE",
     lockedSubject?: SubjectLifecycleRecord,
-  ): Promise<{ subject: SubjectLifecycleRecord; auditSeq: number }> {
-    validateErasureRequestRecord(record);
+  ): Promise<{
+    subject: SubjectLifecycleRecord;
+    audits: ErasureAuditEvent[];
+    controlEvents: ErasureJobControlEvent[];
+    auditSeq: number;
+  }> {
+    const rowFault = classifyErasureJobRecordFault(record);
+    if (rowFault) throw rowFault;
     let subject = lockedSubject;
     if (!subject) {
       // Authority paths follow the global tenant -> user lock order. Claim performs a non-locking
@@ -1026,8 +1276,12 @@ export class MysqlSessionStore implements
           WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
         [record.tenantId, record.tenantId],
       );
-      if (!tenantRows[0]) throw new Error("erasure tenant lifecycle row is missing");
-      const tenant = rowToSubjectLifecycle(tenantRows[0]);
+      if (!tenantRows[0]) throw newErasureJobIntegrityFault(record, "subject_binding_invalid");
+      const tenant = deterministicIntegrity(
+        record,
+        "subject_binding_invalid",
+        () => rowToSubjectLifecycle(tenantRows[0]!),
+      );
       if (record.subjectKind === "tenant") subject = tenant;
       else {
         const [subjectRows] = await conn.query<Row[]>(
@@ -1036,7 +1290,13 @@ export class MysqlSessionStore implements
             WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR SHARE`,
           [record.tenantId, record.subjectId],
         );
-        subject = subjectRows[0] ? rowToSubjectLifecycle(subjectRows[0]) : undefined;
+        subject = subjectRows[0]
+          ? deterministicIntegrity(
+              record,
+              "subject_binding_invalid",
+              () => rowToSubjectLifecycle(subjectRows[0]!),
+            )
+          : undefined;
       }
     }
     if (
@@ -1047,7 +1307,7 @@ export class MysqlSessionStore implements
       || subject.state !== "deleting"
       || subject.generation !== record.generation
       || subject.activeRequestId !== record.requestId
-    ) throw new Error("erasure request does not match its active subject lifecycle");
+    ) throw newErasureJobIntegrityFault(record, "subject_binding_invalid");
 
     const [auditRows] = await conn.query<Row[]>(
       `SELECT request_id, seq, event_type, payload, emitted_at_ms
@@ -1055,15 +1315,37 @@ export class MysqlSessionStore implements
         WHERE request_id=? ORDER BY seq ${lock}`,
       [record.requestId],
     );
-    const audits: ErasureAuditEvent[] = auditRows.map((audit) => ({
-      requestId: String(audit.request_id),
-      seq: Number(audit.seq),
-      type: String(audit.event_type) as ErasureAuditEvent["type"],
-      payload: parse<Record<string, unknown>>(audit.payload),
-      emittedAtMs: Number(audit.emitted_at_ms),
-    }));
-    validateErasureAuditChain(record, audits);
-    return { subject, auditSeq: audits.length };
+    const [controlRows] = await conn.query<Row[]>(
+      `SELECT ${ERASURE_CONTROL_EVENT_COLUMNS}
+         FROM erasure_job_control_events
+        WHERE request_id=? ORDER BY control_generation, control_event_id ${lock}`,
+      [record.requestId],
+    );
+    const audits = deterministicIntegrity(
+      record,
+      "audit_chain_invalid",
+      () => rowsToErasureAuditEvents(auditRows),
+    );
+    deterministicIntegrity(
+      record,
+      "audit_chain_invalid",
+      () => validateErasureAuditChain(record, audits),
+    );
+    if (
+      record.subjectKind === "user"
+      && record.requestHash !== userErasureRequestHash(record.tenantId, record.subjectId)
+    ) throw newErasureJobIntegrityFault(record, "idempotency_binding_invalid");
+    const controlEvents = deterministicIntegrity(
+      record,
+      "control_audit_invalid",
+      () => controlRows.map(rowToErasureControlEvent),
+    );
+    deterministicIntegrity(
+      record,
+      "control_audit_invalid",
+      () => validateErasureJobControlAudit(record, audits, controlEvents),
+    );
+    return { subject, audits, controlEvents, auditSeq: audits.length };
   }
 
   private async lockErasureAuthorizationSubject(
@@ -1083,6 +1365,7 @@ export class MysqlSessionStore implements
     if (!tenantRows[0]) return null;
     const tenant = rowToSubjectLifecycle(tenantRows[0]);
     if (authorization.subjectKind === "tenant") return tenant;
+    if (tenant.state !== "active") return null;
     const [userRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
          FROM subject_lifecycle
@@ -1090,6 +1373,83 @@ export class MysqlSessionStore implements
       [authorization.tenantId, authorization.subjectId],
     );
     return userRows[0] ? rowToSubjectLifecycle(userRows[0]) : null;
+  }
+
+  private async lockErasureMaintenanceContext(
+    conn: PoolConnection,
+    identity: ErasureJobMaintenanceIdentity,
+    lock: "FOR SHARE" | "FOR UPDATE",
+  ): Promise<LockedErasureMaintenanceContext | null> {
+    const [tenantRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? ${lock}`,
+      [identity.tenantId, identity.tenantId],
+    );
+    let tenant: SubjectLifecycleRecord | undefined;
+    if (tenantRows[0]) {
+      try {
+        tenant = rowToSubjectLifecycle(tenantRows[0]);
+      } catch {
+        // A quarantined subject-binding fault must remain inspectable. Repair still performs a
+        // strict check before it grants queue authority.
+      }
+    }
+
+    let subject = identity.subjectKind === "tenant" ? tenant : undefined;
+    if (identity.subjectKind === "user") {
+      const [subjectRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='user' AND subject_id=? ${lock}`,
+        [identity.tenantId, identity.subjectId],
+      );
+      if (subjectRows[0]) {
+        try {
+          subject = rowToSubjectLifecycle(subjectRows[0]);
+        } catch {
+          // See the tenant note above.
+        }
+      }
+    }
+
+    const [requestRows] = await conn.query<Row[]>(
+      `SELECT ${ERASURE_REQUEST_COLUMNS}
+         FROM erasure_requests
+        WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+        ${lock}`,
+      [
+        identity.requestId,
+        identity.tenantId,
+        identity.subjectKind,
+        identity.subjectId,
+        identity.subjectGeneration,
+      ],
+    );
+    if (!requestRows[0]) return null;
+    const decodedRequest = decodeErasureRequest(requestRows[0]);
+    const record = decodedRequest.record;
+    validateErasureRequestRecordForRead(record);
+    const [auditRows] = await conn.query<Row[]>(
+      `SELECT request_id, seq, event_type, payload, emitted_at_ms
+         FROM erasure_audit_events
+        WHERE request_id=? ORDER BY seq ${lock}`,
+      [record.requestId],
+    );
+    const [controlRows] = await conn.query<Row[]>(
+      `SELECT ${ERASURE_CONTROL_EVENT_COLUMNS}
+         FROM erasure_job_control_events
+        WHERE request_id=? ORDER BY control_generation, control_event_id ${lock}`,
+      [record.requestId],
+    );
+    return {
+      tenant,
+      subject,
+      record,
+      rawControlGeneration: decodedRequest.rawControlGeneration,
+      auditRows,
+      controlRows,
+    };
   }
 
   /** Session actions preserve the ordinary writer's session -> tenant -> user lock order. */
@@ -1141,104 +1501,473 @@ export class MysqlSessionStore implements
     const leaseUntilMs = validateClaimErasureJobsOptions(options);
     const conn = await this.pool.getConnection();
     try {
-      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
-      await conn.beginTransaction();
       const statusPlaceholders = CLAIMABLE_ERASURE_REQUEST_STATUSES.map(() => "?").join(",");
-      // Phase 1 is deliberately non-locking. Phase 2 takes tenant -> user -> request for every
-      // candidate, matching transition/session writers and eliminating request <-> subject cycles.
+      // Phase 1 is deliberately non-locking. Each phase-2 candidate receives its own transaction:
+      // a committed quarantine cannot be resurrected by an unrelated later SQL/deadlock failure,
+      // while that failing candidate itself is rolled back and never misclassified as poison.
       const [candidateRows] = await conn.query<Row[]>(
-        `SELECT request_id, tenant_id, subject_kind, subject_id, generation, attempts
+        `SELECT request_id, tenant_id, subject_kind, subject_id, generation
            FROM erasure_requests
           WHERE status IN (${statusPlaceholders})
-            AND available_at_ms IS NOT NULL AND available_at_ms<=?
-            AND (claim_token IS NULL OR lease_until_ms<=?)
+            AND NOT (
+              quarantined_at_ms IS NOT NULL
+              AND quarantine_reason_code IS NOT NULL
+              AND quarantine_evidence_sha256 IS NOT NULL
+            )
+            AND (
+              (available_at_ms IS NOT NULL AND available_at_ms<=?
+                AND (claim_token IS NULL OR (lease_until_ms IS NOT NULL AND lease_until_ms<=?)))
+              OR available_at_ms IS NULL
+              OR available_at_ms < 0
+              OR available_at_ms > 9007199254740991
+              OR (claim_token IS NULL AND lease_until_ms IS NOT NULL)
+              OR (claim_token IS NOT NULL AND lease_until_ms IS NULL)
+              OR lease_until_ms < 0
+              OR lease_until_ms > 9007199254740991
+              OR control_generation >= 9007199254740991
+              OR (claim_token IS NOT NULL
+                AND NOT REGEXP_LIKE(claim_token, '^[A-Za-z0-9._:-]{1,64}$', 'c'))
+              OR (quarantined_at_ms IS NULL
+                AND (quarantine_reason_code IS NOT NULL OR quarantine_evidence_sha256 IS NOT NULL))
+              OR (quarantined_at_ms IS NOT NULL
+                AND (quarantine_reason_code IS NULL OR quarantine_evidence_sha256 IS NULL))
+            )
           ORDER BY available_at_ms ASC, request_id ASC
-          LIMIT ?`,
-        [...CLAIMABLE_ERASURE_REQUEST_STATUSES, options.nowMs, options.nowMs, options.limit],
+          LIMIT 100`,
+        [...CLAIMABLE_ERASURE_REQUEST_STATUSES, options.nowMs, options.nowMs],
       );
-      const candidates = candidateRows.map((row) => {
-        const authorization: ErasureJobAuthorization = {
+      const candidates: ErasureClaimCandidate[] = candidateRows.map((row) => ({
           requestId: String(row.request_id),
           tenantId: String(row.tenant_id),
           subjectKind: String(row.subject_kind) as DataSubjectKind,
           subjectId: String(row.subject_id),
           subjectGeneration: Number(row.generation),
-          claimToken: options.claimToken,
-          claimAttempt: Number(row.attempts) + 1,
-        };
-        validateErasureJobAuthorization(authorization);
-        return authorization;
-      }).sort((left, right) => (
+      })).sort((left, right) => (
         left.tenantId.localeCompare(right.tenantId)
         || left.subjectKind.localeCompare(right.subjectKind)
         || left.subjectId.localeCompare(right.subjectId)
         || left.requestId.localeCompare(right.requestId)
       ));
       const claimed: ErasureRequestRecord[] = [];
+      let consumed = 0;
       for (const candidate of candidates) {
-        const subject = await this.lockErasureAuthorizationSubject(conn, candidate, "FOR SHARE");
-        if (!subject) throw new Error("erasure request subject lifecycle is missing");
-        const [requestRows] = await conn.query<Row[]>(
-          `SELECT ${ERASURE_REQUEST_COLUMNS}
-             FROM erasure_requests
-            WHERE request_id=?
-            FOR UPDATE SKIP LOCKED`,
-          [candidate.requestId],
-        );
-        // Another worker may have locked this request after the non-locking candidate scan.
-        if (!requestRows[0]) continue;
-        const current = rowToErasureRequest(requestRows[0]);
-        if (
-          current.tenantId !== candidate.tenantId
-          || current.subjectKind !== candidate.subjectKind
-          || current.subjectId !== candidate.subjectId
-          || current.generation !== candidate.subjectGeneration
-        ) throw new Error("erasure request identity changed during claim");
-        if (
-          !isClaimableErasureRequestStatus(current.status)
-          || current.availableAtMs === undefined
-          || current.availableAtMs > options.nowMs
-          || (current.claimToken !== undefined
-            && (current.leaseUntilMs === undefined || current.leaseUntilMs > options.nowMs))
-        ) continue;
-        await this.assertLockedErasureJobIntegrity(conn, current, "FOR SHARE", subject);
-        const next: ErasureRequestRecord = {
-          ...current,
-          attempts: current.attempts + 1,
-          claimToken: options.claimToken,
-          leaseUntilMs,
-        };
-        validateErasureRequestRecord(next);
-        const [updated] = await conn.query<mysql.ResultSetHeader>(
-          `UPDATE erasure_requests
-              SET attempts=?, claim_token=?, lease_until_ms=?
-            WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
-              AND status=? AND available_at_ms IS NOT NULL AND available_at_ms<=?
-              AND (claim_token IS NULL OR lease_until_ms<=?)`,
-          [
-            next.attempts,
-            options.claimToken,
+        if (consumed >= options.limit) break;
+        try {
+          await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+          await conn.beginTransaction();
+          const result = await this.claimErasureCandidate(
+            conn,
+            candidate,
+            options,
             leaseUntilMs,
-            current.requestId,
-            current.tenantId,
-            current.subjectKind,
-            current.subjectId,
-            current.generation,
-            current.status,
-            options.nowMs,
-            options.nowMs,
-          ],
-        );
-        if (updated.affectedRows !== 1) throw new Error("erasure job changed while locked");
-        claimed.push(next);
+          );
+          await conn.commit();
+          if (result.kind === "consumed") {
+            consumed += 1;
+            if (result.record) claimed.push(result.record);
+          }
+        } catch (error) {
+          await conn.rollback().catch(() => {});
+          // A prior candidate was already committed in its own transaction. Returning that
+          // authority is safer than rejecting the whole call and orphaning an invisible live
+          // lease; the failed candidate remains unchanged and will surface on the next poll.
+          if (claimed.length > 0) break;
+          throw error;
+        }
       }
-      await conn.commit();
       return claimed.map(erasureJobClaimFromRecord);
     } catch (error) {
       await conn.rollback().catch(() => {});
       throw error;
     } finally {
       conn.release();
+    }
+  }
+
+  private async claimErasureCandidate(
+    conn: PoolConnection,
+    candidate: ErasureClaimCandidate,
+    options: ClaimErasureJobsOptions,
+    leaseUntilMs: number,
+  ): Promise<ErasureClaimCandidateResult> {
+    const [tenantRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [candidate.tenantId, candidate.tenantId],
+    );
+    let tenant: SubjectLifecycleRecord | undefined;
+    let subject: SubjectLifecycleRecord | undefined;
+    let subjectDecodeFailed = false;
+    if (tenantRows[0]) {
+      try {
+        tenant = rowToSubjectLifecycle(tenantRows[0]);
+        if (candidate.subjectKind === "tenant") subject = tenant;
+      } catch {
+        subjectDecodeFailed = true;
+      }
+    }
+    if (candidate.subjectKind === "user") {
+      const [userRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR SHARE`,
+        [candidate.tenantId, candidate.subjectId],
+      );
+      if (userRows[0]) {
+        try {
+          subject = rowToSubjectLifecycle(userRows[0]);
+        } catch {
+          subjectDecodeFailed = true;
+        }
+      }
+    }
+    const [requestRows] = await conn.query<Row[]>(
+      `SELECT ${ERASURE_REQUEST_COLUMNS}
+         FROM erasure_requests
+        WHERE request_id=?
+        FOR UPDATE SKIP LOCKED`,
+      [candidate.requestId],
+    );
+    if (!requestRows[0]) return { kind: "skipped" };
+    const rawQuarantineEnvelope = rawErasureRequestQuarantineEnvelope(requestRows[0]);
+    const decodedCurrent = decodeErasureRequest(requestRows[0]);
+    const current = decodedCurrent.record;
+    if (
+      current.tenantId !== candidate.tenantId
+      || current.subjectKind !== candidate.subjectKind
+      || current.subjectId !== candidate.subjectId
+      || current.generation !== candidate.subjectGeneration
+    ) return { kind: "skipped" };
+    if (!isClaimableErasureRequestStatus(current.status) || isErasureJobQuarantined(current)) {
+      return { kind: "skipped" };
+    }
+    if (!hasSafeErasureRequestQuarantineEnvelope(current)) {
+      await this.terminallyIsolateUnsafeErasureJobEnvelope(
+        conn,
+        rawQuarantineEnvelope,
+        options.nowMs,
+      );
+      return { kind: "consumed" };
+    }
+    let fault = decodedCurrent.controlGenerationSaturated
+      ? newErasureJobIntegrityFault(current, "control_audit_invalid")
+      : classifyErasureJobRecordFault(current);
+    const normallyDue = current.availableAtMs !== undefined
+      && Number.isSafeInteger(current.availableAtMs)
+      && current.availableAtMs <= options.nowMs
+      && (
+        current.claimToken === undefined
+        || (current.leaseUntilMs !== undefined
+          && Number.isSafeInteger(current.leaseUntilMs)
+          && current.leaseUntilMs <= options.nowMs)
+      );
+    if (!fault && !normallyDue) return { kind: "skipped" };
+
+    const [auditRows] = await conn.query<Row[]>(
+      `SELECT request_id, seq, event_type, payload, emitted_at_ms
+         FROM erasure_audit_events
+        WHERE request_id=? ORDER BY seq FOR SHARE`,
+      [current.requestId],
+    );
+    const controlValidationAudits = rowsToErasureControlValidationAudits(auditRows);
+    const [controlRows] = await conn.query<Row[]>(
+      `SELECT ${ERASURE_CONTROL_EVENT_COLUMNS}
+         FROM erasure_job_control_events
+        WHERE request_id=? ORDER BY control_generation, control_event_id FOR SHARE`,
+      [current.requestId],
+    );
+
+    if (!fault && (
+      subjectDecodeFailed
+      || !tenant
+      || tenant.tenantId !== current.tenantId
+      || tenant.subjectKind !== "tenant"
+      || tenant.subjectId !== current.tenantId
+      || (current.subjectKind === "user" && tenant.state !== "active")
+      || !subject
+      || subject.tenantId !== current.tenantId
+      || subject.subjectKind !== current.subjectKind
+      || subject.subjectId !== current.subjectId
+      || subject.state !== "deleting"
+      || subject.generation !== current.generation
+      || subject.activeRequestId !== current.requestId
+    )) fault = newErasureJobIntegrityFault(current, "subject_binding_invalid");
+    if (!fault) {
+      try {
+        const audits = rowsToErasureAuditEvents(auditRows);
+        validateErasureAuditChain(current, audits);
+      } catch {
+        fault = newErasureJobIntegrityFault(current, "audit_chain_invalid");
+      }
+    }
+    if (
+      !fault
+      && current.subjectKind === "user"
+      && current.requestHash !== userErasureRequestHash(current.tenantId, current.subjectId)
+    ) fault = newErasureJobIntegrityFault(current, "idempotency_binding_invalid");
+    // A torn quarantine overlay is queue-control poison, not proof that the append-only audit is
+    // corrupt. Validate the audit against the pre-overlay projection in that one recoverable case;
+    // every other mismatch still takes precedence as control_audit_invalid. A normal quarantine
+    // advances to a free safe generation; an exhausted row fence takes the terminal no-event path.
+    const quarantineMarkerCount = [
+      current.quarantinedAtMs,
+      current.quarantineReasonCode,
+      current.quarantineEvidenceSha256,
+    ].filter((value) => value !== undefined).length;
+    const controlRecord = fault?.reasonCode === "queue_control_invalid"
+      && quarantineMarkerCount > 0
+      && quarantineMarkerCount < 3
+      ? (() => {
+          const normalized = { ...current };
+          delete normalized.quarantinedAtMs;
+          delete normalized.quarantineReasonCode;
+          delete normalized.quarantineEvidenceSha256;
+          return normalized;
+        })()
+      : current;
+    try {
+      const controlEvents = controlRows.map(rowToErasureControlEvent);
+      validateErasureJobControlAudit(controlRecord, controlValidationAudits, controlEvents);
+    } catch {
+      fault = newErasureJobIntegrityFault(current, "control_audit_invalid");
+    }
+    if (fault) {
+      await this.quarantineLockedErasureJob(
+        conn,
+        current,
+        decodedCurrent.rawControlGeneration,
+        fault,
+        controlRows,
+        options.nowMs,
+      );
+      return { kind: "consumed" };
+    }
+
+    const next: ErasureRequestRecord = {
+      ...current,
+      attempts: current.attempts + 1,
+      claimToken: options.claimToken,
+      leaseUntilMs,
+    };
+    validateErasureRequestRecord(next);
+    const [updated] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE erasure_requests
+          SET attempts=?, claim_token=?, lease_until_ms=?
+        WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+          AND status=? AND available_at_ms IS NOT NULL AND available_at_ms<=?
+          AND quarantined_at_ms IS NULL
+          AND quarantine_reason_code IS NULL
+          AND quarantine_evidence_sha256 IS NULL
+          AND control_generation=?
+          AND (claim_token IS NULL OR lease_until_ms<=?)`,
+      [
+        next.attempts,
+        options.claimToken,
+        leaseUntilMs,
+        current.requestId,
+        current.tenantId,
+        current.subjectKind,
+        current.subjectId,
+        current.generation,
+        current.status,
+        options.nowMs,
+        current.controlGeneration,
+        options.nowMs,
+      ],
+    );
+    if (updated.affectedRows !== 1) throw new Error("erasure job changed while locked");
+    return { kind: "consumed", record: next };
+  }
+
+  /**
+   * A damaged owner/generation/time envelope cannot enter the repairable control chain without
+   * guessing authority. Preserve a hash commitment to the exact locked BIGINT/string fields,
+   * revoke queue authority, and append a private terminal incident in this same transaction.
+   */
+  private async terminallyIsolateUnsafeErasureJobEnvelope(
+    conn: PoolConnection,
+    raw: ErasureJobUnsafeQuarantineEnvelope,
+    atMs: number,
+  ): Promise<void> {
+    if (!isClaimableErasureRequestStatus(raw.status as ErasureRequestStatus)) {
+      throw new Error("erasure request is not terminally isolatable");
+    }
+    const evidenceSha256 = erasureJobUnsafeQuarantineEnvelopeEvidenceSha256(raw);
+    const [updated] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE erasure_requests
+          SET control_generation=?, quarantined_at_ms=?,
+              quarantine_reason_code='control_audit_invalid',
+              quarantine_evidence_sha256=?, available_at_ms=NULL, claim_token=NULL,
+              lease_until_ms=NULL
+        WHERE request_id=? AND control_generation=?`,
+      [
+        raw.rawControlGeneration,
+        atMs,
+        evidenceSha256,
+        raw.requestId,
+        raw.rawControlGeneration,
+      ],
+    );
+    if (updated.affectedRows !== 1) {
+      throw new Error("erasure request changed while terminally isolating its envelope");
+    }
+    await conn.query(
+      `INSERT INTO erasure_job_terminal_incidents
+         (request_id, raw_control_generation, reason_code, evidence_sha256, emitted_at_ms)
+       VALUES (?,?,'unsafe_quarantine_envelope',?,?)`,
+      [raw.requestId, raw.rawControlGeneration, evidenceSha256, atMs],
+    );
+  }
+
+  private async quarantineLockedErasureJob(
+    conn: PoolConnection,
+    current: ErasureRequestRecord,
+    rawControlGeneration: string,
+    fault: ErasureJobIntegrityFault,
+    controlRows: readonly Row[],
+    atMs: number,
+  ): Promise<void> {
+    if (!isClaimableErasureRequestStatus(current.status) || isErasureJobQuarantined(current)) {
+      throw new Error("erasure request is not safely quarantineable");
+    }
+    const occupiedSafeGenerations = new Set<number>();
+    for (const row of controlRows) {
+      try {
+        const generation = mysqlSafeInteger(
+          row.control_generation,
+          "stored erasure control generation",
+        );
+        if (generation > 0) occupiedSafeGenerations.add(generation);
+      } catch {
+        // An unsafe/invalid event is itself control_audit_invalid evidence. It must not prevent a
+        // safe row fence and durable quarantine; this chain intentionally remains non-repairable.
+      }
+    }
+    let controlGeneration = current.controlGeneration + 1;
+    while (Number.isSafeInteger(controlGeneration) && occupiedSafeGenerations.has(controlGeneration)) {
+      controlGeneration += 1;
+    }
+    if (!Number.isSafeInteger(controlGeneration) || controlGeneration <= 0) {
+      await this.terminallyQuarantineLockedErasureJob(
+        conn,
+        current,
+        rawControlGeneration,
+        atMs,
+      );
+      return;
+    }
+    const evidenceSha256 = erasureJobInterventionEvidenceSha256({
+      requestId: current.requestId,
+      controlGeneration,
+      phase: current.status,
+      kind: "quarantine",
+      reasonCode: fault.reasonCode,
+    });
+    const effectiveAtMs = Math.max(
+      atMs,
+      Number.isSafeInteger(current.gatedAtMs) ? current.gatedAtMs : atMs,
+      Number.isSafeInteger(current.updatedAtMs) ? current.updatedAtMs : atMs,
+    );
+    const [updated] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE erasure_requests
+          SET control_generation=?, quarantined_at_ms=?, quarantine_reason_code=?,
+              quarantine_evidence_sha256=?, available_at_ms=NULL, claim_token=NULL,
+              lease_until_ms=NULL, updated_at_ms=?
+        WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+          AND status=? AND control_generation=?
+          AND quarantined_at_ms <=> ? AND quarantine_reason_code <=> ?
+          AND quarantine_evidence_sha256 <=> ?`,
+      [
+        controlGeneration,
+        effectiveAtMs,
+        fault.reasonCode,
+        evidenceSha256,
+        effectiveAtMs,
+        current.requestId,
+        current.tenantId,
+        current.subjectKind,
+        current.subjectId,
+        current.generation,
+        current.status,
+        rawControlGeneration,
+        current.quarantinedAtMs ?? null,
+        current.quarantineReasonCode ?? null,
+        current.quarantineEvidenceSha256 ?? null,
+      ],
+    );
+    if (updated.affectedRows !== 1) throw new Error("erasure request changed while quarantining");
+    await conn.query(
+      `INSERT INTO erasure_job_control_events
+         (request_id, control_generation, event_type, phase, reason_code, action_code,
+          actor_key_id, before_sha256, after_sha256, emitted_at_ms)
+       VALUES (?,?,'erasure_job/quarantined',?,?,NULL,NULL,?,NULL,?)`,
+      [
+        current.requestId,
+        controlGeneration,
+        current.status,
+        fault.reasonCode,
+        evidenceSha256,
+        effectiveAtMs,
+      ],
+    );
+  }
+
+  /**
+   * Terminal exception for an exhausted/unrepresentable fence. The exact durable BIGINT is never
+   * reduced, no colliding control event is fabricated, and the row becomes permanently
+   * unavailable to workers while remaining owner/maintenance-readable.
+   */
+  private async terminallyQuarantineLockedErasureJob(
+    conn: PoolConnection,
+    current: ErasureRequestRecord,
+    rawControlGeneration: string,
+    atMs: number,
+  ): Promise<void> {
+    const maximum = BigInt(Number.MAX_SAFE_INTEGER);
+    const currentFence = BigInt(rawControlGeneration);
+    const terminalFence = currentFence < maximum ? maximum : currentFence;
+    const terminalFenceText = terminalFence.toString();
+    const effectiveAtMs = Math.max(
+      atMs,
+      Number.isSafeInteger(current.gatedAtMs) ? current.gatedAtMs : atMs,
+      Number.isSafeInteger(current.updatedAtMs) ? current.updatedAtMs : atMs,
+    );
+    const evidenceSha256 = erasureJobTerminalInterventionEvidenceSha256({
+      requestId: current.requestId,
+      rawControlGeneration: terminalFenceText,
+      phase: current.status,
+      reasonCode: "control_audit_invalid",
+    });
+    const [updated] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE erasure_requests
+          SET control_generation=?, quarantined_at_ms=?,
+              quarantine_reason_code='control_audit_invalid',
+              quarantine_evidence_sha256=?, available_at_ms=NULL, claim_token=NULL,
+              lease_until_ms=NULL, updated_at_ms=?
+        WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+          AND status=? AND control_generation=?
+          AND quarantined_at_ms <=> ? AND quarantine_reason_code <=> ?
+          AND quarantine_evidence_sha256 <=> ?`,
+      [
+        terminalFenceText,
+        effectiveAtMs,
+        evidenceSha256,
+        effectiveAtMs,
+        current.requestId,
+        current.tenantId,
+        current.subjectKind,
+        current.subjectId,
+        current.generation,
+        current.status,
+        rawControlGeneration,
+        current.quarantinedAtMs ?? null,
+        current.quarantineReasonCode ?? null,
+        current.quarantineEvidenceSha256 ?? null,
+      ],
+    );
+    if (updated.affectedRows !== 1) {
+      throw new Error("erasure request changed while terminally quarantining");
     }
   }
 
@@ -1478,6 +2207,459 @@ export class MysqlSessionStore implements
         ],
       );
       if (updated.affectedRows !== 1) throw new Error("erasure job retry changed while locked");
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async inspectErasureJobIntervention(
+    identity: ErasureJobMaintenanceIdentity,
+  ): Promise<ErasureJobInterventionInspection | null> {
+    validateErasureJobMaintenanceIdentity(identity);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const context = await this.lockErasureMaintenanceContext(conn, identity, "FOR SHARE");
+      if (!context) {
+        await conn.commit();
+        return null;
+      }
+      const { record } = context;
+      if (isErasureJobQuarantined(record)) {
+        // Every individual event is decoded strictly. A quarantine whose reason is a broken
+        // control chain remains inspectable, but the broken chain cannot be declared repaired by
+        // this API; repairAndResume still requires the complete validator to pass.
+        try {
+          const controlEvents = context.controlRows.map(rowToErasureControlEvent);
+          validateErasureJobControlAudit(
+            record,
+            rowsToErasureControlValidationAudits(context.auditRows),
+            controlEvents,
+          );
+        } catch (error) {
+          if (record.quarantineReasonCode !== "control_audit_invalid") throw error;
+        }
+        const reasonCode = record.quarantineReasonCode!;
+        const evidenceSha256 = record.quarantineEvidenceSha256!;
+        const rawControlGeneration = BigInt(context.rawControlGeneration);
+        const maximumSafeGeneration = BigInt(Number.MAX_SAFE_INTEGER);
+        // A raw fence above the public number domain must be bound only by the exact-decimal
+        // terminal evidence. Accepting the MAX_SAFE projection there would hide a database-level
+        // change to the original BIGINT, even though the row remains non-repairable.
+        const expected = rawControlGeneration > maximumSafeGeneration
+          ? undefined
+          : erasureJobInterventionEvidenceSha256({
+              requestId: record.requestId,
+              controlGeneration: record.controlGeneration,
+              phase: record.status,
+              kind: "quarantine",
+              reasonCode,
+            });
+        const terminalExpected = reasonCode === "control_audit_invalid"
+          && rawControlGeneration >= maximumSafeGeneration
+          ? erasureJobTerminalInterventionEvidenceSha256({
+              requestId: record.requestId,
+              rawControlGeneration: context.rawControlGeneration,
+              phase: record.status,
+              reasonCode,
+            })
+          : undefined;
+        if (expected !== evidenceSha256 && terminalExpected !== evidenceSha256) {
+          throw new Error("erasure quarantine evidence is corrupt");
+        }
+        const currentAudits = reasonCode === "audit_chain_invalid"
+          ? context.auditRows.map((row) => ({
+              requestId: String(row.request_id),
+              seq: Number(row.seq),
+              type: String(row.event_type) as ErasureAuditEvent["type"],
+              // Inspection needs only the bounded envelope/count. Repair always decodes and
+              // validates the actual payload before restoring authority.
+              payload: {},
+              emittedAtMs: Number(row.emitted_at_ms),
+            }))
+          : rowsToErasureAuditEvents(context.auditRows);
+        // A corrupt control chain is observable through this bounded projection but cannot be
+        // proven repaired by an API that itself relies on that append-only chain as authority.
+        const allowedActions = reasonCode === "control_audit_invalid"
+          ? []
+          : erasureJobAllowedMaintenanceActions(record, currentAudits);
+        await conn.commit();
+        return {
+          requestId: record.requestId,
+          phase: record.status,
+          controlGeneration: record.controlGeneration,
+          kind: "quarantine",
+          reasonCode,
+          evidenceSha256,
+          occurredAtMs: record.quarantinedAtMs!,
+          allowedActions,
+        };
+      }
+
+      if (record.status !== "blocked") {
+        await conn.commit();
+        return null;
+      }
+      if (
+        !context.tenant
+        || (record.subjectKind === "user" && context.tenant.state !== "active")
+      ) throw new Error("erasure request tenant lifecycle is invalid");
+      const { audits } = await this.assertLockedErasureJobIntegrity(
+        conn,
+        record,
+        "FOR SHARE",
+        context.subject,
+      );
+      const reasonCode = record.lastErrorCode!;
+      const evidenceSha256 = erasureJobInterventionEvidenceSha256({
+        requestId: record.requestId,
+        controlGeneration: record.controlGeneration,
+        phase: record.status,
+        kind: "blocked",
+        reasonCode,
+      });
+      const allowedActions = erasureJobAllowedMaintenanceActions(record, audits);
+      const resumePhase = allowedActions.includes("resume_blocked")
+        ? deriveBlockedErasureResumePhase(record, audits)
+        : undefined;
+      const result: ErasureJobInterventionInspection = {
+        requestId: record.requestId,
+        phase: record.status,
+        controlGeneration: record.controlGeneration,
+        kind: "blocked",
+        reasonCode,
+        evidenceSha256,
+        occurredAtMs: audits.at(-1)!.emittedAtMs,
+        ...(resumePhase === undefined ? {} : { resumePhase }),
+        allowedActions,
+      };
+      await conn.commit();
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async repairAndResumeErasureJob(input: RepairAndResumeErasureJobInput): Promise<boolean> {
+    validateRepairAndResumeErasureJobInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const context = await this.lockErasureMaintenanceContext(conn, input, "FOR UPDATE");
+      if (!context) {
+        await conn.commit();
+        return false;
+      }
+      const current = context.record;
+      if (current.controlGeneration !== input.expectedControlGeneration) {
+        await conn.commit();
+        return false;
+      }
+
+      if (isErasureJobQuarantined(current)) {
+        const expectedEvidenceSha256 = erasureJobInterventionEvidenceSha256({
+          requestId: current.requestId,
+          controlGeneration: current.controlGeneration,
+          phase: current.status,
+          kind: "quarantine",
+          reasonCode: current.quarantineReasonCode!,
+        });
+        if (
+          current.quarantineEvidenceSha256 !== expectedEvidenceSha256
+          || input.expectedEvidenceSha256 !== expectedEvidenceSha256
+          || input.actionCode === "resume_blocked"
+        ) {
+          await conn.commit();
+          return false;
+        }
+        const currentAudits = rowsToErasureAuditEvents(context.auditRows);
+        const allowedActions = current.quarantineReasonCode === "control_audit_invalid"
+          ? []
+          : erasureJobAllowedMaintenanceActions(current, currentAudits);
+        if (!allowedActions.includes(input.actionCode)) {
+          await conn.commit();
+          return false;
+        }
+        const currentControlEvents = context.controlRows.map(rowToErasureControlEvent);
+        validateErasureJobControlAudit(current, currentAudits, currentControlEvents);
+
+        const effectiveAtMs = Math.max(current.updatedAtMs, input.atMs);
+        const next: ErasureRequestRecord = { ...current };
+        next.controlGeneration = current.controlGeneration + 1;
+        next.updatedAtMs = effectiveAtMs;
+        next.availableAtMs = effectiveAtMs;
+        delete next.claimToken;
+        delete next.leaseUntilMs;
+        delete next.quarantinedAtMs;
+        delete next.quarantineReasonCode;
+        delete next.quarantineEvidenceSha256;
+
+        let stagedAudits = currentAudits;
+        if (input.actionCode === "restore_initial_gate_audit") {
+          if (current.status !== "gated" || currentAudits.length !== 0) {
+            await conn.commit();
+            return false;
+          }
+          stagedAudits = [{
+            requestId: current.requestId,
+            seq: 1,
+            type: "erasure/gated",
+            payload: {
+              status: "gated",
+              subjectKind: current.subjectKind,
+              generation: current.generation,
+            },
+            emittedAtMs: current.gatedAtMs,
+          }];
+        }
+
+        validateErasureRequestRecord(next);
+        validateErasureAuditChain(next, stagedAudits);
+        if (
+          !context.tenant
+          || (next.subjectKind === "user" && context.tenant.state !== "active")
+          || !context.subject
+          || context.subject.tenantId !== next.tenantId
+          || context.subject.subjectKind !== next.subjectKind
+          || context.subject.subjectId !== next.subjectId
+          || context.subject.state !== "deleting"
+          || context.subject.generation !== next.generation
+          || context.subject.activeRequestId !== next.requestId
+        ) throw new Error("repaired erasure request does not match its subject lifecycle");
+        if (
+          next.subjectKind === "user"
+          && next.requestHash !== userErasureRequestHash(next.tenantId, next.subjectId)
+        ) throw new Error("repaired erasure request idempotency binding is invalid");
+
+        const controlOutcome = {
+          requestId: next.requestId,
+          controlGeneration: next.controlGeneration,
+          eventType: "erasure_job/quarantine_repaired" as const,
+          phase: next.status,
+          reasonCode: current.quarantineReasonCode!,
+          actionCode: input.actionCode,
+          actorKeyId: input.actorKeyId,
+          beforeSha256: expectedEvidenceSha256,
+          emittedAtMs: effectiveAtMs,
+        };
+        const afterSha256 = erasureJobControlOutcomeSha256(controlOutcome);
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE erasure_requests
+              SET control_generation=?, quarantined_at_ms=NULL, quarantine_reason_code=NULL,
+                  quarantine_evidence_sha256=NULL, available_at_ms=?, claim_token=NULL,
+                  lease_until_ms=NULL, updated_at_ms=?
+            WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+              AND status=? AND control_generation=? AND quarantined_at_ms=?
+              AND quarantine_reason_code=? AND quarantine_evidence_sha256=?`,
+          [
+            next.controlGeneration,
+            next.availableAtMs,
+            next.updatedAtMs,
+            current.requestId,
+            current.tenantId,
+            current.subjectKind,
+            current.subjectId,
+            current.generation,
+            current.status,
+            input.expectedControlGeneration,
+            current.quarantinedAtMs,
+            current.quarantineReasonCode,
+            expectedEvidenceSha256,
+          ],
+        );
+        if (updated.affectedRows !== 1) throw new Error("erasure quarantine changed while repairing");
+        if (input.actionCode === "restore_initial_gate_audit") {
+          const audit = stagedAudits[0]!;
+          await conn.query(
+            `INSERT INTO erasure_audit_events
+               (request_id, seq, event_type, payload, emitted_at_ms)
+             VALUES (?,?,?,?,?)`,
+            [audit.requestId, audit.seq, audit.type, json(audit.payload), audit.emittedAtMs],
+          );
+        }
+        const [inserted] = await conn.query<mysql.ResultSetHeader>(
+          `INSERT INTO erasure_job_control_events
+             (request_id, control_generation, event_type, phase, reason_code, action_code,
+              actor_key_id, before_sha256, after_sha256, emitted_at_ms)
+           VALUES (?,?,'erasure_job/quarantine_repaired',?,?,?,?,?,?,?)`,
+          [
+            next.requestId,
+            next.controlGeneration,
+            next.status,
+            current.quarantineReasonCode,
+            input.actionCode,
+            input.actorKeyId,
+            expectedEvidenceSha256,
+            afterSha256,
+            effectiveAtMs,
+          ],
+        );
+        const controlEvent: ErasureJobControlEvent = {
+          controlEventId: Number(inserted.insertId),
+          requestId: next.requestId,
+          controlGeneration: next.controlGeneration,
+          eventType: "erasure_job/quarantine_repaired",
+          phase: next.status,
+          reasonCode: current.quarantineReasonCode!,
+          actionCode: input.actionCode,
+          actorKeyId: input.actorKeyId,
+          beforeSha256: expectedEvidenceSha256,
+          afterSha256,
+          emittedAtMs: effectiveAtMs,
+        };
+        validateErasureJobControlEvent(controlEvent);
+        validateErasureJobControlAudit(
+          next,
+          stagedAudits,
+          [...currentControlEvents, controlEvent],
+        );
+        await conn.commit();
+        return true;
+      }
+
+      if (current.status !== "blocked" || input.actionCode !== "resume_blocked") {
+        await conn.commit();
+        return false;
+      }
+      if (
+        !context.tenant
+        || (current.subjectKind === "user" && context.tenant.state !== "active")
+      ) throw new Error("erasure request tenant lifecycle is invalid");
+      const { audits: currentAudits, controlEvents: currentControlEvents } =
+        await this.assertLockedErasureJobIntegrity(
+          conn,
+          current,
+          "FOR UPDATE",
+          context.subject,
+        );
+      const reasonCode = current.lastErrorCode!;
+      const evidenceSha256 = erasureJobInterventionEvidenceSha256({
+        requestId: current.requestId,
+        controlGeneration: current.controlGeneration,
+        phase: current.status,
+        kind: "blocked",
+        reasonCode,
+      });
+      if (evidenceSha256 !== input.expectedEvidenceSha256) {
+        await conn.commit();
+        return false;
+      }
+      if (!erasureJobAllowedMaintenanceActions(current, currentAudits).includes("resume_blocked")) {
+        await conn.commit();
+        return false;
+      }
+      const resumePhase = deriveBlockedErasureResumePhase(current, currentAudits);
+      const effectiveAtMs = Math.max(current.updatedAtMs, input.atMs);
+      const next: ErasureRequestRecord = {
+        ...current,
+        status: resumePhase,
+        controlGeneration: current.controlGeneration + 1,
+        updatedAtMs: effectiveAtMs,
+        availableAtMs: effectiveAtMs,
+      };
+      delete next.lastErrorCode;
+      delete next.claimToken;
+      delete next.leaseUntilMs;
+      validateErasureRequestRecord(next);
+      const resumedAudit: ErasureAuditEvent = {
+        requestId: next.requestId,
+        seq: currentAudits.length + 1,
+        type: "erasure/resumed",
+        payload: {
+          fromStatus: "blocked",
+          status: resumePhase,
+          generation: next.generation,
+          ...(next.policyVersion === undefined ? {} : { policyVersion: next.policyVersion }),
+          ...(next.policyHash === undefined ? {} : { policyHash: next.policyHash }),
+        },
+        emittedAtMs: effectiveAtMs,
+      };
+      const stagedAudits = [...currentAudits, resumedAudit];
+      validateErasureAuditChain(next, stagedAudits);
+      const controlOutcome = {
+        requestId: next.requestId,
+        controlGeneration: next.controlGeneration,
+        eventType: "erasure_job/blocked_resumed" as const,
+        phase: next.status,
+        reasonCode,
+        actionCode: "resume_blocked" as const,
+        actorKeyId: input.actorKeyId,
+        beforeSha256: evidenceSha256,
+        emittedAtMs: effectiveAtMs,
+      };
+      const afterSha256 = erasureJobControlOutcomeSha256(controlOutcome);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE erasure_requests
+            SET status=?, control_generation=?, available_at_ms=?, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+            AND status='blocked' AND control_generation=? AND last_error_code=?
+            AND quarantined_at_ms IS NULL AND quarantine_reason_code IS NULL
+            AND quarantine_evidence_sha256 IS NULL`,
+        [
+          next.status,
+          next.controlGeneration,
+          next.availableAtMs,
+          next.updatedAtMs,
+          current.requestId,
+          current.tenantId,
+          current.subjectKind,
+          current.subjectId,
+          current.generation,
+          input.expectedControlGeneration,
+          reasonCode,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new Error("blocked erasure request changed while resuming");
+      await conn.query(
+        `INSERT INTO erasure_audit_events
+           (request_id, seq, event_type, payload, emitted_at_ms)
+         VALUES (?,?,?,?,?)`,
+        [resumedAudit.requestId, resumedAudit.seq, resumedAudit.type, json(resumedAudit.payload), effectiveAtMs],
+      );
+      const [inserted] = await conn.query<mysql.ResultSetHeader>(
+        `INSERT INTO erasure_job_control_events
+           (request_id, control_generation, event_type, phase, reason_code, action_code,
+            actor_key_id, before_sha256, after_sha256, emitted_at_ms)
+         VALUES (?,?,'erasure_job/blocked_resumed',?,?, 'resume_blocked',?,?,?,?)`,
+        [
+          next.requestId,
+          next.controlGeneration,
+          next.status,
+          reasonCode,
+          input.actorKeyId,
+          evidenceSha256,
+          afterSha256,
+          effectiveAtMs,
+        ],
+      );
+      const controlEvent: ErasureJobControlEvent = {
+        controlEventId: Number(inserted.insertId),
+        requestId: next.requestId,
+        controlGeneration: next.controlGeneration,
+        eventType: "erasure_job/blocked_resumed",
+        phase: next.status,
+        reasonCode,
+        actionCode: "resume_blocked",
+        actorKeyId: input.actorKeyId,
+        beforeSha256: evidenceSha256,
+        afterSha256,
+        emittedAtMs: effectiveAtMs,
+      };
+      validateErasureJobControlEvent(controlEvent);
+      validateErasureJobControlAudit(
+        next,
+        stagedAudits,
+        [...currentControlEvents, controlEvent],
+      );
       await conn.commit();
       return true;
     } catch (error) {

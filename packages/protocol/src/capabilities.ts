@@ -28,6 +28,16 @@ export const INTERNAL_ERASURE_DRAIN_ACK_HEADER = "x-agent-service-erasure-worker
 export const INTERNAL_ERASURE_DRAIN_ACK_VALUE = "drain-v1" as const;
 
 /**
+ * A runner probes this router-only endpoint before it may claim a durable erasure job. The router
+ * acknowledges only after this router process has successfully observed every configured stable
+ * runner address on the additive 0013 quarantine/control contract. A later pure outage preserves
+ * that observation for crash recovery; an explicit legacy/incompatible response revokes it.
+ */
+export const INTERNAL_ERASURE_JOB_CONTROL_READY_PATH = "/_internal/user-erasure-job-control-v1/ready" as const;
+export const INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER = "x-agent-service-erasure-job-control" as const;
+export const INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE = "quarantine-v1" as const;
+
+/**
  * Fixed, content-free signal from a runner whose old local execution is already fenced but has not
  * acknowledged abort yet. The router may bypass that runner only after the authoritative Redis
  * lease has expired; until then it must not create overlapping execution on another runner.
@@ -63,6 +73,8 @@ export const Capabilities = z.object({
      * durable jobs still need to drain a mixed owner fleet.
      */
     userErasureWorker: z.array(z.literal("drain-v1")).max(1).default([]),
+    /** Runner-to-router rollout signal; public routers deliberately project this as an empty list. */
+    erasureJobControl: z.array(z.literal("quarantine-v1")).max(1).default([]),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

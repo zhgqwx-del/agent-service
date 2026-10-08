@@ -19,9 +19,9 @@ scripts/local-service.sh down        # 停应用和本地基础设施
 验证入口：
 
 ```bash
-scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 0007→0012 历史迁移 + lifecycle 专项 + cluster + SDK/应用构建产物
+scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 0007→0013 历史迁移 + lifecycle 专项 + cluster + SDK/应用构建产物
 scripts/local-service.sh verify-real  # 使用本机 .env，仅跑真实模型 E2E
-pnpm test:migrations                  # 独立真实 MySQL：固定 0007→0008→0009→0010→0011→0012 历史升级
+pnpm test:migrations                  # 独立真实 MySQL：固定 0007→0008→0009→0010→0011→0012→0013 历史升级
 pnpm test:blob-mysql                  # 强制执行并验明 Blob ownership/绑定/cleanup 的独立真实 MySQL 套件
 pnpm test:usage-lifecycle-mysql       # 强制执行 usage 双写/reconcile/anonymize 的独立真实 MySQL 套件
 pnpm test:subject-lifecycle-mysql     # 强制执行 subject gate/erasure request 的独立真实 MySQL 套件
@@ -39,7 +39,7 @@ pnpm check:sdk                        # 编译 SDK、原生 Node import，并检
 
 - `agent-router`：无业务状态，可独立扩缩容。需要能访问全部 runner 的 `RUNNER_ADDR` 和共享 Redis。
 - `agent-runner`：每个实例必须有全局唯一 `RUNNER_ID`，并发布其它 router/runner 可访问的 `RUNNER_ADDR`；terminal-event dispatcher、Blob cleanup 与 user-erasure worker 都内嵌于 runner，不新增第三个应用服务。
-- MySQL：业务真相、事件、审批、配置、operational usage ledger、去身份化 billing facts/reconciliation、subject lifecycle/erasure request/audit、Blob ownership manifest 和两个独立 outbox。生产迁移应作为独立 Job 执行，不能依赖所有 runner 同时自动迁移。
+- MySQL：业务真相、事件、审批、配置、operational usage ledger、去身份化 billing facts/reconciliation、subject lifecycle/erasure request/main audit、append-only erasure job control audit、Blob ownership manifest 和两个独立 outbox。生产迁移应作为独立 Job 执行，不能依赖所有 runner 同时自动迁移。
 - Redis：租约、fence counter、owner 目录和事件扇出。生产环境必须启用满足恢复目标的持久化/高可用方案，不能把它当可随意清空的缓存。
 - BlobStore：本地 filesystem adapter 已接入输入图片 item 与大工具输出；key 采用跨平台无大小写歧义的小写 grammar，新写入使用版本化 storage format，数据与 metadata 以覆盖 header/长度/正文的 SHA-256 单 envelope 原子发布，目录/文件权限为 0700/0600，并可过渡读取/删除安全 key 范围内的旧 raw + sidecar 格式。业务行只保存 owner-scoped opaque `blobId`，`0010` 的 manifest 私有保存 backend/key/token/integrity；`staging → ready` 与 item commit 原子绑定，过期未绑定 staging 经专用 outbox/claim lease 物理删除。该 root 必须由服务独占，当前也没有验证或承诺多 runner/NFS 共享语义；Node 没有可移植的 `openat/O_NOFOLLOW`，不能抵御有权同时替换目录项的恶意本机进程，本地原子发布也不等同于断电持久性承诺。ready Blob 的 erasure/物理 purge 尚未开启，生产必须先替换为共享 OSS/S3 adapter。
 
@@ -56,8 +56,8 @@ Runner 必需配置：
 - `INTERNAL_ROUTER_TOKEN`：router→runner 内部破坏性路由的共享凭证；production 必填，必须从 Secret 注入并与 router 完全一致
 - `MAX_BODY_BYTES`：必须与 router 使用相同值；默认 1 MB，由 router 先拒绝超限请求
 - `LIFECYCLE_OUTBOX_*`：runner 内置 terminal-event dispatcher 的 poll、claim lease、批量和退避边界；该 dispatcher 只处理 `session.tombstoned`，不是 purge worker
-- `DATA_ERASURE_REQUESTS_ENABLED`：user erasure request/status admission，默认 `0`；只控制新 POST，不撤销 durable gate或停止历史 job
-- `ERASURE_WORKER_ENABLED`、`ERASURE_ROUTER_URL`：内嵌 durable worker及私有 router origin；local 默认 worker=`1`，与 admission 独立。worker最多推进到 `awaiting_purge_policy`，不执行 anonymize/purge/completed
+- `DATA_ERASURE_REQUESTS_ENABLED`：user erasure request writer capability，默认 `0`；直接控制新 POST，不撤销 durable gate或停止历史 job。status GET不依赖router writer gate，但仍按runner capability与healthy selected target fail-closed
+- `ERASURE_WORKER_ENABLED`、`ERASURE_ROUTER_URL`：内嵌 durable worker及私有 router origin；local 默认 worker=`1`，与 admission 独立。worker在每次claim前还会调用token-protected router barrier，未获得固定ACK就不接触数据库queue；最多推进到 `awaiting_purge_policy`，不执行 anonymize/purge/completed
 - `ERASURE_WORKER_*`：poll、claim lease、job batch、session page、retry 与单次私有 router 请求超时；`ERASURE_WORKER_REQUEST_TIMEOUT_MS` 默认 20s
 - `ERASURE_DRAIN_TIMEOUT_MS`：runner 内部等待 active turn 到安全边界的上限，默认 10s。部署必须保持 `ERASURE_DRAIN_TIMEOUT_MS < router UPSTREAM_HEADER_TIMEOUT_MS < ERASURE_WORKER_REQUEST_TIMEOUT_MS`（当前默认 10s < 15s < 20s），否则外层先超时会破坏 drain 的可判定性
 - `BLOB_DIR`：当前 filesystem adapter 的服务独占 root；本地脚本默认 `.local-run/blobs`，多 runner/NFS 语义未受支持，不能复制充当生产对象存储
@@ -74,7 +74,7 @@ Router 必需配置：
 - `REDIS_URL`：与 runner 相同的逻辑 Redis 集群
 - `INTERNAL_ROUTER_TOKEN`：与全部 runner 完全一致的共享凭证；router 会剥离客户端伪造的同名 header，仅在版本化内部 tombstone 请求上重新注入
 - `SESSION_TOMBSTONE_ENABLED`：显式 expand→activate 开关；local 脚本默认 `1`，staging/production 发布时默认保持 `0`，且 router 仍会要求全部健康 runner 声明 `tombstone`
-- `DATA_ERASURE_REQUESTS_ENABLED`：user erasure writer gate，local/staging/production 默认都是 `0`。POST 还要求 `RUNNERS` 中全部 configured targets 均已健康探测并声明 capability，且选中 target 仍支持；暂时不可达的已配置实例也会阻断激活。状态 GET 不依赖这个 router writer gate，继续按当前 healthy fleet/selected target capability 规则 fail-closed；writer gate 开启时，所有 user-scoped runtime 每次转发都复核 selected target capability
+- `DATA_ERASURE_REQUESTS_ENABLED`：user erasure writer gate，local/staging/production 默认都是 `0`。POST 还要求 `RUNNERS` 中全部 configured targets 均已健康探测并声明 capability，且选中 target 仍支持；暂时不可达的已配置实例也会阻断激活。状态 GET 不依赖这个 router writer gate，继续按当前 healthy fleet/selected target capability 规则 fail-closed；writer gate 开启时，所有 user-scoped runtime 每次转发都复核 selected target capability。另有不公开的worker barrier要求本router进程曾逐一观察每个稳定地址支持`erasureJobControl=quarantine-v1`
 - `BLOB_FILESYSTEM_SINGLE_RUNNER`：当前 local router 与 runner 一致设为 `1`；只用于单 runner filesystem 拓扑，router 会强制 `RUNNERS` 去重后恰好一个地址，不能带入多实例环境
 - `BLOB_ATTACHMENTS_ENABLED`：新 Blob 上传的独立 gate；local 默认 `1`，router 还要求全部健康 runner 声明 `blobAttachments`。当前 production filesystem 配置禁止开启
 - `BLOB_MAX_BYTES`：只约束 raw Blob upload，必须与 runner 一致并且不大于双方的 `MAX_BODY_BYTES`
@@ -96,11 +96,15 @@ tombstone 是 protocol family `2026-10-08` 内的 additive capability；它没�
 
 Blob 写入未来采用 expand→activate：先应用 expand-only `0010`，接入共享对象存储 adapter 后，让新 runner 以共享 reader/cleanup 开、writer 关的状态上线，发布 writer gate 关闭的新 router，确认全部健康 runner 支持 `blobAttachments` 且共享数据面可读写，最后才激活 writer gate。当前仓库只有 filesystem adapter，production 对 write 和 cleanup 都 fail closed，因此这套 rollout 还不是可执行的云部署步骤；不能把各 VM 本地目录、各 Pod 独立 volume 或手工文件复制当成共享数据面。
 
-user erasure 采用 expand→activate，当前仍只允许本地对可丢弃 user体验：先应用 expand-only `0011`/`0012`，发布 admission `0` 的新 router/runner 并排空 lifecycle-unaware writer；让全部 runner具备私有 `drain-v1` capability并开启 `ERASURE_WORKER_ENABLED`，最后才依次开启 runner、router admission。worker现在可跨 runner有界请求 abort、child-first tombstone、在 usage 写事务内重验 tombstone proof并停在 `awaiting_purge_policy`；真实集群覆盖 owner `SIGKILL`、lease不续期与更高 fence takeover。`0012` 尚无 claim-stage poison quarantine/repair，且 worker尚未物理删除内容或完成 request，所以 staging/production admission仍保持 `0`。紧急停止新请求时只关闭 router gate并保持 worker/capable runner运行；关闭 gate绝不撤销已提交 subject。
+user erasure 采用 expand→activate，当前仍只允许本地对可丢弃 user体验：先应用 expand-only `0011`/`0012`/`0013`；发布 admission `0` 且带私有control barrier的新 router，排空全部旧router；再滚动具备`drain-v1`与`quarantine-v1`的新runner/worker，排空0012 worker并等待其最大job lease过期。新worker每次claim前都要求router私有固定ACK；router必须先在本进程成功观察`RUNNERS`中的每个稳定地址支持`quarantine-v1`。观察后的纯网络不可达会保留进程内attestation，让存活worker仍可接管死亡owner；明确旧版、错误protocol/service、404或畸形capability会撤销。router重启会丢失attestation：若某configured runner仍宕机，claim会安全暂停，直到该地址恢复或经受控配置从`RUNNERS`移除。该可用性恢复步骤不能用共享LB替代稳定地址。
 
-erasure 的回滚边界以“首次请求已接受”为分界：关闭 router writer gate 只停止新的 erasure POST，绝不会撤销已持久化的 subject gate。writer gate 保持 `1` 时，router 会对 `/v1/sessions*`、`/v1/usage` 与 erasure 路径逐次检查 selected target capability，能力回退即返回可重试 `503` 而不转发；gate=`0` 的 expand mixed window 仍可提供普通 runtime。首次接受后必须保持所有处理 user 请求的 runner 都 lifecycle-aware，并优先 forward-fix；不能把业务流量回退给 pre-`0011` 或其它不检查 `subject_lifecycle` 的 runner，否则已 gated subject 可能重新可见并产生新写入。若事故处置确实必须恢复这类旧版本，必须先在 edge 精确阻断受影响的 tenant/user；若 edge 无法可靠识别 subject，则先阻断全部 user-scoped runtime 流量，再恢复旧应用。`0011` schema、erasure request/audit 与 subject gate 必须保留，不能用 down migration、关闭 feature flag 或回滚镜像把它们当作已撤销。
+fleet核对完成后才按需开启`ERASURE_WORKER_ENABLED`，最后依次开启runner、router admission。worker现在会逐候选隔离确定性claim poison、跨 runner有界请求 abort、child-first tombstone、在 usage 写事务内重验 tombstone proof并停在 `awaiting_purge_policy`；真实集群覆盖 quarantine/restart/repair、owner `SIGKILL`、lease不续期与更高 fence takeover。安全envelope进入可审计quarantine；request/tenant/subject identity、generation或有序安全时间戳本身损坏时，store保留原值、撤销queue authority并写不可修复的append-only terminal incident，不猜测owner且不会阻塞邻居。worker尚未物理删除内容或完成 request，所以 staging/production admission仍保持 `0`。紧急停止新请求时只关闭 router gate并保持 worker/capable runner运行；关闭 gate绝不撤销已提交 subject。私有barrier只约束新worker，不能阻止仍直连数据库的旧0012 worker，所以旧worker drain、网络/进程层阻断和forward-fix是硬发布条件。
 
-轮换 `INTERNAL_ROUTER_TOKEN` 时先把 tombstone gate 设为 `0`，在 DELETE 被拒绝期间依次让全部 runner 和 router 收敛到新值，核对健康与 capability 后再恢复 gate；当前不支持双 token 重叠窗口。不得把该 token 写入镜像、Git、日志或公开 API 文档。
+erasure 有两条不可逆回滚边界。第一条是“首次请求已接受”：关闭 router writer gate 只停止新的 erasure POST，绝不会撤销已持久化的 subject gate。writer gate 保持 `1` 时，router 会对 `/v1/sessions*`、`/v1/usage` 与 erasure 路径逐次检查 selected target capability，能力回退即返回可重试 `503` 而不转发；gate=`0` 的 expand mixed window仍可提供普通 runtime。首次接受后必须保持所有处理 user 请求的 runner 都 lifecycle-aware，并优先 forward-fix；不能把业务流量回退给 pre-`0011` 或其它不检查 `subject_lifecycle` 的 runner，否则已 gated subject 可能重新可见并产生新写入。
+
+第二条是“任一 quarantine/maintenance control event或terminal incident已写入”：此后不能回退到pre-`0013` reader/worker。router sticky observation在明确观察到旧runner时会关闭新claim，但它约束不了绕过router、直接连接数据库的旧worker；事故处置必须forward-fix，或先排空/阻断全部旧worker和受影响流量。若确实必须恢复pre-`0011`版本，先在edge精确阻断受影响tenant/user；edge无法可靠识别时先阻断全部user-scoped runtime。`0011` gate/audit、`0012` queue和`0013` control/incident history都必须保留，不能用down migration、feature flag或镜像回滚把它们当作已撤销。
+
+轮换 `INTERNAL_ROUTER_TOKEN` 时先把 tombstone writer gate和erasure request writer gate都设为`0`，并让erasure worker在当前原子job边界停领；durable subject gate与历史job保持不变。随后在DELETE/新erasure POST被拒绝、历史job暂停推进的窗口内，让全部runner和router收敛到新值，核对私有barrier、drain、健康与公开capability后再先恢复worker、最后恢复两个writer gate。当前不支持双token重叠窗口，不能只关闭tombstone gate后让使用旧token的erasure worker继续claim。不得把该 token 写入镜像、Git、日志或公开 API 文档。
 
 未来真正改变 protocol version 的不兼容 contract 仍由健康探测隔离：版本不匹配的 runner 不进入 hash ring，也不能通过 owner 重路由；这类升级需要全量 drain 的维护窗口或将旧/新 router+runner 整组 blue-green，除非另行实现 version range/按版本路由。`session/deleted` 本身不属于这类版本提升。
 
@@ -108,7 +112,7 @@ erasure 的回滚边界以“首次请求已接受”为分界：关闭 router w
 
 `pnpm build` 同时会为 router/runner 生成各自的单文件 ESM JavaScript bundle，可在装有 Node 24 和对应 production dependencies 的 Linux、macOS 或 Windows 主机运行，但它不是原生机器码二进制。目前 CI 对容器镜像和原生 Node bundle 都有启动门禁；生产默认推荐 OCI 镜像，因为依赖、Node 版本和文件布局也被一起冻结。若未来明确采用裸 VM，再增加带校验和的 bundle + production `node_modules` 发布包和 systemd 服务，不需要把两个服务合成一个二进制。
 
-“本地完整”指已实现链路可在真实 MySQL + Redis + router/runner 下重复运行；当前自动门禁还覆盖双 runner user-erasure remote drain、owner crash、fence takeover和停在 policy boundary。它不表示云依赖已被本机替代，也不表示数据生命周期闭环：export、claim-stage poison quarantine/repair、policy、legacy compensation、tenant/key revocation、ready/session purge、completed proof与 restore replay仍待完成。filesystem Blob只证明单 runner本地语义，不能外推成多 VM/Pod共享存储正确性。
+“本地完整”指已实现链路可在真实 MySQL + Redis + router/runner 下重复运行；当前自动门禁还覆盖双 runner user-erasure quarantine/repair、remote drain、owner crash、fence takeover和停在 policy boundary。它不表示云依赖已被本机替代，也不表示数据生命周期闭环：export、canonical policy/legal-hold、legacy compensation、tenant/key revocation、ready/session purge、completed proof与 restore replay仍待完成。filesystem Blob只证明单 runner本地语义，不能外推成多 VM/Pod共享存储正确性。
 
 当前 `MysqlSessionStore.connect()` 仍会自动执行迁移，适合 local/CI，但还不满足上文“生产迁移作为独立 Job”的目标。进入 staging 前必须拆出显式 migration 命令/Job，并让业务进程只做 schema 版本检查、禁止启动时自动 DDL；同时完成备份恢复与迁移失败后的人工审计/重试演练。
 
@@ -122,7 +126,9 @@ erasure 的回滚边界以“首次请求已接受”为分界：关闭 router w
 
 迁移 `0011_erasure_and_usage_separation.sql` 也是 expand-only：为 `usage_ledger` 增加 nullable、大小写敏感的 opaque `usage_id` 及唯一索引，新增只含最小财务字段的 `billing_usage_facts`、`usage_reconciliations`，以及 `subject_lifecycle`、`erasure_requests`、`erasure_audit_events`。它不会给历史 usage 伪造 ID 或 billing fact，不执行 reconcile/anonymize/purge，也不会伪造 erasure request；新写入才事务双写 operational 与 billing 两层。restart-safe `AFTER INSERT sessions` trigger 会为迁移后仍存活的旧 writer 原子补 tenant/user lifecycle 行，重放只做 insert、不会覆盖 gate/legal hold；它不拦截旧 writer 对已有 session 的写入，所以不能替代升级 drain。固定 0010 历史库的真实 MySQL 夹具验证 DDL auto-commit 中断后可重跑收敛、错误形状 identity 索引可修复、大小写敏感约束、旧 writer post-migration insert 与 gate/hold 保留，且既有 usage/session/outbox/blob 原样保留。CI 的 usage/subject lifecycle 独立套件不得 skip，并由 suite report 明确证明实际执行，而不是只验证 fresh schema。
 
-迁移 `0012_erasure_job_queue.sql` 继续 expand-only：为 request 增加 availability、attempt、claim token/lease、bounded error 与 policy identity，并安装兼容 0011 writer 的 insert trigger。它不会激活 purge；waiting/terminal row 始终不可领取，重放不会覆盖 future retry 或 live claim，残缺 claim pair 会 fail-safe 清空。固定 0011 历史夹具覆盖全部状态、legal hold、不可领取 purge intent、partial DDL、错误索引和 marker-loss replay；CI 还独立强制运行 queue/session/catalog/claim-bound usage 四个真实 MySQL 套件，并从主 report证明真实 MySQL worker的事务内 proof重验确实执行。`0012` 仍不隔离 claim-stage poison，下一 `0013` 必须补 durable quarantine/control audit/CAS repair。
+迁移 `0012_erasure_job_queue.sql` 继续 expand-only：为 request 增加 availability、attempt、claim token/lease、bounded error 与 policy identity，并安装兼容 0011 writer 的 insert trigger。它不会激活 purge；waiting/terminal row 始终不可领取，重放不会覆盖 future retry 或 live claim，残缺 claim pair 会 fail-safe 清空。固定 0011 历史夹具覆盖全部状态、legal hold、不可领取 purge intent、partial DDL、错误索引和 marker-loss replay；CI 还独立强制运行 queue/session/catalog/claim-bound usage 四个真实 MySQL 套件，并从主 report证明真实 MySQL worker的事务内 proof重验确实执行。
+
+迁移 `0013_erasure_job_control.sql` 也是 expand-only：为request增加control generation和三列quarantine overlay，新建append-only control event、append-only terminal incident表及quarantine-aware claim index；它不隔离既有row、不repair/resume、不激活purge。incident只保存request locator、exact raw control fence、fixed reason、SHA-256和时间，不复制tenant/user/subject/status/raw payload。MySQL 8.0.26兼容的多重UPDATE/DELETE trigger guard保证migration marker丢失或中断重放时仍收敛到两类append-only保护；早期错误unique-index形状会被修正，若同一request/generation已有冲突证据则迁移故意失败且不删除任一事件。固定0012历史夹具覆盖完整升级、control/incident建表断点、partial DDL/错误索引/marker-loss replay、两类append-only guards和冲突阻断；CI migration wrapper显式枚举该套件并拒绝missing/skipped。运行时按候选独立事务quarantine，maintenance control与普通worker capability分离。若监控发现 `control_audit_invalid`、terminal incident或safe-integer fence耗尽，则该row是永久terminal isolation：原始identity/time/BIGINT不得手工改写，不能补造event或调用普通repair；应保全证据、停止相关旧worker并通过后续受审计的专用迁移/事故流程处理。
 
 新版 `createSession` 会原子写入 session 与 `session/created(seq=1)`；混合版本窗口内旧 runner 仍是旧的两步路径，因此只有在旧实例全部排空后，才能把该原子性作为全 fleet 不变量。这个约束与下述 legacy pending 清理边界相同：不能在旧进程仍可能写入时提前宣告升级完成。
 

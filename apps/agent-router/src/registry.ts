@@ -43,8 +43,16 @@ const hash = (s: string) => {
 export class RunnerRegistry {
   private readonly targets = new Map<string, RunnerTarget>();
   private readonly ring: { point: number; url: string }[] = [];
+  /**
+   * Sticky only across transient health loss inside this router process. A target enters the set
+   * after a successful quarantine-v1 probe and leaves it after any later successful legacy probe.
+   * This distinguishes an unobserved rollout target from a known-compatible runner that crashed:
+   * the former must block activation, while the latter must not deadlock erasure recovery.
+   */
+  private readonly erasureJobControlCompatible = new Set<string>();
   private readonly redis?: Redis;
   private timer?: NodeJS.Timeout;
+  private checkInFlight?: Promise<void>;
 
   constructor(private readonly opts: RunnerRegistryOptions) {
     for (const url of opts.runners) {
@@ -83,6 +91,7 @@ export class RunnerRegistry {
 
   async close(): Promise<void> {
     clearInterval(this.timer);
+    await this.checkInFlight?.catch(() => {});
     await this.redis?.quit().catch(() => {});
   }
 
@@ -205,6 +214,19 @@ export class RunnerRegistry {
   }
 
   /**
+   * Publishing a quarantine changes how every reader interprets an otherwise claimable request.
+   * Every configured target must first have been observed on quarantine-v1. Once observed, a
+   * transient crash does not close the worker barrier: otherwise the surviving worker could never
+   * recover that runner's live session lease. Rolling back an observed target to pre-0013 remains
+   * forbidden; a later successful legacy probe removes it from this set and closes the barrier.
+   */
+  allConfiguredSupportErasureJobControl(): boolean {
+    const configured = this.list();
+    return configured.length > 0
+      && configured.every((target) => this.erasureJobControlCompatible.has(target.url));
+  }
+
+  /**
    * A runner address as reported by `X-Owner` (host:port) mapped back onto a configured target.
    * Matching on the port alone as a fallback covers the common misconfiguration where a runner advertises
    * a wildcard or container-internal host (`0.0.0.0:8787`) that never string-matches the configured URL.
@@ -231,17 +253,53 @@ export class RunnerRegistry {
     if (t.consecutiveFailures >= 2) t.healthy = false;
   }
 
-  private async checkAll(): Promise<void> {
+  private checkAll(): Promise<void> {
+    if (this.checkInFlight) return this.checkInFlight;
+    const check = this.checkAllOnce();
+    this.checkInFlight = check.finally(() => {
+      this.checkInFlight = undefined;
+    });
+    return this.checkInFlight;
+  }
+
+  private async checkAllOnce(): Promise<void> {
     await Promise.all(
       [...this.targets.values()].map(async (t) => {
         try {
           const signal = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
           const ready = await fetch(`${t.url}/readyz`, { signal });
           if (!ready.ok) throw new Error(`readiness returned ${ready.status}`);
-          const capabilities = await fetch(`${t.url}/v1/capabilities`, { signal });
-          const parsed = capabilities.ok ? Capabilities.safeParse(await capabilities.json()) : undefined;
+          let capabilities: Response;
+          try {
+            capabilities = await fetch(`${t.url}/v1/capabilities`, { signal });
+          } catch {
+            // A process that answered readiness but cannot prove its capability is not equivalent
+            // to a wholly unreachable, previously attested target. Revoke until a later good probe.
+            this.erasureJobControlCompatible.delete(t.url);
+            throw new Error("runner capability probe transport failed");
+          }
+          if (!capabilities.ok) {
+            this.erasureJobControlCompatible.delete(t.url);
+            throw new Error(`runner capability endpoint returned ${capabilities.status}`);
+          }
+          let payload: unknown;
+          try {
+            payload = await capabilities.json();
+          } catch {
+            this.erasureJobControlCompatible.delete(t.url);
+            throw new Error("runner capability document is malformed");
+          }
+          const parsed = Capabilities.safeParse(payload);
           if (!parsed?.success || parsed.data.service !== "agent-runner") {
+            // A successful HTTP response with an old protocol, missing feature or wrong service is
+            // affirmative incompatibility, so it revokes the sticky observation immediately.
+            this.erasureJobControlCompatible.delete(t.url);
             throw new Error("runner protocol is incompatible");
+          }
+          if (parsed.data.features.erasureJobControl.includes("quarantine-v1")) {
+            this.erasureJobControlCompatible.add(t.url);
+          } else {
+            this.erasureJobControlCompatible.delete(t.url);
           }
           t.capabilities = parsed.data;
           t.healthy = true;

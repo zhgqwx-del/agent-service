@@ -122,16 +122,20 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     poisonMaxAttempts: cfg.BLOB_CLEANUP_POISON_MAX_ATTEMPTS,
   });
   if (cfg.BLOB_CLEANUP_ENABLED) blobCleanup.start();
-  const erasureWorker = cfg.ERASURE_WORKER_ENABLED
+  const erasureExecutor = cfg.ERASURE_WORKER_ENABLED
+    ? new RouterErasureSessionExecutor({
+      routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+      internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+      requestTimeoutMs: cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS,
+    })
+    : undefined;
+  const erasureWorker = erasureExecutor
     ? new ErasureWorker({
       jobs: store,
       catalog: store,
       usage: store,
-      executor: new RouterErasureSessionExecutor({
-        routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
-        internalToken: cfg.INTERNAL_ROUTER_TOKEN,
-        requestTimeoutMs: cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS,
-      }),
+      executor: erasureExecutor,
+      canClaim: () => erasureExecutor.canClaimErasureJobs(),
     }, {
       pollIntervalMs: cfg.ERASURE_WORKER_POLL_MS,
       leaseMs: cfg.ERASURE_WORKER_LEASE_MS,

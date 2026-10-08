@@ -16,6 +16,7 @@ const requiredTestFiles = [
   "packages/store/test/migrations/0009-to-0010.migration.ts",
   "packages/store/test/migrations/0010-to-0011.migration.ts",
   "packages/store/test/migrations/0011-to-0012.migration.ts",
+  "packages/store/test/migrations/0012-to-0013.migration.ts",
 ];
 const discoveredTestFiles = (await readdir(migrationTestDir, { recursive: true }))
   .filter((name) => name.endsWith(".migration.ts"))

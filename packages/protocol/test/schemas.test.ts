@@ -148,6 +148,7 @@ describe("protocol schemas", () => {
     });
     expect(parsed.features.dataErasureRequests).toBe(false);
     expect(parsed.features.userErasureWorker).toEqual([]);
+    expect(parsed.features.erasureJobControl).toEqual([]);
   });
 
   it("keeps the internal erasure drain contract claim-only and strict", () => {

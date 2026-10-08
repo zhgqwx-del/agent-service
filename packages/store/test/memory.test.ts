@@ -14,6 +14,46 @@ lifecycleOutboxStoreConformance("memory", async () => new MemorySessionStore());
 leaseStoreConformance("memory", async () => new MemoryLeaseStore(), async (l, sid) => (l as MemoryLeaseStore).expire(sid));
 eventBusConformance("memory", async () => new MemoryEventBus());
 
+describe("MemorySessionStore session creation publication", () => {
+  it("rolls back lifecycle and session maps when the final creation-event publication fails", async () => {
+    const store = new MemorySessionStore();
+    const session = mkSession("tenant_create_publish_rollback", "user_create_publish_rollback");
+    const originalSet = store.events.set.bind(store.events);
+    let fail = true;
+    Object.defineProperty(store.events, "set", {
+      configurable: true,
+      value: (key: string, value: Parameters<typeof store.events.set>[1]) => {
+        if (fail) {
+          fail = false;
+          throw new Error("injected creation event publication failure");
+        }
+        return originalSet(key, value);
+      },
+    });
+
+    await expect(store.createSession(session))
+      .rejects.toThrow("injected creation event publication failure");
+    expect(store.sessions.has(session.id)).toBe(false);
+    expect(store.events.has(session.id)).toBe(false);
+    expect(store.subjectLifecycles).toHaveLength(0);
+    expect(await store.getSession(session.tenantId, session.id)).toBeNull();
+    expect(await store.readEvents(session.id, 0, 10)).toEqual([]);
+
+    await expect(store.createSession(session)).resolves.toEqual({
+      events: [{
+        type: "session/created",
+        sessionId: session.id,
+        emittedAtMs: session.createdAtMs,
+        seq: 1,
+      }],
+      lastSeq: 1,
+    });
+    expect(await store.getSession(session.tenantId, session.id)).toMatchObject({ lastSeq: 1 });
+    expect(await store.readEvents(session.id, 0, 10)).toHaveLength(1);
+    await store.close();
+  });
+});
+
 describe("MemorySessionStore legacy idempotency compatibility", () => {
   it.each([
     ["unexpired", 60_000],

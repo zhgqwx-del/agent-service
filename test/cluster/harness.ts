@@ -51,6 +51,8 @@ export interface Proc {
   kill: () => void;
   /** SIGSTOP: freezes the process while preserving its live sockets and durable leases. */
   pause: () => void;
+  /** SIGCONT: resumes a process previously frozen with pause(). */
+  resume: () => void;
   /** SIGTERM: graceful drain */
   term: () => void;
   exited: Promise<number | null>;
@@ -88,6 +90,7 @@ function launch(name: string, script: string, port: number, env: Record<string, 
     log,
     kill: () => signal("SIGKILL"),
     pause: () => signal("SIGSTOP"),
+    resume: () => signal("SIGCONT"),
     term: () => signal("SIGTERM"),
     exited,
   };
@@ -123,6 +126,10 @@ export interface ClusterOptions {
   erasureWorkerRequestTimeoutMs?: number;
   /** Per-runner non-secret overrides, useful for deterministic multi-worker races. */
   runnerEnv?: (runnerNumber: number) => Record<string, string>;
+  /** Optional deterministic worker placement; defaults to the cluster-wide worker setting. */
+  erasureWorkerEnabledForRunner?: (runnerNumber: number) => boolean;
+  /** Optional deterministic admission placement; defaults to the cluster-wide admission gate. */
+  dataErasureRequestsEnabledForRunner?: (runnerNumber: number) => boolean;
 }
 
 /**
@@ -182,9 +189,14 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     // Security/activation values are intentionally applied after custom test tuning. Every process
     // in one cluster must share the same private credential and router origin.
     INTERNAL_ROUTER_TOKEN,
-    ERASURE_WORKER_ENABLED: erasureWorkerEnabled ? "1" : "0",
+    ERASURE_WORKER_ENABLED: (
+      opts.erasureWorkerEnabledForRunner?.(runnerNumber) ?? erasureWorkerEnabled
+    ) ? "1" : "0",
     ERASURE_ROUTER_URL: routerUrl,
-    DATA_ERASURE_REQUESTS_ENABLED: opts.dataErasureRequestsEnabled ? "1" : "0",
+    DATA_ERASURE_REQUESTS_ENABLED: (
+      opts.dataErasureRequestsEnabledForRunner?.(runnerNumber)
+        ?? opts.dataErasureRequestsEnabled === true
+    ) ? "1" : "0",
   });
 
   const runners: Proc[] = [];

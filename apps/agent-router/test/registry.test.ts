@@ -29,6 +29,7 @@ describe("RunnerRegistry owner address mapping", () => {
       blobAttachments = true,
       dataErasureRequests = true,
       userErasureWorker = ["drain-v1"],
+      erasureJobControl = ["quarantine-v1"],
     ) => ({
       protocolVersion,
       service: "agent-runner",
@@ -40,6 +41,7 @@ describe("RunnerRegistry owner address mapping", () => {
         blobAttachments,
         dataErasureRequests,
         userErasureWorker,
+        erasureJobControl,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -52,7 +54,14 @@ describe("RunnerRegistry owner address mapping", () => {
       if (url.endsWith("/readyz")) return new Response("ready");
       if (url.startsWith("http://current/")) return Response.json(capabilities(PROTOCOL_VERSION));
       if (url.startsWith("http://current-basic/")) {
-        return Response.json(capabilities(PROTOCOL_VERSION, ["archive", "unarchive"], false, false, []));
+        return Response.json(capabilities(
+          PROTOCOL_VERSION,
+          ["archive", "unarchive"],
+          false,
+          false,
+          [],
+          [],
+        ));
       }
       if (url.startsWith("http://old/")) return Response.json(capabilities("2026-09-22"));
       return new Response("not found", { status: 404 });
@@ -84,6 +93,7 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.allHealthySupportUserErasureWorker()).toBe(false);
     expect(registry.supportsUserErasureWorker("http://current")).toBe(true);
     expect(registry.supportsUserErasureWorker("http://current-basic")).toBe(false);
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
     expect(registry.anyHealthy()).toBe("http://current");
     expect(registry.routeableUrl("current")).toBe("http://current");
     expect(registry.routeableUrl("old")).toBeUndefined();
@@ -91,10 +101,16 @@ describe("RunnerRegistry owner address mapping", () => {
   });
 
   it("does not ignore an unavailable configured legacy writer when activating erasure", async () => {
-    let legacyState: "down" | "legacy" | "upgraded" = "down";
-    const capabilities = (dataErasureRequests: boolean) => ({
-      protocolVersion: PROTOCOL_VERSION,
-      service: "agent-runner",
+    let legacyState: "down" | "legacy" | "upgraded" | "wrong-protocol" | "missing-endpoint"
+      | "malformed" | "wrong-service" | "capability-transport" = "down";
+    const capabilities = (
+      dataErasureRequests: boolean,
+      erasureJobControl: boolean,
+      protocolVersion: string = PROTOCOL_VERSION,
+      service: string = "agent-runner",
+    ) => ({
+      protocolVersion,
+      service,
       features: {
         streaming: true,
         replay: { persistedEvents: true, hotWindowMs: 1 },
@@ -103,6 +119,7 @@ describe("RunnerRegistry owner address mapping", () => {
         blobAttachments: true,
         dataErasureRequests,
         userErasureWorker: ["drain-v1"],
+        ...(erasureJobControl ? { erasureJobControl: ["quarantine-v1"] } : {}),
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -113,12 +130,23 @@ describe("RunnerRegistry owner address mapping", () => {
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       if (url.startsWith("http://current/readyz")) return new Response("ready");
-      if (url.startsWith("http://current/v1/capabilities")) return Response.json(capabilities(true));
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true));
+      }
       if (url.startsWith("http://legacy/readyz")) {
         return legacyState === "down" ? new Response("down", { status: 503 }) : new Response("ready");
       }
       if (url.startsWith("http://legacy/v1/capabilities")) {
-        return Response.json(capabilities(legacyState === "upgraded"));
+        if (legacyState === "capability-transport") throw new Error("capability transport failed");
+        if (legacyState === "missing-endpoint") return new Response("not found", { status: 404 });
+        if (legacyState === "malformed") return new Response("not-json");
+        if (legacyState === "wrong-protocol") {
+          return Response.json(capabilities(true, true, "2026-09-22"));
+        }
+        if (legacyState === "wrong-service") {
+          return Response.json(capabilities(true, true, PROTOCOL_VERSION, "agent-router"));
+        }
+        return Response.json(capabilities(true, legacyState === "upgraded"));
       }
       return new Response("not found", { status: 404 });
     }));
@@ -134,17 +162,93 @@ describe("RunnerRegistry owner address mapping", () => {
     // the configured, currently unavailable writer has already been drained or upgraded.
     expect(registry.allHealthySupportDataErasureRequests()).toBe(true);
     expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
 
     legacyState = "legacy";
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.list().find((target) => target.url === "http://legacy")?.healthy).toBe(true);
-    expect(registry.allHealthySupportDataErasureRequests()).toBe(false);
-    expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
+    expect(registry.allHealthySupportDataErasureRequests()).toBe(true);
+    expect(registry.allConfiguredSupportDataErasureRequests()).toBe(true);
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
 
     legacyState = "upgraded";
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.allHealthySupportDataErasureRequests()).toBe(true);
     expect(registry.allConfiguredSupportDataErasureRequests()).toBe(true);
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+
+    // Admission still closes while a configured writer is unavailable, but an already-activated
+    // worker must retain queue authority so it can recover the crashed runner's sessions.
+    legacyState = "down";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+
+    // Rollback after activation is forbidden. If it nevertheless becomes observable, fail closed
+    // again rather than treating the earlier capability observation as permanent authorization.
+    legacyState = "legacy";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+
+    for (const incompatible of [
+      "wrong-protocol",
+      "missing-endpoint",
+      "malformed",
+      "wrong-service",
+      "capability-transport",
+    ] as const) {
+      legacyState = "upgraded";
+      await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+      expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+      legacyState = incompatible;
+      await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+      expect(registry.allConfiguredSupportErasureJobControl(), incompatible).toBe(false);
+    }
+    await registry.close();
+  });
+
+  it("serializes overlapping health probes so an older result cannot overwrite a newer one", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      await gate;
+      return String(input).endsWith("/readyz")
+        ? new Response("ready")
+        : Response.json({
+          protocolVersion: PROTOCOL_VERSION,
+          service: "agent-runner",
+          features: {
+            streaming: true,
+            replay: { persistedEvents: true, hotWindowMs: 1 },
+            approvals: true,
+            sessionLifecycle: ["archive", "unarchive", "tombstone"],
+            blobAttachments: true,
+            dataErasureRequests: true,
+            userErasureWorker: ["drain-v1"],
+            erasureJobControl: ["quarantine-v1"],
+            dynamicTools: true,
+            mcp: [],
+            skills: false,
+            sandbox: ["none"],
+            byok: true,
+          },
+        });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const registry = new RunnerRegistry({
+      runners: ["http://single-flight"],
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    const first = (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    const second = (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(first).toBe(second);
+    release();
+    await Promise.all([first, second]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
     await registry.close();
   });
 });

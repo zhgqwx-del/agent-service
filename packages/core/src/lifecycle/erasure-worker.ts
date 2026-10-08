@@ -59,6 +59,12 @@ export interface ErasureWorkerDeps {
   catalog: ErasureSessionCatalogStore;
   usage: ErasureUsageReconciliationStore;
   executor: ErasureSessionExecutor;
+  /**
+   * Fleet-wide activation barrier checked before every claim pass. It is required so a future
+   * distributed wiring cannot silently bypass rolling-version safety; local tests must grant
+   * authority explicitly with an async true function.
+   */
+  canClaim: () => Promise<boolean>;
   clock?: ErasureWorkerClock;
   logger?: Pick<Console, "warn">;
 }
@@ -270,6 +276,15 @@ export class ErasureWorker {
 
   /** One claim pass. Each claim executes exactly its claimed phase and then releases authority. */
   private async processOnceWithSignal(signal?: AbortSignal): Promise<number> {
+    if (signal?.aborted) return 0;
+    try {
+      if (!(await this.deps.canClaim())) return 0;
+    } catch {
+      // Readiness is fail-closed and deliberately content-free. A transient router failure must
+      // not grant queue authority or leak its URL/token/error through worker logs.
+      return 0;
+    }
+    if (signal?.aborted) return 0;
     const claims = await this.deps.jobs.claimErasureJobs({
       nowMs: this.clock.now(),
       limit: this.opts.jobBatchSize,
@@ -337,8 +352,6 @@ export class ErasureWorker {
           return await this.tombstone(authority, userAuthority, heartbeat, signal);
         case "reconciling_usage":
           return await this.reconcileUsage(claim, authority, userAuthority, heartbeat, signal);
-        case "purging":
-          return await this.block("purging", authority, heartbeat, "policy_unavailable", signal);
       }
     } catch (error) {
       if (error === RUN_STOPPED || signal?.aborted || error === CLAIM_LOST) return false;

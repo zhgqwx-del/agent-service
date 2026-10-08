@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层，以及 admission 默认关闭的 durable user-erasure gate/queue/worker 已完成。worker 可跨 runner drain、child-first tombstone、原子重验 tombstone proof并 reconcile usage，安全停在 `awaiting_purge_policy`；异步 export artifact/TTL、claim-stage poison quarantine/repair、tenant erasure/key revocation、legacy generation `0` 补偿、policy-gated ready/session purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层，以及 admission 默认关闭的 durable user-erasure gate/queue/worker 已完成。`0013` 已把确定性 claim-stage poison逐候选隔离：安全envelope进入durable quarantine与generation/evidence CAS maintenance，identity/generation/time envelope损坏进入保留原值的append-only terminal incident；两者都撤销worker authority且不饿死邻居。滚动升级fleet barrier已接线；worker 可跨 runner drain、child-first tombstone、原子重验 tombstone proof并 reconcile usage，安全停在 `awaiting_purge_policy`。异步 export artifact/TTL、tenant erasure/key revocation、legacy generation `0` 补偿、canonical policy/legal-hold、policy-gated ready/session purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -333,3 +333,31 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - 当前最重要的正确性缺口是 claim-stage poison：`0012` 在锁内发现 request/subject/audit/idempotency/queue结构损坏时会回滚整批，同一最早候选可能持续饿死有效邻居。下一独立切片是 `0013_erasure_job_control.sql`：保留原 phase的 durable quarantine overlay、append-only control audit、control generation/evidence hash CAS，以及固定配方、最小权限的 repair/resume；不能 catch-and-skip、直接改表或伪造普通主 audit链。
 - 当前 non-destructive worker仍会领取意外 `purging` 并将其 fail-closed为 `policy_unavailable`。未来激活真正 purge worker前必须先升级并排空所有0012 worker、等待最大 job lease过期，再使用独立 policy activation与purge authority。
 - `0013`之后仍需依次完成 legacy generation `0`补偿、canonical policy/legal-hold管理与默认关闭的purge substrate、export artifact/download/TTL、tenant key/provider/auth secret revocation、completed proof和独立故障域 restore replay；不可逆 purge只能在策略与真实共享对象存储确定后单独激活。
+
+## 2026-10-08（M1 数据生命周期：0013 erasure quarantine/control plane）
+
+### 已完成
+
+1. 新增 expand-only `0013_erasure_job_control.sql`：request 增加 control generation 与三列 quarantine overlay，新建 append-only `erasure_job_control_events`、append-only `erasure_job_terminal_incidents` 和 quarantine-aware claim index。terminal incident只存opaque request locator、精确raw control fence、固定reason、SHA-256与时间，不复制tenant/user/subject/status/raw payload，也不建立可能误绑owner的外键。MySQL 8.0.26 可用的多重 UPDATE/DELETE trigger 在 migration 中断或 marker 丢失重放时持续保护两类证据；早期 triple unique 会先建立更强的临时 pair unique 后再切换，冲突时旧约束、两条证据和未写 marker 都保持原样，不由 migration 选择丢账。
+2. Memory/MySQL claim 改为逐候选原子提交。安全envelope内的request、subject、main audit、idempotency、queue或control确定性损坏会保留原phase、清空availability/claim/lease、写canonical quarantine evidence，并继续扫描邻居。request/tenant/subject identity、generation或created/gated/updated顺序本身损坏时，不猜测owner：保留所有原字段与精确BIGINT fence，只撤销queue authority、写terminal overlay并在同一原子边界追加incident，随后继续邻居；重复poll不重复incident。未知程序、SQL 或网络错误仍回滚当前候选，不会被误判为 poison。Memory 的 gate、session 创建/首事件、普通 phase transition、control 与incident发布均有 intrinsic Map rollback；MySQL row、audit/control/incident与修复操作保持同一事务。
+3. control audit 现在与主 audit 联合验证：重算 quarantine/blocked evidence，固定 reason→action，逐对核验 blocked/resume 的 phase、reason、时间和 generation，事件时间不得早于 durable gate或晚于 row update；repair outcome 使用可重放的 event commitment。`control_audit_invalid` 只可检查、没有通用 repair，full quarantine 即使残留损坏的私有 queue 字段也可安全读取和 CAS 处置，但 worker authority始终 fail-closed。
+4. safe control-event 冲突使用未占用的后继 generation。若 request row 的原始 MySQL BIGINT fence 已达到或超过 `Number.MAX_SAFE_INTEGER`，则进入显式 terminal quarantine：保留/单调推进精确原 fence、把原始十进制值绑定进 evidence、清除全部 worker authority，不降级 fence、不补造冲突 control event，公开仍只显示 `blocked`，maintenance 返回空 action 且永久拒绝普通 repair。并发只终止写一次，UPDATE 失败完整回滚，正常邻居仍可领取。
+5. runner 新增 additive `erasureJobControl=["quarantine-v1"]`；worker 每次数据库 claim 前都从 router 的 token-protected 私有 endpoint取得固定 ACK。router 必须在本进程观察 `RUNNERS` 每个稳定地址支持该能力；已观察地址的纯网络不可达保留 sticky attestation以支持死亡 owner 接管，明确旧版/错误/畸形响应会撤销，router重启则安全停领直至重新观察。公开 router capability 故意投影为空，不泄 fleet rollout 状态；新 request admission 仍另行要求 configured fleet 当前全健康。
+6. 发布契约明确为：先迁移，部署 admission `0` 的新 router并排空旧router，再滚动新runner/worker、排空0012 worker并等待最大lease，最后才激活 writer gate。首个0013 control event或terminal incident后不得回退到旧reader/worker；barrier不能约束直连数据库的旧worker，因此旧进程 drain、网络/进程阻断和forward-fix仍是硬条件。
+7. 固定 `mysql-0012.sql` 历史夹具和 `0012→0013` 独立套件已进入 no-skip manifest，覆盖完整升级、control表已提交但incident表尚未创建的DDL断点、partial DDL、两个 unique-index 隐式提交断点、marker-loss evidence保留、两张表append-only trigger逐步轮换，以及同 generation冲突证据阻断。CI 主测试固定最低支持 `mysql:8.0.26`，image job保留浮动 `mysql:8.0`，同时证明兼容下限与当前8.0镜像。
+8. `docs/operations/development-and-ci-guide.md` 继续作为学习入口，已同步本地启动/手动体验、router/runner职责、Node bundle与Linux OCI image、CI构建门禁，以及local→staging→production使用同一digest的promotion与0013滚动激活边界。
+
+### 本轮验证
+
+- `pnpm check:secrets`：通过，扫描 **233 files**；`pnpm check:api`、`pnpm typecheck`、`pnpm check:sdk` 与 `git diff --check` 通过，SDK真实 **18-file** package在隔离consumer中完成runtime import与TypeScript编译。
+- Memory session/gate/erasure定向套件 **90/90 passed**（其中unsafe-envelope/control专项 **36/36**）；真实MySQL erasure-job **29/29 passed**，覆盖三类unsafe envelope、nullable gate、双store竞争、exact BIGINT保留、完整evidence重算与incident INSERT整事务回滚。required execution proof明确确认目标文件执行；独立安全review未发现P0–P2、authority bypass、跨tenant/user越权或secret泄漏。
+- 固定六文件历史迁移套件 **15/15 passed**；其中 `0012→0013` **6/6**，真实执行完整升级、中断重放、两类append-only证据保护、约束切换和冲突阻断。`0007→0008`的相同usage合并、内容冲突阻断与legacy pending receipt保留仍在同一必跑链中。
+- `scripts/local-service.sh verify`：主套件 **728 passed / 1 skipped**；覆盖率 **85.66% statements / 79.38% branches / 87.12% functions / 90.00% lines**；cluster **14/14 passed**；runner/router原生Node bundle的readiness、转发与OpenAPI深比较通过。
+- 本轮未修改provider dialect或真实厂商网络契约，因此没有重复运行收费的`verify-real`或acceptance；最近真实模型 **1/1** 与十阶段acceptance仍只作为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2本地/CI代码范围仍正式冻结；本轮没有提前开始M3。M1仍不能冻结：legacy `deletion_generation=0`补偿、canonical policy/legal-hold、异步export artifact/download/TTL、tenant与key/provider/auth secret撤销、默认关闭的ready/session purge、completed proof和restore replay尚未闭环。
+- terminal quarantine/incident是fence耗尽或unsafe identity/generation/time envelope的永久安全停机点，不是普通可修复状态。incident只解决worker authority撤销、审计留痕和邻居进度，不会猜测owner或修复原行；当前需保全证据并forward-fix。专用事故迁移、指标/告警和受审计的operator workflow留在后续运维/M4收口，绝不能手工调小BIGINT、改写incident或补造event。
+- barrier ACK到数据库claim之间仍有极短TOCTOU，安全性依赖禁止版本回退；共享internal bearer token在云上还需私网ACL、TLS/mTLS、Secret轮换。真实固定N-1镜像mixed-version canary、production独立migration Job和运行时最小数据库权限也留待M4部署编排。
+- 下一独立切片先处理legacy generation `0`可审计补偿，再实现canonical policy/legal-hold和默认关闭的purge substrate；在真实共享对象存储、保留政策与恢复门禁确定前，不激活不可逆删除。

@@ -6,6 +6,9 @@ import {
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_ACK_VALUE,
   INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
+  INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
   INTERNAL_ROUTER_TOKEN_HEADER,
   UserErasureDrainRequest,
   isCanonicalId,
@@ -68,6 +71,39 @@ export class RouterErasureSessionExecutor implements ErasureSessionExecutor {
       || options.requestTimeoutMs > 30_000
     ) throw new Error("requestTimeoutMs must be between 100 and 30000");
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  }
+
+  /**
+   * Fail-closed fleet barrier for durable queue claims. The probe reads no response body and
+   * accepts only the fixed status/header pair, so redirects, proxies and legacy routers cannot
+   * accidentally authorize work during a rolling upgrade.
+   */
+  async canClaimErasureJobs(): Promise<boolean> {
+    const url = new URL(INTERNAL_ERASURE_JOB_CONTROL_READY_PATH, this.routerBaseUrl);
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          [INTERNAL_ROUTER_TOKEN_HEADER]: this.options.internalToken,
+        },
+        signal: AbortSignal.timeout(this.options.requestTimeoutMs),
+      });
+    } catch {
+      return false;
+    }
+
+    let ready = false;
+    try {
+      ready = response.status === 204
+        && response.headers.get(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER)
+          === INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE;
+    } catch {
+      ready = false;
+    }
+    await cancelResponseBody(response);
+    return ready;
   }
 
   async drainSessionForErasure(

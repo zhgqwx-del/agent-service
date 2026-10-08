@@ -6,6 +6,7 @@ import {
   MemorySessionStore,
   newErasureRequestId,
   userErasureRequestHash,
+  validateErasureRequestRecord,
   type ErasureJobClaim,
 } from "@agent-service/store";
 import {
@@ -218,6 +219,7 @@ describe("agent-runner HTTP API", () => {
       features: {
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         dataErasureRequests: false,
+        erasureJobControl: [],
       },
     });
   });
@@ -228,14 +230,22 @@ describe("agent-runner HTTP API", () => {
     const enabled = await makeApp(60_000, { enabled: true, attachStore: true });
 
     expect(await (await gateOnly.app.request("/v1/capabilities")).json()).toMatchObject({
-      features: { dataErasureRequests: false, userErasureWorker: [] },
+      features: { dataErasureRequests: false, userErasureWorker: [], erasureJobControl: [] },
     });
     // Closing admission must not strand an already-durable erasure job.
     expect(await (await storeOnly.app.request("/v1/capabilities")).json()).toMatchObject({
-      features: { dataErasureRequests: false, userErasureWorker: ["drain-v1"] },
+      features: {
+        dataErasureRequests: false,
+        userErasureWorker: ["drain-v1"],
+        erasureJobControl: ["quarantine-v1"],
+      },
     });
     expect(await (await enabled.app.request("/v1/capabilities")).json()).toMatchObject({
-      features: { dataErasureRequests: true, userErasureWorker: ["drain-v1"] },
+      features: {
+        dataErasureRequests: true,
+        userErasureWorker: ["drain-v1"],
+        erasureJobControl: ["quarantine-v1"],
+      },
     });
   });
 
@@ -493,6 +503,63 @@ describe("agent-runner HTTP API", () => {
     expect((await call(`/v1/data-erasure-requests/${first.id}`, {
       headers: { authorization: "Bearer runtime-key", "x-user-id": "u_1" },
     })).status).toBe(403);
+  });
+
+  it("projects an active quarantine as public blocked without leaking control-plane evidence", async () => {
+    const { store, call } = await makeApp(60_000, { enabled: true, attachStore: true });
+    const idempotencyKey = "quarantine-public-projection";
+    const createdResponse = await call("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { "idempotency-key": idempotencyKey },
+    });
+    expect(createdResponse.status).toBe(202);
+    const created = await j<{ id: string; status: string }>(createdResponse);
+    expect(created.status).toBe("gated");
+
+    // Seed the complete Memory quarantine overlay directly. It deliberately preserves the durable
+    // phase (`gated`) while revoking worker authority; only the public projection becomes blocked.
+    const current = store.erasureRequests.get(created.id)!;
+    const evidence = "f".repeat(64);
+    const quarantined = {
+      ...current,
+      controlGeneration: current.controlGeneration + 1,
+      quarantinedAtMs: current.updatedAtMs + 1,
+      quarantineReasonCode: "audit_chain_invalid" as const,
+      quarantineEvidenceSha256: evidence,
+      updatedAtMs: current.updatedAtMs + 1,
+    };
+    delete quarantined.availableAtMs;
+    delete quarantined.claimToken;
+    delete quarantined.leaseUntilMs;
+    validateErasureRequestRecord(quarantined);
+    store.erasureRequests.set(created.id, quarantined);
+
+    const statusResponse = await call(`/v1/data-erasure-requests/${created.id}`);
+    const replayResponse = await call("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { "idempotency-key": idempotencyKey },
+    });
+    for (const [response, expectedStatus] of [
+      [statusResponse, 200],
+      [replayResponse, 202],
+    ] as const) {
+      expect(response.status).toBe(expectedStatus);
+      expectPrivateLifecycleResponse(response);
+      const body = await j<Record<string, unknown>>(response);
+      expect(body).toMatchObject({ id: created.id, status: "blocked" });
+      expect(Object.keys(body).sort()).toEqual([
+        "createdAtMs", "generation", "id", "scope", "status", "updatedAtMs", "userId",
+      ]);
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("audit_chain_invalid");
+      expect(serialized).not.toContain(evidence);
+      expect(serialized).not.toContain("controlGeneration");
+    }
+    expect(store.erasureRequests.get(created.id)).toMatchObject({
+      status: "gated",
+      quarantineReasonCode: "audit_chain_invalid",
+      quarantineEvidenceSha256: evidence,
+    });
   });
 
   it("rejects M3-only agent declarations and turn inputs at the HTTP contract boundary", async () => {

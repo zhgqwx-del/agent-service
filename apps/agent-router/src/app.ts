@@ -8,6 +8,9 @@ import {
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
   INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX,
   INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
+  INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
@@ -79,6 +82,7 @@ const STRIP_RESPONSE = new Set([
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
 ]);
 
 /** Methods that are safe to send again after a transport failure, with no risk of doing the work twice. */
@@ -129,11 +133,16 @@ export function createRouterApp(deps: RouterAppDeps) {
     && deps.registry.allHealthySupportBlobAttachments()
   );
   const erasureWriterGateEnabled = () => deps.erasureRequestsEnabled?.() ?? false;
+  const erasureJobControlAvailable = () => (
+    !!deps.internalRunnerToken
+    && deps.registry.allConfiguredSupportErasureJobControl()
+  );
   const erasureRequestsAvailable = () => (
     erasureWriterGateEnabled()
     // Unlike a reversible read, this durable gate must account for unavailable configured writers:
     // an old runner that recovers later could otherwise ignore the already-accepted subject gate.
     && deps.registry.allConfiguredSupportDataErasureRequests()
+    && erasureJobControlAvailable()
   );
 
   app.get("/healthz", (c) => c.text("ok"));
@@ -171,6 +180,9 @@ export function createRouterApp(deps: RouterAppDeps) {
                   && deps.registry.allHealthySupportUserErasureWorker()
                   ? ["drain-v1"]
                   : [],
+                // Fleet rollout state is private control-plane information. External callers only
+                // need the public dataErasureRequests result; workers use the token-protected ACK.
+                erasureJobControl: [],
               },
             } satisfies Capabilities);
           }
@@ -186,6 +198,20 @@ export function createRouterApp(deps: RouterAppDeps) {
         retryable: true,
       },
     }, 503);
+  });
+
+  /**
+   * A worker must pass this fleet-wide barrier before every queue claim. Authentication happens
+   * before returning any capability state, so an external probe cannot enumerate rollout status.
+   */
+  app.get(INTERNAL_ERASURE_JOB_CONTROL_READY_PATH, (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    if (!erasureJobControlAvailable()) return c.body(null, 503);
+    c.header(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER, INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE);
+    return c.body(null, 204);
   });
 
   /**
@@ -362,6 +388,8 @@ export function createRouterApp(deps: RouterAppDeps) {
       || url.pathname.startsWith(`${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/`)
       || url.pathname === INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX
       || url.pathname.startsWith(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/`)
+      || url.pathname === INTERNAL_ERASURE_JOB_CONTROL_READY_PATH
+      || url.pathname.startsWith(`${INTERNAL_ERASURE_JOB_CONTROL_READY_PATH}/`)
     ) {
       privateInternalHeaders(c);
       return c.json({ error: { code: "not_found", message: "not found" } }, 404);
@@ -419,7 +447,13 @@ export function createRouterApp(deps: RouterAppDeps) {
         },
       }, 503);
     }
-    if (isErasureStatus && !deps.registry.allHealthySupportDataErasureRequests()) {
+    if (
+      isErasureStatus
+      && (
+        !deps.registry.allHealthySupportDataErasureRequests()
+        || !erasureJobControlAvailable()
+      )
+    ) {
       return c.json({
         error: {
           code: "draining",
@@ -488,7 +522,9 @@ export function createRouterApp(deps: RouterAppDeps) {
       if (
         (isErasureRequest && (!erasureRequestsAvailable() || !targetSupportsErasure))
         || (isErasureStatus && (
-          !deps.registry.allHealthySupportDataErasureRequests() || !targetSupportsErasure
+          !deps.registry.allHealthySupportDataErasureRequests()
+          || !erasureJobControlAvailable()
+          || !targetSupportsErasure
         ))
         || (requiresErasureCapableTarget && !targetSupportsErasure)
       ) {

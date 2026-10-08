@@ -8,6 +8,8 @@ import {
   UsageReconciliationError,
   newErasureRequestId,
   userErasureRequestHash,
+  validateErasureAuditChain,
+  validateErasureRequestRecord,
 } from "@agent-service/store";
 import type {
   ClaimErasureJobsOptions,
@@ -211,6 +213,8 @@ class FakeExecutor implements ErasureSessionExecutor {
   }
 }
 
+const allowClaims = async () => true;
+
 function setup(status: ErasureJobClaim["status"], options: ConstructorParameters<typeof ErasureWorker>[1] = {}) {
   const jobs = new FakeJobs();
   const catalog = new FakeCatalog();
@@ -218,7 +222,7 @@ function setup(status: ErasureJobClaim["status"], options: ConstructorParameters
   const executor = new FakeExecutor();
   jobs.claimBatches.push([claim(status)]);
   const worker = new ErasureWorker(
-    { jobs, catalog, usage, executor, clock: { now: () => 1_000 } },
+    { jobs, catalog, usage, executor, canClaim: allowClaims, clock: { now: () => 1_000 } },
     options,
   );
   return { worker, jobs, catalog, usage, executor };
@@ -341,6 +345,54 @@ afterEach(() => {
 });
 
 describe("ErasureWorker phase boundaries", () => {
+  it("does not claim while the fleet barrier is false, resumes when true, then stops again", async () => {
+    const jobs = new FakeJobs();
+    const catalog = new FakeCatalog();
+    const usage = new FakeUsage();
+    const executor = new FakeExecutor();
+    let ready = false;
+    const canClaim = vi.fn(async () => ready);
+    const worker = new ErasureWorker({
+      jobs,
+      catalog,
+      usage,
+      executor,
+      canClaim,
+      clock: { now: () => 1_000 },
+    });
+
+    await expect(worker.processOnce()).resolves.toBe(0);
+    expect(jobs.claimCalls).toHaveLength(0);
+
+    ready = true;
+    await expect(worker.processOnce()).resolves.toBe(0);
+    expect(jobs.claimCalls).toHaveLength(1);
+
+    ready = false;
+    await expect(worker.processOnce()).resolves.toBe(0);
+    expect(jobs.claimCalls).toHaveLength(1);
+    expect(canClaim).toHaveBeenCalledTimes(3);
+  });
+
+  it("fails closed before claiming when the fleet barrier probe rejects", async () => {
+    const jobs = new FakeJobs();
+    const warn = vi.fn();
+    const worker = new ErasureWorker({
+      jobs,
+      catalog: new FakeCatalog(),
+      usage: new FakeUsage(),
+      executor: new FakeExecutor(),
+      canClaim: async () => {
+        throw new Error("private router detail");
+      },
+      logger: { warn },
+    });
+
+    await expect(worker.processOnce()).resolves.toBe(0);
+    expect(jobs.claimCalls).toHaveLength(0);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("moves a gated user to draining and does not execute the newly entered phase", async () => {
     const h = setup("gated");
 
@@ -608,20 +660,88 @@ describe("ErasureWorker phase boundaries", () => {
     });
   });
 
-  it("fails a prematurely activated purge closed without touching session or usage data", async () => {
-    const h = setup("purging");
-
-    await expect(h.worker.processOnce()).resolves.toBe(1);
-
-    expect(h.jobs.transitionCalls[0]?.options).toMatchObject({
-      fromStatus: "purging",
-      toStatus: "blocked",
-      errorCode: "policy_unavailable",
+  it("never claims or touches a policy-activated purging row from the real Memory store", async () => {
+    const store = new MemorySessionStore();
+    const nowMs = 1_000;
+    const requestId = newErasureRequestId();
+    await store.requestUserErasure({
+      requestId,
+      tenantId: "tenant-purging-boundary",
+      userId: "user-purging-boundary",
+      requestedByKeyId: "purging-boundary",
+      idempotencyKey: requestId,
+      requestHash: userErasureRequestHash("tenant-purging-boundary", "user-purging-boundary"),
+      atMs: nowMs,
     });
-    expect(h.catalog.listCalls).toEqual([]);
-    expect(h.usage.calls).toEqual([]);
-    expect(h.executor.drains).toEqual([]);
-    expect(h.executor.erases).toEqual([]);
+    const policy = { policyVersion: "policy-v1", policyHash: "a".repeat(64) };
+    const audits = store.erasureAuditEvents.get(requestId)!;
+    const transitions = [
+      ["gated", "draining"],
+      ["draining", "tombstoning"],
+      ["tombstoning", "reconciling_usage"],
+      ["reconciling_usage", "awaiting_purge_policy"],
+      ["awaiting_purge_policy", "purging"],
+    ] as const;
+    for (const [index, [fromStatus, status]] of transitions.entries()) {
+      audits.push({
+        requestId,
+        seq: audits.length + 1,
+        type: "erasure/status_changed",
+        payload: {
+          fromStatus,
+          status,
+          generation: 1,
+          ...(status === "purging" ? policy : {}),
+        },
+        emittedAtMs: nowMs + index + 1,
+      });
+    }
+    const seeded = {
+      ...store.erasureRequests.get(requestId)!,
+      status: "purging" as const,
+      updatedAtMs: nowMs + transitions.length,
+      availableAtMs: nowMs,
+      attempts: 4,
+      claimToken: "legacy-purge-worker",
+      leaseUntilMs: nowMs + 60_000,
+      ...policy,
+    };
+    validateErasureRequestRecord(seeded);
+    validateErasureAuditChain(seeded, audits);
+    store.erasureRequests.set(requestId, seeded);
+
+    const renew = vi.spyOn(store, "renewErasureJobClaim");
+    const transition = vi.spyOn(store, "transitionErasureJob");
+    const retry = vi.spyOn(store, "retryErasureJob");
+    const list = vi.spyOn(store, "listErasureSessions");
+    const inspect = vi.spyOn(store, "inspectErasureSubjectProgress");
+    const reconcile = vi.spyOn(store, "reconcileErasureSessionUsage");
+    const executor = new FakeExecutor();
+    const worker = new ErasureWorker({
+      jobs: store,
+      catalog: store,
+      usage: store,
+      executor,
+      canClaim: allowClaims,
+      clock: { now: () => nowMs + 10 },
+    });
+
+    await expect(worker.processOnce()).resolves.toBe(0);
+    expect(await store.claimErasureJobs({
+      nowMs: nowMs + 10,
+      limit: 1,
+      leaseMs: 30_000,
+      claimToken: "normal-worker",
+    })).toEqual([]);
+    expect(store.erasureRequests.get(requestId)).toEqual(seeded);
+    expect(renew).not.toHaveBeenCalled();
+    expect(transition).not.toHaveBeenCalled();
+    expect(retry).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
+    expect(inspect).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(executor.drains).toEqual([]);
+    expect(executor.erases).toEqual([]);
   });
 });
 
@@ -646,6 +766,7 @@ describe("ErasureWorker durable Memory tombstone proof gate", () => {
       catalog: h.store,
       usage: h.store,
       executor: new FakeExecutor(),
+      canClaim: allowClaims,
       clock: { now: () => h.nowMs + 2 },
     });
 
@@ -695,6 +816,7 @@ describe("ErasureWorker durable Memory tombstone proof gate", () => {
       catalog,
       usage: h.store,
       executor: new FakeExecutor(),
+      canClaim: allowClaims,
       clock: { now: () => h.nowMs + 2 },
     });
 
@@ -744,6 +866,7 @@ describe("ErasureWorker durable Memory tombstone proof gate", () => {
       catalog: h.store,
       usage: h.store,
       executor: new FakeExecutor(),
+      canClaim: allowClaims,
       clock: { now: () => h.nowMs + 2 },
     });
 
@@ -786,7 +909,7 @@ describe("ErasureWorker authority and retry safety", () => {
     const slowFirst = deferred<void>();
     executor.drainHook = (sessionId) => sessionId === SESSION_1 ? slowFirst.promise : undefined;
     const worker = new ErasureWorker(
-      { jobs, catalog, usage, executor },
+      { jobs, catalog, usage, executor, canClaim: allowClaims },
       { jobBatchSize: 2 },
     );
 
@@ -828,7 +951,7 @@ describe("ErasureWorker authority and retry safety", () => {
       return true;
     };
     const worker = new ErasureWorker(
-      { jobs, catalog, usage, executor, logger: { warn } },
+      { jobs, catalog, usage, executor, canClaim: allowClaims, logger: { warn } },
       { jobBatchSize: 2 },
     );
 
@@ -896,7 +1019,7 @@ describe("ErasureWorker authority and retry safety", () => {
     const held = new Promise<void>((resolve) => { release = resolve; });
     executor.drainHook = () => held;
     const worker = new ErasureWorker(
-      { jobs, catalog, usage, executor },
+      { jobs, catalog, usage, executor, canClaim: allowClaims },
       { leaseMs: 300 },
     );
 
@@ -927,7 +1050,7 @@ describe("ErasureWorker authority and retry safety", () => {
     const held = new Promise<void>((resolve) => { release = resolve; });
     executor.drainHook = () => held;
     const worker = new ErasureWorker(
-      { jobs, catalog, usage, executor },
+      { jobs, catalog, usage, executor, canClaim: allowClaims },
       { leaseMs: 300 },
     );
 
@@ -954,6 +1077,7 @@ describe("ErasureWorker authority and retry safety", () => {
       catalog,
       usage,
       executor,
+      canClaim: allowClaims,
       clock: { now: () => ++now },
     });
 
@@ -984,7 +1108,7 @@ describe("ErasureWorker authority and retry safety", () => {
     const executor = new FakeExecutor();
     const claimed = deferred<ErasureJobClaim[]>();
     jobs.claimHook = () => claimed.promise;
-    const worker = new ErasureWorker({ jobs, catalog, usage, executor });
+    const worker = new ErasureWorker({ jobs, catalog, usage, executor, canClaim: allowClaims });
 
     worker.start();
     await vi.advanceTimersByTimeAsync(0);
@@ -1015,7 +1139,7 @@ describe("ErasureWorker authority and retry safety", () => {
     });
     const activeCall = deferred<void>();
     executor.drainHook = (sessionId) => sessionId === SESSION_1 ? activeCall.promise : undefined;
-    const worker = new ErasureWorker({ jobs, catalog, usage, executor });
+    const worker = new ErasureWorker({ jobs, catalog, usage, executor, canClaim: allowClaims });
 
     worker.start();
     await vi.advanceTimersByTimeAsync(0);

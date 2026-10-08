@@ -2,6 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import {
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
+  INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
+  INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
+  INTERNAL_ROUTER_TOKEN_HEADER,
+} from "@agent-service/protocol";
 
 const mockedServer = vi.hoisted(() => ({
   listening: true,
@@ -23,6 +29,7 @@ import { ErasureWorker } from "@agent-service/core";
 import { startRunner } from "../src/main.js";
 
 const MASTER_KEY = "88".repeat(32);
+const INTERNAL_TOKEN = "runner-main-private-router-token-0001";
 
 describe("runner main blob wiring", () => {
   it("constructs one filesystem data plane, advertises the write gate, and closes workers cleanly", async () => {
@@ -45,7 +52,11 @@ describe("runner main blob wiring", () => {
       expect(await runner.blobCleanup.cleanupOnce()).toBe(0);
       const capabilityResponse = await runner.app.request("/v1/capabilities");
       expect(await capabilityResponse.json()).toMatchObject({
-        features: { blobAttachments: true, userErasureWorker: ["drain-v1"] },
+        features: {
+          blobAttachments: true,
+          userErasureWorker: ["drain-v1"],
+          erasureJobControl: ["quarantine-v1"],
+        },
       });
       expect(runner.erasureWorker).toBeUndefined();
 
@@ -59,10 +70,15 @@ describe("runner main blob wiring", () => {
     }
   });
 
-  it("starts the embedded erasure worker and stops it before draining the host without network I/O", async () => {
+  it("gates the embedded erasure worker through the router probe and stops it before host drain", async () => {
     const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-erasure-"));
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected network"));
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, {
+      status: 204,
+      headers: {
+        [INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER]: INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
+      },
+    }));
     const startSpy = vi.spyOn(ErasureWorker.prototype, "start");
     let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
     try {
@@ -75,6 +91,7 @@ describe("runner main blob wiring", () => {
         ERASURE_ROUTER_URL: "http://127.0.0.1:8080",
         ERASURE_WORKER_POLL_MS: "60000",
         DATA_ERASURE_REQUESTS_ENABLED: "1",
+        INTERNAL_ROUTER_TOKEN: INTERNAL_TOKEN,
       });
       expect(startSpy).toHaveBeenCalledOnce();
       expect(runner.erasureWorker).toBeInstanceOf(ErasureWorker);
@@ -83,8 +100,14 @@ describe("runner main blob wiring", () => {
         features: {
           dataErasureRequests: true,
           userErasureWorker: ["drain-v1"],
+          erasureJobControl: ["quarantine-v1"],
         },
       });
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledOnce());
+      const [input, init] = fetchSpy.mock.calls[0]!;
+      expect(String(input)).toBe(`http://127.0.0.1:8080${INTERNAL_ERASURE_JOB_CONTROL_READY_PATH}`);
+      expect(init?.method).toBe("GET");
+      expect(new Headers(init?.headers).get(INTERNAL_ROUTER_TOKEN_HEADER)).toBe(INTERNAL_TOKEN);
 
       const stopSpy = vi.spyOn(runner.erasureWorker!, "stop");
       const drainSpy = vi.spyOn(runner.host, "drain");
@@ -92,7 +115,7 @@ describe("runner main blob wiring", () => {
       expect(stopSpy).toHaveBeenCalledOnce();
       expect(drainSpy).toHaveBeenCalledOnce();
       expect(stopSpy.mock.invocationCallOrder[0]).toBeLessThan(drainSpy.mock.invocationCallOrder[0]!);
-      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(fetchSpy).toHaveBeenCalledOnce();
       expect(runner.server.listening).toBe(false);
       runner = undefined;
     } finally {

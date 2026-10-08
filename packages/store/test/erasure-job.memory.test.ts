@@ -101,7 +101,98 @@ describe("MemorySessionStore durable erasure job queue", () => {
     }))[0]).toMatchObject({ attempts: 3, claimToken: "worker-retry" });
   });
 
-  it("enforces the state graph, writes audit atomically, and erases the subject only on completed", async () => {
+  it("returns an already committed claim before a later unknown candidate failure", async () => {
+    const store = new MemorySessionStore();
+    const first = requestInput("tenant-partial-claim", "user-first", 100);
+    const later = requestInput("tenant-partial-claim", "user-later", 101);
+    await store.requestUserErasure(first);
+    await store.requestUserErasure(later);
+
+    const internal = store as unknown as {
+      assertErasureJobIntegrity: (record: { requestId: string }) => unknown;
+    };
+    const originalAssert = internal.assertErasureJobIntegrity.bind(store);
+    internal.assertErasureJobIntegrity = (record) => {
+      if (record.requestId === later.requestId) throw new TypeError("injected later failure");
+      return originalAssert(record);
+    };
+
+    expect(await store.claimErasureJobs({
+      nowMs: 101,
+      limit: 2,
+      leaseMs: 20,
+      claimToken: "worker-partial-success",
+    })).toEqual([expect.objectContaining({
+      requestId: first.requestId,
+      attempts: 1,
+      claimToken: "worker-partial-success",
+    })]);
+    expect(store.erasureRequests.get(first.requestId)).toMatchObject({
+      attempts: 1,
+      claimToken: "worker-partial-success",
+      leaseUntilMs: 121,
+    });
+    expect(store.erasureRequests.get(later.requestId)).toMatchObject({
+      attempts: 0,
+      availableAtMs: 101,
+    });
+
+    await expect(store.claimErasureJobs({
+      nowMs: 101,
+      limit: 1,
+      leaseMs: 20,
+      claimToken: "worker-no-prior-success",
+    })).rejects.toThrow("injected later failure");
+  });
+
+  it("rejects user claim authority after the parent tenant stops being active", async () => {
+    const store = new MemorySessionStore();
+    const input = requestInput("tenant-parent-gate", "user-parent-gate");
+    await store.requestUserErasure(input);
+    const claim = (await store.claimErasureJobs({
+      nowMs: 100, limit: 1, leaseMs: 50, claimToken: "worker-parent-gate",
+    }))[0]!;
+    const tenantKey = subjectLifecycleKey(input.tenantId, "tenant", input.tenantId);
+    const tenant = store.subjectLifecycles.get(tenantKey)!;
+
+    store.subjectLifecycles.set(tenantKey, {
+      ...tenant,
+      state: "deleting",
+      generation: 1,
+      activeRequestId: newErasureRequestId(),
+      updatedAtMs: 101,
+    });
+    expect(await store.renewErasureJobClaim(authorization(claim), {
+      nowMs: 101,
+      leaseMs: 50,
+    })).toBe(false);
+
+    store.subjectLifecycles.set(tenantKey, {
+      ...tenant,
+      state: "erased",
+      generation: 1,
+      updatedAtMs: 102,
+    });
+    expect(await store.transitionErasureJob(authorization(claim), {
+      fromStatus: "gated",
+      toStatus: "draining",
+      atMs: 102,
+      availableAtMs: 102,
+    })).toBe(false);
+    expect(await store.retryErasureJob(authorization(claim), {
+      failedAtMs: 102,
+      availableAtMs: 110,
+      errorCode: "temporary_failure",
+    })).toBe(false);
+    expect(store.erasureRequests.get(input.requestId)).toMatchObject({
+      status: "gated",
+      attempts: 1,
+      claimToken: "worker-parent-gate",
+      leaseUntilMs: 150,
+    });
+  });
+
+  it("enforces the state graph and keeps rolling-upgrade purging rows outside the normal worker", async () => {
     const store = new MemorySessionStore();
     const input = requestInput("tenant-transition", "user-transition");
     await store.requestUserErasure(input);
@@ -150,42 +241,16 @@ describe("MemorySessionStore durable erasure job queue", () => {
       availableAtMs: 105,
       updatedAtMs: 105,
     });
-    delete audits[3]!.payload.policyVersion;
-    delete audits[3]!.payload.policyHash;
-    await expect(store.claimErasureJobs({
-      nowMs: 105, limit: 1, leaseMs: 100, claimToken: "worker-missing-policy",
-    })).rejects.toThrow("not carried forward");
-    Object.assign(audits[3]!.payload, policy);
-    const purging = (await store.claimErasureJobs({
+    expect(await store.claimErasureJobs({
       nowMs: 105, limit: 1, leaseMs: 100, claimToken: "worker-purge",
-    }))[0]!;
-    expect(await store.transitionErasureJob(authorization(purging), {
-      fromStatus: "purging",
-      toStatus: "completed",
-      atMs: 106,
-      counts: { sessions: 2, blobs: 3 },
-      checksum: "b".repeat(64),
-    })).toBe(true);
+    })).toEqual([]);
     expect(await store.getUserErasureRequest(input.tenantId, input.userId, input.requestId)).toMatchObject({
-      status: "completed",
-      completedAtMs: 106,
-      counts: { sessions: 2, blobs: 3 },
-      checksum: "b".repeat(64),
+      status: "purging",
+      availableAtMs: 105,
+      attempts: 1,
     });
     expect(await store.getSubjectLifecycle(input.tenantId, "user", input.userId)).toMatchObject({
-      state: "erased", generation: 1,
-    });
-    expect(await store.getSubjectLifecycle(input.tenantId, "user", input.userId))
-      .not.toHaveProperty("activeRequestId");
-    expect((await store.listErasureAuditEvents(input.requestId)).at(-1)).toMatchObject({
-      seq: 7,
-      type: "erasure/completed",
-      payload: {
-        fromStatus: "purging",
-        status: "completed",
-        generation: 1,
-        ...policy,
-      },
+      state: "deleting", generation: 1, activeRequestId: input.requestId,
     });
   });
 
@@ -217,9 +282,66 @@ describe("MemorySessionStore durable erasure job queue", () => {
     store.subjectLifecycles.set(subjectKey, { ...subject, activeRequestId: newErasureRequestId() });
     await expect(store.retryErasureJob(authorization(claim), {
       failedAtMs: 102, availableAtMs: 120, errorCode: "integrity_conflict",
-    })).rejects.toThrow("does not match its active subject lifecycle");
+    })).rejects.toMatchObject({ reasonCode: "subject_binding_invalid" });
     expect(store.erasureRequests.get(input.requestId)).toMatchObject({
       status: "gated", claimToken: "worker-corrupt", leaseUntilMs: 200,
+    });
+  });
+
+  it("rolls back the request when the following audit publication fails", async () => {
+    const store = new MemorySessionStore();
+    const input = requestInput("tenant-transition-rollback", "user-transition-rollback");
+    await store.requestUserErasure(input);
+    const claim = (await store.claimErasureJobs({
+      nowMs: 100,
+      limit: 1,
+      leaseMs: 100,
+      claimToken: "worker-transition-rollback",
+    }))[0]!;
+    const record = store.erasureRequests.get(input.requestId)!;
+    const audits = store.erasureAuditEvents.get(input.requestId)!;
+    const subjectKey = subjectLifecycleKey(input.tenantId, "user", input.userId);
+    const auditMap = store.erasureAuditEvents;
+    const originalSet = auditMap.set.bind(auditMap);
+    let fail = true;
+    Object.defineProperty(auditMap, "set", {
+      configurable: true,
+      value: (key: string, value: Parameters<typeof auditMap.set>[1]) => {
+        if (key === input.requestId && fail) {
+          fail = false;
+          throw new Error("injected transition audit publication failure");
+        }
+        return originalSet(key, value);
+      },
+    });
+
+    const transition = {
+      fromStatus: "gated" as const,
+      toStatus: "draining" as const,
+      atMs: 101,
+      availableAtMs: 101,
+    };
+    await expect(store.transitionErasureJob(authorization(claim), transition))
+      .rejects.toThrow("injected transition audit publication failure");
+    expect(store.erasureRequests.get(input.requestId)).toBe(record);
+    expect(record).toMatchObject({
+      status: "gated",
+      claimToken: claim.claimToken,
+      leaseUntilMs: 200,
+    });
+    expect(store.erasureAuditEvents.get(input.requestId)).toBe(audits);
+    expect(audits).toHaveLength(1);
+    expect(store.subjectLifecycles.get(subjectKey)).toMatchObject({
+      state: "deleting",
+      activeRequestId: input.requestId,
+    });
+
+    await expect(store.transitionErasureJob(authorization(claim), transition)).resolves.toBe(true);
+    expect(store.erasureRequests.get(input.requestId)).toMatchObject({ status: "draining" });
+    expect(store.erasureAuditEvents.get(input.requestId)).toHaveLength(2);
+    expect(store.subjectLifecycles.get(subjectKey)).toMatchObject({
+      state: "deleting",
+      activeRequestId: input.requestId,
     });
   });
 });

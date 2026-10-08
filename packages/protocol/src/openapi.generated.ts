@@ -780,6 +780,17 @@ export const OPENAPI_DOCUMENT = {
               "dynamicTools": {
                 "type": "boolean"
               },
+              "erasureJobControl": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "quarantine-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
               "mcp": {
                 "items": {
                   "enum": [

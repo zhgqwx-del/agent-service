@@ -11,6 +11,8 @@ import {
   type ErasureSessionCatalogStore,
   type UsageLedgerEntry,
 } from "@agent-service/store";
+
+const allowClaims = async () => true;
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ErasureWorker, newId, type ErasureSessionExecutor } from "../src/index.js";
@@ -174,6 +176,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         catalog: store,
         usage: store,
         executor,
+        canClaim: allowClaims,
         clock: { now: () => h.nowMs + 1 },
       });
 
@@ -223,6 +226,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         catalog,
         usage: store,
         executor,
+        canClaim: allowClaims,
         clock: { now: () => h.nowMs + 1 },
       });
 
@@ -319,6 +323,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         catalog: store,
         usage: store,
         executor,
+        canClaim: allowClaims,
         clock: { now: () => h.nowMs + 1 },
       });
 
@@ -380,6 +385,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         catalog: store,
         usage: store,
         executor,
+        canClaim: allowClaims,
         clock: { now: () => h.nowMs + 1 },
       });
 
