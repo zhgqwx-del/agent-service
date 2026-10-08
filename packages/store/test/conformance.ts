@@ -1051,13 +1051,13 @@ export function lifecycleOutboxStoreConformance(
           leaseMs: 100,
           claimToken: "unknown-topic",
         })).rejects.toThrow("unsupported lifecycle outbox topic");
-        expect(await store.claimLifecycleOutbox({
+        await expect(store.claimLifecycleOutbox({
           topics: ["session.purge"],
           nowMs: 9_000,
           limit: 1,
           leaseMs: 100,
           claimToken: "purge-must-remain-disabled",
-        })).toEqual([]);
+        })).rejects.toThrow("not claimable by this store");
         expect(await store.claimLifecycleOutbox({
           topics: ["session.tombstoned"],
           nowMs: 999,

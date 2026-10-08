@@ -256,6 +256,7 @@ import {
   RetentionPolicyNotFoundError,
   RetentionPolicyVersionConflictError,
   compareLegalHoldIds,
+  legalHoldControlAtGeneration,
   legalHoldControlSha256,
   legalHoldProjectionSha256,
   retentionPolicyControlSha256,
@@ -283,6 +284,46 @@ import {
   type RetentionPolicyVersionRecord,
   type SetLegalHoldInput,
 } from "./retention-policy.js";
+import {
+  EMPTY_ERASURE_PURGE_TARGET_ROOT_SHA256,
+  ErasurePurgeEvidenceChangedError,
+  checkedRetentionDeadline,
+  erasurePolicyDecisionSha256,
+  erasurePolicyEvaluationAuthorizationMatches,
+  erasurePurgeAuthorityMatchesDecision,
+  erasurePurgeAuthoritySha256,
+  erasurePurgeTargetMatchesRetentionPolicy,
+  erasurePurgeTargetEvidenceSha256,
+  newErasurePolicyEvaluationJob,
+  nextErasurePurgeTargetRootSha256,
+  validateBuildErasurePurgeTargetPageOptions,
+  validateClaimErasurePolicyEvaluationsOptions,
+  validateErasurePolicyEvaluationAuthorization,
+  validateErasurePurgeTargetEvidence,
+  validateRenewErasurePolicyEvaluationOptions,
+  validateRetryErasurePolicyEvaluationOptions,
+  validateScheduleAwaitingErasurePolicyEvaluationsOptions,
+  validateSealErasurePurgeAuthorityOptions,
+  type BuildErasurePurgeTargetPageOptions,
+  type BuildErasurePurgeTargetPageResult,
+  type ClaimErasurePolicyEvaluationsOptions,
+  type ErasureCompletionReadiness,
+  type ErasurePolicyEvaluationAuthorization,
+  type ErasurePolicyEvaluationClaim,
+  type ErasurePolicyEvaluationDecision,
+  type ErasurePolicyEvaluationDecisionEvent,
+  type ErasurePolicyEvaluationJob,
+  type ErasurePolicyEvaluationSealResult,
+  type ErasurePolicyEvaluationStore,
+  type ErasurePurgeAuthorityControl,
+  type ErasurePurgeAuthorityRecord,
+  type ErasurePurgeTargetEvidence,
+  type ErasurePurgeTargetIssueCode,
+  type RenewErasurePolicyEvaluationOptions,
+  type RetryErasurePolicyEvaluationOptions,
+  type ScheduleAwaitingErasurePolicyEvaluationsOptions,
+  type SealErasurePurgeAuthorityOptions,
+} from "./erasure-purge-policy.js";
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -391,8 +432,43 @@ function validateUploadedBlobInput(input: MarkBlobUploadedInput): void {
   if (!Number.isSafeInteger(input.fence) || input.fence < 0) throw new Error("invalid blob fence");
 }
 
+function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): boolean {
+  try {
+    validateBlobKey(manifest.storageKey);
+  } catch {
+    return false;
+  }
+  return mapKey === manifest.blobId
+    && isCanonicalId("blob", manifest.blobId)
+    && isCanonicalId("sess", manifest.sessionId)
+    && manifest.state === "ready"
+    && (manifest.purpose === "input_image" || manifest.purpose === "tool_output")
+    && /^[a-z0-9][a-z0-9._-]{0,31}$/.test(manifest.storageBackend)
+    && manifest.storageFormat === BLOB_STORAGE_FORMAT
+    && /^[a-z0-9-]{16,64}$/.test(manifest.uploadToken)
+    && manifest.itemId !== undefined
+    && isCanonicalId("item", manifest.itemId)
+    && manifest.sha256 !== undefined
+    && /^[0-9a-f]{64}$/.test(manifest.sha256)
+    && manifest.sizeBytes !== undefined
+    && Number.isSafeInteger(manifest.sizeBytes)
+    && manifest.sizeBytes >= 0
+    && manifest.uploadedAtMs !== undefined
+    && Number.isSafeInteger(manifest.uploadedAtMs)
+    && manifest.uploadedAtMs >= manifest.createdAtMs
+    && manifest.readyAtMs !== undefined
+    && Number.isSafeInteger(manifest.readyAtMs)
+    && manifest.readyAtMs >= manifest.createdAtMs
+    && Number.isSafeInteger(manifest.createdAtMs)
+    && manifest.createdAtMs >= 0
+    && manifest.stagingExpiresAtMs === undefined
+    && manifest.deleteAfterMs === undefined
+    && manifest.deletedAtMs === undefined
+    && manifest.deletionGeneration === 0;
+}
+
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore {
   agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -427,6 +503,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   legalHoldControls = new Map<string, LegalHoldControlRecord>();
   legalHoldEvents = new Map<string, LegalHoldEvent[]>();
   private nextLegalHoldEventId = 1;
+  erasurePolicyEvaluationJobs = new Map<string, ErasurePolicyEvaluationJob>();
+  erasurePurgeTargets = new Map<string, ErasurePurgeTargetEvidence>();
+  erasurePolicyEvaluationDecisions = new Map<string, ErasurePolicyEvaluationDecisionEvent[]>();
+  erasurePurgeAuthorityControls = new Map<string, ErasurePurgeAuthorityControl>();
+  erasurePurgeAuthorities = new Map<string, ErasurePurgeAuthorityRecord[]>();
   legacyTombstoneCutovers = new Map<string, LegacyTombstoneCutoverRecord>();
   legacyTombstoneCompensationJobs = new Map<string, LegacyTombstoneCompensationJobRecord>();
   legacyTombstoneCompensationAudits = new Map<string, LegacyTombstoneCompensationAudit[]>();
@@ -1190,6 +1271,1225 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     subjectId: string,
   ): Promise<LegalHoldEvent[]> {
     return this.assertLegalHoldState(tenantId, subjectKind, subjectId).events.map(clone);
+  }
+
+  private erasurePurgeTargetKey(
+    requestId: string,
+    buildGeneration: number,
+    sessionId: string,
+  ): string {
+    return JSON.stringify([requestId, buildGeneration, sessionId]);
+  }
+
+  private assertErasurePolicyEvaluationJob(
+    job: ErasurePolicyEvaluationJob,
+  ): { request: ErasureRequestRecord; subject: SubjectLifecycleRecord } {
+    const request = this.erasureRequests.get(job.requestId);
+    if (
+      !request
+      || request.requestId !== job.requestId
+      || request.tenantId !== job.tenantId
+      || request.subjectKind !== job.subjectKind
+      || request.subjectId !== job.subjectId
+      || request.generation !== job.subjectGeneration
+      || request.status !== "awaiting_purge_policy"
+    ) throw new Error("erasure policy evaluation request binding is invalid");
+    const subject = this.assertErasureJobIntegrity(request);
+    if (
+      subject.generation !== job.subjectGeneration
+      || subject.activeRequestId !== job.requestId
+      || subject.state !== "deleting"
+    ) throw new Error("erasure policy evaluation subject binding is invalid");
+    if (
+      (job.subjectKind !== "tenant" && job.subjectKind !== "user")
+      || !Number.isSafeInteger(job.buildGeneration)
+      || job.buildGeneration <= 0
+      || !Number.isSafeInteger(job.targetCount)
+      || job.targetCount < 0
+      || !/^[0-9a-f]{64}$/.test(job.targetRootSha256)
+      || !Number.isSafeInteger(job.attempts)
+      || job.attempts < 0
+      || (job.cursorSessionId !== undefined && !isCanonicalId("sess", job.cursorSessionId))
+      || (job.availableAtMs !== undefined
+        && (!Number.isSafeInteger(job.availableAtMs) || job.availableAtMs < 0))
+      || (job.leaseUntilMs !== undefined
+        && (!Number.isSafeInteger(job.leaseUntilMs) || job.leaseUntilMs < 0))
+      || (job.sealedAtMs !== undefined
+        && (!Number.isSafeInteger(job.sealedAtMs) || job.sealedAtMs < 0))
+      || !Number.isSafeInteger(job.createdAtMs)
+      || job.createdAtMs < 0
+      || !Number.isSafeInteger(job.updatedAtMs)
+      || job.updatedAtMs < job.createdAtMs
+      || ((job.claimToken === undefined) !== (job.leaseUntilMs === undefined))
+      || (job.claimToken !== undefined && !/^[A-Za-z0-9._:-]{16,128}$/.test(job.claimToken))
+      || (job.claimToken !== undefined && job.availableAtMs === undefined)
+      || (job.lastErrorCode !== undefined
+        && job.lastErrorCode !== "temporary_failure"
+        && job.lastErrorCode !== "evidence_changed")
+      || (job.sealedAtMs !== undefined && (
+        job.availableAtMs !== undefined
+        || job.claimToken !== undefined
+        || job.leaseUntilMs !== undefined
+        || job.lastErrorCode !== undefined
+      ))
+    ) throw new Error("erasure policy evaluation job is invalid");
+    return { request, subject };
+  }
+
+  private erasurePolicyEvaluationClaim(
+    job: ErasurePolicyEvaluationJob,
+  ): ErasurePolicyEvaluationClaim {
+    if (
+      job.availableAtMs === undefined
+      || job.claimToken === undefined
+      || job.leaseUntilMs === undefined
+    ) throw new Error("erasure policy evaluation job is not claimed");
+    return {
+      requestId: job.requestId,
+      tenantId: job.tenantId,
+      subjectKind: job.subjectKind,
+      subjectId: job.subjectId,
+      subjectGeneration: job.subjectGeneration,
+      buildGeneration: job.buildGeneration,
+      availableAtMs: job.availableAtMs,
+      claimToken: job.claimToken,
+      claimAttempt: job.attempts,
+      leaseUntilMs: job.leaseUntilMs,
+    };
+  }
+
+  private assertErasurePolicyEvaluationAuthorization(
+    authorization: ErasurePolicyEvaluationAuthorization,
+    nowMs: number,
+  ): { job: ErasurePolicyEvaluationJob; request: ErasureRequestRecord } {
+    validateErasurePolicyEvaluationAuthorization(authorization);
+    const job = this.erasurePolicyEvaluationJobs.get(authorization.requestId);
+    if (!job) throw new Error("stale erasure policy evaluation authority");
+    const { request } = this.assertErasurePolicyEvaluationJob(job);
+    if (!erasurePolicyEvaluationAuthorizationMatches(job, authorization, nowMs)) {
+      throw new Error("stale erasure policy evaluation authority");
+    }
+    return { job, request };
+  }
+
+  private memoryErasurePurgeTarget(
+    request: ErasureRequestRecord,
+    job: ErasurePolicyEvaluationJob,
+    policy: RetentionPolicyVersionRecord,
+    session: Session,
+  ): ErasurePurgeTargetEvidence {
+    const issues = new Set<ErasurePurgeTargetIssueCode>();
+    const tombstone = this.deleted.get(session.id);
+    let deletedAtMs = 0;
+    let deletionGeneration = 0;
+    if (tombstone) {
+      deletedAtMs = tombstone.deletedAtMs;
+      deletionGeneration = tombstone.deletionGeneration;
+    }
+    try {
+      if (!tombstone) throw new Error("missing tombstone");
+      this.assertExistingErasureTombstone(session, tombstone);
+    } catch {
+      issues.add("tombstone_invalid");
+      if (!Number.isSafeInteger(deletedAtMs) || deletedAtMs < 0) deletedAtMs = 0;
+      if (!Number.isSafeInteger(deletionGeneration) || deletionGeneration <= 0) deletionGeneration = 1;
+    }
+
+    const contentDeadline = checkedRetentionDeadline(
+      deletedAtMs,
+      policy.policy.sessionContentRetentionMs,
+    );
+    if (contentDeadline.kind === "unconfigured") issues.add("policy_unconfigured");
+    if (contentDeadline.kind === "invalid") issues.add("deadline_overflow");
+
+    const sessionBlobs = [...this.blobManifests.entries()]
+      .filter(([, blob]) => blob.sessionId === session.id)
+      .sort((left, right) => left[1].blobId.localeCompare(right[1].blobId));
+    if (sessionBlobs.some(([key, blob]) => (
+      blob.tenantId !== request.tenantId
+      || blob.userId !== request.subjectId
+      || (blob.state !== "ready" && blob.state !== "deleted")
+      || (blob.state === "ready" && !isValidReadyPurgeBlobManifest(key, blob))
+    ))) issues.add("blob_invalid");
+    const readyBlobs = sessionBlobs
+      .map(([, blob]) => blob)
+      .filter((blob) => (
+        blob.tenantId === request.tenantId
+        && blob.userId === request.subjectId
+        && blob.state === "ready"
+      ));
+    const readyBlobRootSha256 = createHash("sha256").update(JSON.stringify([
+      "agent-service/erasure-ready-blob-root/v1",
+      ...readyBlobs.map((blob) => [
+        blob.blobId,
+        blob.deletionGeneration,
+        blob.sha256 ?? null,
+        blob.sizeBytes ?? null,
+      ]),
+    ])).digest("hex");
+
+    const reconciliation = this.usageReconciliations.get(
+      this.usageReconciliationMapKey(session.id, deletionGeneration),
+    );
+    let reconciliationValid = !!reconciliation && (
+      reconciliation.tenantId === request.tenantId
+      && reconciliation.userId === request.subjectId
+      && reconciliation.sessionId === session.id
+      && reconciliation.deletionGeneration === deletionGeneration
+      && (reconciliation.status === "verified" || reconciliation.status === "anonymized")
+      && Number.isSafeInteger(reconciliation.verifiedAtMs)
+      && reconciliation.verifiedAtMs >= deletedAtMs
+      && /^[0-9a-f]{64}$/.test(reconciliation.checksum)
+    );
+    if (reconciliationValid && reconciliation) {
+      const ledger = this.usageLedger.filter((entry) => entry.sessionId === session.id);
+      if (ledger.some((entry) => (
+        entry.tenantId !== request.tenantId || entry.userId !== request.subjectId
+      ))) {
+        reconciliationValid = false;
+      } else if (reconciliation.status === "anonymized") {
+        reconciliationValid = ledger.length === 0
+          && reconciliation.anonymizedAtMs !== undefined
+          && reconciliation.anonymizedAtMs >= reconciliation.verifiedAtMs;
+      } else {
+        try {
+          const facts = ledger.map((entry) => {
+            if (!entry.usageId || !isUsageId(entry.usageId)) throw new Error("missing usage identity");
+            const durable = this.billingUsageFacts.get(entry.usageId);
+            if (!durable) throw new Error("missing billing fact");
+            const expected = billingUsageFactFromLedger({
+              ...entry,
+              usage: normalizeHistoricalUsageCost(entry.usage),
+            } as UsageLedgerEntry & { usageId: string });
+            if (!billingUsageFactContentEquals(durable, expected)) throw new Error("billing fact mismatch");
+            return durable;
+          });
+          reconciliationValid = usageReconciliationSummariesEqual(
+            reconciliation,
+            summarizeBillingUsageFacts(facts),
+          );
+        } catch {
+          reconciliationValid = false;
+        }
+      }
+    }
+    if (
+      !reconciliation
+      || !reconciliationValid
+    ) issues.add("usage_reconciliation_invalid");
+    // Invalid reconciliation rows are untrusted, including their owner-scoped timestamp and
+    // checksum. Use deterministic subject-local placeholders so target evidence cannot disclose
+    // fields from a foreign tenant/user that happens to share the session/generation key.
+    const usageVerifiedAtMs = reconciliationValid ? reconciliation!.verifiedAtMs : deletedAtMs;
+    const usageDeadline = checkedRetentionDeadline(
+      usageVerifiedAtMs,
+      policy.policy.operationalUsageRetentionMs,
+    );
+    if (usageDeadline.kind === "unconfigured") issues.add("policy_unconfigured");
+    if (usageDeadline.kind === "invalid") issues.add("deadline_overflow");
+
+    const receipts: number[] = [];
+    let ownedReceiptCount = 0;
+    for (const [key, receipt] of this.idem) {
+      let scope: unknown;
+      try {
+        scope = JSON.parse(key);
+      } catch {
+        continue;
+      }
+      if (
+        !Array.isArray(scope)
+        || scope.length !== 4
+        || scope[2] !== session.id
+      ) continue;
+      if (scope[0] !== request.tenantId || scope[1] !== request.subjectId) {
+        issues.add("receipt_invalid");
+        continue;
+      }
+      ownedReceiptCount += 1;
+      if (!Number.isSafeInteger(receipt.expiresAt) || receipt.expiresAt < 0) {
+        issues.add("receipt_invalid");
+      } else {
+        receipts.push(receipt.expiresAt);
+      }
+    }
+    const receiptFloor = checkedRetentionDeadline(
+      deletedAtMs,
+      policy.policy.idempotencyReceiptRetentionMs,
+    );
+    if (receiptFloor.kind === "unconfigured") issues.add("policy_unconfigured");
+    if (receiptFloor.kind === "invalid") issues.add("deadline_overflow");
+    const idempotencyReceiptDeadlineMs = receipts.length > 0 && receiptFloor.kind === "deadline"
+      ? Math.max(receiptFloor.value, ...receipts)
+      : undefined;
+
+    const withoutHash: Omit<ErasurePurgeTargetEvidence, "evidenceSha256"> = {
+      requestId: request.requestId,
+      buildGeneration: job.buildGeneration,
+      tenantId: request.tenantId,
+      userId: request.subjectId,
+      sessionId: session.id,
+      deletionGeneration,
+      deletedAtMs,
+      ...(contentDeadline.kind === "deadline"
+        ? { sessionContentDeadlineMs: contentDeadline.value }
+        : {}),
+      readyBlobCount: readyBlobs.length,
+      readyBlobRootSha256,
+      ...(readyBlobs.length > 0 && contentDeadline.kind === "deadline"
+        ? { readyBlobDeadlineMs: contentDeadline.value }
+        : {}),
+      operationalUsageStatus: reconciliationValid
+        ? reconciliation!.status
+        : "missing_or_invalid",
+      operationalUsageVerifiedAtMs: usageVerifiedAtMs,
+      operationalUsageChecksum: reconciliationValid ? reconciliation!.checksum : "0".repeat(64),
+      ...(usageDeadline.kind === "deadline"
+        ? { operationalUsageDeadlineMs: usageDeadline.value }
+        : {}),
+      idempotencyReceiptCount: ownedReceiptCount,
+      ...(idempotencyReceiptDeadlineMs === undefined ? {} : { idempotencyReceiptDeadlineMs }),
+      exportArtifactDisposition: "not_applicable",
+      billingFactDisposition: "retained",
+      lifecycleAuditDisposition: "retained",
+      issueCodes: [...issues].sort(),
+    };
+    return clone({
+      ...withoutHash,
+      evidenceSha256: erasurePurgeTargetEvidenceSha256(withoutHash),
+    });
+  }
+
+  async scheduleAwaitingErasurePolicyEvaluations(
+    options: ScheduleAwaitingErasurePolicyEvaluationsOptions,
+  ): Promise<number> {
+    validateScheduleAwaitingErasurePolicyEvaluationsOptions(options);
+    const candidates = [...this.erasureRequests.values()]
+      .filter((request) => request.status === "awaiting_purge_policy")
+      .sort((left, right) => left.requestId.localeCompare(right.requestId));
+    let scheduled = 0;
+    let firstError: unknown;
+    for (const request of candidates) {
+      if (scheduled >= options.limit) break;
+      try {
+        const job = this.erasurePolicyEvaluationJobs.get(request.requestId);
+        let shouldSchedule = !job;
+        if (job?.sealedAtMs !== undefined) {
+          const decisions = this.assertMemoryErasurePolicyDecisionChain(request.requestId);
+          const last = decisions.at(-1);
+          if (!last || last.buildGeneration !== job.buildGeneration) {
+            throw new Error("sealed evaluation job has no matching decision");
+          }
+          if (last.decision === "unbound" || last.decision === "unconfigured") continue;
+          let liveEvidenceChanged = false;
+          if (request.policyVersion !== undefined && request.policyHash !== undefined) {
+            let policy = this.retentionPolicies.get(retentionPolicyKey(
+              request.tenantId,
+              request.policyVersion,
+            ));
+            if (policy?.policySha256 === request.policyHash) {
+              try {
+                validateRetentionPolicyVersionRecord(policy);
+              } catch {
+                // A malformed/missing bound policy is a terminal policy-identity failure, not a
+                // recoverable inventory drift signal.
+                policy = undefined;
+              }
+            }
+            if (policy?.policySha256 === request.policyHash) {
+              liveEvidenceChanged = !this.memoryErasurePurgeInventoryMatches(request, job, policy);
+            }
+          }
+          if (last.decision === "invalid") {
+            shouldSchedule = liveEvidenceChanged;
+          } else {
+            const tenantHold = this.assertLegalHoldState(
+              request.tenantId,
+              "tenant",
+              request.tenantId,
+            ).control;
+            const userHold = this.assertLegalHoldState(
+              request.tenantId,
+              "user",
+              request.subjectId,
+            ).control;
+            const holdChanged = tenantHold.controlGeneration !== last.tenantHoldControlGeneration
+              || tenantHold.activeProjectionSha256 !== last.tenantHoldProjectionSha256
+              || userHold.controlGeneration !== last.userHoldControlGeneration
+              || userHold.activeProjectionSha256 !== last.userHoldProjectionSha256;
+            const deadlineReached = last.decision === "waiting"
+              && last.eligibilityDeadlineMs !== undefined
+              && last.eligibilityDeadlineMs <= options.nowMs;
+            shouldSchedule = holdChanged || deadlineReached || liveEvidenceChanged;
+          }
+        } else if (job) {
+          shouldSchedule = false;
+        }
+        if (!shouldSchedule) continue;
+
+        this.assertErasureJobIntegrity(request);
+        const existing = this.erasurePolicyEvaluationJobs.get(request.requestId);
+        const priorControl = this.erasurePurgeAuthorityControls.get(request.requestId);
+        let nextJob: ErasurePolicyEvaluationJob;
+        let nextControl: ErasurePurgeAuthorityControl | undefined;
+        if (!existing) {
+          nextJob = clone(newErasurePolicyEvaluationJob({
+            requestId: request.requestId,
+            tenantId: request.tenantId,
+            subjectKind: request.subjectKind,
+            subjectId: request.subjectId,
+            subjectGeneration: request.generation,
+          }, Math.max(options.nowMs, request.updatedAtMs)));
+        } else {
+          this.assertErasurePolicyEvaluationJob(existing);
+          if (existing.buildGeneration >= Number.MAX_SAFE_INTEGER - 1) {
+            throw new Error("erasure policy evaluation build generation exhausted");
+          }
+          const decisions = this.assertMemoryErasurePolicyDecisionChain(request.requestId);
+          const last = decisions.at(-1)!;
+          const atMs = Math.max(
+            options.nowMs,
+            request.updatedAtMs,
+            existing.updatedAtMs,
+            last.decidedAtMs,
+            priorControl?.updatedAtMs ?? 0,
+          );
+          nextJob = clone({
+            requestId: existing.requestId,
+            tenantId: existing.tenantId,
+            subjectKind: existing.subjectKind,
+            subjectId: existing.subjectId,
+            subjectGeneration: existing.subjectGeneration,
+            buildGeneration: existing.buildGeneration + 1,
+            targetCount: 0,
+            targetRootSha256: EMPTY_ERASURE_PURGE_TARGET_ROOT_SHA256,
+            availableAtMs: atMs,
+            attempts: 0,
+            createdAtMs: existing.createdAtMs,
+            updatedAtMs: atMs,
+          });
+          if (priorControl?.activeAuthoritySha256 !== undefined) {
+            nextControl = clone({
+              requestId: priorControl.requestId,
+              authorityGeneration: priorControl.authorityGeneration,
+              updatedAtMs: atMs,
+            });
+          }
+        }
+        const priorJob = this.erasurePolicyEvaluationJobs.get(request.requestId);
+        try {
+          this.erasurePolicyEvaluationJobs.set(request.requestId, nextJob);
+          if (nextControl) this.erasurePurgeAuthorityControls.set(request.requestId, nextControl);
+        } catch (error) {
+          restoreMapEntry(
+            this.erasurePurgeAuthorityControls,
+            request.requestId,
+            priorControl !== undefined,
+            priorControl,
+          );
+          restoreMapEntry(
+            this.erasurePolicyEvaluationJobs,
+            request.requestId,
+            priorJob !== undefined,
+            priorJob,
+          );
+          throw error;
+        }
+        scheduled += 1;
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+    if (firstError !== undefined) throw firstError;
+    return scheduled;
+  }
+
+  async claimErasurePolicyEvaluations(
+    options: ClaimErasurePolicyEvaluationsOptions,
+  ): Promise<ErasurePolicyEvaluationClaim[]> {
+    const leaseUntilMs = validateClaimErasurePolicyEvaluationsOptions(options);
+    const candidates = [...this.erasurePolicyEvaluationJobs.values()]
+      .filter((job) => (
+        job.sealedAtMs === undefined
+        && job.availableAtMs !== undefined
+        && job.availableAtMs <= options.nowMs
+        && (job.claimToken === undefined || job.leaseUntilMs! <= options.nowMs)
+      ))
+      .sort((left, right) => left.availableAtMs! - right.availableAtMs!
+        || left.requestId.localeCompare(right.requestId));
+    const claims: ErasurePolicyEvaluationClaim[] = [];
+    let firstError: unknown;
+    for (const current of candidates) {
+      if (claims.length >= options.limit) break;
+      try {
+        this.assertErasurePolicyEvaluationJob(current);
+        if (current.attempts >= Number.MAX_SAFE_INTEGER - 1) {
+          throw new Error("erasure policy evaluation claim generation exhausted");
+        }
+        const next = clone<ErasurePolicyEvaluationJob>({
+          ...current,
+          attempts: current.attempts + 1,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+          updatedAtMs: Math.max(current.updatedAtMs, options.nowMs),
+        });
+        this.erasurePolicyEvaluationJobs.set(next.requestId, next);
+        claims.push(this.erasurePolicyEvaluationClaim(next));
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+    if (claims.length === 0 && firstError !== undefined) throw firstError;
+    return clone(claims);
+  }
+
+  async renewErasurePolicyEvaluation(
+    authorization: ErasurePolicyEvaluationAuthorization,
+    options: RenewErasurePolicyEvaluationOptions,
+  ): Promise<boolean> {
+    validateErasurePolicyEvaluationAuthorization(authorization);
+    const leaseUntilMs = validateRenewErasurePolicyEvaluationOptions(options);
+    const job = this.erasurePolicyEvaluationJobs.get(authorization.requestId);
+    if (!job) return false;
+    this.assertErasurePolicyEvaluationJob(job);
+    if (!erasurePolicyEvaluationAuthorizationMatches(job, authorization, options.nowMs)) return false;
+    const next = clone(job);
+    next.leaseUntilMs = Math.max(job.leaseUntilMs!, leaseUntilMs);
+    next.updatedAtMs = Math.max(job.updatedAtMs, options.nowMs);
+    this.erasurePolicyEvaluationJobs.set(job.requestId, next);
+    return true;
+  }
+
+  async retryErasurePolicyEvaluation(
+    authorization: ErasurePolicyEvaluationAuthorization,
+    options: RetryErasurePolicyEvaluationOptions,
+  ): Promise<boolean> {
+    validateErasurePolicyEvaluationAuthorization(authorization);
+    validateRetryErasurePolicyEvaluationOptions(options);
+    const job = this.erasurePolicyEvaluationJobs.get(authorization.requestId);
+    if (!job) return false;
+    this.assertErasurePolicyEvaluationJob(job);
+    if (!erasurePolicyEvaluationAuthorizationMatches(job, authorization, options.failedAtMs)) return false;
+    let next: ErasurePolicyEvaluationJob;
+    if (options.errorCode === "evidence_changed") {
+      if (job.buildGeneration >= Number.MAX_SAFE_INTEGER - 1) {
+        throw new Error("erasure policy evaluation build generation exhausted");
+      }
+      next = {
+        requestId: job.requestId,
+        tenantId: job.tenantId,
+        subjectKind: job.subjectKind,
+        subjectId: job.subjectId,
+        subjectGeneration: job.subjectGeneration,
+        buildGeneration: job.buildGeneration + 1,
+        targetCount: 0,
+        targetRootSha256: EMPTY_ERASURE_PURGE_TARGET_ROOT_SHA256,
+        availableAtMs: options.availableAtMs,
+        attempts: 0,
+        lastErrorCode: options.errorCode,
+        createdAtMs: job.createdAtMs,
+        updatedAtMs: Math.max(job.updatedAtMs, options.failedAtMs),
+      };
+    } else {
+      next = clone(job);
+      next.availableAtMs = options.availableAtMs;
+      next.lastErrorCode = options.errorCode;
+      next.updatedAtMs = Math.max(job.updatedAtMs, options.failedAtMs);
+      delete next.claimToken;
+      delete next.leaseUntilMs;
+    }
+    this.erasurePolicyEvaluationJobs.set(job.requestId, next);
+    return true;
+  }
+
+  async buildErasurePurgeTargetPage(
+    authorization: ErasurePolicyEvaluationAuthorization,
+    options: BuildErasurePurgeTargetPageOptions,
+  ): Promise<BuildErasurePurgeTargetPageResult> {
+    validateBuildErasurePurgeTargetPageOptions(options);
+    const { job, request } = this.assertErasurePolicyEvaluationAuthorization(
+      authorization,
+      options.nowMs,
+    );
+    if (request.subjectKind !== "user") throw new Error("tenant purge evaluation is not implemented");
+    if (request.policyVersion === undefined || request.policyHash === undefined) {
+      return clone({
+        built: 0,
+        done: true,
+        ...(job.cursorSessionId === undefined ? {} : { cursorSessionId: job.cursorSessionId }),
+        targetCount: job.targetCount,
+        targetRootSha256: job.targetRootSha256,
+      });
+    }
+    const policy = this.retentionPolicies.get(retentionPolicyKey(
+      request.tenantId,
+      request.policyVersion,
+    ));
+    if (!policy || policy.policySha256 !== request.policyHash) {
+      return clone({
+        built: 0,
+        done: true,
+        ...(job.cursorSessionId === undefined ? {} : { cursorSessionId: job.cursorSessionId }),
+        targetCount: job.targetCount,
+        targetRootSha256: job.targetRootSha256,
+      });
+    }
+    validateRetentionPolicyVersionRecord(policy);
+    const remaining = [...this.sessions.values()]
+      .filter((session) => (
+        session.tenantId === request.tenantId
+        && session.userId === request.subjectId
+        && (job.cursorSessionId === undefined || session.id > job.cursorSessionId)
+      ))
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const page = remaining.slice(0, options.limit);
+    const stagedTargets = new Map<string, ErasurePurgeTargetEvidence>();
+    let targetRootSha256 = job.targetRootSha256;
+    let targetCount = job.targetCount;
+    for (const session of page) {
+      const evidence = this.memoryErasurePurgeTarget(request, job, policy, session);
+      const key = this.erasurePurgeTargetKey(job.requestId, job.buildGeneration, session.id);
+      const existing = this.erasurePurgeTargets.get(key);
+      if (existing && existing.evidenceSha256 !== evidence.evidenceSha256) {
+        throw new Error("erasure purge target evidence conflicts with an immutable row");
+      }
+      if (existing) throw new Error("erasure policy evaluation cursor overlaps existing evidence");
+      stagedTargets.set(key, evidence);
+      targetRootSha256 = nextErasurePurgeTargetRootSha256(
+        targetRootSha256,
+        evidence.evidenceSha256,
+      );
+      targetCount += 1;
+    }
+    const next = clone(job);
+    next.targetCount = targetCount;
+    next.targetRootSha256 = targetRootSha256;
+    next.updatedAtMs = Math.max(job.updatedAtMs, options.nowMs);
+    const cursor = page.at(-1)?.id;
+    if (cursor !== undefined) next.cursorSessionId = cursor;
+
+    const priorJob = this.erasurePolicyEvaluationJobs.get(job.requestId);
+    const priorTargets = [...stagedTargets.keys()].map((key) => ({
+      key,
+      existed: this.erasurePurgeTargets.has(key),
+      value: this.erasurePurgeTargets.get(key),
+    }));
+    try {
+      for (const [key, value] of stagedTargets) this.erasurePurgeTargets.set(key, clone(value));
+      this.erasurePolicyEvaluationJobs.set(job.requestId, next);
+    } catch (error) {
+      for (const prior of priorTargets.reverse()) {
+        restoreMapEntry(this.erasurePurgeTargets, prior.key, prior.existed, prior.value);
+      }
+      restoreMapEntry(this.erasurePolicyEvaluationJobs, job.requestId, true, priorJob);
+      throw error;
+    }
+    return clone({
+      built: page.length,
+      done: remaining.length <= page.length,
+      ...(next.cursorSessionId === undefined ? {} : { cursorSessionId: next.cursorSessionId }),
+      targetCount: next.targetCount,
+      targetRootSha256: next.targetRootSha256,
+    });
+  }
+
+  private initialErasurePurgeAuthorityControl(requestId: string): ErasurePurgeAuthorityControl {
+    return { requestId, authorityGeneration: 0, updatedAtMs: 0 };
+  }
+
+  private assertMemoryErasurePolicyDecisionChain(
+    requestId: string,
+  ): ErasurePolicyEvaluationDecisionEvent[] {
+    const decisions = this.erasurePolicyEvaluationDecisions.get(requestId) ?? [];
+    let beforeSha256 = createHash("sha256").update(JSON.stringify([
+      "agent-service/erasure-policy-decision-root/v1",
+      requestId,
+    ])).digest("hex");
+    let decidedAtMs = 0;
+    for (const [index, decision] of decisions.entries()) {
+      const { afterSha256, ...withoutAfter } = decision;
+      if (
+        decision.requestId !== requestId
+        || decision.decisionSeq !== index + 1
+        || decision.beforeSha256 !== beforeSha256
+        || decision.decidedAtMs < decidedAtMs
+        || erasurePolicyDecisionSha256(withoutAfter) !== afterSha256
+      ) throw new Error("erasure policy evaluation decision chain is corrupt");
+      beforeSha256 = afterSha256;
+      decidedAtMs = decision.decidedAtMs;
+    }
+    return decisions.map(clone);
+  }
+
+  private memoryErasurePolicyEvaluationState(
+    request: ErasureRequestRecord,
+    job: ErasurePolicyEvaluationJob,
+    nowMs: number,
+  ): {
+    decision: ErasurePolicyEvaluationDecision;
+    policy?: RetentionPolicyVersionRecord;
+    userGraceDeadlineMs?: number;
+    eligibilityDeadlineMs?: number;
+    targets: ErasurePurgeTargetEvidence[];
+    tenantHold: LegalHoldControlRecord;
+    userHold: LegalHoldControlRecord;
+  } {
+    const tenantHoldState = this.assertLegalHoldState(request.tenantId, "tenant", request.tenantId);
+    const userHoldState = this.assertLegalHoldState(request.tenantId, "user", request.subjectId);
+    const targetEntries = [...this.erasurePurgeTargets.entries()]
+      .filter(([, target]) => (
+        target.requestId === request.requestId
+        && target.buildGeneration === job.buildGeneration
+      ))
+      .sort((left, right) => left[1].sessionId.localeCompare(right[1].sessionId));
+    for (const [key, target] of targetEntries) {
+      validateErasurePurgeTargetEvidence(target);
+      if (
+        key !== this.erasurePurgeTargetKey(request.requestId, job.buildGeneration, target.sessionId)
+        || !isCanonicalId("sess", target.sessionId)
+        || target.tenantId !== request.tenantId
+        || target.userId !== request.subjectId
+      ) throw new Error("erasure purge evaluation target is invalid");
+    }
+    const targets = targetEntries.map(([, target]) => target);
+    if (request.policyVersion === undefined || request.policyHash === undefined) {
+      return {
+        decision: "unbound",
+        targets,
+        tenantHold: tenantHoldState.control,
+        userHold: userHoldState.control,
+      };
+    }
+    const policy = this.retentionPolicies.get(retentionPolicyKey(request.tenantId, request.policyVersion));
+    if (!policy || policy.policySha256 !== request.policyHash) {
+      return {
+        decision: "invalid",
+        targets,
+        tenantHold: tenantHoldState.control,
+        userHold: userHoldState.control,
+      };
+    }
+    try {
+      validateRetentionPolicyVersionRecord(policy);
+    } catch {
+      return {
+        decision: "invalid",
+        targets,
+        tenantHold: tenantHoldState.control,
+        userHold: userHoldState.control,
+      };
+    }
+    const grace = checkedRetentionDeadline(request.gatedAtMs, policy.policy.userErasureGraceMs);
+    if (
+      grace.kind === "invalid"
+      || targets.some((target) => target.issueCodes.some((issue) => issue !== "policy_unconfigured"))
+    ) {
+      return {
+        decision: "invalid",
+        policy,
+        targets,
+        tenantHold: tenantHoldState.control,
+        userHold: userHoldState.control,
+      };
+    }
+    if (
+      grace.kind === "unconfigured"
+      || policy.policy.sessionContentRetentionMs === null
+      || policy.policy.operationalUsageRetentionMs === null
+      || policy.policy.idempotencyReceiptRetentionMs === null
+      || targets.some((target) => target.issueCodes.includes("policy_unconfigured"))
+    ) {
+      return {
+        decision: "unconfigured",
+        policy,
+        targets,
+        tenantHold: tenantHoldState.control,
+        userHold: userHoldState.control,
+      };
+    }
+    const deadlines = [
+      grace.value,
+      ...targets.flatMap((target) => [
+        target.sessionContentDeadlineMs,
+        target.readyBlobDeadlineMs,
+        target.operationalUsageDeadlineMs,
+        target.idempotencyReceiptDeadlineMs,
+      ].filter((value): value is number => value !== undefined)),
+    ];
+    const eligibilityDeadlineMs = Math.max(...deadlines);
+    const held = tenantHoldState.control.activeHoldCount > 0
+      || userHoldState.control.activeHoldCount > 0;
+    return {
+      decision: held
+        ? "held"
+        : eligibilityDeadlineMs > nowMs
+          ? "waiting"
+          : "eligible_execution_disabled",
+      policy,
+      userGraceDeadlineMs: grace.value,
+      eligibilityDeadlineMs,
+      targets,
+      tenantHold: tenantHoldState.control,
+      userHold: userHoldState.control,
+    };
+  }
+
+  private memoryErasurePurgeInventoryMatches(
+    request: ErasureRequestRecord,
+    job: ErasurePolicyEvaluationJob,
+    policy: RetentionPolicyVersionRecord,
+  ): boolean {
+    const storedTargets = [...this.erasurePurgeTargets.values()]
+      .filter((target) => (
+        target.requestId === request.requestId
+        && target.buildGeneration === job.buildGeneration
+      ))
+      .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+    const sessions = [...this.sessions.values()]
+      .filter((session) => session.tenantId === request.tenantId && session.userId === request.subjectId)
+      .sort((left, right) => left.id.localeCompare(right.id));
+    let liveRoot = EMPTY_ERASURE_PURGE_TARGET_ROOT_SHA256;
+    const liveTargets = sessions.map((session) => {
+      const target = this.memoryErasurePurgeTarget(request, job, policy, session);
+      liveRoot = nextErasurePurgeTargetRootSha256(liveRoot, target.evidenceSha256);
+      return target;
+    });
+    return liveTargets.length === job.targetCount
+      && storedTargets.length === job.targetCount
+      && liveRoot === job.targetRootSha256
+      && liveTargets.every((target, index) => (
+        target.evidenceSha256 === storedTargets[index]?.evidenceSha256
+      ));
+  }
+
+  async sealErasurePurgeAuthority(
+    authorization: ErasurePolicyEvaluationAuthorization,
+    options: SealErasurePurgeAuthorityOptions,
+  ): Promise<ErasurePolicyEvaluationSealResult> {
+    validateSealErasurePurgeAuthorityOptions(options);
+    let { job, request } = this.assertErasurePolicyEvaluationAuthorization(
+      authorization,
+      options.nowMs,
+    );
+    if (request.subjectKind !== "user") throw new Error("tenant purge evaluation is not implemented");
+
+    // Never extend an authority ledger whose immutable history is already corrupt. During a
+    // superseding build this intentionally returns null after validating the complete old chain.
+    await this.getValidatedErasurePurgeAuthority(request.requestId);
+    ({ job, request } = this.assertErasurePolicyEvaluationAuthorization(
+      authorization,
+      options.nowMs,
+    ));
+
+    // Re-read every owner row and rederive every target/root at the seal linearization point.
+    const decisions = this.assertMemoryErasurePolicyDecisionChain(request.requestId);
+    const currentControl = clone(this.erasurePurgeAuthorityControls.get(request.requestId)
+      ?? this.initialErasurePurgeAuthorityControl(request.requestId));
+    let state = this.memoryErasurePolicyEvaluationState(request, job, options.nowMs);
+    const effectiveAtMs = Math.max(
+      options.nowMs,
+      request.updatedAtMs,
+      job.updatedAtMs,
+      state.tenantHold.updatedAtMs,
+      state.userHold.updatedAtMs,
+      state.policy?.createdAtMs ?? 0,
+      decisions.at(-1)?.decidedAtMs ?? 0,
+      currentControl.updatedAtMs,
+    );
+    if (effectiveAtMs !== options.nowMs) {
+      state = this.memoryErasurePolicyEvaluationState(request, job, effectiveAtMs);
+    }
+    if (
+      state.policy
+      && !this.memoryErasurePurgeInventoryMatches(request, job, state.policy)
+    ) {
+      throw new ErasurePurgeEvidenceChangedError();
+    }
+
+    const decisionSeq = decisions.length + 1;
+    const beforeSha256 = decisions.at(-1)?.afterSha256 ?? createHash("sha256").update(JSON.stringify([
+      "agent-service/erasure-policy-decision-root/v1",
+      request.requestId,
+    ])).digest("hex");
+    const eventWithoutAfter: Omit<ErasurePolicyEvaluationDecisionEvent, "afterSha256"> = {
+      requestId: request.requestId,
+      decisionSeq,
+      buildGeneration: job.buildGeneration,
+      decision: state.decision,
+      ...(state.policy === undefined ? {} : {
+        policyVersion: state.policy.policyVersion,
+        policySha256: state.policy.policySha256,
+      }),
+      ...(state.userGraceDeadlineMs === undefined
+        ? {}
+        : { userGraceDeadlineMs: state.userGraceDeadlineMs }),
+      ...(state.eligibilityDeadlineMs === undefined
+        ? {}
+        : { eligibilityDeadlineMs: state.eligibilityDeadlineMs }),
+      targetCount: job.targetCount,
+      targetRootSha256: job.targetRootSha256,
+      tenantHoldControlGeneration: state.tenantHold.controlGeneration,
+      tenantHoldProjectionSha256: state.tenantHold.activeProjectionSha256,
+      userHoldControlGeneration: state.userHold.controlGeneration,
+      userHoldProjectionSha256: state.userHold.activeProjectionSha256,
+      beforeSha256,
+      decidedAtMs: effectiveAtMs,
+    };
+    const decision = clone<ErasurePolicyEvaluationDecisionEvent>({
+      ...eventWithoutAfter,
+      afterSha256: erasurePolicyDecisionSha256(eventWithoutAfter),
+    });
+    const control = currentControl;
+    let authority: ErasurePurgeAuthorityRecord | undefined;
+    let nextControl = control;
+    if (state.decision === "eligible_execution_disabled") {
+      if (!state.policy || state.userGraceDeadlineMs === undefined || state.eligibilityDeadlineMs === undefined) {
+        throw new Error("eligible authority evidence is incomplete");
+      }
+      if (control.authorityGeneration >= Number.MAX_SAFE_INTEGER - 1) {
+        throw new Error("erasure purge authority generation exhausted");
+      }
+      const withoutHash: Omit<ErasurePurgeAuthorityRecord, "authoritySha256"> = {
+        requestId: request.requestId,
+        authorityGeneration: control.authorityGeneration + 1,
+        tenantId: request.tenantId,
+        subjectKind: request.subjectKind,
+        subjectId: request.subjectId,
+        subjectGeneration: request.generation,
+        buildGeneration: job.buildGeneration,
+        policyVersion: state.policy.policyVersion,
+        policySha256: state.policy.policySha256,
+        policySchemaVersion: state.policy.schemaVersion,
+        userGraceDeadlineMs: state.userGraceDeadlineMs,
+        eligibilityDeadlineMs: state.eligibilityDeadlineMs,
+        targetCount: job.targetCount,
+        targetRootSha256: job.targetRootSha256,
+        tenantHoldControlGeneration: state.tenantHold.controlGeneration,
+        tenantHoldProjectionSha256: state.tenantHold.activeProjectionSha256,
+        userHoldControlGeneration: state.userHold.controlGeneration,
+        userHoldProjectionSha256: state.userHold.activeProjectionSha256,
+        decisionSha256: decision.afterSha256,
+        createdAtMs: effectiveAtMs,
+      };
+      authority = clone({
+        ...withoutHash,
+        authoritySha256: erasurePurgeAuthoritySha256(withoutHash),
+      });
+      nextControl = clone({
+        requestId: request.requestId,
+        authorityGeneration: authority.authorityGeneration,
+        activeAuthoritySha256: authority.authoritySha256,
+        updatedAtMs: effectiveAtMs,
+      });
+    } else if (control.activeAuthoritySha256 !== undefined) {
+      nextControl = clone({
+        requestId: control.requestId,
+        authorityGeneration: control.authorityGeneration,
+        updatedAtMs: effectiveAtMs,
+      });
+    }
+    const nextJob = clone(job);
+    nextJob.sealedAtMs = effectiveAtMs;
+    nextJob.updatedAtMs = effectiveAtMs;
+    delete nextJob.availableAtMs;
+    delete nextJob.claimToken;
+    delete nextJob.leaseUntilMs;
+    delete nextJob.lastErrorCode;
+    const nextDecisions = clone([...decisions, decision]);
+    const authorities = this.erasurePurgeAuthorities.get(request.requestId) ?? [];
+    const nextAuthorities = authority ? clone([...authorities, authority]) : clone(authorities);
+
+    const priorJob = this.erasurePolicyEvaluationJobs.get(request.requestId);
+    const priorDecisions = this.erasurePolicyEvaluationDecisions.get(request.requestId);
+    const priorControl = this.erasurePurgeAuthorityControls.get(request.requestId);
+    const priorAuthorities = this.erasurePurgeAuthorities.get(request.requestId);
+    try {
+      this.erasurePolicyEvaluationDecisions.set(request.requestId, nextDecisions);
+      this.erasurePurgeAuthorityControls.set(request.requestId, nextControl);
+      if (authority) this.erasurePurgeAuthorities.set(request.requestId, nextAuthorities);
+      this.erasurePolicyEvaluationJobs.set(request.requestId, nextJob);
+    } catch (error) {
+      restoreMapEntry(
+        this.erasurePolicyEvaluationJobs,
+        request.requestId,
+        priorJob !== undefined,
+        priorJob,
+      );
+      restoreMapEntry(
+        this.erasurePurgeAuthorities,
+        request.requestId,
+        priorAuthorities !== undefined,
+        priorAuthorities,
+      );
+      restoreMapEntry(
+        this.erasurePurgeAuthorityControls,
+        request.requestId,
+        priorControl !== undefined,
+        priorControl,
+      );
+      restoreMapEntry(
+        this.erasurePolicyEvaluationDecisions,
+        request.requestId,
+        priorDecisions !== undefined,
+        priorDecisions,
+      );
+      throw error;
+    }
+    return clone({ decision, ...(authority === undefined ? {} : { authority }), control: nextControl });
+  }
+
+  async getErasurePolicyEvaluationJob(
+    requestId: string,
+  ): Promise<ErasurePolicyEvaluationJob | null> {
+    const job = this.erasurePolicyEvaluationJobs.get(requestId);
+    if (!job) return null;
+    this.assertErasurePolicyEvaluationJob(job);
+    return clone(job);
+  }
+
+  async listErasurePurgeTargetEvidence(
+    requestId: string,
+    buildGeneration: number,
+  ): Promise<ErasurePurgeTargetEvidence[]> {
+    if (!Number.isSafeInteger(buildGeneration) || buildGeneration <= 0) {
+      throw new Error("invalid erasure purge target generation");
+    }
+    return clone([...this.erasurePurgeTargets.values()]
+      .filter((target) => target.requestId === requestId && target.buildGeneration === buildGeneration)
+      .sort((left, right) => left.sessionId.localeCompare(right.sessionId)));
+  }
+
+  async listErasurePolicyEvaluationDecisions(
+    requestId: string,
+  ): Promise<ErasurePolicyEvaluationDecisionEvent[]> {
+    return this.assertMemoryErasurePolicyDecisionChain(requestId);
+  }
+
+  async getValidatedErasurePurgeAuthority(
+    requestId: string,
+  ): Promise<ErasurePurgeAuthorityRecord | null> {
+    const authorities = this.erasurePurgeAuthorities.get(requestId) ?? [];
+    const decisions = this.assertMemoryErasurePolicyDecisionChain(requestId);
+    const eligibleDecisions = decisions.filter((decision) => (
+      decision.decision === "eligible_execution_disabled"
+    ));
+    const control = this.erasurePurgeAuthorityControls.get(requestId);
+    if (!control) {
+      if (authorities.length > 0 || eligibleDecisions.length > 0) {
+        throw new Error("erasure purge authority control is corrupt");
+      }
+      return null;
+    }
+    if (
+      control.requestId !== requestId
+      || !Number.isSafeInteger(control.authorityGeneration)
+      || control.authorityGeneration < 0
+      || !Number.isSafeInteger(control.updatedAtMs)
+      || control.updatedAtMs < 0
+      || (control.activeAuthoritySha256 !== undefined
+        && !/^[0-9a-f]{64}$/.test(control.activeAuthoritySha256))
+      || (control.authorityGeneration === 0 && control.activeAuthoritySha256 !== undefined)
+    ) throw new Error("erasure purge authority control is corrupt");
+    if (control.authorityGeneration === 0) {
+      if (authorities.length > 0 || eligibleDecisions.length > 0) {
+        throw new Error("erasure purge authority chain is corrupt");
+      }
+      return null;
+    }
+    const job = this.erasurePolicyEvaluationJobs.get(requestId);
+    if (!job) throw new Error("erasure purge authority job is corrupt");
+    const { request } = this.assertErasurePolicyEvaluationJob(job);
+    if (request.subjectKind !== "user") throw new Error("tenant purge authority is not implemented");
+    const boundPolicy = request.policyVersion === undefined
+      ? undefined
+      : this.retentionPolicies.get(retentionPolicyKey(request.tenantId, request.policyVersion));
+    if (boundPolicy) validateRetentionPolicyVersionRecord(boundPolicy);
+    if (
+      request.policyVersion === undefined
+      || request.policyHash === undefined
+      || !boundPolicy
+      || boundPolicy.policySha256 !== request.policyHash
+    ) throw new Error("erasure purge authority policy binding is corrupt");
+    const tenantHoldHistory = this.assertLegalHoldState(
+      request.tenantId,
+      "tenant",
+      request.tenantId,
+    );
+    const userHoldHistory = this.assertLegalHoldState(
+      request.tenantId,
+      "user",
+      request.subjectId,
+    );
+    for (const [index, candidate] of authorities.entries()) {
+      const { authoritySha256, ...withoutHash } = candidate;
+      const linkedDecision = eligibleDecisions[index];
+      if (
+        candidate.requestId !== requestId
+        || candidate.authorityGeneration !== index + 1
+        || candidate.policySchemaVersion !== RETENTION_POLICY_SCHEMA_VERSION
+        || erasurePurgeAuthoritySha256(withoutHash) !== authoritySha256
+        || candidate.tenantId !== request.tenantId
+        || candidate.subjectKind !== request.subjectKind
+        || candidate.subjectId !== request.subjectId
+        || candidate.subjectGeneration !== request.generation
+        || candidate.policyVersion !== request.policyVersion
+        || candidate.policySha256 !== request.policyHash
+        || candidate.policySchemaVersion !== boundPolicy.schemaVersion
+        || !linkedDecision
+        || !erasurePurgeAuthorityMatchesDecision(candidate, linkedDecision)
+        || (index > 0 && candidate.buildGeneration <= authorities[index - 1]!.buildGeneration)
+      ) throw new Error("erasure purge authority chain is corrupt");
+
+      const targetEntries = [...this.erasurePurgeTargets.entries()]
+        .filter(([, target]) => (
+          target.requestId === requestId
+          && target.buildGeneration === candidate.buildGeneration
+        ))
+        .sort((left, right) => left[1].sessionId.localeCompare(right[1].sessionId));
+      let targetRootSha256 = EMPTY_ERASURE_PURGE_TARGET_ROOT_SHA256;
+      for (const [key, target] of targetEntries) {
+        validateErasurePurgeTargetEvidence(target);
+        if (
+          key !== this.erasurePurgeTargetKey(requestId, candidate.buildGeneration, target.sessionId)
+          || !isCanonicalId("sess", target.sessionId)
+          || target.tenantId !== request.tenantId
+          || target.userId !== request.subjectId
+        ) throw new Error("erasure purge authority target chain is corrupt");
+        targetRootSha256 = nextErasurePurgeTargetRootSha256(
+          targetRootSha256,
+          target.evidenceSha256,
+        );
+      }
+      if (
+        targetEntries.length !== candidate.targetCount
+        || targetRootSha256 !== candidate.targetRootSha256
+      ) throw new Error("erasure purge authority target chain is corrupt");
+      const grace = checkedRetentionDeadline(
+        request.gatedAtMs,
+        boundPolicy.policy.userErasureGraceMs,
+      );
+      const destructivePolicyConfigured = boundPolicy.policy.sessionContentRetentionMs !== null
+        && boundPolicy.policy.operationalUsageRetentionMs !== null
+        && boundPolicy.policy.idempotencyReceiptRetentionMs !== null;
+      const historicalTargets = targetEntries.map(([, target]) => target);
+      const eligibilityDeadlineMs = grace.kind === "deadline"
+        && destructivePolicyConfigured
+        && historicalTargets.every((target) => (
+          erasurePurgeTargetMatchesRetentionPolicy(target, boundPolicy.policy)
+        ))
+        ? Math.max(
+          grace.value,
+          ...historicalTargets.flatMap((target) => [
+            target.sessionContentDeadlineMs,
+            target.readyBlobDeadlineMs,
+            target.operationalUsageDeadlineMs,
+            target.idempotencyReceiptDeadlineMs,
+          ].filter((value): value is number => value !== undefined)),
+        )
+        : undefined;
+      if (
+        grace.kind !== "deadline"
+        || eligibilityDeadlineMs === undefined
+        || candidate.userGraceDeadlineMs !== grace.value
+        || candidate.eligibilityDeadlineMs !== eligibilityDeadlineMs
+        || candidate.createdAtMs < request.gatedAtMs
+        || candidate.createdAtMs < request.updatedAtMs
+        || candidate.createdAtMs < boundPolicy.createdAtMs
+        || candidate.createdAtMs < eligibilityDeadlineMs
+      ) throw new Error("erasure purge authority deadline chain is corrupt");
+      const historicalTenantHold = legalHoldControlAtGeneration(
+        request.tenantId,
+        "tenant",
+        request.tenantId,
+        tenantHoldHistory.holds,
+        tenantHoldHistory.events,
+        candidate.tenantHoldControlGeneration,
+      );
+      const historicalUserHold = legalHoldControlAtGeneration(
+        request.tenantId,
+        "user",
+        request.subjectId,
+        userHoldHistory.holds,
+        userHoldHistory.events,
+        candidate.userHoldControlGeneration,
+      );
+      if (
+        historicalTenantHold.activeHoldCount !== 0
+        || historicalUserHold.activeHoldCount !== 0
+        || historicalTenantHold.activeProjectionSha256 !== candidate.tenantHoldProjectionSha256
+        || historicalUserHold.activeProjectionSha256 !== candidate.userHoldProjectionSha256
+        || candidate.createdAtMs < historicalTenantHold.updatedAtMs
+        || candidate.createdAtMs < historicalUserHold.updatedAtMs
+      ) throw new Error("erasure purge authority hold chain is corrupt");
+    }
+    const authority = authorities.at(-1);
+    if (
+      eligibleDecisions.length !== authorities.length
+      || authorities.length !== control.authorityGeneration
+      || !authority
+      || authority.authorityGeneration !== control.authorityGeneration
+      || (control.activeAuthoritySha256 !== undefined
+        && authority.authoritySha256 !== control.activeAuthoritySha256)
+      || (control.activeAuthoritySha256 !== undefined
+        && decisions.at(-1)?.afterSha256 !== authority.decisionSha256)
+      || control.updatedAtMs < authority.createdAtMs
+      || (control.activeAuthoritySha256 !== undefined
+        && control.updatedAtMs !== authority.createdAtMs)
+    ) throw new Error("erasure purge authority control is corrupt");
+    if (authority.buildGeneration !== job.buildGeneration) {
+      if (authority.buildGeneration < job.buildGeneration) return null;
+      throw new Error("erasure purge authority job generation is corrupt");
+    }
+    if (control.activeAuthoritySha256 === undefined) {
+      throw new Error("inactive erasure purge authority did not advance the evaluation build");
+    }
+    if (
+      job.sealedAtMs === undefined
+      || job.sealedAtMs !== authority.createdAtMs
+      || job.updatedAtMs !== authority.createdAtMs
+      || request.updatedAtMs > authority.createdAtMs
+      || job.targetCount !== authority.targetCount
+      || job.targetRootSha256 !== authority.targetRootSha256
+    ) throw new Error("erasure purge authority job is corrupt");
+    const state = this.memoryErasurePolicyEvaluationState(request, job, authority.createdAtMs);
+    if (!state.policy) return null;
+    if (
+      state.decision !== "eligible_execution_disabled"
+      || state.policy.policyVersion !== authority.policyVersion
+      || state.policy.policySha256 !== authority.policySha256
+      || state.policy.schemaVersion !== authority.policySchemaVersion
+      || state.userGraceDeadlineMs !== authority.userGraceDeadlineMs
+      || state.eligibilityDeadlineMs !== authority.eligibilityDeadlineMs
+      || authority.createdAtMs < authority.eligibilityDeadlineMs
+      || state.tenantHold.controlGeneration !== authority.tenantHoldControlGeneration
+      || state.tenantHold.activeProjectionSha256 !== authority.tenantHoldProjectionSha256
+      || state.userHold.controlGeneration !== authority.userHoldControlGeneration
+      || state.userHold.activeProjectionSha256 !== authority.userHoldProjectionSha256
+      || state.targets.length !== authority.targetCount
+      || !this.memoryErasurePurgeInventoryMatches(request, job, state.policy)
+    ) return null;
+    // A hold set+release ABA leaves active_count at zero but advances this exact generation fence.
+    return clone(authority);
+  }
+
+  async getErasureCompletionReadiness(requestId: string): Promise<ErasureCompletionReadiness> {
+    const authority = await this.getValidatedErasurePurgeAuthority(requestId);
+    return clone({
+      requestId,
+      complete: false,
+      missing: [
+        "purge_execution_disabled",
+        "trusted_clock_linearization",
+        "session_content_receipts",
+        "ready_blob_physical_acks",
+        "operational_usage_anonymization",
+        "idempotency_receipt_deletion",
+        "redis_cleanup",
+        "provider_secret_revocation",
+        "restore_ledger_ack",
+      ],
+      ...(authority === null ? {} : { authority }),
+    });
   }
 
   private activeLegacyTombstoneCutover(): LegacyTombstoneCutoverRecord {
@@ -2928,7 +4228,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const current = this.erasureRequests.get(authorization.requestId);
     if (!current) return false;
     if (!this.erasureJobParentAllowsAuthority(current)) return false;
-    const subject = this.assertErasureJobIntegrity(current);
+    this.assertErasureJobIntegrity(current);
     if (
       current.status !== options.fromStatus
       || !erasureJobAuthorizationMatches(current, authorization, options.atMs)
@@ -2951,15 +4251,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     next.policyHash = options.policyHash ?? current.policyHash;
     delete next.claimToken;
     delete next.leaseUntilMs;
-    if (options.toStatus === "completed") {
-      next.completedAtMs = effectiveAtMs;
-      next.counts = clone(options.counts!);
-      next.checksum = options.checksum;
-    } else {
-      delete next.completedAtMs;
-      delete next.counts;
-      delete next.checksum;
-    }
+    delete next.completedAtMs;
+    delete next.counts;
+    delete next.checksum;
     if (next.availableAtMs === undefined) delete next.availableAtMs;
     if (next.lastErrorCode === undefined) delete next.lastErrorCode;
     if (next.policyVersion === undefined) delete next.policyVersion;
@@ -2972,9 +4266,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const stagedAudits = clone(existingAudits);
     const auditType: ErasureAuditEvent["type"] = options.toStatus === "blocked"
       ? "erasure/blocked"
-      : options.toStatus === "completed"
-        ? "erasure/completed"
-        : "erasure/status_changed";
+      : "erasure/status_changed";
     const payload: Record<string, unknown> = {
       fromStatus: options.fromStatus,
       status: options.toStatus,
@@ -2982,8 +4274,6 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       ...(next.policyVersion === undefined ? {} : { policyVersion: next.policyVersion }),
       ...(next.policyHash === undefined ? {} : { policyHash: next.policyHash }),
       ...(options.errorCode === undefined ? {} : { errorCode: options.errorCode }),
-      ...(options.counts === undefined ? {} : { counts: clone(options.counts) }),
-      ...(options.checksum === undefined ? {} : { checksum: options.checksum }),
     };
     stagedAudits.push(clone({
       requestId: current.requestId,
@@ -2993,31 +4283,37 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       emittedAtMs: effectiveAtMs,
     }));
 
-    let nextSubject: SubjectLifecycleRecord | undefined;
-    if (options.toStatus === "completed") {
-      nextSubject = clone({
-        ...subject,
-        state: "erased",
-        updatedAtMs: Math.max(subject.updatedAtMs, effectiveAtMs),
-      });
-      delete nextSubject.activeRequestId;
+    let evaluationJob: ErasurePolicyEvaluationJob | undefined;
+    if (options.fromStatus === "reconciling_usage" && options.toStatus === "awaiting_purge_policy") {
+      if (this.erasurePolicyEvaluationJobs.has(current.requestId)) {
+        throw new Error("erasure policy evaluation job already exists before first scheduling");
+      }
+      evaluationJob = clone(newErasurePolicyEvaluationJob({
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectKind: current.subjectKind,
+        subjectId: current.subjectId,
+        subjectGeneration: current.generation,
+      }, effectiveAtMs));
     }
 
-    const subjectKey = nextSubject
-      ? subjectLifecycleKey(nextSubject.tenantId, nextSubject.subjectKind, nextSubject.subjectId)
-      : undefined;
     const requestExisted = this.erasureRequests.has(next.requestId);
     const priorRequest = this.erasureRequests.get(next.requestId);
     const auditExisted = this.erasureAuditEvents.has(next.requestId);
     const priorAudits = this.erasureAuditEvents.get(next.requestId);
-    const subjectExisted = subjectKey === undefined ? false : this.subjectLifecycles.has(subjectKey);
-    const priorSubject = subjectKey === undefined ? undefined : this.subjectLifecycles.get(subjectKey);
+    const evaluationJobExisted = this.erasurePolicyEvaluationJobs.has(next.requestId);
+    const priorEvaluationJob = this.erasurePolicyEvaluationJobs.get(next.requestId);
     try {
       this.erasureRequests.set(next.requestId, next);
       this.erasureAuditEvents.set(next.requestId, stagedAudits);
-      if (nextSubject && subjectKey) this.subjectLifecycles.set(subjectKey, nextSubject);
+      if (evaluationJob) this.erasurePolicyEvaluationJobs.set(next.requestId, evaluationJob);
     } catch (error) {
-      if (subjectKey) restoreMapEntry(this.subjectLifecycles, subjectKey, subjectExisted, priorSubject);
+      restoreMapEntry(
+        this.erasurePolicyEvaluationJobs,
+        next.requestId,
+        evaluationJobExisted,
+        priorEvaluationJob,
+      );
       restoreMapEntry(this.erasureAuditEvents, next.requestId, auditExisted, priorAudits);
       restoreMapEntry(this.erasureRequests, next.requestId, requestExisted, priorRequest);
       throw error;
@@ -5218,7 +6514,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!entry) return false;
     const row = entry[1];
     if (
-      row.completedAtMs !== undefined
+      row.topic !== "session.tombstoned"
+      || row.completedAtMs !== undefined
       || row.deadLetteredAtMs !== undefined
       || row.claimToken !== claimToken
       || row.leaseUntilMs === undefined
@@ -5234,7 +6531,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!entry) return false;
     const row = entry[1];
     if (
-      row.completedAtMs !== undefined
+      row.topic !== "session.tombstoned"
+      || row.completedAtMs !== undefined
       || row.deadLetteredAtMs !== undefined
       || row.claimToken !== claimToken
       || row.leaseUntilMs === undefined
@@ -5259,7 +6557,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!entry) return false;
     const row = entry[1];
     if (
-      row.completedAtMs !== undefined
+      row.topic !== "session.tombstoned"
+      || row.completedAtMs !== undefined
       || row.deadLetteredAtMs !== undefined
       || row.claimToken !== claimToken
       || row.leaseUntilMs === undefined

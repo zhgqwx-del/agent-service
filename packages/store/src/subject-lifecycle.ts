@@ -52,6 +52,12 @@ export const CLAIMABLE_ERASURE_REQUEST_STATUSES = [
 
 export type ClaimableErasureRequestStatus = (typeof CLAIMABLE_ERASURE_REQUEST_STATUSES)[number];
 
+/** States the generic, non-destructive queue is allowed to enter. */
+export type NonDestructiveErasureRequestStatus =
+  | ClaimableErasureRequestStatus
+  | "awaiting_purge_policy"
+  | "blocked";
+
 const CLAIMABLE_ERASURE_REQUEST_STATUS_SET = new Set<ErasureRequestStatus>(
   CLAIMABLE_ERASURE_REQUEST_STATUSES,
 );
@@ -264,8 +270,8 @@ export interface ErasureJobClaim {
 }
 
 export interface TransitionErasureJobOptions {
-  fromStatus: ErasureRequestStatus;
-  toStatus: ErasureRequestStatus;
+  fromStatus: ClaimableErasureRequestStatus;
+  toStatus: NonDestructiveErasureRequestStatus;
   atMs: number;
   /** Required for a claimable destination; forbidden for an unavailable destination. */
   availableAtMs?: number;
@@ -274,9 +280,6 @@ export interface TransitionErasureJobOptions {
   /** May only repeat the immutable identity selected at admission; it cannot bind old backlog. */
   policyVersion?: string;
   policyHash?: string;
-  /** Completion proof contains aggregate counts/checksum only, never content. */
-  counts?: Record<string, number>;
-  checksum?: string;
 }
 
 export interface RetryErasureJobOptions {
@@ -1447,7 +1450,25 @@ export function validateRenewErasureJobClaimOptions(options: RenewErasureJobClai
 }
 
 export function validateTransitionErasureJobOptions(options: TransitionErasureJobOptions): void {
-  assertErasureJobTransition(options.fromStatus, options.toStatus);
+  // This generic queue predates the split destructive capability. Keep its historical transition
+  // graph for validating rolling-upgrade rows and audit chains, but never let a current caller use
+  // it to mint purging/completed state or caller-supplied completion proof. A future executor must
+  // expose a separate store-derived proof API.
+  const legacy = options as unknown as {
+    fromStatus: ErasureRequestStatus;
+    toStatus: ErasureRequestStatus;
+    counts?: unknown;
+    checksum?: unknown;
+  };
+  if (
+    legacy.fromStatus === "purging"
+    || legacy.fromStatus === "completed"
+    || legacy.toStatus === "purging"
+    || legacy.toStatus === "completed"
+  ) {
+    throw new Error("destructive erasure transitions require the unavailable purge executor");
+  }
+  assertErasureJobTransition(legacy.fromStatus, legacy.toStatus);
   assertTimestamp(options.atMs, "transition timestamp");
   if (isClaimableErasureRequestStatus(options.toStatus)) {
     if (options.availableAtMs === undefined) throw new Error("claimable erasure status requires availableAtMs");
@@ -1462,18 +1483,10 @@ export function validateTransitionErasureJobOptions(options: TransitionErasureJo
   }
   if (options.errorCode !== undefined) assertErasureJobErrorCode(options.errorCode);
   validatePolicyIdentity(options.policyVersion, options.policyHash);
-  validateCounts(options.counts);
-  if (options.checksum !== undefined && !/^[0-9a-f]{64}$/.test(options.checksum)) {
-    throw new Error("invalid erasure completion checksum");
-  }
-  if ((options.counts === undefined) !== (options.checksum === undefined)) {
-    throw new Error("erasure completion counts and checksum must be provided together");
-  }
-  if (options.toStatus !== "completed" && (options.counts !== undefined || options.checksum !== undefined)) {
-    throw new Error("completion proof is only valid for completed erasure requests");
-  }
-  if (options.toStatus === "completed" && (options.counts === undefined || options.checksum === undefined)) {
-    throw new Error("completed erasure status requires counts and checksum");
+  // Keep rejecting pre-split/cast JavaScript callers even though completion proof is no longer in
+  // the TypeScript surface. A future destructive executor must derive its own proof in-store.
+  if (legacy.counts !== undefined || legacy.checksum !== undefined) {
+    throw new Error("caller-supplied erasure completion proof is unavailable");
   }
 }
 

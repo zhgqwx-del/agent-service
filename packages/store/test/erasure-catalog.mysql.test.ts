@@ -5,6 +5,7 @@ import {
   MysqlSessionStore,
   newErasureRequestId,
   userErasureRequestHash,
+  type ClaimableErasureRequestStatus,
   type ErasureJobAuthorization,
   type ErasureJobClaim,
   type ErasureRequestStatus,
@@ -92,7 +93,7 @@ async function gateAndClaim(
   });
   let nowMs = atMs;
   let claim = await claimRequest(store, requestId, nowMs, tokenFor("gated"));
-  const path: readonly ErasureRequestStatus[] = targetStatus === "draining"
+  const path: readonly ClaimableErasureRequestStatus[] = targetStatus === "draining"
     ? ["draining"]
     : targetStatus === "tombstoning"
       ? ["draining", "tombstoning"]

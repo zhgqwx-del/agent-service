@@ -9,6 +9,7 @@ describe("router configuration", () => {
     expect(local.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(local.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(local.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
+    expect(local.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
     expect(local.BLOB_MAX_BYTES).toBe(1_000_000);
     expect(local.UPSTREAM_HEADER_TIMEOUT_MS).toBe(15_000);
     expect(local.INTERNAL_ROUTER_TOKEN.length).toBeGreaterThanOrEqual(32);
@@ -35,6 +36,14 @@ describe("router configuration", () => {
     expect(() => loadRouterConfig({
       RUNNERS: "http://runner:8787",
       DATA_GOVERNANCE_MANAGEMENT_ENABLED: "true",
+    })).toThrow();
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      PURGE_POLICY_EVALUATOR_ENABLED: "1",
+    }).PURGE_POLICY_EVALUATOR_ENABLED).toBe(true);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      PURGE_POLICY_EVALUATOR_ENABLED: "true",
     })).toThrow();
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",

@@ -268,6 +268,64 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
+    it("refuses every acknowledgement operation for an old or abnormal purge claim", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const sessionId = newId("sess");
+      let fixture: SeededOutbox | undefined;
+
+      try {
+        await conn.query(
+          `INSERT INTO lifecycle_outbox
+             (topic, aggregate_id, generation, payload, available_at_ms, attempts,
+              claim_token, lease_until_ms, created_at_ms)
+           VALUES ('session.purge', ?, 1, ?, NULL, 1, 'legacy-purge-claim', 100, 0)`,
+          [sessionId, JSON.stringify({ sessionId, deletionGeneration: 1 })],
+        );
+        const [rows] = await conn.query<(RowDataPacket & { outbox_id: number })[]>(
+          `SELECT outbox_id FROM lifecycle_outbox
+            WHERE topic='session.purge' AND aggregate_id=? AND generation=1`,
+          [sessionId],
+        );
+        fixture = { outboxId: Number(rows[0]?.outbox_id), sessionId };
+
+        expect(await store.renewLifecycleOutboxClaim(
+          fixture.outboxId,
+          "legacy-purge-claim",
+          { nowMs: 1, leaseMs: 200 },
+        )).toBe(false);
+        expect(await store.completeLifecycleOutbox(
+          fixture.outboxId,
+          "legacy-purge-claim",
+          1,
+        )).toBe(false);
+        expect(await store.retryLifecycleOutbox(fixture.outboxId, "legacy-purge-claim", {
+          failedAtMs: 1,
+          availableAtMs: 10,
+          error: "must stay dormant without an attempt bound",
+        })).toBe(false);
+        expect(await store.retryLifecycleOutbox(fixture.outboxId, "legacy-purge-claim", {
+          failedAtMs: 1,
+          availableAtMs: 10,
+          error: "must stay dormant",
+          maxAttempts: 2,
+        })).toBe(false);
+        expect(await readOutboxState(conn, fixture.outboxId)).toMatchObject({
+          attempts: 1,
+          claim_token: "legacy-purge-claim",
+          lease_until_ms: 100,
+          available_at_ms: null,
+          last_error: null,
+          completed_at_ms: null,
+          dead_lettered_at_ms: null,
+        });
+      } finally {
+        if (fixture) await cleanupIntents(conn, [fixture]).catch(() => {});
+        await conn.end();
+        await store.close();
+      }
+    });
+
     it("expires leases at the exact boundary, increments attempts on reclaim, and rejects stale tokens", async () => {
       const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
       const conn = await mysql.createConnection(mysqlUrl);

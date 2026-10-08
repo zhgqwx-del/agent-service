@@ -1101,6 +1101,13 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "dataPurgeExecution": {
+                "default": false,
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              },
               "dynamicTools": {
                 "type": "boolean"
               },
@@ -1124,6 +1131,17 @@ export const OPENAPI_DOCUMENT = {
                   ],
                   "type": "string"
                 },
+                "type": "array"
+              },
+              "purgePolicyEvaluation": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "policy-evaluator-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
                 "type": "array"
               },
               "replay": {

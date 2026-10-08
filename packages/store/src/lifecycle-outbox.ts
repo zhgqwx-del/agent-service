@@ -9,6 +9,10 @@ export const MAX_LIFECYCLE_OUTBOX_CLAIM = 100;
 export const MAX_LIFECYCLE_OUTBOX_ERROR_CHARS = 1_024;
 
 const TOPICS = new Set<LifecycleOutboxTopic>(["session.tombstoned", "session.purge"]);
+// The generic dispatcher surface is intentionally terminal-event-only. A future destructive
+// executor must receive a separate least-privilege store interface; merely making a dormant purge
+// row available must never let this existing worker claim it.
+const CLAIMABLE_TOPICS = new Set<LifecycleOutboxTopic>(["session.tombstoned"]);
 
 function assertTimestamp(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be a non-negative safe integer`);
@@ -39,6 +43,9 @@ export function validateClaimLifecycleOutboxOptions(options: ClaimLifecycleOutbo
   const topics = [...new Set(options.topics)];
   for (const topic of topics) {
     if (!TOPICS.has(topic)) throw new Error(`unsupported lifecycle outbox topic: ${String(topic)}`);
+    if (!CLAIMABLE_TOPICS.has(topic)) {
+      throw new Error(`lifecycle outbox topic is not claimable by this store: ${String(topic)}`);
+    }
   }
   const leaseUntilMs = options.nowMs + options.leaseMs;
   assertTimestamp(leaseUntilMs, "leaseUntilMs");

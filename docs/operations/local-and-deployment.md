@@ -19,13 +19,14 @@ scripts/local-service.sh down        # 停应用和本地基础设施
 验证入口：
 
 ```bash
-scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 0007→0015 历史迁移 + lifecycle/retention 专项 + cluster + SDK/应用构建产物
+scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 0007→0016 历史迁移 + lifecycle/policy-evaluator 专项 + cluster + SDK/应用构建产物
 scripts/local-service.sh verify-real  # 使用本机 .env，仅跑真实模型 E2E
-pnpm test:migrations                  # 独立真实 MySQL：固定 0007→0008→...→0014→0015 历史升级
+pnpm test:migrations                  # 独立真实 MySQL：固定 0007→0008→...→0015→0016 历史升级
 pnpm test:blob-mysql                  # 强制执行并验明 Blob ownership/绑定/cleanup 的独立真实 MySQL 套件
 pnpm test:usage-lifecycle-mysql       # 强制执行 usage 双写/reconcile/anonymize 的独立真实 MySQL 套件
 pnpm test:subject-lifecycle-mysql     # 强制执行 subject gate/erasure request 的独立真实 MySQL 套件
 pnpm test:retention-policy-mysql      # 强制执行 canonical policy/multi legal hold/CAS/rollback/跨 runner 时钟语义的独立真实 MySQL 套件
+pnpm test:erasure-purge-policy-mysql  # 强制执行 evaluator/authority、claim ABA、回滚和live evidence/hold重评真实 MySQL 套件
 pnpm test:erasure-job-mysql           # 强制执行 erasure claim/lease/audit 的独立真实 MySQL 套件
 pnpm test:erasure-session-mysql       # 强制执行 claim-bound session action/rollback 套件
 pnpm test:erasure-catalog-mysql       # 强制执行 content-free catalog/completeness proof 套件
@@ -40,8 +41,8 @@ pnpm check:sdk                        # 编译 SDK、原生 Node import，并检
 ## 模块边界
 
 - `agent-router`：无业务状态，可独立扩缩容。需要能访问全部 runner 的 `RUNNER_ADDR` 和共享 Redis。
-- `agent-runner`：每个实例必须有全局唯一 `RUNNER_ID`，并发布其它 router/runner 可访问的 `RUNNER_ADDR`；terminal-event dispatcher、Blob cleanup、user-erasure worker 与 legacy tombstone compensation worker 都内嵌于 runner，不新增第三个应用服务。
-- MySQL：业务真相、事件、审批、配置、operational usage ledger、去身份化 billing facts/reconciliation、subject lifecycle/erasure request/main audit、append-only erasure job control audit、legacy tombstone cutover/job/audit、tenant-scoped immutable retention policy/activation audit、tenant/user multi legal-hold ledger/control/audit、Blob ownership manifest 和两个独立 outbox。生产迁移应作为独立 Job 执行，不能依赖所有 runner 同时自动迁移。
+- `agent-runner`：每个实例必须有全局唯一 `RUNNER_ID`，并发布其它 router/runner 可访问的 `RUNNER_ADDR`；terminal-event dispatcher、Blob cleanup、user-erasure worker、legacy tombstone compensation worker与非破坏性purge-policy evaluator都内嵌于runner，不新增第三个应用服务。
+- MySQL：业务真相、事件、审批、配置、operational usage ledger、去身份化 billing facts/reconciliation、subject lifecycle/erasure request/main audit、append-only erasure job control audit、legacy tombstone cutover/job/audit、tenant-scoped immutable retention policy/activation audit、tenant/user multi legal-hold ledger/control/audit、purge-policy evaluation job/immutable target/decision/authority、Blob ownership manifest 和两个独立 outbox。生产迁移应作为独立 Job 执行，不能依赖所有 runner 同时自动迁移。
 - Redis：租约、fence counter、owner 目录和事件扇出。生产环境必须启用满足恢复目标的持久化/高可用方案，不能把它当可随意清空的缓存。
 - BlobStore：本地 filesystem adapter 已接入输入图片 item 与大工具输出；key 采用跨平台无大小写歧义的小写 grammar，新写入使用版本化 storage format，数据与 metadata 以覆盖 header/长度/正文的 SHA-256 单 envelope 原子发布，目录/文件权限为 0700/0600，并可过渡读取/删除安全 key 范围内的旧 raw + sidecar 格式。业务行只保存 owner-scoped opaque `blobId`，`0010` 的 manifest 私有保存 backend/key/token/integrity；`staging → ready` 与 item commit 原子绑定，过期未绑定 staging 经专用 outbox/claim lease 物理删除。该 root 必须由服务独占，当前也没有验证或承诺多 runner/NFS 共享语义；Node 没有可移植的 `openat/O_NOFOLLOW`，不能抵御有权同时替换目录项的恶意本机进程，本地原子发布也不等同于断电持久性承诺。ready Blob 的 erasure/物理 purge 尚未开启，生产必须先替换为共享 OSS/S3 adapter。
 
@@ -60,6 +61,8 @@ Runner 必需配置：
 - `LIFECYCLE_OUTBOX_*`：runner 内置 terminal-event dispatcher 的 poll、claim lease、批量和退避边界；该 dispatcher 只处理 `session.tombstoned`，不是 purge worker
 - `DATA_ERASURE_REQUESTS_ENABLED`：user erasure request writer capability，默认 `0`；直接控制新 POST，不撤销 durable gate或停止历史 job。status GET不依赖router writer gate，但仍按runner capability与healthy selected target fail-closed
 - `DATA_GOVERNANCE_MANAGEMENT_ENABLED`：canonical retention-policy 与 multi legal-hold 管理端点开关，默认 `0`。置 `0` 只关闭 `/v1/retention-policies*`、`/v1/legal-holds*`，不会撤销已提交的 active policy/hold，也绝不启用 purge；具备 `0015` store contract 的 runner 仍会发布 `canonical-retention-v1`、`multi-legal-hold-v1` 代码感知 capability，管理端点是否已开放则由独立的 `dataGovernanceManagement` boolean 表示
+- `PURGE_POLICY_EVALUATOR_ENABLED`：非破坏性policy evaluator开关，默认`0`，必须和router同名gate一起开启。开启后runner才创建worker；但code-aware runner即使gate关闭也会声明`purgePolicyEvaluation=["policy-evaluator-v1"]`。worker只有evaluation store权限，最多写不可执行target/decision/authority，绝不启用`session.purge`、Blob delete、usage anonymize或request completion
+- `PURGE_POLICY_EVALUATOR_*`：poll、claim lease、job batch、target page和bounded retry边界。`evidence_changed`会以新build generation清空cursor/count/root后重建，不覆写旧证据；普通临时故障保留当前generation/cursor并重试
 - `ERASURE_WORKER_ENABLED`、`ERASURE_ROUTER_URL`：内嵌 durable worker及私有 router origin；产品默认 worker=`0`，local 显式设为 `1`，与 admission 独立。worker在每次claim前调用token-protected v2 router barrier，未获得固定ACK就不接触数据库queue；最多推进到 `awaiting_purge_policy`，不执行 anonymize/purge/completed
 - `LEGACY_TOMBSTONE_COMPENSATION_ENABLED`：内嵌 generation-zero compensation worker；产品默认 `0`，local 显式 `1`。首次通过 v2 barrier 后可能激活 write-once cutover，之后不能再运行 pre-`0014` writer。`DATA_ERASURE_REQUESTS_ENABLED=1` 要求它与 `ERASURE_WORKER_ENABLED` 都为 `1`
 - `LEGACY_TOMBSTONE_COMPENSATION_*`：compensation poll、claim lease、batch 和 bounded retry；只补齐 terminal proof/outbox/audit，不使 purge 可领取、不删除内容
@@ -81,6 +84,7 @@ Router 必需配置：
 - `SESSION_TOMBSTONE_ENABLED`：显式 expand→activate 开关；local 脚本默认 `1`，staging/production 发布时默认保持 `0`，且 router 仍会要求全部健康 runner 声明 `tombstone`
 - `DATA_ERASURE_REQUESTS_ENABLED`：user erasure writer gate，local/staging/production 默认都是 `0`。POST 还要求 `RUNNERS` 中全部 configured targets 均已健康探测并声明 capability，且选中 target 仍支持；暂时不可达的已配置实例也会阻断激活。状态 GET 不依赖这个 router writer gate，继续按当前 healthy fleet/selected target capability 规则 fail-closed；writer gate 开启时，所有 user-scoped runtime 每次转发都复核 selected target capability。另有不公开的 v2 worker barrier 要求本 router 进程曾逐一观察每个稳定地址同时声明 `quarantine-v1` 与 `legacy-tombstone-compensation-v1`；旧 v1 私有路径故意 404，不提供降级 fallback
 - `DATA_GOVERNANCE_MANAGEMENT_ENABLED`：router 的独立管理面 gate，默认 `0`。即使置 `1`，也只有在每个 configured `RUNNERS` 稳定地址当前健康、同时声明 `canonical-retention-v1`、`multi-legal-hold-v1` 且 runner 自身 `dataGovernanceManagement=true` 时才开放；每次发送前还会复核选中 target。router 对外 capability 中 `dataGovernance` 表示全 fleet 已理解并会遵守 durable policy/hold，`dataGovernanceManagement` 才表示管理 API 已激活，二者不能混为一谈
+- `PURGE_POLICY_EVALUATOR_ENABLED`：router的独立evaluator barrier gate，默认`0`。token-protected私有ACK只在该gate开启、`INTERNAL_ROUTER_TOKEN`存在且每个configured稳定runner当前健康并声明`policy-evaluator-v1`时返回；runner也必须独立开启同名gate才会请求ACK并schedule/claim。公开`purgePolicyEvaluation`只表示fleet代码感知，不能用来推断worker已经激活；`dataPurgeExecution`固定为`false`
 - `BLOB_FILESYSTEM_SINGLE_RUNNER`：当前 local router 与 runner 一致设为 `1`；只用于单 runner filesystem 拓扑，router 会强制 `RUNNERS` 去重后恰好一个地址，不能带入多实例环境
 - `BLOB_ATTACHMENTS_ENABLED`：新 Blob 上传的独立 gate；local 默认 `1`，router 还要求全部健康 runner 声明 `blobAttachments`。当前 production filesystem 配置禁止开启
 - `BLOB_MAX_BYTES`：只约束 raw Blob upload，必须与 runner 一致并且不大于双方的 `MAX_BODY_BYTES`
@@ -112,6 +116,10 @@ policy activate 是提交即生效的 CAS，不提供“预设未来时间”调
 
 一旦首个 policy activation或canonical legal-hold control event提交，发布就进入另一条 forward-only 兼容边界：关闭management/admission gate只能停止新管理请求/新erasure请求，不能取消已激活策略、已设置hold或既有request绑定。不得回退到不会验证canonical ledger、不会在erasure admission绑定policy的pre-`0015` reader/writer，也不得删除control/event、手工清空policy identity或执行down migration；故障恢复必须保留证据并forward-fix。active legal hold会继续阻止尚未提交的usage anonymization；释放一个hold不会覆盖同subject的其它active hold。
 
+`0016`采用独立的expand→code-aware→evaluator-active顺序。先在evaluator gate关闭时运行expand-only migration；它只建job/target/decision/authority表与append-only guards，不回填历史awaiting row、不开放任何purge intent。再部署`PURGE_POLICY_EVALUATOR_ENABLED=0`的新router并排空旧router，随后滚动同样gate=`0`、但会声明`policy-evaluator-v1`的新runner。确认每个configured稳定地址当前健康且code-aware后，逐runner开启该gate，最后开启router gate；每次schedule/claim仍需新的token-protected固定ACK。关闭gate只暂停新的evaluation pass，不撤销immutable evidence，也不恢复任何subject；它从不控制物理purge，因为本版本根本没有`dataPurgeExecution`开关。
+
+evaluator rollout不能被描述为destructive activation。当前eligibility用runner记录的wall clock，跨VM正/负时钟偏差尚未以数据库/可信时间线性化；target只摘要每个session的tombstone、ready Blob、usage和receipt，不枚举turn/item/event/approval全量owner内容。未来destructive executor必须另行设计默认关闭的fleet gate和最小权限store，在执行事务中重验数据库/可信时间及tenant/user hold，执行owner-scan并持久化`session_content_receipts`，再核对Blob物理ACK、usage匿名化、receipt/Redis清理、secret撤销和restore-ledger ACK。`0016` completion因此固定为false，即使decision是`eligible_execution_disabled`也不得删除数据。
+
 erasure 现在有三条不可逆回滚边界。第一条是“首次请求已接受”：关闭 router writer gate 只停止新的 erasure POST，绝不会撤销已持久化的 subject gate。writer gate 保持 `1` 时，router 会对 `/v1/sessions*`、`/v1/usage` 与 erasure 路径逐次检查 selected target capability，能力回退即返回可重试 `503` 而不转发；gate=`0` 的 expand mixed window仍可提供普通 runtime。首次接受后必须保持所有处理 user 请求的 runner 都 lifecycle-aware，并优先 forward-fix；不能把业务流量回退给 pre-`0011` 或其它不检查 `subject_lifecycle` 的 runner，否则已 gated subject 可能重新可见并产生新写入。
 
 第二条是“任一 quarantine/maintenance control event或terminal incident已写入”：此后不能回退到pre-`0013` reader/worker。router sticky observation在明确观察到旧runner时会关闭新claim，但它约束不了绕过router、直接连接数据库的旧worker；事故处置必须forward-fix，或先排空/阻断全部旧worker和受影响流量。若确实必须恢复pre-`0011`版本，先在edge精确阻断受影响tenant/user；edge无法可靠识别时先阻断全部user-scoped runtime。`0011` gate/audit、`0012` queue和`0013` control/incident history都必须保留，不能用down migration、feature flag或镜像回滚把它们当作已撤销。
@@ -126,7 +134,7 @@ erasure 现在有三条不可逆回滚边界。第一条是“首次请求已接
 
 `pnpm build` 同时会为 router/runner 生成各自的单文件 ESM JavaScript bundle，可在装有 Node 24 和对应 production dependencies 的 Linux、macOS 或 Windows 主机运行，但它不是原生机器码二进制。目前 CI 对容器镜像和原生 Node bundle 都有启动门禁；生产默认推荐 OCI 镜像，因为依赖、Node 版本和文件布局也被一起冻结。若未来明确采用裸 VM，再增加带校验和的 bundle + production `node_modules` 发布包和 systemd 服务，不需要把两个服务合成一个二进制。
 
-“本地完整”指已实现链路可在真实 MySQL + Redis + router/runner 下重复运行；当前自动门禁还覆盖双 runner user-erasure quarantine/repair、remote drain、owner crash、fence takeover、generation-zero compensation、canonical retention policy/multi legal hold和停在 policy boundary。它不表示云依赖已被本机替代，也不表示数据生命周期闭环：异步export artifact/TTL、tenant/key revocation、policy-gated ready/session purge、completed proof与 restore replay仍待完成。filesystem Blob只证明单 runner本地语义，不能外推成多 VM/Pod共享存储正确性。
+“本地完整”指已实现链路可在真实 MySQL + Redis + router/runner 下重复运行；当前自动门禁还覆盖双 runner user-erasure quarantine/repair、remote drain、owner crash、fence takeover、generation-zero compensation、canonical retention policy/multi legal hold、停在 policy boundary，以及默认关闭的non-destructive evaluator/authority重评。它不表示云依赖已被本机替代，也不表示数据生命周期闭环：异步export artifact/TTL、tenant/key revocation、可信时钟/完整内容proof、policy-gated ready/session purge、completed proof与 restore replay仍待完成。filesystem Blob只证明单 runner本地语义，不能外推成多 VM/Pod共享存储正确性。
 
 当前 `MysqlSessionStore.connect()` 仍会自动执行迁移，适合 local/CI，但还不满足上文“生产迁移作为独立 Job”的目标。进入 staging 前必须拆出显式 migration 命令/Job，并让业务进程只做 schema 版本检查、禁止启动时自动 DDL；同时完成备份恢复与迁移失败后的人工审计/重试演练。
 
@@ -147,6 +155,8 @@ erasure 现在有三条不可逆回滚边界。第一条是“首次请求已接
 迁移 `0014_legacy_tombstone_compensation.sql` 继续保持 expand-only 和 dormant：新增 inactive write-once cutover、每 session 一个 durable compensation job、append-only result audit、candidate/claim indexes 与 session row guards。应用 migration 本身不会激活 cutover、扫描或排队历史 row、生成 event/outbox、修改 generation、使 purge 可领取或删除内容。固定 `0013 → 0014` 历史夹具覆盖完整升级、DDL 中断/marker-loss replay、错误 index/trigger 收敛、旧数据原样保留、cutover 与并发 legacy writer 的锁线性化，以及激活后的 guard；CI migration manifest拒绝缺失或 skipped fixture。另有 `pnpm test:legacy-tombstone-mysql` named no-skip 套件使用真实 InnoDB 验证 claim/ABA、active资源结算、原子成功发布、audit/outbox失败回滚、child/owner隔离、terminal incident与幂等重试。CI runner image 还检查 migration marker `0014_legacy_tombstone_compensation.sql`，但 marker 不等于 runtime cutover 已激活。
 
 迁移 `0015_retention_policy_and_legal_holds.sql` 仍是 expand-only：新增tenant immutable policy versions、generation-fenced active control与append-only activation audit，并把单个 `legal_hold_at_ms` 兼容shadow提升为tenant/user scoped multi-hold ledger、control和append-only audit。migration会为历史非空shadow生成确定性`legacy_unattributed`证据，但不会创建默认active policy、激活management、修改既有erasure backlog、调度purge、开放`session.purge` intent、anonymize usage、删除内容或推进job；retention duration为`NULL`时始终表示fail-closed不授权过期，当前非`NULL`值也没有自动开启物理purge。固定`0014 → 0015`真实MySQL夹具覆盖历史数据保留、legacy hold证据、DDL中断/marker-loss重放、冲突阻断、append-only/单向release guards以及purge继续dormant；migration wrapper显式枚举该夹具并拒绝missing/skipped。`pnpm test:retention-policy-mysql`是另一条named no-skip真实InnoDB门禁，覆盖immutable版本、并发CAS、事务回滚、跨runner时钟clamp、erasure admission绑定、multi hold及anonymization竞态；`scripts/local-service.sh verify`和GitHub CI都会执行两条门禁，而不是只验证fresh schema。
+
+迁移 `0016_erasure_purge_policy_authority.sql` 继续expand-only和destructive-dormant：新增durable evaluation job、按build generation不可变的per-session target、rooted decision chain、generation-CAS active authority projection与append-only authority。migration不扫描或回填历史awaiting request、不设置`purge_after_ms`、不开放`session.purge`/ready Blob delete、不匿名化或删除任何数据，也不推进`purging/completed`。固定`0015 → 0016`真实MySQL夹具覆盖原policy/hold/request/content保留、partial DDL、marker-loss/replay、append-only trigger轮换、升级后同key异内容写入被拒并保留原证据，以及purge继续休眠；migration wrapper显式枚举该夹具并拒绝missing/skipped。`pnpm test:erasure-purge-policy-mysql`是另一条named no-skip真实InnoDB门禁，覆盖原子job建立、claim/ABA、deadline、live evidence/hold重评、并发锁顺序和seal回滚；CI runner image检查`0016_erasure_purge_policy_authority.sql` marker，但marker只证明schema存在，不表示evaluator或purge已开启。
 
 新版 `createSession` 会原子写入 session 与 `session/created(seq=1)`；混合版本窗口内旧 runner 仍是旧的两步路径，因此只有在旧实例全部排空后，才能把该原子性作为全 fleet 不变量。这个约束与下述 legacy pending 清理边界相同：不能在旧进程仍可能写入时提前宣告升级完成。
 

@@ -5,6 +5,7 @@ import {
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   PROTOCOL_VERSION,
+  PURGE_POLICY_EVALUATOR_V1,
 } from "@agent-service/protocol";
 import { RunnerRegistry } from "../src/registry.js";
 
@@ -47,6 +48,7 @@ describe("RunnerRegistry owner address mapping", () => {
       erasureJobControl: readonly string[] = JOB_CONTROL_V2,
       dataGovernance: readonly string[] = DATA_GOVERNANCE_V1,
       dataGovernanceManagement = true,
+      purgePolicyEvaluation: readonly string[] = [PURGE_POLICY_EVALUATOR_V1],
     ) => ({
       protocolVersion,
       service: "agent-runner",
@@ -61,6 +63,8 @@ describe("RunnerRegistry owner address mapping", () => {
         erasureJobControl,
         dataGovernance,
         dataGovernanceManagement,
+        purgePolicyEvaluation,
+        dataPurgeExecution: false,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -121,6 +125,7 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.supportsUserErasureWorker("http://current")).toBe(true);
     expect(registry.supportsUserErasureWorker("http://current-basic")).toBe(false);
     expect(registry.allConfiguredSupportErasureJobControl()).toBe(false);
+    expect(registry.allConfiguredSupportPurgePolicyEvaluation()).toBe(false);
     expect(registry.anyHealthy()).toBe("http://current");
     expect(registry.routeableUrl("current")).toBe("http://current");
     expect(registry.routeableUrl("old")).toBeUndefined();
@@ -244,6 +249,64 @@ describe("RunnerRegistry owner address mapping", () => {
       await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
       expect(registry.allConfiguredSupportErasureJobControl(), incompatible).toBe(false);
     }
+    await registry.close();
+  });
+
+  it("requires every configured stable runner to be healthy and policy-evaluator aware", async () => {
+    let legacyState: "legacy" | "upgraded" | "down" = "legacy";
+    const capabilities = (aware: boolean) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        purgePolicyEvaluation: aware ? [PURGE_POLICY_EVALUATOR_V1] : [],
+        dataPurgeExecution: false,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        return Response.json(capabilities(legacyState === "upgraded"));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allConfiguredSupportPurgePolicyEvaluation()).toBe(false);
+
+    legacyState = "upgraded";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportPurgePolicyEvaluation()).toBe(true);
+
+    legacyState = "down";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportPurgePolicyEvaluation()).toBe(false);
+
+    legacyState = "legacy";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allConfiguredSupportPurgePolicyEvaluation()).toBe(false);
     await registry.close();
   });
 

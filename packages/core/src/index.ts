@@ -13,3 +13,4 @@ export * from "./lifecycle/outbox-dispatcher.js";
 export * from "./lifecycle/blob-cleanup-worker.js";
 export * from "./lifecycle/erasure-worker.js";
 export * from "./lifecycle/legacy-tombstone-compensation-worker.js";
+export * from "./lifecycle/purge-policy-evaluator.js";

@@ -5,6 +5,7 @@ import {
   newErasureRequestId,
   subjectLifecycleKey,
   userErasureRequestHash,
+  validateTransitionErasureJobOptions,
   type ErasureJobAuthorization,
   type ErasureJobClaim,
 } from "../src/index.js";
@@ -34,6 +35,34 @@ function authorization(claim: ErasureJobClaim): ErasureJobAuthorization {
 }
 
 describe("MemorySessionStore durable erasure job queue", () => {
+  it("cannot use the generic transition API to mint purge or caller-supplied completion proof", () => {
+    expect(() => validateTransitionErasureJobOptions({
+      fromStatus: "awaiting_purge_policy",
+      toStatus: "purging",
+      atMs: 1,
+    } as never)).toThrow("unavailable purge executor");
+    expect(() => validateTransitionErasureJobOptions({
+      fromStatus: "purging",
+      toStatus: "completed",
+      atMs: 2,
+      counts: { sessions: 0, turns: 0, items: 0, blobs: 0, usageRows: 0 },
+      checksum: "a".repeat(64),
+    } as never)).toThrow("unavailable purge executor");
+    expect(() => validateTransitionErasureJobOptions({
+      fromStatus: "purging",
+      toStatus: "blocked",
+      atMs: 3,
+      errorCode: "integrity_conflict",
+    } as never)).toThrow("unavailable purge executor");
+    expect(() => validateTransitionErasureJobOptions({
+      fromStatus: "gated",
+      toStatus: "draining",
+      atMs: 4,
+      availableAtMs: 4,
+      counts: { sessions: 0 },
+    } as never)).toThrow("caller-supplied erasure completion proof is unavailable");
+  });
+
   it("makes a new gate immediately claimable and exposes only a least-privilege claim", async () => {
     const store = new MemorySessionStore();
     const input = requestInput("tenant-job", "user-job");

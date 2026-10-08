@@ -39,6 +39,7 @@ import {
   INTERNAL_ROUTER_TOKEN_HEADER,
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
+  PURGE_POLICY_EVALUATOR_V1,
   Pagination,
   RetentionPolicyActivateRequest,
   RetentionPolicyParams,
@@ -104,6 +105,8 @@ export interface AppDeps {
   legacyTombstoneCompensationEnabled?: boolean;
   /** Canonical policy/legal-hold management; independent from and incapable of physical purge. */
   dataGovernanceManagementEnabled?: boolean;
+  /** Store/runtime implements the sealed, non-destructive policy-evaluation contract. */
+  purgePolicyEvaluationSupported?: boolean;
   retentionPolicy?: RetentionPolicyStore;
   subjectLifecycle?: SubjectLifecycleStore;
   ready: () => boolean;
@@ -205,6 +208,10 @@ export function createApp(deps: AppDeps) {
           : [],
         dataGovernanceManagement: deps.retentionPolicy !== undefined
           && deps.dataGovernanceManagementEnabled === true,
+        purgePolicyEvaluation: deps.purgePolicyEvaluationSupported === true
+          ? [PURGE_POLICY_EVALUATOR_V1]
+          : [],
+        dataPurgeExecution: false,
         dynamicTools: true,
         mcp: [],
         skills: false,

@@ -348,6 +348,79 @@ export function legalHoldControlSha256(control: LegalHoldControlRecord): string 
   ])).digest("hex");
 }
 
+/** Reconstruct an already validated legal-hold ledger at an immutable generation fence. */
+export function legalHoldControlAtGeneration(
+  tenantId: string,
+  subjectKind: DataSubjectKind,
+  subjectId: string,
+  holds: readonly LegalHoldRecord[],
+  events: readonly LegalHoldEvent[],
+  generation: number,
+): LegalHoldControlRecord {
+  if (!Number.isSafeInteger(generation) || generation < 0 || generation > events.length) {
+    throw new LegalHoldIntegrityError("legal hold historical generation is invalid");
+  }
+  const byId = new Map(holds.map((hold) => [hold.holdId, hold]));
+  const active = new Map<string, LegalHoldRecord>();
+  let control: LegalHoldControlRecord = {
+    tenantId,
+    subjectKind,
+    subjectId,
+    controlGeneration: 0,
+    activeHoldCount: 0,
+    activeProjectionSha256: legalHoldProjectionSha256([]),
+    updatedAtMs: 0,
+  };
+  for (let index = 0; index < generation; index += 1) {
+    const event = events[index];
+    const hold = event && byId.get(event.holdId);
+    if (
+      !event
+      || !hold
+      || event.tenantId !== tenantId
+      || event.subjectKind !== subjectKind
+      || event.subjectId !== subjectId
+      || event.controlGeneration !== index + 1
+      || event.beforeSha256 !== legalHoldControlSha256(control)
+    ) throw new LegalHoldIntegrityError("legal hold historical event chain is invalid");
+    if (event.eventType === "legal_hold/set") {
+      if (active.has(event.holdId) || hold.createdControlGeneration !== event.controlGeneration) {
+        throw new LegalHoldIntegrityError("legal hold historical set is invalid");
+      }
+      active.set(event.holdId, {
+        tenantId,
+        holdId: hold.holdId,
+        subjectKind,
+        subjectId,
+        state: "active",
+        reasonCode: hold.reasonCode,
+        ...(hold.externalReferenceSha256 === undefined
+          ? {}
+          : { externalReferenceSha256: hold.externalReferenceSha256 }),
+        createdControlGeneration: hold.createdControlGeneration,
+        createdByKeyId: hold.createdByKeyId,
+        createdAtMs: hold.createdAtMs,
+      });
+    } else if (!active.delete(event.holdId)) {
+      throw new LegalHoldIntegrityError("legal hold historical release is invalid");
+    }
+    const projected = [...active.values()];
+    control = {
+      tenantId,
+      subjectKind,
+      subjectId,
+      controlGeneration: event.controlGeneration,
+      activeHoldCount: projected.length,
+      activeProjectionSha256: legalHoldProjectionSha256(projected),
+      updatedAtMs: event.emittedAtMs,
+    };
+    if (event.afterSha256 !== legalHoldControlSha256(control)) {
+      throw new LegalHoldIntegrityError("legal hold historical projection is invalid");
+    }
+  }
+  return control;
+}
+
 export function newLegalHoldId(): string {
   return `hold_${randomUUID()}`;
 }

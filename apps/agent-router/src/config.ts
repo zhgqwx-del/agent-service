@@ -35,6 +35,10 @@ const Env = z.object({
   DATA_GOVERNANCE_MANAGEMENT_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Non-destructive purge-policy evaluator barrier; physical purge has no activation flag. */
+  PURGE_POLICY_EVALUATOR_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   SHUTDOWN_GRACE_MS: z.coerce.number().int().nonnegative().default(10_000),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   NODE_ENV: z.string().optional(),

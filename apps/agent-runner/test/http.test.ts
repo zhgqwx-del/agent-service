@@ -78,6 +78,7 @@ async function makeApp(
     attachStore?: boolean;
     legacyCompensation?: boolean;
     governance?: boolean;
+    evaluation?: boolean;
   } = {},
 ) {
   const store = new MemorySessionStore();
@@ -99,6 +100,7 @@ async function makeApp(
     legacyTombstoneCompensationEnabled: lifecycle.legacyCompensation,
     subjectLifecycle: lifecycle.attachStore ? store : undefined,
     dataGovernanceManagementEnabled: lifecycle.governance,
+    purgePolicyEvaluationSupported: lifecycle.evaluation,
     retentionPolicy: store,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
@@ -230,6 +232,8 @@ describe("agent-runner HTTP API", () => {
         erasureJobControl: [],
         dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"],
         dataGovernanceManagement: false,
+        purgePolicyEvaluation: [],
+        dataPurgeExecution: false,
       },
     });
     const enabled = await makeApp(60_000, { governance: true });
@@ -237,6 +241,17 @@ describe("agent-runner HTTP API", () => {
       features: {
         dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"],
         dataGovernanceManagement: true,
+      },
+    });
+  });
+
+  it("advertises policy-evaluation code awareness without claiming purge execution", async () => {
+    const { app } = await makeApp(60_000, { evaluation: true });
+    expect(await (await app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        purgePolicyEvaluation: ["policy-evaluator-v1"],
+        dataPurgeExecution: false,
       },
     });
   });

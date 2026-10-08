@@ -14,12 +14,16 @@ import {
   INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
   INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
   INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH,
+  INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
+  INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
+  INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
   INTERNAL_ROUTER_TOKEN_HEADER,
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
+  PURGE_POLICY_EVALUATOR_V1,
   UserErasureDrainRequest,
   isCanonicalId,
 } from "@agent-service/protocol";
@@ -47,6 +51,8 @@ export interface RouterAppDeps {
   erasureRequestsEnabled?: () => boolean;
   /** Explicit fleet activation gate for canonical policy/legal-hold administration. */
   dataGovernanceManagementEnabled?: () => boolean;
+  /** Independent activation gate for non-destructive policy evaluation queue claims. */
+  purgePolicyEvaluatorEnabled?: () => boolean;
   /** Shared runner-internal credential. Omission keeps destructive routing disabled. */
   internalRunnerToken?: string;
   logger?: Pick<Console, "info" | "warn" | "error">;
@@ -88,6 +94,7 @@ const STRIP_RESPONSE = new Set([
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
+  INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
 ]);
 
 /** Methods that are safe to send again after a transport failure, with no risk of doing the work twice. */
@@ -161,6 +168,11 @@ export function createRouterApp(deps: RouterAppDeps) {
     && dataGovernanceWritersAvailable()
     && deps.registry.allConfiguredSupportDataGovernanceManagement()
   );
+  const purgePolicyEvaluationAvailable = () => (
+    !!deps.internalRunnerToken
+    && (deps.purgePolicyEvaluatorEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportPurgePolicyEvaluation()
+  );
 
   app.get("/healthz", (c) => c.text("ok"));
   // Serve the immutable contract locally. Forwarding this endpoint would make API discovery depend
@@ -182,9 +194,12 @@ export function createRouterApp(deps: RouterAppDeps) {
           // /openapi.json. Deployment still drains old runners before promoting the new router.
           const parsed = Capabilities.safeParse(await res.json());
           if (parsed.success) {
-            const lifecycle = parsed.data.features.sessionLifecycle.filter(
-              (feature) => feature !== "tombstone" || tombstoneAvailable(),
-            );
+            const lifecycle = parsed.data.features.sessionLifecycle.filter((feature) => (
+              // Physical purge is not implemented. Never forward an accidental or stale runner
+              // claim, even if every runner reports it during a rolling upgrade.
+              feature !== "purge"
+              && (feature !== "tombstone" || tombstoneAvailable())
+            ));
             return c.json({
               ...parsed.data,
               service: "agent-router",
@@ -204,6 +219,12 @@ export function createRouterApp(deps: RouterAppDeps) {
                   ? [DATA_GOVERNANCE_CANONICAL_RETENTION_V1, DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1]
                   : [],
                 dataGovernanceManagement: dataGovernanceAvailable(),
+                purgePolicyEvaluation: deps.registry.allConfiguredSupportPurgePolicyEvaluation()
+                  ? [PURGE_POLICY_EVALUATOR_V1]
+                  : [],
+                // Evaluation is evidence only. Destructive execution requires a future, separate
+                // protocol and fleet gate; it cannot be enabled by runner input or this barrier.
+                dataPurgeExecution: false,
               },
             } satisfies Capabilities);
           }
@@ -232,6 +253,23 @@ export function createRouterApp(deps: RouterAppDeps) {
     }
     if (!erasureJobControlAvailable()) return c.body(null, 503);
     c.header(INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER, INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE);
+    return c.body(null, 204);
+  });
+
+  /**
+   * Dedicated evaluator barrier. A valid ACK authorizes only a claim from the policy-evaluation
+   * queue; it conveys no authority over erasure jobs, lifecycle outbox entries or blob deletion.
+   */
+  app.get(INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH, (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    if (!purgePolicyEvaluationAvailable()) return c.body(null, 503);
+    c.header(
+      INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
+      INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
+    );
     return c.body(null, 204);
   });
 
@@ -413,6 +451,8 @@ export function createRouterApp(deps: RouterAppDeps) {
       || url.pathname.startsWith(`${INTERNAL_ERASURE_JOB_CONTROL_READY_PATH}/`)
       || url.pathname === INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH}/`)
+      || url.pathname === INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH
+      || url.pathname.startsWith(`${INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH}/`)
     ) {
       privateInternalHeaders(c);
       return c.json({ error: { code: "not_found", message: "not found" } }, 404);

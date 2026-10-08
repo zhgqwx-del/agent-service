@@ -6,6 +6,7 @@ import {
   LifecycleOutboxDispatcher,
   PiEngine,
   PiSummariser,
+  PurgePolicyEvaluator,
   SessionBlobService,
   SessionHost,
   StaticToolRegistry,
@@ -24,6 +25,7 @@ import {
   type BlobManifestStore,
   type EventBus,
   type ErasureJobStore,
+  type ErasurePolicyEvaluationStore,
   type ErasureSessionCatalogStore,
   type ErasureSessionStore,
   type ErasureUsageReconciliationStore,
@@ -39,6 +41,7 @@ import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
 import { loadConfig } from "./config.js";
 import { RouterErasureSessionExecutor } from "./erasure-executor.js";
+import { RouterPurgePolicyEvaluationGate } from "./purge-policy-evaluation-gate.js";
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
@@ -48,6 +51,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & BlobCleanupStore
     & SubjectLifecycleStore
     & ErasureJobStore
+    & ErasurePolicyEvaluationStore
     & ErasureSessionCatalogStore
     & ErasureUsageReconciliationStore
     & LegacyTombstoneCompensationStore
@@ -165,8 +169,29 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       retryMaxMs: cfg.LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS,
     })
     : undefined;
+  const purgePolicyEvaluationGate = cfg.PURGE_POLICY_EVALUATOR_ENABLED
+    ? new RouterPurgePolicyEvaluationGate({
+      routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+      internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+      requestTimeoutMs: cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS,
+    })
+    : undefined;
+  const purgePolicyEvaluator = purgePolicyEvaluationGate
+    ? new PurgePolicyEvaluator({
+      store,
+      canClaim: () => purgePolicyEvaluationGate.canClaim(),
+    }, {
+      pollIntervalMs: cfg.PURGE_POLICY_EVALUATOR_POLL_MS,
+      leaseMs: cfg.PURGE_POLICY_EVALUATOR_LEASE_MS,
+      jobBatchSize: cfg.PURGE_POLICY_EVALUATOR_BATCH_SIZE,
+      targetPageSize: cfg.PURGE_POLICY_EVALUATOR_TARGET_PAGE_SIZE,
+      retryBaseMs: cfg.PURGE_POLICY_EVALUATOR_RETRY_BASE_MS,
+      retryMaxMs: cfg.PURGE_POLICY_EVALUATOR_RETRY_MAX_MS,
+    })
+    : undefined;
   legacyTombstoneCompensationWorker?.start();
   erasureWorker?.start();
+  purgePolicyEvaluator?.start();
 
   let ready = true;
   const app = createApp({
@@ -180,6 +205,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     legacyTombstoneCompensationEnabled: cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED,
     dataGovernanceManagementEnabled: cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
     retentionPolicy: store,
+    purgePolicyEvaluationSupported: true,
     subjectLifecycle: store,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
     ready: () => ready,
@@ -204,6 +230,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       await Promise.all([
         erasureWorker?.stop(),
         legacyTombstoneCompensationWorker?.stop(),
+        purgePolicyEvaluator?.stop(),
       ]);
       await host.drain(30_000);
       await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
@@ -237,10 +264,11 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
-    legacyTombstoneCompensationWorker, blobs, blobStore, store, lease, bus, cfg,
+    legacyTombstoneCompensationWorker, purgePolicyEvaluator,
+    blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };
 }

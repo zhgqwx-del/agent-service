@@ -66,6 +66,16 @@ const Env = z.object({
   DATA_GOVERNANCE_MANAGEMENT_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Non-destructive purge-policy evaluator. Physical purge remains unavailable. */
+  PURGE_POLICY_EVALUATOR_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  PURGE_POLICY_EVALUATOR_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  PURGE_POLICY_EVALUATOR_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+  PURGE_POLICY_EVALUATOR_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(10),
+  PURGE_POLICY_EVALUATOR_TARGET_PAGE_SIZE: z.coerce.number().int().min(1).max(1_000).default(100),
+  PURGE_POLICY_EVALUATOR_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  PURGE_POLICY_EVALUATOR_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** 32-byte hex key that encrypts BYOK secrets at rest. No default: a silent all-zero key is worse than a crash. */
   SECRETS_MASTER_KEY: z.string().regex(/^[0-9a-f]{64}$/i, "SECRETS_MASTER_KEY must be 64 hex chars (32 bytes)"),
   /** Dev convenience: seeds a tenant + api key on boot. Refused when NODE_ENV=production. */
@@ -197,6 +207,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS",
     );
   }
+  if (c.PURGE_POLICY_EVALUATOR_RETRY_MAX_MS < c.PURGE_POLICY_EVALUATOR_RETRY_BASE_MS) {
+    throw new Error(
+      "PURGE_POLICY_EVALUATOR_RETRY_MAX_MS must be at least "
+        + "PURGE_POLICY_EVALUATOR_RETRY_BASE_MS",
+    );
+  }
   if (c.ERASURE_WORKER_REQUEST_TIMEOUT_MS <= c.ERASURE_DRAIN_TIMEOUT_MS + ERASURE_REQUEST_TIMEOUT_MARGIN_MS) {
     throw new Error(
       `ERASURE_WORKER_REQUEST_TIMEOUT_MS must be greater than ERASURE_DRAIN_TIMEOUT_MS + ${ERASURE_REQUEST_TIMEOUT_MARGIN_MS}ms`,
@@ -206,12 +222,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     ? undefined
     : validateErasureRouterUrl(c.ERASURE_ROUTER_URL);
   if (
-    (c.ERASURE_WORKER_ENABLED || c.LEGACY_TOMBSTONE_COMPENSATION_ENABLED)
+    (
+      c.ERASURE_WORKER_ENABLED
+      || c.LEGACY_TOMBSTONE_COMPENSATION_ENABLED
+      || c.PURGE_POLICY_EVALUATOR_ENABLED
+    )
     && erasureRouterUrl === undefined
   ) {
     throw new Error(
       "ERASURE_ROUTER_URL is required when ERASURE_WORKER_ENABLED=1 or "
-        + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1",
+        + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1 or PURGE_POLICY_EVALUATOR_ENABLED=1",
     );
   }
   if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.ERASURE_WORKER_ENABLED) {

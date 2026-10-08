@@ -6,6 +6,7 @@ import {
   DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
+  PURGE_POLICY_EVALUATOR_V1,
 } from "@agent-service/protocol";
 
 /**
@@ -245,6 +246,21 @@ export class RunnerRegistry {
     const target = this.targets.get(normalized);
     return this.supportsDataGovernance(normalized)
       && target?.capabilities?.features.dataGovernanceManagement === true;
+  }
+
+  /**
+   * Evaluation writes a durable sealed decision, so every configured stable destination must be
+   * healthy and code-aware before any evaluator may claim work. An unavailable runner is not
+   * silently removed from this rollout boundary.
+   */
+  allConfiguredSupportPurgePolicyEvaluation(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.purgePolicyEvaluation.includes(
+        PURGE_POLICY_EVALUATOR_V1,
+      ) === true
+    ));
   }
 
   /** Existing durable erasure jobs keep running even when admission of new requests is disabled. */

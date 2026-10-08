@@ -1011,10 +1011,17 @@ export type components = {
                 readonly dataGovernance?: readonly ("canonical-retention-v1" | "multi-legal-hold-v1")[];
                 /** @default false */
                 readonly dataGovernanceManagement?: boolean;
+                /**
+                 * @default false
+                 * @enum {boolean}
+                 */
+                readonly dataPurgeExecution?: false;
                 readonly dynamicTools: boolean;
                 /** @default [] */
                 readonly erasureJobControl?: readonly ("quarantine-v1" | "legacy-tombstone-compensation-v1")[];
                 readonly mcp: readonly ("streamable-http" | "stdio")[];
+                /** @default [] */
+                readonly purgePolicyEvaluation?: readonly "policy-evaluator-v1"[];
                 readonly replay: {
                     readonly hotWindowMs: number;
                     /** @enum {boolean} */

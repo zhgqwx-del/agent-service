@@ -1099,6 +1099,13 @@
                 "default": false,
                 "type": "boolean"
               },
+              "dataPurgeExecution": {
+                "default": false,
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              },
               "dynamicTools": {
                 "type": "boolean"
               },
@@ -1122,6 +1129,17 @@
                   ],
                   "type": "string"
                 },
+                "type": "array"
+              },
+              "purgePolicyEvaluation": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "policy-evaluator-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
                 "type": "array"
               },
               "replay": {

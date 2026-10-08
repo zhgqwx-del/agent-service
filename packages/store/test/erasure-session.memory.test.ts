@@ -280,8 +280,52 @@ describe("MemorySessionStore fixed erasure session actions", () => {
       payload: { sessionId: session.id, deletionGeneration: 1 },
     });
     expect(purge).not.toHaveProperty("availableAtMs");
+    await expect(store.claimLifecycleOutbox({
+      topics: ["session.purge"],
+      nowMs: Date.now() + 10,
+      limit: 10,
+      leaseMs: 1_000,
+      claimToken: "memory-purge-must-remain-disabled",
+    })).rejects.toThrow("not claimable by this store");
+    if (!purge) throw new Error("missing dormant purge intent");
+    const dormantPurge = [...store.lifecycleOutbox.values()].find(
+      (row) => row.outboxId === purge.outboxId,
+    );
+    if (!dormantPurge) throw new Error("missing raw dormant purge intent");
+    const ackAtMs = Date.now();
+    dormantPurge.attempts = 1;
+    dormantPurge.claimToken = "legacy-purge-claim";
+    dormantPurge.leaseUntilMs = ackAtMs + 1_000;
+    expect(await store.renewLifecycleOutboxClaim(
+      purge.outboxId,
+      "legacy-purge-claim",
+      { nowMs: ackAtMs, leaseMs: 2_000 },
+    )).toBe(false);
+    expect(await store.completeLifecycleOutbox(
+      purge.outboxId,
+      "legacy-purge-claim",
+      ackAtMs,
+    )).toBe(false);
+    expect(await store.retryLifecycleOutbox(purge.outboxId, "legacy-purge-claim", {
+      failedAtMs: ackAtMs,
+      availableAtMs: ackAtMs + 100,
+      error: "must stay dormant",
+      maxAttempts: 2,
+    })).toBe(false);
+    expect(dormantPurge).toMatchObject({
+      topic: "session.purge",
+      attempts: 1,
+      claimToken: "legacy-purge-claim",
+      leaseUntilMs: ackAtMs + 1_000,
+    });
+    expect(dormantPurge).not.toHaveProperty("availableAtMs");
+    expect(dormantPurge).not.toHaveProperty("completedAtMs");
+    expect(dormantPurge).not.toHaveProperty("deadLetteredAtMs");
+    delete dormantPurge.claimToken;
+    delete dormantPurge.leaseUntilMs;
+    dormantPurge.attempts = 0;
     expect(await store.claimLifecycleOutbox({
-      topics: ["session.tombstoned", "session.purge"],
+      topics: ["session.tombstoned"],
       nowMs: Date.now() + 10,
       limit: 10,
       leaseMs: 1_000,

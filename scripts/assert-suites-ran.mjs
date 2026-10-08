@@ -36,6 +36,7 @@ const requiredTestFiles = [
   "packages/store/test/usage-lifecycle.mysql.test.ts",
   "packages/store/test/subject-lifecycle.mysql.test.ts",
   "packages/store/test/retention-policy.mysql.test.ts",
+  "packages/store/test/erasure-purge-policy.mysql.test.ts",
   "packages/store/test/erasure-job.mysql.test.ts",
   "packages/store/test/erasure-session.mysql.test.ts",
   "packages/store/test/erasure-catalog.mysql.test.ts",

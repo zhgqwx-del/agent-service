@@ -6,6 +6,9 @@ import {
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
   INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
   INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
+  INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
+  INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
+  INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH,
   INTERNAL_ROUTER_TOKEN_HEADER,
 } from "@agent-service/protocol";
 
@@ -25,7 +28,11 @@ vi.mock("@hono/node-server", () => ({
   },
 }));
 
-import { ErasureWorker, LegacyTombstoneCompensationWorker } from "@agent-service/core";
+import {
+  ErasureWorker,
+  LegacyTombstoneCompensationWorker,
+  PurgePolicyEvaluator,
+} from "@agent-service/core";
 import { startRunner } from "../src/main.js";
 
 const MASTER_KEY = "88".repeat(32);
@@ -56,6 +63,8 @@ describe("runner main blob wiring", () => {
           blobAttachments: true,
           userErasureWorker: ["drain-v1"],
           erasureJobControl: ["quarantine-v1"],
+          purgePolicyEvaluation: ["policy-evaluator-v1"],
+          dataPurgeExecution: false,
         },
       });
       expect(runner.erasureWorker).toBeUndefined();
@@ -136,6 +145,63 @@ describe("runner main blob wiring", () => {
       await runner?.close();
       startSpy.mockRestore();
       legacyStartSpy.mockRestore();
+      fetchSpy.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("wires the independent policy evaluator through its dedicated default-off barrier", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-policy-evaluator-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, {
+      status: 204,
+      headers: {
+        [INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER]:
+          INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
+      },
+    }));
+    const startSpy = vi.spyOn(PurgePolicyEvaluator.prototype, "start");
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        PURGE_POLICY_EVALUATOR_ENABLED: "1",
+        PURGE_POLICY_EVALUATOR_POLL_MS: "60000",
+        ERASURE_ROUTER_URL: "http://127.0.0.1:8080",
+        INTERNAL_ROUTER_TOKEN: INTERNAL_TOKEN,
+      });
+      expect(startSpy).toHaveBeenCalledOnce();
+      expect(runner.purgePolicyEvaluator).toBeInstanceOf(PurgePolicyEvaluator);
+      expect(runner.erasureWorker).toBeUndefined();
+      expect(runner.legacyTombstoneCompensationWorker).toBeUndefined();
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: {
+          purgePolicyEvaluation: ["policy-evaluator-v1"],
+          dataPurgeExecution: false,
+        },
+      });
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledOnce());
+      const [input, init] = fetchSpy.mock.calls[0]!;
+      expect(String(input)).toBe(
+        `http://127.0.0.1:8080${INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH}`,
+      );
+      expect(init?.method).toBe("GET");
+      expect(new Headers(init?.headers).get(INTERNAL_ROUTER_TOKEN_HEADER)).toBe(INTERNAL_TOKEN);
+
+      const stopSpy = vi.spyOn(runner.purgePolicyEvaluator!, "stop");
+      const drainSpy = vi.spyOn(runner.host, "drain");
+      await runner.close();
+      expect(stopSpy).toHaveBeenCalledOnce();
+      expect(stopSpy.mock.invocationCallOrder[0]).toBeLessThan(drainSpy.mock.invocationCallOrder[0]!);
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      startSpy.mockRestore();
       fetchSpy.mockRestore();
       log.mockRestore();
       await rm(blobDir, { recursive: true, force: true });

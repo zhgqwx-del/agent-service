@@ -25,6 +25,7 @@ describe("runner configuration", () => {
     expect(cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
     expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED).toBe(false);
+    expect(cfg.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
     expect(cfg.ERASURE_ROUTER_URL).toBeUndefined();
     expect(cfg.ERASURE_WORKER_POLL_MS).toBe(1_000);
     expect(cfg.ERASURE_WORKER_LEASE_MS).toBe(30_000);
@@ -37,6 +38,12 @@ describe("runner configuration", () => {
     expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_BATCH_SIZE).toBe(10);
     expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS).toBe(1_000);
     expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS).toBe(60_000);
+    expect(cfg.PURGE_POLICY_EVALUATOR_POLL_MS).toBe(1_000);
+    expect(cfg.PURGE_POLICY_EVALUATOR_LEASE_MS).toBe(30_000);
+    expect(cfg.PURGE_POLICY_EVALUATOR_BATCH_SIZE).toBe(10);
+    expect(cfg.PURGE_POLICY_EVALUATOR_TARGET_PAGE_SIZE).toBe(100);
+    expect(cfg.PURGE_POLICY_EVALUATOR_RETRY_BASE_MS).toBe(1_000);
+    expect(cfg.PURGE_POLICY_EVALUATOR_RETRY_MAX_MS).toBe(60_000);
     expect(cfg.ERASURE_DRAIN_TIMEOUT_MS).toBe(10_000);
     expect(cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS).toBe(20_000);
     expect(cfg.BLOB_MAX_BYTES).toBe(1_000_000);
@@ -154,6 +161,48 @@ describe("runner configuration", () => {
       LEGACY_TOMBSTONE_COMPENSATION_RETRY_BASE_MS: "2",
       LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS: "1",
     })).toThrow(/LEGACY_TOMBSTONE_COMPENSATION_RETRY_MAX_MS/);
+  });
+
+  it("keeps purge-policy evaluation behind an independent default-off gate", () => {
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      PURGE_POLICY_EVALUATOR_ENABLED: "1",
+    })).toThrow(/ERASURE_ROUTER_URL is required/);
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      PURGE_POLICY_EVALUATOR_ENABLED: "1",
+      ERASURE_ROUTER_URL: "http://router.internal:8080/",
+    });
+    expect(enabled.PURGE_POLICY_EVALUATOR_ENABLED).toBe(true);
+    expect(enabled.ERASURE_WORKER_ENABLED).toBe(false);
+    expect(enabled.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(enabled.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
+    expect(enabled.ERASURE_ROUTER_URL).toBe("http://router.internal:8080");
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      PURGE_POLICY_EVALUATOR_ENABLED: "true",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      PURGE_POLICY_EVALUATOR_POLL_MS: "0",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      PURGE_POLICY_EVALUATOR_LEASE_MS: "99",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      PURGE_POLICY_EVALUATOR_BATCH_SIZE: "101",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      PURGE_POLICY_EVALUATOR_TARGET_PAGE_SIZE: "1001",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      PURGE_POLICY_EVALUATOR_RETRY_BASE_MS: "2",
+      PURGE_POLICY_EVALUATOR_RETRY_MAX_MS: "1",
+    })).toThrow(/PURGE_POLICY_EVALUATOR_RETRY_MAX_MS/);
   });
 
   it("validates lifecycle outbox worker bounds", () => {

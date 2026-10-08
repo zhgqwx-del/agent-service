@@ -12,6 +12,9 @@ import {
   INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
   INTERNAL_ERASURE_JOB_CONTROL_READY_PATH,
   INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH,
+  INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
+  INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
+  INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH,
   INTERNAL_ROUTER_TOKEN_HEADER,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
@@ -92,6 +95,7 @@ function fakeRegistry(
     targetGovernance?: boolean;
     governanceManagement?: boolean;
     targetGovernanceManagement?: boolean;
+    purgePolicyEvaluation?: boolean;
   } = {},
 ): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
@@ -139,6 +143,7 @@ function fakeRegistry(
         : opts.targetWorker ?? opts.worker ?? false
     ),
     allConfiguredSupportErasureJobControl: () => opts.jobControl ?? true,
+    allConfiguredSupportPurgePolicyEvaluation: () => opts.purgePolicyEvaluation ?? false,
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
     routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
@@ -165,6 +170,59 @@ function expectPrivateLifecycleResponse(response: Response): void {
 }
 
 describe("internal user-erasure routing", () => {
+  it("keeps policy-evaluation claims behind their own private fleet barrier", async () => {
+    const target = "http://runner.internal:8787";
+    const enabled = createRouterApp({
+      registry: fakeRegistry([target], { purgePolicyEvaluation: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      purgePolicyEvaluatorEnabled: () => true,
+      logger: silent,
+    });
+
+    for (const headers of [
+      undefined,
+      { [INTERNAL_ROUTER_TOKEN_HEADER]: "wrong-internal-token-000000000000" },
+    ]) {
+      const hidden = await enabled.request(INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH, { headers });
+      expect(hidden.status).toBe(404);
+      expect(hidden.headers.get(INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER)).toBeNull();
+      expectPrivateLifecycleResponse(hidden);
+    }
+
+    const ready = await enabled.request(INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(ready.status).toBe(204);
+    expect(ready.headers.get(INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER)).toBe(
+      INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
+    );
+    expectPrivateLifecycleResponse(ready);
+
+    for (const unavailable of [
+      createRouterApp({
+        registry: fakeRegistry([target], { purgePolicyEvaluation: true }),
+        internalRunnerToken: INTERNAL_TOKEN,
+        logger: silent,
+      }),
+      createRouterApp({
+        registry: fakeRegistry([target], { purgePolicyEvaluation: false }),
+        internalRunnerToken: INTERNAL_TOKEN,
+        purgePolicyEvaluatorEnabled: () => true,
+        logger: silent,
+      }),
+    ]) {
+      const response = await unavailable.request(INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH, {
+        headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      });
+      expect(response.status).toBe(503);
+      expect(response.headers.get(INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER)).toBeNull();
+      expectPrivateLifecycleResponse(response);
+    }
+    expect((await enabled.request(`${INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH}/extra`, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    })).status).toBe(404);
+  });
+
   it("keeps the job-control readiness route private and ACKs only a homogeneous configured fleet", async () => {
     const target = await upstream(() => ({ body: "{}" }));
     const capable = createRouterApp({
@@ -1098,9 +1156,13 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"], dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"], dataGovernanceManagement: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone", "purge"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"], dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"], dataGovernanceManagement: true, purgePolicyEvaluation: ["policy-evaluator-v1"], dataPurgeExecution: false, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
-      registry: fakeRegistry([a.url], { blobs: true, worker: true }),
+      registry: fakeRegistry([a.url], {
+        blobs: true,
+        worker: true,
+        purgePolicyEvaluation: true,
+      }),
       tombstoneEnabled: () => true,
       blobAttachmentsEnabled: () => true,
       erasureRequestsEnabled: () => true,
@@ -1108,7 +1170,7 @@ describe("operational endpoints", () => {
       internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
-    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[]; erasureJobControl: string[]; dataGovernance: string[]; dataGovernanceManagement: boolean } };
+    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[]; erasureJobControl: string[]; dataGovernance: string[]; dataGovernanceManagement: boolean; purgePolicyEvaluation: string[]; dataPurgeExecution: boolean } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
@@ -1119,6 +1181,8 @@ describe("operational endpoints", () => {
     expect(caps.features.erasureJobControl).toEqual([]);
     expect(caps.features.dataGovernance).toEqual(["canonical-retention-v1", "multi-legal-hold-v1"]);
     expect(caps.features.dataGovernanceManagement).toBe(true);
+    expect(caps.features.purgePolicyEvaluation).toEqual(["policy-evaluator-v1"]);
+    expect(caps.features.dataPurgeExecution).toBe(false);
 
     const noToken = createRouterApp({
       registry: fakeRegistry([a.url], { worker: true }),

@@ -26,6 +26,7 @@ import {
   UserErasureDrainRequest,
   idSchema,
   PROTOCOL_VERSION,
+  PURGE_POLICY_EVALUATOR_V1,
   RetentionPolicyActivateRequest,
   RetentionPolicyParams,
 } from "../src/index.js";
@@ -159,6 +160,43 @@ describe("protocol schemas", () => {
     expect(parsed.features.erasureJobControl).toEqual([]);
     expect(parsed.features.dataGovernance).toEqual([]);
     expect(parsed.features.dataGovernanceManagement).toBe(false);
+    expect(parsed.features.purgePolicyEvaluation).toEqual([]);
+    expect(parsed.features.dataPurgeExecution).toBe(false);
+  });
+
+  it("separates non-destructive policy evaluation from physical purge execution", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    const aware = Capabilities.parse({
+      ...base,
+      features: {
+        ...base.features,
+        purgePolicyEvaluation: [PURGE_POLICY_EVALUATOR_V1],
+      },
+    });
+    expect(aware.features.purgePolicyEvaluation).toEqual([PURGE_POLICY_EVALUATOR_V1]);
+    expect(aware.features.dataPurgeExecution).toBe(false);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: { ...base.features, purgePolicyEvaluation: ["future-evaluator-v2"] },
+    }).success).toBe(false);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: { ...base.features, dataPurgeExecution: true },
+    }).success).toBe(false);
   });
 
   it("accepts only the cumulative canonical retention and multi-hold capabilities", () => {

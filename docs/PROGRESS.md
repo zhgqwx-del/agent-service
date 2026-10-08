@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、admission 默认关闭的 durable user-erasure gate/queue/worker、legacy generation `0` 补偿，以及 canonical retention policy / multi legal hold 管理面已完成。`0015` 增加不可变策略版本、generation-CAS activation、tenant/user 多 hold 账本与 append-only audit；新 erasure request 在线性化点绑定 active policy，数据库 guard 会在 activation 后拒绝 pre-`0015` writer 的空/错误绑定，旧 backlog 不被事后改写。迁移不创建默认策略，管理 gate 默认关闭，任何 duration 都尚未启用 purge。异步 export artifact/TTL、tenant erasure及 key/provider/auth-secret 撤销、policy evaluator、默认关闭的 ready/session purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、admission 默认关闭的 durable user-erasure gate/queue/worker、legacy generation `0` 补偿、canonical retention policy / multi legal hold管理面，以及默认关闭的非破坏性purge-policy evaluator/authority substrate已完成。`0016`只建立claim-bound evaluation job、按build generation不可变的per-session target、rooted decision chain与不可执行authority；双端gate默认关闭，`dataPurgeExecution=false`且completion固定为false。live evidence或hold ABA会撤销active projection并以新generation重评，但deadline仍使用runner wall clock，target也不是全部内容行清单。异步 export artifact/TTL、tenant erasure及 key/provider/auth-secret 撤销、可信时钟/owner-scan content receipt、ready/session物理purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -417,3 +417,32 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - `0015`应在management/admission关闭时先迁移，再滚动code-aware runner/router，最后才开启各runner及router管理gate。首个policy activation或canonical hold event提交后不可回退pre-`0015` writer，只能保留证据并forward-fix。固定N-1旧镜像canary、独立production migration Job、runtime最小数据库权限与真实Kubernetes rollout仍属于M4/真实环境工作。
 - app-level append-only校验和数据库trigger不能抵御拥有DDL/TRUNCATE权限的主体；生产必须把migration identity与runtime identity分离。当前filesystem Blob仍只承诺单runner本地语义，不能在无共享对象存储时开启多VM/Pod物理purge。
 - 下一独立切片实现policy evaluator与默认关闭、不可领取的purge authority substrate：先证明到期计算、hold复核、request-bound policy及完成证明，不在缺少共享对象存储、恢复门禁和显式激活的情况下执行不可逆删除。随后收口export、tenant/key撤销与restore replay，M1闭环后再正式进入M3。
+
+## 2026-10-09（M1 数据生命周期：0016 非破坏性 purge-policy evaluator / authority）
+
+### 已完成
+
+1. 新增expand-only、destructive-dormant的`0016_erasure_purge_policy_authority.sql`：durable evaluation job、按build generation不可变的per-session target、rooted append-only decision chain、generation-CAS authority control和append-only authority。migration不回填历史`awaiting_purge_policy`、不设置`purge_after_ms`、不开放`session.purge`或ready Blob delete、不匿名化/删除数据，也不推进request到`purging/completed`。
+2. Memory/MySQL在普通erasure worker把request从`reconciling_usage`推进到`awaiting_purge_policy`的同一原子边界创建generation 1 evaluation job；phase、main audit与job任一步失败都整体回滚。历史awaiting row由新scheduler显式补排，并发scheduler通过request/job锁与唯一身份只建立一个build。
+3. evaluation job使用build generation、attempt、claim token和lease防stale/ABA worker；分页target以session id keyset推进并形成root hash。证据只包含request-bound policy下的tombstone generation/time、session content deadline、ready Blob count/root/deadline、usage reconciliation状态/checksum/deadline、receipt count/deadline，以及固定的billing fact/lifecycle audit retained与export not-applicable分类，不复制正文或物理locator。
+4. 每次seal把`unbound/invalid/unconfigured/held/waiting/eligible_execution_disabled`之一追加到不可变hash chain；只有最后一种会追加authority并推进active projection。authority/control故意没有availability、claim或lease，evaluator也没有SessionStore、lifecycle outbox、Blob delete、usage anonymize或erasure phase-transition接口；protocol明确发布`dataPurgeExecution=false`，completion readiness固定`complete=false`。
+5. seal重新读取owner-scoped inventory、request-bound immutable policy以及tenant/user hold generation/projection。build中session/usage/receipt/Blob evidence漂移会以`evidence_changed`释放claim、递增build generation并从空cursor/root重建；sealed结果后的live evidence变化或hold set/release ABA会清除旧active projection并调度新generation，旧target/decision/authority不被覆写。validated read还会重算hash chain、owner与live root，损坏或过期证据fail closed。
+6. runner内嵌独立`PurgePolicyEvaluator`，只依赖最小`ErasurePolicyEvaluationStore`；按原子target page响应shutdown，不会在partial build后seal。runner/router的`PURGE_POLICY_EVALUATOR_ENABLED`均默认`0`；worker每次schedule/claim前请求token-protected专用固定ACK，router只有在自身gate开启且全部configured稳定runner当前健康、声明`policy-evaluator-v1`时放行。公开`purgePolicyEvaluation`表示代码感知，不代表worker或执行面已激活。
+7. 冻结`mysql-0015.sql`历史库并新增独立`0015 → 0016`真实MySQL夹具，覆盖升级前数据、完整升级、partial DDL/marker-loss replay、append-only trigger轮换、升级后同key异内容写入被拒且原证据保留，以及purge继续休眠。`pnpm test:migrations`清单、CI、runner image marker和本地`verify`已接到0016；`pnpm test:erasure-purge-policy-mysql`作为named no-skip真实InnoDB门禁，主JSON report也要求目标文件确实执行。
+8. README、架构/生命周期设计、部署runbook和长期学习指南已同步：evaluator仍是runner内部循环，不新增第三个服务或镜像；本地可显式开启双端gate观察job/decision/authority，GitHub Actions仍只构建runner/router两个Node bundle和两个Linux OCI候选镜像。
+
+### 本轮验证
+
+- `pnpm check:secrets`通过，扫描 **259 files**；`pnpm check:api`、`pnpm check:sdk`、`pnpm typecheck`与`git diff --check`通过，生成OpenAPI/SDK无漂移，SDK真实 **18-file** package在隔离consumer中验证。
+- evaluator Memory **17/17**、core **9/9**；generic transition/outbox hardening相关Memory三文件 **31/31**，真实MySQL lifecycle outbox **11/11**。router/runner/protocol的barrier、capability、HTTP与启停定向套件均通过。
+- 命名的真实MySQL purge-policy套件 **14/14**，required wrapper明确证明目标文件实际执行且无skip；固定九文件历史迁移 **34/34**，其中`0015 → 0016` **5/5**，覆盖冻结0015库、完整升级、DDL双中断/marker-loss重放、升级后真实evaluator，以及升级后同key异内容写入被拒且原证据保留。`0007 → 0008`的相同usage合并、冲突阻断与legacy pending receipt保留仍在同一必跑链中。
+- `scripts/local-service.sh verify`主套件 **861 passed / 1 skipped**；唯一skip是真实厂商E2E的显式开关。覆盖率 **84.86% statements / 79.52% branches / 88.33% functions / 88.84% lines**，全部超过门槛；cluster **14/14**；runner/router两个独立Node 24 bundle、SDK package、readiness、转发与OpenAPI门禁通过。
+- 从并发正确性、事务回滚、滚动升级、安全隔离和测试有效性复核，无剩余P0–P2。独立复核促成并验证了scheduler/claim poison不饿死邻居、Memory seal ABA二次授权、policy时钟clamp、target字段/hash/owner校验、foreign reconciliation字段隔离、通用transition证明面关闭及两端outbox topic ACK门禁。本轮不改变provider dialect或真实厂商网络契约，因此没有重复运行收费的`verify-real`或acceptance；最近真实模型 **1/1** 与十阶段acceptance只保留为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2本地/CI冻结结论不变，本轮仍属于M1，没有提前开始M3。`eligible_execution_disabled`这个名字故意表达“policy候选条件已满足，但执行关闭”；它不是purge license，也不会改变公开request仍为`awaiting_purge_policy`。
+- 当前eligibility使用runner记录的wall clock；虽然单条control/audit时间会单调clamp，但跨VM forward/slow skew尚未由共享数据库/可信时间在线性化点重验。future destructive executor必须使用数据库时间或等价可信clock重新证明deadline，不能直接相信0016 authority的时间判断。
+- target是per-session policy摘要而非turns/items/events/approvals全量内容清单，无法排除孤儿正文。未来执行事务必须owner-scan并提交`session_content_receipts`，同时补齐ready Blob physical ACK、operational usage anonymization、idempotency receipt与Redis清理、provider/auth secret撤销、独立restore-ledger ACK；上述proof全部缺失时completion保持false。
+- 两项非阻断P3留到后续运维/性能切片：MySQL scheduler的初选会把缺失或损坏latest decision的sealed job安全地排除但不会主动quarantine/告警；同一查询当前也没有due水位或分页，长期稳定backlog会被每轮全量复核。它们不会生成authority或启用purge，但M4需补poison可观测性、due index/水位与有界扫描。
+- M1仍需异步export artifact/download/TTL、tenant erasure及key/provider/auth-secret撤销、默认关闭且分权的ready/session destructive executor、completed proof与独立故障域restore replay。完成这些local/CI可验证范围后再正式进入M3；真实共享对象存储、KMS/Secret、Kubernetes rollout、域名/TLS和云MySQL/Redis拓扑继续等待实际资源，不能编造。

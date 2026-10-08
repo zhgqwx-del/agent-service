@@ -39,6 +39,21 @@ export const INTERNAL_ERASURE_JOB_CONTROL_READY_PATH = "/_internal/user-erasure-
 export const INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER = "x-agent-service-erasure-job-control" as const;
 export const INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE = "job-control-v2" as const;
 
+/**
+ * A policy evaluator probes this router-only endpoint before every durable queue claim. Evaluation
+ * is deliberately separate from physical purge: the ACK only authorizes producing a sealed,
+ * non-destructive policy decision, never advancing an erasure request or making delete work ready.
+ */
+export const INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH =
+  "/_internal/purge-policy-evaluation-v1/ready" as const;
+export const INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER =
+  "x-agent-service-purge-policy-evaluation" as const;
+export const INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE = "policy-evaluator-v1" as const;
+
+export const PURGE_POLICY_EVALUATOR_V1 = "policy-evaluator-v1" as const;
+export const PurgePolicyEvaluationCapability = z.literal(PURGE_POLICY_EVALUATOR_V1);
+export type PurgePolicyEvaluationCapability = z.infer<typeof PurgePolicyEvaluationCapability>;
+
 export const ERASURE_JOB_CONTROL_QUARANTINE_V1 = "quarantine-v1" as const;
 export const ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1 = "legacy-tombstone-compensation-v1" as const;
 export const ErasureJobControlCapability = z.enum([
@@ -97,6 +112,10 @@ export const Capabilities = z.object({
     dataGovernance: z.array(DataGovernanceCapability).max(2).default([]),
     /** The admin management endpoints are enabled on this runner; still never implies purge. */
     dataGovernanceManagement: z.boolean().default(false),
+    /** Code understands the sealed, non-destructive purge-policy evaluation contract. */
+    purgePolicyEvaluation: z.array(PurgePolicyEvaluationCapability).max(1).default([]),
+    /** Reserved execution signal. It remains false until a separate destructive rollout exists. */
+    dataPurgeExecution: z.literal(false).default(false),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

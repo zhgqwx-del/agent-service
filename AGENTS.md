@@ -16,7 +16,9 @@
 - M1 核心运行范围、OpenAPI 3.1 与生成 TypeScript SDK 已完成；完整数据生命周期仍未闭环。
 - M2 的本地/CI 代码范围已完成并正式冻结；尚未正式进入 M3，云上部署不属于本次冻结范围。
 - M3 的 MCP/skills/hooks 主体和 M4 的生产化主体尚未开始。
-- session 创建与首事件原子化、`0007 -> ... -> 0015` 历史升级夹具、OpenAPI/SDK、Archive/tombstone/outbox、Blob ownership/业务接线、staging orphan 清理、legacy generation `0` 补偿，以及 canonical retention policy / multi legal hold 管理面已收口。`0015` 不提供默认策略，不启用 purge；策略版本不可变、activation 使用 generation CAS，tenant/user hold 使用多记录账本和 append-only audit。新 erasure request 在 admission 线性化点绑定已激活策略，MySQL INSERT guard会在 activation 后拒绝 pre-0015 writer 的空/错误绑定；旧 backlog 不事后补绑。异步 export artifact/TTL、tenant erasure与 key/provider/auth secret撤销、policy evaluator、默认关闭的 ready/session purge、完成证明与 restore replay仍未完成。M1尚未闭环，完成后再正式进入 M3。
+- session 创建与首事件原子化、`0007 -> ... -> 0016` 历史升级夹具、OpenAPI/SDK、Archive/tombstone/outbox、Blob ownership/业务接线、staging orphan 清理、legacy generation `0` 补偿、canonical retention policy / multi legal hold 管理面，以及非破坏性的 purge-policy evaluator/authority substrate 已收口。`0016` 只建立 claim/lease evaluation job、按 build generation 不可变的 per-session target evidence、rooted decision chain 和不可执行 authority；双端 `PURGE_POLICY_EVALUATOR_ENABLED` 默认关闭，公开 capability 固定声明 `dataPurgeExecution=false`。异步 export artifact/TTL、tenant erasure与 key/provider/auth secret撤销、ready/session 物理 purge、完成证明与 restore replay仍未完成。M1尚未闭环，完成后再正式进入 M3。
+- evaluator 的 `eligible_execution_disabled` 只是候选证据，不是删除许可：当前 deadline 使用 runner 记录的 wall clock，target 也不是 turns/items/events/approvals 的完整内容清单；未来 destructive executor 必须用共享数据库/可信时间重验，并以 owner-scan + `session_content_receipts` 证明内容完整性。completion 固定为 `false`，live evidence 或 tenant/user hold generation/projection 变化会撤销当前投影并以新 build generation 重评。
+- 通用 erasure transition 类型与实现都不能表达 `purging/completed` 或 caller-supplied completion proof；lifecycle outbox 的 claim/renew/complete/retry 只接受 `session.tombstoned`，即使旧版或异常进程曾给 `session.purge` 写入 claim token，也不能经通用 ACK 面续租、完成或重试。
 - `DATA_ERASURE_REQUESTS_ENABLED` 在 runner/router 默认 `0`，只控制新 request admission；`ERASURE_WORKER_ENABLED` 与它独立，本地默认 `1`，使已持久化 job 即使关闭 admission 也继续走到安全策略边界。POST 需要 router gate、全部 configured targets 健康且支持；status GET 不依赖 router writer gate，但仍按 healthy fleet/selected target capability fail-closed。任一 request 首次接受后，关闭 gate 不能撤销 durable subject gate，也不能回退到 pre-`0011`/lifecycle-unaware runner；必须 forward-fix。不得把 `awaiting_purge_policy` 描述为擦除完成，也不得擅自启用 tenant erasure、usage anonymize 或不可逆 purge。
 - `DATA_GOVERNANCE_MANAGEMENT_ENABLED` 在 runner/router 默认 `0`。`dataGovernance` 表示 writer代码理解 policy/hold，`dataGovernanceManagement` 才表示管理端点已开启；两者不能混用。管理 API只允许 admin service key，所有响应 no-store；activation 提交即生效，不支持把 runner wall clock当作未来调度器。首次 policy activation或canonical hold event后不得回退pre-`0015` writer，只能forward-fix。
 - erasure POST/status 的所有成功与错误响应必须保持 `Cache-Control: no-store`；usage 的公开 `costCNY` 只表示完整总成本，mixed known/unknown 不得返回已知小计，硬成本上限不得把 unknown 当作 `0`。已完成的 anonymize 重试可在后来出现 legal hold 时幂等返回，但 hold 必须阻止尚未发生的 `verified -> anonymized` 转换。
@@ -44,6 +46,7 @@ pnpm test:migrations
 pnpm test:usage-lifecycle-mysql
 pnpm test:subject-lifecycle-mysql
 pnpm test:retention-policy-mysql
+pnpm test:erasure-purge-policy-mysql
 pnpm test:erasure-job-mysql
 pnpm test:erasure-session-mysql
 pnpm test:erasure-catalog-mysql
