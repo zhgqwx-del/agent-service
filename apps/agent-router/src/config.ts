@@ -18,7 +18,10 @@ const Env = z.object({
   BLOB_FILESYSTEM_SINGLE_RUNNER: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** Explicit expand→activate gate for blob writes across the whole healthy fleet. */
   BLOB_ATTACHMENTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
-  /** waiting for upstream HEADERS only; the SSE body is never subject to it */
+  /**
+   * Waiting for upstream HEADERS only; the SSE body is never subject to it. Deployment invariant:
+   * Host erasure drain bound < this timeout < runner worker-to-router request timeout.
+   */
   UPSTREAM_HEADER_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
   /** enables /_router/* when set */
   ROUTER_ADMIN_TOKEN: z.string().optional(),

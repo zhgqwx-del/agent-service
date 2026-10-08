@@ -11,3 +11,4 @@ export * from "./session/host.js";
 export * from "./blob/service.js";
 export * from "./lifecycle/outbox-dispatcher.js";
 export * from "./lifecycle/blob-cleanup-worker.js";
+export * from "./lifecycle/erasure-worker.js";

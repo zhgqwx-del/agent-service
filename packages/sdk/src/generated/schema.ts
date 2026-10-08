@@ -836,6 +836,8 @@ export type components = {
                 readonly skills: boolean;
                 /** @enum {boolean} */
                 readonly streaming: true;
+                /** @default [] */
+                readonly userErasureWorker?: readonly "drain-v1"[];
             };
             /** @enum {string} */
             readonly protocolVersion: "2026-10-08";

@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle，以及默认关闭的 user erasure durable gate/request/status 和 usage operational/billing 双写、reconcile/anonymize primitive 已完成；异步 export artifact/TTL、erasure worker 状态推进、tenant erasure/key revocation、legacy generation `0` 补偿和默认关闭的 ready/session purge 仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层，以及 admission 默认关闭的 durable user-erasure gate/queue/worker 已完成。worker 可跨 runner drain、child-first tombstone、原子重验 tombstone proof并 reconcile usage，安全停在 `awaiting_purge_policy`；异步 export artifact/TTL、claim-stage poison quarantine/repair、tenant erasure/key revocation、legacy generation `0` 补偿、policy-gated ready/session purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -305,3 +305,31 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - export 尚无异步 job、一致性 ownership snapshot、artifact ownership、下载 API、TTL 或删除任务；不能以同步大 JSON 替代完整 export。
 - usage 已有安全 primitive，但自动任务、政策化 operational/billing 保留期、长期字段白名单治理和审计管理面仍待完成。legacy `deletion_generation = 0` 补偿以及默认关闭的 ready/session physical purge 仍是后续工作。
 - MySQL 投影已避免把整份 ledger 拉入 Node，并保证同一快照正确性；当前聚合仍会按 `(session_id, ...)` 索引扫描长 session 的 ledger。M4 前应基于真实长会话做基准并决定是否增加事务维护的物化汇总，但不得以牺牲 unknown/owner fail-closed 语义换取性能。
+
+## 2026-10-08（M1 数据生命周期：durable erasure worker 到安全策略边界）
+
+### 已完成
+
+1. 新增 expand-only `0012_erasure_job_queue.sql`：为 `erasure_requests` 增加 availability、attempt、claim token/lease、bounded error 与 immutable policy identity，并用 restart-safe trigger/backfill 让迁移后残留的 0011 writer 新建 gate 可领取。迁移不激活 purge，不覆盖 future retry/live claim；固定 0011 历史夹具覆盖完整状态、partial DDL、错误索引、marker-loss replay、legal hold 与不可领取 purge intent。
+2. Memory/MySQL 实现最小权限 durable queue：claim、lease renew、phase transition、retry、attempt+token+lease 防 ABA，以及 request row 与无正文 audit 的原子更新。exact lease boundary、并发 claim、stale transition、audit INSERT 失败回滚、subject completion 与 owner/generation/audit corruption 均有真实 MySQL 回归。
+3. 新增 claim-bound fixed session actions 和 content-free catalog。worker 只能 fence、固定 settle 与 tombstone，不能提交任意 patch/正文/usage；catalog 按 owner/generation/phase 分页，draining 枚举全部 live session，tombstoning 只给 child-first live leaves，reconciliation 返回最小 tombstone proof 与 completeness counts。MySQL 使用 owner-scoped composite index锁定，跨 tenant/user 查询不锁住真实 owner 行。
+4. runner 内嵌、与 request admission 独立的 worker 已实现 `gated → draining → tombstoning → reconciling_usage → awaiting_purge_policy`。批量 claim 后每个 job立即独立 heartbeat，停机只在安全边界停止；失败只持久化 bounded code。成功不会调用 anonymize、领取 `session.purge`、删除 ready Blob/content/receipt，或标记 request `completed`。
+5. 跨 runner drain 使用版本化私有 `drain-v1` 路径和同一内部 token；router 只选 configured、healthy、capable target，owner 409 至多重路由一次，内部 claim/拓扑/header不会回显。active turn 在 claim+session fence 线性化后收到 abort；若默认 10s 内仍未停止，旧 runner 不再 acquire/renew但也不主动释放 session lease。router只有在 Redis 明确确认 owner不存在时才绕过；owner仍存在或 Redis状态未知时 fail-closed，lease到期后由更高 fence接管。默认超时严格保持 Host 10s < Router 15s < Worker 20s。
+6. usage reconciliation 现在与 erasure claim属于同一原子边界。catalog proof只做早期无正文筛查；Memory在单进程同步临界区、MySQL在同一事务中重新锁定 session→subject→request并验证 marker、terminal `session/deleted`、`session.tombstoned` 与从未激活的 `session.purge`，然后才分配 legacy usage id、写 billing fact/reconciliation。proof、usage identity或reconciliation确定性冲突进入 `blocked/integrity_conflict`；未知数据库/网络错误保持 retryable，任何冲突都不会留下部分 ID、fact 或 reconciliation。
+7. 最终 review 另收口两个 fail-closed 缺口：MySQL live session若意外带正 `deletion_generation` 或非空 `purge_after_ms`，固定 action在任何写入前回滚，不能静默覆盖 marker；`applyErasureSessionAction` 在首次 await前克隆完整输入，避免锁等待期间的 mutable-input TOCTOU。真实 MySQL测试证明 fence、seq、事件、outbox与 marker均无部分写入。
+8. 本地/CI execution proof已扩展：四个 erasure store专项命令不得 skip，主 JSON report还必须证明真实 MySQL worker文件执行；历史 migration wrapper使用固定五文件 manifest，缺失或未登记夹具都会失败。cluster新增双 runner remote drain、owner `SIGKILL`、Redis lease绝对过期时间不被重试刷新、过期后更高 fence takeover，以及完整 no-purge断言。OpenAPI、运行时常量和生成 SDK已同步 `userErasureWorker: ["drain-v1"]` capability。
+
+### 本轮验证
+
+- `pnpm check:secrets`：通过，扫描 **228 files**；`pnpm check:api`、`pnpm typecheck` 与 `git diff --check` 通过，生成 OpenAPI/SDK无漂移。
+- Memory/core/protocol定向套件 **108/108 passed**；最终审查修复后的 core worker **38/38**、真实 MySQL erasure session **18/18**、真实 MySQL worker **7/7**。
+- 固定历史 MySQL migration suites **9/9 passed**，真实执行 `0007 → 0008 → 0009 → 0010 → 0011 → 0012`；每个冻结夹具均由 report证明实际执行。
+- `scripts/local-service.sh verify`：主套件 **652 passed / 1 skipped**；覆盖率 **85.33% statements / 79.03% branches / 86.65% functions / 89.83% lines**；cluster **13/13 passed**；SDK真实18-file package和 runner/router原生 Node bundle的启动、readiness、转发及 OpenAPI深比较通过。
+- 本轮不改变真实 provider dialect或厂商网络契约，因此没有重复运行收费的 `verify-real` 或 acceptance；最近真实模型 **1/1** 与十阶段 acceptance仍只作为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2冻结结论不变，本轮没有开始M3；M1仍不能冻结。`awaiting_purge_policy`只是安全的非破坏边界，不是用户数据已擦除。
+- 当前最重要的正确性缺口是 claim-stage poison：`0012` 在锁内发现 request/subject/audit/idempotency/queue结构损坏时会回滚整批，同一最早候选可能持续饿死有效邻居。下一独立切片是 `0013_erasure_job_control.sql`：保留原 phase的 durable quarantine overlay、append-only control audit、control generation/evidence hash CAS，以及固定配方、最小权限的 repair/resume；不能 catch-and-skip、直接改表或伪造普通主 audit链。
+- 当前 non-destructive worker仍会领取意外 `purging` 并将其 fail-closed为 `policy_unavailable`。未来激活真正 purge worker前必须先升级并排空所有0012 worker、等待最大 job lease过期，再使用独立 policy activation与purge authority。
+- `0013`之后仍需依次完成 legacy generation `0`补偿、canonical policy/legal-hold管理与默认关闭的purge substrate、export artifact/download/TTL、tenant key/provider/auth secret revocation、completed proof和独立故障域 restore replay；不可逆 purge只能在策略与真实共享对象存储确定后单独激活。

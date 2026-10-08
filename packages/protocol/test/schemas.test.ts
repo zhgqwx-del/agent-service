@@ -17,6 +17,7 @@ import {
   emptyUsageAccumulator,
   mergeLimits,
   StartTurnRequest,
+  UserErasureDrainRequest,
   idSchema,
   PROTOCOL_VERSION,
 } from "../src/index.js";
@@ -146,6 +147,21 @@ describe("protocol schemas", () => {
       },
     });
     expect(parsed.features.dataErasureRequests).toBe(false);
+    expect(parsed.features.userErasureWorker).toEqual([]);
+  });
+
+  it("keeps the internal erasure drain contract claim-only and strict", () => {
+    const authority = {
+      tenantId: "tenant-a",
+      userId: "user-a",
+      requestId: "erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+      subjectGeneration: 1,
+      claimToken: "worker.claim-1",
+      claimAttempt: 2,
+    };
+    expect(UserErasureDrainRequest.parse(authority)).toEqual(authority);
+    expect(UserErasureDrainRequest.safeParse({ ...authority, phase: "tombstoning" }).success).toBe(false);
+    expect(UserErasureDrainRequest.safeParse({ ...authority, claimToken: "unsafe token" }).success).toBe(false);
   });
 
   it("rejects unknown item types", () => {

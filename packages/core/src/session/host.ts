@@ -29,6 +29,9 @@ import type {
   BlobManifestStore,
   BlobObject,
   CommitBatch,
+  ErasureSessionHead,
+  ErasureSessionStore,
+  ErasureWriteAuthorization,
   EventBus,
   EventListener,
   IdempotencyReceiptInput,
@@ -114,10 +117,14 @@ export interface SessionHostConfig {
    * active when Blob writes are gated off, offload is disabled, or no Blob service is installed.
    */
   maxDurableToolOutputBytes?: number;
+  /** Bounded wait for a local provider/tool execution to acknowledge a subject-erasure abort. */
+  erasureDrainTimeoutMs?: number;
 }
 
 export interface SessionHostDeps {
   store: SessionStore & Partial<BlobManifestStore>;
+  /** Separate gate-aware capability; defaults to store only when that adapter implements it. */
+  erasureStore?: ErasureSessionStore;
   /** Optional data-plane adapter. Required before image writes or tool-output offload can be enabled. */
   blobs?: SessionBlobService;
   /** optional: without one, long sessions fall back to cheap pruning only */
@@ -130,6 +137,19 @@ export interface SessionHostDeps {
   skills?: SkillSource;
   config: SessionHostConfig;
   logger?: Pick<Console, "info" | "warn" | "error">;
+}
+
+/**
+ * Internal control-plane signal: an earlier erasure call already fenced this runner's local turn,
+ * but the provider/tool has not stopped yet. Retrying on this runner must not re-acquire the same
+ * lease owner and refresh its TTL; the router waits for expiry before selecting another runner.
+ */
+export class ErasureLocalTurnFencedError extends ApiError {
+  override readonly name = "ErasureLocalTurnFencedError";
+
+  constructor() {
+    super("session_busy", "local execution is already fenced and still draining");
+  }
 }
 
 interface ActiveTurn {
@@ -183,6 +203,8 @@ interface ActiveTurn {
   pendingSteers: EngineInputPart[][];
   /** makes timeout/drain/lease-loss cleanup safe when more than one stop signal races */
   finishPromise?: Promise<void>;
+  /** Set only when a subject-erasure abort exceeded its configured local drain deadline. */
+  erasureDrainTimedOut?: boolean;
 }
 
 /**
@@ -268,6 +290,10 @@ export class SessionHost {
     if (threshold > this.maxDurableToolOutputBytes) {
       throw new Error("toolOutputBlobThresholdBytes must not exceed maxDurableToolOutputBytes");
     }
+    if (
+      deps.config.erasureDrainTimeoutMs !== undefined
+      && (!Number.isSafeInteger(deps.config.erasureDrainTimeoutMs) || deps.config.erasureDrainTimeoutMs <= 0)
+    ) throw new Error("erasureDrainTimeoutMs must be a positive safe integer");
   }
 
   get cfg() {
@@ -534,6 +560,259 @@ export class SessionHost {
    */
   async deleteSession(principal: Principal, sessionId: string): Promise<void> {
     return this.serialiseSessionStart(sessionId, () => this.deleteSessionLocked(principal, sessionId));
+  }
+
+  /**
+   * Internal draining-phase operation. It proves the worker claim under the session fence and stops
+   * only execution owned by this runner. Durable orphan repair and tombstoning belong to the later
+   * tombstoning phase and are intentionally not performed here.
+   */
+  async drainSessionForErasure(
+    authority: ErasureWriteAuthorization,
+    sessionId: string,
+  ): Promise<void> {
+    return this.serialiseSessionStart(
+      sessionId,
+      () => this.drainSessionForErasureLocked(authority, sessionId),
+    );
+  }
+
+  /**
+   * Internal user-erasure path. Unlike public DELETE, this can see a gated subject, but every read
+   * and commit is bound to the worker's live durable claim. It deliberately remains outside the
+   * HTTP/public SessionStore surface.
+   */
+  async eraseSessionForErasure(
+    authority: ErasureWriteAuthorization,
+    sessionId: string,
+  ): Promise<void> {
+    return this.serialiseSessionStart(
+      sessionId,
+      () => this.eraseSessionForErasureLocked(authority, sessionId),
+    );
+  }
+
+  private getErasureStore(): ErasureSessionStore {
+    const candidate = this.deps.erasureStore ?? this.deps.store as SessionStore & Partial<ErasureSessionStore>;
+    if (
+      typeof candidate.getErasureSessionHead !== "function"
+      || typeof candidate.applyErasureSessionAction !== "function"
+    ) throw new Error("this runner has no erasure session store");
+    return candidate as ErasureSessionStore;
+  }
+
+  private assertErasureHead(
+    head: ErasureSessionHead,
+    authority: ErasureWriteAuthorization,
+    sessionId: string,
+  ): void {
+    if (
+      head.sessionId !== sessionId
+      || head.tenantId !== authority.tenantId
+      || head.userId !== authority.userId
+      || typeof head.deleted !== "boolean"
+      || !Number.isSafeInteger(head.deletionGeneration)
+      || head.deletionGeneration < 0
+    ) throw new Error("erasure session head owner mismatch");
+  }
+
+  private async readErasureHead(
+    store: ErasureSessionStore,
+    authority: ErasureWriteAuthorization,
+    sessionId: string,
+  ): Promise<ErasureSessionHead | null> {
+    const head = await store.getErasureSessionHead(authority, sessionId);
+    if (head) this.assertErasureHead(head, authority, sessionId);
+    return head;
+  }
+
+  /** Stop local execution without letting its ordinary, now-gated commit path write again. */
+  private async drainLocalTurnForErasure(state: ActiveTurn): Promise<void> {
+    const wasReserved = state.phase === "reserved";
+    state.stopReason = "interrupted";
+    state.closingRequested = true;
+    // The gate is already durable. Marking this state fenced prevents a late provider/tool result
+    // from attempting an ordinary commit; the fixed erasure action repairs durable state below.
+    state.fenced = true;
+    this.failPendingApprovals(state, "cancel");
+    state.abort.abort();
+    if (wasReserved) {
+      void this.finishTurn(state, { steps: 0, aborted: true }).catch((error) => {
+        const name = error instanceof Error ? error.name : "unknown error";
+        this.log.error(`[session ${state.session.id}] erasure pre-run cleanup failed (${name})`);
+      });
+    }
+
+    const timeoutMs = this.deps.config.erasureDrainTimeoutMs ?? 10_000;
+    let timer: NodeJS.Timeout | undefined;
+    const stopped = await Promise.race([
+      state.done.then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (stopped) return;
+
+    // A provider which ignores AbortSignal must not keep renewing forever. Do not release the lease:
+    // expiry plus the next fence is what prevents this still-running process from becoming a writer.
+    state.erasureDrainTimedOut = true;
+    state.leaseGuard.stop();
+    throw new ApiError("session_busy", "active turn did not stop before the erasure drain deadline", {
+      turnId: state.turn.id,
+    });
+  }
+
+  /**
+   * Common claim/lease boundary for draining and tombstoning. No local execution is disturbed until
+   * the authority and fence have linearized together. The callback runs only after local execution
+   * has stopped, while this runner still owns and renews the session lease.
+   */
+  private async withClaimedErasureSession(
+    store: ErasureSessionStore,
+    authority: ErasureWriteAuthorization,
+    sessionId: string,
+    operation: (context: { fence: number; leaseGuard: LeaseGuard }) => Promise<void>,
+  ): Promise<void> {
+    const localBeforeAcquire = this.active.get(sessionId);
+    if (localBeforeAcquire && (
+      localBeforeAcquire.session.tenantId !== authority.tenantId
+      || localBeforeAcquire.session.userId !== authority.userId
+    )) throw new Error("local active turn owner does not match erasure authority");
+
+    this.clearHold(sessionId);
+    const lease = await this.deps.lease.acquire(
+      sessionId,
+      this.deps.config.runnerId,
+      this.deps.config.runnerAddr,
+      this.cfg.leaseTtlMs,
+    );
+    if (!lease.ok) {
+      throw new ApiError("session_lease_conflict", "session owned by another runner", {
+        ownerId: lease.ownerId,
+        ownerAddr: lease.ownerAddr,
+      });
+    }
+
+    const leaseGuard = this.startLeaseGuard(sessionId);
+    let claimValidated = false;
+    let releaseLease = true;
+    try {
+      leaseGuard.assertOwned();
+      await leaseGuard.wait(store.applyErasureSessionAction({
+        authority,
+        sessionId,
+        fence: lease.fence,
+        action: "fence",
+      }));
+      claimValidated = true;
+
+      // Do not disturb a live local turn until the durable request/subject/generation/claim lease has
+      // been revalidated inside the same transaction as the fence hand-off.
+      const local = this.active.get(sessionId);
+      if (local) {
+        try {
+          await leaseGuard.wait(this.drainLocalTurnForErasure(local));
+        } catch (error) {
+          // A wedged provider/tool may still have external side effects in flight. Stop both renewal
+          // loops and let the lease expire; releasing immediately would let a new worker overlap it.
+          releaseLease = false;
+          local.leaseGuard.stop();
+          leaseGuard.stop();
+          throw error;
+        }
+      }
+      // A failed ordinary turn-end write may have scheduled the normal warm-owner hold while the
+      // local state was draining. It must not release the erasure owner's lease mid-operation.
+      this.clearHold(sessionId);
+      await operation({ fence: lease.fence, leaseGuard });
+    } catch (error) {
+      const failure = leaseGuard.lost ?? error;
+      // A stale/expired authority must not tear down the lease of an otherwise valid local turn.
+      if (!claimValidated && this.active.has(sessionId)) releaseLease = false;
+      if (leaseGuard.lost) releaseLease = false;
+      if (failure instanceof SessionGoneError) {
+        const concurrent = await this.readErasureHead(store, authority, sessionId).catch(() => null);
+        if (concurrent?.deleted) return;
+      }
+      throw await this.translateSessionLeaseFailure(sessionId, failure);
+    } finally {
+      leaseGuard.stop();
+      if (releaseLease) {
+        await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+      }
+    }
+  }
+
+  private async drainSessionForErasureLocked(
+    authority: ErasureWriteAuthorization,
+    sessionId: string,
+  ): Promise<void> {
+    const store = this.getErasureStore();
+    const head = await this.readErasureHead(store, authority, sessionId);
+    if (!head) throw new ApiError("not_found", "session not found");
+    if (head.deleted) return;
+    this.assertNoFencedLocalErasureTurn(sessionId);
+    await this.withClaimedErasureSession(store, authority, sessionId, async () => {});
+  }
+
+  private async eraseSessionForErasureLocked(
+    authority: ErasureWriteAuthorization,
+    sessionId: string,
+  ): Promise<void> {
+    const store = this.getErasureStore();
+    let head = await this.readErasureHead(store, authority, sessionId);
+    if (!head) throw new ApiError("not_found", "session not found");
+    if (head.deleted) return;
+    this.assertNoFencedLocalErasureTurn(sessionId);
+
+    await this.withClaimedErasureSession(store, authority, sessionId, async ({ fence, leaseGuard }) => {
+      head = await leaseGuard.wait(this.readErasureHead(store, authority, sessionId));
+      if (!head) throw new ApiError("not_found", "session not found");
+      if (head.deleted) return;
+      if (this.active.has(sessionId)) {
+        throw new ApiError("session_busy", "local turn remained active after erasure drain");
+      }
+
+      if (head.activeTurnId !== undefined) {
+        leaseGuard.assertOwned();
+        const settled = await leaseGuard.wait(store.applyErasureSessionAction({
+          authority,
+          sessionId,
+          fence,
+          action: "settle",
+          atMs: Date.now(),
+        }));
+        await this.publishAll(sessionId, settled.events);
+        head = await leaseGuard.wait(this.readErasureHead(store, authority, sessionId));
+        if (!head) throw new ApiError("not_found", "session not found");
+        if (head.deleted) return;
+      }
+      if (head.activeTurnId !== undefined) {
+        throw new SessionLifecycleBusyError(sessionId);
+      }
+
+      leaseGuard.assertOwned();
+      const result = await leaseGuard.wait(store.applyErasureSessionAction({
+        authority,
+        sessionId,
+        fence,
+        action: "tombstone",
+        atMs: Date.now(),
+      }));
+      await this.publishAll(sessionId, result.events);
+    });
+  }
+
+  /**
+   * A timed-out erasure drain deliberately leaves the session lease to expire. Because ordinary
+   * leases use the stable runner id, a queued duplicate on this same process would otherwise
+   * re-acquire that owner and extend the TTL forever. The active state is removed only after the
+   * provider/tool really stops, so this check is the exact safe boundary for allowing a retry.
+   */
+  private assertNoFencedLocalErasureTurn(sessionId: string): void {
+    const local = this.active.get(sessionId);
+    if (local?.erasureDrainTimedOut) throw new ErasureLocalTurnFencedError();
   }
 
   private async deleteSessionLocked(principal: Principal, sessionId: string): Promise<void> {
@@ -1679,14 +1958,15 @@ export class SessionHost {
     }
 
     const now = Date.now();
+    const approvalItemId = newId("item");
     const approval: Approval = {
-      id: newId("apr"), sessionId: state.session.id, turnId: state.turn.id, itemId: item?.id ?? newId("item"),
+      id: newId("apr"), sessionId: state.session.id, turnId: state.turn.id, itemId: approvalItemId,
       status: "pending", toolCallId: call.id, toolName: call.name, args: call.args,
       reason: msg.text || undefined,
       availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
       createdAtMs: now, expiresAtMs: now + this.cfg.approvalTtlMs,
     };
-    const reqItem: Item = { id: newId("item"), sessionId: state.session.id, turnId: state.turn.id, seq: 0, step: state.step, status: "inProgress", createdAtMs: now, type: "approvalRequest", approvalId: approval.id, toolCallId: call.id, name: call.name, args: call.args };
+    const reqItem: Item = { id: approvalItemId, sessionId: state.session.id, turnId: state.turn.id, seq: 0, step: state.step, status: "inProgress", createdAtMs: now, type: "approvalRequest", approvalId: approval.id, toolCallId: call.id, name: call.name, args: call.args };
     const status = { type: "active" as const, turnId: state.turn.id, activeFlags: ["waitingOnApproval" as const] };
     await this.commit(state, {
       approvals: [approval], items: [reqItem],

@@ -101,6 +101,22 @@ export class RunnerRegistry {
     }
   }
 
+  /**
+   * Tri-state authoritative lease presence for destructive retry coordination. `false` is returned
+   * only after Redis confirms the key is absent; an unavailable directory is `undefined`, never a
+   * license to overlap a possibly-live provider/tool call.
+   */
+  async hasLeaseOwner(sessionId: string): Promise<boolean | undefined> {
+    if (!this.redis) return undefined;
+    try {
+      return await this.redis.exists(
+        `${this.opts.redisPrefix ?? "as"}:lease:{${sessionId}}`,
+      ) === 1;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Ring position for a session nobody owns yet, skipping unhealthy runners. */
   candidate(sessionId: string): string | undefined {
     if (!this.ring.length) return undefined;
@@ -172,6 +188,20 @@ export class RunnerRegistry {
   supportsDataErasureRequests(url: string): boolean {
     const target = this.targets.get(url.replace(/\/+$/, ""));
     return !!target?.healthy && target.capabilities?.features.dataErasureRequests === true;
+  }
+
+  /** Existing durable erasure jobs keep running even when admission of new requests is disabled. */
+  allHealthySupportUserErasureWorker(): boolean {
+    const healthy = this.list().filter((target) => target.healthy);
+    return healthy.length > 0 && healthy.every((target) => (
+      target.capabilities?.features.userErasureWorker.includes("drain-v1") === true
+    ));
+  }
+
+  supportsUserErasureWorker(url: string): boolean {
+    const target = this.targets.get(url.replace(/\/+$/, ""));
+    return !!target?.healthy
+      && target.capabilities?.features.userErasureWorker.includes("drain-v1") === true;
   }
 
   /**

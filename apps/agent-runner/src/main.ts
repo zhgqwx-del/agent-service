@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import {
   BlobCleanupWorker,
+  ErasureWorker,
   LifecycleOutboxDispatcher,
   PiEngine,
   PiSummariser,
@@ -21,18 +22,33 @@ import {
   type BlobCleanupStore,
   type BlobManifestStore,
   type EventBus,
+  type ErasureJobStore,
+  type ErasureSessionCatalogStore,
+  type ErasureSessionStore,
+  type ErasureUsageReconciliationStore,
   type LeaseStore,
   type LifecycleOutboxStore,
   type SubjectLifecycleStore,
   type SessionStore,
+  type UsageLifecycleStore,
 } from "@agent-service/store";
 import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
 import { loadConfig } from "./config.js";
+import { RouterErasureSessionExecutor } from "./erasure-executor.js";
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
-  const store: SessionStore & LifecycleOutboxStore & BlobManifestStore & BlobCleanupStore & SubjectLifecycleStore = cfg.STORE === "mysql"
+  const store: SessionStore
+    & LifecycleOutboxStore
+    & BlobManifestStore
+    & BlobCleanupStore
+    & SubjectLifecycleStore
+    & ErasureJobStore
+    & ErasureSessionCatalogStore
+    & ErasureUsageReconciliationStore
+    & UsageLifecycleStore
+    & ErasureSessionStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({ url: cfg.MYSQL_URL })
     : new MemorySessionStore();
   const lease: LeaseStore = cfg.REDIS_URL ? new RedisLeaseStore(cfg.REDIS_URL) : new MemoryLeaseStore();
@@ -74,7 +90,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const providers = new ProviderService({ store, cipher, platform });
   const tools = new StaticToolRegistry(builtinTools);
   const host = new SessionHost({
-    store, lease, bus, providers, tools, blobs,
+    store, erasureStore: store, lease, bus, providers, tools, blobs,
     engine: new PiEngine(providers.models),
     summariser: new PiSummariser(providers.models),
     config: {
@@ -86,6 +102,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       blobAttachmentsEnabled: cfg.BLOB_ATTACHMENTS_ENABLED,
       toolOutputBlobThresholdBytes: cfg.BLOB_TOOL_OUTPUT_THRESHOLD_BYTES,
       maxDurableToolOutputBytes: cfg.BLOB_MAX_BYTES,
+      erasureDrainTimeoutMs: cfg.ERASURE_DRAIN_TIMEOUT_MS,
     },
   });
   const lifecycleOutbox = new LifecycleOutboxDispatcher({ store, bus }, {
@@ -105,6 +122,26 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     poisonMaxAttempts: cfg.BLOB_CLEANUP_POISON_MAX_ATTEMPTS,
   });
   if (cfg.BLOB_CLEANUP_ENABLED) blobCleanup.start();
+  const erasureWorker = cfg.ERASURE_WORKER_ENABLED
+    ? new ErasureWorker({
+      jobs: store,
+      catalog: store,
+      usage: store,
+      executor: new RouterErasureSessionExecutor({
+        routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+        internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+        requestTimeoutMs: cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS,
+      }),
+    }, {
+      pollIntervalMs: cfg.ERASURE_WORKER_POLL_MS,
+      leaseMs: cfg.ERASURE_WORKER_LEASE_MS,
+      jobBatchSize: cfg.ERASURE_WORKER_BATCH_SIZE,
+      sessionPageSize: cfg.ERASURE_WORKER_SESSION_PAGE_SIZE,
+      retryBaseMs: cfg.ERASURE_WORKER_RETRY_BASE_MS,
+      retryMaxMs: cfg.ERASURE_WORKER_RETRY_MAX_MS,
+    })
+    : undefined;
+  erasureWorker?.start();
 
   let ready = true;
   const app = createApp({
@@ -134,6 +171,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       // Stop accepting new connections while allowing existing requests/streams to finish during
       // the host drain. Stores stay available until workers and HTTP have both quiesced.
       const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+      await erasureWorker?.stop();
       await host.drain(30_000);
       await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
 
@@ -166,9 +204,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"}`);
   return {
-    app, server, host, lifecycleOutbox, blobCleanup, blobs, blobStore, store, lease, bus, cfg,
+    app, server, host, lifecycleOutbox, blobCleanup, erasureWorker, blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };
 }

@@ -28,6 +28,7 @@ describe("RunnerRegistry owner address mapping", () => {
       sessionLifecycle = ["archive", "unarchive", "tombstone"],
       blobAttachments = true,
       dataErasureRequests = true,
+      userErasureWorker = ["drain-v1"],
     ) => ({
       protocolVersion,
       service: "agent-runner",
@@ -38,6 +39,7 @@ describe("RunnerRegistry owner address mapping", () => {
         sessionLifecycle,
         blobAttachments,
         dataErasureRequests,
+        userErasureWorker,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -50,7 +52,7 @@ describe("RunnerRegistry owner address mapping", () => {
       if (url.endsWith("/readyz")) return new Response("ready");
       if (url.startsWith("http://current/")) return Response.json(capabilities(PROTOCOL_VERSION));
       if (url.startsWith("http://current-basic/")) {
-        return Response.json(capabilities(PROTOCOL_VERSION, ["archive", "unarchive"], false, false));
+        return Response.json(capabilities(PROTOCOL_VERSION, ["archive", "unarchive"], false, false, []));
       }
       if (url.startsWith("http://old/")) return Response.json(capabilities("2026-09-22"));
       return new Response("not found", { status: 404 });
@@ -79,6 +81,9 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
     expect(registry.supportsDataErasureRequests("http://current")).toBe(true);
     expect(registry.supportsDataErasureRequests("http://current-basic")).toBe(false);
+    expect(registry.allHealthySupportUserErasureWorker()).toBe(false);
+    expect(registry.supportsUserErasureWorker("http://current")).toBe(true);
+    expect(registry.supportsUserErasureWorker("http://current-basic")).toBe(false);
     expect(registry.anyHealthy()).toBe("http://current");
     expect(registry.routeableUrl("current")).toBe("http://current");
     expect(registry.routeableUrl("old")).toBeUndefined();
@@ -97,6 +102,7 @@ describe("RunnerRegistry owner address mapping", () => {
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         blobAttachments: true,
         dataErasureRequests,
+        userErasureWorker: ["drain-v1"],
         dynamicTools: true,
         mcp: [],
         skills: false,

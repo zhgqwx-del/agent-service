@@ -2,6 +2,13 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  INTERNAL_ERASURE_DRAIN_ACK_HEADER,
+  INTERNAL_ERASURE_DRAIN_ACK_VALUE,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
+  INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX,
+  INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX,
+  INTERNAL_ROUTER_TOKEN_HEADER,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
@@ -64,7 +71,8 @@ async function upstream(reply: (req: { path: string; method: string; body: strin
 function fakeRegistry(
   targets: string[],
   opts: {
-    owner?: string;
+    owner?: string | (() => string | undefined);
+    leaseOwnerPresent?: boolean | (() => boolean | undefined);
     healthy?: (url: string) => boolean;
     tombstone?: boolean;
     targetTombstone?: boolean;
@@ -73,13 +81,20 @@ function fakeRegistry(
     erasure?: boolean;
     configuredErasure?: boolean;
     targetErasure?: boolean | (() => boolean);
+    worker?: boolean;
+    targetWorker?: boolean | ((url: string) => boolean);
   } = {},
 ): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
   let rr = 0;
   const reg = {
     list,
-    owner: async () => opts.owner,
+    owner: async () => typeof opts.owner === "function" ? opts.owner() : opts.owner,
+    hasLeaseOwner: async () => typeof opts.leaseOwnerPresent === "function"
+      ? opts.leaseOwnerPresent()
+      : opts.leaseOwnerPresent ?? (
+        (typeof opts.owner === "function" ? opts.owner() : opts.owner) !== undefined
+      ),
     candidate: () => list().find((t) => t.healthy)?.url,
     anyHealthy: () => {
       const healthy = list().filter((t) => t.healthy);
@@ -96,6 +111,12 @@ function fakeRegistry(
         ? opts.targetErasure()
         : opts.targetErasure ?? opts.erasure ?? true
     ),
+    allHealthySupportUserErasureWorker: () => opts.worker ?? false,
+    supportsUserErasureWorker: (url: string) => (
+      typeof opts.targetWorker === "function"
+        ? opts.targetWorker(url)
+        : opts.targetWorker ?? opts.worker ?? false
+    ),
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
     routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
@@ -107,11 +128,267 @@ function fakeRegistry(
 }
 
 const silent = { info: () => {}, warn: () => {}, error: () => {} };
+const ERASURE_AUTHORITY = {
+  tenantId: "tenant-a",
+  userId: "user-a",
+  requestId: "erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+  subjectGeneration: 3,
+  claimToken: "worker.claim-3",
+  claimAttempt: 4,
+};
 
 function expectPrivateLifecycleResponse(response: Response): void {
   expect(response.headers.get("cache-control")).toBe("no-store");
   expect(response.headers.get("x-content-type-options")).toBe("nosniff");
 }
+
+describe("internal user-erasure routing", () => {
+  it("authenticates before parsing identity or body and never forwards the runner-only path", async () => {
+    const target = await upstream(() => ({ status: 204, body: "" }));
+    const app = createRouterApp({
+      registry: fakeRegistry([target.url], { worker: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    const hidden = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: "wrong-internal-token-000000000000" },
+      body: "{not-json",
+    });
+    expect(hidden.status).toBe(404);
+    expectPrivateLifecycleResponse(hidden);
+    expect(target.requests).toHaveLength(0);
+
+    const oversized = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: "x".repeat(4_097),
+    });
+    expect(oversized.status).toBe(400);
+    expectPrivateLifecycleResponse(oversized);
+    expect(target.requests).toHaveLength(0);
+
+    const runnerOnly = await app.request(`${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(runnerOnly.status).toBe(404);
+    expect(target.requests).toHaveLength(0);
+  });
+
+  it("forwards only the strict claim envelope to the configured owner and validates its ACK", async () => {
+    const target = await upstream(() => ({
+      status: 204,
+      headers: { [INTERNAL_ERASURE_DRAIN_ACK_HEADER]: INTERNAL_ERASURE_DRAIN_ACK_VALUE },
+      body: "",
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([target.url], { owner: target.url, worker: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    const extra = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: {
+        [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ ...ERASURE_AUTHORITY, phase: "tombstoning" }),
+    });
+    expect(extra.status).toBe(400);
+    expectPrivateLifecycleResponse(extra);
+    expect(target.requests).toHaveLength(0);
+
+    const response = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: {
+        [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN,
+        "content-type": "application/json",
+        "x-untrusted-forward-me": "no",
+      },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER)).toBe(INTERNAL_ERASURE_DRAIN_ACK_VALUE);
+    expect(response.headers.get("x-owner")).toBeNull();
+    expectPrivateLifecycleResponse(response);
+    expect(target.requests).toHaveLength(1);
+    expect(target.requests[0]).toMatchObject({
+      method: "POST",
+      path: `${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/${SID}`,
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(target.requests[0]!.headers["x-untrusted-forward-me"]).toBeUndefined();
+  });
+
+  it("reroutes one acknowledged lease conflict only to a configured capable owner", async () => {
+    let ownerUrl = "";
+    const wrong = await upstream(() => ({
+      status: 409,
+      headers: {
+        [INTERNAL_ERASURE_DRAIN_ACK_HEADER]: INTERNAL_ERASURE_DRAIN_ACK_VALUE,
+        "x-owner": ownerUrl.replace(/^http:\/\//, ""),
+      },
+      body: JSON.stringify({ error: { code: "session_lease_conflict", message: "conflict" } }),
+    }));
+    const owner = await upstream(() => ({
+      status: 204,
+      headers: { [INTERNAL_ERASURE_DRAIN_ACK_HEADER]: INTERNAL_ERASURE_DRAIN_ACK_VALUE },
+      body: "",
+    }));
+    ownerUrl = owner.url;
+    const app = createRouterApp({
+      registry: fakeRegistry([wrong.url, owner.url], { owner: wrong.url, worker: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    const response = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("x-owner")).toBeNull();
+    expect(wrong.requests).toHaveLength(1);
+    expect(owner.requests).toHaveLength(1);
+  });
+
+  it("waits for a locally-fenced owner's lease to expire before bypassing its hash candidate", async () => {
+    const old = await upstream(() => ({
+      status: 409,
+      headers: {
+        [INTERNAL_ERASURE_DRAIN_ACK_HEADER]: INTERNAL_ERASURE_DRAIN_ACK_VALUE,
+        [INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER]: INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
+      },
+      body: JSON.stringify({ error: { code: "session_busy", message: "still draining" } }),
+    }));
+    const takeover = await upstream(() => ({
+      status: 204,
+      headers: { [INTERNAL_ERASURE_DRAIN_ACK_HEADER]: INTERNAL_ERASURE_DRAIN_ACK_VALUE },
+      body: "",
+    }));
+    let liveOwner: string | undefined = old.url;
+    let leaseOwnerPresent: boolean | undefined = true;
+    const app = createRouterApp({
+      registry: fakeRegistry([old.url, takeover.url], {
+        owner: () => liveOwner,
+        leaseOwnerPresent: () => leaseOwnerPresent,
+        worker: true,
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    const blocked = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(blocked.status).toBe(409);
+    expect(blocked.headers.get(INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER)).toBeNull();
+    expect(old.requests).toHaveLength(1);
+    expect(takeover.requests).toHaveLength(0);
+
+    liveOwner = undefined;
+    leaseOwnerPresent = undefined;
+    const indeterminate = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(indeterminate.status).toBe(409);
+    expect(old.requests).toHaveLength(2);
+    expect(takeover.requests).toHaveLength(0);
+
+    leaseOwnerPresent = false;
+    const recovered = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(recovered.status).toBe(204);
+    expect(recovered.headers.get(INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER)).toBeNull();
+    expect(old.requests).toHaveLength(3);
+    expect(takeover.requests).toHaveLength(1);
+  });
+
+  it("does not follow an unconfigured advertised owner or expose its topology", async () => {
+    const target = await upstream(() => ({
+      status: 409,
+      headers: {
+        [INTERNAL_ERASURE_DRAIN_ACK_HEADER]: INTERNAL_ERASURE_DRAIN_ACK_VALUE,
+        "x-owner": "unconfigured.internal:9443",
+      },
+      body: JSON.stringify({ error: { code: "session_lease_conflict", message: "conflict" } }),
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([target.url], { owner: target.url, worker: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    const response = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(response.status).toBe(409);
+    expect(response.headers.get("x-owner")).toBeNull();
+    expect(target.requests).toHaveLength(1);
+  });
+
+  it("uses at most one capable fallback after a transport failure", async () => {
+    const dead = "http://127.0.0.1:1";
+    const alive = await upstream(() => ({
+      status: 204,
+      headers: { [INTERNAL_ERASURE_DRAIN_ACK_HEADER]: INTERNAL_ERASURE_DRAIN_ACK_VALUE },
+      body: "",
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([dead, alive.url], { owner: dead, worker: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    const response = await app.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    });
+    expect(response.status).toBe(204);
+    expect(alive.requests).toHaveLength(1);
+  });
+
+  it("fails closed for an incapable target or a missing drain-v1 acknowledgement", async () => {
+    const legacy = await upstream(() => ({ status: 404, body: "{}" }));
+    const incapable = createRouterApp({
+      registry: fakeRegistry([legacy.url], { owner: legacy.url, worker: false }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    expect((await incapable.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    })).status).toBe(503);
+    expect(legacy.requests).toHaveLength(0);
+
+    const noAck = createRouterApp({
+      registry: fakeRegistry([legacy.url], { owner: legacy.url, worker: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    expect((await noAck.request(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      body: JSON.stringify(ERASURE_AUTHORITY),
+    })).status).toBe(503);
+    expect(legacy.requests).toHaveLength(1);
+  });
+});
 
 describe("session routing", () => {
   it("sends a session request to the runner the directory names as owner", async () => {
@@ -614,22 +891,31 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
-      registry: fakeRegistry([a.url], { blobs: true }),
+      registry: fakeRegistry([a.url], { blobs: true, worker: true }),
       tombstoneEnabled: () => true,
       blobAttachmentsEnabled: () => true,
       erasureRequestsEnabled: () => true,
       internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
-    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean } };
+    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[] } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
     expect(caps.features.sessionLifecycle).toEqual(["archive", "unarchive", "tombstone"]);
     expect(caps.features.blobAttachments).toBe(true);
     expect(caps.features.dataErasureRequests).toBe(true);
+    expect(caps.features.userErasureWorker).toEqual(["drain-v1"]);
+
+    const noToken = createRouterApp({
+      registry: fakeRegistry([a.url], { worker: true }),
+      logger: silent,
+    });
+    expect(await (await noToken.request("/v1/capabilities")).json()).toMatchObject({
+      features: { userErasureWorker: [] },
+    });
   });
 
   it("withholds the erasure capability until the deployment gate and whole healthy fleet agree", async () => {

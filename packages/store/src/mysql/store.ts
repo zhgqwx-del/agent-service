@@ -2,8 +2,17 @@ import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
-import type { AgentDefinition, ApiKeyScope, Approval, Item, PersistedEvent, ProviderConfig, Session, TenantAuthPolicy, Turn, UsageQuery } from "@agent-service/protocol";
-import { DEFAULT_AUTH_POLICY, DEFAULT_SCOPES, isCanonicalId } from "@agent-service/protocol";
+import type { AgentDefinition, ApiKeyScope, Approval, EventInput, Item, PersistedEvent, ProviderConfig, Session, TenantAuthPolicy, Turn, UsageQuery } from "@agent-service/protocol";
+import {
+  Approval as ApprovalSchema,
+  DEFAULT_AUTH_POLICY,
+  DEFAULT_SCOPES,
+  Event as EventSchema,
+  Item as ItemSchema,
+  SessionStatus as SessionStatusSchema,
+  Turn as TurnSchema,
+  isCanonicalId,
+} from "@agent-service/protocol";
 import {
   FenceError,
   IdempotencyMismatchError,
@@ -99,18 +108,61 @@ import {
   type UsageProjectionSummary,
 } from "../usage-lifecycle.js";
 import {
+  CLAIMABLE_ERASURE_REQUEST_STATUSES,
   ErasureIdempotencyMismatchError,
   SubjectDeletingError,
+  erasureJobClaimFromRecord,
+  erasureJobAuthorizationMatches,
+  erasureWriteAuthorizationMatches,
+  isClaimableErasureRequestStatus,
+  validateClaimErasureJobsOptions,
+  validateErasureJobAuthorization,
+  validateErasureAuditChain,
+  validateErasureRequestRecord,
+  validateErasureWriteAuthorization,
   validateRequestUserErasureInput,
+  validateRenewErasureJobClaimOptions,
+  validateRetryErasureJobOptions,
+  validateTransitionErasureJobOptions,
+  type ClaimErasureJobsOptions,
   type DataSubjectKind,
   type ErasureAuditEvent,
+  type ErasureJobAuthorization,
+  type ErasureJobClaim,
+  type ErasureJobStore,
   type ErasureRequestRecord,
   type ErasureRequestStatus,
+  type ErasureWriteAuthorization,
   type RequestUserErasureInput,
+  type RetryErasureJobOptions,
+  type RenewErasureJobClaimOptions,
   type SubjectLifecycleRecord,
   type SubjectLifecycleState,
   type SubjectLifecycleStore,
+  type TransitionErasureJobOptions,
 } from "../subject-lifecycle.js";
+import {
+  validateErasureSessionAction,
+  type ErasureSessionAction,
+  type ErasureSessionHead,
+  type ErasureSessionStore,
+} from "../erasure-session.js";
+import {
+  validateErasureProgressQuery,
+  validateErasureSessionQuery,
+  type ErasureProgressQuery,
+  type ErasureSessionCatalogStore,
+  type ErasureSessionPage,
+  type ErasureSessionQuery,
+  type ErasureSessionRef,
+  type ErasureSubjectProgress,
+} from "../erasure-catalog.js";
+import {
+  ErasureTombstoneIntegrityError,
+  validateErasureUsageReconciliationInput,
+  type ErasureUsageReconciliationInput,
+  type ErasureUsageReconciliationStore,
+} from "../erasure-usage.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -136,7 +188,8 @@ const SUBJECT_LIFECYCLE_COLUMNS = `tenant_id, subject_kind, subject_id, state, g
   active_request_id, legal_hold_at_ms, created_at_ms, updated_at_ms`;
 const ERASURE_REQUEST_COLUMNS = `request_id, tenant_id, subject_kind, subject_id, generation, status,
   requested_by_key_id, idempotency_key, request_hash, created_at_ms, gated_at_ms, updated_at_ms,
-  completed_at_ms, counts_json, checksum`;
+  completed_at_ms, counts_json, checksum, available_at_ms, attempts, claim_token, lease_until_ms,
+  last_error_code, policy_version, policy_hash`;
 const USAGE_OWNER_MATCH = "u.tenant_id=s.tenant_id AND u.user_id=s.user_id";
 const usageJsonNumber = (field: string) => (
   `CASE WHEN JSON_TYPE(JSON_EXTRACT(u.usage_json,'$.${field}')) IN ('INTEGER','DOUBLE','DECIMAL') `
@@ -436,17 +489,6 @@ function rowToSubjectLifecycle(row: Row): SubjectLifecycleRecord {
   };
 }
 
-const ERASURE_REQUEST_STATUSES = new Set<ErasureRequestStatus>([
-  "gated",
-  "draining",
-  "tombstoning",
-  "reconciling_usage",
-  "awaiting_purge_policy",
-  "purging",
-  "blocked",
-  "completed",
-]);
-
 function rowToErasureRequest(row: Row): ErasureRequestRecord {
   const subjectKind = String(row.subject_kind) as DataSubjectKind;
   const status = String(row.status) as ErasureRequestStatus;
@@ -455,31 +497,11 @@ function rowToErasureRequest(row: Row): ErasureRequestRecord {
   const gatedAtMs = Number(row.gated_at_ms);
   const updatedAtMs = Number(row.updated_at_ms);
   const counts = row.counts_json == null ? undefined : parse<unknown>(row.counts_json);
-  if (
-    (subjectKind !== "tenant" && subjectKind !== "user")
-    || !ERASURE_REQUEST_STATUSES.has(status)
-    || !Number.isSafeInteger(generation)
-    || generation <= 0
-    || !Number.isSafeInteger(createdAtMs)
-    || createdAtMs < 0
-    || !Number.isSafeInteger(gatedAtMs)
-    || gatedAtMs < createdAtMs
-    || !Number.isSafeInteger(updatedAtMs)
-    || updatedAtMs < gatedAtMs
-    || (counts !== undefined && (typeof counts !== "object" || counts === null || Array.isArray(counts)))
-  ) throw new Error("stored erasure request row is invalid");
-  if (counts !== undefined) {
-    for (const value of Object.values(counts)) {
-      if (!Number.isSafeInteger(value) || (value as number) < 0) {
-        throw new Error("stored erasure request counts are invalid");
-      }
-    }
+  if (counts !== undefined && (typeof counts !== "object" || counts === null || Array.isArray(counts))) {
+    throw new Error("stored erasure request counts are invalid");
   }
   const completedAtMs = row.completed_at_ms == null ? undefined : Number(row.completed_at_ms);
-  if (completedAtMs !== undefined && (!Number.isSafeInteger(completedAtMs) || completedAtMs < createdAtMs)) {
-    throw new Error("stored erasure request completion timestamp is invalid");
-  }
-  return {
+  const record: ErasureRequestRecord = {
     requestId: String(row.request_id),
     tenantId: String(row.tenant_id),
     subjectKind,
@@ -492,10 +514,45 @@ function rowToErasureRequest(row: Row): ErasureRequestRecord {
     createdAtMs,
     gatedAtMs,
     updatedAtMs,
+    attempts: Number(row.attempts),
     ...(completedAtMs === undefined ? {} : { completedAtMs }),
     ...(counts === undefined ? {} : { counts: counts as Record<string, number> }),
     ...(row.checksum == null ? {} : { checksum: String(row.checksum) }),
+    ...(row.available_at_ms == null ? {} : { availableAtMs: Number(row.available_at_ms) }),
+    ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+    ...(row.lease_until_ms == null ? {} : { leaseUntilMs: Number(row.lease_until_ms) }),
+    ...(row.last_error_code == null ? {} : { lastErrorCode: String(row.last_error_code) as ErasureRequestRecord["lastErrorCode"] }),
+    ...(row.policy_version == null ? {} : { policyVersion: String(row.policy_version) }),
+    ...(row.policy_hash == null ? {} : { policyHash: String(row.policy_hash) }),
   };
+  validateErasureRequestRecord(record);
+  return record;
+}
+
+function rowToErasureSessionRef(row: Row): ErasureSessionRef {
+  const sessionId = String(row.session_id);
+  const parentSessionId = row.parent_session_id == null ? undefined : String(row.parent_session_id);
+  const deletionGeneration = Number(row.deletion_generation);
+  if (
+    !isCanonicalId("sess", sessionId)
+    || (parentSessionId !== undefined && !isCanonicalId("sess", parentSessionId))
+    || !Number.isSafeInteger(deletionGeneration)
+    || deletionGeneration < 0
+  ) throw new Error("stored erasure session reference is invalid");
+  return {
+    sessionId,
+    ...(parentSessionId === undefined ? {} : { parentSessionId }),
+    deleted: row.deleted_at_ms != null,
+    deletionGeneration,
+  };
+}
+
+function erasureProgressCount(row: Row, column: string): number {
+  const value = Number(row[column]);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`stored erasure progress count ${column} is invalid`);
+  }
+  return value;
 }
 
 function usageReconciliationSummary(record: UsageReconciliationRecord): UsageReconciliationSummary {
@@ -574,7 +631,18 @@ export interface MysqlStoreOptions {
   migrationLockTimeoutSeconds?: number;
 }
 
-export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore {
+export class MysqlSessionStore implements
+  SessionStore,
+  LifecycleOutboxStore,
+  BlobManifestStore,
+  BlobCleanupStore,
+  UsageLifecycleStore,
+  SubjectLifecycleStore,
+  ErasureJobStore,
+  ErasureSessionStore,
+  ErasureSessionCatalogStore,
+  ErasureUsageReconciliationStore
+{
   private constructor(private readonly pool: Pool) {}
 
   /**
@@ -821,13 +889,16 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
         createdAtMs: input.atMs,
         gatedAtMs: input.atMs,
         updatedAtMs: input.atMs,
+        availableAtMs: input.atMs,
+        attempts: 0,
       };
       await conn.query(
         `INSERT INTO erasure_requests
            (request_id, tenant_id, subject_kind, subject_id, generation, status,
             requested_by_key_id, idempotency_key, request_hash, created_at_ms, gated_at_ms,
-            updated_at_ms, completed_at_ms, counts_json, checksum)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)`,
+            updated_at_ms, completed_at_ms, counts_json, checksum, available_at_ms, attempts,
+            claim_token, lease_until_ms, last_error_code, policy_version, policy_hash)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,0,NULL,NULL,NULL,NULL,NULL)`,
         [
           record.requestId,
           record.tenantId,
@@ -841,6 +912,7 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
           record.createdAtMs,
           record.gatedAtMs,
           record.updatedAtMs,
+          record.availableAtMs,
         ],
       );
       const [updated] = await conn.query<mysql.ResultSetHeader>(
@@ -935,6 +1007,485 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
         emittedAtMs,
       };
     });
+  }
+
+  private async assertLockedErasureJobIntegrity(
+    conn: PoolConnection,
+    record: ErasureRequestRecord,
+    lock: "FOR SHARE" | "FOR UPDATE",
+    lockedSubject?: SubjectLifecycleRecord,
+  ): Promise<{ subject: SubjectLifecycleRecord; auditSeq: number }> {
+    validateErasureRequestRecord(record);
+    let subject = lockedSubject;
+    if (!subject) {
+      // Authority paths follow the global tenant -> user lock order. Claim performs a non-locking
+      // candidate scan before entering that order, then locks the request row last.
+      const [tenantRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+        [record.tenantId, record.tenantId],
+      );
+      if (!tenantRows[0]) throw new Error("erasure tenant lifecycle row is missing");
+      const tenant = rowToSubjectLifecycle(tenantRows[0]);
+      if (record.subjectKind === "tenant") subject = tenant;
+      else {
+        const [subjectRows] = await conn.query<Row[]>(
+          `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+             FROM subject_lifecycle
+            WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR SHARE`,
+          [record.tenantId, record.subjectId],
+        );
+        subject = subjectRows[0] ? rowToSubjectLifecycle(subjectRows[0]) : undefined;
+      }
+    }
+    if (
+      !subject
+      || subject.tenantId !== record.tenantId
+      || subject.subjectKind !== record.subjectKind
+      || subject.subjectId !== record.subjectId
+      || subject.state !== "deleting"
+      || subject.generation !== record.generation
+      || subject.activeRequestId !== record.requestId
+    ) throw new Error("erasure request does not match its active subject lifecycle");
+
+    const [auditRows] = await conn.query<Row[]>(
+      `SELECT request_id, seq, event_type, payload, emitted_at_ms
+         FROM erasure_audit_events
+        WHERE request_id=? ORDER BY seq ${lock}`,
+      [record.requestId],
+    );
+    const audits: ErasureAuditEvent[] = auditRows.map((audit) => ({
+      requestId: String(audit.request_id),
+      seq: Number(audit.seq),
+      type: String(audit.event_type) as ErasureAuditEvent["type"],
+      payload: parse<Record<string, unknown>>(audit.payload),
+      emittedAtMs: Number(audit.emitted_at_ms),
+    }));
+    validateErasureAuditChain(record, audits);
+    return { subject, auditSeq: audits.length };
+  }
+
+  private async lockErasureAuthorizationSubject(
+    conn: PoolConnection,
+    authorization: ErasureJobAuthorization,
+    targetLock: "FOR SHARE" | "FOR UPDATE",
+  ): Promise<SubjectLifecycleRecord | null> {
+    // All authority-bearing paths take tenant before user, matching create/commit/gate and the
+    // later session erasure store. This avoids a request <-> subject lock inversion at completion.
+    const tenantLock = authorization.subjectKind === "tenant" ? targetLock : "FOR SHARE";
+    const [tenantRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? ${tenantLock}`,
+      [authorization.tenantId, authorization.tenantId],
+    );
+    if (!tenantRows[0]) return null;
+    const tenant = rowToSubjectLifecycle(tenantRows[0]);
+    if (authorization.subjectKind === "tenant") return tenant;
+    const [userRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='user' AND subject_id=? ${targetLock}`,
+      [authorization.tenantId, authorization.subjectId],
+    );
+    return userRows[0] ? rowToSubjectLifecycle(userRows[0]) : null;
+  }
+
+  /** Session actions preserve the ordinary writer's session -> tenant -> user lock order. */
+  private async lockErasureSessionAuthority(
+    conn: PoolConnection,
+    authorization: ErasureWriteAuthorization,
+    allowedStatuses: readonly ErasureRequestStatus[],
+    nowMs = Date.now(),
+  ): Promise<ErasureRequestRecord> {
+    const [tenantRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [authorization.tenantId, authorization.tenantId],
+    );
+    const [userRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR SHARE`,
+      [authorization.tenantId, authorization.userId],
+    );
+    const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+    const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
+    if (
+      !tenant
+      || tenant.state !== "active"
+      || !user
+      || user.state !== "deleting"
+      || user.generation !== authorization.subjectGeneration
+      || user.activeRequestId !== authorization.requestId
+    ) throw new Error("stale erasure authority");
+
+    const [requestRows] = await conn.query<Row[]>(
+      `SELECT ${ERASURE_REQUEST_COLUMNS}
+         FROM erasure_requests WHERE request_id=? FOR SHARE`,
+      [authorization.requestId],
+    );
+    const request = requestRows[0] ? rowToErasureRequest(requestRows[0]) : undefined;
+    if (!request) throw new Error("stale erasure authority");
+    await this.assertLockedErasureJobIntegrity(conn, request, "FOR SHARE", user);
+    if (
+      !allowedStatuses.includes(request.status)
+      || !erasureWriteAuthorizationMatches(request, authorization, nowMs)
+    ) throw new Error("stale erasure authority");
+    return request;
+  }
+
+  async claimErasureJobs(options: ClaimErasureJobsOptions): Promise<ErasureJobClaim[]> {
+    const leaseUntilMs = validateClaimErasureJobsOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await conn.beginTransaction();
+      const statusPlaceholders = CLAIMABLE_ERASURE_REQUEST_STATUSES.map(() => "?").join(",");
+      // Phase 1 is deliberately non-locking. Phase 2 takes tenant -> user -> request for every
+      // candidate, matching transition/session writers and eliminating request <-> subject cycles.
+      const [candidateRows] = await conn.query<Row[]>(
+        `SELECT request_id, tenant_id, subject_kind, subject_id, generation, attempts
+           FROM erasure_requests
+          WHERE status IN (${statusPlaceholders})
+            AND available_at_ms IS NOT NULL AND available_at_ms<=?
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+          ORDER BY available_at_ms ASC, request_id ASC
+          LIMIT ?`,
+        [...CLAIMABLE_ERASURE_REQUEST_STATUSES, options.nowMs, options.nowMs, options.limit],
+      );
+      const candidates = candidateRows.map((row) => {
+        const authorization: ErasureJobAuthorization = {
+          requestId: String(row.request_id),
+          tenantId: String(row.tenant_id),
+          subjectKind: String(row.subject_kind) as DataSubjectKind,
+          subjectId: String(row.subject_id),
+          subjectGeneration: Number(row.generation),
+          claimToken: options.claimToken,
+          claimAttempt: Number(row.attempts) + 1,
+        };
+        validateErasureJobAuthorization(authorization);
+        return authorization;
+      }).sort((left, right) => (
+        left.tenantId.localeCompare(right.tenantId)
+        || left.subjectKind.localeCompare(right.subjectKind)
+        || left.subjectId.localeCompare(right.subjectId)
+        || left.requestId.localeCompare(right.requestId)
+      ));
+      const claimed: ErasureRequestRecord[] = [];
+      for (const candidate of candidates) {
+        const subject = await this.lockErasureAuthorizationSubject(conn, candidate, "FOR SHARE");
+        if (!subject) throw new Error("erasure request subject lifecycle is missing");
+        const [requestRows] = await conn.query<Row[]>(
+          `SELECT ${ERASURE_REQUEST_COLUMNS}
+             FROM erasure_requests
+            WHERE request_id=?
+            FOR UPDATE SKIP LOCKED`,
+          [candidate.requestId],
+        );
+        // Another worker may have locked this request after the non-locking candidate scan.
+        if (!requestRows[0]) continue;
+        const current = rowToErasureRequest(requestRows[0]);
+        if (
+          current.tenantId !== candidate.tenantId
+          || current.subjectKind !== candidate.subjectKind
+          || current.subjectId !== candidate.subjectId
+          || current.generation !== candidate.subjectGeneration
+        ) throw new Error("erasure request identity changed during claim");
+        if (
+          !isClaimableErasureRequestStatus(current.status)
+          || current.availableAtMs === undefined
+          || current.availableAtMs > options.nowMs
+          || (current.claimToken !== undefined
+            && (current.leaseUntilMs === undefined || current.leaseUntilMs > options.nowMs))
+        ) continue;
+        await this.assertLockedErasureJobIntegrity(conn, current, "FOR SHARE", subject);
+        const next: ErasureRequestRecord = {
+          ...current,
+          attempts: current.attempts + 1,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+        };
+        validateErasureRequestRecord(next);
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE erasure_requests
+              SET attempts=?, claim_token=?, lease_until_ms=?
+            WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+              AND status=? AND available_at_ms IS NOT NULL AND available_at_ms<=?
+              AND (claim_token IS NULL OR lease_until_ms<=?)`,
+          [
+            next.attempts,
+            options.claimToken,
+            leaseUntilMs,
+            current.requestId,
+            current.tenantId,
+            current.subjectKind,
+            current.subjectId,
+            current.generation,
+            current.status,
+            options.nowMs,
+            options.nowMs,
+          ],
+        );
+        if (updated.affectedRows !== 1) throw new Error("erasure job changed while locked");
+        claimed.push(next);
+      }
+      await conn.commit();
+      return claimed.map(erasureJobClaimFromRecord);
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewErasureJobClaim(
+    authorization: ErasureJobAuthorization,
+    options: RenewErasureJobClaimOptions,
+  ): Promise<boolean> {
+    validateErasureJobAuthorization(authorization);
+    const leaseUntilMs = validateRenewErasureJobClaimOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const subject = await this.lockErasureAuthorizationSubject(conn, authorization, "FOR SHARE");
+      if (!subject) {
+        await conn.commit();
+        return false;
+      }
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${ERASURE_REQUEST_COLUMNS} FROM erasure_requests WHERE request_id=? FOR UPDATE`,
+        [authorization.requestId],
+      );
+      if (!rows[0]) {
+        await conn.commit();
+        return false;
+      }
+      const current = rowToErasureRequest(rows[0]);
+      await this.assertLockedErasureJobIntegrity(conn, current, "FOR SHARE", subject);
+      if (!erasureJobAuthorizationMatches(current, authorization, options.nowMs)) {
+        await conn.commit();
+        return false;
+      }
+      const nextLeaseUntilMs = Math.max(current.leaseUntilMs!, leaseUntilMs);
+      if (nextLeaseUntilMs === current.leaseUntilMs) {
+        await conn.commit();
+        return true;
+      }
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE erasure_requests SET lease_until_ms=GREATEST(lease_until_ms, ?)
+          WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+            AND status=? AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          nextLeaseUntilMs,
+          current.requestId,
+          current.tenantId,
+          current.subjectKind,
+          current.subjectId,
+          current.generation,
+          current.status,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          options.nowMs,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new Error("erasure job claim changed while locked");
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async transitionErasureJob(
+    authorization: ErasureJobAuthorization,
+    options: TransitionErasureJobOptions,
+  ): Promise<boolean> {
+    validateErasureJobAuthorization(authorization);
+    validateTransitionErasureJobOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const lockedSubject = await this.lockErasureAuthorizationSubject(conn, authorization, "FOR UPDATE");
+      if (!lockedSubject) {
+        await conn.commit();
+        return false;
+      }
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${ERASURE_REQUEST_COLUMNS} FROM erasure_requests WHERE request_id=? FOR UPDATE`,
+        [authorization.requestId],
+      );
+      if (!rows[0]) {
+        await conn.commit();
+        return false;
+      }
+      const current = rowToErasureRequest(rows[0]);
+      const { subject, auditSeq } = await this.assertLockedErasureJobIntegrity(
+        conn,
+        current,
+        "FOR UPDATE",
+        lockedSubject,
+      );
+      if (
+        current.status !== options.fromStatus
+        || !erasureJobAuthorizationMatches(current, authorization, options.atMs)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      if (
+        options.policyVersion !== undefined
+        && current.policyVersion !== undefined
+        && (current.policyVersion !== options.policyVersion || current.policyHash !== options.policyHash)
+      ) throw new Error("erasure policy identity is immutable");
+
+      const effectiveAtMs = Math.max(current.updatedAtMs, options.atMs);
+      const policyVersion = options.policyVersion ?? current.policyVersion;
+      const policyHash = options.policyHash ?? current.policyHash;
+      const completedAtMs = options.toStatus === "completed" ? effectiveAtMs : undefined;
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE erasure_requests
+            SET status=?, available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=?, policy_version=?, policy_hash=?, updated_at_ms=?,
+                completed_at_ms=?, counts_json=?, checksum=?
+          WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+            AND status=? AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          options.toStatus,
+          options.availableAtMs ?? null,
+          options.toStatus === "blocked" ? options.errorCode : null,
+          policyVersion ?? null,
+          policyHash ?? null,
+          effectiveAtMs,
+          completedAtMs ?? null,
+          options.counts === undefined ? null : json(options.counts),
+          options.checksum ?? null,
+          current.requestId,
+          current.tenantId,
+          current.subjectKind,
+          current.subjectId,
+          current.generation,
+          options.fromStatus,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          options.atMs,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new Error("erasure job transition changed while locked");
+
+      if (options.toStatus === "completed") {
+        const [subjectUpdated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE subject_lifecycle
+              SET state='erased', active_request_id=NULL, updated_at_ms=GREATEST(updated_at_ms, ?)
+            WHERE tenant_id=? AND subject_kind=? AND subject_id=? AND state='deleting'
+              AND generation=? AND active_request_id=?`,
+          [
+            effectiveAtMs,
+            subject.tenantId,
+            subject.subjectKind,
+            subject.subjectId,
+            subject.generation,
+            current.requestId,
+          ],
+        );
+        if (subjectUpdated.affectedRows !== 1) throw new Error("erasure subject changed while locked");
+      }
+
+      const auditType: ErasureAuditEvent["type"] = options.toStatus === "blocked"
+        ? "erasure/blocked"
+        : options.toStatus === "completed"
+          ? "erasure/completed"
+          : "erasure/status_changed";
+      const payload = {
+        fromStatus: options.fromStatus,
+        status: options.toStatus,
+        generation: current.generation,
+        ...(policyVersion === undefined ? {} : { policyVersion }),
+        ...(policyHash === undefined ? {} : { policyHash }),
+        ...(options.errorCode === undefined ? {} : { errorCode: options.errorCode }),
+        ...(options.counts === undefined ? {} : { counts: options.counts }),
+        ...(options.checksum === undefined ? {} : { checksum: options.checksum }),
+      };
+      await conn.query(
+        `INSERT INTO erasure_audit_events (request_id, seq, event_type, payload, emitted_at_ms)
+         VALUES (?,?,?,?,?)`,
+        [current.requestId, auditSeq + 1, auditType, json(payload), effectiveAtMs],
+      );
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryErasureJob(
+    authorization: ErasureJobAuthorization,
+    options: RetryErasureJobOptions,
+  ): Promise<boolean> {
+    validateErasureJobAuthorization(authorization);
+    validateRetryErasureJobOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const subject = await this.lockErasureAuthorizationSubject(conn, authorization, "FOR SHARE");
+      if (!subject) {
+        await conn.commit();
+        return false;
+      }
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${ERASURE_REQUEST_COLUMNS} FROM erasure_requests WHERE request_id=? FOR UPDATE`,
+        [authorization.requestId],
+      );
+      if (!rows[0]) {
+        await conn.commit();
+        return false;
+      }
+      const current = rowToErasureRequest(rows[0]);
+      await this.assertLockedErasureJobIntegrity(conn, current, "FOR SHARE", subject);
+      if (!erasureJobAuthorizationMatches(current, authorization, options.failedAtMs)) {
+        await conn.commit();
+        return false;
+      }
+      const effectiveAtMs = Math.max(current.updatedAtMs, options.failedAtMs);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE erasure_requests
+            SET available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_kind=? AND subject_id=? AND generation=?
+            AND status=? AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          options.availableAtMs,
+          options.errorCode,
+          effectiveAtMs,
+          current.requestId,
+          current.tenantId,
+          current.subjectKind,
+          current.subjectId,
+          current.generation,
+          current.status,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          options.failedAtMs,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new Error("erasure job retry changed while locked");
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
 
   // ---------- agents ----------
@@ -1066,6 +1617,794 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
       };
     });
   }
+
+  private async lockErasureResolution(
+    conn: PoolConnection,
+    sessionId: string,
+    userId: string,
+    atMs: number,
+    turnId?: string,
+  ): Promise<{ approvals: Approval[]; items: Item[] }> {
+    const itemParams: unknown[] = [sessionId];
+    const itemTurn = turnId === undefined ? "" : " AND turn_id=?";
+    if (turnId !== undefined) itemParams.push(turnId);
+    const [itemRows] = await conn.query<Row[]>(
+      `SELECT item_id, session_id, user_id, turn_id, type, status, body
+         FROM items
+        WHERE session_id=?${itemTurn} AND type='approvalRequest' AND status='inProgress'
+        ORDER BY item_id FOR UPDATE`,
+      itemParams,
+    );
+    const existingItems = itemRows.map((row) => {
+      const item = ItemSchema.parse(parse<unknown>(row.body));
+      if (
+        item.type !== "approvalRequest"
+        || item.id !== row.item_id
+        || item.sessionId !== sessionId
+        || item.sessionId !== row.session_id
+        || item.turnId !== row.turn_id
+        || item.status !== "inProgress"
+        || row.status !== "inProgress"
+        || row.type !== "approvalRequest"
+        || row.user_id !== userId
+      ) throw new Error("stored erasure approval item identity is corrupt");
+      return item;
+    });
+
+    const approvalParams: unknown[] = [sessionId];
+    const approvalTurn = turnId === undefined ? "" : " AND turn_id=?";
+    if (turnId !== undefined) approvalParams.push(turnId);
+    const [approvalRows] = await conn.query<Row[]>(
+      `SELECT approval_id, session_id, user_id, turn_id, status, body
+         FROM approvals
+        WHERE session_id=?${approvalTurn} AND status='pending'
+        ORDER BY approval_id FOR UPDATE`,
+      approvalParams,
+    );
+    const existingApprovals = approvalRows.map((row) => {
+      const approval = ApprovalSchema.parse(parse<unknown>(row.body));
+      if (
+        approval.id !== row.approval_id
+        || approval.sessionId !== sessionId
+        || approval.sessionId !== row.session_id
+        || approval.turnId !== row.turn_id
+        || approval.status !== "pending"
+        || row.status !== "pending"
+        || row.user_id !== userId
+      ) throw new Error("stored erasure approval identity is corrupt");
+      return approval;
+    });
+
+    const approvalsById = new Map(existingApprovals.map((approval) => [approval.id, approval]));
+    const itemsByApproval = new Map<string, Extract<Item, { type: "approvalRequest" }>>();
+    for (const item of existingItems) {
+      const approval = approvalsById.get(item.approvalId);
+      if (
+        !approval
+        || itemsByApproval.has(item.approvalId)
+        || approval.turnId !== item.turnId
+        || approval.toolCallId !== item.toolCallId
+        || approval.toolName !== item.name
+      ) throw new Error("stored erasure approval association is corrupt");
+      itemsByApproval.set(item.approvalId, item);
+    }
+    if (itemsByApproval.size !== existingApprovals.length) {
+      throw new Error("stored erasure approval item is missing");
+    }
+
+    const approvals: Approval[] = existingApprovals.map((approval) => ApprovalSchema.parse({
+      ...approval,
+      status: "expired",
+      decision: "cancel",
+      decidedBy: "system:erasure",
+      resolvedAtMs: atMs,
+    }));
+    const items: Item[] = approvals.map((approval) => {
+      const item = itemsByApproval.get(approval.id)!;
+      return ItemSchema.parse({ ...item, status: "declined", completedAtMs: atMs });
+    });
+    return { approvals, items };
+  }
+
+  async getErasureSessionHead(
+    authorization: ErasureWriteAuthorization,
+    sessionId: string,
+  ): Promise<ErasureSessionHead | null> {
+    validateErasureWriteAuthorization(authorization);
+    if (!isCanonicalId("sess", sessionId)) throw new Error("invalid erasure session id");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      // The owner prefix must drive this locking read. A primary-key lookup followed by an owner
+      // predicate may lock a different user's row before MySQL rejects it at the SQL filter.
+      const [rows] = await conn.query<Row[]>(
+        `SELECT session_id, tenant_id, user_id, status, deleted_at_ms, deletion_generation
+           FROM sessions FORCE INDEX (idx_sessions_tenant_user)
+          WHERE tenant_id=? AND user_id=? AND session_id=? FOR SHARE`,
+        [authorization.tenantId, authorization.userId, sessionId],
+      );
+      await this.lockErasureSessionAuthority(conn, authorization, ["draining", "tombstoning"]);
+      const row = rows[0];
+      if (!row) {
+        await conn.commit();
+        return null;
+      }
+      const status = SessionStatusSchema.parse(parse<unknown>(row.status));
+      const generation = Number(row.deletion_generation);
+      if (!Number.isSafeInteger(generation) || generation < 0) {
+        throw new Error("stored session deletion generation is invalid");
+      }
+      const head: ErasureSessionHead = {
+        sessionId,
+        tenantId: authorization.tenantId,
+        userId: authorization.userId,
+        ...(status.type === "active" ? { activeTurnId: status.turnId } : {}),
+        deleted: row.deleted_at_ms != null,
+        deletionGeneration: generation,
+      };
+      await conn.commit();
+      return head;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private erasureTombstoneMarker(
+    deletedAtMs: unknown,
+    purgeAfterMs: unknown,
+    lastSeqValue: unknown,
+    generationValue: unknown,
+  ): { deletedAtMs: number; lastSeq: number; generation: number } {
+    const deletedAt = Number(deletedAtMs);
+    const lastSeq = Number(lastSeqValue);
+    const generation = Number(generationValue);
+    if (
+      !Number.isSafeInteger(deletedAt)
+      || deletedAt < 0
+      || !Number.isSafeInteger(lastSeq)
+      || lastSeq <= 0
+      || !Number.isSafeInteger(generation)
+      || generation <= 0
+      || purgeAfterMs != null
+    ) throw new Error("erasure tombstone marker is corrupt");
+    return { deletedAtMs: deletedAt, lastSeq, generation };
+  }
+
+  private async loadErasureTombstoneProofRows(
+    conn: PoolConnection,
+    sessionId: string,
+    lastSeq: number,
+    generation: number,
+  ): Promise<{ eventRows: Row[]; outboxRows: Row[] }> {
+    const [eventRows] = await conn.query<Row[]>(
+      `SELECT session_id, seq, user_id, type, body, emitted_at_ms
+         FROM events
+        WHERE session_id=? AND seq=? FOR SHARE`,
+      [sessionId, lastSeq],
+    );
+    const [outboxRows] = await conn.query<Row[]>(
+      `SELECT outbox_id, topic, aggregate_id, generation, payload, available_at_ms, attempts,
+              claim_token, lease_until_ms, last_error, completed_at_ms, dead_lettered_at_ms, created_at_ms
+         FROM lifecycle_outbox FORCE INDEX (uk_lifecycle_outbox_identity)
+        WHERE aggregate_id=? AND generation=?
+          AND topic IN ('session.purge', 'session.tombstoned')
+        ORDER BY topic FOR SHARE`,
+      [sessionId, generation],
+    );
+    return { eventRows, outboxRows };
+  }
+
+  private assertErasureTombstoneProofRows(
+    sessionId: string,
+    userId: string,
+    marker: { deletedAtMs: number; lastSeq: number; generation: number },
+    eventRows: Row[],
+    outboxRows: Row[],
+  ): void {
+    const { deletedAtMs, lastSeq, generation } = marker;
+    const eventRow = eventRows[0];
+    let event: ReturnType<typeof EventSchema.safeParse> | undefined;
+    try {
+      event = eventRow ? EventSchema.safeParse(parse<unknown>(eventRow.body)) : undefined;
+    } catch {
+      throw new Error("erasure tombstone event is corrupt");
+    }
+    if (
+      eventRows.length !== 1
+      || !eventRow
+      || !event?.success
+      || eventRow.session_id !== sessionId
+      || Number(eventRow.seq) !== lastSeq
+      || eventRow.user_id !== userId
+      || eventRow.type !== "session/deleted"
+      || Number(eventRow.emitted_at_ms) !== deletedAtMs
+      || event.data.type !== "session/deleted"
+      || event.data.sessionId !== sessionId
+      || event.data.seq !== lastSeq
+      || event.data.emittedAtMs !== deletedAtMs
+      || event.data.deletionGeneration !== generation
+    ) throw new Error("erasure tombstone event is corrupt");
+
+    if (outboxRows.length !== 2) throw new Error("erasure tombstone outbox is missing");
+    let outboxes: LifecycleOutboxRecord[];
+    try {
+      outboxes = outboxRows.map(rowToLifecycleOutbox);
+    } catch {
+      throw new Error("erasure tombstone outbox is corrupt");
+    }
+    const tombstoned = outboxes.find((row) => row.topic === "session.tombstoned");
+    const purge = outboxes.find((row) => row.topic === "session.purge");
+    if (
+      new Set(outboxes.map((row) => row.outboxId)).size !== 2
+      || !tombstoned
+      || tombstoned.aggregateId !== sessionId
+      || tombstoned.generation !== generation
+      || tombstoned.payload.sessionId !== sessionId
+      || tombstoned.payload.deletionGeneration !== generation
+      || tombstoned.payload.eventSeq !== lastSeq
+      || tombstoned.deadLetteredAtMs !== undefined
+      || !purge
+      || purge.aggregateId !== sessionId
+      || purge.generation !== generation
+      || purge.payload.sessionId !== sessionId
+      || purge.payload.deletionGeneration !== generation
+      || purge.availableAtMs !== undefined
+      || purge.attempts !== 0
+      || purge.claimToken !== undefined
+      || purge.leaseUntilMs !== undefined
+      || purge.lastError !== undefined
+      || purge.completedAtMs !== undefined
+      || purge.deadLetteredAtMs !== undefined
+    ) throw new Error("erasure tombstone outbox is corrupt");
+  }
+
+  private async assertExistingErasureSessionTombstone(
+    conn: PoolConnection,
+    sessionId: string,
+    userId: string,
+    deletedAtMs: unknown,
+    purgeAfterMs: unknown,
+    lastSeqValue: unknown,
+    generationValue: unknown,
+  ): Promise<{ lastSeq: number; generation: number }> {
+    const marker = this.erasureTombstoneMarker(
+      deletedAtMs,
+      purgeAfterMs,
+      lastSeqValue,
+      generationValue,
+    );
+    const rows = await this.loadErasureTombstoneProofRows(
+      conn,
+      sessionId,
+      marker.lastSeq,
+      marker.generation,
+    );
+    this.assertErasureTombstoneProofRows(sessionId, userId, marker, rows.eventRows, rows.outboxRows);
+    return { lastSeq: marker.lastSeq, generation: marker.generation };
+  }
+
+  private async erasureTombstoneProofValid(
+    conn: PoolConnection,
+    sessionId: string,
+    userId: string,
+    deletedAtMs: unknown,
+    purgeAfterMs: unknown,
+    lastSeqValue: unknown,
+    generationValue: unknown,
+  ): Promise<boolean> {
+    let marker: { deletedAtMs: number; lastSeq: number; generation: number };
+    try {
+      marker = this.erasureTombstoneMarker(
+        deletedAtMs,
+        purgeAfterMs,
+        lastSeqValue,
+        generationValue,
+      );
+    } catch {
+      return false;
+    }
+    // Query failures deliberately escape so the worker retries. Only deterministic validation of
+    // rows already read from MySQL is collapsed to the content-free invalid-proof bit.
+    const rows = await this.loadErasureTombstoneProofRows(
+      conn,
+      sessionId,
+      marker.lastSeq,
+      marker.generation,
+    );
+    try {
+      this.assertErasureTombstoneProofRows(sessionId, userId, marker, rows.eventRows, rows.outboxRows);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async applyErasureSessionAction(input: ErasureSessionAction): Promise<CommitResult> {
+    // Snapshot the complete capability before the first await. In particular, a caller cannot
+    // mutate session/owner identity while this transaction is waiting for the session row lock.
+    const stagedInput = structuredClone(input);
+    validateErasureSessionAction(stagedInput);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      // Preserve session -> authority lock order while ensuring a forged/cross-owner session id
+      // cannot lock the real owner's row.
+      const [rows] = await conn.query<Row[]>(
+        `SELECT session_id, tenant_id, user_id, status, last_seq, fence_token, updated_at_ms,
+                deleted_at_ms, purge_after_ms, deletion_generation
+           FROM sessions FORCE INDEX (idx_sessions_tenant_user)
+          WHERE tenant_id=? AND user_id=? AND session_id=? FOR UPDATE`,
+        [stagedInput.authority.tenantId, stagedInput.authority.userId, stagedInput.sessionId],
+      );
+      await this.lockErasureSessionAuthority(
+        conn,
+        stagedInput.authority,
+        stagedInput.action === "fence" ? ["draining", "tombstoning"] : ["tombstoning"],
+      );
+      const head = rows[0];
+      if (!head) throw new SessionGoneError(stagedInput.sessionId);
+      const currentFence = Number(head.fence_token);
+      const currentLastSeq = Number(head.last_seq);
+      const currentGeneration = Number(head.deletion_generation);
+      if (!Number.isSafeInteger(currentGeneration) || currentGeneration < 0) {
+        throw new Error("stored session deletion generation is invalid");
+      }
+      if (
+        head.deleted_at_ms == null
+        && (currentGeneration !== 0 || head.purge_after_ms != null)
+      ) {
+        throw new Error("stored live session tombstone marker is corrupt");
+      }
+      if (stagedInput.fence < currentFence) {
+        throw new FenceError(stagedInput.sessionId, stagedInput.fence, currentFence);
+      }
+
+      if (head.deleted_at_ms != null) {
+        if (stagedInput.action !== "tombstone") throw new SessionGoneError(stagedInput.sessionId);
+        const existing = await this.assertExistingErasureSessionTombstone(
+          conn,
+          stagedInput.sessionId,
+          stagedInput.authority.userId,
+          head.deleted_at_ms,
+          head.purge_after_ms,
+          head.last_seq,
+          head.deletion_generation,
+        );
+        await conn.commit();
+        return { events: [], lastSeq: existing.lastSeq, lifecycleGeneration: existing.generation };
+      }
+
+      if (stagedInput.action === "fence") {
+        await conn.query(
+          "UPDATE sessions SET fence_token=? WHERE session_id=?",
+          [stagedInput.fence, stagedInput.sessionId],
+        );
+        await conn.commit();
+        return { events: [], lastSeq: currentLastSeq };
+      }
+
+      const status = SessionStatusSchema.parse(parse<unknown>(head.status));
+      const effectiveAtMs = Math.max(stagedInput.atMs, Number(head.updated_at_ms));
+      if (stagedInput.action === "settle") {
+        if (status.type !== "active") {
+          await conn.query(
+            "UPDATE sessions SET fence_token=? WHERE session_id=?",
+            [stagedInput.fence, stagedInput.sessionId],
+          );
+          await conn.commit();
+          return { events: [], lastSeq: currentLastSeq };
+        }
+
+        const [turnRows] = await conn.query<Row[]>(
+          `SELECT turn_id, session_id, user_id, status, body
+             FROM turns WHERE turn_id=? FOR UPDATE`,
+          [status.turnId],
+        );
+        const turnRow = turnRows[0];
+        if (!turnRow) throw new Error("active erasure turn is missing");
+        const existingTurn = TurnSchema.parse(parse<unknown>(turnRow.body));
+        if (
+          existingTurn.id !== status.turnId
+          || existingTurn.sessionId !== stagedInput.sessionId
+          || existingTurn.sessionId !== turnRow.session_id
+          || existingTurn.status !== "inProgress"
+          || turnRow.status !== "inProgress"
+          || turnRow.user_id !== stagedInput.authority.userId
+        ) throw new Error("active erasure turn identity is corrupt");
+
+        const atMs = Math.max(effectiveAtMs, existingTurn.startedAtMs);
+        const resolution = await this.lockErasureResolution(
+          conn,
+          stagedInput.sessionId,
+          stagedInput.authority.userId,
+          atMs,
+          existingTurn.id,
+        );
+        const resolutionEvents: EventInput[] = [];
+        for (const approval of resolution.approvals) {
+          resolutionEvents.push({
+            type: "approval/resolved",
+            sessionId: stagedInput.sessionId,
+            emittedAtMs: atMs,
+            approval,
+          });
+          const item = resolution.items.find((candidate) => (
+            candidate.type === "approvalRequest" && candidate.approvalId === approval.id
+          ))!;
+          resolutionEvents.push({
+            type: "item/completed",
+            sessionId: stagedInput.sessionId,
+            emittedAtMs: atMs,
+            item,
+          });
+        }
+        const finalSeq = currentLastSeq + resolutionEvents.length + 2;
+        const turn = TurnSchema.parse({
+          ...existingTurn,
+          status: "interrupted",
+          stopReason: "interrupted",
+          seqEnd: finalSeq,
+          completedAtMs: atMs,
+          error: { code: "erasure", message: "turn interrupted for user erasure" },
+        });
+        const inputs: EventInput[] = [
+          ...resolutionEvents,
+          {
+            type: "turn/completed",
+            sessionId: stagedInput.sessionId,
+            emittedAtMs: atMs,
+            turn,
+            stopReason: "interrupted",
+          },
+          {
+            type: "session/status/changed",
+            sessionId: stagedInput.sessionId,
+            emittedAtMs: atMs,
+            status: { type: "idle" },
+          },
+        ];
+        let seq = currentLastSeq;
+        const events = inputs.map((event) => ({ ...event, seq: ++seq } as PersistedEvent));
+        const serializedEvents = events.map((event) => json(event));
+        const serializedItems = resolution.items.map((item) => json(item));
+        const serializedApprovals = resolution.approvals.map((approval) => json(approval));
+        const serializedTurn = json(turn);
+        const serializedIdle = json({ type: "idle" });
+
+        for (const [index, item] of resolution.items.entries()) {
+          const [updated] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE items SET status='declined', body=?, completed_at_ms=?
+              WHERE item_id=? AND session_id=? AND user_id=?
+                AND type='approvalRequest' AND status='inProgress'`,
+            [serializedItems[index], atMs, item.id, stagedInput.sessionId, stagedInput.authority.userId],
+          );
+          if (updated.affectedRows !== 1) throw new Error("erasure approval item changed while locked");
+        }
+        for (const [index, approval] of resolution.approvals.entries()) {
+          const [updated] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE approvals SET status='expired', body=?
+              WHERE approval_id=? AND session_id=? AND user_id=? AND status='pending'`,
+            [serializedApprovals[index], approval.id, stagedInput.sessionId, stagedInput.authority.userId],
+          );
+          if (updated.affectedRows !== 1) throw new Error("erasure approval changed while locked");
+        }
+        const [turnUpdated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE turns SET status='interrupted', stop_reason='interrupted', seq_end=?, body=?, completed_at_ms=?
+            WHERE turn_id=? AND session_id=? AND user_id=? AND status='inProgress'`,
+          [finalSeq, serializedTurn, atMs, turn.id, stagedInput.sessionId, stagedInput.authority.userId],
+        );
+        if (turnUpdated.affectedRows !== 1) throw new Error("erasure turn changed while locked");
+        await conn.query(
+          "INSERT INTO events (session_id, seq, user_id, type, body, emitted_at_ms) VALUES ?",
+          [events.map((event, index) => [
+            stagedInput.sessionId,
+            event.seq,
+            stagedInput.authority.userId,
+            event.type,
+            serializedEvents[index],
+            event.emittedAtMs,
+          ])],
+        );
+        await conn.query(
+          `UPDATE sessions
+              SET status=?, last_seq=?, fence_token=?, updated_at_ms=?
+            WHERE session_id=?`,
+          [serializedIdle, finalSeq, stagedInput.fence, atMs, stagedInput.sessionId],
+        );
+        await conn.commit();
+        return { events, lastSeq: finalSeq };
+      }
+
+      if (status.type === "active") throw new SessionLifecycleBusyError(stagedInput.sessionId);
+      const [children] = await conn.query<Row[]>(
+        "SELECT session_id FROM sessions WHERE parent_session_id=? AND deleted_at_ms IS NULL LIMIT 1 FOR SHARE",
+        [stagedInput.sessionId],
+      );
+      if (children.length) throw new SessionHasChildrenError(stagedInput.sessionId);
+
+      const atMs = effectiveAtMs;
+      const resolution = await this.lockErasureResolution(
+        conn,
+        stagedInput.sessionId,
+        stagedInput.authority.userId,
+        atMs,
+      );
+      const inputs: EventInput[] = [];
+      for (const approval of resolution.approvals) {
+        inputs.push({
+          type: "approval/resolved",
+          sessionId: stagedInput.sessionId,
+          emittedAtMs: atMs,
+          approval,
+        });
+        const item = resolution.items.find((candidate) => (
+          candidate.type === "approvalRequest" && candidate.approvalId === approval.id
+        ))!;
+        inputs.push({ type: "item/completed", sessionId: stagedInput.sessionId, emittedAtMs: atMs, item });
+      }
+      const deletionGeneration = currentGeneration + 1;
+      inputs.push({
+        type: "session/deleted",
+        sessionId: stagedInput.sessionId,
+        emittedAtMs: atMs,
+        deletionGeneration,
+      });
+      let seq = currentLastSeq;
+      const events = inputs.map((event) => ({ ...event, seq: ++seq } as PersistedEvent));
+      const serializedEvents = events.map((event) => json(event));
+      const serializedItems = resolution.items.map((item) => json(item));
+      const serializedApprovals = resolution.approvals.map((approval) => json(approval));
+      const tombstonedPayload = json({
+        sessionId: stagedInput.sessionId,
+        deletionGeneration,
+        eventSeq: seq,
+      });
+      const purgePayload = json({ sessionId: stagedInput.sessionId, deletionGeneration });
+      const clearedAutoApprovals = json([]);
+
+      for (const [index, item] of resolution.items.entries()) {
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE items SET status='declined', body=?, completed_at_ms=?
+            WHERE item_id=? AND session_id=? AND user_id=?
+              AND type='approvalRequest' AND status='inProgress'`,
+          [serializedItems[index], atMs, item.id, stagedInput.sessionId, stagedInput.authority.userId],
+        );
+        if (updated.affectedRows !== 1) throw new Error("erasure approval item changed while locked");
+      }
+      for (const [index, approval] of resolution.approvals.entries()) {
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE approvals SET status='expired', body=?
+            WHERE approval_id=? AND session_id=? AND user_id=? AND status='pending'`,
+          [serializedApprovals[index], approval.id, stagedInput.sessionId, stagedInput.authority.userId],
+        );
+        if (updated.affectedRows !== 1) throw new Error("erasure approval changed while locked");
+      }
+      await conn.query(
+        "INSERT INTO events (session_id, seq, user_id, type, body, emitted_at_ms) VALUES ?",
+        [events.map((event, index) => [
+          stagedInput.sessionId,
+          event.seq,
+          stagedInput.authority.userId,
+          event.type,
+          serializedEvents[index],
+          event.emittedAtMs,
+        ])],
+      );
+      await conn.query(
+        `INSERT INTO lifecycle_outbox
+           (topic, aggregate_id, generation, payload, available_at_ms, attempts, created_at_ms)
+         VALUES ?`,
+        [[
+          ["session.tombstoned", stagedInput.sessionId, deletionGeneration, tombstonedPayload, atMs, 0, atMs],
+          ["session.purge", stagedInput.sessionId, deletionGeneration, purgePayload, null, 0, atMs],
+        ]],
+      );
+      await conn.query(
+        `UPDATE sessions
+            SET last_seq=?, fence_token=?, auto_approved_tools=?, updated_at_ms=?,
+                deleted_at_ms=?, purge_after_ms=NULL, deletion_generation=?
+          WHERE session_id=?`,
+        [seq, stagedInput.fence, clearedAutoApprovals, atMs, atMs, deletionGeneration, stagedInput.sessionId],
+      );
+      await conn.commit();
+      return { events, lastSeq: seq, lifecycleGeneration: deletionGeneration };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private async withErasureCatalogRead<T>(
+    authorization: ErasureWriteAuthorization,
+    phase: ErasureSessionQuery["phase"],
+    nowMs: number,
+    work: (conn: PoolConnection) => Promise<T>,
+  ): Promise<T> {
+    const conn = await this.pool.getConnection();
+    try {
+      // These worker reads hold only the coarse authority rows. The session/usage scans below use
+      // statement snapshots and never lock a whole subject batch, so ordinary row-level lifecycle
+      // work is not serialized behind a long cursor scan.
+      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await conn.beginTransaction();
+      await this.lockErasureSessionAuthority(conn, authorization, [phase], nowMs);
+      const result = await work(conn);
+      await conn.commit();
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async listErasureSessions(
+    authorization: ErasureWriteAuthorization,
+    query: ErasureSessionQuery,
+  ): Promise<ErasureSessionPage> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedQuery = structuredClone(query);
+    validateErasureSessionQuery(stagedAuthorization, stagedQuery);
+    return this.withErasureCatalogRead(
+      stagedAuthorization,
+      stagedQuery.phase,
+      stagedQuery.nowMs,
+      async (conn) => {
+      const where = ["s.tenant_id=?", "s.user_id=?"];
+      const params: unknown[] = [stagedAuthorization.tenantId, stagedAuthorization.userId];
+      if (stagedQuery.phase === "reconciling_usage") {
+        where.push("s.deleted_at_ms IS NOT NULL");
+      } else {
+        where.push("s.deleted_at_ms IS NULL");
+      }
+      if (stagedQuery.phase === "tombstoning") {
+        // The child check deliberately has no owner predicate. A corrupt/imported cross-owner
+        // live child must block its parent instead of being hidden and turned into a dangling row.
+        where.push(`NOT EXISTS (
+          SELECT 1 FROM sessions child
+           WHERE child.parent_session_id=s.session_id AND child.deleted_at_ms IS NULL
+        )`);
+      }
+      if (stagedQuery.afterSessionId !== undefined) {
+        where.push("s.session_id>?");
+        params.push(stagedQuery.afterSessionId);
+      }
+      params.push(stagedQuery.limit + 1);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT s.session_id, s.parent_session_id, s.user_id, s.last_seq,
+                s.deleted_at_ms, s.purge_after_ms, s.deletion_generation
+           FROM sessions s
+          WHERE ${where.join(" AND ")}
+          ORDER BY s.session_id ASC
+          LIMIT ?`,
+        params,
+      );
+      const pageRows = rows.slice(0, stagedQuery.limit);
+      const data: ErasureSessionRef[] = [];
+      for (const row of pageRows) {
+        const ref = rowToErasureSessionRef(row);
+        if (stagedQuery.phase === "reconciling_usage") {
+          ref.tombstoneProofValid = ref.deletionGeneration > 0
+            && String(row.user_id) === stagedAuthorization.userId
+            && await this.erasureTombstoneProofValid(
+              conn,
+              ref.sessionId,
+              stagedAuthorization.userId,
+              row.deleted_at_ms,
+              row.purge_after_ms,
+              row.last_seq,
+              row.deletion_generation,
+            );
+        }
+        data.push(ref);
+      }
+      const nextCursor = rows.length > stagedQuery.limit ? data.at(-1)?.sessionId : undefined;
+      return {
+        data,
+        ...(nextCursor === undefined ? {} : { nextCursor }),
+      };
+      },
+    );
+  }
+
+  async inspectErasureSubjectProgress(
+    authorization: ErasureWriteAuthorization,
+    query: ErasureProgressQuery,
+  ): Promise<ErasureSubjectProgress> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedQuery = structuredClone(query);
+    validateErasureProgressQuery(stagedAuthorization, stagedQuery);
+    return this.withErasureCatalogRead(
+      stagedAuthorization,
+      stagedQuery.phase,
+      stagedQuery.nowMs,
+      async (conn) => {
+      // Keep all counters in one READ COMMITTED statement snapshot. In particular, reconciliation
+      // cannot move between two queries and yield a proof assembled from different database states.
+      const owner = [stagedAuthorization.tenantId, stagedAuthorization.userId];
+      const [rows] = await conn.query<Row[]>(
+        `SELECT
+          (SELECT COUNT(*) FROM sessions s
+            WHERE s.tenant_id=? AND s.user_id=?) AS total_sessions,
+          (SELECT COUNT(*) FROM sessions s
+            WHERE s.tenant_id=? AND s.user_id=? AND s.deleted_at_ms IS NULL) AS live_sessions,
+          (SELECT COUNT(*) FROM sessions s
+            WHERE s.tenant_id=? AND s.user_id=? AND s.deleted_at_ms IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions child
+                 WHERE child.parent_session_id=s.session_id AND child.deleted_at_ms IS NULL
+              )) AS live_leaf_sessions,
+          (SELECT COUNT(*) FROM sessions s
+            WHERE s.tenant_id=? AND s.user_id=? AND s.deleted_at_ms IS NOT NULL) AS tombstoned_sessions,
+          (SELECT COUNT(*) FROM sessions s
+            WHERE s.tenant_id=? AND s.user_id=? AND s.deleted_at_ms IS NOT NULL
+              AND s.deletion_generation=0) AS legacy_generation_zero_sessions,
+          (SELECT COUNT(*) FROM sessions s
+             JOIN usage_reconciliations r
+               ON r.session_id=s.session_id
+              AND r.deletion_generation=s.deletion_generation
+              AND r.tenant_id=s.tenant_id
+              AND r.user_id=s.user_id
+              AND r.status IN ('verified','anonymized')
+            WHERE s.tenant_id=? AND s.user_id=? AND s.deleted_at_ms IS NOT NULL
+              AND s.deletion_generation>0) AS reconciled_usage_sessions,
+          (SELECT COUNT(*) FROM sessions s
+            WHERE s.tenant_id=? AND s.user_id=? AND s.deleted_at_ms IS NOT NULL
+              AND s.deletion_generation>0
+              AND NOT EXISTS (
+                SELECT 1 FROM usage_reconciliations r
+                 WHERE r.session_id=s.session_id
+                   AND r.deletion_generation=s.deletion_generation
+                   AND r.tenant_id=s.tenant_id
+                   AND r.user_id=s.user_id
+                   AND r.status IN ('verified','anonymized')
+              )) AS unreconciled_usage_sessions,
+          ((SELECT COUNT(*) FROM usage_ledger u
+              LEFT JOIN sessions owner_session ON owner_session.session_id=u.session_id
+             WHERE u.tenant_id=? AND u.user_id=?
+               AND (owner_session.session_id IS NULL
+                 OR owner_session.tenant_id<>u.tenant_id
+                 OR owner_session.user_id<>u.user_id))
+           +
+           (SELECT COUNT(*) FROM sessions owner_session
+              JOIN usage_ledger u ON u.session_id=owner_session.session_id
+             WHERE owner_session.tenant_id=? AND owner_session.user_id=?
+               AND (u.tenant_id<>? OR u.user_id<>?))) AS orphan_or_mismatched_usage_rows`,
+        [
+          ...owner,
+          ...owner,
+          ...owner,
+          ...owner,
+          ...owner,
+          ...owner,
+          ...owner,
+          ...owner,
+          ...owner,
+          ...owner,
+        ],
+      );
+      const row = rows[0];
+      if (!row) throw new Error("erasure progress query returned no row");
+      return {
+        totalSessions: erasureProgressCount(row, "total_sessions"),
+        liveSessions: erasureProgressCount(row, "live_sessions"),
+        liveLeafSessions: erasureProgressCount(row, "live_leaf_sessions"),
+        tombstonedSessions: erasureProgressCount(row, "tombstoned_sessions"),
+        legacyGenerationZeroSessions: erasureProgressCount(row, "legacy_generation_zero_sessions"),
+        reconciledUsageSessions: erasureProgressCount(row, "reconciled_usage_sessions"),
+        unreconciledUsageSessions: erasureProgressCount(row, "unreconciled_usage_sessions"),
+        orphanOrMismatchedUsageRows: erasureProgressCount(row, "orphan_or_mismatched_usage_rows"),
+      };
+      },
+    );
+  }
+
   async listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }): Promise<Page<Session>> {
     return this.withConsistentRead(async (conn) => {
       const where = ["s.tenant_id=?", "s.deleted_at_ms IS NULL"];
@@ -2254,11 +3593,13 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
   private async lockUsageLifecycleSession(
     conn: PoolConnection,
     input: ReconcileSessionUsageInput,
-  ): Promise<void> {
+    proofRequired = false,
+  ): Promise<Row> {
     const [rows] = await conn.query<Row[]>(
-      `SELECT tenant_id, user_id, deleted_at_ms, deletion_generation
-         FROM sessions WHERE session_id=? FOR UPDATE`,
-      [input.sessionId],
+      `SELECT tenant_id, user_id, last_seq, deleted_at_ms, purge_after_ms, deletion_generation
+         FROM sessions FORCE INDEX (idx_sessions_tenant_user)
+        WHERE tenant_id=? AND user_id=? AND session_id=? FOR UPDATE`,
+      [input.tenantId, input.userId, input.sessionId],
     );
     const session = rows[0];
     if (
@@ -2266,14 +3607,17 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
       || session.tenant_id !== input.tenantId
       || session.user_id !== input.userId
     ) {
+      if (proofRequired) throw new ErasureTombstoneIntegrityError();
       throw new SessionGoneError(input.sessionId);
     }
     if (
       session.deleted_at_ms == null
       || Number(session.deletion_generation) !== input.deletionGeneration
     ) {
+      if (proofRequired) throw new ErasureTombstoneIntegrityError();
       throw new UsageLifecycleGenerationError(input.sessionId, input.deletionGeneration);
     }
+    return session;
   }
 
   private async lockUsageReconciliation(
@@ -2497,77 +3841,136 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
     };
   }
 
+  /** Session and any erasure authority are already locked by the caller for this transaction. */
+  private async reconcileSessionUsageLocked(
+    conn: PoolConnection,
+    input: ReconcileSessionUsageInput,
+  ): Promise<UsageReconciliationRecord> {
+    const existing = await this.lockUsageReconciliation(conn, input);
+    if (existing?.status === "anonymized") {
+      await this.assertNoOperationalUsage(conn, input);
+      return existing;
+    }
+
+    const { expected, actual } = await this.materializeBillingUsageFacts(
+      conn,
+      input,
+      "reconcile",
+    );
+    const expectedSummary = summarizeBillingUsageFacts(expected);
+    const actualSummary = summarizeBillingUsageFacts(actual);
+    if (!usageReconciliationSummariesEqual(expectedSummary, actualSummary)) {
+      throw new UsageReconciliationError();
+    }
+    if (existing) {
+      if (!usageReconciliationSummariesEqual(usageReconciliationSummary(existing), actualSummary)) {
+        throw new UsageReconciliationError("stored usage reconciliation no longer matches its facts");
+      }
+      return existing;
+    }
+
+    const record: UsageReconciliationRecord = {
+      tenantId: input.tenantId,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      deletionGeneration: input.deletionGeneration,
+      status: "verified",
+      ...actualSummary,
+      verifiedAtMs: input.nowMs,
+    };
+    await conn.query(
+      `INSERT INTO usage_reconciliations
+         (tenant_id, user_id, session_id, deletion_generation, status, row_count, input_tokens,
+          output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+          known_cost_rows, cost_cny, checksum, verified_at_ms, anonymized_at_ms, created_at_ms,
+          updated_at_ms)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        record.tenantId,
+        record.userId,
+        record.sessionId,
+        record.deletionGeneration,
+        record.status,
+        record.rowCount,
+        record.inputTokens,
+        record.outputTokens,
+        record.cacheReadTokens,
+        record.cacheWriteTokens,
+        record.reasoningTokens,
+        record.totalTokens,
+        record.knownCostRows,
+        record.costCNY === undefined ? null : canonicalBillingCostCNY(record.costCNY),
+        record.checksum,
+        record.verifiedAtMs,
+        null,
+        record.verifiedAtMs,
+        record.verifiedAtMs,
+      ],
+    );
+    return record;
+  }
+
   async reconcileSessionUsage(input: ReconcileSessionUsageInput): Promise<UsageReconciliationRecord> {
     validateReconcileSessionUsageInput(input);
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
       await this.lockUsageLifecycleSession(conn, input);
-      const existing = await this.lockUsageReconciliation(conn, input);
-      if (existing?.status === "anonymized") {
-        await this.assertNoOperationalUsage(conn, input);
-        await conn.commit();
-        return existing;
-      }
-
-      const { expected, actual } = await this.materializeBillingUsageFacts(
-        conn,
-        input,
-        "reconcile",
-      );
-      const expectedSummary = summarizeBillingUsageFacts(expected);
-      const actualSummary = summarizeBillingUsageFacts(actual);
-      if (!usageReconciliationSummariesEqual(expectedSummary, actualSummary)) {
-        throw new UsageReconciliationError();
-      }
-      if (existing) {
-        if (!usageReconciliationSummariesEqual(usageReconciliationSummary(existing), actualSummary)) {
-          throw new UsageReconciliationError("stored usage reconciliation no longer matches its facts");
-        }
-        await conn.commit();
-        return existing;
-      }
-
-      const record: UsageReconciliationRecord = {
-        tenantId: input.tenantId,
-        userId: input.userId,
-        sessionId: input.sessionId,
-        deletionGeneration: input.deletionGeneration,
-        status: "verified",
-        ...actualSummary,
-        verifiedAtMs: input.nowMs,
-      };
-      await conn.query(
-        `INSERT INTO usage_reconciliations
-           (tenant_id, user_id, session_id, deletion_generation, status, row_count, input_tokens,
-            output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
-            known_cost_rows, cost_cny, checksum, verified_at_ms, anonymized_at_ms, created_at_ms,
-            updated_at_ms)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [
-          record.tenantId,
-          record.userId,
-          record.sessionId,
-          record.deletionGeneration,
-          record.status,
-          record.rowCount,
-          record.inputTokens,
-          record.outputTokens,
-          record.cacheReadTokens,
-          record.cacheWriteTokens,
-          record.reasoningTokens,
-          record.totalTokens,
-          record.knownCostRows,
-          record.costCNY === undefined ? null : canonicalBillingCostCNY(record.costCNY),
-          record.checksum,
-          record.verifiedAtMs,
-          null,
-          record.verifiedAtMs,
-          record.verifiedAtMs,
-        ],
-      );
+      const result = await this.reconcileSessionUsageLocked(conn, input);
       await conn.commit();
-      return record;
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async reconcileErasureSessionUsage(
+    authorization: ErasureWriteAuthorization,
+    input: ErasureUsageReconciliationInput,
+  ): Promise<UsageReconciliationRecord> {
+    // Freeze the complete authority before the first await so mutable caller objects cannot swap a
+    // token, attempt, owner or timestamp while this method waits for a pooled connection/row lock.
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedInput = structuredClone(input);
+    validateErasureUsageReconciliationInput(stagedAuthorization, stagedInput);
+    const lifecycleInput: ReconcileSessionUsageInput = {
+      tenantId: stagedAuthorization.tenantId,
+      userId: stagedAuthorization.userId,
+      sessionId: stagedInput.sessionId,
+      deletionGeneration: stagedInput.deletionGeneration,
+      nowMs: stagedInput.nowMs,
+    };
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      // Preserve the writer lock order used by claim-bound session actions: session -> tenant ->
+      // user -> request. Reconciliation and usage/billing rows follow those coarse authority locks.
+      // Holding the request lock until commit makes revalidation and every possible write one
+      // linearizable boundary; a transition, retry or ABA reclaim cannot interleave.
+      const proofSession = await this.lockUsageLifecycleSession(conn, lifecycleInput, true);
+      await this.lockErasureSessionAuthority(
+        conn,
+        stagedAuthorization,
+        ["reconciling_usage"],
+        stagedInput.nowMs,
+      );
+      if (!await this.erasureTombstoneProofValid(
+        conn,
+        stagedInput.sessionId,
+        stagedAuthorization.userId,
+        proofSession.deleted_at_ms,
+        proofSession.purge_after_ms,
+        proofSession.last_seq,
+        proofSession.deletion_generation,
+      )) {
+        throw new ErasureTombstoneIntegrityError();
+      }
+      const result = await this.reconcileSessionUsageLocked(conn, lifecycleInput);
+      await conn.commit();
+      return result;
     } catch (error) {
       await conn.rollback().catch(() => {});
       throw error;

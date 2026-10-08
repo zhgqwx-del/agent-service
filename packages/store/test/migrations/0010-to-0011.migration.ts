@@ -12,6 +12,7 @@ const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = resolve(HERE, "../fixtures/mysql-0010.sql");
 const MIGRATION_PATH = resolve(HERE, "../../migrations/0011_erasure_and_usage_separation.sql");
+const MIGRATION_0012_PATH = resolve(HERE, "../../migrations/0012_erasure_job_queue.sql");
 const THROUGH_0010 = [
   "0001_init.sql",
   "0002_auto_approved.sql",
@@ -186,6 +187,7 @@ describe("real MySQL historical upgrade: 0010 -> 0011", () => {
   let fixtureSql: string;
   let migrationStatements: string[];
   let only0011: string;
+  let through0012: string;
 
   beforeAll(async () => {
     baseUrl = assertDisposableMigrationTarget(BASE_URL);
@@ -202,12 +204,16 @@ describe("real MySQL historical upgrade: 0010 -> 0011", () => {
     ))).toHaveLength(1);
     only0011 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0011-"));
     await copyFile(MIGRATION_PATH, join(only0011, "0011_erasure_and_usage_separation.sql"));
+    through0012 = await mkdtemp(join(tmpdir(), "agent-service-migration-through-0012-"));
+    await copyFile(MIGRATION_PATH, join(through0012, "0011_erasure_and_usage_separation.sql"));
+    await copyFile(MIGRATION_0012_PATH, join(through0012, "0012_erasure_job_queue.sql"));
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 
   afterAll(async () => {
     await admin?.end();
     await rm(only0011, { recursive: true, force: true });
+    await rm(through0012, { recursive: true, force: true });
   });
 
   it("converges after usage identity and the first 0011 table auto-commit", async () => {
@@ -433,7 +439,7 @@ describe("real MySQL historical upgrade: 0010 -> 0011", () => {
       // Runtime projections after a historical upgrade are rebuilt from the operational ledger,
       // not trusted from stale 0010 JSON. Exercise both mixed-cost orders, rowless identity,
       // ambiguous legacy zero, exact event prefixes, and compaction snapshots.
-      postMigrationStore = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationsDir: only0011 });
+      postMigrationStore = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationsDir: through0012 });
       const allPriced = await postMigrationStore.getSession("tenant_Case", "sess_Case");
       expect(allPriced?.usage).toEqual({
         inputTokens: 3,
@@ -667,7 +673,7 @@ describe("real MySQL historical upgrade: 0010 -> 0011", () => {
       );
       expect(legacyUsageIdentity).toEqual([expect.objectContaining({ usage_id: null })]);
 
-      postMigrationStore = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0011 });
+      postMigrationStore = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: through0012 });
       expect(await postMigrationStore.getSession(legacyTenantId, legacySessionId)).toMatchObject({
         id: legacySessionId,
         tenantId: legacyTenantId,
@@ -725,7 +731,7 @@ describe("real MySQL historical upgrade: 0010 -> 0011", () => {
           WHERE tenant_id='tenant_Case' AND subject_kind='user' AND subject_id='user_Case'`,
       );
       await conn.query("DELETE FROM schema_migrations WHERE name='0011_erasure_and_usage_separation.sql'");
-      const replayed = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0011 });
+      const replayed = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: through0012 });
       await replayed.close();
       const [gateAfterReplay] = await conn.query<Row[]>(
         `SELECT state, generation, active_request_id, legal_hold_at_ms, updated_at_ms
@@ -749,7 +755,7 @@ describe("real MySQL historical upgrade: 0010 -> 0011", () => {
         legal_hold_at_ms: 221,
         updated_at_ms: 221,
       });
-      postMigrationStore = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0011 });
+      postMigrationStore = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: through0012 });
       expect((await postMigrationStore.getSessionLifecycle(
         "tenant_orphan", "user_orphan", "sess_orphan",
       ))?.session.usage).toMatchObject({ totalTokens: 5, costCNY: 0.5 });

@@ -1,6 +1,9 @@
 export * from "./types.js";
 export * from "./blob-lifecycle.js";
 export * from "./subject-lifecycle.js";
+export * from "./erasure-session.js";
+export * from "./erasure-catalog.js";
+export * from "./erasure-usage.js";
 export * from "./usage-lifecycle.js";
 export * from "./memory.js";
 export { MysqlSessionStore, type MysqlStoreOptions } from "./mysql/store.js";

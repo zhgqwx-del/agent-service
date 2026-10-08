@@ -22,13 +22,91 @@ describe("runner configuration", () => {
     expect(cfg.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
+    expect(cfg.ERASURE_ROUTER_URL).toBeUndefined();
+    expect(cfg.ERASURE_WORKER_POLL_MS).toBe(1_000);
+    expect(cfg.ERASURE_WORKER_LEASE_MS).toBe(30_000);
+    expect(cfg.ERASURE_WORKER_BATCH_SIZE).toBe(10);
+    expect(cfg.ERASURE_WORKER_SESSION_PAGE_SIZE).toBe(100);
+    expect(cfg.ERASURE_WORKER_RETRY_BASE_MS).toBe(1_000);
+    expect(cfg.ERASURE_WORKER_RETRY_MAX_MS).toBe(60_000);
+    expect(cfg.ERASURE_DRAIN_TIMEOUT_MS).toBe(10_000);
+    expect(cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS).toBe(20_000);
     expect(cfg.BLOB_MAX_BYTES).toBe(1_000_000);
     expect(cfg.BLOB_MAX_HYDRATED_BYTES).toBe(4_000_000);
   });
 
   it("keeps subject erasure requests behind an explicit boolean gate", () => {
-    expect(loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_ERASURE_REQUESTS_ENABLED: "1" }).DATA_ERASURE_REQUESTS_ENABLED).toBe(true);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_ERASURE_REQUESTS_ENABLED: "1",
+    })).toThrow(/ERASURE_WORKER_ENABLED=1 is required/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      ERASURE_WORKER_ENABLED: "1",
+    })).toThrow(/ERASURE_ROUTER_URL is required/);
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_ERASURE_REQUESTS_ENABLED: "1",
+      ERASURE_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "http://127.0.0.1:8080/",
+    });
+    expect(enabled.DATA_ERASURE_REQUESTS_ENABLED).toBe(true);
+    expect(enabled.ERASURE_WORKER_ENABLED).toBe(true);
+    expect(enabled.ERASURE_ROUTER_URL).toBe("http://127.0.0.1:8080");
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_ERASURE_REQUESTS_ENABLED: "true" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, ERASURE_WORKER_ENABLED: "true" })).toThrow();
+  });
+
+  it("accepts only a credential-free http(s) router origin", () => {
+    for (const value of [
+      "router.internal:8080",
+      "file:///tmp/router",
+      "https://user:secret@router.internal",
+      "https://router.internal/private",
+      "https://router.internal?target=private",
+      "https://router.internal#private",
+    ]) {
+      expect(() => loadConfig({
+        SECRETS_MASTER_KEY: SECRET,
+        ERASURE_WORKER_ENABLED: "1",
+        ERASURE_ROUTER_URL: value,
+      })).toThrow(/ERASURE_ROUTER_URL/);
+    }
+    expect(loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      ERASURE_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "https://router.internal:8443/",
+    }).ERASURE_ROUTER_URL).toBe("https://router.internal:8443");
+  });
+
+  it("validates erasure worker bounds and retry ordering", () => {
+    const base = {
+      SECRETS_MASTER_KEY: SECRET,
+      ERASURE_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "http://router.internal:8080",
+    };
+    expect(() => loadConfig({ ...base, ERASURE_WORKER_POLL_MS: "0" })).toThrow();
+    expect(() => loadConfig({ ...base, ERASURE_WORKER_LEASE_MS: "99" })).toThrow();
+    expect(() => loadConfig({ ...base, ERASURE_WORKER_BATCH_SIZE: "101" })).toThrow();
+    expect(() => loadConfig({ ...base, ERASURE_WORKER_SESSION_PAGE_SIZE: "201" })).toThrow();
+    expect(() => loadConfig({ ...base, ERASURE_WORKER_REQUEST_TIMEOUT_MS: "99" })).toThrow();
+    expect(() => loadConfig({ ...base, ERASURE_WORKER_REQUEST_TIMEOUT_MS: "30001" })).toThrow();
+    expect(() => loadConfig({
+      ...base,
+      ERASURE_DRAIN_TIMEOUT_MS: "1000",
+      ERASURE_WORKER_REQUEST_TIMEOUT_MS: "2000",
+    })).toThrow(/must be greater than ERASURE_DRAIN_TIMEOUT_MS/);
+    expect(loadConfig({
+      ...base,
+      ERASURE_DRAIN_TIMEOUT_MS: "1000",
+      ERASURE_WORKER_REQUEST_TIMEOUT_MS: "2001",
+    }).ERASURE_WORKER_REQUEST_TIMEOUT_MS).toBe(2001);
+    expect(() => loadConfig({
+      ...base,
+      ERASURE_WORKER_RETRY_BASE_MS: "2",
+      ERASURE_WORKER_RETRY_MAX_MS: "1",
+    })).toThrow(/ERASURE_WORKER_RETRY_MAX_MS/);
   });
 
   it("validates lifecycle outbox worker bounds", () => {

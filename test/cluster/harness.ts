@@ -12,6 +12,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 export const MYSQL_URL = process.env.CLUSTER_MYSQL_URL ?? "mysql://root@127.0.0.1:3306/agent_service_cluster";
 export const REDIS_URL = process.env.CLUSTER_REDIS_URL ?? "redis://127.0.0.1:6379/3";
 const SECRET = "55".repeat(32);
+const INTERNAL_ROUTER_TOKEN = "cluster-internal-router-token-v1-0001";
 
 async function freePort(): Promise<number> {
   return new Promise((res, rej) => {
@@ -48,6 +49,8 @@ export interface Proc {
   log: string[];
   /** SIGKILL: simulates a crash with no chance to drain */
   kill: () => void;
+  /** SIGSTOP: freezes the process while preserving its live sockets and durable leases. */
+  pause: () => void;
   /** SIGTERM: graceful drain */
   term: () => void;
   exited: Promise<number | null>;
@@ -84,6 +87,7 @@ function launch(name: string, script: string, port: number, env: Record<string, 
     child,
     log,
     kill: () => signal("SIGKILL"),
+    pause: () => signal("SIGSTOP"),
     term: () => signal("SIGTERM"),
     exited,
   };
@@ -106,6 +110,19 @@ export interface ClusterOptions {
   script?: ScriptedReply[];
   leaseTtlMs?: number;
   leaseHoldMs?: number;
+  /** Enables both runner admission and the router fleet gate; implies the durable worker. */
+  dataErasureRequestsEnabled?: boolean;
+  /** Runs the durable erasure worker without necessarily accepting new requests. */
+  erasureWorkerEnabled?: boolean;
+  /** Fast-test worker timing; production defaults remain owned by runner config. */
+  erasureWorkerPollMs?: number;
+  erasureWorkerLeaseMs?: number;
+  erasureWorkerRetryBaseMs?: number;
+  erasureWorkerRetryMaxMs?: number;
+  erasureDrainTimeoutMs?: number;
+  erasureWorkerRequestTimeoutMs?: number;
+  /** Per-runner non-secret overrides, useful for deterministic multi-worker races. */
+  runnerEnv?: (runnerNumber: number) => Record<string, string>;
 }
 
 /**
@@ -115,6 +132,8 @@ export interface ClusterOptions {
  */
 export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> {
   const count = opts.runners ?? 2;
+  const erasureWorkerEnabled = opts.erasureWorkerEnabled === true
+    || opts.dataErasureRequestsEnabled === true;
   assertDisposableClusterTargets(MYSQL_URL, REDIS_URL, process.env.AGENT_SERVICE_ALLOW_DESTRUCTIVE_TEST_DB === "1");
 
   // fresh database each run so seq/fence assertions start from a known state
@@ -131,7 +150,12 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
   if (opts.script?.length) vendor.script(...opts.script);
   const vendorUrl = await vendor.start();
 
-  const runnerEnv = (id: string, port: number): Record<string, string> => ({
+  // Allocate the control-plane address before any runner starts so every process receives one
+  // immutable router origin. The router itself still starts after the runner list is complete.
+  const routerPort = await freePort();
+  const routerUrl = `http://127.0.0.1:${routerPort}`;
+
+  const runnerEnv = (id: string, port: number, runnerNumber: number): Record<string, string> => ({
     STORE: "mysql",
     MYSQL_URL,
     REDIS_URL,
@@ -148,6 +172,19 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     LEASE_TTL_MS: String(opts.leaseTtlMs ?? 3_000),
     LEASE_HOLD_MS: String(opts.leaseHoldMs ?? 500),
     SSE_HEARTBEAT_MS: "30000",
+    ERASURE_WORKER_POLL_MS: String(opts.erasureWorkerPollMs ?? 100),
+    ERASURE_WORKER_LEASE_MS: String(opts.erasureWorkerLeaseMs ?? 2_000),
+    ERASURE_WORKER_RETRY_BASE_MS: String(opts.erasureWorkerRetryBaseMs ?? 100),
+    ERASURE_WORKER_RETRY_MAX_MS: String(opts.erasureWorkerRetryMaxMs ?? 1_000),
+    ERASURE_DRAIN_TIMEOUT_MS: String(opts.erasureDrainTimeoutMs ?? 250),
+    ERASURE_WORKER_REQUEST_TIMEOUT_MS: String(opts.erasureWorkerRequestTimeoutMs ?? 2_000),
+    ...opts.runnerEnv?.(runnerNumber),
+    // Security/activation values are intentionally applied after custom test tuning. Every process
+    // in one cluster must share the same private credential and router origin.
+    INTERNAL_ROUTER_TOKEN,
+    ERASURE_WORKER_ENABLED: erasureWorkerEnabled ? "1" : "0",
+    ERASURE_ROUTER_URL: routerUrl,
+    DATA_ERASURE_REQUESTS_ENABLED: opts.dataErasureRequestsEnabled ? "1" : "0",
   });
 
   const runners: Proc[] = [];
@@ -162,7 +199,12 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
   };
   const spawnRunner = async (i: number): Promise<Proc> => {
     const port = await freePort();
-    const p = launch(`runner-${i}`, "apps/agent-runner/src/main.ts", port, runnerEnv(`runner-${i}`, port));
+    const p = launch(
+      `runner-${i}`,
+      "apps/agent-runner/src/main.ts",
+      port,
+      runnerEnv(`runner-${i}`, port, i),
+    );
     started.push(p);
     await waitHttp(`${p.url}/readyz`).catch((e) => abandon(new Error(`${e.message}\n${p.log.slice(-20).join("\n")}`)));
     runners.push(p);
@@ -170,7 +212,6 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
   };
   for (let i = 1; i <= count; i++) await spawnRunner(i);
 
-  const routerPort = await freePort();
   const router = launch("router", "apps/agent-router/src/main.ts", routerPort, {
     ROUTER_PORT: String(routerPort),
     SESSION_TOMBSTONE_ENABLED: "1",
@@ -178,6 +219,9 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     RUNNERS: runners.map((r) => r.url).join(","),
     REDIS_URL,
     HEALTH_INTERVAL_MS: "300",
+    UPSTREAM_HEADER_TIMEOUT_MS: erasureWorkerEnabled ? "1000" : "15000",
+    INTERNAL_ROUTER_TOKEN,
+    DATA_ERASURE_REQUESTS_ENABLED: opts.dataErasureRequestsEnabled ? "1" : "0",
   });
   started.push(router);
   await waitHttp(`${router.url}/readyz`).catch((e) => abandon(new Error(`${e.message}\n${router.log.slice(-20).join("\n")}`)));

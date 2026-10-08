@@ -1,12 +1,26 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { SessionHost, StaticToolRegistry, builtinTools, type AgentEngine, type EngineRun, type EngineSink, type EngineTurnParams, type ResolvedModel } from "@agent-service/core";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ErasureLocalTurnFencedError, SessionHost, StaticToolRegistry, builtinTools, newId, type AgentEngine, type EngineRun, type EngineSink, type EngineTurnParams, type ResolvedModel } from "@agent-service/core";
 import {
+  MemoryEventBus,
+  MemoryLeaseStore,
+  MemorySessionStore,
+  newErasureRequestId,
+  userErasureRequestHash,
+  type ErasureJobClaim,
+} from "@agent-service/store";
+import {
+  ApiError,
+  INTERNAL_ERASURE_DRAIN_ACK_HEADER,
+  INTERNAL_ERASURE_DRAIN_ACK_VALUE,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
+  INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
   INTERNAL_ROUTER_TOKEN_HEADER,
   emptyUsage,
+  type UserErasureDrainRequest,
 } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import { createApp } from "../src/app.js";
@@ -52,6 +66,7 @@ class EchoEngine implements AgentEngine {
 
 const hosts: SessionHost[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const h of hosts.splice(0)) await h.drain(1_000).catch(() => {});
 });
 
@@ -84,6 +99,97 @@ async function makeApp(
   const H = { authorization: "Bearer dev-key", "x-user-id": "u_1", "content-type": "application/json" };
   const call = (path: string, init: RequestInit = {}) => app.request(path, { ...init, headers: { ...H, ...(init.headers as Record<string, string> | undefined) } });
   return { app, store, host, call, H };
+}
+
+function erasureJobAuthorization(claim: ErasureJobClaim) {
+  return {
+    tenantId: claim.tenantId,
+    subjectKind: claim.subjectKind,
+    subjectId: claim.subjectId,
+    requestId: claim.requestId,
+    subjectGeneration: claim.subjectGeneration,
+    claimToken: claim.claimToken,
+    claimAttempt: claim.attempts,
+  };
+}
+
+function erasureDrainBody(claim: ErasureJobClaim): UserErasureDrainRequest {
+  if (claim.subjectKind !== "user") throw new Error("test requires a user erasure claim");
+  return {
+    tenantId: claim.tenantId,
+    userId: claim.subjectId,
+    requestId: claim.requestId,
+    subjectGeneration: claim.subjectGeneration,
+    claimToken: claim.claimToken,
+    claimAttempt: claim.attempts,
+  };
+}
+
+async function claimErasurePhase(
+  store: MemorySessionStore,
+  userId: string,
+  target: "gated" | "draining" | "tombstoning" | "reconciling_usage",
+): Promise<ErasureJobClaim> {
+  let nowMs = Date.now();
+  const requestId = newErasureRequestId();
+  await store.requestUserErasure({
+    requestId,
+    tenantId: "t_dev",
+    userId,
+    requestedByKeyId: "runner-http-test",
+    idempotencyKey: requestId,
+    requestHash: userErasureRequestHash("t_dev", userId),
+    atMs: nowMs,
+  });
+  let claim = (await store.claimErasureJobs({
+    nowMs,
+    limit: 1,
+    leaseMs: 120_000,
+    claimToken: "runner-http-gated",
+  }))[0]!;
+  if (target === "gated") return claim;
+
+  const advance = async (
+    fromStatus: "gated" | "draining" | "tombstoning",
+    toStatus: "draining" | "tombstoning" | "reconciling_usage",
+  ) => {
+    nowMs += 1;
+    expect(await store.transitionErasureJob(erasureJobAuthorization(claim), {
+      fromStatus,
+      toStatus,
+      atMs: nowMs,
+      availableAtMs: nowMs,
+    })).toBe(true);
+    claim = (await store.claimErasureJobs({
+      nowMs,
+      limit: 1,
+      leaseMs: 120_000,
+      claimToken: `runner-http-${toStatus}`,
+    }))[0]!;
+  };
+
+  await advance("gated", "draining");
+  if (target === "draining") return claim;
+  await advance("draining", "tombstoning");
+  if (target === "tombstoning") return claim;
+  await advance("tombstoning", "reconciling_usage");
+  return claim;
+}
+
+function callInternalErasureDrain(
+  app: Awaited<ReturnType<typeof makeApp>>["app"],
+  sessionId: string,
+  body: unknown,
+  token = INTERNAL_ROUTER_TOKEN,
+) {
+  return app.request(`${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/${sessionId}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      [INTERNAL_ROUTER_TOKEN_HEADER]: token,
+    },
+    body: JSON.stringify(body),
+  });
 }
 
 const parseSse = (text: string) =>
@@ -121,14 +227,172 @@ describe("agent-runner HTTP API", () => {
     const storeOnly = await makeApp(60_000, { attachStore: true });
     const enabled = await makeApp(60_000, { enabled: true, attachStore: true });
 
-    for (const app of [gateOnly.app, storeOnly.app]) {
-      expect(await (await app.request("/v1/capabilities")).json()).toMatchObject({
-        features: { dataErasureRequests: false },
-      });
-    }
-    expect(await (await enabled.app.request("/v1/capabilities")).json()).toMatchObject({
-      features: { dataErasureRequests: true },
+    expect(await (await gateOnly.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: { dataErasureRequests: false, userErasureWorker: [] },
     });
+    // Closing admission must not strand an already-durable erasure job.
+    expect(await (await storeOnly.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: { dataErasureRequests: false, userErasureWorker: ["drain-v1"] },
+    });
+    expect(await (await enabled.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: { dataErasureRequests: true, userErasureWorker: ["drain-v1"] },
+    });
+  });
+
+  it("authenticates internal erasure drain before id and body parsing", async () => {
+    const { app, store } = await makeApp(60_000, { attachStore: true });
+    const lookup = vi.spyOn(store, "getUserErasureRequest");
+    const untrusted = await app.request(
+      `${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/not-a-session`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: `{${"x".repeat(4_096)}`,
+      },
+    );
+    expect(untrusted.status).toBe(404);
+    expect(await untrusted.json()).toMatchObject({ error: { code: "not_found" } });
+    expectPrivateLifecycleResponse(untrusted);
+    expect(lookup).not.toHaveBeenCalled();
+
+    const wrongToken = await app.request(
+      `${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/${newId("sess")}`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          [INTERNAL_ROUTER_TOKEN_HEADER]: "wrong-token",
+        },
+        body: `{${"x".repeat(4_096)}`,
+      },
+    );
+    expect(wrongToken.status).toBe(404);
+    expectPrivateLifecycleResponse(wrongToken);
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
+  it("strictly validates the small claim-only erasure drain body and rejects stale or wrong-phase claims", async () => {
+    const draining = await makeApp(60_000, { attachStore: true });
+    const claim = await claimErasurePhase(draining.store, "u_1", "draining");
+    const sessionId = newId("sess");
+    const body = erasureDrainBody(claim);
+    const drain = vi.spyOn(draining.host, "drainSessionForErasure").mockResolvedValue();
+
+    const extraField = await callInternalErasureDrain(draining.app, sessionId, {
+      ...body,
+      phase: "draining",
+    });
+    expect(extraField.status).toBe(400);
+    expectPrivateLifecycleResponse(extraField);
+    expect(drain).not.toHaveBeenCalled();
+
+    const oversized = await callInternalErasureDrain(draining.app, sessionId, {
+      ...body,
+      content: "x".repeat(4_096),
+    });
+    expect(oversized.status).toBe(400);
+    expect(await oversized.json()).toMatchObject({
+      error: { message: "request body exceeds 2048 bytes" },
+    });
+    expectPrivateLifecycleResponse(oversized);
+    expect(drain).not.toHaveBeenCalled();
+
+    const stale = await callInternalErasureDrain(draining.app, sessionId, {
+      ...body,
+      claimAttempt: body.claimAttempt + 1,
+    });
+    expect(stale.status).toBe(404);
+    expectPrivateLifecycleResponse(stale);
+    expect(stale.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER)).toBeNull();
+    expect(drain).not.toHaveBeenCalled();
+
+    const wrongPhase = await makeApp(60_000, { attachStore: true });
+    const reconciling = await claimErasurePhase(wrongPhase.store, "u_phase", "reconciling_usage");
+    const unsupported = await callInternalErasureDrain(
+      wrongPhase.app,
+      sessionId,
+      erasureDrainBody(reconciling),
+    );
+    expect(unsupported.status).toBe(404);
+    expectPrivateLifecycleResponse(unsupported);
+    expect(unsupported.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER)).toBeNull();
+  });
+
+  it("dispatches durable draining and tombstoning phases and acknowledges success and routing conflicts", async () => {
+    const draining = await makeApp(60_000, { attachStore: true });
+    const drainClaim = await claimErasurePhase(draining.store, "u_drain", "draining");
+    const drainBody = erasureDrainBody(drainClaim);
+    const drainSessionId = newId("sess");
+    const drain = vi.spyOn(draining.host, "drainSessionForErasure").mockResolvedValue();
+    const erase = vi.spyOn(draining.host, "eraseSessionForErasure").mockResolvedValue();
+    const drained = await callInternalErasureDrain(draining.app, drainSessionId, drainBody);
+    expect(drained.status).toBe(204);
+    expect(drained.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER)).toBe(INTERNAL_ERASURE_DRAIN_ACK_VALUE);
+    expectPrivateLifecycleResponse(drained);
+    expect(drain).toHaveBeenCalledWith(drainBody, drainSessionId);
+    expect(erase).not.toHaveBeenCalled();
+
+    drain.mockRejectedValueOnce(new ApiError(
+      "session_lease_conflict",
+      "session owned by another runner",
+      { ownerAddr: "http://owner.internal" },
+    ));
+    const conflict = await callInternalErasureDrain(draining.app, drainSessionId, drainBody);
+    expect(conflict.status).toBe(409);
+    expect(conflict.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER)).toBe(INTERNAL_ERASURE_DRAIN_ACK_VALUE);
+    expect(conflict.headers.get("x-owner")).toBe("http://owner.internal");
+    expectPrivateLifecycleResponse(conflict);
+
+    drain.mockRejectedValueOnce(new ErasureLocalTurnFencedError());
+    const locallyFenced = await callInternalErasureDrain(draining.app, drainSessionId, drainBody);
+    expect(locallyFenced.status).toBe(409);
+    expect(locallyFenced.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER)).toBe(
+      INTERNAL_ERASURE_DRAIN_ACK_VALUE,
+    );
+    expect(locallyFenced.headers.get(INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER)).toBe(
+      INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
+    );
+    expectPrivateLifecycleResponse(locallyFenced);
+
+    const tombstoning = await makeApp(60_000, { attachStore: true });
+    const tombstoneClaim = await claimErasurePhase(tombstoning.store, "u_tombstone", "tombstoning");
+    const tombstoneBody = erasureDrainBody(tombstoneClaim);
+    const tombstoneSessionId = newId("sess");
+    const tombstoneDrain = vi.spyOn(tombstoning.host, "drainSessionForErasure").mockResolvedValue();
+    const tombstoneErase = vi.spyOn(tombstoning.host, "eraseSessionForErasure").mockResolvedValue();
+    const erased = await callInternalErasureDrain(
+      tombstoning.app,
+      tombstoneSessionId,
+      tombstoneBody,
+    );
+    expect(erased.status).toBe(204);
+    expect(erased.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER)).toBe(INTERNAL_ERASURE_DRAIN_ACK_VALUE);
+    expectPrivateLifecycleResponse(erased);
+    expect(tombstoneErase).toHaveBeenCalledWith(tombstoneBody, tombstoneSessionId);
+    expect(tombstoneDrain).not.toHaveBeenCalled();
+  });
+
+  it("returns a private 404 when a valid erasure claim targets another user's session", async () => {
+    const { app, store, call } = await makeApp(60_000, { attachStore: true });
+    const agent = await j<{ id: string }>(await call("/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "erasure-cross-owner",
+        instructions: "",
+        model: { provider: "dashscope", model: "qwen-plus" },
+      }),
+    }));
+    const foreignSession = await j<{ id: string }>(await call("/v1/sessions", {
+      method: "POST",
+      headers: { "x-user-id": "u_other" },
+      body: JSON.stringify({ agentId: agent.id }),
+    }));
+    const claim = await claimErasurePhase(store, "u_1", "draining");
+
+    const response = await callInternalErasureDrain(app, foreignSession.id, erasureDrainBody(claim));
+    expect(response.status).toBe(404);
+    expectPrivateLifecycleResponse(response);
+    expect(response.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER)).toBeNull();
   });
 
   it("keeps erasure writes closed by default and enforces admin, user and idempotency identity", async () => {

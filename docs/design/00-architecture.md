@@ -366,7 +366,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `billing_usage_facts` | `usage_id PK, tenant_id, accounting_period, provider/model, token columns, nullable cost, checksum` | 当前最小财务事实；不含 user/session/turn/step/raw JSON |
 | `usage_reconciliations` | owner/session/generation + totals/checksum/status | 当前核对/匿名化 operational 证明，最终 subject purge 尚未实现 |
 | `idempotency_keys` | `(tenant_id, user_id, session_id, idem_key) PK, request_hash, value, expires_at_ms` | 新版只写 completed receipt；升级期可暂存 legacy pending |
-| `subject_lifecycle` / `erasure_requests` / `erasure_audit_events` | tenant + subject + generation/request/status/audit | 当前 user erasure durable gate；worker、tenant erasure 与 completed proof 尚未实现 |
+| `subject_lifecycle` / `erasure_requests` / `erasure_audit_events` | tenant + subject + generation/request/status/audit + claim lease/policy identity | user erasure gate 与 worker queue；当前最多推进到 `awaiting_purge_policy`，tenant erasure/physical purge/completed proof 尚未实现 |
 | `lifecycle_outbox` | topic + aggregate + generation + claim token/lease | 当前可靠投递 `session.tombstoned`；`session.purge` intent 默认不可领取 |
 | `blob_objects` | `blob_id PK, tenant_id, user_id, session_id, item_id, purpose, storage locator, state, integrity descriptor` | ownership manifest；`staging → ready → delete_pending → deleted` |
 | `blob_delete_outbox` | `(blob_id, generation) UNIQUE, available_at_ms, claim token/lease, attempts, completion/dead-letter` | 独立的 at-least-once 物理删除队列 |
@@ -377,7 +377,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 
 滚动升级兼容：迁移保留旧版 runner 写入的 legacy pending receipt；新版命中 pending 时返回 `409 idempotency_conflict`，不得接管或替换，以免旧 runner 随后执行 delayed complete 覆写新版结果。运维上必须先排空并下线全部旧 runner，确认不存在旧进程后，才可清理已过期 pending。新版自身不再创建 pending，只原子写入 completed receipt。
 
-user erasure 的 durable gate 属于不可撤销 admission。router 只有在 writer gate 开启、`RUNNERS` 中每个 configured target 都已通过健康探测并明确声明 `dataErasureRequests`、且本次 selected target 仍满足能力时才接受 POST；暂时不可达的已配置 target 不会被健康子集过滤掉后误判为已排空。writer gate 开启期间，session/usage 等 user-scoped runtime 也会在每次转发前拒绝能力已回退的 selected target；gate 关闭的 expand mixed window 不受此限制。status GET 不依赖 writer gate，仍按健康 fleet 与 selected target capability fail-closed。首次接受 gate 后不得恢复 lifecycle-unaware writer；需要回滚时只能 forward-fix，或先在 edge 阻断相关 user-scoped 流量。
+user erasure 的 durable gate 属于不可撤销 admission。router 只有在 writer gate 开启、`RUNNERS` 中每个 configured target 都健康且声明 `dataErasureRequests`、selected target 仍满足能力时才接受 POST；status GET 继续 fail-closed。runner 内嵌 worker 与 admission 独立，通过 claim-bound `drain-v1` 控制面跨 owner有界请求 abort、child-first tombstone，并在同一事务重验 terminal proof后 reconcile usage，最多到 `awaiting_purge_policy`；它没有一般 SessionStore 写权限，也不执行 anonymize/purge/completed。超时后不主动释放 session lease，router 仅在 Redis 明确确认 owner 消失时绕过旧 runner；未知状态 fail-closed。`0012` 尚无 claim-stage poison quarantine/repair，最早损坏 job可使整批 claim回滚并饿死邻居，必须由后续 `0013` 以 append-only control audit和CAS修复。首次接受 gate 后不得恢复 lifecycle-unaware writer；回滚只能 forward-fix，或先在 edge 阻断相关 user-scoped 流量。
 
 ### 8.2 Redis 键
 

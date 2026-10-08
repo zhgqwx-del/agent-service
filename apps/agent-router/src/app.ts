@@ -1,12 +1,20 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import {
   Capabilities,
+  INTERNAL_ERASURE_DRAIN_ACK_HEADER,
+  INTERNAL_ERASURE_DRAIN_ACK_VALUE,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
+  INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX,
+  INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
   INTERNAL_ROUTER_TOKEN_HEADER,
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
+  UserErasureDrainRequest,
   isCanonicalId,
 } from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
@@ -60,7 +68,18 @@ function sessionIdFrom(pathname: string): string | undefined {
 /** Hop-by-hop headers must not be forwarded, and the upstream sets its own content headers. */
 const STRIP_REQUEST = new Set(["host", "connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-authorization", "te", "content-length", INTERNAL_ROUTER_TOKEN_HEADER]);
 /** `x-owner` is internal topology: the runner needs it, an external client must not see it. */
-const STRIP_RESPONSE = new Set(["connection", "keep-alive", "transfer-encoding", "upgrade", "content-encoding", "content-length", "x-owner", INTERNAL_TOMBSTONE_ACK_HEADER]);
+const STRIP_RESPONSE = new Set([
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "upgrade",
+  "content-encoding",
+  "content-length",
+  "x-owner",
+  INTERNAL_TOMBSTONE_ACK_HEADER,
+  INTERNAL_ERASURE_DRAIN_ACK_HEADER,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
+]);
 
 /** Methods that are safe to send again after a transport failure, with no risk of doing the work twice. */
 const REPLAYABLE = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -72,6 +91,22 @@ const SESSION_BLOB_UPLOAD = /^\/v1\/sessions\/[^/]+\/blobs\/?$/;
 const USER_ERASURE_REQUEST = /^\/v1\/data-erasure-requests\/?$/;
 const USER_ERASURE_STATUS = /^\/v1\/data-erasure-requests\/[^/]+\/?$/;
 const USER_SCOPED_RUNTIME = /^\/v1\/(?:sessions(?:\/|$)|usage\/?$|data-erasure-requests(?:\/|$))/;
+const INTERNAL_ERASURE_BODY_MAX_BYTES = 4_096;
+
+function internalTokenMatches(received: string | undefined, expected: string | undefined): boolean {
+  const left = createHash("sha256").update(received ?? "").digest();
+  const right = createHash("sha256").update(expected ?? "").digest();
+  return received !== undefined && expected !== undefined && timingSafeEqual(left, right);
+}
+
+function privateInternalHeaders(c: { header: (name: string, value: string) => void }): void {
+  c.header("Cache-Control", "no-store");
+  c.header("X-Content-Type-Options", "nosniff");
+}
+
+function internalNotFound(c: { json: (body: object, status: 404) => Response }): Response {
+  return c.json({ error: { code: "not_found", message: "not found" } }, 404);
+}
 
 /**
  * agent-router: stateless. It authenticates nothing itself (the runner is the authority) and holds no
@@ -132,6 +167,10 @@ export function createRouterApp(deps: RouterAppDeps) {
                 sessionLifecycle: lifecycle,
                 blobAttachments: parsed.data.features.blobAttachments && blobAttachmentsAvailable(),
                 dataErasureRequests: parsed.data.features.dataErasureRequests && erasureRequestsAvailable(),
+                userErasureWorker: deps.internalRunnerToken
+                  && deps.registry.allHealthySupportUserErasureWorker()
+                  ? ["drain-v1"]
+                  : [],
               },
             } satisfies Capabilities);
           }
@@ -164,9 +203,167 @@ export function createRouterApp(deps: RouterAppDeps) {
     });
   });
 
+  /**
+   * Runner-worker to router control plane. The shared credential is checked before the session id
+   * or body is parsed, and only the fixed claim envelope is ever forwarded to a configured target.
+   */
+  app.post(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/:id`, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+
+    const sessionId = c.req.param("id");
+    if (!isCanonicalId("sess", sessionId)) return internalNotFound(c);
+
+    const declaredLength = Number(c.req.header("content-length") ?? "0");
+    if (declaredLength > INTERNAL_ERASURE_BODY_MAX_BYTES) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    const read = await readCapped(c.req.raw.body, INTERNAL_ERASURE_BODY_MAX_BYTES);
+    if (!read.ok) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder().decode(read.bytes));
+    } catch {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    const parsed = UserErasureDrainRequest.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    const body = new TextEncoder().encode(JSON.stringify(parsed.data));
+    const upstreamUrl = new URL(c.req.url);
+    upstreamUrl.pathname = `${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/${sessionId}`;
+    upstreamUrl.search = "";
+    const upstreamHeaders = new Headers({
+      "content-type": "application/json",
+      [INTERNAL_ROUTER_TOKEN_HEADER]: deps.internalRunnerToken!,
+    });
+
+    const owner = await deps.registry.owner(sessionId);
+    let target = owner ?? deps.registry.candidate(sessionId);
+    if (owner && !deps.registry.supportsUserErasureWorker(owner)) {
+      return c.json({
+        error: { code: "draining", message: "session erasure owner is upgrading", retryable: true },
+      }, 503);
+    }
+    if (!target || !deps.registry.supportsUserErasureWorker(target)) {
+      target = deps.registry.list().find((candidate) => (
+        candidate.healthy && deps.registry.supportsUserErasureWorker(candidate.url)
+      ))?.url;
+    }
+    if (!target) {
+      return c.json({
+        error: { code: "draining", message: "no erasure-capable runner is available", retryable: true },
+      }, 503);
+    }
+
+    const tried = new Set<string>();
+    let rerouted = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!deps.registry.supportsUserErasureWorker(target)) {
+        return c.json({
+          error: { code: "draining", message: "session erasure target is upgrading", retryable: true },
+        }, 503);
+      }
+      tried.add(target);
+      let response: Response;
+      try {
+        response = await forward(
+          target,
+          upstreamUrl,
+          "POST",
+          upstreamHeaders,
+          body,
+          deps.upstreamHeaderTimeoutMs,
+        );
+      } catch {
+        deps.registry.markFailure(target);
+        const retry = deps.registry.list().find((candidate) => (
+          candidate.healthy
+          && !tried.has(candidate.url)
+          && deps.registry.supportsUserErasureWorker(candidate.url)
+        ))?.url;
+        if (!retry || attempt === 1) {
+          return c.json({
+            error: { code: "draining", message: "session erasure owner is unavailable", retryable: true },
+          }, 503);
+        }
+        target = retry;
+        continue;
+      }
+
+      if (response.headers.get(INTERNAL_ERASURE_DRAIN_ACK_HEADER) !== INTERNAL_ERASURE_DRAIN_ACK_VALUE) {
+        await response.body?.cancel().catch(() => {});
+        return c.json({
+          error: { code: "draining", message: "runner lacks the erasure drain-v1 contract", retryable: true },
+        }, 503);
+      }
+
+      if (response.status === 409 && !rerouted && attempt === 0) {
+        const localFenced = response.headers.get(INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER)
+          === INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE;
+        if (localFenced) {
+          // While Redis still names any authoritative owner, bypassing this process could overlap
+          // provider/tool side effects. Once that lease naturally disappears, retrying the same
+          // locally-fenced hash candidate can never make progress, so exclude it exactly once.
+          const ownerPresent = await deps.registry.hasLeaseOwner(sessionId);
+          if (ownerPresent === false) {
+            const retry = deps.registry.list().find((candidate) => (
+              candidate.healthy
+              && !tried.has(candidate.url)
+              && deps.registry.supportsUserErasureWorker(candidate.url)
+            ))?.url;
+            if (retry) {
+              await response.body?.cancel().catch(() => {});
+              rerouted = true;
+              target = retry;
+              continue;
+            }
+          }
+        }
+        if (!localFenced) {
+          const advertisedOwner = response.headers.get("x-owner");
+          const ownerUrl = advertisedOwner ? deps.registry.routeableUrl(advertisedOwner) : undefined;
+          if (
+            ownerUrl
+            && !tried.has(ownerUrl)
+            && deps.registry.supportsUserErasureWorker(ownerUrl)
+          ) {
+            await response.body?.cancel().catch(() => {});
+            rerouted = true;
+            target = ownerUrl;
+            continue;
+          }
+        }
+      }
+
+      const result = streamBack(response);
+      result.headers.set(INTERNAL_ERASURE_DRAIN_ACK_HEADER, INTERNAL_ERASURE_DRAIN_ACK_VALUE);
+      result.headers.set("Cache-Control", "no-store");
+      result.headers.set("X-Content-Type-Options", "nosniff");
+      return result;
+    }
+
+    return c.json({
+      error: { code: "draining", message: "session erasure owner is unavailable", retryable: true },
+    }, 503);
+  });
+
   app.all("*", async (c) => {
     const url = new URL(c.req.url);
-    if (url.pathname === INTERNAL_TOMBSTONE_PATH_PREFIX || url.pathname.startsWith(`${INTERNAL_TOMBSTONE_PATH_PREFIX}/`)) {
+    if (
+      url.pathname === INTERNAL_TOMBSTONE_PATH_PREFIX
+      || url.pathname.startsWith(`${INTERNAL_TOMBSTONE_PATH_PREFIX}/`)
+      || url.pathname === INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX
+      || url.pathname.startsWith(`${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/`)
+      || url.pathname === INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX
+      || url.pathname.startsWith(`${INTERNAL_ERASURE_DRAIN_ROUTER_PATH_PREFIX}/`)
+    ) {
+      privateInternalHeaders(c);
       return c.json({ error: { code: "not_found", message: "not found" } }, 404);
     }
     const sessionId = sessionIdFrom(url.pathname);
@@ -376,7 +573,10 @@ async function readCapped(stream: ReadableStream<Uint8Array> | null, maxBytes: n
       if (done) break;
       if (!value) continue;
       total += value.byteLength;
-      if (total > maxBytes) return { ok: false };
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return { ok: false };
+      }
       chunks.push(value);
     }
   } finally {

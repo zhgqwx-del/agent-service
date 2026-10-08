@@ -837,6 +837,17 @@ export const OPENAPI_DOCUMENT = {
                   true
                 ],
                 "type": "boolean"
+              },
+              "userErasureWorker": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "drain-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
               }
             },
             "required": [

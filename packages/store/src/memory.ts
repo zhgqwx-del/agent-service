@@ -2,7 +2,9 @@ import type {
   AgentDefinition,
   Approval,
   Event,
+  EventInput,
   Item,
+  ItemOf,
   PersistedEvent,
   ProviderConfig,
   Session,
@@ -12,7 +14,18 @@ import type {
   Usage,
   UsageQuery,
 } from "@agent-service/protocol";
-import { DEFAULT_AUTH_POLICY, DEFAULT_SCOPES, addUsage, emptyUsageAccumulator, isCanonicalId } from "@agent-service/protocol";
+import {
+  Approval as ApprovalSchema,
+  DEFAULT_AUTH_POLICY,
+  DEFAULT_SCOPES,
+  Event as EventSchema,
+  Item as ItemSchema,
+  Session as SessionSchema,
+  Turn as TurnSchema,
+  addUsage,
+  emptyUsageAccumulator,
+  isCanonicalId,
+} from "@agent-service/protocol";
 import { createHash } from "node:crypto";
 import {
   BlobConflictError,
@@ -115,15 +128,57 @@ import {
 import {
   ErasureIdempotencyMismatchError,
   SubjectDeletingError,
+  erasureJobClaimFromRecord,
+  erasureJobAuthorizationMatches,
+  erasureWriteAuthorizationMatches,
+  isClaimableErasureRequestStatus,
   subjectLifecycleKey,
+  validateClaimErasureJobsOptions,
+  validateErasureJobAuthorization,
+  validateErasureAuditChain,
+  validateErasureRequestRecord,
   validateRequestUserErasureInput,
+  validateRenewErasureJobClaimOptions,
+  validateRetryErasureJobOptions,
+  validateTransitionErasureJobOptions,
+  type ClaimErasureJobsOptions,
   type DataSubjectKind,
   type ErasureAuditEvent,
+  type ErasureJobAuthorization,
+  type ErasureJobClaim,
+  type ErasureJobStore,
   type ErasureRequestRecord,
+  type ErasureRequestStatus,
+  type ErasureWriteAuthorization,
   type RequestUserErasureInput,
+  type RetryErasureJobOptions,
+  type RenewErasureJobClaimOptions,
   type SubjectLifecycleRecord,
   type SubjectLifecycleStore,
+  type TransitionErasureJobOptions,
 } from "./subject-lifecycle.js";
+import {
+  validateErasureSessionAction,
+  type ErasureSessionAction,
+  type ErasureSessionHead,
+  type ErasureSessionStore,
+} from "./erasure-session.js";
+import {
+  validateErasureProgressQuery,
+  validateErasureSessionQuery,
+  type ErasureProgressQuery,
+  type ErasureSessionCatalogStore,
+  type ErasureSessionPage,
+  type ErasureSessionQuery,
+  type ErasureSessionRef,
+  type ErasureSubjectProgress,
+} from "./erasure-catalog.js";
+import {
+  ErasureTombstoneIntegrityError,
+  validateErasureUsageReconciliationInput,
+  type ErasureUsageReconciliationInput,
+  type ErasureUsageReconciliationStore,
+} from "./erasure-usage.js";
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -163,7 +218,7 @@ function validateUploadedBlobInput(input: MarkBlobUploadedInput): void {
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore {
   agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -327,6 +382,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       createdAtMs: input.atMs,
       gatedAtMs: input.atMs,
       updatedAtMs: input.atMs,
+      availableAtMs: input.atMs,
+      attempts: 0,
     });
     const stagedAudit = clone<ErasureAuditEvent>({
       requestId: input.requestId,
@@ -374,6 +431,777 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   async listErasureAuditEvents(requestId: string): Promise<ErasureAuditEvent[]> {
     return (this.erasureAuditEvents.get(requestId) ?? []).map(clone);
+  }
+
+  private assertErasureJobIntegrity(record: ErasureRequestRecord): SubjectLifecycleRecord {
+    validateErasureRequestRecord(record);
+    const subject = this.subjectRecord(record.tenantId, record.subjectKind, record.subjectId);
+    if (
+      !subject
+      || subject.state !== "deleting"
+      || subject.generation !== record.generation
+      || subject.activeRequestId !== record.requestId
+    ) throw new Error("erasure request does not match its active subject lifecycle");
+    const audits = this.erasureAuditEvents.get(record.requestId);
+    if (!audits) throw new Error("erasure request audit chain is corrupt");
+    validateErasureAuditChain(record, audits);
+    if (record.subjectKind === "user") {
+      const key = JSON.stringify([record.tenantId, "user", record.subjectId, record.idempotencyKey]);
+      if (this.erasureIdempotency.get(key) !== record.requestId) {
+        throw new Error("erasure request idempotency index is corrupt");
+      }
+    }
+    return subject;
+  }
+
+  async claimErasureJobs(options: ClaimErasureJobsOptions): Promise<ErasureJobClaim[]> {
+    const leaseUntilMs = validateClaimErasureJobsOptions(options);
+    const candidates = [...this.erasureRequests.values()]
+      .filter((record) => (
+        isClaimableErasureRequestStatus(record.status)
+        && record.availableAtMs !== undefined
+        && record.availableAtMs <= options.nowMs
+        && (record.claimToken === undefined
+          || (record.leaseUntilMs !== undefined && record.leaseUntilMs <= options.nowMs))
+      ))
+      .sort((left, right) => (
+        left.availableAtMs! - right.availableAtMs!
+        || left.requestId.localeCompare(right.requestId)
+      ))
+      .slice(0, options.limit);
+    const staged = new Map<string, ErasureRequestRecord>();
+    for (const current of candidates) {
+      this.assertErasureJobIntegrity(current);
+      const next = clone<ErasureRequestRecord>({
+        ...current,
+        attempts: current.attempts + 1,
+        claimToken: options.claimToken,
+        leaseUntilMs,
+      });
+      validateErasureRequestRecord(next);
+      staged.set(next.requestId, next);
+    }
+    for (const [requestId, record] of staged) this.erasureRequests.set(requestId, record);
+    return [...staged.values()].map((record) => clone(erasureJobClaimFromRecord(record)));
+  }
+
+  async renewErasureJobClaim(
+    authorization: ErasureJobAuthorization,
+    options: RenewErasureJobClaimOptions,
+  ): Promise<boolean> {
+    validateErasureJobAuthorization(authorization);
+    const leaseUntilMs = validateRenewErasureJobClaimOptions(options);
+    const current = this.erasureRequests.get(authorization.requestId);
+    if (!current) return false;
+    this.assertErasureJobIntegrity(current);
+    if (!erasureJobAuthorizationMatches(current, authorization, options.nowMs)) return false;
+    const next = clone(current);
+    next.leaseUntilMs = Math.max(current.leaseUntilMs!, leaseUntilMs);
+    validateErasureRequestRecord(next);
+    this.erasureRequests.set(next.requestId, next);
+    return true;
+  }
+
+  async transitionErasureJob(
+    authorization: ErasureJobAuthorization,
+    options: TransitionErasureJobOptions,
+  ): Promise<boolean> {
+    validateErasureJobAuthorization(authorization);
+    validateTransitionErasureJobOptions(options);
+    const current = this.erasureRequests.get(authorization.requestId);
+    if (!current) return false;
+    const subject = this.assertErasureJobIntegrity(current);
+    if (
+      current.status !== options.fromStatus
+      || !erasureJobAuthorizationMatches(current, authorization, options.atMs)
+    ) return false;
+    if (
+      options.policyVersion !== undefined
+      && current.policyVersion !== undefined
+      && (current.policyVersion !== options.policyVersion || current.policyHash !== options.policyHash)
+    ) throw new Error("erasure policy identity is immutable");
+
+    const effectiveAtMs = Math.max(current.updatedAtMs, options.atMs);
+    const next = clone(current);
+    next.status = options.toStatus;
+    next.updatedAtMs = effectiveAtMs;
+    next.availableAtMs = options.availableAtMs;
+    next.lastErrorCode = options.toStatus === "blocked" ? options.errorCode : undefined;
+    next.policyVersion = options.policyVersion ?? current.policyVersion;
+    next.policyHash = options.policyHash ?? current.policyHash;
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+    if (options.toStatus === "completed") {
+      next.completedAtMs = effectiveAtMs;
+      next.counts = clone(options.counts!);
+      next.checksum = options.checksum;
+    } else {
+      delete next.completedAtMs;
+      delete next.counts;
+      delete next.checksum;
+    }
+    if (next.availableAtMs === undefined) delete next.availableAtMs;
+    if (next.lastErrorCode === undefined) delete next.lastErrorCode;
+    if (next.policyVersion === undefined) delete next.policyVersion;
+    if (next.policyHash === undefined) delete next.policyHash;
+    validateErasureRequestRecord(next);
+
+    const existingAudits = this.erasureAuditEvents.get(current.requestId)!;
+    // Stage the entire chain so a non-cloneable/corrupt prior payload cannot publish half a state
+    // transition in the in-memory reference implementation.
+    const stagedAudits = clone(existingAudits);
+    const auditType: ErasureAuditEvent["type"] = options.toStatus === "blocked"
+      ? "erasure/blocked"
+      : options.toStatus === "completed"
+        ? "erasure/completed"
+        : "erasure/status_changed";
+    const payload: Record<string, unknown> = {
+      fromStatus: options.fromStatus,
+      status: options.toStatus,
+      generation: current.generation,
+      ...(next.policyVersion === undefined ? {} : { policyVersion: next.policyVersion }),
+      ...(next.policyHash === undefined ? {} : { policyHash: next.policyHash }),
+      ...(options.errorCode === undefined ? {} : { errorCode: options.errorCode }),
+      ...(options.counts === undefined ? {} : { counts: clone(options.counts) }),
+      ...(options.checksum === undefined ? {} : { checksum: options.checksum }),
+    };
+    stagedAudits.push(clone({
+      requestId: current.requestId,
+      seq: stagedAudits.length + 1,
+      type: auditType,
+      payload,
+      emittedAtMs: effectiveAtMs,
+    }));
+
+    let nextSubject: SubjectLifecycleRecord | undefined;
+    if (options.toStatus === "completed") {
+      nextSubject = clone({
+        ...subject,
+        state: "erased",
+        updatedAtMs: Math.max(subject.updatedAtMs, effectiveAtMs),
+      });
+      delete nextSubject.activeRequestId;
+    }
+
+    this.erasureRequests.set(next.requestId, next);
+    this.erasureAuditEvents.set(next.requestId, stagedAudits);
+    if (nextSubject) {
+      this.subjectLifecycles.set(
+        subjectLifecycleKey(nextSubject.tenantId, nextSubject.subjectKind, nextSubject.subjectId),
+        nextSubject,
+      );
+    }
+    return true;
+  }
+
+  async retryErasureJob(
+    authorization: ErasureJobAuthorization,
+    options: RetryErasureJobOptions,
+  ): Promise<boolean> {
+    validateErasureJobAuthorization(authorization);
+    validateRetryErasureJobOptions(options);
+    const current = this.erasureRequests.get(authorization.requestId);
+    if (!current) return false;
+    this.assertErasureJobIntegrity(current);
+    if (!erasureJobAuthorizationMatches(current, authorization, options.failedAtMs)) return false;
+    const next = clone(current);
+    next.updatedAtMs = Math.max(current.updatedAtMs, options.failedAtMs);
+    next.availableAtMs = options.availableAtMs;
+    next.lastErrorCode = options.errorCode;
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+    validateErasureRequestRecord(next);
+    this.erasureRequests.set(next.requestId, next);
+    return true;
+  }
+
+  private assertErasureSessionAuthority(
+    authorization: ErasureWriteAuthorization,
+    allowedStatuses: readonly ErasureRequestStatus[],
+    nowMs: number,
+  ): ErasureRequestRecord {
+    const request = this.erasureRequests.get(authorization.requestId);
+    const tenant = this.subjectRecord(authorization.tenantId, "tenant", authorization.tenantId);
+    const user = this.subjectRecord(authorization.tenantId, "user", authorization.userId);
+    if (
+      !request
+      || !tenant
+      || tenant.state !== "active"
+      || !user
+      || user.state !== "deleting"
+      || user.generation !== authorization.subjectGeneration
+      || user.activeRequestId !== authorization.requestId
+    ) throw new Error("stale erasure authority");
+    this.assertErasureJobIntegrity(request);
+    if (
+      !allowedStatuses.includes(request.status)
+      || !erasureWriteAuthorizationMatches(request, authorization, nowMs)
+    ) throw new Error("stale erasure authority");
+    return request;
+  }
+
+  private cloneAndValidateErasureEventLog(session: Session): PersistedEvent[] {
+    const current = this.events.get(session.id);
+    if (!current) throw new Error("erasure session event log is missing");
+    const staged = clone(current);
+    if (staged.length !== session.lastSeq) throw new Error("erasure session event cursor is corrupt");
+    for (const [index, event] of staged.entries()) {
+      if (
+        event.sessionId !== session.id
+        || event.seq !== index + 1
+        || !EventSchema.safeParse(event).success
+      ) throw new Error("erasure session event log is corrupt");
+    }
+    return staged;
+  }
+
+  private stageErasureApprovalTerminals(
+    sessionId: string,
+    atMs: number,
+    turnId?: string,
+  ): { approvals: Approval[]; items: Item[]; events: EventInput[] } {
+    const selected = [...this.approvals.entries()]
+      .filter(([, approval]) => (
+        approval.sessionId === sessionId
+        && approval.status === "pending"
+        && (turnId === undefined || approval.turnId === turnId)
+      ))
+      .sort((left, right) => left[1].id.localeCompare(right[1].id));
+    const approvals: Approval[] = [];
+    const items: Item[] = [];
+    const events: EventInput[] = [];
+    const approvalIds = new Set<string>();
+    const itemIds = new Set<string>();
+    const selectedApprovalIds = new Set(selected.map(([, approval]) => approval.id));
+    const scopedInProgressItems = [...this.items.entries()].filter(
+      (entry): entry is [string, ItemOf<"approvalRequest">] => {
+        const item = entry[1];
+        return item.sessionId === sessionId
+          && item.type === "approvalRequest"
+          && item.status === "inProgress"
+          && (turnId === undefined || item.turnId === turnId);
+      },
+    );
+    if (scopedInProgressItems.some(([, item]) => !selectedApprovalIds.has(item.approvalId))) {
+      throw new Error("erasure approval item is orphaned");
+    }
+
+    for (const [approvalKey, storedApproval] of selected) {
+      if (
+        approvalKey !== storedApproval.id
+        || approvalIds.has(storedApproval.id)
+        || [...this.approvals.values()].filter((candidate) => candidate.id === storedApproval.id).length !== 1
+        || !ApprovalSchema.safeParse(storedApproval).success
+      ) throw new Error("erasure approval identity is corrupt");
+      approvalIds.add(storedApproval.id);
+
+      const approvalTurn = this.turns.get(storedApproval.turnId);
+      if (
+        !approvalTurn
+        || approvalTurn.id !== storedApproval.turnId
+        || approvalTurn.sessionId !== sessionId
+        || !TurnSchema.safeParse(approvalTurn).success
+      ) throw new Error("erasure approval turn identity is corrupt");
+
+      // Historical rows may point Approval.itemId at the tool-call item. The durable relationship is
+      // approvalRequest.approvalId; require a strict one-to-one existing association and never INSERT.
+      const associated = [...this.items.entries()].filter(
+        (entry): entry is [string, ItemOf<"approvalRequest">] => {
+          const item = entry[1];
+          return item.sessionId === sessionId
+            && item.type === "approvalRequest"
+            && item.approvalId === storedApproval.id;
+        },
+      );
+      if (associated.length !== 1) throw new Error("erasure approval item association is corrupt");
+      const [itemKey, storedItem] = associated[0]!;
+      if (
+        itemKey !== storedItem.id
+        || itemIds.has(storedItem.id)
+        || [...this.items.values()].filter((candidate) => candidate.id === storedItem.id).length !== 1
+        || storedItem.turnId !== storedApproval.turnId
+        || storedItem.toolCallId !== storedApproval.toolCallId
+        || storedItem.name !== storedApproval.toolName
+        || storedItem.status !== "inProgress"
+        || !ItemSchema.safeParse(storedItem).success
+      ) throw new Error("erasure approval item identity is corrupt");
+      itemIds.add(storedItem.id);
+
+      const approval = clone<Approval>({
+        ...storedApproval,
+        status: "expired",
+        decision: "cancel",
+        decidedBy: "system:erasure",
+        resolvedAtMs: atMs,
+      });
+      const item = clone<Item>({
+        ...storedItem,
+        status: "declined",
+        completedAtMs: atMs,
+      });
+      if (!ApprovalSchema.safeParse(approval).success || !ItemSchema.safeParse(item).success) {
+        throw new Error("erasure approval terminal projection is invalid");
+      }
+      approvals.push(approval);
+      items.push(item);
+      events.push(clone({ type: "approval/resolved", sessionId, emittedAtMs: atMs, approval }));
+      events.push(clone({ type: "item/completed", sessionId, emittedAtMs: atMs, item }));
+    }
+    return { approvals, items, events };
+  }
+
+  private assertExistingErasureTombstone(
+    session: Session,
+    tombstone: { deletedAtMs: number; purgeAfterMs?: number; deletionGeneration: number },
+  ): void {
+    if (
+      !Number.isSafeInteger(tombstone.deletedAtMs)
+      || tombstone.deletedAtMs < 0
+      || !Number.isSafeInteger(tombstone.deletionGeneration)
+      || tombstone.deletionGeneration <= 0
+      || tombstone.purgeAfterMs !== undefined
+    ) throw new Error("erasure tombstone marker is corrupt");
+    const log = this.cloneAndValidateErasureEventLog(session);
+    const terminal = log.at(-1);
+    if (
+      terminal?.type !== "session/deleted"
+      || terminal.deletionGeneration !== tombstone.deletionGeneration
+      || terminal.emittedAtMs !== tombstone.deletedAtMs
+    ) throw new Error("erasure tombstone event is corrupt");
+
+    const outboxIds = new Set<number>();
+    for (const topic of ["session.tombstoned", "session.purge"] as const) {
+      const key = this.lifecycleOutboxMapKey(topic, session.id, tombstone.deletionGeneration);
+      const row = this.lifecycleOutbox.get(key);
+      if (!row) throw new Error("erasure tombstone outbox is missing");
+      assertLifecycleOutboxId(row.outboxId);
+      outboxIds.add(row.outboxId);
+      const envelope = parseLifecycleOutboxEnvelope(row.topic, clone(row.payload));
+      if (
+        row.topic !== topic
+        || row.aggregateId !== session.id
+        || row.generation !== tombstone.deletionGeneration
+        || envelope.payload.sessionId !== session.id
+        || envelope.payload.deletionGeneration !== tombstone.deletionGeneration
+      ) throw new Error("erasure tombstone outbox is corrupt");
+      if (
+        topic === "session.tombstoned"
+        && (
+          envelope.topic !== "session.tombstoned"
+          || !("eventSeq" in envelope.payload)
+          || envelope.payload.eventSeq !== terminal.seq
+          || row.deadLetteredAtMs !== undefined
+        )
+      ) throw new Error("erasure tombstone outbox is corrupt");
+      if (
+        topic === "session.purge"
+        && (
+          envelope.topic !== "session.purge"
+          || row.availableAtMs !== undefined
+          || row.attempts !== 0
+          || row.claimToken !== undefined
+          || row.leaseUntilMs !== undefined
+          || row.lastError !== undefined
+          || row.completedAtMs !== undefined
+          || row.deadLetteredAtMs !== undefined
+        )
+      ) throw new Error("erasure tombstone outbox is corrupt");
+    }
+    if (outboxIds.size !== 2) throw new Error("erasure tombstone outbox is corrupt");
+  }
+
+  private erasureTombstoneProofValid(
+    session: Session,
+    tombstone: { deletedAtMs: number; purgeAfterMs?: number; deletionGeneration: number },
+  ): boolean {
+    try {
+      this.assertExistingErasureTombstone(session, tombstone);
+      return true;
+    } catch {
+      // Memory has no transport boundary: every failure here is a deterministic stored-proof
+      // conflict. The catalog exposes only this bit and never the corrupt content or exception.
+      return false;
+    }
+  }
+
+  async getErasureSessionHead(
+    authorization: ErasureWriteAuthorization,
+    sessionId: string,
+  ): Promise<ErasureSessionHead | null> {
+    const stagedAuthorization = clone(authorization);
+    if (!isCanonicalId("sess", sessionId)) throw new Error("invalid erasure session identity");
+    this.assertErasureSessionAuthority(stagedAuthorization, ["draining", "tombstoning"], Date.now());
+    const session = this.sessions.get(sessionId);
+    if (
+      !session
+      || session.tenantId !== stagedAuthorization.tenantId
+      || session.userId !== stagedAuthorization.userId
+    ) {
+      return null;
+    }
+    if (session.id !== sessionId) throw new Error("erasure session identity is corrupt");
+    const tombstone = this.deleted.get(sessionId);
+    const head: ErasureSessionHead = {
+      sessionId,
+      tenantId: session.tenantId,
+      userId: session.userId,
+      ...(session.status.type === "active" ? { activeTurnId: session.status.turnId } : {}),
+      deleted: tombstone !== undefined,
+      deletionGeneration: tombstone?.deletionGeneration ?? 0,
+    };
+    if (
+      (head.activeTurnId !== undefined && !isCanonicalId("turn", head.activeTurnId))
+      || !Number.isSafeInteger(head.deletionGeneration)
+      || head.deletionGeneration < 0
+    ) throw new Error("erasure session head is corrupt");
+    return clone(head);
+  }
+
+  async applyErasureSessionAction(input: ErasureSessionAction): Promise<CommitResult> {
+    // Clone the complete caller input before inspecting or mutating store state. Accessors, proxies,
+    // functions or extra non-serializable authority material therefore fail before publication.
+    const action = clone(input);
+    validateErasureSessionAction(action);
+    const allowedStatuses: readonly ErasureRequestStatus[] = action.action === "fence"
+      ? ["draining", "tombstoning"]
+      : ["tombstoning"];
+    this.assertErasureSessionAuthority(action.authority, allowedStatuses, Date.now());
+
+    const storedSession = this.sessions.get(action.sessionId);
+    if (
+      !storedSession
+      || storedSession.id !== action.sessionId
+      || storedSession.tenantId !== action.authority.tenantId
+      || storedSession.userId !== action.authority.userId
+    ) throw new SessionGoneError(action.sessionId);
+    if (action.fence < storedSession.fenceToken) {
+      throw new FenceError(action.sessionId, action.fence, storedSession.fenceToken);
+    }
+
+    const existingTombstone = this.deleted.get(action.sessionId);
+    if (existingTombstone) {
+      if (action.action !== "tombstone") throw new SessionGoneError(action.sessionId);
+      this.assertExistingErasureTombstone(storedSession, existingTombstone);
+      return {
+        events: [],
+        lastSeq: storedSession.lastSeq,
+        lifecycleGeneration: existingTombstone.deletionGeneration,
+      };
+    }
+
+    const stagedSession = clone(storedSession);
+    stagedSession.fenceToken = action.fence;
+    if (!SessionSchema.safeParse(stagedSession).success) throw new Error("erasure session row is invalid");
+    if (action.action === "fence") {
+      // This branch deliberately stages no event log or business resource. Publishing the cloned
+      // session replaces exactly one scalar: the durable fence token.
+      this.sessions.set(action.sessionId, stagedSession);
+      return { events: [], lastSeq: stagedSession.lastSeq };
+    }
+
+    if (action.action === "settle" && stagedSession.status.type !== "active") {
+      // A lost response may retry after the first settlement. The preceding fence action already
+      // linearized ownership, so an inactive projection is a safe idempotent business no-op. A
+      // direct caller may still carry a newer valid session fence, which must be published.
+      this.sessions.set(action.sessionId, stagedSession);
+      return { events: [], lastSeq: stagedSession.lastSeq };
+    }
+
+    if (action.action === "tombstone" && stagedSession.status.type === "active") {
+      throw new SessionLifecycleBusyError(action.sessionId);
+    }
+
+    const stagedLog = this.cloneAndValidateErasureEventLog(stagedSession);
+    let stagedTurn: Turn | undefined;
+    let terminalApprovals: Approval[] = [];
+    let terminalItems: Item[] = [];
+    const eventInputs: EventInput[] = [];
+    let effectiveAtMs = Math.max(action.atMs, stagedSession.updatedAtMs);
+
+    if (action.action === "settle") {
+      const activeTurnId = stagedSession.status.type === "active" ? stagedSession.status.turnId : undefined;
+      const storedTurn = activeTurnId ? this.turns.get(activeTurnId) : undefined;
+      if (
+        !activeTurnId
+        || !storedTurn
+        || storedTurn.id !== activeTurnId
+        || storedTurn.sessionId !== action.sessionId
+        || [...this.turns.values()].filter((candidate) => candidate.id === activeTurnId).length !== 1
+        || storedTurn.status !== "inProgress"
+        || !TurnSchema.safeParse(storedTurn).success
+      ) throw new Error("erasure active turn is missing or not in progress");
+      effectiveAtMs = Math.max(effectiveAtMs, storedTurn.startedAtMs);
+
+      const approvalTerminals = this.stageErasureApprovalTerminals(action.sessionId, effectiveAtMs, activeTurnId);
+      terminalApprovals = approvalTerminals.approvals;
+      terminalItems = approvalTerminals.items;
+      eventInputs.push(...approvalTerminals.events);
+
+      stagedTurn = clone({
+        ...storedTurn,
+        status: "interrupted" as const,
+        stopReason: "interrupted" as const,
+        completedAtMs: effectiveAtMs,
+        error: { code: "erasure", message: "turn interrupted for user erasure" },
+      });
+      const finalSeq = stagedSession.lastSeq + eventInputs.length + 2;
+      stagedTurn.seqEnd = finalSeq;
+      if (!TurnSchema.safeParse(stagedTurn).success) throw new Error("erasure terminal turn is invalid");
+      eventInputs.push(clone({
+        type: "turn/completed",
+        sessionId: action.sessionId,
+        emittedAtMs: effectiveAtMs,
+        turn: stagedTurn,
+        stopReason: "interrupted",
+      }));
+      eventInputs.push(clone({
+        type: "session/status/changed",
+        sessionId: action.sessionId,
+        emittedAtMs: effectiveAtMs,
+        status: { type: "idle" },
+      }));
+      stagedSession.status = { type: "idle" };
+    } else {
+      if ([...this.sessions.values()].some((candidate) => (
+        candidate.parentSessionId === action.sessionId && !this.deleted.has(candidate.id)
+      ))) throw new SessionHasChildrenError(action.sessionId);
+      const approvalTerminals = this.stageErasureApprovalTerminals(action.sessionId, effectiveAtMs);
+      terminalApprovals = approvalTerminals.approvals;
+      terminalItems = approvalTerminals.items;
+      eventInputs.push(...approvalTerminals.events);
+      eventInputs.push(clone({
+        type: "session/deleted",
+        sessionId: action.sessionId,
+        emittedAtMs: effectiveAtMs,
+        deletionGeneration: 1,
+      }));
+      stagedSession.autoApprovedTools = [];
+    }
+
+    const persistedEvents = eventInputs.map((event, index) => clone({
+      ...event,
+      seq: stagedSession.lastSeq + index + 1,
+    } as PersistedEvent));
+    for (const event of persistedEvents) {
+      if (!EventSchema.safeParse(event).success) throw new Error("erasure terminal event is invalid");
+    }
+    const nextLastSeq = stagedSession.lastSeq + persistedEvents.length;
+    stagedSession.lastSeq = nextLastSeq;
+    stagedSession.updatedAtMs = effectiveAtMs;
+    if (!SessionSchema.safeParse(stagedSession).success) throw new Error("erasure terminal session is invalid");
+    const nextLog = [...stagedLog, ...persistedEvents.map(clone)];
+    const resultEvents = persistedEvents.map(clone);
+
+    let stagedTombstone: { deletedAtMs: number; deletionGeneration: number } | undefined;
+    let stagedOutboxes: [string, LifecycleOutboxRecord][] = [];
+    let nextOutboxId = this.nextLifecycleOutboxId;
+    if (action.action === "tombstone") {
+      stagedTombstone = clone({ deletedAtMs: effectiveAtMs, deletionGeneration: 1 });
+      if (
+        !Number.isSafeInteger(nextOutboxId)
+        || nextOutboxId <= 0
+        || nextOutboxId > Number.MAX_SAFE_INTEGER - 2
+      ) {
+        throw new Error("lifecycle outbox sequence is exhausted");
+      }
+      const deletedEvent = persistedEvents.at(-1);
+      if (deletedEvent?.type !== "session/deleted") throw new Error("erasure terminal event is missing");
+      const outboxes = ([
+        {
+          outboxId: nextOutboxId,
+          topic: "session.tombstoned",
+          aggregateId: action.sessionId,
+          generation: 1,
+          payload: { sessionId: action.sessionId, deletionGeneration: 1, eventSeq: deletedEvent.seq },
+          availableAtMs: effectiveAtMs,
+          attempts: 0,
+          createdAtMs: effectiveAtMs,
+        },
+        {
+          outboxId: nextOutboxId + 1,
+          topic: "session.purge",
+          aggregateId: action.sessionId,
+          generation: 1,
+          payload: { sessionId: action.sessionId, deletionGeneration: 1 },
+          attempts: 0,
+          createdAtMs: effectiveAtMs,
+        },
+      ] satisfies LifecycleOutboxRecord[]).map(clone);
+      stagedOutboxes = outboxes.map((outbox) => {
+        assertLifecycleOutboxId(outbox.outboxId);
+        const envelope = parseLifecycleOutboxEnvelope(outbox.topic, clone(outbox.payload));
+        if (
+          envelope.payload.sessionId !== action.sessionId
+          || envelope.payload.deletionGeneration !== 1
+          || [...this.lifecycleOutbox.values()].some((candidate) => candidate.outboxId === outbox.outboxId)
+        ) throw new Error("erasure lifecycle outbox identity is corrupt");
+        const key = this.lifecycleOutboxMapKey(outbox.topic, action.sessionId, 1);
+        if (this.lifecycleOutbox.has(key)) throw new Error("lifecycle outbox identity already exists");
+        return [key, outbox];
+      });
+      nextOutboxId += stagedOutboxes.length;
+    }
+
+    // All clone/schema/identity checks above are complete. The remainder is a synchronous Memory
+    // publication with no fallible serialization, mirroring one database transaction.
+    this.sessions.set(action.sessionId, stagedSession);
+    if (stagedTurn) this.turns.set(stagedTurn.id, stagedTurn);
+    for (const approval of terminalApprovals) this.approvals.set(approval.id, approval);
+    for (const item of terminalItems) this.items.set(item.id, item);
+    this.events.set(action.sessionId, nextLog);
+    if (stagedTombstone) {
+      this.deleted.set(action.sessionId, stagedTombstone);
+      for (const [key, outbox] of stagedOutboxes) this.lifecycleOutbox.set(key, outbox);
+      this.nextLifecycleOutboxId = nextOutboxId;
+    }
+    return {
+      events: resultEvents,
+      lastSeq: nextLastSeq,
+      ...(stagedTombstone ? { lifecycleGeneration: stagedTombstone.deletionGeneration } : {}),
+    };
+  }
+
+  private erasureSessionRef(sessionKey: string, session: Session): ErasureSessionRef {
+    if (
+      sessionKey !== session.id
+      || !isCanonicalId("sess", session.id)
+      || (session.parentSessionId !== undefined && !isCanonicalId("sess", session.parentSessionId))
+    ) throw new Error("erasure catalog session identity is corrupt");
+    const tombstone = this.deleted.get(session.id);
+    const generation = tombstone?.deletionGeneration ?? 0;
+    if (
+      !Number.isSafeInteger(generation)
+      || generation < 0
+      || (tombstone !== undefined && (
+        !Number.isSafeInteger(tombstone.deletedAtMs)
+        || tombstone.deletedAtMs < 0
+      ))
+    ) throw new Error("erasure catalog tombstone is corrupt");
+    return {
+      sessionId: session.id,
+      ...(session.parentSessionId === undefined ? {} : { parentSessionId: session.parentSessionId }),
+      deleted: tombstone !== undefined,
+      deletionGeneration: generation,
+    };
+  }
+
+  /** Child ownership is deliberately ignored: any live child blocks parent tombstoning. */
+  private hasLiveErasureChild(parentSessionId: string): boolean {
+    return [...this.sessions.entries()].some(([sessionKey, candidate]) => {
+      if (candidate.parentSessionId !== parentSessionId) return false;
+      // Validate a row which participates in the leaf decision instead of allowing corrupt identity
+      // to turn a real child into an apparently safe leaf.
+      this.erasureSessionRef(sessionKey, candidate);
+      return !this.deleted.has(candidate.id);
+    });
+  }
+
+  async listErasureSessions(
+    authorization: ErasureWriteAuthorization,
+    query: ErasureSessionQuery,
+  ): Promise<ErasureSessionPage> {
+    const stagedAuthorization = clone(authorization);
+    const stagedQuery = clone(query);
+    validateErasureSessionQuery(stagedAuthorization, stagedQuery);
+    this.assertErasureSessionAuthority(
+      stagedAuthorization,
+      [stagedQuery.phase],
+      stagedQuery.nowMs,
+    );
+
+    const candidates: ErasureSessionRef[] = [];
+    for (const [sessionKey, session] of this.sessions) {
+      if (
+        session.tenantId !== stagedAuthorization.tenantId
+        || session.userId !== stagedAuthorization.userId
+      ) continue;
+      const ref = this.erasureSessionRef(sessionKey, session);
+      if (stagedQuery.afterSessionId !== undefined && ref.sessionId <= stagedQuery.afterSessionId) continue;
+      if (stagedQuery.phase === "draining" && ref.deleted) continue;
+      if (stagedQuery.phase === "tombstoning" && (
+        ref.deleted || this.hasLiveErasureChild(ref.sessionId)
+      )) continue;
+      if (stagedQuery.phase === "reconciling_usage" && !ref.deleted) continue;
+      if (stagedQuery.phase === "reconciling_usage") {
+        const tombstone = this.deleted.get(ref.sessionId);
+        ref.tombstoneProofValid = tombstone !== undefined
+          && this.erasureTombstoneProofValid(session, tombstone);
+      }
+      candidates.push(ref);
+    }
+    candidates.sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+    const hasMore = candidates.length > stagedQuery.limit;
+    const data = candidates.slice(0, stagedQuery.limit).map(clone);
+    const last = data.at(-1);
+    return clone({
+      data,
+      ...(hasMore && last ? { nextCursor: last.sessionId } : {}),
+    });
+  }
+
+  async inspectErasureSubjectProgress(
+    authorization: ErasureWriteAuthorization,
+    query: ErasureProgressQuery,
+  ): Promise<ErasureSubjectProgress> {
+    const stagedAuthorization = clone(authorization);
+    const stagedQuery = clone(query);
+    validateErasureProgressQuery(stagedAuthorization, stagedQuery);
+    this.assertErasureSessionAuthority(
+      stagedAuthorization,
+      [stagedQuery.phase],
+      stagedQuery.nowMs,
+    );
+
+    const owned: ErasureSessionRef[] = [];
+    for (const [sessionKey, session] of this.sessions) {
+      if (
+        session.tenantId === stagedAuthorization.tenantId
+        && session.userId === stagedAuthorization.userId
+      ) owned.push(this.erasureSessionRef(sessionKey, session));
+    }
+    const live = owned.filter((session) => !session.deleted);
+    const tombstoned = owned.filter((session) => session.deleted);
+    const positiveGeneration = tombstoned.filter((session) => session.deletionGeneration > 0);
+    let reconciledUsageSessions = 0;
+    for (const session of positiveGeneration) {
+      const reconciliation = this.usageReconciliations.get(
+        this.usageReconciliationMapKey(session.sessionId, session.deletionGeneration),
+      );
+      if (
+        reconciliation
+        && reconciliation.tenantId === stagedAuthorization.tenantId
+        && reconciliation.userId === stagedAuthorization.userId
+        && reconciliation.sessionId === session.sessionId
+        && reconciliation.deletionGeneration === session.deletionGeneration
+        && (reconciliation.status === "verified" || reconciliation.status === "anonymized")
+      ) reconciledUsageSessions += 1;
+    }
+
+    let orphanOrMismatchedUsageRows = 0;
+    for (const usage of this.usageLedger) {
+      const session = this.sessions.get(usage.sessionId);
+      const rowOwned = usage.tenantId === stagedAuthorization.tenantId
+        && usage.userId === stagedAuthorization.userId;
+      const sessionOwned = !!session
+        && session.id === usage.sessionId
+        && session.tenantId === stagedAuthorization.tenantId
+        && session.userId === stagedAuthorization.userId;
+      if ((rowOwned && !sessionOwned) || (sessionOwned && !rowOwned)) {
+        orphanOrMismatchedUsageRows += 1;
+      }
+    }
+
+    const progress: ErasureSubjectProgress = {
+      totalSessions: owned.length,
+      liveSessions: live.length,
+      liveLeafSessions: live.filter((session) => !this.hasLiveErasureChild(session.sessionId)).length,
+      tombstonedSessions: tombstoned.length,
+      legacyGenerationZeroSessions: tombstoned.filter((session) => session.deletionGeneration === 0).length,
+      reconciledUsageSessions,
+      unreconciledUsageSessions: positiveGeneration.length - reconciledUsageSessions,
+      orphanOrMismatchedUsageRows,
+    };
+    return clone(progress);
   }
 
   async createAgent(def: AgentDefinition) {
@@ -1074,6 +1902,50 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async reconcileSessionUsage(input: ReconcileSessionUsageInput): Promise<UsageReconciliationRecord> {
+    const stagedInput = clone(input);
+    validateReconcileSessionUsageInput(stagedInput);
+    return this.reconcileSessionUsageAtomically(stagedInput);
+  }
+
+  async reconcileErasureSessionUsage(
+    authorization: ErasureWriteAuthorization,
+    input: ErasureUsageReconciliationInput,
+  ): Promise<UsageReconciliationRecord> {
+    // Clone before consulting authority so caller accessors/proxies cannot mutate an identity
+    // between the claim check and publication. This method and the helper below contain no await:
+    // in the single-process Memory store they form one indivisible synchronous critical section.
+    const stagedAuthorization = clone(authorization);
+    const stagedInput = clone(input);
+    validateErasureUsageReconciliationInput(stagedAuthorization, stagedInput);
+    this.assertErasureSessionAuthority(
+      stagedAuthorization,
+      ["reconciling_usage"],
+      stagedInput.nowMs,
+    );
+    const proofSession = this.sessions.get(stagedInput.sessionId);
+    const proofTombstone = this.deleted.get(stagedInput.sessionId);
+    if (
+      !proofSession
+      || proofSession.tenantId !== stagedAuthorization.tenantId
+      || proofSession.userId !== stagedAuthorization.userId
+      || !proofTombstone
+      || proofTombstone.deletionGeneration !== stagedInput.deletionGeneration
+      || !this.erasureTombstoneProofValid(proofSession, proofTombstone)
+    ) {
+      throw new ErasureTombstoneIntegrityError();
+    }
+    return this.reconcileSessionUsageAtomically({
+      tenantId: stagedAuthorization.tenantId,
+      userId: stagedAuthorization.userId,
+      sessionId: stagedInput.sessionId,
+      deletionGeneration: stagedInput.deletionGeneration,
+      nowMs: stagedInput.nowMs,
+    });
+  }
+
+  private reconcileSessionUsageAtomically(
+    input: ReconcileSessionUsageInput,
+  ): UsageReconciliationRecord {
     validateReconcileSessionUsageInput(input);
     this.assertUsageLifecycleScope(input);
     const reconciliationKey = this.usageReconciliationMapKey(input.sessionId, input.deletionGeneration);

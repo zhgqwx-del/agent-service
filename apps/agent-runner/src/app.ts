@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono, type MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
@@ -21,6 +21,11 @@ import {
   ErasureRequestHeaders,
   ErasureRequestParams,
   ItemListQuery,
+  INTERNAL_ERASURE_DRAIN_ACK_HEADER,
+  INTERNAL_ERASURE_DRAIN_ACK_VALUE,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
+  INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
+  INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_ROUTER_TOKEN_HEADER,
@@ -38,6 +43,7 @@ import {
   UsageQuery,
   UpsertProviderRequest,
   TurnSteerRequest,
+  UserErasureDrainRequest,
   type Capabilities,
   type BlobUploadResponse,
   ImageMediaType,
@@ -45,9 +51,10 @@ import {
   type ErasureRequest,
 } from "@agent-service/protocol";
 import type { SessionHost, ToolRegistry } from "@agent-service/core";
-import { newId } from "@agent-service/core";
+import { ErasureLocalTurnFencedError, newId } from "@agent-service/core";
 import {
   ErasureIdempotencyMismatchError,
+  erasureWriteAuthorizationMatches,
   newErasureRequestId,
   userErasureRequestHash,
   type SessionStore,
@@ -92,11 +99,14 @@ const parse = async <T extends z.ZodTypeAny>(schema: T, body: unknown): Promise<
 };
 const json = (c: { req: { json: () => Promise<unknown> } }) => c.req.json().catch(() => ({}));
 
+// This claim-only envelope is intentionally far smaller than the public runtime request budget.
+// Keeping a separate ceiling also ensures future public body-limit changes cannot widen this path.
+const INTERNAL_ERASURE_DRAIN_MAX_BODY_BYTES = 2_048;
+
 function internalTokenMatches(received: string | undefined, expected: string): boolean {
-  if (!received) return false;
-  const left = Buffer.from(received);
-  const right = Buffer.from(expected);
-  return left.length === right.length && timingSafeEqual(left, right);
+  const left = createHash("sha256").update(received ?? "").digest();
+  const right = createHash("sha256").update(expected).digest();
+  return received !== undefined && timingSafeEqual(left, right);
 }
 
 export function createApp(deps: AppDeps) {
@@ -137,6 +147,7 @@ export function createApp(deps: AppDeps) {
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         blobAttachments: deps.blobAttachmentsEnabled === true,
         dataErasureRequests: deps.erasureRequestsEnabled === true && deps.subjectLifecycle !== undefined,
+        userErasureWorker: deps.subjectLifecycle === undefined ? [] : ["drain-v1"],
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -145,6 +156,71 @@ export function createApp(deps: AppDeps) {
       },
     } satisfies Capabilities),
   );
+
+  // Runner-only worker traffic bypasses tenant authentication. Authenticate the fixed internal
+  // token before inspecting the session id, Content-Length or JSON so every untrusted probe has
+  // the same private 404 response. The durable request is then the sole source of phase/authority.
+  const erasureDrainPath = `${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/:id`;
+  app.use(erasureDrainPath, privateResponseHeaders);
+  app.use(erasureDrainPath, async (c, next) => {
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) {
+      throw new ApiError("not_found", "not found");
+    }
+    await next();
+  });
+  app.use(erasureDrainPath, validateIdParams);
+  app.use(erasureDrainPath, bodyLimit({
+    maxSize: INTERNAL_ERASURE_DRAIN_MAX_BODY_BYTES,
+    onError: () => {
+      throw new ApiError(
+        "invalid_request",
+        `request body exceeds ${INTERNAL_ERASURE_DRAIN_MAX_BODY_BYTES} bytes`,
+      );
+    },
+  }));
+  app.post(erasureDrainPath, async (c) => {
+    if (!deps.subjectLifecycle) throw new ApiError("not_found", "not found");
+    const sessionId = c.req.param("id");
+    if (!sessionId) throw new ApiError("not_found", "not found");
+    const authority = await parse(UserErasureDrainRequest, await json(c));
+    const record = await deps.subjectLifecycle.getUserErasureRequest(
+      authority.tenantId,
+      authority.userId,
+      authority.requestId,
+    );
+    if (!record || !erasureWriteAuthorizationMatches(record, authority, Date.now())) {
+      throw new ApiError("not_found", "not found");
+    }
+
+    const operation = record.status === "draining"
+      ? deps.host.drainSessionForErasure.bind(deps.host)
+      : record.status === "tombstoning"
+        ? deps.host.eraseSessionForErasure.bind(deps.host)
+        : undefined;
+    if (!operation) throw new ApiError("not_found", "not found");
+    try {
+      await operation(authority, sessionId);
+    } catch (error) {
+      // A routing 409 must carry proof that this is a drain-v1 runner, while unrelated failures
+      // (especially owner/claim 404s) do not gain a distinguishing header.
+      if (error instanceof ApiError && error.status === 409) {
+        c.header(INTERNAL_ERASURE_DRAIN_ACK_HEADER, INTERNAL_ERASURE_DRAIN_ACK_VALUE);
+      }
+      if (error instanceof ErasureLocalTurnFencedError) {
+        c.header(
+          INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
+          INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
+        );
+      }
+      throw error;
+    }
+    c.header(INTERNAL_ERASURE_DRAIN_ACK_HEADER, INTERNAL_ERASURE_DRAIN_ACK_VALUE);
+    return c.body(null, 204);
+  });
+  // Prevent unsupported methods from falling through to the ordinary /v1 auth middleware.
+  app.all(erasureDrainPath, (c) => {
+    throw new ApiError("not_found", "not found");
+  });
 
   const v1 = new Hono<AuthEnv>();
   // Blob bytes and hydrated tool output are user data. Apply these headers before auth/id
