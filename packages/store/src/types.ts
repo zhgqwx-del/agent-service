@@ -76,6 +76,20 @@ export interface IdempotencyReceiptInput {
   expiresAtMs: number;
 }
 
+export type SessionLifecycleTransition = {
+  type: "archive" | "unarchive";
+  atMs: number;
+  /** Expected ownership is checked while the session row is locked. */
+  tenantId: string;
+  userId: string;
+};
+
+export interface SessionFenceClaim {
+  /** Expected ownership is checked while the session row is locked. */
+  tenantId: string;
+  userId: string;
+}
+
 export interface Page<T> {
   data: T[];
   nextCursor: string | null;
@@ -89,6 +103,10 @@ export interface Page<T> {
 export interface CommitBatch {
   sessionId: string;
   fence: number;
+  /** The only write path allowed to change archive state or mutate an already archived session. */
+  lifecycle?: SessionLifecycleTransition;
+  /** Pure ownership hand-off: advances only the durable fence before a takeover snapshot is read. */
+  fenceClaim?: SessionFenceClaim;
   /** Optional compare-and-swap guard for work prepared from a session snapshot (for example a summary). */
   expectedLastSeq?: number;
   events?: EventInput[];
@@ -99,13 +117,30 @@ export interface CommitBatch {
   usageEntries?: UsageLedgerWrite[];
   /** A completed receipt committed atomically with the first durable write for an idempotent request. */
   idempotency?: IdempotencyReceiptInput;
-  sessionPatch?: Partial<Pick<Session, "status" | "title" | "usage" | "contextEpoch" | "metadata" | "archivedAtMs" | "autoApprovedTools" | "lastCompactionSeq">>;
+  sessionPatch?: Partial<Pick<Session, "status" | "title" | "usage" | "contextEpoch" | "metadata" | "autoApprovedTools" | "lastCompactionSeq">>;
 }
 
 export interface CommitResult {
   /** events with seq assigned, in input order */
   events: PersistedEvent[];
   lastSeq: number;
+}
+
+/** A fence hand-off must never smuggle business data into the archived/active bypass. */
+export function assertPureFenceClaim(batch: CommitBatch): void {
+  if (!batch.fenceClaim) return;
+  if (
+    batch.lifecycle
+    || batch.events?.length
+    || batch.items?.length
+    || batch.turn
+    || batch.approvals?.length
+    || batch.usageEntries?.length
+    || batch.idempotency
+    || batch.sessionPatch
+  ) {
+    throw new Error("fenceClaim must be a pure fence-only commit");
+  }
 }
 
 /**
@@ -179,6 +214,22 @@ export class SessionGoneError extends Error {
   constructor(public readonly sessionId: string) {
     super(`session ${sessionId} no longer exists`);
     this.name = "SessionGoneError";
+  }
+}
+
+/** Normal runtime writes cannot mutate an archived session. */
+export class SessionArchivedError extends Error {
+  constructor(public readonly sessionId: string) {
+    super(`session ${sessionId} is archived`);
+    this.name = "SessionArchivedError";
+  }
+}
+
+/** Archive may only linearize while the durable session projection is not active. */
+export class SessionLifecycleBusyError extends Error {
+  constructor(public readonly sessionId: string) {
+    super(`session ${sessionId} has an active turn`);
+    this.name = "SessionLifecycleBusyError";
   }
 }
 

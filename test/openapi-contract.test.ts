@@ -98,7 +98,7 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(36);
+    expect(operations).toHaveLength(37);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
@@ -150,13 +150,13 @@ describe("committed OpenAPI contract", () => {
     });
   });
 
-  it("matches all 35 implemented runner routes plus the OpenAPI route in both directions", () => {
+  it("matches all 36 implemented runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     const specKeys = specOperations().map(operationKey).sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(35);
-    expect(registered).toHaveLength(36);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(36);
+    expect(registered).toHaveLength(37);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
   });

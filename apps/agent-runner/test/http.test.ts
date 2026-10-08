@@ -123,12 +123,20 @@ describe("agent-runner HTTP API", () => {
       method: "POST",
       body: JSON.stringify({ agentId: agent.id }),
     }));
-    expect((await call(`/v1/sessions/${session.id}/archive`, { method: "POST" })).status).toBe(200);
+    const archivedResponse = await call(`/v1/sessions/${session.id}/archive`, { method: "POST" });
+    expect(archivedResponse.status).toBe(200);
+    expect((await j<{ archivedAtMs?: number }>(archivedResponse)).archivedAtMs).toEqual(expect.any(Number));
 
     const hidden = await j<{ data: unknown[] }>(await call("/v1/sessions?includeArchived=false"));
     const visible = await j<{ data: { id: string }[] }>(await call("/v1/sessions?includeArchived=true"));
     expect(hidden.data).toEqual([]);
     expect(visible.data.map(({ id }) => id)).toEqual([session.id]);
+    const archivedTurn = await call(`/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ input: [{ type: "text", text: "blocked" }], stream: false }),
+    });
+    expect(archivedTurn.status).toBe(409);
+    expect((await j<{ error: { code: string } }>(archivedTurn)).error.code).toBe("session_archived");
     expect((await call("/v1/sessions?includeArchived=not-a-boolean")).status).toBe(400);
     expect((await call(`/v1/agents/${agent.id}?version=not-a-number`)).status).toBe(400);
     expect((await call(`/v1/sessions/${session.id}/events?after=not-a-number`)).status).toBe(400);
@@ -142,6 +150,12 @@ describe("agent-runner HTTP API", () => {
       headers: { "idempotency-key": "   " },
       body: JSON.stringify({ input: [{ type: "text", text: "ignored" }], stream: false }),
     })).status).toBe(400);
+
+    const unarchivedResponse = await call(`/v1/sessions/${session.id}/unarchive`, { method: "POST" });
+    expect(unarchivedResponse.status).toBe(200);
+    expect((await j<{ archivedAtMs?: number }>(unarchivedResponse)).archivedAtMs).toBeUndefined();
+    expect((await call(`/v1/sessions/${session.id}/unarchive`, { method: "POST" })).status).toBe(200);
+    expect((await j<{ data: { id: string }[] }>(await call("/v1/sessions"))).data.map(({ id }) => id)).toEqual([session.id]);
   });
 
   it("emits protocol-valid heartbeats with the subscribed session id", async () => {

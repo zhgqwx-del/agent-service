@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI 3.1 和生成 TypeScript SDK 已实现；完整数据生命周期仍待按 `docs/design/04-data-lifecycle.md` 的策略门禁确认并实现。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI 3.1、生成 TypeScript SDK 和可逆 Archive v2 已实现；fenced tombstone、ownership manifest/outbox、erasure/export、Blob 接线及默认关闭的 purge 仍待按 `docs/design/04-data-lifecycle.md` 完成。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -18,7 +18,7 @@
 # 依赖：Node 24（fnm）、pnpm 12、MySQL 8（已有）、Redis（deploy/local/install 说明见 infra.sh 头部）
 pnpm install
 deploy/local/infra.sh start          # 启动 redis + mysql，建库 agent_service / agent_service_test
-cp .env.example .env                 # 填 API_KEY / API_BASE_URL / DEFAULT_MODEL（DashScope 兼容模式）
+cp .env.example .env                 # 真实模型只强制 API_KEY；base URL / model 可覆盖默认值
 
 # 单节点（MySQL + Redis）
 STORE=mysql REDIS_URL=redis://127.0.0.1:6379 pnpm dev:runner
@@ -60,7 +60,7 @@ scripts/local-service.sh cleanup-idempotency --dry-run  # 检查/分批清理过
 scripts/local-service.sh stop
 ```
 
-详细配置与未来 staging/production 部署契约见 `docs/operations/local-and-deployment.md`。
+详细配置与未来 staging/production 部署契约见 `docs/operations/local-and-deployment.md`；面向项目学习、手动体验和 CI 构建产物的完整说明见 `docs/operations/development-and-ci-guide.md`。
 
 ## 部署形态
 
@@ -90,7 +90,7 @@ curl -sN -X POST "localhost:8787/v1/sessions/sess_.../turns?exclude=usage/update
 # 其他：GET .../items | .../turns | POST .../turns/{id}/interrupt | steer | tool-results（动态工具回填）
 #       GET/POST .../approvals/{id} {decision: accept|acceptForSession|decline|cancel}
 #       GET/PUT/DELETE /v1/providers/{id}（BYOK，apiKey 只写不读，AES-GCM 落库）  GET /v1/models  GET /v1/tools
-#       POST .../resume  GET /v1/capabilities  GET /openapi.json  GET /healthz /readyz
+#       POST .../archive | .../unarchive | .../resume  GET /v1/capabilities  GET /openapi.json  GET /healthz /readyz
 ```
 
 事件类型与资源 schema 在 `packages/protocol/src/`（zod，单一真相）。`pnpm generate:api` 由同一组 schema 确定性生成并提交 `packages/protocol/openapi.json`、运行时文档常量和 SDK route types；CI 的 `pnpm check:api` 会阻止手改或漏生成。`packages/sdk` 提供可编译/打包的 ESM TypeScript SDK、`openapi-fetch` 类型化客户端、`startTurnStream`、`subscribeSessionEvents` 和增量 SSE 解析器；`pnpm check:sdk` 从实际发布包入口验证消费者路径。
@@ -115,7 +115,9 @@ docs/                  调研、设计
 ## 关键不变量（测试覆盖）
 
 - 同一 session 同时只有一个 writer：Redis 租约 + 单调 fence，MySQL 每次写入校验 `fence_token`，旧 owner 的写入被拒绝（`FenceError`）。
+- 新 owner 在读取 takeover/orphan 快照前先用纯 `fenceClaim` 推进 MySQL fence；该批次不能夹带业务写，active/archived 行也不会留下 Redis 与数据库 fence 的 hand-off 窗口。
 - session 行与首条 `session/created(seq=1)` 由 store 原子创建；序列化或数据库事件写入失败不会留下孤立 session、首事件空洞或部分游标。
+- archive/unarchive 与生命周期事件、授权清理和异常审批结算原子提交；archived session 可读但拒绝 turn/steer/compact/approval/dynamic-result 写入。
 - 持久化事件 per-session `seq` 严格连续；delta 事件只走总线不落库不占 seq。
 - 工具调用先落库（write-ahead）再执行；崩溃后按是否 `startedAtMs` 生成 `TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN` 交给模型。
 - 安全阀 `maxSteps / maxToolCalls / maxWallClockMs / maxCostCNY` 取 min，只能收紧。

@@ -269,7 +269,7 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({ registry: fakeRegistry([a.url]), logger: silent });
     const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[] } };
     expect(caps.service).toBe("agent-router");
@@ -278,7 +278,7 @@ describe("operational endpoints", () => {
   });
 
   it("does not publish capabilities from a runner on an older protocol contract", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: "2026-09-22", service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: "2026-09-22", service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({ registry: fakeRegistry([a.url]), logger: silent });
     const response = await app.request("/v1/capabilities");
     expect(response.status).toBe(503);

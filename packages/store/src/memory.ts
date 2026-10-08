@@ -18,9 +18,12 @@ import {
   IdempotencyMismatchError,
   IdempotencyPendingError,
   IdempotencyReplayError,
+  SessionArchivedError,
   SessionExistsError,
   SessionGoneError,
+  SessionLifecycleBusyError,
   SessionVersionError,
+  assertPureFenceClaim,
   assignItemSeqs,
   assignTurnSeqEnd,
   backfillAssignedSequences,
@@ -126,11 +129,31 @@ export class MemorySessionStore implements SessionStore {
   }
 
   async commit(batch: CommitBatch): Promise<CommitResult> {
+    assertPureFenceClaim(batch);
     const s = this.sessions.get(batch.sessionId);
     if (!s || this.deleted.has(batch.sessionId)) throw new SessionGoneError(batch.sessionId);
+    const expectedOwner = batch.lifecycle ?? batch.fenceClaim;
+    if (expectedOwner && (expectedOwner.tenantId !== s.tenantId || expectedOwner.userId !== s.userId)) {
+      throw new SessionGoneError(batch.sessionId);
+    }
     if (batch.fence < s.fenceToken) throw new FenceError(batch.sessionId, batch.fence, s.fenceToken);
+    if (batch.lifecycle) {
+      if (batch.lifecycle.type === "archive" && s.status.type === "active" && batch.sessionPatch?.status?.type !== "idle") {
+        throw new SessionLifecycleBusyError(batch.sessionId);
+      }
+    } else if (!batch.fenceClaim && s.archivedAtMs !== undefined) {
+      throw new SessionArchivedError(batch.sessionId);
+    }
     if (batch.expectedLastSeq !== undefined && batch.expectedLastSeq !== s.lastSeq) {
       throw new SessionVersionError(batch.sessionId, batch.expectedLastSeq, s.lastSeq);
+    }
+
+    if (batch.fenceClaim) {
+      // Clone before mutation so accessors/proxies cannot leave a half-applied claim. A claim is not
+      // a business update: updatedAt, lastSeq and every projection remain byte-for-byte unchanged.
+      clone(batch.fenceClaim);
+      s.fenceToken = batch.fence;
+      return { events: [], lastSeq: s.lastSeq };
     }
 
     // Validate every fallible invariant before mutating any map. This gives the in-memory reference
@@ -178,6 +201,7 @@ export class MemorySessionStore implements SessionStore {
     const stagedApprovals = (batch.approvals ?? []).map(clone);
     const stagedIdempotencyValue = batch.idempotency ? clone(batch.idempotency.value) : undefined;
     const stagedSessionPatch = batch.sessionPatch ? clone(batch.sessionPatch) : undefined;
+    const stagedLifecycle = batch.lifecycle ? clone(batch.lifecycle) : undefined;
     assignItemSeqs(stagedItems, stagedEvents, seq);
     assignTurnSeqEnd(stagedTurn, stagedEvents, seq);
     const resultEvents = stagedEvents.map(clone);
@@ -198,6 +222,8 @@ export class MemorySessionStore implements SessionStore {
       });
     }
     if (stagedSessionPatch) Object.assign(s, stagedSessionPatch);
+    if (stagedLifecycle?.type === "archive") s.archivedAtMs = stagedLifecycle.atMs;
+    else if (stagedLifecycle?.type === "unarchive") delete s.archivedAtMs;
     s.updatedAtMs = Date.now();
     backfillAssignedSequences(batch, { items: stagedItems, turn: stagedTurn, events: stagedEvents });
     return { events: resultEvents, lastSeq: seq };

@@ -22,6 +22,8 @@ export const Event = z.discriminatedUnion("type", [
   z.object({ ...persisted, type: z.literal("session/created") }),
   z.object({ ...persisted, type: z.literal("session/status/changed"), status: SessionStatus }),
   z.object({ ...persisted, type: z.literal("session/compacted"), itemId: idSchema("item") }),
+  z.object({ ...persisted, type: z.literal("session/archived") }),
+  z.object({ ...persisted, type: z.literal("session/unarchived") }),
 
   z.object({ ...persisted, type: z.literal("turn/started"), turn: Turn }),
   z.object({ ...persisted, type: z.literal("turn/steered"), turnId: idSchema("turn"), itemId: idSchema("item") }),

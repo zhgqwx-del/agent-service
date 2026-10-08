@@ -96,7 +96,17 @@ export function createApp(deps: AppDeps) {
     c.json({
       protocolVersion: PROTOCOL_VERSION,
       service: "agent-runner",
-      features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 3_600_000 }, approvals: true, dynamicTools: true, mcp: [], skills: false, sandbox: ["none"], byok: true },
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 3_600_000 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
     } satisfies Capabilities),
   );
 
@@ -242,11 +252,10 @@ export function createApp(deps: AppDeps) {
     return c.json(await deps.host.compactSession(requireUser(c), c.req.param("id")));
   });
   v1.post("/sessions/:id/archive", async (c) => {
-    const session = await deps.host.getSession(requireUser(c), c.req.param("id"));
-    if (session.archivedAtMs) return c.json(session);
-    const now = Date.now();
-    await deps.store.commit({ sessionId: session.id, fence: session.fenceToken, sessionPatch: { archivedAtMs: now } });
-    return c.json({ ...session, archivedAtMs: now });
+    return c.json(await deps.host.archiveSession(requireUser(c), c.req.param("id")));
+  });
+  v1.post("/sessions/:id/unarchive", async (c) => {
+    return c.json(await deps.host.unarchiveSession(requireUser(c), c.req.param("id")));
   });
   v1.post("/sessions/:id/resume", async (c) => {
     const session = await deps.host.getSession(requireUser(c), c.req.param("id"));
@@ -331,9 +340,9 @@ export function createApp(deps: AppDeps) {
     return c.json({ ok: true }, 202);
   });
   v1.post("/sessions/:id/turns/:turnId/tool-results", async (c) => {
-    await deps.host.getSession(requireUser(c), c.req.param("id"));
+    const principal = requireUser(c);
     const req = await parse(DynamicToolResultRequest, await json(c));
-    await deps.host.submitDynamicToolResultOrThrow(c.req.param("id"), req.toolCallId, { content: req.content, isError: req.isError });
+    await deps.host.submitDynamicToolResultOrThrow(principal, c.req.param("id"), req.toolCallId, { content: req.content, isError: req.isError });
     return c.json({ ok: true }, 202);
   });
 

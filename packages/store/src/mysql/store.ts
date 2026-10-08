@@ -9,9 +9,12 @@ import {
   IdempotencyMismatchError,
   IdempotencyPendingError,
   IdempotencyReplayError,
+  SessionArchivedError,
   SessionExistsError,
   SessionGoneError,
+  SessionLifecycleBusyError,
   SessionVersionError,
+  assertPureFenceClaim,
   assignItemSeqs,
   assignTurnSeqEnd,
   backfillAssignedSequences,
@@ -255,23 +258,47 @@ export class MysqlSessionStore implements SessionStore {
 
   // ---------- fenced commit ----------
   async commit(batch: CommitBatch): Promise<CommitResult> {
+    assertPureFenceClaim(batch);
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
       const [rows] = await conn.query<Row[]>(
-        "SELECT tenant_id, user_id, last_seq, fence_token, deleted_at_ms FROM sessions WHERE session_id=? FOR UPDATE",
+        "SELECT tenant_id, user_id, status, last_seq, fence_token, archived_at_ms, deleted_at_ms FROM sessions WHERE session_id=? FOR UPDATE",
         [batch.sessionId],
       );
       const head = rows[0];
       if (!head || head.deleted_at_ms != null) throw new SessionGoneError(batch.sessionId);
+      const tenantId = head.tenant_id as string;
+      const userId = head.user_id as string;
+      const expectedOwner = batch.lifecycle ?? batch.fenceClaim;
+      if (expectedOwner && (expectedOwner.tenantId !== tenantId || expectedOwner.userId !== userId)) {
+        throw new SessionGoneError(batch.sessionId);
+      }
       const currentFence = Number(head.fence_token);
       if (batch.fence < currentFence) throw new FenceError(batch.sessionId, batch.fence, currentFence);
       const currentLastSeq = Number(head.last_seq);
       if (batch.expectedLastSeq !== undefined && batch.expectedLastSeq !== currentLastSeq) {
         throw new SessionVersionError(batch.sessionId, batch.expectedLastSeq, currentLastSeq);
       }
-      const tenantId = head.tenant_id as string;
-      const userId = head.user_id as string;
+      if (batch.lifecycle) {
+        if (
+          batch.lifecycle.type === "archive"
+          && parse<Session["status"]>(head.status).type === "active"
+          && batch.sessionPatch?.status?.type !== "idle"
+        ) {
+          throw new SessionLifecycleBusyError(batch.sessionId);
+        }
+      } else if (!batch.fenceClaim && head.archived_at_ms != null) {
+        throw new SessionArchivedError(batch.sessionId);
+      }
+
+      if (batch.fenceClaim) {
+        // Ownership hand-off is intentionally invisible to clients: do not change updated_at_ms or
+        // last_seq, and do not emit an event. The row lock makes this the linearization point.
+        await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [batch.fence, batch.sessionId]);
+        await conn.commit();
+        return { events: [], lastSeq: currentLastSeq };
+      }
 
       // A completed idempotency receipt and the first turn write share this transaction. There is no
       // pending reservation: a process that dies during preflight therefore leaves nothing to poison
@@ -361,7 +388,10 @@ export class MysqlSessionStore implements SessionStore {
         if (p.metadata !== undefined) { sets.push("metadata=?"); params.push(json(p.metadata)); }
         if (p.autoApprovedTools !== undefined) { sets.push("auto_approved_tools=?"); params.push(json(p.autoApprovedTools)); }
         if (p.lastCompactionSeq !== undefined) { sets.push("last_compaction_seq=?"); params.push(p.lastCompactionSeq); }
-        if (p.archivedAtMs !== undefined) { sets.push("archived_at_ms=?"); params.push(p.archivedAtMs); }
+      }
+      if (batch.lifecycle) {
+        sets.push("archived_at_ms=?");
+        params.push(batch.lifecycle.type === "archive" ? batch.lifecycle.atMs : null);
       }
       params.push(batch.sessionId);
       await conn.query(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id=?`, params);

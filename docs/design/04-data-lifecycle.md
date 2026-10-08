@@ -1,10 +1,12 @@
 # 数据生命周期设计
 
-> 状态：**待产品/合规确认，尚未启用物理清理**（2026-09-26）。本文给出 M1 完整数据生命周期的实现契约和安全默认值；在“待确认策略”确定前，只允许继续实现可逆状态机、租约协调、ownership manifest、outbox 和测试，不得自动永久删除数据。
+> 状态：**Archive v2 已实现；待产品/合规确认，尚未启用物理清理**（2026-10-08）。本文给出 M1 完整数据生命周期的实现契约和安全默认值；在“待确认策略”确定前，只允许继续实现可逆状态机、fenced tombstone、ownership manifest、outbox、erasure gate 和测试，不得自动永久删除数据。
 
 ## 1. 当前实现与缺口
 
-当前已有的 `archive` 只是设置 `archivedAtMs` 并从默认列表隐藏；`DELETE` 只是设置 `deleted_at_ms`，普通读取看不到 session，但 turns、items、events、approvals、idempotency receipts 和 usage 仍无限期保留。两条路径都没有完整的 active-turn/lease 协调。
+当前 `archive/unarchive` 已通过 `SessionHost` 的同一 per-session 队列、Redis lease 与 MySQL fence 完成可逆状态转换；生命周期事件、session marker、授权和异常 pending approval 在一个 store commit 中提交。archived session 保持可读但统一拒绝 mutable runtime 操作；active turn、同 runner 并发、跨 runner takeover、历史 archived-active 行、Memory/MySQL 回滚和事件 seq 均有测试。获取新 lease 后会先用纯 `fenceClaim` 推进数据库 fence、再读取 orphan repair 快照，关闭 Redis→MySQL hand-off 期间旧 owner 仍可写的窗口。
+
+`DELETE` 仍只是 HTTP 层直接设置 `deleted_at_ms`；普通读取看不到 session，但 turns、items、events、approvals、idempotency receipts 和 usage 仍无限期保留。它尚未完成 active-turn/lease 协调、删除事件、grace/outbox 或物理 purge，因此 Archive v2 完成不代表整体数据生命周期已经闭环。
 
 `BlobStore` 已有 memory 与本地文件实现；本地格式使用无大小写歧义的 key 和版本化 ref、带长度/校验和的单 envelope 原子发布，并覆盖路径、权限、静态 symlink、损坏及并发测试，也可读取/删除安全 key 范围内的旧 raw + sidecar 格式。但它尚未接入 item，也没有数据库 ownership manifest、事务 outbox 或孤儿回收；filesystem root 仍必须由服务独占，且本地 rename 不代表断电持久性。`outputRef` 因此仍只是协议预留字段，不能当成已完成的大输出生命周期。
 
@@ -19,7 +21,7 @@
 
 必须保持以下不变量：
 
-1. session 生命周期变更与 turn 使用同一 lease/fence，并进入同一 per-session 串行队列；HTTP 层不得旁路 `SessionHost` 直接修改 store。
+1. session 生命周期变更与 turn 使用同一 lease/fence，并进入同一 per-session 串行队列；新 owner 获取 Redis lease 后必须先以纯 fence claim 推进数据库 fence、再读取 takeover 快照；HTTP 层不得旁路 `SessionHost` 直接修改 store。
 2. tombstone 一旦提交，普通 API 统一表现为 `404`，普通 commit 必须失败，session ID 永不复用。
 3. archive 可逆；DELETE 对普通用户不可逆。grace period 只服务后台恢复、legal hold 和最终清理，不是用户回收站。
 4. 内容数据与财务事实分开处理；删除内容不能静默丢账，也不能让完整 prompt/工具输出伪装成“审计日志”长期保留。
@@ -28,6 +30,8 @@
 7. MySQL 事务不能包含对象存储删除；必须用事务 outbox 保证最终完成与安全重试。
 
 ## 3. Archive 推荐语义
+
+以下语义已实现；本节同时作为兼容性与回归契约：
 
 推荐直接采用以下默认值：
 

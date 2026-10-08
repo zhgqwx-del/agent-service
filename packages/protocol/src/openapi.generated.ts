@@ -764,6 +764,18 @@ export const OPENAPI_DOCUMENT = {
                 },
                 "type": "array"
               },
+              "sessionLifecycle": {
+                "items": {
+                  "enum": [
+                    "archive",
+                    "unarchive",
+                    "tombstone",
+                    "purge"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
               "skills": {
                 "type": "boolean"
               },
@@ -778,6 +790,7 @@ export const OPENAPI_DOCUMENT = {
               "streaming",
               "replay",
               "approvals",
+              "sessionLifecycle",
               "dynamicTools",
               "mcp",
               "skills",
@@ -788,7 +801,7 @@ export const OPENAPI_DOCUMENT = {
           },
           "protocolVersion": {
             "enum": [
-              "2026-09-26"
+              "2026-10-08"
             ],
             "type": "string"
           },
@@ -959,6 +972,7 @@ export const OPENAPI_DOCUMENT = {
                   "forbidden",
                   "not_found",
                   "session_busy",
+                  "session_archived",
                   "session_lease_conflict",
                   "idempotency_conflict",
                   "provider_error",
@@ -1143,6 +1157,62 @@ export const OPENAPI_DOCUMENT = {
               "seq",
               "type",
               "itemId"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "session/archived"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "session/unarchived"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "type"
             ],
             "type": "object"
           },
@@ -7380,7 +7450,7 @@ export const OPENAPI_DOCUMENT = {
   "info": {
     "description": "Public local-first API exposed by agent-runner and proxied by agent-router.",
     "title": "agent-service API",
-    "version": "2026-09-26"
+    "version": "2026-10-08"
   },
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "openapi": "3.1.0",
@@ -8384,6 +8454,7 @@ export const OPENAPI_DOCUMENT = {
     },
     "/v1/sessions/{id}/archive": {
       "post": {
+        "description": "Idempotently archives an idle session through the lease/fence path. Archived sessions remain readable but reject new mutable runtime operations.",
         "operationId": "archiveSession",
         "parameters": [
           {
@@ -9438,6 +9509,81 @@ export const OPENAPI_DOCUMENT = {
         "summary": "Return a result for a client-executed dynamic tool",
         "tags": [
           "Turns"
+        ]
+      }
+    },
+    "/v1/sessions/{id}/unarchive": {
+      "post": {
+        "description": "Idempotently returns an archived session to the visible, writable state through the lease/fence path.",
+        "operationId": "unarchiveSession",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "Unarchived session."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Restore an archived session",
+        "tags": [
+          "Sessions"
         ]
       }
     },

@@ -73,7 +73,7 @@ Router 必需配置：
 
 `pnpm build` 同时会为 router/runner 生成各自的单文件 ESM JavaScript bundle，可在装有 Node 24 和对应 production dependencies 的 Linux、macOS 或 Windows 主机运行，但它不是原生机器码二进制。目前 CI 对容器镜像和原生 Node bundle 都有启动门禁；生产默认推荐 OCI 镜像，因为依赖、Node 版本和文件布局也被一起冻结。若未来明确采用裸 VM，再增加带校验和的 bundle + production `node_modules` 发布包和 systemd 服务，不需要把两个服务合成一个二进制。
 
-“本地完整”指当前已实现的 M1/M2 主链路可在真实 MySQL + Redis + router + runner 下运行，并可用假厂商做无费用日常回归、用显式 `.env` 门禁做真实模型验证。它不表示云依赖已经由本机替代：完整数据生命周期、Blob/附件接线、M3 扩展和 M4 生产化仍按各自里程碑推进；OpenAPI/SDK 已纳入本地与 CI 门禁。
+“本地完整”指当前已实现的 M1/M2 主链路可在真实 MySQL + Redis + router + runner 下运行，并可用假厂商做无费用日常回归、用显式 `.env` 门禁做真实模型验证。可逆 Archive v2、OpenAPI/SDK 已纳入本地与 CI 门禁；它不表示云依赖已经由本机替代，也不表示数据生命周期已经全部完成：fenced tombstone、ownership manifest/outbox、Blob/附件接线、erasure/purge、M3 扩展和 M4 生产化仍按各自里程碑推进。
 
 当前 `MysqlSessionStore.connect()` 仍会自动执行迁移，适合 local/CI，但还不满足上文“生产迁移作为独立 Job”的目标。进入 staging 前必须拆出显式 migration 命令/Job，并让业务进程只做 schema 版本检查、禁止启动时自动 DDL；同时完成备份恢复与迁移失败后的人工审计/重试演练。
 

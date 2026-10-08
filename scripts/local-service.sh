@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# Load local defaults while keeping explicit command-line environment overrides authoritative.
+# Load local defaults while keeping the explicitly snapshotted topology overrides authoritative.
 caller_runner_port="${RUNNER_PORT-}"
 caller_router_port="${ROUTER_PORT-}"
 caller_runner_id="${RUNNER_ID-}"

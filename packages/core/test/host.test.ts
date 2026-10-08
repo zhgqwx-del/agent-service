@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { addUsage, ApiError, emptyUsage, type AgentDefinition, type Event, type Principal, type Usage } from "@agent-service/protocol";
-import { IdempotencyPendingError, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, SessionVersionError, type CommitBatch } from "@agent-service/store";
+import { addUsage, ApiError, emptyUsage, type AgentDefinition, type Approval, type Event, type Item, type Principal, type Turn, type Usage } from "@agent-service/protocol";
+import { FenceError, IdempotencyPendingError, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, SessionVersionError, type CommitBatch } from "@agent-service/store";
 import {
   SessionHost,
   StaticToolRegistry,
@@ -136,6 +136,19 @@ class FailingCompactionStore extends MemorySessionStore {
   }
 }
 
+class LifecycleFenceStore extends MemorySessionStore {
+  override async commit(batch: CommitBatch) {
+    if (batch.lifecycle) throw new FenceError(batch.sessionId, batch.fence, batch.fence + 1);
+    return super.commit(batch);
+  }
+}
+
+class ChangedOwnerLeaseStore extends MemoryLeaseStore {
+  override async getOwner(_sessionId: string) {
+    return { ownerId: "runner-new", ownerAddr: "127.0.0.1:9999", fence: 2 };
+  }
+}
+
 class AmbiguousIdempotencyStore extends MemorySessionStore {
   failOnce = true;
 
@@ -257,6 +270,222 @@ describe("SessionHost", () => {
       parentSessionId: foreignParent.id,
       metadata: {},
     })).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("archives and unarchives through the fenced host path, expiring session grants and stale approvals", async () => {
+    const h = await setup([{ text: "after restore" }]);
+    const approval: Approval = {
+      id: newId("apr"),
+      sessionId: h.session.id,
+      turnId: newId("turn"),
+      itemId: newId("item"),
+      status: "pending",
+      toolCallId: "legacy-call",
+      toolName: "danger",
+      args: {},
+      availableDecisions: ["accept", "decline"],
+      createdAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60_000,
+    };
+    const approvalItem: Item = {
+      id: approval.itemId,
+      sessionId: h.session.id,
+      turnId: approval.turnId,
+      seq: 0,
+      status: "inProgress",
+      createdAtMs: approval.createdAtMs,
+      type: "approvalRequest",
+      approvalId: approval.id,
+      toolCallId: approval.toolCallId,
+      name: approval.toolName,
+      args: approval.args,
+    };
+    await h.store.commit({
+      sessionId: h.session.id,
+      fence: 1,
+      approvals: [approval],
+      items: [approvalItem],
+      sessionPatch: { autoApprovedTools: ["danger"] },
+    });
+
+    await expect(h.host.archiveSession({ tenantId: "t_a", userId: "u_other" }, h.session.id)).rejects.toMatchObject({ code: "not_found" });
+    await expect(h.host.archiveSession({ tenantId: "t_other", userId: principal.userId }, h.session.id)).rejects.toMatchObject({ code: "not_found" });
+
+    const archived = await h.host.archiveSession(principal, h.session.id);
+    expect(archived.archivedAtMs).toEqual(expect.any(Number));
+    expect(archived.autoApprovedTools).toEqual([]);
+    expect((await h.store.getApproval(h.session.id, approval.id))).toMatchObject({
+      status: "expired",
+      decision: "cancel",
+      decidedBy: "system:archive",
+    });
+    expect(await h.store.getItem(h.session.id, approval.itemId)).toMatchObject({ status: "declined" });
+    const afterArchiveEvents = await h.store.readEvents(h.session.id, 0, 100);
+    expect(afterArchiveEvents.map((event) => event.type).slice(-3)).toEqual([
+      "approval/resolved",
+      "item/completed",
+      "session/archived",
+    ]);
+
+    const archiveSeq = archived.lastSeq;
+    expect((await h.host.archiveSession(principal, h.session.id)).lastSeq).toBe(archiveSeq);
+    expect((await h.store.readEvents(h.session.id, 0, 100)).at(-1)?.type).toBe("session/archived");
+    await expect(h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "blocked" }],
+      stream: false,
+      metadata: {},
+    })).rejects.toMatchObject({ code: "session_archived" });
+    await expect(h.host.compactSession(principal, h.session.id)).rejects.toMatchObject({ code: "session_archived" });
+    await expect(h.host.resolveApproval(principal, h.session.id, approval.id, "accept")).rejects.toMatchObject({ code: "session_archived" });
+    await expect(h.host.submitDynamicToolResultOrThrow(principal, h.session.id, "legacy-call", {
+      content: [{ type: "text", text: "blocked" }],
+      isError: false,
+    })).rejects.toMatchObject({ code: "session_archived" });
+    await expect(h.host.unarchiveSession({ tenantId: "t_a", userId: "u_other" }, h.session.id)).rejects.toMatchObject({ code: "not_found" });
+
+    const unarchived = await h.host.unarchiveSession(principal, h.session.id);
+    expect(unarchived.archivedAtMs).toBeUndefined();
+    expect(unarchived.autoApprovedTools).toEqual([]);
+    expect((await h.store.readEvents(h.session.id, archiveSeq, 10)).map((event) => event.type)).toEqual(["session/unarchived"]);
+    const started = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "restored" }],
+      stream: false,
+      metadata: {},
+    });
+    expect(started.turn.status).toBe("inProgress");
+    await waitIdle(h);
+  });
+
+  it("returns busy when archive loses the race to an active turn", async () => {
+    const h = await setup([
+      { text: "working", toolCalls: [{ name: "slow", args: { text: "x" } }] },
+      { text: "done" },
+    ]);
+    const { turn } = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "run" }],
+      stream: false,
+      metadata: {},
+    });
+    await expect(h.host.archiveSession(principal, h.session.id)).rejects.toMatchObject({ code: "session_busy" });
+    await h.host.interrupt(principal, h.session.id, turn.id);
+    await waitIdle(h);
+    expect((await h.host.archiveSession(principal, h.session.id)).archivedAtMs).toEqual(expect.any(Number));
+  });
+
+  it("serialises concurrent archive/unarchive calls and leases even an idempotent no-op", async () => {
+    const lease = new MemoryLeaseStore();
+    const h = await setup([], {}, {}, { lease });
+
+    const [archived, unarchived] = await Promise.all([
+      h.host.archiveSession(principal, h.session.id),
+      h.host.unarchiveSession(principal, h.session.id),
+    ]);
+    expect(archived.archivedAtMs).toEqual(expect.any(Number));
+    expect(unarchived.archivedAtMs).toBeUndefined();
+    expect((await h.store.readEvents(h.session.id, 0, 20)).map((event) => event.type).slice(-2)).toEqual([
+      "session/archived",
+      "session/unarchived",
+    ]);
+
+    const seqBeforeNoop = unarchived.lastSeq;
+    const fenceBeforeNoop = lease.fences.get(h.session.id);
+    const noopResult = await h.host.unarchiveSession(principal, h.session.id);
+    expect(noopResult.lastSeq).toBe(seqBeforeNoop);
+    expect(lease.fences.get(h.session.id)).toBe((fenceBeforeNoop ?? 0) + 1);
+    expect(noopResult.fenceToken).toBe(lease.fences.get(h.session.id));
+    await expect(h.store.commit({
+      sessionId: h.session.id,
+      fence: fenceBeforeNoop ?? 0,
+      sessionPatch: { title: "stale writer" },
+    })).rejects.toBeInstanceOf(FenceError);
+    expect(await lease.getOwner(h.session.id)).toBeNull();
+  });
+
+  it("reports a lifecycle stale fence as an owner-aware lease conflict", async () => {
+    const h = await setup([], {}, {}, {
+      store: new LifecycleFenceStore(),
+      lease: new ChangedOwnerLeaseStore(),
+    });
+
+    await expect(h.host.archiveSession(principal, h.session.id)).rejects.toMatchObject({
+      code: "session_lease_conflict",
+      details: { ownerId: "runner-new", ownerAddr: "127.0.0.1:9999" },
+    });
+  });
+
+  it("normalizes grants and approvals while unarchiving a legacy archived-active projection", async () => {
+    const store = new MemorySessionStore();
+    const h = await setup([], {}, {}, { store });
+    const legacyTurnId = newId("turn");
+    const approval: Approval = {
+      id: newId("apr"),
+      sessionId: h.session.id,
+      turnId: legacyTurnId,
+      itemId: newId("item"),
+      status: "pending",
+      toolCallId: "legacy-call",
+      toolName: "danger",
+      args: {},
+      availableDecisions: ["accept", "decline"],
+      createdAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60_000,
+    };
+    const approvalItem: Item = {
+      id: approval.itemId,
+      sessionId: h.session.id,
+      turnId: legacyTurnId,
+      seq: 0,
+      status: "inProgress",
+      createdAtMs: approval.createdAtMs,
+      type: "approvalRequest",
+      approvalId: approval.id,
+      toolCallId: approval.toolCallId,
+      name: approval.toolName,
+      args: approval.args,
+    };
+    const legacyTurn: Turn = {
+      id: legacyTurnId,
+      sessionId: h.session.id,
+      status: "inProgress",
+      seqStart: 2,
+      steps: 0,
+      toolCalls: 0,
+      usage: emptyUsage(),
+      startedAtMs: approval.createdAtMs,
+    };
+    const activeStatus = { type: "active" as const, turnId: legacyTurnId, activeFlags: ["waitingOnApproval" as const] };
+    await store.commit({
+      sessionId: h.session.id,
+      fence: 0,
+      approvals: [approval],
+      items: [approvalItem],
+      turn: legacyTurn,
+      events: [
+        { type: "turn/started", sessionId: h.session.id, emittedAtMs: approval.createdAtMs, turn: legacyTurn },
+        { type: "item/started", sessionId: h.session.id, emittedAtMs: approval.createdAtMs, item: approvalItem },
+        { type: "approval/requested", sessionId: h.session.id, emittedAtMs: approval.createdAtMs, approval },
+        { type: "session/status/changed", sessionId: h.session.id, emittedAtMs: approval.createdAtMs, status: activeStatus },
+      ],
+      sessionPatch: { status: activeStatus, autoApprovedTools: ["danger"] },
+    });
+    const persisted = store.sessions.get(h.session.id)!;
+    persisted.archivedAtMs = Date.now();
+
+    const repaired = await h.host.unarchiveSession(principal, h.session.id);
+    expect(repaired.archivedAtMs).toBeUndefined();
+    expect(repaired.status).toEqual({ type: "idle" });
+    expect(repaired.autoApprovedTools).toEqual([]);
+    expect(repaired.fenceToken).toBe(1);
+    expect(await store.getApproval(h.session.id, approval.id)).toMatchObject({ status: "expired", decision: "cancel" });
+    expect(await store.getItem(h.session.id, approval.itemId)).toMatchObject({ status: "declined" });
+    expect(await store.getTurn(h.session.id, legacyTurnId)).toMatchObject({ status: "interrupted", stopReason: "interrupted" });
+    expect((await store.readEvents(h.session.id, 0, 20)).map((event) => event.type).slice(-5)).toEqual([
+      "approval/resolved",
+      "item/completed",
+      "turn/completed",
+      "session/status/changed",
+      "session/unarchived",
+    ]);
   });
 
   it("runs a multi-step turn: text → tool → final; events are contiguous and items replayable", async () => {

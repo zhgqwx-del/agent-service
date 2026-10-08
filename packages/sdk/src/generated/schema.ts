@@ -240,7 +240,10 @@ export type paths = {
         };
         readonly get?: never;
         readonly put?: never;
-        /** Archive a session */
+        /**
+         * Archive a session
+         * @description Idempotently archives an idle session through the lease/fence path. Archived sessions remain readable but reject new mutable runtime operations.
+         */
         readonly post: operations["archiveSession"];
         readonly delete?: never;
         readonly options?: never;
@@ -402,6 +405,26 @@ export type paths = {
         readonly put?: never;
         /** Return a result for a client-executed dynamic tool */
         readonly post: operations["submitDynamicToolResult"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/sessions/{id}/unarchive": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Restore an archived session
+         * @description Idempotently returns an archived session to the visible, writable state through the lease/fence path.
+         */
+        readonly post: operations["unarchiveSession"];
         readonly delete?: never;
         readonly options?: never;
         readonly head?: never;
@@ -697,12 +720,13 @@ export type components = {
                     readonly persistedEvents: true;
                 };
                 readonly sandbox: readonly "none"[];
+                readonly sessionLifecycle: readonly ("archive" | "unarchive" | "tombstone" | "purge")[];
                 readonly skills: boolean;
                 /** @enum {boolean} */
                 readonly streaming: true;
             };
             /** @enum {string} */
-            readonly protocolVersion: "2026-09-26";
+            readonly protocolVersion: "2026-10-08";
             /** @enum {string} */
             readonly service: "agent-runner" | "agent-router";
         };
@@ -748,7 +772,7 @@ export type components = {
         readonly ErrorBody: {
             readonly error: {
                 /** @enum {string} */
-                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_lease_conflict" | "idempotency_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
+                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_lease_conflict" | "idempotency_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
                 readonly details?: unknown;
                 readonly message: string;
                 readonly retryable?: boolean;
@@ -787,6 +811,18 @@ export type components = {
             readonly sessionId: string;
             /** @enum {string} */
             readonly type: "session/compacted";
+        } | {
+            readonly emittedAtMs: number;
+            readonly seq: number;
+            readonly sessionId: string;
+            /** @enum {string} */
+            readonly type: "session/archived";
+        } | {
+            readonly emittedAtMs: number;
+            readonly seq: number;
+            readonly sessionId: string;
+            /** @enum {string} */
+            readonly type: "session/unarchived";
         } | {
             readonly emittedAtMs: number;
             readonly seq: number;
@@ -3392,6 +3428,42 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["OkResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly unarchiveSession: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly id: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Unarchived session. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["Session"];
                 };
             };
             /** @description Error response. */

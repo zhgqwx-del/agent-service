@@ -3,6 +3,7 @@
 ## design/
 - `01-identity-and-auth.md` — **身份与鉴权定稿**：service key 与端用户身份的区别、为什么 runner 必须自己验证、`trusted_caller` 与 `end_user_token` 两种模式的配置与取舍。
 - `00-architecture.md` — **总体架构方案 v0.1（已采用的设计基线）**：结论、服务拆分、分布式一致性、对外协议、runner 内部、扩展性、存储、容量、技术栈与里程碑；实时完成度以 `PROGRESS.md` 为准。
+- `04-data-lifecycle.md` — **数据生命周期设计门禁**：archive/delete、usage、Blob ownership、outbox、erasure、purge 和滚动升级语义。
 
 ## research/（调研阶段产出，2026-09-22）
 | 文件 | 内容 |
@@ -27,3 +28,4 @@ shallow clone 在 `../oss-refs/`（opencode、deepseek-harness、pi、codex、op
 ## operations/
 
 - `local-and-deployment.md`：本地服务生命周期、自动验证入口，以及未来 staging/production 的配置与模块部署契约。
+- `development-and-ci-guide.md`：面向学习与日常研发的完整操作指南；解释服务/代码库边界、本地启动、手动体验、验证分层、Node bundle、OCI image 和 GitHub Actions 构建内容。

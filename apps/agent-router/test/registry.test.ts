@@ -30,6 +30,7 @@ describe("RunnerRegistry owner address mapping", () => {
         streaming: true,
         replay: { persistedEvents: true, hotWindowMs: 1 },
         approvals: true,
+        sessionLifecycle: ["archive", "unarchive"],
         dynamicTools: true,
         mcp: [],
         skills: false,

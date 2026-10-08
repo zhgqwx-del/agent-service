@@ -1,15 +1,18 @@
 import { describe, expect, it } from "vitest";
-import type { Event, EventInput, Item, Session, Turn } from "@agent-service/protocol";
+import type { Approval, Event, EventInput, Item, Session, Turn } from "@agent-service/protocol";
 import { emptyUsage } from "@agent-service/protocol";
 import {
   FenceError,
   IdempotencyMismatchError,
   IdempotencyReplayError,
+  SessionArchivedError,
   SessionExistsError,
   SessionGoneError,
+  SessionLifecycleBusyError,
   SessionVersionError,
   type EventBus,
   type LeaseStore,
+  type SessionLifecycleTransition,
   type SessionStore,
 } from "../src/index.js";
 
@@ -133,6 +136,209 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const got = await store.getSession(s.tenantId, s.id);
       expect(got?.lastSeq).toBe(5);
       expect(got?.fenceToken).toBe(2);
+      await store.close();
+    });
+
+    it("sets and clears the archive marker atomically with lifecycle events", async () => {
+      const store = await make();
+      const s = mkSession();
+      await store.createSession(s);
+      const archivedAtMs = Date.now();
+
+      const archived = await store.commit({
+        sessionId: s.id,
+        fence: 1,
+        lifecycle: { type: "archive", atMs: archivedAtMs, tenantId: s.tenantId, userId: s.userId },
+        events: [{ type: "session/archived", sessionId: s.id, emittedAtMs: archivedAtMs }],
+      });
+      expect(archived.events).toEqual([
+        { type: "session/archived", sessionId: s.id, emittedAtMs: archivedAtMs, seq: 2 },
+      ]);
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ archivedAtMs, lastSeq: 2, fenceToken: 1 });
+      expect((await store.listSessions(s.tenantId, { limit: 100 })).data.map((session) => session.id)).not.toContain(s.id);
+      expect((await store.listSessions(s.tenantId, { limit: 100, includeArchived: true })).data.map((session) => session.id)).toContain(s.id);
+
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 2,
+        events: [{ type: "session/created", sessionId: s.id, emittedAtMs: archivedAtMs + 1 }],
+        sessionPatch: { title: "must not change" },
+      })).rejects.toBeInstanceOf(SessionArchivedError);
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ archivedAtMs, lastSeq: 2, fenceToken: 1 });
+      expect((await store.getSession(s.tenantId, s.id))?.title).toBeUndefined();
+
+      const unarchivedAtMs = archivedAtMs + 1;
+      const unarchived = await store.commit({
+        sessionId: s.id,
+        fence: 2,
+        lifecycle: { type: "unarchive", atMs: unarchivedAtMs, tenantId: s.tenantId, userId: s.userId },
+        events: [{ type: "session/unarchived", sessionId: s.id, emittedAtMs: unarchivedAtMs }],
+      });
+      expect(unarchived.events).toEqual([
+        { type: "session/unarchived", sessionId: s.id, emittedAtMs: unarchivedAtMs, seq: 3 },
+      ]);
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 3, fenceToken: 2 });
+      expect((await store.getSession(s.tenantId, s.id))?.archivedAtMs).toBeUndefined();
+      expect((await store.listSessions(s.tenantId, { limit: 100 })).data.map((session) => session.id)).toContain(s.id);
+      await store.close();
+    });
+
+    it("rolls back the complete lifecycle batch when approval serialization fails", async () => {
+      const store = await make();
+      const s = mkSession();
+      await store.createSession(s);
+      await store.commit({ sessionId: s.id, fence: 1, sessionPatch: { autoApprovedTools: ["danger"] } });
+      const args = {} as Record<string, unknown>;
+      Object.defineProperty(args, "invalid", {
+        enumerable: true,
+        get: () => { throw new Error("injected lifecycle serialization failure"); },
+      });
+      const approval: Approval = {
+        id: newId("apr"), sessionId: s.id, turnId: newId("turn"), itemId: newId("item"),
+        status: "expired", toolCallId: "call", toolName: "danger", args,
+        availableDecisions: ["accept", "decline"], decision: "cancel", decidedBy: "system:archive",
+        createdAtMs: 1, expiresAtMs: 2, resolvedAtMs: 3,
+      };
+      const archivedAtMs = Date.now();
+
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 2,
+        lifecycle: { type: "archive", atMs: archivedAtMs, tenantId: s.tenantId, userId: s.userId },
+        approvals: [approval],
+        events: [{ type: "session/archived", sessionId: s.id, emittedAtMs: archivedAtMs }],
+        sessionPatch: { autoApprovedTools: [] },
+      })).rejects.toThrow("injected lifecycle serialization failure");
+
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({
+        lastSeq: 1,
+        fenceToken: 1,
+        autoApprovedTools: ["danger"],
+      });
+      expect((await store.getSession(s.tenantId, s.id))?.archivedAtMs).toBeUndefined();
+      expect(await store.readEvents(s.id, 0, 10)).toHaveLength(1);
+      expect(await store.getApproval(s.id, approval.id)).toBeNull();
+      await store.close();
+    });
+
+    it("does not mutate memory state when lifecycle serialization itself fails", async () => {
+      const store = await make();
+      const s = mkSession();
+      await store.createSession(s);
+      const lifecycle = {
+        type: "archive",
+        tenantId: s.tenantId,
+        userId: s.userId,
+      } as unknown as SessionLifecycleTransition;
+      Object.defineProperty(lifecycle, "atMs", {
+        enumerable: true,
+        get: () => { throw new Error("injected lifecycle marker serialization failure"); },
+      });
+
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 9,
+        lifecycle,
+        events: [{ type: "session/archived", sessionId: s.id, emittedAtMs: Date.now() }],
+      })).rejects.toThrow("injected lifecycle marker serialization failure");
+      const unchanged = await store.getSession(s.tenantId, s.id);
+      expect(unchanged).toMatchObject({ lastSeq: 1, fenceToken: 0 });
+      expect(unchanged?.archivedAtMs).toBeUndefined();
+      expect((await store.readEvents(s.id, 0, 10)).map((event) => event.type)).toEqual(["session/created"]);
+      await store.close();
+    });
+
+    it("enforces lifecycle ownership, fencing, active-session and tombstone guards", async () => {
+      const store = await make();
+      const s = mkSession("t_lifecycle_guards", "u_lifecycle_guards");
+      await store.createSession(s);
+      await store.commit({
+        sessionId: s.id,
+        fence: 2,
+        sessionPatch: { status: { type: "active", turnId: newId("turn"), activeFlags: [] } },
+      });
+      const lifecycle = {
+        type: "archive" as const,
+        atMs: Date.now(),
+        tenantId: s.tenantId,
+        userId: s.userId,
+      };
+
+      await expect(store.commit({ sessionId: s.id, fence: 1, lifecycle })).rejects.toBeInstanceOf(FenceError);
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 3,
+        lifecycle: { ...lifecycle, userId: "u_wrong" },
+      })).rejects.toBeInstanceOf(SessionGoneError);
+      await expect(store.commit({ sessionId: s.id, fence: 3, lifecycle })).rejects.toBeInstanceOf(SessionLifecycleBusyError);
+      const guardedSession = await store.getSession(s.tenantId, s.id);
+      expect(guardedSession).toMatchObject({
+        status: { type: "active" },
+        fenceToken: 2,
+        lastSeq: 1,
+      });
+      expect(guardedSession?.archivedAtMs).toBeUndefined();
+
+      expect(await store.deleteSession(s.tenantId, s.id)).toBe(true);
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 3,
+        lifecycle: { ...lifecycle, type: "unarchive" },
+      })).rejects.toBeInstanceOf(SessionGoneError);
+      await store.close();
+    });
+
+    it("claims a durable fence without changing active or archived business state", async () => {
+      const store = await make();
+      const s = mkSession("t_fence_claim", "u_fence_claim");
+      await store.createSession(s);
+      const activeStatus = { type: "active" as const, turnId: newId("turn"), activeFlags: [] };
+      await store.commit({ sessionId: s.id, fence: 1, sessionPatch: { status: activeStatus } });
+
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 2,
+        fenceClaim: { tenantId: s.tenantId, userId: "u_wrong" },
+      })).rejects.toBeInstanceOf(SessionGoneError);
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 2,
+        fenceClaim: { tenantId: s.tenantId, userId: s.userId },
+        sessionPatch: { status: { type: "idle" } },
+      })).rejects.toThrow("fenceClaim must be a pure fence-only commit");
+
+      const beforeActiveClaim = await store.getSession(s.tenantId, s.id);
+      const claimedActive = await store.commit({
+        sessionId: s.id,
+        fence: 2,
+        fenceClaim: { tenantId: s.tenantId, userId: s.userId },
+      });
+      expect(claimedActive).toEqual({ events: [], lastSeq: 1 });
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ status: activeStatus, fenceToken: 2, lastSeq: 1 });
+      expect((await store.getSession(s.tenantId, s.id))?.updatedAtMs).toBe(beforeActiveClaim?.updatedAtMs);
+
+      const archivedAtMs = Date.now();
+      await store.commit({
+        sessionId: s.id,
+        fence: 3,
+        lifecycle: { type: "archive", atMs: archivedAtMs, tenantId: s.tenantId, userId: s.userId },
+        events: [{ type: "session/archived", sessionId: s.id, emittedAtMs: archivedAtMs }],
+        sessionPatch: { status: { type: "idle" } },
+      });
+      const beforeArchivedClaim = await store.getSession(s.tenantId, s.id);
+      const claimedArchived = await store.commit({
+        sessionId: s.id,
+        fence: 4,
+        fenceClaim: { tenantId: s.tenantId, userId: s.userId },
+      });
+      expect(claimedArchived).toEqual({ events: [], lastSeq: 2 });
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ archivedAtMs, status: { type: "idle" }, fenceToken: 4, lastSeq: 2 });
+      expect((await store.getSession(s.tenantId, s.id))?.updatedAtMs).toBe(beforeArchivedClaim?.updatedAtMs);
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 3,
+        sessionPatch: { title: "stale writer" },
+      })).rejects.toBeInstanceOf(FenceError);
       await store.close();
     });
 

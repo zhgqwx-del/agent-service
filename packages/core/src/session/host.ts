@@ -21,8 +21,16 @@ import {
   type Turn,
   type Usage,
 } from "@agent-service/protocol";
-import type { CommitBatch, EventBus, EventListener, IdempotencyReceiptInput, LeaseStore, SessionStore } from "@agent-service/store";
-import { FenceError, IdempotencyMismatchError, IdempotencyPendingError, IdempotencyReplayError, SessionGoneError } from "@agent-service/store";
+import type { CommitBatch, EventBus, EventListener, IdempotencyReceiptInput, LeaseStore, SessionLifecycleTransition, SessionStore } from "@agent-service/store";
+import {
+  FenceError,
+  IdempotencyMismatchError,
+  IdempotencyPendingError,
+  IdempotencyReplayError,
+  SessionArchivedError,
+  SessionGoneError,
+  SessionLifecycleBusyError,
+} from "@agent-service/store";
 import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineRun, EngineSink, ResolvedModel, Summariser } from "../engine/types.js";
 import { buildSystemPrompt, computeContextEpoch, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
 import { projectItems, pruneToolResults } from "../context/history.js";
@@ -276,6 +284,116 @@ export class SessionHost {
     return s;
   }
 
+  private assertNotArchived(session: Session, action: string): void {
+    if (session.archivedAtMs !== undefined) {
+      throw new ApiError("session_archived", `cannot ${action} an archived session`);
+    }
+  }
+
+  /** Archive is a fenced lifecycle write and is serialised with turn starts on this runner. */
+  async archiveSession(principal: Principal, sessionId: string): Promise<Session> {
+    return this.serialiseSessionStart(sessionId, () => this.setArchiveStateLocked(principal, sessionId, true));
+  }
+
+  /** Unarchive uses the same lease/fence path so it cannot race another owner or a new turn. */
+  async unarchiveSession(principal: Principal, sessionId: string): Promise<Session> {
+    return this.serialiseSessionStart(sessionId, () => this.setArchiveStateLocked(principal, sessionId, false));
+  }
+
+  private async setArchiveStateLocked(principal: Principal, sessionId: string, archive: boolean): Promise<Session> {
+    let session = await this.getSession(principal, sessionId);
+    if (this.active.has(sessionId)) {
+      throw new ApiError("session_busy", `cannot ${archive ? "archive" : "unarchive"} while a turn is active`);
+    }
+
+    this.clearHold(sessionId);
+    const lease = await this.deps.lease.acquire(sessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+    if (!lease.ok) {
+      throw new ApiError("session_lease_conflict", "session owned by another runner", {
+        ownerId: lease.ownerId,
+        ownerAddr: lease.ownerAddr,
+      });
+    }
+    const leaseGuard = this.startLeaseGuard(sessionId);
+    try {
+      await this.claimSessionFence(session, lease.fence, leaseGuard);
+      session = await leaseGuard.wait(this.getSession(principal, sessionId));
+      if (this.active.has(sessionId)) {
+        throw new ApiError("session_busy", `cannot ${archive ? "archive" : "unarchive"} while a turn is active`);
+      }
+      if (session.status.type === "active") {
+        const legacyArchivedRepair: SessionLifecycleTransition | undefined = session.archivedAtMs === undefined ? undefined : {
+          type: "archive",
+          atMs: session.archivedAtMs,
+          tenantId: session.tenantId,
+          userId: session.userId,
+        };
+        await leaseGuard.wait(this.closeOrphanedTurn(session, lease.fence, leaseGuard, legacyArchivedRepair));
+        // Orphan repair can advance lastSeq/fence and resolve approvals. Re-read before deciding
+        // whether the requested lifecycle transition is now a no-op and before returning a resource.
+        session = await leaseGuard.wait(this.getSession(principal, sessionId));
+      }
+
+      const transitioning = archive ? session.archivedAtMs === undefined : session.archivedAtMs !== undefined;
+      // Old runners archived sessions without clearing grants or pending approvals. Normalize both
+      // archive and unarchive so restoring a historical row can never revive stale authorization.
+      const pending = await leaseGuard.wait(this.deps.store.listApprovals(sessionId, { pendingOnly: true }));
+
+      const now = Date.now();
+      const approvals: Approval[] = pending.map((approval) => ({
+        ...approval,
+        status: "expired",
+        decision: "cancel",
+        decidedBy: "system:archive",
+        resolvedAtMs: now,
+      }));
+      const approvalItems = await leaseGuard.wait(Promise.all(
+        pending.map((approval) => this.deps.store.getItem(sessionId, approval.itemId)),
+      ));
+      const items: Item[] = approvalItems.flatMap((item) => (
+        item && item.type === "approvalRequest" && item.status === "inProgress"
+          ? [{ ...item, status: "declined" as const, completedAtMs: now }]
+          : []
+      ));
+      const events: EventInput[] = [];
+      for (const approval of approvals) {
+        events.push({ type: "approval/resolved", sessionId, emittedAtMs: now, approval });
+        const item = items.find((candidate) => candidate.type === "approvalRequest" && candidate.approvalId === approval.id);
+        if (item) events.push({ type: "item/completed", sessionId, emittedAtMs: now, item });
+      }
+      if (transitioning) {
+        events.push({ type: archive ? "session/archived" : "session/unarchived", sessionId, emittedAtMs: now });
+      }
+
+      leaseGuard.assertOwned();
+      const result = await leaseGuard.wait(this.deps.store.commit({
+        sessionId,
+        fence: lease.fence,
+        lifecycle: {
+          type: archive ? "archive" : "unarchive",
+          atMs: archive ? (session.archivedAtMs ?? now) : now,
+          tenantId: session.tenantId,
+          userId: session.userId,
+        },
+        approvals,
+        items,
+        events,
+        sessionPatch: { autoApprovedTools: [] },
+      }));
+      await this.publishAll(sessionId, result.events);
+      return await leaseGuard.wait(this.getSession(principal, sessionId));
+    } catch (err) {
+      const failure = leaseGuard.lost ?? err;
+      if (failure instanceof SessionLifecycleBusyError) {
+        throw new ApiError("session_busy", `cannot ${archive ? "archive" : "unarchive"} while a turn is active`);
+      }
+      throw await this.translateSessionLeaseFailure(sessionId, failure);
+    } finally {
+      leaseGuard.stop();
+      await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+    }
+  }
+
   // ---------------- event subscription ----------------
 
   /**
@@ -468,6 +586,32 @@ export class SessionHost {
     };
   }
 
+  /**
+   * Close the Redis-to-MySQL hand-off window before reading takeover state. Once this pure commit
+   * advances the durable fence, every write from the previous owner is rejected by the row lock.
+   */
+  private async claimSessionFence(session: Session, fence: number, leaseGuard: LeaseGuard): Promise<void> {
+    leaseGuard.assertOwned();
+    await leaseGuard.wait(this.deps.store.commit({
+      sessionId: session.id,
+      fence,
+      fenceClaim: { tenantId: session.tenantId, userId: session.userId },
+    }));
+    leaseGuard.assertOwned();
+  }
+
+  private async translateSessionLeaseFailure(sessionId: string, failure: unknown): Promise<unknown> {
+    if (failure instanceof SessionGoneError) return new ApiError("not_found", "session not found");
+    if (failure instanceof FenceError) {
+      return new ApiError(
+        "session_lease_conflict",
+        "session ownership changed before the durable fence was established",
+        await this.ownerDetails(sessionId),
+      );
+    }
+    return failure;
+  }
+
   /** begin + run in one call. Convenience for non-streaming callers and tests. */
   async startTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string } = {}): Promise<{ turn: Turn; session: Session; steered?: boolean; replayed?: boolean }> {
     const begun = await this.beginTurn(principal, sessionId, req, opts);
@@ -485,6 +629,9 @@ export class SessionHost {
     } catch (err) {
       if (err instanceof IdempotencyPendingError) {
         throw new ApiError("idempotency_conflict", "this Idempotency-Key has a legacy request still in progress");
+      }
+      if (err instanceof SessionArchivedError) {
+        throw new ApiError("session_archived", "cannot start a turn in an archived session");
       }
       throw err;
     }
@@ -507,9 +654,11 @@ export class SessionHost {
       ? await this.lookupIdempotentTurn(session, opts.idempotencyKey, requestHash!)
       : undefined;
     const local = this.active.get(sessionId);
-    if (existing && (existing.status !== "inProgress" || local?.turn.id === existing.id)) {
+    if (existing && existing.status !== "inProgress") {
       return { turn: existing, session, replayed: true, run: noop };
     }
+    this.assertNotArchived(session, "start a turn in");
+    if (existing && local?.turn.id === existing.id) return { turn: existing, session, replayed: true, run: noop };
     const probingInProgressReplay = existing?.status === "inProgress" && !local;
     if (this.draining && !probingInProgressReplay) throw new ApiError("draining", "runner is draining");
     const agent = await this.deps.store.getAgent(principal.tenantId, session.agentId, session.agentVersion);
@@ -552,6 +701,7 @@ export class SessionHost {
     const leaseGuard = this.startLeaseGuard(sessionId);
 
     try {
+      await this.claimSessionFence(session, fence, leaseGuard);
       // The snapshot read at entry is stale by now (several awaits, one of them a DB round trip): a
       // turn may have finished in between. Re-read before deciding anything about the session state.
       const fresh = await leaseGuard.wait(this.getSession(principal, sessionId));
@@ -560,6 +710,9 @@ export class SessionHost {
         ? await leaseGuard.wait(this.lookupIdempotentTurn(session, opts.idempotencyKey, requestHash!))
         : undefined;
       if (afterLeaseExisting) {
+        if (session.archivedAtMs !== undefined && afterLeaseExisting.status === "inProgress") {
+          throw new ApiError("session_archived", "cannot resume an in-progress turn in an archived session");
+        }
         // A response can be lost after the atomic turn-start commit but before run(). If no runner is
         // executing that durable in-progress turn, close it as interrupted before replaying it.
         if (afterLeaseExisting.status === "inProgress") {
@@ -574,6 +727,7 @@ export class SessionHost {
         await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
         return { turn: replay, session, replayed: true, run: noop };
       }
+      this.assertNotArchived(session, "start a turn in");
       // The receipt may have expired between the optimistic lookup and lease acquisition. A draining
       // runner may repair/replay an existing durable turn, but must never fall through and create one.
       if (this.draining) throw new ApiError("draining", "runner is draining");
@@ -584,9 +738,10 @@ export class SessionHost {
       }
       return await this.beginTurnInner(principal, session, agent, req, input, opts, fence, leaseGuard);
     } catch (err) {
+      const failure = leaseGuard.lost ?? err;
       leaseGuard.stop();
       await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
-      throw leaseGuard.lost ?? err;
+      throw await this.translateSessionLeaseFailure(sessionId, failure);
     }
   }
 
@@ -699,6 +854,9 @@ export class SessionHost {
       }
       if (err instanceof IdempotencyPendingError) {
         throw new ApiError("idempotency_conflict", "this Idempotency-Key has a legacy request still in progress");
+      }
+      if (err instanceof SessionArchivedError) {
+        throw new ApiError("session_archived", "cannot start a turn in an archived session");
       }
       if (err instanceof IdempotencyReplayError) {
         const existingTurn = await this.deps.store.getTurn(sessionId, err.receipt.value.turnId);
@@ -1043,7 +1201,8 @@ export class SessionHost {
   }
 
   async resolveApproval(principal: Principal, sessionId: string, approvalId: string, decision: ApprovalDecision): Promise<Approval> {
-    await this.getSession(principal, sessionId);
+    const session = await this.getSession(principal, sessionId);
+    this.assertNotArchived(session, "resolve an approval in");
     const state = this.active.get(sessionId);
     const pending = state?.pendingApprovals.get(approvalId);
     if (!pending) {
@@ -1072,7 +1231,8 @@ export class SessionHost {
     req: { input: InputPart[]; expectedTurnId?: string },
     idempotency?: IdempotencyReceiptInput,
   ): Promise<void> {
-    await this.getSession(principal, sessionId);
+    const session = await this.getSession(principal, sessionId);
+    this.assertNotArchived(session, "steer");
     const state = this.active.get(sessionId);
     if (!state || state.turn.id !== turnId) {
       const owner = await this.ownerDetails(sessionId);
@@ -1182,7 +1342,9 @@ export class SessionHost {
   }
 
   /** Async twin of submitDynamicToolResult that reports the owner when this runner is not it. */
-  async submitDynamicToolResultOrThrow(sessionId: string, toolCallId: string, result: { content: { type: "text"; text: string }[]; isError: boolean }): Promise<void> {
+  async submitDynamicToolResultOrThrow(principal: Principal, sessionId: string, toolCallId: string, result: { content: { type: "text"; text: string }[]; isError: boolean }): Promise<void> {
+    const session = await this.getSession(principal, sessionId);
+    this.assertNotArchived(session, "submit a tool result to");
     if (this.submitDynamicToolResult(sessionId, toolCallId, result)) return;
     const owner = await this.ownerDetails(sessionId);
     if (owner.ownerAddr && owner.ownerId !== this.deps.config.runnerId) {
@@ -1273,8 +1435,9 @@ export class SessionHost {
   }
 
   private async compactSessionLocked(principal: Principal, sessionId: string): Promise<{ compacted: boolean; summaryItemId?: string }> {
-    if (!this.deps.summariser) throw new ApiError("invalid_request", "this runner has no summariser configured");
     const session = await this.getSession(principal, sessionId);
+    this.assertNotArchived(session, "compact");
+    if (!this.deps.summariser) throw new ApiError("invalid_request", "this runner has no summariser configured");
     if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot compact while a turn is running");
     const agent = await this.deps.store.getAgent(principal.tenantId, session.agentId, session.agentVersion);
     if (!agent) throw new ApiError("not_found", "agent version not found");
@@ -1283,8 +1446,10 @@ export class SessionHost {
     if (!lease.ok) throw new ApiError("session_lease_conflict", "session owned by another runner", { ownerId: lease.ownerId, ownerAddr: lease.ownerAddr });
     const leaseGuard = this.startLeaseGuard(sessionId);
     try {
+      await this.claimSessionFence(session, lease.fence, leaseGuard);
       const fresh = await leaseGuard.wait(this.getSession(principal, sessionId));
       Object.assign(session, fresh);
+      this.assertNotArchived(session, "compact");
       if (session.status.type === "active" || this.active.has(sessionId)) throw new ApiError("session_busy", "cannot compact while a turn is running");
       const model = await leaseGuard.wait(this.deps.providers.resolve(principal, agent.model));
       const items = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
@@ -1293,7 +1458,7 @@ export class SessionHost {
       leaseGuard.assertOwned();
       return { compacted: !!result, summaryItemId: result?.itemId };
     } catch (err) {
-      throw leaseGuard.lost ?? err;
+      throw await this.translateSessionLeaseFailure(sessionId, leaseGuard.lost ?? err);
     } finally {
       leaseGuard.stop();
       await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
@@ -1385,32 +1550,74 @@ export class SessionHost {
 
   /**
    * The previous owner died mid-turn: mark its turn interrupted so the store never shows two active
-   * turns. Writes nothing when the turn already finished — a spurious `idle` event would close the
-   * SSE stream of the turn we are about to start.
+   * turns. A stale projection is repaired without a spurious `idle` event, which would close the SSE
+   * stream of the turn we are about to start; orphaned approvals still receive resolution events.
    */
-  private async closeOrphanedTurn(session: Session, fence: number, leaseGuard?: LeaseGuard) {
+  private async closeOrphanedTurn(
+    session: Session,
+    fence: number,
+    leaseGuard?: LeaseGuard,
+    lifecycle?: SessionLifecycleTransition,
+  ) {
     if (session.status.type !== "active") return;
-    const t = await this.deps.store.getTurn(session.id, session.status.turnId);
+    const activeTurnId = session.status.turnId;
+    const t = await this.deps.store.getTurn(session.id, activeTurnId);
+    const now = Date.now();
+    const pending = (await this.deps.store.listApprovals(session.id, { pendingOnly: true }))
+      .filter((approval) => approval.turnId === activeTurnId);
+    const approvals: Approval[] = pending.map((approval) => ({
+      ...approval,
+      status: "expired",
+      decision: "cancel",
+      decidedBy: "system:owner_lost",
+      resolvedAtMs: now,
+    }));
+    const approvalItems = await Promise.all(
+      pending.map((approval) => this.deps.store.getItem(session.id, approval.itemId)),
+    );
+    const items: Item[] = approvalItems.flatMap((item) => (
+      item && item.type === "approvalRequest" && item.status === "inProgress"
+        ? [{ ...item, status: "declined" as const, completedAtMs: now }]
+        : []
+    ));
+    const approvalEvents: EventInput[] = [];
+    for (const approval of approvals) {
+      approvalEvents.push({ type: "approval/resolved", sessionId: session.id, emittedAtMs: now, approval });
+      const item = items.find((candidate) => candidate.type === "approvalRequest" && candidate.approvalId === approval.id);
+      if (item) approvalEvents.push({ type: "item/completed", sessionId: session.id, emittedAtMs: now, item });
+    }
     leaseGuard?.assertOwned();
     if (!t || t.status !== "inProgress") {
-      // Stale projection only: repair the row quietly, without an event.
+      // Stale projection only: repair the row without a spurious idle event. Any orphaned approval
+      // still gets its own resolution events so its item cannot remain inProgress forever.
       if (session.status.type === "active") {
         leaseGuard?.assertOwned();
-        await this.deps.store.commit({ sessionId: session.id, fence, sessionPatch: { status: { type: "idle" } } });
+        const r = await this.deps.store.commit({
+          sessionId: session.id,
+          fence,
+          lifecycle,
+          approvals,
+          items,
+          events: approvalEvents,
+          sessionPatch: { status: { type: "idle" } },
+        });
+        await this.publishAll(session.id, r.events);
         session.status = { type: "idle" };
+        session.lastSeq = r.lastSeq;
       }
       return;
     }
-    const now = Date.now();
     const turn: Turn = { ...t, status: "interrupted", stopReason: "interrupted", completedAtMs: now, error: { code: "owner_lost", message: "previous runner lost its lease during this turn" } };
-    const pend = (await this.deps.store.listApprovals(session.id, { pendingOnly: true })).filter((a) => a.turnId === t.id);
     leaseGuard?.assertOwned();
     const r = await this.deps.store.commit({
       sessionId: session.id,
       fence,
+      lifecycle,
       turn,
-      approvals: pend.map((a) => ({ ...a, status: "expired" as const, resolvedAtMs: now, decidedBy: "system:owner_lost" })),
+      approvals,
+      items,
       events: [
+        ...approvalEvents,
         { type: "turn/completed", sessionId: session.id, emittedAtMs: now, turn, stopReason: "interrupted" },
         { type: "session/status/changed", sessionId: session.id, emittedAtMs: now, status: { type: "idle" } },
       ],
@@ -1453,7 +1660,12 @@ export class SessionHost {
       } catch (err) {
         // These are a normal control-flow result of the atomic turn-start receipt check, not a
         // storage failure and not evidence that this writer lost ownership.
-        if (
+        if (err instanceof SessionArchivedError) {
+          // At reservation time beginTurnInner translates the race to a clean 409 and removes the
+          // not-yet-started state itself. Once execution has begun, however, an old writer that
+          // archives behind our lease must stop this turn just like deletion or fencing would.
+          if (state.phase !== "reserved") this.onCommitError(state, err);
+        } else if (
           !(err instanceof IdempotencyReplayError)
           && !(err instanceof IdempotencyMismatchError)
           && !(err instanceof IdempotencyPendingError)
@@ -1474,8 +1686,9 @@ export class SessionHost {
    */
   private onCommitError(state: ActiveTurn, err: unknown) {
     const wasReserved = state.phase === "reserved";
-    if (err instanceof SessionGoneError) {
-      this.log.warn(`[session ${state.session.id}] session was deleted mid-turn; stopping turn ${state.turn.id}`);
+    if (err instanceof SessionGoneError || err instanceof SessionArchivedError) {
+      const lifecycleState = err instanceof SessionGoneError ? "deleted" : "archived";
+      this.log.warn(`[session ${state.session.id}] session was ${lifecycleState} mid-turn; stopping turn ${state.turn.id}`);
       state.fenced = true; // same handling: stop writing, stop stepping
       state.closingRequested = true;
       state.phase = "finishing";

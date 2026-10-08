@@ -201,6 +201,146 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, i) => i + 1));
   }, 180_000);
 
+  it("a new runner repairs and archives an orphaned active turn after lease takeover", async () => {
+    cluster = await startCluster({
+      runners: 2,
+      leaseTtlMs: 6_000,
+      leaseHoldMs: 200,
+      script: [{ text: "too late from the stale owner", ttftMs: 12_000 }],
+    });
+    const { router, runners, redis } = cluster;
+    const session = await newSession(router.url);
+    const stream = openSse(router.url, `/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ input: [{ type: "text", text: "start lifecycle takeover" }] }),
+    });
+    const started = await waitFor(
+      () => stream.events.find((event) => event.event === "turn/started"),
+      15_000,
+      "orphan candidate turn starts",
+    );
+    const turnId = (started.data.turn as { id: string }).id;
+    const ownerAddr = await waitFor(
+      async () => (await redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined,
+      5_000,
+      "lifecycle owner",
+    );
+    const staleOwner = runners.find((runner) => runner.url.includes(ownerAddr))!;
+    const successor = runners.find((runner) => runner !== staleOwner)!;
+    const fenceBefore = Number(await redis.get(`as:fence:{${session.id}}`));
+
+    // Simulate a lost Redis lease without killing the process. The successor must use the higher
+    // fence to repair the durable active turn before it can atomically archive the session.
+    await redis.del(`as:lease:{${session.id}}`);
+    const archived = await waitFor(
+      async () => {
+        const response = await api<{ archivedAtMs?: number }>(successor.url, `/v1/sessions/${session.id}/archive`, { method: "POST" });
+        return response.status === 200 ? response : undefined;
+      },
+      20_000,
+      "successor archives orphan",
+    );
+    expect(archived.body.archivedAtMs).toEqual(expect.any(Number));
+    const fenceAfter = Number(await redis.get(`as:fence:{${session.id}}`));
+    expect(fenceAfter).toBeGreaterThan(fenceBefore);
+
+    await waitFor(
+      () => (staleOwner.log.some((line) => /lease lost|fenced out|no longer owns/i.test(line)) ? true : undefined),
+      15_000,
+      "stale lifecycle owner stops",
+    );
+    stream.cancel();
+
+    const [sessionRow] = await queryDb<{ status: string; archived_at_ms: number | null; fence_token: number }>(
+      "SELECT JSON_UNQUOTE(JSON_EXTRACT(status, '$.type')) status, archived_at_ms, fence_token FROM sessions WHERE session_id=?",
+      [session.id],
+    );
+    expect(sessionRow).toMatchObject({ status: "idle", archived_at_ms: expect.any(Number), fence_token: fenceAfter });
+    const [turnRow] = await queryDb<{ status: string; stop_reason: string | null }>(
+      "SELECT status, stop_reason FROM turns WHERE turn_id=?",
+      [turnId],
+    );
+    expect(turnRow).toMatchObject({ status: "interrupted", stop_reason: "interrupted" });
+
+    const blocked = await api<{ error: { code: string } }>(staleOwner.url, `/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ input: [{ type: "text", text: "stale retry" }], stream: false }),
+    });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error.code).toBe("session_archived");
+
+    const rows = await queryDb<{ seq: number }>("SELECT seq FROM events WHERE session_id=? ORDER BY seq", [session.id]);
+    const seqs = rows.map((row) => Number(row.seq));
+    expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+  }, 180_000);
+
+  it("linearizes archive against an active turn and restores the session without event gaps", async () => {
+    cluster = await startCluster({
+      runners: 2,
+      leaseTtlMs: 5_000,
+      leaseHoldMs: 500,
+      script: [{ text: "slow lifecycle turn", ttftMs: 10_000 }, { text: "after unarchive", ttftMs: 20 }],
+    });
+    const { router } = cluster;
+    const session = await newSession(router.url);
+
+    const stream = openSse(router.url, `/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ input: [{ type: "text", text: "hold for archive race" }] }),
+    });
+    const started = await waitFor(
+      () => stream.events.find((event) => event.event === "turn/started"),
+      15_000,
+      "lifecycle turn starts",
+    );
+    const turnId = (started.data.turn as { id: string }).id;
+
+    const busyArchive = await api<{ error: { code: string } }>(router.url, `/v1/sessions/${session.id}/archive`, { method: "POST" });
+    expect(busyArchive.status).toBe(409);
+    expect(busyArchive.body.error.code).toBe("session_busy");
+
+    const interrupted = await api(router.url, `/v1/sessions/${session.id}/turns/${turnId}/interrupt`, { method: "POST" });
+    expect(interrupted.status).toBe(200);
+    await stream.done;
+    await waitFor(
+      async () => ((await queryDb<{ status: string }>("SELECT JSON_UNQUOTE(JSON_EXTRACT(status, '$.type')) status FROM sessions WHERE session_id=?", [session.id]))[0]?.status === "idle" ? true : undefined),
+      15_000,
+      "interrupted session becomes idle",
+    );
+
+    const archived = await api<{ archivedAtMs?: number }>(router.url, `/v1/sessions/${session.id}/archive`, { method: "POST" });
+    expect(archived.status).toBe(200);
+    expect(archived.body.archivedAtMs).toEqual(expect.any(Number));
+    const blockedTurn = await api<{ error: { code: string } }>(router.url, `/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ input: [{ type: "text", text: "blocked" }], stream: false }),
+    });
+    expect(blockedTurn.status).toBe(409);
+    expect(blockedTurn.body.error.code).toBe("session_archived");
+    expect((await api(router.url, `/v1/sessions/${session.id}/items`)).status).toBe(200);
+
+    const unarchived = await api<{ archivedAtMs?: number }>(router.url, `/v1/sessions/${session.id}/unarchive`, { method: "POST" });
+    expect(unarchived.status).toBe(200);
+    expect(unarchived.body.archivedAtMs).toBeUndefined();
+    const resumed = await api(router.url, `/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ input: [{ type: "text", text: "restored" }], stream: false }),
+    });
+    expect(resumed.status).toBe(202);
+
+    const rows = await waitFor(
+      async () => {
+        const events = await queryDb<{ seq: number; type: string }>("SELECT seq, type FROM events WHERE session_id=? ORDER BY seq", [session.id]);
+        return events.some((event) => event.type === "session/unarchived") ? events : undefined;
+      },
+      15_000,
+      "lifecycle events persist",
+    );
+    const seqs = rows.map((row) => Number(row.seq));
+    expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+    expect(rows.map((row) => row.type)).toEqual(expect.arrayContaining(["session/archived", "session/unarchived"]));
+  }, 120_000);
+
   it("SIGTERM drains: the in-flight turn completes normally and the lease is released", async () => {
     // A long lease TTL so a released lease can only mean the drain released it, not that it expired.
     cluster = await startCluster({ runners: 2, leaseTtlMs: 60_000, leaseHoldMs: 100, script: [{ text: "finishing before shutdown", ttftMs: 1_500 }] });

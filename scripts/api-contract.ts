@@ -433,9 +433,21 @@ export function buildOpenApiDocument() {
     operationId: "archiveSession",
     tags: ["Sessions"],
     summary: "Archive a session",
+    description: "Idempotently archives an idle session through the lease/fence path. Archived sessions remain readable but reject new mutable runtime operations.",
     security: userSecurity,
     request: { params: SessionIdParams, headers: UserIdentityHeaders },
     responses: { 200: jsonResponse(schemas.session, "Archived session."), default: errorResponse },
+  });
+  register({
+    method: "post",
+    path: "/v1/sessions/{id}/unarchive",
+    operationId: "unarchiveSession",
+    tags: ["Sessions"],
+    summary: "Restore an archived session",
+    description: "Idempotently returns an archived session to the visible, writable state through the lease/fence path.",
+    security: userSecurity,
+    request: { params: SessionIdParams, headers: UserIdentityHeaders },
+    responses: { 200: jsonResponse(schemas.session, "Unarchived session."), default: errorResponse },
   });
   register({
     method: "post",
@@ -620,8 +632,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 36) {
-    throw new Error(`expected 36 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 37) {
+    throw new Error(`expected 37 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({
