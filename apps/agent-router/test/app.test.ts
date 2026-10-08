@@ -20,6 +20,7 @@ import {
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
   PROTOCOL_VERSION,
+  USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "@agent-service/protocol";
 import { createRouterApp } from "../src/app.js";
 import type { RunnerRegistry, RunnerTarget } from "../src/registry.js";
@@ -96,6 +97,9 @@ function fakeRegistry(
     governanceManagement?: boolean;
     targetGovernanceManagement?: boolean;
     purgePolicyEvaluation?: boolean;
+    exportReadable?: boolean;
+    exportAdmission?: boolean;
+    targetExport?: boolean | ((url: string) => boolean);
   } = {},
 ): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
@@ -144,6 +148,13 @@ function fakeRegistry(
     ),
     allConfiguredSupportErasureJobControl: () => opts.jobControl ?? true,
     allConfiguredSupportPurgePolicyEvaluation: () => opts.purgePolicyEvaluation ?? false,
+    allHealthySupportUserDataExport: () => opts.exportReadable ?? false,
+    allConfiguredSupportUserDataExportAdmission: () => opts.exportAdmission ?? false,
+    supportsUserDataExport: (url: string) => (
+      typeof opts.targetExport === "function"
+        ? opts.targetExport(url)
+        : opts.targetExport ?? opts.exportReadable ?? false
+    ),
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
     routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
@@ -1129,6 +1140,284 @@ describe("failure handling", () => {
     expect(alive.requests).toHaveLength(0);
     await new Promise((r) => setTimeout(r, 20));
     expect(hang.state.abortedResponses).toBe(1);
+  });
+});
+
+describe("user data export routing", () => {
+  const capabilities = (admission = true) => ({
+    protocolVersion: PROTOCOL_VERSION,
+    service: "agent-runner",
+    features: {
+      streaming: true,
+      replay: { persistedEvents: true, hotWindowMs: 1 },
+      approvals: true,
+      sessionLifecycle: ["archive", "unarchive", "tombstone"],
+      blobAttachments: false,
+      dataErasureRequests: false,
+      userErasureWorker: [],
+      erasureJobControl: [],
+      dataGovernance: [],
+      dataGovernanceManagement: false,
+      purgePolicyEvaluation: [],
+      dataPurgeExecution: false,
+      userDataExport: [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1],
+      dataExportRequests: admission,
+      dynamicTools: true,
+      mcp: [],
+      skills: false,
+      sandbox: ["none"],
+      byok: true,
+    },
+  });
+
+  it("aggregates code awareness separately from fleet-wide admission", async () => {
+    const runner = await upstream(() => ({ body: JSON.stringify(capabilities()) }));
+    const enabled = createRouterApp({
+      registry: fakeRegistry([runner.url], {
+        exportReadable: true,
+        exportAdmission: true,
+        targetExport: true,
+      }),
+      dataExportArtifactsEnabled: () => true,
+      dataExportRequestsEnabled: () => true,
+      logger: silent,
+    });
+    expect(await (await enabled.request("/v1/capabilities")).json()).toMatchObject({
+      service: "agent-router",
+      features: {
+        userDataExport: [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1],
+        dataExportRequests: true,
+      },
+    });
+
+    const gated = createRouterApp({
+      registry: fakeRegistry([runner.url], {
+        exportReadable: true,
+        exportAdmission: true,
+        targetExport: true,
+      }),
+      dataExportArtifactsEnabled: () => true,
+      dataExportRequestsEnabled: () => false,
+      logger: silent,
+    });
+    expect(await (await gated.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        userDataExport: [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1],
+        dataExportRequests: false,
+      },
+    });
+
+    const mixed = createRouterApp({
+      registry: fakeRegistry([runner.url], {
+        exportReadable: false,
+        exportAdmission: false,
+        targetExport: false,
+      }),
+      dataExportArtifactsEnabled: () => true,
+      dataExportRequestsEnabled: () => true,
+      logger: silent,
+    });
+    expect(await (await mixed.request("/v1/capabilities")).json()).toMatchObject({
+      features: { userDataExport: [], dataExportRequests: false },
+    });
+
+    const filesystemDisabled = createRouterApp({
+      registry: fakeRegistry([runner.url], {
+        exportReadable: true,
+        exportAdmission: true,
+        targetExport: true,
+      }),
+      dataExportArtifactsEnabled: () => false,
+      dataExportRequestsEnabled: () => true,
+      logger: silent,
+    });
+    expect(await (await filesystemDisabled.request("/v1/capabilities")).json()).toMatchObject({
+      features: { userDataExport: [], dataExportRequests: false },
+    });
+    const forwardedBefore = runner.requests.length;
+    for (const [path, method] of [
+      ["/v1/data-export-requests/export_request", "GET"],
+      ["/v1/data-export-requests/export_request/download", "GET"],
+      ["/v1/data-export-requests", "POST"],
+    ] as const) {
+      const response = await filesystemDisabled.request(path, { method });
+      expect(response.status).toBe(503);
+      expectPrivateLifecycleResponse(response);
+    }
+    expect(runner.requests).toHaveLength(forwardedBefore);
+  });
+
+  it("keeps status and download independent of admission while requiring a healthy code-aware fleet", async () => {
+    const runner = await upstream(({ path }) => ({
+      status: 200,
+      body: path.endsWith("/download") ? "export-bytes" : JSON.stringify({ status: "queued" }),
+    }));
+    const readable = createRouterApp({
+      registry: fakeRegistry([runner.url], {
+        exportReadable: true,
+        exportAdmission: true,
+        targetExport: true,
+      }),
+      dataExportArtifactsEnabled: () => true,
+      dataExportRequestsEnabled: () => false,
+      logger: silent,
+    });
+    const status = await readable.request(`/v1/data-export-requests/export_request`);
+    const download = await readable.request(`/v1/data-export-requests/export_request/download`);
+    expect(status.status).toBe(200);
+    expect(download.status).toBe(200);
+    expect(await download.text()).toBe("export-bytes");
+    expectPrivateLifecycleResponse(status);
+    expectPrivateLifecycleResponse(download);
+
+    const post = await readable.request("/v1/data-export-requests", {
+      method: "POST",
+      headers: { "idempotency-key": "once" },
+    });
+    expect(post.status).toBe(503);
+    expectPrivateLifecycleResponse(post);
+
+    for (const app of [
+      createRouterApp({
+        registry: fakeRegistry([runner.url], {
+          exportReadable: false,
+          exportAdmission: false,
+          targetExport: false,
+        }),
+        dataExportArtifactsEnabled: () => true,
+        dataExportRequestsEnabled: () => true,
+        logger: silent,
+      }),
+      createRouterApp({
+        registry: fakeRegistry([runner.url], {
+          exportReadable: true,
+          exportAdmission: true,
+          targetExport: false,
+        }),
+        dataExportArtifactsEnabled: () => true,
+        dataExportRequestsEnabled: () => true,
+        logger: silent,
+      }),
+    ]) {
+      const response = await app.request(`/v1/data-export-requests/export_request`);
+      expect(response.status).toBe(503);
+      expectPrivateLifecycleResponse(response);
+    }
+  });
+
+  it("opens POST only after every configured target advertises admission", async () => {
+    const runner = await upstream(() => ({ status: 202, body: "{}" }));
+    for (const registry of [
+      fakeRegistry([runner.url, "http://configured-but-unavailable"], {
+        exportReadable: true,
+        exportAdmission: false,
+        targetExport: true,
+      }),
+      fakeRegistry([runner.url, "http://configured-legacy"], {
+        exportReadable: false,
+        exportAdmission: false,
+        targetExport: (url) => url === runner.url,
+      }),
+    ]) {
+      const app = createRouterApp({
+        registry,
+        dataExportArtifactsEnabled: () => true,
+        dataExportRequestsEnabled: () => true,
+        logger: silent,
+      });
+      const response = await app.request("/v1/data-export-requests", {
+        method: "POST",
+        headers: { "idempotency-key": "once" },
+      });
+      expect(response.status).toBe(503);
+      expectPrivateLifecycleResponse(response);
+    }
+    expect(runner.requests).toHaveLength(0);
+  });
+
+  it("retries export POST after transport failure only when Idempotency-Key is present", async () => {
+    const first = await upstream(() => "drop");
+    const second = await upstream(() => ({ status: 202, body: JSON.stringify({ status: "queued" }) }));
+    const opts = {
+      exportReadable: true,
+      exportAdmission: true,
+      targetExport: true,
+    } as const;
+    const retrying = createRouterApp({
+      registry: fakeRegistry([first.url, second.url], opts),
+      dataExportArtifactsEnabled: () => true,
+      dataExportRequestsEnabled: () => true,
+      maxAttempts: 2,
+      logger: silent,
+    });
+    const retried = await retrying.request("/v1/data-export-requests", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer admin",
+        "x-user-id": "user-a",
+        "idempotency-key": "export-once",
+        [INTERNAL_ROUTER_TOKEN_HEADER]: "must-not-be-forwarded",
+      },
+    });
+    expect(retried.status).toBe(202);
+    expect(first.requests).toHaveLength(1);
+    expect(second.requests).toHaveLength(1);
+    expect(second.requests[0]!.headers["idempotency-key"]).toBe("export-once");
+    expect(second.requests[0]!.headers[INTERNAL_ROUTER_TOKEN_HEADER]).toBeUndefined();
+
+    const secondCount = second.requests.length;
+    const nonRetrying = createRouterApp({
+      registry: fakeRegistry([first.url, second.url], opts),
+      dataExportArtifactsEnabled: () => true,
+      dataExportRequestsEnabled: () => true,
+      maxAttempts: 2,
+      logger: silent,
+    });
+    const notRetried = await nonRetrying.request("/v1/data-export-requests", {
+      method: "POST",
+      headers: { authorization: "Bearer admin", "x-user-id": "user-a" },
+    });
+    expect(notRetried.status).toBe(502);
+    expect(await notRetried.json()).toMatchObject({
+      error: { code: "provider_error", retryable: false },
+    });
+    expect(second.requests).toHaveLength(secondCount);
+  });
+
+  it("preserves export integrity metadata while stripping private topology and framing headers", async () => {
+    const runner = await upstream(() => ({
+      status: 200,
+      headers: {
+        "content-type": "application/vnd.agent-service.user-export+ndjson",
+        "content-length": "12",
+        "content-digest": "sha-256=:YWJjZA==:",
+        "x-artifact-size": "12",
+        "x-owner": "runner.internal:8787",
+        [INTERNAL_TOMBSTONE_ACK_HEADER]: INTERNAL_TOMBSTONE_ACK_VALUE,
+      },
+      body: "export-bytes",
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([runner.url], {
+        exportReadable: true,
+        targetExport: true,
+      }),
+      dataExportArtifactsEnabled: () => true,
+      dataExportRequestsEnabled: () => false,
+      logger: silent,
+    });
+    const response = await app.request("/v1/data-export-requests/export_request/download", {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: "external-probe-must-be-stripped" },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("export-bytes");
+    expect(response.headers.get("content-digest")).toBe("sha-256=:YWJjZA==:");
+    expect(response.headers.get("x-artifact-size")).toBe("12");
+    expect(response.headers.get("content-length")).toBeNull();
+    expect(response.headers.get("x-owner")).toBeNull();
+    expect(response.headers.get(INTERNAL_TOMBSTONE_ACK_HEADER)).toBeNull();
+    expectPrivateLifecycleResponse(response);
+    expect(runner.requests[0]!.headers[INTERNAL_ROUTER_TOKEN_HEADER]).toBeUndefined();
   });
 });
 

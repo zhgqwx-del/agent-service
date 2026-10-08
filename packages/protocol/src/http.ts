@@ -136,8 +136,14 @@ export const StartTurnHeaders = UserIdentityHeaders.extend({
   "idempotency-key": z.string().trim().min(1).max(256).optional(),
 });
 
+const RequiredIdempotencyKey = z.string().trim().min(1).max(256);
+
 export const ErasureRequestHeaders = UserIdentityHeaders.extend({
-  "idempotency-key": z.string().trim().min(1).max(256),
+  "idempotency-key": RequiredIdempotencyKey,
+});
+
+export const DataExportRequestHeaders = UserIdentityHeaders.extend({
+  "idempotency-key": RequiredIdempotencyKey,
 });
 
 export const EventStreamHeaders = UserIdentityHeaders.extend({

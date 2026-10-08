@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { Hono, type MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
@@ -13,6 +13,9 @@ import {
   ApprovalResponseRequest,
   CreateApiKeyRequest,
   CreateSessionRequest,
+  DATA_EXPORT_CONTENT_TYPE,
+  DataExportRequestHeaders,
+  DataExportRequestParams,
   DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
   DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   DynamicToolResultRequest,
@@ -56,16 +59,19 @@ import {
   UpsertProviderRequest,
   TurnSteerRequest,
   UserErasureDrainRequest,
+  USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   type Capabilities,
   type BlobUploadResponse,
   ImageMediaType,
   type Event,
   type ErasureRequest,
+  type DataExportRequest,
   UserId,
 } from "@agent-service/protocol";
 import type { SessionHost, ToolRegistry } from "@agent-service/core";
 import { ErasureLocalTurnFencedError, newId } from "@agent-service/core";
 import {
+  BLOB_STORAGE_FORMAT,
   ErasureIdempotencyMismatchError,
   LegalHoldConflictError,
   LegalHoldGenerationConflictError,
@@ -73,13 +79,25 @@ import {
   RetentionPolicyGenerationConflictError,
   RetentionPolicyNotFoundError,
   RetentionPolicyVersionConflictError,
+  SubjectDeletingError,
+  UserDataExportIdempotencyMismatchError,
+  UserDataExportPolicyUnavailableError,
+  UserDataExportStateError,
   erasureWriteAuthorizationMatches,
+  newUserDataExportRequestId,
   newErasureRequestId,
+  userDataExportIdempotencyKeySha256,
+  userDataExportManifestSha256,
+  userDataExportRequestHash,
+  userDataExportStorageKey,
   publicErasureRequestStatus,
   userErasureRequestHash,
   type RetentionPolicyStore,
+  type BlobStore,
   type SessionStore,
   type SubjectLifecycleStore,
+  type UserDataExportRequestRecord,
+  type UserDataExportRequestStore,
 } from "@agent-service/store";
 import { redactProviderConfig, type ProviderService } from "@agent-service/providers";
 import { assertMayActAs, authMiddleware, generateApiKey, hashApiKey, requireAdmin, requireUser, TenantPolicyCache, type AuthEnv } from "./auth.js";
@@ -107,6 +125,12 @@ export interface AppDeps {
   dataGovernanceManagementEnabled?: boolean;
   /** Store/runtime implements the sealed, non-destructive policy-evaluation contract. */
   purgePolicyEvaluationSupported?: boolean;
+  /** Code-aware export store. Admission remains independently gated for rolling upgrades. */
+  userDataExport?: UserDataExportRequestStore;
+  dataExportBlob?: BlobStore;
+  dataExportRequestsEnabled?: boolean;
+  dataExportDownloadLeaseMs?: number;
+  maxDataExportPartBytes?: number;
   retentionPolicy?: RetentionPolicyStore;
   subjectLifecycle?: SubjectLifecycleStore;
   ready: () => boolean;
@@ -157,6 +181,16 @@ export function createApp(deps: AppDeps) {
   const maxBlobBytes = deps.maxBlobBytes ?? deps.maxBodyBytes;
   if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > deps.maxBodyBytes) {
     throw new Error("maxBlobBytes must be a positive safe integer no larger than maxBodyBytes");
+  }
+  const dataExportDownloadLeaseMs = deps.dataExportDownloadLeaseMs ?? 30_000;
+  if (
+    !Number.isSafeInteger(dataExportDownloadLeaseMs)
+    || dataExportDownloadLeaseMs < 1_000
+    || dataExportDownloadLeaseMs > 60_000
+  ) throw new Error("dataExportDownloadLeaseMs must be between 1000 and 60000");
+  const maxDataExportPartBytes = deps.maxDataExportPartBytes ?? 1024 * 1024;
+  if (!Number.isSafeInteger(maxDataExportPartBytes) || maxDataExportPartBytes < 1) {
+    throw new Error("maxDataExportPartBytes must be a positive safe integer");
   }
 
   app.onError((err, c) => {
@@ -212,6 +246,12 @@ export function createApp(deps: AppDeps) {
           ? [PURGE_POLICY_EVALUATOR_V1]
           : [],
         dataPurgeExecution: false,
+        userDataExport: deps.userDataExport !== undefined && deps.dataExportBlob !== undefined
+          ? [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1]
+          : [],
+        dataExportRequests: deps.dataExportRequestsEnabled === true
+          && deps.userDataExport !== undefined
+          && deps.dataExportBlob !== undefined,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -296,6 +336,9 @@ export function createApp(deps: AppDeps) {
   // validation so success and every 4xx/5xx response are forbidden from entering a cache.
   v1.use("/data-erasure-requests", privateResponseHeaders);
   v1.use("/data-erasure-requests/:requestId", privateResponseHeaders);
+  v1.use("/data-export-requests", privateResponseHeaders);
+  v1.use("/data-export-requests/:requestId", privateResponseHeaders);
+  v1.use("/data-export-requests/:requestId/download", privateResponseHeaders);
   v1.use("/retention-policies/*", privateResponseHeaders);
   v1.use("/legal-holds", privateResponseHeaders);
   v1.use("/legal-holds/*", privateResponseHeaders);
@@ -647,6 +690,240 @@ export function createApp(deps: AppDeps) {
     return c.json(publicErasureRequest(record));
   });
 
+  // ---------- asynchronous user data export ----------
+  const exportStore = () => {
+    if (!deps.userDataExport || !deps.dataExportBlob) {
+      throw new ApiError("draining", "user data export is unavailable on this runner");
+    }
+    return { store: deps.userDataExport, blob: deps.dataExportBlob };
+  };
+
+  v1.post("/data-export-requests", async (c) => {
+    if (!deps.dataExportRequestsEnabled) {
+      throw new ApiError("draining", "user data export requests are not activated on this fleet");
+    }
+    requireAdmin(c);
+    const principal = requireUser(c);
+    const headers = await parse(DataExportRequestHeaders, {
+      "x-user-id": c.req.header("x-user-id"),
+      "x-end-user-token": c.req.header("x-end-user-token"),
+      "idempotency-key": c.req.header("idempotency-key"),
+    });
+    const { store } = exportStore();
+    try {
+      const record = await store.requestUserDataExport({
+        requestId: newUserDataExportRequestId(),
+        tenantId: principal.tenantId,
+        userId: principal.userId,
+        requestedByKeyId: c.get("apiKeyId"),
+        idempotencyKeySha256: userDataExportIdempotencyKeySha256(headers["idempotency-key"]),
+        requestHash: userDataExportRequestHash(principal.tenantId, principal.userId),
+      });
+      return c.json(publicUserDataExportRequest(record), 202);
+    } catch (error) {
+      if (error instanceof UserDataExportIdempotencyMismatchError) {
+        throw new ApiError("idempotency_conflict", error.message);
+      }
+      if (error instanceof UserDataExportPolicyUnavailableError) {
+        throw new ApiError("draining", error.message);
+      }
+      if (error instanceof UserDataExportStateError || error instanceof SubjectDeletingError) {
+        throw new ApiError("state_conflict", error.message);
+      }
+      throw error;
+    }
+  });
+
+  v1.get("/data-export-requests/:requestId", async (c) => {
+    requireAdmin(c);
+    const principal = requireUser(c);
+    const { requestId } = await parse(DataExportRequestParams, c.req.param());
+    const record = await exportStore().store.getUserDataExport(
+      principal.tenantId,
+      principal.userId,
+      requestId,
+    );
+    if (!record) throw new ApiError("not_found", "data export request not found");
+    return c.json(publicUserDataExportRequest(record));
+  });
+
+  v1.get("/data-export-requests/:requestId/download", async (c) => {
+    requireAdmin(c);
+    const principal = requireUser(c);
+    const { requestId } = await parse(DataExportRequestParams, c.req.param());
+    const { store, blob } = exportStore();
+    const leaseToken = randomUUID();
+    const download = await store.acquireUserDataExportDownload(
+      principal.tenantId,
+      principal.userId,
+      requestId,
+      leaseToken,
+      dataExportDownloadLeaseMs,
+    );
+    if (!download) throw new ApiError("not_found", "data export artifact not found");
+    const { request, artifact, parts } = download;
+    let metadataValid = false;
+    try {
+      const totalSizeBytes = parts.reduce((total, part) => total + (part.sizeBytes ?? 0), 0);
+      metadataValid = request.requestId === requestId
+        && request.tenantId === principal.tenantId
+        && request.userId === principal.userId
+        && request.status === "ready"
+        && request.currentArtifactId === artifact.artifactId
+        && request.currentBuildGeneration === artifact.buildGeneration
+        && request.subjectGeneration === artifact.subjectGeneration
+        && request.format === artifact.format
+        && request.schemaVersion === artifact.schemaVersion
+        && request.policyVersion === artifact.policyVersion
+        && request.policySha256 === artifact.policySha256
+        && request.artifactTtlMs === artifact.artifactTtlMs
+        && request.snapshotAtMs === artifact.snapshotAtMs
+        && request.readyAtMs === artifact.readyAtMs
+        && request.expiresAtMs === artifact.expiresAtMs
+        && request.artifactSha256 === artifact.contentSha256
+        && request.artifactSizeBytes === artifact.totalSizeBytes
+        && request.recordCount === artifact.recordCount
+        && artifact.requestId === requestId
+        && artifact.tenantId === principal.tenantId
+        && artifact.userId === principal.userId
+        && artifact.storageBackend === blob.backend
+        && artifact.storageFormat === BLOB_STORAGE_FORMAT
+        && artifact.contentType === DATA_EXPORT_CONTENT_TYPE
+        && artifact.state === "ready"
+        && artifact.deletionGeneration === 0
+        && artifact.partCount !== undefined
+        && artifact.totalSizeBytes !== undefined
+        && artifact.contentSha256 !== undefined
+        && artifact.manifestSha256 !== undefined
+        && parts.length === artifact.partCount
+        && parts.every((part, index) => (
+          part.artifactId === artifact.artifactId
+          && part.requestId === requestId
+          && part.buildGeneration === artifact.buildGeneration
+          && part.partNumber === index
+          && part.state === "uploaded"
+          && part.storageBackend === artifact.storageBackend
+          && part.storageFormat === artifact.storageFormat
+          && part.storageKey === userDataExportStorageKey(
+            { tenantId: principal.tenantId, userId: principal.userId },
+            requestId,
+            artifact.artifactId,
+            part.partNumber,
+          )
+          && part.sha256 !== undefined
+          && part.sizeBytes !== undefined
+          && part.contentType === DATA_EXPORT_CONTENT_TYPE
+          && part.deletionGeneration === 0
+        ))
+        && Number.isSafeInteger(totalSizeBytes)
+        && totalSizeBytes === artifact.totalSizeBytes
+        && userDataExportManifestSha256(parts) === artifact.manifestSha256;
+    } catch {
+      metadataValid = false;
+    }
+    if (!metadataValid) {
+      await store.releaseUserDataExportDownload(artifact.artifactId, leaseToken).catch(() => {});
+      throw new Error("ready data export artifact is corrupt");
+    }
+
+    let partIndex = 0;
+    let totalBytes = 0;
+    let finished = false;
+    let leaseLost = false;
+    const digest = createHash("sha256");
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const finalize = async () => {
+      if (finished) return;
+      finished = true;
+      if (heartbeat !== undefined) clearInterval(heartbeat);
+      await store.releaseUserDataExportDownload(artifact.artifactId, leaseToken).catch(() => {});
+    };
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    heartbeat = setInterval(() => {
+      void store.renewUserDataExportDownload(
+        artifact.artifactId,
+        leaseToken,
+        dataExportDownloadLeaseMs,
+      ).then((renewed) => {
+        if (renewed || finished) return;
+        leaseLost = true;
+        streamController?.error(new Error("data export download lease expired"));
+        void finalize();
+      }).catch(() => {
+        if (finished) return;
+        leaseLost = true;
+        streamController?.error(new Error("data export download lease renewal failed"));
+        void finalize();
+      });
+    }, Math.max(250, Math.floor(dataExportDownloadLeaseMs / 3)));
+    heartbeat.unref?.();
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+      async pull(controller) {
+        if (finished || leaseLost) return;
+        try {
+          if (partIndex >= parts.length) {
+            if (
+              totalBytes !== artifact.totalSizeBytes
+              || digest.digest("hex") !== artifact.contentSha256
+            ) throw new Error("data export artifact digest is corrupt");
+            controller.close();
+            await finalize();
+            return;
+          }
+          if (!await store.renewUserDataExportDownload(
+            artifact.artifactId,
+            leaseToken,
+            dataExportDownloadLeaseMs,
+          )) throw new Error("data export download lease expired");
+          const part = parts[partIndex]!;
+          if (part.sizeBytes! > maxDataExportPartBytes) {
+            throw new Error("data export part exceeds the configured read ceiling");
+          }
+          const object = await blob.get(part.storageKey, { maxBytes: maxDataExportPartBytes });
+          if (leaseLost || finished) {
+            throw new Error("data export download lease expired");
+          }
+          if (
+            !object
+            || object.storageKey !== part.storageKey
+            || object.sha256 !== part.sha256
+            || object.sizeBytes !== part.sizeBytes
+            || object.contentType !== part.contentType
+            || createHash("sha256").update(object.data).digest("hex") !== part.sha256
+          ) throw new Error("data export artifact part is missing or corrupt");
+          totalBytes += object.data.byteLength;
+          if (!Number.isSafeInteger(totalBytes)) throw new Error("data export size overflowed");
+          digest.update(object.data);
+          partIndex += 1;
+          controller.enqueue(object.data);
+        } catch (error) {
+          controller.error(error);
+          await finalize();
+        }
+      },
+      async cancel() {
+        await finalize();
+      },
+    });
+    const digestBase64 = Buffer.from(artifact.contentSha256!, "hex").toString("base64");
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": DATA_EXPORT_CONTENT_TYPE,
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": `attachment; filename="agent-service-user-export-${requestId}.ndjson"`,
+        "Content-Digest": `sha-256=:${digestBase64}:`,
+        "X-Artifact-Size": String(artifact.totalSizeBytes),
+        "Content-Length": String(artifact.totalSizeBytes),
+      },
+    });
+  });
+
   const governanceStore = () => {
     if (!deps.dataGovernanceManagementEnabled || !deps.retentionPolicy) {
       throw new ApiError("draining", "retention policy and legal-hold management are not activated on this fleet");
@@ -826,6 +1103,39 @@ function publicErasureRequest(record: Awaited<ReturnType<SubjectLifecycleStore["
     createdAtMs: record.createdAtMs,
     updatedAtMs: record.updatedAtMs,
   };
+}
+
+function publicUserDataExportRequest(record: UserDataExportRequestRecord): DataExportRequest {
+  const base = {
+    id: record.requestId,
+    scope: "user" as const,
+    userId: record.userId,
+    format: record.format,
+    createdAtMs: record.createdAtMs,
+    updatedAtMs: record.updatedAtMs,
+  };
+  if (record.status === "ready") {
+    if (
+      record.snapshotAtMs === undefined
+      || record.readyAtMs === undefined
+      || record.expiresAtMs === undefined
+      || record.artifactSha256 === undefined
+      || record.artifactSizeBytes === undefined
+    ) throw new Error("ready data export request is incomplete");
+    return {
+      ...base,
+      status: "ready",
+      snapshotAtMs: record.snapshotAtMs,
+      readyAtMs: record.readyAtMs,
+      expiresAtMs: record.expiresAtMs,
+      artifact: {
+        contentType: DATA_EXPORT_CONTENT_TYPE,
+        sizeBytes: record.artifactSizeBytes,
+        sha256: record.artifactSha256,
+      },
+    };
+  }
+  return { ...base, status: record.status };
 }
 
 /**

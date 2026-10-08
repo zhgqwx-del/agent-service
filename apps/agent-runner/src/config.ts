@@ -76,6 +76,25 @@ const Env = z.object({
   PURGE_POLICY_EVALUATOR_TARGET_PAGE_SIZE: z.coerce.number().int().min(1).max(1_000).default(100),
   PURGE_POLICY_EVALUATOR_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
   PURGE_POLICY_EVALUATOR_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
+  /** Asynchronous user-export admission. Workers remain independently enabled while this is off. */
+  DATA_EXPORT_REQUESTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  DATA_EXPORT_WORKER_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  DATA_EXPORT_CLEANUP_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  DATA_EXPORT_WORKER_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  DATA_EXPORT_WORKER_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+  DATA_EXPORT_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(5),
+  DATA_EXPORT_SNAPSHOT_PAGE_SIZE: z.coerce.number().int().min(1).max(1_000).default(200),
+  DATA_EXPORT_ARTIFACT_STAGING_TTL_MS: z.coerce.number().int().min(1_000).default(15 * 60_000),
+  DATA_EXPORT_WORKER_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  DATA_EXPORT_WORKER_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
+  DATA_EXPORT_WORKER_POISON_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(100).default(3),
+  DATA_EXPORT_CLEANUP_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  DATA_EXPORT_CLEANUP_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+  DATA_EXPORT_CLEANUP_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(50),
+  DATA_EXPORT_CLEANUP_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(250),
+  DATA_EXPORT_CLEANUP_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
+  DATA_EXPORT_CLEANUP_POISON_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(100).default(3),
+  DATA_EXPORT_DOWNLOAD_LEASE_MS: z.coerce.number().int().min(1_000).max(60_000).default(30_000),
   /** 32-byte hex key that encrypts BYOK secrets at rest. No default: a silent all-zero key is worse than a crash. */
   SECRETS_MASTER_KEY: z.string().regex(/^[0-9a-f]{64}$/i, "SECRETS_MASTER_KEY must be 64 hex chars (32 bytes)"),
   /** Dev convenience: seeds a tenant + api key on boot. Refused when NODE_ENV=production. */
@@ -108,6 +127,8 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   RUNNER_ID: string;
   INTERNAL_ROUTER_TOKEN: string;
   runnerAddr: string;
+  /** The bundled filesystem adapter is readable only in an explicitly single-runner local topology. */
+  dataExportArtifactsReadable: boolean;
 };
 
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
@@ -180,6 +201,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       "filesystem Blob writes and cleanup are unsupported in production until a shared object-store adapter is configured",
     );
   }
+  if (production && (
+    c.DATA_EXPORT_REQUESTS_ENABLED
+    || c.DATA_EXPORT_WORKER_ENABLED
+    || c.DATA_EXPORT_CLEANUP_ENABLED
+  )) {
+    throw new Error(
+      "filesystem user-export artifacts are unsupported in production until a shared object-store adapter is configured",
+    );
+  }
   if (!c.RUNNER_ADDR && WILDCARD_HOSTS.has(c.RUNNER_HOST)) {
     throw new Error("RUNNER_ADDR is required when RUNNER_HOST is a wildcard bind address");
   }
@@ -212,6 +242,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       "PURGE_POLICY_EVALUATOR_RETRY_MAX_MS must be at least "
         + "PURGE_POLICY_EVALUATOR_RETRY_BASE_MS",
     );
+  }
+  if (c.DATA_EXPORT_WORKER_RETRY_MAX_MS < c.DATA_EXPORT_WORKER_RETRY_BASE_MS) {
+    throw new Error("DATA_EXPORT_WORKER_RETRY_MAX_MS must be at least DATA_EXPORT_WORKER_RETRY_BASE_MS");
+  }
+  if (c.DATA_EXPORT_CLEANUP_RETRY_MAX_MS < c.DATA_EXPORT_CLEANUP_RETRY_BASE_MS) {
+    throw new Error("DATA_EXPORT_CLEANUP_RETRY_MAX_MS must be at least DATA_EXPORT_CLEANUP_RETRY_BASE_MS");
   }
   if (c.ERASURE_WORKER_REQUEST_TIMEOUT_MS <= c.ERASURE_DRAIN_TIMEOUT_MS + ERASURE_REQUEST_TIMEOUT_MARGIN_MS) {
     throw new Error(
@@ -246,9 +282,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (c.BLOB_ATTACHMENTS_ENABLED && !c.BLOB_CLEANUP_ENABLED) {
     throw new Error("BLOB_CLEANUP_ENABLED=1 is required before BLOB_ATTACHMENTS_ENABLED=1");
   }
+  if (c.DATA_EXPORT_REQUESTS_ENABLED && !c.DATA_EXPORT_WORKER_ENABLED) {
+    throw new Error("DATA_EXPORT_WORKER_ENABLED=1 is required before DATA_EXPORT_REQUESTS_ENABLED=1");
+  }
+  if (c.DATA_EXPORT_WORKER_ENABLED && !c.DATA_EXPORT_CLEANUP_ENABLED) {
+    throw new Error("DATA_EXPORT_CLEANUP_ENABLED=1 is required before DATA_EXPORT_WORKER_ENABLED=1");
+  }
   if ((c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED) && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
     throw new Error(
       "BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required for filesystem Blob writes or cleanup",
+    );
+  }
+  if (
+    (c.DATA_EXPORT_REQUESTS_ENABLED || c.DATA_EXPORT_WORKER_ENABLED || c.DATA_EXPORT_CLEANUP_ENABLED)
+    && !c.BLOB_FILESYSTEM_SINGLE_RUNNER
+  ) {
+    throw new Error(
+      "BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required for filesystem user-export artifacts",
     );
   }
   const runnerAddr = validateAdvertisedAddress(c.RUNNER_ADDR ?? `${c.RUNNER_HOST}:${c.RUNNER_PORT}`);
@@ -259,5 +309,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     INTERNAL_ROUTER_TOKEN: c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
     RUNNER_ID: runnerId,
     runnerAddr,
+    dataExportArtifactsReadable: !production && c.BLOB_FILESYSTEM_SINGLE_RUNNER,
   };
 }

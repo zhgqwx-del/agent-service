@@ -26,6 +26,10 @@ import {
   CompactSessionResponse,
   configureProtocolZod,
   CreateApiKeyResponse,
+  DATA_EXPORT_CONTENT_TYPE,
+  DataExportRequest,
+  DataExportRequestHeaders,
+  DataExportRequestParams,
   DynamicToolResultSubmitRequest,
   ErrorBody,
   ExcludableEventTypeSchema,
@@ -116,6 +120,26 @@ const privateJsonResponse = (schema: ContractSchema, description: string): Respo
   headers: PRIVATE_RESPONSE_HEADERS,
 });
 
+const EXPORT_RESPONSE_HEADERS: NonNullable<ResponseConfig["headers"]> = {
+  ...PRIVATE_RESPONSE_HEADERS,
+  "Content-Disposition": {
+    description: "Attachment disposition with a server-generated ASCII filename.",
+    schema: { type: "string" },
+  },
+  "Content-Digest": {
+    description: "SHA-256 digest of the complete artifact using HTTP structured-field syntax.",
+    schema: { type: "string", pattern: "^sha-256=:[A-Za-z0-9+/]{43}=:$" },
+  },
+  "X-Artifact-Size": {
+    description: "Complete artifact size in bytes, independent of transfer framing.",
+    schema: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+  "Content-Length": {
+    description: "Artifact transfer length when known; proxies may omit it and use chunked transfer.",
+    schema: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
 const textResponse = (schema: ContractSchema, description: string): ResponseConfig => ({
   description,
   content: { "text/plain": { schema } },
@@ -126,6 +150,12 @@ const BINARY_SCHEMA = { type: "string", format: "binary" } as const;
 const binaryResponse = (description: string): ResponseConfig => ({
   description,
   content: Object.fromEntries(IMAGE_MEDIA_TYPES.map((mediaType) => [mediaType, { schema: BINARY_SCHEMA }])),
+});
+
+const privateExportBinaryResponse = (description: string): ResponseConfig => ({
+  description,
+  headers: EXPORT_RESPONSE_HEADERS,
+  content: { [DATA_EXPORT_CONTENT_TYPE]: { schema: BINARY_SCHEMA } },
 });
 
 const binaryBody = (description: string): NonNullable<RouteConfig["request"]>["body"] => ({
@@ -181,6 +211,7 @@ export function buildOpenApiDocument() {
     error: registry.register("ErrorBody", ErrorBody),
     event: registry.register("Event", EventStreamEvent),
     erasureRequest: registry.register("ErasureRequest", ErasureRequest),
+    dataExportRequest: registry.register("DataExportRequest", DataExportRequest),
     retentionPolicyPut: registry.register("RetentionPolicyPutRequest", RetentionPolicyPutRequest),
     retentionPolicyActivate: registry.register("RetentionPolicyActivateRequest", RetentionPolicyActivateRequest),
     retentionPolicy: registry.register("RetentionPolicy", RetentionPolicyRecord),
@@ -675,6 +706,50 @@ export function buildOpenApiDocument() {
     },
   });
   register({
+    method: "post",
+    path: "/v1/data-export-requests",
+    operationId: "requestUserDataExport",
+    tags: ["Data lifecycle"],
+    summary: "Request an asynchronous user data export",
+    description: "Admin-only, user-scoped and capability-gated. Idempotently queues a point-in-time NDJSON export artifact; no partial artifact is downloadable.",
+    security: userSecurity,
+    ...adminOnly,
+    request: { headers: DataExportRequestHeaders },
+    responses: {
+      202: privateJsonResponse(schemas.dataExportRequest, "Existing or newly accepted user data export request."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "get",
+    path: "/v1/data-export-requests/{requestId}",
+    operationId: "getUserDataExportRequest",
+    tags: ["Data lifecycle"],
+    summary: "Read an owned user data export request",
+    security: userSecurity,
+    ...adminOnly,
+    request: { params: DataExportRequestParams, headers: UserIdentityHeaders },
+    responses: {
+      200: privateJsonResponse(schemas.dataExportRequest, "Data export request status."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "get",
+    path: "/v1/data-export-requests/{requestId}/download",
+    operationId: "downloadUserDataExport",
+    tags: ["Data lifecycle"],
+    summary: "Download a ready user data export artifact",
+    description: "Streams the complete owner-scoped artifact only while the request is ready and unexpired. Missing, expired, revoked and ownership-mismatched artifacts return the same private 404 response.",
+    security: userSecurity,
+    ...adminOnly,
+    request: { params: DataExportRequestParams, headers: UserIdentityHeaders },
+    responses: {
+      200: privateExportBinaryResponse("Complete NDJSON export artifact."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
     method: "put",
     path: "/v1/retention-policies/{policyVersion}",
     operationId: "putRetentionPolicy",
@@ -884,8 +959,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 50) {
-    throw new Error(`expected 50 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 53) {
+    throw new Error(`expected 53 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({

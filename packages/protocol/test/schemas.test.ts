@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   ErrorCode,
+  DATA_EXPORT_CONTENT_TYPE,
+  DataExportRequest,
+  DataExportRequestHeaders,
+  DataExportRequestParams,
   ErasureRequest,
   ErasureRequestHeaders,
   ErasureRequestParams,
@@ -29,6 +33,7 @@ import {
   PURGE_POLICY_EVALUATOR_V1,
   RetentionPolicyActivateRequest,
   RetentionPolicyParams,
+  USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "../src/index.js";
 
 describe("protocol schemas", () => {
@@ -129,6 +134,58 @@ describe("protocol schemas", () => {
     }).success).toBe(false);
   });
 
+  it("keeps data export identity, state and ready artifact metadata strict", () => {
+    const base = {
+      id: "export_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+      scope: "user" as const,
+      userId: "u_1",
+      format: "ndjson-v1" as const,
+      createdAtMs: 1,
+      updatedAtMs: 2,
+    };
+    const queued = DataExportRequest.parse({ ...base, status: "queued" });
+    expect(queued.status).toBe("queued");
+    for (const status of ["queued", "building", "failed", "expired", "revoked"] as const) {
+      expect(DataExportRequest.safeParse({
+        ...base,
+        status,
+        artifact: { contentType: DATA_EXPORT_CONTENT_TYPE, sizeBytes: 1, sha256: "a".repeat(64) },
+      }).success, status).toBe(false);
+    }
+
+    const ready = DataExportRequest.parse({
+      ...base,
+      status: "ready",
+      snapshotAtMs: 2,
+      readyAtMs: 3,
+      expiresAtMs: 4,
+      artifact: {
+        contentType: DATA_EXPORT_CONTENT_TYPE,
+        sizeBytes: 123,
+        sha256: "a".repeat(64),
+      },
+    });
+    expect(ready.status).toBe("ready");
+    expect(DataExportRequest.safeParse({ ...ready, artifact: undefined }).success).toBe(false);
+    expect(DataExportRequest.safeParse({ ...ready, storageKey: "private/object" }).success).toBe(false);
+    expect(DataExportRequestParams.safeParse({ requestId: base.id.toUpperCase() }).success).toBe(false);
+    expect(DataExportRequestParams.safeParse({
+      requestId: "export_019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b",
+    }).success).toBe(false);
+  });
+
+  it("requires a bounded non-blank idempotency key for data export requests", () => {
+    expect(DataExportRequestHeaders.parse({
+      "x-user-id": "u_1",
+      "idempotency-key": " export-1 ",
+    })["idempotency-key"]).toBe("export-1");
+    expect(DataExportRequestHeaders.safeParse({ "x-user-id": "u_1" }).success).toBe(false);
+    expect(DataExportRequestHeaders.safeParse({
+      "x-user-id": "u_1",
+      "idempotency-key": " ",
+    }).success).toBe(false);
+  });
+
   it("declares private response headers for every erasure success and error response", () => {
     const post = OPENAPI_DOCUMENT.paths["/v1/data-erasure-requests"].post.responses;
     const get = OPENAPI_DOCUMENT.paths["/v1/data-erasure-requests/{requestId}"].get.responses;
@@ -136,6 +193,24 @@ describe("protocol schemas", () => {
       expect(response.headers["Cache-Control"].schema.enum).toEqual(["no-store"]);
       expect(response.headers["X-Content-Type-Options"].schema.enum).toEqual(["nosniff"]);
     }
+  });
+
+  it("declares private export status and binary download responses", () => {
+    const post = OPENAPI_DOCUMENT.paths["/v1/data-export-requests"].post.responses;
+    const get = OPENAPI_DOCUMENT.paths["/v1/data-export-requests/{requestId}"].get.responses;
+    const download = OPENAPI_DOCUMENT.paths["/v1/data-export-requests/{requestId}/download"].get.responses;
+    for (const response of [post["202"], post.default, get["200"], get.default, download["200"], download.default]) {
+      expect(response.headers["Cache-Control"].schema.enum).toEqual(["no-store"]);
+      expect(response.headers["X-Content-Type-Options"].schema.enum).toEqual(["nosniff"]);
+    }
+    expect(download["200"].content).toHaveProperty(DATA_EXPORT_CONTENT_TYPE);
+    expect(download["200"].headers).toEqual(expect.objectContaining({
+      "Content-Disposition": expect.any(Object),
+      "Content-Digest": expect.any(Object),
+      "X-Artifact-Size": expect.any(Object),
+      "Content-Length": expect.any(Object),
+    }));
+    expect(download["200"].headers["Content-Length"]).not.toHaveProperty("required");
   });
 
   it("normalizes missing additive erasure capability to false for mixed fleets", () => {
@@ -162,6 +237,40 @@ describe("protocol schemas", () => {
     expect(parsed.features.dataGovernanceManagement).toBe(false);
     expect(parsed.features.purgePolicyEvaluation).toEqual([]);
     expect(parsed.features.dataPurgeExecution).toBe(false);
+    expect(parsed.features.userDataExport).toEqual([]);
+    expect(parsed.features.dataExportRequests).toBe(false);
+  });
+
+  it("accepts only the additive NDJSON export capability", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    const enabled = Capabilities.parse({
+      ...base,
+      features: {
+        ...base.features,
+        userDataExport: [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1],
+        dataExportRequests: true,
+      },
+    });
+    expect(enabled.features.userDataExport).toEqual([USER_DATA_EXPORT_ARTIFACT_NDJSON_V1]);
+    expect(enabled.features.dataExportRequests).toBe(true);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: { ...base.features, userDataExport: ["artifact-json-v1"] },
+    }).success).toBe(false);
   });
 
   it("separates non-destructive policy evaluation from physical purge execution", () => {

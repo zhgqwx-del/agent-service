@@ -16,7 +16,7 @@
 - M1 核心运行范围、OpenAPI 3.1 与生成 TypeScript SDK 已完成；完整数据生命周期仍未闭环。
 - M2 的本地/CI 代码范围已完成并正式冻结；尚未正式进入 M3，云上部署不属于本次冻结范围。
 - M3 的 MCP/skills/hooks 主体和 M4 的生产化主体尚未开始。
-- session 创建与首事件原子化、`0007 -> ... -> 0016` 历史升级夹具、OpenAPI/SDK、Archive/tombstone/outbox、Blob ownership/业务接线、staging orphan 清理、legacy generation `0` 补偿、canonical retention policy / multi legal hold 管理面，以及非破坏性的 purge-policy evaluator/authority substrate 已收口。`0016` 只建立 claim/lease evaluation job、按 build generation 不可变的 per-session target evidence、rooted decision chain 和不可执行 authority；双端 `PURGE_POLICY_EVALUATOR_ENABLED` 默认关闭，公开 capability 固定声明 `dataPurgeExecution=false`。异步 export artifact/TTL、tenant erasure与 key/provider/auth secret撤销、ready/session 物理 purge、完成证明与 restore replay仍未完成。M1尚未闭环，完成后再正式进入 M3。
+- session 创建与首事件原子化、`0007 -> ... -> 0017` 历史升级夹具、OpenAPI/SDK、Archive/tombstone/outbox、Blob ownership/业务接线、staging orphan 清理、legacy generation `0` 补偿、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 已收口。`0017` 建立 owner/subject-generation 绑定的 request/job、一致性 snapshot、确定性 NDJSON 分片、durable download lease 与独立 delete outbox；`DATA_EXPORT_REQUESTS_ENABLED` 默认关闭，本地 build/cleanup worker 可继续处理已有 job。tenant erasure 与 key/provider/auth-secret 撤销、ready/session 物理 purge、可信时钟/完整内容 proof、完成证明与 restore replay仍未完成。M1尚未闭环，完成后再正式进入 M3。
 - evaluator 的 `eligible_execution_disabled` 只是候选证据，不是删除许可：当前 deadline 使用 runner 记录的 wall clock，target 也不是 turns/items/events/approvals 的完整内容清单；未来 destructive executor 必须用共享数据库/可信时间重验，并以 owner-scan + `session_content_receipts` 证明内容完整性。completion 固定为 `false`，live evidence 或 tenant/user hold generation/projection 变化会撤销当前投影并以新 build generation 重评。
 - 通用 erasure transition 类型与实现都不能表达 `purging/completed` 或 caller-supplied completion proof；lifecycle outbox 的 claim/renew/complete/retry 只接受 `session.tombstoned`，即使旧版或异常进程曾给 `session.purge` 写入 claim token，也不能经通用 ACK 面续租、完成或重试。
 - `DATA_ERASURE_REQUESTS_ENABLED` 在 runner/router 默认 `0`，只控制新 request admission；`ERASURE_WORKER_ENABLED` 与它独立，本地默认 `1`，使已持久化 job 即使关闭 admission 也继续走到安全策略边界。POST 需要 router gate、全部 configured targets 健康且支持；status GET 不依赖 router writer gate，但仍按 healthy fleet/selected target capability fail-closed。任一 request 首次接受后，关闭 gate 不能撤销 durable subject gate，也不能回退到 pre-`0011`/lifecycle-unaware runner；必须 forward-fix。不得把 `awaiting_purge_policy` 描述为擦除完成，也不得擅自启用 tenant erasure、usage anonymize 或不可逆 purge。
@@ -29,6 +29,7 @@
 - tombstone 已原子写入 marker、terminal `session/deleted`、单调 generation、即时 `session.tombstoned` intent 和不可领取的 `session.purge` intent；普通资源隐藏且 parent/child 竞态受保护。每个 runner 内置的 dispatcher 只处理 `session.tombstoned`，通过 claim lease/CAS 和有上限退避按 at-least-once 语义投递；短暂故障无限重试，确定损坏的 intent 才 dead-letter，event `seq` 是重复身份。它不会领取或执行物理 purge。
 - tombstone 保持在 protocol family `2026-10-08` 内，以 additive capability 协商。router 还要求显式 `SESSION_TOMBSTONE_ENABLED=1` 和全部健康 runner 支持该 capability；外部 DELETE 只会改写为带内部 token、要求 ACK 的版本化 runner-only POST，不会回退到旧公开 DELETE。`RUNNERS` 必须使用实例稳定地址。发布前先由 edge 暂停精确 session DELETE（或整体切换 router 池），再按新 router（gate=0）→ 排空旧 router → 滚动新 runner → 核对 fleet → 激活 gate 的顺序执行，旧 router 自身没有该 gate。未来真正不兼容的 protocol 变更仍需维护窗口或整组 blue-green。
 - BlobStore 的跨平台 key、防损坏单-envelope 原子发布、旧安全格式读取/删除、私有权限、静态 symlink 防护和 memory 复制语义已有测试。`0010`、Memory/MySQL ownership manifest、图片/大工具输出接线、staging→ready 原子绑定、独立 Blob outbox/worker、硬 TTL、并发 claim、key-scoped delete fence 和 stale staging 清理已实现；工具结果有独立持久化硬上限，序列化/超限/adapter 写失败在 current/replay 中使用同一无 locator 的稳定结果，单次请求共享完整 data URL 水合预算，compaction 不会跨过未物化的外置工具事实。历史图片像素目前不会跨 compaction 保留。ready/session purge 仍关闭。filesystem root 必须由单一 runner 独占并显式设置 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`、不承诺断电持久性；production filesystem writer/cleanup 在共享对象存储适配器完成前均 fail-closed，不能宣称大输出最终删除已闭环。
+- user export 仅允许 admin service key + 明确 user + `Idempotency-Key`，且 active policy 必须有正值 `exportArtifactTtlMs`。公开状态只在 ready 时返回 hash/size/TTL；snapshot/artifact/download/delete 全链路按 tenant/user 和 generation 隔离。worker 是 runner 内部循环，不是第三个服务；filesystem 制品只支持本地单 runner，production 任一 export flag 都 fail-closed，直到共享对象存储 adapter 完成。
 
 ## 工作边界
 
@@ -52,6 +53,7 @@ pnpm test:erasure-session-mysql
 pnpm test:erasure-catalog-mysql
 pnpm test:erasure-usage-mysql
 pnpm test:legacy-tombstone-mysql
+pnpm test:user-data-export-mysql
 scripts/local-service.sh verify-real
 scripts/local-service.sh acceptance
 ```

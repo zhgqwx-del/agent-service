@@ -140,6 +140,63 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/data-export-requests": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Request an asynchronous user data export
+         * @description Admin-only, user-scoped and capability-gated. Idempotently queues a point-in-time NDJSON export artifact; no partial artifact is downloadable.
+         */
+        readonly post: operations["requestUserDataExport"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/data-export-requests/{requestId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read an owned user data export request */
+        readonly get: operations["getUserDataExportRequest"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/data-export-requests/{requestId}/download": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /**
+         * Download a ready user data export artifact
+         * @description Streams the complete owner-scoped artifact only while the request is ready and unexpired. Missing, expired, revoked and ownership-mismatched artifacts return the same private 404 response.
+         */
+        readonly get: operations["downloadUserDataExport"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/legal-holds": {
         readonly parameters: {
             readonly query?: never;
@@ -1007,6 +1064,8 @@ export type components = {
                 readonly byok: boolean;
                 /** @default false */
                 readonly dataErasureRequests?: boolean;
+                /** @default false */
+                readonly dataExportRequests?: boolean;
                 /** @default [] */
                 readonly dataGovernance?: readonly ("canonical-retention-v1" | "multi-legal-hold-v1")[];
                 /** @default false */
@@ -1032,6 +1091,8 @@ export type components = {
                 readonly skills: boolean;
                 /** @enum {boolean} */
                 readonly streaming: true;
+                /** @default [] */
+                readonly userDataExport?: readonly "artifact-ndjson-v1"[];
                 /** @default [] */
                 readonly userErasureWorker?: readonly "drain-v1"[];
             };
@@ -1068,6 +1129,82 @@ export type components = {
             readonly parentSessionId?: string;
             readonly title?: string;
             readonly userId?: string;
+        };
+        readonly DataExportRequest: {
+            readonly createdAtMs: number;
+            /** @enum {string} */
+            readonly format: "ndjson-v1";
+            readonly id: string;
+            /** @enum {string} */
+            readonly scope: "user";
+            /** @enum {string} */
+            readonly status: "queued";
+            readonly updatedAtMs: number;
+            readonly userId: string;
+        } | {
+            readonly createdAtMs: number;
+            /** @enum {string} */
+            readonly format: "ndjson-v1";
+            readonly id: string;
+            /** @enum {string} */
+            readonly scope: "user";
+            /** @enum {string} */
+            readonly status: "building";
+            readonly updatedAtMs: number;
+            readonly userId: string;
+        } | {
+            readonly artifact: {
+                /** @enum {string} */
+                readonly contentType: "application/vnd.agent-service.user-export+ndjson";
+                readonly sha256: string;
+                readonly sizeBytes: number;
+            };
+            readonly createdAtMs: number;
+            readonly expiresAtMs: number;
+            /** @enum {string} */
+            readonly format: "ndjson-v1";
+            readonly id: string;
+            readonly readyAtMs: number;
+            /** @enum {string} */
+            readonly scope: "user";
+            readonly snapshotAtMs: number;
+            /** @enum {string} */
+            readonly status: "ready";
+            readonly updatedAtMs: number;
+            readonly userId: string;
+        } | {
+            readonly createdAtMs: number;
+            /** @enum {string} */
+            readonly format: "ndjson-v1";
+            readonly id: string;
+            /** @enum {string} */
+            readonly scope: "user";
+            /** @enum {string} */
+            readonly status: "failed";
+            readonly updatedAtMs: number;
+            readonly userId: string;
+        } | {
+            readonly createdAtMs: number;
+            /** @enum {string} */
+            readonly format: "ndjson-v1";
+            readonly id: string;
+            /** @enum {string} */
+            readonly scope: "user";
+            /** @enum {string} */
+            readonly status: "expired";
+            readonly updatedAtMs: number;
+            readonly userId: string;
+        } | {
+            readonly createdAtMs: number;
+            /** @enum {string} */
+            readonly format: "ndjson-v1";
+            readonly id: string;
+            /** @enum {string} */
+            readonly scope: "user";
+            /** @enum {string} */
+            readonly status: "revoked";
+            readonly updatedAtMs: number;
+            readonly userId: string;
         };
         readonly DynamicToolResultRequest: {
             readonly content: readonly {
@@ -2854,6 +2991,7 @@ export type SchemaCompactSessionResponse = components['schemas']['CompactSession
 export type SchemaCreateApiKeyRequest = components['schemas']['CreateApiKeyRequest'];
 export type SchemaCreateApiKeyResponse = components['schemas']['CreateApiKeyResponse'];
 export type SchemaCreateSessionRequest = components['schemas']['CreateSessionRequest'];
+export type SchemaDataExportRequest = components['schemas']['DataExportRequest'];
 export type SchemaDynamicToolResultRequest = components['schemas']['DynamicToolResultRequest'];
 export type SchemaErasureRequest = components['schemas']['ErasureRequest'];
 export type SchemaErrorBody = components['schemas']['ErrorBody'];
@@ -3191,6 +3329,145 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["ErasureRequest"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly requestUserDataExport: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Existing or newly accepted user data export request. */
+            readonly 202: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["DataExportRequest"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getUserDataExportRequest: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly requestId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Data export request status. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["DataExportRequest"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly downloadUserDataExport: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly requestId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Complete NDJSON export artifact. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description SHA-256 digest of the complete artifact using HTTP structured-field syntax. */
+                    readonly "Content-Digest"?: string;
+                    /** @description Attachment disposition with a server-generated ASCII filename. */
+                    readonly "Content-Disposition"?: string;
+                    /** @description Artifact transfer length when known; proxies may omit it and use chunked transfer. */
+                    readonly "Content-Length"?: number;
+                    /** @description Complete artifact size in bytes, independent of transfer framing. */
+                    readonly "X-Artifact-Size"?: number;
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/vnd.agent-service.user-export+ndjson": string;
                 };
             };
             /** @description Error response. */

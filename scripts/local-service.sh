@@ -17,6 +17,9 @@ caller_session_tombstone_enabled="${SESSION_TOMBSTONE_ENABLED-}"
 caller_data_erasure_requests_enabled="${DATA_ERASURE_REQUESTS_ENABLED-}"
 caller_data_governance_management_enabled="${DATA_GOVERNANCE_MANAGEMENT_ENABLED-}"
 caller_purge_policy_evaluator_enabled="${PURGE_POLICY_EVALUATOR_ENABLED-}"
+caller_data_export_requests_enabled="${DATA_EXPORT_REQUESTS_ENABLED-}"
+caller_data_export_worker_enabled="${DATA_EXPORT_WORKER_ENABLED-}"
+caller_data_export_cleanup_enabled="${DATA_EXPORT_CLEANUP_ENABLED-}"
 caller_erasure_worker_enabled="${ERASURE_WORKER_ENABLED-}"
 caller_legacy_tombstone_compensation_enabled="${LEGACY_TOMBSTONE_COMPENSATION_ENABLED-}"
 caller_erasure_router_url="${ERASURE_ROUTER_URL-}"
@@ -41,6 +44,9 @@ fi
 [ -n "$caller_data_erasure_requests_enabled" ] && DATA_ERASURE_REQUESTS_ENABLED="$caller_data_erasure_requests_enabled"
 [ -n "$caller_data_governance_management_enabled" ] && DATA_GOVERNANCE_MANAGEMENT_ENABLED="$caller_data_governance_management_enabled"
 [ -n "$caller_purge_policy_evaluator_enabled" ] && PURGE_POLICY_EVALUATOR_ENABLED="$caller_purge_policy_evaluator_enabled"
+[ -n "$caller_data_export_requests_enabled" ] && DATA_EXPORT_REQUESTS_ENABLED="$caller_data_export_requests_enabled"
+[ -n "$caller_data_export_worker_enabled" ] && DATA_EXPORT_WORKER_ENABLED="$caller_data_export_worker_enabled"
+[ -n "$caller_data_export_cleanup_enabled" ] && DATA_EXPORT_CLEANUP_ENABLED="$caller_data_export_cleanup_enabled"
 [ -n "$caller_erasure_worker_enabled" ] && ERASURE_WORKER_ENABLED="$caller_erasure_worker_enabled"
 [ -n "$caller_legacy_tombstone_compensation_enabled" ] && LEGACY_TOMBSTONE_COMPENSATION_ENABLED="$caller_legacy_tombstone_compensation_enabled"
 [ -n "$caller_erasure_router_url" ] && ERASURE_ROUTER_URL="$caller_erasure_router_url"
@@ -102,6 +108,9 @@ start_apps() {
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
+      DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
+      DATA_EXPORT_WORKER_ENABLED="${DATA_EXPORT_WORKER_ENABLED:-1}" \
+      DATA_EXPORT_CLEANUP_ENABLED="${DATA_EXPORT_CLEANUP_ENABLED:-1}" \
       ERASURE_WORKER_ENABLED="${ERASURE_WORKER_ENABLED:-1}" \
       LEGACY_TOMBSTONE_COMPENSATION_ENABLED="${LEGACY_TOMBSTONE_COMPENSATION_ENABLED:-1}" \
       ERASURE_ROUTER_URL="${ERASURE_ROUTER_URL:-$ROUTER_URL}" \
@@ -120,6 +129,7 @@ start_apps() {
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
+      DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
       BLOB_FILESYSTEM_SINGLE_RUNNER="${BLOB_FILESYSTEM_SINGLE_RUNNER:-1}" \
       BLOB_ATTACHMENTS_ENABLED="${BLOB_ATTACHMENTS_ENABLED:-1}" \
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
@@ -216,6 +226,8 @@ verify() {
     pnpm run test:erasure-usage-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:legacy-tombstone-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:user-data-export-mysql
   AGENT_SERVICE_CLUSTER=1 \
     CLUSTER_MYSQL_URL="${CLUSTER_MYSQL_URL:-mysql://root@127.0.0.1:3306/agent_service_cluster}" \
     CLUSTER_REDIS_URL="${CLUSTER_REDIS_URL:-redis://127.0.0.1:6379/3}" \

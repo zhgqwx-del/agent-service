@@ -1085,6 +1085,10 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "dataExportRequests": {
+                "default": false,
+                "type": "boolean"
+              },
               "dataGovernance": {
                 "default": [],
                 "items": {
@@ -1191,6 +1195,17 @@ export const OPENAPI_DOCUMENT = {
                   true
                 ],
                 "type": "boolean"
+              },
+              "userDataExport": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "artifact-ndjson-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
               },
               "userErasureWorker": {
                 "default": [],
@@ -1337,6 +1352,361 @@ export const OPENAPI_DOCUMENT = {
           "agentId"
         ],
         "type": "object"
+      },
+      "DataExportRequest": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "format": {
+                "enum": [
+                  "ndjson-v1"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "user"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "queued"
+                ],
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "userId": {
+                "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "scope",
+              "userId",
+              "format",
+              "createdAtMs",
+              "updatedAtMs",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "format": {
+                "enum": [
+                  "ndjson-v1"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "user"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "building"
+                ],
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "userId": {
+                "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "scope",
+              "userId",
+              "format",
+              "createdAtMs",
+              "updatedAtMs",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "artifact": {
+                "additionalProperties": false,
+                "properties": {
+                  "contentType": {
+                    "enum": [
+                      "application/vnd.agent-service.user-export+ndjson"
+                    ],
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "sizeBytes": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "contentType",
+                  "sizeBytes",
+                  "sha256"
+                ],
+                "type": "object"
+              },
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "expiresAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "format": {
+                "enum": [
+                  "ndjson-v1"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "readyAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "scope": {
+                "enum": [
+                  "user"
+                ],
+                "type": "string"
+              },
+              "snapshotAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "enum": [
+                  "ready"
+                ],
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "userId": {
+                "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "scope",
+              "userId",
+              "format",
+              "createdAtMs",
+              "updatedAtMs",
+              "status",
+              "snapshotAtMs",
+              "readyAtMs",
+              "expiresAtMs",
+              "artifact"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "format": {
+                "enum": [
+                  "ndjson-v1"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "user"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "failed"
+                ],
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "userId": {
+                "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "scope",
+              "userId",
+              "format",
+              "createdAtMs",
+              "updatedAtMs",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "format": {
+                "enum": [
+                  "ndjson-v1"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "user"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "expired"
+                ],
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "userId": {
+                "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "scope",
+              "userId",
+              "format",
+              "createdAtMs",
+              "updatedAtMs",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "format": {
+                "enum": [
+                  "ndjson-v1"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "user"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "revoked"
+                ],
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "userId": {
+                "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "scope",
+              "userId",
+              "format",
+              "createdAtMs",
+              "updatedAtMs",
+              "status"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "DynamicToolResultRequest": {
         "properties": {
@@ -9218,6 +9588,390 @@ export const OPENAPI_DOCUMENT = {
           }
         ],
         "summary": "Read an owned user erasure request",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/data-export-requests": {
+      "post": {
+        "description": "Admin-only, user-scoped and capability-gated. Idempotently queues a point-in-time NDJSON export artifact; no partial artifact is downloadable.",
+        "operationId": "requestUserDataExport",
+        "parameters": [
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataExportRequest"
+                }
+              }
+            },
+            "description": "Existing or newly accepted user data export request.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Request an asynchronous user data export",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/data-export-requests/{requestId}": {
+      "get": {
+        "operationId": "getUserDataExportRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "requestId",
+            "required": true,
+            "schema": {
+              "pattern": "^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataExportRequest"
+                }
+              }
+            },
+            "description": "Data export request status.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read an owned user data export request",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/data-export-requests/{requestId}/download": {
+      "get": {
+        "description": "Streams the complete owner-scoped artifact only while the request is ready and unexpired. Missing, expired, revoked and ownership-mismatched artifacts return the same private 404 response.",
+        "operationId": "downloadUserDataExport",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "requestId",
+            "required": true,
+            "schema": {
+              "pattern": "^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/vnd.agent-service.user-export+ndjson": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Complete NDJSON export artifact.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "Content-Digest": {
+                "description": "SHA-256 digest of the complete artifact using HTTP structured-field syntax.",
+                "schema": {
+                  "pattern": "^sha-256=:[A-Za-z0-9+/]{43}=:$",
+                  "type": "string"
+                }
+              },
+              "Content-Disposition": {
+                "description": "Attachment disposition with a server-generated ASCII filename.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Content-Length": {
+                "description": "Artifact transfer length when known; proxies may omit it and use chunked transfer.",
+                "schema": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "X-Artifact-Size": {
+                "description": "Complete artifact size in bytes, independent of transfer framing.",
+                "schema": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Download a ready user data export artifact",
         "tags": [
           "Data lifecycle"
         ],

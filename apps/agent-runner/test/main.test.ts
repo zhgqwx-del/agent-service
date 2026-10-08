@@ -32,6 +32,8 @@ import {
   ErasureWorker,
   LegacyTombstoneCompensationWorker,
   PurgePolicyEvaluator,
+  UserDataExportCleanupWorker,
+  UserDataExportWorker,
 } from "@agent-service/core";
 import { startRunner } from "../src/main.js";
 
@@ -203,6 +205,55 @@ describe("runner main blob wiring", () => {
       await runner?.close();
       startSpy.mockRestore();
       fetchSpy.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("starts export build and cleanup workers independently from admission and stops both before host drain", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-data-export-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const workerStart = vi.spyOn(UserDataExportWorker.prototype, "start");
+    const cleanupStart = vi.spyOn(UserDataExportCleanupWorker.prototype, "start");
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+        DATA_EXPORT_REQUESTS_ENABLED: "1",
+        DATA_EXPORT_WORKER_ENABLED: "1",
+        DATA_EXPORT_CLEANUP_ENABLED: "1",
+        DATA_EXPORT_WORKER_POLL_MS: "60000",
+        DATA_EXPORT_CLEANUP_POLL_MS: "60000",
+      });
+      expect(workerStart).toHaveBeenCalledOnce();
+      expect(cleanupStart).toHaveBeenCalledOnce();
+      expect(runner.dataExportWorker).toBeInstanceOf(UserDataExportWorker);
+      expect(runner.dataExportCleanup).toBeInstanceOf(UserDataExportCleanupWorker);
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: {
+          userDataExport: ["artifact-ndjson-v1"],
+          dataExportRequests: true,
+        },
+      });
+
+      const workerStop = vi.spyOn(runner.dataExportWorker!, "stop");
+      const cleanupStop = vi.spyOn(runner.dataExportCleanup!, "stop");
+      const drain = vi.spyOn(runner.host, "drain");
+      await runner.close();
+      expect(workerStop).toHaveBeenCalledOnce();
+      expect(cleanupStop).toHaveBeenCalledOnce();
+      expect(workerStop.mock.invocationCallOrder[0]).toBeLessThan(drain.mock.invocationCallOrder[0]!);
+      expect(cleanupStop.mock.invocationCallOrder[0]).toBeLessThan(drain.mock.invocationCallOrder[0]!);
+      expect(runner.server.listening).toBe(false);
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      workerStart.mockRestore();
+      cleanupStart.mockRestore();
       log.mockRestore();
       await rm(blobDir, { recursive: true, force: true });
     }

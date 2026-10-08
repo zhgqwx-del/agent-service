@@ -39,11 +39,20 @@ const Env = z.object({
   PURGE_POLICY_EVALUATOR_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** User-export admission; status/download remain capability-gated when this is off. */
+  DATA_EXPORT_REQUESTS_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   SHUTDOWN_GRACE_MS: z.coerce.number().int().nonnegative().default(10_000),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   NODE_ENV: z.string().optional(),
 });
-export type RouterConfig = Omit<z.infer<typeof Env>, "INTERNAL_ROUTER_TOKEN"> & { runnerList: string[]; INTERNAL_ROUTER_TOKEN: string };
+export type RouterConfig = Omit<z.infer<typeof Env>, "INTERNAL_ROUTER_TOKEN"> & {
+  runnerList: string[];
+  INTERNAL_ROUTER_TOKEN: string;
+  /** The bundled filesystem artifact path is readable only in a single-runner local topology. */
+  dataExportArtifactsReadable: boolean;
+};
 
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
 
@@ -84,5 +93,21 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
       "filesystem Blob writes are unsupported in production until a shared object-store adapter is configured",
     );
   }
-  return { ...c, INTERNAL_ROUTER_TOKEN: c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN, runnerList };
+  if (c.DATA_EXPORT_REQUESTS_ENABLED && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
+    throw new Error(
+      "BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required before DATA_EXPORT_REQUESTS_ENABLED=1",
+    );
+  }
+  if (c.NODE_ENV === "production" && c.DATA_EXPORT_REQUESTS_ENABLED) {
+    throw new Error(
+      "filesystem user-export artifacts are unsupported in production until a shared object-store adapter is configured",
+    );
+  }
+  return {
+    ...c,
+    INTERNAL_ROUTER_TOKEN: c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
+    runnerList,
+    dataExportArtifactsReadable:
+      c.NODE_ENV !== "production" && c.BLOB_FILESYSTEM_SINGLE_RUNNER,
+  };
 }

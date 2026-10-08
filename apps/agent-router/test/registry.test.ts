@@ -6,6 +6,7 @@ import {
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "@agent-service/protocol";
 import { RunnerRegistry } from "../src/registry.js";
 
@@ -307,6 +308,79 @@ describe("RunnerRegistry owner address mapping", () => {
     legacyState = "legacy";
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.allConfiguredSupportPurgePolicyEvaluation()).toBe(false);
+    await registry.close();
+  });
+
+  it("uses healthy code awareness for export reads but every configured runner for admission", async () => {
+    let legacyState: "down" | "legacy" | "code-only" | "upgraded" = "down";
+    const capabilities = (aware: boolean, admission: boolean) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        userDataExport: aware ? [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1] : [],
+        dataExportRequests: admission,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        return Response.json(capabilities(
+          legacyState === "code-only" || legacyState === "upgraded",
+          legacyState === "upgraded",
+        ));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allHealthySupportUserDataExport()).toBe(true);
+    expect(registry.allConfiguredSupportUserDataExportAdmission()).toBe(false);
+    expect(registry.supportsUserDataExport("http://current")).toBe(true);
+    expect(registry.supportsUserDataExport("http://legacy")).toBe(false);
+
+    legacyState = "legacy";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allHealthySupportUserDataExport()).toBe(false);
+    expect(registry.allConfiguredSupportUserDataExportAdmission()).toBe(false);
+
+    legacyState = "code-only";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allHealthySupportUserDataExport()).toBe(true);
+    expect(registry.allConfiguredSupportUserDataExportAdmission()).toBe(false);
+    expect(registry.supportsUserDataExport("http://legacy")).toBe(true);
+
+    legacyState = "upgraded";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allHealthySupportUserDataExport()).toBe(true);
+    expect(registry.allConfiguredSupportUserDataExportAdmission()).toBe(true);
+
+    legacyState = "down";
+    await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
+    expect(registry.allHealthySupportUserDataExport()).toBe(true);
+    expect(registry.allConfiguredSupportUserDataExportAdmission()).toBe(false);
     await registry.close();
   });
 

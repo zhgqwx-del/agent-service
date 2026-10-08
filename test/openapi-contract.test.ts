@@ -11,6 +11,9 @@ interface OpenApiOperation {
   operationId?: string;
   parameters?: { in?: string; name?: string }[];
   responses?: Record<string, unknown>;
+  requestBody?: unknown;
+  security?: Record<string, unknown>[];
+  "x-required-api-key-scopes"?: string[];
 }
 
 interface OpenApiDocument {
@@ -100,7 +103,7 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(50);
+    expect(operations).toHaveLength(53);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
@@ -115,6 +118,9 @@ describe("committed OpenAPI contract", () => {
       "/v1/sessions/{id}/items/{itemId}/output",
       "/v1/data-erasure-requests",
       "/v1/data-erasure-requests/{requestId}",
+      "/v1/data-export-requests",
+      "/v1/data-export-requests/{requestId}",
+      "/v1/data-export-requests/{requestId}/download",
     ]));
   });
 
@@ -220,19 +226,80 @@ describe("committed OpenAPI contract", () => {
               default: false,
               type: "boolean",
             },
+            userDataExport: {
+              items: { enum: ["artifact-ndjson-v1"] },
+              maxItems: 1,
+            },
+            dataExportRequests: {
+              default: false,
+              type: "boolean",
+            },
           },
         },
       },
     });
   });
 
-  it("matches all 49 implemented runner routes plus the OpenAPI route in both directions", () => {
+  it("publishes the private admin-and-user data export contract", () => {
+    const post = document.paths["/v1/data-export-requests"]?.post;
+    const status = document.paths["/v1/data-export-requests/{requestId}"]?.get;
+    const download = document.paths["/v1/data-export-requests/{requestId}/download"]?.get;
+    for (const operation of [post, status, download]) {
+      expect(operation?.security).toEqual([
+        { ServiceApiKey: [], TrustedCallerUser: [] },
+        { EndUserToken: [], ServiceApiKey: [] },
+      ]);
+      expect(operation?.["x-required-api-key-scopes"]).toEqual(["admin"]);
+    }
+    expect(post?.requestBody).toBeUndefined();
+    expect(post?.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ in: "header", name: "idempotency-key", required: true }),
+    ]));
+
+    const postResponses = post?.responses as Record<string, {
+      headers?: Record<string, unknown>;
+      content?: Record<string, unknown>;
+    }>;
+    const statusResponses = status?.responses as typeof postResponses;
+    const downloadResponses = download?.responses as typeof postResponses;
+    for (const response of [
+      postResponses["202"],
+      postResponses.default,
+      statusResponses["200"],
+      statusResponses.default,
+      downloadResponses["200"],
+      downloadResponses.default,
+    ]) {
+      expect(response?.headers).toEqual(expect.objectContaining({
+        "Cache-Control": expect.any(Object),
+        "X-Content-Type-Options": expect.any(Object),
+      }));
+    }
+    expect(downloadResponses["200"]?.content).toHaveProperty(
+      "application/vnd.agent-service.user-export+ndjson",
+    );
+    expect(downloadResponses["200"]?.headers).toEqual(expect.objectContaining({
+      "Content-Disposition": expect.any(Object),
+      "Content-Digest": expect.any(Object),
+      "Content-Length": expect.not.objectContaining({ required: true }),
+      "X-Artifact-Size": expect.any(Object),
+    }));
+
+    const exportSchema = document.components?.schemas?.DataExportRequest as {
+      oneOf?: { additionalProperties?: boolean; properties?: Record<string, unknown> }[];
+    };
+    expect(exportSchema.oneOf).toHaveLength(6);
+    expect(exportSchema.oneOf?.every((branch) => branch.additionalProperties === false)).toBe(true);
+    expect(exportSchema.oneOf?.filter((branch) => "artifact" in (branch.properties ?? {}))).toHaveLength(1);
+  });
+
+  it("matches all 52 implemented runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     const specKeys = specOperations().map(operationKey).sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(49);
-    expect(registered).toHaveLength(50);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(52);
+    expect(registered).toHaveLength(53);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
   });

@@ -54,6 +54,10 @@ export const PURGE_POLICY_EVALUATOR_V1 = "policy-evaluator-v1" as const;
 export const PurgePolicyEvaluationCapability = z.literal(PURGE_POLICY_EVALUATOR_V1);
 export type PurgePolicyEvaluationCapability = z.infer<typeof PurgePolicyEvaluationCapability>;
 
+export const USER_DATA_EXPORT_ARTIFACT_NDJSON_V1 = "artifact-ndjson-v1" as const;
+export const UserDataExportCapability = z.literal(USER_DATA_EXPORT_ARTIFACT_NDJSON_V1);
+export type UserDataExportCapability = z.infer<typeof UserDataExportCapability>;
+
 export const ERASURE_JOB_CONTROL_QUARANTINE_V1 = "quarantine-v1" as const;
 export const ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1 = "legacy-tombstone-compensation-v1" as const;
 export const ErasureJobControlCapability = z.enum([
@@ -116,6 +120,10 @@ export const Capabilities = z.object({
     purgePolicyEvaluation: z.array(PurgePolicyEvaluationCapability).max(1).default([]),
     /** Reserved execution signal. It remains false until a separate destructive rollout exists. */
     dataPurgeExecution: z.literal(false).default(false),
+    /** Code understands owner-scoped NDJSON export artifacts and their private download contract. */
+    userDataExport: z.array(UserDataExportCapability).max(1).default([]),
+    /** Admission gate for new export requests; status, download and cleanup remain independent. */
+    dataExportRequests: z.boolean().default(false),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

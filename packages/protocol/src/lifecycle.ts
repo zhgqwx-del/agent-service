@@ -1,6 +1,12 @@
 import { z } from "zod";
 import { UserId } from "./common.js";
 
+const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
+// Keep explicit bounds in this order. Chaining `.nonnegative().safe()` makes the OpenAPI
+// generator retain safe()'s negative lower bound even though Zod rejects it at runtime.
+const SafeNonnegativeInteger = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const SafePositiveInteger = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+
 export const ErasureRequestId = z.string().regex(
   /^erase_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
 );
@@ -30,17 +36,67 @@ export type ErasureRequest = z.infer<typeof ErasureRequest>;
 
 export const ErasureRequestParams = z.object({ requestId: ErasureRequestId });
 
+// ---------- asynchronous user data export ----------
+
+export const DataExportRequestId = z.string().regex(
+  /^export_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+);
+export const DataExportFormat = z.literal("ndjson-v1");
+export const DataExportRequestStatus = z.enum([
+  "queued",
+  "building",
+  "ready",
+  "failed",
+  "expired",
+  "revoked",
+]);
+export const DATA_EXPORT_CONTENT_TYPE = "application/vnd.agent-service.user-export+ndjson" as const;
+
+export const DataExportArtifact = z.object({
+  contentType: z.literal(DATA_EXPORT_CONTENT_TYPE),
+  sizeBytes: SafeNonnegativeInteger,
+  sha256: Sha256,
+}).strict();
+export type DataExportArtifact = z.infer<typeof DataExportArtifact>;
+
+const dataExportRequestBase = {
+  id: DataExportRequestId,
+  scope: z.literal("user"),
+  userId: UserId,
+  format: DataExportFormat,
+  createdAtMs: SafeNonnegativeInteger,
+  updatedAtMs: SafeNonnegativeInteger,
+};
+
+/**
+ * Public export status. Only a ready request carries artifact metadata; physical storage identity,
+ * worker claims, idempotency material and failure evidence remain private.
+ */
+export const DataExportRequest = z.discriminatedUnion("status", [
+  z.object({ ...dataExportRequestBase, status: z.literal("queued") }).strict(),
+  z.object({ ...dataExportRequestBase, status: z.literal("building") }).strict(),
+  z.object({
+    ...dataExportRequestBase,
+    status: z.literal("ready"),
+    snapshotAtMs: SafeNonnegativeInteger,
+    readyAtMs: SafeNonnegativeInteger,
+    expiresAtMs: SafeNonnegativeInteger,
+    artifact: DataExportArtifact,
+  }).strict(),
+  z.object({ ...dataExportRequestBase, status: z.literal("failed") }).strict(),
+  z.object({ ...dataExportRequestBase, status: z.literal("expired") }).strict(),
+  z.object({ ...dataExportRequestBase, status: z.literal("revoked") }).strict(),
+]);
+export type DataExportRequest = z.infer<typeof DataExportRequest>;
+
+export const DataExportRequestParams = z.object({ requestId: DataExportRequestId });
+
 // ---------- canonical retention policy and legal-hold management ----------
 
 // `active` is the fixed read endpoint below `/v1/retention-policies`; allowing an immutable
 // version with the same literal would make that version impossible to address with GET.
 export const RetentionPolicyVersion = z.string().regex(/^(?!active$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
 export const LegalHoldId = z.string().regex(/^hold_[A-Za-z0-9][A-Za-z0-9._-]{0,58}$/);
-const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
-// Keep explicit bounds in this order. Chaining `.nonnegative().safe()` makes the OpenAPI
-// generator retain safe()'s negative lower bound even though Zod rejects it at runtime.
-const SafeNonnegativeInteger = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
-const SafePositiveInteger = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
 const SafeDurationMs = SafeNonnegativeInteger.nullable().describe(
   "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
 );

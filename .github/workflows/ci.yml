@@ -156,11 +156,18 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:legacy-tombstone-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0016
+      # User export combines owner isolation, repeatable-read snapshotting, build leases, download
+      # leases and exact-identity cleanup. Keep a named no-skip proof against real InnoDB.
+      - name: User data export real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:user-data-export-mysql
+
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0017
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
-      # missing/skipped fixture, including the 0014 -> 0015 policy/hold and 0015 -> 0016
-      # purge-policy authority replay matrices.
-      - name: Historical MySQL migrations (0007 through 0016, no skips)
+      # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
+      # purge-policy authority and 0016 -> 0017 user-export replay matrices.
+      - name: Historical MySQL migrations (0007 through 0017, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -257,7 +264,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0016_erasure_purge_policy_authority.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0017_user_export_jobs_and_artifacts.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

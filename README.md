@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold 管理面，以及非破坏性的 purge-policy evaluator/authority substrate均已完成。user-erasure admission 默认关闭；与 admission 独立的 durable worker 在本地统一脚本中默认开启，已能跨 runner 有界请求 abort、按 child-first tombstone、原子核对 usage，并可靠停在 `awaiting_purge_policy`。`0013` 已把确定性 claim-stage poison逐候选隔离；`0014` 提供默认休眠的 generation `0` tombstone 补偿；`0015` 建立策略/hold authority；`0016` 建立默认关闭的 evaluation job、不可变 target/decision/authority证据。它不会使 `session.purge` 可领取，公开 capability 固定为 `dataPurgeExecution=false`。异步 export artifact/TTL、tenant erasure/key revocation、ready/session 物理 purge、可信时钟与完整内容proof、完成证明及 restore replay仍待按 `docs/design/04-data-lifecycle.md` 收口，因此 M1 尚未闭环。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。`0017` 增加 owner-scoped export request/job、一致性快照、分片制品、下载 lease 和独立删除 outbox；runner 内嵌 build/cleanup worker，本地默认处理已有 job，但新导出 admission 仍默认关闭。导出只包含白名单 operational 数据和附件字节，不暴露 secret、物理 locator、claim 或内部 fence。tenant erasure/key/provider/auth-secret 撤销、ready/session 物理 purge、可信时钟与完整内容 proof、完成证明及 restore replay仍待按 `docs/design/04-data-lifecycle.md` 收口，因此 M1 尚未闭环。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -35,7 +35,7 @@ scripts/demo.sh
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0015 → 0016 的真实 MySQL 历史升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0016 → 0017 的真实 MySQL 历史升级夹具
 pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
 pnpm test:usage-lifecycle-mysql               # 强制执行 usage 双写/核对/匿名化真实 MySQL 专项套件
 pnpm test:subject-lifecycle-mysql             # 强制执行 subject gate/回滚/并发真实 MySQL 专项套件
@@ -46,6 +46,7 @@ pnpm test:erasure-session-mysql               # 强制执行 claim-bound session
 pnpm test:erasure-catalog-mysql               # 强制执行 content-free catalog/completeness proof 的真实 MySQL 套件
 pnpm test:erasure-usage-mysql                 # 强制执行 claim-bound usage reconcile/ABA/回滚的真实 MySQL 套件
 pnpm test:legacy-tombstone-mysql              # 强制执行 generation-zero 补偿/cutover/回滚的真实 MySQL 套件
+pnpm test:user-data-export-mysql              # 强制执行一致性快照、制品、下载 lease、TTL/撤销清理的真实 MySQL 套件
 pnpm test:cluster                             # + 多进程集群：2~3 runner + 1 router，SIGKILL 租约持有者
 pnpm check:api                                # OpenAPI 与生成 SDK 漂移检查
 pnpm check:sdk                                # 编译 SDK、原生 Node import，并校验 pnpm pack 内容
@@ -91,6 +92,8 @@ user erasure request 也是 additive、默认关闭的 capability。只有 runne
 
 canonical policy / legal-hold 管理 API 也默认关闭：runner 与 router 都设置 `DATA_GOVERNANCE_MANAGEMENT_ENABLED=1`，且全部 configured runner 同时声明 code-aware `dataGovernance` 和 management-active `dataGovernanceManagement` 后才开放。策略版本不可变，`active` 是保留路由名；activation 使用 generation CAS，提交即生效，不是未来定时任务。七个 duration 字段中的 `null` 均表示 fail-closed、没有授权到期。tenant/user 可并存多个 hold，release 只释放指定 hold；任何 active hold都会阻止后续匿名化/物理 purge，但不会恢复已经隐藏的数据。该管理面只建立未来 destructive worker 的可审计 authority，不会自行匿名化、删除或把 request 标记 completed。
 
+user data export 同样采用默认关闭的 writer gate。runner/router 都设置 `DATA_EXPORT_REQUESTS_ENABLED=1`，全部 configured runner 当前健康并声明 `userDataExport=["artifact-ndjson-v1"]` 且选中 runner 仍启用 admission 后，才接受 admin service key 代表明确 user 发起的 `POST /v1/data-export-requests`；必须携带 `Idempotency-Key`，并要求 active retention policy 的 `exportArtifactTtlMs` 为正值。build/cleanup worker 与 admission 分离，已有 job 在关闭 POST 后仍可 forward-fix。下载逐分片校验并持有有上限的 durable lease，普通 TTL 会等待活动下载；subject erasure 会撤销请求并使制品进入独立 delete outbox。当前制品使用 runner 独占的 filesystem BlobStore，故只允许本地单 runner；`NODE_ENV=production` 下任一 export flag 都 fail-closed，直到共享对象存储适配器完成。
+
 本地统一入口当前启动单个 router、单个 runner，并把 Blob 写入 runner 独占的 `.local-run/blobs`。Blob 上传另有 `BLOB_ATTACHMENTS_ENABLED` 显式 gate，router 还会检查全部健康 runner 的 `blobAttachments` capability；当前 filesystem adapter 同时要求显式 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`。它不能作为多 VM/多 Pod 共享存储，production runner 对 filesystem 写入和 cleanup 都会 fail closed；接入共享 OSS/S3 adapter 前不得在生产开启这两个工作循环。
 
 ## API 速览（对外经 `apps/agent-router`）
@@ -116,6 +119,8 @@ curl -sN -X POST "$BASE/v1/sessions/sess_.../turns?exclude=usage/updated" "${H[@
 #       POST .../archive | .../unarchive | .../resume  DELETE /v1/sessions/{id}（fenced tombstone，不物理 purge）
 #       POST /v1/data-erasure-requests（admin + user + Idempotency-Key，默认关闭）
 #       GET /v1/data-erasure-requests/{requestId}（仅同 tenant/user；worker 最多推进到 awaiting_purge_policy）
+#       POST /v1/data-export-requests（admin + user + Idempotency-Key，默认关闭）
+#       GET /v1/data-export-requests/{requestId} | GET .../{requestId}/download（同 owner；ready 后可下载 NDJSON）
 #       PUT/GET /v1/retention-policies/{policyVersion} | POST .../{policyVersion}/activate | GET .../active
 #       POST/GET /v1/legal-holds | GET /v1/legal-holds/{holdId} | POST .../{holdId}/release（均为 admin、默认关闭）
 #       GET /v1/capabilities  GET /openapi.json  GET /healthz /readyz
@@ -131,7 +136,7 @@ apps/agent-router      无状态路由；owner 目录、一致性哈希、SSE �
 packages/protocol      资源 / 事件 / 错误 schema（zod）
 packages/sdk           从 OpenAPI 生成的 TypeScript 路由类型、类型化客户端与 SSE 流式辅助函数
 packages/store         SessionStore / LeaseStore / EventBus / BlobStore 接口；ownership manifest 与 Blob delete outbox；memory、MySQL（fenced commit）、Redis（Lua 租约、Streams 热重放）实现；migrations/
-packages/core          AgentEngine 接口 + PiEngine（pi-agent-core 适配）；SessionHost（租约续期、write-ahead、审批门、安全阀、Blob/崩溃修复）；上下文装配；内置工具，以及 lifecycle/Blob/erasure 内嵌 workers
+packages/core          AgentEngine 接口 + PiEngine（pi-agent-core 适配）；SessionHost（租约续期、write-ahead、审批门、安全阀、Blob/崩溃修复）；上下文装配；内置工具，以及 lifecycle/Blob/erasure/export 内嵌 workers
 packages/providers     BYOK provider 配置 → pi Model；密钥加密；国内厂商 preset
 packages/testkit       假厂商与跨包测试夹具
 deploy/local           本机 redis / mysql 启停脚本
@@ -157,6 +162,7 @@ docs/                  调研、设计
 - pre-0009 的 generation `0` tombstone 由独立 durable compensation job 修复。`0014` migration 只安装 inactive cutover、job/audit 表、索引与 guards，不扫描、排队或改写历史行；worker 只有通过 v2 fleet barrier 才会激活一次性 cutover并开始处理。成功事务保留原删除时间，固定结算残留 active 资源，递增到 generation `1`，追加 terminal `session/deleted`、`session.tombstoned`/不可领取的 `session.purge` intent、append-only audit并完成 job；任一步失败全部回滚，重试不会重复证据。cutover 激活后数据库拒绝新的 legacy tombstone 写入，不能回退 pre-`0014` writer。
 - retention policy 版本和 activation audit不可变；control generation CAS与 rooted hash chain 防止 lost-update/ABA，跨 runner 时钟回拨通过锁内单调 clamp处理。tenant/user legal hold使用多记录账本、active projection与append-only event chain，release 只允许一次；Memory/MySQL 都会在 usage anonymize 前读取 canonical tenant+user hold状态并 fail-closed。`0015` migration不提供默认策略、不改变 purge intent、usage或内容；policy/hold 管理本身也不构成删除授权。
 - `0016` evaluator job使用attempt/token/lease防ABA；每个build的target、decision与authority证据不可变且hash-chain可重算，seal与validated read都会复核owner、request-bound policy、live inventory及两级hold fence。build期间证据漂移会以`evidence_changed`开启新generation，sealed证据后漂移也会由scheduler重评。authority无availability/claim/lease字段，`dataPurgeExecution=false`且completion proof固定不完整，因此任何`eligible_execution_disabled`都不能触发匿名化或删除。
+- `0017` export request/job/snapshot/artifact/download/delete 状态均绑定 tenant、user、subject generation 与 build/deletion generation。MySQL 在 `REPEATABLE READ WITH CONSISTENT SNAPSHOT` 事务内复制白名单记录，事务外按确定性 `ndjson-v1` 分片发布；只有全部分片和整体 digest 验证后才原子变为 ready。claim/download/delete 都使用 lease 与 CAS 防 stale/ABA；跨 owner 统一 404，失败或撤销不会留下可下载的部分制品。附件只以 base64 chunk 输出，内部 Blob key、idempotency、secret、claim 和 fence 从不进入制品。
 - 通用erasure transition API不能表达`purging/completed`或由调用方注入completion proof；lifecycle outbox的claim/renew/complete/retry也全部绑定`session.tombstoned` topic。旧版或异常进程即使留下`session.purge` claim token，也不能借通用ACK接口把它续租、完成或重新排队。
 - 新 usage write 以 opaque `usage_id` 在同一事务双写 operational ledger 与不含 user/session/turn/step/raw JSON/精确请求时间的 billing fact；金额以 9 位小数规范字符串写入 `DECIMAL(24,9)`。session/turn/event/compaction 投影由 ledger 权威重建，MySQL 使用一致性快照内的 SQL 聚合；legacy `usage_id IS NULL + costCNY=0` 保守视为 unknown，而新版有 identity 的零价仍为 known-zero。legacy row 只有在 tombstone generation、owner、逐行事实和汇总校验和全部核对后才可显式匿名化，任何 ledger/session owner 不一致都会 fail-closed。普通聚合只有在全部组成记录都有价格时才返回完整 `costCNY`；任一未知价格都会保持缺失，已知零价仍为 `0`。启用 `maxCostCNY` 时，未定价的正常 step 会在落账后 fail-closed，不能继续执行其工具或下一模型 step。
 - 审批授权是服务端状态，客户端 metadata 改不动；BYOK 的 `baseUrl` 必须解析到公网地址。

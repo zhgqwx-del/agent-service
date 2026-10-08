@@ -22,6 +22,7 @@ import {
   Item as ItemSchema,
   Session as SessionSchema,
   Turn as TurnSchema,
+  Usage as UsageSchema,
   addUsage,
   emptyUsageAccumulator,
   isCanonicalId,
@@ -90,6 +91,7 @@ import {
   BLOB_STORAGE_FORMAT,
   BlobStateError,
   assertBlobBindingsMatch,
+  blobBindingsFromItems,
   isUnexpiredStagingBlob,
   sanitizeBlobDeleteError,
   validateBlobDeleteAck,
@@ -324,8 +326,84 @@ import {
   type ScheduleAwaitingErasurePolicyEvaluationsOptions,
   type SealErasurePurgeAuthorityOptions,
 } from "./erasure-purge-policy.js";
+import {
+  EMPTY_USER_DATA_EXPORT_SNAPSHOT_ROOT_SHA256,
+  USER_DATA_EXPORT_CONTENT_TYPE,
+  USER_DATA_EXPORT_FORMAT,
+  USER_DATA_EXPORT_RECORD_KIND_ORDER,
+  USER_DATA_EXPORT_SCHEMA_VERSION,
+  UserDataExportIdempotencyMismatchError,
+  UserDataExportIntegrityError,
+  UserDataExportPolicyUnavailableError,
+  UserDataExportStateError,
+  canonicalUserDataExportBytes,
+  canonicalUserDataExportJson,
+  sanitizeExportEvent,
+  sanitizeExportSession,
+  sanitizeExportTurn,
+  sanitizeUserDataExportError,
+  nextUserDataExportSnapshotRootSha256,
+  userDataExportAttachmentLogicalKey,
+  userDataExportManifestSha256,
+  userDataExportStorageKey,
+  validateClaimUserDataExportsOptions,
+  validateStartUserDataExportArtifactInput,
+  validateUserDataExportAuthorization,
+  validateUserDataExportRequestInput,
+  validateUserDataExportRequestRecord,
+  type ClaimUserDataExportDeletesOptions,
+  type ClaimUserDataExportsOptions,
+  type CompleteUserDataExportArtifactInput,
+  type MarkUserDataExportPartUploadedInput,
+  type RequestUserDataExportInput,
+  type RetryUserDataExportDeleteInput,
+  type RetryUserDataExportInput,
+  type StageUserDataExportPartInput,
+  type StartUserDataExportArtifactInput,
+  type UserDataExportArtifactPart,
+  type UserDataExportArtifactRecord,
+  type UserDataExportAuthorization,
+  type UserDataExportClaim,
+  type UserDataExportCleanupStore,
+  type UserDataExportDeleteOutboxRecord,
+  type UserDataExportDownloadLease,
+  type UserDataExportJobStore,
+  type UserDataExportRequestRecord,
+  type UserDataExportRequestStore,
+  type UserDataExportSnapshotEntry,
+  type UserDataExportSnapshotBlob,
+  type UserDataExportSnapshotBlobPage,
+  type UserDataExportSnapshotRecord,
+  type UserDataExportSnapshotRecordPage,
+  type UserDataExportSnapshotSummary,
+} from "./data-export.js";
+
+interface MemoryUserDataExportJob {
+  requestId: string;
+  status: "queued" | "building" | "completed" | "failed" | "revoked";
+  buildGeneration: number;
+  attempts: number;
+  availableAtMs?: number;
+  claimToken?: string;
+  leaseUntilMs?: number;
+  currentArtifactId?: string;
+  lastErrorCode?: import("./data-export.js").UserDataExportErrorCode;
+  snapshot?: UserDataExportSnapshotSummary;
+  completedAtMs?: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
 
 const clone = <T>(v: T): T => structuredClone(v);
+
+function cloneUserDataExportSnapshotRecord(
+  record: UserDataExportSnapshotRecord,
+): UserDataExportSnapshotRecord {
+  return {
+    ...clone(record),
+    canonicalBytes: Buffer.from(record.canonicalBytes),
+  };
+}
 
 function restoreMapEntry<K, V>(
   map: Map<K, V>,
@@ -337,6 +415,11 @@ function restoreMapEntry<K, V>(
   // rollback of an otherwise durable-looking multi-map publication.
   if (existed) Map.prototype.set.call(map, key, previous as V);
   else Map.prototype.delete.call(map, key);
+}
+
+function restoreMapSnapshot<K, V>(map: Map<K, V>, snapshot: Map<K, V>): void {
+  Map.prototype.clear.call(map);
+  for (const [key, value] of snapshot) Map.prototype.set.call(map, key, value);
 }
 
 function retentionPolicyKey(tenantId: string, policyVersion: string): string {
@@ -468,7 +551,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore {
   agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -512,6 +595,26 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   legacyTombstoneCompensationJobs = new Map<string, LegacyTombstoneCompensationJobRecord>();
   legacyTombstoneCompensationAudits = new Map<string, LegacyTombstoneCompensationAudit[]>();
   private nextLegacyTombstoneAuditId = 1;
+  userDataExportRequests = new Map<string, UserDataExportRequestRecord>();
+  userDataExportJobs = new Map<string, MemoryUserDataExportJob>();
+  userDataExportArtifacts = new Map<string, UserDataExportArtifactRecord>();
+  userDataExportParts = new Map<string, UserDataExportArtifactPart>();
+  userDataExportSnapshotRecords = new Map<string, UserDataExportSnapshotRecord[]>();
+  userDataExportSnapshotBlobs = new Map<string, UserDataExportSnapshotBlob[]>();
+  userDataExportDeleteOutbox = new Map<string, UserDataExportDeleteOutboxRecord>();
+  userDataExportDownloadLeases = new Map<string, {
+    artifactId: string;
+    requestId: string;
+    tenantId: string;
+    userId: string;
+    leaseToken: string;
+    leaseUntilMs: number;
+    createdAtMs: number;
+  }>();
+  private userDataExportIdempotency = new Map<string, string>();
+  private nextUserDataExportDeleteOutboxId = 1;
+
+  constructor(private readonly dataExportClock: { now(): number } = { now: () => Date.now() }) {}
 
   private initialRetentionPolicyControl(tenantId: string): RetentionPolicyControlRecord {
     const control: RetentionPolicyControlRecord = {
@@ -3639,6 +3742,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return (tenant?.state ?? "active") === "active" && (user?.state ?? "active") === "active";
   }
 
+  private isUserDataExportSubjectCurrent(request: UserDataExportRequestRecord): boolean {
+    if (!this.isSubjectActive(request.tenantId, request.userId)) return false;
+    const user = this.subjectRecord(request.tenantId, "user", request.userId);
+    return (user?.generation ?? 0) === request.subjectGeneration;
+  }
+
   private assertSubjectWritable(tenantId: string, userId: string): void {
     const tenant = this.subjectRecord(tenantId, "tenant", tenantId);
     if (!tenant && [...this.erasureRequests.values()].some((request) => (
@@ -3819,13 +3928,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const priorAudit = this.erasureAuditEvents.get(input.requestId);
     const idempotencyExisted = this.erasureIdempotency.has(idempotencyKey);
     const priorIdempotency = this.erasureIdempotency.get(idempotencyKey);
+    const priorExportState = this.captureUserDataExportState();
     try {
       if (stagedTenant) this.subjectLifecycles.set(tenantKey, stagedTenant);
       this.subjectLifecycles.set(userKey, stagedUser);
       this.erasureRequests.set(input.requestId, stagedRequest);
       this.erasureAuditEvents.set(input.requestId, [stagedAudit]);
       this.erasureIdempotency.set(idempotencyKey, input.requestId);
+      this.revokeUserDataExportsForSubject(input.tenantId, input.userId, input.atMs);
     } catch (error) {
+      this.restoreUserDataExportState(priorExportState);
       restoreMapEntry(this.erasureIdempotency, idempotencyKey, idempotencyExisted, priorIdempotency);
       restoreMapEntry(this.erasureAuditEvents, input.requestId, auditExisted, priorAudit);
       restoreMapEntry(this.erasureRequests, input.requestId, requestExisted, priorRequest);
@@ -6427,6 +6539,1747 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async getBlobDeleteOutbox(blobId: string, generation: number): Promise<BlobDeleteOutboxRecord | null> {
     const row = this.blobDeleteOutbox.get(this.blobDeleteOutboxMapKey(blobId, generation));
     return row ? this.hydrateBlobDeleteOutbox(row, false) : null;
+  }
+
+  // ---------- user data export ----------
+  private userDataExportNow(): number {
+    const now = this.dataExportClock.now();
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("invalid data export clock");
+    return now;
+  }
+
+  private userDataExportPartKey(artifactId: string, partNumber: number): string {
+    return JSON.stringify([artifactId, partNumber]);
+  }
+
+  private userDataExportDeleteKey(
+    artifactId: string,
+    partNumber: number,
+    deletionGeneration: number,
+  ): string {
+    return JSON.stringify([artifactId, partNumber, deletionGeneration]);
+  }
+
+  private userDataExportDownloadLeaseKey(artifactId: string, leaseToken: string): string {
+    return JSON.stringify([artifactId, leaseToken]);
+  }
+
+  private userDataExportIdempotencyKeyFor(input: Pick<
+    RequestUserDataExportInput,
+    "tenantId" | "userId" | "idempotencyKeySha256"
+  >): string {
+    return JSON.stringify([input.tenantId, input.userId, input.idempotencyKeySha256]);
+  }
+
+  private captureUserDataExportState() {
+    const copy = <K, V>(map: Map<K, V>) => new Map(
+      [...map].map(([key, value]) => [key, clone(value)] as const),
+    );
+    return {
+      requests: copy(this.userDataExportRequests),
+      jobs: copy(this.userDataExportJobs),
+      artifacts: copy(this.userDataExportArtifacts),
+      parts: copy(this.userDataExportParts),
+      snapshotRecords: new Map(
+        [...this.userDataExportSnapshotRecords].map(([key, records]) => [
+          key,
+          records.map(cloneUserDataExportSnapshotRecord),
+        ] as const),
+      ),
+      snapshotBlobs: copy(this.userDataExportSnapshotBlobs),
+      deleteOutbox: copy(this.userDataExportDeleteOutbox),
+      downloadLeases: copy(this.userDataExportDownloadLeases),
+      idempotency: copy(this.userDataExportIdempotency),
+      nextDeleteOutboxId: this.nextUserDataExportDeleteOutboxId,
+    };
+  }
+
+  private restoreUserDataExportState(state: ReturnType<MemorySessionStore["captureUserDataExportState"]>): void {
+    restoreMapSnapshot(this.userDataExportRequests, state.requests);
+    restoreMapSnapshot(this.userDataExportJobs, state.jobs);
+    restoreMapSnapshot(this.userDataExportArtifacts, state.artifacts);
+    restoreMapSnapshot(this.userDataExportParts, state.parts);
+    restoreMapSnapshot(this.userDataExportSnapshotRecords, state.snapshotRecords);
+    restoreMapSnapshot(this.userDataExportSnapshotBlobs, state.snapshotBlobs);
+    restoreMapSnapshot(this.userDataExportDeleteOutbox, state.deleteOutbox);
+    restoreMapSnapshot(this.userDataExportDownloadLeases, state.downloadLeases);
+    restoreMapSnapshot(this.userDataExportIdempotency, state.idempotency);
+    this.nextUserDataExportDeleteOutboxId = state.nextDeleteOutboxId;
+  }
+
+  private releaseUserDataExportSnapshot(requestId: string, buildGeneration: number, atMs: number): void {
+    this.userDataExportSnapshotRecords.delete(requestId);
+    const blobs = this.userDataExportSnapshotBlobs.get(requestId);
+    if (blobs) {
+      this.userDataExportSnapshotBlobs.set(
+        requestId,
+        blobs.map((blob) => (
+          blob.buildGeneration === buildGeneration && blob.releasedAtMs === undefined
+            ? { ...blob, releasedAtMs: atMs }
+            : blob
+        )),
+      );
+    }
+  }
+
+  private transitionUserDataExportArtifactToDeletePending(
+    artifactId: string,
+    atMs: number,
+  ): void {
+    const artifact = this.userDataExportArtifacts.get(artifactId);
+    if (!artifact || artifact.state === "deleted" || artifact.state === "delete_pending") return;
+    const deletionGeneration = artifact.deletionGeneration + 1;
+    if (!Number.isSafeInteger(deletionGeneration) || deletionGeneration < 1) {
+      throw new UserDataExportIntegrityError("data export deletion generation is exhausted");
+    }
+    const parts = [...this.userDataExportParts.values()]
+      .filter((part) => part.artifactId === artifactId && part.state !== "deleted")
+      .sort((left, right) => left.partNumber - right.partNumber);
+    if (parts.length === 0) {
+      this.userDataExportArtifacts.set(artifactId, clone({
+        ...artifact,
+        state: "deleted" as const,
+        deletePendingAtMs: atMs,
+        deletedAtMs: atMs,
+        deletionGeneration,
+      }));
+      return;
+    }
+    for (const part of parts) {
+      const key = this.userDataExportDeleteKey(artifactId, part.partNumber, deletionGeneration);
+      const existing = this.userDataExportDeleteOutbox.get(key);
+      if (existing) {
+        if (existing.requestId !== artifact.requestId) {
+          throw new UserDataExportIntegrityError("data export delete identity conflicts");
+        }
+        continue;
+      }
+      const outboxId = this.nextUserDataExportDeleteOutboxId++;
+      if (!Number.isSafeInteger(outboxId) || outboxId < 1) {
+        throw new UserDataExportIntegrityError("data export delete outbox id is exhausted");
+      }
+      this.userDataExportParts.set(this.userDataExportPartKey(artifactId, part.partNumber), clone({
+        ...part,
+        state: "delete_pending" as const,
+        deletePendingAtMs: atMs,
+        deletionGeneration,
+      }));
+      this.userDataExportDeleteOutbox.set(key, clone({
+        outboxId,
+        artifactId,
+        requestId: artifact.requestId,
+        partNumber: part.partNumber,
+        deletionGeneration,
+        storageBackend: part.storageBackend,
+        storageFormat: part.storageFormat,
+        storageKey: part.storageKey,
+        uploadToken: part.uploadToken,
+        availableAtMs: atMs,
+        attempts: 0,
+        createdAtMs: atMs,
+      }));
+    }
+    this.userDataExportArtifacts.set(artifactId, clone({
+      ...artifact,
+      state: "delete_pending" as const,
+      deletePendingAtMs: atMs,
+      deletionGeneration,
+    }));
+  }
+
+  private revokeUserDataExportsForSubject(tenantId: string, userId: string, atMs: number): void {
+    for (const request of [...this.userDataExportRequests.values()]) {
+      if (
+        request.tenantId !== tenantId
+        || request.userId !== userId
+        || request.status === "revoked"
+      ) continue;
+      const next = clone({ ...request, status: "revoked" as const, updatedAtMs: atMs });
+      delete next.lastErrorCode;
+      this.userDataExportRequests.set(request.requestId, next);
+      const job = this.userDataExportJobs.get(request.requestId);
+      if (job) {
+        const revoked = clone({ ...job, status: "revoked" as const, updatedAtMs: atMs });
+        delete revoked.availableAtMs;
+        delete revoked.claimToken;
+        delete revoked.leaseUntilMs;
+        this.userDataExportJobs.set(request.requestId, revoked);
+      }
+      if (request.currentArtifactId) {
+        this.transitionUserDataExportArtifactToDeletePending(request.currentArtifactId, atMs);
+      }
+      this.releaseUserDataExportSnapshot(
+        request.requestId,
+        request.currentBuildGeneration,
+        atMs,
+      );
+      for (const [key, lease] of this.userDataExportDownloadLeases) {
+        if (lease.requestId === request.requestId) this.userDataExportDownloadLeases.delete(key);
+      }
+    }
+  }
+
+  async requestUserDataExport(
+    input: RequestUserDataExportInput,
+  ): Promise<UserDataExportRequestRecord> {
+    const stagedInput = clone(input);
+    validateUserDataExportRequestInput(stagedInput);
+    const now = this.userDataExportNow();
+    const idempotencyKey = this.userDataExportIdempotencyKeyFor(stagedInput);
+    const replayId = this.userDataExportIdempotency.get(idempotencyKey);
+    if (replayId) {
+      const replay = this.userDataExportRequests.get(replayId);
+      if (
+        !replay
+        || replay.tenantId !== stagedInput.tenantId
+        || replay.userId !== stagedInput.userId
+        || replay.idempotencyKeySha256 !== stagedInput.idempotencyKeySha256
+      ) throw new UserDataExportIntegrityError("data export idempotency index is corrupt");
+      validateUserDataExportRequestRecord(replay);
+      if (replay.requestHash !== stagedInput.requestHash) {
+        throw new UserDataExportIdempotencyMismatchError();
+      }
+      return clone(replay);
+    }
+    this.assertSubjectWritable(stagedInput.tenantId, stagedInput.userId);
+    if (this.userDataExportRequests.has(stagedInput.requestId)) {
+      throw new UserDataExportStateError("data export request id already exists");
+    }
+    const policyState = this.assertRetentionPolicyState(stagedInput.tenantId);
+    const policy = policyState.active;
+    const ttl = policy?.policy.exportArtifactTtlMs;
+    if (
+      !policy
+      || policyState.control.activePolicyVersion !== policy.policyVersion
+      || policyState.control.activePolicySha256 !== policy.policySha256
+      || policyState.control.effectiveAtMs === undefined
+      || policyState.control.effectiveAtMs > now
+      || ttl === null
+      || ttl === undefined
+      || ttl <= 0
+    ) throw new UserDataExportPolicyUnavailableError();
+
+    const tenantKey = subjectLifecycleKey(stagedInput.tenantId, "tenant", stagedInput.tenantId);
+    const userKey = subjectLifecycleKey(stagedInput.tenantId, "user", stagedInput.userId);
+    const tenant = this.subjectLifecycles.get(tenantKey);
+    const user = this.subjectLifecycles.get(userKey);
+    const stagedTenant = tenant ?? this.activeSubjectRecord(
+      stagedInput.tenantId,
+      "tenant",
+      stagedInput.tenantId,
+      now,
+    );
+    const stagedUser = user ?? this.activeSubjectRecord(
+      stagedInput.tenantId,
+      "user",
+      stagedInput.userId,
+      now,
+    );
+    if (stagedTenant.state !== "active" || stagedUser.state !== "active") {
+      throw new SubjectDeletingError(stagedInput.tenantId, stagedInput.userId);
+    }
+    const request = clone<UserDataExportRequestRecord>({
+      requestId: stagedInput.requestId,
+      tenantId: stagedInput.tenantId,
+      userId: stagedInput.userId,
+      subjectGeneration: stagedUser.generation,
+      requestedByKeyId: stagedInput.requestedByKeyId,
+      idempotencyKeySha256: stagedInput.idempotencyKeySha256,
+      requestHash: stagedInput.requestHash,
+      format: USER_DATA_EXPORT_FORMAT,
+      schemaVersion: USER_DATA_EXPORT_SCHEMA_VERSION,
+      policyVersion: policy.policyVersion,
+      policySha256: policy.policySha256,
+      artifactTtlMs: ttl,
+      status: "queued",
+      currentBuildGeneration: 0,
+      createdAtMs: now,
+      updatedAtMs: now,
+    });
+    const job = clone<MemoryUserDataExportJob>({
+      requestId: request.requestId,
+      status: "queued",
+      buildGeneration: 0,
+      attempts: 0,
+      availableAtMs: now,
+      createdAtMs: now,
+      updatedAtMs: now,
+    });
+    validateUserDataExportRequestRecord(request);
+    const prior = this.captureUserDataExportState();
+    const tenantExisted = this.subjectLifecycles.has(tenantKey);
+    const priorTenant = this.subjectLifecycles.get(tenantKey);
+    const userExisted = this.subjectLifecycles.has(userKey);
+    const priorUser = this.subjectLifecycles.get(userKey);
+    try {
+      if (!tenant) this.subjectLifecycles.set(tenantKey, clone(stagedTenant));
+      if (!user) this.subjectLifecycles.set(userKey, clone(stagedUser));
+      this.userDataExportRequests.set(request.requestId, request);
+      this.userDataExportJobs.set(request.requestId, job);
+      this.userDataExportIdempotency.set(idempotencyKey, request.requestId);
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      restoreMapEntry(this.subjectLifecycles, userKey, userExisted, priorUser);
+      restoreMapEntry(this.subjectLifecycles, tenantKey, tenantExisted, priorTenant);
+      throw error;
+    }
+    return clone(request);
+  }
+
+  async getUserDataExport(
+    tenantId: string,
+    userId: string,
+    requestId: string,
+  ): Promise<UserDataExportRequestRecord | null> {
+    let request = this.userDataExportRequests.get(requestId);
+    if (!request || request.tenantId !== tenantId || request.userId !== userId) return null;
+    const now = this.userDataExportNow();
+    if (!this.isUserDataExportSubjectCurrent(request) && request.status !== "revoked") {
+      const prior = this.captureUserDataExportState();
+      try {
+        this.revokeUserDataExportsForSubject(tenantId, userId, now);
+      } catch (error) {
+        this.restoreUserDataExportState(prior);
+        throw error;
+      }
+      request = this.userDataExportRequests.get(requestId)!;
+    } else if (request.status === "ready" && request.expiresAtMs! <= now) {
+      const prior = this.captureUserDataExportState();
+      try {
+        this.expireUserDataExportRequest(request, now);
+      } catch (error) {
+        this.restoreUserDataExportState(prior);
+        throw error;
+      }
+      request = this.userDataExportRequests.get(requestId)!;
+    }
+    validateUserDataExportRequestRecord(request);
+    return clone(request);
+  }
+
+  private expireUserDataExportRequest(request: UserDataExportRequestRecord, atMs: number): void {
+    if (request.status !== "ready") return;
+    this.userDataExportRequests.set(request.requestId, clone({
+      ...request,
+      status: "expired" as const,
+      updatedAtMs: atMs,
+    }));
+    if (request.currentArtifactId) {
+      const hasActiveLease = [...this.userDataExportDownloadLeases.values()].some((lease) => (
+        lease.artifactId === request.currentArtifactId && lease.leaseUntilMs > atMs
+      ));
+      if (!hasActiveLease) {
+        this.transitionUserDataExportArtifactToDeletePending(request.currentArtifactId, atMs);
+      }
+    }
+  }
+
+  async acquireUserDataExportDownload(
+    tenantId: string,
+    userId: string,
+    requestId: string,
+    leaseToken: string,
+    leaseMs: number,
+  ): Promise<UserDataExportDownloadLease | null> {
+    if (!/^[A-Za-z0-9._:~-]{1,128}$/.test(leaseToken)) throw new Error("invalid export download lease token");
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 60_000) {
+      throw new Error("export download lease must be between 1 and 60000 milliseconds");
+    }
+    const now = this.userDataExportNow();
+    for (const [key, lease] of this.userDataExportDownloadLeases) {
+      if (lease.leaseUntilMs <= now) this.userDataExportDownloadLeases.delete(key);
+    }
+    let request = this.userDataExportRequests.get(requestId);
+    if (!request || request.tenantId !== tenantId || request.userId !== userId) return null;
+    if (!this.isUserDataExportSubjectCurrent(request)) {
+      const prior = this.captureUserDataExportState();
+      try {
+        this.revokeUserDataExportsForSubject(tenantId, userId, now);
+      } catch (error) {
+        this.restoreUserDataExportState(prior);
+        throw error;
+      }
+      request = this.userDataExportRequests.get(requestId)!;
+    } else if (request.status === "ready" && request.expiresAtMs! <= now) {
+      const prior = this.captureUserDataExportState();
+      try {
+        this.expireUserDataExportRequest(request, now);
+      } catch (error) {
+        this.restoreUserDataExportState(prior);
+        throw error;
+      }
+      request = this.userDataExportRequests.get(requestId)!;
+    }
+    if (!request || request.status !== "ready" || request.expiresAtMs! <= now) return null;
+    const artifact = request.currentArtifactId
+      ? this.userDataExportArtifacts.get(request.currentArtifactId)
+      : undefined;
+    if (
+      !artifact
+      || artifact.requestId !== request.requestId
+      || artifact.tenantId !== tenantId
+      || artifact.userId !== userId
+      || artifact.subjectGeneration !== request.subjectGeneration
+      || artifact.buildGeneration !== request.currentBuildGeneration
+      || artifact.state !== "ready"
+      || artifact.format !== request.format
+      || artifact.schemaVersion !== request.schemaVersion
+      || artifact.contentType !== USER_DATA_EXPORT_CONTENT_TYPE
+      || artifact.storageFormat !== BLOB_STORAGE_FORMAT
+      || artifact.policyVersion !== request.policyVersion
+      || artifact.policySha256 !== request.policySha256
+      || artifact.artifactTtlMs !== request.artifactTtlMs
+      || artifact.snapshotAtMs !== request.snapshotAtMs
+      || artifact.readyAtMs !== request.readyAtMs
+      || artifact.expiresAtMs !== request.expiresAtMs
+      || artifact.contentSha256 !== request.artifactSha256
+      || artifact.totalSizeBytes !== request.artifactSizeBytes
+      || artifact.recordCount !== request.recordCount
+      || artifact.deletionGeneration !== 0
+      || artifact.partCount === undefined
+      || artifact.manifestSha256 === undefined
+      || artifact.expiresAtMs === undefined
+      || artifact.expiresAtMs <= now
+    ) throw new UserDataExportIntegrityError("ready export artifact identity is invalid");
+    const parts = [...this.userDataExportParts.values()]
+      .filter((part) => part.artifactId === artifact.artifactId)
+      .sort((left, right) => left.partNumber - right.partNumber);
+    if (
+      parts.length !== artifact.partCount
+      || parts.some((part, index) => (
+        part.artifactId !== artifact.artifactId
+        || part.requestId !== request.requestId
+        || part.buildGeneration !== request.currentBuildGeneration
+        || part.partNumber !== index
+        || part.state !== "uploaded"
+        || part.storageBackend !== artifact.storageBackend
+        || part.storageFormat !== artifact.storageFormat
+        || part.storageKey !== userDataExportStorageKey(
+          { tenantId, userId },
+          request.requestId,
+          artifact.artifactId,
+          part.partNumber,
+        )
+        || part.sha256 === undefined
+        || part.sizeBytes === undefined
+        || part.contentType !== USER_DATA_EXPORT_CONTENT_TYPE
+        || part.deletionGeneration !== 0
+      ))
+    ) throw new UserDataExportIntegrityError("ready export artifact parts are incomplete");
+    const totalSizeBytes = parts.reduce((total, part) => total + part.sizeBytes!, 0);
+    if (
+      !Number.isSafeInteger(totalSizeBytes)
+      || totalSizeBytes !== artifact.totalSizeBytes
+      || userDataExportManifestSha256(parts) !== artifact.manifestSha256
+    ) throw new UserDataExportIntegrityError("ready export artifact manifest is invalid");
+    const key = this.userDataExportDownloadLeaseKey(artifact.artifactId, leaseToken);
+    const existing = this.userDataExportDownloadLeases.get(key);
+    if (existing && (
+      existing.requestId !== request.requestId
+      || existing.tenantId !== tenantId
+      || existing.userId !== userId
+    )) throw new UserDataExportIntegrityError("export download lease identity conflicts");
+    const requestedUntilMs = now + leaseMs;
+    const createdAtMs = existing?.createdAtMs ?? now;
+    const hardDeadlineMs = createdAtMs + 10 * 60_000;
+    const leaseUntilMs = Math.min(
+      hardDeadlineMs,
+      Math.max(existing?.leaseUntilMs ?? 0, requestedUntilMs),
+    );
+    if (
+      !Number.isSafeInteger(requestedUntilMs)
+      || !Number.isSafeInteger(hardDeadlineMs)
+      || !Number.isSafeInteger(leaseUntilMs)
+      || leaseUntilMs <= now
+    ) throw new Error("export download lease expiry overflow");
+    this.userDataExportDownloadLeases.set(key, clone(existing
+      ? { ...existing, leaseUntilMs }
+      : {
+          artifactId: artifact.artifactId,
+          requestId: request.requestId,
+          tenantId,
+          userId,
+          leaseToken,
+          leaseUntilMs,
+          createdAtMs,
+        }));
+    return {
+      request: clone(request),
+      artifact: clone(artifact),
+      parts: parts.map(clone),
+      leaseToken,
+      leaseUntilMs,
+    };
+  }
+
+  async renewUserDataExportDownload(
+    artifactId: string,
+    leaseToken: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 60_000) return false;
+    const now = this.userDataExportNow();
+    const key = this.userDataExportDownloadLeaseKey(artifactId, leaseToken);
+    const lease = this.userDataExportDownloadLeases.get(key);
+    if (!lease || lease.leaseUntilMs <= now) return false;
+    const hardDeadline = lease.createdAtMs + 10 * 60_000;
+    const next = Math.min(hardDeadline, Math.max(lease.leaseUntilMs, now + leaseMs));
+    if (!Number.isSafeInteger(next) || next <= now) return false;
+    this.userDataExportDownloadLeases.set(key, { ...lease, leaseUntilMs: next });
+    return true;
+  }
+
+  async releaseUserDataExportDownload(artifactId: string, leaseToken: string): Promise<void> {
+    this.userDataExportDownloadLeases.delete(
+      this.userDataExportDownloadLeaseKey(artifactId, leaseToken),
+    );
+  }
+
+  private activeUserDataExportClaim(
+    authorization: UserDataExportAuthorization,
+    now = this.userDataExportNow(),
+  ): {
+    request: UserDataExportRequestRecord;
+    job: MemoryUserDataExportJob;
+  } | null {
+    validateUserDataExportAuthorization(authorization);
+    const request = this.userDataExportRequests.get(authorization.requestId);
+    const job = this.userDataExportJobs.get(authorization.requestId);
+    if (
+      !request
+      || !job
+      || request.tenantId !== authorization.tenantId
+      || request.userId !== authorization.userId
+      || request.subjectGeneration !== authorization.subjectGeneration
+      || request.currentBuildGeneration !== authorization.buildGeneration
+      || job.buildGeneration !== authorization.buildGeneration
+      || job.attempts !== authorization.claimAttempt
+      || job.claimToken !== authorization.claimToken
+      || job.leaseUntilMs === undefined
+      || job.leaseUntilMs <= now
+      || job.status !== "building"
+      || request.status !== "building"
+      || !this.isUserDataExportSubjectCurrent(request)
+    ) return null;
+    return { request, job };
+  }
+
+  async claimUserDataExports(
+    options: ClaimUserDataExportsOptions,
+  ): Promise<UserDataExportClaim[]> {
+    validateClaimUserDataExportsOptions(options);
+    const now = this.userDataExportNow();
+    const leaseUntilMs = now + options.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("data export lease expiry overflow");
+    const prior = this.captureUserDataExportState();
+    try {
+      for (const request of [...this.userDataExportRequests.values()]) {
+        if (!this.isUserDataExportSubjectCurrent(request)) {
+          this.revokeUserDataExportsForSubject(request.tenantId, request.userId, now);
+        }
+      }
+      const candidates = [...this.userDataExportJobs.values()]
+        .filter((job) => (
+          (job.status === "queued" || job.status === "building")
+          && (job.availableAtMs ?? 0) <= now
+          && (job.claimToken === undefined || (job.leaseUntilMs !== undefined && job.leaseUntilMs <= now))
+        ))
+        .sort((left, right) => left.requestId.localeCompare(right.requestId))
+        .slice(0, options.limit);
+      const claims: UserDataExportClaim[] = [];
+      for (const job of candidates) {
+        const request = this.userDataExportRequests.get(job.requestId);
+        if (!request || (request.status !== "queued" && request.status !== "building")) continue;
+        const buildGeneration = job.snapshot
+          ? job.buildGeneration
+          : job.buildGeneration + 1;
+        const claimAttempt = job.attempts + 1;
+        if (!Number.isSafeInteger(buildGeneration) || buildGeneration < 1) {
+          throw new UserDataExportIntegrityError("data export build generation is exhausted");
+        }
+        if (!Number.isSafeInteger(claimAttempt) || claimAttempt < 1) {
+          throw new UserDataExportIntegrityError("data export claim attempt is exhausted");
+        }
+        const nextJob = clone<MemoryUserDataExportJob>({
+          ...job,
+          status: "building",
+          buildGeneration,
+          attempts: claimAttempt,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+          updatedAtMs: now,
+        });
+        delete nextJob.availableAtMs;
+        if (!job.snapshot && job.buildGeneration !== buildGeneration) {
+          delete nextJob.currentArtifactId;
+          delete nextJob.lastErrorCode;
+        }
+        const nextRequest = clone<UserDataExportRequestRecord>({
+          ...request,
+          status: "building",
+          currentBuildGeneration: buildGeneration,
+          currentArtifactId: nextJob.currentArtifactId,
+          updatedAtMs: now,
+        });
+        delete nextRequest.lastErrorCode;
+        this.userDataExportJobs.set(job.requestId, nextJob);
+        this.userDataExportRequests.set(job.requestId, nextRequest);
+        claims.push({
+          requestId: request.requestId,
+          tenantId: request.tenantId,
+          userId: request.userId,
+          subjectGeneration: request.subjectGeneration,
+          buildGeneration,
+          claimAttempt,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+          policyVersion: request.policyVersion,
+          policySha256: request.policySha256,
+          artifactTtlMs: request.artifactTtlMs,
+        });
+      }
+      return claims.map(clone);
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      throw error;
+    }
+  }
+
+  async renewUserDataExportClaim(
+    authorization: UserDataExportAuthorization,
+    leaseMs: number,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) throw new Error("invalid data export lease duration");
+    const now = this.userDataExportNow();
+    const state = this.activeUserDataExportClaim(authorization, now);
+    if (!state || !this.isUserDataExportSubjectCurrent(state.request)) return false;
+    const until = now + leaseMs;
+    if (!Number.isSafeInteger(until)) throw new Error("data export lease expiry overflow");
+    this.userDataExportJobs.set(state.job.requestId, clone({
+      ...state.job,
+      leaseUntilMs: Math.max(state.job.leaseUntilMs!, until),
+      updatedAtMs: now,
+    }));
+    return true;
+  }
+
+  async startUserDataExportArtifact(
+    authorization: UserDataExportAuthorization,
+    input: StartUserDataExportArtifactInput,
+  ): Promise<UserDataExportArtifactRecord> {
+    validateStartUserDataExportArtifactInput(input);
+    if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(input.storageBackend)) {
+      throw new Error("invalid data export storage backend");
+    }
+    if (input.storageFormat !== BLOB_STORAGE_FORMAT) {
+      throw new Error("unsupported data export storage format");
+    }
+    const now = this.userDataExportNow();
+    const state = this.activeUserDataExportClaim(authorization, now);
+    if (!state || !this.isUserDataExportSubjectCurrent(state.request)) {
+      throw new UserDataExportStateError("stale data export claim");
+    }
+    if (!state.job.snapshot) {
+      throw new UserDataExportStateError("data export snapshot is not sealed");
+    }
+    if (state.job.currentArtifactId) {
+      const existing = this.userDataExportArtifacts.get(state.job.currentArtifactId);
+      if (
+        !existing
+        || existing.artifactId !== input.artifactId
+        || existing.requestId !== authorization.requestId
+        || existing.buildGeneration !== authorization.buildGeneration
+        || existing.storageBackend !== input.storageBackend
+        || existing.storageFormat !== input.storageFormat
+        || existing.snapshotRootSha256 !== state.job.snapshot.snapshotRootSha256
+      ) throw new UserDataExportIntegrityError("data export artifact identity conflicts");
+      return clone(existing);
+    }
+    if (this.userDataExportArtifacts.has(input.artifactId)) {
+      throw new UserDataExportStateError("data export artifact id already exists");
+    }
+    const stagingExpiresAtMs = now + input.stagingTtlMs;
+    if (!Number.isSafeInteger(stagingExpiresAtMs)) {
+      throw new Error("data export staging expiry overflow");
+    }
+    const artifact: UserDataExportArtifactRecord = {
+      artifactId: input.artifactId,
+      requestId: state.request.requestId,
+      tenantId: state.request.tenantId,
+      userId: state.request.userId,
+      subjectGeneration: state.request.subjectGeneration,
+      buildGeneration: authorization.buildGeneration,
+      state: "staging",
+      format: USER_DATA_EXPORT_FORMAT,
+      schemaVersion: USER_DATA_EXPORT_SCHEMA_VERSION,
+      contentType: USER_DATA_EXPORT_CONTENT_TYPE,
+      storageBackend: input.storageBackend,
+      storageFormat: input.storageFormat,
+      policyVersion: state.request.policyVersion,
+      policySha256: state.request.policySha256,
+      snapshotRootSha256: state.job.snapshot.snapshotRootSha256,
+      artifactTtlMs: state.request.artifactTtlMs,
+      stagingExpiresAtMs,
+      deletionGeneration: 0,
+      createdAtMs: now,
+    };
+    const prior = this.captureUserDataExportState();
+    try {
+      this.userDataExportArtifacts.set(input.artifactId, clone(artifact));
+      this.userDataExportJobs.set(state.job.requestId, clone({
+        ...state.job,
+        currentArtifactId: input.artifactId,
+        updatedAtMs: now,
+      }));
+      this.userDataExportRequests.set(state.request.requestId, clone({
+        ...state.request,
+        currentArtifactId: input.artifactId,
+        updatedAtMs: now,
+      }));
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      throw error;
+    }
+    return clone(artifact);
+  }
+
+  async captureAndSealUserDataExportSnapshot(
+    authorization: UserDataExportAuthorization,
+  ): Promise<UserDataExportSnapshotSummary> {
+    const now = this.userDataExportNow();
+    const state = this.activeUserDataExportClaim(authorization, now);
+    if (!state || !this.isUserDataExportSubjectCurrent(state.request)) {
+      throw new UserDataExportStateError("stale data export claim");
+    }
+    if (state.job.snapshot) {
+      const records = this.userDataExportSnapshotRecords.get(authorization.requestId) ?? [];
+      const blobs = this.userDataExportSnapshotBlobs.get(authorization.requestId) ?? [];
+      if (
+        records.some((record) => record.buildGeneration !== authorization.buildGeneration)
+        || blobs.some((blob) => (
+          blob.buildGeneration !== authorization.buildGeneration || blob.releasedAtMs !== undefined
+        ))
+        || records.length + blobs.length !== state.job.snapshot.recordCount
+      ) throw new UserDataExportIntegrityError("sealed data export snapshot is incomplete");
+      return clone(state.job.snapshot);
+    }
+    if (state.job.currentArtifactId) {
+      throw new UserDataExportIntegrityError("unsealed data export job already has an artifact");
+    }
+
+    const compareText = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+    const ownedSessions = [...this.sessions.entries()]
+      .filter(([, session]) => (
+        session.tenantId === authorization.tenantId && session.userId === authorization.userId
+      ))
+      .sort((left, right) => compareText(left[0], right[0]));
+    const ownedSessionIds = new Set(ownedSessions.map(([, session]) => session.id));
+    for (const [mapKey, session] of ownedSessions) {
+      if (mapKey !== session.id) throw new UserDataExportIntegrityError("session identity is corrupt");
+    }
+    for (const usage of this.usageLedger) {
+      const sourceSession = this.sessions.get(usage.sessionId);
+      const rowOwned = usage.tenantId === authorization.tenantId
+        && usage.userId === authorization.userId;
+      const sessionOwned = !!sourceSession
+        && sourceSession.tenantId === authorization.tenantId
+        && sourceSession.userId === authorization.userId;
+      if (rowOwned !== sessionOwned) {
+        throw new UserDataExportIntegrityError("operational usage ownership is corrupt");
+      }
+    }
+    for (const [mapKey, manifest] of this.blobManifests) {
+      const sourceSession = this.sessions.get(manifest.sessionId);
+      const rowOwned = manifest.tenantId === authorization.tenantId
+        && manifest.userId === authorization.userId;
+      const sessionOwned = !!sourceSession
+        && sourceSession.tenantId === authorization.tenantId
+        && sourceSession.userId === authorization.userId;
+      if (mapKey !== manifest.blobId || rowOwned !== sessionOwned) {
+        throw new UserDataExportIntegrityError("blob ownership is corrupt");
+      }
+    }
+
+    const counts: UserDataExportSnapshotSummary["counts"] = {
+      session: 0,
+      turn: 0,
+      item: 0,
+      event: 0,
+      approval: 0,
+      operational_usage: 0,
+      attachment: 0,
+    };
+    const pendingRecords: Omit<UserDataExportSnapshotRecord, "ordinal">[] = [];
+    const pendingBlobs: Omit<UserDataExportSnapshotBlob, "ordinal">[] = [];
+    const appendRecord = (
+      kind: UserDataExportSnapshotRecord["kind"],
+      logicalKey: string,
+      value: UserDataExportSnapshotEntry["value"],
+    ) => {
+      const canonicalBytes = canonicalUserDataExportBytes({ type: kind, value } as UserDataExportSnapshotEntry);
+      const sha256 = createHash("sha256").update(canonicalBytes).digest("hex");
+      const record: Omit<UserDataExportSnapshotRecord, "ordinal"> = {
+        requestId: authorization.requestId,
+        buildGeneration: authorization.buildGeneration,
+        kind,
+        logicalKey,
+        canonicalBytes,
+        sha256,
+        sizeBytes: canonicalBytes.byteLength,
+      };
+      pendingRecords.push(record);
+      counts[kind] += 1;
+    };
+
+    for (const [, storedSession] of ownedSessions) {
+      const session = SessionSchema.parse(clone(storedSession));
+      const tombstone = this.deleted.get(session.id);
+      if (tombstone && (
+        !Number.isSafeInteger(tombstone.deletedAtMs)
+        || tombstone.deletedAtMs < 0
+        || !Number.isSafeInteger(tombstone.deletionGeneration)
+        || tombstone.deletionGeneration < 0
+      )) throw new UserDataExportIntegrityError("session tombstone is corrupt");
+      const projectedSession = this.sessionForRead(session);
+      appendRecord(
+        "session",
+        canonicalUserDataExportJson(["session", session.id]),
+        sanitizeExportSession(projectedSession, tombstone?.deletedAtMs),
+      );
+
+      const sessionTurns = [...this.turns.entries()]
+        .filter(([, turn]) => turn.sessionId === session.id)
+        .sort((left, right) => compareText(left[0], right[0]));
+      const sessionTurnIds = new Set<string>();
+      for (const [mapKey, storedTurn] of sessionTurns) {
+        const turn = TurnSchema.parse(clone(storedTurn));
+        if (mapKey !== turn.id || turn.sessionId !== session.id) {
+          throw new UserDataExportIntegrityError("turn identity is corrupt");
+        }
+        sessionTurnIds.add(turn.id);
+        appendRecord(
+          "turn",
+          canonicalUserDataExportJson(["turn", session.id, turn.id]),
+          sanitizeExportTurn(this.turnForRead(turn, session)),
+        );
+      }
+
+      const sessionItems = [...this.items.entries()]
+        .filter(([, item]) => item.sessionId === session.id)
+        .sort((left, right) => (left[1].seq - right[1].seq) || compareText(left[0], right[0]));
+      const normalizedItems: Item[] = [];
+      const sessionItemIds = new Set<string>();
+      for (const [mapKey, storedItem] of sessionItems) {
+        const item = ItemSchema.parse(clone(storedItem));
+        if (mapKey !== item.id || !sessionTurnIds.has(item.turnId)) {
+          throw new UserDataExportIntegrityError("item identity is corrupt");
+        }
+        const usage = this.usageProjectionRows(session.id, item.turnId).find((row) => (
+          row.step === 0 && row.tenantId === session.tenantId && row.userId === session.userId
+        ));
+        const normalized = canonicalizeUsageItem(item, usage);
+        normalizedItems.push(normalized);
+        sessionItemIds.add(normalized.id);
+        appendRecord(
+          "item",
+          canonicalUserDataExportJson(["item", session.id, normalized.id]),
+          normalized,
+        );
+      }
+
+      const sessionEvents = clone(this.events.get(session.id) ?? []);
+      if (sessionEvents.length !== session.lastSeq) {
+        throw new UserDataExportIntegrityError("event sequence is incomplete");
+      }
+      for (const [index, storedEvent] of sessionEvents.entries()) {
+        const event = EventSchema.parse(storedEvent);
+        if (event.seq === undefined || event.seq !== index + 1 || event.sessionId !== session.id) {
+          throw new UserDataExportIntegrityError("event sequence is corrupt");
+        }
+        const normalized = sanitizeExportEvent(canonicalizePersistedUsageEvent(
+          event as PersistedEvent,
+          this.usageProjectionRows(session.id),
+          { tenantId: session.tenantId, userId: session.userId },
+        ));
+        appendRecord(
+          "event",
+          canonicalUserDataExportJson(["event", session.id, normalized.seq]),
+          normalized,
+        );
+      }
+
+      const sessionApprovals = [...this.approvals.entries()]
+        .filter(([, approval]) => approval.sessionId === session.id)
+        .sort((left, right) => compareText(left[0], right[0]));
+      for (const [mapKey, storedApproval] of sessionApprovals) {
+        const approval = ApprovalSchema.parse(clone(storedApproval));
+        if (
+          mapKey !== approval.id
+          || !sessionTurnIds.has(approval.turnId)
+          || !sessionItemIds.has(approval.itemId)
+        ) throw new UserDataExportIntegrityError("approval identity is corrupt");
+        appendRecord(
+          "approval",
+          canonicalUserDataExportJson(["approval", session.id, approval.id]),
+          approval,
+        );
+      }
+
+      const usageRows = this.usageProjectionRows(session.id)
+        .sort((left, right) => (
+          compareText(left.turnId, right.turnId)
+          || left.step - right.step
+          || compareText(left.provider, right.provider)
+          || compareText(left.model, right.model)
+        ));
+      const usageKeys = new Set<string>();
+      for (const usage of usageRows) {
+        if (
+          usage.tenantId !== session.tenantId
+          || usage.userId !== session.userId
+          || !sessionTurnIds.has(usage.turnId)
+          || !Number.isSafeInteger(usage.step)
+          || usage.step < 0
+          || !usage.provider
+          || !usage.model
+          || !Number.isSafeInteger(usage.createdAtMs)
+          || usage.createdAtMs < 0
+        ) throw new UserDataExportIntegrityError("operational usage is corrupt");
+        const logicalKey = canonicalUserDataExportJson([
+          "operational_usage", session.id, usage.turnId, usage.step,
+        ]);
+        if (usageKeys.has(logicalKey)) {
+          throw new UserDataExportIntegrityError("operational usage identity is duplicated");
+        }
+        usageKeys.add(logicalKey);
+        const value = {
+          sessionId: session.id,
+          turnId: usage.turnId,
+          step: usage.step,
+          provider: usage.provider,
+          model: usage.model,
+          usage: UsageSchema.parse(normalizeOperationalUsageCost(usage.usage, usage.usageId)),
+          createdAtMs: usage.createdAtMs,
+        };
+        appendRecord("operational_usage", logicalKey, value);
+      }
+
+      const bindings = blobBindingsFromItems(normalizedItems).sort((left, right) => (
+        compareText(left.blobId, right.blobId)
+        || compareText(left.itemId, right.itemId)
+        || compareText(left.purpose, right.purpose)
+      ));
+      const readyForSession = [...this.blobManifests.values()].filter((manifest) => (
+        manifest.sessionId === session.id && manifest.state === "ready"
+      ));
+      if (readyForSession.length !== bindings.length) {
+        throw new UserDataExportIntegrityError("ready blob ownership does not match item references");
+      }
+      for (const binding of bindings) {
+        const manifest = this.blobManifests.get(binding.blobId);
+        if (
+          !manifest
+          || manifest.tenantId !== session.tenantId
+          || manifest.userId !== session.userId
+          || manifest.sessionId !== session.id
+          || manifest.itemId !== binding.itemId
+          || manifest.purpose !== binding.purpose
+          || manifest.state !== "ready"
+          || manifest.sha256 === undefined
+          || !/^[0-9a-f]{64}$/.test(manifest.sha256)
+          || manifest.sizeBytes === undefined
+          || !Number.isSafeInteger(manifest.sizeBytes)
+          || manifest.sizeBytes < 0
+          || manifest.readyAtMs === undefined
+          || manifest.uploadedAtMs === undefined
+        ) throw new UserDataExportIntegrityError("ready blob manifest is corrupt");
+        validateBlobKey(manifest.storageKey);
+        validateBlobUploadToken(manifest.uploadToken);
+        validateBlobContentType(manifest.contentType);
+        if (manifest.storageFormat !== BLOB_STORAGE_FORMAT) {
+          throw new UserDataExportIntegrityError("ready blob storage format is unsupported");
+        }
+        const publicAttachment = {
+          blobId: manifest.blobId,
+          sessionId: manifest.sessionId,
+          itemId: manifest.itemId,
+          purpose: manifest.purpose,
+          ...(manifest.contentType === undefined ? {} : { contentType: manifest.contentType }),
+          sha256: manifest.sha256,
+          sizeBytes: manifest.sizeBytes,
+        };
+        const logicalKey = userDataExportAttachmentLogicalKey(publicAttachment);
+        pendingBlobs.push({
+          ...publicAttachment,
+          requestId: authorization.requestId,
+          buildGeneration: authorization.buildGeneration,
+          storageBackend: manifest.storageBackend,
+          storageFormat: manifest.storageFormat,
+          storageKey: manifest.storageKey,
+          sourceUploadToken: manifest.uploadToken,
+          sourceDeletionGeneration: manifest.deletionGeneration,
+          pinToken: createHash("sha256").update(canonicalUserDataExportJson([
+            "agent-service/user-data-export-pin/v1",
+            authorization.requestId,
+            authorization.buildGeneration,
+            manifest.blobId,
+          ])).digest("hex"),
+          pinnedAtMs: now,
+        });
+        counts.attachment += 1;
+      }
+    }
+
+    // Resources whose owner is determined by an owned session must all have been selected above.
+    for (const [key, turn] of this.turns) {
+      if (ownedSessionIds.has(turn.sessionId) && key !== turn.id) {
+        throw new UserDataExportIntegrityError("turn map identity is corrupt");
+      }
+    }
+    for (const [key, item] of this.items) {
+      if (ownedSessionIds.has(item.sessionId) && key !== item.id) {
+        throw new UserDataExportIntegrityError("item map identity is corrupt");
+      }
+    }
+    for (const [key, approval] of this.approvals) {
+      if (ownedSessionIds.has(approval.sessionId) && key !== approval.id) {
+        throw new UserDataExportIntegrityError("approval map identity is corrupt");
+      }
+    }
+    for (const [key, storedEvents] of this.events) {
+      if (
+        storedEvents.some((event) => ownedSessionIds.has(event.sessionId))
+        && !ownedSessionIds.has(key)
+      ) throw new UserDataExportIntegrityError("event log identity is corrupt");
+    }
+    const kindIndex = new Map<UserDataExportSnapshotRecord["kind"], number>(
+      USER_DATA_EXPORT_RECORD_KIND_ORDER.map((kind, index) => [kind, index]),
+    );
+    pendingRecords.sort((left, right) => (
+      kindIndex.get(left.kind)! - kindIndex.get(right.kind)!
+      || compareText(left.logicalKey, right.logicalKey)
+    ));
+    if (pendingRecords.some((record, index) => (
+      index > 0
+      && pendingRecords[index - 1]!.kind === record.kind
+      && pendingRecords[index - 1]!.logicalKey === record.logicalKey
+    ))) throw new UserDataExportIntegrityError("data export snapshot record identity is duplicated");
+    const records: UserDataExportSnapshotRecord[] = pendingRecords.map((record, ordinal) => ({
+      ...record,
+      ordinal,
+    }));
+    pendingBlobs.sort((left, right) => compareText(
+      userDataExportAttachmentLogicalKey(left),
+      userDataExportAttachmentLogicalKey(right),
+    ));
+    if (pendingBlobs.some((blob, index) => (
+      index > 0
+      && userDataExportAttachmentLogicalKey(pendingBlobs[index - 1]!)
+        === userDataExportAttachmentLogicalKey(blob)
+    ))) throw new UserDataExportIntegrityError("data export attachment identity is duplicated");
+    const blobs: UserDataExportSnapshotBlob[] = pendingBlobs.map((blob, ordinal) => ({
+      ...blob,
+      ordinal,
+    }));
+    let root = EMPTY_USER_DATA_EXPORT_SNAPSHOT_ROOT_SHA256;
+    for (const record of records) {
+      root = nextUserDataExportSnapshotRootSha256(
+        root,
+        record.kind,
+        record.logicalKey,
+        record.sha256,
+        record.sizeBytes,
+      );
+    }
+    for (const blob of blobs) {
+      const publicAttachment = {
+        blobId: blob.blobId,
+        sessionId: blob.sessionId,
+        ...(blob.itemId === undefined ? {} : { itemId: blob.itemId }),
+        purpose: blob.purpose,
+        ...(blob.contentType === undefined ? {} : { contentType: blob.contentType }),
+        sha256: blob.sha256,
+        sizeBytes: blob.sizeBytes,
+      };
+      const canonicalBytes = canonicalUserDataExportBytes({
+        type: "attachment",
+        value: publicAttachment,
+      });
+      root = nextUserDataExportSnapshotRootSha256(
+        root,
+        "attachment",
+        userDataExportAttachmentLogicalKey(publicAttachment),
+        createHash("sha256").update(canonicalBytes).digest("hex"),
+        canonicalBytes.byteLength,
+      );
+    }
+    const summary: UserDataExportSnapshotSummary = {
+      snapshotAtMs: now,
+      counts,
+      recordCount: records.length + blobs.length,
+      snapshotRootSha256: root,
+    };
+    const prior = this.captureUserDataExportState();
+    try {
+      this.userDataExportSnapshotRecords.set(
+        authorization.requestId,
+        records.map(cloneUserDataExportSnapshotRecord),
+      );
+      this.userDataExportSnapshotBlobs.set(authorization.requestId, blobs.map(clone));
+      this.userDataExportJobs.set(state.job.requestId, clone({
+        ...state.job,
+        snapshot: summary,
+        updatedAtMs: now,
+      }));
+      this.userDataExportRequests.set(state.request.requestId, clone({
+        ...state.request,
+        snapshotAtMs: now,
+        updatedAtMs: now,
+      }));
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      throw error;
+    }
+    return clone(summary);
+  }
+
+  async readUserDataExportSnapshotRecords(
+    authorization: UserDataExportAuthorization,
+    options: { afterOrdinal?: number; limit: number },
+  ): Promise<UserDataExportSnapshotRecordPage> {
+    const state = this.activeUserDataExportClaim(authorization);
+    if (!state?.job.snapshot) throw new UserDataExportStateError("stale or unsealed data export claim");
+    if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 1_000) {
+      throw new Error("data export snapshot page limit must be between 1 and 1000");
+    }
+    if (options.afterOrdinal !== undefined && (
+      !Number.isSafeInteger(options.afterOrdinal) || options.afterOrdinal < 0
+    )) throw new Error("invalid data export snapshot cursor");
+    const all = (this.userDataExportSnapshotRecords.get(authorization.requestId) ?? [])
+      .filter((record) => (
+        record.buildGeneration === authorization.buildGeneration
+        && (options.afterOrdinal === undefined || record.ordinal > options.afterOrdinal)
+      ))
+      .sort((left, right) => left.ordinal - right.ordinal);
+    const data = all.slice(0, options.limit);
+    return {
+      data: data.map(cloneUserDataExportSnapshotRecord),
+      nextOrdinal: all.length > data.length ? data.at(-1)!.ordinal : null,
+    };
+  }
+
+  async readUserDataExportSnapshotBlobs(
+    authorization: UserDataExportAuthorization,
+    options: { afterOrdinal?: number; limit: number },
+  ): Promise<UserDataExportSnapshotBlobPage> {
+    const state = this.activeUserDataExportClaim(authorization);
+    if (!state?.job.snapshot) throw new UserDataExportStateError("stale or unsealed data export claim");
+    if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 1_000) {
+      throw new Error("data export snapshot page limit must be between 1 and 1000");
+    }
+    if (options.afterOrdinal !== undefined && (
+      !Number.isSafeInteger(options.afterOrdinal) || options.afterOrdinal < 0
+    )) throw new Error("invalid data export snapshot cursor");
+    const all = (this.userDataExportSnapshotBlobs.get(authorization.requestId) ?? [])
+      .filter((blob) => (
+        blob.buildGeneration === authorization.buildGeneration
+        && blob.releasedAtMs === undefined
+        && (options.afterOrdinal === undefined || blob.ordinal > options.afterOrdinal)
+      ))
+      .sort((left, right) => left.ordinal - right.ordinal);
+    const data = all.slice(0, options.limit);
+    return {
+      data: data.map(clone),
+      nextOrdinal: all.length > data.length ? data.at(-1)!.ordinal : null,
+    };
+  }
+
+  async getUserDataExportArtifactBuild(
+    authorization: UserDataExportAuthorization,
+  ): Promise<{ artifact: UserDataExportArtifactRecord | null; parts: UserDataExportArtifactPart[] }> {
+    const state = this.activeUserDataExportClaim(authorization);
+    if (!state) throw new UserDataExportStateError("stale data export claim");
+    const artifact = state.job.currentArtifactId
+      ? this.userDataExportArtifacts.get(state.job.currentArtifactId)
+      : undefined;
+    if (artifact && (
+      artifact.requestId !== authorization.requestId
+      || artifact.buildGeneration !== authorization.buildGeneration
+    )) throw new UserDataExportIntegrityError("data export artifact build is corrupt");
+    const parts = artifact
+      ? [...this.userDataExportParts.values()]
+        .filter((part) => part.artifactId === artifact.artifactId)
+        .sort((left, right) => left.partNumber - right.partNumber)
+      : [];
+    return { artifact: artifact ? clone(artifact) : null, parts: parts.map(clone) };
+  }
+
+  async stageUserDataExportPart(
+    authorization: UserDataExportAuthorization,
+    input: StageUserDataExportPartInput,
+  ): Promise<UserDataExportArtifactPart> {
+    if (!Number.isSafeInteger(input.partNumber) || input.partNumber < 0) {
+      throw new Error("invalid data export part number");
+    }
+    validateBlobKey(input.storageKey);
+    validateBlobUploadToken(input.uploadToken);
+    if (input.storageKey !== userDataExportStorageKey(
+      { tenantId: authorization.tenantId, userId: authorization.userId },
+      authorization.requestId,
+      input.artifactId,
+      input.partNumber,
+    )) throw new UserDataExportIntegrityError("data export artifact storage key is not canonical");
+    const now = this.userDataExportNow();
+    const state = this.activeUserDataExportClaim(authorization, now);
+    const artifact = state?.job.currentArtifactId
+      ? this.userDataExportArtifacts.get(state.job.currentArtifactId)
+      : undefined;
+    if (
+      !state
+      || !artifact
+      || artifact.artifactId !== input.artifactId
+      || artifact.state !== "staging"
+      || input.storageBackend !== artifact.storageBackend
+      || input.storageFormat !== artifact.storageFormat
+    ) throw new UserDataExportStateError("stale data export artifact build");
+    const key = this.userDataExportPartKey(input.artifactId, input.partNumber);
+    const existing = this.userDataExportParts.get(key);
+    if (existing) {
+      if (
+        existing.requestId !== authorization.requestId
+        || existing.buildGeneration !== authorization.buildGeneration
+        || existing.storageBackend !== input.storageBackend
+        || existing.storageFormat !== input.storageFormat
+        || existing.storageKey !== input.storageKey
+        || existing.uploadToken !== input.uploadToken
+      ) throw new UserDataExportIntegrityError("data export part identity conflicts");
+      return clone(existing);
+    }
+    if ([...this.userDataExportParts.values()].some((part) => part.storageKey === input.storageKey)) {
+      throw new UserDataExportIntegrityError("data export storage key already exists");
+    }
+    if (input.partNumber > 0) {
+      const prior = this.userDataExportParts.get(
+        this.userDataExportPartKey(input.artifactId, input.partNumber - 1),
+      );
+      if (prior?.state !== "uploaded") {
+        throw new UserDataExportStateError("data export artifact parts must be staged in order");
+      }
+    }
+    const part: UserDataExportArtifactPart = {
+      artifactId: input.artifactId,
+      requestId: authorization.requestId,
+      buildGeneration: authorization.buildGeneration,
+      partNumber: input.partNumber,
+      state: "staging",
+      storageBackend: input.storageBackend,
+      storageFormat: input.storageFormat,
+      storageKey: input.storageKey,
+      uploadToken: input.uploadToken,
+      deletionGeneration: 0,
+      createdAtMs: now,
+    };
+    this.userDataExportParts.set(key, clone(part));
+    return clone(part);
+  }
+
+  async markUserDataExportPartUploaded(
+    authorization: UserDataExportAuthorization,
+    input: MarkUserDataExportPartUploadedInput,
+  ): Promise<UserDataExportArtifactPart> {
+    if (!Number.isSafeInteger(input.partNumber) || input.partNumber < 0) {
+      throw new Error("invalid data export part number");
+    }
+    validateBlobKey(input.descriptor.storageKey);
+    validateBlobContentType(input.descriptor.contentType);
+    if (input.descriptor.contentType !== USER_DATA_EXPORT_CONTENT_TYPE) {
+      throw new Error("invalid data export part content type");
+    }
+    if (!/^[0-9a-f]{64}$/.test(input.descriptor.sha256)) throw new Error("invalid export part hash");
+    if (!Number.isSafeInteger(input.descriptor.sizeBytes) || input.descriptor.sizeBytes < 0) {
+      throw new Error("invalid export part size");
+    }
+    const now = this.userDataExportNow();
+    const state = this.activeUserDataExportClaim(authorization, now);
+    const artifact = state?.job.currentArtifactId
+      ? this.userDataExportArtifacts.get(state.job.currentArtifactId)
+      : undefined;
+    const key = this.userDataExportPartKey(input.artifactId, input.partNumber);
+    const part = this.userDataExportParts.get(key);
+    if (
+      !state
+      || !artifact
+      || artifact.artifactId !== input.artifactId
+      || artifact.state !== "staging"
+      || !part
+      || part.requestId !== authorization.requestId
+      || part.buildGeneration !== authorization.buildGeneration
+      || part.storageKey !== input.descriptor.storageKey
+    ) throw new UserDataExportStateError("stale data export part");
+    if (part.state === "uploaded") {
+      if (
+        part.sha256 !== input.descriptor.sha256
+        || part.sizeBytes !== input.descriptor.sizeBytes
+        || part.contentType !== input.descriptor.contentType
+      ) throw new UserDataExportIntegrityError("uploaded data export part conflicts");
+      return clone(part);
+    }
+    if (part.state !== "staging") throw new UserDataExportStateError("data export part is not uploadable");
+    const uploaded: UserDataExportArtifactPart = {
+      ...part,
+      state: "uploaded",
+      sha256: input.descriptor.sha256,
+      sizeBytes: input.descriptor.sizeBytes,
+      ...(input.descriptor.contentType === undefined ? {} : { contentType: input.descriptor.contentType }),
+      uploadedAtMs: now,
+    };
+    this.userDataExportParts.set(key, clone(uploaded));
+    return clone(uploaded);
+  }
+
+  async completeUserDataExportArtifact(
+    authorization: UserDataExportAuthorization,
+    input: CompleteUserDataExportArtifactInput,
+  ): Promise<UserDataExportRequestRecord> {
+    const now = this.userDataExportNow();
+    const state = this.activeUserDataExportClaim(authorization, now);
+    const artifact = state?.job.currentArtifactId
+      ? this.userDataExportArtifacts.get(state.job.currentArtifactId)
+      : undefined;
+    if (
+      !state?.job.snapshot
+      || !artifact
+      || artifact.artifactId !== input.artifactId
+      || artifact.state !== "staging"
+      || !this.isUserDataExportSubjectCurrent(state.request)
+    ) throw new UserDataExportStateError("stale data export artifact completion");
+    for (const [name, value, minimum] of [
+      ["snapshot timestamp", input.snapshotAtMs, 0],
+      ["part count", input.partCount, 1],
+      ["record count", input.recordCount, 0],
+      ["total size", input.totalSizeBytes, 0],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`invalid data export ${name}`);
+    }
+    if (!/^[0-9a-f]{64}$/.test(input.contentSha256) || !/^[0-9a-f]{64}$/.test(input.manifestSha256)) {
+      throw new Error("invalid data export completion hash");
+    }
+    if (
+      input.snapshotAtMs !== state.job.snapshot.snapshotAtMs
+      || input.recordCount !== state.job.snapshot.recordCount
+    ) throw new UserDataExportIntegrityError("data export completion does not match its snapshot");
+    const parts = [...this.userDataExportParts.values()]
+      .filter((part) => part.artifactId === artifact.artifactId)
+      .sort((left, right) => left.partNumber - right.partNumber);
+    if (
+      parts.length !== input.partCount
+      || parts.some((part, index) => (
+        part.partNumber !== index
+        || part.state !== "uploaded"
+        || part.sha256 === undefined
+        || part.sizeBytes === undefined
+      ))
+    ) throw new UserDataExportIntegrityError("data export artifact parts are incomplete");
+    const totalSizeBytes = parts.reduce((total, part) => total + part.sizeBytes!, 0);
+    if (!Number.isSafeInteger(totalSizeBytes) || totalSizeBytes !== input.totalSizeBytes) {
+      throw new UserDataExportIntegrityError("data export artifact size does not match its parts");
+    }
+    if (userDataExportManifestSha256(parts) !== input.manifestSha256) {
+      throw new UserDataExportIntegrityError("data export artifact manifest hash does not match");
+    }
+    const expiresAtMs = now + state.request.artifactTtlMs;
+    if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= now) {
+      throw new UserDataExportIntegrityError("data export expiry is invalid");
+    }
+    const readyArtifact: UserDataExportArtifactRecord = {
+      ...artifact,
+      state: "ready",
+      partCount: input.partCount,
+      recordCount: input.recordCount,
+      totalSizeBytes: input.totalSizeBytes,
+      contentSha256: input.contentSha256,
+      manifestSha256: input.manifestSha256,
+      snapshotAtMs: input.snapshotAtMs,
+      readyAtMs: now,
+      expiresAtMs,
+    };
+    const readyRequest: UserDataExportRequestRecord = {
+      ...state.request,
+      status: "ready",
+      currentArtifactId: artifact.artifactId,
+      snapshotAtMs: input.snapshotAtMs,
+      readyAtMs: now,
+      expiresAtMs,
+      artifactSha256: input.contentSha256,
+      artifactSizeBytes: input.totalSizeBytes,
+      recordCount: input.recordCount,
+      updatedAtMs: now,
+    };
+    const completedJob = clone({
+      ...state.job,
+      status: "completed" as const,
+      completedAtMs: now,
+      updatedAtMs: now,
+    });
+    delete completedJob.claimToken;
+    delete completedJob.leaseUntilMs;
+    delete completedJob.availableAtMs;
+    delete completedJob.lastErrorCode;
+    const prior = this.captureUserDataExportState();
+    try {
+      this.userDataExportArtifacts.set(artifact.artifactId, clone(readyArtifact));
+      this.userDataExportRequests.set(state.request.requestId, clone(readyRequest));
+      this.userDataExportJobs.set(state.job.requestId, completedJob);
+      this.releaseUserDataExportSnapshot(state.request.requestId, authorization.buildGeneration, now);
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      throw error;
+    }
+    validateUserDataExportRequestRecord(readyRequest);
+    return clone(readyRequest);
+  }
+
+  async retryUserDataExport(
+    authorization: UserDataExportAuthorization,
+    input: RetryUserDataExportInput,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(input.delayMs) || input.delayMs < 0) {
+      throw new Error("invalid data export retry delay");
+    }
+    if (input.maxAttempts !== undefined && (
+      !Number.isInteger(input.maxAttempts) || input.maxAttempts < 1
+    )) throw new Error("invalid data export retry limit");
+    const now = this.userDataExportNow();
+    const state = this.activeUserDataExportClaim(authorization, now);
+    if (!state) return false;
+    if (!this.isUserDataExportSubjectCurrent(state.request)) {
+      const prior = this.captureUserDataExportState();
+      try {
+        this.revokeUserDataExportsForSubject(authorization.tenantId, authorization.userId, now);
+      } catch (error) {
+        this.restoreUserDataExportState(prior);
+        throw error;
+      }
+      return true;
+    }
+    const terminal = input.maxAttempts !== undefined && state.job.attempts >= input.maxAttempts;
+    const prior = this.captureUserDataExportState();
+    try {
+      if (terminal) {
+        if (state.job.currentArtifactId) {
+          this.transitionUserDataExportArtifactToDeletePending(state.job.currentArtifactId, now);
+        }
+        this.releaseUserDataExportSnapshot(
+          state.request.requestId,
+          authorization.buildGeneration,
+          now,
+        );
+        const failedJob = clone({
+          ...state.job,
+          status: "failed" as const,
+          lastErrorCode: input.errorCode,
+          updatedAtMs: now,
+        });
+        delete failedJob.claimToken;
+        delete failedJob.leaseUntilMs;
+        delete failedJob.availableAtMs;
+        this.userDataExportJobs.set(state.job.requestId, failedJob);
+        this.userDataExportRequests.set(state.request.requestId, clone({
+          ...state.request,
+          status: "failed" as const,
+          lastErrorCode: input.errorCode,
+          updatedAtMs: now,
+        }));
+      } else {
+        const availableAtMs = now + input.delayMs;
+        if (!Number.isSafeInteger(availableAtMs)) throw new Error("data export retry time overflow");
+        const queuedJob = clone({
+          ...state.job,
+          status: "queued" as const,
+          availableAtMs,
+          lastErrorCode: input.errorCode,
+          updatedAtMs: now,
+        });
+        delete queuedJob.claimToken;
+        delete queuedJob.leaseUntilMs;
+        this.userDataExportJobs.set(state.job.requestId, queuedJob);
+        this.userDataExportRequests.set(state.request.requestId, clone({
+          ...state.request,
+          status: "queued" as const,
+          lastErrorCode: input.errorCode,
+          updatedAtMs: now,
+        }));
+      }
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      throw error;
+    }
+    return true;
+  }
+
+  async scheduleUserDataExportDeletes(limit: number): Promise<number> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new Error("data export cleanup limit must be between 1 and 1000");
+    }
+    const now = this.userDataExportNow();
+    const prior = this.captureUserDataExportState();
+    try {
+      for (const [key, lease] of this.userDataExportDownloadLeases) {
+        if (lease.leaseUntilMs <= now) this.userDataExportDownloadLeases.delete(key);
+      }
+      const candidates = [...this.userDataExportArtifacts.values()]
+        .filter((artifact) => {
+          if (artifact.state === "deleted") return false;
+          const request = this.userDataExportRequests.get(artifact.requestId);
+          if (!request) throw new UserDataExportIntegrityError("export artifact request is missing");
+          if (
+            artifact.state === "ready"
+            && [...this.userDataExportDownloadLeases.values()].some((lease) => (
+              lease.artifactId === artifact.artifactId && lease.leaseUntilMs > now
+            ))
+          ) return false;
+          if (artifact.state === "delete_pending") return true;
+          if (request.status === "revoked" || request.status === "failed" || request.status === "expired") return true;
+          if (artifact.state === "staging") {
+            const job = this.userDataExportJobs.get(artifact.requestId);
+            const activelyClaimed = job?.status === "building"
+              && job.claimToken !== undefined
+              && job.leaseUntilMs !== undefined
+              && job.leaseUntilMs > now;
+            return artifact.stagingExpiresAtMs <= now && !activelyClaimed;
+          }
+          if (artifact.state === "ready" && artifact.expiresAtMs !== undefined && artifact.expiresAtMs <= now) {
+            return true;
+          }
+          return false;
+        })
+        .sort((left, right) => left.createdAtMs - right.createdAtMs || left.artifactId.localeCompare(right.artifactId))
+        .slice(0, limit);
+      for (const artifact of candidates) {
+        const request = this.userDataExportRequests.get(artifact.requestId)!;
+        if (artifact.state === "staging") {
+          const job = this.userDataExportJobs.get(artifact.requestId);
+          if (!job) throw new UserDataExportIntegrityError("export artifact job is missing");
+          const failedJob = clone({
+            ...job,
+            status: "failed" as const,
+            lastErrorCode: "artifact_invalid" as const,
+            updatedAtMs: now,
+          });
+          delete failedJob.availableAtMs;
+          delete failedJob.claimToken;
+          delete failedJob.leaseUntilMs;
+          this.userDataExportJobs.set(job.requestId, failedJob);
+          this.userDataExportRequests.set(request.requestId, clone({
+            ...request,
+            status: "failed" as const,
+            lastErrorCode: "artifact_invalid" as const,
+            updatedAtMs: now,
+          }));
+          this.releaseUserDataExportSnapshot(request.requestId, artifact.buildGeneration, now);
+        }
+        if (artifact.state === "ready" && artifact.expiresAtMs! <= now && request.status === "ready") {
+          this.userDataExportRequests.set(request.requestId, clone({
+            ...request,
+            status: "expired" as const,
+            updatedAtMs: now,
+          }));
+        }
+        this.transitionUserDataExportArtifactToDeletePending(artifact.artifactId, now);
+      }
+      return candidates.length;
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      throw error;
+    }
+  }
+
+  private findUserDataExportDeleteOutboxById(
+    outboxId: number,
+  ): [string, UserDataExportDeleteOutboxRecord] | undefined {
+    for (const entry of this.userDataExportDeleteOutbox) {
+      if (entry[1].outboxId === outboxId) return entry;
+    }
+    return undefined;
+  }
+
+  private hydrateUserDataExportDeleteOutbox(
+    row: UserDataExportDeleteOutboxRecord,
+  ): UserDataExportDeleteOutboxRecord {
+    const part = this.userDataExportParts.get(this.userDataExportPartKey(row.artifactId, row.partNumber));
+    if (
+      !part
+      || part.requestId !== row.requestId
+      || part.deletionGeneration !== row.deletionGeneration
+      || (part.state !== "delete_pending" && part.state !== "deleted")
+      || part.storageBackend !== row.storageBackend
+      || part.storageFormat !== row.storageFormat
+      || part.storageKey !== row.storageKey
+      || part.uploadToken !== row.uploadToken
+    ) throw new UserDataExportIntegrityError("data export delete outbox is corrupt");
+    return clone(row);
+  }
+
+  async claimUserDataExportDeletes(
+    options: ClaimUserDataExportDeletesOptions,
+  ): Promise<UserDataExportDeleteOutboxRecord[]> {
+    if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100) {
+      throw new Error("data export delete claim limit must be between 1 and 100");
+    }
+    if (!Number.isSafeInteger(options.leaseMs) || options.leaseMs < 1) {
+      throw new Error("invalid data export delete lease");
+    }
+    if (!/^[A-Za-z0-9._:~-]{1,128}$/.test(options.claimToken)) {
+      throw new Error("invalid data export delete claim token");
+    }
+    const now = this.userDataExportNow();
+    const leaseUntilMs = now + options.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("data export delete lease overflow");
+    const candidates = [...this.userDataExportDeleteOutbox.entries()]
+      .filter(([, row]) => (
+        row.completedAtMs === undefined
+        && row.deadLetteredAtMs === undefined
+        && row.availableAtMs <= now
+        && (row.claimToken === undefined || (row.leaseUntilMs !== undefined && row.leaseUntilMs <= now))
+      ))
+      .sort((left, right) => left[1].outboxId - right[1].outboxId)
+      .slice(0, options.limit);
+    const claimed: UserDataExportDeleteOutboxRecord[] = [];
+    const prior = this.captureUserDataExportState();
+    try {
+      for (const [key, row] of candidates) {
+        this.hydrateUserDataExportDeleteOutbox(row);
+        const next = clone({
+          ...row,
+          attempts: row.attempts + 1,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+        });
+        delete next.lastError;
+        this.userDataExportDeleteOutbox.set(key, next);
+        claimed.push(next);
+      }
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      throw error;
+    }
+    return claimed.map(clone);
+  }
+
+  async renewUserDataExportDeleteClaim(
+    outboxId: number,
+    claimToken: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(outboxId) || outboxId < 1 || !Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+      throw new Error("invalid data export delete renewal");
+    }
+    const now = this.userDataExportNow();
+    const entry = this.findUserDataExportDeleteOutboxById(outboxId);
+    if (
+      !entry
+      || entry[1].claimToken !== claimToken
+      || entry[1].leaseUntilMs === undefined
+      || entry[1].leaseUntilMs <= now
+      || entry[1].completedAtMs !== undefined
+      || entry[1].deadLetteredAtMs !== undefined
+    ) return false;
+    const nextLease = now + leaseMs;
+    if (!Number.isSafeInteger(nextLease)) throw new Error("data export delete lease overflow");
+    this.hydrateUserDataExportDeleteOutbox(entry[1]);
+    this.userDataExportDeleteOutbox.set(entry[0], clone({
+      ...entry[1],
+      leaseUntilMs: Math.max(entry[1].leaseUntilMs, nextLease),
+    }));
+    return true;
+  }
+
+  async completeUserDataExportDelete(outboxId: number, claimToken: string): Promise<boolean> {
+    const now = this.userDataExportNow();
+    const entry = this.findUserDataExportDeleteOutboxById(outboxId);
+    if (
+      !entry
+      || entry[1].claimToken !== claimToken
+      || entry[1].leaseUntilMs === undefined
+      || entry[1].leaseUntilMs <= now
+      || entry[1].completedAtMs !== undefined
+      || entry[1].deadLetteredAtMs !== undefined
+    ) return false;
+    const row = this.hydrateUserDataExportDeleteOutbox(entry[1]);
+    const partKey = this.userDataExportPartKey(row.artifactId, row.partNumber);
+    const part = this.userDataExportParts.get(partKey)!;
+    const completed = clone({ ...row, completedAtMs: now });
+    delete completed.claimToken;
+    delete completed.leaseUntilMs;
+    delete completed.lastError;
+    const prior = this.captureUserDataExportState();
+    try {
+      this.userDataExportParts.set(partKey, clone({
+        ...part,
+        state: "deleted" as const,
+        deletedAtMs: now,
+      }));
+      this.userDataExportDeleteOutbox.set(entry[0], completed);
+      const remaining = [...this.userDataExportParts.values()].some((candidate) => (
+        candidate.artifactId === row.artifactId && candidate.state !== "deleted"
+      ));
+      if (!remaining) {
+        const artifact = this.userDataExportArtifacts.get(row.artifactId);
+        if (
+          !artifact
+          || artifact.state !== "delete_pending"
+          || artifact.deletionGeneration !== row.deletionGeneration
+        ) throw new UserDataExportIntegrityError("data export artifact delete state is corrupt");
+        this.userDataExportArtifacts.set(row.artifactId, clone({
+          ...artifact,
+          state: "deleted" as const,
+          deletedAtMs: now,
+        }));
+      }
+    } catch (error) {
+      this.restoreUserDataExportState(prior);
+      throw error;
+    }
+    return true;
+  }
+
+  async retryUserDataExportDelete(
+    outboxId: number,
+    claimToken: string,
+    input: RetryUserDataExportDeleteInput,
+  ): Promise<boolean> {
+    if (!Number.isSafeInteger(input.delayMs) || input.delayMs < 0) {
+      throw new Error("invalid data export delete retry delay");
+    }
+    if (input.maxAttempts !== undefined && (
+      !Number.isInteger(input.maxAttempts) || input.maxAttempts < 1
+    )) throw new Error("invalid data export delete retry limit");
+    const now = this.userDataExportNow();
+    const entry = this.findUserDataExportDeleteOutboxById(outboxId);
+    if (
+      !entry
+      || entry[1].claimToken !== claimToken
+      || entry[1].leaseUntilMs === undefined
+      || entry[1].leaseUntilMs <= now
+      || entry[1].completedAtMs !== undefined
+      || entry[1].deadLetteredAtMs !== undefined
+    ) return false;
+    this.hydrateUserDataExportDeleteOutbox(entry[1]);
+    const next = clone({
+      ...entry[1],
+      lastError: sanitizeUserDataExportError(input.error),
+    });
+    delete next.claimToken;
+    delete next.leaseUntilMs;
+    if (input.maxAttempts !== undefined && next.attempts >= input.maxAttempts) {
+      next.deadLetteredAtMs = now;
+    } else {
+      const availableAtMs = now + input.delayMs;
+      if (!Number.isSafeInteger(availableAtMs)) throw new Error("data export delete retry time overflow");
+      next.availableAtMs = availableAtMs;
+    }
+    this.userDataExportDeleteOutbox.set(entry[0], next);
+    return true;
   }
 
   private lifecycleOutboxMapKey(topic: LifecycleOutboxRecord["topic"], aggregateId: string, generation: number) {

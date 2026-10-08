@@ -26,6 +26,19 @@ describe("runner configuration", () => {
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
     expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED).toBe(false);
     expect(cfg.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
+    expect(cfg.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
+    expect(cfg.DATA_EXPORT_WORKER_ENABLED).toBe(false);
+    expect(cfg.DATA_EXPORT_CLEANUP_ENABLED).toBe(false);
+    expect(cfg.dataExportArtifactsReadable).toBe(false);
+    expect(cfg.DATA_EXPORT_WORKER_POLL_MS).toBe(1_000);
+    expect(cfg.DATA_EXPORT_WORKER_LEASE_MS).toBe(30_000);
+    expect(cfg.DATA_EXPORT_WORKER_BATCH_SIZE).toBe(5);
+    expect(cfg.DATA_EXPORT_SNAPSHOT_PAGE_SIZE).toBe(200);
+    expect(cfg.DATA_EXPORT_ARTIFACT_STAGING_TTL_MS).toBe(15 * 60_000);
+    expect(cfg.DATA_EXPORT_CLEANUP_POLL_MS).toBe(1_000);
+    expect(cfg.DATA_EXPORT_CLEANUP_LEASE_MS).toBe(30_000);
+    expect(cfg.DATA_EXPORT_CLEANUP_BATCH_SIZE).toBe(50);
+    expect(cfg.DATA_EXPORT_DOWNLOAD_LEASE_MS).toBe(30_000);
     expect(cfg.ERASURE_ROUTER_URL).toBeUndefined();
     expect(cfg.ERASURE_WORKER_POLL_MS).toBe(1_000);
     expect(cfg.ERASURE_WORKER_LEASE_MS).toBe(30_000);
@@ -205,6 +218,68 @@ describe("runner configuration", () => {
     })).toThrow(/PURGE_POLICY_EVALUATOR_RETRY_MAX_MS/);
   });
 
+  it("keeps export admission separate from draining accepted jobs and enforces local filesystem ownership", () => {
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_EXPORT_REQUESTS_ENABLED: "1",
+    })).toThrow(/DATA_EXPORT_WORKER_ENABLED=1 is required/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_EXPORT_WORKER_ENABLED: "1",
+    })).toThrow(/DATA_EXPORT_CLEANUP_ENABLED=1 is required/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_EXPORT_CLEANUP_ENABLED: "1",
+    })).toThrow(/BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required/);
+
+    const drainOnly = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+      DATA_EXPORT_WORKER_ENABLED: "1",
+      DATA_EXPORT_CLEANUP_ENABLED: "1",
+    });
+    expect(drainOnly.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
+    expect(drainOnly.DATA_EXPORT_WORKER_ENABLED).toBe(true);
+    expect(drainOnly.DATA_EXPORT_CLEANUP_ENABLED).toBe(true);
+    expect(drainOnly.dataExportArtifactsReadable).toBe(true);
+
+    const admitted = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+      DATA_EXPORT_REQUESTS_ENABLED: "1",
+      DATA_EXPORT_WORKER_ENABLED: "1",
+      DATA_EXPORT_CLEANUP_ENABLED: "1",
+    });
+    expect(admitted.DATA_EXPORT_REQUESTS_ENABLED).toBe(true);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+      DATA_EXPORT_REQUESTS_ENABLED: "true",
+    })).toThrow();
+  });
+
+  it("validates export worker, cleanup and download bounds", () => {
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_WORKER_POLL_MS: "0" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_WORKER_LEASE_MS: "99" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_WORKER_BATCH_SIZE: "101" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_SNAPSHOT_PAGE_SIZE: "1001" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_ARTIFACT_STAGING_TTL_MS: "999" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_CLEANUP_LEASE_MS: "99" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_CLEANUP_BATCH_SIZE: "101" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_DOWNLOAD_LEASE_MS: "999" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_EXPORT_DOWNLOAD_LEASE_MS: "60001" })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_EXPORT_WORKER_RETRY_BASE_MS: "2",
+      DATA_EXPORT_WORKER_RETRY_MAX_MS: "1",
+    })).toThrow(/DATA_EXPORT_WORKER_RETRY_MAX_MS/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_EXPORT_CLEANUP_RETRY_BASE_MS: "2",
+      DATA_EXPORT_CLEANUP_RETRY_MAX_MS: "1",
+    })).toThrow(/DATA_EXPORT_CLEANUP_RETRY_MAX_MS/);
+  });
+
   it("validates lifecycle outbox worker bounds", () => {
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, LIFECYCLE_OUTBOX_BATCH_SIZE: "101" })).toThrow();
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, LIFECYCLE_OUTBOX_LEASE_MS: "0" })).toThrow();
@@ -299,6 +374,25 @@ describe("runner configuration", () => {
       BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
       BLOB_CLEANUP_ENABLED: "1",
     })).toThrow(/shared object-store adapter/);
+  });
+
+  it("fails closed when production export would use the local filesystem adapter", () => {
+    expect(loadConfig(productionEnv).dataExportArtifactsReadable).toBe(false);
+    expect(loadConfig({
+      ...productionEnv,
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+    }).dataExportArtifactsReadable).toBe(false);
+    for (const flag of [
+      "DATA_EXPORT_REQUESTS_ENABLED",
+      "DATA_EXPORT_WORKER_ENABLED",
+      "DATA_EXPORT_CLEANUP_ENABLED",
+    ] as const) {
+      expect(() => loadConfig({
+        ...productionEnv,
+        BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+        [flag]: "1",
+      })).toThrow(/shared object-store adapter/);
+    }
   });
 
   it("never advertises a wildcard bind address", () => {

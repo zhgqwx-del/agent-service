@@ -19,7 +19,7 @@
 
 正式客户端应访问 router 的 `8080`。runner 的 `8787` 用于开发诊断和对照，不应当成为生产环境的公网入口。
 
-当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive/tombstone/outbox、Blob ownership/业务接线、usage 财务分层、默认关闭的 user erasure、`0015` canonical retention policy/multi legal hold，以及`0016`非破坏性purge-policy evaluator/authority substrate。terminal-event dispatcher、Blob cleanup、durable erasure worker、generation-zero tombstone compensation worker与policy evaluator都是runner内部工作循环，不是第三个应用服务或镜像。普通 erasure worker 会在 router 私有 fleet barrier 放行后逐候选隔离确定性 poison，再跨 runner drain active turn、child-first tombstone、reconcile usage，并停在 `awaiting_purge_policy`；compensation worker 把 pre-0009 generation `0` tombstone 补成可审计的 generation `1` terminal proof；默认关闭的evaluator只建立不可执行target/decision/authority证据。三者都不执行物理删除或把request标记completed。异步 export artifact/TTL 执行、tenant/key/provider/auth-secret 撤销、可信时钟/完整内容proof、ready/session purge、completed proof 与 restore replay 仍未完成，因此 M1 尚未闭环。M3/M4 实现后继续加入本文；设计中的目标模块不会提前伪装成可启动服务。
+当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive/tombstone/outbox、Blob ownership/业务接线、usage 财务分层、user erasure、canonical policy/multi legal hold、非破坏性purge-policy evaluator，以及异步user-export artifact/download/TTL。terminal-event dispatcher、Blob cleanup、erasure/legacy compensation/policy evaluator和export build/cleanup都是runner内部工作循环，不是第三个应用服务或镜像。导出worker从MySQL一致性快照生成确定性分片NDJSON，下载持有durable lease，TTL或subject撤销通过独立outbox清理制品。tenant/key/provider/auth-secret撤销、可信时钟/完整内容proof、ready/session destructive purge、completed proof与restore replay仍未完成，因此M1尚未闭环。M3/M4实现后继续加入本文；设计中的目标模块不会提前伪装成可启动服务。
 
 ## 2. 一次性准备
 
@@ -53,7 +53,7 @@ test -f .env || cp .env.example .env
 - 使用 `openssl rand -hex 32` 生成独立的 `SECRETS_MASTER_KEY`；
 - `.env` 不得提交，也不得把密钥复制到命令日志、文档或问题报告中。
 
-`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前端口/地址、Redis、tombstone/Blob gate、`DATA_ERASURE_REQUESTS_ENABLED`、`DATA_GOVERNANCE_MANAGEMENT_ENABLED`、`PURGE_POLICY_EVALUATOR_ENABLED`、`ERASURE_WORKER_ENABLED`、`LEGACY_TOMBSTONE_COMPENSATION_ENABLED` 和 `ERASURE_ROUTER_URL` 等显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。
+`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前端口/地址、Redis、tombstone/Blob gate、`DATA_ERASURE_REQUESTS_ENABLED`、`DATA_GOVERNANCE_MANAGEMENT_ENABLED`、`PURGE_POLICY_EVALUATOR_ENABLED`、`DATA_EXPORT_REQUESTS_ENABLED`、`DATA_EXPORT_WORKER_ENABLED`、`DATA_EXPORT_CLEANUP_ENABLED`、`ERASURE_WORKER_ENABLED`、`LEGACY_TOMBSTONE_COMPENSATION_ENABLED` 和 `ERASURE_ROUTER_URL` 等显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。
 
 ## 3. 启动与停止完整本地栈
 
@@ -69,7 +69,7 @@ scripts/local-service.sh smoke
 2. 从 TypeScript 源码启动一个 runner；
 3. 从 TypeScript 源码启动一个 router，并等待其发现健康 runner。
 
-runner 启动后会同时启动 lifecycle outbox dispatcher、Blob cleanup、durable erasure worker 和 generation-zero compensation worker；policy evaluator只有显式开启后才启动。停止时先并发停两个 erasure workers与evaluator、drain SessionHost，再等待其它 workers。产品配置中 `ERASURE_WORKER_ENABLED`、`LEGACY_TOMBSTONE_COMPENSATION_ENABLED` 与`PURGE_POLICY_EVALUATOR_ENABLED`都默认 `0`；本地脚本为已有job的完整生命周期验证显式开启前两个，但evaluator仍保持`0`。`DATA_ERASURE_REQUESTS_ENABLED` 与 `DATA_GOVERNANCE_MANAGEMENT_ENABLED` 也默认 `0`，所以普通启动不会意外 gate 新 user、开放 policy/hold 管理写面或生成新authority。compensation worker 首次通过 v2 barrier 后可能激活数据库的一次性 cutover，之后该本地库不能再安全配合 pre-`0014` writer。drain/转发的默认超时层级是 runner 10s < router 15s < worker 20s；部署时必须保持这一严格大小关系。Blob gate仍按单 runner filesystem约束开启；该 root不能当成跨 VM/Pod共享数据面。
+runner 启动后会同时启动 lifecycle outbox dispatcher、Blob cleanup、durable erasure、generation-zero compensation，以及user-export build/cleanup worker；policy evaluator只有显式开启后才启动。停止时先停有claim/lease的worker并drain SessionHost，再等待其它循环。产品配置中这些worker均默认`0`；本地脚本为已有job的forward-fix显式开启erasure、compensation和export build/cleanup，但evaluator仍保持`0`。`DATA_ERASURE_REQUESTS_ENABLED`、`DATA_GOVERNANCE_MANAGEMENT_ENABLED`和`DATA_EXPORT_REQUESTS_ENABLED`默认`0`，所以普通启动不会意外gate新user、开放治理管理面或接受新导出。Blob/export仍受单runner filesystem约束；该root不能当成跨VM/Pod共享数据面。
 
 要专门体验当前 user erasure gate，请只对可丢弃 user 显式开启两端 gate 后重启：
 
@@ -127,6 +127,7 @@ MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:erasur
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:erasure-catalog-mysql
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:erasure-usage-mysql
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:legacy-tombstone-mysql
+MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:user-data-export-mysql
 AGENT_SERVICE_CLUSTER=1 CLUSTER_MYSQL_URL="mysql://root@127.0.0.1:3306/agent_service_cluster" CLUSTER_REDIS_URL="redis://127.0.0.1:6379/3" \
   pnpm vitest run test/cluster
 pnpm build:check
@@ -266,15 +267,22 @@ capability 故意拆成两层：`features.dataGovernance` 表示所有 configure
 只在全新、可丢弃的本地 tenant 和测试数据库上运行下面示例。policy version 与审计记录不可变，激活也没有“撤销为未配置”接口；即使 legal hold 可以 release，其历史证据仍会保留。不要对含重要数据的 tenant 试验，也不要把 admin key 写入命令历史、文档或日志。以下 8 个操作覆盖当前全部 policy/hold admin API；示例中的 generation 只适用于尚未操作过的 subject，实际操作必须使用上一步响应中的最新 `controlGeneration`：
 
 ```bash
+(
 BASE=http://127.0.0.1:8080
+umask 077
+set +x
 printf 'Disposable local tenant admin key: '
 IFS= read -r -s ADMIN_KEY
 printf '\n'
-GH=(-H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json")
+CURL_CONFIG="$(mktemp "${TMPDIR:-/tmp}/agent-service-curl.XXXXXX")"
+printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_KEY" > "$CURL_CONFIG"
+unset ADMIN_KEY
+trap 'rm -f "${CURL_CONFIG:-}"' EXIT
+GH=(--config "$CURL_CONFIG" -H "Content-Type: application/json")
 
-# 1/8 注册 immutable policy version；所有 null 都表示 fail closed、不授权到期
+# 1/8 注册 immutable policy version；仅给本地导出制品一小时 TTL，其余 null 仍 fail closed
 curl -sS -X PUT "$BASE/v1/retention-policies/local-safe-v1" "${GH[@]}" \
-  -d '{"policy":{"sessionContentRetentionMs":null,"userErasureGraceMs":null,"operationalUsageRetentionMs":null,"idempotencyReceiptRetentionMs":null,"billingFactRetentionMs":null,"lifecycleAuditRetentionMs":null,"exportArtifactTtlMs":null}}' \
+  -d '{"policy":{"sessionContentRetentionMs":null,"userErasureGraceMs":null,"operationalUsageRetentionMs":null,"idempotencyReceiptRetentionMs":null,"billingFactRetentionMs":null,"lifecycleAuditRetentionMs":null,"exportArtifactTtlMs":3600000}}' \
   | python3 -m json.tool
 
 # 2/8 立即激活；全新 tenant 的 policy control generation 是 0
@@ -304,16 +312,100 @@ curl -sS -X POST "$BASE/v1/legal-holds/hold_local-demo/release" "${GH[@]}" \
   -d '{"expectedControlGeneration":1,"reasonCode":"matter_closed"}' \
   | python3 -m json.tool
 
-unset ADMIN_KEY GH
+rm -f "$CURL_CONFIG"
+trap - EXIT
+unset CURL_CONFIG GH
+)
 ```
 
-policy 激活在 activate 事务的线性化点立即生效：之后新建的 erasure request 必须绑定当时 active policy 的精确 version/hash；激活前已有的 backlog 不会被静默改绑。当前 API 没有未来 `effectiveAt` 参数，不支持定时激活；要切换策略，应先注册新 version，再用当前 generation 执行一次即时 CAS 激活。policy 中的 duration 只是后续 destructive worker 的 canonical authority，当前没有 export worker、tenant revoke、ready/session purge、completed proof 或 restore replay，因而激活 policy 仍不会删除、匿名化或导出任何数据。
+policy 激活在 activate 事务的线性化点立即生效：之后新建的 erasure/export request 必须绑定当时 active policy 的精确 version/hash；激活前已有的 backlog 不会被静默改绑。当前 API 没有未来 `effectiveAt` 参数，不支持定时激活；要切换策略，应先注册新 version，再用当前 generation 执行一次即时 CAS 激活。policy 中只有正值 `exportArtifactTtlMs` 会授权显式请求产生临时导出制品；其它duration仍只是后续destructive worker的authority，激活本身不会删除、匿名化或自动导出数据。
 
 体验结束后可关闭管理 API，但这不会回滚任何 durable policy/hold 状态：
 
 ```bash
 DATA_GOVERNANCE_MANAGEMENT_ENABLED=0 scripts/local-service.sh restart
 ```
+
+### User data export 制品（显式开启后）
+
+`0017` 已实现 user-scoped 异步导出。POST 只负责原子建立request/job；runner内嵌worker从同一个MySQL `REPEATABLE READ WITH CONSISTENT SNAPSHOT`复制白名单数据，再在事务外生成确定性的`ndjson-v1`分片。只有所有分片、manifest和整体SHA-256都验证成功后，状态才变成`ready`；部分制品永远不能下载。内容包含该user的session、turn、item、event、approval、operational usage和附件字节（附件按base64 chunk表示），不含provider/API secret、idempotency material、内部claim/fence或物理Blob locator。
+
+先按上一节为可丢弃tenant激活一个`exportArtifactTtlMs > 0`的policy，再开启两端admission；build/cleanup worker本地默认已开，此处仍显式写出，便于看清依赖关系：
+
+```bash
+DATA_EXPORT_WORKER_ENABLED=1 \
+  DATA_EXPORT_CLEANUP_ENABLED=1 \
+  DATA_EXPORT_REQUESTS_ENABLED=1 \
+  scripts/local-service.sh restart
+BASE=http://127.0.0.1:8080
+curl -sS "$BASE/v1/capabilities" | python3 -m json.tool
+```
+
+预期`features.userDataExport=["artifact-ndjson-v1"]`且`features.dataExportRequests=true`。以下命令不调用模型；`EXPORT_USER`可以是已有少量测试session的可丢弃user。admin key以隐藏输入写入权限为0600的临时curl配置，避免出现在curl进程参数中，并在示例结束或shell退出时删除；不要开启shell trace，也不要把key写入日志或文档：
+
+```bash
+(
+BASE=http://127.0.0.1:8080
+umask 077
+set +x
+printf 'Disposable local tenant admin key: '
+IFS= read -r -s ADMIN_KEY
+printf '\n'
+CURL_CONFIG="$(mktemp "${TMPDIR:-/tmp}/agent-service-export-curl.XXXXXX")"
+printf 'header = "Authorization: Bearer %s"\n' "$ADMIN_KEY" > "$CURL_CONFIG"
+unset ADMIN_KEY
+EXPORT_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-service-export.XXXXXX")"
+trap 'rm -f "${CURL_CONFIG:-}"; rm -rf "${EXPORT_TMP_DIR:-}"' EXIT
+EXPORT_USER=u_export_demo
+
+EXPORT_JSON="$(curl -sS -X POST "$BASE/v1/data-export-requests" \
+  --config "$CURL_CONFIG" \
+  -H "X-User-Id: $EXPORT_USER" \
+  -H "Idempotency-Key: export-local-demo-1")"
+printf '%s' "$EXPORT_JSON" | python3 -m json.tool
+EXPORT_ID="$(printf '%s' "$EXPORT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+
+# 最多轮询30秒；通常依次看到queued/building/ready，terminal失败立即停止
+attempt=1
+EXPORT_STATUS=
+while [ "$attempt" -le 30 ]; do
+  STATUS_JSON="$(curl -sS "$BASE/v1/data-export-requests/$EXPORT_ID" \
+    --config "$CURL_CONFIG" \
+    -H "X-User-Id: $EXPORT_USER")"
+  printf '%s' "$STATUS_JSON" | python3 -m json.tool
+  EXPORT_STATUS="$(printf '%s' "$STATUS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
+  case "$EXPORT_STATUS" in
+    ready) break ;;
+    failed|expired|revoked) printf 'export stopped: %s\n' "$EXPORT_STATUS" >&2; exit 1 ;;
+  esac
+  attempt=$((attempt + 1))
+  sleep 1
+done
+[ "$EXPORT_STATUS" = ready ] || { printf 'export did not become ready in 30s\n' >&2; exit 1; }
+
+# 仅ready可下载；服务会逐分片及整体复核digest，并在传输期间续租
+EXPORT_FILE="$EXPORT_TMP_DIR/$EXPORT_ID.ndjson"
+curl --fail --show-error "$BASE/v1/data-export-requests/$EXPORT_ID/download" \
+  --config "$CURL_CONFIG" \
+  -H "X-User-Id: $EXPORT_USER" \
+  -o "$EXPORT_FILE"
+wc -c "$EXPORT_FILE"
+python3 -c 'import json,sys; [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]; print("valid ndjson")' "$EXPORT_FILE"
+
+rm -f "$CURL_CONFIG"
+rm -rf "$EXPORT_TMP_DIR"
+trap - EXIT
+unset CURL_CONFIG EXPORT_TMP_DIR EXPORT_FILE EXPORT_JSON STATUS_JSON EXPORT_STATUS attempt
+)
+```
+
+同一个tenant/user/key重放返回同一request；同key异义冲突，跨user/tenant status或download与不存在一样返回404。普通TTL会等待活动download lease；subject进入erasure时则撤销导出、阻止新下载并把精确artifact identity交给独立delete outbox。体验结束可只关闭新admission，已有job与cleanup仍继续forward-fix：
+
+```bash
+DATA_EXPORT_REQUESTS_ENABLED=0 scripts/local-service.sh restart
+```
+
+当前export制品复用runner独占filesystem BlobStore，只适合本地单runner。production会在request/build/cleanup任一export flag开启时拒绝启动；共享OSS/S3 adapter完成前不要在多VM/Pod、NFS或各Pod本地卷上开放该能力。
 
 ### User erasure 到安全策略边界（显式开启后）
 
@@ -391,8 +483,8 @@ scripts/local-service.sh smoke
 
 scripts/local-service.sh verify
 # 无真实模型费用；运行 secret/API drift/typecheck、MySQL/Redis 集成、
-# 包含 Blob/usage/subject/retention-policy/legal-hold/policy-evaluator/erasure/legacy-compensation real-MySQL 专项、
-# 0007→...→0016 历史迁移、真实多进程 cluster、
+# 包含 Blob/usage/subject/policy/evaluator/erasure/legacy-compensation/user-export real-MySQL 专项、
+# 0007→...→0017 历史迁移、真实多进程 cluster、
 # SDK 打包和两个应用 bundle 启动门禁
 
 scripts/local-service.sh verify-real
@@ -404,7 +496,7 @@ scripts/local-service.sh acceptance
 
 日常开发至少运行与修改范围匹配的定向测试；合并或里程碑冻结前运行完整 `verify`。真实模型路径只有在明确需要时运行，不能把未重跑的历史结果描述为本轮结果。
 
-手动体验不必等到 M1/M3/M4 全部完成：每个安全切片先做短反馈，能更早发现交互和运维问题；待本地/CI整体范围完成后，再按第 3～6 节做一次完整 walkthrough作为阶段验收。canonical policy/multi legal hold管理和non-destructive evaluator已接线；当前尚未接线的是异步 export artifact/TTL、可信时钟/完整content proof、destructive purge/completion、tenant/key/provider/auth-secret revocation、restore replay、M3扩展和M4生产化，不能提前模拟成已存在。
+手动体验不必等到 M1/M3/M4 全部完成：每个安全切片先做短反馈，能更早发现交互和运维问题；待本地/CI整体范围完成后，再按第 3～6 节做一次完整 walkthrough作为阶段验收。policy/hold、non-destructive evaluator和异步user export已接线；当前尚未接线的是可信时钟/完整content proof、destructive purge/completion、tenant/key/provider/auth-secret revocation、restore replay、M3扩展和M4生产化，不能提前模拟成已存在。
 
 ## 7. 本地源码进程与生产构建产物
 
@@ -476,10 +568,11 @@ GitHub 的主测试 job 固定启动最低支持版本 `mysql:8.0.26` 与 Redis 
 12. 以独立、可见且不得 skip 的 `pnpm test:erasure-purge-policy-mysql` 验证0016 evaluator的原子job建立、request-bound deadline、claim/ABA、live evidence与hold ABA重评、并发锁顺序及seal回滚；主JSON report也强制证明该文件实际执行；
 13. 分别强制运行 `test:erasure-job-mysql`、`test:erasure-session-mysql`、`test:erasure-catalog-mysql`、`test:erasure-usage-mysql`，证明 claim/lease/audit、固定动作/回滚、无正文 completeness scan 及 claim-bound usage/ABA 事务确实执行；主 JSON report 还强制证明真实 MySQL 的 `erasure-worker.mysql.test.ts` 已执行，覆盖 catalog→usage 间 proof 损坏与零部分写；
 14. 以独立、可见且不得 skip 的 `pnpm test:legacy-tombstone-mysql` 验证 generation-zero compensation 的一次性 cutover、claim/ABA、原子发布、失败回滚、owner/child 隔离与幂等重试；
-15. 从冻结历史 schema 验证 `0007 → ... → 0016`；其中独立 `0013 → 0014` 夹具证明 dormant compensation cutover 的 replay/linearization，`0014 → 0015` 夹具证明 legacy hold导入与policy-binding guard，`0015 → 0016`夹具证明原policy/hold/request/content保留、partial-DDL/marker-loss replay、append-only evidence guards、升级后同key异内容写入被拒且原证据保留，以及purge继续dormant；migration wrapper 会核对清单并拒绝任一缺失或 skip 的夹具；
-16. 真实 runner/router 多进程 cluster，包含 remote erasure drain、owner `SIGKILL` takeover以及 quarantine/restart/repair，并通过 v2 fleet barrier；
-17. `pnpm build:check`；
-18. 上传 coverage artifact。
+15. 以独立、可见且不得 skip 的 `pnpm test:user-data-export-mysql` 验证owner隔离、RR一致性snapshot、真实core worker跨层发布、claim/download/delete lease、TTL/撤销清理与失败回滚；主JSON report也强制证明目标文件确实执行；
+16. 从冻结历史 schema 验证 `0007 → ... → 0017`；其中`0016 → 0017`夹具证明原数据保留、partial-DDL/marker-loss replay、append-only guards和nullable staging descriptor契约；migration wrapper会核对清单并拒绝任一缺失或skip的夹具；
+17. 真实 runner/router 多进程 cluster，包含 remote erasure drain、owner `SIGKILL` takeover以及 quarantine/restart/repair，并通过 v2 fleet barrier；
+18. `pnpm build:check`；
+19. 上传 coverage artifact。
 
 MySQL 和 Redis 是拉取的第三方 service images，不是本仓库构建的产品服务。
 
@@ -499,7 +592,7 @@ agent-service/agent-runner:ci
 agent-service/agent-router:ci
 ```
 
-每个镜像都包含 Node 24 slim、该应用 bundle、迁移和 production dependencies。它们是 Linux OCI image，不是 VM磁盘或原生机器码。CI会实际启动镜像并检查 OpenAPI/healthcheck；runner还查询 `schema_migrations`，明确验证最新 `0016_erasure_purge_policy_authority.sql` marker 已由镜像内迁移器写入，并验证 production bootstrap。该 marker 只证明0016 expand schema/guards已安装，不表示evaluator已激活、存在eligible authority，更不表示purge已启用。生产默认仍关闭 Blob filesystem writer/cleanup、erasure admission、普通 erasure worker、compensation worker、data-governance 管理面与policy evaluator，不会绕过未激活边界。
+每个镜像都包含 Node 24 slim、该应用 bundle、迁移和 production dependencies。它们是 Linux OCI image，不是 VM磁盘或原生机器码。CI会实际启动镜像并检查 OpenAPI/healthcheck；runner还查询 `schema_migrations`，明确验证最新 `0017_user_export_jobs_and_artifacts.sql` marker 已由镜像内迁移器写入，并验证 production bootstrap。该 marker 只证明expand schema/guards已安装，不表示export admission/worker已开启。生产默认仍关闭filesystem Blob/export、erasure admission/worker、compensation、governance管理面与policy evaluator，不会绕过未激活边界。
 
 当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前明确上传的 GitHub Actions artifact 只有 coverage。
 
@@ -539,7 +632,9 @@ policy activate 是提交即生效的 generation CAS，不提供未来时间调�
 
 `0016` authority不能直接用于未来purge：eligibility由runner wall clock记录，尚未使用共享数据库/可信时间抵御跨VM forward/slow skew；per-session target也不是turn/item/event/approval的完整owner inventory。destructive executor必须另行提供默认关闭的双端gate，在执行事务中用可信时间和canonical hold重验，owner-scan并写`session_content_receipts`，再核对ready Blob ACK、usage匿名化、receipt/Redis清理、secret撤销和restore-ledger ACK。当前completion固定为false；live evidence或hold generation/projection变化会让旧active projection失效并以新build generation重评，而不是覆盖旧证据。
 
-当前普通 worker 已能逐候选隔离确定性 claim poison、有界请求 abort、child-first tombstone、在 usage 写事务内重验 terminal proof，并停在 `awaiting_purge_policy`；compensation worker 已能保留历史 `deletedAt` 并在一个事务中生成 generation `1` terminal event、两条 outbox intent、append-only audit 和 job completion；evaluator已能形成不可执行的immutable candidate并在live evidence/hold变化后重评。三者都不会让 `session.purge` 可领取、删除内容或完成 user erasure request。物理 purge/completion、export、tenant revoke 与 restore replay 尚未闭环，所以 staging/production admission 仍保持 `0`。任一已配置 target 暂时不可达或仍是旧版本时，POST 都返回 `503`，不能把健康子集误当成已完成 drain；gate=`1` 后 selected target 若能力回退，session/usage 等 user-scoped runtime 也会在转发前返回可重试 `503`。回滚先关闭 router writer gate；一旦已经接受过 gate，仍必须保持 lifecycle-aware fleet；一旦写入任一0013 control event或terminal incident，还必须保持0013-aware reader/worker并forward-fix；一旦0014 cutover激活，则所有 session writer都必须保持0014-aware。私有barrier不能阻止旧worker直连数据库，不能用gate-off或sticky observation作为旧版本回滚许可。status GET 不依赖 router writer gate，继续要求当前 healthy fleet 和 selected target capability，healthy mixed fleet 时 fail-closed；它不承担 POST 的全 configured-fleet 激活判定。该流程也不能替代 tenant key revocation 或 purge。
+`0017` export采用expand→code-aware→worker→admission边界：先迁移，再部署admission=`0`的新router并排空旧router，随后滚动admission=`0`但声明`artifact-ndjson-v1`的新runner。local单runner可以先开启cleanup、再开启build worker，最后开启runner/router admission；关闭admission只停止新POST，已有job、status、download和cleanup继续forward-fix。production在共享对象存储adapter完成前完全不注入filesystem export read surface，也不宣告export capability，request/build/cleanup任一flag为`1`都会拒绝启动。未来接入共享对象存储后，必须以同一image digest在staging验证跨runner可见性、条件发布、下载lease与TTL/撤销删除竞态，不能用NFS或各Pod本地目录模拟。
+
+当前ordinary erasure/compensation/evaluator继续停在不可执行策略边界；export则已能生成、下载并按TTL或subject撤销清理临时制品，但它不删除源数据。物理purge/completion、tenant/key/provider/auth-secret revoke与restore replay尚未闭环，所以staging/production erasure和export admission仍保持`0`。任一configured target不可达或版本不兼容时，writer POST都返回`503`；status/download同样要求code-aware healthy fleet与selected target。关闭router writer gate是第一回滚动作，但不会撤销durable gate、request或immutable evidence；所有forward-only边界仍须保留。
 
 没有云资源时，仍可完成业务代码、协议、迁移、memory/MySQL/Redis 实现、单机 filesystem Blob 行为、本地多进程与容器测试、故障注入、指标定义和部署契约设计；当前 user erasure gate 和 usage 分层也属于这一范围。以下结论必须等待真实环境：共享 OSS/S3 adapter 与 IAM/KMS 的真实集成、云网络和权限正确性、IdP 集成、Kubernetes 滚动发布、真实告警链路、备份恢复目标、云 Redis 灾备以及生产容量。仓库不会为这些未知参数编造可直接部署的 Kubernetes、域名/TLS 或 Secret 配置。
 

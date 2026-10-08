@@ -55,6 +55,7 @@ import {
   BLOB_STORAGE_FORMAT,
   BlobStateError,
   assertBlobBindingsMatch,
+  blobBindingsFromItems,
   isUnexpiredStagingBlob,
   sanitizeBlobDeleteError,
   validateBlobDeleteAck,
@@ -72,7 +73,7 @@ import {
   type ScheduleStaleBlobsOptions,
   type StageBlobInput,
 } from "../blob-lifecycle.js";
-import { validateBlobKey } from "../blob/key.js";
+import { validateBlobKey, validateBlobUploadToken } from "../blob/key.js";
 import {
   assertLifecycleOutboxId,
   parseLifecycleOutboxEnvelope,
@@ -309,6 +310,57 @@ import {
   type ScheduleAwaitingErasurePolicyEvaluationsOptions,
   type SealErasurePurgeAuthorityOptions,
 } from "../erasure-purge-policy.js";
+import {
+  EMPTY_USER_DATA_EXPORT_SNAPSHOT_ROOT_SHA256,
+  USER_DATA_EXPORT_CONTENT_TYPE,
+  USER_DATA_EXPORT_FORMAT,
+  USER_DATA_EXPORT_RECORD_KIND_ORDER,
+  USER_DATA_EXPORT_SCHEMA_VERSION,
+  UserDataExportIdempotencyMismatchError,
+  UserDataExportIntegrityError,
+  UserDataExportPolicyUnavailableError,
+  UserDataExportStateError,
+  canonicalUserDataExportBytes,
+  canonicalUserDataExportJson,
+  nextUserDataExportSnapshotRootSha256,
+  sanitizeExportEvent,
+  sanitizeExportSession,
+  sanitizeExportTurn,
+  sanitizeUserDataExportError,
+  userDataExportAttachmentLogicalKey,
+  userDataExportManifestSha256,
+  userDataExportStorageKey,
+  validateClaimUserDataExportsOptions,
+  validateStartUserDataExportArtifactInput,
+  validateUserDataExportAuthorization,
+  validateUserDataExportRequestInput,
+  validateUserDataExportRequestRecord,
+  type ClaimUserDataExportDeletesOptions,
+  type ClaimUserDataExportsOptions,
+  type CompleteUserDataExportArtifactInput,
+  type MarkUserDataExportPartUploadedInput,
+  type RequestUserDataExportInput,
+  type RetryUserDataExportDeleteInput,
+  type RetryUserDataExportInput,
+  type StageUserDataExportPartInput,
+  type StartUserDataExportArtifactInput,
+  type UserDataExportArtifactPart,
+  type UserDataExportArtifactRecord,
+  type UserDataExportAuthorization,
+  type UserDataExportClaim,
+  type UserDataExportCleanupStore,
+  type UserDataExportDeleteOutboxRecord,
+  type UserDataExportDownloadLease,
+  type UserDataExportJobStore,
+  type UserDataExportRequestRecord,
+  type UserDataExportRequestStore,
+  type UserDataExportSnapshotBlob,
+  type UserDataExportSnapshotBlobPage,
+  type UserDataExportSnapshotEntry,
+  type UserDataExportSnapshotRecord,
+  type UserDataExportSnapshotRecordPage,
+  type UserDataExportSnapshotSummary,
+} from "../data-export.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -387,6 +439,35 @@ const ERASURE_PURGE_AUTHORITY_COLUMNS = `request_id, authority_generation, tenan
   target_root_sha256, tenant_hold_control_generation, tenant_hold_projection_sha256,
   user_hold_control_generation, user_hold_projection_sha256, decision_sha256, authority_sha256,
   created_at_ms`;
+const USER_EXPORT_REQUEST_COLUMNS = `r.request_id, r.tenant_id, r.user_id,
+  r.subject_generation, r.requested_by_key_id, r.idempotency_key_sha256, r.request_sha256,
+  r.export_format, r.export_schema_version, r.policy_version, r.policy_sha256, r.artifact_ttl_ms,
+  r.status, r.active_build_generation, r.active_artifact_id, r.last_error_code, r.created_at_ms,
+  r.updated_at_ms, r.snapshot_at_ms, r.ready_at_ms, r.expires_at_ms, r.revoked_at_ms,
+  a.content_sha256 AS active_artifact_sha256,
+  a.total_size_bytes AS active_artifact_size_bytes,
+  a.record_count AS active_artifact_record_count,
+  a.state AS active_artifact_state`;
+const USER_EXPORT_JOB_COLUMNS = `request_id, tenant_id, user_id, subject_generation,
+  build_generation, status, active_artifact_id, available_at_ms, attempts, claim_token,
+  lease_until_ms, last_error_code, snapshot_at_ms, snapshot_record_count, snapshot_blob_count,
+  snapshot_root_sha256, snapshot_sealed_at_ms, created_at_ms, updated_at_ms, completed_at_ms`;
+const USER_EXPORT_ARTIFACT_COLUMNS = `artifact_id, request_id, tenant_id, user_id,
+  subject_generation, build_generation, export_format, export_schema_version, content_type,
+  content_encoding, storage_backend, storage_format, state, part_count, record_count,
+  total_size_bytes, manifest_sha256, content_sha256, snapshot_root_sha256, policy_version,
+  policy_sha256, artifact_ttl_ms, snapshot_at_ms, staging_expires_at_ms, ready_at_ms,
+  expires_at_ms, delete_after_ms, deleted_at_ms, deletion_generation, created_at_ms,
+  updated_at_ms`;
+const USER_EXPORT_PART_COLUMNS = `artifact_id, part_number, request_id, build_generation,
+  tenant_id, user_id, subject_generation, state, storage_backend, storage_format, storage_key,
+  upload_token, content_type, content_encoding, sha256, size_bytes, record_count,
+  staging_expires_at_ms, uploaded_at_ms, delete_after_ms, deleted_at_ms,
+  deletion_generation, created_at_ms, updated_at_ms`;
+const USER_EXPORT_DELETE_COLUMNS = `outbox_id, artifact_id, part_number, request_id,
+  build_generation, deletion_generation, storage_backend, storage_format, storage_key,
+  upload_token, expected_sha256, expected_size_bytes, available_at_ms, attempts, claim_token,
+  lease_until_ms, last_error, completed_at_ms, dead_lettered_at_ms, created_at_ms`;
 const EMPTY_LEGAL_HOLD_PROJECTION_SHA256 = legalHoldProjectionSha256([]);
 interface LegalHoldContext {
   lifecycle?: SubjectLifecycleRecord;
@@ -883,6 +964,323 @@ function rowToBlobDeleteOutbox(row: Row, requirePending = true): BlobDeleteOutbo
     ...(row.dead_lettered_at_ms == null ? {} : { deadLetteredAtMs: Number(row.dead_lettered_at_ms) }),
     createdAtMs: Number(row.created_at_ms),
   };
+}
+
+type StoredUserDataExportJob = {
+  requestId: string;
+  tenantId: string;
+  userId: string;
+  subjectGeneration: number;
+  buildGeneration: number;
+  status: "queued" | "building" | "completed" | "failed" | "revoked";
+  activeArtifactId?: string;
+  availableAtMs?: number;
+  attempts: number;
+  claimToken?: string;
+  leaseUntilMs?: number;
+  lastErrorCode?: import("../data-export.js").UserDataExportErrorCode;
+  snapshotAtMs?: number;
+  snapshotRecordCount: number;
+  snapshotBlobCount: number;
+  snapshotRootSha256?: string;
+  snapshotSealedAtMs?: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+  completedAtMs?: number;
+};
+
+function storedSafeInteger(value: unknown, name: string, minimum = 0): number {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < minimum) {
+    throw new UserDataExportIntegrityError(`stored ${name} is invalid`);
+  }
+  return number;
+}
+
+function optionalStoredSafeInteger(value: unknown, name: string, minimum = 0): number | undefined {
+  return value == null ? undefined : storedSafeInteger(value, name, minimum);
+}
+
+function rowToUserDataExportRequest(row: Row): UserDataExportRequestRecord {
+  const status = String(row.status) as UserDataExportRequestRecord["status"];
+  const record: UserDataExportRequestRecord = {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
+    subjectGeneration: storedSafeInteger(row.subject_generation, "data export subject generation"),
+    requestedByKeyId: String(row.requested_by_key_id),
+    idempotencyKeySha256: String(row.idempotency_key_sha256),
+    requestHash: String(row.request_sha256),
+    format: String(row.export_format) as typeof USER_DATA_EXPORT_FORMAT,
+    schemaVersion: storedSafeInteger(row.export_schema_version, "data export schema version") as 1,
+    policyVersion: String(row.policy_version),
+    policySha256: String(row.policy_sha256),
+    artifactTtlMs: storedSafeInteger(row.artifact_ttl_ms, "data export artifact TTL", 1),
+    status,
+    currentBuildGeneration: storedSafeInteger(
+      row.active_build_generation,
+      "data export active build generation",
+    ),
+    ...(row.active_artifact_id == null ? {} : { currentArtifactId: String(row.active_artifact_id) }),
+    ...(row.snapshot_at_ms == null
+      ? {}
+      : { snapshotAtMs: storedSafeInteger(row.snapshot_at_ms, "data export snapshot timestamp") }),
+    ...(row.ready_at_ms == null
+      ? {}
+      : { readyAtMs: storedSafeInteger(row.ready_at_ms, "data export ready timestamp") }),
+    ...(row.expires_at_ms == null
+      ? {}
+      : { expiresAtMs: storedSafeInteger(row.expires_at_ms, "data export expiry timestamp") }),
+    ...(row.last_error_code == null
+      ? {}
+      : { lastErrorCode: String(row.last_error_code) as UserDataExportRequestRecord["lastErrorCode"] }),
+    createdAtMs: storedSafeInteger(row.created_at_ms, "data export creation timestamp"),
+    updatedAtMs: storedSafeInteger(row.updated_at_ms, "data export update timestamp"),
+  };
+  if (status === "ready") {
+    if (row.active_artifact_state !== "ready") {
+      throw new UserDataExportIntegrityError("ready data export does not reference a ready artifact");
+    }
+    record.artifactSha256 = String(row.active_artifact_sha256);
+    record.artifactSizeBytes = storedSafeInteger(
+      row.active_artifact_size_bytes,
+      "data export artifact size",
+    );
+    record.recordCount = storedSafeInteger(
+      row.active_artifact_record_count,
+      "data export artifact record count",
+    );
+  }
+  try {
+    validateUserDataExportRequestRecord(record);
+  } catch (error) {
+    if (error instanceof UserDataExportIntegrityError) throw error;
+    throw new UserDataExportIntegrityError("stored data export request is invalid");
+  }
+  return record;
+}
+
+function rowToUserDataExportJob(row: Row): StoredUserDataExportJob {
+  const job: StoredUserDataExportJob = {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
+    subjectGeneration: storedSafeInteger(row.subject_generation, "data export job subject generation"),
+    buildGeneration: storedSafeInteger(row.build_generation, "data export job build generation"),
+    status: String(row.status) as StoredUserDataExportJob["status"],
+    ...(row.active_artifact_id == null ? {} : { activeArtifactId: String(row.active_artifact_id) }),
+    ...(row.available_at_ms == null
+      ? {}
+      : { availableAtMs: storedSafeInteger(row.available_at_ms, "data export job availability") }),
+    attempts: storedSafeInteger(row.attempts, "data export job attempts"),
+    ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+    ...(row.lease_until_ms == null
+      ? {}
+      : { leaseUntilMs: storedSafeInteger(row.lease_until_ms, "data export job lease") }),
+    ...(row.last_error_code == null
+      ? {}
+      : { lastErrorCode: String(row.last_error_code) as StoredUserDataExportJob["lastErrorCode"] }),
+    ...(row.snapshot_at_ms == null
+      ? {}
+      : { snapshotAtMs: storedSafeInteger(row.snapshot_at_ms, "data export job snapshot time") }),
+    snapshotRecordCount: storedSafeInteger(
+      row.snapshot_record_count,
+      "data export snapshot record count",
+    ),
+    snapshotBlobCount: storedSafeInteger(
+      row.snapshot_blob_count,
+      "data export snapshot blob count",
+    ),
+    ...(row.snapshot_root_sha256 == null
+      ? {}
+      : { snapshotRootSha256: String(row.snapshot_root_sha256) }),
+    ...(row.snapshot_sealed_at_ms == null
+      ? {}
+      : { snapshotSealedAtMs: storedSafeInteger(row.snapshot_sealed_at_ms, "data export snapshot seal time") }),
+    createdAtMs: storedSafeInteger(row.created_at_ms, "data export job creation time"),
+    updatedAtMs: storedSafeInteger(row.updated_at_ms, "data export job update time"),
+    ...(row.completed_at_ms == null
+      ? {}
+      : { completedAtMs: storedSafeInteger(row.completed_at_ms, "data export job completion time") }),
+  };
+  if (!["queued", "building", "completed", "failed", "revoked"].includes(job.status)) {
+    throw new UserDataExportIntegrityError("stored data export job status is invalid");
+  }
+  if (
+    (job.claimToken === undefined) !== (job.leaseUntilMs === undefined)
+    || (job.snapshotSealedAtMs !== undefined && (
+      job.snapshotAtMs === undefined
+      || job.snapshotRootSha256 === undefined
+    ))
+  ) throw new UserDataExportIntegrityError("stored data export job envelope is invalid");
+  return job;
+}
+
+function rowToUserDataExportArtifact(row: Row): UserDataExportArtifactRecord {
+  const state = String(row.state) as UserDataExportArtifactRecord["state"];
+  const record: UserDataExportArtifactRecord = {
+    artifactId: String(row.artifact_id),
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
+    subjectGeneration: storedSafeInteger(row.subject_generation, "export artifact subject generation"),
+    buildGeneration: storedSafeInteger(row.build_generation, "export artifact build generation", 1),
+    state,
+    format: String(row.export_format) as typeof USER_DATA_EXPORT_FORMAT,
+    schemaVersion: storedSafeInteger(row.export_schema_version, "export artifact schema version") as 1,
+    contentType: String(row.content_type) as typeof USER_DATA_EXPORT_CONTENT_TYPE,
+    storageBackend: String(row.storage_backend),
+    storageFormat: String(row.storage_format),
+    policyVersion: String(row.policy_version),
+    policySha256: String(row.policy_sha256),
+    snapshotRootSha256: String(row.snapshot_root_sha256),
+    artifactTtlMs: storedSafeInteger(row.artifact_ttl_ms, "export artifact TTL", 1),
+    ...(row.manifest_sha256 == null ? {} : { manifestSha256: String(row.manifest_sha256) }),
+    ...(row.content_sha256 == null ? {} : { contentSha256: String(row.content_sha256) }),
+    ...(row.snapshot_at_ms == null
+      ? {}
+      : { snapshotAtMs: storedSafeInteger(row.snapshot_at_ms, "export artifact snapshot time") }),
+    stagingExpiresAtMs: storedSafeInteger(
+      row.staging_expires_at_ms,
+      "export artifact staging expiry",
+    ),
+    ...(row.ready_at_ms == null
+      ? {}
+      : { readyAtMs: storedSafeInteger(row.ready_at_ms, "export artifact ready time") }),
+    ...(row.expires_at_ms == null
+      ? {}
+      : { expiresAtMs: storedSafeInteger(row.expires_at_ms, "export artifact expiry") }),
+    ...(row.delete_after_ms == null
+      ? {}
+      : { deletePendingAtMs: storedSafeInteger(row.delete_after_ms, "export artifact delete time") }),
+    ...(row.deleted_at_ms == null
+      ? {}
+      : { deletedAtMs: storedSafeInteger(row.deleted_at_ms, "export artifact deleted time") }),
+    deletionGeneration: storedSafeInteger(
+      row.deletion_generation,
+      "export artifact deletion generation",
+    ),
+    createdAtMs: storedSafeInteger(row.created_at_ms, "export artifact creation time"),
+  };
+  if (!["staging", "ready", "delete_pending", "deleted"].includes(state)) {
+    throw new UserDataExportIntegrityError("stored export artifact state is invalid");
+  }
+  if (
+    record.format !== USER_DATA_EXPORT_FORMAT
+    || record.schemaVersion !== USER_DATA_EXPORT_SCHEMA_VERSION
+    || record.contentType !== USER_DATA_EXPORT_CONTENT_TYPE
+    || row.content_encoding !== "identity"
+    || !/^[0-9a-f]{64}$/.test(record.policySha256)
+    || !/^[0-9a-f]{64}$/.test(record.snapshotRootSha256)
+  ) throw new UserDataExportIntegrityError("stored export artifact envelope is invalid");
+  if (row.content_sha256 != null) {
+    record.partCount = storedSafeInteger(row.part_count, "export artifact part count", 1);
+    record.recordCount = storedSafeInteger(row.record_count, "export artifact record count");
+    record.totalSizeBytes = storedSafeInteger(row.total_size_bytes, "export artifact size");
+  }
+  return record;
+}
+
+function rowToUserDataExportPart(row: Row): UserDataExportArtifactPart {
+  const state = String(row.state) as UserDataExportArtifactPart["state"];
+  const record: UserDataExportArtifactPart = {
+    artifactId: String(row.artifact_id),
+    requestId: String(row.request_id),
+    buildGeneration: storedSafeInteger(row.build_generation, "export part build generation", 1),
+    partNumber: storedSafeInteger(row.part_number, "export part number"),
+    state,
+    storageBackend: String(row.storage_backend),
+    storageFormat: String(row.storage_format),
+    storageKey: String(row.storage_key),
+    uploadToken: String(row.upload_token),
+    ...(row.sha256 == null ? {} : { sha256: String(row.sha256) }),
+    ...(row.size_bytes == null
+      ? {}
+      : { sizeBytes: storedSafeInteger(row.size_bytes, "export part size") }),
+    ...(row.content_type == null ? {} : { contentType: String(row.content_type) }),
+    ...(row.uploaded_at_ms == null
+      ? {}
+      : { uploadedAtMs: storedSafeInteger(row.uploaded_at_ms, "export part upload time") }),
+    ...(row.delete_after_ms == null
+      ? {}
+      : { deletePendingAtMs: storedSafeInteger(row.delete_after_ms, "export part delete time") }),
+    ...(row.deleted_at_ms == null
+      ? {}
+      : { deletedAtMs: storedSafeInteger(row.deleted_at_ms, "export part deleted time") }),
+    deletionGeneration: storedSafeInteger(
+      row.deletion_generation,
+      "export part deletion generation",
+    ),
+    createdAtMs: storedSafeInteger(row.created_at_ms, "export part creation time"),
+  };
+  if (
+    !["staging", "uploaded", "delete_pending", "deleted"].includes(state)
+    || row.content_encoding !== "identity"
+    || (record.sha256 === undefined) !== (record.sizeBytes === undefined)
+    || (record.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(record.sha256))
+  ) throw new UserDataExportIntegrityError("stored export artifact part is invalid");
+  return record;
+}
+
+function assertUserDataExportPartOwner(
+  row: Row,
+  expected: {
+    artifactId: string;
+    requestId: string;
+    buildGeneration: number;
+    tenantId?: string;
+    userId?: string;
+    subjectGeneration?: number;
+  },
+): void {
+  if (
+    String(row.artifact_id) !== expected.artifactId
+    || String(row.request_id) !== expected.requestId
+    || storedSafeInteger(row.build_generation, "export part build generation", 1)
+      !== expected.buildGeneration
+    || (expected.tenantId !== undefined && String(row.tenant_id) !== expected.tenantId)
+    || (expected.userId !== undefined && String(row.user_id) !== expected.userId)
+    || (expected.subjectGeneration !== undefined && storedSafeInteger(
+      row.subject_generation,
+      "export part subject generation",
+    ) !== expected.subjectGeneration)
+  ) throw new UserDataExportIntegrityError("data export artifact part owner is invalid");
+}
+
+function rowToUserDataExportDelete(row: Row): UserDataExportDeleteOutboxRecord {
+  const record: UserDataExportDeleteOutboxRecord = {
+    outboxId: storedSafeInteger(row.outbox_id, "export delete outbox id", 1),
+    artifactId: String(row.artifact_id),
+    requestId: String(row.request_id),
+    partNumber: storedSafeInteger(row.part_number, "export delete part number"),
+    deletionGeneration: storedSafeInteger(
+      row.deletion_generation,
+      "export delete generation",
+      1,
+    ),
+    storageBackend: String(row.storage_backend),
+    storageFormat: String(row.storage_format),
+    storageKey: String(row.storage_key),
+    uploadToken: String(row.upload_token),
+    availableAtMs: storedSafeInteger(row.available_at_ms, "export delete availability"),
+    attempts: storedSafeInteger(row.attempts, "export delete attempts"),
+    ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+    ...(row.lease_until_ms == null
+      ? {}
+      : { leaseUntilMs: storedSafeInteger(row.lease_until_ms, "export delete lease") }),
+    ...(row.last_error == null ? {} : { lastError: String(row.last_error) }),
+    ...(row.completed_at_ms == null
+      ? {}
+      : { completedAtMs: storedSafeInteger(row.completed_at_ms, "export delete completion") }),
+    ...(row.dead_lettered_at_ms == null
+      ? {}
+      : { deadLetteredAtMs: storedSafeInteger(row.dead_lettered_at_ms, "export delete dead letter time") }),
+    createdAtMs: storedSafeInteger(row.created_at_ms, "export delete creation time"),
+  };
+  if ((record.claimToken === undefined) !== (record.leaseUntilMs === undefined)) {
+    throw new UserDataExportIntegrityError("stored export delete claim is incomplete");
+  }
+  return record;
 }
 
 function rowToBillingUsageFact(row: Row): BillingUsageFact {
@@ -1784,7 +2182,10 @@ export class MysqlSessionStore implements
   ErasureUsageReconciliationStore,
   LegacyTombstoneCompensationStore,
   RetentionPolicyStore,
-  ErasurePolicyEvaluationStore
+  ErasurePolicyEvaluationStore,
+  UserDataExportRequestStore,
+  UserDataExportJobStore,
+  UserDataExportCleanupStore
 {
   private constructor(private readonly pool: Pool) {}
 
@@ -6725,6 +7126,15 @@ export class MysqlSessionStore implements
           input.atMs,
         ],
       );
+      // Export admission and erasure share the user lifecycle lock. Revocation, download lease
+      // cancellation, snapshot release and artifact deletion intents must commit with the gate so
+      // there is no observable "deleting subject with a still-downloadable export" window.
+      await this.revokeUserExportsForSubject(
+        conn,
+        input.tenantId,
+        input.userId,
+        await this.userExportDatabaseNow(conn),
+      );
       await conn.commit();
       return record;
     } catch (error) {
@@ -11267,6 +11677,3063 @@ export class MysqlSessionStore implements
       [blobId, generation],
     );
     return rows[0] ? rowToBlobDeleteOutbox(rows[0], false) : null;
+  }
+
+  // ---------- user data export ----------
+  private async userExportDatabaseNow(executor: Pool | PoolConnection): Promise<number> {
+    const [rows] = await executor.query<Row[]>(
+      "SELECT FLOOR(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000) AS now_ms",
+    );
+    return storedSafeInteger(rows[0]?.now_ms, "data export database clock");
+  }
+
+  private async loadUserExportRequest(
+    conn: PoolConnection,
+    tenantId: string,
+    userId: string,
+    requestId: string,
+    lock = false,
+  ): Promise<UserDataExportRequestRecord | null> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${USER_EXPORT_REQUEST_COLUMNS}
+         FROM user_export_requests r FORCE INDEX (idx_user_export_requests_owner)
+         LEFT JOIN user_export_artifacts a ON a.artifact_id=r.active_artifact_id
+          AND a.request_id=r.request_id AND a.tenant_id=r.tenant_id AND a.user_id=r.user_id
+          AND a.subject_generation=r.subject_generation
+          AND a.build_generation=r.active_build_generation
+        WHERE r.tenant_id=? AND r.user_id=? AND r.request_id=?
+        ${lock ? "FOR UPDATE" : ""}`,
+      [tenantId, userId, requestId],
+    );
+    return rows[0] ? rowToUserDataExportRequest(rows[0]) : null;
+  }
+
+  private async lockUserExportSubject(
+    conn: PoolConnection,
+    tenantId: string,
+    userId: string,
+    atMs: number,
+    options: { userLock: "FOR SHARE" | "FOR UPDATE"; requireActive: boolean },
+  ): Promise<{ tenant: SubjectLifecycleRecord; user: SubjectLifecycleRecord }> {
+    await this.ensureSubjectLifecycleRows(conn, tenantId, userId, atMs);
+    const [tenantRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [tenantId, tenantId],
+    );
+    const [userRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='user' AND subject_id=? ${options.userLock}`,
+      [tenantId, userId],
+    );
+    const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+    const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
+    if (!tenant || !user) throw new UserDataExportIntegrityError("data export subject gate is missing");
+    if (options.requireActive && (tenant.state !== "active" || user.state !== "active")) {
+      throw new SubjectDeletingError(tenantId, user.state === "active" ? undefined : userId);
+    }
+    return { tenant, user };
+  }
+
+  private async lockActiveUserExportClaim(
+    conn: PoolConnection,
+    authorization: UserDataExportAuthorization,
+    nowMs: number,
+    currentSubjectGeneration: number,
+  ): Promise<{ request: UserDataExportRequestRecord; job: StoredUserDataExportJob } | null> {
+    validateUserDataExportAuthorization(authorization);
+    const request = await this.loadUserExportRequest(
+      conn,
+      authorization.tenantId,
+      authorization.userId,
+      authorization.requestId,
+      true,
+    );
+    const [jobRows] = await conn.query<Row[]>(
+      `SELECT ${USER_EXPORT_JOB_COLUMNS}
+         FROM user_export_jobs WHERE request_id=? FOR UPDATE`,
+      [authorization.requestId],
+    );
+    const job = jobRows[0] ? rowToUserDataExportJob(jobRows[0]) : undefined;
+    if (
+      !request
+      || !job
+      || job.tenantId !== authorization.tenantId
+      || job.userId !== authorization.userId
+      || request.subjectGeneration !== currentSubjectGeneration
+      || job.subjectGeneration !== currentSubjectGeneration
+      || request.subjectGeneration !== authorization.subjectGeneration
+      || job.subjectGeneration !== authorization.subjectGeneration
+      || request.currentBuildGeneration !== authorization.buildGeneration
+      || job.buildGeneration !== authorization.buildGeneration
+      || job.attempts !== authorization.claimAttempt
+      || job.claimToken !== authorization.claimToken
+      || job.leaseUntilMs === undefined
+      || job.leaseUntilMs <= nowMs
+      || request.status !== "building"
+      || job.status !== "building"
+    ) return null;
+    return { request, job };
+  }
+
+  private async userExportSnapshotSummary(
+    conn: PoolConnection,
+    job: StoredUserDataExportJob,
+  ): Promise<UserDataExportSnapshotSummary> {
+    if (
+      job.snapshotAtMs === undefined
+      || job.snapshotSealedAtMs === undefined
+      || job.snapshotRootSha256 === undefined
+    ) throw new UserDataExportIntegrityError("data export snapshot is not sealed");
+    const counts = Object.fromEntries(
+      [...USER_DATA_EXPORT_RECORD_KIND_ORDER, "attachment"].map((kind) => [kind, 0]),
+    ) as Record<UserDataExportSnapshotEntry["type"], number>;
+    const [rows] = await conn.query<Row[]>(
+      `SELECT record_kind, COUNT(*) AS row_count
+         FROM user_export_snapshot_records
+        WHERE request_id=? AND build_generation=?
+        GROUP BY record_kind FOR SHARE`,
+      [job.requestId, job.buildGeneration],
+    );
+    for (const row of rows) {
+      const kind = String(row.record_kind) as keyof typeof counts;
+      if (!USER_DATA_EXPORT_RECORD_KIND_ORDER.includes(kind as never)) {
+        throw new UserDataExportIntegrityError("data export snapshot contains an unknown record kind");
+      }
+      counts[kind] = storedSafeInteger(row.row_count, "data export snapshot kind count");
+    }
+    counts.attachment = job.snapshotBlobCount;
+    const regularCount = USER_DATA_EXPORT_RECORD_KIND_ORDER.reduce(
+      (total, kind) => total + counts[kind],
+      0,
+    );
+    if (regularCount !== job.snapshotRecordCount) {
+      throw new UserDataExportIntegrityError("data export snapshot count does not match its seal");
+    }
+    const recordCount = regularCount + job.snapshotBlobCount;
+    if (!Number.isSafeInteger(recordCount)) {
+      throw new UserDataExportIntegrityError("data export snapshot count overflowed");
+    }
+    return {
+      snapshotAtMs: job.snapshotAtMs,
+      counts,
+      recordCount,
+      snapshotRootSha256: job.snapshotRootSha256,
+    };
+  }
+
+  private async releaseUserExportSnapshot(
+    conn: PoolConnection,
+    requestId: string,
+    buildGeneration: number,
+    atMs: number,
+  ): Promise<void> {
+    await conn.query(
+      `UPDATE user_export_snapshot_blobs
+          SET released_at_ms=COALESCE(released_at_ms, ?)
+        WHERE request_id=? AND build_generation=?`,
+      [atMs, requestId, buildGeneration],
+    );
+    await conn.query(
+      `DELETE FROM user_export_snapshot_records
+        WHERE request_id=? AND build_generation=?`,
+      [requestId, buildGeneration],
+    );
+  }
+
+  private async transitionUserExportArtifactToDeletePending(
+    conn: PoolConnection,
+    artifactId: string,
+    atMs: number,
+  ): Promise<boolean> {
+    const [artifactRows] = await conn.query<Row[]>(
+      `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+         FROM user_export_artifacts WHERE artifact_id=? FOR UPDATE`,
+      [artifactId],
+    );
+    if (!artifactRows[0]) return false;
+    const artifact = rowToUserDataExportArtifact(artifactRows[0]);
+    if (artifact.state === "delete_pending" || artifact.state === "deleted") return false;
+    const deletionGeneration = artifact.deletionGeneration + 1;
+    if (!Number.isSafeInteger(deletionGeneration) || deletionGeneration < 1) {
+      throw new UserDataExportIntegrityError("data export deletion generation is exhausted");
+    }
+    const [partRows] = await conn.query<Row[]>(
+      `SELECT ${USER_EXPORT_PART_COLUMNS}
+         FROM user_export_artifact_parts
+        WHERE artifact_id=? ORDER BY part_number FOR UPDATE`,
+      [artifactId],
+    );
+    const parts = partRows.map((row) => {
+      assertUserDataExportPartOwner(row, {
+        artifactId: artifact.artifactId,
+        requestId: artifact.requestId,
+        buildGeneration: artifact.buildGeneration,
+        tenantId: artifact.tenantId,
+        userId: artifact.userId,
+        subjectGeneration: artifact.subjectGeneration,
+      });
+      return rowToUserDataExportPart(row);
+    });
+    if (parts.some((part, index) => (
+      part.partNumber !== index
+      || part.storageKey !== userDataExportStorageKey(
+        { tenantId: artifact.tenantId, userId: artifact.userId },
+        artifact.requestId,
+        artifact.artifactId,
+        part.partNumber,
+      )
+    ))) {
+      throw new UserDataExportIntegrityError("data export artifact parts are non-contiguous");
+    }
+    await conn.query("DELETE FROM user_export_download_leases WHERE artifact_id=?", [artifactId]);
+    if (parts.length === 0) {
+      await conn.query(
+        `UPDATE user_export_artifacts
+            SET state='deleted', delete_after_ms=?, deleted_at_ms=?, deletion_generation=?,
+                updated_at_ms=?
+          WHERE artifact_id=?`,
+        [atMs, atMs, deletionGeneration, atMs, artifactId],
+      );
+      return true;
+    }
+    for (const part of parts) {
+      if (part.state === "deleted") continue;
+      await conn.query(
+        `UPDATE user_export_artifact_parts
+            SET state='delete_pending', delete_after_ms=?, deletion_generation=?, updated_at_ms=?
+          WHERE artifact_id=? AND part_number=?`,
+        [atMs, deletionGeneration, atMs, artifactId, part.partNumber],
+      );
+      await conn.query(
+        `INSERT INTO user_export_artifact_delete_outbox
+           (artifact_id, part_number, request_id, build_generation, deletion_generation,
+            storage_backend, storage_format, storage_key, upload_token, expected_sha256,
+            expected_size_bytes, available_at_ms, attempts, claim_token, lease_until_ms,
+            last_error, completed_at_ms, dead_lettered_at_ms, created_at_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?, ?,0,NULL,NULL,NULL,NULL,NULL,?)`,
+        [
+          artifactId,
+          part.partNumber,
+          artifact.requestId,
+          artifact.buildGeneration,
+          deletionGeneration,
+          part.storageBackend,
+          part.storageFormat,
+          part.storageKey,
+          part.uploadToken,
+          part.sha256 ?? null,
+          part.sizeBytes ?? null,
+          atMs,
+          atMs,
+        ],
+      );
+    }
+    await conn.query(
+      `UPDATE user_export_artifacts
+          SET state='delete_pending', delete_after_ms=?, deletion_generation=?, updated_at_ms=?
+        WHERE artifact_id=?`,
+      [atMs, deletionGeneration, atMs, artifactId],
+    );
+    return true;
+  }
+
+  private async revokeUserExportsForSubject(
+    conn: PoolConnection,
+    tenantId: string,
+    userId: string,
+    atMs: number,
+  ): Promise<void> {
+    const [requestRows] = await conn.query<Row[]>(
+      `SELECT ${USER_EXPORT_REQUEST_COLUMNS}
+         FROM user_export_requests r FORCE INDEX (idx_user_export_requests_owner)
+         LEFT JOIN user_export_artifacts a ON a.artifact_id=r.active_artifact_id
+          AND a.request_id=r.request_id AND a.tenant_id=r.tenant_id AND a.user_id=r.user_id
+          AND a.subject_generation=r.subject_generation
+          AND a.build_generation=r.active_build_generation
+        WHERE r.tenant_id=? AND r.user_id=?
+        ORDER BY r.created_at_ms, r.request_id FOR UPDATE`,
+      [tenantId, userId],
+    );
+    const requests = requestRows.map(rowToUserDataExportRequest);
+    if (requests.length === 0) return;
+    const requestIds = requests.map((request) => request.requestId);
+    const placeholders = requestIds.map(() => "?").join(",");
+    const [artifactRows] = await conn.query<Row[]>(
+      `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+         FROM user_export_artifacts
+        WHERE request_id IN (${placeholders})
+        ORDER BY request_id, build_generation FOR UPDATE`,
+      requestIds,
+    );
+    await conn.query(
+      `UPDATE user_export_requests
+          SET status='revoked', revoked_at_ms=COALESCE(revoked_at_ms, ?), updated_at_ms=?,
+              last_error_code=NULL
+        WHERE request_id IN (${placeholders}) AND status<>'revoked'`,
+      [atMs, atMs, ...requestIds],
+    );
+    await conn.query(
+      `UPDATE user_export_jobs
+          SET status='revoked', available_at_ms=NULL, claim_token=NULL, lease_until_ms=NULL,
+              last_error_code=NULL, updated_at_ms=?
+        WHERE request_id IN (${placeholders}) AND status<>'revoked'`,
+      [atMs, ...requestIds],
+    );
+    await conn.query(
+      `DELETE FROM user_export_download_leases WHERE request_id IN (${placeholders})`,
+      requestIds,
+    );
+    for (const request of requests) {
+      await this.releaseUserExportSnapshot(
+        conn,
+        request.requestId,
+        request.currentBuildGeneration,
+        atMs,
+      );
+    }
+    for (const row of artifactRows) {
+      const artifact = rowToUserDataExportArtifact(row);
+      await this.transitionUserExportArtifactToDeletePending(conn, artifact.artifactId, atMs);
+    }
+  }
+
+  private async quarantineUserExportBuildCandidate(
+    conn: PoolConnection,
+    tenantId: string,
+    userId: string,
+    requestId: string,
+  ): Promise<void> {
+    await conn.beginTransaction();
+    try {
+      const now = await this.userExportDatabaseNow(conn);
+      // Keep the global export lock order (request -> job -> artifact -> parts). These raw reads
+      // intentionally avoid the normal parsers because a parser failure is what routed the row
+      // here, but their exact owner coordinates are still independently constrained in SQL.
+      const [requestRows] = await conn.query<Row[]>(
+        `SELECT subject_generation, active_build_generation, active_artifact_id
+           FROM user_export_requests
+          WHERE request_id=? AND tenant_id=? AND user_id=?
+            AND status IN ('queued','building') FOR UPDATE`,
+        [requestId, tenantId, userId],
+      );
+      if (requestRows.length === 0) {
+        await conn.commit();
+        return;
+      }
+      const requestIdentity = requestRows[0]!;
+      const [jobRows] = await conn.query<Row[]>(
+        `SELECT subject_generation, build_generation, active_artifact_id
+           FROM user_export_jobs
+          WHERE request_id=? AND tenant_id=? AND user_id=?
+            AND status IN ('queued','building') FOR UPDATE`,
+        [requestId, tenantId, userId],
+      );
+      if (jobRows.length === 0) {
+        await conn.commit();
+        return;
+      }
+      const jobIdentity = jobRows[0]!;
+      const jobArtifactId = jobIdentity.active_artifact_id == null
+        ? undefined
+        : String(jobIdentity.active_artifact_id);
+      const requestArtifactId = requestIdentity.active_artifact_id == null
+        ? undefined
+        : String(requestIdentity.active_artifact_id);
+      // The request parser may be the reason this candidate was quarantined. Use only the raw,
+      // redundantly-bound coordinates here, and never follow one pointer unless request, job and
+      // artifact all agree on the exact owner/generation. A valid partial artifact must enter its
+      // ordinary delete outbox in this same quarantine transaction; otherwise the malformed
+      // request would also poison the cleanup scheduler and strand its object indefinitely.
+      if (
+        jobArtifactId !== undefined
+        && jobArtifactId === requestArtifactId
+        && String(jobIdentity.subject_generation) === String(requestIdentity.subject_generation)
+        && String(jobIdentity.build_generation) === String(requestIdentity.active_build_generation)
+      ) {
+        const [artifactIdentityRows] = await conn.query<Row[]>(
+          `SELECT artifact_id
+             FROM user_export_artifacts
+            WHERE artifact_id=? AND request_id=? AND tenant_id=? AND user_id=?
+              AND subject_generation=? AND build_generation=? FOR UPDATE`,
+          [
+            jobArtifactId,
+            requestId,
+            tenantId,
+            userId,
+            jobIdentity.subject_generation,
+            jobIdentity.build_generation,
+          ],
+        );
+        if (artifactIdentityRows.length === 1) {
+          await this.transitionUserExportArtifactToDeletePending(conn, jobArtifactId, now);
+        }
+      }
+      await conn.query(
+        `UPDATE user_export_jobs
+            SET status='failed', available_at_ms=NULL, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code='artifact_invalid', updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND user_id=? AND status IN ('queued','building')`,
+        [now, requestId, tenantId, userId],
+      );
+      await conn.query(
+        `UPDATE user_export_requests
+            SET status='failed', last_error_code='artifact_invalid', updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND user_id=? AND status IN ('queued','building')`,
+        [now, requestId, tenantId, userId],
+      );
+      await conn.query(
+        `UPDATE user_export_snapshot_blobs SET released_at_ms=COALESCE(released_at_ms, ?)
+          WHERE request_id=?`,
+        [now, requestId],
+      );
+      await conn.query("DELETE FROM user_export_snapshot_records WHERE request_id=?", [requestId]);
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    }
+  }
+
+  async requestUserDataExport(
+    input: RequestUserDataExportInput,
+  ): Promise<UserDataExportRequestRecord> {
+    const staged = structuredClone(input);
+    validateUserDataExportRequestInput(staged);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const { user: subject } = await this.lockUserExportSubject(
+        conn,
+        staged.tenantId,
+        staged.userId,
+        now,
+        { userLock: "FOR UPDATE", requireActive: true },
+      );
+      const [replayRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_REQUEST_COLUMNS}
+           FROM user_export_requests r FORCE INDEX (uk_user_export_requests_idempotency)
+           LEFT JOIN user_export_artifacts a ON a.artifact_id=r.active_artifact_id
+            AND a.request_id=r.request_id AND a.tenant_id=r.tenant_id AND a.user_id=r.user_id
+            AND a.subject_generation=r.subject_generation
+            AND a.build_generation=r.active_build_generation
+          WHERE r.tenant_id=? AND r.user_id=? AND r.idempotency_key_sha256=? FOR UPDATE`,
+        [staged.tenantId, staged.userId, staged.idempotencyKeySha256],
+      );
+      if (replayRows[0]) {
+        const replay = rowToUserDataExportRequest(replayRows[0]);
+        if (replay.requestHash !== staged.requestHash) {
+          throw new UserDataExportIdempotencyMismatchError();
+        }
+        await conn.commit();
+        return replay;
+      }
+      const active = await this.loadValidatedActiveRetentionPolicy(
+        conn,
+        staged.tenantId,
+        "FOR SHARE",
+      );
+      const ttl = active?.policy.policy.exportArtifactTtlMs;
+      if (
+        !active
+        || active.control.effectiveAtMs === undefined
+        || active.control.effectiveAtMs > now
+        || ttl === null
+        || ttl === undefined
+        || ttl <= 0
+      ) throw new UserDataExportPolicyUnavailableError();
+      const record: UserDataExportRequestRecord = {
+        requestId: staged.requestId,
+        tenantId: staged.tenantId,
+        userId: staged.userId,
+        subjectGeneration: subject.generation,
+        requestedByKeyId: staged.requestedByKeyId,
+        idempotencyKeySha256: staged.idempotencyKeySha256,
+        requestHash: staged.requestHash,
+        format: USER_DATA_EXPORT_FORMAT,
+        schemaVersion: USER_DATA_EXPORT_SCHEMA_VERSION,
+        policyVersion: active.policy.policyVersion,
+        policySha256: active.policy.policySha256,
+        artifactTtlMs: ttl,
+        status: "queued",
+        currentBuildGeneration: 0,
+        createdAtMs: now,
+        updatedAtMs: now,
+      };
+      validateUserDataExportRequestRecord(record);
+      try {
+        await conn.query(
+          `INSERT INTO user_export_requests
+             (request_id, tenant_id, user_id, subject_generation, requested_by_key_id,
+              idempotency_key_sha256, request_sha256, export_format, export_schema_version,
+              policy_version, policy_sha256, artifact_ttl_ms, status, active_build_generation,
+              active_artifact_id, last_error_code, created_at_ms, updated_at_ms, snapshot_at_ms,
+              ready_at_ms, expires_at_ms, revoked_at_ms)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'queued',0,NULL,NULL,?,?,NULL,NULL,NULL,NULL)`,
+          [
+            record.requestId,
+            record.tenantId,
+            record.userId,
+            record.subjectGeneration,
+            record.requestedByKeyId,
+            record.idempotencyKeySha256,
+            record.requestHash,
+            record.format,
+            record.schemaVersion,
+            record.policyVersion,
+            record.policySha256,
+            record.artifactTtlMs,
+            now,
+            now,
+          ],
+        );
+        await conn.query(
+          `INSERT INTO user_export_jobs
+             (request_id, tenant_id, user_id, subject_generation, build_generation, status,
+              active_artifact_id, available_at_ms, attempts, claim_token, lease_until_ms,
+              last_error_code, snapshot_at_ms, snapshot_record_count, snapshot_blob_count,
+              snapshot_root_sha256, snapshot_sealed_at_ms, created_at_ms, updated_at_ms,
+              completed_at_ms)
+           VALUES (?,?,?,?,0,'queued',NULL,?,0,NULL,NULL,NULL,NULL,0,0,NULL,NULL,?,?,NULL)`,
+          [record.requestId, record.tenantId, record.userId, record.subjectGeneration, now, now, now],
+        );
+      } catch (error) {
+        if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+          throw new UserDataExportStateError("data export request identity already exists");
+        }
+        throw error;
+      }
+      await conn.commit();
+      return record;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getUserDataExport(
+    tenantId: string,
+    userId: string,
+    requestId: string,
+  ): Promise<UserDataExportRequestRecord | null> {
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        tenantId,
+        userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: false },
+      );
+      let request = await this.loadUserExportRequest(conn, tenantId, userId, requestId, true);
+      if (!request) {
+        await conn.commit();
+        return null;
+      }
+      if (
+        (subject.tenant.state !== "active"
+          || subject.user.state !== "active"
+          || subject.user.generation !== request.subjectGeneration)
+        && request.status !== "revoked"
+      ) {
+        await this.revokeUserExportsForSubject(conn, tenantId, userId, now);
+        request = await this.loadUserExportRequest(conn, tenantId, userId, requestId, false);
+      } else if (request.status === "ready" && request.expiresAtMs! <= now) {
+        await conn.query(
+          `UPDATE user_export_requests
+              SET status='expired', updated_at_ms=?
+            WHERE request_id=? AND status='ready'`,
+          [now, requestId],
+        );
+        // Expiry closes admission for new downloads immediately. Existing downloads keep their
+        // bounded leases; the cleanup scheduler rechecks them under the artifact lock before it
+        // publishes any delete intent.
+        request = await this.loadUserExportRequest(conn, tenantId, userId, requestId, false);
+      }
+      await conn.commit();
+      return request;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async acquireUserDataExportDownload(
+    tenantId: string,
+    userId: string,
+    requestId: string,
+    leaseToken: string,
+    leaseMs: number,
+  ): Promise<UserDataExportDownloadLease | null> {
+    if (!/^[A-Za-z0-9._:~-]{1,128}$/.test(leaseToken)) {
+      throw new Error("invalid export download lease token");
+    }
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > 60_000) {
+      throw new Error("export download lease must be between 1 and 60000 milliseconds");
+    }
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        tenantId,
+        userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: false },
+      );
+      let request = await this.loadUserExportRequest(conn, tenantId, userId, requestId, true);
+      if (!request) {
+        await conn.commit();
+        return null;
+      }
+      if (
+        (subject.tenant.state !== "active"
+          || subject.user.state !== "active"
+          || subject.user.generation !== request.subjectGeneration)
+        && request.status !== "revoked"
+      ) {
+        await this.revokeUserExportsForSubject(conn, tenantId, userId, now);
+        request = await this.loadUserExportRequest(conn, tenantId, userId, requestId, false);
+      }
+      if (!request || request.status !== "ready" || request.expiresAtMs! <= now) {
+        if (request?.status === "ready" && request.expiresAtMs! <= now) {
+          await conn.query(
+            `UPDATE user_export_requests SET status='expired', updated_at_ms=?
+              WHERE request_id=? AND status='ready'`,
+            [now, requestId],
+          );
+        }
+        await conn.commit();
+        return null;
+      }
+      const [artifactRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+           FROM user_export_artifacts WHERE artifact_id=? FOR UPDATE`,
+        [request.currentArtifactId],
+      );
+      const artifact = artifactRows[0] ? rowToUserDataExportArtifact(artifactRows[0]) : undefined;
+      if (
+        !artifact
+        || artifact.requestId !== request.requestId
+        || artifact.tenantId !== tenantId
+        || artifact.userId !== userId
+        || artifact.subjectGeneration !== request.subjectGeneration
+        || artifact.buildGeneration !== request.currentBuildGeneration
+        || artifact.state !== "ready"
+        || artifact.expiresAtMs === undefined
+        || artifact.expiresAtMs <= now
+      ) throw new UserDataExportIntegrityError("ready data export artifact is unavailable");
+      const [partRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_PART_COLUMNS}
+           FROM user_export_artifact_parts WHERE artifact_id=? ORDER BY part_number FOR SHARE`,
+        [artifact.artifactId],
+      );
+      const parts = partRows.map((row) => {
+        assertUserDataExportPartOwner(row, {
+          artifactId: artifact.artifactId,
+          requestId: artifact.requestId,
+          buildGeneration: artifact.buildGeneration,
+          tenantId: artifact.tenantId,
+          userId: artifact.userId,
+          subjectGeneration: artifact.subjectGeneration,
+        });
+        return rowToUserDataExportPart(row);
+      });
+      if (
+        artifact.partCount === undefined
+        || parts.length !== artifact.partCount
+        || parts.some((part, index) => (
+          part.partNumber !== index
+          || part.state !== "uploaded"
+          || part.sha256 === undefined
+          || part.sizeBytes === undefined
+          || part.storageKey !== userDataExportStorageKey(
+            { tenantId, userId },
+            request.requestId,
+            artifact.artifactId,
+            part.partNumber,
+          )
+        ))
+      ) throw new UserDataExportIntegrityError("ready data export artifact parts are incomplete");
+      await conn.query(
+        "DELETE FROM user_export_download_leases WHERE artifact_id=? AND lease_until_ms<=?",
+        [artifact.artifactId, now],
+      );
+      const [leaseRows] = await conn.query<Row[]>(
+        `SELECT artifact_id, lease_token, tenant_id, user_id, request_id, build_generation,
+                artifact_deletion_generation, lease_until_ms, created_at_ms, updated_at_ms
+           FROM user_export_download_leases
+          WHERE artifact_id=? AND lease_token=? FOR UPDATE`,
+        [artifact.artifactId, leaseToken],
+      );
+      const existing = leaseRows[0];
+      if (existing && (
+        existing.tenant_id !== tenantId
+        || existing.user_id !== userId
+        || existing.request_id !== requestId
+        || Number(existing.build_generation) !== artifact.buildGeneration
+        || Number(existing.artifact_deletion_generation) !== artifact.deletionGeneration
+      )) throw new UserDataExportIntegrityError("data export download lease identity conflicts");
+      const createdAtMs = existing && Number(existing.lease_until_ms) > now
+        ? storedSafeInteger(existing.created_at_ms, "data export download lease creation time")
+        : now;
+      const hardDeadline = createdAtMs + 10 * 60_000;
+      const requestedUntilMs = now + leaseMs;
+      const existingLeaseUntilMs = existing
+        ? storedSafeInteger(existing.lease_until_ms, "data export download lease expiry")
+        : 0;
+      const leaseUntilMs = Math.min(
+        hardDeadline,
+        Math.max(existingLeaseUntilMs, requestedUntilMs),
+      );
+      if (
+        !Number.isSafeInteger(hardDeadline)
+        || !Number.isSafeInteger(requestedUntilMs)
+        || !Number.isSafeInteger(leaseUntilMs)
+        || leaseUntilMs <= now
+      ) {
+        throw new Error("data export download lease expiry overflow");
+      }
+      await conn.query(
+        `INSERT INTO user_export_download_leases
+           (artifact_id, lease_token, tenant_id, user_id, request_id, build_generation,
+            artifact_deletion_generation, lease_until_ms, created_at_ms, updated_at_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE lease_until_ms=VALUES(lease_until_ms),
+           created_at_ms=VALUES(created_at_ms), updated_at_ms=VALUES(updated_at_ms)`,
+        [
+          artifact.artifactId,
+          leaseToken,
+          tenantId,
+          userId,
+          requestId,
+          artifact.buildGeneration,
+          artifact.deletionGeneration,
+          leaseUntilMs,
+          createdAtMs,
+          now,
+        ],
+      );
+      await conn.commit();
+      return { request, artifact, parts, leaseToken, leaseUntilMs };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewUserDataExportDownload(
+    artifactId: string,
+    leaseToken: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    if (
+      !/^[A-Za-z0-9._:~-]{1,128}$/.test(leaseToken)
+      || !Number.isSafeInteger(leaseMs)
+      || leaseMs < 1
+      || leaseMs > 60_000
+    ) return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT l.lease_until_ms, l.created_at_ms, l.artifact_deletion_generation,
+                a.state, a.deletion_generation
+           FROM user_export_download_leases l
+           JOIN user_export_artifacts a ON a.artifact_id=l.artifact_id
+            AND a.request_id=l.request_id AND a.tenant_id=l.tenant_id AND a.user_id=l.user_id
+            AND a.build_generation=l.build_generation
+           JOIN user_export_requests r ON r.request_id=a.request_id
+            AND r.tenant_id=a.tenant_id AND r.user_id=a.user_id
+            AND r.subject_generation=a.subject_generation
+            AND r.active_build_generation=a.build_generation
+            AND r.active_artifact_id=a.artifact_id
+           JOIN subject_lifecycle tl ON tl.tenant_id=a.tenant_id
+            AND tl.subject_kind='tenant' AND tl.subject_id=a.tenant_id AND tl.state='active'
+           JOIN subject_lifecycle ul ON ul.tenant_id=a.tenant_id
+            AND ul.subject_kind='user' AND ul.subject_id=a.user_id AND ul.state='active'
+            AND ul.generation=a.subject_generation
+          WHERE l.artifact_id=? AND l.lease_token=? FOR UPDATE`,
+        [artifactId, leaseToken],
+      );
+      const row = rows[0];
+      if (
+        !row
+        || Number(row.lease_until_ms) <= now
+        || row.state !== "ready"
+        || Number(row.artifact_deletion_generation) !== Number(row.deletion_generation)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const hardDeadline = storedSafeInteger(
+        row.created_at_ms,
+        "data export download lease creation time",
+      ) + 10 * 60_000;
+      const leaseUntilMs = Math.min(hardDeadline, now + leaseMs);
+      if (!Number.isSafeInteger(leaseUntilMs) || leaseUntilMs <= now) {
+        await conn.commit();
+        return false;
+      }
+      await conn.query(
+        `UPDATE user_export_download_leases
+            SET lease_until_ms=GREATEST(lease_until_ms, ?), updated_at_ms=?
+          WHERE artifact_id=? AND lease_token=?`,
+        [leaseUntilMs, now, artifactId, leaseToken],
+      );
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async releaseUserDataExportDownload(artifactId: string, leaseToken: string): Promise<void> {
+    if (!/^[A-Za-z0-9._:~-]{1,128}$/.test(leaseToken)) return;
+    await this.pool.query(
+      "DELETE FROM user_export_download_leases WHERE artifact_id=? AND lease_token=?",
+      [artifactId, leaseToken],
+    );
+  }
+
+  async claimUserDataExports(
+    options: ClaimUserDataExportsOptions,
+  ): Promise<UserDataExportClaim[]> {
+    validateClaimUserDataExportsOptions(options);
+    const observedNow = await this.userExportDatabaseNow(this.pool);
+    const [candidateRows] = await this.pool.query<Row[]>(
+      `SELECT j.request_id, j.tenant_id, j.user_id
+         FROM user_export_jobs j FORCE INDEX (idx_user_export_jobs_claim)
+         JOIN user_export_requests r ON r.request_id=j.request_id
+          AND r.tenant_id=j.tenant_id AND r.user_id=j.user_id
+          AND r.subject_generation=j.subject_generation
+         JOIN subject_lifecycle tl ON tl.tenant_id=j.tenant_id
+          AND tl.subject_kind='tenant' AND tl.subject_id=j.tenant_id AND tl.state='active'
+         JOIN subject_lifecycle ul ON ul.tenant_id=j.tenant_id
+          AND ul.subject_kind='user' AND ul.subject_id=j.user_id AND ul.state='active'
+          AND ul.generation=j.subject_generation
+        WHERE j.status IN ('queued','building')
+          AND r.status IN ('queued','building')
+          AND ((j.status='queued' AND j.available_at_ms IS NOT NULL
+                AND j.available_at_ms<=? AND j.claim_token IS NULL
+                AND j.lease_until_ms IS NULL)
+            OR (j.status='building' AND j.claim_token IS NOT NULL
+                AND j.lease_until_ms IS NOT NULL AND j.lease_until_ms<=?))
+        ORDER BY j.available_at_ms, j.request_id
+        LIMIT ?`,
+      [observedNow, observedNow, options.limit],
+    );
+    const claims: UserDataExportClaim[] = [];
+    for (const candidate of candidateRows) {
+      const tenantId = String(candidate.tenant_id);
+      const userId = String(candidate.user_id);
+      const requestId = String(candidate.request_id);
+      const conn = await this.pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const now = await this.userExportDatabaseNow(conn);
+        const subject = await this.lockUserExportSubject(
+          conn,
+          tenantId,
+          userId,
+          now,
+          { userLock: "FOR SHARE", requireActive: true },
+        );
+        const request = await this.loadUserExportRequest(conn, tenantId, userId, requestId, true);
+        const [jobRows] = await conn.query<Row[]>(
+          `SELECT ${USER_EXPORT_JOB_COLUMNS}
+             FROM user_export_jobs WHERE request_id=? FOR UPDATE`,
+          [requestId],
+        );
+        const job = jobRows[0] ? rowToUserDataExportJob(jobRows[0]) : undefined;
+        const claimableQueued = job?.status === "queued"
+          && job.availableAtMs !== undefined
+          && job.availableAtMs <= now
+          && job.claimToken === undefined
+          && job.leaseUntilMs === undefined;
+        const claimableTakeover = job?.status === "building"
+          && job.claimToken !== undefined
+          && job.leaseUntilMs !== undefined
+          && job.leaseUntilMs <= now;
+        if (
+          !request
+          || !job
+          || request.subjectGeneration !== subject.user.generation
+          || job.subjectGeneration !== subject.user.generation
+          || request.status !== "queued" && request.status !== "building"
+          || (!claimableQueued && !claimableTakeover)
+        ) {
+          await conn.commit();
+          continue;
+        }
+        const sealed = job.snapshotSealedAtMs !== undefined;
+        const buildGeneration = sealed ? job.buildGeneration : job.buildGeneration + 1;
+        const claimAttempt = job.attempts + 1;
+        const leaseUntilMs = now + options.leaseMs;
+        if (
+          !Number.isSafeInteger(buildGeneration)
+          || buildGeneration < 1
+          || !Number.isSafeInteger(claimAttempt)
+          || claimAttempt < 1
+          || !Number.isSafeInteger(leaseUntilMs)
+        ) throw new UserDataExportIntegrityError("data export claim counter overflowed");
+        if (!sealed && job.activeArtifactId !== undefined) {
+          throw new UserDataExportIntegrityError("unsealed data export job references an artifact");
+        }
+        await conn.query(
+          `UPDATE user_export_jobs
+              SET status='building', build_generation=?, attempts=?, claim_token=?,
+                  lease_until_ms=?, available_at_ms=NULL, last_error_code=NULL, updated_at_ms=?
+            WHERE request_id=?`,
+          [
+            buildGeneration,
+            claimAttempt,
+            options.claimToken,
+            leaseUntilMs,
+            now,
+            requestId,
+          ],
+        );
+        await conn.query(
+          `UPDATE user_export_requests
+              SET status='building', active_build_generation=?,
+                  active_artifact_id=?, last_error_code=NULL, updated_at_ms=?
+            WHERE request_id=?`,
+          [buildGeneration, sealed ? (job.activeArtifactId ?? null) : null, now, requestId],
+        );
+        await conn.commit();
+        claims.push({
+          requestId,
+          tenantId,
+          userId,
+          subjectGeneration: request.subjectGeneration,
+          buildGeneration,
+          claimAttempt,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+          policyVersion: request.policyVersion,
+          policySha256: request.policySha256,
+          artifactTtlMs: request.artifactTtlMs,
+        });
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        if (error instanceof SubjectDeletingError) continue;
+        if (error instanceof UserDataExportIntegrityError) {
+          await this.quarantineUserExportBuildCandidate(conn, tenantId, userId, requestId);
+          continue;
+        }
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    return claims;
+  }
+
+  async renewUserDataExportClaim(
+    authorization: UserDataExportAuthorization,
+    leaseMs: number,
+  ): Promise<boolean> {
+    validateUserDataExportAuthorization(authorization);
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+      throw new Error("invalid data export lease duration");
+    }
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn,
+        authorization,
+        now,
+        subject.user.generation,
+      );
+      if (!state) {
+        await conn.commit();
+        return false;
+      }
+      const leaseUntilMs = now + leaseMs;
+      if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("data export lease expiry overflow");
+      await conn.query(
+        `UPDATE user_export_jobs
+            SET lease_until_ms=GREATEST(lease_until_ms, ?), updated_at_ms=?
+          WHERE request_id=?`,
+        [leaseUntilMs, now, authorization.requestId],
+      );
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if (error instanceof SubjectDeletingError) return false;
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async startUserDataExportArtifact(
+    authorization: UserDataExportAuthorization,
+    input: StartUserDataExportArtifactInput,
+  ): Promise<UserDataExportArtifactRecord> {
+    validateUserDataExportAuthorization(authorization);
+    validateStartUserDataExportArtifactInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn,
+        authorization,
+        now,
+        subject.user.generation,
+      );
+      if (!state) throw new UserDataExportStateError("data export claim is no longer active");
+      if (
+        state.job.snapshotSealedAtMs === undefined
+        || state.job.snapshotRootSha256 === undefined
+        || state.job.snapshotAtMs === undefined
+      ) throw new UserDataExportStateError("data export snapshot must be sealed before artifact creation");
+      if (state.job.activeArtifactId !== undefined) {
+        const [rows] = await conn.query<Row[]>(
+          `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+             FROM user_export_artifacts WHERE artifact_id=? FOR UPDATE`,
+          [state.job.activeArtifactId],
+        );
+        if (!rows[0]) throw new UserDataExportIntegrityError("data export artifact pointer is dangling");
+        const artifact = rowToUserDataExportArtifact(rows[0]);
+        if (
+          artifact.artifactId !== input.artifactId
+          || artifact.storageBackend !== input.storageBackend
+          || artifact.storageFormat !== input.storageFormat
+          || artifact.requestId !== authorization.requestId
+          || artifact.buildGeneration !== authorization.buildGeneration
+        ) throw new UserDataExportIntegrityError("data export artifact replay conflicts");
+        await conn.commit();
+        return artifact;
+      }
+      const stagingExpiresAtMs = now + input.stagingTtlMs;
+      if (!Number.isSafeInteger(stagingExpiresAtMs)) {
+        throw new Error("data export artifact staging expiry overflow");
+      }
+      try {
+        await conn.query(
+          `INSERT INTO user_export_artifacts
+             (artifact_id, request_id, tenant_id, user_id, subject_generation, build_generation,
+              export_format, export_schema_version, content_type, content_encoding,
+              storage_backend, storage_format, state, part_count, record_count, total_size_bytes,
+              manifest_sha256, content_sha256, snapshot_root_sha256, policy_version,
+              policy_sha256, artifact_ttl_ms, snapshot_at_ms, staging_expires_at_ms, ready_at_ms,
+              expires_at_ms, delete_after_ms, deleted_at_ms, deletion_generation, created_at_ms,
+              updated_at_ms)
+           VALUES (?,?,?,?,?,?,?,? ,?,'identity',?,?,'staging',0,0,0,NULL,NULL,?,?,?, ?,?, ?,NULL,
+                   NULL,NULL,NULL,0,?,?)`,
+          [
+            input.artifactId,
+            authorization.requestId,
+            authorization.tenantId,
+            authorization.userId,
+            authorization.subjectGeneration,
+            authorization.buildGeneration,
+            USER_DATA_EXPORT_FORMAT,
+            USER_DATA_EXPORT_SCHEMA_VERSION,
+            USER_DATA_EXPORT_CONTENT_TYPE,
+            input.storageBackend,
+            input.storageFormat,
+            state.job.snapshotRootSha256,
+            state.request.policyVersion,
+            state.request.policySha256,
+            state.request.artifactTtlMs,
+            state.job.snapshotAtMs,
+            stagingExpiresAtMs,
+            now,
+            now,
+          ],
+        );
+      } catch (error) {
+        if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+          throw new UserDataExportIntegrityError("data export artifact identity conflicts");
+        }
+        throw error;
+      }
+      await conn.query(
+        "UPDATE user_export_jobs SET active_artifact_id=?, updated_at_ms=? WHERE request_id=?",
+        [input.artifactId, now, authorization.requestId],
+      );
+      await conn.query(
+        "UPDATE user_export_requests SET active_artifact_id=?, updated_at_ms=? WHERE request_id=?",
+        [input.artifactId, now, authorization.requestId],
+      );
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+           FROM user_export_artifacts WHERE artifact_id=?`,
+        [input.artifactId],
+      );
+      if (!rows[0]) throw new UserDataExportIntegrityError("data export artifact insert was lost");
+      const artifact = rowToUserDataExportArtifact(rows[0]);
+      await conn.commit();
+      return artifact;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async captureAndSealUserDataExportSnapshot(
+    authorization: UserDataExportAuthorization,
+  ): Promise<UserDataExportSnapshotSummary> {
+    validateUserDataExportAuthorization(authorization);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.query("START TRANSACTION WITH CONSISTENT SNAPSHOT");
+      const snapshotAtMs = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        snapshotAtMs,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn,
+        authorization,
+        snapshotAtMs,
+        subject.user.generation,
+      );
+      if (!state) throw new UserDataExportStateError("data export claim is no longer active");
+      if (state.job.snapshotSealedAtMs !== undefined) {
+        const summary = await this.userExportSnapshotSummary(conn, state.job);
+        await conn.commit();
+        return summary;
+      }
+      if (
+        state.job.snapshotAtMs !== undefined
+        || state.job.snapshotRootSha256 !== undefined
+        || state.job.snapshotRecordCount !== 0
+        || state.job.snapshotBlobCount !== 0
+      ) throw new UserDataExportIntegrityError("unsealed data export snapshot state is not pristine");
+      const [existingRecordRows] = await conn.query<Row[]>(
+        `SELECT ordinal FROM user_export_snapshot_records
+          WHERE request_id=? AND build_generation=? LIMIT 1`,
+        [authorization.requestId, authorization.buildGeneration],
+      );
+      const [existingBlobRows] = await conn.query<Row[]>(
+        `SELECT ordinal FROM user_export_snapshot_blobs
+          WHERE request_id=? AND build_generation=? LIMIT 1`,
+        [authorization.requestId, authorization.buildGeneration],
+      );
+      if (existingRecordRows[0] || existingBlobRows[0]) {
+        throw new UserDataExportIntegrityError("unsealed data export snapshot has partial durable rows");
+      }
+
+      const [sessionRows] = await conn.query<Row[]>(
+        `SELECT s.* FROM sessions s FORCE INDEX (idx_sessions_tenant_user)
+          WHERE s.tenant_id=? AND s.user_id=? ORDER BY s.session_id`,
+        [authorization.tenantId, authorization.userId],
+      );
+      const sessions = sessionRows.map((row) => {
+        const parsed = SessionSchema.parse(rowToSession(row));
+        if (
+          parsed.id !== row.session_id
+          || parsed.tenantId !== authorization.tenantId
+          || parsed.userId !== authorization.userId
+          || !Number.isSafeInteger(parsed.lastSeq)
+          || parsed.lastSeq < 1
+        ) throw new UserDataExportIntegrityError("data export session ownership is invalid");
+        return {
+          row,
+          value: parsed,
+          deletedAtMs: optionalStoredSafeInteger(
+            row.deleted_at_ms,
+            "data export session deletion time",
+          ),
+        };
+      });
+      const sessionIds = sessions.map(({ value }) => value.id);
+      const sessionIdSet = new Set(sessionIds);
+      const sessionUsage = await this.loadSessionUsageSummaries(conn, sessionIds);
+      const projectedSessions = sessions.map(({ row, value, deletedAtMs }) => ({
+        row,
+        value: SessionSchema.parse(this.projectSessionUsage(value, sessionUsage.get(value.id))),
+        deletedAtMs,
+      }));
+
+      const [turnRows] = await conn.query<Row[]>(
+        `SELECT t.*
+           FROM turns t
+           JOIN sessions s ON s.session_id=t.session_id
+          WHERE s.tenant_id=? AND s.user_id=?
+          ORDER BY t.session_id, t.turn_id`,
+        [authorization.tenantId, authorization.userId],
+      );
+      const rawTurns = turnRows.map((row) => {
+        const value = TurnSchema.parse(parse<unknown>(row.body));
+        if (
+          value.id !== row.turn_id
+          || value.sessionId !== row.session_id
+          || row.user_id !== authorization.userId
+          || !sessionIdSet.has(value.sessionId)
+        ) throw new UserDataExportIntegrityError("data export turn ownership is invalid");
+        return value;
+      });
+      const turnIdsBySession = new Map<string, string[]>();
+      for (const turn of rawTurns) {
+        const ids = turnIdsBySession.get(turn.sessionId) ?? [];
+        ids.push(turn.id);
+        turnIdsBySession.set(turn.sessionId, ids);
+      }
+      const turnUsage = new Map<string, UsageProjectionSummary>();
+      for (const [sessionId, turnIds] of turnIdsBySession) {
+        for (const [turnId, summary] of await this.loadTurnUsageSummaries(conn, sessionId, turnIds)) {
+          turnUsage.set(turnId, summary);
+        }
+      }
+      const turns = rawTurns.map((turn) => TurnSchema.parse(
+        this.projectTurnUsage(turn, turnUsage.get(turn.id)),
+      ));
+      const turnById = new Map(turns.map((turn) => [turn.id, turn]));
+
+      const [itemRows] = await conn.query<Row[]>(
+        `SELECT i.*
+           FROM items i
+           JOIN sessions s ON s.session_id=i.session_id
+          WHERE s.tenant_id=? AND s.user_id=?
+          ORDER BY i.session_id, i.item_id`,
+        [authorization.tenantId, authorization.userId],
+      );
+      let items = itemRows.map((row) => {
+        const value = ItemSchema.parse(parse<unknown>(row.body));
+        const turn = turnById.get(value.turnId);
+        if (
+          value.id !== row.item_id
+          || value.sessionId !== row.session_id
+          || value.turnId !== row.turn_id
+          || value.seq !== Number(row.seq)
+          || value.type !== row.type
+          || value.status !== row.status
+          || row.user_id !== authorization.userId
+          || !turn
+          || turn.sessionId !== value.sessionId
+        ) throw new UserDataExportIntegrityError("data export item ownership is invalid");
+        return value;
+      });
+      const compactionsBySession = new Map<string, { turnId: string; step: number }[]>();
+      for (const item of items) {
+        if (item.type !== "contextCompaction" || item.usageSnapshot === undefined) continue;
+        const keys = compactionsBySession.get(item.sessionId) ?? [];
+        keys.push({ turnId: item.turnId, step: 0 });
+        compactionsBySession.set(item.sessionId, keys);
+      }
+      const exactUsageBySession = new Map<string, Map<string, UsageProjectionLedgerRow>>();
+      for (const [sessionId, keys] of compactionsBySession) {
+        exactUsageBySession.set(
+          sessionId,
+          await this.loadExactUsageProjectionRows(conn, sessionId, keys),
+        );
+      }
+      items = items.map((item) => ItemSchema.parse(canonicalizeUsageItem(
+        item,
+        exactUsageBySession.get(item.sessionId)?.get(usageProjectionStepKey(item.turnId, 0)),
+      )));
+      const itemById = new Map(items.map((item) => [item.id, item]));
+
+      const [eventRows] = await conn.query<Row[]>(
+        `SELECT e.*
+           FROM events e
+           JOIN sessions s ON s.session_id=e.session_id
+          WHERE s.tenant_id=? AND s.user_id=?
+          ORDER BY e.session_id, e.seq`,
+        [authorization.tenantId, authorization.userId],
+      );
+      const rawEventsBySession = new Map<string, PersistedEvent[]>();
+      for (const row of eventRows) {
+        const value = EventSchema.parse(parse<unknown>(row.body));
+        if (
+          !("seq" in value)
+          || value.sessionId !== row.session_id
+          || value.seq !== Number(row.seq)
+          || value.type !== row.type
+          || value.emittedAtMs !== Number(row.emitted_at_ms)
+          || row.user_id !== authorization.userId
+          || !sessionIdSet.has(value.sessionId)
+        ) throw new UserDataExportIntegrityError("data export event ownership is invalid");
+        const events = rawEventsBySession.get(value.sessionId) ?? [];
+        events.push(value as PersistedEvent);
+        rawEventsBySession.set(value.sessionId, events);
+      }
+      const events: PersistedEvent[] = [];
+      for (const { value: session } of projectedSessions) {
+        const raw = rawEventsBySession.get(session.id) ?? [];
+        if (
+          raw.length !== session.lastSeq
+          || raw.some((event, index) => event.seq !== index + 1)
+        ) throw new UserDataExportIntegrityError("data export event sequence is incomplete");
+        const relevantTurnIds: string[] = [];
+        const exactKeys: { turnId: string; step: number }[] = [];
+        const prefixKeys: { turnId: string; step: number }[] = [];
+        for (const event of raw) {
+          if (event.type === "turn/completed") relevantTurnIds.push(event.turn.id);
+          if (event.type === "usage/updated") {
+            relevantTurnIds.push(event.turnId);
+            exactKeys.push({ turnId: event.turnId, step: event.step });
+            prefixKeys.push({ turnId: event.turnId, step: event.step });
+          }
+          if (
+            (event.type === "item/started" || event.type === "item/completed")
+            && event.item.type === "contextCompaction"
+            && event.item.usageSnapshot !== undefined
+          ) exactKeys.push({ turnId: event.item.turnId, step: 0 });
+        }
+        const eventTurns = await this.loadTurnUsageSummaries(conn, session.id, relevantTurnIds);
+        const eventPrefixes = await this.loadTurnPrefixUsageSummaries(conn, session.id, prefixKeys);
+        const eventExact = await this.loadExactUsageProjectionRows(conn, session.id, exactKeys);
+        for (const event of raw) {
+          const canonical = canonicalizePersistedUsageEventFromSummaries(event, {
+            session: sessionUsage.get(session.id) ?? emptyUsageProjectionSummary(),
+            turns: eventTurns,
+            turnPrefixes: eventPrefixes,
+            exactRows: eventExact,
+          });
+          events.push(EventSchema.parse(sanitizeExportEvent(canonical)) as PersistedEvent);
+        }
+      }
+
+      const [approvalRows] = await conn.query<Row[]>(
+        `SELECT a.*
+           FROM approvals a
+           JOIN sessions s ON s.session_id=a.session_id
+          WHERE s.tenant_id=? AND s.user_id=?
+          ORDER BY a.session_id, a.approval_id`,
+        [authorization.tenantId, authorization.userId],
+      );
+      const approvals = approvalRows.map((row) => {
+        const value = ApprovalSchema.parse(parse<unknown>(row.body));
+        const turn = turnById.get(value.turnId);
+        const item = itemById.get(value.itemId);
+        if (
+          value.id !== row.approval_id
+          || value.sessionId !== row.session_id
+          || value.turnId !== row.turn_id
+          || value.status !== row.status
+          || row.user_id !== authorization.userId
+          || !turn
+          || turn.sessionId !== value.sessionId
+          || !item
+          || item.sessionId !== value.sessionId
+          || item.turnId !== value.turnId
+        ) throw new UserDataExportIntegrityError("data export approval ownership is invalid");
+        return value;
+      });
+
+      const [usageRows] = await conn.query<Row[]>(
+        `SELECT u.usage_id, u.tenant_id, u.user_id, u.session_id, u.turn_id, u.step,
+                u.provider, u.model, u.usage_json, u.created_at_ms,
+                s.tenant_id AS session_tenant_id, s.user_id AS session_user_id
+           FROM usage_ledger u
+           LEFT JOIN sessions s ON s.session_id=u.session_id
+          WHERE (u.tenant_id=? AND u.user_id=?)
+             OR (s.tenant_id=? AND s.user_id=?)
+          ORDER BY u.session_id, u.turn_id, u.step, u.id`,
+        [
+          authorization.tenantId,
+          authorization.userId,
+          authorization.tenantId,
+          authorization.userId,
+        ],
+      );
+      const usageEntries: Extract<UserDataExportSnapshotEntry, { type: "operational_usage" }>[] = [];
+      const usageKeys = new Set<string>();
+      for (const row of usageRows) {
+        const projection = rowToUsageProjection(row);
+        const turn = turnById.get(projection.turnId);
+        const step = storedSafeInteger(row.step, "data export usage step");
+        const logicalKey = canonicalUserDataExportJson([
+          "operational_usage",
+          projection.sessionId,
+          projection.turnId,
+          step,
+        ]);
+        if (
+          row.session_tenant_id !== authorization.tenantId
+          || row.session_user_id !== authorization.userId
+          || projection.tenantId !== authorization.tenantId
+          || projection.userId !== authorization.userId
+          || !sessionIdSet.has(projection.sessionId)
+          || !turn
+          || turn.sessionId !== projection.sessionId
+          || usageKeys.has(logicalKey)
+        ) throw new UserDataExportIntegrityError("data export usage ownership is invalid");
+        usageKeys.add(logicalKey);
+        usageEntries.push({
+          type: "operational_usage",
+          value: {
+            sessionId: projection.sessionId,
+            turnId: projection.turnId,
+            step,
+            provider: String(row.provider),
+            model: String(row.model),
+            usage: projection.usage,
+            createdAtMs: storedSafeInteger(row.created_at_ms, "data export usage creation time"),
+          },
+        });
+      }
+
+      const [blobRows] = await conn.query<Row[]>(
+        `SELECT ${QUALIFIED_BLOB_COLUMNS},
+                s.tenant_id AS session_tenant_id, s.user_id AS session_user_id
+           FROM blob_objects b
+           LEFT JOIN sessions s ON s.session_id=b.session_id
+          WHERE b.state='ready' AND ((b.tenant_id=? AND b.user_id=?)
+             OR (s.tenant_id=? AND s.user_id=?))
+          ORDER BY b.blob_id`,
+        [
+          authorization.tenantId,
+          authorization.userId,
+          authorization.tenantId,
+          authorization.userId,
+        ],
+      );
+      const manifests = blobRows.map((row) => {
+        const manifest = rowToBlobManifest(row);
+        if (
+          row.session_tenant_id !== authorization.tenantId
+          || row.session_user_id !== authorization.userId
+          || manifest.tenantId !== authorization.tenantId
+          || manifest.userId !== authorization.userId
+          || !sessionIdSet.has(manifest.sessionId)
+          || !isValidReadyPurgeBlobManifest(manifest)
+        ) throw new UserDataExportIntegrityError("data export attachment ownership is invalid");
+        return manifest;
+      });
+      const bindings = blobBindingsFromItems(items);
+      const bindingByBlob = new Map<string, BlobBinding>();
+      for (const binding of bindings) {
+        if (bindingByBlob.has(binding.blobId)) {
+          throw new UserDataExportIntegrityError("data export attachment is referenced more than once");
+        }
+        bindingByBlob.set(binding.blobId, binding);
+      }
+      if (manifests.length !== bindingByBlob.size) {
+        throw new UserDataExportIntegrityError("data export attachment manifest is incomplete");
+      }
+      const snapshotBlobs = manifests.map((manifest) => {
+        const binding = bindingByBlob.get(manifest.blobId);
+        if (
+          !binding
+          || binding.itemId !== manifest.itemId
+          || binding.purpose !== manifest.purpose
+          || !itemById.has(binding.itemId)
+          || manifest.sha256 === undefined
+          || manifest.sizeBytes === undefined
+        ) throw new UserDataExportIntegrityError("data export attachment binding is invalid");
+        const pinToken = createHash("sha256")
+          .update(canonicalUserDataExportJson([
+            "agent-service/user-data-export-pin/v1",
+            authorization.requestId,
+            authorization.buildGeneration,
+            manifest.blobId,
+          ]))
+          .digest("hex");
+        return {
+          requestId: authorization.requestId,
+          buildGeneration: authorization.buildGeneration,
+          blobId: manifest.blobId,
+          sessionId: manifest.sessionId,
+          itemId: manifest.itemId,
+          purpose: manifest.purpose,
+          ...(manifest.contentType === undefined ? {} : { contentType: manifest.contentType }),
+          sha256: manifest.sha256,
+          sizeBytes: manifest.sizeBytes,
+          storageBackend: manifest.storageBackend,
+          storageFormat: manifest.storageFormat,
+          storageKey: manifest.storageKey,
+          sourceUploadToken: manifest.uploadToken,
+          sourceDeletionGeneration: manifest.deletionGeneration,
+          pinToken,
+          pinnedAtMs: snapshotAtMs,
+        } satisfies Omit<UserDataExportSnapshotBlob, "ordinal">;
+      }).sort((left, right) => {
+        const a = userDataExportAttachmentLogicalKey(left);
+        const b = userDataExportAttachmentLogicalKey(right);
+        return a < b ? -1 : a > b ? 1 : 0;
+      }).map((blob, ordinal) => ({ ...blob, ordinal }));
+
+      if (snapshotBlobs.length > 0) {
+        const placeholders = snapshotBlobs.map(() => "?").join(",");
+        const [currentBlobRows] = await conn.query<Row[]>(
+          `SELECT ${BLOB_COLUMNS} FROM blob_objects
+            WHERE blob_id IN (${placeholders}) ORDER BY blob_id FOR SHARE`,
+          snapshotBlobs.map((blob) => blob.blobId),
+        );
+        const current = new Map(currentBlobRows.map((row) => {
+          const manifest = rowToBlobManifest(row);
+          return [manifest.blobId, manifest] as const;
+        }));
+        for (const blob of snapshotBlobs) {
+          const manifest = current.get(blob.blobId);
+          if (
+            !manifest
+            || manifest.state !== "ready"
+            || manifest.tenantId !== authorization.tenantId
+            || manifest.userId !== authorization.userId
+            || manifest.sessionId !== blob.sessionId
+            || manifest.itemId !== blob.itemId
+            || manifest.purpose !== blob.purpose
+            || manifest.storageBackend !== blob.storageBackend
+            || manifest.storageFormat !== blob.storageFormat
+            || manifest.storageKey !== blob.storageKey
+            || manifest.uploadToken !== blob.sourceUploadToken
+            || manifest.deletionGeneration !== blob.sourceDeletionGeneration
+            || manifest.sha256 !== blob.sha256
+            || manifest.sizeBytes !== blob.sizeBytes
+            || manifest.contentType !== blob.contentType
+          ) throw new UserDataExportIntegrityError("data export attachment changed during snapshot capture");
+        }
+      }
+
+      type RecordCandidate = {
+        kind: Exclude<UserDataExportSnapshotEntry["type"], "attachment">;
+        logicalKey: string;
+        entry: Exclude<UserDataExportSnapshotEntry, { type: "attachment" }>;
+      };
+      const candidates: RecordCandidate[] = [];
+      for (const { value, deletedAtMs } of projectedSessions) {
+        candidates.push({
+          kind: "session",
+          logicalKey: canonicalUserDataExportJson(["session", value.id]),
+          entry: { type: "session", value: sanitizeExportSession(value, deletedAtMs) },
+        });
+      }
+      for (const value of turns) {
+        candidates.push({
+          kind: "turn",
+          logicalKey: canonicalUserDataExportJson(["turn", value.sessionId, value.id]),
+          entry: { type: "turn", value: sanitizeExportTurn(value) },
+        });
+      }
+      for (const value of items) {
+        candidates.push({
+          kind: "item",
+          logicalKey: canonicalUserDataExportJson(["item", value.sessionId, value.id]),
+          entry: { type: "item", value },
+        });
+      }
+      for (const value of events) {
+        candidates.push({
+          kind: "event",
+          logicalKey: canonicalUserDataExportJson(["event", value.sessionId, value.seq]),
+          entry: { type: "event", value },
+        });
+      }
+      for (const value of approvals) {
+        candidates.push({
+          kind: "approval",
+          logicalKey: canonicalUserDataExportJson(["approval", value.sessionId, value.id]),
+          entry: { type: "approval", value },
+        });
+      }
+      for (const entry of usageEntries) {
+        candidates.push({
+          kind: "operational_usage",
+          logicalKey: canonicalUserDataExportJson([
+            "operational_usage",
+            entry.value.sessionId,
+            entry.value.turnId,
+            entry.value.step,
+          ]),
+          entry,
+        });
+      }
+      const kindOrder = new Map(USER_DATA_EXPORT_RECORD_KIND_ORDER.map((kind, index) => [kind, index]));
+      candidates.sort((left, right) => {
+        const kind = kindOrder.get(left.kind)! - kindOrder.get(right.kind)!;
+        if (kind !== 0) return kind;
+        return left.logicalKey < right.logicalKey ? -1 : left.logicalKey > right.logicalKey ? 1 : 0;
+      });
+      const records: UserDataExportSnapshotRecord[] = candidates.map((candidate, ordinal) => {
+        let canonicalBytes: Buffer;
+        try {
+          canonicalBytes = canonicalUserDataExportBytes(candidate.entry);
+        } catch (error) {
+          if (error instanceof UserDataExportIntegrityError) {
+            throw new UserDataExportIntegrityError(
+              `data export ${candidate.kind} record cannot be serialized`,
+            );
+          }
+          throw error;
+        }
+        return {
+          requestId: authorization.requestId,
+          buildGeneration: authorization.buildGeneration,
+          ordinal,
+          kind: candidate.kind,
+          logicalKey: candidate.logicalKey,
+          canonicalBytes,
+          sha256: createHash("sha256").update(canonicalBytes).digest("hex"),
+          sizeBytes: canonicalBytes.byteLength,
+        };
+      });
+      let snapshotRootSha256 = EMPTY_USER_DATA_EXPORT_SNAPSHOT_ROOT_SHA256;
+      for (const record of records) {
+        snapshotRootSha256 = nextUserDataExportSnapshotRootSha256(
+          snapshotRootSha256,
+          record.kind,
+          record.logicalKey,
+          record.sha256,
+          record.sizeBytes,
+        );
+      }
+      for (const blob of snapshotBlobs) {
+        const publicAttachment = {
+          blobId: blob.blobId,
+          sessionId: blob.sessionId,
+          ...(blob.itemId === undefined ? {} : { itemId: blob.itemId }),
+          purpose: blob.purpose,
+          ...(blob.contentType === undefined ? {} : { contentType: blob.contentType }),
+          sha256: blob.sha256,
+          sizeBytes: blob.sizeBytes,
+        };
+        const canonicalBytes = canonicalUserDataExportBytes({
+          type: "attachment",
+          value: publicAttachment,
+        });
+        snapshotRootSha256 = nextUserDataExportSnapshotRootSha256(
+          snapshotRootSha256,
+          "attachment",
+          userDataExportAttachmentLogicalKey(publicAttachment),
+          createHash("sha256").update(canonicalBytes).digest("hex"),
+          canonicalBytes.byteLength,
+        );
+      }
+
+      for (const record of records) {
+        await conn.query(
+          `INSERT INTO user_export_snapshot_records
+             (request_id, build_generation, ordinal, tenant_id, user_id, subject_generation,
+              record_kind, logical_key, canonical_utf8_bytes, record_sha256, size_bytes,
+              captured_at_ms)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            record.requestId,
+            record.buildGeneration,
+            record.ordinal,
+            authorization.tenantId,
+            authorization.userId,
+            authorization.subjectGeneration,
+            record.kind,
+            record.logicalKey,
+            record.canonicalBytes,
+            record.sha256,
+            record.sizeBytes,
+            snapshotAtMs,
+          ],
+        );
+      }
+      for (const blob of snapshotBlobs) {
+        await conn.query(
+          `INSERT INTO user_export_snapshot_blobs
+             (request_id, build_generation, ordinal, blob_id, tenant_id, user_id,
+              subject_generation, session_id, item_id, purpose, storage_backend, storage_format,
+              storage_key, upload_token, source_deletion_generation, source_sha256,
+              source_size_bytes, source_content_type, pin_token, pinned_at_ms, released_at_ms)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
+          [
+            blob.requestId,
+            blob.buildGeneration,
+            blob.ordinal,
+            blob.blobId,
+            authorization.tenantId,
+            authorization.userId,
+            authorization.subjectGeneration,
+            blob.sessionId,
+            blob.itemId ?? null,
+            blob.purpose,
+            blob.storageBackend,
+            blob.storageFormat,
+            blob.storageKey,
+            blob.sourceUploadToken,
+            blob.sourceDeletionGeneration,
+            blob.sha256,
+            blob.sizeBytes,
+            blob.contentType ?? null,
+            blob.pinToken,
+            snapshotAtMs,
+          ],
+        );
+      }
+      const sealNow = await this.userExportDatabaseNow(conn);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE user_export_jobs
+            SET snapshot_at_ms=?, snapshot_record_count=?, snapshot_blob_count=?,
+                snapshot_root_sha256=?, snapshot_sealed_at_ms=?, updated_at_ms=?
+          WHERE request_id=? AND build_generation=? AND status='building'
+            AND attempts=? AND claim_token=? AND snapshot_sealed_at_ms IS NULL`,
+        [
+          snapshotAtMs,
+          records.length,
+          snapshotBlobs.length,
+          snapshotRootSha256,
+          sealNow,
+          sealNow,
+          authorization.requestId,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+        ],
+      );
+      if (updated.affectedRows !== 1) {
+        throw new UserDataExportStateError("data export claim changed before snapshot seal");
+      }
+      await conn.query(
+        `UPDATE user_export_requests SET snapshot_at_ms=?, updated_at_ms=?
+          WHERE request_id=? AND status='building' AND active_build_generation=?`,
+        [snapshotAtMs, sealNow, authorization.requestId, authorization.buildGeneration],
+      );
+      const counts = Object.fromEntries(
+        [...USER_DATA_EXPORT_RECORD_KIND_ORDER, "attachment"].map((kind) => [kind, 0]),
+      ) as Record<UserDataExportSnapshotEntry["type"], number>;
+      for (const record of records) counts[record.kind] += 1;
+      counts.attachment = snapshotBlobs.length;
+      const recordCount = records.length + snapshotBlobs.length;
+      const summary: UserDataExportSnapshotSummary = {
+        snapshotAtMs,
+        counts,
+        recordCount,
+        snapshotRootSha256,
+      };
+      await conn.commit();
+      return summary;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async readUserDataExportSnapshotRecords(
+    authorization: UserDataExportAuthorization,
+    options: { afterOrdinal?: number; limit: number },
+  ): Promise<UserDataExportSnapshotRecordPage> {
+    validateUserDataExportAuthorization(authorization);
+    if (
+      !Number.isInteger(options.limit)
+      || options.limit < 1
+      || options.limit > 1_000
+      || (options.afterOrdinal !== undefined && (
+        !Number.isSafeInteger(options.afterOrdinal) || options.afterOrdinal < 0
+      ))
+    ) throw new Error("invalid data export snapshot record page");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn, authorization, now, subject.user.generation,
+      );
+      if (!state || state.job.snapshotSealedAtMs === undefined) {
+        throw new UserDataExportStateError("data export snapshot is not readable");
+      }
+      const params: unknown[] = [
+        authorization.requestId,
+        authorization.buildGeneration,
+        authorization.tenantId,
+        authorization.userId,
+        authorization.subjectGeneration,
+      ];
+      const cursor = options.afterOrdinal === undefined ? "" : " AND ordinal>?";
+      if (options.afterOrdinal !== undefined) params.push(options.afterOrdinal);
+      params.push(options.limit + 1);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT request_id, build_generation, ordinal, tenant_id, user_id, subject_generation,
+                record_kind, logical_key, canonical_utf8_bytes, record_sha256, size_bytes
+           FROM user_export_snapshot_records
+          WHERE request_id=? AND build_generation=? AND tenant_id=? AND user_id=?
+            AND subject_generation=?${cursor}
+          ORDER BY ordinal LIMIT ?`,
+        params,
+      );
+      const hasMore = rows.length > options.limit;
+      const data = rows.slice(0, options.limit).map((row): UserDataExportSnapshotRecord => {
+        const canonicalBytes = Buffer.from(row.canonical_utf8_bytes);
+        const record: UserDataExportSnapshotRecord = {
+          requestId: String(row.request_id),
+          buildGeneration: storedSafeInteger(row.build_generation, "snapshot record build", 1),
+          ordinal: storedSafeInteger(row.ordinal, "snapshot record ordinal"),
+          kind: String(row.record_kind) as UserDataExportSnapshotRecord["kind"],
+          logicalKey: String(row.logical_key),
+          canonicalBytes,
+          sha256: String(row.record_sha256),
+          sizeBytes: storedSafeInteger(row.size_bytes, "snapshot record size"),
+        };
+        if (
+          record.requestId !== authorization.requestId
+          || record.buildGeneration !== authorization.buildGeneration
+          || !USER_DATA_EXPORT_RECORD_KIND_ORDER.includes(record.kind)
+          || record.sizeBytes !== canonicalBytes.byteLength
+          || createHash("sha256").update(canonicalBytes).digest("hex") !== record.sha256
+        ) throw new UserDataExportIntegrityError("stored data export snapshot record is invalid");
+        return record;
+      });
+      await conn.commit();
+      return {
+        data,
+        nextOrdinal: hasMore ? (data.at(-1)?.ordinal ?? null) : null,
+      };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async readUserDataExportSnapshotBlobs(
+    authorization: UserDataExportAuthorization,
+    options: { afterOrdinal?: number; limit: number },
+  ): Promise<UserDataExportSnapshotBlobPage> {
+    validateUserDataExportAuthorization(authorization);
+    if (
+      !Number.isInteger(options.limit)
+      || options.limit < 1
+      || options.limit > 1_000
+      || (options.afterOrdinal !== undefined && (
+        !Number.isSafeInteger(options.afterOrdinal) || options.afterOrdinal < 0
+      ))
+    ) throw new Error("invalid data export snapshot blob page");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn, authorization, now, subject.user.generation,
+      );
+      if (!state || state.job.snapshotSealedAtMs === undefined) {
+        throw new UserDataExportStateError("data export snapshot is not readable");
+      }
+      const params: unknown[] = [
+        authorization.requestId,
+        authorization.buildGeneration,
+        authorization.tenantId,
+        authorization.userId,
+        authorization.subjectGeneration,
+      ];
+      const cursor = options.afterOrdinal === undefined ? "" : " AND ordinal>?";
+      if (options.afterOrdinal !== undefined) params.push(options.afterOrdinal);
+      params.push(options.limit + 1);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT request_id, build_generation, ordinal, blob_id, tenant_id, user_id,
+                subject_generation, session_id, item_id, purpose, storage_backend,
+                storage_format, storage_key, upload_token, source_deletion_generation,
+                source_sha256, source_size_bytes, source_content_type, pin_token, pinned_at_ms,
+                released_at_ms
+           FROM user_export_snapshot_blobs
+          WHERE request_id=? AND build_generation=? AND tenant_id=? AND user_id=?
+            AND subject_generation=? AND released_at_ms IS NULL${cursor}
+          ORDER BY ordinal LIMIT ?`,
+        params,
+      );
+      const hasMore = rows.length > options.limit;
+      const data = rows.slice(0, options.limit).map((row): UserDataExportSnapshotBlob => {
+        const blob: UserDataExportSnapshotBlob = {
+          requestId: String(row.request_id),
+          buildGeneration: storedSafeInteger(row.build_generation, "snapshot blob build", 1),
+          ordinal: storedSafeInteger(row.ordinal, "snapshot blob ordinal"),
+          blobId: String(row.blob_id),
+          sessionId: String(row.session_id),
+          ...(row.item_id == null ? {} : { itemId: String(row.item_id) }),
+          purpose: String(row.purpose) as UserDataExportSnapshotBlob["purpose"],
+          ...(row.source_content_type == null
+            ? {}
+            : { contentType: String(row.source_content_type) }),
+          sha256: String(row.source_sha256),
+          sizeBytes: storedSafeInteger(row.source_size_bytes, "snapshot blob size"),
+          storageBackend: String(row.storage_backend),
+          storageFormat: String(row.storage_format),
+          storageKey: String(row.storage_key),
+          sourceUploadToken: String(row.upload_token),
+          sourceDeletionGeneration: storedSafeInteger(
+            row.source_deletion_generation,
+            "snapshot blob source deletion generation",
+          ),
+          pinToken: String(row.pin_token),
+          pinnedAtMs: storedSafeInteger(row.pinned_at_ms, "snapshot blob pin time"),
+        };
+        if (
+          blob.requestId !== authorization.requestId
+          || blob.buildGeneration !== authorization.buildGeneration
+          || (blob.purpose !== "input_image" && blob.purpose !== "tool_output")
+          || !/^[0-9a-f]{64}$/.test(blob.sha256)
+          || !blob.storageBackend
+          || !blob.storageFormat
+          || !blob.storageKey
+          || !blob.sourceUploadToken
+          || !blob.pinToken
+        ) throw new UserDataExportIntegrityError("stored data export snapshot blob is invalid");
+        return blob;
+      });
+      await conn.commit();
+      return {
+        data,
+        nextOrdinal: hasMore ? (data.at(-1)?.ordinal ?? null) : null,
+      };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getUserDataExportArtifactBuild(
+    authorization: UserDataExportAuthorization,
+  ): Promise<{ artifact: UserDataExportArtifactRecord | null; parts: UserDataExportArtifactPart[] }> {
+    validateUserDataExportAuthorization(authorization);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn, authorization, now, subject.user.generation,
+      );
+      if (!state) throw new UserDataExportStateError("data export claim is no longer active");
+      if (!state.job.activeArtifactId) {
+        await conn.commit();
+        return { artifact: null, parts: [] };
+      }
+      const [artifactRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+           FROM user_export_artifacts WHERE artifact_id=? FOR SHARE`,
+        [state.job.activeArtifactId],
+      );
+      if (!artifactRows[0]) throw new UserDataExportIntegrityError("data export artifact pointer is dangling");
+      const artifact = rowToUserDataExportArtifact(artifactRows[0]);
+      if (
+        artifact.requestId !== authorization.requestId
+        || artifact.tenantId !== authorization.tenantId
+        || artifact.userId !== authorization.userId
+        || artifact.subjectGeneration !== authorization.subjectGeneration
+        || artifact.buildGeneration !== authorization.buildGeneration
+      ) throw new UserDataExportIntegrityError("data export artifact owner is invalid");
+      const [partRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_PART_COLUMNS}
+           FROM user_export_artifact_parts WHERE artifact_id=? ORDER BY part_number`,
+        [artifact.artifactId],
+      );
+      const parts = partRows.map((row) => {
+        assertUserDataExportPartOwner(row, {
+          artifactId: artifact.artifactId,
+          requestId: artifact.requestId,
+          buildGeneration: artifact.buildGeneration,
+          tenantId: artifact.tenantId,
+          userId: artifact.userId,
+          subjectGeneration: artifact.subjectGeneration,
+        });
+        return rowToUserDataExportPart(row);
+      });
+      if (parts.some((part, index) => (
+        part.requestId !== authorization.requestId
+        || part.buildGeneration !== authorization.buildGeneration
+        || part.partNumber !== index
+        || part.storageKey !== userDataExportStorageKey(
+          { tenantId: authorization.tenantId, userId: authorization.userId },
+          authorization.requestId,
+          artifact.artifactId,
+          part.partNumber,
+        )
+      ))) throw new UserDataExportIntegrityError("data export artifact part owner is invalid");
+      await conn.commit();
+      return { artifact, parts };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async stageUserDataExportPart(
+    authorization: UserDataExportAuthorization,
+    input: StageUserDataExportPartInput,
+  ): Promise<UserDataExportArtifactPart> {
+    validateUserDataExportAuthorization(authorization);
+    if (
+      !Number.isSafeInteger(input.partNumber)
+      || input.partNumber < 0
+      || !input.storageBackend
+      || input.storageBackend.length > 32
+      || !input.storageFormat
+      || input.storageFormat.length > 64
+    ) throw new Error("invalid data export artifact part input");
+    validateBlobKey(input.storageKey);
+    validateBlobUploadToken(input.uploadToken);
+    if (!/^[a-z0-9-]{16,64}$/.test(input.uploadToken)) {
+      throw new Error("invalid data export artifact upload token");
+    }
+    if (input.storageKey !== userDataExportStorageKey(
+      { tenantId: authorization.tenantId, userId: authorization.userId },
+      authorization.requestId,
+      input.artifactId,
+      input.partNumber,
+    )) throw new UserDataExportIntegrityError("data export artifact storage key is not canonical");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn, authorization, now, subject.user.generation,
+      );
+      if (!state) throw new UserDataExportStateError("data export claim is no longer active");
+      if (state.job.activeArtifactId !== input.artifactId) {
+        throw new UserDataExportStateError("data export artifact is no longer active");
+      }
+      const [artifactRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+           FROM user_export_artifacts WHERE artifact_id=? FOR UPDATE`,
+        [input.artifactId],
+      );
+      if (!artifactRows[0]) throw new UserDataExportIntegrityError("data export artifact is missing");
+      const artifact = rowToUserDataExportArtifact(artifactRows[0]);
+      if (
+        artifact.state !== "staging"
+        || artifact.requestId !== authorization.requestId
+        || artifact.buildGeneration !== authorization.buildGeneration
+        || artifact.storageBackend !== input.storageBackend
+        || artifact.storageFormat !== input.storageFormat
+      ) throw new UserDataExportStateError("data export artifact cannot accept parts");
+      const [existingRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_PART_COLUMNS}
+           FROM user_export_artifact_parts
+          WHERE artifact_id=? AND part_number=? FOR UPDATE`,
+        [input.artifactId, input.partNumber],
+      );
+      if (existingRows[0]) {
+        assertUserDataExportPartOwner(existingRows[0], {
+          artifactId: artifact.artifactId,
+          requestId: artifact.requestId,
+          buildGeneration: artifact.buildGeneration,
+          tenantId: artifact.tenantId,
+          userId: artifact.userId,
+          subjectGeneration: artifact.subjectGeneration,
+        });
+        const existing = rowToUserDataExportPart(existingRows[0]);
+        if (
+          existing.requestId !== authorization.requestId
+          || existing.buildGeneration !== authorization.buildGeneration
+          || existing.storageBackend !== input.storageBackend
+          || existing.storageFormat !== input.storageFormat
+          || existing.storageKey !== input.storageKey
+          || existing.uploadToken !== input.uploadToken
+        ) throw new UserDataExportIntegrityError("data export artifact part replay conflicts");
+        await conn.commit();
+        return existing;
+      }
+      if (input.partNumber > 0) {
+        const [priorRows] = await conn.query<Row[]>(
+          `SELECT state FROM user_export_artifact_parts
+            WHERE artifact_id=? AND part_number=? FOR SHARE`,
+          [input.artifactId, input.partNumber - 1],
+        );
+        if (priorRows[0]?.state !== "uploaded") {
+          throw new UserDataExportStateError("data export artifact parts must be staged in order");
+        }
+      }
+      try {
+        await conn.query(
+          `INSERT INTO user_export_artifact_parts
+             (artifact_id, part_number, request_id, build_generation, tenant_id, user_id,
+              subject_generation, state, storage_backend, storage_format, storage_key,
+              upload_token, content_type, content_encoding, sha256, size_bytes, record_count,
+              staging_expires_at_ms, uploaded_at_ms, delete_after_ms, deleted_at_ms,
+              deletion_generation, created_at_ms, updated_at_ms)
+           VALUES (?,?,?,?,?,?,?,'staging',?,?,?,?,NULL,'identity',NULL,NULL,NULL,?,NULL,NULL,NULL,0,?,?)`,
+          [
+            input.artifactId,
+            input.partNumber,
+            authorization.requestId,
+            authorization.buildGeneration,
+            authorization.tenantId,
+            authorization.userId,
+            authorization.subjectGeneration,
+            input.storageBackend,
+            input.storageFormat,
+            input.storageKey,
+            input.uploadToken,
+            artifact.stagingExpiresAtMs,
+            now,
+            now,
+          ],
+        );
+      } catch (error) {
+        if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+          throw new UserDataExportIntegrityError("data export artifact part identity conflicts");
+        }
+        throw error;
+      }
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_PART_COLUMNS}
+           FROM user_export_artifact_parts WHERE artifact_id=? AND part_number=?`,
+        [input.artifactId, input.partNumber],
+      );
+      if (!rows[0]) throw new UserDataExportIntegrityError("data export artifact part insert was lost");
+      assertUserDataExportPartOwner(rows[0], {
+        artifactId: artifact.artifactId,
+        requestId: artifact.requestId,
+        buildGeneration: artifact.buildGeneration,
+        tenantId: artifact.tenantId,
+        userId: artifact.userId,
+        subjectGeneration: artifact.subjectGeneration,
+      });
+      const part = rowToUserDataExportPart(rows[0]);
+      await conn.commit();
+      return part;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async markUserDataExportPartUploaded(
+    authorization: UserDataExportAuthorization,
+    input: MarkUserDataExportPartUploadedInput,
+  ): Promise<UserDataExportArtifactPart> {
+    validateUserDataExportAuthorization(authorization);
+    if (
+      !Number.isSafeInteger(input.partNumber)
+      || input.partNumber < 0
+      || input.descriptor.storageKey.length < 1
+      || !/^[0-9a-f]{64}$/.test(input.descriptor.sha256)
+      || !Number.isSafeInteger(input.descriptor.sizeBytes)
+      || input.descriptor.sizeBytes < 0
+    ) throw new Error("invalid uploaded data export part descriptor");
+    validateBlobKey(input.descriptor.storageKey);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn, authorization, now, subject.user.generation,
+      );
+      if (!state || state.job.activeArtifactId !== input.artifactId) {
+        throw new UserDataExportStateError("data export artifact claim is no longer active");
+      }
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_PART_COLUMNS}
+           FROM user_export_artifact_parts
+          WHERE artifact_id=? AND part_number=? FOR UPDATE`,
+        [input.artifactId, input.partNumber],
+      );
+      if (!rows[0]) throw new UserDataExportStateError("data export artifact part is missing");
+      assertUserDataExportPartOwner(rows[0], {
+        artifactId: input.artifactId,
+        requestId: authorization.requestId,
+        buildGeneration: authorization.buildGeneration,
+        tenantId: authorization.tenantId,
+        userId: authorization.userId,
+        subjectGeneration: authorization.subjectGeneration,
+      });
+      const part = rowToUserDataExportPart(rows[0]);
+      if (
+        part.requestId !== authorization.requestId
+        || part.buildGeneration !== authorization.buildGeneration
+        || part.storageKey !== input.descriptor.storageKey
+        || input.descriptor.contentType !== USER_DATA_EXPORT_CONTENT_TYPE
+      ) throw new UserDataExportIntegrityError("uploaded data export part identity is invalid");
+      if (part.state === "uploaded") {
+        if (
+          part.sha256 !== input.descriptor.sha256
+          || part.sizeBytes !== input.descriptor.sizeBytes
+          || part.contentType !== input.descriptor.contentType
+        ) throw new UserDataExportIntegrityError("uploaded data export part replay conflicts");
+        await conn.commit();
+        return part;
+      }
+      if (part.state !== "staging") {
+        throw new UserDataExportStateError("data export artifact part cannot be uploaded");
+      }
+      await conn.query(
+        `UPDATE user_export_artifact_parts
+            SET state='uploaded', sha256=?, size_bytes=?, content_type=?, uploaded_at_ms=?,
+                updated_at_ms=?
+          WHERE artifact_id=? AND part_number=?`,
+        [
+          input.descriptor.sha256,
+          input.descriptor.sizeBytes,
+          input.descriptor.contentType,
+          now,
+          now,
+          input.artifactId,
+          input.partNumber,
+        ],
+      );
+      const [updatedRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_PART_COLUMNS}
+           FROM user_export_artifact_parts WHERE artifact_id=? AND part_number=?`,
+        [input.artifactId, input.partNumber],
+      );
+      assertUserDataExportPartOwner(updatedRows[0]!, {
+        artifactId: input.artifactId,
+        requestId: authorization.requestId,
+        buildGeneration: authorization.buildGeneration,
+        tenantId: authorization.tenantId,
+        userId: authorization.userId,
+        subjectGeneration: authorization.subjectGeneration,
+      });
+      const uploaded = rowToUserDataExportPart(updatedRows[0]!);
+      await conn.commit();
+      return uploaded;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async completeUserDataExportArtifact(
+    authorization: UserDataExportAuthorization,
+    input: CompleteUserDataExportArtifactInput,
+  ): Promise<UserDataExportRequestRecord> {
+    validateUserDataExportAuthorization(authorization);
+    if (
+      !Number.isSafeInteger(input.snapshotAtMs)
+      || input.snapshotAtMs < 0
+      || !Number.isSafeInteger(input.partCount)
+      || input.partCount < 1
+      || !Number.isSafeInteger(input.recordCount)
+      || input.recordCount < 0
+      || !Number.isSafeInteger(input.totalSizeBytes)
+      || input.totalSizeBytes < 0
+      || !/^[0-9a-f]{64}$/.test(input.contentSha256)
+      || !/^[0-9a-f]{64}$/.test(input.manifestSha256)
+    ) throw new Error("invalid completed data export artifact");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn, authorization, now, subject.user.generation,
+      );
+      if (!state || state.job.activeArtifactId !== input.artifactId) {
+        throw new UserDataExportStateError("data export artifact claim is no longer active");
+      }
+      const summary = await this.userExportSnapshotSummary(conn, state.job);
+      if (
+        summary.snapshotAtMs !== input.snapshotAtMs
+        || summary.recordCount !== input.recordCount
+      ) throw new UserDataExportIntegrityError("data export artifact does not match its snapshot");
+      const [artifactRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+           FROM user_export_artifacts WHERE artifact_id=? FOR UPDATE`,
+        [input.artifactId],
+      );
+      if (!artifactRows[0]) throw new UserDataExportIntegrityError("data export artifact is missing");
+      const artifact = rowToUserDataExportArtifact(artifactRows[0]);
+      if (
+        artifact.requestId !== authorization.requestId
+        || artifact.tenantId !== authorization.tenantId
+        || artifact.userId !== authorization.userId
+        || artifact.subjectGeneration !== authorization.subjectGeneration
+        || artifact.buildGeneration !== authorization.buildGeneration
+        || artifact.state !== "staging"
+        || artifact.snapshotAtMs !== input.snapshotAtMs
+        || artifact.snapshotRootSha256 !== summary.snapshotRootSha256
+        || artifact.policyVersion !== state.request.policyVersion
+        || artifact.policySha256 !== state.request.policySha256
+        || artifact.artifactTtlMs !== state.request.artifactTtlMs
+      ) throw new UserDataExportIntegrityError("data export artifact identity is invalid");
+      const [partRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_PART_COLUMNS}
+           FROM user_export_artifact_parts WHERE artifact_id=? ORDER BY part_number FOR UPDATE`,
+        [input.artifactId],
+      );
+      const parts = partRows.map((row) => {
+        assertUserDataExportPartOwner(row, {
+          artifactId: artifact.artifactId,
+          requestId: artifact.requestId,
+          buildGeneration: artifact.buildGeneration,
+          tenantId: artifact.tenantId,
+          userId: artifact.userId,
+          subjectGeneration: artifact.subjectGeneration,
+        });
+        return rowToUserDataExportPart(row);
+      });
+      if (
+        parts.length !== input.partCount
+        || parts.some((part, index) => (
+          part.partNumber !== index
+          || part.requestId !== authorization.requestId
+          || part.buildGeneration !== authorization.buildGeneration
+          || part.state !== "uploaded"
+          || part.sha256 === undefined
+          || part.sizeBytes === undefined
+          || part.contentType !== USER_DATA_EXPORT_CONTENT_TYPE
+          || part.storageKey !== userDataExportStorageKey(
+            { tenantId: authorization.tenantId, userId: authorization.userId },
+            authorization.requestId,
+            artifact.artifactId,
+            part.partNumber,
+          )
+        ))
+      ) throw new UserDataExportIntegrityError("data export artifact parts are incomplete");
+      const totalSizeBytes = parts.reduce((total, part) => total + part.sizeBytes!, 0);
+      if (!Number.isSafeInteger(totalSizeBytes) || totalSizeBytes !== input.totalSizeBytes) {
+        throw new UserDataExportIntegrityError("data export artifact size does not match its parts");
+      }
+      if (userDataExportManifestSha256(parts) !== input.manifestSha256) {
+        throw new UserDataExportIntegrityError("data export artifact manifest hash is invalid");
+      }
+      const expiresAtMs = now + state.request.artifactTtlMs;
+      if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= now) {
+        throw new UserDataExportIntegrityError("data export artifact expiry overflowed");
+      }
+      await conn.query(
+        `UPDATE user_export_artifacts
+            SET state='ready', part_count=?, record_count=?, total_size_bytes=?,
+                manifest_sha256=?, content_sha256=?, ready_at_ms=?, expires_at_ms=?,
+                updated_at_ms=?
+          WHERE artifact_id=?`,
+        [
+          input.partCount,
+          input.recordCount,
+          input.totalSizeBytes,
+          input.manifestSha256,
+          input.contentSha256,
+          now,
+          expiresAtMs,
+          now,
+          input.artifactId,
+        ],
+      );
+      await conn.query(
+        `UPDATE user_export_requests
+            SET status='ready', snapshot_at_ms=?, ready_at_ms=?, expires_at_ms=?,
+                last_error_code=NULL, updated_at_ms=?
+          WHERE request_id=? AND status='building' AND active_build_generation=?
+            AND active_artifact_id=?`,
+        [
+          input.snapshotAtMs,
+          now,
+          expiresAtMs,
+          now,
+          authorization.requestId,
+          authorization.buildGeneration,
+          input.artifactId,
+        ],
+      );
+      await conn.query(
+        `UPDATE user_export_jobs
+            SET status='completed', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, completed_at_ms=?, updated_at_ms=?
+          WHERE request_id=?`,
+        [now, now, authorization.requestId],
+      );
+      await this.releaseUserExportSnapshot(
+        conn,
+        authorization.requestId,
+        authorization.buildGeneration,
+        now,
+      );
+      const request = await this.loadUserExportRequest(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        authorization.requestId,
+        false,
+      );
+      if (!request || request.status !== "ready") {
+        throw new UserDataExportIntegrityError("ready data export request publication failed");
+      }
+      await conn.commit();
+      return request;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryUserDataExport(
+    authorization: UserDataExportAuthorization,
+    input: RetryUserDataExportInput,
+  ): Promise<boolean> {
+    validateUserDataExportAuthorization(authorization);
+    if (
+      !Number.isSafeInteger(input.delayMs)
+      || input.delayMs < 0
+      || !["temporary_failure", "snapshot_invalid", "artifact_invalid", "subject_revoked"].includes(
+        input.errorCode,
+      )
+      || (input.maxAttempts !== undefined && (
+        !Number.isInteger(input.maxAttempts) || input.maxAttempts < 1
+      ))
+    ) throw new Error("invalid data export retry");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const subject = await this.lockUserExportSubject(
+        conn,
+        authorization.tenantId,
+        authorization.userId,
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
+      const state = await this.lockActiveUserExportClaim(
+        conn, authorization, now, subject.user.generation,
+      );
+      if (!state) {
+        await conn.commit();
+        return false;
+      }
+      const terminal = input.maxAttempts !== undefined && state.job.attempts >= input.maxAttempts;
+      if (terminal) {
+        if (state.job.activeArtifactId) {
+          await this.transitionUserExportArtifactToDeletePending(
+            conn,
+            state.job.activeArtifactId,
+            now,
+          );
+        }
+        await this.releaseUserExportSnapshot(
+          conn,
+          authorization.requestId,
+          authorization.buildGeneration,
+          now,
+        );
+        await conn.query(
+          `UPDATE user_export_jobs
+              SET status='failed', available_at_ms=NULL, claim_token=NULL, lease_until_ms=NULL,
+                  last_error_code=?, updated_at_ms=?
+            WHERE request_id=?`,
+          [input.errorCode, now, authorization.requestId],
+        );
+        await conn.query(
+          `UPDATE user_export_requests
+              SET status='failed', last_error_code=?, updated_at_ms=?
+            WHERE request_id=?`,
+          [input.errorCode, now, authorization.requestId],
+        );
+      } else {
+        const availableAtMs = now + input.delayMs;
+        if (!Number.isSafeInteger(availableAtMs)) throw new Error("data export retry time overflow");
+        await conn.query(
+          `UPDATE user_export_jobs
+              SET status='queued', available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                  last_error_code=?, updated_at_ms=?
+            WHERE request_id=?`,
+          [availableAtMs, input.errorCode, now, authorization.requestId],
+        );
+        await conn.query(
+          `UPDATE user_export_requests
+              SET status='queued', last_error_code=?, updated_at_ms=?
+            WHERE request_id=?`,
+          [input.errorCode, now, authorization.requestId],
+        );
+      }
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if (error instanceof SubjectDeletingError) return false;
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async scheduleUserDataExportDeletes(limit: number): Promise<number> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new Error("data export cleanup limit must be between 1 and 1000");
+    }
+    const observedNow = await this.userExportDatabaseNow(this.pool);
+    await this.pool.query(
+      "DELETE FROM user_export_download_leases WHERE lease_until_ms<=?",
+      [observedNow],
+    );
+    const [candidateRows] = await this.pool.query<Row[]>(
+      `SELECT a.artifact_id, a.request_id, a.tenant_id, a.user_id
+         FROM user_export_artifacts a
+         JOIN user_export_requests r ON r.request_id=a.request_id
+          AND r.tenant_id=a.tenant_id AND r.user_id=a.user_id
+        WHERE a.state IN ('staging','ready') AND (
+          r.status IN ('failed','revoked')
+          OR (r.status='expired' AND NOT EXISTS (
+            SELECT 1 FROM user_export_download_leases l
+             WHERE l.artifact_id=a.artifact_id AND l.lease_until_ms>?
+          ))
+          OR (a.state='ready' AND a.expires_at_ms IS NOT NULL AND a.expires_at_ms<=?
+            AND NOT EXISTS (
+              SELECT 1 FROM user_export_download_leases l
+               WHERE l.artifact_id=a.artifact_id AND l.lease_until_ms>?
+            ))
+          OR (a.state='staging' AND a.staging_expires_at_ms<=? AND NOT EXISTS (
+            SELECT 1 FROM user_export_jobs j
+             WHERE j.request_id=a.request_id AND j.build_generation=a.build_generation
+               AND j.status='building' AND j.claim_token IS NOT NULL
+               AND j.lease_until_ms>?
+          ))
+        )
+        ORDER BY COALESCE(a.expires_at_ms, a.staging_expires_at_ms), a.artifact_id
+        LIMIT ?`,
+      [observedNow, observedNow, observedNow, observedNow, observedNow, limit],
+    );
+    let scheduled = 0;
+    for (const candidate of candidateRows) {
+      const tenantId = String(candidate.tenant_id);
+      const userId = String(candidate.user_id);
+      const artifactId = String(candidate.artifact_id);
+      const requestId = String(candidate.request_id);
+      const conn = await this.pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const now = await this.userExportDatabaseNow(conn);
+        const subject = await this.lockUserExportSubject(
+          conn,
+          tenantId,
+          userId,
+          now,
+          { userLock: "FOR SHARE", requireActive: false },
+        );
+        let request = await this.loadUserExportRequest(
+          conn,
+          tenantId,
+          userId,
+          requestId,
+          true,
+        );
+        if (!request) throw new UserDataExportIntegrityError("data export artifact request is missing");
+        const [artifactRows] = await conn.query<Row[]>(
+          `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+             FROM user_export_artifacts WHERE artifact_id=? FOR UPDATE`,
+          [artifactId],
+        );
+        if (!artifactRows[0]) {
+          await conn.commit();
+          continue;
+        }
+        const artifact = rowToUserDataExportArtifact(artifactRows[0]);
+        if (artifact.requestId !== request.requestId) {
+          throw new UserDataExportIntegrityError("data export artifact request identity conflicts");
+        }
+        if (
+          (subject.tenant.state !== "active"
+            || subject.user.state !== "active"
+            || subject.user.generation !== request.subjectGeneration)
+          && request.status !== "revoked"
+        ) {
+          await this.revokeUserExportsForSubject(conn, tenantId, userId, now);
+          await conn.commit();
+          scheduled += 1;
+          continue;
+        }
+        await conn.query(
+          "DELETE FROM user_export_download_leases WHERE artifact_id=? AND lease_until_ms<=?",
+          [artifactId, now],
+        );
+        const [leaseRows] = await conn.query<Row[]>(
+          `SELECT lease_token FROM user_export_download_leases
+            WHERE artifact_id=? AND lease_until_ms>? LIMIT 1 FOR SHARE`,
+          [artifactId, now],
+        );
+        // Erasure/revocation may invalidate active downloads immediately. Ordinary artifact TTL
+        // expiry cannot: it marks the request expired but waits for every bounded lease to drain.
+        const forced = request.status === "failed" || request.status === "revoked";
+        const readyExpired = artifact.state === "ready"
+          && artifact.expiresAtMs !== undefined
+          && artifact.expiresAtMs <= now
+          && leaseRows.length === 0;
+        let stagingStale = artifact.state === "staging" && artifact.stagingExpiresAtMs <= now;
+        if (stagingStale) {
+          const [jobRows] = await conn.query<Row[]>(
+            `SELECT ${USER_EXPORT_JOB_COLUMNS}
+               FROM user_export_jobs WHERE request_id=? FOR UPDATE`,
+            [artifact.requestId],
+          );
+          const job = jobRows[0] ? rowToUserDataExportJob(jobRows[0]) : undefined;
+          if (
+            job
+            && job.buildGeneration === artifact.buildGeneration
+            && job.status === "building"
+            && job.claimToken !== undefined
+            && job.leaseUntilMs !== undefined
+            && job.leaseUntilMs > now
+          ) stagingStale = false;
+        }
+        if (!forced && !readyExpired && !stagingStale) {
+          await conn.commit();
+          continue;
+        }
+        if (readyExpired && request.status === "ready") {
+          await conn.query(
+            `UPDATE user_export_requests SET status='expired', updated_at_ms=?
+              WHERE request_id=? AND status='ready'`,
+            [now, request.requestId],
+          );
+          request = { ...request, status: "expired", updatedAtMs: now };
+        }
+        if (stagingStale && (request.status === "queued" || request.status === "building")) {
+          await conn.query(
+            `UPDATE user_export_requests
+                SET status='failed', last_error_code='artifact_invalid', updated_at_ms=?
+              WHERE request_id=?`,
+            [now, request.requestId],
+          );
+          await conn.query(
+            `UPDATE user_export_jobs
+                SET status='failed', available_at_ms=NULL, claim_token=NULL, lease_until_ms=NULL,
+                    last_error_code='artifact_invalid', updated_at_ms=?
+              WHERE request_id=?`,
+            [now, request.requestId],
+          );
+          await this.releaseUserExportSnapshot(
+            conn,
+            request.requestId,
+            artifact.buildGeneration,
+            now,
+          );
+        }
+        if (await this.transitionUserExportArtifactToDeletePending(conn, artifactId, now)) {
+          scheduled += 1;
+        }
+        await conn.commit();
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        // A malformed candidate is fail-closed for itself, but must not prevent a later safe
+        // artifact in this bounded scheduling pass from reaching its exact delete outbox.
+        if (error instanceof UserDataExportIntegrityError) continue;
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    return scheduled;
+  }
+
+  async claimUserDataExportDeletes(
+    options: ClaimUserDataExportDeletesOptions,
+  ): Promise<UserDataExportDeleteOutboxRecord[]> {
+    if (
+      !Number.isInteger(options.limit)
+      || options.limit < 1
+      || options.limit > 100
+      || !Number.isSafeInteger(options.leaseMs)
+      || options.leaseMs < 1
+      || !/^[A-Za-z0-9._:~-]{1,128}$/.test(options.claimToken)
+    ) throw new Error("invalid data export delete claim");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const leaseUntilMs = now + options.leaseMs;
+      if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("data export delete lease overflow");
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_DELETE_COLUMNS}
+           FROM user_export_artifact_delete_outbox
+          WHERE completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL
+            AND available_at_ms<=?
+            AND ((claim_token IS NULL AND lease_until_ms IS NULL)
+              OR (claim_token IS NOT NULL AND lease_until_ms IS NOT NULL AND lease_until_ms<=?))
+          ORDER BY available_at_ms, outbox_id
+          LIMIT ? FOR UPDATE SKIP LOCKED`,
+        [now, now, options.limit],
+      );
+      const claimed: UserDataExportDeleteOutboxRecord[] = [];
+      for (const row of rows) {
+        const rawOutboxId = Number(row.outbox_id);
+        let record: UserDataExportDeleteOutboxRecord;
+        try {
+          record = rowToUserDataExportDelete(row);
+        } catch {
+          // A permanently malformed intent must not poison the ordered queue and starve every
+          // valid intent behind it. Keep the row as immutable evidence and quarantine it.
+          await conn.query(
+            `UPDATE user_export_artifact_delete_outbox
+                SET attempts=attempts+1, claim_token=NULL, lease_until_ms=NULL,
+                    last_error='delete_intent_envelope_invalid', dead_lettered_at_ms=?
+              WHERE outbox_id=? AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+            [now, rawOutboxId],
+          );
+          continue;
+        }
+        const [partRows] = await conn.query<Row[]>(
+          `SELECT ${USER_EXPORT_PART_COLUMNS}
+             FROM user_export_artifact_parts
+            WHERE artifact_id=? AND part_number=? FOR SHARE`,
+          [record.artifactId, record.partNumber],
+        );
+        const [artifactRows] = await conn.query<Row[]>(
+          `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+             FROM user_export_artifacts WHERE artifact_id=? FOR SHARE`,
+          [record.artifactId],
+        );
+        let identityValid = false;
+        try {
+          const buildGeneration = storedSafeInteger(
+            row.build_generation,
+            "export delete build generation",
+            1,
+          );
+          const artifact = artifactRows[0]
+            ? rowToUserDataExportArtifact(artifactRows[0])
+            : undefined;
+          if (partRows[0] && artifact) {
+            assertUserDataExportPartOwner(partRows[0], {
+              artifactId: artifact.artifactId,
+              requestId: artifact.requestId,
+              buildGeneration: artifact.buildGeneration,
+              tenantId: artifact.tenantId,
+              userId: artifact.userId,
+              subjectGeneration: artifact.subjectGeneration,
+            });
+          }
+          const part = partRows[0] ? rowToUserDataExportPart(partRows[0]) : undefined;
+          identityValid = !!artifact
+            && artifact.state === "delete_pending"
+            && artifact.requestId === record.requestId
+            && artifact.buildGeneration === buildGeneration
+            && artifact.deletionGeneration === record.deletionGeneration
+            && artifact.storageBackend === record.storageBackend
+            && artifact.storageFormat === record.storageFormat
+            && !!part
+            && part.state === "delete_pending"
+            && part.deletionGeneration === record.deletionGeneration
+            && part.requestId === record.requestId
+            && part.buildGeneration === buildGeneration
+            && part.storageBackend === record.storageBackend
+            && part.storageFormat === record.storageFormat
+            && part.storageKey === record.storageKey
+            && part.storageKey === userDataExportStorageKey(
+              { tenantId: artifact.tenantId, userId: artifact.userId },
+              record.requestId,
+              record.artifactId,
+              record.partNumber,
+            )
+            && part.uploadToken === record.uploadToken
+            && part.sha256 === (row.expected_sha256 == null
+              ? undefined
+              : String(row.expected_sha256))
+            && part.sizeBytes === (row.expected_size_bytes == null
+              ? undefined
+              : storedSafeInteger(row.expected_size_bytes, "export delete expected size"));
+        } catch {
+          identityValid = false;
+        }
+        if (!identityValid) {
+          await conn.query(
+            `UPDATE user_export_artifact_delete_outbox
+                SET attempts=attempts+1, claim_token=NULL, lease_until_ms=NULL,
+                    last_error='delete_intent_identity_invalid', dead_lettered_at_ms=?
+              WHERE outbox_id=? AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+            [now, record.outboxId],
+          );
+          continue;
+        }
+        await conn.query(
+          `UPDATE user_export_artifact_delete_outbox
+              SET attempts=attempts+1, claim_token=?, lease_until_ms=?
+            WHERE outbox_id=?`,
+          [options.claimToken, leaseUntilMs, record.outboxId],
+        );
+        claimed.push({
+          ...record,
+          attempts: record.attempts + 1,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+        });
+      }
+      await conn.commit();
+      return claimed;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewUserDataExportDeleteClaim(
+    outboxId: number,
+    claimToken: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    if (
+      !Number.isSafeInteger(outboxId)
+      || outboxId < 1
+      || !/^[A-Za-z0-9._:~-]{1,128}$/.test(claimToken)
+      || !Number.isSafeInteger(leaseMs)
+      || leaseMs < 1
+    ) throw new Error("invalid data export delete renewal");
+    const now = await this.userExportDatabaseNow(this.pool);
+    const leaseUntilMs = now + leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("data export delete lease overflow");
+    const [result] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE user_export_artifact_delete_outbox
+          SET lease_until_ms=GREATEST(lease_until_ms, ?)
+        WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+          AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+      [leaseUntilMs, outboxId, claimToken, now],
+    );
+    return result.affectedRows === 1;
+  }
+
+  async completeUserDataExportDelete(
+    outboxId: number,
+    claimToken: string,
+  ): Promise<boolean> {
+    if (
+      !Number.isSafeInteger(outboxId)
+      || outboxId < 1
+      || !/^[A-Za-z0-9._:~-]{1,128}$/.test(claimToken)
+    ) throw new Error("invalid data export delete completion");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const now = await this.userExportDatabaseNow(conn);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_DELETE_COLUMNS}
+           FROM user_export_artifact_delete_outbox
+          WHERE outbox_id=? FOR UPDATE`,
+        [outboxId],
+      );
+      const row = rows[0] ? rowToUserDataExportDelete(rows[0]) : undefined;
+      if (
+        !row
+        || row.completedAtMs !== undefined
+        || row.deadLetteredAtMs !== undefined
+        || row.claimToken !== claimToken
+        || row.leaseUntilMs === undefined
+        || row.leaseUntilMs <= now
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const buildGeneration = storedSafeInteger(
+        rows[0]!.build_generation,
+        "export delete build generation",
+        1,
+      );
+      const [artifactRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_ARTIFACT_COLUMNS}
+           FROM user_export_artifacts WHERE artifact_id=? FOR UPDATE`,
+        [row.artifactId],
+      );
+      const artifact = artifactRows[0]
+        ? rowToUserDataExportArtifact(artifactRows[0])
+        : undefined;
+      if (
+        !artifact
+        || artifact.state !== "delete_pending"
+        || artifact.requestId !== row.requestId
+        || artifact.buildGeneration !== buildGeneration
+        || artifact.deletionGeneration !== row.deletionGeneration
+        || artifact.storageBackend !== row.storageBackend
+        || artifact.storageFormat !== row.storageFormat
+      ) throw new UserDataExportIntegrityError("data export delete artifact identity is invalid");
+      const [partRows] = await conn.query<Row[]>(
+        `SELECT ${USER_EXPORT_PART_COLUMNS}
+           FROM user_export_artifact_parts
+          WHERE artifact_id=? AND part_number=? FOR UPDATE`,
+        [row.artifactId, row.partNumber],
+      );
+      if (partRows[0]) {
+        assertUserDataExportPartOwner(partRows[0], {
+          artifactId: artifact.artifactId,
+          requestId: artifact.requestId,
+          buildGeneration: artifact.buildGeneration,
+          tenantId: artifact.tenantId,
+          userId: artifact.userId,
+          subjectGeneration: artifact.subjectGeneration,
+        });
+      }
+      const part = partRows[0] ? rowToUserDataExportPart(partRows[0]) : undefined;
+      if (
+        !part
+        || part.state !== "delete_pending"
+        || part.deletionGeneration !== row.deletionGeneration
+        || part.requestId !== row.requestId
+        || part.buildGeneration !== buildGeneration
+        || part.storageBackend !== row.storageBackend
+        || part.storageFormat !== row.storageFormat
+        || part.storageKey !== row.storageKey
+        || part.storageKey !== userDataExportStorageKey(
+          { tenantId: artifact.tenantId, userId: artifact.userId },
+          row.requestId,
+          row.artifactId,
+          row.partNumber,
+        )
+        || part.uploadToken !== row.uploadToken
+        || part.sha256 !== (rows[0]!.expected_sha256 == null
+          ? undefined
+          : String(rows[0]!.expected_sha256))
+        || part.sizeBytes !== (rows[0]!.expected_size_bytes == null
+          ? undefined
+          : storedSafeInteger(rows[0]!.expected_size_bytes, "export delete expected size"))
+      ) throw new UserDataExportIntegrityError("data export delete completion identity is invalid");
+      await conn.query(
+        `UPDATE user_export_artifact_parts
+            SET state='deleted', deleted_at_ms=?, updated_at_ms=?
+          WHERE artifact_id=? AND part_number=?`,
+        [now, now, row.artifactId, row.partNumber],
+      );
+      await conn.query(
+        `UPDATE user_export_artifact_delete_outbox
+            SET completed_at_ms=?, claim_token=NULL, lease_until_ms=NULL, last_error=NULL
+          WHERE outbox_id=?`,
+        [now, outboxId],
+      );
+      const [remainingRows] = await conn.query<Row[]>(
+        `SELECT part_number FROM user_export_artifact_parts
+          WHERE artifact_id=? AND state<>'deleted' LIMIT 1 FOR SHARE`,
+        [row.artifactId],
+      );
+      if (remainingRows.length === 0) {
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE user_export_artifacts
+              SET state='deleted', deleted_at_ms=?, updated_at_ms=?
+            WHERE artifact_id=? AND state='delete_pending' AND deletion_generation=?`,
+          [now, now, row.artifactId, row.deletionGeneration],
+        );
+        if (updated.affectedRows !== 1) {
+          throw new UserDataExportIntegrityError("data export delete artifact completion was lost");
+        }
+      }
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryUserDataExportDelete(
+    outboxId: number,
+    claimToken: string,
+    input: RetryUserDataExportDeleteInput,
+  ): Promise<boolean> {
+    if (
+      !Number.isSafeInteger(outboxId)
+      || outboxId < 1
+      || !/^[A-Za-z0-9._:~-]{1,128}$/.test(claimToken)
+      || !Number.isSafeInteger(input.delayMs)
+      || input.delayMs < 0
+      || (input.maxAttempts !== undefined && (
+        !Number.isInteger(input.maxAttempts) || input.maxAttempts < 1
+      ))
+    ) throw new Error("invalid data export delete retry");
+    const now = await this.userExportDatabaseNow(this.pool);
+    const availableAtMs = now + input.delayMs;
+    if (!Number.isSafeInteger(availableAtMs)) throw new Error("data export delete retry overflow");
+    const error = sanitizeUserDataExportError(input.error);
+    if (input.maxAttempts === undefined) {
+      const [result] = await this.pool.query<mysql.ResultSetHeader>(
+        `UPDATE user_export_artifact_delete_outbox
+            SET claim_token=NULL, lease_until_ms=NULL, last_error=?, available_at_ms=?
+          WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+            AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+        [error, availableAtMs, outboxId, claimToken, now],
+      );
+      return result.affectedRows === 1;
+    }
+    const [result] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE user_export_artifact_delete_outbox
+          SET claim_token=NULL, lease_until_ms=NULL, last_error=?,
+              available_at_ms=CASE WHEN attempts>=? THEN available_at_ms ELSE ? END,
+              dead_lettered_at_ms=CASE WHEN attempts>=? THEN ? ELSE NULL END
+        WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+          AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+      [
+        error,
+        input.maxAttempts,
+        availableAtMs,
+        input.maxAttempts,
+        now,
+        outboxId,
+        claimToken,
+        now,
+      ],
+    );
+    return result.affectedRows === 1;
   }
 
   async close() {

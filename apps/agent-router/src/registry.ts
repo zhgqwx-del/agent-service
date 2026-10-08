@@ -7,6 +7,7 @@ import {
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   PURGE_POLICY_EVALUATOR_V1,
+  USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "@agent-service/protocol";
 
 /**
@@ -246,6 +247,33 @@ export class RunnerRegistry {
     const target = this.targets.get(normalized);
     return this.supportsDataGovernance(normalized)
       && target?.capabilities?.features.dataGovernanceManagement === true;
+  }
+
+  allHealthySupportUserDataExport(): boolean {
+    const healthy = this.list().filter((target) => target.healthy);
+    return healthy.length > 0 && healthy.every((target) => (
+      target.capabilities?.features.userDataExport.includes(
+        USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+      ) === true
+    ));
+  }
+
+  allConfiguredSupportUserDataExportAdmission(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.userDataExport.includes(
+        USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+      ) === true
+      && target.capabilities.features.dataExportRequests === true
+    ));
+  }
+
+  supportsUserDataExport(url: string): boolean {
+    const target = this.targets.get(url.replace(/\/+$/, ""));
+    return !!target?.healthy && target.capabilities?.features.userDataExport.includes(
+      USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+    ) === true;
   }
 
   /**

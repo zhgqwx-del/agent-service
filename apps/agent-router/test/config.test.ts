@@ -10,6 +10,8 @@ describe("router configuration", () => {
     expect(local.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(local.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(local.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
+    expect(local.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
+    expect(local.dataExportArtifactsReadable).toBe(false);
     expect(local.BLOB_MAX_BYTES).toBe(1_000_000);
     expect(local.UPSTREAM_HEADER_TIMEOUT_MS).toBe(15_000);
     expect(local.INTERNAL_ROUTER_TOKEN.length).toBeGreaterThanOrEqual(32);
@@ -47,6 +49,18 @@ describe("router configuration", () => {
     })).toThrow();
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",
+      DATA_EXPORT_REQUESTS_ENABLED: "1",
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+    })).toMatchObject({
+      DATA_EXPORT_REQUESTS_ENABLED: true,
+      dataExportArtifactsReadable: true,
+    });
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      DATA_EXPORT_REQUESTS_ENABLED: "true",
+    })).toThrow();
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
       BLOB_ATTACHMENTS_ENABLED: "1",
       BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
       BLOB_MAX_BYTES: "2048",
@@ -69,6 +83,18 @@ describe("router configuration", () => {
     })).toThrow(/exactly one runner/);
   });
 
+  it("requires exactly one acknowledged filesystem runner before export admission", () => {
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      DATA_EXPORT_REQUESTS_ENABLED: "1",
+    })).toThrow(/BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner-a:8787,http://runner-b:8787",
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+      DATA_EXPORT_REQUESTS_ENABLED: "1",
+    })).toThrow(/exactly one runner/);
+  });
+
   it("rejects a Blob ceiling above the router request-body ceiling", () => {
     expect(() => loadRouterConfig({
       RUNNERS: "http://runner:8787",
@@ -85,13 +111,29 @@ describe("router configuration", () => {
       RUNNERS: "http://runner:8787",
       NODE_ENV: "production",
       INTERNAL_ROUTER_TOKEN: "production-internal-router-token-0001",
-    }).INTERNAL_ROUTER_TOKEN).toBe("production-internal-router-token-0001");
+    })).toMatchObject({
+      INTERNAL_ROUTER_TOKEN: "production-internal-router-token-0001",
+      dataExportArtifactsReadable: false,
+    });
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      NODE_ENV: "production",
+      INTERNAL_ROUTER_TOKEN: "production-internal-router-token-0001",
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+    }).dataExportArtifactsReadable).toBe(false);
     expect(() => loadRouterConfig({
       RUNNERS: "http://runner:8787",
       NODE_ENV: "production",
       INTERNAL_ROUTER_TOKEN: "production-internal-router-token-0001",
       BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
       BLOB_ATTACHMENTS_ENABLED: "1",
+    })).toThrow(/shared object-store adapter/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      NODE_ENV: "production",
+      INTERNAL_ROUTER_TOKEN: "production-internal-router-token-0001",
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+      DATA_EXPORT_REQUESTS_ENABLED: "1",
     })).toThrow(/shared object-store adapter/);
   });
 

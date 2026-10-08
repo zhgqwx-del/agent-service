@@ -24,6 +24,7 @@ import {
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   UserErasureDrainRequest,
   isCanonicalId,
 } from "@agent-service/protocol";
@@ -53,6 +54,10 @@ export interface RouterAppDeps {
   dataGovernanceManagementEnabled?: () => boolean;
   /** Independent activation gate for non-destructive policy evaluation queue claims. */
   purgePolicyEvaluatorEnabled?: () => boolean;
+  /** Read/download surface for the configured artifact backend. Filesystem stays local-only. */
+  dataExportArtifactsEnabled?: () => boolean;
+  /** Additive fleet admission gate; status/download remain available while it is closed. */
+  dataExportRequestsEnabled?: () => boolean;
   /** Shared runner-internal credential. Omission keeps destructive routing disabled. */
   internalRunnerToken?: string;
   logger?: Pick<Console, "info" | "warn" | "error">;
@@ -106,8 +111,11 @@ const IDEMPOTENT_SESSION_DELETE = /^\/v1\/sessions\/[^/]+\/?$/;
 const SESSION_BLOB_UPLOAD = /^\/v1\/sessions\/[^/]+\/blobs\/?$/;
 const USER_ERASURE_REQUEST = /^\/v1\/data-erasure-requests\/?$/;
 const USER_ERASURE_STATUS = /^\/v1\/data-erasure-requests\/[^/]+\/?$/;
+const USER_DATA_EXPORT_REQUEST = /^\/v1\/data-export-requests\/?$/;
+const USER_DATA_EXPORT_STATUS = /^\/v1\/data-export-requests\/[^/]+\/?$/;
+const USER_DATA_EXPORT_DOWNLOAD = /^\/v1\/data-export-requests\/[^/]+\/download\/?$/;
 const DATA_GOVERNANCE_MANAGEMENT = /^\/v1\/(?:retention-policies|legal-holds)(?:\/|$)/;
-const USER_SCOPED_RUNTIME = /^\/v1\/(?:sessions(?:\/|$)|usage\/?$|data-erasure-requests(?:\/|$))/;
+const USER_SCOPED_RUNTIME = /^\/v1\/(?:sessions(?:\/|$)|usage\/?$|data-erasure-requests(?:\/|$)|data-export-requests(?:\/|$))/;
 const INTERNAL_ERASURE_BODY_MAX_BYTES = 4_096;
 
 function internalTokenMatches(received: string | undefined, expected: string | undefined): boolean {
@@ -173,6 +181,15 @@ export function createRouterApp(deps: RouterAppDeps) {
     && (deps.purgePolicyEvaluatorEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportPurgePolicyEvaluation()
   );
+  const userDataExportReadable = () => (
+    (deps.dataExportArtifactsEnabled?.() ?? false)
+    && deps.registry.allHealthySupportUserDataExport()
+  );
+  const dataExportRequestsAvailable = () => (
+    userDataExportReadable()
+    && (deps.dataExportRequestsEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportUserDataExportAdmission()
+  );
 
   app.get("/healthz", (c) => c.text("ok"));
   // Serve the immutable contract locally. Forwarding this endpoint would make API discovery depend
@@ -225,6 +242,10 @@ export function createRouterApp(deps: RouterAppDeps) {
                 // Evaluation is evidence only. Destructive execution requires a future, separate
                 // protocol and fleet gate; it cannot be enabled by runner input or this barrier.
                 dataPurgeExecution: false,
+                userDataExport: userDataExportReadable()
+                  ? [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1]
+                  : [],
+                dataExportRequests: dataExportRequestsAvailable(),
               },
             } satisfies Capabilities);
           }
@@ -467,10 +488,20 @@ export function createRouterApp(deps: RouterAppDeps) {
       && SESSION_BLOB_UPLOAD.test(url.pathname);
     const isErasureRequest = method === "POST" && USER_ERASURE_REQUEST.test(url.pathname);
     const isErasureStatus = method === "GET" && USER_ERASURE_STATUS.test(url.pathname);
+    const isDataExportRequest = method === "POST" && USER_DATA_EXPORT_REQUEST.test(url.pathname);
+    const isDataExportStatus = method === "GET" && USER_DATA_EXPORT_STATUS.test(url.pathname);
+    const isDataExportDownload = method === "GET" && USER_DATA_EXPORT_DOWNLOAD.test(url.pathname);
     const isDataGovernanceManagement = DATA_GOVERNANCE_MANAGEMENT.test(url.pathname);
     const requiresErasureCapableTarget = erasureWriterGateEnabled()
       && USER_SCOPED_RUNTIME.test(url.pathname);
-    if (isErasureRequest || isErasureStatus || isDataGovernanceManagement) {
+    if (
+      isErasureRequest
+      || isErasureStatus
+      || isDataExportRequest
+      || isDataExportStatus
+      || isDataExportDownload
+      || isDataGovernanceManagement
+    ) {
       // The same admin credential can act for multiple users, so URI-only caches must never retain
       // either an owned status body or an owner-hiding 404. This also covers router-generated gates.
       c.header("Cache-Control", "no-store");
@@ -507,6 +538,24 @@ export function createRouterApp(deps: RouterAppDeps) {
         error: {
           code: "draining",
           message: "data erasure requests are unavailable while the runner fleet is upgrading",
+          retryable: true,
+        },
+      }, 503);
+    }
+    if (isDataExportRequest && !dataExportRequestsAvailable()) {
+      return c.json({
+        error: {
+          code: "draining",
+          message: "user data export requests are unavailable while the runner fleet is upgrading",
+          retryable: true,
+        },
+      }, 503);
+    }
+    if ((isDataExportStatus || isDataExportDownload) && !userDataExportReadable()) {
+      return c.json({
+        error: {
+          code: "draining",
+          message: "user data export is unavailable while the runner fleet is upgrading",
           retryable: true,
         },
       }, 503);
@@ -593,6 +642,7 @@ export function createRouterApp(deps: RouterAppDeps) {
       }
       const targetSupportsErasure = deps.registry.supportsDataErasureRequests(target);
       const targetSupportsDataGovernance = deps.registry.supportsDataGovernance(target);
+      const targetSupportsUserDataExport = deps.registry.supportsUserDataExport(target);
       if (isDataGovernanceManagement && (
         !dataGovernanceAvailable()
         || !targetSupportsDataGovernance
@@ -627,6 +677,20 @@ export function createRouterApp(deps: RouterAppDeps) {
           },
         }, 503);
       }
+      if (
+        (isDataExportRequest && (!dataExportRequestsAvailable() || !targetSupportsUserDataExport))
+        || ((isDataExportStatus || isDataExportDownload) && (
+          !userDataExportReadable() || !targetSupportsUserDataExport
+        ))
+      ) {
+        return c.json({
+          error: {
+            code: "draining",
+            message: "user data export is unavailable while the runner fleet is upgrading",
+            retryable: true,
+          },
+        }, 503);
+      }
       tried.add(target);
       let res: Response;
       try {
@@ -641,6 +705,7 @@ export function createRouterApp(deps: RouterAppDeps) {
           isDataGovernanceManagement ||
           (method === "POST" && !!sessionId && IDEMPOTENT_TURN_POST.test(url.pathname) && !!c.req.header("idempotency-key")?.trim()) ||
           (method === "POST" && isErasureRequest && !!c.req.header("idempotency-key")?.trim()) ||
+          (method === "POST" && isDataExportRequest && !!c.req.header("idempotency-key")?.trim()) ||
           (method === "DELETE" && !!sessionId && IDEMPOTENT_SESSION_DELETE.test(url.pathname));
         const next = safeToRetry ? pickOther(deps, sessionId, tried) : undefined;
         if (!next || attempt >= maxAttempts) {
@@ -675,7 +740,14 @@ export function createRouterApp(deps: RouterAppDeps) {
         }
       }
       const response = streamBack(res);
-      if (isErasureRequest || isErasureStatus || isDataGovernanceManagement) {
+      if (
+        isErasureRequest
+        || isErasureStatus
+        || isDataExportRequest
+        || isDataExportStatus
+        || isDataExportDownload
+        || isDataGovernanceManagement
+      ) {
         // New runners already send these headers. Reassert them at the public edge so a proxying
         // regression or an unexpected upstream error can never make this identity-scoped route cacheable.
         response.headers.set("Cache-Control", "no-store");

@@ -1,6 +1,6 @@
 # 数据生命周期设计
 
-> 状态：**Archive v2、fenced tombstone、reliable terminal-event outbox、Blob ownership/业务接线与 staging orphan 清理、usage 财务分层、默认关闭且最多推进到 `awaiting_purge_policy` 的 durable user-erasure worker、`0013` quarantine/control、`0014` legacy generation-zero tombstone 补偿、`0015` canonical retention policy / multi legal hold 管理面，以及`0016`非破坏性purge-policy evaluator/authority substrate均已实现；尚未启用 ready/session 内容的物理清理**（2026-10-09）。本文给出 M1 完整数据生命周期的实现契约和安全默认值；evaluator只产生不可执行候选证据，export、tenant/key revocation、可信时钟/完整内容proof、restore replay和默认关闭的purge执行路径仍需继续实现，不得因存在`eligible_execution_disabled` authority就永久删除或匿名化用户内容。
+> 状态：**Archive v2、fenced tombstone、reliable terminal-event outbox、Blob ownership/业务接线与 staging orphan 清理、usage 财务分层、durable user-erasure、`0013` quarantine/control、`0014` legacy compensation、`0015` policy/hold、`0016`非破坏性purge authority，以及`0017`异步user-export artifact/download/TTL均已实现；尚未启用ready/session内容的物理清理**（2026-10-09）。本文给出M1完整数据生命周期的实现契约和安全默认值；tenant/key/provider/auth-secret撤销、可信时钟/完整内容proof、restore replay和默认关闭的purge执行路径仍需继续实现。
 
 ## 1. 当前实现与缺口
 
@@ -32,9 +32,15 @@ evaluator是与普通erasure worker、legacy compensation worker分离的最小�
 
 seal会重新推导owner-scoped live inventory并核对request-bound immutable policy与tenant/user hold generation/projection。build期间出现usage、receipt、Blob或session证据变化时，store抛出显式`evidence_changed`，claim-bound retry以新build generation从空cursor/root重建；sealed authority之后的同类变化或hold set/release ABA会先撤销active projection再调度新generation，旧target/decision/authority仍不可变。target不是turns/items/events/approvals全量内容清单，无法证明没有孤儿正文；eligibility deadline当前也使用runner记录的wall clock，尚未以共享数据库/可信时间处理跨VM forward/slow skew。因此validated authority仍只是non-executable candidate：未来destructive executor必须在执行事务中重验可信时间与canonical hold，并用owner-scan + `session_content_receipts`、ready Blob physical ACK、usage anonymization、receipt/Redis清理、secret revocation和独立restore-ledger ACK形成完成证明。当前`getErasureCompletionReadiness`固定返回`complete=false`并列出这些缺口。
 
+`0017_user_export_jobs_and_artifacts.sql`继续expand-only：新增owner/subject-generation绑定的request/job、白名单snapshot record/source-Blob pin、artifact/part、download lease和artifact-delete outbox。POST要求admin service key、明确user、Idempotency-Key，以及线性化点active policy中的正值`exportArtifactTtlMs`；request与job原子建立，同key重放稳定，同key异义冲突，subject已经deleting则拒绝。export与erasure在同一subject control上串行：erasure先提交时不再接收export；export先提交时erasure会把request标为revoked、撤销下载并调度精确制品清理。
+
+MySQL worker用`REPEATABLE READ WITH CONSISTENT SNAPSHOT`事务复制该owner的session/turn/item/event/approval/operational usage白名单和附件source descriptor，然后释放事务，在BlobStore中按确定性`ndjson-v1`分片发布。公开记录按固定kind、logical key和全局ordinal排序；附件按独立ordinal输出base64 chunks。header/footer、manifest/content digest和snapshot root都可重算，但制品不包含provider/API secret、idempotency material、claim/lease、subject/build fence或物理locator。只有全部part descriptor、manifest和整体bytes验证后，request/artifact才原子变为ready；序列化、source Blob或发布失败不会留下可下载的部分制品。claim、part ACK、download和delete都由attempt/token/lease/generation CAS约束，防止stale/ABA worker提交。
+
+ready status只公开content type、size、SHA-256与时间；download逐part校验owner、canonical storage key、backend/format/content type、size/hash，并在创建响应前验证完整manifest，传输时持有总寿命有硬上限的durable lease和整体digest。artifact staging TTL是无活动build claim时的orphan回收阈值，不是活动build的硬deadline；claim与cleanup在锁内竞争，claim存活或已安全接管时可以继续stage/ACK/complete，cleanup先赢时则原子failed并发布精确delete intent。普通TTL等待活动下载结束再进入delete outbox；revocation可取消活动lease并优先清理。delete worker只接受`data_exports/...`下由owner/request/artifact/part精确推导的identity，物理删除成功后才CAS ACK。Memory与MySQL共享同一契约；filesystem只支持本地单runner，production在共享对象存储adapter完成前不注入export read surface且任一export flag均fail-closed。
+
 新 usage write 会在同一 store transaction 中以 opaque `usage_id` 双写 operational ledger 与严格白名单的 billing fact；后者不含 user/session/turn/step、原始 usage JSON、prompt 或 idempotency key，金额统一以 9 位小数规范字符串写入 MySQL `DECIMAL(24,9)`，避免高金额经 JavaScript 隐式字符串化产生 checksum 漂移。session/turn/event/compaction 投影以 ledger 为权威：Memory 直接聚合事实，MySQL 在同一 consistent read/业务事务快照内用 SQL summary 聚合，读取和下一次 commit 都能修复旧 writer 留下的 partial projection，而不依赖 migration 回写。对 legacy `usage_id IS NULL` 行，显式 reconciliation 会在 tombstone generation 大于 `0`、owner 匹配的前提下先固化历史 cost 归一化，再补 ID、逐行核对或插入 billing fact，最后核对 row count、各 token、known-cost row、规范化 cost 和 checksum；冲突会回滚 ID、JSON、fact 与 reconciliation，而非覆盖。显式 anonymize primitive 还会在锁内复核 checksum 和 durable tenant/user legal hold，只删除目标 session 的 operational usage，保留 billing fact，并支持幂等重试；legal hold 只阻止尚未发生的 `verified → anonymized` 转换，不能把已提交但响应丢失的同 checksum 重试伪装成失败。它尚未由 erasure worker 或公开 API 调度。未知模型价格保持 cost 缺失，已知零价保持 `0`；历史 `usage_id IS NULL + costCNY=0` 无法可靠区分“旧 writer 用零表示未知”与“真实免费价”，因此安全默认把它视为 unknown，新版有非空 identity 的零价仍是 known-zero。普通 rollup 只有在全部 constituent 已定价时才公开完整 cost，不能把已知小计伪装成总价。硬 `maxCostCNY` 遇到未定价的正常 step 会在该 step 落账后关闭 admission，不执行其工具或下一模型 step。
 
-这意味着当前实现可以原子、安全地隐藏 gated user 数据、隔离claim-stage poison、跨 runner 收口 active execution、tombstone其全部 session、补齐可安全证明的legacy generation-zero tombstone、核对 usage、持续重投 terminal event，并生成可重评的非执行policy候选证据；但 `awaiting_purge_policy` 与`eligible_execution_disabled`都不是 erasure completed。ready 内容、operational usage、receipt/manifest 与对象字节尚未永久删除，export、tenant erasure、附件最终清理和 restore 防复活也未闭环。成功 claim 后发现的 policy/proof冲突继续使用普通 `blocked` 或专用terminal路径；quarantine与legacy incident都是独立overlay，不能把损坏审计伪装成合法状态迁移或静默跳过。
+这意味着当前实现还可以对active user生成时间点一致、可校验且自动过期的导出制品；但`awaiting_purge_policy`与`eligible_execution_disabled`都不是erasure completed。ready源内容、operational usage、receipt/manifest与对象字节尚未永久删除，tenant erasure、secret撤销、附件最终清理和restore防复活仍未闭环。export artifact cleanup只删除临时导出副本，不能替代源数据purge。
 
 ## 2. 生命周期模型与不变量
 
@@ -62,7 +68,7 @@ seal会重新推导owner-scoped live inventory并核对request-bound immutable p
 
 - `POST /v1/sessions/{id}/archive` 幂等；只允许非 active session。
 - 新增 `POST /v1/sessions/{id}/unarchive`，幂等恢复。
-- archived session 可 GET、resume、列举 turns/items/events；默认列表隐藏，`includeArchived=true` 可见。未来 export 也必须包含 archived session，但 export API 尚未实现。
+- archived session 可 GET、resume、列举 turns/items/events；默认列表隐藏，`includeArchived=true` 可见。user export 的ownership snapshot包含archived session及其白名单子资源。
 - archived session 禁止新 turn、steer、compact、approval decision 和 dynamic tool result，返回 `409 session_archived`。
 - archive/unarchive 产生持久事件 `session/archived` / `session/unarchived` 并递增 seq。
 - archive 清空 `autoApprovedTools`，异常残留的 pending approval 置为 expired；恢复后重新审批。
@@ -144,7 +150,7 @@ user scope 已实现 durable gate 与安全的非破坏性 orchestration：`POST
 7. 完成记录只保存数量与校验和，不保存正文。
 8. 从备份恢复后必须先重放独立故障域中的 erasure ledger，再开放流量，防止已删除数据复活；仅把 audit 放在同一 MySQL 不足以抵御恢复旧备份。
 
-导出应使用同一 ownership 视图，生成时间点一致的 manifest，至少包含 session/turn/item/approval/usage operational data 和用户上传附件；平台 agent/provider secret、其他用户数据和内部租约信息不得导出。导出包本身也必须有 TTL 和删除任务。
+user导出已按同一ownership视图实现：公开入口为`POST /v1/data-export-requests`、status GET和download GET，均要求admin service key与明确user，POST还要求`Idempotency-Key`。MySQL在RR一致性快照中复制session/turn/item/event/approval/operational usage与用户附件白名单，worker再生成可重算的multipart NDJSON manifest；平台agent/provider secret、其他用户数据、receipt、内部租约/fence和物理locator不进入制品。policy的`exportArtifactTtlMs`必须为正值，TTL/revocation通过独立delete outbox清理。tenant-scope export尚未公开。
 
 ## 9. Blob ownership 与 outbox
 
@@ -170,7 +176,7 @@ runner 内置 lifecycle dispatcher 只声明 `session.tombstoned` topic，读取
 
 采用 expand → activate → contract：
 
-1. 已增加 nullable tombstone 字段、parent index、两个 outbox、Blob manifest，以及 `0011` 的 usage/billing/subject 基础、`0012` 的 erasure claim queue、`0013`的quarantine/control/terminal-incident substrate、`0014`的legacy tombstone cutover/job/result substrate、`0015`的canonical policy/multi-hold authority和`0016`的非破坏性policy-evaluation/authority substrate。各迁移都不启用purge；冻结历史fixtures会从`0007`逐段真实升级到`0016`，并验证partial DDL、错误索引、marker-loss replay、append-only evidence guards、cutover/session-write、policy-activation/request-insert和0016 destructive dormancy。
+1. 已增加 nullable tombstone 字段、各生命周期outbox/Blob manifest，以及 `0011` usage/subject、`0012` erasure queue、`0013` quarantine/control、`0014` legacy compensation、`0015` policy/hold、`0016` non-destructive authority和`0017`user-export substrate。各迁移都不启用purge；冻结历史fixtures会从`0007`逐段真实升级到`0017`，并验证partial DDL、marker-loss、append-only guards和destructive dormancy。
 2. tombstone 是 protocol family `2026-10-08` 内的 additive capability，不提升 exact protocol version。客户端必须忽略未知 event；新 router 能同时探测未声明和已声明 `tombstone` 的同 family runner。
 3. 先在 API gateway 暂停精确 session DELETE（或将流量整体切到 gate 为 `0` 的新 router 池），再发布新 router 并保持 `SESSION_TOMBSTONE_ENABLED=0`；在开始发布新 runner 前，排空并退出全部不能理解新 capability 的旧 router。旧 router 自身没有该 gate，因此不能在它仍接收 DELETE 时只靠逐实例替换保证一致语义；runner 端口必须保持内网不可直连，否则会绕过 gate。切换后其它 API 保持可用，精确的 session DELETE 返回可重试 `503 draining`。
 4. 再滚动新 runner。router 除显式开关外还要求全部健康 runner 都声明 `tombstone`，所以旧 owner/哈希目标仍存在时不会激活新 DELETE 语义；核对配置 fleet 和 `/v1/capabilities` 后，才把新 router 的 `SESSION_TOMBSTONE_ENABLED` 设为 `1`。外部 DELETE 会改写成带 `INTERNAL_ROUTER_TOKEN` 的版本化 runner-only POST，并要求 ACK；旧 runner 只会 404，router 不会回退到旧公开 DELETE。`RUNNERS` 每项必须是实例稳定地址，不能是随机选择不同版本 Pod 的共享 LB；token 轮换期间先把 gate 恢复为 `0`。
@@ -180,8 +186,9 @@ runner 内置 lifecycle dispatcher 只声明 `session.tombstoned` topic，读取
 8. 全部 legacy writer drain 后，才能清理允许删除的 pending receipt或激活0014 cutover。generation `0` 补偿已实现，但cutover本身是不可逆contract边界；不能把本地默认开启误抄成production默认，也不能用关闭feature flag撤销已经提交的activation。当前erasure worker仍最多到 `awaiting_purge_policy`；claim-stage poison进入`0013` quarantine，legacy补偿的owner/session/child/proof冲突进入独立terminal incident。两类证据都不能catch-and-skip、直接改表或伪造成成功。
 9. `session.purge` 与 ready 内容的物理 purge 独立保持关闭；canonical policy/hold authority和非破坏性evaluator虽已实现，仍须完成可信时钟/完整内容证明、destructive usage匿名化、备份恢复演练和destructive-worker校验后才允许启用。当前版本会对意外的 `purging` claim fail-closed 为 `policy_unavailable`；未来激活前必须升级并排空这些旧 worker，避免它们与新版 purge worker抢单。
    `0016` evaluator现在可以生成`eligible_execution_disabled`候选，但这不改变上述结论：它由runner wall clock判断deadline，只摘要per-session policy targets，且没有execution queue。未来executor rollout必须另建默认关闭的双端gate和最小权限接口，以数据库/可信时间重验deadline与两级hold，完成owner-scan + `session_content_receipts`及全部physical ACK后才能进入`purging/completed`。
-10. usage 采用先双写、再锁内回填/核对、最后显式匿名化；不能一次 migration 直接破坏现有 attribution/唯一键。
-11. staging/production 使用独立 migration Job，runner 只检查 schema；本地/CI 可继续自动迁移。sticky barrier只能约束新worker；它不能阻止旧worker直接连接数据库，所以混跑结束、旧worker drain、最大lease等待和网络/进程层阻断是不可省略的发布条件。0014 session trigger会拒绝cutover后的legacy tombstone写，但这只是fail-closed保护，不是允许旧binary继续运行的兼容承诺。
+10. user export采用migration→code-aware→worker→admission：先应用`0017`，部署admission=`0`的新router/runner并排空旧进程，再先启cleanup、后启build worker，最后启runner/router writer gate。关闭admission后已有job/status/download/cleanup继续forward-fix。当前filesystem只允许local单runner；production完全不宣告该read surface且任一export flag都fail-closed，直到共享对象存储adapter完成。
+11. usage 采用先双写、再锁内回填/核对、最后显式匿名化；不能一次 migration 直接破坏现有 attribution/唯一键。
+12. staging/production 使用独立 migration Job，runner 只检查 schema；本地/CI 可继续自动迁移。sticky barrier只能约束新worker；它不能阻止旧worker直接连接数据库，所以混跑结束、旧worker drain、最大lease等待和网络/进程层阻断是不可省略的发布条件。0014 session trigger会拒绝cutover后的legacy tombstone写，但这只是fail-closed保护，不是允许旧binary继续运行的兼容承诺。
 
 ## 11. 待确认策略
 
@@ -200,7 +207,7 @@ runner 内置 lifecycle dispatcher 只声明 `session.tombstoned` topic，读取
 
 ## 12. 验收矩阵
 
-当前还覆盖 `0012` queue 的 exact lease/ABA/audit rollback、`0013`逐候选quarantine/control CAS/repair rollback、`0014`cutover/compensation、`0015`policy/hold CAS、审计回滚、跨时钟、activation/request与hold/anonymize线性化，以及`0016`evaluation claim/ABA、deadline、live-evidence/hold重评、seal回滚和non-executable completion；另有claim-bound固定 session action、content-free catalog/completeness proof、catalog→usage 间 proof 损坏的事务内重验、core phase/crash retry，以及真实 MySQL+Redis 双 runner 的 remote active-turn drain、owner SIGKILL/fence takeover和quarantine后重启/repair。固定历史 fixtures证明从`0007`逐段升级到`0016`时DDL中断/marker-loss可恢复、证据不被重写且cutover/legacy writer、policy activation/legacy request insert与0016 destructive dormancy均受门禁。erasure worker只到 `awaiting_purge_policy`，补偿worker只建立generation 1 proof，evaluator只建立不可执行候选；因此以下矩阵中的 destructive purge、export、tenant/key revocation与 backup replay 仍是后续验收目标：
+当前还覆盖`0012`到`0016`的queue/quarantine/compensation/policy/evaluator语义，以及`0017`export request/job原子性、RR snapshot、真实core worker跨层发布、确定性制品、下载lease、TTL/撤销delete outbox与owner隔离。固定历史fixtures从`0007`逐段升级到`0017`并证明DDL中断/marker-loss可恢复且原证据不被重写。以下矩阵中的destructive purge、tenant/key revocation与backup replay仍是后续验收目标：
 
 - Memory/MySQL conformance：archive/unarchive 幂等、archived 禁写、事件 seq 连续、tombstone 隐藏且拒写、失败全回滚。
 - MySQL + Redis 并发：turn/archive/delete 竞态、stale fence、lease loss、orphan active repair。
@@ -209,6 +216,6 @@ runner 内置 lifecycle dispatcher 只声明 `session.tombstoned` topic，读取
 - tenant/user 隔离：跨主体 archive/delete/unarchive 与不存在一致。
 - usage/idempotency：worker-driven reconcile 与 crash/resume 已覆盖；仍需 policy-gated anonymize、receipt purge、长期保留期和完成审计。tombstone 后 receipt 不重放；legacy pending 在旧实例 drain 前保留。
 - Blob/outbox：已覆盖 staging orphan、对象删除重试/重复领取、跨 tenant/user/session 注入；仍需覆盖 session purge 原子调度全部 ready blob、批次 crash/resume 和共享对象存储故障。
-- erasure：user gate、正常 queue、claim-stage poison quarantine/control audit/CAS repair、generation `0`可审计补偿、canonical policy/multi-hold管理、admission binding、跨 runner drain、状态推进到 policy boundary，以及non-destructive evaluator的批次游标、crash/resume、evidence/hold ABA重评均已覆盖；仍需trusted-clock与完整content receipt、tenant key/secret先失效、export artifact/TTL、physical purge和completed证明。
+- erasure/export：user gate、queue/quarantine、legacy补偿、policy/multi-hold、跨runner drain与non-destructive evaluator均已覆盖；export artifact/download/TTL也已覆盖成功、序列化/source/blob失败、并发claim/ABA、真实MySQL回滚、跨owner404和erasure撤销。仍需trusted-clock与完整content receipt、tenant key/secret先失效、physical purge和completed证明。
 - rolling upgrade：additive capability、私有fleet barrier、部分回填重启和全旧实例 drain 后才激活新不变量已覆盖；固定N-1镜像的真实混版本canary仍留到M4发布编排。
 - 备份恢复：先重放 erasure ledger，已删除主体的数据不会重新开放。

@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、admission 默认关闭的 durable user-erasure gate/queue/worker、legacy generation `0` 补偿、canonical retention policy / multi legal hold管理面，以及默认关闭的非破坏性purge-policy evaluator/authority substrate已完成。`0016`只建立claim-bound evaluation job、按build generation不可变的per-session target、rooted decision chain与不可执行authority；双端gate默认关闭，`dataPurgeExecution=false`且completion固定为false。live evidence或hold ABA会撤销active projection并以新generation重评，但deadline仍使用runner wall clock，target也不是全部内容行清单。异步 export artifact/TTL、tenant erasure及 key/provider/auth-secret 撤销、可信时钟/owner-scan content receipt、ready/session物理purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority，以及异步user-export artifact/download/TTL均已完成。`0017`建立owner-scoped request/job、RR一致性snapshot、确定性multipart NDJSON、durable download lease和独立artifact-delete outbox；新request gate默认关闭，本地build/cleanup worker可处理已有job。tenant erasure及key/provider/auth-secret撤销、可信时钟/owner-scan content receipt、ready/session物理purge、completed proof与restore replay仍未完成，M1尚未闭环。M2本地/CI代码范围已完成并正式冻结；M3/M4尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -446,3 +446,31 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - target是per-session policy摘要而非turns/items/events/approvals全量内容清单，无法排除孤儿正文。未来执行事务必须owner-scan并提交`session_content_receipts`，同时补齐ready Blob physical ACK、operational usage anonymization、idempotency receipt与Redis清理、provider/auth secret撤销、独立restore-ledger ACK；上述proof全部缺失时completion保持false。
 - 两项非阻断P3留到后续运维/性能切片：MySQL scheduler的初选会把缺失或损坏latest decision的sealed job安全地排除但不会主动quarantine/告警；同一查询当前也没有due水位或分页，长期稳定backlog会被每轮全量复核。它们不会生成authority或启用purge，但M4需补poison可观测性、due index/水位与有界扫描。
 - M1仍需异步export artifact/download/TTL、tenant erasure及key/provider/auth-secret撤销、默认关闭且分权的ready/session destructive executor、completed proof与独立故障域restore replay。完成这些local/CI可验证范围后再正式进入M3；真实共享对象存储、KMS/Secret、Kubernetes rollout、域名/TLS和云MySQL/Redis拓扑继续等待实际资源，不能编造。
+
+## 2026-10-09（M1 数据生命周期：0017 异步 user export artifact / download / TTL）
+
+### 已完成
+
+1. 新增expand-only的`0017_user_export_jobs_and_artifacts.sql`：owner/subject-generation绑定的request/job、不可变snapshot record、source-Blob pin、artifact/part、download lease和artifact-delete outbox。migration不创建request、不扫描/导出历史内容、不启用HTTP gate或worker，也不改变`0016` purge authority的非执行语义。
+2. POST admission在Memory/MySQL中原子建立request与job，并与active retention policy的正值`exportArtifactTtlMs`绑定；tenant/user/idempotency作用域、同key重放/异义冲突及export/erasure的subject锁线性化均有回归。subject进入deleting后不再接收新export；已先提交的export会被erasure撤销、取消download lease并调度精确制品清理。
+3. MySQL worker用`REPEATABLE READ WITH CONSISTENT SNAPSHOT`复制owner白名单数据和附件descriptor，事务外按固定kind/logical-key/ordinal生成确定性的multipart `ndjson-v1`。附件按base64 chunk输出；secret、idempotency、claim/lease、subject/build fence、storage backend/format/key等私有信息均不进入制品。只有part、manifest、整体size/hash全部核对后，request/artifact/job才原子变为ready。
+4. build、part ACK、download与delete均使用attempt/token/lease/generation CAS防stale/ABA。download在任何Blob读取前重复核对owner、subject/build/deletion generation、policy、format/schema/content type、canonical key、part连续性、总大小与manifest；durable lease重放单调且单次存活期硬限制10分钟。普通artifact TTL等待活动download结束，erasure revocation可立即撤销；物理删除通过独立outbox完成后才CAS ACK。
+5. artifact staging TTL明确为“无活动build claim时的orphan回收阈值”，不是活动build的硬deadline。claim与cleanup在request→job→artifact→parts锁序下竞争：活动或已接管的exact claim可继续stage/ACK/complete；cleanup先赢则原子failed、释放snapshot并生成精确delete intent。Memory/MySQL语义及真实InnoDB竞态测试一致。
+6. poison request/job/artifact处理采用fail-closed隔离。可证明owner/generation/active指针一致时，quarantine在一个事务中先把exact artifact/parts转`delete_pending`并写outbox，再失败request/job和释放snapshot；故障注入证明中途失败全部回滚。坐标本身冲突时不猜测owner、不自动删除；单个poison候选也不会饿死同轮健康邻居。
+7. runner新增三个公开操作：`POST /v1/data-export-requests`、status GET和download GET；router/runner双端admission gate默认关闭，build/cleanup worker与admission分离。filesystem read surface只在非production、显式single-runner断言下注入/宣告；production即使误配flag或runner误报capability也fail-closed，待共享对象存储adapter完成后再设计多VM/Pod rollout。OpenAPI 3.1与生成TypeScript SDK同步到53个操作。
+8. 冻结`mysql-0016.sql`并增加独立`0016 → 0017`真实MySQL夹具；完整历史wrapper固定执行`0007 → ... → 0017`。CI/local verify增加named export no-skip proof、migration manifest和runner image `0017` marker；学习指南同步本地启停、手工export体验、router/runner职责、Node bundle与Linux OCI image、GitHub Actions构建内容及local→staging→production同digest promotion边界。
+
+### 本轮验证与审查
+
+- `pnpm check:secrets`通过，扫描 **269 files**；`pnpm check:api`、`pnpm check:sdk`、`pnpm typecheck`与`git diff --check`通过，生成OpenAPI/SDK无漂移，SDK真实 **18-file** package在隔离consumer中验证。
+- export相关10个定向文件 **151/151**；Memory export **11/11**；named真实MySQL export **11/11**，required wrapper明确证明目标文件实际执行且无skip。真实套件覆盖request/job原子回滚、并发idempotency、RR snapshot回滚/重试、source Blob pin、core worker跨层发布、claim ABA、export/erasure串行、download TTL lease、staging orphan cutoff、poison quarantine与delete dead-letter邻居进度。
+- 固定10文件历史MySQL迁移 **39/39**，其中`0016 → 0017` **5/5**；wrapper逐文件证明`0007 → 0008`的相同usage重复安全合并、内容冲突阻断及legacy pending receipt保留仍真实执行，`0010 → 0011`的through-latest路径也已覆盖到`0017`。
+- `scripts/local-service.sh verify`主套件 **922 passed / 1 skipped**；唯一skip是真实厂商E2E的显式开关。覆盖率 **83.17% statements / 78.63% branches / 86.82% functions / 86.83% lines**，MySQL store **85% lines**；cluster **14/14**；SDK package与runner/router两个独立Node 24 bundle均完成构建，并以原生Node验证启动、readiness、转发和OpenAPI。
+- 从并发正确性、事务回滚、滚动升级、安全隔离和测试有效性进行三轮独立复核，最终无P0/P1。复核促成下载前完整identity/manifest校验、production read-surface关闭、NDJSON私有字段扫描、poison artifact原子清理、staging TTL一致语义及download lease硬上限。本轮没有改变provider dialect或真实厂商网络契约，因此未重复运行收费的`verify-real`或十阶段acceptance；最近真实模型 **1/1** 与acceptance通过只保留为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2本地/CI冻结结论不变，本轮仍属于M1，没有开始M3。异步user export的local/CI代码范围已完成，但它只生成临时副本，不能替代源数据purge或证明erasure completed。
+- 当前MySQL snapshot capture仍在一个RR事务内全量读取并序列化单个user数据，同时持有subject SHARE及request/job锁；超大user可能放大runner内存、MVCC事务时长和erasure等待。正式production开放export前必须用同一快照内的keyset分页/流式hash-insert或明确的record/byte资源上限收口，并做长用户压测。
+- 身份坐标本身发生特权数据库损坏时，cleanup会安全拒绝猜测删除，可能保留孤儿制品，未来需受审计maintenance remediation。后续ready/session物理purge executor必须尊重未释放的export source-Blob pin；当前destructive purge仍关闭，因此不是现时删除竞态。
+- M1下一步仍是tenant erasure、key/provider/auth-secret撤销、使用可信数据库时间和owner-scan/content receipt的默认关闭destructive executor、ready Blob/session及receipt/Redis物理清理、completed proof与独立故障域restore replay。完成这些local/CI可验证范围后才能正式冻结M1并进入M3；没有云资源不阻止继续实现代码与本地门禁，但共享对象存储、KMS/Secret、Kubernetes、云MySQL/Redis、域名/TLS、备份和真实IdP仍必须等待实际环境，不能伪造参数或宣称已部署。

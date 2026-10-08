@@ -28,6 +28,7 @@
     "test:erasure-catalog-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/erasure-catalog.mysql.test.ts",
     "test:erasure-usage-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/erasure-usage.mysql.test.ts",
     "test:legacy-tombstone-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/legacy-tombstone-compensation.mysql.test.ts",
+    "test:user-data-export-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/user-data-export.mysql.test.ts",
     "test:outbox-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/lifecycle-outbox.mysql.test.ts",
     "test:watch": "vitest",
     "dev:runner": "pnpm --filter @agent-service/runner dev",

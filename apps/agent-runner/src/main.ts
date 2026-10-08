@@ -10,6 +10,8 @@ import {
   SessionBlobService,
   SessionHost,
   StaticToolRegistry,
+  UserDataExportCleanupWorker,
+  UserDataExportWorker,
   builtinTools,
 } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService, PROVIDER_PRESETS } from "@agent-service/providers";
@@ -36,6 +38,9 @@ import {
   type SubjectLifecycleStore,
   type SessionStore,
   type UsageLifecycleStore,
+  type UserDataExportCleanupStore,
+  type UserDataExportJobStore,
+  type UserDataExportRequestStore,
 } from "@agent-service/store";
 import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
@@ -57,7 +62,10 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & LegacyTombstoneCompensationStore
     & RetentionPolicyStore
     & UsageLifecycleStore
-    & ErasureSessionStore = cfg.STORE === "mysql"
+    & ErasureSessionStore
+    & UserDataExportRequestStore
+    & UserDataExportJobStore
+    & UserDataExportCleanupStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({ url: cfg.MYSQL_URL })
     : new MemorySessionStore();
   const lease: LeaseStore = cfg.REDIS_URL ? new RedisLeaseStore(cfg.REDIS_URL) : new MemoryLeaseStore();
@@ -189,9 +197,34 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       retryMaxMs: cfg.PURGE_POLICY_EVALUATOR_RETRY_MAX_MS,
     })
     : undefined;
+  const dataExportWorker = cfg.DATA_EXPORT_WORKER_ENABLED
+    ? new UserDataExportWorker({ store, blob: blobStore }, {
+      pollIntervalMs: cfg.DATA_EXPORT_WORKER_POLL_MS,
+      leaseMs: cfg.DATA_EXPORT_WORKER_LEASE_MS,
+      batchSize: cfg.DATA_EXPORT_WORKER_BATCH_SIZE,
+      snapshotPageSize: cfg.DATA_EXPORT_SNAPSHOT_PAGE_SIZE,
+      artifactStagingTtlMs: cfg.DATA_EXPORT_ARTIFACT_STAGING_TTL_MS,
+      maxSourceBlobBytes: cfg.BLOB_MAX_BYTES,
+      retryBaseMs: cfg.DATA_EXPORT_WORKER_RETRY_BASE_MS,
+      retryMaxMs: cfg.DATA_EXPORT_WORKER_RETRY_MAX_MS,
+      poisonMaxAttempts: cfg.DATA_EXPORT_WORKER_POISON_MAX_ATTEMPTS,
+    })
+    : undefined;
+  const dataExportCleanup = cfg.DATA_EXPORT_CLEANUP_ENABLED
+    ? new UserDataExportCleanupWorker({ store, blob: blobStore }, {
+      pollIntervalMs: cfg.DATA_EXPORT_CLEANUP_POLL_MS,
+      leaseMs: cfg.DATA_EXPORT_CLEANUP_LEASE_MS,
+      batchSize: cfg.DATA_EXPORT_CLEANUP_BATCH_SIZE,
+      retryBaseMs: cfg.DATA_EXPORT_CLEANUP_RETRY_BASE_MS,
+      retryMaxMs: cfg.DATA_EXPORT_CLEANUP_RETRY_MAX_MS,
+      poisonMaxAttempts: cfg.DATA_EXPORT_CLEANUP_POISON_MAX_ATTEMPTS,
+    })
+    : undefined;
   legacyTombstoneCompensationWorker?.start();
   erasureWorker?.start();
   purgePolicyEvaluator?.start();
+  dataExportWorker?.start();
+  dataExportCleanup?.start();
 
   let ready = true;
   const app = createApp({
@@ -206,6 +239,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     dataGovernanceManagementEnabled: cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
     retentionPolicy: store,
     purgePolicyEvaluationSupported: true,
+    ...(cfg.dataExportArtifactsReadable ? {
+      userDataExport: store,
+      dataExportBlob: blobStore,
+    } : {}),
+    dataExportRequestsEnabled: cfg.dataExportArtifactsReadable && cfg.DATA_EXPORT_REQUESTS_ENABLED,
+    dataExportDownloadLeaseMs: cfg.DATA_EXPORT_DOWNLOAD_LEASE_MS,
     subjectLifecycle: store,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
     ready: () => ready,
@@ -231,6 +270,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         erasureWorker?.stop(),
         legacyTombstoneCompensationWorker?.stop(),
         purgePolicyEvaluator?.stop(),
+        dataExportWorker?.stop(),
+        dataExportCleanup?.stop(),
       ]);
       await host.drain(30_000);
       await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
@@ -264,10 +305,11 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,
+    dataExportWorker, dataExportCleanup,
     blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };
