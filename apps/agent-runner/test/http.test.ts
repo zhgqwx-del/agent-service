@@ -62,7 +62,7 @@ async function makeApp(heartbeatMs = 60_000) {
     platform: [ProviderService.preset("dashscope", "x")],
     assertBaseUrl: async () => {},
   });
-  const fake: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, apiKey: async () => "k" };
+  const fake: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, input: ["text"], apiKey: async () => "k" };
   const tools = new StaticToolRegistry(builtinTools);
   const host = new SessionHost({ store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), engine: new EchoEngine(), providers: { resolve: async () => fake }, tools, config: { runnerId: "r", runnerAddr: "x", leaseHoldMs: 10 } });
   const cipher = new LocalAesGcmCipher("33".repeat(32));
@@ -424,5 +424,19 @@ describe("agent-runner HTTP API", () => {
     const models = await j<{ data: { provider: string; id: string }[] }>(await call("/v1/models"));
     expect(models.data.some((m) => m.provider === "mine" && m.id === "m")).toBe(true);
     expect((await call("/v1/providers/mine", { method: "DELETE" })).status).toBe(204);
+  });
+
+  it("rejects empty, image-only, and duplicate model capabilities at the HTTP boundary", async () => {
+    const { call } = await makeApp();
+    const invalidInputs = [[], ["image"], ["text", "text"], ["image", "image"]];
+    for (const [index, input] of invalidInputs.entries()) {
+      const response = await call(`/v1/providers/invalid-${index}`, {
+        method: "PUT",
+        body: JSON.stringify({ baseUrl: "https://example.com/v1", models: [{ id: "m", input }] }),
+      });
+      expect(response.status, JSON.stringify(input)).toBe(400);
+    }
+    const listed = await j<{ data: { id: string }[] }>(await call("/v1/providers"));
+    expect(listed.data.some((provider) => provider.id.startsWith("invalid-"))).toBe(false);
   });
 });

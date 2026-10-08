@@ -29,6 +29,8 @@ import {
   AgentMessageItem,
   ApprovalRequestItem,
   ContextCompactionItem,
+  ImageInputPart,
+  ImageMediaType,
   InputPart,
   ItemStatus,
   ReasoningItem,
@@ -36,12 +38,14 @@ import {
   ToolCallItem,
   ToolContentPart,
   ToolKind,
+  ToolOutputPayload,
   ToolResultItem,
   TextInputPart,
   UserMessageItem,
 } from "./item.js";
 import {
   ModelPrice,
+  ModelInputCapabilities,
   ModelSpec,
   ProviderCompat,
   ProviderConfig,
@@ -114,6 +118,8 @@ export type EventStreamEvent = z.infer<typeof EventStreamEvent>;
 
 export const AgentIdParams = z.object({ id: idSchema("agt") });
 export const SessionIdParams = z.object({ id: idSchema("sess") });
+export const SessionBlobParams = z.object({ id: idSchema("sess"), blobId: idSchema("blob") });
+export const SessionItemOutputParams = z.object({ id: idSchema("sess"), itemId: idSchema("item") });
 export const SessionTurnParams = z.object({ id: idSchema("sess"), turnId: idSchema("turn") });
 export const SessionApprovalParams = z.object({ id: idSchema("sess"), approvalId: idSchema("apr") });
 export const ProviderIdParams = z.object({ id: externalId });
@@ -209,7 +215,7 @@ export const ModelPriceResponse = ModelPrice.extend({
 export const ModelSpecResponse = ModelSpec.extend({
   contextWindow: z.number().int().positive(),
   maxOutputTokens: z.number().int().positive(),
-  input: z.array(z.enum(["text", "image"])),
+  input: ModelInputCapabilities,
   reasoning: z.boolean(),
   price: ModelPriceResponse.optional(),
 });
@@ -330,7 +336,8 @@ export const ResumeSessionHttpResponse = ResumeSessionResponse.extend({
 });
 export type ResumeSessionHttpResponse = z.infer<typeof ResumeSessionHttpResponse>;
 
-const UserMessageItemResponse = UserMessageItem.extend({ content: z.array(TextInputPart) });
+const CurrentTurnInputPart = z.discriminatedUnion("type", [TextInputPart, ImageInputPart]);
+const UserMessageItemResponse = UserMessageItem.extend({ content: z.array(CurrentTurnInputPart) });
 const AgentMessageItemResponse = AgentMessageItem.extend({ phase: z.enum(["commentary", "finalAnswer"]) });
 const ToolResultItemResponse = ToolResultItem.extend({ isError: z.boolean() });
 const ContextCompactionItemResponse = ContextCompactionItem.extend({ usageSnapshot: UsageResponse.optional() });
@@ -348,6 +355,19 @@ export type ItemResponse = z.infer<typeof ItemResponse>;
 export const ItemListResponse = z.object({ data: z.array(ItemResponse) });
 export type ItemListResponse = z.infer<typeof ItemListResponse>;
 
+export const BlobUploadResponse = z.object({
+  blobId: idSchema("blob"),
+  purpose: z.literal("input_image"),
+  state: z.literal("staging"),
+  sizeBytes: z.number().int().nonnegative(),
+  contentType: ImageMediaType,
+  expiresAtMs: z.number().int(),
+});
+export type BlobUploadResponse = z.infer<typeof BlobUploadResponse>;
+
+export const ItemOutputResponse = ToolOutputPayload;
+export type ItemOutputResponse = z.infer<typeof ItemOutputResponse>;
+
 export const ApprovalListResponse = z.object({ data: z.array(Approval) });
 export type ApprovalListResponse = z.infer<typeof ApprovalListResponse>;
 
@@ -364,7 +384,7 @@ export const AgentDefinitionRequest = AgentDefinitionInput.extend({
 export const ApiKeyCreateRequest = CreateApiKeyRequest;
 export const TenantAuthUpdateRequest = TenantAuthPolicyInput;
 export const SessionCreateRequest = CreateSessionRequest;
-const CurrentTurnInput = z.array(TextInputPart).min(1).max(32);
+const CurrentTurnInput = z.array(CurrentTurnInputPart).min(1).max(32);
 export const TurnStartRequest = StartTurnRequest.extend({ input: CurrentTurnInput });
 export const TurnSteerRequest = SteerRequest.extend({ input: CurrentTurnInput });
 export const DynamicToolResultSubmitRequest = DynamicToolResultRequest;

@@ -1,6 +1,6 @@
 # 数据生命周期设计
 
-> 状态：**Archive v2、fenced tombstone 与 reliable terminal-event outbox dispatcher 已实现；待产品/合规确认，尚未启用物理清理**（2026-10-08）。本文给出 M1 完整数据生命周期的实现契约和安全默认值；在“待确认策略”确定前，只允许继续实现 ownership manifest/Blob 接线、erasure gate/export、legacy 补偿和测试，不得自动永久删除数据。
+> 状态：**Archive v2、fenced tombstone、reliable terminal-event outbox，以及 Blob ownership/业务接线与 staging orphan 清理已实现；待产品/合规确认，尚未启用 ready/session 内容的物理清理**（2026-10-08）。本文给出 M1 完整数据生命周期的实现契约和安全默认值；在“待确认策略”确定前，只允许继续实现 erasure gate/export、legacy 补偿、usage 对账匿名化、默认关闭的 purge 路径和测试，不得自动永久删除用户内容。
 
 ## 1. 当前实现与缺口
 
@@ -8,11 +8,13 @@
 
 `DELETE` 已通过 `SessionHost` 使用同一队列、lease/fence 和 orphan repair。Memory/MySQL 在一个原子 commit 中写入 tombstone marker、terminal `session/deleted`、连续 seq、单调 `deletion_generation`、立即可用的 `session.tombstoned` intent 和不可领取的 `session.purge` intent；`purge_after_ms` 安全默认为 `NULL`。普通 session/turn/item/approval/usage/receipt 随即隐藏且普通 commit 拒写，同 owner 重试幂等；已建立的 SSE 可收到 terminal event 后关闭。parent create/delete 行锁还保证并发时不会留下指向 tombstoned parent 的 child。
 
-`BlobStore` 已有 memory 与本地文件实现；本地格式使用无大小写歧义的 key 和版本化 ref、带长度/校验和的单 envelope 原子发布，并覆盖路径、权限、静态 symlink、损坏及并发测试，也可读取/删除安全 key 范围内的旧 raw + sidecar 格式。但它尚未接入 item，也没有数据库 ownership manifest、Blob 专用 outbox 或孤儿回收；filesystem root 仍必须由服务独占，且本地 rename 不代表断电持久性。当前通用 lifecycle outbox 只记录 session 级 intent，不能替代 blob ownership。`outputRef` 因此仍只是协议预留字段，不能当成已完成的大输出生命周期。
+`BlobStore` 已有 memory 与本地文件实现；本地格式使用无大小写歧义的 key、带长度/校验和的单 envelope create-only 原子发布，并覆盖路径、权限、静态 symlink、损坏及并发测试，也可读取/删除安全 key 范围内的旧 raw + sidecar 格式。`0010` 增加 case-sensitive `blob_objects` ownership manifest 和独立 `blob_delete_outbox`；Memory/MySQL 都实现 staging/upload/原子 item 绑定、owner-scoped ready 读取、claim lease/CAS 删除与 stale staging 调度。用户图片以 opaque `blobId` 持久化，绑定前会校验声明 MIME 与文件签名，执行前还会检查所选模型的 image input 能力；大工具输出通过 `outputRef` 外置，当前 step 与重放使用同一份 JSON-safe 结果。历史按新到旧在总水化预算内读取 manifest 和对象，超出预算的旧图片/输出变成明确占位符；提交失败不会留下 ready manifest 或 item/event 半状态。当前 compaction 只保证 summary range 内的外置工具事实全部物化后才推进 watermark；历史图片在 planning/summary 投影中是文字占位，像素不会跨过 compaction 保留，未来必须增加视觉摘要/OCR 或等价策略后才能宣称多模态长期上下文无损。
+
+runner 内置 Blob cleanup worker 目前只把过期 staging orphan 标记为 `delete_pending`，再以 at-least-once 语义物理删除并转为 `deleted`；ready/session blob 不会被该 sweeper 选中。filesystem delete 会先持久化 key-scoped cancellation fence，阻止任何迟到 writer 在 outbox ACK 后复活对象；该微小 marker 当前不做 GC，长期 churn 会累积 metadata 文件。filesystem root 仍必须由一个服务实例独占，且本地 hard-link 原子发布不代表断电持久性；因此本地单 runner 只有显式设置 `BLOB_FILESYSTEM_SINGLE_RUNNER=1` 才能开放写入或 cleanup。该设置是运维断言而非分布式锁；TTL、outbox claim 和重试边界目前比较 runner 传入的 wall-clock 毫秒，未来多 VM 部署必须约束并监控时钟偏差或改用共享数据库时间。`NODE_ENV=production` 下 Blob 写入和 cleanup 都会 fail-closed，直到实现具有等价条件发布/删除栅栏的共享 OSS/S3 适配器。session purge 与 ready blob 的原子 `delete_pending` 接线仍未完成，不能宣称附件或大输出已满足最终删除。
 
 runner 启动时会同时启动 lifecycle outbox dispatcher。它只领取 `session.tombstoned`，重新读取 durable `session/deleted` 并校验 session、seq 与 generation，再发布到 event bus；claim lease/CAS 与有上限的指数退避使进程崩溃和暂时总线/存储失败可以持续恢复，不会因次数耗尽而永久停投。确定损坏的 envelope/event identity 会隔离到 dead-letter，且 poison row 不会阻塞后续 intent。投递是 at-least-once，丢失完成确认时允许重复发布同一 event `seq`，`SessionHost` 的订阅路径会按 seq 去重并补洞；这不是 exactly-once 承诺。
 
-这意味着当前实现可以原子、安全地隐藏 tombstoned 数据，并对可恢复故障持续重投 terminal event；但不能宣称内容已永久删除，或已满足用户主体删除、财务保留、导出和附件清理要求。确定损坏的 dead-letter 目前只有 durable marker；dispatcher 识别出的 event identity 损坏另有受控日志，但 claim 阶段识别出的 malformed envelope 不会主动产生日志。管理端查看、修复/重放、指标和告警均尚未闭环。
+这意味着当前实现可以原子、安全地隐藏 tombstoned 数据、持续重投 terminal event，并清理由上传/提交失败产生的 staging 对象；但不能宣称 ready 内容已永久删除，或已满足用户主体删除、财务保留、导出和附件最终清理要求。确定损坏的 dead-letter 目前只有 durable marker；dispatcher 识别出的 event identity 损坏另有受控日志，但 claim 阶段识别出的 malformed envelope 不会主动产生日志。管理端查看、修复/重放、指标和告警均尚未闭环。
 
 ## 2. 生命周期模型与不变量
 
@@ -133,25 +135,26 @@ blob_objects(
 
 其中 `state = staging | ready | delete_pending | deleted`。初期禁止跨 item/session 共享 blob，避免危险引用计数；未来若做去重，再加显式 reference table。
 
-上传先进入 staging；manifest 与 item 原子关联后才 ready。上传成功而数据库事务失败的对象由 staging orphan sweeper 删除。session purge 事务只标记 `delete_pending` 并写 outbox；worker 幂等删除对象，对象已不存在视为成功。
+上传先进入 staging；manifest 与 item 原子关联后才 ready。上传成功而数据库事务失败的对象由 staging orphan sweeper 删除。该部分已经实现，并覆盖 binding/sweeper 竞态、事务回滚、跨 owner 注入、claim lease/retry/CAS complete。目标态的 session purge 事务还需把该 session 的 ready manifest 标记为 `delete_pending` 并写 outbox；worker 幂等删除对象，对象已不存在视为成功。
 
 当前 `lifecycle_outbox` 已包含 `UNIQUE(topic, aggregate_id, generation)`、`available_at_ms`、`attempts`、claim token/lease、`last_error`、`completed_at_ms` 和 dead-letter marker，并与 tombstone 同事务写入。Memory/MySQL 都实现独立的最小权限 claim/renew/complete/retry API；MySQL 在 `READ COMMITTED` 事务中用 `FOR UPDATE SKIP LOCKED` 非阻塞领取，所有续租、完成与重试都由 outbox id + claim token + 有效 lease 做 CAS，失败消息先脱敏再持久化。
 
-runner 内置 dispatcher 只声明 `session.tombstoned` topic，读取并校验 durable terminal event 后发布；暂时失败以有上限退避无限重试，确定损坏才进入 dead-letter，crash-after-publish 依靠同一 event seq 重复安全。它绝不领取 `session.purge`，因此这套 terminal-event 可靠投递不会扩张为物理删除能力。本地与未来云上运行相同逻辑，只改变进程/容器载体；Blob 删除仍需要 ownership manifest 和独立 worker。
+runner 内置 lifecycle dispatcher 只声明 `session.tombstoned` topic，读取并校验 durable terminal event 后发布；暂时失败以有上限退避无限重试，确定损坏才进入 dead-letter，crash-after-publish 依靠同一 event seq 重复安全。它绝不领取 `session.purge`，因此不会扩张为内容清理能力。独立 Blob cleanup worker 只领取 `blob_delete_outbox`，目前 intent 只来自 stale staging sweeper；它不读取 lifecycle outbox，也不能删除 ready blob。
 
 ## 10. 滚动升级顺序
 
 采用 expand → activate → contract：
 
-1. 已增加 nullable tombstone 字段、parent index 和 lifecycle outbox；关系类型、blob manifest 与 erasure 表仍按 nullable/additive 方式扩展，旧代码必须可忽略。
+1. 已增加 nullable tombstone 字段、parent index、lifecycle outbox、Blob manifest 与 Blob delete outbox；关系类型和 erasure 表仍按 nullable/additive 方式扩展，旧代码必须可忽略。
 2. tombstone 是 protocol family `2026-10-08` 内的 additive capability，不提升 exact protocol version。客户端必须忽略未知 event；新 router 能同时探测未声明和已声明 `tombstone` 的同 family runner。
 3. 先在 API gateway 暂停精确 session DELETE（或将流量整体切到 gate 为 `0` 的新 router 池），再发布新 router 并保持 `SESSION_TOMBSTONE_ENABLED=0`；在开始发布新 runner 前，排空并退出全部不能理解新 capability 的旧 router。旧 router 自身没有该 gate，因此不能在它仍接收 DELETE 时只靠逐实例替换保证一致语义；runner 端口必须保持内网不可直连，否则会绕过 gate。切换后其它 API 保持可用，精确的 session DELETE 返回可重试 `503 draining`。
 4. 再滚动新 runner。router 除显式开关外还要求全部健康 runner 都声明 `tombstone`，所以旧 owner/哈希目标仍存在时不会激活新 DELETE 语义；核对配置 fleet 和 `/v1/capabilities` 后，才把新 router 的 `SESSION_TOMBSTONE_ENABLED` 设为 `1`。外部 DELETE 会改写成带 `INTERNAL_ROUTER_TOKEN` 的版本化 runner-only POST，并要求 ACK；旧 runner 只会 404，router 不会回退到旧公开 DELETE。`RUNNERS` 每项必须是实例稳定地址，不能是随机选择不同版本 Pod 的共享 LB；token 轮换期间先把 gate 恢复为 `0`。
-5. 上述 gate 只覆盖本次 additive tombstone rollout。未来真正改变 protocol version 的不兼容变更仍需全量 drain 的维护窗口或将 router+runner 整组 blue-green，除非另行实现 version range/按版本路由。
-6. 全部 legacy writer drain 后，才能清理允许删除的 pending receipt、执行 generation `0` 补偿，或激活后续 erasure gate。
-7. `session.purge` 与物理 purge 独立保持关闭；只有策略确认、usage 核对、备份恢复演练和校验完成后才允许启用对应 worker。
-8. usage 匿名化字段先双写、回填、核对，不能一次迁移直接破坏现有 attribution/唯一键。
-9. staging/production 使用独立 migration Job，runner 只检查 schema；本地/CI 可继续自动迁移。
+5. Blob 写入采用另一组 expand→activate gate：新 runner 可先带 reader、manifest、worker 部署但保持 `BLOB_ATTACHMENTS_ENABLED=0`；新 router 同样保持 gate `0`。确认全部健康 runner 声明 `blobAttachments`、共享对象存储可从每个 runner 访问且 cleanup 已启用后，才同时激活写入口。关闭写 gate不能关闭历史 ready blob 的读取。当前只有 runner-exclusive filesystem adapter，`BLOB_FILESYSTEM_SINGLE_RUNNER=1` 只允许本地单实例体验；production 配置会同时拒绝 writer 与 cleanup，不能据此演练真正的多实例 rollout。
+6. 上述 gate 只覆盖同一 protocol family 内的 additive rollout。未来真正改变 protocol version 的不兼容变更仍需全量 drain 的维护窗口或将 router+runner 整组 blue-green，除非另行实现 version range/按版本路由。
+7. 全部 legacy writer drain 后，才能清理允许删除的 pending receipt、执行 generation `0` 补偿，或激活后续 erasure gate。
+8. `session.purge` 与 ready 内容的物理 purge 独立保持关闭；只有策略确认、usage 核对、备份恢复演练和校验完成后才允许启用对应 worker。
+9. usage 匿名化字段先双写、回填、核对，不能一次迁移直接破坏现有 attribution/唯一键。
+10. staging/production 使用独立 migration Job，runner 只检查 schema；本地/CI 可继续自动迁移。
 
 ## 11. 待确认策略
 
@@ -170,7 +173,7 @@ runner 内置 dispatcher 只声明 `session.tombstoned` topic，读取并校验 
 
 ## 12. 验收矩阵
 
-当前 fenced tombstone 已覆盖 Memory/MySQL 原子性与回滚、普通资源隐藏、tenant/user 隔离、幂等重试、parent/child 并发、stale fence、orphan repair、terminal SSE、真实 0008→0009 迁移和多进程 takeover。outbox 测试覆盖 Memory/MySQL 并发领取、lease 回收、stale acknowledgement、退避/dead-letter，以及 dispatcher 的暂时发布失败、lost acknowledgement 重复、poison intent 和不触碰 purge。以下矩阵的 purge/blob/erasure/backup 项仍是后续验收目标：
+当前 fenced tombstone 已覆盖 Memory/MySQL 原子性与回滚、普通资源隐藏、tenant/user 隔离、幂等重试、parent/child 并发、stale fence、orphan repair、terminal SSE、真实 0008→0009 迁移和多进程 takeover。lifecycle outbox 测试覆盖并发领取、lease 回收、stale acknowledgement、退避/dead-letter、总线故障和不触碰 purge。Blob 测试覆盖 filesystem/in-memory adapter、Memory/MySQL ownership、上传→绑定、事务回滚、跨 owner 隔离、全局资源 identity、并发首写、过期 staging 的硬拒绝、sweep/bind 竞态、两个独立 MySQL store 的并发领取与 lease takeover、delete claim/CAS，以及真实 0009→0010 迁移。以下矩阵中 ready purge、erasure 与 backup 项仍是后续验收目标：
 
 - Memory/MySQL conformance：archive/unarchive 幂等、archived 禁写、事件 seq 连续、tombstone 隐藏且拒写、失败全回滚。
 - MySQL + Redis 并发：turn/archive/delete 竞态、stale fence、lease loss、orphan active repair。
@@ -178,7 +181,7 @@ runner 内置 dispatcher 只声明 `session.tombstoned` topic，读取并校验 
 - 数据完整性：purge 后内容表与 receipt/blob 清空，usage tokens/cost 校验和不变，无 dangling parent。
 - tenant/user 隔离：跨主体 archive/delete/unarchive 与不存在一致。
 - usage/idempotency：汇总重试不重复计费；tombstone 后 receipt 不重放；legacy pending 在旧实例 drain 前保留。
-- Blob/outbox：DB 回滚产生的 staging orphan、对象删除重试、重复投递、跨 tenant blob 注入。
+- Blob/outbox：已覆盖 staging orphan、对象删除重试/重复领取、跨 tenant/user/session 注入；仍需覆盖 session purge 原子调度全部 ready blob、批次 crash/resume 和共享对象存储故障。
 - erasure：gate 与 createSession 竞态、任务 crash/resume、legal hold、批次游标、tenant key/secret 先失效。
 - rolling upgrade：旧/新 runner 混跑、feature gate、部分回填重启、全旧实例 drain 后才激活新不变量。
 - 备份恢复：先重放 erasure ledger，已删除主体的数据不会重新开放。

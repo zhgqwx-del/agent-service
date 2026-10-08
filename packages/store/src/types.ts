@@ -13,6 +13,7 @@ import type {
   Session,
   Turn,
 } from "@agent-service/protocol";
+import { blobBindingsFromItems, type BlobBinding } from "./blob-lifecycle.js";
 
 export interface ApiKeyRecord {
   keyId: string;
@@ -203,6 +204,8 @@ export interface CommitBatch {
   expectedLastSeq?: number;
   events?: EventInput[];
   items?: Item[];
+  /** Must exactly declare every opaque blob reference carried by `items`; finalized atomically. */
+  blobBindings?: BlobBinding[];
   turn?: Turn;
   approvals?: Approval[];
   /** Usage entries committed atomically with their milestone event and aggregate projections. */
@@ -227,6 +230,7 @@ export function assertPureFenceClaim(batch: CommitBatch): void {
     batch.lifecycle
     || batch.events?.length
     || batch.items?.length
+    || batch.blobBindings?.length
     || batch.turn
     || batch.approvals?.length
     || batch.usageEntries?.length
@@ -234,6 +238,44 @@ export function assertPureFenceClaim(batch: CommitBatch): void {
     || batch.sessionPatch
   ) {
     throw new Error("fenceClaim must be a pure fence-only commit");
+  }
+}
+
+/** Reject nested resources that try to escape the locked session row. */
+export function assertCommitResourceOwnership(batch: CommitBatch): void {
+  const assertSession = (resource: { sessionId: string }, kind: string) => {
+    if (resource.sessionId !== batch.sessionId) throw new Error(`${kind} does not belong to the committed session`);
+  };
+  const itemIds = new Set<string>();
+  for (const item of batch.items ?? []) {
+    assertSession(item, "item");
+    if (itemIds.has(item.id)) throw new Error("commit contains the same item more than once");
+    itemIds.add(item.id);
+  }
+  if (batch.turn) assertSession(batch.turn, "turn");
+  for (const approval of batch.approvals ?? []) assertSession(approval, "approval");
+  for (const event of batch.events ?? []) {
+    assertSession(event, "event");
+    if ("item" in event) {
+      assertSession(event.item, "event item");
+      const eventBindings = blobBindingsFromItems([event.item]);
+      if (eventBindings.length) {
+        const committed = batch.items?.find((item) => item.id === event.item.id);
+        const committedBindings = blobBindingsFromItems(committed ? [committed] : []);
+        if (
+          eventBindings.length !== committedBindings.length
+          || eventBindings.some((binding, index) => {
+            const expected = committedBindings[index];
+            return !expected
+              || binding.blobId !== expected.blobId
+              || binding.itemId !== expected.itemId
+              || binding.purpose !== expected.purpose;
+          })
+        ) throw new Error("event blob references must match the committed item");
+      }
+    }
+    if ("turn" in event) assertSession(event.turn, "event turn");
+    if ("approval" in event) assertSession(event.approval, "event approval");
   }
 }
 
@@ -523,8 +565,69 @@ export interface EventBus {
   close(): Promise<void>;
 }
 
+/** Durable identity and integrity metadata persisted by the ownership manifest. */
+export interface BlobDescriptor {
+  storageKey: string;
+  sha256: string;
+  sizeBytes: number;
+  contentType?: string;
+}
+
+export interface BlobPutOptions {
+  /** Server-generated token that also names recoverable filesystem upload artifacts. */
+  uploadToken: string;
+  /** Hard upper bound checked before copying/allocating the caller's payload. */
+  maxBytes: number;
+  contentType?: string;
+}
+
+export interface BlobReadOptions {
+  /** Hard upper bound checked from stored metadata before allocating the payload buffer. */
+  maxBytes: number;
+}
+
+export interface BlobDeleteOptions {
+  /**
+   * When present, deletion first establishes a persistent, key-scoped cancellation fence, then
+   * removes this upload's temporary artifacts and the final object. Globally unique keys fenced by
+   * a manifest-driven delete cannot subsequently be published, even with a different token.
+   */
+  uploadToken?: string;
+}
+
+export interface BlobObject extends BlobDescriptor {
+  data: Buffer;
+}
+
+/** A globally unique storage key was reused for non-identical bytes or content type. */
+export class BlobConflictError extends Error {
+  constructor(public readonly storageKey: string) {
+    super(`blob ${storageKey} already exists with different content`);
+    this.name = "BlobConflictError";
+  }
+}
+
+/** The caller or stored object exceeds the operation's explicit allocation/read ceiling. */
+export class BlobTooLargeError extends Error {
+  constructor(
+    public readonly storageKey: string,
+    public readonly maxBytes: number,
+    public readonly actualBytes: number,
+  ) {
+    super(`blob ${storageKey} is ${actualBytes} bytes, exceeding the ${maxBytes} byte limit`);
+    this.name = "BlobTooLargeError";
+  }
+}
+
 export interface BlobStore {
-  put(key: string, data: Buffer | string, contentType?: string): Promise<{ ref: string }>;
-  get(ref: string): Promise<{ data: Buffer; contentType?: string } | null>;
-  delete(ref: string): Promise<void>;
+  /** Stable adapter identity recorded by the manifest; changing it requires an explicit migration. */
+  readonly backend: string;
+  /**
+   * Create-only write. An exact byte/content-type retry is idempotent; a non-identical value at the
+   * same server-generated key fails with BlobConflictError and is never overwritten.
+   */
+  putIfAbsent(storageKey: string, data: Buffer | string, options: BlobPutOptions): Promise<BlobDescriptor>;
+  /** New business paths address objects by opaque storage key, never by backend-specific URI. */
+  get(storageKey: string, options: BlobReadOptions): Promise<BlobObject | null>;
+  delete(storageKey: string, options?: BlobDeleteOptions): Promise<void>;
 }

@@ -1,12 +1,17 @@
 // The MySQL/Redis conformance suite and the dialect suite skip themselves when their environment is
 // missing. A misconfigured CI job would then pass with a large part of the suite silently absent, so
-// assert on the coverage summary that the code they exercise was actually executed.
+// assert both the exercised implementation coverage and the exact required test-file results.
 import { readFile } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const summary = JSON.parse(await readFile(resolve(ROOT, "coverage/coverage-summary.json"), "utf8"));
+const testReportPath = resolve(
+  ROOT,
+  process.env.AGENT_SERVICE_TEST_REPORT ?? ".local-run/verify-tests.json",
+);
+const testReport = JSON.parse(await readFile(testReportPath, "utf8"));
 
 const required = [
   ["packages/store/src/mysql/store.ts", 40, "MySQL store — set AGENT_SERVICE_INTEGRATION=1 and MYSQL_TEST_URL"],
@@ -23,6 +28,26 @@ for (const [file, minLines, hint] of required) {
     failed = true;
   } else {
     console.log(`✓ ${file}: ${pct}%`);
+  }
+}
+
+const requiredTestFiles = ["packages/store/test/blob-lifecycle.mysql.test.ts"];
+for (const file of requiredTestFiles) {
+  const suffix = `/${file}`;
+  const result = testReport.testResults?.find((entry) =>
+    String(entry.name).split("\\").join("/").endsWith(suffix),
+  );
+  const assertions = result?.assertionResults ?? [];
+  const passed = assertions.filter((assertion) => assertion.status === "passed").length;
+  const nonPassed = assertions.filter((assertion) => assertion.status !== "passed").length;
+  if (!result || result.status !== "passed" || passed === 0 || nonPassed > 0) {
+    console.error(
+      `✗ ${file}: required test file did not execute cleanly `
+      + `(file=${result?.status ?? "missing"}, passed=${passed}, nonPassed=${nonPassed})`,
+    );
+    failed = true;
+  } else {
+    console.log(`✓ ${file}: ${passed} tests executed and passed`);
   }
 }
 process.exit(failed ? 1 : 0);

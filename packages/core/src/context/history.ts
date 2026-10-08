@@ -1,5 +1,5 @@
 import type { Item } from "@agent-service/protocol";
-import type { TranscriptMessage } from "../engine/types.js";
+import type { EngineInputPart, TranscriptMessage } from "../engine/types.js";
 import { estimateTokens } from "./assemble.js";
 
 export const RECOVERY_NOT_STARTED =
@@ -13,6 +13,16 @@ export interface ProjectionResult {
   repaired: { toolCallId: string; code: "TOOL_NOT_STARTED" | "TOOL_OUTCOME_UNKNOWN" }[];
 }
 
+const planningImagePlaceholder = (blobId: string): EngineInputPart => ({
+  type: "text",
+  text: `[historical image ${blobId} omitted from lightweight context planning]`,
+});
+
+interface ProjectionOptions {
+  /** Planning never consumes image bytes; persisted image references become explicit text markers. */
+  lightweightImages: boolean;
+}
+
 /**
  * Project persisted items (after the last compaction) into an engine transcript.
  *
@@ -23,6 +33,21 @@ export interface ProjectionResult {
  *  - compaction summaries lead the transcript as a system message.
  */
 export function projectItems(items: Item[]): ProjectionResult {
+  return projectItemsWithOptions(items, { lightweightImages: false });
+}
+
+/**
+ * Project persisted items without requiring Blob bytes.
+ *
+ * This view is for token planning and compaction input selection only. An image reference becomes
+ * an explicit text marker so callers can plan raw persisted history before hydrating the retained
+ * tail. The normal `projectItems` path remains strict and rejects unmaterialized images.
+ */
+export function projectItemsForPlanning(items: Item[]): ProjectionResult {
+  return projectItemsWithOptions(items, { lightweightImages: true });
+}
+
+function projectItemsWithOptions(items: Item[], options: ProjectionOptions): ProjectionResult {
   const sorted = [...items].sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
   const messages: TranscriptMessage[] = [];
   const repaired: ProjectionResult["repaired"] = [];
@@ -41,7 +66,14 @@ export function projectItems(items: Item[]): ProjectionResult {
     for (const call of g.calls) {
       const r = results.get(call.toolCallId);
       if (r) {
-        messages.push({ role: "toolResult", toolCallId: r.toolCallId, name: r.name, content: r.content, isError: r.isError });
+        messages.push({
+          role: "toolResult",
+          toolCallId: r.toolCallId,
+          name: r.name,
+          content: r.content,
+          isError: r.isError,
+          ...(r.details === undefined ? {} : { details: r.details }),
+        });
       } else {
         const code = call.startedAtMs ? "TOOL_OUTCOME_UNKNOWN" : "TOOL_NOT_STARTED";
         repaired.push({ toolCallId: call.toolCallId, code });
@@ -74,7 +106,15 @@ export function projectItems(items: Item[]): ProjectionResult {
         break; // already emitted as a leading system message
       case "userMessage": {
         flushGroup();
-        const content = it.content.filter((p): p is Extract<typeof p, { type: "text" | "image" }> => p.type === "text" || p.type === "image");
+        const content = it.content
+          .filter((p): p is Extract<typeof p, { type: "text" | "image" }> => p.type === "text" || p.type === "image")
+          .map((part): EngineInputPart => {
+            if (part.type === "image" && typeof (part as { url?: unknown }).url !== "string") {
+              if (options.lightweightImages) return planningImagePlaceholder(part.blobId);
+              throw new Error(`image blob ${part.blobId} was not materialized for model input`);
+            }
+            return part as EngineInputPart;
+          });
         if (content.length) messages.push({ role: "user", content });
         break;
       }

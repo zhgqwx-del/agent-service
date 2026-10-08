@@ -82,18 +82,37 @@ try {
 
   await writeFile(resolve(consumer, "smoke.mjs"), `
 import * as sdk from "@agent-service/sdk";
-for (const name of ["createAgentServiceClient", "startTurnStream", "subscribeSessionEvents", "parseSse"]) {
+for (const name of [
+  "createAgentServiceClient",
+  "startTurnStream",
+  "subscribeSessionEvents",
+  "uploadSessionBlob",
+  "readSessionBlob",
+  "readItemOutput",
+  "parseSse",
+]) {
   if (typeof sdk[name] !== "function") throw new Error(\`installed SDK does not export \${name}\`);
 }
 `);
   execFileSync(process.execPath, [resolve(consumer, "smoke.mjs")], { cwd: consumer, stdio: "pipe" });
 
   await writeFile(resolve(consumer, "smoke.ts"), `
-import { createAgentServiceClient, type AgentServiceEvent, type ExcludableEventType } from "@agent-service/sdk";
+import {
+  createAgentServiceClient,
+  readItemOutput,
+  readSessionBlob,
+  uploadSessionBlob,
+  type AgentServiceEvent,
+  type ExcludableEventType,
+} from "@agent-service/sdk";
 const client = createAgentServiceClient({ baseUrl: "http://127.0.0.1:8080" });
 const event = null as unknown as AgentServiceEvent;
 const excluded: ExcludableEventType = "heartbeat";
-void [client, event, excluded];
+const request = { baseUrl: "http://127.0.0.1:8080" };
+const uploaded = uploadSessionBlob(request, "sess_example", new Uint8Array([1]), "image/png");
+const downloaded = readSessionBlob(request, "sess_example", "blob_example");
+const output = readItemOutput(request, "sess_example", "item_example");
+void [client, event, excluded, uploaded, downloaded, output];
 `);
   await writeFile(resolve(consumer, "tsconfig.json"), `${JSON.stringify({
     compilerOptions: {

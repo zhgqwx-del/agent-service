@@ -19,12 +19,16 @@ export interface RouterAppDeps {
   upstreamHeaderTimeoutMs?: number;
   /** reject a request body larger than this before forwarding anything */
   maxBodyBytes?: number;
+  /** separate raw-binary ceiling for the blob upload route */
+  maxBlobBytes?: number;
   /** when set, `/_router/*` requires `Authorization: Bearer <token>`; when unset those routes are off */
   adminToken?: string;
   /** false once draining, so the load balancer stops sending new work */
   ready?: () => boolean;
   /** Explicit deployment activation gate, in addition to the observed fleet capability. */
   tombstoneEnabled?: () => boolean;
+  /** Explicit deployment activation gate for new blob writes. Blob reads remain available. */
+  blobAttachmentsEnabled?: () => boolean;
   /** Shared runner-internal credential. Omission keeps destructive routing disabled. */
   internalRunnerToken?: string;
   logger?: Pick<Console, "info" | "warn" | "error">;
@@ -62,6 +66,7 @@ const REPLAYABLE = new Set(["GET", "HEAD", "OPTIONS"]);
 const IDEMPOTENT_TURN_POST = /^\/v1\/sessions\/[^/]+\/turns\/?$/;
 /** Fenced tombstoning is idempotent even when the first 204 was lost in transit. */
 const IDEMPOTENT_SESSION_DELETE = /^\/v1\/sessions\/[^/]+\/?$/;
+const SESSION_BLOB_UPLOAD = /^\/v1\/sessions\/[^/]+\/blobs\/?$/;
 
 /**
  * agent-router: stateless. It authenticates nothing itself (the runner is the authority) and holds no
@@ -73,10 +78,15 @@ export function createRouterApp(deps: RouterAppDeps) {
   const log = deps.logger ?? console;
   const maxAttempts = deps.maxAttempts ?? 2;
   const maxBodyBytes = deps.maxBodyBytes ?? 1_000_000;
+  const maxBlobBytes = deps.maxBlobBytes ?? 1_000_000;
   const tombstoneAvailable = () => (
     !!deps.internalRunnerToken
     && (deps.tombstoneEnabled?.() ?? false)
     && deps.registry.allHealthySupportLifecycle("tombstone")
+  );
+  const blobAttachmentsAvailable = () => (
+    (deps.blobAttachmentsEnabled?.() ?? false)
+    && deps.registry.allHealthySupportBlobAttachments()
   );
 
   app.get("/healthz", (c) => c.text("ok"));
@@ -105,7 +115,11 @@ export function createRouterApp(deps: RouterAppDeps) {
             return c.json({
               ...parsed.data,
               service: "agent-router",
-              features: { ...parsed.data.features, sessionLifecycle: lifecycle },
+              features: {
+                ...parsed.data.features,
+                sessionLifecycle: lifecycle,
+                blobAttachments: parsed.data.features.blobAttachments && blobAttachmentsAvailable(),
+              },
             } satisfies Capabilities);
           }
         }
@@ -147,6 +161,9 @@ export function createRouterApp(deps: RouterAppDeps) {
     const isTombstoneDelete = method === "DELETE"
       && !!sessionId
       && IDEMPOTENT_SESSION_DELETE.test(url.pathname);
+    const isBlobUpload = method === "POST"
+      && !!sessionId
+      && SESSION_BLOB_UPLOAD.test(url.pathname);
 
     // The new router is intentionally deployed before new runners. It keeps the rest of the API
     // available during that rollout, but does not activate tombstoning until the healthy fleet is
@@ -164,15 +181,25 @@ export function createRouterApp(deps: RouterAppDeps) {
         },
       }, 503);
     }
+    if (isBlobUpload && !blobAttachmentsAvailable()) {
+      return c.json({
+        error: {
+          code: "draining",
+          message: "blob uploads are unavailable while the runner fleet is upgrading",
+          retryable: true,
+        },
+      }, 503);
+    }
 
     // Buffer the body once (a re-route replays it) but refuse an unbounded upload first: without this the
     // router OOMs before the runner's own body limit is ever consulted.
     let body: Uint8Array | undefined;
     if (method !== "GET" && method !== "HEAD") {
+      const requestBodyLimit = isBlobUpload ? maxBlobBytes : maxBodyBytes;
       const declared = Number(c.req.header("content-length") ?? "0");
-      if (declared > maxBodyBytes) return c.json({ error: { code: "invalid_request", message: `request body exceeds ${maxBodyBytes} bytes` } }, 400);
-      const read = await readCapped(c.req.raw.body, maxBodyBytes);
-      if (!read.ok) return c.json({ error: { code: "invalid_request", message: `request body exceeds ${maxBodyBytes} bytes` } }, 400);
+      if (declared > requestBodyLimit) return c.json({ error: { code: "invalid_request", message: `request body exceeds ${requestBodyLimit} bytes` } }, 400);
+      const read = await readCapped(c.req.raw.body, requestBodyLimit);
+      if (!read.ok) return c.json({ error: { code: "invalid_request", message: `request body exceeds ${requestBodyLimit} bytes` } }, 400);
       body = read.bytes;
     }
 
@@ -203,6 +230,18 @@ export function createRouterApp(deps: RouterAppDeps) {
           error: {
             code: "draining",
             message: "session deletion is unavailable while the runner fleet is upgrading",
+            retryable: true,
+          },
+        }, 503);
+      }
+      if (
+        isBlobUpload
+        && (!blobAttachmentsAvailable() || !deps.registry.supportsBlobAttachments(target))
+      ) {
+        return c.json({
+          error: {
+            code: "draining",
+            message: "blob uploads are unavailable while the runner fleet is upgrading",
             retryable: true,
           },
         }, 503);

@@ -70,9 +70,9 @@
                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ agent-router（无状态，N 副本）                                              │
-│   1. 鉴权：service key → tenantId；端用户身份 → userId                      │
-│   2. 幂等：透传 Idempotency-Key；仅对带 key 的 turn POST 允许安全重路由   │
-│   3. 定位：owner:{sessionId} → runnerAddr；无 owner → 一致性哈希 / 最少负载   │
+│   1. 透传外部身份；权威 service/user 鉴权仍由 runner 完成                    │
+│   2. 幂等：透传 Idempotency-Key；仅对带 key 的 turn POST 允许安全重路由      │
+│   3. 定位：owner:{sessionId} → runnerAddr；无 owner → 一致性哈希 / 最少负载  │
 │   4. 反向代理（SSE 不缓冲）；runner 回 409 lease_conflict → 重查目录重路由一次 │
 │   5. 非 session 类请求（agents/providers/skills CRUD）直接打任意 runner      │
 │   只有连接态，没有业务态；可随时重启                                          │
@@ -176,6 +176,8 @@ runner 处理 `POST /sessions/{id}/turns` 的顺序：
 
 命名综合 codex（thread/turn/item）、opencode（session）、hermes（runs）。对外叫 **session**（与简报一致），内部结构就是 codex 的 thread。所有 id 用 UUIDv7。
 
+本节保留总体目标态；当前真正可调用、由 CI 锁定的端点和 schema 以仓库提交的 `packages/protocol/openapi.json` 为准。表中 MCP、Skills、hooks、`fork`、`GET /metrics` 等目标态能力仍属于 M3/M4，不能因为列在架构基线中就视为已实现。
+
 ### 5.1 鉴权
 
 双层：`Authorization: Bearer <service_api_key>`（→ `tenantId`，服务级）+ `X-User-Id`（或租户配置的端用户 JWT，→ `userId`）。`principal = (tenantId, userId)` 贯穿所有存取；任何进程级缓存都按 principal 分片。
@@ -186,6 +188,7 @@ runner 处理 `POST /sessions/{id}/turns` 的顺序：
 |---|---|---|
 | Agent 定义（版本化） | `POST/GET /v1/agents`，`GET/PUT /v1/agents/{id}`，`GET /v1/agents/{id}/versions` | `{name, instructions, model, tools[], mcpServers[], skills[], limits, approvalPolicy, sandbox}`；每次 PUT 生成新版本；session 引用 `agentId@version` |
 | Session | `POST /v1/sessions`，`GET /v1/sessions?cursor&limit&userId`，`GET /v1/sessions/{id}`，`DELETE`，`POST .../archive`，`POST .../fork`，`POST .../compact`，`POST .../resume` | `resume` 返回快照 + 游标 + 未决审批（codex 流程） |
+| Blob | `POST /v1/sessions/{id}/blobs`，`GET /v1/sessions/{id}/blobs/{blobId}`，`GET /v1/sessions/{id}/items/{itemId}/output` | 当前支持 image 原始字节上传和大工具结果读取；外部只见 owner-scoped opaque `blobId`，声明 MIME 必须匹配文件签名，执行模型必须支持 image input，staging 与 item 同事务绑定后才可读 |
 | Turn | `POST /v1/sessions/{id}/turns`（`stream=true` 直接 SSE；`false` 返回 202 + turnId），`GET .../turns`，`GET .../turns/{turnId}`，`POST .../turns/{turnId}/interrupt`，`POST .../turns/{turnId}/steer` | body `{input:[...], model?, limits?, busyPolicy: steer|reject}`；`Idempotency-Key` 建议必填，作用域是 tenant + user + session；服务端对解析后的请求语义取 hash（`stream` 仅影响传输，不参与 hash），同 key 异请求返回 `409 idempotency_conflict`；命中 completed receipt 时返回 `200 application/json {turn}` + `Idempotency-Replayed: true` |
 | Item | `GET /v1/sessions/{id}/items?turnId&cursor`，`GET .../items/{itemId}/output`（大输出） | 完整消息历史（替代 opencode 的 `GET /session/:id/message`） |
 | Event 流 | `GET /v1/sessions/{id}/events?after=<seq>&exclude=item/reasoning/*` | SSE；`id: <seq>`；`Last-Event-ID` 等价 `after` |
@@ -204,7 +207,7 @@ POST /v1/sessions/{id}/turns
 {
   "input": [
     {"type":"text","text":"..."},
-    {"type":"image","url":"oss://..."},
+    {"type":"image","blobId":"blob_...","mimeType":"image/png"},
     {"type":"skill","name":"..."},          // 显式 /skill 调用
     {"type":"mention","name":"..."}
   ],
@@ -352,13 +355,15 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `agents` / `agent_versions` | `(tenant_id, agent_id, version)` | 定义快照，不可变 |
 | `sessions` | `session_id PK, tenant_id, user_id(分片键), agent_id, agent_version, status, fence_token, next_seq, last_compaction_seq, title, parent_session_id, archived_at` | 投影 |
 | `turns` | `turn_id PK, session_id, seq_start, seq_end, status, stop_reason, model, provider, usage(JSON), metadata(JSON), started_at_ms, completed_at_ms` | turn 完整资源保存在 `body` JSON |
-| `items` | `item_id PK(UUIDv7), session_id, turn_id, seq, type, status, payload(JSON), output_ref(OSS)` | 完整消息历史 |
+| `items` | `item_id PK(UUIDv7), session_id, turn_id, seq, type, status, payload(JSON), output_ref(blob id)` | 完整消息历史；不保存物理对象 locator |
 | `events` | `(session_id, seq) PK, type, payload(JSON), emitted_at_ms` | 里程碑事件，`>90 天` 分区归档到 OSS |
 | `approvals` | `approval_id PK, session_id, turn_id, item_id, status, decision, expires_at, payload` | 一等资源 |
 | `provider_configs` | `(tenant_id, provider_id)`, `api_key_ciphertext, kms_key_id` | BYOK |
 | `mcp_servers` / `skills` / `skill_versions` | scope ∈ platform/tenant/user | |
 | `usage_ledger` | tenant/user/session/turn/step + tokens/cache/cost；`UNIQUE(session_id, turn_id, step)` | 每个最终 step 恰好一条，计费归因 |
 | `idempotency_keys` | `(tenant_id, user_id, session_id, key) PK, request_hash, response_ref, expires_at` | 新版只写 completed receipt；升级期可暂存 legacy pending |
+| `blob_objects` | `blob_id PK, tenant_id, user_id, session_id, item_id, purpose, storage locator, state, integrity descriptor` | ownership manifest；`staging → ready → delete_pending → deleted` |
+| `blob_delete_outbox` | `(blob_id, generation) UNIQUE, available_at_ms, claim token/lease, attempts, completion/dead-letter` | 独立的 at-least-once 物理删除队列 |
 
 创建路径：`SessionStore.createSession` 必须在一个原子操作中写入 session 与 `session/created(seq=1)`；MemoryStore 在发布状态前完成整个写集的 staging，MySQLStore 在同一 InnoDB 事务中插入两行。失败不得暴露孤立 session、事件空洞或部分游标。
 
@@ -395,12 +400,12 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 
 ## 10. 技术栈与 monorepo
 
-> 以下是 v0.1 的**目标态目录树**，不是当前文件清单。当前实际目录见仓库根 `README.md`；例如租约实现现位于 `packages/store/src/redis/`，MCP、skills、hooks、生成 SDK 和 Kubernetes 清单仍属于后续里程碑。
+> 以下是 v0.1 的**目标态目录树**，不是当前文件清单。当前实际目录见仓库根 `README.md`；例如租约实现现位于 `packages/store/src/redis/`，OpenAPI 生成链路和 `packages/sdk` 已实现并纳入 CI，而 MCP、skills、hooks 和 Kubernetes 清单仍属于后续里程碑。
 
 ```
 agent-service/
 ├── apps/
-│   ├── agent-router/        # Hono；鉴权、所有权目录、幂等 turn 安全重路由、SSE 反代
+│   ├── agent-router/        # Hono；所有权目录、capability gate、幂等 turn 安全重路由、SSE 反代
 │   └── agent-runner/        # Hono；SessionHost、engines、tools、providers、SSE
 ├── packages/
 │   ├── protocol/            # zod schema + OpenAPI 生成 + 事件类型（codex 类型移植，含 NOTICE）

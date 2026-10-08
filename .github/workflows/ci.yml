@@ -65,12 +65,23 @@ jobs:
           AGENT_SERVICE_INTEGRATION: "1"
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
           REDIS_TEST_URL: redis://127.0.0.1:6379/1
-        run: pnpm vitest run --coverage --exclude 'test/cluster/**'
+        run: |
+          mkdir -p .local-run
+          pnpm vitest run --coverage --exclude 'test/cluster/**' \
+            --reporter=default --reporter=json --outputFile.json=.local-run/verify-tests.json
 
       # The integration suite skips itself when the env var is missing, which would make a
       # misconfigured job pass with half the tests silently absent.
       - name: Assert the integration suite actually ran
         run: node scripts/assert-suites-ran.mjs
+
+      # Keep a named, verbose, no-skip proof for the real-MySQL ownership/cleanup contract. The
+      # broad coverage suite alone does not make execution of this dedicated concurrency file clear.
+      - name: Blob lifecycle real MySQL suite (must execute)
+        env:
+          AGENT_SERVICE_INTEGRATION: "1"
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:blob-mysql
 
       # Keep a named, verbose, no-skip proof for the lifecycle queue. The broad coverage assertion
       # above cannot by itself prove that this dedicated real-MySQL concurrency file executed.
@@ -80,9 +91,10 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:outbox-mysql
 
-      # These are immutable historical snapshots, not fresh-schema tests. The dedicated command has
-      # no skip path: CI must create disposable databases and visibly execute every upgrade fixture.
-      - name: Historical MySQL migrations (0007 to 0008 to 0009)
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 and 0009 baselines
+      # are frozen SQL snapshots; 0008 is materialized from frozen 0007 through the production runner.
+      # The command has no skip path and must visibly execute every upgrade fixture.
+      - name: Historical MySQL migrations (0007 through 0010)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -179,7 +191,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0009_session_tombstone_outbox.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0010_blob_ownership.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

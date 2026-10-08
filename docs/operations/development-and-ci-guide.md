@@ -11,15 +11,15 @@
 | 组件 | 默认地址 | 是否独立进程 | 职责 |
 | --- | --- | --- | --- |
 | `agent-router` | `http://127.0.0.1:8080` | 是 | 对外入口、runner 发现、session owner 路由、SSE 透传和一次安全重路由 |
-| `agent-runner` | `http://127.0.0.1:8787` | 是 | 鉴权、Agent Runtime API、模型执行、session/turn/item/event/approval 生命周期 |
-| MySQL | `127.0.0.1:3306` | 是，外部基础设施 | 业务真相、持久事件、配置和 usage ledger |
+| `agent-runner` | `http://127.0.0.1:8787` | 是 | 鉴权、Agent Runtime API、模型执行、session/turn/item/event/approval 与 Blob 生命周期 |
+| MySQL | `127.0.0.1:3306` | 是，外部基础设施 | 业务真相、持久事件、配置、usage ledger、Blob ownership manifest/outbox |
 | Redis | `127.0.0.1:6379` | 是，外部基础设施 | 租约、fence、owner 目录和事件热扇出 |
 | `packages/sdk` | — | 否 | 供客户端使用的 TypeScript SDK |
 | `protocol/core/store/providers/testkit` | — | 否 | 被 runner/router 或测试加载的内部代码库 |
 
 正式客户端应访问 router 的 `8080`。runner 的 `8787` 用于开发诊断和对照，不应当成为生产环境的公网入口。
 
-当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive v2、fenced tombstone 与 reliable terminal-event outbox dispatcher。dispatcher 是每个 runner 内部的工作循环，不是第三个应用服务或镜像；ownership manifest/Blob 接线、erasure/export、legacy 补偿和物理 purge 尚未完成。M3 的 MCP/skills/hooks 和 M4 的生产化能力会在实现后加入本文；尚未实现的模块不会因为出现在设计文档中就成为可启动服务。
+当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive v2、fenced tombstone、reliable terminal-event outbox dispatcher、Blob ownership manifest、输入图片上传/原子绑定、大工具输出卸载和 stale staging 清理。terminal-event dispatcher 与 Blob cleanup worker 都是 runner 内部工作循环，不是第三个应用服务或镜像。erasure/export、usage 对账匿名化、legacy generation `0` 补偿和默认关闭的 ready/session 物理 purge 尚未完成，因此不能把 M1 数据生命周期描述为完整闭环。M3 的 MCP/skills/hooks 和 M4 的生产化能力会在实现后加入本文；尚未实现的模块不会因为出现在设计文档中就成为可启动服务。
 
 ## 2. 一次性准备
 
@@ -53,7 +53,7 @@ test -f .env || cp .env.example .env
 - 使用 `openssl rand -hex 32` 生成独立的 `SECRETS_MASTER_KEY`；
 - `.env` 不得提交，也不得把密钥复制到命令日志、文档或问题报告中。
 
-`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前只有 `RUNNER_PORT`、`ROUTER_PORT`、`RUNNER_ID`、`RUNNER_ADDR`、`RUNNERS`、`REDIS_URL` 和 `SESSION_TOMBSTONE_ENABLED` 保证显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。
+`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前 `RUNNER_PORT`、`ROUTER_PORT`、`RUNNER_ID`、`RUNNER_ADDR`、`RUNNERS`、`REDIS_URL`、`SESSION_TOMBSTONE_ENABLED`、`BLOB_DIR`、`BLOB_FILESYSTEM_SINGLE_RUNNER`、`BLOB_CLEANUP_ENABLED`、`BLOB_ATTACHMENTS_ENABLED` 和 `BLOB_MAX_BYTES` 保证显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。
 
 ## 3. 启动与停止完整本地栈
 
@@ -69,7 +69,9 @@ scripts/local-service.sh smoke
 2. 从 TypeScript 源码启动一个 runner；
 3. 从 TypeScript 源码启动一个 router，并等待其发现健康 runner。
 
-runner 启动后会同时启动 lifecycle outbox dispatcher；停止时先 drain session，再等待当前 dispatcher pass 结束。`.env.example` 与本地脚本将 `SESSION_TOMBSTONE_ENABLED` 设为 `1` 方便完整体验；生产默认必须保持 `0`，直到完成第 9 节的 capability rollout。
+runner 启动后会同时启动 lifecycle outbox dispatcher 和 Blob cleanup worker；停止时先 drain session，再等待两个 worker 的当前 pass 结束。`.env.example` 与本地脚本将 `SESSION_TOMBSTONE_ENABLED=1`、`BLOB_FILESYSTEM_SINGLE_RUNNER=1`、`BLOB_CLEANUP_ENABLED=1`、`BLOB_ATTACHMENTS_ENABLED=1`，方便在单 router + 单 runner 拓扑完整体验已实现能力。Blob 原始对象默认写入这个 runner 独占的 `.local-run/blobs`；`BLOB_FILESYSTEM_SINGLE_RUNNER=1` 是对这一拓扑约束的显式确认，不是分布式锁，router 还会要求 `RUNNERS` 去重后恰好只有一个地址。当前实现没有验证或承诺多 runner 共享 filesystem root，更不能把它当成跨 VM/Pod 数据面。
+
+staging/production 的 tombstone gate 必须按第 9 节滚动发布流程激活。当前 production runner 会拒绝启用 filesystem Blob 写入或 cleanup：共享 OSS/S3 adapter 尚未实现，任何 replica 都不能领取全局 MySQL outbox 后只操作自己的本地磁盘。没有共享对象存储时，不能因 reader 代码存在就声称 production Blob 可用。
 
 `smoke` 不调用真实模型，验证两端 readiness、两份 OpenAPI、router 转发和未鉴权请求返回 `401`。
 
@@ -93,17 +95,20 @@ scripts/local-service.sh down  # 停 router/runner/MySQL/Redis
 - `/usr/local/bin/mysqld` 和 `mysql`；
 - `~/.local/var` 下的数据目录。
 
-其它机器可用 `REDIS_BIN`、`REDIS_CLI`、`MYSQLD`、`MYSQL` 覆盖路径。`deploy/local/compose.yaml` 只启动 MySQL/Redis，应用仍从宿主机启动；使用 Compose 或其它兼容实例时不要执行会再次调用 `infra.sh` 的 `local-service.sh start/verify`，而应按第 7 节的两条源码命令启动应用，并直接运行下面的等价门禁。后续会为统一入口增加显式的外部基础设施模式。
+其它机器可用 `REDIS_BIN`、`REDIS_CLI`、`MYSQLD`、`MYSQL` 覆盖路径。`deploy/local/compose.yaml` 只启动 MySQL/Redis，应用仍从宿主机启动；使用 Compose 或其它兼容实例时不要执行会再次调用 `infra.sh` 的 `local-service.sh start/verify`，而应按第 7 节的两条源码命令启动应用，并直接运行下面的等价门禁。先显式创建 `agent_service_test` 与 `agent_service_cluster` 两个可丢弃数据库；测试安全门会拒绝把业务库 `agent_service` 当删除/重建目标。后续会为统一入口增加显式的外部基础设施模式。
 
 ```bash
 pnpm check:secrets
 pnpm check:api
 pnpm typecheck
-AGENT_SERVICE_INTEGRATION=1 MYSQL_TEST_URL="$MYSQL_URL" REDIS_TEST_URL="$REDIS_URL" \
-  pnpm vitest run --coverage --exclude 'test/cluster/**'
-node scripts/assert-suites-ran.mjs
-MYSQL_MIGRATION_TEST_URL="$MYSQL_URL" pnpm test:migrations
-AGENT_SERVICE_CLUSTER=1 CLUSTER_MYSQL_URL="$CLUSTER_MYSQL_URL" CLUSTER_REDIS_URL="$CLUSTER_REDIS_URL" \
+mkdir -p .local-run
+AGENT_SERVICE_INTEGRATION=1 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" REDIS_TEST_URL="redis://127.0.0.1:6379/1" \
+  pnpm vitest run --coverage --exclude 'test/cluster/**' \
+    --reporter=default --reporter=json --outputFile.json=.local-run/verify-tests.json
+AGENT_SERVICE_TEST_REPORT=.local-run/verify-tests.json node scripts/assert-suites-ran.mjs
+MYSQL_MIGRATION_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:migrations
+MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:blob-mysql
+AGENT_SERVICE_CLUSTER=1 CLUSTER_MYSQL_URL="mysql://root@127.0.0.1:3306/agent_service_cluster" CLUSTER_REDIS_URL="redis://127.0.0.1:6379/3" \
   pnpm vitest run test/cluster
 pnpm build:check
 ```
@@ -154,7 +159,7 @@ scripts/local-service.sh acceptance
 BASE=http://127.0.0.1:8080 scripts/demo.sh
 ```
 
-README 的 API 速览提供创建 agent、session 和 turn 的逐步 `curl` 示例。手动体验部署形态时，应把其中的 `localhost:8787` 换成 `localhost:8080`。
+README 的 API 速览提供创建 agent、session 和 turn 的逐步 `curl` 示例，并默认把 `BASE` 指向 router 的 `8080`。
 
 拿到 `SESSION_ID` 后，可单独体验可逆生命周期；下列请求都应经 router：
 
@@ -167,6 +172,51 @@ curl -sS -X POST "$BASE/v1/sessions/$SESSION_ID/unarchive" "${H[@]}"
 ```
 
 archive active turn 会返回 `409 session_busy`；先 interrupt 并等待 turn 结算后再重试。archive 会清空 session 级工具授权并结算异常遗留审批，unarchive 不恢复旧授权。
+
+### 输入图片 Blob
+
+下面假设已经按 README 创建 agent/session，并把 session id 放入 `SESSION_ID`。上传本身不调用模型；支持的媒体类型是 `image/png`、`image/jpeg`、`image/webp` 和 `image/gif`，服务还会核对对应文件签名，因此示例文件类型、`Content-Type` 与 turn 中可选的 `mimeType` 必须一致。
+
+把图片绑定进 turn 会调用模型，且所选 provider model 的 `input` 必须包含 `"image"`。仓库当前内置的文本模型 preset 都只声明 `"text"`；手动体验前需按实际厂商文档配置一个真实支持视觉输入的模型（不要仅把文本模型的声明改成 image）。没有视觉模型/key 时，上传与 staging 404 可手工体验，完整绑定链路则用不收费的 `blob-http.test.ts`/`host.test.ts` 验证。
+
+```bash
+IMAGE=/absolute/path/to/example.png
+UPLOAD_JSON="$(curl -sS -X POST "$BASE/v1/sessions/$SESSION_ID/blobs" \
+  -H "Authorization: Bearer dev-key" \
+  -H "X-User-Id: u_42" \
+  -H "Content-Type: image/png" \
+  --data-binary "@$IMAGE")"
+BLOB_ID="$(printf '%s' "$UPLOAD_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["blobId"])')"
+printf 'staged blob: %s\n' "$BLOB_ID"
+
+# staging 对象尚未绑定，故意不可读，预期 404
+curl -i "$BASE/v1/sessions/$SESSION_ID/blobs/$BLOB_ID" \
+  -H "Authorization: Bearer dev-key" -H "X-User-Id: u_42"
+
+# 把 opaque blobId 放入 turn；非流式请求返回 202，随后仍会调用真实模型
+curl -sS -X POST "$BASE/v1/sessions/$SESSION_ID/turns" "${H[@]}" \
+  -d "{\"stream\":false,\"input\":[{\"type\":\"text\",\"text\":\"请描述图片\"},{\"type\":\"image\",\"blobId\":\"$BLOB_ID\",\"mimeType\":\"image/png\"}]}"
+
+# turn 的 userMessage item 与 Blob 在同一存储 commit 中绑定后变为 ready
+curl -sS -D /tmp/agent-service-blob.headers \
+  "$BASE/v1/sessions/$SESSION_ID/blobs/$BLOB_ID" \
+  -H "Authorization: Bearer dev-key" -H "X-User-Id: u_42" \
+  -o /tmp/agent-service-downloaded.png
+```
+
+持久化 item 只保存 `blobId`，不会保存 filesystem path、bucket/key 或 data URL；runner 读取时核对 owner、purpose、item 绑定、大小、SHA-256 和媒体类型，再只在内存中为模型生成 data URL。同一 id 被另一个 tenant/user/session 请求时与不存在一样返回 404。上传后一直未绑定的 staging 对象在 `BLOB_STAGING_TTL_MS` 到期后会被专用 worker 改为 `delete_pending`，经 claim lease/outbox 执行幂等物理删除；它在整个过程中都不能由读 API 取回。
+
+### 大工具输出
+
+当可序列化工具输出达到或超过 `BLOB_TOOL_OUTPUT_THRESHOLD_BYTES` 且不超过 `BLOB_MAX_BYTES` 时，runner 自动把完整 `{content, details}` 卸载到 Blob，在 `toolResult` item 中留下有界提示和 opaque `outputRef`。先列出 items 找到对应 `itemId`，再经精确 owner/item 路径取回原始 JSON：
+
+```bash
+curl -sS "$BASE/v1/sessions/$SESSION_ID/items" "${H[@]}" | python3 -m json.tool
+ITEM_ID=item_...
+curl -sS "$BASE/v1/sessions/$SESSION_ID/items/$ITEM_ID/output" "${H[@]}" | python3 -m json.tool
+```
+
+输出不可序列化、超过 Blob 上限或 Blob 持久化失败时，item 与当前模型 step 都会看到同一个稳定且不含内部 locator 的明确失败结果，不会出现“本轮成功、重放失败”的分叉。合法外置结果的当前 step 仍看到完整 JSON-safe payload；后续历史按新到旧分配 `BLOB_MAX_HYDRATED_BYTES`，超预算旧工具输出保留 durable marker，旧图片变为明确文字占位，从而避免长 session 因累计 Blob 永久不可运行。当前 compaction 只保证外置工具事实不会被跳过；历史图片以占位文字参与摘要，像素不会跨 compaction 保留，长会话若依赖视觉事实应先把事实转成文本，直到后续实现视觉摘要/OCR。其 session erasure/物理 purge 仍未开启。
 
 要体验 DELETE，请另建一个可丢弃的 idle session；该操作对普通 API 不可逆：
 
@@ -191,7 +241,8 @@ scripts/local-service.sh smoke
 
 scripts/local-service.sh verify
 # 无真实模型费用；运行 secret/API drift/typecheck、MySQL/Redis 集成、
-# 0007→0008 与 0008→0009 历史迁移、真实多进程 cluster、SDK 打包和两个应用 bundle 启动门禁
+# 包含 Blob real-MySQL 用例、0007→0008→0009→0010 历史迁移、真实多进程 cluster、
+# SDK 打包和两个应用 bundle 启动门禁
 
 scripts/local-service.sh verify-real
 # 读取本机 .env，只跑真实 provider E2E，会产生费用
@@ -256,10 +307,12 @@ GitHub 启动 MySQL 8 和 Redis 8 service container，然后执行：
 4. 源码与测试的 TypeScript 全量检查；
 5. 单元及 MySQL/Redis 集成测试和覆盖率门槛；
 6. 断言集成套件没有被环境错误静默 skip；
-7. 固定 0007 历史库到 0008、固定 0008 历史库到 0009 的真实 MySQL 迁移测试；
-8. 真实 runner/router 多进程 cluster 测试；
-9. `pnpm build:check`；
-10. 上传 coverage artifact。
+7. 以单独、可见且不得 skip 的 `pnpm test:blob-mysql` 再跑 Blob ownership/绑定/cleanup 真实 MySQL 专项套件；
+8. 以同样的独立门禁运行 lifecycle outbox 真实 MySQL 专项套件；
+9. 从预置历史 schema 依次验证 `0007 → 0008`、`0008 → 0009`、`0009 → 0010`，而不是只测 fresh schema；
+10. 真实 runner/router 多进程 cluster 测试；
+11. `pnpm build:check`；
+12. 上传 coverage artifact。
 
 MySQL 和 Redis 是拉取的第三方 service images，不是本仓库构建的产品服务。
 
@@ -279,7 +332,7 @@ agent-service/agent-runner:ci
 agent-service/agent-router:ci
 ```
 
-每个镜像都包含 Node 24 slim、该应用的 bundle、迁移文件和 production dependencies。CI 会实际启动镜像并检查外部可达性、OpenAPI 和 Docker healthcheck；runner 还验证最新迁移已执行及生产 bootstrap 路径。
+每个镜像都包含 Node 24 slim、该应用的 bundle、迁移文件和 production dependencies。它们是容器运行时使用的 Linux OCI image，不是 VM 磁盘镜像，也不是 Windows/Linux 原生机器码二进制。CI 会实际启动镜像并检查外部可达性、OpenAPI 和 Docker healthcheck；runner 还验证包括 `0010_blob_ownership.sql` 在内的最新迁移已执行及生产 bootstrap 路径。生产模式的镜像门禁保持 Blob 写入与 cleanup 关闭，因此不会绕过 filesystem adapter 的 fail-closed 约束。
 
 当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前明确上传的 GitHub Actions artifact 只有 coverage。
 
@@ -303,7 +356,9 @@ tombstone 保持在 exact protocol family `2026-10-08`，作为 additive capabil
 
 这套 activation gate 只覆盖同一 protocol family 内的 additive tombstone rollout。未来真正改变 protocol version 时仍需全量 drain 的维护窗口协调切换或整组 blue-green，除非再实现 version range/按版本路由。
 
-没有云资源时，仍可完成业务代码、协议、迁移、memory/MySQL/Redis 实现、本地多进程与容器测试、故障注入、指标定义和部署模板设计。以下结论必须等待真实环境：云网络和权限正确性、KMS/对象存储/IdP 集成、Kubernetes 滚动发布、真实告警链路、备份恢复目标、云 Redis 灾备以及生产容量。
+Blob 写入也采用 expand→activate：`0010` 先增加 ownership manifest 和专用 delete outbox，reader 在 writer gate 关闭时仍可服务已绑定对象；router 只有在 `BLOB_ATTACHMENTS_ENABLED=1` 且全部健康 runner 声明 `blobAttachments` 时才转发新上传。当前这只用于单 runner 本地体验，因为 runner 在 `NODE_ENV=production` 下会对 filesystem Blob writer 与 cleanup 都 fail closed。未来接入共享对象存储 adapter 后，才可以按“迁移 → 新 runner（cleanup/read 开、writer 关）→ 新 router（gate 关）→ 核对 fleet/storage → 激活 writer gate”的顺序开放 staging，再以同一 image digest 推进 production。filesystem `BLOB_DIR` 不能通过复制到多台 VM、hostPath 或各 Pod 独立卷伪装成共享对象存储。
+
+没有云资源时，仍可完成业务代码、协议、迁移、memory/MySQL/Redis 实现、单机 filesystem Blob 行为、本地多进程与容器测试、故障注入、指标定义和部署契约设计。以下结论必须等待真实环境：共享 OSS/S3 adapter 与 IAM/KMS 的真实集成、云网络和权限正确性、IdP 集成、Kubernetes 滚动发布、真实告警链路、备份恢复目标、云 Redis 灾备以及生产容量。仓库不会为这些未知参数编造可直接部署的 Kubernetes、域名/TLS 或 Secret 配置。
 
 ## 10. 文档维护规则
 

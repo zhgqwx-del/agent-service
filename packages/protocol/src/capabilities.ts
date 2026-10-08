@@ -23,6 +23,8 @@ export const Capabilities = z.object({
     replay: z.object({ persistedEvents: z.literal(true), hotWindowMs: z.number().int() }),
     approvals: z.literal(true),
     sessionLifecycle: z.array(z.enum(["archive", "unarchive", "tombstone", "purge"])),
+    /** Missing on older runners in this protocol family; parsers normalize that to false. */
+    blobAttachments: z.boolean().default(false),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

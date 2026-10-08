@@ -6,6 +6,7 @@ import {
   HTTP_STATUS,
   IntrospectionVerifier,
   Item,
+  ModelSpec,
   mergeLimits,
   StartTurnRequest,
   idSchema,
@@ -29,6 +30,16 @@ describe("protocol schemas", () => {
     const r = StartTurnRequest.parse({ input: [{ type: "text", text: "hi" }] });
     expect(r.stream).toBe(true);
     expect(r.metadata).toEqual({});
+  });
+
+  it("requires every model capability declaration to contain one text entry", () => {
+    expect(ModelSpec.parse({ id: "default-text" }).input).toEqual(["text"]);
+    for (const input of [["text"], ["text", "image"], ["image", "text"]]) {
+      expect(ModelSpec.safeParse({ id: "valid", input }).success, JSON.stringify(input)).toBe(true);
+    }
+    for (const input of [[], ["image"], ["text", "text"], ["image", "image"]]) {
+      expect(ModelSpec.safeParse({ id: "invalid", input }).success, JSON.stringify(input)).toBe(false);
+    }
   });
 
   it("distinguishes persisted and live events", () => {

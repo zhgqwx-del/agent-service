@@ -1,12 +1,17 @@
-import type { InputPart, Principal, ToolContentPart, Usage } from "@agent-service/protocol";
+import type { InputPart, ModelSpec, Principal, ToolContentPart, Usage } from "@agent-service/protocol";
 import type { RunnerTool } from "../tools/types.js";
+
+/** Persisted image parts carry only a blob id; the host adds a verified data URL in memory. */
+export type EngineInputPart =
+  | Extract<InputPart, { type: "text" }>
+  | (Extract<InputPart, { type: "image" }> & { url: string });
 
 /**
  * Engine-neutral transcript. This is what the store's items are projected into before a turn and
  * what an engine consumes. It deliberately mirrors the chat-completions shape.
  */
 export type TranscriptMessage =
-  | { role: "user"; content: (InputPart & { type: "text" | "image" })[] }
+  | { role: "user"; content: EngineInputPart[] }
   | {
       role: "assistant";
       text: string;
@@ -16,7 +21,7 @@ export type TranscriptMessage =
       provider?: string;
       model?: string;
     }
-  | { role: "toolResult"; toolCallId: string; name: string; content: ToolContentPart[]; isError: boolean }
+  | { role: "toolResult"; toolCallId: string; name: string; content: ToolContentPart[]; isError: boolean; details?: unknown }
   | { role: "system"; text: string };
 
 export interface ResolvedModel {
@@ -25,6 +30,8 @@ export interface ResolvedModel {
   provider: string;
   model: string;
   contextWindow: number;
+  /** Input modalities accepted by the selected model, copied from its provider model spec. */
+  input: ModelSpec["input"];
   /** returns the API key for this request (BYOK), or undefined for keyless endpoints */
   apiKey: () => Promise<string | undefined>;
   headers?: Record<string, string>;
@@ -36,7 +43,7 @@ export interface EngineTurnParams {
   systemPrompt: string;
   tools: RunnerTool[];
   history: TranscriptMessage[];
-  input: (InputPart & { type: "text" | "image" })[];
+  input: EngineInputPart[];
   model: ResolvedModel;
   maxOutputTokens?: number;
   signal: AbortSignal;
@@ -58,6 +65,19 @@ export interface AssistantStepResult {
 export type BeforeToolCallDecision = { allow: true } | { allow: false; reason: string; interrupt?: boolean };
 
 /**
+ * One finalized tool result. `afterToolCall` returns the exact JSON-safe value that the engine
+ * must append to its live transcript; this prevents the model from observing a different result
+ * from the one the host durably recorded.
+ */
+export interface EngineToolResult {
+  toolCallId: string;
+  name: string;
+  content: ToolContentPart[];
+  isError: boolean;
+  details?: unknown;
+}
+
+/**
  * Callbacks the engine drives during a turn. The host implements persistence, approvals,
  * limits and event publishing behind these.
  */
@@ -73,14 +93,20 @@ export interface EngineSink {
   beforeToolCall(call: { id: string; name: string; args: unknown }, msg: AssistantStepResult): Promise<BeforeToolCallDecision>;
   onToolExecutionStart(toolCallId: string): Promise<void> | void;
   onToolProgress(toolCallId: string, text: string): void;
-  onToolResult(result: { toolCallId: string; name: string; content: ToolContentPart[]; isError: boolean; details?: unknown }): Promise<void>;
+  /** Persist and return the canonical result before an engine exposes it to the next model step. */
+  afterToolCall(result: EngineToolResult): Promise<EngineToolResult>;
+  /**
+   * Compatibility path for engine-generated immediate failures that cannot pass through a tool
+   * post-processing hook (for example an unknown or blocked tool in Pi).
+   */
+  onToolResult(result: EngineToolResult): Promise<void>;
   /** after the assistant message and all tool results of this step are final; return "end" to stop */
   onStepEnd(step: number, msg: AssistantStepResult): Promise<"continue" | "end">;
 }
 
 export interface EngineRun {
   /** inject a user message at the next step boundary */
-  steer(input: (InputPart & { type: "text" | "image" })[]): void;
+  steer(input: EngineInputPart[]): void;
   interrupt(): void;
   /** resolves when the engine loop has fully settled */
   done: Promise<{ steps: number; aborted: boolean; error?: string }>;

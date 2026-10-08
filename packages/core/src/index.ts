@@ -8,4 +8,6 @@ export * from "./tools/types.js";
 export * from "./tools/dynamic.js";
 export * from "./tools/builtin/index.js";
 export * from "./session/host.js";
+export * from "./blob/service.js";
 export * from "./lifecycle/outbox-dispatcher.js";
+export * from "./lifecycle/blob-cleanup-worker.js";

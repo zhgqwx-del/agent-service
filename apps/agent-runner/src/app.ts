@@ -37,6 +37,8 @@ import {
   UpsertProviderRequest,
   TurnSteerRequest,
   type Capabilities,
+  type BlobUploadResponse,
+  ImageMediaType,
   type Event,
 } from "@agent-service/protocol";
 import type { SessionHost, ToolRegistry } from "@agent-service/core";
@@ -56,6 +58,10 @@ export interface AppDeps {
   internalRouterToken: string;
   heartbeatMs: number;
   maxBodyBytes: number;
+  /** Accept new attachment uploads. Reads remain available while this rolling-upgrade gate is off. */
+  blobAttachmentsEnabled?: boolean;
+  /** Raw upload ceiling. Main validates that this is no larger than maxBodyBytes. */
+  maxBlobBytes?: number;
   ready: () => boolean;
   /** decrypts a tenant's stored auth secret (HS256 key / introspection credential) */
   decryptSecret: (secret: { ciphertext: Buffer; keyId: string }) => Promise<string>;
@@ -83,6 +89,10 @@ function internalTokenMatches(received: string | undefined, expected: string): b
 
 export function createApp(deps: AppDeps) {
   const app = new Hono<AuthEnv>();
+  const maxBlobBytes = deps.maxBlobBytes ?? deps.maxBodyBytes;
+  if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > deps.maxBodyBytes) {
+    throw new Error("maxBlobBytes must be a positive safe integer no larger than maxBodyBytes");
+  }
 
   app.onError((err, c) => {
     if (err instanceof ApiError) {
@@ -113,6 +123,7 @@ export function createApp(deps: AppDeps) {
         replay: { persistedEvents: true, hotWindowMs: 3_600_000 },
         approvals: true,
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        blobAttachments: deps.blobAttachmentsEnabled === true,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -123,6 +134,11 @@ export function createApp(deps: AppDeps) {
   );
 
   const v1 = new Hono<AuthEnv>();
+  // Blob bytes and hydrated tool output are user data. Apply these headers before auth/id
+  // validation so success and every error response share the same cache and sniffing policy.
+  v1.use("/sessions/:id/blobs", blobResponseHeaders);
+  v1.use("/sessions/:id/blobs/:blobId", blobResponseHeaders);
+  v1.use("/sessions/:id/items/:itemId/output", blobResponseHeaders);
   /**
    * Reject any non-canonical id before it reaches the store or the lease.
    * A case variant of a session id used to find the real row (MySQL's default collation is
@@ -139,6 +155,10 @@ export function createApp(deps: AppDeps) {
   });
   v1.use("/_internal/session-tombstone/:id", validateIdParams);
   v1.use("/agents/:id", validateIdParams);
+  v1.use("/sessions/:id/blobs", bodyLimit({
+    maxSize: maxBlobBytes,
+    onError: () => { throw new ApiError("invalid_request", `blob body exceeds ${maxBlobBytes} bytes`); },
+  }));
   // Reject oversized bodies before they are buffered or parsed.
   v1.use("*", bodyLimit({ maxSize: deps.maxBodyBytes, onError: () => { throw new ApiError("invalid_request", `request body exceeds ${deps.maxBodyBytes} bytes`); } }));
   const policyCache = new TenantPolicyCache(deps.policyCacheMs);
@@ -250,6 +270,47 @@ export function createApp(deps: AppDeps) {
     const principal = requireUser(c);
     assertMayActAs(c, req.userId);
     return c.json(await deps.host.createSession(principal, req), 201);
+  });
+  v1.post("/sessions/:id/blobs", async (c) => {
+    const principal = requireUser(c);
+    if (deps.blobAttachmentsEnabled !== true) {
+      // Capability=false only withholds new writes. Reader routes intentionally remain available
+      // during a mixed-version rollout so blobs written by an upgraded peer stay readable.
+      throw new ApiError("draining", "blob attachment uploads are not enabled on this runner");
+    }
+    const parsedContentType = ImageMediaType.safeParse(c.req.header("content-type"));
+    if (!parsedContentType.success) {
+      throw new ApiError("invalid_request", "Content-Type must be image/png, image/jpeg, image/webp, or image/gif");
+    }
+    const contentType = parsedContentType.data;
+    const data = Buffer.from(await c.req.arrayBuffer());
+    if (data.byteLength === 0) throw new ApiError("invalid_request", "blob body must not be empty");
+    // bodyLimit is the allocation guard; retain an explicit check for adapters/tests that construct
+    // a request without a reliable Content-Length header.
+    if (data.byteLength > maxBlobBytes) {
+      throw new ApiError("invalid_request", `blob body exceeds ${maxBlobBytes} bytes`);
+    }
+    const uploaded = await deps.host.uploadInputBlob(principal, c.req.param("id"), data, contentType);
+    const response = {
+      blobId: uploaded.blobId,
+      purpose: "input_image",
+      state: "staging",
+      sizeBytes: uploaded.sizeBytes,
+      contentType,
+      expiresAtMs: uploaded.expiresAtMs,
+    } satisfies BlobUploadResponse;
+    return c.json(response, 201);
+  });
+  v1.get("/sessions/:id/blobs/:blobId", async (c) => {
+    const blob = await deps.host.readInputBlob(requireUser(c), c.req.param("id"), c.req.param("blobId"));
+    if (!blob) throw new ApiError("not_found", "blob not found");
+    if (!blob.contentType || !ImageMediaType.safeParse(blob.contentType).success) {
+      // Do not let corrupt persisted metadata become a response header or change browser handling.
+      throw new ApiError("internal_error", "blob metadata is invalid");
+    }
+    c.header("Content-Type", blob.contentType);
+    c.header("Content-Length", String(blob.sizeBytes));
+    return c.body(new Uint8Array(blob.data));
   });
   v1.get("/sessions", async (c) => {
     const q = await parse(SessionListQuery, c.req.query());
@@ -391,6 +452,11 @@ export function createApp(deps: AppDeps) {
     const q = await parse(ItemListQuery, c.req.query());
     return c.json({ data: await deps.store.listItems(c.req.param("id"), { turnId: q.turnId, afterSeq: q.afterSeq, limit: q.limit }) });
   });
+  v1.get("/sessions/:id/items/:itemId/output", async (c) => {
+    const output = await deps.host.readItemOutput(requireUser(c), c.req.param("id"), c.req.param("itemId"));
+    if (!output) throw new ApiError("not_found", "item output not found");
+    return c.json(output);
+  });
   v1.get("/sessions/:id/events", async (c) => {
     const principal = requireUser(c);
     const sessionId = c.req.param("id");
@@ -436,8 +502,16 @@ export function createApp(deps: AppDeps) {
 const ID_PARAMS: [string, IdPrefix][] = [
   ["id", "sess"],
   ["turnId", "turn"],
+  ["blobId", "blob"],
+  ["itemId", "item"],
   ["approvalId", "apr"],
 ];
+
+const blobResponseHeaders: MiddlewareHandler<AuthEnv> = async (c, next) => {
+  c.header("Cache-Control", "no-store");
+  c.header("X-Content-Type-Options", "nosniff");
+  await next();
+};
 
 const validateIdParams: MiddlewareHandler<AuthEnv> = async (c, next) => {
   const path = c.req.path;

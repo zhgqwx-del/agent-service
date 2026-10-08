@@ -63,7 +63,14 @@ async function upstream(reply: (req: { path: string; method: string; body: strin
 
 function fakeRegistry(
   targets: string[],
-  opts: { owner?: string; healthy?: (url: string) => boolean; tombstone?: boolean; targetTombstone?: boolean } = {},
+  opts: {
+    owner?: string;
+    healthy?: (url: string) => boolean;
+    tombstone?: boolean;
+    targetTombstone?: boolean;
+    blobs?: boolean;
+    targetBlobs?: boolean;
+  } = {},
 ): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
   let rr = 0;
@@ -77,6 +84,8 @@ function fakeRegistry(
     },
     allHealthySupportLifecycle: () => opts.tombstone ?? true,
     supportsLifecycle: () => opts.targetTombstone ?? opts.tombstone ?? true,
+    allHealthySupportBlobAttachments: () => opts.blobs ?? true,
+    supportsBlobAttachments: () => opts.targetBlobs ?? opts.blobs ?? true,
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
     routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
@@ -181,6 +190,52 @@ describe("request and response handling", () => {
     const res = await app.request("/v1/agents", { method: "POST", body: "x".repeat(5_000) });
     // Match the runner's public error contract: invalid_request maps to HTTP 400.
     expect(res.status).toBe(400);
+    expect(a.requests).toHaveLength(0);
+  });
+
+  it("gates blob writes on both deployment and fleet capability while keeping reads available", async () => {
+    const a = await upstream(() => ({ body: '{"ok":true}' }));
+    const disabled = createRouterApp({ registry: fakeRegistry([a.url]), logger: silent });
+    expect((await disabled.request(`/v1/sessions/${SID}/blobs`, {
+      method: "POST",
+      headers: { "content-type": "image/png" },
+      body: "image",
+    })).status).toBe(503);
+    expect((await disabled.request(`/v1/sessions/${SID}/blobs/blob_019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b`)).status).toBe(200);
+    expect(a.requests).toHaveLength(1);
+
+    const mixed = createRouterApp({
+      registry: fakeRegistry([a.url], { blobs: false }),
+      blobAttachmentsEnabled: () => true,
+      logger: silent,
+    });
+    expect((await mixed.request(`/v1/sessions/${SID}/blobs`, { method: "POST", body: "image" })).status).toBe(503);
+
+    const enabled = createRouterApp({
+      registry: fakeRegistry([a.url], { blobs: true, targetBlobs: true }),
+      blobAttachmentsEnabled: () => true,
+      maxBodyBytes: 4,
+      maxBlobBytes: 10,
+      logger: silent,
+    });
+    expect((await enabled.request(`/v1/sessions/${SID}/blobs`, {
+      method: "POST",
+      headers: { "content-type": "image/png" },
+      body: "12345678",
+    })).status).toBe(200);
+    expect(a.requests.at(-1)?.body).toBe("12345678");
+  });
+
+  it("enforces the dedicated blob body ceiling before selecting an upstream", async () => {
+    const a = await upstream(() => ({ body: "{}" }));
+    const app = createRouterApp({
+      registry: fakeRegistry([a.url], { blobs: true }),
+      blobAttachmentsEnabled: () => true,
+      maxBlobBytes: 5,
+      logger: silent,
+    });
+    const response = await app.request(`/v1/sessions/${SID}/blobs`, { method: "POST", body: "123456" });
+    expect(response.status).toBe(400);
     expect(a.requests).toHaveLength(0);
   });
 });
@@ -385,18 +440,20 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
-      registry: fakeRegistry([a.url]),
+      registry: fakeRegistry([a.url], { blobs: true }),
       tombstoneEnabled: () => true,
+      blobAttachmentsEnabled: () => true,
       internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
-    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[] } };
+    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
     expect(caps.features.sessionLifecycle).toEqual(["archive", "unarchive", "tombstone"]);
+    expect(caps.features.blobAttachments).toBe(true);
   });
 
   it("withholds tombstone and rejects DELETE until every healthy runner supports it", async () => {

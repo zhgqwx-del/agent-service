@@ -67,7 +67,7 @@ async function makeApp() {
   await store.createApiKey("t_auth", "k1", hashApiKey("svc-key"), ["runtime", "admin"]);
   const cipher = new LocalAesGcmCipher(KEY);
   const providers = new ProviderService({ store, cipher, assertBaseUrl: async () => {} });
-  const model: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, apiKey: async () => "k" };
+  const model: ResolvedModel = { handle: {}, provider: "fake", model: "fake", contextWindow: 1000, input: ["text"], apiKey: async () => "k" };
   const host = new SessionHost({
     store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(),
     engine: { name: "noop", start: () => ({ steer: () => {}, interrupt: () => {}, done: Promise.resolve({ steps: 0, aborted: false }) }) },

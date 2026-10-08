@@ -23,6 +23,9 @@ export type AgentServiceEvent = components["schemas"]["Event"];
 export type ExcludableEventType = components["schemas"]["ExcludableEventType"];
 export type StartTurnInput = components["schemas"]["StartTurnRequest"];
 export type TurnReplay = components["schemas"]["TurnReplayResponse"];
+export type SessionBlobContentType = components["schemas"]["BlobUploadResponse"]["contentType"];
+export type SessionBlobUpload = components["schemas"]["BlobUploadResponse"];
+export type ItemOutput = components["schemas"]["ToolOutputPayload"];
 type HeaderInput = ConstructorParameters<typeof Headers>[0];
 
 function authHeaders(auth: AgentServiceAuth): Record<string, string> {
@@ -57,12 +60,15 @@ export function createAgentServiceClient(options: AgentServiceClientOptions): Ag
   });
 }
 
-export interface AgentServiceStreamOptions extends AgentServiceAuth {
+export interface AgentServiceRequestOptions extends AgentServiceAuth {
   baseUrl: string;
   headers?: HeaderInput;
   fetch?: typeof globalThis.fetch;
   signal?: AbortSignal;
 }
+
+/** Request options shared by the incremental event-stream helpers. */
+export interface AgentServiceStreamOptions extends AgentServiceRequestOptions {}
 
 export interface SessionEventQuery {
   after?: number;
@@ -77,11 +83,26 @@ export interface EventStreamResult<T = AgentServiceEvent> {
   events: AsyncGenerator<SseEvent<T>>;
 }
 
+export interface SessionBlobUploadResult {
+  response: Response;
+  data: SessionBlobUpload;
+}
+
+export interface SessionBlobReadResult {
+  response: Response;
+  bytes: Uint8Array;
+}
+
+export interface ItemOutputResult {
+  response: Response;
+  data: ItemOutput;
+}
+
 export type StartTurnStreamResult =
   | ({ kind: "events" } & EventStreamResult)
   | { kind: "replay"; response: Response; data: TurnReplay };
 
-/** HTTP failures from the streaming helpers. The response body is retained as parsed JSON/text. */
+/** HTTP failures from SDK request helpers. The response body is retained as parsed JSON/text. */
 export class AgentServiceHttpError extends Error {
   constructor(
     readonly response: Response,
@@ -97,7 +118,7 @@ function endpoint(baseUrl: string, path: string): URL {
   return new URL(path.replace(/^\//, ""), normalized);
 }
 
-function requestHeaders(options: AgentServiceStreamOptions, extra?: HeaderInput): Headers {
+function requestHeaders(options: AgentServiceRequestOptions, extra?: HeaderInput): Headers {
   const headers = new Headers(options.headers);
   for (const [key, value] of Object.entries(authHeaders(options))) headers.set(key, value);
   if (extra) new Headers(extra).forEach((value, key) => headers.set(key, value));
@@ -121,6 +142,96 @@ async function responseError(response: Response): Promise<AgentServiceHttpError>
     body = undefined;
   }
   return new AgentServiceHttpError(response, body);
+}
+
+const SESSION_BLOB_CONTENT_TYPES = new Set<SessionBlobContentType>([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+]);
+
+function sessionBlobContentType(body: Uint8Array | Blob, supplied?: SessionBlobContentType): SessionBlobContentType {
+  const blobType = body instanceof Uint8Array || !body.type ? undefined : body.type;
+  if (supplied && blobType && supplied !== blobType) {
+    throw new TypeError(`session blob Content-Type ${supplied} does not match Blob type ${blobType}`);
+  }
+  const contentType = supplied ?? blobType;
+  if (!contentType || !SESSION_BLOB_CONTENT_TYPES.has(contentType as SessionBlobContentType)) {
+    throw new TypeError("session blob Content-Type must be image/png, image/jpeg, image/webp, or image/gif");
+  }
+  return contentType as SessionBlobContentType;
+}
+
+/**
+ * Upload raw image bytes into a session-scoped staging blob. Uint8Array callers must provide the
+ * media type; Blob callers may rely on Blob.type. The helper intentionally bypasses JSON encoding.
+ */
+export function uploadSessionBlob(
+  options: AgentServiceRequestOptions,
+  sessionId: string,
+  body: Uint8Array,
+  contentType: SessionBlobContentType,
+): Promise<SessionBlobUploadResult>;
+export function uploadSessionBlob(
+  options: AgentServiceRequestOptions,
+  sessionId: string,
+  body: Blob,
+  contentType?: SessionBlobContentType,
+): Promise<SessionBlobUploadResult>;
+export async function uploadSessionBlob(
+  options: AgentServiceRequestOptions,
+  sessionId: string,
+  body: Uint8Array | Blob,
+  contentType?: SessionBlobContentType,
+): Promise<SessionBlobUploadResult> {
+  const mediaType = sessionBlobContentType(body, contentType);
+  const url = endpoint(options.baseUrl, `/v1/sessions/${encodeURIComponent(sessionId)}/blobs`);
+  const headers = requestHeaders(options, {
+    Accept: "application/json",
+    "Content-Type": mediaType,
+  });
+  const response = await (options.fetch ?? globalThis.fetch)(url, {
+    method: "POST",
+    headers,
+    body,
+    signal: options.signal,
+  });
+  if (!response.ok) throw await responseError(response);
+  return { response, data: await response.json() as SessionBlobUpload };
+}
+
+/** Read ready image bytes for the exact session/blob owner pair without JSON coercion. */
+export async function readSessionBlob(
+  options: AgentServiceRequestOptions,
+  sessionId: string,
+  blobId: string,
+): Promise<SessionBlobReadResult> {
+  const url = endpoint(
+    options.baseUrl,
+    `/v1/sessions/${encodeURIComponent(sessionId)}/blobs/${encodeURIComponent(blobId)}`,
+  );
+  const headers = requestHeaders(options, { Accept: "image/png, image/jpeg, image/webp, image/gif" });
+  const response = await (options.fetch ?? globalThis.fetch)(url, { headers, signal: options.signal });
+  if (!response.ok) throw await responseError(response);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  return { response, bytes };
+}
+
+/** Fetch a full offloaded tool output for the exact session/item owner pair. */
+export async function readItemOutput(
+  options: AgentServiceRequestOptions,
+  sessionId: string,
+  itemId: string,
+): Promise<ItemOutputResult> {
+  const url = endpoint(
+    options.baseUrl,
+    `/v1/sessions/${encodeURIComponent(sessionId)}/items/${encodeURIComponent(itemId)}/output`,
+  );
+  const headers = requestHeaders(options, { Accept: "application/json" });
+  const response = await (options.fetch ?? globalThis.fetch)(url, { headers, signal: options.signal });
+  if (!response.ok) throw await responseError(response);
+  return { response, data: await response.json() as ItemOutput };
 }
 
 function eventStream(response: Response): EventStreamResult {

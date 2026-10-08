@@ -23,7 +23,11 @@ describe("RunnerRegistry owner address mapping", () => {
   });
 
   it("admits only ready runners on the current protocol into routing", async () => {
-    const capabilities = (protocolVersion: string, sessionLifecycle = ["archive", "unarchive", "tombstone"]) => ({
+    const capabilities = (
+      protocolVersion: string,
+      sessionLifecycle = ["archive", "unarchive", "tombstone"],
+      blobAttachments = true,
+    ) => ({
       protocolVersion,
       service: "agent-runner",
       features: {
@@ -31,6 +35,7 @@ describe("RunnerRegistry owner address mapping", () => {
         replay: { persistedEvents: true, hotWindowMs: 1 },
         approvals: true,
         sessionLifecycle,
+        blobAttachments,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -43,7 +48,7 @@ describe("RunnerRegistry owner address mapping", () => {
       if (url.endsWith("/readyz")) return new Response("ready");
       if (url.startsWith("http://current/")) return Response.json(capabilities(PROTOCOL_VERSION));
       if (url.startsWith("http://current-basic/")) {
-        return Response.json(capabilities(PROTOCOL_VERSION, ["archive", "unarchive"]));
+        return Response.json(capabilities(PROTOCOL_VERSION, ["archive", "unarchive"], false));
       }
       if (url.startsWith("http://old/")) return Response.json(capabilities("2026-09-22"));
       return new Response("not found", { status: 404 });
@@ -65,6 +70,9 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.supportsLifecycle("http://current", "tombstone")).toBe(true);
     expect(registry.supportsLifecycle("http://current-basic", "tombstone")).toBe(false);
     expect(registry.supportsLifecycle("http://old", "tombstone")).toBe(false);
+    expect(registry.allHealthySupportBlobAttachments()).toBe(false);
+    expect(registry.supportsBlobAttachments("http://current")).toBe(true);
+    expect(registry.supportsBlobAttachments("http://current-basic")).toBe(false);
     expect(registry.anyHealthy()).toBe("http://current");
     expect(registry.routeableUrl("current")).toBe("http://current");
     expect(registry.routeableUrl("old")).toBeUndefined();

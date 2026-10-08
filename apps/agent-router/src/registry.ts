@@ -142,6 +142,16 @@ export class RunnerRegistry {
     return !!target?.healthy && !!target.capabilities?.features.sessionLifecycle.includes(feature);
   }
 
+  allHealthySupportBlobAttachments(): boolean {
+    const healthy = this.list().filter((target) => target.healthy);
+    return healthy.length > 0 && healthy.every((target) => target.capabilities?.features.blobAttachments === true);
+  }
+
+  supportsBlobAttachments(url: string): boolean {
+    const target = this.targets.get(url.replace(/\/+$/, ""));
+    return !!target?.healthy && target.capabilities?.features.blobAttachments === true;
+  }
+
   /**
    * A runner address as reported by `X-Owner` (host:port) mapped back onto a configured target.
    * Matching on the port alone as a fallback covers the common misconfiguration where a runner advertises

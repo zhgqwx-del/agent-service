@@ -10,8 +10,8 @@ import {
 const SESSION_ID = "sess_019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b";
 
 describe("generated SDK client", () => {
-  it("types the current turn contract as text-only", () => {
-    expectTypeOf<StartTurnInput["input"][number]["type"]>().toEqualTypeOf<"text">();
+  it("types the current turn contract as text or an opaque image blob", () => {
+    expectTypeOf<StartTurnInput["input"][number]["type"]>().toEqualTypeOf<"text" | "image">();
   });
 
   it("performs a typed GET with service, trusted-user, and tenant-specific end-user authentication", async () => {

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { addUsage, ApiError, emptyUsage, type AgentDefinition, type Approval, type Event, type Item, type Principal, type Turn, type Usage } from "@agent-service/protocol";
-import { FenceError, IdempotencyPendingError, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, SessionVersionError, type CommitBatch } from "@agent-service/store";
+import { FenceError, IdempotencyPendingError, MemoryBlobStore, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, SessionVersionError, type CommitBatch } from "@agent-service/store";
 import {
+  SessionBlobService,
   SessionHost,
   LifecycleOutboxDispatcher,
   StaticToolRegistry,
@@ -18,7 +19,14 @@ import {
 import { ScriptedEngine, type ScriptStep } from "./fake-engine.js";
 
 const principal: Principal = { tenantId: "t_a", userId: "u_1" };
-const fakeModel: ResolvedModel = { handle: {}, provider: "fake", model: "fake-1", contextWindow: 32_000, apiKey: async () => "k" };
+const fakeModel: ResolvedModel = {
+  handle: {},
+  provider: "fake",
+  model: "fake-1",
+  contextWindow: 32_000,
+  input: ["text", "image"],
+  apiKey: async () => "k",
+};
 const providers: ProviderResolver = { resolve: async () => fakeModel };
 
 const echoTool: RunnerTool = {
@@ -38,6 +46,23 @@ const slowTool: RunnerTool = {
     return { content: [{ type: "text", text: ctx.signal.aborted ? "aborted" : "slow-done" }] };
   },
 };
+const circularDetailsTool: RunnerTool = {
+  ...echoTool,
+  name: "circular_details",
+  execute: async () => {
+    const details: Record<string, unknown> = { source: "tool" };
+    details.self = details;
+    return { content: [{ type: "text", text: "raw-success-must-not-leak" }], details };
+  },
+};
+const jsonPayloadTool: RunnerTool = {
+  ...echoTool,
+  name: "json_payload",
+  execute: async (args) => ({
+    content: [{ type: "text", text: `payload:${(args as { text: string }).text}` }],
+    details: { nonFinite: Number.NaN, nested: { keep: true, drop: undefined } },
+  }),
+};
 
 /** Every host a test creates, so timers and subscriptions cannot outlive it. */
 const created: { host: SessionHost; unsub: () => void }[] = [];
@@ -54,6 +79,7 @@ interface SetupExtras {
   bus?: MemoryEventBus;
   providers?: ProviderResolver;
   summariser?: Summariser;
+  blobs?: SessionBlobService;
 }
 
 async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> = {}, cfg: Partial<SessionHostDeps["config"]> = {}, extras: SetupExtras = {}) {
@@ -63,14 +89,14 @@ async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> 
   const engine = new ScriptedEngine(script);
   const agent: AgentDefinition = {
     id: newId("agt"), tenantId: "t_a", version: 1, name: "test", instructions: "You are a test agent.",
-    model: { provider: "fake", model: "fake-1" }, tools: ["echo", "danger", "slow"], mcpServers: [], skills: [],
+    model: { provider: "fake", model: "fake-1" }, tools: ["echo", "danger", "slow", "circular_details", "json_payload"], mcpServers: [], skills: [],
     limits: {}, approvalPolicy: "on-request", busyPolicy: "steer", sandbox: "none", metadata: {}, createdAtMs: Date.now(),
     ...agentPatch,
   };
   await store.createAgent(agent);
   const host = new SessionHost({
-    store, lease, bus, engine, providers: extras.providers ?? providers, summariser: extras.summariser,
-    tools: new StaticToolRegistry([echoTool, dangerousTool, slowTool]),
+    store, lease, bus, engine, providers: extras.providers ?? providers, summariser: extras.summariser, blobs: extras.blobs,
+    tools: new StaticToolRegistry([echoTool, dangerousTool, slowTool, circularDetailsTool, jsonPayloadTool]),
     config: { runnerId: "r1", runnerAddr: "127.0.0.1:1", leaseTtlMs: 2000, leaseHoldMs: 50, approvalTtlMs: 5000, ...cfg },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
   });
@@ -106,6 +132,55 @@ class FailingRenewLeaseStore extends MemoryLeaseStore {
   override async renew(_sessionId: string, _ownerId: string, _ttlMs: number) {
     this.renewCalls += 1;
     return false;
+  }
+}
+
+class ToggleRenewLeaseStore extends MemoryLeaseStore {
+  rejectRenewal = false;
+
+  override async renew(sessionId: string, ownerId: string, ttlMs: number) {
+    if (this.rejectRenewal) return false;
+    return super.renew(sessionId, ownerId, ttlMs);
+  }
+}
+
+class BlockingMemoryBlobStore extends MemoryBlobStore {
+  private releaseWrite!: () => void;
+  readonly writeStarted: Promise<void>;
+  private readonly writeMayFinish: Promise<void>;
+
+  constructor() {
+    super();
+    let started!: () => void;
+    this.writeStarted = new Promise<void>((resolve) => { started = resolve; });
+    this.writeMayFinish = new Promise<void>((resolve) => { this.releaseWrite = resolve; });
+    this.signalStarted = started;
+  }
+
+  private readonly signalStarted: () => void;
+
+  allowWriteToFinish() {
+    this.releaseWrite();
+  }
+
+  override async putIfAbsent(
+    storageKey: string,
+    data: Buffer | string,
+    options: Parameters<MemoryBlobStore["putIfAbsent"]>[2],
+  ) {
+    this.signalStarted();
+    await this.writeMayFinish;
+    return super.putIfAbsent(storageKey, data, options);
+  }
+}
+
+class SecretLeakingBlobStore extends MemoryBlobStore {
+  override async putIfAbsent(
+    _storageKey: string,
+    _data: Buffer | string,
+    _options: Parameters<MemoryBlobStore["putIfAbsent"]>[2],
+  ): ReturnType<MemoryBlobStore["putIfAbsent"]> {
+    throw new Error("write /srv/private/tenant-a/output.bin failed: locator=s3://internal-bucket/key apiKey=secret-adapter-value");
   }
 }
 
@@ -1480,6 +1555,639 @@ describe("SessionHost", () => {
     expect(msg).toHaveLength(1);
     expect(msg[0]!.seq).toBe(startedItem.seq);
     expect((await h.store.listItems(h.session.id, { afterSeq: startedItem.seq - 1, limit: 100 })).map((i) => i.id)).toContain(startedItem.id);
+  });
+
+  it("binds an uploaded image atomically and gives the engine only verified in-memory bytes", async () => {
+    const store = new MemorySessionStore();
+    const objects = new MemoryBlobStore();
+    const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const h = await setup(
+      [{ text: "saw image" }],
+      {},
+      { blobAttachmentsEnabled: true },
+      { store, blobs },
+    );
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02]);
+    const uploaded = await h.host.uploadInputBlob(principal, h.session.id, bytes, "image/png");
+
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "inspect" }, { type: "image", blobId: uploaded.blobId, mimeType: "image/png" }],
+      stream: false,
+      metadata: {},
+    });
+    await waitIdle(h);
+
+    expect(h.engine.received[0]?.input).toEqual([
+      { type: "text", text: "inspect" },
+      { type: "image", blobId: uploaded.blobId, mimeType: "image/png", url: `data:image/png;base64,${bytes.toString("base64")}` },
+    ]);
+    const user = (await store.listItems(h.session.id, { limit: 100 })).find((item) => item.type === "userMessage");
+    expect(user && user.type === "userMessage" ? user.content : []).toEqual([
+      { type: "text", text: "inspect" },
+      { type: "image", blobId: uploaded.blobId, mimeType: "image/png" },
+    ]);
+    expect(await store.getBlobManifest(uploaded.blobId)).toMatchObject({ state: "ready", itemId: user?.id });
+    expect((await h.host.readInputBlob(principal, h.session.id, uploaded.blobId))?.data).toEqual(bytes);
+  });
+
+  it("accepts image-only input when the resolved model declares image support", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const h = await setup([{ text: "saw image-only input" }], {}, { blobAttachmentsEnabled: true }, { store, blobs });
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const uploaded = await h.host.uploadInputBlob(principal, h.session.id, bytes, "image/png");
+
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "image", blobId: uploaded.blobId }],
+      stream: false,
+      metadata: {},
+    });
+    await waitIdle(h);
+
+    expect(h.engine.received[0]?.input).toEqual([{
+      type: "image",
+      blobId: uploaded.blobId,
+      mimeType: "image/png",
+      url: `data:image/png;base64,${bytes.toString("base64")}`,
+    }]);
+  });
+
+  it("rejects image input before binding when the selected model is text-only", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const textOnly: ProviderResolver = { resolve: async () => ({ ...fakeModel, input: ["text"] }) };
+    const h = await setup(
+      [{ text: "must not run" }],
+      {},
+      { blobAttachmentsEnabled: true },
+      { store, blobs, providers: textOnly },
+    );
+    const bytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+    const uploaded = await h.host.uploadInputBlob(principal, h.session.id, bytes, "image/jpeg");
+
+    await expect(h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "image", blobId: uploaded.blobId }],
+      stream: false,
+      metadata: {},
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    const manifest = await store.getBlobManifest(uploaded.blobId);
+    expect(manifest).toMatchObject({ state: "staging" });
+    expect(manifest?.itemId).toBeUndefined();
+    expect((await store.listTurns(h.session.id, { limit: 10 })).data).toEqual([]);
+    expect(h.engine.received).toEqual([]);
+  });
+
+  it("rejects an image steer when the active turn's resolved model is text-only", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const textOnly: ProviderResolver = { resolve: async () => ({ ...fakeModel, input: ["text"] }) };
+    const h = await setup(
+      [{ text: "slow", delayMs: 300 }],
+      {},
+      { blobAttachmentsEnabled: true },
+      { store, blobs, providers: textOnly },
+    );
+    const begun = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "start" }], stream: true, metadata: {},
+    });
+    const uploaded = await h.host.uploadInputBlob(
+      principal,
+      h.session.id,
+      Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+      "image/jpeg",
+    );
+
+    await expect(h.host.steer(principal, h.session.id, begun.turn.id, {
+      input: [{ type: "image", blobId: uploaded.blobId }],
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    const manifest = await store.getBlobManifest(uploaded.blobId);
+    expect(manifest).toMatchObject({ state: "staging" });
+    expect(manifest?.itemId).toBeUndefined();
+    await waitIdle(h);
+  });
+
+  it("shares the active engine hydration budget across successive image steers", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), {
+      maxBlobBytes: 128,
+      maxHydratedBytes: 128,
+      stagingTtlMs: 60_000,
+    });
+    const h = await setup(
+      [{ text: "initial" }, { text: "after steer" }],
+      {},
+      { blobAttachmentsEnabled: true },
+      { store, blobs },
+    );
+    const begun = await h.host.beginTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "start" }], stream: true, metadata: {},
+    });
+    const imageBytes = (fill: number) => {
+      const bytes = Buffer.alloc(60, fill);
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes);
+      return bytes;
+    };
+    const first = await h.host.uploadInputBlob(principal, h.session.id, imageBytes(1), "image/png");
+    const second = await h.host.uploadInputBlob(principal, h.session.id, imageBytes(2), "image/png");
+
+    await expect(h.host.steer(principal, h.session.id, begun.turn.id, {
+      input: [{ type: "image", blobId: first.blobId }],
+    })).resolves.toBeUndefined();
+    await expect(h.host.steer(principal, h.session.id, begun.turn.id, {
+      input: [{ type: "image", blobId: second.blobId }],
+    })).rejects.toMatchObject({ code: "invalid_request" });
+
+    expect(await store.getBlobManifest(first.blobId)).toMatchObject({ state: "ready" });
+    const rejectedManifest = await store.getBlobManifest(second.blobId);
+    expect(rejectedManifest).toMatchObject({ state: "staging" });
+    expect(rejectedManifest?.itemId).toBeUndefined();
+    expect((await store.listItems(h.session.id, { limit: 100 }))
+      .filter((item) => item.type === "userMessage")).toHaveLength(2);
+
+    begun.run();
+    await waitIdle(h);
+    expect(h.engine.steers).toHaveLength(1);
+    expect(h.engine.steers[0]).toMatchObject([{ type: "image", blobId: first.blobId }]);
+  });
+
+  it("rejects a duplicate image reference as a client error without a partial turn", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const h = await setup([{ text: "must not run" }], {}, { blobAttachmentsEnabled: true }, { store, blobs });
+    const bytes = Buffer.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]);
+    const uploaded = await h.host.uploadInputBlob(principal, h.session.id, bytes, "image/gif");
+
+    await expect(h.host.startTurn(principal, h.session.id, {
+      input: [
+        { type: "text", text: "duplicate" },
+        { type: "image", blobId: uploaded.blobId },
+        { type: "image", blobId: uploaded.blobId },
+      ],
+      stream: false,
+      metadata: {},
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    const manifest = await store.getBlobManifest(uploaded.blobId);
+    expect(manifest).toMatchObject({ state: "staging" });
+    expect(manifest?.itemId).toBeUndefined();
+    expect((await store.listTurns(h.session.id, { limit: 10 })).data).toEqual([]);
+  });
+
+  it("does not report an active-turn upload as successful after losing its lease", async () => {
+    const store = new MemorySessionStore();
+    const lease = new ToggleRenewLeaseStore();
+    const objects = new BlockingMemoryBlobStore();
+    const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const h = await setup(
+      [{ text: "slow response", delayMs: 500 }],
+      {},
+      { blobAttachmentsEnabled: true, leaseTtlMs: 60 },
+      { store, lease, blobs },
+    );
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "start" }],
+      stream: true,
+      metadata: {},
+    });
+
+    const uploading = h.host.uploadInputBlob(
+      principal,
+      h.session.id,
+      Buffer.from([0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50]),
+      "image/webp",
+    );
+    await objects.writeStarted;
+    lease.rejectRenewal = true;
+    try {
+      await expect(uploading).rejects.toMatchObject({ code: "session_lease_conflict" });
+    } finally {
+      objects.allowWriteToFinish();
+    }
+    await waitFor(() => ((h.host as unknown as { active: Map<string, unknown> }).active.size === 0 ? true : undefined));
+  });
+
+  it("does not let a staged image cross a session boundary", async () => {
+    const store = new MemorySessionStore();
+    const objects = new MemoryBlobStore();
+    const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const h = await setup([{ text: "unused" }], {}, { blobAttachmentsEnabled: true }, { store, blobs });
+    const uploaded = await h.host.uploadInputBlob(
+      principal,
+      h.session.id,
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      "image/png",
+    );
+    const other = await h.host.createSession(principal, { agentId: h.agent.id, metadata: {} });
+
+    await expect(h.host.startTurn(principal, other.id, {
+      input: [{ type: "text", text: "wrong session" }, { type: "image", blobId: uploaded.blobId }],
+      stream: false,
+      metadata: {},
+    })).rejects.toMatchObject({ code: "invalid_request" });
+    const manifest = await store.getBlobManifest(uploaded.blobId);
+    expect(manifest).toMatchObject({ state: "staging" });
+    expect(manifest?.itemId).toBeUndefined();
+    expect((await store.listTurns(other.id, { limit: 10 })).data).toEqual([]);
+  });
+
+  it("offloads large tool output, serves it by item ownership, and hydrates later history", async () => {
+    const store = new MemorySessionStore();
+    const objects = new MemoryBlobStore();
+    const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 20_000, stagingTtlMs: 60_000 });
+    const large = "x".repeat(2_000);
+    const h = await setup(
+      [
+        { text: "", toolCalls: [{ name: "json_payload", args: { text: large } }] },
+        {
+          text: (results) => results[0]?.content[0]?.type === "text"
+            && results[0].content[0].text === `payload:${large}`
+            && JSON.stringify(results[0].details) === JSON.stringify({ nonFinite: null, nested: { keep: true } })
+            ? "MODEL_SAW_FULL_OFFLOADED_RESULT"
+            : "MODEL_SAW_STORAGE_MARKER",
+        },
+      ],
+      {},
+      { blobAttachmentsEnabled: true, toolOutputBlobThresholdBytes: 128 },
+      { store, blobs },
+    );
+    await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: false, metadata: {} });
+    await waitIdle(h);
+
+    const result = (await store.listItems(h.session.id, { limit: 100 })).find((item) => item.type === "toolResult");
+    expect(result).toMatchObject({ type: "toolResult", outputRef: expect.stringMatching(/^blob_/) });
+    if (!result || result.type !== "toolResult" || !result.outputRef) throw new Error("expected offloaded tool result");
+    expect(result.details).toBeUndefined();
+    expect(JSON.stringify(result).length).toBeLessThan(1_000);
+    expect(await h.host.readItemOutput(principal, h.session.id, result.id)).toEqual({
+      content: [{ type: "text", text: `payload:${large}` }],
+      details: { nonFinite: null, nested: { keep: true } },
+    });
+    expect((await store.listItems(h.session.id, { limit: 100 })).find((item) => item.type === "agentMessage" && item.text === "MODEL_SAW_FULL_OFFLOADED_RESULT")).toBeDefined();
+
+    await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "again" }], stream: false, metadata: {} });
+    await waitIdle(h);
+    const hydrated = h.engine.received[1]?.history.find((message) => message.role === "toolResult");
+    expect(hydrated).toMatchObject({
+      content: [{ type: "text", text: `payload:${large}` }],
+      details: { nonFinite: null, nested: { keep: true } },
+    });
+  });
+
+  it("hydrates offloaded tool facts before compaction and carries their summary into the next turn", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), {
+      maxBlobBytes: 20_000,
+      maxHydratedBytes: 20_000,
+      stagingTtlMs: 60_000,
+    });
+    const durableFact = `customer-reference-COMPACTION-FACT-${"evidence-".repeat(32)}`;
+    let summaryInput = "";
+    const summariser: Summariser = {
+      summarise: async ({ text }) => {
+        summaryInput = text;
+        return { text: `Preserved fact: ${durableFact}`, usage: emptyUsage() };
+      },
+    };
+    const h = await setup(
+      [
+        { text: "", toolCalls: [{ name: "json_payload", args: { text: durableFact } }] },
+        { text: "answer" },
+      ],
+      {},
+      { blobAttachmentsEnabled: true, toolOutputBlobThresholdBytes: 64 },
+      { store, blobs, summariser },
+    );
+
+    for (let i = 0; i < 4; i++) {
+      await h.host.startTurn(principal, h.session.id, {
+        input: [{ type: "text", text: `question ${i} ${"detail ".repeat(120)}` }],
+        stream: false,
+        metadata: {},
+      });
+      await waitIdle(h);
+    }
+    const persistedResults = (await store.listItems(h.session.id, { limit: 1_000 }))
+      .filter((item) => item.type === "toolResult");
+    expect(persistedResults).toHaveLength(4);
+    expect(persistedResults.every((item) => item.type === "toolResult" && item.outputRef)).toBe(true);
+
+    await expect(h.host.compactSession(principal, h.session.id)).resolves.toMatchObject({ compacted: true });
+    expect(summaryInput).toContain(`payload:${durableFact}`);
+    expect(summaryInput).not.toContain("Tool output stored externally");
+
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "what fact survived compaction?" }],
+      stream: false,
+      metadata: {},
+    });
+    await waitIdle(h);
+    const nextHistory = h.engine.received.at(-1)?.history ?? [];
+    expect(nextHistory.some((message) => (
+      message.role === "system" && message.text.includes(`Preserved fact: ${durableFact}`)
+    ))).toBe(true);
+  });
+
+  it("does not compact across an offloaded tool result that exceeds the aggregate hydration budget", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), {
+      maxBlobBytes: 512,
+      maxHydratedBytes: 512,
+      stagingTtlMs: 60_000,
+    });
+    const largeFact = "bounded-tool-fact-".repeat(12);
+    let summaryCalls = 0;
+    const summariser: Summariser = {
+      summarise: async () => {
+        summaryCalls += 1;
+        return { text: "unsafe marker-only summary", usage: emptyUsage() };
+      },
+    };
+    const h = await setup(
+      [
+        { text: "", toolCalls: [{ name: "json_payload", args: { text: largeFact } }] },
+        { text: "answer" },
+      ],
+      {},
+      { blobAttachmentsEnabled: true, toolOutputBlobThresholdBytes: 64 },
+      { store, blobs, summariser },
+    );
+
+    for (let i = 0; i < 4; i++) {
+      await h.host.startTurn(principal, h.session.id, {
+        input: [{ type: "text", text: `question ${i} ${"detail ".repeat(120)}` }],
+        stream: false,
+        metadata: {},
+      });
+      await waitIdle(h);
+    }
+    const before = await store.getSession(principal.tenantId, h.session.id);
+    const result = await h.host.compactSession(principal, h.session.id);
+    const after = await store.getSession(principal.tenantId, h.session.id);
+
+    expect(result).toEqual({ compacted: false, summaryItemId: undefined });
+    expect(summaryCalls).toBe(0);
+    expect(after?.lastCompactionSeq).toBe(before?.lastCompactionSeq);
+    expect((await store.listItems(h.session.id, { limit: 1_000 }))
+      .some((item) => item.type === "contextCompaction")).toBe(false);
+  });
+
+  it("plans compaction before hydrating an over-budget Blob history", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), {
+      maxBlobBytes: 128,
+      maxHydratedBytes: 128,
+      stagingTtlMs: 60_000,
+    });
+    let summaryInput = "";
+    const summariser: Summariser = {
+      summarise: async ({ text }) => {
+        summaryInput = text;
+        return { text: "blob history summary", usage: emptyUsage() };
+      },
+    };
+    const h = await setup(
+      [{ text: "answer" }],
+      {},
+      { blobAttachmentsEnabled: true },
+      { store, blobs, summariser },
+    );
+
+    for (let i = 0; i < 3; i++) {
+      const bytes = Buffer.alloc(60, i + 1);
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes);
+      const uploaded = await h.host.uploadInputBlob(principal, h.session.id, bytes, "image/png");
+      await h.host.startTurn(principal, h.session.id, {
+        input: [
+          { type: "text", text: `question ${i} ${"detail ".repeat(100)}` },
+          { type: "image", blobId: uploaded.blobId },
+        ],
+        stream: false,
+        metadata: {},
+      });
+      await waitIdle(h);
+    }
+
+    const thirdHistoryParts = h.engine.received[2]?.history
+      .filter((message) => message.role === "user")
+      .flatMap((message) => message.content);
+    expect(h.engine.received[2]?.input.some((part) => part.type === "image")).toBe(true);
+    expect(thirdHistoryParts?.some((part) => part.type === "image")).toBe(false);
+    expect(thirdHistoryParts?.some((part) => part.type === "text" && part.text.includes("Blob hydration budget exceeded"))).toBe(true);
+
+    const compacted = await h.host.compactSession(principal, h.session.id);
+    expect(compacted.compacted).toBe(true);
+    expect(summaryInput).toContain("omitted from lightweight context planning");
+  });
+
+  it("offloads a tool result whose serialized size is exactly the configured threshold", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const text = "threshold-boundary";
+    const canonical = { content: [{ type: "text" as const, text: `echo:${text}` }] };
+    const threshold = Buffer.byteLength(JSON.stringify(canonical), "utf8");
+    const h = await setup(
+      [{ toolCalls: [{ name: "echo", args: { text } }] }, { text: "done" }],
+      {},
+      { blobAttachmentsEnabled: true, toolOutputBlobThresholdBytes: threshold },
+      { store, blobs },
+    );
+
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: false, metadata: {},
+    });
+    await waitIdle(h);
+    expect((await store.listItems(h.session.id, { limit: 100 })).find((item) => item.type === "toolResult"))
+      .toMatchObject({ outputRef: expect.stringMatching(/^blob_/) });
+  });
+
+  it("replaces circular tool details before both persistence and the next model step", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const h = await setup(
+      [
+        { toolCalls: [{ name: "circular_details", args: {} }] },
+        {
+          text: (results) => results[0]?.isError === true
+            && results[0].content[0]?.type === "text"
+            && results[0].content[0].text.startsWith("TOOL_OUTPUT_NOT_SERIALIZABLE")
+            ? "MODEL_SAW_SERIALIZATION_FAILURE"
+            : "MODEL_SAW_RAW_SUCCESS",
+        },
+      ],
+      {},
+      { blobAttachmentsEnabled: true, toolOutputBlobThresholdBytes: 128 },
+      { store, blobs },
+    );
+
+    await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: false, metadata: {} });
+    await waitIdle(h);
+
+    const items = await store.listItems(h.session.id, { limit: 100 });
+    expect(items.find((item) => item.type === "toolResult")).toMatchObject({
+      type: "toolResult",
+      isError: true,
+      content: [{ type: "text", text: expect.stringMatching(/^TOOL_OUTPUT_NOT_SERIALIZABLE/) }],
+      details: { code: "TOOL_OUTPUT_NOT_SERIALIZABLE" },
+    });
+    expect(items.find((item) => item.type === "agentMessage" && item.text === "MODEL_SAW_SERIALIZATION_FAILURE")).toBeDefined();
+    expect(JSON.stringify(items)).not.toContain("raw-success-must-not-leak");
+  });
+
+  it("replaces over-limit tool output before both persistence and the next model step", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 256, stagingTtlMs: 60_000 });
+    const rawSuccess = `echo:${"z".repeat(2_000)}`;
+    const h = await setup(
+      [
+        { toolCalls: [{ name: "echo", args: { text: "z".repeat(2_000) } }] },
+        {
+          text: (results) => results[0]?.isError === true
+            && results[0].content[0]?.type === "text"
+            && results[0].content[0].text.startsWith("TOOL_OUTPUT_TOO_LARGE")
+            ? "MODEL_SAW_SIZE_FAILURE"
+            : `MODEL_SAW_RAW:${results[0]?.content[0]?.type === "text" ? results[0].content[0].text : "missing"}`,
+        },
+      ],
+      {},
+      { blobAttachmentsEnabled: true, toolOutputBlobThresholdBytes: 32 },
+      { store, blobs },
+    );
+
+    await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: false, metadata: {} });
+    await waitIdle(h);
+
+    const items = await store.listItems(h.session.id, { limit: 100 });
+    expect(items.find((item) => item.type === "toolResult")).toMatchObject({
+      type: "toolResult",
+      isError: true,
+      content: [{ type: "text", text: expect.stringMatching(/^TOOL_OUTPUT_TOO_LARGE/) }],
+      details: { code: "TOOL_OUTPUT_TOO_LARGE", maxBytes: 256 },
+    });
+    expect(items.find((item) => item.type === "agentMessage" && item.text === "MODEL_SAW_SIZE_FAILURE")).toBeDefined();
+    expect(JSON.stringify(items)).not.toContain(rawSuccess);
+  });
+
+  it("replaces Blob adapter failures before an engine fallback can expose storage details", async () => {
+    const store = new MemorySessionStore();
+    const blobs = new SessionBlobService(store, new SecretLeakingBlobStore(), {
+      maxBlobBytes: 10_000,
+      stagingTtlMs: 60_000,
+    });
+    const canonicalText = "TOOL_OUTPUT_STORAGE_FAILED: the tool output could not be durably stored.";
+    const forbidden = ["/srv/private", "s3://internal-bucket", "secret-adapter-value"];
+    const h = await setup(
+      [
+        { toolCalls: [{ name: "echo", args: { text: "must-be-offloaded" } }] },
+        {
+          text: (results) => {
+            const observed = JSON.stringify(results[0]);
+            return results[0]?.isError === true
+              && results[0].content[0]?.type === "text"
+              && results[0].content[0].text === canonicalText
+              && forbidden.every((value) => !observed.includes(value))
+              ? "MODEL_SAW_STORAGE_FAILURE"
+              : `MODEL_SAW_UNSAFE:${observed}`;
+          },
+        },
+      ],
+      {},
+      { blobAttachmentsEnabled: true, toolOutputBlobThresholdBytes: 1 },
+      { store, blobs },
+    );
+
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: false, metadata: {},
+    });
+    await waitIdle(h);
+
+    let items = await store.listItems(h.session.id, { limit: 100 });
+    expect(items.find((item) => item.type === "toolResult")).toMatchObject({
+      type: "toolResult",
+      status: "failed",
+      isError: true,
+      content: [{ type: "text", text: canonicalText }],
+      details: { code: "TOOL_OUTPUT_STORAGE_FAILED" },
+    });
+    expect(items.find((item) => item.type === "agentMessage" && item.text === "MODEL_SAW_STORAGE_FAILURE")).toBeDefined();
+
+    for (const value of forbidden) expect(JSON.stringify(items)).not.toContain(value);
+
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "replay" }], stream: false, metadata: {},
+    });
+    await waitIdle(h);
+    const replayed = h.engine.received[1]?.history.find((message) => message.role === "toolResult");
+    expect(replayed).toMatchObject({
+      content: [{ type: "text", text: canonicalText }],
+      isError: true,
+      details: { code: "TOOL_OUTPUT_STORAGE_FAILED" },
+    });
+    items = await store.listItems(h.session.id, { limit: 100 });
+    for (const value of forbidden) {
+      expect(JSON.stringify(replayed)).not.toContain(value);
+      expect(JSON.stringify(items)).not.toContain(value);
+    }
+  });
+
+  it.each([
+    { name: "the Blob writer gate is off", blobAttachmentsEnabled: false, threshold: 32, withBlobService: true },
+    { name: "the offload threshold is zero", blobAttachmentsEnabled: true, threshold: 0, withBlobService: true },
+    { name: "no Blob service is installed", blobAttachmentsEnabled: true, threshold: 32, withBlobService: false },
+  ])("enforces the durable tool-output ceiling when $name", async ({
+    blobAttachmentsEnabled,
+    threshold,
+    withBlobService,
+  }) => {
+    const store = new MemorySessionStore();
+    const blobs = withBlobService
+      ? new SessionBlobService(store, new MemoryBlobStore(), { maxBlobBytes: 10_000, stagingTtlMs: 60_000 })
+      : undefined;
+    const rawSuccess = `echo:${"q".repeat(2_000)}`;
+    const h = await setup(
+      [
+        { toolCalls: [{ name: "echo", args: { text: "q".repeat(2_000) } }] },
+        {
+          text: (results) => results[0]?.isError === true
+            && results[0].content[0]?.type === "text"
+            && results[0].content[0].text.startsWith("TOOL_OUTPUT_TOO_LARGE")
+            ? "MODEL_SAW_DURABLE_LIMIT"
+            : `MODEL_SAW_RAW:${results[0]?.content[0]?.type === "text" ? results[0].content[0].text : "missing"}`,
+        },
+      ],
+      {},
+      {
+        blobAttachmentsEnabled,
+        toolOutputBlobThresholdBytes: threshold,
+        maxDurableToolOutputBytes: 256,
+      },
+      { store, ...(blobs ? { blobs } : {}) },
+    );
+
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: false, metadata: {},
+    });
+    await waitIdle(h);
+
+    const items = await store.listItems(h.session.id, { limit: 100 });
+    const persistedResult = items.find((item) => item.type === "toolResult");
+    expect(persistedResult).toMatchObject({
+      type: "toolResult",
+      isError: true,
+      content: [{ type: "text", text: expect.stringMatching(/^TOOL_OUTPUT_TOO_LARGE/) }],
+      details: { code: "TOOL_OUTPUT_TOO_LARGE", sizeBytes: expect.any(Number), maxBytes: 256 },
+    });
+    expect(persistedResult?.type === "toolResult" ? persistedResult.outputRef : "missing result").toBeUndefined();
+    expect(items.find((item) => item.type === "agentMessage" && item.text === "MODEL_SAW_DURABLE_LIMIT")).toBeDefined();
+    expect(JSON.stringify(items)).not.toContain(rawSuccess);
+
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "replay" }], stream: false, metadata: {},
+    });
+    await waitIdle(h);
+    expect(h.engine.received[1]?.history.find((message) => message.role === "toolResult")).toMatchObject({
+      content: [{ type: "text", text: expect.stringMatching(/^TOOL_OUTPUT_TOO_LARGE/) }],
+      isError: true,
+      details: { code: "TOOL_OUTPUT_TOO_LARGE", sizeBytes: expect.any(Number), maxBytes: 256 },
+    });
   });
 
   it("a deleted session stops its running turn instead of writing on", async () => {

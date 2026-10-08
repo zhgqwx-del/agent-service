@@ -2,9 +2,9 @@ import { Agent, type AgentEvent, type AgentMessage, type AgentTool } from "@eare
 import type { AssistantMessage, ImageContent, Message, Model, TextContent, ToolCall } from "@earendil-works/pi-ai";
 import { createModels, type Models } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import type { InputPart, ToolContentPart, Usage } from "@agent-service/protocol";
+import type { ToolContentPart, Usage } from "@agent-service/protocol";
 import type { RunnerTool } from "../tools/types.js";
-import type { AgentEngine, AssistantStepResult, EngineRun, EngineSink, EngineTurnParams, ResolvedModel, Summariser, TranscriptMessage } from "./types.js";
+import type { AgentEngine, AssistantStepResult, EngineInputPart, EngineRun, EngineSink, EngineTurnParams, ResolvedModel, Summariser, TranscriptMessage } from "./types.js";
 
 /**
  * AgentEngine backed by @earendil-works/pi-agent-core's `Agent` class (route A in docs/design §6.1).
@@ -20,6 +20,10 @@ export class PiEngine implements AgentEngine {
     let step = 0;
     let currentAssistant: AssistantStepResult | undefined;
     let sawToolArgsDelta = new Map<number, string>();
+    // Pi's afterToolCall runs before it emits tool_execution_end and, critically, before it appends
+    // the result to the live transcript. Track those calls so the later lifecycle event is not
+    // persisted a second time; immediate Pi-generated failures still use the event fallback.
+    const finalizedThroughSink = new Set<string>();
 
     const agent = new Agent({
       initialState: {
@@ -44,6 +48,21 @@ export class PiEngine implements AgentEngine {
         if (decision.allow) return undefined;
         if (decision.interrupt) queueMicrotask(() => agent.abort());
         return { block: true, reason: decision.reason, terminate: decision.interrupt === true };
+      },
+      afterToolCall: async ({ toolCall, result, isError }) => {
+        const canonical = await sink.afterToolCall({
+          toolCallId: toolCall.id,
+          name: toolCall.name,
+          content: toProtocolContent(result.content ?? []),
+          isError,
+          details: result.details,
+        });
+        finalizedThroughSink.add(toolCall.id);
+        return {
+          content: toPiContent(canonical.content),
+          details: canonical.details,
+          isError: canonical.isError,
+        };
       },
       finishTurn: async ({ message }) => {
         if (message.role !== "assistant") return undefined;
@@ -93,6 +112,10 @@ export class PiEngine implements AgentEngine {
           break;
         }
         case "tool_execution_end":
+          if (finalizedThroughSink.delete(ev.toolCallId)) break;
+          // Unknown/invalid/blocked calls are finalized inside Pi before a real tool execution and
+          // Pi 0.87 does not run afterToolCall for that immediate path. Its synthesized result is
+          // already JSON-safe, so persist it here before Pi emits the corresponding result message.
           await sink.onToolResult({
             toolCallId: ev.toolCallId,
             name: ev.toolName,
@@ -177,11 +200,11 @@ function toAgentTool(tool: RunnerTool, ctx: EngineTurnParams["toolContext"]): Ag
 
 class ToolError extends Error {}
 
-function toUserMessage(input: (InputPart & { type: "text" | "image" })[]): AgentMessage {
+function toUserMessage(input: EngineInputPart[]): AgentMessage {
   return { role: "user", content: toPiUserContent(input), timestamp: Date.now() };
 }
 
-function toPiUserContent(input: (InputPart & { type: "text" | "image" })[]): (TextContent | ImageContent)[] {
+function toPiUserContent(input: EngineInputPart[]): (TextContent | ImageContent)[] {
   return input.map((p) => (p.type === "text" ? { type: "text", text: p.text } : { type: "image", data: p.url, mimeType: p.mimeType ?? "image/png" }));
 }
 
@@ -214,7 +237,7 @@ function toPiMessage(m: TranscriptMessage): Message {
       };
     }
     case "toolResult":
-      return { role: "toolResult", toolCallId: m.toolCallId, toolName: m.name, content: toPiContent(m.content), isError: m.isError, timestamp: 0 };
+      return { role: "toolResult", toolCallId: m.toolCallId, toolName: m.name, content: toPiContent(m.content), details: m.details as any, isError: m.isError, timestamp: 0 };
     case "system":
       return { role: "system", content: m.text, timestamp: 0 };
   }

@@ -8,6 +8,7 @@ export const IdPrefix = {
   session: "sess",
   turn: "turn",
   item: "item",
+  blob: "blob",
   approval: "apr",
   provider: "prov",
   mcpServer: "mcp",

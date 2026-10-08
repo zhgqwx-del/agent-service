@@ -143,6 +143,7 @@ export class ProviderService implements ProviderResolver {
       provider: piProviderId,
       model: spec.id,
       contextWindow: spec.contextWindow,
+      input: spec.input,
       apiKey,
       headers: Object.keys(config.headers).length ? config.headers : undefined,
       fetch: this.opts.fetch,

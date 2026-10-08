@@ -25,12 +25,26 @@ export const ModelPrice = z.object({
 });
 export type ModelPrice = z.infer<typeof ModelPrice>;
 
+export type ModelInputCapability = "text" | "image";
+
+/**
+ * This runtime always sends a textual system prompt and may replay textual history. Consequently a
+ * configured model must accept text; image is an optional, non-duplicated additive capability.
+ * Enumerating the three valid tuples keeps the same invariant visible in OpenAPI instead of relying
+ * on a refinement that a schema generator would discard.
+ */
+export const ModelInputCapabilities = z.union([
+  z.tuple([z.literal("text")]),
+  z.tuple([z.literal("text"), z.literal("image")]),
+  z.tuple([z.literal("image"), z.literal("text")]),
+]) as z.ZodType<ModelInputCapability[]>;
+
 export const ModelSpec = z.object({
   id: externalId,
   name: z.string().optional(),
   contextWindow: z.number().int().positive().default(128_000),
   maxOutputTokens: z.number().int().positive().default(8192),
-  input: z.array(z.enum(["text", "image"])).default(["text"]),
+  input: ModelInputCapabilities.default(["text"]),
   reasoning: z.boolean().default(false),
   price: ModelPrice.optional(),
   compat: ProviderCompat.optional(),

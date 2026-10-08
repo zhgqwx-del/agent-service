@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI 3.1、生成 TypeScript SDK、可逆 Archive v2、fenced tombstone 和可靠 terminal-event outbox dispatcher 已实现；ownership manifest/Blob 接线、erasure/export、legacy generation `0` 补偿及默认关闭的物理 purge 仍待按 `docs/design/04-data-lifecycle.md` 完成。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI 3.1、生成 TypeScript SDK、可逆 Archive v2、fenced tombstone、可靠 terminal-event outbox dispatcher，以及 Blob ownership manifest、输入图片上传/原子 item 绑定、大工具输出卸载和 stale staging 清理已实现；erasure/export、usage 对账匿名化、legacy generation `0` 补偿及默认关闭的 ready/session 物理 purge 仍待按 `docs/design/04-data-lifecycle.md` 完成，因此还不能宣称完整数据生命周期闭环。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -35,7 +35,8 @@ scripts/demo.sh
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008、0008 → 0009 的真实 MySQL 升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008 → 0009 → 0010 的真实 MySQL 历史升级夹具
+pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
 pnpm test:cluster                             # + 多进程集群：2~3 runner + 1 router，SIGKILL 租约持有者
 pnpm check:api                                # OpenAPI 与生成 SDK 漂移检查
 pnpm check:sdk                                # 编译 SDK、原生 Node import，并校验 pnpm pack 内容
@@ -45,6 +46,7 @@ pnpm typecheck
 # 生产构建验证（SDK 发布包 + 两个应用的单文件 bundle，原生 node 启动，不依赖 tsx）
 pnpm build:check
 docker build --build-arg APP=agent-runner -t agent-runner .
+docker build --build-arg APP=agent-router -t agent-router .
 ```
 
 也可以通过统一的本地运维入口完成生命周期与验证：
@@ -67,31 +69,35 @@ scripts/local-service.sh stop
 ```
 客户端 → agent-router（无状态，N 副本）→ agent-runner（有状态，N 副本）
                   ↓ 读 Redis 所有权目录            ↓ 租约 + fence
-              一致性哈希兜底                  MySQL / Redis / 对象存储
+              一致性哈希兜底                  MySQL / Redis / BlobStore
 ```
 
 `agent-router` 的核心职责是按 sessionId 找到持有租约的 runner、把 SSE 原样透传、收到 runner 的 `409 + X-Owner` 后安全重路由，并在发布窗口执行 protocol/capability gate。它没有业务状态，可随时重启。
 
 tombstone 是现有 `2026-10-08` protocol family 内的 additive capability。router 只有在显式设置 `SESSION_TOMBSTONE_ENABLED=1` 且全部健康 runner 都声明 `tombstone` 时才开放 session DELETE；本地脚本默认启用。外部 DELETE 会被改写为带 `INTERNAL_ROUTER_TOKEN` 的版本化 runner-only POST，并要求新 runner 回 ACK；内部路径不进入 OpenAPI，客户端伪造的内部 header 会被剥离。`RUNNERS` 必须是实例稳定地址，runner 端口必须保持内网不可直连。staging/production 需先在 edge 暂停精确 session DELETE（或整体切换 router 池），再按“新 router（gate=0）→ 排空旧 router → 滚动新 runner → 核对 fleet capability → 激活 gate”的顺序升级；旧 router 本身没有该 gate。
 
-## API 速览（`apps/agent-runner`）
+本地统一入口当前启动单个 router、单个 runner，并把 Blob 写入 runner 独占的 `.local-run/blobs`。Blob 上传另有 `BLOB_ATTACHMENTS_ENABLED` 显式 gate，router 还会检查全部健康 runner 的 `blobAttachments` capability；当前 filesystem adapter 同时要求显式 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`。它不能作为多 VM/多 Pod 共享存储，production runner 对 filesystem 写入和 cleanup 都会 fail closed；接入共享 OSS/S3 adapter 前不得在生产开启这两个工作循环。
+
+## API 速览（对外经 `apps/agent-router`）
 
 鉴权两层：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（trusted caller）或 runner 验证的端用户 token。入站 token header 不能占用 service/user/framing/hop-by-hop 保留头；即使数据库中存在升级前的坏策略，admin service key 仍可通过 `/v1/tenant/auth` 修复。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入。
 
 ```bash
+BASE=http://127.0.0.1:8080
 H=(-H "Authorization: Bearer dev-key" -H "X-User-Id: u_42" -H "Content-Type: application/json")
 # agent 定义（版本化）
-curl -s -X POST localhost:8787/v1/agents "${H[@]}" -d '{"name":"assistant","instructions":"你是一个简洁的助手。","model":{"provider":"dashscope","model":"qwen3.8-max"},"tools":["current_time","web_fetch"],"limits":{"maxSteps":6}}'
+curl -sS -X POST "$BASE/v1/agents" "${H[@]}" -d '{"name":"assistant","instructions":"你是一个简洁的助手。","model":{"provider":"dashscope","model":"qwen3.8-max"},"tools":["current_time","web_fetch"],"limits":{"maxSteps":6}}'
 # session
-curl -s -X POST localhost:8787/v1/sessions "${H[@]}" -d '{"agentId":"agt_..."}'
+curl -sS -X POST "$BASE/v1/sessions" "${H[@]}" -d '{"agentId":"agt_..."}'
 # turn（SSE；id: 为 seq，Last-Event-ID / ?after= 可续订；?exclude= 过滤事件）
-curl -sN -X POST "localhost:8787/v1/sessions/sess_.../turns?exclude=usage/updated" "${H[@]}" -H "Idempotency-Key: k1" -d '{"input":[{"type":"text","text":"现在几点？"}]}'
+curl -sN -X POST "$BASE/v1/sessions/sess_.../turns?exclude=usage/updated" "${H[@]}" -H "Idempotency-Key: k1" -d '{"input":[{"type":"text","text":"现在几点？"}]}'
 # 非流式：{"stream":false} → 202 + turn；之后 GET .../events?after=<seq> 消费
 # 幂等键按 tenant + user + session 隔离；同 key 异请求 → 409。stream 不参与请求 hash；重放命中时固定返回
 # 200 application/json {turn} + Idempotency-Replayed: true，需要事件流时用 GET .../events?after=<seq> 续订。
 # 其他：GET .../items | .../turns | POST .../turns/{id}/interrupt | steer | tool-results（动态工具回填）
 #       GET/POST .../approvals/{id} {decision: accept|acceptForSession|decline|cancel}
 #       GET/PUT/DELETE /v1/providers/{id}（BYOK，apiKey 只写不读，AES-GCM 落库）  GET /v1/models  GET /v1/tools
+#       POST .../blobs（图片原始字节） | GET .../blobs/{blobId} | GET .../items/{itemId}/output
 #       POST .../archive | .../unarchive | .../resume  DELETE /v1/sessions/{id}（fenced tombstone，不物理 purge）
 #       GET /v1/capabilities  GET /openapi.json  GET /healthz /readyz
 ```
@@ -105,8 +111,8 @@ apps/agent-runner      Hono HTTP + SSE；鉴权；幂等；路由 → SessionHos
 apps/agent-router      无状态路由；owner 目录、一致性哈希、SSE 透传与安全重路由
 packages/protocol      资源 / 事件 / 错误 schema（zod）
 packages/sdk           从 OpenAPI 生成的 TypeScript 路由类型、类型化客户端与 SSE 流式辅助函数
-packages/store         SessionStore / LeaseStore / EventBus / BlobStore 接口；memory、MySQL（fenced commit）、Redis（Lua 租约、Streams 热重放）实现；migrations/
-packages/core          AgentEngine 接口 + PiEngine（pi-agent-core 适配）；SessionHost（租约续期、write-ahead、审批门、安全阀、崩溃修复、事件序列化）；上下文装配；内置工具
+packages/store         SessionStore / LeaseStore / EventBus / BlobStore 接口；ownership manifest 与 Blob delete outbox；memory、MySQL（fenced commit）、Redis（Lua 租约、Streams 热重放）实现；migrations/
+packages/core          AgentEngine 接口 + PiEngine（pi-agent-core 适配）；SessionHost（租约续期、write-ahead、审批门、安全阀、Blob 绑定/水合、崩溃修复、事件序列化）；上下文装配；内置工具与 Blob cleanup worker
 packages/providers     BYOK provider 配置 → pi Model；密钥加密；国内厂商 preset
 packages/testkit       假厂商与跨包测试夹具
 deploy/local           本机 redis / mysql 启停脚本
@@ -130,3 +136,4 @@ docs/                  调研、设计
 - 审批授权是服务端状态，客户端 metadata 改不动；BYOK 的 `baseUrl` 必须解析到公网地址。
 - 被抢占（fence 失效）或会话被删除时，turn 立即停止，不再调模型、不再执行工具。
 - 同一条流式消息的 item 只分配一次 seq，`?afterSeq=` 增量拉取不会漏掉最终回答。
+- Blob 客户端只看到 owner-scoped opaque `blobId`，看不到物理 locator；输入图片会校验声明 MIME 与文件签名，且所选模型必须声明 image input。从 `staging` 到 item 的 `ready` 绑定与业务 commit 原子提交，tenant/user/session 或 item 不匹配统一返回 404。达到阈值的合法工具输出卸载到 Blob 并由 `outputRef` 精确取回；不可序列化、超过持久化硬上限或 storage adapter 写入失败的结果都会在当前 step 与重放中变成同一稳定失败，且不会回显物理路径/locator。单次模型请求优先装配当前输入，历史按新到旧使用剩余水合预算；compaction 只有在 summary range 的全部外置工具事实都能物化时才推进 watermark。当前历史图片像素不会跨 compaction 保留，长期视觉记忆仍需后续视觉摘要/OCR。过期未绑定 staging 通过专用 outbox/claim lease 按 at-least-once 语义删除，key-scoped cancellation fence 阻止迟到上传复活对象；ready Blob 的 session erasure/物理 purge 尚未开启。

@@ -1,4 +1,5 @@
 export * from "./types.js";
+export * from "./blob-lifecycle.js";
 export * from "./memory.js";
 export { MysqlSessionStore, type MysqlStoreOptions } from "./mysql/store.js";
 export { RedisLeaseStore } from "./redis/lease.js";

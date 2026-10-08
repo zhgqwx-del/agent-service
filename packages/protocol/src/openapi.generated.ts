@@ -711,6 +711,51 @@ export const OPENAPI_DOCUMENT = {
         ],
         "type": "object"
       },
+      "BlobUploadResponse": {
+        "properties": {
+          "blobId": {
+            "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "contentType": {
+            "enum": [
+              "image/png",
+              "image/jpeg",
+              "image/webp",
+              "image/gif"
+            ],
+            "type": "string"
+          },
+          "expiresAtMs": {
+            "type": "integer"
+          },
+          "purpose": {
+            "enum": [
+              "input_image"
+            ],
+            "type": "string"
+          },
+          "sizeBytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "staging"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "blobId",
+          "purpose",
+          "state",
+          "sizeBytes",
+          "contentType",
+          "expiresAtMs"
+        ],
+        "type": "object"
+      },
       "Capabilities": {
         "properties": {
           "features": {
@@ -719,6 +764,10 @@ export const OPENAPI_DOCUMENT = {
                 "enum": [
                   true
                 ],
+                "type": "boolean"
+              },
+              "blobAttachments": {
+                "default": false,
                 "type": "boolean"
               },
               "byok": {
@@ -1719,7 +1768,17 @@ export const OPENAPI_DOCUMENT = {
                             },
                             {
                               "properties": {
+                                "blobId": {
+                                  "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                                  "type": "string"
+                                },
                                 "mimeType": {
+                                  "enum": [
+                                    "image/png",
+                                    "image/jpeg",
+                                    "image/webp",
+                                    "image/gif"
+                                  ],
                                   "type": "string"
                                 },
                                 "type": {
@@ -1727,15 +1786,11 @@ export const OPENAPI_DOCUMENT = {
                                     "image"
                                   ],
                                   "type": "string"
-                                },
-                                "url": {
-                                  "format": "uri",
-                                  "type": "string"
                                 }
                               },
                               "required": [
                                 "type",
-                                "url"
+                                "blobId"
                               ],
                               "type": "object"
                             },
@@ -2107,6 +2162,7 @@ export const OPENAPI_DOCUMENT = {
                         "type": "string"
                       },
                       "outputRef": {
+                        "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "type": "string"
                       },
                       "seq": {
@@ -2466,7 +2522,17 @@ export const OPENAPI_DOCUMENT = {
                             },
                             {
                               "properties": {
+                                "blobId": {
+                                  "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                                  "type": "string"
+                                },
                                 "mimeType": {
+                                  "enum": [
+                                    "image/png",
+                                    "image/jpeg",
+                                    "image/webp",
+                                    "image/gif"
+                                  ],
                                   "type": "string"
                                 },
                                 "type": {
@@ -2474,15 +2540,11 @@ export const OPENAPI_DOCUMENT = {
                                     "image"
                                   ],
                                   "type": "string"
-                                },
-                                "url": {
-                                  "format": "uri",
-                                  "type": "string"
                                 }
                               },
                               "required": [
                                 "type",
-                                "url"
+                                "blobId"
                               ],
                               "type": "object"
                             },
@@ -2854,6 +2916,7 @@ export const OPENAPI_DOCUMENT = {
                         "type": "string"
                       },
                       "outputRef": {
+                        "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                         "type": "string"
                       },
                       "seq": {
@@ -3818,24 +3881,56 @@ export const OPENAPI_DOCUMENT = {
                     },
                     "content": {
                       "items": {
-                        "properties": {
-                          "text": {
-                            "maxLength": 100000,
-                            "minLength": 1,
-                            "type": "string"
-                          },
-                          "type": {
-                            "enum": [
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "text": {
+                                "maxLength": 100000,
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "text"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "type",
                               "text"
                             ],
-                            "type": "string"
+                            "type": "object"
+                          },
+                          {
+                            "properties": {
+                              "blobId": {
+                                "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                                "type": "string"
+                              },
+                              "mimeType": {
+                                "enum": [
+                                  "image/png",
+                                  "image/jpeg",
+                                  "image/webp",
+                                  "image/gif"
+                                ],
+                                "type": "string"
+                              },
+                              "type": {
+                                "enum": [
+                                  "image"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "blobId"
+                            ],
+                            "type": "object"
                           }
-                        },
-                        "required": [
-                          "type",
-                          "text"
-                        ],
-                        "type": "object"
+                        ]
                       },
                       "type": "array"
                     },
@@ -4159,6 +4254,7 @@ export const OPENAPI_DOCUMENT = {
                       "type": "string"
                     },
                     "outputRef": {
+                      "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                       "type": "string"
                     },
                     "seq": {
@@ -4527,14 +4623,53 @@ export const OPENAPI_DOCUMENT = {
                   "type": "string"
                 },
                 "input": {
-                  "items": {
-                    "enum": [
-                      "text",
-                      "image"
-                    ],
-                    "type": "string"
-                  },
-                  "type": "array"
+                  "anyOf": [
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "enum": [
+                            "image"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "image"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    }
+                  ]
                 },
                 "maxOutputTokens": {
                   "exclusiveMinimum": 0,
@@ -4786,14 +4921,53 @@ export const OPENAPI_DOCUMENT = {
                   "type": "string"
                 },
                 "input": {
-                  "items": {
-                    "enum": [
-                      "text",
-                      "image"
-                    ],
-                    "type": "string"
-                  },
-                  "type": "array"
+                  "anyOf": [
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "enum": [
+                            "image"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "image"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    }
+                  ]
                 },
                 "maxOutputTokens": {
                   "exclusiveMinimum": 0,
@@ -5031,14 +5205,53 @@ export const OPENAPI_DOCUMENT = {
                         "type": "string"
                       },
                       "input": {
-                        "items": {
-                          "enum": [
-                            "text",
-                            "image"
-                          ],
-                          "type": "string"
-                        },
-                        "type": "array"
+                        "anyOf": [
+                          {
+                            "prefixItems": [
+                              {
+                                "enum": [
+                                  "text"
+                                ],
+                                "type": "string"
+                              }
+                            ],
+                            "type": "array"
+                          },
+                          {
+                            "prefixItems": [
+                              {
+                                "enum": [
+                                  "text"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "enum": [
+                                  "image"
+                                ],
+                                "type": "string"
+                              }
+                            ],
+                            "type": "array"
+                          },
+                          {
+                            "prefixItems": [
+                              {
+                                "enum": [
+                                  "image"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "enum": [
+                                  "text"
+                                ],
+                                "type": "string"
+                              }
+                            ],
+                            "type": "array"
+                          }
+                        ]
                       },
                       "maxOutputTokens": {
                         "exclusiveMinimum": 0,
@@ -5961,24 +6174,56 @@ export const OPENAPI_DOCUMENT = {
           },
           "input": {
             "items": {
-              "properties": {
-                "text": {
-                  "maxLength": 100000,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "type": {
-                  "enum": [
+              "oneOf": [
+                {
+                  "properties": {
+                    "text": {
+                      "maxLength": 100000,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "text"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
                     "text"
                   ],
-                  "type": "string"
+                  "type": "object"
+                },
+                {
+                  "properties": {
+                    "blobId": {
+                      "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "mimeType": {
+                      "enum": [
+                        "image/png",
+                        "image/jpeg",
+                        "image/webp",
+                        "image/gif"
+                      ],
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "image"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "blobId"
+                  ],
+                  "type": "object"
                 }
-              },
-              "required": [
-                "type",
-                "text"
-              ],
-              "type": "object"
+              ]
             },
             "maxItems": 32,
             "minItems": 1,
@@ -6056,24 +6301,56 @@ export const OPENAPI_DOCUMENT = {
           },
           "input": {
             "items": {
-              "properties": {
-                "text": {
-                  "maxLength": 100000,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "type": {
-                  "enum": [
+              "oneOf": [
+                {
+                  "properties": {
+                    "text": {
+                      "maxLength": 100000,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "text"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
                     "text"
                   ],
-                  "type": "string"
+                  "type": "object"
+                },
+                {
+                  "properties": {
+                    "blobId": {
+                      "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                      "type": "string"
+                    },
+                    "mimeType": {
+                      "enum": [
+                        "image/png",
+                        "image/jpeg",
+                        "image/webp",
+                        "image/gif"
+                      ],
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "image"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "blobId"
+                  ],
+                  "type": "object"
                 }
-              },
-              "required": [
-                "type",
-                "text"
-              ],
-              "type": "object"
+              ]
             },
             "maxItems": 32,
             "minItems": 1,
@@ -6476,6 +6753,61 @@ export const OPENAPI_DOCUMENT = {
         },
         "required": [
           "data"
+        ],
+        "type": "object"
+      },
+      "ToolOutputPayload": {
+        "properties": {
+          "content": {
+            "items": {
+              "oneOf": [
+                {
+                  "properties": {
+                    "text": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "text"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "text"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "properties": {
+                    "mimeType": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "enum": [
+                        "image"
+                      ],
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "url"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "details": {}
+        },
+        "required": [
+          "content"
         ],
         "type": "object"
       },
@@ -7302,17 +7634,56 @@ export const OPENAPI_DOCUMENT = {
                   "type": "string"
                 },
                 "input": {
+                  "anyOf": [
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "enum": [
+                            "image"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    },
+                    {
+                      "prefixItems": [
+                        {
+                          "enum": [
+                            "image"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "enum": [
+                            "text"
+                          ],
+                          "type": "string"
+                        }
+                      ],
+                      "type": "array"
+                    }
+                  ],
                   "default": [
                     "text"
-                  ],
-                  "items": {
-                    "enum": [
-                      "text",
-                      "image"
-                    ],
-                    "type": "string"
-                  },
-                  "type": "array"
+                  ]
                 },
                 "maxOutputTokens": {
                   "default": 8192,
@@ -8561,6 +8932,214 @@ export const OPENAPI_DOCUMENT = {
         ]
       }
     },
+    "/v1/sessions/{id}/blobs": {
+      "post": {
+        "description": "Uploads raw bytes and returns an opaque, owner-scoped blob id. A staging blob is not readable until a turn or steer request atomically attaches it. Cross-tenant, cross-user and cross-session lookups return 404.",
+        "operationId": "uploadSessionBlob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "image/gif": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            },
+            "image/jpeg": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            },
+            "image/png": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            },
+            "image/webp": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "description": "Raw input-image bytes. Send the image media type in Content-Type.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlobUploadResponse"
+                }
+              }
+            },
+            "description": "Staged input image."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Stage an input image for a session",
+        "tags": [
+          "Blobs"
+        ]
+      }
+    },
+    "/v1/sessions/{id}/blobs/{blobId}": {
+      "get": {
+        "description": "Returns bytes only after the opaque blob id is ready and attached to this session. Staging, missing and ownership-mismatched blobs all return 404.",
+        "operationId": "getSessionBlob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "blobId",
+            "required": true,
+            "schema": {
+              "pattern": "^blob_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "image/gif": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Attached blob bytes; Content-Type is the recorded media type."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read an attached session blob",
+        "tags": [
+          "Blobs"
+        ]
+      }
+    },
     "/v1/sessions/{id}/compact": {
       "post": {
         "operationId": "compactSession",
@@ -8863,6 +9442,90 @@ export const OPENAPI_DOCUMENT = {
           }
         ],
         "summary": "List durable items in a session",
+        "tags": [
+          "Items"
+        ]
+      }
+    },
+    "/v1/sessions/{id}/items/{itemId}/output": {
+      "get": {
+        "description": "Resolves an item's opaque output blob only for the exact tenant, user, session and item owner. Missing, non-ready and ownership-mismatched outputs return 404.",
+        "operationId": "getItemOutput",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "itemId",
+            "required": true,
+            "schema": {
+              "pattern": "^item_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolOutputPayload"
+                }
+              }
+            },
+            "description": "Full offloaded tool output."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Fetch an offloaded tool output",
         "tags": [
           "Items"
         ]
@@ -10027,6 +10690,9 @@ export const OPENAPI_DOCUMENT = {
     },
     {
       "name": "Sessions"
+    },
+    {
+      "name": "Blobs"
     },
     {
       "name": "Turns"

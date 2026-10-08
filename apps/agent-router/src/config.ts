@@ -12,6 +12,12 @@ const Env = z.object({
   // Keep this default identical to agent-runner. If the router accepts a body the runner rejects,
   // the runner may close the upload and an ordinary client error is misreported as a 502.
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(1_000_000),
+  /** Must match the runner's raw blob ceiling; applies only to the binary upload route. */
+  BLOB_MAX_BYTES: z.coerce.number().int().positive().default(1_000_000),
+  /** Explicit acknowledgement that the current Blob fleet is exactly one filesystem-backed runner. */
+  BLOB_FILESYSTEM_SINGLE_RUNNER: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Explicit expand→activate gate for blob writes across the whole healthy fleet. */
+  BLOB_ATTACHMENTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** waiting for upstream HEADERS only; the SSE body is never subject to it */
   UPSTREAM_HEADER_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
   /** enables /_router/* when set */
@@ -50,6 +56,20 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   if (!runnerList.length) throw new Error("RUNNERS must list at least one runner base url");
   if (c.NODE_ENV === "production" && !c.INTERNAL_ROUTER_TOKEN) {
     throw new Error("INTERNAL_ROUTER_TOKEN is required in production");
+  }
+  if (c.BLOB_MAX_BYTES > c.MAX_BODY_BYTES) {
+    throw new Error("BLOB_MAX_BYTES must not exceed MAX_BODY_BYTES");
+  }
+  if (c.BLOB_FILESYSTEM_SINGLE_RUNNER && runnerList.length !== 1) {
+    throw new Error("BLOB_FILESYSTEM_SINGLE_RUNNER=1 requires RUNNERS to contain exactly one runner");
+  }
+  if (c.BLOB_ATTACHMENTS_ENABLED && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
+    throw new Error("BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required before BLOB_ATTACHMENTS_ENABLED=1");
+  }
+  if (c.NODE_ENV === "production" && c.BLOB_ATTACHMENTS_ENABLED) {
+    throw new Error(
+      "filesystem Blob writes are unsupported in production until a shared object-store adapter is configured",
+    );
   }
   return { ...c, INTERNAL_ROUTER_TOKEN: c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN, runnerList };
 }

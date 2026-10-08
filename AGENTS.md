@@ -16,10 +16,10 @@
 - M1 核心运行范围、OpenAPI 3.1 与生成 TypeScript SDK 已完成；完整数据生命周期仍未闭环。
 - M2 的本地/CI 代码范围已完成并正式冻结；尚未正式进入 M3，云上部署不属于本次冻结范围。
 - M3 的 MCP/skills/hooks 主体和 M4 的生产化主体尚未开始。
-- session 创建与首条事件原子化、`0007 -> 0008 -> 0009` 历史升级夹具、OpenAPI/SDK、可逆 Archive v2、fenced tombstone 和 reliable terminal-event outbox dispatcher 已收口；当前继续按 `docs/design/04-data-lifecycle.md` 实现 ownership manifest/Blob 接线、erasure/export、legacy generation `0` 补偿和默认关闭的物理 purge，完成数据生命周期后再正式进入 M3。
+- session 创建与首条事件原子化、`0007 -> 0008 -> 0009 -> 0010` 历史升级夹具、OpenAPI/SDK、可逆 Archive v2、fenced tombstone、reliable terminal-event outbox dispatcher，以及 Blob ownership/业务接线与 staging orphan 清理已收口；当前继续按 `docs/design/04-data-lifecycle.md` 实现 erasure/export、usage 对账匿名化、legacy generation `0` 补偿和默认关闭的 ready/session purge，完成数据生命周期后再正式进入 M3。
 - tombstone 已原子写入 marker、terminal `session/deleted`、单调 generation、即时 `session.tombstoned` intent 和不可领取的 `session.purge` intent；普通资源隐藏且 parent/child 竞态受保护。每个 runner 内置的 dispatcher 只处理 `session.tombstoned`，通过 claim lease/CAS 和有上限退避按 at-least-once 语义投递；短暂故障无限重试，确定损坏的 intent 才 dead-letter，event `seq` 是重复身份。它不会领取或执行物理 purge。
 - tombstone 保持在 protocol family `2026-10-08` 内，以 additive capability 协商。router 还要求显式 `SESSION_TOMBSTONE_ENABLED=1` 和全部健康 runner 支持该 capability；外部 DELETE 只会改写为带内部 token、要求 ACK 的版本化 runner-only POST，不会回退到旧公开 DELETE。`RUNNERS` 必须使用实例稳定地址。发布前先由 edge 暂停精确 session DELETE（或整体切换 router 池），再按新 router（gate=0）→ 排空旧 router → 滚动新 runner → 核对 fleet → 激活 gate 的顺序执行，旧 router 自身没有该 gate。未来真正不兼容的 protocol 变更仍需维护窗口或整组 blue-green。
-- BlobStore 的跨平台 key、防损坏单-envelope 原子发布、旧安全格式读取/删除、私有权限、静态 symlink 防护和 memory 复制语义已有测试；filesystem root 必须由服务独占，且不承诺断电持久性。item/附件接线、ownership manifest、Blob 专用 outbox/worker 与 purge 尚未完成，不能宣称大输出生命周期已闭环。
+- BlobStore 的跨平台 key、防损坏单-envelope 原子发布、旧安全格式读取/删除、私有权限、静态 symlink 防护和 memory 复制语义已有测试。`0010`、Memory/MySQL ownership manifest、图片/大工具输出接线、staging→ready 原子绑定、独立 Blob outbox/worker、硬 TTL、并发 claim、key-scoped delete fence 和 stale staging 清理已实现；工具结果有独立持久化硬上限，序列化/超限/adapter 写失败在 current/replay 中使用同一无 locator 的稳定结果，单次请求共享完整 data URL 水合预算，compaction 不会跨过未物化的外置工具事实。历史图片像素目前不会跨 compaction 保留。ready/session purge 仍关闭。filesystem root 必须由单一 runner 独占并显式设置 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`、不承诺断电持久性；production filesystem writer/cleanup 在共享对象存储适配器完成前均 fail-closed，不能宣称大输出最终删除已闭环。
 
 ## 工作边界
 

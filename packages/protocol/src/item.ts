@@ -2,7 +2,15 @@ import { z } from "zod";
 import { externalId, idSchema, Usage } from "./common.js";
 
 export const TextInputPart = z.object({ type: z.literal("text"), text: z.string().min(1).max(100_000) });
-export const ImageInputPart = z.object({ type: z.literal("image"), url: z.string().url(), mimeType: z.string().optional() });
+export const IMAGE_MEDIA_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"] as const;
+export const ImageMediaType = z.enum(IMAGE_MEDIA_TYPES);
+export type ImageMediaType = z.infer<typeof ImageMediaType>;
+export const ImageInputPart = z.object({
+  type: z.literal("image"),
+  /** Opaque, owner-scoped id returned by the session blob upload endpoint. */
+  blobId: idSchema("blob"),
+  mimeType: ImageMediaType.optional(),
+});
 export const SkillInputPart = z.object({
   type: z.literal("skill"),
   name: externalId,
@@ -10,7 +18,7 @@ export const SkillInputPart = z.object({
 });
 export const MentionInputPart = z.object({ type: z.literal("mention"), name: externalId });
 
-/** Full protocol vocabulary. Current HTTP turn inputs intentionally expose only TextInputPart. */
+/** Full protocol vocabulary. HTTP turn inputs expose text and owner-scoped image parts. */
 export const InputPart = z.discriminatedUnion("type", [
   TextInputPart,
   ImageInputPart,
@@ -26,6 +34,13 @@ export const ToolContentPart = z.discriminatedUnion("type", [
   z.object({ type: z.literal("image"), url: z.string(), mimeType: z.string().optional() }),
 ]);
 export type ToolContentPart = z.infer<typeof ToolContentPart>;
+
+/** Full offloaded tool result fetched through the owner-scoped item output endpoint. */
+export const ToolOutputPayload = z.object({
+  content: z.array(ToolContentPart),
+  details: z.unknown().optional(),
+});
+export type ToolOutputPayload = z.infer<typeof ToolOutputPayload>;
 
 export const ItemStatus = z.enum(["inProgress", "completed", "failed", "declined"]);
 export type ItemStatus = z.infer<typeof ItemStatus>;
@@ -71,8 +86,8 @@ export const ToolResultItem = z.object({
   name: z.string(),
   content: z.array(ToolContentPart),
   isError: z.boolean().default(false),
-  /** large outputs are offloaded to blob storage and referenced here */
-  outputRef: z.string().optional(),
+  /** Opaque owner-scoped id for a large output stored outside the item row. */
+  outputRef: idSchema("blob").optional(),
   details: z.unknown().optional(),
 });
 export const ApprovalRequestItem = z.object({

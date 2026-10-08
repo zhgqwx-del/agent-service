@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import type { AgentDefinition, ApiKeyScope, Approval, Item, PersistedEvent, ProviderConfig, Session, TenantAuthPolicy, Turn, UsageQuery } from "@agent-service/protocol";
-import { DEFAULT_AUTH_POLICY, DEFAULT_SCOPES } from "@agent-service/protocol";
+import { DEFAULT_AUTH_POLICY, DEFAULT_SCOPES, isCanonicalId } from "@agent-service/protocol";
 import {
   FenceError,
   IdempotencyMismatchError,
@@ -16,6 +16,7 @@ import {
   SessionLifecycleBusyError,
   SessionVersionError,
   assertPureFenceClaim,
+  assertCommitResourceOwnership,
   assertTombstoneEvent,
   assignItemSeqs,
   assignTurnSeqEnd,
@@ -33,6 +34,28 @@ import {
   type TenantRecord,
 } from "../types.js";
 import {
+  BLOB_STORAGE_FORMAT,
+  BlobStateError,
+  assertBlobBindingsMatch,
+  isUnexpiredStagingBlob,
+  sanitizeBlobDeleteError,
+  validateBlobDeleteAck,
+  validateBlobDeleteClaim,
+  type BlobCleanupStore,
+  type BlobBinding,
+  type BindableBlobLookup,
+  type BlobDeleteOutboxRecord,
+  type BlobManifest,
+  type BlobManifestStore,
+  type ClaimBlobDeletesOptions,
+  type MarkBlobUploadedInput,
+  type ReadyBlobLookup,
+  type RetryBlobDeleteOptions,
+  type ScheduleStaleBlobsOptions,
+  type StageBlobInput,
+} from "../blob-lifecycle.js";
+import { validateBlobKey } from "../blob/key.js";
+import {
   assertLifecycleOutboxId,
   parseLifecycleOutboxEnvelope,
   sanitizeLifecycleOutboxError,
@@ -45,6 +68,23 @@ import {
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
 const parse = <T>(v: unknown): T => (typeof v === "string" ? JSON.parse(v) : (v as T));
+const BLOB_COLUMNS = `blob_id, tenant_id, user_id, session_id, item_id, purpose, storage_backend,
+  storage_format, storage_key, upload_token, state, sha256, size_bytes, content_type,
+  uploaded_at_ms, ready_at_ms, staging_expires_at_ms, delete_after_ms, deleted_at_ms,
+  deletion_generation, created_at_ms`;
+const QUALIFIED_BLOB_COLUMNS = `b.blob_id, b.tenant_id, b.user_id, b.session_id, b.item_id, b.purpose,
+  b.storage_backend, b.storage_format, b.storage_key, b.upload_token, b.state, b.sha256, b.size_bytes,
+  b.content_type, b.uploaded_at_ms, b.ready_at_ms, b.staging_expires_at_ms, b.delete_after_ms,
+  b.deleted_at_ms, b.deletion_generation, b.created_at_ms`;
+const BLOB_DELETE_COLUMNS = `o.outbox_id, o.blob_id, o.generation, o.available_at_ms, o.attempts,
+  o.claim_token, o.lease_until_ms, o.last_error, o.completed_at_ms, o.dead_lettered_at_ms, o.created_at_ms,
+  b.storage_backend, b.storage_format, b.storage_key, b.upload_token, b.state, b.deletion_generation`;
+
+interface ExistingCommitResources {
+  itemIds: Set<string>;
+  turnIds: Set<string>;
+  approvalIds: Set<string>;
+}
 
 /** Serialize a Session row. The projection columns are the source for filtering; `body` holds the rest. */
 function rowToSession(r: Row): Session {
@@ -95,6 +135,90 @@ function rowToLifecycleOutbox(row: Row): LifecycleOutboxRecord {
   } as LifecycleOutboxRecord;
 }
 
+function rowToBlobManifest(row: Row): BlobManifest {
+  const sha = row.sha256 == null ? undefined : Buffer.from(row.sha256).toString("hex");
+  return {
+    blobId: String(row.blob_id),
+    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
+    sessionId: String(row.session_id),
+    ...(row.item_id == null ? {} : { itemId: String(row.item_id) }),
+    purpose: row.purpose,
+    storageBackend: String(row.storage_backend),
+    storageFormat: String(row.storage_format),
+    storageKey: String(row.storage_key),
+    uploadToken: String(row.upload_token),
+    state: row.state,
+    ...(sha === undefined ? {} : { sha256: sha }),
+    ...(row.size_bytes == null ? {} : { sizeBytes: Number(row.size_bytes) }),
+    ...(row.content_type == null ? {} : { contentType: String(row.content_type) }),
+    ...(row.uploaded_at_ms == null ? {} : { uploadedAtMs: Number(row.uploaded_at_ms) }),
+    ...(row.ready_at_ms == null ? {} : { readyAtMs: Number(row.ready_at_ms) }),
+    ...(row.staging_expires_at_ms == null ? {} : { stagingExpiresAtMs: Number(row.staging_expires_at_ms) }),
+    ...(row.delete_after_ms == null ? {} : { deleteAfterMs: Number(row.delete_after_ms) }),
+    ...(row.deleted_at_ms == null ? {} : { deletedAtMs: Number(row.deleted_at_ms) }),
+    deletionGeneration: Number(row.deletion_generation),
+    createdAtMs: Number(row.created_at_ms),
+  } as BlobManifest;
+}
+
+function validateStageBlobInput(input: StageBlobInput): void {
+  if (!isCanonicalId("sess", input.sessionId) || !isCanonicalId("blob", input.blobId)) {
+    throw new Error("invalid blob manifest identity");
+  }
+  validateBlobKey(input.storageKey);
+  if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(input.storageBackend)) throw new Error("invalid blob storage backend");
+  if (input.storageFormat !== BLOB_STORAGE_FORMAT) throw new Error("unsupported blob storage format");
+  if (!/^[a-z0-9-]{16,64}$/.test(input.uploadToken)) throw new Error("invalid blob upload token");
+  if (!Number.isSafeInteger(input.fence) || input.fence < 0) throw new Error("invalid blob fence");
+  if (!Number.isSafeInteger(input.createdAtMs) || input.createdAtMs < 0) throw new Error("invalid blob creation timestamp");
+  if (!Number.isSafeInteger(input.stagingExpiresAtMs) || input.stagingExpiresAtMs <= input.createdAtMs) {
+    throw new Error("blob staging expiry must be after creation");
+  }
+}
+
+function validateUploadedBlobInput(input: MarkBlobUploadedInput): void {
+  if (!isCanonicalId("sess", input.sessionId) || !isCanonicalId("blob", input.blobId)) {
+    throw new Error("invalid blob manifest identity");
+  }
+  if (!/^[a-z0-9-]{16,64}$/.test(input.uploadToken)) throw new Error("invalid blob upload token");
+  if (!/^[0-9a-f]{64}$/.test(input.sha256)) throw new Error("invalid blob sha256");
+  if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) throw new Error("invalid blob size");
+  if (!Number.isSafeInteger(input.uploadedAtMs) || input.uploadedAtMs < 0) throw new Error("invalid blob upload timestamp");
+  if (!Number.isSafeInteger(input.fence) || input.fence < 0) throw new Error("invalid blob fence");
+}
+
+function rowToBlobDeleteOutbox(row: Row, requirePending = true): BlobDeleteOutboxRecord {
+  const outboxId = Number(row.outbox_id);
+  const generation = Number(row.generation);
+  if (!Number.isSafeInteger(outboxId) || outboxId < 1) throw new Error("invalid blob delete outbox id");
+  if (
+    Number(row.deletion_generation) !== generation
+    || (requirePending ? row.state !== "delete_pending" : row.state !== "delete_pending" && row.state !== "deleted")
+  ) {
+    throw new Error(`blob delete outbox ${outboxId} does not match its manifest state`);
+  }
+  const uploadToken = String(row.upload_token);
+  if (!uploadToken) throw new Error(`blob delete outbox ${outboxId} has no upload token`);
+  return {
+    outboxId,
+    blobId: String(row.blob_id),
+    generation,
+    storageBackend: String(row.storage_backend),
+    storageFormat: String(row.storage_format),
+    storageKey: String(row.storage_key),
+    uploadToken,
+    availableAtMs: Number(row.available_at_ms),
+    attempts: Number(row.attempts),
+    ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+    ...(row.lease_until_ms == null ? {} : { leaseUntilMs: Number(row.lease_until_ms) }),
+    ...(row.last_error == null ? {} : { lastError: String(row.last_error) }),
+    ...(row.completed_at_ms == null ? {} : { completedAtMs: Number(row.completed_at_ms) }),
+    ...(row.dead_lettered_at_ms == null ? {} : { deadLetteredAtMs: Number(row.dead_lettered_at_ms) }),
+    createdAtMs: Number(row.created_at_ms),
+  };
+}
+
 export interface MysqlStoreOptions {
   url: string;
   connectionLimit?: number;
@@ -104,7 +228,7 @@ export interface MysqlStoreOptions {
   migrationLockTimeoutSeconds?: number;
 }
 
-export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore {
+export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore {
   private constructor(private readonly pool: Pool) {}
 
   /**
@@ -319,10 +443,377 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore {
     const data = rows.slice(0, opts.limit).map(rowToSession);
     return { data, nextCursor: rows.length > opts.limit ? (data.at(-1)?.id ?? null) : null };
   }
+
+  // ---------- blob ownership manifest ----------
+  async stageBlob(input: StageBlobInput): Promise<void> {
+    validateStageBlobInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [sessions] = await conn.query<Row[]>(
+        `SELECT tenant_id, user_id, fence_token, archived_at_ms, deleted_at_ms
+           FROM sessions WHERE session_id=? FOR UPDATE`,
+        [input.sessionId],
+      );
+      const session = sessions[0];
+      if (
+        !session
+        || session.deleted_at_ms != null
+        || session.tenant_id !== input.owner.tenantId
+        || session.user_id !== input.owner.userId
+      ) throw new SessionGoneError(input.sessionId);
+      if (session.archived_at_ms != null) throw new SessionArchivedError(input.sessionId);
+      const currentFence = Number(session.fence_token);
+      if (input.fence < currentFence) throw new FenceError(input.sessionId, input.fence, currentFence);
+
+      const [existingRows] = await conn.query<Row[]>(
+        `SELECT ${BLOB_COLUMNS} FROM blob_objects WHERE blob_id=? FOR UPDATE`,
+        [input.blobId],
+      );
+      const existing = existingRows[0] ? rowToBlobManifest(existingRows[0]) : undefined;
+      if (existing) {
+        if (
+          existing.state !== "staging"
+          || existing.tenantId !== input.owner.tenantId
+          || existing.userId !== input.owner.userId
+          || existing.sessionId !== input.sessionId
+          || existing.purpose !== input.purpose
+          || existing.storageBackend !== input.storageBackend
+          || existing.storageFormat !== input.storageFormat
+          || existing.storageKey !== input.storageKey
+          || existing.uploadToken !== input.uploadToken
+          || existing.createdAtMs !== input.createdAtMs
+          || existing.stagingExpiresAtMs !== input.stagingExpiresAtMs
+        ) throw new BlobStateError(input.blobId);
+      } else {
+        await conn.query(
+          `INSERT INTO blob_objects
+             (blob_id, tenant_id, user_id, session_id, item_id, purpose, storage_backend, storage_format,
+              storage_key, upload_token, state, created_at_ms, staging_expires_at_ms, deletion_generation)
+           VALUES (?,?,?,?,NULL,?,?,?,?,?,'staging',?,?,0)`,
+          [
+            input.blobId,
+            input.owner.tenantId,
+            input.owner.userId,
+            input.sessionId,
+            input.purpose,
+            input.storageBackend,
+            input.storageFormat,
+            input.storageKey,
+            input.uploadToken,
+            input.createdAtMs,
+            input.stagingExpiresAtMs,
+          ],
+        );
+      }
+      if (input.fence > currentFence) {
+        await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [input.fence, input.sessionId]);
+      }
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async markBlobUploaded(input: MarkBlobUploadedInput): Promise<void> {
+    validateUploadedBlobInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [sessions] = await conn.query<Row[]>(
+        `SELECT tenant_id, user_id, fence_token, archived_at_ms, deleted_at_ms
+           FROM sessions WHERE session_id=? FOR UPDATE`,
+        [input.sessionId],
+      );
+      const session = sessions[0];
+      if (
+        !session
+        || session.deleted_at_ms != null
+        || session.tenant_id !== input.owner.tenantId
+        || session.user_id !== input.owner.userId
+      ) throw new SessionGoneError(input.sessionId);
+      if (session.archived_at_ms != null) throw new SessionArchivedError(input.sessionId);
+      const currentFence = Number(session.fence_token);
+      if (input.fence < currentFence) throw new FenceError(input.sessionId, input.fence, currentFence);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${BLOB_COLUMNS} FROM blob_objects WHERE blob_id=? FOR UPDATE`,
+        [input.blobId],
+      );
+      const manifest = rows[0] ? rowToBlobManifest(rows[0]) : undefined;
+      if (
+        !manifest
+        || manifest.state !== "staging"
+        || manifest.tenantId !== input.owner.tenantId
+        || manifest.userId !== input.owner.userId
+        || manifest.sessionId !== input.sessionId
+        || manifest.uploadToken !== input.uploadToken
+      ) throw new BlobStateError(input.blobId);
+      if (manifest.uploadedAtMs !== undefined) {
+        if (
+          manifest.sha256 !== input.sha256
+          || manifest.sizeBytes !== input.sizeBytes
+          || manifest.contentType !== input.contentType
+        ) throw new BlobStateError(input.blobId, "uploaded blob descriptor does not match");
+      } else {
+        await conn.query(
+          `UPDATE blob_objects
+              SET sha256=UNHEX(?), size_bytes=?, content_type=?, uploaded_at_ms=?
+            WHERE blob_id=? AND state='staging' AND upload_token=?`,
+          [input.sha256, input.sizeBytes, input.contentType ?? null, input.uploadedAtMs, input.blobId, input.uploadToken],
+        );
+      }
+      if (input.fence > currentFence) {
+        await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [input.fence, input.sessionId]);
+      }
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getBlobManifest(blobId: string): Promise<BlobManifest | null> {
+    const [rows] = await this.pool.query<Row[]>(`SELECT ${BLOB_COLUMNS} FROM blob_objects WHERE blob_id=?`, [blobId]);
+    return rows[0] ? rowToBlobManifest(rows[0]) : null;
+  }
+
+  async getBindableBlob(input: BindableBlobLookup): Promise<BlobManifest | null> {
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT ${QUALIFIED_BLOB_COLUMNS}
+         FROM blob_objects b
+         JOIN sessions s ON s.session_id=b.session_id AND s.tenant_id=b.tenant_id AND s.user_id=b.user_id
+        WHERE b.blob_id=? AND b.tenant_id=? AND b.user_id=? AND b.session_id=? AND b.purpose=?
+          AND b.state='staging' AND b.item_id IS NULL AND b.uploaded_at_ms IS NOT NULL
+          AND b.sha256 IS NOT NULL AND b.size_bytes IS NOT NULL
+          AND s.deleted_at_ms IS NULL AND s.archived_at_ms IS NULL`,
+      [input.blobId, input.owner.tenantId, input.owner.userId, input.sessionId, input.purpose],
+    );
+    const manifest = rows[0] ? rowToBlobManifest(rows[0]) : null;
+    return manifest && isUnexpiredStagingBlob(manifest, Date.now()) ? manifest : null;
+  }
+
+  async getReadyBlob(input: ReadyBlobLookup): Promise<BlobManifest | null> {
+    const where = [
+      "b.blob_id=?",
+      "b.tenant_id=?",
+      "b.user_id=?",
+      "b.session_id=?",
+      "b.state='ready'",
+      "s.deleted_at_ms IS NULL",
+      "i.item_id=b.item_id",
+      "i.session_id=b.session_id",
+      "i.user_id=b.user_id",
+    ];
+    const params: unknown[] = [input.blobId, input.owner.tenantId, input.owner.userId, input.sessionId];
+    if (input.itemId) { where.push("b.item_id=?"); params.push(input.itemId); }
+    if (input.purpose) { where.push("b.purpose=?"); params.push(input.purpose); }
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT ${QUALIFIED_BLOB_COLUMNS}
+         FROM blob_objects b
+         JOIN sessions s ON s.session_id=b.session_id AND s.tenant_id=b.tenant_id AND s.user_id=b.user_id
+         JOIN items i ON i.item_id=b.item_id
+        WHERE ${where.join(" AND ")}`,
+      params,
+    );
+    return rows[0] ? rowToBlobManifest(rows[0]) : null;
+  }
+
+  private async lockBlobBindings(
+    conn: PoolConnection,
+    bindings: readonly BlobBinding[],
+    owner: { tenantId: string; userId: string },
+    sessionId: string,
+  ): Promise<{ blobIds: string[]; readyAtMs: number }> {
+    if (bindings.length === 0) return { blobIds: [], readyAtMs: Date.now() };
+    const sorted = [...bindings].sort((left, right) => left.blobId.localeCompare(right.blobId));
+    const placeholders = sorted.map(() => "?").join(",");
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${BLOB_COLUMNS} FROM blob_objects
+        WHERE blob_id IN (${placeholders}) ORDER BY blob_id FOR UPDATE`,
+      sorted.map((binding) => binding.blobId),
+    );
+    const manifests = new Map(rows.map((row) => {
+      const manifest = rowToBlobManifest(row);
+      return [manifest.blobId, manifest] as const;
+    }));
+    // Evaluate the hard staging deadline only after all selected manifest rows are locked. A
+    // transaction that waited behind the sweeper (or another binder) cannot use a stale timestamp
+    // captured before lock acquisition to resurrect an expired object.
+    const readyAtMs = Date.now();
+    const toReady: string[] = [];
+    for (const binding of sorted) {
+      const manifest = manifests.get(binding.blobId);
+      if (
+        !manifest
+        || manifest.tenantId !== owner.tenantId
+        || manifest.userId !== owner.userId
+        || manifest.sessionId !== sessionId
+        || manifest.purpose !== binding.purpose
+        || manifest.uploadedAtMs === undefined
+        || manifest.sha256 === undefined
+        || manifest.sizeBytes === undefined
+      ) throw new BlobStateError(binding.blobId);
+      if (manifest.state === "ready" && manifest.itemId === binding.itemId) continue;
+      if (!isUnexpiredStagingBlob(manifest, readyAtMs) || manifest.itemId !== undefined) {
+        throw new BlobStateError(binding.blobId);
+      }
+      toReady.push(binding.blobId);
+    }
+    return { blobIds: toReady, readyAtMs };
+  }
+
+  /**
+   * Item/turn/approval primary keys are global while their API ownership is session-scoped. Lock
+   * every existing identity before any event or blob state is written, and reject both direct
+   * collisions and references to a resource owned by another session. The returned sets also let
+   * persistence use an explicit INSERT or UPDATE; ON DUPLICATE KEY UPDATE would let a concurrent
+   * first writer from another session overwrite the globally keyed row after this preflight.
+   */
+  private async preflightCommitResources(
+    conn: PoolConnection,
+    batch: CommitBatch,
+    owner: { tenantId: string; userId: string },
+  ): Promise<ExistingCommitResources> {
+    const observedItems = new Map<string, Item>();
+    const observedTurns = new Map<string, Turn>();
+    const observedApprovals = new Map<string, Approval>();
+    const observeItem = (item: Item) => {
+      const previous = observedItems.get(item.id);
+      if (previous && (previous.sessionId !== item.sessionId || previous.turnId !== item.turnId || previous.type !== item.type)) {
+        throw new Error("item identity conflicts with another resource");
+      }
+      observedItems.set(item.id, item);
+    };
+    const observeTurn = (turn: Turn) => {
+      const previous = observedTurns.get(turn.id);
+      if (previous && previous.sessionId !== turn.sessionId) throw new Error("turn identity conflicts with another resource");
+      observedTurns.set(turn.id, turn);
+    };
+    const observeApproval = (approval: Approval) => {
+      const previous = observedApprovals.get(approval.id);
+      if (
+        previous
+        && (
+          previous.sessionId !== approval.sessionId
+          || previous.turnId !== approval.turnId
+          || previous.itemId !== approval.itemId
+          || previous.toolCallId !== approval.toolCallId
+        )
+      ) throw new Error("approval identity conflicts with another resource");
+      observedApprovals.set(approval.id, approval);
+    };
+
+    for (const item of batch.items ?? []) observeItem(item);
+    if (batch.turn) observeTurn(batch.turn);
+    for (const approval of batch.approvals ?? []) {
+      if (observedApprovals.has(approval.id)) throw new Error("commit contains the same approval more than once");
+      observeApproval(approval);
+    }
+    for (const event of batch.events ?? []) {
+      if ("item" in event) observeItem(event.item);
+      if ("turn" in event) observeTurn(event.turn);
+      if ("approval" in event) observeApproval(event.approval);
+    }
+
+    const turnReferences = new Set<string>();
+    for (const id of observedTurns.keys()) turnReferences.add(id);
+    for (const item of batch.items ?? []) turnReferences.add(item.turnId);
+    for (const approval of batch.approvals ?? []) turnReferences.add(approval.turnId);
+    for (const usage of batch.usageEntries ?? []) turnReferences.add(usage.turnId);
+    if (batch.idempotency) turnReferences.add(batch.idempotency.value.turnId);
+
+    const itemReferences = new Set<string>(observedItems.keys());
+    for (const approval of batch.approvals ?? []) itemReferences.add(approval.itemId);
+
+    const existing: ExistingCommitResources = {
+      itemIds: new Set<string>(),
+      turnIds: new Set<string>(),
+      approvalIds: new Set<string>(),
+    };
+
+    const turnIds = [...turnReferences].sort();
+    if (turnIds.length) {
+      const placeholders = turnIds.map(() => "?").join(",");
+      const [rows] = await conn.query<Row[]>(
+        `SELECT turn_id, session_id, user_id
+           FROM turns WHERE turn_id IN (${placeholders})
+          ORDER BY turn_id FOR UPDATE`,
+        turnIds,
+      );
+      for (const row of rows) {
+        if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
+          throw new Error("turn identity conflicts with another session owner");
+        }
+        if (batch.turn?.id === row.turn_id) existing.turnIds.add(String(row.turn_id));
+      }
+    }
+
+    const itemIds = [...itemReferences].sort();
+    if (itemIds.length) {
+      const placeholders = itemIds.map(() => "?").join(",");
+      const [rows] = await conn.query<Row[]>(
+        `SELECT item_id, session_id, user_id, turn_id, type
+           FROM items WHERE item_id IN (${placeholders})
+          ORDER BY item_id FOR UPDATE`,
+        itemIds,
+      );
+      for (const row of rows) {
+        if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
+          throw new Error("item identity conflicts with another session owner");
+        }
+        const incoming = observedItems.get(String(row.item_id));
+        if (incoming) {
+          if (row.turn_id !== incoming.turnId || row.type !== incoming.type) {
+            throw new Error("item identity cannot change its turn or type");
+          }
+          existing.itemIds.add(String(row.item_id));
+        }
+      }
+    }
+
+    const approvalIds = [...observedApprovals.keys()].sort();
+    if (approvalIds.length) {
+      const placeholders = approvalIds.map(() => "?").join(",");
+      const [rows] = await conn.query<Row[]>(
+        `SELECT approval_id, session_id, user_id, turn_id, body
+           FROM approvals WHERE approval_id IN (${placeholders})
+          ORDER BY approval_id FOR UPDATE`,
+        approvalIds,
+      );
+      for (const row of rows) {
+        if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
+          throw new Error("approval identity conflicts with another session owner");
+        }
+        const incoming = observedApprovals.get(String(row.approval_id));
+        const stored = parse<Approval>(row.body);
+        if (
+          !incoming
+          || row.turn_id !== incoming.turnId
+          || stored.itemId !== incoming.itemId
+          || stored.toolCallId !== incoming.toolCallId
+        ) {
+          throw new Error("approval identity cannot change its turn, item or tool call");
+        }
+        if (batch.approvals?.some((approval) => approval.id === row.approval_id)) {
+          existing.approvalIds.add(String(row.approval_id));
+        }
+      }
+    }
+
+    return existing;
+  }
+
   // ---------- fenced commit ----------
   async commit(batch: CommitBatch): Promise<CommitResult> {
     assertPureFenceClaim(batch);
     assertTombstoneEvent(batch);
+    assertCommitResourceOwnership(batch);
+    assertBlobBindingsMatch(batch.items, batch.blobBindings);
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
@@ -417,6 +908,24 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore {
         }
       }
 
+      const existingResources = await this.preflightCommitResources(
+        conn,
+        batch,
+        { tenantId, userId },
+      );
+
+      // Lock every referenced manifest only after the session and globally keyed resource rows, in
+      // bytewise blob-id order. The
+      // staging sweeper locks only blob rows, so it either wins this state transition or observes the
+      // committed ready state; it can never delete an object that this transaction just attached.
+      const bindings = batch.blobBindings ?? [];
+      const { blobIds: blobsToReady, readyAtMs } = await this.lockBlobBindings(
+        conn,
+        bindings,
+        { tenantId, userId },
+        batch.sessionId,
+      );
+
       let seq = currentLastSeq;
       const events: PersistedEvent[] = [];
       for (const e of batch.events ?? []) {
@@ -438,9 +947,21 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore {
           [events.map((e) => [batch.sessionId, e.seq, userId, e.type, json(e), e.emittedAtMs])],
         );
       }
-      for (const it of items ?? []) await upsertItem(conn, it, userId);
-      if (turn) await upsertTurn(conn, turn, userId);
-      for (const a of batch.approvals ?? []) await upsertApproval(conn, a, userId);
+      for (const it of items ?? []) await upsertItem(conn, it, userId, existingResources.itemIds.has(it.id));
+      for (const blobId of blobsToReady) {
+        const binding = bindings.find((candidate) => candidate.blobId === blobId)!;
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE blob_objects
+            SET state='ready', item_id=?, ready_at_ms=?, staging_expires_at_ms=NULL
+            WHERE blob_id=? AND state='staging' AND item_id IS NULL AND staging_expires_at_ms>?`,
+          [binding.itemId, readyAtMs, blobId, readyAtMs],
+        );
+        if (updated.affectedRows !== 1) throw new BlobStateError(blobId);
+      }
+      if (turn) await upsertTurn(conn, turn, userId, existingResources.turnIds.has(turn.id));
+      for (const a of batch.approvals ?? []) {
+        await upsertApproval(conn, a, userId, existingResources.approvalIds.has(a.id));
+      }
       if (batch.usageEntries?.length) {
         await conn.query(
           "INSERT INTO usage_ledger (tenant_id, user_id, session_id, turn_id, step, provider, model, usage_json, created_at_ms) VALUES ?",
@@ -932,32 +1453,305 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore {
     return result.affectedRows === 1;
   }
 
+  // ---------- blob staging sweeper + delete outbox ----------
+  async scheduleStaleBlobDeletes(options: ScheduleStaleBlobsOptions): Promise<number> {
+    if (!Number.isSafeInteger(options.nowMs) || options.nowMs < 0) throw new Error("invalid blob sweep timestamp");
+    if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100) throw new Error("blob sweep limit must be between 1 and 100");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await conn.beginTransaction();
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${BLOB_COLUMNS} FROM blob_objects
+          WHERE state='staging' AND staging_expires_at_ms IS NOT NULL AND staging_expires_at_ms<=?
+          ORDER BY staging_expires_at_ms, blob_id
+          LIMIT ? FOR UPDATE SKIP LOCKED`,
+        [options.nowMs, options.limit],
+      );
+      for (const row of rows) {
+        const manifest = rowToBlobManifest(row);
+        const generation = manifest.deletionGeneration + 1;
+        await conn.query(
+          `UPDATE blob_objects
+              SET state='delete_pending', staging_expires_at_ms=NULL, delete_after_ms=?, deletion_generation=?
+            WHERE blob_id=? AND state='staging'`,
+          [options.nowMs, generation, manifest.blobId],
+        );
+        await conn.query(
+          `INSERT INTO blob_delete_outbox
+             (blob_id, generation, available_at_ms, attempts, created_at_ms)
+           VALUES (?,?,?,0,?)`,
+          [manifest.blobId, generation, options.nowMs, options.nowMs],
+        );
+      }
+      await conn.commit();
+      return rows.length;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async claimBlobDeletes(options: ClaimBlobDeletesOptions): Promise<BlobDeleteOutboxRecord[]> {
+    const leaseUntilMs = validateBlobDeleteClaim(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await conn.beginTransaction();
+      const [locked] = await conn.query<Row[]>(
+        `SELECT outbox_id FROM blob_delete_outbox
+          WHERE available_at_ms<=?
+            AND completed_at_ms IS NULL
+            AND dead_lettered_at_ms IS NULL
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+          ORDER BY available_at_ms, outbox_id
+          LIMIT ? FOR UPDATE SKIP LOCKED`,
+        [options.nowMs, options.nowMs, options.limit],
+      );
+      if (locked.length === 0) {
+        await conn.commit();
+        return [];
+      }
+      const ids = locked.map((row) => Number(row.outbox_id));
+      const placeholders = ids.map(() => "?").join(",");
+      const [joined] = await conn.query<Row[]>(
+        `SELECT ${BLOB_DELETE_COLUMNS}
+           FROM blob_delete_outbox o
+           LEFT JOIN blob_objects b ON b.blob_id=o.blob_id
+          WHERE o.outbox_id IN (${placeholders})`,
+        ids,
+      );
+      const validIds: number[] = [];
+      const poisonIds: number[] = [];
+      for (const row of joined) {
+        try {
+          rowToBlobDeleteOutbox(row);
+          validIds.push(Number(row.outbox_id));
+        } catch {
+          poisonIds.push(Number(row.outbox_id));
+        }
+      }
+      if (poisonIds.length) {
+        const poison = poisonIds.map(() => "?").join(",");
+        await conn.query(
+          `UPDATE blob_delete_outbox
+              SET attempts=attempts+1, claim_token=NULL, lease_until_ms=NULL,
+                  last_error='invalid blob delete outbox identity', dead_lettered_at_ms=?
+            WHERE outbox_id IN (${poison})`,
+          [options.nowMs, ...poisonIds],
+        );
+      }
+      if (validIds.length === 0) {
+        await conn.commit();
+        return [];
+      }
+      const valid = validIds.map(() => "?").join(",");
+      await conn.query(
+        `UPDATE blob_delete_outbox SET attempts=attempts+1, claim_token=?, lease_until_ms=?
+          WHERE outbox_id IN (${valid})`,
+        [options.claimToken, leaseUntilMs, ...validIds],
+      );
+      const [claimedRows] = await conn.query<Row[]>(
+        `SELECT ${BLOB_DELETE_COLUMNS}
+           FROM blob_delete_outbox o
+           JOIN blob_objects b ON b.blob_id=o.blob_id
+          WHERE o.outbox_id IN (${valid})`,
+        validIds,
+      );
+      const byId = new Map(claimedRows.map((row) => {
+        const record = rowToBlobDeleteOutbox(row);
+        return [record.outboxId, record] as const;
+      }));
+      const claimed = validIds.map((id) => {
+        const record = byId.get(id);
+        if (!record) throw new Error(`claimed blob delete outbox ${id} disappeared inside its transaction`);
+        return record;
+      });
+      await conn.commit();
+      return claimed;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewBlobDeleteClaim(
+    outboxId: number,
+    claimToken: string,
+    options: import("../blob-lifecycle.js").RenewBlobDeleteClaimOptions,
+  ): Promise<boolean> {
+    validateBlobDeleteAck(outboxId, claimToken, options.nowMs);
+    if (!Number.isSafeInteger(options.leaseMs) || options.leaseMs < 1) throw new Error("invalid blob delete lease duration");
+    const leaseUntilMs = options.nowMs + options.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("invalid blob delete lease expiry");
+    const [result] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE blob_delete_outbox SET lease_until_ms=GREATEST(lease_until_ms, ?)
+        WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+          AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+      [leaseUntilMs, outboxId, claimToken, options.nowMs],
+    );
+    return result.affectedRows === 1;
+  }
+
+  async completeBlobDelete(outboxId: number, claimToken: string, completedAtMs: number): Promise<boolean> {
+    validateBlobDeleteAck(outboxId, claimToken, completedAtMs);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [outboxes] = await conn.query<Row[]>(
+        `SELECT blob_id, generation, claim_token, lease_until_ms, completed_at_ms, dead_lettered_at_ms
+           FROM blob_delete_outbox WHERE outbox_id=? FOR UPDATE`,
+        [outboxId],
+      );
+      const outbox = outboxes[0];
+      if (
+        !outbox
+        || outbox.completed_at_ms != null
+        || outbox.dead_lettered_at_ms != null
+        || outbox.claim_token !== claimToken
+        || outbox.lease_until_ms == null
+        || Number(outbox.lease_until_ms) <= completedAtMs
+      ) {
+        await conn.rollback();
+        return false;
+      }
+      const [blobs] = await conn.query<Row[]>(
+        "SELECT state, deletion_generation FROM blob_objects WHERE blob_id=? FOR UPDATE",
+        [outbox.blob_id],
+      );
+      const blob = blobs[0];
+      if (!blob || blob.state !== "delete_pending" || Number(blob.deletion_generation) !== Number(outbox.generation)) {
+        throw new BlobStateError(String(outbox.blob_id));
+      }
+      await conn.query(
+        `UPDATE blob_objects
+            SET state='deleted', sha256=NULL, size_bytes=NULL, content_type=NULL, uploaded_at_ms=NULL,
+                ready_at_ms=NULL, delete_after_ms=NULL, deleted_at_ms=?
+          WHERE blob_id=? AND state='delete_pending' AND deletion_generation=?`,
+        [completedAtMs, outbox.blob_id, outbox.generation],
+      );
+      await conn.query(
+        `UPDATE blob_delete_outbox
+            SET completed_at_ms=?, claim_token=NULL, lease_until_ms=NULL, last_error=NULL
+          WHERE outbox_id=?`,
+        [completedAtMs, outboxId],
+      );
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryBlobDelete(outboxId: number, claimToken: string, options: RetryBlobDeleteOptions): Promise<boolean> {
+    validateBlobDeleteAck(outboxId, claimToken, options.failedAtMs);
+    if (!Number.isSafeInteger(options.availableAtMs) || options.availableAtMs < options.failedAtMs) {
+      throw new Error("blob delete retry must not move backwards");
+    }
+    if (options.maxAttempts !== undefined && (!Number.isInteger(options.maxAttempts) || options.maxAttempts < 1)) {
+      throw new Error("blob delete maxAttempts must be positive");
+    }
+    const error = sanitizeBlobDeleteError(options.error);
+    if (options.maxAttempts === undefined) {
+      const [result] = await this.pool.query<mysql.ResultSetHeader>(
+        `UPDATE blob_delete_outbox
+            SET claim_token=NULL, lease_until_ms=NULL, last_error=?, available_at_ms=?
+          WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+            AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+        [error, options.availableAtMs, outboxId, claimToken, options.failedAtMs],
+      );
+      return result.affectedRows === 1;
+    }
+    const [result] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE blob_delete_outbox
+          SET claim_token=NULL, lease_until_ms=NULL, last_error=?,
+              available_at_ms=CASE WHEN attempts>=? THEN available_at_ms ELSE ? END,
+              dead_lettered_at_ms=CASE WHEN attempts>=? THEN ? ELSE NULL END
+        WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+          AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+      [
+        error,
+        options.maxAttempts,
+        options.availableAtMs,
+        options.maxAttempts,
+        options.failedAtMs,
+        outboxId,
+        claimToken,
+        options.failedAtMs,
+      ],
+    );
+    return result.affectedRows === 1;
+  }
+
+  async getBlobDeleteOutbox(blobId: string, generation: number): Promise<BlobDeleteOutboxRecord | null> {
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT ${BLOB_DELETE_COLUMNS}
+         FROM blob_delete_outbox o
+         JOIN blob_objects b ON b.blob_id=o.blob_id
+        WHERE o.blob_id=? AND o.generation=?`,
+      [blobId, generation],
+    );
+    return rows[0] ? rowToBlobDeleteOutbox(rows[0], false) : null;
+  }
+
   async close() {
     await this.pool.end();
   }
 }
 
-async function upsertItem(conn: PoolConnection, it: Item, userId: string) {
+async function upsertItem(conn: PoolConnection, it: Item, userId: string, exists: boolean) {
+  if (exists) {
+    await conn.query(
+      `UPDATE items SET status=?, body=?, completed_at_ms=?
+        WHERE item_id=? AND session_id=? AND user_id=?`,
+      [it.status, json(it), it.completedAtMs ?? null, it.id, it.sessionId, userId],
+    );
+    return;
+  }
   await conn.query(
-    `INSERT INTO items (item_id, session_id, user_id, turn_id, seq, type, status, body, created_at_ms, completed_at_ms)
-     VALUES (?,?,?,?,?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE status=VALUES(status), body=VALUES(body), completed_at_ms=VALUES(completed_at_ms)`,
+    `INSERT INTO items
+       (item_id, session_id, user_id, turn_id, seq, type, status, body, created_at_ms, completed_at_ms)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
     [it.id, it.sessionId, userId, it.turnId, it.seq, it.type, it.status, json(it), it.createdAtMs, it.completedAtMs ?? null],
   );
 }
-async function upsertTurn(conn: PoolConnection, t: Turn, userId: string) {
+async function upsertTurn(conn: PoolConnection, t: Turn, userId: string, exists: boolean) {
+  if (exists) {
+    await conn.query(
+      `UPDATE turns SET status=?, stop_reason=?, seq_end=?, body=?, completed_at_ms=?
+        WHERE turn_id=? AND session_id=? AND user_id=?`,
+      [t.status, t.stopReason ?? null, t.seqEnd ?? null, json(t), t.completedAtMs ?? null, t.id, t.sessionId, userId],
+    );
+    return;
+  }
   await conn.query(
-    `INSERT INTO turns (turn_id, session_id, user_id, status, stop_reason, seq_start, seq_end, body, idempotency_key, started_at_ms, completed_at_ms)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE status=VALUES(status), stop_reason=VALUES(stop_reason), seq_end=VALUES(seq_end), body=VALUES(body), completed_at_ms=VALUES(completed_at_ms)`,
+    `INSERT INTO turns
+       (turn_id, session_id, user_id, status, stop_reason, seq_start, seq_end, body,
+        idempotency_key, started_at_ms, completed_at_ms)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     [t.id, t.sessionId, userId, t.status, t.stopReason ?? null, t.seqStart, t.seqEnd ?? null, json(t), t.idempotencyKey ?? null, t.startedAtMs, t.completedAtMs ?? null],
   );
 }
-async function upsertApproval(conn: PoolConnection, a: Approval, userId: string) {
+async function upsertApproval(conn: PoolConnection, a: Approval, userId: string, exists: boolean) {
+  if (exists) {
+    await conn.query(
+      `UPDATE approvals SET status=?, body=?
+        WHERE approval_id=? AND session_id=? AND user_id=?`,
+      [a.status, json(a), a.id, a.sessionId, userId],
+    );
+    return;
+  }
   await conn.query(
-    `INSERT INTO approvals (approval_id, session_id, user_id, turn_id, status, body, created_at_ms, expires_at_ms)
-     VALUES (?,?,?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE status=VALUES(status), body=VALUES(body)`,
+    `INSERT INTO approvals
+       (approval_id, session_id, user_id, turn_id, status, body, created_at_ms, expires_at_ms)
+     VALUES (?,?,?,?,?,?,?,?)`,
     [a.id, a.sessionId, userId, a.turnId, a.status, json(a), a.createdAtMs, a.expiresAtMs],
   );
 }

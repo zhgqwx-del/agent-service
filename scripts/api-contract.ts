@@ -19,6 +19,7 @@ import {
   ApprovalListQuery,
   ApprovalListResponse,
   ApprovalResolveRequest,
+  BlobUploadResponse,
   Capabilities,
   CompactSessionResponse,
   configureProtocolZod,
@@ -33,6 +34,8 @@ import {
   HealthResponse,
   ItemListQuery,
   ItemListResponse,
+  ItemOutputResponse,
+  IMAGE_MEDIA_TYPES,
   ModelListResponse,
   OkResponse,
   OpenApiDocumentResponse,
@@ -43,8 +46,10 @@ import {
   ReadinessResponse,
   ResumeSessionHttpResponse,
   SessionApprovalParams,
+  SessionBlobParams,
   SessionCreateRequest,
   SessionIdParams,
+  SessionItemOutputParams,
   SessionListQuery,
   SessionPageResponse,
   SessionResponse,
@@ -84,6 +89,19 @@ const jsonResponse = (schema: ContractSchema, description: string): ResponseConf
 const textResponse = (schema: ContractSchema, description: string): ResponseConfig => ({
   description,
   content: { "text/plain": { schema } },
+});
+
+const BINARY_SCHEMA = { type: "string", format: "binary" } as const;
+
+const binaryResponse = (description: string): ResponseConfig => ({
+  description,
+  content: Object.fromEntries(IMAGE_MEDIA_TYPES.map((mediaType) => [mediaType, { schema: BINARY_SCHEMA }])),
+});
+
+const binaryBody = (description: string): NonNullable<RouteConfig["request"]>["body"] => ({
+  description,
+  required: true,
+  content: Object.fromEntries(IMAGE_MEDIA_TYPES.map((mediaType) => [mediaType, { schema: BINARY_SCHEMA }])),
 });
 
 const jsonBody = (schema: ContractSchema, description: string): NonNullable<RouteConfig["request"]>["body"] => ({
@@ -163,6 +181,8 @@ export function buildOpenApiDocument() {
     ok: registry.register("OkResponse", OkResponse),
     usageList: registry.register("UsageListResponse", UsageListResponse),
     itemList: registry.register("ItemListResponse", ItemListResponse),
+    itemOutput: registry.register("ToolOutputPayload", ItemOutputResponse),
+    blobUpload: registry.register("BlobUploadResponse", BlobUploadResponse),
     approvalList: registry.register("ApprovalListResponse", ApprovalListResponse),
     approvalResolve: registry.register("ApprovalResponseRequest", ApprovalResolveRequest),
     approval: registry.register("Approval", Approval),
@@ -459,6 +479,32 @@ export function buildOpenApiDocument() {
     request: { params: SessionIdParams, headers: UserIdentityHeaders },
     responses: { 200: jsonResponse(schemas.resumeSession, "Session snapshot, recent turns and replay cursor."), default: errorResponse },
   });
+  register({
+    method: "post",
+    path: "/v1/sessions/{id}/blobs",
+    operationId: "uploadSessionBlob",
+    tags: ["Blobs"],
+    summary: "Stage an input image for a session",
+    description: "Uploads raw bytes and returns an opaque, owner-scoped blob id. A staging blob is not readable until a turn or steer request atomically attaches it. Cross-tenant, cross-user and cross-session lookups return 404.",
+    security: userSecurity,
+    request: {
+      params: SessionIdParams,
+      headers: UserIdentityHeaders,
+      body: binaryBody("Raw input-image bytes. Send the image media type in Content-Type."),
+    },
+    responses: { 201: jsonResponse(schemas.blobUpload, "Staged input image."), default: errorResponse },
+  });
+  register({
+    method: "get",
+    path: "/v1/sessions/{id}/blobs/{blobId}",
+    operationId: "getSessionBlob",
+    tags: ["Blobs"],
+    summary: "Read an attached session blob",
+    description: "Returns bytes only after the opaque blob id is ready and attached to this session. Staging, missing and ownership-mismatched blobs all return 404.",
+    security: userSecurity,
+    request: { params: SessionBlobParams, headers: UserIdentityHeaders },
+    responses: { 200: binaryResponse("Attached blob bytes; Content-Type is the recorded media type."), default: errorResponse },
+  });
 
   // ---------- turns ----------
 
@@ -583,6 +629,17 @@ export function buildOpenApiDocument() {
   });
   register({
     method: "get",
+    path: "/v1/sessions/{id}/items/{itemId}/output",
+    operationId: "getItemOutput",
+    tags: ["Items"],
+    summary: "Fetch an offloaded tool output",
+    description: "Resolves an item's opaque output blob only for the exact tenant, user, session and item owner. Missing, non-ready and ownership-mismatched outputs return 404.",
+    security: userSecurity,
+    request: { params: SessionItemOutputParams, headers: UserIdentityHeaders },
+    responses: { 200: jsonResponse(schemas.itemOutput, "Full offloaded tool output."), default: errorResponse },
+  });
+  register({
+    method: "get",
     path: "/v1/sessions/{id}/events",
     operationId: "subscribeEvents",
     tags: ["Events"],
@@ -632,8 +689,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 37) {
-    throw new Error(`expected 37 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 40) {
+    throw new Error(`expected 40 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({
@@ -651,6 +708,7 @@ export function buildOpenApiDocument() {
       { name: "Catalog" },
       { name: "Tenant" },
       { name: "Sessions" },
+      { name: "Blobs" },
       { name: "Turns" },
       { name: "Usage" },
       { name: "Items" },

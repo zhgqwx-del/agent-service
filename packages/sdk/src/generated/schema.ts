@@ -251,6 +251,46 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/sessions/{id}/blobs": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Stage an input image for a session
+         * @description Uploads raw bytes and returns an opaque, owner-scoped blob id. A staging blob is not readable until a turn or steer request atomically attaches it. Cross-tenant, cross-user and cross-session lookups return 404.
+         */
+        readonly post: operations["uploadSessionBlob"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/sessions/{id}/blobs/{blobId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /**
+         * Read an attached session blob
+         * @description Returns bytes only after the opaque blob id is ready and attached to this session. Staging, missing and ownership-mismatched blobs all return 404.
+         */
+        readonly get: operations["getSessionBlob"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/sessions/{id}/compact": {
         readonly parameters: {
             readonly query?: never;
@@ -297,6 +337,26 @@ export type paths = {
         };
         /** List durable items in a session */
         readonly get: operations["listItems"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/sessions/{id}/items/{itemId}/output": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /**
+         * Fetch an offloaded tool output
+         * @description Resolves an item's opaque output blob only for the exact tenant, user, session and item owner. Missing, non-ready and ownership-mismatched outputs return 404.
+         */
+        readonly get: operations["getItemOutput"];
         readonly put?: never;
         readonly post?: never;
         readonly delete?: never;
@@ -707,10 +767,23 @@ export type components = {
             /** @enum {string} */
             readonly decision: "accept" | "acceptForSession" | "decline" | "cancel";
         };
+        readonly BlobUploadResponse: {
+            readonly blobId: string;
+            /** @enum {string} */
+            readonly contentType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+            readonly expiresAtMs: number;
+            /** @enum {string} */
+            readonly purpose: "input_image";
+            readonly sizeBytes: number;
+            /** @enum {string} */
+            readonly state: "staging";
+        };
         readonly Capabilities: {
             readonly features: {
                 /** @enum {boolean} */
                 readonly approvals: true;
+                /** @default false */
+                readonly blobAttachments?: boolean;
                 readonly byok: boolean;
                 readonly dynamicTools: boolean;
                 readonly mcp: readonly ("streamable-http" | "stdio")[];
@@ -947,11 +1020,11 @@ export type components = {
                     /** @enum {string} */
                     readonly type: "text";
                 } | {
-                    readonly mimeType?: string;
+                    readonly blobId: string;
+                    /** @enum {string} */
+                    readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
                     /** @enum {string} */
                     readonly type: "image";
-                    /** Format: uri */
-                    readonly url: string;
                 } | {
                     readonly args?: string;
                     readonly name: string;
@@ -1121,11 +1194,11 @@ export type components = {
                     /** @enum {string} */
                     readonly type: "text";
                 } | {
-                    readonly mimeType?: string;
+                    readonly blobId: string;
+                    /** @enum {string} */
+                    readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
                     /** @enum {string} */
                     readonly type: "image";
-                    /** Format: uri */
-                    readonly url: string;
                 } | {
                     readonly args?: string;
                     readonly name: string;
@@ -1437,11 +1510,17 @@ export type components = {
         readonly ItemListResponse: {
             readonly data: readonly ({
                 readonly completedAtMs?: number;
-                readonly content: readonly {
+                readonly content: readonly ({
                     readonly text: string;
                     /** @enum {string} */
                     readonly type: "text";
-                }[];
+                } | {
+                    readonly blobId: string;
+                    /** @enum {string} */
+                    readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+                    /** @enum {string} */
+                    readonly type: "image";
+                })[];
                 readonly createdAtMs: number;
                 readonly id: string;
                 readonly seq: number;
@@ -1600,7 +1679,15 @@ export type components = {
                 };
                 readonly contextWindow: number;
                 readonly id: string;
-                readonly input: readonly ("text" | "image")[];
+                readonly input: readonly [
+                    "text"
+                ] | readonly [
+                    "text",
+                    "image"
+                ] | readonly [
+                    "image",
+                    "text"
+                ];
                 readonly maxOutputTokens: number;
                 readonly name?: string;
                 readonly price?: {
@@ -1673,7 +1760,15 @@ export type components = {
                 };
                 readonly contextWindow: number;
                 readonly id: string;
-                readonly input: readonly ("text" | "image")[];
+                readonly input: readonly [
+                    "text"
+                ] | readonly [
+                    "text",
+                    "image"
+                ] | readonly [
+                    "image",
+                    "text"
+                ];
                 readonly maxOutputTokens: number;
                 readonly name?: string;
                 readonly price?: {
@@ -1739,7 +1834,15 @@ export type components = {
                     };
                     readonly contextWindow: number;
                     readonly id: string;
-                    readonly input: readonly ("text" | "image")[];
+                    readonly input: readonly [
+                        "text"
+                    ] | readonly [
+                        "text",
+                        "image"
+                    ] | readonly [
+                        "image",
+                        "text"
+                    ];
                     readonly maxOutputTokens: number;
                     readonly name?: string;
                     readonly price?: {
@@ -1940,11 +2043,17 @@ export type components = {
                     readonly [key: string]: unknown;
                 };
             }[];
-            readonly input: readonly {
+            readonly input: readonly ({
                 readonly text: string;
                 /** @enum {string} */
                 readonly type: "text";
-            }[];
+            } | {
+                readonly blobId: string;
+                /** @enum {string} */
+                readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+                /** @enum {string} */
+                readonly type: "image";
+            })[];
             readonly limits?: {
                 readonly maxCostCNY?: number;
                 readonly maxOutputTokensPerStep?: number;
@@ -1967,11 +2076,17 @@ export type components = {
         };
         readonly SteerRequest: {
             readonly expectedTurnId?: string;
-            readonly input: readonly {
+            readonly input: readonly ({
                 readonly text: string;
                 /** @enum {string} */
                 readonly type: "text";
-            }[];
+            } | {
+                readonly blobId: string;
+                /** @enum {string} */
+                readonly mimeType?: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+                /** @enum {string} */
+                readonly type: "image";
+            })[];
         };
         readonly TenantAuthState: {
             readonly hasSecret: boolean;
@@ -2113,6 +2228,19 @@ export type components = {
                 };
                 readonly readOnly?: boolean;
             }[];
+        };
+        readonly ToolOutputPayload: {
+            readonly content: readonly ({
+                readonly text: string;
+                /** @enum {string} */
+                readonly type: "text";
+            } | {
+                readonly mimeType?: string;
+                /** @enum {string} */
+                readonly type: "image";
+                readonly url: string;
+            })[];
+            readonly details?: unknown;
         };
         readonly Turn: {
             readonly completedAtMs?: number;
@@ -2329,7 +2457,15 @@ export type components = {
                  *       "text"
                  *     ]
                  */
-                readonly input?: readonly ("text" | "image")[];
+                readonly input?: readonly [
+                    "text"
+                ] | readonly [
+                    "text",
+                    "image"
+                ] | readonly [
+                    "image",
+                    "text"
+                ];
                 /** @default 8192 */
                 readonly maxOutputTokens?: number;
                 readonly name?: string;
@@ -2381,6 +2517,7 @@ export type SchemaApiKeyList = components['schemas']['ApiKeyList'];
 export type SchemaApproval = components['schemas']['Approval'];
 export type SchemaApprovalListResponse = components['schemas']['ApprovalListResponse'];
 export type SchemaApprovalResponseRequest = components['schemas']['ApprovalResponseRequest'];
+export type SchemaBlobUploadResponse = components['schemas']['BlobUploadResponse'];
 export type SchemaCapabilities = components['schemas']['Capabilities'];
 export type SchemaCompactSessionResponse = components['schemas']['CompactSessionResponse'];
 export type SchemaCreateApiKeyRequest = components['schemas']['CreateApiKeyRequest'];
@@ -2404,6 +2541,7 @@ export type SchemaSteerRequest = components['schemas']['SteerRequest'];
 export type SchemaTenantAuthState = components['schemas']['TenantAuthState'];
 export type SchemaTenantAuthUpdateRequest = components['schemas']['TenantAuthUpdateRequest'];
 export type SchemaToolList = components['schemas']['ToolList'];
+export type SchemaToolOutputPayload = components['schemas']['ToolOutputPayload'];
 export type SchemaTurn = components['schemas']['Turn'];
 export type SchemaTurnAcceptedResponse = components['schemas']['TurnAcceptedResponse'];
 export type SchemaTurnPage = components['schemas']['TurnPage'];
@@ -3032,6 +3170,90 @@ export interface operations {
             };
         };
     };
+    readonly uploadSessionBlob: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly id: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Raw input-image bytes. Send the image media type in Content-Type. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "image/gif": string;
+                readonly "image/jpeg": string;
+                readonly "image/png": string;
+                readonly "image/webp": string;
+            };
+        };
+        readonly responses: {
+            /** @description Staged input image. */
+            readonly 201: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["BlobUploadResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getSessionBlob: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly blobId: string;
+                readonly id: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Attached blob bytes; Content-Type is the recorded media type. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "image/gif": string;
+                    readonly "image/jpeg": string;
+                    readonly "image/png": string;
+                    readonly "image/webp": string;
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     readonly compactSession: {
         readonly parameters: {
             readonly query?: never;
@@ -3140,6 +3362,43 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["ItemListResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getItemOutput: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly id: string;
+                readonly itemId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Full offloaded tool output. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ToolOutputPayload"];
                 };
             };
             /** @description Error response. */

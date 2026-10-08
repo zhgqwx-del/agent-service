@@ -23,6 +23,7 @@ describe("ProviderService", () => {
     const r = await svc.resolve({ tenantId: "t_a", userId: "u" }, { provider: "mine", model: "m1" });
     expect(await r.apiKey()).toBe("sk-secret");
     expect(r.provider).toBe("t_a:mine");
+    expect(r.input).toEqual(["text"]);
     expect((r.handle as { cost: { input: number } }).cost.input).toBe(1);
 
     // another tenant cannot see it and falls through to platform presets only
@@ -32,6 +33,57 @@ describe("ProviderService", () => {
     expect(plat.provider).toBe("platform:dashscope");
     expect((await svc.listVisible("t_b")).map((c) => c.id)).toEqual(["dashscope"]);
     expect((await svc.listVisible("t_a")).map((c) => c.id)).toEqual(["mine", "dashscope"]);
+  });
+
+  it("exposes the selected model's text and image input capabilities", async () => {
+    const svc = new ProviderService({
+      store: new MemorySessionStore(),
+      cipher: new LocalAesGcmCipher(KEY),
+      platform: [{
+        config: {
+          id: "modalities",
+          api: "openai-completions",
+          baseUrl: "https://example.com/v1",
+          headers: {},
+          quota: {},
+          fallback: [],
+          models: [
+            { id: "text-only", contextWindow: 1_000, maxOutputTokens: 100, input: ["text"], reasoning: false },
+            { id: "vision", contextWindow: 2_000, maxOutputTokens: 200, input: ["text", "image"], reasoning: false },
+          ],
+        },
+      }],
+      assertBaseUrl,
+    });
+
+    const principal = { tenantId: "t_modalities", userId: "u" };
+    await expect(svc.resolve(principal, { provider: "modalities", model: "text-only" }))
+      .resolves.toMatchObject({ input: ["text"] });
+    await expect(svc.resolve(principal, { provider: "modalities", model: "vision" }))
+      .resolves.toMatchObject({ input: ["text", "image"] });
+  });
+
+  it("rejects invalid model capability declarations at the provider write boundary", async () => {
+    const store = new MemorySessionStore();
+    const svc = new ProviderService({ store, cipher: new LocalAesGcmCipher(KEY), assertBaseUrl });
+    for (const [index, input] of [[], ["image"], ["text", "text"], ["image", "image"]].entries()) {
+      await expect(svc.upsertTenantProvider("t", {
+        id: `invalid-${index}`,
+        api: "openai-completions",
+        baseUrl: "https://example.com/v1",
+        headers: {},
+        quota: {},
+        fallback: [],
+        models: [{
+          id: "m",
+          contextWindow: 1_000,
+          maxOutputTokens: 100,
+          input: input as never,
+          reasoning: false,
+        }],
+      })).rejects.toBeDefined();
+    }
+    expect(await store.listProviderConfigs("t")).toEqual([]);
   });
 
   it("rejects unknown models with the available list", async () => {

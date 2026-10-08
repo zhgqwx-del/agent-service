@@ -100,7 +100,7 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(37);
+    expect(operations).toHaveLength(40);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
@@ -109,7 +109,11 @@ describe("committed OpenAPI contract", () => {
     expect(paths).not.toContain("/_router/targets");
     expect(paths).not.toContain("/v1/agents/{id}/versions");
     expect(paths).not.toContain("/v1/sessions/{id}/fork");
-    expect(paths).not.toContain("/v1/sessions/{id}/items/{itemId}/output");
+    expect(paths).toEqual(expect.arrayContaining([
+      "/v1/sessions/{id}/blobs",
+      "/v1/sessions/{id}/blobs/{blobId}",
+      "/v1/sessions/{id}/items/{itemId}/output",
+    ]));
   });
 
   it("keeps every domain event variant in the OpenAPI-safe SSE schema", () => {
@@ -145,7 +149,16 @@ describe("committed OpenAPI contract", () => {
       ],
     });
     expect(document.components?.schemas?.StartTurnRequest).toMatchObject({
-      properties: { input: { items: { properties: { type: { enum: ["text"] } } } } },
+      properties: {
+        input: {
+          items: {
+            oneOf: [
+              { properties: { type: { enum: ["text"] } }, required: ["type", "text"] },
+              { properties: { type: { enum: ["image"] } }, required: ["type", "blobId"] },
+            ],
+          },
+        },
+      },
     });
     expect(document.components?.schemas?.AgentDefinitionRequest).toMatchObject({
       properties: { mcpServers: { maxItems: 0 }, skills: { maxItems: 0 } },
@@ -166,13 +179,13 @@ describe("committed OpenAPI contract", () => {
     });
   });
 
-  it("matches all 36 implemented runner routes plus the OpenAPI route in both directions", () => {
+  it("matches all 39 implemented runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     const specKeys = specOperations().map(operationKey).sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(36);
-    expect(registered).toHaveLength(37);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(39);
+    expect(registered).toHaveLength(40);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
   });

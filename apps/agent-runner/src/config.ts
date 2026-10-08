@@ -12,6 +12,25 @@ const Env = z.object({
   MYSQL_URL: z.string().default("mysql://root@127.0.0.1:3306/agent_service"),
   REDIS_URL: z.string().optional(),
   BLOB_DIR: z.string().default("./.data/blobs"),
+  /**
+   * Explicit acknowledgement that this process is the only runner using BLOB_DIR.
+   * The filesystem adapter is not a shared multi-replica object store.
+   */
+  BLOB_FILESYSTEM_SINGLE_RUNNER: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Writer rollout gate. Readers remain enabled while this is off. */
+  BLOB_ATTACHMENTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Local orphan cleanup gate; a future shared adapter may also use it during rollout. */
+  BLOB_CLEANUP_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  BLOB_MAX_BYTES: z.coerce.number().int().positive().default(1_000_000),
+  BLOB_MAX_HYDRATED_BYTES: z.coerce.number().int().positive().default(4_000_000),
+  BLOB_TOOL_OUTPUT_THRESHOLD_BYTES: z.coerce.number().int().nonnegative().default(64_000),
+  BLOB_STAGING_TTL_MS: z.coerce.number().int().positive().default(60 * 60_000),
+  BLOB_CLEANUP_POLL_MS: z.coerce.number().int().positive().default(1_000),
+  BLOB_CLEANUP_LEASE_MS: z.coerce.number().int().positive().default(30_000),
+  BLOB_CLEANUP_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(50),
+  BLOB_CLEANUP_RETRY_BASE_MS: z.coerce.number().int().positive().default(250),
+  BLOB_CLEANUP_RETRY_MAX_MS: z.coerce.number().int().positive().default(60_000),
+  BLOB_CLEANUP_POISON_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
   /** 32-byte hex key that encrypts BYOK secrets at rest. No default: a silent all-zero key is worse than a crash. */
   SECRETS_MASTER_KEY: z.string().regex(/^[0-9a-f]{64}$/i, "SECRETS_MASTER_KEY must be 64 hex chars (32 bytes)"),
   /** Dev convenience: seeds a tenant + api key on boot. Refused when NODE_ENV=production. */
@@ -84,8 +103,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (production && !c.INTERNAL_ROUTER_TOKEN) {
     throw new Error("INTERNAL_ROUTER_TOKEN is required in production");
   }
+  if (production && (c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED)) {
+    throw new Error(
+      "filesystem Blob writes and cleanup are unsupported in production until a shared object-store adapter is configured",
+    );
+  }
   if (!c.RUNNER_ADDR && WILDCARD_HOSTS.has(c.RUNNER_HOST)) {
     throw new Error("RUNNER_ADDR is required when RUNNER_HOST is a wildcard bind address");
+  }
+  if (c.BLOB_MAX_BYTES > c.MAX_BODY_BYTES) {
+    throw new Error("BLOB_MAX_BYTES must not exceed MAX_BODY_BYTES");
+  }
+  if (c.BLOB_MAX_HYDRATED_BYTES < c.BLOB_MAX_BYTES) {
+    throw new Error("BLOB_MAX_HYDRATED_BYTES must be at least BLOB_MAX_BYTES");
+  }
+  if (c.BLOB_TOOL_OUTPUT_THRESHOLD_BYTES > c.BLOB_MAX_BYTES) {
+    throw new Error("BLOB_TOOL_OUTPUT_THRESHOLD_BYTES must not exceed BLOB_MAX_BYTES");
+  }
+  if (c.BLOB_CLEANUP_RETRY_MAX_MS < c.BLOB_CLEANUP_RETRY_BASE_MS) {
+    throw new Error("BLOB_CLEANUP_RETRY_MAX_MS must be at least BLOB_CLEANUP_RETRY_BASE_MS");
+  }
+  if (c.BLOB_ATTACHMENTS_ENABLED && !c.BLOB_CLEANUP_ENABLED) {
+    throw new Error("BLOB_CLEANUP_ENABLED=1 is required before BLOB_ATTACHMENTS_ENABLED=1");
+  }
+  if ((c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED) && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
+    throw new Error(
+      "BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required for filesystem Blob writes or cleanup",
+    );
   }
   const runnerAddr = validateAdvertisedAddress(c.RUNNER_ADDR ?? `${c.RUNNER_HOST}:${c.RUNNER_PORT}`);
   const runnerId = c.RUNNER_ID ?? (production ? `runner-${randomUUID()}` : `runner-${process.pid}`);

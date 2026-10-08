@@ -1,8 +1,9 @@
 import { emptyUsage, type InputPart, type Usage } from "@agent-service/protocol";
-import type { AgentEngine, AssistantStepResult, EngineRun, EngineSink, EngineTurnParams } from "../src/index.js";
+import type { AgentEngine, AssistantStepResult, EngineRun, EngineSink, EngineToolResult, EngineTurnParams } from "../src/index.js";
 
 export interface ScriptStep {
-  text?: string;
+  /** A function models a response that genuinely depends on the previous step's tool results. */
+  text?: string | ((previousToolResults: EngineToolResult[]) => string);
   reasoning?: string;
   toolCalls?: { name: string; args: unknown }[];
   stopReason?: AssistantStepResult["stopReason"];
@@ -29,6 +30,7 @@ export class ScriptedEngine implements AgentEngine {
     const done = (async () => {
       let step = 0;
       let error: string | undefined;
+      let previousToolResults: EngineToolResult[] = [];
       for (const s of this.script) {
         if (interrupted || params.signal.aborted) break;
         step += 1;
@@ -36,10 +38,11 @@ export class ScriptedEngine implements AgentEngine {
         if (s.delayMs) await new Promise((r) => setTimeout(r, s.delayMs));
         if (interrupted || params.signal.aborted) break;
         if (s.reasoning) sink.onReasoningDelta(s.reasoning);
-        for (const chunk of (s.text ?? "").match(/.{1,4}/gs) ?? []) sink.onTextDelta(chunk);
+        const text = typeof s.text === "function" ? s.text(previousToolResults) : (s.text ?? "");
+        for (const chunk of text.match(/.{1,4}/gs) ?? []) sink.onTextDelta(chunk);
         const toolCalls = (s.toolCalls ?? []).map((tc) => ({ id: `call_${++callSeq}`, ...tc }));
         const msg: AssistantStepResult = {
-          text: s.text ?? "",
+          text,
           reasoning: s.reasoning,
           toolCalls,
           usage: { ...emptyUsage(), inputTokens: 10, outputTokens: 5, totalTokens: 15, ...(s.usage ?? {}) },
@@ -54,21 +57,20 @@ export class ScriptedEngine implements AgentEngine {
           break;
         }
         let terminate = false;
-        await Promise.all(
+        previousToolResults = await Promise.all(
           toolCalls.map(async (tc) => {
             const d = await sink.beforeToolCall(tc, msg);
             if (!d.allow) {
               if (d.interrupt) terminate = true;
-              await sink.onToolResult({ toolCallId: tc.id, name: tc.name, content: [{ type: "text", text: d.reason }], isError: true });
-              return;
+              return sink.afterToolCall({ toolCallId: tc.id, name: tc.name, content: [{ type: "text", text: d.reason }], isError: true });
             }
             await sink.onToolExecutionStart(tc.id);
             const tool = params.tools.find((t) => t.name === tc.name)!;
             try {
               const r = await tool.execute(tc.args, { ...params.toolContext, toolCallId: tc.id, signal: params.signal });
-              await sink.onToolResult({ toolCallId: tc.id, name: tc.name, content: r.content, isError: !!r.isError, details: r.details });
+              return await sink.afterToolCall({ toolCallId: tc.id, name: tc.name, content: r.content, isError: !!r.isError, details: r.details });
             } catch (err) {
-              await sink.onToolResult({ toolCallId: tc.id, name: tc.name, content: [{ type: "text", text: String(err) }], isError: true });
+              return sink.afterToolCall({ toolCallId: tc.id, name: tc.name, content: [{ type: "text", text: String(err) }], isError: true });
             }
           }),
         );

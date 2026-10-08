@@ -1,5 +1,6 @@
 import {
   ApiError,
+  ImageMediaType,
   addUsage,
   emptyUsage,
   mergeLimits,
@@ -20,9 +21,23 @@ import {
   type StopReason,
   type Turn,
   type Usage,
+  ToolOutputPayload,
 } from "@agent-service/protocol";
-import type { CommitBatch, EventBus, EventListener, IdempotencyReceiptInput, LeaseStore, SessionLifecycleTransition, SessionStore } from "@agent-service/store";
+import type {
+  BlobBinding,
+  BlobManifestStore,
+  BlobObject,
+  CommitBatch,
+  EventBus,
+  EventListener,
+  IdempotencyReceiptInput,
+  LeaseStore,
+  SessionLifecycleTransition,
+  SessionStore,
+} from "@agent-service/store";
 import {
+  BlobStateError,
+  TOOL_OUTPUT_CONTENT_TYPE,
   FenceError,
   IdempotencyMismatchError,
   IdempotencyPendingError,
@@ -32,13 +47,20 @@ import {
   SessionHasChildrenError,
   SessionLifecycleBusyError,
 } from "@agent-service/store";
-import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineRun, EngineSink, ResolvedModel, Summariser } from "../engine/types.js";
+import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineInputPart, EngineRun, EngineSink, EngineToolResult, ResolvedModel, Summariser } from "../engine/types.js";
 import { buildSystemPrompt, computeContextEpoch, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
-import { projectItems, pruneToolResults } from "../context/history.js";
+import { projectItems, projectItemsForPlanning, pruneToolResults } from "../context/history.js";
 import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptTokens } from "../context/compact.js";
 import { newId } from "../ids.js";
 import type { RunnerTool, ToolRegistry } from "../tools/types.js";
 import { DynamicToolBridge } from "../tools/dynamic.js";
+import {
+  BlobDataError,
+  SessionBlobService,
+  matchesImageSignature,
+  type BlobHydrationBudget,
+  type UploadedSessionBlob,
+} from "../blob/service.js";
 
 export interface ProviderResolver {
   resolve(principal: Principal, ref: { provider: string; model: string; reasoning?: "off" | "low" | "medium" | "high" }): Promise<ResolvedModel>;
@@ -80,10 +102,21 @@ export interface SessionHostConfig {
   hotReplayWindowMs?: number;
   /** lifetime of a completed turn idempotency receipt */
   idempotencyTtlMs?: number;
+  /** Writer rollout gate. Readers remain enabled so mixed-version fleets can drain safely. */
+  blobAttachmentsEnabled?: boolean;
+  /** Offload serialized tool output at or above this size. Zero disables tool-output offload. */
+  toolOutputBlobThresholdBytes?: number;
+  /**
+   * Hard ceiling for the JSON-safe tool result persisted inline or in Blob storage. This remains
+   * active when Blob writes are gated off, offload is disabled, or no Blob service is installed.
+   */
+  maxDurableToolOutputBytes?: number;
 }
 
 export interface SessionHostDeps {
-  store: SessionStore;
+  store: SessionStore & Partial<BlobManifestStore>;
+  /** Optional data-plane adapter. Required before image writes or tool-output offload can be enabled. */
+  blobs?: SessionBlobService;
   /** optional: without one, long sessions fall back to cheap pruning only */
   summariser?: Summariser;
   lease: LeaseStore;
@@ -100,6 +133,10 @@ interface ActiveTurn {
   turn: Turn;
   session: Session;
   agent: AgentDefinition;
+  /** The active engine's actual resolved modalities; steer must obey the same model contract. */
+  modelInput: ResolvedModel["input"];
+  /** One cumulative Blob byte budget for initial input, retained history and every admitted steer. */
+  hydrationBudget?: BlobHydrationBudget;
   fence: number;
   abort: AbortController;
   run?: EngineRun;
@@ -140,7 +177,7 @@ interface ActiveTurn {
   /** steer operations admitted before a step boundary; onStepEnd waits for this barrier */
   steerChain: Promise<unknown>;
   /** inputs accepted after turn/start was committed but before the engine was attached */
-  pendingSteers: ((InputPart & { type: "text" | "image" })[])[];
+  pendingSteers: EngineInputPart[][];
   /** makes timeout/drain/lease-loss cleanup safe when more than one stop signal races */
   finishPromise?: Promise<void>;
 }
@@ -172,14 +209,21 @@ function turnRequestHash(req: StartTurnRequest): string {
 }
 
 /** Validate once for both a new turn and busyPolicy/public steer paths. */
-function executableInput(parts: InputPart[]): (InputPart & { type: "text" | "image" })[] {
+function executableInput(parts: InputPart[], imagesEnabled: boolean): (InputPart & { type: "text" | "image" })[] {
   const unsupported = parts.find((part) => part.type === "skill" || part.type === "mention");
   if (unsupported) throw new ApiError("invalid_request", `input part "${unsupported.type}" is not supported yet (skills land in M3)`);
-  if (parts.some((part) => part.type === "image")) {
-    throw new ApiError("invalid_request", "image input is not supported yet: attachments need the blob store (M3)");
+  if (!imagesEnabled && parts.some((part) => part.type === "image")) {
+    throw new ApiError("invalid_request", "image input is not enabled on this runner");
   }
   const input = parts.filter((part): part is InputPart & { type: "text" | "image" } => part.type === "text" || part.type === "image");
-  if (!input.some((part) => part.type === "text")) throw new ApiError("invalid_request", "input must contain at least one text part");
+  const imageIds = new Set<string>();
+  for (const part of input) {
+    if (part.type !== "image") continue;
+    if (imageIds.has(part.blobId)) {
+      throw new ApiError("invalid_request", "the same image blob cannot be referenced more than once in one input");
+    }
+    imageIds.add(part.blobId);
+  }
   return input;
 }
 
@@ -203,9 +247,24 @@ export class SessionHost {
   private readonly dynamicTools = new DynamicToolBridge();
   private draining = false;
   private readonly log: Pick<Console, "info" | "warn" | "error">;
+  private readonly maxDurableToolOutputBytes: number;
 
   constructor(private readonly deps: SessionHostDeps) {
     this.log = deps.logger ?? console;
+    const threshold = deps.config.toolOutputBlobThresholdBytes ?? 0;
+    if (!Number.isSafeInteger(threshold) || threshold < 0) {
+      throw new Error("toolOutputBlobThresholdBytes must be a non-negative safe integer");
+    }
+    const configuredMax = deps.config.maxDurableToolOutputBytes ?? deps.blobs?.maxBlobBytes ?? 1_000_000;
+    if (!Number.isSafeInteger(configuredMax) || configuredMax < 1) {
+      throw new Error("maxDurableToolOutputBytes must be a positive safe integer");
+    }
+    // A physical adapter may impose a stricter ceiling than the host's general durable limit. Keep
+    // one effective bound so an offloaded result cannot pass host validation and then fail mid-write.
+    this.maxDurableToolOutputBytes = Math.min(configuredMax, deps.blobs?.maxBlobBytes ?? configuredMax);
+    if (threshold > this.maxDurableToolOutputBytes) {
+      throw new Error("toolOutputBlobThresholdBytes must not exceed maxDurableToolOutputBytes");
+    }
   }
 
   get cfg() {
@@ -219,6 +278,8 @@ export class SessionHost {
       compactionKeepRatio: c.compactionKeepRatio ?? 0.5,
       compactionMaxTokens: c.compactionMaxTokens ?? 1_500,
       idempotencyTtlMs: c.idempotencyTtlMs ?? 24 * 3_600_000,
+      blobAttachmentsEnabled: c.blobAttachmentsEnabled ?? false,
+      toolOutputBlobThresholdBytes: c.toolOutputBlobThresholdBytes ?? 0,
     };
   }
 
@@ -287,6 +348,154 @@ export class SessionHost {
     if (!s) throw new ApiError("not_found", "session not found");
     if (s.userId !== principal.userId) throw new ApiError("not_found", "session not found");
     return s;
+  }
+
+  /** Stage an image under the same session fence later used to bind it into a user-message item. */
+  async uploadInputBlob(
+    principal: Principal,
+    sessionId: string,
+    data: Buffer,
+    contentType: string,
+  ): Promise<UploadedSessionBlob> {
+    return this.serialiseSessionStart(sessionId, async () => {
+      const blobs = this.writerBlobService();
+      if (!ImageMediaType.safeParse(contentType).success) {
+        throw new ApiError("invalid_request", "blob uploads must use a supported image content type");
+      }
+      if (!matchesImageSignature(data, contentType)) {
+        throw new ApiError("invalid_request", "image bytes do not match the declared Content-Type");
+      }
+      const session = await this.getSession(principal, sessionId);
+      this.assertNotArchived(session, "upload an attachment to");
+
+      // Uploads used by steer are allowed on the owning runner while a turn is active. They do not
+      // enter the turn's commit chain, but both paths carry the same durable fence and the manifest
+      // transition is independently transactional.
+      const active = this.active.get(sessionId);
+      if (active) {
+        try {
+          active.leaseGuard.assertOwned();
+          return await active.leaseGuard.wait(blobs.stageAndUpload({
+            owner: principal,
+            sessionId,
+            fence: active.fence,
+            purpose: "input_image",
+            data,
+            contentType,
+          }));
+        } catch (error) {
+          throw await this.translateSessionLeaseFailure(sessionId, active.leaseGuard.lost ?? error);
+        }
+      }
+
+      this.clearHold(sessionId);
+      const lease = await this.deps.lease.acquire(
+        sessionId,
+        this.deps.config.runnerId,
+        this.deps.config.runnerAddr,
+        this.cfg.leaseTtlMs,
+      );
+      if (!lease.ok) {
+        throw new ApiError("session_lease_conflict", "session owned by another runner", {
+          ownerId: lease.ownerId,
+          ownerAddr: lease.ownerAddr,
+        });
+      }
+      const guard = this.startLeaseGuard(sessionId);
+      try {
+        await this.claimSessionFence(session, lease.fence, guard);
+        const fresh = await guard.wait(this.getSession(principal, sessionId));
+        this.assertNotArchived(fresh, "upload an attachment to");
+        if (fresh.status.type === "active") {
+          // The previous owner disappeared after persisting turn/start. Repair that durable state
+          // before this new fence is used for unrelated writes, exactly as normal turn takeover does.
+          await guard.wait(this.closeOrphanedTurn(fresh, lease.fence, guard));
+        }
+        guard.assertOwned();
+        return await guard.wait(blobs.stageAndUpload({
+          owner: principal,
+          sessionId,
+          fence: lease.fence,
+          purpose: "input_image",
+          data,
+          contentType,
+        }));
+      } catch (error) {
+        throw await this.translateSessionLeaseFailure(sessionId, guard.lost ?? error);
+      } finally {
+        guard.stop();
+        await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+      }
+    });
+  }
+
+  /** Owner-scoped reads never expose the manifest's physical storage key. */
+  async readInputBlob(principal: Principal, sessionId: string, blobId: string): Promise<BlobObject | null> {
+    await this.getSession(principal, sessionId);
+    if (!this.deps.blobs) return null;
+    return this.deps.blobs.readReadyInputBlob(principal, sessionId, blobId);
+  }
+
+  async readItemOutput(
+    principal: Principal,
+    sessionId: string,
+    itemId: string,
+  ): Promise<ToolOutputPayload | null> {
+    await this.getSession(principal, sessionId);
+    const item = await this.deps.store.getItem(sessionId, itemId);
+    if (!item || item.type !== "toolResult" || !item.outputRef || !this.deps.blobs) return null;
+    return this.deps.blobs.readReadyToolOutput(principal, sessionId, itemId, item.outputRef);
+  }
+
+  private writerBlobService(): SessionBlobService {
+    if (!this.cfg.blobAttachmentsEnabled || !this.deps.blobs) {
+      throw new ApiError("invalid_request", "blob attachments are not enabled on this runner");
+    }
+    return this.deps.blobs;
+  }
+
+  private imagesEnabled(): boolean {
+    return this.cfg.blobAttachmentsEnabled && this.deps.blobs !== undefined;
+  }
+
+  private async materializeSubmittedInput(
+    principal: Principal,
+    sessionId: string,
+    input: (InputPart & { type: "text" | "image" })[],
+    hydrationBudget?: BlobHydrationBudget,
+  ): Promise<EngineInputPart[]> {
+    if (!input.some((part) => part.type === "image")) return input as EngineInputPart[];
+    const blobs = this.writerBlobService();
+    try {
+      return await blobs.materializeBindableInput(principal, sessionId, input, hydrationBudget);
+    } catch (error) {
+      if (error instanceof BlobDataError) {
+        // Keep missing, cross-owner and corrupt references indistinguishable at this write boundary.
+        throw new ApiError("invalid_request", "one or more image blobs are unavailable");
+      }
+      throw error;
+    }
+  }
+
+  private async hydratePersistedItems(
+    principal: Principal,
+    sessionId: string,
+    items: Item[],
+    hydrationBudget?: BlobHydrationBudget,
+  ): Promise<Item[]> {
+    const carriesBlob = items.some((item) => (
+      (item.type === "toolResult" && item.outputRef !== undefined)
+      || (item.type === "userMessage" && item.content.some((part) => part.type === "image"))
+    ));
+    if (!carriesBlob) return items;
+    if (!this.deps.blobs) throw new BlobDataError("this runner cannot hydrate blob-backed history");
+    return this.deps.blobs.materializeReadyHistory(principal, sessionId, items, hydrationBudget);
+  }
+
+  private inputBlobBindings(input: readonly InputPart[], itemId: string): BlobBinding[] {
+    return input.flatMap((part) => (
+      part.type === "image" ? [{ blobId: part.blobId, itemId, purpose: "input_image" as const }] : []
+    ));
   }
 
   /** Tenant-scoped read for administrative listings, where no single user owns the result. */
@@ -845,7 +1054,7 @@ export class SessionHost {
     const agent = await this.deps.store.getAgent(principal.tenantId, session.agentId, session.agentVersion);
     if (!agent) throw new ApiError("not_found", "agent version not found");
     const busyPolicy = req.busyPolicy ?? agent.busyPolicy;
-    const input = executableInput(req.input);
+    const input = executableInput(req.input, this.imagesEnabled());
 
     // Busy handling: the truth is the session status in the store (survives restarts), the active map is our local view.
     if (local) {
@@ -941,6 +1150,9 @@ export class SessionHost {
     // ---- resolve model, tools, context ----
     const modelRef = { ...agent.model, ...(req.model ?? {}) };
     const model = await leaseGuard.wait(this.deps.providers.resolve(principal, modelRef));
+    if (input.some((part) => part.type === "image") && !model.input.includes("image")) {
+      throw new ApiError("invalid_request", `model ${model.model} does not support image input`);
+    }
     const tools: RunnerTool[] = [
       ...this.deps.tools.resolve(agent.tools),
       ...(req.dynamicTools ?? []).map((d) => this.dynamicTools.asTool(d, this.cfg.dynamicToolTimeoutMs)),
@@ -950,19 +1162,42 @@ export class SessionHost {
     const limits = mergeLimits(agent.limits, req.limits);
     let repairWarning: { code: string; message: string } | undefined;
 
-    const items = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
-    const projected = projectItems(items);
-    if (projected.repaired.length) {
-      this.log.warn(`[session ${sessionId}] repaired ${projected.repaired.length} orphaned tool calls`);
+    // One request-local byte budget covers everything sent to the main model. Materialize the
+    // submitted input first and strictly: retained history may degrade, but the caller's current
+    // input must either arrive intact or fail before a turn is persisted.
+    const hydrationBudget = this.deps.blobs?.createHydrationBudget();
+    const engineInput = await leaseGuard.wait(
+      this.materializeSubmittedInput(principal, sessionId, input, hydrationBudget),
+    );
+
+    const persistedItems = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
+    // Plan against raw persisted items. Historical images become explicit placeholders, and
+    // offloaded tool results retain their small durable marker, so old bytes cannot exhaust the
+    // hydration budget before compaction/pruning has selected the retained tail.
+    const planningProjection = projectItemsForPlanning(persistedItems);
+    if (planningProjection.repaired.length) {
+      this.log.warn(`[session ${sessionId}] repaired ${planningProjection.repaired.length} orphaned tool calls`);
       repairWarning = {
         code: "tool_calls_repaired",
-        message: `${projected.repaired.length} tool call(s) from an interrupted turn were resolved as ${[...new Set(projected.repaired.map((r) => r.code))].join("/")}`,
+        message: `${planningProjection.repaired.length} tool call(s) from an interrupted turn were resolved as ${[...new Set(planningProjection.repaired.map((r) => r.code))].join("/")}`,
       };
     }
     const budget = Math.floor(model.contextWindow * this.cfg.contextBudgetRatio);
     // Summary tier first: it changes which items are in play. Then cheap pruning on what remains.
-    const compacted = await this.maybeCompact(session, fence, items, model, budget, leaseGuard);
-    const history = pruneToolResults(compacted?.messages ?? projected.messages, budget);
+    const compacted = await this.maybeCompact(
+      principal,
+      session,
+      fence,
+      persistedItems,
+      model,
+      budget,
+      leaseGuard,
+      hydrationBudget,
+    );
+    const projectedMessages = compacted?.messages ?? projectItems(
+      await leaseGuard.wait(this.hydratePersistedItems(principal, sessionId, persistedItems, hydrationBudget)),
+    ).messages;
+    const history = pruneToolResults(projectedMessages, budget);
 
     // ---- persist turn start + user message ----
     const now = Date.now();
@@ -981,7 +1216,7 @@ export class SessionHost {
     };
     const userItem: Item = { id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input };
     const state: ActiveTurn = {
-      turn, session, agent, fence, abort: leaseGuard.abort, leaseGuard, limits,
+      turn, session, agent, modelInput: model.input, hydrationBudget, fence, abort: leaseGuard.abort, leaseGuard, limits,
       stepUsage: emptyUsage(), step: 0, toolCalls: 0, agentText: "", reasoningText: "", lastText: "",
       toolCallItems: new Map(), pendingApprovals: new Map(),
       autoApproved: new Set(session.autoApprovedTools),
@@ -1011,6 +1246,7 @@ export class SessionHost {
       await this.commit(state, {
         turn,
         items: [userItem],
+        blobBindings: this.inputBlobBindings(req.input, userItem.id),
         idempotency: opts.idempotencyKey ? {
           scope: { tenantId: session.tenantId, userId: session.userId, sessionId },
           key: opts.idempotencyKey,
@@ -1038,6 +1274,9 @@ export class SessionHost {
       }
       if (err instanceof SessionArchivedError) {
         throw new ApiError("session_archived", "cannot start a turn in an archived session");
+      }
+      if (err instanceof BlobStateError) {
+        throw new ApiError("invalid_request", "one or more image blobs expired or became unavailable");
       }
       if (err instanceof IdempotencyReplayError) {
         const existingTurn = await this.deps.store.getTurn(sessionId, err.receipt.value.turnId);
@@ -1070,7 +1309,7 @@ export class SessionHost {
     const run = () => {
       if (state.phase !== "reserved" || state.closingRequested) return;
       state.phase = "running";
-      void this.runEngine(principal, state, { systemPrompt, tools, history, input, model, limits });
+      void this.runEngine(principal, state, { systemPrompt, tools, history, input: engineInput, model, limits });
     };
     return { turn, session, run };
   }
@@ -1078,7 +1317,7 @@ export class SessionHost {
   private async runEngine(
     principal: Principal,
     state: ActiveTurn,
-    p: { systemPrompt: string; tools: RunnerTool[]; history: ReturnType<typeof projectItems>["messages"]; input: (InputPart & { type: "text" | "image" })[]; model: ResolvedModel; limits: ReturnType<typeof mergeLimits> },
+    p: { systemPrompt: string; tools: RunnerTool[]; history: ReturnType<typeof projectItems>["messages"]; input: EngineInputPart[]; model: ResolvedModel; limits: ReturnType<typeof mergeLimits> },
   ) {
     const sessionId = state.session.id;
     const sink = this.makeSink(principal, state, p.tools);
@@ -1108,11 +1347,150 @@ export class SessionHost {
     await this.finishTurn(state, result).catch((err) => this.log.error(`[session ${sessionId}] finishTurn failed`, err));
   }
 
+  private async durableToolResult(
+    principal: Principal,
+    state: ActiveTurn,
+    result: EngineToolResult,
+    now: number,
+  ): Promise<{ item: Extract<Item, { type: "toolResult" }>; blobBindings: BlobBinding[]; canonical: EngineToolResult }> {
+    const base = {
+      id: newId("item"),
+      sessionId: state.session.id,
+      turnId: state.turn.id,
+      seq: 0,
+      step: state.step,
+      createdAtMs: now,
+      completedAtMs: now,
+      type: "toolResult" as const,
+      toolCallId: result.toolCallId,
+      name: result.name,
+    };
+    const failed = (
+      code: "TOOL_OUTPUT_NOT_SERIALIZABLE" | "TOOL_OUTPUT_TOO_LARGE" | "TOOL_OUTPUT_STORAGE_FAILED",
+      text: string,
+      details: Record<string, unknown> = { code },
+    ) => {
+      const canonical: EngineToolResult = {
+        toolCallId: result.toolCallId,
+        name: result.name,
+        content: [{ type: "text", text }],
+        isError: true,
+        details,
+      };
+      const item: Extract<Item, { type: "toolResult" }> = {
+        ...base,
+        status: "failed",
+        content: canonical.content,
+        isError: true,
+        details: canonical.details,
+      };
+      return { item, blobBindings: [] as BlobBinding[], canonical };
+    };
+
+    // The round trip is intentional. Database JSON columns and blob payloads observe JSON values,
+    // so the live Pi transcript must consume that same representation (undefined fields removed,
+    // non-finite numbers normalized, and custom toJSON behavior applied) rather than the raw object.
+    let serialized: string;
+    let payload: ToolOutputPayload;
+    try {
+      const raw = JSON.stringify({ content: result.content, details: result.details });
+      const parsed = ToolOutputPayload.safeParse(JSON.parse(raw));
+      if (!parsed.success) throw new Error("invalid tool output payload");
+      payload = parsed.data;
+      // A non-undefined value whose toJSON() omitted itself must not leak back into Pi via the
+      // dependency's nullish override semantics. Normalize that rare case to an empty JSON object.
+      if (result.details !== undefined && payload.details === undefined) payload.details = {};
+      serialized = JSON.stringify(payload);
+    } catch {
+      return failed(
+        "TOOL_OUTPUT_NOT_SERIALIZABLE",
+        "TOOL_OUTPUT_NOT_SERIALIZABLE: the tool output could not be durably recorded.",
+      );
+    }
+
+    const canonical: EngineToolResult = {
+      toolCallId: result.toolCallId,
+      name: result.name,
+      content: payload.content,
+      isError: result.isError,
+      details: payload.details,
+    };
+    const inline = (): Extract<Item, { type: "toolResult" }> => ({
+      ...base,
+      status: canonical.isError ? "failed" : "completed",
+      content: canonical.content,
+      isError: canonical.isError,
+      details: canonical.details,
+    });
+    const sizeBytes = Buffer.byteLength(serialized, "utf8");
+    if (sizeBytes > this.maxDurableToolOutputBytes) {
+      return failed(
+        "TOOL_OUTPUT_TOO_LARGE",
+        "TOOL_OUTPUT_TOO_LARGE: the tool output exceeded the configured durable storage limit.",
+        { code: "TOOL_OUTPUT_TOO_LARGE", sizeBytes, maxBytes: this.maxDurableToolOutputBytes },
+      );
+    }
+    const threshold = this.cfg.toolOutputBlobThresholdBytes;
+    if (!this.cfg.blobAttachmentsEnabled || threshold === 0 || !this.deps.blobs) {
+      return { item: inline(), blobBindings: [], canonical };
+    }
+    if (sizeBytes < threshold) return { item: inline(), blobBindings: [], canonical };
+
+    let uploaded: Awaited<ReturnType<SessionBlobService["stageAndUpload"]>>;
+    try {
+      uploaded = await this.deps.blobs.stageAndUpload({
+        owner: principal,
+        sessionId: state.session.id,
+        fence: state.fence,
+        purpose: "tool_output",
+        data: Buffer.from(serialized, "utf8"),
+        contentType: TOOL_OUTPUT_CONTENT_TYPE,
+      });
+    } catch {
+      // Blob adapters may include filesystem paths, object locators or credentials in their
+      // errors. Never let those errors escape through an engine's tool-result fallback or enter
+      // the durable transcript; an unbound staged manifest is reclaimed by the staging sweeper.
+      return failed(
+        "TOOL_OUTPUT_STORAGE_FAILED",
+        "TOOL_OUTPUT_STORAGE_FAILED: the tool output could not be durably stored.",
+      );
+    }
+    const item: Extract<Item, { type: "toolResult" }> = {
+      ...base,
+      status: canonical.isError ? "failed" : "completed",
+      content: [{ type: "text", text: `Tool output stored externally (${sizeBytes} bytes).` }],
+      isError: canonical.isError,
+      outputRef: uploaded.blobId,
+    };
+    return {
+      item,
+      blobBindings: [{ blobId: uploaded.blobId, itemId: item.id, purpose: "tool_output" }],
+      canonical,
+    };
+  }
+
   private makeSink(principal: Principal, state: ActiveTurn, tools: RunnerTool[]): EngineSink {
     const sessionId = state.session.id;
     const turnId = state.turn.id;
     const toolByName = new Map(tools.map((t) => [t.name, t]));
     const live = (e: Event) => void this.deps.bus.publish(sessionId, e).catch(() => {});
+    const persistToolResult = async (r: EngineToolResult): Promise<EngineToolResult> => {
+      const now = Date.now();
+      const durable = await this.durableToolResult(principal, state, r, now);
+      const call = state.toolCallItems.get(r.toolCallId);
+      const items: Item[] = [];
+      const events: EventInput[] = [];
+      if (call) {
+        call.status = call.status === "declined" ? "declined" : durable.canonical.isError ? "failed" : "completed";
+        call.completedAtMs = now;
+        items.push(call);
+        events.push({ type: "item/completed", sessionId, emittedAtMs: now, item: call });
+      }
+      items.push(durable.item);
+      events.push({ type: "item/completed", sessionId, emittedAtMs: now, item: durable.item });
+      await this.commit(state, { items, events, blobBindings: durable.blobBindings });
+      return durable.canonical;
+    };
 
     return {
       onStepStart: (step) => {
@@ -1230,22 +1608,8 @@ export class SessionHost {
       // tool that never ran.
       onToolExecutionStart: () => {},
       onToolProgress: () => {},
-      onToolResult: async (r) => {
-        const now = Date.now();
-        const call = state.toolCallItems.get(r.toolCallId);
-        const items: Item[] = [];
-        const events: EventInput[] = [];
-        if (call) {
-          call.status = call.status === "declined" ? "declined" : r.isError ? "failed" : "completed";
-          call.completedAtMs = now;
-          items.push(call);
-          events.push({ type: "item/completed", sessionId, emittedAtMs: now, item: call });
-        }
-        const result: Item = { id: newId("item"), sessionId, turnId, seq: 0, step: state.step, status: r.isError ? "failed" : "completed", createdAtMs: now, completedAtMs: now, type: "toolResult", toolCallId: r.toolCallId, name: r.name, content: r.content, isError: r.isError, details: r.details };
-        items.push(result);
-        events.push({ type: "item/completed", sessionId, emittedAtMs: now, item: result });
-        await this.commit(state, { items, events });
-      },
+      afterToolCall: persistToolResult,
+      onToolResult: async (r) => { await persistToolResult(r); },
 
       onStepEnd: async (step) => {
         if (state.fenced || isTurnClosing(state)) return "end";
@@ -1423,7 +1787,7 @@ export class SessionHost {
       throw new ApiError("not_found", "no active turn with that id on this runner");
     }
     if (req.expectedTurnId && req.expectedTurnId !== turnId) throw new ApiError("invalid_request", "expectedTurnId mismatch");
-    await this.steerActive(state, req.input, executableInput(req.input), idempotency);
+    await this.steerActive(state, req.input, executableInput(req.input, this.imagesEnabled()), idempotency);
   }
 
   /** Admit one steer against the exact ActiveTurn already selected by the caller. */
@@ -1445,14 +1809,28 @@ export class SessionHost {
       if (this.active.get(sessionId) !== state || state.fenced || isTurnClosing(state)) {
         throw new ApiError("session_busy", "the active turn is no longer accepting steer input", { turnId });
       }
+      if (input.some((part) => part.type === "image") && !state.modelInput.includes("image")) {
+        throw new ApiError("invalid_request", "the active turn's model does not support image input");
+      }
       const now = Date.now();
       const item: Item = {
         id: newId("item"), sessionId, turnId, seq: 0, step: state.step, status: "completed",
         createdAtMs: now, completedAtMs: now, type: "userMessage", content: originalInput,
       };
+      const hydrationCheckpoint = state.hydrationBudget?.usedBytes;
+      let engineInput: EngineInputPart[];
       try {
+        engineInput = await state.leaseGuard.wait(
+          this.materializeSubmittedInput(
+            { tenantId: state.session.tenantId, userId: state.session.userId },
+            sessionId,
+            input,
+            state.hydrationBudget,
+          ),
+        );
         await this.commit(state, {
           items: [item],
+          blobBindings: this.inputBlobBindings(originalInput, item.id),
           idempotency,
           events: [
             { type: "item/completed", sessionId, emittedAtMs: now, item },
@@ -1460,6 +1838,7 @@ export class SessionHost {
           ],
         });
       } catch (err) {
+        if (hydrationCheckpoint !== undefined) state.hydrationBudget?.rollbackTo(hydrationCheckpoint);
         if (err instanceof IdempotencyMismatchError) {
           throw new ApiError("idempotency_conflict", "this Idempotency-Key was already used for a different request");
         }
@@ -1472,6 +1851,9 @@ export class SessionHost {
           && err.receipt.value.turnId === turnId
           && (!err.receipt.requestHash || err.receipt.requestHash === idempotency.requestHash)
         ) return;
+        if (err instanceof BlobStateError) {
+          throw new ApiError("invalid_request", "one or more image blobs expired or became unavailable");
+        }
         throw err;
       }
       // A stop request closes admission synchronously but must drain operations already admitted.
@@ -1484,8 +1866,8 @@ export class SessionHost {
           { turnId },
         );
       }
-      if (state.run) state.run.steer(input);
-      else state.pendingSteers.push(input);
+      if (state.run) state.run.steer(engineInput);
+      else state.pendingSteers.push(engineInput);
     };
 
     const admitted = state.steerChain.then(operation, operation);
@@ -1547,23 +1929,46 @@ export class SessionHost {
    * undefined when nothing was done.
    */
   private async maybeCompact(
+    principal: Principal,
     session: Session,
     fence: number,
     items: Item[],
     model: ResolvedModel,
     budgetTokens: number,
     leaseGuard?: LeaseGuard,
+    mainRequestHydrationBudget?: BlobHydrationBudget,
   ): Promise<CompactionResult | undefined> {
     if (!this.deps.summariser) return undefined;
     const plan = planCompaction(items, { budgetTokens, keepRatio: this.cfg.compactionKeepRatio });
     if (!plan) return undefined;
     const surfaceLastSeq = session.lastSeq;
+    let summaryItems = plan.summarise;
+    if (plan.summarise.some((item) => item.type === "toolResult" && item.outputRef)) {
+      if (!this.deps.blobs) {
+        throw new BlobDataError("this runner cannot hydrate Blob-backed tool results for compaction");
+      }
+      const hydrationWork = this.deps.blobs.materializeReadyHistoryForCompaction(
+        principal,
+        session.id,
+        plan.summarise,
+      );
+      const hydrated = leaseGuard ? await leaseGuard.wait(hydrationWork) : await hydrationWork;
+      if (!hydrated) {
+        // Advancing the watermark would permanently replace at least one real tool result with its
+        // small durable storage marker. Keeping the un-compacted history is the safe bounded fallback.
+        this.log.warn(
+          `[session ${session.id}] compaction skipped: Blob hydration budget cannot materialize every offloaded tool result in the summary range`,
+        );
+        return undefined;
+      }
+      summaryItems = hydrated;
+    }
     let summary: Awaited<ReturnType<Summariser["summarise"]>>;
     try {
       const work = this.deps.summariser.summarise({
         model,
         systemPrompt: COMPACTION_SYSTEM_PROMPT,
-        text: renderForSummary(projectItems(plan.summarise).messages),
+        text: renderForSummary(projectItemsForPlanning(summaryItems).messages),
         maxTokens: this.cfg.compactionMaxTokens,
         signal: leaseGuard?.abort.signal,
       });
@@ -1606,7 +2011,14 @@ export class SessionHost {
     this.log.info(`[session ${session.id}] compacted ${plan.summarise.length} items (~${plan.droppedTokens} tokens) into a summary; keeping from seq ${plan.keepFromSeq}`);
     // Re-project from the new watermark so the caller sees exactly what later turns will see.
     const keptWork = this.deps.store.listItems(session.id, { afterSeq: plan.keepFromSeq - 1, limit: MAX_PROJECTED_ITEMS, newestFirst: true });
-    const kept = leaseGuard ? await leaseGuard.wait(keptWork) : await keptWork;
+    const persistedKept = leaseGuard ? await leaseGuard.wait(keptWork) : await keptWork;
+    const hydrateWork = this.hydratePersistedItems(
+      principal,
+      session.id,
+      persistedKept,
+      mainRequestHydrationBudget,
+    );
+    const kept = leaseGuard ? await leaseGuard.wait(hydrateWork) : await hydrateWork;
     return { messages: projectItems(kept).messages, itemId: item.id };
   }
 
@@ -1633,9 +2045,18 @@ export class SessionHost {
       this.assertNotArchived(session, "compact");
       if (session.status.type === "active" || this.active.has(sessionId)) throw new ApiError("session_busy", "cannot compact while a turn is running");
       const model = await leaseGuard.wait(this.deps.providers.resolve(principal, agent.model));
-      const items = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
+      const persistedItems = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
       // force a cut by setting the budget below the current size
-      const result = await this.maybeCompact(session, lease.fence, items, model, Math.floor(transcriptTokens(projectItems(items).messages) * 0.5), leaseGuard);
+      const planningMessages = projectItemsForPlanning(persistedItems).messages;
+      const result = await this.maybeCompact(
+        principal,
+        session,
+        lease.fence,
+        persistedItems,
+        model,
+        Math.floor(transcriptTokens(planningMessages) * 0.5),
+        leaseGuard,
+      );
       leaseGuard.assertOwned();
       return { compacted: !!result, summaryItemId: result?.itemId };
     } catch (err) {
