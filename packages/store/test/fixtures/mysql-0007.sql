@@ -1,6 +1,6 @@
 -- Historical MySQL fixture frozen at migration 0007.
 --
--- Only the tables touched by 0008 are included. Keeping their old shape as a fixture (instead of
+-- Only the tables touched by 0008/0009 are included. Keeping their old shape as a fixture (instead of
 -- rebuilding it from today's 0001-0007 files) makes this a compatibility test for an already-running
 -- database. In particular, request_hash and both 0008 indexes must not appear here.
 
@@ -41,4 +41,28 @@ CREATE TABLE usage_ledger (
   created_at_ms BIGINT       NOT NULL,
   KEY idx_usage_tenant_time (tenant_id, created_at_ms),
   KEY idx_usage_user_time (tenant_id, user_id, created_at_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE sessions (
+  session_id          VARCHAR(64)  COLLATE utf8mb4_0900_as_cs NOT NULL PRIMARY KEY,
+  tenant_id           VARCHAR(128) COLLATE utf8mb4_0900_as_cs NOT NULL,
+  user_id             VARCHAR(128) COLLATE utf8mb4_0900_as_cs NOT NULL,
+  agent_id            VARCHAR(64)  COLLATE utf8mb4_0900_as_cs NOT NULL,
+  agent_version       INT          NOT NULL,
+  status              JSON         NOT NULL,
+  title               VARCHAR(256) NULL,
+  parent_session_id   VARCHAR(64)  COLLATE utf8mb4_0900_as_cs NULL,
+  last_seq            BIGINT       NOT NULL DEFAULT 0,
+  fence_token         BIGINT       NOT NULL DEFAULT 0,
+  context_epoch       VARCHAR(64)  COLLATE utf8mb4_0900_as_cs NOT NULL,
+  usage_json          JSON         NOT NULL,
+  metadata            JSON         NOT NULL,
+  created_at_ms       BIGINT       NOT NULL,
+  updated_at_ms       BIGINT       NOT NULL,
+  archived_at_ms      BIGINT       NULL,
+  deleted_at_ms       BIGINT       NULL,
+  auto_approved_tools JSON         NULL,
+  last_compaction_seq BIGINT       NULL,
+  KEY idx_sessions_tenant_user (tenant_id, user_id, session_id),
+  KEY idx_sessions_tenant (tenant_id, session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

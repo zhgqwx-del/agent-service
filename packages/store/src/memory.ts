@@ -21,9 +21,11 @@ import {
   SessionArchivedError,
   SessionExistsError,
   SessionGoneError,
+  SessionHasChildrenError,
   SessionLifecycleBusyError,
   SessionVersionError,
   assertPureFenceClaim,
+  assertTombstoneEvent,
   assignItemSeqs,
   assignTurnSeqEnd,
   backfillAssignedSequences,
@@ -35,15 +37,27 @@ import {
   type IdempotencyReceipt,
   type IdempotencyReceiptValue,
   type IdempotencyScope,
+  type LifecycleOutboxStore,
+  type LifecycleOutboxRecord,
   type LeaseAcquireResult,
   type LeaseConflict,
   type LeaseStore,
   type Page,
   type SessionStore,
+  type SessionLifecycleRecord,
   type TenantRecord,
   type UsageLedgerEntry,
 } from "./types.js";
 import { validateBlobKey } from "./blob/key.js";
+import {
+  assertLifecycleOutboxId,
+  parseLifecycleOutboxEnvelope,
+  sanitizeLifecycleOutboxError,
+  validateClaimLifecycleOutboxOptions,
+  validateLifecycleOutboxAck,
+  validateRenewLifecycleOutboxClaim,
+  validateRetryLifecycleOutboxOptions,
+} from "./lifecycle-outbox.js";
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -57,7 +71,7 @@ function paginate<T>(rows: T[], key: (r: T) => string, cursor: string | undefine
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore {
   agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -67,7 +81,9 @@ export class MemorySessionStore implements SessionStore {
   providers = new Map<string, { config: ProviderConfig; secret?: { ciphertext: Buffer; keyId: string } }>();
   apiKeys = new Map<string, { tenantId: string; keyId: string; scopes: ApiKeyScope[]; createdAtMs?: number; revokedAtMs?: number }>();
   idem = new Map<string, { value: IdempotencyReceiptValue | null; requestHash?: string; expiresAt: number }>();
-  deleted = new Set<string>();
+  deleted = new Map<string, { deletedAtMs: number; purgeAfterMs?: number; deletionGeneration: number }>();
+  lifecycleOutbox = new Map<string, LifecycleOutboxRecord>();
+  private nextLifecycleOutboxId = 1;
   tenants = new Map<string, TenantRecord>();
 
   async createAgent(def: AgentDefinition) {
@@ -94,6 +110,21 @@ export class MemorySessionStore implements SessionStore {
     if (session.fenceToken !== 0) throw new Error("a new session must start at fenceToken 0");
     if (this.sessions.has(session.id)) throw new SessionExistsError(session.id);
 
+    // The parent check and child publication are one synchronous critical section. MySQL takes the
+    // corresponding parent row lock in its creation transaction, so create-vs-delete has the same
+    // linearization semantics in both implementations.
+    if (session.parentSessionId) {
+      const parent = this.sessions.get(session.parentSessionId);
+      if (
+        !parent
+        || this.deleted.has(session.parentSessionId)
+        || parent.tenantId !== session.tenantId
+        || parent.userId !== session.userId
+      ) {
+        throw new SessionGoneError(session.parentSessionId);
+      }
+    }
+
     // Stage every fallible clone before publishing either map entry. Session metadata is open-ended
     // and may contain an uncloneable/throwing value; such a failure must not leave a session without
     // its creation event (or vice versa).
@@ -114,22 +145,26 @@ export class MemorySessionStore implements SessionStore {
     const s = this.sessions.get(sessionId);
     return s && s.tenantId === tenantId && !this.deleted.has(sessionId) ? clone(s) : null;
   }
+  async getSessionLifecycle(tenantId: string, userId: string, sessionId: string): Promise<SessionLifecycleRecord | null> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.tenantId !== tenantId || session.userId !== userId) return null;
+    const tombstone = this.deleted.get(sessionId);
+    return {
+      session: clone(session),
+      deletedAtMs: tombstone?.deletedAtMs,
+      purgeAfterMs: tombstone?.purgeAfterMs,
+      deletionGeneration: tombstone?.deletionGeneration ?? 0,
+    };
+  }
   async listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }) {
     const rows = [...this.sessions.values()].filter(
       (s) => s.tenantId === tenantId && !this.deleted.has(s.id) && (!opts.userId || s.userId === opts.userId) && (opts.includeArchived || !s.archivedAtMs),
     );
     return paginate(rows, (s) => s.id, opts.cursor, opts.limit, "desc");
   }
-  /** Soft delete, matching the MySQL implementation: rows stay for the retention window. */
-  async deleteSession(tenantId: string, sessionId: string) {
-    const s = this.sessions.get(sessionId);
-    if (!s || s.tenantId !== tenantId || this.deleted.has(sessionId)) return false;
-    this.deleted.add(sessionId);
-    return true;
-  }
-
   async commit(batch: CommitBatch): Promise<CommitResult> {
     assertPureFenceClaim(batch);
+    assertTombstoneEvent(batch);
     const s = this.sessions.get(batch.sessionId);
     if (!s || this.deleted.has(batch.sessionId)) throw new SessionGoneError(batch.sessionId);
     const expectedOwner = batch.lifecycle ?? batch.fenceClaim;
@@ -138,7 +173,11 @@ export class MemorySessionStore implements SessionStore {
     }
     if (batch.fence < s.fenceToken) throw new FenceError(batch.sessionId, batch.fence, s.fenceToken);
     if (batch.lifecycle) {
-      if (batch.lifecycle.type === "archive" && s.status.type === "active" && batch.sessionPatch?.status?.type !== "idle") {
+      if (
+        (batch.lifecycle.type === "archive" || batch.lifecycle.type === "tombstone")
+        && s.status.type === "active"
+        && batch.sessionPatch?.status?.type !== "idle"
+      ) {
         throw new SessionLifecycleBusyError(batch.sessionId);
       }
     } else if (!batch.fenceClaim && s.archivedAtMs !== undefined) {
@@ -146,6 +185,25 @@ export class MemorySessionStore implements SessionStore {
     }
     if (batch.expectedLastSeq !== undefined && batch.expectedLastSeq !== s.lastSeq) {
       throw new SessionVersionError(batch.sessionId, batch.expectedLastSeq, s.lastSeq);
+    }
+
+    let stagedTombstone: { deletedAtMs: number; purgeAfterMs?: number; deletionGeneration: number } | undefined;
+    if (batch.lifecycle?.type === "tombstone") {
+      const transition = batch.lifecycle;
+      const currentGeneration = this.deleted.get(batch.sessionId)?.deletionGeneration ?? 0;
+      if (transition.deletionGeneration !== currentGeneration + 1) {
+        throw new Error(`deletion generation must advance from ${currentGeneration} to ${currentGeneration + 1}`);
+      }
+      if ([...this.sessions.values()].some((candidate) => (
+        candidate.parentSessionId === batch.sessionId && !this.deleted.has(candidate.id)
+      ))) {
+        throw new SessionHasChildrenError(batch.sessionId);
+      }
+      stagedTombstone = clone({
+        deletedAtMs: transition.atMs,
+        purgeAfterMs: transition.purgeAfterMs ?? undefined,
+        deletionGeneration: transition.deletionGeneration,
+      });
     }
 
     if (batch.fenceClaim) {
@@ -205,6 +263,43 @@ export class MemorySessionStore implements SessionStore {
     assignItemSeqs(stagedItems, stagedEvents, seq);
     assignTurnSeqEnd(stagedTurn, stagedEvents, seq);
     const resultEvents = stagedEvents.map(clone);
+    const stagedOutboxes: [string, LifecycleOutboxRecord][] = [];
+    if (stagedLifecycle?.type === "tombstone") {
+      const deletedEvent = stagedEvents.at(-1);
+      if (deletedEvent?.type !== "session/deleted") throw new Error("tombstone event was not assigned a sequence");
+      const outboxes: LifecycleOutboxRecord[] = ([
+        {
+          outboxId: this.nextLifecycleOutboxId,
+          topic: "session.tombstoned",
+          aggregateId: batch.sessionId,
+          generation: stagedLifecycle.deletionGeneration,
+          payload: {
+            sessionId: batch.sessionId,
+            deletionGeneration: stagedLifecycle.deletionGeneration,
+            eventSeq: deletedEvent.seq,
+          },
+          availableAtMs: stagedLifecycle.atMs,
+          attempts: 0,
+          createdAtMs: stagedLifecycle.atMs,
+        },
+        {
+          outboxId: this.nextLifecycleOutboxId + 1,
+          topic: "session.purge",
+          aggregateId: batch.sessionId,
+          generation: stagedLifecycle.deletionGeneration,
+          payload: { sessionId: batch.sessionId, deletionGeneration: stagedLifecycle.deletionGeneration },
+          attempts: 0,
+          createdAtMs: stagedLifecycle.atMs,
+        },
+      ] satisfies LifecycleOutboxRecord[]).map((outbox) => clone(outbox));
+      for (const outbox of outboxes) {
+        const key = this.lifecycleOutboxMapKey(outbox.topic, outbox.aggregateId, outbox.generation);
+        if (this.lifecycleOutbox.has(key) || stagedOutboxes.some(([candidate]) => candidate === key)) {
+          throw new Error("lifecycle outbox identity already exists");
+        }
+        stagedOutboxes.push([key, outbox]);
+      }
+    }
 
     s.fenceToken = batch.fence;
     const log = this.events.get(batch.sessionId)!;
@@ -224,23 +319,37 @@ export class MemorySessionStore implements SessionStore {
     if (stagedSessionPatch) Object.assign(s, stagedSessionPatch);
     if (stagedLifecycle?.type === "archive") s.archivedAtMs = stagedLifecycle.atMs;
     else if (stagedLifecycle?.type === "unarchive") delete s.archivedAtMs;
+    else if (stagedLifecycle?.type === "tombstone" && stagedTombstone) {
+      this.deleted.set(batch.sessionId, stagedTombstone);
+      for (const [key, outbox] of stagedOutboxes) this.lifecycleOutbox.set(key, outbox);
+      this.nextLifecycleOutboxId += stagedOutboxes.length;
+    }
     s.updatedAtMs = Date.now();
     backfillAssignedSequences(batch, { items: stagedItems, turn: stagedTurn, events: stagedEvents });
-    return { events: resultEvents, lastSeq: seq };
+    return {
+      events: resultEvents,
+      lastSeq: seq,
+      lifecycleGeneration: stagedLifecycle?.type === "tombstone" ? stagedLifecycle.deletionGeneration : undefined,
+    };
   }
 
   async readEvents(sessionId: string, afterSeq: number, limit: number) {
+    // Deliberately raw: an already-established SSE subscription must be able to deliver the final
+    // session/deleted event. Public subscription setup performs an owner-aware session check first.
     return (this.events.get(sessionId) ?? []).filter((e) => e.seq > afterSeq).slice(0, limit).map(clone);
   }
   async getTurn(sessionId: string, turnId: string) {
+    if (this.deleted.has(sessionId)) return null;
     const t = this.turns.get(turnId);
     return t && t.sessionId === sessionId ? clone(t) : null;
   }
   async listTurns(sessionId: string, opts: { cursor?: string; limit: number; sortDirection?: "asc" | "desc" }) {
+    if (this.deleted.has(sessionId)) return { data: [], nextCursor: null };
     const rows = [...this.turns.values()].filter((t) => t.sessionId === sessionId);
     return paginate(rows, (t) => t.id, opts.cursor, opts.limit, opts.sortDirection ?? "desc");
   }
   async listItems(sessionId: string, opts: { turnId?: string; afterSeq?: number; limit: number; newestFirst?: boolean }) {
+    if (this.deleted.has(sessionId)) return [];
     const all = [...this.items.values()]
       .filter((i) => i.sessionId === sessionId && (!opts.turnId || i.turnId === opts.turnId) && i.seq > (opts.afterSeq ?? -1))
       .sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
@@ -248,16 +357,19 @@ export class MemorySessionStore implements SessionStore {
     return kept.map(clone);
   }
   async getItem(sessionId: string, itemId: string) {
+    if (this.deleted.has(sessionId)) return null;
     const i = this.items.get(itemId);
     return i && i.sessionId === sessionId ? clone(i) : null;
   }
   async listApprovals(sessionId: string, opts: { pendingOnly?: boolean }) {
+    if (this.deleted.has(sessionId)) return [];
     return [...this.approvals.values()]
       .filter((a) => a.sessionId === sessionId && (!opts.pendingOnly || a.status === "pending"))
       .sort((a, b) => a.createdAtMs - b.createdAtMs)
       .map(clone);
   }
   async getApproval(sessionId: string, approvalId: string) {
+    if (this.deleted.has(sessionId)) return null;
     const a = this.approvals.get(approvalId);
     return a && a.sessionId === sessionId ? clone(a) : null;
   }
@@ -320,6 +432,7 @@ export class MemorySessionStore implements SessionStore {
     const rows = this.usageLedger.filter(
       (e) =>
         e.tenantId === tenantId &&
+        !this.deleted.has(e.sessionId) &&
         (!q.userId || e.userId === q.userId) &&
         (!q.sessionId || e.sessionId === q.sessionId) &&
         (q.from === undefined || e.createdAtMs >= q.from) &&
@@ -354,10 +467,155 @@ export class MemorySessionStore implements SessionStore {
   }
 
   async getIdempotencyKey(scope: IdempotencyScope, key: string): Promise<IdempotencyReceipt | null> {
+    if (this.deleted.has(scope.sessionId)) return null;
     const k = this.idempotencyMapKey(scope, key);
     const cur = this.idem.get(k);
     if (!cur || cur.expiresAt < Date.now() || !cur.value) return null;
     return { requestHash: cur.requestHash, value: clone(cur.value), expiresAtMs: cur.expiresAt };
+  }
+
+  private lifecycleOutboxMapKey(topic: LifecycleOutboxRecord["topic"], aggregateId: string, generation: number) {
+    return JSON.stringify([topic, aggregateId, generation]);
+  }
+
+  async getLifecycleOutbox(topic: LifecycleOutboxRecord["topic"], aggregateId: string, generation: number) {
+    const row = this.lifecycleOutbox.get(this.lifecycleOutboxMapKey(topic, aggregateId, generation));
+    if (!row) return null;
+    assertLifecycleOutboxId(row.outboxId);
+    const cloned = clone(row);
+    const envelope = parseLifecycleOutboxEnvelope(cloned.topic, cloned.payload);
+    if (envelope.payload.sessionId !== cloned.aggregateId || envelope.payload.deletionGeneration !== cloned.generation) {
+      throw new Error(`lifecycle outbox ${cloned.outboxId} payload does not match its durable identity`);
+    }
+    return { ...cloned, ...envelope } as LifecycleOutboxRecord;
+  }
+
+  private findLifecycleOutboxById(outboxId: number): [string, LifecycleOutboxRecord] | undefined {
+    for (const entry of this.lifecycleOutbox.entries()) {
+      if (entry[1].outboxId === outboxId) return entry;
+    }
+    return undefined;
+  }
+
+  async claimLifecycleOutbox(options: import("./types.js").ClaimLifecycleOutboxOptions) {
+    const { topics, leaseUntilMs } = validateClaimLifecycleOutboxOptions(options);
+    if (topics.length === 0) return [];
+    const allowed = new Set(topics);
+    const candidates = [...this.lifecycleOutbox.entries()]
+      .filter((row) => (
+        allowed.has(row[1].topic)
+        && row[1].availableAtMs !== undefined
+        && row[1].availableAtMs <= options.nowMs
+        && row[1].completedAtMs === undefined
+        && row[1].deadLetteredAtMs === undefined
+        && (row[1].claimToken === undefined || (row[1].leaseUntilMs !== undefined && row[1].leaseUntilMs <= options.nowMs))
+      ))
+      .sort((a, b) => (a[1].availableAtMs! - b[1].availableAtMs!) || (a[1].outboxId - b[1].outboxId))
+      .slice(0, options.limit);
+    const staged = new Map<string, LifecycleOutboxRecord>();
+    const claimed: LifecycleOutboxRecord[] = [];
+    for (const [key, row] of candidates) {
+      try {
+        assertLifecycleOutboxId(row.outboxId);
+        const cloned = clone(row);
+        const envelope = parseLifecycleOutboxEnvelope(cloned.topic, cloned.payload);
+        if (envelope.payload.sessionId !== cloned.aggregateId || envelope.payload.deletionGeneration !== cloned.generation) {
+          throw new Error(`lifecycle outbox ${cloned.outboxId} payload does not match its durable identity`);
+        }
+        const next = {
+          ...cloned,
+          ...envelope,
+          attempts: row.attempts + 1,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+        } as LifecycleOutboxRecord;
+        staged.set(key, next);
+        claimed.push(next);
+      } catch {
+        // A corrupt durable envelope cannot become valid by retrying and must not starve every
+        // well-formed row behind it. Quarantine it without exposing its payload in durable errors.
+        const poison = clone(row);
+        poison.attempts += 1;
+        poison.lastError = "invalid lifecycle outbox envelope";
+        poison.deadLetteredAtMs = options.nowMs;
+        delete poison.availableAtMs;
+        delete poison.claimToken;
+        delete poison.leaseUntilMs;
+        staged.set(key, poison);
+      }
+    }
+
+    for (const [key, row] of staged) this.lifecycleOutbox.set(key, row);
+    return claimed.map(clone);
+  }
+
+  async renewLifecycleOutboxClaim(
+    outboxId: number,
+    claimToken: string,
+    options: import("./types.js").RenewLifecycleOutboxClaimOptions,
+  ) {
+    const leaseUntilMs = validateRenewLifecycleOutboxClaim(outboxId, claimToken, options.nowMs, options.leaseMs);
+    const entry = this.findLifecycleOutboxById(outboxId);
+    if (!entry) return false;
+    const row = entry[1];
+    if (
+      row.completedAtMs !== undefined
+      || row.deadLetteredAtMs !== undefined
+      || row.claimToken !== claimToken
+      || row.leaseUntilMs === undefined
+      || row.leaseUntilMs <= options.nowMs
+    ) return false;
+    row.leaseUntilMs = Math.max(row.leaseUntilMs, leaseUntilMs);
+    return true;
+  }
+
+  async completeLifecycleOutbox(outboxId: number, claimToken: string, completedAtMs: number) {
+    validateLifecycleOutboxAck(outboxId, claimToken, completedAtMs);
+    const entry = this.findLifecycleOutboxById(outboxId);
+    if (!entry) return false;
+    const row = entry[1];
+    if (
+      row.completedAtMs !== undefined
+      || row.deadLetteredAtMs !== undefined
+      || row.claimToken !== claimToken
+      || row.leaseUntilMs === undefined
+      || row.leaseUntilMs <= completedAtMs
+    ) return false;
+    row.completedAtMs = completedAtMs;
+    delete row.claimToken;
+    delete row.leaseUntilMs;
+    delete row.lastError;
+    return true;
+  }
+
+  async retryLifecycleOutbox(
+    outboxId: number,
+    claimToken: string,
+    options: import("./types.js").RetryLifecycleOutboxOptions,
+  ) {
+    validateLifecycleOutboxAck(outboxId, claimToken, options.failedAtMs);
+    validateRetryLifecycleOutboxOptions(options);
+    const lastError = sanitizeLifecycleOutboxError(options.error);
+    const entry = this.findLifecycleOutboxById(outboxId);
+    if (!entry) return false;
+    const row = entry[1];
+    if (
+      row.completedAtMs !== undefined
+      || row.deadLetteredAtMs !== undefined
+      || row.claimToken !== claimToken
+      || row.leaseUntilMs === undefined
+      || row.leaseUntilMs <= options.failedAtMs
+    ) return false;
+    delete row.claimToken;
+    delete row.leaseUntilMs;
+    row.lastError = lastError;
+    if (options.maxAttempts !== undefined && row.attempts >= options.maxAttempts) {
+      delete row.availableAtMs;
+      row.deadLetteredAtMs = options.failedAtMs;
+    } else {
+      row.availableAtMs = options.availableAtMs;
+    }
+    return true;
   }
 
   async close() {}
@@ -417,7 +675,7 @@ export class MemoryEventBus implements EventBus {
     }
     for (const l of this.listeners.get(sessionId) ?? []) l(clone(event));
   }
-  async subscribe(sessionId: string, listener: EventListener, opts?: { afterSeq?: number }) {
+  async subscribe(sessionId: string, listener: EventListener, opts?: import("./types.js").EventSubscriptionOptions) {
     if (opts?.afterSeq !== undefined) {
       for (const e of this.hot.get(sessionId) ?? []) if (e.seq > opts.afterSeq) listener(clone(e));
     }

@@ -8,9 +8,11 @@ import {
   SessionArchivedError,
   SessionExistsError,
   SessionGoneError,
+  SessionHasChildrenError,
   SessionLifecycleBusyError,
   SessionVersionError,
   type EventBus,
+  type LifecycleOutboxStore,
   type LeaseStore,
   type SessionLifecycleTransition,
   type SessionStore,
@@ -248,6 +250,94 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       await store.close();
     });
 
+    it("rejects a tombstone without one matching terminal deletion event before any write", async () => {
+      const store = await make();
+      const s = mkSession("t_tombstone_event", "u_tombstone_event");
+      await store.createSession(s);
+      const atMs = Date.now();
+      const lifecycle = {
+        type: "tombstone" as const,
+        atMs,
+        deletionGeneration: 1,
+        tenantId: s.tenantId,
+        userId: s.userId,
+      };
+
+      await expect(store.commit({ sessionId: s.id, fence: 1, lifecycle })).rejects.toThrow(
+        "one matching terminal session/deleted event",
+      );
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 1,
+        lifecycle,
+        events: [{ type: "session/deleted", sessionId: s.id, emittedAtMs: atMs, deletionGeneration: 2 }],
+      })).rejects.toThrow("one matching terminal session/deleted event");
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 1,
+        lifecycle,
+        events: [
+          { type: "session/deleted", sessionId: s.id, emittedAtMs: atMs, deletionGeneration: 1 },
+          { type: "session/created", sessionId: s.id, emittedAtMs: atMs + 1 },
+        ],
+      })).rejects.toThrow("one matching terminal session/deleted event");
+      await expect(store.commit({
+        sessionId: s.id,
+        fence: 1,
+        lifecycle: { ...lifecycle, deletionGeneration: 2 },
+        events: [{ type: "session/deleted", sessionId: s.id, emittedAtMs: atMs, deletionGeneration: 2 }],
+      })).rejects.toThrow("deletion generation must advance from 0 to 1");
+
+      expect(await store.getSession(s.tenantId, s.id)).toMatchObject({ lastSeq: 1, fenceToken: 0 });
+      expect(await store.getSessionLifecycle(s.tenantId, s.userId, s.id)).toMatchObject({
+        deletedAtMs: undefined,
+        deletionGeneration: 0,
+      });
+      expect(await store.getLifecycleOutbox("session.tombstoned", s.id, 1)).toBeNull();
+      expect(await store.getLifecycleOutbox("session.purge", s.id, 1)).toBeNull();
+      await store.close();
+    });
+
+    it("serializes child creation with parent tombstoning and never leaves a live dangling child", async () => {
+      const store = await make();
+      const parent = mkSession("t_parent_race", "u_parent_race");
+      await store.createSession(parent);
+      const child = { ...mkSession(parent.tenantId, parent.userId), parentSessionId: parent.id };
+      const atMs = Date.now();
+      const outcomes = await Promise.allSettled([
+        store.createSession(child),
+        store.commit({
+          sessionId: parent.id,
+          fence: 1,
+          lifecycle: {
+            type: "tombstone",
+            atMs,
+            deletionGeneration: 1,
+            tenantId: parent.tenantId,
+            userId: parent.userId,
+          },
+          events: [{
+            type: "session/deleted",
+            sessionId: parent.id,
+            emittedAtMs: atMs,
+            deletionGeneration: 1,
+          }],
+        }),
+      ]);
+
+      expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+      if (outcomes[0]!.status === "fulfilled") {
+        expect(outcomes[1]).toMatchObject({ status: "rejected", reason: expect.any(SessionHasChildrenError) });
+        expect(await store.getSession(parent.tenantId, parent.id)).not.toBeNull();
+        expect(await store.getSession(child.tenantId, child.id)).not.toBeNull();
+      } else {
+        expect(outcomes[0]).toMatchObject({ status: "rejected", reason: expect.any(SessionGoneError) });
+        expect(await store.getSession(parent.tenantId, parent.id)).toBeNull();
+        expect(await store.getSession(child.tenantId, child.id)).toBeNull();
+      }
+      await store.close();
+    });
+
     it("enforces lifecycle ownership, fencing, active-session and tombstone guards", async () => {
       const store = await make();
       const s = mkSession("t_lifecycle_guards", "u_lifecycle_guards");
@@ -279,7 +369,25 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       });
       expect(guardedSession?.archivedAtMs).toBeUndefined();
 
-      expect(await store.deleteSession(s.tenantId, s.id)).toBe(true);
+      const deletedAtMs = Date.now();
+      await store.commit({
+        sessionId: s.id,
+        fence: 3,
+        lifecycle: {
+          type: "tombstone",
+          atMs: deletedAtMs,
+          deletionGeneration: 1,
+          tenantId: s.tenantId,
+          userId: s.userId,
+        },
+        events: [{
+          type: "session/deleted",
+          sessionId: s.id,
+          emittedAtMs: deletedAtMs,
+          deletionGeneration: 1,
+        }],
+        sessionPatch: { status: { type: "idle" } },
+      });
       await expect(store.commit({
         sessionId: s.id,
         fence: 3,
@@ -347,7 +455,8 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const s = mkSession("t_a");
       await store.createSession(s);
       expect(await store.getSession("t_b", s.id)).toBeNull();
-      expect(await store.deleteSession("t_b", s.id)).toBe(false);
+      expect(await store.getSessionLifecycle("t_b", s.userId, s.id)).toBeNull();
+      expect(await store.getSessionLifecycle(s.tenantId, "u_wrong", s.id)).toBeNull();
       expect((await store.listSessions("t_b", { limit: 10 })).data).toEqual([]);
       await store.close();
     });
@@ -528,10 +637,123 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const store = await make();
       const s = mkSession();
       await store.createSession(s);
-      expect(await store.deleteSession(s.tenantId, s.id)).toBe(true);
+      const deletedAtMs = Date.now();
+      const deleted = await store.commit({
+        sessionId: s.id,
+        fence: 1,
+        lifecycle: {
+          type: "tombstone",
+          atMs: deletedAtMs,
+          deletionGeneration: 1,
+          tenantId: s.tenantId,
+          userId: s.userId,
+        },
+        events: [{
+          type: "session/deleted",
+          sessionId: s.id,
+          emittedAtMs: deletedAtMs,
+          deletionGeneration: 1,
+        }],
+      });
+      expect(deleted.lifecycleGeneration).toBe(1);
       expect(await store.getSession(s.tenantId, s.id)).toBeNull();
-      expect(await store.deleteSession(s.tenantId, s.id)).toBe(false);
+      expect(await store.getSessionLifecycle(s.tenantId, s.userId, s.id)).toMatchObject({
+        deletedAtMs,
+        purgeAfterMs: undefined,
+        deletionGeneration: 1,
+      });
+      expect(await store.getLifecycleOutbox("session.tombstoned", s.id, 1)).toMatchObject({
+        topic: "session.tombstoned",
+        aggregateId: s.id,
+        generation: 1,
+        payload: { sessionId: s.id, deletionGeneration: 1, eventSeq: 2 },
+        availableAtMs: deletedAtMs,
+      });
+      const purgeOutbox = await store.getLifecycleOutbox("session.purge", s.id, 1);
+      expect(purgeOutbox).toMatchObject({
+        topic: "session.purge",
+        aggregateId: s.id,
+        generation: 1,
+        payload: { sessionId: s.id, deletionGeneration: 1 },
+      });
+      expect(purgeOutbox?.availableAtMs).toBeUndefined();
       await expect(store.commit({ sessionId: s.id, fence: 1, events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 1 }] })).rejects.toBeInstanceOf(SessionGoneError);
+      await store.close();
+    });
+
+    it("atomically hides every ordinary session-scoped projection after tombstoning", async () => {
+      const store = await make();
+      const s = mkSession("t_deleted_reads", "u_deleted_reads");
+      await store.createSession(s);
+      const now = Date.now();
+      const turn: Turn = {
+        id: newId("turn"), sessionId: s.id, status: "completed", stopReason: "end_turn",
+        seqStart: 2, steps: 1, toolCalls: 0, usage: emptyUsage(), startedAtMs: now, completedAtMs: now,
+      };
+      const item: Item = {
+        id: newId("item"), sessionId: s.id, turnId: turn.id, seq: 0, step: 1,
+        status: "completed", createdAtMs: now, completedAtMs: now,
+        type: "agentMessage", text: "private", phase: "finalAnswer",
+      };
+      const approval: Approval = {
+        id: newId("apr"), sessionId: s.id, turnId: turn.id, itemId: item.id,
+        status: "pending", toolCallId: "call", toolName: "private", args: {},
+        availableDecisions: ["accept", "decline"], createdAtMs: now, expiresAtMs: now + 60_000,
+      };
+      const scope = { tenantId: s.tenantId, userId: s.userId, sessionId: s.id };
+      const usage = { ...emptyUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3 };
+      await store.commit({
+        sessionId: s.id,
+        fence: 1,
+        turn,
+        items: [item],
+        approvals: [approval],
+        usageEntries: [{ turnId: turn.id, step: 1, provider: "fake", model: "fake", usage, createdAtMs: now }],
+        idempotency: {
+          scope,
+          key: "private-key",
+          requestHash: "a".repeat(64),
+          value: { sessionId: s.id, turnId: turn.id },
+          expiresAtMs: now + 60_000,
+        },
+        events: [
+          { type: "turn/started", sessionId: s.id, emittedAtMs: now, turn },
+          { type: "item/completed", sessionId: s.id, emittedAtMs: now, item },
+        ],
+      });
+      expect((await store.queryUsage(s.tenantId, { groupBy: "total", limit: 100 })).data).toHaveLength(1);
+
+      const deletedAtMs = now + 1;
+      const result = await store.commit({
+        sessionId: s.id,
+        fence: 2,
+        lifecycle: {
+          type: "tombstone",
+          atMs: deletedAtMs,
+          deletionGeneration: 1,
+          tenantId: s.tenantId,
+          userId: s.userId,
+        },
+        events: [{
+          type: "session/deleted",
+          sessionId: s.id,
+          emittedAtMs: deletedAtMs,
+          deletionGeneration: 1,
+        }],
+      });
+
+      expect(await store.getTurn(s.id, turn.id)).toBeNull();
+      expect((await store.listTurns(s.id, { limit: 10 })).data).toEqual([]);
+      expect(await store.getItem(s.id, item.id)).toBeNull();
+      expect(await store.listItems(s.id, { limit: 10 })).toEqual([]);
+      expect(await store.getApproval(s.id, approval.id)).toBeNull();
+      expect(await store.listApprovals(s.id, {})).toEqual([]);
+      expect(await store.getIdempotencyKey(scope, "private-key")).toBeNull();
+      expect((await store.queryUsage(s.tenantId, { groupBy: "total", limit: 100 })).data).toEqual([]);
+      expect((await store.readEvents(s.id, result.lastSeq - 1, 10)).map((event) => event.type)).toEqual(["session/deleted"]);
+      expect(await store.getLifecycleOutbox("session.tombstoned", s.id, 1)).toMatchObject({
+        payload: { eventSeq: result.lastSeq },
+      });
       await store.close();
     });
 
@@ -676,6 +898,228 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
   });
 }
 
+export function lifecycleOutboxStoreConformance(
+  name: string,
+  make: () => Promise<SessionStore & LifecycleOutboxStore>,
+) {
+  const tombstone = async (store: SessionStore, atMs: number) => {
+    const session = mkSession(`tenant_outbox_${newId("t")}`, `user_outbox_${newId("u")}`);
+    await store.createSession(session);
+    await store.commit({
+      sessionId: session.id,
+      fence: 1,
+      lifecycle: {
+        type: "tombstone",
+        atMs,
+        deletionGeneration: 1,
+        tenantId: session.tenantId,
+        userId: session.userId,
+      },
+      events: [{
+        type: "session/deleted",
+        sessionId: session.id,
+        emittedAtMs: atMs,
+        deletionGeneration: 1,
+      }],
+    });
+    return session;
+  };
+
+  describe(`LifecycleOutboxStore conformance: ${name}`, () => {
+    it("claims only known, available topics and leaves purge disabled", async () => {
+      const store = await make();
+      const session = await tombstone(store, 1_000);
+      try {
+        await expect(store.claimLifecycleOutbox({
+          topics: ["unknown.topic" as "session.tombstoned"],
+          nowMs: 1_000,
+          limit: 1,
+          leaseMs: 100,
+          claimToken: "unknown-topic",
+        })).rejects.toThrow("unsupported lifecycle outbox topic");
+        expect(await store.claimLifecycleOutbox({
+          topics: ["session.purge"],
+          nowMs: 9_000,
+          limit: 1,
+          leaseMs: 100,
+          claimToken: "purge-must-remain-disabled",
+        })).toEqual([]);
+        expect(await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"],
+          nowMs: 999,
+          limit: 1,
+          leaseMs: 100,
+          claimToken: "too-early",
+        })).toEqual([]);
+
+        const claimed = await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"],
+          nowMs: 1_000,
+          limit: 1,
+          leaseMs: 100,
+          claimToken: "worker-a",
+        });
+        expect(claimed).toHaveLength(1);
+        expect(claimed[0]).toMatchObject({
+          outboxId: expect.any(Number),
+          topic: "session.tombstoned",
+          aggregateId: session.id,
+          generation: 1,
+          payload: { sessionId: session.id, deletionGeneration: 1, eventSeq: 2 },
+          availableAtMs: 1_000,
+          attempts: 1,
+          claimToken: "worker-a",
+          leaseUntilMs: 1_100,
+        });
+        expect(claimed[0]!.outboxId).toBeGreaterThan(0);
+        expect(await store.completeLifecycleOutbox(claimed[0]!.outboxId, "worker-a", 1_001)).toBe(true);
+      } finally {
+        await store.close();
+      }
+    });
+
+    it("atomically splits concurrent claims without duplicate delivery", async () => {
+      const store = await make();
+      const sessions = await Promise.all(Array.from({ length: 4 }, () => tombstone(store, 2_000)));
+      try {
+        const [first, second] = await Promise.all([
+          store.claimLifecycleOutbox({
+            topics: ["session.tombstoned"], nowMs: 2_000, limit: 3, leaseMs: 100, claimToken: "worker-a",
+          }),
+          store.claimLifecycleOutbox({
+            topics: ["session.tombstoned"], nowMs: 2_000, limit: 3, leaseMs: 100, claimToken: "worker-b",
+          }),
+        ]);
+        // SKIP LOCKED is allowed to under-fill a concurrent batch: some engines count skipped
+        // records inside the LIMIT scan window. A subsequent poll must still drain every row.
+        const third = await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 2_000, limit: 4, leaseMs: 100, claimToken: "worker-c",
+        });
+        const all = [...first, ...second, ...third];
+        expect(all).toHaveLength(4);
+        expect(new Set(all.map((row) => row.outboxId)).size).toBe(4);
+        expect(new Set(all.map((row) => row.aggregateId))).toEqual(new Set(sessions.map((session) => session.id)));
+        for (const row of all) {
+          expect(await store.completeLifecycleOutbox(row.outboxId, row.claimToken!, 2_001)).toBe(true);
+        }
+      } finally {
+        await store.close();
+      }
+    });
+
+    it("uses an unexpired outboxId/token lease as the acknowledgement CAS", async () => {
+      const store = await make();
+      const session = await tombstone(store, 3_000);
+      try {
+        const [first] = await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 3_000, limit: 1, leaseMs: 100, claimToken: "worker-old",
+        });
+        expect(first).toBeDefined();
+        expect(await store.renewLifecycleOutboxClaim(first!.outboxId, "wrong-token", { nowMs: 3_001, leaseMs: 100 })).toBe(false);
+        expect(await store.completeLifecycleOutbox(first!.outboxId, "wrong-token", 3_001)).toBe(false);
+        expect(await store.retryLifecycleOutbox(first!.outboxId, "wrong-token", {
+          failedAtMs: 3_001, availableAtMs: 3_010, error: "wrong", maxAttempts: 3,
+        })).toBe(false);
+        expect(await store.renewLifecycleOutboxClaim(first!.outboxId, "worker-old", { nowMs: 3_050, leaseMs: 200 })).toBe(true);
+        expect((await store.getLifecycleOutbox("session.tombstoned", session.id, 1))?.leaseUntilMs).toBe(3_250);
+        expect(await store.renewLifecycleOutboxClaim(first!.outboxId, "worker-old", { nowMs: 3_051, leaseMs: 1 })).toBe(true);
+        expect((await store.getLifecycleOutbox("session.tombstoned", session.id, 1))?.leaseUntilMs).toBe(3_250);
+
+        // Equality is expired: a late worker cannot resurrect or acknowledge its old lease.
+        expect(await store.renewLifecycleOutboxClaim(first!.outboxId, "worker-old", { nowMs: 3_250, leaseMs: 100 })).toBe(false);
+        expect(await store.completeLifecycleOutbox(first!.outboxId, "worker-old", 3_250)).toBe(false);
+        expect(await store.retryLifecycleOutbox(first!.outboxId, "worker-old", {
+          failedAtMs: 3_250, availableAtMs: 3_300, error: "late", maxAttempts: 3,
+        })).toBe(false);
+
+        const [reclaimed] = await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 3_250, limit: 1, leaseMs: 100, claimToken: "worker-new",
+        });
+        expect(reclaimed).toMatchObject({ outboxId: first!.outboxId, attempts: 2, claimToken: "worker-new" });
+        expect(await store.completeLifecycleOutbox(first!.outboxId, "worker-old", 3_251)).toBe(false);
+        expect(await store.completeLifecycleOutbox(first!.outboxId, "worker-new", 3_251)).toBe(true);
+        expect(await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 9_999, limit: 1, leaseMs: 100, claimToken: "after-complete",
+        })).toEqual([]);
+      } finally {
+        await store.close();
+      }
+    });
+
+    it("retries with a sanitized bounded error and dead-letters at max attempts", async () => {
+      const store = await make();
+      const session = await tombstone(store, 4_000);
+      try {
+        const [first] = await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 4_000, limit: 1, leaseMs: 1_000, claimToken: "retry-1",
+        });
+        expect(await store.retryLifecycleOutbox(first!.outboxId, "retry-1", {
+          failedAtMs: 4_001,
+          availableAtMs: 4_100,
+          error: `first\nBearer secret-token\u0000 api_key=secret mysql://admin:db-secret@localhost/db?access_token=query-secret redis://:redis-secret@localhost/0 ${"x".repeat(2_000)}`,
+          maxAttempts: 2,
+        })).toBe(true);
+        const retried = await store.getLifecycleOutbox("session.tombstoned", session.id, 1);
+        expect(retried).toMatchObject({ attempts: 1, availableAtMs: 4_100 });
+        expect(retried).not.toHaveProperty("claimToken");
+        expect(retried).not.toHaveProperty("leaseUntilMs");
+        expect(retried?.lastError).not.toMatch(/[\n\u0000]/);
+        expect(retried?.lastError).not.toContain("secret-token");
+        expect(retried?.lastError).not.toContain("api_key=secret");
+        expect(retried?.lastError).not.toContain("db-secret");
+        expect(retried?.lastError).not.toContain("query-secret");
+        expect(retried?.lastError).not.toContain("redis-secret");
+        expect(Array.from(retried?.lastError ?? "")).toHaveLength(1_024);
+        expect(await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 4_099, limit: 1, leaseMs: 100, claimToken: "too-early",
+        })).toEqual([]);
+
+        const [second] = await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 4_100, limit: 1, leaseMs: 100, claimToken: "retry-2",
+        });
+        expect(second).toMatchObject({ outboxId: first!.outboxId, attempts: 2 });
+        expect(await store.retryLifecycleOutbox(second!.outboxId, "retry-2", {
+          failedAtMs: 4_101, availableAtMs: 4_200, error: new Error("permanent"), maxAttempts: 2,
+        })).toBe(true);
+        const deadLettered = await store.getLifecycleOutbox("session.tombstoned", session.id, 1);
+        expect(deadLettered).toMatchObject({
+          attempts: 2,
+          lastError: "permanent",
+          deadLetteredAtMs: 4_101,
+        });
+        expect(deadLettered).not.toHaveProperty("availableAtMs");
+        expect(deadLettered).not.toHaveProperty("claimToken");
+        expect(deadLettered).not.toHaveProperty("leaseUntilMs");
+        expect(await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 9_999, limit: 1, leaseMs: 100, claimToken: "after-dead-letter",
+        })).toEqual([]);
+      } finally {
+        await store.close();
+      }
+    });
+
+    it("keeps a transient retry claimable when no dead-letter cap is supplied", async () => {
+      const store = await make();
+      const session = await tombstone(store, 4_500);
+      try {
+        const [claimed] = await store.claimLifecycleOutbox({
+          topics: ["session.tombstoned"], nowMs: 4_500, limit: 1, leaseMs: 100, claimToken: "retry-unbounded",
+        });
+        expect(await store.retryLifecycleOutbox(claimed!.outboxId, "retry-unbounded", {
+          failedAtMs: 4_501,
+          availableAtMs: 4_600,
+          error: "temporary outage",
+        })).toBe(true);
+        const pending = await store.getLifecycleOutbox("session.tombstoned", session.id, 1);
+        expect(pending).toMatchObject({ attempts: 1, availableAtMs: 4_600, lastError: "temporary outage" });
+        expect(pending).not.toHaveProperty("deadLetteredAtMs");
+      } finally {
+        await store.close();
+      }
+    });
+  });
+}
+
 export function leaseStoreConformance(name: string, make: () => Promise<LeaseStore>, expire: (l: LeaseStore, sid: string) => Promise<void>) {
   describe(`LeaseStore conformance: ${name}`, () => {
     it("single writer wins, fence increases on takeover, stale owner cannot renew", async () => {
@@ -734,7 +1178,7 @@ export function eventBusConformance(name: string, make: () => Promise<EventBus>)
       unsub();
       await bus.publish(sid, pe(4));
       await new Promise((r) => setTimeout(r, 50));
-      expect(seqs).toEqual([2, 3]);
+      expect(got.filter((e) => typeof (e as { seq?: number }).seq === "number").map((e) => (e as { seq: number }).seq)).toEqual([2, 3]);
       await bus.close();
     });
   });

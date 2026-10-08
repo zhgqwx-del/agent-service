@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  ErrorCode,
   EndUserTokenHeaderName,
   Event,
+  HTTP_STATUS,
   IntrospectionVerifier,
   Item,
   mergeLimits,
@@ -37,6 +39,13 @@ describe("protocol schemas", () => {
     expect(Event.safeParse({ type: "item/agentMessage/delta", sessionId: sid, turnId: tid, itemId: iid, delta: "x", emittedAtMs: 1 }).success).toBe(true);
     expect(Event.safeParse({ type: "session/created", sessionId: sid, emittedAtMs: 1 }).success).toBe(false); // needs seq
     expect(Event.safeParse({ type: "session/created", sessionId: sid, emittedAtMs: 1, seq: 1 }).success).toBe(true);
+    expect(Event.safeParse({ type: "session/deleted", sessionId: sid, emittedAtMs: 2, seq: 2, deletionGeneration: 1 }).success).toBe(true);
+    expect(Event.safeParse({ type: "session/deleted", sessionId: sid, emittedAtMs: 2, seq: 2, deletionGeneration: 0 }).success).toBe(false);
+  });
+
+  it("publishes the parent-child deletion conflict as a stable 409", () => {
+    expect(ErrorCode.parse("session_has_children")).toBe("session_has_children");
+    expect(HTTP_STATUS.session_has_children).toBe(409);
   });
 
   it("rejects unknown item types", () => {

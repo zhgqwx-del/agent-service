@@ -121,6 +121,88 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await store.close();
       }
     });
+
+    it("rolls back the deletion event, both outbox intents and marker when tombstone update fails", async () => {
+      const store = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 2 });
+      const conn = await mysql.createConnection(MYSQL_URL);
+      const session = mkSession("tenant_tombstone_rollback", "user_tombstone_rollback");
+      const triggerName = `test_tombstone_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+      const now = Date.now();
+
+      try {
+        await store.createSession(session);
+        // Events and both outbox rows are inserted before the final sessions UPDATE. This trigger
+        // therefore proves InnoDB rolls the complete tombstone write set back as one unit.
+        await conn.query(
+          `CREATE TRIGGER \`${triggerName}\` BEFORE UPDATE ON sessions FOR EACH ROW
+           BEGIN
+             IF NEW.session_id = ? AND NEW.deleted_at_ms IS NOT NULL THEN
+               SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'injected tombstone session update failure';
+             END IF;
+           END`,
+          [session.id],
+        );
+
+        await expect(store.commit({
+          sessionId: session.id,
+          fence: 1,
+          lifecycle: {
+            type: "tombstone",
+            atMs: now,
+            deletionGeneration: 1,
+            tenantId: session.tenantId,
+            userId: session.userId,
+          },
+          events: [{
+            type: "session/deleted",
+            sessionId: session.id,
+            emittedAtMs: now,
+            deletionGeneration: 1,
+          }],
+        })).rejects.toThrow("injected tombstone session update failure");
+
+        expect(await store.getSession(session.tenantId, session.id)).toMatchObject({
+          fenceToken: 0,
+          lastSeq: 1,
+        });
+        expect(await store.getSessionLifecycle(session.tenantId, session.userId, session.id)).toMatchObject({
+          deletedAtMs: undefined,
+          purgeAfterMs: undefined,
+          deletionGeneration: 0,
+        });
+        expect((await store.readEvents(session.id, 0, 20)).map((event) => event.type)).toEqual(["session/created"]);
+        expect(await store.getLifecycleOutbox("session.tombstoned", session.id, 1)).toBeNull();
+        expect(await store.getLifecycleOutbox("session.purge", session.id, 1)).toBeNull();
+
+        const [rows] = await conn.query<(RowDataPacket & {
+          deleted_at_ms: number | null;
+          purge_after_ms: number | null;
+          deletion_generation: number;
+          last_seq: number;
+          fence_token: number;
+        })[]>(
+          `SELECT deleted_at_ms, purge_after_ms, deletion_generation, last_seq, fence_token
+             FROM sessions WHERE session_id=?`,
+          [session.id],
+        );
+        expect(rows[0]).toMatchObject({
+          deleted_at_ms: null,
+          purge_after_ms: null,
+          deletion_generation: 0,
+          last_seq: 1,
+          fence_token: 0,
+        });
+        const [outbox] = await conn.query<(RowDataPacket & { count: number })[]>(
+          "SELECT COUNT(*) AS count FROM lifecycle_outbox WHERE aggregate_id=?",
+          [session.id],
+        );
+        expect(Number(outbox[0]?.count)).toBe(0);
+      } finally {
+        await conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
+        await conn.end();
+        await store.close();
+      }
+    });
   });
 } else {
   describe("MysqlSessionStore atomic session lifecycle", () => {

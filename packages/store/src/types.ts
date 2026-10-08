@@ -76,13 +76,105 @@ export interface IdempotencyReceiptInput {
   expiresAtMs: number;
 }
 
-export type SessionLifecycleTransition = {
-  type: "archive" | "unarchive";
-  atMs: number;
+interface SessionLifecycleOwner {
   /** Expected ownership is checked while the session row is locked. */
   tenantId: string;
   userId: string;
-};
+}
+
+export type SessionLifecycleTransition = SessionLifecycleOwner & (
+  | {
+      type: "archive" | "unarchive";
+      atMs: number;
+    }
+  | {
+      type: "tombstone";
+      atMs: number;
+      /** NULL keeps irreversible purge unscheduled until retention policy is explicitly activated. */
+      purgeAfterMs?: number | null;
+      /** Must be exactly the locked row's current generation + 1. */
+      deletionGeneration: number;
+    }
+);
+
+/** Internal owner-aware view. Unlike public session reads, it can represent an existing tombstone. */
+export interface SessionLifecycleRecord {
+  session: Session;
+  deletedAtMs?: number;
+  purgeAfterMs?: number;
+  deletionGeneration: number;
+}
+
+export type LifecycleOutboxTopic = "session.tombstoned" | "session.purge";
+
+interface LifecycleOutboxRecordBase {
+  /** Stable delivery identity. Workers acknowledge one claimed row at a time with this id. */
+  outboxId: number;
+  topic: LifecycleOutboxTopic;
+  aggregateId: string;
+  generation: number;
+  /** Undefined means deliberately unavailable: physical purge is disabled. */
+  availableAtMs?: number;
+  attempts: number;
+  claimToken?: string;
+  leaseUntilMs?: number;
+  lastError?: string;
+  completedAtMs?: number;
+  deadLetteredAtMs?: number;
+  createdAtMs: number;
+}
+
+export type LifecycleOutboxRecord = LifecycleOutboxRecordBase & (
+  | {
+      topic: "session.tombstoned";
+      payload: { sessionId: string; deletionGeneration: number; eventSeq: number };
+    }
+  | {
+      topic: "session.purge";
+      payload: { sessionId: string; deletionGeneration: number };
+    }
+);
+
+export interface ClaimLifecycleOutboxOptions {
+  topics: readonly LifecycleOutboxTopic[];
+  nowMs: number;
+  limit: number;
+  leaseMs: number;
+  /** Opaque worker-generated token, compared together with outboxId by every acknowledgement. */
+  claimToken: string;
+}
+
+export interface RenewLifecycleOutboxClaimOptions {
+  nowMs: number;
+  leaseMs: number;
+}
+
+export interface RetryLifecycleOutboxOptions {
+  failedAtMs: number;
+  availableAtMs: number;
+  error: unknown;
+  /** Omit for delivery-critical transient failures that must continue retrying indefinitely. */
+  maxAttempts?: number;
+}
+
+/**
+ * Least-privilege lifecycle worker surface. It intentionally excludes session/content mutations;
+ * workers can only lease and acknowledge already-created durable intents.
+ */
+export interface LifecycleOutboxStore {
+  claimLifecycleOutbox(options: ClaimLifecycleOutboxOptions): Promise<LifecycleOutboxRecord[]>;
+  renewLifecycleOutboxClaim(
+    outboxId: number,
+    claimToken: string,
+    options: RenewLifecycleOutboxClaimOptions,
+  ): Promise<boolean>;
+  completeLifecycleOutbox(outboxId: number, claimToken: string, completedAtMs: number): Promise<boolean>;
+  retryLifecycleOutbox(
+    outboxId: number,
+    claimToken: string,
+    options: RetryLifecycleOutboxOptions,
+  ): Promise<boolean>;
+}
 
 export interface SessionFenceClaim {
   /** Expected ownership is checked while the session row is locked. */
@@ -124,6 +216,8 @@ export interface CommitResult {
   /** events with seq assigned, in input order */
   events: PersistedEvent[];
   lastSeq: number;
+  /** Present when this commit installed a new tombstone generation. */
+  lifecycleGeneration?: number;
 }
 
 /** A fence hand-off must never smuggle business data into the archived/active bypass. */
@@ -140,6 +234,22 @@ export function assertPureFenceClaim(batch: CommitBatch): void {
     || batch.sessionPatch
   ) {
     throw new Error("fenceClaim must be a pure fence-only commit");
+  }
+}
+
+/** A tombstone marker, its terminal event and its outbox intent are one indivisible transition. */
+export function assertTombstoneEvent(batch: CommitBatch): void {
+  if (batch.lifecycle?.type !== "tombstone") return;
+  const events = batch.events ?? [];
+  const deleted = events.filter((event) => event.type === "session/deleted");
+  const marker = deleted[0];
+  if (
+    deleted.length !== 1
+    || marker?.sessionId !== batch.sessionId
+    || marker.deletionGeneration !== batch.lifecycle.deletionGeneration
+    || events.at(-1) !== marker
+  ) {
+    throw new Error("tombstone commit requires one matching terminal session/deleted event");
   }
 }
 
@@ -233,6 +343,14 @@ export class SessionLifecycleBusyError extends Error {
   }
 }
 
+/** Parent deletion is blocked until every directly related child is itself tombstoned. */
+export class SessionHasChildrenError extends Error {
+  constructor(public readonly sessionId: string) {
+    super(`session ${sessionId} has live child sessions`);
+    this.name = "SessionHasChildrenError";
+  }
+}
+
 /** Session ids are globally unique; a concurrent creator must not replace the winner. */
 export class SessionExistsError extends Error {
   constructor(public readonly sessionId: string) {
@@ -305,8 +423,9 @@ export interface SessionStore {
    */
   createSession(session: Session): Promise<CommitResult>;
   getSession(tenantId: string, sessionId: string): Promise<Session | null>;
+  /** Internal lifecycle lookup that also sees an owned tombstone; never expose directly over HTTP. */
+  getSessionLifecycle(tenantId: string, userId: string, sessionId: string): Promise<SessionLifecycleRecord | null>;
   listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }): Promise<Page<Session>>;
-  deleteSession(tenantId: string, sessionId: string): Promise<boolean>;
 
   /** The single fenced write path for anything that belongs to a session. */
   commit(batch: CommitBatch): Promise<CommitResult>;
@@ -348,6 +467,13 @@ export interface SessionStore {
   /** Completed receipts only; pending reservations are intentionally not part of the protocol. */
   getIdempotencyKey(scope: IdempotencyScope, key: string): Promise<IdempotencyReceipt | null>;
 
+  // ---- lifecycle outbox (diagnostic read; claiming/processing is a separate least-privilege API) ----
+  getLifecycleOutbox(
+    topic: LifecycleOutboxTopic,
+    aggregateId: string,
+    generation: number,
+  ): Promise<LifecycleOutboxRecord | null>;
+
   close(): Promise<void>;
 }
 
@@ -377,6 +503,12 @@ export interface LeaseStore {
 
 export type EventListener = (event: Event) => void;
 
+export interface EventSubscriptionOptions {
+  afterSeq?: number;
+  /** Called after a live transport reconnects so the owner can recover beyond the hot window. */
+  onReconnect?: () => void | Promise<void>;
+}
+
 /**
  * Cross-replica live fan-out with a short hot replay window. Persisted events are written to the
  * store first, then published here; live-only events are published only here.
@@ -387,7 +519,7 @@ export interface EventBus {
    * Subscribe to live events. `afterSeq` lets the bus replay persisted events from its hot window
    * (best effort; the caller must still read older events from the store).
    */
-  subscribe(sessionId: string, listener: EventListener, opts?: { afterSeq?: number }): Promise<() => void>;
+  subscribe(sessionId: string, listener: EventListener, opts?: EventSubscriptionOptions): Promise<() => void>;
   close(): Promise<void>;
 }
 

@@ -76,7 +76,9 @@ async function makeApp() {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
   });
   const app = createApp({
-    store, host, providers, tools: new StaticToolRegistry([]), runnerId: "r", heartbeatMs: 60_000, maxBodyBytes: 1_000_000, ready: () => true,
+    store, host, providers, tools: new StaticToolRegistry([]), runnerId: "r",
+    internalRouterToken: "auth-test-internal-router-token-01",
+    heartbeatMs: 60_000, maxBodyBytes: 1_000_000, ready: () => true,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
     // the test JWKS/introspection servers listen on 127.0.0.1; the strict default guard is covered by

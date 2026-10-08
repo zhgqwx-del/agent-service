@@ -18,6 +18,7 @@
     "typecheck": "tsc -b tsconfig.json && tsc -p tsconfig.typecheck.json",
     "test": "vitest run",
     "test:migrations": "vitest run --config packages/store/test/migrations/vitest.config.ts --reporter=verbose",
+    "test:outbox-mysql": "vitest run packages/store/test/lifecycle-outbox.mysql.test.ts --reporter=verbose",
     "test:watch": "vitest",
     "dev:runner": "pnpm --filter @agent-service/runner dev",
     "dev:router": "pnpm --filter @agent-service/router dev",

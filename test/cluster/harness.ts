@@ -174,6 +174,7 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
   const routerPort = await freePort();
   const router = launch("router", "apps/agent-router/src/main.ts", routerPort, {
     ROUTER_PORT: String(routerPort),
+    SESSION_TOMBSTONE_ENABLED: "1",
     ROUTER_HOST: "127.0.0.1",
     RUNNERS: runners.map((r) => r.url).join(","),
     REDIS_URL,

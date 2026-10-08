@@ -19,7 +19,7 @@
 
 正式客户端应访问 router 的 `8080`。runner 的 `8787` 用于开发诊断和对照，不应当成为生产环境的公网入口。
 
-当前本地拓扑覆盖已实现的 M1/M2 主链路。M3 的 MCP/skills/hooks 和 M4 的生产化能力会在实现后加入本文；尚未实现的模块不会因为出现在设计文档中就成为可启动服务。
+当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive v2、fenced tombstone 与 reliable terminal-event outbox dispatcher。dispatcher 是每个 runner 内部的工作循环，不是第三个应用服务或镜像；ownership manifest/Blob 接线、erasure/export、legacy 补偿和物理 purge 尚未完成。M3 的 MCP/skills/hooks 和 M4 的生产化能力会在实现后加入本文；尚未实现的模块不会因为出现在设计文档中就成为可启动服务。
 
 ## 2. 一次性准备
 
@@ -53,7 +53,7 @@ test -f .env || cp .env.example .env
 - 使用 `openssl rand -hex 32` 生成独立的 `SECRETS_MASTER_KEY`；
 - `.env` 不得提交，也不得把密钥复制到命令日志、文档或问题报告中。
 
-`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前只有 `RUNNER_PORT`、`ROUTER_PORT`、`RUNNER_ID`、`RUNNER_ADDR`、`RUNNERS` 和 `REDIS_URL` 保证显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。
+`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前只有 `RUNNER_PORT`、`ROUTER_PORT`、`RUNNER_ID`、`RUNNER_ADDR`、`RUNNERS`、`REDIS_URL` 和 `SESSION_TOMBSTONE_ENABLED` 保证显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。
 
 ## 3. 启动与停止完整本地栈
 
@@ -68,6 +68,8 @@ scripts/local-service.sh smoke
 1. 通过 `deploy/local/infra.sh` 启动 MySQL 和 Redis；
 2. 从 TypeScript 源码启动一个 runner；
 3. 从 TypeScript 源码启动一个 router，并等待其发现健康 runner。
+
+runner 启动后会同时启动 lifecycle outbox dispatcher；停止时先 drain session，再等待当前 dispatcher pass 结束。`.env.example` 与本地脚本将 `SESSION_TOMBSTONE_ENABLED` 设为 `1` 方便完整体验；生产默认必须保持 `0`，直到完成第 9 节的 capability rollout。
 
 `smoke` 不调用真实模型，验证两端 readiness、两份 OpenAPI、router 转发和未鉴权请求返回 `401`。
 
@@ -166,6 +168,19 @@ curl -sS -X POST "$BASE/v1/sessions/$SESSION_ID/unarchive" "${H[@]}"
 
 archive active turn 会返回 `409 session_busy`；先 interrupt 并等待 turn 结算后再重试。archive 会清空 session 级工具授权并结算异常遗留审批，unarchive 不恢复旧授权。
 
+要体验 DELETE，请另建一个可丢弃的 idle session；该操作对普通 API 不可逆：
+
+```bash
+DELETE_SESSION_ID=sess_...
+curl -i -X DELETE "$BASE/v1/sessions/$DELETE_SESSION_ID" "${H[@]}"
+curl -i "$BASE/v1/sessions/$DELETE_SESSION_ID" "${H[@]}"  # 预期 404
+curl -i -X DELETE "$BASE/v1/sessions/$DELETE_SESSION_ID" "${H[@]}"  # 同 owner 重试仍为 204
+```
+
+DELETE 经同一队列、lease/fence 原子写入 terminal `session/deleted`、单调 generation 和 durable cleanup intents；active session 返回 `409 session_busy`，存在任何未删除 child 的 parent 返回 `409 session_has_children`。runner 内置 dispatcher 会用 claim lease 和有上限退避可靠重投 `session.tombstoned` 对应的 durable event；短暂故障持续重试，确定损坏的 intent 才 dead-letter。投递是 at-least-once，相同 event `seq` 可能出现多次并由订阅路径去重。当前 `purge_after_ms = NULL`、purge intent 不可领取，dispatcher 也不会处理它，因此 `404` 表示普通 API 已隐藏，并不表示磁盘或数据库内容已物理清除。
+
+外部客户端只能调用公开 DELETE；router 会在 gate/fleet 校验后将其改写为 runner 的版本化内部 POST，剥离任何客户端伪造的内部 header，并注入与 runner 一致的 `INTERNAL_ROUTER_TOKEN`。该内部路径不进入 OpenAPI/SDK，直接经 router 调用返回 404；production runner 端口还必须由网络策略限制为 router/运维平面可达。
+
 当前 `scripts/demo.sh approval` 不会完成一条人工审批交互；审批状态机由自动测试覆盖。后续若增加交互式审批 demo，应在此处补充。
 
 ## 6. 四级验证路径
@@ -176,7 +191,7 @@ scripts/local-service.sh smoke
 
 scripts/local-service.sh verify
 # 无真实模型费用；运行 secret/API drift/typecheck、MySQL/Redis 集成、
-# 历史迁移、真实多进程 cluster、SDK 打包和两个应用 bundle 启动门禁
+# 0007→0008 与 0008→0009 历史迁移、真实多进程 cluster、SDK 打包和两个应用 bundle 启动门禁
 
 scripts/local-service.sh verify-real
 # 读取本机 .env，只跑真实 provider E2E，会产生费用
@@ -241,7 +256,7 @@ GitHub 启动 MySQL 8 和 Redis 8 service container，然后执行：
 4. 源码与测试的 TypeScript 全量检查；
 5. 单元及 MySQL/Redis 集成测试和覆盖率门槛；
 6. 断言集成套件没有被环境错误静默 skip；
-7. 固定 0007 历史库到 0008 的真实 MySQL 迁移测试；
+7. 固定 0007 历史库到 0008、固定 0008 历史库到 0009 的真实 MySQL 迁移测试；
 8. 真实 runner/router 多进程 cluster 测试；
 9. `pnpm build:check`；
 10. 上传 coverage artifact。
@@ -283,6 +298,10 @@ agent-service/agent-router:ci
 ```
 
 staging/production 不重新编译镜像。环境差异只通过受控配置和 Secret 注入；两个环境不共享 MySQL、Redis、对象存储、密钥或 service key。
+
+tombstone 保持在 exact protocol family `2026-10-08`，作为 additive capability 激活。发布时先由 API gateway 暂停精确 session DELETE（或整体切换 router 池），部署新 router 且保持 `SESSION_TOMBSTONE_ENABLED=0`，排空全部旧 router，再滚动新 runner；确认每个健康 runner 都声明 `tombstone` 后才把新 router gate 设为 `1`。router 会在显式 gate 之外持续检查全健康 fleet，任一健康旧 runner 存在时 DELETE 都返回可重试 `503`。仅逐个替换旧 router 而不先阻断 DELETE 不安全，因为旧 router 没有这个 gate；runner 端口也必须保持内网不可直连，否则会绕过 router gate。
+
+这套 activation gate 只覆盖同一 protocol family 内的 additive tombstone rollout。未来真正改变 protocol version 时仍需全量 drain 的维护窗口协调切换或整组 blue-green，除非再实现 version range/按版本路由。
 
 没有云资源时，仍可完成业务代码、协议、迁移、memory/MySQL/Redis 实现、本地多进程与容器测试、故障注入、指标定义和部署模板设计。以下结论必须等待真实环境：云网络和权限正确性、KMS/对象存储/IdP 集成、Kubernetes 滚动发布、真实告警链路、备份恢复目标、云 Redis 灾备以及生产容量。
 

@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI 3.1、生成 TypeScript SDK 和可逆 Archive v2 已实现；fenced tombstone、ownership manifest/outbox、erasure/export、Blob 接线及默认关闭的 purge 仍待按 `docs/design/04-data-lifecycle.md` 完成。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI 3.1、生成 TypeScript SDK、可逆 Archive v2、fenced tombstone 和可靠 terminal-event outbox dispatcher 已实现；ownership manifest/Blob 接线、erasure/export、legacy generation `0` 补偿及默认关闭的物理 purge 仍待按 `docs/design/04-data-lifecycle.md` 完成。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -35,7 +35,7 @@ scripts/demo.sh
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 历史库 → 0008 的真实 MySQL 升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008、0008 → 0009 的真实 MySQL 升级夹具
 pnpm test:cluster                             # + 多进程集群：2~3 runner + 1 router，SIGKILL 租约持有者
 pnpm check:api                                # OpenAPI 与生成 SDK 漂移检查
 pnpm check:sdk                                # 编译 SDK、原生 Node import，并校验 pnpm pack 内容
@@ -70,7 +70,9 @@ scripts/local-service.sh stop
               一致性哈希兜底                  MySQL / Redis / 对象存储
 ```
 
-`agent-router` 只做三件事：按 sessionId 找到持有租约的 runner、把 SSE 原样透传、收到 runner 的 `409 + X-Owner` 后重路由一次。它没有业务状态，可随时重启。
+`agent-router` 的核心职责是按 sessionId 找到持有租约的 runner、把 SSE 原样透传、收到 runner 的 `409 + X-Owner` 后安全重路由，并在发布窗口执行 protocol/capability gate。它没有业务状态，可随时重启。
+
+tombstone 是现有 `2026-10-08` protocol family 内的 additive capability。router 只有在显式设置 `SESSION_TOMBSTONE_ENABLED=1` 且全部健康 runner 都声明 `tombstone` 时才开放 session DELETE；本地脚本默认启用。外部 DELETE 会被改写为带 `INTERNAL_ROUTER_TOKEN` 的版本化 runner-only POST，并要求新 runner 回 ACK；内部路径不进入 OpenAPI，客户端伪造的内部 header 会被剥离。`RUNNERS` 必须是实例稳定地址，runner 端口必须保持内网不可直连。staging/production 需先在 edge 暂停精确 session DELETE（或整体切换 router 池），再按“新 router（gate=0）→ 排空旧 router → 滚动新 runner → 核对 fleet capability → 激活 gate”的顺序升级；旧 router 本身没有该 gate。
 
 ## API 速览（`apps/agent-runner`）
 
@@ -90,7 +92,8 @@ curl -sN -X POST "localhost:8787/v1/sessions/sess_.../turns?exclude=usage/update
 # 其他：GET .../items | .../turns | POST .../turns/{id}/interrupt | steer | tool-results（动态工具回填）
 #       GET/POST .../approvals/{id} {decision: accept|acceptForSession|decline|cancel}
 #       GET/PUT/DELETE /v1/providers/{id}（BYOK，apiKey 只写不读，AES-GCM 落库）  GET /v1/models  GET /v1/tools
-#       POST .../archive | .../unarchive | .../resume  GET /v1/capabilities  GET /openapi.json  GET /healthz /readyz
+#       POST .../archive | .../unarchive | .../resume  DELETE /v1/sessions/{id}（fenced tombstone，不物理 purge）
+#       GET /v1/capabilities  GET /openapi.json  GET /healthz /readyz
 ```
 
 事件类型与资源 schema 在 `packages/protocol/src/`（zod，单一真相）。`pnpm generate:api` 由同一组 schema 确定性生成并提交 `packages/protocol/openapi.json`、运行时文档常量和 SDK route types；CI 的 `pnpm check:api` 会阻止手改或漏生成。`packages/sdk` 提供可编译/打包的 ESM TypeScript SDK、`openapi-fetch` 类型化客户端、`startTurnStream`、`subscribeSessionEvents` 和增量 SSE 解析器；`pnpm check:sdk` 从实际发布包入口验证消费者路径。
@@ -118,6 +121,7 @@ docs/                  调研、设计
 - 新 owner 在读取 takeover/orphan 快照前先用纯 `fenceClaim` 推进 MySQL fence；该批次不能夹带业务写，active/archived 行也不会留下 Redis 与数据库 fence 的 hand-off 窗口。
 - session 行与首条 `session/created(seq=1)` 由 store 原子创建；序列化或数据库事件写入失败不会留下孤立 session、首事件空洞或部分游标。
 - archive/unarchive 与生命周期事件、授权清理和异常审批结算原子提交；archived session 可读但拒绝 turn/steer/compact/approval/dynamic-result 写入。
+- DELETE 经同一队列、lease 与 fence 原子提交 `session/deleted`、单调 deletion generation、tombstone marker 和两条 durable cleanup intent；普通资源随即 404。runner 内置 dispatcher 只领取 `session.tombstoned`，以 claim lease 和有上限的指数退避按 at-least-once 语义重投，短暂存储/总线故障默认不会因次数耗尽而永久停投；只有确定损坏的 envelope/event identity 才隔离到 dead-letter，消费者以 event `seq` 去重。`session.purge` 在策略确认前不可领取且不执行物理删除。
 - 持久化事件 per-session `seq` 严格连续；delta 事件只走总线不落库不占 seq。
 - 工具调用先落库（write-ahead）再执行；崩溃后按是否 `startedAtMs` 生成 `TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN` 交给模型。
 - 安全阀 `maxSteps / maxToolCalls / maxWallClockMs / maxCostCNY` 取 min，只能收紧。

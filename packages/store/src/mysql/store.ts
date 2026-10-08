@@ -12,9 +12,11 @@ import {
   SessionArchivedError,
   SessionExistsError,
   SessionGoneError,
+  SessionHasChildrenError,
   SessionLifecycleBusyError,
   SessionVersionError,
   assertPureFenceClaim,
+  assertTombstoneEvent,
   assignItemSeqs,
   assignTurnSeqEnd,
   backfillAssignedSequences,
@@ -23,10 +25,22 @@ import {
   type CommitResult,
   type IdempotencyReceipt,
   type IdempotencyScope,
+  type LifecycleOutboxRecord,
+  type LifecycleOutboxStore,
   type Page,
   type SessionStore,
+  type SessionLifecycleRecord,
   type TenantRecord,
 } from "../types.js";
+import {
+  assertLifecycleOutboxId,
+  parseLifecycleOutboxEnvelope,
+  sanitizeLifecycleOutboxError,
+  validateClaimLifecycleOutboxOptions,
+  validateLifecycleOutboxAck,
+  validateRenewLifecycleOutboxClaim,
+  validateRetryLifecycleOutboxOptions,
+} from "../lifecycle-outbox.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -56,6 +70,31 @@ function rowToSession(r: Row): Session {
   };
 }
 
+function rowToLifecycleOutbox(row: Row): LifecycleOutboxRecord {
+  const outboxId = Number(row.outbox_id);
+  assertLifecycleOutboxId(outboxId);
+  const generation = Number(row.generation);
+  const aggregateId = String(row.aggregate_id);
+  const envelope = parseLifecycleOutboxEnvelope(row.topic, parse(row.payload));
+  if (envelope.payload.sessionId !== aggregateId || envelope.payload.deletionGeneration !== generation) {
+    throw new Error(`lifecycle outbox ${outboxId} payload does not match its durable identity`);
+  }
+  return {
+    outboxId,
+    aggregateId,
+    generation,
+    ...envelope,
+    ...(row.available_at_ms == null ? {} : { availableAtMs: Number(row.available_at_ms) }),
+    attempts: Number(row.attempts),
+    ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+    ...(row.lease_until_ms == null ? {} : { leaseUntilMs: Number(row.lease_until_ms) }),
+    ...(row.last_error == null ? {} : { lastError: String(row.last_error) }),
+    ...(row.completed_at_ms == null ? {} : { completedAtMs: Number(row.completed_at_ms) }),
+    ...(row.dead_lettered_at_ms == null ? {} : { deadLetteredAtMs: Number(row.dead_lettered_at_ms) }),
+    createdAtMs: Number(row.created_at_ms),
+  } as LifecycleOutboxRecord;
+}
+
 export interface MysqlStoreOptions {
   url: string;
   connectionLimit?: number;
@@ -65,7 +104,7 @@ export interface MysqlStoreOptions {
   migrationLockTimeoutSeconds?: number;
 }
 
-export class MysqlSessionStore implements SessionStore {
+export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore {
   private constructor(private readonly pool: Pool) {}
 
   /**
@@ -191,6 +230,24 @@ export class MysqlSessionStore implements SessionStore {
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      if (s.parentSessionId) {
+        // Serialize child creation with parent tombstoning. Host preflight is only an early error;
+        // this locked re-check is the authority that prevents a dangling child under a deleted row.
+        const [parentRows] = await conn.query<Row[]>(
+          `SELECT tenant_id, user_id, deleted_at_ms
+             FROM sessions WHERE session_id=? FOR UPDATE`,
+          [s.parentSessionId],
+        );
+        const parent = parentRows[0];
+        if (
+          !parent
+          || parent.deleted_at_ms != null
+          || parent.tenant_id !== s.tenantId
+          || parent.user_id !== s.userId
+        ) {
+          throw new SessionGoneError(s.parentSessionId);
+        }
+      }
       try {
         await conn.query(
           `INSERT INTO sessions (session_id, tenant_id, user_id, agent_id, agent_version, status, title, parent_session_id,
@@ -233,6 +290,21 @@ export class MysqlSessionStore implements SessionStore {
     );
     return rows[0] ? rowToSession(rows[0]) : null;
   }
+  async getSessionLifecycle(tenantId: string, userId: string, sessionId: string): Promise<SessionLifecycleRecord | null> {
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT * FROM sessions
+        WHERE session_id=? AND tenant_id=? AND user_id=?`,
+      [sessionId, tenantId, userId],
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      session: rowToSession(row),
+      deletedAtMs: row.deleted_at_ms == null ? undefined : Number(row.deleted_at_ms),
+      purgeAfterMs: row.purge_after_ms == null ? undefined : Number(row.purge_after_ms),
+      deletionGeneration: Number(row.deletion_generation),
+    };
+  }
   async listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }): Promise<Page<Session>> {
     const where = ["tenant_id=?", "deleted_at_ms IS NULL"];
     const params: unknown[] = [tenantId];
@@ -247,23 +319,17 @@ export class MysqlSessionStore implements SessionStore {
     const data = rows.slice(0, opts.limit).map(rowToSession);
     return { data, nextCursor: rows.length > opts.limit ? (data.at(-1)?.id ?? null) : null };
   }
-  async deleteSession(tenantId: string, sessionId: string) {
-    // soft delete: data lifecycle job purges later (docs/design §14 #6)
-    const [res] = await this.pool.query<mysql.ResultSetHeader>(
-      "UPDATE sessions SET deleted_at_ms=? WHERE session_id=? AND tenant_id=? AND deleted_at_ms IS NULL",
-      [Date.now(), sessionId, tenantId],
-    );
-    return res.affectedRows > 0;
-  }
-
   // ---------- fenced commit ----------
   async commit(batch: CommitBatch): Promise<CommitResult> {
     assertPureFenceClaim(batch);
+    assertTombstoneEvent(batch);
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
       const [rows] = await conn.query<Row[]>(
-        "SELECT tenant_id, user_id, status, last_seq, fence_token, archived_at_ms, deleted_at_ms FROM sessions WHERE session_id=? FOR UPDATE",
+        `SELECT tenant_id, user_id, status, last_seq, fence_token, archived_at_ms,
+                deleted_at_ms, purge_after_ms, deletion_generation
+           FROM sessions WHERE session_id=? FOR UPDATE`,
         [batch.sessionId],
       );
       const head = rows[0];
@@ -282,7 +348,7 @@ export class MysqlSessionStore implements SessionStore {
       }
       if (batch.lifecycle) {
         if (
-          batch.lifecycle.type === "archive"
+          (batch.lifecycle.type === "archive" || batch.lifecycle.type === "tombstone")
           && parse<Session["status"]>(head.status).type === "active"
           && batch.sessionPatch?.status?.type !== "idle"
         ) {
@@ -298,6 +364,18 @@ export class MysqlSessionStore implements SessionStore {
         await conn.query("UPDATE sessions SET fence_token=? WHERE session_id=?", [batch.fence, batch.sessionId]);
         await conn.commit();
         return { events: [], lastSeq: currentLastSeq };
+      }
+
+      if (batch.lifecycle?.type === "tombstone") {
+        const currentGeneration = Number(head.deletion_generation);
+        if (batch.lifecycle.deletionGeneration !== currentGeneration + 1) {
+          throw new Error(`deletion generation must advance from ${currentGeneration} to ${currentGeneration + 1}`);
+        }
+        const [children] = await conn.query<Row[]>(
+          "SELECT session_id FROM sessions WHERE parent_session_id=? AND deleted_at_ms IS NULL LIMIT 1",
+          [batch.sessionId],
+        );
+        if (children.length) throw new SessionHasChildrenError(batch.sessionId);
       }
 
       // A completed idempotency receipt and the first turn write share this transaction. There is no
@@ -376,6 +454,36 @@ export class MysqlSessionStore implements SessionStore {
           [tenantId, userId, batch.sessionId, receipt.key, receipt.requestHash, json(receipt.value), receipt.expiresAtMs],
         );
       }
+      if (batch.lifecycle?.type === "tombstone") {
+        const generation = batch.lifecycle.deletionGeneration;
+        const deletedEvent = events.at(-1);
+        if (deletedEvent?.type !== "session/deleted") throw new Error("tombstone event was not assigned a sequence");
+        await conn.query(
+          `INSERT INTO lifecycle_outbox
+             (topic, aggregate_id, generation, payload, available_at_ms, attempts, created_at_ms)
+           VALUES ?`,
+          [[
+            [
+              "session.tombstoned",
+              batch.sessionId,
+              generation,
+              json({ sessionId: batch.sessionId, deletionGeneration: generation, eventSeq: deletedEvent.seq }),
+              batch.lifecycle.atMs,
+              0,
+              batch.lifecycle.atMs,
+            ],
+            [
+              "session.purge",
+              batch.sessionId,
+              generation,
+              json({ sessionId: batch.sessionId, deletionGeneration: generation }),
+              null,
+              0,
+              batch.lifecycle.atMs,
+            ],
+          ]],
+        );
+      }
 
       const sets = ["last_seq=?", "fence_token=?", "updated_at_ms=?"];
       const params: unknown[] = [seq, batch.fence, Date.now()];
@@ -390,14 +498,23 @@ export class MysqlSessionStore implements SessionStore {
         if (p.lastCompactionSeq !== undefined) { sets.push("last_compaction_seq=?"); params.push(p.lastCompactionSeq); }
       }
       if (batch.lifecycle) {
-        sets.push("archived_at_ms=?");
-        params.push(batch.lifecycle.type === "archive" ? batch.lifecycle.atMs : null);
+        if (batch.lifecycle.type === "tombstone") {
+          sets.push("deleted_at_ms=?", "purge_after_ms=?", "deletion_generation=?");
+          params.push(batch.lifecycle.atMs, batch.lifecycle.purgeAfterMs ?? null, batch.lifecycle.deletionGeneration);
+        } else {
+          sets.push("archived_at_ms=?");
+          params.push(batch.lifecycle.type === "archive" ? batch.lifecycle.atMs : null);
+        }
       }
       params.push(batch.sessionId);
       await conn.query(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id=?`, params);
       await conn.commit();
       backfillAssignedSequences(batch, { items, turn, events });
-      return { events, lastSeq: seq };
+      return {
+        events,
+        lastSeq: seq,
+        lifecycleGeneration: batch.lifecycle?.type === "tombstone" ? batch.lifecycle.deletionGeneration : undefined,
+      };
     } catch (err) {
       await conn.rollback().catch(() => {});
       throw err;
@@ -408,6 +525,8 @@ export class MysqlSessionStore implements SessionStore {
 
   // ---------- reads ----------
   async readEvents(sessionId: string, afterSeq: number, limit: number) {
+    // Deliberately raw: an established SSE stream must be able to observe session/deleted. Public
+    // subscription setup performs an owner-aware live-session check before calling this method.
     const [rows] = await this.pool.query<Row[]>(
       "SELECT body FROM events WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
       [sessionId, afterSeq, limit],
@@ -415,46 +534,69 @@ export class MysqlSessionStore implements SessionStore {
     return rows.map((r) => parse<PersistedEvent>(r.body));
   }
   async getTurn(sessionId: string, turnId: string) {
-    const [rows] = await this.pool.query<Row[]>("SELECT body FROM turns WHERE turn_id=? AND session_id=?", [turnId, sessionId]);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT t.body FROM turns t
+         JOIN sessions s ON s.session_id=t.session_id AND s.deleted_at_ms IS NULL
+        WHERE t.turn_id=? AND t.session_id=?`,
+      [turnId, sessionId],
+    );
     return rows[0] ? parse<Turn>(rows[0].body) : null;
   }
   async listTurns(sessionId: string, opts: { cursor?: string; limit: number; sortDirection?: "asc" | "desc" }): Promise<Page<Turn>> {
     const desc = (opts.sortDirection ?? "desc") === "desc";
     const [rows] = await this.pool.query<Row[]>(
-      `SELECT body FROM turns WHERE session_id=? ${opts.cursor ? `AND turn_id ${desc ? "<" : ">"} ?` : ""} ORDER BY turn_id ${desc ? "DESC" : "ASC"} LIMIT ?`,
+      `SELECT t.body FROM turns t
+         JOIN sessions s ON s.session_id=t.session_id AND s.deleted_at_ms IS NULL
+        WHERE t.session_id=? ${opts.cursor ? `AND t.turn_id ${desc ? "<" : ">"} ?` : ""}
+        ORDER BY t.turn_id ${desc ? "DESC" : "ASC"} LIMIT ?`,
       opts.cursor ? [sessionId, opts.cursor, opts.limit + 1] : [sessionId, opts.limit + 1],
     );
     const data = rows.slice(0, opts.limit).map((r) => parse<Turn>(r.body));
     return { data, nextCursor: rows.length > opts.limit ? (data.at(-1)?.id ?? null) : null };
   }
   async listItems(sessionId: string, opts: { turnId?: string; afterSeq?: number; limit: number; newestFirst?: boolean }) {
-    const where = ["session_id=?"];
+    const where = ["i.session_id=?", "s.deleted_at_ms IS NULL"];
     const params: unknown[] = [sessionId];
-    if (opts.turnId) { where.push("turn_id=?"); params.push(opts.turnId); }
-    if (opts.afterSeq !== undefined) { where.push("seq>?"); params.push(opts.afterSeq); }
+    if (opts.turnId) { where.push("i.turn_id=?"); params.push(opts.turnId); }
+    if (opts.afterSeq !== undefined) { where.push("i.seq>?"); params.push(opts.afterSeq); }
     params.push(opts.limit);
     // Take the newest rows when asked, then flip back to seq-ascending for the caller.
     const order = opts.newestFirst ? "DESC" : "ASC";
     const [rows] = await this.pool.query<Row[]>(
-      `SELECT body FROM items WHERE ${where.join(" AND ")} ORDER BY seq ${order}, item_id ${order} LIMIT ?`,
+      `SELECT i.body FROM items i
+         JOIN sessions s ON s.session_id=i.session_id
+        WHERE ${where.join(" AND ")} ORDER BY i.seq ${order}, i.item_id ${order} LIMIT ?`,
       params,
     );
     const items = rows.map((r) => parse<Item>(r.body));
     return opts.newestFirst ? items.reverse() : items;
   }
   async getItem(sessionId: string, itemId: string) {
-    const [rows] = await this.pool.query<Row[]>("SELECT body FROM items WHERE item_id=? AND session_id=?", [itemId, sessionId]);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT i.body FROM items i
+         JOIN sessions s ON s.session_id=i.session_id AND s.deleted_at_ms IS NULL
+        WHERE i.item_id=? AND i.session_id=?`,
+      [itemId, sessionId],
+    );
     return rows[0] ? parse<Item>(rows[0].body) : null;
   }
   async listApprovals(sessionId: string, opts: { pendingOnly?: boolean }) {
     const [rows] = await this.pool.query<Row[]>(
-      `SELECT body FROM approvals WHERE session_id=? ${opts.pendingOnly ? "AND status='pending'" : ""} ORDER BY created_at_ms ASC`,
+      `SELECT a.body FROM approvals a
+         JOIN sessions s ON s.session_id=a.session_id AND s.deleted_at_ms IS NULL
+        WHERE a.session_id=? ${opts.pendingOnly ? "AND a.status='pending'" : ""}
+        ORDER BY a.created_at_ms ASC`,
       [sessionId],
     );
     return rows.map((r) => parse<Approval>(r.body));
   }
   async getApproval(sessionId: string, approvalId: string) {
-    const [rows] = await this.pool.query<Row[]>("SELECT body FROM approvals WHERE approval_id=? AND session_id=?", [approvalId, sessionId]);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT a.body FROM approvals a
+         JOIN sessions s ON s.session_id=a.session_id AND s.deleted_at_ms IS NULL
+        WHERE a.approval_id=? AND a.session_id=?`,
+      [approvalId, sessionId],
+    );
     return rows[0] ? parse<Approval>(rows[0].body) : null;
   }
 
@@ -548,30 +690,31 @@ export class MysqlSessionStore implements SessionStore {
   async queryUsage(tenantId: string, q: UsageQuery) {
     // Grouping keys are chosen from a fixed set, never interpolated from input.
     const keyExpr =
-      q.groupBy === "user" ? "user_id"
-      : q.groupBy === "session" ? "session_id"
-      : q.groupBy === "model" ? "CONCAT(provider, '/', model)"
-      : q.groupBy === "day" ? "DATE_FORMAT(FROM_UNIXTIME(created_at_ms/1000), '%Y-%m-%d')"
+      q.groupBy === "user" ? "u.user_id"
+      : q.groupBy === "session" ? "u.session_id"
+      : q.groupBy === "model" ? "CONCAT(u.provider, '/', u.model)"
+      : q.groupBy === "day" ? "DATE_FORMAT(FROM_UNIXTIME(u.created_at_ms/1000), '%Y-%m-%d')"
       : "'total'";
-    const where = ["tenant_id=?"];
+    const where = ["u.tenant_id=?", "s.deleted_at_ms IS NULL"];
     const params: unknown[] = [tenantId];
-    if (q.userId) { where.push("user_id=?"); params.push(q.userId); }
-    if (q.sessionId) { where.push("session_id=?"); params.push(q.sessionId); }
-    if (q.from !== undefined) { where.push("created_at_ms>=?"); params.push(q.from); }
-    if (q.to !== undefined) { where.push("created_at_ms<?"); params.push(q.to); }
+    if (q.userId) { where.push("u.user_id=?"); params.push(q.userId); }
+    if (q.sessionId) { where.push("u.session_id=?"); params.push(q.sessionId); }
+    if (q.from !== undefined) { where.push("u.created_at_ms>=?"); params.push(q.from); }
+    if (q.to !== undefined) { where.push("u.created_at_ms<?"); params.push(q.to); }
     params.push(q.limit);
     const [rows] = await this.pool.query<Row[]>(
       `SELECT ${keyExpr} AS k,
-              COUNT(DISTINCT turn_id) AS turns,
+              COUNT(DISTINCT u.turn_id) AS turns,
               COUNT(*) AS steps,
-              COALESCE(SUM(CAST(JSON_EXTRACT(usage_json,'$.inputTokens') AS UNSIGNED)),0) AS input_tokens,
-              COALESCE(SUM(CAST(JSON_EXTRACT(usage_json,'$.outputTokens') AS UNSIGNED)),0) AS output_tokens,
-              COALESCE(SUM(CAST(JSON_EXTRACT(usage_json,'$.cacheReadTokens') AS UNSIGNED)),0) AS cache_read_tokens,
-              COALESCE(SUM(CAST(JSON_EXTRACT(usage_json,'$.cacheWriteTokens') AS UNSIGNED)),0) AS cache_write_tokens,
-              COALESCE(SUM(CAST(JSON_EXTRACT(usage_json,'$.reasoningTokens') AS UNSIGNED)),0) AS reasoning_tokens,
-              COALESCE(SUM(CAST(JSON_EXTRACT(usage_json,'$.totalTokens') AS UNSIGNED)),0) AS total_tokens,
-              COALESCE(SUM(JSON_EXTRACT(usage_json,'$.costCNY')),0) AS cost
-         FROM usage_ledger
+              COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.inputTokens') AS UNSIGNED)),0) AS input_tokens,
+              COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.outputTokens') AS UNSIGNED)),0) AS output_tokens,
+              COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.cacheReadTokens') AS UNSIGNED)),0) AS cache_read_tokens,
+              COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.cacheWriteTokens') AS UNSIGNED)),0) AS cache_write_tokens,
+              COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.reasoningTokens') AS UNSIGNED)),0) AS reasoning_tokens,
+              COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.totalTokens') AS UNSIGNED)),0) AS total_tokens,
+              COALESCE(SUM(JSON_EXTRACT(u.usage_json,'$.costCNY')),0) AS cost
+         FROM usage_ledger u
+         JOIN sessions s ON s.session_id=u.session_id
         WHERE ${where.join(" AND ")}
         GROUP BY k
         ORDER BY total_tokens DESC, k ASC
@@ -599,7 +742,12 @@ export class MysqlSessionStore implements SessionStore {
   // ---------- idempotency ----------
   async getIdempotencyKey(scope: IdempotencyScope, key: string): Promise<IdempotencyReceipt | null> {
     const [rows] = await this.pool.query<Row[]>(
-      "SELECT value, request_hash, expires_at_ms FROM idempotency_keys WHERE tenant_id=? AND user_id=? AND session_id=? AND idem_key=?",
+      `SELECT i.value, i.request_hash, i.expires_at_ms
+         FROM idempotency_keys i
+         JOIN sessions s
+           ON s.session_id=i.session_id AND s.tenant_id=i.tenant_id AND s.user_id=i.user_id
+          AND s.deleted_at_ms IS NULL
+        WHERE i.tenant_id=? AND i.user_id=? AND i.session_id=? AND i.idem_key=?`,
       [scope.tenantId, scope.userId, scope.sessionId, key],
     );
     const row = rows[0];
@@ -609,6 +757,179 @@ export class MysqlSessionStore implements SessionStore {
       value: parse(row.value),
       expiresAtMs: Number(row.expires_at_ms),
     };
+  }
+
+  async getLifecycleOutbox(
+    topic: LifecycleOutboxRecord["topic"],
+    aggregateId: string,
+    generation: number,
+  ): Promise<LifecycleOutboxRecord | null> {
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT outbox_id, topic, aggregate_id, generation, payload, available_at_ms, attempts, claim_token,
+              lease_until_ms, last_error, completed_at_ms, dead_lettered_at_ms, created_at_ms
+         FROM lifecycle_outbox
+        WHERE topic=? AND aggregate_id=? AND generation=?`,
+      [topic, aggregateId, generation],
+    );
+    const row = rows[0];
+    return row ? rowToLifecycleOutbox(row) : null;
+  }
+
+  async claimLifecycleOutbox(options: import("../types.js").ClaimLifecycleOutboxOptions) {
+    const { topics, leaseUntilMs } = validateClaimLifecycleOutboxOptions(options);
+    if (topics.length === 0) return [];
+    const conn = await this.pool.getConnection();
+    try {
+      // READ COMMITTED reduces next-key/gap-lock contention around this worker queue. SKIP LOCKED
+      // remains deliberately non-blocking and may under-fill a concurrent batch; the next poll
+      // drains any eligible row skipped inside another transaction's LIMIT scan window.
+      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await conn.beginTransaction();
+      const topicPlaceholders = topics.map(() => "?").join(",");
+      const [locked] = await conn.query<Row[]>(
+        `SELECT outbox_id, topic, aggregate_id, generation, payload, available_at_ms, attempts,
+                claim_token, lease_until_ms, last_error, completed_at_ms, dead_lettered_at_ms, created_at_ms
+           FROM lifecycle_outbox
+          WHERE topic IN (${topicPlaceholders})
+            AND available_at_ms IS NOT NULL
+            AND available_at_ms<=?
+            AND completed_at_ms IS NULL
+            AND dead_lettered_at_ms IS NULL
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+          ORDER BY available_at_ms ASC, outbox_id ASC
+          LIMIT ?
+          FOR UPDATE SKIP LOCKED`,
+        [...topics, options.nowMs, options.nowMs, options.limit],
+      );
+      if (locked.length === 0) {
+        await conn.commit();
+        return [];
+      }
+      const ids: number[] = [];
+      const poisonIds: number[] = [];
+      for (const row of locked) {
+        const id = Number(row.outbox_id);
+        assertLifecycleOutboxId(id);
+        try {
+          rowToLifecycleOutbox(row);
+          ids.push(id);
+        } catch {
+          poisonIds.push(id);
+        }
+      }
+      if (poisonIds.length) {
+        const poisonPlaceholders = poisonIds.map(() => "?").join(",");
+        // Corrupt envelopes are deterministic poison. Quarantine them in the same locked
+        // transaction so they cannot starve every valid intent behind the first queue position.
+        await conn.query(
+          `UPDATE lifecycle_outbox
+              SET attempts=attempts+1, claim_token=NULL, lease_until_ms=NULL, available_at_ms=NULL,
+                  last_error='invalid lifecycle outbox envelope', dead_lettered_at_ms=?
+            WHERE outbox_id IN (${poisonPlaceholders})`,
+          [options.nowMs, ...poisonIds],
+        );
+      }
+      if (ids.length === 0) {
+        await conn.commit();
+        return [];
+      }
+      const idPlaceholders = ids.map(() => "?").join(",");
+      await conn.query(
+        `UPDATE lifecycle_outbox
+            SET attempts=attempts+1, claim_token=?, lease_until_ms=?
+          WHERE outbox_id IN (${idPlaceholders})`,
+        [options.claimToken, leaseUntilMs, ...ids],
+      );
+      const [rows] = await conn.query<Row[]>(
+        `SELECT outbox_id, topic, aggregate_id, generation, payload, available_at_ms, attempts,
+                claim_token, lease_until_ms, last_error, completed_at_ms, dead_lettered_at_ms, created_at_ms
+           FROM lifecycle_outbox
+          WHERE outbox_id IN (${idPlaceholders})`,
+        ids,
+      );
+      const byId = new Map(rows.map((row) => [Number(row.outbox_id), rowToLifecycleOutbox(row)]));
+      const claimed = ids.map((id) => {
+        const row = byId.get(id);
+        if (!row) throw new Error(`claimed lifecycle outbox ${id} disappeared inside its transaction`);
+        return row;
+      });
+      await conn.commit();
+      return claimed;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewLifecycleOutboxClaim(
+    outboxId: number,
+    claimToken: string,
+    options: import("../types.js").RenewLifecycleOutboxClaimOptions,
+  ) {
+    const leaseUntilMs = validateRenewLifecycleOutboxClaim(outboxId, claimToken, options.nowMs, options.leaseMs);
+    const [result] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE lifecycle_outbox
+          SET lease_until_ms=GREATEST(lease_until_ms, ?)
+        WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+          AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+      [leaseUntilMs, outboxId, claimToken, options.nowMs],
+    );
+    return result.affectedRows === 1;
+  }
+
+  async completeLifecycleOutbox(outboxId: number, claimToken: string, completedAtMs: number) {
+    validateLifecycleOutboxAck(outboxId, claimToken, completedAtMs);
+    const [result] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE lifecycle_outbox
+          SET completed_at_ms=?, claim_token=NULL, lease_until_ms=NULL, last_error=NULL
+        WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+          AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+      [completedAtMs, outboxId, claimToken, completedAtMs],
+    );
+    return result.affectedRows === 1;
+  }
+
+  async retryLifecycleOutbox(
+    outboxId: number,
+    claimToken: string,
+    options: import("../types.js").RetryLifecycleOutboxOptions,
+  ) {
+    validateLifecycleOutboxAck(outboxId, claimToken, options.failedAtMs);
+    validateRetryLifecycleOutboxOptions(options);
+    const lastError = sanitizeLifecycleOutboxError(options.error);
+    if (options.maxAttempts === undefined) {
+      const [result] = await this.pool.query<mysql.ResultSetHeader>(
+        `UPDATE lifecycle_outbox
+            SET claim_token=NULL, lease_until_ms=NULL, last_error=?, available_at_ms=?
+          WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+            AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+        [lastError, options.availableAtMs, outboxId, claimToken, options.failedAtMs],
+      );
+      return result.affectedRows === 1;
+    }
+    const [result] = await this.pool.query<mysql.ResultSetHeader>(
+      `UPDATE lifecycle_outbox
+          SET claim_token=NULL,
+              lease_until_ms=NULL,
+              last_error=?,
+              available_at_ms=CASE WHEN attempts>=? THEN NULL ELSE ? END,
+              dead_lettered_at_ms=CASE WHEN attempts>=? THEN ? ELSE NULL END
+        WHERE outbox_id=? AND claim_token=? AND lease_until_ms>?
+          AND completed_at_ms IS NULL AND dead_lettered_at_ms IS NULL`,
+      [
+        lastError,
+        options.maxAttempts,
+        options.availableAtMs,
+        options.maxAttempts,
+        options.failedAtMs,
+        outboxId,
+        claimToken,
+        options.failedAtMs,
+      ],
+    );
+    return result.affectedRows === 1;
   }
 
   async close() {

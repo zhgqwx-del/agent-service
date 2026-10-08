@@ -44,6 +44,7 @@ function runnerApp() {
     providers: unreachable<AppDeps["providers"]>("providers"),
     tools: unreachable<AppDeps["tools"]>("tools"),
     runnerId: "contract-test",
+    internalRouterToken: "contract-test-internal-token-0001",
     heartbeatMs: 60_000,
     maxBodyBytes: 1_000_000,
     ready: () => true,
@@ -74,6 +75,7 @@ function registeredOperations() {
   const routes = (runnerApp() as unknown as { routes: RegisteredRoute[] }).routes;
   return routes
     .filter(({ method }) => HTTP_METHODS.has(method.toLowerCase()))
+    .filter(({ path }) => !path.startsWith("/v1/_internal/"))
     .map(({ method, path }) => ({
       method: method.toUpperCase(),
       path: path.replace(/:([^/]+)/g, "{$1}"),
@@ -148,6 +150,20 @@ describe("committed OpenAPI contract", () => {
     expect(document.components?.schemas?.AgentDefinitionRequest).toMatchObject({
       properties: { mcpServers: { maxItems: 0 }, skills: { maxItems: 0 } },
     });
+    expect(document.components?.schemas?.ErrorBody).toMatchObject({
+      properties: {
+        error: {
+          properties: {
+            code: { enum: expect.arrayContaining(["session_has_children"]) },
+          },
+        },
+      },
+    });
+    expect(document.components?.schemas?.Capabilities).toMatchObject({
+      properties: {
+        protocolVersion: { enum: ["2026-10-08"] },
+      },
+    });
   });
 
   it("matches all 36 implemented runner routes plus the OpenAPI route in both directions", () => {
@@ -159,5 +175,14 @@ describe("committed OpenAPI contract", () => {
     expect(registered).toHaveLength(37);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
+  });
+
+  it("keeps the versioned router-to-runner tombstone route out of the public OpenAPI/SDK", () => {
+    const routes = (runnerApp() as unknown as { routes: RegisteredRoute[] }).routes
+      .filter(({ method }) => HTTP_METHODS.has(method.toLowerCase()))
+      .map(({ method, path }) => ({ method: method.toUpperCase(), path }));
+
+    expect(routes).toContainEqual({ method: "POST", path: "/v1/_internal/session-tombstone/:id" });
+    expect(Object.keys(document.paths).some((path) => path.startsWith("/v1/_internal/"))).toBe(false);
   });
 });

@@ -188,8 +188,8 @@ export type paths = {
         readonly put?: never;
         readonly post?: never;
         /**
-         * Soft-delete a session
-         * @description Hides the session from normal access. Durable child records remain until the retention/purge lifecycle is implemented.
+         * Tombstone a session
+         * @description Idempotently tombstones a visible or archived idle session through the lease/fence path. A retry by the same owner returns 204 without another event or generation; an active session returns session_busy and a parent with non-deleted children returns session_has_children. After success all normal resource APIs return 404. Physical purge remains disabled until retention policy is configured.
          */
         readonly delete: operations["deleteSession"];
         readonly options?: never;
@@ -772,7 +772,7 @@ export type components = {
         readonly ErrorBody: {
             readonly error: {
                 /** @enum {string} */
-                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_lease_conflict" | "idempotency_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
+                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_has_children" | "session_lease_conflict" | "idempotency_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
                 readonly details?: unknown;
                 readonly message: string;
                 readonly retryable?: boolean;
@@ -823,6 +823,13 @@ export type components = {
             readonly sessionId: string;
             /** @enum {string} */
             readonly type: "session/unarchived";
+        } | {
+            readonly deletionGeneration: number;
+            readonly emittedAtMs: number;
+            readonly seq: number;
+            readonly sessionId: string;
+            /** @enum {string} */
+            readonly type: "session/deleted";
         } | {
             readonly emittedAtMs: number;
             readonly seq: number;
@@ -2891,7 +2898,7 @@ export interface operations {
         };
         readonly requestBody?: never;
         readonly responses: {
-            /** @description Session hidden. */
+            /** @description Session tombstoned. */
             readonly 204: {
                 headers: {
                     readonly [name: string]: unknown;

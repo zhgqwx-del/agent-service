@@ -18,6 +18,8 @@ export interface RunnerTarget {
   healthy: boolean;
   lastCheckMs: number;
   consecutiveFailures: number;
+  /** Last capability document from the same probe that marked this target healthy. */
+  capabilities?: Capabilities;
 }
 
 export interface RunnerRegistryOptions {
@@ -125,6 +127,22 @@ export class RunnerRegistry {
   }
 
   /**
+   * Lifecycle writes are fleet semantics, not a per-request experiment. During a rolling upgrade
+   * the router activates one only after every healthy runner advertises it; otherwise consistent
+   * hashing or an existing owner could select an old implementation.
+   */
+  allHealthySupportLifecycle(feature: Capabilities["features"]["sessionLifecycle"][number]): boolean {
+    const healthy = this.list().filter((target) => target.healthy);
+    return healthy.length > 0 && healthy.every((target) => target.capabilities?.features.sessionLifecycle.includes(feature));
+  }
+
+  /** Revalidate the concrete destination immediately before a capability-gated write is sent. */
+  supportsLifecycle(url: string, feature: Capabilities["features"]["sessionLifecycle"][number]): boolean {
+    const target = this.targets.get(url.replace(/\/+$/, ""));
+    return !!target?.healthy && !!target.capabilities?.features.sessionLifecycle.includes(feature);
+  }
+
+  /**
    * A runner address as reported by `X-Owner` (host:port) mapped back onto a configured target.
    * Matching on the port alone as a fallback covers the common misconfiguration where a runner advertises
    * a wildcard or container-internal host (`0.0.0.0:8787`) that never string-matches the configured URL.
@@ -163,9 +181,11 @@ export class RunnerRegistry {
           if (!parsed?.success || parsed.data.service !== "agent-runner") {
             throw new Error("runner protocol is incompatible");
           }
+          t.capabilities = parsed.data;
           t.healthy = true;
           t.consecutiveFailures = 0;
         } catch {
+          t.capabilities = undefined;
           t.consecutiveFailures += 1;
           t.healthy = false;
         }

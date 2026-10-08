@@ -1,5 +1,14 @@
 import { Hono } from "hono";
-import { Capabilities, OPENAPI_DOCUMENT, PROTOCOL_VERSION, isCanonicalId } from "@agent-service/protocol";
+import {
+  Capabilities,
+  INTERNAL_TOMBSTONE_ACK_HEADER,
+  INTERNAL_TOMBSTONE_ACK_VALUE,
+  INTERNAL_TOMBSTONE_PATH_PREFIX,
+  INTERNAL_ROUTER_TOKEN_HEADER,
+  OPENAPI_DOCUMENT,
+  PROTOCOL_VERSION,
+  isCanonicalId,
+} from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
 
 export interface RouterAppDeps {
@@ -14,6 +23,10 @@ export interface RouterAppDeps {
   adminToken?: string;
   /** false once draining, so the load balancer stops sending new work */
   ready?: () => boolean;
+  /** Explicit deployment activation gate, in addition to the observed fleet capability. */
+  tombstoneEnabled?: () => boolean;
+  /** Shared runner-internal credential. Omission keeps destructive routing disabled. */
+  internalRunnerToken?: string;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -39,14 +52,16 @@ function sessionIdFrom(pathname: string): string | undefined {
 }
 
 /** Hop-by-hop headers must not be forwarded, and the upstream sets its own content headers. */
-const STRIP_REQUEST = new Set(["host", "connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-authorization", "te", "content-length"]);
+const STRIP_REQUEST = new Set(["host", "connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-authorization", "te", "content-length", INTERNAL_ROUTER_TOKEN_HEADER]);
 /** `x-owner` is internal topology: the runner needs it, an external client must not see it. */
-const STRIP_RESPONSE = new Set(["connection", "keep-alive", "transfer-encoding", "upgrade", "content-encoding", "content-length", "x-owner"]);
+const STRIP_RESPONSE = new Set(["connection", "keep-alive", "transfer-encoding", "upgrade", "content-encoding", "content-length", "x-owner", INTERNAL_TOMBSTONE_ACK_HEADER]);
 
 /** Methods that are safe to send again after a transport failure, with no risk of doing the work twice. */
 const REPLAYABLE = new Set(["GET", "HEAD", "OPTIONS"]);
 /** The runner currently implements Idempotency-Key only for this collection POST. */
 const IDEMPOTENT_TURN_POST = /^\/v1\/sessions\/[^/]+\/turns\/?$/;
+/** Fenced tombstoning is idempotent even when the first 204 was lost in transit. */
+const IDEMPOTENT_SESSION_DELETE = /^\/v1\/sessions\/[^/]+\/?$/;
 
 /**
  * agent-router: stateless. It authenticates nothing itself (the runner is the authority) and holds no
@@ -58,6 +73,11 @@ export function createRouterApp(deps: RouterAppDeps) {
   const log = deps.logger ?? console;
   const maxAttempts = deps.maxAttempts ?? 2;
   const maxBodyBytes = deps.maxBodyBytes ?? 1_000_000;
+  const tombstoneAvailable = () => (
+    !!deps.internalRunnerToken
+    && (deps.tombstoneEnabled?.() ?? false)
+    && deps.registry.allHealthySupportLifecycle("tombstone")
+  );
 
   app.get("/healthz", (c) => c.text("ok"));
   // Serve the immutable contract locally. Forwarding this endpoint would make API discovery depend
@@ -79,7 +99,14 @@ export function createRouterApp(deps: RouterAppDeps) {
           // /openapi.json. Deployment still drains old runners before promoting the new router.
           const parsed = Capabilities.safeParse(await res.json());
           if (parsed.success) {
-            return c.json({ ...parsed.data, service: "agent-router" } satisfies Capabilities);
+            const lifecycle = parsed.data.features.sessionLifecycle.filter(
+              (feature) => feature !== "tombstone" || tombstoneAvailable(),
+            );
+            return c.json({
+              ...parsed.data,
+              service: "agent-router",
+              features: { ...parsed.data.features, sessionLifecycle: lifecycle },
+            } satisfies Capabilities);
           }
         }
       } catch {
@@ -112,8 +139,31 @@ export function createRouterApp(deps: RouterAppDeps) {
 
   app.all("*", async (c) => {
     const url = new URL(c.req.url);
+    if (url.pathname === INTERNAL_TOMBSTONE_PATH_PREFIX || url.pathname.startsWith(`${INTERNAL_TOMBSTONE_PATH_PREFIX}/`)) {
+      return c.json({ error: { code: "not_found", message: "not found" } }, 404);
+    }
     const sessionId = sessionIdFrom(url.pathname);
     const method = c.req.method;
+    const isTombstoneDelete = method === "DELETE"
+      && !!sessionId
+      && IDEMPOTENT_SESSION_DELETE.test(url.pathname);
+
+    // The new router is intentionally deployed before new runners. It keeps the rest of the API
+    // available during that rollout, but does not activate tombstoning until the healthy fleet is
+    // homogeneous. This prevents one session from receiving old direct-delete semantics merely
+    // because its owner or hash-ring target has not been upgraded yet.
+    if (
+      isTombstoneDelete
+      && !tombstoneAvailable()
+    ) {
+      return c.json({
+        error: {
+          code: "draining",
+          message: "session deletion is unavailable while the runner fleet is upgrading",
+          retryable: true,
+        },
+      }, 503);
+    }
 
     // Buffer the body once (a re-route replays it) but refuse an unbounded upload first: without this the
     // router OOMs before the runner's own body limit is ever consulted.
@@ -126,6 +176,15 @@ export function createRouterApp(deps: RouterAppDeps) {
       body = read.bytes;
     }
 
+    // Never send a capability-gated destructive request to the legacy public DELETE route. If a
+    // configured target is accidentally a load-balancer and chooses an old pod after a new-pod
+    // health probe, the versioned path fails closed instead of executing the old delete semantics.
+    const upstreamUrl = new URL(url);
+    const upstreamMethod = isTombstoneDelete ? "POST" : method;
+    if (isTombstoneDelete) upstreamUrl.pathname = `${INTERNAL_TOMBSTONE_PATH_PREFIX}/${sessionId}`;
+    const upstreamHeaders = requestHeaders(c.req.raw.headers);
+    if (isTombstoneDelete) upstreamHeaders.set(INTERNAL_ROUTER_TOKEN_HEADER, deps.internalRunnerToken!);
+
     const tried = new Set<string>();
     let target = (sessionId ? await deps.registry.owner(sessionId) : undefined) ?? (sessionId ? deps.registry.candidate(sessionId) : deps.registry.anyHealthy());
     if (!target) return c.json({ error: { code: "draining", message: "no healthy runner available" } }, 503);
@@ -133,23 +192,52 @@ export function createRouterApp(deps: RouterAppDeps) {
     // MAX_ATTEMPTS is the total upstream-send budget, including the initial request and any 409 route.
     let reroutes = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // owner() and every upstream attempt cross an async boundary. Revalidate both the fleet and
+      // the selected destination here so a health probe cannot admit an old runner between the
+      // entry gate above and the irreversible lifecycle write.
+      if (
+        isTombstoneDelete
+        && (!tombstoneAvailable() || !deps.registry.supportsLifecycle(target, "tombstone"))
+      ) {
+        return c.json({
+          error: {
+            code: "draining",
+            message: "session deletion is unavailable while the runner fleet is upgrading",
+            retryable: true,
+          },
+        }, 503);
+      }
       tried.add(target);
       let res: Response;
       try {
-        res = await forward(target, url, method, requestHeaders(c.req.raw.headers), body, deps.upstreamHeaderTimeoutMs);
+        res = await forward(target, upstreamUrl, upstreamMethod, upstreamHeaders, body, deps.upstreamHeaderTimeoutMs);
       } catch (err) {
         deps.registry.markFailure(target);
-        log.warn(`[router] ${target} unreachable: ${(err as Error).message}`);
+        const name = err instanceof Error ? err.name : "unknown error";
+        log.warn(`[router] ${target} unreachable (${name})`);
         // Only this exact POST is deduplicated by the runner. A caller-provided Idempotency-Key on an
         // agent/session/api-key POST does not magically make that endpoint safe to replay.
         const safeToRetry = REPLAYABLE.has(method) ||
-          (method === "POST" && !!sessionId && IDEMPOTENT_TURN_POST.test(url.pathname) && !!c.req.header("idempotency-key")?.trim());
+          (method === "POST" && !!sessionId && IDEMPOTENT_TURN_POST.test(url.pathname) && !!c.req.header("idempotency-key")?.trim()) ||
+          (method === "DELETE" && !!sessionId && IDEMPOTENT_SESSION_DELETE.test(url.pathname));
         const next = safeToRetry ? pickOther(deps, sessionId, tried) : undefined;
         if (!next || attempt >= maxAttempts) {
           return c.json({ error: { code: "provider_error", message: "runner unreachable", retryable: safeToRetry } }, 502);
         }
         target = next;
         continue;
+      }
+
+
+      if (isTombstoneDelete && res.headers.get(INTERNAL_TOMBSTONE_ACK_HEADER) !== INTERNAL_TOMBSTONE_ACK_VALUE) {
+        await res.body?.cancel().catch(() => {});
+        return c.json({
+          error: {
+            code: "draining",
+            message: "session deletion reached a runner without the tombstone-v1 internal contract",
+            retryable: true,
+          },
+        }, 503);
       }
 
       // The runner tells us who really owns this session; follow it exactly once.

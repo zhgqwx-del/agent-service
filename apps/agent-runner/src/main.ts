@@ -1,14 +1,16 @@
 import { serve } from "@hono/node-server";
-import { PiEngine, PiSummariser, SessionHost, StaticToolRegistry, builtinTools } from "@agent-service/core";
+import { LifecycleOutboxDispatcher, PiEngine, PiSummariser, SessionHost, StaticToolRegistry, builtinTools } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService, PROVIDER_PRESETS } from "@agent-service/providers";
-import { FsBlobStore, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, MysqlSessionStore, RedisEventBus, RedisLeaseStore, type EventBus, type LeaseStore, type SessionStore } from "@agent-service/store";
+import { FsBlobStore, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, MysqlSessionStore, RedisEventBus, RedisLeaseStore, type EventBus, type LeaseStore, type LifecycleOutboxStore, type SessionStore } from "@agent-service/store";
 import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
 import { loadConfig } from "./config.js";
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
-  const store: SessionStore = cfg.STORE === "mysql" ? await MysqlSessionStore.connect({ url: cfg.MYSQL_URL }) : new MemorySessionStore();
+  const store: SessionStore & LifecycleOutboxStore = cfg.STORE === "mysql"
+    ? await MysqlSessionStore.connect({ url: cfg.MYSQL_URL })
+    : new MemorySessionStore();
   const lease: LeaseStore = cfg.REDIS_URL ? new RedisLeaseStore(cfg.REDIS_URL) : new MemoryLeaseStore();
   const bus: EventBus = cfg.REDIS_URL ? new RedisEventBus(cfg.REDIS_URL) : new MemoryEventBus();
   void new FsBlobStore(cfg.BLOB_DIR);
@@ -48,11 +50,20 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     summariser: new PiSummariser(providers.models),
     config: { runnerId: cfg.RUNNER_ID, runnerAddr: cfg.runnerAddr, leaseTtlMs: cfg.LEASE_TTL_MS, leaseHoldMs: cfg.LEASE_HOLD_MS, approvalTtlMs: cfg.APPROVAL_TTL_MS },
   });
+  const lifecycleOutbox = new LifecycleOutboxDispatcher({ store, bus }, {
+    pollIntervalMs: cfg.LIFECYCLE_OUTBOX_POLL_MS,
+    leaseMs: cfg.LIFECYCLE_OUTBOX_LEASE_MS,
+    batchSize: cfg.LIFECYCLE_OUTBOX_BATCH_SIZE,
+    retryBaseMs: cfg.LIFECYCLE_OUTBOX_RETRY_BASE_MS,
+    retryMaxMs: cfg.LIFECYCLE_OUTBOX_RETRY_MAX_MS,
+  });
+  lifecycleOutbox.start();
 
   let ready = true;
   const app = createApp({
     store, host, providers, tools,
     runnerId: cfg.RUNNER_ID,
+    internalRouterToken: cfg.INTERNAL_ROUTER_TOKEN,
     heartbeatMs: cfg.SSE_HEARTBEAT_MS,
     maxBodyBytes: cfg.MAX_BODY_BYTES,
     ready: () => ready,
@@ -65,6 +76,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     console.log(`[runner ${cfg.RUNNER_ID}] ${signal}: draining`);
     ready = false;
     await host.drain(30_000);
+    await lifecycleOutbox.stop();
     server.close();
     await Promise.all([store.close(), lease.close(), bus.close()]);
     process.exit(0);
@@ -73,7 +85,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGINT", () => void shutdown("SIGINT"));
 
   console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"}`);
-  return { app, server, host, store, lease, bus, cfg, close: () => shutdown("close") };
+  return { app, server, host, lifecycleOutbox, store, lease, bus, cfg, close: () => shutdown("close") };
 }
 
 if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file://").href) {

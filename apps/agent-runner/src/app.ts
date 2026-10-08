@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { Hono, type MiddlewareHandler } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
@@ -18,6 +19,9 @@ import {
   EventStreamHeaders,
   EventStreamQuery,
   ItemListQuery,
+  INTERNAL_TOMBSTONE_ACK_HEADER,
+  INTERNAL_TOMBSTONE_ACK_VALUE,
+  INTERNAL_ROUTER_TOKEN_HEADER,
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
   Pagination,
@@ -49,6 +53,7 @@ export interface AppDeps {
   providers: ProviderService;
   tools: ToolRegistry;
   runnerId: string;
+  internalRouterToken: string;
   heartbeatMs: number;
   maxBodyBytes: number;
   ready: () => boolean;
@@ -68,6 +73,13 @@ const parse = async <T extends z.ZodTypeAny>(schema: T, body: unknown): Promise<
   return r.data;
 };
 const json = (c: { req: { json: () => Promise<unknown> } }) => c.req.json().catch(() => ({}));
+
+function internalTokenMatches(received: string | undefined, expected: string): boolean {
+  if (!received) return false;
+  const left = Buffer.from(received);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
 
 export function createApp(deps: AppDeps) {
   const app = new Hono<AuthEnv>();
@@ -100,7 +112,7 @@ export function createApp(deps: AppDeps) {
         streaming: true,
         replay: { persistedEvents: true, hotWindowMs: 3_600_000 },
         approvals: true,
-        sessionLifecycle: ["archive", "unarchive"],
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -118,6 +130,14 @@ export function createApp(deps: AppDeps) {
    */
   v1.use("/sessions/:id/*", validateIdParams);
   v1.use("/sessions/:id", validateIdParams);
+  v1.use("/_internal/session-tombstone/:id", async (c, next) => {
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) {
+      throw new ApiError("not_found", "not found");
+    }
+    c.header(INTERNAL_TOMBSTONE_ACK_HEADER, INTERNAL_TOMBSTONE_ACK_VALUE);
+    await next();
+  });
+  v1.use("/_internal/session-tombstone/:id", validateIdParams);
   v1.use("/agents/:id", validateIdParams);
   // Reject oversized bodies before they are buffered or parsed.
   v1.use("*", bodyLimit({ maxSize: deps.maxBodyBytes, onError: () => { throw new ApiError("invalid_request", `request body exceeds ${deps.maxBodyBytes} bytes`); } }));
@@ -241,11 +261,14 @@ export function createApp(deps: AppDeps) {
     return c.json(await deps.store.listSessions(c.get("tenantId"), { userId: caller || q.userId, cursor: q.cursor, limit: q.limit, includeArchived: q.includeArchived }));
   });
   v1.get("/sessions/:id", async (c) => c.json(await deps.host.getSession(requireUser(c), c.req.param("id"))));
+  // Router-only, versioned destructive path. A mixed backend containing an older runner cannot
+  // accidentally execute legacy public DELETE semantics because that binary does not own this path.
+  v1.post("/_internal/session-tombstone/:id", async (c) => {
+    await deps.host.deleteSession(requireUser(c), c.req.param("id"));
+    return c.body(null, 204);
+  });
   v1.delete("/sessions/:id", async (c) => {
-    // getSession enforces ownership first: deleting by tenant alone would let one user delete another's.
-    const session = await deps.host.getSession(requireUser(c), c.req.param("id"));
-    const ok = await deps.store.deleteSession(session.tenantId, session.id);
-    if (!ok) throw new ApiError("not_found", "session not found");
+    await deps.host.deleteSession(requireUser(c), c.req.param("id"));
     return c.body(null, 204);
   });
   v1.post("/sessions/:id/compact", async (c) => {
@@ -305,6 +328,11 @@ export function createApp(deps: AppDeps) {
         try {
           return await deps.host.subscribe(principal, sessionId, afterSeq, (e) => {
             send(e);
+            if (e.type === "session/deleted") {
+              clearTimeout(fallback);
+              close();
+              return;
+            }
             if (e.type === "turn/completed" && e.turn.id === turnId) {
               completed = true;
               // The idle status is published right after, but a fenced-out turn never writes it.
@@ -375,7 +403,13 @@ export function createApp(deps: AppDeps) {
     const exclude = parseExclude(query.exclude);
     return sseResponse(
       c,
-      (send) => deps.host.subscribe(principal, sessionId, after, send, { exclude }),
+      (send, close) => deps.host.subscribe(principal, sessionId, after, (event) => {
+        send(event);
+        // A tombstone is the final event visible to an already-established subscriber. New
+        // subscriptions fail ownership lookup with 404, so keeping this stream alive would only
+        // emit heartbeats for a resource the caller can no longer access.
+        if (event.type === "session/deleted") close();
+      }, { exclude }),
       { heartbeatMs: deps.heartbeatMs, sessionId },
     );
   });

@@ -19,6 +19,8 @@ const Env = z.object({
   BOOTSTRAP_TENANT_ID: z.string().default("t_dev"),
   /** mint the first admin key for this tenant if it has none; subsequent boots do not mint another */
   ADMIN_BOOTSTRAP_TENANT: z.string().optional(),
+  /** Shared only with routers; protects versioned runner-internal lifecycle routes. */
+  INTERNAL_ROUTER_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
   NODE_ENV: z.string().optional(),
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(1_000_000),
   /** platform provider preset enabled for all tenants, keyed from API_KEY */
@@ -30,10 +32,21 @@ const Env = z.object({
   LEASE_HOLD_MS: z.coerce.number().int().default(60_000),
   APPROVAL_TTL_MS: z.coerce.number().int().default(10 * 60_000),
   SSE_HEARTBEAT_MS: z.coerce.number().int().default(10_000),
+  LIFECYCLE_OUTBOX_POLL_MS: z.coerce.number().int().positive().default(250),
+  LIFECYCLE_OUTBOX_LEASE_MS: z.coerce.number().int().positive().default(10_000),
+  LIFECYCLE_OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(50),
+  LIFECYCLE_OUTBOX_RETRY_BASE_MS: z.coerce.number().int().positive().default(250),
+  LIFECYCLE_OUTBOX_RETRY_MAX_MS: z.coerce.number().int().positive().default(60_000),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
 type ParsedConfig = z.infer<typeof Env>;
-export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID"> & { RUNNER_ID: string; runnerAddr: string };
+export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOKEN"> & {
+  RUNNER_ID: string;
+  INTERNAL_ROUTER_TOKEN: string;
+  runnerAddr: string;
+};
+
+const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
 
 const WILDCARD_HOSTS = new Set(["0.0.0.0", "::", "[::]"]);
 
@@ -68,10 +81,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (production && !c.RUNNER_ADDR) {
     throw new Error("RUNNER_ADDR is required in production and must be reachable by the router and peer runners");
   }
+  if (production && !c.INTERNAL_ROUTER_TOKEN) {
+    throw new Error("INTERNAL_ROUTER_TOKEN is required in production");
+  }
   if (!c.RUNNER_ADDR && WILDCARD_HOSTS.has(c.RUNNER_HOST)) {
     throw new Error("RUNNER_ADDR is required when RUNNER_HOST is a wildcard bind address");
   }
   const runnerAddr = validateAdvertisedAddress(c.RUNNER_ADDR ?? `${c.RUNNER_HOST}:${c.RUNNER_PORT}`);
   const runnerId = c.RUNNER_ID ?? (production ? `runner-${randomUUID()}` : `runner-${process.pid}`);
-  return { ...c, RUNNER_ID: runnerId, runnerAddr };
+  return { ...c, INTERNAL_ROUTER_TOKEN: c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN, RUNNER_ID: runnerId, runnerAddr };
 }

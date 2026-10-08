@@ -1,7 +1,12 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION } from "@agent-service/protocol";
+import {
+  INTERNAL_TOMBSTONE_ACK_HEADER,
+  INTERNAL_TOMBSTONE_ACK_VALUE,
+  INTERNAL_TOMBSTONE_PATH_PREFIX,
+  PROTOCOL_VERSION,
+} from "@agent-service/protocol";
 import { createRouterApp } from "../src/app.js";
 import type { RunnerRegistry, RunnerTarget } from "../src/registry.js";
 
@@ -11,6 +16,7 @@ import type { RunnerRegistry, RunnerTarget } from "../src/registry.js";
  */
 
 const SID = "sess_019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b";
+const INTERNAL_TOKEN = "router-test-internal-token-000001";
 let servers: Server[] = [];
 afterEach(async () => {
   // closeAllConnections first: keep-alive sockets keep `close()` pending forever otherwise, and the
@@ -55,7 +61,10 @@ async function upstream(reply: (req: { path: string; method: string; body: strin
   return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests, state };
 }
 
-function fakeRegistry(targets: string[], opts: { owner?: string; healthy?: (url: string) => boolean } = {}): RunnerRegistry {
+function fakeRegistry(
+  targets: string[],
+  opts: { owner?: string; healthy?: (url: string) => boolean; tombstone?: boolean; targetTombstone?: boolean } = {},
+): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
   let rr = 0;
   const reg = {
@@ -66,6 +75,8 @@ function fakeRegistry(targets: string[], opts: { owner?: string; healthy?: (url:
       const healthy = list().filter((t) => t.healthy);
       return healthy.length ? healthy[rr++ % healthy.length]!.url : undefined;
     },
+    allHealthySupportLifecycle: () => opts.tombstone ?? true,
+    supportsLifecycle: () => opts.targetTombstone ?? opts.tombstone ?? true,
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
     routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
@@ -197,6 +208,111 @@ describe("failure handling", () => {
     expect(otherAlive.requests).toHaveLength(0);
   });
 
+  it("retries only the exact idempotent session DELETE after a transport failure", async () => {
+    const dead = "http://127.0.0.1:1";
+    const alive = await upstream(() => ({
+      status: 204,
+      headers: { [INTERNAL_TOMBSTONE_ACK_HEADER]: INTERNAL_TOMBSTONE_ACK_VALUE },
+      body: "",
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([dead, alive.url], { owner: dead }),
+      tombstoneEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    const deleted = await app.request(`/v1/sessions/${SID}`, { method: "DELETE" });
+    expect(deleted.status).toBe(204);
+    expect(deleted.headers.get(INTERNAL_TOMBSTONE_ACK_HEADER)).toBeNull();
+    expect(alive.requests).toHaveLength(1);
+    expect(alive.requests[0]).toMatchObject({
+      method: "POST",
+      path: `${INTERNAL_TOMBSTONE_PATH_PREFIX}/${SID}`,
+      headers: { "x-agent-service-internal-token": INTERNAL_TOKEN },
+    });
+
+    // A DELETE on a child resource has no tombstone idempotency contract and must not be replayed.
+    const nestedAlive = await upstream(() => ({ status: 204, body: "" }));
+    const nested = createRouterApp({ registry: fakeRegistry([dead, nestedAlive.url], { owner: dead }), logger: silent });
+    expect((await nested.request(`/v1/sessions/${SID}/items`, { method: "DELETE" })).status).toBe(502);
+    expect(nestedAlive.requests).toHaveLength(0);
+
+    // Nor does this rule make unrelated resource deletion replayable.
+    const providerAlive = await upstream(() => ({ status: 204, body: "" }));
+    const provider = createRouterApp({ registry: fakeRegistry([dead, providerAlive.url]), logger: silent });
+    expect((await provider.request("/v1/providers/mine", { method: "DELETE" })).status).toBe(502);
+    expect(providerAlive.requests).toHaveLength(0);
+  });
+
+  it("rechecks the tombstone fleet gate after the asynchronous owner lookup", async () => {
+    const target = await upstream(() => ({ status: 204, body: "" }));
+    let fleetSupportsTombstone = true;
+    const registry = fakeRegistry([target.url]);
+    registry.owner = async () => {
+      fleetSupportsTombstone = false;
+      return target.url;
+    };
+    registry.allHealthySupportLifecycle = () => fleetSupportsTombstone;
+
+    const app = createRouterApp({ registry, tombstoneEnabled: () => true, internalRunnerToken: INTERNAL_TOKEN, logger: silent });
+    const response = await app.request(`/v1/sessions/${SID}`, { method: "DELETE" });
+
+    expect(response.status).toBe(503);
+    expect(target.requests).toHaveLength(0);
+  });
+
+  it("fails closed when the selected destination no longer has the tombstone capability", async () => {
+    const target = await upstream(() => ({
+      status: 204,
+      headers: { [INTERNAL_TOMBSTONE_ACK_HEADER]: INTERNAL_TOMBSTONE_ACK_VALUE },
+      body: "",
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([target.url], { tombstone: true, targetTombstone: false }),
+      tombstoneEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    expect((await app.request(`/v1/sessions/${SID}`, { method: "DELETE" })).status).toBe(503);
+    expect(target.requests).toHaveLength(0);
+  });
+
+  it("fails closed when a target does not acknowledge the versioned internal tombstone contract", async () => {
+    const legacyBehindBalancer = await upstream(() => ({ status: 404, body: "{}" }));
+    const app = createRouterApp({
+      registry: fakeRegistry([legacyBehindBalancer.url]),
+      tombstoneEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    const response = await app.request(`/v1/sessions/${SID}`, { method: "DELETE" });
+    expect(response.status).toBe(503);
+    expect(legacyBehindBalancer.requests[0]).toMatchObject({
+      method: "POST",
+      path: `${INTERNAL_TOMBSTONE_PATH_PREFIX}/${SID}`,
+    });
+  });
+
+  it("never forwards a client request to the runner-internal tombstone path", async () => {
+    const target = await upstream(() => ({ status: 204, body: "" }));
+    const app = createRouterApp({
+      registry: fakeRegistry([target.url]),
+      tombstoneEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    const response = await app.request(`${INTERNAL_TOMBSTONE_PATH_PREFIX}/${SID}`, {
+      method: "POST",
+      headers: { "x-agent-service-internal-token": INTERNAL_TOKEN },
+    });
+    expect(response.status).toBe(404);
+    expect(target.requests).toHaveLength(0);
+  });
+
   it("treats maxAttempts as the total number of upstream sends", async () => {
     const a = await upstream(() => "drop");
     const b = await upstream(() => "drop");
@@ -269,12 +385,66 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
-    const app = createRouterApp({ registry: fakeRegistry([a.url]), logger: silent });
-    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[] } };
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const app = createRouterApp({
+      registry: fakeRegistry([a.url]),
+      tombstoneEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[] } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
+    expect(caps.features.sessionLifecycle).toEqual(["archive", "unarchive", "tombstone"]);
+  });
+
+  it("withholds tombstone and rejects DELETE until every healthy runner supports it", async () => {
+    const a = await upstream(() => ({
+      body: JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        service: "agent-runner",
+        features: {
+          streaming: true,
+          replay: { persistedEvents: true, hotWindowMs: 1 },
+          approvals: true,
+          sessionLifecycle: ["archive", "unarchive", "tombstone"],
+          dynamicTools: true,
+          mcp: [],
+          skills: false,
+          sandbox: ["none"],
+          byok: true,
+        },
+      }),
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([a.url], { tombstone: false }),
+      tombstoneEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+
+    const capabilities = await (await app.request("/v1/capabilities")).json() as {
+      features: { sessionLifecycle: string[] };
+    };
+    expect(capabilities.features.sessionLifecycle).toEqual(["archive", "unarchive"]);
+    expect((await app.request(`/v1/sessions/${SID}`, { method: "DELETE" })).status).toBe(503);
+    expect(a.requests).toHaveLength(1);
+
+    const explicitlyDisabled = createRouterApp({
+      registry: fakeRegistry([a.url]),
+      tombstoneEnabled: () => false,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    expect((await explicitlyDisabled.request(`/v1/sessions/${SID}`, { method: "DELETE" })).status).toBe(503);
+    const omittedGate = createRouterApp({
+      registry: fakeRegistry([a.url]),
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    expect((await omittedGate.request(`/v1/sessions/${SID}`, { method: "DELETE" })).status).toBe(503);
+    expect(a.requests).toHaveLength(1);
   });
 
   it("does not publish capabilities from a runner on an older protocol contract", async () => {

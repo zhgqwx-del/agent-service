@@ -29,6 +29,7 @@ import {
   IdempotencyReplayError,
   SessionArchivedError,
   SessionGoneError,
+  SessionHasChildrenError,
   SessionLifecycleBusyError,
 } from "@agent-service/store";
 import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineRun, EngineSink, ResolvedModel, Summariser } from "../engine/types.js";
@@ -257,7 +258,18 @@ export class SessionHost {
       updatedAtMs: now,
       metadata: req.metadata ?? {},
     };
-    const r = await this.deps.store.createSession(session);
+    let r;
+    try {
+      r = await this.deps.store.createSession(session);
+    } catch (err) {
+      // The optimistic parent read above is for a useful early error. The store rechecks/locks the
+      // parent in the creation transaction so a concurrent parent DELETE cannot leave a dangling
+      // child; translate that authoritative race result without creating an existence oracle.
+      if (err instanceof SessionGoneError && req.parentSessionId) {
+        throw new ApiError("not_found", "parent session not found");
+      }
+      throw err;
+    }
     await this.publishAll(session.id, r.events);
     return { ...session, lastSeq: r.lastSeq };
   }
@@ -298,6 +310,139 @@ export class SessionHost {
   /** Unarchive uses the same lease/fence path so it cannot race another owner or a new turn. */
   async unarchiveSession(principal: Principal, sessionId: string): Promise<Session> {
     return this.serialiseSessionStart(sessionId, () => this.setArchiveStateLocked(principal, sessionId, false));
+  }
+
+  /**
+   * DELETE is an irreversible-to-the-user, fenced lifecycle transition. It deliberately only records
+   * a tombstone and an outbox intent: physical erasure remains disabled until retention, legal-hold
+   * and billing policies have been explicitly configured.
+   */
+  async deleteSession(principal: Principal, sessionId: string): Promise<void> {
+    return this.serialiseSessionStart(sessionId, () => this.deleteSessionLocked(principal, sessionId));
+  }
+
+  private async deleteSessionLocked(principal: Principal, sessionId: string): Promise<void> {
+    if (!principal.userId) throw new ApiError("unauthorized", "an end-user identity is required to delete a session");
+    let lifecycle = await this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, sessionId);
+    if (!lifecycle) throw new ApiError("not_found", "session not found");
+    // A tombstone is idempotent for its owner during the retention window. Do not acquire a new
+    // lease or append another event/outbox row for a retry whose 204 response was lost.
+    if (lifecycle.deletedAtMs !== undefined) return;
+
+    let session = lifecycle.session;
+    if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot delete while a turn is active");
+
+    this.clearHold(sessionId);
+    const lease = await this.deps.lease.acquire(sessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
+    if (!lease.ok) {
+      throw new ApiError("session_lease_conflict", "session owned by another runner", {
+        ownerId: lease.ownerId,
+        ownerAddr: lease.ownerAddr,
+      });
+    }
+    const leaseGuard = this.startLeaseGuard(sessionId);
+    try {
+      await this.claimSessionFence(session, lease.fence, leaseGuard);
+      lifecycle = await leaseGuard.wait(
+        this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, sessionId),
+      );
+      if (!lifecycle) throw new ApiError("not_found", "session not found");
+      if (lifecycle.deletedAtMs !== undefined) return;
+      session = lifecycle.session;
+      if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot delete while a turn is active");
+
+      if (session.status.type === "active") {
+        // A durable active projection with no live owner is an orphan. Repair it under the new fence
+        // before deleting, exactly as turn start/archive takeover do. Historical archived+active rows
+        // need the archive lifecycle bypass while that repair is committed.
+        const legacyArchivedRepair: SessionLifecycleTransition | undefined = session.archivedAtMs === undefined ? undefined : {
+          type: "archive",
+          atMs: session.archivedAtMs,
+          tenantId: session.tenantId,
+          userId: session.userId,
+        };
+        await leaseGuard.wait(this.closeOrphanedTurn(session, lease.fence, leaseGuard, legacyArchivedRepair));
+        lifecycle = await leaseGuard.wait(
+          this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, sessionId),
+        );
+        if (!lifecycle || lifecycle.deletedAtMs !== undefined) {
+          if (lifecycle?.deletedAtMs !== undefined) return;
+          throw new ApiError("not_found", "session not found");
+        }
+        session = lifecycle.session;
+      }
+
+      // Normalize stale approvals and session grants in the same transaction as the tombstone. This
+      // prevents an old authorization snapshot from becoming usable if an operator inspects or
+      // restores a database copy during the grace period.
+      const pending = await leaseGuard.wait(this.deps.store.listApprovals(sessionId, { pendingOnly: true }));
+      const now = Date.now();
+      const approvals: Approval[] = pending.map((approval) => ({
+        ...approval,
+        status: "expired",
+        decision: "cancel",
+        decidedBy: "system:delete",
+        resolvedAtMs: now,
+      }));
+      const approvalItems = await leaseGuard.wait(Promise.all(
+        pending.map((approval) => this.deps.store.getItem(sessionId, approval.itemId)),
+      ));
+      const items: Item[] = approvalItems.flatMap((item) => (
+        item && item.type === "approvalRequest" && item.status === "inProgress"
+          ? [{ ...item, status: "declined" as const, completedAtMs: now }]
+          : []
+      ));
+      const events: EventInput[] = [];
+      for (const approval of approvals) {
+        events.push({ type: "approval/resolved", sessionId, emittedAtMs: now, approval });
+        const item = items.find((candidate) => candidate.type === "approvalRequest" && candidate.approvalId === approval.id);
+        if (item) events.push({ type: "item/completed", sessionId, emittedAtMs: now, item });
+      }
+      const deletionGeneration = lifecycle.deletionGeneration + 1;
+      events.push({ type: "session/deleted", sessionId, emittedAtMs: now, deletionGeneration });
+
+      leaseGuard.assertOwned();
+      const result = await leaseGuard.wait(this.deps.store.commit({
+        sessionId,
+        fence: lease.fence,
+        lifecycle: {
+          type: "tombstone",
+          atMs: now,
+          // NULL is a deliberate safety gate: no retention policy has been approved, so no worker
+          // may interpret this tombstone as due for irreversible physical deletion.
+          purgeAfterMs: null,
+          deletionGeneration,
+          tenantId: session.tenantId,
+          userId: session.userId,
+        },
+        approvals,
+        items,
+        events,
+        sessionPatch: { autoApprovedTools: [] },
+      }));
+      await this.publishAll(sessionId, result.events);
+    } catch (err) {
+      const failure = leaseGuard.lost ?? err;
+      if (failure instanceof SessionGoneError) {
+        // Another owner may commit the same tombstone after our initial lifecycle read but before
+        // this owner can install its fence. Preserve DELETE idempotency for the owning principal
+        // without turning the lookup into a cross-user existence oracle.
+        const concurrent = await this.deps.store
+          .getSessionLifecycle(principal.tenantId, principal.userId, sessionId)
+          .catch(() => null);
+        if (concurrent?.deletedAtMs !== undefined) return;
+      }
+      if (failure instanceof SessionLifecycleBusyError) {
+        throw new ApiError("session_busy", "cannot delete while a turn is active");
+      }
+      if (failure instanceof SessionHasChildrenError) {
+        throw new ApiError("session_has_children", "delete child sessions before deleting their parent");
+      }
+      throw await this.translateSessionLeaseFailure(sessionId, failure);
+    } finally {
+      leaseGuard.stop();
+      await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
+    }
   }
 
   private async setArchiveStateLocked(principal: Principal, sessionId: string, archive: boolean): Promise<Session> {
@@ -418,7 +563,7 @@ export class SessionHost {
     };
 
     const backfillBefore = async (targetSeq: number) => {
-      while (seenSeq + 1 < targetSeq) {
+      while (!closed && seenSeq + 1 < targetSeq) {
         const page = await this.deps.store.readEvents(sessionId, seenSeq, 500);
         if (!page.length) break;
         let advanced = false;
@@ -441,27 +586,59 @@ export class SessionHost {
       deliver(event);
     };
 
+    const backfillToEnd = async () => {
+      while (!closed) {
+        const page = await this.deps.store.readEvents(sessionId, seenSeq, 500);
+        for (const event of page) deliver(event);
+        if (page.length < 500) return;
+      }
+    };
+
     // Subscribe first so nothing is lost between the store read and the live attach.
     const buffer: Event[] = [];
     let buffering = true;
+    let reconnectPending = false;
     let liveChain = Promise.resolve();
     const enqueue = (event: Event) => {
       liveChain = liveChain
-        .then(() => processLive(event))
-        .catch((err) => this.log.warn(`[session ${sessionId}] live event gap recovery failed`, err));
+        .then(async () => {
+          let delayMs = 50;
+          while (!closed) {
+            try {
+              await processLive(event);
+              return;
+            } catch (error) {
+              // Keep the triggering event in this ordered chain. A terminal event may be the last
+              // sequence forever, so waiting for another live event to cause recovery is unsafe.
+              const name = error instanceof Error ? error.name : "unknown error";
+              this.log.warn(`[session ${sessionId}] live event gap recovery failed (${name}); retrying`);
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
+              delayMs = Math.min(1_000, delayMs * 2);
+            }
+          }
+        });
+    };
+    const recoverAfterReconnect = () => {
+      if (closed) return Promise.resolve();
+      if (buffering) {
+        reconnectPending = true;
+        return Promise.resolve();
+      }
+      const recovery = liveChain.then(backfillToEnd);
+      // Keep the live chain usable for later events, but return the rejecting branch to the bus so
+      // it retries durable catch-up until the store is available again.
+      liveChain = recovery.catch((error) => {
+        const name = error instanceof Error ? error.name : "unknown error";
+        this.log.warn(`[session ${sessionId}] reconnect catch-up failed (${name})`);
+      });
+      return recovery;
     };
     const unsub = await this.deps.bus.subscribe(sessionId, (event) => {
       if (buffering) buffer.push(event);
       else enqueue(event);
-    });
+    }, { onReconnect: recoverAfterReconnect });
     try {
-      let cursor = afterSeq;
-      for (;;) {
-        const page = await this.deps.store.readEvents(sessionId, cursor, 500);
-        for (const event of page) deliver(event);
-        if (page.length < 500) break;
-        cursor = page.at(-1)!.seq;
-      }
+      await backfillToEnd();
       // Keep buffering until every event that arrived during replay has been processed. The loop's
       // final empty check and the flag flip are synchronous, so a publication cannot fall between them.
       while (buffer.length) {
@@ -469,6 +646,10 @@ export class SessionHost {
         for (const event of batch) await processLive(event);
       }
       buffering = false;
+      if (reconnectPending) {
+        reconnectPending = false;
+        await recoverAfterReconnect();
+      }
     } catch (err) {
       closed = true;
       unsub();
@@ -1725,7 +1906,12 @@ export class SessionHost {
   }
 
   private async publishAll(sessionId: string, events: PersistedEvent[]) {
-    for (const e of events) await this.deps.bus.publish(sessionId, e).catch((err) => this.log.warn(`[session ${sessionId}] publish failed`, err));
+    for (const e of events) {
+      await this.deps.bus.publish(sessionId, e).catch((error) => {
+        const name = error instanceof Error ? error.name : "unknown error";
+        this.log.warn(`[session ${sessionId}] publish failed (${name})`);
+      });
+    }
   }
 
   // ---------------- lifecycle ----------------

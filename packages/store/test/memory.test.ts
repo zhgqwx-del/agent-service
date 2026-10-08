@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { IdempotencyPendingError, MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "../src/index.js";
-import { eventBusConformance, leaseStoreConformance, mkSession, newId, sessionStoreConformance } from "./conformance.js";
+import {
+  eventBusConformance,
+  leaseStoreConformance,
+  lifecycleOutboxStoreConformance,
+  mkSession,
+  newId,
+  sessionStoreConformance,
+} from "./conformance.js";
 
 sessionStoreConformance("memory", async () => new MemorySessionStore());
+lifecycleOutboxStoreConformance("memory", async () => new MemorySessionStore());
 leaseStoreConformance("memory", async () => new MemoryLeaseStore(), async (l, sid) => (l as MemoryLeaseStore).expire(sid));
 eventBusConformance("memory", async () => new MemoryEventBus());
 
@@ -45,5 +53,80 @@ describe("MemorySessionStore legacy idempotency compatibility", () => {
 
   it("exposes a typed error for host/API translation", () => {
     expect(new IdempotencyPendingError(123)).toMatchObject({ name: "IdempotencyPendingError", expiresAtMs: 123 });
+  });
+});
+
+describe("MemorySessionStore lifecycle outbox validation", () => {
+  it("ignores additive payload fields while preserving the known delivery identity", async () => {
+    const store = new MemorySessionStore();
+    const session = mkSession("tenant_additive_outbox", "user_additive_outbox");
+    await store.createSession(session);
+    await store.commit({
+      sessionId: session.id,
+      fence: 1,
+      lifecycle: {
+        type: "tombstone",
+        atMs: 1,
+        deletionGeneration: 1,
+        tenantId: session.tenantId,
+        userId: session.userId,
+      },
+      events: [{
+        type: "session/deleted",
+        sessionId: session.id,
+        emittedAtMs: 1,
+        deletionGeneration: 1,
+      }],
+    });
+    const row = [...store.lifecycleOutbox.values()].find((candidate) => candidate.topic === "session.tombstoned")!;
+    (row as { payload: Record<string, unknown> }).payload.futureOptionalField = "ignored-by-old-worker";
+
+    const claimed = await store.claimLifecycleOutbox({
+      topics: ["session.tombstoned"], nowMs: 1, limit: 1, leaseMs: 100, claimToken: "additive-worker",
+    });
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0]?.payload).toEqual({ sessionId: session.id, deletionGeneration: 1, eventSeq: 2 });
+    await store.close();
+  });
+
+  it("quarantines a topic/payload mismatch instead of repeatedly blocking claims", async () => {
+    const store = new MemorySessionStore();
+    const session = mkSession("tenant_corrupt_outbox", "user_corrupt_outbox");
+    await store.createSession(session);
+    await store.commit({
+      sessionId: session.id,
+      fence: 1,
+      lifecycle: {
+        type: "tombstone",
+        atMs: 1,
+        deletionGeneration: 1,
+        tenantId: session.tenantId,
+        userId: session.userId,
+      },
+      events: [{
+        type: "session/deleted",
+        sessionId: session.id,
+        emittedAtMs: 1,
+        deletionGeneration: 1,
+      }],
+    });
+    const row = [...store.lifecycleOutbox.values()].find((candidate) => candidate.topic === "session.tombstoned")!;
+    (row as { payload: unknown }).payload = { sessionId: session.id, deletionGeneration: 1 };
+
+    await expect(store.getLifecycleOutbox("session.tombstoned", session.id, 1)).rejects.toThrow("eventSeq");
+    expect(await store.claimLifecycleOutbox({
+      topics: ["session.tombstoned"], nowMs: 1, limit: 1, leaseMs: 100, claimToken: "must-not-claim",
+    })).toEqual([]);
+    const quarantined = [...store.lifecycleOutbox.values()].find(
+      (candidate) => candidate.topic === "session.tombstoned",
+    );
+    expect(quarantined).toMatchObject({
+      attempts: 1,
+      deadLetteredAtMs: 1,
+      lastError: "invalid lifecycle outbox envelope",
+    });
+    expect(quarantined).not.toHaveProperty("availableAtMs");
+    expect(quarantined).not.toHaveProperty("claimToken");
+    await store.close();
   });
 });

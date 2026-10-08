@@ -973,6 +973,7 @@ export const OPENAPI_DOCUMENT = {
                   "not_found",
                   "session_busy",
                   "session_archived",
+                  "session_has_children",
                   "session_lease_conflict",
                   "idempotency_conflict",
                   "provider_error",
@@ -1213,6 +1214,39 @@ export const OPENAPI_DOCUMENT = {
               "emittedAtMs",
               "seq",
               "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "deletionGeneration": {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "session/deleted"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "type",
+              "deletionGeneration"
             ],
             "type": "object"
           },
@@ -8134,7 +8168,7 @@ export const OPENAPI_DOCUMENT = {
     },
     "/v1/sessions/{id}": {
       "delete": {
-        "description": "Hides the session from normal access. Durable child records remain until the retention/purge lifecycle is implemented.",
+        "description": "Idempotently tombstones a visible or archived idle session through the lease/fence path. A retry by the same owner returns 204 without another event or generation; an active session returns session_busy and a parent with non-deleted children returns session_has_children. After success all normal resource APIs return 404. Physical purge remains disabled until retention policy is configured.",
         "operationId": "deleteSession",
         "parameters": [
           {
@@ -8171,7 +8205,7 @@ export const OPENAPI_DOCUMENT = {
         ],
         "responses": {
           "204": {
-            "description": "Session hidden."
+            "description": "Session tombstoned."
           },
           "default": {
             "content": {
@@ -8194,7 +8228,7 @@ export const OPENAPI_DOCUMENT = {
             "ServiceApiKey": []
           }
         ],
-        "summary": "Soft-delete a session",
+        "summary": "Tombstone a session",
         "tags": [
           "Sessions"
         ]

@@ -3,6 +3,7 @@ import { addUsage, ApiError, emptyUsage, type AgentDefinition, type Approval, ty
 import { FenceError, IdempotencyPendingError, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, SessionVersionError, type CommitBatch } from "@agent-service/store";
 import {
   SessionHost,
+  LifecycleOutboxDispatcher,
   StaticToolRegistry,
   newId,
   projectItems,
@@ -120,6 +121,15 @@ class DroppingEventBus extends MemoryEventBus {
   }
 }
 
+class FlakyReadStore extends MemorySessionStore {
+  readFailures = 0;
+
+  override async readEvents(sessionId: string, afterSeq: number, limit: number) {
+    if (this.readFailures-- > 0) throw new Error("temporary read outage");
+    return super.readEvents(sessionId, afterSeq, limit);
+  }
+}
+
 class RecordingStore extends MemorySessionStore {
   commits: CommitBatch[] = [];
 
@@ -146,6 +156,17 @@ class LifecycleFenceStore extends MemorySessionStore {
 class ChangedOwnerLeaseStore extends MemoryLeaseStore {
   override async getOwner(_sessionId: string) {
     return { ownerId: "runner-new", ownerAddr: "127.0.0.1:9999", fence: 2 };
+  }
+}
+
+class TombstoneBeforeAcquireLeaseStore extends MemoryLeaseStore {
+  beforeAcquire?: () => Promise<void>;
+
+  override async acquire(...args: Parameters<MemoryLeaseStore["acquire"]>) {
+    const hook = this.beforeAcquire;
+    this.beforeAcquire = undefined;
+    if (hook) await hook();
+    return super.acquire(...args);
   }
 }
 
@@ -372,6 +393,153 @@ describe("SessionHost", () => {
     expect((await h.host.archiveSession(principal, h.session.id)).archivedAtMs).toEqual(expect.any(Number));
   });
 
+  it("tombstones an idle session once, publishes its terminal event and isolates retries by principal", async () => {
+    const h = await setup([]);
+    await h.host.archiveSession(principal, h.session.id);
+
+    await expect(h.host.deleteSession({ tenantId: "t_a", userId: "u_other" }, h.session.id)).rejects.toMatchObject({
+      code: "not_found",
+    });
+    await expect(h.host.deleteSession({ tenantId: "t_other", userId: principal.userId }, h.session.id)).rejects.toMatchObject({
+      code: "not_found",
+    });
+
+    await h.host.deleteSession(principal, h.session.id);
+    const lifecycle = await h.store.getSessionLifecycle(principal.tenantId, principal.userId!, h.session.id);
+    expect(lifecycle).toMatchObject({
+      deletedAtMs: expect.any(Number),
+      purgeAfterMs: undefined,
+      deletionGeneration: 1,
+      session: { archivedAtMs: expect.any(Number), autoApprovedTools: [] },
+    });
+    expect(await h.store.getSession(principal.tenantId, h.session.id)).toBeNull();
+    expect(h.events.at(-1)).toMatchObject({
+      type: "session/deleted",
+      sessionId: h.session.id,
+      deletionGeneration: 1,
+      seq: lifecycle!.session.lastSeq,
+    });
+    const beforeRetry = await h.store.readEvents(h.session.id, 0, 100);
+
+    await expect(h.host.deleteSession(principal, h.session.id)).resolves.toBeUndefined();
+    const afterRetry = await h.store.getSessionLifecycle(principal.tenantId, principal.userId!, h.session.id);
+    expect(afterRetry).toMatchObject({
+      deletedAtMs: lifecycle!.deletedAtMs,
+      deletionGeneration: 1,
+      session: { lastSeq: lifecycle!.session.lastSeq, fenceToken: lifecycle!.session.fenceToken },
+    });
+    expect(await h.store.readEvents(h.session.id, 0, 100)).toEqual(beforeRetry);
+    await expect(h.host.deleteSession({ tenantId: "t_a", userId: "u_other" }, h.session.id)).rejects.toMatchObject({
+      code: "not_found",
+    });
+    await expect(h.host.getSession(principal, h.session.id)).rejects.toMatchObject({ code: "not_found" });
+    await expect(h.host.archiveSession(principal, h.session.id)).rejects.toMatchObject({ code: "not_found" });
+    await expect(h.host.unarchiveSession(principal, h.session.id)).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("returns busy when DELETE races a locally active turn, then succeeds after interrupt", async () => {
+    const h = await setup([
+      { text: "working", toolCalls: [{ name: "slow", args: { text: "x" } }] },
+      { text: "done" },
+    ]);
+    const { turn } = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "run" }],
+      stream: false,
+      metadata: {},
+    });
+    await expect(h.host.deleteSession(principal, h.session.id)).rejects.toMatchObject({ code: "session_busy" });
+    await h.host.interrupt(principal, h.session.id, turn.id);
+    await waitIdle(h);
+    await expect(h.host.deleteSession(principal, h.session.id)).resolves.toBeUndefined();
+    expect(await h.store.getSession(principal.tenantId, h.session.id)).toBeNull();
+  });
+
+  it("keeps a same-owner DELETE idempotent when another runner commits after the initial read", async () => {
+    const lease = new TombstoneBeforeAcquireLeaseStore();
+    const h = await setup([], {}, {}, { lease });
+    const deletedAtMs = Date.now();
+    lease.beforeAcquire = async () => {
+      await h.store.commit({
+        sessionId: h.session.id,
+        fence: 1,
+        lifecycle: {
+          type: "tombstone",
+          atMs: deletedAtMs,
+          deletionGeneration: 1,
+          tenantId: principal.tenantId,
+          userId: principal.userId!,
+        },
+        events: [{
+          type: "session/deleted",
+          sessionId: h.session.id,
+          emittedAtMs: deletedAtMs,
+          deletionGeneration: 1,
+        }],
+      });
+    };
+
+    await expect(h.host.deleteSession(principal, h.session.id)).resolves.toBeUndefined();
+    expect((await h.store.readEvents(h.session.id, 0, 20)).filter((event) => event.type === "session/deleted")).toHaveLength(1);
+  });
+
+  it("repairs an orphaned active turn before committing the tombstone", async () => {
+    const store = new MemorySessionStore();
+    const h = await setup([], {}, {}, { store });
+    const turn: Turn = {
+      id: newId("turn"),
+      sessionId: h.session.id,
+      status: "inProgress",
+      seqStart: 2,
+      steps: 0,
+      toolCalls: 0,
+      usage: emptyUsage(),
+      startedAtMs: Date.now(),
+    };
+    const active = { type: "active" as const, turnId: turn.id, activeFlags: [] };
+    await store.commit({
+      sessionId: h.session.id,
+      fence: 0,
+      turn,
+      events: [
+        { type: "turn/started", sessionId: h.session.id, emittedAtMs: turn.startedAtMs, turn },
+        { type: "session/status/changed", sessionId: h.session.id, emittedAtMs: turn.startedAtMs, status: active },
+      ],
+      sessionPatch: { status: active },
+    });
+
+    await h.host.deleteSession(principal, h.session.id);
+
+    // Public child-resource reads deliberately hide everything after the tombstone. Inspect the
+    // in-memory projection directly here to prove orphan repair committed before that visibility
+    // boundary was installed.
+    expect(store.turns.get(turn.id)).toMatchObject({
+      status: "interrupted",
+      stopReason: "interrupted",
+    });
+    const lifecycle = await store.getSessionLifecycle(principal.tenantId, principal.userId!, h.session.id);
+    expect(lifecycle).toMatchObject({ deletionGeneration: 1, session: { status: { type: "idle" } } });
+    expect((await store.readEvents(h.session.id, 0, 20)).map((event) => event.type).slice(-3)).toEqual([
+      "turn/completed",
+      "session/status/changed",
+      "session/deleted",
+    ]);
+  });
+
+  it("blocks parent deletion until every visible child is tombstoned", async () => {
+    const h = await setup([]);
+    const child = await h.host.createSession(principal, {
+      agentId: h.agent.id,
+      parentSessionId: h.session.id,
+      metadata: {},
+    });
+
+    await expect(h.host.deleteSession(principal, h.session.id)).rejects.toMatchObject({
+      code: "session_has_children",
+    });
+    await h.host.deleteSession(principal, child.id);
+    await expect(h.host.deleteSession(principal, h.session.id)).resolves.toBeUndefined();
+  });
+
   it("serialises concurrent archive/unarchive calls and leases even an idempotent no-op", async () => {
     const lease = new MemoryLeaseStore();
     const h = await setup([], {}, {}, { lease });
@@ -408,6 +576,10 @@ describe("SessionHost", () => {
     });
 
     await expect(h.host.archiveSession(principal, h.session.id)).rejects.toMatchObject({
+      code: "session_lease_conflict",
+      details: { ownerId: "runner-new", ownerAddr: "127.0.0.1:9999" },
+    });
+    await expect(h.host.deleteSession(principal, h.session.id)).rejects.toMatchObject({
       code: "session_lease_conflict",
       details: { ownerId: "runner-new", ownerAddr: "127.0.0.1:9999" },
     });
@@ -1173,6 +1345,51 @@ describe("SessionHost", () => {
     expect(deliveredSeqs).toEqual(stored.map((event) => event.seq));
   });
 
+  it("keeps retrying a failed gap read when the terminal event is the final live event", async () => {
+    const store = new FlakyReadStore();
+    const h = await setup([], {}, {}, { store });
+    const atMs = Date.now();
+    const committed = await store.commit({
+      sessionId: h.session.id,
+      fence: 0,
+      events: [
+        { type: "warning", sessionId: h.session.id, emittedAtMs: atMs, code: "before_delete", message: "gap" },
+        { type: "session/deleted", sessionId: h.session.id, emittedAtMs: atMs, deletionGeneration: 1 },
+      ],
+    });
+    store.readFailures = 2;
+
+    await h.bus.publish(h.session.id, committed.events[1]!);
+
+    await waitFor(
+      () => h.events.find((event) => event.type === "session/deleted"),
+      3_000,
+    );
+    expect(h.events.filter((event) => event.type === "session/deleted")).toHaveLength(1);
+    expect(
+      h.events.filter((event) => typeof (event as { seq?: number }).seq === "number")
+        .map((event) => (event as { seq: number }).seq),
+    ).toEqual([1, 2, 3]);
+  });
+
+  it("replays a committed tombstone intent after the direct bus publish is lost", async () => {
+    const bus = new DroppingEventBus();
+    const h = await setup([], {}, {}, { bus });
+    bus.dropNextPersisted = true;
+
+    await h.host.deleteSession(principal, h.session.id);
+    expect(h.events.some((event) => event.type === "session/deleted")).toBe(false);
+
+    const dispatcher = new LifecycleOutboxDispatcher({
+      store: h.store,
+      bus,
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    expect(await dispatcher.dispatchOnce(Date.now() + 1_000)).toBe(1);
+    await waitFor(() => h.events.find((event) => event.type === "session/deleted"));
+    expect(h.events.filter((event) => event.type === "session/deleted")).toHaveLength(1);
+  });
+
   it("stops the turn when the lease is taken over mid-turn (fence loss must not keep stepping)", async () => {
     // Regression: a rejected commit used to propagate into the engine without setting any stop state,
     // so a stale owner kept calling the model and re-running tools.
@@ -1269,7 +1486,26 @@ describe("SessionHost", () => {
     const h = await setup([{ text: "a", toolCalls: [{ name: "slow", args: { text: "x" } }] }, { text: "b" }]);
     await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
     await waitFor(() => h.events.find((e) => e.type === "item/started" && e.item.type === "toolCall"));
-    expect(await h.store.deleteSession("t_a", h.session.id)).toBe(true);
+    const atMs = Date.now();
+    await h.store.commit({
+      sessionId: h.session.id,
+      fence: 99,
+      lifecycle: {
+        type: "tombstone",
+        atMs,
+        purgeAfterMs: null,
+        deletionGeneration: 1,
+        tenantId: principal.tenantId,
+        userId: principal.userId!,
+      },
+      events: [{
+        type: "session/deleted",
+        sessionId: h.session.id,
+        emittedAtMs: atMs,
+        deletionGeneration: 1,
+      }],
+      sessionPatch: { status: { type: "idle" } },
+    });
     await waitFor(() => ((h.host as unknown as { active: Map<string, unknown> }).active.size === 0 ? true : undefined), 8000);
     expect(h.engine.received).toHaveLength(1); // never advanced to the second step
   });

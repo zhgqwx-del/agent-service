@@ -77,7 +77,9 @@ async function makeApp(opts: { scopes?: ("runtime" | "admin")[]; overrides?: Par
     logger: { info: () => {}, warn: () => {}, error: () => {} },
   });
   const app = createApp({
-    store, host, providers, tools: new StaticToolRegistry([]), runnerId: "r", heartbeatMs: 60_000, maxBodyBytes: 1_000_000, ready: () => true,
+    store, host, providers, tools: new StaticToolRegistry([]), runnerId: "r",
+    internalRouterToken: "hardening-test-internal-token-01",
+    heartbeatMs: 60_000, maxBodyBytes: 1_000_000, ready: () => true,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
     assertPublicUrl: async () => {},

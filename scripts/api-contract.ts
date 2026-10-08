@@ -411,11 +411,11 @@ export function buildOpenApiDocument() {
     path: "/v1/sessions/{id}",
     operationId: "deleteSession",
     tags: ["Sessions"],
-    summary: "Soft-delete a session",
-    description: "Hides the session from normal access. Durable child records remain until the retention/purge lifecycle is implemented.",
+    summary: "Tombstone a session",
+    description: "Idempotently tombstones a visible or archived idle session through the lease/fence path. A retry by the same owner returns 204 without another event or generation; an active session returns session_busy and a parent with non-deleted children returns session_has_children. After success all normal resource APIs return 404. Physical purge remains disabled until retention policy is configured.",
     security: userSecurity,
     request: { params: SessionIdParams, headers: UserIdentityHeaders },
-    responses: { 204: noContentResponse("Session hidden."), default: errorResponse },
+    responses: { 204: noContentResponse("Session tombstoned."), default: errorResponse },
   });
   register({
     method: "post",

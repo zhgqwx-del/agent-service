@@ -24,6 +24,12 @@ export const Event = z.discriminatedUnion("type", [
   z.object({ ...persisted, type: z.literal("session/compacted"), itemId: idSchema("item") }),
   z.object({ ...persisted, type: z.literal("session/archived") }),
   z.object({ ...persisted, type: z.literal("session/unarchived") }),
+  z.object({
+    ...persisted,
+    type: z.literal("session/deleted"),
+    /** Monotonic generation used to deduplicate the corresponding purge outbox request. */
+    deletionGeneration: z.number().int().positive(),
+  }),
 
   z.object({ ...persisted, type: z.literal("turn/started"), turn: Turn }),
   z.object({ ...persisted, type: z.literal("turn/steered"), turnId: idSchema("turn"), itemId: idSchema("item") }),

@@ -23,14 +23,14 @@ describe("RunnerRegistry owner address mapping", () => {
   });
 
   it("admits only ready runners on the current protocol into routing", async () => {
-    const capabilities = (protocolVersion: string) => ({
+    const capabilities = (protocolVersion: string, sessionLifecycle = ["archive", "unarchive", "tombstone"]) => ({
       protocolVersion,
       service: "agent-runner",
       features: {
         streaming: true,
         replay: { persistedEvents: true, hotWindowMs: 1 },
         approvals: true,
-        sessionLifecycle: ["archive", "unarchive"],
+        sessionLifecycle,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -42,12 +42,15 @@ describe("RunnerRegistry owner address mapping", () => {
       const url = String(input);
       if (url.endsWith("/readyz")) return new Response("ready");
       if (url.startsWith("http://current/")) return Response.json(capabilities(PROTOCOL_VERSION));
+      if (url.startsWith("http://current-basic/")) {
+        return Response.json(capabilities(PROTOCOL_VERSION, ["archive", "unarchive"]));
+      }
       if (url.startsWith("http://old/")) return Response.json(capabilities("2026-09-22"));
       return new Response("not found", { status: 404 });
     }));
 
     const registry = new RunnerRegistry({
-      runners: ["http://current", "http://old"],
+      runners: ["http://current", "http://current-basic", "http://old"],
       healthIntervalMs: 60_000,
     });
     registry.start();
@@ -55,8 +58,13 @@ describe("RunnerRegistry owner address mapping", () => {
 
     expect(registry.list().map(({ url, healthy }) => ({ url, healthy }))).toEqual([
       { url: "http://current", healthy: true },
+      { url: "http://current-basic", healthy: true },
       { url: "http://old", healthy: false },
     ]);
+    expect(registry.allHealthySupportLifecycle("tombstone")).toBe(false);
+    expect(registry.supportsLifecycle("http://current", "tombstone")).toBe(true);
+    expect(registry.supportsLifecycle("http://current-basic", "tombstone")).toBe(false);
+    expect(registry.supportsLifecycle("http://old", "tombstone")).toBe(false);
     expect(registry.anyHealthy()).toBe("http://current");
     expect(registry.routeableUrl("current")).toBe("http://current");
     expect(registry.routeableUrl("old")).toBeUndefined();

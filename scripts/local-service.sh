@@ -13,6 +13,7 @@ caller_runner_id="${RUNNER_ID-}"
 caller_runner_addr="${RUNNER_ADDR-}"
 caller_runners="${RUNNERS-}"
 caller_redis_url="${REDIS_URL-}"
+caller_session_tombstone_enabled="${SESSION_TOMBSTONE_ENABLED-}"
 if [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091
@@ -25,6 +26,7 @@ fi
 [ -n "$caller_runner_addr" ] && RUNNER_ADDR="$caller_runner_addr"
 [ -n "$caller_runners" ] && RUNNERS="$caller_runners"
 [ -n "$caller_redis_url" ] && REDIS_URL="$caller_redis_url"
+[ -n "$caller_session_tombstone_enabled" ] && SESSION_TOMBSTONE_ENABLED="$caller_session_tombstone_enabled"
 
 STATE_DIR="${AGENT_SERVICE_STATE_DIR:-$ROOT/.local-run}"
 RUNNER_PID_FILE="$STATE_DIR/runner.pid"
@@ -81,6 +83,7 @@ start_apps() {
   else
     nohup env RUNNERS="${RUNNERS:-$RUNNER_URL}" \
       REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}" \
+      SESSION_TOMBSTONE_ENABLED="${SESSION_TOMBSTONE_ENABLED:-1}" \
       ROUTER_PORT="$ROUTER_PORT" \
       node --import tsx apps/agent-router/src/main.ts </dev/null >"$ROUTER_LOG" 2>&1 &
     echo "$!" >"$ROUTER_PID_FILE"

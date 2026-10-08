@@ -274,6 +274,129 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
   }, 180_000);
 
+  it("a new runner tombstones an orphaned active turn after lease takeover", async () => {
+    cluster = await startCluster({
+      runners: 2,
+      leaseTtlMs: 6_000,
+      leaseHoldMs: 200,
+      script: [{ text: "too late after deletion", ttftMs: 12_000 }],
+    });
+    const { router, runners, redis } = cluster;
+    const session = await newSession(router.url);
+    const stream = openSse(router.url, `/v1/sessions/${session.id}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ input: [{ type: "text", text: "start tombstone takeover" }] }),
+    });
+    const started = await waitFor(
+      () => stream.events.find((event) => event.event === "turn/started"),
+      15_000,
+      "tombstone candidate turn starts",
+    );
+    const turnId = (started.data.turn as { id: string }).id;
+    const ownerAddr = await waitFor(
+      async () => (await redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined,
+      5_000,
+      "tombstone owner",
+    );
+    const staleOwner = runners.find((runner) => runner.url.includes(ownerAddr))!;
+    const successor = runners.find((runner) => runner !== staleOwner)!;
+    const fenceBefore = Number(await redis.get(`as:fence:{${session.id}}`));
+
+    // Lose only the Redis lease: runner A remains alive and would still finish its slow model call if
+    // the lease guard and durable fence did not stop it. Runner B must directly repair + tombstone.
+    await redis.del(`as:lease:{${session.id}}`);
+    const deleted = await waitFor(
+      async () => {
+        const response = await api(successor.url, `/v1/sessions/${session.id}`, { method: "DELETE" });
+        return response.status === 204 ? response : undefined;
+      },
+      20_000,
+      "successor tombstones orphan",
+    );
+    expect(deleted.body).toBeUndefined();
+
+    const fenceAfter = Number(await redis.get(`as:fence:{${session.id}}`));
+    expect(fenceAfter).toBeGreaterThan(fenceBefore);
+    await waitFor(
+      () => (
+        staleOwner.log.some((line) => /lease lost|fenced out|no longer owns|session was deleted/i.test(line))
+          ? true
+          : undefined
+      ),
+      15_000,
+      "stale tombstone owner stops",
+    );
+    // This is a turn-scoped stream, so orphan repair legitimately closes it on turn/completed + idle
+    // before the following terminal lifecycle event. The durable log below proves session/deleted.
+    stream.cancel();
+    await stream.done;
+
+    const [sessionRow] = await queryDb<{
+      status: string;
+      deleted_at_ms: number | null;
+      purge_after_ms: number | null;
+      deletion_generation: number;
+      fence_token: number;
+      last_seq: number;
+    }>(
+      `SELECT JSON_UNQUOTE(JSON_EXTRACT(status, '$.type')) status,
+              deleted_at_ms, purge_after_ms, deletion_generation, fence_token, last_seq
+         FROM sessions WHERE session_id=?`,
+      [session.id],
+    );
+    expect(sessionRow).toMatchObject({
+      status: "idle",
+      deleted_at_ms: expect.any(Number),
+      purge_after_ms: null,
+      deletion_generation: 1,
+      fence_token: fenceAfter,
+    });
+    const [turnRow] = await queryDb<{ status: string; stop_reason: string | null }>(
+      "SELECT status, stop_reason FROM turns WHERE turn_id=?",
+      [turnId],
+    );
+    expect(turnRow).toMatchObject({ status: "interrupted", stop_reason: "interrupted" });
+
+    const rows = await queryDb<{ seq: number; type: string }>(
+      "SELECT seq, type FROM events WHERE session_id=? ORDER BY seq",
+      [session.id],
+    );
+    const seqs = rows.map((row) => Number(row.seq));
+    expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, index) => index + 1));
+    expect(rows.at(-1)?.type).toBe("session/deleted");
+    expect(Number(sessionRow!.last_seq)).toBe(seqs.length);
+
+    // DELETE is the sole post-tombstone exception: an owner retry is idempotent, while every normal
+    // resource operation and a different user see the same 404 as a never-existing session.
+    expect((await api(successor.url, `/v1/sessions/${session.id}`, { method: "DELETE" })).status).toBe(204);
+    expect((await api(successor.url, `/v1/sessions/${session.id}`, {
+      method: "DELETE",
+      headers: { "x-user-id": "u_other" },
+    })).status).toBe(404);
+
+    const hidden = await api<{ data: Array<{ id: string }> }>(successor.url, "/v1/sessions?includeArchived=true");
+    expect(hidden.status).toBe(200);
+    expect(hidden.body.data.map(({ id }) => id)).not.toContain(session.id);
+
+    const ordinaryCalls: Array<[string, string, RequestInit?]> = [
+      ["GET", `/v1/sessions/${session.id}`],
+      ["GET", `/v1/sessions/${session.id}/turns`],
+      ["GET", `/v1/sessions/${session.id}/turns/${turnId}`],
+      ["GET", `/v1/sessions/${session.id}/items`],
+      ["GET", `/v1/sessions/${session.id}/events`],
+      ["GET", `/v1/sessions/${session.id}/approvals`],
+      ["POST", `/v1/sessions/${session.id}/archive`],
+      ["POST", `/v1/sessions/${session.id}/unarchive`],
+      ["POST", `/v1/sessions/${session.id}/compact`],
+      ["POST", `/v1/sessions/${session.id}/turns`, {
+        body: JSON.stringify({ input: [{ type: "text", text: "must stay deleted" }], stream: false }),
+      }],
+    ];
+    for (const [method, path, init] of ordinaryCalls) {
+      expect((await api(successor.url, path, { ...init, method })).status, `${method} ${path}`).toBe(404);
+    }
+  }, 180_000);
+
   it("linearizes archive against an active turn and restores the session without event gaps", async () => {
     cluster = await startCluster({
       runners: 2,

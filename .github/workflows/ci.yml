@@ -72,9 +72,17 @@ jobs:
       - name: Assert the integration suite actually ran
         run: node scripts/assert-suites-ran.mjs
 
-      # This is an immutable 0007 schema snapshot, not a fresh-schema test. The dedicated command has
-      # no skip path: CI must create disposable databases, execute 0008, and report both scenarios.
-      - name: Historical MySQL migration 0007 to 0008
+      # Keep a named, verbose, no-skip proof for the lifecycle queue. The broad coverage assertion
+      # above cannot by itself prove that this dedicated real-MySQL concurrency file executed.
+      - name: Lifecycle outbox real MySQL suite (must execute)
+        env:
+          AGENT_SERVICE_INTEGRATION: "1"
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:outbox-mysql
+
+      # These are immutable historical snapshots, not fresh-schema tests. The dedicated command has
+      # no skip path: CI must create disposable databases and visibly execute every upgrade fixture.
+      - name: Historical MySQL migrations (0007 to 0008 to 0009)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -142,6 +150,7 @@ jobs:
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
             docker run -d --name app --network host \
               -e SECRETS_MASTER_KEY=$SECRETS_MASTER_KEY \
+              -e INTERNAL_ROUTER_TOKEN=ci-internal-router-token-00000001 \
               -e STORE=mysql -e MYSQL_URL=mysql://root@127.0.0.1:3306/agent_service \
               -e REDIS_URL=redis://127.0.0.1:6379 \
               -e ADMIN_BOOTSTRAP_TENANT=t_ci \
@@ -150,6 +159,7 @@ jobs:
             PORT=8787
           else
             docker run -d --name app --network host \
+              -e INTERNAL_ROUTER_TOKEN=ci-internal-router-token-00000001 \
               -e RUNNERS=http://127.0.0.1:8787 -e ROUTER_PORT=8080 \
               agent-service/${{ matrix.app }}:ci
             PORT=8080
@@ -169,7 +179,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0008_atomic_turn_writes.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0009_session_tombstone_outbox.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

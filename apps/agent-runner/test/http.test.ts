@@ -1,13 +1,20 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { SessionHost, StaticToolRegistry, builtinTools, type AgentEngine, type EngineRun, type EngineSink, type EngineTurnParams, type ResolvedModel } from "@agent-service/core";
 import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
-import { emptyUsage } from "@agent-service/protocol";
+import {
+  INTERNAL_TOMBSTONE_ACK_HEADER,
+  INTERNAL_TOMBSTONE_ACK_VALUE,
+  INTERNAL_TOMBSTONE_PATH_PREFIX,
+  INTERNAL_ROUTER_TOKEN_HEADER,
+  emptyUsage,
+} from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import { createApp } from "../src/app.js";
 import { hashApiKey } from "../src/auth.js";
 
 /** typed json read: the suite used to be full of `unknown`, which hid drift from the real API */
 const j = async <T>(res: Response): Promise<T> => (await res.json()) as T;
+const INTERNAL_ROUTER_TOKEN = "runner-test-internal-token-000001";
 
 /** Echo engine: replies with the user's text; calls `current_time` when asked for time. */
 class EchoEngine implements AgentEngine {
@@ -60,7 +67,8 @@ async function makeApp(heartbeatMs = 60_000) {
   const host = new SessionHost({ store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), engine: new EchoEngine(), providers: { resolve: async () => fake }, tools, config: { runnerId: "r", runnerAddr: "x", leaseHoldMs: 10 } });
   const cipher = new LocalAesGcmCipher("33".repeat(32));
   const app = createApp({
-    store, host, providers, tools, runnerId: "r", heartbeatMs, maxBodyBytes: 1_000_000, ready: () => true,
+    store, host, providers, tools, runnerId: "r", internalRouterToken: INTERNAL_ROUTER_TOKEN,
+    heartbeatMs, maxBodyBytes: 1_000_000, ready: () => true,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
     assertPublicUrl: async () => {},
@@ -82,6 +90,17 @@ const parseSse = (text: string) =>
     });
 
 describe("agent-runner HTTP API", () => {
+  it("advertises tombstone support without claiming physical purge", async () => {
+    const { app } = await makeApp();
+    const response = await app.request("/v1/capabilities");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      protocolVersion: "2026-10-08",
+      service: "agent-runner",
+      features: { sessionLifecycle: ["archive", "unarchive", "tombstone"] },
+    });
+  });
+
   it("rejects M3-only agent declarations and turn inputs at the HTTP contract boundary", async () => {
     const { call } = await makeApp();
     const futureAgent = {
@@ -156,6 +175,93 @@ describe("agent-runner HTTP API", () => {
     expect((await j<{ archivedAtMs?: number }>(unarchivedResponse)).archivedAtMs).toBeUndefined();
     expect((await call(`/v1/sessions/${session.id}/unarchive`, { method: "POST" })).status).toBe(200);
     expect((await j<{ data: { id: string }[] }>(await call("/v1/sessions"))).data.map(({ id }) => id)).toEqual([session.id]);
+  });
+
+  it("tombstones idempotently, emits the terminal lifecycle event and closes an established SSE", async () => {
+    const { call } = await makeApp(5);
+    const agent = await j<{ id: string }>(await call("/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "delete", instructions: "", model: { provider: "dashscope", model: "qwen-plus" } }),
+    }));
+    const session = await j<{ id: string }>(await call("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.id }),
+    }));
+
+    const response = await call(`/v1/sessions/${session.id}/events?after=1`);
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    let wire = "";
+    let ended = false;
+    try {
+      // Receiving a heartbeat proves the stream callback is running before DELETE publishes.
+      const first = await reader.read();
+      wire += new TextDecoder().decode(first.value ?? new Uint8Array());
+
+      const untrusted = await call(`${INTERNAL_TOMBSTONE_PATH_PREFIX}/${session.id}`, { method: "POST" });
+      expect(untrusted.status).toBe(404);
+      const deleted = await call(`${INTERNAL_TOMBSTONE_PATH_PREFIX}/${session.id}`, {
+        method: "POST",
+        headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_ROUTER_TOKEN },
+      });
+      expect(deleted.status).toBe(204);
+      expect(deleted.headers.get(INTERNAL_TOMBSTONE_ACK_HEADER)).toBe(INTERNAL_TOMBSTONE_ACK_VALUE);
+      expect(await deleted.text()).toBe("");
+
+      for (let i = 0; i < 20; i++) {
+        const next = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("deleted session SSE did not close")), 250)),
+        ]);
+        wire += new TextDecoder().decode(next.value ?? new Uint8Array());
+        if (next.done) {
+          ended = true;
+          break;
+        }
+      }
+    } finally {
+      if (!ended) await reader.cancel().catch(() => {});
+    }
+
+    expect(ended).toBe(true);
+    expect(parseSse(wire).filter((event) => event.type === "session/deleted")).toEqual([
+      expect.objectContaining({ sessionId: session.id, deletionGeneration: 1, id: expect.any(String) }),
+    ]);
+
+    // A lost 204 may be retried by the router. It must not create another lifecycle event.
+    expect((await call(`/v1/sessions/${session.id}`, { method: "DELETE" })).status).toBe(204);
+    for (const [method, path] of [
+      ["GET", `/v1/sessions/${session.id}`],
+      ["GET", `/v1/sessions/${session.id}/items`],
+      ["GET", `/v1/sessions/${session.id}/events`],
+      ["POST", `/v1/sessions/${session.id}/archive`],
+      ["POST", `/v1/sessions/${session.id}/unarchive`],
+    ] as const) {
+      expect((await call(path, { method })).status, `${method} ${path}`).toBe(404);
+    }
+  });
+
+  it("refuses to tombstone a parent while a non-deleted child exists", async () => {
+    const { call } = await makeApp();
+    const agent = await j<{ id: string }>(await call("/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "children", instructions: "", model: { provider: "dashscope", model: "qwen-plus" } }),
+    }));
+    const parent = await j<{ id: string }>(await call("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.id }),
+    }));
+    const child = await j<{ id: string }>(await call("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.id, parentSessionId: parent.id }),
+    }));
+
+    const blocked = await call(`/v1/sessions/${parent.id}`, { method: "DELETE" });
+    expect(blocked.status).toBe(409);
+    expect(await blocked.json()).toMatchObject({ error: { code: "session_has_children" } });
+
+    expect((await call(`/v1/sessions/${child.id}`, { method: "DELETE" })).status).toBe(204);
+    expect((await call(`/v1/sessions/${parent.id}`, { method: "DELETE" })).status).toBe(204);
   });
 
   it("emits protocol-valid heartbeats with the subscribed session id", async () => {
