@@ -12,6 +12,8 @@ import {
   AgentListQuery,
   AgentPageResponse,
   AgentVersionQuery,
+  ActiveLegalHoldListResponse,
+  ActiveRetentionPolicyResponse,
   ApiKeyCreateRequest,
   ApiKeyIdParams,
   ApiKeyListResponse,
@@ -38,6 +40,11 @@ import {
   ItemListQuery,
   ItemListResponse,
   ItemOutputResponse,
+  LegalHoldListQuery,
+  LegalHoldParams,
+  LegalHoldRecord,
+  LegalHoldReleaseRequest,
+  LegalHoldSetRequest,
   IMAGE_MEDIA_TYPES,
   ModelListResponse,
   OkResponse,
@@ -47,6 +54,10 @@ import {
   ProviderIdParams,
   ProviderListResponse,
   ReadinessResponse,
+  RetentionPolicyActivateRequest,
+  RetentionPolicyParams,
+  RetentionPolicyPutRequest,
+  RetentionPolicyRecord,
   ResumeSessionHttpResponse,
   SessionApprovalParams,
   SessionBlobParams,
@@ -170,6 +181,14 @@ export function buildOpenApiDocument() {
     error: registry.register("ErrorBody", ErrorBody),
     event: registry.register("Event", EventStreamEvent),
     erasureRequest: registry.register("ErasureRequest", ErasureRequest),
+    retentionPolicyPut: registry.register("RetentionPolicyPutRequest", RetentionPolicyPutRequest),
+    retentionPolicyActivate: registry.register("RetentionPolicyActivateRequest", RetentionPolicyActivateRequest),
+    retentionPolicy: registry.register("RetentionPolicy", RetentionPolicyRecord),
+    activeRetentionPolicy: registry.register("ActiveRetentionPolicy", ActiveRetentionPolicyResponse),
+    legalHoldSet: registry.register("LegalHoldSetRequest", LegalHoldSetRequest),
+    legalHoldRelease: registry.register("LegalHoldReleaseRequest", LegalHoldReleaseRequest),
+    legalHold: registry.register("LegalHold", LegalHoldRecord),
+    activeLegalHolds: registry.register("ActiveLegalHoldList", ActiveLegalHoldListResponse),
     excludableEventType: registry.register("ExcludableEventType", ExcludableEventTypeSchema),
     capabilities: registry.register("Capabilities", Capabilities),
     openapi: registry.register("OpenApiDocument", OpenApiDocumentResponse),
@@ -655,6 +674,130 @@ export function buildOpenApiDocument() {
       default: privateJsonResponse(schemas.error, "Error response."),
     },
   });
+  register({
+    method: "put",
+    path: "/v1/retention-policies/{policyVersion}",
+    operationId: "putRetentionPolicy",
+    tags: ["Data lifecycle"],
+    summary: "Register an immutable tenant retention policy version",
+    description: "Admin-only and rollout-gated. Registering a version does not activate it and cannot authorize purge.",
+    security: serviceSecurity,
+    ...adminOnly,
+    request: {
+      params: RetentionPolicyParams,
+      body: jsonBody(schemas.retentionPolicyPut, "Complete version-1 retention policy document."),
+    },
+    responses: {
+      200: privateJsonResponse(schemas.retentionPolicy, "Existing or newly registered immutable policy version."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "post",
+    path: "/v1/retention-policies/{policyVersion}/activate",
+    operationId: "activateRetentionPolicy",
+    tags: ["Data lifecycle"],
+    summary: "Activate a canonical tenant retention policy",
+    description: "Admin-only generation-CAS activation. It affects only requests created after the activation linearization point; existing backlog is never adopted implicitly.",
+    security: serviceSecurity,
+    ...adminOnly,
+    request: {
+      params: RetentionPolicyParams,
+      body: jsonBody(schemas.retentionPolicyActivate, "Expected policy-control generation."),
+    },
+    responses: {
+      200: privateJsonResponse(schemas.activeRetentionPolicy, "Active policy and its monotonic control."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "get",
+    path: "/v1/retention-policies/active",
+    operationId: "getActiveRetentionPolicy",
+    tags: ["Data lifecycle"],
+    summary: "Read the active canonical tenant retention policy",
+    security: serviceSecurity,
+    ...adminOnly,
+    responses: {
+      200: privateJsonResponse(schemas.activeRetentionPolicy, "Active policy and its monotonic control."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "get",
+    path: "/v1/retention-policies/{policyVersion}",
+    operationId: "getRetentionPolicy",
+    tags: ["Data lifecycle"],
+    summary: "Read an immutable tenant retention policy version",
+    security: serviceSecurity,
+    ...adminOnly,
+    request: { params: RetentionPolicyParams },
+    responses: {
+      200: privateJsonResponse(schemas.retentionPolicy, "Immutable policy version."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "post",
+    path: "/v1/legal-holds",
+    operationId: "setLegalHold",
+    tags: ["Data lifecycle"],
+    summary: "Set a tenant- or user-scoped legal hold",
+    description: "Admin-only generation-CAS operation. A hold pauses destructive work but never restores ordinary API visibility.",
+    security: serviceSecurity,
+    ...adminOnly,
+    request: { body: jsonBody(schemas.legalHoldSet, "Bounded hold identity, scope and reason.") },
+    responses: {
+      200: privateJsonResponse(schemas.legalHold, "Existing or newly set legal hold."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "post",
+    path: "/v1/legal-holds/{holdId}/release",
+    operationId: "releaseLegalHold",
+    tags: ["Data lifecycle"],
+    summary: "Release one legal hold",
+    description: "Admin-only generation-CAS release. Other active holds on the same subject remain effective.",
+    security: serviceSecurity,
+    ...adminOnly,
+    request: {
+      params: LegalHoldParams,
+      body: jsonBody(schemas.legalHoldRelease, "Expected subject hold generation and bounded release reason."),
+    },
+    responses: {
+      200: privateJsonResponse(schemas.legalHold, "Released legal hold."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "get",
+    path: "/v1/legal-holds/{holdId}",
+    operationId: "getLegalHold",
+    tags: ["Data lifecycle"],
+    summary: "Read one tenant-owned legal hold",
+    security: serviceSecurity,
+    ...adminOnly,
+    request: { params: LegalHoldParams },
+    responses: {
+      200: privateJsonResponse(schemas.legalHold, "Legal hold."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "get",
+    path: "/v1/legal-holds",
+    operationId: "listActiveLegalHolds",
+    tags: ["Data lifecycle"],
+    summary: "List active holds and their subject control",
+    security: serviceSecurity,
+    ...adminOnly,
+    request: { query: LegalHoldListQuery },
+    responses: {
+      200: privateJsonResponse(schemas.activeLegalHolds, "Active holds and fail-closed projection control."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
 
   // ---------- usage, items, events and approvals ----------
 
@@ -741,8 +884,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 42) {
-    throw new Error(`expected 42 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 50) {
+    throw new Error(`expected 50 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({

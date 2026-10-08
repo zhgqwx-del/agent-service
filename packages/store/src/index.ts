@@ -6,6 +6,7 @@ export * from "./erasure-catalog.js";
 export * from "./erasure-usage.js";
 export * from "./legacy-tombstone.js";
 export * from "./usage-lifecycle.js";
+export * from "./retention-policy.js";
 export * from "./memory.js";
 export { MysqlSessionStore, type MysqlStoreOptions } from "./mysql/store.js";
 export { RedisLeaseStore } from "./redis/lease.js";

@@ -73,7 +73,12 @@ afterEach(async () => {
 
 async function makeApp(
   heartbeatMs = 60_000,
-  lifecycle: { enabled?: boolean; attachStore?: boolean; legacyCompensation?: boolean } = {},
+  lifecycle: {
+    enabled?: boolean;
+    attachStore?: boolean;
+    legacyCompensation?: boolean;
+    governance?: boolean;
+  } = {},
 ) {
   const store = new MemorySessionStore();
   await store.createApiKey("t_dev", "k1", hashApiKey("dev-key"), ["runtime", "admin"]);
@@ -93,6 +98,8 @@ async function makeApp(
     erasureRequestsEnabled: lifecycle.enabled,
     legacyTombstoneCompensationEnabled: lifecycle.legacyCompensation,
     subjectLifecycle: lifecycle.attachStore ? store : undefined,
+    dataGovernanceManagementEnabled: lifecycle.governance,
+    retentionPolicy: store,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
     assertPublicUrl: async () => {},
@@ -210,7 +217,7 @@ function expectPrivateLifecycleResponse(response: Response): void {
 }
 
 describe("agent-runner HTTP API", () => {
-  it("advertises tombstone support without claiming physical purge", async () => {
+  it("separates governance writer awareness from the gated management surface", async () => {
     const { app } = await makeApp();
     const response = await app.request("/v1/capabilities");
     expect(response.status).toBe(200);
@@ -221,6 +228,15 @@ describe("agent-runner HTTP API", () => {
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         dataErasureRequests: false,
         erasureJobControl: [],
+        dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"],
+        dataGovernanceManagement: false,
+      },
+    });
+    const enabled = await makeApp(60_000, { governance: true });
+    expect(await (await enabled.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"],
+        dataGovernanceManagement: true,
       },
     });
   });
@@ -452,6 +468,144 @@ describe("agent-runner HTTP API", () => {
     });
     expect(unauthorized.status).toBe(401);
     expectPrivateLifecycleResponse(unauthorized);
+  });
+
+  it("manages canonical policies and multiple legal holds without enabling purge", async () => {
+    const closed = await makeApp();
+    const closedResponse = await closed.call("/v1/retention-policies/policy-v1", {
+      method: "PUT",
+      body: JSON.stringify({ policy: {} }),
+    });
+    expect(closedResponse.status).toBe(503);
+    expectPrivateLifecycleResponse(closedResponse);
+
+    const { store, call } = await makeApp(60_000, {
+      governance: true,
+      enabled: true,
+      attachStore: true,
+    });
+    await store.createApiKey("t_dev", "runtime-only", hashApiKey("runtime-key"), ["runtime"]);
+    await store.createApiKey("t_other", "other-admin", hashApiKey("other-key"), ["admin"]);
+    const policy = {
+      sessionContentRetentionMs: 30 * 24 * 60 * 60_000,
+      userErasureGraceMs: 24 * 60 * 60_000,
+      operationalUsageRetentionMs: null,
+      idempotencyReceiptRetentionMs: 7 * 24 * 60 * 60_000,
+      billingFactRetentionMs: null,
+      lifecycleAuditRetentionMs: null,
+      exportArtifactTtlMs: 60 * 60_000,
+    };
+    const reservedVersion = await call("/v1/retention-policies/active", {
+      method: "PUT",
+      body: JSON.stringify({ policy }),
+    });
+    expect(reservedVersion.status).toBe(400);
+    expect(await reservedVersion.json()).toMatchObject({ error: { code: "invalid_request" } });
+    expectPrivateLifecycleResponse(reservedVersion);
+    const put = () => call("/v1/retention-policies/policy-v1", {
+      method: "PUT",
+      body: JSON.stringify({ policy }),
+    });
+    const forbidden = await call("/v1/retention-policies/policy-v1", {
+      method: "PUT",
+      headers: { authorization: "Bearer runtime-key" },
+      body: JSON.stringify({ policy }),
+    });
+    expect(forbidden.status).toBe(403);
+    expectPrivateLifecycleResponse(forbidden);
+
+    const created = await put();
+    expect(created.status).toBe(200);
+    expectPrivateLifecycleResponse(created);
+    const createdPolicy = await j<{ policySha256: string; createdAtMs: number }>(created);
+    const replayedPolicy = await j<{ policySha256: string; createdAtMs: number }>(await put());
+    expect(replayedPolicy).toEqual(createdPolicy);
+    const conflict = await call("/v1/retention-policies/policy-v1", {
+      method: "PUT",
+      body: JSON.stringify({ policy: { ...policy, userErasureGraceMs: 1 } }),
+    });
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ error: { code: "state_conflict" } });
+
+    const unsupportedGeneration = await call("/v1/retention-policies/policy-v1/activate", {
+      method: "POST",
+      body: JSON.stringify({ expectedControlGeneration: Number.MAX_SAFE_INTEGER }),
+    });
+    expect(unsupportedGeneration.status).toBe(400);
+    expect(await unsupportedGeneration.json()).toMatchObject({ error: { code: "invalid_request" } });
+
+    const activate = await call("/v1/retention-policies/policy-v1/activate", {
+      method: "POST",
+      body: JSON.stringify({ expectedControlGeneration: 0 }),
+    });
+    expect(activate.status).toBe(200);
+    const active = await j<{ control: { controlGeneration: number }; policy: { policySha256: string } }>(activate);
+    expect(active).toMatchObject({
+      control: { controlGeneration: 1, activePolicyVersion: "policy-v1" },
+      policy: { policySha256: createdPolicy.policySha256 },
+    });
+    expect((await call("/v1/retention-policies/active")).status).toBe(200);
+    expect((await call("/v1/retention-policies/policy-v1", {
+      headers: { authorization: "Bearer other-key" },
+    })).status).toBe(404);
+
+    const setHold = (holdId: string, expectedControlGeneration: number) => call("/v1/legal-holds", {
+      method: "POST",
+      body: JSON.stringify({
+        holdId,
+        subjectKind: "user",
+        subjectId: "u_1",
+        reasonCode: "litigation",
+        expectedControlGeneration,
+      }),
+    });
+    expect((await setHold("hold_http-one", 0)).status).toBe(200);
+    expect((await setHold("hold_http-two", 1)).status).toBe(200);
+    const held = await call("/v1/legal-holds?subjectKind=user&subjectId=u_1");
+    expect(await held.json()).toMatchObject({
+      control: { controlGeneration: 2, activeHoldCount: 2 },
+      data: [{ holdId: "hold_http-one" }, { holdId: "hold_http-two" }],
+    });
+
+    const release = await call("/v1/legal-holds/hold_http-one/release", {
+      method: "POST",
+      body: JSON.stringify({ expectedControlGeneration: 2, reasonCode: "matter_closed" }),
+    });
+    expect(release.status).toBe(200);
+    expect(await release.json()).toMatchObject({ state: "released", releasedControlGeneration: 3 });
+    expect(await (await call("/v1/legal-holds?subjectKind=user&subjectId=u_1")).json()).toMatchObject({
+      control: { controlGeneration: 3, activeHoldCount: 1 },
+      data: [{ holdId: "hold_http-two" }],
+    });
+    expect((await call("/v1/legal-holds/hold_http-one", {
+      headers: { authorization: "Bearer other-key" },
+    })).status).toBe(404);
+
+    expect((await call("/v1/legal-holds/hold_http-two/release", {
+      method: "POST",
+      body: JSON.stringify({ expectedControlGeneration: 3, reasonCode: "matter_closed" }),
+    })).status).toBe(200);
+    expect(await (await call("/v1/legal-holds?subjectKind=user&subjectId=u_1")).json()).toMatchObject({
+      control: { controlGeneration: 4, activeHoldCount: 0 },
+      data: [],
+    });
+
+    const erasure = await call("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { "idempotency-key": "policy-bound-http" },
+    });
+    expect(erasure.status).toBe(202);
+    const request = [...store.erasureRequests.values()].find((record) => (
+      record.idempotencyKey === "policy-bound-http"
+    ));
+    expect(request).toMatchObject({
+      status: "gated",
+      policyVersion: "policy-v1",
+      policyHash: createdPolicy.policySha256,
+    });
+    expect(request?.availableAtMs).toBeDefined();
+    expect(request?.status).not.toBe("purging");
+    expect(request?.status).not.toBe("completed");
   });
 
   it("replays a subject request without leaking receipts and isolates the same key across users and tenants", async () => {

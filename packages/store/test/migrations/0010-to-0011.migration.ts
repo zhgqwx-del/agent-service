@@ -14,6 +14,8 @@ const FIXTURE_PATH = resolve(HERE, "../fixtures/mysql-0010.sql");
 const MIGRATION_PATH = resolve(HERE, "../../migrations/0011_erasure_and_usage_separation.sql");
 const MIGRATION_0012_PATH = resolve(HERE, "../../migrations/0012_erasure_job_queue.sql");
 const MIGRATION_0013_PATH = resolve(HERE, "../../migrations/0013_erasure_job_control.sql");
+const MIGRATION_0014_PATH = resolve(HERE, "../../migrations/0014_legacy_tombstone_compensation.sql");
+const MIGRATION_0015_PATH = resolve(HERE, "../../migrations/0015_retention_policy_and_legal_holds.sql");
 const THROUGH_0010 = [
   "0001_init.sql",
   "0002_auto_approved.sql",
@@ -209,6 +211,8 @@ describe("real MySQL historical upgrade: 0010 -> 0011", () => {
     await copyFile(MIGRATION_PATH, join(throughLatest, "0011_erasure_and_usage_separation.sql"));
     await copyFile(MIGRATION_0012_PATH, join(throughLatest, "0012_erasure_job_queue.sql"));
     await copyFile(MIGRATION_0013_PATH, join(throughLatest, "0013_erasure_job_control.sql"));
+    await copyFile(MIGRATION_0014_PATH, join(throughLatest, "0014_legacy_tombstone_compensation.sql"));
+    await copyFile(MIGRATION_0015_PATH, join(throughLatest, "0015_retention_policy_and_legal_holds.sql"));
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 

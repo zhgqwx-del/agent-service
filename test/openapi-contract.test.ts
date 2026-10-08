@@ -100,7 +100,7 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(42);
+    expect(operations).toHaveLength(50);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
@@ -165,6 +165,31 @@ describe("committed OpenAPI contract", () => {
     expect(document.components?.schemas?.AgentDefinitionRequest).toMatchObject({
       properties: { mcpServers: { maxItems: 0 }, skills: { maxItems: 0 } },
     });
+    expect(document.paths["/v1/retention-policies/{policyVersion}"]?.put?.parameters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "policyVersion",
+          schema: expect.objectContaining({
+            pattern: "^(?!active$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+          }),
+        }),
+      ]),
+    );
+    expect(document.components?.schemas?.RetentionPolicyPutRequest).toMatchObject({
+      properties: {
+        policy: {
+          properties: {
+            sessionContentRetentionMs: { minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            userErasureGraceMs: { minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            operationalUsageRetentionMs: { minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            idempotencyReceiptRetentionMs: { minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            billingFactRetentionMs: { minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            lifecycleAuditRetentionMs: { minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+            exportArtifactTtlMs: { minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+          },
+        },
+      },
+    });
     expect(document.components?.schemas?.ErrorBody).toMatchObject({
       properties: {
         error: {
@@ -185,19 +210,29 @@ describe("committed OpenAPI contract", () => {
               },
               maxItems: 2,
             },
+            dataGovernance: {
+              items: {
+                enum: ["canonical-retention-v1", "multi-legal-hold-v1"],
+              },
+              maxItems: 2,
+            },
+            dataGovernanceManagement: {
+              default: false,
+              type: "boolean",
+            },
           },
         },
       },
     });
   });
 
-  it("matches all 41 implemented runner routes plus the OpenAPI route in both directions", () => {
+  it("matches all 49 implemented runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     const specKeys = specOperations().map(operationKey).sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(41);
-    expect(registered).toHaveLength(42);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(49);
+    expect(registered).toHaveLength(50);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
   });

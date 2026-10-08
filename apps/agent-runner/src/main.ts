@@ -30,6 +30,7 @@ import {
   type LeaseStore,
   type LifecycleOutboxStore,
   type LegacyTombstoneCompensationStore,
+  type RetentionPolicyStore,
   type SubjectLifecycleStore,
   type SessionStore,
   type UsageLifecycleStore,
@@ -50,6 +51,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & ErasureSessionCatalogStore
     & ErasureUsageReconciliationStore
     & LegacyTombstoneCompensationStore
+    & RetentionPolicyStore
     & UsageLifecycleStore
     & ErasureSessionStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({ url: cfg.MYSQL_URL })
@@ -176,6 +178,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     blobAttachmentsEnabled: cfg.BLOB_ATTACHMENTS_ENABLED,
     erasureRequestsEnabled: cfg.DATA_ERASURE_REQUESTS_ENABLED,
     legacyTombstoneCompensationEnabled: cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED,
+    dataGovernanceManagementEnabled: cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
+    retentionPolicy: store,
     subjectLifecycle: store,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
     ready: () => ready,
@@ -233,7 +237,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, blobs, blobStore, store, lease, bus, cfg,

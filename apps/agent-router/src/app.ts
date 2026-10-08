@@ -2,6 +2,8 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import {
   Capabilities,
+  DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+  DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_ACK_VALUE,
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
@@ -43,6 +45,8 @@ export interface RouterAppDeps {
   blobAttachmentsEnabled?: () => boolean;
   /** Explicit deployment activation gate for the subject-level durable write barrier. */
   erasureRequestsEnabled?: () => boolean;
+  /** Explicit fleet activation gate for canonical policy/legal-hold administration. */
+  dataGovernanceManagementEnabled?: () => boolean;
   /** Shared runner-internal credential. Omission keeps destructive routing disabled. */
   internalRunnerToken?: string;
   logger?: Pick<Console, "info" | "warn" | "error">;
@@ -95,6 +99,7 @@ const IDEMPOTENT_SESSION_DELETE = /^\/v1\/sessions\/[^/]+\/?$/;
 const SESSION_BLOB_UPLOAD = /^\/v1\/sessions\/[^/]+\/blobs\/?$/;
 const USER_ERASURE_REQUEST = /^\/v1\/data-erasure-requests\/?$/;
 const USER_ERASURE_STATUS = /^\/v1\/data-erasure-requests\/[^/]+\/?$/;
+const DATA_GOVERNANCE_MANAGEMENT = /^\/v1\/(?:retention-policies|legal-holds)(?:\/|$)/;
 const USER_SCOPED_RUNTIME = /^\/v1\/(?:sessions(?:\/|$)|usage\/?$|data-erasure-requests(?:\/|$))/;
 const INTERNAL_ERASURE_BODY_MAX_BYTES = 4_096;
 
@@ -143,7 +148,18 @@ export function createRouterApp(deps: RouterAppDeps) {
     // Unlike a reversible read, this durable gate must account for unavailable configured writers:
     // an old runner that recovers later could otherwise ignore the already-accepted subject gate.
     && deps.registry.allConfiguredSupportDataErasureRequests()
+    // Once a tenant can activate a canonical policy, every possible admission writer must bind it.
+    // Old runners may still advertise the earlier erasure bool, so require the additive contract.
+    && deps.registry.allConfiguredSupportDataGovernance()
     && erasureJobControlAvailable()
+  );
+  const dataGovernanceWritersAvailable = () => (
+    deps.registry.allConfiguredSupportDataGovernance()
+  );
+  const dataGovernanceAvailable = () => (
+    (deps.dataGovernanceManagementEnabled?.() ?? false)
+    && dataGovernanceWritersAvailable()
+    && deps.registry.allConfiguredSupportDataGovernanceManagement()
   );
 
   app.get("/healthz", (c) => c.text("ok"));
@@ -184,6 +200,10 @@ export function createRouterApp(deps: RouterAppDeps) {
                 // Fleet rollout state is private control-plane information. External callers only
                 // need the public dataErasureRequests result; workers use the token-protected ACK.
                 erasureJobControl: [],
+                dataGovernance: dataGovernanceWritersAvailable()
+                  ? [DATA_GOVERNANCE_CANONICAL_RETENTION_V1, DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1]
+                  : [],
+                dataGovernanceManagement: dataGovernanceAvailable(),
               },
             } satisfies Capabilities);
           }
@@ -407,9 +427,10 @@ export function createRouterApp(deps: RouterAppDeps) {
       && SESSION_BLOB_UPLOAD.test(url.pathname);
     const isErasureRequest = method === "POST" && USER_ERASURE_REQUEST.test(url.pathname);
     const isErasureStatus = method === "GET" && USER_ERASURE_STATUS.test(url.pathname);
+    const isDataGovernanceManagement = DATA_GOVERNANCE_MANAGEMENT.test(url.pathname);
     const requiresErasureCapableTarget = erasureWriterGateEnabled()
       && USER_SCOPED_RUNTIME.test(url.pathname);
-    if (isErasureRequest || isErasureStatus) {
+    if (isErasureRequest || isErasureStatus || isDataGovernanceManagement) {
       // The same admin credential can act for multiple users, so URI-only caches must never retain
       // either an owned status body or an owner-hiding 404. This also covers router-generated gates.
       c.header("Cache-Control", "no-store");
@@ -461,6 +482,15 @@ export function createRouterApp(deps: RouterAppDeps) {
         error: {
           code: "draining",
           message: "data erasure request status is unavailable while the runner fleet is upgrading",
+          retryable: true,
+        },
+      }, 503);
+    }
+    if (isDataGovernanceManagement && !dataGovernanceAvailable()) {
+      return c.json({
+        error: {
+          code: "draining",
+          message: "retention policy and legal-hold management are unavailable while the runner fleet is upgrading",
           retryable: true,
         },
       }, 503);
@@ -522,8 +552,26 @@ export function createRouterApp(deps: RouterAppDeps) {
         }, 503);
       }
       const targetSupportsErasure = deps.registry.supportsDataErasureRequests(target);
+      const targetSupportsDataGovernance = deps.registry.supportsDataGovernance(target);
+      if (isDataGovernanceManagement && (
+        !dataGovernanceAvailable()
+        || !targetSupportsDataGovernance
+        || !deps.registry.supportsDataGovernanceManagement(target)
+      )) {
+        return c.json({
+          error: {
+            code: "draining",
+            message: "retention policy and legal-hold management are unavailable while the runner fleet is upgrading",
+            retryable: true,
+          },
+        }, 503);
+      }
       if (
-        (isErasureRequest && (!erasureRequestsAvailable() || !targetSupportsErasure))
+        (isErasureRequest && (
+          !erasureRequestsAvailable()
+          || !targetSupportsErasure
+          || !targetSupportsDataGovernance
+        ))
         || (isErasureStatus && (
           !deps.registry.allHealthySupportDataErasureRequests()
           || !erasureJobControlAvailable()
@@ -550,6 +598,7 @@ export function createRouterApp(deps: RouterAppDeps) {
         // Only this exact POST is deduplicated by the runner. A caller-provided Idempotency-Key on an
         // agent/session/api-key POST does not magically make that endpoint safe to replay.
         const safeToRetry = REPLAYABLE.has(method) ||
+          isDataGovernanceManagement ||
           (method === "POST" && !!sessionId && IDEMPOTENT_TURN_POST.test(url.pathname) && !!c.req.header("idempotency-key")?.trim()) ||
           (method === "POST" && isErasureRequest && !!c.req.header("idempotency-key")?.trim()) ||
           (method === "DELETE" && !!sessionId && IDEMPOTENT_SESSION_DELETE.test(url.pathname));
@@ -586,7 +635,7 @@ export function createRouterApp(deps: RouterAppDeps) {
         }
       }
       const response = streamBack(res);
-      if (isErasureRequest || isErasureStatus) {
+      if (isErasureRequest || isErasureStatus || isDataGovernanceManagement) {
         // New runners already send these headers. Reassert them at the public edge so a proxying
         // regression or an unexpected upstream error can never make this identity-scoped route cacheable.
         response.headers.set("Cache-Control", "no-store");

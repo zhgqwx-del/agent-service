@@ -271,7 +271,7 @@ export interface TransitionErasureJobOptions {
   availableAtMs?: number;
   /** Required only when entering blocked. */
   errorCode?: ErasureJobErrorCode;
-  /** Optional immutable policy identity carried forward once selected. */
+  /** May only repeat the immutable identity selected at admission; it cannot bind old backlog. */
   policyVersion?: string;
   policyHash?: string;
   /** Completion proof contains aggregate counts/checksum only, never content. */
@@ -821,7 +821,15 @@ export function validateErasureAuditChain(
     ) throw new Error("erasure request audit chain is corrupt");
     emittedAtMs = audit.emittedAtMs;
     if (index === 0) {
-      assertExactAuditPayloadKeys(audit.payload, ["status", "subjectKind", "generation"]);
+      const initialPolicyVersion = audit.payload.policyVersion;
+      const initialPolicyHash = audit.payload.policyHash;
+      const carriesPolicy = initialPolicyVersion !== undefined || initialPolicyHash !== undefined;
+      assertExactAuditPayloadKeys(audit.payload, [
+        "status",
+        "subjectKind",
+        "generation",
+        ...(carriesPolicy ? ["policyVersion", "policyHash"] : []),
+      ]);
       if (
         audit.type !== "erasure/gated"
         || audit.payload.status !== "gated"
@@ -829,6 +837,14 @@ export function validateErasureAuditChain(
         || audit.payload.generation !== record.generation
         || audit.emittedAtMs !== record.gatedAtMs
       ) throw new Error("erasure request gated audit identity is corrupt");
+      if (carriesPolicy) {
+        if (typeof initialPolicyVersion !== "string" || typeof initialPolicyHash !== "string") {
+          throw new Error("erasure request gated audit policy identity is incomplete");
+        }
+        validatePolicyIdentity(initialPolicyVersion, initialPolicyHash);
+        policyVersion = initialPolicyVersion;
+        policyHash = initialPolicyHash;
+      }
       continue;
     }
 

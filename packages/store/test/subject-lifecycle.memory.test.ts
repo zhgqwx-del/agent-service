@@ -5,7 +5,6 @@ import {
   SessionGoneError,
   SubjectDeletingError,
   newErasureRequestId,
-  subjectLifecycleKey,
   userErasureRequestHash,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
@@ -270,9 +269,16 @@ describe("MemorySessionStore subject lifecycle", () => {
     const store = new MemorySessionStore();
     const session = mkSession("tenant-held", "user-held");
     await store.createSession(session);
-    const tenantKey = subjectLifecycleKey(session.tenantId, "tenant", session.tenantId);
-    const tenant = store.subjectLifecycles.get(tenantKey)!;
-    store.subjectLifecycles.set(tenantKey, { ...tenant, legalHoldAtMs: 123 });
+    await store.setLegalHold({
+      tenantId: session.tenantId,
+      holdId: "hold_tenant_usage",
+      subjectKind: "tenant",
+      subjectId: session.tenantId,
+      reasonCode: "litigation",
+      expectedControlGeneration: 0,
+      actorKeyId: "legal-admin",
+      atMs: 123,
+    });
 
     // This assertion deliberately inspects only the trusted hook integration. Full reconcile and
     // anonymize behavior (including preserving rows) is covered by usage-lifecycle.memory.test.ts.

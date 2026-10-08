@@ -13,6 +13,7 @@ import {
   billingUsageFactFromLedger,
   canonicalBillingCostCNY,
   isUsageId,
+  newLegalHoldId,
   newUsageId,
   type BillingUsageFact,
 } from "../src/index.js";
@@ -738,22 +739,31 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           enabled: true,
         })).rejects.toBeInstanceOf(UsageReconciliationError);
 
-        await conn.query(
-          `UPDATE subject_lifecycle SET legal_hold_at_ms=?
-            WHERE tenant_id=? AND subject_kind='user' AND subject_id=?`,
-          [MONTH_START + 250, target.tenantId, target.userId],
-        );
+        const firstHoldId = newLegalHoldId();
+        await store.setLegalHold({
+          tenantId: target.tenantId,
+          holdId: firstHoldId,
+          subjectKind: "user",
+          subjectId: target.userId,
+          reasonCode: "billing_dispute",
+          expectedControlGeneration: 0,
+          actorKeyId: "usage-test",
+          atMs: MONTH_START + 250,
+        });
         await expect(store.anonymizeSessionUsage({
           ...lifecycleInput,
           nowMs: MONTH_START + 300,
           expectedChecksum: verified.checksum,
           enabled: true,
         })).rejects.toBeInstanceOf(UsageLegalHoldError);
-        await conn.query(
-          `UPDATE subject_lifecycle SET legal_hold_at_ms=NULL
-            WHERE tenant_id=? AND subject_kind='user' AND subject_id=?`,
-          [target.tenantId, target.userId],
-        );
+        await store.releaseLegalHold({
+          tenantId: target.tenantId,
+          holdId: firstHoldId,
+          expectedControlGeneration: 1,
+          reasonCode: "matter_closed",
+          actorKeyId: "usage-test",
+          atMs: MONTH_START + 275,
+        });
 
         const anonymized = await store.anonymizeSessionUsage({
           ...lifecycleInput,
@@ -762,11 +772,16 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           enabled: true,
         });
         expect(anonymized).toMatchObject({ status: "anonymized", anonymizedAtMs: MONTH_START + 300 });
-        await conn.query(
-          `UPDATE subject_lifecycle SET legal_hold_at_ms=?
-            WHERE tenant_id=? AND subject_kind='user' AND subject_id=?`,
-          [MONTH_START + 350, target.tenantId, target.userId],
-        );
+        await store.setLegalHold({
+          tenantId: target.tenantId,
+          holdId: newLegalHoldId(),
+          subjectKind: "user",
+          subjectId: target.userId,
+          reasonCode: "litigation",
+          expectedControlGeneration: 2,
+          actorKeyId: "usage-test",
+          atMs: MONTH_START + 350,
+        });
         const replay = await store.anonymizeSessionUsage({
           ...lifecycleInput,
           nowMs: MONTH_START + 400,

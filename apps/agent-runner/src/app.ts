@@ -13,6 +13,8 @@ import {
   ApprovalResponseRequest,
   CreateApiKeyRequest,
   CreateSessionRequest,
+  DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+  DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   DynamicToolResultRequest,
   ErrorBody,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
@@ -23,6 +25,10 @@ import {
   ErasureRequestHeaders,
   ErasureRequestParams,
   ItemListQuery,
+  LegalHoldListQuery,
+  LegalHoldParams,
+  LegalHoldReleaseRequest,
+  LegalHoldSetRequest,
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_ACK_VALUE,
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
@@ -34,6 +40,9 @@ import {
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
   Pagination,
+  RetentionPolicyActivateRequest,
+  RetentionPolicyParams,
+  RetentionPolicyPutRequest,
   isCanonicalId,
   type IdPrefix,
   ProviderIdParams,
@@ -51,15 +60,23 @@ import {
   ImageMediaType,
   type Event,
   type ErasureRequest,
+  UserId,
 } from "@agent-service/protocol";
 import type { SessionHost, ToolRegistry } from "@agent-service/core";
 import { ErasureLocalTurnFencedError, newId } from "@agent-service/core";
 import {
   ErasureIdempotencyMismatchError,
+  LegalHoldConflictError,
+  LegalHoldGenerationConflictError,
+  LegalHoldNotFoundError,
+  RetentionPolicyGenerationConflictError,
+  RetentionPolicyNotFoundError,
+  RetentionPolicyVersionConflictError,
   erasureWriteAuthorizationMatches,
   newErasureRequestId,
   publicErasureRequestStatus,
   userErasureRequestHash,
+  type RetentionPolicyStore,
   type SessionStore,
   type SubjectLifecycleStore,
 } from "@agent-service/store";
@@ -85,6 +102,9 @@ export interface AppDeps {
   erasureRequestsEnabled?: boolean;
   /** Advertise the irreversible generation-zero compensation contract only while its worker runs. */
   legacyTombstoneCompensationEnabled?: boolean;
+  /** Canonical policy/legal-hold management; independent from and incapable of physical purge. */
+  dataGovernanceManagementEnabled?: boolean;
+  retentionPolicy?: RetentionPolicyStore;
   subjectLifecycle?: SubjectLifecycleStore;
   ready: () => boolean;
   /** decrypts a tenant's stored auth secret (HS256 key / introspection credential) */
@@ -112,6 +132,21 @@ function internalTokenMatches(received: string | undefined, expected: string): b
   const left = createHash("sha256").update(received ?? "").digest();
   const right = createHash("sha256").update(expected).digest();
   return received !== undefined && timingSafeEqual(left, right);
+}
+
+function governanceApiError(error: unknown): never {
+  if (
+    error instanceof RetentionPolicyVersionConflictError
+    || error instanceof RetentionPolicyGenerationConflictError
+    || error instanceof LegalHoldConflictError
+    || error instanceof LegalHoldGenerationConflictError
+  ) {
+    throw new ApiError("state_conflict", error.message);
+  }
+  if (error instanceof RetentionPolicyNotFoundError || error instanceof LegalHoldNotFoundError) {
+    throw new ApiError("not_found", error.message);
+  }
+  throw error;
 }
 
 export function createApp(deps: AppDeps) {
@@ -163,6 +198,13 @@ export function createApp(deps: AppDeps) {
                 ? [ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1]
                 : []),
             ],
+        // Code-awareness is distinct from endpoint activation: the router uses this durable-writer
+        // signal to prevent an old erasure admission path from omitting an already-active policy.
+        dataGovernance: deps.retentionPolicy !== undefined
+          ? [DATA_GOVERNANCE_CANONICAL_RETENTION_V1, DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1]
+          : [],
+        dataGovernanceManagement: deps.retentionPolicy !== undefined
+          && deps.dataGovernanceManagementEnabled === true,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -247,6 +289,9 @@ export function createApp(deps: AppDeps) {
   // validation so success and every 4xx/5xx response are forbidden from entering a cache.
   v1.use("/data-erasure-requests", privateResponseHeaders);
   v1.use("/data-erasure-requests/:requestId", privateResponseHeaders);
+  v1.use("/retention-policies/*", privateResponseHeaders);
+  v1.use("/legal-holds", privateResponseHeaders);
+  v1.use("/legal-holds/*", privateResponseHeaders);
   /**
    * Reject any non-canonical id before it reaches the store or the lease.
    * A case variant of a session id used to find the real row (MySQL's default collation is
@@ -593,6 +638,126 @@ export function createApp(deps: AppDeps) {
     const record = await deps.subjectLifecycle.getUserErasureRequest(principal.tenantId, principal.userId, requestId);
     if (!record) throw new ApiError("not_found", "erasure request not found");
     return c.json(publicErasureRequest(record));
+  });
+
+  const governanceStore = () => {
+    if (!deps.dataGovernanceManagementEnabled || !deps.retentionPolicy) {
+      throw new ApiError("draining", "retention policy and legal-hold management are not activated on this fleet");
+    }
+    return deps.retentionPolicy;
+  };
+
+  v1.put("/retention-policies/:policyVersion", async (c) => {
+    requireAdmin(c);
+    const store = governanceStore();
+    const { policyVersion } = await parse(RetentionPolicyParams, c.req.param());
+    const input = await parse(RetentionPolicyPutRequest, await json(c));
+    try {
+      return c.json(await store.putRetentionPolicy({
+        tenantId: c.get("tenantId"),
+        policyVersion,
+        policy: input.policy,
+        actorKeyId: c.get("apiKeyId"),
+        atMs: Date.now(),
+      }));
+    } catch (error) {
+      governanceApiError(error);
+    }
+  });
+  v1.post("/retention-policies/:policyVersion/activate", async (c) => {
+    requireAdmin(c);
+    const store = governanceStore();
+    const { policyVersion } = await parse(RetentionPolicyParams, c.req.param());
+    const input = await parse(RetentionPolicyActivateRequest, await json(c));
+    try {
+      const control = await store.activateRetentionPolicy({
+        tenantId: c.get("tenantId"),
+        policyVersion,
+        expectedControlGeneration: input.expectedControlGeneration,
+        actorKeyId: c.get("apiKeyId"),
+        atMs: Date.now(),
+      });
+      const policy = await store.getRetentionPolicy(c.get("tenantId"), policyVersion);
+      if (!policy) throw new Error("activated retention policy disappeared");
+      return c.json({ control, policy });
+    } catch (error) {
+      governanceApiError(error);
+    }
+  });
+  // Register the fixed segment before the parameter route for routers/frameworks that preserve
+  // declaration order when matching an otherwise-valid policy version named "active".
+  v1.get("/retention-policies/active", async (c) => {
+    requireAdmin(c);
+    const active = await governanceStore().getActiveRetentionPolicy(c.get("tenantId"));
+    if (!active) throw new ApiError("not_found", "no active retention policy");
+    return c.json(active);
+  });
+  v1.get("/retention-policies/:policyVersion", async (c) => {
+    requireAdmin(c);
+    const { policyVersion } = await parse(RetentionPolicyParams, c.req.param());
+    const policy = await governanceStore().getRetentionPolicy(c.get("tenantId"), policyVersion);
+    if (!policy) throw new ApiError("not_found", "retention policy not found");
+    return c.json(policy);
+  });
+  v1.post("/legal-holds", async (c) => {
+    requireAdmin(c);
+    const store = governanceStore();
+    const input = await parse(LegalHoldSetRequest, await json(c));
+    const tenantId = c.get("tenantId");
+    if (
+      (input.subjectKind === "tenant" && input.subjectId !== tenantId)
+      || (input.subjectKind === "user" && !UserId.safeParse(input.subjectId).success)
+    ) throw new ApiError("invalid_request", "legal hold subject does not match its declared scope");
+    try {
+      return c.json(await store.setLegalHold({
+        ...input,
+        tenantId,
+        actorKeyId: c.get("apiKeyId"),
+        atMs: Date.now(),
+      }));
+    } catch (error) {
+      governanceApiError(error);
+    }
+  });
+  v1.post("/legal-holds/:holdId/release", async (c) => {
+    requireAdmin(c);
+    const store = governanceStore();
+    const { holdId } = await parse(LegalHoldParams, c.req.param());
+    const input = await parse(LegalHoldReleaseRequest, await json(c));
+    try {
+      return c.json(await store.releaseLegalHold({
+        ...input,
+        tenantId: c.get("tenantId"),
+        holdId,
+        actorKeyId: c.get("apiKeyId"),
+        atMs: Date.now(),
+      }));
+    } catch (error) {
+      governanceApiError(error);
+    }
+  });
+  v1.get("/legal-holds/:holdId", async (c) => {
+    requireAdmin(c);
+    const { holdId } = await parse(LegalHoldParams, c.req.param());
+    const hold = await governanceStore().getLegalHold(c.get("tenantId"), holdId);
+    if (!hold) throw new ApiError("not_found", "legal hold not found");
+    return c.json(hold);
+  });
+  v1.get("/legal-holds", async (c) => {
+    requireAdmin(c);
+    const store = governanceStore();
+    const query = await parse(LegalHoldListQuery, c.req.query());
+    const tenantId = c.get("tenantId");
+    if (
+      (query.subjectKind === "tenant" && query.subjectId !== tenantId)
+      || (query.subjectKind === "user" && !UserId.safeParse(query.subjectId).success)
+    ) throw new ApiError("invalid_request", "legal hold subject does not match its declared scope");
+    const state = await store.getActiveLegalHoldState(
+      tenantId,
+      query.subjectKind,
+      query.subjectId,
+    );
+    return c.json({ control: state.control, data: state.holds });
   });
 
   // ---------- items / events ----------

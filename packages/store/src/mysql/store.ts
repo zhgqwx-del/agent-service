@@ -229,6 +229,47 @@ import {
   type ScheduleLegacyTombstoneCandidatesOptions,
   type ScheduleLegacyTombstoneCompensationInput,
 } from "../legacy-tombstone.js";
+import {
+  LEGAL_HOLD_REASON_CODES,
+  LEGAL_HOLD_RELEASE_REASON_CODES,
+  RETENTION_POLICY_DURATION_FIELDS,
+  RETENTION_POLICY_SCHEMA_VERSION,
+  LegalHoldConflictError,
+  LegalHoldGenerationConflictError,
+  LegalHoldIntegrityError,
+  LegalHoldNotFoundError,
+  RetentionPolicyGenerationConflictError,
+  RetentionPolicyNotFoundError,
+  RetentionPolicyVersionConflictError,
+  compareLegalHoldIds,
+  legalHoldControlSha256,
+  legalHoldProjectionSha256,
+  retentionPolicyControlSha256,
+  retentionPolicySha256,
+  validateActivateRetentionPolicyInput,
+  validateLegalHoldControlRecord,
+  validateLegalHoldRecord,
+  validatePutRetentionPolicyInput,
+  validateReleaseLegalHoldInput,
+  validateRetentionPolicyControlRecord,
+  validateRetentionPolicyIdentity,
+  validateRetentionPolicyTenantId,
+  validateRetentionPolicyVersionRecord,
+  validateSetLegalHoldInput,
+  type ActivateRetentionPolicyInput,
+  type ActiveRetentionPolicy,
+  type LegalHoldControlRecord,
+  type LegalHoldEvent,
+  type LegalHoldRecord,
+  type PutRetentionPolicyInput,
+  type ReleaseLegalHoldInput,
+  type RetentionPolicyActivationEvent,
+  type RetentionPolicyControlRecord,
+  type RetentionPolicyDocumentV1,
+  type RetentionPolicyStore,
+  type RetentionPolicyVersionRecord,
+  type SetLegalHoldInput,
+} from "../retention-policy.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -268,6 +309,30 @@ const LEGACY_TOMBSTONE_JOB_COLUMNS = `job_id, session_id, tenant_id, user_id, so
 const LEGACY_TOMBSTONE_EVENT_COLUMNS = `result_event_id, job_id, session_id, control_generation,
   event_type, reason_code, actor_key_id, claim_attempt, source_deleted_at_ms,
   target_deletion_generation, terminal_event_seq, before_sha256, after_sha256, emitted_at_ms`;
+const RETENTION_POLICY_VERSION_COLUMNS = `tenant_id, policy_version, schema_version,
+  session_content_retention_ms, user_erasure_grace_ms, operational_usage_retention_ms,
+  idempotency_receipt_retention_ms, billing_fact_retention_ms, lifecycle_audit_retention_ms,
+  export_artifact_ttl_ms, policy_sha256, created_by_key_id, created_at_ms`;
+const RETENTION_POLICY_CONTROL_COLUMNS = `tenant_id, control_generation, active_policy_version,
+  active_policy_sha256, effective_at_ms, updated_at_ms`;
+const RETENTION_POLICY_ACTIVATION_EVENT_COLUMNS = `event_id, tenant_id, control_generation,
+  policy_version, policy_sha256, effective_at_ms, actor_key_id, before_sha256, after_sha256,
+  emitted_at_ms`;
+const LEGAL_HOLD_CONTROL_COLUMNS = `tenant_id, subject_kind, subject_id, control_generation,
+  active_hold_count, active_projection_sha256, updated_at_ms`;
+const LEGAL_HOLD_COLUMNS = `tenant_id, hold_id, subject_kind, subject_id, state, reason_code,
+  external_reference_sha256, created_control_generation, created_by_key_id, created_at_ms,
+  released_control_generation, released_by_key_id, released_at_ms, release_reason_code`;
+const LEGAL_HOLD_EVENT_COLUMNS = `event_id, tenant_id, subject_kind, subject_id,
+  control_generation, hold_id, event_type, reason_code, external_reference_sha256, actor_key_id,
+  before_sha256, after_sha256, emitted_at_ms`;
+const EMPTY_LEGAL_HOLD_PROJECTION_SHA256 = legalHoldProjectionSha256([]);
+interface LegalHoldContext {
+  lifecycle?: SubjectLifecycleRecord;
+  control: LegalHoldControlRecord;
+  holds: LegalHoldRecord[];
+  events: LegalHoldEvent[];
+}
 const LEGACY_TOMBSTONE_JOB_EVIDENCE_FIELDS = [
   "job_id",
   "session_id",
@@ -991,6 +1056,193 @@ function mysqlSafeInteger(value: unknown, label: string): number {
   throw new Error(`${label} is not a non-negative integer`);
 }
 
+function rowToRetentionPolicyVersion(row: Row): RetentionPolicyVersionRecord {
+  const policy: RetentionPolicyDocumentV1 = {
+    sessionContentRetentionMs: row.session_content_retention_ms == null
+      ? null
+      : mysqlSafeInteger(row.session_content_retention_ms, "stored session content retention"),
+    userErasureGraceMs: row.user_erasure_grace_ms == null
+      ? null
+      : mysqlSafeInteger(row.user_erasure_grace_ms, "stored user erasure grace"),
+    operationalUsageRetentionMs: row.operational_usage_retention_ms == null
+      ? null
+      : mysqlSafeInteger(row.operational_usage_retention_ms, "stored operational usage retention"),
+    idempotencyReceiptRetentionMs: row.idempotency_receipt_retention_ms == null
+      ? null
+      : mysqlSafeInteger(row.idempotency_receipt_retention_ms, "stored idempotency receipt retention"),
+    billingFactRetentionMs: row.billing_fact_retention_ms == null
+      ? null
+      : mysqlSafeInteger(row.billing_fact_retention_ms, "stored billing fact retention"),
+    lifecycleAuditRetentionMs: row.lifecycle_audit_retention_ms == null
+      ? null
+      : mysqlSafeInteger(row.lifecycle_audit_retention_ms, "stored lifecycle audit retention"),
+    exportArtifactTtlMs: row.export_artifact_ttl_ms == null
+      ? null
+      : mysqlSafeInteger(row.export_artifact_ttl_ms, "stored export artifact ttl"),
+  };
+  const record: RetentionPolicyVersionRecord = {
+    tenantId: String(row.tenant_id),
+    policyVersion: String(row.policy_version),
+    schemaVersion: mysqlSafeInteger(
+      row.schema_version,
+      "stored retention policy schema version",
+    ) as typeof RETENTION_POLICY_SCHEMA_VERSION,
+    policy,
+    policySha256: String(row.policy_sha256),
+    createdByKeyId: String(row.created_by_key_id),
+    createdAtMs: mysqlSafeInteger(row.created_at_ms, "stored retention policy creation timestamp"),
+  };
+  validateRetentionPolicyVersionRecord(record);
+  return record;
+}
+
+function rowToRetentionPolicyControl(row: Row): RetentionPolicyControlRecord {
+  const record: RetentionPolicyControlRecord = {
+    tenantId: String(row.tenant_id),
+    controlGeneration: mysqlSafeInteger(
+      row.control_generation,
+      "stored retention policy control generation",
+    ),
+    ...(row.active_policy_version == null
+      ? {}
+      : { activePolicyVersion: String(row.active_policy_version) }),
+    ...(row.active_policy_sha256 == null
+      ? {}
+      : { activePolicySha256: String(row.active_policy_sha256) }),
+    ...(row.effective_at_ms == null
+      ? {}
+      : { effectiveAtMs: mysqlSafeInteger(row.effective_at_ms, "stored retention policy effective timestamp") }),
+    updatedAtMs: mysqlSafeInteger(row.updated_at_ms, "stored retention policy update timestamp"),
+  };
+  validateRetentionPolicyControlRecord(record);
+  return record;
+}
+
+const MANAGEMENT_ACTOR_KEY_ID = /^[A-Za-z0-9._-]{1,64}$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+function rowToRetentionPolicyActivationEvent(row: Row): RetentionPolicyActivationEvent {
+  const event: RetentionPolicyActivationEvent = {
+    eventId: mysqlSafeInteger(row.event_id, "stored retention policy activation event id"),
+    tenantId: String(row.tenant_id),
+    controlGeneration: mysqlSafeInteger(
+      row.control_generation,
+      "stored retention policy activation generation",
+    ),
+    policyVersion: String(row.policy_version),
+    policySha256: String(row.policy_sha256),
+    effectiveAtMs: mysqlSafeInteger(row.effective_at_ms, "stored retention policy activation timestamp"),
+    actorKeyId: String(row.actor_key_id),
+    beforeSha256: String(row.before_sha256),
+    afterSha256: String(row.after_sha256),
+    emittedAtMs: mysqlSafeInteger(row.emitted_at_ms, "stored retention policy event timestamp"),
+  };
+  validateRetentionPolicyIdentity(event.tenantId, event.policyVersion);
+  if (
+    event.eventId <= 0
+    || event.controlGeneration <= 0
+    || !SHA256_HEX.test(event.policySha256)
+    || !MANAGEMENT_ACTOR_KEY_ID.test(event.actorKeyId)
+    || !SHA256_HEX.test(event.beforeSha256)
+    || !SHA256_HEX.test(event.afterSha256)
+    || event.emittedAtMs < event.effectiveAtMs
+  ) throw new Error("stored retention policy activation event is invalid");
+  return event;
+}
+
+function rowToLegalHoldControl(row: Row): LegalHoldControlRecord {
+  const record: LegalHoldControlRecord = {
+    tenantId: String(row.tenant_id),
+    subjectKind: String(row.subject_kind) as DataSubjectKind,
+    subjectId: String(row.subject_id),
+    controlGeneration: mysqlSafeInteger(row.control_generation, "stored legal hold generation"),
+    activeHoldCount: mysqlSafeInteger(row.active_hold_count, "stored legal hold active count"),
+    activeProjectionSha256: String(row.active_projection_sha256),
+    updatedAtMs: mysqlSafeInteger(row.updated_at_ms, "stored legal hold update timestamp"),
+  };
+  validateLegalHoldControlRecord(record);
+  return record;
+}
+
+function rowToLegalHold(row: Row): LegalHoldRecord {
+  const record: LegalHoldRecord = {
+    tenantId: String(row.tenant_id),
+    holdId: String(row.hold_id),
+    subjectKind: String(row.subject_kind) as DataSubjectKind,
+    subjectId: String(row.subject_id),
+    state: String(row.state) as LegalHoldRecord["state"],
+    reasonCode: String(row.reason_code) as LegalHoldRecord["reasonCode"],
+    ...(row.external_reference_sha256 == null
+      ? {}
+      : { externalReferenceSha256: String(row.external_reference_sha256) }),
+    createdControlGeneration: mysqlSafeInteger(
+      row.created_control_generation,
+      "stored legal hold creation generation",
+    ),
+    createdByKeyId: String(row.created_by_key_id),
+    createdAtMs: mysqlSafeInteger(row.created_at_ms, "stored legal hold creation timestamp"),
+    ...(row.released_control_generation == null
+      ? {}
+      : {
+          releasedControlGeneration: mysqlSafeInteger(
+            row.released_control_generation,
+            "stored legal hold release generation",
+          ),
+        }),
+    ...(row.released_by_key_id == null ? {} : { releasedByKeyId: String(row.released_by_key_id) }),
+    ...(row.released_at_ms == null
+      ? {}
+      : { releasedAtMs: mysqlSafeInteger(row.released_at_ms, "stored legal hold release timestamp") }),
+    ...(row.release_reason_code == null
+      ? {}
+      : { releaseReasonCode: String(row.release_reason_code) as LegalHoldRecord["releaseReasonCode"] }),
+  };
+  validateLegalHoldRecord(record);
+  return record;
+}
+
+function rowToLegalHoldEvent(row: Row): LegalHoldEvent {
+  const event: LegalHoldEvent = {
+    eventId: mysqlSafeInteger(row.event_id, "stored legal hold event id"),
+    tenantId: String(row.tenant_id),
+    subjectKind: String(row.subject_kind) as DataSubjectKind,
+    subjectId: String(row.subject_id),
+    controlGeneration: mysqlSafeInteger(row.control_generation, "stored legal hold event generation"),
+    holdId: String(row.hold_id),
+    eventType: String(row.event_type) as LegalHoldEvent["eventType"],
+    reasonCode: String(row.reason_code) as LegalHoldEvent["reasonCode"],
+    ...(row.external_reference_sha256 == null
+      ? {}
+      : { externalReferenceSha256: String(row.external_reference_sha256) }),
+    actorKeyId: String(row.actor_key_id),
+    beforeSha256: String(row.before_sha256),
+    afterSha256: String(row.after_sha256),
+    emittedAtMs: mysqlSafeInteger(row.emitted_at_ms, "stored legal hold event timestamp"),
+  };
+  const validReason = event.eventType === "legal_hold/set"
+    ? LEGAL_HOLD_REASON_CODES.includes(event.reasonCode as LegalHoldRecord["reasonCode"])
+    : event.eventType === "legal_hold/released"
+      ? LEGAL_HOLD_RELEASE_REASON_CODES.includes(
+          event.reasonCode as NonNullable<LegalHoldRecord["releaseReasonCode"]>,
+        )
+      : false;
+  const subjectValid = event.subjectKind === "tenant"
+    ? event.subjectId === event.tenantId
+    : event.subjectKind === "user" && event.subjectId.length > 0;
+  if (
+    event.eventId <= 0
+    || event.controlGeneration <= 0
+    || !subjectValid
+    || !/^hold_[A-Za-z0-9][A-Za-z0-9._-]{0,58}$/.test(event.holdId)
+    || !validReason
+    || (event.externalReferenceSha256 !== undefined && !SHA256_HEX.test(event.externalReferenceSha256))
+    || !MANAGEMENT_ACTOR_KEY_ID.test(event.actorKeyId)
+    || !SHA256_HEX.test(event.beforeSha256)
+    || !SHA256_HEX.test(event.afterSha256)
+  ) throw new LegalHoldIntegrityError("stored legal hold event is invalid");
+  return event;
+}
+
 function rowToErasureControlEvent(row: Row): ErasureJobControlEvent {
   const event: ErasureJobControlEvent = {
     controlEventId: mysqlSafeInteger(row.control_event_id, "stored erasure control event id"),
@@ -1184,7 +1436,8 @@ export class MysqlSessionStore implements
   ErasureSessionStore,
   ErasureSessionCatalogStore,
   ErasureUsageReconciliationStore,
-  LegacyTombstoneCompensationStore
+  LegacyTombstoneCompensationStore,
+  RetentionPolicyStore
 {
   private constructor(private readonly pool: Pool) {}
 
@@ -3060,6 +3313,1112 @@ export class MysqlSessionStore implements
     }
   }
 
+  // ---------- retention policy and legal holds ----------
+  private async loadRetentionPolicyVersion(
+    conn: PoolConnection,
+    tenantId: string,
+    policyVersion: string,
+    lockClause = "",
+  ): Promise<RetentionPolicyVersionRecord | null> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${RETENTION_POLICY_VERSION_COLUMNS}
+         FROM retention_policy_versions
+        WHERE tenant_id=? AND policy_version=? ${lockClause}`,
+      [tenantId, policyVersion],
+    );
+    return rows[0] ? rowToRetentionPolicyVersion(rows[0]) : null;
+  }
+
+  async putRetentionPolicy(input: PutRetentionPolicyInput): Promise<RetentionPolicyVersionRecord> {
+    input = structuredClone(input);
+    validatePutRetentionPolicyInput(input);
+    const record: RetentionPolicyVersionRecord = {
+      tenantId: input.tenantId,
+      policyVersion: input.policyVersion,
+      schemaVersion: RETENTION_POLICY_SCHEMA_VERSION,
+      policy: structuredClone(input.policy),
+      policySha256: retentionPolicySha256(input.tenantId, input.policyVersion, input.policy),
+      createdByKeyId: input.actorKeyId,
+      createdAtMs: input.atMs,
+    };
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      // All policy writers take the per-tenant control before immutable versions. Activation and
+      // erasure binding use the same order, avoiding a control/version lock inversion.
+      await conn.query(
+        `INSERT IGNORE INTO retention_policy_controls
+           (tenant_id, control_generation, active_policy_version, active_policy_sha256,
+            effective_at_ms, updated_at_ms)
+         VALUES (?,0,NULL,NULL,NULL,0)`,
+        [input.tenantId],
+      );
+      await conn.query(
+        `INSERT IGNORE INTO retention_policy_versions
+           (tenant_id, policy_version, schema_version, session_content_retention_ms,
+            user_erasure_grace_ms, operational_usage_retention_ms,
+            idempotency_receipt_retention_ms, billing_fact_retention_ms,
+            lifecycle_audit_retention_ms, export_artifact_ttl_ms, policy_sha256,
+            created_by_key_id, created_at_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          record.tenantId,
+          record.policyVersion,
+          record.schemaVersion,
+          record.policy.sessionContentRetentionMs,
+          record.policy.userErasureGraceMs,
+          record.policy.operationalUsageRetentionMs,
+          record.policy.idempotencyReceiptRetentionMs,
+          record.policy.billingFactRetentionMs,
+          record.policy.lifecycleAuditRetentionMs,
+          record.policy.exportArtifactTtlMs,
+          record.policySha256,
+          record.createdByKeyId,
+          record.createdAtMs,
+        ],
+      );
+      const stored = await this.loadRetentionPolicyVersion(
+        conn,
+        input.tenantId,
+        input.policyVersion,
+        "FOR SHARE",
+      );
+      if (
+        !stored
+        || stored.policySha256 !== record.policySha256
+        || RETENTION_POLICY_DURATION_FIELDS.some(
+          (field) => stored.policy[field] !== record.policy[field],
+        )
+      ) {
+        throw new RetentionPolicyVersionConflictError(input.policyVersion);
+      }
+      // Creation metadata belongs to the first successful immutable write. A retry carrying a new
+      // request timestamp or actor is still the same policy document and must not rewrite history.
+      await conn.commit();
+      return stored;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async activateRetentionPolicy(
+    input: ActivateRetentionPolicyInput,
+  ): Promise<RetentionPolicyControlRecord> {
+    input = structuredClone(input);
+    validateActivateRetentionPolicyInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [controlRows] = await conn.query<Row[]>(
+        `SELECT ${RETENTION_POLICY_CONTROL_COLUMNS}
+           FROM retention_policy_controls WHERE tenant_id=? FOR UPDATE`,
+        [input.tenantId],
+      );
+      if (!controlRows[0]) throw new RetentionPolicyNotFoundError(input.policyVersion);
+      const current = rowToRetentionPolicyControl(controlRows[0]);
+      const validatedActive = await this.loadValidatedActiveRetentionPolicy(
+        conn,
+        input.tenantId,
+        "FOR UPDATE",
+      );
+      if (
+        (current.controlGeneration === 0 && validatedActive !== null)
+        || (current.controlGeneration > 0 && (
+          !validatedActive
+          || retentionPolicyControlSha256(validatedActive.control)
+            !== retentionPolicyControlSha256(current)
+        ))
+      ) throw new Error("retention policy control changed or failed audit validation");
+      const policy = await this.loadRetentionPolicyVersion(
+        conn,
+        input.tenantId,
+        input.policyVersion,
+        "FOR SHARE",
+      );
+      if (!policy) throw new RetentionPolicyNotFoundError(input.policyVersion);
+
+      if (input.expectedControlGeneration !== current.controlGeneration) {
+        // Only the immediately preceding exact activation is replayable. This closes the
+        // response-lost window without turning an arbitrarily stale generation into authority.
+        if (
+          input.expectedControlGeneration + 1 === current.controlGeneration
+          && current.activePolicyVersion === policy.policyVersion
+          && current.activePolicySha256 === policy.policySha256
+        ) {
+          const [tailRows] = await conn.query<Row[]>(
+            `SELECT ${RETENTION_POLICY_ACTIVATION_EVENT_COLUMNS}
+               FROM retention_policy_activation_events
+              WHERE tenant_id=? AND control_generation=? FOR SHARE`,
+            [input.tenantId, current.controlGeneration],
+          );
+          const tail = tailRows[0] ? rowToRetentionPolicyActivationEvent(tailRows[0]) : undefined;
+          if (
+            tail
+            && tail.policyVersion === input.policyVersion
+            && tail.policySha256 === policy.policySha256
+            && tail.afterSha256 === retentionPolicyControlSha256(current)
+          ) {
+            await conn.commit();
+            return current;
+          }
+        }
+        throw new RetentionPolicyGenerationConflictError(
+          input.expectedControlGeneration,
+          current.controlGeneration,
+        );
+      }
+      if (
+        current.activePolicyVersion === policy.policyVersion
+        && current.activePolicySha256 === policy.policySha256
+      ) {
+        await conn.commit();
+        return current;
+      }
+      if (current.controlGeneration + 1 >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("retention policy control generation is exhausted");
+      }
+      const effectiveAtMs = Math.max(input.atMs, current.updatedAtMs);
+      const next: RetentionPolicyControlRecord = {
+        tenantId: input.tenantId,
+        controlGeneration: current.controlGeneration + 1,
+        activePolicyVersion: policy.policyVersion,
+        activePolicySha256: policy.policySha256,
+        effectiveAtMs,
+        updatedAtMs: effectiveAtMs,
+      };
+      validateRetentionPolicyControlRecord(next);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE retention_policy_controls
+            SET control_generation=?, active_policy_version=?, active_policy_sha256=?,
+                effective_at_ms=?, updated_at_ms=?
+          WHERE tenant_id=? AND control_generation=?`,
+        [
+          next.controlGeneration,
+          next.activePolicyVersion,
+          next.activePolicySha256,
+          next.effectiveAtMs,
+          next.updatedAtMs,
+          input.tenantId,
+          current.controlGeneration,
+        ],
+      );
+      if (updated.affectedRows !== 1) {
+        throw new RetentionPolicyGenerationConflictError(
+          input.expectedControlGeneration,
+          current.controlGeneration,
+        );
+      }
+      await conn.query(
+        `INSERT INTO retention_policy_activation_events
+           (tenant_id, control_generation, policy_version, policy_sha256, effective_at_ms,
+            actor_key_id, before_sha256, after_sha256, emitted_at_ms)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [
+          input.tenantId,
+          next.controlGeneration,
+          policy.policyVersion,
+          policy.policySha256,
+          effectiveAtMs,
+          input.actorKeyId,
+          retentionPolicyControlSha256(current),
+          retentionPolicyControlSha256(next),
+          effectiveAtMs,
+        ],
+      );
+      await conn.commit();
+      return next;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getRetentionPolicy(
+    tenantId: string,
+    policyVersion: string,
+  ): Promise<RetentionPolicyVersionRecord | null> {
+    validateRetentionPolicyIdentity(tenantId, policyVersion);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT ${RETENTION_POLICY_VERSION_COLUMNS}
+         FROM retention_policy_versions WHERE tenant_id=? AND policy_version=?`,
+      [tenantId, policyVersion],
+    );
+    return rows[0] ? rowToRetentionPolicyVersion(rows[0]) : null;
+  }
+
+  private async loadValidatedActiveRetentionPolicy(
+    conn: PoolConnection,
+    tenantId: string,
+    lockClause = "",
+  ): Promise<ActiveRetentionPolicy | null> {
+    const [controlRows] = await conn.query<Row[]>(
+      `SELECT ${RETENTION_POLICY_CONTROL_COLUMNS}
+         FROM retention_policy_controls WHERE tenant_id=? ${lockClause}`,
+      [tenantId],
+    );
+    if (!controlRows[0]) {
+      const [orphanRows] = await conn.query<Row[]>(
+        `SELECT event_id FROM retention_policy_activation_events
+          WHERE tenant_id=? LIMIT 1 ${lockClause}`,
+        [tenantId],
+      );
+      if (orphanRows[0]) {
+        throw new Error("retention policy activation audit exists without its control row");
+      }
+      return null;
+    }
+    const control = rowToRetentionPolicyControl(controlRows[0]);
+    const [eventRows] = await conn.query<Row[]>(
+      `SELECT ${RETENTION_POLICY_ACTIVATION_EVENT_COLUMNS}
+         FROM retention_policy_activation_events
+        WHERE tenant_id=? ORDER BY control_generation, event_id ${lockClause}`,
+      [tenantId],
+    );
+    const events = eventRows.map(rowToRetentionPolicyActivationEvent);
+    let projected: RetentionPolicyControlRecord = {
+      tenantId,
+      controlGeneration: 0,
+      updatedAtMs: 0,
+    };
+    let active: RetentionPolicyVersionRecord | null = null;
+    let previousEventId = 0;
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index]!;
+      const policy = await this.loadRetentionPolicyVersion(
+        conn,
+        tenantId,
+        event.policyVersion,
+        lockClause,
+      );
+      if (
+        event.eventId <= previousEventId
+        || event.controlGeneration !== index + 1
+        || event.effectiveAtMs !== event.emittedAtMs
+        || event.emittedAtMs < projected.updatedAtMs
+        || event.beforeSha256 !== retentionPolicyControlSha256(projected)
+        || !policy
+        || policy.policySha256 !== event.policySha256
+      ) throw new Error("retention policy activation audit is invalid");
+      previousEventId = event.eventId;
+      projected = {
+        tenantId,
+        controlGeneration: event.controlGeneration,
+        activePolicyVersion: event.policyVersion,
+        activePolicySha256: event.policySha256,
+        effectiveAtMs: event.effectiveAtMs,
+        updatedAtMs: event.emittedAtMs,
+      };
+      if (event.afterSha256 !== retentionPolicyControlSha256(projected)) {
+        throw new Error("retention policy activation audit outcome is invalid");
+      }
+      active = policy;
+    }
+    if (
+      events.length !== control.controlGeneration
+      || retentionPolicyControlSha256(projected) !== retentionPolicyControlSha256(control)
+    ) throw new Error("retention policy control and activation audit do not agree");
+    if (control.controlGeneration === 0) return null;
+    if (!active || active.policySha256 !== control.activePolicySha256) {
+      throw new Error("active retention policy control does not match its immutable version");
+    }
+    return { control, policy: active };
+  }
+
+  async getActiveRetentionPolicy(tenantId: string): Promise<ActiveRetentionPolicy | null> {
+    validateRetentionPolicyTenantId(tenantId);
+    return this.withConsistentRead((conn) => this.loadValidatedActiveRetentionPolicy(conn, tenantId));
+  }
+
+  async listRetentionPolicyActivationEvents(
+    tenantId: string,
+  ): Promise<RetentionPolicyActivationEvent[]> {
+    validateRetentionPolicyTenantId(tenantId);
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${RETENTION_POLICY_ACTIVATION_EVENT_COLUMNS}
+           FROM retention_policy_activation_events
+          WHERE tenant_id=? ORDER BY control_generation, event_id`,
+        [tenantId],
+      );
+      const events = rows.map(rowToRetentionPolicyActivationEvent);
+      let previousEventId = 0;
+      let previousEmittedAtMs = 0;
+      for (let index = 0; index < events.length; index += 1) {
+        const event = events[index]!;
+        if (
+          event.eventId <= previousEventId
+          || event.controlGeneration !== index + 1
+          || event.effectiveAtMs !== event.emittedAtMs
+          || event.emittedAtMs < previousEmittedAtMs
+        ) {
+          throw new Error("retention policy activation audit has a generation gap");
+        }
+        previousEventId = event.eventId;
+        previousEmittedAtMs = event.emittedAtMs;
+        const expectedBeforeSha256 = index === 0
+          ? retentionPolicyControlSha256({ tenantId, controlGeneration: 0, updatedAtMs: 0 })
+          : events[index - 1]!.afterSha256;
+        if (expectedBeforeSha256 !== event.beforeSha256) {
+          throw new Error("retention policy activation audit chain is invalid");
+        }
+        const policy = await this.loadRetentionPolicyVersion(
+          conn,
+          tenantId,
+          event.policyVersion,
+        );
+        if (!policy || policy.policySha256 !== event.policySha256) {
+          throw new Error("retention policy activation audit references an invalid version");
+        }
+        const projected: RetentionPolicyControlRecord = {
+          tenantId,
+          controlGeneration: event.controlGeneration,
+          activePolicyVersion: event.policyVersion,
+          activePolicySha256: event.policySha256,
+          effectiveAtMs: event.effectiveAtMs,
+          updatedAtMs: event.emittedAtMs,
+        };
+        if (event.afterSha256 !== retentionPolicyControlSha256(projected)) {
+          throw new Error("retention policy activation audit projection is invalid");
+        }
+      }
+      const [controlRows] = await conn.query<Row[]>(
+        `SELECT ${RETENTION_POLICY_CONTROL_COLUMNS}
+           FROM retention_policy_controls WHERE tenant_id=?`,
+        [tenantId],
+      );
+      if (controlRows[0]) {
+        const control = rowToRetentionPolicyControl(controlRows[0]);
+        const expectedTailSha256 = events.length === 0
+          ? retentionPolicyControlSha256({ tenantId, controlGeneration: 0, updatedAtMs: 0 })
+          : events[events.length - 1]!.afterSha256;
+        if (
+          control.controlGeneration !== events.length
+          || expectedTailSha256 !== retentionPolicyControlSha256(control)
+        ) throw new Error("retention policy control and activation audit do not agree");
+      } else if (events.length > 0) {
+        throw new Error("retention policy activation audit has no control row");
+      }
+      return events;
+    });
+  }
+
+  private async lockRetentionPolicyForErasureRequest(
+    conn: PoolConnection,
+    tenantId: string,
+  ): Promise<RetentionPolicyVersionRecord | null> {
+    const active = await this.loadValidatedActiveRetentionPolicy(conn, tenantId, "FOR SHARE");
+    if (!active) return null;
+    return active.policy;
+  }
+
+  private async ensureLegalHoldSubjectRows(
+    conn: PoolConnection,
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+    atMs: number,
+  ): Promise<void> {
+    if (subjectKind === "user") {
+      await this.ensureSubjectLifecycleRows(conn, tenantId, subjectId, atMs);
+      return;
+    }
+    const [existing] = await conn.query<Row[]>(
+      `SELECT subject_id FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+      [tenantId, tenantId],
+    );
+    if (!existing[0]) {
+      const [requests] = await conn.query<Row[]>(
+        `SELECT request_id FROM erasure_requests
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? LIMIT 1`,
+        [tenantId, tenantId],
+      );
+      if (requests.length > 0) {
+        throw new LegalHoldIntegrityError(
+          "tenant lifecycle gate is missing for an existing erasure request",
+        );
+      }
+      await conn.query(
+        `INSERT IGNORE INTO subject_lifecycle
+           (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
+            legal_hold_at_ms, created_at_ms, updated_at_ms)
+         VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?)`,
+        [tenantId, tenantId, atMs, atMs],
+      );
+    }
+  }
+
+  private async ensureLegalHoldControlForLifecycle(
+    conn: PoolConnection,
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<void> {
+    // Never adopt a legacy shadow without provenance. The 0015 migration is the only component
+    // allowed to convert such a timestamp into a canonical hold/event ledger.
+    await conn.query(
+      `INSERT IGNORE INTO legal_hold_controls
+         (tenant_id, subject_kind, subject_id, control_generation, active_hold_count,
+          active_projection_sha256, updated_at_ms)
+       SELECT tenant_id, subject_kind, subject_id, 0, 0, ?, 0
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind=? AND subject_id=? AND legal_hold_at_ms IS NULL`,
+      [EMPTY_LEGAL_HOLD_PROJECTION_SHA256, tenantId, subjectKind, subjectId],
+    );
+  }
+
+  private validateLegalHoldLifecycle(
+    lifecycle: SubjectLifecycleRecord,
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): void {
+    if (
+      lifecycle.tenantId !== tenantId
+      || lifecycle.subjectKind !== subjectKind
+      || lifecycle.subjectId !== subjectId
+      || (lifecycle.legalHoldAtMs !== undefined
+        && (!Number.isSafeInteger(lifecycle.legalHoldAtMs) || lifecycle.legalHoldAtMs < 0))
+    ) throw new LegalHoldIntegrityError("legal hold lifecycle owner or timestamp is invalid");
+  }
+
+  private async loadLegalHoldContextForLifecycle(
+    conn: PoolConnection,
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+    lifecycle: SubjectLifecycleRecord | undefined,
+    lockClause = "",
+  ): Promise<LegalHoldContext> {
+    const [controlRows] = await conn.query<Row[]>(
+      `SELECT ${LEGAL_HOLD_CONTROL_COLUMNS}
+         FROM legal_hold_controls
+        WHERE tenant_id=? AND subject_kind=? AND subject_id=? ${lockClause}`,
+      [tenantId, subjectKind, subjectId],
+    );
+    const [holdRows] = await conn.query<Row[]>(
+      `SELECT ${LEGAL_HOLD_COLUMNS}
+         FROM legal_holds
+        WHERE tenant_id=? AND subject_kind=? AND subject_id=?
+        ORDER BY hold_id ${lockClause}`,
+      [tenantId, subjectKind, subjectId],
+    );
+    const [eventRows] = await conn.query<Row[]>(
+      `SELECT ${LEGAL_HOLD_EVENT_COLUMNS}
+         FROM legal_hold_events
+        WHERE tenant_id=? AND subject_kind=? AND subject_id=?
+        ORDER BY control_generation, event_id ${lockClause}`,
+      [tenantId, subjectKind, subjectId],
+    );
+    let control: LegalHoldControlRecord | undefined;
+    let holds: LegalHoldRecord[];
+    let events: LegalHoldEvent[];
+    try {
+      control = controlRows[0] ? rowToLegalHoldControl(controlRows[0]) : undefined;
+      holds = holdRows.map(rowToLegalHold)
+        .sort((left, right) => compareLegalHoldIds(left.holdId, right.holdId));
+      events = eventRows.map(rowToLegalHoldEvent);
+    } catch (error) {
+      if (error instanceof LegalHoldIntegrityError) throw error;
+      throw new LegalHoldIntegrityError(
+        `stored legal hold row is invalid: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
+    if (!lifecycle) {
+      if (control || holds.length > 0 || events.length > 0) {
+        throw new LegalHoldIntegrityError("legal hold ledger exists without a lifecycle subject");
+      }
+      const synthetic: LegalHoldControlRecord = {
+        tenantId,
+        subjectKind,
+        subjectId,
+        controlGeneration: 0,
+        activeHoldCount: 0,
+        activeProjectionSha256: EMPTY_LEGAL_HOLD_PROJECTION_SHA256,
+        updatedAtMs: 0,
+      };
+      validateLegalHoldControlRecord(synthetic);
+      return { control: synthetic, holds, events };
+    }
+    this.validateLegalHoldLifecycle(lifecycle, tenantId, subjectKind, subjectId);
+    if (!control) {
+      if (holds.length > 0 || events.length > 0 || lifecycle.legalHoldAtMs !== undefined) {
+        throw new LegalHoldIntegrityError("legal hold lifecycle shadow has no canonical provenance");
+      }
+      const synthetic: LegalHoldControlRecord = {
+        tenantId,
+        subjectKind,
+        subjectId,
+        controlGeneration: 0,
+        activeHoldCount: 0,
+        activeProjectionSha256: EMPTY_LEGAL_HOLD_PROJECTION_SHA256,
+        updatedAtMs: 0,
+      };
+      validateLegalHoldControlRecord(synthetic);
+      return { lifecycle, control: synthetic, holds, events };
+    }
+    if (
+      control.tenantId !== tenantId
+      || control.subjectKind !== subjectKind
+      || control.subjectId !== subjectId
+    ) throw new LegalHoldIntegrityError("legal hold control owner is invalid");
+    if (
+      control.controlGeneration === 0
+      && (
+        control.updatedAtMs !== 0
+        || control.activeProjectionSha256 !== EMPTY_LEGAL_HOLD_PROJECTION_SHA256
+      )
+    ) throw new LegalHoldIntegrityError("initial legal hold control is invalid");
+    if (holds.some((hold) => (
+      hold.tenantId !== tenantId
+      || hold.subjectKind !== subjectKind
+      || hold.subjectId !== subjectId
+    ))) throw new LegalHoldIntegrityError("legal hold owner does not match its control");
+
+    const activeHolds = holds.filter((hold) => hold.state === "active");
+    if (
+      control.activeHoldCount !== activeHolds.length
+      || control.activeProjectionSha256 !== legalHoldProjectionSha256(activeHolds)
+    ) throw new LegalHoldIntegrityError("legal hold control and active projection do not agree");
+    const expectedShadow = activeHolds.length === 0
+      ? undefined
+      : Math.min(...activeHolds.map((hold) => hold.createdAtMs));
+    if (lifecycle.legalHoldAtMs !== expectedShadow) {
+      throw new LegalHoldIntegrityError("legal hold lifecycle shadow does not match active holds");
+    }
+    if (events.length !== control.controlGeneration) {
+      throw new LegalHoldIntegrityError("legal hold event ledger has a generation gap");
+    }
+
+    const byId = new Map(holds.map((hold) => [hold.holdId, hold]));
+    const seenSet = new Set<string>();
+    const seenRelease = new Set<string>();
+    const simulatedActive = new Map<string, LegalHoldRecord>();
+    let simulated: LegalHoldControlRecord = {
+      tenantId,
+      subjectKind,
+      subjectId,
+      controlGeneration: 0,
+      activeHoldCount: 0,
+      activeProjectionSha256: EMPTY_LEGAL_HOLD_PROJECTION_SHA256,
+      updatedAtMs: 0,
+    };
+    let previousEventId = 0;
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index]!;
+      const hold = byId.get(event.holdId);
+      if (
+        event.tenantId !== tenantId
+        || event.subjectKind !== subjectKind
+        || event.subjectId !== subjectId
+        || event.eventId <= previousEventId
+        || event.controlGeneration !== index + 1
+        || !hold
+        || event.beforeSha256 !== legalHoldControlSha256(simulated)
+        || event.emittedAtMs < simulated.updatedAtMs
+      ) throw new LegalHoldIntegrityError("legal hold event chain is invalid");
+      previousEventId = event.eventId;
+      if (event.eventType === "legal_hold/set") {
+        if (
+          seenSet.has(hold.holdId)
+          || hold.createdControlGeneration !== event.controlGeneration
+          || hold.reasonCode !== event.reasonCode
+          || hold.externalReferenceSha256 !== event.externalReferenceSha256
+          || hold.createdByKeyId !== event.actorKeyId
+          || event.emittedAtMs !== hold.createdAtMs
+        ) throw new LegalHoldIntegrityError("legal hold set evidence is invalid");
+        seenSet.add(hold.holdId);
+        simulatedActive.set(hold.holdId, {
+          tenantId: hold.tenantId,
+          holdId: hold.holdId,
+          subjectKind: hold.subjectKind,
+          subjectId: hold.subjectId,
+          state: "active",
+          reasonCode: hold.reasonCode,
+          ...(hold.externalReferenceSha256 === undefined
+            ? {}
+            : { externalReferenceSha256: hold.externalReferenceSha256 }),
+          createdControlGeneration: hold.createdControlGeneration,
+          createdByKeyId: hold.createdByKeyId,
+          createdAtMs: hold.createdAtMs,
+        });
+      } else {
+        if (
+          !seenSet.has(hold.holdId)
+          || seenRelease.has(hold.holdId)
+          || hold.state !== "released"
+          || hold.releasedControlGeneration !== event.controlGeneration
+          || hold.releaseReasonCode !== event.reasonCode
+          || event.externalReferenceSha256 !== undefined
+          || hold.releasedByKeyId !== event.actorKeyId
+          || hold.releasedAtMs === undefined
+          || event.emittedAtMs !== hold.releasedAtMs
+        ) throw new LegalHoldIntegrityError("legal hold release evidence is invalid");
+        seenRelease.add(hold.holdId);
+        simulatedActive.delete(hold.holdId);
+      }
+      const projectedHolds = [...simulatedActive.values()];
+      const next: LegalHoldControlRecord = {
+        tenantId,
+        subjectKind,
+        subjectId,
+        controlGeneration: event.controlGeneration,
+        activeHoldCount: projectedHolds.length,
+        activeProjectionSha256: legalHoldProjectionSha256(projectedHolds),
+        updatedAtMs: event.emittedAtMs,
+      };
+      if (event.afterSha256 !== legalHoldControlSha256(next)) {
+        throw new LegalHoldIntegrityError("legal hold event projection hash is invalid");
+      }
+      simulated = next;
+    }
+    if (
+      holds.some((hold) => (
+        !seenSet.has(hold.holdId)
+        || (hold.state === "released" && !seenRelease.has(hold.holdId))
+        || (hold.state === "active" && seenRelease.has(hold.holdId))
+      ))
+      || legalHoldControlSha256(simulated) !== legalHoldControlSha256(control)
+    ) throw new LegalHoldIntegrityError("legal hold ledger and control tail do not agree");
+    return { lifecycle, control, holds, events };
+  }
+
+  private async lockLegalHoldContext(
+    conn: PoolConnection,
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<LegalHoldContext> {
+    const [tenantRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
+      [tenantId, tenantId],
+    );
+    let lifecycleRow = tenantRows[0];
+    if (subjectKind === "user") {
+      const [userRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR UPDATE`,
+        [tenantId, subjectId],
+      );
+      lifecycleRow = userRows[0];
+    }
+    if (!lifecycleRow) {
+      throw new LegalHoldIntegrityError("legal hold lifecycle subject is missing after initialization");
+    }
+    const lifecycle = rowToSubjectLifecycle(lifecycleRow);
+    await this.ensureLegalHoldControlForLifecycle(conn, tenantId, subjectKind, subjectId);
+    return this.loadLegalHoldContextForLifecycle(
+      conn,
+      tenantId,
+      subjectKind,
+      subjectId,
+      lifecycle,
+      "FOR UPDATE",
+    );
+  }
+
+  private async readLegalHoldContext(
+    conn: PoolConnection,
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<LegalHoldContext> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind=? AND subject_id=?`,
+      [tenantId, subjectKind, subjectId],
+    );
+    const lifecycle = rows[0] ? rowToSubjectLifecycle(rows[0]) : undefined;
+    return this.loadLegalHoldContextForLifecycle(
+      conn,
+      tenantId,
+      subjectKind,
+      subjectId,
+      lifecycle,
+    );
+  }
+
+  async setLegalHold(input: SetLegalHoldInput): Promise<LegalHoldRecord> {
+    input = structuredClone(input);
+    validateSetLegalHoldInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.ensureLegalHoldSubjectRows(
+        conn,
+        input.tenantId,
+        input.subjectKind,
+        input.subjectId,
+        input.atMs,
+      );
+      const context = await this.lockLegalHoldContext(
+        conn,
+        input.tenantId,
+        input.subjectKind,
+        input.subjectId,
+      );
+      const [existingRows] = await conn.query<Row[]>(
+        `SELECT ${LEGAL_HOLD_COLUMNS}
+           FROM legal_holds WHERE tenant_id=? AND hold_id=? FOR UPDATE`,
+        [input.tenantId, input.holdId],
+      );
+      if (existingRows[0]) {
+        const existing = rowToLegalHold(existingRows[0]);
+        if (
+          existing.state === "active"
+          &&
+          existing.subjectKind === input.subjectKind
+          && existing.subjectId === input.subjectId
+          && existing.reasonCode === input.reasonCode
+          && existing.externalReferenceSha256 === input.externalReferenceSha256
+          && existing.createdControlGeneration - 1 === input.expectedControlGeneration
+        ) {
+          await conn.commit();
+          return existing;
+        }
+        throw new LegalHoldConflictError(input.holdId);
+      }
+      if (input.expectedControlGeneration !== context.control.controlGeneration) {
+        throw new LegalHoldGenerationConflictError(
+          input.expectedControlGeneration,
+          context.control.controlGeneration,
+        );
+      }
+      if (context.control.controlGeneration + 1 >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("legal hold control generation is exhausted");
+      }
+      const effectiveAtMs = Math.max(input.atMs, context.control.updatedAtMs);
+      const record: LegalHoldRecord = {
+        tenantId: input.tenantId,
+        holdId: input.holdId,
+        subjectKind: input.subjectKind,
+        subjectId: input.subjectId,
+        state: "active",
+        reasonCode: input.reasonCode,
+        ...(input.externalReferenceSha256 === undefined
+          ? {}
+          : { externalReferenceSha256: input.externalReferenceSha256 }),
+        createdControlGeneration: context.control.controlGeneration + 1,
+        createdByKeyId: input.actorKeyId,
+        createdAtMs: effectiveAtMs,
+      };
+      validateLegalHoldRecord(record);
+      const active = [...context.holds.filter((hold) => hold.state === "active"), record];
+      const next: LegalHoldControlRecord = {
+        tenantId: input.tenantId,
+        subjectKind: input.subjectKind,
+        subjectId: input.subjectId,
+        controlGeneration: record.createdControlGeneration,
+        activeHoldCount: active.length,
+        activeProjectionSha256: legalHoldProjectionSha256(active),
+        updatedAtMs: effectiveAtMs,
+      };
+      await conn.query(
+        `INSERT INTO legal_holds
+           (tenant_id, hold_id, subject_kind, subject_id, state, reason_code,
+            external_reference_sha256, created_control_generation, created_by_key_id,
+            created_at_ms, released_control_generation, released_by_key_id, released_at_ms,
+            release_reason_code)
+         VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,NULL)`,
+        [
+          record.tenantId,
+          record.holdId,
+          record.subjectKind,
+          record.subjectId,
+          record.state,
+          record.reasonCode,
+          record.externalReferenceSha256 ?? null,
+          record.createdControlGeneration,
+          record.createdByKeyId,
+          record.createdAtMs,
+        ],
+      );
+      const [controlUpdated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE legal_hold_controls
+            SET control_generation=?, active_hold_count=?, active_projection_sha256=?,
+                updated_at_ms=?
+          WHERE tenant_id=? AND subject_kind=? AND subject_id=? AND control_generation=?`,
+        [
+          next.controlGeneration,
+          next.activeHoldCount,
+          next.activeProjectionSha256,
+          next.updatedAtMs,
+          input.tenantId,
+          input.subjectKind,
+          input.subjectId,
+          context.control.controlGeneration,
+        ],
+      );
+      if (controlUpdated.affectedRows !== 1) {
+        throw new LegalHoldGenerationConflictError(
+          input.expectedControlGeneration,
+          context.control.controlGeneration,
+        );
+      }
+      const shadow = Math.min(...active.map((hold) => hold.createdAtMs));
+      const [lifecycleUpdated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE subject_lifecycle
+            SET legal_hold_at_ms=?, updated_at_ms=GREATEST(updated_at_ms, ?)
+          WHERE tenant_id=? AND subject_kind=? AND subject_id=?`,
+        [shadow, effectiveAtMs, input.tenantId, input.subjectKind, input.subjectId],
+      );
+      if (lifecycleUpdated.affectedRows !== 1) {
+        throw new LegalHoldIntegrityError("legal hold lifecycle subject disappeared while locked");
+      }
+      await conn.query(
+        `INSERT INTO legal_hold_events
+           (tenant_id, subject_kind, subject_id, control_generation, hold_id, event_type,
+            reason_code, external_reference_sha256, actor_key_id, before_sha256,
+            after_sha256, emitted_at_ms)
+         VALUES (?,?,?,?,?,'legal_hold/set',?,?,?,?,?,?)`,
+        [
+          input.tenantId,
+          input.subjectKind,
+          input.subjectId,
+          next.controlGeneration,
+          input.holdId,
+          input.reasonCode,
+          input.externalReferenceSha256 ?? null,
+          input.actorKeyId,
+          legalHoldControlSha256(context.control),
+          legalHoldControlSha256(next),
+          effectiveAtMs,
+        ],
+      );
+      await conn.commit();
+      return record;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async releaseLegalHold(input: ReleaseLegalHoldInput): Promise<LegalHoldRecord> {
+    input = structuredClone(input);
+    validateReleaseLegalHoldInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      // This snapshot lookup discovers the immutable scope. The canonical lifecycle rows are then
+      // locked before the locking ledger read, preserving tenant -> user -> ledger order.
+      const [candidateRows] = await conn.query<Row[]>(
+        `SELECT ${LEGAL_HOLD_COLUMNS} FROM legal_holds WHERE tenant_id=? AND hold_id=?`,
+        [input.tenantId, input.holdId],
+      );
+      if (!candidateRows[0]) throw new LegalHoldNotFoundError(input.holdId);
+      const candidate = rowToLegalHold(candidateRows[0]);
+      const context = await this.lockLegalHoldContext(
+        conn,
+        input.tenantId,
+        candidate.subjectKind,
+        candidate.subjectId,
+      );
+      const existing = context.holds.find((hold) => hold.holdId === input.holdId);
+      if (!existing) throw new LegalHoldIntegrityError("legal hold disappeared from its owner ledger");
+      if (existing.state === "released") {
+        if (
+          existing.releaseReasonCode === input.reasonCode
+          && existing.releasedControlGeneration! - 1 === input.expectedControlGeneration
+        ) {
+          await conn.commit();
+          return existing;
+        }
+        throw new LegalHoldConflictError(input.holdId);
+      }
+      if (input.expectedControlGeneration !== context.control.controlGeneration) {
+        throw new LegalHoldGenerationConflictError(
+          input.expectedControlGeneration,
+          context.control.controlGeneration,
+        );
+      }
+      if (context.control.controlGeneration + 1 >= Number.MAX_SAFE_INTEGER) {
+        throw new Error("legal hold control generation is exhausted");
+      }
+      const effectiveAtMs = Math.max(input.atMs, context.control.updatedAtMs);
+      const released: LegalHoldRecord = {
+        ...existing,
+        state: "released",
+        releasedControlGeneration: context.control.controlGeneration + 1,
+        releasedByKeyId: input.actorKeyId,
+        releasedAtMs: effectiveAtMs,
+        releaseReasonCode: input.reasonCode,
+      };
+      validateLegalHoldRecord(released);
+      const remaining = context.holds.filter(
+        (hold) => hold.state === "active" && hold.holdId !== existing.holdId,
+      );
+      const next: LegalHoldControlRecord = {
+        tenantId: existing.tenantId,
+        subjectKind: existing.subjectKind,
+        subjectId: existing.subjectId,
+        controlGeneration: released.releasedControlGeneration!,
+        activeHoldCount: remaining.length,
+        activeProjectionSha256: legalHoldProjectionSha256(remaining),
+        updatedAtMs: effectiveAtMs,
+      };
+      const [holdUpdated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE legal_holds
+            SET state='released', released_control_generation=?, released_by_key_id=?,
+                released_at_ms=?, release_reason_code=?
+          WHERE tenant_id=? AND hold_id=? AND subject_kind=? AND subject_id=? AND state='active'`,
+        [
+          released.releasedControlGeneration,
+          released.releasedByKeyId,
+          released.releasedAtMs,
+          released.releaseReasonCode,
+          input.tenantId,
+          input.holdId,
+          existing.subjectKind,
+          existing.subjectId,
+        ],
+      );
+      if (holdUpdated.affectedRows !== 1) throw new LegalHoldConflictError(input.holdId);
+      const [controlUpdated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE legal_hold_controls
+            SET control_generation=?, active_hold_count=?, active_projection_sha256=?,
+                updated_at_ms=?
+          WHERE tenant_id=? AND subject_kind=? AND subject_id=? AND control_generation=?`,
+        [
+          next.controlGeneration,
+          next.activeHoldCount,
+          next.activeProjectionSha256,
+          next.updatedAtMs,
+          next.tenantId,
+          next.subjectKind,
+          next.subjectId,
+          context.control.controlGeneration,
+        ],
+      );
+      if (controlUpdated.affectedRows !== 1) {
+        throw new LegalHoldGenerationConflictError(
+          input.expectedControlGeneration,
+          context.control.controlGeneration,
+        );
+      }
+      const shadow = remaining.length === 0
+        ? null
+        : Math.min(...remaining.map((hold) => hold.createdAtMs));
+      const [lifecycleUpdated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE subject_lifecycle
+            SET legal_hold_at_ms=?, updated_at_ms=GREATEST(updated_at_ms, ?)
+          WHERE tenant_id=? AND subject_kind=? AND subject_id=?`,
+        [shadow, effectiveAtMs, next.tenantId, next.subjectKind, next.subjectId],
+      );
+      if (lifecycleUpdated.affectedRows !== 1) {
+        throw new LegalHoldIntegrityError("legal hold lifecycle subject disappeared while locked");
+      }
+      await conn.query(
+        `INSERT INTO legal_hold_events
+           (tenant_id, subject_kind, subject_id, control_generation, hold_id, event_type,
+            reason_code, external_reference_sha256, actor_key_id, before_sha256,
+            after_sha256, emitted_at_ms)
+         VALUES (?,?,?,?,?,'legal_hold/released',?,?,?,?,?,?)`,
+        [
+          next.tenantId,
+          next.subjectKind,
+          next.subjectId,
+          next.controlGeneration,
+          existing.holdId,
+          input.reasonCode,
+          null,
+          input.actorKeyId,
+          legalHoldControlSha256(context.control),
+          legalHoldControlSha256(next),
+          effectiveAtMs,
+        ],
+      );
+      await conn.commit();
+      return released;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getLegalHold(tenantId: string, holdId: string): Promise<LegalHoldRecord | null> {
+    validateReleaseLegalHoldInput({
+      tenantId,
+      holdId,
+      expectedControlGeneration: 0,
+      reasonCode: "matter_closed",
+      actorKeyId: "read",
+      atMs: 0,
+    });
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${LEGAL_HOLD_COLUMNS} FROM legal_holds WHERE tenant_id=? AND hold_id=?`,
+        [tenantId, holdId],
+      );
+      if (!rows[0]) return null;
+      const hold = rowToLegalHold(rows[0]);
+      const context = await this.readLegalHoldContext(
+        conn,
+        tenantId,
+        hold.subjectKind,
+        hold.subjectId,
+      );
+      const validated = context.holds.find((candidate) => candidate.holdId === holdId);
+      if (!validated) throw new LegalHoldIntegrityError("legal hold is missing from its owner ledger");
+      return validated;
+    });
+  }
+
+  async getActiveLegalHoldState(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<{ control: LegalHoldControlRecord; holds: LegalHoldRecord[] }> {
+    return this.withConsistentRead(async (conn) => {
+      const context = await this.readLegalHoldContext(conn, tenantId, subjectKind, subjectId);
+      return {
+        control: context.control,
+        holds: context.holds.filter((hold) => hold.state === "active"),
+      };
+    });
+  }
+
+  async getLegalHoldControl(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<LegalHoldControlRecord> {
+    const state = await this.getActiveLegalHoldState(tenantId, subjectKind, subjectId);
+    return state.control;
+  }
+
+  async listActiveLegalHolds(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<LegalHoldRecord[]> {
+    const state = await this.getActiveLegalHoldState(tenantId, subjectKind, subjectId);
+    return state.holds;
+  }
+
+  async listLegalHoldEvents(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<LegalHoldEvent[]> {
+    return this.withConsistentRead(async (conn) => {
+      const context = await this.readLegalHoldContext(conn, tenantId, subjectKind, subjectId);
+      return context.events;
+    });
+  }
+
   // ---------- durable subject lifecycle ----------
   private async ensureSubjectLifecycleRows(
     conn: PoolConnection,
@@ -3149,6 +4508,7 @@ export class MysqlSessionStore implements
   }
 
   async requestUserErasure(input: RequestUserErasureInput): Promise<ErasureRequestRecord> {
+    input = structuredClone(input);
     validateRequestUserErasureInput(input);
     const conn = await this.pool.getConnection();
     try {
@@ -3188,7 +4548,11 @@ export class MysqlSessionStore implements
       if (user.state !== "active") {
         if (!user.activeRequestId) throw new SubjectDeletingError(input.tenantId, input.userId);
         const [activeRows] = await conn.query<Row[]>(
-          `SELECT ${ERASURE_REQUEST_COLUMNS} FROM erasure_requests WHERE request_id=?`,
+          // ensureSubjectLifecycleRows performs an optimistic consistent read before this lock
+          // chain. Use a locking current read here: after waiting for a competing gate, the RR
+          // snapshot may predate the winner's request even though the user row already exposes it.
+          `SELECT ${ERASURE_REQUEST_COLUMNS}
+             FROM erasure_requests WHERE request_id=? FOR SHARE`,
           [user.activeRequestId],
         );
         const active = activeRows[0] ? rowToErasureRequest(activeRows[0]) : undefined;
@@ -3203,6 +4567,12 @@ export class MysqlSessionStore implements
         return active;
       }
 
+      // The shared control/version locks make request creation linearizable with activation. Any
+      // active policy observed here is bound; runner wall clocks are audit data, not a scheduler.
+      const boundPolicy = await this.lockRetentionPolicyForErasureRequest(
+        conn,
+        input.tenantId,
+      );
       const generation = user.generation + 1;
       const record: ErasureRequestRecord = {
         requestId: input.requestId,
@@ -3219,6 +4589,12 @@ export class MysqlSessionStore implements
         updatedAtMs: input.atMs,
         availableAtMs: input.atMs,
         attempts: 0,
+        ...(boundPolicy === null
+          ? {}
+          : {
+              policyVersion: boundPolicy.policyVersion,
+              policyHash: boundPolicy.policySha256,
+            }),
         controlGeneration: 0,
       };
       await conn.query(
@@ -3227,7 +4603,7 @@ export class MysqlSessionStore implements
             requested_by_key_id, idempotency_key, request_hash, created_at_ms, gated_at_ms,
             updated_at_ms, completed_at_ms, counts_json, checksum, available_at_ms, attempts,
             claim_token, lease_until_ms, last_error_code, policy_version, policy_hash)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,0,NULL,NULL,NULL,NULL,NULL)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,0,NULL,NULL,NULL,?,?)`,
         [
           record.requestId,
           record.tenantId,
@@ -3242,6 +4618,8 @@ export class MysqlSessionStore implements
           record.gatedAtMs,
           record.updatedAtMs,
           record.availableAtMs,
+          record.policyVersion ?? null,
+          record.policyHash ?? null,
         ],
       );
       const [updated] = await conn.query<mysql.ResultSetHeader>(
@@ -3265,7 +4643,17 @@ export class MysqlSessionStore implements
          VALUES (?,1,'erasure/gated',?,?)`,
         [
           input.requestId,
-          json({ status: "gated", subjectKind: "user", generation }),
+          json({
+            status: "gated",
+            subjectKind: "user",
+            generation,
+            ...(boundPolicy === null
+              ? {}
+              : {
+                  policyVersion: boundPolicy.policyVersion,
+                  policyHash: boundPolicy.policySha256,
+                }),
+          }),
           input.atMs,
         ],
       );
@@ -4161,13 +5549,18 @@ export class MysqlSessionStore implements
       }
       if (
         options.policyVersion !== undefined
-        && current.policyVersion !== undefined
-        && (current.policyVersion !== options.policyVersion || current.policyHash !== options.policyHash)
-      ) throw new Error("erasure policy identity is immutable");
+      ) {
+        if (current.policyVersion === undefined) {
+          throw new Error("erasure policy identity cannot be assigned after admission");
+        }
+        if (current.policyVersion !== options.policyVersion || current.policyHash !== options.policyHash) {
+          throw new Error("erasure policy identity is immutable");
+        }
+      }
 
       const effectiveAtMs = Math.max(current.updatedAtMs, options.atMs);
-      const policyVersion = options.policyVersion ?? current.policyVersion;
-      const policyHash = options.policyHash ?? current.policyHash;
+      const policyVersion = current.policyVersion;
+      const policyHash = current.policyHash;
       const completedAtMs = options.toStatus === "completed" ? effectiveAtMs : undefined;
       const [updated] = await conn.query<mysql.ResultSetHeader>(
         `UPDATE erasure_requests
@@ -4507,6 +5900,12 @@ export class MysqlSessionStore implements
               status: "gated",
               subjectKind: current.subjectKind,
               generation: current.generation,
+              ...(current.policyVersion === undefined
+                ? {}
+                : {
+                    policyVersion: current.policyVersion,
+                    policyHash: current.policyHash,
+                  }),
             },
             emittedAtMs: current.gatedAtMs,
           }];
@@ -6915,7 +8314,7 @@ export class MysqlSessionStore implements
     input: ReconcileSessionUsageInput,
   ): Promise<boolean> {
     const [rows] = await conn.query<Row[]>(
-      `SELECT subject_kind, subject_id, legal_hold_at_ms
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
          FROM subject_lifecycle
         WHERE tenant_id=?
           AND ((subject_kind='tenant' AND subject_id=?)
@@ -6933,7 +8332,32 @@ export class MysqlSessionStore implements
     if (!tenantLifecycle || !userLifecycle) {
       throw new UsageReconciliationError("subject lifecycle state is missing; anonymization is fail-closed");
     }
-    return tenantLifecycle.legal_hold_at_ms != null || userLifecycle.legal_hold_at_ms != null;
+    let tenant: LegalHoldContext;
+    let user: LegalHoldContext;
+    try {
+      tenant = await this.loadLegalHoldContextForLifecycle(
+        conn,
+        input.tenantId,
+        "tenant",
+        input.tenantId,
+        rowToSubjectLifecycle(tenantLifecycle),
+        "FOR UPDATE",
+      );
+      user = await this.loadLegalHoldContextForLifecycle(
+        conn,
+        input.tenantId,
+        "user",
+        input.userId,
+        rowToSubjectLifecycle(userLifecycle),
+        "FOR UPDATE",
+      );
+    } catch (error) {
+      if (error instanceof LegalHoldIntegrityError) throw error;
+      throw new LegalHoldIntegrityError(
+        `legal hold state cannot be proven: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
+    return tenant.control.activeHoldCount > 0 || user.control.activeHoldCount > 0;
   }
 
   private async assertNoOperationalUsage(

@@ -43,6 +43,27 @@ function requestInput(tenantId: string, userId: string, idempotencyKey = "erase-
   };
 }
 
+async function waitForSubjectLifecycleLockWaiters(
+  conn: Connection,
+  database: string,
+  expected: number,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const [rows] = await conn.query<(RowDataPacket & { waiters: number })[]>(
+      `SELECT COUNT(DISTINCT waits.REQUESTING_ENGINE_TRANSACTION_ID) AS waiters
+         FROM performance_schema.data_lock_waits waits
+         JOIN performance_schema.data_locks requested
+           ON requested.ENGINE_LOCK_ID=waits.REQUESTING_ENGINE_LOCK_ID
+        WHERE requested.OBJECT_SCHEMA=? AND requested.OBJECT_NAME='subject_lifecycle'`,
+      [database],
+    );
+    if (Number(rows[0]?.waiters ?? 0) >= expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${expected} subject lifecycle lock waiters`);
+}
+
 if (process.env.AGENT_SERVICE_INTEGRATION) {
   describe("MysqlSessionStore subject lifecycle", () => {
     let admin: Connection | undefined;
@@ -207,6 +228,57 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         ]);
       } finally {
         await store.close();
+      }
+    });
+
+    it("returns the durable winner when two stores concurrently gate one user with different keys", async () => {
+      const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+      const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+      const blocker = await mysql.createConnection(mysqlUrl);
+      const session = mkSession(`tenant_subject_${randomUUID()}`, `user_${randomUUID()}`);
+      await firstStore.createSession(session);
+      const firstInput = requestInput(session.tenantId, session.userId, "concurrent-key-a");
+      const secondInput = requestInput(session.tenantId, session.userId, "concurrent-key-b");
+      try {
+        await blocker.beginTransaction();
+        await blocker.query(
+          `SELECT subject_id FROM subject_lifecycle
+            WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR UPDATE`,
+          [session.tenantId, session.userId],
+        );
+
+        // Both requests establish their ordinary RR snapshot in ensureSubjectLifecycleRows and
+        // then wait on the same user row. After the blocker releases, exactly one creates the gate;
+        // the loser must current-read and return that durable request rather than using its stale
+        // snapshot to report a fabricated integrity failure.
+        const raced = Promise.allSettled([
+          firstStore.requestUserErasure(firstInput),
+          secondStore.requestUserErasure(secondInput),
+        ]);
+        await waitForSubjectLifecycleLockWaiters(blocker, database, 2);
+        await blocker.commit();
+
+        const [first, second] = await raced;
+        expect(first.status).toBe("fulfilled");
+        expect(second.status).toBe("fulfilled");
+        if (first.status !== "fulfilled" || second.status !== "fulfilled") return;
+        expect(second.value).toEqual(first.value);
+        expect([firstInput.requestId, secondInput.requestId]).toContain(first.value.requestId);
+        expect(await firstStore.listErasureAuditEvents(first.value.requestId)).toHaveLength(1);
+        expect(await firstStore.getSubjectLifecycle(
+          session.tenantId,
+          "user",
+          session.userId,
+        )).toMatchObject({
+          state: "deleting",
+          generation: 1,
+          activeRequestId: first.value.requestId,
+        });
+      } finally {
+        await blocker.rollback().catch(() => {});
+        await blocker.end();
+        await secondStore.close();
+        await firstStore.close();
       }
     });
 

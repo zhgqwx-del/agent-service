@@ -210,6 +210,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const conn = await mysql.createConnection(mysqlUrl);
       const input = requestInput(`tenant_audit_${randomUUID()}`, `user_${randomUUID()}`);
       try {
+        const boundPolicy = await store.putRetentionPolicy({
+          tenantId: input.tenantId,
+          policyVersion: "policy-v1",
+          policy: {
+            sessionContentRetentionMs: null,
+            userErasureGraceMs: null,
+            operationalUsageRetentionMs: null,
+            idempotencyReceiptRetentionMs: null,
+            billingFactRetentionMs: null,
+            lifecycleAuditRetentionMs: null,
+            exportArtifactTtlMs: null,
+          },
+          actorKeyId: "admin-key",
+          atMs: 90,
+        });
+        await store.activateRetentionPolicy({
+          tenantId: input.tenantId,
+          policyVersion: "policy-v1",
+          expectedControlGeneration: 0,
+          actorKeyId: "admin-key",
+          atMs: 95,
+        });
         await store.requestUserErasure(input);
         const claim = (await store.claimErasureJobs({
           nowMs: 100, limit: 1, leaseMs: 100, claimToken: "worker-audit",
@@ -228,7 +250,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           atMs: 101,
           availableAtMs: 101,
           policyVersion: "policy-v1",
-          policyHash: "a".repeat(64),
+          policyHash: boundPolicy.policySha256,
         })).rejects.toThrow("injected job audit failure");
         expect(await store.getUserErasureRequest(input.tenantId, input.userId, input.requestId)).toMatchObject({
           status: "gated", claimToken: "worker-audit", leaseUntilMs: 200,
@@ -242,7 +264,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           atMs: 102,
           availableAtMs: 102,
           policyVersion: "policy-v1",
-          policyHash: "a".repeat(64),
+          policyHash: boundPolicy.policySha256,
         })).toBe(true);
         const next = (await store.claimErasureJobs({
           nowMs: 102, limit: 1, leaseMs: 100, claimToken: "worker-next",
@@ -256,7 +278,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           policyHash: "b".repeat(64),
         })).rejects.toThrow("policy identity is immutable");
         expect(await store.getUserErasureRequest(input.tenantId, input.userId, input.requestId)).toMatchObject({
-          status: "draining", policyVersion: "policy-v1", policyHash: "a".repeat(64),
+          status: "draining", policyVersion: "policy-v1", policyHash: boundPolicy.policySha256,
         });
         expect(await store.transitionErasureJob(authorization(next), {
           fromStatus: "draining", toStatus: "blocked", atMs: 104, errorCode: "policy_unavailable",
@@ -264,6 +286,50 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await conn.query("DROP TRIGGER IF EXISTS fail_erasure_job_audit").catch(() => {});
         await conn.end();
+        await store.close();
+      }
+    });
+
+    it("rejects retroactive policy adoption for a request admitted without a policy", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const input = requestInput(`tenant_policy_backlog_${randomUUID()}`, `user_${randomUUID()}`);
+      try {
+        const created = await store.requestUserErasure(input);
+        expect(created).not.toHaveProperty("policyVersion");
+        const claim = (await store.claimErasureJobs({
+          nowMs: 100,
+          limit: 1,
+          leaseMs: 100,
+          claimToken: "worker-policy-backlog",
+        }))[0]!;
+        await expect(store.transitionErasureJob(authorization(claim), {
+          fromStatus: "gated",
+          toStatus: "draining",
+          atMs: 101,
+          availableAtMs: 101,
+          policyVersion: "later-policy",
+          policyHash: "c".repeat(64),
+        })).rejects.toThrow("cannot be assigned after admission");
+        expect(await store.getUserErasureRequest(
+          input.tenantId,
+          input.userId,
+          input.requestId,
+        )).toMatchObject({
+          status: "gated",
+          claimToken: "worker-policy-backlog",
+        });
+        expect(await store.transitionErasureJob(authorization(claim), {
+          fromStatus: "gated",
+          toStatus: "blocked",
+          atMs: 102,
+          errorCode: "policy_unavailable",
+        })).toBe(true);
+        expect(await store.getUserErasureRequest(
+          input.tenantId,
+          input.userId,
+          input.requestId,
+        )).toMatchObject({ status: "blocked" });
+      } finally {
         await store.close();
       }
     });

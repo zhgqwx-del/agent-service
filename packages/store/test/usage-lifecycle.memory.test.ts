@@ -536,10 +536,15 @@ describe("MemorySessionStore usage billing lifecycle", () => {
     expect(store.usageLedger.map((entry) => entry.sessionId)).toEqual([other.id]);
     expect([...store.billingUsageFacts.keys()]).toEqual(factIds);
 
-    const targetSubjectKey = subjectLifecycleKey(target.tenantId, "user", target.userId);
-    store.subjectLifecycles.set(targetSubjectKey, {
-      ...store.subjectLifecycles.get(targetSubjectKey)!,
-      legalHoldAtMs: MONTH_START + 350,
+    await store.setLegalHold({
+      tenantId: target.tenantId,
+      holdId: "hold_after_anonymization",
+      subjectKind: "user",
+      subjectId: target.userId,
+      reasonCode: "litigation",
+      expectedControlGeneration: 0,
+      actorKeyId: "legal-admin",
+      atMs: MONTH_START + 350,
     });
     const replay = await store.anonymizeSessionUsage({
       tenantId: target.tenantId,
@@ -614,9 +619,16 @@ describe("MemorySessionStore usage billing lifecycle", () => {
   it("uses store-owned legal-hold state rather than trusting the destructive caller", async () => {
     const store = new MemorySessionStore();
     const session = await createSession(store, "tenant-held", "user-held");
-    const subjectKey = subjectLifecycleKey(session.tenantId, "user", session.userId);
-    const subject = store.subjectLifecycles.get(subjectKey)!;
-    store.subjectLifecycles.set(subjectKey, { ...subject, legalHoldAtMs: MONTH_START + 50 });
+    await store.setLegalHold({
+      tenantId: session.tenantId,
+      holdId: "hold_usage_anonymization",
+      subjectKind: "user",
+      subjectId: session.userId,
+      reasonCode: "regulatory",
+      expectedControlGeneration: 0,
+      actorKeyId: "legal-admin",
+      atMs: MONTH_START + 50,
+    });
     store.usageLedger.push(legacyUsage(session));
     await tombstone(store, session);
     const verified = await store.reconcileSessionUsage({

@@ -16,8 +16,9 @@
 - M1 核心运行范围、OpenAPI 3.1 与生成 TypeScript SDK 已完成；完整数据生命周期仍未闭环。
 - M2 的本地/CI 代码范围已完成并正式冻结；尚未正式进入 M3，云上部署不属于本次冻结范围。
 - M3 的 MCP/skills/hooks 主体和 M4 的生产化主体尚未开始。
-- session 创建与首事件原子化、`0007 -> ... -> 0014` 历史升级夹具、OpenAPI/SDK、Archive/tombstone/outbox、Blob ownership/业务接线、staging orphan 清理与 legacy generation `0` 补偿已收口。erasure admission 默认关闭；普通 worker 已能跨 runner drain、child-first tombstone并在同一 usage 写事务重验 proof 后停在 `awaiting_purge_policy`。`0013` 的 quarantine/terminal incident与 `0014` 的 dormant write-once cutover、per-session compensation job和append-only result audit均按候选隔离 poison，不猜测损坏归属、不阻塞健康邻居。补偿成功只原子补齐 generation `1` terminal event、两条 lifecycle intent与审计，不开放 purge或删除内容。异步 export artifact/TTL、tenant erasure与 key/provider/auth secret撤销、canonical policy/legal-hold管理、默认关闭的 ready/session purge、完成证明与 restore replay仍未完成。M1尚未闭环，完成后再正式进入 M3。
+- session 创建与首事件原子化、`0007 -> ... -> 0015` 历史升级夹具、OpenAPI/SDK、Archive/tombstone/outbox、Blob ownership/业务接线、staging orphan 清理、legacy generation `0` 补偿，以及 canonical retention policy / multi legal hold 管理面已收口。`0015` 不提供默认策略，不启用 purge；策略版本不可变、activation 使用 generation CAS，tenant/user hold 使用多记录账本和 append-only audit。新 erasure request 在 admission 线性化点绑定已激活策略，MySQL INSERT guard会在 activation 后拒绝 pre-0015 writer 的空/错误绑定；旧 backlog 不事后补绑。异步 export artifact/TTL、tenant erasure与 key/provider/auth secret撤销、policy evaluator、默认关闭的 ready/session purge、完成证明与 restore replay仍未完成。M1尚未闭环，完成后再正式进入 M3。
 - `DATA_ERASURE_REQUESTS_ENABLED` 在 runner/router 默认 `0`，只控制新 request admission；`ERASURE_WORKER_ENABLED` 与它独立，本地默认 `1`，使已持久化 job 即使关闭 admission 也继续走到安全策略边界。POST 需要 router gate、全部 configured targets 健康且支持；status GET 不依赖 router writer gate，但仍按 healthy fleet/selected target capability fail-closed。任一 request 首次接受后，关闭 gate 不能撤销 durable subject gate，也不能回退到 pre-`0011`/lifecycle-unaware runner；必须 forward-fix。不得把 `awaiting_purge_policy` 描述为擦除完成，也不得擅自启用 tenant erasure、usage anonymize 或不可逆 purge。
+- `DATA_GOVERNANCE_MANAGEMENT_ENABLED` 在 runner/router 默认 `0`。`dataGovernance` 表示 writer代码理解 policy/hold，`dataGovernanceManagement` 才表示管理端点已开启；两者不能混用。管理 API只允许 admin service key，所有响应 no-store；activation 提交即生效，不支持把 runner wall clock当作未来调度器。首次 policy activation或canonical hold event后不得回退pre-`0015` writer，只能forward-fix。
 - erasure POST/status 的所有成功与错误响应必须保持 `Cache-Control: no-store`；usage 的公开 `costCNY` 只表示完整总成本，mixed known/unknown 不得返回已知小计，硬成本上限不得把 unknown 当作 `0`。已完成的 anonymize 重试可在后来出现 legal hold 时幂等返回，但 hold 必须阻止尚未发生的 `verified -> anonymized` 转换。
 - 长期 billing fact 不得保留 user/session/turn/step/raw JSON 或精确请求/reconcile 时间；精确验证时间只属于 owner-scoped reconciliation。usage row 与 session owner 不一致必须在查询中隐藏、在 reconcile/anonymize 中事务性 fail-closed，不能静默漏账或跨 tenant 聚合。
 - `gated` 隐藏该 subject 的普通资源并阻止 durable 写入；worker 的 draining/tombstoning 使用 claim-bound 私有 `drain-v1` 路径和固定 store actions，不可携带正文、usage 或任意 patch。active provider/tool 会被有界 abort；超时后保留 session lease 到期而非立即与新 owner 重叠。成功后现有 SSE 通过 terminal event 收口，但内容、ready Blob、receipt 和 operational usage 仍保留到后续 policy-gated purge。当前只在本地对可丢弃 user 显式体验，staging/production 保持 admission 关闭。
@@ -42,6 +43,7 @@ pnpm check:sdk
 pnpm test:migrations
 pnpm test:usage-lifecycle-mysql
 pnpm test:subject-lifecycle-mysql
+pnpm test:retention-policy-mysql
 pnpm test:erasure-job-mysql
 pnpm test:erasure-session-mysql
 pnpm test:erasure-catalog-mysql

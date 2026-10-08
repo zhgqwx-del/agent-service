@@ -4,6 +4,8 @@ import {
   ErasureRequest,
   ErasureRequestHeaders,
   ErasureRequestParams,
+  DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+  DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   Capabilities,
@@ -12,6 +14,8 @@ import {
   HTTP_STATUS,
   IntrospectionVerifier,
   Item,
+  LegalHoldReleaseRequest,
+  LegalHoldSetRequest,
   ModelSpec,
   OPENAPI_DOCUMENT,
   addUsage,
@@ -22,6 +26,8 @@ import {
   UserErasureDrainRequest,
   idSchema,
   PROTOCOL_VERSION,
+  RetentionPolicyActivateRequest,
+  RetentionPolicyParams,
 } from "../src/index.js";
 
 describe("protocol schemas", () => {
@@ -151,6 +157,63 @@ describe("protocol schemas", () => {
     expect(parsed.features.dataErasureRequests).toBe(false);
     expect(parsed.features.userErasureWorker).toEqual([]);
     expect(parsed.features.erasureJobControl).toEqual([]);
+    expect(parsed.features.dataGovernance).toEqual([]);
+    expect(parsed.features.dataGovernanceManagement).toBe(false);
+  });
+
+  it("accepts only the cumulative canonical retention and multi-hold capabilities", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    const dataGovernance = [
+      DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+      DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
+    ];
+    const enabled = Capabilities.parse({
+      ...base,
+      features: { ...base.features, dataGovernance, dataGovernanceManagement: true },
+    });
+    expect(enabled.features.dataGovernance).toEqual(dataGovernance);
+    expect(enabled.features.dataGovernanceManagement).toBe(true);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: { ...base.features, dataGovernance: [...dataGovernance, "purge-v1"] },
+    }).success).toBe(false);
+  });
+
+  it("reserves the fixed active retention-policy path segment", () => {
+    expect(RetentionPolicyParams.safeParse({ policyVersion: "policy-v1" }).success).toBe(true);
+    expect(RetentionPolicyParams.safeParse({ policyVersion: "active" }).success).toBe(false);
+  });
+
+  it("rejects a governance CAS generation that the stores cannot represent", () => {
+    const unsupported = Number.MAX_SAFE_INTEGER;
+    expect(RetentionPolicyActivateRequest.safeParse({
+      expectedControlGeneration: unsupported,
+    }).success).toBe(false);
+    expect(LegalHoldSetRequest.safeParse({
+      holdId: "hold_generation-limit",
+      subjectKind: "user",
+      subjectId: "u_1",
+      reasonCode: "litigation",
+      expectedControlGeneration: unsupported,
+    }).success).toBe(false);
+    expect(LegalHoldReleaseRequest.safeParse({
+      expectedControlGeneration: unsupported,
+      reasonCode: "matter_closed",
+    }).success).toBe(false);
   });
 
   it("accepts both cumulative erasure job-control capabilities while rejecting unknown control contracts", () => {

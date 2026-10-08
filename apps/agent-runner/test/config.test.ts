@@ -22,6 +22,7 @@ describe("runner configuration", () => {
     expect(cfg.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
     expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED).toBe(false);
     expect(cfg.ERASURE_ROUTER_URL).toBeUndefined();
@@ -73,6 +74,14 @@ describe("runner configuration", () => {
     expect(enabled.LEGACY_TOMBSTONE_COMPENSATION_ENABLED).toBe(true);
     expect(enabled.ERASURE_ROUTER_URL).toBe("http://127.0.0.1:8080");
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_ERASURE_REQUESTS_ENABLED: "true" })).toThrow();
+    expect(loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_GOVERNANCE_MANAGEMENT_ENABLED: "1",
+    }).DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(true);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      DATA_GOVERNANCE_MANAGEMENT_ENABLED: "true",
+    })).toThrow();
     expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, ERASURE_WORKER_ENABLED: "true" })).toThrow();
     expect(() => loadConfig({
       SECRETS_MASTER_KEY: SECRET,

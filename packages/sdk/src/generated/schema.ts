@@ -140,6 +140,64 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/legal-holds": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** List active holds and their subject control */
+        readonly get: operations["listActiveLegalHolds"];
+        readonly put?: never;
+        /**
+         * Set a tenant- or user-scoped legal hold
+         * @description Admin-only generation-CAS operation. A hold pauses destructive work but never restores ordinary API visibility.
+         */
+        readonly post: operations["setLegalHold"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/legal-holds/{holdId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read one tenant-owned legal hold */
+        readonly get: operations["getLegalHold"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/legal-holds/{holdId}/release": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Release one legal hold
+         * @description Admin-only generation-CAS release. Other active holds on the same subject remain effective.
+         */
+        readonly post: operations["releaseLegalHold"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/models": {
         readonly parameters: {
             readonly query?: never;
@@ -187,6 +245,64 @@ export type paths = {
         readonly post?: never;
         /** Delete a tenant provider configuration */
         readonly delete: operations["deleteProvider"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/retention-policies/{policyVersion}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read an immutable tenant retention policy version */
+        readonly get: operations["getRetentionPolicy"];
+        /**
+         * Register an immutable tenant retention policy version
+         * @description Admin-only and rollout-gated. Registering a version does not activate it and cannot authorize purge.
+         */
+        readonly put: operations["putRetentionPolicy"];
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/retention-policies/{policyVersion}/activate": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Activate a canonical tenant retention policy
+         * @description Admin-only generation-CAS activation. It affects only requests created after the activation linearization point; existing backlog is never adopted implicitly.
+         */
+        readonly post: operations["activateRetentionPolicy"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/retention-policies/active": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read the active canonical tenant retention policy */
+        readonly get: operations["getActiveRetentionPolicy"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
         readonly options?: never;
         readonly head?: never;
         readonly patch?: never;
@@ -625,6 +741,73 @@ export type paths = {
 export type webhooks = Record<string, never>;
 export type components = {
     schemas: {
+        readonly ActiveLegalHoldList: {
+            readonly control: {
+                readonly activeHoldCount: number;
+                readonly activeProjectionSha256: string;
+                readonly controlGeneration: number;
+                readonly subjectId: string;
+                /** @enum {string} */
+                readonly subjectKind: "tenant" | "user";
+                readonly tenantId: string;
+                readonly updatedAtMs: number;
+            };
+            readonly data: readonly {
+                readonly createdAtMs: number;
+                readonly createdByKeyId: string;
+                readonly createdControlGeneration: number;
+                readonly externalReferenceSha256?: string;
+                readonly holdId: string;
+                /** @enum {string} */
+                readonly reasonCode: "litigation" | "regulatory" | "security_incident" | "billing_dispute" | "legacy_unattributed";
+                readonly releasedAtMs?: number;
+                readonly releasedByKeyId?: string;
+                readonly releasedControlGeneration?: number;
+                /** @enum {string} */
+                readonly releaseReasonCode?: "matter_closed" | "issued_in_error" | "superseded";
+                /** @enum {string} */
+                readonly state: "active" | "released";
+                readonly subjectId: string;
+                /** @enum {string} */
+                readonly subjectKind: "tenant" | "user";
+                readonly tenantId: string;
+            }[];
+        };
+        readonly ActiveRetentionPolicy: {
+            readonly control: {
+                readonly activePolicySha256?: string;
+                readonly activePolicyVersion?: string;
+                readonly controlGeneration: number;
+                readonly effectiveAtMs?: number;
+                readonly tenantId: string;
+                readonly updatedAtMs: number;
+            };
+            readonly policy: {
+                readonly createdAtMs: number;
+                readonly createdByKeyId: string;
+                readonly policy: {
+                    /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                    readonly billingFactRetentionMs: number | null;
+                    /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                    readonly exportArtifactTtlMs: number | null;
+                    /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                    readonly idempotencyReceiptRetentionMs: number | null;
+                    /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                    readonly lifecycleAuditRetentionMs: number | null;
+                    /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                    readonly operationalUsageRetentionMs: number | null;
+                    /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                    readonly sessionContentRetentionMs: number | null;
+                    /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                    readonly userErasureGraceMs: number | null;
+                };
+                readonly policySha256: string;
+                readonly policyVersion: string;
+                /** @enum {number} */
+                readonly schemaVersion: 1;
+                readonly tenantId: string;
+            };
+        };
         readonly AgentDefinition: {
             /** @enum {string} */
             readonly approvalPolicy: "untrusted" | "on-request" | "never";
@@ -824,6 +1007,10 @@ export type components = {
                 readonly byok: boolean;
                 /** @default false */
                 readonly dataErasureRequests?: boolean;
+                /** @default [] */
+                readonly dataGovernance?: readonly ("canonical-retention-v1" | "multi-legal-hold-v1")[];
+                /** @default false */
+                readonly dataGovernanceManagement?: boolean;
                 readonly dynamicTools: boolean;
                 /** @default [] */
                 readonly erasureJobControl?: readonly ("quarantine-v1" | "legacy-tombstone-compensation-v1")[];
@@ -899,7 +1086,7 @@ export type components = {
         readonly ErrorBody: {
             readonly error: {
                 /** @enum {string} */
-                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_has_children" | "subject_deleting" | "session_lease_conflict" | "idempotency_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
+                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_has_children" | "subject_deleting" | "session_lease_conflict" | "idempotency_conflict" | "state_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
                 readonly details?: unknown;
                 readonly message: string;
                 readonly retryable?: boolean;
@@ -1715,6 +1902,41 @@ export type components = {
                 readonly type: "systemNotice";
             })[];
         };
+        readonly LegalHold: {
+            readonly createdAtMs: number;
+            readonly createdByKeyId: string;
+            readonly createdControlGeneration: number;
+            readonly externalReferenceSha256?: string;
+            readonly holdId: string;
+            /** @enum {string} */
+            readonly reasonCode: "litigation" | "regulatory" | "security_incident" | "billing_dispute" | "legacy_unattributed";
+            readonly releasedAtMs?: number;
+            readonly releasedByKeyId?: string;
+            readonly releasedControlGeneration?: number;
+            /** @enum {string} */
+            readonly releaseReasonCode?: "matter_closed" | "issued_in_error" | "superseded";
+            /** @enum {string} */
+            readonly state: "active" | "released";
+            readonly subjectId: string;
+            /** @enum {string} */
+            readonly subjectKind: "tenant" | "user";
+            readonly tenantId: string;
+        };
+        readonly LegalHoldReleaseRequest: {
+            readonly expectedControlGeneration: number;
+            /** @enum {string} */
+            readonly reasonCode: "matter_closed" | "issued_in_error" | "superseded";
+        };
+        readonly LegalHoldSetRequest: {
+            readonly expectedControlGeneration: number;
+            readonly externalReferenceSha256?: string;
+            readonly holdId: string;
+            /** @enum {string} */
+            readonly reasonCode: "litigation" | "regulatory" | "security_incident" | "billing_dispute";
+            readonly subjectId: string;
+            /** @enum {string} */
+            readonly subjectKind: "tenant" | "user";
+        };
         readonly ModelList: {
             readonly data: readonly {
                 readonly compat?: {
@@ -1998,6 +2220,52 @@ export type components = {
                     readonly totalTokens: number;
                 };
                 readonly userId: string;
+            };
+        };
+        readonly RetentionPolicy: {
+            readonly createdAtMs: number;
+            readonly createdByKeyId: string;
+            readonly policy: {
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly billingFactRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly exportArtifactTtlMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly idempotencyReceiptRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly lifecycleAuditRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly operationalUsageRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly sessionContentRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly userErasureGraceMs: number | null;
+            };
+            readonly policySha256: string;
+            readonly policyVersion: string;
+            /** @enum {number} */
+            readonly schemaVersion: 1;
+            readonly tenantId: string;
+        };
+        readonly RetentionPolicyActivateRequest: {
+            readonly expectedControlGeneration: number;
+        };
+        readonly RetentionPolicyPutRequest: {
+            readonly policy: {
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly billingFactRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly exportArtifactTtlMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly idempotencyReceiptRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly lifecycleAuditRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly operationalUsageRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly sessionContentRetentionMs: number | null;
+                /** @description Retention duration in milliseconds. null is fail-closed and does not authorize expiry. */
+                readonly userErasureGraceMs: number | null;
             };
         };
         readonly Session: {
@@ -2564,6 +2832,8 @@ export type components = {
     headers: never;
     pathItems: never;
 };
+export type SchemaActiveLegalHoldList = components['schemas']['ActiveLegalHoldList'];
+export type SchemaActiveRetentionPolicy = components['schemas']['ActiveRetentionPolicy'];
 export type SchemaAgentDefinition = components['schemas']['AgentDefinition'];
 export type SchemaAgentDefinitionRequest = components['schemas']['AgentDefinitionRequest'];
 export type SchemaAgentPage = components['schemas']['AgentPage'];
@@ -2583,12 +2853,18 @@ export type SchemaErrorBody = components['schemas']['ErrorBody'];
 export type SchemaEvent = components['schemas']['Event'];
 export type SchemaExcludableEventType = components['schemas']['ExcludableEventType'];
 export type SchemaItemListResponse = components['schemas']['ItemListResponse'];
+export type SchemaLegalHold = components['schemas']['LegalHold'];
+export type SchemaLegalHoldReleaseRequest = components['schemas']['LegalHoldReleaseRequest'];
+export type SchemaLegalHoldSetRequest = components['schemas']['LegalHoldSetRequest'];
 export type SchemaModelList = components['schemas']['ModelList'];
 export type SchemaOkResponse = components['schemas']['OkResponse'];
 export type SchemaOpenApiDocument = components['schemas']['OpenApiDocument'];
 export type SchemaProviderConfig = components['schemas']['ProviderConfig'];
 export type SchemaProviderList = components['schemas']['ProviderList'];
 export type SchemaResumeSessionResponse = components['schemas']['ResumeSessionResponse'];
+export type SchemaRetentionPolicy = components['schemas']['RetentionPolicy'];
+export type SchemaRetentionPolicyActivateRequest = components['schemas']['RetentionPolicyActivateRequest'];
+export type SchemaRetentionPolicyPutRequest = components['schemas']['RetentionPolicyPutRequest'];
 export type SchemaSession = components['schemas']['Session'];
 export type SchemaSessionPage = components['schemas']['SessionPage'];
 export type SchemaStartTurnRequest = components['schemas']['StartTurnRequest'];
@@ -2925,6 +3201,171 @@ export interface operations {
             };
         };
     };
+    readonly listActiveLegalHolds: {
+        readonly parameters: {
+            readonly query: {
+                readonly subjectId: string;
+                readonly subjectKind: "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Active holds and fail-closed projection control. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ActiveLegalHoldList"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly setLegalHold: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** @description Bounded hold identity, scope and reason. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["LegalHoldSetRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Existing or newly set legal hold. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["LegalHold"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getLegalHold: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly holdId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Legal hold. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["LegalHold"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly releaseLegalHold: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly holdId: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Expected subject hold generation and bounded release reason. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["LegalHoldReleaseRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Released legal hold. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["LegalHold"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     readonly listModels: {
         readonly parameters: {
             readonly query?: never;
@@ -3040,6 +3481,170 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getRetentionPolicy: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly policyVersion: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Immutable policy version. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["RetentionPolicy"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly putRetentionPolicy: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly policyVersion: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Complete version-1 retention policy document. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["RetentionPolicyPutRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Existing or newly registered immutable policy version. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["RetentionPolicy"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly activateRetentionPolicy: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly policyVersion: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Expected policy-control generation. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["RetentionPolicyActivateRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Active policy and its monotonic control. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ActiveRetentionPolicy"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getActiveRetentionPolicy: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Active policy and its monotonic control. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ActiveRetentionPolicy"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
                     readonly [name: string]: unknown;
                 };
                 content: {

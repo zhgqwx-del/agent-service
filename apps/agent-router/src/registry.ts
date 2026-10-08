@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { Redis } from "ioredis";
 import {
   Capabilities,
+  DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+  DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
 } from "@agent-service/protocol";
@@ -202,6 +204,47 @@ export class RunnerRegistry {
   supportsDataErasureRequests(url: string): boolean {
     const target = this.targets.get(url.replace(/\/+$/, ""));
     return !!target?.healthy && target.capabilities?.features.dataErasureRequests === true;
+  }
+
+  /** Policy activation changes how every new erasure request is bound, so unavailable writers count. */
+  allConfiguredSupportDataGovernance(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.dataGovernance.includes(
+        DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+      ) === true
+      && target.capabilities.features.dataGovernance.includes(
+        DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
+      )
+    ));
+  }
+
+  supportsDataGovernance(url: string): boolean {
+    const target = this.targets.get(url.replace(/\/+$/, ""));
+    return !!target?.healthy
+      && target.capabilities?.features.dataGovernance.includes(
+        DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+      ) === true
+      && target.capabilities.features.dataGovernance.includes(
+        DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
+      );
+  }
+
+  /** Endpoint activation is separate from writer awareness and must also be homogeneous. */
+  allConfiguredSupportDataGovernanceManagement(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      this.supportsDataGovernance(target.url)
+      && target.capabilities?.features.dataGovernanceManagement === true
+    ));
+  }
+
+  supportsDataGovernanceManagement(url: string): boolean {
+    const normalized = url.replace(/\/+$/, "");
+    const target = this.targets.get(normalized);
+    return this.supportsDataGovernance(normalized)
+      && target?.capabilities?.features.dataGovernanceManagement === true;
   }
 
   /** Existing durable erasure jobs keep running even when admission of new requests is disabled. */

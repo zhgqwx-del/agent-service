@@ -47,6 +47,14 @@ export const ErasureJobControlCapability = z.enum([
 ]);
 export type ErasureJobControlCapability = z.infer<typeof ErasureJobControlCapability>;
 
+export const DATA_GOVERNANCE_CANONICAL_RETENTION_V1 = "canonical-retention-v1" as const;
+export const DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1 = "multi-legal-hold-v1" as const;
+export const DataGovernanceCapability = z.enum([
+  DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+  DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
+]);
+export type DataGovernanceCapability = z.infer<typeof DataGovernanceCapability>;
+
 /**
  * Fixed, content-free signal from a runner whose old local execution is already fenced but has not
  * acknowledged abort yet. The router may bypass that runner only after the authoritative Redis
@@ -85,6 +93,10 @@ export const Capabilities = z.object({
     userErasureWorker: z.array(z.literal("drain-v1")).max(1).default([]),
     /** Runner-to-router rollout signals; public routers deliberately project these as an empty list. */
     erasureJobControl: z.array(ErasureJobControlCapability).max(2).default([]),
+    /** Writer/store understands canonical policy and multi-hold authority; endpoint activation is separate. */
+    dataGovernance: z.array(DataGovernanceCapability).max(2).default([]),
+    /** The admin management endpoints are enabled on this runner; still never implies purge. */
+    dataGovernanceManagement: z.boolean().default(false),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

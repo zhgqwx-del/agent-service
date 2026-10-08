@@ -2,6 +2,314 @@
   "components": {
     "parameters": {},
     "schemas": {
+      "ActiveLegalHoldList": {
+        "properties": {
+          "control": {
+            "properties": {
+              "activeHoldCount": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "activeProjectionSha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "controlGeneration": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "subjectId": {
+                "type": "string"
+              },
+              "subjectKind": {
+                "enum": [
+                  "tenant",
+                  "user"
+                ],
+                "type": "string"
+              },
+              "tenantId": {
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "tenantId",
+              "subjectKind",
+              "subjectId",
+              "controlGeneration",
+              "activeHoldCount",
+              "activeProjectionSha256",
+              "updatedAtMs"
+            ],
+            "type": "object"
+          },
+          "data": {
+            "items": {
+              "properties": {
+                "createdAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "createdByKeyId": {
+                  "type": "string"
+                },
+                "createdControlGeneration": {
+                  "maximum": 9007199254740991,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "externalReferenceSha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "holdId": {
+                  "pattern": "^hold_[A-Za-z0-9][A-Za-z0-9._-]{0,58}$",
+                  "type": "string"
+                },
+                "reasonCode": {
+                  "enum": [
+                    "litigation",
+                    "regulatory",
+                    "security_incident",
+                    "billing_dispute",
+                    "legacy_unattributed"
+                  ],
+                  "type": "string"
+                },
+                "releaseReasonCode": {
+                  "enum": [
+                    "matter_closed",
+                    "issued_in_error",
+                    "superseded"
+                  ],
+                  "type": "string"
+                },
+                "releasedAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "releasedByKeyId": {
+                  "type": "string"
+                },
+                "releasedControlGeneration": {
+                  "maximum": 9007199254740991,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "state": {
+                  "enum": [
+                    "active",
+                    "released"
+                  ],
+                  "type": "string"
+                },
+                "subjectId": {
+                  "type": "string"
+                },
+                "subjectKind": {
+                  "enum": [
+                    "tenant",
+                    "user"
+                  ],
+                  "type": "string"
+                },
+                "tenantId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tenantId",
+                "holdId",
+                "subjectKind",
+                "subjectId",
+                "state",
+                "reasonCode",
+                "createdControlGeneration",
+                "createdByKeyId",
+                "createdAtMs"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "control",
+          "data"
+        ],
+        "type": "object"
+      },
+      "ActiveRetentionPolicy": {
+        "properties": {
+          "control": {
+            "properties": {
+              "activePolicySha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "activePolicyVersion": {
+                "pattern": "^(?!active$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                "type": "string"
+              },
+              "controlGeneration": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "effectiveAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "tenantId": {
+                "type": "string"
+              },
+              "updatedAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "tenantId",
+              "controlGeneration",
+              "updatedAtMs"
+            ],
+            "type": "object"
+          },
+          "policy": {
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "createdByKeyId": {
+                "type": "string"
+              },
+              "policy": {
+                "additionalProperties": false,
+                "properties": {
+                  "billingFactRetentionMs": {
+                    "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "exportArtifactTtlMs": {
+                    "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "idempotencyReceiptRetentionMs": {
+                    "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "lifecycleAuditRetentionMs": {
+                    "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "operationalUsageRetentionMs": {
+                    "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "sessionContentRetentionMs": {
+                    "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "userErasureGraceMs": {
+                    "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "sessionContentRetentionMs",
+                  "userErasureGraceMs",
+                  "operationalUsageRetentionMs",
+                  "idempotencyReceiptRetentionMs",
+                  "billingFactRetentionMs",
+                  "lifecycleAuditRetentionMs",
+                  "exportArtifactTtlMs"
+                ],
+                "type": "object"
+              },
+              "policySha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "policyVersion": {
+                "pattern": "^(?!active$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+                "type": "string"
+              },
+              "schemaVersion": {
+                "enum": [
+                  1
+                ],
+                "type": "number"
+              },
+              "tenantId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tenantId",
+              "policyVersion",
+              "schemaVersion",
+              "policy",
+              "policySha256",
+              "createdByKeyId",
+              "createdAtMs"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "control",
+          "policy"
+        ],
+        "type": "object"
+      },
       "AgentDefinition": {
         "properties": {
           "approvalPolicy": {
@@ -775,6 +1083,22 @@
                 "default": false,
                 "type": "boolean"
               },
+              "dataGovernance": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "canonical-retention-v1",
+                    "multi-legal-hold-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 2,
+                "type": "array"
+              },
+              "dataGovernanceManagement": {
+                "default": false,
+                "type": "boolean"
+              },
               "dynamicTools": {
                 "type": "boolean"
               },
@@ -1104,6 +1428,7 @@
                   "subject_deleting",
                   "session_lease_conflict",
                   "idempotency_conflict",
+                  "state_conflict",
                   "provider_error",
                   "approval_expired",
                   "draining",
@@ -4641,6 +4966,164 @@
         ],
         "type": "object"
       },
+      "LegalHold": {
+        "properties": {
+          "createdAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "createdByKeyId": {
+            "type": "string"
+          },
+          "createdControlGeneration": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "externalReferenceSha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "holdId": {
+            "pattern": "^hold_[A-Za-z0-9][A-Za-z0-9._-]{0,58}$",
+            "type": "string"
+          },
+          "reasonCode": {
+            "enum": [
+              "litigation",
+              "regulatory",
+              "security_incident",
+              "billing_dispute",
+              "legacy_unattributed"
+            ],
+            "type": "string"
+          },
+          "releaseReasonCode": {
+            "enum": [
+              "matter_closed",
+              "issued_in_error",
+              "superseded"
+            ],
+            "type": "string"
+          },
+          "releasedAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "releasedByKeyId": {
+            "type": "string"
+          },
+          "releasedControlGeneration": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "released"
+            ],
+            "type": "string"
+          },
+          "subjectId": {
+            "type": "string"
+          },
+          "subjectKind": {
+            "enum": [
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          },
+          "tenantId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenantId",
+          "holdId",
+          "subjectKind",
+          "subjectId",
+          "state",
+          "reasonCode",
+          "createdControlGeneration",
+          "createdByKeyId",
+          "createdAtMs"
+        ],
+        "type": "object"
+      },
+      "LegalHoldReleaseRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedControlGeneration": {
+            "maximum": 9007199254740990,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reasonCode": {
+            "enum": [
+              "matter_closed",
+              "issued_in_error",
+              "superseded"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedControlGeneration",
+          "reasonCode"
+        ],
+        "type": "object"
+      },
+      "LegalHoldSetRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedControlGeneration": {
+            "maximum": 9007199254740990,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "externalReferenceSha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "holdId": {
+            "pattern": "^hold_[A-Za-z0-9][A-Za-z0-9._-]{0,58}$",
+            "type": "string"
+          },
+          "reasonCode": {
+            "enum": [
+              "litigation",
+              "regulatory",
+              "security_incident",
+              "billing_dispute"
+            ],
+            "type": "string"
+          },
+          "subjectId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "subjectKind": {
+            "enum": [
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "holdId",
+          "subjectKind",
+          "subjectId",
+          "reasonCode",
+          "expectedControlGeneration"
+        ],
+        "type": "object"
+      },
       "ModelList": {
         "properties": {
           "data": {
@@ -5807,6 +6290,224 @@
           "recentTurns",
           "pendingApprovalIds",
           "lastSeq"
+        ],
+        "type": "object"
+      },
+      "RetentionPolicy": {
+        "properties": {
+          "createdAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "createdByKeyId": {
+            "type": "string"
+          },
+          "policy": {
+            "additionalProperties": false,
+            "properties": {
+              "billingFactRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "exportArtifactTtlMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "idempotencyReceiptRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lifecycleAuditRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "operationalUsageRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "sessionContentRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "userErasureGraceMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "sessionContentRetentionMs",
+              "userErasureGraceMs",
+              "operationalUsageRetentionMs",
+              "idempotencyReceiptRetentionMs",
+              "billingFactRetentionMs",
+              "lifecycleAuditRetentionMs",
+              "exportArtifactTtlMs"
+            ],
+            "type": "object"
+          },
+          "policySha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "policyVersion": {
+            "pattern": "^(?!active$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+            "type": "string"
+          },
+          "schemaVersion": {
+            "enum": [
+              1
+            ],
+            "type": "number"
+          },
+          "tenantId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenantId",
+          "policyVersion",
+          "schemaVersion",
+          "policy",
+          "policySha256",
+          "createdByKeyId",
+          "createdAtMs"
+        ],
+        "type": "object"
+      },
+      "RetentionPolicyActivateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedControlGeneration": {
+            "maximum": 9007199254740990,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expectedControlGeneration"
+        ],
+        "type": "object"
+      },
+      "RetentionPolicyPutRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "policy": {
+            "additionalProperties": false,
+            "properties": {
+              "billingFactRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "exportArtifactTtlMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "idempotencyReceiptRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "lifecycleAuditRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "operationalUsageRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "sessionContentRetentionMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "userErasureGraceMs": {
+                "description": "Retention duration in milliseconds. null is fail-closed and does not authorize expiry.",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "sessionContentRetentionMs",
+              "userErasureGraceMs",
+              "operationalUsageRetentionMs",
+              "idempotencyReceiptRetentionMs",
+              "billingFactRetentionMs",
+              "lifecycleAuditRetentionMs",
+              "exportArtifactTtlMs"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "policy"
         ],
         "type": "object"
       },
@@ -8505,6 +9206,390 @@
         ]
       }
     },
+    "/v1/legal-holds": {
+      "get": {
+        "operationId": "listActiveLegalHolds",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "subjectKind",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "subjectId",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActiveLegalHoldList"
+                }
+              }
+            },
+            "description": "Active holds and fail-closed projection control.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "List active holds and their subject control",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Admin-only generation-CAS operation. A hold pauses destructive work but never restores ordinary API visibility.",
+        "operationId": "setLegalHold",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LegalHoldSetRequest"
+              }
+            }
+          },
+          "description": "Bounded hold identity, scope and reason.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LegalHold"
+                }
+              }
+            },
+            "description": "Existing or newly set legal hold.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Set a tenant- or user-scoped legal hold",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/legal-holds/{holdId}": {
+      "get": {
+        "operationId": "getLegalHold",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "holdId",
+            "required": true,
+            "schema": {
+              "pattern": "^hold_[A-Za-z0-9][A-Za-z0-9._-]{0,58}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LegalHold"
+                }
+              }
+            },
+            "description": "Legal hold.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read one tenant-owned legal hold",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/legal-holds/{holdId}/release": {
+      "post": {
+        "description": "Admin-only generation-CAS release. Other active holds on the same subject remain effective.",
+        "operationId": "releaseLegalHold",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "holdId",
+            "required": true,
+            "schema": {
+              "pattern": "^hold_[A-Za-z0-9][A-Za-z0-9._-]{0,58}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LegalHoldReleaseRequest"
+              }
+            }
+          },
+          "description": "Expected subject hold generation and bounded release reason.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LegalHold"
+                }
+              }
+            },
+            "description": "Released legal hold.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Release one legal hold",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
     "/v1/models": {
       "get": {
         "operationId": "listModels",
@@ -8675,6 +9760,377 @@
         "summary": "Create or replace a tenant provider configuration",
         "tags": [
           "Providers"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/retention-policies/active": {
+      "get": {
+        "operationId": "getActiveRetentionPolicy",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActiveRetentionPolicy"
+                }
+              }
+            },
+            "description": "Active policy and its monotonic control.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read the active canonical tenant retention policy",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/retention-policies/{policyVersion}": {
+      "get": {
+        "operationId": "getRetentionPolicy",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "policyVersion",
+            "required": true,
+            "schema": {
+              "pattern": "^(?!active$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionPolicy"
+                }
+              }
+            },
+            "description": "Immutable policy version.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read an immutable tenant retention policy version",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      },
+      "put": {
+        "description": "Admin-only and rollout-gated. Registering a version does not activate it and cannot authorize purge.",
+        "operationId": "putRetentionPolicy",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "policyVersion",
+            "required": true,
+            "schema": {
+              "pattern": "^(?!active$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionPolicyPutRequest"
+              }
+            }
+          },
+          "description": "Complete version-1 retention policy document.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionPolicy"
+                }
+              }
+            },
+            "description": "Existing or newly registered immutable policy version.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Register an immutable tenant retention policy version",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/retention-policies/{policyVersion}/activate": {
+      "post": {
+        "description": "Admin-only generation-CAS activation. It affects only requests created after the activation linearization point; existing backlog is never adopted implicitly.",
+        "operationId": "activateRetentionPolicy",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "policyVersion",
+            "required": true,
+            "schema": {
+              "pattern": "^(?!active$)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionPolicyActivateRequest"
+              }
+            }
+          },
+          "description": "Expected policy-control generation.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActiveRetentionPolicy"
+                }
+              }
+            },
+            "description": "Active policy and its monotonic control.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Activate a canonical tenant retention policy",
+        "tags": [
+          "Data lifecycle"
         ],
         "x-required-api-key-scopes": [
           "admin"

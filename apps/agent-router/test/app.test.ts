@@ -88,6 +88,10 @@ function fakeRegistry(
     worker?: boolean;
     targetWorker?: boolean | ((url: string) => boolean);
     jobControl?: boolean;
+    governance?: boolean;
+    targetGovernance?: boolean;
+    governanceManagement?: boolean;
+    targetGovernanceManagement?: boolean;
   } = {},
 ): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
@@ -115,6 +119,18 @@ function fakeRegistry(
       typeof opts.targetErasure === "function"
         ? opts.targetErasure()
         : opts.targetErasure ?? opts.erasure ?? true
+    ),
+    allConfiguredSupportDataGovernance: () => opts.governance ?? true,
+    supportsDataGovernance: () => opts.targetGovernance ?? opts.governance ?? true,
+    allConfiguredSupportDataGovernanceManagement: () => (
+      opts.governanceManagement ?? opts.governance ?? true
+    ),
+    supportsDataGovernanceManagement: () => (
+      opts.targetGovernanceManagement
+      ?? opts.governanceManagement
+      ?? opts.targetGovernance
+      ?? opts.governance
+      ?? true
     ),
     allHealthySupportUserErasureWorker: () => opts.worker ?? false,
     supportsUserErasureWorker: (url: string) => (
@@ -634,6 +650,26 @@ describe("request and response handling", () => {
     const staleTargetResponse = await staleTarget.request("/v1/data-erasure-requests", request);
     expect(staleTargetResponse.status).toBe(503);
     expectPrivateLifecycleResponse(staleTargetResponse);
+    // A pre-policy runner may still advertise the older erasure boolean. It must not admit a new
+    // request because it would omit an already-active canonical policy binding.
+    const legacyGovernanceWriter = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true, governance: false }),
+      erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    expect((await legacyGovernanceWriter.request("/v1/data-erasure-requests", request)).status).toBe(503);
+    const staleGovernanceTarget = createRouterApp({
+      registry: fakeRegistry([a.url], {
+        erasure: true,
+        governance: true,
+        targetGovernance: false,
+      }),
+      erasureRequestsEnabled: () => true,
+      internalRunnerToken: INTERNAL_TOKEN,
+      logger: silent,
+    });
+    expect((await staleGovernanceTarget.request("/v1/data-erasure-requests", request)).status).toBe(503);
 
     const enabled = createRouterApp({
       registry: fakeRegistry([a.url], { erasure: true }),
@@ -751,9 +787,91 @@ describe("request and response handling", () => {
     expect((await app.request("/v1/usage")).status).toBe(200);
     expect(a.requests).toHaveLength(3);
   });
+
+  it("gates canonical policy and legal-hold management on the whole configured fleet", async () => {
+    const target = await upstream(() => ({ body: '{"ok":true}' }));
+    const request = {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        holdId: "hold_router-gate",
+        subjectKind: "user",
+        subjectId: "u_1",
+        reasonCode: "litigation",
+        expectedControlGeneration: 0,
+      }),
+    };
+
+    const gateOff = createRouterApp({
+      registry: fakeRegistry([target.url], { governance: true }),
+      logger: silent,
+    });
+    const closed = await gateOff.request("/v1/legal-holds", request);
+    expect(closed.status).toBe(503);
+    expectPrivateLifecycleResponse(closed);
+
+    const mixed = createRouterApp({
+      registry: fakeRegistry([target.url], { governance: false }),
+      dataGovernanceManagementEnabled: () => true,
+      logger: silent,
+    });
+    expect((await mixed.request("/v1/legal-holds", request)).status).toBe(503);
+
+    const managementOff = createRouterApp({
+      registry: fakeRegistry([target.url], {
+        governance: true,
+        governanceManagement: false,
+      }),
+      dataGovernanceManagementEnabled: () => true,
+      logger: silent,
+    });
+    expect((await managementOff.request("/v1/legal-holds", request)).status).toBe(503);
+
+    const staleTarget = createRouterApp({
+      registry: fakeRegistry([target.url], { governance: true, targetGovernance: false }),
+      dataGovernanceManagementEnabled: () => true,
+      logger: silent,
+    });
+    expect((await staleTarget.request("/v1/legal-holds", request)).status).toBe(503);
+
+    const enabled = createRouterApp({
+      registry: fakeRegistry([target.url], { governance: true }),
+      dataGovernanceManagementEnabled: () => true,
+      logger: silent,
+    });
+    const forwarded = await enabled.request("/v1/legal-holds", request);
+    expect(forwarded.status).toBe(200);
+    expectPrivateLifecycleResponse(forwarded);
+    expect(target.requests).toHaveLength(1);
+    expect(target.requests[0]).toMatchObject({ method: "POST", path: "/v1/legal-holds" });
+  });
 });
 
 describe("failure handling", () => {
+  it("retries generation-CAS governance writes after a transport failure", async () => {
+    const dead = "http://127.0.0.1:1";
+    const alive = await upstream(() => ({ body: '{"holdId":"hold_retry"}' }));
+    const app = createRouterApp({
+      registry: fakeRegistry([dead, alive.url], { governance: true }),
+      dataGovernanceManagementEnabled: () => true,
+      maxAttempts: 2,
+      logger: silent,
+    });
+    const response = await app.request("/v1/legal-holds", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        holdId: "hold_retry",
+        subjectKind: "user",
+        subjectId: "u_1",
+        reasonCode: "litigation",
+        expectedControlGeneration: 0,
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(alive.requests).toHaveLength(1);
+  });
+
   it("retries only an idempotency-keyed erasure request after a transport failure", async () => {
     const dead = "http://127.0.0.1:1";
     const alive = await upstream(() => ({ status: 202, body: '{"status":"gated"}' }));
@@ -980,16 +1098,17 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"], dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"], dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"], dataGovernanceManagement: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
       registry: fakeRegistry([a.url], { blobs: true, worker: true }),
       tombstoneEnabled: () => true,
       blobAttachmentsEnabled: () => true,
       erasureRequestsEnabled: () => true,
+      dataGovernanceManagementEnabled: () => true,
       internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
-    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[]; erasureJobControl: string[] } };
+    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[]; erasureJobControl: string[]; dataGovernance: string[]; dataGovernanceManagement: boolean } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
@@ -998,13 +1117,20 @@ describe("operational endpoints", () => {
     expect(caps.features.dataErasureRequests).toBe(true);
     expect(caps.features.userErasureWorker).toEqual(["drain-v1"]);
     expect(caps.features.erasureJobControl).toEqual([]);
+    expect(caps.features.dataGovernance).toEqual(["canonical-retention-v1", "multi-legal-hold-v1"]);
+    expect(caps.features.dataGovernanceManagement).toBe(true);
 
     const noToken = createRouterApp({
       registry: fakeRegistry([a.url], { worker: true }),
       logger: silent,
     });
     expect(await (await noToken.request("/v1/capabilities")).json()).toMatchObject({
-      features: { userErasureWorker: [], erasureJobControl: [] },
+      features: {
+        userErasureWorker: [],
+        erasureJobControl: [],
+        dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"],
+        dataGovernanceManagement: false,
+      },
     });
   });
 

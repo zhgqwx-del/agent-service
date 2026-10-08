@@ -31,6 +31,10 @@ const Env = z.object({
   SESSION_TOMBSTONE_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** Explicit expand→activate gate for subject write barriers. */
   DATA_ERASURE_REQUESTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Canonical retention-policy/legal-hold management. Physical purge remains a separate gate. */
+  DATA_GOVERNANCE_MANAGEMENT_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   SHUTDOWN_GRACE_MS: z.coerce.number().int().nonnegative().default(10_000),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   NODE_ENV: z.string().optional(),

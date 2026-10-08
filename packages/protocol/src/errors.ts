@@ -11,6 +11,7 @@ export const ErrorCode = z.enum([
   "subject_deleting",
   "session_lease_conflict",
   "idempotency_conflict",
+  "state_conflict",
   // NOTE: `quota_exceeded` (429) arrives with per-tenant quotas in M4; `limits_exceeded` was removed
   // because request limits are clamped (mergeLimits takes the min), never rejected. Do not declare a
   // code before something can return it — clients write dead branches for it.
@@ -32,6 +33,7 @@ export const HTTP_STATUS: Record<ErrorCode, number> = {
   subject_deleting: 409,
   session_lease_conflict: 409,
   idempotency_conflict: 409,
+  state_conflict: 409,
   provider_error: 502,
   approval_expired: 410,
   draining: 503,

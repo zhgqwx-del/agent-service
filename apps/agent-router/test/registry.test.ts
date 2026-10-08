@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+  DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   PROTOCOL_VERSION,
@@ -11,6 +13,10 @@ afterEach(() => vi.unstubAllGlobals());
 const JOB_CONTROL_V2 = [
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
+] as const;
+const DATA_GOVERNANCE_V1 = [
+  DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
+  DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
 ] as const;
 
 describe("RunnerRegistry owner address mapping", () => {
@@ -39,6 +45,8 @@ describe("RunnerRegistry owner address mapping", () => {
       dataErasureRequests = true,
       userErasureWorker = ["drain-v1"],
       erasureJobControl: readonly string[] = JOB_CONTROL_V2,
+      dataGovernance: readonly string[] = DATA_GOVERNANCE_V1,
+      dataGovernanceManagement = true,
     ) => ({
       protocolVersion,
       service: "agent-runner",
@@ -51,6 +59,8 @@ describe("RunnerRegistry owner address mapping", () => {
         dataErasureRequests,
         userErasureWorker,
         erasureJobControl,
+        dataGovernance,
+        dataGovernanceManagement,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -70,6 +80,8 @@ describe("RunnerRegistry owner address mapping", () => {
           false,
           [],
           [],
+          [],
+          false,
         ));
       }
       if (url.startsWith("http://old/")) return Response.json(capabilities("2026-09-22"));
@@ -99,6 +111,12 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.allConfiguredSupportDataErasureRequests()).toBe(false);
     expect(registry.supportsDataErasureRequests("http://current")).toBe(true);
     expect(registry.supportsDataErasureRequests("http://current-basic")).toBe(false);
+    expect(registry.allConfiguredSupportDataGovernance()).toBe(false);
+    expect(registry.supportsDataGovernance("http://current")).toBe(true);
+    expect(registry.supportsDataGovernance("http://current-basic")).toBe(false);
+    expect(registry.allConfiguredSupportDataGovernanceManagement()).toBe(false);
+    expect(registry.supportsDataGovernanceManagement("http://current")).toBe(true);
+    expect(registry.supportsDataGovernanceManagement("http://current-basic")).toBe(false);
     expect(registry.allHealthySupportUserErasureWorker()).toBe(false);
     expect(registry.supportsUserErasureWorker("http://current")).toBe(true);
     expect(registry.supportsUserErasureWorker("http://current-basic")).toBe(false);

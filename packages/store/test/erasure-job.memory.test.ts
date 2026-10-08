@@ -195,6 +195,29 @@ describe("MemorySessionStore durable erasure job queue", () => {
   it("enforces the state graph and keeps rolling-upgrade purging rows outside the normal worker", async () => {
     const store = new MemorySessionStore();
     const input = requestInput("tenant-transition", "user-transition");
+    const policyDocument = {
+      sessionContentRetentionMs: null,
+      userErasureGraceMs: null,
+      operationalUsageRetentionMs: null,
+      idempotencyReceiptRetentionMs: null,
+      billingFactRetentionMs: null,
+      lifecycleAuditRetentionMs: null,
+      exportArtifactTtlMs: null,
+    } as const;
+    const admittedPolicy = await store.putRetentionPolicy({
+      tenantId: input.tenantId,
+      policyVersion: "policy-v1",
+      policy: policyDocument,
+      actorKeyId: "policy-admin",
+      atMs: 90,
+    });
+    await store.activateRetentionPolicy({
+      tenantId: input.tenantId,
+      policyVersion: admittedPolicy.policyVersion,
+      expectedControlGeneration: 0,
+      actorKeyId: "policy-admin",
+      atMs: 90,
+    });
     await store.requestUserErasure(input);
     const gated = (await store.claimErasureJobs({
       nowMs: 100, limit: 1, leaseMs: 100, claimToken: "worker-gated",
@@ -207,19 +230,22 @@ describe("MemorySessionStore durable erasure job queue", () => {
       toStatus: "draining",
       atMs: 101,
       availableAtMs: 101,
-      policyVersion: "policy-v1",
-      policyHash: "a".repeat(64),
+      policyVersion: admittedPolicy.policyVersion,
+      policyHash: admittedPolicy.policySha256,
     })).toBe(true);
     expect(await store.getSubjectLifecycle(input.tenantId, "user", input.userId)).toMatchObject({
       state: "deleting", activeRequestId: input.requestId,
     });
     expect(await store.listErasureAuditEvents(input.requestId)).toHaveLength(2);
 
-    // Seed the future policy decision without implementing policy activation in this substrate.
-    // The complete legal audit chain is still mandatory and must carry immutable policy identity.
+    // Seed a rolling-upgrade purging row. Its policy was selected at admission and every later
+    // audit must carry that same immutable identity.
     const record = store.erasureRequests.get(input.requestId)!;
     const audits = store.erasureAuditEvents.get(input.requestId)!;
-    const policy = { policyVersion: "policy-v1", policyHash: "a".repeat(64) };
+    const policy = {
+      policyVersion: admittedPolicy.policyVersion,
+      policyHash: admittedPolicy.policySha256,
+    };
     const futureStates = [
       ["draining", "tombstoning"],
       ["tombstoning", "reconciling_usage"],

@@ -1319,6 +1319,28 @@ describe("MemorySessionStore erasure quarantine and maintenance", () => {
   it("keeps immutable policy identity strict across the main audit chain", async () => {
     const store = new MemorySessionStore();
     const input = requestInput("tenant-policy-audit", "user-policy-audit");
+    const policy = await store.putRetentionPolicy({
+      tenantId: input.tenantId,
+      policyVersion: "policy-v1",
+      policy: {
+        sessionContentRetentionMs: null,
+        userErasureGraceMs: null,
+        operationalUsageRetentionMs: null,
+        idempotencyReceiptRetentionMs: null,
+        billingFactRetentionMs: null,
+        lifecycleAuditRetentionMs: null,
+        exportArtifactTtlMs: null,
+      },
+      actorKeyId: "policy-admin",
+      atMs: 90,
+    });
+    await store.activateRetentionPolicy({
+      tenantId: input.tenantId,
+      policyVersion: policy.policyVersion,
+      expectedControlGeneration: 0,
+      actorKeyId: "policy-admin",
+      atMs: 90,
+    });
     await store.requestUserErasure(input);
     const claim = (await store.claimErasureJobs({
       nowMs: 100,
@@ -1331,8 +1353,8 @@ describe("MemorySessionStore erasure quarantine and maintenance", () => {
       toStatus: "draining",
       atMs: 101,
       availableAtMs: 101,
-      policyVersion: "policy-v1",
-      policyHash: "a".repeat(64),
+      policyVersion: policy.policyVersion,
+      policyHash: policy.policySha256,
     });
     const record = store.erasureRequests.get(input.requestId)!;
     const audits = store.erasureAuditEvents.get(input.requestId)!;

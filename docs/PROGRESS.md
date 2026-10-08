@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层，以及 admission 默认关闭的 durable user-erasure gate/queue/worker 已完成。`0013` 已把确定性 claim-stage poison逐候选隔离；`0014` 进一步以默认休眠的 write-once cutover、durable job/audit 和 runner 内嵌 worker闭环 pre-0009 `deletion_generation=0` tombstone 的可审计补偿。v2 私有 barrier 只有在全部 configured runner 同时声明 `quarantine-v1` 与 `legacy-tombstone-compensation-v1` 后放行；成功事务保留原删除时间，原子补齐 generation `1` terminal event、两条 lifecycle intent、append-only audit 与 job completion，但不会激活 purge 或删除内容。异步 export artifact/TTL、tenant erasure与 key/provider/auth secret撤销、canonical policy/legal-hold、policy-gated ready/session purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、admission 默认关闭的 durable user-erasure gate/queue/worker、legacy generation `0` 补偿，以及 canonical retention policy / multi legal hold 管理面已完成。`0015` 增加不可变策略版本、generation-CAS activation、tenant/user 多 hold 账本与 append-only audit；新 erasure request 在线性化点绑定 active policy，数据库 guard 会在 activation 后拒绝 pre-`0015` writer 的空/错误绑定，旧 backlog 不被事后改写。迁移不创建默认策略，管理 gate 默认关闭，任何 duration 都尚未启用 purge。异步 export artifact/TTL、tenant erasure及 key/provider/auth-secret 撤销、policy evaluator、默认关闭的 ready/session purge、completed proof 与 restore replay仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -389,3 +389,31 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - 下一独立切片先实现 canonical policy/legal-hold与不可领取的 purge policy substrate；在保留期、共享对象存储、备份恢复门禁和 operator事故流程明确前，不激活不可逆 ready Blob/session purge。随后完成 export、tenant/key撤销、completed proof与restore replay，再正式进入 M3。
 - `0014` cutover 激活后必须 forward-only。sticky barrier仍依赖实例稳定地址、排空旧 worker和禁止版本回退；尚无真实 N-1旧binary canary。正常 runtime不可生成但特权数据库损坏可制造同 session/不同jobId的 orphan result，当前作为 P3事故风险保全并留给受审计运维流程；Memory非canonical audit-only候选也只有 O(n)重扫的测试后端效率残余。append-only trigger不能防御持有DDL/TRUNCATE权限的主体，生产需独立 migration identity与最小 runtime权限。
 - 当前无云资源不阻止继续完成 local/CI代码范围，但不能据此宣称 staging/production已部署。Kubernetes、共享对象存储、KMS/Secret、域名/TLS、真实 IdP、MySQL/Redis拓扑、备份和容量参数仍等待真实环境后落地；CI当前只 build/load/start候选镜像，不推 registry、不签名也不执行 promotion。
+
+## 2026-10-09（M1 数据生命周期：0015 canonical retention policy / multi legal hold）
+
+### 已完成
+
+1. 新增 canonical retention-policy authority：tenant 内的 policy version 不可变，七类 duration 必须完整声明且 `null` 明确表示 fail closed；active control 通过 generation CAS 和 rooted append-only activation audit 切换。activation 提交即生效，不提供依赖 runner 墙钟的未来调度，跨 runner 时钟倒退会在 control 锁内单调化。
+2. 新增 tenant/user scoped multi legal-hold ledger：同一 subject 可并存多条 hold，set/release 各自使用 generation CAS；release 只结算指定 hold，其它 active hold 继续生效。control、active projection、legacy compatibility shadow 与 append-only event chain相互校验，外部案件引用只接收 SHA-256，不保存原文。canonical hold 已接入 usage anonymize 的破坏性写入门禁，但本轮没有新增 anonymize/purge worker。
+3. MemoryStore 以同步临界区和 staged multi-map publish 保证 policy/hold control、ledger、audit及 lifecycle shadow 同时提交或回滚；MySQLStore 使用 InnoDB transaction、tenant→user→ledger 锁顺序、generation CAS和失败回滚。两端都覆盖immutable replay、response-loss replay、并发 activation/set/release、时钟落后、audit注入失败、跨tenant隔离及hold/anonymize线性化。
+4. 新 erasure request 在 admission 事务中观察并永久绑定当时 active policy 的 version/hash；activation 前已提交的 backlog及其幂等 replay保持未绑定，不能事后借新策略获得删除权限。`0015` 的 replay-safe `BEFORE INSERT` guards与activation共用tenant control锁：control缺失/休眠时只允许`NULL/NULL`，active后只允许binary-exact version/hash；旧 writer若晚于activation只会整事务失败。guard故意不拦 UPDATE，避免把历史 backlog困死。
+5. 新增 admin-only且`Cache-Control: no-store`的8个公开管理操作：policy put/activate/active get/version get，以及 hold set/release/get/active-list。`policyVersion=active`保留给固定路由。runner/router的`DATA_GOVERNANCE_MANAGEMENT_ENABLED`默认`0`；`dataGovernance`只表示writer/store理解durable contract，`dataGovernanceManagement`才表示管理API已开启。router要求全部configured target健康、code-aware且management-active，并在转发前复核目标；erasure POST也要求全fleet code-aware，避免mixed-version漏绑。
+6. 新增expand-only `0015_retention_policy_and_legal_holds.sql`及冻结的`mysql-0014.sql`历史夹具。migration不会创建active policy、改绑backlog、修改usage/content、调度purge或推进request；已有`legal_hold_at_ms`被保全为确定性的migration-owned canonical hold。marker-loss replay验证rooted generation-1 provenance；同key/内容冲突、损坏control或audit会阻断而非静默覆盖。
+7. 固定`0014 → 0015`真实MySQL套件覆盖无control/休眠control、legacy hold导入、partial DDL、marker-loss、冲突阻断、append-only/单向release、旧writer INSERT guard、旧backlog UPDATE，以及activation-first/insert-first两种并发顺序；同时恢复冻结夹具中的真实0012 job trigger，证明多个`BEFORE INSERT` trigger共存。历史wrapper现在固定枚举`0007 → ... → 0015`八个夹具并拒绝missing/skip。
+8. OpenAPI 3.1、runtime schema、生成TypeScript SDK、CI命名real-MySQL门禁、runner image migration marker、本地统一验证脚本、README、架构/生命周期设计、部署runbook和长期学习指南均已同步。学习指南已集中回答本地启动与手动体验、router/runner职责、Node bundle与Linux OCI image差异，以及GitHub Actions实际构建/启动哪些进程和镜像。
+
+### 本轮验证与审查
+
+- `pnpm check:secrets`通过，扫描 **249 files**；`pnpm check:api`、`pnpm check:sdk`、`pnpm typecheck`与`git diff --check`通过，生成API/SDK无漂移，SDK真实 **18-file** package在隔离consumer中验证。
+- `scripts/local-service.sh verify`主套件 **810 passed / 1 skipped**；唯一skip是真实厂商E2E的显式开关。覆盖率 **85.09% statements / 79.15% branches / 88.20% functions / 89.05% lines**，全部超过门槛。
+- canonical policy/hold命名真实MySQL套件 **7/7**、Memory专项 **11/11**；历史迁移 **29/29**，其中`0014 → 0015` **9/9**，wrapper逐文件证明八个冻结夹具实际执行且未skip。真实MySQL usage **8/8**、subject **6/6**、erasure job **30/30**、legacy compensation **13/13**命名套件也全部通过。
+- 多进程cluster **14/14**；`pnpm build:check`构建SDK与两个独立Node 24 ESM bundle，并以原生Node启动runner/router验证readiness、capabilities、转发和OpenAPI一致性。
+- 从并发正确性、事务回滚、滚动升级、安全隔离和测试有效性复核：activation/request与hold/anonymize均有数据库锁线性化；Memory故障注入和MySQL audit/trigger失败均证明无部分状态；tenant/user查询和hash/audit均owner-scoped；管理面默认关闭且不持有purge authority；CI和local都有named no-skip execution proof。两轮独立复核发现并修复了OpenAPI非负安全整数下界漂移，以及MySQL repeatable-read并发请求在等待winner后必须使用locking current read的问题，并增加边界契约与双连接确定性回归。本轮未改变provider dialect或真实厂商网络契约，因此没有重复运行收费的`verify-real`或acceptance；最近真实模型 **1/1** 与十阶段acceptance只保留为历史基线。
+
+### 当前边界与下一步
+
+- M2本地/CI冻结结论不变，本轮仍属于M1，没有提前开始M3。M1仍不能正式冻结：canonical policy现在只是可信authority，尚缺policy evaluator、默认关闭且分权的ready Blob/session purge substrate、completed proof；异步export artifact/download/TTL、tenant erasure及key/provider/auth-secret撤销、独立故障域restore replay也未完成。
+- `0015`应在management/admission关闭时先迁移，再滚动code-aware runner/router，最后才开启各runner及router管理gate。首个policy activation或canonical hold event提交后不可回退pre-`0015` writer，只能保留证据并forward-fix。固定N-1旧镜像canary、独立production migration Job、runtime最小数据库权限与真实Kubernetes rollout仍属于M4/真实环境工作。
+- app-level append-only校验和数据库trigger不能抵御拥有DDL/TRUNCATE权限的主体；生产必须把migration identity与runtime identity分离。当前filesystem Blob仍只承诺单runner本地语义，不能在无共享对象存储时开启多VM/Pod物理purge。
+- 下一独立切片实现policy evaluator与默认关闭、不可领取的purge authority substrate：先证明到期计算、hold复核、request-bound policy及完成证明，不在缺少共享对象存储、恢复门禁和显式激活的情况下执行不可逆删除。随后收口export、tenant/key撤销与restore replay，M1闭环后再正式进入M3。

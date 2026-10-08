@@ -246,6 +246,43 @@ import {
   type ScheduleLegacyTombstoneCandidatesOptions,
   type ScheduleLegacyTombstoneCompensationInput,
 } from "./legacy-tombstone.js";
+import {
+  RETENTION_POLICY_SCHEMA_VERSION,
+  LegalHoldConflictError,
+  LegalHoldGenerationConflictError,
+  LegalHoldIntegrityError,
+  LegalHoldNotFoundError,
+  RetentionPolicyGenerationConflictError,
+  RetentionPolicyNotFoundError,
+  RetentionPolicyVersionConflictError,
+  compareLegalHoldIds,
+  legalHoldControlSha256,
+  legalHoldProjectionSha256,
+  retentionPolicyControlSha256,
+  retentionPolicySha256,
+  validateActivateRetentionPolicyInput,
+  validateLegalHoldControlRecord,
+  validateLegalHoldRecord,
+  validatePutRetentionPolicyInput,
+  validateReleaseLegalHoldInput,
+  validateRetentionPolicyControlRecord,
+  validateRetentionPolicyIdentity,
+  validateRetentionPolicyTenantId,
+  validateRetentionPolicyVersionRecord,
+  validateSetLegalHoldInput,
+  type ActivateRetentionPolicyInput,
+  type ActiveRetentionPolicy,
+  type LegalHoldControlRecord,
+  type LegalHoldEvent,
+  type LegalHoldRecord,
+  type PutRetentionPolicyInput,
+  type ReleaseLegalHoldInput,
+  type RetentionPolicyActivationEvent,
+  type RetentionPolicyControlRecord,
+  type RetentionPolicyStore,
+  type RetentionPolicyVersionRecord,
+  type SetLegalHoldInput,
+} from "./retention-policy.js";
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -259,6 +296,64 @@ function restoreMapEntry<K, V>(
   // rollback of an otherwise durable-looking multi-map publication.
   if (existed) Map.prototype.set.call(map, key, previous as V);
   else Map.prototype.delete.call(map, key);
+}
+
+function retentionPolicyKey(tenantId: string, policyVersion: string): string {
+  return JSON.stringify([tenantId, policyVersion]);
+}
+
+function legalHoldKey(tenantId: string, holdId: string): string {
+  return JSON.stringify([tenantId, holdId]);
+}
+
+function retentionPolicyDocumentsEqual(
+  left: RetentionPolicyVersionRecord["policy"],
+  right: RetentionPolicyVersionRecord["policy"],
+): boolean {
+  return retentionPolicySha256("comparison", "comparison", left)
+    === retentionPolicySha256("comparison", "comparison", right);
+}
+
+function retentionPolicyControlsEqual(
+  left: RetentionPolicyControlRecord,
+  right: RetentionPolicyControlRecord,
+): boolean {
+  return left.tenantId === right.tenantId
+    && left.controlGeneration === right.controlGeneration
+    && left.activePolicyVersion === right.activePolicyVersion
+    && left.activePolicySha256 === right.activePolicySha256
+    && left.effectiveAtMs === right.effectiveAtMs
+    && left.updatedAtMs === right.updatedAtMs;
+}
+
+function legalHoldRecordsEqual(left: LegalHoldRecord, right: LegalHoldRecord): boolean {
+  return left.tenantId === right.tenantId
+    && left.holdId === right.holdId
+    && left.subjectKind === right.subjectKind
+    && left.subjectId === right.subjectId
+    && left.state === right.state
+    && left.reasonCode === right.reasonCode
+    && left.externalReferenceSha256 === right.externalReferenceSha256
+    && left.createdControlGeneration === right.createdControlGeneration
+    && left.createdByKeyId === right.createdByKeyId
+    && left.createdAtMs === right.createdAtMs
+    && left.releasedControlGeneration === right.releasedControlGeneration
+    && left.releasedByKeyId === right.releasedByKeyId
+    && left.releasedAtMs === right.releasedAtMs
+    && left.releaseReasonCode === right.releaseReasonCode;
+}
+
+function legalHoldControlsEqual(
+  left: LegalHoldControlRecord,
+  right: LegalHoldControlRecord,
+): boolean {
+  return left.tenantId === right.tenantId
+    && left.subjectKind === right.subjectKind
+    && left.subjectId === right.subjectId
+    && left.controlGeneration === right.controlGeneration
+    && left.activeHoldCount === right.activeHoldCount
+    && left.activeProjectionSha256 === right.activeProjectionSha256
+    && left.updatedAtMs === right.updatedAtMs;
 }
 
 function paginate<T>(rows: T[], key: (r: T) => string, cursor: string | undefined, limit: number, dir: "asc" | "desc"): Page<T> {
@@ -297,7 +392,7 @@ function validateUploadedBlobInput(input: MarkBlobUploadedInput): void {
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore {
   agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -324,10 +419,778 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
   private nextErasureJobTerminalIncidentId = 1;
   private erasureIdempotency = new Map<string, string>();
+  retentionPolicies = new Map<string, RetentionPolicyVersionRecord>();
+  retentionPolicyControls = new Map<string, RetentionPolicyControlRecord>();
+  retentionPolicyActivationEvents = new Map<string, RetentionPolicyActivationEvent[]>();
+  private nextRetentionPolicyActivationEventId = 1;
+  legalHolds = new Map<string, LegalHoldRecord>();
+  legalHoldControls = new Map<string, LegalHoldControlRecord>();
+  legalHoldEvents = new Map<string, LegalHoldEvent[]>();
+  private nextLegalHoldEventId = 1;
   legacyTombstoneCutovers = new Map<string, LegacyTombstoneCutoverRecord>();
   legacyTombstoneCompensationJobs = new Map<string, LegacyTombstoneCompensationJobRecord>();
   legacyTombstoneCompensationAudits = new Map<string, LegacyTombstoneCompensationAudit[]>();
   private nextLegacyTombstoneAuditId = 1;
+
+  private initialRetentionPolicyControl(tenantId: string): RetentionPolicyControlRecord {
+    const control: RetentionPolicyControlRecord = {
+      tenantId,
+      controlGeneration: 0,
+      updatedAtMs: 0,
+    };
+    validateRetentionPolicyControlRecord(control);
+    return control;
+  }
+
+  private assertRetentionPolicyState(tenantId: string): {
+    control: RetentionPolicyControlRecord;
+    events: RetentionPolicyActivationEvent[];
+    active: RetentionPolicyVersionRecord | null;
+  } {
+    const storedControl = this.retentionPolicyControls.get(tenantId);
+    const storedEvents = this.retentionPolicyActivationEvents.get(tenantId) ?? [];
+    const initial = this.initialRetentionPolicyControl(tenantId);
+    if (!storedControl) {
+      if (storedEvents.length !== 0) {
+        throw new Error("retention policy activation audit exists without its control row");
+      }
+      return { control: initial, events: [], active: null };
+    }
+    validateRetentionPolicyControlRecord(storedControl);
+    if (storedControl.tenantId !== tenantId) {
+      throw new Error("retention policy control tenant is corrupt");
+    }
+
+    let reconstructed = initial;
+    let previousEventId = 0;
+    for (const [index, event] of storedEvents.entries()) {
+      if (
+        !Number.isSafeInteger(event.eventId)
+        || event.eventId <= previousEventId
+        || event.tenantId !== tenantId
+        || event.controlGeneration !== index + 1
+        || event.effectiveAtMs !== event.emittedAtMs
+      ) throw new Error("retention policy activation audit is corrupt");
+      previousEventId = event.eventId;
+      validateActivateRetentionPolicyInput({
+        tenantId: event.tenantId,
+        policyVersion: event.policyVersion,
+        expectedControlGeneration: event.controlGeneration - 1,
+        actorKeyId: event.actorKeyId,
+        atMs: event.emittedAtMs,
+      });
+      if (event.emittedAtMs < reconstructed.updatedAtMs) {
+        throw new Error("retention policy activation time regressed");
+      }
+      const version = this.retentionPolicies.get(retentionPolicyKey(tenantId, event.policyVersion));
+      if (!version) throw new Error("retention policy activation references a missing version");
+      validateRetentionPolicyVersionRecord(version);
+      if (
+        version.tenantId !== tenantId
+        || version.policyVersion !== event.policyVersion
+        || version.policySha256 !== event.policySha256
+        || event.beforeSha256 !== retentionPolicyControlSha256(reconstructed)
+      ) throw new Error("retention policy activation audit does not match its version or prior state");
+      const next: RetentionPolicyControlRecord = {
+        tenantId,
+        controlGeneration: event.controlGeneration,
+        activePolicyVersion: event.policyVersion,
+        activePolicySha256: event.policySha256,
+        effectiveAtMs: event.effectiveAtMs,
+        updatedAtMs: event.emittedAtMs,
+      };
+      validateRetentionPolicyControlRecord(next);
+      if (event.afterSha256 !== retentionPolicyControlSha256(next)) {
+        throw new Error("retention policy activation audit does not match its outcome");
+      }
+      reconstructed = next;
+    }
+    if (
+      storedEvents.length !== storedControl.controlGeneration
+      || !retentionPolicyControlsEqual(storedControl, reconstructed)
+    ) throw new Error("retention policy activation audit does not match its control row");
+    if (storedControl.controlGeneration === 0) {
+      return { control: clone(storedControl), events: storedEvents.map(clone), active: null };
+    }
+    const active = this.retentionPolicies.get(retentionPolicyKey(
+      tenantId,
+      storedControl.activePolicyVersion!,
+    ));
+    if (!active) throw new Error("active retention policy version is missing");
+    validateRetentionPolicyVersionRecord(active);
+    if (active.policySha256 !== storedControl.activePolicySha256) {
+      throw new Error("active retention policy hash does not match its control row");
+    }
+    return {
+      control: clone(storedControl),
+      events: storedEvents.map(clone),
+      active: clone(active),
+    };
+  }
+
+  async putRetentionPolicy(input: PutRetentionPolicyInput): Promise<RetentionPolicyVersionRecord> {
+    const stagedInput = clone(input);
+    validatePutRetentionPolicyInput(stagedInput);
+    const key = retentionPolicyKey(stagedInput.tenantId, stagedInput.policyVersion);
+    const existing = this.retentionPolicies.get(key);
+    if (existing) {
+      validateRetentionPolicyVersionRecord(existing);
+      if (
+        existing.tenantId === stagedInput.tenantId
+        && existing.policyVersion === stagedInput.policyVersion
+        && retentionPolicyDocumentsEqual(existing.policy, stagedInput.policy)
+      ) return clone(existing);
+      throw new RetentionPolicyVersionConflictError(stagedInput.policyVersion);
+    }
+    const record = clone<RetentionPolicyVersionRecord>({
+      tenantId: stagedInput.tenantId,
+      policyVersion: stagedInput.policyVersion,
+      schemaVersion: RETENTION_POLICY_SCHEMA_VERSION,
+      policy: stagedInput.policy,
+      policySha256: retentionPolicySha256(
+        stagedInput.tenantId,
+        stagedInput.policyVersion,
+        stagedInput.policy,
+      ),
+      createdByKeyId: stagedInput.actorKeyId,
+      createdAtMs: stagedInput.atMs,
+    });
+    validateRetentionPolicyVersionRecord(record);
+    const existed = this.retentionPolicies.has(key);
+    const prior = this.retentionPolicies.get(key);
+    try {
+      this.retentionPolicies.set(key, record);
+    } catch (error) {
+      restoreMapEntry(this.retentionPolicies, key, existed, prior);
+      throw error;
+    }
+    return clone(record);
+  }
+
+  async getRetentionPolicy(
+    tenantId: string,
+    policyVersion: string,
+  ): Promise<RetentionPolicyVersionRecord | null> {
+    validateRetentionPolicyIdentity(tenantId, policyVersion);
+    const key = retentionPolicyKey(tenantId, policyVersion);
+    const record = this.retentionPolicies.get(key);
+    if (!record) return null;
+    validateRetentionPolicyVersionRecord(record);
+    if (record.tenantId !== tenantId || record.policyVersion !== policyVersion) {
+      throw new Error("retention policy index is corrupt");
+    }
+    return clone(record);
+  }
+
+  async activateRetentionPolicy(
+    input: ActivateRetentionPolicyInput,
+  ): Promise<RetentionPolicyControlRecord> {
+    const stagedInput = clone(input);
+    validateActivateRetentionPolicyInput(stagedInput);
+    const policy = this.retentionPolicies.get(retentionPolicyKey(
+      stagedInput.tenantId,
+      stagedInput.policyVersion,
+    ));
+    if (!policy) throw new RetentionPolicyNotFoundError(stagedInput.policyVersion);
+    validateRetentionPolicyVersionRecord(policy);
+    const state = this.assertRetentionPolicyState(stagedInput.tenantId);
+    const current = state.control;
+    const sameActive = current.activePolicyVersion === policy.policyVersion
+      && current.activePolicySha256 === policy.policySha256;
+    if (sameActive) {
+      if (stagedInput.expectedControlGeneration === current.controlGeneration) return clone(current);
+      const tail = state.events.at(-1);
+      if (
+        stagedInput.expectedControlGeneration + 1 === current.controlGeneration
+        && tail?.controlGeneration === current.controlGeneration
+        && tail.policyVersion === stagedInput.policyVersion
+        && tail.policySha256 === policy.policySha256
+      ) return clone(current);
+    }
+    if (stagedInput.expectedControlGeneration !== current.controlGeneration) {
+      throw new RetentionPolicyGenerationConflictError(
+        stagedInput.expectedControlGeneration,
+        current.controlGeneration,
+      );
+    }
+    if (current.controlGeneration >= Number.MAX_SAFE_INTEGER - 1) {
+      throw new Error("retention policy control generation is exhausted");
+    }
+    const effectiveAtMs = Math.max(stagedInput.atMs, current.updatedAtMs);
+    const next = clone<RetentionPolicyControlRecord>({
+      tenantId: stagedInput.tenantId,
+      controlGeneration: current.controlGeneration + 1,
+      activePolicyVersion: policy.policyVersion,
+      activePolicySha256: policy.policySha256,
+      effectiveAtMs,
+      updatedAtMs: effectiveAtMs,
+    });
+    validateRetentionPolicyControlRecord(next);
+    if (
+      !Number.isSafeInteger(this.nextRetentionPolicyActivationEventId)
+      || this.nextRetentionPolicyActivationEventId <= 0
+    ) throw new Error("retention policy activation event sequence is exhausted");
+    const event = clone<RetentionPolicyActivationEvent>({
+      eventId: this.nextRetentionPolicyActivationEventId,
+      tenantId: stagedInput.tenantId,
+      controlGeneration: next.controlGeneration,
+      policyVersion: policy.policyVersion,
+      policySha256: policy.policySha256,
+      effectiveAtMs,
+      actorKeyId: stagedInput.actorKeyId,
+      beforeSha256: retentionPolicyControlSha256(current),
+      afterSha256: retentionPolicyControlSha256(next),
+      emittedAtMs: effectiveAtMs,
+    });
+    const nextEvents = clone([...state.events, event]);
+
+    const controlExisted = this.retentionPolicyControls.has(stagedInput.tenantId);
+    const priorControl = this.retentionPolicyControls.get(stagedInput.tenantId);
+    const eventsExisted = this.retentionPolicyActivationEvents.has(stagedInput.tenantId);
+    const priorEvents = this.retentionPolicyActivationEvents.get(stagedInput.tenantId);
+    try {
+      this.retentionPolicyControls.set(stagedInput.tenantId, next);
+      this.retentionPolicyActivationEvents.set(stagedInput.tenantId, nextEvents);
+    } catch (error) {
+      restoreMapEntry(
+        this.retentionPolicyActivationEvents,
+        stagedInput.tenantId,
+        eventsExisted,
+        priorEvents,
+      );
+      restoreMapEntry(
+        this.retentionPolicyControls,
+        stagedInput.tenantId,
+        controlExisted,
+        priorControl,
+      );
+      throw error;
+    }
+    this.nextRetentionPolicyActivationEventId += 1;
+    return clone(next);
+  }
+
+  async getActiveRetentionPolicy(tenantId: string): Promise<ActiveRetentionPolicy | null> {
+    validateRetentionPolicyTenantId(tenantId);
+    const state = this.assertRetentionPolicyState(tenantId);
+    if (!state.active) return null;
+    return clone({ control: state.control, policy: state.active });
+  }
+
+  async listRetentionPolicyActivationEvents(
+    tenantId: string,
+  ): Promise<RetentionPolicyActivationEvent[]> {
+    validateRetentionPolicyTenantId(tenantId);
+    return this.assertRetentionPolicyState(tenantId).events.map(clone);
+  }
+
+  private initialLegalHoldControl(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): LegalHoldControlRecord {
+    const control: LegalHoldControlRecord = {
+      tenantId,
+      subjectKind,
+      subjectId,
+      controlGeneration: 0,
+      activeHoldCount: 0,
+      activeProjectionSha256: legalHoldProjectionSha256([]),
+      updatedAtMs: 0,
+    };
+    validateLegalHoldControlRecord(control);
+    return control;
+  }
+
+  private subjectLegalHoldRecords(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): LegalHoldRecord[] {
+    const records: LegalHoldRecord[] = [];
+    for (const [key, record] of this.legalHolds) {
+      if (
+        record.tenantId !== tenantId
+        || record.subjectKind !== subjectKind
+        || record.subjectId !== subjectId
+      ) continue;
+      validateLegalHoldRecord(record);
+      if (key !== legalHoldKey(record.tenantId, record.holdId)) {
+        throw new LegalHoldIntegrityError("legal hold index does not match its record");
+      }
+      records.push(clone(record));
+    }
+    return records.sort((left, right) => compareLegalHoldIds(left.holdId, right.holdId));
+  }
+
+  private assertLegalHoldState(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): { control: LegalHoldControlRecord; holds: LegalHoldRecord[]; events: LegalHoldEvent[] } {
+    const key = subjectLifecycleKey(tenantId, subjectKind, subjectId);
+    const initial = this.initialLegalHoldControl(tenantId, subjectKind, subjectId);
+    const storedControl = this.legalHoldControls.get(key);
+    const durableHolds = this.subjectLegalHoldRecords(tenantId, subjectKind, subjectId);
+    const storedEvents = this.legalHoldEvents.get(key) ?? [];
+    const lifecycle = this.subjectLifecycles.get(key);
+    if (lifecycle && (
+      lifecycle.tenantId !== tenantId
+      || lifecycle.subjectKind !== subjectKind
+      || lifecycle.subjectId !== subjectId
+    )) throw new LegalHoldIntegrityError("legal hold lifecycle index is corrupt");
+
+    if (!storedControl) {
+      if (durableHolds.length !== 0 || storedEvents.length !== 0) {
+        throw new LegalHoldIntegrityError("legal hold ledger exists without its control row");
+      }
+      if (lifecycle?.legalHoldAtMs !== undefined) {
+        throw new LegalHoldIntegrityError("legacy legal hold shadow has no canonical provenance");
+      }
+      return { control: initial, holds: [], events: [] };
+    }
+    validateLegalHoldControlRecord(storedControl);
+    if (
+      storedControl.tenantId !== tenantId
+      || storedControl.subjectKind !== subjectKind
+      || storedControl.subjectId !== subjectId
+    ) throw new LegalHoldIntegrityError("legal hold control identity is corrupt");
+
+    let reconstructedControl = initial;
+    const reconstructedHolds = new Map<string, LegalHoldRecord>();
+    let previousEventId = 0;
+    for (const [index, event] of storedEvents.entries()) {
+      if (
+        !Number.isSafeInteger(event.eventId)
+        || event.eventId <= previousEventId
+        || event.tenantId !== tenantId
+        || event.subjectKind !== subjectKind
+        || event.subjectId !== subjectId
+        || event.controlGeneration !== index + 1
+      ) throw new LegalHoldIntegrityError("legal hold audit identity is corrupt");
+      previousEventId = event.eventId;
+      if (event.emittedAtMs < reconstructedControl.updatedAtMs) {
+        throw new LegalHoldIntegrityError("legal hold audit time regressed");
+      }
+      if (event.beforeSha256 !== legalHoldControlSha256(reconstructedControl)) {
+        throw new LegalHoldIntegrityError("legal hold audit prior-state commitment is invalid");
+      }
+      if (event.eventType === "legal_hold/set") {
+        validateSetLegalHoldInput({
+          tenantId,
+          holdId: event.holdId,
+          subjectKind,
+          subjectId,
+          reasonCode: event.reasonCode as SetLegalHoldInput["reasonCode"],
+          ...(event.externalReferenceSha256 === undefined
+            ? {}
+            : { externalReferenceSha256: event.externalReferenceSha256 }),
+          expectedControlGeneration: event.controlGeneration - 1,
+          actorKeyId: event.actorKeyId,
+          atMs: event.emittedAtMs,
+        });
+        if (reconstructedHolds.has(event.holdId)) {
+          throw new LegalHoldIntegrityError("legal hold was set more than once");
+        }
+        reconstructedHolds.set(event.holdId, {
+          tenantId,
+          holdId: event.holdId,
+          subjectKind,
+          subjectId,
+          state: "active",
+          reasonCode: event.reasonCode as SetLegalHoldInput["reasonCode"],
+          ...(event.externalReferenceSha256 === undefined
+            ? {}
+            : { externalReferenceSha256: event.externalReferenceSha256 }),
+          createdControlGeneration: event.controlGeneration,
+          createdByKeyId: event.actorKeyId,
+          createdAtMs: event.emittedAtMs,
+        });
+      } else if (event.eventType === "legal_hold/released") {
+        if (event.externalReferenceSha256 !== undefined) {
+          throw new LegalHoldIntegrityError("legal hold release audit carries set-only evidence");
+        }
+        validateReleaseLegalHoldInput({
+          tenantId,
+          holdId: event.holdId,
+          expectedControlGeneration: event.controlGeneration - 1,
+          reasonCode: event.reasonCode as ReleaseLegalHoldInput["reasonCode"],
+          actorKeyId: event.actorKeyId,
+          atMs: event.emittedAtMs,
+        });
+        const existing = reconstructedHolds.get(event.holdId);
+        if (!existing || existing.state !== "active") {
+          throw new LegalHoldIntegrityError("legal hold release audit has no active hold");
+        }
+        reconstructedHolds.set(event.holdId, {
+          ...existing,
+          state: "released",
+          releasedControlGeneration: event.controlGeneration,
+          releasedByKeyId: event.actorKeyId,
+          releasedAtMs: event.emittedAtMs,
+          releaseReasonCode: event.reasonCode as ReleaseLegalHoldInput["reasonCode"],
+        });
+      } else {
+        throw new LegalHoldIntegrityError("legal hold audit type is invalid");
+      }
+      const active = [...reconstructedHolds.values()].filter((hold) => hold.state === "active");
+      const nextControl: LegalHoldControlRecord = {
+        tenantId,
+        subjectKind,
+        subjectId,
+        controlGeneration: event.controlGeneration,
+        activeHoldCount: active.length,
+        activeProjectionSha256: legalHoldProjectionSha256(active),
+        updatedAtMs: event.emittedAtMs,
+      };
+      validateLegalHoldControlRecord(nextControl);
+      if (event.afterSha256 !== legalHoldControlSha256(nextControl)) {
+        throw new LegalHoldIntegrityError("legal hold audit outcome commitment is invalid");
+      }
+      reconstructedControl = nextControl;
+    }
+
+    const reconstructed = [...reconstructedHolds.values()]
+      .sort((left, right) => compareLegalHoldIds(left.holdId, right.holdId));
+    if (
+      storedEvents.length !== storedControl.controlGeneration
+      || !legalHoldControlsEqual(storedControl, reconstructedControl)
+      || reconstructed.length !== durableHolds.length
+      || reconstructed.some((hold, index) => !legalHoldRecordsEqual(hold, durableHolds[index]!))
+    ) throw new LegalHoldIntegrityError();
+    const active = durableHolds.filter((hold) => hold.state === "active");
+    if (
+      storedControl.activeHoldCount !== active.length
+      || storedControl.activeProjectionSha256 !== legalHoldProjectionSha256(active)
+    ) throw new LegalHoldIntegrityError();
+    if (storedControl.controlGeneration > 0 && !lifecycle) {
+      throw new LegalHoldIntegrityError("legal hold lifecycle shadow row is missing");
+    }
+    const expectedShadow = active.length === 0
+      ? undefined
+      : Math.min(...active.map((hold) => hold.createdAtMs));
+    if (lifecycle?.legalHoldAtMs !== expectedShadow) throw new LegalHoldIntegrityError();
+    return {
+      control: clone(storedControl),
+      holds: durableHolds.map(clone),
+      events: storedEvents.map(clone),
+    };
+  }
+
+  private stageLegalHoldLifecycleRows(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+    legalHoldAtMs: number | undefined,
+    atMs: number,
+  ): Array<{ key: string; value: SubjectLifecycleRecord }> {
+    const keys = [subjectLifecycleKey(tenantId, "tenant", tenantId)];
+    if (subjectKind === "user") keys.push(subjectLifecycleKey(tenantId, "user", subjectId));
+    const staged: Array<{ key: string; value: SubjectLifecycleRecord }> = [];
+    for (const key of keys) {
+      const isTarget = key === subjectLifecycleKey(tenantId, subjectKind, subjectId);
+      const existing = this.subjectLifecycles.get(key);
+      const rowKind: DataSubjectKind = key === keys[0] ? "tenant" : "user";
+      const rowSubjectId = rowKind === "tenant" ? tenantId : subjectId;
+      if (!existing && [...this.erasureRequests.values()].some((request) => (
+        request.tenantId === tenantId
+        && request.subjectKind === rowKind
+        && request.subjectId === rowSubjectId
+      ))) {
+        throw new LegalHoldIntegrityError(
+          `${rowKind} lifecycle gate is missing for an existing erasure request`,
+        );
+      }
+      const value = clone(existing ?? this.activeSubjectRecord(
+        tenantId,
+        rowKind,
+        rowSubjectId,
+        atMs,
+      ));
+      if (isTarget) {
+        value.updatedAtMs = Math.max(value.updatedAtMs, atMs);
+        value.legalHoldAtMs = legalHoldAtMs;
+        if (value.legalHoldAtMs === undefined) delete value.legalHoldAtMs;
+      }
+      staged.push({ key, value });
+    }
+    return staged;
+  }
+
+  private publishLegalHoldState(
+    key: string,
+    control: LegalHoldControlRecord,
+    holdKey: string,
+    hold: LegalHoldRecord,
+    events: LegalHoldEvent[],
+    lifecycleRows: Array<{ key: string; value: SubjectLifecycleRecord }>,
+  ): void {
+    const controlExisted = this.legalHoldControls.has(key);
+    const priorControl = this.legalHoldControls.get(key);
+    const holdExisted = this.legalHolds.has(holdKey);
+    const priorHold = this.legalHolds.get(holdKey);
+    const eventsExisted = this.legalHoldEvents.has(key);
+    const priorEvents = this.legalHoldEvents.get(key);
+    const lifecyclePrior = lifecycleRows.map((row) => ({
+      key: row.key,
+      existed: this.subjectLifecycles.has(row.key),
+      value: this.subjectLifecycles.get(row.key),
+    }));
+    try {
+      this.legalHolds.set(holdKey, hold);
+      this.legalHoldEvents.set(key, events);
+      this.legalHoldControls.set(key, control);
+      for (const row of lifecycleRows) this.subjectLifecycles.set(row.key, row.value);
+    } catch (error) {
+      for (const row of lifecyclePrior.reverse()) {
+        restoreMapEntry(this.subjectLifecycles, row.key, row.existed, row.value);
+      }
+      restoreMapEntry(this.legalHoldControls, key, controlExisted, priorControl);
+      restoreMapEntry(this.legalHoldEvents, key, eventsExisted, priorEvents);
+      restoreMapEntry(this.legalHolds, holdKey, holdExisted, priorHold);
+      throw error;
+    }
+  }
+
+  async setLegalHold(input: SetLegalHoldInput): Promise<LegalHoldRecord> {
+    const stagedInput = clone(input);
+    validateSetLegalHoldInput(stagedInput);
+    const holdKey = legalHoldKey(stagedInput.tenantId, stagedInput.holdId);
+    const existing = this.legalHolds.get(holdKey);
+    if (existing) {
+      validateLegalHoldRecord(existing);
+      this.assertLegalHoldState(existing.tenantId, existing.subjectKind, existing.subjectId);
+      if (
+        existing.tenantId === stagedInput.tenantId
+        && existing.subjectKind === stagedInput.subjectKind
+        && existing.subjectId === stagedInput.subjectId
+        && existing.state === "active"
+        && existing.reasonCode === stagedInput.reasonCode
+        && existing.externalReferenceSha256 === stagedInput.externalReferenceSha256
+        && existing.createdControlGeneration === stagedInput.expectedControlGeneration + 1
+      ) return clone(existing);
+      throw new LegalHoldConflictError(stagedInput.holdId);
+    }
+    const state = this.assertLegalHoldState(
+      stagedInput.tenantId,
+      stagedInput.subjectKind,
+      stagedInput.subjectId,
+    );
+    if (stagedInput.expectedControlGeneration !== state.control.controlGeneration) {
+      throw new LegalHoldGenerationConflictError(
+        stagedInput.expectedControlGeneration,
+        state.control.controlGeneration,
+      );
+    }
+    if (state.control.controlGeneration >= Number.MAX_SAFE_INTEGER - 1) {
+      throw new Error("legal hold control generation is exhausted");
+    }
+    const effectiveAtMs = Math.max(stagedInput.atMs, state.control.updatedAtMs);
+    const record = clone<LegalHoldRecord>({
+      tenantId: stagedInput.tenantId,
+      holdId: stagedInput.holdId,
+      subjectKind: stagedInput.subjectKind,
+      subjectId: stagedInput.subjectId,
+      state: "active",
+      reasonCode: stagedInput.reasonCode,
+      ...(stagedInput.externalReferenceSha256 === undefined
+        ? {}
+        : { externalReferenceSha256: stagedInput.externalReferenceSha256 }),
+      createdControlGeneration: state.control.controlGeneration + 1,
+      createdByKeyId: stagedInput.actorKeyId,
+      createdAtMs: effectiveAtMs,
+    });
+    validateLegalHoldRecord(record);
+    const active = [...state.holds.filter((hold) => hold.state === "active"), record]
+      .sort((left, right) => compareLegalHoldIds(left.holdId, right.holdId));
+    const nextControl = clone<LegalHoldControlRecord>({
+      tenantId: stagedInput.tenantId,
+      subjectKind: stagedInput.subjectKind,
+      subjectId: stagedInput.subjectId,
+      controlGeneration: record.createdControlGeneration,
+      activeHoldCount: active.length,
+      activeProjectionSha256: legalHoldProjectionSha256(active),
+      updatedAtMs: effectiveAtMs,
+    });
+    validateLegalHoldControlRecord(nextControl);
+    if (!Number.isSafeInteger(this.nextLegalHoldEventId) || this.nextLegalHoldEventId <= 0) {
+      throw new Error("legal hold event sequence is exhausted");
+    }
+    const event = clone<LegalHoldEvent>({
+      eventId: this.nextLegalHoldEventId,
+      tenantId: stagedInput.tenantId,
+      subjectKind: stagedInput.subjectKind,
+      subjectId: stagedInput.subjectId,
+      controlGeneration: nextControl.controlGeneration,
+      holdId: stagedInput.holdId,
+      eventType: "legal_hold/set",
+      reasonCode: stagedInput.reasonCode,
+      ...(stagedInput.externalReferenceSha256 === undefined
+        ? {}
+        : { externalReferenceSha256: stagedInput.externalReferenceSha256 }),
+      actorKeyId: stagedInput.actorKeyId,
+      beforeSha256: legalHoldControlSha256(state.control),
+      afterSha256: legalHoldControlSha256(nextControl),
+      emittedAtMs: effectiveAtMs,
+    });
+    const key = subjectLifecycleKey(
+      stagedInput.tenantId,
+      stagedInput.subjectKind,
+      stagedInput.subjectId,
+    );
+    const lifecycleRows = this.stageLegalHoldLifecycleRows(
+      stagedInput.tenantId,
+      stagedInput.subjectKind,
+      stagedInput.subjectId,
+      Math.min(...active.map((hold) => hold.createdAtMs)),
+      effectiveAtMs,
+    );
+    this.publishLegalHoldState(
+      key,
+      nextControl,
+      holdKey,
+      record,
+      clone([...state.events, event]),
+      lifecycleRows,
+    );
+    this.nextLegalHoldEventId += 1;
+    return clone(record);
+  }
+
+  async releaseLegalHold(input: ReleaseLegalHoldInput): Promise<LegalHoldRecord> {
+    const stagedInput = clone(input);
+    validateReleaseLegalHoldInput(stagedInput);
+    const holdKey = legalHoldKey(stagedInput.tenantId, stagedInput.holdId);
+    const existing = this.legalHolds.get(holdKey);
+    if (!existing) throw new LegalHoldNotFoundError(stagedInput.holdId);
+    validateLegalHoldRecord(existing);
+    const state = this.assertLegalHoldState(
+      existing.tenantId,
+      existing.subjectKind,
+      existing.subjectId,
+    );
+    if (existing.state === "released") {
+      if (
+        existing.releasedControlGeneration === stagedInput.expectedControlGeneration + 1
+        && existing.releaseReasonCode === stagedInput.reasonCode
+      ) return clone(existing);
+      throw new LegalHoldConflictError(stagedInput.holdId);
+    }
+    if (stagedInput.expectedControlGeneration !== state.control.controlGeneration) {
+      throw new LegalHoldGenerationConflictError(
+        stagedInput.expectedControlGeneration,
+        state.control.controlGeneration,
+      );
+    }
+    if (state.control.controlGeneration >= Number.MAX_SAFE_INTEGER - 1) {
+      throw new Error("legal hold control generation is exhausted");
+    }
+    const effectiveAtMs = Math.max(stagedInput.atMs, state.control.updatedAtMs);
+    const released = clone<LegalHoldRecord>({
+      ...existing,
+      state: "released",
+      releasedControlGeneration: state.control.controlGeneration + 1,
+      releasedByKeyId: stagedInput.actorKeyId,
+      releasedAtMs: effectiveAtMs,
+      releaseReasonCode: stagedInput.reasonCode,
+    });
+    validateLegalHoldRecord(released);
+    const active = state.holds
+      .filter((hold) => hold.holdId !== released.holdId && hold.state === "active")
+      .sort((left, right) => compareLegalHoldIds(left.holdId, right.holdId));
+    const nextControl = clone<LegalHoldControlRecord>({
+      tenantId: existing.tenantId,
+      subjectKind: existing.subjectKind,
+      subjectId: existing.subjectId,
+      controlGeneration: released.releasedControlGeneration!,
+      activeHoldCount: active.length,
+      activeProjectionSha256: legalHoldProjectionSha256(active),
+      updatedAtMs: effectiveAtMs,
+    });
+    validateLegalHoldControlRecord(nextControl);
+    if (!Number.isSafeInteger(this.nextLegalHoldEventId) || this.nextLegalHoldEventId <= 0) {
+      throw new Error("legal hold event sequence is exhausted");
+    }
+    const event = clone<LegalHoldEvent>({
+      eventId: this.nextLegalHoldEventId,
+      tenantId: existing.tenantId,
+      subjectKind: existing.subjectKind,
+      subjectId: existing.subjectId,
+      controlGeneration: nextControl.controlGeneration,
+      holdId: existing.holdId,
+      eventType: "legal_hold/released",
+      reasonCode: stagedInput.reasonCode,
+      actorKeyId: stagedInput.actorKeyId,
+      beforeSha256: legalHoldControlSha256(state.control),
+      afterSha256: legalHoldControlSha256(nextControl),
+      emittedAtMs: effectiveAtMs,
+    });
+    const key = subjectLifecycleKey(existing.tenantId, existing.subjectKind, existing.subjectId);
+    const lifecycleRows = this.stageLegalHoldLifecycleRows(
+      existing.tenantId,
+      existing.subjectKind,
+      existing.subjectId,
+      active.length === 0 ? undefined : Math.min(...active.map((hold) => hold.createdAtMs)),
+      effectiveAtMs,
+    );
+    this.publishLegalHoldState(
+      key,
+      nextControl,
+      holdKey,
+      released,
+      clone([...state.events, event]),
+      lifecycleRows,
+    );
+    this.nextLegalHoldEventId += 1;
+    return clone(released);
+  }
+
+  async getLegalHold(tenantId: string, holdId: string): Promise<LegalHoldRecord | null> {
+    const record = this.legalHolds.get(legalHoldKey(tenantId, holdId));
+    if (!record) return null;
+    validateLegalHoldRecord(record);
+    if (record.tenantId !== tenantId || record.holdId !== holdId) {
+      throw new LegalHoldIntegrityError("legal hold index is corrupt");
+    }
+    this.assertLegalHoldState(record.tenantId, record.subjectKind, record.subjectId);
+    return clone(record);
+  }
+
+  async getActiveLegalHoldState(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<{ control: LegalHoldControlRecord; holds: LegalHoldRecord[] }> {
+    const state = this.assertLegalHoldState(tenantId, subjectKind, subjectId);
+    return clone({
+      control: state.control,
+      holds: state.holds.filter((hold) => hold.state === "active"),
+    });
+  }
+
+  async getLegalHoldControl(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<LegalHoldControlRecord> {
+    return (await this.getActiveLegalHoldState(tenantId, subjectKind, subjectId)).control;
+  }
+
+  async listActiveLegalHolds(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<LegalHoldRecord[]> {
+    return (await this.getActiveLegalHoldState(tenantId, subjectKind, subjectId)).holds;
+  }
+
+  async listLegalHoldEvents(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<LegalHoldEvent[]> {
+    return this.assertLegalHoldState(tenantId, subjectKind, subjectId).events.map(clone);
+  }
 
   private activeLegacyTombstoneCutover(): LegacyTombstoneCutoverRecord {
     const cutover = this.legacyTombstoneCutovers.get(LEGACY_TOMBSTONE_CUTOVER_ID);
@@ -1541,6 +2404,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return JSON.stringify([input.tenantId, "user", input.userId, input.idempotencyKey]);
   }
 
+  private activeRetentionPolicyBinding(
+    tenantId: string,
+  ): { policyVersion: string; policyHash: string } | undefined {
+    const state = this.assertRetentionPolicyState(tenantId);
+    if (!state.active || state.control.effectiveAtMs === undefined) return undefined;
+    return {
+      policyVersion: state.active.policyVersion,
+      policyHash: state.active.policySha256,
+    };
+  }
+
   async requestUserErasure(input: RequestUserErasureInput): Promise<ErasureRequestRecord> {
     validateRequestUserErasureInput(input);
     const tenant = this.subjectRecord(input.tenantId, "tenant", input.tenantId);
@@ -1582,6 +2456,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new Error("erasure request id already exists");
     }
 
+    // Resolve only for a brand-new request. A replay or pre-policy backlog must retain the exact
+    // immutable identity (including the deliberate absence of a policy) captured at admission.
+    const boundPolicy = this.activeRetentionPolicyBinding(input.tenantId);
+
     // Clone every row before publishing any map mutation. Invalid/uncloneable audit data can never
     // leave a deleting subject without its request/audit row (or a request without the durable gate).
     const generation = (existingUser?.generation ?? 0) + 1;
@@ -1612,15 +2490,23 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       updatedAtMs: input.atMs,
       availableAtMs: input.atMs,
       attempts: 0,
+      ...(boundPolicy ?? {}),
       controlGeneration: 0,
     });
     const stagedAudit = clone<ErasureAuditEvent>({
       requestId: input.requestId,
       seq: 1,
       type: "erasure/gated",
-      payload: { status: "gated", subjectKind: "user", generation },
+      payload: {
+        status: "gated",
+        subjectKind: "user",
+        generation,
+        ...(boundPolicy ?? {}),
+      },
       emittedAtMs: input.atMs,
     });
+    validateErasureRequestRecord(stagedRequest);
+    validateErasureAuditChain(stagedRequest, [stagedAudit]);
 
     const tenantKey = subjectLifecycleKey(input.tenantId, "tenant", input.tenantId);
     const tenantExisted = this.subjectLifecycles.has(tenantKey);
@@ -2047,9 +2933,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       current.status !== options.fromStatus
       || !erasureJobAuthorizationMatches(current, authorization, options.atMs)
     ) return false;
+    if (options.policyVersion !== undefined && current.policyVersion === undefined) {
+      throw new Error("erasure policy identity cannot be assigned after admission");
+    }
     if (
       options.policyVersion !== undefined
-      && current.policyVersion !== undefined
       && (current.policyVersion !== options.policyVersion || current.policyHash !== options.policyHash)
     ) throw new Error("erasure policy identity is immutable");
 
@@ -2300,6 +3188,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
             status: "gated",
             subjectKind: current.subjectKind,
             generation: current.generation,
+            ...(current.policyVersion === undefined ? {} : { policyVersion: current.policyVersion }),
+            ...(current.policyHash === undefined ? {} : { policyHash: current.policyHash }),
           },
           emittedAtMs: current.gatedAtMs,
         })];
@@ -3724,7 +4614,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!tenant || !user) {
       throw new UsageReconciliationError("subject lifecycle state is missing; anonymization is fail-closed");
     }
-    return tenant.legalHoldAtMs !== undefined || user.legalHoldAtMs !== undefined;
+    const tenantHolds = this.assertLegalHoldState(input.tenantId, "tenant", input.tenantId);
+    const userHolds = this.assertLegalHoldState(input.tenantId, "user", input.userId);
+    return tenantHolds.control.activeHoldCount > 0 || userHolds.control.activeHoldCount > 0;
   }
 
   async reconcileSessionUsage(input: ReconcileSessionUsageInput): Promise<UsageReconciliationRecord> {
