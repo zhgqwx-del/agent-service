@@ -21,6 +21,8 @@ export class ScriptedEngine implements AgentEngine {
   readonly name = "scripted";
   received: { history: EngineTurnParams["history"]; input: EngineTurnParams["input"]; systemPrompt: string }[] = [];
   steers: InputPart[][] = [];
+  startedSteps = 0;
+  executedToolCalls = 0;
   constructor(private readonly script: ScriptStep[]) {}
 
   start(params: EngineTurnParams, sink: EngineSink): EngineRun {
@@ -34,6 +36,7 @@ export class ScriptedEngine implements AgentEngine {
       for (const s of this.script) {
         if (interrupted || params.signal.aborted) break;
         step += 1;
+        this.startedSteps += 1;
         await sink.onStepStart(step);
         if (s.delayMs) await new Promise((r) => setTimeout(r, s.delayMs));
         if (interrupted || params.signal.aborted) break;
@@ -41,11 +44,17 @@ export class ScriptedEngine implements AgentEngine {
         const text = typeof s.text === "function" ? s.text(previousToolResults) : (s.text ?? "");
         for (const chunk of text.match(/.{1,4}/gs) ?? []) sink.onTextDelta(chunk);
         const toolCalls = (s.toolCalls ?? []).map((tc) => ({ id: `call_${++callSeq}`, ...tc }));
+        const usage: Usage = {
+          ...emptyUsage(), inputTokens: 10, outputTokens: 5, totalTokens: 15, costCNY: 0, ...(s.usage ?? {}),
+        };
+        if (usage.costCNY === undefined) delete usage.costCNY;
         const msg: AssistantStepResult = {
           text,
           reasoning: s.reasoning,
           toolCalls,
-          usage: { ...emptyUsage(), inputTokens: 10, outputTokens: 5, totalTokens: 15, ...(s.usage ?? {}) },
+          // Deterministic tests use a known-free fake provider by default. Individual scripts set
+          // `costCNY: undefined` to exercise genuinely unpriced responses.
+          usage,
           stopReason: s.stopReason ?? (toolCalls.length ? "toolUse" : "stop"),
           errorMessage: s.errorMessage,
           provider: "fake",
@@ -67,6 +76,7 @@ export class ScriptedEngine implements AgentEngine {
             await sink.onToolExecutionStart(tc.id);
             const tool = params.tools.find((t) => t.name === tc.name)!;
             try {
+              this.executedToolCalls += 1;
               const r = await tool.execute(tc.args, { ...params.toolContext, toolCallId: tc.id, signal: params.signal });
               return await sink.afterToolCall({ toolCallId: tc.id, name: tc.name, content: r.content, isError: !!r.isError, details: r.details });
             } catch (err) {

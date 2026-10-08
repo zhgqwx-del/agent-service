@@ -22,6 +22,8 @@ import {
   assignTurnSeqEnd,
   backfillAssignedSequences,
   type ApiKeyRecord,
+  type AnonymizeSessionUsageInput,
+  type BillingUsageFact,
   type CommitBatch,
   type CommitResult,
   type IdempotencyReceipt,
@@ -29,9 +31,14 @@ import {
   type LifecycleOutboxRecord,
   type LifecycleOutboxStore,
   type Page,
+  type ReconcileSessionUsageInput,
   type SessionStore,
   type SessionLifecycleRecord,
   type TenantRecord,
+  type UsageLedgerEntry,
+  type UsageLifecycleStore,
+  type UsageReconciliationRecord,
+  type UsageReconciliationSummary,
 } from "../types.js";
 import {
   BLOB_STORAGE_FORMAT,
@@ -64,6 +71,46 @@ import {
   validateRenewLifecycleOutboxClaim,
   validateRetryLifecycleOutboxOptions,
 } from "../lifecycle-outbox.js";
+import {
+  UsageIdentityConflictError,
+  UsageLifecycleGenerationError,
+  UsageReconciliationError,
+  assertBillingUsageFact,
+  assertUsageAnonymizationAllowed,
+  billingUsageFactContentEquals,
+  billingUsageFactFromLedger,
+  canonicalBillingCostCNY,
+  canonicalizePersistedUsageEventFromSummaries,
+  canonicalizeUsageItem,
+  emptyUsageProjectionSummary,
+  isUsageId,
+  mergeUsageProjectionSummaries,
+  newUsageId,
+  normalizeHistoricalUsageCost,
+  normalizeOperationalUsageCost,
+  normalizeRowlessUsageProjection,
+  summarizeBillingUsageFacts,
+  summarizeUsageProjectionRows,
+  usageReconciliationSummariesEqual,
+  usageProjectionFromSummary,
+  usageProjectionStepKey,
+  validateReconcileSessionUsageInput,
+  type UsageProjectionLedgerRow,
+  type UsageProjectionSummary,
+} from "../usage-lifecycle.js";
+import {
+  ErasureIdempotencyMismatchError,
+  SubjectDeletingError,
+  validateRequestUserErasureInput,
+  type DataSubjectKind,
+  type ErasureAuditEvent,
+  type ErasureRequestRecord,
+  type ErasureRequestStatus,
+  type RequestUserErasureInput,
+  type SubjectLifecycleRecord,
+  type SubjectLifecycleState,
+  type SubjectLifecycleStore,
+} from "../subject-lifecycle.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -79,6 +126,25 @@ const QUALIFIED_BLOB_COLUMNS = `b.blob_id, b.tenant_id, b.user_id, b.session_id,
 const BLOB_DELETE_COLUMNS = `o.outbox_id, o.blob_id, o.generation, o.available_at_ms, o.attempts,
   o.claim_token, o.lease_until_ms, o.last_error, o.completed_at_ms, o.dead_lettered_at_ms, o.created_at_ms,
   b.storage_backend, b.storage_format, b.storage_key, b.upload_token, b.state, b.deletion_generation`;
+const BILLING_USAGE_COLUMNS = `usage_id, tenant_id, accounting_period, provider, model, input_tokens,
+  output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, cost_cny,
+  currency, fact_sha256`;
+const USAGE_RECONCILIATION_COLUMNS = `tenant_id, user_id, session_id, deletion_generation, status,
+  row_count, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+  total_tokens, known_cost_rows, cost_cny, checksum, verified_at_ms, anonymized_at_ms`;
+const SUBJECT_LIFECYCLE_COLUMNS = `tenant_id, subject_kind, subject_id, state, generation,
+  active_request_id, legal_hold_at_ms, created_at_ms, updated_at_ms`;
+const ERASURE_REQUEST_COLUMNS = `request_id, tenant_id, subject_kind, subject_id, generation, status,
+  requested_by_key_id, idempotency_key, request_hash, created_at_ms, gated_at_ms, updated_at_ms,
+  completed_at_ms, counts_json, checksum`;
+const USAGE_OWNER_MATCH = "u.tenant_id=s.tenant_id AND u.user_id=s.user_id";
+const usageJsonNumber = (field: string) => (
+  `CASE WHEN JSON_TYPE(JSON_EXTRACT(u.usage_json,'$.${field}')) IN ('INTEGER','DOUBLE','DECIMAL') `
+  + `THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(u.usage_json,'$.${field}')) AS DECIMAL(30,9)) ELSE 0 END`
+);
+const USAGE_COST_NUMBER = usageJsonNumber("costCNY");
+const USAGE_PRICE_KNOWN = `JSON_TYPE(JSON_EXTRACT(u.usage_json,'$.costCNY')) IN ('INTEGER','DOUBLE','DECIMAL')
+  AND NOT (u.usage_id IS NULL AND ${USAGE_COST_NUMBER}=0)`;
 
 interface ExistingCommitResources {
   itemIds: Set<string>;
@@ -88,6 +154,7 @@ interface ExistingCommitResources {
 
 /** Serialize a Session row. The projection columns are the source for filtering; `body` holds the rest. */
 function rowToSession(r: Row): Session {
+  const usage = normalizeHistoricalUsageCost(parse<Session["usage"]>(r.usage_json));
   return {
     id: r.session_id,
     tenantId: r.tenant_id,
@@ -100,13 +167,40 @@ function rowToSession(r: Row): Session {
     lastSeq: Number(r.last_seq),
     fenceToken: Number(r.fence_token),
     contextEpoch: r.context_epoch,
-    usage: parse(r.usage_json),
+    usage,
     autoApprovedTools: r.auto_approved_tools == null ? [] : parse(r.auto_approved_tools),
     lastCompactionSeq: r.last_compaction_seq == null ? undefined : Number(r.last_compaction_seq),
     metadata: parse(r.metadata),
     createdAtMs: Number(r.created_at_ms),
     updatedAtMs: Number(r.updated_at_ms),
     archivedAtMs: r.archived_at_ms == null ? undefined : Number(r.archived_at_ms),
+  };
+}
+
+function rowToUsageProjection(row: Row): UsageProjectionLedgerRow {
+  return {
+    ...(row.usage_id == null ? {} : { usageId: String(row.usage_id) }),
+    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
+    sessionId: String(row.session_id),
+    turnId: String(row.turn_id),
+    step: Number(row.step),
+    usage: normalizeHistoricalUsageCost(parse<UsageLedgerEntry["usage"]>(row.usage_json)),
+  };
+}
+
+function rowToUsageProjectionSummary(row: Row): UsageProjectionSummary {
+  return {
+    rowCount: Number(row.row_count),
+    ownerRowCount: Number(row.owner_row_count),
+    pricedRowCount: Number(row.priced_row_count),
+    inputTokens: Number(row.input_tokens),
+    outputTokens: Number(row.output_tokens),
+    cacheReadTokens: Number(row.cache_read_tokens),
+    cacheWriteTokens: Number(row.cache_write_tokens),
+    reasoningTokens: Number(row.reasoning_tokens),
+    totalTokens: Number(row.total_tokens),
+    costCNY: Number(row.cost_cny),
   };
 }
 
@@ -219,6 +313,258 @@ function rowToBlobDeleteOutbox(row: Row, requirePending = true): BlobDeleteOutbo
   };
 }
 
+function rowToBillingUsageFact(row: Row): BillingUsageFact {
+  const fact: BillingUsageFact = {
+    usageId: String(row.usage_id),
+    tenantId: String(row.tenant_id),
+    accountingPeriod: String(row.accounting_period),
+    provider: String(row.provider),
+    model: String(row.model),
+    inputTokens: Number(row.input_tokens),
+    outputTokens: Number(row.output_tokens),
+    cacheReadTokens: Number(row.cache_read_tokens),
+    cacheWriteTokens: Number(row.cache_write_tokens),
+    reasoningTokens: Number(row.reasoning_tokens),
+    totalTokens: Number(row.total_tokens),
+    ...(row.cost_cny == null ? {} : { costCNY: Number(row.cost_cny) }),
+    currency: String(row.currency) as "CNY",
+    factSha256: String(row.fact_sha256),
+  };
+  assertBillingUsageFact(fact);
+  return fact;
+}
+
+function usageReconciliationSummaryFromRow(row: Row): UsageReconciliationSummary {
+  const summary: UsageReconciliationSummary = {
+    rowCount: Number(row.row_count),
+    inputTokens: Number(row.input_tokens),
+    outputTokens: Number(row.output_tokens),
+    cacheReadTokens: Number(row.cache_read_tokens),
+    cacheWriteTokens: Number(row.cache_write_tokens),
+    reasoningTokens: Number(row.reasoning_tokens),
+    totalTokens: Number(row.total_tokens),
+    knownCostRows: Number(row.known_cost_rows),
+    ...(row.cost_cny == null ? {} : { costCNY: Number(row.cost_cny) }),
+    checksum: String(row.checksum),
+  };
+  const integerFields = [
+    summary.rowCount,
+    summary.inputTokens,
+    summary.outputTokens,
+    summary.cacheReadTokens,
+    summary.cacheWriteTokens,
+    summary.reasoningTokens,
+    summary.totalTokens,
+    summary.knownCostRows,
+  ];
+  if (integerFields.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new UsageReconciliationError("stored usage reconciliation contains an invalid count");
+  }
+  if (!/^[0-9a-f]{64}$/.test(summary.checksum)) {
+    throw new UsageReconciliationError("stored usage reconciliation contains an invalid checksum");
+  }
+  if (
+    summary.knownCostRows > summary.rowCount
+    || (summary.knownCostRows === 0) !== (summary.costCNY === undefined)
+    || (summary.costCNY !== undefined && (!Number.isFinite(summary.costCNY) || summary.costCNY < 0))
+  ) {
+    throw new UsageReconciliationError("stored usage reconciliation contains an invalid cost summary");
+  }
+  return summary;
+}
+
+function rowToUsageReconciliation(row: Row): UsageReconciliationRecord {
+  const status = String(row.status);
+  if (status !== "verified" && status !== "anonymized") {
+    throw new UsageReconciliationError("stored usage reconciliation has an invalid status");
+  }
+  const verifiedAtMs = Number(row.verified_at_ms);
+  const anonymizedAtMs = row.anonymized_at_ms == null ? undefined : Number(row.anonymized_at_ms);
+  const deletionGeneration = Number(row.deletion_generation);
+  if (
+    !Number.isSafeInteger(deletionGeneration)
+    || deletionGeneration <= 0
+    || !String(row.tenant_id)
+    || !String(row.user_id)
+    || !String(row.session_id)
+    || !Number.isSafeInteger(verifiedAtMs)
+    || verifiedAtMs < 0
+    || (anonymizedAtMs !== undefined && (!Number.isSafeInteger(anonymizedAtMs) || anonymizedAtMs < verifiedAtMs))
+    || (status === "verified" && anonymizedAtMs !== undefined)
+    || (status === "anonymized" && anonymizedAtMs === undefined)
+  ) {
+    throw new UsageReconciliationError("stored usage reconciliation has invalid lifecycle timestamps");
+  }
+  return {
+    tenantId: String(row.tenant_id),
+    userId: String(row.user_id),
+    sessionId: String(row.session_id),
+    deletionGeneration,
+    status,
+    ...usageReconciliationSummaryFromRow(row),
+    verifiedAtMs,
+    ...(anonymizedAtMs === undefined ? {} : { anonymizedAtMs }),
+  };
+}
+
+function rowToSubjectLifecycle(row: Row): SubjectLifecycleRecord {
+  const subjectKind = String(row.subject_kind) as DataSubjectKind;
+  const state = String(row.state) as SubjectLifecycleState;
+  const generation = Number(row.generation);
+  const createdAtMs = Number(row.created_at_ms);
+  const updatedAtMs = Number(row.updated_at_ms);
+  if (
+    (subjectKind !== "tenant" && subjectKind !== "user")
+    || (state !== "active" && state !== "deleting" && state !== "erased")
+    || !Number.isSafeInteger(generation)
+    || generation < 0
+    || !Number.isSafeInteger(createdAtMs)
+    || createdAtMs < 0
+    || !Number.isSafeInteger(updatedAtMs)
+    || updatedAtMs < createdAtMs
+  ) throw new Error("stored subject lifecycle row is invalid");
+  return {
+    tenantId: String(row.tenant_id),
+    subjectKind,
+    subjectId: String(row.subject_id),
+    state,
+    generation,
+    ...(row.active_request_id == null ? {} : { activeRequestId: String(row.active_request_id) }),
+    ...(row.legal_hold_at_ms == null ? {} : { legalHoldAtMs: Number(row.legal_hold_at_ms) }),
+    createdAtMs,
+    updatedAtMs,
+  };
+}
+
+const ERASURE_REQUEST_STATUSES = new Set<ErasureRequestStatus>([
+  "gated",
+  "draining",
+  "tombstoning",
+  "reconciling_usage",
+  "awaiting_purge_policy",
+  "purging",
+  "blocked",
+  "completed",
+]);
+
+function rowToErasureRequest(row: Row): ErasureRequestRecord {
+  const subjectKind = String(row.subject_kind) as DataSubjectKind;
+  const status = String(row.status) as ErasureRequestStatus;
+  const generation = Number(row.generation);
+  const createdAtMs = Number(row.created_at_ms);
+  const gatedAtMs = Number(row.gated_at_ms);
+  const updatedAtMs = Number(row.updated_at_ms);
+  const counts = row.counts_json == null ? undefined : parse<unknown>(row.counts_json);
+  if (
+    (subjectKind !== "tenant" && subjectKind !== "user")
+    || !ERASURE_REQUEST_STATUSES.has(status)
+    || !Number.isSafeInteger(generation)
+    || generation <= 0
+    || !Number.isSafeInteger(createdAtMs)
+    || createdAtMs < 0
+    || !Number.isSafeInteger(gatedAtMs)
+    || gatedAtMs < createdAtMs
+    || !Number.isSafeInteger(updatedAtMs)
+    || updatedAtMs < gatedAtMs
+    || (counts !== undefined && (typeof counts !== "object" || counts === null || Array.isArray(counts)))
+  ) throw new Error("stored erasure request row is invalid");
+  if (counts !== undefined) {
+    for (const value of Object.values(counts)) {
+      if (!Number.isSafeInteger(value) || (value as number) < 0) {
+        throw new Error("stored erasure request counts are invalid");
+      }
+    }
+  }
+  const completedAtMs = row.completed_at_ms == null ? undefined : Number(row.completed_at_ms);
+  if (completedAtMs !== undefined && (!Number.isSafeInteger(completedAtMs) || completedAtMs < createdAtMs)) {
+    throw new Error("stored erasure request completion timestamp is invalid");
+  }
+  return {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectKind,
+    subjectId: String(row.subject_id),
+    generation,
+    status,
+    requestedByKeyId: String(row.requested_by_key_id),
+    idempotencyKey: String(row.idempotency_key),
+    requestHash: String(row.request_hash),
+    createdAtMs,
+    gatedAtMs,
+    updatedAtMs,
+    ...(completedAtMs === undefined ? {} : { completedAtMs }),
+    ...(counts === undefined ? {} : { counts: counts as Record<string, number> }),
+    ...(row.checksum == null ? {} : { checksum: String(row.checksum) }),
+  };
+}
+
+function usageReconciliationSummary(record: UsageReconciliationRecord): UsageReconciliationSummary {
+  return {
+    rowCount: record.rowCount,
+    inputTokens: record.inputTokens,
+    outputTokens: record.outputTokens,
+    cacheReadTokens: record.cacheReadTokens,
+    cacheWriteTokens: record.cacheWriteTokens,
+    reasoningTokens: record.reasoningTokens,
+    totalTokens: record.totalTokens,
+    knownCostRows: record.knownCostRows,
+    ...(record.costCNY === undefined ? {} : { costCNY: record.costCNY }),
+    checksum: record.checksum,
+  };
+}
+
+function assertUsageReconciliationOwner(
+  record: UsageReconciliationRecord,
+  input: ReconcileSessionUsageInput,
+): void {
+  if (
+    record.tenantId !== input.tenantId
+    || record.userId !== input.userId
+    || record.sessionId !== input.sessionId
+    || record.deletionGeneration !== input.deletionGeneration
+  ) {
+    throw new UsageLifecycleGenerationError(input.sessionId, input.deletionGeneration);
+  }
+}
+
+function billingUsageFactValues(fact: BillingUsageFact): unknown[] {
+  assertBillingUsageFact(fact);
+  return [
+    fact.usageId,
+    fact.tenantId,
+    fact.accountingPeriod,
+    fact.provider,
+    fact.model,
+    fact.inputTokens,
+    fact.outputTokens,
+    fact.cacheReadTokens,
+    fact.cacheWriteTokens,
+    fact.reasoningTokens,
+    fact.totalTokens,
+    fact.costCNY === undefined ? null : canonicalBillingCostCNY(fact.costCNY),
+    fact.currency,
+    fact.factSha256,
+  ];
+}
+
+async function insertBillingUsageFact(conn: PoolConnection, fact: BillingUsageFact): Promise<void> {
+  try {
+    await conn.query(
+      `INSERT INTO billing_usage_facts
+         (usage_id, tenant_id, accounting_period, provider, model, input_tokens, output_tokens,
+          cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, cost_cny, currency,
+          fact_sha256)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      billingUsageFactValues(fact),
+    );
+  } catch (error) {
+    if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+      throw new UsageIdentityConflictError(fact.usageId);
+    }
+    throw error;
+  }
+}
+
 export interface MysqlStoreOptions {
   url: string;
   connectionLimit?: number;
@@ -228,7 +574,7 @@ export interface MysqlStoreOptions {
   migrationLockTimeoutSeconds?: number;
 }
 
-export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore {
+export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore {
   private constructor(private readonly pool: Pool) {}
 
   /**
@@ -318,6 +664,279 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
     }
   }
 
+  // ---------- durable subject lifecycle ----------
+  private async ensureSubjectLifecycleRows(
+    conn: PoolConnection,
+    tenantId: string,
+    userId: string,
+    atMs: number,
+  ): Promise<void> {
+    // Most transactions hit rows created by migration/session creation. The optimistic read avoids
+    // taking an unnecessary exclusive duplicate-key lock on the tenant row for every turn while a
+    // mixed-version writer can still be healed safely: a final locking read below always sees the
+    // winner's current state before any business write is allowed.
+    const [existing] = await conn.query<Row[]>(
+      `SELECT subject_kind, subject_id
+         FROM subject_lifecycle
+        WHERE tenant_id=?
+          AND ((subject_kind='tenant' AND subject_id=?)
+            OR (subject_kind='user' AND subject_id=?))`,
+      [tenantId, tenantId, userId],
+    );
+    const hasTenant = existing.some((row) => row.subject_kind === "tenant" && row.subject_id === tenantId);
+    const hasUser = existing.some((row) => row.subject_kind === "user" && row.subject_id === userId);
+    if (!hasTenant) {
+      const [requests] = await conn.query<Row[]>(
+        `SELECT request_id FROM erasure_requests
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? LIMIT 1`,
+        [tenantId, tenantId],
+      );
+      if (requests.length > 0) {
+        throw new Error("tenant lifecycle gate is missing for an existing erasure request");
+      }
+      await conn.query(
+        `INSERT IGNORE INTO subject_lifecycle
+           (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
+            legal_hold_at_ms, created_at_ms, updated_at_ms)
+         VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?)`,
+        [tenantId, tenantId, atMs, atMs],
+      );
+    }
+    if (!hasUser) {
+      const [requests] = await conn.query<Row[]>(
+        `SELECT request_id FROM erasure_requests
+          WHERE tenant_id=? AND subject_kind='user' AND subject_id=? LIMIT 1`,
+        [tenantId, userId],
+      );
+      if (requests.length > 0) {
+        throw new Error("user lifecycle gate is missing for an existing erasure request");
+      }
+      await conn.query(
+        `INSERT IGNORE INTO subject_lifecycle
+           (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
+            legal_hold_at_ms, created_at_ms, updated_at_ms)
+         VALUES (?, 'user', ?, 'active', 0, NULL, NULL, ?, ?)`,
+        [tenantId, userId, atMs, atMs],
+      );
+    }
+  }
+
+  private async lockActiveSubjectGate(
+    conn: PoolConnection,
+    tenantId: string,
+    userId: string,
+    atMs: number,
+    blockedSessionId?: string,
+  ): Promise<void> {
+    await this.ensureSubjectLifecycleRows(conn, tenantId, userId, atMs);
+    // Every path takes the coarse tenant row before the user row. User erasure takes the same order
+    // with an exclusive user lock, so create/commit/gate have one unambiguous linearization point.
+    const [tenantRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [tenantId, tenantId],
+    );
+    const [userRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR SHARE`,
+      [tenantId, userId],
+    );
+    const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+    const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
+    if (!tenant || !user) throw new Error("subject lifecycle gate row is missing");
+    if (tenant.state !== "active" || user.state !== "active") {
+      if (blockedSessionId) throw new SessionGoneError(blockedSessionId);
+      throw new SubjectDeletingError(tenantId, user.state === "active" ? undefined : userId);
+    }
+  }
+
+  async requestUserErasure(input: RequestUserErasureInput): Promise<ErasureRequestRecord> {
+    validateRequestUserErasureInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.ensureSubjectLifecycleRows(conn, input.tenantId, input.userId, input.atMs);
+      const [tenantRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+        [input.tenantId, input.tenantId],
+      );
+      const [userRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR UPDATE`,
+        [input.tenantId, input.userId],
+      );
+      const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+      const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
+      if (!tenant || !user) throw new Error("subject lifecycle gate row is missing");
+      if (tenant.state !== "active") throw new SubjectDeletingError(input.tenantId);
+
+      const [idempotencyRows] = await conn.query<Row[]>(
+        `SELECT ${ERASURE_REQUEST_COLUMNS}
+           FROM erasure_requests
+          WHERE tenant_id=? AND subject_kind='user' AND subject_id=? AND idempotency_key=?
+          FOR UPDATE`,
+        [input.tenantId, input.userId, input.idempotencyKey],
+      );
+      if (idempotencyRows[0]) {
+        const replay = rowToErasureRequest(idempotencyRows[0]);
+        if (replay.requestHash !== input.requestHash) throw new ErasureIdempotencyMismatchError();
+        await conn.commit();
+        return replay;
+      }
+
+      if (user.state !== "active") {
+        if (!user.activeRequestId) throw new SubjectDeletingError(input.tenantId, input.userId);
+        const [activeRows] = await conn.query<Row[]>(
+          `SELECT ${ERASURE_REQUEST_COLUMNS} FROM erasure_requests WHERE request_id=?`,
+          [user.activeRequestId],
+        );
+        const active = activeRows[0] ? rowToErasureRequest(activeRows[0]) : undefined;
+        if (
+          !active
+          || active.tenantId !== input.tenantId
+          || active.subjectKind !== "user"
+          || active.subjectId !== input.userId
+          || active.generation !== user.generation
+        ) throw new Error("subject lifecycle active request is corrupt");
+        await conn.commit();
+        return active;
+      }
+
+      const generation = user.generation + 1;
+      const record: ErasureRequestRecord = {
+        requestId: input.requestId,
+        tenantId: input.tenantId,
+        subjectKind: "user",
+        subjectId: input.userId,
+        generation,
+        status: "gated",
+        requestedByKeyId: input.requestedByKeyId,
+        idempotencyKey: input.idempotencyKey,
+        requestHash: input.requestHash,
+        createdAtMs: input.atMs,
+        gatedAtMs: input.atMs,
+        updatedAtMs: input.atMs,
+      };
+      await conn.query(
+        `INSERT INTO erasure_requests
+           (request_id, tenant_id, subject_kind, subject_id, generation, status,
+            requested_by_key_id, idempotency_key, request_hash, created_at_ms, gated_at_ms,
+            updated_at_ms, completed_at_ms, counts_json, checksum)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)`,
+        [
+          record.requestId,
+          record.tenantId,
+          record.subjectKind,
+          record.subjectId,
+          record.generation,
+          record.status,
+          record.requestedByKeyId,
+          record.idempotencyKey,
+          record.requestHash,
+          record.createdAtMs,
+          record.gatedAtMs,
+          record.updatedAtMs,
+        ],
+      );
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE subject_lifecycle
+            SET state='deleting', generation=?, active_request_id=?, updated_at_ms=?
+          WHERE tenant_id=? AND subject_kind='user' AND subject_id=?
+            AND state='active' AND generation=?`,
+        [
+          generation,
+          input.requestId,
+          Math.max(user.updatedAtMs, input.atMs),
+          input.tenantId,
+          input.userId,
+          user.generation,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new Error("subject lifecycle gate changed while locked");
+      await conn.query(
+        `INSERT INTO erasure_audit_events
+           (request_id, seq, event_type, payload, emitted_at_ms)
+         VALUES (?,1,'erasure/gated',?,?)`,
+        [
+          input.requestId,
+          json({ status: "gated", subjectKind: "user", generation }),
+          input.atMs,
+        ],
+      );
+      await conn.commit();
+      return record;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getUserErasureRequest(
+    tenantId: string,
+    userId: string,
+    requestId: string,
+  ): Promise<ErasureRequestRecord | null> {
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT ${ERASURE_REQUEST_COLUMNS}
+         FROM erasure_requests
+        WHERE request_id=? AND tenant_id=? AND subject_kind='user' AND subject_id=?`,
+      [requestId, tenantId, userId],
+    );
+    return rows[0] ? rowToErasureRequest(rows[0]) : null;
+  }
+
+  async getSubjectLifecycle(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<SubjectLifecycleRecord | null> {
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind=? AND subject_id=?`,
+      [tenantId, subjectKind, subjectId],
+    );
+    return rows[0] ? rowToSubjectLifecycle(rows[0]) : null;
+  }
+
+  async listErasureAuditEvents(requestId: string): Promise<ErasureAuditEvent[]> {
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT request_id, seq, event_type, payload, emitted_at_ms
+         FROM erasure_audit_events WHERE request_id=? ORDER BY seq`,
+      [requestId],
+    );
+    return rows.map((row) => {
+      const type = String(row.event_type) as ErasureAuditEvent["type"];
+      const payload = parse<unknown>(row.payload);
+      const seq = Number(row.seq);
+      const emittedAtMs = Number(row.emitted_at_ms);
+      if (
+        !["erasure/gated", "erasure/status_changed", "erasure/blocked", "erasure/completed"].includes(type)
+        || typeof payload !== "object"
+        || payload === null
+        || Array.isArray(payload)
+        || !Number.isSafeInteger(seq)
+        || seq < 1
+        || !Number.isSafeInteger(emittedAtMs)
+        || emittedAtMs < 0
+      ) throw new Error("stored erasure audit event is invalid");
+      return {
+        requestId: String(row.request_id),
+        seq,
+        type,
+        payload: payload as Record<string, unknown>,
+        emittedAtMs,
+      };
+    });
+  }
+
   // ---------- agents ----------
   async createAgent(def: AgentDefinition) {
     await this.pool.query(
@@ -354,6 +973,7 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      await this.lockActiveSubjectGate(conn, s.tenantId, s.userId, s.createdAtMs);
       if (s.parentSessionId) {
         // Serialize child creation with parent tombstoning. Host preflight is only an early error;
         // this locked re-check is the authority that prevents a dangling child under a deleted row.
@@ -372,6 +992,7 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
           throw new SessionGoneError(s.parentSessionId);
         }
       }
+      const initialUsage = normalizeRowlessUsageProjection(s.usage);
       try {
         await conn.query(
           `INSERT INTO sessions (session_id, tenant_id, user_id, agent_id, agent_version, status, title, parent_session_id,
@@ -379,7 +1000,7 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
           [
             s.id, s.tenantId, s.userId, s.agentId, s.agentVersion, json(s.status), s.title ?? null, s.parentSessionId ?? null,
-            1, s.fenceToken, s.contextEpoch, json(s.usage), json(s.autoApprovedTools), json(s.metadata), s.createdAtMs, s.updatedAtMs, s.archivedAtMs ?? null,
+            1, s.fenceToken, s.contextEpoch, json(initialUsage), json(s.autoApprovedTools), json(s.metadata), s.createdAtMs, s.updatedAtMs, s.archivedAtMs ?? null,
           ],
         );
       } catch (err) {
@@ -408,40 +1029,68 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
     }
   }
   async getSession(tenantId: string, sessionId: string) {
-    const [rows] = await this.pool.query<Row[]>(
-      "SELECT * FROM sessions WHERE session_id=? AND tenant_id=? AND deleted_at_ms IS NULL",
-      [sessionId, tenantId],
-    );
-    return rows[0] ? rowToSession(rows[0]) : null;
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT s.* FROM sessions s
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=s.tenant_id AND tl.state='active'
+           JOIN subject_lifecycle ul
+             ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+            AND ul.subject_id=s.user_id AND ul.state='active'
+          WHERE s.session_id=? AND s.tenant_id=? AND s.deleted_at_ms IS NULL`,
+        [sessionId, tenantId],
+      );
+      if (!rows[0]) return null;
+      const session = rowToSession(rows[0]);
+      const summaries = await this.loadSessionUsageSummaries(conn, [session.id]);
+      return this.projectSessionUsage(session, summaries.get(session.id));
+    });
   }
   async getSessionLifecycle(tenantId: string, userId: string, sessionId: string): Promise<SessionLifecycleRecord | null> {
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT * FROM sessions
-        WHERE session_id=? AND tenant_id=? AND user_id=?`,
-      [sessionId, tenantId, userId],
-    );
-    const row = rows[0];
-    if (!row) return null;
-    return {
-      session: rowToSession(row),
-      deletedAtMs: row.deleted_at_ms == null ? undefined : Number(row.deleted_at_ms),
-      purgeAfterMs: row.purge_after_ms == null ? undefined : Number(row.purge_after_ms),
-      deletionGeneration: Number(row.deletion_generation),
-    };
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT s.* FROM sessions s
+          WHERE s.session_id=? AND s.tenant_id=? AND s.user_id=?`,
+        [sessionId, tenantId, userId],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      const session = rowToSession(row);
+      const summaries = await this.loadSessionUsageSummaries(conn, [session.id]);
+      return {
+        session: this.projectSessionUsage(session, summaries.get(session.id)),
+        deletedAtMs: row.deleted_at_ms == null ? undefined : Number(row.deleted_at_ms),
+        purgeAfterMs: row.purge_after_ms == null ? undefined : Number(row.purge_after_ms),
+        deletionGeneration: Number(row.deletion_generation),
+      };
+    });
   }
   async listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }): Promise<Page<Session>> {
-    const where = ["tenant_id=?", "deleted_at_ms IS NULL"];
-    const params: unknown[] = [tenantId];
-    if (opts.userId) { where.push("user_id=?"); params.push(opts.userId); }
-    if (!opts.includeArchived) where.push("archived_at_ms IS NULL");
-    if (opts.cursor) { where.push("session_id < ?"); params.push(opts.cursor); }
-    params.push(opts.limit + 1);
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT * FROM sessions WHERE ${where.join(" AND ")} ORDER BY session_id DESC LIMIT ?`,
-      params,
-    );
-    const data = rows.slice(0, opts.limit).map(rowToSession);
-    return { data, nextCursor: rows.length > opts.limit ? (data.at(-1)?.id ?? null) : null };
+    return this.withConsistentRead(async (conn) => {
+      const where = ["s.tenant_id=?", "s.deleted_at_ms IS NULL"];
+      const params: unknown[] = [tenantId];
+      if (opts.userId) { where.push("s.user_id=?"); params.push(opts.userId); }
+      if (!opts.includeArchived) where.push("s.archived_at_ms IS NULL");
+      if (opts.cursor) { where.push("s.session_id < ?"); params.push(opts.cursor); }
+      params.push(opts.limit + 1);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT s.* FROM sessions s
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=s.tenant_id AND tl.state='active'
+           JOIN subject_lifecycle ul
+             ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+            AND ul.subject_id=s.user_id AND ul.state='active'
+          WHERE ${where.join(" AND ")} ORDER BY s.session_id DESC LIMIT ?`,
+        params,
+      );
+      const pageRows = rows.slice(0, opts.limit);
+      const sessions = pageRows.map(rowToSession);
+      const summaries = await this.loadSessionUsageSummaries(conn, sessions.map((session) => session.id));
+      const data = sessions.map((session) => this.projectSessionUsage(session, summaries.get(session.id)));
+      return { data, nextCursor: rows.length > opts.limit ? (data.at(-1)?.id ?? null) : null };
+    });
   }
 
   // ---------- blob ownership manifest ----------
@@ -462,6 +1111,13 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
         || session.tenant_id !== input.owner.tenantId
         || session.user_id !== input.owner.userId
       ) throw new SessionGoneError(input.sessionId);
+      await this.lockActiveSubjectGate(
+        conn,
+        input.owner.tenantId,
+        input.owner.userId,
+        Date.now(),
+        input.sessionId,
+      );
       if (session.archived_at_ms != null) throw new SessionArchivedError(input.sessionId);
       const currentFence = Number(session.fence_token);
       if (input.fence < currentFence) throw new FenceError(input.sessionId, input.fence, currentFence);
@@ -535,6 +1191,13 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
         || session.tenant_id !== input.owner.tenantId
         || session.user_id !== input.owner.userId
       ) throw new SessionGoneError(input.sessionId);
+      await this.lockActiveSubjectGate(
+        conn,
+        input.owner.tenantId,
+        input.owner.userId,
+        Date.now(),
+        input.sessionId,
+      );
       if (session.archived_at_ms != null) throw new SessionArchivedError(input.sessionId);
       const currentFence = Number(session.fence_token);
       if (input.fence < currentFence) throw new FenceError(input.sessionId, input.fence, currentFence);
@@ -587,6 +1250,12 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
       `SELECT ${QUALIFIED_BLOB_COLUMNS}
          FROM blob_objects b
          JOIN sessions s ON s.session_id=b.session_id AND s.tenant_id=b.tenant_id AND s.user_id=b.user_id
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=s.tenant_id AND tl.state='active'
+         JOIN subject_lifecycle ul
+           ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+          AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE b.blob_id=? AND b.tenant_id=? AND b.user_id=? AND b.session_id=? AND b.purpose=?
           AND b.state='staging' AND b.item_id IS NULL AND b.uploaded_at_ms IS NOT NULL
           AND b.sha256 IS NOT NULL AND b.size_bytes IS NOT NULL
@@ -616,6 +1285,12 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
       `SELECT ${QUALIFIED_BLOB_COLUMNS}
          FROM blob_objects b
          JOIN sessions s ON s.session_id=b.session_id AND s.tenant_id=b.tenant_id AND s.user_id=b.user_id
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=s.tenant_id AND tl.state='active'
+         JOIN subject_lifecycle ul
+           ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+          AND ul.subject_id=s.user_id AND ul.state='active'
          JOIN items i ON i.item_id=b.item_id
         WHERE ${where.join(" AND ")}`,
       params,
@@ -818,7 +1493,7 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
     try {
       await conn.beginTransaction();
       const [rows] = await conn.query<Row[]>(
-        `SELECT tenant_id, user_id, status, last_seq, fence_token, archived_at_ms,
+        `SELECT tenant_id, user_id, status, last_seq, fence_token, usage_json, archived_at_ms,
                 deleted_at_ms, purge_after_ms, deletion_generation
            FROM sessions WHERE session_id=? FOR UPDATE`,
         [batch.sessionId],
@@ -827,6 +1502,7 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
       if (!head || head.deleted_at_ms != null) throw new SessionGoneError(batch.sessionId);
       const tenantId = head.tenant_id as string;
       const userId = head.user_id as string;
+      await this.lockActiveSubjectGate(conn, tenantId, userId, Date.now(), batch.sessionId);
       const expectedOwner = batch.lifecycle ?? batch.fenceClaim;
       if (expectedOwner && (expectedOwner.tenantId !== tenantId || expectedOwner.userId !== userId)) {
         throw new SessionGoneError(batch.sessionId);
@@ -926,8 +1602,82 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
         batch.sessionId,
       );
 
+      const stagedUsage = (batch.usageEntries ?? []).map((entry) => {
+        if (!isUsageId(entry.usageId)) throw new Error("invalid usage id");
+        const operational: UsageLedgerEntry & { usageId: string } = {
+          ...entry,
+          tenantId,
+          userId,
+          sessionId: batch.sessionId,
+        };
+        return {
+          operational,
+          billing: billingUsageFactFromLedger(operational),
+        };
+      });
+      const owner = { tenantId, userId };
+      const stagedProjectionRows = stagedUsage.map(({ operational }) => operational);
+      const turnIds = new Set<string>();
+      if (batch.turn) turnIds.add(batch.turn.id);
+      for (const item of batch.items ?? []) turnIds.add(item.turnId);
+      const exactKeys: { turnId: string; step: number }[] = [];
+      const prefixKeys: { turnId: string; step: number }[] = [];
+      for (const event of batch.events ?? []) {
+        if (event.type === "turn/started" || event.type === "turn/completed") turnIds.add(event.turn.id);
+        if (event.type === "usage/updated") {
+          turnIds.add(event.turnId);
+          exactKeys.push({ turnId: event.turnId, step: event.step });
+          prefixKeys.push({ turnId: event.turnId, step: event.step });
+        }
+        if (
+          (event.type === "item/started" || event.type === "item/completed")
+          && event.item.type === "contextCompaction"
+          && event.item.usageSnapshot !== undefined
+        ) exactKeys.push({ turnId: event.item.turnId, step: 0 });
+      }
+      for (const item of batch.items ?? []) {
+        if (item.type === "contextCompaction" && item.usageSnapshot !== undefined) {
+          exactKeys.push({ turnId: item.turnId, step: 0 });
+        }
+      }
+
+      // The locked session row serialises every conforming old/new writer for this ledger slice.
+      // Aggregate only the facts needed by the batch; do not load an unbounded session ledger into
+      // Node. The first consistent read occurs after the session lock, so it includes the previous
+      // writer that released that lock and no later writer can race this transaction.
+      const sessionSummaries = await this.loadSessionUsageSummaries(conn, [batch.sessionId]);
+      const turnSummaries = await this.loadTurnUsageSummaries(conn, batch.sessionId, [...turnIds]);
+      const turnPrefixes = await this.loadTurnPrefixUsageSummaries(conn, batch.sessionId, prefixKeys);
+      const exactRows = await this.loadExactUsageProjectionRows(conn, batch.sessionId, exactKeys);
+      const sessionSummary = mergeUsageProjectionSummaries(
+        sessionSummaries.get(batch.sessionId),
+        summarizeUsageProjectionRows(stagedProjectionRows, owner),
+      );
+      for (const turnId of turnIds) {
+        turnSummaries.set(turnId, mergeUsageProjectionSummaries(
+          turnSummaries.get(turnId),
+          summarizeUsageProjectionRows(
+            stagedProjectionRows.filter((row) => row.turnId === turnId),
+            owner,
+          ),
+        ));
+      }
+      for (const key of prefixKeys) {
+        const mapKey = usageProjectionStepKey(key.turnId, key.step);
+        turnPrefixes.set(mapKey, mergeUsageProjectionSummaries(
+          turnPrefixes.get(mapKey),
+          summarizeUsageProjectionRows(
+            stagedProjectionRows.filter((row) => row.turnId === key.turnId && row.step <= key.step),
+            owner,
+          ),
+        ));
+      }
+      for (const row of stagedProjectionRows) {
+        exactRows.set(usageProjectionStepKey(row.turnId, row.step), row);
+      }
+
       let seq = currentLastSeq;
-      const events: PersistedEvent[] = [];
+      let events: PersistedEvent[] = [];
       for (const e of batch.events ?? []) {
         seq += 1;
         const event = { ...e, seq } as PersistedEvent;
@@ -937,8 +1687,26 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
         if (event.type === "turn/completed") event.turn = { ...event.turn };
         events.push(event);
       }
-      const items = batch.items?.map((item) => ({ ...item }));
-      const turn = batch.turn ? { ...batch.turn } : undefined;
+      let items = batch.items?.map((item) => ({ ...item }));
+      let turn = batch.turn ? { ...batch.turn } : undefined;
+      const sessionPatch = {
+        ...(batch.sessionPatch ?? {}),
+        usage: usageProjectionFromSummary(
+          batch.sessionPatch?.usage ?? parse<Session["usage"]>(head.usage_json),
+          sessionSummary,
+        ),
+      };
+      if (turn) turn = this.projectTurnUsage(turn, turnSummaries.get(turn.id));
+      items = items?.map((item) => canonicalizeUsageItem(
+        item,
+        exactRows.get(usageProjectionStepKey(item.turnId, 0)),
+      ));
+      events = events.map((event) => canonicalizePersistedUsageEventFromSummaries(event, {
+        session: sessionSummary,
+        turns: turnSummaries,
+        turnPrefixes,
+        exactRows,
+      }));
       assignItemSeqs(items, events, seq);
       assignTurnSeqEnd(turn, events, seq);
       if (events.length) {
@@ -962,11 +1730,25 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
       for (const a of batch.approvals ?? []) {
         await upsertApproval(conn, a, userId, existingResources.approvalIds.has(a.id));
       }
-      if (batch.usageEntries?.length) {
+      if (stagedUsage.length) {
         await conn.query(
-          "INSERT INTO usage_ledger (tenant_id, user_id, session_id, turn_id, step, provider, model, usage_json, created_at_ms) VALUES ?",
-          [batch.usageEntries.map((e) => [tenantId, userId, batch.sessionId, e.turnId, e.step, e.provider, e.model, json(e.usage), e.createdAtMs])],
+          `INSERT INTO usage_ledger
+             (usage_id, tenant_id, user_id, session_id, turn_id, step, provider, model, usage_json, created_at_ms)
+           VALUES ?`,
+          [stagedUsage.map(({ operational: entry }) => [
+            entry.usageId,
+            entry.tenantId,
+            entry.userId,
+            entry.sessionId,
+            entry.turnId,
+            entry.step,
+            entry.provider,
+            entry.model,
+            json(entry.usage),
+            entry.createdAtMs,
+          ])],
         );
+        for (const { billing } of stagedUsage) await insertBillingUsageFact(conn, billing);
       }
       if (batch.idempotency) {
         const receipt = batch.idempotency;
@@ -1008,7 +1790,7 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
 
       const sets = ["last_seq=?", "fence_token=?", "updated_at_ms=?"];
       const params: unknown[] = [seq, batch.fence, Date.now()];
-      const p = batch.sessionPatch;
+      const p = sessionPatch;
       if (p) {
         if (p.status !== undefined) { sets.push("status=?"); params.push(json(p.status)); }
         if (p.title !== undefined) { sets.push("title=?"); params.push(p.title); }
@@ -1045,66 +1827,321 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
   }
 
   // ---------- reads ----------
+  private async withConsistentRead<T>(work: (conn: PoolConnection) => Promise<T>): Promise<T> {
+    const conn = await this.pool.getConnection();
+    try {
+      // Session/turn JSON and their ledger rollup must come from one MVCC snapshot. Without this,
+      // an old writer committing between two ordinary SELECTs could pair a stale projection with a
+      // newer ledger (or the reverse).
+      await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      const result = await work(conn);
+      await conn.commit();
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private usageProjectionSummarySql(groupColumns: string): string {
+    const owned = USAGE_OWNER_MATCH;
+    const ownedNumber = (field: string) => `CASE WHEN ${owned} THEN ${usageJsonNumber(field)} ELSE 0 END`;
+    return `${groupColumns},
+            COUNT(*) AS row_count,
+            SUM(CASE WHEN ${owned} THEN 1 ELSE 0 END) AS owner_row_count,
+            SUM(CASE WHEN ${owned} AND ${USAGE_PRICE_KNOWN} THEN 1 ELSE 0 END) AS priced_row_count,
+            COALESCE(SUM(${ownedNumber("inputTokens")}),0) AS input_tokens,
+            COALESCE(SUM(${ownedNumber("outputTokens")}),0) AS output_tokens,
+            COALESCE(SUM(${ownedNumber("cacheReadTokens")}),0) AS cache_read_tokens,
+            COALESCE(SUM(${ownedNumber("cacheWriteTokens")}),0) AS cache_write_tokens,
+            COALESCE(SUM(${ownedNumber("reasoningTokens")}),0) AS reasoning_tokens,
+            COALESCE(SUM(${ownedNumber("totalTokens")}),0) AS total_tokens,
+            COALESCE(SUM(CASE WHEN ${owned} AND ${USAGE_PRICE_KNOWN}
+              THEN ${USAGE_COST_NUMBER} ELSE 0 END),0) AS cost_cny`;
+  }
+
+  private async loadSessionUsageSummaries(
+    executor: Pool | PoolConnection,
+    sessionIds: readonly string[],
+  ): Promise<Map<string, UsageProjectionSummary>> {
+    const result = new Map<string, UsageProjectionSummary>();
+    if (sessionIds.length === 0) return result;
+    const placeholders = sessionIds.map(() => "?").join(",");
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${this.usageProjectionSummarySql("u.session_id")}
+         FROM usage_ledger u
+         JOIN sessions s ON s.session_id=u.session_id
+        WHERE u.session_id IN (${placeholders})
+        GROUP BY u.session_id`,
+      [...sessionIds],
+    );
+    for (const row of rows) result.set(String(row.session_id), rowToUsageProjectionSummary(row));
+    return result;
+  }
+
+  private async loadTurnUsageSummaries(
+    executor: Pool | PoolConnection,
+    sessionId: string,
+    turnIds: readonly string[],
+  ): Promise<Map<string, UsageProjectionSummary>> {
+    const result = new Map<string, UsageProjectionSummary>();
+    const unique = [...new Set(turnIds)];
+    if (unique.length === 0) return result;
+    const placeholders = unique.map(() => "?").join(",");
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${this.usageProjectionSummarySql("u.turn_id")}
+         FROM usage_ledger u
+         JOIN sessions s ON s.session_id=u.session_id
+        WHERE u.session_id=? AND u.turn_id IN (${placeholders})
+        GROUP BY u.turn_id`,
+      [sessionId, ...unique],
+    );
+    for (const row of rows) result.set(String(row.turn_id), rowToUsageProjectionSummary(row));
+    return result;
+  }
+
+  private async loadExactUsageProjectionRows(
+    executor: Pool | PoolConnection,
+    sessionId: string,
+    keys: readonly { turnId: string; step: number }[],
+  ): Promise<Map<string, UsageProjectionLedgerRow>> {
+    const result = new Map<string, UsageProjectionLedgerRow>();
+    const unique = [...new Map(keys.map((key) => [usageProjectionStepKey(key.turnId, key.step), key])).values()];
+    if (unique.length === 0) return result;
+    const predicates = unique.map(() => "(turn_id=? AND step=?)").join(" OR ");
+    const [rows] = await executor.query<Row[]>(
+      `SELECT u.usage_id, u.tenant_id, u.user_id, u.session_id, u.turn_id, u.step, u.usage_json
+         FROM usage_ledger u
+         JOIN sessions s
+           ON s.session_id=u.session_id AND s.tenant_id=u.tenant_id AND s.user_id=u.user_id
+        WHERE u.session_id=? AND (${predicates.replaceAll("turn_id", "u.turn_id").replaceAll("step", "u.step")})`,
+      [sessionId, ...unique.flatMap((key) => [key.turnId, key.step])],
+    );
+    for (const raw of rows) {
+      const row = rowToUsageProjection(raw);
+      result.set(usageProjectionStepKey(row.turnId, row.step), row);
+    }
+    return result;
+  }
+
+  private async loadTurnPrefixUsageSummaries(
+    executor: Pool | PoolConnection,
+    sessionId: string,
+    keys: readonly { turnId: string; step: number }[],
+  ): Promise<Map<string, UsageProjectionSummary>> {
+    const result = new Map<string, UsageProjectionSummary>();
+    const unique = [...new Map(keys.map((key) => [usageProjectionStepKey(key.turnId, key.step), key])).values()];
+    if (unique.length === 0) return result;
+    const requested = unique.map(() => "SELECT ? AS turn_id, ? AS step").join(" UNION ALL ");
+    const owned = USAGE_OWNER_MATCH;
+    const ownedNumber = (field: string) => `CASE WHEN u.id IS NOT NULL AND ${owned}
+      THEN ${usageJsonNumber(field)} ELSE 0 END`;
+    const [rows] = await executor.query<Row[]>(
+      `SELECT requested.turn_id, requested.step,
+              COUNT(u.id) AS row_count,
+              SUM(CASE WHEN u.id IS NOT NULL AND ${owned} THEN 1 ELSE 0 END) AS owner_row_count,
+              SUM(CASE WHEN u.id IS NOT NULL AND ${owned} AND ${USAGE_PRICE_KNOWN}
+                THEN 1 ELSE 0 END) AS priced_row_count,
+              COALESCE(SUM(${ownedNumber("inputTokens")}),0) AS input_tokens,
+              COALESCE(SUM(${ownedNumber("outputTokens")}),0) AS output_tokens,
+              COALESCE(SUM(${ownedNumber("cacheReadTokens")}),0) AS cache_read_tokens,
+              COALESCE(SUM(${ownedNumber("cacheWriteTokens")}),0) AS cache_write_tokens,
+              COALESCE(SUM(${ownedNumber("reasoningTokens")}),0) AS reasoning_tokens,
+              COALESCE(SUM(${ownedNumber("totalTokens")}),0) AS total_tokens,
+              COALESCE(SUM(CASE WHEN u.id IS NOT NULL AND ${owned} AND ${USAGE_PRICE_KNOWN}
+                THEN ${USAGE_COST_NUMBER} ELSE 0 END),0) AS cost_cny
+         FROM (${requested}) requested
+         JOIN sessions s ON s.session_id=?
+         LEFT JOIN usage_ledger u
+           ON u.session_id=s.session_id AND u.turn_id=requested.turn_id AND u.step<=requested.step
+        GROUP BY requested.turn_id, requested.step`,
+      [...unique.flatMap((key) => [key.turnId, key.step]), sessionId],
+    );
+    for (const row of rows) {
+      result.set(
+        usageProjectionStepKey(String(row.turn_id), Number(row.step)),
+        rowToUsageProjectionSummary(row),
+      );
+    }
+    return result;
+  }
+
+  private projectSessionUsage(session: Session, summary: UsageProjectionSummary | undefined): Session {
+    return {
+      ...session,
+      usage: usageProjectionFromSummary(session.usage, summary ?? emptyUsageProjectionSummary()),
+    };
+  }
+
+  private projectTurnUsage(
+    turn: Turn,
+    summary: UsageProjectionSummary | undefined,
+  ): Turn {
+    return {
+      ...turn,
+      usage: usageProjectionFromSummary(turn.usage, summary ?? emptyUsageProjectionSummary()),
+    };
+  }
+
   async readEvents(sessionId: string, afterSeq: number, limit: number) {
     // Deliberately raw: an established SSE stream must be able to observe session/deleted. Public
     // subscription setup performs an owner-aware live-session check before calling this method.
-    const [rows] = await this.pool.query<Row[]>(
-      "SELECT body FROM events WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
-      [sessionId, afterSeq, limit],
-    );
-    return rows.map((r) => parse<PersistedEvent>(r.body));
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        "SELECT body FROM events WHERE session_id=? AND seq>? ORDER BY seq ASC LIMIT ?",
+        [sessionId, afterSeq, limit],
+      );
+      const events = rows.map((r) => parse<PersistedEvent>(r.body));
+      if (!events.some((event) => (
+        event.type === "turn/started" || event.type === "turn/completed"
+        || event.type === "usage/updated"
+        || ((event.type === "item/started" || event.type === "item/completed")
+          && event.item.type === "contextCompaction" && event.item.usageSnapshot !== undefined)
+      ))) return events;
+      const [owners] = await conn.query<Row[]>(
+        "SELECT tenant_id, user_id FROM sessions WHERE session_id=?",
+        [sessionId],
+      );
+      if (!owners[0]) return events;
+
+      const turnIds: string[] = [];
+      const exactKeys: { turnId: string; step: number }[] = [];
+      const prefixKeys: { turnId: string; step: number }[] = [];
+      for (const event of events) {
+        if (event.type === "turn/completed") turnIds.push(event.turn.id);
+        if (event.type === "usage/updated") {
+          turnIds.push(event.turnId);
+          exactKeys.push({ turnId: event.turnId, step: event.step });
+          prefixKeys.push({ turnId: event.turnId, step: event.step });
+        }
+        if (
+          (event.type === "item/started" || event.type === "item/completed")
+          && event.item.type === "contextCompaction"
+          && event.item.usageSnapshot !== undefined
+        ) exactKeys.push({ turnId: event.item.turnId, step: 0 });
+      }
+      const sessionSummaries = await this.loadSessionUsageSummaries(conn, [sessionId]);
+      const turns = await this.loadTurnUsageSummaries(conn, sessionId, turnIds);
+      const turnPrefixes = await this.loadTurnPrefixUsageSummaries(conn, sessionId, prefixKeys);
+      const exactRows = await this.loadExactUsageProjectionRows(conn, sessionId, exactKeys);
+      return events.map((event) => canonicalizePersistedUsageEventFromSummaries(event, {
+        session: sessionSummaries.get(sessionId) ?? emptyUsageProjectionSummary(),
+        turns,
+        turnPrefixes,
+        exactRows,
+      }));
+    });
   }
   async getTurn(sessionId: string, turnId: string) {
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT t.body FROM turns t
-         JOIN sessions s ON s.session_id=t.session_id AND s.deleted_at_ms IS NULL
-        WHERE t.turn_id=? AND t.session_id=?`,
-      [turnId, sessionId],
-    );
-    return rows[0] ? parse<Turn>(rows[0].body) : null;
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT t.body FROM turns t
+           JOIN sessions s ON s.session_id=t.session_id AND s.deleted_at_ms IS NULL
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=s.tenant_id AND tl.state='active'
+           JOIN subject_lifecycle ul
+             ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+            AND ul.subject_id=s.user_id AND ul.state='active'
+          WHERE t.turn_id=? AND t.session_id=?`,
+        [turnId, sessionId],
+      );
+      if (!rows[0]) return null;
+      const summaries = await this.loadTurnUsageSummaries(conn, sessionId, [turnId]);
+      return this.projectTurnUsage(parse<Turn>(rows[0].body), summaries.get(turnId));
+    });
   }
   async listTurns(sessionId: string, opts: { cursor?: string; limit: number; sortDirection?: "asc" | "desc" }): Promise<Page<Turn>> {
-    const desc = (opts.sortDirection ?? "desc") === "desc";
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT t.body FROM turns t
-         JOIN sessions s ON s.session_id=t.session_id AND s.deleted_at_ms IS NULL
-        WHERE t.session_id=? ${opts.cursor ? `AND t.turn_id ${desc ? "<" : ">"} ?` : ""}
-        ORDER BY t.turn_id ${desc ? "DESC" : "ASC"} LIMIT ?`,
-      opts.cursor ? [sessionId, opts.cursor, opts.limit + 1] : [sessionId, opts.limit + 1],
-    );
-    const data = rows.slice(0, opts.limit).map((r) => parse<Turn>(r.body));
-    return { data, nextCursor: rows.length > opts.limit ? (data.at(-1)?.id ?? null) : null };
+    return this.withConsistentRead(async (conn) => {
+      const desc = (opts.sortDirection ?? "desc") === "desc";
+      const [rows] = await conn.query<Row[]>(
+        `SELECT t.body FROM turns t
+           JOIN sessions s ON s.session_id=t.session_id AND s.deleted_at_ms IS NULL
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=s.tenant_id AND tl.state='active'
+           JOIN subject_lifecycle ul
+             ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+            AND ul.subject_id=s.user_id AND ul.state='active'
+          WHERE t.session_id=? ${opts.cursor ? `AND t.turn_id ${desc ? "<" : ">"} ?` : ""}
+          ORDER BY t.turn_id ${desc ? "DESC" : "ASC"} LIMIT ?`,
+        opts.cursor ? [sessionId, opts.cursor, opts.limit + 1] : [sessionId, opts.limit + 1],
+      );
+      const pageRows = rows.slice(0, opts.limit);
+      const parsed = pageRows.map((row) => parse<Turn>(row.body));
+      const summaries = await this.loadTurnUsageSummaries(conn, sessionId, parsed.map((turn) => turn.id));
+      const data = parsed.map((turn) => this.projectTurnUsage(turn, summaries.get(turn.id)));
+      return { data, nextCursor: rows.length > opts.limit ? (data.at(-1)?.id ?? null) : null };
+    });
   }
   async listItems(sessionId: string, opts: { turnId?: string; afterSeq?: number; limit: number; newestFirst?: boolean }) {
-    const where = ["i.session_id=?", "s.deleted_at_ms IS NULL"];
-    const params: unknown[] = [sessionId];
-    if (opts.turnId) { where.push("i.turn_id=?"); params.push(opts.turnId); }
-    if (opts.afterSeq !== undefined) { where.push("i.seq>?"); params.push(opts.afterSeq); }
-    params.push(opts.limit);
-    // Take the newest rows when asked, then flip back to seq-ascending for the caller.
-    const order = opts.newestFirst ? "DESC" : "ASC";
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT i.body FROM items i
-         JOIN sessions s ON s.session_id=i.session_id
-        WHERE ${where.join(" AND ")} ORDER BY i.seq ${order}, i.item_id ${order} LIMIT ?`,
-      params,
-    );
-    const items = rows.map((r) => parse<Item>(r.body));
-    return opts.newestFirst ? items.reverse() : items;
+    return this.withConsistentRead(async (conn) => {
+      const where = ["i.session_id=?", "s.deleted_at_ms IS NULL"];
+      const params: unknown[] = [sessionId];
+      if (opts.turnId) { where.push("i.turn_id=?"); params.push(opts.turnId); }
+      if (opts.afterSeq !== undefined) { where.push("i.seq>?"); params.push(opts.afterSeq); }
+      params.push(opts.limit);
+      // Take the newest rows when asked, then flip back to seq-ascending for the caller.
+      const order = opts.newestFirst ? "DESC" : "ASC";
+      const [rows] = await conn.query<Row[]>(
+        `SELECT i.body FROM items i
+           JOIN sessions s ON s.session_id=i.session_id
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=s.tenant_id AND tl.state='active'
+           JOIN subject_lifecycle ul
+             ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+            AND ul.subject_id=s.user_id AND ul.state='active'
+          WHERE ${where.join(" AND ")} ORDER BY i.seq ${order}, i.item_id ${order} LIMIT ?`,
+        params,
+      );
+      let items = rows.map((r) => parse<Item>(r.body));
+      const compactions = items.filter((item) => item.type === "contextCompaction" && item.usageSnapshot !== undefined);
+      const exact = await this.loadExactUsageProjectionRows(
+        conn,
+        sessionId,
+        compactions.map((item) => ({ turnId: item.turnId, step: 0 })),
+      );
+      items = items.map((item) => canonicalizeUsageItem(
+        item,
+        exact.get(usageProjectionStepKey(item.turnId, 0)),
+      ));
+      return opts.newestFirst ? items.reverse() : items;
+    });
   }
   async getItem(sessionId: string, itemId: string) {
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT i.body FROM items i
-         JOIN sessions s ON s.session_id=i.session_id AND s.deleted_at_ms IS NULL
-        WHERE i.item_id=? AND i.session_id=?`,
-      [itemId, sessionId],
-    );
-    return rows[0] ? parse<Item>(rows[0].body) : null;
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT i.body FROM items i
+           JOIN sessions s ON s.session_id=i.session_id AND s.deleted_at_ms IS NULL
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=s.tenant_id AND tl.state='active'
+           JOIN subject_lifecycle ul
+             ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+            AND ul.subject_id=s.user_id AND ul.state='active'
+          WHERE i.item_id=? AND i.session_id=?`,
+        [itemId, sessionId],
+      );
+      if (!rows[0]) return null;
+      const item = parse<Item>(rows[0].body);
+      const exact = await this.loadExactUsageProjectionRows(conn, sessionId, [{ turnId: item.turnId, step: 0 }]);
+      return canonicalizeUsageItem(item, exact.get(usageProjectionStepKey(item.turnId, 0)));
+    });
   }
   async listApprovals(sessionId: string, opts: { pendingOnly?: boolean }) {
     const [rows] = await this.pool.query<Row[]>(
       `SELECT a.body FROM approvals a
          JOIN sessions s ON s.session_id=a.session_id AND s.deleted_at_ms IS NULL
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=s.tenant_id AND tl.state='active'
+         JOIN subject_lifecycle ul
+           ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+          AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE a.session_id=? ${opts.pendingOnly ? "AND a.status='pending'" : ""}
         ORDER BY a.created_at_ms ASC`,
       [sessionId],
@@ -1115,6 +2152,12 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
     const [rows] = await this.pool.query<Row[]>(
       `SELECT a.body FROM approvals a
          JOIN sessions s ON s.session_id=a.session_id AND s.deleted_at_ms IS NULL
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=s.tenant_id AND tl.state='active'
+         JOIN subject_lifecycle ul
+           ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+          AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE a.approval_id=? AND a.session_id=?`,
       [approvalId, sessionId],
     );
@@ -1208,6 +2251,183 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
   }
 
   // ---------- usage ledger ----------
+  private async lockUsageLifecycleSession(
+    conn: PoolConnection,
+    input: ReconcileSessionUsageInput,
+  ): Promise<void> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT tenant_id, user_id, deleted_at_ms, deletion_generation
+         FROM sessions WHERE session_id=? FOR UPDATE`,
+      [input.sessionId],
+    );
+    const session = rows[0];
+    if (
+      !session
+      || session.tenant_id !== input.tenantId
+      || session.user_id !== input.userId
+    ) {
+      throw new SessionGoneError(input.sessionId);
+    }
+    if (
+      session.deleted_at_ms == null
+      || Number(session.deletion_generation) !== input.deletionGeneration
+    ) {
+      throw new UsageLifecycleGenerationError(input.sessionId, input.deletionGeneration);
+    }
+  }
+
+  private async lockUsageReconciliation(
+    conn: PoolConnection,
+    input: ReconcileSessionUsageInput,
+  ): Promise<UsageReconciliationRecord | null> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${USAGE_RECONCILIATION_COLUMNS}
+         FROM usage_reconciliations
+        WHERE session_id=? AND deletion_generation=?
+        FOR UPDATE`,
+      [input.sessionId, input.deletionGeneration],
+    );
+    if (!rows[0]) return null;
+    const record = rowToUsageReconciliation(rows[0]);
+    assertUsageReconciliationOwner(record, input);
+    return record;
+  }
+
+  private async lockUsageLegalHold(
+    conn: PoolConnection,
+    input: ReconcileSessionUsageInput,
+  ): Promise<boolean> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT subject_kind, subject_id, legal_hold_at_ms
+         FROM subject_lifecycle
+        WHERE tenant_id=?
+          AND ((subject_kind='tenant' AND subject_id=?)
+            OR (subject_kind='user' AND subject_id=?))
+        ORDER BY subject_kind, subject_id
+        FOR UPDATE`,
+      [input.tenantId, input.tenantId, input.userId],
+    );
+    const tenantLifecycle = rows.find(
+      (row) => row.subject_kind === "tenant" && row.subject_id === input.tenantId,
+    );
+    const userLifecycle = rows.find(
+      (row) => row.subject_kind === "user" && row.subject_id === input.userId,
+    );
+    if (!tenantLifecycle || !userLifecycle) {
+      throw new UsageReconciliationError("subject lifecycle state is missing; anonymization is fail-closed");
+    }
+    return tenantLifecycle.legal_hold_at_ms != null || userLifecycle.legal_hold_at_ms != null;
+  }
+
+  private async assertNoOperationalUsage(
+    conn: PoolConnection,
+    input: ReconcileSessionUsageInput,
+  ): Promise<void> {
+    const rows = await this.lockSessionUsageRows(conn, input);
+    if (rows.length > 0) {
+      throw new UsageReconciliationError("operational usage reappeared after anonymization");
+    }
+  }
+
+  private async lockSessionUsageRows(
+    conn: PoolConnection,
+    input: ReconcileSessionUsageInput,
+  ): Promise<Row[]> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT id, usage_id, tenant_id, user_id, session_id, turn_id, step, provider, model,
+              usage_json, created_at_ms
+         FROM usage_ledger
+        WHERE session_id=?
+        ORDER BY id
+        FOR UPDATE`,
+      [input.sessionId],
+    );
+    // Validate the complete session slice before assigning a legacy id or deleting a row. The
+    // schema historically had no composite owner FK, so corrupt/imported rows must fail closed
+    // instead of being omitted from reconciliation and left behind by anonymization.
+    if (rows.some((row) => row.tenant_id !== input.tenantId || row.user_id !== input.userId)) {
+      throw new UsageReconciliationError("operational usage owner does not match its session");
+    }
+    return rows;
+  }
+
+  private async materializeBillingUsageFacts(
+    conn: PoolConnection,
+    input: ReconcileSessionUsageInput,
+    mode: "reconcile" | "verify",
+  ): Promise<{ expected: BillingUsageFact[]; actual: BillingUsageFact[] }> {
+    const rows = await this.lockSessionUsageRows(conn, input);
+    const operational: (UsageLedgerEntry & { usageId: string })[] = [];
+    for (const row of rows) {
+      let usageId = row.usage_id == null ? undefined : String(row.usage_id);
+      const parsedUsage = parse<UsageLedgerEntry["usage"]>(row.usage_json);
+      // Preserve legacy provenance before assigning an identity. Pre-0011 Pi wrote costCNY=0 both
+      // for genuinely free models and for missing pricing; those cases are indistinguishable, so
+      // reconciliation conservatively persists the normalized unknown form in the same transaction.
+      const normalizedUsage = normalizeOperationalUsageCost(parsedUsage, usageId);
+      if (usageId === undefined && mode === "reconcile") {
+        for (let attempt = 0; attempt < 5 && usageId === undefined; attempt += 1) {
+          const candidate = newUsageId();
+          try {
+            const [updated] = await conn.query<mysql.ResultSetHeader>(
+              "UPDATE usage_ledger SET usage_id=?, usage_json=? WHERE id=? AND usage_id IS NULL",
+              [candidate, json(normalizedUsage), row.id],
+            );
+            if (updated.affectedRows !== 1) {
+              throw new UsageReconciliationError("legacy usage identity assignment lost its row lock");
+            }
+            usageId = candidate;
+          } catch (error) {
+            if ((error as { code?: string }).code !== "ER_DUP_ENTRY") throw error;
+          }
+        }
+      }
+      if (!isUsageId(usageId)) {
+        throw new UsageReconciliationError(
+          mode === "reconcile"
+            ? "could not assign a stable identity to legacy usage"
+            : "verified operational usage is missing its stable identity",
+        );
+      }
+      operational.push({
+        usageId,
+        tenantId: String(row.tenant_id),
+        userId: String(row.user_id),
+        sessionId: String(row.session_id),
+        turnId: String(row.turn_id),
+        step: Number(row.step),
+        provider: String(row.provider),
+        model: String(row.model),
+        usage: normalizedUsage,
+        createdAtMs: Number(row.created_at_ms),
+      });
+    }
+
+    const expected = operational.map((entry) => billingUsageFactFromLedger(entry));
+    const actual: BillingUsageFact[] = [];
+    for (const fact of [...expected].sort((left, right) => left.usageId.localeCompare(right.usageId))) {
+      const [billingRows] = await conn.query<Row[]>(
+        `SELECT ${BILLING_USAGE_COLUMNS}
+           FROM billing_usage_facts WHERE usage_id=? FOR UPDATE`,
+        [fact.usageId],
+      );
+      const existing = billingRows[0] ? rowToBillingUsageFact(billingRows[0]) : undefined;
+      if (existing) {
+        if (!billingUsageFactContentEquals(existing, fact)) {
+          throw new UsageIdentityConflictError(fact.usageId);
+        }
+        actual.push(existing);
+      } else {
+        if (mode === "verify") {
+          throw new UsageReconciliationError("a verified billing usage fact is missing");
+        }
+        await insertBillingUsageFact(conn, fact);
+        actual.push(fact);
+      }
+    }
+    return { expected, actual };
+  }
+
   async queryUsage(tenantId: string, q: UsageQuery) {
     // Grouping keys are chosen from a fixed set, never interpolated from input.
     const keyExpr =
@@ -1233,9 +2453,24 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
               COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.cacheWriteTokens') AS UNSIGNED)),0) AS cache_write_tokens,
               COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.reasoningTokens') AS UNSIGNED)),0) AS reasoning_tokens,
               COALESCE(SUM(CAST(JSON_EXTRACT(u.usage_json,'$.totalTokens') AS UNSIGNED)),0) AS total_tokens,
-              COALESCE(SUM(JSON_EXTRACT(u.usage_json,'$.costCNY')),0) AS cost
+              COUNT(CASE
+                WHEN ${USAGE_PRICE_KNOWN}
+                THEN 1
+              END) AS priced_rows,
+              COALESCE(SUM(CASE
+                WHEN ${USAGE_PRICE_KNOWN}
+                THEN ${USAGE_COST_NUMBER}
+                ELSE 0
+              END),0) AS cost
          FROM usage_ledger u
-         JOIN sessions s ON s.session_id=u.session_id
+         JOIN sessions s
+           ON s.session_id=u.session_id AND s.tenant_id=u.tenant_id AND s.user_id=u.user_id
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=s.tenant_id AND tl.state='active'
+         JOIN subject_lifecycle ul
+           ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+          AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE ${where.join(" AND ")}
         GROUP BY k
         ORDER BY total_tokens DESC, k ASC
@@ -1254,10 +2489,163 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
           cacheWriteTokens: Number(r.cache_write_tokens),
           reasoningTokens: Number(r.reasoning_tokens),
           totalTokens: Number(r.total_tokens),
-          costCNY: Number(r.cost),
+          // A cost total is publishable only when every constituent row is priced. Returning the
+          // known subtotal would silently understate mixed priced/unpriced usage.
+          ...(Number(r.priced_rows) === Number(r.steps) ? { costCNY: Number(r.cost) } : {}),
         },
       })),
     };
+  }
+
+  async reconcileSessionUsage(input: ReconcileSessionUsageInput): Promise<UsageReconciliationRecord> {
+    validateReconcileSessionUsageInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockUsageLifecycleSession(conn, input);
+      const existing = await this.lockUsageReconciliation(conn, input);
+      if (existing?.status === "anonymized") {
+        await this.assertNoOperationalUsage(conn, input);
+        await conn.commit();
+        return existing;
+      }
+
+      const { expected, actual } = await this.materializeBillingUsageFacts(
+        conn,
+        input,
+        "reconcile",
+      );
+      const expectedSummary = summarizeBillingUsageFacts(expected);
+      const actualSummary = summarizeBillingUsageFacts(actual);
+      if (!usageReconciliationSummariesEqual(expectedSummary, actualSummary)) {
+        throw new UsageReconciliationError();
+      }
+      if (existing) {
+        if (!usageReconciliationSummariesEqual(usageReconciliationSummary(existing), actualSummary)) {
+          throw new UsageReconciliationError("stored usage reconciliation no longer matches its facts");
+        }
+        await conn.commit();
+        return existing;
+      }
+
+      const record: UsageReconciliationRecord = {
+        tenantId: input.tenantId,
+        userId: input.userId,
+        sessionId: input.sessionId,
+        deletionGeneration: input.deletionGeneration,
+        status: "verified",
+        ...actualSummary,
+        verifiedAtMs: input.nowMs,
+      };
+      await conn.query(
+        `INSERT INTO usage_reconciliations
+           (tenant_id, user_id, session_id, deletion_generation, status, row_count, input_tokens,
+            output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens,
+            known_cost_rows, cost_cny, checksum, verified_at_ms, anonymized_at_ms, created_at_ms,
+            updated_at_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          record.tenantId,
+          record.userId,
+          record.sessionId,
+          record.deletionGeneration,
+          record.status,
+          record.rowCount,
+          record.inputTokens,
+          record.outputTokens,
+          record.cacheReadTokens,
+          record.cacheWriteTokens,
+          record.reasoningTokens,
+          record.totalTokens,
+          record.knownCostRows,
+          record.costCNY === undefined ? null : canonicalBillingCostCNY(record.costCNY),
+          record.checksum,
+          record.verifiedAtMs,
+          null,
+          record.verifiedAtMs,
+          record.verifiedAtMs,
+        ],
+      );
+      await conn.commit();
+      return record;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async anonymizeSessionUsage(input: AnonymizeSessionUsageInput): Promise<UsageReconciliationRecord> {
+    // The runtime check is intentional even though TypeScript callers see literal `true`.
+    assertUsageAnonymizationAllowed(input, false);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockUsageLifecycleSession(conn, input);
+      const existing = await this.lockUsageReconciliation(conn, input);
+      if (!existing) throw new UsageReconciliationError("usage must be reconciled before anonymization");
+      if (existing.checksum !== input.expectedChecksum) {
+        throw new UsageReconciliationError("expected reconciliation checksum does not match");
+      }
+      const legalHoldActive = await this.lockUsageLegalHold(conn, input);
+      if (existing.status === "anonymized") {
+        await this.assertNoOperationalUsage(conn, input);
+        await conn.commit();
+        return existing;
+      }
+      // A hold blocks only the destructive verified -> anonymized transition. If that transition
+      // already committed but its response was lost, a later hold cannot restore operational rows
+      // and must not make the same-checksum retry report a false failure.
+      assertUsageAnonymizationAllowed(input, legalHoldActive);
+      if (input.nowMs < existing.verifiedAtMs) {
+        throw new UsageReconciliationError("anonymization cannot precede verification");
+      }
+
+      const { expected, actual } = await this.materializeBillingUsageFacts(
+        conn,
+        input,
+        "verify",
+      );
+      const expectedSummary = summarizeBillingUsageFacts(expected);
+      const actualSummary = summarizeBillingUsageFacts(actual);
+      const storedSummary = usageReconciliationSummary(existing);
+      if (
+        !usageReconciliationSummariesEqual(expectedSummary, actualSummary)
+        || !usageReconciliationSummariesEqual(storedSummary, expectedSummary)
+      ) {
+        throw new UsageReconciliationError("usage changed after verification");
+      }
+
+      const [deleted] = await conn.query<mysql.ResultSetHeader>(
+        "DELETE FROM usage_ledger WHERE tenant_id=? AND user_id=? AND session_id=?",
+        [input.tenantId, input.userId, input.sessionId],
+      );
+      if (deleted.affectedRows !== existing.rowCount) {
+        throw new UsageReconciliationError("operational usage delete count does not match verification");
+      }
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE usage_reconciliations
+            SET status='anonymized', anonymized_at_ms=?, updated_at_ms=?
+          WHERE session_id=? AND deletion_generation=? AND status='verified'`,
+        [input.nowMs, input.nowMs, input.sessionId, input.deletionGeneration],
+      );
+      if (updated.affectedRows !== 1) {
+        throw new UsageReconciliationError("usage reconciliation was not in verified state");
+      }
+      const result: UsageReconciliationRecord = {
+        ...existing,
+        status: "anonymized",
+        anonymizedAtMs: input.nowMs,
+      };
+      await conn.commit();
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
 
   // ---------- idempotency ----------
@@ -1268,6 +2656,12 @@ export class MysqlSessionStore implements SessionStore, LifecycleOutboxStore, Bl
          JOIN sessions s
            ON s.session_id=i.session_id AND s.tenant_id=i.tenant_id AND s.user_id=i.user_id
           AND s.deleted_at_ms IS NULL
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=s.tenant_id AND tl.state='active'
+         JOIN subject_lifecycle ul
+           ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
+          AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE i.tenant_id=? AND i.user_id=? AND i.session_id=? AND i.idem_key=?`,
       [scope.tenantId, scope.userId, scope.sessionId, key],
     );

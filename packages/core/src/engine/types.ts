@@ -32,6 +32,12 @@ export interface ResolvedModel {
   contextWindow: number;
   /** Input modalities accepted by the selected model, copied from its provider model spec. */
   input: ModelSpec["input"];
+  /**
+   * Whether the configured price table is authoritative for this model. Pi requires numeric cost
+   * coefficients, so an unpriced model is registered with zeroes internally; this bit prevents
+   * those compatibility zeroes from being persisted as a known free charge.
+   */
+  priceKnown?: boolean;
   /** returns the API key for this request (BYOK), or undefined for keyless endpoints */
   apiKey: () => Promise<string | undefined>;
   headers?: Record<string, string>;

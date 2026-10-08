@@ -349,27 +349,35 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 
 ### 8.1 MySQL（一期单库，schema 预留分片）
 
+下表同时保留目标态并标注当前边界；实际可迁移 schema 以 `packages/store/migrations/` 为准，当前完成度以 `docs/PROGRESS.md` 最后一节为准。M3 表与 events 外部归档仍只是目标设计，不能据此视为已实现。
+
 | 表 | 关键列 | 说明 |
 |---|---|---|
-| `tenants` / `api_keys` / `users` | | 鉴权 |
-| `agents` / `agent_versions` | `(tenant_id, agent_id, version)` | 定义快照，不可变 |
-| `sessions` | `session_id PK, tenant_id, user_id(分片键), agent_id, agent_version, status, fence_token, next_seq, last_compaction_seq, title, parent_session_id, archived_at` | 投影 |
-| `turns` | `turn_id PK, session_id, seq_start, seq_end, status, stop_reason, model, provider, usage(JSON), metadata(JSON), started_at_ms, completed_at_ms` | turn 完整资源保存在 `body` JSON |
-| `items` | `item_id PK(UUIDv7), session_id, turn_id, seq, type, status, payload(JSON), output_ref(blob id)` | 完整消息历史；不保存物理对象 locator |
-| `events` | `(session_id, seq) PK, type, payload(JSON), emitted_at_ms` | 里程碑事件，`>90 天` 分区归档到 OSS |
-| `approvals` | `approval_id PK, session_id, turn_id, item_id, status, decision, expires_at, payload` | 一等资源 |
-| `provider_configs` | `(tenant_id, provider_id)`, `api_key_ciphertext, kms_key_id` | BYOK |
-| `mcp_servers` / `skills` / `skill_versions` | scope ∈ platform/tenant/user | |
-| `usage_ledger` | tenant/user/session/turn/step + tokens/cache/cost；`UNIQUE(session_id, turn_id, step)` | 每个最终 step 恰好一条，计费归因 |
-| `idempotency_keys` | `(tenant_id, user_id, session_id, key) PK, request_hash, response_ref, expires_at` | 新版只写 completed receipt；升级期可暂存 legacy pending |
+| `tenants` / `api_keys` | | 当前鉴权真相；user identity 来自受信调用方或端用户 token，目前没有独立 `users` 表 |
+| `agent_versions` | `(tenant_id, agent_id, version)` | 当前定义快照，不可变；没有单独 `agents` row |
+| `sessions` | `session_id PK, tenant_id, user_id(分片键), agent_id, agent_version, status, fence_token, last_seq, last_compaction_seq, parent_session_id, archived_at_ms, deleted_at_ms, deletion_generation` | 当前投影与 lifecycle marker |
+| `turns` | `turn_id PK, session_id, seq_start, seq_end, status, stop_reason, body(JSON), started_at_ms, completed_at_ms` | turn 完整资源保存在 `body` JSON |
+| `items` | `item_id PK, session_id, turn_id, seq, type, status, body(JSON)` | 完整消息历史；Blob 引用是 body 中的 opaque id，不保存物理 locator |
+| `events` | `(session_id, seq) PK, type, body(JSON), emitted_at_ms` | 当前 durable 里程碑事件；分区/外部归档仍是目标态 |
+| `approvals` | `approval_id PK, session_id, turn_id, status, body(JSON), expires_at_ms` | 一等资源 |
+| `provider_configs` | `(tenant_id, provider_id), config(JSON), secret_cipher, secret_key_id` | 当前 BYOK 加密信封 |
+| `mcp_servers` / `skills` / `skill_versions` | scope ∈ platform/tenant/user | M3 目标态，尚未建表 |
+| `usage_ledger` | nullable opaque `usage_id` + tenant/user/session/turn/step + usage JSON；`UNIQUE(session_id, turn_id, step)` | operational 归因；legacy row 可暂时没有 `usage_id` |
+| `billing_usage_facts` | `usage_id PK, tenant_id, accounting_period, provider/model, token columns, nullable cost, checksum` | 当前最小财务事实；不含 user/session/turn/step/raw JSON |
+| `usage_reconciliations` | owner/session/generation + totals/checksum/status | 当前核对/匿名化 operational 证明，最终 subject purge 尚未实现 |
+| `idempotency_keys` | `(tenant_id, user_id, session_id, idem_key) PK, request_hash, value, expires_at_ms` | 新版只写 completed receipt；升级期可暂存 legacy pending |
+| `subject_lifecycle` / `erasure_requests` / `erasure_audit_events` | tenant + subject + generation/request/status/audit | 当前 user erasure durable gate；worker、tenant erasure 与 completed proof 尚未实现 |
+| `lifecycle_outbox` | topic + aggregate + generation + claim token/lease | 当前可靠投递 `session.tombstoned`；`session.purge` intent 默认不可领取 |
 | `blob_objects` | `blob_id PK, tenant_id, user_id, session_id, item_id, purpose, storage locator, state, integrity descriptor` | ownership manifest；`staging → ready → delete_pending → deleted` |
 | `blob_delete_outbox` | `(blob_id, generation) UNIQUE, available_at_ms, claim token/lease, attempts, completion/dead-letter` | 独立的 at-least-once 物理删除队列 |
 
 创建路径：`SessionStore.createSession` 必须在一个原子操作中写入 session 与 `session/created(seq=1)`；MemoryStore 在发布状态前完成整个写集的 staging，MySQLStore 在同一 InnoDB 事务中插入两行。失败不得暴露孤立 session、事件空洞或部分游标。
 
-后续写路径：`SessionStore.commit` 锁定 session 行，校验 fence（长操作再校验 `expectedLastSeq`），把 `events`、`items`、turn/approval、usage ledger、幂等 receipt 与 session 投影放进同一个 MySQL 事务；提交后才向 Redis 扇出。session/turn usage 是该单写者事务内的绝对聚合投影，ledger 是不可重复的明细真相。
+后续写路径：`SessionStore.commit` 锁定 session 行，再检查 tenant/user subject gate 与 fence（长操作再校验 `expectedLastSeq`），把 `events`、`items`、turn/approval、operational usage ledger、对应 billing fact、幂等 receipt 与 session 投影放进同一个 MySQL 事务；提交后才向 Redis 扇出。session/turn usage 是该单写者事务内的绝对聚合投影，operational ledger 是可归因明细，最小 billing fact 是未来删除内容身份后保留的财务层。
 
 滚动升级兼容：迁移保留旧版 runner 写入的 legacy pending receipt；新版命中 pending 时返回 `409 idempotency_conflict`，不得接管或替换，以免旧 runner 随后执行 delayed complete 覆写新版结果。运维上必须先排空并下线全部旧 runner，确认不存在旧进程后，才可清理已过期 pending。新版自身不再创建 pending，只原子写入 completed receipt。
+
+user erasure 的 durable gate 属于不可撤销 admission。router 只有在 writer gate 开启、`RUNNERS` 中每个 configured target 都已通过健康探测并明确声明 `dataErasureRequests`、且本次 selected target 仍满足能力时才接受 POST；暂时不可达的已配置 target 不会被健康子集过滤掉后误判为已排空。writer gate 开启期间，session/usage 等 user-scoped runtime 也会在每次转发前拒绝能力已回退的 selected target；gate 关闭的 expand mixed window 不受此限制。status GET 不依赖 writer gate，仍按健康 fleet 与 selected target capability fail-closed。首次接受 gate 后不得恢复 lifecycle-unaware writer；需要回滚时只能 forward-fix，或先在 edge 阻断相关 user-scoped 流量。
 
 ### 8.2 Redis 键
 

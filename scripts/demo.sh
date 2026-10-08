@@ -29,7 +29,7 @@ say "0. 前置检查"
 if ! curl -fsS "$BASE/readyz" >/dev/null 2>&1; then
   bad "服务未在 $BASE ready。请在另一个终端执行："
   echo "      STORE=mysql REDIS_URL=redis://127.0.0.1:6379 pnpm dev:runner"
-  echo "   （纯内存模式：pnpm dev:runner）"
+  echo "   （纯内存模式：STORE=memory REDIS_URL= pnpm dev:runner）"
   exit 1
 fi
 ok "服务就绪：$(curl -fsS "$BASE/readyz")"

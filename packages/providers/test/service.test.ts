@@ -24,6 +24,7 @@ describe("ProviderService", () => {
     expect(await r.apiKey()).toBe("sk-secret");
     expect(r.provider).toBe("t_a:mine");
     expect(r.input).toEqual(["text"]);
+    expect(r.priceKnown).toBe(true);
     expect((r.handle as { cost: { input: number } }).cost.input).toBe(1);
 
     // another tenant cannot see it and falls through to platform presets only
@@ -58,7 +59,7 @@ describe("ProviderService", () => {
 
     const principal = { tenantId: "t_modalities", userId: "u" };
     await expect(svc.resolve(principal, { provider: "modalities", model: "text-only" }))
-      .resolves.toMatchObject({ input: ["text"] });
+      .resolves.toMatchObject({ input: ["text"], priceKnown: false });
     await expect(svc.resolve(principal, { provider: "modalities", model: "vision" }))
       .resolves.toMatchObject({ input: ["text", "image"] });
   });

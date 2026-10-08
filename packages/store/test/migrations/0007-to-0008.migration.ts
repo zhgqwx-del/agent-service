@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -8,7 +9,9 @@ import { MysqlSessionStore } from "../../src/index.js";
 
 const DEFAULT_MYSQL_URL = "mysql://root@127.0.0.1:3306/agent_service_test";
 const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_URL ?? DEFAULT_MYSQL_URL;
-const FIXTURE_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "../fixtures/mysql-0007.sql");
+const HERE = dirname(fileURLToPath(import.meta.url));
+const FIXTURE_PATH = resolve(HERE, "../fixtures/mysql-0007.sql");
+const MIGRATION_0008 = resolve(HERE, "../../migrations/0008_atomic_turn_writes.sql");
 
 type Row = RowDataPacket;
 
@@ -65,15 +68,19 @@ describe("real MySQL historical upgrade: 0007 -> 0008", () => {
   let admin: Connection;
   let baseUrl: URL;
   let fixtureSql: string;
+  let only0008: string;
 
   beforeAll(async () => {
     baseUrl = assertDisposableMigrationTarget(BASE_URL);
     fixtureSql = await readFile(FIXTURE_PATH, "utf8");
+    only0008 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0008-"));
+    await copyFile(MIGRATION_0008, join(only0008, "0008_atomic_turn_writes.sql"));
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 
   afterAll(async () => {
     await admin?.end();
+    await rm(only0008, { recursive: true, force: true });
   });
 
   async function withHistoricalDatabase(run: (url: string, conn: Connection) => Promise<void>): Promise<void> {
@@ -99,7 +106,7 @@ describe("real MySQL historical upgrade: 0007 -> 0008", () => {
   async function expectUsageIdentityConflict(url: string): Promise<void> {
     let failure: unknown;
     try {
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
+      const store = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0008 });
       await store.close();
     } catch (error) {
       failure = error;
@@ -130,7 +137,7 @@ describe("real MySQL historical upgrade: 0007 -> 0008", () => {
          VALUES ('t1', 'u1', 'sess_same', 'legacy-pending', NULL, 1)`,
       );
 
-      const store = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
+      const store = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0008 });
       await store.close();
 
       const [usageRows] = await conn.query<Row[]>(
@@ -242,7 +249,7 @@ describe("real MySQL historical upgrade: 0007 -> 0008", () => {
              OR (session_id = 'sess_attribution' AND turn_id = 'turn_attribution' AND step = 3
                  AND tenant_id = 't2' AND user_id = 'u2')`,
       );
-      const recovered = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
+      const recovered = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0008 });
       await recovered.close();
       expect(await hasIndex(conn, "usage_ledger", "uk_usage_session_turn_step")).toBe(true);
       const [recoveryState] = await conn.query<Row[]>(

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -77,6 +78,7 @@ describe("real MySQL historical upgrade: 0009 -> 0010", () => {
   let baseUrl: URL;
   let fixtureSql: string;
   let migrationStatements: string[];
+  let only0010: string;
 
   beforeAll(async () => {
     baseUrl = assertDisposableMigrationTarget(BASE_URL);
@@ -88,11 +90,14 @@ describe("real MySQL historical upgrade: 0009 -> 0010", () => {
       .map((statement) => statement.trim())
       .filter(Boolean);
     expect(migrationStatements).toHaveLength(2);
+    only0010 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0010-"));
+    await copyFile(MIGRATION_PATH, join(only0010, "0010_blob_ownership.sql"));
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 
   afterAll(async () => {
     await admin?.end();
+    await rm(only0010, { recursive: true, force: true });
   });
 
   it("restarts safely after only the first 0010 table auto-commits", async () => {
@@ -133,7 +138,7 @@ describe("real MySQL historical upgrade: 0009 -> 0010", () => {
         applied: Number(beforeRestart[0]?.applied),
       }).toEqual({ manifestTables: 1, outboxTables: 0, applied: 0 });
 
-      const restarted = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
+      const restarted = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0010 });
       await restarted.close();
 
       const [afterRestart] = await conn.query<Row[]>(
@@ -195,7 +200,7 @@ describe("real MySQL historical upgrade: 0009 -> 0010", () => {
       );
       expect(Number(beforeTables[0]?.count)).toBe(0);
 
-      const upgraded = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
+      const upgraded = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0010 });
       await upgraded.close();
 
       expect(await tableColumns(conn, "blob_objects")).toEqual([
@@ -347,7 +352,7 @@ describe("real MySQL historical upgrade: 0009 -> 0010", () => {
       // Model a process dying after both CREATE TABLE statements auto-committed but before the
       // schema_migrations marker was durable. Replaying must preserve all manifest and queue rows.
       await conn.query("DELETE FROM schema_migrations WHERE name='0010_blob_ownership.sql'");
-      const retried = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
+      const retried = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0010 });
       await retried.close();
       const [replayed] = await conn.query<Row[]>(
         `SELECT

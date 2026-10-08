@@ -144,6 +144,7 @@ export class ProviderService implements ProviderResolver {
       model: spec.id,
       contextWindow: spec.contextWindow,
       input: spec.input,
+      priceKnown: spec.price !== undefined,
       apiKey,
       headers: Object.keys(config.headers).length ? config.headers : undefined,
       fetch: this.opts.fetch,

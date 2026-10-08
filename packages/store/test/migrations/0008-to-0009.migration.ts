@@ -12,6 +12,7 @@ const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = resolve(HERE, "../fixtures/mysql-0007.sql");
 const MIGRATION_0008 = resolve(HERE, "../../migrations/0008_atomic_turn_writes.sql");
+const MIGRATION_0009 = resolve(HERE, "../../migrations/0009_session_tombstone_outbox.sql");
 
 type Row = RowDataPacket;
 
@@ -73,7 +74,9 @@ describe("real MySQL historical upgrade: 0008 -> 0009", () => {
     const database = `agent_service_migration_test_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
     if (!/^agent_service_migration_test_[a-zA-Z0-9_]+$/.test(database)) throw new Error("unsafe generated fixture database name");
     const only0008 = await mkdtemp(join(tmpdir(), "agent-service-migration-0008-"));
+    const only0009 = await mkdtemp(join(tmpdir(), "agent-service-migration-0009-"));
     await copyFile(MIGRATION_0008, join(only0008, "0008_atomic_turn_writes.sql"));
+    await copyFile(MIGRATION_0009, join(only0009, "0009_session_tombstone_outbox.sql"));
 
     await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
     const url = databaseUrl(baseUrl, database);
@@ -107,7 +110,7 @@ describe("real MySQL historical upgrade: 0008 -> 0009", () => {
       );
       expect(Number(beforeColumns[0]?.count)).toBe(0);
 
-      const upgraded = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
+      const upgraded = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0009 });
       await upgraded.close();
 
       const [sessions] = await conn.query<Row[]>(
@@ -153,7 +156,7 @@ describe("real MySQL historical upgrade: 0008 -> 0009", () => {
              (completed_at_ms, dead_lettered_at_ms, available_at_ms, lease_until_ms, outbox_id)`,
       );
       await conn.query("DELETE FROM schema_migrations WHERE name='0009_session_tombstone_outbox.sql'");
-      const retried = await MysqlSessionStore.connect({ url, connectionLimit: 1 });
+      const retried = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0009 });
       await retried.close();
       const [retriedState] = await conn.query<Row[]>(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE name='0009_session_tombstone_outbox.sql'",
@@ -172,6 +175,7 @@ describe("real MySQL historical upgrade: 0008 -> 0009", () => {
       await conn?.end().catch(() => {});
       await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
       await rm(only0008, { recursive: true, force: true });
+      await rm(only0009, { recursive: true, force: true });
     }
   });
 });

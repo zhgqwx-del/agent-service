@@ -152,6 +152,28 @@ export class RunnerRegistry {
     return !!target?.healthy && target.capabilities?.features.blobAttachments === true;
   }
 
+  allHealthySupportDataErasureRequests(): boolean {
+    const healthy = this.list().filter((target) => target.healthy);
+    return healthy.length > 0 && healthy.every((target) => target.capabilities?.features.dataErasureRequests === true);
+  }
+
+  /**
+   * Erasure admission is irreversible: an unavailable legacy writer cannot be ignored merely
+   * because it is absent from the currently healthy subset. Require every configured destination
+   * to have completed a healthy capability probe before the router may accept the first gate.
+   */
+  allConfiguredSupportDataErasureRequests(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy && target.capabilities?.features.dataErasureRequests === true
+    ));
+  }
+
+  supportsDataErasureRequests(url: string): boolean {
+    const target = this.targets.get(url.replace(/\/+$/, ""));
+    return !!target?.healthy && target.capabilities?.features.dataErasureRequests === true;
+  }
+
   /**
    * A runner address as reported by `X-Owner` (host:port) mapped back onto a configured target.
    * Matching on the port alone as a fallback covers the common misconfiguration where a runner advertises

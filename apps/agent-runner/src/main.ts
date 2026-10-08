@@ -23,6 +23,7 @@ import {
   type EventBus,
   type LeaseStore,
   type LifecycleOutboxStore,
+  type SubjectLifecycleStore,
   type SessionStore,
 } from "@agent-service/store";
 import { createApp } from "./app.js";
@@ -31,7 +32,7 @@ import { loadConfig } from "./config.js";
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
-  const store: SessionStore & LifecycleOutboxStore & BlobManifestStore & BlobCleanupStore = cfg.STORE === "mysql"
+  const store: SessionStore & LifecycleOutboxStore & BlobManifestStore & BlobCleanupStore & SubjectLifecycleStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({ url: cfg.MYSQL_URL })
     : new MemorySessionStore();
   const lease: LeaseStore = cfg.REDIS_URL ? new RedisLeaseStore(cfg.REDIS_URL) : new MemoryLeaseStore();
@@ -113,6 +114,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     heartbeatMs: cfg.SSE_HEARTBEAT_MS,
     maxBodyBytes: cfg.MAX_BODY_BYTES,
     blobAttachmentsEnabled: cfg.BLOB_ATTACHMENTS_ENABLED,
+    erasureRequestsEnabled: cfg.DATA_ERASURE_REQUESTS_ENABLED,
+    subjectLifecycle: store,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
     ready: () => ready,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
@@ -163,7 +166,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),

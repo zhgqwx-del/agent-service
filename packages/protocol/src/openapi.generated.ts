@@ -773,6 +773,10 @@ export const OPENAPI_DOCUMENT = {
               "byok": {
                 "type": "boolean"
               },
+              "dataErasureRequests": {
+                "default": false,
+                "type": "boolean"
+              },
               "dynamicTools": {
                 "type": "boolean"
               },
@@ -1010,6 +1014,59 @@ export const OPENAPI_DOCUMENT = {
         ],
         "type": "object"
       },
+      "ErasureRequest": {
+        "properties": {
+          "createdAtMs": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "exclusiveMinimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^erase_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "user"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "gated",
+              "draining",
+              "tombstoning",
+              "reconciling_usage",
+              "awaiting_purge_policy",
+              "purging",
+              "blocked",
+              "completed"
+            ],
+            "type": "string"
+          },
+          "updatedAtMs": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "userId": {
+            "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "userId",
+          "generation",
+          "status",
+          "createdAtMs",
+          "updatedAtMs"
+        ],
+        "type": "object"
+      },
       "ErrorBody": {
         "properties": {
           "error": {
@@ -1023,6 +1080,7 @@ export const OPENAPI_DOCUMENT = {
                   "session_busy",
                   "session_archived",
                   "session_has_children",
+                  "subject_deleting",
                   "session_lease_conflict",
                   "idempotency_conflict",
                   "provider_error",
@@ -8190,6 +8248,242 @@ export const OPENAPI_DOCUMENT = {
         ]
       }
     },
+    "/v1/data-erasure-requests": {
+      "post": {
+        "description": "Admin-only and capability-gated. Atomically blocks new user-owned writes and creates an auditable request; it does not claim physical purge is complete.",
+        "operationId": "requestUserErasure",
+        "parameters": [
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasureRequest"
+                }
+              }
+            },
+            "description": "Existing or newly accepted user erasure request.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Gate a user's data for asynchronous erasure",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
+    "/v1/data-erasure-requests/{requestId}": {
+      "get": {
+        "operationId": "getUserErasureRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "requestId",
+            "required": true,
+            "schema": {
+              "pattern": "^erase_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "User asserted by a trusted tenant backend.",
+            "in": "header",
+            "name": "x-user-id",
+            "required": false,
+            "schema": {
+              "description": "User asserted by a trusted tenant backend.",
+              "pattern": "^[A-Za-z0-9._:@|-]{1,128}$",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+            "in": "header",
+            "name": "x-end-user-token",
+            "required": false,
+            "schema": {
+              "description": "Default end-user token header. A tenant may configure a different header name in its auth policy.",
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasureRequest"
+                }
+              }
+            },
+            "description": "Erasure request status.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this user-owned lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read an owned user erasure request",
+        "tags": [
+          "Data lifecycle"
+        ],
+        "x-required-api-key-scopes": [
+          "admin"
+        ]
+      }
+    },
     "/v1/models": {
       "get": {
         "operationId": "listModels",
@@ -10696,6 +10990,9 @@ export const OPENAPI_DOCUMENT = {
     },
     {
       "name": "Turns"
+    },
+    {
+      "name": "Data lifecycle"
     },
     {
       "name": "Usage"

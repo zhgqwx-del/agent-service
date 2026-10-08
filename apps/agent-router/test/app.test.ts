@@ -70,6 +70,9 @@ function fakeRegistry(
     targetTombstone?: boolean;
     blobs?: boolean;
     targetBlobs?: boolean;
+    erasure?: boolean;
+    configuredErasure?: boolean;
+    targetErasure?: boolean | (() => boolean);
   } = {},
 ): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
@@ -86,6 +89,13 @@ function fakeRegistry(
     supportsLifecycle: () => opts.targetTombstone ?? opts.tombstone ?? true,
     allHealthySupportBlobAttachments: () => opts.blobs ?? true,
     supportsBlobAttachments: () => opts.targetBlobs ?? opts.blobs ?? true,
+    allHealthySupportDataErasureRequests: () => opts.erasure ?? true,
+    allConfiguredSupportDataErasureRequests: () => opts.configuredErasure ?? opts.erasure ?? true,
+    supportsDataErasureRequests: () => (
+      typeof opts.targetErasure === "function"
+        ? opts.targetErasure()
+        : opts.targetErasure ?? opts.erasure ?? true
+    ),
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
     routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
@@ -97,6 +107,11 @@ function fakeRegistry(
 }
 
 const silent = { info: () => {}, warn: () => {}, error: () => {} };
+
+function expectPrivateLifecycleResponse(response: Response): void {
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+}
 
 describe("session routing", () => {
   it("sends a session request to the runner the directory names as owner", async () => {
@@ -238,9 +253,168 @@ describe("request and response handling", () => {
     expect(response.status).toBe(400);
     expect(a.requests).toHaveLength(0);
   });
+
+  it("gates erasure requests on both deployment and every selected runner capability", async () => {
+    const a = await upstream(() => ({
+      status: 202,
+      headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+      body: '{"status":"gated"}',
+    }));
+    const request = { method: "POST", headers: { "idempotency-key": "erase-1" } } as const;
+
+    const disabled = createRouterApp({ registry: fakeRegistry([a.url], { erasure: true }), logger: silent });
+    const disabledResponse = await disabled.request("/v1/data-erasure-requests", request);
+    expect(disabledResponse.status).toBe(503);
+    expectPrivateLifecycleResponse(disabledResponse);
+    const mixed = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: false }),
+      erasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    const mixedResponse = await mixed.request("/v1/data-erasure-requests", request);
+    expect(mixedResponse.status).toBe(503);
+    expectPrivateLifecycleResponse(mixedResponse);
+    const unavailableConfiguredTarget = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true, configuredErasure: false }),
+      erasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    const unavailableResponse = await unavailableConfiguredTarget.request("/v1/data-erasure-requests", request);
+    expect(unavailableResponse.status).toBe(503);
+    expectPrivateLifecycleResponse(unavailableResponse);
+    const staleTarget = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true, targetErasure: false }),
+      erasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    const staleTargetResponse = await staleTarget.request("/v1/data-erasure-requests", request);
+    expect(staleTargetResponse.status).toBe(503);
+    expectPrivateLifecycleResponse(staleTargetResponse);
+
+    const enabled = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true }),
+      erasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    const enabledResponse = await enabled.request("/v1/data-erasure-requests", request);
+    expect(enabledResponse.status).toBe(202);
+    expectPrivateLifecycleResponse(enabledResponse);
+    // Status remains readable after the write gate is turned off, but only when every healthy
+    // runner and the selected target still implement the additive contract.
+    const readableStatus = await disabled.request(
+      "/v1/data-erasure-requests/erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+    );
+    expect(readableStatus.status).toBe(202);
+    expectPrivateLifecycleResponse(readableStatus);
+    const mixedStatus = await mixed.request(
+      "/v1/data-erasure-requests/erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+    );
+    expect(mixedStatus.status).toBe(503);
+    expectPrivateLifecycleResponse(mixedStatus);
+    const staleStatus = await staleTarget.request(
+      "/v1/data-erasure-requests/erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+    );
+    expect(staleStatus.status).toBe(503);
+    expectPrivateLifecycleResponse(staleStatus);
+    expect(a.requests).toHaveLength(2);
+  });
+
+  it("keeps an owner-hiding erasure status 404 private while proxying it", async () => {
+    const a = await upstream(() => ({
+      status: 404,
+      headers: {
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+        "x-test-upstream": "preserved",
+      },
+      body: '{"error":{"code":"not_found","message":"erasure request not found"}}',
+    }));
+    const app = createRouterApp({ registry: fakeRegistry([a.url], { erasure: true }), logger: silent });
+
+    const response = await app.request(
+      "/v1/data-erasure-requests/erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+    );
+
+    expect(response.status).toBe(404);
+    expectPrivateLifecycleResponse(response);
+    expect(response.headers.get("x-test-upstream")).toBe("preserved");
+  });
+
+  it("stops user-scoped runtime from reaching a target whose erasure capability regressed", async () => {
+    let targetCapable = true;
+    const a = await upstream(() => ({ body: '{"ok":true}' }));
+    const app = createRouterApp({
+      registry: fakeRegistry([a.url], {
+        erasure: true,
+        configuredErasure: true,
+        targetErasure: () => targetCapable,
+      }),
+      erasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+
+    expect((await app.request("/v1/sessions")).status).toBe(200);
+    targetCapable = false;
+    for (const path of [
+      "/v1/sessions",
+      `/v1/sessions/${SID}`,
+      "/v1/usage",
+      "/v1/data-erasure-requests/erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+    ]) {
+      const response = await app.request(path);
+      expect(response.status).toBe(503);
+      expect((await response.json()) as object).toMatchObject({
+        error: { code: "draining", retryable: true },
+      });
+    }
+    expect(a.requests).toHaveLength(1);
+
+    // Tenant-scoped administration is outside the user erasure gate and remains routable.
+    expect((await app.request("/v1/agents")).status).toBe(200);
+    expect(a.requests).toHaveLength(2);
+  });
+
+  it("keeps the mixed-fleet expand window open while the erasure writer gate is off", async () => {
+    const a = await upstream(() => ({ body: '{"ok":true}' }));
+    const app = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: false, targetErasure: false }),
+      erasureRequestsEnabled: () => false,
+      logger: silent,
+    });
+
+    expect((await app.request("/v1/sessions")).status).toBe(200);
+    expect((await app.request(`/v1/sessions/${SID}`)).status).toBe(200);
+    expect((await app.request("/v1/usage")).status).toBe(200);
+    expect(a.requests).toHaveLength(3);
+  });
 });
 
 describe("failure handling", () => {
+  it("retries only an idempotency-keyed erasure request after a transport failure", async () => {
+    const dead = "http://127.0.0.1:1";
+    const alive = await upstream(() => ({ status: 202, body: '{"status":"gated"}' }));
+    const noRetry = createRouterApp({
+      registry: fakeRegistry([dead, alive.url], { erasure: true }),
+      erasureRequestsEnabled: () => true,
+      maxAttempts: 2,
+      logger: silent,
+    });
+    expect((await noRetry.request("/v1/data-erasure-requests", { method: "POST" })).status).toBe(502);
+    expect(alive.requests).toHaveLength(0);
+
+    const retrying = createRouterApp({
+      registry: fakeRegistry([dead, alive.url], { erasure: true }),
+      erasureRequestsEnabled: () => true,
+      maxAttempts: 2,
+      logger: silent,
+    });
+    expect((await retrying.request("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { "idempotency-key": "erase-transport-1" },
+    })).status).toBe(202);
+    expect(alive.requests).toHaveLength(1);
+  });
+
   it("only retries the idempotent turn POST after a transport failure", async () => {
     const dead = "http://127.0.0.1:1";
     const alive = await upstream(() => ({ body: '{"ok":true}' }));
@@ -440,20 +614,59 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone"], blobAttachments: true, dataErasureRequests: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
       registry: fakeRegistry([a.url], { blobs: true }),
       tombstoneEnabled: () => true,
       blobAttachmentsEnabled: () => true,
+      erasureRequestsEnabled: () => true,
       internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
-    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean } };
+    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
     expect(caps.features.sessionLifecycle).toEqual(["archive", "unarchive", "tombstone"]);
     expect(caps.features.blobAttachments).toBe(true);
+    expect(caps.features.dataErasureRequests).toBe(true);
+  });
+
+  it("withholds the erasure capability until the deployment gate and whole healthy fleet agree", async () => {
+    const runnerCapabilities = JSON.stringify({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive"],
+        blobAttachments: false,
+        dataErasureRequests: true,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    const a = await upstream(() => ({ body: runnerCapabilities }));
+    const gateOff = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: true }),
+      logger: silent,
+    });
+    expect(await (await gateOff.request("/v1/capabilities")).json()).toMatchObject({
+      features: { dataErasureRequests: false },
+    });
+
+    const mixedFleet = createRouterApp({
+      registry: fakeRegistry([a.url], { erasure: false }),
+      erasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    expect(await (await mixedFleet.request("/v1/capabilities")).json()).toMatchObject({
+      features: { dataErasureRequests: false },
+    });
   });
 
   it("withholds tombstone and rejects DELETE until every healthy runner supports it", async () => {

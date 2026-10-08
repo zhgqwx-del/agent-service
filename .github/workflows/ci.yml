@@ -91,10 +91,24 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:outbox-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 and 0009 baselines
-      # are frozen SQL snapshots; 0008 is materialized from frozen 0007 through the production runner.
+      # Usage reconciliation is a financial/content separation boundary. Keep explicit no-skip
+      # evidence for transactional dual-write, conflict rollback, legal hold and anonymization.
+      - name: Usage lifecycle real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:usage-lifecycle-mysql
+
+      # The subject gate is the linearization point for erasure versus new runtime writes. This
+      # named runner parses the JSON report and fails if the dedicated real-MySQL suite did not run.
+      - name: Subject lifecycle real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:subject-lifecycle-mysql
+
+      # These are historical-database upgrades, not fresh-schema tests. The 0007, 0009 and 0010
+      # baselines are frozen SQL snapshots; 0008 is materialized from frozen 0007 through the runner.
       # The command has no skip path and must visibly execute every upgrade fixture.
-      - name: Historical MySQL migrations (0007 through 0010)
+      - name: Historical MySQL migrations (0007 through 0011)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -191,7 +205,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0010_blob_ownership.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0011_erasure_and_usage_separation.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

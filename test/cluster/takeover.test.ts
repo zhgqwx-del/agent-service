@@ -20,7 +20,10 @@ async function newSession(base: string, opts: { maxSteps?: number } = {}) {
     method: "POST",
     body: JSON.stringify({
       name: "cluster", instructions: "be brief",
-      model: { provider: "deepseek", model: "fake-model" },
+      // Use a priced preset model even though the endpoint is the local fake vendor. The cluster
+      // suite exercises lease/drain semantics; an ad-hoc unpriced DEFAULT_MODEL would intentionally
+      // trip the runtime's maxCostCNY fail-closed gate after the first provider step.
+      model: { provider: "deepseek", model: "deepseek-chat" },
       tools: [], limits: { maxSteps: opts.maxSteps ?? 4 },
     }),
   });

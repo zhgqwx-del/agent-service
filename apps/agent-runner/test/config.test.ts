@@ -21,8 +21,14 @@ describe("runner configuration", () => {
     expect(cfg.BLOB_FILESYSTEM_SINGLE_RUNNER).toBe(false);
     expect(cfg.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
+    expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.BLOB_MAX_BYTES).toBe(1_000_000);
     expect(cfg.BLOB_MAX_HYDRATED_BYTES).toBe(4_000_000);
+  });
+
+  it("keeps subject erasure requests behind an explicit boolean gate", () => {
+    expect(loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_ERASURE_REQUESTS_ENABLED: "1" }).DATA_ERASURE_REQUESTS_ENABLED).toBe(true);
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, DATA_ERASURE_REQUESTS_ENABLED: "true" })).toThrow();
   });
 
   it("validates lifecycle outbox worker bounds", () => {

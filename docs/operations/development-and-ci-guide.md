@@ -12,14 +12,14 @@
 | --- | --- | --- | --- |
 | `agent-router` | `http://127.0.0.1:8080` | 是 | 对外入口、runner 发现、session owner 路由、SSE 透传和一次安全重路由 |
 | `agent-runner` | `http://127.0.0.1:8787` | 是 | 鉴权、Agent Runtime API、模型执行、session/turn/item/event/approval 与 Blob 生命周期 |
-| MySQL | `127.0.0.1:3306` | 是，外部基础设施 | 业务真相、持久事件、配置、usage ledger、Blob ownership manifest/outbox |
+| MySQL | `127.0.0.1:3306` | 是，外部基础设施 | 业务真相、持久事件、配置、operational/billing usage、subject lifecycle、Blob manifest/outbox |
 | Redis | `127.0.0.1:6379` | 是，外部基础设施 | 租约、fence、owner 目录和事件热扇出 |
 | `packages/sdk` | — | 否 | 供客户端使用的 TypeScript SDK |
 | `protocol/core/store/providers/testkit` | — | 否 | 被 runner/router 或测试加载的内部代码库 |
 
 正式客户端应访问 router 的 `8080`。runner 的 `8787` 用于开发诊断和对照，不应当成为生产环境的公网入口。
 
-当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive v2、fenced tombstone、reliable terminal-event outbox dispatcher、Blob ownership manifest、输入图片上传/原子绑定、大工具输出卸载和 stale staging 清理。terminal-event dispatcher 与 Blob cleanup worker 都是 runner 内部工作循环，不是第三个应用服务或镜像。erasure/export、usage 对账匿名化、legacy generation `0` 补偿和默认关闭的 ready/session 物理 purge 尚未完成，因此不能把 M1 数据生命周期描述为完整闭环。M3 的 MCP/skills/hooks 和 M4 的生产化能力会在实现后加入本文；尚未实现的模块不会因为出现在设计文档中就成为可启动服务。
+当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive v2、fenced tombstone、reliable terminal-event outbox dispatcher、Blob ownership/业务接线、默认关闭的 user erasure durable gate/request/status，以及 usage operational/billing 双写、legacy reconcile 和显式 anonymize primitive。terminal-event dispatcher 与 Blob cleanup worker 都是 runner 内部工作循环，不是第三个应用服务或镜像；erasure 状态推进和 usage anonymize 也尚无常驻 worker。异步 export artifact/TTL、erasure worker、tenant erasure/key revocation、legacy generation `0` 补偿和默认关闭的 ready/session 物理 purge 尚未完成，因此不能把 M1 数据生命周期描述为完整闭环。M3 的 MCP/skills/hooks 和 M4 的生产化能力会在实现后加入本文；尚未实现的模块不会因为出现在设计文档中就成为可启动服务。
 
 ## 2. 一次性准备
 
@@ -53,7 +53,7 @@ test -f .env || cp .env.example .env
 - 使用 `openssl rand -hex 32` 生成独立的 `SECRETS_MASTER_KEY`；
 - `.env` 不得提交，也不得把密钥复制到命令日志、文档或问题报告中。
 
-`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前 `RUNNER_PORT`、`ROUTER_PORT`、`RUNNER_ID`、`RUNNER_ADDR`、`RUNNERS`、`REDIS_URL`、`SESSION_TOMBSTONE_ENABLED`、`BLOB_DIR`、`BLOB_FILESYSTEM_SINGLE_RUNNER`、`BLOB_CLEANUP_ENABLED`、`BLOB_ATTACHMENTS_ENABLED` 和 `BLOB_MAX_BYTES` 保证显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。
+`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前 `RUNNER_PORT`、`ROUTER_PORT`、`RUNNER_ID`、`RUNNER_ADDR`、`RUNNERS`、`REDIS_URL`、`SESSION_TOMBSTONE_ENABLED`、`DATA_ERASURE_REQUESTS_ENABLED`、`BLOB_DIR`、`BLOB_FILESYSTEM_SINGLE_RUNNER`、`BLOB_CLEANUP_ENABLED`、`BLOB_ATTACHMENTS_ENABLED` 和 `BLOB_MAX_BYTES` 保证显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。
 
 ## 3. 启动与停止完整本地栈
 
@@ -69,7 +69,16 @@ scripts/local-service.sh smoke
 2. 从 TypeScript 源码启动一个 runner；
 3. 从 TypeScript 源码启动一个 router，并等待其发现健康 runner。
 
-runner 启动后会同时启动 lifecycle outbox dispatcher 和 Blob cleanup worker；停止时先 drain session，再等待两个 worker 的当前 pass 结束。`.env.example` 与本地脚本将 `SESSION_TOMBSTONE_ENABLED=1`、`BLOB_FILESYSTEM_SINGLE_RUNNER=1`、`BLOB_CLEANUP_ENABLED=1`、`BLOB_ATTACHMENTS_ENABLED=1`，方便在单 router + 单 runner 拓扑完整体验已实现能力。Blob 原始对象默认写入这个 runner 独占的 `.local-run/blobs`；`BLOB_FILESYSTEM_SINGLE_RUNNER=1` 是对这一拓扑约束的显式确认，不是分布式锁，router 还会要求 `RUNNERS` 去重后恰好只有一个地址。当前实现没有验证或承诺多 runner 共享 filesystem root，更不能把它当成跨 VM/Pod 数据面。
+runner 启动后会同时启动 lifecycle outbox dispatcher 和 Blob cleanup worker；停止时先 drain session，再等待两个 worker 的当前 pass 结束。`.env.example` 与本地脚本将 `SESSION_TOMBSTONE_ENABLED=1`、`BLOB_FILESYSTEM_SINGLE_RUNNER=1`、`BLOB_CLEANUP_ENABLED=1`、`BLOB_ATTACHMENTS_ENABLED=1`，方便在单 router + 单 runner 拓扑体验这些已激活能力；`DATA_ERASURE_REQUESTS_ENABLED` 刻意保持默认 `0`，避免普通启动意外把一个本地 user 永久置为 deleting。Blob 原始对象默认写入这个 runner 独占的 `.local-run/blobs`；`BLOB_FILESYSTEM_SINGLE_RUNNER=1` 是对这一拓扑约束的显式确认，不是分布式锁，router 还会要求 `RUNNERS` 去重后恰好只有一个地址。当前实现没有验证或承诺多 runner 共享 filesystem root，更不能把它当成跨 VM/Pod 数据面。
+
+要专门体验当前 user erasure gate，请只对可丢弃 user 显式开启两端 gate 后重启：
+
+```bash
+DATA_ERASURE_REQUESTS_ENABLED=1 scripts/local-service.sh restart
+curl -sS http://127.0.0.1:8080/v1/capabilities | python3 -m json.tool
+```
+
+预期 router capability 中 `dataErasureRequests` 为 `true`。该开关只接受 durable request，不会启用物理 purge。部署时可以只关闭 router writer gate 并保持 capable runner 的 gate 开启，此时已有 request 的 status GET 继续可读；mixed fleet 会返回 `503`。POST/status 的成功与错误响应均带 `Cache-Control: no-store`，不得在调试代理中改写为可缓存。本地统一脚本用同一个变量配置两端，因此体验结束后运行 `DATA_ERASURE_REQUESTS_ENABLED=0 scripts/local-service.sh restart` 会同时关闭 runner capability：新的 POST 和 status GET 都会返回 `503`，但已经落库的 subject gate 不会被撤销。
 
 staging/production 的 tombstone gate 必须按第 9 节滚动发布流程激活。当前 production runner 会拒绝启用 filesystem Blob 写入或 cleanup：共享 OSS/S3 adapter 尚未实现，任何 replica 都不能领取全局 MySQL outbox 后只操作自己的本地磁盘。没有共享对象存储时，不能因 reader 代码存在就声称 production Blob 可用。
 
@@ -108,6 +117,8 @@ AGENT_SERVICE_INTEGRATION=1 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_se
 AGENT_SERVICE_TEST_REPORT=.local-run/verify-tests.json node scripts/assert-suites-ran.mjs
 MYSQL_MIGRATION_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:migrations
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:blob-mysql
+MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:usage-lifecycle-mysql
+MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:subject-lifecycle-mysql
 AGENT_SERVICE_CLUSTER=1 CLUSTER_MYSQL_URL="mysql://root@127.0.0.1:3306/agent_service_cluster" CLUSTER_REDIS_URL="redis://127.0.0.1:6379/3" \
   pnpm vitest run test/cluster
 pnpm build:check
@@ -233,6 +244,27 @@ DELETE 经同一队列、lease/fence 原子写入 terminal `session/deleted`、�
 
 当前 `scripts/demo.sh approval` 不会完成一条人工审批交互；审批状态机由自动测试覆盖。后续若增加交互式审批 demo，应在此处补充。
 
+### User erasure durable gate（显式开启后）
+
+当前公开能力只接受 admin service key 为一个明确 user 发起请求。请使用全新的可丢弃 user，并先关闭该 user 的 turn/SSE 客户端；请求成功后，该 subject 的 session/turn/item/approval/usage/receipt/Blob 普通读取立即隐藏、对应 durable 写入被拒绝，tenant-scoped agents/provider/auth/api-key 不受此 user gate 影响。没有公开“撤销 gate”接口，且当前 `gated` 尚不会主动关闭已建立 SSE 或跨 runner 中断 active provider/tool。本地要恢复该测试 user，只能按测试数据处置流程重建/恢复数据库，不能把关闭 feature gate 误当成恢复 subject。完成 drain worker 前不得在 staging/production 开启该 gate。
+
+```bash
+ERASURE_USER=u_erasure_demo
+ERASURE_JSON="$(curl -sS -X POST "$BASE/v1/data-erasure-requests" \
+  -H "Authorization: Bearer dev-key" \
+  -H "X-User-Id: $ERASURE_USER" \
+  -H "Idempotency-Key: erasure-demo-1")"
+printf '%s' "$ERASURE_JSON" | python3 -m json.tool
+ERASURE_ID="$(printf '%s' "$ERASURE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+
+# 相同 tenant/user 才能读取；当前应保持 gated，而不是 completed
+curl -sS "$BASE/v1/data-erasure-requests/$ERASURE_ID" \
+  -H "Authorization: Bearer dev-key" \
+  -H "X-User-Id: $ERASURE_USER" | python3 -m json.tool
+```
+
+同一个 subject/key 重放返回同一 request；同 key 可被另一个 user 独立使用。runtime-only key 会得到 `403`，缺 user 或 `Idempotency-Key` 会得到 `400`，跨 user/tenant 查询与不存在一样返回 `404`。成功响应只证明 subject gate、request 和首条 audit 已原子持久化；没有既有 SSE 撤销、active turn drain、erasure worker、export、key revocation 或物理清理发生。若 gate 与 Blob object put 竞态，ready 发布会被拒绝，暂存对象保持不可读并在 staging TTL 到期后由 cleanup worker 回收。
+
 ## 6. 四级验证路径
 
 ```bash
@@ -241,7 +273,7 @@ scripts/local-service.sh smoke
 
 scripts/local-service.sh verify
 # 无真实模型费用；运行 secret/API drift/typecheck、MySQL/Redis 集成、
-# 包含 Blob real-MySQL 用例、0007→0008→0009→0010 历史迁移、真实多进程 cluster、
+# 包含 Blob/usage/subject lifecycle real-MySQL 专项、0007→0008→0009→0010→0011 历史迁移、真实多进程 cluster、
 # SDK 打包和两个应用 bundle 启动门禁
 
 scripts/local-service.sh verify-real
@@ -253,14 +285,22 @@ scripts/local-service.sh acceptance
 
 日常开发至少运行与修改范围匹配的定向测试；合并或里程碑冻结前运行完整 `verify`。真实模型路径只有在明确需要时运行，不能把未重跑的历史结果描述为本轮结果。
 
+手动体验不必等到 M1/M3/M4 全部完成：每个安全切片落地后先用 `smoke`、相关 curl 或假厂商路径做短反馈，能更早发现 API 和操作习惯问题；待本地/CI 可实现的整体范围完成后，再按第 3～6 节做一次完整 walkthrough，形成阶段验收。尚未接线的功能（当前主要是 erasure/export/purge、M3 扩展和 M4 生产化）应继续依赖自动化门禁并在实现后补进本文，不能为了“完整体验”提前模拟成已经存在。
+
 ## 7. 本地源码进程与生产构建产物
 
 本地 `start` 使用：
 
 ```text
-node --import tsx apps/agent-runner/src/main.ts
-node --import tsx apps/agent-router/src/main.ts
+node --env-file=.env --import tsx apps/agent-runner/src/main.ts
+node --env-file=.env --import tsx apps/agent-router/src/main.ts
 ```
+
+这两条命令要从仓库根目录分别在两个终端执行；`--env-file=.env` 不能省略，否则 runner
+拿不到 `SECRETS_MASTER_KEY`/存储配置，router 也拿不到 `RUNNERS`。等价的 workspace 命令是
+`pnpm --filter @agent-service/runner start` 与 `pnpm --filter @agent-service/router start`，两个
+package script 同样会加载仓库根目录的 `.env`。`scripts/local-service.sh start` 则在启动前自行
+加载 `.env`，并为本地单 runner Blob 拓扑补齐显式覆盖。
 
 生产构建使用：
 
@@ -309,10 +349,12 @@ GitHub 启动 MySQL 8 和 Redis 8 service container，然后执行：
 6. 断言集成套件没有被环境错误静默 skip；
 7. 以单独、可见且不得 skip 的 `pnpm test:blob-mysql` 再跑 Blob ownership/绑定/cleanup 真实 MySQL 专项套件；
 8. 以同样的独立门禁运行 lifecycle outbox 真实 MySQL 专项套件；
-9. 从预置历史 schema 依次验证 `0007 → 0008`、`0008 → 0009`、`0009 → 0010`，而不是只测 fresh schema；
-10. 真实 runner/router 多进程 cluster 测试；
-11. `pnpm build:check`；
-12. 上传 coverage artifact。
+9. 以 `pnpm test:usage-lifecycle-mysql` 强制执行 usage 双写、冲突回滚、reconcile、legal hold 和 anonymize 真实 MySQL 套件；
+10. 以 `pnpm test:subject-lifecycle-mysql` 强制执行 durable gate、request/audit 回滚、create 竞态和 Blob 写阻断真实 MySQL 套件；
+11. 从预置历史 schema 依次验证 `0007 → 0008`、`0008 → 0009`、`0009 → 0010`、`0010 → 0011`，而不是只测 fresh schema；
+12. 真实 runner/router 多进程 cluster 测试；
+13. `pnpm build:check`；
+14. 上传 coverage artifact。
 
 MySQL 和 Redis 是拉取的第三方 service images，不是本仓库构建的产品服务。
 
@@ -332,7 +374,7 @@ agent-service/agent-runner:ci
 agent-service/agent-router:ci
 ```
 
-每个镜像都包含 Node 24 slim、该应用的 bundle、迁移文件和 production dependencies。它们是容器运行时使用的 Linux OCI image，不是 VM 磁盘镜像，也不是 Windows/Linux 原生机器码二进制。CI 会实际启动镜像并检查外部可达性、OpenAPI 和 Docker healthcheck；runner 还验证包括 `0010_blob_ownership.sql` 在内的最新迁移已执行及生产 bootstrap 路径。生产模式的镜像门禁保持 Blob 写入与 cleanup 关闭，因此不会绕过 filesystem adapter 的 fail-closed 约束。
+每个镜像都包含 Node 24 slim、该应用的 bundle、迁移文件和 production dependencies。它们是容器运行时使用的 Linux OCI image，不是 VM 磁盘镜像，也不是 Windows/Linux 原生机器码二进制。CI 会实际启动镜像并检查外部可达性、OpenAPI 和 Docker healthcheck；runner 还验证最新 `0011_erasure_and_usage_separation.sql` 已执行及生产 bootstrap 路径。生产模式的镜像门禁保持 Blob 写入与 cleanup 关闭，erasure writer gate 也保持默认关闭，因此不会绕过尚未激活的安全边界。
 
 当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前明确上传的 GitHub Actions artifact 只有 coverage。
 
@@ -358,7 +400,9 @@ tombstone 保持在 exact protocol family `2026-10-08`，作为 additive capabil
 
 Blob 写入也采用 expand→activate：`0010` 先增加 ownership manifest 和专用 delete outbox，reader 在 writer gate 关闭时仍可服务已绑定对象；router 只有在 `BLOB_ATTACHMENTS_ENABLED=1` 且全部健康 runner 声明 `blobAttachments` 时才转发新上传。当前这只用于单 runner 本地体验，因为 runner 在 `NODE_ENV=production` 下会对 filesystem Blob writer 与 cleanup 都 fail closed。未来接入共享对象存储 adapter 后，才可以按“迁移 → 新 runner（cleanup/read 开、writer 关）→ 新 router（gate 关）→ 核对 fleet/storage → 激活 writer gate”的顺序开放 staging，再以同一 image digest 推进 production。filesystem `BLOB_DIR` 不能通过复制到多台 VM、hostPath 或各 Pod 独立卷伪装成共享对象存储。
 
-没有云资源时，仍可完成业务代码、协议、迁移、memory/MySQL/Redis 实现、单机 filesystem Blob 行为、本地多进程与容器测试、故障注入、指标定义和部署契约设计。以下结论必须等待真实环境：共享 OSS/S3 adapter 与 IAM/KMS 的真实集成、云网络和权限正确性、IdP 集成、Kubernetes 滚动发布、真实告警链路、备份恢复目标、云 Redis 灾备以及生产容量。仓库不会为这些未知参数编造可直接部署的 Kubernetes、域名/TLS 或 Secret 配置。
+user erasure POST 未来使用独立的 expand→activate gate；当前因既有 SSE/active turn drain 尚未实现，staging/production 不得激活。完整 worker 就绪后，顺序是先应用 `0011`，部署新 router/runner 且保持 `DATA_ERASURE_REQUESTS_ENABLED=0`，排空旧 router 与旧 writer；然后先在网络不可被客户端直连的新 runner 上启用 gate，确认 `RUNNERS` 中全部 configured targets 都已通过健康探测并声明 `dataErasureRequests`，最后启用 router writer gate。任一已配置 target 暂时不可达或仍是旧版本时，POST 都返回 `503`，不能把健康子集误当成已完成 drain；gate=`1` 后 selected target 若能力回退，session/usage 等 user-scoped runtime 也会在转发前返回可重试 `503`。回滚先关闭 router writer gate；一旦已经接受过 gate，关闭它会同时移除上述 router 侧 target 防线，因此仍必须保持 capable runner fleet，不能用 gate-off 作为旧 writer 回滚许可。status GET 不依赖 router writer gate，继续要求当前 healthy fleet 和 selected target capability，healthy mixed fleet 时 fail-closed；它不承担 POST 的全 configured-fleet 激活判定。该流程也不能替代 tenant key revocation 或 purge。
+
+没有云资源时，仍可完成业务代码、协议、迁移、memory/MySQL/Redis 实现、单机 filesystem Blob 行为、本地多进程与容器测试、故障注入、指标定义和部署契约设计；当前 user erasure gate 和 usage 分层也属于这一范围。以下结论必须等待真实环境：共享 OSS/S3 adapter 与 IAM/KMS 的真实集成、云网络和权限正确性、IdP 集成、Kubernetes 滚动发布、真实告警链路、备份恢复目标、云 Redis 灾备以及生产容量。仓库不会为这些未知参数编造可直接部署的 Kubernetes、域名/TLS 或 Secret 配置。
 
 ## 10. 文档维护规则
 

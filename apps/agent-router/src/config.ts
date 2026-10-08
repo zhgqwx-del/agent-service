@@ -26,6 +26,8 @@ const Env = z.object({
   INTERNAL_ROUTER_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
   /** Explicit expand→activate gate. Keep 0 while any legacy router/runner can receive DELETE. */
   SESSION_TOMBSTONE_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Explicit expand→activate gate for subject write barriers. */
+  DATA_ERASURE_REQUESTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   SHUTDOWN_GRACE_MS: z.coerce.number().int().nonnegative().default(10_000),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   NODE_ENV: z.string().optional(),

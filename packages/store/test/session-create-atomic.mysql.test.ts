@@ -10,7 +10,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it("rolls back the session row when the creation-event insert fails", async () => {
       const store = await MysqlSessionStore.connect({ url: MYSQL_URL, connectionLimit: 2 });
       const conn = await mysql.createConnection(MYSQL_URL);
-      const session = mkSession("tenant_atomic_rollback", "user_atomic_rollback");
+      const suffix = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+      const session = mkSession(`tenant_atomic_${suffix}`, `user_atomic_${suffix}`);
       const triggerName = `test_atomic_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 
       try {
@@ -30,8 +31,13 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
 
         const [sessionRows] = await conn.query<RowDataPacket[]>("SELECT session_id, last_seq FROM sessions WHERE session_id=?", [session.id]);
         const [eventRows] = await conn.query<RowDataPacket[]>("SELECT session_id, seq FROM events WHERE session_id=?", [session.id]);
+        const [subjectRows] = await conn.query<RowDataPacket[]>(
+          "SELECT subject_kind, subject_id FROM subject_lifecycle WHERE tenant_id=?",
+          [session.tenantId],
+        );
         expect(sessionRows).toEqual([]);
         expect(eventRows).toEqual([]);
+        expect(subjectRows).toEqual([]);
       } finally {
         await conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``).catch(() => {});
         await conn.end();

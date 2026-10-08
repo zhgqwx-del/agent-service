@@ -31,6 +31,8 @@ const Env = z.object({
   BLOB_CLEANUP_RETRY_BASE_MS: z.coerce.number().int().positive().default(250),
   BLOB_CLEANUP_RETRY_MAX_MS: z.coerce.number().int().positive().default(60_000),
   BLOB_CLEANUP_POISON_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  /** Subject erasure is additive but write-blocking; keep it off until every writer understands the gate. */
+  DATA_ERASURE_REQUESTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** 32-byte hex key that encrypts BYOK secrets at rest. No default: a silent all-zero key is worse than a crash. */
   SECRETS_MASTER_KEY: z.string().regex(/^[0-9a-f]{64}$/i, "SECRETS_MASTER_KEY must be 64 hex chars (32 bytes)"),
   /** Dev convenience: seeds a tenant + api key on boot. Refused when NODE_ENV=production. */

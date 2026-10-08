@@ -43,6 +43,8 @@ export interface TenantRecord {
 }
 
 export interface UsageLedgerEntry {
+  /** Random, stable billing identity. Legacy rows written before the billing split may be missing it. */
+  usageId?: string;
   tenantId: string;
   userId: string;
   sessionId: string;
@@ -54,8 +56,85 @@ export interface UsageLedgerEntry {
   createdAtMs: number;
 }
 
-/** A usage row written inside a session commit. Ownership is derived from the locked session row. */
-export type UsageLedgerWrite = Omit<UsageLedgerEntry, "tenantId" | "userId" | "sessionId">;
+/**
+ * A usage row written inside a session commit. Ownership is derived from the locked session row.
+ * New writes must allocate the opaque random id before committing; only legacy reconciliation may
+ * assign an id to an existing row whose usage_id is NULL.
+ */
+export type UsageLedgerWrite = Omit<UsageLedgerEntry, "usageId" | "tenantId" | "userId" | "sessionId"> & {
+  usageId: string;
+};
+
+/** Token columns deliberately duplicated out of operational JSON for durable billing facts. */
+export interface UsageTokenColumns {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+}
+
+/**
+ * Long-lived accounting fact. This whitelist intentionally has no user/session/turn/step identity,
+ * request timestamp, idempotency key, prompt, item, or raw JSON column.
+ */
+export interface BillingUsageFact extends UsageTokenColumns {
+  usageId: string;
+  tenantId: string;
+  /** UTC calendar month in YYYY-MM form. */
+  accountingPeriod: string;
+  provider: string;
+  model: string;
+  /** Absence means the price was unknown; zero is a known, billable zero. */
+  costCNY?: number;
+  currency: "CNY";
+  /** SHA-256 of the canonical whitelisted fact fields. */
+  factSha256: string;
+}
+
+export interface UsageReconciliationSummary extends UsageTokenColumns {
+  rowCount: number;
+  knownCostRows: number;
+  /** Absent only when every row has unknown cost; known zero remains 0. */
+  costCNY?: number;
+  /** SHA-256 over the sorted (usageId, factSha256) set. */
+  checksum: string;
+}
+
+/** Minimal lifecycle audit proving operational rows and durable billing facts agree. */
+export interface UsageReconciliationRecord extends UsageReconciliationSummary {
+  tenantId: string;
+  userId: string;
+  sessionId: string;
+  deletionGeneration: number;
+  status: "verified" | "anonymized";
+  verifiedAtMs: number;
+  anonymizedAtMs?: number;
+}
+
+export interface ReconcileSessionUsageInput {
+  tenantId: string;
+  userId: string;
+  sessionId: string;
+  deletionGeneration: number;
+  nowMs: number;
+}
+
+export interface AnonymizeSessionUsageInput extends ReconcileSessionUsageInput {
+  expectedChecksum: string;
+  /** Destructive cleanup is fail-closed unless the caller explicitly supplies literal true. */
+  enabled: true;
+}
+
+/**
+ * Least-privilege content-lifecycle surface. It can reconcile/anonymize usage only for an already
+ * tombstoned, owner-matched generation and cannot mutate sessions, events, or other content.
+ */
+export interface UsageLifecycleStore {
+  reconcileSessionUsage(input: ReconcileSessionUsageInput): Promise<UsageReconciliationRecord>;
+  anonymizeSessionUsage(input: AnonymizeSessionUsageInput): Promise<UsageReconciliationRecord>;
+}
 
 export interface IdempotencyReceiptValue {
   turnId: string;

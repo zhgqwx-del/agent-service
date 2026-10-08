@@ -24,6 +24,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     internalRunnerToken: cfg.INTERNAL_ROUTER_TOKEN,
     tombstoneEnabled: () => cfg.SESSION_TOMBSTONE_ENABLED,
     blobAttachmentsEnabled: () => cfg.BLOB_ATTACHMENTS_ENABLED,
+    erasureRequestsEnabled: () => cfg.DATA_ERASURE_REQUESTS_ENABLED,
   });
   const server = serve({ fetch: app.fetch, port: cfg.ROUTER_PORT, hostname: cfg.ROUTER_HOST });
   /**
@@ -40,7 +41,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   };
   process.once("SIGTERM", () => void shutdown());
   process.once("SIGINT", () => void shutdown());
-  console.log(`[router] listening on http://${cfg.ROUTER_HOST}:${cfg.ROUTER_PORT} → ${cfg.runnerList.join(", ")} directory=${cfg.REDIS_URL ? "redis" : "hash-only"} tombstone=${cfg.SESSION_TOMBSTONE_ENABLED ? "enabled" : "gated"} blobs=${cfg.BLOB_ATTACHMENTS_ENABLED ? "enabled" : "gated"}`);
+  console.log(`[router] listening on http://${cfg.ROUTER_HOST}:${cfg.ROUTER_PORT} → ${cfg.runnerList.join(", ")} directory=${cfg.REDIS_URL ? "redis" : "hash-only"} tombstone=${cfg.SESSION_TOMBSTONE_ENABLED ? "enabled" : "gated"} blobs=${cfg.BLOB_ATTACHMENTS_ENABLED ? "enabled" : "gated"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"}`);
   return { app, server, registry, cfg, close: shutdown };
 }
 

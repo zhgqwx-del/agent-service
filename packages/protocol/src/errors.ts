@@ -8,6 +8,7 @@ export const ErrorCode = z.enum([
   "session_busy",
   "session_archived",
   "session_has_children",
+  "subject_deleting",
   "session_lease_conflict",
   "idempotency_conflict",
   // NOTE: `quota_exceeded` (429) arrives with per-tenant quotas in M4; `limits_exceeded` was removed
@@ -28,6 +29,7 @@ export const HTTP_STATUS: Record<ErrorCode, number> = {
   session_busy: 409,
   session_archived: 409,
   session_has_children: 409,
+  subject_deleting: 409,
   session_lease_conflict: 409,
   idempotency_conflict: 409,
   provider_error: 502,

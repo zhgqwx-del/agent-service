@@ -1,7 +1,19 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { addUsage, ApiError, emptyUsage, type AgentDefinition, type Approval, type Event, type Item, type Principal, type Turn, type Usage } from "@agent-service/protocol";
-import { FenceError, IdempotencyPendingError, MemoryBlobStore, MemoryEventBus, MemoryLeaseStore, MemorySessionStore, SessionVersionError, type CommitBatch } from "@agent-service/store";
 import {
+  FenceError,
+  IdempotencyPendingError,
+  MemoryBlobStore,
+  MemoryEventBus,
+  MemoryLeaseStore,
+  MemorySessionStore,
+  SessionVersionError,
+  newErasureRequestId,
+  userErasureRequestHash,
+  type CommitBatch,
+} from "@agent-service/store";
+import {
+  BlobCleanupWorker,
   SessionBlobService,
   SessionHost,
   LifecycleOutboxDispatcher,
@@ -898,6 +910,49 @@ describe("SessionHost", () => {
     expect((await h.store.getTurn(h.session.id, r.turn.id))?.stopReason).toBe("max_wall_clock");
   });
 
+  it("fails a cost ceiling closed after persisting an unpriced step, before tools or another provider step", async () => {
+    const h = await setup([
+      {
+        text: "unpriced",
+        toolCalls: [{ name: "echo", args: { text: "must-not-run" } }],
+        usage: { costCNY: undefined },
+      },
+      { text: "must-not-run", usage: { costCNY: 0 } },
+    ], { limits: { maxCostCNY: 1 } });
+    const { turn } = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: true, metadata: {},
+    });
+    const session = await waitIdle(h);
+    const persistedTurn = await h.store.getTurn(h.session.id, turn.id);
+
+    expect(persistedTurn).toMatchObject({ status: "completed", stopReason: "max_cost", steps: 1 });
+    expect(persistedTurn?.usage).not.toHaveProperty("costCNY");
+    expect(session.usage).not.toHaveProperty("costCNY");
+    expect(h.store.usageLedger).toHaveLength(1);
+    expect(h.store.usageLedger[0]?.usage).not.toHaveProperty("costCNY");
+    expect(h.engine.startedSteps).toBe(1);
+    expect(h.engine.executedToolCalls).toBe(0);
+  });
+
+  it("keeps a known zero cost distinct from unknown under a cost ceiling", async () => {
+    const h = await setup([
+      { text: "zero", toolCalls: [{ name: "echo", args: { text: "run" } }], usage: { costCNY: 0 } },
+      { text: "done", usage: { costCNY: 0 } },
+    ], { limits: { maxCostCNY: 1 } });
+    const { turn } = await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "go" }], stream: true, metadata: {},
+    });
+    const session = await waitIdle(h);
+    const persistedTurn = await h.store.getTurn(h.session.id, turn.id);
+
+    expect(persistedTurn).toMatchObject({ status: "completed", stopReason: "end_turn", steps: 2 });
+    expect(persistedTurn?.usage.costCNY).toBe(0);
+    expect(session.usage.costCNY).toBe(0);
+    expect(h.store.usageLedger).toHaveLength(2);
+    expect(h.engine.startedSteps).toBe(2);
+    expect(h.engine.executedToolCalls).toBe(1);
+  });
+
   it("interrupt ends the turn as interrupted and keeps partial text", async () => {
     const h = await setup([{ text: "partial answer", toolCalls: [{ name: "slow", args: { text: "x" } }] }, { text: "never" }]);
     const r = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
@@ -1379,11 +1434,12 @@ describe("SessionHost", () => {
   });
 
   it("provider error fails the turn with an error event", async () => {
-    const h = await setup([{ stopReason: "error", errorMessage: "429 rate limited" }]);
+    const h = await setup([{ stopReason: "error", errorMessage: "429 rate limited", usage: { costCNY: undefined } }]);
     const r = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
     await waitIdle(h);
     const t = (await h.store.getTurn(h.session.id, r.turn.id))!;
     expect(t.status).toBe("failed");
+    expect(t.stopReason).toBe("error");
     expect(t.error?.message).toContain("429");
     expect(h.events.some((e) => e.type === "error")).toBe(true);
   });
@@ -1763,6 +1819,52 @@ describe("SessionHost", () => {
       objects.allowWriteToFinish();
     }
     await waitFor(() => ((h.host as unknown as { active: Map<string, unknown> }).active.size === 0 ? true : undefined));
+  });
+
+  it("keeps a gate-raced object inaccessible as staging and reclaims it through cleanup", async () => {
+    const store = new MemorySessionStore();
+    const objects = new BlockingMemoryBlobStore();
+    const blobs = new SessionBlobService(store, objects, { maxBlobBytes: 10_000, stagingTtlMs: 60_000 });
+    const h = await setup(
+      [{ text: "unused" }],
+      {},
+      { blobAttachmentsEnabled: true },
+      { store, blobs },
+    );
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const uploading = h.host.uploadInputBlob(principal, h.session.id, bytes, "image/png");
+    await objects.writeStarted;
+
+    const atMs = Date.now();
+    await store.requestUserErasure({
+      requestId: newErasureRequestId(),
+      tenantId: principal.tenantId,
+      userId: principal.userId,
+      requestedByKeyId: "admin-key",
+      idempotencyKey: "gate-raced-upload",
+      requestHash: userErasureRequestHash(principal.tenantId, principal.userId),
+      atMs,
+    });
+    objects.allowWriteToFinish();
+
+    await expect(uploading).rejects.toMatchObject({ code: "not_found" });
+    const manifests = [...store.blobManifests.values()];
+    expect(manifests).toHaveLength(1);
+    const manifest = manifests[0]!;
+    expect(manifest).toMatchObject({ state: "staging" });
+    expect(manifest).not.toHaveProperty("uploadedAtMs");
+    expect(await store.getBindableBlob({
+      owner: principal,
+      sessionId: h.session.id,
+      blobId: manifest.blobId,
+      purpose: "input_image",
+    })).toBeNull();
+    expect(await objects.get(manifest.storageKey, { maxBytes: 10_000 })).toMatchObject({ data: bytes });
+
+    const cleanup = new BlobCleanupWorker({ store, blob: objects });
+    expect(await cleanup.cleanupOnce(manifest.stagingExpiresAtMs!)).toBe(1);
+    expect(await store.getBlobManifest(manifest.blobId)).toMatchObject({ state: "deleted" });
+    expect(await objects.get(manifest.storageKey, { maxBytes: 10_000 })).toBeNull();
   });
 
   it("does not let a staged image cross a session boundary", async () => {

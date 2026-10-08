@@ -145,7 +145,6 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     PLATFORM_PROVIDER: "deepseek",
     API_KEY: "sk-fake",
     API_BASE_URL: vendorUrl,
-    DEFAULT_MODEL: "fake-model",
     LEASE_TTL_MS: String(opts.leaseTtlMs ?? 3_000),
     LEASE_HOLD_MS: String(opts.leaseHoldMs ?? 500),
     SSE_HEARTBEAT_MS: "30000",

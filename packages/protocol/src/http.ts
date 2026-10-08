@@ -136,6 +136,10 @@ export const StartTurnHeaders = UserIdentityHeaders.extend({
   "idempotency-key": z.string().trim().min(1).max(256).optional(),
 });
 
+export const ErasureRequestHeaders = UserIdentityHeaders.extend({
+  "idempotency-key": z.string().trim().min(1).max(256),
+});
+
 export const EventStreamHeaders = UserIdentityHeaders.extend({
   "last-event-id": z.coerce.number().int().min(-1).optional(),
 });

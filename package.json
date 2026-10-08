@@ -19,6 +19,8 @@
     "test": "vitest run",
     "test:migrations": "vitest run --config packages/store/test/migrations/vitest.config.ts --reporter=verbose",
     "test:blob-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/blob-lifecycle.mysql.test.ts",
+    "test:usage-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/usage-lifecycle.mysql.test.ts",
+    "test:subject-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/subject-lifecycle.mysql.test.ts",
     "test:outbox-mysql": "vitest run packages/store/test/lifecycle-outbox.mysql.test.ts --reporter=verbose",
     "test:watch": "vitest",
     "dev:runner": "pnpm --filter @agent-service/runner dev",

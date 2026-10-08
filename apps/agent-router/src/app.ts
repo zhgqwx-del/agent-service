@@ -29,6 +29,8 @@ export interface RouterAppDeps {
   tombstoneEnabled?: () => boolean;
   /** Explicit deployment activation gate for new blob writes. Blob reads remain available. */
   blobAttachmentsEnabled?: () => boolean;
+  /** Explicit deployment activation gate for the subject-level durable write barrier. */
+  erasureRequestsEnabled?: () => boolean;
   /** Shared runner-internal credential. Omission keeps destructive routing disabled. */
   internalRunnerToken?: string;
   logger?: Pick<Console, "info" | "warn" | "error">;
@@ -67,6 +69,9 @@ const IDEMPOTENT_TURN_POST = /^\/v1\/sessions\/[^/]+\/turns\/?$/;
 /** Fenced tombstoning is idempotent even when the first 204 was lost in transit. */
 const IDEMPOTENT_SESSION_DELETE = /^\/v1\/sessions\/[^/]+\/?$/;
 const SESSION_BLOB_UPLOAD = /^\/v1\/sessions\/[^/]+\/blobs\/?$/;
+const USER_ERASURE_REQUEST = /^\/v1\/data-erasure-requests\/?$/;
+const USER_ERASURE_STATUS = /^\/v1\/data-erasure-requests\/[^/]+\/?$/;
+const USER_SCOPED_RUNTIME = /^\/v1\/(?:sessions(?:\/|$)|usage\/?$|data-erasure-requests(?:\/|$))/;
 
 /**
  * agent-router: stateless. It authenticates nothing itself (the runner is the authority) and holds no
@@ -87,6 +92,13 @@ export function createRouterApp(deps: RouterAppDeps) {
   const blobAttachmentsAvailable = () => (
     (deps.blobAttachmentsEnabled?.() ?? false)
     && deps.registry.allHealthySupportBlobAttachments()
+  );
+  const erasureWriterGateEnabled = () => deps.erasureRequestsEnabled?.() ?? false;
+  const erasureRequestsAvailable = () => (
+    erasureWriterGateEnabled()
+    // Unlike a reversible read, this durable gate must account for unavailable configured writers:
+    // an old runner that recovers later could otherwise ignore the already-accepted subject gate.
+    && deps.registry.allConfiguredSupportDataErasureRequests()
   );
 
   app.get("/healthz", (c) => c.text("ok"));
@@ -119,6 +131,7 @@ export function createRouterApp(deps: RouterAppDeps) {
                 ...parsed.data.features,
                 sessionLifecycle: lifecycle,
                 blobAttachments: parsed.data.features.blobAttachments && blobAttachmentsAvailable(),
+                dataErasureRequests: parsed.data.features.dataErasureRequests && erasureRequestsAvailable(),
               },
             } satisfies Capabilities);
           }
@@ -164,6 +177,16 @@ export function createRouterApp(deps: RouterAppDeps) {
     const isBlobUpload = method === "POST"
       && !!sessionId
       && SESSION_BLOB_UPLOAD.test(url.pathname);
+    const isErasureRequest = method === "POST" && USER_ERASURE_REQUEST.test(url.pathname);
+    const isErasureStatus = method === "GET" && USER_ERASURE_STATUS.test(url.pathname);
+    const requiresErasureCapableTarget = erasureWriterGateEnabled()
+      && USER_SCOPED_RUNTIME.test(url.pathname);
+    if (isErasureRequest || isErasureStatus) {
+      // The same admin credential can act for multiple users, so URI-only caches must never retain
+      // either an owned status body or an owner-hiding 404. This also covers router-generated gates.
+      c.header("Cache-Control", "no-store");
+      c.header("X-Content-Type-Options", "nosniff");
+    }
 
     // The new router is intentionally deployed before new runners. It keeps the rest of the API
     // available during that rollout, but does not activate tombstoning until the healthy fleet is
@@ -186,6 +209,24 @@ export function createRouterApp(deps: RouterAppDeps) {
         error: {
           code: "draining",
           message: "blob uploads are unavailable while the runner fleet is upgrading",
+          retryable: true,
+        },
+      }, 503);
+    }
+    if (isErasureRequest && !erasureRequestsAvailable()) {
+      return c.json({
+        error: {
+          code: "draining",
+          message: "data erasure requests are unavailable while the runner fleet is upgrading",
+          retryable: true,
+        },
+      }, 503);
+    }
+    if (isErasureStatus && !deps.registry.allHealthySupportDataErasureRequests()) {
+      return c.json({
+        error: {
+          code: "draining",
+          message: "data erasure request status is unavailable while the runner fleet is upgrading",
           retryable: true,
         },
       }, 503);
@@ -246,6 +287,22 @@ export function createRouterApp(deps: RouterAppDeps) {
           },
         }, 503);
       }
+      const targetSupportsErasure = deps.registry.supportsDataErasureRequests(target);
+      if (
+        (isErasureRequest && (!erasureRequestsAvailable() || !targetSupportsErasure))
+        || (isErasureStatus && (
+          !deps.registry.allHealthySupportDataErasureRequests() || !targetSupportsErasure
+        ))
+        || (requiresErasureCapableTarget && !targetSupportsErasure)
+      ) {
+        return c.json({
+          error: {
+            code: "draining",
+            message: "user-scoped runtime is unavailable while the runner fleet is upgrading",
+            retryable: true,
+          },
+        }, 503);
+      }
       tried.add(target);
       let res: Response;
       try {
@@ -258,6 +315,7 @@ export function createRouterApp(deps: RouterAppDeps) {
         // agent/session/api-key POST does not magically make that endpoint safe to replay.
         const safeToRetry = REPLAYABLE.has(method) ||
           (method === "POST" && !!sessionId && IDEMPOTENT_TURN_POST.test(url.pathname) && !!c.req.header("idempotency-key")?.trim()) ||
+          (method === "POST" && isErasureRequest && !!c.req.header("idempotency-key")?.trim()) ||
           (method === "DELETE" && !!sessionId && IDEMPOTENT_SESSION_DELETE.test(url.pathname));
         const next = safeToRetry ? pickOther(deps, sessionId, tried) : undefined;
         if (!next || attempt >= maxAttempts) {
@@ -291,7 +349,14 @@ export function createRouterApp(deps: RouterAppDeps) {
           continue;
         }
       }
-      return streamBack(res);
+      const response = streamBack(res);
+      if (isErasureRequest || isErasureStatus) {
+        // New runners already send these headers. Reassert them at the public edge so a proxying
+        // regression or an unexpected upstream error can never make this identity-scoped route cacheable.
+        response.headers.set("Cache-Control", "no-store");
+        response.headers.set("X-Content-Type-Options", "nosniff");
+      }
+      return response;
     }
     return c.json({ error: { code: "session_lease_conflict", message: "could not reach the session owner" } }, 409);
   });

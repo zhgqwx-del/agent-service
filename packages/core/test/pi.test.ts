@@ -79,6 +79,7 @@ describe("PiEngine tool-result finalization", () => {
       readOnly: true,
       execute: async () => ({ content: [{ type: "text", text: "RAW_SUCCESS" }], details: { raw: true } }),
     };
+    const observedCosts: Array<number | undefined> = [];
     const canonical: EngineToolResult = {
       toolCallId: "call_1",
       name: "raw_tool",
@@ -104,7 +105,10 @@ describe("PiEngine tool-result finalization", () => {
       onToolResult: async () => {
         throw new Error("executed tools must be finalized through afterToolCall");
       },
-      onStepEnd: async (step) => (step >= 2 ? "end" : "continue"),
+      onStepEnd: async (step, message) => {
+        observedCosts.push(message.usage.costCNY);
+        return step >= 2 ? "end" : "continue";
+      },
     };
     const resolved: ResolvedModel = {
       handle: model,
@@ -112,6 +116,7 @@ describe("PiEngine tool-result finalization", () => {
       model: model.id,
       contextWindow: model.contextWindow,
       input: model.input,
+      priceKnown: false,
       apiKey: async () => "unused",
     };
 
@@ -128,6 +133,7 @@ describe("PiEngine tool-result finalization", () => {
 
     expect(result.error).toBeUndefined();
     expect(afterCalls).toBe(1);
+    expect(observedCosts).toEqual([undefined, undefined]);
     expect(models.contexts).toHaveLength(2);
     const nextResult = models.contexts[1]?.messages.find((message) => message.role === "toolResult");
     expect(nextResult).toMatchObject({

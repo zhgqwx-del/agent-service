@@ -14,6 +14,7 @@ caller_runner_addr="${RUNNER_ADDR-}"
 caller_runners="${RUNNERS-}"
 caller_redis_url="${REDIS_URL-}"
 caller_session_tombstone_enabled="${SESSION_TOMBSTONE_ENABLED-}"
+caller_data_erasure_requests_enabled="${DATA_ERASURE_REQUESTS_ENABLED-}"
 caller_blob_dir="${BLOB_DIR-}"
 caller_blob_filesystem_single_runner="${BLOB_FILESYSTEM_SINGLE_RUNNER-}"
 caller_blob_cleanup_enabled="${BLOB_CLEANUP_ENABLED-}"
@@ -32,6 +33,7 @@ fi
 [ -n "$caller_runners" ] && RUNNERS="$caller_runners"
 [ -n "$caller_redis_url" ] && REDIS_URL="$caller_redis_url"
 [ -n "$caller_session_tombstone_enabled" ] && SESSION_TOMBSTONE_ENABLED="$caller_session_tombstone_enabled"
+[ -n "$caller_data_erasure_requests_enabled" ] && DATA_ERASURE_REQUESTS_ENABLED="$caller_data_erasure_requests_enabled"
 [ -n "$caller_blob_dir" ] && BLOB_DIR="$caller_blob_dir"
 [ -n "$caller_blob_filesystem_single_runner" ] && BLOB_FILESYSTEM_SINGLE_RUNNER="$caller_blob_filesystem_single_runner"
 [ -n "$caller_blob_cleanup_enabled" ] && BLOB_CLEANUP_ENABLED="$caller_blob_cleanup_enabled"
@@ -87,6 +89,7 @@ start_apps() {
       BLOB_CLEANUP_ENABLED="${BLOB_CLEANUP_ENABLED:-1}" \
       BLOB_ATTACHMENTS_ENABLED="${BLOB_ATTACHMENTS_ENABLED:-1}" \
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
+      DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       node --import tsx apps/agent-runner/src/main.ts </dev/null >"$RUNNER_LOG" 2>&1 &
     echo "$!" >"$RUNNER_PID_FILE"
     wait_http "$RUNNER_URL/readyz" runner
@@ -99,6 +102,7 @@ start_apps() {
     nohup env RUNNERS="${RUNNERS:-$RUNNER_URL}" \
       REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}" \
       SESSION_TOMBSTONE_ENABLED="${SESSION_TOMBSTONE_ENABLED:-1}" \
+      DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       BLOB_FILESYSTEM_SINGLE_RUNNER="${BLOB_FILESYSTEM_SINGLE_RUNNER:-1}" \
       BLOB_ATTACHMENTS_ENABLED="${BLOB_ATTACHMENTS_ENABLED:-1}" \
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
@@ -177,6 +181,10 @@ verify() {
   AGENT_SERVICE_TEST_REPORT="$STATE_DIR/verify-tests.json" node scripts/assert-suites-ran.mjs
   MYSQL_MIGRATION_TEST_URL="${MYSQL_MIGRATION_TEST_URL:-${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}}" \
     pnpm run test:migrations
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:usage-lifecycle-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:subject-lifecycle-mysql
   AGENT_SERVICE_CLUSTER=1 \
     CLUSTER_MYSQL_URL="${CLUSTER_MYSQL_URL:-mysql://root@127.0.0.1:3306/agent_service_cluster}" \
     CLUSTER_REDIS_URL="${CLUSTER_REDIS_URL:-redis://127.0.0.1:6379/3}" \

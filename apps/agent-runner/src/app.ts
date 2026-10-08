@@ -18,6 +18,8 @@ import {
   EXCLUDABLE_EVENT_TYPES,
   EventStreamHeaders,
   EventStreamQuery,
+  ErasureRequestHeaders,
+  ErasureRequestParams,
   ItemListQuery,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
@@ -40,10 +42,17 @@ import {
   type BlobUploadResponse,
   ImageMediaType,
   type Event,
+  type ErasureRequest,
 } from "@agent-service/protocol";
 import type { SessionHost, ToolRegistry } from "@agent-service/core";
 import { newId } from "@agent-service/core";
-import type { SessionStore } from "@agent-service/store";
+import {
+  ErasureIdempotencyMismatchError,
+  newErasureRequestId,
+  userErasureRequestHash,
+  type SessionStore,
+  type SubjectLifecycleStore,
+} from "@agent-service/store";
 import { redactProviderConfig, type ProviderService } from "@agent-service/providers";
 import { assertMayActAs, authMiddleware, generateApiKey, hashApiKey, requireAdmin, requireUser, TenantPolicyCache, type AuthEnv } from "./auth.js";
 import { needsSecret, validateAuthPolicy } from "./auth-policy.js";
@@ -62,6 +71,9 @@ export interface AppDeps {
   blobAttachmentsEnabled?: boolean;
   /** Raw upload ceiling. Main validates that this is no larger than maxBodyBytes. */
   maxBlobBytes?: number;
+  /** Additive rollout gate; must stay off until every writer checks the durable subject gate. */
+  erasureRequestsEnabled?: boolean;
+  subjectLifecycle?: SubjectLifecycleStore;
   ready: () => boolean;
   /** decrypts a tenant's stored auth secret (HS256 key / introspection credential) */
   decryptSecret: (secret: { ciphertext: Buffer; keyId: string }) => Promise<string>;
@@ -124,6 +136,7 @@ export function createApp(deps: AppDeps) {
         approvals: true,
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         blobAttachments: deps.blobAttachmentsEnabled === true,
+        dataErasureRequests: deps.erasureRequestsEnabled === true && deps.subjectLifecycle !== undefined,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -136,9 +149,13 @@ export function createApp(deps: AppDeps) {
   const v1 = new Hono<AuthEnv>();
   // Blob bytes and hydrated tool output are user data. Apply these headers before auth/id
   // validation so success and every error response share the same cache and sniffing policy.
-  v1.use("/sessions/:id/blobs", blobResponseHeaders);
-  v1.use("/sessions/:id/blobs/:blobId", blobResponseHeaders);
-  v1.use("/sessions/:id/items/:itemId/output", blobResponseHeaders);
+  v1.use("/sessions/:id/blobs", privateResponseHeaders);
+  v1.use("/sessions/:id/blobs/:blobId", privateResponseHeaders);
+  v1.use("/sessions/:id/items/:itemId/output", privateResponseHeaders);
+  // Erasure status is user-owned data. Install these before body limits, auth and parameter
+  // validation so success and every 4xx/5xx response are forbidden from entering a cache.
+  v1.use("/data-erasure-requests", privateResponseHeaders);
+  v1.use("/data-erasure-requests/:requestId", privateResponseHeaders);
   /**
    * Reject any non-canonical id before it reaches the store or the lease.
    * A case variant of a session id used to find the real row (MySQL's default collation is
@@ -446,6 +463,47 @@ export function createApp(deps: AppDeps) {
     return c.json(await deps.store.queryUsage(c.get("tenantId"), { ...q, userId: caller || q.userId }));
   });
 
+  // ---------- subject data lifecycle ----------
+  v1.post("/data-erasure-requests", async (c) => {
+    if (!deps.erasureRequestsEnabled || !deps.subjectLifecycle) {
+      throw new ApiError("draining", "data erasure requests are not activated on this fleet");
+    }
+    requireAdmin(c);
+    const principal = requireUser(c);
+    const headers = await parse(ErasureRequestHeaders, {
+      "x-user-id": c.req.header("x-user-id"),
+      "x-end-user-token": c.req.header("x-end-user-token"),
+      "idempotency-key": c.req.header("idempotency-key"),
+    });
+    let record;
+    try {
+      record = await deps.subjectLifecycle.requestUserErasure({
+        requestId: newErasureRequestId(),
+        tenantId: principal.tenantId,
+        userId: principal.userId,
+        requestedByKeyId: c.get("apiKeyId"),
+        idempotencyKey: headers["idempotency-key"],
+        requestHash: userErasureRequestHash(principal.tenantId, principal.userId),
+        atMs: Date.now(),
+      });
+    } catch (error) {
+      if (error instanceof ErasureIdempotencyMismatchError) {
+        throw new ApiError("idempotency_conflict", error.message);
+      }
+      throw error;
+    }
+    return c.json(publicErasureRequest(record), 202);
+  });
+  v1.get("/data-erasure-requests/:requestId", async (c) => {
+    if (!deps.subjectLifecycle) throw new ApiError("draining", "data erasure request status is unavailable");
+    requireAdmin(c);
+    const principal = requireUser(c);
+    const { requestId } = await parse(ErasureRequestParams, c.req.param());
+    const record = await deps.subjectLifecycle.getUserErasureRequest(principal.tenantId, principal.userId, requestId);
+    if (!record) throw new ApiError("not_found", "erasure request not found");
+    return c.json(publicErasureRequest(record));
+  });
+
   // ---------- items / events ----------
   v1.get("/sessions/:id/items", async (c) => {
     await deps.host.getSession(requireUser(c), c.req.param("id"));
@@ -495,6 +553,18 @@ export function createApp(deps: AppDeps) {
   return app;
 }
 
+function publicErasureRequest(record: Awaited<ReturnType<SubjectLifecycleStore["requestUserErasure"]>>): ErasureRequest {
+  return {
+    id: record.requestId,
+    scope: "user",
+    userId: record.subjectId,
+    generation: record.generation,
+    status: record.status,
+    createdAtMs: record.createdAtMs,
+    updatedAtMs: record.updatedAtMs,
+  };
+}
+
 /**
  * Only high-volume, non-terminal event types may be excluded. Excluding e.g. `session/status/changed`
  * would leave a streaming client waiting forever, so an unknown value is a client error.
@@ -507,7 +577,7 @@ const ID_PARAMS: [string, IdPrefix][] = [
   ["approvalId", "apr"],
 ];
 
-const blobResponseHeaders: MiddlewareHandler<AuthEnv> = async (c, next) => {
+const privateResponseHeaders: MiddlewareHandler<AuthEnv> = async (c, next) => {
   c.header("Cache-Control", "no-store");
   c.header("X-Content-Type-Options", "nosniff");
   await next();

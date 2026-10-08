@@ -11,6 +11,7 @@ import {
   SessionHasChildrenError,
   SessionLifecycleBusyError,
   SessionVersionError,
+  newUsageId,
   type EventBus,
   type LifecycleOutboxStore,
   type LeaseStore,
@@ -509,7 +510,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         fence: 7,
         turn,
         items: [item],
-        usageEntries: [{ turnId: turn.id, step: 1, provider: "p", model: "m", usage: emptyUsage(), createdAtMs: 1 }],
+        usageEntries: [{ usageId: newUsageId(), turnId: turn.id, step: 1, provider: "p", model: "m", usage: emptyUsage(), createdAtMs: 1 }],
         idempotency: {
           scope, key: idemKey, requestHash: "a".repeat(64),
           value: { turnId: turn.id, sessionId: s.id }, expiresAtMs: Date.now() + 60_000,
@@ -708,7 +709,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         turn,
         items: [item],
         approvals: [approval],
-        usageEntries: [{ turnId: turn.id, step: 1, provider: "fake", model: "fake", usage, createdAtMs: now }],
+        usageEntries: [{ usageId: newUsageId(), turnId: turn.id, step: 1, provider: "fake", model: "fake", usage, createdAtMs: now }],
         idempotency: {
           scope,
           key: "private-key",
@@ -803,35 +804,148 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
       const s = mkSession();
       await store.createSession(s);
       const turnId = newId("turn");
-      const usage = { ...emptyUsage(), inputTokens: 3, outputTokens: 2, totalTokens: 5 };
+      const usage = { ...emptyUsage(), inputTokens: 3, outputTokens: 2, totalTokens: 5, costCNY: 0.5 };
       await store.commit({
         sessionId: s.id,
         fence: 1,
         events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 1 }],
-        usageEntries: [{ turnId, step: 1, provider: "p", model: "m", usage, createdAtMs: 1 }],
+        usageEntries: [{ usageId: newUsageId(), turnId, step: 1, provider: "p", model: "m", usage, createdAtMs: 1 }],
         sessionPatch: { title: "committed", usage },
       });
-      expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({ steps: 1, usage: { totalTokens: 5 } });
+      expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({ steps: 1, usage: { totalTokens: 5, costCNY: 0.5 } });
+      expect((await store.getSession(s.tenantId, s.id))?.usage).toMatchObject({
+        totalTokens: 5,
+        costCNY: 0.5,
+      });
 
       await expect(store.commit({
         sessionId: s.id,
         fence: 2,
         events: [{ type: "session/created", sessionId: s.id, emittedAtMs: 2 }],
-        usageEntries: [{ turnId, step: 1, provider: "p", model: "m", usage, createdAtMs: 2 }],
+        usageEntries: [{ usageId: newUsageId(), turnId, step: 1, provider: "p", model: "m", usage, createdAtMs: 2 }],
         sessionPatch: { title: "must roll back", usage: { ...usage, totalTokens: 10 } },
       })).rejects.toThrow();
 
       const after = await store.getSession(s.tenantId, s.id);
-      expect(after).toMatchObject({ title: "committed", lastSeq: 2, fenceToken: 1, usage: { totalTokens: 5 } });
+      expect(after).toMatchObject({ title: "committed", lastSeq: 2, fenceToken: 1, usage: { totalTokens: 5, costCNY: 0.5 } });
       expect(await store.readEvents(s.id, 0, 100)).toHaveLength(2);
       expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]).toMatchObject({ steps: 1, usage: { totalTokens: 5 } });
 
       await expect(store.commit({
         sessionId: s.id,
         fence: 0,
-        usageEntries: [{ turnId: newId("turn"), step: 1, provider: "p", model: "m", usage, createdAtMs: 3 }],
+        usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1, provider: "p", model: "m", usage, createdAtMs: 3 }],
       })).rejects.toBeInstanceOf(FenceError);
       expect((await store.queryUsage(s.tenantId, { sessionId: s.id, groupBy: "total", limit: 10 })).data[0]?.steps).toBe(1);
+      await store.close();
+    });
+
+    it("rebuilds mixed-cost session, turn, event, and compaction projections from ledger facts", async () => {
+      const store = await make();
+      const s = mkSession("t_usage_projection", "u_usage_projection");
+      await store.createSession(s);
+      const turnId = newId("turn");
+      const compactionTurnId = newId("turn");
+      const now = Date.now();
+      const priced = {
+        ...emptyUsage(), inputTokens: 2, outputTokens: 1, totalTokens: 3, costCNY: 0.25,
+      };
+      const unknown = {
+        ...emptyUsage(), inputTokens: 3, outputTokens: 2, totalTokens: 5,
+      };
+      const staleMixed = {
+        ...emptyUsage(), inputTokens: 5, outputTokens: 3, totalTokens: 8, costCNY: 0.25,
+      };
+      const compactionUsage = {
+        ...emptyUsage(), inputTokens: 1, outputTokens: 1, totalTokens: 2,
+      };
+      const turn: Turn = {
+        id: turnId,
+        sessionId: s.id,
+        status: "completed",
+        stopReason: "end_turn",
+        seqStart: 2,
+        steps: 2,
+        toolCalls: 0,
+        usage: staleMixed,
+        startedAtMs: now,
+        completedAtMs: now,
+      };
+      const compaction: Item = {
+        id: newId("item"),
+        sessionId: s.id,
+        turnId: compactionTurnId,
+        seq: 0,
+        status: "completed",
+        createdAtMs: now,
+        completedAtMs: now,
+        type: "contextCompaction",
+        replacesUpToSeq: 1,
+        summary: "summary",
+        usageSnapshot: { ...compactionUsage, costCNY: 0.75 },
+      };
+      await store.commit({
+        sessionId: s.id,
+        fence: 1,
+        turn,
+        items: [compaction],
+        usageEntries: [
+          { usageId: newUsageId(), turnId, step: 1, provider: "p", model: "m", usage: priced, createdAtMs: now },
+          { usageId: newUsageId(), turnId, step: 2, provider: "p", model: "m", usage: unknown, createdAtMs: now + 1 },
+          { usageId: newUsageId(), turnId: compactionTurnId, step: 0, provider: "p", model: "m", usage: compactionUsage, createdAtMs: now + 2 },
+        ],
+        events: [
+          {
+            type: "usage/updated", sessionId: s.id, emittedAtMs: now, turnId, step: 1,
+            stepUsage: priced, turnUsage: priced, sessionUsage: priced,
+            runtime: { provider: "p", model: "m" },
+          },
+          {
+            type: "usage/updated", sessionId: s.id, emittedAtMs: now + 1, turnId, step: 2,
+            stepUsage: unknown, turnUsage: staleMixed, sessionUsage: staleMixed,
+            runtime: { provider: "p", model: "m" },
+          },
+          { type: "turn/completed", sessionId: s.id, emittedAtMs: now + 1, turn, stopReason: "end_turn" },
+          { type: "item/completed", sessionId: s.id, emittedAtMs: now + 2, item: compaction },
+        ],
+        sessionPatch: {
+          usage: {
+            ...emptyUsage(), inputTokens: 6, outputTokens: 4, totalTokens: 10, costCNY: 0.25,
+          },
+        },
+      });
+
+      const sessionUsage = (await store.getSession(s.tenantId, s.id))?.usage;
+      expect(sessionUsage).toMatchObject({ inputTokens: 6, outputTokens: 4, totalTokens: 10 });
+      expect(sessionUsage).not.toHaveProperty("costCNY");
+      const storedTurn = await store.getTurn(s.id, turnId);
+      expect(storedTurn?.usage).toMatchObject({ inputTokens: 5, outputTokens: 3, totalTokens: 8 });
+      expect(storedTurn?.usage).not.toHaveProperty("costCNY");
+      const storedCompaction = await store.getItem(s.id, compaction.id);
+      if (storedCompaction?.type !== "contextCompaction") throw new Error("compaction item missing");
+      expect(storedCompaction.usageSnapshot).not.toHaveProperty("costCNY");
+
+      const events = await store.readEvents(s.id, 1, 10);
+      const first = events.find((event) => event.type === "usage/updated" && event.step === 1);
+      const second = events.find((event) => event.type === "usage/updated" && event.step === 2);
+      const completed = events.find((event) => event.type === "turn/completed");
+      const itemCompleted = events.find((event) => event.type === "item/completed");
+      expect(first).toMatchObject({
+        type: "usage/updated",
+        stepUsage: { costCNY: 0.25 },
+        turnUsage: { inputTokens: 2, outputTokens: 1, totalTokens: 3, costCNY: 0.25 },
+      });
+      if (first?.type === "usage/updated") expect(first.sessionUsage).not.toHaveProperty("costCNY");
+      if (second?.type === "usage/updated") {
+        expect(second.stepUsage).not.toHaveProperty("costCNY");
+        expect(second.turnUsage).not.toHaveProperty("costCNY");
+        expect(second.sessionUsage).not.toHaveProperty("costCNY");
+      }
+      if (completed?.type === "turn/completed") expect(completed.turn.usage).not.toHaveProperty("costCNY");
+      if (itemCompleted?.type !== "item/completed" || itemCompleted.item.type !== "contextCompaction") {
+        throw new Error("compaction event missing");
+      }
+      expect(itemCompleted.item.usageSnapshot).not.toHaveProperty("costCNY");
       await store.close();
     });
 
@@ -870,7 +984,7 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
         await store.commit({
           sessionId: session.id,
           fence: 1,
-          usageEntries: [{ turnId, step: 1, provider: providerId, model: modelId, usage: { ...emptyUsage(), totalTokens: 1 }, createdAtMs: Date.now() }],
+          usageEntries: [{ usageId: newUsageId(), turnId, step: 1, provider: providerId, model: modelId, usage: { ...emptyUsage(), totalTokens: 1 }, createdAtMs: Date.now() }],
         });
       }
       expect((await store.queryUsage(tenantUpper, { userId: "usercase", groupBy: "total", limit: 100 })).data).toEqual([]);

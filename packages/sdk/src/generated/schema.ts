@@ -103,6 +103,43 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/data-erasure-requests": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Gate a user's data for asynchronous erasure
+         * @description Admin-only and capability-gated. Atomically blocks new user-owned writes and creates an auditable request; it does not claim physical purge is complete.
+         */
+        readonly post: operations["requestUserErasure"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/data-erasure-requests/{requestId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read an owned user erasure request */
+        readonly get: operations["getUserErasureRequest"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/models": {
         readonly parameters: {
             readonly query?: never;
@@ -785,6 +822,8 @@ export type components = {
                 /** @default false */
                 readonly blobAttachments?: boolean;
                 readonly byok: boolean;
+                /** @default false */
+                readonly dataErasureRequests?: boolean;
                 readonly dynamicTools: boolean;
                 readonly mcp: readonly ("streamable-http" | "stdio")[];
                 readonly replay: {
@@ -842,10 +881,21 @@ export type components = {
             readonly isError?: boolean;
             readonly toolCallId: string;
         };
+        readonly ErasureRequest: {
+            readonly createdAtMs: number;
+            readonly generation: number;
+            readonly id: string;
+            /** @enum {string} */
+            readonly scope: "user";
+            /** @enum {string} */
+            readonly status: "gated" | "draining" | "tombstoning" | "reconciling_usage" | "awaiting_purge_policy" | "purging" | "blocked" | "completed";
+            readonly updatedAtMs: number;
+            readonly userId: string;
+        };
         readonly ErrorBody: {
             readonly error: {
                 /** @enum {string} */
-                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_has_children" | "session_lease_conflict" | "idempotency_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
+                readonly code: "invalid_request" | "unauthorized" | "forbidden" | "not_found" | "session_busy" | "session_archived" | "session_has_children" | "subject_deleting" | "session_lease_conflict" | "idempotency_conflict" | "provider_error" | "approval_expired" | "draining" | "internal_error";
                 readonly details?: unknown;
                 readonly message: string;
                 readonly retryable?: boolean;
@@ -2524,6 +2574,7 @@ export type SchemaCreateApiKeyRequest = components['schemas']['CreateApiKeyReque
 export type SchemaCreateApiKeyResponse = components['schemas']['CreateApiKeyResponse'];
 export type SchemaCreateSessionRequest = components['schemas']['CreateSessionRequest'];
 export type SchemaDynamicToolResultRequest = components['schemas']['DynamicToolResultRequest'];
+export type SchemaErasureRequest = components['schemas']['ErasureRequest'];
 export type SchemaErrorBody = components['schemas']['ErrorBody'];
 export type SchemaEvent = components['schemas']['Event'];
 export type SchemaExcludableEventType = components['schemas']['ExcludableEventType'];
@@ -2775,6 +2826,93 @@ export interface operations {
             /** @description Error response. */
             readonly 503: {
                 headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly requestUserErasure: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Existing or newly accepted user erasure request. */
+            readonly 202: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErasureRequest"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getUserErasureRequest: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: {
+                /** @description Default end-user token header. A tenant may configure a different header name in its auth policy. */
+                readonly "x-end-user-token"?: string;
+                /** @description User asserted by a trusted tenant backend. */
+                readonly "x-user-id"?: string;
+            };
+            readonly path: {
+                readonly requestId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Erasure request status. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErasureRequest"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
                     readonly [name: string]: unknown;
                 };
                 content: {

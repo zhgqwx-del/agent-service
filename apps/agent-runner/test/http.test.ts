@@ -26,7 +26,9 @@ class EchoEngine implements AgentEngine {
       const wantsTime = /time/i.test(text);
       const toolCalls = wantsTime ? [{ id: "call_1", name: "current_time", args: {} }] : [];
       for (const ch of `echo: ${text}`.split(" ")) sink.onTextDelta(ch + " ");
-      const msg = { text: `echo: ${text} `, toolCalls, usage: { ...emptyUsage(), inputTokens: 3, outputTokens: 2, totalTokens: 5 }, stopReason: toolCalls.length ? ("toolUse" as const) : ("stop" as const), provider: "fake", model: "fake" };
+      // This deterministic fake is explicitly known-free; production providers omit costCNY when
+      // pricing is unknown, which the host treats fail-closed under maxCostCNY.
+      const msg = { text: `echo: ${text} `, toolCalls, usage: { ...emptyUsage(), inputTokens: 3, outputTokens: 2, totalTokens: 5, costCNY: 0 }, stopReason: toolCalls.length ? ("toolUse" as const) : ("stop" as const), provider: "fake", model: "fake" };
       await sink.onAssistantMessage(msg);
       for (const tc of toolCalls) {
         const d = await sink.beforeToolCall(tc, msg);
@@ -53,7 +55,10 @@ afterEach(async () => {
   for (const h of hosts.splice(0)) await h.drain(1_000).catch(() => {});
 });
 
-async function makeApp(heartbeatMs = 60_000) {
+async function makeApp(
+  heartbeatMs = 60_000,
+  lifecycle: { enabled?: boolean; attachStore?: boolean } = {},
+) {
   const store = new MemorySessionStore();
   await store.createApiKey("t_dev", "k1", hashApiKey("dev-key"), ["runtime", "admin"]);
   const providers = new ProviderService({
@@ -69,6 +74,8 @@ async function makeApp(heartbeatMs = 60_000) {
   const app = createApp({
     store, host, providers, tools, runnerId: "r", internalRouterToken: INTERNAL_ROUTER_TOKEN,
     heartbeatMs, maxBodyBytes: 1_000_000, ready: () => true,
+    erasureRequestsEnabled: lifecycle.enabled,
+    subjectLifecycle: lifecycle.attachStore ? store : undefined,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
     assertPublicUrl: async () => {},
@@ -89,6 +96,11 @@ const parseSse = (text: string) =>
       return { id, ...data };
     });
 
+function expectPrivateLifecycleResponse(response: Response): void {
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+}
+
 describe("agent-runner HTTP API", () => {
   it("advertises tombstone support without claiming physical purge", async () => {
     const { app } = await makeApp();
@@ -97,8 +109,126 @@ describe("agent-runner HTTP API", () => {
     expect(await response.json()).toMatchObject({
       protocolVersion: "2026-10-08",
       service: "agent-runner",
-      features: { sessionLifecycle: ["archive", "unarchive", "tombstone"] },
+      features: {
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        dataErasureRequests: false,
+      },
     });
+  });
+
+  it("advertises erasure requests only when both the deployment gate and store boundary are present", async () => {
+    const gateOnly = await makeApp(60_000, { enabled: true });
+    const storeOnly = await makeApp(60_000, { attachStore: true });
+    const enabled = await makeApp(60_000, { enabled: true, attachStore: true });
+
+    for (const app of [gateOnly.app, storeOnly.app]) {
+      expect(await (await app.request("/v1/capabilities")).json()).toMatchObject({
+        features: { dataErasureRequests: false },
+      });
+    }
+    expect(await (await enabled.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: { dataErasureRequests: true },
+    });
+  });
+
+  it("keeps erasure writes closed by default and enforces admin, user and idempotency identity", async () => {
+    const closed = await makeApp();
+    const disabled = await closed.call("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { "idempotency-key": "erase-default-off" },
+    });
+    expect(disabled.status).toBe(503);
+    expectPrivateLifecycleResponse(disabled);
+
+    const { app, store, call } = await makeApp(60_000, { enabled: true, attachStore: true });
+    await store.createApiKey("t_dev", "runtime-only", hashApiKey("runtime-key"), ["runtime"]);
+
+    const forbidden = await call("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { authorization: "Bearer runtime-key", "idempotency-key": "erase-no-admin" },
+    });
+    expect(forbidden.status).toBe(403);
+    expectPrivateLifecycleResponse(forbidden);
+    expect((await call("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { "x-user-id": "", "idempotency-key": "erase-no-user" },
+    })).status).toBe(400);
+    expect((await call("/v1/data-erasure-requests", { method: "POST" })).status).toBe(400);
+    expect((await call("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { "idempotency-key": "   " },
+    })).status).toBe(400);
+
+    // The feature route remains behind service-key authentication even when its deployment gate is on.
+    const unauthorized = await app.request("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { "idempotency-key": "erase-no-service-key", "x-user-id": "u_1" },
+    });
+    expect(unauthorized.status).toBe(401);
+    expectPrivateLifecycleResponse(unauthorized);
+  });
+
+  it("replays a subject request without leaking receipts and isolates the same key across users and tenants", async () => {
+    const { store, call } = await makeApp(60_000, { enabled: true, attachStore: true });
+    await store.createApiKey("t_other", "other-admin", hashApiKey("other-key"), ["admin"]);
+    await store.createApiKey("t_dev", "runtime-only", hashApiKey("runtime-key"), ["runtime"]);
+
+    const post = (userId: string, authorization = "Bearer dev-key") => call("/v1/data-erasure-requests", {
+      method: "POST",
+      headers: { authorization, "x-user-id": userId, "idempotency-key": "same-key" },
+    });
+    const agent = await j<{ id: string }>(await call("/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "erasure-gate",
+        instructions: "",
+        model: { provider: "dashscope", model: "qwen-plus" },
+      }),
+    }));
+    const existingSession = await j<{ id: string }>(await call("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.id }),
+    }));
+    const firstResponse = await post("u_1");
+    expect(firstResponse.status).toBe(202);
+    expectPrivateLifecycleResponse(firstResponse);
+    const first = await j<Record<string, unknown> & { id: string; generation: number }>(firstResponse);
+    expect(first).toMatchObject({ scope: "user", userId: "u_1", generation: 1, status: "gated" });
+    expect(Object.keys(first).sort()).toEqual([
+      "createdAtMs", "generation", "id", "scope", "status", "updatedAtMs", "userId",
+    ]);
+    expect((await call(`/v1/sessions/${existingSession.id}`)).status).toBe(404);
+    const blockedCreate = await call("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ agentId: agent.id }),
+    });
+    expect(blockedCreate.status).toBe(409);
+    expect(await blockedCreate.json()).toMatchObject({ error: { code: "subject_deleting" } });
+
+    const replay = await j<{ id: string; generation: number }>(await post("u_1"));
+    expect(replay).toMatchObject({ id: first.id, generation: 1 });
+
+    const second = await j<{ id: string; generation: number; userId: string }>(await post("u_2"));
+    expect(second).toMatchObject({ generation: 1, userId: "u_2" });
+    expect(second.id).not.toBe(first.id);
+
+    const own = await call(`/v1/data-erasure-requests/${first.id}`);
+    expect(own.status).toBe(200);
+    expectPrivateLifecycleResponse(own);
+    expect(await own.json()).toMatchObject({ id: first.id, userId: "u_1" });
+    const otherUser = await call(`/v1/data-erasure-requests/${first.id}`, {
+      headers: { "x-user-id": "u_2" },
+    });
+    expect(otherUser.status).toBe(404);
+    expectPrivateLifecycleResponse(otherUser);
+    const otherTenant = await call(`/v1/data-erasure-requests/${first.id}`, {
+      headers: { authorization: "Bearer other-key", "x-user-id": "u_1" },
+    });
+    expect(otherTenant.status).toBe(404);
+    expectPrivateLifecycleResponse(otherTenant);
+    expect((await call(`/v1/data-erasure-requests/${first.id}`, {
+      headers: { authorization: "Bearer runtime-key", "x-user-id": "u_1" },
+    })).status).toBe(403);
   });
 
   it("rejects M3-only agent declarations and turn inputs at the HTTP contract boundary", async () => {

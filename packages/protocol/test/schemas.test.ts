@@ -1,15 +1,24 @@
 import { describe, expect, it } from "vitest";
 import {
   ErrorCode,
+  ErasureRequest,
+  ErasureRequestHeaders,
+  ErasureRequestParams,
+  Capabilities,
   EndUserTokenHeaderName,
   Event,
   HTTP_STATUS,
   IntrospectionVerifier,
   Item,
   ModelSpec,
+  OPENAPI_DOCUMENT,
+  addUsage,
+  emptyUsage,
+  emptyUsageAccumulator,
   mergeLimits,
   StartTurnRequest,
   idSchema,
+  PROTOCOL_VERSION,
 } from "../src/index.js";
 
 describe("protocol schemas", () => {
@@ -24,6 +33,26 @@ describe("protocol schemas", () => {
     expect(m.maxSteps).toBe(5);
     expect(m.maxCostCNY).toBe(1);
     expect(m.maxToolCalls).toBe(50);
+  });
+
+  it("keeps a known-empty accumulator as the cost identity and makes an actual unknown cost sticky", () => {
+    const priced = { ...emptyUsage(), totalTokens: 1, costCNY: 0.25 };
+    expect(addUsage(emptyUsageAccumulator(), priced)).toEqual(priced);
+
+    // Token counters cannot identify the accumulator identity: a real zero-token provider result
+    // may still have unknown cost.
+    const zeroTokenUnknown = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 0,
+    };
+    const unknownTotal = addUsage(priced, zeroTokenUnknown);
+    expect(unknownTotal).toMatchObject({ totalTokens: 1 });
+    expect(unknownTotal).not.toHaveProperty("costCNY");
+    expect(addUsage(unknownTotal, emptyUsageAccumulator())).not.toHaveProperty("costCNY");
   });
 
   it("applies defaults on StartTurnRequest", () => {
@@ -54,9 +83,69 @@ describe("protocol schemas", () => {
     expect(Event.safeParse({ type: "session/deleted", sessionId: sid, emittedAtMs: 2, seq: 2, deletionGeneration: 0 }).success).toBe(false);
   });
 
-  it("publishes the parent-child deletion conflict as a stable 409", () => {
+  it("publishes lifecycle write barriers as stable 409 errors", () => {
     expect(ErrorCode.parse("session_has_children")).toBe("session_has_children");
     expect(HTTP_STATUS.session_has_children).toBe(409);
+    expect(ErrorCode.parse("subject_deleting")).toBe("subject_deleting");
+    expect(HTTP_STATUS.subject_deleting).toBe(409);
+  });
+
+  it("validates public erasure status without exposing internal idempotency or audit material", () => {
+    const value = ErasureRequest.parse({
+      id: "erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+      scope: "user",
+      userId: "u_1",
+      generation: 1,
+      status: "gated",
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    });
+    expect(value.status).toBe("gated");
+    expect(ErasureRequest.safeParse({ ...value, status: "done" }).success).toBe(false);
+    expect(ErasureRequest.safeParse({ ...value, generation: 0 }).success).toBe(false);
+    expect(ErasureRequestParams.safeParse({ requestId: value.id.toUpperCase() }).success).toBe(false);
+  });
+
+  it("requires a bounded non-blank idempotency key for erasure requests", () => {
+    expect(ErasureRequestHeaders.parse({
+      "x-user-id": "u_1",
+      "idempotency-key": " erasure-1 ",
+    })["idempotency-key"]).toBe("erasure-1");
+    expect(ErasureRequestHeaders.safeParse({ "x-user-id": "u_1" }).success).toBe(false);
+    expect(ErasureRequestHeaders.safeParse({ "x-user-id": "u_1", "idempotency-key": "   " }).success).toBe(false);
+    expect(ErasureRequestHeaders.safeParse({
+      "x-user-id": "u_1",
+      "idempotency-key": "x".repeat(257),
+    }).success).toBe(false);
+  });
+
+  it("declares private response headers for every erasure success and error response", () => {
+    const post = OPENAPI_DOCUMENT.paths["/v1/data-erasure-requests"].post.responses;
+    const get = OPENAPI_DOCUMENT.paths["/v1/data-erasure-requests/{requestId}"].get.responses;
+    for (const response of [post["202"], post.default, get["200"], get.default]) {
+      expect(response.headers["Cache-Control"].schema.enum).toEqual(["no-store"]);
+      expect(response.headers["X-Content-Type-Options"].schema.enum).toEqual(["nosniff"]);
+    }
+  });
+
+  it("normalizes missing additive erasure capability to false for mixed fleets", () => {
+    const parsed = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        blobAttachments: false,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    expect(parsed.features.dataErasureRequests).toBe(false);
   });
 
   it("rejects unknown item types", () => {

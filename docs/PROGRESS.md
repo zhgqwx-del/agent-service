@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、可逆 Archive v2、fenced tombstone、reliable terminal-event outbox，以及 Blob ownership/业务接线与 staging orphan 清理已完成，数据生命周期仍需 erasure/export、usage 对账匿名化、legacy generation `0` 补偿和默认关闭的 ready/session purge；M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-08）**：M0 已完成；M1 核心运行范围、OpenAPI 3.1、生成 TypeScript SDK、Archive/tombstone/outbox/Blob lifecycle，以及默认关闭的 user erasure durable gate/request/status 和 usage operational/billing 双写、reconcile/anonymize primitive 已完成；异步 export artifact/TTL、erasure worker 状态推进、tenant erasure/key revocation、legacy generation `0` 补偿和默认关闭的 ready/session purge 仍未完成，M1 尚未闭环。M2 的本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -270,3 +270,38 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - filesystem 仍只承诺单 runner 本地行为：没有断电持久性、真实 Windows/多进程目录竞争或 NFS 语义保证；永久 cancellation marker 会累积少量 inode/metadata。Blob TTL/outbox lease 使用 runner wall clock，未来多 VM 需约束并监控时钟偏差或改用共享数据库时间。
 - 当前 compaction 保护外置工具事实，但历史图片以文字占位参与 summary，像素不会跨 watermark 保留；要宣称多模态长期上下文无损，仍需视觉摘要/OCR 或等价策略。
 - ready Blob/session 的物理删除仍未接线，共享 OSS/S3 adapter、IAM/KMS 和 production cleanup 仍等待真实云资源。下一切片先实现可审计的 erasure/export 与 usage 内容/财务事实分层，再建设 generation `0` 补偿及默认关闭的 purge；完成 M1 后才正式进入 M3。
+
+## 2026-10-08（M1 数据生命周期：user erasure gate 与 usage 财务分层）
+
+### 已完成
+
+1. 新增 expand-only `0011_erasure_and_usage_separation.sql`：nullable、case-sensitive `usage_id`，最小化 `billing_usage_facts`、`usage_reconciliations`，以及 `subject_lifecycle`、`erasure_requests`、`erasure_audit_events`。migration 不回填 billing fact、不匿名化历史 operational usage、不推进 erasure 状态，也不激活任何物理 purge；legacy writer 在 mixed-version 窗口仍可写 `usage_id = NULL`。restart-safe session trigger 会为迁移后旧 writer 新建的 session 原子补 tenant/user lifecycle 行，migration marker 丢失后重放也不覆盖现有 gate/legal hold；trigger 不会让旧 writer 检查 gate，不能替代发布 drain。
+2. Memory/MySQL 均实现 user subject durable gate。`requestUserErasure` 在一个原子操作中提交 `subject=deleting`、单调 generation、request=`gated` 和首条 `erasure/gated` audit；验证或 audit INSERT 失败会完整回滚。相同 key/主体重放幂等，同 key 跨 user/tenant 隔离。subject lifecycle 的 `updatedAtMs` 取现值与请求时间的最大值，跨 runner 轻微时钟倒退不会写出不可解码状态。gate 与 session create 并发只有“完整创建先提交后立即隐藏”或“创建被 gate 拒绝”两种结果，不会留下 gate 后仍可见的半 session。
+3. 新增 admin-only、user-scoped `POST /v1/data-erasure-requests` 和 owner-scoped status GET，POST 强制 `Idempotency-Key`。writer gate `DATA_ERASURE_REQUESTS_ENABLED` 在 runner/router 默认都是 `0`；router 只有在显式 writer gate、`RUNNERS` 中全部 configured targets 都健康且声明 capability、selected target 仍支持时才接受 POST，暂时不可达的已配置旧 writer 不会被健康子集掩盖。status GET 不依赖 router writer gate，按当前 healthy fleet 与 selected target capability fail-closed；healthy mixed fleet 返回 `503`，不会随机落到旧 runner 返回误导性的 `404`。writer gate 开启期间，session/usage 等 user-scoped runtime 每次转发也会复核 selected target capability。两条 erasure 路由的成功、鉴权/owner 404 与 router 自产错误均强制 `Cache-Control: no-store` 和 `nosniff`，OpenAPI/SDK 同步声明。
+4. subject gate 一旦线性化，新发起的普通 owner session/turn/item/usage/receipt/Blob 读取隐藏，session create、普通 runtime commit 与 Blob stage/mark 被拒绝；同 tenant 的其它 user 保持可用。公开 response 不含 actor key、idempotency material 或内部 audit payload。当前状态只到 `gated`，没有后台 worker推进后续状态；已建立 SSE 不会主动关闭，active provider/tool 尚不跨 runner abort/drain。
+5. 新 usage write 在同一业务事务中生成 opaque `usage_id`，原子双写 operational ledger 与严格白名单 billing fact；billing 层不含 user/session/turn/step、精确请求/reconcile 时间、原始 usage JSON、prompt、item 或 idempotency key。billing identity/content 冲突会回滚完整业务 commit；精确验证时间只保留在 owner-scoped reconciliation。
+6. legacy usage reconciliation primitive 会在 owner 与 tombstone `deletion_generation > 0` 匹配时锁定并串行检查该 session 的全部 operational row；任何 ledger/session owner 不一致都整体 fail-closed，不会跨 tenant 聚合或在 anonymize 时静默漏账。通过 owner 检查后先把历史 `usage_id IS NULL + costCNY=0` 的歧义值固化为 unknown，再逐一分配 ID、原子更新 usage JSON、建立或核对 billing fact，最后核对 row count、六类 token、known-cost row、规范化 cost 与 checksum。冲突会回滚 ID、JSON、fact 和 reconciliation，generation `0` 明确拒绝，不会被误当成已清理。
+7. anonymize primitive 必须显式 enabled、携带已验证 checksum，并由 store 自己复核 durable tenant/user legal hold；通过后只删除目标 session 的 operational usage，保留 billing fact，重试幂等。legal hold 会阻止尚未发生的 `verified → anonymized`，但匿名化已提交、响应丢失后再新增 hold，不会把同 owner/generation/checksum 且 operational row 为零的重试伪装成失败。它尚未接入 erasure worker 或公开 API，因此不把 primitive 描述成自动保留策略已经运行。
+8. 修复未知价格与历史投影语义：provider model 未配置 price 时，Pi turn 与 summarizer 不再把内部零值记录成已知 `costCNY=0`。Memory/MySQL 的 session、turn、event、compaction usage 投影都以 ledger 为权威；MySQL 在同一 consistent read/业务事务快照内以 SQL summary 聚合，读取和下一次 commit 都能纠正旧 writer 的 partial projection。历史 null-ID zero 因无法区分“未知价”与“真实免费价”而保守视为 unknown，新版有 identity 的 zero 保持 known-zero；普通 rollup 仅在全部组成记录已定价时返回完整 cost。硬 `maxCostCNY` 遇到正常 unpriced step 会先持久化该 step，再禁止其工具和后续模型 step，provider error/abort 不会被改写为 `max_cost`。
+9. 新增冻结的 `0010` 历史数据库夹具，真实执行 `0010 → 0011`，覆盖空 ledger、全 priced、两种 mixed 顺序、legacy zero、新版 known-zero、turn/event/compaction 投影、marker 丢失重放不重复、migration 后旧 writer session/usage 插入与 partial projection 修复、owner 隔离，以及首张新表 DDL auto-commit 后续迁、错误形状 identity index 修复、case-sensitive schema、subject backfill、gate/legal hold 保留。runtime 正确性不依赖再次执行 migration DML；既有 usage/session/outbox/Blob 不被静默改写。历史升级链现在覆盖 `0007 → 0008 → 0009 → 0010 → 0011`。
+10. CI/local verify 新增两个命名且不得 skip 的真实 MySQL 门禁：`test:usage-lifecycle-mysql` 与 `test:subject-lifecycle-mysql`；主 JSON report 也要求两个目标文件确实执行。runner image 启动检查要求最新 `0011` migration 已应用。OpenAPI/生成 SDK 已同步新增两条 data-lifecycle operations。
+
+### 验证说明
+
+- Memory 与真实 MySQL 专项套件覆盖 gate/request/audit 原子性、数据库回滚、create/Blob 并发边界、owner 隔离、usage 双写回滚、mixed unknown/known-zero、硬预算 fail-closed、legacy reconciliation 冲突、legal hold 与 crash-retry-safe 幂等 anonymize。
+- `0010 → 0011` 使用独立历史 schema，而不是 fresh-schema 替代测试；CI 和 `scripts/local-service.sh verify` 都有显式执行入口和 no-skip proof。
+- `pnpm check:secrets`：通过，扫描 **206 files**；`pnpm check:api`、`pnpm typecheck` 与 `git diff --check` 通过。
+- MemoryStore/session lifecycle 定向套件 **57/57 passed**；router gate/滚动升级定向套件 **41/41 passed**；真实 MySQL usage lifecycle **8/8**、subject lifecycle **5/5**，两者的 no-skip execution proof 均通过。usage MySQL 还覆盖高金额 canonical `DECIMAL(24,9)` 原值、checksum 与 reconciliation retry。
+- 固定历史 MySQL migration suites **7/7 passed**，真实执行 `0007 → 0008 → 0009 → 0010 → 0011`，包括相同 usage 合并、冲突阻断与 legacy pending receipt 保留。
+- `scripts/local-service.sh verify`：主套件 **482 passed / 1 skipped**；覆盖率 **85.14% statements / 77.56% branches / 86.36% functions / 89.73% lines**；cluster **11/11 passed**；SDK 真实 18-file package 与 runner/router 原生 Node bundle 的启动、readiness、转发及 OpenAPI 门禁通过。
+- 本轮修改了价格投影和预算判断，但未改变真实 provider dialect 或网络契约；unknown/known-zero 与 fail-closed 行为已有确定性 fake-engine/provider 测试，因此没有重复运行收费的 `verify-real` 或 acceptance。最近真实模型 **1/1** 与十阶段 acceptance 只作为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2 冻结结论不变，本轮没有开始 M3。M1 仍未闭环。
+- 当前 user erasure 只完成 durable gate/request/status。尚无状态推进 worker、既有 SSE 撤销、active turn 跨 runner abort/drain、request/generation 绑定的 tombstone 批处理、ready Blob/session purge、completed proof 或备份恢复重放；`gated` 绝不等同于 erasure completed，完成这些能力前 staging/production 必须保持 writer gate 关闭。
+- Blob 上传按 manifest stage→object put→mark 顺序执行；gate 若在 put 期间胜出，mark 会失败，对象只保留为 owner 不可读的 staging orphan，随后由已有 TTL cleanup 删除。该竞态已有真实 `SessionBlobService`→cleanup 回归测试，但它不是“gate 后物理字节已清零”的承诺。
+- tenant erasure 尚未公开，API key 撤销、provider/auth secret 停用与 key revocation 尚未实现。公开范围继续限制为 admin service key 代表明确 user 发起请求。
+- export 尚无异步 job、一致性 ownership snapshot、artifact ownership、下载 API、TTL 或删除任务；不能以同步大 JSON 替代完整 export。
+- usage 已有安全 primitive，但自动任务、政策化 operational/billing 保留期、长期字段白名单治理和审计管理面仍待完成。legacy `deletion_generation = 0` 补偿以及默认关闭的 ready/session physical purge 仍是后续工作。
+- MySQL 投影已避免把整份 ledger 拉入 Node，并保证同一快照正确性；当前聚合仍会按 `(session_id, ...)` 索引扫描长 session 的 ledger。M4 前应基于真实长会话做基准并决定是否增加事务维护的物化汇总，但不得以牺牲 unknown/owner fail-closed 语义换取性能。

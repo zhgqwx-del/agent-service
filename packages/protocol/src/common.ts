@@ -67,15 +67,28 @@ export const emptyUsage = (): Usage => ({
   totalTokens: 0,
 });
 
-export const addUsage = (a: Usage, b: Usage): Usage => ({
-  inputTokens: a.inputTokens + b.inputTokens,
-  outputTokens: a.outputTokens + b.outputTokens,
-  cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
-  cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
-  reasoningTokens: a.reasoningTokens + b.reasoningTokens,
-  totalTokens: a.totalTokens + b.totalTokens,
-  costCNY: a.costCNY === undefined && b.costCNY === undefined ? undefined : (a.costCNY ?? 0) + (b.costCNY ?? 0),
-});
+/**
+ * Additive identity for an aggregate Usage. Keep this distinct from `emptyUsage()`: a real provider
+ * response may legally report zero tokens while its price is still unknown.
+ */
+export const emptyUsageAccumulator = (): Usage => ({ ...emptyUsage(), costCNY: 0 });
+
+export const addUsage = (a: Usage, b: Usage): Usage => {
+  const costCNY = a.costCNY === undefined || b.costCNY === undefined
+    ? undefined
+    : a.costCNY + b.costCNY;
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+    reasoningTokens: a.reasoningTokens + b.reasoningTokens,
+    totalTokens: a.totalTokens + b.totalTokens,
+    // A partial sum is not a total. Once one real constituent is unpriced, every enclosing Usage
+    // stays unpriced; known zero remains distinct from unknown.
+    ...(costCNY === undefined ? {} : { costCNY }),
+  };
+};
 
 /** Kernel safety valves. Effective value = min(config, agent, request): policy can only tighten. */
 export const Limits = z.object({

@@ -1,6 +1,6 @@
 # 数据生命周期设计
 
-> 状态：**Archive v2、fenced tombstone、reliable terminal-event outbox，以及 Blob ownership/业务接线与 staging orphan 清理已实现；待产品/合规确认，尚未启用 ready/session 内容的物理清理**（2026-10-08）。本文给出 M1 完整数据生命周期的实现契约和安全默认值；在“待确认策略”确定前，只允许继续实现 erasure gate/export、legacy 补偿、usage 对账匿名化、默认关闭的 purge 路径和测试，不得自动永久删除用户内容。
+> 状态：**Archive v2、fenced tombstone、reliable terminal-event outbox、Blob ownership/业务接线与 staging orphan 清理、默认关闭的 user erasure durable gate/request/status，以及 usage operational/billing 分层与核对/匿名化 primitive 已实现；尚未启用 ready/session 内容的物理清理**（2026-10-08）。本文给出 M1 完整数据生命周期的实现契约和安全默认值；在“待确认策略”确定前，只允许继续实现异步 export artifact/TTL、erasure worker、tenant erasure/key revocation、legacy 补偿和默认关闭的 purge 路径及测试，不得自动永久删除用户内容。
 
 ## 1. 当前实现与缺口
 
@@ -14,7 +14,11 @@ runner 内置 Blob cleanup worker 目前只把过期 staging orphan 标记为 `d
 
 runner 启动时会同时启动 lifecycle outbox dispatcher。它只领取 `session.tombstoned`，重新读取 durable `session/deleted` 并校验 session、seq 与 generation，再发布到 event bus；claim lease/CAS 与有上限的指数退避使进程崩溃和暂时总线/存储失败可以持续恢复，不会因次数耗尽而永久停投。确定损坏的 envelope/event identity 会隔离到 dead-letter，且 poison row 不会阻塞后续 intent。投递是 at-least-once，丢失完成确认时允许重复发布同一 event `seq`，`SessionHost` 的订阅路径会按 seq 去重并补洞；这不是 exactly-once 承诺。
 
-这意味着当前实现可以原子、安全地隐藏 tombstoned 数据、持续重投 terminal event，并清理由上传/提交失败产生的 staging 对象；但不能宣称 ready 内容已永久删除，或已满足用户主体删除、财务保留、导出和附件最终清理要求。确定损坏的 dead-letter 目前只有 durable marker；dispatcher 识别出的 event identity 损坏另有受控日志，但 claim 阶段识别出的 malformed envelope 不会主动产生日志。管理端查看、修复/重放、指标和告警均尚未闭环。
+`0011_erasure_and_usage_separation.sql` 已增加 case-sensitive `subject_lifecycle`、`erasure_requests`、`erasure_audit_events`、nullable `usage_id`、`billing_usage_facts` 和 `usage_reconciliations`。Memory/MySQL 都能在一个原子操作中安装 user subject gate、request 和首条 `erasure/gated` audit；失败会完整回滚。迁移还安装 restart-safe `AFTER INSERT sessions` trigger，为 mixed-version 旧 writer 新建的 session 原子补齐 tenant/user lifecycle 行且绝不覆盖 gate/hold；它只修复可见性行，不会让旧 writer 检查 gate，所以激活前仍必须排空旧实例。公开入口只允许 admin service key 为明确 user 发起带 `Idempotency-Key` 的请求，runner/router writer gate 默认关闭，所有 POST/status 成功与错误响应都禁止缓存。gate 一旦线性化，新发起的普通 owner 请求被隐藏，session create、runtime commit 与 Blob manifest 发布等 durable 用户写入被阻断；同 tenant 的其他 user 不受影响。该 durable gate 没有公开撤销语义；关闭 router writer gate 只会停止接受新的 erasure POST，不会撤销已经提交的 subject gate。当前 request 只停在 `gated`：已建立 SSE 尚不会被主动撤销，active provider/tool 也尚无跨 runner abort/drain，因此可能继续输出 live-only delta/heartbeat，直到现有执行触及被拒绝的 commit 或未来 worker 接管。它没有推进 `draining/tombstoning/reconciling_usage/awaiting_purge_policy`，也没有公开 tenant erasure 或 API key/provider/auth secret 撤销。
+
+新 usage write 会在同一 store transaction 中以 opaque `usage_id` 双写 operational ledger 与严格白名单的 billing fact；后者不含 user/session/turn/step、原始 usage JSON、prompt 或 idempotency key，金额统一以 9 位小数规范字符串写入 MySQL `DECIMAL(24,9)`，避免高金额经 JavaScript 隐式字符串化产生 checksum 漂移。session/turn/event/compaction 投影以 ledger 为权威：Memory 直接聚合事实，MySQL 在同一 consistent read/业务事务快照内用 SQL summary 聚合，读取和下一次 commit 都能修复旧 writer 留下的 partial projection，而不依赖 migration 回写。对 legacy `usage_id IS NULL` 行，显式 reconciliation 会在 tombstone generation 大于 `0`、owner 匹配的前提下先固化历史 cost 归一化，再补 ID、逐行核对或插入 billing fact，最后核对 row count、各 token、known-cost row、规范化 cost 和 checksum；冲突会回滚 ID、JSON、fact 与 reconciliation，而非覆盖。显式 anonymize primitive 还会在锁内复核 checksum 和 durable tenant/user legal hold，只删除目标 session 的 operational usage，保留 billing fact，并支持幂等重试；legal hold 只阻止尚未发生的 `verified → anonymized` 转换，不能把已提交但响应丢失的同 checksum 重试伪装成失败。它尚未由 erasure worker 或公开 API 调度。未知模型价格保持 cost 缺失，已知零价保持 `0`；历史 `usage_id IS NULL + costCNY=0` 无法可靠区分“旧 writer 用零表示未知”与“真实免费价”，因此安全默认把它视为 unknown，新版有非空 identity 的零价仍是 known-zero。普通 rollup 只有在全部 constituent 已定价时才公开完整 cost，不能把已知小计伪装成总价。硬 `maxCostCNY` 遇到未定价的正常 step 会在该 step 落账后关闭 admission，不执行其工具或下一模型 step。
+
+这意味着当前实现可以原子、安全地隐藏 tombstoned 或已 gated user 的普通数据、持续重投 terminal event、清理由上传/提交失败产生的 staging 对象，并为 usage 财务保留提供可验证 primitive；但不能宣称 ready 内容已永久删除、user erasure 已完成，或 export/tenant erasure/附件最终清理已闭环。确定损坏的 dead-letter 目前只有 durable marker；dispatcher 识别出的 event identity 损坏另有受控日志，但 claim 阶段识别出的 malformed envelope 不会主动产生日志。管理端查看、修复/重放、指标和告警均尚未闭环。
 
 ## 2. 生命周期模型与不变量
 
@@ -32,6 +36,7 @@ runner 启动时会同时启动 lifecycle outbox dispatcher。它只领取 `sess
 5. events 包含 item、turn、approval 快照，必须与 session 内容执行相同的删除策略。
 6. 跨 tenant/user 操作继续返回与不存在相同的 `404`，不能形成存在性 oracle。
 7. MySQL 事务不能包含对象存储删除；必须用事务 outbox 保证最终完成与安全重试。
+8. 任一 subject gate 首次提交后，所有可能处理该 tenant/user 请求的 writer 都必须继续理解并执行 `subject_lifecycle`；关闭 admission 开关不能把 lifecycle-aware fleet 安全回退成会忽略 durable gate 的旧 writer。
 
 ## 3. Archive 推荐语义
 
@@ -86,12 +91,14 @@ turn 与 archive 竞态只允许两种结果：archive 先提交时 turn 不产�
 
 继续保持现有正确性基础：ledger 与 `usage/updated`、turn/session usage 投影在同一 commit 中，且 `(session_id, turn_id, step)` 唯一。
 
-目标态分两层：
+`0011` 已把 usage 落盘分成两层：
 
 - operational usage ledger：短期保留 tenant/user/session/turn/step，用于重试、查询和对账。
-- billing ledger：长期仅保留 tenant、accounting period、provider/model、tokens/cost/invoice，以及政策允许的 pseudonymous subject；不保留 prompt、item 或原始 idempotency key。
+- billing ledger：新写入只保留 opaque usage identity、tenant、UTC accounting period、provider/model、tokens、可选 cost/currency 和完整性 metadata；不保留 user/session/turn/step、精确请求/reconcile 时间、prompt、item、原始 usage JSON 或 idempotency key。
 
-purge 必须先用稳定 `usage_id` 幂等汇总到 billing ledger，核对 tokens、cost、row count 校验和，再清除 user/session/turn 直接归因并删除 operational row。若仍需用户级账务，应使用独立 `billing_subject_id`，删除其与真实 user id 的映射。
+新 writer 在业务 commit 内原子双写两层，billing identity 或内容冲突会使整个 commit 回滚。所有持久化 cost 使用同一个 9 位小数 canonical formatter；投影从 ledger summary 重建，mixed priced/unpriced 保持 unknown，owner-corrupt facts 不参与“部分正确”的计数而是整体 fail-closed。legacy 行不会由 migration 静默改写；`reconcileSessionUsage` 只处理 owner 匹配且已 tombstone、`deletion_generation > 0` 的 session，在并发锁下锁定该 session 的全部 usage row，先把历史 null-ID zero 规范为 unknown，再分配稳定 `usage_id`、核对 tokens、known/unknown cost、row count 与 checksum。`anonymizeSessionUsage` 必须由调用方显式传入 enablement 和预期 checksum，并由 store 自己读取 durable legal hold；核对成功后只删除 operational row，billing fact 继续保留。
+
+这仍是最小权限 primitive，不是已经运行的 retention/erasure worker。启用批量匿名化前仍需确认 operational/billing 保留期、成本/币种和 provider/model 白名单、legal hold 管理面、任务游标/恢复与审计策略。若未来仍需用户级账务，应使用独立 `billing_subject_id`，删除其与真实 user id 的映射。
 
 原始 `Idempotency-Key` 后续应改为服务端 HMAC 后的确定性值；客户端可能误把邮箱等个人信息放进 key，当前明文存储会扩大个人信息面。
 
@@ -108,10 +115,12 @@ purge 必须先用稳定 `usage_id` 幂等汇总到 billing ledger，核对 toke
 
 ## 8. User/Tenant erasure 与导出
 
-主体删除应是异步、幂等的 erasure job，而不是循环调用 session DELETE：
+当前已经实现 user scope 的第一道 durable gate：`POST /v1/data-erasure-requests` 由 admin service key 代表明确 user 发起，要求 `Idempotency-Key`；Memory/MySQL 原子提交 subject=`deleting`、单调 generation、request=`gated` 和首条无正文 audit。router 的 POST 入口要求显式 `DATA_ERASURE_REQUESTS_ENABLED=1`、`RUNNERS` 中全部 configured targets 均健康且声明 capability，以及 selected target capability；暂时不可达的已配置旧 writer 不能被当作已排空。writer gate 开启期间，session/usage 等 user-scoped runtime 每次转发也会拒绝 capability 已回退的 selected target；gate 关闭的 expand mixed window 不受此限制。状态 GET 不依赖 router writer gate，仍按当前 healthy fleet 与 selected target 支持能力 fail-closed，healthy mixed fleet 返回 `503` 而不是随机命中旧 runner 的 `404`；GET 不承担 POST 的全 configured-fleet 激活判定。gate 后的新普通请求隐藏，新的 durable user write 被 store transaction 拒绝；既有 SSE/active execution 的可靠撤销属于下一状态 `draining`，当前尚未实现。
 
-1. 建立 `erasure_requests`，以 `(tenant_id, user_id?, generation)` 唯一。
-2. 先把 tenant/subject 标为 `deleting`；session create 和 turn start 的存储事务检查该 gate，避免枚举期间创建新数据。
+主体删除的完整目标仍应是异步、幂等的 erasure job，而不是循环调用 session DELETE：
+
+1. 建立 `erasure_requests`，以 `(tenant_id, subject_kind, subject_id, generation)` 唯一；user scope 已实现，tenant scope 尚未公开。
+2. 先把 tenant/subject 标为 `deleting`；session create 和普通 runtime/Blob 写入的存储事务检查该 gate，避免枚举期间创建新数据。user scope 已实现并停在此状态。
 3. tenant erasure 立即吊销 API keys，停止使用 provider/auth secrets。
 4. 请求 owner 中断 active turn并有界 drain；超时后等待 lease 失效，再用新 fence tombstone。
 5. 分批删除内容、receipt 和 blob；usage 按财务政策匿名化。
@@ -145,16 +154,17 @@ runner 内置 lifecycle dispatcher 只声明 `session.tombstoned` topic，读取
 
 采用 expand → activate → contract：
 
-1. 已增加 nullable tombstone 字段、parent index、lifecycle outbox、Blob manifest 与 Blob delete outbox；关系类型和 erasure 表仍按 nullable/additive 方式扩展，旧代码必须可忽略。
+1. 已增加 nullable tombstone 字段、parent index、lifecycle outbox、Blob manifest/Blob delete outbox，以及 `0011` 的 nullable usage identity、billing/reconciliation 表和 subject/erasure 表。`0011` 不回填 billing fact、不匿名化历史 usage、不激活物理 purge，旧 writer 可在 mixed-version 窗口继续留下 `usage_id = NULL`。
 2. tombstone 是 protocol family `2026-10-08` 内的 additive capability，不提升 exact protocol version。客户端必须忽略未知 event；新 router 能同时探测未声明和已声明 `tombstone` 的同 family runner。
 3. 先在 API gateway 暂停精确 session DELETE（或将流量整体切到 gate 为 `0` 的新 router 池），再发布新 router 并保持 `SESSION_TOMBSTONE_ENABLED=0`；在开始发布新 runner 前，排空并退出全部不能理解新 capability 的旧 router。旧 router 自身没有该 gate，因此不能在它仍接收 DELETE 时只靠逐实例替换保证一致语义；runner 端口必须保持内网不可直连，否则会绕过 gate。切换后其它 API 保持可用，精确的 session DELETE 返回可重试 `503 draining`。
 4. 再滚动新 runner。router 除显式开关外还要求全部健康 runner 都声明 `tombstone`，所以旧 owner/哈希目标仍存在时不会激活新 DELETE 语义；核对配置 fleet 和 `/v1/capabilities` 后，才把新 router 的 `SESSION_TOMBSTONE_ENABLED` 设为 `1`。外部 DELETE 会改写成带 `INTERNAL_ROUTER_TOKEN` 的版本化 runner-only POST，并要求 ACK；旧 runner 只会 404，router 不会回退到旧公开 DELETE。`RUNNERS` 每项必须是实例稳定地址，不能是随机选择不同版本 Pod 的共享 LB；token 轮换期间先把 gate 恢复为 `0`。
-5. Blob 写入采用另一组 expand→activate gate：新 runner 可先带 reader、manifest、worker 部署但保持 `BLOB_ATTACHMENTS_ENABLED=0`；新 router 同样保持 gate `0`。确认全部健康 runner 声明 `blobAttachments`、共享对象存储可从每个 runner 访问且 cleanup 已启用后，才同时激活写入口。关闭写 gate不能关闭历史 ready blob 的读取。当前只有 runner-exclusive filesystem adapter，`BLOB_FILESYSTEM_SINGLE_RUNNER=1` 只允许本地单实例体验；production 配置会同时拒绝 writer 与 cleanup，不能据此演练真正的多实例 rollout。
-6. 上述 gate 只覆盖同一 protocol family 内的 additive rollout。未来真正改变 protocol version 的不兼容变更仍需全量 drain 的维护窗口或将 router+runner 整组 blue-green，除非另行实现 version range/按版本路由。
-7. 全部 legacy writer drain 后，才能清理允许删除的 pending receipt、执行 generation `0` 补偿，或激活后续 erasure gate。
-8. `session.purge` 与 ready 内容的物理 purge 独立保持关闭；只有策略确认、usage 核对、备份恢复演练和校验完成后才允许启用对应 worker。
-9. usage 匿名化字段先双写、回填、核对，不能一次迁移直接破坏现有 attribution/唯一键。
-10. staging/production 使用独立 migration Job，runner 只检查 schema；本地/CI 可继续自动迁移。
+5. Blob 写入采用另一组 expand→activate gate：新 runner 可先带 reader、manifest、worker 部署但保持 `BLOB_ATTACHMENTS_ENABLED=0`；新 router 同样保持 gate `0`。确认全部健康 runner 声明 `blobAttachments`、共享对象存储可从每个 runner 访问且 cleanup 已启用后，才同时激活写入口。关闭写 gate 不能关闭历史 ready blob 的读取。当前只有 runner-exclusive filesystem adapter，`BLOB_FILESYSTEM_SINGLE_RUNNER=1` 只允许本地单实例体验；production 配置会同时拒绝 writer 与 cleanup，不能据此演练真正的多实例 rollout。
+6. user erasure POST 采用独立 expand→activate gate：先应用 `0011`，部署新 router/runner 且保持 `DATA_ERASURE_REQUESTS_ENABLED=0`，排空旧 router 与旧 writer；0011 的 session trigger 能补齐旧 writer 新建的 session lifecycle 行，但不能阻止其继续写已有 session，不能替代 drain。随后先在不可被公网直连的新 runner 上启用 gate，使 `RUNNERS` 中每个 configured target 都完成健康探测并声明 `dataErasureRequests`，再启用 router writer gate；任一 configured target 暂时不可达或缺少能力时 POST 均 fail-closed。紧急停止 admission 时先关闭 router writer gate；这只阻止新的 POST，不撤销任何已提交 gate。状态 GET 不依赖 router writer gate，但会持续要求当前 healthy fleet 与 selected target capability，healthy mixed fleet fail-closed；GET 不承担 POST 的全 configured-fleet 激活判定。一旦至少一个 erasure request 已被接受，应用层不能再安全回退到 pre-`0011` 或任何 lifecycle-unaware runner：旧 writer 会忽略 durable subject gate，可能重新暴露数据或接受写入。此后必须维持 capable fleet 并 forward-fix；若紧急恢复旧版本不可避免，必须先在 edge 阻断所有受影响的 tenant/user subject，无法精确阻断时就阻断全部 user-scoped runtime 流量，再执行恢复，同时保留 `0011` schema 与 durable lifecycle 记录。
+7. 上述 gate 只覆盖同一 protocol family 内的 additive rollout。未来真正改变 protocol version 的不兼容变更仍需全量 drain 的维护窗口或将 router+runner 整组 blue-green，除非另行实现 version range/按版本路由。
+8. 全部 legacy writer drain 后，才能清理允许删除的 pending receipt、运行 legacy usage reconciliation、执行 generation `0` 补偿，或把 erasure worker 推进到不可逆阶段。
+9. `session.purge` 与 ready 内容的物理 purge 独立保持关闭；只有策略确认、usage 核对、备份恢复演练和校验完成后才允许启用对应 worker。
+10. usage 采用先双写、再锁内回填/核对、最后显式匿名化；不能一次 migration 直接破坏现有 attribution/唯一键。
+11. staging/production 使用独立 migration Job，runner 只检查 schema；本地/CI 可继续自动迁移。
 
 ## 11. 待确认策略
 
@@ -173,15 +183,15 @@ runner 内置 lifecycle dispatcher 只声明 `session.tombstoned` topic，读取
 
 ## 12. 验收矩阵
 
-当前 fenced tombstone 已覆盖 Memory/MySQL 原子性与回滚、普通资源隐藏、tenant/user 隔离、幂等重试、parent/child 并发、stale fence、orphan repair、terminal SSE、真实 0008→0009 迁移和多进程 takeover。lifecycle outbox 测试覆盖并发领取、lease 回收、stale acknowledgement、退避/dead-letter、总线故障和不触碰 purge。Blob 测试覆盖 filesystem/in-memory adapter、Memory/MySQL ownership、上传→绑定、事务回滚、跨 owner 隔离、全局资源 identity、并发首写、过期 staging 的硬拒绝、sweep/bind 竞态、两个独立 MySQL store 的并发领取与 lease takeover、delete claim/CAS，以及真实 0009→0010 迁移。以下矩阵中 ready purge、erasure 与 backup 项仍是后续验收目标：
+当前 fenced tombstone 已覆盖 Memory/MySQL 原子性与回滚、普通资源隐藏、tenant/user 隔离、幂等重试、parent/child 并发、stale fence、orphan repair、terminal SSE、真实 0008→0009 迁移和多进程 takeover。lifecycle outbox 测试覆盖并发领取、lease 回收、stale acknowledgement、退避/dead-letter、总线故障和不触碰 purge。Blob 测试覆盖 filesystem/in-memory adapter、Memory/MySQL ownership、上传→绑定、事务回滚、跨 owner 隔离、全局资源 identity、并发首写、过期 staging 的硬拒绝、sweep/bind 竞态、两个独立 MySQL store 的并发领取与 lease takeover、delete claim/CAS，以及真实 0009→0010 迁移。subject gate 已覆盖 Memory/MySQL 原子 request/audit、失败回滚、同 key 隔离、gate/create 线性化、普通资源隐藏、Blob 写阻断和 HTTP no-store；usage 已覆盖双写回滚、mixed unknown/known-zero 聚合、硬预算 fail-closed、并发 legacy reconcile、冲突阻断、generation/owner、checksum、durable legal hold 与 crash-retry-safe 幂等 anonymize。真实 0010→0011 夹具还覆盖 DDL auto-commit 中断续迁、case-sensitive identity、不改写历史 usage，以及 migration 后旧 writer 新建 session 的 trigger/backfill/replay 兼容。以下矩阵中 worker-driven erasure、ready purge、export 与 backup 项仍是后续验收目标：
 
 - Memory/MySQL conformance：archive/unarchive 幂等、archived 禁写、事件 seq 连续、tombstone 隐藏且拒写、失败全回滚。
 - MySQL + Redis 并发：turn/archive/delete 竞态、stale fence、lease loss、orphan active repair。
 - active turn 各阶段：reserved/running/waiting approval/settling 默认均 busy；interrupt 后可归档/删除。
 - 数据完整性：purge 后内容表与 receipt/blob 清空，usage tokens/cost 校验和不变，无 dangling parent。
 - tenant/user 隔离：跨主体 archive/delete/unarchive 与不存在一致。
-- usage/idempotency：汇总重试不重复计费；tombstone 后 receipt 不重放；legacy pending 在旧实例 drain 前保留。
+- usage/idempotency：双写与显式 reconcile/anonymize primitive 已覆盖；仍需 worker 批次 crash/resume、政策化保留期和完成审计。tombstone 后 receipt 不重放；legacy pending 在旧实例 drain 前保留。
 - Blob/outbox：已覆盖 staging orphan、对象删除重试/重复领取、跨 tenant/user/session 注入；仍需覆盖 session purge 原子调度全部 ready blob、批次 crash/resume 和共享对象存储故障。
-- erasure：gate 与 createSession 竞态、任务 crash/resume、legal hold、批次游标、tenant key/secret 先失效。
+- erasure：user gate 与 createSession/普通写入竞态、回滚、隔离已覆盖；仍需 worker crash/resume、状态推进、批次游标、tenant key/secret 先失效、export artifact/TTL 和 completed 证明。
 - rolling upgrade：旧/新 runner 混跑、feature gate、部分回填重启、全旧实例 drain 后才激活新不变量。
 - 备份恢复：先重放 erasure ledger，已删除主体的数据不会重新开放。

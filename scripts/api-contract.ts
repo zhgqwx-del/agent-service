@@ -31,6 +31,9 @@ import {
   EventStreamEvent,
   EventStreamHeaders,
   EventStreamQuery,
+  ErasureRequest,
+  ErasureRequestHeaders,
+  ErasureRequestParams,
   HealthResponse,
   ItemListQuery,
   ItemListResponse,
@@ -84,6 +87,22 @@ const SSE_MEDIA_TYPE = "text/event-stream";
 const jsonResponse = (schema: ContractSchema, description: string): ResponseConfig => ({
   description,
   content: { [JSON_MEDIA_TYPE]: { schema } },
+});
+
+const PRIVATE_RESPONSE_HEADERS: NonNullable<ResponseConfig["headers"]> = {
+  "Cache-Control": {
+    description: "Prevents storage of this user-owned lifecycle response.",
+    schema: { type: "string", enum: ["no-store"] },
+  },
+  "X-Content-Type-Options": {
+    description: "Prevents content-type sniffing.",
+    schema: { type: "string", enum: ["nosniff"] },
+  },
+};
+
+const privateJsonResponse = (schema: ContractSchema, description: string): ResponseConfig => ({
+  ...jsonResponse(schema, description),
+  headers: PRIVATE_RESPONSE_HEADERS,
 });
 
 const textResponse = (schema: ContractSchema, description: string): ResponseConfig => ({
@@ -150,6 +169,7 @@ export function buildOpenApiDocument() {
   const schemas = {
     error: registry.register("ErrorBody", ErrorBody),
     event: registry.register("Event", EventStreamEvent),
+    erasureRequest: registry.register("ErasureRequest", ErasureRequest),
     excludableEventType: registry.register("ExcludableEventType", ExcludableEventTypeSchema),
     capabilities: registry.register("Capabilities", Capabilities),
     openapi: registry.register("OpenApiDocument", OpenApiDocumentResponse),
@@ -604,6 +624,38 @@ export function buildOpenApiDocument() {
     responses: { 202: jsonResponse(schemas.ok, "Tool result accepted."), default: errorResponse },
   });
 
+  // ---------- subject lifecycle ----------
+
+  register({
+    method: "post",
+    path: "/v1/data-erasure-requests",
+    operationId: "requestUserErasure",
+    tags: ["Data lifecycle"],
+    summary: "Gate a user's data for asynchronous erasure",
+    description: "Admin-only and capability-gated. Atomically blocks new user-owned writes and creates an auditable request; it does not claim physical purge is complete.",
+    security: userSecurity,
+    ...adminOnly,
+    request: { headers: ErasureRequestHeaders },
+    responses: {
+      202: privateJsonResponse(schemas.erasureRequest, "Existing or newly accepted user erasure request."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "get",
+    path: "/v1/data-erasure-requests/{requestId}",
+    operationId: "getUserErasureRequest",
+    tags: ["Data lifecycle"],
+    summary: "Read an owned user erasure request",
+    security: userSecurity,
+    ...adminOnly,
+    request: { params: ErasureRequestParams, headers: UserIdentityHeaders },
+    responses: {
+      200: privateJsonResponse(schemas.erasureRequest, "Erasure request status."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+
   // ---------- usage, items, events and approvals ----------
 
   register({
@@ -689,8 +741,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 40) {
-    throw new Error(`expected 40 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 42) {
+    throw new Error(`expected 42 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({
@@ -710,6 +762,7 @@ export function buildOpenApiDocument() {
       { name: "Sessions" },
       { name: "Blobs" },
       { name: "Turns" },
+      { name: "Data lifecycle" },
       { name: "Usage" },
       { name: "Items" },
       { name: "Events" },

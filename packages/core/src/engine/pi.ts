@@ -43,7 +43,7 @@ export class PiEngine implements AgentEngine {
       getApiKey: async (p) => (p === provider ? await params.model.apiKey() : undefined),
       toolExecution: "parallel",
       beforeToolCall: async ({ toolCall, args, assistantMessage }) => {
-        const msg = currentAssistant ?? toStepResult(assistantMessage);
+        const msg = currentAssistant ?? toStepResult(assistantMessage, params.model.priceKnown !== false);
         const decision = await sink.beforeToolCall({ id: toolCall.id, name: toolCall.name, args }, msg);
         if (decision.allow) return undefined;
         if (decision.interrupt) queueMicrotask(() => agent.abort());
@@ -66,7 +66,7 @@ export class PiEngine implements AgentEngine {
       },
       finishTurn: async ({ message }) => {
         if (message.role !== "assistant") return undefined;
-        const res = toStepResult(message);
+        const res = toStepResult(message, params.model.priceKnown !== false);
         if (res.stopReason === "error" || res.stopReason === "aborted") return undefined;
         const d = await sink.onStepEnd(step, res);
         return d === "end" ? { action: "end" } : undefined;
@@ -97,7 +97,7 @@ export class PiEngine implements AgentEngine {
         }
         case "message_end":
           if (ev.message.role === "assistant") {
-            currentAssistant = toStepResult(ev.message);
+            currentAssistant = toStepResult(ev.message, params.model.priceKnown !== false);
             if (currentAssistant.stopReason === "error") lastError = currentAssistant.errorMessage ?? "provider error";
             if (currentAssistant.stopReason === "aborted") aborted = true;
             await sink.onAssistantMessage(currentAssistant);
@@ -171,7 +171,7 @@ export class PiSummariser implements Summariser {
     if (msg.stopReason === "error" || msg.stopReason === "aborted") {
       throw new Error(`summarisation failed: ${msg.errorMessage ?? msg.stopReason}`);
     }
-    const res = toStepResult(msg);
+    const res = toStepResult(msg, input.model.priceKnown !== false);
     return { text: res.text, usage: res.usage };
   }
 }
@@ -243,7 +243,7 @@ function toPiMessage(m: TranscriptMessage): Message {
   }
 }
 
-function toStepResult(msg: AssistantMessage): AssistantStepResult {
+function toStepResult(msg: AssistantMessage, priceKnown = true): AssistantStepResult {
   const text = msg.content.filter((c): c is TextContent => c.type === "text").map((c) => c.text).join("");
   const reasoning = msg.content.filter((c) => c.type === "thinking").map((c) => (c as { thinking: string }).thinking).join("") || undefined;
   const toolCalls = msg.content.filter((c): c is ToolCall => c.type === "toolCall").map((c) => ({ id: c.id, name: c.name, args: c.arguments }));
@@ -255,7 +255,7 @@ function toStepResult(msg: AssistantMessage): AssistantStepResult {
     cacheWriteTokens: u.cacheWrite,
     reasoningTokens: u.reasoning ?? 0,
     totalTokens: u.totalTokens,
-    costCNY: u.cost?.total,
+    ...(priceKnown && u.cost?.total !== undefined ? { costCNY: u.cost.total } : {}),
   };
   const stop = msg.stopReason === "stop" || msg.stopReason === "length" || msg.stopReason === "toolUse" || msg.stopReason === "error" || msg.stopReason === "aborted" ? msg.stopReason : "stop";
   return { text, reasoning, toolCalls, usage, stopReason: stop, errorMessage: msg.errorMessage, provider: msg.provider, model: msg.model };

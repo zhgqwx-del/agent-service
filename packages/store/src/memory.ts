@@ -12,7 +12,7 @@ import type {
   Usage,
   UsageQuery,
 } from "@agent-service/protocol";
-import { DEFAULT_AUTH_POLICY, DEFAULT_SCOPES, addUsage, emptyUsage, isCanonicalId } from "@agent-service/protocol";
+import { DEFAULT_AUTH_POLICY, DEFAULT_SCOPES, addUsage, emptyUsageAccumulator, isCanonicalId } from "@agent-service/protocol";
 import { createHash } from "node:crypto";
 import {
   BlobConflictError,
@@ -35,6 +35,7 @@ import {
   backfillAssignedSequences,
   type BlobStore,
   type BlobDescriptor,
+  type BillingUsageFact,
   type CommitBatch,
   type CommitResult,
   type EventBus,
@@ -51,7 +52,11 @@ import {
   type SessionStore,
   type SessionLifecycleRecord,
   type TenantRecord,
+  type UsageLifecycleStore,
   type UsageLedgerEntry,
+  type UsageReconciliationRecord,
+  type ReconcileSessionUsageInput,
+  type AnonymizeSessionUsageInput,
 } from "./types.js";
 import {
   validateBlobContentType,
@@ -88,6 +93,37 @@ import {
   type ScheduleStaleBlobsOptions,
   type StageBlobInput,
 } from "./blob-lifecycle.js";
+import {
+  UsageIdentityConflictError,
+  UsageLifecycleGenerationError,
+  UsageReconciliationError,
+  assertUsageAnonymizationAllowed,
+  billingUsageFactContentEquals,
+  billingUsageFactFromLedger,
+  canonicalUsageProjection,
+  canonicalizePersistedUsageEvent,
+  canonicalizeUsageItem,
+  isUsageId,
+  newUsageId,
+  normalizeHistoricalUsageCost,
+  normalizeOperationalUsageCost,
+  normalizeRowlessUsageProjection,
+  summarizeBillingUsageFacts,
+  usageReconciliationSummariesEqual,
+  validateReconcileSessionUsageInput,
+} from "./usage-lifecycle.js";
+import {
+  ErasureIdempotencyMismatchError,
+  SubjectDeletingError,
+  subjectLifecycleKey,
+  validateRequestUserErasureInput,
+  type DataSubjectKind,
+  type ErasureAuditEvent,
+  type ErasureRequestRecord,
+  type RequestUserErasureInput,
+  type SubjectLifecycleRecord,
+  type SubjectLifecycleStore,
+} from "./subject-lifecycle.js";
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -127,7 +163,7 @@ function validateUploadedBlobInput(input: MarkBlobUploadedInput): void {
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore {
   agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -144,6 +180,201 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   blobDeleteOutbox = new Map<string, BlobDeleteOutboxRecord>();
   private nextBlobDeleteOutboxId = 1;
   tenants = new Map<string, TenantRecord>();
+  billingUsageFacts = new Map<string, BillingUsageFact>();
+  usageReconciliations = new Map<string, UsageReconciliationRecord>();
+  subjectLifecycles = new Map<string, SubjectLifecycleRecord>();
+  erasureRequests = new Map<string, ErasureRequestRecord>();
+  erasureAuditEvents = new Map<string, ErasureAuditEvent[]>();
+  private erasureIdempotency = new Map<string, string>();
+
+  private subjectRecord(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): SubjectLifecycleRecord | undefined {
+    return this.subjectLifecycles.get(subjectLifecycleKey(tenantId, subjectKind, subjectId));
+  }
+
+  private isSubjectActive(tenantId: string, userId: string): boolean {
+    const tenant = this.subjectRecord(tenantId, "tenant", tenantId);
+    const user = this.subjectRecord(tenantId, "user", userId);
+    if (!tenant && [...this.erasureRequests.values()].some((request) => (
+      request.tenantId === tenantId && request.subjectKind === "tenant" && request.subjectId === tenantId
+    ))) return false;
+    if (!user && [...this.erasureRequests.values()].some((request) => (
+      request.tenantId === tenantId && request.subjectKind === "user" && request.subjectId === userId
+    ))) return false;
+    return (tenant?.state ?? "active") === "active" && (user?.state ?? "active") === "active";
+  }
+
+  private assertSubjectWritable(tenantId: string, userId: string): void {
+    const tenant = this.subjectRecord(tenantId, "tenant", tenantId);
+    if (!tenant && [...this.erasureRequests.values()].some((request) => (
+      request.tenantId === tenantId && request.subjectKind === "tenant" && request.subjectId === tenantId
+    ))) throw new SubjectDeletingError(tenantId);
+    if (tenant && tenant.state !== "active") throw new SubjectDeletingError(tenantId);
+    const user = this.subjectRecord(tenantId, "user", userId);
+    if (!user && [...this.erasureRequests.values()].some((request) => (
+      request.tenantId === tenantId && request.subjectKind === "user" && request.subjectId === userId
+    ))) throw new SubjectDeletingError(tenantId, userId);
+    if (user && user.state !== "active") throw new SubjectDeletingError(tenantId, userId);
+  }
+
+  private isSessionVisible(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    return !!session && !this.deleted.has(sessionId) && this.isSubjectActive(session.tenantId, session.userId);
+  }
+
+  private usageProjectionRows(sessionId: string, turnId?: string) {
+    return this.usageLedger.filter((row) => (
+      row.sessionId === sessionId && (turnId === undefined || row.turnId === turnId)
+    ));
+  }
+
+  private sessionForRead(session: Session): Session {
+    const projected = clone(session);
+    projected.usage = canonicalUsageProjection(
+      projected.usage,
+      this.usageProjectionRows(projected.id),
+      { tenantId: projected.tenantId, userId: projected.userId },
+    );
+    return projected;
+  }
+
+  private turnForRead(turn: Turn, session: Session): Turn {
+    const projected = clone(turn);
+    projected.usage = canonicalUsageProjection(
+      projected.usage,
+      this.usageProjectionRows(session.id, projected.id),
+      { tenantId: session.tenantId, userId: session.userId },
+    );
+    return projected;
+  }
+
+  private activeSubjectRecord(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+    atMs: number,
+  ): SubjectLifecycleRecord {
+    return {
+      tenantId,
+      subjectKind,
+      subjectId,
+      state: "active",
+      generation: 0,
+      createdAtMs: atMs,
+      updatedAtMs: atMs,
+    };
+  }
+
+  private erasureIdempotencyKey(input: Pick<RequestUserErasureInput, "tenantId" | "userId" | "idempotencyKey">): string {
+    return JSON.stringify([input.tenantId, "user", input.userId, input.idempotencyKey]);
+  }
+
+  async requestUserErasure(input: RequestUserErasureInput): Promise<ErasureRequestRecord> {
+    validateRequestUserErasureInput(input);
+    const tenant = this.subjectRecord(input.tenantId, "tenant", input.tenantId);
+    if (tenant && tenant.state !== "active") throw new SubjectDeletingError(input.tenantId);
+
+    const idempotencyKey = this.erasureIdempotencyKey(input);
+    const replayId = this.erasureIdempotency.get(idempotencyKey);
+    if (replayId) {
+      const replay = this.erasureRequests.get(replayId);
+      if (!replay) throw new Error("erasure idempotency index is corrupt");
+      if (replay.requestHash !== input.requestHash) throw new ErasureIdempotencyMismatchError();
+      return clone(replay);
+    }
+
+    const userKey = subjectLifecycleKey(input.tenantId, "user", input.userId);
+    const existingUser = this.subjectLifecycles.get(userKey);
+    if (existingUser && existingUser.state !== "active") {
+      const active = existingUser.activeRequestId
+        ? this.erasureRequests.get(existingUser.activeRequestId)
+        : undefined;
+      if (!active) throw new SubjectDeletingError(input.tenantId, input.userId);
+      return clone(active);
+    }
+    if (this.erasureRequests.has(input.requestId)) {
+      throw new Error("erasure request id already exists");
+    }
+
+    // Clone every row before publishing any map mutation. Invalid/uncloneable audit data can never
+    // leave a deleting subject without its request/audit row (or a request without the durable gate).
+    const generation = (existingUser?.generation ?? 0) + 1;
+    const stagedTenant = tenant
+      ? undefined
+      : clone(this.activeSubjectRecord(input.tenantId, "tenant", input.tenantId, input.atMs));
+    const stagedUser = clone<SubjectLifecycleRecord>({
+      ...(existingUser ?? this.activeSubjectRecord(input.tenantId, "user", input.userId, input.atMs)),
+      state: "deleting",
+      generation,
+      activeRequestId: input.requestId,
+      // Lifecycle timestamps are monotonic across runners even when their wall clocks are skewed.
+      // The request/audit timestamps below intentionally retain the initiating runner's clock.
+      updatedAtMs: Math.max(existingUser?.updatedAtMs ?? input.atMs, input.atMs),
+    });
+    const stagedRequest = clone<ErasureRequestRecord>({
+      requestId: input.requestId,
+      tenantId: input.tenantId,
+      subjectKind: "user",
+      subjectId: input.userId,
+      generation,
+      status: "gated",
+      requestedByKeyId: input.requestedByKeyId,
+      idempotencyKey: input.idempotencyKey,
+      requestHash: input.requestHash,
+      createdAtMs: input.atMs,
+      gatedAtMs: input.atMs,
+      updatedAtMs: input.atMs,
+    });
+    const stagedAudit = clone<ErasureAuditEvent>({
+      requestId: input.requestId,
+      seq: 1,
+      type: "erasure/gated",
+      payload: { status: "gated", subjectKind: "user", generation },
+      emittedAtMs: input.atMs,
+    });
+
+    if (stagedTenant) {
+      this.subjectLifecycles.set(
+        subjectLifecycleKey(input.tenantId, "tenant", input.tenantId),
+        stagedTenant,
+      );
+    }
+    this.subjectLifecycles.set(userKey, stagedUser);
+    this.erasureRequests.set(input.requestId, stagedRequest);
+    this.erasureAuditEvents.set(input.requestId, [stagedAudit]);
+    this.erasureIdempotency.set(idempotencyKey, input.requestId);
+    return clone(stagedRequest);
+  }
+
+  async getUserErasureRequest(
+    tenantId: string,
+    userId: string,
+    requestId: string,
+  ): Promise<ErasureRequestRecord | null> {
+    const request = this.erasureRequests.get(requestId);
+    return request
+      && request.tenantId === tenantId
+      && request.subjectKind === "user"
+      && request.subjectId === userId
+      ? clone(request)
+      : null;
+  }
+
+  async getSubjectLifecycle(
+    tenantId: string,
+    subjectKind: DataSubjectKind,
+    subjectId: string,
+  ): Promise<SubjectLifecycleRecord | null> {
+    const record = this.subjectRecord(tenantId, subjectKind, subjectId);
+    return record ? clone(record) : null;
+  }
+
+  async listErasureAuditEvents(requestId: string): Promise<ErasureAuditEvent[]> {
+    return (this.erasureAuditEvents.get(requestId) ?? []).map(clone);
+  }
 
   async createAgent(def: AgentDefinition) {
     this.agents.set(`${def.tenantId}/${def.id}@${def.version}`, clone(def));
@@ -167,6 +398,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async createSession(session: Session): Promise<CommitResult> {
     if (session.lastSeq !== 0) throw new Error("a new session must start at lastSeq 0");
     if (session.fenceToken !== 0) throw new Error("a new session must start at fenceToken 0");
+    this.assertSubjectWritable(session.tenantId, session.userId);
     if (this.sessions.has(session.id)) throw new SessionExistsError(session.id);
 
     // The parent check and child publication are one synchronous critical section. MySQL takes the
@@ -188,6 +420,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     // and may contain an uncloneable/throwing value; such a failure must not leave a session without
     // its creation event (or vice versa).
     const stagedSession = clone(session);
+    // Memory has no durable cross-release state to migrate, but direct/legacy SessionStore callers
+    // can still construct a pristine session with pre-0011 emptyUsage(). New-session provenance
+    // proves there are no provider rows, so this is the one safe place to restore the cost identity.
+    stagedSession.usage = normalizeRowlessUsageProjection(stagedSession.usage);
     const stagedEvent = clone<PersistedEvent>({
       type: "session/created",
       sessionId: session.id,
@@ -195,21 +431,31 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       seq: 1,
     });
     stagedSession.lastSeq = 1;
+    const tenantKey = subjectLifecycleKey(session.tenantId, "tenant", session.tenantId);
+    const userKey = subjectLifecycleKey(session.tenantId, "user", session.userId);
+    const stagedTenant = this.subjectLifecycles.has(tenantKey)
+      ? undefined
+      : clone(this.activeSubjectRecord(session.tenantId, "tenant", session.tenantId, session.createdAtMs));
+    const stagedUser = this.subjectLifecycles.has(userKey)
+      ? undefined
+      : clone(this.activeSubjectRecord(session.tenantId, "user", session.userId, session.createdAtMs));
 
+    if (stagedTenant) this.subjectLifecycles.set(tenantKey, stagedTenant);
+    if (stagedUser) this.subjectLifecycles.set(userKey, stagedUser);
     this.sessions.set(session.id, stagedSession);
     this.events.set(session.id, [stagedEvent]);
     return { events: [clone(stagedEvent)], lastSeq: 1 };
   }
   async getSession(tenantId: string, sessionId: string) {
     const s = this.sessions.get(sessionId);
-    return s && s.tenantId === tenantId && !this.deleted.has(sessionId) ? clone(s) : null;
+    return s && s.tenantId === tenantId && this.isSessionVisible(sessionId) ? this.sessionForRead(s) : null;
   }
   async getSessionLifecycle(tenantId: string, userId: string, sessionId: string): Promise<SessionLifecycleRecord | null> {
     const session = this.sessions.get(sessionId);
     if (!session || session.tenantId !== tenantId || session.userId !== userId) return null;
     const tombstone = this.deleted.get(sessionId);
     return {
-      session: clone(session),
+      session: this.sessionForRead(session),
       deletedAtMs: tombstone?.deletedAtMs,
       purgeAfterMs: tombstone?.purgeAfterMs,
       deletionGeneration: tombstone?.deletionGeneration ?? 0,
@@ -217,8 +463,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
   async listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }) {
     const rows = [...this.sessions.values()].filter(
-      (s) => s.tenantId === tenantId && !this.deleted.has(s.id) && (!opts.userId || s.userId === opts.userId) && (opts.includeArchived || !s.archivedAtMs),
-    );
+      (s) => s.tenantId === tenantId && this.isSessionVisible(s.id) && (!opts.userId || s.userId === opts.userId) && (opts.includeArchived || !s.archivedAtMs),
+    ).map((session) => this.sessionForRead(session));
     return paginate(rows, (s) => s.id, opts.cursor, opts.limit, "desc");
   }
 
@@ -232,6 +478,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || session.tenantId !== input.owner.tenantId
       || session.userId !== input.owner.userId
     ) throw new SessionGoneError(input.sessionId);
+    if (!this.isSubjectActive(session.tenantId, session.userId)) throw new SessionGoneError(input.sessionId);
     if (session.archivedAtMs !== undefined) throw new SessionArchivedError(input.sessionId);
     if (input.fence < session.fenceToken) throw new FenceError(input.sessionId, input.fence, session.fenceToken);
 
@@ -283,6 +530,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || session.tenantId !== input.owner.tenantId
       || session.userId !== input.owner.userId
     ) throw new SessionGoneError(input.sessionId);
+    if (!this.isSubjectActive(session.tenantId, session.userId)) throw new SessionGoneError(input.sessionId);
     if (session.archivedAtMs !== undefined) throw new SessionArchivedError(input.sessionId);
     if (input.fence < session.fenceToken) throw new FenceError(input.sessionId, input.fence, session.fenceToken);
     const manifest = this.blobManifests.get(input.blobId);
@@ -326,6 +574,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (
       !session
       || this.deleted.has(input.sessionId)
+      || !this.isSubjectActive(session.tenantId, session.userId)
       || session.archivedAtMs !== undefined
       || session.tenantId !== input.owner.tenantId
       || session.userId !== input.owner.userId
@@ -350,6 +599,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (
       !session
       || this.deleted.has(input.sessionId)
+      || !this.isSubjectActive(session.tenantId, session.userId)
       || session.tenantId !== input.owner.tenantId
       || session.userId !== input.owner.userId
       || !manifest
@@ -372,6 +622,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     assertBlobBindingsMatch(batch.items, batch.blobBindings);
     const s = this.sessions.get(batch.sessionId);
     if (!s || this.deleted.has(batch.sessionId)) throw new SessionGoneError(batch.sessionId);
+    if (!this.isSubjectActive(s.tenantId, s.userId)) throw new SessionGoneError(batch.sessionId);
     const expectedOwner = batch.lifecycle ?? batch.fenceClaim;
     if (expectedOwner && (expectedOwner.tenantId !== s.tenantId || expectedOwner.userId !== s.userId)) {
       throw new SessionGoneError(batch.sessionId);
@@ -476,10 +727,26 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       ...clone(entry), tenantId: s.tenantId, userId: s.userId, sessionId: s.id,
     }));
     const usageKeys = new Set(this.usageLedger.map((entry) => JSON.stringify([entry.sessionId, entry.turnId, entry.step])));
+    const usageIds = new Set<string>();
+    if (stagedUsage.length > 0) {
+      for (const entry of this.usageLedger) {
+        if (entry.usageId === undefined) continue;
+        if (!isUsageId(entry.usageId)) throw new UsageReconciliationError("stored operational usage has an invalid usage id");
+        if (usageIds.has(entry.usageId)) throw new UsageIdentityConflictError(entry.usageId);
+        usageIds.add(entry.usageId);
+      }
+    }
+    const stagedBillingFacts = new Map<string, BillingUsageFact>();
     for (const entry of stagedUsage) {
       const key = JSON.stringify([entry.sessionId, entry.turnId, entry.step]);
       if (usageKeys.has(key)) throw new Error(`duplicate usage entry for turn ${entry.turnId} step ${entry.step}`);
       usageKeys.add(key);
+      if (!isUsageId(entry.usageId)) throw new Error("new usage writes require a valid random usage id");
+      if (usageIds.has(entry.usageId) || this.billingUsageFacts.has(entry.usageId)) {
+        throw new UsageIdentityConflictError(entry.usageId);
+      }
+      usageIds.add(entry.usageId);
+      stagedBillingFacts.set(entry.usageId, billingUsageFactFromLedger(entry as UsageLedgerEntry & { usageId: string }));
     }
 
     let seq = s.lastSeq;
@@ -492,13 +759,44 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     // `Item.args`, tool-result `details`, and session metadata are intentionally typed as unknown.
     // Clone the entire write-set before changing persistent state so an uncloneable value cannot
     // leave a partial event log (or advance the fence without advancing lastSeq).
-    const stagedEvents = out.map(clone);
-    const stagedItems = (batch.items ?? []).map(clone);
-    const stagedTurn = batch.turn ? clone(batch.turn) : undefined;
+    let stagedEvents = out.map(clone);
+    let stagedItems = (batch.items ?? []).map(clone);
+    let stagedTurn = batch.turn ? clone(batch.turn) : undefined;
     const stagedApprovals = (batch.approvals ?? []).map(clone);
     const stagedIdempotencyValue = batch.idempotency ? clone(batch.idempotency.value) : undefined;
-    const stagedSessionPatch = batch.sessionPatch ? clone(batch.sessionPatch) : undefined;
+    const stagedSessionPatch = batch.sessionPatch ? clone(batch.sessionPatch) : {};
     const stagedLifecycle = batch.lifecycle ? clone(batch.lifecycle) : undefined;
+    // The ledger, not a legacy caller's aggregate JSON, is authoritative. Do this before publishing
+    // any map mutation so a mixed-version writer cannot make a known subtotal sticky in a later
+    // current-writer commit.
+    const projectionRows = [...this.usageProjectionRows(s.id), ...stagedUsage];
+    stagedSessionPatch.usage = canonicalUsageProjection(
+      stagedSessionPatch.usage ?? s.usage,
+      projectionRows,
+      { tenantId: s.tenantId, userId: s.userId },
+    );
+    if (stagedTurn) {
+      stagedTurn = {
+        ...stagedTurn,
+        usage: canonicalUsageProjection(
+          stagedTurn.usage,
+          projectionRows.filter((row) => row.turnId === stagedTurn!.id),
+          { tenantId: s.tenantId, userId: s.userId },
+        ),
+      };
+    }
+    stagedItems = stagedItems.map((item) => canonicalizeUsageItem(
+      item,
+      projectionRows.find((row) => (
+        row.turnId === item.turnId && row.step === 0
+        && row.tenantId === s.tenantId && row.userId === s.userId
+      )),
+    ));
+    stagedEvents = stagedEvents.map((event) => canonicalizePersistedUsageEvent(
+      event,
+      projectionRows,
+      { tenantId: s.tenantId, userId: s.userId },
+    ));
     assignItemSeqs(stagedItems, stagedEvents, seq);
     assignTurnSeqEnd(stagedTurn, stagedEvents, seq);
     const resultEvents = stagedEvents.map(clone);
@@ -552,6 +850,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (stagedTurn) this.turns.set(stagedTurn.id, stagedTurn);
     for (const a of stagedApprovals) this.approvals.set(a.id, a);
     this.usageLedger.push(...stagedUsage);
+    for (const [usageId, fact] of stagedBillingFacts) this.billingUsageFacts.set(usageId, fact);
     if (batch.idempotency && idemMapKey && stagedIdempotencyValue) {
       this.idem.set(idemMapKey, {
         value: stagedIdempotencyValue,
@@ -578,40 +877,67 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async readEvents(sessionId: string, afterSeq: number, limit: number) {
     // Deliberately raw: an already-established SSE subscription must be able to deliver the final
     // session/deleted event. Public subscription setup performs an owner-aware session check first.
-    return (this.events.get(sessionId) ?? []).filter((e) => e.seq > afterSeq).slice(0, limit).map(clone);
+    const session = this.sessions.get(sessionId);
+    const rows = this.usageProjectionRows(sessionId);
+    return (this.events.get(sessionId) ?? [])
+      .filter((e) => e.seq > afterSeq)
+      .slice(0, limit)
+      .map((event) => session
+        ? canonicalizePersistedUsageEvent(clone(event), rows, session)
+        : clone(event));
   }
   async getTurn(sessionId: string, turnId: string) {
-    if (this.deleted.has(sessionId)) return null;
+    if (!this.isSessionVisible(sessionId)) return null;
+    const session = this.sessions.get(sessionId)!;
     const t = this.turns.get(turnId);
-    return t && t.sessionId === sessionId ? clone(t) : null;
+    return t && t.sessionId === sessionId ? this.turnForRead(t, session) : null;
   }
   async listTurns(sessionId: string, opts: { cursor?: string; limit: number; sortDirection?: "asc" | "desc" }) {
-    if (this.deleted.has(sessionId)) return { data: [], nextCursor: null };
-    const rows = [...this.turns.values()].filter((t) => t.sessionId === sessionId);
+    if (!this.isSessionVisible(sessionId)) return { data: [], nextCursor: null };
+    const session = this.sessions.get(sessionId)!;
+    const rows = [...this.turns.values()]
+      .filter((t) => t.sessionId === sessionId)
+      .map((turn) => this.turnForRead(turn, session));
     return paginate(rows, (t) => t.id, opts.cursor, opts.limit, opts.sortDirection ?? "desc");
   }
   async listItems(sessionId: string, opts: { turnId?: string; afterSeq?: number; limit: number; newestFirst?: boolean }) {
-    if (this.deleted.has(sessionId)) return [];
+    if (!this.isSessionVisible(sessionId)) return [];
+    const session = this.sessions.get(sessionId)!;
     const all = [...this.items.values()]
       .filter((i) => i.sessionId === sessionId && (!opts.turnId || i.turnId === opts.turnId) && i.seq > (opts.afterSeq ?? -1))
       .sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
     const kept = opts.newestFirst ? all.slice(Math.max(0, all.length - opts.limit)) : all.slice(0, opts.limit);
-    return kept.map(clone);
+    const projectionRows = this.usageProjectionRows(sessionId);
+    return kept.map((item) => canonicalizeUsageItem(
+      clone(item),
+      projectionRows.find((row) => (
+        row.turnId === item.turnId && row.step === 0
+        && row.tenantId === session.tenantId && row.userId === session.userId
+      )),
+    ));
   }
   async getItem(sessionId: string, itemId: string) {
-    if (this.deleted.has(sessionId)) return null;
+    if (!this.isSessionVisible(sessionId)) return null;
+    const session = this.sessions.get(sessionId)!;
     const i = this.items.get(itemId);
-    return i && i.sessionId === sessionId ? clone(i) : null;
+    return i && i.sessionId === sessionId
+      ? canonicalizeUsageItem(
+        clone(i),
+        this.usageProjectionRows(sessionId, i.turnId).find((row) => (
+          row.step === 0 && row.tenantId === session.tenantId && row.userId === session.userId
+        )),
+      )
+      : null;
   }
   async listApprovals(sessionId: string, opts: { pendingOnly?: boolean }) {
-    if (this.deleted.has(sessionId)) return [];
+    if (!this.isSessionVisible(sessionId)) return [];
     return [...this.approvals.values()]
       .filter((a) => a.sessionId === sessionId && (!opts.pendingOnly || a.status === "pending"))
       .sort((a, b) => a.createdAtMs - b.createdAtMs)
       .map(clone);
   }
   async getApproval(sessionId: string, approvalId: string) {
-    if (this.deleted.has(sessionId)) return null;
+    if (!this.isSessionVisible(sessionId)) return null;
     const a = this.approvals.get(approvalId);
     return a && a.sessionId === sessionId ? clone(a) : null;
   }
@@ -671,15 +997,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   usageLedger: UsageLedgerEntry[] = [];
   async queryUsage(tenantId: string, q: UsageQuery) {
-    const rows = this.usageLedger.filter(
-      (e) =>
-        e.tenantId === tenantId &&
-        !this.deleted.has(e.sessionId) &&
-        (!q.userId || e.userId === q.userId) &&
-        (!q.sessionId || e.sessionId === q.sessionId) &&
-        (q.from === undefined || e.createdAtMs >= q.from) &&
-        (q.to === undefined || e.createdAtMs < q.to),
-    );
+    const rows = this.usageLedger.filter((e) => {
+      const session = this.sessions.get(e.sessionId);
+      return e.tenantId === tenantId
+        && session?.tenantId === e.tenantId
+        && session.userId === e.userId
+        && this.isSessionVisible(e.sessionId)
+        && (!q.userId || e.userId === q.userId)
+        && (!q.sessionId || e.sessionId === q.sessionId)
+        && (q.from === undefined || e.createdAtMs >= q.from)
+        && (q.to === undefined || e.createdAtMs < q.to);
+    });
     const keyOf = (e: UsageLedgerEntry) =>
       q.groupBy === "user" ? e.userId
       : q.groupBy === "session" ? e.sessionId
@@ -689,10 +1017,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const acc = new Map<string, { turns: Set<string>; steps: number; usage: Usage }>();
     for (const e of rows) {
       const k = keyOf(e);
-      const cur = acc.get(k) ?? { turns: new Set<string>(), steps: 0, usage: emptyUsage() };
+      const cur = acc.get(k) ?? { turns: new Set<string>(), steps: 0, usage: emptyUsageAccumulator() };
       cur.turns.add(e.turnId);
       cur.steps += 1;
-      cur.usage = addUsage(cur.usage, e.usage);
+      cur.usage = addUsage(cur.usage, normalizeOperationalUsageCost(e.usage, e.usageId));
       acc.set(k, cur);
     }
     return {
@@ -701,6 +1029,221 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         .sort((a, b) => (b.usage.totalTokens - a.usage.totalTokens) || a.key.localeCompare(b.key))
         .slice(0, q.limit),
     };
+  }
+
+  private usageReconciliationMapKey(sessionId: string, deletionGeneration: number): string {
+    return JSON.stringify([sessionId, deletionGeneration]);
+  }
+
+  private assertUsageLifecycleScope(input: ReconcileSessionUsageInput): void {
+    const session = this.sessions.get(input.sessionId);
+    if (!session || session.tenantId !== input.tenantId || session.userId !== input.userId) {
+      // Preserve the same non-oracle owner semantics as every public session resource. Although this
+      // is an internal least-privilege interface, a scoped worker must not probe another principal.
+      throw new SessionGoneError(input.sessionId);
+    }
+    const tombstone = this.deleted.get(input.sessionId);
+    if (
+      !tombstone
+      || input.deletionGeneration <= 0
+      || tombstone.deletionGeneration !== input.deletionGeneration
+    ) {
+      throw new UsageLifecycleGenerationError(input.sessionId, input.deletionGeneration);
+    }
+  }
+
+  private usageRowsForLifecycle(
+    ledger: readonly UsageLedgerEntry[],
+    input: ReconcileSessionUsageInput,
+  ): UsageLedgerEntry[] {
+    const rows = ledger.filter((entry) => entry.sessionId === input.sessionId);
+    if (rows.some((entry) => entry.tenantId !== input.tenantId || entry.userId !== input.userId)) {
+      throw new UsageReconciliationError("operational usage owner does not match its session");
+    }
+    return rows;
+  }
+
+  /** The destructive input has no caller `legalHold: false`; only durable store state decides. */
+  protected isUsageAnonymizationLegalHoldActive(input: AnonymizeSessionUsageInput): boolean {
+    const tenant = this.subjectRecord(input.tenantId, "tenant", input.tenantId);
+    const user = this.subjectRecord(input.tenantId, "user", input.userId);
+    if (!tenant || !user) {
+      throw new UsageReconciliationError("subject lifecycle state is missing; anonymization is fail-closed");
+    }
+    return tenant.legalHoldAtMs !== undefined || user.legalHoldAtMs !== undefined;
+  }
+
+  async reconcileSessionUsage(input: ReconcileSessionUsageInput): Promise<UsageReconciliationRecord> {
+    validateReconcileSessionUsageInput(input);
+    this.assertUsageLifecycleScope(input);
+    const reconciliationKey = this.usageReconciliationMapKey(input.sessionId, input.deletionGeneration);
+    const existingRecord = this.usageReconciliations.get(reconciliationKey);
+    if (existingRecord?.status === "anonymized") {
+      if (this.usageRowsForLifecycle(this.usageLedger, input).length > 0) {
+        throw new UsageReconciliationError("operational usage reappeared after anonymization");
+      }
+      return clone(existingRecord);
+    }
+
+    // Clone the complete ledger so assigning ids to legacy NULL rows cannot become visible until
+    // every row and pre-existing billing fact passes conflict and checksum verification.
+    const stagedLedger = this.usageLedger.map(clone);
+    const targetRows = this.usageRowsForLifecycle(stagedLedger, input);
+    const reservedUsageIds = new Set<string>();
+    for (const entry of stagedLedger) {
+      if (entry.usageId === undefined) continue;
+      if (!isUsageId(entry.usageId)) {
+        throw new UsageReconciliationError("stored operational usage has an invalid usage id");
+      }
+      if (reservedUsageIds.has(entry.usageId)) throw new UsageIdentityConflictError(entry.usageId);
+      reservedUsageIds.add(entry.usageId);
+    }
+    for (const usageId of this.billingUsageFacts.keys()) reservedUsageIds.add(usageId);
+
+    for (const entry of targetRows) {
+      if (entry.usageId !== undefined) continue;
+      // Pre-0011 Pi used numeric zero when price metadata was unavailable. Remove that ambiguous
+      // encoding before assigning an id, otherwise the same row would become spuriously "known"
+      // immediately after a successful reconciliation.
+      entry.usage = normalizeOperationalUsageCost(entry.usage, undefined);
+      let allocated: string | undefined;
+      for (let attempt = 0; attempt < 32; attempt += 1) {
+        const candidate = newUsageId();
+        if (!reservedUsageIds.has(candidate)) {
+          allocated = candidate;
+          break;
+        }
+      }
+      if (!allocated) throw new UsageReconciliationError("could not allocate a unique usage id");
+      entry.usageId = allocated;
+      reservedUsageIds.add(allocated);
+    }
+
+    const stagedNewFacts = new Map<string, BillingUsageFact>();
+    const expectedFacts: BillingUsageFact[] = [];
+    const verifiedFacts: BillingUsageFact[] = [];
+    const targetIds = new Set<string>();
+    for (const entry of targetRows) {
+      if (!entry.usageId || targetIds.has(entry.usageId)) {
+        throw new UsageIdentityConflictError(entry.usageId ?? "missing");
+      }
+      targetIds.add(entry.usageId);
+      const expected = billingUsageFactFromLedger({
+        ...entry,
+        usage: normalizeOperationalUsageCost(entry.usage, entry.usageId),
+      } as UsageLedgerEntry & { usageId: string });
+      expectedFacts.push(expected);
+      const existingFact = this.billingUsageFacts.get(entry.usageId);
+      if (existingFact) {
+        if (!billingUsageFactContentEquals(existingFact, expected)) {
+          throw new UsageIdentityConflictError(entry.usageId);
+        }
+        verifiedFacts.push(clone(existingFact));
+      } else {
+        stagedNewFacts.set(entry.usageId, expected);
+        verifiedFacts.push(expected);
+      }
+    }
+
+    const expectedSummary = summarizeBillingUsageFacts(expectedFacts);
+    const verifiedSummary = summarizeBillingUsageFacts(verifiedFacts);
+    if (!usageReconciliationSummariesEqual(expectedSummary, verifiedSummary)) {
+      throw new UsageReconciliationError();
+    }
+    if (existingRecord && !usageReconciliationSummariesEqual(existingRecord, verifiedSummary)) {
+      throw new UsageReconciliationError("verified usage changed after its first reconciliation");
+    }
+
+    const record = clone<UsageReconciliationRecord>(existingRecord ?? {
+      tenantId: input.tenantId,
+      userId: input.userId,
+      sessionId: input.sessionId,
+      deletionGeneration: input.deletionGeneration,
+      status: "verified",
+      ...verifiedSummary,
+      verifiedAtMs: input.nowMs,
+    });
+    if (
+      record.tenantId !== input.tenantId
+      || record.userId !== input.userId
+      || record.sessionId !== input.sessionId
+      || record.deletionGeneration !== input.deletionGeneration
+      || record.status !== "verified"
+    ) throw new UsageReconciliationError("usage reconciliation identity changed");
+
+    this.usageLedger = stagedLedger;
+    for (const [usageId, fact] of stagedNewFacts) this.billingUsageFacts.set(usageId, clone(fact));
+    this.usageReconciliations.set(reconciliationKey, record);
+    return clone(record);
+  }
+
+  async anonymizeSessionUsage(input: AnonymizeSessionUsageInput): Promise<UsageReconciliationRecord> {
+    // Validate the explicit destructive gate without consulting owner-scoped state first. A caller
+    // must not be able to distinguish another subject's legal hold from a nonexistent session.
+    assertUsageAnonymizationAllowed(input, false);
+    this.assertUsageLifecycleScope(input);
+    const reconciliationKey = this.usageReconciliationMapKey(input.sessionId, input.deletionGeneration);
+    const record = this.usageReconciliations.get(reconciliationKey);
+    if (!record) throw new UsageReconciliationError("usage must be reconciled before anonymization");
+    if (
+      record.tenantId !== input.tenantId
+      || record.userId !== input.userId
+      || record.sessionId !== input.sessionId
+      || record.deletionGeneration !== input.deletionGeneration
+    ) throw new SessionGoneError(input.sessionId);
+    if (record.checksum !== input.expectedChecksum) {
+      throw new UsageReconciliationError("expected reconciliation checksum does not match");
+    }
+    // Resolve the durable lifecycle rows before the idempotent fast path so missing state still
+    // fails closed. A hold installed after anonymization committed cannot undo that deletion and
+    // must not turn a lost-response retry into a permanently blocked job.
+    const legalHoldActive = this.isUsageAnonymizationLegalHoldActive(input);
+    const targetRows = this.usageRowsForLifecycle(this.usageLedger, input);
+    if (record.status === "anonymized") {
+      if (targetRows.length !== 0) throw new UsageReconciliationError("operational usage reappeared after anonymization");
+      return clone(record);
+    }
+    assertUsageAnonymizationAllowed(input, legalHoldActive);
+    if (input.nowMs < record.verifiedAtMs) {
+      throw new UsageReconciliationError("anonymization cannot precede verification");
+    }
+
+    const verifiedFacts: BillingUsageFact[] = [];
+    for (const entry of targetRows) {
+      if (!entry.usageId || !isUsageId(entry.usageId)) {
+        throw new UsageReconciliationError("operational usage was not fully assigned before anonymization");
+      }
+      const existingFact = this.billingUsageFacts.get(entry.usageId);
+      if (!existingFact) throw new UsageReconciliationError("a reconciled billing fact is missing");
+      const expectedFact = billingUsageFactFromLedger(
+        {
+          ...entry,
+          usage: normalizeHistoricalUsageCost(entry.usage),
+        } as UsageLedgerEntry & { usageId: string },
+      );
+      if (!billingUsageFactContentEquals(existingFact, expectedFact)) {
+        throw new UsageIdentityConflictError(entry.usageId);
+      }
+      verifiedFacts.push(existingFact);
+    }
+    const currentSummary = summarizeBillingUsageFacts(verifiedFacts);
+    if (!usageReconciliationSummariesEqual(record, currentSummary)) {
+      throw new UsageReconciliationError("operational usage changed after verification");
+    }
+
+    const remainingLedger = this.usageLedger.filter((entry) => !(
+      entry.tenantId === input.tenantId
+      && entry.userId === input.userId
+      && entry.sessionId === input.sessionId
+    ));
+    const anonymized = clone<UsageReconciliationRecord>({
+      ...record,
+      status: "anonymized",
+      anonymizedAtMs: input.nowMs,
+    });
+    this.usageLedger = remainingLedger;
+    this.usageReconciliations.set(reconciliationKey, anonymized);
+    return clone(anonymized);
   }
 
   private assertCommitResourceIdentities(batch: CommitBatch): void {
@@ -758,7 +1301,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async getIdempotencyKey(scope: IdempotencyScope, key: string): Promise<IdempotencyReceipt | null> {
-    if (this.deleted.has(scope.sessionId)) return null;
+    if (!this.isSessionVisible(scope.sessionId)) return null;
     const k = this.idempotencyMapKey(scope, key);
     const cur = this.idem.get(k);
     if (!cur || cur.expiresAt < Date.now() || !cur.value) return null;

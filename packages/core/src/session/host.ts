@@ -3,6 +3,7 @@ import {
   ImageMediaType,
   addUsage,
   emptyUsage,
+  emptyUsageAccumulator,
   mergeLimits,
   type AgentDefinition,
   type Approval,
@@ -46,6 +47,8 @@ import {
   SessionGoneError,
   SessionHasChildrenError,
   SessionLifecycleBusyError,
+  SubjectDeletingError,
+  newUsageId,
 } from "@agent-service/store";
 import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineInputPart, EngineRun, EngineSink, EngineToolResult, ResolvedModel, Summariser } from "../engine/types.js";
 import { buildSystemPrompt, computeContextEpoch, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
@@ -312,7 +315,7 @@ export class SessionHost {
       lastSeq: 0,
       contextEpoch: computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills }),
       fenceToken: 0,
-      usage: emptyUsage(),
+      usage: emptyUsageAccumulator(),
       autoApprovedTools: [],
       lastCompactionSeq: undefined,
       createdAtMs: now,
@@ -328,6 +331,9 @@ export class SessionHost {
       // child; translate that authoritative race result without creating an existence oracle.
       if (err instanceof SessionGoneError && req.parentSessionId) {
         throw new ApiError("not_found", "parent session not found");
+      }
+      if (err instanceof SubjectDeletingError) {
+        throw new ApiError("subject_deleting", "cannot create a session while this user is being erased");
       }
       throw err;
     }
@@ -1208,7 +1214,7 @@ export class SessionHost {
       seqStart: session.lastSeq + 1,
       steps: 0,
       toolCalls: 0,
-      usage: emptyUsage(),
+      usage: emptyUsageAccumulator(),
       startedAtMs: now,
       idempotencyKey: opts.idempotencyKey,
       model: { provider: model.provider, model: model.model },
@@ -1574,7 +1580,16 @@ export class SessionHost {
         const nextTurnUsage = addUsage(state.turn.usage, msg.usage);
         const nextSessionUsage = addUsage(state.session.usage, msg.usage);
         const nextTurn = { ...state.turn, usage: nextTurnUsage };
-        if (state.limits.maxCostCNY && (nextTurnUsage.costCNY ?? 0) > state.limits.maxCostCNY) {
+        // An active cost ceiling cannot safely treat an unpriced step as free. Persist/account for
+        // this completed provider step, but close admission before any of its tools or another model
+        // step can run.
+        if (
+          state.limits.maxCostCNY
+          && msg.stopReason !== "error"
+          && msg.stopReason !== "aborted"
+          && !(msg.stopReason === "length" && msg.toolCalls.length === 0)
+          && (nextTurnUsage.costCNY === undefined || nextTurnUsage.costCNY > state.limits.maxCostCNY)
+        ) {
           state.limitHit ??= "max_cost";
           state.closingRequested = true;
         }
@@ -1588,7 +1603,7 @@ export class SessionHost {
           items,
           events,
           turn: nextTurn,
-          usageEntries: [{ turnId, step: state.step, provider: msg.provider, model: msg.model, usage: msg.usage, createdAtMs: now }],
+          usageEntries: [{ usageId: newUsageId(), turnId, step: state.step, provider: msg.provider, model: msg.model, usage: msg.usage, createdAtMs: now }],
           sessionPatch: { usage: nextSessionUsage },
         });
         state.stepUsage = msg.usage;
@@ -1999,7 +2014,7 @@ export class SessionHost {
         { type: "item/completed", sessionId: session.id, emittedAtMs: now, item },
         { type: "session/compacted", sessionId: session.id, emittedAtMs: now, itemId: item.id },
       ],
-      usageEntries: [{ turnId: item.turnId, step: 0, provider: model.provider, model: model.model, usage, createdAtMs: now }],
+      usageEntries: [{ usageId: newUsageId(), turnId: item.turnId, step: 0, provider: model.provider, model: model.model, usage, createdAtMs: now }],
       // The watermark is the first KEPT item, not the summary item: projecting from the summary would
       // also drop the recent turns this plan deliberately preserved.
       sessionPatch: { lastCompactionSeq: plan.keepFromSeq, usage: nextSessionUsage },

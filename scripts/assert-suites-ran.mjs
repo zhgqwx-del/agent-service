@@ -31,7 +31,11 @@ for (const [file, minLines, hint] of required) {
   }
 }
 
-const requiredTestFiles = ["packages/store/test/blob-lifecycle.mysql.test.ts"];
+const requiredTestFiles = [
+  "packages/store/test/blob-lifecycle.mysql.test.ts",
+  "packages/store/test/usage-lifecycle.mysql.test.ts",
+  "packages/store/test/subject-lifecycle.mysql.test.ts",
+];
 for (const file of requiredTestFiles) {
   const suffix = `/${file}`;
   const result = testReport.testResults?.find((entry) =>
