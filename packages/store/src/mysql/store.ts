@@ -483,6 +483,55 @@ import {
   type TenantContentInventoryStore,
   type TenantSessionContentReceipt,
 } from "../tenant-content-inventory.js";
+import {
+  EMPTY_TENANT_PURGE_PLAN_BLOCKER_ROOT_SHA256,
+  EMPTY_TENANT_PURGE_PLAN_ENTRY_ROOT_SHA256,
+  TENANT_PURGE_PLAN_DOMAINS,
+  TENANT_PURGE_PLAN_ENTRY_SCOPE,
+  TENANT_PURGE_PLAN_RECEIPT_SCOPE,
+  TenantPurgePlanEvidenceChangedError,
+  TenantPurgePlanNotReadyError,
+  isTenantPurgePlanBlockingDisposition,
+  tenantPurgePlanAuthorizationMatches,
+  tenantPurgePlanBlockerRootSha256,
+  tenantPurgePlanClaimFromJob,
+  tenantPurgePlanClaimTokenSha256,
+  tenantPurgePlanDomainOrdinal,
+  tenantPurgePlanDomainSourceSha256,
+  tenantPurgePlanEntryRootSha256,
+  tenantPurgePlanEntrySha256,
+  tenantPurgePlanNextBlockerRootSha256,
+  tenantPurgePlanNextEntryRootSha256,
+  tenantPurgePlanReceiptMatchesAuthorization,
+  tenantPurgePlanReceiptSha256,
+  tenantPurgePlanTargetRootSha256,
+  tenantPurgePlanTargetSha256,
+  validateBuildTenantPurgePlanPageOptions,
+  validateClaimTenantPurgePlansOptions,
+  validateMaterializeTenantPurgePlanJobsOptions,
+  validateRenewTenantPurgePlanOptions,
+  validateRetryTenantPurgePlanOptions,
+  validateTenantPurgePlanAuthorization,
+  validateTenantPurgePlanCompletionProof,
+  validateTenantPurgePlanEntry,
+  validateTenantPurgePlanJobRecord,
+  validateTenantPurgePlanReceipt,
+  type BuildTenantPurgePlanPageOptions,
+  type BuildTenantPurgePlanPageResult,
+  type ClaimTenantPurgePlansOptions,
+  type MaterializeTenantPurgePlanJobsOptions,
+  type RenewTenantPurgePlanOptions,
+  type RetryTenantPurgePlanOptions,
+  type TenantPurgePlanAuthorization,
+  type TenantPurgePlanClaim,
+  type TenantPurgePlanDisposition,
+  type TenantPurgePlanDomain,
+  type TenantPurgePlanEntry,
+  type TenantPurgePlanJobRecord,
+  type TenantPurgePlanReceipt,
+  type TenantPurgePlanSource,
+  type TenantPurgePlanStore,
+} from "../tenant-purge-plan.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -564,6 +613,25 @@ const TENANT_CONTENT_INVENTORY_RECEIPT_COLUMNS = `scope, request_id, tenant_id,
   global_orphan_check, store_db_timestamp_ms, completed_claim_attempt,
   completed_claim_token_sha256, content_inventory_complete, content_purge_executed,
   receipt_sha256`;
+const TENANT_PURGE_PLAN_JOB_COLUMNS = `request_id, tenant_id, subject_generation,
+  t1_fence_sha256, t3a_receipt_sha256, t3b_receipt_sha256, t3c_receipt_sha256,
+  policy_version, policy_sha256, policy_schema_version, build_generation,
+  retention_anchor_db_ms, purge_not_before_db_ms, source_evidence_db_ms, cursor_domain,
+  scan_complete, plan_entry_count, plan_entry_root_sha256, blocker_count,
+  blocker_root_sha256, phase, available_at_ms, attempts, claim_token, lease_until_ms,
+  last_error_code, created_at_ms, updated_at_ms, sealed_at_ms, completed_claim_attempt,
+  completed_claim_token_sha256, aggregate_receipt_sha256, blocked_at_ms,
+  blocked_reason_code`;
+const TENANT_PURGE_PLAN_ENTRY_COLUMNS = `scope, request_id, build_generation, tenant_id,
+  subject_generation, domain, target_count, target_root_sha256, disposition, source_sha256,
+  captured_at_db_ms, receipt_sha256`;
+const TENANT_PURGE_PLAN_RECEIPT_COLUMNS = `scope, request_id, tenant_id, subject_generation,
+  build_generation, t1_fence_sha256, t3a_receipt_sha256, t3b_receipt_sha256,
+  t3c_receipt_sha256, policy_version, policy_sha256, policy_schema_version,
+  retention_anchor_db_ms, purge_not_before_db_ms, source_evidence_db_ms,
+  plan_entry_count, plan_entry_root_sha256, blocker_count, blocker_root_sha256,
+  store_db_timestamp_ms, completed_claim_attempt, completed_claim_token_sha256,
+  plan_complete, execution_ready, content_purge_executed, receipt_sha256`;
 type TenantContentSessionRow = {
   sessionId: string;
   tenantId: string;
@@ -2291,6 +2359,247 @@ function rowToTenantContentInventoryReceipt(row: Row): TenantContentInventoryRec
   }
 }
 
+function rowToTenantPurgePlanJob(row: Row): TenantPurgePlanJobRecord {
+  try {
+    const common = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant purge plan subject generation",
+        1,
+      ),
+      buildGeneration: storedSafeInteger(
+        row.build_generation,
+        "stored tenant purge plan build generation",
+        1,
+      ),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3aReceiptSha256: String(row.t3a_receipt_sha256),
+      t3bReceiptSha256: String(row.t3b_receipt_sha256),
+      t3cReceiptSha256: String(row.t3c_receipt_sha256),
+      policyVersion: String(row.policy_version),
+      policySha256: String(row.policy_sha256),
+      policySchemaVersion: storedSafeInteger(
+        row.policy_schema_version,
+        "stored tenant purge plan policy schema version",
+        1,
+      ) as typeof RETENTION_POLICY_SCHEMA_VERSION,
+      retentionAnchorDbMs: storedSafeInteger(
+        row.retention_anchor_db_ms,
+        "stored tenant purge plan retention anchor",
+      ),
+      purgeNotBeforeDbMs: storedSafeInteger(
+        row.purge_not_before_db_ms,
+        "stored tenant purge plan deadline",
+      ),
+      sourceEvidenceDbMs: storedSafeInteger(
+        row.source_evidence_db_ms,
+        "stored tenant purge plan source evidence timestamp",
+      ),
+      ...(row.cursor_domain == null
+        ? {}
+        : { cursorDomain: String(row.cursor_domain) as TenantPurgePlanDomain }),
+      scanComplete: tenantCredentialBoolean(
+        row.scan_complete,
+        "stored tenant purge plan scan marker",
+      ),
+      planEntryCount: storedSafeInteger(
+        row.plan_entry_count,
+        "stored tenant purge plan entry count",
+      ),
+      planEntryRootSha256: String(row.plan_entry_root_sha256),
+      blockerCount: storedSafeInteger(
+        row.blocker_count,
+        "stored tenant purge plan blocker count",
+      ),
+      blockerRootSha256: String(row.blocker_root_sha256),
+      attempts: storedSafeInteger(row.attempts, "stored tenant purge plan attempts"),
+      createdAtMs: storedSafeInteger(
+        row.created_at_ms,
+        "stored tenant purge plan creation timestamp",
+      ),
+      updatedAtMs: storedSafeInteger(
+        row.updated_at_ms,
+        "stored tenant purge plan update timestamp",
+      ),
+    };
+    const phase = String(row.phase);
+    let job: TenantPurgePlanJobRecord;
+    if (phase === "queued") {
+      job = {
+        ...common,
+        phase,
+        availableAtMs: storedSafeInteger(
+          row.available_at_ms,
+          "stored tenant purge plan availability",
+        ),
+        ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+        ...(row.lease_until_ms == null
+          ? {}
+          : {
+              leaseUntilMs: storedSafeInteger(
+                row.lease_until_ms,
+                "stored tenant purge plan lease",
+              ),
+            }),
+        ...(row.last_error_code == null
+          ? {}
+          : { lastErrorCode: String(row.last_error_code) as "temporary_failure" }),
+      };
+    } else if (phase === "plan_sealed") {
+      job = {
+        ...common,
+        phase,
+        planSealedAtDbMs: storedSafeInteger(
+          row.sealed_at_ms,
+          "stored tenant purge plan seal timestamp",
+        ),
+        completedClaimAttempt: storedSafeInteger(
+          row.completed_claim_attempt,
+          "stored tenant purge plan completion attempt",
+          1,
+        ),
+        completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+        aggregateReceiptSha256: String(row.aggregate_receipt_sha256),
+      };
+    } else if (phase === "blocked") {
+      job = {
+        ...common,
+        phase,
+        blockedAtDbMs: storedSafeInteger(
+          row.blocked_at_ms,
+          "stored tenant purge plan blocked timestamp",
+        ),
+        blockedReasonCode: String(row.blocked_reason_code) as "integrity_conflict",
+      };
+    } else {
+      throw new Error("stored tenant purge plan phase is invalid");
+    }
+    validateTenantPurgePlanJobRecord(job);
+    return job;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantPurgePlanEntry(row: Row): TenantPurgePlanEntry {
+  try {
+    const entry: TenantPurgePlanEntry = {
+      scope: String(row.scope) as TenantPurgePlanEntry["scope"],
+      requestId: String(row.request_id),
+      buildGeneration: storedSafeInteger(
+        row.build_generation,
+        "stored tenant purge plan entry build generation",
+        1,
+      ),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant purge plan entry subject generation",
+        1,
+      ),
+      domain: String(row.domain) as TenantPurgePlanDomain,
+      targetCount: storedSafeInteger(
+        row.target_count,
+        "stored tenant purge plan target count",
+      ),
+      targetRootSha256: String(row.target_root_sha256),
+      disposition: String(row.disposition) as TenantPurgePlanDisposition,
+      sourceSha256: String(row.source_sha256),
+      capturedAtDbMs: storedSafeInteger(
+        row.captured_at_db_ms,
+        "stored tenant purge plan capture timestamp",
+      ),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantPurgePlanEntry(entry);
+    return entry;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantPurgePlanReceipt(row: Row): TenantPurgePlanReceipt {
+  try {
+    const receipt: TenantPurgePlanReceipt = {
+      scope: String(row.scope) as TenantPurgePlanReceipt["scope"],
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant purge plan receipt subject generation",
+        1,
+      ),
+      buildGeneration: storedSafeInteger(
+        row.build_generation,
+        "stored tenant purge plan receipt build generation",
+        1,
+      ),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3aReceiptSha256: String(row.t3a_receipt_sha256),
+      t3bReceiptSha256: String(row.t3b_receipt_sha256),
+      t3cReceiptSha256: String(row.t3c_receipt_sha256),
+      policyVersion: String(row.policy_version),
+      policySha256: String(row.policy_sha256),
+      policySchemaVersion: storedSafeInteger(
+        row.policy_schema_version,
+        "stored tenant purge plan receipt policy schema version",
+        1,
+      ) as typeof RETENTION_POLICY_SCHEMA_VERSION,
+      retentionAnchorDbMs: storedSafeInteger(
+        row.retention_anchor_db_ms,
+        "stored tenant purge plan receipt retention anchor",
+      ),
+      purgeNotBeforeDbMs: storedSafeInteger(
+        row.purge_not_before_db_ms,
+        "stored tenant purge plan receipt deadline",
+      ),
+      sourceEvidenceDbMs: storedSafeInteger(
+        row.source_evidence_db_ms,
+        "stored tenant purge plan receipt source evidence timestamp",
+      ),
+      planEntryCount: storedSafeInteger(
+        row.plan_entry_count,
+        "stored tenant purge plan receipt entry count",
+      ),
+      planEntryRootSha256: String(row.plan_entry_root_sha256),
+      blockerCount: storedSafeInteger(
+        row.blocker_count,
+        "stored tenant purge plan receipt blocker count",
+      ),
+      blockerRootSha256: String(row.blocker_root_sha256),
+      storeDbTimestampMs: storedSafeInteger(
+        row.store_db_timestamp_ms,
+        "stored tenant purge plan receipt timestamp",
+      ),
+      completedClaimAttempt: storedSafeInteger(
+        row.completed_claim_attempt,
+        "stored tenant purge plan receipt completion attempt",
+        1,
+      ),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      planComplete: tenantCredentialBoolean(
+        row.plan_complete,
+        "stored tenant purge plan completion flag",
+      ) as true,
+      executionReady: tenantCredentialBoolean(
+        row.execution_ready,
+        "stored tenant purge plan execution flag",
+      ) as false,
+      contentPurgeExecuted: tenantCredentialBoolean(
+        row.content_purge_executed,
+        "stored tenant purge execution flag",
+      ) as false,
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantPurgePlanReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
 function mysqlControlGeneration(value: unknown): {
   projected: number;
   raw: string;
@@ -3103,11 +3412,13 @@ export class MysqlSessionStore implements
   TenantCredentialRevocationStore,
   TenantRuntimeRevocationStore,
   TenantContentInventoryStore,
+  TenantPurgePlanStore,
   UserDataExportRequestStore,
   UserDataExportJobStore,
   UserDataExportCleanupStore
 {
   private tenantContentMaterializationCursorRequestId?: string;
+  private tenantPurgePlanMaterializationCursorRequestId?: string;
 
   private constructor(private readonly pool: Pool) {}
 
@@ -13069,6 +13380,3006 @@ export class MysqlSessionStore implements
       }
       const proof = await this.validateTenantContentInventoryReadProof(conn, job);
       return proof.aggregate;
+    });
+  }
+
+  private async beginTenantPurgePlanTransaction(conn: PoolConnection): Promise<void> {
+    // Every page and seal binds a cross-table snapshot. Pin RR so owner scans use InnoDB
+    // next-key locks and cannot silently miss a concurrent insert in a domain already captured.
+    await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    await conn.beginTransaction();
+  }
+
+  private async loadTenantPurgePlanJob(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" | "FOR UPDATE SKIP LOCKED" = "",
+  ): Promise<TenantPurgePlanJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_PURGE_PLAN_JOB_COLUMNS}
+         FROM tenant_purge_plan_jobs
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const job = rowToTenantPurgePlanJob(rows[0]);
+    return job.tenantId === tenantId && job.requestId === requestId ? job : null;
+  }
+
+  private async loadTenantPurgePlanEntries(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    buildGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantPurgePlanEntry[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_PURGE_PLAN_ENTRY_COLUMNS}
+         FROM tenant_purge_plan_entries
+        WHERE tenant_id=? AND request_id=? AND build_generation=? ${lock}`,
+      [tenantId, requestId, buildGeneration],
+    );
+    return rows.map((row) => {
+      const entry = rowToTenantPurgePlanEntry(row);
+      if (
+        entry.tenantId !== tenantId
+        || entry.requestId !== requestId
+        || entry.buildGeneration !== buildGeneration
+      ) throw new TenantErasureIntegrityError();
+      return entry;
+    }).sort((left, right) => (
+      tenantPurgePlanDomainOrdinal(left.domain) - tenantPurgePlanDomainOrdinal(right.domain)
+    ));
+  }
+
+  private async loadTenantPurgePlanReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantPurgePlanReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_PURGE_PLAN_RECEIPT_COLUMNS}
+         FROM tenant_purge_plan_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const receipt = rowToTenantPurgePlanReceipt(rows[0]);
+    return receipt.tenantId === tenantId && receipt.requestId === requestId ? receipt : null;
+  }
+
+  private tenantPurgePlanSameSource(
+    left: TenantPurgePlanJobRecord,
+    right: TenantPurgePlanJobRecord,
+  ): boolean {
+    const fields = [
+      "requestId", "tenantId", "subjectGeneration", "buildGeneration", "t1FenceSha256",
+      "t3aReceiptSha256", "t3bReceiptSha256", "t3cReceiptSha256", "policyVersion",
+      "policySha256", "policySchemaVersion", "retentionAnchorDbMs", "purgeNotBeforeDbMs",
+      "sourceEvidenceDbMs",
+    ] as const;
+    return fields.every((field) => left[field] === right[field]);
+  }
+
+  private async validateTenantPurgePlanSource(
+    conn: PoolConnection,
+    job: TenantPurgePlanJobRecord,
+    requireLiveSource: boolean,
+  ): Promise<{
+    contentJob: Extract<TenantContentInventoryJobRecord, { phase: "inventory_sealed" }>;
+    contentReceipt: TenantContentInventoryReceipt;
+    credentialReceipt: TenantCredentialRevocationReceipt;
+    sessionReceipts: TenantSessionContentReceipt[];
+  }> {
+    try {
+      validateTenantPurgePlanJobRecord(job);
+      const contentJob = await this.loadTenantContentInventoryJob(
+        conn,
+        job.tenantId,
+        job.requestId,
+        "FOR SHARE",
+      );
+      if (
+        !contentJob
+        || contentJob.phase !== "inventory_sealed"
+        || contentJob.subjectGeneration !== job.subjectGeneration
+        || contentJob.buildGeneration !== job.buildGeneration
+      ) throw new Error("tenant purge plan T3c source is missing");
+      if (requireLiveSource) {
+        await this.lockAndValidateTenantContentInventoryCurrentSource(conn, contentJob);
+      } else {
+        await this.validateTenantContentInventoryImmutableSource(conn, contentJob, "FOR SHARE");
+      }
+      const sessionReceipts = await this.loadTenantSessionContentReceipts(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.buildGeneration,
+        "FOR SHARE",
+      );
+      const contentReceipt = await this.loadTenantContentInventoryReceipt(
+        conn,
+        job.tenantId,
+        job.requestId,
+        "FOR SHARE",
+      );
+      if (!contentReceipt) throw new Error("tenant purge plan T3c receipt is missing");
+      validateTenantContentInventoryCompletionProof(contentJob, sessionReceipts, contentReceipt);
+      const credentialReceipt = await this.loadTenantCredentialRevocationReceipt(
+        conn,
+        job.tenantId,
+        job.requestId,
+        "FOR SHARE",
+      );
+      if (!credentialReceipt) throw new Error("tenant purge plan T3a receipt is missing");
+      if (
+        job.t1FenceSha256 !== contentJob.t1FenceSha256
+        || job.t3aReceiptSha256 !== contentJob.t3aReceiptSha256
+        || job.t3bReceiptSha256 !== contentJob.t3bReceiptSha256
+        || job.t3cReceiptSha256 !== contentReceipt.receiptSha256
+        || job.policyVersion !== contentJob.policyVersion
+        || job.policySha256 !== contentJob.policySha256
+        || job.policySchemaVersion !== contentJob.policySchemaVersion
+        || job.retentionAnchorDbMs !== contentJob.retentionAnchorDbMs
+        || job.purgeNotBeforeDbMs !== contentJob.contentNotBeforeDbMs
+        || job.sourceEvidenceDbMs !== contentReceipt.storeDbTimestampMs
+        || credentialReceipt.receiptSha256 !== job.t3aReceiptSha256
+      ) throw new Error("tenant purge plan source binding is invalid");
+
+      if (requireLiveSource) {
+        const [sessionRows] = await conn.query<Row[]>(
+          `SELECT session_id, tenant_id, user_id, parent_session_id, last_seq,
+                  archived_at_ms, deleted_at_ms, deletion_generation
+             FROM sessions FORCE INDEX (idx_sessions_tenant)
+            WHERE tenant_id=? ORDER BY session_id FOR SHARE`,
+          [job.tenantId],
+        );
+        if (sessionRows.length !== sessionReceipts.length) {
+          throw new TenantPurgePlanEvidenceChangedError();
+        }
+        let contentRecordCount = 0;
+        for (const [index, row] of sessionRows.entries()) {
+          const session = this.tenantContentSessionRow(row);
+          const stored = sessionReceipts[index];
+          if (!stored || stored.sessionId !== session.sessionId) {
+            throw new TenantPurgePlanEvidenceChangedError();
+          }
+          const evidence = await this.loadTenantSessionContentEvidence(conn, session);
+          const recomputed = this.tenantSessionContentReceipt(
+            contentJob,
+            session,
+            evidence,
+            stored.capturedAtDbMs,
+          );
+          if (recomputed.receiptSha256 !== stored.receiptSha256) {
+            throw new TenantPurgePlanEvidenceChangedError();
+          }
+          contentRecordCount += recomputed.contentRecordCount;
+          if (!Number.isSafeInteger(contentRecordCount)) throw new Error("content count overflow");
+        }
+        if (contentRecordCount !== contentReceipt.contentRecordCount) {
+          throw new TenantPurgePlanEvidenceChangedError();
+        }
+        await this.lockAndValidateTenantContentGlobalRelations(conn);
+      }
+      return { contentJob, contentReceipt, credentialReceipt, sessionReceipts };
+    } catch (error) {
+      if (error instanceof TenantPurgePlanEvidenceChangedError) throw error;
+      if (error instanceof TenantContentInventoryEvidenceChangedError) {
+        throw new TenantPurgePlanEvidenceChangedError();
+      }
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async lockTenantPurgePlanHoldProof(
+    conn: PoolConnection,
+    tenantId: string,
+  ): Promise<{ holdControlCount: number; holdControlRootSha256: string }> {
+    try {
+      return await this.lockTenantContentHoldProof(conn, tenantId);
+    } catch (error) {
+      if (
+        error instanceof TenantContentInventoryNotReadyError
+        && error.reason === "active_legal_hold"
+      ) throw new TenantPurgePlanNotReadyError("active_legal_hold");
+      throw error;
+    }
+  }
+
+  private tenantPurgePlanEntryState(
+    job: TenantPurgePlanJobRecord,
+    entries: readonly TenantPurgePlanEntry[],
+  ): void {
+    if (
+      entries.length !== job.planEntryCount
+      || entries.length > TENANT_PURGE_PLAN_DOMAINS.length
+      || tenantPurgePlanEntryRootSha256(entries) !== job.planEntryRootSha256
+      || tenantPurgePlanBlockerRootSha256(entries) !== job.blockerRootSha256
+      || entries.filter((entry) => isTenantPurgePlanBlockingDisposition(entry.disposition)).length
+        !== job.blockerCount
+      || entries.some((entry, index) => entry.domain !== TENANT_PURGE_PLAN_DOMAINS[index])
+      || (entries.length === 0
+        ? job.cursorDomain !== undefined
+        : job.cursorDomain !== entries.at(-1)!.domain)
+      || (job.scanComplete && entries.length !== TENANT_PURGE_PLAN_DOMAINS.length)
+    ) throw new TenantErasureIntegrityError();
+  }
+
+  /**
+   * T3d cannot describe a complete plan while a child row has no trustworthy owner. Scan and
+   * next-key lock the complete relation sets (not just this tenant) so an orphan outside the
+   * selected owner cannot be hidden by an inner join or race the page/seal snapshot.
+   */
+  private async lockAndValidateTenantPurgePlanGlobalRelations(
+    conn: PoolConnection,
+  ): Promise<void> {
+    try {
+      const query = async (sql: string): Promise<Row[]> => {
+        const [rows] = await conn.query<Row[]>(sql);
+        return rows;
+      };
+      const number = (value: unknown, label: string, minimum = 0): number => (
+        storedSafeInteger(value, label, minimum)
+      );
+
+      const sessions = await query(
+        `SELECT session_id, tenant_id, user_id, last_seq, deleted_at_ms, purge_after_ms,
+                deletion_generation
+           FROM sessions ORDER BY session_id FOR SHARE`,
+      );
+      const sessionById = new Map<string, {
+        tenantId: string;
+        userId: string;
+        lastSeq: number;
+        deletedAtMs?: number;
+        purgeAfterMs?: number;
+        deletionGeneration: number;
+      }>();
+      for (const row of sessions) {
+        const sessionId = String(row.session_id);
+        if (sessionById.has(sessionId)) throw new Error("duplicate session relation owner");
+        sessionById.set(sessionId, {
+          tenantId: String(row.tenant_id),
+          userId: String(row.user_id),
+          lastSeq: number(row.last_seq, "session event sequence"),
+          ...(row.deleted_at_ms == null
+            ? {}
+            : { deletedAtMs: number(row.deleted_at_ms, "session deletion timestamp") }),
+          ...(row.purge_after_ms == null
+            ? {}
+            : { purgeAfterMs: number(row.purge_after_ms, "session purge timestamp") }),
+          deletionGeneration: number(row.deletion_generation, "session deletion generation"),
+        });
+      }
+
+      const turns = await query(
+        `SELECT turn_id, session_id, user_id FROM turns ORDER BY turn_id FOR SHARE`,
+      );
+      const turnById = new Map<string, { sessionId: string; userId: string }>();
+      for (const row of turns) {
+        const turnId = String(row.turn_id);
+        const sessionId = String(row.session_id);
+        const session = sessionById.get(sessionId);
+        if (
+          !session
+          || session.userId !== String(row.user_id)
+          || turnById.has(turnId)
+        ) throw new Error("turn owner relation is invalid");
+        turnById.set(turnId, { sessionId, userId: String(row.user_id) });
+      }
+
+      // These three operational tables deliberately have no owner foreign keys. Lock and scan
+      // their complete primary-key ranges so an orphan or cross-owner row anywhere in the
+      // database cannot be hidden by the tenant-filtered evidence queries below. Operational
+      // usage may legitimately name a synthetic/legacy turn, so session ownership is the only
+      // relation required for the ledger itself.
+      const idempotencyRows = await query(
+        `SELECT tenant_id, user_id, session_id, idem_key, value
+           FROM idempotency_keys
+          ORDER BY tenant_id, user_id, session_id, idem_key FOR SHARE`,
+      );
+      for (const row of idempotencyRows) {
+        const sessionId = String(row.session_id);
+        const session = sessionById.get(sessionId);
+        if (
+          !session
+          || session.tenantId !== String(row.tenant_id)
+          || session.userId !== String(row.user_id)
+        ) throw new Error("idempotency owner relation is invalid");
+        // NULL is the intentionally preserved legacy pending receipt. A completed receipt is a
+        // durable response pointer and must resolve to a turn owned by the same scoped session.
+        if (row.value != null) {
+          const value = parse<unknown>(row.value);
+          if (
+            typeof value !== "object"
+            || value === null
+            || Array.isArray(value)
+            || typeof (value as { turnId?: unknown }).turnId !== "string"
+          ) throw new Error("idempotency completed value is invalid");
+          const valueSessionId = (value as { sessionId?: unknown }).sessionId;
+          if (valueSessionId !== undefined && typeof valueSessionId !== "string") {
+            throw new Error("idempotency completed session pointer is invalid");
+          }
+          const valueTurnId = (value as { turnId: string }).turnId;
+          const turn = turnById.get(valueTurnId);
+          if (
+            (valueSessionId !== undefined && valueSessionId !== sessionId)
+            || !turn
+            || turn.sessionId !== sessionId
+            || turn.userId !== session.userId
+          ) throw new Error("idempotency completed value relation is invalid");
+        }
+      }
+
+      const usageRows = await query(
+        `SELECT id, tenant_id, user_id, session_id
+           FROM usage_ledger ORDER BY id FOR SHARE`,
+      );
+      for (const row of usageRows) {
+        const session = sessionById.get(String(row.session_id));
+        if (
+          !session
+          || session.tenantId !== String(row.tenant_id)
+          || session.userId !== String(row.user_id)
+        ) throw new Error("operational usage owner relation is invalid");
+      }
+
+      const reconciliationRows = await query(
+        `SELECT tenant_id, user_id, session_id, deletion_generation
+           FROM usage_reconciliations
+          ORDER BY session_id, deletion_generation FOR SHARE`,
+      );
+      for (const row of reconciliationRows) {
+        const session = sessionById.get(String(row.session_id));
+        const deletionGeneration = number(
+          row.deletion_generation,
+          "usage reconciliation deletion generation",
+          1,
+        );
+        // A reconciliation is created only after a positive-generation tombstone and remains
+        // bound to that exact generation. Legacy generation-zero tombstones must first pass the
+        // dedicated compensation protocol; live generation-zero sessions remain valid owners for
+        // idempotency/operational usage, but never for reconciliation evidence.
+        if (
+          !session
+          || session.tenantId !== String(row.tenant_id)
+          || session.userId !== String(row.user_id)
+          || session.deletedAtMs === undefined
+          || session.deletionGeneration !== deletionGeneration
+        ) throw new Error("usage reconciliation owner relation is invalid");
+      }
+
+      const items = await query(
+        `SELECT item_id, session_id, user_id FROM items ORDER BY item_id FOR SHARE`,
+      );
+      const itemById = new Map<string, { sessionId: string; userId: string }>();
+      for (const row of items) {
+        const itemId = String(row.item_id);
+        const sessionId = String(row.session_id);
+        const owner = sessionById.get(sessionId);
+        if (!owner || owner.userId !== String(row.user_id) || itemById.has(itemId)) {
+          throw new Error("item owner relation is invalid");
+        }
+        itemById.set(itemId, { sessionId, userId: String(row.user_id) });
+      }
+
+      const blobs = await query(
+        `SELECT blob_id, tenant_id, user_id, session_id, item_id, deletion_generation
+           FROM blob_objects ORDER BY blob_id FOR SHARE`,
+      );
+      const blobById = new Map<string, {
+        tenantId: string;
+        userId: string;
+        sessionId: string;
+        deletionGeneration: number;
+      }>();
+      for (const row of blobs) {
+        const blobId = String(row.blob_id);
+        const sessionId = String(row.session_id);
+        const tenantId = String(row.tenant_id);
+        const userId = String(row.user_id);
+        const session = sessionById.get(sessionId);
+        if (
+          !session
+          || session.tenantId !== tenantId
+          || session.userId !== userId
+          || blobById.has(blobId)
+        ) throw new Error("blob owner relation is invalid");
+        if (row.item_id != null) {
+          const item = itemById.get(String(row.item_id));
+          if (!item || item.sessionId !== sessionId || item.userId !== userId) {
+            throw new Error("blob item relation is invalid");
+          }
+        }
+        blobById.set(blobId, {
+          tenantId,
+          userId,
+          sessionId,
+          deletionGeneration: number(row.deletion_generation, "blob deletion generation"),
+        });
+      }
+      const blobDeletes = await query(
+        `SELECT outbox_id, blob_id, generation
+           FROM blob_delete_outbox ORDER BY outbox_id FOR SHARE`,
+      );
+      for (const row of blobDeletes) {
+        const blob = blobById.get(String(row.blob_id));
+        if (
+          !blob
+          || blob.deletionGeneration !== number(row.generation, "blob outbox generation")
+        ) throw new Error("blob delete outbox relation is invalid");
+      }
+
+      const lifecycleRows = await query(
+        `SELECT outbox_id, topic, aggregate_id, generation, payload
+           FROM lifecycle_outbox ORDER BY outbox_id FOR SHARE`,
+      );
+      for (const row of lifecycleRows) {
+        const sessionId = String(row.aggregate_id);
+        const generation = number(row.generation, "lifecycle outbox generation", 1);
+        const session = sessionById.get(sessionId);
+        const envelope = parseLifecycleOutboxEnvelope(row.topic, parse<unknown>(row.payload));
+        if (
+          !session
+          || session.deletionGeneration !== generation
+          || envelope.payload.sessionId !== sessionId
+          || envelope.payload.deletionGeneration !== generation
+        ) throw new Error("lifecycle outbox relation is invalid");
+      }
+
+      const exportRequests = await query(
+        `SELECT request_id, tenant_id, user_id, subject_generation, active_build_generation
+           FROM user_export_requests ORDER BY request_id FOR SHARE`,
+      );
+      type ExportOwner = {
+        tenantId: string;
+        userId: string;
+        subjectGeneration: number;
+        activeBuildGeneration: number;
+      };
+      const exportRequestById = new Map<string, ExportOwner>();
+      for (const row of exportRequests) {
+        const requestId = String(row.request_id);
+        if (exportRequestById.has(requestId)) throw new Error("duplicate export request");
+        exportRequestById.set(requestId, {
+          tenantId: String(row.tenant_id),
+          userId: String(row.user_id),
+          // A normal active user starts at lifecycle generation zero. Export rows created before
+          // the first erasure gate legitimately retain that generation after they are revoked.
+          subjectGeneration: number(row.subject_generation, "export subject generation"),
+          activeBuildGeneration: number(
+            row.active_build_generation,
+            "export active build generation",
+          ),
+        });
+      }
+      const exportJobs = await query(
+        `SELECT request_id, tenant_id, user_id, subject_generation, build_generation
+           FROM user_export_jobs ORDER BY request_id FOR SHARE`,
+      );
+      type ExportJobOwner = Omit<ExportOwner, "activeBuildGeneration"> & {
+        buildGeneration: number;
+      };
+      const exportJobByRequest = new Map<string, ExportJobOwner>();
+      for (const row of exportJobs) {
+        const requestId = String(row.request_id);
+        // queued/revoked exports which have never started a build legitimately remain at zero.
+        const buildGeneration = number(row.build_generation, "export build generation");
+        const owner = exportRequestById.get(requestId);
+        const actual: ExportJobOwner = {
+          tenantId: String(row.tenant_id),
+          userId: String(row.user_id),
+          subjectGeneration: number(row.subject_generation, "export job subject generation"),
+          buildGeneration,
+        };
+        if (
+          !owner
+          || owner.tenantId !== actual.tenantId
+          || owner.userId !== actual.userId
+          || owner.subjectGeneration !== actual.subjectGeneration
+          || owner.activeBuildGeneration !== actual.buildGeneration
+        ) throw new Error("export job owner relation is invalid");
+        exportJobByRequest.set(requestId, actual);
+      }
+      type ArtifactOwner = ExportJobOwner & {
+        requestId: string;
+        deletionGeneration: number;
+      };
+      const artifacts = await query(
+        `SELECT artifact_id, request_id, tenant_id, user_id, subject_generation,
+                build_generation, deletion_generation
+           FROM user_export_artifacts ORDER BY artifact_id FOR SHARE`,
+      );
+      const artifactById = new Map<string, ArtifactOwner>();
+      for (const row of artifacts) {
+        const artifactId = String(row.artifact_id);
+        const requestId = String(row.request_id);
+        const buildGeneration = number(row.build_generation, "artifact build generation", 1);
+        const owner = exportJobByRequest.get(requestId);
+        const actual: ArtifactOwner = {
+          requestId,
+          buildGeneration,
+          tenantId: String(row.tenant_id),
+          userId: String(row.user_id),
+          subjectGeneration: number(row.subject_generation, "artifact subject generation"),
+          deletionGeneration: number(row.deletion_generation, "artifact deletion generation"),
+        };
+        if (
+          !owner
+          || buildGeneration > owner.buildGeneration
+          || owner.tenantId !== actual.tenantId
+          || owner.userId !== actual.userId
+          || owner.subjectGeneration !== actual.subjectGeneration
+          || artifactById.has(artifactId)
+        ) throw new Error("export artifact owner relation is invalid");
+        artifactById.set(artifactId, actual);
+      }
+      const snapshotRecords = await query(
+        `SELECT request_id, build_generation, tenant_id, user_id, subject_generation
+           FROM user_export_snapshot_records
+          ORDER BY request_id, build_generation, ordinal FOR SHARE`,
+      );
+      for (const row of snapshotRecords) {
+        const owner = exportJobByRequest.get(String(row.request_id));
+        const buildGeneration = number(
+          row.build_generation,
+          "snapshot record build generation",
+          1,
+        );
+        if (
+          !owner
+          || buildGeneration > owner.buildGeneration
+          || owner.tenantId !== String(row.tenant_id)
+          || owner.userId !== String(row.user_id)
+          || owner.subjectGeneration
+            !== number(row.subject_generation, "snapshot record subject generation")
+        ) throw new Error("export snapshot record owner relation is invalid");
+      }
+      const snapshotBlobs = await query(
+        `SELECT request_id, build_generation, blob_id, tenant_id, user_id,
+                subject_generation, session_id, source_deletion_generation, released_at_ms
+           FROM user_export_snapshot_blobs
+          ORDER BY request_id, build_generation, ordinal FOR SHARE`,
+      );
+      for (const row of snapshotBlobs) {
+        const requestId = String(row.request_id);
+        const buildGeneration = number(row.build_generation, "snapshot blob build generation", 1);
+        const sourceDeletionGeneration = number(
+          row.source_deletion_generation,
+          "snapshot source generation",
+        );
+        const released = row.released_at_ms != null;
+        if (released) number(row.released_at_ms, "snapshot release timestamp");
+        const owner = exportJobByRequest.get(requestId);
+        const blob = blobById.get(String(row.blob_id));
+        if (
+          !owner
+          || buildGeneration > owner.buildGeneration
+          || owner.tenantId !== String(row.tenant_id)
+          || owner.userId !== String(row.user_id)
+          || owner.subjectGeneration
+            !== number(row.subject_generation, "snapshot blob subject generation")
+          || !blob
+          || blob.tenantId !== owner.tenantId
+          || blob.userId !== owner.userId
+          || blob.sessionId !== String(row.session_id)
+          // A live pin freezes the exact source generation. Once released, the source is free to
+          // advance into a later deletion generation, while rollback or identity replacement is
+          // still rejected.
+          || (released
+            ? blob.deletionGeneration < sourceDeletionGeneration
+            : blob.deletionGeneration !== sourceDeletionGeneration)
+        ) throw new Error("export snapshot blob owner relation is invalid");
+      }
+      type PartOwner = ArtifactOwner & { artifactId: string; partNumber: number };
+      const parts = await query(
+        `SELECT artifact_id, part_number, request_id, build_generation, tenant_id, user_id,
+                subject_generation, deletion_generation
+           FROM user_export_artifact_parts ORDER BY artifact_id, part_number FOR SHARE`,
+      );
+      const partByKey = new Map<string, PartOwner>();
+      for (const row of parts) {
+        const artifactId = String(row.artifact_id);
+        const partNumber = number(row.part_number, "artifact part number");
+        const artifact = artifactById.get(artifactId);
+        const actual: PartOwner = {
+          artifactId,
+          partNumber,
+          requestId: String(row.request_id),
+          buildGeneration: number(row.build_generation, "artifact part build generation", 1),
+          tenantId: String(row.tenant_id),
+          userId: String(row.user_id),
+          subjectGeneration: number(row.subject_generation, "artifact part subject generation"),
+          deletionGeneration: number(row.deletion_generation, "artifact part deletion generation"),
+        };
+        if (
+          !artifact
+          || artifact.requestId !== actual.requestId
+          || artifact.buildGeneration !== actual.buildGeneration
+          || artifact.tenantId !== actual.tenantId
+          || artifact.userId !== actual.userId
+          || artifact.subjectGeneration !== actual.subjectGeneration
+          || artifact.deletionGeneration !== actual.deletionGeneration
+        ) throw new Error("export artifact part relation is invalid");
+        partByKey.set(JSON.stringify([artifactId, partNumber]), actual);
+      }
+      const downloadLeases = await query(
+        `SELECT artifact_id, request_id, build_generation, artifact_deletion_generation,
+                tenant_id, user_id
+           FROM user_export_download_leases ORDER BY artifact_id, lease_token FOR SHARE`,
+      );
+      for (const row of downloadLeases) {
+        const artifact = artifactById.get(String(row.artifact_id));
+        if (
+          !artifact
+          || artifact.requestId !== String(row.request_id)
+          || artifact.buildGeneration !== number(row.build_generation, "download build generation", 1)
+          || artifact.deletionGeneration
+            !== number(row.artifact_deletion_generation, "download artifact generation")
+          || artifact.tenantId !== String(row.tenant_id)
+          || artifact.userId !== String(row.user_id)
+        ) throw new Error("export download lease relation is invalid");
+      }
+      const exportDeletes = await query(
+        `SELECT outbox_id, artifact_id, part_number, request_id, build_generation,
+                deletion_generation
+           FROM user_export_artifact_delete_outbox ORDER BY outbox_id FOR SHARE`,
+      );
+      for (const row of exportDeletes) {
+        const artifactId = String(row.artifact_id);
+        const partNumber = number(row.part_number, "export delete part number");
+        const artifact = artifactById.get(artifactId);
+        const part = partByKey.get(JSON.stringify([artifactId, partNumber]));
+        const requestId = String(row.request_id);
+        const buildGeneration = number(row.build_generation, "export delete build generation", 1);
+        const deletionGeneration = number(
+          row.deletion_generation,
+          "export delete generation",
+          1,
+        );
+        if (
+          !artifact
+          || !part
+          || artifact.requestId !== requestId
+          || part.requestId !== requestId
+          || artifact.buildGeneration !== buildGeneration
+          || part.buildGeneration !== buildGeneration
+          || artifact.deletionGeneration !== deletionGeneration
+          || part.deletionGeneration !== deletionGeneration
+        ) throw new Error("export artifact delete relation is invalid");
+      }
+
+      const subjectLifecycleRows = await query(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          ORDER BY tenant_id, subject_kind, subject_id FOR SHARE`,
+      );
+      const lifecycleByKey = new Map<string, SubjectLifecycleRecord>();
+      for (const row of subjectLifecycleRows) {
+        const lifecycle = rowToSubjectLifecycle(row);
+        const key = JSON.stringify([
+          lifecycle.tenantId,
+          lifecycle.subjectKind,
+          lifecycle.subjectId,
+        ]);
+        if (lifecycleByKey.has(key)) throw new Error("duplicate subject lifecycle owner");
+        lifecycleByKey.set(key, lifecycle);
+      }
+
+      type ErasureOwner = {
+        tenantId: string;
+        subjectKind: string;
+        subjectId: string;
+        subjectGeneration: number;
+      };
+      const erasureRequests = await query(
+        `SELECT request_id, tenant_id, subject_kind, subject_id, generation
+           FROM erasure_requests ORDER BY request_id FOR SHARE`,
+      );
+      const erasureById = new Map<string, ErasureOwner>();
+      for (const row of erasureRequests) {
+        const requestId = String(row.request_id);
+        if (erasureById.has(requestId)) throw new Error("duplicate erasure request");
+        const owner: ErasureOwner = {
+          tenantId: String(row.tenant_id),
+          subjectKind: String(row.subject_kind),
+          subjectId: String(row.subject_id),
+          subjectGeneration: number(row.generation, "erasure subject generation", 1),
+        };
+        if (owner.subjectKind !== "user") {
+          throw new Error("tenant erasure request must use the admission table");
+        }
+        const lifecycle = lifecycleByKey.get(JSON.stringify([
+          owner.tenantId,
+          owner.subjectKind,
+          owner.subjectId,
+        ]));
+        if (
+          !lifecycle
+          || lifecycle.state !== "deleting"
+          || lifecycle.generation !== owner.subjectGeneration
+          || lifecycle.activeRequestId !== requestId
+        ) throw new Error("erasure request lifecycle relation is invalid");
+        erasureById.set(requestId, owner);
+      }
+      const tenantAdmissions = await query(
+        `SELECT request_id, tenant_id, subject_generation
+           FROM tenant_erasure_admissions ORDER BY request_id FOR SHARE`,
+      );
+      const tenantAdmissionById = new Map<string, {
+        tenantId: string;
+        subjectGeneration: number;
+      }>();
+      for (const row of tenantAdmissions) {
+        const requestId = String(row.request_id);
+        if (tenantAdmissionById.has(requestId)) throw new Error("duplicate tenant admission");
+        const tenantId = String(row.tenant_id);
+        const subjectGeneration = number(
+          row.subject_generation,
+          "tenant admission subject generation",
+          1,
+        );
+        const lifecycle = lifecycleByKey.get(JSON.stringify([
+          tenantId,
+          "tenant",
+          tenantId,
+        ]));
+        if (
+          !lifecycle
+          || lifecycle.state !== "deleting"
+          || lifecycle.generation !== subjectGeneration
+          || lifecycle.activeRequestId !== requestId
+        ) throw new Error("tenant admission lifecycle relation is invalid");
+        tenantAdmissionById.set(requestId, { tenantId, subjectGeneration });
+      }
+      for (const lifecycle of lifecycleByKey.values()) {
+        if (lifecycle.subjectKind === "tenant" && lifecycle.subjectId !== lifecycle.tenantId) {
+          throw new Error("tenant lifecycle subject relation is invalid");
+        }
+        if (lifecycle.state !== "deleting") {
+          if (lifecycle.activeRequestId !== undefined) {
+            throw new Error("inactive lifecycle request relation is invalid");
+          }
+          continue;
+        }
+        if (lifecycle.activeRequestId === undefined) {
+          throw new Error("deleting lifecycle request relation is missing");
+        }
+        if (lifecycle.subjectKind === "user") {
+          const request = erasureById.get(lifecycle.activeRequestId);
+          if (
+            !request
+            || request.tenantId !== lifecycle.tenantId
+            || request.subjectKind !== "user"
+            || request.subjectId !== lifecycle.subjectId
+            || request.subjectGeneration !== lifecycle.generation
+          ) throw new Error("deleting user lifecycle request relation is invalid");
+        } else {
+          const admission = tenantAdmissionById.get(lifecycle.activeRequestId);
+          if (
+            !admission
+            || admission.tenantId !== lifecycle.tenantId
+            || admission.subjectGeneration !== lifecycle.generation
+          ) throw new Error("deleting tenant lifecycle admission relation is invalid");
+        }
+      }
+      const auditRows = await query(
+        `SELECT request_id, seq FROM erasure_audit_events ORDER BY request_id, seq FOR SHARE`,
+      );
+      for (const row of auditRows) {
+        const requestId = String(row.request_id);
+        // Tenant admission and user erasure intentionally use different parent tables during the
+        // rolling-upgrade boundary, but a request identity may never resolve to both (or neither).
+        if (erasureById.has(requestId) === tenantAdmissionById.has(requestId)) {
+          throw new Error("erasure audit owner relation is invalid");
+        }
+      }
+      for (const [table, idColumn] of [
+        ["erasure_job_control_events", "control_event_id"],
+        ["erasure_job_terminal_incidents", "terminal_incident_id"],
+      ] as const) {
+        const children = await query(
+          `SELECT request_id, ${idColumn} AS child_id FROM ${table}
+            ORDER BY request_id, ${idColumn} FOR SHARE`,
+        );
+        for (const row of children) {
+          if (!erasureById.has(String(row.request_id))) {
+            throw new Error(`${table} owner relation is invalid`);
+          }
+        }
+      }
+
+      const legacyJobs = await query(
+        `SELECT ${LEGACY_TOMBSTONE_JOB_COLUMNS} FROM legacy_tombstone_compensation_jobs
+          ORDER BY job_id FOR SHARE`,
+      );
+      const legacyJobById = new Map<string, {
+        record: LegacyTombstoneCompensationJobRecord;
+        row: Row;
+      }>();
+      for (const row of legacyJobs) {
+        const jobId = String(row.job_id);
+        const legacyJob = rowToLegacyTombstoneCompensationJob(row);
+        const session = sessionById.get(legacyJob.sessionId);
+        const sourceLastSeq = number(
+          row.source_last_seq,
+          "legacy compensation source event sequence",
+        );
+        if (
+          legacyJobById.has(jobId)
+          || legacyJob.jobId !== jobId
+          || jobId !== legacyTombstoneCompensationJobIdForSession(legacyJob.sessionId)
+          || !session
+          || session.tenantId !== legacyJob.tenantId
+          || session.userId !== legacyJob.userId
+          || session.deletedAtMs === undefined
+          || session.deletedAtMs !== legacyJob.legacyDeletedAtMs
+          || session.purgeAfterMs !== undefined
+          || session.deletionGeneration !== (legacyJob.status === "completed" ? 1 : 0)
+          || String(row.candidate_sha256) !== legacyTombstoneCandidateSha256({
+            sessionId: legacyJob.sessionId,
+            tenantId: legacyJob.tenantId,
+            userId: legacyJob.userId,
+            deletedAtMs: legacyJob.legacyDeletedAtMs,
+            lastSeq: sourceLastSeq,
+          })
+          || (legacyJob.status === "completed"
+            ? legacyJob.completedEventSeq === undefined
+              || session.lastSeq !== legacyJob.completedEventSeq
+              || sourceLastSeq >= legacyJob.completedEventSeq
+            : session.lastSeq !== sourceLastSeq)
+        ) throw new Error("legacy compensation owner relation is invalid");
+        if (legacyJob.sourceKind === "erasure_claim") {
+          const request = erasureById.get(legacyJob.sourceRequestId);
+          if (
+            !request
+            || request.subjectKind !== "user"
+            || request.tenantId !== legacyJob.tenantId
+            || request.subjectId !== legacyJob.userId
+            || request.subjectGeneration !== legacyJob.sourceSubjectGeneration
+          ) throw new Error("legacy compensation source relation is invalid");
+        }
+        legacyJobById.set(jobId, { record: legacyJob, row });
+      }
+      const legacyEvents = await query(
+        `SELECT ${LEGACY_TOMBSTONE_EVENT_COLUMNS}
+           FROM legacy_tombstone_compensation_events
+          ORDER BY result_event_id FOR SHARE`,
+      );
+      const legacyEventRowsByJobId = new Map<string, Row[]>();
+      for (const row of legacyEvents) {
+        const jobId = String(row.job_id);
+        const job = legacyJobById.get(jobId)?.record;
+        const audit = rowToLegacyTombstoneAudit(row);
+        if (
+          !job
+          || audit.jobId !== job.jobId
+          || String(row.event_type) !== audit.type
+          || job.sessionId !== String(row.session_id)
+          || job.cutoverGeneration
+            !== number(row.control_generation, "legacy event control generation", 1)
+          || (audit.type === "legacy_tombstone/compensated"
+            && audit.sessionId !== job.sessionId)
+        ) {
+          throw new Error("legacy compensation event relation is invalid");
+        }
+        const rows = legacyEventRowsByJobId.get(jobId) ?? [];
+        rows.push(row);
+        legacyEventRowsByJobId.set(jobId, rows);
+      }
+      for (const [jobId, { record, row }] of legacyJobById) {
+        const resultRows = legacyEventRowsByJobId.get(jobId) ?? [];
+        if (record.status === "pending") {
+          if (resultRows.length !== 0) {
+            throw new Error("pending legacy compensation has an event");
+          }
+        } else if (!this.legacyTombstoneResultMatchesJob(row, record, resultRows)) {
+          throw new Error("legacy compensation result relation is invalid");
+        }
+      }
+
+      const evaluations = await query(
+        `SELECT request_id, tenant_id, subject_kind, subject_id, subject_generation,
+                build_generation
+           FROM erasure_policy_evaluation_jobs ORDER BY request_id FOR SHARE`,
+      );
+      type EvaluationOwner = ErasureOwner & { buildGeneration: number };
+      const evaluationByRequest = new Map<string, EvaluationOwner>();
+      for (const row of evaluations) {
+        const requestId = String(row.request_id);
+        const owner = erasureById.get(requestId);
+        const actual: EvaluationOwner = {
+          tenantId: String(row.tenant_id),
+          subjectKind: String(row.subject_kind),
+          subjectId: String(row.subject_id),
+          subjectGeneration: number(row.subject_generation, "policy subject generation", 1),
+          buildGeneration: number(row.build_generation, "policy build generation", 1),
+        };
+        if (
+          !owner
+          || owner.tenantId !== actual.tenantId
+          || owner.subjectKind !== actual.subjectKind
+          || owner.subjectId !== actual.subjectId
+          || owner.subjectGeneration !== actual.subjectGeneration
+        ) throw new Error("policy evaluation owner relation is invalid");
+        evaluationByRequest.set(requestId, actual);
+      }
+      const purgeTargets = await query(
+        `SELECT request_id, build_generation, tenant_id, user_id, session_id,
+                deletion_generation, deleted_at_ms
+           FROM erasure_purge_targets ORDER BY request_id, build_generation, session_id FOR SHARE`,
+      );
+      for (const row of purgeTargets) {
+        const requestId = String(row.request_id);
+        const buildGeneration = number(row.build_generation, "purge target build generation", 1);
+        const owner = evaluationByRequest.get(requestId);
+        const session = sessionById.get(String(row.session_id));
+        if (
+          !owner
+          || buildGeneration > owner.buildGeneration
+          || owner.tenantId !== String(row.tenant_id)
+          || owner.subjectKind !== "user"
+          || owner.subjectId !== String(row.user_id)
+          || !session
+          || session.tenantId !== owner.tenantId
+          || session.userId !== owner.subjectId
+          || session.deletedAtMs === undefined
+          || session.deletedAtMs !== number(row.deleted_at_ms, "purge target deletion timestamp")
+          || session.deletionGeneration
+            !== number(row.deletion_generation, "purge target deletion generation", 1)
+        ) throw new Error("purge target owner relation is invalid");
+      }
+      const decisions = await query(
+        `SELECT request_id, decision_seq, build_generation
+           FROM erasure_policy_evaluation_decisions
+          ORDER BY request_id, decision_seq FOR SHARE`,
+      );
+      for (const row of decisions) {
+        const requestId = String(row.request_id);
+        const buildGeneration = number(row.build_generation, "policy decision build generation", 1);
+        const evaluation = evaluationByRequest.get(requestId);
+        if (
+          !erasureById.has(requestId)
+          || !evaluation
+          || buildGeneration > evaluation.buildGeneration
+        ) throw new Error("policy decision owner relation is invalid");
+      }
+      const authorityControls = await query(
+        `SELECT request_id FROM erasure_purge_authority_controls
+          ORDER BY request_id FOR SHARE`,
+      );
+      for (const row of authorityControls) {
+        if (!erasureById.has(String(row.request_id))) {
+          throw new Error("purge authority control owner relation is invalid");
+        }
+      }
+      const authorities = await query(
+        `SELECT request_id, tenant_id, subject_kind, subject_id, subject_generation,
+                build_generation
+           FROM erasure_purge_authorities
+          ORDER BY request_id, authority_generation FOR SHARE`,
+      );
+      for (const row of authorities) {
+        const requestId = String(row.request_id);
+        const buildGeneration = number(row.build_generation, "purge authority build generation", 1);
+        const owner = erasureById.get(requestId);
+        const evaluation = evaluationByRequest.get(requestId);
+        if (
+          !owner
+          || owner.tenantId !== String(row.tenant_id)
+          || owner.subjectKind !== String(row.subject_kind)
+          || owner.subjectId !== String(row.subject_id)
+          || owner.subjectGeneration
+            !== number(row.subject_generation, "purge authority subject generation", 1)
+          || !evaluation
+          || buildGeneration > evaluation.buildGeneration
+        ) throw new Error("purge authority owner relation is invalid");
+      }
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async tenantPurgePlanTargetEvidence(
+    conn: PoolConnection,
+    job: TenantPurgePlanJobRecord,
+    domain: TenantPurgePlanDomain,
+    source: Awaited<ReturnType<MysqlSessionStore["validateTenantPurgePlanSource"]>>,
+    holdProof: { holdControlCount: number; holdControlRootSha256: string },
+  ): Promise<{
+    targetCount: number;
+    targetRootSha256: string;
+    disposition: TenantPurgePlanDisposition;
+  }> {
+    const tuples: Array<readonly (string | number | boolean | null)[]> = [];
+    let targetCount: number | undefined;
+    let disposition: TenantPurgePlanDisposition;
+    const add = (...tuple: readonly (string | number | boolean | null)[]) => tuples.push(tuple);
+    const rows = async (sql: string, params: readonly unknown[] = []): Promise<Row[]> => {
+      const [result] = await conn.query<Row[]>(sql, [...params]);
+      return result;
+    };
+    const integer = (value: unknown, name: string, minimum = 0) => (
+      storedSafeInteger(value, name, minimum)
+    );
+    const bool = (value: unknown, name: string) => tenantCredentialBoolean(value, name);
+    const queueState = (row: Row): string => (
+      row.completed_at_ms != null
+        ? "completed"
+        : row.dead_lettered_at_ms != null ? "dead_letter" : "pending"
+    );
+
+    switch (domain) {
+      case "tenant_registry": {
+        const result = await rows(
+          "SELECT tenant_id FROM tenants WHERE tenant_id=? FOR SHARE",
+          [job.tenantId],
+        );
+        if (result.length !== 1 || String(result[0]!.tenant_id) !== job.tenantId) {
+          throw new TenantErasureIntegrityError();
+        }
+        add(job.tenantId);
+        disposition = "retain_evidence";
+        break;
+      }
+      case "tenant_profile": {
+        const result = await rows(
+          `SELECT tenant_id, name, auth_policy IS NOT NULL AS auth_policy_present,
+                  auth_secret_cipher IS NOT NULL AS auth_secret_cipher_present,
+                  auth_secret_key_id IS NOT NULL AS auth_secret_key_id_present
+             FROM tenants WHERE tenant_id=? FOR SHARE`,
+          [job.tenantId],
+        );
+        const row = result[0];
+        if (!row || result.length !== 1 || String(row.tenant_id) !== job.tenantId) {
+          throw new TenantErasureIntegrityError();
+        }
+        add(
+          job.tenantId,
+          row.name == null ? null : String(row.name),
+          bool(row.auth_policy_present, "tenant profile auth-policy presence"),
+          bool(row.auth_secret_cipher_present, "tenant profile cipher presence"),
+          bool(row.auth_secret_key_id_present, "tenant profile key-id presence"),
+        );
+        disposition = "clear";
+        break;
+      }
+      case "agent_definitions": {
+        const result = await rows(
+          `SELECT agent_id, version FROM agent_versions
+            WHERE tenant_id=? ORDER BY agent_id, version FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of result) add(String(row.agent_id), integer(row.version, "agent version"));
+        disposition = "delete";
+        break;
+      }
+      case "session_content":
+        for (const receipt of source.sessionReceipts) {
+          add(receipt.sessionId, receipt.receiptSha256);
+        }
+        targetCount = source.contentReceipt.sessionReceiptCount
+          + source.contentReceipt.contentRecordCount;
+        if (!Number.isSafeInteger(targetCount)) throw new TenantErasureIntegrityError();
+        disposition = "delete";
+        break;
+      case "idempotency_receipts": {
+        const result = await rows(
+          `SELECT user_id, session_id, idem_key, value
+             FROM idempotency_keys
+            WHERE tenant_id=? ORDER BY user_id, session_id, idem_key FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of result) {
+          add(
+            String(row.user_id),
+            String(row.session_id),
+            String(row.idem_key),
+            row.value == null ? "pending" : "completed",
+          );
+        }
+        disposition = "delete";
+        break;
+      }
+      case "operational_usage": {
+        const result = await rows(
+          `SELECT usage_id, session_id, turn_id, step
+             FROM usage_ledger WHERE tenant_id=? ORDER BY id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of result) {
+          add(
+            row.usage_id == null ? null : String(row.usage_id),
+            String(row.session_id),
+            String(row.turn_id),
+            integer(row.step, "usage step"),
+          );
+        }
+        disposition = "anonymize";
+        break;
+      }
+      case "billing_facts": {
+        const result = await rows(
+          `SELECT usage_id, fact_sha256 FROM billing_usage_facts
+            WHERE tenant_id=? ORDER BY usage_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of result) add(String(row.usage_id), String(row.fact_sha256));
+        disposition = "retain_anonymized";
+        break;
+      }
+      case "billing_reconciliation": {
+        const result = await rows(
+          `SELECT session_id, deletion_generation, status, checksum
+             FROM usage_reconciliations
+            WHERE tenant_id=? ORDER BY session_id, deletion_generation FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of result) {
+          add(
+            String(row.session_id),
+            integer(row.deletion_generation, "reconciliation generation"),
+            String(row.status),
+            String(row.checksum),
+          );
+        }
+        disposition = "retain_anonymized";
+        break;
+      }
+      case "blob_manifest":
+      case "blob_bytes": {
+        const onlyLiveBytes = domain === "blob_bytes";
+        const result = await rows(
+          `SELECT blob_id, deletion_generation, state FROM blob_objects
+            WHERE tenant_id=? ${onlyLiveBytes ? "AND state<>'deleted'" : ""}
+            ORDER BY blob_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of result) {
+          add(
+            String(row.blob_id),
+            integer(row.deletion_generation, "blob generation"),
+            String(row.state),
+          );
+        }
+        disposition = onlyLiveBytes ? "blocked_adapter_unconfigured" : "delete";
+        break;
+      }
+      case "blob_outbox": {
+        const result = await rows(
+          `SELECT o.outbox_id, o.blob_id, o.generation, o.completed_at_ms,
+                  o.dead_lettered_at_ms
+             FROM blob_delete_outbox o
+             JOIN blob_objects b ON b.blob_id=o.blob_id
+            WHERE b.tenant_id=? ORDER BY o.outbox_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of result) {
+          add(
+            integer(row.outbox_id, "blob outbox id", 1),
+            String(row.blob_id),
+            integer(row.generation, "blob outbox generation"),
+            queueState(row),
+          );
+        }
+        disposition = "delete";
+        break;
+      }
+      case "lifecycle_outbox": {
+        const result = await rows(
+          `SELECT o.outbox_id, o.topic, o.aggregate_id, o.generation, o.completed_at_ms,
+                  o.dead_lettered_at_ms
+             FROM lifecycle_outbox o
+             JOIN sessions s ON s.session_id=o.aggregate_id
+            WHERE s.tenant_id=? ORDER BY o.outbox_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of result) {
+          add(
+            integer(row.outbox_id, "lifecycle outbox id", 1),
+            String(row.topic),
+            String(row.aggregate_id),
+            integer(row.generation, "lifecycle outbox generation"),
+            queueState(row),
+          );
+        }
+        disposition = "delete";
+        break;
+      }
+      case "user_export_control": {
+        const requests = await rows(
+          `SELECT request_id, subject_generation, status, user_id, idempotency_key_sha256
+             FROM user_export_requests WHERE tenant_id=? ORDER BY request_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of requests) {
+          add(
+            "request",
+            String(row.request_id),
+            integer(row.subject_generation, "export request generation"),
+            String(row.status),
+          );
+          add(
+            "idempotency",
+            String(row.user_id),
+            String(row.idempotency_key_sha256),
+            String(row.request_id),
+          );
+        }
+        const jobs = await rows(
+          `SELECT request_id, build_generation, status FROM user_export_jobs
+            WHERE tenant_id=? ORDER BY request_id, build_generation FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of jobs) {
+          add(
+            "job",
+            String(row.request_id),
+            integer(row.build_generation, "export build generation"),
+            String(row.status),
+          );
+        }
+        const leases = await rows(
+          `SELECT artifact_id, lease_token, request_id, build_generation,
+                  artifact_deletion_generation, lease_until_ms, created_at_ms
+             FROM user_export_download_leases
+            WHERE tenant_id=? ORDER BY artifact_id, lease_token FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of leases) {
+          const leaseTokenSha256 = createHash("sha256")
+            .update(JSON.stringify([
+              "tenant-purge-plan-download-lease-token-v1",
+              String(row.lease_token),
+            ]))
+            .digest("hex");
+          add(
+            "download",
+            String(row.artifact_id),
+            String(row.request_id),
+            integer(row.build_generation, "export lease build generation", 1),
+            integer(
+              row.artifact_deletion_generation,
+              "export lease artifact deletion generation",
+            ),
+            leaseTokenSha256,
+            integer(row.lease_until_ms, "export lease timestamp"),
+            integer(row.created_at_ms, "export lease creation timestamp"),
+          );
+        }
+        disposition = "delete";
+        break;
+      }
+      case "user_export_snapshots": {
+        const records = await rows(
+          `SELECT request_id, build_generation, ordinal, record_sha256
+             FROM user_export_snapshot_records
+            WHERE tenant_id=? ORDER BY request_id, build_generation, ordinal FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of records) {
+          add(
+            "record",
+            String(row.request_id),
+            integer(row.build_generation, "snapshot build generation", 1),
+            integer(row.ordinal, "snapshot record ordinal"),
+            String(row.record_sha256),
+          );
+        }
+        const blobs = await rows(
+          `SELECT request_id, build_generation, ordinal, blob_id, released_at_ms
+             FROM user_export_snapshot_blobs
+            WHERE tenant_id=? ORDER BY request_id, build_generation, ordinal FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of blobs) {
+          add(
+            "blob",
+            String(row.request_id),
+            integer(row.build_generation, "snapshot blob generation", 1),
+            integer(row.ordinal, "snapshot blob ordinal"),
+            String(row.blob_id),
+            row.released_at_ms == null ? "pinned" : "released",
+          );
+        }
+        disposition = "delete";
+        break;
+      }
+      case "user_export_artifacts":
+      case "user_export_bytes": {
+        const bytesOnly = domain === "user_export_bytes";
+        if (!bytesOnly) {
+          const artifacts = await rows(
+            `SELECT artifact_id, request_id, build_generation, deletion_generation, state
+               FROM user_export_artifacts
+              WHERE tenant_id=? ORDER BY artifact_id FOR SHARE`,
+            [job.tenantId],
+          );
+          for (const row of artifacts) {
+            add(
+              "artifact",
+              String(row.artifact_id),
+              String(row.request_id),
+              integer(row.build_generation, "artifact build generation", 1),
+              integer(row.deletion_generation, "artifact deletion generation"),
+              String(row.state),
+            );
+          }
+        }
+        const parts = await rows(
+          `SELECT artifact_id, part_number, deletion_generation, state
+             FROM user_export_artifact_parts
+            WHERE tenant_id=? ${bytesOnly ? "AND state<>'deleted'" : ""}
+            ORDER BY artifact_id, part_number FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of parts) {
+          add(
+            ...(bytesOnly ? [] : ["part"] as const),
+            String(row.artifact_id),
+            integer(row.part_number, "artifact part number"),
+            integer(row.deletion_generation, "artifact part deletion generation"),
+            String(row.state),
+          );
+        }
+        if (!bytesOnly) {
+          const outbox = await rows(
+            `SELECT o.outbox_id, o.artifact_id, o.part_number, o.deletion_generation,
+                    o.completed_at_ms, o.dead_lettered_at_ms
+               FROM user_export_artifact_delete_outbox o
+               JOIN user_export_artifacts a ON a.artifact_id=o.artifact_id
+              WHERE a.tenant_id=? ORDER BY o.outbox_id FOR SHARE`,
+            [job.tenantId],
+          );
+          for (const row of outbox) {
+            add(
+              "outbox",
+              integer(row.outbox_id, "export outbox id", 1),
+              String(row.artifact_id),
+              integer(row.part_number, "export outbox part number"),
+              integer(row.deletion_generation, "export outbox deletion generation"),
+              queueState(row),
+            );
+          }
+        }
+        disposition = bytesOnly ? "blocked_adapter_unconfigured" : "delete";
+        break;
+      }
+      case "user_erasure_evidence": {
+        const lifecycles = await rows(
+          `SELECT subject_id, generation, state FROM subject_lifecycle
+            WHERE tenant_id=? AND subject_kind='user'
+            ORDER BY subject_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of lifecycles) {
+          add(
+            "lifecycle",
+            String(row.subject_id),
+            integer(row.generation, "user lifecycle generation"),
+            String(row.state),
+          );
+        }
+        const requests = await rows(
+          `SELECT request_id, subject_id, generation, status, idempotency_key
+             FROM erasure_requests
+            WHERE tenant_id=? AND subject_kind='user'
+            ORDER BY request_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of requests) {
+          add(
+            "request",
+            String(row.request_id),
+            String(row.subject_id),
+            integer(row.generation, "user erasure generation", 1),
+            String(row.status),
+          );
+          add(
+            "idempotency",
+            String(row.subject_id),
+            String(row.idempotency_key),
+            String(row.request_id),
+          );
+        }
+        const audits = await rows(
+          `SELECT a.request_id, a.seq, a.event_type
+             FROM erasure_audit_events a
+             JOIN erasure_requests r ON r.request_id=a.request_id
+            WHERE r.tenant_id=? AND r.subject_kind='user'
+            ORDER BY a.request_id, a.seq FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of audits) {
+          add(
+            "audit",
+            String(row.request_id),
+            integer(row.seq, "user erasure audit sequence", 1),
+            String(row.event_type),
+          );
+        }
+        const controls = await rows(
+          `SELECT c.request_id, c.control_event_id, c.control_generation, c.event_type
+             FROM erasure_job_control_events c
+             JOIN erasure_requests r ON r.request_id=c.request_id
+            WHERE r.tenant_id=? AND r.subject_kind='user'
+            ORDER BY c.request_id, c.control_generation, c.control_event_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of controls) {
+          add(
+            "control",
+            String(row.request_id),
+            integer(row.control_event_id, "user erasure control id", 1),
+            integer(row.control_generation, "user erasure control generation", 1),
+            String(row.event_type),
+          );
+        }
+        const incidents = await rows(
+          `SELECT i.terminal_incident_id, i.request_id, i.evidence_sha256
+             FROM erasure_job_terminal_incidents i
+             JOIN erasure_requests r ON r.request_id=i.request_id
+            WHERE r.tenant_id=? AND r.subject_kind='user'
+            ORDER BY i.request_id, i.terminal_incident_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of incidents) {
+          add(
+            "incident",
+            integer(row.terminal_incident_id, "user erasure incident id", 1),
+            String(row.request_id),
+            String(row.evidence_sha256),
+          );
+        }
+        const legacyJobs = await rows(
+          `SELECT job_id, session_id, control_generation, source_kind, status
+             FROM legacy_tombstone_compensation_jobs
+            WHERE tenant_id=? ORDER BY job_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of legacyJobs) {
+          add(
+            "legacy_job",
+            String(row.job_id),
+            String(row.session_id),
+            integer(row.control_generation, "legacy compensation generation", 1),
+            String(row.source_kind),
+            String(row.status),
+          );
+        }
+        const legacyEvents = await rows(
+          `SELECT e.job_id, e.result_event_id, e.event_type
+             FROM legacy_tombstone_compensation_events e
+             JOIN legacy_tombstone_compensation_jobs j ON j.job_id=e.job_id
+            WHERE j.tenant_id=? ORDER BY e.job_id, e.result_event_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of legacyEvents) {
+          add(
+            "legacy_audit",
+            String(row.job_id),
+            integer(row.result_event_id, "legacy compensation event id", 1),
+            String(row.event_type),
+          );
+        }
+        disposition = "retain_evidence";
+        break;
+      }
+      case "user_purge_policy_evidence": {
+        const evaluationJobs = await rows(
+          `SELECT request_id, build_generation, target_root_sha256
+             FROM erasure_policy_evaluation_jobs
+            WHERE tenant_id=? ORDER BY request_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of evaluationJobs) {
+          add(
+            "job",
+            String(row.request_id),
+            integer(row.build_generation, "purge evaluation generation", 1),
+            String(row.target_root_sha256),
+          );
+        }
+        const targets = await rows(
+          `SELECT request_id, build_generation, session_id, evidence_sha256
+             FROM erasure_purge_targets
+            WHERE tenant_id=? ORDER BY request_id, build_generation, session_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of targets) {
+          add(
+            "target",
+            String(row.request_id),
+            integer(row.build_generation, "purge target generation", 1),
+            String(row.session_id),
+            String(row.evidence_sha256),
+          );
+        }
+        const decisions = await rows(
+          `SELECT d.request_id, d.decision_seq, d.after_sha256
+             FROM erasure_policy_evaluation_decisions d
+             JOIN erasure_requests r ON r.request_id=d.request_id
+            WHERE r.tenant_id=? ORDER BY d.request_id, d.decision_seq FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of decisions) {
+          add(
+            "decision",
+            String(row.request_id),
+            integer(row.decision_seq, "purge decision sequence", 1),
+            String(row.after_sha256),
+          );
+        }
+        const controls = await rows(
+          `SELECT c.request_id, c.authority_generation, c.active_authority_sha256
+             FROM erasure_purge_authority_controls c
+             JOIN erasure_requests r ON r.request_id=c.request_id
+            WHERE r.tenant_id=? ORDER BY c.request_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of controls) {
+          add(
+            "control",
+            String(row.request_id),
+            integer(row.authority_generation, "purge authority generation"),
+            row.active_authority_sha256 == null ? null : String(row.active_authority_sha256),
+          );
+        }
+        const authorities = await rows(
+          `SELECT request_id, authority_generation, authority_sha256
+             FROM erasure_purge_authorities
+            WHERE tenant_id=? ORDER BY request_id, authority_generation FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of authorities) {
+          add(
+            "authority",
+            String(row.request_id),
+            integer(row.authority_generation, "purge authority generation", 1),
+            String(row.authority_sha256),
+          );
+        }
+        disposition = "retain_evidence";
+        break;
+      }
+      case "governance_policy": {
+        const versions = await rows(
+          `SELECT policy_version, policy_sha256, schema_version
+             FROM retention_policy_versions
+            WHERE tenant_id=? ORDER BY policy_version FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of versions) {
+          add(
+            "version",
+            String(row.policy_version),
+            String(row.policy_sha256),
+            integer(row.schema_version, "retention policy schema version", 1),
+          );
+        }
+        const controls = await rows(
+          `SELECT control_generation, active_policy_sha256 FROM retention_policy_controls
+            WHERE tenant_id=? ORDER BY control_generation FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of controls) {
+          add(
+            "control",
+            integer(row.control_generation, "retention policy generation"),
+            row.active_policy_sha256 == null ? null : String(row.active_policy_sha256),
+          );
+        }
+        const activations = await rows(
+          `SELECT event_id, control_generation, after_sha256
+             FROM retention_policy_activation_events
+            WHERE tenant_id=? ORDER BY control_generation, event_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of activations) {
+          add(
+            "activation",
+            integer(row.event_id, "retention activation id", 1),
+            integer(row.control_generation, "retention activation generation", 1),
+            String(row.after_sha256),
+          );
+        }
+        disposition = "retain_evidence";
+        break;
+      }
+      case "legal_holds":
+        add("projection", holdProof.holdControlCount, holdProof.holdControlRootSha256);
+        targetCount = holdProof.holdControlCount;
+        disposition = "retain_evidence";
+        break;
+      case "tenant_t1_evidence": {
+        const admission = await this.loadTenantErasureAdmission(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        );
+        const fence = await this.loadTenantCredentialRevocationFence(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        );
+        const [lifecycleRows] = await conn.query<Row[]>(
+          `SELECT ${SUBJECT_LIFECYCLE_COLUMNS} FROM subject_lifecycle
+            WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+          [job.tenantId, job.tenantId],
+        );
+        const audits = await rows(
+          `SELECT request_id, seq, event_type FROM erasure_audit_events
+            WHERE request_id=? ORDER BY seq FOR SHARE`,
+          [job.requestId],
+        );
+        if (!admission || !fence || !lifecycleRows[0] || audits.length === 0) {
+          throw new TenantErasureIntegrityError();
+        }
+        const lifecycle = rowToSubjectLifecycle(lifecycleRows[0]);
+        add("admission", admission.requestId, admission.generation, admission.status);
+        add("lifecycle", lifecycle.subjectId, lifecycle.generation, lifecycle.state);
+        add("fence", fence.tenantId, fence.subjectGeneration, fence.evidenceSha256);
+        for (const row of audits) {
+          add(
+            "audit",
+            String(row.request_id),
+            integer(row.seq, "tenant erasure audit sequence", 1),
+            String(row.event_type),
+          );
+        }
+        disposition = "retain_evidence";
+        break;
+      }
+      case "tenant_t3a_evidence": {
+        const sourceJob = await this.loadTenantCredentialRevocationJob(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        );
+        if (!sourceJob) throw new TenantErasureIntegrityError();
+        add("job", sourceJob.requestId, sourceJob.attempts, sourceJob.phase);
+        add("receipt", source.credentialReceipt.requestId, source.credentialReceipt.receiptSha256);
+        disposition = "retain_evidence";
+        break;
+      }
+      case "tenant_t3b_evidence": {
+        const sourceJob = await this.loadTenantRuntimeRevocationJob(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        );
+        const receipt = await this.loadTenantRuntimeRevocationReceipt(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        );
+        if (!sourceJob || !receipt) throw new TenantErasureIntegrityError();
+        add("job", sourceJob.requestId, sourceJob.attempts, sourceJob.phase);
+        const targets = await this.loadTenantRuntimeRevocationTargetReceipts(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        );
+        for (const target of targets) add("target", target.targetSha256, target.evidenceSha256);
+        add("receipt", receipt.requestId, receipt.receiptSha256);
+        disposition = "retain_evidence";
+        break;
+      }
+      case "tenant_t3c_evidence":
+        add(
+          "job",
+          source.contentJob.requestId,
+          source.contentJob.buildGeneration,
+          source.contentJob.phase,
+        );
+        for (const receipt of source.sessionReceipts) {
+          add("session", receipt.sessionId, receipt.receiptSha256);
+        }
+        add("receipt", source.contentReceipt.requestId, source.contentReceipt.receiptSha256);
+        disposition = "retain_evidence";
+        break;
+      case "redis_leases":
+      case "redis_fences":
+      case "redis_streams": {
+        const sessions = await rows(
+          `SELECT session_id FROM sessions WHERE tenant_id=? ORDER BY session_id FOR SHARE`,
+          [job.tenantId],
+        );
+        for (const row of sessions) add(String(row.session_id));
+        disposition = "blocked_adapter_unconfigured";
+        break;
+      }
+      case "external_provider":
+        targetCount = source.credentialReceipt.providerConfigCountBefore;
+        if (targetCount > 0) {
+          add(source.credentialReceipt.receiptSha256, targetCount);
+          disposition = "blocked_legacy_external_source_unavailable";
+        } else {
+          disposition = "not_applicable";
+        }
+        break;
+      case "kms": {
+        const tenantAuthEnvelopeCount = source.credentialReceipt.authSecretCipherPresentBefore
+          || source.credentialReceipt.authSecretKeyIdPresentBefore ? 1 : 0;
+        targetCount = source.credentialReceipt.providerConfigCountBefore
+          + tenantAuthEnvelopeCount;
+        if (!Number.isSafeInteger(targetCount)) throw new TenantErasureIntegrityError();
+        if (targetCount > 0) {
+          add(
+            source.credentialReceipt.receiptSha256,
+            source.credentialReceipt.providerConfigCountBefore,
+            source.credentialReceipt.authSecretCipherPresentBefore,
+            source.credentialReceipt.authSecretKeyIdPresentBefore,
+          );
+          disposition = "blocked_legacy_external_source_unavailable";
+        } else {
+          disposition = "not_applicable";
+        }
+        break;
+      }
+      case "backup_ledger":
+      case "logs":
+      case "traces":
+        disposition = "blocked_adapter_unconfigured";
+        break;
+      case "restore_ledger":
+        disposition = "blocked_restore_replay_unproven";
+        break;
+      default: {
+        const exhaustive: never = domain;
+        throw new Error(`unhandled tenant purge plan domain: ${String(exhaustive)}`);
+      }
+    }
+
+    const targetHashes = tuples.map((tuple) => tenantPurgePlanTargetSha256(domain, tuple));
+    const count = targetCount ?? targetHashes.length;
+    if (!Number.isSafeInteger(count) || count < 0) throw new TenantErasureIntegrityError();
+    return {
+      targetCount: count,
+      targetRootSha256: tenantPurgePlanTargetRootSha256(domain, targetHashes),
+      disposition,
+    };
+  }
+
+  private async mysqlTenantPurgePlanEntry(
+    conn: PoolConnection,
+    job: TenantPurgePlanJobRecord,
+    domain: TenantPurgePlanDomain,
+    capturedAtDbMs: number,
+    source: Awaited<ReturnType<MysqlSessionStore["validateTenantPurgePlanSource"]>>,
+    holdProof: { holdControlCount: number; holdControlRootSha256: string },
+  ): Promise<TenantPurgePlanEntry> {
+    const target = await this.tenantPurgePlanTargetEvidence(
+      conn,
+      job,
+      domain,
+      source,
+      holdProof,
+    );
+    const body = {
+      scope: TENANT_PURGE_PLAN_ENTRY_SCOPE,
+      requestId: job.requestId,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      buildGeneration: job.buildGeneration,
+      domain,
+      ...target,
+      sourceSha256: tenantPurgePlanDomainSourceSha256(job, domain),
+      capturedAtDbMs,
+    };
+    const entry: TenantPurgePlanEntry = {
+      ...body,
+      receiptSha256: tenantPurgePlanEntrySha256(body),
+    };
+    validateTenantPurgePlanEntry(entry);
+    return entry;
+  }
+
+  private async validateTenantPurgePlanBuildState(
+    conn: PoolConnection,
+    job: TenantPurgePlanJobRecord,
+    source: Awaited<ReturnType<MysqlSessionStore["validateTenantPurgePlanSource"]>>,
+    holdProof: { holdControlCount: number; holdControlRootSha256: string },
+  ): Promise<TenantPurgePlanEntry[]> {
+    const entries = await this.loadTenantPurgePlanEntries(
+      conn,
+      job.tenantId,
+      job.requestId,
+      job.buildGeneration,
+      "FOR SHARE",
+    );
+    this.tenantPurgePlanEntryState(job, entries);
+    for (const entry of entries) {
+      const recomputed = await this.mysqlTenantPurgePlanEntry(
+        conn,
+        job,
+        entry.domain,
+        entry.capturedAtDbMs,
+        source,
+        holdProof,
+      );
+      if (recomputed.receiptSha256 !== entry.receiptSha256) {
+        throw new TenantPurgePlanEvidenceChangedError();
+      }
+    }
+    return entries;
+  }
+
+  async materializeTenantPurgePlanJobs(
+    options: MaterializeTenantPurgePlanJobsOptions,
+  ): Promise<number> {
+    validateMaterializeTenantPurgePlanJobsOptions(options);
+    const maxCandidatesToScan = Math.min(400, Math.max(32, options.limit * 4));
+    const startingCursor = this.tenantPurgePlanMaterializationCursorRequestId;
+    const loadCandidates = async (
+      afterRequestId: string | undefined,
+      throughRequestId: string | undefined,
+    ): Promise<Row[]> => {
+      const [rows] = await this.pool.query<Row[]>(
+        `SELECT c.request_id, c.tenant_id
+           FROM tenant_content_inventory_jobs c
+          WHERE c.phase='inventory_sealed'
+            ${afterRequestId === undefined ? "" : "AND c.request_id>?"}
+            ${throughRequestId === undefined ? "" : "AND c.request_id<=?"}
+            AND NOT EXISTS (
+              SELECT 1 FROM tenant_purge_plan_jobs p WHERE p.request_id=c.request_id
+            )
+          ORDER BY c.request_id LIMIT ?`,
+        [
+          ...(afterRequestId === undefined ? [] : [afterRequestId]),
+          ...(throughRequestId === undefined ? [] : [throughRequestId]),
+          maxCandidatesToScan,
+        ],
+      );
+      return rows;
+    };
+    let candidates = await loadCandidates(startingCursor, undefined);
+    if (candidates.length === 0 && startingCursor !== undefined) {
+      candidates = await loadCandidates(undefined, startingCursor);
+      if (candidates.length === 0) this.tenantPurgePlanMaterializationCursorRequestId = undefined;
+    }
+    let materialized = 0;
+    let firstIntegrityError: TenantErasureIntegrityError | undefined;
+    let firstNotReady: TenantPurgePlanNotReadyError | undefined;
+    for (const candidate of candidates) {
+      if (materialized >= options.limit) break;
+      const requestId = String(candidate.request_id);
+      const tenantId = String(candidate.tenant_id);
+      this.tenantPurgePlanMaterializationCursorRequestId = requestId;
+      const conn = await this.pool.getConnection();
+      try {
+        await this.beginTenantPurgePlanTransaction(conn);
+        const existing = await this.loadTenantPurgePlanJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (existing) {
+          await conn.commit();
+          continue;
+        }
+        const contentJob = await this.loadTenantContentInventoryJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        const contentReceipt = await this.loadTenantContentInventoryReceipt(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (!contentJob || contentJob.phase !== "inventory_sealed" || !contentReceipt) {
+          throw new TenantErasureIntegrityError();
+        }
+        const now = await this.databaseNow(conn);
+        if (now < contentReceipt.storeDbTimestampMs) {
+          throw new TenantPurgePlanNotReadyError("trusted_clock_before_source");
+        }
+        const job: TenantPurgePlanJobRecord = {
+          requestId,
+          tenantId,
+          subjectGeneration: contentJob.subjectGeneration,
+          buildGeneration: contentJob.buildGeneration,
+          t1FenceSha256: contentJob.t1FenceSha256,
+          t3aReceiptSha256: contentJob.t3aReceiptSha256,
+          t3bReceiptSha256: contentJob.t3bReceiptSha256,
+          t3cReceiptSha256: contentReceipt.receiptSha256,
+          policyVersion: contentJob.policyVersion,
+          policySha256: contentJob.policySha256,
+          policySchemaVersion: contentJob.policySchemaVersion,
+          retentionAnchorDbMs: contentJob.retentionAnchorDbMs,
+          purgeNotBeforeDbMs: contentJob.contentNotBeforeDbMs,
+          sourceEvidenceDbMs: contentReceipt.storeDbTimestampMs,
+          phase: "queued",
+          scanComplete: false,
+          planEntryCount: 0,
+          planEntryRootSha256: EMPTY_TENANT_PURGE_PLAN_ENTRY_ROOT_SHA256,
+          blockerCount: 0,
+          blockerRootSha256: EMPTY_TENANT_PURGE_PLAN_BLOCKER_ROOT_SHA256,
+          availableAtMs: now,
+          attempts: 0,
+          createdAtMs: now,
+          updatedAtMs: now,
+        };
+        validateTenantPurgePlanJobRecord(job);
+        await this.validateTenantPurgePlanSource(conn, job, true);
+        const [orphans] = await conn.query<Row[]>(
+          `SELECT request_id FROM tenant_purge_plan_entries
+            WHERE request_id=? OR tenant_id=? LIMIT 1 FOR SHARE`,
+          [requestId, tenantId],
+        );
+        const [orphanReceipts] = await conn.query<Row[]>(
+          `SELECT request_id FROM tenant_purge_plan_receipts
+            WHERE request_id=? OR tenant_id=? LIMIT 1 FOR SHARE`,
+          [requestId, tenantId],
+        );
+        if (orphans[0] || orphanReceipts[0]) throw new TenantErasureIntegrityError();
+        await conn.query(
+          `INSERT INTO tenant_purge_plan_jobs
+             (request_id, tenant_id, subject_generation, t1_fence_sha256,
+              t3a_receipt_sha256, t3b_receipt_sha256, t3c_receipt_sha256,
+              policy_version, policy_sha256, policy_schema_version, build_generation,
+              retention_anchor_db_ms, purge_not_before_db_ms, source_evidence_db_ms,
+              cursor_domain, scan_complete, plan_entry_count, plan_entry_root_sha256,
+              blocker_count, blocker_root_sha256, phase, available_at_ms, attempts,
+              claim_token, lease_until_ms, last_error_code, created_at_ms, updated_at_ms,
+              sealed_at_ms, completed_claim_attempt, completed_claim_token_sha256,
+              aggregate_receipt_sha256, blocked_at_ms, blocked_reason_code)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,FALSE,?,?,?,?,'queued',?,0,
+                   NULL,NULL,NULL,?,?,NULL,NULL,NULL,NULL,NULL,NULL)`,
+          [
+            job.requestId,
+            job.tenantId,
+            job.subjectGeneration,
+            job.t1FenceSha256,
+            job.t3aReceiptSha256,
+            job.t3bReceiptSha256,
+            job.t3cReceiptSha256,
+            job.policyVersion,
+            job.policySha256,
+            job.policySchemaVersion,
+            job.buildGeneration,
+            job.retentionAnchorDbMs,
+            job.purgeNotBeforeDbMs,
+            job.sourceEvidenceDbMs,
+            job.planEntryCount,
+            job.planEntryRootSha256,
+            job.blockerCount,
+            job.blockerRootSha256,
+            job.availableAtMs,
+            job.createdAtMs,
+            job.updatedAtMs,
+          ],
+        );
+        await conn.commit();
+        materialized += 1;
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        if (error instanceof TenantPurgePlanNotReadyError) {
+          firstNotReady ??= error;
+          continue;
+        }
+        if (
+          error instanceof TenantErasureIntegrityError
+          || error instanceof TenantPurgePlanEvidenceChangedError
+          || (error as { code?: string }).code === "ER_DUP_ENTRY"
+        ) {
+          firstIntegrityError ??= new TenantErasureIntegrityError();
+          continue;
+        }
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    if (firstIntegrityError) throw firstIntegrityError;
+    if (firstNotReady) throw firstNotReady;
+    return materialized;
+  }
+
+  async claimTenantPurgePlans(
+    options: ClaimTenantPurgePlansOptions,
+  ): Promise<TenantPurgePlanClaim[]> {
+    validateClaimTenantPurgePlansOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantPurgePlanTransaction(conn);
+      const scanNow = await this.databaseNow(conn);
+      const claims: TenantPurgePlanClaim[] = [];
+      const maxCandidatesToScan = Math.min(400, Math.max(32, options.limit * 4));
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_PURGE_PLAN_JOB_COLUMNS}
+           FROM tenant_purge_plan_jobs
+          WHERE phase='queued' AND available_at_ms<=?
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+          ORDER BY available_at_ms, request_id LIMIT ?`,
+        [scanNow, scanNow, maxCandidatesToScan],
+      );
+      for (const row of rows) {
+        if (claims.length >= options.limit) break;
+        const candidate = rowToTenantPurgePlanJob(row);
+        if (candidate.phase !== "queued") throw new TenantErasureIntegrityError();
+        let sourceIntegrityValid = true;
+        try {
+          await this.validateTenantPurgePlanSource(conn, candidate, true);
+        } catch (error) {
+          if (error instanceof TenantPurgePlanNotReadyError) continue;
+          if (
+            error instanceof TenantErasureIntegrityError
+            || error instanceof TenantPurgePlanEvidenceChangedError
+          ) sourceIntegrityValid = false;
+          else throw error;
+        }
+        const current = await this.loadTenantPurgePlanJob(
+          conn,
+          candidate.tenantId,
+          candidate.requestId,
+          "FOR UPDATE SKIP LOCKED",
+        );
+        if (!current) continue;
+        if (!this.tenantPurgePlanSameSource(current, candidate)) {
+          throw new TenantErasureIntegrityError();
+        }
+        const now = await this.databaseNow(conn);
+        if (
+          current.phase !== "queued"
+          || current.availableAtMs > now
+          || (current.claimToken !== undefined && current.leaseUntilMs! > now)
+        ) continue;
+        if (current.attempts >= 0xffff_ffff) throw new TenantErasureIntegrityError();
+        const leaseUntilMs = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+          ? Number.MAX_SAFE_INTEGER
+          : now + options.leaseMs;
+        if (leaseUntilMs <= now) continue;
+        const updatedAtMs = Math.max(current.updatedAtMs, now);
+        const [claimed] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_purge_plan_jobs
+              SET attempts=attempts+1, claim_token=?, lease_until_ms=?,
+                  last_error_code=NULL, updated_at_ms=?
+            WHERE request_id=? AND tenant_id=? AND subject_generation=?
+              AND build_generation=? AND phase='queued' AND attempts=?
+              AND available_at_ms<=?
+              AND (claim_token IS NULL OR lease_until_ms<=?)`,
+          [
+            options.claimToken,
+            leaseUntilMs,
+            updatedAtMs,
+            current.requestId,
+            current.tenantId,
+            current.subjectGeneration,
+            current.buildGeneration,
+            current.attempts,
+            now,
+            now,
+          ],
+        );
+        if (claimed.affectedRows !== 1) throw new TenantErasureIntegrityError();
+        if (!sourceIntegrityValid) {
+          const [blocked] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE tenant_purge_plan_jobs
+                SET phase='blocked', available_at_ms=NULL, claim_token=NULL,
+                    lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                    blocked_at_ms=?, blocked_reason_code='integrity_conflict'
+              WHERE request_id=? AND tenant_id=? AND subject_generation=?
+                AND build_generation=? AND phase='queued' AND attempts=?
+                AND claim_token=? AND lease_until_ms>?`,
+            [
+              updatedAtMs,
+              updatedAtMs,
+              current.requestId,
+              current.tenantId,
+              current.subjectGeneration,
+              current.buildGeneration,
+              current.attempts + 1,
+              options.claimToken,
+              now,
+            ],
+          );
+          if (blocked.affectedRows !== 1) throw new TenantErasureIntegrityError();
+          continue;
+        }
+        const claimedJob: TenantPurgePlanJobRecord = {
+          ...current,
+          attempts: current.attempts + 1,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+          updatedAtMs,
+        };
+        delete claimedJob.lastErrorCode;
+        claims.push(tenantPurgePlanClaimFromJob(claimedJob));
+      }
+      await conn.commit();
+      return claims;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewTenantPurgePlan(
+    authorization: TenantPurgePlanAuthorization,
+    options: RenewTenantPurgePlanOptions,
+  ): Promise<boolean> {
+    validateTenantPurgePlanAuthorization(authorization);
+    validateRenewTenantPurgePlanOptions(options);
+    const preflight = await this.loadTenantPurgePlanJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantPurgePlanTransaction(conn);
+      await this.validateTenantPurgePlanSource(conn, preflight, true);
+      const current = await this.loadTenantPurgePlanJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || current.phase !== "queued"
+        || !this.tenantPurgePlanSameSource(current, preflight)
+        || !tenantPurgePlanAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const requestedLease = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+        ? Number.MAX_SAFE_INTEGER
+        : now + options.leaseMs;
+      if (requestedLease <= now) {
+        await conn.commit();
+        return false;
+      }
+      const leaseUntilMs = Math.max(current.leaseUntilMs!, requestedLease);
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_purge_plan_jobs
+            SET lease_until_ms=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          leaseUntilMs,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryTenantPurgePlan(
+    authorization: TenantPurgePlanAuthorization,
+    options: RetryTenantPurgePlanOptions,
+  ): Promise<boolean> {
+    validateTenantPurgePlanAuthorization(authorization);
+    validateRetryTenantPurgePlanOptions(options);
+    const preflight = await this.loadTenantPurgePlanJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantPurgePlanTransaction(conn);
+      await this.validateTenantPurgePlanSource(conn, preflight, true);
+      const current = await this.loadTenantPurgePlanJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || current.phase !== "queued"
+        || !this.tenantPurgePlanSameSource(current, preflight)
+        || !tenantPurgePlanAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const base = Math.max(
+        now,
+        current.createdAtMs,
+        current.updatedAtMs,
+        current.availableAtMs,
+      );
+      const availableAtMs = options.delayMs > Number.MAX_SAFE_INTEGER - base
+        ? Number.MAX_SAFE_INTEGER
+        : base + options.delayMs;
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_purge_plan_jobs
+            SET available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          availableAtMs,
+          options.errorCode,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async blockTenantPurgePlan(
+    authorization: TenantPurgePlanAuthorization,
+  ): Promise<boolean> {
+    validateTenantPurgePlanAuthorization(authorization);
+    const preflight = await this.loadTenantPurgePlanJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantPurgePlanTransaction(conn);
+      try {
+        await this.validateTenantPurgePlanSource(conn, preflight, true);
+      } catch (error) {
+        if (
+          !(error instanceof TenantErasureIntegrityError)
+          && !(error instanceof TenantPurgePlanEvidenceChangedError)
+        ) throw error;
+      }
+      const current = await this.loadTenantPurgePlanJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || !this.tenantPurgePlanSameSource(current, preflight)
+        || !tenantPurgePlanAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const terminalAtMs = Math.max(current.createdAtMs, current.updatedAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_purge_plan_jobs
+            SET phase='blocked', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                blocked_at_ms=?, blocked_reason_code='integrity_conflict'
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          terminalAtMs,
+          terminalAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  /** @deprecated Diagnostic/compatibility only; production workers must call atomic seal. */
+  async buildTenantPurgePlanPage(
+    authorization: TenantPurgePlanAuthorization,
+    options: BuildTenantPurgePlanPageOptions,
+  ): Promise<BuildTenantPurgePlanPageResult> {
+    validateTenantPurgePlanAuthorization(authorization);
+    validateBuildTenantPurgePlanPageOptions(options);
+    const preflight = await this.loadTenantPurgePlanJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") throw new TenantErasureIntegrityError();
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantPurgePlanTransaction(conn);
+      const source = await this.validateTenantPurgePlanSource(conn, preflight, true);
+      const holdProof = await this.lockTenantPurgePlanHoldProof(conn, preflight.tenantId);
+      await this.lockAndValidateTenantPurgePlanGlobalRelations(conn);
+      const current = await this.loadTenantPurgePlanJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || !this.tenantPurgePlanSameSource(current, preflight)
+        || !tenantPurgePlanAuthorizationMatches(current, authorization, now)
+      ) throw new TenantErasureIntegrityError();
+      if (now < current.retentionAnchorDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_anchor");
+      }
+      if (now < current.purgeNotBeforeDbMs) {
+        throw new TenantPurgePlanNotReadyError("deadline_not_reached");
+      }
+      if (now < current.sourceEvidenceDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+      }
+      const existing = await this.validateTenantPurgePlanBuildState(
+        conn,
+        current,
+        source,
+        holdProof,
+      );
+      if (current.scanComplete) {
+        const result: BuildTenantPurgePlanPageResult = {
+          built: 0,
+          done: true,
+          ...(current.cursorDomain === undefined ? {} : { cursorDomain: current.cursorDomain }),
+          planEntryCount: current.planEntryCount,
+          planEntryRootSha256: current.planEntryRootSha256,
+          blockerCount: current.blockerCount,
+          blockerRootSha256: current.blockerRootSha256,
+        };
+        await conn.commit();
+        return result;
+      }
+
+      const domains = TENANT_PURGE_PLAN_DOMAINS.slice(
+        existing.length,
+        existing.length + options.limit,
+      );
+      const entries: TenantPurgePlanEntry[] = [];
+      for (const domain of domains) {
+        entries.push(await this.mysqlTenantPurgePlanEntry(
+          conn,
+          current,
+          domain,
+          now,
+          source,
+          holdProof,
+        ));
+      }
+      let planEntryRootSha256 = current.planEntryRootSha256;
+      let blockerRootSha256 = current.blockerRootSha256;
+      let blockerCount = current.blockerCount;
+      for (const entry of entries) {
+        planEntryRootSha256 = tenantPurgePlanNextEntryRootSha256(
+          planEntryRootSha256,
+          entry.domain,
+          entry.receiptSha256,
+        );
+        if (isTenantPurgePlanBlockingDisposition(entry.disposition)) {
+          blockerRootSha256 = tenantPurgePlanNextBlockerRootSha256(
+            blockerRootSha256,
+            entry.domain,
+            entry.disposition,
+            entry.receiptSha256,
+          );
+          blockerCount += 1;
+        }
+        await conn.query(
+          `INSERT INTO tenant_purge_plan_entries
+             (scope, request_id, build_generation, tenant_id, subject_generation, domain,
+              target_count, target_root_sha256, disposition, source_sha256,
+              captured_at_db_ms, receipt_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            entry.scope,
+            entry.requestId,
+            entry.buildGeneration,
+            entry.tenantId,
+            entry.subjectGeneration,
+            entry.domain,
+            entry.targetCount,
+            entry.targetRootSha256,
+            entry.disposition,
+            entry.sourceSha256,
+            entry.capturedAtDbMs,
+            entry.receiptSha256,
+          ],
+        );
+      }
+      const planEntryCount = current.planEntryCount + entries.length;
+      const done = planEntryCount === TENANT_PURGE_PLAN_DOMAINS.length;
+      const cursorDomain = entries.at(-1)?.domain ?? current.cursorDomain;
+      if (!cursorDomain || entries.length === 0) throw new TenantErasureIntegrityError();
+
+      // INSERTs can wait on immutable-domain uniqueness. Re-read the trusted clock afterwards;
+      // an expired claim rolls every entry in this page back with the job projection.
+      const publishNow = await this.databaseNow(conn);
+      if (!tenantPurgePlanAuthorizationMatches(current, authorization, publishNow)) {
+        throw new Error("tenant purge plan lease expired while publishing a page");
+      }
+      if (publishNow < current.sourceEvidenceDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+      }
+      const updatedAtMs = Math.max(current.updatedAtMs, publishNow);
+      const [advanced] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_purge_plan_jobs
+            SET cursor_domain=?, plan_entry_count=?, plan_entry_root_sha256=?,
+                blocker_count=?, blocker_root_sha256=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND scan_complete=FALSE
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          cursorDomain,
+          planEntryCount,
+          planEntryRootSha256,
+          blockerCount,
+          blockerRootSha256,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          publishNow,
+        ],
+      );
+      if (advanced.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      if (done) {
+        const [completedScan] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_purge_plan_jobs
+              SET scan_complete=TRUE
+            WHERE request_id=? AND tenant_id=? AND subject_generation=?
+              AND build_generation=? AND phase='queued' AND scan_complete=FALSE
+              AND plan_entry_count=? AND attempts=? AND claim_token=?
+              AND lease_until_ms>?`,
+          [
+            authorization.requestId,
+            authorization.tenantId,
+            authorization.subjectGeneration,
+            authorization.buildGeneration,
+            planEntryCount,
+            authorization.claimAttempt,
+            authorization.claimToken,
+            publishNow,
+          ],
+        );
+        if (completedScan.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      }
+      await conn.commit();
+      return {
+        built: entries.length,
+        done,
+        cursorDomain,
+        planEntryCount,
+        planEntryRootSha256,
+        blockerCount,
+        blockerRootSha256,
+      };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async sealTenantPurgePlan(
+    authorization: TenantPurgePlanAuthorization,
+  ): Promise<TenantPurgePlanReceipt | null> {
+    validateTenantPurgePlanAuthorization(authorization);
+    const preflight = await this.loadTenantPurgePlanJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight) return null;
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantPurgePlanTransaction(conn);
+      if (preflight.phase === "plan_sealed") {
+        await this.validateTenantPurgePlanSource(conn, preflight, false);
+        const terminal = await this.loadTenantPurgePlanJob(
+          conn,
+          authorization.tenantId,
+          authorization.requestId,
+          "FOR UPDATE",
+        );
+        if (!terminal || !this.tenantPurgePlanSameSource(terminal, preflight)) {
+          throw new TenantErasureIntegrityError();
+        }
+        const entries = await this.loadTenantPurgePlanEntries(
+          conn,
+          terminal.tenantId,
+          terminal.requestId,
+          terminal.buildGeneration,
+          "FOR SHARE",
+        );
+        const receipt = await this.loadTenantPurgePlanReceipt(
+          conn,
+          terminal.tenantId,
+          terminal.requestId,
+          "FOR SHARE",
+        );
+        if (!receipt) throw new TenantErasureIntegrityError();
+        try {
+          validateTenantPurgePlanCompletionProof(terminal, entries, receipt);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        if (!tenantPurgePlanReceiptMatchesAuthorization(receipt, authorization)) {
+          await conn.commit();
+          return null;
+        }
+        await conn.commit();
+        return receipt;
+      }
+      if (preflight.phase === "blocked") {
+        await this.validateTenantPurgePlanSource(conn, preflight, true);
+        await conn.commit();
+        return null;
+      }
+
+      const source = await this.validateTenantPurgePlanSource(conn, preflight, true);
+      const holdProof = await this.lockTenantPurgePlanHoldProof(conn, preflight.tenantId);
+      await this.lockAndValidateTenantPurgePlanGlobalRelations(conn);
+      let current = await this.loadTenantPurgePlanJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || !this.tenantPurgePlanSameSource(current, preflight)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const initialNow = await this.databaseNow(conn);
+      if (!tenantPurgePlanAuthorizationMatches(current, authorization, initialNow)) {
+        await conn.commit();
+        return null;
+      }
+      let entries = await this.validateTenantPurgePlanBuildState(
+        conn,
+        current,
+        source,
+        holdProof,
+      );
+      let builtAtomically = false;
+      if (!current.scanComplete) {
+        // The production path seals an untouched build atomically. Historical partial builds
+        // remain diagnosable/resumable through buildTenantPurgePlanPage, but seal never appends to
+        // them because doing so could reinterpret an already-observed multi-transaction snapshot.
+        if (entries.length !== 0) throw new TenantPurgePlanEvidenceChangedError();
+        if (initialNow < current.retentionAnchorDbMs) {
+          throw new TenantPurgePlanNotReadyError("trusted_clock_before_anchor");
+        }
+        if (initialNow < current.purgeNotBeforeDbMs) {
+          throw new TenantPurgePlanNotReadyError("deadline_not_reached");
+        }
+        if (initialNow < current.sourceEvidenceDbMs) {
+          throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+        }
+
+        const builtEntries: TenantPurgePlanEntry[] = [];
+        let planEntryRootSha256 = current.planEntryRootSha256;
+        let blockerRootSha256 = current.blockerRootSha256;
+        let blockerCount = current.blockerCount;
+        for (const domain of TENANT_PURGE_PLAN_DOMAINS) {
+          const entry = await this.mysqlTenantPurgePlanEntry(
+            conn,
+            current,
+            domain,
+            initialNow,
+            source,
+            holdProof,
+          );
+          builtEntries.push(entry);
+          planEntryRootSha256 = tenantPurgePlanNextEntryRootSha256(
+            planEntryRootSha256,
+            entry.domain,
+            entry.receiptSha256,
+          );
+          if (isTenantPurgePlanBlockingDisposition(entry.disposition)) {
+            blockerRootSha256 = tenantPurgePlanNextBlockerRootSha256(
+              blockerRootSha256,
+              entry.domain,
+              entry.disposition,
+              entry.receiptSha256,
+            );
+            blockerCount += 1;
+          }
+          await conn.query(
+            `INSERT INTO tenant_purge_plan_entries
+               (scope, request_id, build_generation, tenant_id, subject_generation, domain,
+                target_count, target_root_sha256, disposition, source_sha256,
+                captured_at_db_ms, receipt_sha256)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              entry.scope,
+              entry.requestId,
+              entry.buildGeneration,
+              entry.tenantId,
+              entry.subjectGeneration,
+              entry.domain,
+              entry.targetCount,
+              entry.targetRootSha256,
+              entry.disposition,
+              entry.sourceSha256,
+              entry.capturedAtDbMs,
+              entry.receiptSha256,
+            ],
+          );
+        }
+
+        // Entry INSERTs can wait on uniqueness or next-key locks. A post-write trusted-clock
+        // observation ensures the same claim still owns every write before publishing progress.
+        const buildPublishNow = await this.databaseNow(conn);
+        if (!tenantPurgePlanAuthorizationMatches(current, authorization, buildPublishNow)) {
+          throw new Error("tenant purge plan lease expired while publishing atomic entries");
+        }
+        if (buildPublishNow < current.sourceEvidenceDbMs) {
+          throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+        }
+        const buildUpdatedAtMs = Math.max(current.updatedAtMs, buildPublishNow);
+        const cursorDomain = builtEntries.at(-1)?.domain;
+        if (!cursorDomain || builtEntries.length !== TENANT_PURGE_PLAN_DOMAINS.length) {
+          throw new TenantErasureIntegrityError();
+        }
+        const [advanced] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_purge_plan_jobs
+              SET cursor_domain=?, plan_entry_count=?, plan_entry_root_sha256=?,
+                  blocker_count=?, blocker_root_sha256=?, updated_at_ms=?
+            WHERE request_id=? AND tenant_id=? AND subject_generation=?
+              AND build_generation=? AND phase='queued' AND scan_complete=FALSE
+              AND plan_entry_count=0 AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+          [
+            cursorDomain,
+            builtEntries.length,
+            planEntryRootSha256,
+            blockerCount,
+            blockerRootSha256,
+            buildUpdatedAtMs,
+            authorization.requestId,
+            authorization.tenantId,
+            authorization.subjectGeneration,
+            authorization.buildGeneration,
+            authorization.claimAttempt,
+            authorization.claimToken,
+            buildPublishNow,
+          ],
+        );
+        if (advanced.affectedRows !== 1) throw new TenantErasureIntegrityError();
+        const [completedScan] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_purge_plan_jobs
+              SET scan_complete=TRUE
+            WHERE request_id=? AND tenant_id=? AND subject_generation=?
+              AND build_generation=? AND phase='queued' AND scan_complete=FALSE
+              AND plan_entry_count=? AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+          [
+            authorization.requestId,
+            authorization.tenantId,
+            authorization.subjectGeneration,
+            authorization.buildGeneration,
+            builtEntries.length,
+            authorization.claimAttempt,
+            authorization.claimToken,
+            buildPublishNow,
+          ],
+        );
+        if (completedScan.affectedRows !== 1) throw new TenantErasureIntegrityError();
+        const published = await this.loadTenantPurgePlanJob(
+          conn,
+          authorization.tenantId,
+          authorization.requestId,
+          "FOR UPDATE",
+        );
+        if (
+          !published
+          || !this.tenantPurgePlanSameSource(published, current)
+          || !tenantPurgePlanAuthorizationMatches(published, authorization, buildPublishNow)
+        ) throw new TenantErasureIntegrityError();
+        current = published;
+        entries = await this.validateTenantPurgePlanBuildState(
+          conn,
+          current,
+          source,
+          holdProof,
+        );
+        builtAtomically = true;
+      }
+      if (!current.scanComplete || entries.length !== TENANT_PURGE_PLAN_DOMAINS.length) {
+        throw new TenantPurgePlanEvidenceChangedError();
+      }
+
+      const sealNow = await this.databaseNow(conn);
+      if (!tenantPurgePlanAuthorizationMatches(current, authorization, sealNow)) {
+        if (builtAtomically) {
+          throw new Error("tenant purge plan lease expired before atomic aggregate publication");
+        }
+        await conn.commit();
+        return null;
+      }
+      if (sealNow < current.retentionAnchorDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_anchor");
+      }
+      if (sealNow < current.purgeNotBeforeDbMs) {
+        throw new TenantPurgePlanNotReadyError("deadline_not_reached");
+      }
+      const latestCapturedAtDbMs = entries.reduce(
+        (latest, entry) => Math.max(latest, entry.capturedAtDbMs),
+        current.sourceEvidenceDbMs,
+      );
+      if (sealNow < latestCapturedAtDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+      }
+      const completedClaimTokenSha256 = tenantPurgePlanClaimTokenSha256(
+        authorization.claimToken,
+      );
+      const receiptBody = {
+        scope: TENANT_PURGE_PLAN_RECEIPT_SCOPE,
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        buildGeneration: current.buildGeneration,
+        t1FenceSha256: current.t1FenceSha256,
+        t3aReceiptSha256: current.t3aReceiptSha256,
+        t3bReceiptSha256: current.t3bReceiptSha256,
+        t3cReceiptSha256: current.t3cReceiptSha256,
+        policyVersion: current.policyVersion,
+        policySha256: current.policySha256,
+        policySchemaVersion: current.policySchemaVersion,
+        retentionAnchorDbMs: current.retentionAnchorDbMs,
+        purgeNotBeforeDbMs: current.purgeNotBeforeDbMs,
+        sourceEvidenceDbMs: current.sourceEvidenceDbMs,
+        planEntryCount: current.planEntryCount,
+        planEntryRootSha256: current.planEntryRootSha256,
+        blockerCount: current.blockerCount,
+        blockerRootSha256: current.blockerRootSha256,
+        storeDbTimestampMs: sealNow,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256,
+        planComplete: true as const,
+        executionReady: false as const,
+        contentPurgeExecuted: false as const,
+      };
+      const receipt: TenantPurgePlanReceipt = {
+        ...receiptBody,
+        receiptSha256: tenantPurgePlanReceiptSha256(receiptBody),
+      };
+      await conn.query(
+        `INSERT INTO tenant_purge_plan_receipts
+           (scope, request_id, tenant_id, subject_generation, build_generation,
+            t1_fence_sha256, t3a_receipt_sha256, t3b_receipt_sha256, t3c_receipt_sha256,
+            policy_version, policy_sha256, policy_schema_version, retention_anchor_db_ms,
+            purge_not_before_db_ms, source_evidence_db_ms, plan_entry_count,
+            plan_entry_root_sha256, blocker_count, blocker_root_sha256,
+            store_db_timestamp_ms, completed_claim_attempt, completed_claim_token_sha256,
+            plan_complete, execution_ready, content_purge_executed, receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          receipt.scope,
+          receipt.requestId,
+          receipt.tenantId,
+          receipt.subjectGeneration,
+          receipt.buildGeneration,
+          receipt.t1FenceSha256,
+          receipt.t3aReceiptSha256,
+          receipt.t3bReceiptSha256,
+          receipt.t3cReceiptSha256,
+          receipt.policyVersion,
+          receipt.policySha256,
+          receipt.policySchemaVersion,
+          receipt.retentionAnchorDbMs,
+          receipt.purgeNotBeforeDbMs,
+          receipt.sourceEvidenceDbMs,
+          receipt.planEntryCount,
+          receipt.planEntryRootSha256,
+          receipt.blockerCount,
+          receipt.blockerRootSha256,
+          receipt.storeDbTimestampMs,
+          receipt.completedClaimAttempt,
+          receipt.completedClaimTokenSha256,
+          receipt.planComplete,
+          receipt.executionReady,
+          receipt.contentPurgeExecuted,
+          receipt.receiptSha256,
+        ],
+      );
+
+      // Receipt uniqueness may wait. Re-observe DB time after the INSERT; stale authority must
+      // roll back both the aggregate and terminal projection rather than leave a partial proof.
+      const publishNow = await this.databaseNow(conn);
+      if (!tenantPurgePlanAuthorizationMatches(current, authorization, publishNow)) {
+        throw new Error("tenant purge plan lease expired while publishing the aggregate");
+      }
+      if (publishNow < latestCapturedAtDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+      }
+      const updatedAtMs = Math.max(current.updatedAtMs, publishNow);
+      const terminalJob: TenantPurgePlanJobRecord = {
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        buildGeneration: current.buildGeneration,
+        t1FenceSha256: current.t1FenceSha256,
+        t3aReceiptSha256: current.t3aReceiptSha256,
+        t3bReceiptSha256: current.t3bReceiptSha256,
+        t3cReceiptSha256: current.t3cReceiptSha256,
+        policyVersion: current.policyVersion,
+        policySha256: current.policySha256,
+        policySchemaVersion: current.policySchemaVersion,
+        retentionAnchorDbMs: current.retentionAnchorDbMs,
+        purgeNotBeforeDbMs: current.purgeNotBeforeDbMs,
+        sourceEvidenceDbMs: current.sourceEvidenceDbMs,
+        phase: "plan_sealed",
+        cursorDomain: current.cursorDomain!,
+        scanComplete: true,
+        planEntryCount: current.planEntryCount,
+        planEntryRootSha256: current.planEntryRootSha256,
+        blockerCount: current.blockerCount,
+        blockerRootSha256: current.blockerRootSha256,
+        attempts: current.attempts,
+        createdAtMs: current.createdAtMs,
+        updatedAtMs,
+        planSealedAtDbMs: sealNow,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256,
+        aggregateReceiptSha256: receipt.receiptSha256,
+      };
+      try {
+        validateTenantPurgePlanCompletionProof(terminalJob, entries, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      const [completed] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_purge_plan_jobs
+            SET phase='plan_sealed', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?, sealed_at_ms=?,
+                completed_claim_attempt=?, completed_claim_token_sha256=?,
+                aggregate_receipt_sha256=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND scan_complete=TRUE
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          updatedAtMs,
+          sealNow,
+          authorization.claimAttempt,
+          completedClaimTokenSha256,
+          receipt.receiptSha256,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          publishNow,
+        ],
+      );
+      if (completed.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      await conn.commit();
+      return receipt;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private async validateTenantPurgePlanReadProof(
+    conn: PoolConnection,
+    job: TenantPurgePlanJobRecord,
+  ): Promise<{ entries: TenantPurgePlanEntry[]; receipt: TenantPurgePlanReceipt | null }> {
+    await this.validateTenantPurgePlanSource(conn, job, job.phase !== "plan_sealed");
+    const entries = await this.loadTenantPurgePlanEntries(
+      conn,
+      job.tenantId,
+      job.requestId,
+      job.buildGeneration,
+    );
+    const receipt = await this.loadTenantPurgePlanReceipt(conn, job.tenantId, job.requestId);
+    if (job.phase === "plan_sealed") {
+      if (!receipt) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantPurgePlanCompletionProof(job, entries, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    } else {
+      if (receipt) throw new TenantErasureIntegrityError();
+      this.tenantPurgePlanEntryState(job, entries);
+    }
+    return { entries, receipt };
+  }
+
+  async getTenantPurgePlanJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantPurgePlanJobRecord | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantPurgePlanJob(conn, tenantId, requestId);
+      if (!job) return null;
+      await this.validateTenantPurgePlanReadProof(conn, job);
+      return job;
+    });
+  }
+
+  async getTenantPurgePlanEntries(
+    tenantId: string,
+    requestId: string,
+    buildGeneration: number,
+  ): Promise<TenantPurgePlanEntry[]> {
+    if (!Number.isSafeInteger(buildGeneration) || buildGeneration <= 0) {
+      throw new Error("invalid tenant purge plan build generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantPurgePlanJob(conn, tenantId, requestId);
+      if (!job || job.buildGeneration !== buildGeneration) return [];
+      const proof = await this.validateTenantPurgePlanReadProof(conn, job);
+      return proof.entries;
+    });
+  }
+
+  async getTenantPurgePlanReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantPurgePlanReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantPurgePlanJob(conn, tenantId, requestId);
+      if (!job) {
+        const orphan = await this.loadTenantPurgePlanReceipt(conn, tenantId, requestId);
+        if (orphan) throw new TenantErasureIntegrityError();
+        return null;
+      }
+      const proof = await this.validateTenantPurgePlanReadProof(conn, job);
+      return proof.receipt;
     });
   }
 

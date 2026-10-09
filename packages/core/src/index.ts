@@ -19,4 +19,5 @@ export * from "./lifecycle/user-data-export-cleanup-worker.js";
 export * from "./lifecycle/tenant-credential-revocation-worker.js";
 export * from "./lifecycle/tenant-runtime-revocation-worker.js";
 export * from "./lifecycle/tenant-content-inventory-worker.js";
+export * from "./lifecycle/tenant-purge-plan-worker.js";
 export * from "./lifecycle/tenant-runtime-coordinator.js";

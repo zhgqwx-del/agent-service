@@ -97,6 +97,16 @@ const Env = z.object({
   TENANT_CONTENT_INVENTORY_SESSION_PAGE_SIZE: z.coerce.number().int().min(1).max(1_000).default(100),
   TENANT_CONTENT_INVENTORY_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
   TENANT_CONTENT_INVENTORY_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
+  /** T3d full-domain planning only. It cannot delete, anonymize, revoke, or complete erasure. */
+  TENANT_PURGE_PLAN_WORKER_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  TENANT_PURGE_PLAN_WORKER_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_PURGE_PLAN_WORKER_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+  TENANT_PURGE_PLAN_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(5),
+  TENANT_PURGE_PLAN_MATERIALIZE_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
+  TENANT_PURGE_PLAN_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_PURGE_PLAN_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** Bounded runner-to-router fleet check performed immediately before each tenant admission. */
   TENANT_ERASURE_BARRIER_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(2_000),
   /** Canonical policy/legal-hold admin surface. This never enables destructive purge. */
@@ -358,6 +368,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     throw new Error(
       "TENANT_CONTENT_INVENTORY_RETRY_MAX_MS must be at least "
         + "TENANT_CONTENT_INVENTORY_RETRY_BASE_MS",
+    );
+  }
+  if (
+    c.TENANT_PURGE_PLAN_RETRY_MAX_MS
+      < c.TENANT_PURGE_PLAN_RETRY_BASE_MS
+  ) {
+    throw new Error(
+      "TENANT_PURGE_PLAN_RETRY_MAX_MS must be at least "
+        + "TENANT_PURGE_PLAN_RETRY_BASE_MS",
     );
   }
   if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.ERASURE_WORKER_ENABLED) {

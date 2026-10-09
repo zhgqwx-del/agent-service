@@ -25,6 +25,7 @@
     "test:tenant-credential-physical-revocation-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-physical-revocation.mysql.test.ts",
     "test:tenant-runtime-revocation-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-runtime-revocation.mysql.test.ts",
     "test:tenant-content-inventory-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-content-inventory.mysql.test.ts",
+    "test:tenant-purge-plan-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-purge-plan.mysql.test.ts",
     "test:retention-policy-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/retention-policy.mysql.test.ts",
     "test:erasure-purge-policy-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/erasure-purge-policy.mysql.test.ts",
     "test:erasure-job-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/erasure-job.mysql.test.ts",

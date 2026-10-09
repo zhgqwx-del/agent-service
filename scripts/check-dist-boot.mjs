@@ -81,6 +81,17 @@ function cleanEnv() {
     "ERASURE_WORKER_REQUEST_TIMEOUT_MS",
     "ERASURE_DRAIN_TIMEOUT_MS",
   ]) delete env[key];
+  // Lifecycle rollout flags and tuning grow independently. Strip each family so a developer's
+  // sourced .env cannot accidentally start a worker or expose a private execution surface here.
+  for (const key of Object.keys(env)) {
+    if ([
+      "TENANT_ERASURE_",
+      "TENANT_CREDENTIAL_REVOCATION_",
+      "TENANT_RUNTIME_",
+      "TENANT_CONTENT_INVENTORY_",
+      "TENANT_PURGE_PLAN_",
+    ].some((prefix) => key.startsWith(prefix))) delete env[key];
+  }
   return env;
 }
 

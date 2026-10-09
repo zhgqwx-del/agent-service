@@ -41,6 +41,7 @@ import {
   LegacyTombstoneCompensationWorker,
   PurgePolicyEvaluator,
   TenantContentInventoryWorker,
+  TenantPurgePlanWorker,
   TenantRuntimeRevocationWorker,
   UserDataExportCleanupWorker,
   UserDataExportWorker,
@@ -407,6 +408,41 @@ describe("runner main blob wiring", () => {
       });
 
       const stop = vi.spyOn(runner.tenantContentInventoryWorker!, "stop");
+      const hostDrain = vi.spyOn(runner.host, "drain");
+      await runner.close();
+      expect(stop).toHaveBeenCalledOnce();
+      expect(stop.mock.invocationCallOrder[0]).toBeLessThan(hostDrain.mock.invocationCallOrder[0]!);
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      start.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("starts and stops the independent default-off T3d purge-plan worker", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-purge-plan-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const start = vi.spyOn(TenantPurgePlanWorker.prototype, "start");
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        TENANT_PURGE_PLAN_WORKER_ENABLED: "1",
+        TENANT_PURGE_PLAN_WORKER_POLL_MS: "60000",
+      });
+      expect(start).toHaveBeenCalledOnce();
+      expect(runner.tenantPurgePlanWorker).toBeInstanceOf(TenantPurgePlanWorker);
+      expect(runner.tenantContentInventoryWorker).toBeUndefined();
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: { dataPurgeExecution: false },
+      });
+
+      const stop = vi.spyOn(runner.tenantPurgePlanWorker!, "stop");
       const hostDrain = vi.spyOn(runner.host, "drain");
       await runner.close();
       expect(stop).toHaveBeenCalledOnce();

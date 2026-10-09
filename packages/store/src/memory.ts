@@ -496,6 +496,53 @@ import {
   type TenantContentInventoryStore,
   type TenantSessionContentReceipt,
 } from "./tenant-content-inventory.js";
+import {
+  EMPTY_TENANT_PURGE_PLAN_BLOCKER_ROOT_SHA256,
+  EMPTY_TENANT_PURGE_PLAN_ENTRY_ROOT_SHA256,
+  TENANT_PURGE_PLAN_DOMAINS,
+  TENANT_PURGE_PLAN_ENTRY_SCOPE,
+  TENANT_PURGE_PLAN_RECEIPT_SCOPE,
+  TenantPurgePlanEvidenceChangedError,
+  TenantPurgePlanNotReadyError,
+  isTenantPurgePlanBlockingDisposition,
+  tenantPurgePlanAuthorizationMatches,
+  tenantPurgePlanBlockerRootSha256,
+  tenantPurgePlanClaimFromJob,
+  tenantPurgePlanClaimTokenSha256,
+  tenantPurgePlanDomainOrdinal,
+  tenantPurgePlanDomainSourceSha256,
+  tenantPurgePlanEntryRootSha256,
+  tenantPurgePlanEntrySha256,
+  tenantPurgePlanNextBlockerRootSha256,
+  tenantPurgePlanNextEntryRootSha256,
+  tenantPurgePlanReceiptMatchesAuthorization,
+  tenantPurgePlanReceiptSha256,
+  tenantPurgePlanTargetRootSha256,
+  tenantPurgePlanTargetSha256,
+  validateBuildTenantPurgePlanPageOptions,
+  validateClaimTenantPurgePlansOptions,
+  validateMaterializeTenantPurgePlanJobsOptions,
+  validateRenewTenantPurgePlanOptions,
+  validateRetryTenantPurgePlanOptions,
+  validateTenantPurgePlanAuthorization,
+  validateTenantPurgePlanCompletionProof,
+  validateTenantPurgePlanEntry,
+  validateTenantPurgePlanJobRecord,
+  type BuildTenantPurgePlanPageOptions,
+  type BuildTenantPurgePlanPageResult,
+  type ClaimTenantPurgePlansOptions,
+  type MaterializeTenantPurgePlanJobsOptions,
+  type RenewTenantPurgePlanOptions,
+  type RetryTenantPurgePlanOptions,
+  type TenantPurgePlanAuthorization,
+  type TenantPurgePlanClaim,
+  type TenantPurgePlanDisposition,
+  type TenantPurgePlanDomain,
+  type TenantPurgePlanEntry,
+  type TenantPurgePlanJobRecord,
+  type TenantPurgePlanReceipt,
+  type TenantPurgePlanStore,
+} from "./tenant-purge-plan.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -683,7 +730,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -719,6 +766,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantContentInventoryJobs = new Map<string, TenantContentInventoryJobRecord>();
   tenantSessionContentReceipts = new Map<string, TenantSessionContentReceipt>();
   tenantContentInventoryReceipts = new Map<string, TenantContentInventoryReceipt>();
+  tenantPurgePlanJobs = new Map<string, TenantPurgePlanJobRecord>();
+  tenantPurgePlanEntries = new Map<string, TenantPurgePlanEntry>();
+  tenantPurgePlanReceipts = new Map<string, TenantPurgePlanReceipt>();
   erasureJobControlEvents = new Map<string, ErasureJobControlEvent[]>();
   private nextErasureJobControlEventId = 1;
   erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
@@ -6625,6 +6675,1900 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new TenantErasureIntegrityError();
     }
     return clone(aggregate);
+  }
+
+  /**
+   * T3d cannot attribute a child row whose owner row is missing. Fail the whole planning snapshot
+   * closed instead of letting an owner-filtered scan silently omit that orphan and seal an
+   * incomplete `planComplete` receipt. MySQL takes equivalent full-range shared locks while it
+   * validates these relations.
+   */
+  private assertTenantPurgePlanGlobalRelations(): void {
+    try {
+      for (const [sessionId, session] of this.sessions) {
+        if (sessionId !== session.id) throw new Error("session identity is invalid");
+      }
+      for (const [itemId, item] of this.items) {
+        const session = this.sessions.get(item.sessionId);
+        if (
+          itemId !== item.id
+          || !session
+        ) throw new Error("item owner relation is invalid");
+      }
+      for (const [key, receipt] of this.idem) {
+        let scope: unknown;
+        try {
+          scope = JSON.parse(key);
+        } catch {
+          throw new Error("idempotency scope is invalid");
+        }
+        if (
+          !Array.isArray(scope)
+          || scope.length !== 4
+          || scope.some((value) => typeof value !== "string")
+        ) throw new Error("idempotency scope is invalid");
+        const [tenantId, userId, sessionId] = scope as string[];
+        const session = this.sessions.get(sessionId!);
+        if (
+          !session
+          || session.tenantId !== tenantId
+          || session.userId !== userId
+        ) throw new Error("idempotency owner relation is invalid");
+        // NULL is the intentionally preserved legacy pending receipt. Historical completed
+        // receipts may contain only turnId; modern receipts also carry sessionId. In either shape
+        // the durable response pointer must resolve to a turn owned by the scoped session.
+        if (receipt.value !== null) {
+          const value: unknown = receipt.value;
+          if (
+            typeof value !== "object"
+            || Array.isArray(value)
+            || typeof (value as { turnId?: unknown }).turnId !== "string"
+          ) throw new Error("idempotency completed value is invalid");
+          const valueSessionId = (value as { sessionId?: unknown }).sessionId;
+          const turnId = (value as { turnId: string }).turnId;
+          const turn = this.turns.get(turnId);
+          if (
+            (valueSessionId !== undefined && valueSessionId !== sessionId)
+            || !turn
+            || turn.sessionId !== sessionId
+          ) throw new Error("idempotency completed value relation is invalid");
+        }
+      }
+      for (const usage of this.usageLedger) {
+        const session = this.sessions.get(usage.sessionId);
+        if (
+          !session
+          || session.tenantId !== usage.tenantId
+          || session.userId !== usage.userId
+        ) throw new Error("operational usage owner relation is invalid");
+      }
+      for (const [key, reconciliation] of this.usageReconciliations) {
+        const session = this.sessions.get(reconciliation.sessionId);
+        const tombstone = this.deleted.get(reconciliation.sessionId);
+        if (
+          key !== this.usageReconciliationMapKey(
+            reconciliation.sessionId,
+            reconciliation.deletionGeneration,
+          )
+          || !session
+          || session.tenantId !== reconciliation.tenantId
+          || session.userId !== reconciliation.userId
+          || !tombstone
+          || tombstone.deletionGeneration !== reconciliation.deletionGeneration
+        ) throw new Error("usage reconciliation owner relation is invalid");
+      }
+      for (const [blobId, manifest] of this.blobManifests) {
+        const session = this.sessions.get(manifest.sessionId);
+        if (
+          blobId !== manifest.blobId
+          || !session
+          || session.tenantId !== manifest.tenantId
+          || session.userId !== manifest.userId
+        ) throw new Error("blob owner relation is invalid");
+        if (manifest.itemId !== undefined) {
+          const item = this.items.get(manifest.itemId);
+          if (
+            !item
+            || item.sessionId !== manifest.sessionId
+          ) throw new Error("blob item relation is invalid");
+        }
+      }
+      for (const outbox of this.blobDeleteOutbox.values()) {
+        const manifest = this.blobManifests.get(outbox.blobId);
+        if (!manifest || manifest.deletionGeneration !== outbox.generation) {
+          throw new Error("orphaned blob delete outbox");
+        }
+      }
+      for (const outbox of this.lifecycleOutbox.values()) {
+        const session = this.sessions.get(outbox.aggregateId);
+        const tombstone = this.deleted.get(outbox.aggregateId);
+        if (
+          !session
+          || !tombstone
+          || outbox.payload.sessionId !== outbox.aggregateId
+          || outbox.payload.deletionGeneration !== outbox.generation
+          || tombstone.deletionGeneration !== outbox.generation
+        ) throw new Error("orphaned lifecycle outbox");
+      }
+
+      for (const [requestId, request] of this.userDataExportRequests) {
+        if (requestId !== request.requestId) throw new Error("export request identity is invalid");
+        if (
+          this.userDataExportIdempotency.get(
+            this.userDataExportIdempotencyKeyFor(request),
+          ) !== requestId
+        ) throw new Error("export request idempotency relation is invalid");
+        const job = this.userDataExportJobs.get(requestId);
+        if (!job || job.requestId !== requestId
+          || job.buildGeneration !== request.currentBuildGeneration) {
+          throw new Error("export job owner relation is invalid");
+        }
+      }
+      for (const [requestId, exportJob] of this.userDataExportJobs) {
+        const request = this.userDataExportRequests.get(requestId);
+        if (
+          exportJob.requestId !== requestId
+          || !request
+          || request.currentBuildGeneration !== exportJob.buildGeneration
+        ) throw new Error("export job relation is invalid");
+      }
+      for (const [artifactId, artifact] of this.userDataExportArtifacts) {
+        const request = this.userDataExportRequests.get(artifact.requestId);
+        const exportJob = this.userDataExportJobs.get(artifact.requestId);
+        if (
+          artifactId !== artifact.artifactId
+          || !request
+          || !exportJob
+          || artifact.tenantId !== request.tenantId
+          || artifact.userId !== request.userId
+          || artifact.subjectGeneration !== request.subjectGeneration
+          || artifact.buildGeneration > exportJob.buildGeneration
+        ) throw new Error("export artifact owner relation is invalid");
+      }
+      for (const [requestId, records] of this.userDataExportSnapshotRecords) {
+        const request = this.userDataExportRequests.get(requestId);
+        const exportJob = this.userDataExportJobs.get(requestId);
+        if (!request || !exportJob || records.some((record) => (
+          record.requestId !== requestId
+          || record.buildGeneration > exportJob.buildGeneration
+        ))) throw new Error("export snapshot record owner relation is invalid");
+      }
+      for (const [requestId, blobs] of this.userDataExportSnapshotBlobs) {
+        const request = this.userDataExportRequests.get(requestId);
+        const exportJob = this.userDataExportJobs.get(requestId);
+        if (!request || !exportJob) throw new Error("export snapshot blob owner is missing");
+        for (const blob of blobs) {
+          const manifest = this.blobManifests.get(blob.blobId);
+          if (
+            blob.requestId !== requestId
+            || blob.buildGeneration > exportJob.buildGeneration
+            || !manifest
+            || manifest.tenantId !== request.tenantId
+            || manifest.userId !== request.userId
+            || manifest.sessionId !== blob.sessionId
+            || (blob.releasedAtMs === undefined
+              ? manifest.deletionGeneration !== blob.sourceDeletionGeneration
+              : manifest.deletionGeneration < blob.sourceDeletionGeneration)
+          ) throw new Error("export snapshot blob owner relation is invalid");
+        }
+      }
+      for (const [partKey, part] of this.userDataExportParts) {
+        const artifact = this.userDataExportArtifacts.get(part.artifactId);
+        if (
+          partKey !== this.userDataExportPartKey(part.artifactId, part.partNumber)
+          || !artifact
+          || artifact.requestId !== part.requestId
+          || artifact.buildGeneration !== part.buildGeneration
+          || artifact.deletionGeneration !== part.deletionGeneration
+        ) throw new Error("export artifact part relation is invalid");
+      }
+      for (const outbox of this.userDataExportDeleteOutbox.values()) {
+        const artifact = this.userDataExportArtifacts.get(outbox.artifactId);
+        const part = this.userDataExportParts.get(JSON.stringify([
+          outbox.artifactId,
+          outbox.partNumber,
+        ]));
+        if (
+          !artifact
+          || !part
+          || artifact.requestId !== outbox.requestId
+          || part.requestId !== outbox.requestId
+          || part.deletionGeneration !== outbox.deletionGeneration
+          || artifact.deletionGeneration !== outbox.deletionGeneration
+        ) throw new Error("orphaned export delete outbox");
+      }
+      for (const lease of this.userDataExportDownloadLeases.values()) {
+        const request = this.userDataExportRequests.get(lease.requestId);
+        const artifact = this.userDataExportArtifacts.get(lease.artifactId);
+        if (
+          !request
+          || !artifact
+          || request.tenantId !== lease.tenantId
+          || request.userId !== lease.userId
+          || artifact.requestId !== lease.requestId
+          || artifact.tenantId !== lease.tenantId
+          || artifact.userId !== lease.userId
+        ) throw new Error("orphaned export download lease");
+      }
+      for (const [key, requestId] of this.userDataExportIdempotency) {
+        const request = this.userDataExportRequests.get(requestId);
+        let scope: unknown;
+        try {
+          scope = JSON.parse(key);
+        } catch {
+          throw new Error("export idempotency scope is invalid");
+        }
+        if (
+          !request
+          || !Array.isArray(scope)
+          || scope.length !== 3
+          || scope[0] !== request.tenantId
+          || scope[1] !== request.userId
+          || scope[2] !== request.idempotencyKeySha256
+        ) throw new Error("export idempotency owner relation is invalid");
+      }
+
+      for (const [requestId, request] of this.erasureRequests) {
+        const lifecycle = this.subjectLifecycles.get(subjectLifecycleKey(
+          request.tenantId,
+          request.subjectKind,
+          request.subjectId,
+        ));
+        if (
+          requestId !== request.requestId
+          || request.subjectKind !== "user"
+          || this.erasureIdempotency.get(JSON.stringify([
+            request.tenantId,
+            request.subjectKind,
+            request.subjectId,
+            request.idempotencyKey,
+          ])) !== requestId
+          || !lifecycle
+          || lifecycle.state !== "deleting"
+          || lifecycle.generation !== request.generation
+          || lifecycle.activeRequestId !== requestId
+        ) throw new Error("erasure request lifecycle relation is invalid");
+      }
+      for (const [requestId, admission] of this.tenantErasureAdmissions) {
+        const lifecycle = this.subjectLifecycles.get(subjectLifecycleKey(
+          admission.tenantId,
+          "tenant",
+          admission.tenantId,
+        ));
+        if (
+          requestId !== admission.requestId
+          || admission.subjectKind !== "tenant"
+          || admission.subjectId !== admission.tenantId
+          || this.erasureIdempotency.get(JSON.stringify([
+            admission.tenantId,
+            admission.subjectKind,
+            admission.subjectId,
+            admission.idempotencyKey,
+          ])) !== requestId
+          || !lifecycle
+          || lifecycle.state !== "deleting"
+          || lifecycle.generation !== admission.generation
+          || lifecycle.activeRequestId !== requestId
+        ) throw new Error("tenant erasure admission lifecycle relation is invalid");
+      }
+      for (const [key, lifecycle] of this.subjectLifecycles) {
+        if (key !== subjectLifecycleKey(
+          lifecycle.tenantId,
+          lifecycle.subjectKind,
+          lifecycle.subjectId,
+        )) throw new Error("subject lifecycle identity is invalid");
+        if (lifecycle.state !== "deleting") {
+          if (lifecycle.activeRequestId !== undefined) {
+            throw new Error("inactive subject lifecycle retains an active request");
+          }
+          continue;
+        }
+        if (lifecycle.activeRequestId === undefined) {
+          throw new Error("deleting subject lifecycle has no active request");
+        }
+        const owner = lifecycle.subjectKind === "user"
+          ? this.erasureRequests.get(lifecycle.activeRequestId)
+          : this.tenantErasureAdmissions.get(lifecycle.activeRequestId);
+        if (
+          !owner
+          || owner.tenantId !== lifecycle.tenantId
+          || owner.subjectKind !== lifecycle.subjectKind
+          || owner.subjectId !== lifecycle.subjectId
+          || owner.generation !== lifecycle.generation
+        ) throw new Error("subject lifecycle active request relation is invalid");
+      }
+      for (const [key, requestId] of this.erasureIdempotency) {
+        let scope: unknown;
+        try {
+          scope = JSON.parse(key);
+        } catch {
+          throw new Error("erasure idempotency scope is invalid");
+        }
+        if (
+          !Array.isArray(scope)
+          || scope.length !== 4
+          || scope.some((value) => typeof value !== "string")
+        ) throw new Error("erasure idempotency scope is invalid");
+        const [tenantId, subjectKind, subjectId, idempotencyKey] = scope as string[];
+        const request = subjectKind === "user"
+          ? this.erasureRequests.get(requestId)
+          : subjectKind === "tenant" ? this.tenantErasureAdmissions.get(requestId) : undefined;
+        if (
+          !request
+          || request.tenantId !== tenantId
+          || request.subjectKind !== subjectKind
+          || request.subjectId !== subjectId
+          || request.idempotencyKey !== idempotencyKey
+        ) throw new Error("erasure idempotency owner relation is invalid");
+      }
+      for (const [requestId, events] of this.erasureAuditEvents) {
+        const userRequest = this.erasureRequests.get(requestId);
+        const tenantAdmission = this.tenantErasureAdmissions.get(requestId);
+        if ((userRequest === undefined) === (tenantAdmission === undefined)) {
+          throw new Error("orphaned or ambiguous erasure audit");
+        }
+        if (events.some((event) => event.requestId !== requestId)) {
+          throw new Error("cross-request erasure audit");
+        }
+      }
+      for (const [requestId, events] of this.erasureJobControlEvents) {
+        if (
+          !this.erasureRequests.has(requestId)
+          || events.some((event) => event.requestId !== requestId)
+        ) throw new Error("orphaned erasure control event");
+      }
+      for (const incident of this.erasureJobTerminalIncidents.values()) {
+        if (!this.erasureRequests.has(incident.requestId)) {
+          throw new Error("orphaned erasure terminal incident");
+        }
+      }
+      for (const [jobId, legacyJob] of this.legacyTombstoneCompensationJobs) {
+        validateLegacyTombstoneCompensationJobRecord(legacyJob);
+        const session = this.sessions.get(legacyJob.sessionId);
+        const tombstone = this.deleted.get(legacyJob.sessionId);
+        if (
+          jobId !== legacyJob.jobId
+          || jobId !== legacyTombstoneCompensationJobIdForSession(legacyJob.sessionId)
+          || !session
+          || session.tenantId !== legacyJob.tenantId
+          || session.userId !== legacyJob.userId
+          || !tombstone
+          || tombstone.deletedAtMs !== legacyJob.legacyDeletedAtMs
+          || tombstone.purgeAfterMs !== undefined
+          || tombstone.deletionGeneration !== (legacyJob.status === "completed" ? 1 : 0)
+          || (legacyJob.status === "completed"
+            && session.lastSeq !== legacyJob.completedEventSeq)
+        ) throw new Error("legacy compensation owner relation is invalid");
+        if (legacyJob.sourceKind === "erasure_claim") {
+          const request = this.erasureRequests.get(legacyJob.sourceRequestId);
+          if (
+            !request
+            || request.subjectKind !== "user"
+            || request.tenantId !== legacyJob.tenantId
+            || request.subjectId !== legacyJob.userId
+            || request.generation !== legacyJob.sourceSubjectGeneration
+          ) throw new Error("legacy compensation source relation is invalid");
+        }
+        const audits = this.legacyTombstoneCompensationAudits.get(jobId) ?? [];
+        if (legacyJob.status === "pending") {
+          if (audits.length !== 0) throw new Error("pending legacy compensation has an audit");
+        } else if (legacyJob.status === "completed") {
+          const audit = audits[0];
+          if (
+            audits.length !== 1
+            || !audit
+            || audit.type !== "legacy_tombstone/compensated"
+            || legacyJob.completedAtMs === undefined
+            || legacyJob.completedEventSeq === undefined
+            || legacyJob.completedClaimAttempt === undefined
+            || audit.sessionId !== legacyJob.sessionId
+            || audit.cutoverGeneration !== legacyJob.cutoverGeneration
+            || audit.deletionGeneration !== 1
+            || audit.eventSeq !== legacyJob.completedEventSeq
+            || audit.claimAttempt !== legacyJob.completedClaimAttempt
+            || audit.emittedAtMs !== legacyJob.completedAtMs
+            || audit.evidenceSha256 !== legacyTombstoneSuccessEvidenceSha256({
+              jobId: legacyJob.jobId,
+              tenantId: legacyJob.tenantId,
+              userId: legacyJob.userId,
+              sessionId: legacyJob.sessionId,
+              cutoverGeneration: legacyJob.cutoverGeneration,
+              legacyDeletedAtMs: legacyJob.legacyDeletedAtMs,
+              deletionGeneration: 1,
+              eventSeq: legacyJob.completedEventSeq,
+              claimAttempt: legacyJob.completedClaimAttempt,
+              emittedAtMs: legacyJob.completedAtMs,
+            })
+          ) throw new Error("completed legacy compensation audit is invalid");
+        } else {
+          const audit = audits[0];
+          if (
+            audits.length !== 1
+            || !audit
+            || audit.type !== "legacy_tombstone/terminal_incident"
+            || audit.reasonCode !== legacyJob.terminalReasonCode
+            || audit.emittedAtMs !== legacyJob.terminalAtMs
+            || audit.evidenceSha256 !== legacyJob.terminalEvidenceSha256
+          ) throw new Error("terminal legacy compensation audit is invalid");
+        }
+      }
+      for (const [jobId, audits] of this.legacyTombstoneCompensationAudits) {
+        const legacyJob = this.legacyTombstoneCompensationJobs.get(jobId);
+        if (
+          !legacyJob
+          || audits.some((audit) => {
+            validateLegacyTombstoneCompensationAudit(audit);
+            return audit.jobId !== jobId
+              || (audit.type === "legacy_tombstone/compensated"
+                && audit.sessionId !== legacyJob.sessionId);
+          })
+        ) throw new Error("orphaned legacy compensation event");
+      }
+      for (const [requestId, evaluation] of this.erasurePolicyEvaluationJobs) {
+        const request = this.erasureRequests.get(requestId);
+        if (
+          evaluation.requestId !== requestId
+          || !request
+          || evaluation.tenantId !== request.tenantId
+          || evaluation.subjectKind !== request.subjectKind
+          || evaluation.subjectId !== request.subjectId
+          || evaluation.subjectGeneration !== request.generation
+        ) throw new Error("purge-policy evaluation owner relation is invalid");
+      }
+      for (const [key, target] of this.erasurePurgeTargets) {
+        const evaluation = this.erasurePolicyEvaluationJobs.get(target.requestId);
+        const session = this.sessions.get(target.sessionId);
+        const tombstone = this.deleted.get(target.sessionId);
+        if (
+          key !== this.erasurePurgeTargetKey(
+            target.requestId,
+            target.buildGeneration,
+            target.sessionId,
+          )
+          || !evaluation
+          || target.buildGeneration > evaluation.buildGeneration
+          || evaluation.tenantId !== target.tenantId
+          || evaluation.subjectKind !== "user"
+          || evaluation.subjectId !== target.userId
+          || !session
+          || session.tenantId !== target.tenantId
+          || session.userId !== target.userId
+          || !tombstone
+          || tombstone.deletionGeneration !== target.deletionGeneration
+          || tombstone.deletedAtMs !== target.deletedAtMs
+        ) throw new Error("purge target owner relation is invalid");
+      }
+      for (const [requestId, decisions] of this.erasurePolicyEvaluationDecisions) {
+        const evaluation = this.erasurePolicyEvaluationJobs.get(requestId);
+        if (
+          !this.erasureRequests.has(requestId)
+          || !evaluation
+          || decisions.some((decision) => (
+            decision.requestId !== requestId
+            || decision.buildGeneration > evaluation.buildGeneration
+          ))
+        ) throw new Error("orphaned purge-policy decision");
+      }
+      for (const [requestId, control] of this.erasurePurgeAuthorityControls) {
+        if (!this.erasureRequests.has(requestId) || control.requestId !== requestId) {
+          throw new Error("orphaned purge-authority control");
+        }
+      }
+      for (const [requestId, authorities] of this.erasurePurgeAuthorities) {
+        const request = this.erasureRequests.get(requestId);
+        const evaluation = this.erasurePolicyEvaluationJobs.get(requestId);
+        if (
+          !request
+          || !evaluation
+          || authorities.some((authority) => (
+            authority.requestId !== requestId
+            || authority.tenantId !== request.tenantId
+            || authority.subjectKind !== request.subjectKind
+            || authority.subjectId !== request.subjectId
+            || authority.subjectGeneration !== request.generation
+            || authority.buildGeneration > evaluation.buildGeneration
+          ))
+        ) throw new Error("orphaned purge authority");
+      }
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantPurgePlanEntryKey(
+    requestId: string,
+    buildGeneration: number,
+    domain: TenantPurgePlanDomain,
+  ): string {
+    return JSON.stringify([requestId, buildGeneration, domain]);
+  }
+
+  private tenantPurgePlanEntriesFor(job: TenantPurgePlanJobRecord): TenantPurgePlanEntry[] {
+    return [...this.tenantPurgePlanEntries.values()]
+      .filter((entry) => (
+        entry.requestId === job.requestId
+        && entry.buildGeneration === job.buildGeneration
+      ))
+      .sort((left, right) => (
+        tenantPurgePlanDomainOrdinal(left.domain) - tenantPurgePlanDomainOrdinal(right.domain)
+      ));
+  }
+
+  /**
+   * Bind T3d only to a complete immutable T1/T3a/T3b/T3c chain. Advancing operations also
+   * require the live deleting lifecycle and re-scan the current session topology against T3c.
+   */
+  private assertTenantPurgePlanSource(
+    job: TenantPurgePlanJobRecord,
+    requireLiveSource: boolean,
+  ): {
+    contentJob: Extract<TenantContentInventoryJobRecord, { phase: "inventory_sealed" }>;
+    contentReceipt: TenantContentInventoryReceipt;
+    credentialReceipt: TenantCredentialRevocationReceipt;
+  } {
+    try {
+      validateTenantPurgePlanJobRecord(job);
+      const contentJob = this.tenantContentInventoryJobs.get(job.requestId);
+      const contentReceipt = this.tenantContentInventoryReceipts.get(job.requestId);
+      if (
+        !contentJob
+        || contentJob.phase !== "inventory_sealed"
+        || !contentReceipt
+        || contentJob.tenantId !== job.tenantId
+        || contentJob.subjectGeneration !== job.subjectGeneration
+        || contentJob.buildGeneration !== job.buildGeneration
+      ) throw new Error("tenant purge plan T3c source is missing");
+      this.assertTenantContentInventorySource(contentJob, requireLiveSource);
+      const sessionReceipts = this.tenantContentInventoryReceiptsFor(contentJob);
+      validateTenantContentInventoryCompletionProof(contentJob, sessionReceipts, contentReceipt);
+      const credentialReceipt = this.tenantCredentialRevocationReceipts.get(job.requestId);
+      if (!credentialReceipt) throw new Error("tenant purge plan T3a receipt is missing");
+      if (
+        job.t1FenceSha256 !== contentJob.t1FenceSha256
+        || job.t3aReceiptSha256 !== contentJob.t3aReceiptSha256
+        || job.t3bReceiptSha256 !== contentJob.t3bReceiptSha256
+        || job.t3cReceiptSha256 !== contentReceipt.receiptSha256
+        || job.policyVersion !== contentJob.policyVersion
+        || job.policySha256 !== contentJob.policySha256
+        || job.policySchemaVersion !== contentJob.policySchemaVersion
+        || job.retentionAnchorDbMs !== contentJob.retentionAnchorDbMs
+        || job.purgeNotBeforeDbMs !== contentJob.contentNotBeforeDbMs
+        || job.sourceEvidenceDbMs !== contentReceipt.storeDbTimestampMs
+        || credentialReceipt.receiptSha256 !== job.t3aReceiptSha256
+      ) throw new Error("tenant purge plan source binding is invalid");
+
+      if (requireLiveSource) {
+        this.assertTenantContentGlobalRelations();
+        const sessions = this.tenantContentSessions(job.tenantId);
+        const state = this.assertTenantContentInventoryBuildState(contentJob, sessions);
+        if (
+          !contentJob.scanComplete
+          || state.receipts.length !== sessions.length
+          || state.contentRecordCount !== contentReceipt.contentRecordCount
+          || state.receipts.length !== contentReceipt.sessionReceiptCount
+        ) throw new TenantPurgePlanEvidenceChangedError();
+      }
+      return { contentJob, contentReceipt, credentialReceipt };
+    } catch (error) {
+      if (error instanceof TenantPurgePlanEvidenceChangedError) throw error;
+      if (error instanceof TenantContentInventoryEvidenceChangedError) {
+        throw new TenantPurgePlanEvidenceChangedError();
+      }
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantPurgePlanHoldProof(tenantId: string): {
+    holdControlCount: number;
+    holdControlRootSha256: string;
+  } {
+    try {
+      return this.tenantContentHoldProof(tenantId);
+    } catch (error) {
+      if (
+        error instanceof TenantContentInventoryNotReadyError
+        && error.reason === "active_legal_hold"
+      ) throw new TenantPurgePlanNotReadyError("active_legal_hold");
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantPurgePlanTargetEvidence(
+    job: TenantPurgePlanJobRecord,
+    domain: TenantPurgePlanDomain,
+    contentReceipt: TenantContentInventoryReceipt,
+    credentialReceipt: TenantCredentialRevocationReceipt,
+    holdProof: { holdControlCount: number; holdControlRootSha256: string },
+  ): {
+    targetCount: number;
+    targetRootSha256: string;
+    disposition: TenantPurgePlanDisposition;
+  } {
+    const tuples: Array<readonly (string | number | boolean | null)[]> = [];
+    let targetCount: number | undefined;
+    let disposition: TenantPurgePlanDisposition;
+    const add = (...tuple: readonly (string | number | boolean | null)[]) => tuples.push(tuple);
+    const tenantSessions = [...this.sessions.values()]
+      .filter((session) => session.tenantId === job.tenantId)
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const tenantRequestIds = new Set(
+      [...this.erasureRequests.values()]
+        .filter((request) => request.tenantId === job.tenantId)
+        .map((request) => request.requestId),
+    );
+    const userRequestIds = new Set(
+      [...this.erasureRequests.values()]
+        .filter((request) => (
+          request.tenantId === job.tenantId && request.subjectKind === "user"
+        ))
+        .map((request) => request.requestId),
+    );
+
+    switch (domain) {
+      case "tenant_registry": {
+        const tenant = this.tenants.get(job.tenantId);
+        if (!tenant) throw new TenantErasureIntegrityError();
+        add(tenant.tenantId);
+        disposition = "retain_evidence";
+        break;
+      }
+      case "tenant_profile": {
+        const tenant = this.tenants.get(job.tenantId);
+        if (!tenant) throw new TenantErasureIntegrityError();
+        add(
+          tenant.tenantId,
+          tenant.name ?? null,
+          tenant.authPolicy !== undefined,
+          tenant.authSecret?.ciphertext !== undefined,
+          tenant.authSecret?.keyId !== undefined,
+        );
+        disposition = "clear";
+        break;
+      }
+      case "agent_definitions":
+        for (const agent of this.agents.values()) {
+          if (agent.tenantId === job.tenantId) add(agent.id, agent.version);
+        }
+        disposition = "delete";
+        break;
+      case "session_content": {
+        const receipts = [...this.tenantSessionContentReceipts.values()]
+          .filter((receipt) => (
+            receipt.requestId === job.requestId
+            && receipt.buildGeneration === job.buildGeneration
+          ));
+        for (const receipt of receipts) add(receipt.sessionId, receipt.receiptSha256);
+        targetCount = contentReceipt.sessionReceiptCount + contentReceipt.contentRecordCount;
+        if (!Number.isSafeInteger(targetCount)) throw new TenantErasureIntegrityError();
+        disposition = "delete";
+        break;
+      }
+      case "idempotency_receipts":
+        for (const [key, value] of this.idem) {
+          let scope: unknown;
+          try {
+            scope = JSON.parse(key);
+          } catch {
+            throw new TenantErasureIntegrityError();
+          }
+          if (!Array.isArray(scope) || scope.length !== 4) {
+            throw new TenantErasureIntegrityError();
+          }
+          if (scope[0] === job.tenantId) {
+            add(
+              String(scope[1]),
+              String(scope[2]),
+              String(scope[3]),
+              value.value === null ? "pending" : "completed",
+            );
+          }
+        }
+        disposition = "delete";
+        break;
+      case "operational_usage":
+        for (const row of this.usageLedger) {
+          if (row.tenantId === job.tenantId) {
+            add(row.usageId ?? null, row.sessionId, row.turnId, row.step);
+          }
+        }
+        disposition = "anonymize";
+        break;
+      case "billing_facts":
+        for (const fact of this.billingUsageFacts.values()) {
+          if (fact.tenantId === job.tenantId) add(fact.usageId, fact.factSha256);
+        }
+        disposition = "retain_anonymized";
+        break;
+      case "billing_reconciliation":
+        for (const record of this.usageReconciliations.values()) {
+          if (record.tenantId === job.tenantId) {
+            add(record.sessionId, record.deletionGeneration, record.status, record.checksum);
+          }
+        }
+        disposition = "retain_anonymized";
+        break;
+      case "blob_manifest":
+        for (const manifest of this.blobManifests.values()) {
+          if (manifest.tenantId === job.tenantId) {
+            add(manifest.blobId, manifest.deletionGeneration, manifest.state);
+          }
+        }
+        disposition = "delete";
+        break;
+      case "blob_bytes":
+        for (const manifest of this.blobManifests.values()) {
+          if (manifest.tenantId === job.tenantId && manifest.state !== "deleted") {
+            add(manifest.blobId, manifest.deletionGeneration, manifest.state);
+          }
+        }
+        disposition = "blocked_adapter_unconfigured";
+        break;
+      case "blob_outbox":
+        for (const outbox of this.blobDeleteOutbox.values()) {
+          const manifest = this.blobManifests.get(outbox.blobId);
+          if (!manifest) throw new TenantErasureIntegrityError();
+          if (manifest.tenantId === job.tenantId) {
+            add(
+              outbox.outboxId,
+              outbox.blobId,
+              outbox.generation,
+              outbox.completedAtMs !== undefined
+                ? "completed"
+                : outbox.deadLetteredAtMs !== undefined ? "dead_letter" : "pending",
+            );
+          }
+        }
+        disposition = "delete";
+        break;
+      case "lifecycle_outbox":
+        for (const outbox of this.lifecycleOutbox.values()) {
+          const session = this.sessions.get(outbox.aggregateId);
+          if (!session) throw new TenantErasureIntegrityError();
+          if (session.tenantId === job.tenantId) {
+            add(
+              outbox.outboxId,
+              outbox.topic,
+              outbox.aggregateId,
+              outbox.generation,
+              outbox.completedAtMs !== undefined
+                ? "completed"
+                : outbox.deadLetteredAtMs !== undefined ? "dead_letter" : "pending",
+            );
+          }
+        }
+        disposition = "delete";
+        break;
+      case "user_export_control":
+        for (const request of this.userDataExportRequests.values()) {
+          if (request.tenantId === job.tenantId) {
+            add("request", request.requestId, request.subjectGeneration, request.status);
+          }
+        }
+        for (const exportJob of this.userDataExportJobs.values()) {
+          const request = this.userDataExportRequests.get(exportJob.requestId);
+          if (!request) throw new TenantErasureIntegrityError();
+          if (request.tenantId === job.tenantId) {
+            add("job", exportJob.requestId, exportJob.buildGeneration, exportJob.status);
+          }
+        }
+        for (const lease of this.userDataExportDownloadLeases.values()) {
+          if (lease.tenantId === job.tenantId) {
+            const artifact = this.userDataExportArtifacts.get(lease.artifactId);
+            if (
+              !artifact
+              || artifact.requestId !== lease.requestId
+              || artifact.tenantId !== lease.tenantId
+              || artifact.userId !== lease.userId
+            ) throw new TenantErasureIntegrityError();
+            const leaseTokenSha256 = createHash("sha256")
+              .update(JSON.stringify([
+                "tenant-purge-plan-download-lease-token-v1",
+                lease.leaseToken,
+              ]))
+              .digest("hex");
+            add(
+              "download",
+              lease.artifactId,
+              lease.requestId,
+              artifact.buildGeneration,
+              artifact.deletionGeneration,
+              leaseTokenSha256,
+              lease.leaseUntilMs,
+              lease.createdAtMs,
+            );
+          }
+        }
+        for (const [key, requestId] of this.userDataExportIdempotency) {
+          let scope: unknown;
+          try {
+            scope = JSON.parse(key);
+          } catch {
+            throw new TenantErasureIntegrityError();
+          }
+          if (!Array.isArray(scope) || scope.length !== 3) {
+            throw new TenantErasureIntegrityError();
+          }
+          if (scope[0] === job.tenantId) add("idempotency", String(scope[1]), String(scope[2]), requestId);
+        }
+        disposition = "delete";
+        break;
+      case "user_export_snapshots":
+        for (const records of this.userDataExportSnapshotRecords.values()) {
+          for (const record of records) {
+            const request = this.userDataExportRequests.get(record.requestId);
+            if (!request) throw new TenantErasureIntegrityError();
+            if (request.tenantId === job.tenantId) {
+              add("record", record.requestId, record.buildGeneration, record.ordinal, record.sha256);
+            }
+          }
+        }
+        for (const blobs of this.userDataExportSnapshotBlobs.values()) {
+          for (const blob of blobs) {
+            const request = this.userDataExportRequests.get(blob.requestId);
+            if (!request) throw new TenantErasureIntegrityError();
+            if (request.tenantId === job.tenantId) {
+              add(
+                "blob",
+                blob.requestId,
+                blob.buildGeneration,
+                blob.ordinal,
+                blob.blobId,
+                blob.releasedAtMs === undefined ? "pinned" : "released",
+              );
+            }
+          }
+        }
+        disposition = "delete";
+        break;
+      case "user_export_artifacts":
+        for (const artifact of this.userDataExportArtifacts.values()) {
+          if (artifact.tenantId === job.tenantId) {
+            add(
+              "artifact",
+              artifact.artifactId,
+              artifact.requestId,
+              artifact.buildGeneration,
+              artifact.deletionGeneration,
+              artifact.state,
+            );
+          }
+        }
+        for (const part of this.userDataExportParts.values()) {
+          const artifact = this.userDataExportArtifacts.get(part.artifactId);
+          if (!artifact) throw new TenantErasureIntegrityError();
+          if (artifact.tenantId === job.tenantId) {
+            add(
+              "part",
+              part.artifactId,
+              part.partNumber,
+              part.deletionGeneration,
+              part.state,
+            );
+          }
+        }
+        for (const outbox of this.userDataExportDeleteOutbox.values()) {
+          const artifact = this.userDataExportArtifacts.get(outbox.artifactId);
+          if (!artifact) throw new TenantErasureIntegrityError();
+          if (artifact.tenantId === job.tenantId) {
+            add(
+              "outbox",
+              outbox.outboxId,
+              outbox.artifactId,
+              outbox.partNumber,
+              outbox.deletionGeneration,
+              outbox.completedAtMs !== undefined
+                ? "completed"
+                : outbox.deadLetteredAtMs !== undefined ? "dead_letter" : "pending",
+            );
+          }
+        }
+        disposition = "delete";
+        break;
+      case "user_export_bytes":
+        for (const part of this.userDataExportParts.values()) {
+          const artifact = this.userDataExportArtifacts.get(part.artifactId);
+          if (!artifact) throw new TenantErasureIntegrityError();
+          if (artifact.tenantId === job.tenantId && part.state !== "deleted") {
+            add(part.artifactId, part.partNumber, part.deletionGeneration, part.state);
+          }
+        }
+        disposition = "blocked_adapter_unconfigured";
+        break;
+      case "user_erasure_evidence":
+        for (const lifecycle of this.subjectLifecycles.values()) {
+          if (lifecycle.tenantId === job.tenantId && lifecycle.subjectKind === "user") {
+            add("lifecycle", lifecycle.subjectId, lifecycle.generation, lifecycle.state);
+          }
+        }
+        for (const request of this.erasureRequests.values()) {
+          if (request.tenantId === job.tenantId && request.subjectKind === "user") {
+            add("request", request.requestId, request.subjectId, request.generation, request.status);
+          }
+        }
+        for (const [requestId, events] of this.erasureAuditEvents) {
+          if (!userRequestIds.has(requestId)) continue;
+          for (const event of events) add("audit", requestId, event.seq, event.type);
+        }
+        for (const [requestId, events] of this.erasureJobControlEvents) {
+          if (!userRequestIds.has(requestId)) continue;
+          for (const event of events) {
+            add("control", requestId, event.controlEventId, event.controlGeneration, event.eventType);
+          }
+        }
+        for (const incident of this.erasureJobTerminalIncidents.values()) {
+          if (userRequestIds.has(incident.requestId)) {
+            add("incident", incident.terminalIncidentId, incident.requestId, incident.evidenceSha256);
+          }
+        }
+        for (const compensation of this.legacyTombstoneCompensationJobs.values()) {
+          if (compensation.tenantId === job.tenantId) {
+            add(
+              "legacy_job",
+              compensation.jobId,
+              compensation.sessionId,
+              compensation.cutoverGeneration,
+              compensation.sourceKind,
+              compensation.status,
+            );
+          }
+        }
+        for (const [jobId, audits] of this.legacyTombstoneCompensationAudits) {
+          const compensation = this.legacyTombstoneCompensationJobs.get(jobId);
+          if (!compensation || compensation.tenantId !== job.tenantId) continue;
+          for (const audit of audits) add("legacy_audit", jobId, audit.auditId, audit.type);
+        }
+        for (const [key, requestId] of this.erasureIdempotency) {
+          let scope: unknown;
+          try {
+            scope = JSON.parse(key);
+          } catch {
+            throw new TenantErasureIntegrityError();
+          }
+          if (Array.isArray(scope) && scope[0] === job.tenantId && scope[1] === "user") {
+            add("idempotency", String(scope[2]), String(scope[3]), requestId);
+          }
+        }
+        disposition = "retain_evidence";
+        break;
+      case "user_purge_policy_evidence":
+        for (const evaluation of this.erasurePolicyEvaluationJobs.values()) {
+          if (evaluation.tenantId === job.tenantId) {
+            add("job", evaluation.requestId, evaluation.buildGeneration, evaluation.targetRootSha256);
+          }
+        }
+        for (const target of this.erasurePurgeTargets.values()) {
+          if (target.tenantId === job.tenantId) {
+            add("target", target.requestId, target.buildGeneration, target.sessionId, target.evidenceSha256);
+          }
+        }
+        for (const [requestId, decisions] of this.erasurePolicyEvaluationDecisions) {
+          if (!tenantRequestIds.has(requestId)) continue;
+          for (const decision of decisions) add("decision", requestId, decision.decisionSeq, decision.afterSha256);
+        }
+        for (const control of this.erasurePurgeAuthorityControls.values()) {
+          if (tenantRequestIds.has(control.requestId)) {
+            add("control", control.requestId, control.authorityGeneration, control.activeAuthoritySha256 ?? null);
+          }
+        }
+        for (const authorities of this.erasurePurgeAuthorities.values()) {
+          for (const authority of authorities) {
+            if (authority.tenantId === job.tenantId) {
+              add("authority", authority.requestId, authority.authorityGeneration, authority.authoritySha256);
+            }
+          }
+        }
+        disposition = "retain_evidence";
+        break;
+      case "governance_policy":
+        for (const policy of this.retentionPolicies.values()) {
+          if (policy.tenantId === job.tenantId) {
+            add("version", policy.policyVersion, policy.policySha256, policy.schemaVersion);
+          }
+        }
+        for (const control of this.retentionPolicyControls.values()) {
+          if (control.tenantId === job.tenantId) {
+            add("control", control.controlGeneration, control.activePolicySha256 ?? null);
+          }
+        }
+        for (const events of this.retentionPolicyActivationEvents.values()) {
+          for (const event of events) {
+            if (event.tenantId === job.tenantId) {
+              add("activation", event.eventId, event.controlGeneration, event.afterSha256);
+            }
+          }
+        }
+        disposition = "retain_evidence";
+        break;
+      case "legal_holds":
+        add("projection", holdProof.holdControlCount, holdProof.holdControlRootSha256);
+        targetCount = holdProof.holdControlCount;
+        disposition = "retain_evidence";
+        break;
+      case "tenant_t1_evidence": {
+        const admission = this.tenantErasureAdmissions.get(job.requestId);
+        const lifecycle = this.subjectLifecycles.get(subjectLifecycleKey(
+          job.tenantId,
+          "tenant",
+          job.tenantId,
+        ));
+        const fence = this.tenantCredentialRevocationFences.get(job.tenantId);
+        const audits = this.erasureAuditEvents.get(job.requestId) ?? [];
+        if (!admission || !lifecycle || !fence || audits.length === 0) {
+          throw new TenantErasureIntegrityError();
+        }
+        add("admission", admission.requestId, admission.generation, admission.status);
+        add("lifecycle", lifecycle.subjectId, lifecycle.generation, lifecycle.state);
+        add("fence", fence.tenantId, fence.subjectGeneration, fence.evidenceSha256);
+        for (const audit of audits) add("audit", audit.requestId, audit.seq, audit.type);
+        disposition = "retain_evidence";
+        break;
+      }
+      case "tenant_t3a_evidence": {
+        const sourceJob = this.tenantCredentialRevocationJobs.get(job.requestId);
+        const receipt = this.tenantCredentialRevocationReceipts.get(job.requestId);
+        if (!sourceJob || !receipt) throw new TenantErasureIntegrityError();
+        add("job", sourceJob.requestId, sourceJob.attempts, sourceJob.phase);
+        add("receipt", receipt.requestId, receipt.receiptSha256);
+        disposition = "retain_evidence";
+        break;
+      }
+      case "tenant_t3b_evidence": {
+        const sourceJob = this.tenantRuntimeRevocationJobs.get(job.requestId);
+        const receipt = this.tenantRuntimeRevocationReceipts.get(job.requestId);
+        if (!sourceJob || !receipt) throw new TenantErasureIntegrityError();
+        add("job", sourceJob.requestId, sourceJob.attempts, sourceJob.phase);
+        for (const target of this.tenantRuntimeRevocationTargetReceipts.values()) {
+          if (target.requestId === job.requestId) {
+            add("target", target.targetSha256, target.evidenceSha256);
+          }
+        }
+        add("receipt", receipt.requestId, receipt.receiptSha256);
+        disposition = "retain_evidence";
+        break;
+      }
+      case "tenant_t3c_evidence": {
+        const sourceJob = this.tenantContentInventoryJobs.get(job.requestId);
+        if (!sourceJob) throw new TenantErasureIntegrityError();
+        add("job", sourceJob.requestId, sourceJob.buildGeneration, sourceJob.phase);
+        for (const receipt of this.tenantContentInventoryReceiptsFor(sourceJob)) {
+          add("session", receipt.sessionId, receipt.receiptSha256);
+        }
+        add("receipt", contentReceipt.requestId, contentReceipt.receiptSha256);
+        disposition = "retain_evidence";
+        break;
+      }
+      case "redis_leases":
+      case "redis_fences":
+      case "redis_streams":
+        for (const session of tenantSessions) add(session.id);
+        disposition = "blocked_adapter_unconfigured";
+        break;
+      case "external_provider":
+        targetCount = credentialReceipt.providerConfigCountBefore;
+        if (targetCount > 0) {
+          add(credentialReceipt.receiptSha256, targetCount);
+          disposition = "blocked_legacy_external_source_unavailable";
+        } else {
+          disposition = "not_applicable";
+        }
+        break;
+      case "kms":
+        targetCount = credentialReceipt.providerConfigCountBefore
+          + (credentialReceipt.authSecretCipherPresentBefore
+            || credentialReceipt.authSecretKeyIdPresentBefore ? 1 : 0);
+        if (targetCount > 0) {
+          add(
+            credentialReceipt.receiptSha256,
+            credentialReceipt.providerConfigCountBefore,
+            credentialReceipt.authSecretCipherPresentBefore,
+            credentialReceipt.authSecretKeyIdPresentBefore,
+          );
+          disposition = "blocked_legacy_external_source_unavailable";
+        } else {
+          disposition = "not_applicable";
+        }
+        break;
+      case "backup_ledger":
+        disposition = "blocked_adapter_unconfigured";
+        break;
+      case "restore_ledger":
+        disposition = "blocked_restore_replay_unproven";
+        break;
+      case "logs":
+      case "traces":
+        disposition = "blocked_adapter_unconfigured";
+        break;
+      default: {
+        const exhaustive: never = domain;
+        throw new Error(`unhandled tenant purge plan domain: ${String(exhaustive)}`);
+      }
+    }
+
+    const targetHashes = tuples.map((tuple) => tenantPurgePlanTargetSha256(domain, tuple));
+    const count = targetCount ?? targetHashes.length;
+    if (!Number.isSafeInteger(count) || count < 0) throw new TenantErasureIntegrityError();
+    return {
+      targetCount: count,
+      targetRootSha256: tenantPurgePlanTargetRootSha256(domain, targetHashes),
+      disposition,
+    };
+  }
+
+  private memoryTenantPurgePlanEntry(
+    job: TenantPurgePlanJobRecord,
+    domain: TenantPurgePlanDomain,
+    capturedAtDbMs: number,
+    source: ReturnType<MemorySessionStore["assertTenantPurgePlanSource"]>,
+    holdProof: { holdControlCount: number; holdControlRootSha256: string },
+  ): TenantPurgePlanEntry {
+    const target = this.tenantPurgePlanTargetEvidence(
+      job,
+      domain,
+      source.contentReceipt,
+      source.credentialReceipt,
+      holdProof,
+    );
+    const body = {
+      scope: TENANT_PURGE_PLAN_ENTRY_SCOPE,
+      requestId: job.requestId,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      buildGeneration: job.buildGeneration,
+      domain,
+      ...target,
+      sourceSha256: tenantPurgePlanDomainSourceSha256(job, domain),
+      capturedAtDbMs,
+    };
+    const entry = clone<TenantPurgePlanEntry>({
+      ...body,
+      receiptSha256: tenantPurgePlanEntrySha256(body),
+    });
+    validateTenantPurgePlanEntry(entry);
+    return entry;
+  }
+
+  private assertTenantPurgePlanBuildState(
+    job: TenantPurgePlanJobRecord,
+    source: ReturnType<MemorySessionStore["assertTenantPurgePlanSource"]>,
+    holdProof: { holdControlCount: number; holdControlRootSha256: string },
+  ): TenantPurgePlanEntry[] {
+    const entries = this.tenantPurgePlanEntriesFor(job);
+    if (
+      entries.length !== job.planEntryCount
+      || entries.length > TENANT_PURGE_PLAN_DOMAINS.length
+      || tenantPurgePlanEntryRootSha256(entries) !== job.planEntryRootSha256
+      || tenantPurgePlanBlockerRootSha256(entries) !== job.blockerRootSha256
+      || entries.filter((entry) => isTenantPurgePlanBlockingDisposition(entry.disposition)).length
+        !== job.blockerCount
+      || entries.some((entry, index) => (
+        entry.domain !== TENANT_PURGE_PLAN_DOMAINS[index]
+        || entry.receiptSha256 !== this.memoryTenantPurgePlanEntry(
+          job,
+          entry.domain,
+          entry.capturedAtDbMs,
+          source,
+          holdProof,
+        ).receiptSha256
+      ))
+      || (entries.length === 0
+        ? job.cursorDomain !== undefined
+        : job.cursorDomain !== entries.at(-1)!.domain)
+      || (job.scanComplete && entries.length !== TENANT_PURGE_PLAN_DOMAINS.length)
+    ) throw new TenantPurgePlanEvidenceChangedError();
+    return entries;
+  }
+
+  private blockedTenantPurgePlanJob(
+    current: TenantPurgePlanJobRecord,
+    blockedAtDbMs: number,
+    attempts: number = current.attempts,
+  ): TenantPurgePlanJobRecord {
+    const terminalAtDbMs = Math.max(current.createdAtMs, current.updatedAtMs, blockedAtDbMs);
+    const blocked = clone<TenantPurgePlanJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      buildGeneration: current.buildGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      t3bReceiptSha256: current.t3bReceiptSha256,
+      t3cReceiptSha256: current.t3cReceiptSha256,
+      policyVersion: current.policyVersion,
+      policySha256: current.policySha256,
+      policySchemaVersion: current.policySchemaVersion,
+      retentionAnchorDbMs: current.retentionAnchorDbMs,
+      purgeNotBeforeDbMs: current.purgeNotBeforeDbMs,
+      sourceEvidenceDbMs: current.sourceEvidenceDbMs,
+      phase: "blocked",
+      ...(current.cursorDomain === undefined ? {} : { cursorDomain: current.cursorDomain }),
+      scanComplete: current.scanComplete,
+      planEntryCount: current.planEntryCount,
+      planEntryRootSha256: current.planEntryRootSha256,
+      blockerCount: current.blockerCount,
+      blockerRootSha256: current.blockerRootSha256,
+      attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: terminalAtDbMs,
+      blockedAtDbMs: terminalAtDbMs,
+      blockedReasonCode: "integrity_conflict",
+    });
+    validateTenantPurgePlanJobRecord(blocked);
+    return blocked;
+  }
+
+  async materializeTenantPurgePlanJobs(
+    options: MaterializeTenantPurgePlanJobsOptions,
+  ): Promise<number> {
+    const stagedOptions = clone(options);
+    validateMaterializeTenantPurgePlanJobsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const candidates = [...this.tenantContentInventoryJobs.values()]
+      .filter((content) => (
+        content.phase === "inventory_sealed"
+        && !this.tenantPurgePlanJobs.has(content.requestId)
+      ))
+      .sort((left, right) => left.requestId.localeCompare(right.requestId));
+    const staged: TenantPurgePlanJobRecord[] = [];
+    let sourceIntegrityConflict = false;
+    let firstNotReady: TenantPurgePlanNotReadyError | undefined;
+    for (const content of candidates) {
+      if (staged.length >= stagedOptions.limit) break;
+      try {
+        const receipt = this.tenantContentInventoryReceipts.get(content.requestId);
+        if (!receipt) throw new TenantErasureIntegrityError();
+        if (nowMs < receipt.storeDbTimestampMs) {
+          throw new TenantPurgePlanNotReadyError("trusted_clock_before_source");
+        }
+        const job = clone<TenantPurgePlanJobRecord>({
+          requestId: content.requestId,
+          tenantId: content.tenantId,
+          subjectGeneration: content.subjectGeneration,
+          buildGeneration: content.buildGeneration,
+          t1FenceSha256: content.t1FenceSha256,
+          t3aReceiptSha256: content.t3aReceiptSha256,
+          t3bReceiptSha256: content.t3bReceiptSha256,
+          t3cReceiptSha256: receipt.receiptSha256,
+          policyVersion: content.policyVersion,
+          policySha256: content.policySha256,
+          policySchemaVersion: content.policySchemaVersion,
+          retentionAnchorDbMs: content.retentionAnchorDbMs,
+          purgeNotBeforeDbMs: content.contentNotBeforeDbMs,
+          sourceEvidenceDbMs: receipt.storeDbTimestampMs,
+          phase: "queued",
+          scanComplete: false,
+          planEntryCount: 0,
+          planEntryRootSha256: EMPTY_TENANT_PURGE_PLAN_ENTRY_ROOT_SHA256,
+          blockerCount: 0,
+          blockerRootSha256: EMPTY_TENANT_PURGE_PLAN_BLOCKER_ROOT_SHA256,
+          availableAtMs: nowMs,
+          attempts: 0,
+          createdAtMs: nowMs,
+          updatedAtMs: nowMs,
+        });
+        this.assertTenantPurgePlanSource(job, true);
+        if (
+          this.tenantPurgePlanReceipts.has(job.requestId)
+          || [...this.tenantPurgePlanJobs.values()].some(
+            (existing) => existing.tenantId === job.tenantId,
+          )
+          || staged.some((existing) => existing.tenantId === job.tenantId)
+          || [...this.tenantPurgePlanEntries.values()].some((entry) => (
+            entry.requestId === job.requestId || entry.tenantId === job.tenantId
+          ))
+          || [...this.tenantPurgePlanReceipts.values()].some(
+            (existing) => existing.tenantId === job.tenantId,
+          )
+        ) throw new TenantErasureIntegrityError();
+        staged.push(job);
+      } catch (error) {
+        if (error instanceof TenantPurgePlanNotReadyError) {
+          firstNotReady ??= error;
+          continue;
+        }
+        sourceIntegrityConflict = true;
+      }
+    }
+    const prior = new Map(this.tenantPurgePlanJobs);
+    try {
+      for (const job of staged) this.tenantPurgePlanJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantPurgePlanJobs, prior);
+      throw error;
+    }
+    if (sourceIntegrityConflict) throw new TenantErasureIntegrityError();
+    if (firstNotReady) throw firstNotReady;
+    return staged.length;
+  }
+
+  async claimTenantPurgePlans(
+    options: ClaimTenantPurgePlansOptions,
+  ): Promise<TenantPurgePlanClaim[]> {
+    const stagedOptions = clone(options);
+    validateClaimTenantPurgePlansOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
+      ? Number.MAX_SAFE_INTEGER
+      : nowMs + stagedOptions.leaseMs;
+    if (leaseUntilMs <= nowMs) return [];
+    const candidates = [...this.tenantPurgePlanJobs.values()]
+      .filter((job): job is Extract<TenantPurgePlanJobRecord, { phase: "queued" }> => (
+        job.phase === "queued"
+        && job.availableAtMs <= nowMs
+        && (job.claimToken === undefined || job.leaseUntilMs! <= nowMs)
+      ))
+      .sort((left, right) => (
+        left.availableAtMs - right.availableAtMs
+        || left.requestId.localeCompare(right.requestId)
+      ))
+      .slice(0, stagedOptions.limit);
+    const staged: TenantPurgePlanJobRecord[] = [];
+    const claims: TenantPurgePlanJobRecord[] = [];
+    for (const current of candidates) {
+      const attempts = current.attempts + 1;
+      if (!Number.isSafeInteger(attempts) || attempts > 0xffff_ffff) {
+        throw new TenantErasureIntegrityError();
+      }
+      try {
+        this.assertTenantPurgePlanSource(current, true);
+      } catch (error) {
+        if (error instanceof TenantPurgePlanNotReadyError) continue;
+        if (
+          !(error instanceof TenantErasureIntegrityError)
+          && !(error instanceof TenantPurgePlanEvidenceChangedError)
+        ) throw error;
+        staged.push(this.blockedTenantPurgePlanJob(current, nowMs, attempts));
+        continue;
+      }
+      const next = clone<TenantPurgePlanJobRecord>({
+        ...current,
+        attempts,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+        lastErrorCode: undefined,
+        updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      });
+      delete next.lastErrorCode;
+      validateTenantPurgePlanJobRecord(next);
+      staged.push(next);
+      claims.push(next);
+    }
+    const prior = new Map(this.tenantPurgePlanJobs);
+    try {
+      for (const job of staged) this.tenantPurgePlanJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantPurgePlanJobs, prior);
+      throw error;
+    }
+    return claims.map((job) => clone(tenantPurgePlanClaimFromJob(job)));
+  }
+
+  async renewTenantPurgePlan(
+    authorization: TenantPurgePlanAuthorization,
+    options: RenewTenantPurgePlanOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantPurgePlanAuthorization(stagedAuthorization);
+    validateRenewTenantPurgePlanOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const requestedLeaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
+      ? Number.MAX_SAFE_INTEGER
+      : nowMs + stagedOptions.leaseMs;
+    if (requestedLeaseUntilMs <= nowMs) return false;
+    const current = this.tenantPurgePlanJobs.get(stagedAuthorization.requestId);
+    if (!current || current.phase !== "queued" || !tenantPurgePlanAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    this.assertTenantPurgePlanSource(current, true);
+    const next = clone<TenantPurgePlanJobRecord>({
+      ...current,
+      leaseUntilMs: Math.max(current.leaseUntilMs!, requestedLeaseUntilMs),
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantPurgePlanJobRecord(next);
+    try {
+      this.tenantPurgePlanJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantPurgePlanJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async retryTenantPurgePlan(
+    authorization: TenantPurgePlanAuthorization,
+    options: RetryTenantPurgePlanOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantPurgePlanAuthorization(stagedAuthorization);
+    validateRetryTenantPurgePlanOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantPurgePlanJobs.get(stagedAuthorization.requestId);
+    if (!current || current.phase !== "queued" || !tenantPurgePlanAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    this.assertTenantPurgePlanSource(current, true);
+    const availableBaseMs = Math.max(
+      nowMs,
+      current.createdAtMs,
+      current.updatedAtMs,
+      current.availableAtMs,
+    );
+    const availableAtMs = stagedOptions.delayMs > Number.MAX_SAFE_INTEGER - availableBaseMs
+      ? Number.MAX_SAFE_INTEGER
+      : availableBaseMs + stagedOptions.delayMs;
+    const next = clone<TenantPurgePlanJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      buildGeneration: current.buildGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      t3bReceiptSha256: current.t3bReceiptSha256,
+      t3cReceiptSha256: current.t3cReceiptSha256,
+      policyVersion: current.policyVersion,
+      policySha256: current.policySha256,
+      policySchemaVersion: current.policySchemaVersion,
+      retentionAnchorDbMs: current.retentionAnchorDbMs,
+      purgeNotBeforeDbMs: current.purgeNotBeforeDbMs,
+      sourceEvidenceDbMs: current.sourceEvidenceDbMs,
+      phase: "queued",
+      ...(current.cursorDomain === undefined ? {} : { cursorDomain: current.cursorDomain }),
+      scanComplete: current.scanComplete,
+      planEntryCount: current.planEntryCount,
+      planEntryRootSha256: current.planEntryRootSha256,
+      blockerCount: current.blockerCount,
+      blockerRootSha256: current.blockerRootSha256,
+      availableAtMs,
+      attempts: current.attempts,
+      lastErrorCode: stagedOptions.errorCode,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantPurgePlanJobRecord(next);
+    try {
+      this.tenantPurgePlanJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantPurgePlanJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async blockTenantPurgePlan(
+    authorization: TenantPurgePlanAuthorization,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantPurgePlanAuthorization(stagedAuthorization);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantPurgePlanJobs.get(stagedAuthorization.requestId);
+    if (!current || !tenantPurgePlanAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    const next = this.blockedTenantPurgePlanJob(current, nowMs);
+    try {
+      this.tenantPurgePlanJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantPurgePlanJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  /** @deprecated Diagnostic/compatibility only; production workers must call atomic seal. */
+  async buildTenantPurgePlanPage(
+    authorization: TenantPurgePlanAuthorization,
+    options: BuildTenantPurgePlanPageOptions,
+  ): Promise<BuildTenantPurgePlanPageResult> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantPurgePlanAuthorization(stagedAuthorization);
+    validateBuildTenantPurgePlanPageOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantPurgePlanJobs.get(stagedAuthorization.requestId);
+    if (!current || !tenantPurgePlanAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) throw new TenantErasureIntegrityError();
+    if (nowMs < current.retentionAnchorDbMs) {
+      throw new TenantPurgePlanNotReadyError("trusted_clock_before_anchor");
+    }
+    if (nowMs < current.purgeNotBeforeDbMs) {
+      throw new TenantPurgePlanNotReadyError("deadline_not_reached");
+    }
+    if (nowMs < current.sourceEvidenceDbMs) {
+      throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+    }
+    const source = this.assertTenantPurgePlanSource(current, true);
+    this.assertTenantPurgePlanGlobalRelations();
+    const holdProof = this.tenantPurgePlanHoldProof(current.tenantId);
+    const existing = this.assertTenantPurgePlanBuildState(current, source, holdProof);
+    if (current.scanComplete) {
+      return clone({
+        built: 0,
+        done: true,
+        ...(current.cursorDomain === undefined ? {} : { cursorDomain: current.cursorDomain }),
+        planEntryCount: current.planEntryCount,
+        planEntryRootSha256: current.planEntryRootSha256,
+        blockerCount: current.blockerCount,
+        blockerRootSha256: current.blockerRootSha256,
+      });
+    }
+
+    const domains = TENANT_PURGE_PLAN_DOMAINS.slice(
+      existing.length,
+      existing.length + stagedOptions.limit,
+    );
+    const stagedEntries = domains.map((domain) => this.memoryTenantPurgePlanEntry(
+      current,
+      domain,
+      nowMs,
+      source,
+      holdProof,
+    ));
+    let planEntryRootSha256 = current.planEntryRootSha256;
+    let blockerRootSha256 = current.blockerRootSha256;
+    let blockerCount = current.blockerCount;
+    for (const entry of stagedEntries) {
+      const key = this.tenantPurgePlanEntryKey(
+        entry.requestId,
+        entry.buildGeneration,
+        entry.domain,
+      );
+      if (this.tenantPurgePlanEntries.has(key)) throw new TenantErasureIntegrityError();
+      planEntryRootSha256 = tenantPurgePlanNextEntryRootSha256(
+        planEntryRootSha256,
+        entry.domain,
+        entry.receiptSha256,
+      );
+      if (isTenantPurgePlanBlockingDisposition(entry.disposition)) {
+        blockerRootSha256 = tenantPurgePlanNextBlockerRootSha256(
+          blockerRootSha256,
+          entry.domain,
+          entry.disposition,
+          entry.receiptSha256,
+        );
+        blockerCount += 1;
+      }
+    }
+    const planEntryCount = current.planEntryCount + stagedEntries.length;
+    const done = planEntryCount === TENANT_PURGE_PLAN_DOMAINS.length;
+    const cursorDomain = stagedEntries.at(-1)?.domain ?? current.cursorDomain;
+    const next = clone<TenantPurgePlanJobRecord>({
+      ...current,
+      ...(cursorDomain === undefined ? {} : { cursorDomain }),
+      scanComplete: done,
+      planEntryCount,
+      planEntryRootSha256,
+      blockerCount,
+      blockerRootSha256,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantPurgePlanJobRecord(next);
+    const jobsBefore = new Map(this.tenantPurgePlanJobs);
+    const entriesBefore = new Map(this.tenantPurgePlanEntries);
+    try {
+      for (const entry of stagedEntries) {
+        this.tenantPurgePlanEntries.set(
+          this.tenantPurgePlanEntryKey(entry.requestId, entry.buildGeneration, entry.domain),
+          entry,
+        );
+      }
+      this.tenantPurgePlanJobs.set(current.requestId, next);
+      const publishNowMs = this.storeNowMs();
+      if (!tenantPurgePlanAuthorizationMatches(next, stagedAuthorization, publishNowMs)) {
+        throw new Error("tenant purge plan lease expired while publishing a page");
+      }
+      if (publishNowMs < current.sourceEvidenceDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+      }
+    } catch (error) {
+      restoreMapSnapshot(this.tenantPurgePlanJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantPurgePlanEntries, entriesBefore);
+      throw error;
+    }
+    return clone({
+      built: stagedEntries.length,
+      done,
+      ...(cursorDomain === undefined ? {} : { cursorDomain }),
+      planEntryCount,
+      planEntryRootSha256,
+      blockerCount,
+      blockerRootSha256,
+    });
+  }
+
+  async sealTenantPurgePlan(
+    authorization: TenantPurgePlanAuthorization,
+  ): Promise<TenantPurgePlanReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantPurgePlanAuthorization(stagedAuthorization);
+    const current = this.tenantPurgePlanJobs.get(stagedAuthorization.requestId);
+    if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    validateTenantPurgePlanJobRecord(current);
+    const existingEntries = this.tenantPurgePlanEntriesFor(current);
+    if (current.phase === "plan_sealed") {
+      this.assertTenantPurgePlanSource(current, false);
+      const receipt = this.tenantPurgePlanReceipts.get(current.requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantPurgePlanCompletionProof(current, existingEntries, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!tenantPurgePlanReceiptMatchesAuthorization(receipt, stagedAuthorization)) return null;
+      return clone(receipt);
+    }
+    if (current.phase === "blocked") {
+      this.assertTenantPurgePlanSource(current, true);
+      return null;
+    }
+
+    const initialNowMs = this.storeNowMs();
+    if (!tenantPurgePlanAuthorizationMatches(current, stagedAuthorization, initialNowMs)) {
+      return null;
+    }
+    if (initialNowMs < current.retentionAnchorDbMs) {
+      throw new TenantPurgePlanNotReadyError("trusted_clock_before_anchor");
+    }
+    if (initialNowMs < current.purgeNotBeforeDbMs) {
+      throw new TenantPurgePlanNotReadyError("deadline_not_reached");
+    }
+    if (initialNowMs < current.sourceEvidenceDbMs) {
+      throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+    }
+    const source = this.assertTenantPurgePlanSource(current, true);
+    this.assertTenantPurgePlanGlobalRelations();
+    const holdProof = this.tenantPurgePlanHoldProof(current.tenantId);
+    let entries = this.assertTenantPurgePlanBuildState(current, source, holdProof);
+    let working: TenantPurgePlanJobRecord = current;
+    const stagedEntries: TenantPurgePlanEntry[] = [];
+    if (!current.scanComplete) {
+      // The production path never exposes a multi-transaction partial snapshot. An untouched
+      // queued plan is built and sealed below in one in-memory atomic boundary. Historical or
+      // diagnostic partial builds remain readable/resumable through buildTenantPurgePlanPage,
+      // but seal refuses to reinterpret them against a newer live snapshot.
+      if (entries.length !== 0) throw new TenantPurgePlanEvidenceChangedError();
+      let planEntryRootSha256 = current.planEntryRootSha256;
+      let blockerRootSha256 = current.blockerRootSha256;
+      let blockerCount = current.blockerCount;
+      for (const domain of TENANT_PURGE_PLAN_DOMAINS) {
+        const entry = this.memoryTenantPurgePlanEntry(
+          current,
+          domain,
+          initialNowMs,
+          source,
+          holdProof,
+        );
+        stagedEntries.push(entry);
+        planEntryRootSha256 = tenantPurgePlanNextEntryRootSha256(
+          planEntryRootSha256,
+          entry.domain,
+          entry.receiptSha256,
+        );
+        if (isTenantPurgePlanBlockingDisposition(entry.disposition)) {
+          blockerRootSha256 = tenantPurgePlanNextBlockerRootSha256(
+            blockerRootSha256,
+            entry.domain,
+            entry.disposition,
+            entry.receiptSha256,
+          );
+          blockerCount += 1;
+        }
+      }
+      const cursorDomain = stagedEntries.at(-1)?.domain;
+      if (!cursorDomain || stagedEntries.length !== TENANT_PURGE_PLAN_DOMAINS.length) {
+        throw new TenantErasureIntegrityError();
+      }
+      working = clone<TenantPurgePlanJobRecord>({
+        ...current,
+        cursorDomain,
+        scanComplete: true,
+        planEntryCount: stagedEntries.length,
+        planEntryRootSha256,
+        blockerCount,
+        blockerRootSha256,
+        updatedAtMs: Math.max(current.updatedAtMs, initialNowMs),
+      });
+      validateTenantPurgePlanJobRecord(working);
+      entries = stagedEntries;
+    }
+    if (!working.scanComplete || entries.length !== TENANT_PURGE_PLAN_DOMAINS.length) {
+      throw new TenantPurgePlanEvidenceChangedError();
+    }
+
+    const sealNowMs = this.storeNowMs();
+    if (!tenantPurgePlanAuthorizationMatches(working, stagedAuthorization, sealNowMs)) return null;
+    if (sealNowMs < working.retentionAnchorDbMs) {
+      throw new TenantPurgePlanNotReadyError("trusted_clock_before_anchor");
+    }
+    if (sealNowMs < working.purgeNotBeforeDbMs) {
+      throw new TenantPurgePlanNotReadyError("deadline_not_reached");
+    }
+    const latestCapturedAtDbMs = entries.reduce(
+      (latest, entry) => Math.max(latest, entry.capturedAtDbMs),
+      working.sourceEvidenceDbMs,
+    );
+    if (sealNowMs < latestCapturedAtDbMs) {
+      throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+    }
+    this.assertTenantPurgePlanSource(working, true);
+    this.assertTenantPurgePlanGlobalRelations();
+    this.tenantPurgePlanHoldProof(working.tenantId);
+
+    const receiptBody = {
+      scope: TENANT_PURGE_PLAN_RECEIPT_SCOPE,
+      requestId: working.requestId,
+      tenantId: working.tenantId,
+      subjectGeneration: working.subjectGeneration,
+      buildGeneration: working.buildGeneration,
+      t1FenceSha256: working.t1FenceSha256,
+      t3aReceiptSha256: working.t3aReceiptSha256,
+      t3bReceiptSha256: working.t3bReceiptSha256,
+      t3cReceiptSha256: working.t3cReceiptSha256,
+      policyVersion: working.policyVersion,
+      policySha256: working.policySha256,
+      policySchemaVersion: working.policySchemaVersion,
+      retentionAnchorDbMs: working.retentionAnchorDbMs,
+      purgeNotBeforeDbMs: working.purgeNotBeforeDbMs,
+      sourceEvidenceDbMs: working.sourceEvidenceDbMs,
+      planEntryCount: working.planEntryCount,
+      planEntryRootSha256: working.planEntryRootSha256,
+      blockerCount: working.blockerCount,
+      blockerRootSha256: working.blockerRootSha256,
+      storeDbTimestampMs: sealNowMs,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: tenantPurgePlanClaimTokenSha256(
+        stagedAuthorization.claimToken,
+      ),
+      planComplete: true as const,
+      executionReady: false as const,
+      contentPurgeExecuted: false as const,
+    };
+    const receipt = clone<TenantPurgePlanReceipt>({
+      ...receiptBody,
+      receiptSha256: tenantPurgePlanReceiptSha256(receiptBody),
+    });
+    const jobsBefore = new Map(this.tenantPurgePlanJobs);
+    const entriesBefore = new Map(this.tenantPurgePlanEntries);
+    const receiptsBefore = new Map(this.tenantPurgePlanReceipts);
+    try {
+      if (this.tenantPurgePlanReceipts.has(working.requestId)) {
+        throw new TenantErasureIntegrityError();
+      }
+      for (const entry of stagedEntries) {
+        const key = this.tenantPurgePlanEntryKey(
+          entry.requestId,
+          entry.buildGeneration,
+          entry.domain,
+        );
+        if (this.tenantPurgePlanEntries.has(key)) throw new TenantErasureIntegrityError();
+        this.tenantPurgePlanEntries.set(key, entry);
+      }
+      this.tenantPurgePlanReceipts.set(working.requestId, receipt);
+      const publishNowMs = this.storeNowMs();
+      if (!tenantPurgePlanAuthorizationMatches(working, stagedAuthorization, publishNowMs)) {
+        restoreMapSnapshot(this.tenantPurgePlanJobs, jobsBefore);
+        restoreMapSnapshot(this.tenantPurgePlanEntries, entriesBefore);
+        restoreMapSnapshot(this.tenantPurgePlanReceipts, receiptsBefore);
+        return null;
+      }
+      if (publishNowMs < latestCapturedAtDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+      }
+      const next = clone<TenantPurgePlanJobRecord>({
+        requestId: working.requestId,
+        tenantId: working.tenantId,
+        subjectGeneration: working.subjectGeneration,
+        buildGeneration: working.buildGeneration,
+        t1FenceSha256: working.t1FenceSha256,
+        t3aReceiptSha256: working.t3aReceiptSha256,
+        t3bReceiptSha256: working.t3bReceiptSha256,
+        t3cReceiptSha256: working.t3cReceiptSha256,
+        policyVersion: working.policyVersion,
+        policySha256: working.policySha256,
+        policySchemaVersion: working.policySchemaVersion,
+        retentionAnchorDbMs: working.retentionAnchorDbMs,
+        purgeNotBeforeDbMs: working.purgeNotBeforeDbMs,
+        sourceEvidenceDbMs: working.sourceEvidenceDbMs,
+        phase: "plan_sealed",
+        cursorDomain: working.cursorDomain!,
+        scanComplete: true,
+        planEntryCount: working.planEntryCount,
+        planEntryRootSha256: working.planEntryRootSha256,
+        blockerCount: working.blockerCount,
+        blockerRootSha256: working.blockerRootSha256,
+        attempts: working.attempts,
+        createdAtMs: working.createdAtMs,
+        updatedAtMs: Math.max(working.updatedAtMs, publishNowMs),
+        planSealedAtDbMs: sealNowMs,
+        completedClaimAttempt: stagedAuthorization.claimAttempt,
+        completedClaimTokenSha256: receipt.completedClaimTokenSha256,
+        aggregateReceiptSha256: receipt.receiptSha256,
+      });
+      validateTenantPurgePlanCompletionProof(next, entries, receipt);
+      this.tenantPurgePlanJobs.set(working.requestId, next);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantPurgePlanJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantPurgePlanEntries, entriesBefore);
+      restoreMapSnapshot(this.tenantPurgePlanReceipts, receiptsBefore);
+      throw error;
+    }
+    return clone(receipt);
+  }
+
+  async getTenantPurgePlanJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantPurgePlanJobRecord | null> {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    this.assertTenantPurgePlanSource(job, job.phase !== "plan_sealed");
+    const entries = this.tenantPurgePlanEntriesFor(job);
+    if (job.phase === "plan_sealed") {
+      const receipt = this.tenantPurgePlanReceipts.get(requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantPurgePlanCompletionProof(job, entries, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    return clone(job);
+  }
+
+  async getTenantPurgePlanEntries(
+    tenantId: string,
+    requestId: string,
+    buildGeneration: number,
+  ): Promise<TenantPurgePlanEntry[]> {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.buildGeneration !== buildGeneration) return [];
+    this.assertTenantPurgePlanSource(job, job.phase !== "plan_sealed");
+    const entries = this.tenantPurgePlanEntriesFor(job);
+    if (job.phase === "plan_sealed") {
+      const receipt = this.tenantPurgePlanReceipts.get(requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantPurgePlanCompletionProof(job, entries, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    } else {
+      for (const entry of entries) validateTenantPurgePlanEntry(entry);
+      if (
+        entries.length !== job.planEntryCount
+        || tenantPurgePlanEntryRootSha256(entries) !== job.planEntryRootSha256
+        || tenantPurgePlanBlockerRootSha256(entries) !== job.blockerRootSha256
+      ) throw new TenantErasureIntegrityError();
+    }
+    return entries.map(clone);
+  }
+
+  async getTenantPurgePlanReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantPurgePlanReceipt | null> {
+    const receipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!receipt || receipt.tenantId !== tenantId) return null;
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job) throw new TenantErasureIntegrityError();
+    const entries = this.tenantPurgePlanEntriesFor(job);
+    this.assertTenantPurgePlanSource(job, false);
+    try {
+      validateTenantPurgePlanCompletionProof(job, entries, receipt);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return clone(receipt);
   }
 
   async getSubjectLifecycle(

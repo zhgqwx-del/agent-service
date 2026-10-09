@@ -13,9 +13,9 @@ export default defineConfig({
       include: ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts"],
       exclude: ["**/*.d.ts", "packages/testkit/**"],
       reporter: ["text", "json-summary", "html"],
-      // A floor just below the measured numbers (74.4 / 63.5 / 70.7 / 78.7 with every source file
-      // counted, not only those a test happens to import). It catches a regression without failing on
-      // noise. Raise these as coverage improves; never lower them to turn a red build green.
+      // Current full-verify baseline: 82.05 / 77.92 / 86.19 / 85.39 with every source file counted,
+      // not only those a test happens to import. The lower floor catches a material regression without
+      // failing on small instrumentation changes; raise it deliberately as coverage stabilizes.
       thresholds: { statements: 72, branches: 61, functions: 68, lines: 76 },
     },
   },
