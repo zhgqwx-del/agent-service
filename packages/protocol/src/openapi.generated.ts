@@ -1226,6 +1226,21 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "tenantPurgeExecution": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "local-execution-ack-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantPurgeExecutionWorker": {
+                "default": false,
+                "type": "boolean"
+              },
               "tenantRuntimeDrain": {
                 "default": [],
                 "items": {

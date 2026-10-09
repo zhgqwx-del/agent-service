@@ -11,6 +11,7 @@ import {
   INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
   INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
@@ -426,6 +427,29 @@ export class RunnerRegistry {
         TENANT_CREDENTIAL_REVOCATION_STORE_V1,
       ) === true
       && target.capabilities.features.tenantCredentialRevocationWorker === true
+    ));
+  }
+
+  /** Every configured runner must freshly prove the exact local T3e execution/ACK contract. */
+  allConfiguredSupportTenantPurgeExecution(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantPurgeExecution.includes(
+        TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+      ) === true
+    ));
+  }
+
+  /** Destructive authority additionally requires every code-aware runner's worker to be active. */
+  allConfiguredSupportTenantPurgeExecutionWorker(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantPurgeExecution.includes(
+        TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+      ) === true
+      && target.capabilities.features.tenantPurgeExecutionWorker === true
     ));
   }
 

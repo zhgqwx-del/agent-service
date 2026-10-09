@@ -282,6 +282,17 @@ describe("agent-runner HTTP API", () => {
     });
   });
 
+  it("advertises T3e ACK code awareness while the local executor remains inactive", async () => {
+    const { app } = await makeApp();
+    expect(await (await app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantPurgeExecution: ["local-execution-ack-v1"],
+        tenantPurgeExecutionWorker: false,
+        dataPurgeExecution: false,
+      },
+    });
+  });
+
   it("separates credential-store awareness and local worker activation from data purge", async () => {
     const unsupported = await makeApp();
     const codeAware = await makeApp(60_000, { attachStore: true });

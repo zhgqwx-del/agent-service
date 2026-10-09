@@ -107,6 +107,16 @@ const Env = z.object({
   TENANT_PURGE_PLAN_MATERIALIZE_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
   TENANT_PURGE_PLAN_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
   TENANT_PURGE_PLAN_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
+  /** T3e local execution/physical-ACK worker. Independent and default-off until 0023 rollout. */
+  TENANT_PURGE_EXECUTION_WORKER_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  TENANT_PURGE_EXECUTION_WORKER_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_PURGE_EXECUTION_WORKER_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+  TENANT_PURGE_EXECUTION_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(5),
+  TENANT_PURGE_EXECUTION_MATERIALIZE_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
+  TENANT_PURGE_EXECUTION_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_PURGE_EXECUTION_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** Bounded runner-to-router fleet check performed immediately before each tenant admission. */
   TENANT_ERASURE_BARRIER_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(2_000),
   /** Canonical policy/legal-hold admin surface. This never enables destructive purge. */
@@ -326,6 +336,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.TENANT_ERASURE_REQUESTS_ENABLED
       || c.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED
       || c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED
+      || c.TENANT_PURGE_EXECUTION_WORKER_ENABLED
     )
     && erasureRouterUrl === undefined
   ) {
@@ -334,7 +345,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1, PURGE_POLICY_EVALUATOR_ENABLED=1, "
         + "TENANT_ERASURE_REQUESTS_ENABLED=1, or "
         + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1, or "
-        + "TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=1",
+        + "TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=1, or "
+        + "TENANT_PURGE_EXECUTION_WORKER_ENABLED=1",
     );
   }
   if (c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED && !c.TENANT_RUNTIME_DRAIN_ENABLED) {
@@ -379,6 +391,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_PURGE_PLAN_RETRY_BASE_MS",
     );
   }
+  if (
+    c.TENANT_PURGE_EXECUTION_RETRY_MAX_MS
+      < c.TENANT_PURGE_EXECUTION_RETRY_BASE_MS
+  ) {
+    throw new Error(
+      "TENANT_PURGE_EXECUTION_RETRY_MAX_MS must be at least "
+        + "TENANT_PURGE_EXECUTION_RETRY_BASE_MS",
+    );
+  }
   if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.ERASURE_WORKER_ENABLED) {
     throw new Error("ERASURE_WORKER_ENABLED=1 is required before DATA_ERASURE_REQUESTS_ENABLED=1");
   }
@@ -408,6 +429,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   ) {
     throw new Error(
       "BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required for filesystem user-export artifacts",
+    );
+  }
+  if (c.TENANT_PURGE_EXECUTION_WORKER_ENABLED && (
+    !c.BLOB_CLEANUP_ENABLED
+    || !c.DATA_EXPORT_CLEANUP_ENABLED
+    || !c.BLOB_FILESYSTEM_SINGLE_RUNNER
+  )) {
+    throw new Error(
+      "T3e local execution requires BLOB_CLEANUP_ENABLED=1, "
+        + "DATA_EXPORT_CLEANUP_ENABLED=1, and BLOB_FILESYSTEM_SINGLE_RUNNER=1",
     );
   }
   const runnerAddr = validateAdvertisedAddress(c.RUNNER_ADDR ?? `${c.RUNNER_HOST}:${c.RUNNER_PORT}`);

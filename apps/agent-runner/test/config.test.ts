@@ -41,6 +41,13 @@ describe("runner configuration", () => {
     expect(cfg.TENANT_PURGE_PLAN_WORKER_LEASE_MS).toBe(30_000);
     expect(cfg.TENANT_PURGE_PLAN_WORKER_BATCH_SIZE).toBe(5);
     expect(cfg.TENANT_PURGE_PLAN_MATERIALIZE_BATCH_SIZE).toBe(25);
+    expect(cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED).toBe(false);
+    expect(cfg.TENANT_PURGE_EXECUTION_WORKER_POLL_MS).toBe(1_000);
+    expect(cfg.TENANT_PURGE_EXECUTION_WORKER_LEASE_MS).toBe(30_000);
+    expect(cfg.TENANT_PURGE_EXECUTION_WORKER_BATCH_SIZE).toBe(5);
+    expect(cfg.TENANT_PURGE_EXECUTION_MATERIALIZE_BATCH_SIZE).toBe(25);
+    expect(cfg.TENANT_PURGE_EXECUTION_RETRY_BASE_MS).toBe(1_000);
+    expect(cfg.TENANT_PURGE_EXECUTION_RETRY_MAX_MS).toBe(60_000);
     expect(cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS).toBe(2_000);
     expect(cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
@@ -312,6 +319,66 @@ describe("runner configuration", () => {
       SECRETS_MASTER_KEY: SECRET,
       TENANT_PURGE_PLAN_WORKER_ENABLED: "true",
     })).toThrow();
+  });
+
+  it("keeps T3e local execution behind an independent default-off worker gate", () => {
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_WORKER_ENABLED: "1",
+    })).toThrow(/ERASURE_ROUTER_URL is required/);
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_WORKER_ENABLED: "1",
+      TENANT_PURGE_EXECUTION_WORKER_POLL_MS: "17",
+      TENANT_PURGE_EXECUTION_WORKER_LEASE_MS: "1900",
+      TENANT_PURGE_EXECUTION_WORKER_BATCH_SIZE: "7",
+      TENANT_PURGE_EXECUTION_MATERIALIZE_BATCH_SIZE: "11",
+      TENANT_PURGE_EXECUTION_RETRY_BASE_MS: "13",
+      TENANT_PURGE_EXECUTION_RETRY_MAX_MS: "29",
+      ERASURE_ROUTER_URL: "https://router.internal:8443/",
+      BLOB_CLEANUP_ENABLED: "1",
+      DATA_EXPORT_CLEANUP_ENABLED: "1",
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+    });
+    expect(enabled.TENANT_PURGE_EXECUTION_WORKER_ENABLED).toBe(true);
+    expect(enabled.TENANT_PURGE_EXECUTION_WORKER_POLL_MS).toBe(17);
+    expect(enabled.TENANT_PURGE_EXECUTION_WORKER_LEASE_MS).toBe(1_900);
+    expect(enabled.TENANT_PURGE_EXECUTION_WORKER_BATCH_SIZE).toBe(7);
+    expect(enabled.TENANT_PURGE_EXECUTION_MATERIALIZE_BATCH_SIZE).toBe(11);
+    expect(enabled.TENANT_PURGE_EXECUTION_RETRY_BASE_MS).toBe(13);
+    expect(enabled.TENANT_PURGE_EXECUTION_RETRY_MAX_MS).toBe(29);
+    expect(enabled.ERASURE_ROUTER_URL).toBe("https://router.internal:8443");
+    expect(enabled.TENANT_PURGE_PLAN_WORKER_ENABLED).toBe(false);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "https://router.internal:8443/",
+    })).toThrow(/T3e local execution requires/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_WORKER_ENABLED: "true",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_WORKER_POLL_MS: "0",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_WORKER_LEASE_MS: "99",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_WORKER_BATCH_SIZE: "101",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_MATERIALIZE_BATCH_SIZE: "101",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_PURGE_EXECUTION_RETRY_BASE_MS: "2",
+      TENANT_PURGE_EXECUTION_RETRY_MAX_MS: "1",
+    })).toThrow(/TENANT_PURGE_EXECUTION_RETRY_MAX_MS/);
   });
 
   it("validates erasure worker bounds and retry ordering", () => {

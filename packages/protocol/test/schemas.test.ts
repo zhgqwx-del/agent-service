@@ -29,6 +29,7 @@ import {
   StartTurnRequest,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
@@ -306,6 +307,8 @@ describe("protocol schemas", () => {
     expect(parsed.features.tenantErasureRequests).toBe(false);
     expect(parsed.features.tenantCredentialRevocation).toEqual([]);
     expect(parsed.features.tenantCredentialRevocationWorker).toBe(false);
+    expect(parsed.features.tenantPurgeExecution).toEqual([]);
+    expect(parsed.features.tenantPurgeExecutionWorker).toBe(false);
     expect(parsed.features.tenantRuntimeDrain).toEqual([]);
     expect(parsed.features.tenantRuntimeDrainEndpoint).toBe(false);
   });
@@ -462,6 +465,52 @@ describe("protocol schemas", () => {
       features: {
         ...base.features,
         tenantCredentialRevocation: ["credential-store-v2"],
+      },
+    }).success).toBe(false);
+  });
+
+  it("separates local tenant-purge execution ACK awareness from completion", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    const enabled = Capabilities.parse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantPurgeExecution: [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1],
+        tenantPurgeExecutionWorker: true,
+      },
+    });
+    expect(enabled.features.tenantPurgeExecution).toEqual([
+      TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+    ]);
+    expect(enabled.features.tenantPurgeExecutionWorker).toBe(true);
+    expect(enabled.features.dataPurgeExecution).toBe(false);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantPurgeExecution: ["local-execution-ack-v2"],
+      },
+    }).success).toBe(false);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantPurgeExecution: [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1],
+        dataPurgeExecution: true,
       },
     }).success).toBe(false);
   });

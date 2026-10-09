@@ -543,6 +543,57 @@ import {
   type TenantPurgePlanReceipt,
   type TenantPurgePlanStore,
 } from "./tenant-purge-plan.js";
+import {
+  EMPTY_TENANT_PURGE_EXECUTION_DOMAIN_ACK_ROOT_SHA256,
+  EMPTY_TENANT_PURGE_EXECUTION_GLOBAL_ACK_ROOT_SHA256,
+  TENANT_PURGE_EXECUTION_CUTOVER_SINGLETON_ID,
+  TENANT_PURGE_EXECUTION_DOMAIN_ACK_SCOPE,
+  TENANT_PURGE_LOCAL_CUTOVER_SCOPE,
+  TENANT_PURGE_LOCAL_PHYSICAL_ACK_SCOPE,
+  TenantPurgeExecutionEvidenceChangedError,
+  TenantPurgeExecutionNotReadyError,
+  TenantPurgeExecutionPhysicalAckDeadLetterError,
+  tenantPurgeExecutionAuthorizationMatches,
+  tenantPurgeExecutionClaimFromJob,
+  tenantPurgeExecutionClaimTokenSha256,
+  tenantPurgeExecutionCutoverEvidenceSha256,
+  tenantPurgeExecutionDomainAckSha256,
+  tenantPurgeExecutionNextDomainAckRootSha256,
+  tenantPurgeExecutionNextGlobalAckRootSha256,
+  tenantPurgeExecutionOutboxRootSha256,
+  tenantPurgeExecutionOutboxTargetSha256,
+  tenantPurgeExecutionOperationSha256,
+  tenantPurgeExecutionPhysicalProofSha256,
+  tenantPurgeExecutionResultRootSha256,
+  tenantPurgeLocalCutoverReceiptSha256,
+  tenantPurgeLocalPhysicalAckReceiptSha256,
+  validateClaimTenantPurgeExecutionsOptions,
+  validateMaterializeTenantPurgeExecutionJobsOptions,
+  validateRenewTenantPurgeExecutionOptions,
+  validateRetryTenantPurgeExecutionOptions,
+  validateTenantPurgeExecutionAuthorization,
+  validateTenantPurgeExecutionCutoverRecord,
+  validateTenantPurgeExecutionDomainAck,
+  validateTenantPurgeExecutionDomainRecord,
+  validateTenantPurgeExecutionJobRecord,
+  validateTenantPurgeLocalCutoverReceipt,
+  validateTenantPurgeLocalPhysicalAckReceipt,
+  type ClaimTenantPurgeExecutionsOptions,
+  type MaterializeTenantPurgeExecutionJobsOptions,
+  type RenewTenantPurgeExecutionOptions,
+  type RetryTenantPurgeExecutionOptions,
+  type TenantPurgeExecutionAuthorization,
+  type TenantPurgeExecutionBlockReasonCode,
+  type TenantPurgeExecutionClaim,
+  type TenantPurgeExecutionCutoverRecord,
+  type TenantPurgeExecutionDomainAck,
+  type TenantPurgeExecutionDomainRecord,
+  type TenantPurgeExecutionJobRecord,
+  type TenantPurgeExecutionOutboxReference,
+  type TenantPurgeExecutionStore,
+  type TenantPurgeLocalCutoverReceipt,
+  type TenantPurgeLocalPhysicalAckReceipt,
+} from "./tenant-purge-execution.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -730,7 +781,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -769,6 +820,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantPurgePlanJobs = new Map<string, TenantPurgePlanJobRecord>();
   tenantPurgePlanEntries = new Map<string, TenantPurgePlanEntry>();
   tenantPurgePlanReceipts = new Map<string, TenantPurgePlanReceipt>();
+  tenantPurgeExecutionJobs = new Map<string, TenantPurgeExecutionJobRecord>();
+  tenantPurgeExecutionDomains = new Map<string, TenantPurgeExecutionDomainRecord>();
+  tenantPurgeExecutionDomainAcks = new Map<string, TenantPurgeExecutionDomainAck>();
+  tenantPurgeLocalCutoverReceipts = new Map<string, TenantPurgeLocalCutoverReceipt>();
+  tenantPurgeLocalPhysicalAckReceipts = new Map<string, TenantPurgeLocalPhysicalAckReceipt>();
+  tenantPurgeExecutionCutovers = new Map<1, TenantPurgeExecutionCutoverRecord>([[
+    TENANT_PURGE_EXECUTION_CUTOVER_SINGLETON_ID,
+    { singletonId: TENANT_PURGE_EXECUTION_CUTOVER_SINGLETON_ID, controlGeneration: 0 },
+  ]]);
   erasureJobControlEvents = new Map<string, ErasureJobControlEvent[]>();
   private nextErasureJobControlEventId = 1;
   erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
@@ -8571,6 +8631,1828 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return clone(receipt);
   }
 
+  // ---------- tenant purge execution + local physical ACK ledger ----------
+  private tenantPurgeExecutionDomainKey(
+    requestId: string,
+    executionGeneration: number,
+    domain: TenantPurgePlanDomain,
+  ): string {
+    return JSON.stringify([requestId, executionGeneration, domain]);
+  }
+
+  private tenantPurgeExecutionAckKey(
+    requestId: string,
+    executionGeneration: number,
+    globalAckSeq: number,
+  ): string {
+    return JSON.stringify([requestId, executionGeneration, globalAckSeq]);
+  }
+
+  private tenantPurgeExecutionDomainsFor(
+    job: TenantPurgeExecutionJobRecord,
+  ): TenantPurgeExecutionDomainRecord[] {
+    return [...this.tenantPurgeExecutionDomains.values()]
+      .filter((record) => (
+        record.requestId === job.requestId
+        && record.executionGeneration === job.executionGeneration
+      ))
+      .sort((left, right) => left.executionOrdinal - right.executionOrdinal);
+  }
+
+  private tenantPurgeExecutionAcksFor(
+    job: TenantPurgeExecutionJobRecord,
+  ): TenantPurgeExecutionDomainAck[] {
+    return [...this.tenantPurgeExecutionDomainAcks.values()]
+      .filter((ack) => (
+        ack.requestId === job.requestId
+        && ack.executionGeneration === job.executionGeneration
+      ))
+      .sort((left, right) => left.globalAckSeq - right.globalAckSeq);
+  }
+
+  private tenantPurgeExecutionIdentity(job: TenantPurgeExecutionJobRecord) {
+    return {
+      requestId: job.requestId,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      planBuildGeneration: job.planBuildGeneration,
+      executionGeneration: job.executionGeneration,
+    };
+  }
+
+  private tenantPurgeExecutionSource(job: TenantPurgeExecutionJobRecord) {
+    return {
+      ...this.tenantPurgeExecutionIdentity(job),
+      t3cReceiptSha256: job.t3cReceiptSha256,
+      planReceiptSha256: job.planReceiptSha256,
+      planEntryRootSha256: job.planEntryRootSha256,
+      planBlockerCount: job.planBlockerCount,
+      planBlockerRootSha256: job.planBlockerRootSha256,
+      policySha256: job.policySha256,
+      purgeNotBeforeDbMs: job.purgeNotBeforeDbMs,
+      sourceEvidenceDbMs: job.sourceEvidenceDbMs,
+    };
+  }
+
+  private assertTenantPurgeExecutionCutoverState(): TenantPurgeExecutionCutoverRecord {
+    if (this.tenantPurgeExecutionCutovers.size !== 1) throw new TenantErasureIntegrityError();
+    const cutover = this.tenantPurgeExecutionCutovers.get(
+      TENANT_PURGE_EXECUTION_CUTOVER_SINGLETON_ID,
+    );
+    if (!cutover) throw new TenantErasureIntegrityError();
+    try {
+      validateTenantPurgeExecutionCutoverRecord(cutover);
+      if (cutover.controlGeneration === 0) {
+        if (this.tenantPurgeLocalCutoverReceipts.size !== 0) {
+          throw new Error("inactive execution cutover has a local receipt");
+        }
+      } else {
+        const first = this.tenantPurgeLocalCutoverReceipts.get(cutover.firstRequestId);
+        if (
+          !first
+          || first.receiptSha256 !== cutover.firstReceiptSha256
+          || first.storeDbTimestampMs !== cutover.activatedAtDbMs
+        ) throw new Error("active execution cutover lacks its first receipt");
+      }
+      return cutover;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private assertTenantPurgeExecutionGlobalRelations(): void {
+    this.assertTenantPurgeExecutionCutoverState();
+    try {
+      for (const [requestId, job] of this.tenantPurgeExecutionJobs) {
+        if (requestId !== job.requestId) throw new Error("execution job identity is invalid");
+      }
+      for (const [key, domain] of this.tenantPurgeExecutionDomains) {
+        const job = this.tenantPurgeExecutionJobs.get(domain.requestId);
+        if (
+          key !== this.tenantPurgeExecutionDomainKey(
+            domain.requestId,
+            domain.executionGeneration,
+            domain.domain,
+          )
+          || !job
+          || domain.tenantId !== job.tenantId
+          || domain.subjectGeneration !== job.subjectGeneration
+          || domain.planBuildGeneration !== job.planBuildGeneration
+          || domain.executionGeneration !== job.executionGeneration
+        ) throw new Error("execution domain owner relation is invalid");
+      }
+      for (const [key, ack] of this.tenantPurgeExecutionDomainAcks) {
+        const job = this.tenantPurgeExecutionJobs.get(ack.requestId);
+        if (
+          key !== this.tenantPurgeExecutionAckKey(
+            ack.requestId,
+            ack.executionGeneration,
+            ack.globalAckSeq,
+          )
+          || !job
+          || ack.tenantId !== job.tenantId
+          || ack.subjectGeneration !== job.subjectGeneration
+          || ack.planBuildGeneration !== job.planBuildGeneration
+          || ack.executionGeneration !== job.executionGeneration
+        ) throw new Error("execution ACK owner relation is invalid");
+      }
+      for (const [requestId, receipt] of this.tenantPurgeLocalCutoverReceipts) {
+        const job = this.tenantPurgeExecutionJobs.get(requestId);
+        if (!job || receipt.requestId !== requestId || receipt.tenantId !== job.tenantId) {
+          throw new Error("execution cutover receipt owner relation is invalid");
+        }
+      }
+      for (const [requestId, receipt] of this.tenantPurgeLocalPhysicalAckReceipts) {
+        const job = this.tenantPurgeExecutionJobs.get(requestId);
+        if (!job || receipt.requestId !== requestId || receipt.tenantId !== job.tenantId) {
+          throw new Error("execution physical receipt owner relation is invalid");
+        }
+      }
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private assertTenantPurgeExecutionState(
+    job: TenantPurgeExecutionJobRecord,
+    requireLivePlan: boolean,
+  ): {
+    planJob: Extract<TenantPurgePlanJobRecord, { phase: "plan_sealed" }>;
+    planReceipt: TenantPurgePlanReceipt;
+    planEntries: TenantPurgePlanEntry[];
+    domains: TenantPurgeExecutionDomainRecord[];
+    acks: TenantPurgeExecutionDomainAck[];
+  } {
+    try {
+      validateTenantPurgeExecutionJobRecord(job);
+      this.assertTenantPurgeExecutionGlobalRelations();
+      const planJob = this.tenantPurgePlanJobs.get(job.requestId);
+      const planReceipt = this.tenantPurgePlanReceipts.get(job.requestId);
+      if (!planJob || planJob.phase !== "plan_sealed" || !planReceipt) {
+        throw new Error("tenant purge execution plan source is missing");
+      }
+      const planEntries = this.tenantPurgePlanEntriesFor(planJob);
+      const source = this.assertTenantPurgePlanSource(planJob, requireLivePlan);
+      validateTenantPurgePlanCompletionProof(planJob, planEntries, planReceipt);
+      if (requireLivePlan) {
+        this.assertTenantPurgePlanGlobalRelations();
+        const holdProof = this.tenantPurgePlanHoldProof(job.tenantId);
+        this.assertTenantPurgePlanBuildState(planJob, source, holdProof);
+      }
+      if (
+        planJob.requestId !== job.requestId
+        || planJob.tenantId !== job.tenantId
+        || planJob.subjectGeneration !== job.subjectGeneration
+        || planJob.buildGeneration !== job.planBuildGeneration
+        || planReceipt.t3cReceiptSha256 !== job.t3cReceiptSha256
+        || planReceipt.receiptSha256 !== job.planReceiptSha256
+        || planReceipt.planEntryRootSha256 !== job.planEntryRootSha256
+        || planReceipt.blockerCount !== job.planBlockerCount
+        || planReceipt.blockerRootSha256 !== job.planBlockerRootSha256
+        || planReceipt.policySha256 !== job.policySha256
+        || planReceipt.purgeNotBeforeDbMs !== job.purgeNotBeforeDbMs
+        || planReceipt.storeDbTimestampMs !== job.sourceEvidenceDbMs
+      ) throw new Error("tenant purge execution source binding is invalid");
+
+      const domains = this.tenantPurgeExecutionDomainsFor(job);
+      if (domains.length !== TENANT_PURGE_PLAN_DOMAINS.length) {
+        throw new Error("tenant purge execution domain catalog is incomplete");
+      }
+      for (const [index, domain] of domains.entries()) {
+        validateTenantPurgeExecutionDomainRecord(domain);
+        const planEntry = planEntries[index];
+        if (
+          domain.domain !== TENANT_PURGE_PLAN_DOMAINS[index]
+          || !planEntry
+          || planEntry.domain !== domain.domain
+          || domain.requestId !== job.requestId
+          || domain.tenantId !== job.tenantId
+          || domain.subjectGeneration !== job.subjectGeneration
+          || domain.planBuildGeneration !== job.planBuildGeneration
+          || domain.executionGeneration !== job.executionGeneration
+          || domain.planDisposition !== planEntry.disposition
+          || domain.planTargetCount !== planEntry.targetCount
+          || domain.planTargetRootSha256 !== planEntry.targetRootSha256
+          || domain.planSourceSha256 !== planEntry.sourceSha256
+          || domain.planEntryReceiptSha256 !== planEntry.receiptSha256
+        ) throw new Error("tenant purge execution domain source is invalid");
+      }
+
+      const acks = this.tenantPurgeExecutionAcksFor(job);
+      let globalRoot = EMPTY_TENANT_PURGE_EXECUTION_GLOBAL_ACK_ROOT_SHA256;
+      const domainCounts = new Map<TenantPurgePlanDomain, number>();
+      const domainRoots = new Map<TenantPurgePlanDomain, string>();
+      const finalAcks = new Map<TenantPurgePlanDomain, string>();
+      const blockerResolutions = new Set<TenantPurgePlanDomain>();
+      const physicalPending = new Set<TenantPurgePlanDomain>();
+      for (const [index, ack] of acks.entries()) {
+        validateTenantPurgeExecutionDomainAck(ack);
+        const domain = domains[tenantPurgePlanDomainOrdinal(ack.domain)];
+        const domainCount = domainCounts.get(ack.domain) ?? 0;
+        const domainRoot = domainRoots.get(ack.domain)
+          ?? EMPTY_TENANT_PURGE_EXECUTION_DOMAIN_ACK_ROOT_SHA256;
+        if (
+          ack.globalAckSeq !== index + 1
+          || ack.domainAckSeq !== domainCount + 1
+          || ack.previousGlobalAckSha256 !== globalRoot
+          || ack.previousDomainAckSha256 !== domainRoot
+          || ack.requestId !== job.requestId
+          || ack.tenantId !== job.tenantId
+          || ack.subjectGeneration !== job.subjectGeneration
+          || ack.planBuildGeneration !== job.planBuildGeneration
+          || ack.executionGeneration !== job.executionGeneration
+          || ack.planEntryReceiptSha256 !== domain?.planEntryReceiptSha256
+          || finalAcks.has(ack.domain)
+        ) throw new Error("tenant purge execution ACK chain is invalid");
+        const nextDomainRoot = tenantPurgeExecutionNextDomainAckRootSha256(
+          domainRoot,
+          ack.domain,
+          ack.receiptSha256,
+        );
+        globalRoot = tenantPurgeExecutionNextGlobalAckRootSha256(
+          globalRoot,
+          ack.globalAckSeq,
+          ack.receiptSha256,
+        );
+        domainCounts.set(ack.domain, domainCount + 1);
+        domainRoots.set(ack.domain, nextDomainRoot);
+        if (ack.final) finalAcks.set(ack.domain, ack.receiptSha256);
+        if (ack.ackKind === "blocker_resolution") {
+          if (blockerResolutions.has(ack.domain)) {
+            throw new Error("tenant purge execution blocker is resolved more than once");
+          }
+          blockerResolutions.add(ack.domain);
+        }
+        if (ack.ackKind === "outbox_scheduled") physicalPending.add(ack.domain);
+        if (ack.ackKind === "physical_delete" && ack.final) physicalPending.delete(ack.domain);
+      }
+      if (acks.length !== job.domainAckCount || globalRoot !== job.domainAckRootSha256) {
+        throw new Error("tenant purge execution aggregate ACK chain is invalid");
+      }
+      for (const domain of domains) {
+        const ackCount = domainCounts.get(domain.domain) ?? 0;
+        const ackRoot = domainRoots.get(domain.domain)
+          ?? EMPTY_TENANT_PURGE_EXECUTION_DOMAIN_ACK_ROOT_SHA256;
+        const expectedPhase = finalAcks.has(domain.domain)
+          ? "acked"
+          : blockerResolutions.has(domain.domain) || physicalPending.has(domain.domain)
+            ? "awaiting_physical_ack"
+            : isTenantPurgePlanBlockingDisposition(domain.planDisposition)
+              ? "awaiting_blocker_resolution"
+              : "pending";
+        if (
+          domain.ackCount !== ackCount
+          || domain.ackRootSha256 !== ackRoot
+          || domain.finalAckSha256 !== finalAcks.get(domain.domain)
+          || domain.phase !== expectedPhase
+        ) throw new Error("tenant purge execution domain ACK state is invalid");
+      }
+      if (job.unresolvedBlockerCount !== job.planBlockerCount - blockerResolutions.size) {
+        throw new Error("tenant purge execution unresolved blocker count is invalid");
+      }
+
+      const cutoverReceipt = this.tenantPurgeLocalCutoverReceipts.get(job.requestId);
+      if (cutoverReceipt) {
+        validateTenantPurgeLocalCutoverReceipt(cutoverReceipt);
+        const operational = domains[tenantPurgePlanDomainOrdinal("operational_usage")]!;
+        const blob = domains[tenantPurgePlanDomainOrdinal("blob_bytes")]!;
+        const exportControl = domains[tenantPurgePlanDomainOrdinal("user_export_control")]!;
+        const exportSnapshots = domains[tenantPurgePlanDomainOrdinal("user_export_snapshots")]!;
+        const exportBytes = domains[tenantPurgePlanDomainOrdinal("user_export_bytes")]!;
+        const cutoverAcks = acks.slice(0, cutoverReceipt.domainAckCount);
+        let cursor = 0;
+        const operationMatches = (ack: TenantPurgeExecutionDomainAck, action: string) => (
+          ack.adapterProtocol === "local-store-v1"
+          && ack.operationSha256 === tenantPurgeExecutionOperationSha256({
+            identity: this.tenantPurgeExecutionIdentity(job),
+            domain: ack.domain,
+            action,
+            affectedCount: ack.affectedCount,
+            resultCount: ack.resultCount,
+            resultRootSha256: ack.resultRootSha256,
+          })
+        );
+        const take = (
+          domain: TenantPurgePlanDomain,
+          ackKind: TenantPurgeExecutionDomainAck["ackKind"],
+          final: boolean,
+        ) => {
+          const ack = cutoverAcks[cursor++];
+          if (!ack || ack.domain !== domain || ack.ackKind !== ackKind || ack.final !== final) {
+            throw new Error("tenant purge execution local ACK order is invalid");
+          }
+          return ack;
+        };
+        const operationalAck = take("operational_usage", "anonymized", true);
+        if (
+          operationalAck.affectedCount !== operational.planTargetCount
+          || operationalAck.resultCount !== operational.planTargetCount
+          || !operationMatches(operationalAck, "anonymize")
+        ) throw new Error("tenant purge execution usage ACK count is invalid");
+        const blobResolution = take(
+          "blob_bytes",
+          "blocker_resolution",
+          blob.planTargetCount === 0,
+        );
+        if (
+          blob.planDisposition !== "blocked_adapter_unconfigured"
+          || blobResolution.affectedCount !== blob.planTargetCount
+          || blobResolution.resultCount !== blob.planTargetCount
+          || !operationMatches(blobResolution, "schedule-delete")
+        ) throw new Error("tenant purge execution Blob blocker resolution is invalid");
+        const blobScheduled: TenantPurgeExecutionDomainAck[] = [];
+        for (let index = 0; index < blob.planTargetCount; index += 1) {
+          blobScheduled.push(take("blob_bytes", "outbox_scheduled", false));
+        }
+        const controlAck = take("user_export_control", "applied", true);
+        const snapshotAck = take("user_export_snapshots", "applied", true);
+        if (
+          controlAck.affectedCount !== exportControl.planTargetCount
+          || controlAck.resultCount !== exportControl.planTargetCount
+          || snapshotAck.affectedCount !== exportSnapshots.planTargetCount
+          || snapshotAck.resultCount !== exportSnapshots.planTargetCount
+          || controlAck.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
+            "user_export_control",
+            "revoke",
+            this.tenantPurgeExecutionAppliedResultHashes(
+              job,
+              "user_export_control",
+              "revoke-result",
+              exportControl.planTargetCount,
+              exportControl.planTargetRootSha256,
+            ),
+          )
+          || snapshotAck.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
+            "user_export_snapshots",
+            "release-pins",
+            this.tenantPurgeExecutionAppliedResultHashes(
+              job,
+              "user_export_snapshots",
+              "release-pin-result",
+              exportSnapshots.planTargetCount,
+              exportSnapshots.planTargetRootSha256,
+            ),
+          )
+          || !operationMatches(controlAck, "revoke")
+          || !operationMatches(snapshotAck, "release-pins")
+        ) throw new Error("tenant purge execution export relation ACK count is invalid");
+        const exportResolution = take(
+          "user_export_bytes",
+          "blocker_resolution",
+          exportBytes.planTargetCount === 0,
+        );
+        if (
+          exportBytes.planDisposition !== "blocked_adapter_unconfigured"
+          || exportResolution.affectedCount !== exportBytes.planTargetCount
+          || exportResolution.resultCount !== exportBytes.planTargetCount
+          || !operationMatches(exportResolution, "schedule-delete")
+        ) throw new Error("tenant purge execution export blocker resolution is invalid");
+        const exportScheduled: TenantPurgeExecutionDomainAck[] = [];
+        for (let index = 0; index < exportBytes.planTargetCount; index += 1) {
+          exportScheduled.push(take("user_export_bytes", "outbox_scheduled", false));
+        }
+        if (cursor !== cutoverAcks.length) {
+          throw new Error("tenant purge execution cutover has an unsupported ACK");
+        }
+        const validateScheduled = (
+          scheduled: TenantPurgeExecutionDomainAck[],
+          outboxKind: TenantPurgeExecutionOutboxReference["outboxKind"],
+        ): TenantPurgeExecutionOutboxReference[] => {
+          const refs = scheduled.map((ack) => {
+            if (
+              ack.outboxKind !== outboxKind
+              || ack.outboxId === undefined
+              || ack.deletionGeneration === undefined
+              || ack.targetSha256 === undefined
+              || ack.scheduledAckSha256 !== undefined
+              || ack.affectedCount !== 1
+              || ack.resultCount !== 1
+            ) throw new Error("tenant purge execution scheduled ACK is invalid");
+            return {
+              outboxKind,
+              outboxId: ack.outboxId,
+              deletionGeneration: ack.deletionGeneration,
+              targetSha256: ack.targetSha256,
+            };
+          });
+          if (scheduled.some((ack, index) => (
+            index > 0 && scheduled[index - 1]!.targetSha256! >= ack.targetSha256!
+          ))) throw new Error("tenant purge execution scheduled ACK order is invalid");
+          return refs;
+        };
+        const blobReferences = validateScheduled(blobScheduled, "blob_delete");
+        const exportReferences = validateScheduled(exportScheduled, "user_export_delete");
+        const validateOutboxProofs = (
+          resolution: TenantPurgeExecutionDomainAck,
+          scheduled: TenantPurgeExecutionDomainAck[],
+          domain: "blob_bytes" | "user_export_bytes",
+          refs: TenantPurgeExecutionOutboxReference[],
+        ) => {
+          const hashes = refs.map(tenantPurgeExecutionOutboxTargetSha256);
+          if (
+            resolution.resultRootSha256
+              !== tenantPurgeExecutionResultRootSha256(domain, "schedule-delete", hashes)
+            || scheduled.some((ack, index) => (
+              ack.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
+                domain,
+                "outbox-scheduled",
+                [hashes[index]!],
+              )
+              || !operationMatches(ack, "outbox-scheduled")
+            ))
+          ) throw new Error("tenant purge execution outbox proof is invalid");
+        };
+        validateOutboxProofs(blobResolution, blobScheduled, "blob_bytes", blobReferences);
+        validateOutboxProofs(
+          exportResolution,
+          exportScheduled,
+          "user_export_bytes",
+          exportReferences,
+        );
+        let cutoverRoot = EMPTY_TENANT_PURGE_EXECUTION_GLOBAL_ACK_ROOT_SHA256;
+        for (const ack of cutoverAcks) {
+          cutoverRoot = tenantPurgeExecutionNextGlobalAckRootSha256(
+            cutoverRoot,
+            ack.globalAckSeq,
+            ack.receiptSha256,
+          );
+        }
+        if (
+          cutoverReceipt.requestId !== job.requestId
+          || cutoverReceipt.tenantId !== job.tenantId
+          || cutoverReceipt.subjectGeneration !== job.subjectGeneration
+          || cutoverReceipt.planBuildGeneration !== job.planBuildGeneration
+          || cutoverReceipt.executionGeneration !== job.executionGeneration
+          || cutoverReceipt.t3cReceiptSha256 !== job.t3cReceiptSha256
+          || cutoverReceipt.planReceiptSha256 !== job.planReceiptSha256
+          || cutoverReceipt.planEntryRootSha256 !== job.planEntryRootSha256
+          || cutoverReceipt.planBlockerCount !== job.planBlockerCount
+          || cutoverReceipt.planBlockerRootSha256 !== job.planBlockerRootSha256
+          || cutoverReceipt.policySha256 !== job.policySha256
+          || cutoverReceipt.purgeNotBeforeDbMs !== job.purgeNotBeforeDbMs
+          || cutoverReceipt.sourceEvidenceDbMs !== job.sourceEvidenceDbMs
+          || cutoverReceipt.receiptSha256 !== job.localCutoverReceiptSha256
+          || cutoverReceipt.domainAckCount > acks.length
+          || cutoverReceipt.domainAckRootSha256 !== cutoverRoot
+          || cutoverReceipt.operationalUsageTargetCount !== operational.planTargetCount
+          || cutoverReceipt.operationalUsageTargetRootSha256 !== operational.planTargetRootSha256
+          || cutoverReceipt.blobBytesTargetCount !== blob.planTargetCount
+          || cutoverReceipt.blobBytesTargetRootSha256 !== blob.planTargetRootSha256
+          || cutoverReceipt.blobDeleteOutboxCount !== blobReferences.length
+          || cutoverReceipt.blobDeleteOutboxRootSha256
+            !== tenantPurgeExecutionOutboxRootSha256(blobReferences)
+          || cutoverReceipt.exportBytesTargetCount !== exportBytes.planTargetCount
+          || cutoverReceipt.exportBytesTargetRootSha256 !== exportBytes.planTargetRootSha256
+          || cutoverReceipt.exportDeleteOutboxCount !== exportReferences.length
+          || cutoverReceipt.exportDeleteOutboxRootSha256
+            !== tenantPurgeExecutionOutboxRootSha256(exportReferences)
+          || cutoverAcks.some((ack) => (
+            ack.storeDbTimestampMs !== cutoverReceipt.storeDbTimestampMs
+            || ack.completedClaimAttempt !== cutoverReceipt.completedClaimAttempt
+            || ack.completedClaimTokenSha256 !== cutoverReceipt.completedClaimTokenSha256
+          ))
+        ) throw new Error("tenant purge execution local cutover receipt is invalid");
+
+        const remaining = acks.slice(cutoverReceipt.domainAckCount);
+        const blobPhysical = remaining.slice(0, blobReferences.length);
+        const exportPhysical = remaining.slice(blobReferences.length);
+        const validatePhysical = (
+          physical: TenantPurgeExecutionDomainAck[],
+          domain: "blob_bytes" | "user_export_bytes",
+          scheduled: TenantPurgeExecutionDomainAck[],
+          refs: TenantPurgeExecutionOutboxReference[],
+        ) => {
+          if (physical.length !== refs.length) {
+            throw new Error("tenant purge execution physical ACK count is invalid");
+          }
+          for (const [index, ack] of physical.entries()) {
+            const reference = refs[index]!;
+            const scheduledAck = scheduled[index]!;
+            if (
+              ack.domain !== domain
+              || ack.ackKind !== "physical_delete"
+              || ack.final !== (index === physical.length - 1)
+              || ack.outboxKind !== reference.outboxKind
+              || ack.outboxId !== reference.outboxId
+              || ack.deletionGeneration !== reference.deletionGeneration
+              || ack.targetSha256 !== reference.targetSha256
+              || ack.scheduledAckSha256 !== scheduledAck.receiptSha256
+              || ack.affectedCount !== 1
+              || ack.resultCount !== 1
+              || ack.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
+                domain,
+                "physical-delete",
+                [tenantPurgeExecutionOutboxTargetSha256(reference)],
+              )
+              || !operationMatches(ack, "physical-delete")
+            ) throw new Error("tenant purge execution physical ACK chain is invalid");
+          }
+        };
+        if (job.phase === "local_physical_acks_sealed") {
+          if (remaining.length !== blobReferences.length + exportReferences.length) {
+            throw new Error("tenant purge execution physical ACK catalog is invalid");
+          }
+          validatePhysical(blobPhysical, "blob_bytes", blobScheduled, blobReferences);
+          validatePhysical(exportPhysical, "user_export_bytes", exportScheduled, exportReferences);
+        } else if (remaining.length !== 0) {
+          throw new Error("tenant purge execution has a partial physical ACK publication");
+        }
+      } else if (job.localCutoverReceiptSha256 !== undefined || acks.length !== 0) {
+        throw new Error("tenant purge execution has ACKs without local cutover");
+      }
+      const physicalReceipt = this.tenantPurgeLocalPhysicalAckReceipts.get(job.requestId);
+      if (physicalReceipt) {
+        validateTenantPurgeLocalPhysicalAckReceipt(physicalReceipt);
+        const physicalAcks = acks.slice(cutoverReceipt!.domainAckCount);
+        const blobPhysicalHashes = physicalAcks
+          .filter((ack) => ack.domain === "blob_bytes")
+          .map((ack) => ack.receiptSha256);
+        const exportPhysicalHashes = physicalAcks
+          .filter((ack) => ack.domain === "user_export_bytes")
+          .map((ack) => ack.receiptSha256);
+        if (
+          job.phase !== "local_physical_acks_sealed"
+          || physicalReceipt.requestId !== job.requestId
+          || physicalReceipt.tenantId !== job.tenantId
+          || physicalReceipt.subjectGeneration !== job.subjectGeneration
+          || physicalReceipt.planBuildGeneration !== job.planBuildGeneration
+          || physicalReceipt.executionGeneration !== job.executionGeneration
+          || physicalReceipt.t3cReceiptSha256 !== job.t3cReceiptSha256
+          || physicalReceipt.planReceiptSha256 !== job.planReceiptSha256
+          || physicalReceipt.planEntryRootSha256 !== job.planEntryRootSha256
+          || physicalReceipt.planBlockerCount !== job.planBlockerCount
+          || physicalReceipt.planBlockerRootSha256 !== job.planBlockerRootSha256
+          || physicalReceipt.policySha256 !== job.policySha256
+          || physicalReceipt.purgeNotBeforeDbMs !== job.purgeNotBeforeDbMs
+          || physicalReceipt.sourceEvidenceDbMs !== job.sourceEvidenceDbMs
+          || physicalReceipt.receiptSha256 !== job.localPhysicalAckReceiptSha256
+          || physicalReceipt.localCutoverReceiptSha256 !== job.localCutoverReceiptSha256
+          || physicalReceipt.domainAckCount !== job.domainAckCount
+          || physicalReceipt.domainAckRootSha256 !== job.domainAckRootSha256
+          || physicalReceipt.unresolvedBlockerCount !== job.unresolvedBlockerCount
+          || physicalReceipt.completedClaimAttempt !== job.completedClaimAttempt
+          || physicalReceipt.completedClaimTokenSha256 !== job.completedClaimTokenSha256
+          || physicalReceipt.storeDbTimestampMs !== job.localPhysicalAcksSealedAtDbMs
+          || physicalReceipt.blobPhysicalAckCount !== blobPhysicalHashes.length
+          || physicalReceipt.blobPhysicalAckRootSha256 !== tenantPurgeExecutionResultRootSha256(
+            "blob_bytes",
+            "physical-ack-chain",
+            blobPhysicalHashes,
+          )
+          || physicalReceipt.exportPhysicalAckCount !== exportPhysicalHashes.length
+          || physicalReceipt.exportPhysicalAckRootSha256 !== tenantPurgeExecutionResultRootSha256(
+            "user_export_bytes",
+            "physical-ack-chain",
+            exportPhysicalHashes,
+          )
+          || physicalAcks.some((ack) => (
+            ack.storeDbTimestampMs !== physicalReceipt.storeDbTimestampMs
+            || ack.completedClaimAttempt !== physicalReceipt.completedClaimAttempt
+            || ack.completedClaimTokenSha256 !== physicalReceipt.completedClaimTokenSha256
+          ))
+        ) throw new Error("tenant purge execution physical ACK receipt is invalid");
+      } else if (job.phase === "local_physical_acks_sealed") {
+        throw new Error("tenant purge execution terminal receipt is missing");
+      }
+      return { planJob, planReceipt, planEntries, domains, acks };
+    } catch (error) {
+      if (error instanceof TenantPurgeExecutionNotReadyError) throw error;
+      if (
+        error instanceof TenantPurgePlanNotReadyError
+        && error.reason === "active_legal_hold"
+      ) throw new TenantPurgeExecutionNotReadyError("active_legal_hold");
+      if (
+        error instanceof TenantPurgePlanEvidenceChangedError
+        || error instanceof TenantContentInventoryEvidenceChangedError
+      ) throw new TenantPurgeExecutionEvidenceChangedError();
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private blockedTenantPurgeExecutionJob(
+    current: TenantPurgeExecutionJobRecord,
+    blockedAtDbMs: number,
+    reason: TenantPurgeExecutionBlockReasonCode,
+    attempts = current.attempts,
+  ): TenantPurgeExecutionJobRecord {
+    const terminalAtDbMs = Math.max(current.createdAtMs, current.updatedAtMs, blockedAtDbMs);
+    const blocked = clone<TenantPurgeExecutionJobRecord>({
+      ...this.tenantPurgeExecutionSource(current),
+      phase: "blocked",
+      domainCount: current.domainCount,
+      domainAckCount: current.domainAckCount,
+      domainAckRootSha256: current.domainAckRootSha256,
+      unresolvedBlockerCount: current.unresolvedBlockerCount,
+      ...(current.localCutoverReceiptSha256 === undefined
+        ? {} : { localCutoverReceiptSha256: current.localCutoverReceiptSha256 }),
+      attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: terminalAtDbMs,
+      blockedAtDbMs: terminalAtDbMs,
+      blockedReasonCode: reason,
+    });
+    validateTenantPurgeExecutionJobRecord(blocked);
+    return blocked;
+  }
+
+  async materializeTenantPurgeExecutionJobs(
+    options: MaterializeTenantPurgeExecutionJobsOptions,
+  ): Promise<number> {
+    const stagedOptions = clone(options);
+    validateMaterializeTenantPurgeExecutionJobsOptions(stagedOptions);
+    this.assertTenantPurgeExecutionGlobalRelations();
+    const nowMs = this.storeNowMs();
+    const candidates = [...this.tenantPurgePlanJobs.values()]
+      .filter((job): job is Extract<TenantPurgePlanJobRecord, { phase: "plan_sealed" }> => (
+        job.phase === "plan_sealed" && !this.tenantPurgeExecutionJobs.has(job.requestId)
+      ))
+      .sort((left, right) => left.requestId.localeCompare(right.requestId));
+    const jobs: TenantPurgeExecutionJobRecord[] = [];
+    const domains: TenantPurgeExecutionDomainRecord[] = [];
+    for (const planJob of candidates) {
+      if (jobs.length >= stagedOptions.limit) break;
+      const receipt = this.tenantPurgePlanReceipts.get(planJob.requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      const entries = this.tenantPurgePlanEntriesFor(planJob);
+      this.assertTenantPurgePlanSource(planJob, true);
+      validateTenantPurgePlanCompletionProof(planJob, entries, receipt);
+      this.assertTenantPurgePlanGlobalRelations();
+      const holdProof = this.tenantPurgePlanHoldProof(planJob.tenantId);
+      this.assertTenantPurgePlanBuildState(planJob, this.assertTenantPurgePlanSource(planJob, true), holdProof);
+      if (nowMs < receipt.storeDbTimestampMs) continue;
+      if (
+        [...this.tenantPurgeExecutionJobs.values()].some((job) => job.tenantId === planJob.tenantId)
+        || [...this.tenantPurgeExecutionDomains.values()].some((row) => (
+          row.requestId === planJob.requestId || row.tenantId === planJob.tenantId
+        ))
+        || [...this.tenantPurgeExecutionDomainAcks.values()].some((row) => (
+          row.requestId === planJob.requestId || row.tenantId === planJob.tenantId
+        ))
+        || [...this.tenantPurgeLocalCutoverReceipts.values()].some((row) => (
+          row.requestId === planJob.requestId || row.tenantId === planJob.tenantId
+        ))
+        || [...this.tenantPurgeLocalPhysicalAckReceipts.values()].some((row) => (
+          row.requestId === planJob.requestId || row.tenantId === planJob.tenantId
+        ))
+      ) throw new TenantErasureIntegrityError();
+      const job = clone<TenantPurgeExecutionJobRecord>({
+        requestId: planJob.requestId,
+        tenantId: planJob.tenantId,
+        subjectGeneration: planJob.subjectGeneration,
+        planBuildGeneration: planJob.buildGeneration,
+        executionGeneration: 1,
+        t3cReceiptSha256: receipt.t3cReceiptSha256,
+        planReceiptSha256: receipt.receiptSha256,
+        planEntryRootSha256: receipt.planEntryRootSha256,
+        planBlockerCount: receipt.blockerCount,
+        planBlockerRootSha256: receipt.blockerRootSha256,
+        policySha256: receipt.policySha256,
+        purgeNotBeforeDbMs: receipt.purgeNotBeforeDbMs,
+        sourceEvidenceDbMs: receipt.storeDbTimestampMs,
+        phase: "queued",
+        domainCount: TENANT_PURGE_PLAN_DOMAINS.length,
+        domainAckCount: 0,
+        domainAckRootSha256: EMPTY_TENANT_PURGE_EXECUTION_GLOBAL_ACK_ROOT_SHA256,
+        unresolvedBlockerCount: receipt.blockerCount,
+        availableAtMs: nowMs,
+        attempts: 0,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      });
+      validateTenantPurgeExecutionJobRecord(job);
+      jobs.push(job);
+      for (const entry of entries) {
+        const row = clone<TenantPurgeExecutionDomainRecord>({
+          ...this.tenantPurgeExecutionIdentity(job),
+          domain: entry.domain,
+          executionOrdinal: tenantPurgePlanDomainOrdinal(entry.domain),
+          planDisposition: entry.disposition,
+          planTargetCount: entry.targetCount,
+          planTargetRootSha256: entry.targetRootSha256,
+          planSourceSha256: entry.sourceSha256,
+          planEntryReceiptSha256: entry.receiptSha256,
+          phase: isTenantPurgePlanBlockingDisposition(entry.disposition)
+            ? "awaiting_blocker_resolution"
+            : "pending",
+          ackCount: 0,
+          ackRootSha256: EMPTY_TENANT_PURGE_EXECUTION_DOMAIN_ACK_ROOT_SHA256,
+          updatedAtMs: nowMs,
+        });
+        validateTenantPurgeExecutionDomainRecord(row);
+        domains.push(row);
+      }
+    }
+    const jobsBefore = new Map(this.tenantPurgeExecutionJobs);
+    const domainsBefore = new Map(this.tenantPurgeExecutionDomains);
+    try {
+      for (const job of jobs) this.tenantPurgeExecutionJobs.set(job.requestId, job);
+      for (const domain of domains) {
+        const key = this.tenantPurgeExecutionDomainKey(
+          domain.requestId,
+          domain.executionGeneration,
+          domain.domain,
+        );
+        if (this.tenantPurgeExecutionDomains.has(key)) throw new TenantErasureIntegrityError();
+        this.tenantPurgeExecutionDomains.set(key, domain);
+      }
+    } catch (error) {
+      restoreMapSnapshot(this.tenantPurgeExecutionJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantPurgeExecutionDomains, domainsBefore);
+      throw error;
+    }
+    return jobs.length;
+  }
+
+  async claimTenantPurgeExecutions(
+    options: ClaimTenantPurgeExecutionsOptions,
+  ): Promise<TenantPurgeExecutionClaim[]> {
+    const stagedOptions = clone(options);
+    validateClaimTenantPurgeExecutionsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
+      ? Number.MAX_SAFE_INTEGER
+      : nowMs + stagedOptions.leaseMs;
+    if (leaseUntilMs <= nowMs) return [];
+    const candidates = [...this.tenantPurgeExecutionJobs.values()]
+      .filter((job): job is Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }> => (
+        job.phase === "queued"
+        && job.availableAtMs <= nowMs
+        && (job.claimToken === undefined || job.leaseUntilMs! <= nowMs)
+      ))
+      .sort((left, right) => (
+        left.availableAtMs - right.availableAtMs || left.requestId.localeCompare(right.requestId)
+      ))
+      .slice(0, stagedOptions.limit);
+    const staged: TenantPurgeExecutionJobRecord[] = [];
+    const claims: TenantPurgeExecutionJobRecord[] = [];
+    for (const current of candidates) {
+      const attempts = current.attempts + 1;
+      if (!Number.isSafeInteger(attempts) || attempts > 0xffff_ffff) {
+        throw new TenantErasureIntegrityError();
+      }
+      try {
+        this.assertTenantPurgeExecutionState(
+          current,
+          current.localCutoverReceiptSha256 === undefined,
+        );
+      } catch (error) {
+        if (error instanceof TenantPurgeExecutionNotReadyError) continue;
+        if (
+          !(error instanceof TenantErasureIntegrityError)
+          && !(error instanceof TenantPurgeExecutionEvidenceChangedError)
+        ) throw error;
+        staged.push(this.blockedTenantPurgeExecutionJob(
+          current,
+          nowMs,
+          "integrity_conflict",
+          attempts,
+        ));
+        continue;
+      }
+      const next = clone<TenantPurgeExecutionJobRecord>({
+        ...current,
+        attempts,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+        updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      });
+      delete next.lastErrorCode;
+      validateTenantPurgeExecutionJobRecord(next);
+      staged.push(next);
+      claims.push(next);
+    }
+    const prior = new Map(this.tenantPurgeExecutionJobs);
+    try {
+      for (const job of staged) this.tenantPurgeExecutionJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantPurgeExecutionJobs, prior);
+      throw error;
+    }
+    return claims.map((job) => clone(tenantPurgeExecutionClaimFromJob(job)));
+  }
+
+  async renewTenantPurgeExecution(
+    authorization: TenantPurgeExecutionAuthorization,
+    options: RenewTenantPurgeExecutionOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantPurgeExecutionAuthorization(stagedAuthorization);
+    validateRenewTenantPurgeExecutionOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const requestedLeaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
+      ? Number.MAX_SAFE_INTEGER
+      : nowMs + stagedOptions.leaseMs;
+    if (requestedLeaseUntilMs <= nowMs) return false;
+    const current = this.tenantPurgeExecutionJobs.get(stagedAuthorization.requestId);
+    if (!current || current.phase !== "queued" || !tenantPurgeExecutionAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    this.assertTenantPurgeExecutionState(current, current.localCutoverReceiptSha256 === undefined);
+    const next = clone<TenantPurgeExecutionJobRecord>({
+      ...current,
+      leaseUntilMs: Math.max(current.leaseUntilMs!, requestedLeaseUntilMs),
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantPurgeExecutionJobRecord(next);
+    try {
+      this.tenantPurgeExecutionJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantPurgeExecutionJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async retryTenantPurgeExecution(
+    authorization: TenantPurgeExecutionAuthorization,
+    options: RetryTenantPurgeExecutionOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantPurgeExecutionAuthorization(stagedAuthorization);
+    validateRetryTenantPurgeExecutionOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantPurgeExecutionJobs.get(stagedAuthorization.requestId);
+    if (!current || current.phase !== "queued" || !tenantPurgeExecutionAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    this.assertTenantPurgeExecutionState(current, current.localCutoverReceiptSha256 === undefined);
+    const baseMs = Math.max(nowMs, current.createdAtMs, current.updatedAtMs, current.availableAtMs);
+    const availableAtMs = stagedOptions.delayMs > Number.MAX_SAFE_INTEGER - baseMs
+      ? Number.MAX_SAFE_INTEGER
+      : baseMs + stagedOptions.delayMs;
+    const next = clone<TenantPurgeExecutionJobRecord>({
+      ...this.tenantPurgeExecutionSource(current),
+      phase: "queued",
+      domainCount: current.domainCount,
+      domainAckCount: current.domainAckCount,
+      domainAckRootSha256: current.domainAckRootSha256,
+      unresolvedBlockerCount: current.unresolvedBlockerCount,
+      ...(current.localCutoverReceiptSha256 === undefined
+        ? {} : { localCutoverReceiptSha256: current.localCutoverReceiptSha256 }),
+      availableAtMs,
+      attempts: current.attempts,
+      lastErrorCode: stagedOptions.errorCode,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantPurgeExecutionJobRecord(next);
+    try {
+      this.tenantPurgeExecutionJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantPurgeExecutionJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async blockTenantPurgeExecution(
+    authorization: TenantPurgeExecutionAuthorization,
+    reason: TenantPurgeExecutionBlockReasonCode = "integrity_conflict",
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantPurgeExecutionAuthorization(stagedAuthorization);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantPurgeExecutionJobs.get(stagedAuthorization.requestId);
+    if (!current || !tenantPurgeExecutionAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    const next = this.blockedTenantPurgeExecutionJob(current, nowMs, reason);
+    try {
+      this.tenantPurgeExecutionJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantPurgeExecutionJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  private appendTenantPurgeExecutionAck(
+    current: Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }>,
+    domainName: TenantPurgePlanDomain,
+    input: {
+      ackKind: TenantPurgeExecutionDomainAck["ackKind"];
+      action: string;
+      affectedCount: number;
+      resultHashes: string[];
+      proofFields: Array<string | number | boolean | null>;
+      atMs: number;
+      authorization: TenantPurgeExecutionAuthorization;
+      final: boolean;
+      resolvesBlocker?: boolean;
+      outbox?: TenantPurgeExecutionOutboxReference;
+      scheduledAckSha256?: string;
+    },
+  ): Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }> {
+    const key = this.tenantPurgeExecutionDomainKey(
+      current.requestId,
+      current.executionGeneration,
+      domainName,
+    );
+    const domain = this.tenantPurgeExecutionDomains.get(key);
+    if (!domain || domain.phase === "acked") throw new TenantErasureIntegrityError();
+    const globalAckSeq = current.domainAckCount + 1;
+    const domainAckSeq = domain.ackCount + 1;
+    if (!Number.isSafeInteger(globalAckSeq) || !Number.isSafeInteger(domainAckSeq)) {
+      throw new TenantErasureIntegrityError();
+    }
+    const identity = this.tenantPurgeExecutionIdentity(current);
+    const resultRootSha256 = tenantPurgeExecutionResultRootSha256(
+      domainName,
+      input.action,
+      input.resultHashes,
+    );
+    const body = {
+      ...identity,
+      scope: TENANT_PURGE_EXECUTION_DOMAIN_ACK_SCOPE,
+      domain: domainName,
+      globalAckSeq,
+      domainAckSeq,
+      previousDomainAckSha256: domain.ackRootSha256,
+      previousGlobalAckSha256: current.domainAckRootSha256,
+      ackKind: input.ackKind,
+      planEntryReceiptSha256: domain.planEntryReceiptSha256,
+      affectedCount: input.affectedCount,
+      resultCount: input.resultHashes.length,
+      resultRootSha256,
+      adapterProtocol: "local-store-v1",
+      operationSha256: tenantPurgeExecutionOperationSha256({
+        identity,
+        domain: domainName,
+        action: input.action,
+        affectedCount: input.affectedCount,
+        resultCount: input.resultHashes.length,
+        resultRootSha256,
+      }),
+      physicalProofSha256: tenantPurgeExecutionPhysicalProofSha256({
+        identity,
+        domain: domainName,
+        action: input.action,
+        proofFields: input.proofFields,
+      }),
+      completedClaimAttempt: input.authorization.claimAttempt,
+      completedClaimTokenSha256: tenantPurgeExecutionClaimTokenSha256(
+        input.authorization.claimToken,
+      ),
+      storeDbTimestampMs: input.atMs,
+      final: input.final,
+      ...(input.outbox === undefined ? {} : input.outbox),
+      ...(input.scheduledAckSha256 === undefined
+        ? {} : { scheduledAckSha256: input.scheduledAckSha256 }),
+    };
+    const ack = clone<TenantPurgeExecutionDomainAck>({
+      ...body,
+      receiptSha256: tenantPurgeExecutionDomainAckSha256(body),
+    });
+    validateTenantPurgeExecutionDomainAck(ack);
+    const ackKey = this.tenantPurgeExecutionAckKey(
+      ack.requestId,
+      ack.executionGeneration,
+      ack.globalAckSeq,
+    );
+    if (this.tenantPurgeExecutionDomainAcks.has(ackKey)) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (input.resolvesBlocker && domain.phase !== "awaiting_blocker_resolution") {
+      throw new TenantErasureIntegrityError();
+    }
+    const nextDomain = clone<TenantPurgeExecutionDomainRecord>({
+      ...domain,
+      phase: input.final ? "acked" : (
+        input.resolvesBlocker || input.ackKind === "outbox_scheduled"
+          ? "awaiting_physical_ack"
+          : domain.phase
+      ),
+      ackCount: domainAckSeq,
+      ackRootSha256: tenantPurgeExecutionNextDomainAckRootSha256(
+        domain.ackRootSha256,
+        domainName,
+        ack.receiptSha256,
+      ),
+      ...(input.final ? { finalAckSha256: ack.receiptSha256 } : {}),
+      updatedAtMs: Math.max(domain.updatedAtMs, input.atMs),
+    });
+    validateTenantPurgeExecutionDomainRecord(nextDomain);
+    const unresolvedBlockerCount = input.resolvesBlocker
+      ? current.unresolvedBlockerCount - 1
+      : current.unresolvedBlockerCount;
+    if (unresolvedBlockerCount < 0) throw new TenantErasureIntegrityError();
+    const next = clone<Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }>>({
+      ...current,
+      domainAckCount: globalAckSeq,
+      domainAckRootSha256: tenantPurgeExecutionNextGlobalAckRootSha256(
+        current.domainAckRootSha256,
+        globalAckSeq,
+        ack.receiptSha256,
+      ),
+      unresolvedBlockerCount,
+      updatedAtMs: Math.max(current.updatedAtMs, input.atMs),
+    });
+    validateTenantPurgeExecutionJobRecord(next);
+    this.tenantPurgeExecutionDomainAcks.set(ackKey, ack);
+    this.tenantPurgeExecutionDomains.set(key, nextDomain);
+    this.tenantPurgeExecutionJobs.set(next.requestId, next);
+    return next;
+  }
+
+  private tenantPurgeExecutionAppliedResultHashes(
+    job: TenantPurgeExecutionJobRecord,
+    domain: TenantPurgePlanDomain,
+    action: string,
+    targetCount: number,
+    targetRootSha256: string,
+  ): string[] {
+    const identity = this.tenantPurgeExecutionIdentity(job);
+    return Array.from({ length: targetCount }, (_, ordinal) => (
+      tenantPurgeExecutionPhysicalProofSha256({
+        identity,
+        domain,
+        action,
+        proofFields: [targetRootSha256, ordinal],
+      })
+    ));
+  }
+
+  private captureTenantPurgeExecutionAtomicState() {
+    const copy = <K, V>(map: Map<K, V>) => new Map(
+      [...map].map(([key, value]) => [key, clone(value)] as const),
+    );
+    return {
+      jobs: copy(this.tenantPurgeExecutionJobs),
+      domains: copy(this.tenantPurgeExecutionDomains),
+      acks: copy(this.tenantPurgeExecutionDomainAcks),
+      cutoverReceipts: copy(this.tenantPurgeLocalCutoverReceipts),
+      physicalReceipts: copy(this.tenantPurgeLocalPhysicalAckReceipts),
+      cutovers: copy(this.tenantPurgeExecutionCutovers),
+      usageLedger: this.usageLedger.map(clone),
+      billingFacts: copy(this.billingUsageFacts),
+      blobManifests: copy(this.blobManifests),
+      blobDeleteOutbox: copy(this.blobDeleteOutbox),
+      nextBlobDeleteOutboxId: this.nextBlobDeleteOutboxId,
+      exports: this.captureUserDataExportState(),
+    };
+  }
+
+  private restoreTenantPurgeExecutionAtomicState(
+    state: ReturnType<MemorySessionStore["captureTenantPurgeExecutionAtomicState"]>,
+  ): void {
+    restoreMapSnapshot(this.tenantPurgeExecutionJobs, state.jobs);
+    restoreMapSnapshot(this.tenantPurgeExecutionDomains, state.domains);
+    restoreMapSnapshot(this.tenantPurgeExecutionDomainAcks, state.acks);
+    restoreMapSnapshot(this.tenantPurgeLocalCutoverReceipts, state.cutoverReceipts);
+    restoreMapSnapshot(this.tenantPurgeLocalPhysicalAckReceipts, state.physicalReceipts);
+    restoreMapSnapshot(this.tenantPurgeExecutionCutovers, state.cutovers);
+    this.usageLedger = state.usageLedger.map(clone);
+    restoreMapSnapshot(this.billingUsageFacts, state.billingFacts);
+    restoreMapSnapshot(this.blobManifests, state.blobManifests);
+    restoreMapSnapshot(this.blobDeleteOutbox, state.blobDeleteOutbox);
+    this.nextBlobDeleteOutboxId = state.nextBlobDeleteOutboxId;
+    this.restoreUserDataExportState(state.exports);
+  }
+
+  async executeTenantPurgeLocalCutover(
+    authorization: TenantPurgeExecutionAuthorization,
+  ): Promise<TenantPurgeLocalCutoverReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantPurgeExecutionAuthorization(stagedAuthorization);
+    const initialNowMs = this.storeNowMs();
+    const current = this.tenantPurgeExecutionJobs.get(stagedAuthorization.requestId);
+    if (!current || current.phase !== "queued" || !tenantPurgeExecutionAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      initialNowMs,
+    )) return null;
+    const existing = this.tenantPurgeLocalCutoverReceipts.get(current.requestId);
+    if (existing) {
+      this.assertTenantPurgeExecutionState(current, false);
+      return clone(existing);
+    }
+    if (initialNowMs < current.purgeNotBeforeDbMs || initialNowMs < current.sourceEvidenceDbMs) {
+      throw new TenantPurgeExecutionEvidenceChangedError();
+    }
+    const state = this.assertTenantPurgeExecutionState(current, true);
+    const entryByDomain = new Map(state.planEntries.map((entry) => [entry.domain, entry] as const));
+    const operationalEntry = entryByDomain.get("operational_usage")!;
+    const blobEntry = entryByDomain.get("blob_bytes")!;
+    const exportControlEntry = entryByDomain.get("user_export_control")!;
+    const exportSnapshotEntry = entryByDomain.get("user_export_snapshots")!;
+    const exportBytesEntry = entryByDomain.get("user_export_bytes")!;
+    const atomicState = this.captureTenantPurgeExecutionAtomicState();
+    try {
+      const cutoverAtMs = this.storeNowMs();
+      if (!tenantPurgeExecutionAuthorizationMatches(current, stagedAuthorization, cutoverAtMs)) {
+        return null;
+      }
+      if (cutoverAtMs < current.sourceEvidenceDbMs) {
+        throw new TenantPurgeExecutionEvidenceChangedError();
+      }
+      this.tenantPurgePlanHoldProof(current.tenantId);
+
+      // Verify every tenant usage row against its owner, assign legacy ids only in the staged
+      // ledger, materialize/verify durable billing facts, and then remove operational rows.
+      const stagedLedger = this.usageLedger.map(clone);
+      const tenantUsageRows = stagedLedger
+        .filter((row) => row.tenantId === current.tenantId)
+        .sort((left, right) => (
+          left.sessionId.localeCompare(right.sessionId)
+          || left.turnId.localeCompare(right.turnId)
+          || left.step - right.step
+        ));
+      const usageTargetHashes = tenantUsageRows.map((row) => tenantPurgePlanTargetSha256(
+        "operational_usage",
+        [row.usageId ?? null, row.sessionId, row.turnId, row.step],
+      ));
+      if (
+        tenantUsageRows.length !== operationalEntry.targetCount
+        || tenantPurgePlanTargetRootSha256("operational_usage", usageTargetHashes)
+          !== operationalEntry.targetRootSha256
+      ) throw new TenantPurgeExecutionEvidenceChangedError();
+      const reservedUsageIds = new Set<string>();
+      for (const row of stagedLedger) {
+        const session = this.sessions.get(row.sessionId);
+        if (!session || session.tenantId !== row.tenantId || session.userId !== row.userId) {
+          throw new TenantErasureIntegrityError();
+        }
+        if (row.usageId === undefined) continue;
+        if (!isUsageId(row.usageId) || reservedUsageIds.has(row.usageId)) {
+          throw new UsageIdentityConflictError(row.usageId);
+        }
+        reservedUsageIds.add(row.usageId);
+      }
+      for (const usageId of this.billingUsageFacts.keys()) reservedUsageIds.add(usageId);
+      for (const row of tenantUsageRows) {
+        if (row.usageId !== undefined) continue;
+        row.usage = normalizeOperationalUsageCost(row.usage, undefined);
+        let allocated: string | undefined;
+        for (let attempt = 0; attempt < 32; attempt += 1) {
+          const candidate = newUsageId();
+          if (!reservedUsageIds.has(candidate)) {
+            allocated = candidate;
+            break;
+          }
+        }
+        if (!allocated) throw new UsageReconciliationError("could not allocate a unique usage id");
+        row.usageId = allocated;
+        reservedUsageIds.add(allocated);
+      }
+      const usageFactHashes: string[] = [];
+      for (const row of tenantUsageRows) {
+        if (!row.usageId) throw new UsageIdentityConflictError("missing");
+        const fact = billingUsageFactFromLedger({
+          ...row,
+          usage: normalizeOperationalUsageCost(row.usage, row.usageId),
+        } as UsageLedgerEntry & { usageId: string });
+        const prior = this.billingUsageFacts.get(row.usageId);
+        if (prior && !billingUsageFactContentEquals(prior, fact)) {
+          throw new UsageIdentityConflictError(row.usageId);
+        }
+        if (!prior) this.billingUsageFacts.set(row.usageId, clone(fact));
+        usageFactHashes.push((prior ?? fact).factSha256);
+      }
+      this.usageLedger = stagedLedger.filter((row) => row.tenantId !== current.tenantId);
+
+      // Freeze each pre-cutover Blob target hash, then bind it to exactly one existing or newly
+      // created delete outbox row. No locator enters the execution ACK ledger.
+      const blobTargets = [...this.blobManifests.values()]
+        .filter((manifest) => manifest.tenantId === current.tenantId && manifest.state !== "deleted")
+        .sort((left, right) => left.blobId.localeCompare(right.blobId));
+      const blobTargetHashes = blobTargets.map((manifest) => tenantPurgePlanTargetSha256(
+        "blob_bytes",
+        [manifest.blobId, manifest.deletionGeneration, manifest.state],
+      ));
+      if (
+        blobTargets.length !== blobEntry.targetCount
+        || tenantPurgePlanTargetRootSha256("blob_bytes", blobTargetHashes)
+          !== blobEntry.targetRootSha256
+      ) throw new TenantPurgeExecutionEvidenceChangedError();
+      const blobReferences: TenantPurgeExecutionOutboxReference[] = [];
+      for (const [index, manifest] of blobTargets.entries()) {
+        let generation = manifest.deletionGeneration;
+        let outbox: BlobDeleteOutboxRecord | undefined;
+        if (manifest.state === "delete_pending") {
+          outbox = this.blobDeleteOutbox.get(this.blobDeleteOutboxMapKey(manifest.blobId, generation));
+          if (!outbox) throw new TenantErasureIntegrityError();
+          this.hydrateBlobDeleteOutbox(outbox, false);
+        } else {
+          generation += 1;
+          if (!Number.isSafeInteger(generation) || generation < 1) {
+            throw new TenantErasureIntegrityError();
+          }
+          const outboxKey = this.blobDeleteOutboxMapKey(manifest.blobId, generation);
+          if (this.blobDeleteOutbox.has(outboxKey)) throw new TenantErasureIntegrityError();
+          const outboxId = this.nextBlobDeleteOutboxId++;
+          if (!Number.isSafeInteger(outboxId) || outboxId < 1) {
+            throw new TenantErasureIntegrityError();
+          }
+          const pending = clone({
+            ...manifest,
+            state: "delete_pending" as const,
+            deletionGeneration: generation,
+            deleteAfterMs: cutoverAtMs,
+          });
+          delete pending.stagingExpiresAtMs;
+          outbox = clone<BlobDeleteOutboxRecord>({
+            outboxId,
+            blobId: manifest.blobId,
+            generation,
+            storageBackend: manifest.storageBackend,
+            storageFormat: manifest.storageFormat,
+            storageKey: manifest.storageKey,
+            uploadToken: manifest.uploadToken,
+            availableAtMs: cutoverAtMs,
+            attempts: 0,
+            createdAtMs: cutoverAtMs,
+          });
+          this.blobManifests.set(manifest.blobId, pending);
+          this.blobDeleteOutbox.set(outboxKey, outbox);
+        }
+        blobReferences.push({
+          outboxKind: "blob_delete",
+          outboxId: outbox.outboxId,
+          deletionGeneration: generation,
+          targetSha256: blobTargetHashes[index]!,
+        });
+      }
+      blobReferences.sort((left, right) => left.targetSha256.localeCompare(right.targetSha256));
+
+      // Revoke every export control row, remove download/idempotency capability, release every
+      // snapshot pin, and bind each non-deleted artifact part to its exact delete outbox row.
+      const controlTargetHashes = this.tenantPurgePlanTargetEvidence(
+        state.planJob,
+        "user_export_control",
+        this.tenantContentInventoryReceipts.get(current.requestId)!,
+        this.tenantCredentialRevocationReceipts.get(current.requestId)!,
+        this.tenantPurgePlanHoldProof(current.tenantId),
+      );
+      const snapshotTargetHashes = this.tenantPurgePlanTargetEvidence(
+        state.planJob,
+        "user_export_snapshots",
+        this.tenantContentInventoryReceipts.get(current.requestId)!,
+        this.tenantCredentialRevocationReceipts.get(current.requestId)!,
+        this.tenantPurgePlanHoldProof(current.tenantId),
+      );
+      if (
+        controlTargetHashes.targetCount !== exportControlEntry.targetCount
+        || controlTargetHashes.targetRootSha256 !== exportControlEntry.targetRootSha256
+        || snapshotTargetHashes.targetCount !== exportSnapshotEntry.targetCount
+        || snapshotTargetHashes.targetRootSha256 !== exportSnapshotEntry.targetRootSha256
+      ) throw new TenantPurgeExecutionEvidenceChangedError();
+      const exportParts = [...this.userDataExportParts.values()]
+        .filter((part) => {
+          const artifact = this.userDataExportArtifacts.get(part.artifactId);
+          if (!artifact) throw new TenantErasureIntegrityError();
+          return artifact.tenantId === current.tenantId && part.state !== "deleted";
+        })
+        .sort((left, right) => (
+          left.artifactId.localeCompare(right.artifactId) || left.partNumber - right.partNumber
+        ));
+      const exportTargetHashes = exportParts.map((part) => tenantPurgePlanTargetSha256(
+        "user_export_bytes",
+        [part.artifactId, part.partNumber, part.deletionGeneration, part.state],
+      ));
+      if (
+        exportParts.length !== exportBytesEntry.targetCount
+        || tenantPurgePlanTargetRootSha256("user_export_bytes", exportTargetHashes)
+          !== exportBytesEntry.targetRootSha256
+      ) throw new TenantPurgeExecutionEvidenceChangedError();
+      const tenantExportRequestIds = new Set<string>();
+      for (const request of [...this.userDataExportRequests.values()]) {
+        if (request.tenantId !== current.tenantId) continue;
+        tenantExportRequestIds.add(request.requestId);
+        const revoked = clone({ ...request, status: "revoked" as const, updatedAtMs: cutoverAtMs });
+        delete revoked.lastErrorCode;
+        this.userDataExportRequests.set(request.requestId, revoked);
+        const exportJob = this.userDataExportJobs.get(request.requestId);
+        if (exportJob) {
+          const revokedJob = clone({ ...exportJob, status: "revoked" as const, updatedAtMs: cutoverAtMs });
+          delete revokedJob.availableAtMs;
+          delete revokedJob.claimToken;
+          delete revokedJob.leaseUntilMs;
+          delete revokedJob.lastErrorCode;
+          this.userDataExportJobs.set(request.requestId, revokedJob);
+        }
+        this.userDataExportSnapshotRecords.delete(request.requestId);
+        const snapshotBlobs = this.userDataExportSnapshotBlobs.get(request.requestId);
+        if (snapshotBlobs) {
+          this.userDataExportSnapshotBlobs.set(request.requestId, snapshotBlobs.map((blob) => (
+            blob.releasedAtMs === undefined ? { ...blob, releasedAtMs: cutoverAtMs } : blob
+          )));
+        }
+      }
+      for (const [key, lease] of this.userDataExportDownloadLeases) {
+        if (lease.tenantId === current.tenantId) this.userDataExportDownloadLeases.delete(key);
+      }
+      for (const [key, requestId] of this.userDataExportIdempotency) {
+        if (tenantExportRequestIds.has(requestId)) this.userDataExportIdempotency.delete(key);
+      }
+      for (const artifact of [...this.userDataExportArtifacts.values()]) {
+        if (artifact.tenantId === current.tenantId && artifact.state !== "deleted") {
+          this.transitionUserDataExportArtifactToDeletePending(artifact.artifactId, cutoverAtMs);
+        }
+      }
+      const exportReferences: TenantPurgeExecutionOutboxReference[] = [];
+      for (const [index, originalPart] of exportParts.entries()) {
+        const part = this.userDataExportParts.get(this.userDataExportPartKey(
+          originalPart.artifactId,
+          originalPart.partNumber,
+        ));
+        if (!part || part.state !== "delete_pending") throw new TenantErasureIntegrityError();
+        const outbox = this.userDataExportDeleteOutbox.get(this.userDataExportDeleteKey(
+          part.artifactId,
+          part.partNumber,
+          part.deletionGeneration,
+        ));
+        if (!outbox) throw new TenantErasureIntegrityError();
+        this.hydrateUserDataExportDeleteOutbox(outbox);
+        exportReferences.push({
+          outboxKind: "user_export_delete",
+          outboxId: outbox.outboxId,
+          deletionGeneration: outbox.deletionGeneration,
+          targetSha256: exportTargetHashes[index]!,
+        });
+      }
+      exportReferences.sort((left, right) => left.targetSha256.localeCompare(right.targetSha256));
+
+      let working = current;
+      working = this.appendTenantPurgeExecutionAck(working, "operational_usage", {
+        ackKind: "anonymized",
+        action: "anonymize",
+        affectedCount: tenantUsageRows.length,
+        resultHashes: usageFactHashes,
+        proofFields: [operationalEntry.targetRootSha256, usageFactHashes.length, cutoverAtMs],
+        atMs: cutoverAtMs,
+        authorization: stagedAuthorization,
+        final: true,
+      });
+      const blobReferenceHashes = blobReferences.map(tenantPurgeExecutionOutboxTargetSha256);
+      working = this.appendTenantPurgeExecutionAck(working, "blob_bytes", {
+        ackKind: "blocker_resolution",
+        action: "schedule-delete",
+        affectedCount: blobTargets.length,
+        resultHashes: blobReferenceHashes,
+        proofFields: [blobEntry.targetRootSha256, tenantPurgeExecutionOutboxRootSha256(blobReferences)],
+        atMs: cutoverAtMs,
+        authorization: stagedAuthorization,
+        final: blobReferences.length === 0,
+        resolvesBlocker: true,
+      });
+      for (const reference of blobReferences) {
+        working = this.appendTenantPurgeExecutionAck(working, "blob_bytes", {
+          ackKind: "outbox_scheduled",
+          action: "outbox-scheduled",
+          affectedCount: 1,
+          resultHashes: [tenantPurgeExecutionOutboxTargetSha256(reference)],
+          proofFields: [reference.outboxKind, reference.outboxId, reference.deletionGeneration, reference.targetSha256],
+          atMs: cutoverAtMs,
+          authorization: stagedAuthorization,
+          final: false,
+          outbox: reference,
+        });
+      }
+      working = this.appendTenantPurgeExecutionAck(working, "user_export_control", {
+        ackKind: "applied",
+        action: "revoke",
+        affectedCount: exportControlEntry.targetCount,
+        resultHashes: this.tenantPurgeExecutionAppliedResultHashes(
+          working,
+          "user_export_control",
+          "revoke-result",
+          exportControlEntry.targetCount,
+          exportControlEntry.targetRootSha256,
+        ),
+        proofFields: [exportControlEntry.targetRootSha256, exportControlEntry.targetCount, cutoverAtMs],
+        atMs: cutoverAtMs,
+        authorization: stagedAuthorization,
+        final: true,
+      });
+      working = this.appendTenantPurgeExecutionAck(working, "user_export_snapshots", {
+        ackKind: "applied",
+        action: "release-pins",
+        affectedCount: exportSnapshotEntry.targetCount,
+        resultHashes: this.tenantPurgeExecutionAppliedResultHashes(
+          working,
+          "user_export_snapshots",
+          "release-pin-result",
+          exportSnapshotEntry.targetCount,
+          exportSnapshotEntry.targetRootSha256,
+        ),
+        proofFields: [exportSnapshotEntry.targetRootSha256, exportSnapshotEntry.targetCount, cutoverAtMs],
+        atMs: cutoverAtMs,
+        authorization: stagedAuthorization,
+        final: true,
+      });
+      const exportReferenceHashes = exportReferences.map(tenantPurgeExecutionOutboxTargetSha256);
+      working = this.appendTenantPurgeExecutionAck(working, "user_export_bytes", {
+        ackKind: "blocker_resolution",
+        action: "schedule-delete",
+        affectedCount: exportParts.length,
+        resultHashes: exportReferenceHashes,
+        proofFields: [exportBytesEntry.targetRootSha256, tenantPurgeExecutionOutboxRootSha256(exportReferences)],
+        atMs: cutoverAtMs,
+        authorization: stagedAuthorization,
+        final: exportReferences.length === 0,
+        resolvesBlocker: true,
+      });
+      for (const reference of exportReferences) {
+        working = this.appendTenantPurgeExecutionAck(working, "user_export_bytes", {
+          ackKind: "outbox_scheduled",
+          action: "outbox-scheduled",
+          affectedCount: 1,
+          resultHashes: [tenantPurgeExecutionOutboxTargetSha256(reference)],
+          proofFields: [reference.outboxKind, reference.outboxId, reference.deletionGeneration, reference.targetSha256],
+          atMs: cutoverAtMs,
+          authorization: stagedAuthorization,
+          final: false,
+          outbox: reference,
+        });
+      }
+
+      const receiptBody = {
+        ...this.tenantPurgeExecutionSource(working),
+        scope: TENANT_PURGE_LOCAL_CUTOVER_SCOPE,
+        operationalUsageTargetCount: operationalEntry.targetCount,
+        operationalUsageTargetRootSha256: operationalEntry.targetRootSha256,
+        blobBytesTargetCount: blobEntry.targetCount,
+        blobBytesTargetRootSha256: blobEntry.targetRootSha256,
+        blobDeleteOutboxCount: blobReferences.length,
+        blobDeleteOutboxRootSha256: tenantPurgeExecutionOutboxRootSha256(blobReferences),
+        exportBytesTargetCount: exportBytesEntry.targetCount,
+        exportBytesTargetRootSha256: exportBytesEntry.targetRootSha256,
+        exportDeleteOutboxCount: exportReferences.length,
+        exportDeleteOutboxRootSha256: tenantPurgeExecutionOutboxRootSha256(exportReferences),
+        domainAckCount: working.domainAckCount,
+        domainAckRootSha256: working.domainAckRootSha256,
+        storeDbTimestampMs: cutoverAtMs,
+        completedClaimAttempt: stagedAuthorization.claimAttempt,
+        completedClaimTokenSha256: tenantPurgeExecutionClaimTokenSha256(stagedAuthorization.claimToken),
+        localDestructiveProgress: true as const,
+        physicalAcksComplete: false as const,
+        allDomainsComplete: false as const,
+        contentPurgeExecuted: false as const,
+      };
+      const receipt = clone<TenantPurgeLocalCutoverReceipt>({
+        ...receiptBody,
+        receiptSha256: tenantPurgeLocalCutoverReceiptSha256(receiptBody),
+      });
+      validateTenantPurgeLocalCutoverReceipt(receipt);
+      const next = clone<Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }>>({
+        ...working,
+        localCutoverReceiptSha256: receipt.receiptSha256,
+      });
+      validateTenantPurgeExecutionJobRecord(next);
+      if (this.tenantPurgeLocalCutoverReceipts.has(next.requestId)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const cutover = this.assertTenantPurgeExecutionCutoverState();
+      this.tenantPurgeLocalCutoverReceipts.set(next.requestId, receipt);
+      this.tenantPurgeExecutionJobs.set(next.requestId, next);
+      if (cutover.controlGeneration === 0) {
+        const activatedBody = {
+          singletonId: TENANT_PURGE_EXECUTION_CUTOVER_SINGLETON_ID,
+          controlGeneration: 1 as const,
+          activatedAtDbMs: cutoverAtMs,
+          firstRequestId: next.requestId,
+          firstReceiptSha256: receipt.receiptSha256,
+        };
+        const activated = clone<TenantPurgeExecutionCutoverRecord>({
+          ...activatedBody,
+          evidenceSha256: tenantPurgeExecutionCutoverEvidenceSha256(activatedBody),
+        });
+        validateTenantPurgeExecutionCutoverRecord(activated);
+        this.tenantPurgeExecutionCutovers.set(TENANT_PURGE_EXECUTION_CUTOVER_SINGLETON_ID, activated);
+      }
+      const publishNowMs = this.storeNowMs();
+      if (!tenantPurgeExecutionAuthorizationMatches(next, stagedAuthorization, publishNowMs)) {
+        this.restoreTenantPurgeExecutionAtomicState(atomicState);
+        return null;
+      }
+      this.tenantPurgePlanHoldProof(next.tenantId);
+      return clone(receipt);
+    } catch (error) {
+      this.restoreTenantPurgeExecutionAtomicState(atomicState);
+      if (
+        error instanceof TenantPurgeExecutionEvidenceChangedError
+        || error instanceof TenantPurgeExecutionNotReadyError
+      ) throw error;
+      if (error instanceof TenantPurgePlanNotReadyError && error.reason === "active_legal_hold") {
+        throw new TenantPurgeExecutionNotReadyError("active_legal_hold");
+      }
+      throw error;
+    }
+  }
+
+  async sealTenantPurgeLocalPhysicalAcks(
+    authorization: TenantPurgeExecutionAuthorization,
+  ): Promise<TenantPurgeLocalPhysicalAckReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantPurgeExecutionAuthorization(stagedAuthorization);
+    const initialNowMs = this.storeNowMs();
+    const current = this.tenantPurgeExecutionJobs.get(stagedAuthorization.requestId);
+    if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    if (current.phase === "local_physical_acks_sealed") {
+      this.assertTenantPurgeExecutionState(current, false);
+      if (
+        current.subjectGeneration !== stagedAuthorization.subjectGeneration
+        || current.planBuildGeneration !== stagedAuthorization.planBuildGeneration
+        || current.executionGeneration !== stagedAuthorization.executionGeneration
+        || current.completedClaimAttempt !== stagedAuthorization.claimAttempt
+        || current.completedClaimTokenSha256
+          !== tenantPurgeExecutionClaimTokenSha256(stagedAuthorization.claimToken)
+      ) return null;
+      return clone(this.tenantPurgeLocalPhysicalAckReceipts.get(current.requestId)!);
+    }
+    if (current.phase !== "queued" || !tenantPurgeExecutionAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      initialNowMs,
+    )) return null;
+    const state = this.assertTenantPurgeExecutionState(current, false);
+    const cutoverReceipt = this.tenantPurgeLocalCutoverReceipts.get(current.requestId);
+    if (!cutoverReceipt || current.localCutoverReceiptSha256 !== cutoverReceipt.receiptSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const scheduled = state.acks.filter((ack) => ack.ackKind === "outbox_scheduled");
+    const blobScheduled = scheduled
+      .filter((ack) => ack.outboxKind === "blob_delete")
+      .sort((left, right) => left.targetSha256!.localeCompare(right.targetSha256!));
+    const exportScheduled = scheduled
+      .filter((ack) => ack.outboxKind === "user_export_delete")
+      .sort((left, right) => left.targetSha256!.localeCompare(right.targetSha256!));
+    const references = (acks: TenantPurgeExecutionDomainAck[]): TenantPurgeExecutionOutboxReference[] => (
+      acks.map((ack) => ({
+        outboxKind: ack.outboxKind!,
+        outboxId: ack.outboxId!,
+        deletionGeneration: ack.deletionGeneration!,
+        targetSha256: ack.targetSha256!,
+      }))
+    );
+    if (
+      blobScheduled.length !== cutoverReceipt.blobDeleteOutboxCount
+      || exportScheduled.length !== cutoverReceipt.exportDeleteOutboxCount
+      || tenantPurgeExecutionOutboxRootSha256(references(blobScheduled))
+        !== cutoverReceipt.blobDeleteOutboxRootSha256
+      || tenantPurgeExecutionOutboxRootSha256(references(exportScheduled))
+        !== cutoverReceipt.exportDeleteOutboxRootSha256
+    ) throw new TenantErasureIntegrityError();
+
+    const completed: Array<{
+      scheduled: TenantPurgeExecutionDomainAck;
+      reference: TenantPurgeExecutionOutboxReference;
+      completedAtMs: number;
+    }> = [];
+    let pending = false;
+    let deadLettered = false;
+    for (const scheduledAck of [...blobScheduled, ...exportScheduled]) {
+      const reference = references([scheduledAck])[0]!;
+      if (reference.outboxKind === "blob_delete") {
+        const entry = this.findBlobDeleteOutboxById(reference.outboxId);
+        if (!entry || entry[1].generation !== reference.deletionGeneration) {
+          throw new TenantErasureIntegrityError();
+        }
+        const row = this.hydrateBlobDeleteOutbox(entry[1], false);
+        const manifest = this.blobManifests.get(row.blobId);
+        if (!manifest || manifest.tenantId !== current.tenantId) {
+          throw new TenantErasureIntegrityError();
+        }
+        if (row.deadLetteredAtMs !== undefined) {
+          deadLettered = true;
+        } else if (row.completedAtMs === undefined) {
+          pending = true;
+        } else {
+          if (manifest.state !== "deleted" || manifest.deletionGeneration !== row.generation) {
+            throw new TenantErasureIntegrityError();
+          }
+          completed.push({ scheduled: scheduledAck, reference, completedAtMs: row.completedAtMs });
+        }
+      } else {
+        const entry = this.findUserDataExportDeleteOutboxById(reference.outboxId);
+        if (!entry || entry[1].deletionGeneration !== reference.deletionGeneration) {
+          throw new TenantErasureIntegrityError();
+        }
+        const row = this.hydrateUserDataExportDeleteOutbox(entry[1]);
+        const artifact = this.userDataExportArtifacts.get(row.artifactId);
+        const part = this.userDataExportParts.get(this.userDataExportPartKey(
+          row.artifactId,
+          row.partNumber,
+        ));
+        if (!artifact || artifact.tenantId !== current.tenantId || !part) {
+          throw new TenantErasureIntegrityError();
+        }
+        if (row.deadLetteredAtMs !== undefined) {
+          deadLettered = true;
+        } else if (row.completedAtMs === undefined) {
+          pending = true;
+        } else {
+          if (part.state !== "deleted" || part.deletionGeneration !== row.deletionGeneration) {
+            throw new TenantErasureIntegrityError();
+          }
+          completed.push({ scheduled: scheduledAck, reference, completedAtMs: row.completedAtMs });
+        }
+      }
+    }
+    if (deadLettered) {
+      const before = new Map(this.tenantPurgeExecutionJobs);
+      try {
+        this.tenantPurgeExecutionJobs.set(current.requestId, this.blockedTenantPurgeExecutionJob(
+          current,
+          initialNowMs,
+          "physical_ack_dead_lettered",
+        ));
+      } catch (error) {
+        restoreMapSnapshot(this.tenantPurgeExecutionJobs, before);
+        throw error;
+      }
+      throw new TenantPurgeExecutionPhysicalAckDeadLetterError();
+    }
+    if (pending || completed.length !== scheduled.length) {
+      throw new TenantPurgeExecutionNotReadyError("physical_ack_pending");
+    }
+
+    const atomicState = this.captureTenantPurgeExecutionAtomicState();
+    try {
+      const sealAtMs = this.storeNowMs();
+      if (!tenantPurgeExecutionAuthorizationMatches(current, stagedAuthorization, sealAtMs)) {
+        return null;
+      }
+      let working = current;
+      const physicalByDomain = new Map<TenantPurgePlanDomain, string[]>();
+      for (const domainName of ["blob_bytes", "user_export_bytes"] as const) {
+        const candidates = completed
+          .filter((entry) => entry.scheduled.domain === domainName)
+          .sort((left, right) => left.reference.targetSha256.localeCompare(right.reference.targetSha256));
+        for (const [index, entry] of candidates.entries()) {
+          if (entry.completedAtMs > sealAtMs) throw new TenantErasureIntegrityError();
+          const resultHash = tenantPurgeExecutionOutboxTargetSha256(entry.reference);
+          working = this.appendTenantPurgeExecutionAck(working, domainName, {
+            ackKind: "physical_delete",
+            action: "physical-delete",
+            affectedCount: 1,
+            resultHashes: [resultHash],
+            proofFields: [
+              entry.reference.outboxKind,
+              entry.reference.outboxId,
+              entry.reference.deletionGeneration,
+              entry.reference.targetSha256,
+              entry.completedAtMs,
+            ],
+            atMs: sealAtMs,
+            authorization: stagedAuthorization,
+            final: index === candidates.length - 1,
+            outbox: entry.reference,
+            scheduledAckSha256: entry.scheduled.receiptSha256,
+          });
+          const hashes = physicalByDomain.get(domainName) ?? [];
+          hashes.push(this.tenantPurgeExecutionAcksFor(working).at(-1)!.receiptSha256);
+          physicalByDomain.set(domainName, hashes);
+        }
+      }
+      const blobPhysicalHashes = physicalByDomain.get("blob_bytes") ?? [];
+      const exportPhysicalHashes = physicalByDomain.get("user_export_bytes") ?? [];
+      const receiptBody = {
+        ...this.tenantPurgeExecutionSource(working),
+        scope: TENANT_PURGE_LOCAL_PHYSICAL_ACK_SCOPE,
+        localCutoverReceiptSha256: cutoverReceipt.receiptSha256,
+        blobPhysicalAckCount: blobPhysicalHashes.length,
+        blobPhysicalAckRootSha256: tenantPurgeExecutionResultRootSha256(
+          "blob_bytes",
+          "physical-ack-chain",
+          blobPhysicalHashes,
+        ),
+        exportPhysicalAckCount: exportPhysicalHashes.length,
+        exportPhysicalAckRootSha256: tenantPurgeExecutionResultRootSha256(
+          "user_export_bytes",
+          "physical-ack-chain",
+          exportPhysicalHashes,
+        ),
+        domainAckCount: working.domainAckCount,
+        domainAckRootSha256: working.domainAckRootSha256,
+        unresolvedBlockerCount: working.unresolvedBlockerCount,
+        storeDbTimestampMs: sealAtMs,
+        completedClaimAttempt: stagedAuthorization.claimAttempt,
+        completedClaimTokenSha256: tenantPurgeExecutionClaimTokenSha256(stagedAuthorization.claimToken),
+        localPhysicalAcksComplete: true as const,
+        allDomainsComplete: false as const,
+        contentPurgeExecuted: false as const,
+      };
+      const receipt = clone<TenantPurgeLocalPhysicalAckReceipt>({
+        ...receiptBody,
+        receiptSha256: tenantPurgeLocalPhysicalAckReceiptSha256(receiptBody),
+      });
+      validateTenantPurgeLocalPhysicalAckReceipt(receipt);
+      const publishNowMs = this.storeNowMs();
+      if (!tenantPurgeExecutionAuthorizationMatches(working, stagedAuthorization, publishNowMs)) {
+        this.restoreTenantPurgeExecutionAtomicState(atomicState);
+        return null;
+      }
+      if (this.tenantPurgeLocalPhysicalAckReceipts.has(working.requestId)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const terminal = clone<TenantPurgeExecutionJobRecord>({
+        ...this.tenantPurgeExecutionSource(working),
+        phase: "local_physical_acks_sealed",
+        domainCount: working.domainCount,
+        domainAckCount: working.domainAckCount,
+        domainAckRootSha256: working.domainAckRootSha256,
+        unresolvedBlockerCount: working.unresolvedBlockerCount,
+        localCutoverReceiptSha256: cutoverReceipt.receiptSha256,
+        attempts: working.attempts,
+        createdAtMs: working.createdAtMs,
+        updatedAtMs: Math.max(working.updatedAtMs, sealAtMs),
+        localPhysicalAckReceiptSha256: receipt.receiptSha256,
+        localPhysicalAcksSealedAtDbMs: sealAtMs,
+        completedClaimAttempt: stagedAuthorization.claimAttempt,
+        completedClaimTokenSha256: receipt.completedClaimTokenSha256,
+      });
+      validateTenantPurgeExecutionJobRecord(terminal);
+      this.tenantPurgeLocalPhysicalAckReceipts.set(working.requestId, receipt);
+      this.tenantPurgeExecutionJobs.set(working.requestId, terminal);
+      return clone(receipt);
+    } catch (error) {
+      this.restoreTenantPurgeExecutionAtomicState(atomicState);
+      throw error;
+    }
+  }
+
+  async getTenantPurgeExecutionJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantPurgeExecutionJobRecord | null> {
+    const job = this.tenantPurgeExecutionJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    this.assertTenantPurgeExecutionState(job, job.localCutoverReceiptSha256 === undefined);
+    return clone(job);
+  }
+
+  async getTenantPurgeExecutionDomains(
+    tenantId: string,
+    requestId: string,
+    executionGeneration: number,
+  ): Promise<TenantPurgeExecutionDomainRecord[]> {
+    const job = this.tenantPurgeExecutionJobs.get(requestId);
+    if (
+      !job
+      || job.tenantId !== tenantId
+      || job.executionGeneration !== executionGeneration
+    ) return [];
+    return this.assertTenantPurgeExecutionState(
+      job,
+      job.localCutoverReceiptSha256 === undefined,
+    ).domains.map(clone);
+  }
+
+  async getTenantPurgeExecutionDomainAcks(
+    tenantId: string,
+    requestId: string,
+    executionGeneration: number,
+  ): Promise<TenantPurgeExecutionDomainAck[]> {
+    const job = this.tenantPurgeExecutionJobs.get(requestId);
+    if (
+      !job
+      || job.tenantId !== tenantId
+      || job.executionGeneration !== executionGeneration
+    ) return [];
+    return this.assertTenantPurgeExecutionState(
+      job,
+      job.localCutoverReceiptSha256 === undefined,
+    ).acks.map(clone);
+  }
+
+  async getTenantPurgeLocalCutoverReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantPurgeLocalCutoverReceipt | null> {
+    const receipt = this.tenantPurgeLocalCutoverReceipts.get(requestId);
+    if (!receipt || receipt.tenantId !== tenantId) return null;
+    const job = this.tenantPurgeExecutionJobs.get(requestId);
+    if (!job) throw new TenantErasureIntegrityError();
+    this.assertTenantPurgeExecutionState(job, false);
+    return clone(receipt);
+  }
+
+  async getTenantPurgeLocalPhysicalAckReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantPurgeLocalPhysicalAckReceipt | null> {
+    const receipt = this.tenantPurgeLocalPhysicalAckReceipts.get(requestId);
+    if (!receipt || receipt.tenantId !== tenantId) return null;
+    const job = this.tenantPurgeExecutionJobs.get(requestId);
+    if (!job) throw new TenantErasureIntegrityError();
+    this.assertTenantPurgeExecutionState(job, false);
+    return clone(receipt);
+  }
+
+  async getTenantPurgeExecutionCutover(): Promise<TenantPurgeExecutionCutoverRecord> {
+    return clone(this.assertTenantPurgeExecutionCutoverState());
+  }
+
   async getSubjectLifecycle(
     tenantId: string,
     subjectKind: DataSubjectKind,
@@ -10160,7 +12042,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || manifest.userId !== input.owner.userId
       || manifest.sessionId !== input.sessionId
       || manifest.purpose !== input.purpose
-      || !isUnexpiredStagingBlob(manifest, Date.now())
+      || !isUnexpiredStagingBlob(manifest, this.storeNowMs())
       || manifest.itemId !== undefined
       || manifest.uploadedAtMs === undefined
       || manifest.sha256 === undefined
@@ -10253,7 +12135,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     this.assertCommitResourceIdentities(batch);
 
     const stagedReadyBlobs = new Map<string, BlobManifest>();
-    const readyAtMs = Date.now();
+    const readyAtMs = this.storeNowMs();
     for (const binding of batch.blobBindings ?? []) {
       const manifest = this.blobManifests.get(binding.blobId);
       if (

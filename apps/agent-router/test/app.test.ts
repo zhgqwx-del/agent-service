@@ -22,6 +22,9 @@ import {
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH,
+  INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER,
+  INTERNAL_TENANT_PURGE_EXECUTION_ACK_VALUE,
+  INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH,
   INTERNAL_TENANT_ERASURE_ACTOR_HEADER,
   INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
   INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
@@ -34,6 +37,7 @@ import {
   INTERNAL_TOMBSTONE_PATH_PREFIX,
   PROTOCOL_VERSION,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "@agent-service/protocol";
 import { createRouterApp } from "../src/app.js";
@@ -115,6 +119,8 @@ function fakeRegistry(
     purgePolicyEvaluation?: boolean;
     credentialRevocation?: boolean;
     credentialWorker?: boolean;
+    purgeExecution?: boolean;
+    purgeExecutionWorker?: boolean;
     exportReadable?: boolean;
     exportAdmission?: boolean;
     targetExport?: boolean | ((url: string) => boolean);
@@ -176,6 +182,10 @@ function fakeRegistry(
     ),
     allConfiguredSupportTenantCredentialRevocationWorker: () => (
       (opts.credentialRevocation ?? false) && (opts.credentialWorker ?? false)
+    ),
+    allConfiguredSupportTenantPurgeExecution: () => opts.purgeExecution ?? false,
+    allConfiguredSupportTenantPurgeExecutionWorker: () => (
+      (opts.purgeExecution ?? false) && (opts.purgeExecutionWorker ?? false)
     ),
     allHealthySupportUserDataExport: () => opts.exportReadable ?? false,
     allConfiguredSupportUserDataExportAdmission: () => opts.exportAdmission ?? false,
@@ -705,6 +715,96 @@ describe("internal user-erasure routing", () => {
     expect(failed.status).toBe(503);
     expect(failed.headers.get(INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER)).toBeNull();
     expect((await enabled.request(`${INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH}/extra`, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    })).status).toBe(404);
+  });
+
+  it("freshly gates T3e execution on an exact all-configured worker fleet", async () => {
+    const target = "http://runner.internal:8787";
+    const refresh = vi.fn();
+    const enabled = createRouterApp({
+      registry: fakeRegistry([target], {
+        purgeExecution: true,
+        purgeExecutionWorker: true,
+        refresh,
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantPurgeExecutionEnabled: () => true,
+      logger: silent,
+    });
+
+    const hidden = await enabled.request(INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: "wrong-internal-token-000000000000" },
+    });
+    expect(hidden.status).toBe(404);
+    expect(hidden.headers.get(INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER)).toBeNull();
+    expectPrivateLifecycleResponse(hidden);
+    expect(refresh).not.toHaveBeenCalled();
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const ready = await enabled.request(INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH, {
+        headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      });
+      expect(ready.status).toBe(204);
+      expect(ready.headers.get(INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER)).toBe(
+        INTERNAL_TENANT_PURGE_EXECUTION_ACK_VALUE,
+      );
+      expectPrivateLifecycleResponse(ready);
+      expect(refresh).toHaveBeenCalledTimes(attempt);
+    }
+
+    for (const unavailable of [
+      createRouterApp({
+        registry: fakeRegistry([target], {
+          purgeExecution: true,
+          purgeExecutionWorker: true,
+        }),
+        internalRunnerToken: INTERNAL_TOKEN,
+        logger: silent,
+      }),
+      createRouterApp({
+        registry: fakeRegistry([target], {
+          purgeExecution: true,
+          purgeExecutionWorker: false,
+        }),
+        internalRunnerToken: INTERNAL_TOKEN,
+        tenantPurgeExecutionEnabled: () => true,
+        logger: silent,
+      }),
+      createRouterApp({
+        registry: fakeRegistry([target], {
+          purgeExecution: false,
+          purgeExecutionWorker: true,
+        }),
+        internalRunnerToken: INTERNAL_TOKEN,
+        tenantPurgeExecutionEnabled: () => true,
+        logger: silent,
+      }),
+    ]) {
+      const response = await unavailable.request(INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH, {
+        headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      });
+      expect(response.status).toBe(503);
+      expect(response.headers.get(INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER)).toBeNull();
+      expectPrivateLifecycleResponse(response);
+    }
+
+    const refreshFailure = createRouterApp({
+      registry: fakeRegistry([target], {
+        purgeExecution: true,
+        purgeExecutionWorker: true,
+        refresh: async () => { throw new Error("probe failed"); },
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantPurgeExecutionEnabled: () => true,
+      logger: silent,
+    });
+    const failed = await refreshFailure.request(INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(failed.status).toBe(503);
+    expect(failed.headers.get(INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER)).toBeNull();
+    expect((await enabled.request(`${INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH}/extra`, {
       headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
     })).status).toBe(404);
   });
@@ -1920,7 +2020,7 @@ describe("operational endpoints", () => {
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {
-    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone", "purge"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"], dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"], dataGovernanceManagement: true, purgePolicyEvaluation: ["policy-evaluator-v1"], dataPurgeExecution: false, tenantCredentialRevocation: [TENANT_CREDENTIAL_REVOCATION_STORE_V1], tenantCredentialRevocationWorker: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone", "purge"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"], dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"], dataGovernanceManagement: true, purgePolicyEvaluation: ["policy-evaluator-v1"], dataPurgeExecution: false, tenantCredentialRevocation: [TENANT_CREDENTIAL_REVOCATION_STORE_V1], tenantCredentialRevocationWorker: true, tenantPurgeExecution: [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1], tenantPurgeExecutionWorker: true, dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
       registry: fakeRegistry([a.url], {
         blobs: true,
@@ -1928,16 +2028,19 @@ describe("operational endpoints", () => {
         purgePolicyEvaluation: true,
         credentialRevocation: true,
         credentialWorker: true,
+        purgeExecution: true,
+        purgeExecutionWorker: true,
       }),
       tombstoneEnabled: () => true,
       blobAttachmentsEnabled: () => true,
       erasureRequestsEnabled: () => true,
       dataGovernanceManagementEnabled: () => true,
       tenantCredentialRevocationExecutionEnabled: () => true,
+      tenantPurgeExecutionEnabled: () => true,
       internalRunnerToken: INTERNAL_TOKEN,
       logger: silent,
     });
-    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[]; erasureJobControl: string[]; dataGovernance: string[]; dataGovernanceManagement: boolean; purgePolicyEvaluation: string[]; dataPurgeExecution: boolean; tenantCredentialRevocation: string[]; tenantCredentialRevocationWorker: boolean } };
+    const caps = (await (await app.request("/v1/capabilities")).json()) as { service: string; features: { skills: boolean; mcp: string[]; sessionLifecycle: string[]; blobAttachments: boolean; dataErasureRequests: boolean; userErasureWorker: string[]; erasureJobControl: string[]; dataGovernance: string[]; dataGovernanceManagement: boolean; purgePolicyEvaluation: string[]; dataPurgeExecution: boolean; tenantCredentialRevocation: string[]; tenantCredentialRevocationWorker: boolean; tenantPurgeExecution: string[]; tenantPurgeExecutionWorker: boolean } };
     expect(caps.service).toBe("agent-router");
     expect(caps.features.skills).toBe(true);
     expect(caps.features.mcp).toEqual(["streamable-http"]);
@@ -1951,6 +2054,8 @@ describe("operational endpoints", () => {
     expect(caps.features.purgePolicyEvaluation).toEqual(["policy-evaluator-v1"]);
     expect(caps.features.tenantCredentialRevocation).toEqual(["credential-store-v1"]);
     expect(caps.features.tenantCredentialRevocationWorker).toBe(true);
+    expect(caps.features.tenantPurgeExecution).toEqual([TENANT_PURGE_EXECUTION_LOCAL_ACK_V1]);
+    expect(caps.features.tenantPurgeExecutionWorker).toBe(true);
     expect(caps.features.dataPurgeExecution).toBe(false);
 
     const noToken = createRouterApp({

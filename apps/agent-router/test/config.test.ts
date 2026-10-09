@@ -14,6 +14,7 @@ describe("router configuration", () => {
     expect(local.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(local.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
     expect(local.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED).toBe(false);
+    expect(local.TENANT_PURGE_EXECUTION_ENABLED).toBe(false);
     expect(local.TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED).toBe(false);
     expect(local.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
     expect(local.dataExportArtifactsReadable).toBe(false);
@@ -68,6 +69,14 @@ describe("router configuration", () => {
     expect(() => loadRouterConfig({
       RUNNERS: "http://runner:8787",
       TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: "true",
+    })).toThrow();
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_PURGE_EXECUTION_ENABLED: "1",
+    }).TENANT_PURGE_EXECUTION_ENABLED).toBe(true);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_PURGE_EXECUTION_ENABLED: "true",
     })).toThrow();
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",

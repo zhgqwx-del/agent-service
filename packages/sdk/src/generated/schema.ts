@@ -1140,6 +1140,10 @@ export type components = {
                 /** @default false */
                 readonly tenantErasureRequests?: boolean;
                 /** @default [] */
+                readonly tenantPurgeExecution?: readonly "local-execution-ack-v1"[];
+                /** @default false */
+                readonly tenantPurgeExecutionWorker?: boolean;
+                /** @default [] */
                 readonly tenantRuntimeDrain?: readonly "runtime-drain-v1"[];
                 /** @default false */
                 readonly tenantRuntimeDrainEndpoint?: boolean;

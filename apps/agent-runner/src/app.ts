@@ -60,6 +60,7 @@ import {
   RetentionPolicyPutRequest,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
   TenantErasureRequestHeaders,
@@ -165,6 +166,8 @@ export interface AppDeps {
   tenantErasureAdmissionGate?: { canAdmit: () => Promise<boolean> };
   /** Local credential-revocation worker activation; the router barrier remains separately required. */
   tenantCredentialRevocationWorkerEnabled?: boolean;
+  /** Local T3e worker activation; code awareness remains separately advertised during rollout. */
+  tenantPurgeExecutionWorkerEnabled?: boolean;
   /** Narrow T3a store surface; its presence is the code-awareness signal advertised to routers. */
   tenantCredentialRevocation?: TenantCredentialRevocationStore;
   /** Narrow T3b runtime surface; main owns the coordinator and per-process boot identity. */
@@ -316,6 +319,9 @@ export function createApp(deps: AppDeps) {
         tenantCredentialRevocationWorker:
           deps.tenantCredentialRevocation !== undefined
           && deps.tenantCredentialRevocationWorkerEnabled === true,
+        // Code awareness and activation are deliberately separate rolling-upgrade signals.
+        tenantPurgeExecution: [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1],
+        tenantPurgeExecutionWorker: deps.tenantPurgeExecutionWorkerEnabled === true,
         tenantRuntimeDrain: deps.tenantRuntimeDrain === undefined
           ? []
           : [TENANT_RUNTIME_DRAIN_V1],

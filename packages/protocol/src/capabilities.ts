@@ -101,6 +101,19 @@ export const INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE =
   "credential-revocation-v1" as const;
 
 /**
+ * A tenant-purge executor obtains this content-free ACK before it may touch the independent
+ * execution queue or cross an irreversible local action boundary. The router emits it only after
+ * a fresh, non-sticky observation of every configured runner. This ACK is deliberately narrower
+ * than the reserved public dataPurgeExecution signal and cannot prove purge completion.
+ */
+export const INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH =
+  "/_internal/tenant-purge-execution-v1/ready" as const;
+export const INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER =
+  "x-agent-service-tenant-purge-execution" as const;
+export const INTERNAL_TENANT_PURGE_EXECUTION_ACK_VALUE =
+  "local-execution-ack-v1" as const;
+
+/**
  * T3b is a fleet operation rather than an owner-routed request. A claimant calls the router path,
  * the router takes a fresh identity snapshot from every exact configured runner URL, then invokes
  * the runner path once per snapshot member. The private ready route binds a stable logical runner
@@ -368,6 +381,14 @@ export type TenantCredentialRevocationCapability = z.infer<
   typeof TenantCredentialRevocationCapability
 >;
 
+export const TENANT_PURGE_EXECUTION_LOCAL_ACK_V1 = "local-execution-ack-v1" as const;
+export const TenantPurgeExecutionCapability = z.literal(
+  TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+);
+export type TenantPurgeExecutionCapability = z.infer<
+  typeof TenantPurgeExecutionCapability
+>;
+
 export const PURGE_POLICY_EVALUATOR_V1 = "policy-evaluator-v1" as const;
 export const PurgePolicyEvaluationCapability = z.literal(PURGE_POLICY_EVALUATOR_V1);
 export type PurgePolicyEvaluationCapability = z.infer<typeof PurgePolicyEvaluationCapability>;
@@ -450,6 +471,10 @@ export const Capabilities = z.object({
     tenantCredentialRevocation: z.array(TenantCredentialRevocationCapability).max(1).default([]),
     /** Local worker activation; fleet execution additionally requires the router's fresh barrier. */
     tenantCredentialRevocationWorker: z.boolean().default(false),
+    /** Code understands the local T3e execution/physical-ACK substrate; this is not completion. */
+    tenantPurgeExecution: z.array(TenantPurgeExecutionCapability).max(1).default([]),
+    /** Local executor activation; fleet authority additionally requires the router's fresh barrier. */
+    tenantPurgeExecutionWorker: z.boolean().default(false),
     /** Code understands the private all-configured runtime-drain receipt contract. */
     tenantRuntimeDrain: z.array(TenantRuntimeDrainCapability).max(1).default([]),
     /** Local private endpoint is active; the router still performs a fresh identity probe. */

@@ -52,6 +52,10 @@ const Env = z.object({
   TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Independent execution barrier for the T3e local execution/physical-ACK worker. */
+  TENANT_PURGE_EXECUTION_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** Broadcast T3b runtime drain. Keep closed until every configured stable runner endpoint is active. */
   TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")

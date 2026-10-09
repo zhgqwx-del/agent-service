@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority、异步user-export artifact/download/TTL，以及tenant-erasure T1/T2/T3a/T3b、非破坏性T3c与T3d本地/CI切片均已完成。`0021` T3c以可信数据库时间封存完整session/turn/item/event/approval owner结构清单；`0022` T3d再从T1/T3a/T3b/T3c、immutable policy和DB-time deadline显式materialize固定33域的content-free purge plan，每域都有count/root/disposition/source hash，不能因adapter缺失而省略。历史provider/auth均为零时仍明确记录9个adapter/restore blocker；仅tenant auth envelope非零时记录10个；任一provider config非零时因其也可能包含BYOK/KMS envelope而记录11个。aggregate只声明`planComplete=true`，固定`executionReady=false`、`contentPurgeExecuted=false`；store/worker没有delete/anonymize/revoke/completion入口。公开status仍为`gated`、`dataPurgeExecution=false`，destructive executor、各物理ACK、external provider/KMS与独立故障域restore replay仍未完成，M1尚未闭环。M2本地/CI代码范围已完成并正式冻结；M3/M4尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority、异步user-export artifact/download/TTL，以及tenant-erasure T1/T2/T3a/T3b、非破坏性T3c/T3d与本地受限T3e执行/ACK切片均已完成。`0021` T3c封存可信DB-time owner清单，`0022` T3d固定33域plan与显式blocker；`0023` T3e则在Memory原子边界或MySQL事务中重验T3c/T3d、canonical hold、owner closure、DB time与live lease，完成operational usage→billing事实去身份化、user export撤销/download lease清除/snapshot pin释放，并为Blob/export bytes写exact delete outbox，cleanup实际完成后才seal physical ACK。T3e内嵌runner、双gate默认关闭且每个关键边界需要fresh all-configured fleet proof；不新增服务、进程或镜像。它仍不处理session/idempotency/lifecycle/Redis、其余本地域、external provider/KMS、backup/restore、logs/traces与restore replay，receipt固定`allDomainsComplete=false`、`contentPurgeExecuted=false`，公开status仍为`gated`、`dataPurgeExecution=false`，因此M1尚未冻结。M2本地/CI代码范围已完成并正式冻结；M3/M4尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -641,3 +641,33 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - M2冻结结论不变；本轮仍属于M1，没有开始M3。T3d解决的是“所有已知域都必须被列出并说明处置/阻断原因”，不是“已经可以删除”。9、10或11个blocker恰好证明本地环境不能冒充云adapter、外部撤销或restore replay已经就绪。
 - 下一独立切片仍需设计默认关闭、最小权限的destructive execution/ACK saga：在执行边界重新验证0016、T3c、T3d、canonical hold、owner关系和DB-time deadline，再分别取得usage匿名化、ready Blob与export bytes物理删除、session/idempotency/lifecycle/Redis清理等本地可验证ACK。external provider/KMS、共享对象存储、backup/restore、logs/traces必须由真实adapter提供proof；缺失时保持blocker，不得把计划receipt改写成成功。
 - 只有全部域执行、物理ACK、completion proof及独立故障域restore replay闭环后，才可推进tenant completed、正式冻结M1并进入M3。没有云资源不阻止继续实现本地/CI executor协议、Memory/MySQL/Redis与fake-adapter故障注入；真实云资源、IAM/KMS、共享对象存储、备份恢复、Kubernetes/VM拓扑、域名/TLS与告警集成仍等待实际参数。
+
+## 2026-10-09（M1 数据生命周期：0023 tenant erasure T3e local execution / physical ACK）
+
+### 已完成
+
+1. 新增expand-only、runtime默认休眠的`0023_tenant_purge_execution_ack.sql`：独立execution job、固定33域执行投影、append-only domain ACK、local cutover/physical ACK receipt和write-once cutover singleton。migration不materialize历史plan、不运行worker、不修改业务数据、不创建delete outbox或伪造physical ACK；六张表的精确列/index/CHECK/FK/trigger fingerprint和永久guard会拒绝不兼容同名schema。
+2. Memory/MySQL实现同一最小权限`TenantPurgeExecutionStore`：materialize只消费完整T3d aggregate，并把`sourceEvidenceDbMs`绑定到plan receipt的可信DB时间；claim/renew/retry/block、cutover、physical seal和read-proof全部绑定tenant/request/subject/plan/execution generation、claim attempt/token及完整ACK链。响应丢失只能按精确completed claim identity重放，不能由“源已为空”推断成功。
+3. local cutover只推进五个已实现域：`operational_usage`原子生成/核对匿名billing fact后删除operational ledger；`user_export_control`撤销request/job并清除download lease；`user_export_snapshots`释放Blob pin并删除snapshot record；`blob_bytes`与`user_export_bytes`只把精确目标切为delete-pending并写现有cleanup outbox。blocker resolution、每个outbox identity、target/deletion generation及其顺序都进入content-free ACK chain。
+4. physical seal只接受同一outbox identity已经由原Blob/export cleanup worker实际完成的结果；pending只重试，dead-letter在同一事务中把execution job终结为blocked，不能伪装成功。cleanup completion晚于当前可信DB seal time会使整个physical publication回滚，避免先提交一个随后被read-proof判坏的不可变receipt。
+5. irreversible cutover在一个Memory原子发布或单个MySQL `REPEATABLE READ`事务内重验T3c/T3d、canonical tenant/全部user hold、全局owner closure、purge deadline、DB time和live lease；usage、billing fact、export control/snapshot、Blob/export outbox、domain ACK、receipt、job和首次cutover任一失败都整体回滚。cutover后读路径只依赖不可变source/receipt/ACK链，不再要求已被合法修改的live source仍保持原状。
+6. runner内嵌`TenantPurgeExecutionWorker`，没有新增第三个服务、进程、bundle或镜像。runner的`TENANT_PURGE_EXECUTION_WORKER_ENABLED`和router的`TENANT_PURGE_EXECUTION_ENABLED`双重默认`0`；每次materialize、claim、lease续期、不可逆cutover、physical seal及模糊响应重试前都重新取得token-protected、fresh、non-sticky的all-configured fleet ACK。runner启用还强制要求Blob cleanup、export cleanup和本地单runner filesystem契约。
+7. capability把代码理解能力`tenantPurgeExecution=["local-execution-ack-v1"]`与worker实际激活布尔值分开；公开`dataPurgeExecution`继续固定`false`。local cutover/physical receipt分别固定`physicalAcksComplete=false`或`localPhysicalAcksComplete=true`，但两者始终`allDomainsComplete=false`、`contentPurgeExecuted=false`，tenant公开status仍为`gated`。
+8. 冻结真实`0022` delta并新增独立`0022→0023`历史MySQL夹具；覆盖历史T3d与业务证据保持、零隐式执行、两个DDL auto-commit中断点、marker-loss replay、弱trigger修复/额外trigger拒绝、错误index/额外列/弱化CHECK拒绝，以及33域/ACK/owner-generation约束。CI、本地verify、required-suite/no-skip证明和runner image最新migration marker均已接线。
+9. 学习与运维文档已同步T3e手工体验、安全rollout、默认关闭边界和CI产物事实：本仓库仍只构建router/runner两个Node ESM bundle及两个Linux OCI image；T3e随runner部署，不产生第三个可执行单元。staging/production和多VM/Pod在共享对象存储adapter完成前必须保持T3e双gate关闭。
+
+### 本轮验证与审查
+
+- `scripts/local-service.sh verify`完整通过（exit 0）：`pnpm check:secrets`扫描 **336 files**，OpenAPI/生成SDK漂移检查与`pnpm typecheck`通过；主套件 **93 files passed / 1 skipped、1226 passed / 1 skipped**，唯一skip仍是真实厂商E2E显式付费开关。覆盖率 **81.56% statements / 77.92% branches / 85.66% functions / 84.85% lines**，MySQL store **83.86% lines**。
+- T3e Memory **6/6**、core worker **10/10**、runner gate **8/8**、named真实MySQL **5/5**；另行组合的protocol/runner/registry相关定向套件 **10 files / 139 passed**，需要真实loopback的router app **57/57**。真实MySQL覆盖nonzero ready export/download lease/artifact outbox、live sealed snapshot pin、usage→billing、existing/new Blob outbox、canonical hold零部分写、并发/response-loss replay、SQL故障回滚、过期lease、pending/dead-letter优先、future completion回滚、tenant隔离和exact ACK/read-proof。
+- 固定历史升级链从`0007`运行到`0023`，共 **16 files / 83 passed**；新增`0022→0023` **6/6**，原`0007→0008` **2/2**仍证明相同usage重复安全合并、内容冲突阻断且不丢账、legacy pending receipt保留。每个required migration与MySQL suite均由JSON proof确认目标文件实际执行且零skip。
+- cluster **6 files / 23 passed**；SDK **18-file**隔离包通过；runner/router Node 24 bundle约 **4086 KB / 802 KB**，原生启动、readiness、tenant/platform auth边界、转发与OpenAPI检查通过。候选发布物仍只有两个bundle和两个Linux OCI image。
+- 并发正确性、事务回滚、滚动升级兼容、安全隔离、测试有效性与文档/CI接线均经独立复核；修复了模糊destructive replay复用旧fleet proof、MySQL source DB-time错绑和future cleanup completion先提交后自证损坏的问题。最终 **P0=0、P1=0、P2=0**。
+- 本轮没有改变provider dialect或公开真实模型网络契约，因此未重复运行会产生费用的`verify-real`或十阶段acceptance；最近真实模型 **1/1** 与acceptance通过只保留为历史基线，不冒充本轮重跑结果。
+
+### 当前边界、风险与下一步
+
+- M2冻结结论不变；本轮仍属于M1，没有开始M3。T3e只是本地受限执行/ACK地基：它实际修改五个域并证明本地Blob/export物理清理，但session content、idempotency receipt、lifecycle outbox、Redis lease/fence/stream、tenant registry/profile/agent、其余export/Blob投影、external provider/KMS、backup/restore、logs/traces及全域completion仍未闭环。M1不能冻结，公开`dataPurgeExecution`不能开启。
+- 保留三个非阻断、fail-closed的P3：大量排序靠前的active-hold execution job可能填满固定候选窗口并饿死后续eligible job，后续需游标分页或原子hold backoff；T3e真实MySQL成功路径会重验owner closure、T3d套件也有cross-owner/orphan负向覆盖，但T3e专属套件尚缺直接损坏注入；`0023` partial-DDL restart显式抽样两个建表边界而非六表/全部trigger auto-commit点。它们不授予错误删除权限，但应在后续切片/预发演练补强。
+- 下一独立切片应继续T3f本地DB内容/控制域：设计不可变pre-delete receipt与exact ACK，原子清理`session_content`、`idempotency_receipts`、`lifecycle_outbox`并闭合Blob manifest/outbox和export artifact投影；必须保持tenant/user owner、事件seq、billing retained evidence和响应丢失重放正确。之后再以独立adapter/ACK处理Redis三域，并逐步实现local fake external/KMS/backup/restore/log/trace契约；缺少真实云资源时只能验证接口、故障注入和fail-closed blocker，不能伪造真实云完成。
+- 整体local/CI实现全部闭环后再进行一次完整手工walkthrough最稳定，但无需等到那时才体验；当前可按`docs/operations/development-and-ci-guide.md`分阶段启动、smoke和观察各模块。真实shared object storage、KMS/IAM、云MySQL/Redis、registry/promotion、Kubernetes/VM拓扑、域名/TLS、备份恢复与告警仍等待实际资源参数。

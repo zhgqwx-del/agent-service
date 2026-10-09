@@ -13,6 +13,7 @@ export * from "./tenant-credential-revocation.js";
 export * from "./tenant-runtime-revocation.js";
 export * from "./tenant-content-inventory.js";
 export * from "./tenant-purge-plan.js";
+export * from "./tenant-purge-execution.js";
 export * from "./memory.js";
 export { MysqlSessionStore, type MysqlStoreOptions } from "./mysql/store.js";
 export { RedisLeaseStore } from "./redis/lease.js";
