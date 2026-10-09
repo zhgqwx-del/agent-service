@@ -23,6 +23,9 @@ import {
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH,
+  INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
+  INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
+  INTERNAL_TENANT_DATABASE_PURGE_READY_PATH,
   INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER,
   INTERNAL_TENANT_PURGE_EXECUTION_ACK_VALUE,
   INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH,
@@ -48,6 +51,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
   TenantErasureRequestHeaders,
@@ -99,6 +103,8 @@ export interface RouterAppDeps {
   tenantCredentialRevocationExecutionEnabled?: () => boolean;
   /** Independent activation gate for local T3e execution/physical-ACK queue claims. */
   tenantPurgeExecutionEnabled?: () => boolean;
+  /** Independent activation gate for T3f local database-content deletion queue claims. */
+  tenantDatabasePurgeEnabled?: () => boolean;
   /** Independent all-configured broadcast gate for T3b runtime drain. */
   tenantRuntimeDrainExecutionEnabled?: () => boolean;
   /** Read/download surface for the configured artifact backend. Filesystem stays local-only. */
@@ -291,6 +297,11 @@ export function createRouterApp(deps: RouterAppDeps) {
     !!deps.internalRunnerToken
     && (deps.tenantPurgeExecutionEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportTenantPurgeExecutionWorker()
+  );
+  const tenantDatabasePurgeAvailable = () => (
+    !!deps.internalRunnerToken
+    && (deps.tenantDatabasePurgeEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportTenantDatabasePurgeWorker()
   );
   const userDataExportReadable = () => (
     (deps.dataExportArtifactsEnabled?.() ?? false)
@@ -513,10 +524,16 @@ export function createRouterApp(deps: RouterAppDeps) {
                 tenantCredentialRevocationWorker:
                   tenantCredentialRevocationExecutionAvailable(),
                 tenantPurgeExecution:
-                  deps.registry.allConfiguredSupportTenantPurgeExecution()
-                    ? [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1]
-                    : [],
+                  [
+                    ...(deps.registry.allConfiguredSupportTenantPurgeExecution()
+                      ? [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1]
+                      : []),
+                    ...(deps.registry.allConfiguredSupportTenantDatabasePurge()
+                      ? [TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1]
+                      : []),
+                  ],
                 tenantPurgeExecutionWorker: tenantPurgeExecutionAvailable(),
+                tenantDatabasePurgeWorker: tenantDatabasePurgeAvailable(),
                 // Per-instance runtime identity and activation are private rollout state. The
                 // worker consumes the token-protected fleet proof route instead.
                 tenantRuntimeDrain: [],
@@ -609,6 +626,28 @@ export function createRouterApp(deps: RouterAppDeps) {
     c.header(
       INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER,
       INTERNAL_TENANT_PURGE_EXECUTION_ACK_VALUE,
+    );
+    return c.body(null, 204);
+  });
+
+  /**
+   * T3f has a distinct fresh, non-sticky all-configured barrier. Its ACK authorizes one bounded
+   * database-content worker boundary only and cannot be substituted by the T3e execution ACK.
+   */
+  app.get(INTERNAL_TENANT_DATABASE_PURGE_READY_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    try {
+      await deps.registry.refresh();
+    } catch {
+      return c.body(null, 503);
+    }
+    if (!tenantDatabasePurgeAvailable()) return c.body(null, 503);
+    c.header(
+      INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
+      INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
     );
     return c.body(null, 204);
   });
@@ -1052,6 +1091,8 @@ export function createRouterApp(deps: RouterAppDeps) {
       || url.pathname.startsWith(`${INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH}/`)
+      || url.pathname === INTERNAL_TENANT_DATABASE_PURGE_READY_PATH
+      || url.pathname.startsWith(`${INTERNAL_TENANT_DATABASE_PURGE_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX

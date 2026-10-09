@@ -114,6 +114,19 @@ export const INTERNAL_TENANT_PURGE_EXECUTION_ACK_VALUE =
   "local-execution-ack-v1" as const;
 
 /**
+ * T3f database-content deletion is a separate destructive boundary from the T3e local execution
+ * slice. A worker must obtain this exact, content-free ACK before each bounded queue interaction
+ * and immediately before an irreversible database transaction. It never implies all-domain purge
+ * completion and deliberately cannot be substituted by the T3e ACK above.
+ */
+export const INTERNAL_TENANT_DATABASE_PURGE_READY_PATH =
+  "/_internal/tenant-database-purge-v1/ready" as const;
+export const INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER =
+  "x-agent-service-tenant-database-purge" as const;
+export const INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE =
+  "local-db-content-delete-v1" as const;
+
+/**
  * T3b is a fleet operation rather than an owner-routed request. A claimant calls the router path,
  * the router takes a fresh identity snapshot from every exact configured runner URL, then invokes
  * the runner path once per snapshot member. The private ready route binds a stable logical runner
@@ -382,9 +395,12 @@ export type TenantCredentialRevocationCapability = z.infer<
 >;
 
 export const TENANT_PURGE_EXECUTION_LOCAL_ACK_V1 = "local-execution-ack-v1" as const;
-export const TenantPurgeExecutionCapability = z.literal(
+export const TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1 =
+  "local-db-content-delete-v1" as const;
+export const TenantPurgeExecutionCapability = z.enum([
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
-);
+  TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+]);
 export type TenantPurgeExecutionCapability = z.infer<
   typeof TenantPurgeExecutionCapability
 >;
@@ -472,9 +488,11 @@ export const Capabilities = z.object({
     /** Local worker activation; fleet execution additionally requires the router's fresh barrier. */
     tenantCredentialRevocationWorker: z.boolean().default(false),
     /** Code understands the local T3e execution/physical-ACK substrate; this is not completion. */
-    tenantPurgeExecution: z.array(TenantPurgeExecutionCapability).max(1).default([]),
+    tenantPurgeExecution: z.array(TenantPurgeExecutionCapability).max(2).default([]),
     /** Local executor activation; fleet authority additionally requires the router's fresh barrier. */
     tenantPurgeExecutionWorker: z.boolean().default(false),
+    /** Local T3f database-content worker activation; it has an independent router barrier. */
+    tenantDatabasePurgeWorker: z.boolean().default(false),
     /** Code understands the private all-configured runtime-drain receipt contract. */
     tenantRuntimeDrain: z.array(TenantRuntimeDrainCapability).max(1).default([]),
     /** Local private endpoint is active; the router still performs a fresh identity probe. */

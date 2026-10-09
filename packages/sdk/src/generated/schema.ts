@@ -1135,12 +1135,14 @@ export type components = {
                 readonly tenantCredentialRevocation?: readonly "credential-store-v1"[];
                 /** @default false */
                 readonly tenantCredentialRevocationWorker?: boolean;
+                /** @default false */
+                readonly tenantDatabasePurgeWorker?: boolean;
                 /** @default [] */
                 readonly tenantErasureControl?: readonly "platform-control-v1"[];
                 /** @default false */
                 readonly tenantErasureRequests?: boolean;
                 /** @default [] */
-                readonly tenantPurgeExecution?: readonly "local-execution-ack-v1"[];
+                readonly tenantPurgeExecution?: readonly ("local-execution-ack-v1" | "local-db-content-delete-v1")[];
                 /** @default false */
                 readonly tenantPurgeExecutionWorker?: boolean;
                 /** @default [] */

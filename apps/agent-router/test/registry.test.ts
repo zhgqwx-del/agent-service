@@ -12,6 +12,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   tenantRuntimeFleetSha256,
@@ -468,6 +469,92 @@ describe("RunnerRegistry owner address mapping", () => {
     await registry.refresh();
     expect(registry.allConfiguredSupportTenantPurgeExecution()).toBe(false);
     expect(registry.allConfiguredSupportTenantPurgeExecutionWorker()).toBe(false);
+    await registry.close();
+  });
+
+  it("requires every configured runner to be freshly T3f-aware and database-worker-active", async () => {
+    let legacyState: "down" | "legacy" | "new-only" | "code-only" | "active" = "down";
+    const capabilities = (aware: boolean, worker: boolean, t3eAware = true) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        tenantPurgeExecution: [
+          ...(t3eAware ? [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1] : []),
+          ...(aware ? [TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1] : []),
+        ],
+        tenantPurgeExecutionWorker: true,
+        tenantDatabasePurgeWorker: worker,
+        dataPurgeExecution: false,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        if (legacyState === "legacy") {
+          const document = capabilities(false, false);
+          delete (document.features as Partial<typeof document.features>).tenantDatabasePurgeWorker;
+          return Response.json(document);
+        }
+        return Response.json(capabilities(
+          legacyState === "new-only" || legacyState === "code-only" || legacyState === "active",
+          legacyState === "active",
+          legacyState !== "new-only",
+        ));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allConfiguredSupportTenantDatabasePurge()).toBe(false);
+    expect(registry.allConfiguredSupportTenantDatabasePurgeWorker()).toBe(false);
+
+    legacyState = "new-only";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantDatabasePurge()).toBe(false);
+    expect(registry.allConfiguredSupportTenantDatabasePurgeWorker()).toBe(false);
+
+    legacyState = "legacy";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantDatabasePurge()).toBe(false);
+    expect(registry.allConfiguredSupportTenantDatabasePurgeWorker()).toBe(false);
+
+    legacyState = "code-only";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantDatabasePurge()).toBe(true);
+    expect(registry.allConfiguredSupportTenantDatabasePurgeWorker()).toBe(false);
+
+    legacyState = "active";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantDatabasePurge()).toBe(true);
+    expect(registry.allConfiguredSupportTenantDatabasePurgeWorker()).toBe(true);
+
+    legacyState = "down";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantDatabasePurge()).toBe(false);
+    expect(registry.allConfiguredSupportTenantDatabasePurgeWorker()).toBe(false);
     await registry.close();
   });
 

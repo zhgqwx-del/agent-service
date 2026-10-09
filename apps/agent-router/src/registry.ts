@@ -12,6 +12,7 @@ import {
   INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
   PURGE_POLICY_EVALUATOR_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
@@ -450,6 +451,35 @@ export class RunnerRegistry {
         TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
       ) === true
       && target.capabilities.features.tenantPurgeExecutionWorker === true
+    ));
+  }
+
+  /** Every configured runner must understand the distinct T3f database-content contract. */
+  allConfiguredSupportTenantDatabasePurge(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantPurgeExecution.includes(
+        TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+      ) === true
+      && target.capabilities?.features.tenantPurgeExecution.includes(
+        TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+      ) === true
+    ));
+  }
+
+  /** T3f authority requires the exact capability and an active worker on every configured runner. */
+  allConfiguredSupportTenantDatabasePurgeWorker(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantPurgeExecution.includes(
+        TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+      ) === true
+      && target.capabilities?.features.tenantPurgeExecution.includes(
+        TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+      ) === true
+      && target.capabilities.features.tenantDatabasePurgeWorker === true
     ));
   }
 

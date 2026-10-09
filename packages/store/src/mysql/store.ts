@@ -584,6 +584,78 @@ import {
   type TenantPurgeLocalCutoverReceipt,
   type TenantPurgeLocalPhysicalAckReceipt,
 } from "../tenant-purge-execution.js";
+import {
+  EMPTY_TENANT_DATABASE_PURGE_DOMAIN_ACK_ROOT_SHA256,
+  EMPTY_TENANT_DATABASE_PURGE_PREDELETE_ENTRY_ROOT_SHA256,
+  TENANT_DATABASE_PURGE_ACTION_BY_DOMAIN,
+  TENANT_DATABASE_PURGE_ADAPTER_PROTOCOL,
+  TENANT_DATABASE_PURGE_CUTOVER_SINGLETON_ID,
+  TENANT_DATABASE_PURGE_DOMAIN_ACK_SCOPE,
+  TENANT_DATABASE_PURGE_DOMAINS,
+  TENANT_DATABASE_PURGE_PREDELETE_ENTRY_SCOPE,
+  TENANT_DATABASE_PURGE_PREDELETE_RECEIPT_SCOPE,
+  TENANT_DATABASE_PURGE_RECEIPT_SCOPE,
+  TENANT_PURGE_SESSION_GRAVE_MARKER_SCOPE,
+  TenantDatabasePurgeEvidenceChangedError,
+  TenantDatabasePurgeNotReadyError,
+  tenantDatabasePurgeAuthorizationMatches,
+  tenantDatabasePurgeBillingFactRootSha256,
+  tenantDatabasePurgeBridgeKind,
+  tenantDatabasePurgeBridgeSha256,
+  tenantDatabasePurgeClaimFromJob,
+  tenantDatabasePurgeClaimTokenSha256,
+  tenantDatabasePurgeCutoverEvidenceSha256,
+  tenantDatabasePurgeDomainAckRootSha256,
+  tenantDatabasePurgeDomainAckSha256,
+  tenantDatabasePurgeDomainOrdinal,
+  tenantDatabasePurgeNextDomainAckRootSha256,
+  tenantDatabasePurgeOperationSha256,
+  tenantDatabasePurgePhysicalProofSha256,
+  tenantDatabasePurgePreDeleteEntryRootSha256,
+  tenantDatabasePurgePreDeleteEntrySha256,
+  tenantDatabasePurgePreDeleteReceiptSha256,
+  tenantDatabasePurgeReceiptMatchesAuthorization,
+  tenantDatabasePurgeReceiptSha256,
+  tenantDatabasePurgeRetainedEvidenceRootSha256,
+  tenantDatabasePurgeSessionGraveMarkerRootSha256,
+  tenantDatabasePurgeSessionGraveMarkerSha256,
+  tenantDatabasePurgeSessionGraveOwnerSha256,
+  tenantDatabasePurgeTargetRootSha256,
+  tenantDatabasePurgeTargetSha256,
+  validateClaimTenantDatabasePurgesOptions,
+  validateMaterializeTenantDatabasePurgeJobsOptions,
+  validateRenewTenantDatabasePurgeOptions,
+  validateRetryTenantDatabasePurgeOptions,
+  validateTenantDatabasePurgeAuthorization,
+  validateTenantDatabasePurgeCompletionProof,
+  validateTenantDatabasePurgeCutoverRecord,
+  validateTenantDatabasePurgeDomainAck,
+  validateTenantDatabasePurgeEvidenceBundle,
+  validateTenantDatabasePurgeJobRecord,
+  validateTenantDatabasePurgePreDeleteEntry,
+  validateTenantDatabasePurgePreDeleteEntryAgainstSource,
+  validateTenantDatabasePurgePreDeleteReceipt,
+  validateTenantDatabasePurgeReceipt,
+  validateTenantDatabasePurgeSessionGraveMarker,
+  type ClaimTenantDatabasePurgesOptions,
+  type MaterializeTenantDatabasePurgeJobsOptions,
+  type RenewTenantDatabasePurgeOptions,
+  type RetryTenantDatabasePurgeOptions,
+  type TenantDatabasePurgeAuthorization,
+  type TenantDatabasePurgeBlockReasonCode,
+  type TenantDatabasePurgeClaim,
+  type TenantDatabasePurgeCutoverRecord,
+  type TenantDatabasePurgeDomain,
+  type TenantDatabasePurgeDomainAck,
+  type TenantDatabasePurgeEvidenceBundle,
+  type TenantDatabasePurgeJobRecord,
+  type TenantDatabasePurgePreDeleteEntry,
+  type TenantDatabasePurgePreDeleteReceipt,
+  type TenantDatabasePurgeReceipt,
+  type TenantDatabasePurgeSource,
+  type TenantDatabasePurgeStore,
+  type TenantPurgeSessionGraveMarker,
+} from "../tenant-database-purge.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -727,6 +799,61 @@ const TENANT_PURGE_LOCAL_PHYSICAL_RECEIPT_COLUMNS = `scope, request_id, tenant_i
   all_domains_complete, content_purge_executed, receipt_sha256`;
 const TENANT_PURGE_EXECUTION_CUTOVER_COLUMNS = `singleton_id, control_generation,
   activated_at_ms, first_request_id, first_receipt_sha256, evidence_sha256`;
+const TENANT_DATABASE_PURGE_JOB_COLUMNS = `request_id, tenant_id, subject_generation,
+  plan_build_generation, execution_generation, database_purge_generation,
+  t3c_receipt_sha256, plan_receipt_sha256, local_physical_ack_receipt_sha256,
+  policy_sha256, purge_not_before_db_ms, source_evidence_db_ms, phase, domain_count,
+  predelete_entry_count, predelete_entry_root_sha256, domain_ack_count,
+  domain_ack_root_sha256, unresolved_blocker_count, predelete_receipt_sha256,
+  terminal_receipt_sha256, available_at_ms, attempts, claim_token, lease_until_ms,
+  last_error_code, created_at_ms, updated_at_ms, purged_at_db_ms,
+  completed_claim_attempt, completed_claim_token_sha256, blocked_at_ms,
+  blocked_reason_code`;
+const TENANT_DATABASE_PURGE_PREDELETE_ENTRY_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, domain, domain_ordinal, action,
+  plan_entry_receipt_sha256, plan_target_count, plan_target_root_sha256, bridge_kind,
+  bridge_sha256, predelete_target_count, predelete_target_root_sha256,
+  captured_at_db_ms, receipt_sha256`;
+const TENANT_DATABASE_PURGE_PREDELETE_RECEIPT_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, t3c_receipt_sha256, plan_receipt_sha256,
+  local_physical_ack_receipt_sha256, policy_sha256, purge_not_before_db_ms,
+  source_evidence_db_ms, entry_count, entry_root_sha256,
+  session_target_count, session_target_root_sha256, retained_billing_fact_count,
+  retained_billing_fact_root_sha256, billing_reconciliation_target_count,
+  billing_reconciliation_target_root_sha256, store_db_timestamp_ms,
+  completed_claim_attempt, completed_claim_token_sha256, predelete_complete,
+  destructive_progress, content_purge_executed, receipt_sha256`;
+const TENANT_DATABASE_PURGE_ACK_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, domain, domain_ordinal, global_ack_seq,
+  previous_global_ack_sha256, action, predelete_entry_receipt_sha256,
+  predelete_target_count, predelete_target_root_sha256, affected_count,
+  result_target_count, result_target_root_sha256, retained_evidence_count,
+  retained_evidence_root_sha256, adapter_protocol, operation_sha256,
+  physical_proof_sha256, store_db_timestamp_ms, completed_claim_attempt,
+  completed_claim_token_sha256, receipt_sha256`;
+const TENANT_DATABASE_PURGE_RECEIPT_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, t3c_receipt_sha256, plan_receipt_sha256,
+  local_physical_ack_receipt_sha256, policy_sha256, purge_not_before_db_ms,
+  source_evidence_db_ms, predelete_receipt_sha256,
+  predelete_entry_count, predelete_entry_root_sha256, domain_ack_count,
+  domain_ack_root_sha256, grave_marker_count, grave_marker_root_sha256,
+  retained_billing_fact_count, retained_billing_fact_root_sha256,
+  billing_reconciliation_evidence_count,
+  billing_reconciliation_evidence_root_sha256, unresolved_blocker_count,
+  store_db_timestamp_ms, completed_claim_attempt, completed_claim_token_sha256,
+  local_database_purge_complete, session_content_deleted, all_domains_complete,
+  content_purge_executed, receipt_sha256`;
+const TENANT_PURGE_SESSION_GRAVE_MARKER_COLUMNS = `scope, session_id, tenant_id,
+  request_id, subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, deletion_generation, deleted_at_db_ms, owner_sha256,
+  t3c_session_receipt_sha256, predelete_receipt_sha256, marked_at_db_ms,
+  marker_sha256`;
+const TENANT_DATABASE_PURGE_CUTOVER_COLUMNS = `singleton_id, control_generation,
+  activated_at_db_ms, first_request_id, first_receipt_sha256, evidence_sha256`;
 type TenantContentSessionRow = {
   sessionId: string;
   tenantId: string;
@@ -3036,6 +3163,321 @@ type QueuedTenantPurgeExecutionJob = Extract<
   { phase: "queued" }
 >;
 
+function rowTenantDatabasePurgeSource(row: Row): TenantDatabasePurgeSource {
+  return {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: storedSafeInteger(row.subject_generation, "stored database purge subject", 1),
+    planBuildGeneration: storedSafeInteger(row.plan_build_generation, "stored database purge plan", 1),
+    executionGeneration: storedSafeInteger(row.execution_generation, "stored database purge execution", 1),
+    databasePurgeGeneration: storedSafeInteger(
+      row.database_purge_generation,
+      "stored database purge generation",
+      1,
+    ),
+    t3cReceiptSha256: String(row.t3c_receipt_sha256),
+    planReceiptSha256: String(row.plan_receipt_sha256),
+    localPhysicalAckReceiptSha256: String(row.local_physical_ack_receipt_sha256),
+    policySha256: String(row.policy_sha256),
+    purgeNotBeforeDbMs: storedSafeInteger(row.purge_not_before_db_ms, "stored database purge deadline"),
+    sourceEvidenceDbMs: storedSafeInteger(
+      row.source_evidence_db_ms,
+      "stored database purge source timestamp",
+    ),
+  };
+}
+
+function rowToTenantDatabasePurgeJob(row: Row): TenantDatabasePurgeJobRecord {
+  try {
+    const common = {
+      ...rowTenantDatabasePurgeSource(row),
+      domainCount: storedSafeInteger(row.domain_count, "stored database purge domain count"),
+      preDeleteEntryCount: storedSafeInteger(
+        row.predelete_entry_count,
+        "stored database purge pre-delete count",
+      ),
+      preDeleteEntryRootSha256: String(row.predelete_entry_root_sha256),
+      domainAckCount: storedSafeInteger(row.domain_ack_count, "stored database purge ACK count"),
+      domainAckRootSha256: String(row.domain_ack_root_sha256),
+      unresolvedBlockerCount: storedSafeInteger(
+        row.unresolved_blocker_count,
+        "stored database purge blocker count",
+      ),
+      attempts: storedSafeInteger(row.attempts, "stored database purge attempts"),
+      createdAtMs: storedSafeInteger(row.created_at_ms, "stored database purge creation timestamp"),
+      updatedAtMs: storedSafeInteger(row.updated_at_ms, "stored database purge update timestamp"),
+    };
+    const phase = String(row.phase);
+    let job: TenantDatabasePurgeJobRecord;
+    if (phase === "queued") {
+      job = {
+        ...common,
+        phase,
+        availableAtMs: storedSafeInteger(
+          row.available_at_ms,
+          "stored database purge availability",
+        ),
+        ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+        ...(row.lease_until_ms == null
+          ? {}
+          : { leaseUntilMs: storedSafeInteger(row.lease_until_ms, "stored database purge lease") }),
+        ...(row.last_error_code == null
+          ? {}
+          : {
+              lastErrorCode: String(
+                row.last_error_code,
+              ) as Extract<TenantDatabasePurgeJobRecord, { phase: "queued" }>["lastErrorCode"],
+            }),
+      } as TenantDatabasePurgeJobRecord;
+    } else if (phase === "database_purged") {
+      job = {
+        ...common,
+        phase,
+        preDeleteReceiptSha256: String(row.predelete_receipt_sha256),
+        terminalReceiptSha256: String(row.terminal_receipt_sha256),
+        purgedAtDbMs: storedSafeInteger(row.purged_at_db_ms, "stored database purge timestamp"),
+        completedClaimAttempt: storedSafeInteger(
+          row.completed_claim_attempt,
+          "stored database purge completion attempt",
+          1,
+        ),
+        completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      };
+    } else if (phase === "blocked") {
+      job = {
+        ...common,
+        phase,
+        blockedAtMs: storedSafeInteger(row.blocked_at_ms, "stored database purge blocked timestamp"),
+        blockedReasonCode: String(
+          row.blocked_reason_code,
+        ) as TenantDatabasePurgeBlockReasonCode,
+      };
+    } else {
+      throw new Error("stored tenant database purge phase is invalid");
+    }
+    validateTenantDatabasePurgeJobRecord(job);
+    return job;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantDatabasePurgePreDeleteEntry(row: Row): TenantDatabasePurgePreDeleteEntry {
+  try {
+    const entry: TenantDatabasePurgePreDeleteEntry = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "stored database purge entry subject", 1),
+      planBuildGeneration: storedSafeInteger(row.plan_build_generation, "stored database purge entry plan", 1),
+      executionGeneration: storedSafeInteger(row.execution_generation, "stored database purge entry execution", 1),
+      databasePurgeGeneration: storedSafeInteger(row.database_purge_generation, "stored database purge entry generation", 1),
+      scope: String(row.scope) as TenantDatabasePurgePreDeleteEntry["scope"],
+      domain: String(row.domain) as TenantDatabasePurgeDomain,
+      domainOrdinal: storedSafeInteger(row.domain_ordinal, "stored database purge entry ordinal"),
+      action: String(row.action) as TenantDatabasePurgePreDeleteEntry["action"],
+      planEntryReceiptSha256: String(row.plan_entry_receipt_sha256),
+      planTargetCount: storedSafeInteger(row.plan_target_count, "stored database purge plan target count"),
+      planTargetRootSha256: String(row.plan_target_root_sha256),
+      bridgeKind: String(row.bridge_kind) as TenantDatabasePurgePreDeleteEntry["bridgeKind"],
+      bridgeSha256: String(row.bridge_sha256),
+      preDeleteTargetCount: storedSafeInteger(row.predelete_target_count, "stored database purge target count"),
+      preDeleteTargetRootSha256: String(row.predelete_target_root_sha256),
+      capturedAtDbMs: storedSafeInteger(row.captured_at_db_ms, "stored database purge capture timestamp"),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantDatabasePurgePreDeleteEntry(entry);
+    return entry;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantDatabasePurgePreDeleteReceipt(row: Row): TenantDatabasePurgePreDeleteReceipt {
+  try {
+    const receipt: TenantDatabasePurgePreDeleteReceipt = {
+      ...rowTenantDatabasePurgeSource(row),
+      scope: String(row.scope) as TenantDatabasePurgePreDeleteReceipt["scope"],
+      entryCount: storedSafeInteger(row.entry_count, "stored database purge entry count"),
+      entryRootSha256: String(row.entry_root_sha256),
+      sessionTargetCount: storedSafeInteger(row.session_target_count, "stored database purge session count"),
+      sessionTargetRootSha256: String(row.session_target_root_sha256),
+      retainedBillingFactCount: storedSafeInteger(row.retained_billing_fact_count, "stored billing fact count"),
+      retainedBillingFactRootSha256: String(row.retained_billing_fact_root_sha256),
+      billingReconciliationTargetCount: storedSafeInteger(
+        row.billing_reconciliation_target_count,
+        "stored reconciliation target count",
+      ),
+      billingReconciliationTargetRootSha256: String(
+        row.billing_reconciliation_target_root_sha256,
+      ),
+      storeDbTimestampMs: storedSafeInteger(row.store_db_timestamp_ms, "stored database purge timestamp"),
+      completedClaimAttempt: storedSafeInteger(row.completed_claim_attempt, "stored database purge attempt", 1),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      preDeleteComplete: tenantCredentialBoolean(row.predelete_complete, "stored pre-delete completion") as true,
+      destructiveProgress: tenantCredentialBoolean(row.destructive_progress, "stored destructive progress") as false,
+      contentPurgeExecuted: tenantCredentialBoolean(row.content_purge_executed, "stored content purge flag") as false,
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantDatabasePurgePreDeleteReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantDatabasePurgeAck(row: Row): TenantDatabasePurgeDomainAck {
+  try {
+    const ack: TenantDatabasePurgeDomainAck = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "stored database purge ACK subject", 1),
+      planBuildGeneration: storedSafeInteger(row.plan_build_generation, "stored database purge ACK plan", 1),
+      executionGeneration: storedSafeInteger(row.execution_generation, "stored database purge ACK execution", 1),
+      databasePurgeGeneration: storedSafeInteger(row.database_purge_generation, "stored database purge ACK generation", 1),
+      scope: String(row.scope) as TenantDatabasePurgeDomainAck["scope"],
+      domain: String(row.domain) as TenantDatabasePurgeDomain,
+      domainOrdinal: storedSafeInteger(row.domain_ordinal, "stored database purge ACK ordinal"),
+      globalAckSeq: storedSafeInteger(row.global_ack_seq, "stored database purge ACK sequence", 1),
+      previousGlobalAckSha256: String(row.previous_global_ack_sha256),
+      action: String(row.action) as TenantDatabasePurgeDomainAck["action"],
+      preDeleteEntryReceiptSha256: String(row.predelete_entry_receipt_sha256),
+      preDeleteTargetCount: storedSafeInteger(row.predelete_target_count, "stored database purge ACK target count"),
+      preDeleteTargetRootSha256: String(row.predelete_target_root_sha256),
+      affectedCount: storedSafeInteger(row.affected_count, "stored database purge affected count"),
+      resultTargetCount: storedSafeInteger(row.result_target_count, "stored database purge result count"),
+      resultTargetRootSha256: String(row.result_target_root_sha256),
+      retainedEvidenceCount: storedSafeInteger(row.retained_evidence_count, "stored database purge evidence count"),
+      retainedEvidenceRootSha256: String(row.retained_evidence_root_sha256),
+      adapterProtocol: String(row.adapter_protocol) as TenantDatabasePurgeDomainAck["adapterProtocol"],
+      operationSha256: String(row.operation_sha256),
+      physicalProofSha256: String(row.physical_proof_sha256),
+      storeDbTimestampMs: storedSafeInteger(row.store_db_timestamp_ms, "stored database purge ACK timestamp"),
+      completedClaimAttempt: storedSafeInteger(row.completed_claim_attempt, "stored database purge ACK attempt", 1),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantDatabasePurgeDomainAck(ack);
+    return ack;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantPurgeSessionGraveMarker(row: Row): TenantPurgeSessionGraveMarker {
+  try {
+    const marker: TenantPurgeSessionGraveMarker = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "stored grave subject", 1),
+      planBuildGeneration: storedSafeInteger(row.plan_build_generation, "stored grave plan", 1),
+      executionGeneration: storedSafeInteger(row.execution_generation, "stored grave execution", 1),
+      databasePurgeGeneration: storedSafeInteger(row.database_purge_generation, "stored grave generation", 1),
+      scope: String(row.scope) as TenantPurgeSessionGraveMarker["scope"],
+      sessionId: String(row.session_id),
+      deletionGeneration: storedSafeInteger(row.deletion_generation, "stored grave deletion generation", 1),
+      deletedAtDbMs: storedSafeInteger(row.deleted_at_db_ms, "stored grave deletion timestamp"),
+      ownerSha256: String(row.owner_sha256),
+      t3cSessionReceiptSha256: String(row.t3c_session_receipt_sha256),
+      preDeleteReceiptSha256: String(row.predelete_receipt_sha256),
+      markedAtDbMs: storedSafeInteger(row.marked_at_db_ms, "stored grave marker timestamp"),
+      markerSha256: String(row.marker_sha256),
+    };
+    validateTenantDatabasePurgeSessionGraveMarker(marker);
+    return marker;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantDatabasePurgeReceipt(row: Row): TenantDatabasePurgeReceipt {
+  try {
+    const receipt: TenantDatabasePurgeReceipt = {
+      ...rowTenantDatabasePurgeSource(row),
+      scope: String(row.scope) as TenantDatabasePurgeReceipt["scope"],
+      preDeleteReceiptSha256: String(row.predelete_receipt_sha256),
+      preDeleteEntryCount: storedSafeInteger(row.predelete_entry_count, "stored database purge entry count"),
+      preDeleteEntryRootSha256: String(row.predelete_entry_root_sha256),
+      domainAckCount: storedSafeInteger(row.domain_ack_count, "stored database purge ACK count"),
+      domainAckRootSha256: String(row.domain_ack_root_sha256),
+      graveMarkerCount: storedSafeInteger(row.grave_marker_count, "stored grave marker count"),
+      graveMarkerRootSha256: String(row.grave_marker_root_sha256),
+      retainedBillingFactCount: storedSafeInteger(row.retained_billing_fact_count, "stored billing fact count"),
+      retainedBillingFactRootSha256: String(row.retained_billing_fact_root_sha256),
+      billingReconciliationEvidenceCount: storedSafeInteger(
+        row.billing_reconciliation_evidence_count,
+        "stored reconciliation evidence count",
+      ),
+      billingReconciliationEvidenceRootSha256: String(
+        row.billing_reconciliation_evidence_root_sha256,
+      ),
+      unresolvedBlockerCount: storedSafeInteger(row.unresolved_blocker_count, "stored database purge blocker count"),
+      storeDbTimestampMs: storedSafeInteger(row.store_db_timestamp_ms, "stored database purge timestamp"),
+      completedClaimAttempt: storedSafeInteger(row.completed_claim_attempt, "stored database purge attempt", 1),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      localDatabasePurgeComplete: tenantCredentialBoolean(
+        row.local_database_purge_complete,
+        "stored database purge completion flag",
+      ) as true,
+      sessionContentDeleted: tenantCredentialBoolean(
+        row.session_content_deleted,
+        "stored session delete flag",
+      ) as true,
+      allDomainsComplete: tenantCredentialBoolean(row.all_domains_complete, "stored all-domains flag") as false,
+      contentPurgeExecuted: tenantCredentialBoolean(row.content_purge_executed, "stored content-purge flag") as false,
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantDatabasePurgeReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantDatabasePurgeCutover(row: Row | undefined): TenantDatabasePurgeCutoverRecord {
+  try {
+    if (!row) throw new Error("tenant database purge cutover is missing");
+    const generation = storedSafeInteger(row.control_generation, "stored database purge cutover generation");
+    const record: TenantDatabasePurgeCutoverRecord = generation === 0
+      ? { singletonId: TENANT_DATABASE_PURGE_CUTOVER_SINGLETON_ID, controlGeneration: 0 }
+      : {
+          singletonId: TENANT_DATABASE_PURGE_CUTOVER_SINGLETON_ID,
+          controlGeneration: generation as 1,
+          activatedAtDbMs: storedSafeInteger(row.activated_at_db_ms, "stored database purge cutover timestamp"),
+          firstRequestId: String(row.first_request_id),
+          firstReceiptSha256: String(row.first_receipt_sha256),
+          evidenceSha256: String(row.evidence_sha256),
+        };
+    validateTenantDatabasePurgeCutoverRecord(record);
+    return record;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+type QueuedTenantDatabasePurgeJob = Extract<
+  TenantDatabasePurgeJobRecord,
+  { phase: "queued" }
+>;
+
+type TenantDatabasePurgeTargetEvidence = {
+  targetCount: number;
+  targetRootSha256: string;
+};
+
+type MysqlTenantDatabasePurgeSession = {
+  sessionId: string;
+  tenantId: string;
+  userId: string;
+  deletionGeneration: number;
+  deletedAtDbMs?: number;
+};
+
+type MysqlTenantDatabasePurgeTargetState = {
+  targets: Map<TenantDatabasePurgeDomain, TenantDatabasePurgeTargetEvidence>;
+  sessions: MysqlTenantDatabasePurgeSession[];
+  billingFacts: BillingUsageFact[];
+};
+
 function mysqlControlGeneration(value: unknown): {
   projected: number;
   raw: string;
@@ -3850,6 +4292,7 @@ export class MysqlSessionStore implements
   TenantContentInventoryStore,
   TenantPurgePlanStore,
   TenantPurgeExecutionStore,
+  TenantDatabasePurgeStore,
   UserDataExportRequestStore,
   UserDataExportJobStore,
   UserDataExportCleanupStore
@@ -3857,6 +4300,7 @@ export class MysqlSessionStore implements
   private tenantContentMaterializationCursorRequestId?: string;
   private tenantPurgePlanMaterializationCursorRequestId?: string;
   private tenantPurgeExecutionMaterializationCursorRequestId?: string;
+  private tenantDatabasePurgeMaterializationCursorRequestId?: string;
 
   private constructor(private readonly pool: Pool) {}
 
@@ -19457,6 +19901,2723 @@ export class MysqlSessionStore implements
     return this.withConsistentRead((conn) => this.validateTenantPurgeExecutionCutoverState(conn));
   }
 
+  // ---------- tenant database purge (T3f, local database destructive slice) ----------
+  private async beginTenantDatabasePurgeTransaction(conn: PoolConnection): Promise<void> {
+    await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    await conn.beginTransaction();
+  }
+
+  private async loadTenantDatabasePurgeJob(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" | "FOR UPDATE SKIP LOCKED" = "",
+  ): Promise<TenantDatabasePurgeJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_DATABASE_PURGE_JOB_COLUMNS}
+         FROM tenant_database_purge_jobs
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const job = rowToTenantDatabasePurgeJob(rows[0]);
+    return job.tenantId === tenantId && job.requestId === requestId ? job : null;
+  }
+
+  private async loadTenantDatabasePurgePreDeleteEntries(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    databasePurgeGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantDatabasePurgePreDeleteEntry[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_DATABASE_PURGE_PREDELETE_ENTRY_COLUMNS}
+         FROM tenant_database_purge_predelete_entries
+        WHERE tenant_id=? AND request_id=? AND database_purge_generation=?
+        ORDER BY domain_ordinal ${lock}`,
+      [tenantId, requestId, databasePurgeGeneration],
+    );
+    return rows.map((row) => {
+      const entry = rowToTenantDatabasePurgePreDeleteEntry(row);
+      if (
+        entry.tenantId !== tenantId
+        || entry.requestId !== requestId
+        || entry.databasePurgeGeneration !== databasePurgeGeneration
+      ) throw new TenantErasureIntegrityError();
+      return entry;
+    });
+  }
+
+  private async loadTenantDatabasePurgePreDeleteReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantDatabasePurgePreDeleteReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_DATABASE_PURGE_PREDELETE_RECEIPT_COLUMNS}
+         FROM tenant_database_purge_predelete_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const receipt = rowToTenantDatabasePurgePreDeleteReceipt(rows[0]);
+    return receipt.tenantId === tenantId && receipt.requestId === requestId ? receipt : null;
+  }
+
+  private async loadTenantDatabasePurgeAcks(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    databasePurgeGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantDatabasePurgeDomainAck[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_DATABASE_PURGE_ACK_COLUMNS}
+         FROM tenant_database_purge_domain_acks
+        WHERE tenant_id=? AND request_id=? AND database_purge_generation=?
+        ORDER BY global_ack_seq ${lock}`,
+      [tenantId, requestId, databasePurgeGeneration],
+    );
+    return rows.map((row) => {
+      const ack = rowToTenantDatabasePurgeAck(row);
+      if (
+        ack.tenantId !== tenantId
+        || ack.requestId !== requestId
+        || ack.databasePurgeGeneration !== databasePurgeGeneration
+      ) throw new TenantErasureIntegrityError();
+      return ack;
+    });
+  }
+
+  private async loadTenantDatabasePurgeReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantDatabasePurgeReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_DATABASE_PURGE_RECEIPT_COLUMNS}
+         FROM tenant_database_purge_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const receipt = rowToTenantDatabasePurgeReceipt(rows[0]);
+    return receipt.tenantId === tenantId && receipt.requestId === requestId ? receipt : null;
+  }
+
+  private async loadTenantDatabasePurgeGraveMarkers(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    databasePurgeGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantPurgeSessionGraveMarker[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_PURGE_SESSION_GRAVE_MARKER_COLUMNS}
+         FROM tenant_purge_session_grave_markers
+        WHERE tenant_id=? AND request_id=? AND database_purge_generation=?
+        ORDER BY session_id ${lock}`,
+      [tenantId, requestId, databasePurgeGeneration],
+    );
+    return rows.map((row) => {
+      const marker = rowToTenantPurgeSessionGraveMarker(row);
+      if (
+        marker.tenantId !== tenantId
+        || marker.requestId !== requestId
+        || marker.databasePurgeGeneration !== databasePurgeGeneration
+      ) throw new TenantErasureIntegrityError();
+      return marker;
+    });
+  }
+
+  private async loadTenantDatabasePurgeBundle(
+    conn: PoolConnection,
+    job: Extract<TenantDatabasePurgeJobRecord, { phase: "database_purged" }>,
+  ): Promise<TenantDatabasePurgeEvidenceBundle> {
+    const [preDeleteEntries, preDeleteReceipt, domainAcks, graveMarkers, receipt] =
+      await Promise.all([
+        this.loadTenantDatabasePurgePreDeleteEntries(
+          conn,
+          job.tenantId,
+          job.requestId,
+          job.databasePurgeGeneration,
+          "FOR SHARE",
+        ),
+        this.loadTenantDatabasePurgePreDeleteReceipt(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        ),
+        this.loadTenantDatabasePurgeAcks(
+          conn,
+          job.tenantId,
+          job.requestId,
+          job.databasePurgeGeneration,
+          "FOR SHARE",
+        ),
+        this.loadTenantDatabasePurgeGraveMarkers(
+          conn,
+          job.tenantId,
+          job.requestId,
+          job.databasePurgeGeneration,
+          "FOR SHARE",
+        ),
+        this.loadTenantDatabasePurgeReceipt(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        ),
+      ]);
+    if (!preDeleteReceipt || !receipt) throw new TenantErasureIntegrityError();
+    return { preDeleteEntries, preDeleteReceipt, domainAcks, graveMarkers, receipt };
+  }
+
+  private async validateTenantDatabasePurgeCutoverState(
+    conn: PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantDatabasePurgeCutoverRecord> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_DATABASE_PURGE_CUTOVER_COLUMNS}
+         FROM tenant_database_purge_cutover WHERE singleton_id=? ${lock}`,
+      [TENANT_DATABASE_PURGE_CUTOVER_SINGLETON_ID],
+    );
+    if (rows.length !== 1) throw new TenantErasureIntegrityError();
+    const cutover = rowToTenantDatabasePurgeCutover(rows[0]);
+    if (cutover.controlGeneration === 0) {
+      const [receiptRows] = await conn.query<Row[]>(
+        "SELECT request_id FROM tenant_database_purge_receipts LIMIT 1",
+      );
+      if (receiptRows[0]) throw new TenantErasureIntegrityError();
+      return cutover;
+    }
+    const [receiptRows] = await conn.query<Row[]>(
+      `SELECT request_id, receipt_sha256, store_db_timestamp_ms
+         FROM tenant_database_purge_receipts
+        WHERE request_id=? AND receipt_sha256=?`,
+      [cutover.firstRequestId, cutover.firstReceiptSha256],
+    );
+    const receipt = receiptRows[0];
+    if (
+      receiptRows.length !== 1
+      || !receipt
+      || String(receipt.request_id) !== cutover.firstRequestId
+      || String(receipt.receipt_sha256) !== cutover.firstReceiptSha256
+      || storedSafeInteger(receipt.store_db_timestamp_ms, "database purge cutover receipt time")
+        !== cutover.activatedAtDbMs
+    ) throw new TenantErasureIntegrityError();
+    return cutover;
+  }
+
+  private async validateTenantDatabasePurgeSource(
+    conn: PoolConnection,
+    job: TenantDatabasePurgeJobRecord,
+    requirePhysicalProjection: boolean,
+  ): Promise<{
+    executionJob: Extract<TenantPurgeExecutionJobRecord, {
+      phase: "local_physical_acks_sealed";
+    }>;
+    physicalReceipt: TenantPurgeLocalPhysicalAckReceipt;
+    planJob: Extract<TenantPurgePlanJobRecord, { phase: "plan_sealed" }>;
+    planEntries: TenantPurgePlanEntry[];
+    contentReceipt: TenantContentInventoryReceipt;
+    sessionReceipts: TenantSessionContentReceipt[];
+    executionAcks: TenantPurgeExecutionDomainAck[];
+  }> {
+    try {
+      validateTenantDatabasePurgeJobRecord(job);
+      const executionJob = await this.loadTenantPurgeExecutionJob(
+        conn,
+        job.tenantId,
+        job.requestId,
+        "FOR SHARE",
+      );
+      if (!executionJob || executionJob.phase !== "local_physical_acks_sealed") {
+        throw new Error("tenant database purge execution source is missing");
+      }
+      const proof = requirePhysicalProjection
+        ? await this.validateTenantPurgeExecutionReadProof(conn, executionJob)
+        : undefined;
+      const executionSource = await this.validateTenantPurgeExecutionSource(
+        conn,
+        executionJob,
+        false,
+      );
+      const physicalReceipt = proof?.physical ?? await this.loadTenantPurgeLocalPhysicalReceipt(
+        conn,
+        job.tenantId,
+        job.requestId,
+        "FOR SHARE",
+      );
+      if (!physicalReceipt) throw new Error("tenant database purge physical receipt is missing");
+      const executionAcks = proof?.acks ?? await this.loadTenantPurgeExecutionAcks(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.executionGeneration,
+        "FOR SHARE",
+      );
+      const contentJob = executionSource.planJob === undefined
+        ? undefined
+        : await this.loadTenantContentInventoryJob(
+            conn,
+            job.tenantId,
+            job.requestId,
+            "FOR SHARE",
+          );
+      const contentReceipt = await this.loadTenantContentInventoryReceipt(
+        conn,
+        job.tenantId,
+        job.requestId,
+        "FOR SHARE",
+      );
+      const sessionReceipts = await this.loadTenantSessionContentReceipts(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.planBuildGeneration,
+        "FOR SHARE",
+      );
+      if (!contentJob || contentJob.phase !== "inventory_sealed" || !contentReceipt) {
+        throw new Error("tenant database purge content source is missing");
+      }
+      validateTenantContentInventoryCompletionProof(contentJob, sessionReceipts, contentReceipt);
+      let executionAckRootSha256 = EMPTY_TENANT_PURGE_EXECUTION_GLOBAL_ACK_ROOT_SHA256;
+      for (const [index, ack] of executionAcks.entries()) {
+        if (
+          ack.globalAckSeq !== index + 1
+          || ack.previousGlobalAckSha256 !== executionAckRootSha256
+        ) throw new Error("tenant database purge execution ACK chain is invalid");
+        executionAckRootSha256 = tenantPurgeExecutionNextGlobalAckRootSha256(
+          executionAckRootSha256,
+          ack.globalAckSeq,
+          ack.receiptSha256,
+        );
+      }
+      if (
+        executionJob.subjectGeneration !== job.subjectGeneration
+        || executionJob.planBuildGeneration !== job.planBuildGeneration
+        || executionJob.executionGeneration !== job.executionGeneration
+        || contentJob.buildGeneration !== job.planBuildGeneration
+        || contentReceipt.receiptSha256 !== job.t3cReceiptSha256
+        || executionSource.planReceipt.receiptSha256 !== job.planReceiptSha256
+        || physicalReceipt.receiptSha256 !== job.localPhysicalAckReceiptSha256
+        || physicalReceipt.policySha256 !== job.policySha256
+        || physicalReceipt.purgeNotBeforeDbMs !== job.purgeNotBeforeDbMs
+        || physicalReceipt.storeDbTimestampMs !== job.sourceEvidenceDbMs
+        || physicalReceipt.unresolvedBlockerCount !== job.unresolvedBlockerCount
+        || executionJob.localPhysicalAckReceiptSha256 !== physicalReceipt.receiptSha256
+        || executionJob.domainAckCount !== physicalReceipt.domainAckCount
+        || executionJob.domainAckRootSha256 !== physicalReceipt.domainAckRootSha256
+        || executionAcks.length !== executionJob.domainAckCount
+        || executionAckRootSha256 !== executionJob.domainAckRootSha256
+      ) throw new Error("tenant database purge source binding is invalid");
+      return {
+        executionJob,
+        physicalReceipt,
+        planJob: executionSource.planJob,
+        planEntries: executionSource.planEntries,
+        contentReceipt,
+        sessionReceipts,
+        executionAcks,
+      };
+    } catch (error) {
+      if (error instanceof TenantDatabasePurgeNotReadyError) throw error;
+      if (error instanceof TenantPurgeExecutionNotReadyError) {
+        throw new TenantDatabasePurgeNotReadyError(
+          error.reason === "active_legal_hold" ? "active_legal_hold" : "physical_projection_pending",
+        );
+      }
+      if (
+        error instanceof TenantPurgeExecutionEvidenceChangedError
+        || error instanceof TenantPurgePlanEvidenceChangedError
+        || error instanceof TenantContentInventoryEvidenceChangedError
+      ) throw new TenantDatabasePurgeEvidenceChangedError();
+      if (error instanceof TenantDatabasePurgeEvidenceChangedError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async lockTenantDatabasePurgeTargets(
+    conn: PoolConnection,
+    job: TenantDatabasePurgeJobRecord,
+    sessionReceipts: readonly TenantSessionContentReceipt[],
+  ): Promise<MysqlTenantDatabasePurgeTargetState> {
+    const targets = new Map<TenantDatabasePurgeDomain, TenantDatabasePurgeTargetEvidence>();
+    const setTarget = (
+      domain: TenantDatabasePurgeDomain,
+      tuples: readonly (readonly (string | number | boolean | null)[])[],
+    ): void => {
+      const hashes = tuples.map((tuple) => tenantDatabasePurgeTargetSha256(domain, tuple));
+      targets.set(domain, {
+        targetCount: hashes.length,
+        targetRootSha256: tenantDatabasePurgeTargetRootSha256(domain, hashes),
+      });
+    };
+    const rows = async (sql: string, params: readonly unknown[] = []): Promise<Row[]> => {
+      const [result] = await conn.query<Row[]>(sql, [...params]);
+      return result;
+    };
+    const integer = (value: unknown, name: string, minimum = 0): number => (
+      storedSafeInteger(value, name, minimum)
+    );
+    const queueState = (row: Row, name: string): "pending" | "completed" | "dead_letter" => {
+      if (row.completed_at_ms != null && row.dead_lettered_at_ms != null) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (row.completed_at_ms != null) {
+        integer(row.completed_at_ms, `${name} completion timestamp`);
+        return "completed";
+      }
+      if (row.dead_lettered_at_ms != null) {
+        integer(row.dead_lettered_at_ms, `${name} dead-letter timestamp`);
+        return "dead_letter";
+      }
+      return "pending";
+    };
+
+    const tenantRows = await rows(
+      `SELECT tenant_id, name, auth_policy IS NOT NULL AS auth_policy_present,
+              auth_secret_cipher IS NOT NULL AS auth_secret_cipher_present,
+              auth_secret_key_id IS NOT NULL AS auth_secret_key_id_present
+         FROM tenants WHERE tenant_id=? FOR UPDATE`,
+      [job.tenantId],
+    );
+    const tenant = tenantRows[0];
+    if (!tenant || tenantRows.length !== 1 || String(tenant.tenant_id) !== job.tenantId) {
+      throw new TenantErasureIntegrityError();
+    }
+    setTarget("tenant_profile", [[
+      job.tenantId,
+      tenant.name == null ? null : String(tenant.name),
+      tenantCredentialBoolean(tenant.auth_policy_present, "database purge auth policy presence"),
+      tenantCredentialBoolean(tenant.auth_secret_cipher_present, "database purge cipher presence"),
+      tenantCredentialBoolean(tenant.auth_secret_key_id_present, "database purge key presence"),
+    ]]);
+
+    const agentRows = await rows(
+      `SELECT agent_id, version FROM agent_versions
+        WHERE tenant_id=? ORDER BY agent_id, version FOR UPDATE`,
+      [job.tenantId],
+    );
+    setTarget("agent_definitions", agentRows.map((row) => [
+      String(row.agent_id), integer(row.version, "database purge agent version"),
+    ]));
+
+    const sessionRows = await rows(
+      `SELECT session_id, tenant_id, user_id, deletion_generation, deleted_at_ms
+         FROM sessions FORCE INDEX (idx_sessions_tenant)
+        WHERE tenant_id=? ORDER BY session_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    const receiptBySession = new Map(sessionReceipts.map((receipt) => [
+      receipt.sessionId,
+      receipt,
+    ] as const));
+    if (receiptBySession.size !== sessionReceipts.length
+      || receiptBySession.size !== sessionRows.length) {
+      throw new TenantDatabasePurgeEvidenceChangedError();
+    }
+    const sessions: MysqlTenantDatabasePurgeSession[] = sessionRows.map((row) => {
+      const sessionId = String(row.session_id);
+      const tenantId = String(row.tenant_id);
+      const userId = String(row.user_id);
+      const deletionGeneration = integer(
+        row.deletion_generation,
+        "database purge session deletion generation",
+      );
+      const deletedAtDbMs = row.deleted_at_ms == null
+        ? undefined
+        : integer(row.deleted_at_ms, "database purge session deletion timestamp");
+      const receipt = receiptBySession.get(sessionId);
+      if (
+        !isCanonicalId("sess", sessionId)
+        || tenantId !== job.tenantId
+        || !userId
+        || userId.length > 128
+        || !receipt
+        || receipt.tenantId !== tenantId
+        || (deletionGeneration === 0) !== (deletedAtDbMs === undefined)
+      ) throw new TenantDatabasePurgeEvidenceChangedError();
+      return {
+        sessionId,
+        tenantId,
+        userId,
+        deletionGeneration,
+        ...(deletedAtDbMs === undefined ? {} : { deletedAtDbMs }),
+      };
+    });
+    setTarget("session_content", sessions.map((session) => [
+      session.sessionId,
+      receiptBySession.get(session.sessionId)!.receiptSha256,
+    ]));
+
+    const idempotencyRows = await rows(
+      `SELECT user_id, session_id, idem_key, value FROM idempotency_keys
+        WHERE tenant_id=? ORDER BY user_id, session_id, idem_key FOR UPDATE`,
+      [job.tenantId],
+    );
+    setTarget("idempotency_receipts", idempotencyRows.map((row) => [
+      String(row.user_id),
+      String(row.session_id),
+      String(row.idem_key),
+      row.value == null ? "pending" : "completed",
+    ]));
+
+    const reconciliationRows = await rows(
+      `SELECT ${USAGE_RECONCILIATION_COLUMNS} FROM usage_reconciliations
+        WHERE tenant_id=? ORDER BY session_id, deletion_generation FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of reconciliationRows) rowToUsageReconciliation(row);
+    setTarget("billing_reconciliation", reconciliationRows.map((row) => [
+      String(row.session_id),
+      integer(row.deletion_generation, "database purge reconciliation generation", 1),
+      String(row.status),
+      String(row.checksum),
+    ]));
+
+    const blobRows = await rows(
+      `SELECT ${BLOB_COLUMNS} FROM blob_objects
+        WHERE tenant_id=? ORDER BY blob_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of blobRows) rowToBlobManifest(row);
+    setTarget("blob_manifest", blobRows.map((row) => [
+      String(row.blob_id),
+      integer(row.deletion_generation, "database purge blob generation"),
+      String(row.state),
+    ]));
+    const blobOutboxRows = await rows(
+      `SELECT o.outbox_id, o.blob_id, o.generation, o.completed_at_ms,
+              o.dead_lettered_at_ms
+         FROM blob_delete_outbox o
+         JOIN blob_objects b ON b.blob_id=o.blob_id
+        WHERE b.tenant_id=? ORDER BY o.outbox_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    setTarget("blob_outbox", blobOutboxRows.map((row) => [
+      integer(row.outbox_id, "database purge blob outbox id", 1),
+      String(row.blob_id),
+      integer(row.generation, "database purge blob outbox generation"),
+      queueState(row, "database purge blob outbox"),
+    ]));
+
+    const lifecycleRows = await rows(
+      `SELECT o.outbox_id, o.topic, o.aggregate_id, o.generation, o.completed_at_ms,
+              o.dead_lettered_at_ms
+         FROM lifecycle_outbox o
+         JOIN sessions s ON s.session_id=o.aggregate_id
+        WHERE s.tenant_id=? ORDER BY o.outbox_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    setTarget("lifecycle_outbox", lifecycleRows.map((row) => [
+      integer(row.outbox_id, "database purge lifecycle outbox id", 1),
+      String(row.topic),
+      String(row.aggregate_id),
+      integer(row.generation, "database purge lifecycle outbox generation"),
+      queueState(row, "database purge lifecycle outbox"),
+    ]));
+
+    const requestRows = await rows(
+      `SELECT request_id, user_id, subject_generation, idempotency_key_sha256, status
+         FROM user_export_requests WHERE tenant_id=? ORDER BY request_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    const exportControlTuples: Array<readonly (string | number | boolean | null)[]> = [];
+    for (const row of requestRows) {
+      exportControlTuples.push([
+        "request",
+        String(row.request_id),
+        integer(row.subject_generation, "database purge export request generation"),
+        String(row.status),
+      ]);
+      exportControlTuples.push([
+        "idempotency",
+        String(row.user_id),
+        String(row.idempotency_key_sha256),
+        String(row.request_id),
+      ]);
+    }
+    const exportJobRows = await rows(
+      `SELECT request_id, build_generation, status FROM user_export_jobs
+        WHERE tenant_id=? ORDER BY request_id, build_generation FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of exportJobRows) {
+      exportControlTuples.push([
+        "job",
+        String(row.request_id),
+        integer(row.build_generation, "database purge export build generation"),
+        String(row.status),
+      ]);
+    }
+    const leaseRows = await rows(
+      `SELECT artifact_id, lease_token, request_id, build_generation,
+              artifact_deletion_generation, lease_until_ms, created_at_ms
+         FROM user_export_download_leases
+        WHERE tenant_id=? ORDER BY artifact_id, lease_token FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of leaseRows) {
+      const leaseTokenSha256 = createHash("sha256")
+        .update(JSON.stringify([
+          "tenant-database-purge-download-lease-token-v1",
+          String(row.lease_token),
+        ]))
+        .digest("hex");
+      exportControlTuples.push([
+        "download",
+        String(row.artifact_id),
+        String(row.request_id),
+        integer(row.build_generation, "database purge export lease build", 1),
+        integer(row.artifact_deletion_generation, "database purge export lease generation"),
+        leaseTokenSha256,
+        integer(row.lease_until_ms, "database purge export lease timestamp"),
+        integer(row.created_at_ms, "database purge export lease creation"),
+      ]);
+    }
+    setTarget("user_export_control", exportControlTuples);
+
+    const snapshotTuples: Array<readonly (string | number | boolean | null)[]> = [];
+    const snapshotRecordRows = await rows(
+      `SELECT request_id, build_generation, ordinal, record_sha256
+         FROM user_export_snapshot_records
+        WHERE tenant_id=? ORDER BY request_id, build_generation, ordinal FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of snapshotRecordRows) {
+      snapshotTuples.push([
+        "record",
+        String(row.request_id),
+        integer(row.build_generation, "database purge snapshot build", 1),
+        integer(row.ordinal, "database purge snapshot record ordinal"),
+        String(row.record_sha256),
+      ]);
+    }
+    const snapshotBlobRows = await rows(
+      `SELECT request_id, build_generation, ordinal, blob_id, released_at_ms
+         FROM user_export_snapshot_blobs
+        WHERE tenant_id=? ORDER BY request_id, build_generation, ordinal FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of snapshotBlobRows) {
+      snapshotTuples.push([
+        "blob",
+        String(row.request_id),
+        integer(row.build_generation, "database purge snapshot blob build", 1),
+        integer(row.ordinal, "database purge snapshot blob ordinal"),
+        String(row.blob_id),
+        row.released_at_ms == null ? "pinned" : "released",
+      ]);
+    }
+    setTarget("user_export_snapshots", snapshotTuples);
+
+    const artifactTuples: Array<readonly (string | number | boolean | null)[]> = [];
+    const artifactRows = await rows(
+      `SELECT artifact_id, request_id, build_generation, deletion_generation, state
+         FROM user_export_artifacts WHERE tenant_id=? ORDER BY artifact_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of artifactRows) {
+      artifactTuples.push([
+        "artifact",
+        String(row.artifact_id),
+        String(row.request_id),
+        integer(row.build_generation, "database purge artifact build", 1),
+        integer(row.deletion_generation, "database purge artifact generation"),
+        String(row.state),
+      ]);
+    }
+    const partRows = await rows(
+      `SELECT artifact_id, part_number, deletion_generation, state
+         FROM user_export_artifact_parts
+        WHERE tenant_id=? ORDER BY artifact_id, part_number FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of partRows) {
+      artifactTuples.push([
+        "part",
+        String(row.artifact_id),
+        integer(row.part_number, "database purge export part number"),
+        integer(row.deletion_generation, "database purge export part generation"),
+        String(row.state),
+      ]);
+    }
+    const exportOutboxRows = await rows(
+      `SELECT o.outbox_id, o.artifact_id, o.part_number, o.deletion_generation,
+              o.completed_at_ms, o.dead_lettered_at_ms
+         FROM user_export_artifact_delete_outbox o
+         JOIN user_export_artifacts a ON a.artifact_id=o.artifact_id
+        WHERE a.tenant_id=? ORDER BY o.outbox_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of exportOutboxRows) {
+      artifactTuples.push([
+        "outbox",
+        integer(row.outbox_id, "database purge export outbox id", 1),
+        String(row.artifact_id),
+        integer(row.part_number, "database purge export outbox part"),
+        integer(row.deletion_generation, "database purge export outbox generation", 1),
+        queueState(row, "database purge export outbox"),
+      ]);
+    }
+    setTarget("user_export_artifacts", artifactTuples);
+
+    const billingRows = await rows(
+      `SELECT ${BILLING_USAGE_COLUMNS} FROM billing_usage_facts
+        WHERE tenant_id=? ORDER BY usage_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    const billingFacts = billingRows.map(rowToBillingUsageFact);
+    if (targets.size !== TENANT_DATABASE_PURGE_DOMAINS.length) {
+      throw new TenantErasureIntegrityError();
+    }
+    return { targets, sessions, billingFacts };
+  }
+
+  private async validateTenantDatabasePurgeReady(
+    conn: PoolConnection,
+    job: TenantDatabasePurgeJobRecord,
+    source: Awaited<ReturnType<MysqlSessionStore["validateTenantDatabasePurgeSource"]>>,
+  ): Promise<{
+    targetState: MysqlTenantDatabasePurgeTargetState;
+    holdProof: { holdControlCount: number; holdControlRootSha256: string };
+  }> {
+    let liveSource: Awaited<ReturnType<MysqlSessionStore["validateTenantPurgePlanSource"]>>;
+    let holdProof: { holdControlCount: number; holdControlRootSha256: string };
+    try {
+      liveSource = await this.validateTenantPurgePlanSource(conn, source.planJob, true);
+      holdProof = await this.lockTenantPurgePlanHoldProof(conn, job.tenantId);
+      await this.lockAndValidateTenantPurgePlanGlobalRelations(conn);
+    } catch (error) {
+      if (error instanceof TenantPurgePlanNotReadyError
+        && error.reason === "active_legal_hold") {
+        throw new TenantDatabasePurgeNotReadyError("active_legal_hold");
+      }
+      if (error instanceof TenantPurgePlanEvidenceChangedError) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+      throw error;
+    }
+    if (
+      liveSource.contentReceipt.receiptSha256 !== source.contentReceipt.receiptSha256
+      || liveSource.sessionReceipts.length !== source.sessionReceipts.length
+      || liveSource.sessionReceipts.some((receipt, index) => (
+        receipt.receiptSha256 !== source.sessionReceipts[index]!.receiptSha256
+      ))
+    ) throw new TenantDatabasePurgeEvidenceChangedError();
+
+    const directDomains = [
+      "tenant_profile",
+      "agent_definitions",
+      "session_content",
+      "idempotency_receipts",
+      "billing_reconciliation",
+      "lifecycle_outbox",
+    ] as const satisfies readonly TenantPurgePlanDomain[];
+    const planEntryByDomain = new Map(source.planEntries.map((entry) => [
+      entry.domain,
+      entry,
+    ] as const));
+    for (const domain of directDomains) {
+      const entry = planEntryByDomain.get(domain);
+      if (!entry) throw new TenantErasureIntegrityError();
+      const current = await this.tenantPurgePlanTargetEvidence(
+        conn,
+        source.planJob,
+        domain,
+        liveSource,
+        holdProof,
+      );
+      if (
+        current.targetCount !== entry.targetCount
+        || current.targetRootSha256 !== entry.targetRootSha256
+      ) throw new TenantDatabasePurgeEvidenceChangedError();
+    }
+
+    const [pendingLifecycleRows] = await conn.query<Row[]>(
+      `SELECT o.outbox_id
+         FROM lifecycle_outbox o
+         JOIN sessions s ON s.session_id=o.aggregate_id
+        WHERE s.tenant_id=? AND o.topic<>'session.purge'
+          AND (o.completed_at_ms IS NULL OR o.dead_lettered_at_ms IS NOT NULL)
+        LIMIT 1 FOR UPDATE`,
+      [job.tenantId],
+    );
+    if (pendingLifecycleRows[0]) {
+      throw new TenantDatabasePurgeNotReadyError("lifecycle_outbox_pending");
+    }
+    const targetState = await this.lockTenantDatabasePurgeTargets(
+      conn,
+      job,
+      source.sessionReceipts,
+    );
+    await this.validateTenantDatabasePurgePhysicalProjections(conn, job, source, targetState);
+    return { targetState, holdProof };
+  }
+
+  private async validateTenantDatabasePurgePhysicalProjections(
+    conn: PoolConnection,
+    job: TenantDatabasePurgeJobRecord,
+    source: Awaited<ReturnType<MysqlSessionStore["validateTenantDatabasePurgeSource"]>>,
+    targetState: MysqlTenantDatabasePurgeTargetState,
+  ): Promise<void> {
+    const planEntryByDomain = new Map(source.planEntries.map((entry) => [
+      entry.domain,
+      entry,
+    ] as const));
+    const executionIdentity = {
+      requestId: source.executionJob.requestId,
+      tenantId: source.executionJob.tenantId,
+      subjectGeneration: source.executionJob.subjectGeneration,
+      planBuildGeneration: source.executionJob.planBuildGeneration,
+      executionGeneration: source.executionJob.executionGeneration,
+    };
+    let globalRoot = EMPTY_TENANT_PURGE_EXECUTION_GLOBAL_ACK_ROOT_SHA256;
+    for (const [index, ack] of source.executionAcks.entries()) {
+      if (ack.globalAckSeq !== index + 1 || ack.previousGlobalAckSha256 !== globalRoot) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+      globalRoot = tenantPurgeExecutionNextGlobalAckRootSha256(
+        globalRoot,
+        ack.globalAckSeq,
+        ack.receiptSha256,
+      );
+    }
+    if (
+      globalRoot !== source.executionJob.domainAckRootSha256
+      || globalRoot !== source.physicalReceipt.domainAckRootSha256
+      || source.executionAcks.length !== source.physicalReceipt.domainAckCount
+    ) throw new TenantDatabasePurgeEvidenceChangedError();
+
+    const operationalAcks = source.executionAcks.filter((ack) => (
+      ack.domain === "operational_usage" && ack.ackKind === "anonymized" && ack.final
+    ));
+    if (operationalAcks.length !== 1) throw new TenantDatabasePurgeEvidenceChangedError();
+    const operationalAck = operationalAcks[0]!;
+    if (
+      targetState.billingFacts.length !== operationalAck.resultCount
+      || tenantPurgeExecutionResultRootSha256(
+        "operational_usage",
+        "anonymize",
+        targetState.billingFacts.map((fact) => fact.factSha256),
+      ) !== operationalAck.resultRootSha256
+    ) throw new TenantDatabasePurgeEvidenceChangedError();
+    const [usageRows] = await conn.query<Row[]>(
+      "SELECT id FROM usage_ledger WHERE tenant_id=? LIMIT 1 FOR UPDATE",
+      [job.tenantId],
+    );
+    if (usageRows[0]) {
+      throw new TenantDatabasePurgeNotReadyError("physical_projection_pending");
+    }
+
+    const finalAppliedAck = (domain: TenantPurgePlanDomain) => (
+      source.executionAcks.find((ack) => (
+        ack.domain === domain && ack.ackKind === "applied" && ack.final
+      ))
+    );
+    const appliedResultHashes = (
+      domain: "user_export_control" | "user_export_snapshots",
+      action: "revoke-result" | "release-pin-result",
+      entry: TenantPurgePlanEntry,
+    ) => Array.from({ length: entry.targetCount }, (_, ordinal) => (
+      tenantPurgeExecutionPhysicalProofSha256({
+        identity: executionIdentity,
+        domain,
+        action,
+        proofFields: [entry.targetRootSha256, ordinal],
+      })
+    ));
+    const controlPlan = planEntryByDomain.get("user_export_control");
+    const snapshotsPlan = planEntryByDomain.get("user_export_snapshots");
+    const controlAck = finalAppliedAck("user_export_control");
+    const snapshotsAck = finalAppliedAck("user_export_snapshots");
+    if (
+      !controlPlan
+      || !snapshotsPlan
+      || !controlAck
+      || !snapshotsAck
+      || controlAck.affectedCount !== controlPlan.targetCount
+      || controlAck.resultCount !== controlPlan.targetCount
+      || controlAck.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
+        "user_export_control",
+        "revoke",
+        appliedResultHashes("user_export_control", "revoke-result", controlPlan),
+      )
+      || snapshotsAck.affectedCount !== snapshotsPlan.targetCount
+      || snapshotsAck.resultCount !== snapshotsPlan.targetCount
+      || snapshotsAck.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
+        "user_export_snapshots",
+        "release-pins",
+        appliedResultHashes("user_export_snapshots", "release-pin-result", snapshotsPlan),
+      )
+    ) throw new TenantDatabasePurgeEvidenceChangedError();
+
+    const scheduled = source.executionAcks.filter((ack) => ack.ackKind === "outbox_scheduled");
+    const physical = source.executionAcks.filter((ack) => ack.ackKind === "physical_delete");
+    const physicalByScheduled = new Map(physical.map((ack) => [
+      ack.scheduledAckSha256,
+      ack,
+    ] as const));
+    if (scheduled.length !== physical.length || physicalByScheduled.size !== physical.length) {
+      throw new TenantDatabasePurgeEvidenceChangedError();
+    }
+    const scheduledTargetSha256s = new Set<string>();
+    const scheduledOutboxIds = new Set<string>();
+    const scheduledBlobIds = new Set<string>();
+    const scheduledExportPartKeys = new Set<string>();
+    const scheduledBlobOutboxIds = new Set<number>();
+    const scheduledExportOutboxIds = new Set<number>();
+    const blobOriginal = new Map<string, {
+      deletionGeneration: number;
+      state: "staging" | "ready" | "delete_pending";
+      outboxExistedBeforeCutover: boolean;
+    }>();
+    const exportPartOriginal = new Map<string, {
+      deletionGeneration: number;
+      state: "staging" | "uploaded" | "delete_pending";
+      outboxExistedBeforeCutover: boolean;
+    }>();
+    for (const scheduledAck of scheduled) {
+      const outboxKey = JSON.stringify([scheduledAck.outboxKind, scheduledAck.outboxId]);
+      if (
+        !scheduledAck.targetSha256
+        || scheduledTargetSha256s.has(scheduledAck.targetSha256)
+        || scheduledOutboxIds.has(outboxKey)
+      ) throw new TenantDatabasePurgeEvidenceChangedError();
+      scheduledTargetSha256s.add(scheduledAck.targetSha256);
+      scheduledOutboxIds.add(outboxKey);
+      const physicalAck = physicalByScheduled.get(scheduledAck.receiptSha256);
+      if (
+        !physicalAck
+        || physicalAck.domain !== scheduledAck.domain
+        || physicalAck.outboxKind !== scheduledAck.outboxKind
+        || physicalAck.outboxId !== scheduledAck.outboxId
+        || physicalAck.deletionGeneration !== scheduledAck.deletionGeneration
+        || physicalAck.targetSha256 !== scheduledAck.targetSha256
+      ) throw new TenantDatabasePurgeEvidenceChangedError();
+      if (scheduledAck.outboxKind === "blob_delete") {
+        const [rows] = await conn.query<Row[]>(
+          `SELECT o.outbox_id, o.blob_id, o.generation, o.completed_at_ms,
+                  o.dead_lettered_at_ms, b.tenant_id, b.state, b.deletion_generation
+             FROM blob_delete_outbox o
+             JOIN blob_objects b ON b.blob_id=o.blob_id
+            WHERE o.outbox_id=? FOR UPDATE`,
+          [scheduledAck.outboxId],
+        );
+        const row = rows[0];
+        const generation = row
+          ? storedSafeInteger(row.generation, "database purge physical blob generation", 1)
+          : 0;
+        if (
+          rows.length !== 1
+          || !row
+          || String(row.tenant_id) !== job.tenantId
+          || String(row.state) !== "deleted"
+          || row.completed_at_ms == null
+          || row.dead_lettered_at_ms != null
+          || generation !== scheduledAck.deletionGeneration
+          || storedSafeInteger(
+            row.deletion_generation,
+            "database purge physical blob manifest generation",
+            1,
+          ) !== generation
+        ) throw new TenantDatabasePurgeNotReadyError("physical_projection_pending");
+        const targetCandidates = [
+          tenantPurgePlanTargetSha256("blob_bytes", [
+            String(row.blob_id),
+            generation,
+            "delete_pending",
+          ]),
+          ...(generation > 0 ? (["staging", "ready"] as const).map((state) => (
+            tenantPurgePlanTargetSha256("blob_bytes", [
+              String(row.blob_id),
+              generation - 1,
+              state,
+            ])
+          )) : []),
+        ];
+        if (!scheduledAck.targetSha256
+          || !targetCandidates.includes(scheduledAck.targetSha256)) {
+          throw new TenantDatabasePurgeEvidenceChangedError();
+        }
+        const blobId = String(row.blob_id);
+        if (scheduledBlobIds.has(blobId)) throw new TenantDatabasePurgeEvidenceChangedError();
+        scheduledBlobIds.add(blobId);
+        const outboxId = storedSafeInteger(
+          row.outbox_id,
+          "database purge physical blob outbox id",
+          1,
+        );
+        scheduledBlobOutboxIds.add(outboxId);
+        if (scheduledAck.targetSha256 === targetCandidates[0]) {
+          blobOriginal.set(blobId, {
+            deletionGeneration: generation,
+            state: "delete_pending",
+            outboxExistedBeforeCutover: true,
+          });
+        } else {
+          const priorState = (["staging", "ready"] as const).find((state) => (
+            scheduledAck.targetSha256 === tenantPurgePlanTargetSha256("blob_bytes", [
+              blobId,
+              generation - 1,
+              state,
+            ])
+          ));
+          if (!priorState) throw new TenantDatabasePurgeEvidenceChangedError();
+          blobOriginal.set(blobId, {
+            deletionGeneration: generation - 1,
+            state: priorState,
+            outboxExistedBeforeCutover: false,
+          });
+        }
+      } else if (scheduledAck.outboxKind === "user_export_delete") {
+        const [rows] = await conn.query<Row[]>(
+          `SELECT o.outbox_id, o.artifact_id, o.part_number, o.request_id,
+                  o.deletion_generation, o.completed_at_ms, o.dead_lettered_at_ms,
+                  p.state AS part_state, p.deletion_generation AS part_generation,
+                  a.tenant_id, a.state AS artifact_state,
+                  a.deletion_generation AS artifact_generation,
+                  a.request_id AS artifact_request_id
+             FROM user_export_artifact_delete_outbox o
+             JOIN user_export_artifact_parts p
+               ON p.artifact_id=o.artifact_id AND p.part_number=o.part_number
+             JOIN user_export_artifacts a ON a.artifact_id=o.artifact_id
+            WHERE o.outbox_id=? FOR UPDATE`,
+          [scheduledAck.outboxId],
+        );
+        const row = rows[0];
+        const generation = row
+          ? storedSafeInteger(row.deletion_generation, "database purge export generation", 1)
+          : 0;
+        if (
+          rows.length !== 1
+          || !row
+          || String(row.tenant_id) !== job.tenantId
+          || String(row.request_id) !== String(row.artifact_request_id)
+          || String(row.part_state) !== "deleted"
+          || String(row.artifact_state) !== "deleted"
+          || row.completed_at_ms == null
+          || row.dead_lettered_at_ms != null
+          || generation !== scheduledAck.deletionGeneration
+          || storedSafeInteger(row.part_generation, "database purge export part generation", 1)
+            !== generation
+          || storedSafeInteger(
+            row.artifact_generation,
+            "database purge export artifact generation",
+            1,
+          ) !== generation
+        ) throw new TenantDatabasePurgeNotReadyError("physical_projection_pending");
+        const targetCandidates = [
+          tenantPurgePlanTargetSha256("user_export_bytes", [
+            String(row.artifact_id),
+            storedSafeInteger(row.part_number, "database purge export part number"),
+            generation,
+            "delete_pending",
+          ]),
+          ...(generation > 0 ? (["staging", "uploaded"] as const).map((state) => (
+            tenantPurgePlanTargetSha256("user_export_bytes", [
+              String(row.artifact_id),
+              storedSafeInteger(row.part_number, "database purge export part number"),
+              generation - 1,
+              state,
+            ])
+          )) : []),
+        ];
+        if (!scheduledAck.targetSha256
+          || !targetCandidates.includes(scheduledAck.targetSha256)) {
+          throw new TenantDatabasePurgeEvidenceChangedError();
+        }
+        const partKey = JSON.stringify([
+          String(row.artifact_id),
+          storedSafeInteger(row.part_number, "database purge export part number"),
+        ]);
+        if (scheduledExportPartKeys.has(partKey)) {
+          throw new TenantDatabasePurgeEvidenceChangedError();
+        }
+        scheduledExportPartKeys.add(partKey);
+        const outboxId = storedSafeInteger(
+          row.outbox_id,
+          "database purge physical export outbox id",
+          1,
+        );
+        scheduledExportOutboxIds.add(outboxId);
+        if (scheduledAck.targetSha256 === targetCandidates[0]) {
+          exportPartOriginal.set(partKey, {
+            deletionGeneration: generation,
+            state: "delete_pending",
+            outboxExistedBeforeCutover: true,
+          });
+        } else {
+          const artifactId = String(row.artifact_id);
+          const partNumber = storedSafeInteger(
+            row.part_number,
+            "database purge export part number",
+          );
+          const priorState = (["staging", "uploaded"] as const).find((state) => (
+            scheduledAck.targetSha256 === tenantPurgePlanTargetSha256(
+              "user_export_bytes",
+              [artifactId, partNumber, generation - 1, state],
+            )
+          ));
+          if (!priorState) throw new TenantDatabasePurgeEvidenceChangedError();
+          exportPartOriginal.set(partKey, {
+            deletionGeneration: generation - 1,
+            state: priorState,
+            outboxExistedBeforeCutover: false,
+          });
+        }
+      } else {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+    }
+
+    const blobBytesPlan = planEntryByDomain.get("blob_bytes");
+    const exportBytesPlan = planEntryByDomain.get("user_export_bytes");
+    const blobManifestPlan = planEntryByDomain.get("blob_manifest");
+    const blobOutboxPlan = planEntryByDomain.get("blob_outbox");
+    const exportArtifactsPlan = planEntryByDomain.get("user_export_artifacts");
+    if (
+      !blobBytesPlan
+      || !exportBytesPlan
+      || !blobManifestPlan
+      || !blobOutboxPlan
+      || !exportArtifactsPlan
+      || scheduledBlobIds.size !== blobBytesPlan.targetCount
+      || scheduledExportPartKeys.size !== exportBytesPlan.targetCount
+      || tenantPurgePlanTargetRootSha256(
+        "blob_bytes",
+        scheduled.filter((ack) => ack.outboxKind === "blob_delete")
+          .map((ack) => ack.targetSha256!),
+      ) !== blobBytesPlan.targetRootSha256
+      || tenantPurgePlanTargetRootSha256(
+        "user_export_bytes",
+        scheduled.filter((ack) => ack.outboxKind === "user_export_delete")
+          .map((ack) => ack.targetSha256!),
+      ) !== exportBytesPlan.targetRootSha256
+    ) throw new TenantDatabasePurgeEvidenceChangedError();
+
+    const queueState = (row: Row): "pending" | "completed" | "dead_letter" => {
+      if (row.completed_at_ms != null && row.dead_lettered_at_ms != null) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+      return row.completed_at_ms != null
+        ? "completed"
+        : row.dead_lettered_at_ms != null ? "dead_letter" : "pending";
+    };
+    const [manifestRows] = await conn.query<Row[]>(
+      `SELECT blob_id, deletion_generation, state FROM blob_objects
+        WHERE tenant_id=? ORDER BY blob_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    const manifestHashes = manifestRows.map((row) => {
+      const blobId = String(row.blob_id);
+      const original = blobOriginal.get(blobId);
+      return tenantPurgePlanTargetSha256("blob_manifest", [
+        blobId,
+        original?.deletionGeneration ?? storedSafeInteger(
+          row.deletion_generation,
+          "database purge blob manifest generation",
+        ),
+        original?.state ?? String(row.state),
+      ]);
+    });
+    if (
+      manifestRows.length !== blobManifestPlan.targetCount
+      || tenantPurgePlanTargetRootSha256("blob_manifest", manifestHashes)
+        !== blobManifestPlan.targetRootSha256
+    ) throw new TenantDatabasePurgeEvidenceChangedError();
+
+    const [blobOutboxRows] = await conn.query<Row[]>(
+      `SELECT o.outbox_id, o.blob_id, o.generation, o.completed_at_ms,
+              o.dead_lettered_at_ms
+         FROM blob_delete_outbox o
+         JOIN blob_objects b ON b.blob_id=o.blob_id
+        WHERE b.tenant_id=? ORDER BY o.outbox_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    const blobOutboxHashes: string[] = [];
+    let blobOutboxCountBeforeCutover = 0;
+    for (const row of blobOutboxRows) {
+      const blobId = String(row.blob_id);
+      const outboxId = storedSafeInteger(
+        row.outbox_id,
+        "database purge blob outbox id",
+        1,
+      );
+      const original = blobOriginal.get(blobId);
+      if (
+        original
+        && !original.outboxExistedBeforeCutover
+        && scheduledBlobOutboxIds.has(outboxId)
+      ) continue;
+      blobOutboxCountBeforeCutover += 1;
+      blobOutboxHashes.push(tenantPurgePlanTargetSha256("blob_outbox", [
+        outboxId,
+        blobId,
+        storedSafeInteger(row.generation, "database purge blob outbox generation", 1),
+        original?.outboxExistedBeforeCutover ? "pending" : queueState(row),
+      ]));
+    }
+    if (
+      blobOutboxCountBeforeCutover !== blobOutboxPlan.targetCount
+      || tenantPurgePlanTargetRootSha256("blob_outbox", blobOutboxHashes)
+        !== blobOutboxPlan.targetRootSha256
+    ) throw new TenantDatabasePurgeEvidenceChangedError();
+
+    const cutoverReceipt = await this.loadTenantPurgeLocalCutoverReceipt(
+      conn,
+      job.tenantId,
+      job.requestId,
+      "FOR SHARE",
+    );
+    if (!cutoverReceipt) throw new TenantDatabasePurgeEvidenceChangedError();
+    const [artifactRows] = await conn.query<Row[]>(
+      `SELECT artifact_id, request_id, build_generation, deletion_generation, state,
+              ready_at_ms, updated_at_ms
+         FROM user_export_artifacts
+        WHERE tenant_id=? ORDER BY artifact_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    const artifactIds = new Set(artifactRows.map((row) => String(row.artifact_id)));
+    const exportArtifactHashes: string[] = [];
+    for (const row of artifactRows) {
+      const artifactId = String(row.artifact_id);
+      const originals = [...exportPartOriginal.entries()]
+        .filter(([key]) => {
+          const parsed = JSON.parse(key) as [string, number];
+          return parsed[0] === artifactId;
+        })
+        .map(([, original]) => original);
+      const wasDeletePending = originals.some((original) => (
+        original.outboxExistedBeforeCutover
+      ));
+      const generation = storedSafeInteger(
+        row.deletion_generation,
+        "database purge export artifact generation",
+      );
+      const transitionedAtCutover = generation > 0 && (
+        (originals.length > 0 && !wasDeletePending)
+        || storedSafeInteger(
+          row.updated_at_ms,
+          "database purge export artifact update timestamp",
+        ) === cutoverReceipt.storeDbTimestampMs
+      );
+      exportArtifactHashes.push(tenantPurgePlanTargetSha256("user_export_artifacts", [
+        "artifact",
+        artifactId,
+        String(row.request_id),
+        storedSafeInteger(row.build_generation, "database purge export artifact build", 1),
+        wasDeletePending ? generation : transitionedAtCutover ? generation - 1 : generation,
+        wasDeletePending
+          ? "delete_pending"
+          : transitionedAtCutover
+            ? row.ready_at_ms == null ? "staging" : "ready"
+            : String(row.state),
+      ]));
+    }
+    const [exportPartRows] = await conn.query<Row[]>(
+      `SELECT artifact_id, part_number, deletion_generation, state
+         FROM user_export_artifact_parts
+        WHERE tenant_id=? ORDER BY artifact_id, part_number FOR UPDATE`,
+      [job.tenantId],
+    );
+    for (const row of exportPartRows) {
+      const artifactId = String(row.artifact_id);
+      if (!artifactIds.has(artifactId)) throw new TenantDatabasePurgeEvidenceChangedError();
+      const partNumber = storedSafeInteger(
+        row.part_number,
+        "database purge export part number",
+      );
+      const original = exportPartOriginal.get(JSON.stringify([artifactId, partNumber]));
+      exportArtifactHashes.push(tenantPurgePlanTargetSha256("user_export_artifacts", [
+        "part",
+        artifactId,
+        partNumber,
+        original?.deletionGeneration ?? storedSafeInteger(
+          row.deletion_generation,
+          "database purge export part generation",
+        ),
+        original?.state ?? String(row.state),
+      ]));
+    }
+    const [exportOutboxRows] = await conn.query<Row[]>(
+      `SELECT o.outbox_id, o.artifact_id, o.part_number, o.deletion_generation,
+              o.completed_at_ms, o.dead_lettered_at_ms
+         FROM user_export_artifact_delete_outbox o
+         JOIN user_export_artifacts a ON a.artifact_id=o.artifact_id
+        WHERE a.tenant_id=? ORDER BY o.outbox_id FOR UPDATE`,
+      [job.tenantId],
+    );
+    let exportArtifactTargetCount = artifactRows.length + exportPartRows.length;
+    for (const row of exportOutboxRows) {
+      const artifactId = String(row.artifact_id);
+      const partNumber = storedSafeInteger(
+        row.part_number,
+        "database purge export outbox part number",
+      );
+      const outboxId = storedSafeInteger(
+        row.outbox_id,
+        "database purge export outbox id",
+        1,
+      );
+      const original = exportPartOriginal.get(JSON.stringify([artifactId, partNumber]));
+      if (
+        original
+        && !original.outboxExistedBeforeCutover
+        && scheduledExportOutboxIds.has(outboxId)
+      ) continue;
+      exportArtifactTargetCount += 1;
+      exportArtifactHashes.push(tenantPurgePlanTargetSha256("user_export_artifacts", [
+        "outbox",
+        outboxId,
+        artifactId,
+        partNumber,
+        storedSafeInteger(
+          row.deletion_generation,
+          "database purge export outbox generation",
+          1,
+        ),
+        original?.outboxExistedBeforeCutover ? "pending" : queueState(row),
+      ]));
+    }
+    if (
+      exportArtifactTargetCount !== exportArtifactsPlan.targetCount
+      || tenantPurgePlanTargetRootSha256(
+        "user_export_artifacts",
+        exportArtifactHashes,
+      ) !== exportArtifactsPlan.targetRootSha256
+    ) throw new TenantDatabasePurgeEvidenceChangedError();
+
+    const [postPlanRows] = await conn.query<Row[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM blob_objects
+           WHERE tenant_id=? AND created_at_ms>?) AS late_blobs,
+         (SELECT COUNT(*) FROM user_export_artifacts
+           WHERE tenant_id=? AND created_at_ms>?) AS late_artifacts,
+         (SELECT COUNT(*) FROM user_export_artifact_parts
+           WHERE tenant_id=? AND created_at_ms>?) AS late_parts`,
+      [
+        job.tenantId,
+        blobManifestPlan.capturedAtDbMs,
+        job.tenantId,
+        exportArtifactsPlan.capturedAtDbMs,
+        job.tenantId,
+        exportArtifactsPlan.capturedAtDbMs,
+      ],
+    );
+    if (!postPlanRows[0] || ["late_blobs", "late_artifacts", "late_parts"].some((field) => (
+      storedSafeInteger(postPlanRows[0]![field], `database purge ${field}`) !== 0
+    ))) throw new TenantDatabasePurgeEvidenceChangedError();
+
+    const [projectionRows] = await conn.query<Row[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM blob_objects
+           WHERE tenant_id=? AND state<>'deleted') AS live_blobs,
+         (SELECT COUNT(*) FROM blob_delete_outbox o
+           JOIN blob_objects b ON b.blob_id=o.blob_id
+          WHERE b.tenant_id=? AND (o.completed_at_ms IS NULL
+            OR o.dead_lettered_at_ms IS NOT NULL)) AS incomplete_blob_outbox,
+         (SELECT COUNT(*) FROM user_export_requests
+           WHERE tenant_id=? AND status<>'revoked') AS live_export_requests,
+         (SELECT COUNT(*) FROM user_export_jobs
+           WHERE tenant_id=? AND status<>'revoked') AS live_export_jobs,
+         (SELECT COUNT(*) FROM user_export_download_leases
+           WHERE tenant_id=?) AS export_leases,
+         (SELECT COUNT(*) FROM user_export_snapshot_records
+           WHERE tenant_id=?) AS snapshot_records,
+         (SELECT COUNT(*) FROM user_export_snapshot_blobs
+           WHERE tenant_id=? AND released_at_ms IS NULL) AS pinned_snapshot_blobs,
+         (SELECT COUNT(*) FROM user_export_artifacts
+           WHERE tenant_id=? AND state<>'deleted') AS live_export_artifacts,
+         (SELECT COUNT(*) FROM user_export_artifact_parts
+           WHERE tenant_id=? AND state<>'deleted') AS live_export_parts,
+         (SELECT COUNT(*) FROM user_export_artifact_delete_outbox o
+           JOIN user_export_artifacts a ON a.artifact_id=o.artifact_id
+          WHERE a.tenant_id=? AND (o.completed_at_ms IS NULL
+            OR o.dead_lettered_at_ms IS NOT NULL)) AS incomplete_export_outbox
+       FOR UPDATE`,
+      Array.from({ length: 10 }, () => job.tenantId),
+    );
+    const projection = projectionRows[0];
+    if (!projection || [
+      "live_blobs",
+      "incomplete_blob_outbox",
+      "live_export_requests",
+      "live_export_jobs",
+      "export_leases",
+      "snapshot_records",
+      "pinned_snapshot_blobs",
+      "live_export_artifacts",
+      "live_export_parts",
+      "incomplete_export_outbox",
+    ].some((field) => storedSafeInteger(
+      projection[field],
+      `database purge projection ${field}`,
+    ) !== 0)) {
+      throw new TenantDatabasePurgeNotReadyError("physical_projection_pending");
+    }
+  }
+
+  private async validateTenantDatabasePurgeReadProof(
+    conn: PoolConnection,
+    job: TenantDatabasePurgeJobRecord,
+  ): Promise<TenantDatabasePurgeEvidenceBundle | null> {
+    await this.validateTenantDatabasePurgeCutoverState(conn);
+    const source = await this.validateTenantDatabasePurgeSource(
+      conn,
+      job,
+      job.phase !== "database_purged",
+    );
+    if (job.phase === "database_purged") {
+      const bundle = await this.loadTenantDatabasePurgeBundle(conn, job);
+      try {
+        validateTenantDatabasePurgeCompletionProof(job, bundle);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      const planEntryByDomain = new Map(source.planEntries.map((entry) => [
+        entry.domain,
+        entry,
+      ] as const));
+      for (const entry of bundle.preDeleteEntries) {
+        const planEntry = planEntryByDomain.get(entry.domain);
+        if (
+          !planEntry
+          || entry.planEntryReceiptSha256 !== planEntry.receiptSha256
+          || entry.planTargetCount !== planEntry.targetCount
+          || entry.planTargetRootSha256 !== planEntry.targetRootSha256
+        ) throw new TenantErasureIntegrityError();
+      }
+      const sessionReceiptById = new Map(source.sessionReceipts.map((receipt) => [
+        receipt.sessionId,
+        receipt,
+      ] as const));
+      if (
+        sessionReceiptById.size !== source.sessionReceipts.length
+        || bundle.graveMarkers.length !== source.sessionReceipts.length
+        || bundle.graveMarkers.some((marker) => (
+          sessionReceiptById.get(marker.sessionId)?.receiptSha256
+            !== marker.t3cSessionReceiptSha256
+        ))
+      ) throw new TenantErasureIntegrityError();
+      const [billingRows] = await conn.query<Row[]>(
+        `SELECT ${BILLING_USAGE_COLUMNS} FROM billing_usage_facts
+          WHERE tenant_id=? ORDER BY usage_id FOR SHARE`,
+        [job.tenantId],
+      );
+      const billingFacts = billingRows.map(rowToBillingUsageFact);
+      const operationalAcks = source.executionAcks.filter((ack) => (
+        ack.domain === "operational_usage" && ack.ackKind === "anonymized" && ack.final
+      ));
+      if (
+        operationalAcks.length !== 1
+        || billingFacts.length !== bundle.receipt.retainedBillingFactCount
+        || tenantDatabasePurgeBillingFactRootSha256(
+          billingFacts.map((fact) => fact.factSha256),
+        ) !== bundle.receipt.retainedBillingFactRootSha256
+        || billingFacts.length !== operationalAcks[0]!.resultCount
+        || tenantPurgeExecutionResultRootSha256(
+          "operational_usage",
+          "anonymize",
+          billingFacts.map((fact) => fact.factSha256),
+        ) !== operationalAcks[0]!.resultRootSha256
+      ) throw new TenantErasureIntegrityError();
+      const [residueRows] = await conn.query<Row[]>(
+        `SELECT t.name, t.auth_policy, t.auth_secret_cipher, t.auth_secret_key_id,
+           (SELECT COUNT(*) FROM agent_versions WHERE tenant_id=?) AS agents,
+           (SELECT COUNT(*) FROM sessions WHERE tenant_id=?) AS sessions,
+           (SELECT COUNT(*) FROM idempotency_keys WHERE tenant_id=?) AS idempotency,
+           (SELECT COUNT(*) FROM usage_reconciliations WHERE tenant_id=?) AS reconciliations,
+           (SELECT COUNT(*) FROM blob_objects WHERE tenant_id=?) AS blobs,
+           (SELECT COUNT(*) FROM user_export_requests WHERE tenant_id=?) AS export_requests,
+           (SELECT COUNT(*) FROM user_export_jobs WHERE tenant_id=?) AS export_jobs,
+           (SELECT COUNT(*) FROM user_export_artifacts WHERE tenant_id=?) AS export_artifacts,
+           (SELECT COUNT(*) FROM user_export_artifact_parts WHERE tenant_id=?) AS export_parts,
+           (SELECT COUNT(*) FROM user_export_snapshot_records WHERE tenant_id=?) AS snapshot_records,
+           (SELECT COUNT(*) FROM user_export_snapshot_blobs WHERE tenant_id=?) AS snapshot_blobs,
+           (SELECT COUNT(*) FROM user_export_download_leases WHERE tenant_id=?) AS export_leases
+         FROM tenants t WHERE t.tenant_id=?`,
+        [...Array.from({ length: 12 }, () => job.tenantId), job.tenantId],
+      );
+      const residue = residueRows[0];
+      if (
+        !residue
+        || residue.name != null
+        || residue.auth_policy != null
+        || residue.auth_secret_cipher != null
+        || residue.auth_secret_key_id != null
+        || [
+          "agents", "sessions", "idempotency", "reconciliations", "blobs",
+          "export_requests", "export_jobs", "export_artifacts", "export_parts",
+          "snapshot_records", "snapshot_blobs", "export_leases",
+        ].some((field) => storedSafeInteger(
+          residue[field],
+          `database purge terminal residue ${field}`,
+        ) !== 0)
+      ) throw new TenantErasureIntegrityError();
+      return bundle;
+    }
+    const [rows] = await conn.query<Row[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM tenant_database_purge_predelete_entries
+           WHERE request_id=? OR tenant_id=?) AS entries_count,
+         (SELECT COUNT(*) FROM tenant_database_purge_predelete_receipts
+           WHERE request_id=? OR tenant_id=?) AS predelete_count,
+         (SELECT COUNT(*) FROM tenant_database_purge_domain_acks
+           WHERE request_id=? OR tenant_id=?) AS ack_count,
+         (SELECT COUNT(*) FROM tenant_database_purge_receipts
+           WHERE request_id=? OR tenant_id=?) AS receipt_count,
+         (SELECT COUNT(*) FROM tenant_purge_session_grave_markers
+           WHERE request_id=? OR tenant_id=?) AS grave_count`,
+      Array.from({ length: 5 }, () => [job.requestId, job.tenantId]).flat(),
+    );
+    const row = rows[0];
+    if (!row || ["entries_count", "predelete_count", "ack_count", "receipt_count", "grave_count"]
+      .some((field) => storedSafeInteger(row[field], `database purge orphan ${field}`) !== 0)) {
+      throw new TenantErasureIntegrityError();
+    }
+    return null;
+  }
+
+  async materializeTenantDatabasePurgeJobs(
+    options: MaterializeTenantDatabasePurgeJobsOptions,
+  ): Promise<number> {
+    validateMaterializeTenantDatabasePurgeJobsOptions(options);
+    const scanLimit = Math.min(400, Math.max(32, options.limit * 4));
+    const cursor = this.tenantDatabasePurgeMaterializationCursorRequestId;
+    const load = async (after: string | undefined, through: string | undefined): Promise<Row[]> => {
+      const [rows] = await this.pool.query<Row[]>(
+        `SELECT e.request_id, e.tenant_id
+           FROM tenant_purge_execution_jobs e
+          WHERE e.phase='local_physical_acks_sealed'
+            ${after === undefined ? "" : "AND e.request_id>?"}
+            ${through === undefined ? "" : "AND e.request_id<=?"}
+            AND NOT EXISTS (
+              SELECT 1 FROM tenant_database_purge_jobs d WHERE d.request_id=e.request_id
+            )
+          ORDER BY e.request_id LIMIT ?`,
+        [
+          ...(after === undefined ? [] : [after]),
+          ...(through === undefined ? [] : [through]),
+          scanLimit,
+        ],
+      );
+      return rows;
+    };
+    let candidates = await load(cursor, undefined);
+    if (candidates.length === 0 && cursor !== undefined) {
+      candidates = await load(undefined, cursor);
+      if (candidates.length === 0) this.tenantDatabasePurgeMaterializationCursorRequestId = undefined;
+    }
+    let materialized = 0;
+    let integrity: TenantErasureIntegrityError | undefined;
+    for (const candidate of candidates) {
+      if (materialized >= options.limit) break;
+      const requestId = String(candidate.request_id);
+      const tenantId = String(candidate.tenant_id);
+      this.tenantDatabasePurgeMaterializationCursorRequestId = requestId;
+      const conn = await this.pool.getConnection();
+      try {
+        await this.beginTenantDatabasePurgeTransaction(conn);
+        const existing = await this.loadTenantDatabasePurgeJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (existing) {
+          await conn.commit();
+          continue;
+        }
+        const executionJob = await this.loadTenantPurgeExecutionJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (!executionJob || executionJob.phase !== "local_physical_acks_sealed") {
+          throw new TenantErasureIntegrityError();
+        }
+        const executionProof = await this.validateTenantPurgeExecutionReadProof(conn, executionJob);
+        const physicalReceipt = executionProof.physical;
+        if (!physicalReceipt) throw new TenantErasureIntegrityError();
+        const source = await this.validateTenantPurgeExecutionSource(conn, executionJob, false);
+        const contentReceipt = await this.loadTenantContentInventoryReceipt(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (!contentReceipt) throw new TenantErasureIntegrityError();
+        const now = await this.databaseNow(conn);
+        if (now < physicalReceipt.storeDbTimestampMs) {
+          throw new TenantDatabasePurgeNotReadyError("physical_projection_pending");
+        }
+        const [ownerRows] = await conn.query<Row[]>(
+          "SELECT request_id FROM tenant_database_purge_jobs WHERE tenant_id=? FOR UPDATE",
+          [tenantId],
+        );
+        const orphanQueries = [
+          "tenant_database_purge_predelete_entries",
+          "tenant_database_purge_predelete_receipts",
+          "tenant_database_purge_domain_acks",
+          "tenant_database_purge_receipts",
+          "tenant_purge_session_grave_markers",
+        ] as const;
+        let orphan = ownerRows[0] !== undefined;
+        for (const table of orphanQueries) {
+          const [rows] = await conn.query<Row[]>(
+            `SELECT request_id FROM ${table}
+              WHERE request_id=? OR tenant_id=? LIMIT 1 FOR SHARE`,
+            [requestId, tenantId],
+          );
+          orphan ||= rows[0] !== undefined;
+        }
+        if (orphan) throw new TenantErasureIntegrityError();
+        const job: QueuedTenantDatabasePurgeJob = {
+          requestId,
+          tenantId,
+          subjectGeneration: executionJob.subjectGeneration,
+          planBuildGeneration: executionJob.planBuildGeneration,
+          executionGeneration: executionJob.executionGeneration,
+          databasePurgeGeneration: 1,
+          t3cReceiptSha256: contentReceipt.receiptSha256,
+          planReceiptSha256: source.planReceipt.receiptSha256,
+          localPhysicalAckReceiptSha256: physicalReceipt.receiptSha256,
+          policySha256: physicalReceipt.policySha256,
+          purgeNotBeforeDbMs: physicalReceipt.purgeNotBeforeDbMs,
+          sourceEvidenceDbMs: physicalReceipt.storeDbTimestampMs,
+          phase: "queued",
+          domainCount: TENANT_DATABASE_PURGE_DOMAINS.length,
+          preDeleteEntryCount: 0,
+          preDeleteEntryRootSha256: EMPTY_TENANT_DATABASE_PURGE_PREDELETE_ENTRY_ROOT_SHA256,
+          domainAckCount: 0,
+          domainAckRootSha256: EMPTY_TENANT_DATABASE_PURGE_DOMAIN_ACK_ROOT_SHA256,
+          unresolvedBlockerCount: physicalReceipt.unresolvedBlockerCount,
+          availableAtMs: now,
+          attempts: 0,
+          createdAtMs: now,
+          updatedAtMs: now,
+        };
+        validateTenantDatabasePurgeJobRecord(job);
+        await conn.query(
+          `INSERT INTO tenant_database_purge_jobs
+             (request_id, tenant_id, subject_generation, plan_build_generation,
+              execution_generation, database_purge_generation, t3c_receipt_sha256,
+              plan_receipt_sha256, local_physical_ack_receipt_sha256, policy_sha256,
+              purge_not_before_db_ms, source_evidence_db_ms, phase, domain_count,
+              predelete_entry_count, predelete_entry_root_sha256, domain_ack_count,
+              domain_ack_root_sha256, unresolved_blocker_count, predelete_receipt_sha256,
+              terminal_receipt_sha256, available_at_ms, attempts, claim_token,
+              lease_until_ms, last_error_code, created_at_ms, updated_at_ms,
+              purged_at_db_ms, completed_claim_attempt, completed_claim_token_sha256,
+              blocked_at_ms, blocked_reason_code)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'queued',?,0,?,0,?, ?,NULL,NULL,?,0,NULL,NULL,NULL,
+                   ?,?,NULL,NULL,NULL,NULL,NULL)`,
+          [
+            job.requestId,
+            job.tenantId,
+            job.subjectGeneration,
+            job.planBuildGeneration,
+            job.executionGeneration,
+            job.databasePurgeGeneration,
+            job.t3cReceiptSha256,
+            job.planReceiptSha256,
+            job.localPhysicalAckReceiptSha256,
+            job.policySha256,
+            job.purgeNotBeforeDbMs,
+            job.sourceEvidenceDbMs,
+            job.domainCount,
+            job.preDeleteEntryRootSha256,
+            job.domainAckRootSha256,
+            job.unresolvedBlockerCount,
+            job.availableAtMs,
+            job.createdAtMs,
+            job.updatedAtMs,
+          ],
+        );
+        await conn.commit();
+        materialized += 1;
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        if (error instanceof TenantDatabasePurgeNotReadyError) continue;
+        if (error instanceof TenantErasureIntegrityError) {
+          integrity ??= error;
+          continue;
+        }
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    if (integrity) throw integrity;
+    return materialized;
+  }
+
+  async claimTenantDatabasePurges(
+    options: ClaimTenantDatabasePurgesOptions,
+  ): Promise<TenantDatabasePurgeClaim[]> {
+    validateClaimTenantDatabasePurgesOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantDatabasePurgeTransaction(conn);
+      const scanNow = await this.databaseNow(conn);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_DATABASE_PURGE_JOB_COLUMNS}
+           FROM tenant_database_purge_jobs
+          WHERE phase='queued' AND available_at_ms<=?
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+          ORDER BY available_at_ms, request_id LIMIT ?`,
+        [scanNow, scanNow, Math.min(400, Math.max(32, options.limit * 4))],
+      );
+      const claims: TenantDatabasePurgeClaim[] = [];
+      for (const row of rows) {
+        if (claims.length >= options.limit) break;
+        const candidate = rowToTenantDatabasePurgeJob(row);
+        if (candidate.phase !== "queued") throw new TenantErasureIntegrityError();
+        const current = await this.loadTenantDatabasePurgeJob(
+          conn,
+          candidate.tenantId,
+          candidate.requestId,
+          "FOR UPDATE SKIP LOCKED",
+        );
+        if (!current || current.phase !== "queued") continue;
+        const now = await this.databaseNow(conn);
+        if (
+          current.availableAtMs > now
+          || (current.claimToken !== undefined && current.leaseUntilMs! > now)
+        ) continue;
+        const attempts = current.attempts + 1;
+        if (!Number.isSafeInteger(attempts) || attempts > 0xffff_ffff) {
+          throw new TenantErasureIntegrityError();
+        }
+        let valid = true;
+        try {
+          await this.validateTenantDatabasePurgeReadProof(conn, current);
+        } catch (error) {
+          if (error instanceof TenantDatabasePurgeNotReadyError) continue;
+          if (
+            !(error instanceof TenantDatabasePurgeEvidenceChangedError)
+            && !(error instanceof TenantErasureIntegrityError)
+          ) throw error;
+          valid = false;
+        }
+        const updatedAtMs = Math.max(current.updatedAtMs, now);
+        if (!valid) {
+          const [blocked] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE tenant_database_purge_jobs
+                SET phase='blocked', available_at_ms=NULL, attempts=?, claim_token=NULL,
+                    lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                    blocked_at_ms=?, blocked_reason_code='integrity_conflict'
+              WHERE request_id=? AND tenant_id=? AND phase='queued' AND attempts=?
+                AND available_at_ms<=? AND (claim_token IS NULL OR lease_until_ms<=?)`,
+            [
+              attempts,
+              updatedAtMs,
+              updatedAtMs,
+              current.requestId,
+              current.tenantId,
+              current.attempts,
+              now,
+              now,
+            ],
+          );
+          if (blocked.affectedRows !== 1) throw new TenantErasureIntegrityError();
+          continue;
+        }
+        const leaseUntilMs = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+          ? Number.MAX_SAFE_INTEGER
+          : now + options.leaseMs;
+        if (leaseUntilMs <= now) continue;
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_database_purge_jobs
+              SET attempts=?, claim_token=?, lease_until_ms=?, last_error_code=NULL,
+                  updated_at_ms=?
+            WHERE request_id=? AND tenant_id=? AND phase='queued' AND attempts=?
+              AND available_at_ms<=? AND (claim_token IS NULL OR lease_until_ms<=?)`,
+          [
+            attempts,
+            options.claimToken,
+            leaseUntilMs,
+            updatedAtMs,
+            current.requestId,
+            current.tenantId,
+            current.attempts,
+            now,
+            now,
+          ],
+        );
+        if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+        claims.push(tenantDatabasePurgeClaimFromJob({
+          ...current,
+          attempts,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+          updatedAtMs,
+        }));
+      }
+      await conn.commit();
+      return claims;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewTenantDatabasePurge(
+    authorization: TenantDatabasePurgeAuthorization,
+    options: RenewTenantDatabasePurgeOptions,
+  ): Promise<boolean> {
+    validateTenantDatabasePurgeAuthorization(authorization);
+    validateRenewTenantDatabasePurgeOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantDatabasePurgeTransaction(conn);
+      const current = await this.loadTenantDatabasePurgeJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      await this.validateTenantDatabasePurgeReadProof(conn, current);
+      const now = await this.databaseNow(conn);
+      if (!tenantDatabasePurgeAuthorizationMatches(current, authorization, now)) {
+        await conn.commit();
+        return false;
+      }
+      const requestedLeaseUntilMs = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+        ? Number.MAX_SAFE_INTEGER
+        : now + options.leaseMs;
+      if (requestedLeaseUntilMs <= now) {
+        await conn.commit();
+        return false;
+      }
+      const leaseUntilMs = Math.max(current.leaseUntilMs!, requestedLeaseUntilMs);
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_database_purge_jobs SET lease_until_ms=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND plan_build_generation=? AND execution_generation=?
+            AND database_purge_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          leaseUntilMs,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.planBuildGeneration,
+          authorization.executionGeneration,
+          authorization.databasePurgeGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryTenantDatabasePurge(
+    authorization: TenantDatabasePurgeAuthorization,
+    options: RetryTenantDatabasePurgeOptions,
+  ): Promise<boolean> {
+    validateTenantDatabasePurgeAuthorization(authorization);
+    validateRetryTenantDatabasePurgeOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantDatabasePurgeTransaction(conn);
+      const current = await this.loadTenantDatabasePurgeJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      await this.validateTenantDatabasePurgeReadProof(conn, current);
+      const now = await this.databaseNow(conn);
+      if (!tenantDatabasePurgeAuthorizationMatches(current, authorization, now)) {
+        await conn.commit();
+        return false;
+      }
+      const base = Math.max(now, current.createdAtMs, current.updatedAtMs, current.availableAtMs);
+      const availableAtMs = options.delayMs > Number.MAX_SAFE_INTEGER - base
+        ? Number.MAX_SAFE_INTEGER
+        : base + options.delayMs;
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_database_purge_jobs
+            SET available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND plan_build_generation=? AND execution_generation=?
+            AND database_purge_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          availableAtMs,
+          options.errorCode,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.planBuildGeneration,
+          authorization.executionGeneration,
+          authorization.databasePurgeGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async blockTenantDatabasePurge(
+    authorization: TenantDatabasePurgeAuthorization,
+    reason: TenantDatabasePurgeBlockReasonCode = "integrity_conflict",
+  ): Promise<boolean> {
+    validateTenantDatabasePurgeAuthorization(authorization);
+    if (reason !== "integrity_conflict") throw new Error("invalid tenant database purge reason");
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantDatabasePurgeTransaction(conn);
+      const current = await this.loadTenantDatabasePurgeJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      try {
+        await this.validateTenantDatabasePurgeReadProof(conn, current);
+      } catch (error) {
+        if (
+          !(error instanceof TenantDatabasePurgeEvidenceChangedError)
+          && !(error instanceof TenantErasureIntegrityError)
+        ) throw error;
+      }
+      const now = await this.databaseNow(conn);
+      if (!tenantDatabasePurgeAuthorizationMatches(current, authorization, now)) {
+        await conn.commit();
+        return false;
+      }
+      const atMs = Math.max(current.createdAtMs, current.updatedAtMs, now);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_database_purge_jobs
+            SET phase='blocked', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                blocked_at_ms=?, blocked_reason_code=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND plan_build_generation=? AND execution_generation=?
+            AND database_purge_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          atMs,
+          atMs,
+          reason,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.planBuildGeneration,
+          authorization.executionGeneration,
+          authorization.databasePurgeGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async executeTenantDatabasePurge(
+    authorization: TenantDatabasePurgeAuthorization,
+  ): Promise<TenantDatabasePurgeReceipt | null> {
+    const staged = structuredClone(authorization);
+    validateTenantDatabasePurgeAuthorization(staged);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantDatabasePurgeTransaction(conn);
+      const current = await this.loadTenantDatabasePurgeJob(
+        conn,
+        staged.tenantId,
+        staged.requestId,
+        "FOR UPDATE",
+      );
+      if (!current) {
+        await conn.commit();
+        return null;
+      }
+      // Hold the singleton for the full transaction. Once this transaction has staged its
+      // terminal receipt, re-reading the still-inactive row through the general validator
+      // would (correctly for an external reader, incorrectly for this atomic writer) see a
+      // receipt before activation. The locked pre-write state is the authority for activation.
+      const cutover = await this.validateTenantDatabasePurgeCutoverState(conn, "FOR UPDATE");
+      if (current.phase === "database_purged") {
+        const bundle = await this.validateTenantDatabasePurgeReadProof(conn, current);
+        if (!bundle) throw new TenantErasureIntegrityError();
+        await conn.commit();
+        return tenantDatabasePurgeReceiptMatchesAuthorization(bundle.receipt, staged)
+          ? bundle.receipt
+          : null;
+      }
+      if (current.phase !== "queued") {
+        await conn.commit();
+        return null;
+      }
+      await this.validateTenantDatabasePurgeReadProof(conn, current);
+      let now = await this.databaseNow(conn);
+      if (!tenantDatabasePurgeAuthorizationMatches(current, staged, now)) {
+        await conn.commit();
+        return null;
+      }
+      if (now < current.purgeNotBeforeDbMs || now < current.sourceEvidenceDbMs) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+      const source = await this.validateTenantDatabasePurgeSource(conn, current, true);
+      const { targetState } = await this.validateTenantDatabasePurgeReady(
+        conn,
+        current,
+        source,
+      );
+      const purgeAtMs = await this.databaseNow(conn);
+      if (!tenantDatabasePurgeAuthorizationMatches(current, staged, purgeAtMs)) {
+        await conn.commit();
+        return null;
+      }
+      if (purgeAtMs < current.purgeNotBeforeDbMs
+        || purgeAtMs < current.sourceEvidenceDbMs) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+
+      const identity = {
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        planBuildGeneration: current.planBuildGeneration,
+        executionGeneration: current.executionGeneration,
+        databasePurgeGeneration: current.databasePurgeGeneration,
+      };
+      const sourceFields: TenantDatabasePurgeSource = {
+        ...identity,
+        t3cReceiptSha256: current.t3cReceiptSha256,
+        planReceiptSha256: current.planReceiptSha256,
+        localPhysicalAckReceiptSha256: current.localPhysicalAckReceiptSha256,
+        policySha256: current.policySha256,
+        purgeNotBeforeDbMs: current.purgeNotBeforeDbMs,
+        sourceEvidenceDbMs: current.sourceEvidenceDbMs,
+      };
+      const planEntryByDomain = new Map(source.planEntries.map((entry) => [
+        entry.domain,
+        entry,
+      ] as const));
+      const preDeleteEntries: TenantDatabasePurgePreDeleteEntry[] = [];
+      for (const domain of TENANT_DATABASE_PURGE_DOMAINS) {
+        const planEntry = planEntryByDomain.get(domain);
+        const target = targetState.targets.get(domain);
+        if (!planEntry || !target) throw new TenantErasureIntegrityError();
+        const bridgeKind = tenantDatabasePurgeBridgeKind(domain);
+        const bridgeSha256 = tenantDatabasePurgeBridgeSha256(
+          bridgeKind === "direct_plan"
+            ? {
+                bridgeKind,
+                domain,
+                planEntryReceiptSha256: planEntry.receiptSha256,
+                planTargetCount: planEntry.targetCount,
+                planTargetRootSha256: planEntry.targetRootSha256,
+                preDeleteTargetCount: target.targetCount,
+                preDeleteTargetRootSha256: target.targetRootSha256,
+              }
+            : {
+                bridgeKind,
+                domain,
+                planEntryReceiptSha256: planEntry.receiptSha256,
+                planTargetCount: planEntry.targetCount,
+                planTargetRootSha256: planEntry.targetRootSha256,
+                localPhysicalAckReceiptSha256: current.localPhysicalAckReceiptSha256,
+                preDeleteTargetCount: target.targetCount,
+                preDeleteTargetRootSha256: target.targetRootSha256,
+              },
+        );
+        const body: Omit<TenantDatabasePurgePreDeleteEntry, "receiptSha256"> = {
+          ...identity,
+          scope: TENANT_DATABASE_PURGE_PREDELETE_ENTRY_SCOPE,
+          domain,
+          domainOrdinal: tenantDatabasePurgeDomainOrdinal(domain),
+          action: TENANT_DATABASE_PURGE_ACTION_BY_DOMAIN[domain],
+          planEntryReceiptSha256: planEntry.receiptSha256,
+          planTargetCount: planEntry.targetCount,
+          planTargetRootSha256: planEntry.targetRootSha256,
+          bridgeKind,
+          bridgeSha256,
+          preDeleteTargetCount: target.targetCount,
+          preDeleteTargetRootSha256: target.targetRootSha256,
+          capturedAtDbMs: purgeAtMs,
+        };
+        const entry: TenantDatabasePurgePreDeleteEntry = {
+          ...body,
+          receiptSha256: tenantDatabasePurgePreDeleteEntrySha256(body),
+        };
+        validateTenantDatabasePurgePreDeleteEntryAgainstSource(entry, sourceFields);
+        preDeleteEntries.push(entry);
+      }
+      const entryRootSha256 = tenantDatabasePurgePreDeleteEntryRootSha256(preDeleteEntries);
+      const entryByDomain = new Map(preDeleteEntries.map((entry) => [entry.domain, entry]));
+      const sessionEntry = entryByDomain.get("session_content");
+      const reconciliationEntry = entryByDomain.get("billing_reconciliation");
+      if (!sessionEntry || !reconciliationEntry) throw new TenantErasureIntegrityError();
+      const billingFactRootSha256 = tenantDatabasePurgeBillingFactRootSha256(
+        targetState.billingFacts.map((fact) => fact.factSha256),
+      );
+      const completedClaimTokenSha256 = tenantDatabasePurgeClaimTokenSha256(staged.claimToken);
+      const preDeleteReceiptBody: Omit<TenantDatabasePurgePreDeleteReceipt, "receiptSha256"> = {
+        ...sourceFields,
+        scope: TENANT_DATABASE_PURGE_PREDELETE_RECEIPT_SCOPE,
+        entryCount: preDeleteEntries.length,
+        entryRootSha256,
+        sessionTargetCount: sessionEntry.preDeleteTargetCount,
+        sessionTargetRootSha256: sessionEntry.preDeleteTargetRootSha256,
+        retainedBillingFactCount: targetState.billingFacts.length,
+        retainedBillingFactRootSha256: billingFactRootSha256,
+        billingReconciliationTargetCount: reconciliationEntry.preDeleteTargetCount,
+        billingReconciliationTargetRootSha256: reconciliationEntry.preDeleteTargetRootSha256,
+        storeDbTimestampMs: purgeAtMs,
+        completedClaimAttempt: staged.claimAttempt,
+        completedClaimTokenSha256,
+        preDeleteComplete: true,
+        destructiveProgress: false,
+        contentPurgeExecuted: false,
+      };
+      const preDeleteReceipt: TenantDatabasePurgePreDeleteReceipt = {
+        ...preDeleteReceiptBody,
+        receiptSha256: tenantDatabasePurgePreDeleteReceiptSha256(preDeleteReceiptBody),
+      };
+      validateTenantDatabasePurgePreDeleteReceipt(preDeleteReceipt);
+
+      const receiptBySession = new Map(source.sessionReceipts.map((receipt) => [
+        receipt.sessionId,
+        receipt,
+      ] as const));
+      const graveMarkers: TenantPurgeSessionGraveMarker[] = targetState.sessions.map((session) => {
+        const sessionReceipt = receiptBySession.get(session.sessionId);
+        if (!sessionReceipt) throw new TenantDatabasePurgeEvidenceChangedError();
+        const body: Omit<TenantPurgeSessionGraveMarker, "markerSha256"> = {
+          ...identity,
+          scope: TENANT_PURGE_SESSION_GRAVE_MARKER_SCOPE,
+          sessionId: session.sessionId,
+          deletionGeneration: session.deletionGeneration === 0
+            ? 1
+            : session.deletionGeneration,
+          deletedAtDbMs: session.deletedAtDbMs ?? purgeAtMs,
+          ownerSha256: tenantDatabasePurgeSessionGraveOwnerSha256({
+            tenantId: session.tenantId,
+            userId: session.userId,
+            sessionId: session.sessionId,
+          }),
+          t3cSessionReceiptSha256: sessionReceipt.receiptSha256,
+          preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+          markedAtDbMs: purgeAtMs,
+        };
+        return {
+          ...body,
+          markerSha256: tenantDatabasePurgeSessionGraveMarkerSha256(body),
+        };
+      });
+      if (graveMarkers.length !== source.sessionReceipts.length) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+      const graveMarkerRootSha256 = tenantDatabasePurgeSessionGraveMarkerRootSha256(
+        graveMarkers,
+      );
+      const billingEvidenceHashes = reconciliationEntry.preDeleteTargetCount === 0
+        ? []
+        : [tenantDatabasePurgeTargetSha256("billing_reconciliation", [
+            "tenant-database-purge-retained-anonymized-v1",
+            reconciliationEntry.preDeleteTargetCount,
+            reconciliationEntry.preDeleteTargetRootSha256,
+          ])];
+      const billingEvidenceRootSha256 = tenantDatabasePurgeRetainedEvidenceRootSha256(
+        "billing_reconciliation",
+        billingEvidenceHashes,
+      );
+
+      for (const entry of preDeleteEntries) {
+        await conn.query(
+          `INSERT INTO tenant_database_purge_predelete_entries
+             (scope, request_id, tenant_id, subject_generation, plan_build_generation,
+              execution_generation, database_purge_generation, domain, domain_ordinal,
+              action, plan_entry_receipt_sha256, plan_target_count,
+              plan_target_root_sha256, bridge_kind, bridge_sha256,
+              predelete_target_count, predelete_target_root_sha256, captured_at_db_ms,
+              receipt_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            entry.scope, entry.requestId, entry.tenantId, entry.subjectGeneration,
+            entry.planBuildGeneration, entry.executionGeneration,
+            entry.databasePurgeGeneration, entry.domain, entry.domainOrdinal, entry.action,
+            entry.planEntryReceiptSha256, entry.planTargetCount,
+            entry.planTargetRootSha256, entry.bridgeKind, entry.bridgeSha256,
+            entry.preDeleteTargetCount, entry.preDeleteTargetRootSha256,
+            entry.capturedAtDbMs, entry.receiptSha256,
+          ],
+        );
+      }
+      await conn.query(
+        `INSERT INTO tenant_database_purge_predelete_receipts
+           (scope, request_id, tenant_id, subject_generation, plan_build_generation,
+            execution_generation, database_purge_generation, t3c_receipt_sha256,
+            plan_receipt_sha256, local_physical_ack_receipt_sha256, policy_sha256,
+            purge_not_before_db_ms, source_evidence_db_ms, entry_count,
+            entry_root_sha256, session_target_count, session_target_root_sha256,
+            retained_billing_fact_count, retained_billing_fact_root_sha256,
+            billing_reconciliation_target_count,
+            billing_reconciliation_target_root_sha256, store_db_timestamp_ms,
+            completed_claim_attempt, completed_claim_token_sha256, predelete_complete,
+            destructive_progress, content_purge_executed, receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          preDeleteReceipt.scope, preDeleteReceipt.requestId, preDeleteReceipt.tenantId,
+          preDeleteReceipt.subjectGeneration, preDeleteReceipt.planBuildGeneration,
+          preDeleteReceipt.executionGeneration, preDeleteReceipt.databasePurgeGeneration,
+          preDeleteReceipt.t3cReceiptSha256, preDeleteReceipt.planReceiptSha256,
+          preDeleteReceipt.localPhysicalAckReceiptSha256, preDeleteReceipt.policySha256,
+          preDeleteReceipt.purgeNotBeforeDbMs, preDeleteReceipt.sourceEvidenceDbMs,
+          preDeleteReceipt.entryCount,
+          preDeleteReceipt.entryRootSha256, preDeleteReceipt.sessionTargetCount,
+          preDeleteReceipt.sessionTargetRootSha256,
+          preDeleteReceipt.retainedBillingFactCount,
+          preDeleteReceipt.retainedBillingFactRootSha256,
+          preDeleteReceipt.billingReconciliationTargetCount,
+          preDeleteReceipt.billingReconciliationTargetRootSha256,
+          preDeleteReceipt.storeDbTimestampMs, preDeleteReceipt.completedClaimAttempt,
+          preDeleteReceipt.completedClaimTokenSha256, preDeleteReceipt.preDeleteComplete,
+          preDeleteReceipt.destructiveProgress, preDeleteReceipt.contentPurgeExecuted,
+          preDeleteReceipt.receiptSha256,
+        ],
+      );
+      for (const marker of graveMarkers) {
+        await conn.query(
+          `INSERT INTO tenant_purge_session_grave_markers
+             (scope, session_id, tenant_id, request_id, subject_generation,
+              plan_build_generation, execution_generation, database_purge_generation,
+              deletion_generation, deleted_at_db_ms, owner_sha256,
+              t3c_session_receipt_sha256, predelete_receipt_sha256, marked_at_db_ms,
+              marker_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            marker.scope, marker.sessionId, marker.tenantId, marker.requestId,
+            marker.subjectGeneration, marker.planBuildGeneration,
+            marker.executionGeneration, marker.databasePurgeGeneration,
+            marker.deletionGeneration, marker.deletedAtDbMs, marker.ownerSha256,
+            marker.t3cSessionReceiptSha256, marker.preDeleteReceiptSha256,
+            marker.markedAtDbMs, marker.markerSha256,
+          ],
+        );
+      }
+
+      await this.deleteTenantDatabasePurgeTargets(conn, current.tenantId, targetState.targets);
+
+      const clearedProfileHash = tenantDatabasePurgeTargetSha256("tenant_profile", [
+        current.tenantId,
+        null,
+        false,
+        false,
+        false,
+      ]);
+      let previousGlobalAckSha256 = EMPTY_TENANT_DATABASE_PURGE_DOMAIN_ACK_ROOT_SHA256;
+      const domainAcks: TenantDatabasePurgeDomainAck[] = [];
+      for (const entry of preDeleteEntries) {
+        const profileClear = entry.domain === "tenant_profile";
+        const sessionDelete = entry.domain === "session_content";
+        const reconciliationRetain = entry.domain === "billing_reconciliation";
+        const resultTargetCount = profileClear ? 1 : 0;
+        const resultTargetRootSha256 = profileClear
+          ? tenantDatabasePurgeTargetRootSha256(entry.domain, [clearedProfileHash])
+          : tenantDatabasePurgeTargetRootSha256(entry.domain, []);
+        const retainedEvidenceCount = sessionDelete
+          ? graveMarkers.length
+          : reconciliationRetain ? billingEvidenceHashes.length : 0;
+        const retainedEvidenceRootSha256 = sessionDelete
+          ? graveMarkerRootSha256
+          : reconciliationRetain
+            ? billingEvidenceRootSha256
+            : tenantDatabasePurgeRetainedEvidenceRootSha256(entry.domain, []);
+        const operationSha256 = tenantDatabasePurgeOperationSha256({
+          identity,
+          domain: entry.domain,
+          action: entry.action,
+          preDeleteTargetCount: entry.preDeleteTargetCount,
+          preDeleteTargetRootSha256: entry.preDeleteTargetRootSha256,
+          affectedCount: entry.preDeleteTargetCount,
+          resultTargetCount,
+          resultTargetRootSha256,
+          retainedEvidenceCount,
+          retainedEvidenceRootSha256,
+        });
+        const body: Omit<TenantDatabasePurgeDomainAck, "receiptSha256"> = {
+          ...identity,
+          scope: TENANT_DATABASE_PURGE_DOMAIN_ACK_SCOPE,
+          domain: entry.domain,
+          domainOrdinal: entry.domainOrdinal,
+          globalAckSeq: entry.domainOrdinal + 1,
+          previousGlobalAckSha256,
+          preDeleteEntryReceiptSha256: entry.receiptSha256,
+          action: entry.action,
+          preDeleteTargetCount: entry.preDeleteTargetCount,
+          preDeleteTargetRootSha256: entry.preDeleteTargetRootSha256,
+          affectedCount: entry.preDeleteTargetCount,
+          resultTargetCount,
+          resultTargetRootSha256,
+          retainedEvidenceCount,
+          retainedEvidenceRootSha256,
+          adapterProtocol: TENANT_DATABASE_PURGE_ADAPTER_PROTOCOL,
+          operationSha256,
+          physicalProofSha256: tenantDatabasePurgePhysicalProofSha256({
+            identity,
+            domain: entry.domain,
+            action: entry.action,
+            adapterProtocol: TENANT_DATABASE_PURGE_ADAPTER_PROTOCOL,
+            previousGlobalAckSha256,
+            preDeleteEntryReceiptSha256: entry.receiptSha256,
+            operationSha256,
+            storeDbTimestampMs: purgeAtMs,
+            completedClaimAttempt: staged.claimAttempt,
+            completedClaimTokenSha256,
+          }),
+          completedClaimAttempt: staged.claimAttempt,
+          completedClaimTokenSha256,
+          storeDbTimestampMs: purgeAtMs,
+        };
+        const ack: TenantDatabasePurgeDomainAck = {
+          ...body,
+          receiptSha256: tenantDatabasePurgeDomainAckSha256(body),
+        };
+        validateTenantDatabasePurgeDomainAck(ack);
+        domainAcks.push(ack);
+        previousGlobalAckSha256 = tenantDatabasePurgeNextDomainAckRootSha256(
+          previousGlobalAckSha256,
+          ack.globalAckSeq,
+          ack.domain,
+          ack.receiptSha256,
+        );
+      }
+      const domainAckRootSha256 = tenantDatabasePurgeDomainAckRootSha256(domainAcks);
+      if (domainAckRootSha256 !== previousGlobalAckSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      for (const ack of domainAcks) {
+        await conn.query(
+          `INSERT INTO tenant_database_purge_domain_acks
+             (scope, request_id, tenant_id, subject_generation, plan_build_generation,
+              execution_generation, database_purge_generation, domain, domain_ordinal,
+              global_ack_seq, previous_global_ack_sha256, action,
+              predelete_entry_receipt_sha256, predelete_target_count,
+              predelete_target_root_sha256, affected_count, result_target_count,
+              result_target_root_sha256, retained_evidence_count,
+              retained_evidence_root_sha256, adapter_protocol, operation_sha256,
+              physical_proof_sha256, store_db_timestamp_ms, completed_claim_attempt,
+              completed_claim_token_sha256, receipt_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            ack.scope, ack.requestId, ack.tenantId, ack.subjectGeneration,
+            ack.planBuildGeneration, ack.executionGeneration,
+            ack.databasePurgeGeneration, ack.domain, ack.domainOrdinal,
+            ack.globalAckSeq, ack.previousGlobalAckSha256, ack.action,
+            ack.preDeleteEntryReceiptSha256, ack.preDeleteTargetCount,
+            ack.preDeleteTargetRootSha256, ack.affectedCount, ack.resultTargetCount,
+            ack.resultTargetRootSha256, ack.retainedEvidenceCount,
+            ack.retainedEvidenceRootSha256, ack.adapterProtocol,
+            ack.operationSha256, ack.physicalProofSha256, ack.storeDbTimestampMs,
+            ack.completedClaimAttempt, ack.completedClaimTokenSha256, ack.receiptSha256,
+          ],
+        );
+      }
+
+      const receiptBody: Omit<TenantDatabasePurgeReceipt, "receiptSha256"> = {
+        ...sourceFields,
+        scope: TENANT_DATABASE_PURGE_RECEIPT_SCOPE,
+        preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+        preDeleteEntryCount: preDeleteEntries.length,
+        preDeleteEntryRootSha256: entryRootSha256,
+        domainAckCount: domainAcks.length,
+        domainAckRootSha256,
+        graveMarkerCount: graveMarkers.length,
+        graveMarkerRootSha256,
+        retainedBillingFactCount: targetState.billingFacts.length,
+        retainedBillingFactRootSha256: billingFactRootSha256,
+        billingReconciliationEvidenceCount: billingEvidenceHashes.length,
+        billingReconciliationEvidenceRootSha256: billingEvidenceRootSha256,
+        unresolvedBlockerCount: current.unresolvedBlockerCount,
+        storeDbTimestampMs: purgeAtMs,
+        completedClaimAttempt: staged.claimAttempt,
+        completedClaimTokenSha256,
+        localDatabasePurgeComplete: true,
+        sessionContentDeleted: true,
+        allDomainsComplete: false,
+        contentPurgeExecuted: false,
+      };
+      const receipt: TenantDatabasePurgeReceipt = {
+        ...receiptBody,
+        receiptSha256: tenantDatabasePurgeReceiptSha256(receiptBody),
+      };
+      validateTenantDatabasePurgeReceipt(receipt);
+      await conn.query(
+        `INSERT INTO tenant_database_purge_receipts
+           (scope, request_id, tenant_id, subject_generation, plan_build_generation,
+            execution_generation, database_purge_generation, t3c_receipt_sha256,
+            plan_receipt_sha256, local_physical_ack_receipt_sha256,
+            policy_sha256, purge_not_before_db_ms, source_evidence_db_ms,
+            predelete_receipt_sha256, predelete_entry_count,
+            predelete_entry_root_sha256, domain_ack_count, domain_ack_root_sha256,
+            grave_marker_count, grave_marker_root_sha256, retained_billing_fact_count,
+            retained_billing_fact_root_sha256,
+            billing_reconciliation_evidence_count,
+            billing_reconciliation_evidence_root_sha256, unresolved_blocker_count,
+            store_db_timestamp_ms, completed_claim_attempt,
+            completed_claim_token_sha256, local_database_purge_complete,
+            session_content_deleted, all_domains_complete, content_purge_executed,
+            receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          receipt.scope, receipt.requestId, receipt.tenantId, receipt.subjectGeneration,
+          receipt.planBuildGeneration, receipt.executionGeneration,
+          receipt.databasePurgeGeneration, receipt.t3cReceiptSha256,
+          receipt.planReceiptSha256, receipt.localPhysicalAckReceiptSha256,
+          receipt.policySha256, receipt.purgeNotBeforeDbMs, receipt.sourceEvidenceDbMs,
+          receipt.preDeleteReceiptSha256, receipt.preDeleteEntryCount,
+          receipt.preDeleteEntryRootSha256, receipt.domainAckCount,
+          receipt.domainAckRootSha256, receipt.graveMarkerCount,
+          receipt.graveMarkerRootSha256, receipt.retainedBillingFactCount,
+          receipt.retainedBillingFactRootSha256,
+          receipt.billingReconciliationEvidenceCount,
+          receipt.billingReconciliationEvidenceRootSha256,
+          receipt.unresolvedBlockerCount, receipt.storeDbTimestampMs,
+          receipt.completedClaimAttempt, receipt.completedClaimTokenSha256,
+          receipt.localDatabasePurgeComplete, receipt.sessionContentDeleted,
+          receipt.allDomainsComplete, receipt.contentPurgeExecuted, receipt.receiptSha256,
+        ],
+      );
+
+      now = await this.databaseNow(conn);
+      if (!tenantDatabasePurgeAuthorizationMatches(current, staged, now)) {
+        throw new Error("tenant database purge lease expired before publication");
+      }
+      try {
+        await this.lockTenantPurgePlanHoldProof(conn, current.tenantId);
+      } catch (error) {
+        if (error instanceof TenantPurgePlanNotReadyError
+          && error.reason === "active_legal_hold") {
+          throw new TenantDatabasePurgeNotReadyError("active_legal_hold");
+        }
+        throw error;
+      }
+      const terminal: Extract<TenantDatabasePurgeJobRecord, { phase: "database_purged" }> = {
+        ...sourceFields,
+        phase: "database_purged",
+        domainCount: current.domainCount,
+        preDeleteEntryCount: preDeleteEntries.length,
+        preDeleteEntryRootSha256: entryRootSha256,
+        domainAckCount: domainAcks.length,
+        domainAckRootSha256,
+        unresolvedBlockerCount: current.unresolvedBlockerCount,
+        attempts: current.attempts,
+        createdAtMs: current.createdAtMs,
+        updatedAtMs: Math.max(current.updatedAtMs, now),
+        preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+        terminalReceiptSha256: receipt.receiptSha256,
+        purgedAtDbMs: purgeAtMs,
+        completedClaimAttempt: staged.claimAttempt,
+        completedClaimTokenSha256,
+      };
+      validateTenantDatabasePurgeCompletionProof(terminal, {
+        preDeleteEntries,
+        preDeleteReceipt,
+        domainAcks,
+        graveMarkers,
+        receipt,
+      });
+
+      if (cutover.controlGeneration === 0) {
+        const body = {
+          singletonId: TENANT_DATABASE_PURGE_CUTOVER_SINGLETON_ID,
+          controlGeneration: 1 as const,
+          activatedAtDbMs: purgeAtMs,
+          firstRequestId: receipt.requestId,
+          firstReceiptSha256: receipt.receiptSha256,
+        };
+        const evidenceSha256 = tenantDatabasePurgeCutoverEvidenceSha256(body);
+        const [activated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_database_purge_cutover
+              SET control_generation=1, activated_at_db_ms=?, first_request_id=?,
+                  first_receipt_sha256=?, evidence_sha256=?
+            WHERE singleton_id=? AND control_generation=0`,
+          [
+            purgeAtMs, receipt.requestId, receipt.receiptSha256, evidenceSha256,
+            TENANT_DATABASE_PURGE_CUTOVER_SINGLETON_ID,
+          ],
+        );
+        if (activated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      }
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_database_purge_jobs
+            SET phase='database_purged', predelete_entry_count=?,
+                predelete_entry_root_sha256=?, domain_ack_count=?,
+                domain_ack_root_sha256=?, predelete_receipt_sha256=?,
+                terminal_receipt_sha256=?, available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                purged_at_db_ms=?, completed_claim_attempt=?,
+                completed_claim_token_sha256=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND plan_build_generation=? AND execution_generation=?
+            AND database_purge_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          terminal.preDeleteEntryCount, terminal.preDeleteEntryRootSha256,
+          terminal.domainAckCount, terminal.domainAckRootSha256,
+          terminal.preDeleteReceiptSha256, terminal.terminalReceiptSha256,
+          terminal.updatedAtMs, terminal.purgedAtDbMs, terminal.completedClaimAttempt,
+          terminal.completedClaimTokenSha256, staged.requestId, staged.tenantId,
+          staged.subjectGeneration, staged.planBuildGeneration,
+          staged.executionGeneration, staged.databasePurgeGeneration,
+          staged.claimAttempt, staged.claimToken, now,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      await this.validateTenantDatabasePurgeCutoverState(conn, "FOR SHARE");
+      await conn.commit();
+      return receipt;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private async deleteTenantDatabasePurgeTargets(
+    conn: PoolConnection,
+    tenantId: string,
+    targets: ReadonlyMap<TenantDatabasePurgeDomain, TenantDatabasePurgeTargetEvidence>,
+  ): Promise<void> {
+    const expected = (domain: TenantDatabasePurgeDomain): number => {
+      const target = targets.get(domain);
+      if (!target) throw new TenantErasureIntegrityError();
+      return target.targetCount;
+    };
+    const remove = async (sql: string, params: readonly unknown[] = [tenantId]): Promise<number> => {
+      const [result] = await conn.query<mysql.ResultSetHeader>(sql, [...params]);
+      return result.affectedRows;
+    };
+
+    const [profile] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE tenants SET name=NULL, auth_policy=NULL, auth_secret_cipher=NULL,
+              auth_secret_key_id=NULL WHERE tenant_id=?`,
+      [tenantId],
+    );
+    if (profile.affectedRows !== 1 || expected("tenant_profile") !== 1) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (await remove("DELETE FROM agent_versions WHERE tenant_id=?")
+      !== expected("agent_definitions")) throw new TenantErasureIntegrityError();
+
+    const lifecycle = await remove(
+      `DELETE o FROM lifecycle_outbox o
+        JOIN sessions s ON s.session_id=o.aggregate_id WHERE s.tenant_id=?`,
+    );
+    if (lifecycle !== expected("lifecycle_outbox")) throw new TenantErasureIntegrityError();
+    await remove(
+      `DELETE a FROM approvals a JOIN sessions s ON s.session_id=a.session_id
+        WHERE s.tenant_id=?`,
+    );
+    await remove(
+      `DELETE i FROM items i JOIN sessions s ON s.session_id=i.session_id
+        WHERE s.tenant_id=?`,
+    );
+    await remove(
+      `DELETE e FROM events e JOIN sessions s ON s.session_id=e.session_id
+        WHERE s.tenant_id=?`,
+    );
+    await remove(
+      `DELETE t FROM turns t JOIN sessions s ON s.session_id=t.session_id
+        WHERE s.tenant_id=?`,
+    );
+    if (await remove("DELETE FROM sessions WHERE tenant_id=?")
+      !== expected("session_content")) throw new TenantErasureIntegrityError();
+
+    if (await remove("DELETE FROM idempotency_keys WHERE tenant_id=?")
+      !== expected("idempotency_receipts")) throw new TenantErasureIntegrityError();
+    if (await remove("DELETE FROM usage_reconciliations WHERE tenant_id=?")
+      !== expected("billing_reconciliation")) throw new TenantErasureIntegrityError();
+
+    const blobOutbox = await remove(
+      `DELETE o FROM blob_delete_outbox o
+        JOIN blob_objects b ON b.blob_id=o.blob_id WHERE b.tenant_id=?`,
+    );
+    if (blobOutbox !== expected("blob_outbox")) throw new TenantErasureIntegrityError();
+    if (await remove("DELETE FROM blob_objects WHERE tenant_id=?")
+      !== expected("blob_manifest")) throw new TenantErasureIntegrityError();
+
+    const leases = await remove("DELETE FROM user_export_download_leases WHERE tenant_id=?");
+    const snapshotRecords = await remove(
+      "DELETE FROM user_export_snapshot_records WHERE tenant_id=?",
+    );
+    const snapshotBlobs = await remove(
+      "DELETE FROM user_export_snapshot_blobs WHERE tenant_id=?",
+    );
+    const exportOutbox = await remove(
+      `DELETE o FROM user_export_artifact_delete_outbox o
+        JOIN user_export_artifacts a ON a.artifact_id=o.artifact_id
+       WHERE a.tenant_id=?`,
+    );
+    const exportParts = await remove("DELETE FROM user_export_artifact_parts WHERE tenant_id=?");
+    const exportArtifacts = await remove("DELETE FROM user_export_artifacts WHERE tenant_id=?");
+    const exportJobs = await remove("DELETE FROM user_export_jobs WHERE tenant_id=?");
+    const exportRequests = await remove("DELETE FROM user_export_requests WHERE tenant_id=?");
+    if (exportRequests * 2 + exportJobs + leases !== expected("user_export_control")
+      || snapshotRecords + snapshotBlobs !== expected("user_export_snapshots")
+      || exportArtifacts + exportParts + exportOutbox !== expected("user_export_artifacts")) {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async getTenantDatabasePurgeJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantDatabasePurgeJobRecord | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
+      if (!job) return null;
+      await this.validateTenantDatabasePurgeReadProof(conn, job);
+      return job;
+    });
+  }
+
+  async getTenantDatabasePurgePreDeleteEntries(
+    tenantId: string,
+    requestId: string,
+    databasePurgeGeneration: number,
+  ): Promise<TenantDatabasePurgePreDeleteEntry[]> {
+    if (!Number.isSafeInteger(databasePurgeGeneration) || databasePurgeGeneration < 1) {
+      throw new Error("invalid tenant database purge generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "database_purged"
+        || job.databasePurgeGeneration !== databasePurgeGeneration) return [];
+      const proof = await this.validateTenantDatabasePurgeReadProof(conn, job);
+      return proof ? [...proof.preDeleteEntries] : [];
+    });
+  }
+
+  async getTenantDatabasePurgePreDeleteReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantDatabasePurgePreDeleteReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "database_purged") return null;
+      const proof = await this.validateTenantDatabasePurgeReadProof(conn, job);
+      return proof?.preDeleteReceipt ?? null;
+    });
+  }
+
+  async getTenantDatabasePurgeDomainAcks(
+    tenantId: string,
+    requestId: string,
+    databasePurgeGeneration: number,
+  ): Promise<TenantDatabasePurgeDomainAck[]> {
+    if (!Number.isSafeInteger(databasePurgeGeneration) || databasePurgeGeneration < 1) {
+      throw new Error("invalid tenant database purge generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "database_purged"
+        || job.databasePurgeGeneration !== databasePurgeGeneration) return [];
+      const proof = await this.validateTenantDatabasePurgeReadProof(conn, job);
+      return proof ? [...proof.domainAcks] : [];
+    });
+  }
+
+  async getTenantDatabasePurgeReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantDatabasePurgeReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "database_purged") return null;
+      const proof = await this.validateTenantDatabasePurgeReadProof(conn, job);
+      return proof?.receipt ?? null;
+    });
+  }
+
+  async getTenantDatabasePurgeCutover(): Promise<TenantDatabasePurgeCutoverRecord> {
+    return this.withConsistentRead((conn) => this.validateTenantDatabasePurgeCutoverState(conn));
+  }
+
+  async getTenantPurgeSessionGraveMarker(
+    tenantId: string,
+    sessionId: string,
+  ): Promise<TenantPurgeSessionGraveMarker | null> {
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_PURGE_SESSION_GRAVE_MARKER_COLUMNS}
+           FROM tenant_purge_session_grave_markers
+          WHERE tenant_id=? AND session_id=?`,
+        [tenantId, sessionId],
+      );
+      if (!rows[0]) return null;
+      const marker = rowToTenantPurgeSessionGraveMarker(rows[0]);
+      const job = await this.loadTenantDatabasePurgeJob(
+        conn,
+        marker.tenantId,
+        marker.requestId,
+      );
+      if (!job || job.phase !== "database_purged") throw new TenantErasureIntegrityError();
+      const proof = await this.validateTenantDatabasePurgeReadProof(conn, job);
+      if (!proof || !proof.graveMarkers.some((candidate) => (
+        candidate.sessionId === marker.sessionId
+        && candidate.markerSha256 === marker.markerSha256
+      ))) throw new TenantErasureIntegrityError();
+      return marker;
+    });
+  }
+
   async getSubjectLifecycle(
     tenantId: string,
     subjectKind: DataSubjectKind,
@@ -21061,7 +24222,13 @@ export class MysqlSessionStore implements
       } catch (err) {
         // Only a collision on the session row has SessionExists semantics. A later duplicate/error
         // while inserting the event must retain its database identity for diagnosis after rollback.
-        if ((err as { code?: string }).code === "ER_DUP_ENTRY") throw new SessionExistsError(s.id);
+        const mysqlError = err as { code?: string; errno?: number; sqlMessage?: string };
+        if (
+          mysqlError.code === "ER_SIGNAL_EXCEPTION"
+          && mysqlError.errno === 1644
+          && mysqlError.sqlMessage === "purged session id cannot be reused"
+        ) throw new SessionGoneError(s.id);
+        if (mysqlError.code === "ER_DUP_ENTRY") throw new SessionExistsError(s.id);
         throw err;
       }
       const event: PersistedEvent = {

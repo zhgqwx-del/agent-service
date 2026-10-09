@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import {
   ErrorCode,
   DATA_EXPORT_CONTENT_TYPE,
@@ -30,6 +31,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
@@ -469,7 +471,7 @@ describe("protocol schemas", () => {
     }).success).toBe(false);
   });
 
-  it("separates local tenant-purge execution ACK awareness from completion", () => {
+  it("separates local tenant-purge execution capabilities and workers from completion", () => {
     const base = Capabilities.parse({
       protocolVersion: PROTOCOL_VERSION,
       service: "agent-runner",
@@ -489,15 +491,29 @@ describe("protocol schemas", () => {
       ...base,
       features: {
         ...base.features,
-        tenantPurgeExecution: [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1],
+        tenantPurgeExecution: [
+          TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+          TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+        ],
         tenantPurgeExecutionWorker: true,
+        tenantDatabasePurgeWorker: true,
       },
     });
     expect(enabled.features.tenantPurgeExecution).toEqual([
       TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+      TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
     ]);
     expect(enabled.features.tenantPurgeExecutionWorker).toBe(true);
+    expect(enabled.features.tenantDatabasePurgeWorker).toBe(true);
     expect(enabled.features.dataPurgeExecution).toBe(false);
+    // The released pre-T3f parser was intentionally strict. A new runner therefore cannot be
+    // mixed with an old router: rollout must replace/drain routers before advertising this value.
+    const frozenPreT3fCapabilityParser = z.array(
+      z.literal(TENANT_PURGE_EXECUTION_LOCAL_ACK_V1),
+    ).max(1);
+    expect(frozenPreT3fCapabilityParser.safeParse(
+      enabled.features.tenantPurgeExecution,
+    ).success).toBe(false);
     expect(Capabilities.safeParse({
       ...base,
       features: {

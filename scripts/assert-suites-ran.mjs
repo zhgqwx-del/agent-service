@@ -42,6 +42,8 @@ const requiredTestFiles = [
   "packages/store/test/tenant-content-inventory.mysql.test.ts",
   "packages/store/test/tenant-purge-plan.mysql.test.ts",
   "packages/store/test/tenant-purge-execution.mysql.test.ts",
+  "packages/store/test/memory-tenant-database-purge.test.ts",
+  "packages/store/test/mysql-tenant-database-purge.test.ts",
   "packages/store/test/retention-policy.mysql.test.ts",
   "packages/store/test/erasure-purge-policy.mysql.test.ts",
   "packages/store/test/erasure-job.mysql.test.ts",

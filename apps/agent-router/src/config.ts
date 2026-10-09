@@ -56,6 +56,10 @@ const Env = z.object({
   TENANT_PURGE_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Independent T3f database-content deletion barrier; never implied by T3e activation. */
+  TENANT_DATABASE_PURGE_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** Broadcast T3b runtime drain. Keep closed until every configured stable runner endpoint is active. */
   TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")

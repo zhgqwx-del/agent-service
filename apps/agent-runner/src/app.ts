@@ -61,6 +61,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+  TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
   TenantErasureRequestHeaders,
@@ -168,6 +169,8 @@ export interface AppDeps {
   tenantCredentialRevocationWorkerEnabled?: boolean;
   /** Local T3e worker activation; code awareness remains separately advertised during rollout. */
   tenantPurgeExecutionWorkerEnabled?: boolean;
+  /** Local T3f database-content worker activation; its router barrier remains independent. */
+  tenantDatabasePurgeWorkerEnabled?: boolean;
   /** Narrow T3a store surface; its presence is the code-awareness signal advertised to routers. */
   tenantCredentialRevocation?: TenantCredentialRevocationStore;
   /** Narrow T3b runtime surface; main owns the coordinator and per-process boot identity. */
@@ -320,8 +323,12 @@ export function createApp(deps: AppDeps) {
           deps.tenantCredentialRevocation !== undefined
           && deps.tenantCredentialRevocationWorkerEnabled === true,
         // Code awareness and activation are deliberately separate rolling-upgrade signals.
-        tenantPurgeExecution: [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1],
+        tenantPurgeExecution: [
+          TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+          TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+        ],
         tenantPurgeExecutionWorker: deps.tenantPurgeExecutionWorkerEnabled === true,
+        tenantDatabasePurgeWorker: deps.tenantDatabasePurgeWorkerEnabled === true,
         tenantRuntimeDrain: deps.tenantRuntimeDrain === undefined
           ? []
           : [TENANT_RUNTIME_DRAIN_V1],

@@ -1211,6 +1211,10 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "tenantDatabasePurgeWorker": {
+                "default": false,
+                "type": "boolean"
+              },
               "tenantErasureControl": {
                 "default": [],
                 "items": {
@@ -1230,11 +1234,12 @@ export const OPENAPI_DOCUMENT = {
                 "default": [],
                 "items": {
                   "enum": [
-                    "local-execution-ack-v1"
+                    "local-execution-ack-v1",
+                    "local-db-content-delete-v1"
                   ],
                   "type": "string"
                 },
-                "maxItems": 1,
+                "maxItems": 2,
                 "type": "array"
               },
               "tenantPurgeExecutionWorker": {

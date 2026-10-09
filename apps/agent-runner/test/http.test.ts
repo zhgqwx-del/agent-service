@@ -81,6 +81,7 @@ async function makeApp(
     governance?: boolean;
     evaluation?: boolean;
     credentialWorker?: boolean;
+    databasePurgeWorker?: boolean;
   } = {},
 ) {
   const store = new MemorySessionStore();
@@ -105,6 +106,7 @@ async function makeApp(
     dataGovernanceManagementEnabled: lifecycle.governance,
     purgePolicyEvaluationSupported: lifecycle.evaluation,
     tenantCredentialRevocationWorkerEnabled: lifecycle.credentialWorker,
+    tenantDatabasePurgeWorkerEnabled: lifecycle.databasePurgeWorker,
     retentionPolicy: store,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
@@ -282,12 +284,25 @@ describe("agent-runner HTTP API", () => {
     });
   });
 
-  it("advertises T3e ACK code awareness while the local executor remains inactive", async () => {
+  it("advertises T3e/T3f code awareness while both local workers remain inactive", async () => {
     const { app } = await makeApp();
     expect(await (await app.request("/v1/capabilities")).json()).toMatchObject({
       features: {
-        tenantPurgeExecution: ["local-execution-ack-v1"],
+        tenantPurgeExecution: ["local-execution-ack-v1", "local-db-content-delete-v1"],
         tenantPurgeExecutionWorker: false,
+        tenantDatabasePurgeWorker: false,
+        dataPurgeExecution: false,
+      },
+    });
+  });
+
+  it("advertises T3f worker activation independently from T3e and public completion", async () => {
+    const { app } = await makeApp(60_000, { databasePurgeWorker: true });
+    expect(await (await app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantPurgeExecution: ["local-execution-ack-v1", "local-db-content-delete-v1"],
+        tenantPurgeExecutionWorker: false,
+        tenantDatabasePurgeWorker: true,
         dataPurgeExecution: false,
       },
     });

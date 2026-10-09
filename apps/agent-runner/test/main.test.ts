@@ -41,6 +41,7 @@ import {
   LegacyTombstoneCompensationWorker,
   PurgePolicyEvaluator,
   TenantContentInventoryWorker,
+  TenantDatabasePurgeWorker,
   TenantPurgeExecutionWorker,
   TenantPurgePlanWorker,
   TenantRuntimeRevocationWorker,
@@ -482,13 +483,58 @@ describe("runner main blob wiring", () => {
       expect(runner.tenantPurgeExecutionGate).toBeDefined();
       expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
         features: {
-          tenantPurgeExecution: ["local-execution-ack-v1"],
+          tenantPurgeExecution: ["local-execution-ack-v1", "local-db-content-delete-v1"],
           tenantPurgeExecutionWorker: true,
+          tenantDatabasePurgeWorker: false,
           dataPurgeExecution: false,
         },
       });
 
       const stop = vi.spyOn(runner.tenantPurgeExecutionWorker!, "stop");
+      const hostDrain = vi.spyOn(runner.host, "drain");
+      await runner.close();
+      expect(stop).toHaveBeenCalledOnce();
+      expect(stop.mock.invocationCallOrder[0]).toBeLessThan(hostDrain.mock.invocationCallOrder[0]!);
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      start.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("starts and drains the independently gated T3f database purge worker", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-database-purge-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const start = vi.spyOn(TenantDatabasePurgeWorker.prototype, "start")
+      .mockImplementation(() => {});
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        INTERNAL_ROUTER_TOKEN: INTERNAL_TOKEN,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        TENANT_DATABASE_PURGE_WORKER_ENABLED: "1",
+        TENANT_DATABASE_PURGE_WORKER_POLL_MS: "60000",
+        ERASURE_ROUTER_URL: "http://router.internal:8080",
+      });
+      expect(start).toHaveBeenCalledOnce();
+      expect(runner.tenantDatabasePurgeWorker).toBeInstanceOf(TenantDatabasePurgeWorker);
+      expect(runner.tenantDatabasePurgeGate).toBeDefined();
+      expect(runner.tenantPurgeExecutionWorker).toBeUndefined();
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: {
+          tenantPurgeExecution: ["local-execution-ack-v1", "local-db-content-delete-v1"],
+          tenantPurgeExecutionWorker: false,
+          tenantDatabasePurgeWorker: true,
+          dataPurgeExecution: false,
+        },
+      });
+
+      const stop = vi.spyOn(runner.tenantDatabasePurgeWorker!, "stop");
       const hostDrain = vi.spyOn(runner.host, "drain");
       await runner.close();
       expect(stop).toHaveBeenCalledOnce();
