@@ -60,6 +60,7 @@ import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptT
 import { newId } from "../ids.js";
 import type { RunnerTool, ToolRegistry } from "../tools/types.js";
 import { DynamicToolBridge } from "../tools/dynamic.js";
+import type { TenantRuntimeCoordinator, TenantRuntimeLease } from "../lifecycle/tenant-runtime-coordinator.js";
 import {
   BlobDataError,
   SessionBlobService,
@@ -135,6 +136,8 @@ export interface SessionHostDeps {
   tools: ToolRegistry;
   providers: ProviderResolver;
   skills?: SkillSource;
+  /** Shared runner-local T3b fence. Omitted while the T3b worker is disabled. */
+  tenantRuntime?: TenantRuntimeCoordinator;
   config: SessionHostConfig;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -205,6 +208,9 @@ interface ActiveTurn {
   finishPromise?: Promise<void>;
   /** Set only when a subject-erasure abort exceeded its configured local drain deadline. */
   erasureDrainTimedOut?: boolean;
+  /** Covers queueing, preflight and engine execution until this turn has fully settled locally. */
+  tenantRuntimeLease?: TenantRuntimeLease;
+  tenantRuntimeAbortListener?: () => void;
 }
 
 /**
@@ -1167,7 +1173,16 @@ export class SessionHost {
    * requests on this same runner, because both would be the same lease owner with the same fence.
    */
   async beginTurn(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string } = {}): Promise<BegunTurn> {
-    return this.serialiseSessionStart(sessionId, () => this.beginTurnLocked(principal, sessionId, req, opts));
+    const runtimeLease = this.deps.tenantRuntime?.enter(principal.tenantId, "turn");
+    let transferred = false;
+    try {
+      return await this.serialiseSessionStart(
+        sessionId,
+        () => this.beginTurnLocked(principal, sessionId, req, opts, runtimeLease, () => { transferred = true; }),
+      );
+    } finally {
+      if (!transferred) runtimeLease?.release();
+    }
   }
 
   /**
@@ -1322,12 +1337,22 @@ export class SessionHost {
     return turn;
   }
 
-  private async beginTurnLocked(principal: Principal, sessionId: string, req: StartTurnRequest, opts: { idempotencyKey?: string }): Promise<BegunTurn> {
+  private async beginTurnLocked(
+    principal: Principal,
+    sessionId: string,
+    req: StartTurnRequest,
+    opts: { idempotencyKey?: string },
+    runtimeLease?: TenantRuntimeLease,
+    transferRuntimeLease: () => void = noop,
+  ): Promise<BegunTurn> {
+    runtimeLease?.assertOpen();
     const session = await this.getSession(principal, sessionId);
+    runtimeLease?.assertOpen();
     const requestHash = opts.idempotencyKey ? turnRequestHash(req) : undefined;
     const existing = opts.idempotencyKey
       ? await this.lookupIdempotentTurn(session, opts.idempotencyKey, requestHash!)
       : undefined;
+    runtimeLease?.assertOpen();
     const local = this.active.get(sessionId);
     if (existing && existing.status !== "inProgress") {
       return { turn: existing, session, replayed: true, run: noop };
@@ -1337,6 +1362,7 @@ export class SessionHost {
     const probingInProgressReplay = existing?.status === "inProgress" && !local;
     if (this.draining && !probingInProgressReplay) throw new ApiError("draining", "runner is draining");
     const agent = await this.deps.store.getAgent(principal.tenantId, session.agentId, session.agentVersion);
+    runtimeLease?.assertOpen();
     if (!agent) throw new ApiError("not_found", "agent version not found");
     const busyPolicy = req.busyPolicy ?? agent.busyPolicy;
     const input = executableInput(req.input, this.imagesEnabled());
@@ -1352,6 +1378,7 @@ export class SessionHost {
           expiresAtMs: Date.now() + this.cfg.idempotencyTtlMs,
         } : undefined;
         await this.steerActive(local, req.input, input, idempotency);
+        runtimeLease?.assertOpen();
         return { turn: local.turn, session, steered: true, run: noop };
       }
       throw new ApiError("session_busy", "a turn is in progress", { turnId: local.turn.id });
@@ -1359,14 +1386,17 @@ export class SessionHost {
 
     // ---- single writer ----
     this.clearHold(sessionId);
+    runtimeLease?.assertOpen();
     const lease = await this.deps.lease.acquire(sessionId, this.deps.config.runnerId, this.deps.config.runnerAddr, this.cfg.leaseTtlMs);
     if (!lease.ok) {
+      runtimeLease?.assertOpen();
       // The first receipt read can race another runner's atomic turn-start commit. Re-read only after
       // acquisition fails: a matching receipt now proves this request already owns a durable turn and
       // is safe to replay; without one this remains an ordinary lease conflict.
       const racedExisting = opts.idempotencyKey
         ? await this.lookupIdempotentTurn(session, opts.idempotencyKey, requestHash!)
         : undefined;
+      runtimeLease?.assertOpen();
       if (racedExisting) {
         return { turn: racedExisting, session, replayed: true, run: noop };
       }
@@ -1376,14 +1406,18 @@ export class SessionHost {
     const leaseGuard = this.startLeaseGuard(sessionId);
 
     try {
+      runtimeLease?.assertOpen();
       await this.claimSessionFence(session, fence, leaseGuard);
+      runtimeLease?.assertOpen();
       // The snapshot read at entry is stale by now (several awaits, one of them a DB round trip): a
       // turn may have finished in between. Re-read before deciding anything about the session state.
       const fresh = await leaseGuard.wait(this.getSession(principal, sessionId));
+      runtimeLease?.assertOpen();
       Object.assign(session, fresh);
       const afterLeaseExisting = opts.idempotencyKey
         ? await leaseGuard.wait(this.lookupIdempotentTurn(session, opts.idempotencyKey, requestHash!))
         : undefined;
+      runtimeLease?.assertOpen();
       if (afterLeaseExisting) {
         if (session.archivedAtMs !== undefined && afterLeaseExisting.status === "inProgress") {
           throw new ApiError("session_archived", "cannot resume an in-progress turn in an archived session");
@@ -1396,8 +1430,10 @@ export class SessionHost {
           }
           leaseGuard.assertOwned();
           await leaseGuard.wait(this.closeOrphanedTurn(session, fence, leaseGuard));
+          runtimeLease?.assertOpen();
         }
         const replay = (await this.deps.store.getTurn(sessionId, afterLeaseExisting.id)) ?? afterLeaseExisting;
+        runtimeLease?.assertOpen();
         leaseGuard.stop();
         await this.deps.lease.release(sessionId, this.deps.config.runnerId).catch(() => {});
         return { turn: replay, session, replayed: true, run: noop };
@@ -1411,7 +1447,8 @@ export class SessionHost {
         leaseGuard.assertOwned();
         await leaseGuard.wait(this.closeOrphanedTurn(session, fence, leaseGuard));
       }
-      return await this.beginTurnInner(principal, session, agent, req, input, opts, fence, leaseGuard);
+      runtimeLease?.assertOpen();
+      return await this.beginTurnInner(principal, session, agent, req, input, opts, fence, leaseGuard, runtimeLease, transferRuntimeLease);
     } catch (err) {
       const failure = leaseGuard.lost ?? err;
       leaseGuard.stop();
@@ -1429,12 +1466,16 @@ export class SessionHost {
     opts: { idempotencyKey?: string },
     fence: number,
     leaseGuard: LeaseGuard,
+    runtimeLease?: TenantRuntimeLease,
+    transferRuntimeLease: () => void = noop,
   ): Promise<BegunTurn> {
     const sessionId = session.id;
 
     // ---- resolve model, tools, context ----
+    runtimeLease?.assertOpen();
     const modelRef = { ...agent.model, ...(req.model ?? {}) };
     const model = await leaseGuard.wait(this.deps.providers.resolve(principal, modelRef));
+    runtimeLease?.assertOpen();
     if (input.some((part) => part.type === "image") && !model.input.includes("image")) {
       throw new ApiError("invalid_request", `model ${model.model} does not support image input`);
     }
@@ -1443,6 +1484,7 @@ export class SessionHost {
       ...(req.dynamicTools ?? []).map((d) => this.dynamicTools.asTool(d, this.cfg.dynamicToolTimeoutMs)),
     ];
     const skills = this.deps.skills ? await leaseGuard.wait(this.deps.skills.list(principal, agent.skills)) : [];
+    runtimeLease?.assertOpen();
     const systemPrompt = buildSystemPrompt(agent, skills);
     const limits = mergeLimits(agent.limits, req.limits);
     let repairWarning: { code: string; message: string } | undefined;
@@ -1454,8 +1496,10 @@ export class SessionHost {
     const engineInput = await leaseGuard.wait(
       this.materializeSubmittedInput(principal, sessionId, input, hydrationBudget),
     );
+    runtimeLease?.assertOpen();
 
     const persistedItems = await leaseGuard.wait(this.deps.store.listItems(sessionId, { afterSeq: projectFromSeq(session), limit: MAX_PROJECTED_ITEMS, newestFirst: true }));
+    runtimeLease?.assertOpen();
     // Plan against raw persisted items. Historical images become explicit placeholders, and
     // offloaded tool results retain their small durable marker, so old bytes cannot exhaust the
     // hydration budget before compaction/pruning has selected the retained tail.
@@ -1479,10 +1523,12 @@ export class SessionHost {
       leaseGuard,
       hydrationBudget,
     );
+    runtimeLease?.assertOpen();
     const projectedMessages = compacted?.messages ?? projectItems(
       await leaseGuard.wait(this.hydratePersistedItems(principal, sessionId, persistedItems, hydrationBudget)),
     ).messages;
     const history = pruneToolResults(projectedMessages, budget);
+    runtimeLease?.assertOpen();
 
     // ---- persist turn start + user message ----
     const now = Date.now();
@@ -1508,12 +1554,14 @@ export class SessionHost {
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
       phase: "reserved", closingRequested: false, steerChain: Promise.resolve(), pendingSteers: [],
+      tenantRuntimeLease: runtimeLease,
     };
     state.done = new Promise((r) => (state.resolveDone = r));
     // Preflight contains provider/store/summariser awaits, during which drain() may observe no active
     // turn and finish. This final synchronous check + registration closes that race: after the check,
     // drain cannot run until `active` contains this state.
     if (this.draining) throw new ApiError("draining", "runner is draining");
+    runtimeLease?.assertOpen();
     leaseGuard.attach(() => {
       this.log.error(`[session ${sessionId}] lease lost; runner no longer owns the session; aborting turn ${turn.id}`);
       const wasReserved = state.phase === "reserved";
@@ -1524,9 +1572,25 @@ export class SessionHost {
       this.failPendingApprovals(state, "cancel");
       if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
     });
+    if (runtimeLease) {
+      const onRuntimeFence = () => {
+        if (state.phase === "finished") return;
+        const wasReserved = state.phase === "reserved";
+        state.fenced = true;
+        state.closingRequested = true;
+        state.stopReason = "interrupted";
+        this.failPendingApprovals(state, "cancel");
+        state.abort.abort();
+        if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
+      };
+      state.tenantRuntimeAbortListener = onRuntimeFence;
+      runtimeLease.signal.addEventListener("abort", onRuntimeFence, { once: true });
+    }
     this.active.set(sessionId, state);
+    transferRuntimeLease();
 
     try {
+      runtimeLease?.assertOpen();
       leaseGuard.assertOwned();
       await this.commit(state, {
         turn,
@@ -1547,10 +1611,12 @@ export class SessionHost {
         ],
         sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } },
       });
+      runtimeLease?.assertOpen();
       leaseGuard.assertOwned();
     } catch (err) {
       this.active.delete(sessionId);
       state.resolveDone();
+      this.releaseTenantRuntime(state);
       if (err instanceof IdempotencyMismatchError) {
         throw new ApiError("idempotency_conflict", "this Idempotency-Key was already used for a different request");
       }
@@ -2369,6 +2435,9 @@ export class SessionHost {
     state.closingRequested = true;
     const finishing = (async () => {
       await state.steerChain;
+      // A fence can arrive while a serialized store commit/publish is still running. Do not release
+      // the tenant runtime lease (and therefore do not prove activeTurnCountAfter=0) until it settles.
+      await state.chain;
       state.phase = "finishing";
       await this.finishTurnOnce(state, result);
     })();
@@ -2420,6 +2489,7 @@ export class SessionHost {
       if (this.active.get(sessionId) === state) this.active.delete(sessionId);
       state.phase = "finished";
       state.resolveDone();
+      this.releaseTenantRuntime(state);
       return;
     }
     try {
@@ -2441,8 +2511,18 @@ export class SessionHost {
       if (this.active.get(sessionId) === state) this.active.delete(sessionId);
       state.phase = "finished";
       state.resolveDone();
+      this.releaseTenantRuntime(state);
       this.scheduleRelease(sessionId);
     }
+  }
+
+  private releaseTenantRuntime(state: ActiveTurn): void {
+    if (state.tenantRuntimeLease && state.tenantRuntimeAbortListener) {
+      state.tenantRuntimeLease.signal.removeEventListener("abort", state.tenantRuntimeAbortListener);
+    }
+    state.tenantRuntimeAbortListener = undefined;
+    state.tenantRuntimeLease?.release();
+    state.tenantRuntimeLease = undefined;
   }
 
   /**

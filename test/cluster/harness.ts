@@ -135,6 +135,10 @@ export interface ClusterOptions {
   tenantCredentialRevocationExecutionEnabled?: boolean;
   /** Runs the local-database credential revocation worker on every runner. */
   tenantCredentialRevocationWorkerEnabled?: boolean;
+  /** Activates the router's all-configured T3b broadcast gate. */
+  tenantRuntimeDrainExecutionEnabled?: boolean;
+  /** Activates each runner's private process-local T3b endpoint. */
+  tenantRuntimeDrainEnabled?: boolean;
   /** Runs the durable erasure worker without necessarily accepting new requests. */
   erasureWorkerEnabled?: boolean;
   /**
@@ -159,6 +163,8 @@ export interface ClusterOptions {
   tenantErasureRequestsEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional mixed-rollout placement for the T3a worker activation signal. */
   tenantCredentialRevocationWorkerEnabledForRunner?: (runnerNumber: number) => boolean;
+  /** Optional mixed-rollout placement for the private T3b endpoint. */
+  tenantRuntimeDrainEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional mixed-rollout placement; a disabled configured target intentionally blocks v2 claims. */
   legacyTombstoneCompensationEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Extra stable targets configured only on the router, used to exercise mixed/failed rollout. */
@@ -250,6 +256,10 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       opts.tenantCredentialRevocationWorkerEnabledForRunner?.(runnerNumber)
         ?? opts.tenantCredentialRevocationWorkerEnabled === true
     ) ? "1" : "0",
+    TENANT_RUNTIME_DRAIN_ENABLED: (
+      opts.tenantRuntimeDrainEnabledForRunner?.(runnerNumber)
+        ?? opts.tenantRuntimeDrainEnabled === true
+    ) ? "1" : "0",
     TENANT_ERASURE_BARRIER_TIMEOUT_MS: "2000",
   });
 
@@ -295,6 +305,8 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     TENANT_ERASURE_REQUESTS_ENABLED: opts.tenantErasureRequestsEnabled ? "1" : "0",
     TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED:
       opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
+    TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED:
+      opts.tenantRuntimeDrainExecutionEnabled ? "1" : "0",
     TENANT_ERASURE_OPERATOR_TOKEN,
     TENANT_ERASURE_OPERATOR_ID: "cluster-platform-operator",
   });

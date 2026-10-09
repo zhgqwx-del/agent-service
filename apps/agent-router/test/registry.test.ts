@@ -4,11 +4,17 @@ import {
   DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
+  INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_RUNTIME_DRAIN_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+  tenantRuntimeFleetSha256,
+  tenantRuntimeTargetSha256,
 } from "@agent-service/protocol";
 import { RunnerRegistry } from "../src/registry.js";
 
@@ -578,6 +584,119 @@ describe("RunnerRegistry owner address mapping", () => {
     await Promise.all([first, second]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
+    await registry.close();
+  });
+});
+
+describe("RunnerRegistry tenant runtime drain fleet snapshot", () => {
+  const token = "registry-runtime-drain-token-000001";
+  const capability = (endpointEnabled = true) => ({
+    protocolVersion: PROTOCOL_VERSION,
+    service: "agent-runner",
+    features: {
+      streaming: true,
+      replay: { persistedEvents: true, hotWindowMs: 1 },
+      approvals: true,
+      sessionLifecycle: ["archive"],
+      tenantRuntimeDrain: [TENANT_RUNTIME_DRAIN_V1],
+      tenantRuntimeDrainEndpoint: endpointEnabled,
+      dynamicTools: true,
+      mcp: [],
+      skills: false,
+      sandbox: ["none"],
+      byok: true,
+    },
+  });
+
+  it("probes every exact configured URL and returns a canonical immutable identity snapshot", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("/readyz")) return new Response("ready");
+      if (url.endsWith("/v1/capabilities")) return Response.json(capability());
+      if (url.endsWith(INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH)) {
+        expect(new Headers(init?.headers).get("x-agent-service-internal-token")).toBe(token);
+        const host = new URL(url).hostname;
+        return Response.json({
+          protocolVersion: PROTOCOL_VERSION,
+          service: "agent-runner",
+          capability: TENANT_RUNTIME_DRAIN_V1,
+          endpointEnabled: true,
+          runnerId: `runner-${host.at(-1)}`,
+          bootId: `boot-${host.at(-1)}`,
+        }, {
+          headers: {
+            [INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER]:
+              INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
+            "cache-control": "no-store",
+          },
+        });
+      }
+      return new Response(null, { status: 404 });
+    }));
+    const registry = new RunnerRegistry({
+      runners: ["http://runner-b:8787", "http://runner-a:8787"],
+      internalRouterToken: token,
+    });
+    const snapshot = await registry.freshTenantRuntimeDrainSnapshot();
+    const expectedHashes = [
+      tenantRuntimeTargetSha256("http://runner-a:8787"),
+      tenantRuntimeTargetSha256("http://runner-b:8787"),
+    ].sort();
+    expect(snapshot.targets.map((target) => target.targetSha256)).toEqual(expectedHashes);
+    expect(snapshot.fleetSha256).toBe(tenantRuntimeFleetSha256(snapshot.targets));
+    expect(calls).toHaveLength(6);
+    expect(calls).toEqual(expect.arrayContaining([
+      `http://runner-a:8787${INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH}`,
+      `http://runner-b:8787${INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH}`,
+    ]));
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.targets)).toBe(true);
+    expect(snapshot.targets.every(Object.isFrozen)).toBe(true);
+    await registry.close();
+  });
+
+  it("fails closed on mixed activation, missing private ACK and duplicate process identity", async () => {
+    let mode: "mixed" | "missing-ack" | "missing-no-store" | "duplicate" = "mixed";
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      const host = new URL(url).hostname;
+      if (url.endsWith("/readyz")) return new Response("ready");
+      if (url.endsWith("/v1/capabilities")) {
+        return Response.json(capability(mode !== "mixed" || host === "runner-a"));
+      }
+      if (url.endsWith(INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH)) {
+        return Response.json({
+          protocolVersion: PROTOCOL_VERSION,
+          service: "agent-runner",
+          capability: TENANT_RUNTIME_DRAIN_V1,
+          endpointEnabled: true,
+          runnerId: mode === "duplicate" ? "runner-same" : `runner-${host.at(-1)}`,
+          bootId: mode === "duplicate" ? "boot-same" : `boot-${host.at(-1)}`,
+        }, {
+          headers: mode === "missing-ack"
+            ? {}
+            : {
+                [INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER]:
+                  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
+                ...(mode === "missing-no-store" ? {} : { "cache-control": "no-store" }),
+              },
+        });
+      }
+      return new Response(null, { status: 404 });
+    }));
+    const registry = new RunnerRegistry({
+      runners: ["http://runner-a", "http://runner-b"],
+      internalRouterToken: token,
+    });
+    await expect(registry.freshTenantRuntimeDrainSnapshot()).rejects.toThrow(/incompatible/);
+    mode = "missing-ack";
+    await expect(registry.freshTenantRuntimeDrainSnapshot()).rejects.toThrow(/attest/);
+    mode = "missing-no-store";
+    await expect(registry.freshTenantRuntimeDrainSnapshot()).rejects.toThrow(/attest/);
+    mode = "duplicate";
+    await expect(registry.freshTenantRuntimeDrainSnapshot()).rejects.toThrow(/not unique/);
     await registry.close();
   });
 });

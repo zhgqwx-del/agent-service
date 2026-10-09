@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { createRemoteJWKSet, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
+import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
 import { ApiError, type IntrospectionVerifier, type JwtVerifier, type TenantAuthPolicy } from "@agent-service/protocol";
 
 /**
@@ -19,19 +19,38 @@ export interface VerifiedUser {
 }
 
 export interface EndUserVerifier {
-  verify(token: string): Promise<VerifiedUser>;
+  verify(token: string, signal?: AbortSignal): Promise<VerifiedUser>;
+  /** Abort owned I/O and discard tenant key/result material. Idempotent. */
+  dispose(): void;
 }
 
 export class JwtEndUserVerifier implements EndUserVerifier {
   private jwks?: JWTVerifyGetKey;
   private readonly secretKey?: Uint8Array;
+  private readonly abort = new AbortController();
+  private disposed = false;
 
   constructor(
     private readonly cfg: JwtVerifier,
     secret?: string,
+    fetchImpl: typeof fetch = fetch,
   ) {
     if (cfg.jwksUri) {
-      this.jwks = createRemoteJWKSet(new URL(cfg.jwksUri), { cacheMaxAge: 10 * 60_000, timeoutDuration: 3_000 });
+      this.jwks = createRemoteJWKSet(new URL(cfg.jwksUri), {
+        cacheMaxAge: 10 * 60_000,
+        timeoutDuration: 3_000,
+        [customFetch]: async (url, options) => {
+          const signal = combineSignals(options.signal, this.abort.signal);
+          const response = await fetchImpl(url, { ...options, signal });
+          if (signal.aborted || response.status !== 200) {
+            // jose rejects non-200 JWKS responses from their headers alone. Cancel here so an error
+            // body/socket cannot outlive the auth operation and a successful runtime-drain proof.
+            await response.body?.cancel().catch(() => {});
+            if (signal.aborted) throw signal.reason ?? new Error("JWKS fetch aborted");
+          }
+          return response;
+        },
+      });
     } else if (cfg.hs256) {
       if (!secret) throw new Error("jwt verifier with hs256 needs the tenant's stored secret");
       this.secretKey = new TextEncoder().encode(secret);
@@ -40,12 +59,20 @@ export class JwtEndUserVerifier implements EndUserVerifier {
     }
   }
 
-  async verify(token: string): Promise<VerifiedUser> {
+  async verify(token: string, signal?: AbortSignal): Promise<VerifiedUser> {
+    this.assertOpen(signal);
     let payload: JWTPayload;
     try {
-      const result = this.jwks
-        ? await jwtVerify(token, this.jwks, this.options())
-        : await jwtVerify(token, this.secretKey!, this.options());
+      const verification = this.jwks
+        ? jwtVerify(token, this.jwks, this.options())
+        : jwtVerify(token, this.secretKey!, this.options());
+      // Do not reject only the outer promise when the runtime fence aborts. The coordinator's
+      // operation lease must remain held until the underlying JOSE/JWKS work has actually settled;
+      // otherwise a non-cooperative fetch could outlive a successful zero-active-operation proof.
+      // `dispose()` aborts the owned JWKS request, while an implementation that ignores abort keeps
+      // this await pending and makes the bounded drain fail closed.
+      const result = await verification;
+      this.assertOpen(signal);
       payload = result.payload;
     } catch (err) {
       // never echo the token or the library's internal details back to the caller
@@ -60,6 +87,20 @@ export class JwtEndUserVerifier implements EndUserVerifier {
       expiresAtMs: payload.exp ? payload.exp * 1000 : undefined,
       claims: { iss: payload.iss, aud: payload.aud, exp: payload.exp },
     };
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.abort.abort();
+    this.secretKey?.fill(0);
+    this.jwks = undefined;
+  }
+
+  private assertOpen(signal?: AbortSignal): void {
+    if (this.disposed || this.abort.signal.aborted || signal?.aborted) {
+      throw new ApiError("unauthorized", "end-user token verification was aborted", undefined, true);
+    }
   }
 
   private options() {
@@ -80,6 +121,8 @@ export class IntrospectionEndUserVerifier implements EndUserVerifier {
   /** Negatives are cached briefly too: otherwise a flood of bad tokens is a free DoS on the tenant's auth service. */
   private readonly negative = new Map<string, number>();
   private static readonly NEGATIVE_TTL_MS = 5_000;
+  private readonly abort = new AbortController();
+  private disposed = false;
 
   constructor(
     private readonly cfg: IntrospectionVerifier,
@@ -91,9 +134,10 @@ export class IntrospectionEndUserVerifier implements EndUserVerifier {
     if (secret && !cfg.useStoredSecret) this.secret = undefined;
   }
 
-  private readonly secret?: string;
+  private secret?: string;
 
-  async verify(token: string): Promise<VerifiedUser> {
+  async verify(token: string, signal?: AbortSignal): Promise<VerifiedUser> {
+    this.assertOpen(signal);
     const key = hashToken(token);
     const hit = this.cache.get(key);
     if (hit && hit.expiresAtMs > Date.now()) return hit.user;
@@ -109,23 +153,37 @@ export class IntrospectionEndUserVerifier implements EndUserVerifier {
           ? await this.fetchImpl(this.cfg.endpoint, {
               method: "GET",
               headers: new Headers([...headers, [this.cfg.tokenHeader, this.cfg.tokenHeader.toLowerCase() === "authorization" ? `Bearer ${token}` : token]]),
-              signal: AbortSignal.timeout(this.cfg.timeoutMs),
+              signal: combineSignals(signal, this.abort.signal, AbortSignal.timeout(this.cfg.timeoutMs)),
             })
           : await this.fetchImpl(this.cfg.endpoint, {
               method: "POST",
               headers: new Headers([...headers, ["content-type", "application/x-www-form-urlencoded"]]),
               body: new URLSearchParams({ token }).toString(),
-              signal: AbortSignal.timeout(this.cfg.timeoutMs),
+              signal: combineSignals(signal, this.abort.signal, AbortSignal.timeout(this.cfg.timeoutMs)),
             });
     } catch (err) {
       // Fail closed: an auth service we cannot reach must not become an open door.
       throw new ApiError("unauthorized", `could not verify the end-user token: ${reason(err)}`, undefined, true);
     }
+    try {
+      this.assertOpen(signal);
+    } catch (error) {
+      // An injected/runtime fetch may ignore abort and return headers after the fence. Cancel its
+      // body before the caller releases the auth-operation lease, or a live socket could outlast a
+      // successful zero-active-operation proof.
+      await res.body?.cancel().catch(() => {});
+      throw error;
+    }
     if (!res.ok) {
+      // A rejected HTTP response can still own a live response stream. Keep the auth operation
+      // lease until cancellation settles so a runtime drain cannot certify zero local I/O early.
+      await res.body?.cancel().catch(() => {});
+      this.assertOpen(signal);
       this.reject(token);
       throw new ApiError("unauthorized", `end-user token rejected by the auth service (${res.status})`);
     }
     const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    this.assertOpen(signal);
     // Strictly true. A missing field, the string "false", 0, or anything else is NOT an authentication:
     // treating "not explicitly false" as valid would let an unrelated 200 response log a user in.
     if (body[this.cfg.activeField] !== true) {
@@ -152,6 +210,21 @@ export class IntrospectionEndUserVerifier implements EndUserVerifier {
     return user;
   }
 
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.abort.abort();
+    this.cache.clear();
+    this.negative.clear();
+    this.secret = undefined;
+  }
+
+  private assertOpen(signal?: AbortSignal): void {
+    if (this.disposed || this.abort.signal.aborted || signal?.aborted) {
+      throw new ApiError("unauthorized", "end-user token verification was aborted", undefined, true);
+    }
+  }
+
   private reject(token: string) {
     this.negative.set(hashToken(token), Date.now() + IntrospectionEndUserVerifier.NEGATIVE_TTL_MS);
     if (this.negative.size > MAX_CACHE_ENTRIES) evictOldest(this.negative, MAX_CACHE_ENTRIES / 2);
@@ -160,8 +233,13 @@ export class IntrospectionEndUserVerifier implements EndUserVerifier {
 
 export function buildVerifier(policy: Extract<TenantAuthPolicy, { mode: "end_user_token" }>, secret?: string, fetchImpl?: typeof fetch): EndUserVerifier {
   return policy.verifier.kind === "jwt"
-    ? new JwtEndUserVerifier(policy.verifier, secret)
+    ? new JwtEndUserVerifier(policy.verifier, secret, fetchImpl)
     : new IntrospectionEndUserVerifier(policy.verifier, secret, fetchImpl);
+}
+
+function combineSignals(...signals: (AbortSignal | null | undefined)[]): AbortSignal {
+  const present = signals.filter((signal): signal is AbortSignal => signal !== undefined && signal !== null);
+  return present.length === 1 ? present[0]! : AbortSignal.any(present);
 }
 
 const MAX_CACHE_ENTRIES = 10_000;

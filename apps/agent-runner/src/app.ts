@@ -44,6 +44,10 @@ import {
   INTERNAL_TENANT_ERASURE_REPLAY_PATH,
   INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
+  INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
+  INTERNAL_TENANT_RUNTIME_DRAIN_RUNNER_PATH,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_ROUTER_TOKEN_HEADER,
@@ -56,10 +60,14 @@ import {
   RetentionPolicyPutRequest,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
   TenantErasureRequestHeaders,
   TenantErasureRequestParams,
   TenantErasureRequestQuery,
+  TenantRuntimeDrainReady,
+  TenantRuntimeDrainRunnerRequest,
+  TenantRuntimeRevocationLocalReceipt,
   isCanonicalId,
   type IdPrefix,
   ProviderIdParams,
@@ -82,7 +90,7 @@ import {
   type DataExportRequest,
   UserId,
 } from "@agent-service/protocol";
-import type { SessionHost, ToolRegistry } from "@agent-service/core";
+import type { SessionHost, TenantRuntimeCoordinator, ToolRegistry } from "@agent-service/core";
 import { ErasureLocalTurnFencedError, newId } from "@agent-service/core";
 import {
   BLOB_STORAGE_FORMAT,
@@ -159,6 +167,17 @@ export interface AppDeps {
   tenantCredentialRevocationWorkerEnabled?: boolean;
   /** Narrow T3a store surface; its presence is the code-awareness signal advertised to routers. */
   tenantCredentialRevocation?: TenantCredentialRevocationStore;
+  /** Narrow T3b runtime surface; main owns the coordinator and per-process boot identity. */
+  tenantRuntimeDrain?: {
+    bootId: string;
+    drain: (
+      request: TenantRuntimeDrainRunnerRequest,
+    ) => Promise<TenantRuntimeRevocationLocalReceipt>;
+  };
+  /** Local private endpoint activation, independent from code awareness. */
+  tenantRuntimeDrainEnabled?: boolean;
+  /** Shared process-local admission fence used by auth, provider I/O and SessionHost turns. */
+  tenantRuntime?: TenantRuntimeCoordinator;
   ready: () => boolean;
   /** decrypts a tenant's stored auth secret (HS256 key / introspection credential) */
   decryptSecret: (secret: { ciphertext: Buffer; keyId: string }) => Promise<string>;
@@ -181,6 +200,7 @@ const json = (c: { req: { json: () => Promise<unknown> } }) => c.req.json().catc
 // Keeping a separate ceiling also ensures future public body-limit changes cannot widen this path.
 const INTERNAL_ERASURE_DRAIN_MAX_BODY_BYTES = 2_048;
 const INTERNAL_TENANT_ERASURE_MAX_BODY_BYTES = 2_048;
+const INTERNAL_TENANT_RUNTIME_DRAIN_MAX_BODY_BYTES = 4_096;
 const TENANT_ERASURE_ACTOR_ID = /^[A-Za-z0-9._-]{1,64}$/;
 
 function internalTokenMatches(received: string | undefined, expected: string): boolean {
@@ -296,6 +316,11 @@ export function createApp(deps: AppDeps) {
         tenantCredentialRevocationWorker:
           deps.tenantCredentialRevocation !== undefined
           && deps.tenantCredentialRevocationWorkerEnabled === true,
+        tenantRuntimeDrain: deps.tenantRuntimeDrain === undefined
+          ? []
+          : [TENANT_RUNTIME_DRAIN_V1],
+        tenantRuntimeDrainEndpoint: deps.tenantRuntimeDrain !== undefined
+          && deps.tenantRuntimeDrainEnabled === true,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -304,6 +329,91 @@ export function createApp(deps: AppDeps) {
       },
     } satisfies Capabilities),
   );
+
+  const runtimeDrainReadyPath = INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH;
+  const runtimeDrainExecutePath = INTERNAL_TENANT_RUNTIME_DRAIN_RUNNER_PATH;
+  const requireRuntimeDrainToken: MiddlewareHandler<AuthEnv> = async (c, next) => {
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) {
+      await c.req.raw.body?.cancel().catch(() => {});
+      throw new ApiError("not_found", "not found");
+    }
+    await next();
+  };
+  for (const path of [runtimeDrainReadyPath, runtimeDrainExecutePath]) {
+    app.use(path, privateResponseHeaders);
+    app.use(`${path}/*`, privateResponseHeaders);
+    app.use(path, requireRuntimeDrainToken);
+    app.use(`${path}/*`, requireRuntimeDrainToken);
+  }
+
+  app.get(runtimeDrainReadyPath, (c) => {
+    if (!deps.tenantRuntimeDrain || deps.tenantRuntimeDrainEnabled !== true) {
+      return c.body(null, 503);
+    }
+    const identity = TenantRuntimeDrainReady.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      capability: TENANT_RUNTIME_DRAIN_V1,
+      endpointEnabled: true,
+      runnerId: deps.runnerId,
+      bootId: deps.tenantRuntimeDrain.bootId,
+    });
+    c.header(INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER, INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE);
+    return c.json(identity, 200);
+  });
+  app.all(runtimeDrainReadyPath, (c) => {
+    throw new ApiError("not_found", "not found");
+  });
+  app.all(`${runtimeDrainReadyPath}/*`, (c) => {
+    throw new ApiError("not_found", "not found");
+  });
+
+  app.use(runtimeDrainExecutePath, async (c, next) => {
+    if (!deps.tenantRuntimeDrain || deps.tenantRuntimeDrainEnabled !== true) {
+      await c.req.raw.body?.cancel().catch(() => {});
+      return c.body(null, 503);
+    }
+    await next();
+  });
+  app.use(runtimeDrainExecutePath, bodyLimit({
+    maxSize: INTERNAL_TENANT_RUNTIME_DRAIN_MAX_BODY_BYTES,
+    onError: () => {
+      throw new ApiError(
+        "invalid_request",
+        `request body exceeds ${INTERNAL_TENANT_RUNTIME_DRAIN_MAX_BODY_BYTES} bytes`,
+      );
+    },
+  }));
+  app.post(runtimeDrainExecutePath, async (c) => {
+    // The activation middleware above narrows this before any body inspection.
+    if (!deps.tenantRuntimeDrain) throw new ApiError("not_found", "not found");
+    const request = await parse(TenantRuntimeDrainRunnerRequest, await json(c));
+    if (
+      request.expectedRunnerId !== deps.runnerId
+      || request.expectedBootId !== deps.tenantRuntimeDrain.bootId
+    ) throw new ApiError("state_conflict", "tenant runtime identity changed");
+
+    const result = await deps.tenantRuntimeDrain.drain(request);
+    const receipt = TenantRuntimeRevocationLocalReceipt.safeParse(result);
+    if (
+      !receipt.success
+      || receipt.data.targetSha256 !== request.targetSha256
+      || receipt.data.runnerId !== request.expectedRunnerId
+      || receipt.data.bootId !== request.expectedBootId
+      || receipt.data.requestId !== request.requestId
+      || receipt.data.tenantId !== request.tenantId
+      || receipt.data.subjectGeneration !== request.subjectGeneration
+      || receipt.data.t3aReceiptSha256 !== request.t3aReceiptSha256
+    ) throw new Error("tenant runtime drain returned an invalid local receipt");
+    c.header(INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER, INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE);
+    return c.json(receipt.data, 200);
+  });
+  app.all(runtimeDrainExecutePath, (c) => {
+    throw new ApiError("not_found", "not found");
+  });
+  app.all(`${runtimeDrainExecutePath}/*`, (c) => {
+    throw new ApiError("not_found", "not found");
+  });
 
   // Runner-only worker traffic bypasses tenant authentication. Authenticate the fixed internal
   // token before inspecting the session id, Content-Length or JSON so every untrusted probe has
@@ -561,8 +671,14 @@ export function createApp(deps: AppDeps) {
   }));
   // Reject oversized bodies before they are buffered or parsed.
   v1.use("*", bodyLimit({ maxSize: deps.maxBodyBytes, onError: () => { throw new ApiError("invalid_request", `request body exceeds ${deps.maxBodyBytes} bytes`); } }));
-  const policyCache = new TenantPolicyCache(deps.policyCacheMs);
-  v1.use("*", authMiddleware({ store: deps.store, decryptSecret: deps.decryptSecret, fetchImpl: deps.fetchImpl, cache: policyCache }));
+  const policyCache = new TenantPolicyCache(deps.policyCacheMs, deps.tenantRuntime);
+  v1.use("*", authMiddleware({
+    store: deps.store,
+    decryptSecret: deps.decryptSecret,
+    fetchImpl: deps.fetchImpl,
+    cache: policyCache,
+    tenantRuntime: deps.tenantRuntime,
+  }));
 
   // ---------- agents ----------
   v1.post("/agents", async (c) => {

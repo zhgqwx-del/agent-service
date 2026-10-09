@@ -52,6 +52,10 @@ const Env = z.object({
   TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Broadcast T3b runtime drain. Keep closed until every configured stable runner endpoint is active. */
+  TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** User-export admission; status/download remain capability-gated when this is off. */
   DATA_EXPORT_REQUESTS_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -82,7 +86,7 @@ function validateRunnerUrl(value: string): string {
   if (parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname && parsed.pathname !== "/")) {
     throw new Error("RUNNERS entries must not contain credentials, a path, query parameters, or a fragment");
   }
-  return value.replace(/\/+$/, "");
+  return parsed.origin;
 }
 
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
@@ -90,6 +94,7 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   const runnerList = [...new Set(c.RUNNERS.split(",").map((s) => s.trim()).filter(Boolean).map(validateRunnerUrl))];
   const internalRouterToken = c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN;
   if (!runnerList.length) throw new Error("RUNNERS must list at least one runner base url");
+  if (runnerList.length > 100) throw new Error("RUNNERS must list at most 100 runner base urls");
   if (c.NODE_ENV === "production" && !c.INTERNAL_ROUTER_TOKEN) {
     throw new Error("INTERNAL_ROUTER_TOKEN is required in production");
   }

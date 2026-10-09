@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority、异步user-export artifact/download/TTL，以及tenant-erasure T1/T2/T3a均已完成。T3a由`0019`独立job/receipt/cutover、runner内嵌最小权限worker和fresh all-configured execution barrier保护；它在单个Memory/MySQL原子边界删除该tenant本地DB全部API-key行（含revoked）和provider-config行，并清空tenant auth三列。global cutover还会在每次不可逆删除前重验首receipt、terminal job、completion与immutable T1 admission/首audit/fence；terminal proof不依赖mutable lifecycle，queue/destructive authority仍严格要求live `deleting` projection，孤儿或冲突proof会fail closed。tenant registry/content保留，receipt固定声明`runtime=not_in_scope`、`external=not_supported`、`contentPurgeRequired=true`，公开status仍为`gated`，`dataPurgeExecution=false`。T3b runtime/cache/active-I/O drain、可信时钟/owner-scan content receipt、ready/session/receipt/Redis物理purge、usage匿名化、completed proof与restore replay仍未完成，M1尚未闭环。M2本地/CI代码范围已完成并正式冻结；M3/M4尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority、异步user-export artifact/download/TTL，以及tenant-erasure T1/T2/T3a/T3b本地/CI切片均已完成。T3a由`0019`独立job/receipt/cutover原子清除本地DB credential material；T3b由`0020`独立runtime job、per-target append-only receipt和aggregate receipt证明每个精确configured runner完成tenant fence、已跟踪auth/provider/turn I/O结算以及auth/provider/host引用清理。T3b只证明`configured-fleet-runtime-v1`，明确声明`memoryDisposition=references_dropped_not_zeroized`、`externalDisposition=not_supported`、`contentPurgeRequired=true`；它不覆盖lifecycle/Blob/export/background store I/O、Redis/session lease、远端provider副作用、外部provider/KMS或content/usage/backup purge。公开status仍为`gated`，`dataPurgeExecution=false`。可信数据库时钟、owner-scan完整content receipt、ready/session/receipt/Redis物理purge、usage匿名化、completed proof与restore replay仍未完成，M1尚未闭环。M2本地/CI代码范围已完成并正式冻结；M3/M4尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -556,3 +556,32 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - M2冻结结论不变；本轮仍属于M1，没有开始M3。T3a只是本地数据库credential material清除，不能把tenant公开状态改成completed，也不能把receipt当作runtime、external、content或backup proof。
 - 下一独立切片是T3b runtime/cache/active-I/O drain：按tenant撤销进程内end-user auth policy/JWT/JWKS/introspection verifier cache和provider注册/secret引用，有界处理中或已发出的provider/JWKS/introspection I/O，并形成可由fleet验证的完成证明；service API key当前每次从store解析，没有进程级verifier cache。之后才继续可信数据库时间、owner-scan `session_content_receipts`、ready Blob/session/idempotency receipt/Redis清理、usage匿名化、completion与独立故障域restore-ledger replay。
 - 没有云资源不阻止继续完成上述local/CI代码范围；但M4的共享对象存储、KMS/IAM、registry/promotion、Kubernetes/VM拓扑、云MySQL/Redis、域名/TLS、备份恢复与真实告警集成必须等待实际资源。日常应每个安全切片先跑smoke/定向验证，整体架构local/CI范围完成后再做完整手动walkthrough，不必为获得反馈一直等到M3/M4全部结束。
+
+## 2026-10-09（M1 数据生命周期：0020 tenant erasure T3b configured-fleet runtime drain）
+
+### 已完成
+
+1. 新增expand-only的`0020_tenant_runtime_revocation.sql`：独立runtime job、每个configured target的append-only receipt及aggregate receipt均与user queue和T3a job分离。migration不扫描/回填`0019` proof、不发网络请求、不执行drain、不改写T3a evidence，也不删除content；runner内嵌worker只在完整验证T1 fence、T3a terminal receipt和live tenant lifecycle后显式materialize。
+2. runner新增单一per-tenant runtime coordinator。它在本地同步fence新auth/provider/turn操作，abort并等待已接纳fetch、response body和turn settle，再清空TenantPolicyCache、JWT/JWKS/introspection verifier、tenant BYOK provider registration及SessionHost引用；初始snapshot或任一participant hook异常时仍best-effort fence全部participant并abort全部lease。超时、non-cooperative I/O或response-body cancel未完成都会保持tenant fenced并拒绝成功proof。
+3. 内部私有`runtime-drain-v1`协议由固定ACK、严格schema和request/target/local/fleet proof hash绑定。router只对`RUNNERS`中每个稳定直连实例origin执行fan-out，前后fresh探测并要求runnerId/bootId不变且全fleet唯一；不使用healthy subset、hash owner、sticky旧观察或LB别名。任一target失败时整体返回`503`且不生成fleet proof，但先前target可能已被fence，故只能forward-fix并精确重试。
+4. Memory/MySQL store使用attempt+token+lease防ABA，以数据库时间claim/renew/retry/block/complete；完成边界原子写全部target receipt、aggregate receipt和terminal job，任一SQL/terminal transition失败整体回滚。响应丢失只允许相同completed attempt/token且逐target原proof完全一致时重放，不能凭aggregate hash、当前空缓存或已移除lifecycle推断成功。
+5. receipt scope固定`configured-fleet-runtime-v1`，target URL、runnerId和bootId只保存SHA-256。它明确声明`memoryDisposition=references_dropped_not_zeroized`、`externalDisposition=not_supported`、`contentPurgeRequired=true`；不覆盖lifecycle/Blob/export/background store I/O、Redis/session lease、远端provider副作用、外部provider/KMS、content/usage/receipt/backup purge，也不把JavaScript字符串引用释放描述为物理清零。公开tenant status继续为`gated`，`dataPurgeExecution=false`。
+6. 三道独立gate均默认关闭：runner私有endpoint `TENANT_RUNTIME_DRAIN_ENABLED`、runner worker `TENANT_RUNTIME_REVOCATION_WORKER_ENABLED`、router fan-out `TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED`。安全rollout为`0020` → execution=0的新router并排空旧router → endpoint/worker=0且稳定`RUNNER_ID`的新runner → 逐实例开endpoint并核对direct origins/identity → 开worker → 最后开router execution；紧急回滚先关router execution，不能撤销已提交fence/receipt或回退不理解T3b的binary。
+7. 冻结真实`0019` delta并新增独立`0019→0020`历史MySQL夹具，覆盖T3a证据逐字节保持、无隐式runtime job、explicit materializer、first-table partial DDL收敛、marker-loss replay及append-only guards。CI、本地verify、suite-executed断言和runner image最新migration marker均已接线。T3b worker仍内嵌runner，候选发布物仍只有router/runner两个Node bundle和两个Linux OCI image。
+8. 学习指南和运维runbook继续作为本地启动/手动体验、模块职责、Node bundle与Linux OCI image、GitHub Actions构建门禁，以及local→staging→production promotion流程的集中材料；没有伪造尚不存在的Kubernetes、registry、KMS/Secret、对象存储、域名/TLS或云数据库参数。
+
+### 本轮验证与审查
+
+- `scripts/local-service.sh verify`全链通过：`pnpm check:secrets`扫描 **309 files**，OpenAPI/SDK漂移检查与`pnpm typecheck`通过；主套件 **1101 passed / 1 skipped**，唯一skip仍为显式付费的真实厂商E2E。覆盖率 **82.98% statements / 79.01% branches / 86.04% functions / 86.44% lines**，MySQL store **85.54% lines**。
+- T3b named真实MySQL套件 **6/6**，明确覆盖exact terminal replay、并发claim/ABA、`SKIP LOCKED`邻居推进、跨job-lock wait后的数据库时钟/lease复核、terminal transition故障时target+aggregate整体回滚和live lifecycle fail-closed。required wrapper与JSON report证明目标文件实际执行且零skip。
+- 固定 **13** 个真实MySQL历史迁移文件 **59/59**，其中`0019→0020` **4/4**；`0007→0008`的相同usage重复安全合并、冲突重复阻断且不丢账、legacy pending receipt保留继续在同一必跑链中。
+- cluster **23/23**；其中T3b覆盖真实router进程加两个独立HTTP runner私有协议fixture的exact-target/boot proof和disabled-endpoint fail-closed，不把它夸大为两个完整runner进程的T2→T3a→T3b端到端链。SDK **18-file**隔离包通过；runner **3123 KB**、router **797 KB**两个Node 24 bundle完成原生启动、readiness、tenant/platform auth边界、转发和OpenAPI检查。
+- 从并发正确性、事务回滚、滚动升级兼容、安全隔离和测试有效性进行两轮独立审查，最终无开放P0–P2。审查补齐了aborted/非2xx/redirect响应体必须settle后再释放operation lease、coordinator异常路径仍完整fence/abort，以及terminal response-loss replay逐target精确匹配。
+- 本轮没有改变provider dialect或公开真实模型契约，因此未重复运行会产生费用的`verify-real`或十阶段acceptance；最近真实模型 **1/1** 与acceptance通过仍只作为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2冻结结论不变；本轮仍属于M1，没有开始M3。T3b完成configured-fleet本地runtime/cache/已跟踪active-I/O证明，但tenant公开状态仍不是completed，M1尚不能冻结。
+- 下一独立切片是T3c：以可信数据库时间建立deadline线性化，并通过owner-scan生成完整`session_content_receipts`及destructive purge所需的content-free durable substrate。之后仍需ready Blob/session/idempotency receipt/Redis物理清理、usage匿名化、external provider/KMS撤销、tenant completion和独立故障域restore-ledger replay；这些闭环后才正式进入M3。
+- `RUNNERS`必须完整列出全部可接流量runner的稳定直连实例origin；隐藏副本的LB会破坏proof边界。当前fence在该进程生命周期内不可逆，restore replay尚未实现；内部token在云环境还需要TLS、网络策略和Secret轮换。自定义timeout必须保持local drain小于router上游/worker请求预算。
+- 没有云资源不阻止继续实现上述local/CI代码范围，也不要求等M3/M4全部完成才做阶段性手动体验；但整体架构本地/CI范围全部完成后再做一次系统性完整walkthrough会更稳定。真实共享对象存储、KMS/IAM、registry/promotion、Kubernetes/VM拓扑、云MySQL/Redis、域名/TLS、备份恢复和告警集成必须等待实际资源，不能把本地proof表述为云部署完成。

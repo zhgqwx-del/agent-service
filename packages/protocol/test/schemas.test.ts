@@ -29,18 +29,29 @@ import {
   StartTurnRequest,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
   TenantErasureRequestHeaders,
   TenantErasureRequestParams,
   TenantErasureRequestQuery,
   UserErasureDrainRequest,
+  TenantRuntimeDrainRequest,
+  TenantRuntimeDrainRunnerRequest,
+  TenantRuntimeDrainReady,
+  TenantRuntimeRevocationFleetProof,
+  TenantRuntimeRevocationLocalReceipt,
+  canonicalTenantRuntimeTargetUrl,
   idSchema,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
   RetentionPolicyActivateRequest,
   RetentionPolicyParams,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+  tenantRuntimeFleetSha256,
+  tenantRuntimeLocalReceiptSha256,
+  tenantRuntimeTargetReceiptsSha256,
+  tenantRuntimeTargetSha256,
 } from "../src/index.js";
 
 describe("protocol schemas", () => {
@@ -295,6 +306,126 @@ describe("protocol schemas", () => {
     expect(parsed.features.tenantErasureRequests).toBe(false);
     expect(parsed.features.tenantCredentialRevocation).toEqual([]);
     expect(parsed.features.tenantCredentialRevocationWorker).toBe(false);
+    expect(parsed.features.tenantRuntimeDrain).toEqual([]);
+    expect(parsed.features.tenantRuntimeDrainEndpoint).toBe(false);
+  });
+
+  it("binds T3b target, local receipt and fleet roots to canonical ordered evidence", () => {
+    expect(canonicalTenantRuntimeTargetUrl("HTTP://Runner-A.Example:80/")).toBe(
+      "http://runner-a.example",
+    );
+    const targetSha256 = tenantRuntimeTargetSha256("HTTP://Runner-A.Example:80/");
+    expect(targetSha256).toBe(
+      "bdc305cc46b752f6902577a7ee0b48b6552d4a6b29e024a8d9a5a2d804011a9f",
+    );
+    const body = {
+      targetSha256,
+      runnerId: "runner-a",
+      bootId: "boot-0001",
+      requestId: "erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+      tenantId: "tenant-a",
+      subjectGeneration: 3,
+      t3aReceiptSha256: "a".repeat(64),
+      cacheEntryCountBefore: 4,
+      cacheEntryCountAfter: 0 as const,
+      activeOperationCountBefore: 2,
+      activeOperationCountAfter: 0 as const,
+      activeTurnCountBefore: 1,
+      activeTurnCountAfter: 0 as const,
+      completedAtMs: 123_456,
+    };
+    const receiptSha256 = tenantRuntimeLocalReceiptSha256(body);
+    expect(receiptSha256).toBe(
+      "a6aeec99fa774fae57f3ada06e2d509a68b68e86c791687a045283a3c69a1b77",
+    );
+    const receipt = TenantRuntimeRevocationLocalReceipt.parse({ ...body, receiptSha256 });
+    expect(tenantRuntimeFleetSha256([receipt])).toBe(
+      "5cd804755c9c86052245e07a7511a37c96d5efaa220ad73ba3b3649d35e3c459",
+    );
+    expect(tenantRuntimeTargetReceiptsSha256([receipt])).toBe(
+      "12d01fe4702f4dfb10b82c9cb0bc3a50589da8789d551d551da2c2bf708d8e73",
+    );
+    expect(TenantRuntimeRevocationLocalReceipt.safeParse({
+      ...receipt,
+      activeTurnCountBefore: 2,
+    }).success).toBe(false);
+    expect(() => canonicalTenantRuntimeTargetUrl("https://user:secret@runner/private"))
+      .toThrow(/credential-free/);
+  });
+
+  it("keeps T3b identity, command and aggregate schemas strict and fail closed", () => {
+    const authority = {
+      requestId: "erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+      tenantId: "tenant-a",
+      subjectGeneration: 3,
+      t3aReceiptSha256: "a".repeat(64),
+    };
+    expect(TenantRuntimeDrainRequest.parse(authority)).toEqual(authority);
+    expect(TenantRuntimeDrainRequest.safeParse({ ...authority, content: "forbidden" }).success)
+      .toBe(false);
+    expect(TenantRuntimeDrainRunnerRequest.safeParse({
+      ...authority,
+      targetSha256: "b".repeat(64),
+      expectedRunnerId: "runner-a",
+      expectedBootId: "boot-a",
+    }).success).toBe(true);
+    expect(TenantRuntimeDrainReady.safeParse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      capability: TENANT_RUNTIME_DRAIN_V1,
+      endpointEnabled: true,
+      runnerId: "runner-a",
+      bootId: "boot-a",
+      url: "forbidden",
+    }).success).toBe(false);
+
+    const makeReceipt = (target: string, runnerId: string, bootId: string) => {
+      const body = {
+        targetSha256: tenantRuntimeTargetSha256(target),
+        runnerId,
+        bootId,
+        ...authority,
+        cacheEntryCountBefore: 0,
+        cacheEntryCountAfter: 0 as const,
+        activeOperationCountBefore: 0,
+        activeOperationCountAfter: 0 as const,
+        activeTurnCountBefore: 0,
+        activeTurnCountAfter: 0 as const,
+        completedAtMs: 1,
+      };
+      return { ...body, receiptSha256: tenantRuntimeLocalReceiptSha256(body) };
+    };
+    const receipts = [
+      makeReceipt("http://runner-a:8787", "runner-a", "boot-a"),
+      makeReceipt("http://runner-b:8787", "runner-b", "boot-b"),
+    ].sort((left, right) => left.targetSha256 < right.targetSha256 ? -1 : 1);
+    const proof = {
+      fleetSha256: tenantRuntimeFleetSha256(receipts),
+      targetReceiptsSha256: tenantRuntimeTargetReceiptsSha256(receipts),
+      targets: receipts,
+    };
+    expect(TenantRuntimeRevocationFleetProof.parse(proof)).toEqual(proof);
+    expect(TenantRuntimeRevocationFleetProof.safeParse({
+      ...proof,
+      targets: [...receipts].reverse(),
+    }).success).toBe(false);
+    const duplicateIdentity = [receipts[0]!, {
+      ...receipts[1]!,
+      runnerId: receipts[0]!.runnerId,
+    }];
+    duplicateIdentity[1]!.receiptSha256 = tenantRuntimeLocalReceiptSha256(duplicateIdentity[1]!);
+    expect(TenantRuntimeRevocationFleetProof.safeParse({
+      fleetSha256: tenantRuntimeFleetSha256(duplicateIdentity),
+      targetReceiptsSha256: tenantRuntimeTargetReceiptsSha256(duplicateIdentity),
+      targets: duplicateIdentity,
+    }).success).toBe(false);
+    const mixedSource = [receipts[0]!, { ...receipts[1]!, tenantId: "tenant-b" }];
+    mixedSource[1]!.receiptSha256 = tenantRuntimeLocalReceiptSha256(mixedSource[1]!);
+    expect(TenantRuntimeRevocationFleetProof.safeParse({
+      fleetSha256: tenantRuntimeFleetSha256(mixedSource),
+      targetReceiptsSha256: tenantRuntimeTargetReceiptsSha256(mixedSource),
+      targets: mixedSource,
+    }).success).toBe(false);
   });
 
   it("separates tenant credential-store awareness from local worker activation and data purge", () => {

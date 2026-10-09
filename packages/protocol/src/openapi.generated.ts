@@ -1226,6 +1226,21 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "tenantRuntimeDrain": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "runtime-drain-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantRuntimeDrainEndpoint": {
+                "default": false,
+                "type": "boolean"
+              },
               "userDataExport": {
                 "default": [],
                 "items": {

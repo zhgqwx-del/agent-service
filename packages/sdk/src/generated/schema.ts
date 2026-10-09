@@ -1140,6 +1140,10 @@ export type components = {
                 /** @default false */
                 readonly tenantErasureRequests?: boolean;
                 /** @default [] */
+                readonly tenantRuntimeDrain?: readonly "runtime-drain-v1"[];
+                /** @default false */
+                readonly tenantRuntimeDrainEndpoint?: boolean;
+                /** @default [] */
                 readonly userDataExport?: readonly "artifact-ndjson-v1"[];
                 /** @default [] */
                 readonly userErasureWorker?: readonly "drain-v1"[];

@@ -421,6 +421,37 @@ import {
   type TenantCredentialRevocationReceipt,
   type TenantCredentialRevocationStore,
 } from "./tenant-credential-revocation.js";
+import {
+  TENANT_RUNTIME_REVOCATION_EXTERNAL_DISPOSITION,
+  TENANT_RUNTIME_REVOCATION_MEMORY_DISPOSITION,
+  TENANT_RUNTIME_REVOCATION_RECEIPT_SCOPE,
+  tenantRuntimeRevocationAuthorizationMatches,
+  tenantRuntimeRevocationClaimFromJob,
+  tenantRuntimeRevocationClaimTokenSha256,
+  tenantRuntimeRevocationCompletionMatchesAuthorization,
+  tenantRuntimeRevocationReceiptSha256,
+  tenantRuntimeRevocationTargetReceiptFromLocal,
+  validateClaimTenantRuntimeRevocationsOptions,
+  validateMaterializeTenantRuntimeRevocationJobsOptions,
+  validateRenewTenantRuntimeRevocationOptions,
+  validateRetryTenantRuntimeRevocationOptions,
+  validateTenantRuntimeRevocationAuthorization,
+  validateTenantRuntimeRevocationCompletionProof,
+  validateTenantRuntimeRevocationCompletionReplayProof,
+  validateTenantRuntimeRevocationFleetProof,
+  validateTenantRuntimeRevocationJobRecord,
+  type ClaimTenantRuntimeRevocationsOptions,
+  type MaterializeTenantRuntimeRevocationJobsOptions,
+  type RenewTenantRuntimeRevocationOptions,
+  type RetryTenantRuntimeRevocationOptions,
+  type TenantRuntimeRevocationAuthorization,
+  type TenantRuntimeRevocationClaim,
+  type TenantRuntimeRevocationFleetProof,
+  type TenantRuntimeRevocationJobRecord,
+  type TenantRuntimeRevocationReceipt,
+  type TenantRuntimeRevocationStore,
+  type TenantRuntimeRevocationTargetReceipt,
+} from "./tenant-runtime-revocation.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -608,7 +639,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -638,6 +669,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     1,
     { singletonId: 1, controlGeneration: 0 },
   ]]);
+  tenantRuntimeRevocationJobs = new Map<string, TenantRuntimeRevocationJobRecord>();
+  tenantRuntimeRevocationTargetReceipts = new Map<string, TenantRuntimeRevocationTargetReceipt>();
+  tenantRuntimeRevocationReceipts = new Map<string, TenantRuntimeRevocationReceipt>();
   erasureJobControlEvents = new Map<string, ErasureJobControlEvent[]>();
   private nextErasureJobControlEventId = 1;
   erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
@@ -4886,6 +4920,470 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   async getTenantCredentialRevocationCutover(): Promise<TenantCredentialRevocationCutoverRecord> {
     return clone(this.readTenantCredentialRevocationCutover(true));
+  }
+
+  private tenantRuntimeRevocationTargetKey(requestId: string, targetSha256: string): string {
+    return JSON.stringify([requestId, targetSha256]);
+  }
+
+  /**
+   * T3b queue authority is derived from immutable T1 + terminal T3a proof. Mutable lifecycle is
+   * required while a job can still cause work, but deliberately excluded from completed replay.
+   */
+  private assertTenantRuntimeRevocationSource(
+    job: TenantRuntimeRevocationJobRecord,
+    requireLiveLifecycle: boolean,
+  ): TenantCredentialRevocationReceipt {
+    try {
+      validateTenantRuntimeRevocationJobRecord(job);
+      const credentialJob = this.tenantCredentialRevocationJobs.get(job.requestId);
+      const credentialReceipt = this.tenantCredentialRevocationReceipts.get(job.requestId);
+      if (
+        !credentialJob
+        || !credentialReceipt
+        || credentialJob.phase !== "credential_store_revoked"
+        || credentialJob.tenantId !== job.tenantId
+        || credentialJob.subjectGeneration !== job.subjectGeneration
+        || credentialJob.t1FenceSha256 !== job.t1FenceSha256
+        || credentialReceipt.tenantId !== job.tenantId
+        || credentialReceipt.subjectGeneration !== job.subjectGeneration
+        || credentialReceipt.t1FenceSha256 !== job.t1FenceSha256
+        || credentialReceipt.receiptSha256 !== job.t3aReceiptSha256
+      ) throw new Error("tenant runtime revocation T3a binding is invalid");
+      this.assertTenantCredentialRevocationSource(credentialJob);
+      validateTenantCredentialRevocationCompletionProof(credentialJob, credentialReceipt);
+      this.readTenantCredentialRevocationCutover(true);
+      if (requireLiveLifecycle) {
+        const admission = this.tenantErasureAdmissions.get(job.requestId);
+        const lifecycle = this.subjectRecord(job.tenantId, "tenant", job.tenantId);
+        const fence = this.tenantCredentialRevocationFences.get(job.tenantId);
+        if (!admission) throw new Error("tenant runtime revocation admission is missing");
+        this.assertTenantErasureAdmissionProof(admission, lifecycle, fence);
+      }
+      return credentialReceipt;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async materializeTenantRuntimeRevocationJobs(
+    options: MaterializeTenantRuntimeRevocationJobsOptions,
+  ): Promise<number> {
+    const stagedOptions = clone(options);
+    validateMaterializeTenantRuntimeRevocationJobsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const candidates = [...this.tenantCredentialRevocationJobs.values()]
+      .filter((job) => (
+        job.phase === "credential_store_revoked"
+        && !this.tenantRuntimeRevocationJobs.has(job.requestId)
+      ))
+      .sort((left, right) => left.requestId.localeCompare(right.requestId))
+      .slice(0, stagedOptions.limit);
+    const staged: TenantRuntimeRevocationJobRecord[] = [];
+    for (const source of candidates) {
+      const receipt = this.tenantCredentialRevocationReceipts.get(source.requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      const job = clone<TenantRuntimeRevocationJobRecord>({
+        requestId: source.requestId,
+        tenantId: source.tenantId,
+        subjectGeneration: source.subjectGeneration,
+        t1FenceSha256: source.t1FenceSha256,
+        t3aReceiptSha256: receipt.receiptSha256,
+        phase: "queued",
+        availableAtMs: nowMs,
+        attempts: 0,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      });
+      this.assertTenantRuntimeRevocationSource(job, true);
+      if (
+        this.tenantRuntimeRevocationReceipts.has(job.requestId)
+        || [...this.tenantRuntimeRevocationJobs.values()].some(
+          (existing) => existing.tenantId === job.tenantId,
+        )
+        || staged.some((existing) => existing.tenantId === job.tenantId)
+        || [...this.tenantRuntimeRevocationTargetReceipts.values()].some(
+          (existing) => (
+            existing.requestId === job.requestId || existing.tenantId === job.tenantId
+          ),
+        )
+        || [...this.tenantRuntimeRevocationReceipts.values()].some(
+          (existing) => existing.tenantId === job.tenantId,
+        )
+      ) throw new TenantErasureIntegrityError();
+      staged.push(job);
+    }
+    const prior = new Map(this.tenantRuntimeRevocationJobs);
+    try {
+      for (const job of staged) this.tenantRuntimeRevocationJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRuntimeRevocationJobs, prior);
+      throw error;
+    }
+    return staged.length;
+  }
+
+  async claimTenantRuntimeRevocations(
+    options: ClaimTenantRuntimeRevocationsOptions,
+  ): Promise<TenantRuntimeRevocationClaim[]> {
+    const stagedOptions = clone(options);
+    validateClaimTenantRuntimeRevocationsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = nowMs + stagedOptions.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) {
+      throw new Error("tenant runtime revocation lease deadline is invalid");
+    }
+    const candidates = [...this.tenantRuntimeRevocationJobs.values()]
+      .filter((job): job is Extract<TenantRuntimeRevocationJobRecord, { phase: "queued" }> => (
+        job.phase === "queued"
+        && job.availableAtMs <= nowMs
+        && (job.claimToken === undefined || job.leaseUntilMs! <= nowMs)
+      ))
+      .sort((left, right) => (
+        left.availableAtMs - right.availableAtMs
+        || left.requestId.localeCompare(right.requestId)
+      ))
+      .slice(0, stagedOptions.limit);
+    const staged: TenantRuntimeRevocationJobRecord[] = [];
+    for (const current of candidates) {
+      this.assertTenantRuntimeRevocationSource(current, true);
+      const claimAttempt = current.attempts + 1;
+      if (!Number.isSafeInteger(claimAttempt) || claimAttempt > 0xffff_ffff) {
+        throw new TenantErasureIntegrityError();
+      }
+      const next = clone<TenantRuntimeRevocationJobRecord>({
+        ...current,
+        attempts: claimAttempt,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+        lastErrorCode: undefined,
+        updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      });
+      validateTenantRuntimeRevocationJobRecord(next);
+      staged.push(next);
+    }
+    const prior = new Map(this.tenantRuntimeRevocationJobs);
+    try {
+      for (const job of staged) this.tenantRuntimeRevocationJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRuntimeRevocationJobs, prior);
+      throw error;
+    }
+    return staged.map((job) => clone(tenantRuntimeRevocationClaimFromJob(job)));
+  }
+
+  async renewTenantRuntimeRevocation(
+    authorization: TenantRuntimeRevocationAuthorization,
+    options: RenewTenantRuntimeRevocationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantRuntimeRevocationAuthorization(stagedAuthorization);
+    validateRenewTenantRuntimeRevocationOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = nowMs + stagedOptions.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) {
+      throw new Error("tenant runtime revocation renewed lease deadline is invalid");
+    }
+    const current = this.tenantRuntimeRevocationJobs.get(stagedAuthorization.requestId);
+    if (!current || !tenantRuntimeRevocationAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    if (current.phase !== "queued") return false;
+    this.assertTenantRuntimeRevocationSource(current, true);
+    const next = clone<TenantRuntimeRevocationJobRecord>({
+      ...current,
+      leaseUntilMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantRuntimeRevocationJobRecord(next);
+    try {
+      this.tenantRuntimeRevocationJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantRuntimeRevocationJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async retryTenantRuntimeRevocation(
+    authorization: TenantRuntimeRevocationAuthorization,
+    options: RetryTenantRuntimeRevocationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantRuntimeRevocationAuthorization(stagedAuthorization);
+    validateRetryTenantRuntimeRevocationOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const availableAtMs = nowMs + stagedOptions.delayMs;
+    if (!Number.isSafeInteger(availableAtMs)) {
+      throw new Error("tenant runtime revocation retry deadline is invalid");
+    }
+    const current = this.tenantRuntimeRevocationJobs.get(stagedAuthorization.requestId);
+    if (!current || !tenantRuntimeRevocationAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    this.assertTenantRuntimeRevocationSource(current, true);
+    const next = clone<TenantRuntimeRevocationJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      phase: "queued",
+      availableAtMs,
+      attempts: current.attempts,
+      lastErrorCode: stagedOptions.errorCode,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantRuntimeRevocationJobRecord(next);
+    try {
+      this.tenantRuntimeRevocationJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantRuntimeRevocationJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async blockTenantRuntimeRevocation(
+    authorization: TenantRuntimeRevocationAuthorization,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantRuntimeRevocationAuthorization(stagedAuthorization);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantRuntimeRevocationJobs.get(stagedAuthorization.requestId);
+    if (!current || !tenantRuntimeRevocationAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    this.assertTenantRuntimeRevocationSource(current, true);
+    const next = clone<TenantRuntimeRevocationJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      phase: "blocked",
+      attempts: current.attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      blockedAtMs: nowMs,
+      blockedReasonCode: "integrity_conflict",
+    });
+    validateTenantRuntimeRevocationJobRecord(next);
+    try {
+      this.tenantRuntimeRevocationJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantRuntimeRevocationJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async completeTenantRuntimeRevocation(
+    authorization: TenantRuntimeRevocationAuthorization,
+    proof: TenantRuntimeRevocationFleetProof,
+  ): Promise<TenantRuntimeRevocationReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    const stagedProof = clone(proof);
+    validateTenantRuntimeRevocationAuthorization(stagedAuthorization);
+    const current = this.tenantRuntimeRevocationJobs.get(stagedAuthorization.requestId);
+    if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    validateTenantRuntimeRevocationJobRecord(current);
+    if (current.phase === "configured_fleet_quiesced") {
+      this.assertTenantRuntimeRevocationSource(current, false);
+      const receipt = this.tenantRuntimeRevocationReceipts.get(current.requestId);
+      const targets = [...this.tenantRuntimeRevocationTargetReceipts.values()]
+        .filter((target) => target.requestId === current.requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantRuntimeRevocationCompletionProof(current, targets, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!tenantRuntimeRevocationCompletionMatchesAuthorization(
+        current,
+        stagedAuthorization,
+      )) return null;
+      try {
+        validateTenantRuntimeRevocationCompletionReplayProof(
+          current,
+          targets,
+          receipt,
+          stagedAuthorization,
+          stagedProof,
+        );
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      return clone(receipt);
+    }
+    if (current.phase === "blocked") {
+      this.assertTenantRuntimeRevocationSource(current, true);
+      return null;
+    }
+    const nowMs = this.storeNowMs();
+    if (!tenantRuntimeRevocationAuthorizationMatches(current, stagedAuthorization, nowMs)) {
+      return null;
+    }
+    this.assertTenantRuntimeRevocationSource(current, true);
+    try {
+      validateTenantRuntimeRevocationFleetProof(stagedProof, current);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    const existingTargets = [...this.tenantRuntimeRevocationTargetReceipts.values()]
+      .filter((target) => target.requestId === current.requestId);
+    if (
+      existingTargets.length !== 0
+      || this.tenantRuntimeRevocationReceipts.has(current.requestId)
+    ) throw new TenantErasureIntegrityError();
+
+    const tokenSha256 = tenantRuntimeRevocationClaimTokenSha256(stagedAuthorization.claimToken);
+    const stagedTargets = stagedProof.targets.map((local) => clone(
+      tenantRuntimeRevocationTargetReceiptFromLocal(
+        local,
+        current,
+        stagedAuthorization,
+        stagedProof.fleetSha256,
+      ),
+    ));
+    const receiptBody = {
+      scope: TENANT_RUNTIME_REVOCATION_RECEIPT_SCOPE,
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      fleetSha256: stagedProof.fleetSha256,
+      targetCount: stagedTargets.length,
+      targetReceiptsSha256: stagedProof.targetReceiptsSha256,
+      storeDbTimestampMs: nowMs,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: tokenSha256,
+      memoryDisposition: TENANT_RUNTIME_REVOCATION_MEMORY_DISPOSITION,
+      externalDisposition: TENANT_RUNTIME_REVOCATION_EXTERNAL_DISPOSITION,
+      contentPurgeRequired: true as const,
+    };
+    const stagedReceipt = clone<TenantRuntimeRevocationReceipt>({
+      ...receiptBody,
+      receiptSha256: tenantRuntimeRevocationReceiptSha256(receiptBody),
+    });
+    const stagedJob = clone<TenantRuntimeRevocationJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      phase: "configured_fleet_quiesced",
+      attempts: current.attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      configuredFleetQuiescedAtMs: nowMs,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: tokenSha256,
+    });
+    try {
+      validateTenantRuntimeRevocationCompletionProof(stagedJob, stagedTargets, stagedReceipt);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    const jobsBefore = new Map(this.tenantRuntimeRevocationJobs);
+    const targetsBefore = new Map(this.tenantRuntimeRevocationTargetReceipts);
+    const receiptsBefore = new Map(this.tenantRuntimeRevocationReceipts);
+    try {
+      for (const target of stagedTargets) {
+        this.tenantRuntimeRevocationTargetReceipts.set(
+          this.tenantRuntimeRevocationTargetKey(target.requestId, target.targetSha256),
+          target,
+        );
+      }
+      this.tenantRuntimeRevocationReceipts.set(current.requestId, stagedReceipt);
+      this.tenantRuntimeRevocationJobs.set(current.requestId, stagedJob);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRuntimeRevocationJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantRuntimeRevocationTargetReceipts, targetsBefore);
+      restoreMapSnapshot(this.tenantRuntimeRevocationReceipts, receiptsBefore);
+      throw error;
+    }
+    return clone(stagedReceipt);
+  }
+
+  async getTenantRuntimeRevocationJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantRuntimeRevocationJobRecord | null> {
+    const job = this.tenantRuntimeRevocationJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    this.assertTenantRuntimeRevocationSource(
+      job,
+      job.phase !== "configured_fleet_quiesced",
+    );
+    if (job.phase === "configured_fleet_quiesced") {
+      const receipt = this.tenantRuntimeRevocationReceipts.get(requestId);
+      const targets = [...this.tenantRuntimeRevocationTargetReceipts.values()]
+        .filter((target) => target.requestId === requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantRuntimeRevocationCompletionProof(job, targets, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    return clone(job);
+  }
+
+  async getTenantRuntimeRevocationTargetReceipts(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantRuntimeRevocationTargetReceipt[]> {
+    const job = this.tenantRuntimeRevocationJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return [];
+    const targets = [...this.tenantRuntimeRevocationTargetReceipts.values()]
+      .filter((target) => target.requestId === requestId)
+      .sort((left, right) => left.targetSha256.localeCompare(right.targetSha256));
+    this.assertTenantRuntimeRevocationSource(
+      job,
+      job.phase !== "configured_fleet_quiesced",
+    );
+    if (job.phase !== "configured_fleet_quiesced") {
+      if (targets.length !== 0) throw new TenantErasureIntegrityError();
+      return [];
+    }
+    const receipt = this.tenantRuntimeRevocationReceipts.get(requestId);
+    if (!receipt) throw new TenantErasureIntegrityError();
+    try {
+      validateTenantRuntimeRevocationCompletionProof(job, targets, receipt);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return targets.map(clone);
+  }
+
+  async getTenantRuntimeRevocationReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantRuntimeRevocationReceipt | null> {
+    const receipt = this.tenantRuntimeRevocationReceipts.get(requestId);
+    if (!receipt || receipt.tenantId !== tenantId) return null;
+    const job = this.tenantRuntimeRevocationJobs.get(requestId);
+    if (!job) throw new TenantErasureIntegrityError();
+    const targets = [...this.tenantRuntimeRevocationTargetReceipts.values()]
+      .filter((target) => target.requestId === requestId);
+    this.assertTenantRuntimeRevocationSource(job, false);
+    try {
+      validateTenantRuntimeRevocationCompletionProof(job, targets, receipt);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return clone(receipt);
   }
 
   async getSubjectLifecycle(

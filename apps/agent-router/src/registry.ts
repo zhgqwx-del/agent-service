@@ -6,10 +6,18 @@ import {
   DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
+  INTERNAL_ROUTER_TOKEN_HEADER,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
+  INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_RUNTIME_DRAIN_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TenantRuntimeDrainReady,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+  tenantRuntimeFleetSha256,
+  tenantRuntimeTargetSha256,
 } from "@agent-service/protocol";
 
 /**
@@ -34,6 +42,8 @@ export interface RunnerTarget {
 
 export interface RunnerRegistryOptions {
   runners: string[];
+  /** Shared only with runners; required for fresh private runtime-drain identity probes. */
+  internalRouterToken?: string;
   redisUrl?: string;
   redisPrefix?: string;
   /** how often to poll readiness and protocol compatibility */
@@ -42,6 +52,61 @@ export interface RunnerRegistryOptions {
   virtualNodes?: number;
   healthTimeoutMs?: number;
   redisCommandTimeoutMs?: number;
+}
+
+export interface TenantRuntimeDrainTarget {
+  /** Exact configured instance-stable origin. No owner or port-fallback resolution is permitted. */
+  readonly url: string;
+  readonly targetSha256: string;
+  readonly runnerId: string;
+  readonly bootId: string;
+}
+
+export interface TenantRuntimeDrainFleetSnapshot {
+  readonly fleetSha256: string;
+  readonly targets: readonly TenantRuntimeDrainTarget[];
+}
+
+const TENANT_RUNTIME_READY_MAX_BYTES = 2_048;
+
+async function readJsonCapped(response: Response, maxBytes: number): Promise<unknown> {
+  if (!response.body) throw new Error("runner identity response has no body");
+  const declared = response.headers.get("content-length");
+  if (declared !== null) {
+    const value = Number(declared);
+    if (!Number.isSafeInteger(value) || value < 0 || value > maxBytes) {
+      await response.body.cancel().catch(() => {});
+      throw new Error("runner identity response is too large");
+    }
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      size += next.value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Error("runner identity response is too large");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new Error("runner identity response is malformed");
+  }
 }
 
 const hash = (s: string) => {
@@ -389,6 +454,100 @@ export class RunnerRegistry {
     const configured = this.list();
     return configured.length > 0
       && configured.every((target) => this.erasureJobControlCompatible.has(target.url));
+  }
+
+  /**
+   * Build a new all-configured T3b fleet snapshot from direct, private per-instance probes. This
+   * deliberately does not consume the periodically cached health state, sticky rollout state,
+   * owner directory or port fallback. A caller gets either one identity for every exact configured
+   * URL or no snapshot at all.
+   */
+  async freshTenantRuntimeDrainSnapshot(): Promise<TenantRuntimeDrainFleetSnapshot> {
+    const token = this.opts.internalRouterToken;
+    if (!token) throw new Error("tenant runtime drain identity probe is disabled");
+    const configured = [...this.targets.values()];
+    if (!configured.length || configured.length > 100) {
+      throw new Error("tenant runtime drain fleet size is invalid");
+    }
+
+    const targets = await Promise.all(configured.map(async (target) => {
+      const signal = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
+      const request = { signal, redirect: "manual" as const };
+      const ready = await fetch(`${target.url}/readyz`, request);
+      if (!ready.ok) {
+        await ready.body?.cancel().catch(() => {});
+        throw new Error("configured tenant runtime target is not ready");
+      }
+      await ready.body?.cancel().catch(() => {});
+
+      const capabilitiesResponse = await fetch(`${target.url}/v1/capabilities`, request);
+      if (!capabilitiesResponse.ok) {
+        await capabilitiesResponse.body?.cancel().catch(() => {});
+        throw new Error("configured tenant runtime target has no capability document");
+      }
+      const capabilitiesPayload = await readJsonCapped(
+        capabilitiesResponse,
+        TENANT_RUNTIME_READY_MAX_BYTES,
+      );
+      const capabilities = Capabilities.safeParse(capabilitiesPayload);
+      if (
+        !capabilities.success
+        || capabilities.data.service !== "agent-runner"
+        || !capabilities.data.features.tenantRuntimeDrain.includes(TENANT_RUNTIME_DRAIN_V1)
+        || capabilities.data.features.tenantRuntimeDrainEndpoint !== true
+      ) throw new Error("configured tenant runtime target is incompatible");
+
+      const identityResponse = await fetch(
+        `${target.url}${INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH}`,
+        {
+          ...request,
+          headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: token },
+        },
+      );
+      if (
+        identityResponse.status !== 200
+        || identityResponse.headers.get(INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER)
+          !== INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE
+        || !identityResponse.headers.get("cache-control")?.split(",").some((value) => (
+          value.trim().toLowerCase() === "no-store"
+        ))
+      ) {
+        await identityResponse.body?.cancel().catch(() => {});
+        throw new Error("configured tenant runtime target did not attest its identity");
+      }
+      const identityPayload = await readJsonCapped(
+        identityResponse,
+        TENANT_RUNTIME_READY_MAX_BYTES,
+      );
+      const identity = TenantRuntimeDrainReady.safeParse(identityPayload);
+      if (!identity.success) {
+        throw new Error("configured tenant runtime target returned an invalid identity");
+      }
+      return Object.freeze({
+        url: target.url,
+        targetSha256: tenantRuntimeTargetSha256(target.url),
+        runnerId: identity.data.runnerId,
+        bootId: identity.data.bootId,
+      });
+    }));
+
+    const sorted = targets.sort((left, right) => (
+      left.targetSha256 < right.targetSha256
+        ? -1
+        : left.targetSha256 > right.targetSha256
+          ? 1
+          : 0
+    ));
+    if (
+      new Set(sorted.map((target) => target.targetSha256)).size !== sorted.length
+      || new Set(sorted.map((target) => target.runnerId)).size !== sorted.length
+      || new Set(sorted.map((target) => target.bootId)).size !== sorted.length
+    ) throw new Error("configured tenant runtime target identities are not unique");
+
+    return Object.freeze({
+      fleetSha256: tenantRuntimeFleetSha256(sorted),
+      targets: Object.freeze(sorted),
+    });
   }
 
   /**

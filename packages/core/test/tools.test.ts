@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DynamicToolBridge, assertPublicHost, builtinTools, currentTimeTool } from "../src/index.js";
 
 const ctx = (over: Partial<Parameters<typeof currentTimeTool.execute>[1]> = {}) => ({
@@ -51,6 +51,24 @@ describe("web_fetch", () => {
   it("rejects an invalid url", async () => {
     const r = await webFetch.execute({ url: "not a url" }, ctx());
     expect(r.isError).toBe(true);
+  });
+
+  it("cancels a manual redirect body before the tool completes", async () => {
+    let cancelled = false;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      new ReadableStream({ cancel: () => { cancelled = true; } }),
+      { status: 302, headers: { location: "https://example.com/next" } },
+    ));
+    try {
+      const result = await webFetch.execute({ url: "https://1.1.1.1/start" }, ctx());
+      expect(result).toMatchObject({ isError: true });
+      expect(result.content[0]).toMatchObject({
+        text: expect.stringContaining("redirect to https://example.com/next not followed"),
+      });
+      expect(cancelled).toBe(true);
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 });
 

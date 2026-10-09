@@ -405,6 +405,39 @@ import {
   type TenantCredentialRevocationReceipt,
   type TenantCredentialRevocationStore,
 } from "../tenant-credential-revocation.js";
+import {
+  TENANT_RUNTIME_REVOCATION_EXTERNAL_DISPOSITION,
+  TENANT_RUNTIME_REVOCATION_MEMORY_DISPOSITION,
+  TENANT_RUNTIME_REVOCATION_RECEIPT_SCOPE,
+  tenantRuntimeRevocationAuthorizationMatches,
+  tenantRuntimeRevocationClaimFromJob,
+  tenantRuntimeRevocationClaimTokenSha256,
+  tenantRuntimeRevocationCompletionMatchesAuthorization,
+  tenantRuntimeRevocationReceiptSha256,
+  tenantRuntimeRevocationTargetReceiptFromLocal,
+  validateClaimTenantRuntimeRevocationsOptions,
+  validateMaterializeTenantRuntimeRevocationJobsOptions,
+  validateRenewTenantRuntimeRevocationOptions,
+  validateRetryTenantRuntimeRevocationOptions,
+  validateTenantRuntimeRevocationAuthorization,
+  validateTenantRuntimeRevocationCompletionProof,
+  validateTenantRuntimeRevocationCompletionReplayProof,
+  validateTenantRuntimeRevocationFleetProof,
+  validateTenantRuntimeRevocationJobRecord,
+  validateTenantRuntimeRevocationReceipt,
+  validateTenantRuntimeRevocationTargetReceipt,
+  type ClaimTenantRuntimeRevocationsOptions,
+  type MaterializeTenantRuntimeRevocationJobsOptions,
+  type RenewTenantRuntimeRevocationOptions,
+  type RetryTenantRuntimeRevocationOptions,
+  type TenantRuntimeRevocationAuthorization,
+  type TenantRuntimeRevocationClaim,
+  type TenantRuntimeRevocationFleetProof,
+  type TenantRuntimeRevocationJobRecord,
+  type TenantRuntimeRevocationReceipt,
+  type TenantRuntimeRevocationStore,
+  type TenantRuntimeRevocationTargetReceipt,
+} from "../tenant-runtime-revocation.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -451,6 +484,22 @@ const TENANT_CREDENTIAL_REVOCATION_RECEIPT_COLUMNS = `request_id, tenant_id, sub
   external_disposition, content_purge_required, receipt_sha256`;
 const TENANT_CREDENTIAL_REVOCATION_CUTOVER_COLUMNS = `singleton_id, control_generation,
   activated_at_ms, first_receipt_sha256, evidence_sha256`;
+const TENANT_RUNTIME_REVOCATION_JOB_COLUMNS = `request_id, tenant_id, subject_generation,
+  t1_fence_sha256, t3a_receipt_sha256, phase, available_at_ms, attempts, claim_token,
+  lease_until_ms, last_error_code, created_at_ms, updated_at_ms,
+  configured_fleet_quiesced_at_ms, completed_claim_attempt, completed_claim_token_sha256,
+  blocked_at_ms, blocked_reason_code`;
+const TENANT_RUNTIME_REVOCATION_TARGET_COLUMNS = `request_id, target_sha256, tenant_id,
+  subject_generation, scope, runner_id_sha256, boot_id_sha256, t1_fence_sha256,
+  t3a_receipt_sha256, fleet_sha256, cache_entry_count_before, cache_entry_count_after,
+  active_operation_count_before, active_operation_count_after, active_turn_count_before,
+  active_turn_count_after, runner_completed_at_ms, local_receipt_sha256,
+  completed_claim_attempt, completed_claim_token_sha256, evidence_sha256`;
+const TENANT_RUNTIME_REVOCATION_RECEIPT_COLUMNS = `request_id, tenant_id, subject_generation,
+  scope, t1_fence_sha256, t3a_receipt_sha256, fleet_sha256, target_count,
+  target_receipts_sha256, store_db_timestamp_ms, completed_claim_attempt,
+  completed_claim_token_sha256, memory_disposition, external_disposition,
+  content_purge_required, receipt_sha256`;
 const ERASURE_CONTROL_EVENT_COLUMNS = `control_event_id, request_id, control_generation, event_type,
   phase, reason_code, action_code, actor_key_id, before_sha256, after_sha256, emitted_at_ms`;
 const LEGACY_TOMBSTONE_JOB_COLUMNS = `job_id, session_id, tenant_id, user_id, source_kind,
@@ -1724,6 +1773,198 @@ function rowToTenantCredentialRevocationCutover(
   }
 }
 
+function rowToTenantRuntimeRevocationJob(row: Row): TenantRuntimeRevocationJobRecord {
+  try {
+    const common = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant runtime revocation generation",
+        1,
+      ),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3aReceiptSha256: String(row.t3a_receipt_sha256),
+      attempts: storedSafeInteger(row.attempts, "stored tenant runtime revocation attempts"),
+      createdAtMs: storedSafeInteger(
+        row.created_at_ms,
+        "stored tenant runtime revocation creation timestamp",
+      ),
+      updatedAtMs: storedSafeInteger(
+        row.updated_at_ms,
+        "stored tenant runtime revocation update timestamp",
+      ),
+    };
+    const phase = String(row.phase);
+    let record: TenantRuntimeRevocationJobRecord;
+    if (phase === "queued") {
+      record = {
+        ...common,
+        phase,
+        availableAtMs: storedSafeInteger(
+          row.available_at_ms,
+          "stored tenant runtime revocation availability",
+        ),
+        ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+        ...(row.lease_until_ms == null
+          ? {}
+          : {
+              leaseUntilMs: storedSafeInteger(
+                row.lease_until_ms,
+                "stored tenant runtime revocation lease",
+              ),
+            }),
+        ...(row.last_error_code == null
+          ? {}
+          : { lastErrorCode: String(row.last_error_code) as "temporary_failure" }),
+      };
+    } else if (phase === "configured_fleet_quiesced") {
+      record = {
+        ...common,
+        phase,
+        configuredFleetQuiescedAtMs: storedSafeInteger(
+          row.configured_fleet_quiesced_at_ms,
+          "stored tenant runtime revocation completion timestamp",
+        ),
+        completedClaimAttempt: storedSafeInteger(
+          row.completed_claim_attempt,
+          "stored tenant runtime revocation completion attempt",
+          1,
+        ),
+        completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      };
+    } else if (phase === "blocked") {
+      record = {
+        ...common,
+        phase,
+        blockedAtMs: storedSafeInteger(
+          row.blocked_at_ms,
+          "stored tenant runtime revocation blocked timestamp",
+        ),
+        blockedReasonCode: String(row.blocked_reason_code) as "integrity_conflict",
+      };
+    } else {
+      throw new TenantErasureIntegrityError();
+    }
+    validateTenantRuntimeRevocationJobRecord(record);
+    return record;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantRuntimeRevocationTargetReceipt(
+  row: Row,
+): TenantRuntimeRevocationTargetReceipt {
+  try {
+    const receipt: TenantRuntimeRevocationTargetReceipt = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant runtime target generation",
+        1,
+      ),
+      scope: String(row.scope) as TenantRuntimeRevocationTargetReceipt["scope"],
+      targetSha256: String(row.target_sha256),
+      runnerIdSha256: String(row.runner_id_sha256),
+      bootIdSha256: String(row.boot_id_sha256),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3aReceiptSha256: String(row.t3a_receipt_sha256),
+      fleetSha256: String(row.fleet_sha256),
+      cacheEntryCountBefore: storedSafeInteger(
+        row.cache_entry_count_before,
+        "stored tenant runtime target cache before count",
+      ),
+      cacheEntryCountAfter: storedSafeInteger(
+        row.cache_entry_count_after,
+        "stored tenant runtime target cache after count",
+      ) as 0,
+      activeOperationCountBefore: storedSafeInteger(
+        row.active_operation_count_before,
+        "stored tenant runtime target operation before count",
+      ),
+      activeOperationCountAfter: storedSafeInteger(
+        row.active_operation_count_after,
+        "stored tenant runtime target operation after count",
+      ) as 0,
+      activeTurnCountBefore: storedSafeInteger(
+        row.active_turn_count_before,
+        "stored tenant runtime target turn before count",
+      ),
+      activeTurnCountAfter: storedSafeInteger(
+        row.active_turn_count_after,
+        "stored tenant runtime target turn after count",
+      ) as 0,
+      runnerCompletedAtMs: storedSafeInteger(
+        row.runner_completed_at_ms,
+        "stored tenant runtime target completion timestamp",
+      ),
+      localReceiptSha256: String(row.local_receipt_sha256),
+      completedClaimAttempt: storedSafeInteger(
+        row.completed_claim_attempt,
+        "stored tenant runtime target completion attempt",
+        1,
+      ),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      evidenceSha256: String(row.evidence_sha256),
+    };
+    validateTenantRuntimeRevocationTargetReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantRuntimeRevocationReceipt(row: Row): TenantRuntimeRevocationReceipt {
+  try {
+    const receipt: TenantRuntimeRevocationReceipt = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant runtime receipt generation",
+        1,
+      ),
+      scope: String(row.scope) as TenantRuntimeRevocationReceipt["scope"],
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3aReceiptSha256: String(row.t3a_receipt_sha256),
+      fleetSha256: String(row.fleet_sha256),
+      targetCount: storedSafeInteger(
+        row.target_count,
+        "stored tenant runtime receipt target count",
+        1,
+      ),
+      targetReceiptsSha256: String(row.target_receipts_sha256),
+      storeDbTimestampMs: storedSafeInteger(
+        row.store_db_timestamp_ms,
+        "stored tenant runtime receipt timestamp",
+      ),
+      completedClaimAttempt: storedSafeInteger(
+        row.completed_claim_attempt,
+        "stored tenant runtime receipt completion attempt",
+        1,
+      ),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      memoryDisposition: String(
+        row.memory_disposition,
+      ) as TenantRuntimeRevocationReceipt["memoryDisposition"],
+      externalDisposition: String(
+        row.external_disposition,
+      ) as TenantRuntimeRevocationReceipt["externalDisposition"],
+      contentPurgeRequired: tenantCredentialBoolean(
+        row.content_purge_required,
+        "stored tenant runtime receipt content-purge flag",
+      ) as true,
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantRuntimeRevocationReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
 function mysqlControlGeneration(value: unknown): {
   projected: number;
   raw: string;
@@ -2534,6 +2775,7 @@ export class MysqlSessionStore implements
   RetentionPolicyStore,
   ErasurePolicyEvaluationStore,
   TenantCredentialRevocationStore,
+  TenantRuntimeRevocationStore,
   UserDataExportRequestStore,
   UserDataExportJobStore,
   UserDataExportCleanupStore
@@ -9118,6 +9360,974 @@ export class MysqlSessionStore implements
       throw new TenantErasureIntegrityError();
     }
     return receipt;
+  }
+
+  private async loadTenantRuntimeRevocationJob(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" | "FOR UPDATE SKIP LOCKED" = "",
+  ): Promise<TenantRuntimeRevocationJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RUNTIME_REVOCATION_JOB_COLUMNS}
+         FROM tenant_runtime_revocation_jobs
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const job = rowToTenantRuntimeRevocationJob(rows[0]);
+    return job.tenantId === tenantId && job.requestId === requestId ? job : null;
+  }
+
+  private async loadTenantRuntimeRevocationTargetReceipts(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantRuntimeRevocationTargetReceipt[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RUNTIME_REVOCATION_TARGET_COLUMNS}
+         FROM tenant_runtime_revocation_target_receipts
+        WHERE tenant_id=? AND request_id=?
+        ORDER BY target_sha256 ${lock}`,
+      [tenantId, requestId],
+    );
+    return rows.map((row) => {
+      const receipt = rowToTenantRuntimeRevocationTargetReceipt(row);
+      if (receipt.tenantId !== tenantId || receipt.requestId !== requestId) {
+        throw new TenantErasureIntegrityError();
+      }
+      return receipt;
+    });
+  }
+
+  private async loadTenantRuntimeRevocationReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantRuntimeRevocationReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RUNTIME_REVOCATION_RECEIPT_COLUMNS}
+         FROM tenant_runtime_revocation_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const receipt = rowToTenantRuntimeRevocationReceipt(rows[0]);
+    return receipt.tenantId === tenantId && receipt.requestId === requestId ? receipt : null;
+  }
+
+  private async validateTenantRuntimeRevocationImmutableSourceProof(
+    conn: PoolConnection,
+    job: TenantRuntimeRevocationJobRecord,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<{
+    admission: ErasureRequestRecord;
+    fence: TenantCredentialRevocationFence;
+    firstAudit: ErasureAuditEvent;
+    credentialReceipt: TenantCredentialRevocationReceipt;
+  }> {
+    // Preserve the global destructive-flow lock order: lifecycle (when required), immutable T1,
+    // terminal T3a, then the mutable T3b job.
+    const admission = await this.loadTenantErasureAdmission(
+      conn,
+      job.tenantId,
+      job.requestId,
+      lock,
+    );
+    const fence = await this.loadTenantCredentialRevocationFence(
+      conn,
+      job.tenantId,
+      job.requestId,
+      lock,
+    );
+    const firstAudit = await this.loadTenantErasureFirstAudit(conn, job.requestId, lock);
+    if (!admission || !fence || !firstAudit) throw new TenantErasureIntegrityError();
+    validateTenantErasureImmutableT1Proof({ admission, fence, firstAudit });
+    if (
+      admission.tenantId !== job.tenantId
+      || admission.requestId !== job.requestId
+      || admission.generation !== job.subjectGeneration
+      || fence.tenantId !== job.tenantId
+      || fence.requestId !== job.requestId
+      || fence.subjectGeneration !== job.subjectGeneration
+      || fence.evidenceSha256 !== job.t1FenceSha256
+    ) throw new TenantErasureIntegrityError();
+    const credentialJob = await this.loadTenantCredentialRevocationJob(
+      conn,
+      job.tenantId,
+      job.requestId,
+      lock,
+    );
+    if (!credentialJob || credentialJob.phase !== "credential_store_revoked") {
+      throw new TenantErasureIntegrityError();
+    }
+    const credentialReceipt = await this.loadTenantCredentialRevocationReceipt(
+      conn,
+      job.tenantId,
+      job.requestId,
+      lock,
+    );
+    if (!credentialReceipt) throw new TenantErasureIntegrityError();
+    try {
+      validateTenantCredentialRevocationCompletionProof(credentialJob, credentialReceipt);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    if (
+      credentialJob.subjectGeneration !== job.subjectGeneration
+      || credentialJob.t1FenceSha256 !== job.t1FenceSha256
+      || credentialReceipt.subjectGeneration !== job.subjectGeneration
+      || credentialReceipt.t1FenceSha256 !== job.t1FenceSha256
+      || credentialReceipt.receiptSha256 !== job.t3aReceiptSha256
+    ) throw new TenantErasureIntegrityError();
+
+    const [cutoverRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_REVOCATION_CUTOVER_COLUMNS}
+         FROM tenant_credential_revocation_cutover WHERE singleton_id=1`,
+    );
+    if (!cutoverRows[0]) throw new TenantErasureIntegrityError();
+    const cutover = rowToTenantCredentialRevocationCutover(cutoverRows[0]);
+    if (cutover.controlGeneration !== 1) throw new TenantErasureIntegrityError();
+    await this.validateTenantCredentialRevocationCutoverProof(conn, cutover);
+    return { admission, fence, firstAudit, credentialReceipt };
+  }
+
+  private async lockAndValidateTenantRuntimeRevocationCurrentSource(
+    conn: PoolConnection,
+    job: TenantRuntimeRevocationJobRecord,
+  ): Promise<void> {
+    const [lifecycleRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [job.tenantId, job.tenantId],
+    );
+    if (
+      !lifecycleRows[0]
+      || String(lifecycleRows[0].tenant_id) !== job.tenantId
+      || String(lifecycleRows[0].subject_kind) !== "tenant"
+      || String(lifecycleRows[0].subject_id) !== job.tenantId
+    ) throw new TenantErasureIntegrityError();
+    let lifecycle: SubjectLifecycleRecord;
+    try {
+      lifecycle = rowToSubjectLifecycle(lifecycleRows[0]);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    const proof = await this.validateTenantRuntimeRevocationImmutableSourceProof(
+      conn,
+      job,
+      "FOR SHARE",
+    );
+    validateTenantErasureAdmissionProof({ lifecycle, ...proof });
+  }
+
+  private async validateTenantRuntimeRevocationReadProof(
+    conn: PoolConnection,
+    job: TenantRuntimeRevocationJobRecord,
+  ): Promise<TenantRuntimeRevocationReceipt | null> {
+    const proof = await this.validateTenantRuntimeRevocationImmutableSourceProof(conn, job);
+    if (job.phase !== "configured_fleet_quiesced") {
+      const [lifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+        [job.tenantId, job.tenantId],
+      );
+      if (!lifecycleRows[0]) throw new TenantErasureIntegrityError();
+      let lifecycle: SubjectLifecycleRecord;
+      try {
+        lifecycle = rowToSubjectLifecycle(lifecycleRows[0]);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      validateTenantErasureAdmissionProof({ lifecycle, ...proof });
+    }
+    const targets = await this.loadTenantRuntimeRevocationTargetReceipts(
+      conn,
+      job.tenantId,
+      job.requestId,
+    );
+    const receipt = await this.loadTenantRuntimeRevocationReceipt(
+      conn,
+      job.tenantId,
+      job.requestId,
+    );
+    if (job.phase !== "configured_fleet_quiesced") {
+      if (targets.length !== 0 || receipt) throw new TenantErasureIntegrityError();
+      return null;
+    }
+    if (!receipt) throw new TenantErasureIntegrityError();
+    try {
+      validateTenantRuntimeRevocationCompletionProof(job, targets, receipt);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return receipt;
+  }
+
+  async materializeTenantRuntimeRevocationJobs(
+    options: MaterializeTenantRuntimeRevocationJobsOptions,
+  ): Promise<number> {
+    validateMaterializeTenantRuntimeRevocationJobsOptions(options);
+    const [candidateRows] = await this.pool.query<Row[]>(
+      `SELECT j.request_id, j.tenant_id, j.subject_generation, j.t1_fence_sha256,
+              r.receipt_sha256 AS t3a_receipt_sha256
+         FROM tenant_credential_revocation_jobs j
+         JOIN tenant_credential_revocation_receipts r
+           ON r.request_id=j.request_id AND r.tenant_id=j.tenant_id
+        WHERE j.phase='credential_store_revoked'
+          AND NOT EXISTS (
+            SELECT 1 FROM tenant_runtime_revocation_jobs t
+             WHERE t.request_id=j.request_id
+          )
+        ORDER BY j.request_id
+        LIMIT ?`,
+      [options.limit],
+    );
+    let materialized = 0;
+    for (const row of candidateRows) {
+      const requestId = String(row.request_id);
+      const tenantId = String(row.tenant_id);
+      const conn = await this.pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const [lifecycleRows] = await conn.query<Row[]>(
+          `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+             FROM subject_lifecycle
+            WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
+          [tenantId, tenantId],
+        );
+        if (!lifecycleRows[0]) throw new TenantErasureIntegrityError();
+        let lifecycle: SubjectLifecycleRecord;
+        try {
+          lifecycle = rowToSubjectLifecycle(lifecycleRows[0]);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        const synthetic: TenantRuntimeRevocationJobRecord = {
+          requestId,
+          tenantId,
+          subjectGeneration: storedSafeInteger(
+            row.subject_generation,
+            "tenant runtime materialization generation",
+            1,
+          ),
+          t1FenceSha256: String(row.t1_fence_sha256),
+          t3aReceiptSha256: String(row.t3a_receipt_sha256),
+          phase: "queued",
+          availableAtMs: 0,
+          attempts: 0,
+          createdAtMs: 0,
+          updatedAtMs: 0,
+        };
+        const proof = await this.validateTenantRuntimeRevocationImmutableSourceProof(
+          conn,
+          synthetic,
+          "FOR SHARE",
+        );
+        validateTenantErasureAdmissionProof({ lifecycle, ...proof });
+
+        const [existingRows] = await conn.query<Row[]>(
+          `SELECT ${TENANT_RUNTIME_REVOCATION_JOB_COLUMNS}
+             FROM tenant_runtime_revocation_jobs
+            WHERE tenant_id=? FOR UPDATE`,
+          [tenantId],
+        );
+        if (existingRows[0]) {
+          const existing = rowToTenantRuntimeRevocationJob(existingRows[0]);
+          if (
+            existing.requestId !== requestId
+            || existing.subjectGeneration !== synthetic.subjectGeneration
+            || existing.t1FenceSha256 !== synthetic.t1FenceSha256
+            || existing.t3aReceiptSha256 !== synthetic.t3aReceiptSha256
+          ) throw new TenantErasureIntegrityError();
+          await this.validateTenantRuntimeRevocationReadProof(conn, existing);
+          await conn.commit();
+          continue;
+        }
+        const [receiptRows] = await conn.query<Row[]>(
+          "SELECT request_id FROM tenant_runtime_revocation_receipts WHERE tenant_id=? FOR SHARE",
+          [tenantId],
+        );
+        if (receiptRows[0]) throw new TenantErasureIntegrityError();
+        const [targetRows] = await conn.query<Row[]>(
+          `SELECT request_id FROM tenant_runtime_revocation_target_receipts
+            WHERE tenant_id=? FOR SHARE`,
+          [tenantId],
+        );
+        if (targetRows[0]) throw new TenantErasureIntegrityError();
+        const now = await this.databaseNow(conn);
+        await conn.query(
+          `INSERT INTO tenant_runtime_revocation_jobs
+             (request_id, tenant_id, subject_generation, t1_fence_sha256,
+              t3a_receipt_sha256, phase, available_at_ms, attempts, claim_token,
+              lease_until_ms, last_error_code, created_at_ms, updated_at_ms,
+              configured_fleet_quiesced_at_ms, completed_claim_attempt,
+              completed_claim_token_sha256, blocked_at_ms, blocked_reason_code)
+           VALUES (?,?,?,?,?,'queued',?,0,NULL,NULL,NULL,?,?,NULL,NULL,NULL,NULL,NULL)`,
+          [
+            requestId,
+            tenantId,
+            synthetic.subjectGeneration,
+            synthetic.t1FenceSha256,
+            synthetic.t3aReceiptSha256,
+            now,
+            now,
+            now,
+          ],
+        );
+        await conn.commit();
+        materialized += 1;
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    return materialized;
+  }
+
+  async claimTenantRuntimeRevocations(
+    options: ClaimTenantRuntimeRevocationsOptions,
+  ): Promise<TenantRuntimeRevocationClaim[]> {
+    validateClaimTenantRuntimeRevocationsOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const scanNow = await this.databaseNow(conn);
+      const claims: TenantRuntimeRevocationClaim[] = [];
+      const maxCandidatesToScan = Math.min(400, Math.max(32, options.limit * 4));
+      const pageSize = Math.min(100, maxCandidatesToScan);
+      let scanned = 0;
+      let cursor: { availableAtMs: number; requestId: string } | undefined;
+      while (claims.length < options.limit && scanned < maxCandidatesToScan) {
+        const batchSize = Math.min(pageSize, maxCandidatesToScan - scanned);
+        const [rows] = await conn.query<Row[]>(
+          `SELECT ${TENANT_RUNTIME_REVOCATION_JOB_COLUMNS}
+             FROM tenant_runtime_revocation_jobs
+            WHERE phase='queued' AND available_at_ms<=?
+              AND (claim_token IS NULL OR lease_until_ms<=?)
+              ${cursor === undefined
+                ? ""
+                : "AND (available_at_ms>? OR (available_at_ms=? AND request_id>?))"}
+            ORDER BY available_at_ms, request_id
+            LIMIT ?`,
+          cursor === undefined
+            ? [scanNow, scanNow, batchSize]
+            : [
+                scanNow,
+                scanNow,
+                cursor.availableAtMs,
+                cursor.availableAtMs,
+                cursor.requestId,
+                batchSize,
+              ],
+        );
+        if (rows.length === 0) break;
+        for (const row of rows) {
+          const candidate = rowToTenantRuntimeRevocationJob(row);
+          if (candidate.phase !== "queued") throw new TenantErasureIntegrityError();
+          scanned += 1;
+          cursor = { availableAtMs: candidate.availableAtMs, requestId: candidate.requestId };
+          await this.lockAndValidateTenantRuntimeRevocationCurrentSource(conn, candidate);
+          const current = await this.loadTenantRuntimeRevocationJob(
+            conn,
+            candidate.tenantId,
+            candidate.requestId,
+            "FOR UPDATE SKIP LOCKED",
+          );
+          if (!current) continue;
+          if (
+            current.subjectGeneration !== candidate.subjectGeneration
+            || current.t1FenceSha256 !== candidate.t1FenceSha256
+            || current.t3aReceiptSha256 !== candidate.t3aReceiptSha256
+          ) throw new TenantErasureIntegrityError();
+          const now = await this.databaseNow(conn);
+          if (
+            current.phase !== "queued"
+            || current.availableAtMs > now
+            || (current.claimToken !== undefined && current.leaseUntilMs! > now)
+          ) continue;
+          if (current.attempts >= 0xffff_ffff) throw new TenantErasureIntegrityError();
+          const leaseUntilMs = Math.min(Number.MAX_SAFE_INTEGER, now + options.leaseMs);
+          const updatedAtMs = Math.max(current.updatedAtMs, now);
+          const [result] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE tenant_runtime_revocation_jobs
+                SET attempts=attempts+1, claim_token=?, lease_until_ms=?,
+                    last_error_code=NULL, updated_at_ms=?
+              WHERE request_id=? AND tenant_id=? AND subject_generation=? AND phase='queued'
+                AND attempts=? AND available_at_ms<=?
+                AND (claim_token IS NULL OR lease_until_ms<=?)`,
+            [
+              options.claimToken,
+              leaseUntilMs,
+              updatedAtMs,
+              current.requestId,
+              current.tenantId,
+              current.subjectGeneration,
+              current.attempts,
+              now,
+              now,
+            ],
+          );
+          if (result.affectedRows !== 1) throw new TenantErasureIntegrityError();
+          claims.push(tenantRuntimeRevocationClaimFromJob({
+            ...current,
+            attempts: current.attempts + 1,
+            claimToken: options.claimToken,
+            leaseUntilMs,
+            updatedAtMs,
+            lastErrorCode: undefined,
+          }));
+          if (claims.length === options.limit) break;
+        }
+        if (rows.length < batchSize) break;
+      }
+      await conn.commit();
+      return claims;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewTenantRuntimeRevocation(
+    authorization: TenantRuntimeRevocationAuthorization,
+    options: RenewTenantRuntimeRevocationOptions,
+  ): Promise<boolean> {
+    validateTenantRuntimeRevocationAuthorization(authorization);
+    validateRenewTenantRuntimeRevocationOptions(options);
+    const preflight = await this.loadTenantRuntimeRevocationJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockAndValidateTenantRuntimeRevocationCurrentSource(conn, preflight);
+      const current = await this.loadTenantRuntimeRevocationJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || current.subjectGeneration !== preflight.subjectGeneration
+        || current.t1FenceSha256 !== preflight.t1FenceSha256
+        || current.t3aReceiptSha256 !== preflight.t3aReceiptSha256
+        || !tenantRuntimeRevocationAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const leaseUntilMs = Math.min(Number.MAX_SAFE_INTEGER, now + options.leaseMs);
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_runtime_revocation_jobs
+            SET lease_until_ms=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          leaseUntilMs,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryTenantRuntimeRevocation(
+    authorization: TenantRuntimeRevocationAuthorization,
+    options: RetryTenantRuntimeRevocationOptions,
+  ): Promise<boolean> {
+    validateTenantRuntimeRevocationAuthorization(authorization);
+    validateRetryTenantRuntimeRevocationOptions(options);
+    const preflight = await this.loadTenantRuntimeRevocationJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockAndValidateTenantRuntimeRevocationCurrentSource(conn, preflight);
+      const current = await this.loadTenantRuntimeRevocationJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || current.subjectGeneration !== preflight.subjectGeneration
+        || current.t1FenceSha256 !== preflight.t1FenceSha256
+        || current.t3aReceiptSha256 !== preflight.t3aReceiptSha256
+        || !tenantRuntimeRevocationAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const availableAtMs = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        Math.max(now, current.createdAtMs) + options.delayMs,
+      );
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_runtime_revocation_jobs
+            SET available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          availableAtMs,
+          options.errorCode,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async blockTenantRuntimeRevocation(
+    authorization: TenantRuntimeRevocationAuthorization,
+  ): Promise<boolean> {
+    validateTenantRuntimeRevocationAuthorization(authorization);
+    const preflight = await this.loadTenantRuntimeRevocationJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockAndValidateTenantRuntimeRevocationCurrentSource(conn, preflight);
+      const current = await this.loadTenantRuntimeRevocationJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || current.subjectGeneration !== preflight.subjectGeneration
+        || current.t1FenceSha256 !== preflight.t1FenceSha256
+        || current.t3aReceiptSha256 !== preflight.t3aReceiptSha256
+        || !tenantRuntimeRevocationAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const terminalAtMs = Math.max(current.updatedAtMs, current.createdAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_runtime_revocation_jobs
+            SET phase='blocked', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                blocked_at_ms=?, blocked_reason_code='integrity_conflict'
+          WHERE request_id=? AND tenant_id=? AND subject_generation=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          terminalAtMs,
+          terminalAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async completeTenantRuntimeRevocation(
+    authorization: TenantRuntimeRevocationAuthorization,
+    proof: TenantRuntimeRevocationFleetProof,
+  ): Promise<TenantRuntimeRevocationReceipt | null> {
+    validateTenantRuntimeRevocationAuthorization(authorization);
+    const preflight = await this.loadTenantRuntimeRevocationJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight) return null;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      // A committed terminal proof is replayable from immutable evidence even after lifecycle
+      // projection advancement/removal. Trigger guards make a terminal preflight irreversible.
+      if (preflight.phase === "configured_fleet_quiesced") {
+        await this.validateTenantRuntimeRevocationImmutableSourceProof(
+          conn,
+          preflight,
+          "FOR SHARE",
+        );
+        const terminal = await this.loadTenantRuntimeRevocationJob(
+          conn,
+          authorization.tenantId,
+          authorization.requestId,
+          "FOR UPDATE",
+        );
+        if (!terminal || terminal.phase !== "configured_fleet_quiesced") {
+          throw new TenantErasureIntegrityError();
+        }
+        const targets = await this.loadTenantRuntimeRevocationTargetReceipts(
+          conn,
+          terminal.tenantId,
+          terminal.requestId,
+          "FOR SHARE",
+        );
+        const receipt = await this.loadTenantRuntimeRevocationReceipt(
+          conn,
+          terminal.tenantId,
+          terminal.requestId,
+          "FOR SHARE",
+        );
+        if (!receipt) throw new TenantErasureIntegrityError();
+        try {
+          validateTenantRuntimeRevocationCompletionProof(terminal, targets, receipt);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        if (!tenantRuntimeRevocationCompletionMatchesAuthorization(terminal, authorization)) {
+          await conn.commit();
+          return null;
+        }
+        try {
+          validateTenantRuntimeRevocationCompletionReplayProof(
+            terminal,
+            targets,
+            receipt,
+            authorization,
+            proof,
+          );
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        await conn.commit();
+        return receipt;
+      }
+
+      await this.lockAndValidateTenantRuntimeRevocationCurrentSource(conn, preflight);
+      const current = await this.loadTenantRuntimeRevocationJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current) {
+        await conn.commit();
+        return null;
+      }
+      if (
+        current.subjectGeneration !== preflight.subjectGeneration
+        || current.t1FenceSha256 !== preflight.t1FenceSha256
+        || current.t3aReceiptSha256 !== preflight.t3aReceiptSha256
+      ) throw new TenantErasureIntegrityError();
+
+      // A competing completion may win after the unlocked preflight. The already-acquired live
+      // gate is stronger than needed; still validate and replay only the immutable terminal proof.
+      if (current.phase === "configured_fleet_quiesced") {
+        const targets = await this.loadTenantRuntimeRevocationTargetReceipts(
+          conn,
+          current.tenantId,
+          current.requestId,
+          "FOR SHARE",
+        );
+        const receipt = await this.loadTenantRuntimeRevocationReceipt(
+          conn,
+          current.tenantId,
+          current.requestId,
+          "FOR SHARE",
+        );
+        if (!receipt) throw new TenantErasureIntegrityError();
+        try {
+          validateTenantRuntimeRevocationCompletionProof(current, targets, receipt);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        if (!tenantRuntimeRevocationCompletionMatchesAuthorization(current, authorization)) {
+          await conn.commit();
+          return null;
+        }
+        try {
+          validateTenantRuntimeRevocationCompletionReplayProof(
+            current,
+            targets,
+            receipt,
+            authorization,
+            proof,
+          );
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        await conn.commit();
+        return receipt;
+      }
+      if (current.phase === "blocked") {
+        await conn.commit();
+        return null;
+      }
+
+      const existingTargets = await this.loadTenantRuntimeRevocationTargetReceipts(
+        conn,
+        current.tenantId,
+        current.requestId,
+        "FOR SHARE",
+      );
+      const existingReceipt = await this.loadTenantRuntimeRevocationReceipt(
+        conn,
+        current.tenantId,
+        current.requestId,
+        "FOR SHARE",
+      );
+      if (existingTargets.length !== 0 || existingReceipt) {
+        throw new TenantErasureIntegrityError();
+      }
+      // Existing proof ranges are the last rows that can make this transaction wait. Read the
+      // database clock only after they and the queue authority are locked, so an expired worker
+      // cannot commit merely because it began waiting while its lease was still live.
+      const finalNow = await this.databaseNow(conn);
+      if (!tenantRuntimeRevocationAuthorizationMatches(current, authorization, finalNow)) {
+        await conn.commit();
+        return null;
+      }
+      try {
+        validateTenantRuntimeRevocationFleetProof(proof, current);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+
+      const completionAtMs = Math.max(current.createdAtMs, current.updatedAtMs, finalNow);
+      const completedClaimTokenSha256 = tenantRuntimeRevocationClaimTokenSha256(
+        authorization.claimToken,
+      );
+      const targets = proof.targets.map((local) => tenantRuntimeRevocationTargetReceiptFromLocal(
+        local,
+        current,
+        authorization,
+        proof.fleetSha256,
+      ));
+      const receiptBody: Omit<TenantRuntimeRevocationReceipt, "receiptSha256"> = {
+        scope: TENANT_RUNTIME_REVOCATION_RECEIPT_SCOPE,
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        t1FenceSha256: current.t1FenceSha256,
+        t3aReceiptSha256: current.t3aReceiptSha256,
+        fleetSha256: proof.fleetSha256,
+        targetCount: targets.length,
+        targetReceiptsSha256: proof.targetReceiptsSha256,
+        storeDbTimestampMs: completionAtMs,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256,
+        memoryDisposition: TENANT_RUNTIME_REVOCATION_MEMORY_DISPOSITION,
+        externalDisposition: TENANT_RUNTIME_REVOCATION_EXTERNAL_DISPOSITION,
+        contentPurgeRequired: true,
+      };
+      const receipt: TenantRuntimeRevocationReceipt = {
+        ...receiptBody,
+        receiptSha256: tenantRuntimeRevocationReceiptSha256(receiptBody),
+      };
+      const terminalJob: TenantRuntimeRevocationJobRecord = {
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        t1FenceSha256: current.t1FenceSha256,
+        t3aReceiptSha256: current.t3aReceiptSha256,
+        phase: "configured_fleet_quiesced",
+        attempts: current.attempts,
+        createdAtMs: current.createdAtMs,
+        updatedAtMs: completionAtMs,
+        configuredFleetQuiescedAtMs: completionAtMs,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256,
+      };
+      try {
+        validateTenantRuntimeRevocationCompletionProof(terminalJob, targets, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+
+      for (const target of targets) {
+        await conn.query(
+          `INSERT INTO tenant_runtime_revocation_target_receipts
+             (request_id, target_sha256, tenant_id, subject_generation, scope,
+              runner_id_sha256, boot_id_sha256, t1_fence_sha256, t3a_receipt_sha256,
+              fleet_sha256, cache_entry_count_before, cache_entry_count_after,
+              active_operation_count_before, active_operation_count_after,
+              active_turn_count_before, active_turn_count_after, runner_completed_at_ms,
+              local_receipt_sha256, completed_claim_attempt,
+              completed_claim_token_sha256, evidence_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            target.requestId,
+            target.targetSha256,
+            target.tenantId,
+            target.subjectGeneration,
+            target.scope,
+            target.runnerIdSha256,
+            target.bootIdSha256,
+            target.t1FenceSha256,
+            target.t3aReceiptSha256,
+            target.fleetSha256,
+            target.cacheEntryCountBefore,
+            target.cacheEntryCountAfter,
+            target.activeOperationCountBefore,
+            target.activeOperationCountAfter,
+            target.activeTurnCountBefore,
+            target.activeTurnCountAfter,
+            target.runnerCompletedAtMs,
+            target.localReceiptSha256,
+            target.completedClaimAttempt,
+            target.completedClaimTokenSha256,
+            target.evidenceSha256,
+          ],
+        );
+      }
+      await conn.query(
+        `INSERT INTO tenant_runtime_revocation_receipts
+           (request_id, tenant_id, subject_generation, scope, t1_fence_sha256,
+            t3a_receipt_sha256, fleet_sha256, target_count, target_receipts_sha256,
+            store_db_timestamp_ms, completed_claim_attempt,
+            completed_claim_token_sha256, memory_disposition, external_disposition,
+            content_purge_required, receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          receipt.requestId,
+          receipt.tenantId,
+          receipt.subjectGeneration,
+          receipt.scope,
+          receipt.t1FenceSha256,
+          receipt.t3aReceiptSha256,
+          receipt.fleetSha256,
+          receipt.targetCount,
+          receipt.targetReceiptsSha256,
+          receipt.storeDbTimestampMs,
+          receipt.completedClaimAttempt,
+          receipt.completedClaimTokenSha256,
+          receipt.memoryDisposition,
+          receipt.externalDisposition,
+          receipt.contentPurgeRequired,
+          receipt.receiptSha256,
+        ],
+      );
+      const [completed] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_runtime_revocation_jobs
+            SET phase='configured_fleet_quiesced', available_at_ms=NULL,
+                claim_token=NULL, lease_until_ms=NULL, last_error_code=NULL,
+                updated_at_ms=?, configured_fleet_quiesced_at_ms=?,
+                completed_claim_attempt=?, completed_claim_token_sha256=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          completionAtMs,
+          completionAtMs,
+          authorization.claimAttempt,
+          completedClaimTokenSha256,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          finalNow,
+        ],
+      );
+      if (completed.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      await conn.commit();
+      return receipt;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantRuntimeRevocationJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantRuntimeRevocationJobRecord | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRuntimeRevocationJob(conn, tenantId, requestId);
+      if (!job) return null;
+      await this.validateTenantRuntimeRevocationReadProof(conn, job);
+      return job;
+    });
+  }
+
+  async getTenantRuntimeRevocationTargetReceipts(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantRuntimeRevocationTargetReceipt[]> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRuntimeRevocationJob(conn, tenantId, requestId);
+      if (!job) return [];
+      await this.validateTenantRuntimeRevocationReadProof(conn, job);
+      return this.loadTenantRuntimeRevocationTargetReceipts(conn, tenantId, requestId);
+    });
+  }
+
+  async getTenantRuntimeRevocationReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantRuntimeRevocationReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const receipt = await this.loadTenantRuntimeRevocationReceipt(conn, tenantId, requestId);
+      if (!receipt) return null;
+      const job = await this.loadTenantRuntimeRevocationJob(conn, tenantId, requestId);
+      if (!job) throw new TenantErasureIntegrityError();
+      const proven = await this.validateTenantRuntimeRevocationReadProof(conn, job);
+      if (!proven || proven.receiptSha256 !== receipt.receiptSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      return receipt;
+    });
   }
 
   async getSubjectLifecycle(

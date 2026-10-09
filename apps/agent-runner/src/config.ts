@@ -8,7 +8,7 @@ const Env = z.object({
   RUNNER_PORT: z.coerce.number().int().default(8787),
   RUNNER_HOST: z.string().default("127.0.0.1"),
   /** Must be unique among simultaneously running replicas. Production gets a UUID when omitted. */
-  RUNNER_ID: z.string().trim().min(1).optional(),
+  RUNNER_ID: z.string().trim().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional(),
   /** address other runners/router use to reach this runner */
   RUNNER_ADDR: z.string().trim().min(1).optional(),
   STORE: z.enum(["memory", "mysql"]).default("memory"),
@@ -70,6 +70,22 @@ const Env = z.object({
   TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** T3b private local fence/drain endpoint. Code awareness is advertised even while this is off. */
+  TENANT_RUNTIME_DRAIN_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  /** Embedded durable T3b claimant. It is independent from T3a and content-purge execution. */
+  TENANT_RUNTIME_REVOCATION_WORKER_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  TENANT_RUNTIME_DRAIN_TIMEOUT_MS: z.coerce.number().int().min(100).max(60_000).default(10_000),
+  TENANT_RUNTIME_REVOCATION_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(100).max(120_000).default(30_000),
+  TENANT_RUNTIME_REVOCATION_WORKER_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_RUNTIME_REVOCATION_WORKER_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+  TENANT_RUNTIME_REVOCATION_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(5),
+  TENANT_RUNTIME_REVOCATION_MATERIALIZE_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
+  TENANT_RUNTIME_REVOCATION_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_RUNTIME_REVOCATION_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** Bounded runner-to-router fleet check performed immediately before each tenant admission. */
   TENANT_ERASURE_BARRIER_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(2_000),
   /** Canonical policy/legal-hold admin surface. This never enables destructive purge. */
@@ -203,6 +219,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   }
   const c = Env.parse(env);
   const production = c.NODE_ENV === "production";
+  if (c.TENANT_RUNTIME_DRAIN_ENABLED && !c.RUNNER_ID) {
+    throw new Error(
+      "RUNNER_ID is required when TENANT_RUNTIME_DRAIN_ENABLED=1 so the configured fleet slot "
+        + "keeps one stable logical identity across process boots",
+    );
+  }
   if (production && c.BOOTSTRAP_API_KEY) {
     throw new Error("BOOTSTRAP_API_KEY must not be set when NODE_ENV=production: seed tenants through an admin path instead");
   }
@@ -282,6 +304,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.PURGE_POLICY_EVALUATOR_ENABLED
       || c.TENANT_ERASURE_REQUESTS_ENABLED
       || c.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED
+      || c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED
     )
     && erasureRouterUrl === undefined
   ) {
@@ -289,7 +312,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       "ERASURE_ROUTER_URL is required when ERASURE_WORKER_ENABLED=1 or "
         + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1, PURGE_POLICY_EVALUATOR_ENABLED=1, "
         + "TENANT_ERASURE_REQUESTS_ENABLED=1, or "
-        + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1",
+        + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1, or "
+        + "TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=1",
+    );
+  }
+  if (c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED && !c.TENANT_RUNTIME_DRAIN_ENABLED) {
+    throw new Error(
+      "TENANT_RUNTIME_DRAIN_ENABLED=1 is required before "
+        + "TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=1",
+    );
+  }
+  if (
+    c.TENANT_RUNTIME_REVOCATION_REQUEST_TIMEOUT_MS
+      <= c.TENANT_RUNTIME_DRAIN_TIMEOUT_MS + ERASURE_REQUEST_TIMEOUT_MARGIN_MS
+  ) {
+    throw new Error(
+      "TENANT_RUNTIME_REVOCATION_REQUEST_TIMEOUT_MS must be greater than "
+        + `TENANT_RUNTIME_DRAIN_TIMEOUT_MS + ${ERASURE_REQUEST_TIMEOUT_MARGIN_MS}ms`,
+    );
+  }
+  if (
+    c.TENANT_RUNTIME_REVOCATION_RETRY_MAX_MS
+      < c.TENANT_RUNTIME_REVOCATION_RETRY_BASE_MS
+  ) {
+    throw new Error(
+      "TENANT_RUNTIME_REVOCATION_RETRY_MAX_MS must be at least "
+        + "TENANT_RUNTIME_REVOCATION_RETRY_BASE_MS",
     );
   }
   if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.ERASURE_WORKER_ENABLED) {

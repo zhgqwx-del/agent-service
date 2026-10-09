@@ -14,6 +14,7 @@ describe("router configuration", () => {
     expect(local.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(local.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
     expect(local.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED).toBe(false);
+    expect(local.TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED).toBe(false);
     expect(local.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
     expect(local.dataExportArtifactsReadable).toBe(false);
     expect(local.BLOB_MAX_BYTES).toBe(1_000_000);
@@ -67,6 +68,14 @@ describe("router configuration", () => {
     expect(() => loadRouterConfig({
       RUNNERS: "http://runner:8787",
       TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: "true",
+    })).toThrow();
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED: "1",
+    }).TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED).toBe(true);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED: "true",
     })).toThrow();
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",
@@ -199,5 +208,11 @@ describe("router configuration", () => {
     expect(() => loadRouterConfig({ RUNNERS: "runner:8787" })).toThrow(/absolute http/);
     expect(() => loadRouterConfig({ RUNNERS: "http://user:secret@runner:8787" })).toThrow(/must not contain credentials/);
     expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787/path" })).toThrow(/must not contain credentials/);
+    expect(loadRouterConfig({
+      RUNNERS: "HTTP://RUNNER-A:80/,http://runner-a",
+    }).runnerList).toEqual(["http://runner-a"]);
+    expect(() => loadRouterConfig({
+      RUNNERS: Array.from({ length: 101 }, (_, index) => `http://runner-${index}`).join(","),
+    })).toThrow(/at most 100/);
   });
 });

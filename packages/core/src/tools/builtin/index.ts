@@ -79,7 +79,12 @@ export const webFetchTool: RunnerTool = {
       return { content: [{ type: "text", text: `blocked: ${(err as Error).message}` }], isError: true };
     }
     const res = await fetch(u, { signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(15_000)]), redirect: "manual", headers: { "user-agent": "agent-runner/0.1" } });
-    if (res.status >= 300 && res.status < 400) return { content: [{ type: "text", text: `redirect to ${res.headers.get("location")} not followed` }], isError: true };
+    if (res.status >= 300 && res.status < 400) {
+      // Even a manual redirect may carry a response body/socket. Settle it before the tool (and
+      // therefore the tenant turn lease) completes so runtime quiescence cannot miss live I/O.
+      await res.body?.cancel().catch(() => {});
+      return { content: [{ type: "text", text: `redirect to ${res.headers.get("location")} not followed` }], isError: true };
+    }
     const raw = await readCapped(res, 256 * 1024);
     const text = raw.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 64 * 1024);
     return { content: [{ type: "text", text: `HTTP ${res.status}\n${text}` }], isError: !res.ok };

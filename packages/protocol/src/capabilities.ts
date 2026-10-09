@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { externalId, UserId } from "./common.js";
 import { ErasureRequestId } from "./lifecycle.js";
@@ -99,6 +100,262 @@ export const INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER =
 export const INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE =
   "credential-revocation-v1" as const;
 
+/**
+ * T3b is a fleet operation rather than an owner-routed request. A claimant calls the router path,
+ * the router takes a fresh identity snapshot from every exact configured runner URL, then invokes
+ * the runner path once per snapshot member. The private ready route binds a stable logical runner
+ * id to a single process boot without publishing either value through public capabilities.
+ */
+export const INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH =
+  "/v1/_internal/tenant-runtime-drain-v1/ready" as const;
+export const INTERNAL_TENANT_RUNTIME_DRAIN_ROUTER_PATH =
+  "/_internal/tenant-runtime-drain-v1/execute" as const;
+export const INTERNAL_TENANT_RUNTIME_DRAIN_RUNNER_PATH =
+  "/v1/_internal/tenant-runtime-drain-v1/execute" as const;
+export const INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER =
+  "x-agent-service-tenant-runtime-drain" as const;
+export const INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE = "runtime-drain-v1" as const;
+
+export const TENANT_RUNTIME_DRAIN_V1 = "runtime-drain-v1" as const;
+export const TenantRuntimeDrainCapability = z.literal(TENANT_RUNTIME_DRAIN_V1);
+export type TenantRuntimeDrainCapability = z.infer<typeof TenantRuntimeDrainCapability>;
+
+const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
+const RuntimeIdentity = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
+const SafeNonnegativeInteger = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const SafePositiveInteger = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+
+export const TenantRuntimeDrainReady = z.object({
+  protocolVersion: z.literal(PROTOCOL_VERSION),
+  service: z.literal("agent-runner"),
+  capability: z.literal(TENANT_RUNTIME_DRAIN_V1),
+  endpointEnabled: z.literal(true),
+  runnerId: RuntimeIdentity,
+  bootId: RuntimeIdentity,
+}).strict();
+export type TenantRuntimeDrainReady = z.infer<typeof TenantRuntimeDrainReady>;
+
+/** Content-free durable authority copied from the already-completed T3a receipt. */
+export const TenantRuntimeDrainRequest = z.object({
+  requestId: ErasureRequestId,
+  tenantId: externalId,
+  subjectGeneration: SafePositiveInteger,
+  t3aReceiptSha256: Sha256,
+}).strict();
+export type TenantRuntimeDrainRequest = z.infer<typeof TenantRuntimeDrainRequest>;
+
+/** Router-added snapshot binding. A restarted or misrouted runner must reject this request. */
+export const TenantRuntimeDrainRunnerRequest = TenantRuntimeDrainRequest.extend({
+  targetSha256: Sha256,
+  expectedRunnerId: RuntimeIdentity,
+  expectedBootId: RuntimeIdentity,
+}).strict();
+export type TenantRuntimeDrainRunnerRequest = z.infer<typeof TenantRuntimeDrainRunnerRequest>;
+
+const TenantRuntimeRevocationLocalReceiptFields = z.object({
+  targetSha256: Sha256,
+  runnerId: RuntimeIdentity,
+  bootId: RuntimeIdentity,
+  requestId: ErasureRequestId,
+  tenantId: externalId,
+  subjectGeneration: SafePositiveInteger,
+  t3aReceiptSha256: Sha256,
+  cacheEntryCountBefore: SafeNonnegativeInteger,
+  cacheEntryCountAfter: z.literal(0),
+  activeOperationCountBefore: SafeNonnegativeInteger,
+  activeOperationCountAfter: z.literal(0),
+  activeTurnCountBefore: SafeNonnegativeInteger,
+  activeTurnCountAfter: z.literal(0),
+  completedAtMs: SafeNonnegativeInteger,
+}).strict();
+export const TenantRuntimeRevocationLocalReceiptBody =
+  TenantRuntimeRevocationLocalReceiptFields;
+export type TenantRuntimeRevocationLocalReceiptBody = z.infer<
+  typeof TenantRuntimeRevocationLocalReceiptBody
+>;
+
+function sha256(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+/**
+ * Canonicalize a configured base URL before committing it to fleet evidence. Default ports,
+ * hostname/protocol case and a trailing slash therefore cannot create two identities for one
+ * destination. Paths, credentials, query parameters and fragments are never accepted.
+ */
+export function canonicalTenantRuntimeTargetUrl(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("tenant runtime target must be an absolute http(s) base URL");
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    || !parsed.hostname
+    || parsed.username
+    || parsed.password
+    || (parsed.pathname && parsed.pathname !== "/")
+    || parsed.search
+    || parsed.hash
+  ) throw new Error("tenant runtime target must be a credential-free http(s) origin");
+  return parsed.origin;
+}
+
+export function tenantRuntimeTargetSha256(baseUrl: string): string {
+  return sha256(["tenant-runtime-target-v1", canonicalTenantRuntimeTargetUrl(baseUrl)]);
+}
+
+export function tenantRuntimeLocalReceiptSha256(
+  receipt: TenantRuntimeRevocationLocalReceiptBody,
+): string {
+  // Project the explicit evidence fields before strict validation. A full receipt legitimately
+  // carries `receiptSha256`; hashing must neither include it nor reject that validated superset.
+  const value = TenantRuntimeRevocationLocalReceiptBody.parse({
+    targetSha256: receipt.targetSha256,
+    runnerId: receipt.runnerId,
+    bootId: receipt.bootId,
+    requestId: receipt.requestId,
+    tenantId: receipt.tenantId,
+    subjectGeneration: receipt.subjectGeneration,
+    t3aReceiptSha256: receipt.t3aReceiptSha256,
+    cacheEntryCountBefore: receipt.cacheEntryCountBefore,
+    cacheEntryCountAfter: receipt.cacheEntryCountAfter,
+    activeOperationCountBefore: receipt.activeOperationCountBefore,
+    activeOperationCountAfter: receipt.activeOperationCountAfter,
+    activeTurnCountBefore: receipt.activeTurnCountBefore,
+    activeTurnCountAfter: receipt.activeTurnCountAfter,
+    completedAtMs: receipt.completedAtMs,
+  });
+  return sha256([
+    "tenant-runtime-local-receipt-v1",
+    value.targetSha256,
+    value.runnerId,
+    value.bootId,
+    value.requestId,
+    value.tenantId,
+    value.subjectGeneration,
+    value.t3aReceiptSha256,
+    value.cacheEntryCountBefore,
+    value.cacheEntryCountAfter,
+    value.activeOperationCountBefore,
+    value.activeOperationCountAfter,
+    value.activeTurnCountBefore,
+    value.activeTurnCountAfter,
+    value.completedAtMs,
+  ]);
+}
+
+export const TenantRuntimeRevocationLocalReceipt =
+  TenantRuntimeRevocationLocalReceiptFields.extend({ receiptSha256: Sha256 })
+    .strict()
+    .superRefine((receipt, ctx) => {
+      if (receipt.receiptSha256 !== tenantRuntimeLocalReceiptSha256(receipt)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["receiptSha256"],
+          message: "tenant runtime local receipt hash does not match its evidence",
+        });
+      }
+    });
+export type TenantRuntimeRevocationLocalReceipt = z.infer<
+  typeof TenantRuntimeRevocationLocalReceipt
+>;
+
+function canonicalTenantRuntimeReceipts(
+  receipts: readonly TenantRuntimeRevocationLocalReceipt[],
+): TenantRuntimeRevocationLocalReceipt[] {
+  return [...receipts].sort((left, right) => (
+    left.targetSha256.localeCompare(right.targetSha256, "en")
+  ));
+}
+
+export function tenantRuntimeFleetSha256(
+  targets: readonly Pick<TenantRuntimeRevocationLocalReceipt, "targetSha256">[],
+): string {
+  const sorted = [...targets]
+    .map((target) => Sha256.parse(target.targetSha256))
+    .sort((left, right) => left.localeCompare(right, "en"));
+  return sha256(["tenant-runtime-fleet-v1", sorted]);
+}
+
+export function tenantRuntimeTargetReceiptsSha256(
+  receipts: readonly Pick<
+    TenantRuntimeRevocationLocalReceipt,
+    "targetSha256" | "receiptSha256"
+  >[],
+): string {
+  const sorted = [...receipts]
+    .map((receipt) => [
+      Sha256.parse(receipt.targetSha256),
+      Sha256.parse(receipt.receiptSha256),
+    ] as const)
+    .sort(([left], [right]) => left.localeCompare(right, "en"));
+  return sha256(["tenant-runtime-target-receipts-v1", sorted]);
+}
+
+export const TenantRuntimeRevocationFleetProof = z.object({
+  fleetSha256: Sha256,
+  targetReceiptsSha256: Sha256,
+  targets: z.array(TenantRuntimeRevocationLocalReceipt).min(1).max(100),
+}).strict().superRefine((proof, ctx) => {
+  const canonical = canonicalTenantRuntimeReceipts(proof.targets);
+  const source = proof.targets[0];
+  const uniqueTargets = new Set(proof.targets.map((receipt) => receipt.targetSha256));
+  const uniqueRunners = new Set(proof.targets.map((receipt) => receipt.runnerId));
+  const uniqueBoots = new Set(proof.targets.map((receipt) => receipt.bootId));
+  if (
+    uniqueTargets.size !== proof.targets.length
+    || uniqueRunners.size !== proof.targets.length
+    || uniqueBoots.size !== proof.targets.length
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["targets"],
+      message: "tenant runtime fleet identities must be unique",
+    });
+  }
+  if (source && proof.targets.some((receipt) => (
+    receipt.requestId !== source.requestId
+    || receipt.tenantId !== source.tenantId
+    || receipt.subjectGeneration !== source.subjectGeneration
+    || receipt.t3aReceiptSha256 !== source.t3aReceiptSha256
+  ))) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["targets"],
+      message: "tenant runtime fleet receipts must share one durable source",
+    });
+  }
+  if (proof.targets.some((receipt, index) => receipt !== canonical[index])) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["targets"],
+      message: "tenant runtime fleet receipts must be sorted by targetSha256",
+    });
+  }
+  if (proof.fleetSha256 !== tenantRuntimeFleetSha256(proof.targets)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["fleetSha256"],
+      message: "tenant runtime fleet hash does not match its targets",
+    });
+  }
+  if (
+    proof.targetReceiptsSha256
+    !== tenantRuntimeTargetReceiptsSha256(proof.targets)
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["targetReceiptsSha256"],
+      message: "tenant runtime receipt root does not match its targets",
+    });
+  }
+});
+export type TenantRuntimeRevocationFleetProof = z.infer<
+  typeof TenantRuntimeRevocationFleetProof
+>;
+
 export const TENANT_ERASURE_PLATFORM_CONTROL_V1 = "platform-control-v1" as const;
 export const TenantErasureControlCapability = z.literal(TENANT_ERASURE_PLATFORM_CONTROL_V1);
 export type TenantErasureControlCapability = z.infer<typeof TenantErasureControlCapability>;
@@ -193,6 +450,10 @@ export const Capabilities = z.object({
     tenantCredentialRevocation: z.array(TenantCredentialRevocationCapability).max(1).default([]),
     /** Local worker activation; fleet execution additionally requires the router's fresh barrier. */
     tenantCredentialRevocationWorker: z.boolean().default(false),
+    /** Code understands the private all-configured runtime-drain receipt contract. */
+    tenantRuntimeDrain: z.array(TenantRuntimeDrainCapability).max(1).default([]),
+    /** Local private endpoint is active; the router still performs a fresh identity probe. */
+    tenantRuntimeDrainEndpoint: z.boolean().default(false),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

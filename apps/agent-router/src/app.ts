@@ -23,6 +23,11 @@ import {
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
+  INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ROUTER_PATH,
+  INTERNAL_TENANT_RUNTIME_DRAIN_RUNNER_PATH,
   INTERNAL_TENANT_ERASURE_ACTOR_HEADER,
   INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
   INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
@@ -44,9 +49,15 @@ import {
   TenantErasureRequestHeaders,
   TenantErasureRequestParams,
   TenantErasureRequestQuery,
+  TenantRuntimeDrainRequest,
+  TenantRuntimeDrainRunnerRequest,
+  TenantRuntimeRevocationFleetProof,
+  TenantRuntimeRevocationLocalReceipt,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   UserErasureDrainRequest,
   isCanonicalId,
+  tenantRuntimeFleetSha256,
+  tenantRuntimeTargetReceiptsSha256,
 } from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
 
@@ -82,12 +93,16 @@ export interface RouterAppDeps {
   purgePolicyEvaluatorEnabled?: () => boolean;
   /** Independent activation gate for tenant credential-store revocation queue claims. */
   tenantCredentialRevocationExecutionEnabled?: () => boolean;
+  /** Independent all-configured broadcast gate for T3b runtime drain. */
+  tenantRuntimeDrainExecutionEnabled?: () => boolean;
   /** Read/download surface for the configured artifact backend. Filesystem stays local-only. */
   dataExportArtifactsEnabled?: () => boolean;
   /** Additive fleet admission gate; status/download remain available while it is closed. */
   dataExportRequestsEnabled?: () => boolean;
   /** Shared runner-internal credential. Omission keeps destructive routing disabled. */
   internalRunnerToken?: string;
+  /** Injectable transport for the all-configured T3b broadcast. */
+  fetchImpl?: typeof globalThis.fetch;
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -129,6 +144,7 @@ const STRIP_RESPONSE = new Set([
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
@@ -151,6 +167,8 @@ const DATA_GOVERNANCE_MANAGEMENT = /^\/v1\/(?:retention-policies|legal-holds)(?:
 const USER_SCOPED_RUNTIME = /^\/v1\/(?:sessions(?:\/|$)|usage\/?$|data-erasure-requests(?:\/|$)|data-export-requests(?:\/|$))/;
 const INTERNAL_ERASURE_BODY_MAX_BYTES = 4_096;
 const TENANT_ERASURE_RESPONSE_MAX_BYTES = 4_096;
+const TENANT_RUNTIME_DRAIN_BODY_MAX_BYTES = 4_096;
+const TENANT_RUNTIME_DRAIN_RESPONSE_MAX_BYTES = 8_192;
 
 function internalTokenMatches(received: string | undefined, expected: string | undefined): boolean {
   const left = createHash("sha256").update(received ?? "").digest();
@@ -217,6 +235,7 @@ export function createRouterApp(deps: RouterAppDeps) {
   const app = new Hono();
   const log = deps.logger ?? console;
   const maxAttempts = deps.maxAttempts ?? 2;
+  const fetchRuntimeTarget = deps.fetchImpl ?? globalThis.fetch;
   const maxBodyBytes = deps.maxBodyBytes ?? 1_000_000;
   const maxBlobBytes = deps.maxBlobBytes ?? 1_000_000;
   const tombstoneAvailable = () => (
@@ -481,6 +500,10 @@ export function createRouterApp(deps: RouterAppDeps) {
                     : [],
                 tenantCredentialRevocationWorker:
                   tenantCredentialRevocationExecutionAvailable(),
+                // Per-instance runtime identity and activation are private rollout state. The
+                // worker consumes the token-protected fleet proof route instead.
+                tenantRuntimeDrain: [],
+                tenantRuntimeDrainEndpoint: false,
               },
             } satisfies Capabilities);
           }
@@ -550,6 +573,165 @@ export function createRouterApp(deps: RouterAppDeps) {
     );
     return c.body(null, 204);
   });
+
+  /**
+   * T3b is broadcast to the exact all-configured fleet. It must never reuse session ownership,
+   * consistent hashing, sticky compatibility or the healthy subset. A fresh private identity
+   * snapshot is taken on both sides of the fanout so a boot change cannot produce a fleet proof.
+   */
+  app.post(INTERNAL_TENANT_RUNTIME_DRAIN_ROUTER_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      await c.req.raw.body?.cancel().catch(() => {});
+      return internalNotFound(c);
+    }
+    if (!(deps.tenantRuntimeDrainExecutionEnabled?.() ?? false)) {
+      await c.req.raw.body?.cancel().catch(() => {});
+      return c.body(null, 503);
+    }
+
+    const declaredLength = Number(c.req.header("content-length") ?? "0");
+    if (
+      !Number.isSafeInteger(declaredLength)
+      || declaredLength < 0
+      || declaredLength > TENANT_RUNTIME_DRAIN_BODY_MAX_BYTES
+    ) {
+      await c.req.raw.body?.cancel().catch(() => {});
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    const read = await readCapped(c.req.raw.body, TENANT_RUNTIME_DRAIN_BODY_MAX_BYTES);
+    if (!read.ok) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder().decode(read.bytes));
+    } catch {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    const authority = TenantRuntimeDrainRequest.safeParse(raw);
+    if (!authority.success) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+
+    try {
+      const before = await deps.registry.freshTenantRuntimeDrainSnapshot();
+      const receipts = await Promise.all(before.targets.map(async (target) => {
+        const input = TenantRuntimeDrainRunnerRequest.parse({
+          ...authority.data,
+          targetSha256: target.targetSha256,
+          expectedRunnerId: target.runnerId,
+          expectedBootId: target.bootId,
+        });
+        const response = await fetchRuntimeTarget(`${target.url}${INTERNAL_TENANT_RUNTIME_DRAIN_RUNNER_PATH}`, {
+          method: "POST",
+          redirect: "manual",
+          headers: {
+            "content-type": "application/json",
+            [INTERNAL_ROUTER_TOKEN_HEADER]: deps.internalRunnerToken!,
+          },
+          body: JSON.stringify(input),
+          signal: AbortSignal.timeout(deps.upstreamHeaderTimeoutMs ?? 15_000),
+        });
+        if (
+          response.status !== 200
+          || response.headers.get(INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER)
+            !== INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE
+          || !response.headers.get("cache-control")?.split(",").some((value) => (
+            value.trim().toLowerCase() === "no-store"
+          ))
+        ) {
+          await response.body?.cancel().catch(() => {});
+          throw new Error("tenant runtime target did not acknowledge drain");
+        }
+        const responseBody = await readCapped(
+          response.body,
+          TENANT_RUNTIME_DRAIN_RESPONSE_MAX_BYTES,
+        );
+        if (!responseBody.ok) throw new Error("tenant runtime target response is too large");
+        let receiptPayload: unknown;
+        try {
+          receiptPayload = JSON.parse(new TextDecoder().decode(responseBody.bytes));
+        } catch {
+          throw new Error("tenant runtime target response is malformed");
+        }
+        const receipt = TenantRuntimeRevocationLocalReceipt.safeParse(receiptPayload);
+        if (
+          !receipt.success
+          || receipt.data.targetSha256 !== target.targetSha256
+          || receipt.data.runnerId !== target.runnerId
+          || receipt.data.bootId !== target.bootId
+          || receipt.data.requestId !== authority.data.requestId
+          || receipt.data.tenantId !== authority.data.tenantId
+          || receipt.data.subjectGeneration !== authority.data.subjectGeneration
+          || receipt.data.t3aReceiptSha256 !== authority.data.t3aReceiptSha256
+        ) throw new Error("tenant runtime target receipt is not bound to the fleet request");
+        return receipt.data;
+      }));
+
+      const after = await deps.registry.freshTenantRuntimeDrainSnapshot();
+      if (
+        before.fleetSha256 !== after.fleetSha256
+        || before.targets.length !== after.targets.length
+        || before.targets.some((target, index) => {
+          const current = after.targets[index];
+          return !current
+            || current.url !== target.url
+            || current.targetSha256 !== target.targetSha256
+            || current.runnerId !== target.runnerId
+            || current.bootId !== target.bootId;
+        })
+      ) throw new Error("tenant runtime fleet changed during drain");
+
+      const targets = receipts.sort((left, right) => (
+        left.targetSha256 < right.targetSha256
+          ? -1
+          : left.targetSha256 > right.targetSha256
+            ? 1
+            : 0
+      ));
+      const proof = TenantRuntimeRevocationFleetProof.parse({
+        fleetSha256: tenantRuntimeFleetSha256(targets),
+        targetReceiptsSha256: tenantRuntimeTargetReceiptsSha256(targets),
+        targets,
+      });
+      c.header(INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER, INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE);
+      return c.json(proof, 200);
+    } catch {
+      return c.json({
+        error: {
+          code: "draining",
+          message: "tenant runtime drain is unavailable across the configured fleet",
+          retryable: true,
+        },
+      }, 503);
+    }
+  });
+  // Reserve every unsupported method and nested variant so it cannot fall through to the generic
+  // proxy and accidentally become an owner-routed or public operation.
+  app.all(INTERNAL_TENANT_RUNTIME_DRAIN_ROUTER_PATH, (c) => {
+    privateInternalHeaders(c);
+    return internalNotFound(c);
+  });
+  app.all(`${INTERNAL_TENANT_RUNTIME_DRAIN_ROUTER_PATH}/*`, (c) => {
+    privateInternalHeaders(c);
+    return internalNotFound(c);
+  });
+  // Runner-private paths must never fall through to the ordinary proxy, even though that proxy
+  // also strips the internal token. The router control plane has one, distinct execution path.
+  for (const path of [
+    INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
+    INTERNAL_TENANT_RUNTIME_DRAIN_RUNNER_PATH,
+  ]) {
+    app.all(path, (c) => {
+      privateInternalHeaders(c);
+      return internalNotFound(c);
+    });
+    app.all(`${path}/*`, (c) => {
+      privateInternalHeaders(c);
+      return internalNotFound(c);
+    });
+  }
 
   /**
    * A runner must acquire this fresh, content-free ACK immediately before committing an

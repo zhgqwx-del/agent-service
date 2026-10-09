@@ -26,6 +26,10 @@ export class DynamicToolBridge {
       readOnly: false,
       execute: (_args, ctx) =>
         new Promise<ToolResult>((resolve) => {
+          if (ctx.signal.aborted) {
+            resolve({ content: [{ type: "text", text: "aborted" }], isError: true });
+            return;
+          }
           const key = this.key(ctx.sessionId, ctx.toolCallId);
           const timer = setTimeout(() => {
             this.pending.delete(key);

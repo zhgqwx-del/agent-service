@@ -7,6 +7,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadRouterConfig(env);
   const registry = new RunnerRegistry({
     runners: cfg.runnerList,
+    internalRouterToken: cfg.INTERNAL_ROUTER_TOKEN,
     redisUrl: cfg.REDIS_URL,
     healthIntervalMs: cfg.HEALTH_INTERVAL_MS,
   });
@@ -33,6 +34,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     tenantCredentialRevocationExecutionEnabled: () => (
       cfg.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED
     ),
+    tenantRuntimeDrainExecutionEnabled: () => cfg.TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED,
     dataExportArtifactsEnabled: () => cfg.dataExportArtifactsReadable,
     dataExportRequestsEnabled: () => cfg.DATA_EXPORT_REQUESTS_ENABLED,
   });
@@ -51,7 +53,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   };
   process.once("SIGTERM", () => void shutdown());
   process.once("SIGINT", () => void shutdown());
-  console.log(`[router] listening on http://${cfg.ROUTER_HOST}:${cfg.ROUTER_PORT} → ${cfg.runnerList.join(", ")} directory=${cfg.REDIS_URL ? "redis" : "hash-only"} tombstone=${cfg.SESSION_TOMBSTONE_ENABLED ? "enabled" : "gated"} blobs=${cfg.BLOB_ATTACHMENTS_ENABLED ? "enabled" : "gated"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantCredentialRevocation=${cfg.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED ? "enabled" : "gated"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "enabled" : "gated"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"}`);
+  console.log(`[router] listening on http://${cfg.ROUTER_HOST}:${cfg.ROUTER_PORT} → ${cfg.runnerList.join(", ")} directory=${cfg.REDIS_URL ? "redis" : "hash-only"} tombstone=${cfg.SESSION_TOMBSTONE_ENABLED ? "enabled" : "gated"} blobs=${cfg.BLOB_ATTACHMENTS_ENABLED ? "enabled" : "gated"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantCredentialRevocation=${cfg.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED ? "enabled" : "gated"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED ? "enabled" : "gated"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "enabled" : "gated"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"}`);
   return { app, server, registry, cfg, close: shutdown };
 }
 

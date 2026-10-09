@@ -24,6 +24,12 @@ describe("runner configuration", () => {
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED).toBe(false);
+    expect(cfg.TENANT_RUNTIME_DRAIN_ENABLED).toBe(false);
+    expect(cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED).toBe(false);
+    expect(cfg.TENANT_RUNTIME_DRAIN_TIMEOUT_MS).toBe(10_000);
+    expect(cfg.TENANT_RUNTIME_REVOCATION_REQUEST_TIMEOUT_MS).toBe(30_000);
+    expect(cfg.TENANT_RUNTIME_REVOCATION_WORKER_BATCH_SIZE).toBe(5);
+    expect(cfg.TENANT_RUNTIME_REVOCATION_MATERIALIZE_BATCH_SIZE).toBe(25);
     expect(cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS).toBe(2_000);
     expect(cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
@@ -187,6 +193,65 @@ describe("runner configuration", () => {
     expect(() => loadConfig({
       SECRETS_MASTER_KEY: SECRET,
       TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: "true",
+    })).toThrow();
+  });
+
+  it("separates the T3b local endpoint from its embedded claimant and validates their bounds", () => {
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_RUNTIME_DRAIN_ENABLED: "1",
+    })).toThrow(/RUNNER_ID is required/);
+    const endpointOnly = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_RUNTIME_DRAIN_ENABLED: "1",
+      RUNNER_ID: "runner-local-a",
+    });
+    expect(endpointOnly.TENANT_RUNTIME_DRAIN_ENABLED).toBe(true);
+    expect(endpointOnly.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED).toBe(false);
+    expect(endpointOnly.ERASURE_ROUTER_URL).toBeUndefined();
+
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_RUNTIME_REVOCATION_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "https://router.internal:8443",
+    })).toThrow(/TENANT_RUNTIME_DRAIN_ENABLED=1 is required/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_RUNTIME_DRAIN_ENABLED: "1",
+      TENANT_RUNTIME_REVOCATION_WORKER_ENABLED: "1",
+      RUNNER_ID: "runner-local-a",
+    })).toThrow(/ERASURE_ROUTER_URL is required/);
+
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_RUNTIME_DRAIN_ENABLED: "1",
+      RUNNER_ID: "runner-local-a",
+      TENANT_RUNTIME_REVOCATION_WORKER_ENABLED: "1",
+      TENANT_RUNTIME_DRAIN_TIMEOUT_MS: "1000",
+      TENANT_RUNTIME_REVOCATION_REQUEST_TIMEOUT_MS: "2500",
+      TENANT_RUNTIME_REVOCATION_WORKER_BATCH_SIZE: "7",
+      TENANT_RUNTIME_REVOCATION_MATERIALIZE_BATCH_SIZE: "11",
+      ERASURE_ROUTER_URL: "https://router.internal:8443/",
+    });
+    expect(enabled.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED).toBe(true);
+    expect(enabled.TENANT_RUNTIME_REVOCATION_WORKER_BATCH_SIZE).toBe(7);
+    expect(enabled.TENANT_RUNTIME_REVOCATION_MATERIALIZE_BATCH_SIZE).toBe(11);
+    expect(enabled.ERASURE_ROUTER_URL).toBe("https://router.internal:8443");
+
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_RUNTIME_DRAIN_TIMEOUT_MS: "1000",
+      TENANT_RUNTIME_REVOCATION_REQUEST_TIMEOUT_MS: "2000",
+    })).toThrow(/TENANT_RUNTIME_REVOCATION_REQUEST_TIMEOUT_MS/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_RUNTIME_REVOCATION_RETRY_BASE_MS: "2",
+      TENANT_RUNTIME_REVOCATION_RETRY_MAX_MS: "1",
+    })).toThrow(/TENANT_RUNTIME_REVOCATION_RETRY_MAX_MS/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_RUNTIME_DRAIN_ENABLED: "true",
+      RUNNER_ID: "runner-local-a",
     })).toThrow();
   });
 
@@ -409,6 +474,7 @@ describe("runner configuration", () => {
 
   it("preserves an explicitly assigned production identity", () => {
     expect(loadConfig({ ...productionEnv, RUNNER_ID: "runner-a" }).RUNNER_ID).toBe("runner-a");
+    expect(() => loadConfig({ ...productionEnv, RUNNER_ID: "runner a" })).toThrow();
   });
 
   it("requires an explicit advertised address in production", () => {

@@ -15,6 +15,9 @@ import {
   INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
   INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH,
   INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER,
+  INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
+  INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
 } from "@agent-service/protocol";
 
 const mockedServer = vi.hoisted(() => ({
@@ -37,6 +40,7 @@ import {
   ErasureWorker,
   LegacyTombstoneCompensationWorker,
   PurgePolicyEvaluator,
+  TenantRuntimeRevocationWorker,
   UserDataExportCleanupWorker,
   UserDataExportWorker,
 } from "@agent-service/core";
@@ -319,6 +323,60 @@ describe("runner main blob wiring", () => {
       await runner?.close();
       workerStart.mockRestore();
       cleanupStart.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("seals and exposes the boot-bound T3b endpoint before starting its optional claimant", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-runtime-drain-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const start = vi.spyOn(TenantRuntimeRevocationWorker.prototype, "start");
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        RUNNER_ID: "runner-runtime-main",
+        BLOB_DIR: blobDir,
+        TENANT_RUNTIME_DRAIN_ENABLED: "1",
+        TENANT_RUNTIME_REVOCATION_WORKER_ENABLED: "1",
+        TENANT_RUNTIME_REVOCATION_WORKER_POLL_MS: "60000",
+        ERASURE_ROUTER_URL: "http://127.0.0.1:8080",
+        INTERNAL_ROUTER_TOKEN: INTERNAL_TOKEN,
+      });
+      expect(start).toHaveBeenCalledOnce();
+      expect(runner.tenantRuntimeRevocationWorker).toBeInstanceOf(
+        TenantRuntimeRevocationWorker,
+      );
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: {
+          tenantRuntimeDrain: ["runtime-drain-v1"],
+          tenantRuntimeDrainEndpoint: true,
+        },
+      });
+      const ready = await runner.app.request(INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH, {
+        headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      });
+      expect(ready.status).toBe(200);
+      expect(ready.headers.get(INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER)).toBe(
+        INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
+      );
+      expect(await ready.json()).toMatchObject({
+        runnerId: "runner-runtime-main",
+        bootId: runner.tenantRuntimeBootId,
+      });
+
+      const stop = vi.spyOn(runner.tenantRuntimeRevocationWorker!, "stop");
+      const hostDrain = vi.spyOn(runner.host, "drain");
+      await runner.close();
+      expect(stop).toHaveBeenCalledOnce();
+      expect(stop.mock.invocationCallOrder[0]).toBeLessThan(hostDrain.mock.invocationCallOrder[0]!);
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      start.mockRestore();
       log.mockRestore();
       await rm(blobDir, { recursive: true, force: true });
     }

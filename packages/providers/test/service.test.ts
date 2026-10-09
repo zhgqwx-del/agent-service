@@ -6,6 +6,10 @@ import {
   tenantErasureRequestHash,
 } from "@agent-service/store";
 import { DEFAULT_AUTH_POLICY } from "@agent-service/protocol";
+import {
+  TenantRuntimeCoordinator,
+  TenantRuntimeDrainTimeoutError,
+} from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService, assertPublicBaseUrl } from "../src/index.js";
 
 const KEY = "11".repeat(32);
@@ -339,5 +343,147 @@ describe("ProviderService", () => {
       message: "baseUrl must not contain credentials",
     });
     await expect(assertPublicBaseUrl("https://1.1.1.1/v1")).resolves.toBeUndefined();
+  });
+
+  it("drains provider response bodies and removes only the fenced tenant's registrations", async () => {
+    const store = new MemorySessionStore();
+    const runtime = new TenantRuntimeCoordinator();
+    let bodyCancelled = false;
+    const svc = new ProviderService({
+      store,
+      cipher: new LocalAesGcmCipher(KEY),
+      tenantRuntime: runtime,
+      assertBaseUrl,
+      platform: [ProviderService.preset("deepseek", "platform-key")],
+      fetch: async () => new Response(new ReadableStream({
+        pull: () => new Promise<void>(() => {}),
+        cancel: () => { bodyCancelled = true; },
+      }), { status: 200 }),
+    });
+    await svc.upsertTenantProvider("t_drain", {
+      id: "mine", api: "openai-completions", baseUrl: "https://example.com/v1", headers: {}, quota: {}, fallback: [],
+      models: [{ id: "m", contextWindow: 1000, maxOutputTokens: 100, input: ["text"], reasoning: false }],
+      apiKey: "tenant-key",
+    });
+    const tenantModel = await svc.resolve({ tenantId: "t_drain", userId: "u" }, { provider: "mine", model: "m" });
+    const platformModel = await svc.resolve({ tenantId: "another", userId: "u" }, { provider: "deepseek", model: "deepseek-chat" });
+    runtime.sealParticipants();
+    const response = await tenantModel.fetch!("https://provider.example/v1");
+    expect(response.body).not.toBeNull();
+    expect(runtime.snapshot("t_drain")).toMatchObject({ providerRegistrations: 1, providerOperations: 1 });
+
+    const result = await runtime.drain({
+      requestId: "ter_provider_body",
+      tenantId: "t_drain",
+      subjectGeneration: 1,
+      t3aReceiptSha256: "cd".repeat(32),
+    }, 1_000);
+    expect(bodyCancelled).toBe(true);
+    expect(result).toMatchObject({
+      cacheEntryCountBefore: 1,
+      cacheEntryCountAfter: 0,
+      activeOperationCountBefore: 1,
+      activeOperationCountAfter: 0,
+    });
+    expect(svc.models.getModel(tenantModel.provider, tenantModel.model)).toBeUndefined();
+    expect(svc.models.getModel(platformModel.provider, platformModel.model)).toBeDefined();
+    await expect(svc.listVisible("t_drain")).rejects.toBeInstanceOf(SubjectDeletingError);
+  });
+
+  it("waits for a late non-cooperative provider response body to finish cancelling", async () => {
+    const store = new MemorySessionStore();
+    const runtime = new TenantRuntimeCoordinator();
+    let fetchStarted!: () => void;
+    const started = new Promise<void>((resolve) => { fetchStarted = resolve; });
+    let releaseFetch!: () => void;
+    const fetchBlocked = new Promise<void>((resolve) => { releaseFetch = resolve; });
+    let cancelStarted!: () => void;
+    const cancelling = new Promise<void>((resolve) => { cancelStarted = resolve; });
+    let releaseCancel!: () => void;
+    const cancelBlocked = new Promise<void>((resolve) => { releaseCancel = resolve; });
+    const svc = new ProviderService({
+      store,
+      cipher: new LocalAesGcmCipher(KEY),
+      tenantRuntime: runtime,
+      assertBaseUrl,
+      platform: [ProviderService.preset("deepseek", "platform-key")],
+      fetch: async () => {
+        fetchStarted();
+        await fetchBlocked; // deliberately ignores the supplied AbortSignal
+        return new Response(new ReadableStream({
+          cancel: async () => {
+            cancelStarted();
+            await cancelBlocked;
+          },
+        }), { status: 200 });
+      },
+    });
+    const model = await svc.resolve(
+      { tenantId: "t_late_provider_body", userId: "u" },
+      { provider: "deepseek", model: "deepseek-chat" },
+    );
+    runtime.sealParticipants();
+    const fetching = model.fetch!("https://provider.example/v1");
+    await started;
+    const identity = {
+      requestId: "ter_late_provider_body",
+      tenantId: "t_late_provider_body",
+      subjectGeneration: 1,
+      t3aReceiptSha256: "ac".repeat(32),
+    };
+    const drainExpectation = expect(runtime.drain(identity, 20))
+      .rejects.toBeInstanceOf(TenantRuntimeDrainTimeoutError);
+    releaseFetch();
+    await cancelling;
+    await drainExpectation;
+    expect(runtime.snapshot(identity.tenantId).providerOperations).toBe(1);
+
+    releaseCancel();
+    await expect(fetching).rejects.toBeInstanceOf(SubjectDeletingError);
+    await expect(runtime.drain(identity, 1_000)).resolves.toMatchObject({
+      activeOperationCountAfter: 0,
+    });
+  });
+
+  it("waits for an in-flight decrypt and never returns its plaintext after the fence", async () => {
+    const store = new MemorySessionStore();
+    const runtime = new TenantRuntimeCoordinator();
+    const delegate = new LocalAesGcmCipher(KEY);
+    let decryptStarted!: () => void;
+    const started = new Promise<void>((resolve) => { decryptStarted = resolve; });
+    let releaseDecrypt!: () => void;
+    const blocked = new Promise<void>((resolve) => { releaseDecrypt = resolve; });
+    const svc = new ProviderService({
+      store,
+      tenantRuntime: runtime,
+      assertBaseUrl,
+      cipher: {
+        keyId: delegate.keyId,
+        encrypt: (plaintext) => delegate.encrypt(plaintext),
+        decrypt: async (ciphertext, keyId) => {
+          decryptStarted();
+          await blocked;
+          return delegate.decrypt(ciphertext, keyId);
+        },
+      },
+    });
+    await svc.upsertTenantProvider("t_decrypt", {
+      id: "mine", api: "openai-completions", baseUrl: "https://example.com/v1", headers: {}, quota: {}, fallback: [],
+      models: [{ id: "m", contextWindow: 1000, maxOutputTokens: 100, input: ["text"], reasoning: false }],
+      apiKey: "must-not-return",
+    });
+    const model = await svc.resolve({ tenantId: "t_decrypt", userId: "u" }, { provider: "mine", model: "m" });
+    runtime.sealParticipants();
+    const key = model.apiKey();
+    await started;
+    const drain = runtime.drain({
+      requestId: "ter_provider_decrypt",
+      tenantId: "t_decrypt",
+      subjectGeneration: 1,
+      t3aReceiptSha256: "ef".repeat(32),
+    }, 1_000);
+    releaseDecrypt();
+    await expect(key).rejects.toBeInstanceOf(SubjectDeletingError);
+    await expect(drain).resolves.toMatchObject({ activeOperationCountBefore: 1, activeOperationCountAfter: 0 });
   });
 });
