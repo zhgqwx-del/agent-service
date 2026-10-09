@@ -129,6 +129,14 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:tenant-runtime-revocation-mysql
 
+      # T3c turns a terminal T3b proof into a DB-clock, owner-complete structural inventory without
+      # deleting content. Prove pagination, exact replay, hold/deadline gates and SQL rollback on
+      # real InnoDB, and keep the suite visible so it cannot silently disappear from broad coverage.
+      - name: Tenant content inventory real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-content-inventory-mysql
+
       # Canonical policy activation and legal holds are destructive-work authority boundaries.
       # Keep explicit real-InnoDB proof for CAS, rollback, audit integrity and request/anonymize races.
       - name: Retention policy and legal hold real MySQL suite (must execute)
@@ -185,12 +193,13 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0020
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0021
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority, 0016 -> 0017 user-export and 0018 -> 0019 inert tenant credential
-      # revocation substrate and 0019 -> 0020 inert runtime-proof replay matrices.
-      - name: Historical MySQL migrations (0007 through 0020, no skips)
+      # revocation substrate, 0019 -> 0020 runtime-proof and 0020 -> 0021 content-inventory
+      # replay matrices.
+      - name: Historical MySQL migrations (0007 through 0021, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -287,7 +296,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0020_tenant_runtime_revocation.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0021_tenant_content_inventory.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

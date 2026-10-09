@@ -452,6 +452,50 @@ import {
   type TenantRuntimeRevocationStore,
   type TenantRuntimeRevocationTargetReceipt,
 } from "./tenant-runtime-revocation.js";
+import {
+  EMPTY_TENANT_SESSION_RECEIPT_ROOT_SHA256,
+  TENANT_CONTENT_INVENTORY_GLOBAL_ORPHAN_CHECK,
+  TENANT_CONTENT_INVENTORY_RECEIPT_SCOPE,
+  TENANT_SESSION_CONTENT_RECEIPT_SCOPE,
+  TenantContentInventoryEvidenceChangedError,
+  TenantContentInventoryNotReadyError,
+  tenantContentIdentityRootSha256,
+  tenantContentEventIdentityRow,
+  tenantContentInventoryAuthorizationMatches,
+  tenantContentInventoryClaimFromJob,
+  tenantContentInventoryClaimTokenSha256,
+  tenantContentInventoryHoldControlRootSha256,
+  tenantContentInventoryHoldControlSha256,
+  tenantContentInventoryNextSessionReceiptRootSha256,
+  tenantContentInventoryReceiptMatchesAuthorization,
+  tenantContentInventoryReceiptSha256,
+  tenantContentInventorySessionReceiptRootSha256,
+  tenantSessionContentReceiptSha256,
+  tenantSessionContentRootSha256,
+  tenantSessionStructuralSha256,
+  validateBuildTenantContentInventoryPageOptions,
+  validateClaimTenantContentInventoriesOptions,
+  validateMaterializeTenantContentInventoryJobsOptions,
+  validateRenewTenantContentInventoryOptions,
+  validateRetryTenantContentInventoryOptions,
+  validateTenantContentInventoryAuthorization,
+  validateTenantContentInventoryCompletionProof,
+  validateTenantContentInventoryJobRecord,
+  validateTenantSessionContentReceipt,
+  type BuildTenantContentInventoryPageOptions,
+  type BuildTenantContentInventoryPageResult,
+  type ClaimTenantContentInventoriesOptions,
+  type MaterializeTenantContentInventoryJobsOptions,
+  type RenewTenantContentInventoryOptions,
+  type RetryTenantContentInventoryOptions,
+  type TenantContentIdentityRows,
+  type TenantContentInventoryAuthorization,
+  type TenantContentInventoryClaim,
+  type TenantContentInventoryJobRecord,
+  type TenantContentInventoryReceipt,
+  type TenantContentInventoryStore,
+  type TenantSessionContentReceipt,
+} from "./tenant-content-inventory.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -639,7 +683,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -672,6 +716,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantRuntimeRevocationJobs = new Map<string, TenantRuntimeRevocationJobRecord>();
   tenantRuntimeRevocationTargetReceipts = new Map<string, TenantRuntimeRevocationTargetReceipt>();
   tenantRuntimeRevocationReceipts = new Map<string, TenantRuntimeRevocationReceipt>();
+  tenantContentInventoryJobs = new Map<string, TenantContentInventoryJobRecord>();
+  tenantSessionContentReceipts = new Map<string, TenantSessionContentReceipt>();
+  tenantContentInventoryReceipts = new Map<string, TenantContentInventoryReceipt>();
   erasureJobControlEvents = new Map<string, ErasureJobControlEvent[]>();
   private nextErasureJobControlEventId = 1;
   erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
@@ -5384,6 +5431,1200 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new TenantErasureIntegrityError();
     }
     return clone(receipt);
+  }
+
+  private tenantSessionContentReceiptKey(
+    requestId: string,
+    buildGeneration: number,
+    sessionId: string,
+  ): string {
+    return JSON.stringify([requestId, buildGeneration, sessionId]);
+  }
+
+  /**
+   * T3c is derived only from the immutable T1/T3a/T3b proof chain and the policy version captured
+   * at T1. Mutable tenant lifecycle is additionally required for every operation that can advance
+   * an unfinished job; a sealed proof remains independently verifiable for response-loss replay.
+   */
+  private assertTenantContentInventorySource(
+    job: TenantContentInventoryJobRecord,
+    requireLiveLifecycle: boolean,
+  ): void {
+    try {
+      validateTenantContentInventoryJobRecord(job);
+      const runtimeJob = this.tenantRuntimeRevocationJobs.get(job.requestId);
+      const runtimeReceipt = this.tenantRuntimeRevocationReceipts.get(job.requestId);
+      const runtimeTargets = [...this.tenantRuntimeRevocationTargetReceipts.values()]
+        .filter((target) => target.requestId === job.requestId);
+      if (
+        !runtimeJob
+        || !runtimeReceipt
+        || runtimeJob.phase !== "configured_fleet_quiesced"
+        || runtimeJob.tenantId !== job.tenantId
+        || runtimeJob.subjectGeneration !== job.subjectGeneration
+        || runtimeJob.t1FenceSha256 !== job.t1FenceSha256
+        || runtimeJob.t3aReceiptSha256 !== job.t3aReceiptSha256
+        || runtimeReceipt.receiptSha256 !== job.t3bReceiptSha256
+      ) throw new Error("tenant content inventory T3b binding is invalid");
+      const credentialReceipt = this.assertTenantRuntimeRevocationSource(
+        runtimeJob,
+        requireLiveLifecycle,
+      );
+      validateTenantRuntimeRevocationCompletionProof(runtimeJob, runtimeTargets, runtimeReceipt);
+      if (job.retentionAnchorDbMs < Math.max(
+        credentialReceipt.storeDbTimestampMs,
+        runtimeReceipt.storeDbTimestampMs,
+      )) throw new Error("tenant content inventory anchor predates its terminal source proof");
+
+      const admission = this.tenantErasureAdmissions.get(job.requestId);
+      if (
+        !admission
+        || admission.tenantId !== job.tenantId
+        || admission.subjectKind !== "tenant"
+        || admission.subjectId !== job.tenantId
+        || admission.generation !== job.subjectGeneration
+        || admission.policyVersion !== job.policyVersion
+        || admission.policyHash !== job.policySha256
+      ) throw new Error("tenant content inventory T1 policy binding is invalid");
+      validateErasureRequestRecordForRead(admission);
+      if (requireLiveLifecycle) {
+        this.assertTenantErasureAdmissionProof(
+          admission,
+          this.subjectRecord(job.tenantId, "tenant", job.tenantId),
+          this.tenantCredentialRevocationFences.get(job.tenantId),
+        );
+      }
+
+      // Validate the complete policy ledger before trusting its immutable bound version. A later
+      // active version does not rewrite an already-admitted request's retention contract.
+      this.assertRetentionPolicyState(job.tenantId);
+      const policy = this.retentionPolicies.get(retentionPolicyKey(
+        job.tenantId,
+        job.policyVersion,
+      ));
+      if (!policy) throw new Error("tenant content inventory policy is missing");
+      validateRetentionPolicyVersionRecord(policy);
+      const deadline = checkedRetentionDeadline(
+        job.retentionAnchorDbMs,
+        policy.policy.sessionContentRetentionMs,
+      );
+      if (
+        policy.tenantId !== job.tenantId
+        || policy.policySha256 !== job.policySha256
+        || policy.schemaVersion !== job.policySchemaVersion
+        || deadline.kind !== "deadline"
+        || deadline.value !== job.contentNotBeforeDbMs
+      ) throw new Error("tenant content inventory policy deadline binding is invalid");
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantContentSessions(tenantId: string): Session[] {
+    return [...this.sessions.entries()]
+      .filter(([, session]) => session.tenantId === tenantId)
+      .map(([key, session]) => {
+        const parsed = SessionSchema.safeParse(session);
+        if (!parsed.success || key !== session.id) {
+          throw new TenantErasureIntegrityError();
+        }
+        return session;
+      })
+      .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  }
+
+  /** Validate that none of the four content child tables contains an orphan or cross-owner edge. */
+  private assertTenantContentGlobalRelations(): void {
+    try {
+      for (const [key, session] of this.sessions) {
+        const parsed = SessionSchema.safeParse(session);
+        if (!parsed.success || key !== session.id) throw new Error("session identity is corrupt");
+        if (session.parentSessionId !== undefined) {
+          const parent = this.sessions.get(session.parentSessionId);
+          if (
+            !parent
+            || parent.tenantId !== session.tenantId
+            || parent.userId !== session.userId
+            || parent.id === session.id
+          ) throw new Error("session parent owner is corrupt");
+        }
+        const log = this.events.get(session.id);
+        if (!log || log.length !== session.lastSeq) {
+          throw new Error("session event cursor is corrupt");
+        }
+        if (
+          !this.deleted.has(session.id)
+          && log.some((event) => event.type === "session/deleted")
+        ) throw new Error("live session has a tombstone event");
+      }
+      const resolvedParentChains = new Set<string>();
+      for (const session of this.sessions.values()) {
+        const path = new Set<string>();
+        let current: Session | undefined = session;
+        while (current?.parentSessionId !== undefined) {
+          if (path.has(current.id)) throw new Error("session parent cycle");
+          if (resolvedParentChains.has(current.id)) break;
+          path.add(current.id);
+          current = this.sessions.get(current.parentSessionId);
+          if (!current) throw new Error("orphaned parent session");
+        }
+        for (const sessionId of path) resolvedParentChains.add(sessionId);
+      }
+
+      for (const [key, marker] of this.deleted) {
+        const session = this.sessions.get(key);
+        if (
+          !session
+          || !Number.isSafeInteger(marker.deletedAtMs)
+          || marker.deletedAtMs < 0
+          || !Number.isSafeInteger(marker.deletionGeneration)
+          || marker.deletionGeneration < 1
+          || (marker.purgeAfterMs !== undefined && (
+            !Number.isSafeInteger(marker.purgeAfterMs)
+            || marker.purgeAfterMs < marker.deletedAtMs
+          ))
+        ) throw new Error("session tombstone marker is corrupt");
+        const terminal = this.events.get(key)?.filter((event) => event.type === "session/deleted") ?? [];
+        if (
+          terminal.length !== 1
+          || terminal[0]!.deletionGeneration !== marker.deletionGeneration
+          || terminal[0]!.emittedAtMs !== marker.deletedAtMs
+          || terminal[0]!.seq !== session.lastSeq
+        ) throw new Error("session tombstone event is corrupt");
+      }
+
+      for (const [key, turn] of this.turns) {
+        const parsed = TurnSchema.safeParse(turn);
+        const session = this.sessions.get(turn.sessionId);
+        if (
+          !parsed.success
+          || key !== turn.id
+          || !session
+          || turn.seqStart > session.lastSeq
+          || (turn.seqEnd !== undefined && (
+            turn.seqEnd < turn.seqStart || turn.seqEnd > session.lastSeq
+          ))
+        ) throw new Error("turn owner relation is corrupt");
+      }
+
+      for (const [key, item] of this.items) {
+        const parsed = ItemSchema.safeParse(item);
+        const session = this.sessions.get(item.sessionId);
+        const turn = this.turns.get(item.turnId);
+        const standaloneCompaction = item.type === "contextCompaction";
+        if (
+          !parsed.success
+          || key !== item.id
+          || !session
+          || (!standaloneCompaction && !turn)
+          || (turn !== undefined && turn.sessionId !== item.sessionId)
+          || item.seq < 1
+          || item.seq > session.lastSeq
+        ) throw new Error("item owner relation is corrupt");
+        if (item.type === "approvalRequest") {
+          const matchingApprovals = [...this.approvals.values()].filter(
+            (approval) => approval.id === item.approvalId,
+          );
+          const approval = matchingApprovals[0];
+          if (
+            matchingApprovals.length !== 1
+            || !approval
+            || approval.sessionId !== item.sessionId
+            || approval.turnId !== item.turnId
+            || approval.toolCallId !== item.toolCallId
+            || approval.toolName !== item.name
+          ) throw new Error("approval request reverse relation is corrupt");
+        }
+      }
+
+      for (const [key, approval] of this.approvals) {
+        const parsed = ApprovalSchema.safeParse(approval);
+        const session = this.sessions.get(approval.sessionId);
+        const turn = this.turns.get(approval.turnId);
+        const matchingItems = [...this.items.values()].filter((item) => (
+          item.type === "approvalRequest" && item.approvalId === approval.id
+        ));
+        const item = matchingItems[0];
+        if (
+          !parsed.success
+          || key !== approval.id
+          || !session
+          || !turn
+          || !item
+          || item.type !== "approvalRequest"
+          || matchingItems.length !== 1
+          || turn.sessionId !== approval.sessionId
+          || item.sessionId !== approval.sessionId
+          || item.turnId !== approval.turnId
+          || item.toolCallId !== approval.toolCallId
+          || item.name !== approval.toolName
+        ) throw new Error("approval owner relation is corrupt");
+      }
+
+      for (const [sessionId, log] of this.events) {
+        const session = this.sessions.get(sessionId);
+        if (!session) throw new Error("event log is orphaned");
+        for (const [index, event] of log.entries()) {
+          const parsed = EventSchema.safeParse(event);
+          if (
+            !parsed.success
+            || event.sessionId !== sessionId
+            || event.seq !== index + 1
+          ) throw new Error("event owner or sequence is corrupt");
+
+          if ("turn" in event) {
+            const turn = this.turns.get(event.turn.id);
+            if (!turn || event.turn.sessionId !== sessionId || turn.sessionId !== sessionId) {
+              throw new Error("event turn relation is corrupt");
+            }
+            if (
+              turn.seqStart !== event.turn.seqStart
+            ) throw new Error("event turn snapshot is corrupt");
+          }
+          if ("item" in event) {
+            const item = this.items.get(event.item.id);
+            const turn = this.turns.get(event.item.turnId);
+            const standaloneCompaction = event.item.type === "contextCompaction";
+            if (
+              !item
+              || event.item.sessionId !== sessionId
+              || item.sessionId !== sessionId
+              || item.turnId !== event.item.turnId
+              || item.seq !== event.item.seq
+              || item.type !== event.item.type
+              || (!standaloneCompaction && !turn)
+              || (turn !== undefined && turn.sessionId !== sessionId)
+            ) throw new Error("event item relation is corrupt");
+            if (event.item.type === "approvalRequest") {
+              const approval = this.approvals.get(event.item.approvalId);
+              if (
+                item.type !== "approvalRequest"
+                || item.approvalId !== event.item.approvalId
+                || item.toolCallId !== event.item.toolCallId
+                || item.name !== event.item.name
+                || !approval
+                || approval.sessionId !== sessionId
+                || approval.turnId !== event.item.turnId
+                || approval.toolCallId !== event.item.toolCallId
+                || approval.toolName !== event.item.name
+              ) throw new Error("event approval request relation is corrupt");
+            }
+          }
+          if ("approval" in event) {
+            const approval = this.approvals.get(event.approval.id);
+            const turn = this.turns.get(event.approval.turnId);
+            const matchingItems = [...this.items.values()].filter((item) => (
+              item.type === "approvalRequest" && item.approvalId === event.approval.id
+            ));
+            const item = matchingItems[0];
+            if (
+              !approval
+              || !turn
+              || !item
+              || item.type !== "approvalRequest"
+              || matchingItems.length !== 1
+              || event.approval.sessionId !== sessionId
+              || approval.sessionId !== sessionId
+              || approval.turnId !== event.approval.turnId
+              || approval.itemId !== event.approval.itemId
+              || turn.sessionId !== sessionId
+              || item.sessionId !== sessionId
+              || item.turnId !== event.approval.turnId
+              || item.toolCallId !== event.approval.toolCallId
+              || item.name !== event.approval.toolName
+              || approval.toolCallId !== event.approval.toolCallId
+              || approval.toolName !== event.approval.toolName
+            ) throw new Error("event approval relation is corrupt");
+          }
+          if ("turnId" in event && event.turnId !== undefined) {
+            const turn = this.turns.get(event.turnId);
+            if (!turn || turn.sessionId !== sessionId) {
+              throw new Error("event turn id is corrupt");
+            }
+          }
+          if (event.type === "turn/steered") {
+            const item = this.items.get(event.itemId);
+            if (
+              !item
+              || item.sessionId !== sessionId
+              || item.turnId !== event.turnId
+            ) {
+              throw new Error("event steered item relation is corrupt");
+            }
+          }
+          if (event.type === "session/compacted") {
+            const item = this.items.get(event.itemId);
+            if (
+              !item
+              || item.sessionId !== sessionId
+              || item.type !== "contextCompaction"
+            ) {
+              throw new Error("event compacted item relation is corrupt");
+            }
+          }
+          if (event.type === "session/status/changed" && event.status.type === "active") {
+            const turn = this.turns.get(event.status.turnId);
+            if (!turn || turn.sessionId !== sessionId) {
+              throw new Error("event active turn is corrupt");
+            }
+          }
+        }
+      }
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private memoryTenantSessionContentReceipt(
+    job: TenantContentInventoryJobRecord,
+    session: Session,
+    capturedAtDbMs: number,
+  ): TenantSessionContentReceipt {
+    const marker = this.deleted.get(session.id);
+    const lifecycleDisposition = marker
+      ? "tombstoned" as const
+      : session.archivedAtMs === undefined ? "live" as const : "archived" as const;
+    const turns = [...this.turns.values()].filter((turn) => turn.sessionId === session.id);
+    const items = [...this.items.values()].filter((item) => item.sessionId === session.id);
+    const events = this.events.get(session.id) ?? [];
+    const approvals = [...this.approvals.values()]
+      .filter((approval) => approval.sessionId === session.id);
+    const turnRows: TenantContentIdentityRows["turn"][] = turns
+      .map((turn) => [
+        turn.id,
+        turn.seqStart,
+        turn.seqEnd ?? null,
+        turn.status,
+      ] as const);
+    const itemRows: TenantContentIdentityRows["item"][] = items
+      .map((item) => [
+        item.id,
+        item.turnId,
+        item.seq,
+        item.type,
+        item.status,
+        item.type === "approvalRequest" ? item.approvalId : null,
+      ] as const);
+    const eventRows: TenantContentIdentityRows["event"][] = events
+      .map((event) => tenantContentEventIdentityRow(event));
+    const approvalRows: TenantContentIdentityRows["approval"][] = approvals
+      .map((approval) => [
+        approval.id,
+        approval.turnId,
+        approval.itemId,
+        approval.status,
+      ] as const);
+    const content = {
+      sessionSha256: tenantSessionStructuralSha256(
+        session.id,
+        session.parentSessionId,
+        session.lastSeq,
+        marker?.deletionGeneration ?? 0,
+        lifecycleDisposition,
+      ),
+      turnCount: turnRows.length,
+      turnRootSha256: tenantContentIdentityRootSha256("turn", turnRows),
+      itemCount: itemRows.length,
+      itemRootSha256: tenantContentIdentityRootSha256("item", itemRows),
+      eventCount: eventRows.length,
+      eventRootSha256: tenantContentIdentityRootSha256("event", eventRows),
+      approvalCount: approvalRows.length,
+      approvalRootSha256: tenantContentIdentityRootSha256("approval", approvalRows),
+      contentRecordCount: 1 + turnRows.length + itemRows.length + events.length + approvals.length,
+    };
+    const body = {
+      scope: TENANT_SESSION_CONTENT_RECEIPT_SCOPE,
+      requestId: job.requestId,
+      buildGeneration: job.buildGeneration,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      sessionId: session.id,
+      ...content,
+      contentRootSha256: tenantSessionContentRootSha256(content),
+      capturedAtDbMs,
+    };
+    const receipt = clone<TenantSessionContentReceipt>({
+      ...body,
+      receiptSha256: tenantSessionContentReceiptSha256(body),
+    });
+    validateTenantSessionContentReceipt(receipt);
+    return receipt;
+  }
+
+  private tenantContentInventoryReceiptsFor(
+    job: TenantContentInventoryJobRecord,
+  ): TenantSessionContentReceipt[] {
+    return [...this.tenantSessionContentReceipts.values()]
+      .filter((receipt) => (
+        receipt.requestId === job.requestId
+        && receipt.buildGeneration === job.buildGeneration
+      ))
+      .sort((left, right) => (
+        left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0
+      ));
+  }
+
+  private assertTenantContentInventoryBuildState(
+    job: TenantContentInventoryJobRecord,
+    sessions: Session[],
+  ): { receipts: TenantSessionContentReceipt[]; contentRecordCount: number } {
+    const receipts = this.tenantContentInventoryReceiptsFor(job);
+    if (
+      receipts.length !== job.sessionReceiptCount
+      || receipts.length > sessions.length
+      || tenantContentInventorySessionReceiptRootSha256(receipts)
+        !== job.sessionReceiptRootSha256
+      || receipts.some((receipt, index) => (
+        receipt.tenantId !== job.tenantId
+        || receipt.subjectGeneration !== job.subjectGeneration
+        || receipt.sessionId !== sessions[index]!.id
+        || receipt.receiptSha256 !== this.memoryTenantSessionContentReceipt(
+          job,
+          sessions[index]!,
+          receipt.capturedAtDbMs,
+        ).receiptSha256
+      ))
+      || (receipts.length === 0
+        ? job.cursorSessionId !== undefined
+        : job.cursorSessionId !== receipts.at(-1)!.sessionId)
+      || (job.scanComplete && receipts.length !== sessions.length)
+    ) throw new TenantContentInventoryEvidenceChangedError();
+    let contentRecordCount = 0;
+    for (const receipt of receipts) {
+      contentRecordCount += receipt.contentRecordCount;
+      if (!Number.isSafeInteger(contentRecordCount)) throw new TenantErasureIntegrityError();
+    }
+    return { receipts, contentRecordCount };
+  }
+
+  private tenantContentHoldProof(tenantId: string): {
+    holdControlCount: number;
+    holdControlRootSha256: string;
+  } {
+    try {
+      const userIds = new Set<string>();
+      for (const session of this.sessions.values()) {
+        if (session.tenantId === tenantId) userIds.add(session.userId);
+      }
+      for (const lifecycle of this.subjectLifecycles.values()) {
+        if (lifecycle.tenantId === tenantId && lifecycle.subjectKind === "user") {
+          userIds.add(lifecycle.subjectId);
+        }
+      }
+      for (const request of this.erasureRequests.values()) {
+        if (request.tenantId === tenantId && request.subjectKind === "user") {
+          userIds.add(request.subjectId);
+        }
+      }
+      for (const [key, control] of this.legalHoldControls) {
+        validateLegalHoldControlRecord(control);
+        if (key !== subjectLifecycleKey(
+          control.tenantId,
+          control.subjectKind,
+          control.subjectId,
+        )) throw new Error("legal hold control index is corrupt");
+        if (control.tenantId === tenantId && control.subjectKind === "user") {
+          userIds.add(control.subjectId);
+        }
+      }
+      for (const [key, hold] of this.legalHolds) {
+        validateLegalHoldRecord(hold);
+        if (key !== legalHoldKey(hold.tenantId, hold.holdId)) {
+          throw new Error("legal hold row index is corrupt");
+        }
+        if (hold.tenantId === tenantId && hold.subjectKind === "user") {
+          userIds.add(hold.subjectId);
+        }
+      }
+      for (const [key, events] of this.legalHoldEvents) {
+        for (const event of events) {
+          if (key !== subjectLifecycleKey(
+            event.tenantId,
+            event.subjectKind,
+            event.subjectId,
+          )) throw new Error("legal hold event index is corrupt");
+          if (event.tenantId === tenantId) {
+            if (event.subjectKind === "tenant") {
+              if (event.subjectId !== tenantId) {
+                throw new Error("tenant legal hold event subject is corrupt");
+              }
+            } else if (event.subjectKind === "user") {
+              userIds.add(event.subjectId);
+            } else {
+              throw new Error("legal hold event subject kind is corrupt");
+            }
+          }
+        }
+      }
+
+      const subjects: Array<{ kind: "tenant" | "user"; id: string }> = [
+        { kind: "tenant", id: tenantId },
+        ...[...userIds]
+          .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+          .map((id) => ({ kind: "user" as const, id })),
+      ];
+      const controlHashes = subjects.map((subject, ordinal) => {
+        const state = this.assertLegalHoldState(tenantId, subject.kind, subject.id);
+        if (state.control.activeHoldCount !== 0) {
+          throw new TenantContentInventoryNotReadyError("active_legal_hold");
+        }
+        return tenantContentInventoryHoldControlSha256(
+          ordinal,
+          subject.kind,
+          state.control.controlGeneration,
+          state.control.activeProjectionSha256,
+        );
+      });
+      return {
+        holdControlCount: controlHashes.length,
+        holdControlRootSha256: tenantContentInventoryHoldControlRootSha256(controlHashes),
+      };
+    } catch (error) {
+      if (error instanceof TenantContentInventoryNotReadyError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  /**
+   * Blocking is a claim-bound, non-destructive terminal transition. It deliberately depends only
+   * on the already validated T3c job envelope: requiring the damaged upstream proof again would
+   * make the integrity incident impossible to persist and would leave it repeatedly claimable.
+   */
+  private blockedTenantContentInventoryJob(
+    current: TenantContentInventoryJobRecord,
+    blockedAtDbMs: number,
+    attempts: number = current.attempts,
+  ): TenantContentInventoryJobRecord {
+    const terminalAtDbMs = Math.max(
+      current.createdAtMs,
+      current.updatedAtMs,
+      blockedAtDbMs,
+    );
+    const blocked = clone<TenantContentInventoryJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      buildGeneration: current.buildGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      t3bReceiptSha256: current.t3bReceiptSha256,
+      policyVersion: current.policyVersion,
+      policySha256: current.policySha256,
+      policySchemaVersion: current.policySchemaVersion,
+      retentionAnchorDbMs: current.retentionAnchorDbMs,
+      contentNotBeforeDbMs: current.contentNotBeforeDbMs,
+      phase: "blocked",
+      ...(current.cursorSessionId === undefined ? {} : { cursorSessionId: current.cursorSessionId }),
+      scanComplete: current.scanComplete,
+      sessionReceiptCount: current.sessionReceiptCount,
+      sessionReceiptRootSha256: current.sessionReceiptRootSha256,
+      attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: terminalAtDbMs,
+      blockedAtDbMs: terminalAtDbMs,
+      blockedReasonCode: "integrity_conflict",
+    });
+    validateTenantContentInventoryJobRecord(blocked);
+    return blocked;
+  }
+
+  async materializeTenantContentInventoryJobs(
+    options: MaterializeTenantContentInventoryJobsOptions,
+  ): Promise<number> {
+    const stagedOptions = clone(options);
+    validateMaterializeTenantContentInventoryJobsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const candidates = [...this.tenantRuntimeRevocationJobs.values()]
+      .filter((runtime) => (
+        runtime.phase === "configured_fleet_quiesced"
+        && !this.tenantContentInventoryJobs.has(runtime.requestId)
+      ))
+      .sort((left, right) => (
+        left.requestId < right.requestId ? -1 : left.requestId > right.requestId ? 1 : 0
+      ));
+    const staged: TenantContentInventoryJobRecord[] = [];
+    let sourceIntegrityConflict = false;
+    let firstNotReady: TenantContentInventoryNotReadyError | undefined;
+    for (const runtime of candidates) {
+      if (staged.length >= stagedOptions.limit) break;
+      try {
+        const admission = this.tenantErasureAdmissions.get(runtime.requestId);
+        const t3bReceipt = this.tenantRuntimeRevocationReceipts.get(runtime.requestId);
+        if (!admission || !t3bReceipt) throw new TenantErasureIntegrityError();
+        if (admission.policyVersion === undefined || admission.policyHash === undefined) continue;
+        const credentialReceipt = this.assertTenantRuntimeRevocationSource(runtime, true);
+        const runtimeTargets = [...this.tenantRuntimeRevocationTargetReceipts.values()]
+          .filter((target) => target.requestId === runtime.requestId);
+        try {
+          validateTenantRuntimeRevocationCompletionProof(runtime, runtimeTargets, t3bReceipt);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        this.assertRetentionPolicyState(runtime.tenantId);
+        const policy = this.retentionPolicies.get(retentionPolicyKey(
+          runtime.tenantId,
+          admission.policyVersion,
+        ));
+        if (!policy) throw new TenantErasureIntegrityError();
+        validateRetentionPolicyVersionRecord(policy);
+        if (policy.policySha256 !== admission.policyHash) {
+          throw new TenantErasureIntegrityError();
+        }
+        const deadline = checkedRetentionDeadline(
+          nowMs,
+          policy.policy.sessionContentRetentionMs,
+        );
+        if (deadline.kind === "unconfigured") continue;
+        if (deadline.kind === "invalid") throw new TenantErasureIntegrityError();
+        if (nowMs < Math.max(
+          credentialReceipt.storeDbTimestampMs,
+          t3bReceipt.storeDbTimestampMs,
+        )) {
+          throw new TenantContentInventoryNotReadyError("trusted_clock_before_source");
+        }
+        const job = clone<TenantContentInventoryJobRecord>({
+          requestId: runtime.requestId,
+          tenantId: runtime.tenantId,
+          subjectGeneration: runtime.subjectGeneration,
+          buildGeneration: 1,
+          t1FenceSha256: runtime.t1FenceSha256,
+          t3aReceiptSha256: runtime.t3aReceiptSha256,
+          t3bReceiptSha256: t3bReceipt.receiptSha256,
+          policyVersion: policy.policyVersion,
+          policySha256: policy.policySha256,
+          policySchemaVersion: policy.schemaVersion,
+          retentionAnchorDbMs: nowMs,
+          contentNotBeforeDbMs: deadline.value,
+          phase: "queued",
+          scanComplete: false,
+          sessionReceiptCount: 0,
+          sessionReceiptRootSha256: EMPTY_TENANT_SESSION_RECEIPT_ROOT_SHA256,
+          availableAtMs: nowMs,
+          attempts: 0,
+          createdAtMs: nowMs,
+          updatedAtMs: nowMs,
+        });
+        this.assertTenantContentInventorySource(job, true);
+        if (
+          this.tenantContentInventoryReceipts.has(job.requestId)
+          || [...this.tenantContentInventoryJobs.values()].some(
+            (existing) => existing.tenantId === job.tenantId,
+          )
+          || staged.some((existing) => existing.tenantId === job.tenantId)
+          || [...this.tenantSessionContentReceipts.values()].some((receipt) => (
+            receipt.requestId === job.requestId || receipt.tenantId === job.tenantId
+          ))
+          || [...this.tenantContentInventoryReceipts.values()].some(
+            (receipt) => receipt.tenantId === job.tenantId,
+          )
+        ) throw new TenantErasureIntegrityError();
+        staged.push(job);
+      } catch (error) {
+        if (error instanceof TenantContentInventoryNotReadyError) {
+          firstNotReady ??= error;
+          continue;
+        }
+        // Model the production per-candidate transactions: one malformed immutable source must be
+        // reported, but cannot roll back or indefinitely hide a healthy neighbor from the worker.
+        sourceIntegrityConflict = true;
+      }
+    }
+    const prior = new Map(this.tenantContentInventoryJobs);
+    try {
+      for (const job of staged) this.tenantContentInventoryJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantContentInventoryJobs, prior);
+      throw error;
+    }
+    if (sourceIntegrityConflict) throw new TenantErasureIntegrityError();
+    if (firstNotReady) throw firstNotReady;
+    return staged.length;
+  }
+
+  async claimTenantContentInventories(
+    options: ClaimTenantContentInventoriesOptions,
+  ): Promise<TenantContentInventoryClaim[]> {
+    const stagedOptions = clone(options);
+    validateClaimTenantContentInventoriesOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
+      ? Number.MAX_SAFE_INTEGER
+      : nowMs + stagedOptions.leaseMs;
+    if (leaseUntilMs <= nowMs) return [];
+    const candidates = [...this.tenantContentInventoryJobs.values()]
+      .filter((job): job is Extract<TenantContentInventoryJobRecord, { phase: "queued" }> => (
+        job.phase === "queued"
+        && job.availableAtMs <= nowMs
+        && (job.claimToken === undefined || job.leaseUntilMs! <= nowMs)
+      ))
+      .sort((left, right) => (
+        left.availableAtMs - right.availableAtMs
+        || left.requestId.localeCompare(right.requestId)
+      ))
+      .slice(0, stagedOptions.limit);
+    const staged: TenantContentInventoryJobRecord[] = [];
+    const stagedClaims: TenantContentInventoryJobRecord[] = [];
+    for (const current of candidates) {
+      const attempts = current.attempts + 1;
+      if (!Number.isSafeInteger(attempts) || attempts > 0xffff_ffff) {
+        throw new TenantErasureIntegrityError();
+      }
+      try {
+        this.assertTenantContentInventorySource(current, true);
+      } catch (error) {
+        if (!(error instanceof TenantErasureIntegrityError)) throw error;
+        staged.push(this.blockedTenantContentInventoryJob(current, nowMs, attempts));
+        continue;
+      }
+      const next = clone<TenantContentInventoryJobRecord>({
+        ...current,
+        attempts,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+        lastErrorCode: undefined,
+        updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      });
+      delete next.lastErrorCode;
+      validateTenantContentInventoryJobRecord(next);
+      staged.push(next);
+      stagedClaims.push(next);
+    }
+    const prior = new Map(this.tenantContentInventoryJobs);
+    try {
+      for (const job of staged) this.tenantContentInventoryJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantContentInventoryJobs, prior);
+      throw error;
+    }
+    return stagedClaims.map((job) => clone(tenantContentInventoryClaimFromJob(job)));
+  }
+
+  async renewTenantContentInventory(
+    authorization: TenantContentInventoryAuthorization,
+    options: RenewTenantContentInventoryOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantContentInventoryAuthorization(stagedAuthorization);
+    validateRenewTenantContentInventoryOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const requestedLeaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
+      ? Number.MAX_SAFE_INTEGER
+      : nowMs + stagedOptions.leaseMs;
+    if (requestedLeaseUntilMs <= nowMs) return false;
+    const current = this.tenantContentInventoryJobs.get(stagedAuthorization.requestId);
+    if (!current || current.phase !== "queued" || !tenantContentInventoryAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    if (current.phase !== "queued") return false;
+    this.assertTenantContentInventorySource(current, true);
+    const leaseUntilMs = Math.max(current.leaseUntilMs!, requestedLeaseUntilMs);
+    const next = clone<TenantContentInventoryJobRecord>({
+      ...current,
+      leaseUntilMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantContentInventoryJobRecord(next);
+    try {
+      this.tenantContentInventoryJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantContentInventoryJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async retryTenantContentInventory(
+    authorization: TenantContentInventoryAuthorization,
+    options: RetryTenantContentInventoryOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantContentInventoryAuthorization(stagedAuthorization);
+    validateRetryTenantContentInventoryOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantContentInventoryJobs.get(stagedAuthorization.requestId);
+    if (!current || current.phase !== "queued" || !tenantContentInventoryAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    this.assertTenantContentInventorySource(current, true);
+    const availableBaseMs = Math.max(
+      nowMs,
+      current.createdAtMs,
+      current.updatedAtMs,
+      current.availableAtMs,
+    );
+    const availableAtMs = stagedOptions.delayMs > Number.MAX_SAFE_INTEGER - availableBaseMs
+      ? Number.MAX_SAFE_INTEGER
+      : availableBaseMs + stagedOptions.delayMs;
+    const next = clone<TenantContentInventoryJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      buildGeneration: current.buildGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      t3bReceiptSha256: current.t3bReceiptSha256,
+      policyVersion: current.policyVersion,
+      policySha256: current.policySha256,
+      policySchemaVersion: current.policySchemaVersion,
+      retentionAnchorDbMs: current.retentionAnchorDbMs,
+      contentNotBeforeDbMs: current.contentNotBeforeDbMs,
+      phase: "queued",
+      ...(current.cursorSessionId === undefined ? {} : { cursorSessionId: current.cursorSessionId }),
+      scanComplete: current.scanComplete,
+      sessionReceiptCount: current.sessionReceiptCount,
+      sessionReceiptRootSha256: current.sessionReceiptRootSha256,
+      availableAtMs,
+      attempts: current.attempts,
+      lastErrorCode: stagedOptions.errorCode,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantContentInventoryJobRecord(next);
+    try {
+      this.tenantContentInventoryJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantContentInventoryJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async blockTenantContentInventory(
+    authorization: TenantContentInventoryAuthorization,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantContentInventoryAuthorization(stagedAuthorization);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantContentInventoryJobs.get(stagedAuthorization.requestId);
+    if (!current || !tenantContentInventoryAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return false;
+    const next = this.blockedTenantContentInventoryJob(current, nowMs);
+    try {
+      this.tenantContentInventoryJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantContentInventoryJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async buildTenantContentInventoryPage(
+    authorization: TenantContentInventoryAuthorization,
+    options: BuildTenantContentInventoryPageOptions,
+  ): Promise<BuildTenantContentInventoryPageResult> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantContentInventoryAuthorization(stagedAuthorization);
+    validateBuildTenantContentInventoryPageOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantContentInventoryJobs.get(stagedAuthorization.requestId);
+    if (!current || !tenantContentInventoryAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) throw new TenantErasureIntegrityError();
+    if (nowMs < current.retentionAnchorDbMs) {
+      throw new TenantContentInventoryNotReadyError("trusted_clock_before_anchor");
+    }
+    this.assertTenantContentInventorySource(current, true);
+    this.assertTenantContentGlobalRelations();
+    const sessions = this.tenantContentSessions(current.tenantId);
+    const state = this.assertTenantContentInventoryBuildState(current, sessions);
+    if (current.scanComplete) {
+      return clone({
+        built: 0,
+        done: true,
+        ...(current.cursorSessionId === undefined ? {} : { cursorSessionId: current.cursorSessionId }),
+        sessionReceiptCount: current.sessionReceiptCount,
+        sessionReceiptRootSha256: current.sessionReceiptRootSha256,
+        contentRecordCount: state.contentRecordCount,
+      });
+    }
+
+    const page = sessions.slice(state.receipts.length, state.receipts.length + stagedOptions.limit);
+    const stagedReceipts = page.map((session) => this.memoryTenantSessionContentReceipt(
+      current,
+      session,
+      nowMs,
+    ));
+    let sessionReceiptRootSha256 = current.sessionReceiptRootSha256;
+    let contentRecordCount = state.contentRecordCount;
+    for (const receipt of stagedReceipts) {
+      const key = this.tenantSessionContentReceiptKey(
+        receipt.requestId,
+        receipt.buildGeneration,
+        receipt.sessionId,
+      );
+      if (this.tenantSessionContentReceipts.has(key)) {
+        throw new TenantErasureIntegrityError();
+      }
+      sessionReceiptRootSha256 = tenantContentInventoryNextSessionReceiptRootSha256(
+        sessionReceiptRootSha256,
+        receipt.receiptSha256,
+      );
+      contentRecordCount += receipt.contentRecordCount;
+      if (!Number.isSafeInteger(contentRecordCount)) throw new TenantErasureIntegrityError();
+    }
+    const sessionReceiptCount = current.sessionReceiptCount + stagedReceipts.length;
+    if (!Number.isSafeInteger(sessionReceiptCount)) throw new TenantErasureIntegrityError();
+    const done = sessionReceiptCount === sessions.length;
+    const cursorSessionId = stagedReceipts.at(-1)?.sessionId ?? current.cursorSessionId;
+    const next = clone<TenantContentInventoryJobRecord>({
+      ...current,
+      ...(cursorSessionId === undefined ? {} : { cursorSessionId }),
+      scanComplete: done,
+      sessionReceiptCount,
+      sessionReceiptRootSha256,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantContentInventoryJobRecord(next);
+    const jobsBefore = new Map(this.tenantContentInventoryJobs);
+    const receiptsBefore = new Map(this.tenantSessionContentReceipts);
+    try {
+      for (const receipt of stagedReceipts) {
+        this.tenantSessionContentReceipts.set(
+          this.tenantSessionContentReceiptKey(
+            receipt.requestId,
+            receipt.buildGeneration,
+            receipt.sessionId,
+          ),
+          receipt,
+        );
+      }
+      this.tenantContentInventoryJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantContentInventoryJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantSessionContentReceipts, receiptsBefore);
+      throw error;
+    }
+    return clone({
+      built: stagedReceipts.length,
+      done,
+      ...(cursorSessionId === undefined ? {} : { cursorSessionId }),
+      sessionReceiptCount,
+      sessionReceiptRootSha256,
+      contentRecordCount,
+    });
+  }
+
+  async sealTenantContentInventory(
+    authorization: TenantContentInventoryAuthorization,
+  ): Promise<TenantContentInventoryReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantContentInventoryAuthorization(stagedAuthorization);
+    const current = this.tenantContentInventoryJobs.get(stagedAuthorization.requestId);
+    if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    validateTenantContentInventoryJobRecord(current);
+    const existingReceipts = this.tenantContentInventoryReceiptsFor(current);
+    if (current.phase === "inventory_sealed") {
+      this.assertTenantContentInventorySource(current, false);
+      const aggregate = this.tenantContentInventoryReceipts.get(current.requestId);
+      if (!aggregate) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantContentInventoryCompletionProof(current, existingReceipts, aggregate);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!tenantContentInventoryReceiptMatchesAuthorization(aggregate, stagedAuthorization)) {
+        return null;
+      }
+      return clone(aggregate);
+    }
+    if (current.phase === "blocked") {
+      this.assertTenantContentInventorySource(current, true);
+      return null;
+    }
+
+    const initialNowMs = this.storeNowMs();
+    if (!tenantContentInventoryAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      initialNowMs,
+    )) return null;
+    this.assertTenantContentInventorySource(current, true);
+    this.assertTenantContentGlobalRelations();
+    const sessions = this.tenantContentSessions(current.tenantId);
+    const state = this.assertTenantContentInventoryBuildState(current, sessions);
+    if (!current.scanComplete || state.receipts.length !== sessions.length) {
+      throw new TenantContentInventoryEvidenceChangedError();
+    }
+    const holdProof = this.tenantContentHoldProof(current.tenantId);
+
+    // This is deliberately the final clock observation after every potentially expensive owner
+    // and hold scan. It models the MySQL implementation's post-lock database timestamp read.
+    const sealNowMs = this.storeNowMs();
+    if (!tenantContentInventoryAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      sealNowMs,
+    )) return null;
+    if (sealNowMs < current.contentNotBeforeDbMs) {
+      throw new TenantContentInventoryNotReadyError("deadline_not_reached");
+    }
+    const latestCapturedAtDbMs = state.receipts.reduce(
+      (latest, receipt) => Math.max(latest, receipt.capturedAtDbMs),
+      current.retentionAnchorDbMs,
+    );
+    if (sealNowMs < latestCapturedAtDbMs) {
+      throw new TenantContentInventoryNotReadyError("trusted_clock_before_evidence");
+    }
+    this.assertTenantContentInventorySource(current, true);
+
+    const receiptBody = {
+      scope: TENANT_CONTENT_INVENTORY_RECEIPT_SCOPE,
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      buildGeneration: current.buildGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      t3bReceiptSha256: current.t3bReceiptSha256,
+      policyVersion: current.policyVersion,
+      policySha256: current.policySha256,
+      policySchemaVersion: current.policySchemaVersion,
+      retentionAnchorDbMs: current.retentionAnchorDbMs,
+      contentNotBeforeDbMs: current.contentNotBeforeDbMs,
+      sessionReceiptCount: current.sessionReceiptCount,
+      sessionReceiptRootSha256: current.sessionReceiptRootSha256,
+      contentRecordCount: state.contentRecordCount,
+      ...holdProof,
+      globalOrphanCheck: TENANT_CONTENT_INVENTORY_GLOBAL_ORPHAN_CHECK,
+      storeDbTimestampMs: sealNowMs,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: tenantContentInventoryClaimTokenSha256(
+        stagedAuthorization.claimToken,
+      ),
+      contentInventoryComplete: true as const,
+      contentPurgeExecuted: false as const,
+    };
+    const aggregate = clone<TenantContentInventoryReceipt>({
+      ...receiptBody,
+      receiptSha256: tenantContentInventoryReceiptSha256(receiptBody),
+    });
+    const next = clone<TenantContentInventoryJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      buildGeneration: current.buildGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      t3aReceiptSha256: current.t3aReceiptSha256,
+      t3bReceiptSha256: current.t3bReceiptSha256,
+      policyVersion: current.policyVersion,
+      policySha256: current.policySha256,
+      policySchemaVersion: current.policySchemaVersion,
+      retentionAnchorDbMs: current.retentionAnchorDbMs,
+      contentNotBeforeDbMs: current.contentNotBeforeDbMs,
+      phase: "inventory_sealed",
+      ...(current.cursorSessionId === undefined ? {} : { cursorSessionId: current.cursorSessionId }),
+      scanComplete: true,
+      sessionReceiptCount: current.sessionReceiptCount,
+      sessionReceiptRootSha256: current.sessionReceiptRootSha256,
+      attempts: current.attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, sealNowMs),
+      inventorySealedAtDbMs: sealNowMs,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: aggregate.completedClaimTokenSha256,
+      aggregateReceiptSha256: aggregate.receiptSha256,
+    });
+    try {
+      validateTenantContentInventoryCompletionProof(next, state.receipts, aggregate);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    if (this.tenantContentInventoryReceipts.has(current.requestId)) {
+      throw new TenantErasureIntegrityError();
+    }
+    const jobsBefore = new Map(this.tenantContentInventoryJobs);
+    const aggregatesBefore = new Map(this.tenantContentInventoryReceipts);
+    try {
+      this.tenantContentInventoryReceipts.set(current.requestId, aggregate);
+      this.tenantContentInventoryJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantContentInventoryJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantContentInventoryReceipts, aggregatesBefore);
+      throw error;
+    }
+    return clone(aggregate);
+  }
+
+  async getTenantContentInventoryJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantContentInventoryJobRecord | null> {
+    const job = this.tenantContentInventoryJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    this.assertTenantContentInventorySource(job, job.phase !== "inventory_sealed");
+    const receipts = this.tenantContentInventoryReceiptsFor(job);
+    if (job.phase === "inventory_sealed") {
+      const aggregate = this.tenantContentInventoryReceipts.get(requestId);
+      if (!aggregate) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantContentInventoryCompletionProof(job, receipts, aggregate);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    return clone(job);
+  }
+
+  async getTenantSessionContentReceipts(
+    tenantId: string,
+    requestId: string,
+    buildGeneration: number,
+  ): Promise<TenantSessionContentReceipt[]> {
+    const job = this.tenantContentInventoryJobs.get(requestId);
+    if (
+      !job
+      || job.tenantId !== tenantId
+      || job.buildGeneration !== buildGeneration
+    ) return [];
+    this.assertTenantContentInventorySource(job, job.phase !== "inventory_sealed");
+    const receipts = this.tenantContentInventoryReceiptsFor(job);
+    if (job.phase === "inventory_sealed") {
+      const aggregate = this.tenantContentInventoryReceipts.get(requestId);
+      if (!aggregate) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantContentInventoryCompletionProof(job, receipts, aggregate);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    } else {
+      for (const receipt of receipts) validateTenantSessionContentReceipt(receipt);
+      if (
+        receipts.length !== job.sessionReceiptCount
+        || tenantContentInventorySessionReceiptRootSha256(receipts)
+          !== job.sessionReceiptRootSha256
+      ) throw new TenantErasureIntegrityError();
+    }
+    return receipts.map(clone);
+  }
+
+  async getTenantContentInventoryReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantContentInventoryReceipt | null> {
+    const aggregate = this.tenantContentInventoryReceipts.get(requestId);
+    if (!aggregate || aggregate.tenantId !== tenantId) return null;
+    const job = this.tenantContentInventoryJobs.get(requestId);
+    if (!job) throw new TenantErasureIntegrityError();
+    const receipts = this.tenantContentInventoryReceiptsFor(job);
+    this.assertTenantContentInventorySource(job, false);
+    try {
+      validateTenantContentInventoryCompletionProof(job, receipts, aggregate);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return clone(aggregate);
   }
 
   async getSubjectLifecycle(

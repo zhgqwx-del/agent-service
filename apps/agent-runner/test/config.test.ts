@@ -30,6 +30,12 @@ describe("runner configuration", () => {
     expect(cfg.TENANT_RUNTIME_REVOCATION_REQUEST_TIMEOUT_MS).toBe(30_000);
     expect(cfg.TENANT_RUNTIME_REVOCATION_WORKER_BATCH_SIZE).toBe(5);
     expect(cfg.TENANT_RUNTIME_REVOCATION_MATERIALIZE_BATCH_SIZE).toBe(25);
+    expect(cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED).toBe(false);
+    expect(cfg.TENANT_CONTENT_INVENTORY_WORKER_POLL_MS).toBe(1_000);
+    expect(cfg.TENANT_CONTENT_INVENTORY_WORKER_LEASE_MS).toBe(30_000);
+    expect(cfg.TENANT_CONTENT_INVENTORY_WORKER_BATCH_SIZE).toBe(5);
+    expect(cfg.TENANT_CONTENT_INVENTORY_MATERIALIZE_BATCH_SIZE).toBe(25);
+    expect(cfg.TENANT_CONTENT_INVENTORY_SESSION_PAGE_SIZE).toBe(100);
     expect(cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS).toBe(2_000);
     expect(cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
@@ -252,6 +258,31 @@ describe("runner configuration", () => {
       SECRETS_MASTER_KEY: SECRET,
       TENANT_RUNTIME_DRAIN_ENABLED: "true",
       RUNNER_ID: "runner-local-a",
+    })).toThrow();
+  });
+
+  it("keeps the non-destructive T3c inventory worker independently default-off", () => {
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_CONTENT_INVENTORY_WORKER_ENABLED: "1",
+      TENANT_CONTENT_INVENTORY_WORKER_BATCH_SIZE: "7",
+      TENANT_CONTENT_INVENTORY_MATERIALIZE_BATCH_SIZE: "11",
+      TENANT_CONTENT_INVENTORY_SESSION_PAGE_SIZE: "13",
+    });
+    expect(enabled.TENANT_CONTENT_INVENTORY_WORKER_ENABLED).toBe(true);
+    expect(enabled.TENANT_CONTENT_INVENTORY_WORKER_BATCH_SIZE).toBe(7);
+    expect(enabled.TENANT_CONTENT_INVENTORY_MATERIALIZE_BATCH_SIZE).toBe(11);
+    expect(enabled.TENANT_CONTENT_INVENTORY_SESSION_PAGE_SIZE).toBe(13);
+    expect(enabled.ERASURE_ROUTER_URL).toBeUndefined();
+    expect(enabled.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED).toBe(false);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_CONTENT_INVENTORY_RETRY_BASE_MS: "2",
+      TENANT_CONTENT_INVENTORY_RETRY_MAX_MS: "1",
+    })).toThrow(/TENANT_CONTENT_INVENTORY_RETRY_MAX_MS/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_CONTENT_INVENTORY_WORKER_ENABLED: "true",
     })).toThrow();
   });
 

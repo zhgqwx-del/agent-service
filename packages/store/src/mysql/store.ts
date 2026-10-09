@@ -438,6 +438,51 @@ import {
   type TenantRuntimeRevocationStore,
   type TenantRuntimeRevocationTargetReceipt,
 } from "../tenant-runtime-revocation.js";
+import {
+  EMPTY_TENANT_SESSION_RECEIPT_ROOT_SHA256,
+  TENANT_CONTENT_INVENTORY_GLOBAL_ORPHAN_CHECK,
+  TENANT_CONTENT_INVENTORY_RECEIPT_SCOPE,
+  TENANT_SESSION_CONTENT_RECEIPT_SCOPE,
+  TenantContentInventoryEvidenceChangedError,
+  TenantContentInventoryNotReadyError,
+  tenantContentIdentityRootSha256,
+  tenantContentEventIdentityRow,
+  tenantContentInventoryAuthorizationMatches,
+  tenantContentInventoryClaimFromJob,
+  tenantContentInventoryClaimTokenSha256,
+  tenantContentInventoryHoldControlRootSha256,
+  tenantContentInventoryHoldControlSha256,
+  tenantContentInventoryNextSessionReceiptRootSha256,
+  tenantContentInventoryReceiptMatchesAuthorization,
+  tenantContentInventoryReceiptSha256,
+  tenantContentInventorySessionReceiptRootSha256,
+  tenantSessionContentReceiptSha256,
+  tenantSessionContentRootSha256,
+  tenantSessionStructuralSha256,
+  validateBuildTenantContentInventoryPageOptions,
+  validateClaimTenantContentInventoriesOptions,
+  validateMaterializeTenantContentInventoryJobsOptions,
+  validateRenewTenantContentInventoryOptions,
+  validateRetryTenantContentInventoryOptions,
+  validateTenantContentInventoryAuthorization,
+  validateTenantContentInventoryCompletionProof,
+  validateTenantContentInventoryJobRecord,
+  validateTenantContentInventoryReceipt,
+  validateTenantSessionContentReceipt,
+  type BuildTenantContentInventoryPageOptions,
+  type BuildTenantContentInventoryPageResult,
+  type ClaimTenantContentInventoriesOptions,
+  type MaterializeTenantContentInventoryJobsOptions,
+  type RenewTenantContentInventoryOptions,
+  type RetryTenantContentInventoryOptions,
+  type TenantContentInventoryAuthorization,
+  type TenantContentInventoryClaim,
+  type TenantContentIdentityRows,
+  type TenantContentInventoryJobRecord,
+  type TenantContentInventoryReceipt,
+  type TenantContentInventoryStore,
+  type TenantSessionContentReceipt,
+} from "../tenant-content-inventory.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -500,6 +545,49 @@ const TENANT_RUNTIME_REVOCATION_RECEIPT_COLUMNS = `request_id, tenant_id, subjec
   target_receipts_sha256, store_db_timestamp_ms, completed_claim_attempt,
   completed_claim_token_sha256, memory_disposition, external_disposition,
   content_purge_required, receipt_sha256`;
+const TENANT_CONTENT_INVENTORY_JOB_COLUMNS = `request_id, tenant_id, subject_generation,
+  t1_fence_sha256, t3a_receipt_sha256, t3b_receipt_sha256, policy_version, policy_sha256,
+  policy_schema_version, build_generation, retention_anchor_db_ms, content_not_before_db_ms,
+  cursor_session_id, scan_complete, session_receipt_count, session_receipt_root_sha256, phase,
+  available_at_ms, attempts, claim_token, lease_until_ms, last_error_code, created_at_ms,
+  updated_at_ms, sealed_at_ms, completed_claim_attempt, completed_claim_token_sha256,
+  aggregate_receipt_sha256, blocked_at_ms, blocked_reason_code`;
+const TENANT_SESSION_CONTENT_RECEIPT_COLUMNS = `scope, request_id, build_generation, tenant_id,
+  subject_generation, session_id, session_sha256, turn_count, turn_root_sha256, item_count,
+  item_root_sha256, event_count, event_root_sha256, approval_count, approval_root_sha256,
+  content_record_count, content_root_sha256, captured_at_db_ms, receipt_sha256`;
+const TENANT_CONTENT_INVENTORY_RECEIPT_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, build_generation, t1_fence_sha256, t3a_receipt_sha256,
+  t3b_receipt_sha256, policy_version, policy_sha256, policy_schema_version,
+  retention_anchor_db_ms, content_not_before_db_ms, session_receipt_count,
+  session_receipt_root_sha256, content_record_count, hold_control_count, hold_root_sha256,
+  global_orphan_check, store_db_timestamp_ms, completed_claim_attempt,
+  completed_claim_token_sha256, content_inventory_complete, content_purge_executed,
+  receipt_sha256`;
+type TenantContentSessionRow = {
+  sessionId: string;
+  tenantId: string;
+  userId: string;
+  parentSessionId?: string;
+  lastSeq: number;
+  deletionGeneration: number;
+  deletedAtMs?: number;
+  lifecycleDisposition: "live" | "archived" | "tombstoned";
+};
+type TenantSessionContentEvidence = Pick<
+  TenantSessionContentReceipt,
+  | "sessionSha256"
+  | "turnCount"
+  | "turnRootSha256"
+  | "itemCount"
+  | "itemRootSha256"
+  | "eventCount"
+  | "eventRootSha256"
+  | "approvalCount"
+  | "approvalRootSha256"
+  | "contentRecordCount"
+  | "contentRootSha256"
+>;
 const ERASURE_CONTROL_EVENT_COLUMNS = `control_event_id, request_id, control_generation, event_type,
   phase, reason_code, action_code, actor_key_id, before_sha256, after_sha256, emitted_at_ms`;
 const LEGACY_TOMBSTONE_JOB_COLUMNS = `job_id, session_id, tenant_id, user_id, source_kind,
@@ -1965,6 +2053,244 @@ function rowToTenantRuntimeRevocationReceipt(row: Row): TenantRuntimeRevocationR
   }
 }
 
+function rowToTenantContentInventoryJob(row: Row): TenantContentInventoryJobRecord {
+  try {
+    const common = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant content inventory generation",
+        1,
+      ),
+      buildGeneration: storedSafeInteger(
+        row.build_generation,
+        "stored tenant content inventory build generation",
+        1,
+      ),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3aReceiptSha256: String(row.t3a_receipt_sha256),
+      t3bReceiptSha256: String(row.t3b_receipt_sha256),
+      policyVersion: String(row.policy_version),
+      policySha256: String(row.policy_sha256),
+      policySchemaVersion: storedSafeInteger(
+        row.policy_schema_version,
+        "stored tenant content inventory policy schema version",
+        1,
+      ) as typeof RETENTION_POLICY_SCHEMA_VERSION,
+      retentionAnchorDbMs: storedSafeInteger(
+        row.retention_anchor_db_ms,
+        "stored tenant content inventory retention anchor",
+      ),
+      contentNotBeforeDbMs: storedSafeInteger(
+        row.content_not_before_db_ms,
+        "stored tenant content inventory content deadline",
+      ),
+      ...(row.cursor_session_id == null ? {} : { cursorSessionId: String(row.cursor_session_id) }),
+      scanComplete: tenantCredentialBoolean(
+        row.scan_complete,
+        "stored tenant content inventory scan marker",
+      ),
+      sessionReceiptCount: storedSafeInteger(
+        row.session_receipt_count,
+        "stored tenant content inventory session receipt count",
+      ),
+      sessionReceiptRootSha256: String(row.session_receipt_root_sha256),
+      attempts: storedSafeInteger(row.attempts, "stored tenant content inventory attempts"),
+      createdAtMs: storedSafeInteger(
+        row.created_at_ms,
+        "stored tenant content inventory creation timestamp",
+      ),
+      updatedAtMs: storedSafeInteger(
+        row.updated_at_ms,
+        "stored tenant content inventory update timestamp",
+      ),
+    };
+    const phase = String(row.phase);
+    let record: TenantContentInventoryJobRecord;
+    if (phase === "queued") {
+      record = {
+        ...common,
+        phase,
+        availableAtMs: storedSafeInteger(
+          row.available_at_ms,
+          "stored tenant content inventory availability",
+        ),
+        ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+        ...(row.lease_until_ms == null
+          ? {}
+          : {
+              leaseUntilMs: storedSafeInteger(
+                row.lease_until_ms,
+                "stored tenant content inventory lease",
+              ),
+            }),
+        ...(row.last_error_code == null
+          ? {}
+          : { lastErrorCode: String(row.last_error_code) as "temporary_failure" }),
+      };
+    } else if (phase === "inventory_sealed") {
+      record = {
+        ...common,
+        phase,
+        inventorySealedAtDbMs: storedSafeInteger(
+          row.sealed_at_ms,
+          "stored tenant content inventory seal timestamp",
+        ),
+        completedClaimAttempt: storedSafeInteger(
+          row.completed_claim_attempt,
+          "stored tenant content inventory completion attempt",
+          1,
+        ),
+        completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+        aggregateReceiptSha256: String(row.aggregate_receipt_sha256),
+      };
+    } else if (phase === "blocked") {
+      record = {
+        ...common,
+        phase,
+        blockedAtDbMs: storedSafeInteger(
+          row.blocked_at_ms,
+          "stored tenant content inventory blocked timestamp",
+        ),
+        blockedReasonCode: String(row.blocked_reason_code) as "integrity_conflict",
+      };
+    } else {
+      throw new TenantErasureIntegrityError();
+    }
+    validateTenantContentInventoryJobRecord(record);
+    return record;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantSessionContentReceipt(row: Row): TenantSessionContentReceipt {
+  try {
+    const receipt: TenantSessionContentReceipt = {
+      scope: String(row.scope) as TenantSessionContentReceipt["scope"],
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant session content subject generation",
+        1,
+      ),
+      buildGeneration: storedSafeInteger(
+        row.build_generation,
+        "stored tenant session content build generation",
+        1,
+      ),
+      sessionId: String(row.session_id),
+      sessionSha256: String(row.session_sha256),
+      turnCount: storedSafeInteger(row.turn_count, "stored tenant session turn count"),
+      turnRootSha256: String(row.turn_root_sha256),
+      itemCount: storedSafeInteger(row.item_count, "stored tenant session item count"),
+      itemRootSha256: String(row.item_root_sha256),
+      eventCount: storedSafeInteger(row.event_count, "stored tenant session event count"),
+      eventRootSha256: String(row.event_root_sha256),
+      approvalCount: storedSafeInteger(
+        row.approval_count,
+        "stored tenant session approval count",
+      ),
+      approvalRootSha256: String(row.approval_root_sha256),
+      contentRecordCount: storedSafeInteger(
+        row.content_record_count,
+        "stored tenant session content record count",
+        1,
+      ),
+      contentRootSha256: String(row.content_root_sha256),
+      capturedAtDbMs: storedSafeInteger(
+        row.captured_at_db_ms,
+        "stored tenant session content capture timestamp",
+      ),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantSessionContentReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantContentInventoryReceipt(row: Row): TenantContentInventoryReceipt {
+  try {
+    const receipt: TenantContentInventoryReceipt = {
+      scope: String(row.scope) as TenantContentInventoryReceipt["scope"],
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored tenant content inventory receipt generation",
+        1,
+      ),
+      buildGeneration: storedSafeInteger(
+        row.build_generation,
+        "stored tenant content inventory receipt build generation",
+        1,
+      ),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3aReceiptSha256: String(row.t3a_receipt_sha256),
+      t3bReceiptSha256: String(row.t3b_receipt_sha256),
+      policyVersion: String(row.policy_version),
+      policySha256: String(row.policy_sha256),
+      policySchemaVersion: storedSafeInteger(
+        row.policy_schema_version,
+        "stored tenant content inventory receipt policy schema version",
+        1,
+      ) as typeof RETENTION_POLICY_SCHEMA_VERSION,
+      retentionAnchorDbMs: storedSafeInteger(
+        row.retention_anchor_db_ms,
+        "stored tenant content inventory receipt retention anchor",
+      ),
+      contentNotBeforeDbMs: storedSafeInteger(
+        row.content_not_before_db_ms,
+        "stored tenant content inventory receipt content deadline",
+      ),
+      sessionReceiptCount: storedSafeInteger(
+        row.session_receipt_count,
+        "stored tenant content inventory receipt session count",
+      ),
+      sessionReceiptRootSha256: String(row.session_receipt_root_sha256),
+      contentRecordCount: storedSafeInteger(
+        row.content_record_count,
+        "stored tenant content inventory receipt content count",
+      ),
+      holdControlCount: storedSafeInteger(
+        row.hold_control_count,
+        "stored tenant content inventory hold control count",
+      ),
+      holdControlRootSha256: String(row.hold_root_sha256),
+      globalOrphanCheck: String(
+        row.global_orphan_check,
+      ) as TenantContentInventoryReceipt["globalOrphanCheck"],
+      storeDbTimestampMs: storedSafeInteger(
+        row.store_db_timestamp_ms,
+        "stored tenant content inventory receipt timestamp",
+      ),
+      completedClaimAttempt: storedSafeInteger(
+        row.completed_claim_attempt,
+        "stored tenant content inventory receipt completion attempt",
+        1,
+      ),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      contentInventoryComplete: tenantCredentialBoolean(
+        row.content_inventory_complete,
+        "stored tenant content inventory completion flag",
+      ) as true,
+      contentPurgeExecuted: tenantCredentialBoolean(
+        row.content_purge_executed,
+        "stored tenant content purge flag",
+      ) as false,
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantContentInventoryReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
 function mysqlControlGeneration(value: unknown): {
   projected: number;
   raw: string;
@@ -2776,10 +3102,13 @@ export class MysqlSessionStore implements
   ErasurePolicyEvaluationStore,
   TenantCredentialRevocationStore,
   TenantRuntimeRevocationStore,
+  TenantContentInventoryStore,
   UserDataExportRequestStore,
   UserDataExportJobStore,
   UserDataExportCleanupStore
 {
+  private tenantContentMaterializationCursorRequestId?: string;
+
   private constructor(private readonly pool: Pool) {}
 
   /**
@@ -10327,6 +10656,2419 @@ export class MysqlSessionStore implements
         throw new TenantErasureIntegrityError();
       }
       return receipt;
+    });
+  }
+
+  private async beginTenantContentInventoryTransaction(conn: PoolConnection): Promise<void> {
+    // The owner/global scans below rely on InnoDB next-key locks. Pin the isolation level for
+    // every T3c writer instead of inheriting a deployment-specific server/session default.
+    await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    await conn.beginTransaction();
+  }
+
+  private async loadTenantContentInventoryJob(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" | "FOR UPDATE SKIP LOCKED" = "",
+  ): Promise<TenantContentInventoryJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_CONTENT_INVENTORY_JOB_COLUMNS}
+         FROM tenant_content_inventory_jobs
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const job = rowToTenantContentInventoryJob(rows[0]);
+    return job.tenantId === tenantId && job.requestId === requestId ? job : null;
+  }
+
+  private async loadTenantSessionContentReceipts(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    buildGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantSessionContentReceipt[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_SESSION_CONTENT_RECEIPT_COLUMNS}
+         FROM session_content_receipts
+        WHERE tenant_id=? AND request_id=? AND build_generation=?
+        ORDER BY session_id ${lock}`,
+      [tenantId, requestId, buildGeneration],
+    );
+    return rows.map((row) => {
+      const receipt = rowToTenantSessionContentReceipt(row);
+      if (
+        receipt.tenantId !== tenantId
+        || receipt.requestId !== requestId
+        || receipt.buildGeneration !== buildGeneration
+      ) throw new TenantErasureIntegrityError();
+      return receipt;
+    });
+  }
+
+  private async loadTenantContentInventoryReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantContentInventoryReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_CONTENT_INVENTORY_RECEIPT_COLUMNS}
+         FROM tenant_content_inventory_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const receipt = rowToTenantContentInventoryReceipt(rows[0]);
+    return receipt.tenantId === tenantId && receipt.requestId === requestId ? receipt : null;
+  }
+
+  private async validateTenantContentInventoryImmutableSource(
+    conn: PoolConnection,
+    job: TenantContentInventoryJobRecord,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<{
+    admission: ErasureRequestRecord;
+    fence: TenantCredentialRevocationFence;
+    firstAudit: ErasureAuditEvent;
+    policy: RetentionPolicyVersionRecord;
+    runtimeJob: TenantRuntimeRevocationJobRecord;
+    runtimeReceipt: TenantRuntimeRevocationReceipt;
+  }> {
+    const runtimePreflight = await this.loadTenantRuntimeRevocationJob(
+      conn,
+      job.tenantId,
+      job.requestId,
+    );
+    if (!runtimePreflight || runtimePreflight.phase !== "configured_fleet_quiesced") {
+      throw new TenantErasureIntegrityError();
+    }
+    const t1t3a = await this.validateTenantRuntimeRevocationImmutableSourceProof(
+      conn,
+      runtimePreflight,
+      lock,
+    );
+    const runtimeJob = await this.loadTenantRuntimeRevocationJob(
+      conn,
+      job.tenantId,
+      job.requestId,
+      lock,
+    );
+    if (!runtimeJob || runtimeJob.phase !== "configured_fleet_quiesced") {
+      throw new TenantErasureIntegrityError();
+    }
+    const runtimeTargets = await this.loadTenantRuntimeRevocationTargetReceipts(
+      conn,
+      job.tenantId,
+      job.requestId,
+      lock,
+    );
+    const runtimeReceipt = await this.loadTenantRuntimeRevocationReceipt(
+      conn,
+      job.tenantId,
+      job.requestId,
+      lock,
+    );
+    if (!runtimeReceipt) throw new TenantErasureIntegrityError();
+    try {
+      validateTenantRuntimeRevocationCompletionProof(
+        runtimeJob,
+        runtimeTargets,
+        runtimeReceipt,
+      );
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    // T3a and T3b are independently committed using the database clock, but T3b's current
+    // materializer does not floor its queue timestamp to the terminal T3a receipt. A database
+    // clock rollback can therefore legitimately make either terminal receipt the high-water mark.
+    // The T3c anchor must bind both rather than imposing a false ordering between them.
+    if (job.retentionAnchorDbMs < Math.max(
+      t1t3a.credentialReceipt.storeDbTimestampMs,
+      runtimeReceipt.storeDbTimestampMs,
+    )) throw new TenantErasureIntegrityError();
+    const admission = t1t3a.admission;
+    if (
+      runtimeJob.requestId !== job.requestId
+      || runtimeJob.tenantId !== job.tenantId
+      || runtimeJob.subjectGeneration !== job.subjectGeneration
+      || runtimeJob.t1FenceSha256 !== job.t1FenceSha256
+      || runtimeJob.t3aReceiptSha256 !== job.t3aReceiptSha256
+      || runtimeReceipt.receiptSha256 !== job.t3bReceiptSha256
+      || admission.policyVersion !== job.policyVersion
+      || admission.policyHash !== job.policySha256
+    ) throw new TenantErasureIntegrityError();
+    let policy: RetentionPolicyVersionRecord | null;
+    try {
+      // Validate the complete append-only activation chain before trusting the immutable version
+      // captured by T1. A later activation may legitimately supersede that version, so only the
+      // ledger integrity (not current-active equality) is required here.
+      const active = await this.loadValidatedActiveRetentionPolicy(conn, job.tenantId, lock);
+      if (!active) throw new Error("tenant content inventory has no policy activation proof");
+      policy = await this.loadRetentionPolicyVersion(
+        conn,
+        job.tenantId,
+        job.policyVersion,
+        lock,
+      );
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    const deadline = policy === null
+      ? { kind: "invalid" as const }
+      : checkedRetentionDeadline(
+          job.retentionAnchorDbMs,
+          policy.policy.sessionContentRetentionMs,
+        );
+    if (
+      !policy
+      || policy.tenantId !== job.tenantId
+      || policy.policyVersion !== job.policyVersion
+      || policy.policySha256 !== job.policySha256
+      || policy.schemaVersion !== job.policySchemaVersion
+      || policy.policy.sessionContentRetentionMs === null
+      || deadline.kind !== "deadline"
+      || deadline.value !== job.contentNotBeforeDbMs
+    ) throw new TenantErasureIntegrityError();
+    return {
+      admission,
+      fence: t1t3a.fence,
+      firstAudit: t1t3a.firstAudit,
+      policy,
+      runtimeJob,
+      runtimeReceipt,
+    };
+  }
+
+  private async lockAndValidateTenantContentInventoryCurrentSource(
+    conn: PoolConnection,
+    job: TenantContentInventoryJobRecord,
+  ): Promise<RetentionPolicyVersionRecord> {
+    const [lifecycleRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [job.tenantId, job.tenantId],
+    );
+    if (
+      !lifecycleRows[0]
+      || String(lifecycleRows[0].tenant_id) !== job.tenantId
+      || String(lifecycleRows[0].subject_kind) !== "tenant"
+      || String(lifecycleRows[0].subject_id) !== job.tenantId
+    ) throw new TenantErasureIntegrityError();
+    let lifecycle: SubjectLifecycleRecord;
+    try {
+      lifecycle = rowToSubjectLifecycle(lifecycleRows[0]);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    const source = await this.validateTenantContentInventoryImmutableSource(conn, job, "FOR SHARE");
+    try {
+      validateTenantErasureAdmissionProof({
+        lifecycle,
+        admission: source.admission,
+        fence: source.fence,
+        firstAudit: source.firstAudit,
+      });
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return source.policy;
+  }
+
+  private tenantContentInventorySameSource(
+    left: TenantContentInventoryJobRecord,
+    right: TenantContentInventoryJobRecord,
+  ): boolean {
+    return left.requestId === right.requestId
+      && left.tenantId === right.tenantId
+      && left.subjectGeneration === right.subjectGeneration
+      && left.buildGeneration === right.buildGeneration
+      && left.t1FenceSha256 === right.t1FenceSha256
+      && left.t3aReceiptSha256 === right.t3aReceiptSha256
+      && left.t3bReceiptSha256 === right.t3bReceiptSha256
+      && left.policyVersion === right.policyVersion
+      && left.policySha256 === right.policySha256
+      && left.policySchemaVersion === right.policySchemaVersion
+      && left.retentionAnchorDbMs === right.retentionAnchorDbMs
+      && left.contentNotBeforeDbMs === right.contentNotBeforeDbMs;
+  }
+
+  private tenantContentSessionRow(row: Row): TenantContentSessionRow {
+    try {
+      const sessionId = String(row.session_id);
+      const tenantId = String(row.tenant_id);
+      const userId = String(row.user_id);
+      const parentSessionId = row.parent_session_id == null
+        ? undefined
+        : String(row.parent_session_id);
+      const lastSeq = mysqlSafeInteger(row.last_seq, "tenant content session last sequence");
+      const deletionGeneration = mysqlSafeInteger(
+        row.deletion_generation,
+        "tenant content session deletion generation",
+      );
+      const archivedAtMs = row.archived_at_ms == null
+        ? undefined
+        : mysqlSafeInteger(row.archived_at_ms, "tenant content session archive timestamp");
+      const deletedAtMs = row.deleted_at_ms == null
+        ? undefined
+        : mysqlSafeInteger(row.deleted_at_ms, "tenant content session deletion timestamp");
+      if (
+        !isCanonicalId("sess", sessionId)
+        || !tenantId
+        || tenantId.length > 128
+        || !userId
+        || userId.length > 128
+        || (parentSessionId !== undefined && (
+          !isCanonicalId("sess", parentSessionId) || parentSessionId === sessionId
+        ))
+        || (deletedAtMs === undefined && deletionGeneration !== 0)
+        || (deletedAtMs !== undefined && deletionGeneration < 1)
+      ) throw new Error("tenant content session identity is invalid");
+      return {
+        sessionId,
+        tenantId,
+        userId,
+        ...(parentSessionId === undefined ? {} : { parentSessionId }),
+        lastSeq,
+        deletionGeneration,
+        ...(deletedAtMs === undefined ? {} : { deletedAtMs }),
+        lifecycleDisposition: deletedAtMs !== undefined
+          ? "tombstoned"
+          : archivedAtMs === undefined ? "live" : "archived",
+      };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private validateTenantContentEventRelations(
+    session: TenantContentSessionRow,
+    events: readonly PersistedEvent[],
+    turns: ReadonlyMap<string, {
+      sessionId: string;
+      seqStart: number;
+      seqEnd?: number;
+      status: string;
+    }>,
+    items: ReadonlyMap<string, {
+      sessionId: string;
+      turnId: string;
+      seq: number;
+      type: string;
+      status: string;
+      approvalId?: string;
+      toolCallId?: string;
+      name?: string;
+    }>,
+    approvals: ReadonlyMap<string, {
+      sessionId: string;
+      turnId: string;
+      itemId: string;
+      status: string;
+      toolCallId: string;
+      toolName: string;
+    }>,
+  ): void {
+    for (const event of events) {
+      if ("turn" in event) {
+        const turn = turns.get(event.turn.id);
+        if (
+          !turn
+          || event.turn.sessionId !== session.sessionId
+          || turn.sessionId !== session.sessionId
+          || turn.seqStart !== event.turn.seqStart
+        ) throw new Error("tenant content event turn relation is invalid");
+      }
+      if ("item" in event) {
+        const item = items.get(event.item.id);
+        const turn = turns.get(event.item.turnId);
+        const standaloneCompaction = event.item.type === "contextCompaction";
+        if (
+          !item
+          || event.item.sessionId !== session.sessionId
+          || item.sessionId !== session.sessionId
+          || item.turnId !== event.item.turnId
+          || item.seq !== event.item.seq
+          || item.type !== event.item.type
+          || (!standaloneCompaction && !turn)
+          || (turn !== undefined && turn.sessionId !== session.sessionId)
+        ) throw new Error("tenant content event item relation is invalid");
+        if (event.item.type === "approvalRequest") {
+          const approval = approvals.get(event.item.approvalId);
+          if (
+            item.approvalId !== event.item.approvalId
+            || item.toolCallId !== event.item.toolCallId
+            || item.name !== event.item.name
+            || !approval
+            || approval.sessionId !== session.sessionId
+            || approval.turnId !== event.item.turnId
+            || approval.toolCallId !== event.item.toolCallId
+            || approval.toolName !== event.item.name
+          ) throw new Error("tenant content event approval request relation is invalid");
+        }
+      }
+      if ("approval" in event) {
+        const approval = approvals.get(event.approval.id);
+        const turn = turns.get(event.approval.turnId);
+        const requestItems = [...items.values()].filter((item) => (
+          item.type === "approvalRequest" && item.approvalId === event.approval.id
+        ));
+        const item = requestItems[0];
+        if (
+          !approval
+          || !turn
+          || !item
+          || requestItems.length !== 1
+          || event.approval.sessionId !== session.sessionId
+          || approval.sessionId !== session.sessionId
+          || approval.turnId !== event.approval.turnId
+          || approval.itemId !== event.approval.itemId
+          || turn.sessionId !== session.sessionId
+          || item.sessionId !== session.sessionId
+          || item.turnId !== event.approval.turnId
+          || item.toolCallId !== event.approval.toolCallId
+          || item.name !== event.approval.toolName
+          || approval.toolCallId !== event.approval.toolCallId
+          || approval.toolName !== event.approval.toolName
+        ) throw new Error("tenant content event approval relation is invalid");
+      }
+      if ("turnId" in event && event.turnId !== undefined) {
+        const turn = turns.get(event.turnId);
+        if (!turn || turn.sessionId !== session.sessionId) {
+          throw new Error("tenant content event turn id is invalid");
+        }
+      }
+      if (event.type === "turn/steered") {
+        const item = items.get(event.itemId);
+        if (
+          !item
+          || item.sessionId !== session.sessionId
+          || item.turnId !== event.turnId
+        ) {
+          throw new Error("tenant content steered item relation is invalid");
+        }
+      }
+      if (event.type === "session/compacted") {
+        const item = items.get(event.itemId);
+        if (
+          !item
+          || item.sessionId !== session.sessionId
+          || item.type !== "contextCompaction"
+        ) {
+          throw new Error("tenant content compacted item relation is invalid");
+        }
+      }
+      if (event.type === "session/status/changed" && event.status.type === "active") {
+        const turn = turns.get(event.status.turnId);
+        if (!turn || turn.sessionId !== session.sessionId) {
+          throw new Error("tenant content event active turn is invalid");
+        }
+      }
+    }
+    const deleted = events.filter((event) => event.type === "session/deleted");
+    if (session.lifecycleDisposition === "tombstoned") {
+      const terminal = deleted[0];
+      if (
+        deleted.length !== 1
+        || !terminal
+        || terminal.deletionGeneration !== session.deletionGeneration
+        || terminal.emittedAtMs !== session.deletedAtMs
+        || terminal.seq !== session.lastSeq
+      ) throw new Error("tenant content terminal tombstone relation is invalid");
+    } else if (deleted.length !== 0) {
+      throw new Error("live tenant content session contains a tombstone event");
+    }
+  }
+
+  private async loadTenantSessionContentEvidence(
+    conn: PoolConnection,
+    session: TenantContentSessionRow,
+  ): Promise<TenantSessionContentEvidence> {
+    try {
+      if (session.parentSessionId !== undefined) {
+        const [parentRows] = await conn.query<Row[]>(
+          `SELECT session_id, tenant_id, user_id, parent_session_id, last_seq,
+                  archived_at_ms, deleted_at_ms, deletion_generation
+             FROM sessions
+            WHERE session_id=? FOR SHARE`,
+          [session.parentSessionId],
+        );
+        if (!parentRows[0]) throw new Error("tenant content parent session is missing");
+        const parent = this.tenantContentSessionRow(parentRows[0]);
+        if (
+          parent.sessionId !== session.parentSessionId
+          || parent.tenantId !== session.tenantId
+          || parent.userId !== session.userId
+        ) throw new Error("tenant content parent owner is invalid");
+      }
+
+      const [turnRows] = await conn.query<Row[]>(
+        `SELECT turn_id, session_id, user_id, status, seq_start, seq_end, body
+           FROM turns FORCE INDEX (idx_turns_session)
+          WHERE session_id=? ORDER BY turn_id FOR SHARE`,
+        [session.sessionId],
+      );
+      const turns = new Map<string, {
+        sessionId: string;
+        seqStart: number;
+        seqEnd?: number;
+        status: string;
+      }>();
+      const turnIdentities: TenantContentIdentityRows["turn"][] = [];
+      for (const row of turnRows) {
+        const turnId = String(row.turn_id);
+        const seqStart = storedSafeInteger(row.seq_start, "tenant content turn start", 1);
+        const seqEnd = row.seq_end == null
+          ? undefined
+          : storedSafeInteger(row.seq_end, "tenant content turn end", 1);
+        const parsedTurn = TurnSchema.safeParse(parse<unknown>(row.body));
+        const status = String(row.status);
+        if (
+          !parsedTurn.success
+          || !isCanonicalId("turn", turnId)
+          || String(row.session_id) !== session.sessionId
+          || String(row.user_id) !== session.userId
+          || parsedTurn.data.id !== turnId
+          || parsedTurn.data.sessionId !== session.sessionId
+          || parsedTurn.data.status !== status
+          || parsedTurn.data.seqStart !== seqStart
+          || parsedTurn.data.seqEnd !== seqEnd
+          || turns.has(turnId)
+          || seqStart > session.lastSeq
+          || (seqEnd !== undefined && (seqEnd < seqStart || seqEnd > session.lastSeq))
+        ) throw new Error("tenant content turn relation is invalid");
+        turns.set(turnId, {
+          sessionId: session.sessionId,
+          seqStart,
+          ...(seqEnd === undefined ? {} : { seqEnd }),
+          status,
+        });
+        turnIdentities.push([turnId, seqStart, seqEnd ?? null, status]);
+      }
+
+      const [itemRows] = await conn.query<Row[]>(
+        `SELECT item_id, session_id, user_id, turn_id, seq, type, status, body
+           FROM items FORCE INDEX (uk_items_session_seq)
+          WHERE session_id=? ORDER BY seq, item_id FOR SHARE`,
+        [session.sessionId],
+      );
+      const items = new Map<string, {
+        sessionId: string;
+        turnId: string;
+        seq: number;
+        type: string;
+        status: string;
+        approvalId?: string;
+        toolCallId?: string;
+        name?: string;
+      }>();
+      const itemIdentities: TenantContentIdentityRows["item"][] = [];
+      for (const row of itemRows) {
+        const itemId = String(row.item_id);
+        const turnId = String(row.turn_id);
+        const seq = storedSafeInteger(row.seq, "tenant content item sequence", 1);
+        const type = String(row.type);
+        const status = String(row.status);
+        const parsedItem = ItemSchema.safeParse(parse<unknown>(row.body));
+        const standaloneCompaction = parsedItem.success
+          && parsedItem.data.type === "contextCompaction";
+        const turn = turns.get(turnId);
+        if (
+          !parsedItem.success
+          || !isCanonicalId("item", itemId)
+          || !isCanonicalId("turn", turnId)
+          || String(row.session_id) !== session.sessionId
+          || String(row.user_id) !== session.userId
+          || parsedItem.data.id !== itemId
+          || parsedItem.data.sessionId !== session.sessionId
+          || parsedItem.data.turnId !== turnId
+          || parsedItem.data.seq !== seq
+          || parsedItem.data.type !== type
+          || parsedItem.data.status !== status
+          || (!standaloneCompaction && !turn)
+          || (turn !== undefined && turn.sessionId !== session.sessionId)
+          || items.has(itemId)
+          || seq > session.lastSeq
+        ) throw new Error("tenant content item relation is invalid");
+        // A context-compaction turn id is a usage grouping key, not necessarily a turns row. If a
+        // row with that id does exist outside this session, however, it is cross-owner corruption.
+        if (standaloneCompaction && !turn) {
+          const [sameIdTurnRows] = await conn.query<Row[]>(
+            "SELECT session_id, user_id FROM turns WHERE turn_id=? FOR SHARE",
+            [turnId],
+          );
+          if (sameIdTurnRows[0]) throw new Error("tenant content compaction turn is cross-owner");
+        }
+        const approvalFields = parsedItem.data.type === "approvalRequest"
+          ? {
+              approvalId: parsedItem.data.approvalId,
+              toolCallId: parsedItem.data.toolCallId,
+              name: parsedItem.data.name,
+            }
+          : {};
+        items.set(itemId, {
+          sessionId: session.sessionId,
+          turnId,
+          seq,
+          type,
+          status,
+          ...approvalFields,
+        });
+        itemIdentities.push([
+          itemId,
+          turnId,
+          seq,
+          type,
+          status,
+          parsedItem.data.type === "approvalRequest" ? parsedItem.data.approvalId : null,
+        ]);
+      }
+
+      const [eventRows] = await conn.query<Row[]>(
+        `SELECT session_id, seq, user_id, type, body, emitted_at_ms
+           FROM events FORCE INDEX (PRIMARY)
+          WHERE session_id=? ORDER BY seq FOR SHARE`,
+        [session.sessionId],
+      );
+      const events: PersistedEvent[] = [];
+      const eventIdentities: TenantContentIdentityRows["event"][] = [];
+      for (const [index, row] of eventRows.entries()) {
+        const seq = storedSafeInteger(row.seq, "tenant content event sequence", 1);
+        const emittedAtMs = storedSafeInteger(
+          row.emitted_at_ms,
+          "tenant content event timestamp",
+        );
+        const parsedEvent = EventSchema.safeParse(parse<unknown>(row.body));
+        if (
+          !parsedEvent.success
+          || String(row.session_id) !== session.sessionId
+          || String(row.user_id) !== session.userId
+          || seq !== index + 1
+          || parsedEvent.data.sessionId !== session.sessionId
+          || parsedEvent.data.seq !== seq
+          || parsedEvent.data.type !== String(row.type)
+          || parsedEvent.data.emittedAtMs !== emittedAtMs
+        ) throw new Error("tenant content event relation is invalid");
+        events.push(parsedEvent.data as PersistedEvent);
+        eventIdentities.push(tenantContentEventIdentityRow(parsedEvent.data as PersistedEvent));
+      }
+      if (eventRows.length !== session.lastSeq) {
+        throw new Error("tenant content event sequence has a gap");
+      }
+
+      const [approvalRows] = await conn.query<Row[]>(
+        `SELECT approval_id, session_id, user_id, turn_id, status, body
+           FROM approvals FORCE INDEX (idx_approvals_session_identity)
+          WHERE session_id=? ORDER BY approval_id FOR SHARE`,
+        [session.sessionId],
+      );
+      const approvalIdentities: TenantContentIdentityRows["approval"][] = [];
+      const approvals = new Map<string, {
+        sessionId: string;
+        turnId: string;
+        itemId: string;
+        status: string;
+        toolCallId: string;
+        toolName: string;
+      }>();
+      for (const row of approvalRows) {
+        const approvalId = String(row.approval_id);
+        const turnId = String(row.turn_id);
+        const status = String(row.status);
+        const parsedApproval = ApprovalSchema.safeParse(parse<unknown>(row.body));
+        const itemId = parsedApproval.success ? parsedApproval.data.itemId : "";
+        const requestItems = parsedApproval.success
+          ? [...items.values()].filter((item) => (
+              item.type === "approvalRequest"
+              && item.approvalId === parsedApproval.data.id
+            ))
+          : [];
+        const item = requestItems[0];
+        if (
+          !parsedApproval.success
+          || !isCanonicalId("apr", approvalId)
+          || !isCanonicalId("turn", turnId)
+          || !isCanonicalId("item", itemId)
+          || String(row.session_id) !== session.sessionId
+          || String(row.user_id) !== session.userId
+          || parsedApproval.data.id !== approvalId
+          || parsedApproval.data.sessionId !== session.sessionId
+          || parsedApproval.data.turnId !== turnId
+          || parsedApproval.data.status !== status
+          || !turns.has(turnId)
+          || !item
+          || requestItems.length !== 1
+          || item.turnId !== turnId
+          || item.sessionId !== session.sessionId
+          || item.toolCallId !== parsedApproval.data.toolCallId
+          || item.name !== parsedApproval.data.toolName
+          || approvals.has(approvalId)
+        ) throw new Error("tenant content approval relation is invalid");
+        approvals.set(approvalId, {
+          sessionId: session.sessionId,
+          turnId,
+          itemId,
+          status,
+          toolCallId: parsedApproval.data.toolCallId,
+          toolName: parsedApproval.data.toolName,
+        });
+        approvalIdentities.push([approvalId, turnId, itemId, status]);
+      }
+      for (const item of items.values()) {
+        if (item.type !== "approvalRequest") continue;
+        const approval = item.approvalId === undefined
+          ? undefined
+          : approvals.get(item.approvalId);
+        if (
+          !approval
+          || approval.sessionId !== item.sessionId
+          || approval.turnId !== item.turnId
+          || approval.toolCallId !== item.toolCallId
+          || approval.toolName !== item.name
+        ) throw new Error("tenant content approval request reverse relation is invalid");
+      }
+      this.validateTenantContentEventRelations(session, events, turns, items, approvals);
+
+      const contentRecordCount = 1
+        + turnIdentities.length
+        + itemIdentities.length
+        + eventIdentities.length
+        + approvalIdentities.length;
+      if (!Number.isSafeInteger(contentRecordCount)) {
+        throw new Error("tenant content record count is invalid");
+      }
+      const content = {
+        sessionSha256: tenantSessionStructuralSha256(
+          session.sessionId,
+          session.parentSessionId,
+          session.lastSeq,
+          session.deletionGeneration,
+          session.lifecycleDisposition,
+        ),
+        turnCount: turnIdentities.length,
+        turnRootSha256: tenantContentIdentityRootSha256("turn", turnIdentities),
+        itemCount: itemIdentities.length,
+        itemRootSha256: tenantContentIdentityRootSha256("item", itemIdentities),
+        eventCount: eventIdentities.length,
+        eventRootSha256: tenantContentIdentityRootSha256("event", eventIdentities),
+        approvalCount: approvalIdentities.length,
+        approvalRootSha256: tenantContentIdentityRootSha256(
+          "approval",
+          approvalIdentities,
+        ),
+        contentRecordCount,
+      };
+      return {
+        ...content,
+        contentRootSha256: tenantSessionContentRootSha256(content),
+      };
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantContentInventoryEvidenceChangedError();
+    }
+  }
+
+  private tenantSessionContentReceipt(
+    job: TenantContentInventoryJobRecord,
+    session: TenantContentSessionRow,
+    content: TenantSessionContentEvidence,
+    capturedAtDbMs: number,
+  ): TenantSessionContentReceipt {
+    const body = {
+      scope: TENANT_SESSION_CONTENT_RECEIPT_SCOPE,
+      requestId: job.requestId,
+      buildGeneration: job.buildGeneration,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      sessionId: session.sessionId,
+      ...content,
+      capturedAtDbMs,
+    };
+    const receipt: TenantSessionContentReceipt = {
+      ...body,
+      receiptSha256: tenantSessionContentReceiptSha256(body),
+    };
+    validateTenantSessionContentReceipt(receipt);
+    return receipt;
+  }
+
+  private tenantContentInventoryReceiptState(
+    job: TenantContentInventoryJobRecord,
+    receipts: readonly TenantSessionContentReceipt[],
+  ): { contentRecordCount: number } {
+    try {
+      if (
+        receipts.length !== job.sessionReceiptCount
+        || tenantContentInventorySessionReceiptRootSha256(receipts)
+          !== job.sessionReceiptRootSha256
+        || (receipts.length === 0
+          ? job.cursorSessionId !== undefined
+          : job.cursorSessionId !== receipts.at(-1)!.sessionId)
+      ) throw new Error("tenant content inventory receipt cursor is inconsistent");
+      let contentRecordCount = 0;
+      let previousSessionId: string | undefined;
+      for (const receipt of receipts) {
+        if (
+          receipt.requestId !== job.requestId
+          || receipt.tenantId !== job.tenantId
+          || receipt.subjectGeneration !== job.subjectGeneration
+          || receipt.buildGeneration !== job.buildGeneration
+          || receipt.capturedAtDbMs < job.retentionAnchorDbMs
+          || (previousSessionId !== undefined && receipt.sessionId <= previousSessionId)
+        ) throw new Error("tenant content inventory receipt source is inconsistent");
+        contentRecordCount += receipt.contentRecordCount;
+        if (!Number.isSafeInteger(contentRecordCount)) {
+          throw new Error("tenant content inventory content count overflowed");
+        }
+        previousSessionId = receipt.sessionId;
+      }
+      return { contentRecordCount };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  /**
+   * The current content tables predate foreign keys. Seal therefore takes shared next-key locks
+   * over every structural identity and proves that no session/turn/item/event/approval edge is
+   * orphaned or crosses an owner. The target tenant is already quiesced by T3b; these global locks
+   * also close the proof window against unrelated writers while the aggregate is committed.
+   */
+  private async lockAndValidateTenantContentGlobalRelations(conn: PoolConnection): Promise<void> {
+    try {
+      const [sessionRows] = await conn.query<Row[]>(
+        `SELECT session_id, tenant_id, user_id, parent_session_id, last_seq,
+                archived_at_ms, deleted_at_ms, deletion_generation
+           FROM sessions FORCE INDEX (PRIMARY)
+          ORDER BY session_id FOR SHARE`,
+      );
+      const sessions = new Map<string, TenantContentSessionRow>();
+      for (const row of sessionRows) {
+        const session = this.tenantContentSessionRow(row);
+        if (sessions.has(session.sessionId)) throw new Error("duplicate session identity");
+        sessions.set(session.sessionId, session);
+      }
+      for (const session of sessions.values()) {
+        if (session.parentSessionId === undefined) continue;
+        const parent = sessions.get(session.parentSessionId);
+        if (
+          !parent
+          || parent.tenantId !== session.tenantId
+          || parent.userId !== session.userId
+        ) throw new Error("orphaned or cross-owner parent session");
+      }
+      const resolvedParentChains = new Set<string>();
+      for (const session of sessions.values()) {
+        const path = new Set<string>();
+        let current: TenantContentSessionRow | undefined = session;
+        while (current?.parentSessionId !== undefined) {
+          if (path.has(current.sessionId)) throw new Error("session parent cycle");
+          if (resolvedParentChains.has(current.sessionId)) break;
+          path.add(current.sessionId);
+          current = sessions.get(current.parentSessionId);
+          if (!current) throw new Error("orphaned parent session");
+        }
+        for (const sessionId of path) resolvedParentChains.add(sessionId);
+      }
+
+      const [turnRows] = await conn.query<Row[]>(
+        `SELECT turn_id, session_id, user_id, status, seq_start, seq_end, body
+           FROM turns FORCE INDEX (idx_turns_session)
+          ORDER BY session_id, turn_id FOR SHARE`,
+      );
+      const turns = new Map<string, {
+        sessionId: string;
+        userId: string;
+        seqStart: number;
+        seqEnd?: number;
+        status: string;
+      }>();
+      for (const row of turnRows) {
+        const turnId = String(row.turn_id);
+        const sessionId = String(row.session_id);
+        const userId = String(row.user_id);
+        const session = sessions.get(sessionId);
+        const seqStart = storedSafeInteger(row.seq_start, "tenant content turn start", 1);
+        const seqEnd = row.seq_end == null
+          ? undefined
+          : storedSafeInteger(row.seq_end, "tenant content turn end", 1);
+        const status = String(row.status);
+        const parsedTurn = TurnSchema.safeParse(parse<unknown>(row.body));
+        if (
+          !parsedTurn.success
+          || !isCanonicalId("turn", turnId)
+          || !session
+          || session.userId !== userId
+          || parsedTurn.data.id !== turnId
+          || parsedTurn.data.sessionId !== sessionId
+          || parsedTurn.data.status !== status
+          || parsedTurn.data.seqStart !== seqStart
+          || parsedTurn.data.seqEnd !== seqEnd
+          || turns.has(turnId)
+          || seqStart > session.lastSeq
+          || (seqEnd !== undefined && (seqEnd < seqStart || seqEnd > session.lastSeq))
+        ) throw new Error("orphaned or cross-owner turn");
+        turns.set(turnId, {
+          sessionId,
+          userId,
+          seqStart,
+          ...(seqEnd === undefined ? {} : { seqEnd }),
+          status,
+        });
+      }
+
+      const [itemRows] = await conn.query<Row[]>(
+        `SELECT item_id, session_id, user_id, turn_id, seq, type, status, body
+           FROM items FORCE INDEX (uk_items_session_seq)
+          ORDER BY session_id, seq, item_id FOR SHARE`,
+      );
+      const items = new Map<string, {
+        sessionId: string;
+        userId: string;
+        turnId: string;
+        seq: number;
+        type: string;
+        status: string;
+        approvalId?: string;
+        toolCallId?: string;
+        name?: string;
+      }>();
+      for (const row of itemRows) {
+        const itemId = String(row.item_id);
+        const sessionId = String(row.session_id);
+        const userId = String(row.user_id);
+        const turnId = String(row.turn_id);
+        const session = sessions.get(sessionId);
+        const turn = turns.get(turnId);
+        const seq = storedSafeInteger(row.seq, "tenant content item sequence", 1);
+        const type = String(row.type);
+        const status = String(row.status);
+        const parsedItem = ItemSchema.safeParse(parse<unknown>(row.body));
+        const standaloneCompaction = parsedItem.success
+          && parsedItem.data.type === "contextCompaction";
+        if (
+          !parsedItem.success
+          || !isCanonicalId("item", itemId)
+          || !session
+          || session.userId !== userId
+          || parsedItem.data.id !== itemId
+          || parsedItem.data.sessionId !== sessionId
+          || parsedItem.data.turnId !== turnId
+          || parsedItem.data.seq !== seq
+          || parsedItem.data.type !== type
+          || parsedItem.data.status !== status
+          || (!standaloneCompaction && !turn)
+          || (turn !== undefined && (
+            turn.sessionId !== sessionId || turn.userId !== userId
+          ))
+          || items.has(itemId)
+          || seq > session.lastSeq
+        ) throw new Error("orphaned or cross-owner item");
+        const approvalFields = parsedItem.data.type === "approvalRequest"
+          ? {
+              approvalId: parsedItem.data.approvalId,
+              toolCallId: parsedItem.data.toolCallId,
+              name: parsedItem.data.name,
+            }
+          : {};
+        items.set(itemId, {
+          sessionId,
+          userId,
+          turnId,
+          seq,
+          type,
+          status,
+          ...approvalFields,
+        });
+      }
+
+      const [eventRows] = await conn.query<Row[]>(
+        `SELECT session_id, seq, user_id, type, body, emitted_at_ms
+           FROM events FORCE INDEX (PRIMARY)
+          ORDER BY session_id, seq FOR SHARE`,
+      );
+      const eventCounts = new Map<string, number>();
+      const eventsBySession = new Map<string, PersistedEvent[]>();
+      for (const row of eventRows) {
+        const sessionId = String(row.session_id);
+        const userId = String(row.user_id);
+        const session = sessions.get(sessionId);
+        const seq = storedSafeInteger(row.seq, "tenant content event sequence", 1);
+        const emittedAtMs = storedSafeInteger(
+          row.emitted_at_ms,
+          "tenant content event timestamp",
+        );
+        const parsedEvent = EventSchema.safeParse(parse<unknown>(row.body));
+        const expected = (eventCounts.get(sessionId) ?? 0) + 1;
+        if (
+          !session
+          || session.userId !== userId
+          || seq !== expected
+          || !parsedEvent.success
+          || parsedEvent.data.sessionId !== sessionId
+          || parsedEvent.data.seq !== seq
+          || parsedEvent.data.type !== String(row.type)
+          || parsedEvent.data.emittedAtMs !== emittedAtMs
+        ) {
+          throw new Error("orphaned, cross-owner, or non-contiguous event");
+        }
+        eventCounts.set(sessionId, expected);
+        const events = eventsBySession.get(sessionId) ?? [];
+        events.push(parsedEvent.data as PersistedEvent);
+        eventsBySession.set(sessionId, events);
+      }
+      for (const session of sessions.values()) {
+        if ((eventCounts.get(session.sessionId) ?? 0) !== session.lastSeq) {
+          throw new Error("session event cursor is inconsistent");
+        }
+      }
+
+      const [approvalRows] = await conn.query<Row[]>(
+        `SELECT approval_id, session_id, user_id, turn_id, status, body
+           FROM approvals FORCE INDEX (idx_approvals_session_identity)
+          ORDER BY session_id, approval_id FOR SHARE`,
+      );
+      const approvals = new Map<string, {
+        sessionId: string;
+        turnId: string;
+        itemId: string;
+        status: string;
+        toolCallId: string;
+        toolName: string;
+      }>();
+      for (const row of approvalRows) {
+        const approvalId = String(row.approval_id);
+        const sessionId = String(row.session_id);
+        const userId = String(row.user_id);
+        const turnId = String(row.turn_id);
+        const status = String(row.status);
+        const parsedApproval = ApprovalSchema.safeParse(parse<unknown>(row.body));
+        const itemId = parsedApproval.success ? parsedApproval.data.itemId : "";
+        const session = sessions.get(sessionId);
+        const turn = turns.get(turnId);
+        const requestItems = parsedApproval.success
+          ? [...items.values()].filter((item) => (
+              item.type === "approvalRequest"
+              && item.approvalId === parsedApproval.data.id
+            ))
+          : [];
+        const item = requestItems[0];
+        if (
+          !parsedApproval.success
+          || !isCanonicalId("apr", approvalId)
+          || !session
+          || session.userId !== userId
+          || parsedApproval.data.id !== approvalId
+          || parsedApproval.data.sessionId !== sessionId
+          || parsedApproval.data.turnId !== turnId
+          || parsedApproval.data.status !== status
+          || !turn
+          || turn.sessionId !== sessionId
+          || turn.userId !== userId
+          || !item
+          || requestItems.length !== 1
+          || item.sessionId !== sessionId
+          || item.userId !== userId
+          || item.turnId !== turnId
+          || item.toolCallId !== parsedApproval.data.toolCallId
+          || item.name !== parsedApproval.data.toolName
+          || approvals.has(approvalId)
+        ) throw new Error("orphaned or cross-owner approval");
+        approvals.set(approvalId, {
+          sessionId,
+          turnId,
+          itemId,
+          status,
+          toolCallId: parsedApproval.data.toolCallId,
+          toolName: parsedApproval.data.toolName,
+        });
+      }
+      for (const item of items.values()) {
+        if (item.type !== "approvalRequest") continue;
+        const approval = item.approvalId === undefined
+          ? undefined
+          : approvals.get(item.approvalId);
+        if (
+          !approval
+          || approval.sessionId !== item.sessionId
+          || approval.turnId !== item.turnId
+          || approval.toolCallId !== item.toolCallId
+          || approval.toolName !== item.name
+        ) throw new Error("orphaned approval request");
+      }
+      for (const session of sessions.values()) {
+        this.validateTenantContentEventRelations(
+          session,
+          eventsBySession.get(session.sessionId) ?? [],
+          turns,
+          items,
+          approvals,
+        );
+      }
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async lockTenantContentHoldProof(
+    conn: PoolConnection,
+    tenantId: string,
+  ): Promise<{ holdControlCount: number; holdControlRootSha256: string }> {
+    try {
+      const [lifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? ORDER BY subject_kind, subject_id FOR SHARE`,
+        [tenantId],
+      );
+      const lifecycleByKey = new Map<string, SubjectLifecycleRecord>();
+      const userIds = new Set<string>();
+      for (const row of lifecycleRows) {
+        const lifecycle = rowToSubjectLifecycle(row);
+        if (lifecycle.tenantId !== tenantId) throw new Error("cross-tenant lifecycle row");
+        if (lifecycle.subjectKind === "tenant" && lifecycle.subjectId !== tenantId) {
+          throw new Error("invalid tenant lifecycle owner");
+        }
+        const key = JSON.stringify([lifecycle.subjectKind, lifecycle.subjectId]);
+        if (lifecycleByKey.has(key)) throw new Error("duplicate lifecycle row");
+        lifecycleByKey.set(key, lifecycle);
+        if (lifecycle.subjectKind === "user") userIds.add(lifecycle.subjectId);
+      }
+
+      const [sessionOwners] = await conn.query<Row[]>(
+        `SELECT tenant_id, user_id
+           FROM sessions FORCE INDEX (idx_sessions_tenant_user)
+          WHERE tenant_id=? ORDER BY user_id, session_id FOR SHARE`,
+        [tenantId],
+      );
+      for (const row of sessionOwners) {
+        if (String(row.tenant_id) !== tenantId) throw new Error("cross-tenant session owner");
+        userIds.add(String(row.user_id));
+      }
+      for (const [table, order] of [
+        ["erasure_requests", "subject_kind, subject_id, request_id"],
+        ["legal_hold_controls", "subject_kind, subject_id"],
+        ["legal_holds", "subject_kind, subject_id, hold_id"],
+        ["legal_hold_events", "subject_kind, subject_id, event_id"],
+      ] as const) {
+        const [rows] = await conn.query<Row[]>(
+          `SELECT tenant_id, subject_kind, subject_id
+             FROM ${table}
+            WHERE tenant_id=? ORDER BY ${order} FOR SHARE`,
+          [tenantId],
+        );
+        for (const row of rows) {
+          if (String(row.tenant_id) !== tenantId) throw new Error("cross-tenant hold owner");
+          const kind = String(row.subject_kind);
+          if (kind !== "tenant" && kind !== "user") {
+            throw new Error("invalid hold subject kind");
+          }
+          const subjectId = String(row.subject_id);
+          if (kind === "tenant") {
+            if (subjectId !== tenantId) throw new Error("invalid tenant hold owner");
+          } else {
+            if (!subjectId || subjectId.length > 128) throw new Error("invalid user hold owner");
+            userIds.add(subjectId);
+          }
+        }
+      }
+
+      const subjects: Array<{ kind: "tenant" | "user"; id: string }> = [
+        { kind: "tenant", id: tenantId },
+        ...[...userIds]
+          .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+          .map((id) => ({ kind: "user" as const, id })),
+      ];
+      const controls: string[] = [];
+      for (const [ordinal, subject] of subjects.entries()) {
+        const lifecycle = lifecycleByKey.get(JSON.stringify([subject.kind, subject.id]));
+        if (!lifecycle) throw new Error("hold owner lifecycle is missing");
+        const context = await this.loadLegalHoldContextForLifecycle(
+          conn,
+          tenantId,
+          subject.kind,
+          subject.id,
+          lifecycle,
+          "FOR SHARE",
+        );
+        if (context.control.activeHoldCount !== 0) {
+          throw new TenantContentInventoryNotReadyError("active_legal_hold");
+        }
+        controls.push(tenantContentInventoryHoldControlSha256(
+          ordinal,
+          subject.kind,
+          context.control.controlGeneration,
+          context.control.activeProjectionSha256,
+        ));
+      }
+      return {
+        holdControlCount: controls.length,
+        holdControlRootSha256: tenantContentInventoryHoldControlRootSha256(controls),
+      };
+    } catch (error) {
+      if (error instanceof TenantContentInventoryNotReadyError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async validateTenantContentInventoryReadProof(
+    conn: PoolConnection,
+    job: TenantContentInventoryJobRecord,
+  ): Promise<{
+    receipts: TenantSessionContentReceipt[];
+    aggregate: TenantContentInventoryReceipt | null;
+    contentRecordCount: number;
+  }> {
+    const source = await this.validateTenantContentInventoryImmutableSource(conn, job);
+    if (job.phase !== "inventory_sealed") {
+      const [lifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+        [job.tenantId, job.tenantId],
+      );
+      if (!lifecycleRows[0]) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantErasureAdmissionProof({
+          lifecycle: rowToSubjectLifecycle(lifecycleRows[0]),
+          admission: source.admission,
+          fence: source.fence,
+          firstAudit: source.firstAudit,
+        });
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    const receipts = await this.loadTenantSessionContentReceipts(
+      conn,
+      job.tenantId,
+      job.requestId,
+      job.buildGeneration,
+    );
+    const state = this.tenantContentInventoryReceiptState(job, receipts);
+    const aggregate = await this.loadTenantContentInventoryReceipt(
+      conn,
+      job.tenantId,
+      job.requestId,
+    );
+    if (job.phase === "inventory_sealed") {
+      if (!aggregate) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantContentInventoryCompletionProof(job, receipts, aggregate);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    } else if (aggregate) {
+      throw new TenantErasureIntegrityError();
+    }
+    return { receipts, aggregate, contentRecordCount: state.contentRecordCount };
+  }
+
+  async materializeTenantContentInventoryJobs(
+    options: MaterializeTenantContentInventoryJobsOptions,
+  ): Promise<number> {
+    validateMaterializeTenantContentInventoryJobsOptions(options);
+    const maxCandidatesToScan = Math.min(400, Math.max(32, options.limit * 4));
+    const startingCursor = this.tenantContentMaterializationCursorRequestId;
+    const loadCandidates = async (
+      afterRequestId: string | undefined,
+      throughRequestId: string | undefined,
+    ): Promise<Row[]> => {
+      const [rows] = await this.pool.query<Row[]>(
+        `SELECT j.request_id, j.tenant_id
+         FROM tenant_runtime_revocation_jobs j
+        WHERE j.phase='configured_fleet_quiesced'
+          ${afterRequestId === undefined ? "" : "AND j.request_id>?"}
+          ${throughRequestId === undefined ? "" : "AND j.request_id<=?"}
+          AND NOT EXISTS (
+            SELECT 1 FROM tenant_content_inventory_jobs c
+             WHERE c.request_id=j.request_id
+          )
+        ORDER BY j.request_id
+        LIMIT ?`,
+        [
+          ...(afterRequestId === undefined ? [] : [afterRequestId]),
+          ...(throughRequestId === undefined ? [] : [throughRequestId]),
+          maxCandidatesToScan,
+        ],
+      );
+      return rows;
+    };
+    let candidateRows = await loadCandidates(startingCursor, undefined);
+    // The scan is deliberately bounded per poll, but a corrupt prefix must not permanently hide a
+    // healthy tail. Carry the keyset cursor across polls and wrap only after reaching the tail.
+    if (candidateRows.length === 0 && startingCursor !== undefined) {
+      candidateRows = await loadCandidates(undefined, startingCursor);
+      if (candidateRows.length === 0) this.tenantContentMaterializationCursorRequestId = undefined;
+    }
+    let materialized = 0;
+    let firstIntegrityError: TenantErasureIntegrityError | undefined;
+    let firstNotReady: TenantContentInventoryNotReadyError | undefined;
+    for (const candidateRow of candidateRows) {
+      if (materialized >= options.limit) break;
+      const requestId = String(candidateRow.request_id);
+      const tenantId = String(candidateRow.tenant_id);
+      this.tenantContentMaterializationCursorRequestId = requestId;
+      const conn = await this.pool.getConnection();
+      try {
+        await this.beginTenantContentInventoryTransaction(conn);
+        const [lifecycleRows] = await conn.query<Row[]>(
+          `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+             FROM subject_lifecycle
+            WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
+          [tenantId, tenantId],
+        );
+        if (
+          !lifecycleRows[0]
+          || String(lifecycleRows[0].tenant_id) !== tenantId
+          || String(lifecycleRows[0].subject_kind) !== "tenant"
+          || String(lifecycleRows[0].subject_id) !== tenantId
+        ) throw new TenantErasureIntegrityError();
+        let lifecycle: SubjectLifecycleRecord;
+        try {
+          lifecycle = rowToSubjectLifecycle(lifecycleRows[0]);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+
+        const runtimeJob = await this.loadTenantRuntimeRevocationJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (!runtimeJob || runtimeJob.phase !== "configured_fleet_quiesced") {
+          throw new TenantErasureIntegrityError();
+        }
+        const source = await this.validateTenantRuntimeRevocationImmutableSourceProof(
+          conn,
+          runtimeJob,
+          "FOR SHARE",
+        );
+        try {
+          validateTenantErasureAdmissionProof({ lifecycle, ...source });
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        const runtimeTargets = await this.loadTenantRuntimeRevocationTargetReceipts(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        const runtimeReceipt = await this.loadTenantRuntimeRevocationReceipt(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (!runtimeReceipt) throw new TenantErasureIntegrityError();
+        try {
+          validateTenantRuntimeRevocationCompletionProof(
+            runtimeJob,
+            runtimeTargets,
+            runtimeReceipt,
+          );
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+
+        const sourceHighWatermarkMs = Math.max(
+          source.credentialReceipt.storeDbTimestampMs,
+          runtimeReceipt.storeDbTimestampMs,
+        );
+
+        if (source.admission.policyVersion === undefined
+          || source.admission.policyHash === undefined) {
+          await conn.commit();
+          continue;
+        }
+        // Validate the complete policy activation ledger, but bind this job to the immutable
+        // policy captured at T1 even when a newer version is now active.
+        try {
+          if (!await this.loadValidatedActiveRetentionPolicy(conn, tenantId, "FOR SHARE")) {
+            throw new Error("tenant content inventory policy is not active");
+          }
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        let policy: RetentionPolicyVersionRecord | null;
+        try {
+          policy = await this.loadRetentionPolicyVersion(
+            conn,
+            tenantId,
+            source.admission.policyVersion,
+            "FOR SHARE",
+          );
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        if (!policy || policy.policySha256 !== source.admission.policyHash) {
+          throw new TenantErasureIntegrityError();
+        }
+        if (policy.policy.sessionContentRetentionMs === null) {
+          await conn.commit();
+          continue;
+        }
+
+        const [existingRows] = await conn.query<Row[]>(
+          `SELECT ${TENANT_CONTENT_INVENTORY_JOB_COLUMNS}
+             FROM tenant_content_inventory_jobs
+            WHERE tenant_id=? FOR UPDATE`,
+          [tenantId],
+        );
+        if (existingRows[0]) {
+          const existing = rowToTenantContentInventoryJob(existingRows[0]);
+          if (
+            existing.requestId !== requestId
+            || existing.subjectGeneration !== runtimeJob.subjectGeneration
+            || existing.t1FenceSha256 !== runtimeJob.t1FenceSha256
+            || existing.t3aReceiptSha256 !== runtimeJob.t3aReceiptSha256
+            || existing.t3bReceiptSha256 !== runtimeReceipt.receiptSha256
+            || existing.policyVersion !== policy.policyVersion
+            || existing.policySha256 !== policy.policySha256
+          ) throw new TenantErasureIntegrityError();
+          await this.validateTenantContentInventoryReadProof(conn, existing);
+          await conn.commit();
+          continue;
+        }
+        const [orphanSessionReceipts] = await conn.query<Row[]>(
+          `SELECT request_id FROM session_content_receipts
+            WHERE tenant_id=? LIMIT 1 FOR SHARE`,
+          [tenantId],
+        );
+        const [orphanAggregateReceipts] = await conn.query<Row[]>(
+          `SELECT request_id FROM tenant_content_inventory_receipts
+            WHERE tenant_id=? LIMIT 1 FOR SHARE`,
+          [tenantId],
+        );
+        if (orphanSessionReceipts[0] || orphanAggregateReceipts[0]) {
+          throw new TenantErasureIntegrityError();
+        }
+
+        // This is intentionally after every source/policy/evidence lock that can wait. Neither the
+        // caller nor an earlier runner wall clock can choose the retention anchor.
+        const now = await this.databaseNow(conn);
+        if (now < sourceHighWatermarkMs) {
+          throw new TenantContentInventoryNotReadyError("trusted_clock_before_source");
+        }
+        const deadline = checkedRetentionDeadline(
+          now,
+          policy.policy.sessionContentRetentionMs,
+        );
+        if (deadline.kind !== "deadline") throw new TenantErasureIntegrityError();
+        const job: TenantContentInventoryJobRecord = {
+          requestId,
+          tenantId,
+          subjectGeneration: runtimeJob.subjectGeneration,
+          buildGeneration: 1,
+          t1FenceSha256: runtimeJob.t1FenceSha256,
+          t3aReceiptSha256: runtimeJob.t3aReceiptSha256,
+          t3bReceiptSha256: runtimeReceipt.receiptSha256,
+          policyVersion: policy.policyVersion,
+          policySha256: policy.policySha256,
+          policySchemaVersion: policy.schemaVersion,
+          retentionAnchorDbMs: now,
+          contentNotBeforeDbMs: deadline.value,
+          phase: "queued",
+          scanComplete: false,
+          sessionReceiptCount: 0,
+          sessionReceiptRootSha256: EMPTY_TENANT_SESSION_RECEIPT_ROOT_SHA256,
+          availableAtMs: now,
+          attempts: 0,
+          createdAtMs: now,
+          updatedAtMs: now,
+        };
+        validateTenantContentInventoryJobRecord(job);
+        await conn.query(
+          `INSERT INTO tenant_content_inventory_jobs
+             (request_id, tenant_id, subject_generation, t1_fence_sha256,
+              t3a_receipt_sha256, t3b_receipt_sha256, policy_version, policy_sha256,
+              policy_schema_version, build_generation, retention_anchor_db_ms,
+              content_not_before_db_ms, cursor_session_id, scan_complete,
+              session_receipt_count, session_receipt_root_sha256, phase, available_at_ms,
+              attempts, claim_token, lease_until_ms, last_error_code, created_at_ms,
+              updated_at_ms, sealed_at_ms, completed_claim_attempt,
+              completed_claim_token_sha256, aggregate_receipt_sha256, blocked_at_ms,
+              blocked_reason_code)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?, ?,NULL,FALSE,0,?,'queued',?,0,NULL,NULL,NULL,?,?,
+                   NULL,NULL,NULL,NULL,NULL,NULL)`,
+          [
+            job.requestId,
+            job.tenantId,
+            job.subjectGeneration,
+            job.t1FenceSha256,
+            job.t3aReceiptSha256,
+            job.t3bReceiptSha256,
+            job.policyVersion,
+            job.policySha256,
+            job.policySchemaVersion,
+            job.buildGeneration,
+            job.retentionAnchorDbMs,
+            job.contentNotBeforeDbMs,
+            job.sessionReceiptRootSha256,
+            job.availableAtMs,
+            job.createdAtMs,
+            job.updatedAtMs,
+          ],
+        );
+        await conn.commit();
+        materialized += 1;
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        if (error instanceof TenantErasureIntegrityError) {
+          firstIntegrityError ??= error;
+          continue;
+        }
+        if (error instanceof TenantContentInventoryNotReadyError) {
+          firstNotReady ??= error;
+          continue;
+        }
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    // Healthy neighbors are already committed in their independent transactions. Still surface a
+    // deterministic corrupt source so operators do not mistake a skipped T3b tail for completion.
+    if (firstIntegrityError) throw firstIntegrityError;
+    if (firstNotReady) throw firstNotReady;
+    return materialized;
+  }
+
+  async claimTenantContentInventories(
+    options: ClaimTenantContentInventoriesOptions,
+  ): Promise<TenantContentInventoryClaim[]> {
+    validateClaimTenantContentInventoriesOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantContentInventoryTransaction(conn);
+      const scanNow = await this.databaseNow(conn);
+      const claims: TenantContentInventoryClaim[] = [];
+      const maxCandidatesToScan = Math.min(400, Math.max(32, options.limit * 4));
+      const pageSize = Math.min(100, maxCandidatesToScan);
+      let scanned = 0;
+      let cursor: { availableAtMs: number; requestId: string } | undefined;
+      while (claims.length < options.limit && scanned < maxCandidatesToScan) {
+        const batchSize = Math.min(pageSize, maxCandidatesToScan - scanned);
+        const [rows] = await conn.query<Row[]>(
+          `SELECT ${TENANT_CONTENT_INVENTORY_JOB_COLUMNS}
+             FROM tenant_content_inventory_jobs
+            WHERE phase='queued' AND available_at_ms<=?
+              AND (claim_token IS NULL OR lease_until_ms<=?)
+              ${cursor === undefined
+                ? ""
+                : "AND (available_at_ms>? OR (available_at_ms=? AND request_id>?))"}
+            ORDER BY available_at_ms, request_id
+            LIMIT ?`,
+          cursor === undefined
+            ? [scanNow, scanNow, batchSize]
+            : [
+                scanNow,
+                scanNow,
+                cursor.availableAtMs,
+                cursor.availableAtMs,
+                cursor.requestId,
+                batchSize,
+              ],
+        );
+        if (rows.length === 0) break;
+        for (const row of rows) {
+          const candidate = rowToTenantContentInventoryJob(row);
+          if (candidate.phase !== "queued") throw new TenantErasureIntegrityError();
+          scanned += 1;
+          cursor = { availableAtMs: candidate.availableAtMs, requestId: candidate.requestId };
+          let sourceIntegrityValid = true;
+          try {
+            await this.lockAndValidateTenantContentInventoryCurrentSource(conn, candidate);
+          } catch (error) {
+            if (!(error instanceof TenantErasureIntegrityError)) throw error;
+            // A deterministic source-proof failure must not poison the whole queue page. It is
+            // safe to acquire queue authority solely to move this evidence-only job to its
+            // terminal blocked state; no receipt or content mutation occurs on this path.
+            sourceIntegrityValid = false;
+          }
+          const current = await this.loadTenantContentInventoryJob(
+            conn,
+            candidate.tenantId,
+            candidate.requestId,
+            "FOR UPDATE SKIP LOCKED",
+          );
+          if (!current) continue;
+          if (!this.tenantContentInventorySameSource(current, candidate)) {
+            throw new TenantErasureIntegrityError();
+          }
+          const now = await this.databaseNow(conn);
+          if (
+            current.phase !== "queued"
+            || current.availableAtMs > now
+            || (current.claimToken !== undefined && current.leaseUntilMs! > now)
+          ) continue;
+          if (current.attempts >= 0xffff_ffff) throw new TenantErasureIntegrityError();
+          const leaseUntilMs = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+            ? Number.MAX_SAFE_INTEGER
+            : now + options.leaseMs;
+          if (leaseUntilMs <= now) continue;
+          const updatedAtMs = Math.max(current.updatedAtMs, now);
+          const [result] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE tenant_content_inventory_jobs
+                SET attempts=attempts+1, claim_token=?, lease_until_ms=?,
+                    last_error_code=NULL, updated_at_ms=?
+              WHERE request_id=? AND tenant_id=? AND subject_generation=?
+                AND build_generation=? AND phase='queued' AND attempts=?
+                AND available_at_ms<=?
+                AND (claim_token IS NULL OR lease_until_ms<=?)`,
+            [
+              options.claimToken,
+              leaseUntilMs,
+              updatedAtMs,
+              current.requestId,
+              current.tenantId,
+              current.subjectGeneration,
+              current.buildGeneration,
+              current.attempts,
+              now,
+              now,
+            ],
+          );
+          if (result.affectedRows !== 1) throw new TenantErasureIntegrityError();
+          if (!sourceIntegrityValid) {
+            const [blocked] = await conn.query<mysql.ResultSetHeader>(
+              `UPDATE tenant_content_inventory_jobs
+                  SET phase='blocked', available_at_ms=NULL, claim_token=NULL,
+                      lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                      blocked_at_ms=?, blocked_reason_code='integrity_conflict'
+                WHERE request_id=? AND tenant_id=? AND subject_generation=?
+                  AND build_generation=? AND phase='queued' AND attempts=?
+                  AND claim_token=? AND lease_until_ms>?`,
+              [
+                updatedAtMs,
+                updatedAtMs,
+                current.requestId,
+                current.tenantId,
+                current.subjectGeneration,
+                current.buildGeneration,
+                current.attempts + 1,
+                options.claimToken,
+                now,
+              ],
+            );
+            if (blocked.affectedRows !== 1) throw new TenantErasureIntegrityError();
+            continue;
+          }
+          claims.push(tenantContentInventoryClaimFromJob({
+            ...current,
+            attempts: current.attempts + 1,
+            claimToken: options.claimToken,
+            leaseUntilMs,
+            updatedAtMs,
+            lastErrorCode: undefined,
+          }));
+          if (claims.length === options.limit) break;
+        }
+        if (rows.length < batchSize) break;
+      }
+      await conn.commit();
+      return claims;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewTenantContentInventory(
+    authorization: TenantContentInventoryAuthorization,
+    options: RenewTenantContentInventoryOptions,
+  ): Promise<boolean> {
+    validateTenantContentInventoryAuthorization(authorization);
+    validateRenewTenantContentInventoryOptions(options);
+    const preflight = await this.loadTenantContentInventoryJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantContentInventoryTransaction(conn);
+      await this.lockAndValidateTenantContentInventoryCurrentSource(conn, preflight);
+      const current = await this.loadTenantContentInventoryJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || !this.tenantContentInventorySameSource(current, preflight)
+        || !tenantContentInventoryAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const requestedLeaseUntilMs = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+        ? Number.MAX_SAFE_INTEGER
+        : now + options.leaseMs;
+      if (requestedLeaseUntilMs <= now) {
+        await conn.commit();
+        return false;
+      }
+      const leaseUntilMs = Math.max(current.leaseUntilMs!, requestedLeaseUntilMs);
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_content_inventory_jobs
+            SET lease_until_ms=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          leaseUntilMs,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryTenantContentInventory(
+    authorization: TenantContentInventoryAuthorization,
+    options: RetryTenantContentInventoryOptions,
+  ): Promise<boolean> {
+    validateTenantContentInventoryAuthorization(authorization);
+    validateRetryTenantContentInventoryOptions(options);
+    const preflight = await this.loadTenantContentInventoryJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantContentInventoryTransaction(conn);
+      await this.lockAndValidateTenantContentInventoryCurrentSource(conn, preflight);
+      const current = await this.loadTenantContentInventoryJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || current.phase !== "queued"
+        || !this.tenantContentInventorySameSource(current, preflight)
+        || !tenantContentInventoryAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const availableBaseMs = Math.max(
+        now,
+        current.createdAtMs,
+        current.updatedAtMs,
+        current.availableAtMs,
+      );
+      const availableAtMs = options.delayMs > Number.MAX_SAFE_INTEGER - availableBaseMs
+        ? Number.MAX_SAFE_INTEGER
+        : availableBaseMs + options.delayMs;
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_content_inventory_jobs
+            SET available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          availableAtMs,
+          options.errorCode,
+          updatedAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async blockTenantContentInventory(
+    authorization: TenantContentInventoryAuthorization,
+  ): Promise<boolean> {
+    validateTenantContentInventoryAuthorization(authorization);
+    const preflight = await this.loadTenantContentInventoryJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") return false;
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantContentInventoryTransaction(conn);
+      try {
+        await this.lockAndValidateTenantContentInventoryCurrentSource(conn, preflight);
+      } catch (error) {
+        // Blocking is the only allowed terminal settlement for a claimed job whose immutable
+        // source proof became invalid. It writes no receipt and grants no content authority.
+        if (!(error instanceof TenantErasureIntegrityError)) throw error;
+      }
+      const current = await this.loadTenantContentInventoryJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      const now = await this.databaseNow(conn);
+      if (
+        !current
+        || !this.tenantContentInventorySameSource(current, preflight)
+        || !tenantContentInventoryAuthorizationMatches(current, authorization, now)
+      ) {
+        await conn.commit();
+        return false;
+      }
+      const terminalAtMs = Math.max(current.createdAtMs, current.updatedAtMs, now);
+      const [result] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_content_inventory_jobs
+            SET phase='blocked', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                blocked_at_ms=?, blocked_reason_code='integrity_conflict'
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          terminalAtMs,
+          terminalAtMs,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          now,
+        ],
+      );
+      await conn.commit();
+      return result.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async buildTenantContentInventoryPage(
+    authorization: TenantContentInventoryAuthorization,
+    options: BuildTenantContentInventoryPageOptions,
+  ): Promise<BuildTenantContentInventoryPageResult> {
+    validateTenantContentInventoryAuthorization(authorization);
+    validateBuildTenantContentInventoryPageOptions(options);
+    const preflight = await this.loadTenantContentInventoryJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight || preflight.phase !== "queued") {
+      throw new Error("stale tenant content inventory authority");
+    }
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantContentInventoryTransaction(conn);
+      await this.lockAndValidateTenantContentInventoryCurrentSource(conn, preflight);
+      const current = await this.loadTenantContentInventoryJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (
+        !current
+        || current.phase !== "queued"
+        || !this.tenantContentInventorySameSource(current, preflight)
+      ) throw new Error("stale tenant content inventory authority");
+      const existingReceipts = await this.loadTenantSessionContentReceipts(
+        conn,
+        current.tenantId,
+        current.requestId,
+        current.buildGeneration,
+        "FOR SHARE",
+      );
+      const existingState = this.tenantContentInventoryReceiptState(
+        current,
+        existingReceipts,
+      );
+
+      const [sessionRows] = await conn.query<Row[]>(
+        `SELECT session_id, tenant_id, user_id, parent_session_id, last_seq,
+                archived_at_ms, deleted_at_ms, deletion_generation
+           FROM sessions FORCE INDEX (idx_sessions_tenant)
+          WHERE tenant_id=? AND (? IS NULL OR session_id>?)
+          ORDER BY session_id LIMIT ? FOR SHARE`,
+        [
+          current.tenantId,
+          current.cursorSessionId ?? null,
+          current.cursorSessionId ?? null,
+          (current.scanComplete ? 0 : options.limit) + 1,
+        ],
+      );
+      if (current.scanComplete && sessionRows.length !== 0) {
+        throw new TenantContentInventoryEvidenceChangedError();
+      }
+      const pageRows = current.scanComplete ? [] : sessionRows.slice(0, options.limit);
+      const page: Array<{
+        session: TenantContentSessionRow;
+        content: TenantSessionContentEvidence;
+      }> = [];
+      let previousSessionId = current.cursorSessionId;
+      for (const row of pageRows) {
+        const session = this.tenantContentSessionRow(row);
+        if (
+          session.tenantId !== current.tenantId
+          || (previousSessionId !== undefined && session.sessionId <= previousSessionId)
+        ) throw new TenantErasureIntegrityError();
+        const content = await this.loadTenantSessionContentEvidence(conn, session);
+        page.push({ session, content });
+        previousSessionId = session.sessionId;
+      }
+
+      // Every source, job, cursor, session and child range that can make this transaction wait is
+      // now locked. A claim expiring while it waited cannot append receipts or advance the cursor.
+      const finalNow = await this.databaseNow(conn);
+      if (!tenantContentInventoryAuthorizationMatches(current, authorization, finalNow)) {
+        throw new Error("stale tenant content inventory authority");
+      }
+      if (finalNow < current.retentionAnchorDbMs) {
+        throw new TenantContentInventoryNotReadyError("trusted_clock_before_anchor");
+      }
+      if (current.scanComplete) {
+        await conn.commit();
+        return {
+          built: 0,
+          done: true,
+          ...(current.cursorSessionId === undefined
+            ? {}
+            : { cursorSessionId: current.cursorSessionId }),
+          sessionReceiptCount: current.sessionReceiptCount,
+          sessionReceiptRootSha256: current.sessionReceiptRootSha256,
+          contentRecordCount: existingState.contentRecordCount,
+        };
+      }
+
+      const receipts = page.map(({ session, content }) => this.tenantSessionContentReceipt(
+        current,
+        session,
+        content,
+        finalNow,
+      ));
+      let sessionReceiptRootSha256 = current.sessionReceiptRootSha256;
+      let contentRecordCount = existingState.contentRecordCount;
+      for (const receipt of receipts) {
+        sessionReceiptRootSha256 = tenantContentInventoryNextSessionReceiptRootSha256(
+          sessionReceiptRootSha256,
+          receipt.receiptSha256,
+        );
+        contentRecordCount += receipt.contentRecordCount;
+        if (!Number.isSafeInteger(contentRecordCount)) {
+          throw new TenantErasureIntegrityError();
+        }
+        await conn.query(
+          `INSERT INTO session_content_receipts
+             (scope, request_id, build_generation, tenant_id, subject_generation,
+              session_id, session_sha256, turn_count, turn_root_sha256, item_count,
+              item_root_sha256, event_count, event_root_sha256, approval_count,
+              approval_root_sha256, content_record_count, content_root_sha256,
+              captured_at_db_ms, receipt_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            receipt.scope,
+            receipt.requestId,
+            receipt.buildGeneration,
+            receipt.tenantId,
+            receipt.subjectGeneration,
+            receipt.sessionId,
+            receipt.sessionSha256,
+            receipt.turnCount,
+            receipt.turnRootSha256,
+            receipt.itemCount,
+            receipt.itemRootSha256,
+            receipt.eventCount,
+            receipt.eventRootSha256,
+            receipt.approvalCount,
+            receipt.approvalRootSha256,
+            receipt.contentRecordCount,
+            receipt.contentRootSha256,
+            receipt.capturedAtDbMs,
+            receipt.receiptSha256,
+          ],
+        );
+      }
+      const sessionReceiptCount = current.sessionReceiptCount + receipts.length;
+      if (!Number.isSafeInteger(sessionReceiptCount)) throw new TenantErasureIntegrityError();
+      const cursorSessionId = receipts.at(-1)?.sessionId ?? current.cursorSessionId;
+      const done = sessionRows.length <= options.limit;
+      // Receipt INSERTs can wait behind storage locks or trigger work. Re-read the trusted clock
+      // after the last such write so a lease that expired while publishing cannot advance the
+      // cursor; the transaction rollback removes every receipt inserted above.
+      const publishNow = await this.databaseNow(conn);
+      if (!tenantContentInventoryAuthorizationMatches(current, authorization, publishNow)) {
+        throw new Error("stale tenant content inventory authority");
+      }
+      const updatedAtMs = Math.max(current.updatedAtMs, finalNow, publishNow);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_content_inventory_jobs
+            SET cursor_session_id=?, scan_complete=?, session_receipt_count=?,
+                session_receipt_root_sha256=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          cursorSessionId ?? null,
+          done,
+          sessionReceiptCount,
+          sessionReceiptRootSha256,
+          updatedAtMs,
+          current.requestId,
+          current.tenantId,
+          current.subjectGeneration,
+          current.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          publishNow,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new Error("tenant content inventory job changed");
+      await conn.commit();
+      return {
+        built: receipts.length,
+        done,
+        ...(cursorSessionId === undefined ? {} : { cursorSessionId }),
+        sessionReceiptCount,
+        sessionReceiptRootSha256,
+        contentRecordCount,
+      };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async sealTenantContentInventory(
+    authorization: TenantContentInventoryAuthorization,
+  ): Promise<TenantContentInventoryReceipt | null> {
+    validateTenantContentInventoryAuthorization(authorization);
+    const preflight = await this.loadTenantContentInventoryJob(
+      this.pool,
+      authorization.tenantId,
+      authorization.requestId,
+    );
+    if (!preflight) return null;
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantContentInventoryTransaction(conn);
+
+      // Terminal evidence is immutable and permits exact attempt/token response-loss replay even
+      // after the mutable lifecycle projection advances. A different worker never receives it.
+      if (preflight.phase === "inventory_sealed") {
+        await this.validateTenantContentInventoryImmutableSource(conn, preflight, "FOR SHARE");
+        const terminal = await this.loadTenantContentInventoryJob(
+          conn,
+          authorization.tenantId,
+          authorization.requestId,
+          "FOR UPDATE",
+        );
+        if (!terminal || terminal.phase !== "inventory_sealed") {
+          throw new TenantErasureIntegrityError();
+        }
+        const receipts = await this.loadTenantSessionContentReceipts(
+          conn,
+          terminal.tenantId,
+          terminal.requestId,
+          terminal.buildGeneration,
+          "FOR SHARE",
+        );
+        const aggregate = await this.loadTenantContentInventoryReceipt(
+          conn,
+          terminal.tenantId,
+          terminal.requestId,
+          "FOR SHARE",
+        );
+        if (!aggregate) throw new TenantErasureIntegrityError();
+        try {
+          validateTenantContentInventoryCompletionProof(terminal, receipts, aggregate);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        if (!tenantContentInventoryReceiptMatchesAuthorization(aggregate, authorization)) {
+          await conn.commit();
+          return null;
+        }
+        await conn.commit();
+        return aggregate;
+      }
+
+      await this.lockAndValidateTenantContentInventoryCurrentSource(conn, preflight);
+      const current = await this.loadTenantContentInventoryJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current) {
+        await conn.commit();
+        return null;
+      }
+      if (!this.tenantContentInventorySameSource(current, preflight)) {
+        throw new TenantErasureIntegrityError();
+      }
+      // A competing transaction may have committed after the unlocked preflight. Validate only
+      // its immutable terminal proof and preserve exact replay semantics.
+      if (current.phase === "inventory_sealed") {
+        const receipts = await this.loadTenantSessionContentReceipts(
+          conn,
+          current.tenantId,
+          current.requestId,
+          current.buildGeneration,
+          "FOR SHARE",
+        );
+        const aggregate = await this.loadTenantContentInventoryReceipt(
+          conn,
+          current.tenantId,
+          current.requestId,
+          "FOR SHARE",
+        );
+        if (!aggregate) throw new TenantErasureIntegrityError();
+        try {
+          validateTenantContentInventoryCompletionProof(current, receipts, aggregate);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        if (!tenantContentInventoryReceiptMatchesAuthorization(aggregate, authorization)) {
+          await conn.commit();
+          return null;
+        }
+        await conn.commit();
+        return aggregate;
+      }
+      if (current.phase === "blocked") {
+        await conn.commit();
+        return null;
+      }
+
+      const storedReceipts = await this.loadTenantSessionContentReceipts(
+        conn,
+        current.tenantId,
+        current.requestId,
+        current.buildGeneration,
+        "FOR SHARE",
+      );
+      const storedState = this.tenantContentInventoryReceiptState(current, storedReceipts);
+      const existingAggregate = await this.loadTenantContentInventoryReceipt(
+        conn,
+        current.tenantId,
+        current.requestId,
+        "FOR SHARE",
+      );
+      if (existingAggregate) throw new TenantErasureIntegrityError();
+      if (!current.scanComplete) throw new TenantContentInventoryEvidenceChangedError();
+
+      const [sessionRows] = await conn.query<Row[]>(
+        `SELECT session_id, tenant_id, user_id, parent_session_id, last_seq,
+                archived_at_ms, deleted_at_ms, deletion_generation
+           FROM sessions FORCE INDEX (idx_sessions_tenant)
+          WHERE tenant_id=? ORDER BY session_id FOR SHARE`,
+        [current.tenantId],
+      );
+      if (sessionRows.length !== storedReceipts.length) {
+        throw new TenantContentInventoryEvidenceChangedError();
+      }
+      let recomputedContentRecordCount = 0;
+      for (const [index, row] of sessionRows.entries()) {
+        const session = this.tenantContentSessionRow(row);
+        const stored = storedReceipts[index];
+        if (
+          session.tenantId !== current.tenantId
+          || !stored
+          || stored.sessionId !== session.sessionId
+        ) throw new TenantContentInventoryEvidenceChangedError();
+        if (stored.capturedAtDbMs < current.retentionAnchorDbMs) {
+          throw new TenantErasureIntegrityError();
+        }
+        const content = await this.loadTenantSessionContentEvidence(conn, session);
+        const recomputed = this.tenantSessionContentReceipt(
+          current,
+          session,
+          content,
+          stored.capturedAtDbMs,
+        );
+        if (recomputed.receiptSha256 !== stored.receiptSha256) {
+          throw new TenantContentInventoryEvidenceChangedError();
+        }
+        recomputedContentRecordCount += recomputed.contentRecordCount;
+        if (!Number.isSafeInteger(recomputedContentRecordCount)) {
+          throw new TenantErasureIntegrityError();
+        }
+      }
+      if (recomputedContentRecordCount !== storedState.contentRecordCount) {
+        throw new TenantContentInventoryEvidenceChangedError();
+      }
+
+      await this.lockAndValidateTenantContentGlobalRelations(conn);
+      const holdProof = await this.lockTenantContentHoldProof(conn, current.tenantId);
+
+      // No potentially waiting read follows this clock observation. Re-check both the lease and
+      // retention deadline against database time immediately before the atomic receipt/job write.
+      const finalNow = await this.databaseNow(conn);
+      if (!tenantContentInventoryAuthorizationMatches(current, authorization, finalNow)) {
+        await conn.commit();
+        return null;
+      }
+      if (finalNow < current.contentNotBeforeDbMs) {
+        throw new TenantContentInventoryNotReadyError("deadline_not_reached");
+      }
+      const latestCapturedAtDbMs = storedReceipts.reduce(
+        (latest, receipt) => Math.max(latest, receipt.capturedAtDbMs),
+        current.retentionAnchorDbMs,
+      );
+      if (finalNow < latestCapturedAtDbMs) {
+        throw new TenantContentInventoryNotReadyError("trusted_clock_before_evidence");
+      }
+
+      const completedClaimTokenSha256 = tenantContentInventoryClaimTokenSha256(
+        authorization.claimToken,
+      );
+      const receiptBody: Omit<TenantContentInventoryReceipt, "receiptSha256"> = {
+        scope: TENANT_CONTENT_INVENTORY_RECEIPT_SCOPE,
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        buildGeneration: current.buildGeneration,
+        t1FenceSha256: current.t1FenceSha256,
+        t3aReceiptSha256: current.t3aReceiptSha256,
+        t3bReceiptSha256: current.t3bReceiptSha256,
+        policyVersion: current.policyVersion,
+        policySha256: current.policySha256,
+        policySchemaVersion: current.policySchemaVersion,
+        retentionAnchorDbMs: current.retentionAnchorDbMs,
+        contentNotBeforeDbMs: current.contentNotBeforeDbMs,
+        sessionReceiptCount: current.sessionReceiptCount,
+        sessionReceiptRootSha256: current.sessionReceiptRootSha256,
+        contentRecordCount: recomputedContentRecordCount,
+        ...holdProof,
+        globalOrphanCheck: TENANT_CONTENT_INVENTORY_GLOBAL_ORPHAN_CHECK,
+        storeDbTimestampMs: finalNow,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256,
+        contentInventoryComplete: true,
+        contentPurgeExecuted: false,
+      };
+      const aggregate: TenantContentInventoryReceipt = {
+        ...receiptBody,
+        receiptSha256: tenantContentInventoryReceiptSha256(receiptBody),
+      };
+      let terminalAtMs = Math.max(current.updatedAtMs, finalNow);
+      const terminalJob: TenantContentInventoryJobRecord = {
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        buildGeneration: current.buildGeneration,
+        t1FenceSha256: current.t1FenceSha256,
+        t3aReceiptSha256: current.t3aReceiptSha256,
+        t3bReceiptSha256: current.t3bReceiptSha256,
+        policyVersion: current.policyVersion,
+        policySha256: current.policySha256,
+        policySchemaVersion: current.policySchemaVersion,
+        retentionAnchorDbMs: current.retentionAnchorDbMs,
+        contentNotBeforeDbMs: current.contentNotBeforeDbMs,
+        phase: "inventory_sealed",
+        ...(current.cursorSessionId === undefined
+          ? {}
+          : { cursorSessionId: current.cursorSessionId }),
+        scanComplete: true,
+        sessionReceiptCount: current.sessionReceiptCount,
+        sessionReceiptRootSha256: current.sessionReceiptRootSha256,
+        attempts: current.attempts,
+        createdAtMs: current.createdAtMs,
+        updatedAtMs: terminalAtMs,
+        inventorySealedAtDbMs: finalNow,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256,
+        aggregateReceiptSha256: aggregate.receiptSha256,
+      };
+      try {
+        validateTenantContentInventoryCompletionProof(
+          terminalJob,
+          storedReceipts,
+          aggregate,
+        );
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+
+      await conn.query(
+        `INSERT INTO tenant_content_inventory_receipts
+           (scope, request_id, tenant_id, subject_generation, build_generation,
+            t1_fence_sha256, t3a_receipt_sha256, t3b_receipt_sha256, policy_version,
+            policy_sha256, policy_schema_version, retention_anchor_db_ms,
+            content_not_before_db_ms, session_receipt_count,
+            session_receipt_root_sha256, content_record_count, hold_control_count,
+            hold_root_sha256, global_orphan_check, store_db_timestamp_ms,
+            completed_claim_attempt, completed_claim_token_sha256,
+            content_inventory_complete, content_purge_executed, receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          aggregate.scope,
+          aggregate.requestId,
+          aggregate.tenantId,
+          aggregate.subjectGeneration,
+          aggregate.buildGeneration,
+          aggregate.t1FenceSha256,
+          aggregate.t3aReceiptSha256,
+          aggregate.t3bReceiptSha256,
+          aggregate.policyVersion,
+          aggregate.policySha256,
+          aggregate.policySchemaVersion,
+          aggregate.retentionAnchorDbMs,
+          aggregate.contentNotBeforeDbMs,
+          aggregate.sessionReceiptCount,
+          aggregate.sessionReceiptRootSha256,
+          aggregate.contentRecordCount,
+          aggregate.holdControlCount,
+          aggregate.holdControlRootSha256,
+          aggregate.globalOrphanCheck,
+          aggregate.storeDbTimestampMs,
+          aggregate.completedClaimAttempt,
+          aggregate.completedClaimTokenSha256,
+          aggregate.contentInventoryComplete,
+          aggregate.contentPurgeExecuted,
+          aggregate.receiptSha256,
+        ],
+      );
+      // The aggregate INSERT is the final operation that can wait without already owning the job
+      // row. Re-check authority afterwards; expiration rolls both the aggregate and terminal job
+      // transition back atomically.
+      const publishNow = await this.databaseNow(conn);
+      if (!tenantContentInventoryAuthorizationMatches(current, authorization, publishNow)) {
+        throw new Error("stale tenant content inventory authority");
+      }
+      terminalAtMs = Math.max(terminalAtMs, publishNow);
+      try {
+        validateTenantContentInventoryCompletionProof(
+          { ...terminalJob, updatedAtMs: terminalAtMs },
+          storedReceipts,
+          aggregate,
+        );
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      const [completed] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_content_inventory_jobs
+            SET phase='inventory_sealed', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?, sealed_at_ms=?,
+                completed_claim_attempt=?, completed_claim_token_sha256=?,
+                aggregate_receipt_sha256=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND build_generation=? AND phase='queued' AND scan_complete=TRUE
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          terminalAtMs,
+          finalNow,
+          authorization.claimAttempt,
+          completedClaimTokenSha256,
+          aggregate.receiptSha256,
+          authorization.requestId,
+          authorization.tenantId,
+          authorization.subjectGeneration,
+          authorization.buildGeneration,
+          authorization.claimAttempt,
+          authorization.claimToken,
+          publishNow,
+        ],
+      );
+      if (completed.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      await conn.commit();
+      return aggregate;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantContentInventoryJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantContentInventoryJobRecord | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantContentInventoryJob(conn, tenantId, requestId);
+      if (!job) return null;
+      await this.validateTenantContentInventoryReadProof(conn, job);
+      return job;
+    });
+  }
+
+  async getTenantSessionContentReceipts(
+    tenantId: string,
+    requestId: string,
+    buildGeneration: number,
+  ): Promise<TenantSessionContentReceipt[]> {
+    if (!Number.isSafeInteger(buildGeneration) || buildGeneration <= 0) {
+      throw new Error("invalid tenant content inventory build generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantContentInventoryJob(conn, tenantId, requestId);
+      if (!job || job.buildGeneration !== buildGeneration) return [];
+      const proof = await this.validateTenantContentInventoryReadProof(conn, job);
+      return proof.receipts;
+    });
+  }
+
+  async getTenantContentInventoryReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantContentInventoryReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantContentInventoryJob(conn, tenantId, requestId);
+      if (!job) {
+        const orphan = await this.loadTenantContentInventoryReceipt(conn, tenantId, requestId);
+        if (orphan) throw new TenantErasureIntegrityError();
+        return null;
+      }
+      const proof = await this.validateTenantContentInventoryReadProof(conn, job);
+      return proof.aggregate;
     });
   }
 

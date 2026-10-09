@@ -39,6 +39,7 @@ const requiredTestFiles = [
   "packages/store/test/tenant-credential-revocation-races.mysql.test.ts",
   "packages/store/test/tenant-credential-physical-revocation.mysql.test.ts",
   "packages/store/test/tenant-runtime-revocation.mysql.test.ts",
+  "packages/store/test/tenant-content-inventory.mysql.test.ts",
   "packages/store/test/retention-policy.mysql.test.ts",
   "packages/store/test/erasure-purge-policy.mysql.test.ts",
   "packages/store/test/erasure-job.mysql.test.ts",

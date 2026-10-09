@@ -11,6 +11,7 @@ import {
   SessionBlobService,
   SessionHost,
   StaticToolRegistry,
+  TenantContentInventoryWorker,
   TenantCredentialRevocationWorker,
   TenantRuntimeCoordinator,
   TenantRuntimeRevocationWorker,
@@ -42,6 +43,7 @@ import {
   type RetentionPolicyStore,
   type SubjectLifecycleStore,
   type TenantCredentialRevocationStore,
+  type TenantContentInventoryStore,
   type TenantRuntimeRevocationStore,
   type SessionStore,
   type UsageLifecycleStore,
@@ -67,6 +69,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & BlobCleanupStore
     & SubjectLifecycleStore
     & TenantCredentialRevocationStore
+    & TenantContentInventoryStore
     & TenantRuntimeRevocationStore
     & ErasureJobStore
     & ErasurePolicyEvaluationStore
@@ -300,12 +303,24 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       retryMaxMs: cfg.TENANT_RUNTIME_REVOCATION_RETRY_MAX_MS,
     })
     : undefined;
+  const tenantContentInventoryWorker = cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED
+    ? new TenantContentInventoryWorker({ store }, {
+      pollIntervalMs: cfg.TENANT_CONTENT_INVENTORY_WORKER_POLL_MS,
+      leaseMs: cfg.TENANT_CONTENT_INVENTORY_WORKER_LEASE_MS,
+      batchSize: cfg.TENANT_CONTENT_INVENTORY_WORKER_BATCH_SIZE,
+      materializeBatchSize: cfg.TENANT_CONTENT_INVENTORY_MATERIALIZE_BATCH_SIZE,
+      sessionPageSize: cfg.TENANT_CONTENT_INVENTORY_SESSION_PAGE_SIZE,
+      retryBaseMs: cfg.TENANT_CONTENT_INVENTORY_RETRY_BASE_MS,
+      retryMaxMs: cfg.TENANT_CONTENT_INVENTORY_RETRY_MAX_MS,
+    })
+    : undefined;
   legacyTombstoneCompensationWorker?.start();
   erasureWorker?.start();
   purgePolicyEvaluator?.start();
   dataExportWorker?.start();
   dataExportCleanup?.start();
   tenantCredentialRevocationWorker?.start();
+  tenantContentInventoryWorker?.start();
 
   let ready = true;
   const app = createApp({
@@ -366,6 +381,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         dataExportCleanup?.stop(),
         tenantCredentialRevocationWorker?.stop(),
         tenantRuntimeRevocationWorker?.stop(),
+        tenantContentInventoryWorker?.stop(),
       ]);
       await host.drain(30_000);
       await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
@@ -399,14 +415,14 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,
     dataExportWorker, dataExportCleanup, tenantErasureAdmissionGate,
     tenantCredentialRevocationGate, tenantCredentialRevocationWorker,
     tenantRuntime, tenantRuntimeDrain, tenantRuntimeDrainClient,
-    tenantRuntimeRevocationWorker, tenantRuntimeBootId,
+    tenantRuntimeRevocationWorker, tenantContentInventoryWorker, tenantRuntimeBootId,
     blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };

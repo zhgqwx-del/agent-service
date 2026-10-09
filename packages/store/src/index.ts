@@ -11,6 +11,7 @@ export * from "./erasure-purge-policy.js";
 export * from "./data-export.js";
 export * from "./tenant-credential-revocation.js";
 export * from "./tenant-runtime-revocation.js";
+export * from "./tenant-content-inventory.js";
 export * from "./memory.js";
 export { MysqlSessionStore, type MysqlStoreOptions } from "./mysql/store.js";
 export { RedisLeaseStore } from "./redis/lease.js";

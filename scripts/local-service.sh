@@ -24,6 +24,7 @@ caller_tenant_credential_revocation_execution_enabled="${TENANT_CREDENTIAL_REVOC
 caller_tenant_runtime_drain_enabled="${TENANT_RUNTIME_DRAIN_ENABLED-}"
 caller_tenant_runtime_revocation_worker_enabled="${TENANT_RUNTIME_REVOCATION_WORKER_ENABLED-}"
 caller_tenant_runtime_drain_execution_enabled="${TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED-}"
+caller_tenant_content_inventory_worker_enabled="${TENANT_CONTENT_INVENTORY_WORKER_ENABLED-}"
 caller_data_governance_management_enabled="${DATA_GOVERNANCE_MANAGEMENT_ENABLED-}"
 caller_purge_policy_evaluator_enabled="${PURGE_POLICY_EVALUATOR_ENABLED-}"
 caller_data_export_requests_enabled="${DATA_EXPORT_REQUESTS_ENABLED-}"
@@ -60,6 +61,7 @@ fi
 [ -n "$caller_tenant_runtime_drain_enabled" ] && TENANT_RUNTIME_DRAIN_ENABLED="$caller_tenant_runtime_drain_enabled"
 [ -n "$caller_tenant_runtime_revocation_worker_enabled" ] && TENANT_RUNTIME_REVOCATION_WORKER_ENABLED="$caller_tenant_runtime_revocation_worker_enabled"
 [ -n "$caller_tenant_runtime_drain_execution_enabled" ] && TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED="$caller_tenant_runtime_drain_execution_enabled"
+[ -n "$caller_tenant_content_inventory_worker_enabled" ] && TENANT_CONTENT_INVENTORY_WORKER_ENABLED="$caller_tenant_content_inventory_worker_enabled"
 [ -n "$caller_data_governance_management_enabled" ] && DATA_GOVERNANCE_MANAGEMENT_ENABLED="$caller_data_governance_management_enabled"
 [ -n "$caller_purge_policy_evaluator_enabled" ] && PURGE_POLICY_EVALUATOR_ENABLED="$caller_purge_policy_evaluator_enabled"
 [ -n "$caller_data_export_requests_enabled" ] && DATA_EXPORT_REQUESTS_ENABLED="$caller_data_export_requests_enabled"
@@ -134,6 +136,7 @@ start_apps() {
       TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED="${TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED:-0}" \
       TENANT_RUNTIME_DRAIN_ENABLED="${TENANT_RUNTIME_DRAIN_ENABLED:-0}" \
       TENANT_RUNTIME_REVOCATION_WORKER_ENABLED="${TENANT_RUNTIME_REVOCATION_WORKER_ENABLED:-0}" \
+      TENANT_CONTENT_INVENTORY_WORKER_ENABLED="${TENANT_CONTENT_INVENTORY_WORKER_ENABLED:-0}" \
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
       DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
@@ -153,6 +156,7 @@ start_apps() {
   else
     nohup env -u TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED \
       -u TENANT_RUNTIME_DRAIN_ENABLED -u TENANT_RUNTIME_REVOCATION_WORKER_ENABLED \
+      -u TENANT_CONTENT_INVENTORY_WORKER_ENABLED \
       RUNNERS="${RUNNERS:-$RUNNER_URL}" \
       REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}" \
       SESSION_TOMBSTONE_ENABLED="${SESSION_TOMBSTONE_ENABLED:-1}" \
@@ -254,6 +258,8 @@ verify() {
     pnpm run test:tenant-credential-physical-revocation-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-runtime-revocation-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-content-inventory-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:retention-policy-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
