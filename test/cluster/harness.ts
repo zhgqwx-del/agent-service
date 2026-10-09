@@ -12,7 +12,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 export const MYSQL_URL = process.env.CLUSTER_MYSQL_URL ?? "mysql://root@127.0.0.1:3306/agent_service_cluster";
 export const REDIS_URL = process.env.CLUSTER_REDIS_URL ?? "redis://127.0.0.1:6379/3";
 const SECRET = "55".repeat(32);
-const INTERNAL_ROUTER_TOKEN = "cluster-internal-router-token-v1-0001";
+export const INTERNAL_ROUTER_TOKEN = "cluster-internal-router-token-v1-0001";
+export const TENANT_ERASURE_OPERATOR_TOKEN = "cluster-platform-operator-token-v1-0001";
 
 async function freePort(): Promise<number> {
   return new Promise((res, rej) => {
@@ -58,13 +59,24 @@ export interface Proc {
   exited: Promise<number | null>;
 }
 
-function launch(name: string, script: string, port: number, env: Record<string, string>): Proc {
+function launch(
+  name: string,
+  script: string,
+  port: number,
+  env: Record<string, string>,
+  options: { runner?: boolean } = {},
+): Proc {
   // `node --import tsx <script>` makes the spawned process BE the server. Running the `tsx` CLI would
   // add a wrapper process, and killing the wrapper leaves the real server alive — which silently turns
   // a takeover test into a no-op (it did, until this was fixed).
+  const childEnv: NodeJS.ProcessEnv = { ...process.env, ...env, NODE_ENV: "test" };
+  if (options.runner) {
+    delete childEnv.TENANT_ERASURE_OPERATOR_TOKEN;
+    delete childEnv.TENANT_ERASURE_OPERATOR_ID;
+  }
   const child = spawn(process.execPath, ["--import", "tsx", script], {
     cwd: ROOT,
-    env: { ...process.env, ...env, NODE_ENV: "test" },
+    env: childEnv,
     stdio: ["ignore", "pipe", "pipe"],
     detached: true, // own process group, so a kill takes any grandchildren with it
   });
@@ -109,12 +121,16 @@ export interface Cluster {
 
 export interface ClusterOptions {
   runners?: number;
+  /** Keep an existing disposable database for restart/rollout tests; defaults to a fresh database. */
+  resetDatabase?: boolean;
   /** replies handed out by the fake vendor, round-robin across all runners */
   script?: ScriptedReply[];
   leaseTtlMs?: number;
   leaseHoldMs?: number;
   /** Enables both runner admission and the router fleet gate; implies the durable worker. */
   dataErasureRequestsEnabled?: boolean;
+  /** Enables the independent platform tenant-admission gate on router and every runner. */
+  tenantErasureRequestsEnabled?: boolean;
   /** Runs the durable erasure worker without necessarily accepting new requests. */
   erasureWorkerEnabled?: boolean;
   /**
@@ -135,6 +151,8 @@ export interface ClusterOptions {
   erasureWorkerEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional deterministic admission placement; defaults to the cluster-wide admission gate. */
   dataErasureRequestsEnabledForRunner?: (runnerNumber: number) => boolean;
+  /** Optional mixed-rollout placement for the irreversible tenant-admission barrier. */
+  tenantErasureRequestsEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional mixed-rollout placement; a disabled configured target intentionally blocks v2 claims. */
   legacyTombstoneCompensationEnabledForRunner?: (runnerNumber: number) => boolean;
 }
@@ -156,11 +174,13 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     );
   assertDisposableClusterTargets(MYSQL_URL, REDIS_URL, process.env.AGENT_SERVICE_ALLOW_DESTRUCTIVE_TEST_DB === "1");
 
-  // fresh database each run so seq/fence assertions start from a known state
+  // Most tests start fresh; rollout/restart tests can deliberately reopen the same disposable DB.
   const admin = await mysql.createConnection({ uri: MYSQL_URL.replace(/\/[^/]*$/, "/mysql") });
   const dbName = decodeURIComponent(new URL(MYSQL_URL).pathname.split("/").filter(Boolean).at(-1)!);
-  await admin.query(`DROP DATABASE IF EXISTS \`${dbName}\``);
-  await admin.query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
+  if (opts.resetDatabase !== false) {
+    await admin.query(`DROP DATABASE IF EXISTS \`${dbName}\``);
+    await admin.query(`CREATE DATABASE \`${dbName}\` CHARACTER SET utf8mb4`);
+  }
   await admin.end();
 
   const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
@@ -214,6 +234,11 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       opts.dataErasureRequestsEnabledForRunner?.(runnerNumber)
         ?? opts.dataErasureRequestsEnabled === true
     ) ? "1" : "0",
+    TENANT_ERASURE_REQUESTS_ENABLED: (
+      opts.tenantErasureRequestsEnabledForRunner?.(runnerNumber)
+        ?? opts.tenantErasureRequestsEnabled === true
+    ) ? "1" : "0",
+    TENANT_ERASURE_BARRIER_TIMEOUT_MS: "2000",
   });
 
   const runners: Proc[] = [];
@@ -233,6 +258,7 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       "apps/agent-runner/src/main.ts",
       port,
       runnerEnv(`runner-${i}`, port, i),
+      { runner: true },
     );
     started.push(p);
     await waitHttp(`${p.url}/readyz`).catch((e) => abandon(new Error(`${e.message}\n${p.log.slice(-20).join("\n")}`)));
@@ -251,6 +277,9 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     UPSTREAM_HEADER_TIMEOUT_MS: erasureWorkerEnabled ? "1000" : "15000",
     INTERNAL_ROUTER_TOKEN,
     DATA_ERASURE_REQUESTS_ENABLED: opts.dataErasureRequestsEnabled ? "1" : "0",
+    TENANT_ERASURE_REQUESTS_ENABLED: opts.tenantErasureRequestsEnabled ? "1" : "0",
+    TENANT_ERASURE_OPERATOR_TOKEN,
+    TENANT_ERASURE_OPERATOR_ID: "cluster-platform-operator",
   });
   started.push(router);
   await waitHttp(`${router.url}/readyz`).catch((e) => abandon(new Error(`${e.message}\n${router.log.slice(-20).join("\n")}`)));

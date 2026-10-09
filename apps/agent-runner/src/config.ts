@@ -62,6 +62,12 @@ const Env = z.object({
   ERASURE_WORKER_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(20_000),
   /** Subject erasure is additive but write-blocking; keep it off until every writer understands the gate. */
   DATA_ERASURE_REQUESTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Independent platform-only tenant-erasure admission; never authenticated by a tenant key. */
+  TENANT_ERASURE_REQUESTS_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  /** Bounded runner-to-router fleet check performed immediately before each tenant admission. */
+  TENANT_ERASURE_BARRIER_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(2_000),
   /** Canonical policy/legal-hold admin surface. This never enables destructive purge. */
   DATA_GOVERNANCE_MANAGEMENT_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -183,6 +189,14 @@ function validateErasureRouterUrl(value: string): string {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
+  if (
+    env.TENANT_ERASURE_OPERATOR_TOKEN !== undefined
+    || env.TENANT_ERASURE_OPERATOR_ID !== undefined
+  ) {
+    throw new Error(
+      "TENANT_ERASURE_OPERATOR_TOKEN and TENANT_ERASURE_OPERATOR_ID are router-only and must not enter a runner process",
+    );
+  }
   const c = Env.parse(env);
   const production = c.NODE_ENV === "production";
   if (production && c.BOOTSTRAP_API_KEY) {
@@ -262,12 +276,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       c.ERASURE_WORKER_ENABLED
       || c.LEGACY_TOMBSTONE_COMPENSATION_ENABLED
       || c.PURGE_POLICY_EVALUATOR_ENABLED
+      || c.TENANT_ERASURE_REQUESTS_ENABLED
     )
     && erasureRouterUrl === undefined
   ) {
     throw new Error(
       "ERASURE_ROUTER_URL is required when ERASURE_WORKER_ENABLED=1 or "
-        + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1 or PURGE_POLICY_EVALUATOR_ENABLED=1",
+        + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1, PURGE_POLICY_EVALUATOR_ENABLED=1, "
+        + "or TENANT_ERASURE_REQUESTS_ENABLED=1",
     );
   }
   if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.ERASURE_WORKER_ENABLED) {

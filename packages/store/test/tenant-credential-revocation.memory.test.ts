@@ -6,6 +6,8 @@ import {
   MemorySessionStore,
   SubjectDeletingError,
   TenantErasureConflictError,
+  TenantErasureIntegrityError,
+  TenantErasureTargetNotFoundError,
   newErasureRequestId,
   newLegalHoldId,
   subjectLifecycleKey,
@@ -313,6 +315,7 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
     const tenantId = "tenant-governance-fence";
     const neighborId = "tenant-governance-neighbor";
     const holdId = newLegalHoldId();
+    await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
     await store.putRetentionPolicy({
       tenantId,
       policyVersion: "policy-before",
@@ -424,7 +427,10 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
     const first = requestInput(tenantId, "shared-key");
     const replay = { ...first, requestId: newErasureRequestId(), atMs: first.atMs + 1 };
 
+    await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
     const created = await store.requestTenantErasure(first);
+    // Replay is authoritative before the independent registry-existence check.
+    store.tenants.delete(tenantId);
     expect(await store.requestTenantErasure(replay)).toEqual(created);
     expect(await store.requestTenantErasure({
       ...replay,
@@ -439,6 +445,7 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
       .rejects.toBeInstanceOf(ErasureIdempotencyMismatchError);
 
     const concurrent = new MemorySessionStore();
+    await concurrent.setTenantAuth("tenant-concurrent", DEFAULT_AUTH_POLICY);
     const [left, right] = await Promise.all([
       concurrent.requestTenantErasure(requestInput("tenant-concurrent", "left")),
       concurrent.requestTenantErasure(requestInput("tenant-concurrent", "right")),
@@ -453,6 +460,120 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
       generation: 1,
       activeRequestId: left.requestId,
     });
+  });
+
+  it("recovers only an exact committed tenant replay without admission authority", async () => {
+    const store = new MemorySessionStore();
+    const tenantId = "tenant-replay-only";
+    const input = requestInput(tenantId, "recover-r\u00e9sponse");
+    await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
+    await store.setTenantAuth("tenant-replay-neighbor", DEFAULT_AUTH_POLICY);
+    const created = await store.requestTenantErasure(input);
+    const sizes = () => ({
+      admissions: store.tenantErasureAdmissions.size,
+      lifecycles: store.subjectLifecycles.size,
+      audits: store.erasureAuditEvents.size,
+      fences: store.tenantCredentialRevocationFences.size,
+    });
+    const before = sizes();
+
+    store.tenants.delete(tenantId);
+    expect(await store.replayTenantErasure({
+      tenantId,
+      idempotencyKey: input.idempotencyKey,
+      requestHash: input.requestHash,
+    })).toEqual(created);
+    expect(await store.replayTenantErasure({
+      tenantId,
+      idempotencyKey: "different-key",
+      requestHash: input.requestHash,
+    })).toBeNull();
+    expect(await store.replayTenantErasure({
+      tenantId,
+      idempotencyKey: "recover-re\u0301sponse",
+      requestHash: input.requestHash,
+    })).toBeNull();
+    expect(await store.replayTenantErasure({
+      tenantId: "tenant-replay-neighbor",
+      idempotencyKey: input.idempotencyKey,
+      requestHash: tenantErasureRequestHash("tenant-replay-neighbor"),
+    })).toBeNull();
+    expect(sizes()).toEqual(before);
+
+    store.tenantCredentialRevocationFences.delete(tenantId);
+    await expect(store.replayTenantErasure({
+      tenantId,
+      idempotencyKey: input.idempotencyKey,
+      requestHash: input.requestHash,
+    })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+  });
+
+  it("rejects nonexistent tenants without residue and does not treat incidental data as identity", async () => {
+    const emptyStore = new MemorySessionStore();
+    const missing = requestInput("tenant-does-not-exist", "missing-tenant");
+    await expect(emptyStore.requestTenantErasure(missing))
+      .rejects.toBeInstanceOf(TenantErasureTargetNotFoundError);
+    expect(emptyStore.tenants).toHaveLength(0);
+    expect(emptyStore.subjectLifecycles).toHaveLength(0);
+    expect(emptyStore.tenantErasureAdmissions).toHaveLength(0);
+    expect(emptyStore.erasureAuditEvents).toHaveLength(0);
+    expect(emptyStore.tenantCredentialRevocationFences).toHaveLength(0);
+
+    const incidentalStore = new MemorySessionStore();
+    const tenantId = "tenant-incidental-data-only";
+    const session = mkSession(tenantId, "user-incidental");
+    await incidentalStore.createSession(session);
+    const lifecycleBefore = structuredClone([...incidentalStore.subjectLifecycles.entries()]);
+    await expect(incidentalStore.requestTenantErasure(requestInput(tenantId, "incidental")))
+      .rejects.toBeInstanceOf(TenantErasureTargetNotFoundError);
+    expect([...incidentalStore.subjectLifecycles.entries()]).toEqual(lifecycleBefore);
+    expect(incidentalStore.tenants).toHaveLength(0);
+    expect(incidentalStore.tenantErasureAdmissions).toHaveLength(0);
+    expect(incidentalStore.erasureAuditEvents).toHaveLength(0);
+    expect(incidentalStore.tenantCredentialRevocationFences).toHaveLength(0);
+  });
+
+  it("requires lifecycle, credential-fence, and first-audit proof on tenant status reads", async () => {
+    const assertIntegrityFailure = async (
+      promise: Promise<unknown>,
+      tenantId: string,
+      requestId: string,
+    ) => {
+      try {
+        await promise;
+        throw new Error("expected tenant-erasure integrity failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(TenantErasureIntegrityError);
+        expect((error as Error).message).toBe("tenant erasure integrity proof is invalid");
+        expect((error as Error).message).not.toContain(tenantId);
+        expect((error as Error).message).not.toContain(requestId);
+      }
+    };
+
+    for (const corruption of ["lifecycle", "fence", "audit", "admission"] as const) {
+      const store = new MemorySessionStore();
+      const tenantId = `tenant-status-corrupt-${corruption}`;
+      const input = requestInput(tenantId, `status-corrupt-${corruption}`);
+      await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
+      await store.requestTenantErasure(input);
+      if (corruption === "lifecycle") {
+        store.subjectLifecycles.get(subjectLifecycleKey(tenantId, "tenant", tenantId))!
+          .generation += 1;
+      } else if (corruption === "fence") {
+        store.tenantCredentialRevocationFences.delete(tenantId);
+      } else if (corruption === "audit") {
+        store.erasureAuditEvents.delete(input.requestId);
+      } else {
+        store.tenantErasureAdmissions.delete(input.requestId);
+      }
+      await assertIntegrityFailure(
+        store.getTenantErasureRequest(tenantId, input.requestId),
+        tenantId,
+        input.requestId,
+      );
+      expect(await store.getTenantErasureRequest("tenant-status-neighbor", input.requestId))
+        .toBeNull();
+    }
   });
 
   it("validates and clones before publication, then rolls back every map on a late failure", async () => {
@@ -474,6 +595,7 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
 
     const store = new MemorySessionStore();
     const input = requestInput("tenant-rollback");
+    await store.setTenantAuth(input.tenantId, DEFAULT_AUTH_POLICY);
     const lifecycle = store.subjectLifecycles;
     const originalSet = lifecycle.set.bind(lifecycle);
     let fail = true;
@@ -572,7 +694,7 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
     await expect(store.createApiKey(tenantId, "late-key", "late-orphan-hash"))
       .rejects.toBeInstanceOf(SubjectDeletingError);
     await expect(store.requestTenantErasure(requestInput(tenantId, "second-request")))
-      .rejects.toThrow("active tenant already has erasure admission");
+      .rejects.toBeInstanceOf(TenantErasureIntegrityError);
     await expect(store.getTenantRuntimeState(tenantId))
       .rejects.toThrow("tenant lifecycle and credential fence do not agree");
     expect(await store.resolveApiKey(neighborHash)).toMatchObject({

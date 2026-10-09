@@ -48,6 +48,7 @@ import { generateApiKey, hashApiKey } from "./auth.js";
 import { loadConfig } from "./config.js";
 import { RouterErasureSessionExecutor } from "./erasure-executor.js";
 import { RouterPurgePolicyEvaluationGate } from "./purge-policy-evaluation-gate.js";
+import { RouterTenantErasureAdmissionGate } from "./tenant-erasure-admission-gate.js";
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
@@ -241,6 +242,13 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       poisonMaxAttempts: cfg.DATA_EXPORT_CLEANUP_POISON_MAX_ATTEMPTS,
     })
     : undefined;
+  const tenantErasureAdmissionGate = cfg.TENANT_ERASURE_REQUESTS_ENABLED
+    ? new RouterTenantErasureAdmissionGate({
+      routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+      internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+      requestTimeoutMs: cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS,
+    })
+    : undefined;
   legacyTombstoneCompensationWorker?.start();
   erasureWorker?.start();
   purgePolicyEvaluator?.start();
@@ -267,6 +275,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     dataExportRequestsEnabled: cfg.dataExportArtifactsReadable && cfg.DATA_EXPORT_REQUESTS_ENABLED,
     dataExportDownloadLeaseMs: cfg.DATA_EXPORT_DOWNLOAD_LEASE_MS,
     subjectLifecycle: store,
+    tenantErasureRequestsEnabled: cfg.TENANT_ERASURE_REQUESTS_ENABLED,
+    tenantErasureAdmissionGate,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
     ready: () => ready,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
@@ -326,11 +336,11 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,
-    dataExportWorker, dataExportCleanup,
+    dataExportWorker, dataExportCleanup, tenantErasureAdmissionGate,
     blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };

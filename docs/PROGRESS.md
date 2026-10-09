@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority、异步user-export artifact/download/TTL，以及tenant-erasure T1逻辑credential fence均已完成。`0018`把独立tenant admission、tenant lifecycle gate、首条audit和append-only credential fence原子提交，现有tenant-scoped credential/data入口在gate后fail closed；但T1没有公开API、status/replay、worker、环境开关或fleet barrier，也不物理删除key/provider/auth secret。tenant T2/T3、可信时钟/owner-scan content receipt、ready/session物理purge、completed proof与restore replay仍未完成，M1尚未闭环。M2本地/CI代码范围已完成并正式冻结；M3/M4尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority、异步user-export artifact/download/TTL，以及tenant-erasure T1/T2均已完成。tenant erasure 现在由独立 platform bearer 经 router-only admission/status/replay 进入，双端 gate 和 fresh all-configured fleet barrier 阻止 mixed-fleet 提交；Memory/MySQL 原子建立 tenant lifecycle gate、首条 audit 和 append-only credential fence，现有 tenant-scoped credential/data 入口在 gate 后 fail closed。T3 worker、物理 key/provider/auth-secret/content 处理、可信时钟/owner-scan content receipt、ready/session 物理 purge、completed proof 与 restore replay 仍未完成，M1 尚未闭环。M2 本地/CI 代码范围已完成并正式冻结；M3/M4 尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -501,3 +501,30 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - 下一独立切片是 tenant erasure T2：增加独立 platform authority、内部/管理 API、status/replay、全 fleet code-aware barrier 和安全 rollout 契约；该 authority 必须使用新入口，不能绕过本轮已封住的 tenant-key governance 方法。随后 T3 增加 durable worker、物理 credential/auth-secret 清理、tenant 内容清理与 completion proof。旧 runtime 不理解 `0018` fence，因此 T2 barrier 完成前不得在 mixed-version fleet 调用 T1。
 - T1 不强制中断 admission 前已经发出的 provider/JWKS/introspection 网络 I/O；解密后的 secret 或 verifier 也可能暂留在进程内存，需通过 drain/restart、短缓存和后续 secret/KMS adapter 收口。migration 的 FORCE INDEX 会验证关键列和命名索引，但不会证明特权主体预建同名表的全部 engine/unique shape，生产仍需 migration identity、runtime 最小权限和 schema attestation。
 - 多 runner 同时首次启动时，现有 `ADMIN_BOOTSTRAP_TENANT` 的 list-then-create 仍可能生成多个 admin key；这是基线已有的 M4 运维风险，后续应改成一次性 Job/CLI 或数据库 singleton claim。完成 tenant T2/T3 后，M1 仍需可信数据库时间、完整 owner-scan content receipt、ready Blob/session/receipt/Redis destructive executor、completed proof 与独立故障域 restore replay，全部闭环后才进入 M3。
+
+## 2026-10-09（M1 数据生命周期：tenant erasure T2 platform control）
+
+### 已完成
+
+1. router 新增 platform-only `POST /v1/tenant-erasure-requests` 与 owner-hiding status GET；OpenAPI 3.1 和生成 TypeScript SDK 提供独立的窄化 platform client。该入口只接受与 tenant service/admin key 完全独立的 bearer，router-only operator token/id 不会进入 runner；runner 配置发现这两个变量会拒绝启动，本地脚本、verify 与 cluster harness 也在子进程边界显式清除。
+2. router 会先移除全部客户端 `x-agent-service-*`、hop-by-hop/framing header，并拒绝通过大小写、空白、重复/合并 Authorization 或 percent/double-percent 编码路径把 platform token 带入普通代理。只有显式 allowlist 的版本化私有控制路由才重新注入 `INTERNAL_ROUTER_TOKEN` 与固定 operator id；上游状态、固定 ACK、响应 schema 和 tenant/request identity 全部核对后才向公网返回。
+3. 新 admission 采用两层 gate 和 fresh all-configured fleet barrier：router 必须开启 writer gate，且全部 configured stable runner 当前健康、声明 `platform-control-v1` 并开启 local gate；选中的 runner 在提交不可逆 T1 事务前再次向 router 查询 barrier。target 缺失、陈旧、不可达、版本不兼容、ACK 错误或任一 local gate 关闭都会返回可重试 `503`，不会提交部分状态。
+4. router 在 fresh registry snapshot 后将请求冻结成 `admit | replay | status` 判别模式，并由模式内部派生 method、私有 path、ACK、capability 和允许状态，避免 gate 在请求中途变化时把 replay 升格为 create。关闭 writer gate 后，精确匹配已提交 raw tenant、`Idempotency-Key` 与 body hash 的 POST 只走独立 read-only replay 路径并返回同一 `202`；未知 tenant/key 返回 `503`，hash 冲突返回 `409`，绝不建立 admission。
+5. Store 增加 tenant erasure replay/status proof：Memory 复制读取，MySQL 使用一致性 snapshot，并同时验证 admission、tenant lifecycle、credential fence 与首条 content-free audit。proof 缺失、损坏或身份不一致统一 fail closed；公开状态当前固定为 `gated`，没有暗示 worker 或物理删除已经完成。
+6. tenant 和 idempotency key 的语义是原始字符串精确相等。MySQL 即使底层 `utf8mb4_0900_as_cs` 把 NFC/NFD 等 Unicode 变体视为等价，查询后仍会比较原始值；registry alias 会以 target-not-found 回滚，replay alias 不会命中，也不会留下 lifecycle/admission/audit/fence 残留。相同 key 仍按 tenant 隔离。
+7. 真实多进程 cluster 新增同一可丢弃 MySQL 的滚动重启证明：gate-on 两 runner 提交后，以 gate-off 两 runner 重启，精确重放仍得到同一 `202`，不同 key/tenant 均为 `503`，数据库始终只有一套 admission/audit/fence。公开 OpenAPI 明确以 router 为 authority；runner 的 `/openapi.json` 只是构建兼容镜像，不授权绕过 router 访问私有路由。
+8. README、架构/生命周期设计、local/deployment runbook、AGENTS/CLAUDE 与长期学习指南已同步。学习指南集中回答本地完整启动/手动体验、router/runner 职责、Node 24 ESM bundle 与 Linux OCI image 的区别、GitHub Actions 的 build/image 门禁，以及 local → staging → production promotion 同一不可变 image digest 的流程。
+
+### 本轮验证与审查
+
+- `scripts/local-service.sh verify` 全链通过：`pnpm check:secrets` 扫描 **279 files**，OpenAPI 生成检查与 `pnpm typecheck` 通过；主套件 **997 passed / 1 skipped**，唯一 skip 仍是真实厂商 E2E 的显式付费开关。覆盖率 **83.65% statements / 79.16% branches / 87.22% functions / 87.27% lines**，MySQL store lines **86.20%**。
+- 固定 **11** 个真实 MySQL 历史迁移文件 **47/47**；`0007 → 0008` 必跑夹具 **2/2** 继续证明相同 usage 重复安全合并、内容冲突阻断且不丢账、legacy pending receipt 保留。tenant credential named MySQL **16/16**、并发矩阵 **9/9**，required wrapper 明确证明目标文件执行且零 skip。
+- 真实 MySQL/Redis 的多进程 cluster **17/17**，其中包含 gate-on commit 后共享数据库 gate-off 重启 replay；SDK 隔离 consumer 的 **18-file** package 通过。runner **2795 KB**、router **760 KB** 两个独立 Node bundle 均完成构建，并以原生 Node 验证启动、readiness、tenant/platform auth 边界、转发和 OpenAPI。
+- 从并发正确性、事务回滚、滚动升级兼容、安全隔离和测试有效性复核，补齐了 replay-only mode 冻结、私有 ACK/响应校验、platform credential 子进程隔离、Unicode raw identity、防止 encoded-path/header smuggling、损坏 proof generic fail-closed 与真实 cluster 恢复路径。本轮未改变 provider dialect 或真实厂商网络契约，因此没有重复运行收费的 `verify-real` 或十阶段 acceptance；最近真实模型 **1/1** 与 acceptance 通过仅保留为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2 的本地/CI 代码范围仍保持正式冻结；本轮属于 M1，没有开始 M3。T2 platform control 的 local/CI 范围已完成，但 durable request 仍停在不可逆 `gated` 状态，不是 tenant 已物理删除或 erasure `completed`，因此 M1 尚不能冻结。
+- 下一独立切片是 tenant erasure T3：设计并实现 durable worker、物理 API key/provider credential/auth-secret 清理、tenant-owned content 清理与可验证 completion proof。它必须复用当前 admission/fence authority，保持 user-erasure、export pin、legal hold、usage/receipt 与 Blob 生命周期的事务和并发边界，不能直接把 T1/T2 的 `gated` 改写成 completed。
+- T3 之后仍需可信数据库时间、完整 owner-scan `session_content_receipts`、ready Blob/session/idempotency receipt/Redis 的物理清理、provider/JWKS/introspection 已发出 I/O 与进程内 secret 的 drain/restart 收口，以及独立故障域 restore-ledger replay。上述 M1 生命周期 proof 闭环后才正式进入 M3；M3 完成后再推进 M4 尚缺的生产可观测性、限流/配额、灾备和部署自动化。
+- 没有云资源不阻止继续实现并验证上述 local/CI 代码范围；但真实共享对象存储、KMS/Secret、registry、Kubernetes/VM 拓扑、云 MySQL/Redis、域名/TLS、备份恢复和 staging/production rollout 必须等待真实环境参数，不能编造，也不能把本地门禁表述为已完成云部署。

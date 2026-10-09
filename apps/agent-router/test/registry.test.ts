@@ -6,6 +6,7 @@ import {
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_ERASURE_PLATFORM_CONTROL_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "@agent-service/protocol";
 import { RunnerRegistry } from "../src/registry.js";
@@ -381,6 +382,82 @@ describe("RunnerRegistry owner address mapping", () => {
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.allHealthySupportUserDataExport()).toBe(true);
     expect(registry.allConfiguredSupportUserDataExportAdmission()).toBe(false);
+    await registry.close();
+  });
+
+  it("uses healthy tenant-control readers but every configured runner for irreversible admission", async () => {
+    let legacyState: "down" | "legacy" | "control" | "active" = "down";
+    const capabilities = (control: boolean, admission: boolean) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        tenantErasureControl: control ? [TENANT_ERASURE_PLATFORM_CONTROL_V1] : [],
+        tenantErasureRequests: admission,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        return Response.json(capabilities(
+          legacyState === "control" || legacyState === "active",
+          legacyState === "active",
+        ));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allHealthySupportTenantErasureControl()).toBe(true);
+    expect(registry.allConfiguredSupportTenantErasureControl()).toBe(false);
+    expect(registry.allConfiguredSupportTenantErasureAdmission()).toBe(false);
+    expect(registry.supportsTenantErasureControl("http://current")).toBe(true);
+    expect(registry.supportsTenantErasureAdmission("http://current")).toBe(true);
+
+    legacyState = "legacy";
+    await registry.refresh();
+    expect(registry.allHealthySupportTenantErasureControl()).toBe(false);
+    expect(registry.allConfiguredSupportTenantErasureControl()).toBe(false);
+
+    legacyState = "control";
+    await registry.refresh();
+    expect(registry.allHealthySupportTenantErasureControl()).toBe(true);
+    expect(registry.allConfiguredSupportTenantErasureControl()).toBe(true);
+    expect(registry.allConfiguredSupportTenantErasureAdmission()).toBe(false);
+    expect(registry.supportsTenantErasureControl("http://legacy")).toBe(true);
+    expect(registry.supportsTenantErasureAdmission("http://legacy")).toBe(false);
+
+    legacyState = "active";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantErasureAdmission()).toBe(true);
+
+    legacyState = "down";
+    await registry.refresh();
+    expect(registry.allHealthySupportTenantErasureControl()).toBe(true);
+    expect(registry.allConfiguredSupportTenantErasureControl()).toBe(false);
+    expect(registry.allConfiguredSupportTenantErasureAdmission()).toBe(false);
     await registry.close();
   });
 

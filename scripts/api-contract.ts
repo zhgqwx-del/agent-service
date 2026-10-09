@@ -74,6 +74,11 @@ import {
   SessionTurnParams,
   StartTurnHeaders,
   StartTurnQuery,
+  TenantErasureCreateRequest,
+  TenantErasureRequest,
+  TenantErasureRequestHeaders,
+  TenantErasureRequestParams,
+  TenantErasureRequestQuery,
   TenantAuthStateResponse,
   TenantAuthUpdateRequest,
   ToolListResponse,
@@ -106,7 +111,7 @@ const jsonResponse = (schema: ContractSchema, description: string): ResponseConf
 
 const PRIVATE_RESPONSE_HEADERS: NonNullable<ResponseConfig["headers"]> = {
   "Cache-Control": {
-    description: "Prevents storage of this user-owned lifecycle response.",
+    description: "Prevents storage of this sensitive lifecycle response.",
     schema: { type: "string", enum: ["no-store"] },
   },
   "X-Content-Type-Options": {
@@ -173,6 +178,7 @@ const jsonBody = (schema: ContractSchema, description: string): NonNullable<Rout
 const noContentResponse = (description: string): ResponseConfig => ({ description });
 
 const serviceSecurity: NonNullable<RouteConfig["security"]> = [{ ServiceApiKey: [] }];
+const platformSecurity: NonNullable<RouteConfig["security"]> = [{ PlatformOperatorToken: [] }];
 const userSecurity: NonNullable<RouteConfig["security"]> = [
   { ServiceApiKey: [], TrustedCallerUser: [] },
   { ServiceApiKey: [], EndUserToken: [] },
@@ -206,11 +212,19 @@ export function buildOpenApiDocument() {
     name: "X-End-User-Token",
     description: "Default end-user token header. A tenant auth policy may configure a different header name.",
   });
+  registry.registerComponent("securitySchemes", "PlatformOperatorToken", {
+    type: "http",
+    scheme: "bearer",
+    bearerFormat: "AgentServicePlatformOperatorToken",
+    description: "Platform lifecycle operator credential. It is independent from every tenant service API key.",
+  });
 
   const schemas = {
     error: registry.register("ErrorBody", ErrorBody),
     event: registry.register("Event", EventStreamEvent),
     erasureRequest: registry.register("ErasureRequest", ErasureRequest),
+    tenantErasureCreate: registry.register("TenantErasureCreateRequest", TenantErasureCreateRequest),
+    tenantErasureRequest: registry.register("TenantErasureRequest", TenantErasureRequest),
     dataExportRequest: registry.register("DataExportRequest", DataExportRequest),
     retentionPolicyPut: registry.register("RetentionPolicyPutRequest", RetentionPolicyPutRequest),
     retentionPolicyActivate: registry.register("RetentionPolicyActivateRequest", RetentionPolicyActivateRequest),
@@ -678,6 +692,41 @@ export function buildOpenApiDocument() {
 
   register({
     method: "post",
+    path: "/v1/tenant-erasure-requests",
+    operationId: "requestTenantErasure",
+    tags: ["Platform data lifecycle"],
+    summary: "Admit and logically fence a tenant for future erasure",
+    description: "Platform-operator-only. New admission is fleet-gated and atomically creates the tenant admission, logical credential fence and first audit event. While admission is closed, an exact already-committed Idempotency-Key replay remains recoverable but can never create a gate. T2 does not claim that a tenant worker exists or that physical credential/content deletion is complete.",
+    security: platformSecurity,
+    request: {
+      headers: TenantErasureRequestHeaders,
+      body: jsonBody(schemas.tenantErasureCreate, "Target tenant. The platform credential is intentionally outside that tenant's credential plane."),
+    },
+    responses: {
+      202: privateJsonResponse(schemas.tenantErasureRequest, "Existing or newly accepted tenant erasure request."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+  register({
+    method: "get",
+    path: "/v1/tenant-erasure-requests/{requestId}",
+    operationId: "getTenantErasureRequest",
+    tags: ["Platform data lifecycle"],
+    summary: "Read a tenant erasure request",
+    description: "Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed.",
+    security: platformSecurity,
+    request: {
+      params: TenantErasureRequestParams,
+      query: TenantErasureRequestQuery,
+    },
+    responses: {
+      200: privateJsonResponse(schemas.tenantErasureRequest, "Tenant erasure request status."),
+      default: privateJsonResponse(schemas.error, "Error response."),
+    },
+  });
+
+  register({
+    method: "post",
     path: "/v1/data-erasure-requests",
     operationId: "requestUserErasure",
     tags: ["Data lifecycle"],
@@ -959,8 +1008,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 53) {
-    throw new Error(`expected 53 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 55) {
+    throw new Error(`expected 55 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({

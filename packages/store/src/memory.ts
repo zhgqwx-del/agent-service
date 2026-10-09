@@ -132,6 +132,8 @@ import {
   ErasureJobIntegrityFault,
   SubjectDeletingError,
   TenantErasureConflictError,
+  TenantErasureIntegrityError,
+  TenantErasureTargetNotFoundError,
   assertErasureClaimToken,
   classifyErasureJobRecordFault,
   deriveBlockedErasureResumePhase,
@@ -158,8 +160,10 @@ import {
   validateErasureRequestRecord,
   validateErasureRequestRecordForRead,
   validateRepairAndResumeErasureJobInput,
+  validateReplayTenantErasureInput,
   validateRequestUserErasureInput,
   validateRequestTenantErasureInput,
+  validateTenantErasureAdmissionProof,
   validateTenantCredentialRevocationFence,
   validateRenewErasureJobClaimOptions,
   validateRetryErasureJobOptions,
@@ -182,6 +186,7 @@ import {
   type ErasureWriteAuthorization,
   type RequestUserErasureInput,
   type RequestTenantErasureInput,
+  type ReplayTenantErasureInput,
   type RepairAndResumeErasureJobInput,
   type RetryErasureJobOptions,
   type RenewErasureJobClaimOptions,
@@ -4056,6 +4061,54 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return JSON.stringify([input.tenantId, "tenant", input.tenantId, input.idempotencyKey]);
   }
 
+  private assertTenantErasureAdmissionProof(
+    admission: ErasureRequestRecord,
+    lifecycle: SubjectLifecycleRecord | undefined,
+    fence: TenantCredentialRevocationFence | undefined,
+  ): void {
+    validateTenantErasureAdmissionProof({
+      admission,
+      lifecycle,
+      fence,
+      firstAudit: this.erasureAuditEvents.get(admission.requestId)?.[0],
+    });
+  }
+
+  async replayTenantErasure(
+    input: ReplayTenantErasureInput,
+  ): Promise<ErasureRequestRecord | null> {
+    const stagedInput = clone(input);
+    validateReplayTenantErasureInput(stagedInput);
+    const idempotencyKey = this.tenantErasureIdempotencyKey(stagedInput);
+    const replayId = this.erasureIdempotency.get(idempotencyKey);
+    if (!replayId) {
+      // The index is part of the atomic publication. If the immutable admission still carries this
+      // exact identity, treating the missing index as "not found" would make recovery lie.
+      if ([...this.tenantErasureAdmissions.values()].some((admission) => (
+        admission.tenantId === stagedInput.tenantId
+        && admission.idempotencyKey === stagedInput.idempotencyKey
+      ))) throw new TenantErasureIntegrityError();
+      return null;
+    }
+    const replay = this.tenantErasureAdmissions.get(replayId);
+    if (
+      !replay
+      || replay.tenantId !== stagedInput.tenantId
+      || replay.subjectKind !== "tenant"
+      || replay.subjectId !== stagedInput.tenantId
+      || replay.idempotencyKey !== stagedInput.idempotencyKey
+    ) throw new TenantErasureIntegrityError();
+    if (replay.requestHash !== stagedInput.requestHash) {
+      throw new ErasureIdempotencyMismatchError();
+    }
+    this.assertTenantErasureAdmissionProof(
+      replay,
+      this.subjectRecord(stagedInput.tenantId, "tenant", stagedInput.tenantId),
+      this.tenantCredentialRevocationFences.get(stagedInput.tenantId),
+    );
+    return clone(replay);
+  }
+
   async requestTenantErasure(input: RequestTenantErasureInput): Promise<ErasureRequestRecord> {
     const stagedInput = clone(input);
     validateRequestTenantErasureInput(stagedInput);
@@ -4063,7 +4116,6 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const existingTenant = this.subjectLifecycles.get(tenantKey);
     const existingAdmission = this.tenantErasureAdmission(stagedInput.tenantId);
     const existingFence = this.tenantCredentialRevocationFences.get(stagedInput.tenantId);
-    if (existingFence) validateTenantCredentialRevocationFence(existingFence);
     const idempotencyKey = this.tenantErasureIdempotencyKey(stagedInput);
     const replayId = this.erasureIdempotency.get(idempotencyKey);
     if (replayId) {
@@ -4074,20 +4126,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || replay.subjectKind !== "tenant"
         || replay.subjectId !== stagedInput.tenantId
         || replay.idempotencyKey !== stagedInput.idempotencyKey
-      ) throw new Error("erasure idempotency index is corrupt");
-      validateErasureRequestRecordForRead(replay);
+      ) throw new TenantErasureIntegrityError();
       if (replay.requestHash !== stagedInput.requestHash) {
         throw new ErasureIdempotencyMismatchError();
       }
-      if (
-        !existingTenant
-        || existingTenant.state === "active"
-        || existingTenant.activeRequestId !== replay.requestId
-        || existingTenant.generation !== replay.generation
-        || !existingFence
-        || existingFence.requestId !== replay.requestId
-        || existingFence.subjectGeneration !== replay.generation
-      ) throw new Error("tenant erasure replay does not match its lifecycle fence");
+      this.assertTenantErasureAdmissionProof(replay, existingTenant, existingFence);
       return clone(replay);
     }
 
@@ -4095,22 +4138,18 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       const active = existingTenant.activeRequestId
         ? this.tenantErasureAdmissions.get(existingTenant.activeRequestId)
         : undefined;
-      if (
-        !active
-        || active.tenantId !== stagedInput.tenantId
-        || active.subjectKind !== "tenant"
-        || active.subjectId !== stagedInput.tenantId
-        || active.generation !== existingTenant.generation
-        || !existingFence
-        || existingFence.requestId !== active.requestId
-        || existingFence.subjectGeneration !== active.generation
-      ) throw new Error("tenant lifecycle active request is corrupt");
-      validateErasureRequestRecordForRead(active);
+      if (!active) throw new TenantErasureIntegrityError();
+      this.assertTenantErasureAdmissionProof(active, existingTenant, existingFence);
       return clone(active);
     }
     if (existingAdmission || existingFence) {
-      throw new Error("active tenant already has erasure admission or credential revocation evidence");
+      throw new TenantErasureIntegrityError();
     }
+    // Only the canonical tenant registry proves that a target exists. Sessions, policies and
+    // lifecycle rows can be written independently and must not authorize tenant-wide erasure.
+    // This check follows all replay paths so loss of an unrelated registry projection cannot
+    // invalidate an already-committed, internally consistent request.
+    if (!this.tenants.has(stagedInput.tenantId)) throw new TenantErasureTargetNotFoundError();
     if (
       this.erasureRequests.has(stagedInput.requestId)
       || this.tenantErasureAdmissions.has(stagedInput.requestId)
@@ -4236,13 +4275,22 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     requestId: string,
   ): Promise<ErasureRequestRecord | null> {
     const request = this.tenantErasureAdmissions.get(requestId);
+    const lifecycle = this.subjectRecord(tenantId, "tenant", tenantId);
+    const fence = this.tenantCredentialRevocationFences.get(tenantId);
+    if (!request) {
+      if (lifecycle?.activeRequestId === requestId || fence?.requestId === requestId) {
+        throw new TenantErasureIntegrityError();
+      }
+      return null;
+    }
+    // Preserve owner isolation: a request id belonging to another tenant is indistinguishable
+    // from a random id, even if the other tenant's proof is corrupt.
     if (
-      !request
-      || request.tenantId !== tenantId
+      request.tenantId !== tenantId
       || request.subjectKind !== "tenant"
       || request.subjectId !== tenantId
     ) return null;
-    validateErasureRequestRecordForRead(request);
+    this.assertTenantErasureAdmissionProof(request, lifecycle, fence);
     return clone(request);
   }
 

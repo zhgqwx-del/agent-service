@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { UserId } from "./common.js";
+import { UserId, externalId } from "./common.js";
 
 const Sha256 = z.string().regex(/^[0-9a-f]{64}$/);
 // Keep explicit bounds in this order. Chaining `.nonnegative().safe()` makes the OpenAPI
@@ -35,6 +35,34 @@ export const ErasureRequest = z.object({
 export type ErasureRequest = z.infer<typeof ErasureRequest>;
 
 export const ErasureRequestParams = z.object({ requestId: ErasureRequestId });
+
+// ---------- tenant erasure platform control plane ----------
+
+/**
+ * Tenant erasure cannot use a tenant service key: admission atomically revokes that entire
+ * credential plane. The HTTP operation is therefore authorized by a separate platform bearer
+ * credential and names the target tenant explicitly.
+ */
+export const TenantErasureCreateRequest = z.object({ tenantId: externalId }).strict();
+export type TenantErasureCreateRequest = z.infer<typeof TenantErasureCreateRequest>;
+
+export const TenantErasureRequestParams = z.object({ requestId: ErasureRequestId });
+export const TenantErasureRequestQuery = z.object({ tenantId: externalId });
+
+/** Actor identity, idempotency material and internal fence evidence never enter this response. */
+export const TenantErasureRequest = z.object({
+  id: ErasureRequestId,
+  scope: z.literal("tenant"),
+  tenantId: externalId,
+  generation: SafePositiveInteger,
+  // T2 is admission and logical credential fencing only. T3 may widen this public projection once
+  // a tenant-aware worker owns the later phases; advertising those states now would imply authority
+  // that the dormant tenant admission table deliberately does not grant.
+  status: z.literal("gated"),
+  createdAtMs: SafeNonnegativeInteger,
+  updatedAtMs: SafeNonnegativeInteger,
+}).strict();
+export type TenantErasureRequest = z.infer<typeof TenantErasureRequest>;
 
 // ---------- asynchronous user data export ----------
 

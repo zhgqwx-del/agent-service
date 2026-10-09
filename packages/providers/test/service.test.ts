@@ -5,6 +5,7 @@ import {
   newErasureRequestId,
   tenantErasureRequestHash,
 } from "@agent-service/store";
+import { DEFAULT_AUTH_POLICY } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService, assertPublicBaseUrl } from "../src/index.js";
 
 const KEY = "11".repeat(32);
@@ -12,6 +13,9 @@ const KEY = "11".repeat(32);
 const assertBaseUrl = async () => {};
 
 async function gateTenant(store: MemorySessionStore, tenantId: string): Promise<void> {
+  // Tenant-wide erasure admits only canonical tenant-registry targets. Provider rows alone are
+  // intentionally insufficient evidence because a typo could otherwise reserve a future id.
+  await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
   await store.requestTenantErasure({
     requestId: newErasureRequestId(),
     tenantId,

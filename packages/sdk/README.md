@@ -16,6 +16,23 @@ const { data, error } = await client.GET("/v1/sessions/{id}", {
 });
 ```
 
+Tenant-wide erasure uses a separate platform authority. Create its deliberately narrow client
+instead of placing that credential in `serviceApiKey`:
+
+```ts
+import { createAgentServicePlatformClient } from "@agent-service/sdk";
+
+const platform = createAgentServicePlatformClient({
+  baseUrl: "http://127.0.0.1:8080",
+  platformOperatorToken: process.env.AGENT_SERVICE_PLATFORM_OPERATOR_TOKEN!,
+});
+
+await platform.POST("/v1/tenant-erasure-requests", {
+  params: { header: { "idempotency-key": "tenant-offboarding-123" } },
+  body: { tenantId: "tenant-a" },
+});
+```
+
 Streaming endpoints use incremental SSE helpers so model output is not buffered:
 
 ```ts

@@ -7,6 +7,7 @@ import {
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_ERASURE_PLATFORM_CONTROL_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "@agent-service/protocol";
 
@@ -203,6 +204,50 @@ export class RunnerRegistry {
     ));
   }
 
+  /** Irreversible admission is fail-closed across every configured stable runner. */
+  allConfiguredSupportTenantErasureControl(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantErasureControl.includes(
+        TENANT_ERASURE_PLATFORM_CONTROL_V1,
+      ) === true
+    ));
+  }
+
+  /** Status is reversible: require every currently healthy target to understand the control read. */
+  allHealthySupportTenantErasureControl(): boolean {
+    const healthy = this.list().filter((target) => target.healthy);
+    return healthy.length > 0 && healthy.every((target) => (
+      target.capabilities?.features.tenantErasureControl.includes(
+        TENANT_ERASURE_PLATFORM_CONTROL_V1,
+      ) === true
+    ));
+  }
+
+  /** New admissions additionally require every configured runner's independent activation gate. */
+  allConfiguredSupportTenantErasureAdmission(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      this.supportsTenantErasureControl(target.url)
+      && target.capabilities?.features.tenantErasureRequests === true
+    ));
+  }
+
+  supportsTenantErasureControl(url: string): boolean {
+    const target = this.targets.get(url.replace(/\/+$/, ""));
+    return !!target?.healthy && target.capabilities?.features.tenantErasureControl.includes(
+      TENANT_ERASURE_PLATFORM_CONTROL_V1,
+    ) === true;
+  }
+
+  supportsTenantErasureAdmission(url: string): boolean {
+    const normalized = url.replace(/\/+$/, "");
+    const target = this.targets.get(normalized);
+    return this.supportsTenantErasureControl(normalized)
+      && target?.capabilities?.features.tenantErasureRequests === true;
+  }
+
   supportsDataErasureRequests(url: string): boolean {
     const target = this.targets.get(url.replace(/\/+$/, ""));
     return !!target?.healthy && target.capabilities?.features.dataErasureRequests === true;
@@ -343,6 +388,11 @@ export class RunnerRegistry {
     if (!t) return;
     t.consecutiveFailures += 1;
     if (t.consecutiveFailures >= 2) t.healthy = false;
+  }
+
+  /** Force one serialized current-fleet probe for irreversible control-plane decisions. */
+  async refresh(): Promise<void> {
+    await this.checkAll();
   }
 
   private checkAll(): Promise<void> {

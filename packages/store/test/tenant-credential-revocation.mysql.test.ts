@@ -18,6 +18,8 @@ import {
   SessionGoneError,
   SubjectDeletingError,
   TenantErasureConflictError,
+  TenantErasureIntegrityError,
+  TenantErasureTargetNotFoundError,
   newErasureRequestId,
   newLegalHoldId,
   newUsageId,
@@ -829,6 +831,376 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         }
       },
     );
+
+    it("rejects a nonexistent tenant atomically with no durable erasure residue", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant_missing_${randomUUID()}`;
+      const input = tenantRequestInput(tenantId, "missing-target");
+      try {
+        await expect(store.requestTenantErasure(input))
+          .rejects.toBeInstanceOf(TenantErasureTargetNotFoundError);
+        const [counts] = await conn.query<(RowDataPacket & {
+          tenants: number;
+          lifecycles: number;
+          requests: number;
+          audits: number;
+          fences: number;
+        })[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenants WHERE tenant_id=?) AS tenants,
+             (SELECT COUNT(*) FROM subject_lifecycle WHERE tenant_id=?) AS lifecycles,
+             (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE tenant_id=?) AS requests,
+             (SELECT COUNT(*) FROM erasure_audit_events WHERE request_id=?) AS audits,
+             (SELECT COUNT(*) FROM tenant_credential_revocation_fences WHERE tenant_id=?) AS fences`,
+          [tenantId, tenantId, tenantId, input.requestId, tenantId],
+        );
+        expect({
+          tenants: Number(counts[0]?.tenants),
+          lifecycles: Number(counts[0]?.lifecycles),
+          requests: Number(counts[0]?.requests),
+          audits: Number(counts[0]?.audits),
+          fences: Number(counts[0]?.fences),
+        }).toEqual({ tenants: 0, lifecycles: 0, requests: 0, audits: 0, fences: 0 });
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("hides collation aliases when a registered tenant already has a lifecycle row", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const suffix = randomUUID().replaceAll("-", "");
+      const registeredTenantId = `tenant_r\u00e9sum\u00e9_${suffix}`;
+      const aliasedTenantId = registeredTenantId.normalize("NFD");
+      const input = tenantRequestInput(aliasedTenantId, "registry-collation-alias");
+      try {
+        expect(aliasedTenantId).not.toBe(registeredTenantId);
+        await store.createApiKey(
+          registeredTenantId,
+          "seed-key",
+          keyDigest("registry-collation-alias"),
+        );
+
+        await expect(store.requestTenantErasure(input))
+          .rejects.toBeInstanceOf(TenantErasureTargetNotFoundError);
+        expect(await store.getTenantErasureRequest(aliasedTenantId, input.requestId)).toBeNull();
+
+        const [counts] = await conn.query<(RowDataPacket & {
+          registeredTenants: number;
+          aliasedTenants: number;
+          lifecycles: number;
+          admissions: number;
+          audits: number;
+          fences: number;
+        })[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenants WHERE BINARY tenant_id=BINARY ?) AS registeredTenants,
+             (SELECT COUNT(*) FROM tenants WHERE BINARY tenant_id=BINARY ?) AS aliasedTenants,
+             (SELECT COUNT(*) FROM subject_lifecycle WHERE BINARY tenant_id=BINARY ?) AS lifecycles,
+             (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE request_id=?) AS admissions,
+             (SELECT COUNT(*) FROM erasure_audit_events WHERE request_id=?) AS audits,
+             (SELECT COUNT(*) FROM tenant_credential_revocation_fences WHERE request_id=?) AS fences`,
+          [
+            registeredTenantId,
+            aliasedTenantId,
+            aliasedTenantId,
+            input.requestId,
+            input.requestId,
+            input.requestId,
+          ],
+        );
+        expect({
+          registeredTenants: Number(counts[0]?.registeredTenants),
+          aliasedTenants: Number(counts[0]?.aliasedTenants),
+          lifecycles: Number(counts[0]?.lifecycles),
+          admissions: Number(counts[0]?.admissions),
+          audits: Number(counts[0]?.audits),
+          fences: Number(counts[0]?.fences),
+        }).toEqual({
+          registeredTenants: 1,
+          aliasedTenants: 0,
+          lifecycles: 0,
+          admissions: 0,
+          audits: 0,
+          fences: 0,
+        });
+
+        const canonicalInput = tenantRequestInput(
+          registeredTenantId,
+          "registry-canonical-request",
+        );
+        const canonical = await store.requestTenantErasure(canonicalInput);
+        expect(await store.getTenantErasureRequest(aliasedTenantId, canonical.requestId)).toBeNull();
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("requires exact raw registry authority and rolls back an alias lifecycle insert", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const suffix = randomUUID().replaceAll("-", "");
+      const registeredTenantId = `tenant_authority_r\u00e9sum\u00e9_${suffix}`;
+      const aliasedTenantId = registeredTenantId.normalize("NFD");
+      const input = tenantRequestInput(aliasedTenantId, "registry-only-collation-alias");
+      try {
+        expect(aliasedTenantId).not.toBe(registeredTenantId);
+        // Deliberately model a historical/administrative registry row that predates lifecycle
+        // materialization. This forces requestTenantErasure past ensureTenantLifecycleRow and onto
+        // the authoritative raw registry comparison; the staged alias lifecycle must roll back.
+        await conn.query(
+          "INSERT INTO tenants (tenant_id, created_at_ms) VALUES (?,?)",
+          [registeredTenantId, NOW],
+        );
+
+        await expect(store.requestTenantErasure(input))
+          .rejects.toBeInstanceOf(TenantErasureTargetNotFoundError);
+
+        const [counts] = await conn.query<(RowDataPacket & {
+          registeredTenants: number;
+          aliasedTenants: number;
+          lifecycles: number;
+          admissions: number;
+          audits: number;
+          fences: number;
+        })[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenants WHERE BINARY tenant_id=BINARY ?) AS registeredTenants,
+             (SELECT COUNT(*) FROM tenants WHERE BINARY tenant_id=BINARY ?) AS aliasedTenants,
+             (SELECT COUNT(*) FROM subject_lifecycle WHERE BINARY tenant_id=BINARY ?) AS lifecycles,
+             (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE request_id=?) AS admissions,
+             (SELECT COUNT(*) FROM erasure_audit_events WHERE request_id=?) AS audits,
+             (SELECT COUNT(*) FROM tenant_credential_revocation_fences WHERE request_id=?) AS fences`,
+          [
+            registeredTenantId,
+            aliasedTenantId,
+            aliasedTenantId,
+            input.requestId,
+            input.requestId,
+            input.requestId,
+          ],
+        );
+        expect({
+          registeredTenants: Number(counts[0]?.registeredTenants),
+          aliasedTenants: Number(counts[0]?.aliasedTenants),
+          lifecycles: Number(counts[0]?.lifecycles),
+          admissions: Number(counts[0]?.admissions),
+          audits: Number(counts[0]?.audits),
+          fences: Number(counts[0]?.fences),
+        }).toEqual({
+          registeredTenants: 1,
+          aliasedTenants: 0,
+          lifecycles: 0,
+          admissions: 0,
+          audits: 0,
+          fences: 0,
+        });
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("replays a committed request before consulting the tenant registry", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant_replay_registry_${randomUUID()}`;
+      const first = tenantRequestInput(tenantId, "registry-replay");
+      try {
+        await store.createApiKey(tenantId, "seed-key", keyDigest("registry-replay"));
+        const created = await store.requestTenantErasure(first);
+        await conn.query("DELETE FROM tenants WHERE tenant_id=?", [tenantId]);
+        expect(await store.requestTenantErasure({
+          ...first,
+          requestId: newErasureRequestId(),
+          atMs: first.atMs + 1,
+        })).toEqual(created);
+        expect(await store.replayTenantErasure({
+          tenantId,
+          idempotencyKey: first.idempotencyKey,
+          requestHash: first.requestHash,
+        })).toEqual(created);
+        expect(await store.replayTenantErasure({
+          tenantId,
+          idempotencyKey: "uncommitted-or-different-key",
+          requestHash: first.requestHash,
+        })).toBeNull();
+        const [counts] = await conn.query<(RowDataPacket & {
+          admissions: number;
+          audits: number;
+          fences: number;
+        })[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE tenant_id=?) AS admissions,
+             (SELECT COUNT(*) FROM erasure_audit_events WHERE request_id=?) AS audits,
+             (SELECT COUNT(*) FROM tenant_credential_revocation_fences WHERE tenant_id=?) AS fences`,
+          [tenantId, first.requestId, tenantId],
+        );
+        expect(counts[0]).toMatchObject({ admissions: 1, audits: 1, fences: 1 });
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("treats Unicode-canonical idempotency variants as different raw keys", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const tenantId = `tenant_replay_exact_${randomUUID()}`;
+      const composedKey = "tenant-r\u00e9play";
+      const decomposedKey = "tenant-re\u0301play";
+      const first = tenantRequestInput(tenantId, composedKey);
+      try {
+        await store.createApiKey(tenantId, "seed-key", keyDigest("exact-replay"));
+        const created = await store.requestTenantErasure(first);
+        expect(await store.replayTenantErasure({
+          tenantId,
+          idempotencyKey: composedKey,
+          requestHash: first.requestHash,
+        })).toEqual(created);
+        expect(await store.replayTenantErasure({
+          tenantId,
+          idempotencyKey: decomposedKey,
+          requestHash: first.requestHash,
+        })).toBeNull();
+        expect(await store.requestTenantErasure({
+          ...first,
+          requestId: newErasureRequestId(),
+          idempotencyKey: decomposedKey,
+          atMs: first.atMs + 1,
+        })).toEqual(created);
+      } finally {
+        await store.close();
+      }
+    });
+
+    it("validates admission, lifecycle, credential fence, and first audit in one status snapshot", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const assertIntegrityFailure = async (
+        promise: Promise<unknown>,
+        tenantId: string,
+        requestId: string,
+      ) => {
+        try {
+          await promise;
+          throw new Error("expected tenant-erasure integrity failure");
+        } catch (error) {
+          expect(error).toBeInstanceOf(TenantErasureIntegrityError);
+          expect((error as Error).message).toBe("tenant erasure integrity proof is invalid");
+          expect((error as Error).message).not.toContain(tenantId);
+          expect((error as Error).message).not.toContain(requestId);
+        }
+      };
+      try {
+        const missingAuditTenant = `tenant_status_audit_${randomUUID()}`;
+        const missingAudit = tenantRequestInput(missingAuditTenant, "missing-audit");
+        await store.createApiKey(missingAuditTenant, "seed-key", keyDigest("status-audit"));
+        await store.requestTenantErasure(missingAudit);
+        await conn.query("DELETE FROM erasure_audit_events WHERE request_id=?", [missingAudit.requestId]);
+        await assertIntegrityFailure(
+          store.getTenantErasureRequest(missingAuditTenant, missingAudit.requestId),
+          missingAuditTenant,
+          missingAudit.requestId,
+        );
+        await assertIntegrityFailure(
+          store.replayTenantErasure({
+            tenantId: missingAuditTenant,
+            idempotencyKey: missingAudit.idempotencyKey,
+            requestHash: missingAudit.requestHash,
+          }),
+          missingAuditTenant,
+          missingAudit.requestId,
+        );
+
+        const lifecycleTenant = `tenant_status_lifecycle_${randomUUID()}`;
+        const lifecycleInput = tenantRequestInput(lifecycleTenant, "wrong-lifecycle");
+        await store.createApiKey(lifecycleTenant, "seed-key", keyDigest("status-lifecycle"));
+        await store.requestTenantErasure(lifecycleInput);
+        await conn.query(
+          `UPDATE subject_lifecycle SET generation=generation+1
+            WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+          [lifecycleTenant, lifecycleTenant],
+        );
+        await assertIntegrityFailure(
+          store.getTenantErasureRequest(lifecycleTenant, lifecycleInput.requestId),
+          lifecycleTenant,
+          lifecycleInput.requestId,
+        );
+
+        const missingFenceTenant = `tenant_status_fence_${randomUUID()}`;
+        const missingFence = tenantRequestInput(missingFenceTenant, "missing-fence");
+        await store.createApiKey(missingFenceTenant, "seed-key", keyDigest("status-fence"));
+        await conn.query(
+          `INSERT INTO tenant_erasure_admissions
+             (request_id, tenant_id, subject_generation, requested_by_key_id, idempotency_key,
+              request_hash, created_at_ms, gated_at_ms, updated_at_ms, policy_version, policy_hash,
+              control_generation)
+           VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,0)`,
+          [
+            missingFence.requestId,
+            missingFenceTenant,
+            1,
+            missingFence.requestedByKeyId,
+            missingFence.idempotencyKey,
+            missingFence.requestHash,
+            missingFence.atMs,
+            missingFence.atMs,
+            missingFence.atMs,
+          ],
+        );
+        await conn.query(
+          `UPDATE subject_lifecycle
+              SET state='deleting', generation=1, active_request_id=?, updated_at_ms=?
+            WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+          [missingFence.requestId, missingFence.atMs, missingFenceTenant, missingFenceTenant],
+        );
+        await conn.query(
+          `INSERT INTO erasure_audit_events
+             (request_id, seq, event_type, payload, emitted_at_ms)
+           VALUES (?,1,'erasure/gated',?,?)`,
+          [
+            missingFence.requestId,
+            JSON.stringify({
+              status: "gated",
+              subjectKind: "tenant",
+              generation: 1,
+              credentialFence: "logical-v1",
+            }),
+            missingFence.atMs,
+          ],
+        );
+        await assertIntegrityFailure(
+          store.getTenantErasureRequest(missingFenceTenant, missingFence.requestId),
+          missingFenceTenant,
+          missingFence.requestId,
+        );
+
+        const orphanTenant = `tenant_status_orphan_${randomUUID()}`;
+        const orphanRequestId = newErasureRequestId();
+        await store.createApiKey(orphanTenant, "seed-key", keyDigest("status-orphan"));
+        await conn.query(
+          `UPDATE subject_lifecycle
+              SET state='deleting', generation=1, active_request_id=?, updated_at_ms=?
+            WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+          [orphanRequestId, NOW, orphanTenant, orphanTenant],
+        );
+        await assertIntegrityFailure(
+          store.getTenantErasureRequest(orphanTenant, orphanRequestId),
+          orphanTenant,
+          orphanRequestId,
+        );
+        expect(await store.getTenantErasureRequest(
+          `tenant_status_neighbor_${randomUUID()}`,
+          missingFence.requestId,
+        )).toBeNull();
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
 
     it("rolls back lifecycle, request, audit, and evidence when the final fence insert fails", async () => {
       const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });

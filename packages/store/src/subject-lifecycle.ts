@@ -211,13 +211,7 @@ export interface RequestUserErasureInput {
   atMs: number;
 }
 
-/**
- * Internal-only tenant admission. The public tenant lifecycle control plane is deliberately not
- * exposed yet: submitting this request invalidates every tenant credential at the same durable
- * linearization point, so status/replay needs an independent platform authority first. No app
- * caller may invoke this while a pre-0018 runtime can still authenticate or serve the tenant; T2
- * must add and enforce the fleet activation barrier before exposing admission.
- */
+/** Internal admission behind the T2 platform authority and fresh all-configured fleet barrier. */
 export interface RequestTenantErasureInput {
   requestId: string;
   tenantId: string;
@@ -225,6 +219,13 @@ export interface RequestTenantErasureInput {
   idempotencyKey: string;
   requestHash: string;
   atMs: number;
+}
+
+/** Read-only idempotency recovery; this input can never authorize creating a tenant gate. */
+export interface ReplayTenantErasureInput {
+  tenantId: string;
+  idempotencyKey: string;
+  requestHash: string;
 }
 
 /** O(1) logical fence proving that all tenant credentials stopped authorizing new work. */
@@ -248,8 +249,10 @@ export interface TenantRuntimeState {
 export interface SubjectLifecycleStore {
   requestUserErasure(input: RequestUserErasureInput): Promise<ErasureRequestRecord>;
   getUserErasureRequest(tenantId: string, userId: string, requestId: string): Promise<ErasureRequestRecord | null>;
-  /** Dormant until a tenant-aware worker and independent operator authority are deployed. */
+  /** T2 admission only; a tenant-aware worker and physical deletion remain absent. */
   requestTenantErasure(input: RequestTenantErasureInput): Promise<ErasureRequestRecord>;
+  /** Return only an already-committed exact replay, or null; never creates or advances state. */
+  replayTenantErasure(input: ReplayTenantErasureInput): Promise<ErasureRequestRecord | null>;
   getTenantErasureRequest(tenantId: string, requestId: string): Promise<ErasureRequestRecord | null>;
   getTenantCredentialRevocationFence(
     tenantId: string,
@@ -263,6 +266,22 @@ export class TenantErasureConflictError extends Error {
   constructor() {
     super("tenant erasure cannot start while a user erasure worker still has authority");
     this.name = "TenantErasureConflictError";
+  }
+}
+
+/** The tenant registry is the admission authority; incidental tenant-scoped rows are not. */
+export class TenantErasureTargetNotFoundError extends Error {
+  constructor() {
+    super("tenant erasure target does not exist");
+    this.name = "TenantErasureTargetNotFoundError";
+  }
+}
+
+/** Fixed, content-free failure for an incomplete or contradictory tenant-erasure proof. */
+export class TenantErasureIntegrityError extends Error {
+  constructor() {
+    super("tenant erasure integrity proof is invalid");
+    this.name = "TenantErasureIntegrityError";
   }
 }
 
@@ -1608,6 +1627,57 @@ export function validateTenantCredentialRevocationFence(
   }
 }
 
+/**
+ * Validate the complete, immutable proof returned by tenant-erasure admission/status reads.
+ * Callers deliberately receive one fixed error: durable owner/control details must not escape
+ * through an error message, and no partial proof may be treated as a valid credential fence.
+ */
+export function validateTenantErasureAdmissionProof(input: {
+  admission: ErasureRequestRecord;
+  lifecycle: SubjectLifecycleRecord | undefined;
+  fence: TenantCredentialRevocationFence | undefined;
+  firstAudit: ErasureAuditEvent | undefined;
+}): void {
+  try {
+    const { admission, lifecycle, fence, firstAudit } = input;
+    validateErasureRequestRecord(admission);
+    if (
+      !isDormantTenantErasureAdmission(admission)
+      || admission.controlGeneration !== 0
+      || admission.requestHash !== tenantErasureRequestHash(admission.tenantId)
+      || !lifecycle
+      || lifecycle.tenantId !== admission.tenantId
+      || lifecycle.subjectKind !== "tenant"
+      || lifecycle.subjectId !== admission.tenantId
+      || lifecycle.state !== "deleting"
+      || lifecycle.generation !== admission.generation
+      || lifecycle.activeRequestId !== admission.requestId
+      || !Number.isSafeInteger(lifecycle.generation)
+      || lifecycle.generation <= 0
+      || !Number.isSafeInteger(lifecycle.createdAtMs)
+      || lifecycle.createdAtMs < 0
+      || !Number.isSafeInteger(lifecycle.updatedAtMs)
+      || lifecycle.updatedAtMs < lifecycle.createdAtMs
+      || (lifecycle.legalHoldAtMs !== undefined && (
+        !Number.isSafeInteger(lifecycle.legalHoldAtMs)
+        || lifecycle.legalHoldAtMs < 0
+      ))
+      || !fence
+    ) throw new Error("invalid tenant erasure admission binding");
+    validateTenantCredentialRevocationFence(fence);
+    if (
+      fence.tenantId !== admission.tenantId
+      || fence.requestId !== admission.requestId
+      || fence.subjectGeneration !== admission.generation
+      || fence.fencedAtMs !== admission.gatedAtMs
+      || !firstAudit
+    ) throw new Error("invalid tenant erasure fence binding");
+    validateErasureAuditChain(admission, [firstAudit]);
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
 export function validateRequestUserErasureInput(input: RequestUserErasureInput): void {
   if (!ERASURE_REQUEST_ID.test(input.requestId)) {
     throw new Error("invalid erasure request id");
@@ -1635,6 +1705,17 @@ export function validateRequestTenantErasureInput(input: RequestTenantErasureInp
   }
   if (!SHA256.test(input.requestHash)) throw new Error("invalid erasure request hash");
   assertTimestamp(input.atMs, "erasure request timestamp");
+  if (input.requestHash !== tenantErasureRequestHash(input.tenantId)) {
+    throw new Error("erasure request hash does not match its subject");
+  }
+}
+
+export function validateReplayTenantErasureInput(input: ReplayTenantErasureInput): void {
+  if (!input.tenantId || input.tenantId.length > 128) throw new Error("invalid erasure tenant id");
+  if (!input.idempotencyKey || input.idempotencyKey.length > 256) {
+    throw new Error("invalid erasure idempotency key");
+  }
+  if (!SHA256.test(input.requestHash)) throw new Error("invalid erasure request hash");
   if (input.requestHash !== tenantErasureRequestHash(input.tenantId)) {
     throw new Error("erasure request hash does not match its subject");
   }

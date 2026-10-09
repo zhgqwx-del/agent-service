@@ -34,6 +34,10 @@ function cleanEnv() {
     "ROUTER_ADMIN_TOKEN",
     "INTERNAL_ROUTER_TOKEN",
     "DATA_ERASURE_REQUESTS_ENABLED",
+    "TENANT_ERASURE_REQUESTS_ENABLED",
+    "TENANT_ERASURE_OPERATOR_TOKEN",
+    "TENANT_ERASURE_OPERATOR_ID",
+    "TENANT_ERASURE_BARRIER_TIMEOUT_MS",
     "DATA_GOVERNANCE_MANAGEMENT_ENABLED",
     "ERASURE_WORKER_ENABLED",
     "LEGACY_TOMBSTONE_COMPENSATION_ENABLED",
@@ -158,8 +162,16 @@ try {
   if (forwarded.status !== 401 || forwardedBody?.error?.code !== "unauthorized") {
     throw new Error("bundled router did not forward an authenticated API route to the runner");
   }
+  const platformControl = await fetch(
+    `http://127.0.0.1:${routerPort}/v1/tenant-erasure-requests`,
+    { method: "POST" },
+  );
+  const platformControlBody = await platformControl.json();
+  if (platformControl.status !== 401 || platformControlBody?.error?.code !== "unauthorized") {
+    throw new Error("bundled router did not retain the platform tenant-erasure auth boundary");
+  }
   await assertOpenApi(`http://127.0.0.1:${routerPort}/openapi.json`, "bundled router OpenAPI");
-  console.log("bundled runner and router started; readiness, forwarding, and OpenAPI passed");
+  console.log("bundled runner and router started; readiness, tenant/platform auth boundaries, forwarding, and OpenAPI passed");
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   for (const proc of [runner, router]) {

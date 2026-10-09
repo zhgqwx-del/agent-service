@@ -19,6 +19,19 @@ export interface AgentServiceClientOptions extends Omit<ClientOptions, "headers"
 
 export type AgentServiceClient = Client<paths>;
 
+/** The platform lifecycle credential is intentionally not part of AgentServiceAuth. */
+export interface AgentServicePlatformClientOptions extends Omit<ClientOptions, "headers"> {
+  baseUrl: string;
+  platformOperatorToken: string;
+  headers?: ClientOptions["headers"];
+}
+
+export type AgentServicePlatformPaths = Pick<
+  paths,
+  "/v1/tenant-erasure-requests" | "/v1/tenant-erasure-requests/{requestId}"
+>;
+export type AgentServicePlatformClient = Client<AgentServicePlatformPaths>;
+
 export type AgentServiceEvent = components["schemas"]["Event"];
 export type ExcludableEventType = components["schemas"]["ExcludableEventType"];
 export type StartTurnInput = components["schemas"]["StartTurnRequest"];
@@ -57,6 +70,25 @@ export function createAgentServiceClient(options: AgentServiceClientOptions): Ag
       endUserToken,
       endUserTokenHeader,
     })),
+  });
+}
+
+/**
+ * Creates the deliberately narrow tenant-lifecycle client. Keeping this credential out of the
+ * tenant runtime auth shape prevents accidental reuse as a service API key or SSE credential.
+ */
+export function createAgentServicePlatformClient(
+  options: AgentServicePlatformClientOptions,
+): AgentServicePlatformClient {
+  const { platformOperatorToken, headers: suppliedHeaders, ...clientOptions } = options;
+  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(platformOperatorToken)) {
+    throw new TypeError("platformOperatorToken must contain 32 to 256 token-safe characters");
+  }
+  return createOpenApiClient<AgentServicePlatformPaths>({
+    ...clientOptions,
+    headers: mergeHeaders(suppliedHeaders, {
+      Authorization: `Bearer ${platformOperatorToken}`,
+    }),
   });
 }
 

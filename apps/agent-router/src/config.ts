@@ -31,6 +31,15 @@ const Env = z.object({
   SESSION_TOMBSTONE_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** Explicit expand→activate gate for subject write barriers. */
   DATA_ERASURE_REQUESTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Independent platform admission gate for tenant-wide erasure. */
+  TENANT_ERASURE_REQUESTS_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  /** Router-only platform authority for tenant-erasure admission, replay and status. */
+  TENANT_ERASURE_OPERATOR_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
+  /** Stable non-secret audit principal injected only on the authenticated runner-internal route. */
+  TENANT_ERASURE_OPERATOR_ID: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)
+    .default("platform-lifecycle-admin"),
   /** Canonical retention-policy/legal-hold management. Physical purge remains a separate gate. */
   DATA_GOVERNANCE_MANAGEMENT_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -75,6 +84,7 @@ function validateRunnerUrl(value: string): string {
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
   const c = Env.parse(env);
   const runnerList = [...new Set(c.RUNNERS.split(",").map((s) => s.trim()).filter(Boolean).map(validateRunnerUrl))];
+  const internalRouterToken = c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN;
   if (!runnerList.length) throw new Error("RUNNERS must list at least one runner base url");
   if (c.NODE_ENV === "production" && !c.INTERNAL_ROUTER_TOKEN) {
     throw new Error("INTERNAL_ROUTER_TOKEN is required in production");
@@ -103,9 +113,27 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
       "filesystem user-export artifacts are unsupported in production until a shared object-store adapter is configured",
     );
   }
+  if (c.TENANT_ERASURE_REQUESTS_ENABLED && !c.TENANT_ERASURE_OPERATOR_TOKEN) {
+    throw new Error(
+      "TENANT_ERASURE_OPERATOR_TOKEN is required before TENANT_ERASURE_REQUESTS_ENABLED=1",
+    );
+  }
+  if (c.TENANT_ERASURE_OPERATOR_TOKEN === internalRouterToken) {
+    throw new Error(
+      "TENANT_ERASURE_OPERATOR_TOKEN must differ from INTERNAL_ROUTER_TOKEN",
+    );
+  }
+  if (
+    c.TENANT_ERASURE_OPERATOR_TOKEN !== undefined
+    && c.TENANT_ERASURE_OPERATOR_TOKEN === c.ROUTER_ADMIN_TOKEN
+  ) {
+    throw new Error(
+      "TENANT_ERASURE_OPERATOR_TOKEN must differ from ROUTER_ADMIN_TOKEN",
+    );
+  }
   return {
     ...c,
-    INTERNAL_ROUTER_TOKEN: c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
+    INTERNAL_ROUTER_TOKEN: internalRouterToken,
     runnerList,
     dataExportArtifactsReadable:
       c.NODE_ENV !== "production" && c.BLOB_FILESYSTEM_SINGLE_RUNNER,

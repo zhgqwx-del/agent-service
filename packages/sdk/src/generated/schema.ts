@@ -701,6 +701,46 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/tenant-erasure-requests": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly get?: never;
+        readonly put?: never;
+        /**
+         * Admit and logically fence a tenant for future erasure
+         * @description Platform-operator-only. New admission is fleet-gated and atomically creates the tenant admission, logical credential fence and first audit event. While admission is closed, an exact already-committed Idempotency-Key replay remains recoverable but can never create a gate. T2 does not claim that a tenant worker exists or that physical credential/content deletion is complete.
+         */
+        readonly post: operations["requestTenantErasure"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/tenant-erasure-requests/{requestId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /**
+         * Read a tenant erasure request
+         * @description Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed.
+         */
+        readonly get: operations["getTenantErasureRequest"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/tenant/api-keys": {
         readonly parameters: {
             readonly query?: never;
@@ -1091,6 +1131,10 @@ export type components = {
                 readonly skills: boolean;
                 /** @enum {boolean} */
                 readonly streaming: true;
+                /** @default [] */
+                readonly tenantErasureControl?: readonly "platform-control-v1"[];
+                /** @default false */
+                readonly tenantErasureRequests?: boolean;
                 /** @default [] */
                 readonly userDataExport?: readonly "artifact-ndjson-v1"[];
                 /** @default [] */
@@ -2681,6 +2725,20 @@ export type components = {
             };
             readonly secret?: string;
         };
+        readonly TenantErasureCreateRequest: {
+            readonly tenantId: string;
+        };
+        readonly TenantErasureRequest: {
+            readonly createdAtMs: number;
+            readonly generation: number;
+            readonly id: string;
+            /** @enum {string} */
+            readonly scope: "tenant";
+            /** @enum {string} */
+            readonly status: "gated";
+            readonly tenantId: string;
+            readonly updatedAtMs: number;
+        };
         readonly ToolList: {
             readonly data: readonly {
                 readonly concurrencySafe?: boolean;
@@ -3016,6 +3074,8 @@ export type SchemaStartTurnRequest = components['schemas']['StartTurnRequest'];
 export type SchemaSteerRequest = components['schemas']['SteerRequest'];
 export type SchemaTenantAuthState = components['schemas']['TenantAuthState'];
 export type SchemaTenantAuthUpdateRequest = components['schemas']['TenantAuthUpdateRequest'];
+export type SchemaTenantErasureCreateRequest = components['schemas']['TenantErasureCreateRequest'];
+export type SchemaTenantErasureRequest = components['schemas']['TenantErasureRequest'];
 export type SchemaToolList = components['schemas']['ToolList'];
 export type SchemaToolOutputPayload = components['schemas']['ToolOutputPayload'];
 export type SchemaTurn = components['schemas']['Turn'];
@@ -3277,7 +3337,7 @@ export interface operations {
             /** @description Existing or newly accepted user erasure request. */
             readonly 202: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3290,7 +3350,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3321,7 +3381,7 @@ export interface operations {
             /** @description Erasure request status. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3334,7 +3394,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3364,7 +3424,7 @@ export interface operations {
             /** @description Existing or newly accepted user data export request. */
             readonly 202: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3377,7 +3437,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3408,7 +3468,7 @@ export interface operations {
             /** @description Data export request status. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3421,7 +3481,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3452,7 +3512,7 @@ export interface operations {
             /** @description Complete NDJSON export artifact. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description SHA-256 digest of the complete artifact using HTTP structured-field syntax. */
                     readonly "Content-Digest"?: string;
@@ -3473,7 +3533,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3500,7 +3560,7 @@ export interface operations {
             /** @description Active holds and fail-closed projection control. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3513,7 +3573,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3542,7 +3602,7 @@ export interface operations {
             /** @description Existing or newly set legal hold. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3555,7 +3615,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3581,7 +3641,7 @@ export interface operations {
             /** @description Legal hold. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3594,7 +3654,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3625,7 +3685,7 @@ export interface operations {
             /** @description Released legal hold. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3638,7 +3698,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3787,7 +3847,7 @@ export interface operations {
             /** @description Immutable policy version. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3800,7 +3860,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3831,7 +3891,7 @@ export interface operations {
             /** @description Existing or newly registered immutable policy version. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3844,7 +3904,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3875,7 +3935,7 @@ export interface operations {
             /** @description Active policy and its monotonic control. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3888,7 +3948,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3912,7 +3972,7 @@ export interface operations {
             /** @description Active policy and its monotonic control. */
             readonly 200: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -3925,7 +3985,7 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
-                    /** @description Prevents storage of this user-owned lifecycle response. */
+                    /** @description Prevents storage of this sensitive lifecycle response. */
                     readonly "Cache-Control"?: "no-store";
                     /** @description Prevents content-type sniffing. */
                     readonly "X-Content-Type-Options"?: "nosniff";
@@ -4766,6 +4826,91 @@ export interface operations {
             /** @description Error response. */
             readonly default: {
                 headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly requestTenantErasure: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** @description Target tenant. The platform credential is intentionally outside that tenant's credential plane. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["TenantErasureCreateRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Existing or newly accepted tenant erasure request. */
+            readonly 202: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["TenantErasureRequest"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getTenantErasureRequest: {
+        readonly parameters: {
+            readonly query: {
+                readonly tenantId: string;
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly requestId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Tenant erasure request status. */
+            readonly 200: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["TenantErasureRequest"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    /** @description Prevents storage of this sensitive lifecycle response. */
+                    readonly "Cache-Control"?: "no-store";
+                    /** @description Prevents content-type sniffing. */
+                    readonly "X-Content-Type-Options"?: "nosniff";
                     readonly [name: string]: unknown;
                 };
                 content: {

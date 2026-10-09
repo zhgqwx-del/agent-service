@@ -10,6 +10,11 @@ import {
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
   INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH,
   INTERNAL_ROUTER_TOKEN_HEADER,
+  INTERNAL_TENANT_ERASURE_ACTOR_HEADER,
+  INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
+  INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH,
+  INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
 } from "@agent-service/protocol";
 
 const mockedServer = vi.hoisted(() => ({
@@ -205,6 +210,66 @@ describe("runner main blob wiring", () => {
       await runner?.close();
       startSpy.mockRestore();
       fetchSpy.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("wires tenant admission through the fresh router barrier without a platform token on the runner", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-tenant-erasure-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, {
+      status: 204,
+      headers: {
+        [INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER]:
+          INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
+      },
+    }));
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        BOOTSTRAP_API_KEY: "tenant-bootstrap-key",
+        BOOTSTRAP_TENANT_ID: "t_tenant_erasure",
+        TENANT_ERASURE_REQUESTS_ENABLED: "1",
+        TENANT_ERASURE_BARRIER_TIMEOUT_MS: "1000",
+        ERASURE_ROUTER_URL: "http://127.0.0.1:8080",
+        INTERNAL_ROUTER_TOKEN: INTERNAL_TOKEN,
+      });
+      expect(runner.tenantErasureAdmissionGate).toBeDefined();
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: {
+          tenantErasureControl: ["platform-control-v1"],
+          tenantErasureRequests: true,
+        },
+      });
+      const response = await runner.app.request(INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": "main-tenant-erasure",
+          [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN,
+          [INTERNAL_TENANT_ERASURE_ACTOR_HEADER]: "platform-main-test",
+        },
+        body: JSON.stringify({ tenantId: "t_tenant_erasure" }),
+      });
+      expect(response.status).toBe(202);
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      const [input, init] = fetchSpy.mock.calls[0]!;
+      expect(String(input)).toBe(
+        `http://127.0.0.1:8080${INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH}`,
+      );
+      expect(new Headers(init?.headers).get(INTERNAL_ROUTER_TOKEN_HEADER)).toBe(INTERNAL_TOKEN);
+      await runner.close();
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      fetchSpy.mockRestore();
+      warn.mockRestore();
       log.mockRestore();
       await rm(blobDir, { recursive: true, force: true });
     }

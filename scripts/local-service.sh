@@ -15,6 +15,10 @@ caller_runners="${RUNNERS-}"
 caller_redis_url="${REDIS_URL-}"
 caller_session_tombstone_enabled="${SESSION_TOMBSTONE_ENABLED-}"
 caller_data_erasure_requests_enabled="${DATA_ERASURE_REQUESTS_ENABLED-}"
+caller_tenant_erasure_requests_enabled="${TENANT_ERASURE_REQUESTS_ENABLED-}"
+caller_tenant_erasure_operator_token="${TENANT_ERASURE_OPERATOR_TOKEN-}"
+caller_tenant_erasure_operator_id="${TENANT_ERASURE_OPERATOR_ID-}"
+caller_tenant_erasure_barrier_timeout_ms="${TENANT_ERASURE_BARRIER_TIMEOUT_MS-}"
 caller_data_governance_management_enabled="${DATA_GOVERNANCE_MANAGEMENT_ENABLED-}"
 caller_purge_policy_evaluator_enabled="${PURGE_POLICY_EVALUATOR_ENABLED-}"
 caller_data_export_requests_enabled="${DATA_EXPORT_REQUESTS_ENABLED-}"
@@ -42,6 +46,10 @@ fi
 [ -n "$caller_redis_url" ] && REDIS_URL="$caller_redis_url"
 [ -n "$caller_session_tombstone_enabled" ] && SESSION_TOMBSTONE_ENABLED="$caller_session_tombstone_enabled"
 [ -n "$caller_data_erasure_requests_enabled" ] && DATA_ERASURE_REQUESTS_ENABLED="$caller_data_erasure_requests_enabled"
+[ -n "$caller_tenant_erasure_requests_enabled" ] && TENANT_ERASURE_REQUESTS_ENABLED="$caller_tenant_erasure_requests_enabled"
+[ -n "$caller_tenant_erasure_operator_token" ] && TENANT_ERASURE_OPERATOR_TOKEN="$caller_tenant_erasure_operator_token"
+[ -n "$caller_tenant_erasure_operator_id" ] && TENANT_ERASURE_OPERATOR_ID="$caller_tenant_erasure_operator_id"
+[ -n "$caller_tenant_erasure_barrier_timeout_ms" ] && TENANT_ERASURE_BARRIER_TIMEOUT_MS="$caller_tenant_erasure_barrier_timeout_ms"
 [ -n "$caller_data_governance_management_enabled" ] && DATA_GOVERNANCE_MANAGEMENT_ENABLED="$caller_data_governance_management_enabled"
 [ -n "$caller_purge_policy_evaluator_enabled" ] && PURGE_POLICY_EVALUATOR_ENABLED="$caller_purge_policy_evaluator_enabled"
 [ -n "$caller_data_export_requests_enabled" ] && DATA_EXPORT_REQUESTS_ENABLED="$caller_data_export_requests_enabled"
@@ -96,7 +104,10 @@ start_apps() {
   if pid_alive "$RUNNER_PID_FILE"; then
     echo "runner: already running (pid $(sed -n '1p' "$RUNNER_PID_FILE"))"
   else
-    nohup env STORE=mysql \
+    # The platform operator credential terminates at the router. `.env` is exported above for the
+    # local stack, so explicitly scrub it from the runner process rather than relying on app config
+    # to ignore an authority it must never possess.
+    nohup env -u TENANT_ERASURE_OPERATOR_TOKEN -u TENANT_ERASURE_OPERATOR_ID STORE=mysql \
       RUNNER_PORT="$RUNNER_PORT" \
       RUNNER_ID="${RUNNER_ID:-runner-local-1}" \
       RUNNER_ADDR="${RUNNER_ADDR:-127.0.0.1:$RUNNER_PORT}" \
@@ -106,6 +117,8 @@ start_apps() {
       BLOB_ATTACHMENTS_ENABLED="${BLOB_ATTACHMENTS_ENABLED:-1}" \
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
+      TENANT_ERASURE_REQUESTS_ENABLED="${TENANT_ERASURE_REQUESTS_ENABLED:-0}" \
+      TENANT_ERASURE_BARRIER_TIMEOUT_MS="${TENANT_ERASURE_BARRIER_TIMEOUT_MS:-2000}" \
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
       DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
@@ -127,6 +140,7 @@ start_apps() {
       REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}" \
       SESSION_TOMBSTONE_ENABLED="${SESSION_TOMBSTONE_ENABLED:-1}" \
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
+      TENANT_ERASURE_REQUESTS_ENABLED="${TENANT_ERASURE_REQUESTS_ENABLED:-0}" \
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
       DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
@@ -195,6 +209,9 @@ smoke() {
 
 verify() {
   require_tools
+  # `.env` is loaded for the local workflow, but platform authority must never be inherited by a
+  # runner spawned from a test harness. Tests use their own fixed, non-production router credential.
+  unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
   deploy/local/infra.sh start
   mkdir -p "$STATE_DIR"
   pnpm run check:secrets

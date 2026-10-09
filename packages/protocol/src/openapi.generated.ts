@@ -1196,6 +1196,21 @@ export const OPENAPI_DOCUMENT = {
                 ],
                 "type": "boolean"
               },
+              "tenantErasureControl": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "platform-control-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantErasureRequests": {
+                "default": false,
+                "type": "boolean"
+              },
               "userDataExport": {
                 "default": [],
                 "items": {
@@ -7875,6 +7890,71 @@ export const OPENAPI_DOCUMENT = {
         ],
         "type": "object"
       },
+      "TenantErasureCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "tenantId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenantId"
+        ],
+        "type": "object"
+      },
+      "TenantErasureRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^erase_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "tenant"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "gated"
+            ],
+            "type": "string"
+          },
+          "tenantId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "updatedAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "tenantId",
+          "generation",
+          "status",
+          "createdAtMs",
+          "updatedAtMs"
+        ],
+        "type": "object"
+      },
       "ToolList": {
         "properties": {
           "data": {
@@ -9008,6 +9088,12 @@ export const OPENAPI_DOCUMENT = {
         "name": "X-End-User-Token",
         "type": "apiKey"
       },
+      "PlatformOperatorToken": {
+        "bearerFormat": "AgentServicePlatformOperatorToken",
+        "description": "Platform lifecycle operator credential. It is independent from every tenant service API key.",
+        "scheme": "bearer",
+        "type": "http"
+      },
       "ServiceApiKey": {
         "bearerFormat": "AgentServiceApiKey",
         "description": "Tenant service API key. Runtime or admin scope is enforced per operation.",
@@ -9410,7 +9496,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Existing or newly accepted user erasure request.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9440,7 +9526,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9527,7 +9613,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Erasure request status.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9557,7 +9643,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9646,7 +9732,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Existing or newly accepted user data export request.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9676,7 +9762,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9763,7 +9849,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Data export request status.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9793,7 +9879,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9882,7 +9968,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Complete NDJSON export artifact.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -9941,7 +10027,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10019,7 +10105,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Active holds and fail-closed projection control.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10049,7 +10135,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10108,7 +10194,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Existing or newly set legal hold.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10138,7 +10224,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10198,7 +10284,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Legal hold.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10228,7 +10314,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10300,7 +10386,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Released legal hold.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10330,7 +10416,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10555,7 +10641,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Active policy and its monotonic control.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10585,7 +10671,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10645,7 +10731,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Immutable policy version.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10675,7 +10761,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10745,7 +10831,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Existing or newly registered immutable policy version.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10775,7 +10861,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10847,7 +10933,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Active policy and its monotonic control.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -10877,7 +10963,7 @@ export const OPENAPI_DOCUMENT = {
             "description": "Error response.",
             "headers": {
               "Cache-Control": {
-                "description": "Prevents storage of this user-owned lifecycle response.",
+                "description": "Prevents storage of this sensitive lifecycle response.",
                 "schema": {
                   "enum": [
                     "no-store"
@@ -12826,6 +12912,204 @@ export const OPENAPI_DOCUMENT = {
         "summary": "Restore an archived session",
         "tags": [
           "Sessions"
+        ]
+      }
+    },
+    "/v1/tenant-erasure-requests": {
+      "post": {
+        "description": "Platform-operator-only. New admission is fleet-gated and atomically creates the tenant admission, logical credential fence and first audit event. While admission is closed, an exact already-committed Idempotency-Key replay remains recoverable but can never create a gate. T2 does not claim that a tenant worker exists or that physical credential/content deletion is complete.",
+        "operationId": "requestTenantErasure",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TenantErasureCreateRequest"
+              }
+            }
+          },
+          "description": "Target tenant. The platform credential is intentionally outside that tenant's credential plane.",
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantErasureRequest"
+                }
+              }
+            },
+            "description": "Existing or newly accepted tenant erasure request.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PlatformOperatorToken": []
+          }
+        ],
+        "summary": "Admit and logically fence a tenant for future erasure",
+        "tags": [
+          "Platform data lifecycle"
+        ]
+      }
+    },
+    "/v1/tenant-erasure-requests/{requestId}": {
+      "get": {
+        "description": "Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed.",
+        "operationId": "getTenantErasureRequest",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "requestId",
+            "required": true,
+            "schema": {
+              "pattern": "^erase_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tenantId",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantErasureRequest"
+                }
+              }
+            },
+            "description": "Tenant erasure request status.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents storage of this sensitive lifecycle response.",
+                "schema": {
+                  "enum": [
+                    "no-store"
+                  ],
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Prevents content-type sniffing.",
+                "schema": {
+                  "enum": [
+                    "nosniff"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "PlatformOperatorToken": []
+          }
+        ],
+        "summary": "Read a tenant erasure request",
+        "tags": [
+          "Platform data lifecycle"
         ]
       }
     },

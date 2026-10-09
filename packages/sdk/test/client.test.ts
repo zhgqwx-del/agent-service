@@ -3,6 +3,7 @@ import {
   AgentServiceHttpError,
   type StartTurnInput,
   createAgentServiceClient,
+  createAgentServicePlatformClient,
   startTurnStream,
   subscribeSessionEvents,
 } from "../src/client.js";
@@ -81,6 +82,41 @@ describe("generated SDK client", () => {
       expect(surface ?? "").not.toContain(serviceApiKey);
       expect(surface ?? "").not.toContain(endUserToken);
     }
+  });
+
+  it("keeps the platform tenant-lifecycle credential on a separate narrow client", async () => {
+    const token = "platform-operator-secret-token-000001";
+    let request: Request | undefined;
+    const client = createAgentServicePlatformClient({
+      baseUrl: "https://agent.example.test",
+      platformOperatorToken: token,
+      fetch: async (input) => {
+        request = input;
+        return Response.json({
+          id: "erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
+          scope: "tenant",
+          tenantId: "tenant-a",
+          generation: 1,
+          status: "gated",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        }, { status: 202 });
+      },
+    });
+    const result = await client.POST("/v1/tenant-erasure-requests", {
+      params: { header: { "idempotency-key": "tenant-operation-1" } },
+      body: { tenantId: "tenant-a" },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.data?.status).toBe("gated");
+    expect(request?.headers.get("authorization")).toBe(`Bearer ${token}`);
+    expect(request?.headers.get("idempotency-key")).toBe("tenant-operation-1");
+    expect(request?.url).not.toContain(token);
+    expect(await request?.clone().text()).not.toContain(token);
+    expect(() => createAgentServicePlatformClient({
+      baseUrl: "https://agent.example.test",
+      platformOperatorToken: "short",
+    })).toThrow(/platformOperatorToken/);
   });
 
   it("subscribes to typed SSE events with replay and authentication headers", async () => {

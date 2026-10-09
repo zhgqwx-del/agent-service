@@ -37,6 +37,13 @@ import {
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_VALUE,
   INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX,
+  INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
+  INTERNAL_TENANT_ERASURE_ACTOR_HEADER,
+  INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_REPLAY_ACK_VALUE,
+  INTERNAL_TENANT_ERASURE_REPLAY_PATH,
+  INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_ROUTER_TOKEN_HEADER,
@@ -47,6 +54,11 @@ import {
   RetentionPolicyActivateRequest,
   RetentionPolicyParams,
   RetentionPolicyPutRequest,
+  TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TenantErasureCreateRequest,
+  TenantErasureRequestHeaders,
+  TenantErasureRequestParams,
+  TenantErasureRequestQuery,
   isCanonicalId,
   type IdPrefix,
   ProviderIdParams,
@@ -65,6 +77,7 @@ import {
   ImageMediaType,
   type Event,
   type ErasureRequest,
+  type TenantErasureRequest,
   type DataExportRequest,
   UserId,
 } from "@agent-service/protocol";
@@ -80,12 +93,15 @@ import {
   RetentionPolicyNotFoundError,
   RetentionPolicyVersionConflictError,
   SubjectDeletingError,
+  TenantErasureConflictError,
+  TenantErasureTargetNotFoundError,
   UserDataExportIdempotencyMismatchError,
   UserDataExportPolicyUnavailableError,
   UserDataExportStateError,
   erasureWriteAuthorizationMatches,
   newUserDataExportRequestId,
   newErasureRequestId,
+  tenantErasureRequestHash,
   userDataExportIdempotencyKeySha256,
   userDataExportManifestSha256,
   userDataExportRequestHash,
@@ -133,6 +149,10 @@ export interface AppDeps {
   maxDataExportPartBytes?: number;
   retentionPolicy?: RetentionPolicyStore;
   subjectLifecycle?: SubjectLifecycleStore;
+  /** Local half of the irreversible tenant-admission rollout switch. */
+  tenantErasureRequestsEnabled?: boolean;
+  /** Fresh router proof that every configured runtime can enforce the tenant fence. */
+  tenantErasureAdmissionGate?: { canAdmit: () => Promise<boolean> };
   ready: () => boolean;
   /** decrypts a tenant's stored auth secret (HS256 key / introspection credential) */
   decryptSecret: (secret: { ciphertext: Buffer; keyId: string }) => Promise<string>;
@@ -154,6 +174,8 @@ const json = (c: { req: { json: () => Promise<unknown> } }) => c.req.json().catc
 // This claim-only envelope is intentionally far smaller than the public runtime request budget.
 // Keeping a separate ceiling also ensures future public body-limit changes cannot widen this path.
 const INTERNAL_ERASURE_DRAIN_MAX_BODY_BYTES = 2_048;
+const INTERNAL_TENANT_ERASURE_MAX_BODY_BYTES = 2_048;
+const TENANT_ERASURE_ACTOR_ID = /^[A-Za-z0-9._-]{1,64}$/;
 
 function internalTokenMatches(received: string | undefined, expected: string): boolean {
   const left = createHash("sha256").update(received ?? "").digest();
@@ -256,6 +278,12 @@ export function createApp(deps: AppDeps) {
         dataExportRequests: deps.dataExportRequestsEnabled === true
           && deps.userDataExport !== undefined
           && deps.dataExportBlob !== undefined,
+        tenantErasureControl: deps.subjectLifecycle === undefined
+          ? []
+          : [TENANT_ERASURE_PLATFORM_CONTROL_V1],
+        tenantErasureRequests: deps.tenantErasureRequestsEnabled === true
+          && deps.subjectLifecycle !== undefined
+          && deps.tenantErasureAdmissionGate !== undefined,
         dynamicTools: true,
         mcp: [],
         skills: false,
@@ -327,6 +355,159 @@ export function createApp(deps: AppDeps) {
   });
   // Prevent unsupported methods from falling through to the ordinary /v1 auth middleware.
   app.all(erasureDrainPath, (c) => {
+    throw new ApiError("not_found", "not found");
+  });
+
+  // Versioned runner-only tenant lifecycle control. The public platform credential terminates at
+  // the router; only its fixed private credential reaches this route. Authenticate that token
+  // before looking at the target, query or body so direct probes cannot enumerate tenant state.
+  const tenantErasureControlPath = INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX;
+  const tenantErasureReplayPath = INTERNAL_TENANT_ERASURE_REPLAY_PATH;
+  const tenantErasureStatusPath = `${tenantErasureControlPath}/:requestId`;
+  app.use(tenantErasureControlPath, privateResponseHeaders);
+  app.use(`${tenantErasureControlPath}/*`, privateResponseHeaders);
+  app.use(tenantErasureReplayPath, privateResponseHeaders);
+  const requireTenantErasureControl: MiddlewareHandler<AuthEnv> = async (c, next) => {
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) {
+      throw new ApiError("not_found", "not found");
+    }
+    c.header(INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER, INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE);
+    await next();
+  };
+  const requireTenantErasureReplay: MiddlewareHandler<AuthEnv> = async (c, next) => {
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) {
+      throw new ApiError("not_found", "not found");
+    }
+    c.header(INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER, INTERNAL_TENANT_ERASURE_REPLAY_ACK_VALUE);
+    await next();
+  };
+  app.use(tenantErasureControlPath, requireTenantErasureControl);
+  app.use(`${tenantErasureControlPath}/*`, requireTenantErasureControl);
+  app.use(tenantErasureReplayPath, requireTenantErasureReplay);
+  app.use(tenantErasureControlPath, bodyLimit({
+    maxSize: INTERNAL_TENANT_ERASURE_MAX_BODY_BYTES,
+    onError: () => {
+      throw new ApiError(
+        "invalid_request",
+        `request body exceeds ${INTERNAL_TENANT_ERASURE_MAX_BODY_BYTES} bytes`,
+      );
+    },
+  }));
+  app.use(tenantErasureReplayPath, bodyLimit({
+    maxSize: INTERNAL_TENANT_ERASURE_MAX_BODY_BYTES,
+    onError: () => {
+      throw new ApiError(
+        "invalid_request",
+        `request body exceeds ${INTERNAL_TENANT_ERASURE_MAX_BODY_BYTES} bytes`,
+      );
+    },
+  }));
+  app.post(tenantErasureControlPath, async (c) => {
+    if (!deps.subjectLifecycle) {
+      throw new ApiError("draining", "tenant erasure control is unavailable on this runner");
+    }
+    const headers = await parse(TenantErasureRequestHeaders, {
+      "idempotency-key": c.req.header("idempotency-key"),
+    });
+    const input = await parse(TenantErasureCreateRequest, await json(c));
+    try {
+      const replay = await deps.subjectLifecycle.replayTenantErasure({
+        tenantId: input.tenantId,
+        idempotencyKey: headers["idempotency-key"],
+        requestHash: tenantErasureRequestHash(input.tenantId),
+      });
+      if (replay) return c.json(publicTenantErasureRequest(replay), 202);
+    } catch (error) {
+      if (error instanceof ErasureIdempotencyMismatchError) {
+        throw new ApiError("idempotency_conflict", error.message);
+      }
+      throw error;
+    }
+
+    if (
+      deps.tenantErasureRequestsEnabled !== true
+      || !deps.tenantErasureAdmissionGate
+    ) {
+      throw new ApiError("draining", "tenant erasure requests are not activated on this fleet");
+    }
+    const actorId = c.req.header(INTERNAL_TENANT_ERASURE_ACTOR_HEADER);
+    if (!actorId || !TENANT_ERASURE_ACTOR_ID.test(actorId)) {
+      throw new ApiError("draining", "tenant erasure platform authority is unavailable");
+    }
+
+    // This proof is intentionally consumed immediately before the store transaction. It prevents
+    // a caller that can reach a runner's private address from using a stale capability observation
+    // to admit a fence while any configured runtime is old, unavailable or locally gated.
+    if (!await deps.tenantErasureAdmissionGate.canAdmit()) {
+      throw new ApiError("draining", "tenant erasure fleet barrier is closed");
+    }
+    try {
+      const record = await deps.subjectLifecycle.requestTenantErasure({
+        requestId: newErasureRequestId(),
+        tenantId: input.tenantId,
+        requestedByKeyId: actorId,
+        idempotencyKey: headers["idempotency-key"],
+        requestHash: tenantErasureRequestHash(input.tenantId),
+        atMs: Date.now(),
+      });
+      return c.json(publicTenantErasureRequest(record), 202);
+    } catch (error) {
+      if (error instanceof ErasureIdempotencyMismatchError) {
+        throw new ApiError("idempotency_conflict", error.message);
+      }
+      if (error instanceof TenantErasureConflictError) {
+        throw new ApiError("state_conflict", error.message);
+      }
+      if (error instanceof TenantErasureTargetNotFoundError) {
+        throw new ApiError("not_found", "not found");
+      }
+      throw error;
+    }
+  });
+  app.post(tenantErasureReplayPath, async (c) => {
+    if (!deps.subjectLifecycle) {
+      throw new ApiError("draining", "tenant erasure replay is unavailable on this runner");
+    }
+    const headers = await parse(TenantErasureRequestHeaders, {
+      "idempotency-key": c.req.header("idempotency-key"),
+    });
+    const input = await parse(TenantErasureCreateRequest, await json(c));
+    try {
+      const record = await deps.subjectLifecycle.replayTenantErasure({
+        tenantId: input.tenantId,
+        idempotencyKey: headers["idempotency-key"],
+        requestHash: tenantErasureRequestHash(input.tenantId),
+      });
+      if (!record) {
+        throw new ApiError("draining", "tenant erasure admission is closed and no replay exists");
+      }
+      return c.json(publicTenantErasureRequest(record), 202);
+    } catch (error) {
+      if (error instanceof ErasureIdempotencyMismatchError) {
+        throw new ApiError("idempotency_conflict", error.message);
+      }
+      throw error;
+    }
+  });
+  app.get(tenantErasureStatusPath, async (c) => {
+    if (!deps.subjectLifecycle) {
+      throw new ApiError("draining", "tenant erasure status is unavailable on this runner");
+    }
+    const [{ requestId }, { tenantId }] = await Promise.all([
+      parse(TenantErasureRequestParams, { requestId: c.req.param("requestId") }),
+      parse(TenantErasureRequestQuery, c.req.query()),
+    ]);
+    const record = await deps.subjectLifecycle.getTenantErasureRequest(tenantId, requestId);
+    if (!record) throw new ApiError("not_found", "tenant erasure request not found");
+    return c.json(publicTenantErasureRequest(record));
+  });
+  app.all(tenantErasureControlPath, (c) => {
+    throw new ApiError("not_found", "not found");
+  });
+  app.all(`${tenantErasureControlPath}/*`, (c) => {
+    throw new ApiError("not_found", "not found");
+  });
+  app.all(tenantErasureReplayPath, (c) => {
     throw new ApiError("not_found", "not found");
   });
 
@@ -1104,6 +1285,23 @@ function publicErasureRequest(record: Awaited<ReturnType<SubjectLifecycleStore["
     userId: record.subjectId,
     generation: record.generation,
     status: publicErasureRequestStatus(record),
+    createdAtMs: record.createdAtMs,
+    updatedAtMs: record.updatedAtMs,
+  };
+}
+
+function publicTenantErasureRequest(
+  record: Awaited<ReturnType<SubjectLifecycleStore["requestTenantErasure"]>>,
+): TenantErasureRequest {
+  if (record.status !== "gated") {
+    throw new Error("tenant erasure admission has an unsupported public status");
+  }
+  return {
+    id: record.requestId,
+    scope: "tenant",
+    tenantId: record.tenantId,
+    generation: record.generation,
+    status: "gated",
     createdAtMs: record.createdAtMs,
     updatedAtMs: record.updatedAtMs,
   };

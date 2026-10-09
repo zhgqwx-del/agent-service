@@ -8,6 +8,9 @@ describe("router configuration", () => {
     expect(local.BLOB_FILESYSTEM_SINGLE_RUNNER).toBe(false);
     expect(local.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(local.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(local.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(local.TENANT_ERASURE_OPERATOR_TOKEN).toBeUndefined();
+    expect(local.TENANT_ERASURE_OPERATOR_ID).toBe("platform-lifecycle-admin");
     expect(local.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(local.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
     expect(local.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
@@ -30,6 +33,15 @@ describe("router configuration", () => {
     expect(() => loadRouterConfig({
       RUNNERS: "http://runner:8787",
       DATA_ERASURE_REQUESTS_ENABLED: "true",
+    })).toThrow();
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_ERASURE_REQUESTS_ENABLED: "1",
+      TENANT_ERASURE_OPERATOR_TOKEN: "tenant-erasure-operator-token-0001",
+    }).TENANT_ERASURE_REQUESTS_ENABLED).toBe(true);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_ERASURE_REQUESTS_ENABLED: "true",
     })).toThrow();
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",
@@ -135,6 +147,39 @@ describe("router configuration", () => {
       BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
       DATA_EXPORT_REQUESTS_ENABLED: "1",
     })).toThrow(/shared object-store adapter/);
+  });
+
+  it("keeps tenant-erasure platform authority independent from router credentials", () => {
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_ERASURE_OPERATOR_TOKEN: "tenant-erasure-operator-token-0001",
+      TENANT_ERASURE_OPERATOR_ID: "lifecycle-operator-1",
+    })).toMatchObject({
+      TENANT_ERASURE_REQUESTS_ENABLED: false,
+      TENANT_ERASURE_OPERATOR_TOKEN: "tenant-erasure-operator-token-0001",
+      TENANT_ERASURE_OPERATOR_ID: "lifecycle-operator-1",
+    });
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_ERASURE_REQUESTS_ENABLED: "1",
+    })).toThrow(/TENANT_ERASURE_OPERATOR_TOKEN is required/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_ERASURE_OPERATOR_TOKEN: "too-short",
+    })).toThrow();
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_ERASURE_OPERATOR_TOKEN: "agent-service-local-router-token-v1",
+    })).toThrow(/must differ from INTERNAL_ROUTER_TOKEN/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      ROUTER_ADMIN_TOKEN: "tenant-erasure-operator-token-0001",
+      TENANT_ERASURE_OPERATOR_TOKEN: "tenant-erasure-operator-token-0001",
+    })).toThrow(/must differ from ROUTER_ADMIN_TOKEN/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_ERASURE_OPERATOR_ID: "contains whitespace",
+    })).toThrow();
   });
 
   it("accepts only credential-free runner base URLs", () => {

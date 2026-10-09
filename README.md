@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。`0017` 增加 owner-scoped export request/job、一致性快照、分片制品、下载 lease 和独立删除 outbox；`0018` 增加内部 tenant-erasure T1：独立 admission、tenant lifecycle gate、首条 audit 与 append-only credential revocation fence 在一个原子边界提交，并让现有 tenant-scoped credential/data 入口逻辑隐藏和拒写。T1 没有公开 API、worker 或 fleet activation barrier，也不物理删除 API key/provider/auth secret；这些 T2/T3 工作，以及 ready/session 物理 purge、可信时钟与完整内容 proof、完成证明及 restore replay仍待按 `docs/design/04-data-lifecycle.md` 收口，因此 M1 尚未闭环。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2 也已收口：`0018` 原子提交独立 admission、tenant lifecycle gate、首条 audit 与 append-only credential revocation fence；router 以独立 platform bearer 暴露 admission/status/replay，runner 只接受版本化私有路由，并在每次不可逆提交前通过 fresh all-configured fleet barrier。当前公开状态固定为 `gated`，没有 tenant worker，也不物理删除 API key/provider/auth secret 或内容；T3、ready/session 物理 purge、可信时钟与完整内容 proof、完成证明及 restore replay仍待按 `docs/design/04-data-lifecycle.md` 收口，因此 M1 尚未闭环。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -20,16 +20,21 @@ pnpm install
 deploy/local/infra.sh start          # 启动 redis + mysql，建库 agent_service / agent_service_test
 cp .env.example .env                 # 真实模型只强制 API_KEY；base URL / model 可覆盖默认值
 
-# 单节点（MySQL + Redis）
-STORE=mysql REDIS_URL=redis://127.0.0.1:6379 pnpm dev:runner
-# 纯内存（不需要任何中间件）
-STORE=memory REDIS_URL= pnpm dev:runner
+# 完整本地栈（MySQL + Redis + runner + router）
+scripts/local-service.sh start
+scripts/local-service.sh status
+scripts/local-service.sh smoke
+
+# 仅调试纯内存 runner 时，先显式移除 router-only platform authority
+set -a; source .env; set +a
+unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
+STORE=memory REDIS_URL= node --import tsx apps/agent-runner/src/main.ts
 ```
 
 ```bash
 # 手动验收（十个环节：鉴权/流式/重放/幂等/上下文/安全阀/隔离/BYOK）
 deploy/local/infra.sh start
-STORE=mysql REDIS_URL=redis://127.0.0.1:6379 pnpm dev:runner   # 另一个终端
+scripts/local-service.sh start
 scripts/demo.sh
 
 # 测试（四层，前三层不需要任何 API key）
@@ -39,7 +44,7 @@ pnpm test:migrations                          # 固定 0007 → 0008 → ... →
 pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
 pnpm test:usage-lifecycle-mysql               # 强制执行 usage 双写/核对/匿名化真实 MySQL 专项套件
 pnpm test:subject-lifecycle-mysql             # 强制执行 subject gate/回滚/并发真实 MySQL 专项套件
-pnpm test:tenant-credential-revocation-mysql  # 强制执行 tenant T1 原子 fence、回滚、隔离和写入 race 真实 MySQL 套件
+pnpm test:tenant-credential-revocation-mysql  # 强制执行 tenant 原子 fence、status proof、回滚、隔离和写入 race 真实 MySQL 套件
 pnpm test:retention-policy-mysql              # 强制执行 policy/hold CAS、审计、回滚与线性化真实 MySQL 套件
 pnpm test:erasure-purge-policy-mysql          # 强制执行非破坏性 evaluator/authority、ABA、回滚与重评真实 MySQL 套件
 pnpm test:erasure-job-mysql                   # 强制执行 erasure job claim/lease/audit 的真实 MySQL 套件
@@ -87,9 +92,9 @@ scripts/local-service.sh stop
 
 tombstone 是现有 `2026-10-08` protocol family 内的 additive capability。router 只有在显式设置 `SESSION_TOMBSTONE_ENABLED=1` 且全部健康 runner 都声明 `tombstone` 时才开放 session DELETE；本地脚本默认启用。外部 DELETE 会被改写为带 `INTERNAL_ROUTER_TOKEN` 的版本化 runner-only POST，并要求新 runner 回 ACK；内部路径不进入 OpenAPI，客户端伪造的内部 header 会被剥离。`RUNNERS` 必须是实例稳定地址，runner 端口必须保持内网不可直连。staging/production 需先在 edge 暂停精确 session DELETE（或整体切换 router 池），再按“新 router（gate=0）→ 排空旧 router → 滚动新 runner → 核对 fleet capability → 激活 gate”的顺序升级；旧 router 本身没有该 gate。
 
-user erasure request 也是 additive、默认关闭的 capability。只有 runner 与 router 都显式设置 `DATA_ERASURE_REQUESTS_ENABLED=1`，且 `RUNNERS` 中每个 configured target 都已通过健康探测并声明 erasure 与 `dataGovernance` writer-awareness、选中 target 也仍支持时，router 才接受 `POST /v1/data-erasure-requests`；runner 配置还要求普通 erasure worker 与 legacy compensation worker 都已启用。当前公开范围仅限 admin service key 代表一个明确 user 发起带 `Idempotency-Key` 的请求：它原子写入 subject gate、request 和首条 audit，并在同一事务绑定线性化点已激活的 canonical policy。`0015` 的 MySQL INSERT guard还会在策略激活后拒绝旧 writer 写入 NULL、部分或错误 policy identity；激活前已有 backlog 保持原身份，不做事后补绑。两个 runner 内嵌 worker 都在接触 durable queue 前请求 router 的 token-protected v2 barrier；router 必须已在本进程逐一观察每个 configured stable runner 同时支持 `quarantine-v1` 与 `legacy-tombstone-compensation-v1`。普通 worker 调用 `drain-v1` 定位当前 owner并有界请求 abort，随后以固定、无正文的 store action child-first tombstone，并逐 session 原子核对 usage。成功只推进到 `awaiting_purge_policy`：operational usage、receipt、item/event、ready Blob 和不可领取的 purge intent 仍保留，绝不标记 `completed`。status GET 不依赖 router writer gate，继续按当前 healthy fleet 与选中 target capability fail-closed；POST/GET 的成功与错误响应都强制 `Cache-Control: no-store`。任一 request 首次接受后不能回退到 pre-`0011`；首个0013 control event/terminal incident后不能回退到 pre-`0013`；0014 cutover 一旦激活则不能回退到 pre-`0014` writer；首次 policy activation 或 canonical hold event 后不能回退到 pre-`0015` writer，只能 forward-fix。物理 purge、匿名化调度、tenant T2/T3、物理 credential 撤销和备份恢复门禁完成前，仍只允许在本地对可丢弃 user 显式体验，方法见 `docs/operations/development-and-ci-guide.md`。
+user erasure request 也是 additive、默认关闭的 capability。只有 runner 与 router 都显式设置 `DATA_ERASURE_REQUESTS_ENABLED=1`，且 `RUNNERS` 中每个 configured target 都已通过健康探测并声明 erasure 与 `dataGovernance` writer-awareness、选中 target 也仍支持时，router 才接受 `POST /v1/data-erasure-requests`；runner 配置还要求普通 erasure worker 与 legacy compensation worker 都已启用。当前公开范围仅限 admin service key 代表一个明确 user 发起带 `Idempotency-Key` 的请求：它原子写入 subject gate、request 和首条 audit，并在同一事务绑定线性化点已激活的 canonical policy。`0015` 的 MySQL INSERT guard还会在策略激活后拒绝旧 writer 写入 NULL、部分或错误 policy identity；激活前已有 backlog 保持原身份，不做事后补绑。两个 runner 内嵌 worker 都在接触 durable queue 前请求 router 的 token-protected v2 barrier；router 必须已在本进程逐一观察每个 configured stable runner 同时支持 `quarantine-v1` 与 `legacy-tombstone-compensation-v1`。普通 worker 调用 `drain-v1` 定位当前 owner并有界请求 abort，随后以固定、无正文的 store action child-first tombstone，并逐 session 原子核对 usage。成功只推进到 `awaiting_purge_policy`：operational usage、receipt、item/event、ready Blob 和不可领取的 purge intent 仍保留，绝不标记 `completed`。status GET 不依赖 router writer gate，继续按当前 healthy fleet 与选中 target capability fail-closed；POST/GET 的成功与错误响应都强制 `Cache-Control: no-store`。任一 request 首次接受后不能回退到 pre-`0011`；首个0013 control event/terminal incident后不能回退到 pre-`0013`；0014 cutover 一旦激活则不能回退到 pre-`0014` writer；首次 policy activation 或 canonical hold event 后不能回退到 pre-`0015` writer，只能 forward-fix。物理 purge、匿名化调度、tenant T3、物理 credential 撤销和备份恢复门禁完成前，仍只允许在本地对可丢弃 user 显式体验，方法见 `docs/operations/development-and-ci-guide.md`。
 
-tenant erasure 与上述 user API 是两条不同边界。`0018` 只完成内部 store 级 T1：Memory/MySQL 原子建立独立 tenant admission、tenant gate、首条 audit 和全 credential 逻辑 fence；API key、provider/secret、tenant auth、agent/session 以及现有 tenant-key policy/hold 管理写在 gate 后 fail closed，已解析 provider handle 在取 key 或发起网络副作用前也会重验 generation。append-only admission 或 fence 单独幸存时，user-erasure worker 与 purge evaluator 也不能恢复 authority。物理 credential 行仍保留，tenant request 不进入旧 `erasure_requests` worker 队列。当前没有 tenant HTTP/OpenAPI/SDK、status/replay、环境开关、worker、router capability 或 fleet barrier；T2 的 platform lifecycle authority 必须使用独立入口，不能绕过现有 tenant-key store 方法。因此不能通过手工 SQL/直接 store 调用体验，也不能在 pre-`0018` runner 仍可服务的 mixed fleet 中激活；T2/T3 完成并排空旧进程前只能安装 expand schema 和运行自动测试。
+tenant erasure 与上述 user API 是两条不同边界。T1 的 Memory/MySQL 原子边界与 append-only fence 保持不变；T2 在 router 新增 `POST /v1/tenant-erasure-requests` 和 owner-hiding status GET，并以独立 `PlatformOperatorToken` 和窄化 SDK client 鉴权，绝不接受 tenant service key。platform token 只注入 router；runner 若在进程环境发现该 token/actor 配置会拒绝启动。router 会剥离所有客户端伪造的内部 header，再用 `INTERNAL_ROUTER_TOKEN` 和固定 operator id 改写到 runner-only 路径。只有新的 admission/create path 才要求 router gate、全部 configured stable runner 的 code-aware/local gate，以及 runner 提交前的 fresh barrier；关闭 admission 后，精确匹配已提交 tenant/key/body 的 POST 只走独立 read-only replay 路径并返回同一 `202`，未知或不同 key 返回 `503`且绝不创建，status仍可读。首次 gate 不可撤销，旧 runtime 必须先完全排空，只能 forward-fix。T2 不新增 worker，不物理删除 credential/content，也不表示 `completed`；这些属于 T3。
 
 `PURGE_POLICY_EVALUATOR_ENABLED` 是 runner/router 双端默认关闭的独立 gate。启用的 evaluator 每次 schedule/claim 前必须从 router 的 token-protected专用barrier取得固定ACK；router要求所有 configured稳定runner当前健康且声明`policy-evaluator-v1`。它只持有最小的evaluation store：按request绑定策略计算grace/内容/ready Blob/usage/receipt deadline，把per-session摘要写成build-generation不可变target，追加rooted decision，并且只对`eligible_execution_disabled`生成不可执行authority。seal时和后续调度都会复核live inventory与tenant/user hold generation/projection；evidence变化或hold ABA会撤销active投影并以新generation重评。当前deadline仍来自runner wall clock，target也不是turn/item/event/approval的全量清单；未来destructive executor必须用数据库/可信时间和owner-scan + `session_content_receipts`重新证明，completion始终为`false`。
 
@@ -101,7 +106,7 @@ user data export 同样采用默认关闭的 writer gate。runner/router 都设�
 
 ## API 速览（对外经 `apps/agent-router`）
 
-鉴权两层：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（trusted caller）或 runner 验证的端用户 token。入站 token header 不能占用 service/user/framing/hop-by-hop 保留头；即使数据库中存在升级前的坏策略，admin service key 仍可通过 `/v1/tenant/auth` 修复。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入。
+普通 runtime API 使用两层鉴权：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（trusted caller）或 runner 验证的端用户 token。tenant-erasure 两个 platform API 则使用完全独立的 platform bearer，不能复用 service key。入站 token header 不能占用 service/user/framing/hop-by-hop 保留头；即使数据库中存在升级前的坏策略，admin service key 仍可通过 `/v1/tenant/auth` 修复。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入。
 
 ```bash
 BASE=http://127.0.0.1:8080
@@ -124,6 +129,8 @@ curl -sN -X POST "$BASE/v1/sessions/sess_.../turns?exclude=usage/updated" "${H[@
 #       GET /v1/data-erasure-requests/{requestId}（仅同 tenant/user；worker 最多推进到 awaiting_purge_policy）
 #       POST /v1/data-export-requests（admin + user + Idempotency-Key，默认关闭）
 #       GET /v1/data-export-requests/{requestId} | GET .../{requestId}/download（同 owner；ready 后可下载 NDJSON）
+#       POST /v1/tenant-erasure-requests（独立 platform bearer + Idempotency-Key，默认关闭）
+#       GET /v1/tenant-erasure-requests/{requestId}?tenantId=...（gate 关闭后仍可读；当前只返回 gated）
 #       PUT/GET /v1/retention-policies/{policyVersion} | POST .../{policyVersion}/activate | GET .../active
 #       POST/GET /v1/legal-holds | GET /v1/legal-holds/{holdId} | POST .../{holdId}/release（均为 admin、默认关闭）
 #       GET /v1/capabilities  GET /openapi.json  GET /healthz /readyz
@@ -161,7 +168,7 @@ docs/                  调研、设计
 - 审批是持久化资源，有 `expiresAt`；`cancel` 记为 interrupted 而不是 declined。
 - 跨租户访问返回 404，与不存在不可区分；带 `X-User-Id` 时同租户内也不能读别人的会话。
 - user erasure gate 与 request/audit 在 Memory/MySQL 中原子提交；claim-bound worker 使用独立最小权限 catalog/session surface，跨 runner drain 当前 owner、按 child-first 顺序 tombstone、核对 usage，并在完整性证明通过后停在不可领取的 `awaiting_purge_policy`。catalog proof 只是无正文的早期筛查；实际写 billing fact/reconciliation 前会在同一 Memory 原子边界或 MySQL 事务内重新验证 tombstone marker、terminal `session/deleted` 和两条 outbox intent，proof 失效会原子进入 `blocked/integrity_conflict`，数据库/传输故障仍可重试。claim token + attempt + lease 防止 stale/ABA worker 写入；私有路由不泄露 owner、claim、token 或正文。该阶段仍保留 operational 内容和账务归属，不匿名化、不领取 purge、不标记 completed。
-- tenant erasure T1 在 Memory/MySQL 中把独立 admission、tenant lifecycle generation、首条无正文 audit 和 append-only credential fence 原子提交；任一步序列化/SQL 失败都不留下部分 gate。tenant-scoped credential/data 与 tenant-key policy/hold 管理写共同检查该 gate，普通资源隐藏、后续写入拒绝，provider 已解析 handle 在解密或 outbound fetch 前重验 generation；append-only admission/fence 还是 user-erasure worker 与 purge evaluator 的独立防复活门禁。tenant admission 不进入旧 user-erasure queue；物理 credential 行仍保留，且在独立 platform authority、status/replay、tenant worker 与 fleet barrier 完成前禁止 mixed-fleet 调用。
+- tenant erasure T1 在 Memory/MySQL 中把独立 admission、tenant lifecycle generation、首条无正文 audit 和 append-only credential fence 原子提交；任一步序列化/SQL 失败都不留下部分 gate。T2 的 platform authority只在router终止，以版本化runner-only路由、固定ACK、双端gate和提交前fresh all-configured barrier开放admission/status/replay；路径编码、伪造内部header或直接runner访问都不能把platform token带入普通代理。status用同一一致性快照核对admission/lifecycle/fence/首条audit，跨tenant与不存在一致。tenant admission不进入旧user-erasure queue，物理credential行仍保留；T3 worker、物理撤销、内容清理及completion proof完成前不得宣称擦除完成。
 - erasure claim按候选独立提交：具备安全quarantine envelope的确定性poison会持久化为保留原phase、无worker authority的quarantine并继续扫描邻居；append-only control audit、canonical evidence、generation CAS和固定maintenance action共同约束repair/resume。隔离身份/generation/时间本身损坏时，不猜测归属，也不复制tenant/user/raw payload：保留原行与exact fence，原子写terminal overlay和append-only content-free incident，随后继续邻居；该incident无通用repair/resume。损坏control audit也没有通用自动修复路径，不能靠直接改表伪造完成。若control generation已达到/超过JS safe-integer上限，则原始MySQL BIGINT fence保持不变并进入无后继event、不可修复的terminal quarantine，避免降级fence或反复饿死邻居。公开API只把可安全owner读取的quarantine映射为`blocked`，不返回私有原因、证据或control generation。
 - pre-0009 的 generation `0` tombstone 由独立 durable compensation job 修复。`0014` migration 只安装 inactive cutover、job/audit 表、索引与 guards，不扫描、排队或改写历史行；worker 只有通过 v2 fleet barrier 才会激活一次性 cutover并开始处理。成功事务保留原删除时间，固定结算残留 active 资源，递增到 generation `1`，追加 terminal `session/deleted`、`session.tombstoned`/不可领取的 `session.purge` intent、append-only audit并完成 job；任一步失败全部回滚，重试不会重复证据。cutover 激活后数据库拒绝新的 legacy tombstone 写入，不能回退 pre-`0014` writer。
 - retention policy 版本和 activation audit不可变；control generation CAS与 rooted hash chain 防止 lost-update/ABA，跨 runner 时钟回拨通过锁内单调 clamp处理。tenant/user legal hold使用多记录账本、active projection与append-only event chain，release 只允许一次；Memory/MySQL 都会在 usage anonymize 前读取 canonical tenant+user hold状态并 fail-closed。`0015` migration不提供默认策略、不改变 purge intent、usage或内容；policy/hold 管理本身也不构成删除授权。

@@ -50,6 +50,46 @@ export const INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER =
   "x-agent-service-purge-policy-evaluation" as const;
 export const INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE = "policy-evaluator-v1" as const;
 
+/**
+ * Tenant erasure uses a platform authority that is independent from every tenant credential. The
+ * public request still crosses the router, which injects the private token and requires this fixed
+ * runner acknowledgement. An old router therefore cannot accidentally expose the new runner
+ * handler by forwarding the public path unchanged without the private credential.
+ */
+export const INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER =
+  "x-agent-service-tenant-erasure-route" as const;
+export const INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE = "platform-control-v1" as const;
+/** Router-derived platform principal; accepted only beside the authenticated private route token. */
+export const INTERNAL_TENANT_ERASURE_ACTOR_HEADER =
+  "x-agent-service-tenant-erasure-actor" as const;
+export const INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX =
+  "/v1/_internal/tenant-erasure-control-v1" as const;
+/**
+ * Read-only recovery for a POST whose irreversible commit may have succeeded before its response
+ * was lost. Keeping this path distinct ensures a pre-replay runner returns 404 instead of treating
+ * a gate-off recovery attempt as authority to create a new admission.
+ */
+export const INTERNAL_TENANT_ERASURE_REPLAY_PATH =
+  "/v1/_internal/tenant-erasure-replay-v1" as const;
+export const INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER =
+  "x-agent-service-tenant-erasure-replay" as const;
+export const INTERNAL_TENANT_ERASURE_REPLAY_ACK_VALUE = "replay-v1" as const;
+
+/**
+ * Immediately before committing a tenant admission, the selected runner probes this router-only
+ * endpoint. The ACK proves that every configured stable runner is currently healthy, configured
+ * for the T2 contract, and that both sides' admission gates are active.
+ */
+export const INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH =
+  "/_internal/tenant-erasure-admission-v1/ready" as const;
+export const INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER =
+  "x-agent-service-tenant-erasure-admission" as const;
+export const INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE = "admission-v1" as const;
+
+export const TENANT_ERASURE_PLATFORM_CONTROL_V1 = "platform-control-v1" as const;
+export const TenantErasureControlCapability = z.literal(TENANT_ERASURE_PLATFORM_CONTROL_V1);
+export type TenantErasureControlCapability = z.infer<typeof TenantErasureControlCapability>;
+
 export const PURGE_POLICY_EVALUATOR_V1 = "policy-evaluator-v1" as const;
 export const PurgePolicyEvaluationCapability = z.literal(PURGE_POLICY_EVALUATOR_V1);
 export type PurgePolicyEvaluationCapability = z.infer<typeof PurgePolicyEvaluationCapability>;
@@ -124,6 +164,10 @@ export const Capabilities = z.object({
     userDataExport: z.array(UserDataExportCapability).max(1).default([]),
     /** Admission gate for new export requests; status, download and cleanup remain independent. */
     dataExportRequests: z.boolean().default(false),
+    /** Independent platform control plane for tenant-erasure admission, status and replay. */
+    tenantErasureControl: z.array(TenantErasureControlCapability).max(1).default([]),
+    /** New tenant-erasure admissions are active on this runner; status remains independently readable. */
+    tenantErasureRequests: z.boolean().default(false),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

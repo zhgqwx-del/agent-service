@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import {
   Capabilities,
   DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
@@ -17,6 +17,16 @@ import {
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
   INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH,
+  INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
+  INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH,
+  INTERNAL_TENANT_ERASURE_ACTOR_HEADER,
+  INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
+  INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_REPLAY_ACK_VALUE,
+  INTERNAL_TENANT_ERASURE_REPLAY_PATH,
+  INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
@@ -24,6 +34,12 @@ import {
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TenantErasureCreateRequest,
+  TenantErasureRequest,
+  TenantErasureRequestHeaders,
+  TenantErasureRequestParams,
+  TenantErasureRequestQuery,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   UserErasureDrainRequest,
   isCanonicalId,
@@ -50,6 +66,12 @@ export interface RouterAppDeps {
   blobAttachmentsEnabled?: () => boolean;
   /** Explicit deployment activation gate for the subject-level durable write barrier. */
   erasureRequestsEnabled?: () => boolean;
+  /** Router-only platform credential. It is consumed here and never forwarded to a runner. */
+  tenantErasureOperatorToken?: string;
+  /** Stable non-secret platform principal injected only beside the runner-internal credential. */
+  tenantErasureOperatorId?: string;
+  /** Independent admission gate; status/replay remain readable while it is closed. */
+  tenantErasureRequestsEnabled?: () => boolean;
   /** Explicit fleet activation gate for canonical policy/legal-hold administration. */
   dataGovernanceManagementEnabled?: () => boolean;
   /** Independent activation gate for non-destructive policy evaluation queue claims. */
@@ -100,6 +122,9 @@ const STRIP_RESPONSE = new Set([
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
 ]);
 
 /** Methods that are safe to send again after a transport failure, with no risk of doing the work twice. */
@@ -114,14 +139,57 @@ const USER_ERASURE_STATUS = /^\/v1\/data-erasure-requests\/[^/]+\/?$/;
 const USER_DATA_EXPORT_REQUEST = /^\/v1\/data-export-requests\/?$/;
 const USER_DATA_EXPORT_STATUS = /^\/v1\/data-export-requests\/[^/]+\/?$/;
 const USER_DATA_EXPORT_DOWNLOAD = /^\/v1\/data-export-requests\/[^/]+\/download\/?$/;
+const TENANT_ERASURE_PUBLIC_COLLECTION = "/v1/tenant-erasure-requests";
 const DATA_GOVERNANCE_MANAGEMENT = /^\/v1\/(?:retention-policies|legal-holds)(?:\/|$)/;
 const USER_SCOPED_RUNTIME = /^\/v1\/(?:sessions(?:\/|$)|usage\/?$|data-erasure-requests(?:\/|$)|data-export-requests(?:\/|$))/;
 const INTERNAL_ERASURE_BODY_MAX_BYTES = 4_096;
+const TENANT_ERASURE_RESPONSE_MAX_BYTES = 4_096;
 
 function internalTokenMatches(received: string | undefined, expected: string | undefined): boolean {
   const left = createHash("sha256").update(received ?? "").digest();
   const right = createHash("sha256").update(expected ?? "").digest();
   return received !== undefined && expected !== undefined && timingSafeEqual(left, right);
+}
+
+function bearerTokenMatches(authorization: string | undefined, expected: string | undefined): boolean {
+  // RFC 7235 authentication schemes are case-insensitive. Parse the scheme that way so a real
+  // platform secret cannot evade the generic-proxy guard merely by spelling `bearer` differently.
+  // SP is canonical for HTTP auth, but downstream tenant auth deliberately accepts horizontal
+  // whitespace. Match HTAB too so a real platform secret can never escape through that wider parser.
+  const received = authorization?.match(/^Bearer[ \t]+([A-Za-z0-9._~-]{32,256})$/i)?.[1];
+  if (!received) return false;
+  return internalTokenMatches(received, expected);
+}
+
+function authorizationContainsBearerToken(
+  authorization: string | undefined,
+  expected: string | undefined,
+): boolean {
+  // Fetch/Node can combine duplicate Authorization fields with commas. Public platform auth stays
+  // strict (one credential only), while the generic proxy must detect the protected credential in
+  // every combined challenge so it can never reach a runner in a malformed header.
+  return authorization?.split(",").some((value) => (
+    bearerTokenMatches(value.trim(), expected)
+  )) ?? false;
+}
+
+/**
+ * Reserve the whole tenant-erasure path family even when an HTTP stack preserves percent escapes.
+ * Decode ASCII escapes a few layers so encoded letters, separators and double-encoding cannot
+ * fall through to the generic tenant proxy. The independent platform-token check below remains the
+ * final credential boundary even for deliberately excessive or malformed encoding.
+ */
+function isTenantErasurePathFamily(pathname: string): boolean {
+  let candidate = pathname;
+  for (let depth = 0; depth < 8; depth++) {
+    if (candidate.startsWith(TENANT_ERASURE_PUBLIC_COLLECTION)) return true;
+    const decoded = candidate.replace(/%([0-7][0-9a-f])/gi, (_escape, hex: string) => (
+      String.fromCharCode(Number.parseInt(hex, 16))
+    ));
+    if (decoded === candidate) return false;
+    candidate = decoded;
+  }
+  return candidate.startsWith(TENANT_ERASURE_PUBLIC_COLLECTION);
 }
 
 function privateInternalHeaders(c: { header: (name: string, value: string) => void }): void {
@@ -134,9 +202,9 @@ function internalNotFound(c: { json: (body: object, status: 404) => Response }):
 }
 
 /**
- * agent-router: stateless. It authenticates nothing itself (the runner is the authority) and holds no
- * business state — only the connection while it streams a response through. Its whole job is picking a
- * runner and honouring the runner's 409 + `X-Owner` re-route.
+ * agent-router is stateless. Tenant service-key authentication remains runner-owned; the one exception
+ * is the independent platform bearer for tenant-erasure control, which must be consumed at this edge
+ * and replaced with the private runner credential. The router holds no business state.
  */
 export function createRouterApp(deps: RouterAppDeps) {
   const app = new Hono();
@@ -190,6 +258,151 @@ export function createRouterApp(deps: RouterAppDeps) {
     && (deps.dataExportRequestsEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportUserDataExportAdmission()
   );
+  const tenantErasureControlAvailable = () => (
+    !!deps.internalRunnerToken
+    && !!deps.tenantErasureOperatorToken
+    && !!deps.tenantErasureOperatorId
+    && deps.registry.allHealthySupportTenantErasureControl()
+  );
+  const tenantErasureAdmissionAvailable = () => (
+    tenantErasureControlAvailable()
+    && (deps.tenantErasureRequestsEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportTenantErasureControl()
+    && deps.registry.allConfiguredSupportTenantErasureAdmission()
+  );
+  const tenantErasureUnavailable = (c: Context): Response => c.json({
+    error: {
+      code: "draining",
+      message: "tenant erasure control is unavailable while the runner fleet is upgrading",
+      retryable: true,
+    },
+  }, 503);
+  const proxyTenantErasureControl = async (
+    c: Context,
+    input: (
+      | {
+        mode: "admit";
+        body: Uint8Array;
+        idempotencyKey: string;
+        expectedTenantId: string;
+      }
+      | {
+        mode: "replay";
+        body: Uint8Array;
+        idempotencyKey: string;
+        expectedTenantId: string;
+      }
+      | {
+        mode: "status";
+        expectedTenantId: string;
+        expectedRequestId: string;
+      }
+    ),
+  ): Promise<Response> => {
+    const admission = input.mode === "admit";
+    const available = () => admission
+      ? tenantErasureAdmissionAvailable()
+      : tenantErasureControlAvailable();
+    if (!available()) return tenantErasureUnavailable(c);
+
+    const upstreamUrl = new URL(c.req.url);
+    upstreamUrl.pathname = input.mode === "admit"
+      ? INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX
+      : input.mode === "replay"
+        ? INTERNAL_TENANT_ERASURE_REPLAY_PATH
+        : `${INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX}/${input.expectedRequestId}`;
+    upstreamUrl.search = input.mode === "status"
+      ? `?tenantId=${encodeURIComponent(input.expectedTenantId)}`
+      : "";
+    const upstreamHeaders = new Headers({
+      [INTERNAL_ROUTER_TOKEN_HEADER]: deps.internalRunnerToken!,
+      [INTERNAL_TENANT_ERASURE_ACTOR_HEADER]: deps.tenantErasureOperatorId!,
+    });
+    if (input.mode !== "status") {
+      upstreamHeaders.set("content-type", "application/json");
+      upstreamHeaders.set("idempotency-key", input.idempotencyKey);
+    }
+    const expectedAckHeader = input.mode === "replay"
+      ? INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER
+      : INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER;
+    const expectedAckValue = input.mode === "replay"
+      ? INTERNAL_TENANT_ERASURE_REPLAY_ACK_VALUE
+      : INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE;
+    const expectedSuccessStatus = input.mode === "status" ? 200 : 202;
+
+    const tried = new Set<string>();
+    let target = deps.registry.anyHealthy();
+    if (!target) return tenantErasureUnavailable(c);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const targetCompatible = admission
+        ? deps.registry.supportsTenantErasureAdmission(target)
+        : deps.registry.supportsTenantErasureControl(target);
+      if (!available() || !targetCompatible) return tenantErasureUnavailable(c);
+      tried.add(target);
+
+      let response: Response;
+      try {
+        response = await forward(
+          target,
+          upstreamUrl,
+          input.mode === "status" ? "GET" : "POST",
+          upstreamHeaders,
+          input.mode === "status" ? undefined : input.body,
+          deps.upstreamHeaderTimeoutMs,
+        );
+      } catch (error) {
+        deps.registry.markFailure(target);
+        const name = error instanceof Error ? error.name : "unknown error";
+        log.warn(`[router] tenant erasure target unreachable (${name})`);
+        const next = pickOther(deps, undefined, tried);
+        if (!next || attempt >= maxAttempts) return tenantErasureUnavailable(c);
+        target = next;
+        continue;
+      }
+
+      if (
+        response.headers.get(expectedAckHeader)
+        !== expectedAckValue
+      ) {
+        await response.body?.cancel().catch(() => {});
+        return tenantErasureUnavailable(c);
+      }
+      // The ACK proves that this is the private T2 route, not that an incompatible runner still
+      // honors the public edge contract. Do not publish an unexpected success status or projection.
+      if (response.status < 400) {
+        if (response.status !== expectedSuccessStatus) {
+          void response.body?.cancel().catch(() => {});
+          return tenantErasureUnavailable(c);
+        }
+        const read = await readCapped(response.body, TENANT_ERASURE_RESPONSE_MAX_BYTES);
+        let projection: unknown;
+        try {
+          if (!read.ok) return tenantErasureUnavailable(c);
+          projection = JSON.parse(new TextDecoder().decode(read.bytes));
+        } catch {
+          return tenantErasureUnavailable(c);
+        }
+        const parsed = TenantErasureRequest.safeParse(projection);
+        if (
+          !parsed.success
+          || parsed.data.tenantId !== input.expectedTenantId
+          || (input.mode === "status" && parsed.data.id !== input.expectedRequestId)
+        ) {
+          return tenantErasureUnavailable(c);
+        }
+        response = new Response(read.bytes, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      }
+      const result = streamBack(response);
+      result.headers.set("Cache-Control", "no-store");
+      result.headers.set("X-Content-Type-Options", "nosniff");
+      return result;
+    }
+    return tenantErasureUnavailable(c);
+  };
 
   app.get("/healthz", (c) => c.text("ok"));
   // Serve the immutable contract locally. Forwarding this endpoint would make API discovery depend
@@ -246,6 +459,10 @@ export function createRouterApp(deps: RouterAppDeps) {
                   ? [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1]
                   : [],
                 dataExportRequests: dataExportRequestsAvailable(),
+                tenantErasureControl: tenantErasureControlAvailable()
+                  ? [TENANT_ERASURE_PLATFORM_CONTROL_V1]
+                  : [],
+                tenantErasureRequests: tenantErasureAdmissionAvailable(),
               },
             } satisfies Capabilities);
           }
@@ -293,6 +510,102 @@ export function createRouterApp(deps: RouterAppDeps) {
     );
     return c.body(null, 204);
   });
+
+  /**
+   * A runner must acquire this fresh, content-free ACK immediately before committing an
+   * irreversible tenant gate. Unlike the worker barrier, this observation is deliberately not
+   * sticky: every configured stable runner must be healthy and admission-active right now.
+   */
+  app.get(INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    await deps.registry.refresh();
+    if (!tenantErasureAdmissionAvailable()) return c.body(null, 503);
+    c.header(
+      INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
+      INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
+    );
+    return c.body(null, 204);
+  });
+
+  const requireTenantErasureOperator = async (c: Context): Promise<Response | undefined> => {
+    if (bearerTokenMatches(c.req.header("authorization"), deps.tenantErasureOperatorToken)) {
+      return undefined;
+    }
+    // Do not parse unauthenticated input, but do cancel its stream so a rejected keep-alive POST
+    // cannot retain transport resources indefinitely.
+    await c.req.raw.body?.cancel().catch(() => {});
+    c.header("WWW-Authenticate", "Bearer");
+    return c.json({
+      error: { code: "unauthorized", message: "platform operator token required" },
+    }, 401);
+  };
+
+  const createTenantErasureRequest = async (c: Context): Promise<Response> => {
+    privateInternalHeaders(c);
+    const unauthorized = await requireTenantErasureOperator(c);
+    if (unauthorized) return unauthorized;
+
+    const requestHeaders = TenantErasureRequestHeaders.safeParse({
+      "idempotency-key": c.req.header("idempotency-key"),
+    });
+    if (!requestHeaders.success) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    const declaredLength = Number(c.req.header("content-length") ?? "0");
+    if (!Number.isFinite(declaredLength) || declaredLength < 0 || declaredLength > maxBodyBytes) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    const read = await readCapped(c.req.raw.body, maxBodyBytes);
+    if (!read.ok) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(new TextDecoder().decode(read.bytes));
+    } catch {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    const request = TenantErasureCreateRequest.safeParse(raw);
+    if (!request.success) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+
+    await deps.registry.refresh();
+    const admission = tenantErasureAdmissionAvailable();
+    return proxyTenantErasureControl(c, {
+      // The discriminated mode derives path, ACK and availability inside the proxy. Once replay is
+      // selected, no later gate transition can accidentally retarget this request to admission.
+      mode: admission ? "admit" : "replay",
+      body: new TextEncoder().encode(JSON.stringify(request.data)),
+      idempotencyKey: requestHeaders.data["idempotency-key"],
+      expectedTenantId: request.data.tenantId,
+    });
+  };
+
+  const getTenantErasureRequest = async (c: Context): Promise<Response> => {
+    privateInternalHeaders(c);
+    const unauthorized = await requireTenantErasureOperator(c);
+    if (unauthorized) return unauthorized;
+
+    const params = TenantErasureRequestParams.safeParse({ requestId: c.req.param("requestId") });
+    const query = TenantErasureRequestQuery.safeParse({ tenantId: c.req.query("tenantId") });
+    if (!params.success || !query.success) {
+      return c.json({ error: { code: "invalid_request", message: "validation failed" } }, 400);
+    }
+    return proxyTenantErasureControl(c, {
+      mode: "status",
+      expectedTenantId: query.data.tenantId,
+      expectedRequestId: params.data.requestId,
+    });
+  };
+
+  app.post(TENANT_ERASURE_PUBLIC_COLLECTION, createTenantErasureRequest);
+  app.post(`${TENANT_ERASURE_PUBLIC_COLLECTION}/`, createTenantErasureRequest);
+  app.get(`${TENANT_ERASURE_PUBLIC_COLLECTION}/:requestId`, getTenantErasureRequest);
+  app.get(`${TENANT_ERASURE_PUBLIC_COLLECTION}/:requestId/`, getTenantErasureRequest);
 
   /**
    * Operational view. Off unless an admin token is configured: it lists every internal runner address
@@ -474,6 +787,24 @@ export function createRouterApp(deps: RouterAppDeps) {
       || url.pathname.startsWith(`${INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH}/`)
       || url.pathname === INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH}/`)
+      || url.pathname === INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH
+      || url.pathname.startsWith(`${INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH}/`)
+      || url.pathname === INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX
+      || url.pathname.startsWith(`${INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX}/`)
+      || url.pathname === INTERNAL_TENANT_ERASURE_REPLAY_PATH
+      || url.pathname.startsWith(`${INTERNAL_TENANT_ERASURE_REPLAY_PATH}/`)
+    ) {
+      privateInternalHeaders(c);
+      return c.json({ error: { code: "not_found", message: "not found" } }, 404);
+    }
+    // The platform credential must never enter the generic proxy. Unsupported methods and malformed
+    // tenant-control paths fail at the router edge rather than forwarding Authorization to a runner.
+    if (
+      isTenantErasurePathFamily(url.pathname)
+      || authorizationContainsBearerToken(
+        c.req.header("authorization"),
+        deps.tenantErasureOperatorToken,
+      )
     ) {
       privateInternalHeaders(c);
       return c.json({ error: { code: "not_found", message: "not found" } }, 404);
@@ -802,7 +1133,8 @@ function pickOther(deps: RouterAppDeps, sessionId: string | undefined, tried: Se
 function requestHeaders(from: Headers): Headers {
   const h = new Headers();
   from.forEach((v, k) => {
-    if (!STRIP_REQUEST.has(k.toLowerCase())) h.set(k, v);
+    const key = k.toLowerCase();
+    if (!STRIP_REQUEST.has(key) && !key.startsWith("x-agent-service-")) h.set(k, v);
   });
   return h;
 }
@@ -834,7 +1166,7 @@ function streamBack(res: Response): Response {
   const cookies = res.headers.getSetCookie?.() ?? [];
   res.headers.forEach((v, k) => {
     const key = k.toLowerCase();
-    if (STRIP_RESPONSE.has(key) || key === "set-cookie") return;
+    if (STRIP_RESPONSE.has(key) || key.startsWith("x-agent-service-") || key === "set-cookie") return;
     headers.set(k, v);
   });
   for (const cookie of cookies) headers.append("set-cookie", cookie);

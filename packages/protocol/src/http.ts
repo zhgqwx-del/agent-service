@@ -146,6 +146,11 @@ export const DataExportRequestHeaders = UserIdentityHeaders.extend({
   "idempotency-key": RequiredIdempotencyKey,
 });
 
+/** Platform bearer authentication is described by the OpenAPI security scheme, not this object. */
+export const TenantErasureRequestHeaders = z.object({
+  "idempotency-key": RequiredIdempotencyKey,
+});
+
 export const EventStreamHeaders = UserIdentityHeaders.extend({
   "last-event-id": z.coerce.number().int().min(-1).optional(),
 });

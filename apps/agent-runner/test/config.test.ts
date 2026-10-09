@@ -22,6 +22,8 @@ describe("runner configuration", () => {
     expect(cfg.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(cfg.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS).toBe(2_000);
     expect(cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
     expect(cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED).toBe(false);
@@ -129,6 +131,42 @@ describe("runner configuration", () => {
       ERASURE_WORKER_ENABLED: "1",
       ERASURE_ROUTER_URL: "https://router.internal:8443/",
     }).ERASURE_ROUTER_URL).toBe("https://router.internal:8443");
+  });
+
+  it("keeps tenant erasure behind an independent runner gate and bounded fresh barrier", () => {
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_ERASURE_OPERATOR_TOKEN: "tenant-erasure-operator-token-0001",
+    })).toThrow(/router-only/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_ERASURE_OPERATOR_ID: "platform-lifecycle-admin",
+    })).toThrow(/router-only/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_ERASURE_REQUESTS_ENABLED: "1",
+    })).toThrow(/ERASURE_ROUTER_URL is required/);
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_ERASURE_REQUESTS_ENABLED: "1",
+      TENANT_ERASURE_BARRIER_TIMEOUT_MS: "2500",
+      ERASURE_ROUTER_URL: "https://router.internal:8443/",
+    });
+    expect(enabled.TENANT_ERASURE_REQUESTS_ENABLED).toBe(true);
+    expect(enabled.TENANT_ERASURE_BARRIER_TIMEOUT_MS).toBe(2_500);
+    expect(enabled.ERASURE_ROUTER_URL).toBe("https://router.internal:8443");
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_ERASURE_REQUESTS_ENABLED: "true",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_ERASURE_BARRIER_TIMEOUT_MS: "99",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_ERASURE_BARRIER_TIMEOUT_MS: "10001",
+    })).toThrow();
   });
 
   it("validates erasure worker bounds and retry ordering", () => {

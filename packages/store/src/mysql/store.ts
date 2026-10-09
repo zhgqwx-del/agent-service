@@ -116,6 +116,8 @@ import {
   ErasureIdempotencyMismatchError,
   SubjectDeletingError,
   TenantErasureConflictError,
+  TenantErasureIntegrityError,
+  TenantErasureTargetNotFoundError,
   classifyErasureJobRecordFault,
   deriveBlockedErasureResumePhase,
   erasureJobClaimFromRecord,
@@ -142,8 +144,10 @@ import {
   validateErasureRequestRecordForRead,
   validateErasureWriteAuthorization,
   validateRepairAndResumeErasureJobInput,
+  validateReplayTenantErasureInput,
   validateRequestTenantErasureInput,
   validateRequestUserErasureInput,
+  validateTenantErasureAdmissionProof,
   validateTenantCredentialRevocationFence,
   validateRenewErasureJobClaimOptions,
   validateRetryErasureJobOptions,
@@ -163,6 +167,7 @@ import {
   type ErasureRequestStatus,
   type ErasureWriteAuthorization,
   type RequestTenantErasureInput,
+  type ReplayTenantErasureInput,
   type RequestUserErasureInput,
   type RepairAndResumeErasureJobInput,
   type RetryErasureJobOptions,
@@ -1441,7 +1446,11 @@ function rowToTenantCredentialRevocationFence(row: Row): TenantCredentialRevocat
     fencedAtMs: Number(row.fenced_at_ms),
     evidenceSha256: String(row.evidence_sha256),
   };
-  validateTenantCredentialRevocationFence(fence);
+  try {
+    validateTenantCredentialRevocationFence(fence);
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
   return fence;
 }
 
@@ -1599,7 +1608,11 @@ function rowToTenantErasureAdmission(row: Row): ErasureRequestRecord {
     ...(row.policy_hash == null ? {} : { policyHash: String(row.policy_hash) }),
     controlGeneration: Number(row.control_generation),
   };
-  validateErasureRequestRecordForRead(record);
+  try {
+    validateErasureRequestRecordForRead(record);
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
   return record;
 }
 
@@ -7009,7 +7022,15 @@ export class MysqlSessionStore implements
         WHERE tenant_id=?${requestId === undefined ? "" : " AND request_id=?"} ${lock}`,
       requestId === undefined ? [tenantId] : [tenantId, requestId],
     );
-    return rows[0] ? rowToTenantErasureAdmission(rows[0]) : null;
+    if (!rows[0]) return null;
+    const admission = rowToTenantErasureAdmission(rows[0]);
+    // MySQL's UCA collation can equate canonically equivalent Unicode strings. Tenant ownership
+    // remains byte/code-point exact at the store boundary, matching MemoryStore and Redis.
+    if (
+      admission.tenantId !== tenantId
+      || (requestId !== undefined && admission.requestId !== requestId)
+    ) return null;
+    return admission;
   }
 
   private async loadTenantCredentialRevocationFence(
@@ -7024,7 +7045,32 @@ export class MysqlSessionStore implements
         WHERE tenant_id=?${requestId === undefined ? "" : " AND request_id=?"} ${lock}`,
       requestId === undefined ? [tenantId] : [tenantId, requestId],
     );
-    return rows[0] ? rowToTenantCredentialRevocationFence(rows[0]) : null;
+    if (!rows[0]) return null;
+    const fence = rowToTenantCredentialRevocationFence(rows[0]);
+    if (
+      fence.tenantId !== tenantId
+      || (requestId !== undefined && fence.requestId !== requestId)
+    ) return null;
+    return fence;
+  }
+
+  private async loadTenantErasureFirstAudit(
+    executor: Pool | PoolConnection,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<ErasureAuditEvent | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT request_id, seq, event_type, payload, emitted_at_ms
+         FROM erasure_audit_events
+        WHERE request_id=? AND seq=1 ${lock}`,
+      [requestId],
+    );
+    if (!rows[0]) return null;
+    try {
+      return rowsToErasureAuditEvents([rows[0]])[0] ?? null;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
   }
 
   private async hasTenantErasureAuthorityFence(
@@ -7079,7 +7125,7 @@ export class MysqlSessionStore implements
       [tenantId],
     );
     if (legacyRequestRows[0] || admissionRows[0] || fenceRows[0]) {
-      throw new Error("tenant lifecycle gate is missing for existing erasure evidence");
+      throw new TenantErasureIntegrityError();
     }
     await conn.query(
       `INSERT IGNORE INTO subject_lifecycle
@@ -7447,6 +7493,55 @@ export class MysqlSessionStore implements
     return rows[0] ? rowToErasureRequest(rows[0]) : null;
   }
 
+  async replayTenantErasure(
+    input: ReplayTenantErasureInput,
+  ): Promise<ErasureRequestRecord | null> {
+    input = structuredClone(input);
+    validateReplayTenantErasureInput(input);
+    return this.withConsistentRead(async (conn) => {
+      const [admissionRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
+           FROM tenant_erasure_admissions
+          WHERE tenant_id=? AND idempotency_key=?`,
+        [input.tenantId, input.idempotencyKey],
+      );
+      if (!admissionRows[0]) return null;
+      const admission = rowToTenantErasureAdmission(admissionRows[0]);
+      if (
+        admission.tenantId !== input.tenantId
+        || admission.idempotencyKey !== input.idempotencyKey
+      ) return null;
+      if (admission.requestHash !== input.requestHash) {
+        throw new ErasureIdempotencyMismatchError();
+      }
+      const [lifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+        [input.tenantId, input.tenantId],
+      );
+      let lifecycle: SubjectLifecycleRecord | undefined;
+      try {
+        lifecycle = lifecycleRows[0] ? rowToSubjectLifecycle(lifecycleRows[0]) : undefined;
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      const fence = await this.loadTenantCredentialRevocationFence(
+        conn,
+        input.tenantId,
+        admission.requestId,
+      );
+      const firstAudit = await this.loadTenantErasureFirstAudit(conn, admission.requestId);
+      validateTenantErasureAdmissionProof({
+        admission,
+        lifecycle,
+        fence: fence ?? undefined,
+        firstAudit: firstAudit ?? undefined,
+      });
+      return admission;
+    });
+  }
+
   async requestTenantErasure(input: RequestTenantErasureInput): Promise<ErasureRequestRecord> {
     input = structuredClone(input);
     validateRequestTenantErasureInput(input);
@@ -7462,13 +7557,25 @@ export class MysqlSessionStore implements
           WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
         [input.tenantId, input.tenantId],
       );
-      const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+      // UCA can return another raw tenant spelling for the same comparison key. It is not the
+      // requested registry identity and must retain owner-hiding target-not-found semantics rather
+      // than being surfaced as corruption or used as the tenant gate.
+      if (
+        tenantRows[0]
+        && String(tenantRows[0].tenant_id) !== input.tenantId
+      ) throw new TenantErasureTargetNotFoundError();
+      let tenant: SubjectLifecycleRecord | undefined;
+      try {
+        tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
       if (
         !tenant
         || tenant.tenantId !== input.tenantId
         || tenant.subjectKind !== "tenant"
         || tenant.subjectId !== input.tenantId
-      ) throw new Error("tenant lifecycle gate row is missing or invalid");
+      ) throw new TenantErasureIntegrityError();
 
       const [idempotencyRows] = await conn.query<Row[]>(
         `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
@@ -7479,22 +7586,33 @@ export class MysqlSessionStore implements
       );
       if (idempotencyRows[0]) {
         const replay = rowToTenantErasureAdmission(idempotencyRows[0]);
-        if (replay.requestHash !== input.requestHash) throw new ErasureIdempotencyMismatchError();
-        const replayFence = await this.loadTenantCredentialRevocationFence(
-          conn,
-          input.tenantId,
-          replay.requestId,
-          "FOR SHARE",
-        );
+        // Treat a UCA-collation match with different original text exactly like any other different
+        // idempotency key. Only the byte/code-point exact key may enter the replay branch.
         if (
-          !replayFence
-          || tenant.state === "active"
-          || tenant.activeRequestId !== replay.requestId
-          || tenant.generation !== replay.generation
-          || replayFence.subjectGeneration !== replay.generation
-        ) throw new Error("tenant erasure replay does not match its lifecycle fence");
-        await conn.commit();
-        return replay;
+          replay.tenantId === input.tenantId
+          && replay.idempotencyKey === input.idempotencyKey
+        ) {
+          if (replay.requestHash !== input.requestHash) throw new ErasureIdempotencyMismatchError();
+          const replayFence = await this.loadTenantCredentialRevocationFence(
+            conn,
+            input.tenantId,
+            replay.requestId,
+            "FOR SHARE",
+          );
+          const firstAudit = await this.loadTenantErasureFirstAudit(
+            conn,
+            replay.requestId,
+            "FOR SHARE",
+          );
+          validateTenantErasureAdmissionProof({
+            admission: replay,
+            lifecycle: tenant,
+            fence: replayFence ?? undefined,
+            firstAudit: firstAudit ?? undefined,
+          });
+          await conn.commit();
+          return replay;
+        }
       }
 
       if (tenant.state !== "active") {
@@ -7514,9 +7632,16 @@ export class MysqlSessionStore implements
               "FOR SHARE",
             )
           : null;
-        if (!active || !activeFence || activeFence.subjectGeneration !== active.generation) {
-          throw new Error("tenant lifecycle active request is corrupt");
-        }
+        const firstAudit = active
+          ? await this.loadTenantErasureFirstAudit(conn, active.requestId, "FOR SHARE")
+          : null;
+        if (!active) throw new TenantErasureIntegrityError();
+        validateTenantErasureAdmissionProof({
+          admission: active,
+          lifecycle: tenant,
+          fence: activeFence ?? undefined,
+          firstAudit: firstAudit ?? undefined,
+        });
         await conn.commit();
         return active;
       }
@@ -7527,8 +7652,21 @@ export class MysqlSessionStore implements
         await this.loadTenantErasureAdmission(conn, input.tenantId, undefined, "FOR SHARE")
         || await this.loadTenantCredentialRevocationFence(conn, input.tenantId, undefined, "FOR SHARE")
       ) {
-        throw new Error("active tenant already has erasure admission or credential revocation evidence");
+        throw new TenantErasureIntegrityError();
       }
+
+      // The registry row is the only authoritative tenant-existence proof. Take this lock after
+      // the lifecycle lock, matching createApiKey/setTenantAuth, so creation and erasure cannot
+      // deadlock or admit a phantom target. Existing committed requests returned above remain
+      // replayable even if this independent projection is later damaged or removed.
+      const [registeredTenantRows] = await conn.query<Row[]>(
+        "SELECT tenant_id FROM tenants WHERE tenant_id=? FOR SHARE",
+        [input.tenantId],
+      );
+      if (
+        !registeredTenantRows[0]
+        || String(registeredTenantRows[0].tenant_id) !== input.tenantId
+      ) throw new TenantErasureTargetNotFoundError();
 
       // A user worker can retain lease authority after its claim transaction releases locks. Gate
       // the tenant only when no user request is in a worker-owned/claimable execution phase. The
@@ -7667,7 +7805,47 @@ export class MysqlSessionStore implements
     tenantId: string,
     requestId: string,
   ): Promise<ErasureRequestRecord | null> {
-    return this.loadTenantErasureAdmission(this.pool, tenantId, requestId);
+    return this.withConsistentRead(async (conn) => {
+      const admission = await this.loadTenantErasureAdmission(conn, tenantId, requestId);
+      const [lifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+        [tenantId, tenantId],
+      );
+      const fence = await this.loadTenantCredentialRevocationFence(
+        conn,
+        tenantId,
+        requestId,
+      );
+      if (!admission) {
+        // Do not consult another tenant's admission/audit by request id. Only exact same-tenant
+        // orphan evidence turns an otherwise indistinguishable missing request into an integrity
+        // failure.
+        if (
+          (
+            String(lifecycleRows[0]?.tenant_id ?? "") === tenantId
+            && String(lifecycleRows[0]?.active_request_id ?? "") === requestId
+          )
+          || fence !== null
+        ) throw new TenantErasureIntegrityError();
+        return null;
+      }
+      let lifecycle: SubjectLifecycleRecord | undefined;
+      try {
+        lifecycle = lifecycleRows[0] ? rowToSubjectLifecycle(lifecycleRows[0]) : undefined;
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      const firstAudit = await this.loadTenantErasureFirstAudit(conn, requestId);
+      validateTenantErasureAdmissionProof({
+        admission,
+        lifecycle,
+        fence: fence ?? undefined,
+        firstAudit: firstAudit ?? undefined,
+      });
+      return admission;
+    });
   }
 
   async getTenantCredentialRevocationFence(

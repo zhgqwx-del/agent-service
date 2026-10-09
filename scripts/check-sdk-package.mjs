@@ -84,6 +84,7 @@ try {
 import * as sdk from "@agent-service/sdk";
 for (const name of [
   "createAgentServiceClient",
+  "createAgentServicePlatformClient",
   "startTurnStream",
   "subscribeSessionEvents",
   "uploadSessionBlob",
@@ -99,6 +100,7 @@ for (const name of [
   await writeFile(resolve(consumer, "smoke.ts"), `
 import {
   createAgentServiceClient,
+  createAgentServicePlatformClient,
   readItemOutput,
   readSessionBlob,
   uploadSessionBlob,
@@ -106,13 +108,17 @@ import {
   type ExcludableEventType,
 } from "@agent-service/sdk";
 const client = createAgentServiceClient({ baseUrl: "http://127.0.0.1:8080" });
+const platformClient = createAgentServicePlatformClient({
+  baseUrl: "http://127.0.0.1:8080",
+  platformOperatorToken: "package-smoke-platform-token-000001",
+});
 const event = null as unknown as AgentServiceEvent;
 const excluded: ExcludableEventType = "heartbeat";
 const request = { baseUrl: "http://127.0.0.1:8080" };
 const uploaded = uploadSessionBlob(request, "sess_example", new Uint8Array([1]), "image/png");
 const downloaded = readSessionBlob(request, "sess_example", "blob_example");
 const output = readItemOutput(request, "sess_example", "item_example");
-void [client, event, excluded, uploaded, downloaded, output];
+void [client, platformClient, event, excluded, uploaded, downloaded, output];
 `);
   await writeFile(resolve(consumer, "tsconfig.json"), `${JSON.stringify({
     compilerOptions: {

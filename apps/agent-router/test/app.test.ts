@@ -1,6 +1,6 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_ACK_VALUE,
@@ -16,6 +16,16 @@ import {
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
   INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH,
   INTERNAL_ROUTER_TOKEN_HEADER,
+  INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
+  INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH,
+  INTERNAL_TENANT_ERASURE_ACTOR_HEADER,
+  INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
+  INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_REPLAY_ACK_VALUE,
+  INTERNAL_TENANT_ERASURE_REPLAY_PATH,
+  INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER,
+  INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE,
   INTERNAL_TOMBSTONE_ACK_HEADER,
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
@@ -32,6 +42,8 @@ import type { RunnerRegistry, RunnerTarget } from "../src/registry.js";
 
 const SID = "sess_019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5b";
 const INTERNAL_TOKEN = "router-test-internal-token-000001";
+const TENANT_ERASURE_OPERATOR_TOKEN = "tenant-erasure-operator-token-0001";
+const TENANT_ERASURE_REQUEST_ID = "erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b";
 let servers: Server[] = [];
 afterEach(async () => {
   // closeAllConnections first: keep-alive sockets keep `close()` pending forever otherwise, and the
@@ -100,6 +112,11 @@ function fakeRegistry(
     exportReadable?: boolean;
     exportAdmission?: boolean;
     targetExport?: boolean | ((url: string) => boolean);
+    tenantControl?: boolean;
+    tenantAdmission?: boolean;
+    targetTenantControl?: boolean | ((url: string) => boolean);
+    targetTenantAdmission?: boolean | ((url: string) => boolean);
+    refresh?: () => void | Promise<void>;
   } = {},
 ): RunnerRegistry {
   const list = (): RunnerTarget[] => targets.map((url) => ({ url, healthy: opts.healthy ? opts.healthy(url) : true, lastCheckMs: Date.now(), consecutiveFailures: 0 }));
@@ -155,9 +172,31 @@ function fakeRegistry(
         ? opts.targetExport(url)
         : opts.targetExport ?? opts.exportReadable ?? false
     ),
+    allConfiguredSupportTenantErasureControl: () => opts.tenantControl ?? false,
+    allHealthySupportTenantErasureControl: () => opts.tenantControl ?? false,
+    allConfiguredSupportTenantErasureAdmission: () => (
+      opts.tenantAdmission ?? opts.tenantControl ?? false
+    ),
+    supportsTenantErasureControl: (url: string) => (
+      typeof opts.targetTenantControl === "function"
+        ? opts.targetTenantControl(url)
+        : opts.targetTenantControl ?? opts.tenantControl ?? false
+    ),
+    supportsTenantErasureAdmission: (url: string) => (
+      typeof opts.targetTenantAdmission === "function"
+        ? opts.targetTenantAdmission(url)
+        : opts.targetTenantAdmission
+          ?? (typeof opts.targetTenantControl === "function"
+            ? opts.targetTenantControl(url)
+            : opts.targetTenantControl)
+          ?? opts.tenantAdmission
+          ?? opts.tenantControl
+          ?? false
+    ),
     toUrl: (addr: string) => targets.find((t) => t.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, "")),
     routeableUrl: (addr: string) => list().find((t) => t.healthy && t.url.replace(/^https?:\/\//, "") === addr.replace(/^https?:\/\//, ""))?.url,
     markFailure: () => {},
+    refresh: async () => { await opts.refresh?.(); },
     start: () => {},
     close: async () => {},
     waitForFirstProbe: async () => {},
@@ -179,6 +218,338 @@ function expectPrivateLifecycleResponse(response: Response): void {
   expect(response.headers.get("cache-control")).toBe("no-store");
   expect(response.headers.get("x-content-type-options")).toBe("nosniff");
 }
+
+describe("tenant-erasure platform control", () => {
+  it("authenticates before parsing input or observing fleet state", async () => {
+    const refresh = vi.fn();
+    const app = createRouterApp({
+      registry: fakeRegistry(["http://runner.invalid"], {
+        tenantControl: true,
+        tenantAdmission: true,
+        refresh,
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantErasureOperatorToken: TENANT_ERASURE_OPERATOR_TOKEN,
+      tenantErasureOperatorId: "platform-lifecycle-admin",
+      tenantErasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+
+    const response = await app.request("/v1/tenant-erasure-requests", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wrong-tenant-erasure-token-000001",
+        "idempotency-key": "tenant-create-1",
+        "content-type": "application/json",
+      },
+      body: "not-json",
+    });
+    expect(response.status).toBe(401);
+    expectPrivateLifecycleResponse(response);
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("rewrites an authenticated POST to the runner-only route without forwarding platform headers", async () => {
+    const runner = await upstream(() => ({
+      status: 202,
+      headers: {
+        [INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER]: INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE,
+        "x-agent-service-private-extra": "must-not-exist-in-response",
+      },
+      body: JSON.stringify({
+        id: TENANT_ERASURE_REQUEST_ID,
+        scope: "tenant",
+        tenantId: "tenant-a",
+        generation: 1,
+        status: "gated",
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      }),
+    }));
+    const refresh = vi.fn();
+    const app = createRouterApp({
+      registry: fakeRegistry([runner.url], {
+        tenantControl: true,
+        tenantAdmission: true,
+        refresh,
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantErasureOperatorToken: TENANT_ERASURE_OPERATOR_TOKEN,
+      tenantErasureOperatorId: "platform-lifecycle-admin",
+      tenantErasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+
+    const response = await app.request("/v1/tenant-erasure-requests", {
+      method: "POST",
+      headers: {
+        authorization: `bEaReR ${TENANT_ERASURE_OPERATOR_TOKEN}`,
+        "idempotency-key": " tenant-create-1 ",
+        "content-type": "application/json",
+        "x-user-id": "must-not-be-forwarded",
+        [INTERNAL_ROUTER_TOKEN_HEADER]: "external-spoofed-internal-token-001",
+        [INTERNAL_TENANT_ERASURE_ACTOR_HEADER]: "external-spoofed-actor",
+        [INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER]: "external-spoofed-ack",
+      },
+      body: JSON.stringify({ tenantId: "tenant-a" }),
+    });
+
+    expect(response.status).toBe(202);
+    expectPrivateLifecycleResponse(response);
+    expect(response.headers.get(INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER)).toBeNull();
+    expect(response.headers.get("x-agent-service-private-extra")).toBeNull();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(runner.requests).toHaveLength(1);
+    expect(runner.requests[0]).toMatchObject({
+      method: "POST",
+      path: INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
+      body: JSON.stringify({ tenantId: "tenant-a" }),
+    });
+    expect(runner.requests[0]!.headers.authorization).toBeUndefined();
+    expect(runner.requests[0]!.headers["x-user-id"]).toBeUndefined();
+    expect(runner.requests[0]!.headers[INTERNAL_ROUTER_TOKEN_HEADER]).toBe(INTERNAL_TOKEN);
+    expect(runner.requests[0]!.headers[INTERNAL_TENANT_ERASURE_ACTOR_HEADER]).toBe(
+      "platform-lifecycle-admin",
+    );
+    expect(runner.requests[0]!.headers[INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER]).toBeUndefined();
+    expect(runner.requests[0]!.headers["idempotency-key"]).toBe("tenant-create-1");
+  });
+
+  it("fails closed when an ACK-bearing runner violates the public success contract", async () => {
+    const runner = await upstream(({ n }) => ({
+      status: n === 1 ? 201 : 202,
+      headers: {
+        [INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER]: INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE,
+      },
+      body: JSON.stringify({
+        id: TENANT_ERASURE_REQUEST_ID,
+        scope: "tenant",
+        tenantId: n === 1 ? "tenant-a" : "tenant-b",
+        generation: 1,
+        status: "gated",
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      }),
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([runner.url], { tenantControl: true, tenantAdmission: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantErasureOperatorToken: TENANT_ERASURE_OPERATOR_TOKEN,
+      tenantErasureOperatorId: "platform-lifecycle-admin",
+      tenantErasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    const request = (idempotencyKey: string) => app.request("/v1/tenant-erasure-requests", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}`,
+        "idempotency-key": idempotencyKey,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ tenantId: "tenant-a" }),
+    });
+
+    const wrongStatus = await request("tenant-create-wrong-status");
+    expect(wrongStatus.status).toBe(503);
+    expectPrivateLifecycleResponse(wrongStatus);
+
+    const wrongIdentity = await request("tenant-create-wrong-identity");
+    expect(wrongIdentity.status).toBe(503);
+    expectPrivateLifecycleResponse(wrongIdentity);
+    expect(runner.requests).toHaveLength(2);
+  });
+
+  it("uses a fixed read-only replay route while admission is closed", async () => {
+    let admissionEnabled = false;
+    const runner = await upstream(() => {
+      // Opening the writer gate after route selection must not upgrade this request into a create.
+      admissionEnabled = true;
+      return {
+        status: 202,
+        headers: {
+          [INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER]: INTERNAL_TENANT_ERASURE_REPLAY_ACK_VALUE,
+        },
+        body: JSON.stringify({
+          id: TENANT_ERASURE_REQUEST_ID,
+          scope: "tenant",
+          tenantId: "tenant-a",
+          generation: 1,
+          status: "gated",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        }),
+      };
+    });
+    const app = createRouterApp({
+      registry: fakeRegistry([runner.url], { tenantControl: true, tenantAdmission: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantErasureOperatorToken: TENANT_ERASURE_OPERATOR_TOKEN,
+      tenantErasureOperatorId: "platform-lifecycle-admin",
+      tenantErasureRequestsEnabled: () => admissionEnabled,
+      logger: silent,
+    });
+
+    const response = await app.request("/v1/tenant-erasure-requests", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}`,
+        "idempotency-key": "tenant-create-recover",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ tenantId: "tenant-a" }),
+    });
+    expect(response.status).toBe(202);
+    expectPrivateLifecycleResponse(response);
+    expect(response.headers.get(INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER)).toBeNull();
+    expect(runner.requests).toHaveLength(1);
+    expect(runner.requests[0]).toMatchObject({
+      method: "POST",
+      path: INTERNAL_TENANT_ERASURE_REPLAY_PATH,
+      body: JSON.stringify({ tenantId: "tenant-a" }),
+    });
+  });
+
+  it("keeps status readable while admission is off and requires the fixed runner ACK on errors", async () => {
+    const runner = await upstream(() => ({
+      status: 404,
+      headers: {
+        [INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER]: INTERNAL_TENANT_ERASURE_ROUTE_ACK_VALUE,
+      },
+      body: JSON.stringify({ error: { code: "not_found", message: "not found" } }),
+    }));
+    const app = createRouterApp({
+      registry: fakeRegistry([runner.url], { tenantControl: true, tenantAdmission: false }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantErasureOperatorToken: TENANT_ERASURE_OPERATOR_TOKEN,
+      tenantErasureOperatorId: "platform-lifecycle-admin",
+      tenantErasureRequestsEnabled: () => false,
+      logger: silent,
+    });
+
+    const response = await app.request(
+      `/v1/tenant-erasure-requests/${TENANT_ERASURE_REQUEST_ID}?tenantId=tenant-a`,
+      { headers: { authorization: `Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}` } },
+    );
+    expect(response.status).toBe(404);
+    expectPrivateLifecycleResponse(response);
+    expect(runner.requests[0]!.path).toBe(
+      `${INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX}/${TENANT_ERASURE_REQUEST_ID}?tenantId=tenant-a`,
+    );
+    expect(runner.requests[0]!.headers.authorization).toBeUndefined();
+    expect(runner.requests[0]!.headers[INTERNAL_ROUTER_TOKEN_HEADER]).toBe(INTERNAL_TOKEN);
+  });
+
+  it("fails closed on mixed fleet state, a missing route ACK, and generic-path bypass attempts", async () => {
+    const runner = await upstream(() => ({ status: 201, body: "{}" }));
+    const mixed = createRouterApp({
+      registry: fakeRegistry([runner.url], { tenantControl: true, tenantAdmission: false }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantErasureOperatorToken: TENANT_ERASURE_OPERATOR_TOKEN,
+      tenantErasureOperatorId: "platform-lifecycle-admin",
+      tenantErasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    const request = {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}`,
+        "idempotency-key": "tenant-create-1",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ tenantId: "tenant-a" }),
+    };
+    const mixedResponse = await mixed.request("/v1/tenant-erasure-requests", request);
+    expect(mixedResponse.status).toBe(503);
+    expectPrivateLifecycleResponse(mixedResponse);
+    expect(runner.requests).toHaveLength(1);
+    expect(runner.requests[0]!.path).toBe(INTERNAL_TENANT_ERASURE_REPLAY_PATH);
+
+    const missingAck = createRouterApp({
+      registry: fakeRegistry([runner.url], { tenantControl: true, tenantAdmission: true }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantErasureOperatorToken: TENANT_ERASURE_OPERATOR_TOKEN,
+      tenantErasureOperatorId: "platform-lifecycle-admin",
+      tenantErasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    const missingAckResponse = await missingAck.request("/v1/tenant-erasure-requests", request);
+    expect(missingAckResponse.status).toBe(503);
+    expectPrivateLifecycleResponse(missingAckResponse);
+
+    const bypass = await missingAck.request(INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX, {
+      method: "POST",
+      headers: { authorization: `Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}` },
+    });
+    expect(bypass.status).toBe(404);
+    expectPrivateLifecycleResponse(bypass);
+    const replayBypass = await missingAck.request(INTERNAL_TENANT_ERASURE_REPLAY_PATH, {
+      method: "POST",
+      headers: { authorization: `Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}` },
+    });
+    expect(replayBypass.status).toBe(404);
+    expectPrivateLifecycleResponse(replayBypass);
+    const wrongMethod = await missingAck.request("/v1/tenant-erasure-requests", {
+      method: "PUT",
+      headers: { authorization: `Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}` },
+    });
+    expect(wrongMethod.status).toBe(404);
+    expectPrivateLifecycleResponse(wrongMethod);
+
+    for (const { path, authorization = `Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}` } of [
+      { path: "/v1/tenant-erasure-requests%2Fprobe" },
+      { path: "/v1/%74enant-erasure-requests-extra/probe" },
+      { path: "/v1/%2574enant-erasure-requests/probe" },
+      // Even an unrelated malformed path cannot carry the platform credential through the
+      // generic tenant proxy: this token terminates at the router, not merely at one path regex.
+      { path: "/v1/agents%2Fencoded", authorization: `bearer ${TENANT_ERASURE_OPERATOR_TOKEN}` },
+      { path: "/v1/agents%2Fspaces", authorization: `Bearer  ${TENANT_ERASURE_OPERATOR_TOKEN}` },
+      { path: "/v1/agents%2Ftab", authorization: `Bearer\t${TENANT_ERASURE_OPERATOR_TOKEN}` },
+      {
+        path: "/v1/agents%2Fcombined-auth",
+        authorization: `Bearer tenant-key, Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}`,
+      },
+    ]) {
+      const encoded = await missingAck.request(path, {
+        headers: { authorization },
+      });
+      expect(encoded.status).toBe(404);
+      expectPrivateLifecycleResponse(encoded);
+    }
+    // The replay-only and missing-ACK probes reached the upstream; every bypass stayed at the edge.
+    expect(runner.requests).toHaveLength(2);
+  });
+
+  it("refreshes the current fleet before returning the private admission ACK", async () => {
+    const refresh = vi.fn();
+    const enabled = createRouterApp({
+      registry: fakeRegistry(["http://runner.internal"], {
+        tenantControl: true,
+        tenantAdmission: true,
+        refresh,
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantErasureOperatorToken: TENANT_ERASURE_OPERATOR_TOKEN,
+      tenantErasureOperatorId: "platform-lifecycle-admin",
+      tenantErasureRequestsEnabled: () => true,
+      logger: silent,
+    });
+    const denied = await enabled.request(INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: "wrong-internal-token-000000000001" },
+    });
+    expect(denied.status).toBe(404);
+    expect(refresh).not.toHaveBeenCalled();
+
+    const response = await enabled.request(INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get(INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER)).toBe(
+      INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
+    );
+    expectPrivateLifecycleResponse(response);
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("internal user-erasure routing", () => {
   it("keeps policy-evaluation claims behind their own private fleet barrier", async () => {

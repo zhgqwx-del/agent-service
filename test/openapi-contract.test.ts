@@ -18,7 +18,10 @@ interface OpenApiOperation {
 
 interface OpenApiDocument {
   paths: Record<string, Record<string, OpenApiOperation>>;
-  components?: { schemas?: Record<string, unknown> };
+  components?: {
+    schemas?: Record<string, unknown>;
+    securitySchemes?: Record<string, unknown>;
+  };
 }
 
 interface RegisteredRoute {
@@ -91,7 +94,7 @@ describe("committed OpenAPI contract", () => {
   it.each([
     ["agent-runner", runnerApp],
     ["agent-router", routerApp],
-  ] as const)("serves the exact committed document publicly from %s", async (_name, create) => {
+  ] as const)("serves the exact committed document artifact from %s", async (_name, create) => {
     const response = await create().request("/openapi.json");
 
     expect(response.status).toBe(200);
@@ -103,7 +106,7 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(53);
+    expect(operations).toHaveLength(55);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
@@ -121,6 +124,8 @@ describe("committed OpenAPI contract", () => {
       "/v1/data-export-requests",
       "/v1/data-export-requests/{requestId}",
       "/v1/data-export-requests/{requestId}/download",
+      "/v1/tenant-erasure-requests",
+      "/v1/tenant-erasure-requests/{requestId}",
     ]));
   });
 
@@ -234,6 +239,14 @@ describe("committed OpenAPI contract", () => {
               default: false,
               type: "boolean",
             },
+            tenantErasureControl: {
+              items: { enum: ["platform-control-v1"] },
+              maxItems: 1,
+            },
+            tenantErasureRequests: {
+              default: false,
+              type: "boolean",
+            },
           },
         },
       },
@@ -293,10 +306,46 @@ describe("committed OpenAPI contract", () => {
     expect(exportSchema.oneOf?.filter((branch) => "artifact" in (branch.properties ?? {}))).toHaveLength(1);
   });
 
-  it("matches all 52 implemented runner routes plus the OpenAPI route in both directions", () => {
+  it("publishes an independent platform-only tenant-erasure control plane", () => {
+    expect(document.components?.securitySchemes?.PlatformOperatorToken).toMatchObject({
+      type: "http",
+      scheme: "bearer",
+    });
+    const post = document.paths["/v1/tenant-erasure-requests"]?.post;
+    const status = document.paths["/v1/tenant-erasure-requests/{requestId}"]?.get;
+    expect(post?.security).toEqual([{ PlatformOperatorToken: [] }]);
+    expect(status?.security).toEqual([{ PlatformOperatorToken: [] }]);
+    expect(post?.["x-required-api-key-scopes"]).toBeUndefined();
+    expect(status?.["x-required-api-key-scopes"]).toBeUndefined();
+    expect(post?.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ in: "header", name: "idempotency-key", required: true }),
+    ]));
+    expect(status?.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ in: "query", name: "tenantId", required: true }),
+    ]));
+    for (const response of [
+      post?.responses?.["202"],
+      post?.responses?.default,
+      status?.responses?.["200"],
+      status?.responses?.default,
+    ] as Array<{ headers?: Record<string, unknown> } | undefined>) {
+      expect(response?.headers).toEqual(expect.objectContaining({
+        "Cache-Control": expect.any(Object),
+        "X-Content-Type-Options": expect.any(Object),
+      }));
+    }
+  });
+
+  it("matches all 52 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
-    const specKeys = specOperations().map(operationKey).sort();
+    // Tenant erasure is an edge-owned platform control plane. The router authenticates its
+    // independent bearer credential and rewrites onto a versioned runner-only route; direct
+    // runners intentionally do not register those two public paths.
+    const specKeys = specOperations()
+      .filter(({ path }) => !path.startsWith("/v1/tenant-erasure-requests"))
+      .map(operationKey)
+      .sort();
 
     expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(52);
     expect(registered).toHaveLength(53);
@@ -304,12 +353,24 @@ describe("committed OpenAPI contract", () => {
     expect(registeredKeys).toEqual(specKeys);
   });
 
-  it("keeps the versioned router-to-runner tombstone route out of the public OpenAPI/SDK", () => {
+  it("keeps every versioned router-to-runner control route out of the public OpenAPI/SDK", () => {
     const routes = (runnerApp() as unknown as { routes: RegisteredRoute[] }).routes
       .filter(({ method }) => HTTP_METHODS.has(method.toLowerCase()))
       .map(({ method, path }) => ({ method: method.toUpperCase(), path }));
 
     expect(routes).toContainEqual({ method: "POST", path: "/v1/_internal/session-tombstone/:id" });
+    expect(routes).toContainEqual({
+      method: "POST",
+      path: "/v1/_internal/tenant-erasure-control-v1",
+    });
+    expect(routes).toContainEqual({
+      method: "GET",
+      path: "/v1/_internal/tenant-erasure-control-v1/:requestId",
+    });
+    expect(routes).toContainEqual({
+      method: "POST",
+      path: "/v1/_internal/tenant-erasure-replay-v1",
+    });
     expect(Object.keys(document.paths).some((path) => path.startsWith("/v1/_internal/"))).toBe(false);
   });
 });

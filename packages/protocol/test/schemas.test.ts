@@ -27,6 +27,12 @@ import {
   emptyUsageAccumulator,
   mergeLimits,
   StartTurnRequest,
+  TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TenantErasureCreateRequest,
+  TenantErasureRequest,
+  TenantErasureRequestHeaders,
+  TenantErasureRequestParams,
+  TenantErasureRequestQuery,
   UserErasureDrainRequest,
   idSchema,
   PROTOCOL_VERSION,
@@ -134,6 +140,37 @@ describe("protocol schemas", () => {
     }).success).toBe(false);
   });
 
+  it("keeps the platform tenant-erasure envelope minimal and T2 status admission-only", () => {
+    const requestId = "erase_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b";
+    expect(TenantErasureCreateRequest.parse({ tenantId: "tenant-a" })).toEqual({
+      tenantId: "tenant-a",
+    });
+    expect(TenantErasureCreateRequest.safeParse({
+      tenantId: "tenant-a",
+      actor: "caller-controlled",
+    }).success).toBe(false);
+    const status = TenantErasureRequest.parse({
+      id: requestId,
+      scope: "tenant",
+      tenantId: "tenant-a",
+      generation: 1,
+      status: "gated",
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    });
+    expect(status.status).toBe("gated");
+    expect(TenantErasureRequest.safeParse({ ...status, status: "draining" }).success).toBe(false);
+    expect(TenantErasureRequest.safeParse({ ...status, requestedByKeyId: "secret" }).success).toBe(false);
+    expect(TenantErasureRequestParams.parse({ requestId })).toEqual({ requestId });
+    expect(TenantErasureRequestQuery.parse({ tenantId: "tenant-a" })).toEqual({
+      tenantId: "tenant-a",
+    });
+    expect(TenantErasureRequestHeaders.parse({
+      "idempotency-key": " tenant-operation-1 ",
+    })["idempotency-key"]).toBe("tenant-operation-1");
+    expect(TenantErasureRequestHeaders.safeParse({ "idempotency-key": " " }).success).toBe(false);
+  });
+
   it("keeps data export identity, state and ready artifact metadata strict", () => {
     const base = {
       id: "export_019a2b3c-4d5e-4f00-8a9b-0c1d2e3f4a5b",
@@ -195,6 +232,20 @@ describe("protocol schemas", () => {
     }
   });
 
+  it("declares platform-only security and private tenant-erasure responses", () => {
+    const post = OPENAPI_DOCUMENT.paths["/v1/tenant-erasure-requests"].post;
+    const get = OPENAPI_DOCUMENT.paths["/v1/tenant-erasure-requests/{requestId}"].get;
+    expect(post.security).toEqual([{ PlatformOperatorToken: [] }]);
+    expect(get.security).toEqual([{ PlatformOperatorToken: [] }]);
+    expect(post.parameters).toEqual(expect.arrayContaining([
+      expect.objectContaining({ in: "header", name: "idempotency-key", required: true }),
+    ]));
+    for (const response of [post.responses["202"], post.responses.default, get.responses["200"], get.responses.default]) {
+      expect(response.headers["Cache-Control"].schema.enum).toEqual(["no-store"]);
+      expect(response.headers["X-Content-Type-Options"].schema.enum).toEqual(["nosniff"]);
+    }
+  });
+
   it("declares private export status and binary download responses", () => {
     const post = OPENAPI_DOCUMENT.paths["/v1/data-export-requests"].post.responses;
     const get = OPENAPI_DOCUMENT.paths["/v1/data-export-requests/{requestId}"].get.responses;
@@ -239,6 +290,42 @@ describe("protocol schemas", () => {
     expect(parsed.features.dataPurgeExecution).toBe(false);
     expect(parsed.features.userDataExport).toEqual([]);
     expect(parsed.features.dataExportRequests).toBe(false);
+    expect(parsed.features.tenantErasureControl).toEqual([]);
+    expect(parsed.features.tenantErasureRequests).toBe(false);
+  });
+
+  it("accepts only the versioned tenant-erasure platform control capability", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    const enabled = Capabilities.parse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantErasureControl: [TENANT_ERASURE_PLATFORM_CONTROL_V1],
+        tenantErasureRequests: true,
+      },
+    });
+    expect(enabled.features.tenantErasureControl).toEqual([
+      TENANT_ERASURE_PLATFORM_CONTROL_V1,
+    ]);
+    expect(enabled.features.tenantErasureRequests).toBe(true);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: { ...base.features, tenantErasureControl: ["platform-control-v2"] },
+    }).success).toBe(false);
   });
 
   it("accepts only the additive NDJSON export capability", () => {
