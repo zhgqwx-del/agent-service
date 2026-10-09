@@ -6,6 +6,7 @@ import {
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "@agent-service/protocol";
@@ -309,6 +310,80 @@ describe("RunnerRegistry owner address mapping", () => {
     legacyState = "legacy";
     await (registry as unknown as { checkAll(): Promise<void> }).checkAll();
     expect(registry.allConfiguredSupportPurgePolicyEvaluation()).toBe(false);
+    await registry.close();
+  });
+
+  it("requires every configured runner to be freshly healthy, code-aware, and worker-active for credential revocation", async () => {
+    let legacyState: "down" | "legacy" | "code-only" | "active" = "down";
+    const capabilities = (aware: boolean, worker: boolean) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        tenantCredentialRevocation: aware
+          ? [TENANT_CREDENTIAL_REVOCATION_STORE_V1]
+          : [],
+        tenantCredentialRevocationWorker: worker,
+        dataPurgeExecution: false,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        return Response.json(capabilities(
+          legacyState === "code-only" || legacyState === "active",
+          legacyState === "active",
+        ));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(false);
+    expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
+
+    legacyState = "legacy";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(false);
+    expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
+
+    legacyState = "code-only";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(true);
+    expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
+
+    legacyState = "active";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(true);
+    expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(true);
+
+    // This observation is deliberately non-sticky: a fresh outage or downgrade closes it.
+    legacyState = "down";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(false);
+    expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
     await registry.close();
   });
 

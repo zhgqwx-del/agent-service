@@ -54,6 +54,7 @@ import {
   RetentionPolicyActivateRequest,
   RetentionPolicyParams,
   RetentionPolicyPutRequest,
+  TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TenantErasureCreateRequest,
   TenantErasureRequestHeaders,
@@ -112,6 +113,7 @@ import {
   type BlobStore,
   type SessionStore,
   type SubjectLifecycleStore,
+  type TenantCredentialRevocationStore,
   type UserDataExportRequestRecord,
   type UserDataExportRequestStore,
 } from "@agent-service/store";
@@ -153,6 +155,10 @@ export interface AppDeps {
   tenantErasureRequestsEnabled?: boolean;
   /** Fresh router proof that every configured runtime can enforce the tenant fence. */
   tenantErasureAdmissionGate?: { canAdmit: () => Promise<boolean> };
+  /** Local credential-revocation worker activation; the router barrier remains separately required. */
+  tenantCredentialRevocationWorkerEnabled?: boolean;
+  /** Narrow T3a store surface; its presence is the code-awareness signal advertised to routers. */
+  tenantCredentialRevocation?: TenantCredentialRevocationStore;
   ready: () => boolean;
   /** decrypts a tenant's stored auth secret (HS256 key / introspection credential) */
   decryptSecret: (secret: { ciphertext: Buffer; keyId: string }) => Promise<string>;
@@ -284,6 +290,12 @@ export function createApp(deps: AppDeps) {
         tenantErasureRequests: deps.tenantErasureRequestsEnabled === true
           && deps.subjectLifecycle !== undefined
           && deps.tenantErasureAdmissionGate !== undefined,
+        tenantCredentialRevocation: deps.tenantCredentialRevocation === undefined
+          ? []
+          : [TENANT_CREDENTIAL_REVOCATION_STORE_V1],
+        tenantCredentialRevocationWorker:
+          deps.tenantCredentialRevocation !== undefined
+          && deps.tenantCredentialRevocationWorkerEnabled === true,
         dynamicTools: true,
         mcp: [],
         skills: false,

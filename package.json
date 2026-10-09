@@ -22,6 +22,7 @@
     "test:usage-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/usage-lifecycle.mysql.test.ts",
     "test:subject-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/subject-lifecycle.mysql.test.ts",
     "test:tenant-credential-revocation-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-revocation.mysql.test.ts && node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-revocation-races.mysql.test.ts",
+    "test:tenant-credential-physical-revocation-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-physical-revocation.mysql.test.ts",
     "test:retention-policy-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/retention-policy.mysql.test.ts",
     "test:erasure-purge-policy-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/erasure-purge-policy.mysql.test.ts",
     "test:erasure-job-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/erasure-job.mysql.test.ts",

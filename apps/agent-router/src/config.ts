@@ -48,6 +48,10 @@ const Env = z.object({
   PURGE_POLICY_EVALUATOR_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Independent execution gate for local tenant credential-store revocation. */
+  TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** User-export admission; status/download remain capability-gated when this is off. */
   DATA_EXPORT_REQUESTS_ENABLED: z.enum(["0", "1"])
     .default("0")

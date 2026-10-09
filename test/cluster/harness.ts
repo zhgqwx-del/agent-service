@@ -131,6 +131,10 @@ export interface ClusterOptions {
   dataErasureRequestsEnabled?: boolean;
   /** Enables the independent platform tenant-admission gate on router and every runner. */
   tenantErasureRequestsEnabled?: boolean;
+  /** Activates the router's T3a execution barrier; independent from tenant admission. */
+  tenantCredentialRevocationExecutionEnabled?: boolean;
+  /** Runs the local-database credential revocation worker on every runner. */
+  tenantCredentialRevocationWorkerEnabled?: boolean;
   /** Runs the durable erasure worker without necessarily accepting new requests. */
   erasureWorkerEnabled?: boolean;
   /**
@@ -153,8 +157,12 @@ export interface ClusterOptions {
   dataErasureRequestsEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional mixed-rollout placement for the irreversible tenant-admission barrier. */
   tenantErasureRequestsEnabledForRunner?: (runnerNumber: number) => boolean;
+  /** Optional mixed-rollout placement for the T3a worker activation signal. */
+  tenantCredentialRevocationWorkerEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional mixed-rollout placement; a disabled configured target intentionally blocks v2 claims. */
   legacyTombstoneCompensationEnabledForRunner?: (runnerNumber: number) => boolean;
+  /** Extra stable targets configured only on the router, used to exercise mixed/failed rollout. */
+  additionalRunnerUrls?: string[];
 }
 
 /**
@@ -238,6 +246,10 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       opts.tenantErasureRequestsEnabledForRunner?.(runnerNumber)
         ?? opts.tenantErasureRequestsEnabled === true
     ) ? "1" : "0",
+    TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: (
+      opts.tenantCredentialRevocationWorkerEnabledForRunner?.(runnerNumber)
+        ?? opts.tenantCredentialRevocationWorkerEnabled === true
+    ) ? "1" : "0",
     TENANT_ERASURE_BARRIER_TIMEOUT_MS: "2000",
   });
 
@@ -271,13 +283,18 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     ROUTER_PORT: String(routerPort),
     SESSION_TOMBSTONE_ENABLED: "1",
     ROUTER_HOST: "127.0.0.1",
-    RUNNERS: runners.map((r) => r.url).join(","),
+    RUNNERS: [
+      ...runners.map((r) => r.url),
+      ...(opts.additionalRunnerUrls ?? []),
+    ].join(","),
     REDIS_URL,
     HEALTH_INTERVAL_MS: "300",
     UPSTREAM_HEADER_TIMEOUT_MS: erasureWorkerEnabled ? "1000" : "15000",
     INTERNAL_ROUTER_TOKEN,
     DATA_ERASURE_REQUESTS_ENABLED: opts.dataErasureRequestsEnabled ? "1" : "0",
     TENANT_ERASURE_REQUESTS_ENABLED: opts.tenantErasureRequestsEnabled ? "1" : "0",
+    TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED:
+      opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
     TENANT_ERASURE_OPERATOR_TOKEN,
     TENANT_ERASURE_OPERATOR_ID: "cluster-platform-operator",
   });

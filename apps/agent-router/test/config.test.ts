@@ -13,6 +13,7 @@ describe("router configuration", () => {
     expect(local.TENANT_ERASURE_OPERATOR_ID).toBe("platform-lifecycle-admin");
     expect(local.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(local.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
+    expect(local.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED).toBe(false);
     expect(local.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
     expect(local.dataExportArtifactsReadable).toBe(false);
     expect(local.BLOB_MAX_BYTES).toBe(1_000_000);
@@ -58,6 +59,14 @@ describe("router configuration", () => {
     expect(() => loadRouterConfig({
       RUNNERS: "http://runner:8787",
       PURGE_POLICY_EVALUATOR_ENABLED: "true",
+    })).toThrow();
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: "1",
+    }).TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED).toBe(true);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: "true",
     })).toThrow();
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",

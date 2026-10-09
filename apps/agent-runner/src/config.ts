@@ -66,6 +66,10 @@ const Env = z.object({
   TENANT_ERASURE_REQUESTS_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Local credential-store revocation worker; independent from later content-purge execution. */
+  TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** Bounded runner-to-router fleet check performed immediately before each tenant admission. */
   TENANT_ERASURE_BARRIER_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(2_000),
   /** Canonical policy/legal-hold admin surface. This never enables destructive purge. */
@@ -277,13 +281,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.LEGACY_TOMBSTONE_COMPENSATION_ENABLED
       || c.PURGE_POLICY_EVALUATOR_ENABLED
       || c.TENANT_ERASURE_REQUESTS_ENABLED
+      || c.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED
     )
     && erasureRouterUrl === undefined
   ) {
     throw new Error(
       "ERASURE_ROUTER_URL is required when ERASURE_WORKER_ENABLED=1 or "
         + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1, PURGE_POLICY_EVALUATOR_ENABLED=1, "
-        + "or TENANT_ERASURE_REQUESTS_ENABLED=1",
+        + "TENANT_ERASURE_REQUESTS_ENABLED=1, or "
+        + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1",
     );
   }
   if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.ERASURE_WORKER_ENABLED) {

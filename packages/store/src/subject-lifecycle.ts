@@ -1628,9 +1628,44 @@ export function validateTenantCredentialRevocationFence(
 }
 
 /**
- * Validate the complete, immutable proof returned by tenant-erasure admission/status reads.
- * Callers deliberately receive one fixed error: durable owner/control details must not escape
- * through an error message, and no partial proof may be treated as a valid credential fence.
+ * Validate the append-only T1 admission proof without consulting the mutable lifecycle
+ * projection. This proof may outlive the `deleting` state after a later phase has atomically
+ * advanced the tenant to `erased`; it never grants queued or destructive worker authority by
+ * itself.
+ */
+export function validateTenantErasureImmutableT1Proof(input: {
+  admission: ErasureRequestRecord;
+  fence: TenantCredentialRevocationFence | undefined;
+  firstAudit: ErasureAuditEvent | undefined;
+}): void {
+  try {
+    const { admission, fence, firstAudit } = input;
+    validateErasureRequestRecord(admission);
+    if (
+      !isDormantTenantErasureAdmission(admission)
+      || admission.controlGeneration !== 0
+      || admission.requestHash !== tenantErasureRequestHash(admission.tenantId)
+      || !fence
+    ) throw new Error("invalid tenant erasure admission binding");
+    validateTenantCredentialRevocationFence(fence);
+    if (
+      fence.tenantId !== admission.tenantId
+      || fence.requestId !== admission.requestId
+      || fence.subjectGeneration !== admission.generation
+      || fence.fencedAtMs !== admission.gatedAtMs
+      || !firstAudit
+    ) throw new Error("invalid tenant erasure fence binding");
+    validateErasureAuditChain(admission, [firstAudit]);
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+/**
+ * Validate the append-only T1 proof and its current `deleting` lifecycle projection. Callers
+ * deliberately receive one fixed error: durable owner/control details must not escape through an
+ * error message. Queue claims, retries and destructive work must use this stronger validator;
+ * only immutable terminal history may use `validateTenantErasureImmutableT1Proof` directly.
  */
 export function validateTenantErasureAdmissionProof(input: {
   admission: ErasureRequestRecord;
@@ -1640,12 +1675,9 @@ export function validateTenantErasureAdmissionProof(input: {
 }): void {
   try {
     const { admission, lifecycle, fence, firstAudit } = input;
-    validateErasureRequestRecord(admission);
+    validateTenantErasureImmutableT1Proof({ admission, fence, firstAudit });
     if (
-      !isDormantTenantErasureAdmission(admission)
-      || admission.controlGeneration !== 0
-      || admission.requestHash !== tenantErasureRequestHash(admission.tenantId)
-      || !lifecycle
+      !lifecycle
       || lifecycle.tenantId !== admission.tenantId
       || lifecycle.subjectKind !== "tenant"
       || lifecycle.subjectId !== admission.tenantId
@@ -1662,17 +1694,7 @@ export function validateTenantErasureAdmissionProof(input: {
         !Number.isSafeInteger(lifecycle.legalHoldAtMs)
         || lifecycle.legalHoldAtMs < 0
       ))
-      || !fence
-    ) throw new Error("invalid tenant erasure admission binding");
-    validateTenantCredentialRevocationFence(fence);
-    if (
-      fence.tenantId !== admission.tenantId
-      || fence.requestId !== admission.requestId
-      || fence.subjectGeneration !== admission.generation
-      || fence.fencedAtMs !== admission.gatedAtMs
-      || !firstAudit
-    ) throw new Error("invalid tenant erasure fence binding");
-    validateErasureAuditChain(admission, [firstAudit]);
+    ) throw new Error("invalid tenant erasure lifecycle binding");
   } catch {
     throw new TenantErasureIntegrityError();
   }

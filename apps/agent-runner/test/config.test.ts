@@ -23,6 +23,7 @@ describe("runner configuration", () => {
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED).toBe(false);
     expect(cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS).toBe(2_000);
     expect(cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
@@ -166,6 +167,26 @@ describe("runner configuration", () => {
     expect(() => loadConfig({
       SECRETS_MASTER_KEY: SECRET,
       TENANT_ERASURE_BARRIER_TIMEOUT_MS: "10001",
+    })).toThrow();
+  });
+
+  it("keeps tenant credential revocation behind an independent default-off worker gate", () => {
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: "1",
+    })).toThrow(/ERASURE_ROUTER_URL is required/);
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "https://router.internal:8443/",
+    });
+    expect(enabled.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED).toBe(true);
+    expect(enabled.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
+    expect(enabled.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
+    expect(enabled.ERASURE_ROUTER_URL).toBe("https://router.internal:8443");
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: "true",
     })).toThrow();
   });
 

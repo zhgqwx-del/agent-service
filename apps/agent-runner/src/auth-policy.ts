@@ -7,6 +7,21 @@ export function needsSecret(policy: TenantAuthPolicy): boolean {
   return policy.verifier.kind === "jwt" ? policy.verifier.hs256 : policy.verifier.useStoredSecret;
 }
 
+function credentialFreeUrl(value: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    // The configured URL can contain credentials even when it is syntactically malformed. Never
+    // reflect the original input into an API error or log-adjacent response.
+    throw new ApiError("invalid_request", "URL is not valid");
+  }
+  if (url.username || url.password) {
+    throw new ApiError("invalid_request", "URL must not contain credentials");
+  }
+  return url;
+}
+
 /**
  * The default URL guard for anything a tenant configures us to call.
  *
@@ -15,12 +30,7 @@ export function needsSecret(policy: TenantAuthPolicy): boolean {
  * token. Tests inject a permissive guard because their servers are local.
  */
 export async function assertPublicUrlDefault(url: string): Promise<void> {
-  let u: URL;
-  try {
-    u = new URL(url);
-  } catch {
-    throw new ApiError("invalid_request", `not a valid URL: ${url}`);
-  }
+  const u = credentialFreeUrl(url);
   if (u.protocol !== "https:") throw new ApiError("invalid_request", `must be https, got ${u.protocol}`);
   try {
     await assertPublicHost(u.hostname);
@@ -66,12 +76,14 @@ export async function validateAuthPolicy(
         : "hs256 needs a secret; send it as `secret` in this request");
     }
     if (v.jwksUri) {
+      credentialFreeUrl(v.jwksUri);
       await assertPublicUrl(v.jwksUri);
       if (!v.issuer || !v.audience) {
         throw new ApiError("invalid_request", "issuer and audience are required with jwksUri: without them any token from that key set is accepted, including tokens minted for another relying party");
       }
     }
   } else {
+    credentialFreeUrl(v.endpoint);
     await assertPublicUrl(v.endpoint);
     const reusable = hasStoredSecret && storedVerifierKind === "introspection";
     if (v.useStoredSecret && !secret && !reusable) {

@@ -10,6 +10,7 @@ import {
   SessionBlobService,
   SessionHost,
   StaticToolRegistry,
+  TenantCredentialRevocationWorker,
   UserDataExportCleanupWorker,
   UserDataExportWorker,
   builtinTools,
@@ -37,6 +38,7 @@ import {
   type LegacyTombstoneCompensationStore,
   type RetentionPolicyStore,
   type SubjectLifecycleStore,
+  type TenantCredentialRevocationStore,
   type SessionStore,
   type UsageLifecycleStore,
   type UserDataExportCleanupStore,
@@ -49,6 +51,7 @@ import { loadConfig } from "./config.js";
 import { RouterErasureSessionExecutor } from "./erasure-executor.js";
 import { RouterPurgePolicyEvaluationGate } from "./purge-policy-evaluation-gate.js";
 import { RouterTenantErasureAdmissionGate } from "./tenant-erasure-admission-gate.js";
+import { RouterTenantCredentialRevocationGate } from "./tenant-credential-revocation-gate.js";
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
@@ -57,6 +60,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & BlobManifestStore
     & BlobCleanupStore
     & SubjectLifecycleStore
+    & TenantCredentialRevocationStore
     & ErasureJobStore
     & ErasurePolicyEvaluationStore
     & ErasureSessionCatalogStore
@@ -249,11 +253,25 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       requestTimeoutMs: cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS,
     })
     : undefined;
+  const tenantCredentialRevocationGate = cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED
+    ? new RouterTenantCredentialRevocationGate({
+      routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+      internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+      requestTimeoutMs: cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS,
+    })
+    : undefined;
+  const tenantCredentialRevocationWorker = tenantCredentialRevocationGate
+    ? new TenantCredentialRevocationWorker({
+      store,
+      canExecute: () => tenantCredentialRevocationGate.canExecute(),
+    })
+    : undefined;
   legacyTombstoneCompensationWorker?.start();
   erasureWorker?.start();
   purgePolicyEvaluator?.start();
   dataExportWorker?.start();
   dataExportCleanup?.start();
+  tenantCredentialRevocationWorker?.start();
 
   let ready = true;
   const app = createApp({
@@ -277,6 +295,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     subjectLifecycle: store,
     tenantErasureRequestsEnabled: cfg.TENANT_ERASURE_REQUESTS_ENABLED,
     tenantErasureAdmissionGate,
+    tenantCredentialRevocation: store,
+    tenantCredentialRevocationWorkerEnabled:
+      cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
     ready: () => ready,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
@@ -303,6 +324,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         purgePolicyEvaluator?.stop(),
         dataExportWorker?.stop(),
         dataExportCleanup?.stop(),
+        tenantCredentialRevocationWorker?.stop(),
       ]);
       await host.drain(30_000);
       await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
@@ -336,11 +358,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,
     dataExportWorker, dataExportCleanup, tenantErasureAdmissionGate,
+    tenantCredentialRevocationGate, tenantCredentialRevocationWorker,
     blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };

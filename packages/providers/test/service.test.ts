@@ -313,9 +313,31 @@ describe("ProviderService", () => {
   it("rejects a BYOK baseUrl that is not a public http(s) endpoint (SSRF)", async () => {
     const svc = new ProviderService({ store: new MemorySessionStore(), cipher: new LocalAesGcmCipher(KEY) });
     const base = { id: "p", api: "openai-completions" as const, headers: {}, quota: {}, fallback: [], models: [{ id: "m", contextWindow: 10, maxOutputTokens: 1, input: ["text" as const], reasoning: false }], apiKey: "k" };
-    for (const baseUrl of ["http://127.0.0.1:8787/v1", "http://169.254.169.254/latest", "http://[::1]/v1", "file:///etc/passwd", "not-a-url"]) {
+    for (const baseUrl of [
+      "http://127.0.0.1:8787/v1",
+      "http://169.254.169.254/latest",
+      "http://[::1]/v1",
+      "https://user:secret@1.1.1.1/v1",
+      "https://user@1.1.1.1/v1",
+      "file:///etc/passwd",
+      "not-a-url",
+    ]) {
       await expect(svc.upsertTenantProvider("t", { ...base, baseUrl })).rejects.toMatchObject({ code: "invalid_request" });
     }
+    await expect(assertPublicBaseUrl("https://user:secret@1.1.1.1/v1"))
+      .rejects.toMatchObject({ code: "invalid_request", message: "baseUrl must not contain credentials" });
+    const injectedGuard = new ProviderService({
+      store: new MemorySessionStore(),
+      cipher: new LocalAesGcmCipher(KEY),
+      assertBaseUrl: async () => {},
+    });
+    await expect(injectedGuard.upsertTenantProvider("t", {
+      ...base,
+      baseUrl: "https://user:secret@example.com/v1",
+    })).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "baseUrl must not contain credentials",
+    });
     await expect(assertPublicBaseUrl("https://1.1.1.1/v1")).resolves.toBeUndefined();
   });
 });

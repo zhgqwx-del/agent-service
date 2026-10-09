@@ -1286,6 +1286,81 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
+    it("rolls back admission, lifecycle, audit, fence, job, and idempotency when the final job insert fails", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant_job_rollback_${randomUUID()}`;
+      const input = tenantRequestInput(tenantId, `job-rollback-${randomUUID()}`);
+      try {
+        await store.createApiKey(tenantId, "seed-key", keyDigest("job-rollback-seed"));
+        await conn.query(
+          `CREATE TRIGGER fail_tenant_credential_job_insert
+           BEFORE INSERT ON tenant_credential_revocation_jobs
+           FOR EACH ROW SIGNAL SQLSTATE '45000'
+           SET MESSAGE_TEXT='injected tenant credential job failure'`,
+        );
+
+        await expect(store.requestTenantErasure(input))
+          .rejects.toThrow("injected tenant credential job failure");
+
+        expect(await store.getTenantRuntimeState(tenantId)).toEqual({
+          tenantId,
+          state: "active",
+          generation: 0,
+        });
+        expect(await store.getTenantErasureRequest(tenantId, input.requestId)).toBeNull();
+        expect(await store.replayTenantErasure({
+          tenantId,
+          idempotencyKey: input.idempotencyKey,
+          requestHash: input.requestHash,
+        })).toBeNull();
+        expect(await store.getTenantCredentialRevocationFence(tenantId, input.requestId)).toBeNull();
+        expect(await store.getTenantCredentialRevocationJob(tenantId, input.requestId)).toBeNull();
+        expect(await store.listErasureAuditEvents(input.requestId)).toEqual([]);
+
+        const [counts] = await conn.query<(RowDataPacket & {
+          admissions: number;
+          idempotency_bindings: number;
+          audits: number;
+          fences: number;
+          jobs: number;
+        })[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE request_id=?) AS admissions,
+             (SELECT COUNT(*) FROM tenant_erasure_admissions
+               WHERE tenant_id=? AND idempotency_key=?) AS idempotency_bindings,
+             (SELECT COUNT(*) FROM erasure_audit_events WHERE request_id=?) AS audits,
+             (SELECT COUNT(*) FROM tenant_credential_revocation_fences WHERE request_id=?) AS fences,
+             (SELECT COUNT(*) FROM tenant_credential_revocation_jobs WHERE request_id=?) AS jobs`,
+          [
+            input.requestId,
+            tenantId,
+            input.idempotencyKey,
+            input.requestId,
+            input.requestId,
+            input.requestId,
+          ],
+        );
+        expect({
+          admissions: Number(counts[0]?.admissions),
+          idempotencyBindings: Number(counts[0]?.idempotency_bindings),
+          audits: Number(counts[0]?.audits),
+          fences: Number(counts[0]?.fences),
+          jobs: Number(counts[0]?.jobs),
+        }).toEqual({
+          admissions: 0,
+          idempotencyBindings: 0,
+          audits: 0,
+          fences: 0,
+          jobs: 0,
+        });
+      } finally {
+        await conn.query("DROP TRIGGER IF EXISTS fail_tenant_credential_job_insert").catch(() => {});
+        await conn.end();
+        await store.close();
+      }
+    });
+
     it("serializes concurrent tenant requests into one generation, request, audit, and fence", async () => {
       const firstStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
       const secondStore = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });

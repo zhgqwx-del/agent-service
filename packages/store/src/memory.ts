@@ -164,6 +164,7 @@ import {
   validateRequestUserErasureInput,
   validateRequestTenantErasureInput,
   validateTenantErasureAdmissionProof,
+  validateTenantErasureImmutableT1Proof,
   validateTenantCredentialRevocationFence,
   validateRenewErasureJobClaimOptions,
   validateRetryErasureJobOptions,
@@ -389,6 +390,37 @@ import {
   type UserDataExportSnapshotRecordPage,
   type UserDataExportSnapshotSummary,
 } from "./data-export.js";
+import {
+  TENANT_CREDENTIAL_REVOCATION_EXTERNAL_DISPOSITION,
+  TENANT_CREDENTIAL_REVOCATION_RECEIPT_SCOPE,
+  TENANT_CREDENTIAL_REVOCATION_RUNTIME_DISPOSITION,
+  tenantCredentialRevocationAuthorizationMatches,
+  tenantCredentialRevocationClaimFromJob,
+  tenantCredentialRevocationClaimTokenSha256,
+  tenantCredentialRevocationCompletionMatchesAuthorization,
+  tenantCredentialRevocationCutoverEvidenceSha256,
+  tenantCredentialRevocationReceiptMatchesAuthorization,
+  tenantCredentialRevocationReceiptSha256,
+  validateClaimTenantCredentialRevocationsOptions,
+  validateMaterializeTenantCredentialRevocationJobsOptions,
+  validateRenewTenantCredentialRevocationOptions,
+  validateRetryTenantCredentialRevocationOptions,
+  validateTenantCredentialRevocationAuthorization,
+  validateTenantCredentialRevocationCompletionProof,
+  validateTenantCredentialRevocationCutoverRecord,
+  validateTenantCredentialRevocationJobRecord,
+  validateTenantCredentialRevocationReceipt,
+  type ClaimTenantCredentialRevocationsOptions,
+  type MaterializeTenantCredentialRevocationJobsOptions,
+  type RenewTenantCredentialRevocationOptions,
+  type RetryTenantCredentialRevocationOptions,
+  type TenantCredentialRevocationAuthorization,
+  type TenantCredentialRevocationClaim,
+  type TenantCredentialRevocationCutoverRecord,
+  type TenantCredentialRevocationJobRecord,
+  type TenantCredentialRevocationReceipt,
+  type TenantCredentialRevocationStore,
+} from "./tenant-credential-revocation.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -405,6 +437,11 @@ interface MemoryUserDataExportJob {
   createdAtMs: number;
   updatedAtMs: number;
 }
+
+/** A physically revoked tenant retains registry identity but has no auth policy or secret. */
+type MemoryTenantRecord = Omit<TenantRecord, "authPolicy"> & {
+  authPolicy?: TenantRecord["authPolicy"];
+};
 
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -571,7 +608,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -587,7 +624,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   blobManifests = new Map<string, BlobManifest>();
   blobDeleteOutbox = new Map<string, BlobDeleteOutboxRecord>();
   private nextBlobDeleteOutboxId = 1;
-  tenants = new Map<string, TenantRecord>();
+  tenants = new Map<string, MemoryTenantRecord>();
   billingUsageFacts = new Map<string, BillingUsageFact>();
   usageReconciliations = new Map<string, UsageReconciliationRecord>();
   subjectLifecycles = new Map<string, SubjectLifecycleRecord>();
@@ -595,6 +632,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantErasureAdmissions = new Map<string, ErasureRequestRecord>();
   erasureAuditEvents = new Map<string, ErasureAuditEvent[]>();
   tenantCredentialRevocationFences = new Map<string, TenantCredentialRevocationFence>();
+  tenantCredentialRevocationJobs = new Map<string, TenantCredentialRevocationJobRecord>();
+  tenantCredentialRevocationReceipts = new Map<string, TenantCredentialRevocationReceipt>();
+  tenantCredentialRevocationCutovers = new Map<1, TenantCredentialRevocationCutoverRecord>([[
+    1,
+    { singletonId: 1, controlGeneration: 0 },
+  ]]);
   erasureJobControlEvents = new Map<string, ErasureJobControlEvent[]>();
   private nextErasureJobControlEventId = 1;
   erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
@@ -636,7 +679,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private userDataExportIdempotency = new Map<string, string>();
   private nextUserDataExportDeleteOutboxId = 1;
 
-  constructor(private readonly dataExportClock: { now(): number } = { now: () => Date.now() }) {}
+  constructor(private readonly storeClock: { now(): number } = { now: () => Date.now() }) {}
+
+  private storeNowMs(): number {
+    const nowMs = this.storeClock.now();
+    if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+      throw new Error("memory store clock must return a non-negative safe integer");
+    }
+    return nowMs;
+  }
 
   private initialRetentionPolicyControl(tenantId: string): RetentionPolicyControlRecord {
     const control: RetentionPolicyControlRecord = {
@@ -4116,6 +4167,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const existingTenant = this.subjectLifecycles.get(tenantKey);
     const existingAdmission = this.tenantErasureAdmission(stagedInput.tenantId);
     const existingFence = this.tenantCredentialRevocationFences.get(stagedInput.tenantId);
+    const existingCredentialJob = [...this.tenantCredentialRevocationJobs.values()].find(
+      (job) => job.tenantId === stagedInput.tenantId,
+    );
+    const existingCredentialReceipt = [...this.tenantCredentialRevocationReceipts.values()].find(
+      (receipt) => receipt.tenantId === stagedInput.tenantId,
+    );
     const idempotencyKey = this.tenantErasureIdempotencyKey(stagedInput);
     const replayId = this.erasureIdempotency.get(idempotencyKey);
     if (replayId) {
@@ -4142,7 +4199,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       this.assertTenantErasureAdmissionProof(active, existingTenant, existingFence);
       return clone(active);
     }
-    if (existingAdmission || existingFence) {
+    if (existingAdmission || existingFence || existingCredentialJob || existingCredentialReceipt) {
       throw new TenantErasureIntegrityError();
     }
     // Only the canonical tenant registry proves that a target exists. Sessions, policies and
@@ -4153,6 +4210,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (
       this.erasureRequests.has(stagedInput.requestId)
       || this.tenantErasureAdmissions.has(stagedInput.requestId)
+      || this.tenantCredentialRevocationJobs.has(stagedInput.requestId)
+      || this.tenantCredentialRevocationReceipts.has(stagedInput.requestId)
     ) {
       throw new Error("erasure request id already exists");
     }
@@ -4222,9 +4281,22 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       ...fenceBase,
       evidenceSha256: tenantCredentialRevocationFenceSha256(fenceBase),
     });
+    const jobNowMs = this.storeNowMs();
+    const stagedCredentialJob = clone<TenantCredentialRevocationJobRecord>({
+      requestId: stagedInput.requestId,
+      tenantId: stagedInput.tenantId,
+      subjectGeneration: generation,
+      t1FenceSha256: stagedFence.evidenceSha256,
+      phase: "queued",
+      availableAtMs: jobNowMs,
+      attempts: 0,
+      createdAtMs: jobNowMs,
+      updatedAtMs: jobNowMs,
+    });
     validateErasureRequestRecord(stagedRequest);
     validateErasureAuditChain(stagedRequest, [stagedAudit]);
     validateTenantCredentialRevocationFence(stagedFence);
+    validateTenantCredentialRevocationJobRecord(stagedCredentialJob);
 
     const tenantExisted = this.subjectLifecycles.has(tenantKey);
     const priorTenant = this.subjectLifecycles.get(tenantKey);
@@ -4236,16 +4308,25 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const priorFence = this.tenantCredentialRevocationFences.get(stagedInput.tenantId);
     const idempotencyExisted = this.erasureIdempotency.has(idempotencyKey);
     const priorIdempotency = this.erasureIdempotency.get(idempotencyKey);
+    const jobExisted = this.tenantCredentialRevocationJobs.has(stagedInput.requestId);
+    const priorJob = this.tenantCredentialRevocationJobs.get(stagedInput.requestId);
     try {
       this.tenantErasureAdmissions.set(stagedInput.requestId, stagedRequest);
       this.erasureAuditEvents.set(stagedInput.requestId, [stagedAudit]);
       this.tenantCredentialRevocationFences.set(stagedInput.tenantId, stagedFence);
       this.erasureIdempotency.set(idempotencyKey, stagedInput.requestId);
+      this.tenantCredentialRevocationJobs.set(stagedInput.requestId, stagedCredentialJob);
       // Publish the lifecycle gate last. All staged values above were cloned and validated first;
       // synchronous rollback below preserves the same all-or-nothing contract as InnoDB.
       this.subjectLifecycles.set(tenantKey, stagedTenant);
     } catch (error) {
       restoreMapEntry(this.subjectLifecycles, tenantKey, tenantExisted, priorTenant);
+      restoreMapEntry(
+        this.tenantCredentialRevocationJobs,
+        stagedInput.requestId,
+        jobExisted,
+        priorJob,
+      );
       restoreMapEntry(
         this.erasureIdempotency,
         idempotencyKey,
@@ -4302,6 +4383,509 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!fence || fence.requestId !== requestId) return null;
     validateTenantCredentialRevocationFence(fence);
     return clone(fence);
+  }
+
+  private assertTenantCredentialRevocationSource(
+    job: TenantCredentialRevocationJobRecord,
+  ): void {
+    try {
+      validateTenantCredentialRevocationJobRecord(job);
+      const admission = this.tenantErasureAdmissions.get(job.requestId);
+      const lifecycle = this.subjectRecord(job.tenantId, "tenant", job.tenantId);
+      const fence = this.tenantCredentialRevocationFences.get(job.tenantId);
+      if (
+        !admission
+        || admission.tenantId !== job.tenantId
+        || admission.generation !== job.subjectGeneration
+        || !fence
+        || fence.requestId !== job.requestId
+        || fence.subjectGeneration !== job.subjectGeneration
+        || fence.evidenceSha256 !== job.t1FenceSha256
+      ) throw new Error("tenant credential revocation source binding is invalid");
+      const firstAudit = this.erasureAuditEvents.get(admission.requestId)?.[0];
+      if (job.phase === "credential_store_revoked") {
+        validateTenantErasureImmutableT1Proof({ admission, fence, firstAudit });
+      } else {
+        validateTenantErasureAdmissionProof({ admission, lifecycle, fence, firstAudit });
+      }
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private readTenantCredentialRevocationCutover(
+    requireCommittedFirstReceipt: boolean,
+  ): TenantCredentialRevocationCutoverRecord {
+    const cutover = this.tenantCredentialRevocationCutovers.get(1);
+    if (!cutover || this.tenantCredentialRevocationCutovers.size !== 1) {
+      throw new TenantErasureIntegrityError();
+    }
+    try {
+      validateTenantCredentialRevocationCutoverRecord(cutover);
+      if (cutover.controlGeneration === 0) {
+        if (
+          this.tenantCredentialRevocationReceipts.size !== 0
+          || [...this.tenantCredentialRevocationJobs.values()].some(
+            (job) => job.phase === "credential_store_revoked",
+          )
+        ) {
+          throw new Error("inactive cutover has physical revocation completion evidence");
+        }
+      } else if (requireCommittedFirstReceipt) {
+        const firstMatches = [...this.tenantCredentialRevocationReceipts.entries()].filter(
+          ([, receipt]) => receipt.receiptSha256 === cutover.firstReceiptSha256,
+        );
+        if (firstMatches.length !== 1) {
+          throw new Error("active cutover does not have exactly one first receipt");
+        }
+        const [firstRequestId, first] = firstMatches[0]!;
+        validateTenantCredentialRevocationReceipt(first);
+        if (firstRequestId !== first.requestId) {
+          throw new Error("cutover first receipt storage identity is invalid");
+        }
+        if (first.storeDbTimestampMs !== cutover.activatedAtMs) {
+          throw new Error("cutover timestamp does not match its first receipt");
+        }
+        const firstJob = this.tenantCredentialRevocationJobs.get(first.requestId);
+        if (!firstJob) throw new Error("active cutover has no first terminal job");
+        this.assertTenantCredentialRevocationSource(firstJob);
+        validateTenantCredentialRevocationCompletionProof(firstJob, first);
+      }
+      return cutover;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async materializeTenantCredentialRevocationJobs(
+    options: MaterializeTenantCredentialRevocationJobsOptions,
+  ): Promise<number> {
+    const stagedOptions = clone(options);
+    validateMaterializeTenantCredentialRevocationJobsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const candidates = [...this.tenantErasureAdmissions.values()]
+      .filter((admission) => !this.tenantCredentialRevocationJobs.has(admission.requestId))
+      .sort((left, right) => left.requestId.localeCompare(right.requestId))
+      .slice(0, stagedOptions.limit);
+    const staged: TenantCredentialRevocationJobRecord[] = [];
+    for (const admission of candidates) {
+      const fence = this.tenantCredentialRevocationFences.get(admission.tenantId);
+      try {
+        this.assertTenantErasureAdmissionProof(
+          admission,
+          this.subjectRecord(admission.tenantId, "tenant", admission.tenantId),
+          fence,
+        );
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (
+        !fence
+        || this.tenantCredentialRevocationReceipts.has(admission.requestId)
+        || [...this.tenantCredentialRevocationJobs.values()].some(
+          (job) => job.tenantId === admission.tenantId,
+        )
+        || [...this.tenantCredentialRevocationReceipts.values()].some(
+          (receipt) => receipt.tenantId === admission.tenantId,
+        )
+      ) throw new TenantErasureIntegrityError();
+      const job = clone<TenantCredentialRevocationJobRecord>({
+        requestId: admission.requestId,
+        tenantId: admission.tenantId,
+        subjectGeneration: admission.generation,
+        t1FenceSha256: fence.evidenceSha256,
+        phase: "queued",
+        availableAtMs: nowMs,
+        attempts: 0,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      });
+      validateTenantCredentialRevocationJobRecord(job);
+      staged.push(job);
+    }
+
+    const prior = new Map(this.tenantCredentialRevocationJobs);
+    try {
+      for (const job of staged) {
+        this.tenantCredentialRevocationJobs.set(job.requestId, job);
+      }
+    } catch (error) {
+      restoreMapSnapshot(this.tenantCredentialRevocationJobs, prior);
+      throw error;
+    }
+    return staged.length;
+  }
+
+  async claimTenantCredentialRevocations(
+    options: ClaimTenantCredentialRevocationsOptions,
+  ): Promise<TenantCredentialRevocationClaim[]> {
+    const stagedOptions = clone(options);
+    validateClaimTenantCredentialRevocationsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = nowMs + stagedOptions.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) {
+      throw new Error("tenant credential revocation lease deadline is invalid");
+    }
+    const candidates = [...this.tenantCredentialRevocationJobs.values()]
+      .filter((job): job is Extract<
+        TenantCredentialRevocationJobRecord,
+        { phase: "queued" }
+      > => (
+        job.phase === "queued"
+        && job.availableAtMs <= nowMs
+        && (job.claimToken === undefined || job.leaseUntilMs! <= nowMs)
+      ))
+      .sort((left, right) => (
+        left.availableAtMs - right.availableAtMs
+        || left.requestId.localeCompare(right.requestId)
+      ))
+      .slice(0, stagedOptions.limit);
+    const staged: TenantCredentialRevocationJobRecord[] = [];
+    for (const current of candidates) {
+      this.assertTenantCredentialRevocationSource(current);
+      const claimAttempt = current.attempts + 1;
+      if (!Number.isSafeInteger(claimAttempt) || claimAttempt > 0xffff_ffff) {
+        throw new TenantErasureIntegrityError();
+      }
+      const next = clone<TenantCredentialRevocationJobRecord>({
+        ...current,
+        attempts: claimAttempt,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+        lastErrorCode: undefined,
+        updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      });
+      validateTenantCredentialRevocationJobRecord(next);
+      staged.push(next);
+    }
+
+    const prior = new Map(this.tenantCredentialRevocationJobs);
+    try {
+      for (const job of staged) this.tenantCredentialRevocationJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantCredentialRevocationJobs, prior);
+      throw error;
+    }
+    return staged.map((job) => clone(tenantCredentialRevocationClaimFromJob(job)));
+  }
+
+  async renewTenantCredentialRevocation(
+    authorization: TenantCredentialRevocationAuthorization,
+    options: RenewTenantCredentialRevocationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantCredentialRevocationAuthorization(stagedAuthorization);
+    validateRenewTenantCredentialRevocationOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = nowMs + stagedOptions.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) {
+      throw new Error("tenant credential revocation renewed lease deadline is invalid");
+    }
+    const current = this.tenantCredentialRevocationJobs.get(stagedAuthorization.requestId);
+    if (
+      !current
+      || !tenantCredentialRevocationAuthorizationMatches(current, stagedAuthorization, nowMs)
+    ) return false;
+    if (current.phase !== "queued") return false;
+    this.assertTenantCredentialRevocationSource(current);
+    const next = clone<TenantCredentialRevocationJobRecord>({
+      ...current,
+      leaseUntilMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantCredentialRevocationJobRecord(next);
+    try {
+      this.tenantCredentialRevocationJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantCredentialRevocationJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async retryTenantCredentialRevocation(
+    authorization: TenantCredentialRevocationAuthorization,
+    options: RetryTenantCredentialRevocationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantCredentialRevocationAuthorization(stagedAuthorization);
+    validateRetryTenantCredentialRevocationOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const availableAtMs = nowMs + stagedOptions.delayMs;
+    if (!Number.isSafeInteger(availableAtMs)) {
+      throw new Error("tenant credential revocation retry deadline is invalid");
+    }
+    const current = this.tenantCredentialRevocationJobs.get(stagedAuthorization.requestId);
+    if (
+      !current
+      || !tenantCredentialRevocationAuthorizationMatches(current, stagedAuthorization, nowMs)
+    ) return false;
+    if (current.phase !== "queued") return false;
+    this.assertTenantCredentialRevocationSource(current);
+    const next = clone<TenantCredentialRevocationJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      phase: "queued",
+      availableAtMs,
+      attempts: current.attempts,
+      lastErrorCode: stagedOptions.errorCode,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantCredentialRevocationJobRecord(next);
+    try {
+      this.tenantCredentialRevocationJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantCredentialRevocationJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async blockTenantCredentialRevocation(
+    authorization: TenantCredentialRevocationAuthorization,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantCredentialRevocationAuthorization(stagedAuthorization);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantCredentialRevocationJobs.get(stagedAuthorization.requestId);
+    if (
+      !current
+      || !tenantCredentialRevocationAuthorizationMatches(current, stagedAuthorization, nowMs)
+    ) return false;
+    if (current.phase !== "queued") return false;
+    this.assertTenantCredentialRevocationSource(current);
+    const next = clone<TenantCredentialRevocationJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      phase: "blocked",
+      attempts: current.attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      blockedAtMs: nowMs,
+      blockedReasonCode: "integrity_conflict",
+    });
+    validateTenantCredentialRevocationJobRecord(next);
+    try {
+      this.tenantCredentialRevocationJobs.set(current.requestId, next);
+    } catch (error) {
+      restoreMapEntry(this.tenantCredentialRevocationJobs, current.requestId, true, current);
+      throw error;
+    }
+    return true;
+  }
+
+  async revokeTenantCredentialMaterial(
+    authorization: TenantCredentialRevocationAuthorization,
+  ): Promise<TenantCredentialRevocationReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantCredentialRevocationAuthorization(stagedAuthorization);
+    const current = this.tenantCredentialRevocationJobs.get(stagedAuthorization.requestId);
+    if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    validateTenantCredentialRevocationJobRecord(current);
+
+    if (current.phase === "credential_store_revoked") {
+      this.assertTenantCredentialRevocationSource(current);
+      const receipt = this.tenantCredentialRevocationReceipts.get(current.requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantCredentialRevocationCompletionProof(current, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      return tenantCredentialRevocationCompletionMatchesAuthorization(current, stagedAuthorization)
+        && tenantCredentialRevocationReceiptMatchesAuthorization(receipt, stagedAuthorization)
+        ? clone(receipt)
+        : null;
+    }
+    if (current.phase === "blocked") {
+      this.assertTenantCredentialRevocationSource(current);
+      return null;
+    }
+
+    const nowMs = this.storeNowMs();
+    if (!tenantCredentialRevocationAuthorizationMatches(current, stagedAuthorization, nowMs)) {
+      return null;
+    }
+    this.assertTenantCredentialRevocationSource(current);
+    if (
+      this.tenantCredentialRevocationReceipts.has(current.requestId)
+      || [...this.tenantCredentialRevocationReceipts.values()].some(
+        (receipt) => receipt.tenantId === current.tenantId,
+      )
+    ) {
+      throw new TenantErasureIntegrityError();
+    }
+    const tenant = this.tenants.get(current.tenantId);
+    if (!tenant || tenant.tenantId !== current.tenantId) throw new TenantErasureIntegrityError();
+    const cutover = this.readTenantCredentialRevocationCutover(true);
+
+    // Clone every credential-bearing target before the first destructive mutation. Besides giving
+    // MemoryStore transaction-like rollback, this makes serialization failure an all-or-nothing
+    // failure and prevents an uncloneable provider/auth value from becoming partial proof.
+    const stagedTenantBefore = clone(tenant);
+    const apiKeyTargets = [...this.apiKeys.entries()]
+      .filter(([, value]) => value.tenantId === current.tenantId)
+      .map(([key, value]) => [key, clone(value)] as const);
+    const providerTargets = [...this.providers.entries()]
+      .filter(([key, value]) => {
+        let keyTenant: unknown;
+        try {
+          const parsed = JSON.parse(key) as unknown;
+          keyTenant = Array.isArray(parsed) ? parsed[0] : undefined;
+        } catch {
+          keyTenant = undefined;
+        }
+        return value.config.tenantId === current.tenantId || keyTenant === current.tenantId;
+      })
+      .map(([key, value]) => {
+        if (key !== providerConfigKey(value.config.tenantId, value.config.id)
+          || value.config.tenantId !== current.tenantId) {
+          throw new TenantErasureIntegrityError();
+        }
+        return [key, clone(value)] as const;
+      });
+    const stagedTenantAfter = clone<MemoryTenantRecord>({
+      tenantId: stagedTenantBefore.tenantId,
+      ...(stagedTenantBefore.name === undefined ? {} : { name: stagedTenantBefore.name }),
+      createdAtMs: stagedTenantBefore.createdAtMs,
+    });
+    const receiptBody = {
+      scope: TENANT_CREDENTIAL_REVOCATION_RECEIPT_SCOPE,
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      apiKeyCountBefore: apiKeyTargets.length,
+      apiKeyCountAfter: 0 as const,
+      providerConfigCountBefore: providerTargets.length,
+      providerConfigCountAfter: 0 as const,
+      authPolicyPresentBefore: stagedTenantBefore.authPolicy !== undefined,
+      authPolicyPresentAfter: false as const,
+      authSecretCipherPresentBefore: stagedTenantBefore.authSecret?.ciphertext !== undefined,
+      authSecretCipherPresentAfter: false as const,
+      authSecretKeyIdPresentBefore: stagedTenantBefore.authSecret?.keyId !== undefined,
+      authSecretKeyIdPresentAfter: false as const,
+      storeDbTimestampMs: nowMs,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: tenantCredentialRevocationClaimTokenSha256(
+        stagedAuthorization.claimToken,
+      ),
+      runtimeDisposition: TENANT_CREDENTIAL_REVOCATION_RUNTIME_DISPOSITION,
+      externalDisposition: TENANT_CREDENTIAL_REVOCATION_EXTERNAL_DISPOSITION,
+      contentPurgeRequired: true as const,
+    };
+    const stagedReceipt = clone<TenantCredentialRevocationReceipt>({
+      ...receiptBody,
+      receiptSha256: tenantCredentialRevocationReceiptSha256(receiptBody),
+    });
+    const stagedJob = clone<TenantCredentialRevocationJobRecord>({
+      requestId: current.requestId,
+      tenantId: current.tenantId,
+      subjectGeneration: current.subjectGeneration,
+      t1FenceSha256: current.t1FenceSha256,
+      phase: "credential_store_revoked",
+      attempts: current.attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      credentialStoreRevokedAtMs: nowMs,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: stagedReceipt.completedClaimTokenSha256,
+    });
+    const stagedCutover = cutover.controlGeneration === 0
+      ? clone<TenantCredentialRevocationCutoverRecord>({
+          singletonId: 1,
+          controlGeneration: 1,
+          activatedAtMs: nowMs,
+          firstReceiptSha256: stagedReceipt.receiptSha256,
+          evidenceSha256: tenantCredentialRevocationCutoverEvidenceSha256({
+            singletonId: 1,
+            controlGeneration: 1,
+            activatedAtMs: nowMs,
+            firstReceiptSha256: stagedReceipt.receiptSha256,
+          }),
+        })
+      : clone(cutover);
+    validateTenantCredentialRevocationReceipt(stagedReceipt);
+    validateTenantCredentialRevocationJobRecord(stagedJob);
+    validateTenantCredentialRevocationCompletionProof(stagedJob, stagedReceipt);
+    validateTenantCredentialRevocationCutoverRecord(stagedCutover);
+
+    const apiKeysBefore = new Map(this.apiKeys);
+    const providersBefore = new Map(this.providers);
+    const tenantsBefore = new Map(this.tenants);
+    const jobsBefore = new Map(this.tenantCredentialRevocationJobs);
+    const receiptsBefore = new Map(this.tenantCredentialRevocationReceipts);
+    const cutoversBefore = new Map(this.tenantCredentialRevocationCutovers);
+    try {
+      for (const [key] of apiKeyTargets) this.apiKeys.delete(key);
+      for (const [key] of providerTargets) this.providers.delete(key);
+      this.tenants.set(current.tenantId, stagedTenantAfter);
+      if (
+        [...this.apiKeys.values()].some((value) => value.tenantId === current.tenantId)
+        || [...this.providers.values()].some((value) => value.config.tenantId === current.tenantId)
+      ) throw new TenantErasureIntegrityError();
+      this.tenantCredentialRevocationReceipts.set(current.requestId, stagedReceipt);
+      if (cutover.controlGeneration === 0) {
+        this.tenantCredentialRevocationCutovers.set(1, stagedCutover);
+      }
+      this.tenantCredentialRevocationJobs.set(current.requestId, stagedJob);
+    } catch (error) {
+      restoreMapSnapshot(this.apiKeys, apiKeysBefore);
+      restoreMapSnapshot(this.providers, providersBefore);
+      restoreMapSnapshot(this.tenants, tenantsBefore);
+      restoreMapSnapshot(this.tenantCredentialRevocationJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantCredentialRevocationReceipts, receiptsBefore);
+      restoreMapSnapshot(this.tenantCredentialRevocationCutovers, cutoversBefore);
+      throw error;
+    }
+    return clone(stagedReceipt);
+  }
+
+  async getTenantCredentialRevocationJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialRevocationJobRecord | null> {
+    const job = this.tenantCredentialRevocationJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    this.assertTenantCredentialRevocationSource(job);
+    if (job.phase === "credential_store_revoked") {
+      const receipt = this.tenantCredentialRevocationReceipts.get(requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantCredentialRevocationCompletionProof(job, receipt);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    return clone(job);
+  }
+
+  async getTenantCredentialRevocationReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialRevocationReceipt | null> {
+    const receipt = this.tenantCredentialRevocationReceipts.get(requestId);
+    if (!receipt || receipt.tenantId !== tenantId) return null;
+    const job = this.tenantCredentialRevocationJobs.get(requestId);
+    if (!job) throw new TenantErasureIntegrityError();
+    this.assertTenantCredentialRevocationSource(job);
+    try {
+      validateTenantCredentialRevocationCompletionProof(job, receipt);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return clone(receipt);
+  }
+
+  async getTenantCredentialRevocationCutover(): Promise<TenantCredentialRevocationCutoverRecord> {
+    return clone(this.readTenantCredentialRevocationCutover(true));
   }
 
   async getSubjectLifecycle(
@@ -6328,7 +6912,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async getTenant(tenantId: string) {
     if (!this.isTenantActive(tenantId)) return null;
     const t = this.tenants.get(tenantId);
-    return t ? { ...clone({ ...t, authSecret: undefined }), authSecret: t.authSecret } : null;
+    if (!t) return null;
+    if (t.authPolicy === undefined) throw new Error("active tenant auth policy is missing");
+    const record: TenantRecord = {
+      tenantId: t.tenantId,
+      ...(t.name === undefined ? {} : { name: t.name }),
+      authPolicy: clone(t.authPolicy),
+      ...(t.authSecret === undefined ? {} : { authSecret: t.authSecret }),
+      createdAtMs: t.createdAtMs,
+    };
+    return record;
   }
   async setTenantAuth(tenantId: string, policy: TenantAuthPolicy, secret?: { ciphertext: Buffer; keyId: string } | null) {
     const stagedPolicy = clone(policy);
@@ -6939,7 +7532,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   // ---------- user data export ----------
   private userDataExportNow(): number {
-    const now = this.dataExportClock.now();
+    const now = this.storeNowMs();
     if (!Number.isSafeInteger(now) || now < 0) throw new Error("invalid data export clock");
     return now;
   }

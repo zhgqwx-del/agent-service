@@ -20,6 +20,9 @@ import {
   INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
   INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH,
+  INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
+  INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE,
+  INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH,
   INTERNAL_TENANT_ERASURE_ACTOR_HEADER,
   INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
   INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
@@ -34,6 +37,7 @@ import {
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
@@ -76,6 +80,8 @@ export interface RouterAppDeps {
   dataGovernanceManagementEnabled?: () => boolean;
   /** Independent activation gate for non-destructive policy evaluation queue claims. */
   purgePolicyEvaluatorEnabled?: () => boolean;
+  /** Independent activation gate for tenant credential-store revocation queue claims. */
+  tenantCredentialRevocationExecutionEnabled?: () => boolean;
   /** Read/download surface for the configured artifact backend. Filesystem stays local-only. */
   dataExportArtifactsEnabled?: () => boolean;
   /** Additive fleet admission gate; status/download remain available while it is closed. */
@@ -122,6 +128,7 @@ const STRIP_RESPONSE = new Set([
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
+  INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_ROUTE_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_REPLAY_ACK_HEADER,
@@ -248,6 +255,11 @@ export function createRouterApp(deps: RouterAppDeps) {
     !!deps.internalRunnerToken
     && (deps.purgePolicyEvaluatorEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportPurgePolicyEvaluation()
+  );
+  const tenantCredentialRevocationExecutionAvailable = () => (
+    !!deps.internalRunnerToken
+    && (deps.tenantCredentialRevocationExecutionEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportTenantCredentialRevocationWorker()
   );
   const userDataExportReadable = () => (
     (deps.dataExportArtifactsEnabled?.() ?? false)
@@ -463,6 +475,12 @@ export function createRouterApp(deps: RouterAppDeps) {
                   ? [TENANT_ERASURE_PLATFORM_CONTROL_V1]
                   : [],
                 tenantErasureRequests: tenantErasureAdmissionAvailable(),
+                tenantCredentialRevocation:
+                  deps.registry.allConfiguredSupportTenantCredentialRevocation()
+                    ? [TENANT_CREDENTIAL_REVOCATION_STORE_V1]
+                    : [],
+                tenantCredentialRevocationWorker:
+                  tenantCredentialRevocationExecutionAvailable(),
               },
             } satisfies Capabilities);
           }
@@ -507,6 +525,28 @@ export function createRouterApp(deps: RouterAppDeps) {
     c.header(
       INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
       INTERNAL_PURGE_POLICY_EVALUATION_ACK_VALUE,
+    );
+    return c.body(null, 204);
+  });
+
+  /**
+   * Credential revocation has its own fresh, non-sticky rollout barrier. Its ACK authorizes one
+   * credential-job claim only and never enables the separate content-purge execution capability.
+   */
+  app.get(INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    try {
+      await deps.registry.refresh();
+    } catch {
+      return c.body(null, 503);
+    }
+    if (!tenantCredentialRevocationExecutionAvailable()) return c.body(null, 503);
+    c.header(
+      INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
+      INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE,
     );
     return c.body(null, 204);
   });
@@ -787,6 +827,8 @@ export function createRouterApp(deps: RouterAppDeps) {
       || url.pathname.startsWith(`${INTERNAL_ERASURE_JOB_CONTROL_V1_READY_PATH}/`)
       || url.pathname === INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_PURGE_POLICY_EVALUATION_READY_PATH}/`)
+      || url.pathname === INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH
+      || url.pathname.startsWith(`${INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX

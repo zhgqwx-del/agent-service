@@ -86,9 +86,30 @@ export const INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER =
   "x-agent-service-tenant-erasure-admission" as const;
 export const INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE = "admission-v1" as const;
 
+/**
+ * A tenant-credential worker obtains this content-free ACK before each bounded queue-claim pass and
+ * again immediately before every destructive completion. The router emits it only after a fresh,
+ * non-sticky observation of every configured runner, keeping local credential cleanup separate
+ * from the later content-purge execution plane.
+ */
+export const INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH =
+  "/_internal/tenant-credential-revocation-v1/ready" as const;
+export const INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER =
+  "x-agent-service-tenant-credential-revocation" as const;
+export const INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE =
+  "credential-revocation-v1" as const;
+
 export const TENANT_ERASURE_PLATFORM_CONTROL_V1 = "platform-control-v1" as const;
 export const TenantErasureControlCapability = z.literal(TENANT_ERASURE_PLATFORM_CONTROL_V1);
 export type TenantErasureControlCapability = z.infer<typeof TenantErasureControlCapability>;
+
+export const TENANT_CREDENTIAL_REVOCATION_STORE_V1 = "credential-store-v1" as const;
+export const TenantCredentialRevocationCapability = z.literal(
+  TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+);
+export type TenantCredentialRevocationCapability = z.infer<
+  typeof TenantCredentialRevocationCapability
+>;
 
 export const PURGE_POLICY_EVALUATOR_V1 = "policy-evaluator-v1" as const;
 export const PurgePolicyEvaluationCapability = z.literal(PURGE_POLICY_EVALUATOR_V1);
@@ -168,6 +189,10 @@ export const Capabilities = z.object({
     tenantErasureControl: z.array(TenantErasureControlCapability).max(1).default([]),
     /** New tenant-erasure admissions are active on this runner; status remains independently readable. */
     tenantErasureRequests: z.boolean().default(false),
+    /** Code understands the local credential-store revocation job and immutable receipt contract. */
+    tenantCredentialRevocation: z.array(TenantCredentialRevocationCapability).max(1).default([]),
+    /** Local worker activation; fleet execution additionally requires the router's fresh barrier. */
+    tenantCredentialRevocationWorker: z.boolean().default(false),
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),

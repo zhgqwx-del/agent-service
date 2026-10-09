@@ -80,6 +80,7 @@ async function makeApp(
     legacyCompensation?: boolean;
     governance?: boolean;
     evaluation?: boolean;
+    credentialWorker?: boolean;
   } = {},
 ) {
   const store = new MemorySessionStore();
@@ -100,8 +101,10 @@ async function makeApp(
     erasureRequestsEnabled: lifecycle.enabled,
     legacyTombstoneCompensationEnabled: lifecycle.legacyCompensation,
     subjectLifecycle: lifecycle.attachStore ? store : undefined,
+    tenantCredentialRevocation: lifecycle.attachStore ? store : undefined,
     dataGovernanceManagementEnabled: lifecycle.governance,
     purgePolicyEvaluationSupported: lifecycle.evaluation,
+    tenantCredentialRevocationWorkerEnabled: lifecycle.credentialWorker,
     retentionPolicy: store,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
@@ -274,6 +277,36 @@ describe("agent-runner HTTP API", () => {
       features: {
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         purgePolicyEvaluation: ["policy-evaluator-v1"],
+        dataPurgeExecution: false,
+      },
+    });
+  });
+
+  it("separates credential-store awareness and local worker activation from data purge", async () => {
+    const unsupported = await makeApp();
+    const codeAware = await makeApp(60_000, { attachStore: true });
+    const workerActive = await makeApp(60_000, {
+      attachStore: true,
+      credentialWorker: true,
+    });
+    expect(await (await unsupported.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantCredentialRevocation: [],
+        tenantCredentialRevocationWorker: false,
+        dataPurgeExecution: false,
+      },
+    });
+    expect(await (await codeAware.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantCredentialRevocation: ["credential-store-v1"],
+        tenantCredentialRevocationWorker: false,
+        dataPurgeExecution: false,
+      },
+    });
+    expect(await (await workerActive.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantCredentialRevocation: ["credential-store-v1"],
+        tenantCredentialRevocationWorker: true,
         dataPurgeExecution: false,
       },
     });

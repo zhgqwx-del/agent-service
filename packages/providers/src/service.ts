@@ -29,6 +29,19 @@ export interface ProviderServiceOptions {
 
 const PLATFORM_TENANT = "__platform__";
 
+function credentialFreeBaseUrl(baseUrl: string): URL {
+  let url: URL;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new ApiError("invalid_request", "baseUrl is not a valid URL");
+  }
+  if (url.username || url.password) {
+    throw new ApiError("invalid_request", "baseUrl must not contain credentials");
+  }
+  return url;
+}
+
 /** Keep the scope kind and tuple separators structural even when external ids contain them. */
 function tenantProviderRegistrationId(tenantId: string, providerId: string): string {
   // Preserve the historical provider identity for every unambiguous tuple because it is persisted
@@ -61,12 +74,7 @@ function providerSecretRef(tenantId: string, providerId: string): string {
  * internal service and read the response back through the turn's error text.
  */
 export async function assertPublicBaseUrl(baseUrl: string): Promise<void> {
-  let u: URL;
-  try {
-    u = new URL(baseUrl);
-  } catch {
-    throw new ApiError("invalid_request", "baseUrl is not a valid URL");
-  }
+  const u = credentialFreeBaseUrl(baseUrl);
   if (u.protocol !== "https:" && u.protocol !== "http:") throw new ApiError("invalid_request", "baseUrl must be http(s)");
   try {
     await assertPublicHost(u.hostname);
@@ -89,9 +97,18 @@ export class ProviderService implements ProviderResolver {
   private readonly assertBaseUrl: (baseUrl: string) => Promise<void>;
 
   constructor(private readonly opts: ProviderServiceOptions) {
-    this.assertBaseUrl = opts.assertBaseUrl ?? assertPublicBaseUrl;
+    const validateBaseUrl = opts.assertBaseUrl ?? assertPublicBaseUrl;
+    this.assertBaseUrl = async (baseUrl) => {
+      // Credential rejection is not injectable: custom DNS guards used by tests/deployments must
+      // never make URL userinfo a second plaintext secret channel.
+      credentialFreeBaseUrl(baseUrl);
+      await validateBaseUrl(baseUrl);
+    };
     this.models = opts.models ?? createModels();
-    for (const p of opts.platform ?? []) this.platform.set(p.config.id, p);
+    for (const p of opts.platform ?? []) {
+      credentialFreeBaseUrl(p.config.baseUrl);
+      this.platform.set(p.config.id, p);
+    }
   }
 
   static preset(id: string, apiKey?: string): PlatformProvider {

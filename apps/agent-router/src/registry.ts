@@ -7,6 +7,7 @@ import {
   ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1,
   ERASURE_JOB_CONTROL_QUARANTINE_V1,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
 } from "@agent-service/protocol";
@@ -333,6 +334,33 @@ export class RunnerRegistry {
       && target.capabilities?.features.purgePolicyEvaluation.includes(
         PURGE_POLICY_EVALUATOR_V1,
       ) === true
+    ));
+  }
+
+  /**
+   * Credential cleanup is irreversible even though it is narrower than content purge. Never use
+   * the healthy subset or the sticky erasure-control observation: every configured stable address
+   * must prove the current code contract in the same fleet snapshot.
+   */
+  allConfiguredSupportTenantCredentialRevocation(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantCredentialRevocation.includes(
+        TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+      ) === true
+    ));
+  }
+
+  /** Every configured code-aware runner must also have its local worker explicitly active. */
+  allConfiguredSupportTenantCredentialRevocationWorker(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantCredentialRevocation.includes(
+        TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+      ) === true
+      && target.capabilities.features.tenantCredentialRevocationWorker === true
     ));
   }
 

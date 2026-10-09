@@ -27,6 +27,7 @@ import {
   emptyUsageAccumulator,
   mergeLimits,
   StartTurnRequest,
+  TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
@@ -292,6 +293,46 @@ describe("protocol schemas", () => {
     expect(parsed.features.dataExportRequests).toBe(false);
     expect(parsed.features.tenantErasureControl).toEqual([]);
     expect(parsed.features.tenantErasureRequests).toBe(false);
+    expect(parsed.features.tenantCredentialRevocation).toEqual([]);
+    expect(parsed.features.tenantCredentialRevocationWorker).toBe(false);
+  });
+
+  it("separates tenant credential-store awareness from local worker activation and data purge", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    const enabled = Capabilities.parse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantCredentialRevocation: [TENANT_CREDENTIAL_REVOCATION_STORE_V1],
+        tenantCredentialRevocationWorker: true,
+      },
+    });
+    expect(enabled.features.tenantCredentialRevocation).toEqual([
+      TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+    ]);
+    expect(enabled.features.tenantCredentialRevocationWorker).toBe(true);
+    expect(enabled.features.dataPurgeExecution).toBe(false);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantCredentialRevocation: ["credential-store-v2"],
+      },
+    }).success).toBe(false);
   });
 
   it("accepts only the versioned tenant-erasure platform control capability", () => {

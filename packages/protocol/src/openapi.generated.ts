@@ -1196,6 +1196,21 @@ export const OPENAPI_DOCUMENT = {
                 ],
                 "type": "boolean"
               },
+              "tenantCredentialRevocation": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "credential-store-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantCredentialRevocationWorker": {
+                "default": false,
+                "type": "boolean"
+              },
               "tenantErasureControl": {
                 "default": [],
                 "items": {

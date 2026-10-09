@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { SignJWT, exportJWK, generateKeyPair, type JWK, type KeyObject } from "jose";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentDefinition, TenantAuthPolicy } from "@agent-service/protocol";
 import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, newId, type ResolvedModel } from "@agent-service/core";
@@ -330,6 +330,44 @@ describe("policy validation happens before storage", () => {
       verifier: { kind: "introspection", endpoint: "http://127.0.0.1:9/introspect", method: "POST", tokenHeader: "authorization", activeField: "active", subjectField: "sub", useStoredSecret: false, cacheTtlMs: 0, timeoutMs: 500 },
     });
     expect(r2.status).toBe(400);
+    const credentialedJwks = await h.setPolicy({
+      mode: "end_user_token", tokenHeader: "x-end-user-token",
+      verifier: { kind: "jwt", jwksUri: "https://user:secret@1.1.1.1/jwks.json", hs256: false, algorithms: ["RS256"], issuer: "i", audience: "a", subjectClaim: "sub", clockToleranceSec: 5 },
+    });
+    expect(credentialedJwks.status).toBe(400);
+    const credentialedIntrospection = await h.setPolicy({
+      mode: "end_user_token", tokenHeader: "x-end-user-token",
+      verifier: { kind: "introspection", endpoint: "https://user:secret@1.1.1.1/introspect", method: "POST", tokenHeader: "authorization", activeField: "active", subjectField: "sub", useStoredSecret: false, cacheTtlMs: 0, timeoutMs: 500 },
+    });
+    expect(credentialedIntrospection.status).toBe(400);
+    await expect(assertPublicUrlDefault("https://user:secret@1.1.1.1/jwks.json"))
+      .rejects.toMatchObject({ code: "invalid_request", message: "URL must not contain credentials" });
+    const malformedSecretUrl = "https://user:malformed-secret@[/jwks.json";
+    const malformedError = await assertPublicUrlDefault(malformedSecretUrl).catch((error: unknown) => error);
+    expect(malformedError).toMatchObject({ code: "invalid_request", message: "URL is not valid" });
+    expect((malformedError as Error).message).not.toContain("malformed-secret");
+    const injectedGuard = vi.fn(async () => {});
+    await expect(validateAuthPolicy({
+      policy: {
+        mode: "end_user_token",
+        tokenHeader: "x",
+        verifier: {
+          kind: "introspection",
+          endpoint: "https://user:secret@auth.example/introspect",
+          method: "POST",
+          tokenHeader: "authorization",
+          activeField: "active",
+          subjectField: "sub",
+          useStoredSecret: false,
+          cacheTtlMs: 0,
+          timeoutMs: 500,
+        },
+      },
+    }, false, injectedGuard)).rejects.toMatchObject({
+      code: "invalid_request",
+      message: "URL must not contain credentials",
+    });
+    expect(injectedGuard).not.toHaveBeenCalled();
     await expect(validateAuthPolicy(
       { policy: { mode: "end_user_token", tokenHeader: "x", verifier: { kind: "jwt", jwksUri: "https://1.1.1.1/jwks.json", hs256: false, algorithms: ["RS256"], issuer: "i", audience: "a", subjectClaim: "sub", clockToleranceSec: 5 } } },
       false,
