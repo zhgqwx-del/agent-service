@@ -1,10 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { MemorySessionStore } from "@agent-service/store";
+import {
+  MemorySessionStore,
+  SubjectDeletingError,
+  newErasureRequestId,
+  tenantErasureRequestHash,
+} from "@agent-service/store";
 import { LocalAesGcmCipher, ProviderService, assertPublicBaseUrl } from "../src/index.js";
 
 const KEY = "11".repeat(32);
 // Offline-deterministic: the real DNS-backed checker is covered by its own test at the bottom.
 const assertBaseUrl = async () => {};
+
+async function gateTenant(store: MemorySessionStore, tenantId: string): Promise<void> {
+  await store.requestTenantErasure({
+    requestId: newErasureRequestId(),
+    tenantId,
+    requestedByKeyId: "admin-key",
+    idempotencyKey: "erase-once",
+    requestHash: tenantErasureRequestHash(tenantId),
+    atMs: 1_800_000_000_000,
+  });
+}
 
 describe("ProviderService", () => {
   it("encrypts BYOK keys at rest, never returns them, and decrypts per request", async () => {
@@ -34,6 +50,190 @@ describe("ProviderService", () => {
     expect(plat.provider).toBe("platform:dashscope");
     expect((await svc.listVisible("t_b")).map((c) => c.id)).toEqual(["dashscope"]);
     expect((await svc.listVisible("t_a")).map((c) => c.id)).toEqual(["mine", "dashscope"]);
+  });
+
+  it("encodes tenant and provider registration components without cross-tenant collisions", async () => {
+    const store = new MemorySessionStore();
+    const svc = new ProviderService({ store, cipher: new LocalAesGcmCipher(KEY), assertBaseUrl });
+    const base = {
+      api: "openai-completions" as const,
+      headers: {}, quota: {}, fallback: [],
+      models: [{ id: "m", contextWindow: 10, maxOutputTokens: 1, input: ["text" as const], reasoning: false }],
+    };
+
+    // These distinct tuples both produced "tenant:/%:p" when joined with a raw colon.
+    const left = await svc.upsertTenantProvider("tenant:/%", {
+      ...base, id: "p", baseUrl: "https://left.example/v1", apiKey: "left-key",
+    });
+    const right = await svc.upsertTenantProvider("tenant", {
+      ...base, id: "/%:p", baseUrl: "https://right.example/v1", apiKey: "right-key",
+    });
+    expect(left.apiKeyRef).toBe("secret:tenant:tenant%3A%2F%25:p");
+    expect(right.apiKeyRef).toBe("secret:tenant:tenant:%2F%25%3Ap");
+
+    const leftResolved = await svc.resolve({ tenantId: "tenant:/%", userId: "u" }, { provider: "p", model: "m" });
+    const rightResolved = await svc.resolve({ tenantId: "tenant", userId: "u" }, { provider: "/%:p", model: "m" });
+    expect(leftResolved.provider).toBe("tenant:tenant%3A%2F%25:p");
+    expect(rightResolved.provider).toBe("tenant:tenant:%2F%25%3Ap");
+    expect(leftResolved.provider).not.toBe(rightResolved.provider);
+    expect(await leftResolved.apiKey()).toBe("left-key");
+    expect(await rightResolved.apiKey()).toBe("right-key");
+    expect((leftResolved.handle as { baseUrl: string }).baseUrl).toBe("https://left.example/v1");
+    expect((rightResolved.handle as { baseUrl: string }).baseUrl).toBe("https://right.example/v1");
+  });
+
+  it("keeps a tenant named platform isolated from the platform provider scope", async () => {
+    const store = new MemorySessionStore();
+    let vendorCalls = 0;
+    const rejectAtVendor: typeof fetch = async () => {
+      vendorCalls += 1;
+      return new Response(JSON.stringify({ error: { message: "fixture rejection" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const svc = new ProviderService({
+      store,
+      cipher: new LocalAesGcmCipher(KEY),
+      assertBaseUrl,
+      fetch: rejectAtVendor,
+      platform: [{
+        config: {
+          id: "shared", api: "openai-completions", baseUrl: "https://platform.example/v1",
+          headers: {}, quota: {}, fallback: [],
+          models: [{ id: "m", contextWindow: 10, maxOutputTokens: 1, input: ["text"], reasoning: false }],
+        },
+        apiKey: "platform-key",
+      }],
+    });
+    await svc.upsertTenantProvider("platform", {
+      id: "shared", api: "openai-completions", baseUrl: "https://tenant.example/v1",
+      headers: {}, quota: {}, fallback: [],
+      models: [{ id: "m", contextWindow: 10, maxOutputTokens: 1, input: ["text"], reasoning: false }],
+      apiKey: "tenant-key",
+    });
+
+    const tenantModel = await svc.resolve(
+      { tenantId: "platform", userId: "u" },
+      { provider: "shared", model: "m" },
+    );
+    const platformModel = await svc.resolve(
+      { tenantId: "other", userId: "u" },
+      { provider: "shared", model: "m" },
+    );
+
+    expect(tenantModel.provider).toBe("tenant:platform:shared");
+    expect(platformModel.provider).toBe("platform:shared");
+    expect(await tenantModel.apiKey()).toBe("tenant-key");
+    expect(await platformModel.apiKey()).toBe("platform-key");
+    expect((tenantModel.handle as { baseUrl: string }).baseUrl).toBe("https://tenant.example/v1");
+    expect((platformModel.handle as { baseUrl: string }).baseUrl).toBe("https://platform.example/v1");
+
+    for (const model of [tenantModel, platformModel]) {
+      const result = await svc.models.streamSimple(
+        model.handle as never,
+        { messages: [{ role: "user", content: "registry probe", timestamp: Date.now() }] },
+        { apiKey: await model.apiKey(), fetch: model.fetch },
+      ).result();
+      expect(result.stopReason).toBe("error");
+      expect(result.errorMessage).not.toMatch(/unknown provider/i);
+    }
+    expect(vendorCalls).toBe(2);
+  });
+
+  it("revokes an already-resolved BYOK key and outbound fetch when the tenant is gated", async () => {
+    const store = new MemorySessionStore();
+    let fetchCalls = 0;
+    const outboundFetch: typeof fetch = async () => {
+      fetchCalls += 1;
+      return new Response(null, { status: 204 });
+    };
+    const svc = new ProviderService({
+      store,
+      cipher: new LocalAesGcmCipher(KEY),
+      fetch: outboundFetch,
+      assertBaseUrl,
+    });
+    await svc.upsertTenantProvider("tenant-revoked-byok", {
+      id: "mine", api: "openai-completions", baseUrl: "https://example.com/v1",
+      headers: { "X-Tenant-Secret": "header-value" }, quota: {}, fallback: [],
+      models: [{ id: "m", contextWindow: 10, maxOutputTokens: 1, input: ["text"], reasoning: false }],
+      apiKey: "byok-value",
+    });
+    const resolved = await svc.resolve(
+      { tenantId: "tenant-revoked-byok", userId: "u" },
+      { provider: "mine", model: "m" },
+    );
+    expect(resolved.headers).toEqual({ "X-Tenant-Secret": "header-value" });
+    expect((await resolved.fetch!("https://provider.example/v1")).status).toBe(204);
+    expect(fetchCalls).toBe(1);
+    fetchCalls = 0;
+
+    await gateTenant(store, "tenant-revoked-byok");
+
+    await expect(resolved.apiKey()).rejects.toBeInstanceOf(SubjectDeletingError);
+    await expect(resolved.fetch!("https://provider.example/v1"))
+      .rejects.toBeInstanceOf(SubjectDeletingError);
+    expect(fetchCalls).toBe(0);
+  });
+
+  it("revokes keyless platform fallback before new or already-resolved outbound work", async () => {
+    const store = new MemorySessionStore();
+    let fetchCalls = 0;
+    const outboundFetch: typeof fetch = async () => {
+      fetchCalls += 1;
+      return new Response(null, { status: 204 });
+    };
+    const svc = new ProviderService({
+      store,
+      cipher: new LocalAesGcmCipher(KEY),
+      fetch: outboundFetch,
+      assertBaseUrl,
+      platform: [{
+        config: {
+          id: "keyless", api: "openai-completions", baseUrl: "https://platform.example/v1",
+          headers: { "X-Platform-Auth": "header-value" }, quota: {}, fallback: [],
+          models: [{ id: "m", contextWindow: 10, maxOutputTokens: 1, input: ["text"], reasoning: false }],
+        },
+      }],
+    });
+    const resolved = await svc.resolve(
+      { tenantId: "tenant-revoked-platform", userId: "u" },
+      { provider: "keyless", model: "m" },
+    );
+    expect(resolved.headers).toEqual({ "X-Platform-Auth": "header-value" });
+    expect(await resolved.apiKey()).toBeUndefined();
+
+    await gateTenant(store, "tenant-revoked-platform");
+
+    await expect(resolved.apiKey()).rejects.toBeInstanceOf(SubjectDeletingError);
+    await expect(resolved.fetch!("https://platform.example/v1"))
+      .rejects.toBeInstanceOf(SubjectDeletingError);
+    await expect(svc.resolve(
+      { tenantId: "tenant-revoked-platform", userId: "u" },
+      { provider: "keyless", model: "m" },
+    )).rejects.toBeInstanceOf(SubjectDeletingError);
+    expect(fetchCalls).toBe(0);
+  });
+
+  it("fails closed for provider list and upsert after the tenant is gated", async () => {
+    const store = new MemorySessionStore();
+    const svc = new ProviderService({
+      store,
+      cipher: new LocalAesGcmCipher(KEY),
+      platform: [ProviderService.preset("dashscope", "platform-key")],
+      assertBaseUrl,
+    });
+    await gateTenant(store, "tenant-provider-management");
+
+    await expect(svc.listVisible("tenant-provider-management"))
+      .rejects.toBeInstanceOf(SubjectDeletingError);
+    await expect(svc.upsertTenantProvider("tenant-provider-management", {
+      id: "mine", api: "openai-completions", baseUrl: "https://example.com/v1",
+      headers: {}, quota: {}, fallback: [],
+      models: [{ id: "m", contextWindow: 10, maxOutputTokens: 1, input: ["text"], reasoning: false }],
+      apiKey: "must-not-be-stored",
+    })).rejects.toBeInstanceOf(SubjectDeletingError);
   });
 
   it("exposes the selected model's text and image input capabilities", async () => {

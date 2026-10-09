@@ -115,6 +115,7 @@ import {
   ErasureJobIntegrityFault,
   ErasureIdempotencyMismatchError,
   SubjectDeletingError,
+  TenantErasureConflictError,
   classifyErasureJobRecordFault,
   deriveBlockedErasureResumePhase,
   erasureJobClaimFromRecord,
@@ -129,6 +130,7 @@ import {
   isErasureJobQuarantined,
   isClaimableErasureRequestStatus,
   newErasureJobIntegrityFault,
+  tenantCredentialRevocationFenceSha256,
   userErasureRequestHash,
   validateClaimErasureJobsOptions,
   validateErasureJobAuthorization,
@@ -140,7 +142,9 @@ import {
   validateErasureRequestRecordForRead,
   validateErasureWriteAuthorization,
   validateRepairAndResumeErasureJobInput,
+  validateRequestTenantErasureInput,
   validateRequestUserErasureInput,
+  validateTenantCredentialRevocationFence,
   validateRenewErasureJobClaimOptions,
   validateRetryErasureJobOptions,
   validateTransitionErasureJobOptions,
@@ -158,6 +162,7 @@ import {
   type ErasureRequestRecord,
   type ErasureRequestStatus,
   type ErasureWriteAuthorization,
+  type RequestTenantErasureInput,
   type RequestUserErasureInput,
   type RepairAndResumeErasureJobInput,
   type RetryErasureJobOptions,
@@ -165,6 +170,8 @@ import {
   type SubjectLifecycleRecord,
   type SubjectLifecycleState,
   type SubjectLifecycleStore,
+  type TenantCredentialRevocationFence,
+  type TenantRuntimeState,
   type TransitionErasureJobOptions,
 } from "../subject-lifecycle.js";
 import {
@@ -389,6 +396,11 @@ const ERASURE_REQUEST_COLUMNS = `request_id, tenant_id, subject_kind, subject_id
   completed_at_ms, counts_json, checksum, available_at_ms, attempts, claim_token, lease_until_ms,
   last_error_code, policy_version, policy_hash, control_generation, quarantined_at_ms,
   quarantine_reason_code, quarantine_evidence_sha256`;
+const TENANT_ERASURE_ADMISSION_COLUMNS = `request_id, tenant_id, subject_generation,
+  requested_by_key_id, idempotency_key, request_hash, created_at_ms, gated_at_ms, updated_at_ms,
+  policy_version, policy_hash, control_generation`;
+const TENANT_CREDENTIAL_REVOCATION_FENCE_COLUMNS = `tenant_id, request_id, subject_generation,
+  fenced_at_ms, evidence_sha256`;
 const ERASURE_CONTROL_EVENT_COLUMNS = `control_event_id, request_id, control_generation, event_type,
   phase, reason_code, action_code, actor_key_id, before_sha256, after_sha256, emitted_at_ms`;
 const LEGACY_TOMBSTONE_JOB_COLUMNS = `job_id, session_id, tenant_id, user_id, source_kind,
@@ -523,6 +535,21 @@ const LEGACY_TOMBSTONE_EVENT_EVIDENCE_FIELDS = [
   "emitted_at_ms",
 ] as const;
 const USAGE_OWNER_MATCH = "u.tenant_id=s.tenant_id AND u.user_id=s.user_id";
+/**
+ * Ordinary session-owned reads must treat either append-only tenant-erasure record as an
+ * independent no-resurrection fence. The lifecycle row is mutable operational state and cannot be
+ * the sole visibility authority after an admission has committed.
+ *
+ * Every query using this fragment owns a `sessions s` alias. Internal erasure/lifecycle readers
+ * intentionally do not use it because they must retain maintenance access to tombstoned data.
+ */
+const SESSION_TENANT_ERASURE_EVIDENCE_ABSENT = `
+  NOT EXISTS (
+    SELECT 1 FROM tenant_erasure_admissions te WHERE te.tenant_id=s.tenant_id
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=s.tenant_id
+  )`;
 const usageJsonNumber = (field: string) => (
   `CASE WHEN JSON_TYPE(JSON_EXTRACT(u.usage_json,'$.${field}')) IN ('INTEGER','DOUBLE','DECIMAL') `
   + `THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(u.usage_json,'$.${field}')) AS DECIMAL(30,9)) ELSE 0 END`
@@ -1406,6 +1433,18 @@ function rowToSubjectLifecycle(row: Row): SubjectLifecycleRecord {
   };
 }
 
+function rowToTenantCredentialRevocationFence(row: Row): TenantCredentialRevocationFence {
+  const fence: TenantCredentialRevocationFence = {
+    tenantId: String(row.tenant_id),
+    requestId: String(row.request_id),
+    subjectGeneration: Number(row.subject_generation),
+    fencedAtMs: Number(row.fenced_at_ms),
+    evidenceSha256: String(row.evidence_sha256),
+  };
+  validateTenantCredentialRevocationFence(fence);
+  return fence;
+}
+
 function mysqlControlGeneration(value: unknown): {
   projected: number;
   raw: string;
@@ -1532,6 +1571,34 @@ function decodeErasureRequest(row: Row): DecodedErasureRequestEnvelope {
 
 function rowToErasureRequest(row: Row): ErasureRequestRecord {
   const { record } = decodeErasureRequest(row);
+  validateErasureRequestRecordForRead(record);
+  return record;
+}
+
+/**
+ * Tenant admission is deliberately stored outside the legacy user-erasure queue. Mapping it to
+ * the common read model keeps lifecycle/audit validation shared without making it claimable.
+ */
+function rowToTenantErasureAdmission(row: Row): ErasureRequestRecord {
+  const tenantId = String(row.tenant_id);
+  const record: ErasureRequestRecord = {
+    requestId: String(row.request_id),
+    tenantId,
+    subjectKind: "tenant",
+    subjectId: tenantId,
+    generation: Number(row.subject_generation),
+    status: "gated",
+    requestedByKeyId: String(row.requested_by_key_id),
+    idempotencyKey: String(row.idempotency_key),
+    requestHash: String(row.request_hash),
+    createdAtMs: Number(row.created_at_ms),
+    gatedAtMs: Number(row.gated_at_ms),
+    updatedAtMs: Number(row.updated_at_ms),
+    attempts: 0,
+    ...(row.policy_version == null ? {} : { policyVersion: String(row.policy_version) }),
+    ...(row.policy_hash == null ? {} : { policyHash: String(row.policy_hash) }),
+    controlGeneration: Number(row.control_generation),
+  };
   validateErasureRequestRecordForRead(record);
   return record;
 }
@@ -4092,6 +4159,7 @@ export class MysqlSessionStore implements
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, input.tenantId, input.atMs);
       // All policy writers take the per-tenant control before immutable versions. Activation and
       // erasure binding use the same order, avoiding a control/version lock inversion.
       await conn.query(
@@ -4160,6 +4228,7 @@ export class MysqlSessionStore implements
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, input.tenantId, input.atMs);
       const [controlRows] = await conn.query<Row[]>(
         `SELECT ${RETENTION_POLICY_CONTROL_COLUMNS}
            FROM retention_policy_controls WHERE tenant_id=? FOR UPDATE`,
@@ -4748,6 +4817,25 @@ export class MysqlSessionStore implements
         WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
       [tenantId, tenantId],
     );
+    const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+    if (!tenant) {
+      throw new LegalHoldIntegrityError("legal hold tenant lifecycle is missing after initialization");
+    }
+    const tenantAdmission = await this.loadTenantErasureAdmission(
+      conn,
+      tenantId,
+      undefined,
+      "FOR SHARE",
+    );
+    const tenantFence = await this.loadTenantCredentialRevocationFence(
+      conn,
+      tenantId,
+      undefined,
+      "FOR SHARE",
+    );
+    if (tenant.state !== "active" || tenantAdmission !== null || tenantFence !== null) {
+      throw new SubjectDeletingError(tenantId);
+    }
     let lifecycleRow = tenantRows[0];
     if (subjectKind === "user") {
       const [userRows] = await conn.query<Row[]>(
@@ -5217,7 +5305,10 @@ export class MysqlSessionStore implements
     const tenant = rowToSubjectLifecycle(tenantRows[0]);
     let subject = tenant;
     if (identity.subjectKind === "user") {
-      if (tenant.state !== "active") return null;
+      if (
+        tenant.state !== "active"
+        || await this.hasTenantErasureAuthorityFence(conn, identity.tenantId)
+      ) return null;
       const [userRows] = await conn.query<Row[]>(
         `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
            FROM subject_lifecycle
@@ -5556,6 +5647,12 @@ export class MysqlSessionStore implements
              WHERE d2.request_id=r.request_id
           )
         WHERE r.status='awaiting_purge_policy'
+          AND NOT EXISTS (
+            SELECT 1 FROM tenant_erasure_admissions te WHERE te.tenant_id=r.tenant_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=r.tenant_id
+          )
           AND (
             j.request_id IS NULL
             OR (
@@ -5586,7 +5683,12 @@ export class MysqlSessionStore implements
           [identity.tenantId, identity.tenantId],
         );
         const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
-        if (!tenant || tenant.state !== "active" || identity.subjectKind !== "user") {
+        if (
+          !tenant
+          || tenant.state !== "active"
+          || identity.subjectKind !== "user"
+          || await this.hasTenantErasureAuthorityFence(conn, identity.tenantId)
+        ) {
           await conn.commit();
           continue;
         }
@@ -5787,9 +5889,15 @@ export class MysqlSessionStore implements
     const leaseUntilMs = validateClaimErasurePolicyEvaluationsOptions(options);
     const [candidateRows] = await this.pool.query<Row[]>(
       `SELECT ${ERASURE_POLICY_EVALUATION_JOB_COLUMNS}
-         FROM erasure_policy_evaluation_jobs
+         FROM erasure_policy_evaluation_jobs j
         WHERE sealed_at_ms IS NULL AND available_at_ms IS NOT NULL AND available_at_ms<=?
           AND (claim_token IS NULL OR lease_until_ms<=?)
+          AND NOT EXISTS (
+            SELECT 1 FROM tenant_erasure_admissions te WHERE te.tenant_id=j.tenant_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=j.tenant_id
+          )
         ORDER BY available_at_ms, request_id`,
       [options.nowMs, options.nowMs],
     );
@@ -6889,12 +6997,181 @@ export class MysqlSessionStore implements
   }
 
   // ---------- durable subject lifecycle ----------
+  private async loadTenantErasureAdmission(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId?: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<ErasureRequestRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
+         FROM tenant_erasure_admissions
+        WHERE tenant_id=?${requestId === undefined ? "" : " AND request_id=?"} ${lock}`,
+      requestId === undefined ? [tenantId] : [tenantId, requestId],
+    );
+    return rows[0] ? rowToTenantErasureAdmission(rows[0]) : null;
+  }
+
+  private async loadTenantCredentialRevocationFence(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId?: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantCredentialRevocationFence | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_REVOCATION_FENCE_COLUMNS}
+         FROM tenant_credential_revocation_fences
+        WHERE tenant_id=?${requestId === undefined ? "" : " AND request_id=?"} ${lock}`,
+      requestId === undefined ? [tenantId] : [tenantId, requestId],
+    );
+    return rows[0] ? rowToTenantCredentialRevocationFence(rows[0]) : null;
+  }
+
+  private async hasTenantErasureAuthorityFence(
+    conn: PoolConnection,
+    tenantId: string,
+  ): Promise<boolean> {
+    // Always read and validate both append-only evidence families while the caller holds the tenant
+    // lifecycle lock. Either one independently revokes child user-worker/evaluator authority if the
+    // mutable lifecycle projection is ever incorrectly restored to active.
+    const admission = await this.loadTenantErasureAdmission(
+      conn,
+      tenantId,
+      undefined,
+      "FOR SHARE",
+    );
+    const fence = await this.loadTenantCredentialRevocationFence(
+      conn,
+      tenantId,
+      undefined,
+      "FOR SHARE",
+    );
+    return admission !== null || fence !== null;
+  }
+
+  private async ensureTenantLifecycleRow(
+    conn: PoolConnection,
+    tenantId: string,
+    atMs: number,
+  ): Promise<void> {
+    if (!tenantId || tenantId.length > 128) throw new Error("invalid tenant id");
+    if (!Number.isSafeInteger(atMs) || atMs < 0) throw new Error("invalid tenant lifecycle timestamp");
+    const [existing] = await conn.query<Row[]>(
+      `SELECT subject_id FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+      [tenantId, tenantId],
+    );
+    if (existing[0]) return;
+
+    // Never heal an already-fenced tenant back to active if its lifecycle row was lost. The final
+    // locking read performed by callers closes the optimistic-read race with a concurrent insert.
+    const [legacyRequestRows] = await conn.query<Row[]>(
+      `SELECT request_id FROM erasure_requests
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? LIMIT 1`,
+      [tenantId, tenantId],
+    );
+    const [admissionRows] = await conn.query<Row[]>(
+      "SELECT request_id FROM tenant_erasure_admissions WHERE tenant_id=? LIMIT 1",
+      [tenantId],
+    );
+    const [fenceRows] = await conn.query<Row[]>(
+      "SELECT request_id FROM tenant_credential_revocation_fences WHERE tenant_id=? LIMIT 1",
+      [tenantId],
+    );
+    if (legacyRequestRows[0] || admissionRows[0] || fenceRows[0]) {
+      throw new Error("tenant lifecycle gate is missing for existing erasure evidence");
+    }
+    await conn.query(
+      `INSERT IGNORE INTO subject_lifecycle
+         (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
+          legal_hold_at_ms, created_at_ms, updated_at_ms)
+       VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?)`,
+      [tenantId, tenantId, atMs, atMs],
+    );
+  }
+
+  private async lockActiveTenantGate(
+    conn: PoolConnection,
+    tenantId: string,
+    atMs: number,
+  ): Promise<SubjectLifecycleRecord> {
+    await this.ensureTenantLifecycleRow(conn, tenantId, atMs);
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [tenantId, tenantId],
+    );
+    const tenant = rows[0] ? rowToSubjectLifecycle(rows[0]) : undefined;
+    if (
+      !tenant
+      || tenant.tenantId !== tenantId
+      || tenant.subjectKind !== "tenant"
+      || tenant.subjectId !== tenantId
+    ) throw new Error("tenant lifecycle gate row is missing or invalid");
+    const admission = await this.loadTenantErasureAdmission(conn, tenantId, undefined, "FOR SHARE");
+    const fence = await this.loadTenantCredentialRevocationFence(conn, tenantId, undefined, "FOR SHARE");
+    if (tenant.state !== "active" || admission !== null || fence !== null) {
+      throw new SubjectDeletingError(tenantId);
+    }
+    return tenant;
+  }
+
+  async getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState> {
+    if (!tenantId || tenantId.length > 128) throw new Error("invalid tenant id");
+    return this.withConsistentRead(async (conn) => {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+        [tenantId, tenantId],
+      );
+      const tenant = rows[0] ? rowToSubjectLifecycle(rows[0]) : undefined;
+      const admission = await this.loadTenantErasureAdmission(conn, tenantId);
+      const fence = await this.loadTenantCredentialRevocationFence(conn, tenantId);
+      if (!tenant) {
+        const [legacyRequestRows] = await conn.query<Row[]>(
+          `SELECT request_id FROM erasure_requests
+            WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? LIMIT 1`,
+          [tenantId, tenantId],
+        );
+        if (legacyRequestRows[0] || admission || fence) {
+          throw new Error("tenant lifecycle gate is missing for existing erasure evidence");
+        }
+        return { tenantId, state: "active", generation: 0 };
+      }
+      if (
+        tenant.tenantId !== tenantId
+        || tenant.subjectKind !== "tenant"
+        || tenant.subjectId !== tenantId
+      ) throw new Error("tenant lifecycle gate row is invalid");
+      if (
+        (tenant.state === "active" && (admission !== null || fence !== null))
+        || (tenant.state !== "active" && (
+          admission === null
+          || fence === null
+          || admission.requestId !== tenant.activeRequestId
+          || admission.generation !== tenant.generation
+          || fence.requestId !== tenant.activeRequestId
+          || fence.subjectGeneration !== tenant.generation
+        ))
+      ) throw new Error("tenant lifecycle and credential fence do not agree");
+      return {
+        tenantId,
+        state: tenant.state,
+        generation: tenant.generation,
+        ...(tenant.activeRequestId === undefined ? {} : { activeRequestId: tenant.activeRequestId }),
+      };
+    });
+  }
+
   private async ensureSubjectLifecycleRows(
     conn: PoolConnection,
     tenantId: string,
     userId: string,
     atMs: number,
   ): Promise<void> {
+    await this.ensureTenantLifecycleRow(conn, tenantId, atMs);
     // Most transactions hit rows created by migration/session creation. The optimistic read avoids
     // taking an unnecessary exclusive duplicate-key lock on the tenant row for every turn while a
     // mixed-version writer can still be healed safely: a final locking read below always sees the
@@ -6907,25 +7184,7 @@ export class MysqlSessionStore implements
             OR (subject_kind='user' AND subject_id=?))`,
       [tenantId, tenantId, userId],
     );
-    const hasTenant = existing.some((row) => row.subject_kind === "tenant" && row.subject_id === tenantId);
     const hasUser = existing.some((row) => row.subject_kind === "user" && row.subject_id === userId);
-    if (!hasTenant) {
-      const [requests] = await conn.query<Row[]>(
-        `SELECT request_id FROM erasure_requests
-          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? LIMIT 1`,
-        [tenantId, tenantId],
-      );
-      if (requests.length > 0) {
-        throw new Error("tenant lifecycle gate is missing for an existing erasure request");
-      }
-      await conn.query(
-        `INSERT IGNORE INTO subject_lifecycle
-           (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
-            legal_hold_at_ms, created_at_ms, updated_at_ms)
-         VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?)`,
-        [tenantId, tenantId, atMs, atMs],
-      );
-    }
     if (!hasUser) {
       const [requests] = await conn.query<Row[]>(
         `SELECT request_id FROM erasure_requests
@@ -6961,6 +7220,18 @@ export class MysqlSessionStore implements
         WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
       [tenantId, tenantId],
     );
+    const tenantAdmission = await this.loadTenantErasureAdmission(
+      conn,
+      tenantId,
+      undefined,
+      "FOR SHARE",
+    );
+    const tenantFence = await this.loadTenantCredentialRevocationFence(
+      conn,
+      tenantId,
+      undefined,
+      "FOR SHARE",
+    );
     const [userRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
          FROM subject_lifecycle
@@ -6970,9 +7241,12 @@ export class MysqlSessionStore implements
     const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
     const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
     if (!tenant || !user) throw new Error("subject lifecycle gate row is missing");
-    if (tenant.state !== "active" || user.state !== "active") {
+    const tenantBlocked = tenant.state !== "active"
+      || tenantAdmission !== null
+      || tenantFence !== null;
+    if (tenantBlocked || user.state !== "active") {
       if (blockedSessionId) throw new SessionGoneError(blockedSessionId);
-      throw new SubjectDeletingError(tenantId, user.state === "active" ? undefined : userId);
+      throw new SubjectDeletingError(tenantId, tenantBlocked ? undefined : userId);
     }
   }
 
@@ -6989,6 +7263,18 @@ export class MysqlSessionStore implements
           WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
         [input.tenantId, input.tenantId],
       );
+      const tenantAdmission = await this.loadTenantErasureAdmission(
+        conn,
+        input.tenantId,
+        undefined,
+        "FOR SHARE",
+      );
+      const tenantFence = await this.loadTenantCredentialRevocationFence(
+        conn,
+        input.tenantId,
+        undefined,
+        "FOR SHARE",
+      );
       const [userRows] = await conn.query<Row[]>(
         `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
            FROM subject_lifecycle
@@ -6998,7 +7284,9 @@ export class MysqlSessionStore implements
       const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
       const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
       if (!tenant || !user) throw new Error("subject lifecycle gate row is missing");
-      if (tenant.state !== "active") throw new SubjectDeletingError(input.tenantId);
+      if (tenant.state !== "active" || tenantAdmission !== null || tenantFence !== null) {
+        throw new SubjectDeletingError(input.tenantId);
+      }
 
       const [idempotencyRows] = await conn.query<Row[]>(
         `SELECT ${ERASURE_REQUEST_COLUMNS}
@@ -7157,6 +7445,236 @@ export class MysqlSessionStore implements
       [requestId, tenantId, userId],
     );
     return rows[0] ? rowToErasureRequest(rows[0]) : null;
+  }
+
+  async requestTenantErasure(input: RequestTenantErasureInput): Promise<ErasureRequestRecord> {
+    input = structuredClone(input);
+    validateRequestTenantErasureInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.ensureTenantLifecycleRow(conn, input.tenantId, input.atMs);
+      // This exclusive tenant gate is the admission linearization point. Every tenant-scoped
+      // credential/data writer takes the same row first with a shared lock before its resource.
+      const [tenantRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR UPDATE`,
+        [input.tenantId, input.tenantId],
+      );
+      const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+      if (
+        !tenant
+        || tenant.tenantId !== input.tenantId
+        || tenant.subjectKind !== "tenant"
+        || tenant.subjectId !== input.tenantId
+      ) throw new Error("tenant lifecycle gate row is missing or invalid");
+
+      const [idempotencyRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
+           FROM tenant_erasure_admissions
+          WHERE tenant_id=? AND idempotency_key=?
+          FOR UPDATE`,
+        [input.tenantId, input.idempotencyKey],
+      );
+      if (idempotencyRows[0]) {
+        const replay = rowToTenantErasureAdmission(idempotencyRows[0]);
+        if (replay.requestHash !== input.requestHash) throw new ErasureIdempotencyMismatchError();
+        const replayFence = await this.loadTenantCredentialRevocationFence(
+          conn,
+          input.tenantId,
+          replay.requestId,
+          "FOR SHARE",
+        );
+        if (
+          !replayFence
+          || tenant.state === "active"
+          || tenant.activeRequestId !== replay.requestId
+          || tenant.generation !== replay.generation
+          || replayFence.subjectGeneration !== replay.generation
+        ) throw new Error("tenant erasure replay does not match its lifecycle fence");
+        await conn.commit();
+        return replay;
+      }
+
+      if (tenant.state !== "active") {
+        if (!tenant.activeRequestId) throw new SubjectDeletingError(input.tenantId);
+        const [activeRows] = await conn.query<Row[]>(
+          `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
+             FROM tenant_erasure_admissions
+            WHERE request_id=? AND tenant_id=? AND subject_generation=? FOR SHARE`,
+          [tenant.activeRequestId, input.tenantId, tenant.generation],
+        );
+        const active = activeRows[0] ? rowToTenantErasureAdmission(activeRows[0]) : undefined;
+        const activeFence = active
+          ? await this.loadTenantCredentialRevocationFence(
+              conn,
+              input.tenantId,
+              active.requestId,
+              "FOR SHARE",
+            )
+          : null;
+        if (!active || !activeFence || activeFence.subjectGeneration !== active.generation) {
+          throw new Error("tenant lifecycle active request is corrupt");
+        }
+        await conn.commit();
+        return active;
+      }
+
+      // An append-only fence can never coexist with a writable tenant. Refuse to resurrect an
+      // accidentally reset lifecycle row rather than authorizing a second erasure generation.
+      if (
+        await this.loadTenantErasureAdmission(conn, input.tenantId, undefined, "FOR SHARE")
+        || await this.loadTenantCredentialRevocationFence(conn, input.tenantId, undefined, "FOR SHARE")
+      ) {
+        throw new Error("active tenant already has erasure admission or credential revocation evidence");
+      }
+
+      // A user worker can retain lease authority after its claim transaction releases locks. Gate
+      // the tenant only when no user request is in a worker-owned/claimable execution phase. The
+      // tenant FOR UPDATE lock prevents a new user worker/admission from crossing this check.
+      const [activeUserRows] = await conn.query<Row[]>(
+        `SELECT request_id FROM erasure_requests
+          WHERE tenant_id=? AND subject_kind='user'
+            AND status IN ('gated','draining','tombstoning','reconciling_usage','purging')
+          LIMIT 1 FOR SHARE`,
+        [input.tenantId],
+      );
+      if (activeUserRows[0]) throw new TenantErasureConflictError();
+
+      const boundPolicy = await this.lockRetentionPolicyForErasureRequest(conn, input.tenantId);
+      const generation = tenant.generation + 1;
+      const record: ErasureRequestRecord = {
+        requestId: input.requestId,
+        tenantId: input.tenantId,
+        subjectKind: "tenant",
+        subjectId: input.tenantId,
+        generation,
+        status: "gated",
+        requestedByKeyId: input.requestedByKeyId,
+        idempotencyKey: input.idempotencyKey,
+        requestHash: input.requestHash,
+        createdAtMs: input.atMs,
+        gatedAtMs: input.atMs,
+        updatedAtMs: input.atMs,
+        attempts: 0,
+        ...(boundPolicy === null
+          ? {}
+          : {
+              policyVersion: boundPolicy.policyVersion,
+              policyHash: boundPolicy.policySha256,
+            }),
+        controlGeneration: 0,
+      };
+      const audit: ErasureAuditEvent = {
+        requestId: record.requestId,
+        seq: 1,
+        type: "erasure/gated",
+        payload: {
+          status: "gated",
+          subjectKind: "tenant",
+          generation,
+          credentialFence: "logical-v1",
+          ...(boundPolicy === null
+            ? {}
+            : {
+                policyVersion: boundPolicy.policyVersion,
+                policyHash: boundPolicy.policySha256,
+              }),
+        },
+        emittedAtMs: input.atMs,
+      };
+      const fenceBase = {
+        tenantId: input.tenantId,
+        requestId: input.requestId,
+        subjectGeneration: generation,
+        fencedAtMs: input.atMs,
+      };
+      const fence: TenantCredentialRevocationFence = {
+        ...fenceBase,
+        evidenceSha256: tenantCredentialRevocationFenceSha256(fenceBase),
+      };
+      validateErasureRequestRecord(record);
+      validateErasureAuditChain(record, [audit]);
+      validateTenantCredentialRevocationFence(fence);
+
+      // Keep dormant tenant admission outside `erasure_requests`: frozen pre-0018 workers scan
+      // NULL queue controls as poison, so sharing that table would not be rolling-upgrade safe.
+      await conn.query(
+        `INSERT INTO tenant_erasure_admissions
+           (request_id, tenant_id, subject_generation, requested_by_key_id, idempotency_key,
+            request_hash, created_at_ms, gated_at_ms, updated_at_ms, policy_version, policy_hash,
+            control_generation)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,0)`,
+        [
+          record.requestId,
+          record.tenantId,
+          record.generation,
+          record.requestedByKeyId,
+          record.idempotencyKey,
+          record.requestHash,
+          record.createdAtMs,
+          record.gatedAtMs,
+          record.updatedAtMs,
+          record.policyVersion ?? null,
+          record.policyHash ?? null,
+        ],
+      );
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE subject_lifecycle
+            SET state='deleting', generation=?, active_request_id=?, updated_at_ms=?
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?
+            AND state='active' AND generation=?`,
+        [
+          generation,
+          input.requestId,
+          Math.max(tenant.updatedAtMs, input.atMs),
+          input.tenantId,
+          input.tenantId,
+          tenant.generation,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new Error("tenant lifecycle gate changed while locked");
+      await conn.query(
+        `INSERT INTO erasure_audit_events
+           (request_id, seq, event_type, payload, emitted_at_ms)
+         VALUES (?,1,'erasure/gated',?,?)`,
+        [audit.requestId, json(audit.payload), audit.emittedAtMs],
+      );
+      await conn.query(
+        `INSERT INTO tenant_credential_revocation_fences
+           (tenant_id, request_id, subject_generation, fenced_at_ms, evidence_sha256)
+         VALUES (?,?,?,?,?)`,
+        [
+          fence.tenantId,
+          fence.requestId,
+          fence.subjectGeneration,
+          fence.fencedAtMs,
+          fence.evidenceSha256,
+        ],
+      );
+      await conn.commit();
+      return record;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantErasureRequest(
+    tenantId: string,
+    requestId: string,
+  ): Promise<ErasureRequestRecord | null> {
+    return this.loadTenantErasureAdmission(this.pool, tenantId, requestId);
+  }
+
+  async getTenantCredentialRevocationFence(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialRevocationFence | null> {
+    return this.loadTenantCredentialRevocationFence(this.pool, tenantId, requestId);
   }
 
   async getSubjectLifecycle(
@@ -7322,7 +7840,10 @@ export class MysqlSessionStore implements
     if (!tenantRows[0]) return null;
     const tenant = rowToSubjectLifecycle(tenantRows[0]);
     if (authorization.subjectKind === "tenant") return tenant;
-    if (tenant.state !== "active") return null;
+    if (
+      tenant.state !== "active"
+      || await this.hasTenantErasureAuthorityFence(conn, authorization.tenantId)
+    ) return null;
     const [userRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
          FROM subject_lifecycle
@@ -7422,18 +7943,21 @@ export class MysqlSessionStore implements
         WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
       [authorization.tenantId, authorization.tenantId],
     );
+    const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
+    if (
+      !tenant
+      || tenant.state !== "active"
+      || await this.hasTenantErasureAuthorityFence(conn, authorization.tenantId)
+    ) throw new Error("stale erasure authority");
     const [userRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
          FROM subject_lifecycle
         WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR SHARE`,
       [authorization.tenantId, authorization.userId],
     );
-    const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
     const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
     if (
-      !tenant
-      || tenant.state !== "active"
-      || !user
+      !user
       || user.state !== "deleting"
       || user.generation !== authorization.subjectGeneration
       || user.activeRequestId !== authorization.requestId
@@ -7463,33 +7987,40 @@ export class MysqlSessionStore implements
       // a committed quarantine cannot be resurrected by an unrelated later SQL/deadlock failure,
       // while that failing candidate itself is rolled back and never misclassified as poison.
       const [candidateRows] = await conn.query<Row[]>(
-        `SELECT request_id, tenant_id, subject_kind, subject_id, generation
-           FROM erasure_requests
-          WHERE status IN (${statusPlaceholders})
+        `SELECT r.request_id, r.tenant_id, r.subject_kind, r.subject_id, r.generation
+           FROM erasure_requests r
+          WHERE r.subject_kind='user'
+            AND r.status IN (${statusPlaceholders})
+            AND NOT EXISTS (
+              SELECT 1 FROM tenant_erasure_admissions te WHERE te.tenant_id=r.tenant_id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=r.tenant_id
+            )
             AND NOT (
-              quarantined_at_ms IS NOT NULL
-              AND quarantine_reason_code IS NOT NULL
-              AND quarantine_evidence_sha256 IS NOT NULL
+              r.quarantined_at_ms IS NOT NULL
+              AND r.quarantine_reason_code IS NOT NULL
+              AND r.quarantine_evidence_sha256 IS NOT NULL
             )
             AND (
-              (available_at_ms IS NOT NULL AND available_at_ms<=?
-                AND (claim_token IS NULL OR (lease_until_ms IS NOT NULL AND lease_until_ms<=?)))
-              OR available_at_ms IS NULL
-              OR available_at_ms < 0
-              OR available_at_ms > 9007199254740991
-              OR (claim_token IS NULL AND lease_until_ms IS NOT NULL)
-              OR (claim_token IS NOT NULL AND lease_until_ms IS NULL)
-              OR lease_until_ms < 0
-              OR lease_until_ms > 9007199254740991
-              OR control_generation >= 9007199254740991
-              OR (claim_token IS NOT NULL
-                AND NOT REGEXP_LIKE(claim_token, '^[A-Za-z0-9._:-]{1,64}$', 'c'))
-              OR (quarantined_at_ms IS NULL
-                AND (quarantine_reason_code IS NOT NULL OR quarantine_evidence_sha256 IS NOT NULL))
-              OR (quarantined_at_ms IS NOT NULL
-                AND (quarantine_reason_code IS NULL OR quarantine_evidence_sha256 IS NULL))
+              (r.available_at_ms IS NOT NULL AND r.available_at_ms<=?
+                AND (r.claim_token IS NULL OR (r.lease_until_ms IS NOT NULL AND r.lease_until_ms<=?)))
+              OR r.available_at_ms IS NULL
+              OR r.available_at_ms < 0
+              OR r.available_at_ms > 9007199254740991
+              OR (r.claim_token IS NULL AND r.lease_until_ms IS NOT NULL)
+              OR (r.claim_token IS NOT NULL AND r.lease_until_ms IS NULL)
+              OR r.lease_until_ms < 0
+              OR r.lease_until_ms > 9007199254740991
+              OR r.control_generation >= 9007199254740991
+              OR (r.claim_token IS NOT NULL
+                AND NOT REGEXP_LIKE(r.claim_token, '^[A-Za-z0-9._:-]{1,64}$', 'c'))
+              OR (r.quarantined_at_ms IS NULL
+                AND (r.quarantine_reason_code IS NOT NULL OR r.quarantine_evidence_sha256 IS NOT NULL))
+              OR (r.quarantined_at_ms IS NOT NULL
+                AND (r.quarantine_reason_code IS NULL OR r.quarantine_evidence_sha256 IS NULL))
             )
-          ORDER BY available_at_ms ASC, request_id ASC
+          ORDER BY r.available_at_ms ASC, r.request_id ASC
           LIMIT 100`,
         [...CLAIMABLE_ERASURE_REQUEST_STATUSES, options.nowMs, options.nowMs],
       );
@@ -7565,6 +8096,9 @@ export class MysqlSessionStore implements
       }
     }
     if (candidate.subjectKind === "user") {
+      if (await this.hasTenantErasureAuthorityFence(conn, candidate.tenantId)) {
+        return { kind: "skipped" };
+      }
       const [userRows] = await conn.query<Row[]>(
         `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
            FROM subject_lifecycle
@@ -8324,6 +8858,17 @@ export class MysqlSessionStore implements
         await conn.commit();
         return false;
       }
+      // Preserve the existing lifecycle-integrity exception below for a genuinely non-active
+      // parent. Only the otherwise-valid active projection plus orphan append-only evidence takes
+      // this no-resurrection path and declines to mint fresh queue authority.
+      if (
+        current.subjectKind === "user"
+        && context.tenant?.state === "active"
+        && await this.hasTenantErasureAuthorityFence(conn, current.tenantId)
+      ) {
+        await conn.commit();
+        return false;
+      }
 
       if (isErasureJobQuarantined(current)) {
         const expectedEvidenceSha256 = erasureJobInterventionEvidenceSha256({
@@ -8639,16 +9184,41 @@ export class MysqlSessionStore implements
 
   // ---------- agents ----------
   async createAgent(def: AgentDefinition) {
-    await this.pool.query(
-      "INSERT INTO agent_versions (tenant_id, agent_id, version, definition, created_at_ms) VALUES (?,?,?,?,?)",
-      [def.tenantId, def.id, def.version, json(def), def.createdAtMs],
-    );
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, def.tenantId, def.createdAtMs);
+      await conn.query(
+        "INSERT INTO agent_versions (tenant_id, agent_id, version, definition, created_at_ms) VALUES (?,?,?,?,?)",
+        [def.tenantId, def.id, def.version, json(def), def.createdAtMs],
+      );
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
   async getAgent(tenantId: string, agentId: string, version?: number) {
     const [rows] = await this.pool.query<Row[]>(
       version === undefined
-        ? "SELECT definition FROM agent_versions WHERE tenant_id=? AND agent_id=? ORDER BY version DESC LIMIT 1"
-        : "SELECT definition FROM agent_versions WHERE tenant_id=? AND agent_id=? AND version=?",
+        ? `SELECT a.definition FROM agent_versions a
+             JOIN subject_lifecycle tl
+               ON tl.tenant_id=a.tenant_id AND tl.subject_kind='tenant'
+              AND tl.subject_id=a.tenant_id AND tl.state='active'
+             LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=a.tenant_id
+             LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=a.tenant_id
+            WHERE a.tenant_id=? AND a.agent_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+            ORDER BY a.version DESC LIMIT 1`
+        : `SELECT a.definition FROM agent_versions a
+             JOIN subject_lifecycle tl
+               ON tl.tenant_id=a.tenant_id AND tl.subject_kind='tenant'
+              AND tl.subject_id=a.tenant_id AND tl.state='active'
+             LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=a.tenant_id
+             LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=a.tenant_id
+            WHERE a.tenant_id=? AND a.agent_id=? AND a.version=?
+              AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
       version === undefined ? [tenantId, agentId] : [tenantId, agentId, version],
     );
     return rows[0] ? parse<AgentDefinition>(rows[0].definition) : null;
@@ -8658,7 +9228,12 @@ export class MysqlSessionStore implements
       `SELECT a.definition, a.agent_id FROM agent_versions a
          JOIN (SELECT agent_id, MAX(version) v FROM agent_versions WHERE tenant_id=? GROUP BY agent_id) m
            ON a.agent_id=m.agent_id AND a.version=m.v
-        WHERE a.tenant_id=? ${opts.cursor ? "AND a.agent_id < ?" : ""}
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=a.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=a.tenant_id AND tl.state='active'
+         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=a.tenant_id
+         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=a.tenant_id
+        WHERE a.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL ${opts.cursor ? "AND a.agent_id < ?" : ""}
         ORDER BY a.agent_id DESC LIMIT ?`,
       opts.cursor ? [tenantId, tenantId, opts.cursor, opts.limit + 1] : [tenantId, tenantId, opts.limit + 1],
     );
@@ -8735,10 +9310,11 @@ export class MysqlSessionStore implements
            JOIN subject_lifecycle tl
              ON tl.tenant_id=s.tenant_id AND tl.subject_kind='tenant'
             AND tl.subject_id=s.tenant_id AND tl.state='active'
-           JOIN subject_lifecycle ul
+          JOIN subject_lifecycle ul
              ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
             AND ul.subject_id=s.user_id AND ul.state='active'
-          WHERE s.session_id=? AND s.tenant_id=? AND s.deleted_at_ms IS NULL`,
+          WHERE s.session_id=? AND s.tenant_id=? AND s.deleted_at_ms IS NULL
+            AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
         [sessionId, tenantId],
       );
       if (!rows[0]) return null;
@@ -9556,7 +10132,11 @@ export class MysqlSessionStore implements
 
   async listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }): Promise<Page<Session>> {
     return this.withConsistentRead(async (conn) => {
-      const where = ["s.tenant_id=?", "s.deleted_at_ms IS NULL"];
+      const where = [
+        "s.tenant_id=?",
+        "s.deleted_at_ms IS NULL",
+        SESSION_TENANT_ERASURE_EVIDENCE_ABSENT,
+      ];
       const params: unknown[] = [tenantId];
       if (opts.userId) { where.push("s.user_id=?"); params.push(opts.userId); }
       if (!opts.includeArchived) where.push("s.archived_at_ms IS NULL");
@@ -9747,7 +10327,8 @@ export class MysqlSessionStore implements
         WHERE b.blob_id=? AND b.tenant_id=? AND b.user_id=? AND b.session_id=? AND b.purpose=?
           AND b.state='staging' AND b.item_id IS NULL AND b.uploaded_at_ms IS NOT NULL
           AND b.sha256 IS NOT NULL AND b.size_bytes IS NOT NULL
-          AND s.deleted_at_ms IS NULL AND s.archived_at_ms IS NULL`,
+          AND s.deleted_at_ms IS NULL AND s.archived_at_ms IS NULL
+          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
       [input.blobId, input.owner.tenantId, input.owner.userId, input.sessionId, input.purpose],
     );
     const manifest = rows[0] ? rowToBlobManifest(rows[0]) : null;
@@ -9765,6 +10346,7 @@ export class MysqlSessionStore implements
       "i.item_id=b.item_id",
       "i.session_id=b.session_id",
       "i.user_id=b.user_id",
+      SESSION_TENANT_ERASURE_EVIDENCE_ABSENT,
     ];
     const params: unknown[] = [input.blobId, input.owner.tenantId, input.owner.userId, input.sessionId];
     if (input.itemId) { where.push("b.item_id=?"); params.push(input.itemId); }
@@ -10534,7 +11116,8 @@ export class MysqlSessionStore implements
            JOIN subject_lifecycle ul
              ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
             AND ul.subject_id=s.user_id AND ul.state='active'
-          WHERE t.turn_id=? AND t.session_id=?`,
+          WHERE t.turn_id=? AND t.session_id=?
+            AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
         [turnId, sessionId],
       );
       if (!rows[0]) return null;
@@ -10555,6 +11138,7 @@ export class MysqlSessionStore implements
              ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
             AND ul.subject_id=s.user_id AND ul.state='active'
           WHERE t.session_id=? ${opts.cursor ? `AND t.turn_id ${desc ? "<" : ">"} ?` : ""}
+            AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}
           ORDER BY t.turn_id ${desc ? "DESC" : "ASC"} LIMIT ?`,
         opts.cursor ? [sessionId, opts.cursor, opts.limit + 1] : [sessionId, opts.limit + 1],
       );
@@ -10567,7 +11151,11 @@ export class MysqlSessionStore implements
   }
   async listItems(sessionId: string, opts: { turnId?: string; afterSeq?: number; limit: number; newestFirst?: boolean }) {
     return this.withConsistentRead(async (conn) => {
-      const where = ["i.session_id=?", "s.deleted_at_ms IS NULL"];
+      const where = [
+        "i.session_id=?",
+        "s.deleted_at_ms IS NULL",
+        SESSION_TENANT_ERASURE_EVIDENCE_ABSENT,
+      ];
       const params: unknown[] = [sessionId];
       if (opts.turnId) { where.push("i.turn_id=?"); params.push(opts.turnId); }
       if (opts.afterSeq !== undefined) { where.push("i.seq>?"); params.push(opts.afterSeq); }
@@ -10611,7 +11199,8 @@ export class MysqlSessionStore implements
            JOIN subject_lifecycle ul
              ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
             AND ul.subject_id=s.user_id AND ul.state='active'
-          WHERE i.item_id=? AND i.session_id=?`,
+          WHERE i.item_id=? AND i.session_id=?
+            AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
         [itemId, sessionId],
       );
       if (!rows[0]) return null;
@@ -10631,6 +11220,7 @@ export class MysqlSessionStore implements
            ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
           AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE a.session_id=? ${opts.pendingOnly ? "AND a.status='pending'" : ""}
+          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}
         ORDER BY a.created_at_ms ASC`,
       [sessionId],
     );
@@ -10646,7 +11236,8 @@ export class MysqlSessionStore implements
          JOIN subject_lifecycle ul
            ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
           AND ul.subject_id=s.user_id AND ul.state='active'
-        WHERE a.approval_id=? AND a.session_id=?`,
+        WHERE a.approval_id=? AND a.session_id=?
+          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
       [approvalId, sessionId],
     );
     return rows[0] ? parse<Approval>(rows[0].body) : null;
@@ -10654,16 +11245,37 @@ export class MysqlSessionStore implements
 
   // ---------- provider configs ----------
   async upsertProviderConfig(cfg: ProviderConfig, secret?: { ciphertext: Buffer; keyId: string }) {
-    await this.pool.query(
-      `INSERT INTO provider_configs (tenant_id, provider_id, config, secret_cipher, secret_key_id, created_at_ms, updated_at_ms)
-       VALUES (?,?,?,?,?,?,?)
-       ON DUPLICATE KEY UPDATE config=VALUES(config), updated_at_ms=VALUES(updated_at_ms),
-         secret_cipher=COALESCE(VALUES(secret_cipher), secret_cipher), secret_key_id=COALESCE(VALUES(secret_key_id), secret_key_id)`,
-      [cfg.tenantId, cfg.id, json(cfg), secret?.ciphertext ?? null, secret?.keyId ?? null, cfg.createdAtMs, cfg.updatedAtMs],
-    );
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, cfg.tenantId, cfg.updatedAtMs);
+      await conn.query(
+        `INSERT INTO provider_configs (tenant_id, provider_id, config, secret_cipher, secret_key_id, created_at_ms, updated_at_ms)
+         VALUES (?,?,?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE config=VALUES(config), updated_at_ms=VALUES(updated_at_ms),
+           secret_cipher=COALESCE(VALUES(secret_cipher), secret_cipher), secret_key_id=COALESCE(VALUES(secret_key_id), secret_key_id)`,
+        [cfg.tenantId, cfg.id, json(cfg), secret?.ciphertext ?? null, secret?.keyId ?? null, cfg.createdAtMs, cfg.updatedAtMs],
+      );
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
   async getProviderConfig(tenantId: string, providerId: string) {
-    const [rows] = await this.pool.query<Row[]>("SELECT config, secret_cipher, secret_key_id FROM provider_configs WHERE tenant_id=? AND provider_id=?", [tenantId, providerId]);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT p.config, p.secret_cipher, p.secret_key_id FROM provider_configs p
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=p.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=p.tenant_id AND tl.state='active'
+         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=p.tenant_id
+         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=p.tenant_id
+        WHERE p.tenant_id=? AND p.provider_id=?
+          AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
+      [tenantId, providerId],
+    );
     const r = rows[0];
     if (!r) return null;
     return {
@@ -10672,27 +11284,85 @@ export class MysqlSessionStore implements
     };
   }
   async listProviderConfigs(tenantId: string) {
-    const [rows] = await this.pool.query<Row[]>("SELECT config FROM provider_configs WHERE tenant_id=? ORDER BY provider_id", [tenantId]);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT p.config FROM provider_configs p
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=p.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=p.tenant_id AND tl.state='active'
+         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=p.tenant_id
+         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=p.tenant_id
+        WHERE p.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL ORDER BY p.provider_id`,
+      [tenantId],
+    );
     return rows.map((r) => parse<ProviderConfig>(r.config));
   }
   async deleteProviderConfig(tenantId: string, providerId: string) {
-    const [res] = await this.pool.query<mysql.ResultSetHeader>("DELETE FROM provider_configs WHERE tenant_id=? AND provider_id=?", [tenantId, providerId]);
-    return res.affectedRows > 0;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, tenantId, Date.now());
+      const [res] = await conn.query<mysql.ResultSetHeader>(
+        "DELETE FROM provider_configs WHERE tenant_id=? AND provider_id=?",
+        [tenantId, providerId],
+      );
+      await conn.commit();
+      return res.affectedRows > 0;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
 
   // ---------- api keys ----------
   async resolveApiKey(hashedKey: string) {
-    const [rows] = await this.pool.query<Row[]>("SELECT tenant_id, key_id, scopes FROM api_keys WHERE key_hash=? AND revoked_at_ms IS NULL", [hashedKey]);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT k.tenant_id, k.key_id, k.scopes FROM api_keys k
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=k.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=k.tenant_id AND tl.state='active'
+         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=k.tenant_id
+         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=k.tenant_id
+        WHERE k.key_hash=? AND k.revoked_at_ms IS NULL
+          AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
+      [hashedKey],
+    );
     const r = rows[0];
     if (!r) return null;
     return { tenantId: r.tenant_id as string, keyId: r.key_id as string, scopes: r.scopes == null ? DEFAULT_SCOPES : parse<ApiKeyScope[]>(r.scopes) };
   }
   async createApiKey(tenantId: string, keyId: string, hashedKey: string, scopes: ApiKeyScope[] = DEFAULT_SCOPES) {
-    await this.pool.query("INSERT IGNORE INTO tenants (tenant_id, created_at_ms) VALUES (?,?)", [tenantId, Date.now()]);
-    await this.pool.query("INSERT IGNORE INTO api_keys (key_hash, key_id, tenant_id, scopes, created_at_ms) VALUES (?,?,?,?,?)", [hashedKey, keyId, tenantId, json(scopes), Date.now()]);
+    const conn = await this.pool.getConnection();
+    const now = Date.now();
+    try {
+      await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, tenantId, now);
+      await conn.query("INSERT IGNORE INTO tenants (tenant_id, created_at_ms) VALUES (?,?)", [tenantId, now]);
+      await conn.query(
+        "INSERT IGNORE INTO api_keys (key_hash, key_id, tenant_id, scopes, created_at_ms) VALUES (?,?,?,?,?)",
+        [hashedKey, keyId, tenantId, json(scopes), now],
+      );
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
   async listApiKeys(tenantId: string): Promise<ApiKeyRecord[]> {
-    const [rows] = await this.pool.query<Row[]>("SELECT key_id, tenant_id, scopes, created_at_ms, revoked_at_ms FROM api_keys WHERE tenant_id=? ORDER BY created_at_ms", [tenantId]);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT k.key_id, k.tenant_id, k.scopes, k.created_at_ms, k.revoked_at_ms
+         FROM api_keys k
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=k.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=k.tenant_id AND tl.state='active'
+         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=k.tenant_id
+         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=k.tenant_id
+        WHERE k.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL ORDER BY k.created_at_ms`,
+      [tenantId],
+    );
     return rows.map((r) => ({
       keyId: r.key_id as string,
       tenantId: r.tenant_id as string,
@@ -10702,16 +11372,36 @@ export class MysqlSessionStore implements
     }));
   }
   async revokeApiKey(tenantId: string, keyId: string) {
-    const [res] = await this.pool.query<mysql.ResultSetHeader>(
-      "UPDATE api_keys SET revoked_at_ms=? WHERE tenant_id=? AND key_id=? AND revoked_at_ms IS NULL",
-      [Date.now(), tenantId, keyId],
-    );
-    return res.affectedRows > 0;
+    const conn = await this.pool.getConnection();
+    const now = Date.now();
+    try {
+      await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, tenantId, now);
+      const [res] = await conn.query<mysql.ResultSetHeader>(
+        "UPDATE api_keys SET revoked_at_ms=? WHERE tenant_id=? AND key_id=? AND revoked_at_ms IS NULL",
+        [now, tenantId, keyId],
+      );
+      await conn.commit();
+      return res.affectedRows > 0;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
 
   async getTenant(tenantId: string): Promise<TenantRecord | null> {
     const [rows] = await this.pool.query<Row[]>(
-      "SELECT tenant_id, name, auth_policy, auth_secret_cipher, auth_secret_key_id, created_at_ms FROM tenants WHERE tenant_id=?",
+      `SELECT t.tenant_id, t.name, t.auth_policy, t.auth_secret_cipher, t.auth_secret_key_id,
+              t.created_at_ms
+         FROM tenants t
+         JOIN subject_lifecycle tl
+           ON tl.tenant_id=t.tenant_id AND tl.subject_kind='tenant'
+          AND tl.subject_id=t.tenant_id AND tl.state='active'
+         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=t.tenant_id
+         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=t.tenant_id
+        WHERE t.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
       [tenantId],
     );
     const r = rows[0];
@@ -10728,14 +11418,26 @@ export class MysqlSessionStore implements
     // `undefined` keeps the stored secret; `null` clears it, so switching verifier kind cannot leave a
     // stale key behind that would then be used to verify tokens for the new configuration.
     const keep = secret === undefined;
-    await this.pool.query(
-      `INSERT INTO tenants (tenant_id, auth_policy, auth_secret_cipher, auth_secret_key_id, created_at_ms)
-       VALUES (?,?,?,?,?)
-       ON DUPLICATE KEY UPDATE auth_policy=VALUES(auth_policy),
-         auth_secret_cipher=${keep ? "auth_secret_cipher" : "VALUES(auth_secret_cipher)"},
-         auth_secret_key_id=${keep ? "auth_secret_key_id" : "VALUES(auth_secret_key_id)"}`,
-      [tenantId, json(policy), secret?.ciphertext ?? null, secret?.keyId ?? null, Date.now()],
-    );
+    const conn = await this.pool.getConnection();
+    const now = Date.now();
+    try {
+      await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, tenantId, now);
+      await conn.query(
+        `INSERT INTO tenants (tenant_id, auth_policy, auth_secret_cipher, auth_secret_key_id, created_at_ms)
+         VALUES (?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE auth_policy=VALUES(auth_policy),
+           auth_secret_cipher=${keep ? "auth_secret_cipher" : "VALUES(auth_secret_cipher)"},
+           auth_secret_key_id=${keep ? "auth_secret_key_id" : "VALUES(auth_secret_key_id)"}`,
+        [tenantId, json(policy), secret?.ciphertext ?? null, secret?.keyId ?? null, now],
+      );
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
 
   // ---------- usage ledger ----------
@@ -10990,6 +11692,7 @@ export class MysqlSessionStore implements
            ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
           AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE ${where.join(" AND ")}
+          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}
         GROUP BY k
         ORDER BY total_tokens DESC, k ASC
         LIMIT ?`,
@@ -11242,7 +11945,8 @@ export class MysqlSessionStore implements
          JOIN subject_lifecycle ul
            ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
           AND ul.subject_id=s.user_id AND ul.state='active'
-        WHERE i.tenant_id=? AND i.user_id=? AND i.session_id=? AND i.idem_key=?`,
+        WHERE i.tenant_id=? AND i.user_id=? AND i.session_id=? AND i.idem_key=?
+          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
       [scope.tenantId, scope.userId, scope.sessionId, key],
     );
     const row = rows[0];
@@ -11714,13 +12418,29 @@ export class MysqlSessionStore implements
     userId: string,
     atMs: number,
     options: { userLock: "FOR SHARE" | "FOR UPDATE"; requireActive: boolean },
-  ): Promise<{ tenant: SubjectLifecycleRecord; user: SubjectLifecycleRecord }> {
+  ): Promise<{
+    tenant: SubjectLifecycleRecord;
+    user: SubjectLifecycleRecord;
+    tenantBlocked: boolean;
+  }> {
     await this.ensureSubjectLifecycleRows(conn, tenantId, userId, atMs);
     const [tenantRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
          FROM subject_lifecycle
         WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
       [tenantId, tenantId],
+    );
+    const tenantAdmission = await this.loadTenantErasureAdmission(
+      conn,
+      tenantId,
+      undefined,
+      "FOR SHARE",
+    );
+    const tenantFence = await this.loadTenantCredentialRevocationFence(
+      conn,
+      tenantId,
+      undefined,
+      "FOR SHARE",
     );
     const [userRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
@@ -11731,10 +12451,16 @@ export class MysqlSessionStore implements
     const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
     const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
     if (!tenant || !user) throw new UserDataExportIntegrityError("data export subject gate is missing");
-    if (options.requireActive && (tenant.state !== "active" || user.state !== "active")) {
-      throw new SubjectDeletingError(tenantId, user.state === "active" ? undefined : userId);
+    const tenantBlocked = tenant.state !== "active"
+      || tenantAdmission !== null
+      || tenantFence !== null;
+    if (options.requireActive && (
+      tenantBlocked
+      || user.state !== "active"
+    )) {
+      throw new SubjectDeletingError(tenantId, tenantBlocked ? undefined : userId);
     }
-    return { tenant, user };
+    return { tenant, user, tenantBlocked };
   }
 
   private async lockActiveUserExportClaim(
@@ -12238,7 +12964,8 @@ export class MysqlSessionStore implements
         return null;
       }
       if (
-        (subject.tenant.state !== "active"
+        (subject.tenantBlocked
+          || subject.tenant.state !== "active"
           || subject.user.state !== "active"
           || subject.user.generation !== request.subjectGeneration)
         && request.status !== "revoked"
@@ -12297,7 +13024,8 @@ export class MysqlSessionStore implements
         return null;
       }
       if (
-        (subject.tenant.state !== "active"
+        (subject.tenantBlocked
+          || subject.tenant.state !== "active"
           || subject.user.state !== "active"
           || subject.user.generation !== request.subjectGeneration)
         && request.status !== "revoked"
@@ -14294,7 +15022,8 @@ export class MysqlSessionStore implements
           throw new UserDataExportIntegrityError("data export artifact request identity conflicts");
         }
         if (
-          (subject.tenant.state !== "active"
+          (subject.tenantBlocked
+            || subject.tenant.state !== "active"
             || subject.user.state !== "active"
             || subject.user.generation !== request.subjectGeneration)
           && request.status !== "revoked"

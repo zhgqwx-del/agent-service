@@ -131,6 +131,7 @@ import {
   ErasureIdempotencyMismatchError,
   ErasureJobIntegrityFault,
   SubjectDeletingError,
+  TenantErasureConflictError,
   assertErasureClaimToken,
   classifyErasureJobRecordFault,
   deriveBlockedErasureResumePhase,
@@ -147,6 +148,7 @@ import {
   isClaimableErasureRequestStatus,
   newErasureJobIntegrityFault,
   subjectLifecycleKey,
+  tenantCredentialRevocationFenceSha256,
   validateClaimErasureJobsOptions,
   validateErasureJobAuthorization,
   validateErasureAuditChain,
@@ -157,6 +159,8 @@ import {
   validateErasureRequestRecordForRead,
   validateRepairAndResumeErasureJobInput,
   validateRequestUserErasureInput,
+  validateRequestTenantErasureInput,
+  validateTenantCredentialRevocationFence,
   validateRenewErasureJobClaimOptions,
   validateRetryErasureJobOptions,
   validateTransitionErasureJobOptions,
@@ -177,11 +181,14 @@ import {
   type ErasureRequestStatus,
   type ErasureWriteAuthorization,
   type RequestUserErasureInput,
+  type RequestTenantErasureInput,
   type RepairAndResumeErasureJobInput,
   type RetryErasureJobOptions,
   type RenewErasureJobClaimOptions,
   type SubjectLifecycleRecord,
   type SubjectLifecycleStore,
+  type TenantCredentialRevocationFence,
+  type TenantRuntimeState,
   type TransitionErasureJobOptions,
 } from "./subject-lifecycle.js";
 import {
@@ -426,6 +433,14 @@ function retentionPolicyKey(tenantId: string, policyVersion: string): string {
   return JSON.stringify([tenantId, policyVersion]);
 }
 
+function agentVersionKey(tenantId: string, agentId: string, version: number): string {
+  return JSON.stringify([tenantId, agentId, version]);
+}
+
+function providerConfigKey(tenantId: string, providerId: string): string {
+  return JSON.stringify([tenantId, providerId]);
+}
+
 function legalHoldKey(tenantId: string, holdId: string): string {
   return JSON.stringify([tenantId, holdId]);
 }
@@ -552,7 +567,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 
 /** In-memory store: reference semantics for tests. Single process only. */
 export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore {
-  agents = new Map<string, AgentDefinition>(); // `${tenant}/${id}@${version}`
+  agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
   items = new Map<string, Item>();
@@ -572,7 +587,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   usageReconciliations = new Map<string, UsageReconciliationRecord>();
   subjectLifecycles = new Map<string, SubjectLifecycleRecord>();
   erasureRequests = new Map<string, ErasureRequestRecord>();
+  tenantErasureAdmissions = new Map<string, ErasureRequestRecord>();
   erasureAuditEvents = new Map<string, ErasureAuditEvent[]>();
+  tenantCredentialRevocationFences = new Map<string, TenantCredentialRevocationFence>();
   erasureJobControlEvents = new Map<string, ErasureJobControlEvent[]>();
   private nextErasureJobControlEventId = 1;
   erasureJobTerminalIncidents = new Map<string, ErasureJobTerminalIncident>();
@@ -715,6 +732,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async putRetentionPolicy(input: PutRetentionPolicyInput): Promise<RetentionPolicyVersionRecord> {
     const stagedInput = clone(input);
     validatePutRetentionPolicyInput(stagedInput);
+    this.assertTenantWritable(stagedInput.tenantId);
     const key = retentionPolicyKey(stagedInput.tenantId, stagedInput.policyVersion);
     const existing = this.retentionPolicies.get(key);
     if (existing) {
@@ -771,6 +789,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   ): Promise<RetentionPolicyControlRecord> {
     const stagedInput = clone(input);
     validateActivateRetentionPolicyInput(stagedInput);
+    this.assertTenantWritable(stagedInput.tenantId);
     const policy = this.retentionPolicies.get(retentionPolicyKey(
       stagedInput.tenantId,
       stagedInput.policyVersion,
@@ -1139,6 +1158,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async setLegalHold(input: SetLegalHoldInput): Promise<LegalHoldRecord> {
     const stagedInput = clone(input);
     validateSetLegalHoldInput(stagedInput);
+    this.assertTenantWritable(stagedInput.tenantId);
     const holdKey = legalHoldKey(stagedInput.tenantId, stagedInput.holdId);
     const existing = this.legalHolds.get(holdKey);
     if (existing) {
@@ -1244,6 +1264,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async releaseLegalHold(input: ReleaseLegalHoldInput): Promise<LegalHoldRecord> {
     const stagedInput = clone(input);
     validateReleaseLegalHoldInput(stagedInput);
+    this.assertTenantWritable(stagedInput.tenantId);
     const holdKey = legalHoldKey(stagedInput.tenantId, stagedInput.holdId);
     const existing = this.legalHolds.get(holdKey);
     if (!existing) throw new LegalHoldNotFoundError(stagedInput.holdId);
@@ -1466,6 +1487,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     nowMs: number,
   ): { job: ErasurePolicyEvaluationJob; request: ErasureRequestRecord } {
     validateErasurePolicyEvaluationAuthorization(authorization);
+    if (!this.isTenantActive(authorization.tenantId)) {
+      throw new Error("stale erasure policy evaluation authority");
+    }
     const job = this.erasurePolicyEvaluationJobs.get(authorization.requestId);
     if (!job) throw new Error("stale erasure policy evaluation authority");
     const { request } = this.assertErasurePolicyEvaluationJob(job);
@@ -1675,6 +1699,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     for (const request of candidates) {
       if (scheduled >= options.limit) break;
       try {
+        // Append-only tenant admission/fence evidence is an independent parent-authority fence.
+        // A privileged repair must not revive user purge evaluation merely by resetting the
+        // mutable tenant lifecycle projection to active.
+        if (!this.isTenantActive(request.tenantId)) continue;
         const job = this.erasurePolicyEvaluationJobs.get(request.requestId);
         let shouldSchedule = !job;
         if (job?.sealedAtMs !== undefined) {
@@ -1813,7 +1841,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const leaseUntilMs = validateClaimErasurePolicyEvaluationsOptions(options);
     const candidates = [...this.erasurePolicyEvaluationJobs.values()]
       .filter((job) => (
-        job.sealedAtMs === undefined
+        this.isTenantActive(job.tenantId)
+        && job.sealedAtMs === undefined
         && job.availableAtMs !== undefined
         && job.availableAtMs <= options.nowMs
         && (job.claimToken === undefined || job.leaseUntilMs! <= options.nowMs)
@@ -1854,6 +1883,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const leaseUntilMs = validateRenewErasurePolicyEvaluationOptions(options);
     const job = this.erasurePolicyEvaluationJobs.get(authorization.requestId);
     if (!job) return false;
+    if (!this.isTenantActive(job.tenantId)) return false;
     this.assertErasurePolicyEvaluationJob(job);
     if (!erasurePolicyEvaluationAuthorizationMatches(job, authorization, options.nowMs)) return false;
     const next = clone(job);
@@ -1871,6 +1901,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateRetryErasurePolicyEvaluationOptions(options);
     const job = this.erasurePolicyEvaluationJobs.get(authorization.requestId);
     if (!job) return false;
+    if (!this.isTenantActive(job.tenantId)) return false;
     this.assertErasurePolicyEvaluationJob(job);
     if (!erasurePolicyEvaluationAuthorizationMatches(job, authorization, options.failedAtMs)) return false;
     let next: ErasurePolicyEvaluationJob;
@@ -2402,6 +2433,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const job = this.erasurePolicyEvaluationJobs.get(requestId);
     if (!job) throw new Error("erasure purge authority job is corrupt");
     const { request } = this.assertErasurePolicyEvaluationJob(job);
+    if (!this.isTenantActive(request.tenantId)) return null;
     if (request.subjectKind !== "user") throw new Error("tenant purge authority is not implemented");
     const boundPolicy = request.policyVersion === undefined
       ? undefined
@@ -3730,16 +3762,74 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return this.subjectLifecycles.get(subjectLifecycleKey(tenantId, subjectKind, subjectId));
   }
 
-  private isSubjectActive(tenantId: string, userId: string): boolean {
+  private tenantErasureAdmission(tenantId: string): ErasureRequestRecord | undefined {
+    return [...this.tenantErasureAdmissions.values()].find((request) => request.tenantId === tenantId);
+  }
+
+  private hasTenantErasureAuthorityFence(tenantId: string): boolean {
+    return this.tenantErasureAdmission(tenantId) !== undefined
+      || this.tenantCredentialRevocationFences.has(tenantId);
+  }
+
+  async getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState> {
+    if (!tenantId || tenantId.length > 128) throw new Error("invalid tenant id");
+    const lifecycle = this.subjectRecord(tenantId, "tenant", tenantId);
+    const admission = this.tenantErasureAdmission(tenantId);
+    const fence = this.tenantCredentialRevocationFences.get(tenantId);
+    if (admission) validateErasureRequestRecordForRead(admission);
+    if (fence) validateTenantCredentialRevocationFence(fence);
+    if (!lifecycle) {
+      if (admission || fence) throw new Error("tenant lifecycle gate is missing for an existing erasure admission");
+      return { tenantId, state: "active", generation: 0 };
+    }
+    if (
+      (lifecycle.state === "active" && (admission !== undefined || fence !== undefined))
+      || (lifecycle.state !== "active" && (
+        !admission
+        || !fence
+        || admission.requestId !== lifecycle.activeRequestId
+        || admission.generation !== lifecycle.generation
+        || fence.requestId !== lifecycle.activeRequestId
+        || fence.subjectGeneration !== lifecycle.generation
+      ))
+    ) throw new Error("tenant lifecycle and credential fence do not agree");
+    return clone({
+      tenantId,
+      state: lifecycle.state,
+      generation: lifecycle.generation,
+      ...(lifecycle.activeRequestId === undefined
+        ? {}
+        : { activeRequestId: lifecycle.activeRequestId }),
+    });
+  }
+
+  private assertTenantWritable(tenantId: string): SubjectLifecycleRecord | undefined {
     const tenant = this.subjectRecord(tenantId, "tenant", tenantId);
+    const admission = this.tenantErasureAdmission(tenantId);
+    if (!tenant && (
+      this.tenantCredentialRevocationFences.has(tenantId)
+      || admission !== undefined
+    )) throw new SubjectDeletingError(tenantId);
+    if (
+      (tenant && tenant.state !== "active")
+      || admission !== undefined
+      || this.tenantCredentialRevocationFences.has(tenantId)
+    ) throw new SubjectDeletingError(tenantId);
+    return tenant;
+  }
+
+  private isTenantActive(tenantId: string): boolean {
+    const tenant = this.subjectRecord(tenantId, "tenant", tenantId);
+    if (this.hasTenantErasureAuthorityFence(tenantId)) return false;
+    return (tenant?.state ?? "active") === "active";
+  }
+
+  private isSubjectActive(tenantId: string, userId: string): boolean {
     const user = this.subjectRecord(tenantId, "user", userId);
-    if (!tenant && [...this.erasureRequests.values()].some((request) => (
-      request.tenantId === tenantId && request.subjectKind === "tenant" && request.subjectId === tenantId
-    ))) return false;
     if (!user && [...this.erasureRequests.values()].some((request) => (
       request.tenantId === tenantId && request.subjectKind === "user" && request.subjectId === userId
     ))) return false;
-    return (tenant?.state ?? "active") === "active" && (user?.state ?? "active") === "active";
+    return this.isTenantActive(tenantId) && (user?.state ?? "active") === "active";
   }
 
   private isUserDataExportSubjectCurrent(request: UserDataExportRequestRecord): boolean {
@@ -3749,11 +3839,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   private assertSubjectWritable(tenantId: string, userId: string): void {
-    const tenant = this.subjectRecord(tenantId, "tenant", tenantId);
-    if (!tenant && [...this.erasureRequests.values()].some((request) => (
-      request.tenantId === tenantId && request.subjectKind === "tenant" && request.subjectId === tenantId
-    ))) throw new SubjectDeletingError(tenantId);
-    if (tenant && tenant.state !== "active") throw new SubjectDeletingError(tenantId);
+    this.assertTenantWritable(tenantId);
     const user = this.subjectRecord(tenantId, "user", userId);
     if (!user && [...this.erasureRequests.values()].some((request) => (
       request.tenantId === tenantId && request.subjectKind === "user" && request.subjectId === userId
@@ -3826,8 +3912,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   async requestUserErasure(input: RequestUserErasureInput): Promise<ErasureRequestRecord> {
     validateRequestUserErasureInput(input);
-    const tenant = this.subjectRecord(input.tenantId, "tenant", input.tenantId);
-    if (tenant && tenant.state !== "active") throw new SubjectDeletingError(input.tenantId);
+    const tenant = this.assertTenantWritable(input.tenantId);
 
     const idempotencyKey = this.erasureIdempotencyKey(input);
     const replayId = this.erasureIdempotency.get(idempotencyKey);
@@ -3964,6 +4049,213 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return clone(request);
   }
 
+  private tenantErasureIdempotencyKey(input: Pick<
+    RequestTenantErasureInput,
+    "tenantId" | "idempotencyKey"
+  >): string {
+    return JSON.stringify([input.tenantId, "tenant", input.tenantId, input.idempotencyKey]);
+  }
+
+  async requestTenantErasure(input: RequestTenantErasureInput): Promise<ErasureRequestRecord> {
+    const stagedInput = clone(input);
+    validateRequestTenantErasureInput(stagedInput);
+    const tenantKey = subjectLifecycleKey(stagedInput.tenantId, "tenant", stagedInput.tenantId);
+    const existingTenant = this.subjectLifecycles.get(tenantKey);
+    const existingAdmission = this.tenantErasureAdmission(stagedInput.tenantId);
+    const existingFence = this.tenantCredentialRevocationFences.get(stagedInput.tenantId);
+    if (existingFence) validateTenantCredentialRevocationFence(existingFence);
+    const idempotencyKey = this.tenantErasureIdempotencyKey(stagedInput);
+    const replayId = this.erasureIdempotency.get(idempotencyKey);
+    if (replayId) {
+      const replay = this.tenantErasureAdmissions.get(replayId);
+      if (
+        !replay
+        || replay.tenantId !== stagedInput.tenantId
+        || replay.subjectKind !== "tenant"
+        || replay.subjectId !== stagedInput.tenantId
+        || replay.idempotencyKey !== stagedInput.idempotencyKey
+      ) throw new Error("erasure idempotency index is corrupt");
+      validateErasureRequestRecordForRead(replay);
+      if (replay.requestHash !== stagedInput.requestHash) {
+        throw new ErasureIdempotencyMismatchError();
+      }
+      if (
+        !existingTenant
+        || existingTenant.state === "active"
+        || existingTenant.activeRequestId !== replay.requestId
+        || existingTenant.generation !== replay.generation
+        || !existingFence
+        || existingFence.requestId !== replay.requestId
+        || existingFence.subjectGeneration !== replay.generation
+      ) throw new Error("tenant erasure replay does not match its lifecycle fence");
+      return clone(replay);
+    }
+
+    if (existingTenant && existingTenant.state !== "active") {
+      const active = existingTenant.activeRequestId
+        ? this.tenantErasureAdmissions.get(existingTenant.activeRequestId)
+        : undefined;
+      if (
+        !active
+        || active.tenantId !== stagedInput.tenantId
+        || active.subjectKind !== "tenant"
+        || active.subjectId !== stagedInput.tenantId
+        || active.generation !== existingTenant.generation
+        || !existingFence
+        || existingFence.requestId !== active.requestId
+        || existingFence.subjectGeneration !== active.generation
+      ) throw new Error("tenant lifecycle active request is corrupt");
+      validateErasureRequestRecordForRead(active);
+      return clone(active);
+    }
+    if (existingAdmission || existingFence) {
+      throw new Error("active tenant already has erasure admission or credential revocation evidence");
+    }
+    if (
+      this.erasureRequests.has(stagedInput.requestId)
+      || this.tenantErasureAdmissions.has(stagedInput.requestId)
+    ) {
+      throw new Error("erasure request id already exists");
+    }
+    if ([...this.erasureRequests.values()].some((request) => (
+      request.tenantId === stagedInput.tenantId
+      && request.subjectKind === "user"
+      && (
+        request.status === "gated"
+        || request.status === "draining"
+        || request.status === "tombstoning"
+        || request.status === "reconciling_usage"
+        || request.status === "purging"
+      )
+    ))) throw new TenantErasureConflictError();
+
+    const boundPolicy = this.activeRetentionPolicyBinding(stagedInput.tenantId);
+    const generation = (existingTenant?.generation ?? 0) + 1;
+    const stagedTenant = clone<SubjectLifecycleRecord>({
+      ...(existingTenant ?? this.activeSubjectRecord(
+        stagedInput.tenantId,
+        "tenant",
+        stagedInput.tenantId,
+        stagedInput.atMs,
+      )),
+      state: "deleting",
+      generation,
+      activeRequestId: stagedInput.requestId,
+      updatedAtMs: Math.max(existingTenant?.updatedAtMs ?? stagedInput.atMs, stagedInput.atMs),
+    });
+    const stagedRequest = clone<ErasureRequestRecord>({
+      requestId: stagedInput.requestId,
+      tenantId: stagedInput.tenantId,
+      subjectKind: "tenant",
+      subjectId: stagedInput.tenantId,
+      generation,
+      status: "gated",
+      requestedByKeyId: stagedInput.requestedByKeyId,
+      idempotencyKey: stagedInput.idempotencyKey,
+      requestHash: stagedInput.requestHash,
+      createdAtMs: stagedInput.atMs,
+      gatedAtMs: stagedInput.atMs,
+      updatedAtMs: stagedInput.atMs,
+      attempts: 0,
+      ...(boundPolicy ?? {}),
+      controlGeneration: 0,
+    });
+    const stagedAudit = clone<ErasureAuditEvent>({
+      requestId: stagedInput.requestId,
+      seq: 1,
+      type: "erasure/gated",
+      payload: {
+        status: "gated",
+        subjectKind: "tenant",
+        generation,
+        credentialFence: "logical-v1",
+        ...(boundPolicy ?? {}),
+      },
+      emittedAtMs: stagedInput.atMs,
+    });
+    const fenceBase = {
+      tenantId: stagedInput.tenantId,
+      requestId: stagedInput.requestId,
+      subjectGeneration: generation,
+      fencedAtMs: stagedInput.atMs,
+    };
+    const stagedFence = clone<TenantCredentialRevocationFence>({
+      ...fenceBase,
+      evidenceSha256: tenantCredentialRevocationFenceSha256(fenceBase),
+    });
+    validateErasureRequestRecord(stagedRequest);
+    validateErasureAuditChain(stagedRequest, [stagedAudit]);
+    validateTenantCredentialRevocationFence(stagedFence);
+
+    const tenantExisted = this.subjectLifecycles.has(tenantKey);
+    const priorTenant = this.subjectLifecycles.get(tenantKey);
+    const requestExisted = this.tenantErasureAdmissions.has(stagedInput.requestId);
+    const priorRequest = this.tenantErasureAdmissions.get(stagedInput.requestId);
+    const auditExisted = this.erasureAuditEvents.has(stagedInput.requestId);
+    const priorAudit = this.erasureAuditEvents.get(stagedInput.requestId);
+    const fenceExisted = this.tenantCredentialRevocationFences.has(stagedInput.tenantId);
+    const priorFence = this.tenantCredentialRevocationFences.get(stagedInput.tenantId);
+    const idempotencyExisted = this.erasureIdempotency.has(idempotencyKey);
+    const priorIdempotency = this.erasureIdempotency.get(idempotencyKey);
+    try {
+      this.tenantErasureAdmissions.set(stagedInput.requestId, stagedRequest);
+      this.erasureAuditEvents.set(stagedInput.requestId, [stagedAudit]);
+      this.tenantCredentialRevocationFences.set(stagedInput.tenantId, stagedFence);
+      this.erasureIdempotency.set(idempotencyKey, stagedInput.requestId);
+      // Publish the lifecycle gate last. All staged values above were cloned and validated first;
+      // synchronous rollback below preserves the same all-or-nothing contract as InnoDB.
+      this.subjectLifecycles.set(tenantKey, stagedTenant);
+    } catch (error) {
+      restoreMapEntry(this.subjectLifecycles, tenantKey, tenantExisted, priorTenant);
+      restoreMapEntry(
+        this.erasureIdempotency,
+        idempotencyKey,
+        idempotencyExisted,
+        priorIdempotency,
+      );
+      restoreMapEntry(
+        this.tenantCredentialRevocationFences,
+        stagedInput.tenantId,
+        fenceExisted,
+        priorFence,
+      );
+      restoreMapEntry(this.erasureAuditEvents, stagedInput.requestId, auditExisted, priorAudit);
+      restoreMapEntry(
+        this.tenantErasureAdmissions,
+        stagedInput.requestId,
+        requestExisted,
+        priorRequest,
+      );
+      throw error;
+    }
+    return clone(stagedRequest);
+  }
+
+  async getTenantErasureRequest(
+    tenantId: string,
+    requestId: string,
+  ): Promise<ErasureRequestRecord | null> {
+    const request = this.tenantErasureAdmissions.get(requestId);
+    if (
+      !request
+      || request.tenantId !== tenantId
+      || request.subjectKind !== "tenant"
+      || request.subjectId !== tenantId
+    ) return null;
+    validateErasureRequestRecordForRead(request);
+    return clone(request);
+  }
+
+  async getTenantCredentialRevocationFence(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialRevocationFence | null> {
+    const fence = this.tenantCredentialRevocationFences.get(tenantId);
+    if (!fence || fence.requestId !== requestId) return null;
+    validateTenantCredentialRevocationFence(fence);
+    return clone(fence);
+  }
+
   async getSubjectLifecycle(
     tenantId: string,
     subjectKind: DataSubjectKind,
@@ -4033,7 +4325,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   private erasureJobParentAllowsAuthority(record: ErasureRequestRecord): boolean {
     if (record.subjectKind === "tenant") return true;
-    return this.subjectRecord(record.tenantId, "tenant", record.tenantId)?.state === "active";
+    return this.isTenantActive(record.tenantId);
   }
 
   private erasureJobNeedsImmediateQueueIsolation(record: ErasureRequestRecord): boolean {
@@ -4255,7 +4547,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const leaseUntilMs = validateClaimErasureJobsOptions(options);
     const candidates = [...this.erasureRequests.entries()]
       .filter(([, record]) => (
-        isClaimableErasureRequestStatus(record.status)
+        record.subjectKind === "user"
+        && this.erasureJobParentAllowsAuthority(record)
+        && isClaimableErasureRequestStatus(record.status)
         && !isErasureJobQuarantined(record)
         && (
           this.erasureJobNeedsImmediateQueueIsolation(record)
@@ -4287,6 +4581,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           this.terminallyIsolateUnsafeErasureJobEnvelope(requestKey, current, options.nowMs);
           continue;
         }
+        if (!this.erasureJobParentAllowsAuthority(current)) continue;
         try {
           this.assertErasureJobIntegrity(current);
         } catch (error) {
@@ -4551,6 +4846,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const current = this.erasureMaintenanceRecord(input);
     if (!current || current.controlGeneration !== input.expectedControlGeneration) return false;
     validateErasureRequestRecordForRead(current);
+    // Preserve the existing lifecycle-integrity exception below for a genuinely non-active parent.
+    // Only the otherwise-valid active projection plus orphan append-only evidence takes this
+    // no-resurrection path and declines to mint fresh queue authority.
+    const tenant = this.subjectRecord(current.tenantId, "tenant", current.tenantId);
+    if (
+      current.subjectKind === "user"
+      && tenant?.state === "active"
+      && this.hasTenantErasureAuthorityFence(current.tenantId)
+    ) return false;
 
     if (isErasureJobQuarantined(current)) {
       const verifiedEvidenceSha256 = erasureJobInterventionEvidenceSha256({
@@ -4734,7 +5038,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (
       !request
       || !tenant
-      || tenant.state !== "active"
+      || !this.isTenantActive(authorization.tenantId)
       || !user
       || user.state !== "deleting"
       || user.generation !== authorization.subjectGeneration
@@ -5313,15 +5617,21 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async createAgent(def: AgentDefinition) {
-    this.agents.set(`${def.tenantId}/${def.id}@${def.version}`, clone(def));
+    const staged = clone(def);
+    this.assertTenantWritable(staged.tenantId);
+    this.agents.set(agentVersionKey(staged.tenantId, staged.id, staged.version), staged);
   }
   async getAgent(tenantId: string, agentId: string, version?: number) {
-    if (version !== undefined) return clone(this.agents.get(`${tenantId}/${agentId}@${version}`) ?? null);
+    if (!this.isTenantActive(tenantId)) return null;
+    if (version !== undefined) {
+      return clone(this.agents.get(agentVersionKey(tenantId, agentId, version)) ?? null);
+    }
     const versions = [...this.agents.values()].filter((a) => a.tenantId === tenantId && a.id === agentId);
     if (!versions.length) return null;
     return clone(versions.reduce((a, b) => (a.version > b.version ? a : b)));
   }
   async listAgents(tenantId: string, opts: { cursor?: string; limit: number }) {
+    if (!this.isTenantActive(tenantId)) return { data: [], nextCursor: null };
     const latest = new Map<string, AgentDefinition>();
     for (const a of this.agents.values()) {
       if (a.tenantId !== tenantId) continue;
@@ -5895,34 +6205,69 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async upsertProviderConfig(cfg: ProviderConfig, secret?: { ciphertext: Buffer; keyId: string }) {
-    const prev = this.providers.get(`${cfg.tenantId}/${cfg.id}`);
-    this.providers.set(`${cfg.tenantId}/${cfg.id}`, { config: clone(cfg), secret: secret ?? prev?.secret });
+    const stagedConfig = clone(cfg);
+    this.assertTenantWritable(stagedConfig.tenantId);
+    const key = providerConfigKey(stagedConfig.tenantId, stagedConfig.id);
+    const prev = this.providers.get(key);
+    this.providers.set(key, { config: stagedConfig, secret: secret ?? prev?.secret });
   }
   async getProviderConfig(tenantId: string, providerId: string) {
-    const p = this.providers.get(`${tenantId}/${providerId}`);
+    if (!this.isTenantActive(tenantId)) return null;
+    const p = this.providers.get(providerConfigKey(tenantId, providerId));
     return p ? { config: clone(p.config), secret: p.secret } : null;
   }
   async listProviderConfigs(tenantId: string) {
+    if (!this.isTenantActive(tenantId)) return [];
     return [...this.providers.values()].filter((p) => p.config.tenantId === tenantId).map((p) => clone(p.config));
   }
   async deleteProviderConfig(tenantId: string, providerId: string) {
-    return this.providers.delete(`${tenantId}/${providerId}`);
+    this.assertTenantWritable(tenantId);
+    return this.providers.delete(providerConfigKey(tenantId, providerId));
   }
 
   async resolveApiKey(hashedKey: string) {
     const k = this.apiKeys.get(hashedKey);
-    return k && !k.revokedAtMs ? { tenantId: k.tenantId, keyId: k.keyId, scopes: k.scopes } : null;
+    return k && !k.revokedAtMs && this.isTenantActive(k.tenantId)
+      ? { tenantId: k.tenantId, keyId: k.keyId, scopes: [...k.scopes] }
+      : null;
   }
   async createApiKey(tenantId: string, keyId: string, hashedKey: string, scopes: ApiKeyScope[] = DEFAULT_SCOPES) {
-    this.apiKeys.set(hashedKey, { tenantId, keyId, scopes, createdAtMs: Date.now() });
-    if (!this.tenants.has(tenantId)) this.tenants.set(tenantId, { tenantId, authPolicy: DEFAULT_AUTH_POLICY, createdAtMs: Date.now() });
+    const stagedScopes = clone(scopes);
+    this.assertTenantWritable(tenantId);
+    // Match MySQL INSERT IGNORE semantics: a digest is permanently owned by its first row and
+    // must never be transferred across tenants by a colliding/replayed bootstrap write.
+    if (this.apiKeys.has(hashedKey)) return;
+    const now = Date.now();
+    const tenantExisted = this.tenants.has(tenantId);
+    const priorTenant = this.tenants.get(tenantId);
+    try {
+      if (!tenantExisted) {
+        this.tenants.set(tenantId, {
+          tenantId,
+          authPolicy: DEFAULT_AUTH_POLICY,
+          createdAtMs: now,
+        });
+      }
+      this.apiKeys.set(hashedKey, {
+        tenantId,
+        keyId,
+        scopes: stagedScopes,
+        createdAtMs: now,
+      });
+    } catch (error) {
+      restoreMapEntry(this.tenants, tenantId, tenantExisted, priorTenant);
+      Map.prototype.delete.call(this.apiKeys, hashedKey);
+      throw error;
+    }
   }
   async listApiKeys(tenantId: string) {
+    if (!this.isTenantActive(tenantId)) return [];
     return [...this.apiKeys.entries()]
       .filter(([, v]) => v.tenantId === tenantId)
       .map(([, v]) => ({ keyId: v.keyId, tenantId: v.tenantId, scopes: [...v.scopes], createdAtMs: v.createdAtMs ?? 0, revokedAtMs: v.revokedAtMs }));
   }
   async revokeApiKey(tenantId: string, keyId: string) {
+    this.assertTenantWritable(tenantId);
     for (const [hash, v] of this.apiKeys) {
       if (v.tenantId === tenantId && v.keyId === keyId && !v.revokedAtMs) {
         this.apiKeys.set(hash, { ...v, revokedAtMs: Date.now() });
@@ -5933,15 +6278,18 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   async getTenant(tenantId: string) {
+    if (!this.isTenantActive(tenantId)) return null;
     const t = this.tenants.get(tenantId);
     return t ? { ...clone({ ...t, authSecret: undefined }), authSecret: t.authSecret } : null;
   }
   async setTenantAuth(tenantId: string, policy: TenantAuthPolicy, secret?: { ciphertext: Buffer; keyId: string } | null) {
+    const stagedPolicy = clone(policy);
+    this.assertTenantWritable(tenantId);
     const prev = this.tenants.get(tenantId);
     this.tenants.set(tenantId, {
       tenantId,
       name: prev?.name,
-      authPolicy: clone(policy),
+      authPolicy: stagedPolicy,
       authSecret: secret === null ? undefined : (secret ?? prev?.authSecret),
       createdAtMs: prev?.createdAtMs ?? Date.now(),
     });

@@ -107,6 +107,14 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:subject-lifecycle-mysql
 
+      # Tenant erasure admission is the all-credential logical revocation point. Keep explicit
+      # InnoDB proof for rollback, request/write races, dormant rolling-upgrade authority and
+      # cross-tenant isolation rather than relying on a fresh-schema coverage run.
+      - name: Tenant credential revocation real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-credential-revocation-mysql
+
       # Canonical policy activation and legal holds are destructive-work authority boundaries.
       # Keep explicit real-InnoDB proof for CAS, rollback, audit integrity and request/anonymize races.
       - name: Retention policy and legal hold real MySQL suite (must execute)
@@ -163,11 +171,11 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0017
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0018
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority and 0016 -> 0017 user-export replay matrices.
-      - name: Historical MySQL migrations (0007 through 0017, no skips)
+      - name: Historical MySQL migrations (0007 through 0018, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -264,7 +272,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0017_user_export_jobs_and_artifacts.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0018_tenant_credential_revocation_fence.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

@@ -18,6 +18,7 @@ const MIGRATION_0014_PATH = resolve(HERE, "../../migrations/0014_legacy_tombston
 const MIGRATION_0015_PATH = resolve(HERE, "../../migrations/0015_retention_policy_and_legal_holds.sql");
 const MIGRATION_0016_PATH = resolve(HERE, "../../migrations/0016_erasure_purge_policy_authority.sql");
 const MIGRATION_0017_PATH = resolve(HERE, "../../migrations/0017_user_export_jobs_and_artifacts.sql");
+const MIGRATION_0018_PATH = resolve(HERE, "../../migrations/0018_tenant_credential_revocation_fence.sql");
 const THROUGH_0010 = [
   "0001_init.sql",
   "0002_auto_approved.sql",
@@ -217,6 +218,7 @@ describe("real MySQL historical upgrade: 0010 -> 0011", () => {
     await copyFile(MIGRATION_0015_PATH, join(throughLatest, "0015_retention_policy_and_legal_holds.sql"));
     await copyFile(MIGRATION_0016_PATH, join(throughLatest, "0016_erasure_purge_policy_authority.sql"));
     await copyFile(MIGRATION_0017_PATH, join(throughLatest, "0017_user_export_jobs_and_artifacts.sql"));
+    await copyFile(MIGRATION_0018_PATH, join(throughLatest, "0018_tenant_credential_revocation_fence.sql"));
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 

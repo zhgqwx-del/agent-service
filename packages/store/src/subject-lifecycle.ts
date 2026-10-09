@@ -211,12 +211,59 @@ export interface RequestUserErasureInput {
   atMs: number;
 }
 
+/**
+ * Internal-only tenant admission. The public tenant lifecycle control plane is deliberately not
+ * exposed yet: submitting this request invalidates every tenant credential at the same durable
+ * linearization point, so status/replay needs an independent platform authority first. No app
+ * caller may invoke this while a pre-0018 runtime can still authenticate or serve the tenant; T2
+ * must add and enforce the fleet activation barrier before exposing admission.
+ */
+export interface RequestTenantErasureInput {
+  requestId: string;
+  tenantId: string;
+  requestedByKeyId: string;
+  idempotencyKey: string;
+  requestHash: string;
+  atMs: number;
+}
+
+/** O(1) logical fence proving that all tenant credentials stopped authorizing new work. */
+export interface TenantCredentialRevocationFence {
+  tenantId: string;
+  requestId: string;
+  subjectGeneration: number;
+  fencedAtMs: number;
+  evidenceSha256: string;
+}
+
+/** Runtime projection used to re-check already-resolved provider/auth work before side effects. */
+export interface TenantRuntimeState {
+  tenantId: string;
+  state: SubjectLifecycleState;
+  generation: number;
+  activeRequestId?: string;
+}
+
 /** Separate capability from SessionStore: erasure orchestration must not acquire general write APIs. */
 export interface SubjectLifecycleStore {
   requestUserErasure(input: RequestUserErasureInput): Promise<ErasureRequestRecord>;
   getUserErasureRequest(tenantId: string, userId: string, requestId: string): Promise<ErasureRequestRecord | null>;
+  /** Dormant until a tenant-aware worker and independent operator authority are deployed. */
+  requestTenantErasure(input: RequestTenantErasureInput): Promise<ErasureRequestRecord>;
+  getTenantErasureRequest(tenantId: string, requestId: string): Promise<ErasureRequestRecord | null>;
+  getTenantCredentialRevocationFence(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialRevocationFence | null>;
   getSubjectLifecycle(tenantId: string, subjectKind: DataSubjectKind, subjectId: string): Promise<SubjectLifecycleRecord | null>;
   listErasureAuditEvents(requestId: string): Promise<ErasureAuditEvent[]>;
+}
+
+export class TenantErasureConflictError extends Error {
+  constructor() {
+    super("tenant erasure cannot start while a user erasure worker still has authority");
+    this.name = "TenantErasureConflictError";
+  }
 }
 
 export interface ClaimErasureJobsOptions {
@@ -717,7 +764,9 @@ export function validateErasureRequestRecord(record: ErasureRequestRecord): void
       || record.leaseUntilMs !== undefined
     ) throw new Error("quarantined erasure request carries worker authority");
   } else if (isClaimableErasureRequestStatus(record.status)) {
-    if (record.availableAtMs === undefined) throw new Error("claimable erasure request is unavailable");
+    if (record.availableAtMs === undefined && !isDormantTenantErasureAdmission(record)) {
+      throw new Error("claimable erasure request is unavailable");
+    }
   } else if (record.status === "purging") {
     // 0012 workers could already have a live purging claim. New normal workers never claim or
     // acknowledge it, but the reader must preserve that row during the drain/forward-fix window.
@@ -739,6 +788,23 @@ export function validateErasureRequestRecord(record: ErasureRequestRecord): void
   if (record.status === "blocked" && record.lastErrorCode === undefined) {
     throw new Error("blocked erasure request has no error code");
   }
+}
+
+/**
+ * A freshly gated tenant admission has no worker authority. MySQL persists it in the independent
+ * tenant admission table (outside the legacy user-erasure queue); this common read model preserves
+ * that dormant shape until a later tenant-aware fleet barrier can publish queue authority.
+ */
+export function isDormantTenantErasureAdmission(record: ErasureRequestRecord): boolean {
+  return record.subjectKind === "tenant"
+    && record.subjectId === record.tenantId
+    && record.status === "gated"
+    && record.availableAtMs === undefined
+    && record.attempts === 0
+    && record.claimToken === undefined
+    && record.leaseUntilMs === undefined
+    && record.lastErrorCode === undefined
+    && !isErasureJobQuarantined(record);
 }
 
 /**
@@ -827,10 +893,12 @@ export function validateErasureAuditChain(
       const initialPolicyVersion = audit.payload.policyVersion;
       const initialPolicyHash = audit.payload.policyHash;
       const carriesPolicy = initialPolicyVersion !== undefined || initialPolicyHash !== undefined;
+      const carriesTenantCredentialFence = record.subjectKind === "tenant";
       assertExactAuditPayloadKeys(audit.payload, [
         "status",
         "subjectKind",
         "generation",
+        ...(carriesTenantCredentialFence ? ["credentialFence"] : []),
         ...(carriesPolicy ? ["policyVersion", "policyHash"] : []),
       ]);
       if (
@@ -838,6 +906,7 @@ export function validateErasureAuditChain(
         || audit.payload.status !== "gated"
         || audit.payload.subjectKind !== record.subjectKind
         || audit.payload.generation !== record.generation
+        || (carriesTenantCredentialFence && audit.payload.credentialFence !== "logical-v1")
         || audit.emittedAtMs !== record.gatedAtMs
       ) throw new Error("erasure request gated audit identity is corrupt");
       if (carriesPolicy) {
@@ -1284,7 +1353,11 @@ export function classifyErasureJobRecordFault(
       || !claimTokenValid
       || !leaseValid
       || !availabilityValid
-      || (isClaimableErasureRequestStatus(record.status) && record.availableAtMs === undefined)
+      || (
+        isClaimableErasureRequestStatus(record.status)
+        && record.availableAtMs === undefined
+        && !isDormantTenantErasureAdmission(record)
+      )
     ) return newErasureJobIntegrityFault(record, "queue_control_invalid");
   }
   try {
@@ -1505,6 +1578,36 @@ export function userErasureRequestHash(tenantId: string, userId: string): string
   return createHash("sha256").update(JSON.stringify(["user", tenantId, userId])).digest("hex");
 }
 
+export function tenantErasureRequestHash(tenantId: string): string {
+  return createHash("sha256").update(JSON.stringify(["tenant", tenantId, tenantId])).digest("hex");
+}
+
+export function tenantCredentialRevocationFenceSha256(input: Omit<
+  TenantCredentialRevocationFence,
+  "evidenceSha256"
+>): string {
+  return createHash("sha256").update(JSON.stringify([
+    "tenant-credential-revocation-fence-v1",
+    input.tenantId,
+    input.requestId,
+    input.subjectGeneration,
+    input.fencedAtMs,
+  ])).digest("hex");
+}
+
+export function validateTenantCredentialRevocationFence(
+  fence: TenantCredentialRevocationFence,
+): void {
+  if (!fence.tenantId || fence.tenantId.length > 128) throw new Error("invalid tenant credential fence tenant id");
+  if (!ERASURE_REQUEST_ID.test(fence.requestId)) throw new Error("invalid tenant credential fence request id");
+  assertPositiveGeneration(fence.subjectGeneration);
+  assertTimestamp(fence.fencedAtMs, "tenant credential fence timestamp");
+  if (!SHA256.test(fence.evidenceSha256)) throw new Error("invalid tenant credential fence evidence");
+  if (fence.evidenceSha256 !== tenantCredentialRevocationFenceSha256(fence)) {
+    throw new Error("tenant credential fence evidence does not match its identity");
+  }
+}
+
 export function validateRequestUserErasureInput(input: RequestUserErasureInput): void {
   if (!ERASURE_REQUEST_ID.test(input.requestId)) {
     throw new Error("invalid erasure request id");
@@ -1521,6 +1624,20 @@ export function validateRequestUserErasureInput(input: RequestUserErasureInput):
   if (!Number.isSafeInteger(input.atMs) || input.atMs < 0) throw new Error("invalid erasure request timestamp");
   const expectedHash = userErasureRequestHash(input.tenantId, input.userId);
   if (input.requestHash !== expectedHash) throw new Error("erasure request hash does not match its subject");
+}
+
+export function validateRequestTenantErasureInput(input: RequestTenantErasureInput): void {
+  if (!ERASURE_REQUEST_ID.test(input.requestId)) throw new Error("invalid erasure request id");
+  if (!input.tenantId || input.tenantId.length > 128) throw new Error("invalid erasure tenant id");
+  if (!ACTOR_KEY_ID.test(input.requestedByKeyId)) throw new Error("invalid erasure actor key id");
+  if (!input.idempotencyKey || input.idempotencyKey.length > 256) {
+    throw new Error("invalid erasure idempotency key");
+  }
+  if (!SHA256.test(input.requestHash)) throw new Error("invalid erasure request hash");
+  assertTimestamp(input.atMs, "erasure request timestamp");
+  if (input.requestHash !== tenantErasureRequestHash(input.tenantId)) {
+    throw new Error("erasure request hash does not match its subject");
+  }
 }
 
 export function subjectLifecycleKey(tenantId: string, subjectKind: DataSubjectKind, subjectId: string): string {

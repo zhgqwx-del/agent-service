@@ -23,6 +23,7 @@ import {
   MysqlSessionStore,
   RedisEventBus,
   RedisLeaseStore,
+  SubjectDeletingError,
   type BlobCleanupStore,
   type BlobManifestStore,
   type EventBus,
@@ -78,18 +79,38 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   });
 
   if (cfg.BOOTSTRAP_API_KEY) {
-    await store.createApiKey(cfg.BOOTSTRAP_TENANT_ID, "bootstrap", hashApiKey(cfg.BOOTSTRAP_API_KEY), ["runtime", "admin"]);
-    console.warn(`[runner ${cfg.RUNNER_ID}] seeded bootstrap api key for tenant ${cfg.BOOTSTRAP_TENANT_ID} (dev only)`);
+    const state = await store.getTenantRuntimeState(cfg.BOOTSTRAP_TENANT_ID);
+    if (state.state !== "active") {
+      console.warn(`[runner ${cfg.RUNNER_ID}] skipped bootstrap api key for inactive tenant ${cfg.BOOTSTRAP_TENANT_ID}`);
+    } else {
+      try {
+        await store.createApiKey(cfg.BOOTSTRAP_TENANT_ID, "bootstrap", hashApiKey(cfg.BOOTSTRAP_API_KEY), ["runtime", "admin"]);
+        console.warn(`[runner ${cfg.RUNNER_ID}] seeded bootstrap api key for tenant ${cfg.BOOTSTRAP_TENANT_ID} (dev only)`);
+      } catch (error) {
+        if (!(error instanceof SubjectDeletingError)) throw error;
+        console.warn(`[runner ${cfg.RUNNER_ID}] skipped bootstrap api key for inactive tenant ${cfg.BOOTSTRAP_TENANT_ID}`);
+      }
+    }
   } else if (cfg.ADMIN_BOOTSTRAP_TENANT) {
     // Production path for a fresh install: mint ONE admin key, print it once, then never again. Without
     // this there is no way to obtain the first admin key except editing the database by hand.
-    const keys = await store.listApiKeys(cfg.ADMIN_BOOTSTRAP_TENANT);
-    if (keys.some((k) => !k.revokedAtMs && k.scopes.includes("admin"))) {
-      console.log(`[runner ${cfg.RUNNER_ID}] tenant ${cfg.ADMIN_BOOTSTRAP_TENANT} already has an admin key; nothing to do`);
+    const state = await store.getTenantRuntimeState(cfg.ADMIN_BOOTSTRAP_TENANT);
+    if (state.state !== "active") {
+      console.warn(`[runner ${cfg.RUNNER_ID}] skipped first admin key for inactive tenant ${cfg.ADMIN_BOOTSTRAP_TENANT}`);
     } else {
-      const key = generateApiKey();
-      await store.createApiKey(cfg.ADMIN_BOOTSTRAP_TENANT, `admin-${Date.now()}`, hashApiKey(key), ["runtime", "admin"]);
-      console.log(`[runner ${cfg.RUNNER_ID}] minted the first admin key for ${cfg.ADMIN_BOOTSTRAP_TENANT}. Store it now, it is not recoverable:\n  ${key}`);
+      const keys = await store.listApiKeys(cfg.ADMIN_BOOTSTRAP_TENANT);
+      if (keys.some((k) => !k.revokedAtMs && k.scopes.includes("admin"))) {
+        console.log(`[runner ${cfg.RUNNER_ID}] tenant ${cfg.ADMIN_BOOTSTRAP_TENANT} already has an admin key; nothing to do`);
+      } else {
+        const key = generateApiKey();
+        try {
+          await store.createApiKey(cfg.ADMIN_BOOTSTRAP_TENANT, `admin-${Date.now()}`, hashApiKey(key), ["runtime", "admin"]);
+          console.log(`[runner ${cfg.RUNNER_ID}] minted the first admin key for ${cfg.ADMIN_BOOTSTRAP_TENANT}. Store it now, it is not recoverable:\n  ${key}`);
+        } catch (error) {
+          if (!(error instanceof SubjectDeletingError)) throw error;
+          console.warn(`[runner ${cfg.RUNNER_ID}] skipped first admin key for inactive tenant ${cfg.ADMIN_BOOTSTRAP_TENANT}`);
+        }
+      }
     }
   }
 

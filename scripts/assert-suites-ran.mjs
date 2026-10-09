@@ -35,6 +35,8 @@ const requiredTestFiles = [
   "packages/store/test/blob-lifecycle.mysql.test.ts",
   "packages/store/test/usage-lifecycle.mysql.test.ts",
   "packages/store/test/subject-lifecycle.mysql.test.ts",
+  "packages/store/test/tenant-credential-revocation.mysql.test.ts",
+  "packages/store/test/tenant-credential-revocation-races.mysql.test.ts",
   "packages/store/test/retention-policy.mysql.test.ts",
   "packages/store/test/erasure-purge-policy.mysql.test.ts",
   "packages/store/test/erasure-job.mysql.test.ts",

@@ -1,7 +1,7 @@
 import { createModels, createProvider, type Model, type MutableModels } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { ApiError, ProviderConfig, type ModelSpec, type Principal, type ProviderConfigInput } from "@agent-service/protocol";
-import type { SessionStore } from "@agent-service/store";
+import { SubjectDeletingError, type SessionStore } from "@agent-service/store";
 import { assertPublicHost, type ProviderResolver, type ResolvedModel } from "@agent-service/core";
 import type { SecretCipher } from "./secrets.js";
 import { PROVIDER_PRESETS } from "./presets.js";
@@ -28,6 +28,24 @@ export interface ProviderServiceOptions {
 }
 
 const PLATFORM_TENANT = "__platform__";
+
+/** Keep the scope kind and tuple separators structural even when external ids contain them. */
+function tenantProviderRegistrationId(tenantId: string, providerId: string): string {
+  // Preserve the historical provider identity for every unambiguous tuple because it is persisted
+  // in turns/events/usage. Only previously-colliding inputs move to the tagged representation.
+  if (tenantId !== "platform" && !tenantId.includes(":") && !providerId.includes(":")) {
+    return `${tenantId}:${providerId}`;
+  }
+  return `tenant:${encodeURIComponent(tenantId)}:${encodeURIComponent(providerId)}`;
+}
+
+function platformProviderRegistrationId(providerId: string): string {
+  return `platform:${providerId}`;
+}
+
+function providerSecretRef(tenantId: string, providerId: string): string {
+  return `secret:${tenantProviderRegistrationId(tenantId, providerId)}`;
+}
 
 /**
  * Turns a (principal, provider, model) reference into an engine-ready model:
@@ -85,14 +103,17 @@ export class ProviderService implements ProviderResolver {
   // ---------- tenant BYOK CRUD ----------
 
   async upsertTenantProvider(tenantId: string, input: ProviderConfigInput): Promise<ProviderConfig> {
+    const generation = await this.requireActiveTenant(tenantId);
     await this.assertBaseUrl(input.baseUrl);
+    await this.assertTenantGeneration(tenantId, generation);
     const existing = await this.opts.store.getProviderConfig(tenantId, input.id);
     const now = Date.now();
     const { apiKey, ...rest } = input;
+    const hasSecret = Boolean(apiKey || existing?.secret || existing?.config.apiKeyRef);
     const config = ProviderConfig.parse({
       ...rest,
       tenantId,
-      apiKeyRef: apiKey ? `secret:${tenantId}:${input.id}` : existing?.config.apiKeyRef,
+      apiKeyRef: hasSecret ? providerSecretRef(tenantId, input.id) : undefined,
       createdAtMs: existing?.config.createdAtMs ?? now,
       updatedAtMs: now,
     });
@@ -102,7 +123,9 @@ export class ProviderService implements ProviderResolver {
   }
 
   async listVisible(tenantId: string): Promise<ProviderConfig[]> {
+    const generation = await this.requireActiveTenant(tenantId);
     const own = await this.opts.store.listProviderConfigs(tenantId);
+    await this.assertTenantGeneration(tenantId, generation);
     const ownIds = new Set(own.map((c) => c.id));
     const platform = [...this.platform.values()].filter((p) => !ownIds.has(p.config.id)).map((p) => this.platformConfig(p));
     return [...own, ...platform];
@@ -115,26 +138,38 @@ export class ProviderService implements ProviderResolver {
   // ---------- resolution ----------
 
   async resolve(principal: Principal, ref: { provider: string; model: string; reasoning?: "off" | "low" | "medium" | "high" }): Promise<ResolvedModel> {
+    const generation = await this.requireActiveTenant(principal.tenantId);
     const tenantCfg = await this.opts.store.getProviderConfig(principal.tenantId, ref.provider);
+    await this.assertTenantGeneration(principal.tenantId, generation);
     let config: ProviderConfig;
     let apiKey: () => Promise<string | undefined>;
     let piProviderId: string;
     if (tenantCfg) {
       config = tenantCfg.config;
-      piProviderId = `${principal.tenantId}:${config.id}`;
+      piProviderId = tenantProviderRegistrationId(principal.tenantId, config.id);
       const secret = tenantCfg.secret;
-      apiKey = async () => (secret ? this.opts.cipher.decrypt(secret.ciphertext, secret.keyId) : undefined);
+      apiKey = async () => {
+        await this.assertTenantGeneration(principal.tenantId, generation);
+        if (!secret) return undefined;
+        const decrypted = await this.opts.cipher.decrypt(secret.ciphertext, secret.keyId);
+        await this.assertTenantGeneration(principal.tenantId, generation);
+        return decrypted;
+      };
     } else {
       const p = this.platform.get(ref.provider);
       if (!p) throw new ApiError("not_found", `provider ${ref.provider} not configured`);
       config = this.platformConfig(p);
-      piProviderId = `platform:${config.id}`;
-      apiKey = async () => p.apiKey;
+      piProviderId = platformProviderRegistrationId(config.id);
+      apiKey = async () => {
+        await this.assertTenantGeneration(principal.tenantId, generation);
+        return p.apiKey;
+      };
     }
     const spec = config.models.find((m) => m.id === ref.model);
     if (!spec) throw new ApiError("invalid_request", `model ${ref.model} not offered by provider ${ref.provider}`, { available: config.models.map((m) => m.id) });
 
     if (tenantCfg) await this.assertBaseUrl(config.baseUrl);
+    await this.assertTenantGeneration(principal.tenantId, generation);
     this.ensureRegistered(piProviderId, config);
     const handle = this.models.getModel(piProviderId, spec.id);
     if (!handle) throw new ApiError("internal_error", `model ${spec.id} not registered`);
@@ -147,9 +182,30 @@ export class ProviderService implements ProviderResolver {
       priceKnown: spec.price !== undefined,
       apiKey,
       headers: Object.keys(config.headers).length ? config.headers : undefined,
-      fetch: this.opts.fetch,
+      fetch: this.generationGuardedFetch(principal.tenantId, generation),
       reasoning: ref.reasoning ?? (spec.reasoning ? undefined : "off"),
     };
+  }
+
+  private async requireActiveTenant(tenantId: string): Promise<number> {
+    const state = await this.opts.store.getTenantRuntimeState(tenantId);
+    if (state.state !== "active") throw new SubjectDeletingError(tenantId);
+    return state.generation;
+  }
+
+  private async assertTenantGeneration(tenantId: string, generation: number): Promise<void> {
+    const state = await this.opts.store.getTenantRuntimeState(tenantId);
+    if (state.state !== "active" || state.generation !== generation) {
+      throw new SubjectDeletingError(tenantId);
+    }
+  }
+
+  private generationGuardedFetch(tenantId: string, generation: number): typeof fetch {
+    const delegate = this.opts.fetch ?? globalThis.fetch;
+    return (async (...args: Parameters<typeof fetch>) => {
+      await this.assertTenantGeneration(tenantId, generation);
+      return delegate(...args);
+    }) as typeof fetch;
   }
 
   private ensureRegistered(piProviderId: string, config: ProviderConfig) {

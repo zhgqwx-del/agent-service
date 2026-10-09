@@ -12,6 +12,7 @@ const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = resolve(HERE, "../fixtures/mysql-0015.sql");
 const MIGRATION_PATH = resolve(HERE, "../../migrations/0016_erasure_purge_policy_authority.sql");
+const MIGRATION_0018_PATH = resolve(HERE, "../../migrations/0018_tenant_credential_revocation_fence.sql");
 
 type Row = RowDataPacket;
 
@@ -286,6 +287,7 @@ describe("real MySQL historical upgrade: 0015 -> 0016", () => {
   let fixtureSql: string;
   let migrationStatements: string[];
   let only0016: string | undefined;
+  let runtime0016And0018: string | undefined;
 
   beforeAll(async () => {
     baseUrl = assertDisposableMigrationTarget(BASE_URL);
@@ -302,12 +304,19 @@ describe("real MySQL historical upgrade: 0015 -> 0016", () => {
       .toHaveLength(24);
     only0016 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0016-"));
     await copyFile(MIGRATION_PATH, join(only0016, "0016_erasure_purge_policy_authority.sql"));
+    runtime0016And0018 = await mkdtemp(join(tmpdir(), "agent-service-migration-runtime-0016-0018-"));
+    await copyFile(MIGRATION_PATH, join(runtime0016And0018, "0016_erasure_purge_policy_authority.sql"));
+    await copyFile(
+      MIGRATION_0018_PATH,
+      join(runtime0016And0018, "0018_tenant_credential_revocation_fence.sql"),
+    );
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 
   afterAll(async () => {
     await admin?.end();
     if (only0016) await rm(only0016, { recursive: true, force: true });
+    if (runtime0016And0018) await rm(runtime0016And0018, { recursive: true, force: true });
   });
 
   it("loads the frozen 0015 lifecycle states before any 0016 schema exists", async () => {
@@ -541,7 +550,14 @@ describe("real MySQL historical upgrade: 0015 -> 0016", () => {
     try {
       conn = await mysql.createConnection({ uri: url, multipleStatements: true });
       await conn.query(fixtureSql);
-      store = await MysqlSessionStore.connect({ url, migrationsDir: only0016!, connectionLimit: 2 });
+      // Evaluate the historical 0016 rows only after the latest runtime's additive 0018 schema
+      // dependency is installed. Empty 0018 tables preserve the pre-admission behavior without
+      // teaching workers to interpret a missing safety table as an absent fence.
+      store = await MysqlSessionStore.connect({
+        url,
+        migrationsDir: runtime0016And0018!,
+        connectionLimit: 2,
+      });
       expect(await store.scheduleAwaitingErasurePolicyEvaluations({
         nowMs: 10_000,
         limit: 10,

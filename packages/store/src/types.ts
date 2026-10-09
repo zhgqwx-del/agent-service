@@ -14,6 +14,7 @@ import type {
   Turn,
 } from "@agent-service/protocol";
 import { blobBindingsFromItems, type BlobBinding } from "./blob-lifecycle.js";
+import type { TenantRuntimeState } from "./subject-lifecycle.js";
 
 export interface ApiKeyRecord {
   keyId: string;
@@ -532,6 +533,9 @@ export class IdempotencyPendingError extends Error {
 }
 
 export interface SessionStore {
+  /** O(1) tenant gate used by authentication/provider code and ordinary tenant-scoped writes. */
+  getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState>;
+
   // ---- agents ----
   createAgent(def: AgentDefinition): Promise<void>;
   getAgent(tenantId: string, agentId: string, version?: number): Promise<AgentDefinition | null>;

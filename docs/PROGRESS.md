@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority，以及异步user-export artifact/download/TTL均已完成。`0017`建立owner-scoped request/job、RR一致性snapshot、确定性multipart NDJSON、durable download lease和独立artifact-delete outbox；新request gate默认关闭，本地build/cleanup worker可处理已有job。tenant erasure及key/provider/auth-secret撤销、可信时钟/owner-scan content receipt、ready/session物理purge、completed proof与restore replay仍未完成，M1尚未闭环。M2本地/CI代码范围已完成并正式冻结；M3/M4尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
+> **当前快照（2026-10-09）**：M0 已完成；M1 核心运行范围、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、durable user-erasure、legacy补偿、canonical policy/multi legal hold、非破坏性purge authority、异步user-export artifact/download/TTL，以及tenant-erasure T1逻辑credential fence均已完成。`0018`把独立tenant admission、tenant lifecycle gate、首条audit和append-only credential fence原子提交，现有tenant-scoped credential/data入口在gate后fail closed；但T1没有公开API、status/replay、worker、环境开关或fleet barrier，也不物理删除key/provider/auth secret。tenant T2/T3、可信时钟/owner-scan content receipt、ready/session物理purge、completed proof与restore replay仍未完成，M1尚未闭环。M2本地/CI代码范围已完成并正式冻结；M3/M4尚未正式开始。本文按时间追加，前文的“下一步”和测试数量都是当时快照；当前事实、验证结果和剩余事项请看最后一节。
 
 ## 2026-09-22
 
@@ -474,3 +474,30 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - 当前MySQL snapshot capture仍在一个RR事务内全量读取并序列化单个user数据，同时持有subject SHARE及request/job锁；超大user可能放大runner内存、MVCC事务时长和erasure等待。正式production开放export前必须用同一快照内的keyset分页/流式hash-insert或明确的record/byte资源上限收口，并做长用户压测。
 - 身份坐标本身发生特权数据库损坏时，cleanup会安全拒绝猜测删除，可能保留孤儿制品，未来需受审计maintenance remediation。后续ready/session物理purge executor必须尊重未释放的export source-Blob pin；当前destructive purge仍关闭，因此不是现时删除竞态。
 - M1下一步仍是tenant erasure、key/provider/auth-secret撤销、使用可信数据库时间和owner-scan/content receipt的默认关闭destructive executor、ready Blob/session及receipt/Redis物理清理、completed proof与独立故障域restore replay。完成这些local/CI可验证范围后才能正式冻结M1并进入M3；没有云资源不阻止继续实现代码与本地门禁，但共享对象存储、KMS/Secret、Kubernetes、云MySQL/Redis、域名/TLS、备份和真实IdP仍必须等待实际环境，不能伪造参数或宣称已部署。
+
+## 2026-10-09（M1 数据生命周期：0018 tenant erasure T1 / credential revocation fence）
+
+### 已完成
+
+1. 新增 expand-only 的 `0018_tenant_credential_revocation_fence.sql`，安装独立 tenant erasure admission/fence 表与 append-only guards；MemoryStore 以 staged publish、MySQLStore 以单个 InnoDB transaction 原子建立 admission、tenant lifecycle deleting gate、首条 content-free audit 和 credential fence。序列化、audit 或 SQL 任一步失败都不会留下半个 admission、部分 generation 或“已 gate 但无 fence”的状态。
+2. T1 的 admission 故意不复用冻结的 `erasure_requests` user queue，pre-`0018` worker 因此不会 claim、quarantine 或篡改 tenant 请求。`0018` 只建立逻辑 credential fence：不提供公开 tenant HTTP/OpenAPI/SDK、status/replay、环境开关、worker 或 fleet barrier，也不物理删除 API key、provider key/config 或 auth secret；mixed fleet 在 T2 barrier 完成前禁止调用该内部原语。
+3. 现有 tenant-scoped API key、provider config/secret、auth policy、agent/session/data 读写与 tenant-key retention-policy/legal-hold 管理写在 gate 后 fail closed。provider secret resolve 会在解密前后重验 tenant generation，新的 outbound fetch 在发出前重验，runner bootstrap 也在线性化边界复核 tenant 状态；已经发出的外部网络 I/O 不会被强制取消，其响应可能短暂留在进程内存，但 gate 后的持久化写入仍会被拒绝。
+4. MySQL 普通 session-owned reads 同时检查 lifecycle、独立 admission 与 credential fence，覆盖 session、turn/item/approval、ready/bindable Blob、usage 与 idempotency receipt；admission-only 或 fence-only 的特权损坏态也不会让数据复活。相同 append-only 证据还是 user-erasure worker 与 purge evaluator 的 parent-authority fence，阻止 lifecycle 异常复位后重新 claim、续租、transition、执行 session action、repair 或生成 purge authority，并保持健康邻 tenant 可推进。`readEvents`、`getSessionLifecycle`、`getBlobManifest` 与 lifecycle outbox 仍是受控 maintenance raw path，用于终止已建立 SSE 和后续清理证明，不是普通数据面绕过。
+5. runner 将 `SubjectDeletingError` 稳定映射为 `409 subject_deleting`。user erasure worker 的 claim 查询明确只选择 `subject_kind='user'`，tenant admission 不会进入旧队列；provider registration identity 也消除了 tuple/`platform` 碰撞，同时保留无歧义历史 identity 的兼容读取。
+6. 冻结 `mysql-0017.sql` 历史数据库并新增独立 `0017 → 0018` 真实 MySQL 迁移夹具，覆盖冻结旧 scheduler、完整升级、partial DDL/marker-loss replay、tenant admission 不进入 legacy user scan、唯一性与 append-only 约束。named tenant Memory/MySQL/race 套件另外覆盖 admission/fence 幂等与冲突，并通过代码面审查确认没有公开入口或后台执行。历史 wrapper 固定执行 `0007 → ... → 0018`，CI 与本地 verify 都要求 migration、tenant MySQL 和 tenant race 报告存在、目标文件实际执行且零 skip。
+7. 学习与运维文档已继续集中说明本地启动/手动体验、router/runner 职责、Node ESM bundle 与 Linux OCI image 的区别、GitHub Actions 实际构建/启动门禁，以及 local → staging → production 应 promotion 同一不可变 image digest 的契约。无云资源不阻止 local/CI 代码推进，但不能据此伪造 Kubernetes、registry、KMS/Secret、对象存储、域名/TLS 或云数据库参数。
+
+### 本轮验证与审查
+
+- `scripts/local-service.sh verify` 全链通过，其中包含 `pnpm check:secrets`（扫描 **275 files**）、`pnpm typecheck`、主套件 **958 passed / 1 skipped**、固定 **11** 个真实 MySQL 历史迁移文件 **47/47**、cluster **14/14**、SDK **18-file** package，以及 runner/router 两个独立 Node bundle 的原生启动、readiness、转发和 OpenAPI 深比较。唯一 skip 仍是真实厂商 E2E 的显式付费开关；覆盖率为 **83.52% statements / 79.03% branches / 87.34% functions / 87.17% lines**。
+- `0017 → 0018` 历史升级 **8/8**；tenant Memory **10/10**、named 真实 MySQL **10/10**、双 store/双连接并发 race **9/9**、user export MySQL **12/12**。具名 wrapper 与 JSON report 断言证明目标套件实际执行且没有被过滤或 skip。
+- 从并发正确性、事务回滚、滚动升级、安全隔离和测试有效性复核，最终无剩余 P0–P2。复核补齐了 orphan admission 独立 fail-closed、export/status/download revocation、普通 MySQL read backstop、user-erasure/evaluator authority 防复活、tenant-key governance 写线性化、runner bootstrap race 与 provider generation recheck；同时保留 runtime 对缺失 `0018` 安全表的硬失败，仅让旧迁移夹具在调用当前 Store 前显式安装空的 dormant `0018` overlay，避免把 `ER_NO_SUCH_TABLE` 误判为“无 fence”。
+- 本地测试库曾残留开发中间态的 `0018` marker，导致首次完整 verify 正确暴露“marker 已存在但 admission table 缺失”；仅重建可丢弃的 `agent_service_test` 后，使用最终冻结 migration 从空测试库和历史 `0017` 夹具均重复通过。业务库 `agent_service` 未被修改。另一次构建失败来自本机缓存 pnpm launcher 缺少 shebang；使用不入库的临时 launcher 后，`build:check` 与随后整套 verify 均通过，产品代码和仓库脚本无需环境特判。
+- 本轮未改变 provider dialect 或真实厂商网络契约，因此没有重复运行收费的 `verify-real` 或十阶段 acceptance；最近真实模型 **1/1** 与 acceptance 通过仍只作为历史基线，不冒充本轮结果。
+
+### 当前边界与下一步
+
+- M2 本地/CI冻结结论不变；本轮仍属于 M1，没有提前开始 M3。T1 只证明 admission 与逻辑 credential/data fence，不能宣称 tenant erasure completed，也不能据此正式冻结 M1。
+- 下一独立切片是 tenant erasure T2：增加独立 platform authority、内部/管理 API、status/replay、全 fleet code-aware barrier 和安全 rollout 契约；该 authority 必须使用新入口，不能绕过本轮已封住的 tenant-key governance 方法。随后 T3 增加 durable worker、物理 credential/auth-secret 清理、tenant 内容清理与 completion proof。旧 runtime 不理解 `0018` fence，因此 T2 barrier 完成前不得在 mixed-version fleet 调用 T1。
+- T1 不强制中断 admission 前已经发出的 provider/JWKS/introspection 网络 I/O；解密后的 secret 或 verifier 也可能暂留在进程内存，需通过 drain/restart、短缓存和后续 secret/KMS adapter 收口。migration 的 FORCE INDEX 会验证关键列和命名索引，但不会证明特权主体预建同名表的全部 engine/unique shape，生产仍需 migration identity、runtime 最小权限和 schema attestation。
+- 多 runner 同时首次启动时，现有 `ADMIN_BOOTSTRAP_TENANT` 的 list-then-create 仍可能生成多个 admin key；这是基线已有的 M4 运维风险，后续应改成一次性 Job/CLI 或数据库 singleton claim。完成 tenant T2/T3 后，M1 仍需可信数据库时间、完整 owner-scan content receipt、ready Blob/session/receipt/Redis destructive executor、completed proof 与独立故障域 restore replay，全部闭环后才进入 M3。

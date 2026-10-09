@@ -22,6 +22,7 @@ import {
   userDataExportRequestHash,
   userDataExportStorageKey,
   userErasureRequestHash,
+  tenantErasureRequestHash,
   type RequestUserDataExportInput,
   type UserDataExportAuthorization,
   type UserDataExportSnapshotSummary,
@@ -789,6 +790,73 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         await conn.end();
         await erasureStore.close();
         await exportStore.close();
+      }
+    });
+
+    it("blocks export on orphan tenant admission evidence without affecting a neighbor", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant_export_orphan_admission_${randomUUID()}`;
+      const userId = `user_${randomUUID()}`;
+      const neighborId = `tenant_export_orphan_neighbor_${randomUUID()}`;
+      const neighborUserId = `user_${randomUUID()}`;
+      const tenantRequestId = newErasureRequestId();
+      const atMs = Date.now();
+      try {
+        await activatePolicy(store, tenantId);
+        await activatePolicy(store, neighborId);
+        await store.createSession(mkSession(tenantId, userId));
+        await store.createSession(mkSession(neighborId, neighborUserId));
+        const existing = await store.requestUserDataExport(exportInput(
+          tenantId,
+          userId,
+          "existing-before-orphan",
+        ));
+        await conn.query(
+          `INSERT INTO tenant_erasure_admissions
+             (request_id, tenant_id, subject_generation, requested_by_key_id,
+              idempotency_key, request_hash, created_at_ms, gated_at_ms, updated_at_ms,
+              policy_version, policy_hash, control_generation)
+           VALUES (?,?,?,?,?,?,?,?,?,NULL,NULL,0)`,
+          [
+            tenantRequestId,
+            tenantId,
+            1,
+            "platform-lifecycle-admin",
+            `orphan-${randomUUID()}`,
+            tenantErasureRequestHash(tenantId),
+            atMs,
+            atMs,
+            atMs,
+          ],
+        );
+
+        await expect(store.requestUserDataExport(exportInput(tenantId, userId, "blocked")))
+          .rejects.toBeInstanceOf(SubjectDeletingError);
+        await expect(store.getUserDataExport(tenantId, userId, existing.requestId))
+          .resolves.toMatchObject({ status: "revoked" });
+        await expect(store.requestUserDataExport(exportInput(
+          neighborId,
+          neighborUserId,
+          "neighbor-allowed",
+        ))).resolves.toMatchObject({
+          tenantId: neighborId,
+          userId: neighborUserId,
+          status: "queued",
+        });
+        const [rows] = await conn.query<Row[]>(
+          `SELECT COUNT(*) AS request_count,
+                  SUM(status<>'revoked') AS live_count
+             FROM user_export_requests WHERE tenant_id=?`,
+          [tenantId],
+        );
+        expect({
+          requestCount: Number(rows[0]!.request_count),
+          liveCount: Number(rows[0]!.live_count),
+        }).toEqual({ requestCount: 1, liveCount: 0 });
+      } finally {
+        await conn.end();
+        await store.close();
       }
     });
 

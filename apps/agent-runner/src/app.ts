@@ -194,6 +194,10 @@ export function createApp(deps: AppDeps) {
   }
 
   app.onError((err, c) => {
+    if (err instanceof SubjectDeletingError) {
+      const apiError = new ApiError("subject_deleting", err.message);
+      return c.json(apiError.toBody() satisfies ErrorBody, apiError.status as 400);
+    }
     if (err instanceof ApiError) {
       // agent-router reads this to re-route the request to the current owner (design §4.2).
       const owner = (err.details as { ownerAddr?: string } | undefined)?.ownerAddr;

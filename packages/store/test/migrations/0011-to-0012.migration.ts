@@ -17,6 +17,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = resolve(HERE, "../fixtures/mysql-0011.sql");
 const MIGRATION_PATH = resolve(HERE, "../../migrations/0012_erasure_job_queue.sql");
 const MIGRATION_0013_PATH = resolve(HERE, "../../migrations/0013_erasure_job_control.sql");
+const MIGRATION_0018_PATH = resolve(HERE, "../../migrations/0018_tenant_credential_revocation_fence.sql");
 
 type Row = RowDataPacket;
 type HistoricalStatus =
@@ -222,7 +223,7 @@ describe("real MySQL historical upgrade: 0011 -> 0012", () => {
   let fixtureSql: string;
   let migrationStatements: string[];
   let only0012: string;
-  let only0013: string;
+  let runtimeExpandsAfter0012: string;
 
   beforeAll(async () => {
     baseUrl = assertDisposableMigrationTarget(BASE_URL);
@@ -236,15 +237,19 @@ describe("real MySQL historical upgrade: 0011 -> 0012", () => {
     expect(migrationStatements.length).toBeGreaterThan(30);
     only0012 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0012-"));
     await copyFile(MIGRATION_PATH, join(only0012, "0012_erasure_job_queue.sql"));
-    only0013 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0013-"));
-    await copyFile(MIGRATION_0013_PATH, join(only0013, "0013_erasure_job_control.sql"));
+    runtimeExpandsAfter0012 = await mkdtemp(join(tmpdir(), "agent-service-migration-runtime-after-0012-"));
+    await copyFile(MIGRATION_0013_PATH, join(runtimeExpandsAfter0012, "0013_erasure_job_control.sql"));
+    await copyFile(
+      MIGRATION_0018_PATH,
+      join(runtimeExpandsAfter0012, "0018_tenant_credential_revocation_fence.sql"),
+    );
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 
   afterAll(async () => {
     await admin?.end();
     await rm(only0012, { recursive: true, force: true });
-    await rm(only0013, { recursive: true, force: true });
+    await rm(runtimeExpandsAfter0012, { recursive: true, force: true });
   });
 
   it("upgrades a frozen 0011 gated request and normalizes synthetic SQL-only state shapes", async () => {
@@ -373,11 +378,16 @@ describe("real MySQL historical upgrade: 0011 -> 0012", () => {
       );
       expect(purge[0]).toMatchObject({ available_at_ms: null, claim_token: null, lease_until_ms: null });
 
-      // The checks above prove the frozen 0011 -> 0012 result. Apply the next expand migration
-      // before loading that row through the current runtime; new binaries require the additive
-      // quarantine columns even though this test remains focused on 0012 normalization.
+      // The checks above prove the frozen 0011 -> 0012 result. Install every additive schema
+      // capability used by this current-runtime probe before loading the historical row. In
+      // particular, 0018 stays dormant here but its append-only tenant-fence tables must exist;
+      // treating ER_NO_SUCH_TABLE as "no fence" would turn schema damage into a fail-open path.
       await upgraded.close();
-      upgraded = await MysqlSessionStore.connect({ url, connectionLimit: 1, migrationsDir: only0013 });
+      upgraded = await MysqlSessionStore.connect({
+        url,
+        connectionLimit: 1,
+        migrationsDir: runtimeExpandsAfter0012,
+      });
       // Prove that the historical row remains consumable after the forward-compatible expand.
       // The earliest gated row is the only selected row.
       const runtimeClaims = await upgraded.claimErasureJobs({

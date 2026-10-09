@@ -4,6 +4,7 @@ import {
   MemoryEventBus,
   MemoryLeaseStore,
   MemorySessionStore,
+  SubjectDeletingError,
   newErasureRequestId,
   userErasureRequestHash,
   validateErasureRequestRecord,
@@ -219,6 +220,28 @@ function expectPrivateLifecycleResponse(response: Response): void {
 }
 
 describe("agent-runner HTTP API", () => {
+  it("maps a late tenant gate race to the stable subject_deleting response", async () => {
+    const { store, call } = await makeApp();
+    vi.spyOn(store, "createAgent").mockRejectedValueOnce(new SubjectDeletingError("t_dev"));
+
+    const response = await call("/v1/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "late tenant gate",
+        instructions: "",
+        model: { provider: "dashscope", model: "qwen-plus" },
+      }),
+    });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "subject_deleting",
+        message: "the tenant is being erased",
+      },
+    });
+  });
+
   it("separates governance writer awareness from the gated management surface", async () => {
     const { app } = await makeApp();
     const response = await app.request("/v1/capabilities");

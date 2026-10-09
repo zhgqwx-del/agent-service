@@ -18,6 +18,7 @@ const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = resolve(HERE, "../fixtures/mysql-0014.sql");
 const MIGRATION_PATH = resolve(HERE, "../../migrations/0015_retention_policy_and_legal_holds.sql");
+const MIGRATION_0018_PATH = resolve(HERE, "../../migrations/0018_tenant_credential_revocation_fence.sql");
 const EMPTY_PROJECTION_SHA256 = "d336a3d705ffe91a7158c28e0e39f45cbc278d4a8890c738d9da03a164fd140f";
 const EMPTY_RETENTION_POLICY = {
   sessionContentRetentionMs: null,
@@ -250,6 +251,7 @@ describe("real MySQL historical upgrade: 0014 -> 0015", () => {
   let fixtureSql: string;
   let migrationStatements: string[];
   let only0015: string;
+  let runtime0015And0018: string;
 
   beforeAll(async () => {
     baseUrl = assertDisposableMigrationTarget(BASE_URL);
@@ -265,12 +267,19 @@ describe("real MySQL historical upgrade: 0014 -> 0015", () => {
     expect(migrationStatements.filter((statement) => statement.startsWith("CREATE TRIGGER"))).toHaveLength(36);
     only0015 = await mkdtemp(join(tmpdir(), "agent-service-migration-only-0015-"));
     await copyFile(MIGRATION_PATH, join(only0015, "0015_retention_policy_and_legal_holds.sql"));
+    runtime0015And0018 = await mkdtemp(join(tmpdir(), "agent-service-migration-runtime-0015-0018-"));
+    await copyFile(MIGRATION_PATH, join(runtime0015And0018, "0015_retention_policy_and_legal_holds.sql"));
+    await copyFile(
+      MIGRATION_0018_PATH,
+      join(runtime0015And0018, "0018_tenant_credential_revocation_fence.sql"),
+    );
     admin = await mysql.createConnection(databaseUrl(baseUrl, "mysql"));
   });
 
   afterAll(async () => {
     await admin?.end();
     await rm(only0015, { recursive: true, force: true });
+    await rm(runtime0015And0018, { recursive: true, force: true });
   });
 
   it("loads a frozen 0014 database before any 0015 schema exists", async () => {
@@ -565,7 +574,13 @@ describe("real MySQL historical upgrade: 0014 -> 0015", () => {
     try {
       conn = await mysql.createConnection({ uri: url, multipleStatements: true });
       await conn.query(fixtureSql);
-      store = await MysqlSessionStore.connect({ url, migrationsDir: only0015, connectionLimit: 1 });
+      // Latest runtime code requires the additive 0018 fence schema to be installed before code
+      // rollout. The tables remain empty, so this still isolates 0015's legal-hold replay behavior.
+      store = await MysqlSessionStore.connect({
+        url,
+        migrationsDir: runtime0015And0018,
+        connectionLimit: 1,
+      });
 
       const importedLegacyHoldId = legacyHoldId("tenant_a", "user", "user_a", 220);
       const successorHoldId = "hold_marker_loss_successor";
@@ -803,7 +818,11 @@ describe("real MySQL historical upgrade: 0014 -> 0015", () => {
     try {
       conn = await mysql.createConnection({ uri: url, multipleStatements: true });
       await conn.query(fixtureSql);
-      store = await MysqlSessionStore.connect({ url, migrationsDir: only0015, connectionLimit: 4 });
+      store = await MysqlSessionStore.connect({
+        url,
+        migrationsDir: runtime0015And0018,
+        connectionLimit: 4,
+      });
       await expectFinalTriggers(conn);
 
       // A genuinely absent control and a migrated-but-dormant control both remain compatible with
@@ -1001,7 +1020,11 @@ describe("real MySQL historical upgrade: 0014 -> 0015", () => {
       const setup = await mysql.createConnection({ uri: url, multipleStatements: true });
       await setup.query(fixtureSql);
       await setup.end();
-      store = await MysqlSessionStore.connect({ url, migrationsDir: only0015, connectionLimit: 4 });
+      store = await MysqlSessionStore.connect({
+        url,
+        migrationsDir: runtime0015And0018,
+        connectionLimit: 4,
+      });
       writer = await mysql.createConnection(url);
       activator = await mysql.createConnection(url);
 
