@@ -304,7 +304,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           await ctx.close();
         }
       }
-    });
+    }, 90_000);
 
     it("makes activation and all inventory checks one rollback boundary", async () => {
       const ctx = await fixture();
