@@ -55,6 +55,18 @@ describe("runner configuration", () => {
     expect(cfg.TENANT_DATABASE_PURGE_MATERIALIZE_BATCH_SIZE).toBe(25);
     expect(cfg.TENANT_DATABASE_PURGE_RETRY_BASE_MS).toBe(1_000);
     expect(cfg.TENANT_DATABASE_PURGE_RETRY_MAX_MS).toBe(60_000);
+    expect(cfg.REDIS_PREFIX).toBe("as");
+    expect(cfg.REDIS_NAMESPACE_ID).toBeUndefined();
+    expect(cfg.TENANT_REDIS_PURGE_WORKER_ENABLED).toBe(false);
+    expect(cfg.TENANT_REDIS_PURGE_WORKER_POLL_MS).toBe(1_000);
+    expect(cfg.TENANT_REDIS_PURGE_WORKER_LEASE_MS).toBe(30_000);
+    expect(cfg.TENANT_REDIS_PURGE_WORKER_BATCH_SIZE).toBe(5);
+    expect(cfg.TENANT_REDIS_PURGE_MATERIALIZE_BATCH_SIZE).toBe(25);
+    expect(cfg.TENANT_REDIS_PURGE_TARGET_PAGE_SIZE).toBe(100);
+    expect(cfg.TENANT_REDIS_PURGE_RESTORE_PAGE_SIZE).toBe(100);
+    expect(cfg.TENANT_REDIS_PURGE_RESTORE_INTERVAL_MS).toBe(60_000);
+    expect(cfg.TENANT_REDIS_PURGE_RETRY_BASE_MS).toBe(1_000);
+    expect(cfg.TENANT_REDIS_PURGE_RETRY_MAX_MS).toBe(60_000);
     expect(cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS).toBe(2_000);
     expect(cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED).toBe(false);
     expect(cfg.ERASURE_WORKER_ENABLED).toBe(false);
@@ -95,6 +107,75 @@ describe("runner configuration", () => {
     expect(cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS).toBe(20_000);
     expect(cfg.BLOB_MAX_BYTES).toBe(1_000_000);
     expect(cfg.BLOB_MAX_HYDRATED_BYTES).toBe(4_000_000);
+  });
+
+  it("keeps Redis purge behind MySQL, Redis, namespace, and router gates", () => {
+    const common = {
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_REDIS_PURGE_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "https://router.internal:8443/",
+    };
+    expect(() => loadConfig(common)).toThrow(/STORE=mysql/);
+    expect(() => loadConfig({ ...common, STORE: "mysql" })).toThrow(/REDIS_URL/);
+    expect(() => loadConfig({
+      ...common,
+      STORE: "mysql",
+      REDIS_URL: "redis://redis:6379",
+    })).toThrow(/REDIS_NAMESPACE_ID/);
+
+    const enabled = loadConfig({
+      ...common,
+      STORE: "mysql",
+      REDIS_URL: "redis://redis:6379",
+      REDIS_PREFIX: "service-a",
+      REDIS_NAMESPACE_ID: "local-compose-db0",
+      TENANT_REDIS_PURGE_WORKER_POLL_MS: "17",
+      TENANT_REDIS_PURGE_WORKER_LEASE_MS: "6000",
+      TENANT_REDIS_PURGE_WORKER_BATCH_SIZE: "7",
+      TENANT_REDIS_PURGE_MATERIALIZE_BATCH_SIZE: "11",
+      TENANT_REDIS_PURGE_TARGET_PAGE_SIZE: "13",
+      TENANT_REDIS_PURGE_RESTORE_PAGE_SIZE: "19",
+      TENANT_REDIS_PURGE_RESTORE_INTERVAL_MS: "31000",
+      TENANT_REDIS_PURGE_RETRY_BASE_MS: "23",
+      TENANT_REDIS_PURGE_RETRY_MAX_MS: "29",
+    });
+    expect(enabled).toMatchObject({
+      REDIS_PREFIX: "service-a",
+      REDIS_NAMESPACE_ID: "local-compose-db0",
+      TENANT_REDIS_PURGE_WORKER_ENABLED: true,
+      TENANT_REDIS_PURGE_WORKER_POLL_MS: 17,
+      TENANT_REDIS_PURGE_WORKER_LEASE_MS: 6_000,
+      TENANT_REDIS_PURGE_WORKER_BATCH_SIZE: 7,
+      TENANT_REDIS_PURGE_MATERIALIZE_BATCH_SIZE: 11,
+      TENANT_REDIS_PURGE_TARGET_PAGE_SIZE: 13,
+      TENANT_REDIS_PURGE_RESTORE_PAGE_SIZE: 19,
+      TENANT_REDIS_PURGE_RESTORE_INTERVAL_MS: 31_000,
+      TENANT_REDIS_PURGE_RETRY_BASE_MS: 23,
+      TENANT_REDIS_PURGE_RETRY_MAX_MS: 29,
+    });
+    expect(() => loadConfig({
+      ...common,
+      STORE: "mysql",
+      REDIS_URL: "redis://redis:6379",
+      REDIS_NAMESPACE_ID: "namespace-a",
+      TENANT_REDIS_PURGE_WORKER_LEASE_MS: "4999",
+    })).toThrow(/twice TENANT_ERASURE_BARRIER_TIMEOUT_MS/);
+    expect(() => loadConfig({
+      ...common,
+      STORE: "mysql",
+      REDIS_URL: "redis://redis:6379",
+      REDIS_NAMESPACE_ID: "namespace-a",
+      TENANT_REDIS_PURGE_RETRY_BASE_MS: "2",
+      TENANT_REDIS_PURGE_RETRY_MAX_MS: "1",
+    })).toThrow(/TENANT_REDIS_PURGE_RETRY_MAX_MS/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_REDIS_PURGE_RESTORE_INTERVAL_MS: "999",
+    })).toThrow();
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_REDIS_PURGE_WORKER_ENABLED: "true",
+    })).toThrow();
   });
 
   it("keeps subject erasure requests behind an explicit boolean gate", () => {

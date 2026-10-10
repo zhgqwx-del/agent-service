@@ -656,6 +656,76 @@ import {
   type TenantDatabasePurgeStore,
   type TenantPurgeSessionGraveMarker,
 } from "../tenant-database-purge.js";
+import {
+  EMPTY_TENANT_REDIS_PURGE_DOMAIN_ACK_ROOT_SHA256,
+  EMPTY_TENANT_REDIS_PURGE_MARKER_ROOT_SHA256,
+  EMPTY_TENANT_REDIS_PURGE_TARGET_ACK_ROOT_SHA256,
+  TENANT_REDIS_PURGE_ADAPTER_PROTOCOL,
+  TENANT_REDIS_PURGE_CUTOVER_SINGLETON_ID,
+  TENANT_REDIS_PURGE_DOMAIN_ACK_SCOPE,
+  TENANT_REDIS_PURGE_DOMAINS,
+  TENANT_REDIS_PURGE_RECEIPT_SCOPE,
+  TENANT_REDIS_PURGE_RESTORE_FENCE_SCOPE,
+  TENANT_REDIS_PURGE_TARGET_ACK_SCOPE,
+  TENANT_REDIS_PURGE_TARGET_SCOPE,
+  TenantRedisPurgeEvidenceChangedError,
+  TenantRedisPurgeNotReadyError,
+  tenantRedisPurgeAuthorizationMatches,
+  tenantRedisPurgeClaimFromJob,
+  tenantRedisPurgeClaimTokenSha256,
+  tenantRedisPurgeCutoverEvidenceSha256,
+  tenantRedisPurgeDomainAckRootSha256,
+  tenantRedisPurgeDomainAckSha256,
+  tenantRedisPurgeDomainOrdinal,
+  tenantRedisPurgeMarkerRootSha256,
+  tenantRedisPurgeNextDomainAckRootSha256,
+  tenantRedisPurgeOperationSha256,
+  tenantRedisPurgePlanEntryRootSha256,
+  tenantRedisPurgePlanTargetRootSha256,
+  tenantRedisPurgePlanTargetSha256,
+  tenantRedisPurgeReceiptSha256,
+  tenantRedisPurgeRestoreFenceSha256,
+  tenantRedisPurgeTargetAckRootSha256,
+  tenantRedisPurgeTargetAckSha256,
+  tenantRedisPurgeTargetRootSha256,
+  tenantRedisPurgeTargetSha256,
+  validateClaimTenantRedisPurgesOptions,
+  validateListTenantRedisPurgeRestoreFencesOptions,
+  validateListTenantRedisPurgeRestoreFencesResult,
+  validateMaterializeTenantRedisPurgeJobsOptions,
+  validateRenewTenantRedisPurgeOptions,
+  validateRetryTenantRedisPurgeOptions,
+  validateTenantRedisPurgeAdapterResult,
+  validateTenantRedisPurgeAuthorization,
+  validateTenantRedisPurgeCutoverRecord,
+  validateTenantRedisPurgeDomainAck,
+  validateTenantRedisPurgeEvidenceBundle,
+  validateTenantRedisPurgeJobRecord,
+  validateTenantRedisPurgeReceipt,
+  validateTenantRedisPurgeTarget,
+  validateTenantRedisPurgeTargetAck,
+  type ClaimTenantRedisPurgesOptions,
+  type ListTenantRedisPurgeRestoreFencesOptions,
+  type ListTenantRedisPurgeRestoreFencesResult,
+  type MaterializeTenantRedisPurgeJobsOptions,
+  type RenewTenantRedisPurgeOptions,
+  type RetryTenantRedisPurgeOptions,
+  type TenantRedisPurgeAdapterResult,
+  type TenantRedisPurgeAuthorization,
+  type TenantRedisPurgeBlockReasonCode,
+  type TenantRedisPurgeClaim,
+  type TenantRedisPurgeCutoverRecord,
+  type TenantRedisPurgeDomain,
+  type TenantRedisPurgeDomainAck,
+  type TenantRedisPurgeEvidenceBundle,
+  type TenantRedisPurgeJobRecord,
+  type TenantRedisPurgeReceipt,
+  type TenantRedisPurgeRestoreFence,
+  type TenantRedisPurgeSource,
+  type TenantRedisPurgeStore,
+  type TenantRedisPurgeTarget,
+  type TenantRedisPurgeTargetAck,
+} from "../tenant-redis-purge.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -854,6 +924,55 @@ const TENANT_PURGE_SESSION_GRAVE_MARKER_COLUMNS = `scope, session_id, tenant_id,
   marker_sha256`;
 const TENANT_DATABASE_PURGE_CUTOVER_COLUMNS = `singleton_id, control_generation,
   activated_at_db_ms, first_request_id, first_receipt_sha256, evidence_sha256`;
+const TENANT_REDIS_PURGE_JOB_COLUMNS = `request_id, tenant_id, subject_generation,
+  plan_build_generation, execution_generation, database_purge_generation,
+  redis_purge_generation, t3c_receipt_sha256, plan_receipt_sha256,
+  redis_plan_entry_count, redis_plan_entry_root_sha256,
+  database_purge_receipt_sha256, grave_marker_count, grave_marker_root_sha256,
+  redis_namespace_sha256, policy_sha256, purge_not_before_db_ms,
+  source_evidence_db_ms, source_unresolved_blocker_count, phase, target_count,
+  target_root_sha256, target_ack_count, target_ack_root_sha256, domain_ack_count,
+  domain_ack_root_sha256, marker_count, marker_root_sha256,
+  unresolved_blocker_count, terminal_receipt_sha256, available_at_ms, attempts,
+  claim_token, lease_until_ms, last_error_code, created_at_ms, updated_at_ms,
+  sealed_at_db_ms, completed_claim_attempt, completed_claim_token_sha256,
+  blocked_at_db_ms, blocked_reason_code`;
+const TENANT_REDIS_PURGE_TARGET_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, redis_purge_generation, target_ordinal, session_id,
+  grave_marker_sha256, redis_namespace_sha256, lease_plan_target_sha256,
+  fence_plan_target_sha256, stream_plan_target_sha256, operation_sha256,
+  captured_at_db_ms, receipt_sha256`;
+const TENANT_REDIS_PURGE_TARGET_ACK_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, redis_purge_generation, target_ordinal, session_id,
+  target_receipt_sha256, operation_sha256, adapter_protocol,
+  redis_namespace_sha256, lease_existed, fence_existed, stream_existed,
+  marker_sha256, completed_claim_attempt, completed_claim_token_sha256,
+  store_db_timestamp_ms, receipt_sha256`;
+const TENANT_REDIS_PURGE_DOMAIN_ACK_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, redis_purge_generation, domain, domain_ordinal,
+  global_ack_seq, previous_global_ack_sha256, plan_entry_receipt_sha256,
+  plan_target_count, plan_target_root_sha256, affected_count, target_ack_count,
+  target_ack_root_sha256, marker_count, marker_root_sha256, adapter_protocol,
+  redis_namespace_sha256, completed_claim_attempt, completed_claim_token_sha256,
+  store_db_timestamp_ms, receipt_sha256`;
+const TENANT_REDIS_PURGE_RECEIPT_COLUMNS = `scope, request_id, tenant_id,
+  subject_generation, plan_build_generation, execution_generation,
+  database_purge_generation, redis_purge_generation, t3c_receipt_sha256,
+  plan_receipt_sha256, redis_plan_entry_count, redis_plan_entry_root_sha256,
+  database_purge_receipt_sha256, grave_marker_count, grave_marker_root_sha256,
+  redis_namespace_sha256, policy_sha256, purge_not_before_db_ms,
+  source_evidence_db_ms, source_unresolved_blocker_count, target_count,
+  target_root_sha256, target_ack_count, target_ack_root_sha256, domain_ack_count,
+  domain_ack_root_sha256, marker_count, marker_root_sha256,
+  unresolved_blocker_count, store_db_timestamp_ms, completed_claim_attempt,
+  completed_claim_token_sha256, redis_purge_complete, all_domains_complete,
+  content_purge_executed, receipt_sha256`;
+const TENANT_REDIS_PURGE_CUTOVER_COLUMNS = `singleton_id, control_generation,
+  activated_at_db_ms, first_request_id, first_receipt_sha256,
+  redis_namespace_sha256, evidence_sha256`;
 type TenantContentSessionRow = {
   sessionId: string;
   tenantId: string;
@@ -3454,6 +3573,293 @@ function rowToTenantDatabasePurgeCutover(row: Row | undefined): TenantDatabasePu
   }
 }
 
+function rowTenantRedisPurgeSource(row: Row): TenantRedisPurgeSource {
+  return {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: storedSafeInteger(row.subject_generation, "stored Redis purge subject", 1),
+    planBuildGeneration: storedSafeInteger(row.plan_build_generation, "stored Redis purge plan", 1),
+    executionGeneration: storedSafeInteger(row.execution_generation, "stored Redis purge execution", 1),
+    databasePurgeGeneration: storedSafeInteger(
+      row.database_purge_generation,
+      "stored Redis purge database generation",
+      1,
+    ),
+    redisPurgeGeneration: storedSafeInteger(
+      row.redis_purge_generation,
+      "stored Redis purge generation",
+      1,
+    ),
+    t3cReceiptSha256: String(row.t3c_receipt_sha256),
+    planReceiptSha256: String(row.plan_receipt_sha256),
+    redisPlanEntryCount: storedSafeInteger(
+      row.redis_plan_entry_count,
+      "stored Redis purge plan entry count",
+    ),
+    redisPlanEntryRootSha256: String(row.redis_plan_entry_root_sha256),
+    databasePurgeReceiptSha256: String(row.database_purge_receipt_sha256),
+    graveMarkerCount: storedSafeInteger(row.grave_marker_count, "stored Redis grave count"),
+    graveMarkerRootSha256: String(row.grave_marker_root_sha256),
+    redisNamespaceSha256: String(row.redis_namespace_sha256),
+    policySha256: String(row.policy_sha256),
+    purgeNotBeforeDbMs: storedSafeInteger(row.purge_not_before_db_ms, "stored Redis deadline"),
+    sourceEvidenceDbMs: storedSafeInteger(
+      row.source_evidence_db_ms,
+      "stored Redis source timestamp",
+    ),
+    sourceUnresolvedBlockerCount: storedSafeInteger(
+      row.source_unresolved_blocker_count,
+      "stored Redis source blocker count",
+    ),
+  };
+}
+
+function tenantRedisPurgeSourceFromJob(job: TenantRedisPurgeJobRecord): TenantRedisPurgeSource {
+  return {
+    requestId: job.requestId,
+    tenantId: job.tenantId,
+    subjectGeneration: job.subjectGeneration,
+    planBuildGeneration: job.planBuildGeneration,
+    executionGeneration: job.executionGeneration,
+    databasePurgeGeneration: job.databasePurgeGeneration,
+    redisPurgeGeneration: job.redisPurgeGeneration,
+    t3cReceiptSha256: job.t3cReceiptSha256,
+    planReceiptSha256: job.planReceiptSha256,
+    redisPlanEntryCount: job.redisPlanEntryCount,
+    redisPlanEntryRootSha256: job.redisPlanEntryRootSha256,
+    databasePurgeReceiptSha256: job.databasePurgeReceiptSha256,
+    graveMarkerCount: job.graveMarkerCount,
+    graveMarkerRootSha256: job.graveMarkerRootSha256,
+    redisNamespaceSha256: job.redisNamespaceSha256,
+    policySha256: job.policySha256,
+    purgeNotBeforeDbMs: job.purgeNotBeforeDbMs,
+    sourceEvidenceDbMs: job.sourceEvidenceDbMs,
+    sourceUnresolvedBlockerCount: job.sourceUnresolvedBlockerCount,
+  };
+}
+
+function rowToTenantRedisPurgeJob(row: Row): TenantRedisPurgeJobRecord {
+  try {
+    const common = {
+      ...rowTenantRedisPurgeSource(row),
+      targetCount: storedSafeInteger(row.target_count, "stored Redis target count"),
+      targetRootSha256: String(row.target_root_sha256),
+      targetAckCount: storedSafeInteger(row.target_ack_count, "stored Redis target ACK count"),
+      targetAckRootSha256: String(row.target_ack_root_sha256),
+      domainAckCount: storedSafeInteger(row.domain_ack_count, "stored Redis domain ACK count"),
+      domainAckRootSha256: String(row.domain_ack_root_sha256),
+      markerCount: storedSafeInteger(row.marker_count, "stored Redis marker count"),
+      markerRootSha256: String(row.marker_root_sha256),
+      unresolvedBlockerCount: storedSafeInteger(
+        row.unresolved_blocker_count,
+        "stored Redis blocker count",
+      ),
+      attempts: storedSafeInteger(row.attempts, "stored Redis purge attempts"),
+      createdAtMs: storedSafeInteger(row.created_at_ms, "stored Redis creation timestamp"),
+      updatedAtMs: storedSafeInteger(row.updated_at_ms, "stored Redis update timestamp"),
+    };
+    const phase = String(row.phase);
+    let job: TenantRedisPurgeJobRecord;
+    if (phase === "queued") {
+      job = {
+        ...common,
+        phase,
+        availableAtMs: storedSafeInteger(row.available_at_ms, "stored Redis availability"),
+        ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+        ...(row.lease_until_ms == null
+          ? {}
+          : { leaseUntilMs: storedSafeInteger(row.lease_until_ms, "stored Redis lease") }),
+        ...(row.last_error_code == null
+          ? {}
+          : {
+              lastErrorCode: String(row.last_error_code) as Extract<
+                TenantRedisPurgeJobRecord,
+                { phase: "queued" }
+              >["lastErrorCode"],
+            }),
+      };
+    } else if (phase === "redis_purge_sealed") {
+      job = {
+        ...common,
+        phase,
+        terminalReceiptSha256: String(row.terminal_receipt_sha256),
+        sealedAtDbMs: storedSafeInteger(row.sealed_at_db_ms, "stored Redis seal timestamp"),
+        completedClaimAttempt: storedSafeInteger(
+          row.completed_claim_attempt,
+          "stored Redis completion attempt",
+          1,
+        ),
+        completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      };
+    } else if (phase === "blocked") {
+      job = {
+        ...common,
+        phase,
+        blockedAtDbMs: storedSafeInteger(row.blocked_at_db_ms, "stored Redis block timestamp"),
+        blockedReasonCode: String(row.blocked_reason_code) as TenantRedisPurgeBlockReasonCode,
+      };
+    } else {
+      throw new Error("stored tenant Redis purge phase is invalid");
+    }
+    validateTenantRedisPurgeJobRecord(job);
+    return job;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantRedisPurgeTarget(row: Row): TenantRedisPurgeTarget {
+  try {
+    const target: TenantRedisPurgeTarget = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "stored Redis target subject", 1),
+      planBuildGeneration: storedSafeInteger(row.plan_build_generation, "stored Redis target plan", 1),
+      executionGeneration: storedSafeInteger(row.execution_generation, "stored Redis target execution", 1),
+      databasePurgeGeneration: storedSafeInteger(row.database_purge_generation, "stored Redis target database generation", 1),
+      redisPurgeGeneration: storedSafeInteger(row.redis_purge_generation, "stored Redis target generation", 1),
+      scope: String(row.scope) as TenantRedisPurgeTarget["scope"],
+      targetOrdinal: storedSafeInteger(row.target_ordinal, "stored Redis target ordinal"),
+      sessionId: String(row.session_id),
+      graveMarkerSha256: String(row.grave_marker_sha256),
+      redisNamespaceSha256: String(row.redis_namespace_sha256),
+      leasePlanTargetSha256: String(row.lease_plan_target_sha256),
+      fencePlanTargetSha256: String(row.fence_plan_target_sha256),
+      streamPlanTargetSha256: String(row.stream_plan_target_sha256),
+      operationSha256: String(row.operation_sha256),
+      capturedAtDbMs: storedSafeInteger(row.captured_at_db_ms, "stored Redis target timestamp"),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantRedisPurgeTarget(target);
+    return target;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantRedisPurgeTargetAck(row: Row): TenantRedisPurgeTargetAck {
+  try {
+    const ack: TenantRedisPurgeTargetAck = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "stored Redis ACK subject", 1),
+      planBuildGeneration: storedSafeInteger(row.plan_build_generation, "stored Redis ACK plan", 1),
+      executionGeneration: storedSafeInteger(row.execution_generation, "stored Redis ACK execution", 1),
+      databasePurgeGeneration: storedSafeInteger(row.database_purge_generation, "stored Redis ACK database generation", 1),
+      redisPurgeGeneration: storedSafeInteger(row.redis_purge_generation, "stored Redis ACK generation", 1),
+      scope: String(row.scope) as TenantRedisPurgeTargetAck["scope"],
+      targetOrdinal: storedSafeInteger(row.target_ordinal, "stored Redis ACK ordinal"),
+      sessionId: String(row.session_id),
+      targetReceiptSha256: String(row.target_receipt_sha256),
+      operationSha256: String(row.operation_sha256),
+      adapterProtocol: String(row.adapter_protocol) as TenantRedisPurgeTargetAck["adapterProtocol"],
+      redisNamespaceSha256: String(row.redis_namespace_sha256),
+      leaseExisted: tenantCredentialBoolean(row.lease_existed, "stored Redis lease bit"),
+      fenceExisted: tenantCredentialBoolean(row.fence_existed, "stored Redis fence bit"),
+      streamExisted: tenantCredentialBoolean(row.stream_existed, "stored Redis stream bit"),
+      markerSha256: String(row.marker_sha256),
+      completedClaimAttempt: storedSafeInteger(row.completed_claim_attempt, "stored Redis ACK attempt", 1),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      storeDbTimestampMs: storedSafeInteger(row.store_db_timestamp_ms, "stored Redis ACK timestamp"),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantRedisPurgeTargetAck(ack);
+    return ack;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantRedisPurgeDomainAck(row: Row): TenantRedisPurgeDomainAck {
+  try {
+    const ack: TenantRedisPurgeDomainAck = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "stored Redis domain ACK subject", 1),
+      planBuildGeneration: storedSafeInteger(row.plan_build_generation, "stored Redis domain ACK plan", 1),
+      executionGeneration: storedSafeInteger(row.execution_generation, "stored Redis domain ACK execution", 1),
+      databasePurgeGeneration: storedSafeInteger(row.database_purge_generation, "stored Redis domain ACK database generation", 1),
+      redisPurgeGeneration: storedSafeInteger(row.redis_purge_generation, "stored Redis domain ACK generation", 1),
+      scope: String(row.scope) as TenantRedisPurgeDomainAck["scope"],
+      domain: String(row.domain) as TenantRedisPurgeDomain,
+      domainOrdinal: storedSafeInteger(row.domain_ordinal, "stored Redis domain ordinal"),
+      globalAckSeq: storedSafeInteger(row.global_ack_seq, "stored Redis domain sequence", 1),
+      previousGlobalAckSha256: String(row.previous_global_ack_sha256),
+      planEntryReceiptSha256: String(row.plan_entry_receipt_sha256),
+      planTargetCount: storedSafeInteger(row.plan_target_count, "stored Redis plan target count"),
+      planTargetRootSha256: String(row.plan_target_root_sha256),
+      affectedCount: storedSafeInteger(row.affected_count, "stored Redis affected count"),
+      targetAckCount: storedSafeInteger(row.target_ack_count, "stored Redis ACK count"),
+      targetAckRootSha256: String(row.target_ack_root_sha256),
+      markerCount: storedSafeInteger(row.marker_count, "stored Redis marker count"),
+      markerRootSha256: String(row.marker_root_sha256),
+      adapterProtocol: String(row.adapter_protocol) as TenantRedisPurgeDomainAck["adapterProtocol"],
+      redisNamespaceSha256: String(row.redis_namespace_sha256),
+      completedClaimAttempt: storedSafeInteger(row.completed_claim_attempt, "stored Redis domain ACK attempt", 1),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      storeDbTimestampMs: storedSafeInteger(row.store_db_timestamp_ms, "stored Redis domain ACK timestamp"),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantRedisPurgeDomainAck(ack);
+    return ack;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantRedisPurgeReceipt(row: Row): TenantRedisPurgeReceipt {
+  try {
+    const receipt: TenantRedisPurgeReceipt = {
+      ...rowTenantRedisPurgeSource(row),
+      scope: String(row.scope) as TenantRedisPurgeReceipt["scope"],
+      targetCount: storedSafeInteger(row.target_count, "stored Redis receipt target count"),
+      targetRootSha256: String(row.target_root_sha256),
+      targetAckCount: storedSafeInteger(row.target_ack_count, "stored Redis receipt ACK count"),
+      targetAckRootSha256: String(row.target_ack_root_sha256),
+      domainAckCount: storedSafeInteger(row.domain_ack_count, "stored Redis receipt domain count"),
+      domainAckRootSha256: String(row.domain_ack_root_sha256),
+      markerCount: storedSafeInteger(row.marker_count, "stored Redis receipt marker count"),
+      markerRootSha256: String(row.marker_root_sha256),
+      unresolvedBlockerCount: storedSafeInteger(row.unresolved_blocker_count, "stored Redis receipt blocker count"),
+      storeDbTimestampMs: storedSafeInteger(row.store_db_timestamp_ms, "stored Redis receipt timestamp"),
+      completedClaimAttempt: storedSafeInteger(row.completed_claim_attempt, "stored Redis receipt attempt", 1),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      redisPurgeComplete: tenantCredentialBoolean(row.redis_purge_complete, "stored Redis completion") as true,
+      allDomainsComplete: tenantCredentialBoolean(row.all_domains_complete, "stored Redis all-domains flag") as false,
+      contentPurgeExecuted: tenantCredentialBoolean(row.content_purge_executed, "stored Redis content flag") as false,
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantRedisPurgeReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantRedisPurgeCutover(row: Row | undefined): TenantRedisPurgeCutoverRecord {
+  try {
+    if (!row) throw new Error("tenant Redis purge cutover is missing");
+    const generation = storedSafeInteger(row.control_generation, "stored Redis cutover generation");
+    const record: TenantRedisPurgeCutoverRecord = generation === 0
+      ? { singletonId: TENANT_REDIS_PURGE_CUTOVER_SINGLETON_ID, controlGeneration: 0 }
+      : {
+          singletonId: TENANT_REDIS_PURGE_CUTOVER_SINGLETON_ID,
+          controlGeneration: generation as 1,
+          activatedAtDbMs: storedSafeInteger(row.activated_at_db_ms, "stored Redis cutover timestamp"),
+          firstRequestId: String(row.first_request_id),
+          firstReceiptSha256: String(row.first_receipt_sha256),
+          redisNamespaceSha256: String(row.redis_namespace_sha256),
+          evidenceSha256: String(row.evidence_sha256),
+        };
+    validateTenantRedisPurgeCutoverRecord(record);
+    return record;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+type QueuedTenantRedisPurgeJob = Extract<TenantRedisPurgeJobRecord, { phase: "queued" }>;
+
 type QueuedTenantDatabasePurgeJob = Extract<
   TenantDatabasePurgeJobRecord,
   { phase: "queued" }
@@ -4270,6 +4676,8 @@ export interface MysqlStoreOptions {
   migrationsDir?: string;
   /** maximum time to wait for another runner to finish schema migration */
   migrationLockTimeoutSeconds?: number;
+  /** Non-secret digest of the exact Redis deployment/database/prefix purge namespace. */
+  tenantRedisPurgeNamespaceSha256?: string;
 }
 
 export class MysqlSessionStore implements
@@ -4293,6 +4701,7 @@ export class MysqlSessionStore implements
   TenantPurgePlanStore,
   TenantPurgeExecutionStore,
   TenantDatabasePurgeStore,
+  TenantRedisPurgeStore,
   UserDataExportRequestStore,
   UserDataExportJobStore,
   UserDataExportCleanupStore
@@ -4301,8 +4710,12 @@ export class MysqlSessionStore implements
   private tenantPurgePlanMaterializationCursorRequestId?: string;
   private tenantPurgeExecutionMaterializationCursorRequestId?: string;
   private tenantDatabasePurgeMaterializationCursorRequestId?: string;
+  private tenantRedisPurgeMaterializationCursorRequestId?: string;
 
-  private constructor(private readonly pool: Pool) {}
+  private constructor(
+    private readonly pool: Pool,
+    private readonly tenantRedisPurgeNamespaceSha256?: string,
+  ) {}
 
   /**
    * Find the .sql migrations. The layout differs between running from source (package root) and from a
@@ -4328,6 +4741,10 @@ export class MysqlSessionStore implements
   }
 
   static async connect(opts: MysqlStoreOptions): Promise<MysqlSessionStore> {
+    if (opts.tenantRedisPurgeNamespaceSha256 !== undefined
+      && !/^[0-9a-f]{64}$/.test(opts.tenantRedisPurgeNamespaceSha256)) {
+      throw new Error("tenant Redis purge namespace must be a lowercase SHA-256 digest");
+    }
     const pool = mysql.createPool({
       uri: opts.url,
       connectionLimit: opts.connectionLimit ?? 20,
@@ -4336,7 +4753,7 @@ export class MysqlSessionStore implements
       namedPlaceholders: false,
       timezone: "Z",
     });
-    const store = new MysqlSessionStore(pool);
+    const store = new MysqlSessionStore(pool, opts.tenantRedisPurgeNamespaceSha256);
     try {
       await store.migrate(await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir), opts.migrationLockTimeoutSeconds ?? 60);
       return store;
@@ -22615,6 +23032,1666 @@ export class MysqlSessionStore implements
         && candidate.markerSha256 === marker.markerSha256
       ))) throw new TenantErasureIntegrityError();
       return marker;
+    });
+  }
+
+  // ---------- tenant Redis purge (T3g, grave-bound Redis session state) ----------
+  private async beginTenantRedisPurgeTransaction(conn: PoolConnection): Promise<void> {
+    await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    await conn.beginTransaction();
+  }
+
+  private async loadTenantRedisPurgeJob(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" | "FOR UPDATE SKIP LOCKED" = "",
+  ): Promise<TenantRedisPurgeJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_REDIS_PURGE_JOB_COLUMNS}
+         FROM tenant_redis_purge_jobs
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const job = rowToTenantRedisPurgeJob(rows[0]);
+    return job.tenantId === tenantId && job.requestId === requestId ? job : null;
+  }
+
+  private async loadTenantRedisPurgeTargets(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    redisPurgeGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantRedisPurgeTarget[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_REDIS_PURGE_TARGET_COLUMNS}
+         FROM tenant_redis_purge_targets
+        WHERE tenant_id=? AND request_id=? AND redis_purge_generation=?
+        ORDER BY target_ordinal ${lock}`,
+      [tenantId, requestId, redisPurgeGeneration],
+    );
+    return rows.map((row) => {
+      const target = rowToTenantRedisPurgeTarget(row);
+      if (target.tenantId !== tenantId || target.requestId !== requestId
+        || target.redisPurgeGeneration !== redisPurgeGeneration) {
+        throw new TenantErasureIntegrityError();
+      }
+      return target;
+    });
+  }
+
+  private async loadTenantRedisPurgeTargetAcks(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    redisPurgeGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantRedisPurgeTargetAck[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_REDIS_PURGE_TARGET_ACK_COLUMNS}
+         FROM tenant_redis_purge_target_acks
+        WHERE tenant_id=? AND request_id=? AND redis_purge_generation=?
+        ORDER BY target_ordinal ${lock}`,
+      [tenantId, requestId, redisPurgeGeneration],
+    );
+    return rows.map((row) => {
+      const ack = rowToTenantRedisPurgeTargetAck(row);
+      if (ack.tenantId !== tenantId || ack.requestId !== requestId
+        || ack.redisPurgeGeneration !== redisPurgeGeneration) {
+        throw new TenantErasureIntegrityError();
+      }
+      return ack;
+    });
+  }
+
+  private async loadTenantRedisPurgeDomainAcks(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    redisPurgeGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantRedisPurgeDomainAck[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_REDIS_PURGE_DOMAIN_ACK_COLUMNS}
+         FROM tenant_redis_purge_domain_acks
+        WHERE tenant_id=? AND request_id=? AND redis_purge_generation=?
+        ORDER BY global_ack_seq ${lock}`,
+      [tenantId, requestId, redisPurgeGeneration],
+    );
+    return rows.map((row) => {
+      const ack = rowToTenantRedisPurgeDomainAck(row);
+      if (ack.tenantId !== tenantId || ack.requestId !== requestId
+        || ack.redisPurgeGeneration !== redisPurgeGeneration) {
+        throw new TenantErasureIntegrityError();
+      }
+      return ack;
+    });
+  }
+
+  private async loadTenantRedisPurgeReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantRedisPurgeReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_REDIS_PURGE_RECEIPT_COLUMNS}
+         FROM tenant_redis_purge_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const receipt = rowToTenantRedisPurgeReceipt(rows[0]);
+    return receipt.tenantId === tenantId && receipt.requestId === requestId ? receipt : null;
+  }
+
+  private async loadTenantRedisPurgeBundle(
+    conn: PoolConnection,
+    job: Extract<TenantRedisPurgeJobRecord, { phase: "redis_purge_sealed" }>,
+  ): Promise<TenantRedisPurgeEvidenceBundle> {
+    const [targets, targetAcks, domainAcks, receipt] = await Promise.all([
+      this.loadTenantRedisPurgeTargets(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.redisPurgeGeneration,
+        "FOR SHARE",
+      ),
+      this.loadTenantRedisPurgeTargetAcks(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.redisPurgeGeneration,
+        "FOR SHARE",
+      ),
+      this.loadTenantRedisPurgeDomainAcks(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.redisPurgeGeneration,
+        "FOR SHARE",
+      ),
+      this.loadTenantRedisPurgeReceipt(conn, job.tenantId, job.requestId, "FOR SHARE"),
+    ]);
+    if (!receipt) throw new TenantErasureIntegrityError();
+    return { targets, targetAcks, domainAcks, receipt };
+  }
+
+  private async validateTenantRedisPurgeCutoverState(
+    conn: PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantRedisPurgeCutoverRecord> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_REDIS_PURGE_CUTOVER_COLUMNS}
+         FROM tenant_redis_purge_cutover WHERE singleton_id=? ${lock}`,
+      [TENANT_REDIS_PURGE_CUTOVER_SINGLETON_ID],
+    );
+    if (rows.length !== 1) throw new TenantErasureIntegrityError();
+    const cutover = rowToTenantRedisPurgeCutover(rows[0]);
+    if (cutover.controlGeneration === 0) {
+      const [receiptRows] = await conn.query<Row[]>(
+        "SELECT request_id FROM tenant_redis_purge_receipts LIMIT 1",
+      );
+      if (receiptRows[0]) throw new TenantErasureIntegrityError();
+      return cutover;
+    }
+    const [receiptRows] = await conn.query<Row[]>(
+      `SELECT request_id, receipt_sha256, store_db_timestamp_ms,
+              redis_namespace_sha256
+         FROM tenant_redis_purge_receipts
+        WHERE request_id=? AND receipt_sha256=?`,
+      [cutover.firstRequestId, cutover.firstReceiptSha256],
+    );
+    const receipt = receiptRows[0];
+    if (!receipt || receiptRows.length !== 1
+      || String(receipt.request_id) !== cutover.firstRequestId
+      || String(receipt.receipt_sha256) !== cutover.firstReceiptSha256
+      || String(receipt.redis_namespace_sha256) !== cutover.redisNamespaceSha256
+      || storedSafeInteger(receipt.store_db_timestamp_ms, "Redis cutover receipt timestamp")
+        !== cutover.activatedAtDbMs) {
+      throw new TenantErasureIntegrityError();
+    }
+    return cutover;
+  }
+
+  private async validateTenantRedisPurgeSource(
+    conn: PoolConnection,
+    job: TenantRedisPurgeJobRecord,
+    options: { requireConfiguredNamespace: boolean; lockCurrentHold: boolean },
+  ): Promise<{
+    databaseJob: Extract<TenantDatabasePurgeJobRecord, { phase: "database_purged" }>;
+    databaseBundle: TenantDatabasePurgeEvidenceBundle;
+    planEntries: TenantPurgePlanEntry[];
+  }> {
+    try {
+      validateTenantRedisPurgeJobRecord(job);
+      if (options.requireConfiguredNamespace) {
+        if (this.tenantRedisPurgeNamespaceSha256 === undefined) {
+          throw new TenantRedisPurgeNotReadyError("dependency_pending");
+        }
+        if (job.redisNamespaceSha256 !== this.tenantRedisPurgeNamespaceSha256) {
+          throw new TenantRedisPurgeNotReadyError("dependency_pending");
+        }
+      }
+      const cutover = await this.validateTenantRedisPurgeCutoverState(conn, "FOR SHARE");
+      if (cutover.controlGeneration === 1
+        && cutover.redisNamespaceSha256 !== job.redisNamespaceSha256) {
+        throw new TenantRedisPurgeEvidenceChangedError();
+      }
+      const databaseJob = await this.loadTenantDatabasePurgeJob(
+        conn,
+        job.tenantId,
+        job.requestId,
+        "FOR SHARE",
+      );
+      if (!databaseJob || databaseJob.phase !== "database_purged") {
+        throw new Error("tenant Redis purge database source is missing");
+      }
+      const databaseBundle = await this.validateTenantDatabasePurgeReadProof(
+        conn,
+        databaseJob,
+      );
+      if (!databaseBundle) throw new Error("tenant Redis purge database proof is missing");
+      const planEntries = await this.loadTenantPurgePlanEntries(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.planBuildGeneration,
+        "FOR SHARE",
+      );
+      const planReceipt = await this.loadTenantPurgePlanReceipt(
+        conn,
+        job.tenantId,
+        job.requestId,
+        "FOR SHARE",
+      );
+      const redisEntries = TENANT_REDIS_PURGE_DOMAINS.map((domain) => (
+        planEntries.find((entry) => entry.domain === domain)
+      ));
+      if (!planReceipt || redisEntries.some((entry) => entry === undefined)) {
+        throw new Error("tenant Redis purge plan source is missing");
+      }
+      const graveSessionIds = databaseBundle.graveMarkers.map((marker) => marker.sessionId);
+      for (const [index, domain] of TENANT_REDIS_PURGE_DOMAINS.entries()) {
+        const entry = redisEntries[index]!;
+        if (entry.domain !== domain || entry.disposition !== "blocked_adapter_unconfigured"
+          || entry.targetCount !== graveSessionIds.length
+          || entry.targetRootSha256
+            !== tenantRedisPurgePlanTargetRootSha256(domain, graveSessionIds)) {
+          throw new TenantRedisPurgeEvidenceChangedError();
+        }
+      }
+      const redisPlanEntryRootSha256 = tenantRedisPurgePlanEntryRootSha256(
+        redisEntries.map((entry) => ({
+          domain: entry!.domain as TenantRedisPurgeDomain,
+          planEntryReceiptSha256: entry!.receiptSha256,
+        })),
+      );
+      if (databaseJob.subjectGeneration !== job.subjectGeneration
+        || databaseJob.planBuildGeneration !== job.planBuildGeneration
+        || databaseJob.executionGeneration !== job.executionGeneration
+        || databaseJob.databasePurgeGeneration !== job.databasePurgeGeneration
+        || databaseJob.t3cReceiptSha256 !== job.t3cReceiptSha256
+        || databaseJob.planReceiptSha256 !== job.planReceiptSha256
+        || databaseBundle.receipt.receiptSha256 !== job.databasePurgeReceiptSha256
+        || databaseBundle.receipt.graveMarkerCount !== job.graveMarkerCount
+        || databaseBundle.receipt.graveMarkerRootSha256 !== job.graveMarkerRootSha256
+        || databaseBundle.receipt.policySha256 !== job.policySha256
+        || databaseBundle.receipt.purgeNotBeforeDbMs !== job.purgeNotBeforeDbMs
+        || databaseBundle.receipt.storeDbTimestampMs !== job.sourceEvidenceDbMs
+        || databaseBundle.receipt.unresolvedBlockerCount
+          !== job.sourceUnresolvedBlockerCount
+        || planReceipt.receiptSha256 !== job.planReceiptSha256
+        || job.redisPlanEntryCount !== TENANT_REDIS_PURGE_DOMAINS.length
+        || job.redisPlanEntryRootSha256 !== redisPlanEntryRootSha256) {
+        throw new TenantRedisPurgeEvidenceChangedError();
+      }
+      if (options.lockCurrentHold) {
+        try {
+          await this.lockTenantPurgePlanHoldProof(conn, job.tenantId);
+        } catch (error) {
+          if (error instanceof TenantPurgePlanNotReadyError
+            && error.reason === "active_legal_hold") {
+            throw new TenantRedisPurgeNotReadyError("active_legal_hold");
+          }
+          throw error;
+        }
+      }
+      return { databaseJob, databaseBundle, planEntries };
+    } catch (error) {
+      if (error instanceof TenantRedisPurgeNotReadyError
+        || error instanceof TenantRedisPurgeEvidenceChangedError) throw error;
+      if (error instanceof TenantDatabasePurgeNotReadyError) {
+        throw new TenantRedisPurgeNotReadyError("dependency_pending");
+      }
+      if (error instanceof TenantDatabasePurgeEvidenceChangedError
+        || error instanceof TenantPurgePlanEvidenceChangedError) {
+        throw new TenantRedisPurgeEvidenceChangedError();
+      }
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async validateTenantRedisPurgeReadProof(
+    conn: PoolConnection,
+    job: TenantRedisPurgeJobRecord,
+  ): Promise<TenantRedisPurgeEvidenceBundle | null> {
+    const source = await this.validateTenantRedisPurgeSource(conn, job, {
+      requireConfiguredNamespace: false,
+      lockCurrentHold: false,
+    });
+    const [targets, targetAcks, domainAcks, receipt] = await Promise.all([
+      this.loadTenantRedisPurgeTargets(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.redisPurgeGeneration,
+        "FOR SHARE",
+      ),
+      this.loadTenantRedisPurgeTargetAcks(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.redisPurgeGeneration,
+        "FOR SHARE",
+      ),
+      this.loadTenantRedisPurgeDomainAcks(
+        conn,
+        job.tenantId,
+        job.requestId,
+        job.redisPurgeGeneration,
+        "FOR SHARE",
+      ),
+      this.loadTenantRedisPurgeReceipt(conn, job.tenantId, job.requestId, "FOR SHARE"),
+    ]);
+    const graveBySession = new Map(source.databaseBundle.graveMarkers.map((marker) => [
+      marker.sessionId,
+      marker,
+    ] as const));
+    if (targets.length !== job.targetCount
+      || tenantRedisPurgeTargetRootSha256(targets) !== job.targetRootSha256
+      || targetAcks.length !== job.targetAckCount
+      || tenantRedisPurgeTargetAckRootSha256(targetAcks) !== job.targetAckRootSha256
+      || tenantRedisPurgeMarkerRootSha256(targetAcks) !== job.markerRootSha256
+      || targets.some((target) => (
+        target.redisNamespaceSha256 !== job.redisNamespaceSha256
+        || graveBySession.get(target.sessionId)?.markerSha256 !== target.graveMarkerSha256
+      ))) {
+      throw new TenantErasureIntegrityError();
+    }
+    const targetByOrdinal = new Map(targets.map((target) => [target.targetOrdinal, target]));
+    if (targetAcks.some((ack) => {
+      const target = targetByOrdinal.get(ack.targetOrdinal);
+      return !target || ack.sessionId !== target.sessionId
+        || ack.targetReceiptSha256 !== target.receiptSha256
+        || ack.operationSha256 !== target.operationSha256
+        || ack.redisNamespaceSha256 !== target.redisNamespaceSha256;
+    })) throw new TenantErasureIntegrityError();
+    if (job.phase === "redis_purge_sealed") {
+      if (!receipt) throw new TenantErasureIntegrityError();
+      const bundle = { targets, targetAcks, domainAcks, receipt };
+      try {
+        validateTenantRedisPurgeEvidenceBundle(bundle);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (receipt.receiptSha256 !== job.terminalReceiptSha256
+        || receipt.completedClaimAttempt !== job.completedClaimAttempt
+        || receipt.completedClaimTokenSha256 !== job.completedClaimTokenSha256
+        || receipt.storeDbTimestampMs !== job.sealedAtDbMs
+        || job.domainAckCount !== domainAcks.length
+        || job.domainAckRootSha256 !== tenantRedisPurgeDomainAckRootSha256(domainAcks)) {
+        throw new TenantErasureIntegrityError();
+      }
+      return bundle;
+    }
+    if (domainAcks.length !== 0 || receipt !== null) throw new TenantErasureIntegrityError();
+    return null;
+  }
+
+  async materializeTenantRedisPurgeJobs(
+    options: MaterializeTenantRedisPurgeJobsOptions,
+  ): Promise<number> {
+    validateMaterializeTenantRedisPurgeJobsOptions(options);
+    if (this.tenantRedisPurgeNamespaceSha256 === undefined) {
+      throw new TenantRedisPurgeNotReadyError("dependency_pending");
+    }
+    const scanLimit = Math.min(400, Math.max(32, options.limit * 4));
+    const cursor = this.tenantRedisPurgeMaterializationCursorRequestId;
+    const load = async (after: string | undefined, through: string | undefined): Promise<Row[]> => {
+      const [rows] = await this.pool.query<Row[]>(
+        `SELECT d.request_id, d.tenant_id
+           FROM tenant_database_purge_jobs d
+          WHERE d.phase='database_purged'
+            ${after === undefined ? "" : "AND d.request_id>?"}
+            ${through === undefined ? "" : "AND d.request_id<=?"}
+            AND NOT EXISTS (
+              SELECT 1 FROM tenant_redis_purge_jobs r WHERE r.request_id=d.request_id
+            )
+          ORDER BY d.request_id LIMIT ?`,
+        [
+          ...(after === undefined ? [] : [after]),
+          ...(through === undefined ? [] : [through]),
+          scanLimit,
+        ],
+      );
+      return rows;
+    };
+    let candidates = await load(cursor, undefined);
+    if (candidates.length === 0 && cursor !== undefined) {
+      candidates = await load(undefined, cursor);
+      if (candidates.length === 0) this.tenantRedisPurgeMaterializationCursorRequestId = undefined;
+    }
+    let materialized = 0;
+    let integrity: TenantErasureIntegrityError | undefined;
+    for (const candidate of candidates) {
+      if (materialized >= options.limit) break;
+      const requestId = String(candidate.request_id);
+      const tenantId = String(candidate.tenant_id);
+      this.tenantRedisPurgeMaterializationCursorRequestId = requestId;
+      const conn = await this.pool.getConnection();
+      try {
+        await this.beginTenantRedisPurgeTransaction(conn);
+        const existing = await this.loadTenantRedisPurgeJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (existing) {
+          await conn.commit();
+          continue;
+        }
+        const cutover = await this.validateTenantRedisPurgeCutoverState(conn, "FOR SHARE");
+        if (cutover.controlGeneration === 1
+          && cutover.redisNamespaceSha256 !== this.tenantRedisPurgeNamespaceSha256) {
+          throw new TenantRedisPurgeNotReadyError("dependency_pending");
+        }
+        const databaseJob = await this.loadTenantDatabasePurgeJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (!databaseJob || databaseJob.phase !== "database_purged") {
+          throw new TenantErasureIntegrityError();
+        }
+        const databaseBundle = await this.validateTenantDatabasePurgeReadProof(conn, databaseJob);
+        if (!databaseBundle) throw new TenantErasureIntegrityError();
+        try {
+          await this.lockTenantPurgePlanHoldProof(conn, tenantId);
+        } catch (error) {
+          if (error instanceof TenantPurgePlanNotReadyError
+            && error.reason === "active_legal_hold") {
+            throw new TenantRedisPurgeNotReadyError("active_legal_hold");
+          }
+          throw error;
+        }
+        const planEntries = await this.loadTenantPurgePlanEntries(
+          conn,
+          tenantId,
+          requestId,
+          databaseJob.planBuildGeneration,
+          "FOR SHARE",
+        );
+        const redisEntries = TENANT_REDIS_PURGE_DOMAINS.map((domain) => (
+          planEntries.find((entry) => entry.domain === domain)
+        ));
+        const sessionIds = databaseBundle.graveMarkers.map((marker) => marker.sessionId);
+        if (redisEntries.some((entry) => entry === undefined)) {
+          throw new TenantErasureIntegrityError();
+        }
+        for (const [index, domain] of TENANT_REDIS_PURGE_DOMAINS.entries()) {
+          const entry = redisEntries[index]!;
+          if (entry.disposition !== "blocked_adapter_unconfigured"
+            || entry.targetCount !== sessionIds.length
+            || entry.targetRootSha256 !== tenantRedisPurgePlanTargetRootSha256(domain, sessionIds)) {
+            throw new TenantRedisPurgeEvidenceChangedError();
+          }
+        }
+        const now = await this.databaseNow(conn);
+        if (now < databaseBundle.receipt.storeDbTimestampMs) {
+          throw new TenantRedisPurgeNotReadyError("dependency_pending");
+        }
+        const orphanTables = [
+          "tenant_redis_purge_jobs",
+          "tenant_redis_purge_targets",
+          "tenant_redis_purge_target_acks",
+          "tenant_redis_purge_domain_acks",
+          "tenant_redis_purge_receipts",
+        ] as const;
+        let orphan = false;
+        for (const table of orphanTables) {
+          const [rows] = await conn.query<Row[]>(
+            `SELECT request_id FROM ${table}
+              WHERE request_id=? OR tenant_id=? LIMIT 1 FOR SHARE`,
+            [requestId, tenantId],
+          );
+          orphan ||= rows[0] !== undefined;
+        }
+        if (orphan) throw new TenantErasureIntegrityError();
+
+        const identity = {
+          requestId,
+          tenantId,
+          subjectGeneration: databaseJob.subjectGeneration,
+          planBuildGeneration: databaseJob.planBuildGeneration,
+          executionGeneration: databaseJob.executionGeneration,
+          databasePurgeGeneration: databaseJob.databasePurgeGeneration,
+          redisPurgeGeneration: 1,
+        } as const;
+        const targets = databaseBundle.graveMarkers.map((marker, targetOrdinal) => {
+          const leasePlanTargetSha256 = tenantRedisPurgePlanTargetSha256(
+            "redis_leases",
+            marker.sessionId,
+          );
+          const fencePlanTargetSha256 = tenantRedisPurgePlanTargetSha256(
+            "redis_fences",
+            marker.sessionId,
+          );
+          const streamPlanTargetSha256 = tenantRedisPurgePlanTargetSha256(
+            "redis_streams",
+            marker.sessionId,
+          );
+          const body = {
+            ...identity,
+            scope: TENANT_REDIS_PURGE_TARGET_SCOPE,
+            targetOrdinal,
+            sessionId: marker.sessionId,
+            graveMarkerSha256: marker.markerSha256,
+            redisNamespaceSha256: this.tenantRedisPurgeNamespaceSha256!,
+            leasePlanTargetSha256,
+            fencePlanTargetSha256,
+            streamPlanTargetSha256,
+            operationSha256: tenantRedisPurgeOperationSha256({
+              identity,
+              sessionId: marker.sessionId,
+              graveMarkerSha256: marker.markerSha256,
+              redisNamespaceSha256: this.tenantRedisPurgeNamespaceSha256!,
+              leasePlanTargetSha256,
+              fencePlanTargetSha256,
+              streamPlanTargetSha256,
+            }),
+            capturedAtDbMs: now,
+          };
+          const target: TenantRedisPurgeTarget = {
+            ...body,
+            receiptSha256: tenantRedisPurgeTargetSha256(body),
+          };
+          validateTenantRedisPurgeTarget(target);
+          return target;
+        });
+        const source: TenantRedisPurgeSource = {
+          ...identity,
+          t3cReceiptSha256: databaseBundle.receipt.t3cReceiptSha256,
+          planReceiptSha256: databaseBundle.receipt.planReceiptSha256,
+          redisPlanEntryCount: TENANT_REDIS_PURGE_DOMAINS.length,
+          redisPlanEntryRootSha256: tenantRedisPurgePlanEntryRootSha256(
+            redisEntries.map((entry) => ({
+              domain: entry!.domain as TenantRedisPurgeDomain,
+              planEntryReceiptSha256: entry!.receiptSha256,
+            })),
+          ),
+          databasePurgeReceiptSha256: databaseBundle.receipt.receiptSha256,
+          graveMarkerCount: databaseBundle.receipt.graveMarkerCount,
+          graveMarkerRootSha256: databaseBundle.receipt.graveMarkerRootSha256,
+          redisNamespaceSha256: this.tenantRedisPurgeNamespaceSha256,
+          policySha256: databaseBundle.receipt.policySha256,
+          purgeNotBeforeDbMs: databaseBundle.receipt.purgeNotBeforeDbMs,
+          sourceEvidenceDbMs: databaseBundle.receipt.storeDbTimestampMs,
+          sourceUnresolvedBlockerCount: databaseBundle.receipt.unresolvedBlockerCount,
+        };
+        const job: QueuedTenantRedisPurgeJob = {
+          ...source,
+          phase: "queued",
+          targetCount: targets.length,
+          targetRootSha256: tenantRedisPurgeTargetRootSha256(targets),
+          targetAckCount: 0,
+          targetAckRootSha256: EMPTY_TENANT_REDIS_PURGE_TARGET_ACK_ROOT_SHA256,
+          domainAckCount: 0,
+          domainAckRootSha256: EMPTY_TENANT_REDIS_PURGE_DOMAIN_ACK_ROOT_SHA256,
+          markerCount: 0,
+          markerRootSha256: EMPTY_TENANT_REDIS_PURGE_MARKER_ROOT_SHA256,
+          unresolvedBlockerCount: source.sourceUnresolvedBlockerCount,
+          availableAtMs: now,
+          attempts: 0,
+          createdAtMs: now,
+          updatedAtMs: now,
+        };
+        validateTenantRedisPurgeJobRecord(job);
+        const jobValues = [
+          job.requestId, job.tenantId, job.subjectGeneration, job.planBuildGeneration,
+          job.executionGeneration, job.databasePurgeGeneration, job.redisPurgeGeneration,
+          job.t3cReceiptSha256, job.planReceiptSha256, job.redisPlanEntryCount,
+          job.redisPlanEntryRootSha256, job.databasePurgeReceiptSha256,
+          job.graveMarkerCount, job.graveMarkerRootSha256, job.redisNamespaceSha256,
+          job.policySha256, job.purgeNotBeforeDbMs, job.sourceEvidenceDbMs,
+          job.sourceUnresolvedBlockerCount, job.phase, job.targetCount,
+          job.targetRootSha256, job.targetAckCount, job.targetAckRootSha256,
+          job.domainAckCount, job.domainAckRootSha256, job.markerCount,
+          job.markerRootSha256, job.unresolvedBlockerCount, null, job.availableAtMs,
+          job.attempts, null, null, null, job.createdAtMs, job.updatedAtMs,
+          null, null, null, null, null,
+        ];
+        await conn.query(
+          `INSERT INTO tenant_redis_purge_jobs
+             (request_id, tenant_id, subject_generation, plan_build_generation,
+              execution_generation, database_purge_generation, redis_purge_generation,
+              t3c_receipt_sha256, plan_receipt_sha256, redis_plan_entry_count,
+              redis_plan_entry_root_sha256, database_purge_receipt_sha256,
+              grave_marker_count, grave_marker_root_sha256, redis_namespace_sha256,
+              policy_sha256, purge_not_before_db_ms, source_evidence_db_ms,
+              source_unresolved_blocker_count, phase, target_count, target_root_sha256,
+              target_ack_count, target_ack_root_sha256, domain_ack_count,
+              domain_ack_root_sha256, marker_count, marker_root_sha256,
+              unresolved_blocker_count, terminal_receipt_sha256, available_at_ms,
+              attempts, claim_token, lease_until_ms, last_error_code, created_at_ms,
+              updated_at_ms, sealed_at_db_ms, completed_claim_attempt,
+              completed_claim_token_sha256, blocked_at_db_ms, blocked_reason_code)
+           VALUES (${jobValues.map(() => "?").join(",")})`,
+          jobValues,
+        );
+        for (const target of targets) {
+          await conn.query(
+            `INSERT INTO tenant_redis_purge_targets
+               (scope, request_id, tenant_id, subject_generation,
+                plan_build_generation, execution_generation, database_purge_generation,
+                redis_purge_generation, target_ordinal, session_id,
+                grave_marker_sha256, redis_namespace_sha256,
+                lease_plan_target_sha256, fence_plan_target_sha256,
+                stream_plan_target_sha256, operation_sha256, captured_at_db_ms,
+                receipt_sha256)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              target.scope, target.requestId, target.tenantId, target.subjectGeneration,
+              target.planBuildGeneration, target.executionGeneration,
+              target.databasePurgeGeneration, target.redisPurgeGeneration,
+              target.targetOrdinal, target.sessionId, target.graveMarkerSha256,
+              target.redisNamespaceSha256, target.leasePlanTargetSha256,
+              target.fencePlanTargetSha256, target.streamPlanTargetSha256,
+              target.operationSha256, target.capturedAtDbMs, target.receiptSha256,
+            ],
+          );
+        }
+        await conn.commit();
+        materialized += 1;
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        if (error instanceof TenantRedisPurgeNotReadyError) continue;
+        if (error instanceof TenantRedisPurgeEvidenceChangedError
+          || error instanceof TenantErasureIntegrityError) {
+          integrity ??= new TenantErasureIntegrityError();
+          continue;
+        }
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    if (integrity) throw integrity;
+    return materialized;
+  }
+
+  async claimTenantRedisPurges(
+    options: ClaimTenantRedisPurgesOptions,
+  ): Promise<TenantRedisPurgeClaim[]> {
+    validateClaimTenantRedisPurgesOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantRedisPurgeTransaction(conn);
+      const scanNow = await this.databaseNow(conn);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_REDIS_PURGE_JOB_COLUMNS}
+           FROM tenant_redis_purge_jobs
+          WHERE phase='queued' AND available_at_ms<=?
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+          ORDER BY available_at_ms, request_id LIMIT ?`,
+        [scanNow, scanNow, Math.min(400, Math.max(32, options.limit * 4))],
+      );
+      const claims: TenantRedisPurgeClaim[] = [];
+      for (const row of rows) {
+        if (claims.length >= options.limit) break;
+        const candidate = rowToTenantRedisPurgeJob(row);
+        if (candidate.phase !== "queued") throw new TenantErasureIntegrityError();
+        const current = await this.loadTenantRedisPurgeJob(
+          conn,
+          candidate.tenantId,
+          candidate.requestId,
+          "FOR UPDATE SKIP LOCKED",
+        );
+        if (!current || current.phase !== "queued") continue;
+        const now = await this.databaseNow(conn);
+        if (current.availableAtMs > now
+          || (current.claimToken !== undefined && current.leaseUntilMs! > now)) continue;
+        const attempts = current.attempts + 1;
+        if (!Number.isSafeInteger(attempts) || attempts > 0xffff_ffff) {
+          throw new TenantErasureIntegrityError();
+        }
+        let valid = true;
+        try {
+          await this.validateTenantRedisPurgeReadProof(conn, current);
+          await this.validateTenantRedisPurgeSource(conn, current, {
+            requireConfiguredNamespace: true,
+            lockCurrentHold: true,
+          });
+          if (now < current.purgeNotBeforeDbMs || now < current.sourceEvidenceDbMs) {
+            throw new TenantRedisPurgeNotReadyError("dependency_pending");
+          }
+        } catch (error) {
+          if (error instanceof TenantRedisPurgeNotReadyError) continue;
+          if (!(error instanceof TenantRedisPurgeEvidenceChangedError)
+            && !(error instanceof TenantErasureIntegrityError)) throw error;
+          valid = false;
+        }
+        const updatedAtMs = Math.max(current.updatedAtMs, now);
+        if (!valid) {
+          const [blocked] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE tenant_redis_purge_jobs
+                SET phase='blocked', available_at_ms=NULL, attempts=?, claim_token=NULL,
+                    lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                    blocked_at_db_ms=?, blocked_reason_code='integrity_conflict'
+              WHERE request_id=? AND tenant_id=? AND phase='queued' AND attempts=?
+                AND available_at_ms<=? AND (claim_token IS NULL OR lease_until_ms<=?)`,
+            [
+              attempts, updatedAtMs, updatedAtMs, current.requestId, current.tenantId,
+              current.attempts, now, now,
+            ],
+          );
+          if (blocked.affectedRows !== 1) throw new TenantErasureIntegrityError();
+          continue;
+        }
+        const leaseUntilMs = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+          ? Number.MAX_SAFE_INTEGER
+          : now + options.leaseMs;
+        if (leaseUntilMs <= now) continue;
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_redis_purge_jobs
+              SET attempts=?, claim_token=?, lease_until_ms=?, last_error_code=NULL,
+                  updated_at_ms=?
+            WHERE request_id=? AND tenant_id=? AND phase='queued' AND attempts=?
+              AND available_at_ms<=? AND (claim_token IS NULL OR lease_until_ms<=?)`,
+          [
+            attempts, options.claimToken, leaseUntilMs, updatedAtMs,
+            current.requestId, current.tenantId, current.attempts, now, now,
+          ],
+        );
+        if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+        const claim = tenantRedisPurgeClaimFromJob({
+          ...current,
+          attempts,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+          updatedAtMs,
+        });
+        if (!claim) throw new TenantErasureIntegrityError();
+        claims.push(claim);
+      }
+      await conn.commit();
+      return claims;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewTenantRedisPurge(
+    authorization: TenantRedisPurgeAuthorization,
+    options: RenewTenantRedisPurgeOptions,
+  ): Promise<boolean> {
+    validateTenantRedisPurgeAuthorization(authorization);
+    validateRenewTenantRedisPurgeOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantRedisPurgeTransaction(conn);
+      const current = await this.loadTenantRedisPurgeJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      const now = await this.databaseNow(conn);
+      if (!tenantRedisPurgeAuthorizationMatches(authorization, current)
+        || current.leaseUntilMs === undefined || current.leaseUntilMs <= now) {
+        await conn.commit();
+        return false;
+      }
+      await this.validateTenantRedisPurgeReadProof(conn, current);
+      await this.validateTenantRedisPurgeSource(conn, current, {
+        requireConfiguredNamespace: true,
+        lockCurrentHold: true,
+      });
+      const requested = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+        ? Number.MAX_SAFE_INTEGER
+        : now + options.leaseMs;
+      if (requested <= now) {
+        await conn.commit();
+        return false;
+      }
+      const leaseUntilMs = Math.max(current.leaseUntilMs, requested);
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_redis_purge_jobs SET lease_until_ms=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND plan_build_generation=? AND execution_generation=?
+            AND database_purge_generation=? AND redis_purge_generation=?
+            AND phase='queued' AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          leaseUntilMs, updatedAtMs, authorization.requestId, authorization.tenantId,
+          authorization.subjectGeneration, authorization.planBuildGeneration,
+          authorization.executionGeneration, authorization.databasePurgeGeneration,
+          authorization.redisPurgeGeneration, authorization.claimAttempt,
+          authorization.claimToken, now,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryTenantRedisPurge(
+    authorization: TenantRedisPurgeAuthorization,
+    options: RetryTenantRedisPurgeOptions,
+  ): Promise<boolean> {
+    validateTenantRedisPurgeAuthorization(authorization);
+    validateRetryTenantRedisPurgeOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantRedisPurgeTransaction(conn);
+      const current = await this.loadTenantRedisPurgeJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      const now = await this.databaseNow(conn);
+      if (!tenantRedisPurgeAuthorizationMatches(authorization, current)
+        || current.leaseUntilMs === undefined || current.leaseUntilMs <= now) {
+        await conn.commit();
+        return false;
+      }
+      await this.validateTenantRedisPurgeReadProof(conn, current);
+      const base = Math.max(now, current.createdAtMs, current.updatedAtMs, current.availableAtMs);
+      const availableAtMs = options.delayMs > Number.MAX_SAFE_INTEGER - base
+        ? Number.MAX_SAFE_INTEGER
+        : base + options.delayMs;
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_redis_purge_jobs
+            SET available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND plan_build_generation=? AND execution_generation=?
+            AND database_purge_generation=? AND redis_purge_generation=?
+            AND phase='queued' AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          availableAtMs, options.errorCode, updatedAtMs,
+          authorization.requestId, authorization.tenantId,
+          authorization.subjectGeneration, authorization.planBuildGeneration,
+          authorization.executionGeneration, authorization.databasePurgeGeneration,
+          authorization.redisPurgeGeneration, authorization.claimAttempt,
+          authorization.claimToken, now,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async blockTenantRedisPurge(
+    authorization: TenantRedisPurgeAuthorization,
+    reason: TenantRedisPurgeBlockReasonCode = "integrity_conflict",
+  ): Promise<boolean> {
+    validateTenantRedisPurgeAuthorization(authorization);
+    if (reason !== "integrity_conflict") throw new Error("invalid tenant Redis purge block reason");
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantRedisPurgeTransaction(conn);
+      const current = await this.loadTenantRedisPurgeJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      const now = await this.databaseNow(conn);
+      if (!tenantRedisPurgeAuthorizationMatches(authorization, current)
+        || current.leaseUntilMs === undefined || current.leaseUntilMs <= now) {
+        await conn.commit();
+        return false;
+      }
+      const blockedAtDbMs = Math.max(now, current.createdAtMs, current.updatedAtMs);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_redis_purge_jobs
+            SET phase='blocked', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                blocked_at_db_ms=?, blocked_reason_code=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND plan_build_generation=? AND execution_generation=?
+            AND database_purge_generation=? AND redis_purge_generation=?
+            AND phase='queued' AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          blockedAtDbMs, blockedAtDbMs, reason,
+          authorization.requestId, authorization.tenantId,
+          authorization.subjectGeneration, authorization.planBuildGeneration,
+          authorization.executionGeneration, authorization.databasePurgeGeneration,
+          authorization.redisPurgeGeneration, authorization.claimAttempt,
+          authorization.claimToken, now,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async recordTenantRedisPurgeTargetAck(
+    authorization: TenantRedisPurgeAuthorization,
+    result: TenantRedisPurgeAdapterResult,
+  ): Promise<TenantRedisPurgeTargetAck | null> {
+    validateTenantRedisPurgeAuthorization(authorization);
+    validateTenantRedisPurgeAdapterResult(result);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantRedisPurgeTransaction(conn);
+      const current = await this.loadTenantRedisPurgeJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return null;
+      }
+      const now = await this.databaseNow(conn);
+      if (!tenantRedisPurgeAuthorizationMatches(authorization, current)
+        || current.leaseUntilMs === undefined || current.leaseUntilMs <= now) {
+        await conn.commit();
+        return null;
+      }
+      await this.validateTenantRedisPurgeReadProof(conn, current);
+      const targets = await this.loadTenantRedisPurgeTargets(
+        conn,
+        current.tenantId,
+        current.requestId,
+        current.redisPurgeGeneration,
+        "FOR SHARE",
+      );
+      const target = targets.find((candidate) => candidate.sessionId === result.sessionId);
+      if (!target || target.operationSha256 !== result.operationSha256
+        || target.redisNamespaceSha256 !== result.redisNamespaceSha256
+        || result.redisNamespaceSha256 !== current.redisNamespaceSha256
+        || result.adapterProtocol !== TENANT_REDIS_PURGE_ADAPTER_PROTOCOL) {
+        throw new TenantRedisPurgeEvidenceChangedError();
+      }
+      const existingAcks = await this.loadTenantRedisPurgeTargetAcks(
+        conn,
+        current.tenantId,
+        current.requestId,
+        current.redisPurgeGeneration,
+        "FOR SHARE",
+      );
+      const existing = existingAcks.find((ack) => ack.targetOrdinal === target.targetOrdinal);
+      if (existing) {
+        if (existing.sessionId !== result.sessionId
+          || existing.operationSha256 !== result.operationSha256
+          || existing.adapterProtocol !== result.adapterProtocol
+          || existing.redisNamespaceSha256 !== result.redisNamespaceSha256
+          || existing.leaseExisted !== result.leaseExisted
+          || existing.fenceExisted !== result.fenceExisted
+          || existing.streamExisted !== result.streamExisted
+          || existing.markerSha256 !== result.markerSha256) {
+          throw new TenantRedisPurgeEvidenceChangedError();
+        }
+        await conn.commit();
+        return existing;
+      }
+      await this.validateTenantRedisPurgeSource(conn, current, {
+        requireConfiguredNamespace: true,
+        lockCurrentHold: true,
+      });
+      if (now < current.purgeNotBeforeDbMs || now < current.sourceEvidenceDbMs) {
+        throw new TenantRedisPurgeNotReadyError("dependency_pending");
+      }
+      const identity = {
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        planBuildGeneration: current.planBuildGeneration,
+        executionGeneration: current.executionGeneration,
+        databasePurgeGeneration: current.databasePurgeGeneration,
+        redisPurgeGeneration: current.redisPurgeGeneration,
+      };
+      const body = {
+        ...identity,
+        scope: TENANT_REDIS_PURGE_TARGET_ACK_SCOPE,
+        targetOrdinal: target.targetOrdinal,
+        sessionId: target.sessionId,
+        targetReceiptSha256: target.receiptSha256,
+        operationSha256: target.operationSha256,
+        adapterProtocol: TENANT_REDIS_PURGE_ADAPTER_PROTOCOL,
+        redisNamespaceSha256: current.redisNamespaceSha256,
+        leaseExisted: result.leaseExisted,
+        fenceExisted: result.fenceExisted,
+        streamExisted: result.streamExisted,
+        markerSha256: result.markerSha256,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256: tenantRedisPurgeClaimTokenSha256(
+          authorization.claimToken,
+        ),
+        storeDbTimestampMs: now,
+      };
+      const ack: TenantRedisPurgeTargetAck = {
+        ...body,
+        receiptSha256: tenantRedisPurgeTargetAckSha256(body),
+      };
+      validateTenantRedisPurgeTargetAck(ack);
+      const acks = [...existingAcks, ack].sort(
+        (left, right) => left.targetOrdinal - right.targetOrdinal,
+      );
+      const targetAckRootSha256 = tenantRedisPurgeTargetAckRootSha256(acks);
+      const markerRootSha256 = tenantRedisPurgeMarkerRootSha256(acks);
+      await conn.query(
+        `INSERT INTO tenant_redis_purge_target_acks
+           (scope, request_id, tenant_id, subject_generation,
+            plan_build_generation, execution_generation, database_purge_generation,
+            redis_purge_generation, target_ordinal, session_id,
+            target_receipt_sha256, operation_sha256, adapter_protocol,
+            redis_namespace_sha256, lease_existed, fence_existed, stream_existed,
+            marker_sha256, completed_claim_attempt, completed_claim_token_sha256,
+            store_db_timestamp_ms, receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          ack.scope, ack.requestId, ack.tenantId, ack.subjectGeneration,
+          ack.planBuildGeneration, ack.executionGeneration,
+          ack.databasePurgeGeneration, ack.redisPurgeGeneration,
+          ack.targetOrdinal, ack.sessionId, ack.targetReceiptSha256,
+          ack.operationSha256, ack.adapterProtocol, ack.redisNamespaceSha256,
+          ack.leaseExisted, ack.fenceExisted, ack.streamExisted,
+          ack.markerSha256, ack.completedClaimAttempt,
+          ack.completedClaimTokenSha256, ack.storeDbTimestampMs, ack.receiptSha256,
+        ],
+      );
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_redis_purge_jobs
+            SET target_ack_count=?, target_ack_root_sha256=?, marker_count=?,
+                marker_root_sha256=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>? AND target_ack_count=?`,
+        [
+          acks.length, targetAckRootSha256, acks.length, markerRootSha256,
+          updatedAtMs, current.requestId, current.tenantId,
+          authorization.claimAttempt, authorization.claimToken, now,
+          current.targetAckCount,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      const publishNow = await this.databaseNow(conn);
+      if (current.leaseUntilMs <= publishNow) {
+        await conn.rollback();
+        return null;
+      }
+      await conn.commit();
+      return ack;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async sealTenantRedisPurge(
+    authorization: TenantRedisPurgeAuthorization,
+  ): Promise<TenantRedisPurgeReceipt | null> {
+    validateTenantRedisPurgeAuthorization(authorization);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantRedisPurgeTransaction(conn);
+      const current = await this.loadTenantRedisPurgeJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current) {
+        await conn.commit();
+        return null;
+      }
+      if (current.phase === "redis_purge_sealed") {
+        const bundle = await this.validateTenantRedisPurgeReadProof(conn, current);
+        const receipt = bundle?.receipt;
+        const exact = receipt
+          && receipt.completedClaimAttempt === authorization.claimAttempt
+          && receipt.completedClaimTokenSha256
+            === tenantRedisPurgeClaimTokenSha256(authorization.claimToken);
+        await conn.commit();
+        return exact ? receipt : null;
+      }
+      if (current.phase !== "queued") {
+        await conn.commit();
+        return null;
+      }
+      const initialNow = await this.databaseNow(conn);
+      if (!tenantRedisPurgeAuthorizationMatches(authorization, current)
+        || current.leaseUntilMs === undefined || current.leaseUntilMs <= initialNow) {
+        await conn.commit();
+        return null;
+      }
+      await this.validateTenantRedisPurgeReadProof(conn, current);
+      const source = await this.validateTenantRedisPurgeSource(conn, current, {
+        requireConfiguredNamespace: true,
+        lockCurrentHold: true,
+      });
+      if (initialNow < current.purgeNotBeforeDbMs
+        || initialNow < current.sourceEvidenceDbMs) {
+        throw new TenantRedisPurgeNotReadyError("dependency_pending");
+      }
+      const targets = await this.loadTenantRedisPurgeTargets(
+        conn,
+        current.tenantId,
+        current.requestId,
+        current.redisPurgeGeneration,
+        "FOR SHARE",
+      );
+      const targetAcks = await this.loadTenantRedisPurgeTargetAcks(
+        conn,
+        current.tenantId,
+        current.requestId,
+        current.redisPurgeGeneration,
+        "FOR SHARE",
+      );
+      if (targetAcks.length !== targets.length) {
+        throw new TenantRedisPurgeNotReadyError("dependency_pending");
+      }
+      const planByDomain = new Map(source.planEntries.map((entry) => [entry.domain, entry]));
+      const sealedAtDbMs = await this.databaseNow(conn);
+      const completedClaimTokenSha256 = tenantRedisPurgeClaimTokenSha256(
+        authorization.claimToken,
+      );
+      const targetAckRootSha256 = tenantRedisPurgeTargetAckRootSha256(targetAcks);
+      const markerRootSha256 = tenantRedisPurgeMarkerRootSha256(targetAcks);
+      const identity = {
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        planBuildGeneration: current.planBuildGeneration,
+        executionGeneration: current.executionGeneration,
+        databasePurgeGeneration: current.databasePurgeGeneration,
+        redisPurgeGeneration: current.redisPurgeGeneration,
+      };
+      let previousGlobalAckSha256 = EMPTY_TENANT_REDIS_PURGE_DOMAIN_ACK_ROOT_SHA256;
+      const domainAcks: TenantRedisPurgeDomainAck[] = [];
+      for (const domain of TENANT_REDIS_PURGE_DOMAINS) {
+        const plan = planByDomain.get(domain);
+        if (!plan) throw new TenantRedisPurgeEvidenceChangedError();
+        const body = {
+          ...identity,
+          scope: TENANT_REDIS_PURGE_DOMAIN_ACK_SCOPE,
+          domain,
+          domainOrdinal: tenantRedisPurgeDomainOrdinal(domain),
+          globalAckSeq: tenantRedisPurgeDomainOrdinal(domain) + 1,
+          previousGlobalAckSha256,
+          planEntryReceiptSha256: plan.receiptSha256,
+          planTargetCount: plan.targetCount,
+          planTargetRootSha256: plan.targetRootSha256,
+          affectedCount: targets.length,
+          targetAckCount: targetAcks.length,
+          targetAckRootSha256,
+          markerCount: targetAcks.length,
+          markerRootSha256,
+          adapterProtocol: TENANT_REDIS_PURGE_ADAPTER_PROTOCOL,
+          redisNamespaceSha256: current.redisNamespaceSha256,
+          completedClaimAttempt: authorization.claimAttempt,
+          completedClaimTokenSha256,
+          storeDbTimestampMs: sealedAtDbMs,
+        };
+        const ack: TenantRedisPurgeDomainAck = {
+          ...body,
+          receiptSha256: tenantRedisPurgeDomainAckSha256(body),
+        };
+        validateTenantRedisPurgeDomainAck(ack);
+        domainAcks.push(ack);
+        previousGlobalAckSha256 = tenantRedisPurgeNextDomainAckRootSha256(
+          previousGlobalAckSha256,
+          domain,
+          ack.receiptSha256,
+        );
+      }
+      const domainAckRootSha256 = tenantRedisPurgeDomainAckRootSha256(domainAcks);
+      if (domainAckRootSha256 !== previousGlobalAckSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const receiptBody = {
+        ...tenantRedisPurgeSourceFromJob(current),
+        scope: TENANT_REDIS_PURGE_RECEIPT_SCOPE,
+        targetCount: targets.length,
+        targetRootSha256: current.targetRootSha256,
+        targetAckCount: targetAcks.length,
+        targetAckRootSha256,
+        domainAckCount: domainAcks.length,
+        domainAckRootSha256,
+        markerCount: targetAcks.length,
+        markerRootSha256,
+        unresolvedBlockerCount: current.sourceUnresolvedBlockerCount
+          - TENANT_REDIS_PURGE_DOMAINS.length,
+        storeDbTimestampMs: sealedAtDbMs,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256,
+        redisPurgeComplete: true as const,
+        allDomainsComplete: false as const,
+        contentPurgeExecuted: false as const,
+      };
+      const receipt: TenantRedisPurgeReceipt = {
+        ...receiptBody,
+        receiptSha256: tenantRedisPurgeReceiptSha256(receiptBody),
+      };
+      validateTenantRedisPurgeEvidenceBundle({ targets, targetAcks, domainAcks, receipt });
+      // Lock and validate the pre-publication cutover state before inserting the first receipt;
+      // the inactive-state validator intentionally rejects any orphan terminal receipt.
+      const cutover = await this.validateTenantRedisPurgeCutoverState(conn, "FOR UPDATE");
+      for (const ack of domainAcks) {
+        await conn.query(
+          `INSERT INTO tenant_redis_purge_domain_acks
+             (scope, request_id, tenant_id, subject_generation,
+              plan_build_generation, execution_generation, database_purge_generation,
+              redis_purge_generation, domain, domain_ordinal, global_ack_seq,
+              previous_global_ack_sha256, plan_entry_receipt_sha256,
+              plan_target_count, plan_target_root_sha256, affected_count,
+              target_ack_count, target_ack_root_sha256, marker_count,
+              marker_root_sha256, adapter_protocol, redis_namespace_sha256,
+              completed_claim_attempt, completed_claim_token_sha256,
+              store_db_timestamp_ms, receipt_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            ack.scope, ack.requestId, ack.tenantId, ack.subjectGeneration,
+            ack.planBuildGeneration, ack.executionGeneration,
+            ack.databasePurgeGeneration, ack.redisPurgeGeneration,
+            ack.domain, ack.domainOrdinal, ack.globalAckSeq,
+            ack.previousGlobalAckSha256, ack.planEntryReceiptSha256,
+            ack.planTargetCount, ack.planTargetRootSha256, ack.affectedCount,
+            ack.targetAckCount, ack.targetAckRootSha256, ack.markerCount,
+            ack.markerRootSha256, ack.adapterProtocol, ack.redisNamespaceSha256,
+            ack.completedClaimAttempt, ack.completedClaimTokenSha256,
+            ack.storeDbTimestampMs, ack.receiptSha256,
+          ],
+        );
+      }
+      const receiptValues = [
+        receipt.scope, receipt.requestId, receipt.tenantId, receipt.subjectGeneration,
+        receipt.planBuildGeneration, receipt.executionGeneration,
+        receipt.databasePurgeGeneration, receipt.redisPurgeGeneration,
+        receipt.t3cReceiptSha256, receipt.planReceiptSha256,
+        receipt.redisPlanEntryCount, receipt.redisPlanEntryRootSha256,
+        receipt.databasePurgeReceiptSha256, receipt.graveMarkerCount,
+        receipt.graveMarkerRootSha256, receipt.redisNamespaceSha256,
+        receipt.policySha256, receipt.purgeNotBeforeDbMs, receipt.sourceEvidenceDbMs,
+        receipt.sourceUnresolvedBlockerCount, receipt.targetCount,
+        receipt.targetRootSha256, receipt.targetAckCount,
+        receipt.targetAckRootSha256, receipt.domainAckCount,
+        receipt.domainAckRootSha256, receipt.markerCount, receipt.markerRootSha256,
+        receipt.unresolvedBlockerCount, receipt.storeDbTimestampMs,
+        receipt.completedClaimAttempt, receipt.completedClaimTokenSha256,
+        receipt.redisPurgeComplete, receipt.allDomainsComplete,
+        receipt.contentPurgeExecuted, receipt.receiptSha256,
+      ];
+      await conn.query(
+        `INSERT INTO tenant_redis_purge_receipts
+           (scope, request_id, tenant_id, subject_generation,
+            plan_build_generation, execution_generation, database_purge_generation,
+            redis_purge_generation, t3c_receipt_sha256, plan_receipt_sha256,
+            redis_plan_entry_count, redis_plan_entry_root_sha256,
+            database_purge_receipt_sha256, grave_marker_count,
+            grave_marker_root_sha256, redis_namespace_sha256, policy_sha256,
+            purge_not_before_db_ms, source_evidence_db_ms,
+            source_unresolved_blocker_count, target_count, target_root_sha256,
+            target_ack_count, target_ack_root_sha256, domain_ack_count,
+            domain_ack_root_sha256, marker_count, marker_root_sha256,
+            unresolved_blocker_count, store_db_timestamp_ms,
+            completed_claim_attempt, completed_claim_token_sha256,
+            redis_purge_complete, all_domains_complete, content_purge_executed,
+            receipt_sha256)
+         VALUES (${receiptValues.map(() => "?").join(",")})`,
+        receiptValues,
+      );
+      if (cutover.controlGeneration === 0) {
+        const cutoverBody = {
+          singletonId: TENANT_REDIS_PURGE_CUTOVER_SINGLETON_ID,
+          controlGeneration: 1 as const,
+          activatedAtDbMs: sealedAtDbMs,
+          firstRequestId: current.requestId,
+          firstReceiptSha256: receipt.receiptSha256,
+          redisNamespaceSha256: current.redisNamespaceSha256,
+        };
+        const evidenceSha256 = tenantRedisPurgeCutoverEvidenceSha256(cutoverBody);
+        const [activated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_redis_purge_cutover
+              SET control_generation=1, activated_at_db_ms=?, first_request_id=?,
+                  first_receipt_sha256=?, redis_namespace_sha256=?, evidence_sha256=?
+            WHERE singleton_id=? AND control_generation=0`,
+          [
+            sealedAtDbMs, current.requestId, receipt.receiptSha256,
+            current.redisNamespaceSha256, evidenceSha256,
+            TENANT_REDIS_PURGE_CUTOVER_SINGLETON_ID,
+          ],
+        );
+        if (activated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      } else if (cutover.redisNamespaceSha256 !== current.redisNamespaceSha256) {
+        throw new TenantRedisPurgeEvidenceChangedError();
+      }
+      const updatedAtMs = Math.max(current.updatedAtMs, sealedAtDbMs);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_redis_purge_jobs
+            SET phase='redis_purge_sealed', target_ack_count=?,
+                target_ack_root_sha256=?, domain_ack_count=?,
+                domain_ack_root_sha256=?, marker_count=?, marker_root_sha256=?,
+                unresolved_blocker_count=?, terminal_receipt_sha256=?,
+                available_at_ms=NULL, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=NULL, updated_at_ms=?, sealed_at_db_ms=?,
+                completed_claim_attempt=?, completed_claim_token_sha256=?
+          WHERE request_id=? AND tenant_id=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [
+          targetAcks.length, targetAckRootSha256, domainAcks.length,
+          domainAckRootSha256, targetAcks.length, markerRootSha256,
+          receipt.unresolvedBlockerCount, receipt.receiptSha256,
+          updatedAtMs, sealedAtDbMs, authorization.claimAttempt,
+          completedClaimTokenSha256, current.requestId, current.tenantId,
+          authorization.claimAttempt, authorization.claimToken, initialNow,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      const publishNow = await this.databaseNow(conn);
+      if (current.leaseUntilMs <= publishNow) {
+        await conn.rollback();
+        return null;
+      }
+      await conn.commit();
+      return receipt;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantRedisPurgeJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantRedisPurgeJobRecord | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRedisPurgeJob(conn, tenantId, requestId);
+      if (!job) return null;
+      await this.validateTenantRedisPurgeReadProof(conn, job);
+      return job;
+    });
+  }
+
+  async getTenantRedisPurgeTargets(
+    tenantId: string,
+    requestId: string,
+    redisPurgeGeneration: number,
+  ): Promise<TenantRedisPurgeTarget[]> {
+    if (!Number.isSafeInteger(redisPurgeGeneration) || redisPurgeGeneration < 1) {
+      throw new Error("invalid tenant Redis purge generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRedisPurgeJob(conn, tenantId, requestId);
+      if (!job || job.redisPurgeGeneration !== redisPurgeGeneration) return [];
+      await this.validateTenantRedisPurgeReadProof(conn, job);
+      return this.loadTenantRedisPurgeTargets(
+        conn,
+        tenantId,
+        requestId,
+        redisPurgeGeneration,
+      );
+    });
+  }
+
+  async getTenantRedisPurgeTargetAcks(
+    tenantId: string,
+    requestId: string,
+    redisPurgeGeneration: number,
+  ): Promise<TenantRedisPurgeTargetAck[]> {
+    if (!Number.isSafeInteger(redisPurgeGeneration) || redisPurgeGeneration < 1) {
+      throw new Error("invalid tenant Redis purge generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRedisPurgeJob(conn, tenantId, requestId);
+      if (!job || job.redisPurgeGeneration !== redisPurgeGeneration) return [];
+      await this.validateTenantRedisPurgeReadProof(conn, job);
+      return this.loadTenantRedisPurgeTargetAcks(
+        conn,
+        tenantId,
+        requestId,
+        redisPurgeGeneration,
+      );
+    });
+  }
+
+  async getTenantRedisPurgeDomainAcks(
+    tenantId: string,
+    requestId: string,
+    redisPurgeGeneration: number,
+  ): Promise<TenantRedisPurgeDomainAck[]> {
+    if (!Number.isSafeInteger(redisPurgeGeneration) || redisPurgeGeneration < 1) {
+      throw new Error("invalid tenant Redis purge generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRedisPurgeJob(conn, tenantId, requestId);
+      if (!job || job.redisPurgeGeneration !== redisPurgeGeneration
+        || job.phase !== "redis_purge_sealed") return [];
+      const bundle = await this.validateTenantRedisPurgeReadProof(conn, job);
+      return bundle ? [...bundle.domainAcks] : [];
+    });
+  }
+
+  async getTenantRedisPurgeReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantRedisPurgeReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRedisPurgeJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "redis_purge_sealed") return null;
+      const bundle = await this.validateTenantRedisPurgeReadProof(conn, job);
+      return bundle?.receipt ?? null;
+    });
+  }
+
+  async getTenantRedisPurgeCutover(): Promise<TenantRedisPurgeCutoverRecord> {
+    return this.withConsistentRead((conn) => this.validateTenantRedisPurgeCutoverState(conn));
+  }
+
+  async hasTenantRedisPurgeJobs(): Promise<boolean> {
+    const [rows] = await this.pool.query<Row[]>(
+      "SELECT EXISTS(SELECT 1 FROM tenant_redis_purge_jobs LIMIT 1) AS present",
+    );
+    return Number(rows[0]?.present) === 1;
+  }
+
+  private tenantRedisRestoreCursor(
+    snapshotUpperBound: number,
+    afterRestoreSeq: number,
+  ): string {
+    return Buffer.from(JSON.stringify([
+      "tenant-redis-purge-restore-cursor-v2",
+      snapshotUpperBound,
+      afterRestoreSeq,
+    ]), "utf8").toString("base64url");
+  }
+
+  private parseTenantRedisRestoreCursor(cursor: string): {
+    snapshotUpperBound: number;
+    afterRestoreSeq: number;
+  } {
+    try {
+      const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as unknown;
+      if (!Array.isArray(value) || value.length !== 3
+        || value[0] !== "tenant-redis-purge-restore-cursor-v2"
+        || !Number.isSafeInteger(value[1]) || Number(value[1]) < 1
+        || !Number.isSafeInteger(value[2]) || Number(value[2]) < 1
+        || Number(value[2]) > Number(value[1])) {
+        throw new Error("invalid tenant Redis purge restore cursor payload");
+      }
+      const canonical = this.tenantRedisRestoreCursor(
+        Number(value[1]),
+        Number(value[2]),
+      );
+      if (canonical !== cursor) throw new Error("non-canonical tenant Redis purge restore cursor");
+      return {
+        snapshotUpperBound: Number(value[1]),
+        afterRestoreSeq: Number(value[2]),
+      };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async listTenantRedisPurgeRestoreFences(
+    options: ListTenantRedisPurgeRestoreFencesOptions,
+  ): Promise<ListTenantRedisPurgeRestoreFencesResult> {
+    validateListTenantRedisPurgeRestoreFencesOptions(options);
+    const cursor = options.cursor === undefined
+      ? undefined
+      : this.parseTenantRedisRestoreCursor(options.cursor);
+    return this.withConsistentRead(async (conn) => {
+      await this.validateTenantRedisPurgeCutoverState(conn);
+      let snapshotUpperBound = cursor?.snapshotUpperBound;
+      if (snapshotUpperBound === undefined) {
+        const [upperRows] = await conn.query<Row[]>(
+          "SELECT MAX(restore_seq) AS snapshot_upper_bound FROM tenant_redis_purge_target_acks",
+        );
+        snapshotUpperBound = upperRows[0]?.snapshot_upper_bound === null
+          ? 0
+          : storedSafeInteger(
+              upperRows[0]?.snapshot_upper_bound,
+              "tenant Redis purge restore snapshot upper bound",
+              0,
+            );
+      }
+      if (cursor !== undefined) {
+        const [cursorRows] = await conn.query<Row[]>(
+          `SELECT restore_seq
+             FROM tenant_redis_purge_target_acks
+            WHERE restore_seq IN (?, ?)`,
+          [cursor.afterRestoreSeq, cursor.snapshotUpperBound],
+        );
+        const present = new Set(cursorRows.map((row) => storedSafeInteger(
+          row.restore_seq,
+          "tenant Redis purge restore cursor sequence",
+          1,
+        )));
+        if (!present.has(cursor.afterRestoreSeq)
+          || !present.has(cursor.snapshotUpperBound)) {
+          throw new TenantErasureIntegrityError();
+        }
+      }
+      const fetchLimit = Math.min(Number.MAX_SAFE_INTEGER, options.limit + 1);
+      const [ackRows] = await conn.query<Row[]>(
+        `SELECT restore_seq, ${TENANT_REDIS_PURGE_TARGET_ACK_COLUMNS}
+           FROM tenant_redis_purge_target_acks
+          WHERE restore_seq>? AND restore_seq<=?
+          ORDER BY restore_seq
+          LIMIT ?`,
+        [
+          cursor?.afterRestoreSeq ?? 0,
+          snapshotUpperBound,
+          fetchLimit,
+        ],
+      );
+      const selectedAcks = ackRows.map((row) => ({
+        restoreSeq: storedSafeInteger(
+          row.restore_seq,
+          "tenant Redis purge restore sequence",
+          1,
+        ),
+        ack: rowToTenantRedisPurgeTargetAck(row),
+      }));
+      const proofByJob = new Map<string, {
+        job: TenantRedisPurgeJobRecord;
+        targetByOrdinal: Map<number, TenantRedisPurgeTarget>;
+        terminalReceiptSha256: string | null;
+      }>();
+      const fences: TenantRedisPurgeRestoreFence[] = [];
+      for (const selected of selectedAcks) {
+        const { ack } = selected;
+        const proofKey = `${ack.requestId}\0${ack.redisPurgeGeneration}`;
+        let proof = proofByJob.get(proofKey);
+        if (!proof) {
+          const job = await this.loadTenantRedisPurgeJob(
+            conn,
+            ack.tenantId,
+            ack.requestId,
+          );
+          if (!job || job.redisPurgeGeneration !== ack.redisPurgeGeneration) {
+            throw new TenantErasureIntegrityError();
+          }
+          const terminalBundle = await this.validateTenantRedisPurgeReadProof(conn, job);
+          const targets = await this.loadTenantRedisPurgeTargets(
+            conn,
+            job.tenantId,
+            job.requestId,
+            job.redisPurgeGeneration,
+          );
+          proof = {
+            job,
+            targetByOrdinal: new Map(targets.map((target) => [
+              target.targetOrdinal,
+              target,
+            ] as const)),
+            terminalReceiptSha256: job.phase === "redis_purge_sealed"
+              ? terminalBundle!.receipt.receiptSha256
+              : null,
+          };
+          proofByJob.set(proofKey, proof);
+        }
+        const { job, targetByOrdinal, terminalReceiptSha256 } = proof;
+        const target = targetByOrdinal.get(ack.targetOrdinal);
+        if (!target
+          || ack.tenantId !== job.tenantId
+          || ack.subjectGeneration !== job.subjectGeneration
+          || ack.planBuildGeneration !== job.planBuildGeneration
+          || ack.executionGeneration !== job.executionGeneration
+          || ack.databasePurgeGeneration !== job.databasePurgeGeneration
+          || ack.redisPurgeGeneration !== job.redisPurgeGeneration
+          || ack.sessionId !== target.sessionId
+          || ack.targetReceiptSha256 !== target.receiptSha256
+          || ack.operationSha256 !== target.operationSha256) {
+          throw new TenantErasureIntegrityError();
+        }
+        const body = {
+          requestId: job.requestId,
+          tenantId: job.tenantId,
+          subjectGeneration: job.subjectGeneration,
+          planBuildGeneration: job.planBuildGeneration,
+          executionGeneration: job.executionGeneration,
+          databasePurgeGeneration: job.databasePurgeGeneration,
+          redisPurgeGeneration: job.redisPurgeGeneration,
+          scope: TENANT_REDIS_PURGE_RESTORE_FENCE_SCOPE,
+          jobPhase: job.phase,
+          targetOrdinal: target.targetOrdinal,
+          sessionId: target.sessionId,
+          targetReceiptSha256: target.receiptSha256,
+          targetAckReceiptSha256: ack.receiptSha256,
+          terminalReceiptSha256,
+          operationSha256: target.operationSha256,
+          adapterProtocol: ack.adapterProtocol,
+          redisNamespaceSha256: ack.redisNamespaceSha256,
+          leaseExisted: ack.leaseExisted,
+          fenceExisted: ack.fenceExisted,
+          streamExisted: ack.streamExisted,
+          markerSha256: ack.markerSha256,
+        };
+        fences.push({
+          ...body,
+          fenceSha256: tenantRedisPurgeRestoreFenceSha256(body),
+        });
+      }
+      const page = fences.slice(0, options.limit);
+      const result: ListTenantRedisPurgeRestoreFencesResult = {
+        fences: page,
+        ...(fences.length > options.limit && page.length > 0
+          ? {
+              nextCursor: this.tenantRedisRestoreCursor(
+                snapshotUpperBound,
+                selectedAcks[page.length - 1]!.restoreSeq,
+              ),
+            }
+          : {}),
+      };
+      validateListTenantRedisPurgeRestoreFencesResult(result);
+      return result;
     });
   }
 

@@ -82,6 +82,9 @@ async function makeApp(
     evaluation?: boolean;
     credentialWorker?: boolean;
     databasePurgeWorker?: boolean;
+    redisPurgeSupported?: boolean;
+    redisPurgeWorker?: boolean;
+    redisPurgeNamespaceSha256?: string;
   } = {},
 ) {
   const store = new MemorySessionStore();
@@ -107,6 +110,9 @@ async function makeApp(
     purgePolicyEvaluationSupported: lifecycle.evaluation,
     tenantCredentialRevocationWorkerEnabled: lifecycle.credentialWorker,
     tenantDatabasePurgeWorkerEnabled: lifecycle.databasePurgeWorker,
+    tenantRedisPurgeSupported: lifecycle.redisPurgeSupported,
+    tenantRedisPurgeWorkerEnabled: lifecycle.redisPurgeWorker,
+    tenantRedisPurgeNamespaceSha256: lifecycle.redisPurgeNamespaceSha256,
     retentionPolicy: store,
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
@@ -303,6 +309,42 @@ describe("agent-runner HTTP API", () => {
         tenantPurgeExecution: ["local-execution-ack-v1", "local-db-content-delete-v1"],
         tenantPurgeExecutionWorker: false,
         tenantDatabasePurgeWorker: true,
+        dataPurgeExecution: false,
+      },
+    });
+  });
+
+  it("advertises T3g only with a namespace-bound adapter and separates worker activation", async () => {
+    const namespaceSha256 = "a".repeat(64);
+    const unsupported = await makeApp();
+    const codeAware = await makeApp(60_000, {
+      redisPurgeSupported: true,
+      redisPurgeNamespaceSha256: namespaceSha256,
+    });
+    const workerActive = await makeApp(60_000, {
+      redisPurgeSupported: true,
+      redisPurgeWorker: true,
+      redisPurgeNamespaceSha256: namespaceSha256,
+    });
+    expect(await (await unsupported.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantRedisPurge: [],
+        tenantRedisPurgeWorker: false,
+        tenantRedisPurgeNamespaceSha256: null,
+      },
+    });
+    expect(await (await codeAware.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantRedisPurge: ["session-state-delete-v1"],
+        tenantRedisPurgeWorker: false,
+        tenantRedisPurgeNamespaceSha256: namespaceSha256,
+      },
+    });
+    expect(await (await workerActive.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantRedisPurge: ["session-state-delete-v1"],
+        tenantRedisPurgeWorker: true,
+        tenantRedisPurgeNamespaceSha256: namespaceSha256,
         dataPurgeExecution: false,
       },
     });

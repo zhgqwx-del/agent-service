@@ -1246,6 +1246,29 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "tenantRedisPurge": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "session-state-delete-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantRedisPurgeNamespaceSha256": {
+                "default": null,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tenantRedisPurgeWorker": {
+                "default": false,
+                "type": "boolean"
+              },
               "tenantRuntimeDrain": {
                 "default": [],
                 "items": {

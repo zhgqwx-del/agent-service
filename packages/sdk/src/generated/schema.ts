@@ -1146,6 +1146,12 @@ export type components = {
                 /** @default false */
                 readonly tenantPurgeExecutionWorker?: boolean;
                 /** @default [] */
+                readonly tenantRedisPurge?: readonly "session-state-delete-v1"[];
+                /** @default null */
+                readonly tenantRedisPurgeNamespaceSha256?: string | null;
+                /** @default false */
+                readonly tenantRedisPurgeWorker?: boolean;
+                /** @default [] */
                 readonly tenantRuntimeDrain?: readonly "runtime-drain-v1"[];
                 /** @default false */
                 readonly tenantRuntimeDrainEndpoint?: boolean;

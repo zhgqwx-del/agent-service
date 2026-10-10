@@ -110,7 +110,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("does not retain a phantom local channel after the first SUBSCRIBE command fails", async () => {
-      const prefix = `test-subscribe-failure-${newId("prefix")}`;
+      const prefix = `sub-fail-${newId("prefix")}`;
       const sessionId = newId("sess");
       const bus = new RedisEventBus(REDIS_URL, { prefix });
       const internal = bus as unknown as {
@@ -182,7 +182,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("keeps a replacement subscription active when a stale unsubscribe is called twice", async () => {
-      const prefix = `test-stale-unsubscribe-${newId("prefix")}`;
+      const prefix = `stale-unsub-${newId("prefix")}`;
       const sessionId = newId("sess");
       const bus = new RedisEventBus(REDIS_URL, { prefix });
       const firstUnsubscribe = await bus.subscribe(sessionId, () => {});
@@ -209,7 +209,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     });
 
     it("serializes an in-flight replacement SUBSCRIBE against the last old unsubscribe", async () => {
-      const prefix = `test-overlap-subscribe-${newId("prefix")}`;
+      const prefix = `overlap-sub-${newId("prefix")}`;
       const sessionId = newId("sess");
       const bus = new RedisEventBus(REDIS_URL, { prefix });
       const internal = bus as unknown as {

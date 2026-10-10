@@ -14,6 +14,7 @@ import {
   TenantContentInventoryWorker,
   TenantCredentialRevocationWorker,
   TenantDatabasePurgeWorker,
+  TenantRedisPurgeWorker,
   TenantPurgeExecutionWorker,
   TenantPurgePlanWorker,
   TenantRuntimeCoordinator,
@@ -22,6 +23,7 @@ import {
   UserDataExportWorker,
   builtinTools,
 } from "@agent-service/core";
+import { tenantRedisNamespaceSha256 } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService, PROVIDER_PRESETS } from "@agent-service/providers";
 import {
   FsBlobStore,
@@ -31,6 +33,7 @@ import {
   MysqlSessionStore,
   RedisEventBus,
   RedisLeaseStore,
+  RedisSessionStatePurgeAdapter,
   SubjectDeletingError,
   type BlobCleanupStore,
   type BlobManifestStore,
@@ -47,6 +50,7 @@ import {
   type SubjectLifecycleStore,
   type TenantCredentialRevocationStore,
   type TenantDatabasePurgeStore,
+  type TenantRedisPurgeStore,
   type TenantContentInventoryStore,
   type TenantPurgeExecutionStore,
   type TenantPurgePlanStore,
@@ -65,12 +69,16 @@ import { RouterPurgePolicyEvaluationGate } from "./purge-policy-evaluation-gate.
 import { RouterTenantErasureAdmissionGate } from "./tenant-erasure-admission-gate.js";
 import { RouterTenantCredentialRevocationGate } from "./tenant-credential-revocation-gate.js";
 import { RouterTenantDatabasePurgeGate } from "./tenant-database-purge-gate.js";
+import { RouterTenantRedisPurgeGate } from "./tenant-redis-purge-gate.js";
 import { RouterTenantPurgeExecutionGate } from "./tenant-purge-execution-gate.js";
 import { RouterTenantRuntimeDrainClient } from "./tenant-runtime-drain-client.js";
 import { LocalTenantRuntimeDrain } from "./tenant-runtime-local-drain.js";
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
+  const redisNamespaceSha256 = cfg.REDIS_URL && cfg.REDIS_NAMESPACE_ID
+    ? tenantRedisNamespaceSha256(cfg.REDIS_NAMESPACE_ID, cfg.REDIS_PREFIX)
+    : undefined;
   const store: SessionStore
     & LifecycleOutboxStore
     & BlobManifestStore
@@ -78,6 +86,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & SubjectLifecycleStore
     & TenantCredentialRevocationStore
     & TenantDatabasePurgeStore
+    & TenantRedisPurgeStore
     & TenantContentInventoryStore
     & TenantPurgeExecutionStore
     & TenantPurgePlanStore
@@ -93,10 +102,79 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & UserDataExportRequestStore
     & UserDataExportJobStore
     & UserDataExportCleanupStore = cfg.STORE === "mysql"
-    ? await MysqlSessionStore.connect({ url: cfg.MYSQL_URL })
+    ? await MysqlSessionStore.connect({
+      url: cfg.MYSQL_URL,
+      ...(redisNamespaceSha256 === undefined
+        ? {}
+        : { tenantRedisPurgeNamespaceSha256: redisNamespaceSha256 }),
+    })
     : new MemorySessionStore();
-  const lease: LeaseStore = cfg.REDIS_URL ? new RedisLeaseStore(cfg.REDIS_URL) : new MemoryLeaseStore();
-  const bus: EventBus = cfg.REDIS_URL ? new RedisEventBus(cfg.REDIS_URL) : new MemoryEventBus();
+  let redisCutover: Awaited<ReturnType<TenantRedisPurgeStore["getTenantRedisPurgeCutover"]>>;
+  let hasRedisPurgeJobs: boolean;
+  try {
+    redisCutover = await store.getTenantRedisPurgeCutover();
+    hasRedisPurgeJobs = await store.hasTenantRedisPurgeJobs();
+  } catch (error) {
+    await store.close().catch(() => {});
+    throw error;
+  }
+  if ((hasRedisPurgeJobs
+      || redisCutover.controlGeneration === 1)
+    && !cfg.TENANT_REDIS_PURGE_WORKER_ENABLED) {
+    await store.close();
+    throw new Error(
+      "TENANT_REDIS_PURGE_WORKER_ENABLED=1 is required after durable T3g Redis purge work exists",
+    );
+  }
+  const lease: LeaseStore = cfg.REDIS_URL
+    ? new RedisLeaseStore(cfg.REDIS_URL, cfg.REDIS_PREFIX)
+    : new MemoryLeaseStore();
+  const bus: EventBus = cfg.REDIS_URL
+    ? new RedisEventBus(cfg.REDIS_URL, { prefix: cfg.REDIS_PREFIX })
+    : new MemoryEventBus();
+  const tenantRedisPurgeAdapter = cfg.REDIS_URL && redisNamespaceSha256
+    ? new RedisSessionStatePurgeAdapter(cfg.REDIS_URL, {
+      prefix: cfg.REDIS_PREFIX,
+      namespaceSha256: redisNamespaceSha256,
+    })
+    : undefined;
+  const tenantRedisPurgeGate = cfg.TENANT_REDIS_PURGE_WORKER_ENABLED
+    ? new RouterTenantRedisPurgeGate({
+      routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+      internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+      requestTimeoutMs: cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS,
+    })
+    : undefined;
+  const tenantRedisPurgeWorker = tenantRedisPurgeGate && tenantRedisPurgeAdapter
+    ? new TenantRedisPurgeWorker({
+      store,
+      adapter: tenantRedisPurgeAdapter,
+      canExecute: () => tenantRedisPurgeGate.canExecute(),
+    }, {
+      pollIntervalMs: cfg.TENANT_REDIS_PURGE_WORKER_POLL_MS,
+      leaseMs: cfg.TENANT_REDIS_PURGE_WORKER_LEASE_MS,
+      batchSize: cfg.TENANT_REDIS_PURGE_WORKER_BATCH_SIZE,
+      materializeBatchSize: cfg.TENANT_REDIS_PURGE_MATERIALIZE_BATCH_SIZE,
+      targetPageSize: cfg.TENANT_REDIS_PURGE_TARGET_PAGE_SIZE,
+      restorePageSize: cfg.TENANT_REDIS_PURGE_RESTORE_PAGE_SIZE,
+      restoreIntervalMs: cfg.TENANT_REDIS_PURGE_RESTORE_INTERVAL_MS,
+      retryBaseMs: cfg.TENANT_REDIS_PURGE_RETRY_BASE_MS,
+      retryMaxMs: cfg.TENANT_REDIS_PURGE_RETRY_MAX_MS,
+    })
+    : undefined;
+  try {
+    // Completed/partial durable ACKs are already-authorized permanent fences. Reapply every one
+    // before any worker or HTTP listener can observe a restored Redis namespace.
+    await tenantRedisPurgeWorker?.replayDurableRestoreFences();
+  } catch (error) {
+    await Promise.all([
+      tenantRedisPurgeAdapter?.close(),
+      bus.close(),
+      lease.close(),
+      store.close(),
+    ]);
+    throw error;
+  }
   const blobStore = new FsBlobStore(cfg.BLOB_DIR);
   const blobs = new SessionBlobService(store, blobStore, {
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
@@ -385,6 +463,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   tenantPurgePlanWorker?.start();
   tenantPurgeExecutionWorker?.start();
   tenantDatabasePurgeWorker?.start();
+  tenantRedisPurgeWorker?.start();
 
   let ready = true;
   const app = createApp({
@@ -415,6 +494,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       tenantPurgeExecutionWorker !== undefined,
     tenantDatabasePurgeWorkerEnabled:
       tenantDatabasePurgeWorker !== undefined,
+    tenantRedisPurgeSupported: tenantRedisPurgeAdapter !== undefined,
+    tenantRedisPurgeWorkerEnabled: tenantRedisPurgeWorker !== undefined,
+    tenantRedisPurgeNamespaceSha256: redisNamespaceSha256,
     tenantRuntime,
     tenantRuntimeDrain,
     tenantRuntimeDrainEnabled: cfg.TENANT_RUNTIME_DRAIN_ENABLED,
@@ -453,6 +535,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         tenantPurgePlanWorker?.stop(),
         tenantPurgeExecutionWorker?.stop(),
         tenantDatabasePurgeWorker?.stop(),
+        tenantRedisPurgeWorker?.stop(),
       ]);
       await host.drain(30_000);
       await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
@@ -476,7 +559,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       if (closeGraceTimer) clearTimeout(closeGraceTimer);
       if (!transportClosed && "closeAllConnections" in server) server.closeAllConnections();
       await serverClosed;
-      await Promise.all([store.close(), lease.close(), bus.close()]);
+      await Promise.all([
+        store.close(),
+        lease.close(),
+        bus.close(),
+        tenantRedisPurgeAdapter?.close(),
+      ]);
       if (exitProcess) process.exit(0);
     })();
     return shutdownPromise;
@@ -486,7 +574,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,
@@ -496,6 +584,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantRuntimeRevocationWorker, tenantContentInventoryWorker, tenantPurgePlanWorker,
     tenantPurgeExecutionGate, tenantPurgeExecutionWorker,
     tenantDatabasePurgeGate, tenantDatabasePurgeWorker,
+    tenantRedisPurgeGate, tenantRedisPurgeWorker, tenantRedisPurgeAdapter,
     tenantRuntimeBootId,
     blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),

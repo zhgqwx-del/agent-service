@@ -1,6 +1,25 @@
 import { Redis } from "ioredis";
 import { Event as EventSchema, type Event, type PersistedEvent } from "@agent-service/protocol";
 import type { EventBus, EventListener, EventSubscriptionOptions } from "../types.js";
+import { RedisSessionPurgedError } from "./purge.js";
+import { DEFAULT_REDIS_KEY_PREFIX, redisSessionKeys, validateRedisKeyPrefix } from "./keys.js";
+
+const PUBLISH_PERSISTED = `
+if redis.call('EXISTS', KEYS[2]) == 1 then return {-1} end
+local reply = redis.call('TYPE', KEYS[1])
+local stream_type = reply['ok'] or reply
+if stream_type ~= 'none' and stream_type ~= 'stream' then return {-2} end
+redis.call('XADD', KEYS[1], 'MAXLEN', '~', ARGV[1], '*', 'seq', ARGV[2], 'e', ARGV[3])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+redis.call('PUBLISH', ARGV[5], ARGV[3])
+return {1}
+`;
+
+const PUBLISH_LIVE = `
+if redis.call('EXISTS', KEYS[1]) == 1 then return {-1} end
+redis.call('PUBLISH', ARGV[1], ARGV[2])
+return {1}
+`;
 
 interface RedisListener {
   listener: EventListener;
@@ -15,6 +34,7 @@ interface RedisListener {
  * Redis event bus:
  *  - live delivery via pub/sub channel `evt:{sid}` (all events, including deltas)
  *  - hot replay of persisted events via stream `stream:{sid}` (MAXLEN-capped, TTL hotWindowMs)
+ *  - both publish paths atomically reject a session once its permanent purge marker exists
  *
  * Subscribe order is: subscribe channel first, then XRANGE the stream for `> afterSeq`, dedupe by seq.
  * Anything older than the hot window must come from the SessionStore.
@@ -33,8 +53,19 @@ export class RedisEventBus implements EventBus {
     url: string,
     private readonly opts: { prefix?: string; hotWindowMs?: number; maxLen?: number } = {},
   ) {
+    validateRedisKeyPrefix(opts.prefix ?? DEFAULT_REDIS_KEY_PREFIX);
+    for (const [value, name] of [
+      [opts.hotWindowMs ?? 3_600_000, "hot window"],
+      [opts.maxLen ?? 2_000, "max length"],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < 1) {
+        throw new Error(`Redis event bus ${name} must be a positive safe integer`);
+      }
+    }
     this.pub = new Redis(url, { maxRetriesPerRequest: 3 });
     this.sub = new Redis(url, { maxRetriesPerRequest: 3 });
+    this.pub.defineCommand("eventPublishPersisted", { numberOfKeys: 2, lua: PUBLISH_PERSISTED });
+    this.pub.defineCommand("eventPublishLive", { numberOfKeys: 1, lua: PUBLISH_LIVE });
     this.sub.on("message", (channel: string, message: string) => {
       const set = this.listeners.get(channel);
       if (!set?.size) return;
@@ -68,10 +99,10 @@ export class RedisEventBus implements EventBus {
     });
   }
   private ch(sid: string) {
-    return `${this.opts.prefix ?? "as"}:evt:{${sid}}`;
+    return redisSessionKeys(sid, this.opts.prefix).eventChannel;
   }
   private stream(sid: string) {
-    return `${this.opts.prefix ?? "as"}:stream:{${sid}}`;
+    return redisSessionKeys(sid, this.opts.prefix).stream;
   }
 
   private async withChannelLock<T>(channel: string, operation: () => Promise<T>): Promise<T> {
@@ -89,22 +120,34 @@ export class RedisEventBus implements EventBus {
   async publish(sessionId: string, event: Event) {
     const payload = JSON.stringify(event);
     const seq = (event as { seq?: number }).seq;
+    const keys = redisSessionKeys(sessionId, this.opts.prefix);
     if (typeof seq === "number") {
-      const s = this.stream(sessionId);
-      const results = await this.pub
-        .multi()
-        .xadd(s, "MAXLEN", "~", String(this.opts.maxLen ?? 2000), "*", "seq", String(seq), "e", payload)
-        .pexpire(s, this.opts.hotWindowMs ?? 3_600_000)
-        .publish(this.ch(sessionId), payload)
-        .exec();
-      // Redis transactions can resolve successfully while individual commands fail (for example,
-      // XADD against a key with the wrong type). Treat any subcommand error as a failed delivery so
-      // a durable outbox is never acknowledged after only part of the hot-replay/live publish pair.
-      if (!results || results.some(([error]) => error !== null)) {
-        throw new Error("Redis event publish transaction failed");
-      }
+      const result = await (this.pub as any).eventPublishPersisted(
+        keys.stream,
+        keys.purgeMarker,
+        String(this.opts.maxLen ?? 2_000),
+        String(seq),
+        payload,
+        String(this.opts.hotWindowMs ?? 3_600_000),
+        keys.eventChannel,
+      ) as unknown;
+      this.assertPublishResult(sessionId, result);
     } else {
-      await this.pub.publish(this.ch(sessionId), payload);
+      const result = await (this.pub as any).eventPublishLive(
+        keys.purgeMarker,
+        keys.eventChannel,
+        payload,
+      ) as unknown;
+      this.assertPublishResult(sessionId, result);
+    }
+  }
+
+  private assertPublishResult(sessionId: string, result: unknown): void {
+    if (Array.isArray(result) && Number(result[0]) === -1) {
+      throw new RedisSessionPurgedError(sessionId);
+    }
+    if (!Array.isArray(result) || Number(result[0]) !== 1) {
+      throw new Error("Redis event publish transaction failed");
     }
   }
 

@@ -72,7 +72,7 @@
 │ agent-router（无状态，N 副本）                                              │
 │   1. 透传外部身份；权威 service/user 鉴权仍由 runner 完成                    │
 │   2. 幂等：透传 Idempotency-Key；仅对带 key 的 turn POST 允许安全重路由      │
-│   3. 定位：owner:{sessionId} → runnerAddr；无 owner → 一致性哈希 / 最少负载  │
+│   3. 定位：lease:{sessionId} 内 owner/addr → runnerAddr；无 owner → 一致性哈希 / 最少负载 │
 │   4. 反向代理（SSE 不缓冲）；runner 回 409 lease_conflict → 重查目录重路由一次 │
 │   5. 非 session 类请求（agents/providers/skills CRUD）直接打任意 runner      │
 │   只有连接态，没有业务态；可随时重启                                          │
@@ -133,9 +133,9 @@
 
 ```
 Redis:
-  lease:{sessionId}   = {runnerId, fence, expiresAt}     SET NX PX，续期 Lua 脚本校验 runnerId
+  lease:{sessionId}   = {runnerId, owner, addr, fence, expiresAt}  hash + TTL；Lua 校验 runnerId
   fence:{sessionId}   = 单调递增整数（INCR），每次成功抢占 +1
-  owner:{sessionId}   = runnerAddr（供 router 查询；TTL 略长于 lease）
+  router 直接读取 lease hash 的 owner/addr；不存在独立 owner key
 
 MySQL:
   sessions.fence_token   = 最近一次成功写入的 fence
@@ -375,6 +375,10 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `tenant_purge_plan_jobs` / `tenant_purge_plan_entries` / `tenant_purge_plan_receipts` | T1/T3a/T3b/T3c + immutable policy/DB-time deadline + 固定33域count/root/disposition/source hash + blocker root | `0022` T3d非破坏性全域计划；`plan_complete=TRUE`只表示目录完整，`execution_ready=FALSE`、`content_purge_executed=FALSE`固定禁止执行/完成 |
 | `tenant_purge_execution_jobs` / `tenant_purge_execution_domains` / `tenant_purge_execution_domain_acks` | T3c/T3d source + execution generation/claim lease + 固定domain ACK chain | `0023` T3e本地受限执行账本；只记录operational usage、Blob/export outbox及export control/snapshot动作，不授予其余域或全局completion |
 | `tenant_purge_local_cutover_receipts` / `tenant_purge_local_physical_ack_receipts` / `tenant_purge_execution_cutover` | exact outbox roots + local/physical ACK roots + write-once cutover | local cutover固定`all_domains_complete=FALSE`、`content_purge_executed=FALSE`；只有精确outbox实际completed后才可seal physical receipt，dead-letter不是成功 |
+| `tenant_database_purge_jobs` / `tenant_database_purge_predelete_entries` / `tenant_database_purge_predelete_receipts` | T3c/T3d/T3e source + 11域pre-delete count/root + claim lease | `0024` T3f本地数据库投影清理；pre-delete目录、destructive action与terminal publication处于同一Memory原子发布或MySQL RR事务 |
+| `tenant_database_purge_domain_acks` / `tenant_database_purge_receipts` / `tenant_purge_session_grave_markers` / `tenant_database_purge_cutover` | exact 11域ACK + terminal flags + global session-id grave + write-once cutover | billing facts保留，session id永久禁止复用；receipt固定不授予Redis、外部、恢复或全局completion |
+| `tenant_redis_purge_jobs` / `tenant_redis_purge_targets` / `tenant_redis_purge_target_acks` | T3d/T3f source + namespace/operation + per-session Redis existence/marker proof + claim lease | `0025` T3g session-scoped Redis清理；target与T3f grave及T3d三个Redis plan entry精确闭合，Redis mutation与MySQL ACK按replay-safe saga收口 |
+| `tenant_redis_purge_domain_acks` / `tenant_redis_purge_receipts` / `tenant_redis_purge_cutover` | 三域aggregate ACK + terminal flags + write-once namespace cutover | 固定`redis_purge_complete=TRUE`、`all_domains_complete=FALSE`、`content_purge_executed=FALSE`；同库row还形成startup/periodic marker replay projection，但不是独立故障域restore ledger |
 | `retention_policy_versions` / `retention_policy_controls` / `retention_policy_activation_events` | tenant + immutable policy document/hash + generation-fenced active projection + rooted audit | `0015` canonical policy authority；activation提交即生效，但自身不调度或授权physical purge |
 | `legal_holds` / `legal_hold_controls` / `legal_hold_events` | tenant/subject/hold + active projection + generation/hash audit | tenant/user多hold账本；单个hold只允许一次release，legacy shadow由canonical active set投影 |
 | `erasure_policy_evaluation_jobs` | request/subject/build generation + cursor/root + attempt/token/lease | `0016`非破坏性evaluator队列；只调度`awaiting_purge_policy`，不具备erasure phase或删除权限 |
@@ -407,7 +411,7 @@ user erasure 的 durable gate 属于不可撤销 admission。router 只有在 wr
 
 `0016`建立独立的、默认关闭的purge-policy evaluator/authority substrate，仍不提供destructive executor。request从`reconciling_usage`原子进入`awaiting_purge_policy`时同时建立首个evaluation job；历史awaiting row由显式scheduler补排。job以build generation、attempt/token/lease防止stale/ABA worker，分页写入按generation不可变的per-session target root，并把`unbound/invalid/unconfigured/held/waiting/eligible_execution_disabled`全部追加到rooted decision chain。只有最后一种会写immutable authority与generation-CAS active projection；这些表故意没有execution availability、claim token或lease，公开capability也固定`dataPurgeExecution=false`。
 
-evaluator seal会重新读取request-bound policy、session tombstone、ready Blob摘要、usage reconciliation/billing一致性、receipt摘要，以及tenant/user hold generation和active projection。build过程中live evidence变化会以`evidence_changed`释放claim并开启新build；sealed结果后出现live inventory或hold ABA变化会清除active projection并重新调度，而不覆写旧证据。这里的target是policy候选摘要，不是turns/items/events/approvals的完整owner清单；当前eligibility还使用runner记录的wall clock，跨VM forward/slow skew没有由共享数据库时间线性化。因此authority只能作为non-executable candidate。`0023` T3e不把它当作删除许可，而是在自己的DB-time事务中重验T3c/T3d、owner与hold，只补齐本地usage/Blob/export子集；后续完整全域executor仍需补齐receipt/Redis、secret/KMS、backup/restore、logs/traces及其它物理ACK，当前completion恒为false。
+evaluator seal会重新读取request-bound policy、session tombstone、ready Blob摘要、usage reconciliation/billing一致性、receipt摘要，以及tenant/user hold generation和active projection。build过程中live evidence变化会以`evidence_changed`释放claim并开启新build；sealed结果后出现live inventory或hold ABA变化会清除active projection并重新调度，而不覆写旧证据。这里的target是policy候选摘要，不是turns/items/events/approvals的完整owner清单；当前eligibility还使用runner记录的wall clock，跨VM forward/slow skew没有由共享数据库时间线性化。因此authority只能作为non-executable candidate。`0023` T3e不把它当作删除许可，而是在自己的DB-time事务中重验T3c/T3d、owner与hold，只补齐本地usage/Blob/export子集；`0024`/`0025`再分别闭合本地数据库投影与session-scoped Redis。后续完整全域executor仍需补齐secret/KMS、backup/独立restore、logs/traces及其它物理ACK，当前completion恒为false。
 
 `0017`实现user-scoped异步导出，但不授予任何源数据删除权限。request/job在同一事务建立并绑定active policy的正值artifact TTL；MySQL worker在RR一致性快照中复制owner白名单，再在事务外生成确定性multipart NDJSON。artifact仅在part、manifest与整体digest全部验证后原子ready；download持有有界durable lease，TTL/revocation通过独立delete outbox清理。所有状态都绑定tenant/user、subject/build/deletion generation，跨owner与不存在一致。build/cleanup是runner内部循环；当前filesystem实现只支持local单runner，production在共享对象存储adapter完成前完全不宣告export read capability。
 
@@ -425,7 +429,7 @@ router只对`RUNNERS`中的每个稳定、逐实例直连origin执行私有fan-o
 
 `0021`实现T3c的非破坏性content inventory。默认关闭的runner内嵌worker只从完整T1/T3a/T3b proof显式materialize；事务在所有可能等待的source/policy锁之后读取数据库时间，且anchor必须不小于T3a credential receipt与T3b runtime receipt两个DB时间的最大值，再按T1绑定的policy计算deadline。数据库时钟低于source high-water、既定anchor或已写page evidence时分别返回可重试的`trusted_clock_before_source`、`trusted_clock_before_anchor`、`trusted_clock_before_evidence`，不转成integrity block。分页事务锁读tenant session及其turn/item/event/approval，schema-parse持久化body并核对索引列，验证owner/parent DAG/seq和event引用；content-free roots绑定结构identity、生命周期状态及关系投影。只有`contextCompaction`允许synthetic `turnId`而无turn row；approval canonical关系是唯一同session/turn且toolCall/name一致的`approvalRequest.approvalId → Approval.id`，legacy `Approval.itemId`仍进入历史hash但不是外键。任何分页后拓扑漂移都会在seal复算时触发`evidence_changed`。
 
-page在全部session receipt INSERT后重新读取DB time并复核attempt/token/live lease；过期时receipt、cursor与job update整事务回滚。seal使用显式`REPEATABLE READ`重新扫描并锁定五类全库结构关系，以next-key/gap lock关闭orphan插入窗口，再验证tenant及全部已知user的canonical legal-hold ledger。pre-insert `finalNow`同时成为aggregate `storeDbTimestampMs`与job `inventorySealedAtDbMs`；aggregate INSERT后的`publishNow`只重新验证lease并单调抬高`updatedAtMs`，过期则aggregate与terminal transition一起回滚。receipt不包含正文、user id、Blob/外部locator或claim token，且固定`contentInventoryComplete=true`、`contentPurgeExecuted=false`；它只是时间点proof。T3e会在本地受限动作边界重验，后续完整全域executor还必须补齐session/idempotency/Redis、其它内容、external/KMS、backup/restore等ACK。
+page在全部session receipt INSERT后重新读取DB time并复核attempt/token/live lease；过期时receipt、cursor与job update整事务回滚。seal使用显式`REPEATABLE READ`重新扫描并锁定五类全库结构关系，以next-key/gap lock关闭orphan插入窗口，再验证tenant及全部已知user的canonical legal-hold ledger。pre-insert `finalNow`同时成为aggregate `storeDbTimestampMs`与job `inventorySealedAtDbMs`；aggregate INSERT后的`publishNow`只重新验证lease并单调抬高`updatedAtMs`，过期则aggregate与terminal transition一起回滚。receipt不包含正文、user id、Blob/外部locator或claim token，且固定`contentInventoryComplete=true`、`contentPurgeExecuted=false`；它只是时间点proof。T3e/T3f/T3g会在各自本地受限动作边界重新验证它；后续完整全域executor还必须补齐external/KMS、backup与独立故障域restore ledger、logs/traces、共享对象存储生产适配及其它completion ACK。
 
 `0022`实现T3d的非破坏性full-domain purge plan，仍不等同于destructive T3。默认关闭的runner内嵌worker只从完整T1/T3a/T3b/T3c、request-bound immutable policy和可信DB-time deadline显式materialize。固定33域包含registry/profile、agent/session/idempotency、usage/billing、Blob/outbox、export、user/tenant lifecycle/governance evidence、Redis、external provider、KMS、backup/restore及logs/traces；catalog不能随部署环境或adapter集合漂移。每条entry只保存target count/root、固定disposition、source hash与DB capture time，不保存正文、user id、credential、locator或raw claim token。
 
@@ -445,6 +449,12 @@ execute在一个Memory staged publication或单个MySQL显式`REPEATABLE READ`�
 
 pre-delete entries/receipt、grave markers、11个domain ACK、terminal receipt/job及首次write-once cutover与业务删除同事务提交；任一步失败、最后一次lease检查失败或证据漂移全部回滚。completed replay不能只信terminal hash：必须同时匹配原authorization、完整bundle、active cutover、T3c session catalog、T3d plan、T3e physical ACK及其operational-usage billing root。receipt固定`localDatabasePurgeComplete=true`、`sessionContentDeleted=true`、`allDomainsComplete=false`、`contentPurgeExecuted=false`；Redis、external/KMS、backup/restore、logs/traces和独立restore proof仍在边界外。
 
+`0025`实现T3g的**session-scoped Redis状态清理与本地restore replay**，仍不是全域tenant purge。`TenantRedisPurgeWorker`继续内嵌runner且只持有窄化store/adapter；它从terminal T3f receipt显式materialize job，把T3f永久grave中的每个session与T3d固定`redis_leases`、`redis_fences`、`redis_streams` entry精确闭合后形成不可变target。Memory/MySQL负责job、target、target ACK、commit-ordered restore序号、三个domain ACK、terminal receipt与cutover；真实Redis adapter负责物理mutation。二者没有跨存储分布式事务，而是用namespace-bound operation hash、永久marker及response-loss replay组成saga。
+
+实际key统一为`${prefix}:lease:{sessionId}`、`fence`、`stream`、`evt`与`purge`，其中大括号中的session id是Redis Cluster hash tag；owner/addr/fence目录位于lease hash，不存在独立owner key。首次mutation的Lua先对同slot相关key、既有marker、类型和operation identity做完整预检，再一次原子写入无TTL、无正文的固定marker并删除lease/fence/stream；首次existence bits进入target ACK。独立的existing-marker-only Lua只在相同namespace/operation的exact marker已存在时返回原bits并再次删除可能复活的三域；marker缺失时零写入、零删除，不会绕过gate建立新authority。`evt`只用于瞬时Pub/Sub，不是第四个持久domain。lease acquire/renew/getOwner、router owner lookup、持久event publish与live publish均先检查marker，所以清理后不能重新建立owner、lease、fence、stream或继续向该session广播。
+
+target+ACK row同时形成durable restore projection：runner在开始监听/ready之前只重放已经有durable ACK的partial/terminal marker，之后周期性重放，恢复后出现的旧Redis状态会再次被同一marker清除。未ACK target不进入startup projection；worker开始轮询后会claim并先调用existing-marker-only Lua，exact marker存在时即使destructive gate关闭也能再次删除三域、持久化ACK并seal，marker缺失时则保持Redis不变并转入需要fresh gate的新mutation路径。namespace由operator指定的非密钥`REDIS_NAMESPACE_ID`与`REDIS_PREFIX`计算digest；它必须准确、唯一地指向实际logical Redis cluster/database/prefix。namespace漂移、marker conflict或证据损坏fail startup或阻止后续destructive work。恢复边界不能过度解释：若Lua已写marker但MySQL ACK尚未提交，且该marker在worker成功existing-marker replay并持久化ACK前又丢失，首次lease/fence/stream existence bits无法由same-MySQL projection恢复；MySQL与Redis同时回滚到旧snapshot也不受保护。大tenant restore keyset的扫描/重放成本、普通live-session fence灾备、marker GC及独立故障域ledger仍待设计和staging压测。当前真实adapter测试使用standalone ioredis并验证same-slot grammar，尚未在真实Redis Cluster、ACL、persistence/failover环境验收。
+
 T3a rollout独立于T2 admission：先应用expand-only `0019`，发布`TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED=0`的新router并排空旧router，再滚动`TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=0`但声明`credential-store-v1`的新runner；逐runner开启worker、核对全部configured稳定地址健康且worker-active，最后开启router execution gate。首个receipt激活write-once cutover后不得回退pre-`0019` writer/worker，只能forward-fix；关闭execution只暂停新批次，不恢复已经删除的credential或撤销durable evidence。
 
 T3b rollout另用三道默认关闭gate：先应用expand-only `0020`；发布`TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED=0`的新router并排空旧router；滚动`TENANT_RUNTIME_DRAIN_ENABLED=0`、`TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=0`且具有稳定`RUNNER_ID`的新runner；逐实例开启私有drain endpoint并核对configured direct origins与runner/boot identity，再开启worker，最后开启router execution。部分fan-out失败可能已经fence此前target，此状态不可回滚，只能修复配置并精确重试。关闭execution/worker只暂停新批次，不解除已经提交的fence或删除receipt；`0020` receipt也不授权content purge或公开completion。
@@ -457,6 +467,8 @@ T3e rollout在`0022`之后另走`0023` expand→code-aware→local-cleanup/worke
 
 T3f rollout另走`0024` expand→router-first parser replacement→worker→execution-gate。新runner会同时声明`tenantPurgeExecution=["local-execution-ack-v1","local-db-content-delete-v1"]`，而pre-T3f router的严格单值parser会把整个capability响应视为不兼容；因此必须先应用`0024`，发布`TENANT_DATABASE_PURGE_ENABLED=0`且理解双值的新router并**完全排空全部旧router**，之后才能以`TENANT_DATABASE_PURGE_WORKER_ENABLED=0`滚动新runner。核对全部configured runner健康、旧/新capability同时存在后逐实例开启worker，最后开启router gate；runner-first不是安全顺序。worker在materialize、claim、renew、destructive execute及模糊response replay前分别获取fresh、`no-store` ACK。关闭gate只暂停新边界，不能恢复已删projection或移除永久grave/cutover；首个receipt后只能forward-fix。当前T3f依赖T3e的local filesystem physical proof，故共享对象存储adapter完成前也不能作为staging/production多VM/Pod方案开启。
 
+T3g rollout另走`0025` expand→marker-aware router→marker-aware runner→worker→execution-gate。先应用execution-dormant migration；为所有router/runner配置相同且准确的`REDIS_NAMESPACE_ID`与`REDIS_PREFIX`；发布`TENANT_REDIS_PURGE_ENABLED=0`的新router并完全排空旧router；再滚动`TENANT_REDIS_PURGE_WORKER_ENABLED=0`但声明`tenantRedisPurge=["session-state-delete-v1"]`与namespace digest的新runner，并在任何T3g Redis mutation前完全排空所有marker-unaware旧runner。核对每个configured stable URL当前健康、capability及digest一致后，保持router gate关闭并逐实例开启worker；这允许已有durable ACK restore及existing-marker-only收口，但不materialize新job或创建首次marker。全部worker-active后最后开启router gate。fresh、`no-store` ACK只用于materialize与每一次新的Redis mutation；mutation前固定执行`gate → renew claim → gate`。worker lease至少是barrier timeout的两倍再加1秒，第二次proof后续租耗时超过lease一半时不开始mutation。claim、existing-marker-only replay、ACK持久化/精确重放、durable restore与全ACK seal不需要destructive gate。首个marker/ACK/cutover后只能forward-fix；关闭router gate只能暂停新materialize/mutation，worker必须保持开启以收口marker-only窗口并执行startup/periodic durable restore，不得切回旧runtime或更换namespace identity。fleet barrier不能约束仍存活且能直接写Redis的旧进程，所以旧runner drain是强制条件。
+
 普通erasure worker与legacy补偿worker在每次数据库claim或cutover activation前都要求router私有v2 barrier，证明本进程已观察每个稳定`RUNNERS`地址同时支持`quarantine-v1`和`legacy-tombstone-compensation-v1`；公开capability不暴露这个rollout状态。policy evaluator使用另一条token-protected固定ACK barrier，runner/router两端`PURGE_POLICY_EVALUATOR_ENABLED`均默认关闭，且router只有在每个configured稳定地址当前健康并声明`policy-evaluator-v1`时才放行一次schedule/claim pass；该ACK不携带request、tenant或删除权限。v1 barrier路径故意返回404，阻止pre-0014 worker混跑。首次接受gate后不得恢复lifecycle-unaware writer；任一0013 control证据写入后不得恢复pre-0013 reader/worker；0014 cutover从generation 0激活为1后，session trigger会拒绝新的legacy tombstone写，且不得恢复pre-0014 writer/worker。回滚只能forward-fix，或在尚未越过相应不可逆边界前先排空并在edge阻断相关流量。
 
 当前T3d全库RR/next-key owner扫描是local/CI正确性基线，在staging必须验证索引、容量、跨tenant写阻塞/死锁、lease预算和锁超时。损坏的queued purge-plan envelope可能在逐候选隔离前解析失败并饿死后续job，cursor重启还会重扫损坏前缀；该路径fail-closed、无receipt/执行authority，但M4仍应增加不信任字段的raw-key quarantine/skip。`0022` migration的trigger fingerprint目前只绑定trigger集合/元数据而不校验action body，历史迁移夹具也只显式模拟第一个DDL auto-commit边界；这些是特权schema tamper与测试深度的剩余风险，不会扩大`0023`仅限本地usage/Blob/export子集的destructive authority。
@@ -467,7 +479,7 @@ T3d owner closure还包括Memory中export request、user erasure request与tenan
 
 ### 8.2 Redis 键
 
-`lease:{sid}` `fence:{sid}` `owner:{sid}` `stream:{sid}` `quota:{scope}:{id}` `keypool:{provider}` `mcp:catalog:{principal}:{serverId}`。幂等 completed receipt 是 MySQL 业务真相，不在 Redis 预留。
+session key的实际grammar为`${prefix}:lease:{sid}`、`${prefix}:fence:{sid}`、`${prefix}:stream:{sid}`、`${prefix}:evt:{sid}`与`${prefix}:purge:{sid}`；`{sid}`是Redis Cluster hash tag，使T3g Lua涉及的key落在同一slot。owner目录直接保存在lease hash的`owner/addr/fence`字段，不存在独立`owner:{sid}` key。`evt`是瞬时Pub/Sub channel，不是持久清理domain；`purge`是无TTL、无正文的永久防复活marker。`REDIS_NAMESPACE_ID + REDIS_PREFIX`的SHA-256是rollout/restore身份承诺，URL故意不进入digest，因此operator必须保证它唯一、准确地代表logical cluster/database/prefix。未来的`quota:{scope}:{id}`、`keypool:{provider}`、`mcp:catalog:{principal}:{serverId}`仍是目标态且不属于T3g；幂等completed receipt是MySQL业务真相，不在Redis预留。
 
 ### 8.3 迁移路径
 
@@ -531,7 +543,7 @@ agent-service/
 | **M3 扩展性**（2–3 周） | 远程 MCP 注册与桥接；skills 上传/注入/guard；hooks/middleware + webhook hook；动态工具反向委托 | MCP 工具在 turn 中被调用并落 item；skill 目录注入去重；hook 超时 fail-open/closed 行为；SSRF 用例被拒 |
 | **M4 生产化**（2–3 周） | 配额/key 池/熔断；OTel + 指标；压测（单进程并发 turn 上限实测）；Streams 分片；k8s 清单；重池/exec-server 设计评审 | 单 runner 1,000 并发 turn 压测报告；`prompt_cache_hit_ratio` 面板；混沌测试（Redis 抖动、厂商 5xx） |
 
-当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结；M1仍因Redis、外部/KMS、backup/restore、logs/traces、共享对象存储生产适配、generic user purge与全域completion/restore闭环不完整而未冻结。`0023`/`0024`只补齐T3e/T3f本地切片，公开`dataPurgeExecution=false`；M3尚未正式开始，M4的云资源与生产编排仍等待真实环境参数。
+当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结；`0023`/`0024`/`0025`已分别补齐T3e local usage/Blob/export、T3f本地数据库投影与T3g session-scoped Redis三域，但M1仍因external/KMS、backup与独立故障域restore ledger、logs/traces、共享对象存储生产适配、generic user purge及全域completion不完整而未冻结。公开`dataPurgeExecution=false`；M3尚未正式开始，M4的云资源与生产编排仍等待真实环境参数。
 
 ---
 

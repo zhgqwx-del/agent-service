@@ -7,6 +7,9 @@ const Env = z.object({
   RUNNERS: z.string().min(1),
   /** same Redis the runners use: the router reads the ownership directory from it */
   REDIS_URL: z.string().optional(),
+  REDIS_PREFIX: z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/).default("as"),
+  /** Non-secret logical identity shared by every process targeting this Redis namespace. */
+  REDIS_NAMESPACE_ID: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional(),
   HEALTH_INTERVAL_MS: z.coerce.number().int().default(5_000),
   MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(2),
   // Keep this default identical to agent-runner. If the router accepts a body the runner rejects,
@@ -58,6 +61,10 @@ const Env = z.object({
     .transform((value) => value === "1"),
   /** Independent T3f database-content deletion barrier; never implied by T3e activation. */
   TENANT_DATABASE_PURGE_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  /** Independent T3g Redis session-state deletion barrier. */
+  TENANT_REDIS_PURGE_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
   /** Broadcast T3b runtime drain. Keep closed until every configured stable runner endpoint is active. */
@@ -139,6 +146,12 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     throw new Error(
       "TENANT_ERASURE_OPERATOR_TOKEN must differ from INTERNAL_ROUTER_TOKEN",
     );
+  }
+  if (c.TENANT_REDIS_PURGE_ENABLED && !c.REDIS_URL) {
+    throw new Error("REDIS_URL is required before TENANT_REDIS_PURGE_ENABLED=1");
+  }
+  if (c.TENANT_REDIS_PURGE_ENABLED && !c.REDIS_NAMESPACE_ID) {
+    throw new Error("REDIS_NAMESPACE_ID is required before TENANT_REDIS_PURGE_ENABLED=1");
   }
   if (
     c.TENANT_ERASURE_OPERATOR_TOKEN !== undefined

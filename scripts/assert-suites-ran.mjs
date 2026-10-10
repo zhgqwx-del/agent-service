@@ -16,6 +16,7 @@ const testReport = JSON.parse(await readFile(testReportPath, "utf8"));
 const required = [
   ["packages/store/src/mysql/store.ts", 40, "MySQL store — set AGENT_SERVICE_INTEGRATION=1 and MYSQL_TEST_URL"],
   ["packages/store/src/redis/lease.ts", 40, "Redis lease — set AGENT_SERVICE_INTEGRATION=1 and REDIS_TEST_URL"],
+  ["packages/store/src/redis/purge.ts", 60, "Redis purge — set AGENT_SERVICE_INTEGRATION=1 and REDIS_TEST_URL"],
   ["packages/core/src/engine/pi.ts", 30, "PiEngine — the dialect tests against the fake vendor must run"],
 ];
 
@@ -33,6 +34,7 @@ for (const [file, minLines, hint] of required) {
 
 const requiredTestFiles = [
   "packages/store/test/blob-lifecycle.mysql.test.ts",
+  "packages/store/test/lifecycle-outbox.mysql.test.ts",
   "packages/store/test/usage-lifecycle.mysql.test.ts",
   "packages/store/test/subject-lifecycle.mysql.test.ts",
   "packages/store/test/tenant-credential-revocation.mysql.test.ts",
@@ -44,6 +46,11 @@ const requiredTestFiles = [
   "packages/store/test/tenant-purge-execution.mysql.test.ts",
   "packages/store/test/memory-tenant-database-purge.test.ts",
   "packages/store/test/mysql-tenant-database-purge.test.ts",
+  "packages/store/test/tenant-redis-purge.test.ts",
+  "packages/store/test/mysql-tenant-redis-purge.test.ts",
+  "packages/store/test/redis-tenant-purge.test.ts",
+  "packages/core/test/tenant-redis-purge-worker.test.ts",
+  "apps/agent-runner/test/tenant-redis-purge-gate.test.ts",
   "packages/store/test/retention-policy.mysql.test.ts",
   "packages/store/test/erasure-purge-policy.mysql.test.ts",
   "packages/store/test/erasure-job.mysql.test.ts",

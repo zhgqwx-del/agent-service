@@ -26,6 +26,9 @@ import {
   INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
   INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
   INTERNAL_TENANT_DATABASE_PURGE_READY_PATH,
+  INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER,
+  INTERNAL_TENANT_REDIS_PURGE_ACK_VALUE,
+  INTERNAL_TENANT_REDIS_PURGE_READY_PATH,
   INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER,
   INTERNAL_TENANT_PURGE_EXECUTION_ACK_VALUE,
   INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH,
@@ -52,6 +55,7 @@ import {
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+  TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
   TenantErasureRequestHeaders,
@@ -105,6 +109,10 @@ export interface RouterAppDeps {
   tenantPurgeExecutionEnabled?: () => boolean;
   /** Independent activation gate for T3f local database-content deletion queue claims. */
   tenantDatabasePurgeEnabled?: () => boolean;
+  /** Independent activation gate for T3g Redis session-state deletion queue claims. */
+  tenantRedisPurgeEnabled?: () => boolean;
+  /** Expected content-free namespace identity projected only after all runners match it. */
+  tenantRedisPurgeNamespaceSha256?: string;
   /** Independent all-configured broadcast gate for T3b runtime drain. */
   tenantRuntimeDrainExecutionEnabled?: () => boolean;
   /** Read/download surface for the configured artifact backend. Filesystem stays local-only. */
@@ -302,6 +310,11 @@ export function createRouterApp(deps: RouterAppDeps) {
     !!deps.internalRunnerToken
     && (deps.tenantDatabasePurgeEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportTenantDatabasePurgeWorker()
+  );
+  const tenantRedisPurgeAvailable = () => (
+    !!deps.internalRunnerToken
+    && (deps.tenantRedisPurgeEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportTenantRedisPurgeWorker()
   );
   const userDataExportReadable = () => (
     (deps.dataExportArtifactsEnabled?.() ?? false)
@@ -534,6 +547,14 @@ export function createRouterApp(deps: RouterAppDeps) {
                   ],
                 tenantPurgeExecutionWorker: tenantPurgeExecutionAvailable(),
                 tenantDatabasePurgeWorker: tenantDatabasePurgeAvailable(),
+                tenantRedisPurge: deps.registry.allConfiguredSupportTenantRedisPurge()
+                  ? [TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1]
+                  : [],
+                tenantRedisPurgeWorker: tenantRedisPurgeAvailable(),
+                tenantRedisPurgeNamespaceSha256:
+                  deps.registry.allConfiguredSupportTenantRedisPurge()
+                    ? (deps.tenantRedisPurgeNamespaceSha256 ?? null)
+                    : null,
                 // Per-instance runtime identity and activation are private rollout state. The
                 // worker consumes the token-protected fleet proof route instead.
                 tenantRuntimeDrain: [],
@@ -649,6 +670,22 @@ export function createRouterApp(deps: RouterAppDeps) {
       INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
       INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
     );
+    return c.body(null, 204);
+  });
+
+  /** T3g has a distinct, non-sticky barrier bound to one exact Redis namespace. */
+  app.get(INTERNAL_TENANT_REDIS_PURGE_READY_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    try {
+      await deps.registry.refresh();
+    } catch {
+      return c.body(null, 503);
+    }
+    if (!tenantRedisPurgeAvailable()) return c.body(null, 503);
+    c.header(INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER, INTERNAL_TENANT_REDIS_PURGE_ACK_VALUE);
     return c.body(null, 204);
   });
 
@@ -1093,6 +1130,8 @@ export function createRouterApp(deps: RouterAppDeps) {
       || url.pathname.startsWith(`${INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_DATABASE_PURGE_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_TENANT_DATABASE_PURGE_READY_PATH}/`)
+      || url.pathname === INTERNAL_TENANT_REDIS_PURGE_READY_PATH
+      || url.pathname.startsWith(`${INTERNAL_TENANT_REDIS_PURGE_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX

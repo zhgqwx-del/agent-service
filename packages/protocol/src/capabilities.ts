@@ -127,6 +127,18 @@ export const INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE =
   "local-db-content-delete-v1" as const;
 
 /**
+ * T3g removes the three session-scoped Redis domains and installs a permanent, content-free
+ * Redis purge fence. This is deliberately independent from both the T3e local execution ACK and
+ * the T3f database-content ACK: one fresh response authorizes one bounded Redis worker boundary.
+ */
+export const INTERNAL_TENANT_REDIS_PURGE_READY_PATH =
+  "/_internal/tenant-redis-purge-v1/ready" as const;
+export const INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER =
+  "x-agent-service-tenant-redis-purge" as const;
+export const INTERNAL_TENANT_REDIS_PURGE_ACK_VALUE =
+  "session-state-delete-v1" as const;
+
+/**
  * T3b is a fleet operation rather than an owner-routed request. A claimant calls the router path,
  * the router takes a fresh identity snapshot from every exact configured runner URL, then invokes
  * the runner path once per snapshot member. The private ready route binds a stable logical runner
@@ -405,6 +417,30 @@ export type TenantPurgeExecutionCapability = z.infer<
   typeof TenantPurgeExecutionCapability
 >;
 
+export const TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1 =
+  "session-state-delete-v1" as const;
+export const TenantRedisPurgeCapability = z.literal(
+  TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
+);
+export type TenantRedisPurgeCapability = z.infer<typeof TenantRedisPurgeCapability>;
+
+/**
+ * Hash an operator-assigned, non-secret Redis namespace identity together with the key prefix.
+ * The value lets a fresh all-runner barrier reject a fleet which would otherwise delete the same
+ * session ids in different Redis clusters or namespaces and incorrectly acknowledge zero keys.
+ */
+export function tenantRedisNamespaceSha256(namespaceId: string, prefix: string): string {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(namespaceId)) {
+    throw new Error("Redis namespace id is invalid");
+  }
+  if (!/^[A-Za-z0-9._:-]{1,64}$/.test(prefix)) {
+    throw new Error("Redis key prefix is invalid");
+  }
+  return createHash("sha256")
+    .update(JSON.stringify(["tenant-redis-namespace-v1", namespaceId, prefix]))
+    .digest("hex");
+}
+
 export const PURGE_POLICY_EVALUATOR_V1 = "policy-evaluator-v1" as const;
 export const PurgePolicyEvaluationCapability = z.literal(PURGE_POLICY_EVALUATOR_V1);
 export type PurgePolicyEvaluationCapability = z.infer<typeof PurgePolicyEvaluationCapability>;
@@ -493,6 +529,12 @@ export const Capabilities = z.object({
     tenantPurgeExecutionWorker: z.boolean().default(false),
     /** Local T3f database-content worker activation; it has an independent router barrier. */
     tenantDatabasePurgeWorker: z.boolean().default(false),
+    /** Additive T3g Redis lease/fence/stream deletion and permanent marker contract. */
+    tenantRedisPurge: z.array(TenantRedisPurgeCapability).max(1).default([]),
+    /** Local T3g worker activation; fleet execution additionally requires its router barrier. */
+    tenantRedisPurgeWorker: z.boolean().default(false),
+    /** Content-free identity of the Redis cluster namespace targeted by the T3g adapter. */
+    tenantRedisPurgeNamespaceSha256: Sha256.nullable().default(null),
     /** Code understands the private all-configured runtime-drain receipt contract. */
     tenantRuntimeDrain: z.array(TenantRuntimeDrainCapability).max(1).default([]),
     /** Local private endpoint is active; the router still performs a fresh identity probe. */

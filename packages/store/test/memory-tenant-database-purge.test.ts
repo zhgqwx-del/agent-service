@@ -18,6 +18,7 @@ import {
   EMPTY_TENANT_DATABASE_PURGE_DOMAIN_ACK_ROOT_SHA256,
   MemorySessionStore,
   SessionGoneError,
+  TENANT_REDIS_PURGE_ADAPTER_PROTOCOL,
   TenantDatabasePurgeEvidenceChangedError,
   TenantDatabasePurgeNotReadyError,
   computeBillingUsageFactSha256,
@@ -42,6 +43,7 @@ import {
   tenantDatabasePurgeTargetRootSha256,
   tenantDatabasePurgeTargetSha256,
   tenantErasureRequestHash,
+  tenantRedisPurgeMarkerSha256,
   userDataExportRequestHash,
   type RetentionPolicyDocumentV1,
   type TenantContentInventoryAuthorization,
@@ -53,6 +55,10 @@ import {
   type TenantDatabasePurgePreDeleteReceipt,
   type TenantDatabasePurgeReceipt,
   type TenantPurgeSessionGraveMarker,
+  type TenantRedisPurgeAdapterResult,
+  type TenantRedisPurgeAuthorization,
+  type TenantRedisPurgeJobRecord,
+  type TenantRedisPurgeTarget,
   type TenantPurgeExecutionAuthorization,
   type TenantPurgePlanAuthorization,
   type TenantRuntimeRevocationAuthorization,
@@ -149,6 +155,44 @@ function databaseAuthorization(
     databasePurgeGeneration: claim.databasePurgeGeneration,
     claimAttempt: claim.claimAttempt,
     claimToken: claim.claimToken,
+  };
+}
+
+function redisAuthorization(
+  claim: Awaited<ReturnType<MemorySessionStore["claimTenantRedisPurges"]>>[number],
+): TenantRedisPurgeAuthorization {
+  return {
+    requestId: claim.requestId,
+    tenantId: claim.tenantId,
+    subjectGeneration: claim.subjectGeneration,
+    planBuildGeneration: claim.planBuildGeneration,
+    executionGeneration: claim.executionGeneration,
+    databasePurgeGeneration: claim.databasePurgeGeneration,
+    redisPurgeGeneration: claim.redisPurgeGeneration,
+    claimAttempt: claim.claimAttempt,
+    claimToken: claim.claimToken,
+  };
+}
+
+function redisResult(
+  target: TenantRedisPurgeTarget,
+  bits: { leaseExisted: boolean; fenceExisted: boolean; streamExisted: boolean } = {
+    leaseExisted: true,
+    fenceExisted: true,
+    streamExisted: true,
+  },
+): TenantRedisPurgeAdapterResult {
+  const evidence = {
+    adapterProtocol: TENANT_REDIS_PURGE_ADAPTER_PROTOCOL,
+    redisNamespaceSha256: target.redisNamespaceSha256,
+    sessionId: target.sessionId,
+    operationSha256: target.operationSha256,
+    ...bits,
+  };
+  return {
+    ...evidence,
+    markerSha256: tenantRedisPurgeMarkerSha256(evidence),
+    replayed: false,
   };
 }
 
@@ -1293,5 +1337,229 @@ describe("MemorySessionStore tenant database purge", () => {
     expect(store.userDataExportArtifacts.has(target.artifactId)).toBe(false);
     expect(store.userDataExportParts).toHaveLength(0);
     expect(store.userDataExportDeleteOutbox).toHaveLength(0);
+  });
+});
+
+describe("MemorySessionStore tenant Redis purge", () => {
+  const namespaceSha256 = "7".repeat(64);
+
+  it("reuses an exact partial ACK across lease takeover, seals once, and isolates tenants", async () => {
+    let nowMs = NOW;
+    const store = new MemorySessionStore(
+      { now: () => nowMs },
+      { tenantRedisPurgeNamespaceSha256: namespaceSha256 },
+    );
+    const tenantId = "tenant-redis-takeover";
+    const session = installSession(store, tenantId, "redis-user");
+    const database = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: session.install,
+    });
+    expect(await store.executeTenantDatabasePurge(database.authorization)).not.toBeNull();
+    expect(await store.hasTenantRedisPurgeJobs()).toBe(false);
+    expect(await store.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
+    expect(await store.hasTenantRedisPurgeJobs()).toBe(true);
+
+    const firstClaim = (await store.claimTenantRedisPurges({
+      limit: 10,
+      leaseMs: 100,
+      claimToken: "redis-first",
+    }))[0]!;
+    const firstAuthorization = redisAuthorization(firstClaim);
+    const [target] = await store.getTenantRedisPurgeTargets(
+      tenantId,
+      database.request.requestId,
+      1,
+    );
+    if (!target) throw new Error("expected Redis purge target");
+    const adapterResult = redisResult(target);
+    expect(await store.recordTenantRedisPurgeTargetAck(
+      { ...firstAuthorization, tenantId: "foreign-tenant" },
+      adapterResult,
+    )).toBeNull();
+    expect(await store.sealTenantRedisPurge({
+      ...firstAuthorization,
+      tenantId: "foreign-tenant",
+    })).toBeNull();
+    const [firstAck, concurrentReplay] = await Promise.all([
+      store.recordTenantRedisPurgeTargetAck(firstAuthorization, adapterResult),
+      store.recordTenantRedisPurgeTargetAck(firstAuthorization, adapterResult),
+    ]);
+    expect(firstAck).toEqual(concurrentReplay);
+    expect(store.tenantRedisPurgeTargetAcks).toHaveLength(1);
+
+    const [partialFence] = (await store.listTenantRedisPurgeRestoreFences({ limit: 10 })).fences;
+    expect(partialFence).toMatchObject({
+      jobPhase: "queued",
+      terminalReceiptSha256: null,
+      markerSha256: adapterResult.markerSha256,
+    });
+    expect(await store.retryTenantRedisPurge(firstAuthorization, {
+      delayMs: 0,
+      errorCode: "temporary_failure",
+    })).toBe(true);
+    nowMs += 1;
+    const secondClaim = (await store.claimTenantRedisPurges({
+      limit: 10,
+      leaseMs: 100,
+      claimToken: "redis-second",
+    }))[0]!;
+    const secondAuthorization = redisAuthorization(secondClaim);
+    expect(await store.renewTenantRedisPurge(firstAuthorization, { leaseMs: 100 })).toBe(false);
+    expect(await store.recordTenantRedisPurgeTargetAck(firstAuthorization, adapterResult)).toBeNull();
+    const reused = await store.recordTenantRedisPurgeTargetAck(
+      secondAuthorization,
+      { ...adapterResult, replayed: true },
+    );
+    expect(reused).toEqual(firstAck);
+    expect(reused?.completedClaimAttempt).toBe(firstClaim.claimAttempt);
+
+    const receipt = await store.sealTenantRedisPurge(secondAuthorization);
+    expect(receipt).toMatchObject({
+      redisPurgeComplete: true,
+      allDomainsComplete: false,
+      contentPurgeExecuted: false,
+      targetAckCount: 1,
+      markerCount: 1,
+      domainAckCount: 3,
+      completedClaimAttempt: secondClaim.claimAttempt,
+    });
+    expect(await store.sealTenantRedisPurge(secondAuthorization)).toEqual(receipt);
+    expect(await store.getTenantRedisPurgeJob("foreign-tenant", database.request.requestId))
+      .toBeNull();
+    expect(await store.getTenantRedisPurgeTargets("foreign-tenant", database.request.requestId, 1))
+      .toEqual([]);
+    const [terminalFence] = (await store.listTenantRedisPurgeRestoreFences({ limit: 10 })).fences;
+    expect(terminalFence).toMatchObject({
+      jobPhase: "redis_purge_sealed",
+      terminalReceiptSha256: receipt?.receiptSha256,
+      targetAckReceiptSha256: firstAck?.receiptSha256,
+    });
+  });
+
+  it("freezes each restore scan while later ACKs append to the in-memory ledger", async () => {
+    const store = new MemorySessionStore(
+      { now: () => NOW },
+      { tenantRedisPurgeNamespaceSha256: namespaceSha256 },
+    );
+    const tenantId = "tenant-redis-restore-snapshot";
+    const sessions = ["one", "two", "three"].map((suffix) => (
+      installSession(store, tenantId, `restore-${suffix}`)
+    ));
+    const database = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: async () => {
+        for (const session of sessions) await session.install();
+      },
+    });
+    expect(await store.executeTenantDatabasePurge(database.authorization)).not.toBeNull();
+    expect(await store.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
+    const claim = (await store.claimTenantRedisPurges({
+      limit: 10,
+      leaseMs: 100,
+      claimToken: "redis-restore-snapshot",
+    }))[0]!;
+    const authorization = redisAuthorization(claim);
+    const targets = await store.getTenantRedisPurgeTargets(
+      tenantId,
+      database.request.requestId,
+      1,
+    );
+    expect(targets).toHaveLength(3);
+    for (const target of targets.slice(0, 2)) {
+      expect(await store.recordTenantRedisPurgeTargetAck(
+        authorization,
+        redisResult(target),
+      )).not.toBeNull();
+    }
+
+    const firstPage = await store.listTenantRedisPurgeRestoreFences({ limit: 1 });
+    expect(firstPage.fences).toHaveLength(1);
+    expect(firstPage.nextCursor).toBeDefined();
+
+    expect(await store.recordTenantRedisPurgeTargetAck(
+      authorization,
+      redisResult(targets[2]!),
+    )).not.toBeNull();
+    const frozenRemainder = await store.listTenantRedisPurgeRestoreFences({
+      limit: 10,
+      cursor: firstPage.nextCursor,
+    });
+    expect(frozenRemainder.fences).toHaveLength(1);
+    expect(frozenRemainder.nextCursor).toBeUndefined();
+
+    const nextScan = await store.listTenantRedisPurgeRestoreFences({ limit: 10 });
+    expect(nextScan.fences).toHaveLength(3);
+  });
+
+  it("rolls back staged publication failures without losing prior target ACKs", async () => {
+    const store = new MemorySessionStore(
+      { now: () => NOW },
+      { tenantRedisPurgeNamespaceSha256: namespaceSha256 },
+    );
+    const tenantId = "tenant-redis-rollback";
+    const session = installSession(store, tenantId, "rollback-user");
+    const database = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: session.install,
+    });
+    expect(await store.executeTenantDatabasePurge(database.authorization)).not.toBeNull();
+
+    store.tenantRedisPurgeTargets = new FailOnceMap();
+    await expect(store.materializeTenantRedisPurgeJobs({ limit: 10 }))
+      .rejects.toThrow("injected database purge publication failure");
+    expect(store.tenantRedisPurgeJobs).toHaveLength(0);
+    expect(store.tenantRedisPurgeTargets).toHaveLength(0);
+    store.tenantRedisPurgeTargets = new Map();
+    expect(await store.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
+
+    const failingJobs = new FailOnceMap<string, TenantRedisPurgeJobRecord>();
+    for (const [key, value] of store.tenantRedisPurgeJobs) {
+      Map.prototype.set.call(failingJobs, key, value);
+    }
+    store.tenantRedisPurgeJobs = failingJobs;
+    await expect(store.claimTenantRedisPurges({
+      limit: 10,
+      leaseMs: 100,
+      claimToken: "redis-claim-rollback",
+    })).rejects.toThrow("injected database purge publication failure");
+    expect([...store.tenantRedisPurgeJobs.values()][0]).toMatchObject({
+      phase: "queued",
+      attempts: 0,
+    });
+    expect([...store.tenantRedisPurgeJobs.values()][0]).not.toHaveProperty("claimToken");
+
+    const claim = (await store.claimTenantRedisPurges({
+      limit: 10,
+      leaseMs: 100,
+      claimToken: "redis-rollback",
+    }))[0]!;
+    const auth = redisAuthorization(claim);
+    const [target] = await store.getTenantRedisPurgeTargets(
+      tenantId,
+      database.request.requestId,
+      1,
+    );
+    if (!target) throw new Error("expected Redis purge target");
+    const adapterResult = redisResult(target);
+    store.tenantRedisPurgeTargetAcks = new FailOnceMap();
+    await expect(store.recordTenantRedisPurgeTargetAck(auth, adapterResult))
+      .rejects.toThrow("injected database purge publication failure");
+    expect(store.tenantRedisPurgeTargetAcks).toHaveLength(0);
+    expect((await store.getTenantRedisPurgeJob(tenantId, database.request.requestId))
+      ?.targetAckCount).toBe(0);
+    expect(await store.recordTenantRedisPurgeTargetAck(auth, adapterResult)).not.toBeNull();
+
+    store.tenantRedisPurgeDomainAcks = new FailOnceMap();
+    await expect(store.sealTenantRedisPurge(auth))
+      .rejects.toThrow("injected database purge publication failure");
+    expect(store.tenantRedisPurgeDomainAcks).toHaveLength(0);
+    expect(store.tenantRedisPurgeReceipts).toHaveLength(0);
+    expect(store.tenantRedisPurgeTargetAcks).toHaveLength(1);
+    expect((await store.getTenantRedisPurgeJob(tenantId, database.request.requestId))?.phase)
+      .toBe("queued");
+    const [partialFence] = (await store.listTenantRedisPurgeRestoreFences({ limit: 10 })).fences;
+    expect(partialFence).toMatchObject({
+      jobPhase: "queued",
+      terminalReceiptSha256: null,
+      markerSha256: adapterResult.markerSha256,
+    });
   });
 });

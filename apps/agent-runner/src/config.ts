@@ -14,6 +14,9 @@ const Env = z.object({
   STORE: z.enum(["memory", "mysql"]).default("memory"),
   MYSQL_URL: z.string().default("mysql://root@127.0.0.1:3306/agent_service"),
   REDIS_URL: z.string().optional(),
+  REDIS_PREFIX: z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/).default("as"),
+  /** Non-secret logical identity shared by every process that targets the same Redis namespace. */
+  REDIS_NAMESPACE_ID: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional(),
   BLOB_DIR: z.string().default("./.data/blobs"),
   /**
    * Explicit acknowledgement that this process is the only runner using BLOB_DIR.
@@ -127,6 +130,20 @@ const Env = z.object({
   TENANT_DATABASE_PURGE_MATERIALIZE_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
   TENANT_DATABASE_PURGE_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
   TENANT_DATABASE_PURGE_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
+  /** T3g Redis lease/fence/stream deletion worker. Dormant until 0025 and a grave-aware fleet exist. */
+  TENANT_REDIS_PURGE_WORKER_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  TENANT_REDIS_PURGE_WORKER_POLL_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_REDIS_PURGE_WORKER_LEASE_MS: z.coerce.number().int().min(100).max(600_000).default(30_000),
+  TENANT_REDIS_PURGE_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(5),
+  TENANT_REDIS_PURGE_MATERIALIZE_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(25),
+  TENANT_REDIS_PURGE_TARGET_PAGE_SIZE: z.coerce.number().int().min(1).max(1_000).default(100),
+  TENANT_REDIS_PURGE_RESTORE_PAGE_SIZE: z.coerce.number().int().min(1).max(1_000).default(100),
+  TENANT_REDIS_PURGE_RESTORE_INTERVAL_MS: z.coerce.number().int()
+    .min(1_000).max(86_400_000).default(60_000),
+  TENANT_REDIS_PURGE_RETRY_BASE_MS: z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_REDIS_PURGE_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** Bounded runner-to-router fleet check performed immediately before each tenant admission. */
   TENANT_ERASURE_BARRIER_TIMEOUT_MS: z.coerce.number().int().min(100).max(10_000).default(2_000),
   /** Canonical policy/legal-hold admin surface. This never enables destructive purge. */
@@ -348,6 +365,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED
       || c.TENANT_PURGE_EXECUTION_WORKER_ENABLED
       || c.TENANT_DATABASE_PURGE_WORKER_ENABLED
+      || c.TENANT_REDIS_PURGE_WORKER_ENABLED
     )
     && erasureRouterUrl === undefined
   ) {
@@ -358,7 +376,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1, or "
         + "TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=1, or "
         + "TENANT_PURGE_EXECUTION_WORKER_ENABLED=1, or "
-        + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1",
+        + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1, or "
+        + "TENANT_REDIS_PURGE_WORKER_ENABLED=1",
     );
   }
   if (c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED && !c.TENANT_RUNTIME_DRAIN_ENABLED) {
@@ -419,6 +438,30 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     throw new Error(
       "TENANT_DATABASE_PURGE_RETRY_MAX_MS must be at least "
         + "TENANT_DATABASE_PURGE_RETRY_BASE_MS",
+    );
+  }
+  if (c.TENANT_REDIS_PURGE_RETRY_MAX_MS < c.TENANT_REDIS_PURGE_RETRY_BASE_MS) {
+    throw new Error(
+      "TENANT_REDIS_PURGE_RETRY_MAX_MS must be at least TENANT_REDIS_PURGE_RETRY_BASE_MS",
+    );
+  }
+  if (c.TENANT_REDIS_PURGE_WORKER_ENABLED
+    && c.TENANT_REDIS_PURGE_WORKER_LEASE_MS
+      < c.TENANT_ERASURE_BARRIER_TIMEOUT_MS * 2 + 1_000) {
+    throw new Error(
+      "TENANT_REDIS_PURGE_WORKER_LEASE_MS must be at least twice "
+        + "TENANT_ERASURE_BARRIER_TIMEOUT_MS plus 1000ms",
+    );
+  }
+  if (c.TENANT_REDIS_PURGE_WORKER_ENABLED && c.STORE !== "mysql") {
+    throw new Error("STORE=mysql is required before TENANT_REDIS_PURGE_WORKER_ENABLED=1");
+  }
+  if (c.TENANT_REDIS_PURGE_WORKER_ENABLED && !c.REDIS_URL) {
+    throw new Error("REDIS_URL is required before TENANT_REDIS_PURGE_WORKER_ENABLED=1");
+  }
+  if (c.TENANT_REDIS_PURGE_WORKER_ENABLED && !c.REDIS_NAMESPACE_ID) {
+    throw new Error(
+      "REDIS_NAMESPACE_ID is required before TENANT_REDIS_PURGE_WORKER_ENABLED=1",
     );
   }
   if (c.DATA_ERASURE_REQUESTS_ENABLED && !c.ERASURE_WORKER_ENABLED) {

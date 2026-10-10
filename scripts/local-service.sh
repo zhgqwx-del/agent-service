@@ -13,6 +13,8 @@ caller_runner_id="${RUNNER_ID-}"
 caller_runner_addr="${RUNNER_ADDR-}"
 caller_runners="${RUNNERS-}"
 caller_redis_url="${REDIS_URL-}"
+caller_redis_prefix="${REDIS_PREFIX-}"
+caller_redis_namespace_id="${REDIS_NAMESPACE_ID-}"
 caller_session_tombstone_enabled="${SESSION_TOMBSTONE_ENABLED-}"
 caller_data_erasure_requests_enabled="${DATA_ERASURE_REQUESTS_ENABLED-}"
 caller_tenant_erasure_requests_enabled="${TENANT_ERASURE_REQUESTS_ENABLED-}"
@@ -30,6 +32,8 @@ caller_tenant_purge_execution_worker_enabled="${TENANT_PURGE_EXECUTION_WORKER_EN
 caller_tenant_purge_execution_enabled="${TENANT_PURGE_EXECUTION_ENABLED-}"
 caller_tenant_database_purge_worker_enabled="${TENANT_DATABASE_PURGE_WORKER_ENABLED-}"
 caller_tenant_database_purge_enabled="${TENANT_DATABASE_PURGE_ENABLED-}"
+caller_tenant_redis_purge_worker_enabled="${TENANT_REDIS_PURGE_WORKER_ENABLED-}"
+caller_tenant_redis_purge_enabled="${TENANT_REDIS_PURGE_ENABLED-}"
 caller_data_governance_management_enabled="${DATA_GOVERNANCE_MANAGEMENT_ENABLED-}"
 caller_purge_policy_evaluator_enabled="${PURGE_POLICY_EVALUATOR_ENABLED-}"
 caller_data_export_requests_enabled="${DATA_EXPORT_REQUESTS_ENABLED-}"
@@ -55,6 +59,8 @@ fi
 [ -n "$caller_runner_addr" ] && RUNNER_ADDR="$caller_runner_addr"
 [ -n "$caller_runners" ] && RUNNERS="$caller_runners"
 [ -n "$caller_redis_url" ] && REDIS_URL="$caller_redis_url"
+[ -n "$caller_redis_prefix" ] && REDIS_PREFIX="$caller_redis_prefix"
+[ -n "$caller_redis_namespace_id" ] && REDIS_NAMESPACE_ID="$caller_redis_namespace_id"
 [ -n "$caller_session_tombstone_enabled" ] && SESSION_TOMBSTONE_ENABLED="$caller_session_tombstone_enabled"
 [ -n "$caller_data_erasure_requests_enabled" ] && DATA_ERASURE_REQUESTS_ENABLED="$caller_data_erasure_requests_enabled"
 [ -n "$caller_tenant_erasure_requests_enabled" ] && TENANT_ERASURE_REQUESTS_ENABLED="$caller_tenant_erasure_requests_enabled"
@@ -72,6 +78,8 @@ fi
 [ -n "$caller_tenant_purge_execution_enabled" ] && TENANT_PURGE_EXECUTION_ENABLED="$caller_tenant_purge_execution_enabled"
 [ -n "$caller_tenant_database_purge_worker_enabled" ] && TENANT_DATABASE_PURGE_WORKER_ENABLED="$caller_tenant_database_purge_worker_enabled"
 [ -n "$caller_tenant_database_purge_enabled" ] && TENANT_DATABASE_PURGE_ENABLED="$caller_tenant_database_purge_enabled"
+[ -n "$caller_tenant_redis_purge_worker_enabled" ] && TENANT_REDIS_PURGE_WORKER_ENABLED="$caller_tenant_redis_purge_worker_enabled"
+[ -n "$caller_tenant_redis_purge_enabled" ] && TENANT_REDIS_PURGE_ENABLED="$caller_tenant_redis_purge_enabled"
 [ -n "$caller_data_governance_management_enabled" ] && DATA_GOVERNANCE_MANAGEMENT_ENABLED="$caller_data_governance_management_enabled"
 [ -n "$caller_purge_policy_evaluator_enabled" ] && PURGE_POLICY_EVALUATOR_ENABLED="$caller_purge_policy_evaluator_enabled"
 [ -n "$caller_data_export_requests_enabled" ] && DATA_EXPORT_REQUESTS_ENABLED="$caller_data_export_requests_enabled"
@@ -133,7 +141,9 @@ start_apps() {
       -u TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED \
       -u TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED \
       -u TENANT_PURGE_EXECUTION_ENABLED \
-      -u TENANT_DATABASE_PURGE_ENABLED STORE=mysql \
+      -u TENANT_DATABASE_PURGE_ENABLED \
+      -u TENANT_REDIS_PURGE_ENABLED \
+      STORE=mysql \
       RUNNER_PORT="$RUNNER_PORT" \
       RUNNER_ID="${RUNNER_ID:-runner-local-1}" \
       RUNNER_ADDR="${RUNNER_ADDR:-127.0.0.1:$RUNNER_PORT}" \
@@ -152,6 +162,9 @@ start_apps() {
       TENANT_PURGE_PLAN_WORKER_ENABLED="${TENANT_PURGE_PLAN_WORKER_ENABLED:-0}" \
       TENANT_PURGE_EXECUTION_WORKER_ENABLED="${TENANT_PURGE_EXECUTION_WORKER_ENABLED:-0}" \
       TENANT_DATABASE_PURGE_WORKER_ENABLED="${TENANT_DATABASE_PURGE_WORKER_ENABLED:-0}" \
+      TENANT_REDIS_PURGE_WORKER_ENABLED="${TENANT_REDIS_PURGE_WORKER_ENABLED:-0}" \
+      REDIS_PREFIX="${REDIS_PREFIX:-as}" \
+      REDIS_NAMESPACE_ID="${REDIS_NAMESPACE_ID:-agent-service-local-db0}" \
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
       DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
@@ -175,8 +188,11 @@ start_apps() {
       -u TENANT_PURGE_PLAN_WORKER_ENABLED \
       -u TENANT_PURGE_EXECUTION_WORKER_ENABLED \
       -u TENANT_DATABASE_PURGE_WORKER_ENABLED \
+      -u TENANT_REDIS_PURGE_WORKER_ENABLED \
       RUNNERS="${RUNNERS:-$RUNNER_URL}" \
       REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}" \
+      REDIS_PREFIX="${REDIS_PREFIX:-as}" \
+      REDIS_NAMESPACE_ID="${REDIS_NAMESPACE_ID:-agent-service-local-db0}" \
       SESSION_TOMBSTONE_ENABLED="${SESSION_TOMBSTONE_ENABLED:-1}" \
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_ERASURE_REQUESTS_ENABLED="${TENANT_ERASURE_REQUESTS_ENABLED:-0}" \
@@ -184,6 +200,7 @@ start_apps() {
       TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED="${TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED:-0}" \
       TENANT_PURGE_EXECUTION_ENABLED="${TENANT_PURGE_EXECUTION_ENABLED:-0}" \
       TENANT_DATABASE_PURGE_ENABLED="${TENANT_DATABASE_PURGE_ENABLED:-0}" \
+      TENANT_REDIS_PURGE_ENABLED="${TENANT_REDIS_PURGE_ENABLED:-0}" \
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
       DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
@@ -269,6 +286,10 @@ verify() {
   MYSQL_MIGRATION_TEST_URL="${MYSQL_MIGRATION_TEST_URL:-${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}}" \
     pnpm run test:migrations
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:blob-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:outbox-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:usage-lifecycle-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:subject-lifecycle-mysql
@@ -287,6 +308,12 @@ verify() {
   pnpm run test:tenant-database-purge-memory
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-database-purge-mysql
+  pnpm run test:tenant-redis-purge-memory
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \
+    pnpm run test:tenant-redis-purge-mysql
+  REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \
+    pnpm run test:tenant-redis-purge-redis
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:retention-policy-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
@@ -307,6 +334,9 @@ verify() {
     CLUSTER_MYSQL_URL="${CLUSTER_MYSQL_URL:-mysql://root@127.0.0.1:3306/agent_service_cluster}" \
     CLUSTER_REDIS_URL="${CLUSTER_REDIS_URL:-redis://127.0.0.1:6379/3}" \
     pnpm vitest run test/cluster
+  CLUSTER_MYSQL_URL="${CLUSTER_MYSQL_URL:-mysql://root@127.0.0.1:3306/agent_service_cluster}" \
+    CLUSTER_REDIS_URL="${CLUSTER_REDIS_URL:-redis://127.0.0.1:6379/3}" \
+    pnpm run test:tenant-redis-purge-cluster
   pnpm run build:check
 }
 

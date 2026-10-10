@@ -13,6 +13,7 @@ import {
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+  TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   tenantRuntimeFleetSha256,
@@ -555,6 +556,84 @@ describe("RunnerRegistry owner address mapping", () => {
     await registry.refresh();
     expect(registry.allConfiguredSupportTenantDatabasePurge()).toBe(false);
     expect(registry.allConfiguredSupportTenantDatabasePurgeWorker()).toBe(false);
+    await registry.close();
+  });
+
+  it("requires every configured runner to target the exact Redis namespace and run T3g", async () => {
+    const expectedNamespace = "a".repeat(64);
+    let legacyState: "down" | "legacy" | "wrong-namespace" | "code-only" | "active" = "down";
+    const capabilities = (aware: boolean, worker: boolean, namespace = expectedNamespace) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        tenantRedisPurge: aware ? [TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1] : [],
+        tenantRedisPurgeWorker: worker,
+        tenantRedisPurgeNamespaceSha256: aware ? namespace : null,
+        dataPurgeExecution: false,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        if (legacyState === "legacy") {
+          const document = capabilities(false, false);
+          delete (document.features as Partial<typeof document.features>).tenantRedisPurge;
+          delete (document.features as Partial<typeof document.features>).tenantRedisPurgeWorker;
+          delete (document.features as Partial<typeof document.features>)
+            .tenantRedisPurgeNamespaceSha256;
+          return Response.json(document);
+        }
+        if (legacyState === "wrong-namespace") {
+          return Response.json(capabilities(true, true, "b".repeat(64)));
+        }
+        return Response.json(capabilities(true, legacyState === "active"));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      redisNamespaceSha256: expectedNamespace,
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allConfiguredSupportTenantRedisPurge()).toBe(false);
+    expect(registry.allConfiguredSupportTenantRedisPurgeWorker()).toBe(false);
+
+    for (const state of ["legacy", "wrong-namespace", "code-only"] as const) {
+      legacyState = state;
+      await registry.refresh();
+      expect(registry.allConfiguredSupportTenantRedisPurge()).toBe(state === "code-only");
+      expect(registry.allConfiguredSupportTenantRedisPurgeWorker()).toBe(false);
+    }
+
+    legacyState = "active";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantRedisPurge()).toBe(true);
+    expect(registry.allConfiguredSupportTenantRedisPurgeWorker()).toBe(true);
+    legacyState = "down";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantRedisPurge()).toBe(false);
+    expect(registry.allConfiguredSupportTenantRedisPurgeWorker()).toBe(false);
     await registry.close();
   });
 

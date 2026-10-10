@@ -135,6 +135,14 @@ export interface ClusterOptions {
   tenantCredentialRevocationExecutionEnabled?: boolean;
   /** Runs the local-database credential revocation worker on every runner. */
   tenantCredentialRevocationWorkerEnabled?: boolean;
+  /** Activates the router's exact-namespace T3g Redis deletion barrier. */
+  tenantRedisPurgeEnabled?: boolean;
+  /** Runs the Redis lease/fence/stream purge worker on every runner. */
+  tenantRedisPurgeWorkerEnabled?: boolean;
+  /** Non-secret logical identity shared by the router and Redis-purge-capable runners. */
+  redisNamespaceId?: string;
+  /** Redis key prefix shared by the router and runners. */
+  redisPrefix?: string;
   /** Activates the router's all-configured T3b broadcast gate. */
   tenantRuntimeDrainExecutionEnabled?: boolean;
   /** Activates each runner's private process-local T3b endpoint. */
@@ -163,6 +171,8 @@ export interface ClusterOptions {
   tenantErasureRequestsEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional mixed-rollout placement for the T3a worker activation signal. */
   tenantCredentialRevocationWorkerEnabledForRunner?: (runnerNumber: number) => boolean;
+  /** Optional mixed-rollout placement for the T3g worker activation signal. */
+  tenantRedisPurgeWorkerEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional mixed-rollout placement for the private T3b endpoint. */
   tenantRuntimeDrainEnabledForRunner?: (runnerNumber: number) => boolean;
   /** Optional mixed-rollout placement; a disabled configured target intentionally blocks v2 claims. */
@@ -208,11 +218,15 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
   // immutable router origin. The router itself still starts after the runner list is complete.
   const routerPort = await freePort();
   const routerUrl = `http://127.0.0.1:${routerPort}`;
+  const redisPrefix = opts.redisPrefix ?? "as";
+  const redisNamespaceId = opts.redisNamespaceId ?? "agent-service-cluster-db3";
 
   const runnerEnv = (id: string, port: number, runnerNumber: number): Record<string, string> => ({
     STORE: "mysql",
     MYSQL_URL,
     REDIS_URL,
+    REDIS_PREFIX: redisPrefix,
+    REDIS_NAMESPACE_ID: redisNamespaceId,
     RUNNER_ID: id,
     RUNNER_PORT: String(port),
     RUNNER_HOST: "127.0.0.1",
@@ -256,6 +270,10 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       opts.tenantCredentialRevocationWorkerEnabledForRunner?.(runnerNumber)
         ?? opts.tenantCredentialRevocationWorkerEnabled === true
     ) ? "1" : "0",
+    TENANT_REDIS_PURGE_WORKER_ENABLED: (
+      opts.tenantRedisPurgeWorkerEnabledForRunner?.(runnerNumber)
+        ?? opts.tenantRedisPurgeWorkerEnabled === true
+    ) ? "1" : "0",
     TENANT_RUNTIME_DRAIN_ENABLED: (
       opts.tenantRuntimeDrainEnabledForRunner?.(runnerNumber)
         ?? opts.tenantRuntimeDrainEnabled === true
@@ -298,6 +316,8 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       ...(opts.additionalRunnerUrls ?? []),
     ].join(","),
     REDIS_URL,
+    REDIS_PREFIX: redisPrefix,
+    REDIS_NAMESPACE_ID: redisNamespaceId,
     HEALTH_INTERVAL_MS: "300",
     UPSTREAM_HEADER_TIMEOUT_MS: erasureWorkerEnabled ? "1000" : "15000",
     INTERNAL_ROUTER_TOKEN,
@@ -305,6 +325,7 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     TENANT_ERASURE_REQUESTS_ENABLED: opts.tenantErasureRequestsEnabled ? "1" : "0",
     TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED:
       opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
+    TENANT_REDIS_PURGE_ENABLED: opts.tenantRedisPurgeEnabled ? "1" : "0",
     TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED:
       opts.tenantRuntimeDrainExecutionEnabled ? "1" : "0",
     TENANT_ERASURE_OPERATOR_TOKEN,

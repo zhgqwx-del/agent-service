@@ -22,4 +22,5 @@ export * from "./lifecycle/tenant-content-inventory-worker.js";
 export * from "./lifecycle/tenant-purge-plan-worker.js";
 export * from "./lifecycle/tenant-purge-execution-worker.js";
 export * from "./lifecycle/tenant-database-purge-worker.js";
+export * from "./lifecycle/tenant-redis-purge-worker.js";
 export * from "./lifecycle/tenant-runtime-coordinator.js";

@@ -32,6 +32,7 @@ import {
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+  TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
@@ -55,6 +56,7 @@ import {
   tenantRuntimeLocalReceiptSha256,
   tenantRuntimeTargetReceiptsSha256,
   tenantRuntimeTargetSha256,
+  tenantRedisNamespaceSha256,
 } from "../src/index.js";
 
 describe("protocol schemas", () => {
@@ -528,6 +530,47 @@ describe("protocol schemas", () => {
         tenantPurgeExecution: [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1],
         dataPurgeExecution: true,
       },
+    }).success).toBe(false);
+  });
+
+  it("advertises Redis purge additively and binds it to one namespace", () => {
+    const namespaceSha256 = tenantRedisNamespaceSha256("local-compose-db0", "as");
+    const enabled = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        tenantPurgeExecution: [
+          TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
+          TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+        ],
+        tenantRedisPurge: [TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1],
+        tenantRedisPurgeWorker: true,
+        tenantRedisPurgeNamespaceSha256: namespaceSha256,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    expect(enabled.features.tenantRedisPurge).toEqual([
+      TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
+    ]);
+    expect(enabled.features.tenantRedisPurgeWorker).toBe(true);
+    expect(enabled.features.tenantRedisPurgeNamespaceSha256).toBe(namespaceSha256);
+    expect(enabled.features.tenantPurgeExecution).toHaveLength(2);
+    expect(tenantRedisNamespaceSha256("local-compose-db0", "as")).toBe(namespaceSha256);
+    expect(tenantRedisNamespaceSha256("other-cluster", "as")).not.toBe(namespaceSha256);
+    expect(tenantRedisNamespaceSha256("local-compose-db0", "other")).not.toBe(namespaceSha256);
+    expect(() => tenantRedisNamespaceSha256("contains whitespace", "as")).toThrow();
+    expect(() => tenantRedisNamespaceSha256("local", "bad{tag}" )).toThrow();
+    expect(Capabilities.safeParse({
+      ...enabled,
+      features: { ...enabled.features, tenantRedisPurge: ["session-state-delete-v2"] },
     }).success).toBe(false);
   });
 

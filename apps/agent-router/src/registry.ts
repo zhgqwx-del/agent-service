@@ -13,6 +13,7 @@ import {
   PURGE_POLICY_EVALUATOR_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+  TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
@@ -48,6 +49,8 @@ export interface RunnerRegistryOptions {
   internalRouterToken?: string;
   redisUrl?: string;
   redisPrefix?: string;
+  /** Exact namespace identity required from every runner before T3g can execute. */
+  redisNamespaceSha256?: string;
   /** how often to poll readiness and protocol compatibility */
   healthIntervalMs?: number;
   /** virtual nodes per runner on the hash ring */
@@ -70,6 +73,14 @@ export interface TenantRuntimeDrainFleetSnapshot {
 }
 
 const TENANT_RUNTIME_READY_MAX_BYTES = 2_048;
+const OWNER_IF_NOT_PURGED = `
+if redis.call('EXISTS', KEYS[2]) == 1 then return false end
+return redis.call('HGET', KEYS[1], 'addr')
+`;
+const HAS_OWNER_IF_NOT_PURGED = `
+if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
+return redis.call('EXISTS', KEYS[1])
+`;
 
 async function readJsonCapped(response: Response, maxBytes: number): Promise<unknown> {
   if (!response.body) throw new Error("runner identity response has no body");
@@ -181,8 +192,16 @@ export class RunnerRegistry {
   async owner(sessionId: string): Promise<string | undefined> {
     if (!this.redis) return undefined;
     try {
-      const addr = await this.redis.hget(`${this.opts.redisPrefix ?? "as"}:lease:{${sessionId}}`, "addr");
-      return addr ? this.routeableUrl(addr) : undefined;
+      const prefix = this.opts.redisPrefix ?? "as";
+      const addr = await this.redis.eval(
+        OWNER_IF_NOT_PURGED,
+        2,
+        `${prefix}:lease:{${sessionId}}`,
+        `${prefix}:purge:{${sessionId}}`,
+      );
+      return typeof addr === "string" && addr.length > 0
+        ? this.routeableUrl(addr)
+        : undefined;
     } catch {
       return undefined; // the directory is a cache; losing it only costs an extra hop
     }
@@ -196,9 +215,13 @@ export class RunnerRegistry {
   async hasLeaseOwner(sessionId: string): Promise<boolean | undefined> {
     if (!this.redis) return undefined;
     try {
-      return await this.redis.exists(
-        `${this.opts.redisPrefix ?? "as"}:lease:{${sessionId}}`,
-      ) === 1;
+      const prefix = this.opts.redisPrefix ?? "as";
+      return Number(await this.redis.eval(
+        HAS_OWNER_IF_NOT_PURGED,
+        2,
+        `${prefix}:lease:{${sessionId}}`,
+        `${prefix}:purge:{${sessionId}}`,
+      )) === 1;
     } catch {
       return undefined;
     }
@@ -481,6 +504,27 @@ export class RunnerRegistry {
       ) === true
       && target.capabilities.features.tenantDatabasePurgeWorker === true
     ));
+  }
+
+  /** Every configured runner must understand T3g and target this exact Redis namespace. */
+  allConfiguredSupportTenantRedisPurge(): boolean {
+    const expectedNamespace = this.opts.redisNamespaceSha256;
+    const configured = this.list();
+    return expectedNamespace !== undefined && configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantRedisPurge.includes(
+        TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
+      ) === true
+      && target.capabilities.features.tenantRedisPurgeNamespaceSha256 === expectedNamespace
+    ));
+  }
+
+  /** Destructive authority additionally requires the T3g worker active on every configured runner. */
+  allConfiguredSupportTenantRedisPurgeWorker(): boolean {
+    return this.allConfiguredSupportTenantRedisPurge()
+      && this.list().every((target) => (
+        target.capabilities?.features.tenantRedisPurgeWorker === true
+      ));
   }
 
   /** Existing durable erasure jobs keep running even when admission of new requests is disabled. */

@@ -62,6 +62,7 @@ import {
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+  TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
   TenantErasureRequestHeaders,
@@ -171,6 +172,12 @@ export interface AppDeps {
   tenantPurgeExecutionWorkerEnabled?: boolean;
   /** Local T3f database-content worker activation; its router barrier remains independent. */
   tenantDatabasePurgeWorkerEnabled?: boolean;
+  /** T3g code-awareness is advertised only when a concrete Redis purge adapter is wired. */
+  tenantRedisPurgeSupported?: boolean;
+  /** Local T3g worker activation; its router barrier remains independent. */
+  tenantRedisPurgeWorkerEnabled?: boolean;
+  /** Hash of the operator-asserted Redis namespace/prefix targeted by the adapter. */
+  tenantRedisPurgeNamespaceSha256?: string;
   /** Narrow T3a store surface; its presence is the code-awareness signal advertised to routers. */
   tenantCredentialRevocation?: TenantCredentialRevocationStore;
   /** Narrow T3b runtime surface; main owns the coordinator and per-process boot identity. */
@@ -232,6 +239,8 @@ function governanceApiError(error: unknown): never {
 
 export function createApp(deps: AppDeps) {
   const app = new Hono<AuthEnv>();
+  const tenantRedisPurgeSupported = deps.tenantRedisPurgeSupported === true
+    && /^[0-9a-f]{64}$/.test(deps.tenantRedisPurgeNamespaceSha256 ?? "");
   const maxBlobBytes = deps.maxBlobBytes ?? deps.maxBodyBytes;
   if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > deps.maxBodyBytes) {
     throw new Error("maxBlobBytes must be a positive safe integer no larger than maxBodyBytes");
@@ -329,6 +338,15 @@ export function createApp(deps: AppDeps) {
         ],
         tenantPurgeExecutionWorker: deps.tenantPurgeExecutionWorkerEnabled === true,
         tenantDatabasePurgeWorker: deps.tenantDatabasePurgeWorkerEnabled === true,
+        tenantRedisPurge: tenantRedisPurgeSupported
+          ? [TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1]
+          : [],
+        tenantRedisPurgeWorker: tenantRedisPurgeSupported
+          && deps.tenantRedisPurgeWorkerEnabled === true,
+        tenantRedisPurgeNamespaceSha256:
+          tenantRedisPurgeSupported
+            ? deps.tenantRedisPurgeNamespaceSha256!
+            : null,
         tenantRuntimeDrain: deps.tenantRuntimeDrain === undefined
           ? []
           : [TENANT_RUNTIME_DRAIN_V1],

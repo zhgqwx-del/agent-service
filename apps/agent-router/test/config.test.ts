@@ -16,6 +16,9 @@ describe("router configuration", () => {
     expect(local.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED).toBe(false);
     expect(local.TENANT_PURGE_EXECUTION_ENABLED).toBe(false);
     expect(local.TENANT_DATABASE_PURGE_ENABLED).toBe(false);
+    expect(local.TENANT_REDIS_PURGE_ENABLED).toBe(false);
+    expect(local.REDIS_PREFIX).toBe("as");
+    expect(local.REDIS_NAMESPACE_ID).toBeUndefined();
     expect(local.TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED).toBe(false);
     expect(local.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
     expect(local.dataExportArtifactsReadable).toBe(false);
@@ -86,6 +89,30 @@ describe("router configuration", () => {
     expect(() => loadRouterConfig({
       RUNNERS: "http://runner:8787",
       TENANT_DATABASE_PURGE_ENABLED: "true",
+    })).toThrow();
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_REDIS_PURGE_ENABLED: "1",
+    })).toThrow(/REDIS_URL/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_REDIS_PURGE_ENABLED: "1",
+      REDIS_URL: "redis://redis:6379",
+    })).toThrow(/REDIS_NAMESPACE_ID/);
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_REDIS_PURGE_ENABLED: "1",
+      REDIS_URL: "redis://redis:6379",
+      REDIS_PREFIX: "service-a",
+      REDIS_NAMESPACE_ID: "local-compose-db0",
+    })).toMatchObject({
+      TENANT_REDIS_PURGE_ENABLED: true,
+      REDIS_PREFIX: "service-a",
+      REDIS_NAMESPACE_ID: "local-compose-db0",
+    });
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_REDIS_PURGE_ENABLED: "true",
     })).toThrow();
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",
