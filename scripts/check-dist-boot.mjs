@@ -9,6 +9,12 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MASTER_KEY = "77".repeat(32); // deterministic test-only key
 const canonicalOpenApi = JSON.parse(await readFile(resolve(ROOT, "packages/protocol/openapi.json"), "utf8"));
+const runnerBundleSource = await readFile(resolve(ROOT, "apps/agent-runner/dist/main.js"), "utf8");
+if (/(?:from\s+|import\s*\(|require\s*\(|__require\s*\()\s*["']@aws-sdk\/client-s3(?:\/[^"']*)?["']/.test(
+  runnerBundleSource,
+)) {
+  throw new Error("bundled runner retained a runtime @aws-sdk/client-s3 import");
+}
 
 async function freePort() {
   return new Promise((resolvePort, reject) => {
@@ -85,6 +91,10 @@ function cleanEnv() {
   // sourced .env cannot accidentally start a worker or expose a private execution surface here.
   for (const key of Object.keys(env)) {
     if ([
+      "AWS_",
+      "BLOB_",
+      "MINIO_",
+      "S3_TEST_",
       "TENANT_ERASURE_",
       "TENANT_CREDENTIAL_REVOCATION_",
       "TENANT_RUNTIME_",

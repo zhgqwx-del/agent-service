@@ -27,6 +27,7 @@ import { tenantRedisNamespaceSha256 } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService, PROVIDER_PRESETS } from "@agent-service/providers";
 import {
   FsBlobStore,
+  S3BlobStore,
   MemoryEventBus,
   MemoryLeaseStore,
   MemorySessionStore,
@@ -36,6 +37,8 @@ import {
   RedisSessionStatePurgeAdapter,
   SubjectDeletingError,
   type BlobCleanupStore,
+  type BlobStorageControlStore,
+  type BlobStore,
   type BlobManifestStore,
   type CredentialLifecycleStore,
   type EventBus,
@@ -64,6 +67,7 @@ import {
 } from "@agent-service/store";
 import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
+import { reconcileBlobStorageControl } from "./blob-storage-control.js";
 import { loadConfig } from "./config.js";
 import { RouterErasureSessionExecutor } from "./erasure-executor.js";
 import { RouterPurgePolicyEvaluationGate } from "./purge-policy-evaluation-gate.js";
@@ -85,6 +89,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & CredentialLifecycleStore
     & BlobManifestStore
     & BlobCleanupStore
+    & BlobStorageControlStore
     & SubjectLifecycleStore
     & TenantCredentialRevocationStore
     & TenantDatabasePurgeStore
@@ -201,7 +206,52 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ]);
     throw error;
   }
-  const blobStore = new FsBlobStore(cfg.BLOB_DIR);
+  const blobStore: BlobStore = cfg.BLOB_STORE === "s3"
+    ? new S3BlobStore({
+      bucket: cfg.BLOB_S3_BUCKET!,
+      namespaceId: cfg.BLOB_NAMESPACE_ID!,
+      prefix: cfg.BLOB_S3_PREFIX,
+      requestTimeoutMs: cfg.BLOB_S3_REQUEST_TIMEOUT_MS,
+      clientConfig: {
+        region: cfg.BLOB_S3_REGION,
+        forcePathStyle: cfg.BLOB_S3_FORCE_PATH_STYLE,
+        ...(cfg.BLOB_S3_ENDPOINT === undefined ? {} : { endpoint: cfg.BLOB_S3_ENDPOINT }),
+        ...(cfg.BLOB_S3_ACCESS_KEY_ID === undefined
+          ? {}
+          : {
+              credentials: {
+                accessKeyId: cfg.BLOB_S3_ACCESS_KEY_ID,
+                secretAccessKey: cfg.BLOB_S3_SECRET_ACCESS_KEY!,
+                ...(cfg.BLOB_S3_SESSION_TOKEN === undefined
+                  ? {}
+                  : { sessionToken: cfg.BLOB_S3_SESSION_TOKEN }),
+              },
+            }),
+      },
+    })
+    : new FsBlobStore(cfg.BLOB_DIR);
+  const activeBlobStorage = cfg.blobStorage;
+  let blobStorageControlGeneration: 0 | 1;
+  try {
+    if (blobStore instanceof S3BlobStore) {
+      await blobStore.validateStartup();
+    }
+    if (blobStore instanceof S3BlobStore) {
+      if (!activeBlobStorage || !cfg.BLOB_STORAGE_CONTROL_ENABLED) {
+        throw new Error("shared Blob storage requires an acknowledged durable control");
+      }
+    }
+    blobStorageControlGeneration = await reconcileBlobStorageControl(store, activeBlobStorage);
+  } catch (error) {
+    await Promise.all([
+      blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
+      tenantRedisPurgeAdapter?.close(),
+      bus.close(),
+      lease.close(),
+      store.close(),
+    ]);
+    throw error;
+  }
   const blobs = new SessionBlobService(store, blobStore, {
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
     maxHydratedBytes: cfg.BLOB_MAX_HYDRATED_BYTES,
@@ -499,6 +549,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     heartbeatMs: cfg.SSE_HEARTBEAT_MS,
     maxBodyBytes: cfg.MAX_BODY_BYTES,
     blobAttachmentsEnabled: cfg.BLOB_ATTACHMENTS_ENABLED,
+    ...(activeBlobStorage === undefined ? {} : { blobStorage: activeBlobStorage }),
     erasureRequestsEnabled: cfg.DATA_ERASURE_REQUESTS_ENABLED,
     legacyTombstoneCompensationEnabled: cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED,
     dataGovernanceManagementEnabled: cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
@@ -593,6 +644,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         lease.close(),
         bus.close(),
         tenantRedisPurgeAdapter?.close(),
+        blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
       ]);
       if (exitProcess) process.exit(0);
     })();
@@ -603,7 +655,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobStore=${cfg.BLOB_STORE} blobControl=${blobStorageControlGeneration} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,

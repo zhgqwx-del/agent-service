@@ -308,6 +308,8 @@ export interface UserDataExportSnapshotBlob extends UserDataExportAttachmentSnap
   ordinal: number;
   /** Worker-only physical identity. None of these fields may be serialized into the export. */
   storageBackend: string;
+  /** Present for snapshots pinned after the global shared-storage cutover. */
+  storageNamespaceSha256?: string;
   storageFormat: string;
   storageKey: string;
   sourceUploadToken: string;

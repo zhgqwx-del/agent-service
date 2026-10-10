@@ -412,6 +412,12 @@ describe("MemorySessionStore user data export", () => {
     const tenantId = "tenant-export-snapshot";
     const userId = "user-export-snapshot";
     await activatePolicy(store, tenantId);
+    const storageNamespaceSha256 = "b".repeat(64);
+    await store.activateBlobStorageControl({
+      expectedControlGeneration: 0,
+      storageBackend: "memory-v1",
+      namespaceSha256: storageNamespaceSha256,
+    });
     const active = sessionAt(tenantId, userId, BASE - 500);
     const archived = sessionAt(tenantId, userId, BASE - 400);
     const tombstoned = sessionAt(tenantId, userId, BASE - 300);
@@ -496,6 +502,7 @@ describe("MemorySessionStore user data export", () => {
       purpose: "tool_output",
       sha256: "a".repeat(64),
       sizeBytes: 128,
+      storageNamespaceSha256,
     });
     const publicAttachment = {
       blobId: blob.blobId,

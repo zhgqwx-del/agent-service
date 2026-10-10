@@ -21,6 +21,7 @@ import {
   tenantRuntimeTargetSha256,
 } from "@agent-service/protocol";
 import { RunnerRegistry } from "../src/registry.js";
+import type { BlobStorageCapability } from "@agent-service/protocol";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -49,6 +50,61 @@ describe("RunnerRegistry owner address mapping", () => {
     const ambiguous = new RunnerRegistry({ runners: ["http://runner-a:8787", "http://runner-b:8787"] });
     expect(ambiguous.toUrl("0.0.0.0:8787")).toBeUndefined();
     await ambiguous.close();
+  });
+
+  it("rejects a healthy shared-Blob fleet when any configured runner has another namespace", async () => {
+    const expected: BlobStorageCapability = {
+      backend: `s3-v1-${"a".repeat(24)}`,
+      shared: true,
+      namespaceSha256: "a".repeat(64),
+      controlGeneration: 1,
+    };
+    const mismatched: BlobStorageCapability = {
+      backend: `s3-v1-${"b".repeat(24)}`,
+      shared: true,
+      namespaceSha256: "b".repeat(64),
+      controlGeneration: 1,
+    };
+    const document = (blobStorage: BlobStorageCapability) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        blobAttachments: true,
+        blobStorage,
+        userDataExport: [USER_DATA_EXPORT_ARTIFACT_NDJSON_V1],
+        dataExportRequests: true,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/readyz")) return new Response("ready");
+      if (url.startsWith("http://runner-a/")) return Response.json(document(expected));
+      if (url.startsWith("http://runner-b/")) return Response.json(document(mismatched));
+      return new Response("not found", { status: 404 });
+    }));
+    const registry = new RunnerRegistry({
+      runners: ["http://runner-a", "http://runner-b"],
+      blobStorage: expected,
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+
+    expect(registry.supportsBlobAttachments("http://runner-a")).toBe(true);
+    expect(registry.supportsBlobAttachments("http://runner-b")).toBe(false);
+    expect(registry.allHealthySupportBlobAttachments()).toBe(false);
+    expect(registry.allHealthySupportUserDataExport()).toBe(false);
+    expect(registry.allConfiguredSupportUserDataExportAdmission()).toBe(false);
+    await registry.close();
   });
 
   it("admits only ready runners on the current protocol into routing", async () => {

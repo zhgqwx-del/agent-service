@@ -53,6 +53,8 @@ import {
   RetentionPolicyParams,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   tenantRuntimeFleetSha256,
+  blobS3Backend,
+  blobS3NamespaceSha256,
   tenantRuntimeLocalReceiptSha256,
   tenantRuntimeTargetReceiptsSha256,
   tenantRuntimeTargetSha256,
@@ -299,6 +301,7 @@ describe("protocol schemas", () => {
       },
     });
     expect(parsed.features.dataErasureRequests).toBe(false);
+    expect(parsed.features.blobStorage).toBeNull();
     expect(parsed.features.userErasureWorker).toEqual([]);
     expect(parsed.features.erasureJobControl).toEqual([]);
     expect(parsed.features.dataGovernance).toEqual([]);
@@ -315,6 +318,30 @@ describe("protocol schemas", () => {
     expect(parsed.features.tenantPurgeExecutionWorker).toBe(false);
     expect(parsed.features.tenantRuntimeDrain).toEqual([]);
     expect(parsed.features.tenantRuntimeDrainEndpoint).toBe(false);
+  });
+
+  it("binds shared Blob storage identity to the logical namespace, bucket, and prefix", () => {
+    const namespaceSha256 = blobS3NamespaceSha256(
+      "agent-service-local",
+      "agent-service-test",
+      "objects-v1",
+    );
+    expect(namespaceSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(blobS3Backend(namespaceSha256)).toBe(`s3-v1-${namespaceSha256.slice(0, 24)}`);
+    expect(blobS3NamespaceSha256(
+      "agent-service-local",
+      "agent-service-test",
+      "objects-v1",
+    )).toBe(namespaceSha256);
+    expect(blobS3NamespaceSha256(
+      "agent-service-local",
+      "agent-service-test",
+      "objects-v2",
+    )).not.toBe(namespaceSha256);
+    expect(() => blobS3NamespaceSha256("bad namespace", "agent-service-test", "objects-v1"))
+      .toThrow(/namespace/);
+    expect(() => blobS3NamespaceSha256("valid", "Bad_Bucket", "objects-v1"))
+      .toThrow(/bucket/);
   });
 
   it("binds T3b target, local receipt and fleet roots to canonical ordered evidence", () => {

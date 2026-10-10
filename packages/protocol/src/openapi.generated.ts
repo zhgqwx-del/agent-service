@@ -1078,6 +1078,39 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "blobStorage": {
+                "additionalProperties": false,
+                "default": null,
+                "properties": {
+                  "backend": {
+                    "pattern": "^[a-z0-9][a-z0-9._-]{0,31}$",
+                    "type": "string"
+                  },
+                  "controlGeneration": {
+                    "enum": [
+                      1
+                    ],
+                    "type": "number"
+                  },
+                  "namespaceSha256": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "shared": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "backend",
+                  "shared",
+                  "namespaceSha256",
+                  "controlGeneration"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
               "byok": {
                 "type": "boolean"
               },

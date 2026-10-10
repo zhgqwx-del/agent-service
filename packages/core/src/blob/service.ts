@@ -10,6 +10,7 @@ import {
 import {
   BLOB_STORAGE_FORMAT,
   TOOL_OUTPUT_CONTENT_TYPE,
+  blobStorageKey,
   type BlobBinding,
   type BlobDescriptor,
   type BlobManifest,
@@ -158,7 +159,7 @@ export class SessionBlobService {
     }
     const blobId = newId("blob");
     const uploadToken = randomUUID();
-    const storageKey = `objects/${blobId.slice(5, 7)}/${blobId}`;
+    const storageKey = blobStorageKey(blobId);
     const createdAtMs = Date.now();
     const expiresAtMs = createdAtMs + this.options.stagingTtlMs;
     await this.store.stageBlob({
@@ -418,7 +419,11 @@ export class SessionBlobService {
   }
 
   private async readVerified(manifest: BlobManifest): Promise<BlobObject> {
-    if (manifest.storageBackend !== this.objects.backend || manifest.storageFormat !== BLOB_STORAGE_FORMAT) {
+    if (
+      manifest.storageBackend !== this.objects.backend
+      || manifest.storageFormat !== BLOB_STORAGE_FORMAT
+      || manifest.storageKey !== blobStorageKey(manifest.blobId)
+    ) {
       throw new BlobDataError("blob storage adapter does not match the manifest");
     }
     if (manifest.sha256 === undefined || manifest.sizeBytes === undefined) {

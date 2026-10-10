@@ -4,6 +4,7 @@ import {
   BLOB_STORAGE_FORMAT,
   MemoryBlobStore,
   TOOL_OUTPUT_CONTENT_TYPE,
+  blobStorageKey,
   type BindableBlobLookup,
   type BlobManifest,
   type BlobManifestStore,
@@ -81,7 +82,7 @@ async function addReadyBlob(input: {
   contentType: string;
   principal?: Principal;
 }) {
-  const storageKey = `objects/aa/${input.id}`;
+  const storageKey = blobStorageKey(input.id);
   const uploadToken = `upload-${input.id.slice(-12)}`;
   const descriptor = await input.objects.putIfAbsent(storageKey, input.data, {
     uploadToken,

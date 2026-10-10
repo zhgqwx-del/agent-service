@@ -1,5 +1,6 @@
 export * from "./types.js";
 export * from "./blob-lifecycle.js";
+export * from "./blob-storage-control.js";
 export * from "./subject-lifecycle.js";
 export * from "./erasure-session.js";
 export * from "./erasure-catalog.js";
@@ -24,3 +25,7 @@ export { RedisEventBus } from "./redis/bus.js";
 export * from "./redis/keys.js";
 export * from "./redis/purge.js";
 export { FsBlobStore } from "./blob/fs.js";
+export {
+  S3BlobStore,
+  type S3BlobStoreOptions,
+} from "./blob/s3.js";

@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { chmod, link, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
@@ -12,6 +12,16 @@ import {
   type BlobStore,
 } from "../types.js";
 import {
+  BLOB_ENVELOPE_HEADER_BYTES,
+  BLOB_ENVELOPE_MAX_METADATA_BYTES,
+  blobDescriptorFor,
+  blobEnvelopeLengths,
+  decodeBlobDataEnvelope,
+  encodeBlobDataEnvelope,
+  inputByteLength,
+  sameBlobDescriptor,
+} from "./envelope.js";
+import {
   validateBlobContentType,
   validateBlobKey,
   validateBlobMaxBytes,
@@ -21,13 +31,6 @@ import {
 const LEGACY_REF_PREFIX = "file://";
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
-const ENVELOPE_MAGIC = Buffer.from("ASBLOB02", "ascii");
-const DIGEST_BYTES = 32;
-const METADATA_LENGTH_OFFSET = ENVELOPE_MAGIC.length;
-const PAYLOAD_LENGTH_OFFSET = METADATA_LENGTH_OFFSET + 4;
-const DIGEST_OFFSET = PAYLOAD_LENGTH_OFFSET + 4;
-const ENVELOPE_HEADER_BYTES = DIGEST_OFFSET + DIGEST_BYTES;
-const MAX_METADATA_BYTES = 16 * 1024;
 const UPLOAD_WAIT_ATTEMPTS = 1_000;
 const UPLOAD_WAIT_MS = 5;
 
@@ -45,96 +48,6 @@ async function unlinkIfExists(path: string) {
   } catch (error) {
     if (!isNotFound(error)) throw error;
   }
-}
-
-function inputByteLength(data: Buffer | string) {
-  return typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.byteLength;
-}
-
-function descriptorFor(storageKey: string, data: Buffer, contentType: string | undefined): BlobDescriptor {
-  return {
-    storageKey,
-    sha256: createHash("sha256").update(data).digest("hex"),
-    sizeBytes: data.byteLength,
-    contentType,
-  };
-}
-
-function sameDescriptor(left: BlobDescriptor, right: BlobDescriptor) {
-  return left.storageKey === right.storageKey
-    && left.sha256 === right.sha256
-    && left.sizeBytes === right.sizeBytes
-    && left.contentType === right.contentType;
-}
-
-function encodeEnvelope(payload: Buffer, contentType: string | undefined) {
-  const metadata = Buffer.from(JSON.stringify(contentType === undefined ? {} : { contentType }), "utf8");
-  if (metadata.length > MAX_METADATA_BYTES) throw new Error("blob metadata is too large");
-
-  const header = Buffer.allocUnsafe(ENVELOPE_HEADER_BYTES);
-  ENVELOPE_MAGIC.copy(header);
-  header.writeUInt32BE(metadata.length, METADATA_LENGTH_OFFSET);
-  header.writeUInt32BE(payload.length, PAYLOAD_LENGTH_OFFSET);
-  const digest = createHash("sha256")
-    .update(header.subarray(0, DIGEST_OFFSET))
-    .update(metadata)
-    .update(payload)
-    .digest();
-  digest.copy(header, DIGEST_OFFSET);
-  return Buffer.concat([header, metadata, payload]);
-}
-
-function hasEnvelopeMagic(data: Buffer) {
-  return data.length >= ENVELOPE_MAGIC.length && data.subarray(0, ENVELOPE_MAGIC.length).equals(ENVELOPE_MAGIC);
-}
-
-function envelopeLengths(header: Buffer) {
-  if (header.length < ENVELOPE_HEADER_BYTES || !hasEnvelopeMagic(header)) {
-    throw new Error("invalid blob envelope");
-  }
-  return {
-    metadataLength: header.readUInt32BE(METADATA_LENGTH_OFFSET),
-    payloadLength: header.readUInt32BE(PAYLOAD_LENGTH_OFFSET),
-  };
-}
-
-function decodeEnvelope(storageKey: string, envelope: Buffer): BlobObject {
-  const { metadataLength, payloadLength } = envelopeLengths(envelope);
-  const payloadOffset = ENVELOPE_HEADER_BYTES + metadataLength;
-  if (metadataLength > MAX_METADATA_BYTES || payloadOffset + payloadLength !== envelope.length) {
-    throw new Error("invalid blob envelope length");
-  }
-
-  const expectedDigest = envelope.subarray(DIGEST_OFFSET, DIGEST_OFFSET + DIGEST_BYTES);
-  const actualDigest = createHash("sha256")
-    .update(envelope.subarray(0, DIGEST_OFFSET))
-    .update(envelope.subarray(ENVELOPE_HEADER_BYTES, payloadOffset))
-    .update(envelope.subarray(payloadOffset))
-    .digest();
-  if (!timingSafeEqual(expectedDigest, actualDigest)) throw new Error("invalid blob envelope checksum");
-
-  let metadata: unknown;
-  try {
-    metadata = JSON.parse(envelope.subarray(ENVELOPE_HEADER_BYTES, payloadOffset).toString("utf8"));
-  } catch {
-    throw new Error("invalid blob metadata");
-  }
-  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) throw new Error("invalid blob metadata");
-  const keys = Object.keys(metadata);
-  if (keys.some((key) => key !== "contentType")) throw new Error("invalid blob metadata");
-
-  let contentType: string | undefined;
-  try {
-    const value = (metadata as { contentType?: unknown }).contentType;
-    if (value !== undefined && typeof value !== "string") throw new Error("invalid blob metadata");
-    contentType = validateBlobContentType(value);
-  } catch (error) {
-    if ((error as Error).message === "invalid blob metadata") throw error;
-    throw new Error("invalid blob metadata", { cause: error });
-  }
-
-  const data = Buffer.from(envelope.subarray(payloadOffset));
-  return { ...descriptorFor(storageKey, data, contentType), data };
 }
 
 async function readExactly(
@@ -326,12 +239,15 @@ export class FsBlobStore implements BlobStore {
     try {
       const stat = await handle.stat();
       if (!stat.isFile()) throw new Error("blob path is not a regular file");
-      if (stat.size < ENVELOPE_HEADER_BYTES) throw new Error("invalid blob envelope");
+      if (stat.size < BLOB_ENVELOPE_HEADER_BYTES) throw new Error("invalid blob envelope");
 
-      const header = Buffer.allocUnsafe(ENVELOPE_HEADER_BYTES);
-      await readExactly(handle, header, 0, ENVELOPE_HEADER_BYTES, 0);
-      const { metadataLength, payloadLength } = envelopeLengths(header);
-      if (metadataLength > MAX_METADATA_BYTES || ENVELOPE_HEADER_BYTES + metadataLength + payloadLength !== stat.size) {
+      const header = Buffer.allocUnsafe(BLOB_ENVELOPE_HEADER_BYTES);
+      await readExactly(handle, header, 0, BLOB_ENVELOPE_HEADER_BYTES, 0);
+      const { metadataLength, payloadLength } = blobEnvelopeLengths(header);
+      if (
+        metadataLength > BLOB_ENVELOPE_MAX_METADATA_BYTES
+        || BLOB_ENVELOPE_HEADER_BYTES + metadataLength + payloadLength !== stat.size
+      ) {
         throw new Error("invalid blob envelope length");
       }
       if (payloadLength > maxBytes) throw new BlobTooLargeError(storageKey, maxBytes, payloadLength);
@@ -342,11 +258,11 @@ export class FsBlobStore implements BlobStore {
       await readExactly(
         handle,
         envelope,
-        ENVELOPE_HEADER_BYTES,
-        stat.size - ENVELOPE_HEADER_BYTES,
-        ENVELOPE_HEADER_BYTES,
+        BLOB_ENVELOPE_HEADER_BYTES,
+        stat.size - BLOB_ENVELOPE_HEADER_BYTES,
+        BLOB_ENVELOPE_HEADER_BYTES,
       );
-      return decodeEnvelope(storageKey, envelope);
+      return decodeBlobDataEnvelope(storageKey, envelope);
     } finally {
       await handle.close();
     }
@@ -375,7 +291,7 @@ export class FsBlobStore implements BlobStore {
   private async legacyContentType(path: string, storageKey: string) {
     const metadataPath = `${path}.meta`;
     if (!(await this.assertSafeFile(metadataPath))) return undefined;
-    const bytes = await this.readRawPath(metadataPath, `${storageKey}.meta`, MAX_METADATA_BYTES);
+    const bytes = await this.readRawPath(metadataPath, `${storageKey}.meta`, BLOB_ENVELOPE_MAX_METADATA_BYTES);
     if (!bytes) return undefined;
     let metadata: unknown;
     try {
@@ -398,7 +314,7 @@ export class FsBlobStore implements BlobStore {
   }
 
   private assertSame(desired: BlobDescriptor, existing: BlobDescriptor) {
-    if (!sameDescriptor(desired, existing)) throw new BlobConflictError(desired.storageKey);
+    if (!sameBlobDescriptor(desired, existing)) throw new BlobConflictError(desired.storageKey);
     return desired;
   }
 
@@ -442,8 +358,8 @@ export class FsBlobStore implements BlobStore {
 
     // Copy only after the byte ceiling has been checked and before the first await yields control.
     const payload = Buffer.from(data);
-    const desired = descriptorFor(storageKey, payload, contentType);
-    const envelope = encodeEnvelope(payload, contentType);
+    const desired = blobDescriptorFor(storageKey, payload, contentType);
+    const envelope = encodeBlobDataEnvelope(payload, contentType);
     const target = await this.path(storageKey, true);
     if (!target) throw new Error("blob root is unavailable");
     const upload = this.uploadPaths(target, uploadToken);

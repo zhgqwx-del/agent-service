@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2、T3a、T3b、非破坏性 T3c/T3d、T3e 本地执行/物理 ACK、T3f 本地数据库内容/控制投影清理与 T3g session-scoped Redis状态清理均已进入本地/CI基线。`0022`固定33域plan；`0023`闭合local usage/Blob/export切片；`0024`原子清理11个本地数据库投影并留下永久session grave；`0025`以真实Redis Lua清理lease/owner、fence与stream并安装防复活marker；`0026`再为每个tenant、永久provider slot与tenant-auth CAS投影、不可变credential version及`external_credential`/`kms_key`两类target disposition建立默认休眠的版本化生命周期账本，并让T3a原子发布不含密钥、配置、header、URL或locator的inventory sidecar。legacy tenant明确记录`legacy_history_unknown`，新tenant在cutover后从创建起完整跟踪；provider/auth热读、写入CAS、删除重建ABA、T3a snapshot与terminal replay都会重验source、slot、version、时间和target集合。当前adapter没有可安全执行的远端locator或独立KMS key：有对应material、需要处置的target只会写`blocked_no_locator`、`blocked_shared_local_key`或`blocked_legacy_history`，无对应material则写`not_applicable`，从不伪造`executable_ref`。T3g及0026都不新增服务、进程或镜像。terminal继续固定`allDomainsComplete=false`、`contentPurgeExecuted=false`；external provider/KMS实际处置、backup与独立故障域restore ledger、logs/traces、共享对象存储生产适配、全域completion及generic user物理purge仍未闭环。公开status保持`gated`、`dataPurgeExecution=false`，因此M1仍未冻结。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2、T3a、T3b、非破坏性 T3c/T3d、T3e 本地执行/物理 ACK、T3f 本地数据库内容/控制投影清理与 T3g session-scoped Redis状态清理均已进入本地/CI基线。`0022`固定33域plan；`0023`闭合local usage/Blob/export切片；`0024`原子清理11个本地数据库投影并留下永久session grave；`0025`以真实Redis Lua清理lease/owner、fence与stream并安装防复活marker；`0026`建立default-dormant的versioned credential lifecycle inventory；`0027`再安装default-dormant、write-once的Blob storage control，并把共享S3-compatible/MinIO adapter、跨runner namespace capability和真实MinIO行为测试接入本地/CI。S3对象以同一key上的`ASBLOB02` data/tombstone envelope配合`If-None-Match`/`If-Match`线性化发布与删除，完整请求deadline覆盖credential/endpoint provider和transport；runner在监听和worker启动前检查bucket可达、从未启用versioning、无lifecycle规则、Object Lock关闭及条件写语义，再把`BLOB_NAMESPACE_ID + bucket + prefix`的非密钥digest与MySQL generation 1精确绑定。该cutover只允许空库或全部live manifest、未释放snapshot pin和未完成delete intent已使用同一backend/namespace的库激活，激活后filesystem回退或namespace漂移都会fail closed。当前external provider/KMS实际处置、backup与独立故障域restore ledger、logs/traces、existing-filesystem bytes的受审计搬迁、managed对象存储/IAM真实环境验收、全域completion及generic user物理purge仍未闭环；公开status保持`gated`、`dataPurgeExecution=false`，因此M1仍未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -42,8 +42,11 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0025 → 0026 的真实 MySQL 历史升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0026 → 0027 的真实 MySQL 历史升级夹具
 pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
+pnpm test:blob-storage-control-memory         # 强制执行 0027 Memory write-once cutover/回滚/并发套件
+pnpm test:blob-storage-control-mysql          # 强制执行 0027 真实InnoDB inventory/回滚/并发套件
+scripts/local-service.sh verify-s3            # 启动本地MinIO，执行真实S3协议与源码应用装配套件
 pnpm test:usage-lifecycle-mysql               # 强制执行 usage 双写/核对/匿名化真实 MySQL 专项套件
 pnpm test:subject-lifecycle-mysql             # 强制执行 subject gate/回滚/并发真实 MySQL 专项套件
 pnpm test:tenant-credential-revocation-mysql  # 强制执行 tenant 原子 fence、status proof、回滚、隔离和写入 race 真实 MySQL 套件
@@ -92,6 +95,20 @@ scripts/local-service.sh cleanup-idempotency --dry-run  # 检查/分批清理过
 scripts/local-service.sh stop
 ```
 
+默认`.env`仍使用单runner filesystem，适合最快的日常开发。要体验与多runner部署语义一致的共享S3数据面，请先在一次性网络可用环境构建仓库固定版本的官方MinIO源码，再启用`.env.example`中的S3块：
+
+```bash
+scripts/build-local-minio.sh
+# 在 .env 中设置 MINIO_ENABLED=1、BLOB_STORE=s3，并启用示例中的
+# BLOB_NAMESPACE_ID/BLOB_STORAGE_CONTROL_ENABLED/BLOB_S3_* 配置；不要提交 .env。
+scripts/local-service.sh start
+scripts/local-service.sh status
+scripts/local-service.sh smoke
+scripts/local-service.sh verify-s3
+```
+
+第一次以S3启动会把当前MySQL的`blob_storage_control`从generation `0`不可逆激活到`1`。请对可丢弃数据库体验；激活后不能改回filesystem，也不能仅修改bucket/prefix/namespace id来“迁移”数据。生产的`BLOB_S3_PRIVATE_BUCKET_ACK=1`只是操作者在独立验证匿名访问被拒、IAM/policy正确之后作出的确认，不是应用自动证明；本地MinIO保持`0`，真实MinIO套件会另行执行匿名raw GET拒绝检查。
+
 详细配置与未来 staging/production 部署契约见 `docs/operations/local-and-deployment.md`；面向项目学习、手动体验和 CI 构建产物的完整说明见 `docs/operations/development-and-ci-guide.md`。
 
 ## 部署形态
@@ -128,13 +145,13 @@ T3g 的 `TenantRedisPurgeWorker`仍内嵌于runner，不新增公开API、服务
 
 T3g由runner的`TENANT_REDIS_PURGE_WORKER_ENABLED`与router的`TENANT_REDIS_PURGE_ENABLED`双重默认关闭gate保护。两端必须用相同的非密钥`REDIS_NAMESPACE_ID`和`REDIS_PREFIX`绑定准确的Redis cluster/database/prefix，并向barrier声明相同namespace digest。fresh destructive gate只用于materialize新job和每一次**新的**Redis mutation；mutation前固定执行`fresh gate → renew claim → fresh gate`，任一检查失败都不调用首次写marker的Lua。worker lease必须至少是barrier timeout的两倍再加1秒，且第二次proof返回时续租耗时不得超过lease的一半，否则fail closed而不开始mutation。claim、existing-marker-only atomic replay、持久化或精确重放ACK、已有durable ACK的marker restore及全ACK后的seal不会扩大删除authority，因此不重新要求gate；existing-marker replay仅在exact marker已存在时按原bits再次删除三域，marker缺失绝不创建或删除。这样关闭router gate后仍可收口marker-only窗口。安全顺序是`0025` → marker-aware新router gate=`0`并完全排空旧router → marker-aware新runner worker=`0`并排空旧runner → 核对全部configured稳定地址、`session-state-delete-v1`和namespace digest → 逐实例开worker → 最后开router gate。首个marker/ACK/cutover后只能forward-fix；router gate可以暂停新materialize/mutation，但worker必须保持开启以完成existing-marker replay/ACK/seal及startup/periodic durable restore，且不得更换namespace identity或回退marker-unaware runtime。永久marker暂无GC、普通live-session fence灾备、managed Redis Cluster/ACL/持久化/故障切换与真实N-1 rollout仍需staging验证。
 
-`PURGE_POLICY_EVALUATOR_ENABLED` 是 runner/router 双端默认关闭的独立 gate。启用的 evaluator 每次 schedule/claim 前必须从 router 的 token-protected专用barrier取得固定ACK；router要求所有 configured稳定runner当前健康且声明`policy-evaluator-v1`。它只持有最小的evaluation store：按request绑定策略计算grace/内容/ready Blob/usage/receipt deadline，把per-session摘要写成build-generation不可变target，追加rooted decision，并且只对`eligible_execution_disabled`生成不可执行authority。seal时和后续调度都会复核live inventory与tenant/user hold generation/projection；evidence变化或hold ABA会撤销active投影并以新generation重评。该旧authority的deadline仍来自runner wall clock且target不是完整owner清单；`0021` T3c另行生成DB-clock `session_content_receipts`，`0023` T3e、`0024` T3f与`0025` T3g分别消费完整上游proof执行本地有限动作，但仍没有把0016候选、33域及external/KMS、backup与独立故障域restore ledger、logs/traces、共享对象存储生产适配等ACK汇总成completion proof，所以completion固定为`false`。
+`PURGE_POLICY_EVALUATOR_ENABLED` 是 runner/router 双端默认关闭的独立 gate。启用的 evaluator 每次 schedule/claim 前必须从 router 的 token-protected专用barrier取得固定ACK；router要求所有 configured稳定runner当前健康且声明`policy-evaluator-v1`。它只持有最小的evaluation store：按request绑定策略计算grace/内容/ready Blob/usage/receipt deadline，把per-session摘要写成build-generation不可变target，追加rooted decision，并且只对`eligible_execution_disabled`生成不可执行authority。seal时和后续调度都会复核live inventory与tenant/user hold generation/projection；evidence变化或hold ABA会撤销active投影并以新generation重评。该旧authority的deadline仍来自runner wall clock且target不是完整owner清单；`0021` T3c另行生成DB-clock `session_content_receipts`，`0023` T3e、`0024` T3f与`0025` T3g分别消费完整上游proof执行本地有限动作，但仍没有把0016候选、33域及external/KMS、backup与独立故障域restore ledger、logs/traces、managed对象存储/IAM真实环境ACK等证据汇总成completion proof，所以completion固定为`false`。
 
 canonical policy / legal-hold 管理 API 也默认关闭：runner 与 router 都设置 `DATA_GOVERNANCE_MANAGEMENT_ENABLED=1`，且全部 configured runner 同时声明 code-aware `dataGovernance` 和 management-active `dataGovernanceManagement` 后才开放。策略版本不可变，`active` 是保留路由名；activation 使用 generation CAS，提交即生效，不是未来定时任务。七个 duration 字段中的 `null` 均表示 fail-closed、没有授权到期。tenant/user 可并存多个 hold，release 只释放指定 hold；任何 active hold都会阻止后续匿名化/物理 purge，但不会恢复已经隐藏的数据。该管理面只建立后续执行边界可审计的authority，不会自行匿名化、删除或把 request 标记 completed；T3e/T3f/T3g仍须在各自原子边界重新验证canonical hold。
 
-user data export 同样采用默认关闭的 writer gate。runner/router 都设置 `DATA_EXPORT_REQUESTS_ENABLED=1`，全部 configured runner 当前健康并声明 `userDataExport=["artifact-ndjson-v1"]` 且选中 runner 仍启用 admission 后，才接受 admin service key 代表明确 user 发起的 `POST /v1/data-export-requests`；必须携带 `Idempotency-Key`，并要求 active retention policy 的 `exportArtifactTtlMs` 为正值。build/cleanup worker 与 admission 分离，已有 job 在关闭 POST 后仍可 forward-fix。下载逐分片校验并持有有上限的 durable lease，普通 TTL 会等待活动下载；subject erasure 会撤销请求并使制品进入独立 delete outbox。当前制品使用 runner 独占的 filesystem BlobStore，故只允许本地单 runner；`NODE_ENV=production` 下任一 export flag 都 fail-closed，直到共享对象存储适配器完成。
+user data export 同样采用默认关闭的 writer gate。runner/router 都设置 `DATA_EXPORT_REQUESTS_ENABLED=1`，全部 configured runner 当前健康并声明 `userDataExport=["artifact-ndjson-v1"]` 且选中 runner 仍启用 admission 后，才接受 admin service key 代表明确 user 发起的 `POST /v1/data-export-requests`；必须携带 `Idempotency-Key`，并要求 active retention policy 的 `exportArtifactTtlMs` 为正值。build/cleanup worker 与 admission 分离，已有 job 在关闭 POST 后仍可 forward-fix。下载逐分片校验并持有有上限的 durable lease，普通 TTL 会等待活动下载；subject erasure 会撤销请求并使制品进入独立 delete outbox。filesystem制品仍只允许本地单runner；S3模式则通过`0027`的write-once control和fleet namespace capability提供共享读写/cleanup，但上生产前仍需在真实managed对象存储上验收IAM、匿名访问、条件写、故障和容量边界。
 
-本地统一入口当前启动单个 router、单个 runner，并把 Blob 写入 runner 独占的 `.local-run/blobs`。Blob 上传另有 `BLOB_ATTACHMENTS_ENABLED` 显式 gate，router 还会检查全部健康 runner 的 `blobAttachments` capability；当前 filesystem adapter 同时要求显式 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`。它不能作为多 VM/多 Pod 共享存储，production runner 对 filesystem 写入和 cleanup 都会 fail closed；接入共享 OSS/S3 adapter 前不得在生产开启这两个工作循环。
+本地统一入口当前启动单个 router、单个 runner；默认把Blob写入runner独占的`.local-run/blobs`，也可按上文切换到本地MinIO。Blob上传另有`BLOB_ATTACHMENTS_ENABLED`显式gate，router还会检查全部健康runner的`blobAttachments`及共享storage capability。filesystem模式必须显式`BLOB_FILESYSTEM_SINGLE_RUNNER=1`，不能作为多VM/多Pod共享存储，production writer/cleanup继续fail closed；S3模式必须`STORE=mysql`、`BLOB_STORAGE_CONTROL_ENABLED=1`、全部fleet使用同一namespace digest，并由runner独占存储凭据，router只接收非密钥namespace/bucket/prefix身份。
 
 ## API 速览（对外经 `apps/agent-router`）
 
@@ -177,11 +194,11 @@ apps/agent-runner      Hono HTTP + SSE；鉴权；幂等；路由 → SessionHos
 apps/agent-router      无状态路由；owner 目录、一致性哈希、SSE 透传与安全重路由
 packages/protocol      资源 / 事件 / 错误 schema（zod）
 packages/sdk           从 OpenAPI 生成的 TypeScript 路由类型、类型化客户端与 SSE 流式辅助函数
-packages/store         SessionStore / LeaseStore / EventBus / BlobStore 接口；ownership manifest 与 Blob delete outbox；memory、MySQL（fenced commit）、Redis（Lua 租约、Streams 热重放、session-state purge marker）实现；migrations/
+packages/store         SessionStore / LeaseStore / EventBus / BlobStore 接口；ownership manifest 与 Blob delete outbox；memory、filesystem、共享S3-compatible、MySQL（fenced commit）、Redis（Lua 租约、Streams 热重放、session-state purge marker）实现；migrations/
 packages/core          AgentEngine 接口 + PiEngine（pi-agent-core 适配）；SessionHost（租约续期、write-ahead、审批门、安全阀、Blob/崩溃修复）；上下文装配；内置工具，以及 lifecycle/Blob/erasure/export 内嵌 workers
 packages/providers     BYOK provider 配置 → pi Model；密钥加密；国内厂商 preset
 packages/testkit       假厂商与跨包测试夹具
-deploy/local           本机 redis / mysql 启停脚本
+deploy/local           本机 Redis / MySQL / 可选MinIO启停脚本与本地Compose定义
 scripts/               本地服务生命周期、验收、验证与维护入口
 spikes/pi-embed        pi 嵌入验证（保留作回归参考）
 docs/                  调研、设计

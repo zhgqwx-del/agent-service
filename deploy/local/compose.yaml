@@ -19,3 +19,40 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       retries: 20
+  # Build the repository-pinned official source commit instead of trusting an unpinned runtime
+  # image. This is local/test infrastructure, not an agent-service product image.
+  minio:
+    image: agent-service/minio:RELEASE.2025-09-07T16-13-09Z
+    build:
+      context: ../..
+      dockerfile: deploy/local/Dockerfile.minio
+    command: --quiet --anonymous server /data --address ":9000" --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentservice-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-agent-service-local-minio-only-0001}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+  minio-init:
+    # The bootstrap script resolves the AWS SDK from the already-installed workspace. The fixed
+    # Node tag is a local-only convenience; production object storage is externally managed.
+    image: node:24.11.1-bookworm-slim@sha256:48abc13a19400ca3985071e287bd405a1d99306770eb81d61202fb6b65cf0b57
+    working_dir: /workspace
+    depends_on:
+      minio:
+        condition: service_started
+    volumes:
+      - ../..:/workspace:ro
+    environment:
+      S3_TEST_ENDPOINT: http://minio:9000
+      S3_TEST_REGION: us-east-1
+      S3_TEST_BUCKET: ${MINIO_BUCKET:-agent-service-local}
+      S3_TEST_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-agentservice-local}
+      S3_TEST_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-agent-service-local-minio-only-0001}
+      S3_TEST_FORCE_PATH_STYLE: "1"
+    command: ["node", "packages/store/scripts/bootstrap-s3.mjs", "--wait"]
+
+volumes:
+  minio-data:

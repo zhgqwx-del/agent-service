@@ -79,6 +79,7 @@ const SNAPSHOT_RECORD_KIND_INDEX = new Map(
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const ARTIFACT_ID = /^xart_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const STORAGE_BACKEND = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 
 class LostUserDataExportClaimError extends Error {
   constructor() {
@@ -98,6 +99,13 @@ class ArtifactPoisonError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ArtifactPoisonError";
+  }
+}
+
+class StorageAdapterUnavailableError extends Error {
+  constructor() {
+    super("data export storage adapter is unavailable");
+    this.name = "StorageAdapterUnavailableError";
   }
 }
 
@@ -213,8 +221,9 @@ function validateSnapshotBlob(
     || !SHA256.test(blob.sha256)
     || !Number.isSafeInteger(blob.sizeBytes)
     || blob.sizeBytes < 0
-    || !blob.storageBackend
-    || !blob.storageFormat
+    || !STORAGE_BACKEND.test(blob.storageBackend)
+    || (blob.storageNamespaceSha256 !== undefined && !SHA256.test(blob.storageNamespaceSha256))
+    || blob.storageFormat !== BLOB_STORAGE_FORMAT
     || !blob.storageKey
     || !blob.sourceUploadToken
     || blob.sourceUploadToken.length > 128
@@ -242,7 +251,6 @@ function publicAttachment(blob: UserDataExportSnapshotBlob): UserDataExportAttac
 function validateArtifact(
   artifact: UserDataExportArtifactRecord,
   claim: UserDataExportClaim,
-  backend: string,
 ): void {
   if (
     !ARTIFACT_ID.test(artifact.artifactId)
@@ -254,7 +262,7 @@ function validateArtifact(
     || artifact.format !== USER_DATA_EXPORT_FORMAT
     || artifact.schemaVersion !== USER_DATA_EXPORT_SCHEMA_VERSION
     || artifact.contentType !== USER_DATA_EXPORT_CONTENT_TYPE
-    || artifact.storageBackend !== backend
+    || !STORAGE_BACKEND.test(artifact.storageBackend)
     || artifact.storageFormat !== BLOB_STORAGE_FORMAT
     || artifact.policyVersion !== claim.policyVersion
     || artifact.policySha256 !== claim.policySha256
@@ -275,14 +283,13 @@ function validatePartIdentity(
   claim: UserDataExportClaim,
   partNumber: number,
   expectedStorageKey: string,
-  backend: string,
 ): void {
   if (
     part.artifactId !== artifact.artifactId
     || part.requestId !== claim.requestId
     || part.buildGeneration !== claim.buildGeneration
     || part.partNumber !== partNumber
-    || part.storageBackend !== backend
+    || !STORAGE_BACKEND.test(part.storageBackend)
     || part.storageFormat !== BLOB_STORAGE_FORMAT
     || part.storageKey !== expectedStorageKey
     || !/^[a-z0-9_-]{1,128}$/.test(part.uploadToken)
@@ -298,6 +305,18 @@ function validatePartIdentity(
     ))
     || (part.state === "uploaded" && !Number.isSafeInteger(part.uploadedAtMs))
   ) throw new ArtifactPoisonError("artifact part identity is invalid");
+}
+
+function requireBlobBackend(storageBackend: string, blob: BlobStore): void {
+  if (storageBackend !== blob.backend) throw new StorageAdapterUnavailableError();
+}
+
+function requireSnapshotBlobAdapter(snapshot: UserDataExportSnapshotBlob, blob: BlobStore): void {
+  if (
+    snapshot.storageBackend !== blob.backend
+    || snapshot.storageNamespaceSha256 !== blob.namespaceSha256
+    || (blob.shared === true && blob.namespaceSha256 === undefined)
+  ) throw new StorageAdapterUnavailableError();
 }
 
 /**
@@ -439,7 +458,8 @@ export class UserDataExportWorker {
       build = await this.deps.store.getUserDataExportArtifactBuild(auth);
       artifact = build.artifact ?? artifact;
     }
-    validateArtifact(artifact, claim, this.deps.blob.backend);
+    validateArtifact(artifact, claim);
+    requireBlobBackend(artifact.storageBackend, this.deps.blob);
     if (artifact.snapshotRootSha256 !== summary.snapshotRootSha256) {
       throw new ArtifactPoisonError("artifact build does not match the sealed snapshot");
     }
@@ -462,8 +482,8 @@ export class UserDataExportWorker {
         claim,
         part.partNumber,
         expectedStorageKey,
-        this.deps.blob.backend,
       );
+      requireBlobBackend(part.storageBackend, this.deps.blob);
       existingParts.set(part.partNumber, part);
     }
 
@@ -574,9 +594,7 @@ export class UserDataExportWorker {
           throw new SnapshotPoisonError("snapshot attachments are not in canonical order");
         }
         previousBlobLogicalKey = logicalKey;
-        if (blob.storageBackend !== this.deps.blob.backend || blob.storageFormat !== BLOB_STORAGE_FORMAT) {
-          throw new ArtifactPoisonError("snapshot attachment storage adapter is unavailable");
-        }
+        requireSnapshotBlobAdapter(blob, this.deps.blob);
         if (blob.sizeBytes > this.opts.maxSourceBlobBytes) {
           throw new ArtifactPoisonError("snapshot attachment exceeds the configured read ceiling");
         }
@@ -700,7 +718,8 @@ export class UserDataExportWorker {
       });
       existingParts.set(partNumber, part);
     }
-    validatePartIdentity(part, artifact, claim, partNumber, storageKey, this.deps.blob.backend);
+    validatePartIdentity(part, artifact, claim, partNumber, storageKey);
+    requireBlobBackend(part.storageBackend, this.deps.blob);
 
     if (part.state === "uploaded") {
       const stored: BlobDescriptor = {
@@ -736,7 +755,8 @@ export class UserDataExportWorker {
       partNumber,
       descriptor,
     });
-    validatePartIdentity(uploaded, artifact, claim, partNumber, storageKey, this.deps.blob.backend);
+    validatePartIdentity(uploaded, artifact, claim, partNumber, storageKey);
+    requireBlobBackend(uploaded.storageBackend, this.deps.blob);
     if (
       uploaded.state !== "uploaded"
       || uploaded.sha256 !== expected.sha256

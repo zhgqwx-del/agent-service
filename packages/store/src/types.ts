@@ -738,6 +738,10 @@ export class BlobTooLargeError extends Error {
 export interface BlobStore {
   /** Stable adapter identity recorded by the manifest; changing it requires an explicit migration. */
   readonly backend: string;
+  /** True only for an adapter whose object namespace may be shared by multiple runners. */
+  readonly shared?: boolean;
+  /** Stable, non-secret identity of the configured shared namespace, when one exists. */
+  readonly namespaceSha256?: string;
   /**
    * Create-only write. An exact byte/content-type retry is idempotent; a non-identical value at the
    * same server-generated key fails with BlobConflictError and is never overwritten.

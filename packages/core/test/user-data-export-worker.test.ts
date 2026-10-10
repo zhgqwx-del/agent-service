@@ -58,6 +58,8 @@ interface StoredBlob {
 
 class FakeBlobStore implements BlobStore {
   readonly backend = "memory-v1";
+  shared?: boolean;
+  namespaceSha256?: string;
   readonly objects = new Map<string, StoredBlob>();
   readonly puts: Array<{ storageKey: string; uploadToken: string }> = [];
   readonly gets: string[] = [];
@@ -147,6 +149,7 @@ function exportFixture(options: {
   buildGeneration?: number;
   payloads?: string[];
   attachment?: boolean;
+  storageNamespaceSha256?: string;
 }): ExportFixture {
   const buildGeneration = options.buildGeneration ?? 1;
   const payloads = options.payloads ?? ["owned session"];
@@ -183,6 +186,9 @@ function exportFixture(options: {
     buildGeneration,
     ordinal: 0,
     storageBackend: "memory-v1",
+    ...(options.storageNamespaceSha256 === undefined
+      ? {}
+      : { storageNamespaceSha256: options.storageNamespaceSha256 }),
     storageFormat: BLOB_STORAGE_FORMAT,
     storageKey: "objects/source_export_blob",
     sourceUploadToken: "source-upload-token",
@@ -534,12 +540,16 @@ function harness(options: {
   payloads?: string[];
   attachment?: boolean;
   seedSource?: boolean;
+  storageNamespaceSha256?: string;
 } = {}) {
   const requestId = options.requestId ?? newUserDataExportRequestId();
   const fixture = exportFixture({
     requestId,
     ...(options.payloads === undefined ? {} : { payloads: options.payloads }),
     ...(options.attachment === undefined ? {} : { attachment: options.attachment }),
+    ...(options.storageNamespaceSha256 === undefined
+      ? {}
+      : { storageNamespaceSha256: options.storageNamespaceSha256 }),
   });
   const store = new FakeExportJobStore(fixture, requestId);
   const blob = new FakeBlobStore();
@@ -598,6 +608,7 @@ describe("UserDataExportWorker", () => {
     const serializedArtifact = complete.toString("utf8");
     for (const forbidden of [
       "storageBackend",
+      "storageNamespaceSha256",
       "storageFormat",
       "storageKey",
       "sourceUploadToken",
@@ -747,6 +758,87 @@ describe("UserDataExportWorker", () => {
     }
     expect(await worker.processOnce()).toBe(1);
     expect(store.attempts).toBe(4);
+  });
+
+  it.each(["artifact", "part"] as const)(
+    "keeps a persisted %s backend mismatch retryable beyond the poison cap",
+    async (kind) => {
+      const { store, blob } = harness({ attachment: false });
+      if (kind === "artifact") store.startFailureAfterCommit = true;
+      else store.stageFailureAfterCommit = true;
+      const worker = new UserDataExportWorker(
+        { store, blob, logger: silent },
+        { ...builderOptions, poisonMaxAttempts: 2 },
+      );
+
+      expect(await worker.processOnce()).toBe(0);
+      if (kind === "artifact") store.artifact = { ...store.artifact!, storageBackend: "other-v1" };
+      else {
+        const part = store.parts.get(0)!;
+        store.parts.set(0, { ...part, storageBackend: "other-v1" });
+      }
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        expect(await worker.processOnce()).toBe(0);
+        expect(store.dead).toBe(false);
+        expect(store.retryCalls.at(-1)).toEqual({ delayMs: 1, errorCode: "temporary_failure" });
+      }
+      expect(store.ready).toBe(false);
+    },
+  );
+
+  it.each(["backend", "namespace"] as const)(
+    "keeps a source storage %s mismatch retryable beyond the poison cap",
+    async (mismatch) => {
+      const namespaceSha256 = "e".repeat(64);
+      const { store, blob, fixture } = harness(
+        mismatch === "namespace" ? { storageNamespaceSha256: namespaceSha256 } : {},
+      );
+      if (mismatch === "backend") fixture.blobs[0]!.storageBackend = "other-v1";
+      else {
+        blob.shared = true;
+        blob.namespaceSha256 = "f".repeat(64);
+      }
+      const worker = new UserDataExportWorker(
+        { store, blob, logger: silent },
+        { ...builderOptions, poisonMaxAttempts: 2 },
+      );
+
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        expect(await worker.processOnce()).toBe(0);
+        expect(store.dead).toBe(false);
+        expect(store.retryCalls.at(-1)).toEqual({ delayMs: 1, errorCode: "temporary_failure" });
+      }
+      expect(blob.gets).toHaveLength(0);
+    },
+  );
+
+  it("accepts a snapshot pinned to the configured shared-storage namespace", async () => {
+    const namespaceSha256 = "e".repeat(64);
+    const { store, blob } = harness({ storageNamespaceSha256: namespaceSha256 });
+    blob.shared = true;
+    blob.namespaceSha256 = namespaceSha256;
+    const worker = new UserDataExportWorker({ store, blob, logger: silent }, builderOptions);
+
+    expect(await worker.processOnce()).toBe(1);
+    expect(store.ready).toBe(true);
+  });
+
+  it("bounds a malformed snapshot namespace as snapshot poison", async () => {
+    const { store, blob, fixture } = harness();
+    fixture.blobs[0]!.storageNamespaceSha256 = "not-a-sha256";
+    const worker = new UserDataExportWorker(
+      { store, blob, logger: silent },
+      { ...builderOptions, poisonMaxAttempts: 1 },
+    );
+
+    expect(await worker.processOnce()).toBe(0);
+    expect(store.dead).toBe(true);
+    expect(store.retryCalls.at(-1)).toEqual({
+      delayMs: 1,
+      errorCode: "snapshot_invalid",
+      maxAttempts: 1,
+    });
+    expect(blob.gets).toHaveLength(0);
   });
 
   it("produces byte-identical partitions for the same sealed input", async () => {
@@ -901,6 +993,24 @@ describe("UserDataExportCleanupWorker", () => {
     }
     expect(await worker.cleanupOnce()).toBe(1);
     expect(store.row.attempts).toBe(4);
+  });
+
+  it("keeps an artifact backend mismatch retryable beyond the deterministic poison cap", async () => {
+    const store = new FakeExportCleanupStore();
+    store.row = { ...pendingDelete(), storageBackend: "other-v1" };
+    const blob = new FakeBlobStore();
+    const worker = new UserDataExportCleanupWorker(
+      { store, blob, logger: silent },
+      { retryBaseMs: 1, retryMaxMs: 1, poisonMaxAttempts: 2 },
+    );
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      expect(await worker.cleanupOnce()).toBe(0);
+      expect(store.row.deadLetteredAtMs).toBeUndefined();
+      expect(store.retries.at(-1)?.maxAttempts).toBeUndefined();
+    }
+    expect(store.row.attempts).toBe(3);
+    expect(blob.deletes).toHaveLength(0);
   });
 
   it("bounds malformed artifact identities without touching the object adapter", async () => {

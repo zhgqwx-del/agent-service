@@ -19,6 +19,10 @@ describe("runner configuration", () => {
     expect(cfg.LIFECYCLE_OUTBOX_BATCH_SIZE).toBe(50);
     expect(cfg.LIFECYCLE_OUTBOX_LEASE_MS).toBe(10_000);
     expect(cfg.BLOB_FILESYSTEM_SINGLE_RUNNER).toBe(false);
+    expect(cfg.BLOB_STORE).toBe("filesystem");
+    expect(cfg.BLOB_S3_PRIVATE_BUCKET_ACK).toBe(false);
+    expect(cfg.BLOB_S3_REQUEST_TIMEOUT_MS).toBe(5_000);
+    expect(cfg.blobStorage).toBeUndefined();
     expect(cfg.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
@@ -705,6 +709,85 @@ describe("runner configuration", () => {
     expect(cfg.BLOB_FILESYSTEM_SINGLE_RUNNER).toBe(true);
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(true);
     expect(cfg.BLOB_ATTACHMENTS_ENABLED).toBe(true);
+  });
+
+  it("accepts a validated shared S3 namespace without the filesystem single-runner assertion", () => {
+    const cfg = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      STORE: "mysql",
+      BLOB_STORE: "s3",
+      BLOB_NAMESPACE_ID: "local-object-store-v1",
+      BLOB_S3_ENDPOINT: "http://127.0.0.1:9000/",
+      BLOB_S3_BUCKET: "agent-service-local",
+      BLOB_S3_PREFIX: "objects-v1",
+      BLOB_S3_FORCE_PATH_STYLE: "1",
+      BLOB_S3_ACCESS_KEY_ID: "local-access",
+      BLOB_S3_SECRET_ACCESS_KEY: "local-secret",
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+      BLOB_CLEANUP_ENABLED: "1",
+      BLOB_ATTACHMENTS_ENABLED: "1",
+      DATA_EXPORT_WORKER_ENABLED: "1",
+      DATA_EXPORT_CLEANUP_ENABLED: "1",
+    });
+    expect(cfg.BLOB_S3_ENDPOINT).toBe("http://127.0.0.1:9000");
+    expect(cfg.BLOB_FILESYSTEM_SINGLE_RUNNER).toBe(false);
+    expect(cfg.dataExportArtifactsReadable).toBe(true);
+    expect(cfg.blobStorage).toEqual({
+      backend: expect.stringMatching(/^s3-v1-[0-9a-f]{24}$/),
+      shared: true,
+      namespaceSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      controlGeneration: 1,
+    });
+  });
+
+  it("fails closed on incomplete or unsafe S3 configuration", () => {
+    const base = {
+      SECRETS_MASTER_KEY: SECRET,
+      STORE: "mysql",
+      BLOB_STORE: "s3",
+      BLOB_NAMESPACE_ID: "local-object-store-v1",
+      BLOB_S3_BUCKET: "agent-service-local",
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+    };
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      BLOB_STORE: "s3",
+      BLOB_NAMESPACE_ID: "local-object-store-v1",
+      BLOB_S3_BUCKET: "agent-service-local",
+    })).toThrow(/BLOB_STORAGE_CONTROL_ENABLED=1/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      BLOB_STORE: "s3",
+      BLOB_NAMESPACE_ID: "local-object-store-v1",
+      BLOB_S3_BUCKET: "agent-service-local",
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+    })).toThrow(/STORE=mysql/);
+    expect(() => loadConfig({ ...base, BLOB_NAMESPACE_ID: undefined })).toThrow(/BLOB_NAMESPACE_ID/);
+    expect(() => loadConfig({ ...base, BLOB_S3_BUCKET: undefined })).toThrow(/BLOB_S3_BUCKET/);
+    expect(() => loadConfig({ ...base, BLOB_S3_BUCKET: "bad..bucket" })).toThrow(/safe DNS/);
+    expect(() => loadConfig({ ...base, BLOB_FILESYSTEM_SINGLE_RUNNER: "1" })).toThrow(/must be 0/);
+    expect(() => loadConfig({ ...base, BLOB_S3_ACCESS_KEY_ID: "only-one-half" })).toThrow(/configured together/);
+    expect(() => loadConfig({ ...base, BLOB_S3_SESSION_TOKEN: "orphan-token" })).toThrow(/requires static/);
+    expect(() => loadConfig({ ...base, BLOB_S3_REQUEST_TIMEOUT_MS: "99" })).toThrow();
+    expect(() => loadConfig({ ...base, BLOB_S3_ENDPOINT: "http://user:password@127.0.0.1:9000" }))
+      .toThrow(/must not contain credentials/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+    })).toThrow(/must be 0/);
+    expect(() => loadConfig({
+      ...productionEnv,
+      ...base,
+      BLOB_S3_ENDPOINT: "http://minio.internal:9000",
+    })).toThrow(/must use https/);
+    const productionS3 = {
+      ...productionEnv,
+      ...base,
+      BLOB_S3_ENDPOINT: "https://s3.internal",
+    };
+    expect(() => loadConfig(productionS3)).toThrow(/BLOB_S3_PRIVATE_BUCKET_ACK=1/);
+    expect(loadConfig({ ...productionS3, BLOB_S3_PRIVATE_BUCKET_ACK: "1" }).BLOB_S3_PRIVATE_BUCKET_ACK)
+      .toBe(true);
   });
 
   it("validates blob allocation and cleanup worker bounds", () => {

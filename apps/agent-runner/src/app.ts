@@ -86,6 +86,7 @@ import {
   UserErasureDrainRequest,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   type Capabilities,
+  type BlobStorageCapability,
   type BlobUploadResponse,
   ImageMediaType,
   type Event,
@@ -146,6 +147,8 @@ export interface AppDeps {
   maxBodyBytes: number;
   /** Accept new attachment uploads. Reads remain available while this rolling-upgrade gate is off. */
   blobAttachmentsEnabled?: boolean;
+  /** Content-free identity used by routers to reject split object-store fleets. */
+  blobStorage?: BlobStorageCapability;
   /** Raw upload ceiling. Main validates that this is no larger than maxBodyBytes. */
   maxBlobBytes?: number;
   /** Additive rollout gate; must stay off until every writer checks the durable subject gate. */
@@ -294,6 +297,7 @@ export function createApp(deps: AppDeps) {
         approvals: true,
         sessionLifecycle: ["archive", "unarchive", "tombstone"],
         blobAttachments: deps.blobAttachmentsEnabled === true,
+        blobStorage: deps.blobStorage ?? null,
         dataErasureRequests: deps.erasureRequestsEnabled === true
           && deps.legacyTombstoneCompensationEnabled === true
           && deps.subjectLifecycle !== undefined,

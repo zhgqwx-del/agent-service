@@ -110,6 +110,18 @@ import {
   type StageBlobInput,
 } from "./blob-lifecycle.js";
 import {
+  BLOB_STORAGE_CONTROL_SINGLETON_ID,
+  BlobStorageControlConflictError,
+  BlobStorageControlIntegrityError,
+  blobStorageControlEvidenceSha256,
+  validateActivateBlobStorageControlInput,
+  validateBlobStorageControlRecord,
+  type ActivateBlobStorageControlInput,
+  type ActiveBlobStorageControlRecord,
+  type BlobStorageControlRecord,
+  type BlobStorageControlStore,
+} from "./blob-storage-control.js";
+import {
   UsageIdentityConflictError,
   UsageLifecycleGenerationError,
   UsageReconciliationError,
@@ -1058,7 +1070,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1074,6 +1086,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   blobManifests = new Map<string, BlobManifest>();
   blobDeleteOutbox = new Map<string, BlobDeleteOutboxRecord>();
   private nextBlobDeleteOutboxId = 1;
+  blobStorageControls = new Map<1, BlobStorageControlRecord>([[
+    BLOB_STORAGE_CONTROL_SINGLETON_ID,
+    { singletonId: BLOB_STORAGE_CONTROL_SINGLETON_ID, controlGeneration: 0 },
+  ]]);
   tenants = new Map<string, MemoryTenantRecord>();
   billingUsageFacts = new Map<string, BillingUsageFact>();
   usageReconciliations = new Map<string, UsageReconciliationRecord>();
@@ -16302,9 +16318,106 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return paginate(rows, (s) => s.id, opts.cursor, opts.limit, "desc");
   }
 
+  // ---------- blob storage write-once control ----------
+  private readMemoryBlobStorageControl(): BlobStorageControlRecord {
+    const control = this.blobStorageControls.get(BLOB_STORAGE_CONTROL_SINGLETON_ID);
+    if (!control || this.blobStorageControls.size !== 1) {
+      throw new BlobStorageControlIntegrityError();
+    }
+    validateBlobStorageControlRecord(control);
+    return control;
+  }
+
+  private hasBlobStorageIdentityConflict(
+    storageBackend: string,
+    namespaceSha256: string,
+  ): boolean {
+    if ([...this.blobManifests.values()].some((row) => (
+      row.state !== "deleted" && row.storageBackend !== storageBackend
+    ))) return true;
+    if ([...this.userDataExportArtifacts.values()].some((row) => (
+      row.state !== "deleted" && row.storageBackend !== storageBackend
+    ))) return true;
+    if ([...this.userDataExportParts.values()].some((row) => (
+      row.state !== "deleted" && row.storageBackend !== storageBackend
+    ))) return true;
+    if ([...this.userDataExportSnapshotBlobs.values()].some((rows) => rows.some((row) => (
+      row.releasedAtMs === undefined
+      && (
+        row.storageBackend !== storageBackend
+        || row.storageNamespaceSha256 !== namespaceSha256
+      )
+    )))) return true;
+    if ([...this.blobDeleteOutbox.values()].some((row) => (
+      row.completedAtMs === undefined
+      && row.storageBackend !== storageBackend
+    ))) return true;
+    return [...this.userDataExportDeleteOutbox.values()].some((row) => (
+      row.completedAtMs === undefined
+      && row.storageBackend !== storageBackend
+    ));
+  }
+
+  private assertBlobStorageBackendAllowed(storageBackend: string): void {
+    const control = this.readMemoryBlobStorageControl();
+    if (control.controlGeneration === 1 && control.storageBackend !== storageBackend) {
+      throw new BlobStorageControlConflictError();
+    }
+  }
+
+  async getBlobStorageControl(): Promise<BlobStorageControlRecord> {
+    return clone(this.readMemoryBlobStorageControl());
+  }
+
+  async activateBlobStorageControl(
+    input: ActivateBlobStorageControlInput,
+  ): Promise<ActiveBlobStorageControlRecord> {
+    const stagedInput = clone(input);
+    validateActivateBlobStorageControlInput(stagedInput);
+    const current = this.readMemoryBlobStorageControl();
+    if (current.controlGeneration === 1) {
+      if (
+        current.storageBackend !== stagedInput.storageBackend
+        || current.namespaceSha256 !== stagedInput.namespaceSha256
+        || this.hasBlobStorageIdentityConflict(
+          current.storageBackend,
+          current.namespaceSha256,
+        )
+      ) throw new BlobStorageControlConflictError();
+      return clone(current);
+    }
+    if (this.hasBlobStorageIdentityConflict(
+      stagedInput.storageBackend,
+      stagedInput.namespaceSha256,
+    )) {
+      throw new BlobStorageControlConflictError();
+    }
+    const activatedAtDbMs = this.storeNowMs();
+    const body = {
+      singletonId: BLOB_STORAGE_CONTROL_SINGLETON_ID,
+      controlGeneration: 1 as const,
+      storageBackend: stagedInput.storageBackend,
+      namespaceSha256: stagedInput.namespaceSha256,
+      activatedAtDbMs,
+    };
+    const activated: ActiveBlobStorageControlRecord = {
+      ...body,
+      evidenceSha256: blobStorageControlEvidenceSha256(body),
+    };
+    const before = new Map(this.blobStorageControls);
+    try {
+      this.blobStorageControls.set(BLOB_STORAGE_CONTROL_SINGLETON_ID, clone(activated));
+    } catch (error) {
+      restoreMapSnapshot(this.blobStorageControls, before);
+      throw error;
+    }
+    return clone(activated);
+  }
+
   // ---------- blob ownership manifest ----------
   async stageBlob(input: StageBlobInput): Promise<void> {
     validateStageBlobInput(input);
+    this.assertBlobStorageBackendAllowed(input.storageBackend);
     const session = this.sessions.get(input.sessionId);
     if (
       !session
@@ -18582,6 +18695,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (input.storageFormat !== BLOB_STORAGE_FORMAT) {
       throw new Error("unsupported data export storage format");
     }
+    this.assertBlobStorageBackendAllowed(input.storageBackend);
     const now = this.userDataExportNow();
     const state = this.activeUserDataExportClaim(authorization, now);
     if (!state || !this.isUserDataExportSubjectCurrent(state.request)) {
@@ -18655,6 +18769,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     authorization: UserDataExportAuthorization,
   ): Promise<UserDataExportSnapshotSummary> {
     const now = this.userDataExportNow();
+    const blobStorageControl = this.readMemoryBlobStorageControl();
     const state = this.activeUserDataExportClaim(authorization, now);
     if (!state || !this.isUserDataExportSubjectCurrent(state.request)) {
       throw new UserDataExportStateError("stale data export claim");
@@ -18922,6 +19037,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           requestId: authorization.requestId,
           buildGeneration: authorization.buildGeneration,
           storageBackend: manifest.storageBackend,
+          ...(blobStorageControl.controlGeneration === 1 ? {
+            storageNamespaceSha256: blobStorageControl.namespaceSha256,
+          } : {}),
           storageFormat: manifest.storageFormat,
           storageKey: manifest.storageKey,
           sourceUploadToken: manifest.uploadToken,
@@ -19131,6 +19249,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     }
     validateBlobKey(input.storageKey);
     validateBlobUploadToken(input.uploadToken);
+    this.assertBlobStorageBackendAllowed(input.storageBackend);
     if (input.storageKey !== userDataExportStorageKey(
       { tenantId: authorization.tenantId, userId: authorization.userId },
       authorization.requestId,

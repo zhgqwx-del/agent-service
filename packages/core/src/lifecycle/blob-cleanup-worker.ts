@@ -3,6 +3,7 @@ import { isCanonicalId } from "@agent-service/protocol";
 import {
   BLOB_STORAGE_FORMAT,
   BlobStateError,
+  blobStorageKey,
   type BlobCleanupStore,
   type BlobDeleteOutboxRecord,
   type BlobStore,
@@ -57,6 +58,7 @@ function hasValidIdentity(row: BlobDeleteOutboxRecord, claimToken: string): bool
     && row.attempts > 0
     && row.claimToken === claimToken
     && validStorageKey(row.storageKey)
+    && row.storageKey === blobStorageKey(row.blobId)
     && UPLOAD_TOKEN.test(row.uploadToken);
 }
 
@@ -143,12 +145,14 @@ export class BlobCleanupWorker {
   }
 
   private async deleteClaimed(row: BlobDeleteOutboxRecord, claimToken: string): Promise<boolean> {
-    if (
-      !hasValidIdentity(row, claimToken)
-      || row.storageBackend !== this.deps.blob.backend
-      || row.storageFormat !== BLOB_STORAGE_FORMAT
-    ) {
-      await this.retry(row, claimToken, new Error("invalid blob delete identity or storage adapter"), true);
+    if (!hasValidIdentity(row, claimToken) || row.storageFormat !== BLOB_STORAGE_FORMAT) {
+      await this.retry(row, claimToken, new Error("invalid blob delete identity"), true);
+      return false;
+    }
+    if (row.storageBackend !== this.deps.blob.backend) {
+      // A rolling adapter/configuration transition is recoverable. Keep the durable intent pending
+      // until a worker with the recorded backend is available; never dead-letter it as corruption.
+      await this.retry(row, claimToken, new Error("blob delete storage adapter is unavailable"), false);
       return false;
     }
 

@@ -1,3 +1,8 @@
+import {
+  blobS3Backend,
+  blobS3NamespaceSha256,
+  type BlobStorageCapability,
+} from "@agent-service/protocol";
 import { z } from "zod";
 
 const Env = z.object({
@@ -17,6 +22,16 @@ const Env = z.object({
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(1_000_000),
   /** Must match the runner's raw blob ceiling; applies only to the binary upload route. */
   BLOB_MAX_BYTES: z.coerce.number().int().positive().default(1_000_000),
+  BLOB_STORE: z.enum(["filesystem", "s3"]).default("filesystem"),
+  /** Non-secret namespace inputs only; the router never receives S3 credentials or an endpoint. */
+  BLOB_NAMESPACE_ID: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional(),
+  BLOB_S3_BUCKET: z.string().min(3).max(63).optional(),
+  BLOB_S3_PREFIX: z.string()
+    .regex(/^[a-z0-9_-]{1,128}(?:\/[a-z0-9_-]{1,128})*$/)
+    .max(256)
+    .default("agent-service-v1"),
+  /** Fleet acknowledgement that the database is pinned to this exact shared namespace. */
+  BLOB_STORAGE_CONTROL_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** Explicit acknowledgement that the current Blob fleet is exactly one filesystem-backed runner. */
   BLOB_FILESYSTEM_SINGLE_RUNNER: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** Explicit expand→activate gate for blob writes across the whole healthy fleet. */
@@ -91,9 +106,30 @@ export type RouterConfig = Omit<z.infer<typeof Env>, "INTERNAL_ROUTER_TOKEN"> & 
   INTERNAL_ROUTER_TOKEN: string;
   /** The bundled filesystem artifact path is readable only in a single-runner local topology. */
   dataExportArtifactsReadable: boolean;
+  /** Expected full namespace identity; used to reject split-brain runner configurations. */
+  blobStorage?: BlobStorageCapability;
 };
 
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
+const ROUTER_ALLOWED_BLOB_S3_ENV = new Set(["BLOB_S3_BUCKET", "BLOB_S3_PREFIX"]);
+const ROUTER_FORBIDDEN_CREDENTIAL_ENV = new Set([
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+  "AWS_SECURITY_TOKEN",
+  "AWS_PROFILE",
+  "AWS_DEFAULT_PROFILE",
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "AWS_CONFIG_FILE",
+  "AWS_CREDENTIAL_FILE",
+  "AWS_WEB_IDENTITY_TOKEN_FILE",
+  "AWS_ROLE_ARN",
+  "AWS_ROLE_SESSION_NAME",
+  "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+  "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+]);
 
 function validateRunnerUrl(value: string): string {
   let parsed: URL;
@@ -111,10 +147,55 @@ function validateRunnerUrl(value: string): string {
   return parsed.origin;
 }
 
+function validateS3Bucket(value: string): string {
+  if (
+    !/^[a-z0-9][a-z0-9.-]+[a-z0-9]$/.test(value)
+    || value.includes("..")
+    || value.includes(".-")
+    || value.includes("-.")
+    || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)
+  ) throw new Error("BLOB_S3_BUCKET must be a safe DNS-style bucket name");
+  return value;
+}
+
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
+  const runnerOnlyKey = Object.keys(env).find((key) => (
+    (key.startsWith("BLOB_S3_") && !ROUTER_ALLOWED_BLOB_S3_ENV.has(key))
+    || key.startsWith("MINIO_ROOT_")
+    || key.startsWith("AWS_SSO_")
+    || ROUTER_FORBIDDEN_CREDENTIAL_ENV.has(key)
+  ) && env[key] !== undefined);
+  if (runnerOnlyKey) {
+    throw new Error(`${runnerOnlyKey} is runner-only object-store authority and must not enter the router process`);
+  }
   const c = Env.parse(env);
   const runnerList = [...new Set(c.RUNNERS.split(",").map((s) => s.trim()).filter(Boolean).map(validateRunnerUrl))];
   const internalRouterToken = c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN;
+  let blobStorage: BlobStorageCapability | undefined;
+  if (c.BLOB_STORE === "s3") {
+    if (!c.BLOB_NAMESPACE_ID) throw new Error("BLOB_NAMESPACE_ID is required when BLOB_STORE=s3");
+    if (!c.BLOB_S3_BUCKET) throw new Error("BLOB_S3_BUCKET is required when BLOB_STORE=s3");
+    const namespaceSha256 = blobS3NamespaceSha256(
+      c.BLOB_NAMESPACE_ID,
+      validateS3Bucket(c.BLOB_S3_BUCKET),
+      c.BLOB_S3_PREFIX,
+    );
+    blobStorage = {
+      backend: blobS3Backend(namespaceSha256),
+      shared: true,
+      namespaceSha256,
+      controlGeneration: 1,
+    };
+    if (c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
+      throw new Error("BLOB_FILESYSTEM_SINGLE_RUNNER must be 0 when BLOB_STORE=s3");
+    }
+  }
+  if (c.BLOB_STORE === "s3" && !c.BLOB_STORAGE_CONTROL_ENABLED) {
+    throw new Error("BLOB_STORAGE_CONTROL_ENABLED=1 is required when BLOB_STORE=s3");
+  }
+  if (c.BLOB_STORE === "filesystem" && c.BLOB_STORAGE_CONTROL_ENABLED) {
+    throw new Error("BLOB_STORAGE_CONTROL_ENABLED must be 0 when BLOB_STORE=filesystem");
+  }
   if (!runnerList.length) throw new Error("RUNNERS must list at least one runner base url");
   if (runnerList.length > 100) throw new Error("RUNNERS must list at most 100 runner base urls");
   if (c.NODE_ENV === "production" && !c.INTERNAL_ROUTER_TOKEN) {
@@ -123,23 +204,23 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   if (c.BLOB_MAX_BYTES > c.MAX_BODY_BYTES) {
     throw new Error("BLOB_MAX_BYTES must not exceed MAX_BODY_BYTES");
   }
-  if (c.BLOB_FILESYSTEM_SINGLE_RUNNER && runnerList.length !== 1) {
+  if (c.BLOB_STORE === "filesystem" && c.BLOB_FILESYSTEM_SINGLE_RUNNER && runnerList.length !== 1) {
     throw new Error("BLOB_FILESYSTEM_SINGLE_RUNNER=1 requires RUNNERS to contain exactly one runner");
   }
-  if (c.BLOB_ATTACHMENTS_ENABLED && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
+  if (c.BLOB_STORE === "filesystem" && c.BLOB_ATTACHMENTS_ENABLED && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
     throw new Error("BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required before BLOB_ATTACHMENTS_ENABLED=1");
   }
-  if (c.NODE_ENV === "production" && c.BLOB_ATTACHMENTS_ENABLED) {
+  if (c.NODE_ENV === "production" && c.BLOB_STORE === "filesystem" && c.BLOB_ATTACHMENTS_ENABLED) {
     throw new Error(
       "filesystem Blob writes are unsupported in production until a shared object-store adapter is configured",
     );
   }
-  if (c.DATA_EXPORT_REQUESTS_ENABLED && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
+  if (c.BLOB_STORE === "filesystem" && c.DATA_EXPORT_REQUESTS_ENABLED && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
     throw new Error(
       "BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required before DATA_EXPORT_REQUESTS_ENABLED=1",
     );
   }
-  if (c.NODE_ENV === "production" && c.DATA_EXPORT_REQUESTS_ENABLED) {
+  if (c.NODE_ENV === "production" && c.BLOB_STORE === "filesystem" && c.DATA_EXPORT_REQUESTS_ENABLED) {
     throw new Error(
       "filesystem user-export artifacts are unsupported in production until a shared object-store adapter is configured",
     );
@@ -182,6 +263,8 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     INTERNAL_ROUTER_TOKEN: internalRouterToken,
     runnerList,
     dataExportArtifactsReadable:
-      c.NODE_ENV !== "production" && c.BLOB_FILESYSTEM_SINGLE_RUNNER,
+      c.BLOB_STORE === "s3"
+      || (c.NODE_ENV !== "production" && c.BLOB_FILESYSTEM_SINGLE_RUNNER),
+    ...(blobStorage === undefined ? {} : { blobStorage }),
   };
 }

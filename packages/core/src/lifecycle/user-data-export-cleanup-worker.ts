@@ -144,12 +144,12 @@ export class UserDataExportCleanupWorker {
   }
 
   private async deleteClaimed(row: UserDataExportDeleteOutboxRecord, claimToken: string): Promise<boolean> {
-    if (
-      !hasValidIdentity(row, claimToken)
-      || row.storageBackend !== this.deps.blob.backend
-      || row.storageFormat !== BLOB_STORAGE_FORMAT
-    ) {
+    if (!hasValidIdentity(row, claimToken) || row.storageFormat !== BLOB_STORAGE_FORMAT) {
       await this.retry(row, claimToken, new Error("invalid export artifact delete identity"), true);
+      return false;
+    }
+    if (row.storageBackend !== this.deps.blob.backend) {
+      await this.retry(row, claimToken, new Error("export artifact storage adapter is unavailable"), false);
       return false;
     }
 

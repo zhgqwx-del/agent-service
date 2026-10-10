@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import {
+  blobS3Backend,
+  blobS3NamespaceSha256,
+  type BlobStorageCapability,
+} from "@agent-service/protocol";
 import { z } from "zod";
 
 /** Transport must remain open after the Host's bounded abort window to receive its final 409/204. */
@@ -17,12 +22,36 @@ const Env = z.object({
   REDIS_PREFIX: z.string().regex(/^[A-Za-z0-9._:-]{1,64}$/).default("as"),
   /** Non-secret logical identity shared by every process that targets the same Redis namespace. */
   REDIS_NAMESPACE_ID: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional(),
+  BLOB_STORE: z.enum(["filesystem", "s3"]).default("filesystem"),
+  /** Non-secret logical identity; changing it is an explicit object migration. */
+  BLOB_NAMESPACE_ID: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional(),
   BLOB_DIR: z.string().default("./.data/blobs"),
   /**
    * Explicit acknowledgement that this process is the only runner using BLOB_DIR.
    * The filesystem adapter is not a shared multi-replica object store.
    */
   BLOB_FILESYSTEM_SINGLE_RUNNER: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  BLOB_S3_ENDPOINT: z.string().trim().min(1).optional(),
+  BLOB_S3_REGION: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).default("us-east-1"),
+  BLOB_S3_BUCKET: z.string().min(3).max(63).optional(),
+  BLOB_S3_PREFIX: z.string()
+    .regex(/^[a-z0-9_-]{1,128}(?:\/[a-z0-9_-]{1,128})*$/)
+    .max(256)
+    .default("agent-service-v1"),
+  BLOB_S3_FORCE_PATH_STYLE: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /**
+   * Operator attestation that anonymous/public reads are denied by the bucket and its surrounding
+   * account policy. Portable S3 APIs cannot prove every provider-specific public-access path.
+   */
+  BLOB_S3_PRIVATE_BUCKET_ACK: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Hard ceiling for one S3 request and response stream; durable workers retry after it expires. */
+  BLOB_S3_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(5_000),
+  /** Optional static local credentials. Production may instead use the SDK's workload identity chain. */
+  BLOB_S3_ACCESS_KEY_ID: z.string().min(1).max(128).optional(),
+  BLOB_S3_SECRET_ACCESS_KEY: z.string().min(1).max(512).optional(),
+  BLOB_S3_SESSION_TOKEN: z.string().min(1).max(4096).optional(),
+  /** One-way database cutover acknowledgement required by every shared-store runner. */
+  BLOB_STORAGE_CONTROL_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** Writer rollout gate. Readers remain enabled while this is off. */
   BLOB_ATTACHMENTS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /** Local orphan cleanup gate; a future shared adapter may also use it during rollout. */
@@ -220,6 +249,8 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   runnerAddr: string;
   /** The bundled filesystem adapter is readable only in an explicitly single-runner local topology. */
   dataExportArtifactsReadable: boolean;
+  /** Present only for a cross-runner object namespace whose exact identity can be fleet-checked. */
+  blobStorage?: BlobStorageCapability;
 };
 
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
@@ -273,6 +304,36 @@ function validateErasureRouterUrl(value: string): string {
   return parsed.origin;
 }
 
+function validateS3Bucket(value: string): string {
+  if (
+    !/^[a-z0-9][a-z0-9.-]+[a-z0-9]$/.test(value)
+    || value.includes("..")
+    || value.includes(".-")
+    || value.includes("-.")
+    || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)
+  ) throw new Error("BLOB_S3_BUCKET must be a safe DNS-style bucket name");
+  return value;
+}
+
+function validateS3Endpoint(value: string, production: boolean): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("BLOB_S3_ENDPOINT must be an absolute http(s) origin");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("BLOB_S3_ENDPOINT must be an absolute http(s) origin");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname && parsed.pathname !== "/")) {
+    throw new Error("BLOB_S3_ENDPOINT must not contain credentials, a path, query parameters, or a fragment");
+  }
+  if (production && parsed.protocol !== "https:") {
+    throw new Error("BLOB_S3_ENDPOINT must use https in production");
+  }
+  return parsed.origin;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (
     env.TENANT_ERASURE_OPERATOR_TOKEN !== undefined
@@ -284,6 +345,50 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   }
   const c = Env.parse(env);
   const production = c.NODE_ENV === "production";
+  const s3Endpoint = c.BLOB_S3_ENDPOINT === undefined
+    ? undefined
+    : validateS3Endpoint(c.BLOB_S3_ENDPOINT, production);
+  if ((c.BLOB_S3_ACCESS_KEY_ID === undefined) !== (c.BLOB_S3_SECRET_ACCESS_KEY === undefined)) {
+    throw new Error("BLOB_S3_ACCESS_KEY_ID and BLOB_S3_SECRET_ACCESS_KEY must be configured together");
+  }
+  if (c.BLOB_S3_SESSION_TOKEN !== undefined && c.BLOB_S3_ACCESS_KEY_ID === undefined) {
+    throw new Error("BLOB_S3_SESSION_TOKEN requires static S3 credentials");
+  }
+  let blobStorage: BlobStorageCapability | undefined;
+  if (c.BLOB_STORE === "s3") {
+    if (!c.BLOB_NAMESPACE_ID) throw new Error("BLOB_NAMESPACE_ID is required when BLOB_STORE=s3");
+    if (!c.BLOB_S3_BUCKET) throw new Error("BLOB_S3_BUCKET is required when BLOB_STORE=s3");
+    const bucket = validateS3Bucket(c.BLOB_S3_BUCKET);
+    const namespaceSha256 = blobS3NamespaceSha256(
+      c.BLOB_NAMESPACE_ID,
+      bucket,
+      c.BLOB_S3_PREFIX,
+    );
+    blobStorage = {
+      backend: blobS3Backend(namespaceSha256),
+      shared: true,
+      namespaceSha256,
+      controlGeneration: 1,
+    };
+    if (c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
+      throw new Error("BLOB_FILESYSTEM_SINGLE_RUNNER must be 0 when BLOB_STORE=s3");
+    }
+  }
+  if (c.BLOB_STORE === "s3" && !c.BLOB_STORAGE_CONTROL_ENABLED) {
+    throw new Error("BLOB_STORAGE_CONTROL_ENABLED=1 is required when BLOB_STORE=s3");
+  }
+  if (c.BLOB_STORE === "s3" && c.STORE !== "mysql") {
+    throw new Error("STORE=mysql is required when BLOB_STORE=s3 so the storage cutover is durable");
+  }
+  if (production && c.BLOB_STORE === "s3" && !c.BLOB_S3_PRIVATE_BUCKET_ACK) {
+    throw new Error(
+      "BLOB_S3_PRIVATE_BUCKET_ACK=1 is required in production after independently verifying "
+        + "that anonymous/public bucket access is denied",
+    );
+  }
+  if (c.BLOB_STORE === "filesystem" && c.BLOB_STORAGE_CONTROL_ENABLED) {
+    throw new Error("BLOB_STORAGE_CONTROL_ENABLED must be 0 when BLOB_STORE=filesystem");
+  }
   if (c.TENANT_RUNTIME_DRAIN_ENABLED && !c.RUNNER_ID) {
     throw new Error(
       "RUNNER_ID is required when TENANT_RUNTIME_DRAIN_ENABLED=1 so the configured fleet slot "
@@ -310,12 +415,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1",
     );
   }
-  if (production && (c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED)) {
+  if (production && c.BLOB_STORE === "filesystem" && (c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED)) {
     throw new Error(
       "filesystem Blob writes and cleanup are unsupported in production until a shared object-store adapter is configured",
     );
   }
-  if (production && (
+  if (production && c.BLOB_STORE === "filesystem" && (
     c.DATA_EXPORT_REQUESTS_ENABLED
     || c.DATA_EXPORT_WORKER_ENABLED
     || c.DATA_EXPORT_CLEANUP_ENABLED
@@ -498,13 +603,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (c.DATA_EXPORT_WORKER_ENABLED && !c.DATA_EXPORT_CLEANUP_ENABLED) {
     throw new Error("DATA_EXPORT_CLEANUP_ENABLED=1 is required before DATA_EXPORT_WORKER_ENABLED=1");
   }
-  if ((c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED) && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
+  if (c.BLOB_STORE === "filesystem"
+    && (c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED)
+    && !c.BLOB_FILESYSTEM_SINGLE_RUNNER) {
     throw new Error(
       "BLOB_FILESYSTEM_SINGLE_RUNNER=1 is required for filesystem Blob writes or cleanup",
     );
   }
   if (
     (c.DATA_EXPORT_REQUESTS_ENABLED || c.DATA_EXPORT_WORKER_ENABLED || c.DATA_EXPORT_CLEANUP_ENABLED)
+    && c.BLOB_STORE === "filesystem"
     && !c.BLOB_FILESYSTEM_SINGLE_RUNNER
   ) {
     throw new Error(
@@ -514,21 +622,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (c.TENANT_PURGE_EXECUTION_WORKER_ENABLED && (
     !c.BLOB_CLEANUP_ENABLED
     || !c.DATA_EXPORT_CLEANUP_ENABLED
-    || !c.BLOB_FILESYSTEM_SINGLE_RUNNER
+    || (c.BLOB_STORE === "filesystem" && !c.BLOB_FILESYSTEM_SINGLE_RUNNER)
   )) {
     throw new Error(
-      "T3e local execution requires BLOB_CLEANUP_ENABLED=1, "
-        + "DATA_EXPORT_CLEANUP_ENABLED=1, and BLOB_FILESYSTEM_SINGLE_RUNNER=1",
+      "T3e local execution requires BLOB_CLEANUP_ENABLED=1 and "
+        + "DATA_EXPORT_CLEANUP_ENABLED=1; filesystem additionally requires "
+        + "BLOB_FILESYSTEM_SINGLE_RUNNER=1",
     );
   }
   const runnerAddr = validateAdvertisedAddress(c.RUNNER_ADDR ?? `${c.RUNNER_HOST}:${c.RUNNER_PORT}`);
   const runnerId = c.RUNNER_ID ?? (production ? `runner-${randomUUID()}` : `runner-${process.pid}`);
   return {
     ...c,
+    BLOB_S3_ENDPOINT: s3Endpoint,
     ERASURE_ROUTER_URL: erasureRouterUrl,
     INTERNAL_ROUTER_TOKEN: c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
     RUNNER_ID: runnerId,
     runnerAddr,
-    dataExportArtifactsReadable: !production && c.BLOB_FILESYSTEM_SINGLE_RUNNER,
+    dataExportArtifactsReadable:
+      c.BLOB_STORE === "s3" || (!production && c.BLOB_FILESYSTEM_SINGLE_RUNNER),
+    ...(blobStorage === undefined ? {} : { blobStorage }),
   };
 }

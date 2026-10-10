@@ -22,6 +22,7 @@ import {
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   tenantRuntimeFleetSha256,
   tenantRuntimeTargetSha256,
+  type BlobStorageCapability,
 } from "@agent-service/protocol";
 
 /**
@@ -52,6 +53,8 @@ export interface RunnerRegistryOptions {
   redisPrefix?: string;
   /** Exact namespace identity required from every runner before T3g can execute. */
   redisNamespaceSha256?: string;
+  /** Exact shared object namespace required before cross-runner Blob/export traffic is admitted. */
+  blobStorage?: BlobStorageCapability;
   /** how often to poll readiness and protocol compatibility */
   healthIntervalMs?: number;
   /** virtual nodes per runner on the hash ring */
@@ -269,14 +272,36 @@ export class RunnerRegistry {
     return !!target?.healthy && !!target.capabilities?.features.sessionLifecycle.includes(feature);
   }
 
+  private matchesConfiguredBlobStorage(target: RunnerTarget): boolean {
+    const expected = this.opts.blobStorage;
+    if (!expected) return true;
+    const actual = target.capabilities?.features.blobStorage;
+    return actual !== null
+      && actual !== undefined
+      && actual.backend === expected.backend
+      && actual.shared === expected.shared
+      && actual.namespaceSha256 === expected.namespaceSha256
+      && actual.controlGeneration === expected.controlGeneration;
+  }
+
   allHealthySupportBlobAttachments(): boolean {
-    const healthy = this.list().filter((target) => target.healthy);
-    return healthy.length > 0 && healthy.every((target) => target.capabilities?.features.blobAttachments === true);
+    const targets = this.opts.blobStorage?.shared
+      // A shared namespace is a fleet invariant. An unavailable configured runner could recover
+      // with a different namespace, so it may not be ignored while durable writes are admitted.
+      ? this.list()
+      : this.list().filter((target) => target.healthy);
+    return targets.length > 0 && targets.every((target) => (
+      target.healthy
+      && target.capabilities?.features.blobAttachments === true
+      && this.matchesConfiguredBlobStorage(target)
+    ));
   }
 
   supportsBlobAttachments(url: string): boolean {
     const target = this.targets.get(url.replace(/\/+$/, ""));
-    return !!target?.healthy && target.capabilities?.features.blobAttachments === true;
+    return !!target?.healthy
+      && target.capabilities?.features.blobAttachments === true
+      && this.matchesConfiguredBlobStorage(target);
   }
 
   allHealthySupportDataErasureRequests(): boolean {
@@ -387,9 +412,13 @@ export class RunnerRegistry {
   }
 
   allHealthySupportUserDataExport(): boolean {
-    const healthy = this.list().filter((target) => target.healthy);
+    const healthy = this.opts.blobStorage?.shared
+      ? this.list()
+      : this.list().filter((target) => target.healthy);
     return healthy.length > 0 && healthy.every((target) => (
-      target.capabilities?.features.userDataExport.includes(
+      target.healthy
+      && this.matchesConfiguredBlobStorage(target)
+      && target.capabilities?.features.userDataExport.includes(
         USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
       ) === true
     ));
@@ -399,6 +428,7 @@ export class RunnerRegistry {
     const configured = this.list();
     return configured.length > 0 && configured.every((target) => (
       target.healthy
+      && this.matchesConfiguredBlobStorage(target)
       && target.capabilities?.features.userDataExport.includes(
         USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
       ) === true
@@ -408,7 +438,7 @@ export class RunnerRegistry {
 
   supportsUserDataExport(url: string): boolean {
     const target = this.targets.get(url.replace(/\/+$/, ""));
-    return !!target?.healthy && target.capabilities?.features.userDataExport.includes(
+    return !!target?.healthy && this.matchesConfiguredBlobStorage(target) && target.capabilities?.features.userDataExport.includes(
       USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
     ) === true;
   }

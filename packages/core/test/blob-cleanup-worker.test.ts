@@ -7,7 +7,7 @@ import type {
   RetryBlobDeleteOptions,
   ScheduleStaleBlobsOptions,
 } from "@agent-service/store";
-import { BLOB_STORAGE_FORMAT } from "@agent-service/store";
+import { BLOB_STORAGE_FORMAT, blobStorageKey } from "@agent-service/store";
 import { BlobCleanupWorker, newId } from "../src/index.js";
 
 const silent = { info: () => {}, warn: () => {}, error: () => {} };
@@ -20,7 +20,7 @@ function pending(nowMs = Date.now()): BlobDeleteOutboxRecord {
     generation: 1,
     storageBackend: "memory-v1",
     storageFormat: BLOB_STORAGE_FORMAT,
-    storageKey: `objects/${blobId.slice("blob_".length)}`,
+    storageKey: blobStorageKey(blobId),
     uploadToken: "upload-token-0001",
     availableAtMs: nowMs,
     attempts: 0,
@@ -234,7 +234,7 @@ describe("BlobCleanupWorker", () => {
     expect(store.row).toMatchObject({ attempts: 2, completedAtMs: expect.any(Number) });
   });
 
-  it("dead-letters a deterministic backend mismatch only after the poison attempt cap", async () => {
+  it("keeps a backend mismatch retryable beyond the poison attempt cap", async () => {
     const store = new FakeCleanupStore();
     store.row = { ...pending(), storageBackend: "wrong-backend" };
     const blob = new FakeBlobStore();
@@ -243,11 +243,30 @@ describe("BlobCleanupWorker", () => {
       { retryBaseMs: 1, retryMaxMs: 1, poisonMaxAttempts: 2 },
     );
 
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      expect(await worker.cleanupOnce(store.row.availableAtMs)).toBe(0);
+      expect(store.row).toMatchObject({ attempts: attempt, availableAtMs: expect.any(Number) });
+      expect(store.row.deadLetteredAtMs).toBeUndefined();
+    }
+    expect(blob.deletes).toHaveLength(0);
+  });
+
+  it("dead-letters a valid-looking but non-canonical key without touching the blob adapter", async () => {
+    const store = new FakeCleanupStore();
+    const row = pending();
+    const actualShard = row.blobId.slice("blob_".length, "blob_".length + 2);
+    store.row = {
+      ...row,
+      storageKey: `objects/${actualShard === "ff" ? "00" : "ff"}/${row.blobId}`,
+    };
+    const blob = new FakeBlobStore();
+    const worker = new BlobCleanupWorker(
+      { store, blob, logger: silent },
+      { retryBaseMs: 1, retryMaxMs: 1, poisonMaxAttempts: 1 },
+    );
+
     expect(await worker.cleanupOnce(store.row.availableAtMs)).toBe(0);
-    expect(store.row).toMatchObject({ attempts: 1, availableAtMs: expect.any(Number) });
-    expect(store.row.deadLetteredAtMs).toBeUndefined();
-    expect(await worker.cleanupOnce(store.row.availableAtMs)).toBe(0);
-    expect(store.row).toMatchObject({ attempts: 2, deadLetteredAtMs: expect.any(Number) });
+    expect(store.row).toMatchObject({ attempts: 1, deadLetteredAtMs: expect.any(Number) });
     expect(blob.deletes).toHaveLength(0);
   });
 

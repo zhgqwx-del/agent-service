@@ -1101,6 +1101,14 @@ export type components = {
                 readonly approvals: true;
                 /** @default false */
                 readonly blobAttachments?: boolean;
+                /** @default null */
+                readonly blobStorage?: {
+                    readonly backend: string;
+                    /** @enum {number} */
+                    readonly controlGeneration: 1;
+                    readonly namespaceSha256: string;
+                    readonly shared: boolean;
+                } | null;
                 readonly byok: boolean;
                 /** @default false */
                 readonly dataErasureRequests?: boolean;

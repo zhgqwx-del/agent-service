@@ -43,8 +43,21 @@ caller_data_export_cleanup_enabled="${DATA_EXPORT_CLEANUP_ENABLED-}"
 caller_erasure_worker_enabled="${ERASURE_WORKER_ENABLED-}"
 caller_legacy_tombstone_compensation_enabled="${LEGACY_TOMBSTONE_COMPENSATION_ENABLED-}"
 caller_erasure_router_url="${ERASURE_ROUTER_URL-}"
+caller_blob_store="${BLOB_STORE-}"
+caller_blob_namespace_id="${BLOB_NAMESPACE_ID-}"
 caller_blob_dir="${BLOB_DIR-}"
 caller_blob_filesystem_single_runner="${BLOB_FILESYSTEM_SINGLE_RUNNER-}"
+caller_blob_storage_control_enabled="${BLOB_STORAGE_CONTROL_ENABLED-}"
+caller_blob_s3_endpoint="${BLOB_S3_ENDPOINT-}"
+caller_blob_s3_region="${BLOB_S3_REGION-}"
+caller_blob_s3_bucket="${BLOB_S3_BUCKET-}"
+caller_blob_s3_prefix="${BLOB_S3_PREFIX-}"
+caller_blob_s3_force_path_style="${BLOB_S3_FORCE_PATH_STYLE-}"
+caller_blob_s3_private_bucket_ack="${BLOB_S3_PRIVATE_BUCKET_ACK-}"
+caller_blob_s3_request_timeout_ms="${BLOB_S3_REQUEST_TIMEOUT_MS-}"
+caller_blob_s3_access_key_id="${BLOB_S3_ACCESS_KEY_ID-}"
+caller_blob_s3_secret_access_key="${BLOB_S3_SECRET_ACCESS_KEY-}"
+caller_blob_s3_session_token="${BLOB_S3_SESSION_TOKEN-}"
 caller_blob_cleanup_enabled="${BLOB_CLEANUP_ENABLED-}"
 caller_blob_attachments_enabled="${BLOB_ATTACHMENTS_ENABLED-}"
 caller_blob_max_bytes="${BLOB_MAX_BYTES-}"
@@ -90,8 +103,21 @@ fi
 [ -n "$caller_erasure_worker_enabled" ] && ERASURE_WORKER_ENABLED="$caller_erasure_worker_enabled"
 [ -n "$caller_legacy_tombstone_compensation_enabled" ] && LEGACY_TOMBSTONE_COMPENSATION_ENABLED="$caller_legacy_tombstone_compensation_enabled"
 [ -n "$caller_erasure_router_url" ] && ERASURE_ROUTER_URL="$caller_erasure_router_url"
+[ -n "$caller_blob_store" ] && BLOB_STORE="$caller_blob_store"
+[ -n "$caller_blob_namespace_id" ] && BLOB_NAMESPACE_ID="$caller_blob_namespace_id"
 [ -n "$caller_blob_dir" ] && BLOB_DIR="$caller_blob_dir"
 [ -n "$caller_blob_filesystem_single_runner" ] && BLOB_FILESYSTEM_SINGLE_RUNNER="$caller_blob_filesystem_single_runner"
+[ -n "$caller_blob_storage_control_enabled" ] && BLOB_STORAGE_CONTROL_ENABLED="$caller_blob_storage_control_enabled"
+[ -n "$caller_blob_s3_endpoint" ] && BLOB_S3_ENDPOINT="$caller_blob_s3_endpoint"
+[ -n "$caller_blob_s3_region" ] && BLOB_S3_REGION="$caller_blob_s3_region"
+[ -n "$caller_blob_s3_bucket" ] && BLOB_S3_BUCKET="$caller_blob_s3_bucket"
+[ -n "$caller_blob_s3_prefix" ] && BLOB_S3_PREFIX="$caller_blob_s3_prefix"
+[ -n "$caller_blob_s3_force_path_style" ] && BLOB_S3_FORCE_PATH_STYLE="$caller_blob_s3_force_path_style"
+[ -n "$caller_blob_s3_private_bucket_ack" ] && BLOB_S3_PRIVATE_BUCKET_ACK="$caller_blob_s3_private_bucket_ack"
+[ -n "$caller_blob_s3_request_timeout_ms" ] && BLOB_S3_REQUEST_TIMEOUT_MS="$caller_blob_s3_request_timeout_ms"
+[ -n "$caller_blob_s3_access_key_id" ] && BLOB_S3_ACCESS_KEY_ID="$caller_blob_s3_access_key_id"
+[ -n "$caller_blob_s3_secret_access_key" ] && BLOB_S3_SECRET_ACCESS_KEY="$caller_blob_s3_secret_access_key"
+[ -n "$caller_blob_s3_session_token" ] && BLOB_S3_SESSION_TOKEN="$caller_blob_s3_session_token"
 [ -n "$caller_blob_cleanup_enabled" ] && BLOB_CLEANUP_ENABLED="$caller_blob_cleanup_enabled"
 [ -n "$caller_blob_attachments_enabled" ] && BLOB_ATTACHMENTS_ENABLED="$caller_blob_attachments_enabled"
 [ -n "$caller_blob_max_bytes" ] && BLOB_MAX_BYTES="$caller_blob_max_bytes"
@@ -118,6 +144,14 @@ require_tools() {
   [ "$major" -ge 24 ] || die "Node 24+ is required (current: $(node -v))"
 }
 
+infra() {
+  if [ "${BLOB_STORE:-filesystem}" = "s3" ] && [ -z "${BLOB_S3_ENDPOINT:-}" ]; then
+    MINIO_ENABLED="${MINIO_ENABLED:-1}" deploy/local/infra.sh "$@"
+  else
+    deploy/local/infra.sh "$@"
+  fi
+}
+
 wait_http() {
   local url="$1" name="$2" i
   for i in $(seq 1 100); do
@@ -131,7 +165,61 @@ start_apps() {
   require_tools
   [ -f .env ] || die ".env is missing; copy .env.example and fill the required values"
   mkdir -p "$STATE_DIR"
-  deploy/local/infra.sh start
+  local blob_store="${BLOB_STORE:-filesystem}"
+  infra start
+
+  local -a runner_blob_env router_blob_env cloud_credential_scrub
+  # `.env` is exported for local orchestration, but these provider-chain credentials must not leak
+  # into either application process. The local S3 runner receives only its explicit BLOB_S3_*
+  # credentials below; the router never receives storage credentials.
+  cloud_credential_scrub=(
+    -u MINIO_ROOT_USER -u MINIO_ROOT_PASSWORD
+    -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN -u AWS_SECURITY_TOKEN
+    -u AWS_PROFILE -u AWS_DEFAULT_PROFILE
+    -u AWS_SHARED_CREDENTIALS_FILE -u AWS_CONFIG_FILE -u AWS_CREDENTIAL_FILE
+    -u AWS_WEB_IDENTITY_TOKEN_FILE -u AWS_ROLE_ARN -u AWS_ROLE_SESSION_NAME
+    -u AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -u AWS_CONTAINER_CREDENTIALS_FULL_URI
+    -u AWS_CONTAINER_AUTHORIZATION_TOKEN -u AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
+  )
+  if [ "$blob_store" = "s3" ]; then
+    runner_blob_env=(
+      BLOB_STORE=s3
+      BLOB_NAMESPACE_ID="${BLOB_NAMESPACE_ID:-agent-service-local-minio-v1}"
+      BLOB_STORAGE_CONTROL_ENABLED="${BLOB_STORAGE_CONTROL_ENABLED:-1}"
+      BLOB_FILESYSTEM_SINGLE_RUNNER=0
+      BLOB_S3_ENDPOINT="${BLOB_S3_ENDPOINT:-${MINIO_ENDPOINT:-http://127.0.0.1:9000}}"
+      BLOB_S3_REGION="${BLOB_S3_REGION:-${MINIO_REGION:-us-east-1}}"
+      BLOB_S3_BUCKET="${BLOB_S3_BUCKET:-${MINIO_BUCKET:-agent-service-local}}"
+      BLOB_S3_PREFIX="${BLOB_S3_PREFIX:-agent-service-v1}"
+      BLOB_S3_FORCE_PATH_STYLE="${BLOB_S3_FORCE_PATH_STYLE:-1}"
+      BLOB_S3_PRIVATE_BUCKET_ACK="${BLOB_S3_PRIVATE_BUCKET_ACK:-0}"
+      BLOB_S3_REQUEST_TIMEOUT_MS="${BLOB_S3_REQUEST_TIMEOUT_MS:-5000}"
+      BLOB_S3_ACCESS_KEY_ID="${BLOB_S3_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-agentservice-local}}"
+      BLOB_S3_SECRET_ACCESS_KEY="${BLOB_S3_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-agent-service-local-minio-only-0001}}"
+    )
+    [ -n "${BLOB_S3_SESSION_TOKEN:-}" ] \
+      && runner_blob_env+=(BLOB_S3_SESSION_TOKEN="$BLOB_S3_SESSION_TOKEN")
+    router_blob_env=(
+      BLOB_STORE=s3
+      BLOB_NAMESPACE_ID="${BLOB_NAMESPACE_ID:-agent-service-local-minio-v1}"
+      BLOB_STORAGE_CONTROL_ENABLED="${BLOB_STORAGE_CONTROL_ENABLED:-1}"
+      BLOB_FILESYSTEM_SINGLE_RUNNER=0
+      BLOB_S3_BUCKET="${BLOB_S3_BUCKET:-${MINIO_BUCKET:-agent-service-local}}"
+      BLOB_S3_PREFIX="${BLOB_S3_PREFIX:-agent-service-v1}"
+    )
+  else
+    runner_blob_env=(
+      BLOB_STORE=filesystem
+      BLOB_STORAGE_CONTROL_ENABLED=0
+      BLOB_DIR="${BLOB_DIR:-$STATE_DIR/blobs}"
+      BLOB_FILESYSTEM_SINGLE_RUNNER="${BLOB_FILESYSTEM_SINGLE_RUNNER:-1}"
+    )
+    router_blob_env=(
+      BLOB_STORE=filesystem
+      BLOB_STORAGE_CONTROL_ENABLED=0
+      BLOB_FILESYSTEM_SINGLE_RUNNER="${BLOB_FILESYSTEM_SINGLE_RUNNER:-1}"
+    )
+  fi
 
   if pid_alive "$RUNNER_PID_FILE"; then
     echo "runner: already running (pid $(sed -n '1p' "$RUNNER_PID_FILE"))"
@@ -145,12 +233,12 @@ start_apps() {
       -u TENANT_PURGE_EXECUTION_ENABLED \
       -u TENANT_DATABASE_PURGE_ENABLED \
       -u TENANT_REDIS_PURGE_ENABLED \
+      "${cloud_credential_scrub[@]}" \
+      "${runner_blob_env[@]}" \
       STORE=mysql \
       RUNNER_PORT="$RUNNER_PORT" \
       RUNNER_ID="${RUNNER_ID:-runner-local-1}" \
       RUNNER_ADDR="${RUNNER_ADDR:-127.0.0.1:$RUNNER_PORT}" \
-      BLOB_DIR="${BLOB_DIR:-$STATE_DIR/blobs}" \
-      BLOB_FILESYSTEM_SINGLE_RUNNER="${BLOB_FILESYSTEM_SINGLE_RUNNER:-1}" \
       BLOB_CLEANUP_ENABLED="${BLOB_CLEANUP_ENABLED:-1}" \
       BLOB_ATTACHMENTS_ENABLED="${BLOB_ATTACHMENTS_ENABLED:-1}" \
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
@@ -192,6 +280,11 @@ start_apps() {
       -u TENANT_PURGE_EXECUTION_WORKER_ENABLED \
       -u TENANT_DATABASE_PURGE_WORKER_ENABLED \
       -u TENANT_REDIS_PURGE_WORKER_ENABLED \
+      -u BLOB_S3_ENDPOINT -u BLOB_S3_REGION -u BLOB_S3_FORCE_PATH_STYLE \
+      -u BLOB_S3_PRIVATE_BUCKET_ACK -u BLOB_S3_REQUEST_TIMEOUT_MS \
+      -u BLOB_S3_ACCESS_KEY_ID -u BLOB_S3_SECRET_ACCESS_KEY -u BLOB_S3_SESSION_TOKEN \
+      "${cloud_credential_scrub[@]}" \
+      "${router_blob_env[@]}" \
       RUNNERS="${RUNNERS:-$RUNNER_URL}" \
       REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}" \
       REDIS_PREFIX="${REDIS_PREFIX:-as}" \
@@ -208,7 +301,6 @@ start_apps() {
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
       DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
-      BLOB_FILESYSTEM_SINGLE_RUNNER="${BLOB_FILESYSTEM_SINGLE_RUNNER:-1}" \
       BLOB_ATTACHMENTS_ENABLED="${BLOB_ATTACHMENTS_ENABLED:-1}" \
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
       ROUTER_PORT="$ROUTER_PORT" \
@@ -245,7 +337,7 @@ stop_apps() {
 }
 
 show_status() {
-  deploy/local/infra.sh status || true
+  infra status || true
   if pid_alive "$RUNNER_PID_FILE"; then
     echo "runner: up pid=$(sed -n '1p' "$RUNNER_PID_FILE") health=$(curl -fsS "$RUNNER_URL/healthz" 2>/dev/null || echo unreachable)"
   else
@@ -276,7 +368,7 @@ verify() {
   # `.env` is loaded for the local workflow, but platform authority must never be inherited by a
   # runner spawned from a test harness. Tests use their own fixed, non-production router credential.
   unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
-  deploy/local/infra.sh start
+  infra start
   mkdir -p "$STATE_DIR"
   pnpm run check:secrets
   pnpm run check:api
@@ -291,6 +383,9 @@ verify() {
     pnpm run test:migrations
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-mysql
+  pnpm run test:blob-storage-control-memory
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:blob-storage-control-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:outbox-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
@@ -353,6 +448,24 @@ verify_real() {
   AGENT_SERVICE_REAL_E2E=1 pnpm vitest run packages/providers/test/e2e-qwen.test.ts
 }
 
+verify_s3() {
+  require_tools
+  MINIO_ENABLED=1 deploy/local/infra.sh start
+  local -a s3_test_env=(
+    S3_TEST_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
+    S3_TEST_REGION="${MINIO_REGION:-us-east-1}"
+    S3_TEST_BUCKET="${MINIO_BUCKET:-agent-service-local}"
+    S3_TEST_ACCESS_KEY_ID="${MINIO_ROOT_USER:-agentservice-local}"
+    S3_TEST_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD:-agent-service-local-minio-only-0001}"
+    S3_TEST_FORCE_PATH_STYLE=1
+  )
+  env "${s3_test_env[@]}" pnpm run test:blob-s3
+  env "${s3_test_env[@]}" \
+    AGENT_SERVICE_APP_SMOKE_MODE=source \
+    MYSQL_APP_SMOKE_URL="${MYSQL_APP_SMOKE_URL:-${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}}" \
+    pnpm run test:app-s3-smoke
+}
+
 cleanup_idempotency() {
   require_tools
   [ -n "${MYSQL_URL:-}" ] || die "MYSQL_URL is empty in .env/environment"
@@ -360,7 +473,7 @@ cleanup_idempotency() {
 }
 
 usage() {
-  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-real|cleanup-idempotency|down"
+  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|down"
 }
 
 case "${1:-}" in
@@ -372,8 +485,9 @@ case "${1:-}" in
   smoke) smoke ;;
   acceptance) BASE="$ROUTER_URL" scripts/demo.sh ;;
   verify) verify ;;
+  verify-s3) verify_s3 ;;
   verify-real) verify_real ;;
   cleanup-idempotency) shift; cleanup_idempotency "$@" ;;
-  down) stop_apps; deploy/local/infra.sh stop ;;
+  down) stop_apps; infra stop ;;
   *) usage; exit 1 ;;
 esac

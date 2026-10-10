@@ -15,6 +15,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     redisUrl: cfg.REDIS_URL,
     redisPrefix: cfg.REDIS_PREFIX,
     redisNamespaceSha256,
+    ...(cfg.blobStorage === undefined ? {} : { blobStorage: cfg.blobStorage }),
     healthIntervalMs: cfg.HEALTH_INTERVAL_MS,
   });
   registry.start();

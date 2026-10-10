@@ -34,6 +34,8 @@ for (const [file, minLines, hint] of required) {
 
 const requiredTestFiles = [
   "packages/store/test/blob-lifecycle.mysql.test.ts",
+  "packages/store/test/blob-storage-control.memory.test.ts",
+  "packages/store/test/blob-storage-control.mysql.test.ts",
   "packages/store/test/lifecycle-outbox.mysql.test.ts",
   "packages/store/test/usage-lifecycle.mysql.test.ts",
   "packages/store/test/subject-lifecycle.mysql.test.ts",

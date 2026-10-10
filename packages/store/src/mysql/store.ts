@@ -77,6 +77,18 @@ import {
 } from "../blob-lifecycle.js";
 import { validateBlobKey, validateBlobUploadToken } from "../blob/key.js";
 import {
+  BLOB_STORAGE_CONTROL_SINGLETON_ID,
+  BlobStorageControlConflictError,
+  BlobStorageControlIntegrityError,
+  blobStorageControlEvidenceSha256,
+  validateActivateBlobStorageControlInput,
+  validateBlobStorageControlRecord,
+  type ActivateBlobStorageControlInput,
+  type ActiveBlobStorageControlRecord,
+  type BlobStorageControlRecord,
+  type BlobStorageControlStore,
+} from "../blob-storage-control.js";
+import {
   assertLifecycleOutboxId,
   parseLifecycleOutboxEnvelope,
   sanitizeLifecycleOutboxError,
@@ -765,6 +777,8 @@ import {
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
 const parse = <T>(v: unknown): T => (typeof v === "string" ? JSON.parse(v) : (v as T));
+const BLOB_STORAGE_CONTROL_COLUMNS = `singleton_id, control_generation, storage_backend,
+  namespace_sha256, activated_at_db_ms, evidence_sha256`;
 const BLOB_COLUMNS = `blob_id, tenant_id, user_id, session_id, item_id, purpose, storage_backend,
   storage_format, storage_key, upload_token, state, sha256, size_bytes, content_type,
   uploaded_at_ms, ready_at_ms, staging_expires_at_ms, delete_after_ms, deleted_at_ms,
@@ -1453,6 +1467,44 @@ function rowToLegacyTombstoneCutover(row: Row): LegacyTombstoneCutoverRecord | n
       !== legacyTombstoneCutoverEvidenceSha256(record.activatedByKeyId, record.activatedAtMs)
   ) throw new Error("stored legacy tombstone cutover evidence is invalid");
   return record;
+}
+
+function rowToBlobStorageControl(row: Row | undefined): BlobStorageControlRecord {
+  if (!row || Number(row.singleton_id) !== BLOB_STORAGE_CONTROL_SINGLETON_ID) {
+    throw new BlobStorageControlIntegrityError();
+  }
+  const generation = storedSafeInteger(
+    row.control_generation,
+    "stored blob storage control generation",
+  );
+  const record: BlobStorageControlRecord = generation === 0
+    ? { singletonId: BLOB_STORAGE_CONTROL_SINGLETON_ID, controlGeneration: 0 }
+    : {
+        singletonId: BLOB_STORAGE_CONTROL_SINGLETON_ID,
+        controlGeneration: generation as 1,
+        storageBackend: String(row.storage_backend),
+        namespaceSha256: String(row.namespace_sha256),
+        activatedAtDbMs: storedSafeInteger(
+          row.activated_at_db_ms,
+          "stored blob storage activation timestamp",
+        ),
+        evidenceSha256: String(row.evidence_sha256),
+      };
+  try {
+    if (
+      generation === 0
+      && (
+        row.storage_backend != null
+        || row.namespace_sha256 != null
+        || row.activated_at_db_ms != null
+        || row.evidence_sha256 != null
+      )
+    ) throw new Error("inactive blob storage control has active fields");
+    validateBlobStorageControlRecord(record);
+    return record;
+  } catch {
+    throw new BlobStorageControlIntegrityError();
+  }
 }
 
 /** Serialize a Session row. The projection columns are the source for filtering; `body` holds the rest. */
@@ -4970,6 +5022,7 @@ export class MysqlSessionStore implements
   LifecycleOutboxStore,
   BlobManifestStore,
   BlobCleanupStore,
+  BlobStorageControlStore,
   UsageLifecycleStore,
   SubjectLifecycleStore,
   ErasureJobStore,
@@ -27737,6 +27790,142 @@ export class MysqlSessionStore implements
     });
   }
 
+  // ---------- blob storage write-once control ----------
+  private async readBlobStorageControl(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<BlobStorageControlRecord> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${BLOB_STORAGE_CONTROL_COLUMNS}
+         FROM blob_storage_control WHERE singleton_id=1 ${lock}`,
+    );
+    if (rows.length !== 1) throw new BlobStorageControlIntegrityError();
+    return rowToBlobStorageControl(rows[0]);
+  }
+
+  private async assertBlobStorageInventoryMatches(
+    conn: PoolConnection,
+    storageBackend: string,
+    namespaceSha256: string,
+  ): Promise<void> {
+    const probes: Array<[string, unknown[]]> = [
+      [
+        `SELECT blob_id FROM blob_objects
+          WHERE state<>'deleted' AND BINARY storage_backend<>BINARY ?
+          LIMIT 1 FOR SHARE`,
+        [storageBackend],
+      ],
+      [
+        `SELECT artifact_id FROM user_export_artifacts
+          WHERE state<>'deleted' AND BINARY storage_backend<>BINARY ?
+          LIMIT 1 FOR SHARE`,
+        [storageBackend],
+      ],
+      [
+        `SELECT artifact_id,part_number FROM user_export_artifact_parts
+          WHERE state<>'deleted' AND BINARY storage_backend<>BINARY ?
+          LIMIT 1 FOR SHARE`,
+        [storageBackend],
+      ],
+      [
+        `SELECT request_id,build_generation,ordinal FROM user_export_snapshot_blobs
+          WHERE released_at_ms IS NULL
+            AND (BINARY storage_backend<>BINARY ?
+              OR storage_namespace_sha256 IS NULL
+              OR BINARY storage_namespace_sha256<>BINARY ?)
+          LIMIT 1 FOR SHARE`,
+        [storageBackend, namespaceSha256],
+      ],
+      [
+        `SELECT o.outbox_id FROM blob_delete_outbox o
+          LEFT JOIN blob_objects b ON b.blob_id=o.blob_id
+         WHERE o.completed_at_ms IS NULL
+           AND (b.blob_id IS NULL OR BINARY b.storage_backend<>BINARY ?)
+         LIMIT 1 FOR SHARE`,
+        [storageBackend],
+      ],
+      [
+        `SELECT outbox_id FROM user_export_artifact_delete_outbox
+          WHERE completed_at_ms IS NULL
+            AND BINARY storage_backend<>BINARY ?
+          LIMIT 1 FOR SHARE`,
+        [storageBackend],
+      ],
+    ];
+    for (const [sql, params] of probes) {
+      const [rows] = await conn.query<Row[]>(sql, params);
+      if (rows.length > 0) throw new BlobStorageControlConflictError();
+    }
+  }
+
+  async getBlobStorageControl(): Promise<BlobStorageControlRecord> {
+    return this.readBlobStorageControl(this.pool);
+  }
+
+  async activateBlobStorageControl(
+    input: ActivateBlobStorageControlInput,
+  ): Promise<ActiveBlobStorageControlRecord> {
+    const stagedInput = structuredClone(input);
+    validateActivateBlobStorageControlInput(stagedInput);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const current = await this.readBlobStorageControl(conn, "FOR UPDATE");
+      if (current.controlGeneration === 1) {
+        if (
+          current.storageBackend !== stagedInput.storageBackend
+          || current.namespaceSha256 !== stagedInput.namespaceSha256
+        ) throw new BlobStorageControlConflictError();
+        await this.assertBlobStorageInventoryMatches(
+          conn,
+          current.storageBackend,
+          current.namespaceSha256,
+        );
+        await conn.commit();
+        return current;
+      }
+
+      await this.assertBlobStorageInventoryMatches(
+        conn,
+        stagedInput.storageBackend,
+        stagedInput.namespaceSha256,
+      );
+      const activatedAtDbMs = await this.databaseNow(conn);
+      const body = {
+        singletonId: BLOB_STORAGE_CONTROL_SINGLETON_ID,
+        controlGeneration: 1 as const,
+        storageBackend: stagedInput.storageBackend,
+        namespaceSha256: stagedInput.namespaceSha256,
+        activatedAtDbMs,
+      };
+      const evidenceSha256 = blobStorageControlEvidenceSha256(body);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE blob_storage_control
+            SET control_generation=1,storage_backend=?,namespace_sha256=?,
+                activated_at_db_ms=?,evidence_sha256=?
+          WHERE singleton_id=1 AND control_generation=0
+            AND storage_backend IS NULL AND namespace_sha256 IS NULL
+            AND activated_at_db_ms IS NULL AND evidence_sha256 IS NULL`,
+        [
+          stagedInput.storageBackend,
+          stagedInput.namespaceSha256,
+          activatedAtDbMs,
+          evidenceSha256,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new BlobStorageControlConflictError();
+      const activated = await this.readBlobStorageControl(conn);
+      if (activated.controlGeneration !== 1) throw new BlobStorageControlIntegrityError();
+      await conn.commit();
+      return activated;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
   // ---------- blob ownership manifest ----------
   async stageBlob(input: StageBlobInput): Promise<void> {
     validateStageBlobInput(input);
@@ -32934,6 +33123,10 @@ export class MysqlSessionStore implements
     try {
       await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       await conn.query("START TRANSACTION WITH CONSISTENT SNAPSHOT");
+      // This current locking read orders snapshot publication against the global cutover. A writer
+      // that started before activation keeps a share lock until its nullable legacy pin commits;
+      // after activation every new pin carries the full namespace digest.
+      const blobStorageControl = await this.readBlobStorageControl(conn, "FOR SHARE");
       const snapshotAtMs = await this.userExportDatabaseNow(conn);
       const subject = await this.lockUserExportSubject(
         conn,
@@ -33293,6 +33486,9 @@ export class MysqlSessionStore implements
           sha256: manifest.sha256,
           sizeBytes: manifest.sizeBytes,
           storageBackend: manifest.storageBackend,
+          ...(blobStorageControl.controlGeneration === 1 ? {
+            storageNamespaceSha256: blobStorageControl.namespaceSha256,
+          } : {}),
           storageFormat: manifest.storageFormat,
           storageKey: manifest.storageKey,
           sourceUploadToken: manifest.uploadToken,
@@ -33481,10 +33677,11 @@ export class MysqlSessionStore implements
         await conn.query(
           `INSERT INTO user_export_snapshot_blobs
              (request_id, build_generation, ordinal, blob_id, tenant_id, user_id,
-              subject_generation, session_id, item_id, purpose, storage_backend, storage_format,
-              storage_key, upload_token, source_deletion_generation, source_sha256,
+              subject_generation, session_id, item_id, purpose, storage_backend,
+              storage_namespace_sha256, storage_format, storage_key, upload_token,
+              source_deletion_generation, source_sha256,
               source_size_bytes, source_content_type, pin_token, pinned_at_ms, released_at_ms)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)`,
           [
             blob.requestId,
             blob.buildGeneration,
@@ -33497,6 +33694,7 @@ export class MysqlSessionStore implements
             blob.itemId ?? null,
             blob.purpose,
             blob.storageBackend,
+            blob.storageNamespaceSha256 ?? null,
             blob.storageFormat,
             blob.storageKey,
             blob.sourceUploadToken,
@@ -33686,7 +33884,8 @@ export class MysqlSessionStore implements
       const [rows] = await conn.query<Row[]>(
         `SELECT request_id, build_generation, ordinal, blob_id, tenant_id, user_id,
                 subject_generation, session_id, item_id, purpose, storage_backend,
-                storage_format, storage_key, upload_token, source_deletion_generation,
+                storage_namespace_sha256, storage_format, storage_key, upload_token,
+                source_deletion_generation,
                 source_sha256, source_size_bytes, source_content_type, pin_token, pinned_at_ms,
                 released_at_ms
            FROM user_export_snapshot_blobs
@@ -33711,6 +33910,9 @@ export class MysqlSessionStore implements
           sha256: String(row.source_sha256),
           sizeBytes: storedSafeInteger(row.source_size_bytes, "snapshot blob size"),
           storageBackend: String(row.storage_backend),
+          ...(row.storage_namespace_sha256 == null
+            ? {}
+            : { storageNamespaceSha256: String(row.storage_namespace_sha256) }),
           storageFormat: String(row.storage_format),
           storageKey: String(row.storage_key),
           sourceUploadToken: String(row.upload_token),
@@ -33727,6 +33929,8 @@ export class MysqlSessionStore implements
           || (blob.purpose !== "input_image" && blob.purpose !== "tool_output")
           || !/^[0-9a-f]{64}$/.test(blob.sha256)
           || !blob.storageBackend
+          || (blob.storageNamespaceSha256 !== undefined
+            && !/^[0-9a-f]{64}$/.test(blob.storageNamespaceSha256))
           || !blob.storageFormat
           || !blob.storageKey
           || !blob.sourceUploadToken

@@ -1,7 +1,14 @@
-import type { Item, Principal } from "@agent-service/protocol";
+import { isCanonicalId, type Item, type Principal } from "@agent-service/protocol";
 
 export const BLOB_STORAGE_FORMAT = "asblob2-envelope" as const;
 export const TOOL_OUTPUT_CONTENT_TYPE = "application/vnd.agent-service.tool-output+json" as const;
+
+/** Canonical, backend-independent physical key for a session-owned Blob. */
+export function blobStorageKey(blobId: string): string {
+  if (!isCanonicalId("blob", blobId)) throw new Error("invalid blob id for storage key");
+  const suffix = blobId.slice("blob_".length);
+  return `objects/${suffix.slice(0, 2)}/${blobId}`;
+}
 
 export type BlobPurpose = "input_image" | "tool_output";
 export type BlobState = "staging" | "ready" | "delete_pending" | "deleted";

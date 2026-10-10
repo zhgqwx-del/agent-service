@@ -464,6 +464,46 @@ export const USER_DATA_EXPORT_ARTIFACT_NDJSON_V1 = "artifact-ndjson-v1" as const
 export const UserDataExportCapability = z.literal(USER_DATA_EXPORT_ARTIFACT_NDJSON_V1);
 export type UserDataExportCapability = z.infer<typeof UserDataExportCapability>;
 
+/**
+ * Content-free identity for the object namespace shared by a runner fleet. The endpoint is
+ * deliberately excluded: two aliases for one service must compare equal, while moving a bucket or
+ * prefix is a data migration and therefore changes this identity.
+ */
+export function blobS3NamespaceSha256(namespaceId: string, bucket: string, prefix: string): string {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(namespaceId)) {
+    throw new Error("Blob namespace id is invalid");
+  }
+  if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)) {
+    throw new Error("S3 bucket is invalid");
+  }
+  if (
+    !prefix
+    || prefix.length > 256
+    || !/^[a-z0-9_-]{1,128}(?:\/[a-z0-9_-]{1,128})*$/.test(prefix)
+  ) {
+    throw new Error("S3 prefix is invalid");
+  }
+  return createHash("sha256")
+    .update(JSON.stringify(["blob-s3-namespace-v1", namespaceId, bucket, prefix]))
+    .digest("hex");
+}
+
+export function blobS3Backend(namespaceSha256: string): string {
+  if (!/^[0-9a-f]{64}$/.test(namespaceSha256)) throw new Error("Blob namespace digest is invalid");
+  return `s3-v1-${namespaceSha256.slice(0, 24)}`;
+}
+
+export const BlobStorageCapability = z.object({
+  /** Manifest backend identity. It changes whenever an object namespace changes. */
+  backend: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,31}$/),
+  /** True only for an adapter with tested cross-process visibility and conditional writes. */
+  shared: z.boolean(),
+  namespaceSha256: Sha256,
+  /** Generation 1 proves the durable database cutover is active for this exact namespace. */
+  controlGeneration: z.literal(1),
+}).strict();
+export type BlobStorageCapability = z.infer<typeof BlobStorageCapability>;
+
 export const ERASURE_JOB_CONTROL_QUARANTINE_V1 = "quarantine-v1" as const;
 export const ERASURE_JOB_CONTROL_LEGACY_TOMBSTONE_COMPENSATION_V1 = "legacy-tombstone-compensation-v1" as const;
 export const ErasureJobControlCapability = z.enum([
@@ -509,6 +549,8 @@ export const Capabilities = z.object({
     sessionLifecycle: z.array(z.enum(["archive", "unarchive", "tombstone", "purge"])),
     /** Missing on older runners in this protocol family; parsers normalize that to false. */
     blobAttachments: z.boolean().default(false),
+    /** Exact shared namespace proof; older/filesystem-only runners normalize to null. */
+    blobStorage: BlobStorageCapability.nullable().default(null),
     /** Missing on older runners in this protocol family; parsers normalize that to false. */
     dataErasureRequests: z.boolean().default(false),
     /**

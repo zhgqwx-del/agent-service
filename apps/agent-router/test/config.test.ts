@@ -6,6 +6,8 @@ describe("router configuration", () => {
     const local = loadRouterConfig({ RUNNERS: "http://runner:8787" });
     expect(local.SESSION_TOMBSTONE_ENABLED).toBe(false);
     expect(local.BLOB_FILESYSTEM_SINGLE_RUNNER).toBe(false);
+    expect(local.BLOB_STORE).toBe("filesystem");
+    expect(local.blobStorage).toBeUndefined();
     expect(local.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(local.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(local.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
@@ -177,6 +179,73 @@ describe("router configuration", () => {
       BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
       DATA_EXPORT_REQUESTS_ENABLED: "1",
     })).toThrow(/exactly one runner/);
+  });
+
+  it("allows multi-runner S3 admission only with an exact logical namespace", () => {
+    const cfg = loadRouterConfig({
+      RUNNERS: "http://runner-a:8787,http://runner-b:8787",
+      BLOB_STORE: "s3",
+      BLOB_NAMESPACE_ID: "local-object-store-v1",
+      BLOB_S3_BUCKET: "agent-service-local",
+      BLOB_S3_PREFIX: "objects-v1",
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+      BLOB_ATTACHMENTS_ENABLED: "1",
+      DATA_EXPORT_REQUESTS_ENABLED: "1",
+    });
+    expect(cfg.dataExportArtifactsReadable).toBe(true);
+    expect(cfg.blobStorage).toEqual({
+      backend: expect.stringMatching(/^s3-v1-[0-9a-f]{24}$/),
+      shared: true,
+      namespaceSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      controlGeneration: 1,
+    });
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      BLOB_STORE: "s3",
+      BLOB_NAMESPACE_ID: "local-object-store-v1",
+      BLOB_S3_BUCKET: "agent-service-local",
+    })).toThrow(/BLOB_STORAGE_CONTROL_ENABLED=1/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      BLOB_STORE: "s3",
+      BLOB_S3_BUCKET: "agent-service-local",
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+    })).toThrow(/BLOB_NAMESPACE_ID/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      BLOB_STORE: "s3",
+      BLOB_NAMESPACE_ID: "local-object-store-v1",
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+    })).toThrow(/BLOB_S3_BUCKET/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      BLOB_STORE: "s3",
+      BLOB_NAMESPACE_ID: "local-object-store-v1",
+      BLOB_S3_BUCKET: "agent-service-local",
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+      BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
+    })).toThrow(/must be 0/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      BLOB_STORAGE_CONTROL_ENABLED: "1",
+    })).toThrow(/must be 0/);
+  });
+
+  it("rejects runner-only object-store endpoint and credential authority", () => {
+    for (const [key, value] of [
+      ["BLOB_S3_ENDPOINT", "https://s3.internal"],
+      ["BLOB_S3_ACCESS_KEY_ID", "must-not-enter-router"],
+      ["AWS_SECURITY_TOKEN", "must-not-enter-router"],
+      ["AWS_PROFILE", "must-not-enter-router"],
+      ["AWS_CREDENTIAL_FILE", "/run/secrets/legacy-aws-credentials"],
+      ["AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/secrets/token"],
+      ["AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://169.254.170.2/credentials"],
+      ["AWS_SSO_SESSION", "must-not-enter-router"],
+      ["MINIO_ROOT_PASSWORD", "must-not-enter-router"],
+    ] as const) {
+      expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))
+        .toThrow(new RegExp(`${key} is runner-only`));
+    }
   });
 
   it("rejects a Blob ceiling above the router request-body ceiling", () => {

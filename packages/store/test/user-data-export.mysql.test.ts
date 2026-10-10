@@ -544,6 +544,12 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const userId = `user_${randomUUID()}`;
       try {
         await activatePolicy(store, tenantId);
+        const storageNamespaceSha256 = "b".repeat(64);
+        await store.activateBlobStorageControl({
+          expectedControlGeneration: 0,
+          storageBackend: "memory-v1",
+          namespaceSha256: storageNamespaceSha256,
+        });
         const session = mkSession(tenantId, userId);
         await store.createSession(session);
         const now = Date.now();
@@ -626,6 +632,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(blobs).toHaveLength(1);
         expect(summary.counts.attachment).toBe(1);
         const blob = blobs[0]!;
+        expect(blob.storageNamespaceSha256).toBe(storageNamespaceSha256);
         const publicAttachment = {
           blobId: blob.blobId,
           sessionId: blob.sessionId,

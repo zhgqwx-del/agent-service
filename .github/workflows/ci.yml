@@ -16,7 +16,10 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Building the pinned official MinIO source adds a few minutes to the existing full matrix.
+    timeout-minutes: 45
+    env:
+      MINIO_SOURCE_COMMIT: 07c3a429bfed433e49018cb0f78a52145d4bedeb
     services:
       mysql:
         # Pin the supported floor here; the image job below deliberately keeps the moving 8.0 tag
@@ -47,6 +50,37 @@ jobs:
       - name: Reject committed credentials
         run: node scripts/check-secrets.mjs
       - run: pnpm install --frozen-lockfile
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.24.8
+          cache: false
+      - name: Build and start real MinIO from the pinned official commit
+        env:
+          # Deterministic CI-only values scoped to the MinIO process launched by this step.
+          MINIO_ROOT_USER: agentservice-ci
+          MINIO_ROOT_PASSWORD: agent-service-ci-minio-only-0001
+        run: |
+          mkdir -p "$RUNNER_TEMP/minio-bin" "$RUNNER_TEMP/minio-data"
+          GOTOOLCHAIN=local GOBIN="$RUNNER_TEMP/minio-bin" \
+            go install "github.com/minio/minio@$MINIO_SOURCE_COMMIT"
+          nohup "$RUNNER_TEMP/minio-bin/minio" --quiet --anonymous server \
+            "$RUNNER_TEMP/minio-data" --address 127.0.0.1:9000 \
+            --console-address 127.0.0.1:9001 >"$RUNNER_TEMP/minio.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/minio.pid"
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null; then break; fi
+            if [ "$i" = "90" ]; then echo "MinIO did not become ready"; exit 1; fi
+            sleep 1
+          done
+      - name: Bootstrap private un-versioned MinIO bucket
+        env:
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_TEST_BUCKET: agent-service-ci-test
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: node packages/store/scripts/bootstrap-s3.mjs
 
       - name: Verify OpenAPI and generated SDK are current
         run: pnpm run check:api
@@ -84,6 +118,30 @@ jobs:
           AGENT_SERVICE_INTEGRATION: "1"
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:blob-mysql
+
+      # The write-once storage control is a rolling-upgrade boundary. Keep both the in-memory
+      # atomic contract and real-InnoDB rollback/concurrency suite visible and impossible to skip.
+      - name: Blob storage control memory suite (must execute)
+        run: pnpm run test:blob-storage-control-memory
+
+      - name: Blob storage control real MySQL suite (must execute)
+        env:
+          AGENT_SERVICE_INTEGRATION: "1"
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:blob-storage-control-mysql
+
+      # Exercise the actual S3 protocol against a fixed MinIO source revision. The required-suite
+      # wrapper rejects a missing file, a silently skipped suite, zero assertions, or any non-passing case.
+      - name: Blob S3 real MinIO suite (must execute)
+        env:
+          AGENT_SERVICE_S3_INTEGRATION: "1"
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_TEST_BUCKET: agent-service-ci-test
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: pnpm run test:blob-s3
 
       # Keep a named, verbose, no-skip proof for the lifecycle queue. The broad coverage assertion
       # above cannot by itself prove that this dedicated real-MySQL concurrency file executed.
@@ -245,15 +303,15 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0026
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0027
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority, 0016 -> 0017 user-export and 0018 -> 0019 inert tenant credential
       # revocation substrate, 0019 -> 0020 runtime-proof, 0020 -> 0021 content-inventory and
       # 0021 -> 0022 full-domain purge-plan, 0022 -> 0023 execution-ledger and 0023 -> 0024
-      # database-content deletion, 0024 -> 0025 Redis-purge ledger and 0025 -> 0026 versioned
-      # credential-lifecycle inventory replay matrices.
-      - name: Historical MySQL migrations (0007 through 0026, no skips)
+      # database-content deletion, 0024 -> 0025 Redis-purge ledger, 0025 -> 0026 versioned
+      # credential-lifecycle inventory and 0026 -> 0027 blob-storage control replay matrices.
+      - name: Historical MySQL migrations (0007 through 0027, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -275,6 +333,22 @@ jobs:
 
       - name: Build distributable artifacts and boot plain Node bundles
         run: pnpm run build:check
+
+      # Start the production-shaped bundles against a throwaway MySQL schema and the real MinIO
+      # process above. This proves the bundled AWS SDK closure, migration 0027 activation and exact
+      # fleet namespace negotiation at the application wiring boundary; object-store credentials
+      # are scoped to this step and the smoke passes them only to the runner child.
+      - name: S3 bundled runner/router application assembly smoke (must execute)
+        env:
+          AGENT_SERVICE_APP_SMOKE_MODE: dist
+          MYSQL_APP_SMOKE_URL: mysql://root@127.0.0.1:3306/agent_service_test
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_TEST_BUCKET: agent-service-ci-test
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: pnpm run test:app-s3-smoke
 
       - name: Upload coverage
         if: always()
@@ -358,7 +432,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0026_credential_lifecycle_inventory.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0027_blob_storage_control.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)
