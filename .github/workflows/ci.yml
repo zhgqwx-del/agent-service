@@ -16,8 +16,10 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # Building the pinned official MinIO source adds a few minutes to the existing full matrix.
-    timeout-minutes: 45
+    # The required lifecycle and frozen-migration matrices intentionally run serially against
+    # shared real services. Keep enough headroom for slower hosted runners without weakening or
+    # skipping any named proof; the job still exits as soon as the matrix completes.
+    timeout-minutes: 90
     env:
       MINIO_SOURCE_COMMIT: 07c3a429bfed433e49018cb0f78a52145d4bedeb
     services:
