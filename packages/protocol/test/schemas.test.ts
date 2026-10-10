@@ -31,6 +31,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
@@ -738,6 +739,57 @@ describe("protocol schemas", () => {
         ...base.features,
         tenantCredentialTargetExecution: ["kms-key-destroy-v1"],
       },
+    }).success).toBe(false);
+  });
+
+  it("defaults restore-journal support off and validates all content-free fleet identities", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    expect(base.features).toMatchObject({
+      tenantRestoreJournal: [],
+      tenantRestoreJournalWorker: false,
+      tenantRestoreJournalNamespaceSha256: null,
+      tenantRestoreJournalTargetRootSha256: null,
+      tenantRestoreRuntimeEpochSha256: null,
+    });
+    const aware = Capabilities.parse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantRestoreJournal: [TENANT_RESTORE_JOURNAL_INDEPENDENT_V1],
+        tenantRestoreJournalWorker: true,
+        tenantRestoreJournalNamespaceSha256: "a".repeat(64),
+        tenantRestoreJournalTargetRootSha256: "b".repeat(64),
+        tenantRestoreRuntimeEpochSha256: "c".repeat(64),
+      },
+    });
+    expect(aware.features).toMatchObject({
+      tenantRestoreJournal: [TENANT_RESTORE_JOURNAL_INDEPENDENT_V1],
+      tenantRestoreJournalWorker: true,
+      tenantRestoreJournalNamespaceSha256: "a".repeat(64),
+      tenantRestoreJournalTargetRootSha256: "b".repeat(64),
+      tenantRestoreRuntimeEpochSha256: "c".repeat(64),
+    });
+    expect(Capabilities.safeParse({
+      ...aware,
+      features: { ...aware.features, tenantRestoreRuntimeEpochSha256: "unsafe-epoch" },
+    }).success).toBe(false);
+    expect(Capabilities.safeParse({
+      ...aware,
+      features: { ...aware.features, tenantRestoreJournal: ["restore-journal-v2"] },
     }).success).toBe(false);
   });
 

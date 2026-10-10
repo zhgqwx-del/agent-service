@@ -118,7 +118,16 @@ const distDir = resolve(ROOT, "apps", app, "dist");
 const entryPoints = {
   main: resolve(ROOT, "apps", app, "src", "main.ts"),
   ...(app === "agent-runner"
-    ? { "blob-storage-migrate": resolve(ROOT, "apps", app, "src", "blob-storage-migrate.ts") }
+    ? {
+        "blob-storage-migrate": resolve(ROOT, "apps", app, "src", "blob-storage-migrate.ts"),
+        "restore-ledger-reconcile": resolve(
+          ROOT,
+          "apps",
+          app,
+          "src",
+          "restore-ledger-reconcile.ts",
+        ),
+      }
     : {}),
 };
 // Clean first: a stale artefact, or a migration deleted since the last build, must not ship.

@@ -833,6 +833,7 @@ import {
   type TenantCredentialTargetExecutionTarget,
   type TenantCredentialTargetExecutionTargetAck,
 } from "./tenant-credential-target-execution.js";
+import * as RestoreJournal from "./tenant-restore-journal.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -872,6 +873,16 @@ interface MemoryTenantCredentialTargetReference {
 }
 
 const clone = <T>(v: T): T => structuredClone(v);
+
+function sameTenantRestorePublicationIdentity(
+  left: RestoreJournal.TenantRestoreJournalPublicationIdentity,
+  right: RestoreJournal.TenantRestoreJournalPublicationIdentity,
+): boolean {
+  return left.requestId === right.requestId
+    && left.tenantId === right.tenantId
+    && left.subjectGeneration === right.subjectGeneration
+    && left.publicationGeneration === right.publicationGeneration;
+}
 
 function cloneCredentialSecret(
   secret: { ciphertext: Buffer; keyId: string },
@@ -1129,7 +1140,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1202,6 +1213,72 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       controlGeneration: 0,
     },
   ]]);
+  tenantRestoreJournalControls = new Map<
+    1,
+    RestoreJournal.TenantRestoreJournalControlRecord
+  >([[
+    RestoreJournal.TENANT_RESTORE_JOURNAL_CONTROL_SINGLETON_ID,
+    {
+      singletonId: RestoreJournal.TENANT_RESTORE_JOURNAL_CONTROL_SINGLETON_ID,
+      controlGeneration: 0,
+    },
+  ]]);
+  tenantRestoreJournalControlTargets = new Map<
+    number,
+    RestoreJournal.TenantRestoreJournalTargetDescriptor
+  >();
+  tenantRestoreJournalPublicationJobs = new Map<
+    string,
+    RestoreJournal.TenantRestoreJournalPublicationJobRecord
+  >();
+  tenantRestoreJournalPublicationTargets = new Map<
+    string,
+    RestoreJournal.TenantRestoreJournalPublicationTarget
+  >();
+  tenantRestoreJournalPublicationTargetAcks = new Map<
+    string,
+    RestoreJournal.TenantRestoreJournalPublicationTargetAck
+  >();
+  tenantRestoreJournalPublicationReceipts = new Map<
+    string,
+    RestoreJournal.TenantRestoreJournalPublicationReceipt
+  >();
+  tenantRestoreFences = new Map<string, RestoreJournal.TenantRestoreFence>();
+  tenantRestoreReplayRuns = new Map<string, RestoreJournal.TenantRestoreReplayRunRecord>();
+  tenantRestoreReplaySealedTargets = new Map<
+    string,
+    RestoreJournal.TenantRestoreReplaySealedTarget
+  >();
+  tenantRestoreReplayEntries = new Map<string, RestoreJournal.TenantRestoreReplayEntry>();
+  tenantRestoreReplayReceipts = new Map<string, RestoreJournal.TenantRestoreReplayReceipt>();
+  tenantRestoreRuntimeControls = new Map<
+    1,
+    RestoreJournal.TenantRestoreRuntimeControlRecord
+  >([[
+    RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+    {
+      singletonId: RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+      state: "inactive",
+      controlGeneration: 0,
+    },
+  ]]);
+  tenantRestoreRuntimeHeads = new Map<
+    number,
+    RestoreJournal.TenantRestoreReplaySealedTarget
+  >();
+  tenantRestoreRuntimeControlEvents = new Map<
+    number,
+    Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>
+  >();
+  tenantRestoreRuntimeKnownEntries = new Map<
+    string,
+    {
+      runtimeEpochSha256: string;
+      controlGeneration: number;
+      targetOrdinal: number;
+      entry: RestoreJournal.TenantRestoreJournalRemoteEntry;
+    }
+  >();
   tenantRuntimeRevocationJobs = new Map<string, TenantRuntimeRevocationJobRecord>();
   tenantRuntimeRevocationTargetReceipts = new Map<string, TenantRuntimeRevocationTargetReceipt>();
   tenantRuntimeRevocationReceipts = new Map<string, TenantRuntimeRevocationReceipt>();
@@ -5307,7 +5384,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   private hasTenantErasureAuthorityFence(tenantId: string): boolean {
     return this.tenantErasureAdmission(tenantId) !== undefined
-      || this.tenantCredentialRevocationFences.has(tenantId);
+      || this.tenantCredentialRevocationFences.has(tenantId)
+      || this.tenantRestoreFences.has(tenantId);
   }
 
   async getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState> {
@@ -5315,8 +5393,24 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const lifecycle = this.subjectRecord(tenantId, "tenant", tenantId);
     const admission = this.tenantErasureAdmission(tenantId);
     const fence = this.tenantCredentialRevocationFences.get(tenantId);
+    const restoreFence = this.tenantRestoreFences.get(tenantId);
     if (admission) validateErasureRequestRecordForRead(admission);
     if (fence) validateTenantCredentialRevocationFence(fence);
+    if (restoreFence) {
+      RestoreJournal.validateTenantRestoreFence(restoreFence);
+      if ((admission && (admission.requestId !== restoreFence.requestId
+        || admission.generation !== restoreFence.subjectGeneration))
+        || (fence && (fence.requestId !== restoreFence.requestId
+          || fence.subjectGeneration !== restoreFence.subjectGeneration))) {
+        throw new Error("tenant restore fence conflicts with live erasure authority");
+      }
+      return clone({
+        tenantId,
+        state: "erased" as const,
+        generation: restoreFence.subjectGeneration,
+        activeRequestId: restoreFence.requestId,
+      });
+    }
     if (!lifecycle) {
       if (admission || fence) throw new Error("tenant lifecycle gate is missing for an existing erasure admission");
       return { tenantId, state: "active", generation: 0 };
@@ -5348,11 +5442,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!tenant && (
       this.tenantCredentialRevocationFences.has(tenantId)
       || admission !== undefined
+      || this.tenantRestoreFences.has(tenantId)
     )) throw new SubjectDeletingError(tenantId);
     if (
       (tenant && tenant.state !== "active")
       || admission !== undefined
       || this.tenantCredentialRevocationFences.has(tenantId)
+      || this.tenantRestoreFences.has(tenantId)
     ) throw new SubjectDeletingError(tenantId);
     return tenant;
   }
@@ -5588,6 +5684,2227 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return clone(request);
   }
 
+  // ---------- independent tenant restore journal ----------
+  private tenantRestorePublicationTargetKey(
+    requestId: string,
+    publicationGeneration: number,
+    targetOrdinal: number,
+  ): string {
+    return JSON.stringify([requestId, publicationGeneration, targetOrdinal]);
+  }
+
+  private tenantRestoreReplaySealedTargetKey(
+    restoreRunId: string,
+    targetOrdinal: number,
+  ): string {
+    return JSON.stringify([restoreRunId, targetOrdinal]);
+  }
+
+  private tenantRestoreReplayEntryKey(restoreRunId: string, replayOrdinal: number): string {
+    return JSON.stringify([restoreRunId, replayOrdinal]);
+  }
+
+  private readTenantRestoreJournalControl(
+  ): RestoreJournal.TenantRestoreJournalControlRecord {
+    const control = this.tenantRestoreJournalControls.get(
+      RestoreJournal.TENANT_RESTORE_JOURNAL_CONTROL_SINGLETON_ID,
+    );
+    if (!control || this.tenantRestoreJournalControls.size !== 1) {
+      throw new TenantErasureIntegrityError();
+    }
+    try {
+      RestoreJournal.validateTenantRestoreJournalControlRecord(control);
+      const targets = [...this.tenantRestoreJournalControlTargets.values()]
+        .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+      if (control.controlGeneration === 0) {
+        if (targets.length !== 0
+          || this.tenantRestoreJournalPublicationJobs.size !== 0
+          || this.tenantRestoreJournalPublicationTargets.size !== 0
+          || this.tenantRestoreJournalPublicationTargetAcks.size !== 0
+          || this.tenantRestoreJournalPublicationReceipts.size !== 0
+          || this.tenantRestoreFences.size !== 0
+          || this.tenantRestoreReplayRuns.size !== 0
+          || this.tenantRestoreReplaySealedTargets.size !== 0
+          || this.tenantRestoreReplayEntries.size !== 0
+          || this.tenantRestoreReplayReceipts.size !== 0) {
+          throw new Error("inactive tenant restore journal control has durable restore state");
+        }
+      } else if (targets.length !== control.targetCount
+        || RestoreJournal.tenantRestoreJournalTargetRootSha256(targets)
+          !== control.targetRootSha256
+        || targets.some((target) => (
+          target.adapterProtocol !== control.adapterProtocol
+          || target.journalNamespaceSha256 !== control.journalNamespaceSha256
+        ))) {
+        throw new Error("tenant restore journal control target catalog does not match");
+      }
+      return control;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantRestoreJournalControlTargetsForRead(
+  ): RestoreJournal.TenantRestoreJournalTargetDescriptor[] {
+    const control = this.readTenantRestoreJournalControl();
+    if (control.controlGeneration === 0) return [];
+    return [...this.tenantRestoreJournalControlTargets.values()]
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal)
+      .map(clone);
+  }
+
+  async getTenantRestoreJournalControl(
+  ): Promise<RestoreJournal.TenantRestoreJournalControlRecord> {
+    return clone(this.readTenantRestoreJournalControl());
+  }
+
+  async getTenantRestoreJournalControlTargets(
+  ): Promise<RestoreJournal.TenantRestoreJournalTargetDescriptor[]> {
+    return this.tenantRestoreJournalControlTargetsForRead();
+  }
+
+  async activateTenantRestoreJournalControl(
+    input: RestoreJournal.ActivateTenantRestoreJournalControlInput,
+  ): Promise<Extract<RestoreJournal.TenantRestoreJournalControlRecord, { controlGeneration: 1 }>> {
+    const stagedInput = clone(input);
+    RestoreJournal.validateActivateTenantRestoreJournalControlInput(stagedInput);
+    const current = this.readTenantRestoreJournalControl();
+    const targetRootSha256 = RestoreJournal.tenantRestoreJournalTargetRootSha256(
+      stagedInput.targets,
+    );
+    if (current.controlGeneration === 1) {
+      const firstRuntimeControl = this.tenantRestoreRuntimeControlEvents.get(1);
+      if (current.adapterProtocol !== stagedInput.adapterProtocol
+        || current.journalNamespaceSha256 !== stagedInput.journalNamespaceSha256
+        || current.logicalDatabaseNamespaceSha256
+          !== stagedInput.logicalDatabaseNamespaceSha256
+        || current.targetCount !== stagedInput.targets.length
+        || current.targetRootSha256 !== targetRootSha256
+        || !firstRuntimeControl
+        || firstRuntimeControl.updateKind !== "primary_activation"
+        || firstRuntimeControl.lineageKind !== "primary"
+        || firstRuntimeControl.runtimeEpochSha256 !== stagedInput.runtimeEpochSha256
+        || firstRuntimeControl.verifiedHeadRootSha256
+          !== RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(
+            stagedInput.observedHeads,
+          )) {
+        throw new TenantErasureIntegrityError();
+      }
+      this.readTenantRestoreRuntimeControl();
+      return clone(current);
+    }
+    // A T3a receipt created before the restore journal cannot be reconstructed after credentials
+    // were destroyed. Activation therefore fails closed rather than pretending a later record was
+    // published before the destructive boundary.
+    if (this.tenantCredentialRevocationReceipts.size !== 0) {
+      throw new TenantErasureIntegrityError();
+    }
+    const runtimeCurrent = this.readTenantRestoreRuntimeControl();
+    if (runtimeCurrent.state !== "inactive") throw new TenantErasureIntegrityError();
+    const activatedAtDbMs = this.storeNowMs();
+    const body = {
+      singletonId: RestoreJournal.TENANT_RESTORE_JOURNAL_CONTROL_SINGLETON_ID,
+      controlGeneration: 1 as const,
+      activatedAtDbMs,
+      protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+      adapterProtocol: stagedInput.adapterProtocol,
+      journalNamespaceSha256: stagedInput.journalNamespaceSha256,
+      logicalDatabaseNamespaceSha256: stagedInput.logicalDatabaseNamespaceSha256,
+      targetCount: stagedInput.targets.length,
+      targetRootSha256,
+    };
+    const activated = clone<Extract<
+      RestoreJournal.TenantRestoreJournalControlRecord,
+      { controlGeneration: 1 }
+    >>({
+      ...body,
+      evidenceSha256: RestoreJournal.tenantRestoreJournalControlEvidenceSha256(body),
+    });
+    RestoreJournal.validateTenantRestoreJournalControlRecord(activated);
+    const runtimeBody = {
+      singletonId: RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+      state: "active" as const,
+      controlGeneration: 1,
+      updateKind: "primary_activation" as const,
+      activatedAtDbMs,
+      updatedAtDbMs: activatedAtDbMs,
+      lineageKind: "primary" as const,
+      runtimeEpochSha256: stagedInput.runtimeEpochSha256,
+      controlEvidenceSha256: activated.evidenceSha256,
+      logicalDatabaseNamespaceSha256: activated.logicalDatabaseNamespaceSha256,
+      targetCount: activated.targetCount,
+      targetRootSha256: activated.targetRootSha256,
+      verifiedHeadRootSha256: RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(
+        stagedInput.observedHeads,
+      ),
+      previousControlEvidenceSha256:
+        RestoreJournal.EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256,
+    };
+    const runtimeActivated = clone<Extract<
+      RestoreJournal.TenantRestoreRuntimeControlRecord,
+      { state: "active" }
+    >>({
+      ...runtimeBody,
+      evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(runtimeBody),
+    });
+    RestoreJournal.validateTenantRestoreRuntimeControlRecord(runtimeActivated);
+    const controlsBefore = new Map(this.tenantRestoreJournalControls);
+    const targetsBefore = new Map(this.tenantRestoreJournalControlTargets);
+    const runtimeControlsBefore = new Map(this.tenantRestoreRuntimeControls);
+    const runtimeHeadsBefore = new Map(this.tenantRestoreRuntimeHeads);
+    const runtimeEventsBefore = new Map(this.tenantRestoreRuntimeControlEvents);
+    try {
+      this.tenantRestoreJournalControlTargets.clear();
+      for (const target of stagedInput.targets) {
+        this.tenantRestoreJournalControlTargets.set(target.targetOrdinal, clone(target));
+      }
+      this.tenantRestoreJournalControls.set(
+        RestoreJournal.TENANT_RESTORE_JOURNAL_CONTROL_SINGLETON_ID,
+        activated,
+      );
+      this.tenantRestoreRuntimeHeads.clear();
+      for (const head of stagedInput.observedHeads) {
+        this.tenantRestoreRuntimeHeads.set(head.targetOrdinal, clone(head));
+      }
+      this.tenantRestoreRuntimeControlEvents.set(1, runtimeActivated);
+      this.tenantRestoreRuntimeControls.set(
+        RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+        runtimeActivated,
+      );
+      this.readTenantRestoreJournalControl();
+      this.readTenantRestoreRuntimeControl();
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreJournalControls, controlsBefore);
+      restoreMapSnapshot(this.tenantRestoreJournalControlTargets, targetsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeControls, runtimeControlsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeHeads, runtimeHeadsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeControlEvents, runtimeEventsBefore);
+      throw error;
+    }
+    return clone(activated);
+  }
+
+  private stageTenantRestoreJournalPublication(
+    admission: ErasureRequestRecord,
+    fence: TenantCredentialRevocationFence,
+    sourceEvidenceDbMs: number,
+    firstAudit: ErasureAuditEvent | undefined = this.erasureAuditEvents.get(admission.requestId)?.[0],
+  ): {
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord;
+    targets: RestoreJournal.TenantRestoreJournalPublicationTarget[];
+  } | null {
+    const control = this.readTenantRestoreJournalControl();
+    // The journal singleton and runtime projection are one cutover contract. Prove that coupling
+    // before staging a T1 admission even while the journal is dormant: otherwise a torn control
+    // projection could commit an admission that can never be safely published or replayed.
+    this.readTenantRestoreRuntimeControl();
+    if (control.controlGeneration === 0) return null;
+    try {
+      if (admission.subjectKind !== "tenant"
+        || admission.tenantId !== admission.subjectId
+        || admission.requestId !== fence.requestId
+        || admission.tenantId !== fence.tenantId
+        || admission.generation !== fence.subjectGeneration) {
+        throw new Error("tenant restore publication T1 identity is invalid");
+      }
+      validateTenantErasureImmutableT1Proof({
+        admission,
+        fence,
+        firstAudit,
+      });
+      const publicationGeneration = 1;
+      const operationSha256 = RestoreJournal.tenantRestoreJournalOperationSha256({
+        logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+        requestId: admission.requestId,
+        tenantId: admission.tenantId,
+        subjectGeneration: admission.generation,
+        t1FenceSha256: fence.evidenceSha256,
+      });
+      const recordBody: RestoreJournal.TenantRestoreJournalRecordBody = {
+        scope: RestoreJournal.TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
+        protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+        logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+        requestId: admission.requestId,
+        tenantId: admission.tenantId,
+        subjectGeneration: admission.generation,
+        t1FenceSha256: fence.evidenceSha256,
+        operationSha256,
+      };
+      const recordSha256 = RestoreJournal.tenantRestoreJournalRecordSha256(recordBody);
+      const targets = this.tenantRestoreJournalControlTargetsForRead().map((target) => {
+        const body = {
+          requestId: admission.requestId,
+          tenantId: admission.tenantId,
+          subjectGeneration: admission.generation,
+          publicationGeneration,
+          scope: RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_TARGET_SCOPE,
+          targetOrdinal: target.targetOrdinal,
+          targetSha256: target.targetSha256,
+          failureDomainSha256: target.failureDomainSha256,
+          adapterProtocol: target.adapterProtocol,
+          journalNamespaceSha256: target.journalNamespaceSha256,
+          logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+          t1FenceSha256: fence.evidenceSha256,
+          operationSha256,
+          recordSha256,
+          capturedAtDbMs: sourceEvidenceDbMs,
+        };
+        const row: RestoreJournal.TenantRestoreJournalPublicationTarget = {
+          ...body,
+          receiptSha256: RestoreJournal.tenantRestoreJournalPublicationTargetSha256(body),
+        };
+        RestoreJournal.validateTenantRestoreJournalPublicationTarget(row);
+        return row;
+      });
+      if (targets.length !== control.targetCount) {
+        throw new Error("tenant restore publication target count changed");
+      }
+      const job = clone<RestoreJournal.TenantRestoreJournalPublicationJobRecord>({
+        requestId: admission.requestId,
+        tenantId: admission.tenantId,
+        subjectGeneration: admission.generation,
+        publicationGeneration,
+        t1FenceSha256: fence.evidenceSha256,
+        controlEvidenceSha256: control.evidenceSha256,
+        adapterProtocol: control.adapterProtocol,
+        journalNamespaceSha256: control.journalNamespaceSha256,
+        logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+        targetCount: control.targetCount,
+        targetRootSha256: control.targetRootSha256,
+        sourceEvidenceDbMs,
+        phase: "queued",
+        targetAckCount: 0,
+        targetAckRootSha256:
+          RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_PUBLICATION_TARGET_ACK_ROOT_SHA256,
+        remoteCommitCount: 0,
+        remoteCommitRootSha256:
+          RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_COMMIT_ROOT_SHA256,
+        attempts: 0,
+        availableAtMs: sourceEvidenceDbMs,
+        createdAtMs: sourceEvidenceDbMs,
+        updatedAtMs: sourceEvidenceDbMs,
+      });
+      RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(job);
+      return { job, targets };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async materializeTenantRestoreJournalPublicationJobs(
+    options: RestoreJournal.MaterializeTenantRestoreJournalPublicationJobsOptions,
+  ): Promise<number> {
+    const stagedOptions = clone(options);
+    RestoreJournal.validateMaterializeTenantRestoreJournalPublicationJobsOptions(stagedOptions);
+    const control = this.readTenantRestoreJournalControl();
+    if (control.controlGeneration === 0) return 0;
+    const candidates = [...this.tenantErasureAdmissions.values()]
+      .filter((admission) => !this.tenantRestoreJournalPublicationJobs.has(admission.requestId))
+      .sort((left, right) => left.requestId.localeCompare(right.requestId))
+      .slice(0, stagedOptions.limit);
+    const nowMs = this.storeNowMs();
+    const staged: Array<ReturnType<MemorySessionStore["stageTenantRestoreJournalPublication"]>> = [];
+    for (const admission of candidates) {
+      const fence = this.tenantCredentialRevocationFences.get(admission.tenantId);
+      if (!fence || this.tenantCredentialRevocationReceipts.has(admission.requestId)) {
+        throw new TenantErasureIntegrityError();
+      }
+      staged.push(this.stageTenantRestoreJournalPublication(admission, fence, nowMs));
+    }
+    const jobsBefore = new Map(this.tenantRestoreJournalPublicationJobs);
+    const targetsBefore = new Map(this.tenantRestoreJournalPublicationTargets);
+    try {
+      for (const publication of staged) {
+        if (!publication) throw new TenantErasureIntegrityError();
+        this.tenantRestoreJournalPublicationJobs.set(publication.job.requestId, publication.job);
+        for (const target of publication.targets) {
+          this.tenantRestoreJournalPublicationTargets.set(
+            this.tenantRestorePublicationTargetKey(
+              target.requestId,
+              target.publicationGeneration,
+              target.targetOrdinal,
+            ),
+            target,
+          );
+        }
+      }
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationTargets, targetsBefore);
+      throw error;
+    }
+    return staged.length;
+  }
+
+  private tenantRestorePublicationTargetsFor(
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+  ): RestoreJournal.TenantRestoreJournalPublicationTarget[] {
+    return [...this.tenantRestoreJournalPublicationTargets.values()]
+      .filter((target) => target.requestId === job.requestId
+        && target.publicationGeneration === job.publicationGeneration)
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+  }
+
+  private tenantRestorePublicationAcksFor(
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+  ): RestoreJournal.TenantRestoreJournalPublicationTargetAck[] {
+    return [...this.tenantRestoreJournalPublicationTargetAcks.values()]
+      .filter((ack) => ack.requestId === job.requestId
+        && ack.publicationGeneration === job.publicationGeneration)
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+  }
+
+  private tenantRestorePublicationSource(
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+  ): RestoreJournal.TenantRestoreJournalPublicationSource {
+    return {
+      requestId: job.requestId,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      publicationGeneration: job.publicationGeneration,
+      t1FenceSha256: job.t1FenceSha256,
+      controlEvidenceSha256: job.controlEvidenceSha256,
+      adapterProtocol: job.adapterProtocol,
+      journalNamespaceSha256: job.journalNamespaceSha256,
+      logicalDatabaseNamespaceSha256: job.logicalDatabaseNamespaceSha256,
+      targetCount: job.targetCount,
+      targetRootSha256: job.targetRootSha256,
+      sourceEvidenceDbMs: job.sourceEvidenceDbMs,
+    };
+  }
+
+  private tenantRestorePublicationAuthorized(
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    nowMs: number,
+  ): job is Extract<
+    RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+    { phase: "queued" }
+  > {
+    return job.phase === "queued"
+      && job.requestId === authorization.requestId
+      && job.tenantId === authorization.tenantId
+      && job.subjectGeneration === authorization.subjectGeneration
+      && job.publicationGeneration === authorization.publicationGeneration
+      && job.attempts === authorization.claimAttempt
+      && job.claimToken === authorization.claimToken
+      && job.leaseUntilMs !== undefined
+      && job.leaseUntilMs > nowMs;
+  }
+
+  private assertTenantRestoreJournalPublicationEvidence(
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+  ): {
+    targets: RestoreJournal.TenantRestoreJournalPublicationTarget[];
+    acks: RestoreJournal.TenantRestoreJournalPublicationTargetAck[];
+    receipt?: RestoreJournal.TenantRestoreJournalPublicationReceipt;
+  } {
+    try {
+      RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(job);
+      const control = this.readTenantRestoreJournalControl();
+      if (control.controlGeneration !== 1
+        || job.controlEvidenceSha256 !== control.evidenceSha256
+        || job.adapterProtocol !== control.adapterProtocol
+        || job.journalNamespaceSha256 !== control.journalNamespaceSha256
+        || job.logicalDatabaseNamespaceSha256 !== control.logicalDatabaseNamespaceSha256
+        || job.targetCount !== control.targetCount
+        || job.targetRootSha256 !== control.targetRootSha256
+        || job.publicationGeneration !== 1) {
+        throw new Error("tenant restore publication control binding is invalid");
+      }
+      const admission = this.tenantErasureAdmissions.get(job.requestId);
+      const fence = this.tenantCredentialRevocationFences.get(job.tenantId);
+      if (admission && fence) {
+        validateTenantErasureImmutableT1Proof({
+          admission,
+          fence,
+          firstAudit: this.erasureAuditEvents.get(job.requestId)?.[0],
+        });
+        if (admission.tenantId !== job.tenantId
+          || admission.generation !== job.subjectGeneration
+          || fence.requestId !== job.requestId
+          || fence.evidenceSha256 !== job.t1FenceSha256) {
+          throw new Error("tenant restore publication T1 binding is invalid");
+        }
+      } else if (job.phase !== "published" || admission || fence) {
+        throw new Error("tenant restore publication T1 source is incomplete");
+      }
+      const targets = this.tenantRestorePublicationTargetsFor(job);
+      const controlTargets = this.tenantRestoreJournalControlTargetsForRead();
+      if (targets.length !== job.targetCount || controlTargets.length !== targets.length) {
+        throw new Error("tenant restore publication target catalog is incomplete");
+      }
+      for (const [ordinal, target] of targets.entries()) {
+        RestoreJournal.validateTenantRestoreJournalPublicationTarget(target);
+        const configured = controlTargets[ordinal];
+        if (!configured
+          || target.targetOrdinal !== ordinal
+          || target.targetSha256 !== configured.targetSha256
+          || target.failureDomainSha256 !== configured.failureDomainSha256
+          || target.adapterProtocol !== configured.adapterProtocol
+          || target.journalNamespaceSha256 !== configured.journalNamespaceSha256
+          || target.requestId !== job.requestId
+          || target.tenantId !== job.tenantId
+          || target.subjectGeneration !== job.subjectGeneration
+          || target.publicationGeneration !== job.publicationGeneration
+          || target.t1FenceSha256 !== job.t1FenceSha256
+          || target.logicalDatabaseNamespaceSha256 !== job.logicalDatabaseNamespaceSha256
+          || target.capturedAtDbMs !== job.sourceEvidenceDbMs) {
+          throw new Error("tenant restore publication target binding is invalid");
+        }
+      }
+      const acks = this.tenantRestorePublicationAcksFor(job);
+      if (acks.length !== job.targetAckCount
+        || RestoreJournal.tenantRestoreJournalPublicationTargetAckRootSha256(acks)
+          !== job.targetAckRootSha256
+        || RestoreJournal.tenantRestoreJournalRemoteCommitRootSha256(acks)
+          !== job.remoteCommitRootSha256
+        || job.remoteCommitCount !== acks.length) {
+        throw new Error("tenant restore publication ACK roots do not match");
+      }
+      for (const ack of acks) {
+        const target = targets[ack.targetOrdinal];
+        if (!target || ack.targetSha256 !== target.targetSha256
+          || ack.failureDomainSha256 !== target.failureDomainSha256
+          || ack.targetReceiptSha256 !== target.receiptSha256
+          || ack.operationSha256 !== target.operationSha256
+          || ack.recordSha256 !== target.recordSha256
+          || ack.adapterProtocol !== target.adapterProtocol
+          || ack.journalNamespaceSha256 !== target.journalNamespaceSha256
+          || ack.logicalDatabaseNamespaceSha256 !== target.logicalDatabaseNamespaceSha256
+          || ack.storeDbTimestampMs < target.capturedAtDbMs
+          || ack.completedClaimAttempt > job.attempts
+          || !sameTenantRestorePublicationIdentity(ack, job)) {
+          throw new Error("tenant restore publication ACK does not match its target");
+        }
+      }
+      const receipt = this.tenantRestoreJournalPublicationReceipts.get(job.requestId);
+      if (job.phase === "published") {
+        if (!receipt) throw new Error("published tenant restore journal job lacks receipt");
+        RestoreJournal.validateTenantRestoreJournalPublicationReceipt(receipt);
+        if (receipt.receiptSha256 !== job.terminalReceiptSha256
+          || !sameTenantRestorePublicationIdentity(receipt, job)
+          || receipt.t1FenceSha256 !== job.t1FenceSha256
+          || receipt.controlEvidenceSha256 !== job.controlEvidenceSha256
+          || receipt.adapterProtocol !== job.adapterProtocol
+          || receipt.journalNamespaceSha256 !== job.journalNamespaceSha256
+          || receipt.logicalDatabaseNamespaceSha256 !== job.logicalDatabaseNamespaceSha256
+          || receipt.targetCount !== job.targetCount
+          || receipt.targetRootSha256 !== job.targetRootSha256
+          || receipt.sourceEvidenceDbMs !== job.sourceEvidenceDbMs
+          || receipt.targetAckCount !== acks.length
+          || receipt.targetAckRootSha256 !== job.targetAckRootSha256
+          || receipt.remoteCommitCount !== job.remoteCommitCount
+          || receipt.remoteCommitRootSha256 !== job.remoteCommitRootSha256
+          || receipt.completedClaimAttempt !== job.completedClaimAttempt
+          || receipt.completedClaimTokenSha256 !== job.completedClaimTokenSha256
+          || receipt.storeDbTimestampMs !== job.sealedAtDbMs) {
+          throw new Error("tenant restore publication receipt does not match terminal job");
+        }
+      } else if (receipt) {
+        throw new Error("nonterminal tenant restore journal job has receipt");
+      }
+      return { targets, acks, ...(receipt ? { receipt } : {}) };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private assertTenantRestoreJournalGlobalRelations(): void {
+    this.readTenantRestoreJournalControl();
+    try {
+      for (const [requestId, job] of this.tenantRestoreJournalPublicationJobs) {
+        if (requestId !== job.requestId) throw new Error("restore publication job key changed");
+        this.assertTenantRestoreJournalPublicationEvidence(job);
+      }
+      for (const [key, target] of this.tenantRestoreJournalPublicationTargets) {
+        const job = this.tenantRestoreJournalPublicationJobs.get(target.requestId);
+        if (!job || key !== this.tenantRestorePublicationTargetKey(
+          target.requestId,
+          target.publicationGeneration,
+          target.targetOrdinal,
+        )) throw new Error("orphan tenant restore publication target");
+      }
+      for (const [key, ack] of this.tenantRestoreJournalPublicationTargetAcks) {
+        const job = this.tenantRestoreJournalPublicationJobs.get(ack.requestId);
+        if (!job || key !== this.tenantRestorePublicationTargetKey(
+          ack.requestId,
+          ack.publicationGeneration,
+          ack.targetOrdinal,
+        )) throw new Error("orphan tenant restore publication ACK");
+      }
+      for (const [requestId, receipt] of this.tenantRestoreJournalPublicationReceipts) {
+        const job = this.tenantRestoreJournalPublicationJobs.get(requestId);
+        if (!job || job.phase !== "published" || receipt.requestId !== requestId
+          || job.terminalReceiptSha256 !== receipt.receiptSha256) {
+          throw new Error("orphan tenant restore publication receipt");
+        }
+      }
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async claimTenantRestoreJournalPublications(
+    options: RestoreJournal.ClaimTenantRestoreJournalPublicationsOptions,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationClaim[]> {
+    const stagedOptions = clone(options);
+    RestoreJournal.validateClaimTenantRestoreJournalPublicationsOptions(stagedOptions);
+    this.assertTenantRestoreJournalGlobalRelations();
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = nowMs + stagedOptions.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("restore publication lease overflow");
+    const candidates = [...this.tenantRestoreJournalPublicationJobs.values()]
+      .filter((job): job is Extract<
+        RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+        { phase: "queued" }
+      > => job.phase === "queued" && job.availableAtMs <= nowMs
+        && (job.claimToken === undefined || job.leaseUntilMs! <= nowMs))
+      .sort((left, right) => left.availableAtMs - right.availableAtMs
+        || left.requestId.localeCompare(right.requestId))
+      .slice(0, stagedOptions.limit);
+    const staged: RestoreJournal.TenantRestoreJournalPublicationJobRecord[] = [];
+    const claims: RestoreJournal.TenantRestoreJournalPublicationClaim[] = [];
+    for (const current of candidates) {
+      const attempts = current.attempts + 1;
+      if (!Number.isSafeInteger(attempts)) throw new Error("restore publication attempts overflow");
+      const next = clone<RestoreJournal.TenantRestoreJournalPublicationJobRecord>({
+        ...this.tenantRestorePublicationSource(current),
+        phase: "queued",
+        targetAckCount: current.targetAckCount,
+        targetAckRootSha256: current.targetAckRootSha256,
+        remoteCommitCount: current.remoteCommitCount,
+        remoteCommitRootSha256: current.remoteCommitRootSha256,
+        attempts,
+        availableAtMs: current.availableAtMs,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+        createdAtMs: current.createdAtMs,
+        updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      });
+      RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(next);
+      const claim = clone<RestoreJournal.TenantRestoreJournalPublicationClaim>({
+        ...this.tenantRestorePublicationSource(next),
+        phase: "queued",
+        claimAttempt: attempts,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+      });
+      RestoreJournal.validateTenantRestoreJournalPublicationClaim(claim);
+      staged.push(next);
+      claims.push(claim);
+    }
+    const before = new Map(this.tenantRestoreJournalPublicationJobs);
+    try {
+      for (const job of staged) this.tenantRestoreJournalPublicationJobs.set(job.requestId, job);
+      this.assertTenantRestoreJournalGlobalRelations();
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationJobs, before);
+      throw error;
+    }
+    return claims.map(clone);
+  }
+
+  async renewTenantRestoreJournalPublication(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    options: RestoreJournal.RenewTenantRestoreJournalPublicationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(stagedAuthorization);
+    RestoreJournal.validateRenewTenantRestoreJournalPublicationOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantRestoreJournalPublicationJobs.get(stagedAuthorization.requestId);
+    if (!current || !this.tenantRestorePublicationAuthorized(current, stagedAuthorization, nowMs)) {
+      return false;
+    }
+    this.assertTenantRestoreJournalPublicationEvidence(current);
+    const leaseUntilMs = nowMs + stagedOptions.leaseMs;
+    if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("restore publication lease overflow");
+    const next = clone<RestoreJournal.TenantRestoreJournalPublicationJobRecord>({
+      ...current,
+      leaseUntilMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(next);
+    this.tenantRestoreJournalPublicationJobs.set(current.requestId, next);
+    return true;
+  }
+
+  async retryTenantRestoreJournalPublication(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    options: RestoreJournal.RetryTenantRestoreJournalPublicationOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(stagedAuthorization);
+    RestoreJournal.validateRetryTenantRestoreJournalPublicationOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantRestoreJournalPublicationJobs.get(stagedAuthorization.requestId);
+    if (!current || !this.tenantRestorePublicationAuthorized(current, stagedAuthorization, nowMs)) {
+      return false;
+    }
+    this.assertTenantRestoreJournalPublicationEvidence(current);
+    const availableAtMs = nowMs + stagedOptions.delayMs;
+    if (!Number.isSafeInteger(availableAtMs)) throw new Error("restore publication retry overflow");
+    const next = clone<RestoreJournal.TenantRestoreJournalPublicationJobRecord>({
+      ...this.tenantRestorePublicationSource(current),
+      phase: "queued",
+      targetAckCount: current.targetAckCount,
+      targetAckRootSha256: current.targetAckRootSha256,
+      remoteCommitCount: current.remoteCommitCount,
+      remoteCommitRootSha256: current.remoteCommitRootSha256,
+      attempts: current.attempts,
+      availableAtMs,
+      lastErrorCode: stagedOptions.errorCode,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(next);
+    this.tenantRestoreJournalPublicationJobs.set(current.requestId, next);
+    return true;
+  }
+
+  async blockTenantRestoreJournalPublication(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    reason: RestoreJournal.TenantRestoreJournalPublicationBlockReasonCode = "remote_conflict",
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(stagedAuthorization);
+    if (!(reason === "source_conflict" || reason === "remote_conflict")) {
+      throw new Error("restore publication block reason is invalid");
+    }
+    const nowMs = this.storeNowMs();
+    const current = this.tenantRestoreJournalPublicationJobs.get(stagedAuthorization.requestId);
+    if (!current || !this.tenantRestorePublicationAuthorized(current, stagedAuthorization, nowMs)) {
+      return false;
+    }
+    this.assertTenantRestoreJournalPublicationEvidence(current);
+    const blocked = clone<RestoreJournal.TenantRestoreJournalPublicationJobRecord>({
+      ...this.tenantRestorePublicationSource(current),
+      phase: "blocked",
+      targetAckCount: current.targetAckCount,
+      targetAckRootSha256: current.targetAckRootSha256,
+      remoteCommitCount: current.remoteCommitCount,
+      remoteCommitRootSha256: current.remoteCommitRootSha256,
+      attempts: current.attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      blockedAtDbMs: nowMs,
+      blockedReasonCode: reason,
+    });
+    RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(blocked);
+    this.tenantRestoreJournalPublicationJobs.set(current.requestId, blocked);
+    return true;
+  }
+
+  async getTenantRestoreJournalPublicationRecord(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    targetOrdinal: number,
+  ): Promise<{
+    target: RestoreJournal.TenantRestoreJournalPublicationTarget;
+    record: RestoreJournal.TenantRestoreJournalRecord;
+  } | null> {
+    const stagedAuthorization = clone(authorization);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(stagedAuthorization);
+    if (!Number.isSafeInteger(targetOrdinal) || targetOrdinal < 0) {
+      throw new Error("restore publication target ordinal is invalid");
+    }
+    const nowMs = this.storeNowMs();
+    const job = this.tenantRestoreJournalPublicationJobs.get(stagedAuthorization.requestId);
+    if (!job || !this.tenantRestorePublicationAuthorized(job, stagedAuthorization, nowMs)) {
+      return null;
+    }
+    const { targets } = this.assertTenantRestoreJournalPublicationEvidence(job);
+    const target = targets[targetOrdinal];
+    if (!target) return null;
+    const record: RestoreJournal.TenantRestoreJournalRecord = {
+      scope: RestoreJournal.TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
+      protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+      logicalDatabaseNamespaceSha256: target.logicalDatabaseNamespaceSha256,
+      requestId: target.requestId,
+      tenantId: target.tenantId,
+      subjectGeneration: target.subjectGeneration,
+      t1FenceSha256: target.t1FenceSha256,
+      operationSha256: target.operationSha256,
+      recordSha256: target.recordSha256,
+    };
+    RestoreJournal.validateTenantRestoreJournalRecord(record);
+    return { target: clone(target), record: clone(record) };
+  }
+
+  async recordTenantRestoreJournalPublicationTargetAck(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    result: RestoreJournal.TenantRestoreJournalAdapterResult,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationTargetAck | null> {
+    const stagedAuthorization = clone(authorization);
+    const stagedResult = clone(result);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(stagedAuthorization);
+    RestoreJournal.validateTenantRestoreJournalAdapterResult(stagedResult);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantRestoreJournalPublicationJobs.get(stagedAuthorization.requestId);
+    if (!current || !this.tenantRestorePublicationAuthorized(current, stagedAuthorization, nowMs)) {
+      return null;
+    }
+    const { targets, acks } = this.assertTenantRestoreJournalPublicationEvidence(current);
+    const target = targets.find((candidate) => candidate.targetSha256 === stagedResult.targetSha256);
+    if (!target
+      || stagedResult.adapterProtocol !== target.adapterProtocol
+      || stagedResult.journalNamespaceSha256 !== target.journalNamespaceSha256
+      || stagedResult.logicalDatabaseNamespaceSha256 !== target.logicalDatabaseNamespaceSha256
+      || stagedResult.record.recordSha256 !== target.recordSha256
+      || stagedResult.record.operationSha256 !== target.operationSha256
+      || stagedResult.record.requestId !== target.requestId
+      || stagedResult.record.tenantId !== target.tenantId
+      || stagedResult.record.subjectGeneration !== target.subjectGeneration
+      || stagedResult.record.t1FenceSha256 !== target.t1FenceSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const existing = acks.find((ack) => ack.targetOrdinal === target.targetOrdinal);
+    if (existing) {
+      if (existing.remoteSequence !== stagedResult.remoteSequence
+        || existing.previousHeadRootSha256 !== stagedResult.previousHeadRootSha256
+        || existing.headRootSha256 !== stagedResult.headRootSha256
+        || existing.recordSha256 !== stagedResult.record.recordSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      // Exact response-loss replay is safe only while the ACK's atomic runtime projection remains
+      // intact. Reconstruct the complete event/head/known-entry chain before returning terminal
+      // evidence; a surviving ACK must never mask a torn or corrupted runtime checkpoint.
+      this.assertTenantRestorePublicationAckIsRuntimeProjected(target, existing);
+      return clone(existing);
+    }
+    const body = {
+      requestId: target.requestId,
+      tenantId: target.tenantId,
+      subjectGeneration: target.subjectGeneration,
+      publicationGeneration: target.publicationGeneration,
+      scope: RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_TARGET_ACK_SCOPE,
+      targetOrdinal: target.targetOrdinal,
+      targetSha256: target.targetSha256,
+      failureDomainSha256: target.failureDomainSha256,
+      targetReceiptSha256: target.receiptSha256,
+      operationSha256: target.operationSha256,
+      recordSha256: target.recordSha256,
+      adapterProtocol: target.adapterProtocol,
+      journalNamespaceSha256: target.journalNamespaceSha256,
+      logicalDatabaseNamespaceSha256: target.logicalDatabaseNamespaceSha256,
+      remoteSequence: stagedResult.remoteSequence,
+      previousHeadRootSha256: stagedResult.previousHeadRootSha256,
+      headRootSha256: stagedResult.headRootSha256,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: RestoreJournal.tenantRestoreJournalClaimTokenSha256(
+        stagedAuthorization.claimToken,
+      ),
+      storeDbTimestampMs: nowMs,
+    };
+    const ack: RestoreJournal.TenantRestoreJournalPublicationTargetAck = {
+      ...body,
+      receiptSha256: RestoreJournal.tenantRestoreJournalPublicationTargetAckSha256(body),
+    };
+    RestoreJournal.validateTenantRestoreJournalPublicationTargetAck(ack);
+    const nextAcks = [...acks, ack].sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+    const next = clone<RestoreJournal.TenantRestoreJournalPublicationJobRecord>({
+      ...current,
+      targetAckCount: nextAcks.length,
+      targetAckRootSha256:
+        RestoreJournal.tenantRestoreJournalPublicationTargetAckRootSha256(nextAcks),
+      remoteCommitCount: nextAcks.length,
+      remoteCommitRootSha256: RestoreJournal.tenantRestoreJournalRemoteCommitRootSha256(nextAcks),
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(next);
+    const runtimeAdvance = this.stageTenantRestoreRuntimeHeadAdvance(
+      target.targetOrdinal,
+      {
+        targetSha256: stagedResult.targetSha256,
+        remoteSequence: stagedResult.remoteSequence,
+        previousHeadRootSha256: stagedResult.previousHeadRootSha256,
+        headRootSha256: stagedResult.headRootSha256,
+        record: stagedResult.record,
+      },
+      undefined,
+      true,
+    );
+    const key = this.tenantRestorePublicationTargetKey(
+      ack.requestId,
+      ack.publicationGeneration,
+      ack.targetOrdinal,
+    );
+    const jobsBefore = new Map(this.tenantRestoreJournalPublicationJobs);
+    const acksBefore = new Map(this.tenantRestoreJournalPublicationTargetAcks);
+    const runtimeControlsBefore = new Map(this.tenantRestoreRuntimeControls);
+    const runtimeHeadsBefore = new Map(this.tenantRestoreRuntimeHeads);
+    const runtimeEventsBefore = new Map(this.tenantRestoreRuntimeControlEvents);
+    const runtimeKnownBefore = new Map(this.tenantRestoreRuntimeKnownEntries);
+    try {
+      this.tenantRestoreJournalPublicationTargetAcks.set(key, ack);
+      this.tenantRestoreJournalPublicationJobs.set(current.requestId, next);
+      this.applyTenantRestoreRuntimeHeadAdvance(runtimeAdvance);
+      this.assertTenantRestoreJournalPublicationEvidence(next);
+      this.readTenantRestoreRuntimeControl();
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationTargetAcks, acksBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeControls, runtimeControlsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeHeads, runtimeHeadsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeControlEvents, runtimeEventsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeKnownEntries, runtimeKnownBefore);
+      throw error;
+    }
+    return clone(ack);
+  }
+
+  async sealTenantRestoreJournalPublication(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(stagedAuthorization);
+    const existing = this.tenantRestoreJournalPublicationJobs.get(stagedAuthorization.requestId);
+    if (!existing || existing.tenantId !== stagedAuthorization.tenantId) return null;
+    if (existing.phase === "published") {
+      const { targets, acks, receipt } = this.assertTenantRestoreJournalPublicationEvidence(existing);
+      const exactReplay = existing.completedClaimAttempt === stagedAuthorization.claimAttempt
+        && existing.completedClaimTokenSha256
+          === RestoreJournal.tenantRestoreJournalClaimTokenSha256(stagedAuthorization.claimToken)
+        ? receipt!
+        : null;
+      if (!exactReplay) return null;
+      // The publication receipt and its ACKs are one side of the commit boundary; the runtime
+      // event/head/known-entry projection is the other. Exact terminal replay must validate both.
+      for (const [targetOrdinal, target] of targets.entries()) {
+        const ack = acks[targetOrdinal];
+        if (!ack || ack.targetOrdinal !== targetOrdinal) throw new TenantErasureIntegrityError();
+        this.assertTenantRestorePublicationAckIsRuntimeProjected(target, ack);
+      }
+      return clone(exactReplay);
+    }
+    const nowMs = this.storeNowMs();
+    if (!this.tenantRestorePublicationAuthorized(existing, stagedAuthorization, nowMs)) return null;
+    const { targets, acks } = this.assertTenantRestoreJournalPublicationEvidence(existing);
+    if (acks.length !== existing.targetCount) return null;
+    for (const [targetOrdinal, target] of targets.entries()) {
+      const ack = acks[targetOrdinal];
+      if (!ack || ack.targetOrdinal !== targetOrdinal) throw new TenantErasureIntegrityError();
+      this.assertTenantRestorePublicationAckIsRuntimeProjected(target, ack);
+    }
+    const completedClaimTokenSha256 = RestoreJournal.tenantRestoreJournalClaimTokenSha256(
+      stagedAuthorization.claimToken,
+    );
+    const receiptBody = {
+      ...this.tenantRestorePublicationSource(existing),
+      scope: RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_RECEIPT_SCOPE,
+      targetAckCount: acks.length,
+      targetAckRootSha256:
+        RestoreJournal.tenantRestoreJournalPublicationTargetAckRootSha256(acks),
+      remoteCommitCount: acks.length,
+      remoteCommitRootSha256: RestoreJournal.tenantRestoreJournalRemoteCommitRootSha256(acks),
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256,
+      storeDbTimestampMs: nowMs,
+      restoreFencePublicationComplete: true as const,
+      restoreFenceReplayComplete: false as const,
+      physicalReplayComplete: false as const,
+      allDomainsComplete: false as const,
+      contentPurgeExecuted: false as const,
+    };
+    const receipt: RestoreJournal.TenantRestoreJournalPublicationReceipt = {
+      ...receiptBody,
+      receiptSha256: RestoreJournal.tenantRestoreJournalPublicationReceiptSha256(receiptBody),
+    };
+    const terminal = clone<RestoreJournal.TenantRestoreJournalPublicationJobRecord>({
+      ...this.tenantRestorePublicationSource(existing),
+      phase: "published",
+      targetAckCount: acks.length,
+      targetAckRootSha256: receipt.targetAckRootSha256,
+      remoteCommitCount: acks.length,
+      remoteCommitRootSha256: receipt.remoteCommitRootSha256,
+      attempts: existing.attempts,
+      createdAtMs: existing.createdAtMs,
+      updatedAtMs: Math.max(existing.updatedAtMs, nowMs),
+      terminalReceiptSha256: receipt.receiptSha256,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256,
+      sealedAtDbMs: nowMs,
+    });
+    RestoreJournal.validateTenantRestoreJournalPublicationReceipt(receipt);
+    RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(terminal);
+    const jobsBefore = new Map(this.tenantRestoreJournalPublicationJobs);
+    const receiptsBefore = new Map(this.tenantRestoreJournalPublicationReceipts);
+    try {
+      const publishNowMs = this.storeNowMs();
+      const publishCurrent = this.tenantRestoreJournalPublicationJobs.get(existing.requestId);
+      if (!publishCurrent
+        || !this.tenantRestorePublicationAuthorized(
+          publishCurrent,
+          stagedAuthorization,
+          publishNowMs,
+        )) return null;
+      this.tenantRestoreJournalPublicationReceipts.set(existing.requestId, receipt);
+      this.tenantRestoreJournalPublicationJobs.set(existing.requestId, terminal);
+      this.assertTenantRestoreJournalPublicationEvidence(terminal);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationReceipts, receiptsBefore);
+      throw error;
+    }
+    return clone(receipt);
+  }
+
+  async getTenantRestoreJournalPublicationJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationJobRecord | null> {
+    const job = this.tenantRestoreJournalPublicationJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    this.assertTenantRestoreJournalPublicationEvidence(job);
+    return clone(job);
+  }
+
+  async getTenantRestoreJournalPublicationBundle(
+    tenantId: string,
+    requestId: string,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationBundle | null> {
+    const job = this.tenantRestoreJournalPublicationJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    const evidence = this.assertTenantRestoreJournalPublicationEvidence(job);
+    return clone({
+      targets: evidence.targets,
+      targetAcks: evidence.acks,
+      ...(evidence.receipt ? { receipt: evidence.receipt } : {}),
+    });
+  }
+
+  async hasTenantRestoreJournalPublicationWork(): Promise<boolean> {
+    this.assertTenantRestoreJournalGlobalRelations();
+    return this.tenantRestoreJournalPublicationJobs.size > 0;
+  }
+
+  private tenantRestoreRuntimeKnownEntryKey(
+    runtimeEpochSha256: string,
+    targetSha256: string,
+    remoteSequence: number,
+  ): string {
+    return JSON.stringify([runtimeEpochSha256, targetSha256, remoteSequence]);
+  }
+
+  private tenantRestoreReplayTargetsFor(
+    restoreRunId: string,
+  ): RestoreJournal.TenantRestoreReplaySealedTarget[] {
+    return [...this.tenantRestoreReplaySealedTargets.entries()]
+      .filter(([key, target]) => key === this.tenantRestoreReplaySealedTargetKey(
+        restoreRunId,
+        target.targetOrdinal,
+      ))
+      .map(([, target]) => target)
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+  }
+
+  private tenantRestoreReplayEntriesFor(
+    restoreRunId: string,
+  ): RestoreJournal.TenantRestoreReplayEntry[] {
+    return [...this.tenantRestoreReplayEntries.values()]
+      .filter((entry) => entry.restoreRunId === restoreRunId)
+      .sort((left, right) => left.replayOrdinal - right.replayOrdinal);
+  }
+
+  private tenantRestoreReplayFencesFor(
+    entries: readonly RestoreJournal.TenantRestoreReplayEntry[],
+  ): RestoreJournal.TenantRestoreFence[] {
+    const unique = new Map<string, RestoreJournal.TenantRestoreFence>();
+    for (const entry of entries) {
+      const fence = this.tenantRestoreFences.get(entry.tenantId);
+      if (!fence || fence.fenceSha256 !== entry.fenceSha256
+        || fence.recordSha256 !== entry.recordSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      unique.set(fence.tenantId, fence);
+    }
+    return [...unique.values()].sort((left, right) => left.tenantId.localeCompare(right.tenantId));
+  }
+
+  private readTenantRestoreRuntimeControl(
+  ): RestoreJournal.TenantRestoreRuntimeControlRecord {
+    const control = this.tenantRestoreRuntimeControls.get(
+      RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+    );
+    if (!control || this.tenantRestoreRuntimeControls.size !== 1) {
+      throw new TenantErasureIntegrityError();
+    }
+    try {
+      RestoreJournal.validateTenantRestoreRuntimeControlRecord(control);
+      const journalControl = this.readTenantRestoreJournalControl();
+      const heads = [...this.tenantRestoreRuntimeHeads.values()]
+        .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+      if (control.state === "inactive") {
+        if (heads.length !== 0 || this.tenantRestoreRuntimeControlEvents.size !== 0
+          || this.tenantRestoreRuntimeKnownEntries.size !== 0
+          || journalControl.controlGeneration !== 0) {
+          throw new Error("inactive tenant restore runtime has active evidence");
+        }
+      } else {
+        if (journalControl.controlGeneration !== 1
+          || control.controlEvidenceSha256 !== journalControl.evidenceSha256
+          || control.logicalDatabaseNamespaceSha256
+            !== journalControl.logicalDatabaseNamespaceSha256
+          || control.targetCount !== journalControl.targetCount
+          || control.targetRootSha256 !== journalControl.targetRootSha256) {
+          throw new Error("active tenant restore runtime does not match journal control");
+        }
+        if (this.tenantRestoreRuntimeControlEvents.size !== control.controlGeneration) {
+          throw new Error("tenant restore runtime control chain has a gap");
+        }
+        let previous = RestoreJournal.EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256;
+        let previousEvent: Extract<
+          RestoreJournal.TenantRestoreRuntimeControlRecord,
+          { state: "active" }
+        > | undefined;
+        let reconstructedHeads: RestoreJournal.TenantRestoreReplaySealedTarget[] = [];
+        const consumedKnownEntries = new Set<string>();
+        const epochs = new Set<string>();
+        for (let generation = 1; generation <= control.controlGeneration; generation += 1) {
+          const event = this.tenantRestoreRuntimeControlEvents.get(generation);
+          if (!event || event.controlGeneration !== generation
+            || event.previousControlEvidenceSha256 !== previous) {
+            throw new Error("tenant restore runtime control chain is broken");
+          }
+          RestoreJournal.validateTenantRestoreRuntimeControlRecord(event);
+          if (event.controlEvidenceSha256 !== journalControl.evidenceSha256
+            || event.logicalDatabaseNamespaceSha256
+              !== journalControl.logicalDatabaseNamespaceSha256
+            || event.targetCount !== journalControl.targetCount
+            || event.targetRootSha256 !== journalControl.targetRootSha256
+            || (previousEvent && event.updatedAtDbMs < previousEvent.updatedAtDbMs)) {
+            throw new Error("tenant restore runtime event does not match journal control");
+          }
+          if (event.updateKind === "primary_activation") {
+            if (generation !== 1 || event.lineageKind !== "primary"
+              || epochs.has(event.runtimeEpochSha256)) {
+              throw new Error("tenant restore primary runtime activation is invalid");
+            }
+            const emptyHeads = this.tenantRestoreJournalControlTargetsForRead().map((target) => ({
+              ...target,
+              logicalDatabaseNamespaceSha256: journalControl.logicalDatabaseNamespaceSha256,
+              sealedRemoteSequence: 0,
+              sealedHeadRootSha256:
+                RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
+            }));
+            if (event.verifiedHeadRootSha256
+              !== RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(emptyHeads)) {
+              throw new Error("tenant restore primary runtime activation is not empty");
+            }
+            reconstructedHeads = emptyHeads;
+            epochs.add(event.runtimeEpochSha256);
+          } else if (event.updateKind === "restore_activation") {
+            if (event.lineageKind !== "restore" || epochs.has(event.runtimeEpochSha256)) {
+              throw new Error("tenant restore runtime epoch was reused");
+            }
+            const receipt = this.tenantRestoreReplayReceipts.get(event.restoreRunId);
+            if (!receipt) throw new Error("tenant restore runtime lacks replay receipt");
+            RestoreJournal.validateTenantRestoreReplayReceipt(receipt);
+            if (receipt.receiptSha256 !== event.replayReceiptSha256
+              || receipt.runtimeEpochSha256 !== event.runtimeEpochSha256
+              || receipt.controlEvidenceSha256 !== event.controlEvidenceSha256
+              || receipt.sealedTargetRootSha256 !== event.verifiedHeadRootSha256) {
+              throw new Error("tenant restore runtime replay receipt does not match activation");
+            }
+            const baselineHeads = this.tenantRestoreReplayTargetsFor(event.restoreRunId);
+            if (baselineHeads.length !== event.targetCount
+              || RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(baselineHeads)
+                !== event.verifiedHeadRootSha256) {
+              throw new Error("tenant restore runtime baseline heads do not match activation");
+            }
+            reconstructedHeads = baselineHeads;
+            epochs.add(event.runtimeEpochSha256);
+          } else {
+            if (!previousEvent
+              || event.runtimeEpochSha256 !== previousEvent.runtimeEpochSha256
+              || event.activatedAtDbMs !== previousEvent.activatedAtDbMs
+              || event.lineageKind !== previousEvent.lineageKind
+              || (event.lineageKind === "restore" && (
+                previousEvent.lineageKind !== "restore"
+                || event.restoreRunId !== previousEvent.restoreRunId
+                || event.replayReceiptSha256 !== previousEvent.replayReceiptSha256
+              ))) {
+              throw new Error("tenant restore runtime head advance changed lineage");
+            }
+            const matchingKnown = [...this.tenantRestoreRuntimeKnownEntries.entries()]
+              .filter(([, known]) => known.controlGeneration === generation);
+            if (matchingKnown.length !== 1) {
+              throw new Error("tenant restore runtime head advance lacks one known entry");
+            }
+            const [knownKey, known] = matchingKnown[0]!;
+            RestoreJournal.validateTenantRestoreJournalRemoteEntry(known.entry);
+            const priorHead = reconstructedHeads[known.targetOrdinal];
+            if (!priorHead
+              || known.runtimeEpochSha256 !== event.runtimeEpochSha256
+              || known.entry.targetSha256 !== priorHead.targetSha256
+              || known.entry.record.logicalDatabaseNamespaceSha256
+                !== priorHead.logicalDatabaseNamespaceSha256
+              || known.entry.remoteSequence !== priorHead.sealedRemoteSequence + 1
+              || known.entry.previousHeadRootSha256 !== priorHead.sealedHeadRootSha256
+              || knownKey !== this.tenantRestoreRuntimeKnownEntryKey(
+                known.runtimeEpochSha256,
+                known.entry.targetSha256,
+                known.entry.remoteSequence,
+              )) {
+              throw new Error("tenant restore runtime known entry does not advance baseline");
+            }
+            reconstructedHeads = reconstructedHeads.map((candidate) => (
+              candidate.targetOrdinal === known.targetOrdinal
+                ? {
+                    ...candidate,
+                    sealedRemoteSequence: known.entry.remoteSequence,
+                    sealedHeadRootSha256: known.entry.headRootSha256,
+                  }
+                : candidate
+            ));
+            if (RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(reconstructedHeads)
+              !== event.verifiedHeadRootSha256) {
+              throw new Error("tenant restore runtime known entry root does not match event");
+            }
+            consumedKnownEntries.add(knownKey);
+          }
+          previous = event.evidenceSha256;
+          previousEvent = event;
+        }
+        if (previous !== control.evidenceSha256
+          || this.tenantRestoreRuntimeKnownEntries.size !== consumedKnownEntries.size
+          || heads.length !== control.targetCount
+          || RestoreJournal.tenantRestoreJournalTargetRootSha256(heads.map((head) => ({
+            targetOrdinal: head.targetOrdinal,
+            targetSha256: head.targetSha256,
+            failureDomainSha256: head.failureDomainSha256,
+            adapterProtocol: head.adapterProtocol,
+            journalNamespaceSha256: head.journalNamespaceSha256,
+          }))) !== control.targetRootSha256
+          || RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(heads)
+            !== control.verifiedHeadRootSha256) {
+          throw new Error("tenant restore runtime heads do not match control");
+        }
+        if (reconstructedHeads.length !== heads.length
+          || reconstructedHeads.some((expected, ordinal) => {
+            const actual = heads[ordinal];
+            return !actual
+              || expected.targetOrdinal !== actual.targetOrdinal
+              || expected.targetSha256 !== actual.targetSha256
+              || expected.failureDomainSha256 !== actual.failureDomainSha256
+              || expected.adapterProtocol !== actual.adapterProtocol
+              || expected.journalNamespaceSha256 !== actual.journalNamespaceSha256
+              || expected.logicalDatabaseNamespaceSha256
+                !== actual.logicalDatabaseNamespaceSha256
+              || expected.sealedRemoteSequence !== actual.sealedRemoteSequence
+              || expected.sealedHeadRootSha256 !== actual.sealedHeadRootSha256;
+          })) {
+          throw new Error("tenant restore runtime head projection does not match event chain");
+        }
+        for (const known of this.tenantRestoreRuntimeKnownEntries.values()) {
+          if (!epochs.has(known.runtimeEpochSha256)) {
+            throw new Error("tenant restore runtime known entry uses an unknown epoch");
+          }
+        }
+      }
+      return control;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantRestoreRemoteEntryMatches(
+    left: RestoreJournal.TenantRestoreJournalRemoteEntry,
+    right: RestoreJournal.TenantRestoreJournalRemoteEntry,
+  ): boolean {
+    return left.targetSha256 === right.targetSha256
+      && left.remoteSequence === right.remoteSequence
+      && left.previousHeadRootSha256 === right.previousHeadRootSha256
+      && left.headRootSha256 === right.headRootSha256
+      && left.record.recordSha256 === right.record.recordSha256;
+  }
+
+  private assertTenantRestorePublicationAckIsRuntimeProjected(
+    target: RestoreJournal.TenantRestoreJournalPublicationTarget,
+    ack: RestoreJournal.TenantRestoreJournalPublicationTargetAck,
+  ): void {
+    const record: RestoreJournal.TenantRestoreJournalRecord = {
+      scope: RestoreJournal.TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
+      protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+      logicalDatabaseNamespaceSha256: target.logicalDatabaseNamespaceSha256,
+      requestId: target.requestId,
+      tenantId: target.tenantId,
+      subjectGeneration: target.subjectGeneration,
+      t1FenceSha256: target.t1FenceSha256,
+      operationSha256: target.operationSha256,
+      recordSha256: target.recordSha256,
+    };
+    const staged = this.stageTenantRestoreRuntimeHeadAdvance(target.targetOrdinal, {
+      targetSha256: ack.targetSha256,
+      remoteSequence: ack.remoteSequence,
+      previousHeadRootSha256: ack.previousHeadRootSha256,
+      headRootSha256: ack.headRootSha256,
+      record,
+    });
+    // Exact replay is a read-only proof. If staging would create a new control event, the ACK and
+    // runtime projection were torn and must not be repaired implicitly by a response-loss retry.
+    if (staged.next || staged.nextHead) throw new TenantErasureIntegrityError();
+  }
+
+  private tenantRestoreRuntimeEntryIsLocallyKnown(
+    targetOrdinal: number,
+    entry: RestoreJournal.TenantRestoreJournalRemoteEntry,
+  ): boolean {
+    const record = entry.record;
+    const restoredFence = this.tenantRestoreFences.get(record.tenantId);
+    if (restoredFence) {
+      RestoreJournal.validateTenantRestoreFence(restoredFence);
+      if (restoredFence.requestId !== record.requestId
+        || restoredFence.subjectGeneration !== record.subjectGeneration
+        || restoredFence.t1FenceSha256 !== record.t1FenceSha256
+        || restoredFence.operationSha256 !== record.operationSha256
+        || restoredFence.recordSha256 !== record.recordSha256
+        || restoredFence.logicalDatabaseNamespaceSha256
+          !== record.logicalDatabaseNamespaceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      return true;
+    }
+    const admission = this.tenantErasureAdmissions.get(record.requestId);
+    const fence = this.tenantCredentialRevocationFences.get(record.tenantId);
+    if (!admission || !fence) return false;
+    try {
+      validateTenantErasureImmutableT1Proof({
+        admission,
+        fence,
+        firstAudit: this.erasureAuditEvents.get(record.requestId)?.[0],
+      });
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    const publication = this.tenantRestoreJournalPublicationJobs.get(record.requestId);
+    if (!publication
+      || admission.tenantId !== record.tenantId
+      || admission.generation !== record.subjectGeneration
+      || fence.evidenceSha256 !== record.t1FenceSha256) return false;
+    const evidence = this.assertTenantRestoreJournalPublicationEvidence(publication);
+    const target = evidence.targets[targetOrdinal];
+    if (!target
+      || target.targetOrdinal !== targetOrdinal
+      || target.targetSha256 !== entry.targetSha256
+      || target.logicalDatabaseNamespaceSha256 !== record.logicalDatabaseNamespaceSha256
+      || target.requestId !== record.requestId
+      || target.tenantId !== record.tenantId
+      || target.subjectGeneration !== record.subjectGeneration
+      || target.t1FenceSha256 !== record.t1FenceSha256
+      || target.operationSha256 !== record.operationSha256
+      || target.recordSha256 !== record.recordSha256) return false;
+    return true;
+  }
+
+  private stageTenantRestoreRuntimeHeadAdvance(
+    targetOrdinal: number,
+    entry: RestoreJournal.TenantRestoreJournalRemoteEntry,
+    expectedControlGeneration?: number,
+    forwardGapIsDependency = false,
+  ): {
+    current: Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>;
+    next?: Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>;
+    nextHead?: RestoreJournal.TenantRestoreReplaySealedTarget;
+    knownKey: string;
+    knownValue: {
+      runtimeEpochSha256: string;
+      controlGeneration: number;
+      targetOrdinal: number;
+      entry: RestoreJournal.TenantRestoreJournalRemoteEntry;
+    };
+  } {
+    RestoreJournal.validateTenantRestoreJournalRemoteEntry(entry);
+    const current = this.readTenantRestoreRuntimeControl();
+    if (current.state !== "active") throw new TenantErasureIntegrityError();
+    const head = this.tenantRestoreRuntimeHeads.get(targetOrdinal);
+    if (!head
+      || head.targetOrdinal !== targetOrdinal
+      || entry.targetSha256 !== head.targetSha256
+      || entry.record.logicalDatabaseNamespaceSha256
+        !== head.logicalDatabaseNamespaceSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const knownKey = this.tenantRestoreRuntimeKnownEntryKey(
+      current.runtimeEpochSha256,
+      entry.targetSha256,
+      entry.remoteSequence,
+    );
+    const knownValue = {
+      runtimeEpochSha256: current.runtimeEpochSha256,
+      controlGeneration: current.controlGeneration + 1,
+      targetOrdinal,
+      entry: clone(entry),
+    };
+    const existingKnown = this.tenantRestoreRuntimeKnownEntries.get(knownKey);
+    if (existingKnown) {
+      if (existingKnown.runtimeEpochSha256 !== current.runtimeEpochSha256
+        || existingKnown.targetOrdinal !== targetOrdinal
+        || !this.tenantRestoreRemoteEntryMatches(existingKnown.entry, entry)
+        || head.sealedRemoteSequence < entry.remoteSequence) {
+        throw new TenantErasureIntegrityError();
+      }
+      return { current, knownKey, knownValue };
+    }
+    if (current.lineageKind === "restore"
+      && entry.remoteSequence <= head.sealedRemoteSequence) {
+      const replayEntry = this.tenantRestoreReplayEntriesFor(current.restoreRunId).find(
+        (candidate) => candidate.targetOrdinal === targetOrdinal
+          && candidate.remoteSequence === entry.remoteSequence,
+      );
+      try {
+        if (replayEntry) RestoreJournal.validateTenantRestoreReplayEntry(replayEntry);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!replayEntry
+        || replayEntry.restoreRunId !== current.restoreRunId
+        || replayEntry.targetOrdinal !== targetOrdinal
+        || replayEntry.targetSha256 !== entry.targetSha256
+        || replayEntry.remoteSequence !== entry.remoteSequence
+        || replayEntry.previousHeadRootSha256 !== entry.previousHeadRootSha256
+        || replayEntry.headRootSha256 !== entry.headRootSha256
+        || replayEntry.logicalDatabaseNamespaceSha256
+          !== entry.record.logicalDatabaseNamespaceSha256
+        || replayEntry.requestId !== entry.record.requestId
+        || replayEntry.tenantId !== entry.record.tenantId
+        || replayEntry.subjectGeneration !== entry.record.subjectGeneration
+        || replayEntry.t1FenceSha256 !== entry.record.t1FenceSha256
+        || replayEntry.operationSha256 !== entry.record.operationSha256
+        || replayEntry.recordSha256 !== entry.record.recordSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      return { current, knownKey, knownValue };
+    }
+    if (expectedControlGeneration !== undefined
+      && expectedControlGeneration !== current.controlGeneration) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (!this.tenantRestoreRuntimeEntryIsLocallyKnown(targetOrdinal, entry)) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (entry.remoteSequence !== head.sealedRemoteSequence + 1
+      || entry.previousHeadRootSha256 !== head.sealedHeadRootSha256) {
+      if (entry.remoteSequence > head.sealedRemoteSequence + 1
+        && forwardGapIsDependency) {
+        throw new RestoreJournal.TenantRestoreJournalPublicationDependencyPendingError();
+      }
+      throw new TenantErasureIntegrityError();
+    }
+    const nowMs = this.storeNowMs();
+    const nextHead = clone<RestoreJournal.TenantRestoreReplaySealedTarget>({
+      ...head,
+      sealedRemoteSequence: entry.remoteSequence,
+      sealedHeadRootSha256: entry.headRootSha256,
+    });
+    RestoreJournal.validateTenantRestoreReplaySealedTarget(nextHead);
+    const nextHeads = [...this.tenantRestoreRuntimeHeads.values()]
+      .map((candidate) => candidate.targetOrdinal === targetOrdinal ? nextHead : candidate)
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+    const common = {
+      singletonId: RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+      state: "active" as const,
+      controlGeneration: current.controlGeneration + 1,
+      updateKind: "journal_head_advance" as const,
+      activatedAtDbMs: current.activatedAtDbMs,
+      updatedAtDbMs: Math.max(current.updatedAtDbMs, nowMs),
+      runtimeEpochSha256: current.runtimeEpochSha256,
+      controlEvidenceSha256: current.controlEvidenceSha256,
+      logicalDatabaseNamespaceSha256: current.logicalDatabaseNamespaceSha256,
+      targetCount: current.targetCount,
+      targetRootSha256: current.targetRootSha256,
+      verifiedHeadRootSha256:
+        RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(nextHeads),
+      previousControlEvidenceSha256: current.evidenceSha256,
+    };
+    const body = current.lineageKind === "restore"
+      ? {
+          ...common,
+          lineageKind: "restore" as const,
+          restoreRunId: current.restoreRunId,
+          replayReceiptSha256: current.replayReceiptSha256,
+        }
+      : { ...common, lineageKind: "primary" as const };
+    const next = clone<Extract<
+      RestoreJournal.TenantRestoreRuntimeControlRecord,
+      { state: "active" }
+    >>({
+      ...body,
+      evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(body),
+    });
+    RestoreJournal.validateTenantRestoreRuntimeControlRecord(next);
+    return { current, next, nextHead, knownKey, knownValue };
+  }
+
+  private applyTenantRestoreRuntimeHeadAdvance(staged: ReturnType<
+    MemorySessionStore["stageTenantRestoreRuntimeHeadAdvance"]
+  >): void {
+    if (!staged.next || !staged.nextHead) return;
+    this.tenantRestoreRuntimeKnownEntries.set(staged.knownKey, staged.knownValue);
+    this.tenantRestoreRuntimeHeads.set(staged.nextHead.targetOrdinal, staged.nextHead);
+    this.tenantRestoreRuntimeControlEvents.set(staged.next.controlGeneration, staged.next);
+    this.tenantRestoreRuntimeControls.set(
+      RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+      staged.next,
+    );
+  }
+
+  private assertTenantRestoreReplayRunEvidence(
+    run: RestoreJournal.TenantRestoreReplayRunRecord,
+  ): {
+    targets: RestoreJournal.TenantRestoreReplaySealedTarget[];
+    entries: RestoreJournal.TenantRestoreReplayEntry[];
+    fences: RestoreJournal.TenantRestoreFence[];
+    receipt?: RestoreJournal.TenantRestoreReplayReceipt;
+  } {
+    try {
+      RestoreJournal.validateTenantRestoreReplayRunRecord(run);
+      const control = this.readTenantRestoreJournalControl();
+      if (control.controlGeneration !== 1
+        || run.controlEvidenceSha256 !== control.evidenceSha256
+        || run.protocol !== control.protocol
+        || run.adapterProtocol !== control.adapterProtocol
+        || run.journalNamespaceSha256 !== control.journalNamespaceSha256
+        || run.logicalDatabaseNamespaceSha256 !== control.logicalDatabaseNamespaceSha256
+        || run.targetCount !== control.targetCount
+        || run.targetRootSha256 !== control.targetRootSha256) {
+        throw new Error("tenant restore replay journal control changed");
+      }
+      const targets = this.tenantRestoreReplayTargetsFor(run.restoreRunId);
+      const configuredTargets = this.tenantRestoreJournalControlTargetsForRead();
+      if (targets.length !== run.targetCount
+        || configuredTargets.length !== targets.length
+        || RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(targets)
+          !== run.sealedTargetRootSha256
+        || targets.reduce((total, target) => total + target.sealedRemoteSequence, 0)
+          !== run.expectedEntryCount) {
+        throw new Error("tenant restore replay sealed targets do not match run");
+      }
+      // Keep the catalog independently bound to the activated journal control as well as to its
+      // own sealed-head root, so a validator-valid persisted catalog cannot drift between roots.
+      for (const [ordinal, target] of targets.entries()) {
+        const configured = configuredTargets[ordinal];
+        if (!configured
+          || target.targetOrdinal !== ordinal
+          || target.targetSha256 !== configured.targetSha256
+          || target.failureDomainSha256 !== configured.failureDomainSha256
+          || target.adapterProtocol !== configured.adapterProtocol
+          || target.journalNamespaceSha256 !== configured.journalNamespaceSha256
+          || target.logicalDatabaseNamespaceSha256 !== run.logicalDatabaseNamespaceSha256) {
+          throw new Error("tenant restore replay sealed target control binding is invalid");
+        }
+      }
+      const entries = this.tenantRestoreReplayEntriesFor(run.restoreRunId);
+      if (entries.length !== run.entryCount
+        || RestoreJournal.tenantRestoreReplayEntryRootSha256(entries) !== run.entryRootSha256) {
+        throw new Error("tenant restore replay entry root does not match run");
+      }
+      let cursor = 0;
+      let prefixEnded = false;
+      for (const target of targets) {
+        let sequence = 0;
+        let root = RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256;
+        while (!prefixEnded && sequence < target.sealedRemoteSequence) {
+          const entry = entries[cursor];
+          if (!entry) {
+            prefixEnded = true;
+            break;
+          }
+          if (entry.targetOrdinal !== target.targetOrdinal
+            || entry.targetSha256 !== target.targetSha256
+            || entry.remoteSequence !== sequence + 1
+            || entry.previousHeadRootSha256 !== root
+            || entry.logicalDatabaseNamespaceSha256 !== run.logicalDatabaseNamespaceSha256) {
+            throw new Error("tenant restore replay entries do not cover sealed head prefix");
+          }
+          sequence = entry.remoteSequence;
+          root = entry.headRootSha256;
+          cursor += 1;
+        }
+        if (sequence === target.sealedRemoteSequence
+          && root !== target.sealedHeadRootSha256) {
+          throw new Error("tenant restore replay entry chain does not reach sealed head");
+        }
+        if (sequence < target.sealedRemoteSequence) prefixEnded = true;
+      }
+      if (cursor !== entries.length) throw new Error("tenant restore replay has extra entries");
+      const fences = this.tenantRestoreReplayFencesFor(entries);
+      if (fences.length !== run.fenceCount
+        || RestoreJournal.tenantRestoreFenceRootSha256(fences) !== run.fenceRootSha256) {
+        throw new Error("tenant restore replay fence root does not match run");
+      }
+      const receipt = this.tenantRestoreReplayReceipts.get(run.restoreRunId);
+      if (run.phase === "replay_sealed" || run.phase === "active") {
+        if (!receipt) throw new Error("sealed tenant restore replay lacks receipt");
+        RestoreJournal.validateTenantRestoreReplayReceipt(receipt);
+        if (receipt.receiptSha256 !== run.terminalReceiptSha256
+          || receipt.restoreRunId !== run.restoreRunId
+          || receipt.sourceBackupSha256 !== run.sourceBackupSha256
+          || receipt.runtimeEpochSha256 !== run.runtimeEpochSha256
+          || receipt.controlEvidenceSha256 !== run.controlEvidenceSha256
+          || receipt.protocol !== run.protocol
+          || receipt.adapterProtocol !== run.adapterProtocol
+          || receipt.journalNamespaceSha256 !== run.journalNamespaceSha256
+          || receipt.logicalDatabaseNamespaceSha256 !== run.logicalDatabaseNamespaceSha256
+          || receipt.targetCount !== run.targetCount
+          || receipt.targetRootSha256 !== run.targetRootSha256
+          || receipt.entryCount !== run.entryCount
+          || receipt.entryRootSha256 !== run.entryRootSha256
+          || receipt.fenceCount !== run.fenceCount
+          || receipt.fenceRootSha256 !== run.fenceRootSha256
+          || receipt.sealedTargetRootSha256 !== run.sealedTargetRootSha256
+          || receipt.storeDbTimestampMs !== run.sealedAtDbMs) {
+          throw new Error("tenant restore replay receipt does not match run");
+        }
+      } else if (receipt) {
+        throw new Error("nonsealed tenant restore replay has receipt");
+      }
+      return { targets, entries, fences, ...(receipt ? { receipt } : {}) };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private assertTenantRestoreReplayGlobalRelations(): void {
+    try {
+      for (const [restoreRunId, run] of this.tenantRestoreReplayRuns) {
+        if (restoreRunId !== run.restoreRunId) throw new Error("restore replay run key changed");
+        this.assertTenantRestoreReplayRunEvidence(run);
+      }
+      for (const [key, target] of this.tenantRestoreReplaySealedTargets) {
+        const run = [...this.tenantRestoreReplayRuns.values()].find((candidate) => (
+          key === this.tenantRestoreReplaySealedTargetKey(
+            candidate.restoreRunId,
+            target.targetOrdinal,
+          )
+        ));
+        if (!run) throw new Error("orphan tenant restore replay sealed target");
+      }
+      for (const [key, entry] of this.tenantRestoreReplayEntries) {
+        if (!this.tenantRestoreReplayRuns.has(entry.restoreRunId)
+          || key !== this.tenantRestoreReplayEntryKey(entry.restoreRunId, entry.replayOrdinal)) {
+          throw new Error("orphan tenant restore replay entry");
+        }
+      }
+      for (const [restoreRunId, receipt] of this.tenantRestoreReplayReceipts) {
+        const run = this.tenantRestoreReplayRuns.get(restoreRunId);
+        if (!run || (run.phase !== "replay_sealed" && run.phase !== "active")
+          || receipt.restoreRunId !== restoreRunId
+          || run.terminalReceiptSha256 !== receipt.receiptSha256) {
+          throw new Error("orphan tenant restore replay receipt");
+        }
+      }
+      for (const [tenantId, fence] of this.tenantRestoreFences) {
+        RestoreJournal.validateTenantRestoreFence(fence);
+        if (tenantId !== fence.tenantId
+          || ![...this.tenantRestoreReplayEntries.values()].some(
+            (entry) => entry.tenantId === tenantId && entry.fenceSha256 === fence.fenceSha256,
+          )) {
+          throw new Error("orphan tenant restore fence");
+        }
+      }
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async prepareTenantRestoreReplay(
+    input: RestoreJournal.PrepareTenantRestoreReplayInput,
+  ): Promise<RestoreJournal.TenantRestoreReplayRunRecord> {
+    const stagedInput = clone(input);
+    RestoreJournal.validatePrepareTenantRestoreReplayInput(stagedInput);
+    const control = this.readTenantRestoreJournalControl();
+    if (control.controlGeneration !== 1
+      || control.evidenceSha256 !== stagedInput.controlEvidenceSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    this.assertTenantRestoreReplayGlobalRelations();
+    const existing = this.tenantRestoreReplayRuns.get(stagedInput.restoreRunId);
+    if (existing) {
+      const evidence = this.assertTenantRestoreReplayRunEvidence(existing);
+      if (existing.sourceBackupSha256 !== stagedInput.sourceBackupSha256
+        || existing.runtimeEpochSha256 !== stagedInput.runtimeEpochSha256
+        || existing.controlEvidenceSha256 !== stagedInput.controlEvidenceSha256
+        || existing.sealedTargetRootSha256
+          !== RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(stagedInput.sealedTargets)
+        || evidence.targets.length !== stagedInput.sealedTargets.length
+        || evidence.targets.some((target, ordinal) => {
+          const replayed = stagedInput.sealedTargets[ordinal];
+          return !replayed
+            || target.targetOrdinal !== replayed.targetOrdinal
+            || target.targetSha256 !== replayed.targetSha256
+            || target.failureDomainSha256 !== replayed.failureDomainSha256
+            || target.adapterProtocol !== replayed.adapterProtocol
+            || target.journalNamespaceSha256 !== replayed.journalNamespaceSha256
+            || target.logicalDatabaseNamespaceSha256
+              !== replayed.logicalDatabaseNamespaceSha256
+            || target.sealedRemoteSequence !== replayed.sealedRemoteSequence
+            || target.sealedHeadRootSha256 !== replayed.sealedHeadRootSha256;
+        })) {
+        throw new TenantErasureIntegrityError();
+      }
+      return clone(existing);
+    }
+    // Match the durable MySQL uniqueness contract: even an aborted attempt burns its operator
+    // epoch, closing an ABA path where a later run could otherwise reuse the same identity.
+    if ([...this.tenantRestoreReplayRuns.values()].some((run) => (
+      run.logicalDatabaseNamespaceSha256 === control.logicalDatabaseNamespaceSha256
+      && run.runtimeEpochSha256 === stagedInput.runtimeEpochSha256
+    ))) throw new TenantErasureIntegrityError();
+    if ([...this.tenantRestoreReplayRuns.values()].some((run) => (
+      run.phase === "prepared" || run.phase === "replay_sealed"
+    ))) throw new TenantErasureIntegrityError();
+    const configured = this.tenantRestoreJournalControlTargetsForRead();
+    for (const [ordinal, sealed] of stagedInput.sealedTargets.entries()) {
+      const target = configured[ordinal];
+      if (!target || sealed.targetOrdinal !== ordinal
+        || sealed.targetSha256 !== target.targetSha256
+        || sealed.failureDomainSha256 !== target.failureDomainSha256
+        || sealed.adapterProtocol !== target.adapterProtocol
+        || sealed.journalNamespaceSha256 !== target.journalNamespaceSha256
+        || sealed.logicalDatabaseNamespaceSha256 !== control.logicalDatabaseNamespaceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    const expectedEntryCount = stagedInput.sealedTargets.reduce(
+      (total, target) => total + target.sealedRemoteSequence,
+      0,
+    );
+    if (!Number.isSafeInteger(expectedEntryCount)) throw new Error("restore replay size overflow");
+    const nowMs = this.storeNowMs();
+    const run = clone<RestoreJournal.TenantRestoreReplayRunRecord>({
+      restoreRunId: stagedInput.restoreRunId,
+      sourceBackupSha256: stagedInput.sourceBackupSha256,
+      runtimeEpochSha256: stagedInput.runtimeEpochSha256,
+      protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+      controlEvidenceSha256: control.evidenceSha256,
+      adapterProtocol: control.adapterProtocol,
+      journalNamespaceSha256: control.journalNamespaceSha256,
+      logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+      targetCount: control.targetCount,
+      targetRootSha256: control.targetRootSha256,
+      sealedTargetRootSha256:
+        RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(stagedInput.sealedTargets),
+      expectedEntryCount,
+      entryCount: 0,
+      entryRootSha256: RestoreJournal.EMPTY_TENANT_RESTORE_REPLAY_ENTRY_ROOT_SHA256,
+      fenceCount: 0,
+      fenceRootSha256: RestoreJournal.EMPTY_TENANT_RESTORE_FENCE_ROOT_SHA256,
+      phase: "prepared",
+      createdAtDbMs: nowMs,
+      updatedAtDbMs: nowMs,
+    });
+    RestoreJournal.validateTenantRestoreReplayRunRecord(run);
+    const runsBefore = new Map(this.tenantRestoreReplayRuns);
+    const targetsBefore = new Map(this.tenantRestoreReplaySealedTargets);
+    try {
+      this.tenantRestoreReplayRuns.set(run.restoreRunId, run);
+      for (const target of stagedInput.sealedTargets) {
+        this.tenantRestoreReplaySealedTargets.set(
+          this.tenantRestoreReplaySealedTargetKey(run.restoreRunId, target.targetOrdinal),
+          clone(target),
+        );
+      }
+      this.assertTenantRestoreReplayRunEvidence(run);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreReplayRuns, runsBefore);
+      restoreMapSnapshot(this.tenantRestoreReplaySealedTargets, targetsBefore);
+      throw error;
+    }
+    return clone(run);
+  }
+
+  async getTenantRestoreReplayRun(
+    restoreRunId: string,
+  ): Promise<RestoreJournal.TenantRestoreReplayRunRecord | null> {
+    const run = this.tenantRestoreReplayRuns.get(restoreRunId);
+    if (!run) return null;
+    this.assertTenantRestoreReplayRunEvidence(run);
+    return clone(run);
+  }
+
+  async getTenantRestoreReplaySealedTargets(
+    restoreRunId: string,
+  ): Promise<RestoreJournal.TenantRestoreReplaySealedTarget[]> {
+    const run = this.tenantRestoreReplayRuns.get(restoreRunId);
+    if (!run) return [];
+    return this.assertTenantRestoreReplayRunEvidence(run).targets.map(clone);
+  }
+
+  async listTenantRestoreReplayEntries(
+    restoreRunId: string,
+    options: RestoreJournal.ListTenantRestoreReplayEntriesOptions,
+  ): Promise<RestoreJournal.TenantRestoreReplayEntry[]> {
+    if (Object.keys(options).some((key) => key !== "limit" && key !== "afterReplayOrdinal")
+      || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1_000
+      || (options.afterReplayOrdinal !== undefined
+        && (!Number.isSafeInteger(options.afterReplayOrdinal)
+          || options.afterReplayOrdinal < 0))) {
+      throw new Error("invalid tenant restore replay entry list options");
+    }
+    const run = this.tenantRestoreReplayRuns.get(restoreRunId);
+    if (!run) return [];
+    const entries = this.assertTenantRestoreReplayRunEvidence(run).entries;
+    return entries.filter((entry) => entry.replayOrdinal > (options.afterReplayOrdinal ?? 0))
+      .slice(0, options.limit).map(clone);
+  }
+
+  async recordTenantRestoreReplayFence(
+    input: RestoreJournal.RecordTenantRestoreReplayFenceInput,
+  ): Promise<RestoreJournal.TenantRestoreReplayEntry | null> {
+    const stagedInput = clone(input);
+    RestoreJournal.validateRecordTenantRestoreReplayFenceInput(stagedInput);
+    this.assertTenantRestoreReplayGlobalRelations();
+    const run = this.tenantRestoreReplayRuns.get(stagedInput.restoreRunId);
+    if (!run || run.phase !== "prepared") return null;
+    const evidence = this.assertTenantRestoreReplayRunEvidence(run);
+    const target = evidence.targets[stagedInput.targetOrdinal];
+    if (!target || target.targetOrdinal !== stagedInput.targetOrdinal
+      || stagedInput.remoteEntry.targetSha256 !== target.targetSha256
+      || stagedInput.remoteEntry.record.logicalDatabaseNamespaceSha256
+        !== run.logicalDatabaseNamespaceSha256
+      || stagedInput.remoteEntry.remoteSequence > target.sealedRemoteSequence) {
+      throw new TenantErasureIntegrityError();
+    }
+    const replayed = evidence.entries.find((entry) => (
+      entry.targetOrdinal === target.targetOrdinal
+      && entry.remoteSequence === stagedInput.remoteEntry.remoteSequence
+    ));
+    if (replayed) {
+      if (replayed.targetSha256 !== stagedInput.remoteEntry.targetSha256
+        || replayed.previousHeadRootSha256 !== stagedInput.remoteEntry.previousHeadRootSha256
+        || replayed.headRootSha256 !== stagedInput.remoteEntry.headRootSha256
+        || replayed.recordSha256 !== stagedInput.remoteEntry.record.recordSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      return clone(replayed);
+    }
+    const targetEntries = evidence.entries.filter(
+      (entry) => entry.targetOrdinal === target.targetOrdinal,
+    );
+    const earlierIncomplete = evidence.targets.slice(0, target.targetOrdinal).some((candidate) => (
+      evidence.entries.filter((entry) => entry.targetOrdinal === candidate.targetOrdinal).length
+        !== candidate.sealedRemoteSequence
+    ));
+    const expectedSequence = targetEntries.length + 1;
+    const previousHeadRootSha256 = targetEntries.at(-1)?.headRootSha256
+      ?? RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256;
+    if (earlierIncomplete
+      || stagedInput.remoteEntry.remoteSequence !== expectedSequence
+      || stagedInput.remoteEntry.previousHeadRootSha256 !== previousHeadRootSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const record = stagedInput.remoteEntry.record;
+    const existingFence = this.tenantRestoreFences.get(record.tenantId);
+    const operationConflict = [...this.tenantRestoreFences.values()].some((fence) => (
+      (fence.requestId === record.requestId || fence.operationSha256 === record.operationSha256)
+      && fence.tenantId !== record.tenantId
+    ));
+    if (operationConflict) throw new TenantErasureIntegrityError();
+    let fence: RestoreJournal.TenantRestoreFence;
+    let fenceDisposition: RestoreJournal.TenantRestoreReplayFenceDisposition;
+    if (existingFence) {
+      RestoreJournal.validateTenantRestoreFence(existingFence);
+      if (existingFence.requestId !== record.requestId
+        || existingFence.subjectGeneration !== record.subjectGeneration
+        || existingFence.t1FenceSha256 !== record.t1FenceSha256
+        || existingFence.operationSha256 !== record.operationSha256
+        || existingFence.recordSha256 !== record.recordSha256
+        || existingFence.logicalDatabaseNamespaceSha256
+          !== record.logicalDatabaseNamespaceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      fence = existingFence;
+      fenceDisposition = "exact_replay";
+    } else {
+      const installedAtDbMs = this.storeNowMs();
+      const body = {
+        scope: RestoreJournal.TENANT_RESTORE_FENCE_SCOPE,
+        logicalDatabaseNamespaceSha256: record.logicalDatabaseNamespaceSha256,
+        requestId: record.requestId,
+        tenantId: record.tenantId,
+        subjectGeneration: record.subjectGeneration,
+        t1FenceSha256: record.t1FenceSha256,
+        operationSha256: record.operationSha256,
+        recordSha256: record.recordSha256,
+        restoreRunId: run.restoreRunId,
+        sourceTargetSha256: target.targetSha256,
+        sourceRemoteSequence: stagedInput.remoteEntry.remoteSequence,
+        sourceHeadRootSha256: stagedInput.remoteEntry.headRootSha256,
+        installedAtDbMs,
+      };
+      fence = {
+        ...body,
+        fenceSha256: RestoreJournal.tenantRestoreFenceSha256(body),
+      };
+      RestoreJournal.validateTenantRestoreFence(fence);
+      fenceDisposition = "installed";
+    }
+    const storeDbTimestampMs = this.storeNowMs();
+    const entryBody = {
+      scope: RestoreJournal.TENANT_RESTORE_REPLAY_ENTRY_SCOPE,
+      restoreRunId: run.restoreRunId,
+      replayOrdinal: run.entryCount + 1,
+      targetOrdinal: target.targetOrdinal,
+      targetSha256: target.targetSha256,
+      remoteSequence: stagedInput.remoteEntry.remoteSequence,
+      previousHeadRootSha256: stagedInput.remoteEntry.previousHeadRootSha256,
+      headRootSha256: stagedInput.remoteEntry.headRootSha256,
+      logicalDatabaseNamespaceSha256: record.logicalDatabaseNamespaceSha256,
+      requestId: record.requestId,
+      tenantId: record.tenantId,
+      subjectGeneration: record.subjectGeneration,
+      t1FenceSha256: record.t1FenceSha256,
+      operationSha256: record.operationSha256,
+      recordSha256: record.recordSha256,
+      fenceDisposition,
+      fenceSha256: fence.fenceSha256,
+      previousEntryRootSha256: run.entryRootSha256,
+      storeDbTimestampMs,
+    };
+    const entry: RestoreJournal.TenantRestoreReplayEntry = {
+      ...entryBody,
+      entrySha256: RestoreJournal.tenantRestoreReplayEntrySha256(entryBody),
+    };
+    RestoreJournal.validateTenantRestoreReplayEntry(entry);
+    const nextEntries = [...evidence.entries, entry];
+    const runFences = new Map(evidence.fences.map((row) => [row.tenantId, row]));
+    runFences.set(fence.tenantId, fence);
+    const nextFences = [...runFences.values()]
+      .sort((left, right) => left.tenantId.localeCompare(right.tenantId));
+    const next = clone<RestoreJournal.TenantRestoreReplayRunRecord>({
+      ...run,
+      entryCount: nextEntries.length,
+      entryRootSha256: RestoreJournal.tenantRestoreReplayEntryRootSha256(nextEntries),
+      fenceCount: nextFences.length,
+      fenceRootSha256: RestoreJournal.tenantRestoreFenceRootSha256(nextFences),
+      updatedAtDbMs: Math.max(run.updatedAtDbMs, storeDbTimestampMs),
+    });
+    RestoreJournal.validateTenantRestoreReplayRunRecord(next);
+    const fencesBefore = new Map(this.tenantRestoreFences);
+    const entriesBefore = new Map(this.tenantRestoreReplayEntries);
+    const runsBefore = new Map(this.tenantRestoreReplayRuns);
+    try {
+      if (!existingFence) this.tenantRestoreFences.set(fence.tenantId, fence);
+      this.tenantRestoreReplayEntries.set(
+        this.tenantRestoreReplayEntryKey(run.restoreRunId, entry.replayOrdinal),
+        entry,
+      );
+      this.tenantRestoreReplayRuns.set(run.restoreRunId, next);
+      this.assertTenantRestoreReplayRunEvidence(next);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreFences, fencesBefore);
+      restoreMapSnapshot(this.tenantRestoreReplayEntries, entriesBefore);
+      restoreMapSnapshot(this.tenantRestoreReplayRuns, runsBefore);
+      throw error;
+    }
+    return clone(entry);
+  }
+
+  async sealTenantRestoreReplay(
+    restoreRunId: string,
+  ): Promise<RestoreJournal.TenantRestoreReplayReceipt | null> {
+    this.assertTenantRestoreReplayGlobalRelations();
+    const run = this.tenantRestoreReplayRuns.get(restoreRunId);
+    if (!run) return null;
+    if (run.phase === "replay_sealed" || run.phase === "active") {
+      return clone(this.assertTenantRestoreReplayRunEvidence(run).receipt!);
+    }
+    if (run.phase !== "prepared") return null;
+    const evidence = this.assertTenantRestoreReplayRunEvidence(run);
+    if (run.entryCount !== run.expectedEntryCount) return null;
+    const nowMs = this.storeNowMs();
+    const body = {
+      scope: RestoreJournal.TENANT_RESTORE_REPLAY_RECEIPT_SCOPE,
+      restoreRunId: run.restoreRunId,
+      sourceBackupSha256: run.sourceBackupSha256,
+      runtimeEpochSha256: run.runtimeEpochSha256,
+      controlEvidenceSha256: run.controlEvidenceSha256,
+      protocol: run.protocol,
+      adapterProtocol: run.adapterProtocol,
+      journalNamespaceSha256: run.journalNamespaceSha256,
+      logicalDatabaseNamespaceSha256: run.logicalDatabaseNamespaceSha256,
+      targetCount: run.targetCount,
+      targetRootSha256: run.targetRootSha256,
+      sealedTargetRootSha256: run.sealedTargetRootSha256,
+      entryCount: evidence.entries.length,
+      entryRootSha256: run.entryRootSha256,
+      fenceCount: evidence.fences.length,
+      fenceRootSha256: run.fenceRootSha256,
+      storeDbTimestampMs: nowMs,
+      restoreFenceReplayComplete: true as const,
+      physicalReplayComplete: false as const,
+      allDomainsComplete: false as const,
+      contentPurgeExecuted: false as const,
+    };
+    const receipt: RestoreJournal.TenantRestoreReplayReceipt = {
+      ...body,
+      receiptSha256: RestoreJournal.tenantRestoreReplayReceiptSha256(body),
+    };
+    const terminal = clone<RestoreJournal.TenantRestoreReplayRunRecord>({
+      ...run,
+      phase: "replay_sealed",
+      terminalReceiptSha256: receipt.receiptSha256,
+      sealedAtDbMs: nowMs,
+      updatedAtDbMs: Math.max(run.updatedAtDbMs, nowMs),
+    });
+    RestoreJournal.validateTenantRestoreReplayReceipt(receipt);
+    RestoreJournal.validateTenantRestoreReplayRunRecord(terminal);
+    const runsBefore = new Map(this.tenantRestoreReplayRuns);
+    const receiptsBefore = new Map(this.tenantRestoreReplayReceipts);
+    try {
+      this.tenantRestoreReplayReceipts.set(run.restoreRunId, receipt);
+      this.tenantRestoreReplayRuns.set(run.restoreRunId, terminal);
+      this.assertTenantRestoreReplayRunEvidence(terminal);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreReplayRuns, runsBefore);
+      restoreMapSnapshot(this.tenantRestoreReplayReceipts, receiptsBefore);
+      throw error;
+    }
+    return clone(receipt);
+  }
+
+  async abortTenantRestoreReplay(restoreRunId: string): Promise<boolean> {
+    this.assertTenantRestoreReplayGlobalRelations();
+    const run = this.tenantRestoreReplayRuns.get(restoreRunId);
+    if (!run || run.phase !== "prepared") return false;
+    this.assertTenantRestoreReplayRunEvidence(run);
+    const nowMs = this.storeNowMs();
+    const aborted = clone<RestoreJournal.TenantRestoreReplayRunRecord>({
+      ...run,
+      phase: "aborted",
+      abortedAtDbMs: nowMs,
+      updatedAtDbMs: Math.max(run.updatedAtDbMs, nowMs),
+    });
+    RestoreJournal.validateTenantRestoreReplayRunRecord(aborted);
+    this.tenantRestoreReplayRuns.set(run.restoreRunId, aborted);
+    return true;
+  }
+
+  async getTenantRestoreReplayReceipt(
+    restoreRunId: string,
+  ): Promise<RestoreJournal.TenantRestoreReplayReceipt | null> {
+    const run = this.tenantRestoreReplayRuns.get(restoreRunId);
+    if (!run || (run.phase !== "replay_sealed" && run.phase !== "active")) return null;
+    return clone(this.assertTenantRestoreReplayRunEvidence(run).receipt!);
+  }
+
+  async activateTenantRestoreRuntime(
+    input: RestoreJournal.ActivateTenantRestoreRuntimeInput,
+  ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
+    const stagedInput = clone(input);
+    RestoreJournal.validateActivateTenantRestoreRuntimeInput(stagedInput);
+    this.assertTenantRestoreReplayGlobalRelations();
+    const run = this.tenantRestoreReplayRuns.get(stagedInput.restoreRunId);
+    if (!run || (run.phase !== "replay_sealed" && run.phase !== "active")) {
+      throw new TenantErasureIntegrityError();
+    }
+    const evidence = this.assertTenantRestoreReplayRunEvidence(run);
+    const receipt = evidence.receipt;
+    if (!receipt) throw new TenantErasureIntegrityError();
+    const current = this.readTenantRestoreRuntimeControl();
+    if (current.state === "active"
+      && current.lineageKind === "restore"
+      && current.restoreRunId === run.restoreRunId
+      && current.replayReceiptSha256 === receipt.receiptSha256
+      && current.runtimeEpochSha256 === run.runtimeEpochSha256) {
+      if (run.phase !== "active") throw new TenantErasureIntegrityError();
+      return clone(current);
+    }
+    if (run.phase !== "replay_sealed"
+      || current.controlGeneration !== stagedInput.expectedControlGeneration
+      || (current.state === "active" && current.runtimeEpochSha256 === run.runtimeEpochSha256)
+      || [...this.tenantRestoreRuntimeControlEvents.values()].some(
+        (event) => event.runtimeEpochSha256 === run.runtimeEpochSha256,
+      )) {
+      throw new TenantErasureIntegrityError();
+    }
+    const nowMs = this.storeNowMs();
+    const previousControlEvidenceSha256 = current.state === "active"
+      ? current.evidenceSha256
+      : RestoreJournal.EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256;
+    const body = {
+      singletonId: RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+      state: "active" as const,
+      controlGeneration: current.controlGeneration + 1,
+      updateKind: "restore_activation" as const,
+      activatedAtDbMs: nowMs,
+      updatedAtDbMs: nowMs,
+      lineageKind: "restore" as const,
+      restoreRunId: run.restoreRunId,
+      replayReceiptSha256: receipt.receiptSha256,
+      runtimeEpochSha256: run.runtimeEpochSha256,
+      controlEvidenceSha256: run.controlEvidenceSha256,
+      logicalDatabaseNamespaceSha256: run.logicalDatabaseNamespaceSha256,
+      targetCount: run.targetCount,
+      targetRootSha256: run.targetRootSha256,
+      verifiedHeadRootSha256: run.sealedTargetRootSha256,
+      previousControlEvidenceSha256,
+    };
+    const activated = clone<Extract<
+      RestoreJournal.TenantRestoreRuntimeControlRecord,
+      { state: "active" }
+    >>({
+      ...body,
+      evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(body),
+    });
+    const activeRun = clone<RestoreJournal.TenantRestoreReplayRunRecord>({
+      ...run,
+      phase: "active",
+      activatedAtDbMs: nowMs,
+      updatedAtDbMs: Math.max(run.updatedAtDbMs, nowMs),
+    });
+    RestoreJournal.validateTenantRestoreRuntimeControlRecord(activated);
+    RestoreJournal.validateTenantRestoreReplayRunRecord(activeRun);
+    const controlsBefore = new Map(this.tenantRestoreRuntimeControls);
+    const headsBefore = new Map(this.tenantRestoreRuntimeHeads);
+    const eventsBefore = new Map(this.tenantRestoreRuntimeControlEvents);
+    const runsBefore = new Map(this.tenantRestoreReplayRuns);
+    try {
+      this.tenantRestoreRuntimeHeads.clear();
+      for (const target of evidence.targets) {
+        this.tenantRestoreRuntimeHeads.set(target.targetOrdinal, clone(target));
+      }
+      this.tenantRestoreRuntimeControlEvents.set(activated.controlGeneration, activated);
+      this.tenantRestoreRuntimeControls.set(
+        RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID,
+        activated,
+      );
+      this.tenantRestoreReplayRuns.set(run.restoreRunId, activeRun);
+      this.assertTenantRestoreReplayRunEvidence(activeRun);
+      this.readTenantRestoreRuntimeControl();
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreRuntimeControls, controlsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeHeads, headsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeControlEvents, eventsBefore);
+      restoreMapSnapshot(this.tenantRestoreReplayRuns, runsBefore);
+      throw error;
+    }
+    return clone(activated);
+  }
+
+  async getTenantRestoreRuntimeControl(
+  ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
+    return clone(this.readTenantRestoreRuntimeControl());
+  }
+
+  async getTenantRestoreRuntimeHeads(
+  ): Promise<RestoreJournal.TenantRestoreReplaySealedTarget[]> {
+    const control = this.readTenantRestoreRuntimeControl();
+    if (control.state === "inactive") return [];
+    return [...this.tenantRestoreRuntimeHeads.values()]
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal)
+      .map(clone);
+  }
+
+  async getTenantRestoreFence(tenantId: string): Promise<RestoreJournal.TenantRestoreFence | null> {
+    if (!tenantId || tenantId.length > 128) throw new Error("invalid tenant id");
+    const fence = this.tenantRestoreFences.get(tenantId);
+    if (!fence) return null;
+    RestoreJournal.validateTenantRestoreFence(fence);
+    return clone(fence);
+  }
+
+  async listTenantRestoreFences(
+    options: RestoreJournal.ListTenantRestoreFencesOptions,
+  ): Promise<RestoreJournal.TenantRestoreFence[]> {
+    const keys = Object.keys(options).sort();
+    const expectedKeys = options.afterTenantId === undefined
+      ? ["limit"]
+      : ["afterTenantId", "limit"];
+    if (keys.length !== expectedKeys.length
+      || keys.some((key, index) => key !== expectedKeys[index])
+      || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1_000
+      || (options.afterTenantId !== undefined
+        && (!options.afterTenantId || options.afterTenantId.length > 128))) {
+      throw new Error("invalid tenant restore fence list options");
+    }
+    return [...this.tenantRestoreFences.values()]
+      .sort((left, right) => left.tenantId.localeCompare(right.tenantId))
+      .filter((fence) => fence.tenantId > (options.afterTenantId ?? ""))
+      .slice(0, options.limit)
+      .map((fence) => {
+        RestoreJournal.validateTenantRestoreFence(fence);
+        return clone(fence);
+      });
+  }
+
+  async assertTenantRestoreRuntimeJournalEntryKnown(
+    input: RestoreJournal.AssertTenantRestoreRuntimeJournalEntryKnownInput,
+  ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
+    const stagedInput = clone(input);
+    RestoreJournal.validateAssertTenantRestoreRuntimeJournalEntryKnownInput(stagedInput);
+    const current = this.readTenantRestoreRuntimeControl();
+    if (current.state !== "active"
+      || current.runtimeEpochSha256 !== stagedInput.runtimeEpochSha256
+      || current.controlEvidenceSha256 !== stagedInput.controlEvidenceSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const staged = this.stageTenantRestoreRuntimeHeadAdvance(
+      stagedInput.targetOrdinal,
+      stagedInput.remoteEntry,
+      stagedInput.expectedControlGeneration,
+    );
+    if (!staged.next) return clone(staged.current);
+    const controlsBefore = new Map(this.tenantRestoreRuntimeControls);
+    const headsBefore = new Map(this.tenantRestoreRuntimeHeads);
+    const eventsBefore = new Map(this.tenantRestoreRuntimeControlEvents);
+    const knownBefore = new Map(this.tenantRestoreRuntimeKnownEntries);
+    try {
+      this.applyTenantRestoreRuntimeHeadAdvance(staged);
+      return clone(this.readTenantRestoreRuntimeControl());
+    } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreRuntimeControls, controlsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeHeads, headsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeControlEvents, eventsBefore);
+      restoreMapSnapshot(this.tenantRestoreRuntimeKnownEntries, knownBefore);
+      throw error;
+    }
+  }
+
+  async assertTenantRestoreRuntimeReady(
+    input: RestoreJournal.AssertTenantRestoreRuntimeReadyInput,
+  ): Promise<void> {
+    const stagedInput = clone(input);
+    RestoreJournal.validateAssertTenantRestoreRuntimeReadyInput(stagedInput);
+    const control = this.readTenantRestoreRuntimeControl();
+    if (control.state !== "active"
+      || control.runtimeEpochSha256 !== stagedInput.runtimeEpochSha256
+      || control.controlEvidenceSha256 !== stagedInput.controlEvidenceSha256
+      || [...this.tenantRestoreReplayRuns.values()].some(
+        (run) => run.phase === "prepared" || run.phase === "replay_sealed",
+      )) {
+      throw new TenantErasureIntegrityError();
+    }
+    const heads = [...this.tenantRestoreRuntimeHeads.values()]
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+    if (heads.length !== stagedInput.observedHeads.length
+      || RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(stagedInput.observedHeads)
+        !== control.verifiedHeadRootSha256
+      || heads.some((head, ordinal) => {
+        const observed = stagedInput.observedHeads[ordinal];
+        return !observed
+          || observed.targetOrdinal !== head.targetOrdinal
+          || observed.targetSha256 !== head.targetSha256
+          || observed.failureDomainSha256 !== head.failureDomainSha256
+          || observed.adapterProtocol !== head.adapterProtocol
+          || observed.journalNamespaceSha256 !== head.journalNamespaceSha256
+          || observed.logicalDatabaseNamespaceSha256
+            !== head.logicalDatabaseNamespaceSha256
+          || observed.sealedRemoteSequence !== head.sealedRemoteSequence
+          || observed.sealedHeadRootSha256 !== head.sealedHeadRootSha256;
+      })) {
+      throw new TenantErasureIntegrityError();
+    }
+    for (const fence of this.tenantRestoreFences.values()) {
+      RestoreJournal.validateTenantRestoreFence(fence);
+    }
+    this.assertTenantRestoreJournalGlobalRelations();
+    this.assertTenantRestoreReplayGlobalRelations();
+  }
+
   private tenantErasureIdempotencyKey(input: Pick<
     RequestTenantErasureInput,
     "tenantId" | "idempotencyKey"
@@ -5606,6 +7923,27 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       fence,
       firstAudit: this.erasureAuditEvents.get(admission.requestId)?.[0],
     });
+  }
+
+  private assertTenantErasureAdmissionPublicationProof(
+    admission: ErasureRequestRecord,
+    lifecycle: SubjectLifecycleRecord | undefined,
+    fence: TenantCredentialRevocationFence | undefined,
+  ): void {
+    this.assertTenantErasureAdmissionProof(admission, lifecycle, fence);
+    const restoreControl = this.readTenantRestoreJournalControl();
+    const restoreJob = this.tenantRestoreJournalPublicationJobs.get(admission.requestId);
+    if (restoreControl.controlGeneration === 0) {
+      if (restoreJob) throw new TenantErasureIntegrityError();
+      return;
+    }
+    if (!restoreJob
+      || restoreJob.tenantId !== admission.tenantId
+      || restoreJob.subjectGeneration !== admission.generation
+      || restoreJob.t1FenceSha256 !== fence?.evidenceSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    this.assertTenantRestoreJournalPublicationEvidence(restoreJob);
   }
 
   async replayTenantErasure(
@@ -5656,6 +7994,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const existingCredentialReceipt = [...this.tenantCredentialRevocationReceipts.values()].find(
       (receipt) => receipt.tenantId === stagedInput.tenantId,
     );
+    const existingRestoreFence = this.tenantRestoreFences.get(stagedInput.tenantId);
     const idempotencyKey = this.tenantErasureIdempotencyKey(stagedInput);
     const replayId = this.erasureIdempotency.get(idempotencyKey);
     if (replayId) {
@@ -5682,7 +8021,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       this.assertTenantErasureAdmissionProof(active, existingTenant, existingFence);
       return clone(active);
     }
-    if (existingAdmission || existingFence || existingCredentialJob || existingCredentialReceipt) {
+    if (existingAdmission || existingFence || existingCredentialJob || existingCredentialReceipt
+      || existingRestoreFence) {
       throw new TenantErasureIntegrityError();
     }
     // Only the canonical tenant registry proves that a target exists. Sessions, policies and
@@ -5695,6 +8035,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || this.tenantErasureAdmissions.has(stagedInput.requestId)
       || this.tenantCredentialRevocationJobs.has(stagedInput.requestId)
       || this.tenantCredentialRevocationReceipts.has(stagedInput.requestId)
+      || this.tenantRestoreJournalPublicationJobs.has(stagedInput.requestId)
+      || this.tenantRestoreJournalPublicationReceipts.has(stagedInput.requestId)
     ) {
       throw new Error("erasure request id already exists");
     }
@@ -5780,6 +8122,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateErasureAuditChain(stagedRequest, [stagedAudit]);
     validateTenantCredentialRevocationFence(stagedFence);
     validateTenantCredentialRevocationJobRecord(stagedCredentialJob);
+    const stagedRestorePublication = this.stageTenantRestoreJournalPublication(
+      stagedRequest,
+      stagedFence,
+      jobNowMs,
+      stagedAudit,
+    );
 
     const tenantExisted = this.subjectLifecycles.has(tenantKey);
     const priorTenant = this.subjectLifecycles.get(tenantKey);
@@ -5793,16 +8141,36 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const priorIdempotency = this.erasureIdempotency.get(idempotencyKey);
     const jobExisted = this.tenantCredentialRevocationJobs.has(stagedInput.requestId);
     const priorJob = this.tenantCredentialRevocationJobs.get(stagedInput.requestId);
+    const restoreJobsBefore = new Map(this.tenantRestoreJournalPublicationJobs);
+    const restoreTargetsBefore = new Map(this.tenantRestoreJournalPublicationTargets);
     try {
       this.tenantErasureAdmissions.set(stagedInput.requestId, stagedRequest);
       this.erasureAuditEvents.set(stagedInput.requestId, [stagedAudit]);
       this.tenantCredentialRevocationFences.set(stagedInput.tenantId, stagedFence);
       this.erasureIdempotency.set(idempotencyKey, stagedInput.requestId);
       this.tenantCredentialRevocationJobs.set(stagedInput.requestId, stagedCredentialJob);
+      if (stagedRestorePublication) {
+        this.tenantRestoreJournalPublicationJobs.set(
+          stagedInput.requestId,
+          stagedRestorePublication.job,
+        );
+        for (const target of stagedRestorePublication.targets) {
+          this.tenantRestoreJournalPublicationTargets.set(
+            this.tenantRestorePublicationTargetKey(
+              target.requestId,
+              target.publicationGeneration,
+              target.targetOrdinal,
+            ),
+            target,
+          );
+        }
+      }
       // Publish the lifecycle gate last. All staged values above were cloned and validated first;
       // synchronous rollback below preserves the same all-or-nothing contract as InnoDB.
       this.subjectLifecycles.set(tenantKey, stagedTenant);
     } catch (error) {
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationTargets, restoreTargetsBefore);
+      restoreMapSnapshot(this.tenantRestoreJournalPublicationJobs, restoreJobsBefore);
       restoreMapEntry(this.subjectLifecycles, tenantKey, tenantExisted, priorTenant);
       restoreMapEntry(
         this.tenantCredentialRevocationJobs,
@@ -5954,7 +8322,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     for (const admission of candidates) {
       const fence = this.tenantCredentialRevocationFences.get(admission.tenantId);
       try {
-        this.assertTenantErasureAdmissionProof(
+        this.assertTenantErasureAdmissionPublicationProof(
           admission,
           this.subjectRecord(admission.tenantId, "tenant", admission.tenantId),
           fence,
@@ -6164,6 +8532,28 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return true;
   }
 
+  private assertTenantRestorePublicationBeforeT3a(
+    job: TenantCredentialRevocationJobRecord,
+  ): void {
+    const control = this.readTenantRestoreJournalControl();
+    if (control.controlGeneration === 0) return;
+    const publication = this.tenantRestoreJournalPublicationJobs.get(job.requestId);
+    if (!publication || publication.phase !== "published"
+      || publication.tenantId !== job.tenantId
+      || publication.subjectGeneration !== job.subjectGeneration
+      || publication.t1FenceSha256 !== job.t1FenceSha256
+      || publication.controlEvidenceSha256 !== control.evidenceSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const evidence = this.assertTenantRestoreJournalPublicationEvidence(publication);
+    if (!evidence.receipt
+      || evidence.receipt.restoreFencePublicationComplete !== true
+      || evidence.receipt.restoreFenceReplayComplete !== false
+      || evidence.receipt.physicalReplayComplete !== false) {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
   async revokeTenantCredentialMaterial(
     authorization: TenantCredentialRevocationAuthorization,
   ): Promise<TenantCredentialRevocationReceipt | null> {
@@ -6172,6 +8562,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const current = this.tenantCredentialRevocationJobs.get(stagedAuthorization.requestId);
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
     validateTenantCredentialRevocationJobRecord(current);
+    this.assertTenantRestorePublicationBeforeT3a(current);
 
     if (current.phase === "credential_store_revoked") {
       this.assertTenantCredentialRevocationSource(current);
@@ -6646,7 +9037,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         const lifecycle = this.subjectRecord(job.tenantId, "tenant", job.tenantId);
         const fence = this.tenantCredentialRevocationFences.get(job.tenantId);
         if (!admission) throw new Error("tenant runtime revocation admission is missing");
-        this.assertTenantErasureAdmissionProof(admission, lifecycle, fence);
+        this.assertTenantErasureAdmissionPublicationProof(admission, lifecycle, fence);
       }
       return credentialReceipt;
     } catch {
@@ -7129,7 +9520,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       ) throw new Error("tenant content inventory T1 policy binding is invalid");
       validateErasureRequestRecordForRead(admission);
       if (requireLiveLifecycle) {
-        this.assertTenantErasureAdmissionProof(
+        this.assertTenantErasureAdmissionPublicationProof(
           admission,
           this.subjectRecord(job.tenantId, "tenant", job.tenantId),
           this.tenantCredentialRevocationFences.get(job.tenantId),
@@ -19366,6 +21757,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   ): Promise<UserDataExportRequestRecord> {
     const stagedInput = clone(input);
     validateUserDataExportRequestInput(stagedInput);
+    this.assertSubjectWritable(stagedInput.tenantId, stagedInput.userId);
     const now = this.userDataExportNow();
     const idempotencyKey = this.userDataExportIdempotencyKeyFor(stagedInput);
     const replayId = this.userDataExportIdempotency.get(idempotencyKey);
@@ -19383,7 +21775,6 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
       return clone(replay);
     }
-    this.assertSubjectWritable(stagedInput.tenantId, stagedInput.userId);
     if (this.userDataExportRequests.has(stagedInput.requestId)) {
       throw new UserDataExportStateError("data export request id already exists");
     }
@@ -19664,6 +22055,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const key = this.userDataExportDownloadLeaseKey(artifactId, leaseToken);
     const lease = this.userDataExportDownloadLeases.get(key);
     if (!lease || lease.leaseUntilMs <= now) return false;
+    if (!this.isSubjectActive(lease.tenantId, lease.userId)) return false;
     const hardDeadline = lease.createdAtMs + 10 * 60_000;
     const next = Math.min(hardDeadline, Math.max(lease.leaseUntilMs, now + leaseMs));
     if (!Number.isSafeInteger(next) || next <= now) return false;

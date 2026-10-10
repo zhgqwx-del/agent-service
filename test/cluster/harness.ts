@@ -15,6 +15,108 @@ const SECRET = "55".repeat(32);
 export const INTERNAL_ROUTER_TOKEN = "cluster-internal-router-token-v1-0001";
 export const TENANT_ERASURE_OPERATOR_TOKEN = "cluster-platform-operator-token-v1-0001";
 
+const CLUSTER_OS_ENV_KEYS = [
+  "PATH",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "TZ",
+  "SystemRoot",
+  "WINDIR",
+] as const;
+const ROUTER_FORBIDDEN_RUNNER_SECRET_KEYS = new Set([
+  "ADMIN_BOOTSTRAP_TENANT",
+  "API_BASE_URL",
+  "API_KEY",
+  "BOOTSTRAP_API_KEY",
+  "BOOTSTRAP_TENANT_ID",
+  "CREDENTIAL_TARGET_EXECUTION_ADAPTER",
+  "DEFAULT_MODEL",
+  "PLATFORM_PROVIDER",
+  "SECRETS_MASTER_KEY",
+]);
+const ROUTER_ALLOWED_BLOB_S3_KEYS = new Set(["BLOB_S3_BUCKET", "BLOB_S3_PREFIX"]);
+const ROUTER_ALLOWED_RESTORE_JOURNAL_KEYS = new Set([
+  "RESTORE_JOURNAL_NAMESPACE_SHA256",
+  "RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256",
+  "RESTORE_JOURNAL_TARGET_ROOT_SHA256",
+]);
+const ROUTER_ALLOWED_TENANT_RESTORE_JOURNAL_KEYS = new Set([
+  "TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED",
+]);
+const RUNNER_FORBIDDEN_ROUTER_OR_CLI_KEYS = new Set([
+  "RESTORE_FLEET_STOPPED_ACK",
+  "RESTORE_JOURNAL_NAMESPACE_SHA256",
+  "RESTORE_JOURNAL_PRIMARY_ACTIVATION_ACK",
+  "RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256",
+  "RESTORE_JOURNAL_TARGET_ROOT_SHA256",
+  "RESTORE_REPLAY_PAGE_SIZE",
+  "RESTORE_RUN_ID",
+  "SOURCE_BACKUP_SHA256",
+  "TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED",
+  "TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED",
+  "TENANT_DATABASE_PURGE_ENABLED",
+  "TENANT_ERASURE_OPERATOR_ID",
+  "TENANT_ERASURE_OPERATOR_TOKEN",
+  "TENANT_PURGE_EXECUTION_ENABLED",
+  "TENANT_REDIS_PURGE_ENABLED",
+  "TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED",
+  "TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED",
+]);
+
+export type ClusterChildRole = "runner" | "router";
+
+function isRouterOnlyForbidden(key: string): boolean {
+  return ROUTER_FORBIDDEN_RUNNER_SECRET_KEYS.has(key)
+    || key.startsWith("MYSQL_")
+    || key.startsWith("S3_TEST_")
+    || (
+      key.startsWith("TENANT_RESTORE_JOURNAL_")
+      && !ROUTER_ALLOWED_TENANT_RESTORE_JOURNAL_KEYS.has(key)
+    )
+    || key.startsWith("AWS_")
+    || key.startsWith("MINIO_ROOT_")
+    || key === "BLOB_DIR"
+    || (key.startsWith("BLOB_S3_") && !ROUTER_ALLOWED_BLOB_S3_KEYS.has(key))
+    || (
+      key.startsWith("RESTORE_JOURNAL_")
+      && !ROUTER_ALLOWED_RESTORE_JOURNAL_KEYS.has(key)
+    );
+}
+
+/**
+ * Builds the exact environment handed to a cluster child process.
+ *
+ * A developer's `.env` is deliberately visible to the Vitest parent, but it must not silently
+ * select an external database/object store or enable restore-journal authority in a child. Only
+ * values declared by this harness (including a test's explicit runner fixture) may reintroduce
+ * application configuration after inherited values have been removed.
+ */
+export function buildClusterChildEnv(
+  inherited: NodeJS.ProcessEnv,
+  explicit: Readonly<Record<string, string>>,
+  role: ClusterChildRole,
+): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = {};
+  for (const key of CLUSTER_OS_ENV_KEYS) {
+    const value = inherited[key];
+    if (value !== undefined) childEnv[key] = value;
+  }
+  Object.assign(childEnv, explicit);
+  childEnv.NODE_ENV = "test";
+
+  if (role === "runner") {
+    for (const key of RUNNER_FORBIDDEN_ROUTER_OR_CLI_KEYS) delete childEnv[key];
+  } else {
+    for (const key of Object.keys(childEnv)) {
+      if (isRouterOnlyForbidden(key)) delete childEnv[key];
+    }
+  }
+  return childEnv;
+}
+
 async function freePort(): Promise<number> {
   return new Promise((res, rej) => {
     const s = createServer();
@@ -64,16 +166,12 @@ function launch(
   script: string,
   port: number,
   env: Record<string, string>,
-  options: { runner?: boolean } = {},
+  role: ClusterChildRole,
 ): Proc {
   // `node --import tsx <script>` makes the spawned process BE the server. Running the `tsx` CLI would
   // add a wrapper process, and killing the wrapper leaves the real server alive — which silently turns
   // a takeover test into a no-op (it did, until this was fixed).
-  const childEnv: NodeJS.ProcessEnv = { ...process.env, ...env, NODE_ENV: "test" };
-  if (options.runner) {
-    delete childEnv.TENANT_ERASURE_OPERATOR_TOKEN;
-    delete childEnv.TENANT_ERASURE_OPERATOR_ID;
-  }
+  const childEnv = buildClusterChildEnv(process.env, env, role);
   const child = spawn(process.execPath, ["--import", "tsx", script], {
     cwd: ROOT,
     env: childEnv,
@@ -303,7 +401,7 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       "apps/agent-runner/src/main.ts",
       port,
       runnerEnv(`runner-${i}`, port, i),
-      { runner: true },
+      "runner",
     );
     started.push(p);
     await waitHttp(`${p.url}/readyz`).catch((e) => abandon(new Error(`${e.message}\n${p.log.slice(-20).join("\n")}`)));
@@ -337,7 +435,7 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       opts.tenantRuntimeDrainExecutionEnabled ? "1" : "0",
     TENANT_ERASURE_OPERATOR_TOKEN,
     TENANT_ERASURE_OPERATOR_ID: "cluster-platform-operator",
-  });
+  }, "router");
   started.push(router);
   await waitHttp(`${router.url}/readyz`).catch((e) => abandon(new Error(`${e.message}\n${router.log.slice(-20).join("\n")}`)));
 

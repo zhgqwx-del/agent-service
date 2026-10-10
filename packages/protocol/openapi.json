@@ -1330,6 +1330,45 @@
                 "default": false,
                 "type": "boolean"
               },
+              "tenantRestoreJournal": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "independent-restore-journal-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantRestoreJournalNamespaceSha256": {
+                "default": null,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tenantRestoreJournalTargetRootSha256": {
+                "default": null,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tenantRestoreJournalWorker": {
+                "default": false,
+                "type": "boolean"
+              },
+              "tenantRestoreRuntimeEpochSha256": {
+                "default": null,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "tenantRuntimeDrain": {
                 "default": [],
                 "items": {

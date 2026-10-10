@@ -81,6 +81,14 @@ const Env = z.object({
   TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Independent append-only restore-journal publication gate. */
+  TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  /** Content-free identities only; object-store endpoint and credentials remain runner-only. */
+  RESTORE_JOURNAL_NAMESPACE_SHA256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  RESTORE_JOURNAL_TARGET_ROOT_SHA256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   /** Independent execution barrier for the T3e local execution/physical-ACK worker. */
   TENANT_PURGE_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -116,6 +124,11 @@ export type RouterConfig = Omit<z.infer<typeof Env>, "INTERNAL_ROUTER_TOKEN"> & 
 
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
 const ROUTER_ALLOWED_BLOB_S3_ENV = new Set(["BLOB_S3_BUCKET", "BLOB_S3_PREFIX"]);
+const ROUTER_ALLOWED_RESTORE_JOURNAL_ENV = new Set([
+  "RESTORE_JOURNAL_NAMESPACE_SHA256",
+  "RESTORE_JOURNAL_TARGET_ROOT_SHA256",
+  "RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256",
+]);
 const ROUTER_FORBIDDEN_CREDENTIAL_ENV = new Set([
   "AWS_ACCESS_KEY_ID",
   "AWS_SECRET_ACCESS_KEY",
@@ -133,6 +146,16 @@ const ROUTER_FORBIDDEN_CREDENTIAL_ENV = new Set([
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
   "AWS_CONTAINER_AUTHORIZATION_TOKEN",
   "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+]);
+const ROUTER_FORBIDDEN_RUNNER_SECRET_ENV = new Set([
+  "API_KEY",
+  "API_BASE_URL",
+  "DEFAULT_MODEL",
+  "PLATFORM_PROVIDER",
+  "SECRETS_MASTER_KEY",
+  "BOOTSTRAP_API_KEY",
+  "BOOTSTRAP_TENANT_ID",
+  "ADMIN_BOOTSTRAP_TENANT",
 ]);
 
 function validateRunnerUrl(value: string): string {
@@ -163,6 +186,26 @@ function validateS3Bucket(value: string): string {
 }
 
 export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterConfig {
+  const runnerOnlySecretKey = Object.keys(env).find((key) => (
+    ROUTER_FORBIDDEN_RUNNER_SECRET_ENV.has(key)
+    || key.startsWith("MYSQL_")
+    || key.startsWith("S3_TEST_")
+  ) && env[key] !== undefined);
+  if (runnerOnlySecretKey) {
+    throw new Error(
+      `${runnerOnlySecretKey} is runner-only secret/configuration and must not enter the router process`,
+    );
+  }
+  const runnerOnlyRestoreJournalKey = Object.keys(env).find((key) => (
+    key.startsWith("RESTORE_JOURNAL_")
+    && !ROUTER_ALLOWED_RESTORE_JOURNAL_ENV.has(key)
+    && env[key] !== undefined
+  ));
+  if (runnerOnlyRestoreJournalKey) {
+    throw new Error(
+      `${runnerOnlyRestoreJournalKey} is runner-only restore-journal authority and must not enter the router process`,
+    );
+  }
   const runnerOnlyKey = Object.keys(env).find((key) => (
     (key.startsWith("BLOB_S3_") && !ROUTER_ALLOWED_BLOB_S3_ENV.has(key))
     || key.startsWith("MINIO_ROOT_")
@@ -256,6 +299,24 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     throw new Error(
       "CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1 is required before "
         + "TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED=1",
+    );
+  }
+  const restoreJournalIdentityCount = [
+    c.RESTORE_JOURNAL_NAMESPACE_SHA256,
+    c.RESTORE_JOURNAL_TARGET_ROOT_SHA256,
+    c.RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256,
+  ].filter((value) => value !== undefined).length;
+  if (restoreJournalIdentityCount !== 0 && restoreJournalIdentityCount !== 3) {
+    throw new Error(
+      "RESTORE_JOURNAL_NAMESPACE_SHA256, RESTORE_JOURNAL_TARGET_ROOT_SHA256, and "
+        + "RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256 must be configured together",
+    );
+  }
+  if (c.TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED
+    && c.RESTORE_JOURNAL_NAMESPACE_SHA256 === undefined) {
+    throw new Error(
+      "restore journal namespace and target-root identities are required before "
+        + "TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED=1",
     );
   }
   if (c.TENANT_REDIS_PURGE_ENABLED && !c.REDIS_NAMESPACE_ID) {

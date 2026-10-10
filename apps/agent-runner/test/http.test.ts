@@ -84,6 +84,11 @@ async function makeApp(
     credentialTrackingActive?: boolean;
     credentialTargetExecutionSupported?: boolean;
     credentialTargetExecutionWorker?: boolean;
+    restoreJournalSupported?: boolean;
+    restoreJournalWorker?: boolean;
+    restoreJournalNamespaceSha256?: string;
+    restoreJournalTargetRootSha256?: string;
+    restoreRuntimeEpochSha256?: string;
     databasePurgeWorker?: boolean;
     redisPurgeSupported?: boolean;
     redisPurgeWorker?: boolean;
@@ -119,6 +124,11 @@ async function makeApp(
       lifecycle.credentialTargetExecutionSupported,
     tenantCredentialTargetExecutionWorkerEnabled:
       lifecycle.credentialTargetExecutionWorker,
+    tenantRestoreJournalSupported: lifecycle.restoreJournalSupported,
+    tenantRestoreJournalWorkerEnabled: lifecycle.restoreJournalWorker,
+    tenantRestoreJournalNamespaceSha256: lifecycle.restoreJournalNamespaceSha256,
+    tenantRestoreJournalTargetRootSha256: lifecycle.restoreJournalTargetRootSha256,
+    tenantRestoreRuntimeEpochSha256: lifecycle.restoreRuntimeEpochSha256,
     tenantDatabasePurgeWorkerEnabled: lifecycle.databasePurgeWorker,
     tenantRedisPurgeSupported: lifecycle.redisPurgeSupported,
     tenantRedisPurgeWorkerEnabled: lifecycle.redisPurgeWorker,
@@ -420,6 +430,51 @@ describe("agent-runner HTTP API", () => {
       features: {
         tenantCredentialTargetExecution: ["external-credential-execution-v1"],
         tenantCredentialTargetExecutionWorker: true,
+      },
+    });
+  });
+
+  it("advertises restore-journal support only with both exact fleet identities", async () => {
+    const namespaceSha256 = "a".repeat(64);
+    const targetRootSha256 = "b".repeat(64);
+    const runtimeEpochSha256 = "c".repeat(64);
+    const unsupported = await makeApp(60_000, { restoreJournalSupported: true });
+    const aware = await makeApp(60_000, {
+      restoreJournalSupported: true,
+      restoreJournalNamespaceSha256: namespaceSha256,
+      restoreJournalTargetRootSha256: targetRootSha256,
+      restoreRuntimeEpochSha256: runtimeEpochSha256,
+    });
+    const worker = await makeApp(60_000, {
+      restoreJournalSupported: true,
+      restoreJournalWorker: true,
+      restoreJournalNamespaceSha256: namespaceSha256,
+      restoreJournalTargetRootSha256: targetRootSha256,
+      restoreRuntimeEpochSha256: runtimeEpochSha256,
+    });
+    expect(await (await unsupported.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantRestoreJournal: [],
+        tenantRestoreJournalWorker: false,
+        tenantRestoreJournalNamespaceSha256: null,
+        tenantRestoreJournalTargetRootSha256: null,
+        tenantRestoreRuntimeEpochSha256: null,
+      },
+    });
+    expect(await (await aware.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantRestoreJournal: ["independent-restore-journal-v1"],
+        tenantRestoreJournalWorker: false,
+        tenantRestoreJournalNamespaceSha256: namespaceSha256,
+        tenantRestoreJournalTargetRootSha256: targetRootSha256,
+        tenantRestoreRuntimeEpochSha256: runtimeEpochSha256,
+      },
+    });
+    expect(await (await worker.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantRestoreJournal: ["independent-restore-journal-v1"],
+        tenantRestoreJournalWorker: true,
+        dataPurgeExecution: false,
       },
     });
   });

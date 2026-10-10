@@ -113,6 +113,19 @@ export const INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_VALUE =
   "external-credential-execution-v1" as const;
 
 /**
+ * Independent restore-journal publication is a prerequisite for the first destructive tenant
+ * credential boundary. One content-free ACK authorizes only the immediately following durable
+ * journal operation and is emitted only when every configured runner reports the exact external
+ * journal namespace and target-set identity.
+ */
+export const INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH =
+  "/_internal/tenant-restore-journal-v1/ready" as const;
+export const INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER =
+  "x-agent-service-tenant-restore-journal" as const;
+export const INTERNAL_TENANT_RESTORE_JOURNAL_ACK_VALUE =
+  "independent-restore-journal-v1" as const;
+
+/**
  * A tenant-purge executor obtains this content-free ACK before it may touch the independent
  * execution queue or cross an irreversible local action boundary. The router emits it only after
  * a fresh, non-sticky observation of every configured runner. This ACK is deliberately narrower
@@ -442,6 +455,15 @@ export type TenantCredentialTargetExecutionCapability = z.infer<
   typeof TenantCredentialTargetExecutionCapability
 >;
 
+export const TENANT_RESTORE_JOURNAL_INDEPENDENT_V1 =
+  "independent-restore-journal-v1" as const;
+export const TenantRestoreJournalCapability = z.literal(
+  TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
+);
+export type TenantRestoreJournalCapability = z.infer<
+  typeof TenantRestoreJournalCapability
+>;
+
 export const TENANT_PURGE_EXECUTION_LOCAL_ACK_V1 = "local-execution-ack-v1" as const;
 export const TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1 =
   "local-db-content-delete-v1" as const;
@@ -610,6 +632,16 @@ export const Capabilities = z.object({
       z.array(TenantCredentialTargetExecutionCapability).max(1).default([]),
     /** Local target executor activation; fleet authority still requires the private fresh barrier. */
     tenantCredentialTargetExecutionWorker: z.boolean().default(false),
+    /** Code is wired to an independent append-only tenant restore journal. */
+    tenantRestoreJournal: z.array(TenantRestoreJournalCapability).max(1).default([]),
+    /** Local publication worker activation; destructive authority still requires a fresh barrier. */
+    tenantRestoreJournalWorker: z.boolean().default(false),
+    /** Content-free external journal namespace identity; null when no adapter is configured. */
+    tenantRestoreJournalNamespaceSha256: Sha256.nullable().default(null),
+    /** Ordered configured target-set identity; null when no adapter is configured. */
+    tenantRestoreJournalTargetRootSha256: Sha256.nullable().default(null),
+    /** Exact live database epoch; a restored database must start under a new digest. */
+    tenantRestoreRuntimeEpochSha256: Sha256.nullable().default(null),
     /** Code understands the local T3e execution/physical-ACK substrate; this is not completion. */
     tenantPurgeExecution: z.array(TenantPurgeExecutionCapability).max(2).default([]),
     /** Local executor activation; fleet authority additionally requires the router's fresh barrier. */

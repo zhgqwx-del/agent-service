@@ -62,6 +62,7 @@ import {
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
@@ -172,6 +173,14 @@ export interface AppDeps {
   tenantErasureRequestsEnabled?: boolean;
   /** Fresh router proof that every configured runtime can enforce the tenant fence. */
   tenantErasureAdmissionGate?: { canAdmit: () => Promise<boolean> };
+  /**
+   * Active-journal response fence. T1 remains a database transaction; this read-only callback
+   * withholds the public acknowledgement until its external publication receipt is durable.
+   */
+  tenantRestoreJournalPublicationReady?: (
+    tenantId: string,
+    requestId: string,
+  ) => Promise<boolean>;
   /** Local credential-revocation worker activation; the router barrier remains separately required. */
   tenantCredentialRevocationWorkerEnabled?: boolean;
   /** Durable write-once tracking state; code awareness is advertised independently. */
@@ -180,6 +189,12 @@ export interface AppDeps {
   tenantCredentialTargetExecutionSupported?: boolean;
   /** Local external target worker activation; the router barrier remains independently required. */
   tenantCredentialTargetExecutionWorkerEnabled?: boolean;
+  /** Concrete independent restore-journal adapter support and its content-free fleet identity. */
+  tenantRestoreJournalSupported?: boolean;
+  tenantRestoreJournalWorkerEnabled?: boolean;
+  tenantRestoreJournalNamespaceSha256?: string;
+  tenantRestoreJournalTargetRootSha256?: string;
+  tenantRestoreRuntimeEpochSha256?: string;
   /** Local T3e worker activation; code awareness remains separately advertised during rollout. */
   tenantPurgeExecutionWorkerEnabled?: boolean;
   /** Local T3f database-content worker activation; its router barrier remains independent. */
@@ -253,6 +268,10 @@ export function createApp(deps: AppDeps) {
   const app = new Hono<AuthEnv>();
   const tenantRedisPurgeSupported = deps.tenantRedisPurgeSupported === true
     && /^[0-9a-f]{64}$/.test(deps.tenantRedisPurgeNamespaceSha256 ?? "");
+  const tenantRestoreJournalSupported = deps.tenantRestoreJournalSupported === true
+    && /^[0-9a-f]{64}$/.test(deps.tenantRestoreJournalNamespaceSha256 ?? "")
+    && /^[0-9a-f]{64}$/.test(deps.tenantRestoreJournalTargetRootSha256 ?? "")
+    && /^[0-9a-f]{64}$/.test(deps.tenantRestoreRuntimeEpochSha256 ?? "");
   const maxBlobBytes = deps.maxBlobBytes ?? deps.maxBodyBytes;
   if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > deps.maxBodyBytes) {
     throw new Error("maxBlobBytes must be a positive safe integer no larger than maxBodyBytes");
@@ -355,6 +374,20 @@ export function createApp(deps: AppDeps) {
         tenantCredentialTargetExecutionWorker:
           deps.tenantCredentialTargetExecutionSupported === true
           && deps.tenantCredentialTargetExecutionWorkerEnabled === true,
+        tenantRestoreJournal: tenantRestoreJournalSupported
+          ? [TENANT_RESTORE_JOURNAL_INDEPENDENT_V1]
+          : [],
+        tenantRestoreJournalWorker: tenantRestoreJournalSupported
+          && deps.tenantRestoreJournalWorkerEnabled === true,
+        tenantRestoreJournalNamespaceSha256: tenantRestoreJournalSupported
+          ? deps.tenantRestoreJournalNamespaceSha256!
+          : null,
+        tenantRestoreJournalTargetRootSha256: tenantRestoreJournalSupported
+          ? deps.tenantRestoreJournalTargetRootSha256!
+          : null,
+        tenantRestoreRuntimeEpochSha256: tenantRestoreJournalSupported
+          ? deps.tenantRestoreRuntimeEpochSha256!
+          : null,
         // Code awareness and activation are deliberately separate rolling-upgrade signals.
         tenantPurgeExecution: [
           TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
@@ -579,6 +612,22 @@ export function createApp(deps: AppDeps) {
       );
     },
   }));
+  const requireTenantRestoreJournalPublication = async (
+    tenantId: string,
+    requestId: string,
+  ): Promise<void> => {
+    if (!deps.tenantRestoreJournalPublicationReady) return;
+    let published = false;
+    try {
+      published = await deps.tenantRestoreJournalPublicationReady(tenantId, requestId);
+    } catch {
+      // A dependency read failure is indistinguishable from publication still being pending at
+      // this boundary. The committed T1 is recovered through the same Idempotency-Key replay.
+    }
+    if (!published) {
+      throw new ApiError("draining", "tenant erasure journal publication is pending");
+    }
+  };
   app.post(tenantErasureControlPath, async (c) => {
     if (!deps.subjectLifecycle) {
       throw new ApiError("draining", "tenant erasure control is unavailable on this runner");
@@ -593,7 +642,10 @@ export function createApp(deps: AppDeps) {
         idempotencyKey: headers["idempotency-key"],
         requestHash: tenantErasureRequestHash(input.tenantId),
       });
-      if (replay) return c.json(publicTenantErasureRequest(replay), 202);
+      if (replay) {
+        await requireTenantRestoreJournalPublication(replay.tenantId, replay.requestId);
+        return c.json(publicTenantErasureRequest(replay), 202);
+      }
     } catch (error) {
       if (error instanceof ErasureIdempotencyMismatchError) {
         throw new ApiError("idempotency_conflict", error.message);
@@ -627,6 +679,7 @@ export function createApp(deps: AppDeps) {
         requestHash: tenantErasureRequestHash(input.tenantId),
         atMs: Date.now(),
       });
+      await requireTenantRestoreJournalPublication(record.tenantId, record.requestId);
       return c.json(publicTenantErasureRequest(record), 202);
     } catch (error) {
       if (error instanceof ErasureIdempotencyMismatchError) {
@@ -658,6 +711,7 @@ export function createApp(deps: AppDeps) {
       if (!record) {
         throw new ApiError("draining", "tenant erasure admission is closed and no replay exists");
       }
+      await requireTenantRestoreJournalPublication(record.tenantId, record.requestId);
       return c.json(publicTenantErasureRequest(record), 202);
     } catch (error) {
       if (error instanceof ErasureIdempotencyMismatchError) {

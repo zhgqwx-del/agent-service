@@ -19,6 +19,11 @@ caller_mover_env_names=(
   SOURCE_CLEANUP_DELAY_MS
   MAX_OBJECT_BYTES
   BLOB_MIGRATION_COMMIT
+  RESTORE_RUN_ID
+  RESTORE_FLEET_STOPPED_ACK
+  SOURCE_BACKUP_SHA256
+  RESTORE_REPLAY_PAGE_SIZE
+  BLOB_STORE
   BLOB_DIR
   BLOB_NAMESPACE_ID
   BLOB_S3_ENDPOINT
@@ -34,7 +39,9 @@ caller_mover_env_names=(
 )
 while IFS= read -r caller_env_name; do
   case "$caller_env_name" in
-    AWS_*) caller_mover_env_names+=("$caller_env_name") ;;
+    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*)
+      caller_mover_env_names+=("$caller_env_name")
+      ;;
   esac
 done < <(compgen -e)
 
@@ -209,7 +216,9 @@ require_mysql_credential_target_execution_dormant() {
 }
 
 infra() {
-  if [ "${BLOB_STORE:-filesystem}" = "s3" ] && [ -z "${BLOB_S3_ENDPOINT:-}" ]; then
+  if { [ "${BLOB_STORE:-filesystem}" = "s3" ] && [ -z "${BLOB_S3_ENDPOINT:-}" ]; } \
+    || { [ "${RESTORE_JOURNAL_ADAPTER:-}" = "s3" ] \
+      && [ -z "${RESTORE_JOURNAL_S3_ENDPOINT:-}" ]; }; then
     MINIO_ENABLED="${MINIO_ENABLED:-1}" deploy/local/infra.sh "$@"
   else
     deploy/local/infra.sh "$@"
@@ -231,9 +240,15 @@ start_apps() {
   require_mysql_credential_target_execution_dormant
   mkdir -p "$STATE_DIR"
   local blob_store="${BLOB_STORE:-filesystem}"
+  local restore_journal_uses_local_minio=0
+  if [ "${RESTORE_JOURNAL_ADAPTER:-}" = "s3" ] \
+    && [ -z "${RESTORE_JOURNAL_S3_ENDPOINT:-}" ]; then
+    restore_journal_uses_local_minio=1
+  fi
   infra start
 
-  local -a runner_blob_env router_blob_env cloud_credential_scrub
+  local -a runner_blob_env router_blob_env runner_restore_journal_env cloud_credential_scrub
+  local -a router_runner_secret_scrub
   # `.env` is exported for local orchestration, but these provider-chain credentials must not leak
   # into either application process. The local S3 runner receives only its explicit BLOB_S3_*
   # credentials below; the router never receives storage credentials.
@@ -245,6 +260,17 @@ start_apps() {
     -u AWS_WEB_IDENTITY_TOKEN_FILE -u AWS_ROLE_ARN -u AWS_ROLE_SESSION_NAME
     -u AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -u AWS_CONTAINER_CREDENTIALS_FULL_URI
     -u AWS_CONTAINER_AUTHORIZATION_TOKEN -u AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
+  )
+  # The router needs Redis and its own narrowly scoped tokens, but never the runner database,
+  # provider, bootstrap or envelope-encryption authorities loaded from `.env`.
+  router_runner_secret_scrub=(
+    -u API_KEY -u API_BASE_URL -u DEFAULT_MODEL -u PLATFORM_PROVIDER
+    -u MYSQL_URL -u MYSQL_TEST_URL -u MYSQL_MIGRATION_TEST_URL -u MYSQL_PWD
+    -u SECRETS_MASTER_KEY -u BOOTSTRAP_API_KEY -u BOOTSTRAP_TENANT_ID
+    -u ADMIN_BOOTSTRAP_TENANT
+    -u S3_TEST_ENDPOINT -u S3_TEST_REGION -u S3_TEST_BUCKET
+    -u S3_TEST_ACCESS_KEY_ID -u S3_TEST_SECRET_ACCESS_KEY -u S3_TEST_SESSION_TOKEN
+    -u S3_TEST_FORCE_PATH_STYLE
   )
   if [ "$blob_store" = "s3" ]; then
     runner_blob_env=(
@@ -286,6 +312,38 @@ start_apps() {
     )
   fi
 
+  runner_restore_journal_env=()
+  if [ "$restore_journal_uses_local_minio" = 1 ]; then
+    local restore_journal_bucket="${RESTORE_JOURNAL_S3_BUCKET:-agent-service-local-restore-journal}"
+    if [ "$blob_store" = "s3" ] \
+      && [ "$restore_journal_bucket" = "${BLOB_S3_BUCKET:-${MINIO_BUCKET:-agent-service-local}}" ]; then
+      die "RESTORE_JOURNAL_S3_BUCKET must differ from the Blob bucket"
+    fi
+    env \
+      S3_TEST_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}" \
+      S3_TEST_REGION="${MINIO_REGION:-us-east-1}" \
+      S3_TEST_BUCKET="$restore_journal_bucket" \
+      S3_TEST_ACCESS_KEY_ID="${MINIO_ROOT_USER:-agentservice-local}" \
+      S3_TEST_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD:-agent-service-local-minio-only-0001}" \
+      S3_TEST_FORCE_PATH_STYLE=1 \
+      node packages/store/scripts/bootstrap-s3.mjs >/dev/null
+    runner_restore_journal_env=(
+      RESTORE_JOURNAL_S3_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"
+      RESTORE_JOURNAL_S3_REGION="${RESTORE_JOURNAL_S3_REGION:-${MINIO_REGION:-us-east-1}}"
+      RESTORE_JOURNAL_S3_BUCKET="$restore_journal_bucket"
+      RESTORE_JOURNAL_S3_PREFIX="${RESTORE_JOURNAL_S3_PREFIX:-tenant-restore-journal}"
+      RESTORE_JOURNAL_S3_FORCE_PATH_STYLE="${RESTORE_JOURNAL_S3_FORCE_PATH_STYLE:-1}"
+      RESTORE_JOURNAL_S3_PRIVATE_BUCKET_ACK="${RESTORE_JOURNAL_S3_PRIVATE_BUCKET_ACK:-0}"
+      RESTORE_JOURNAL_S3_REQUEST_TIMEOUT_MS="${RESTORE_JOURNAL_S3_REQUEST_TIMEOUT_MS:-5000}"
+      RESTORE_JOURNAL_S3_ACCESS_KEY_ID="${RESTORE_JOURNAL_S3_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-agentservice-local}}"
+      RESTORE_JOURNAL_S3_SECRET_ACCESS_KEY="${RESTORE_JOURNAL_S3_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-agent-service-local-minio-only-0001}}"
+    )
+    [ -n "${RESTORE_JOURNAL_S3_SESSION_TOKEN:-}" ] \
+      && runner_restore_journal_env+=(
+        RESTORE_JOURNAL_S3_SESSION_TOKEN="$RESTORE_JOURNAL_S3_SESSION_TOKEN"
+      )
+  fi
+
   if pid_alive "$RUNNER_PID_FILE"; then
     echo "runner: already running (pid $(sed -n '1p' "$RUNNER_PID_FILE"))"
   else
@@ -300,8 +358,16 @@ start_apps() {
       -u TENANT_PURGE_EXECUTION_ENABLED \
       -u TENANT_DATABASE_PURGE_ENABLED \
       -u TENANT_REDIS_PURGE_ENABLED \
+      -u TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED \
+      -u RESTORE_JOURNAL_NAMESPACE_SHA256 \
+      -u RESTORE_JOURNAL_TARGET_ROOT_SHA256 \
+      -u RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256 \
+      -u RESTORE_JOURNAL_PRIMARY_ACTIVATION_ACK \
+      -u RESTORE_RUN_ID -u RESTORE_FLEET_STOPPED_ACK \
+      -u SOURCE_BACKUP_SHA256 -u RESTORE_REPLAY_PAGE_SIZE \
       "${cloud_credential_scrub[@]}" \
       "${runner_blob_env[@]}" \
+      "${runner_restore_journal_env[@]}" \
       STORE=mysql \
       RUNNER_PORT="$RUNNER_PORT" \
       RUNNER_ID="${RUNNER_ID:-runner-local-1}" \
@@ -350,10 +416,35 @@ start_apps() {
       -u TENANT_PURGE_EXECUTION_WORKER_ENABLED \
       -u TENANT_DATABASE_PURGE_WORKER_ENABLED \
       -u TENANT_REDIS_PURGE_WORKER_ENABLED \
+      -u RESTORE_JOURNAL_ADAPTER \
+      -u RESTORE_JOURNAL_DATABASE_NAMESPACE_ID \
+      -u RESTORE_JOURNAL_RUNTIME_EPOCH_ID \
+      -u RESTORE_JOURNAL_NAMESPACE_ID \
+      -u RESTORE_JOURNAL_FAILURE_DOMAIN_ID \
+      -u RESTORE_JOURNAL_INDEPENDENT_FAILURE_DOMAIN_ACK \
+      -u RESTORE_JOURNAL_S3_ENDPOINT -u RESTORE_JOURNAL_S3_REGION \
+      -u RESTORE_JOURNAL_S3_BUCKET -u RESTORE_JOURNAL_S3_PREFIX \
+      -u RESTORE_JOURNAL_S3_FORCE_PATH_STYLE \
+      -u RESTORE_JOURNAL_S3_PRIVATE_BUCKET_ACK \
+      -u RESTORE_JOURNAL_S3_REQUEST_TIMEOUT_MS \
+      -u RESTORE_JOURNAL_S3_ACCESS_KEY_ID \
+      -u RESTORE_JOURNAL_S3_SECRET_ACCESS_KEY \
+      -u RESTORE_JOURNAL_S3_SESSION_TOKEN \
+      -u RESTORE_JOURNAL_PRIMARY_ACTIVATION_ACK \
+      -u RESTORE_RUN_ID -u RESTORE_FLEET_STOPPED_ACK \
+      -u SOURCE_BACKUP_SHA256 -u RESTORE_REPLAY_PAGE_SIZE \
+      -u TENANT_RESTORE_JOURNAL_WORKER_ENABLED \
+      -u TENANT_RESTORE_JOURNAL_WORKER_POLL_MS \
+      -u TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS \
+      -u TENANT_RESTORE_JOURNAL_WORKER_BATCH_SIZE \
+      -u TENANT_RESTORE_JOURNAL_MATERIALIZE_BATCH_SIZE \
+      -u TENANT_RESTORE_JOURNAL_RETRY_BASE_MS \
+      -u TENANT_RESTORE_JOURNAL_RETRY_MAX_MS \
       -u BLOB_S3_ENDPOINT -u BLOB_S3_REGION -u BLOB_S3_FORCE_PATH_STYLE \
       -u BLOB_S3_PRIVATE_BUCKET_ACK -u BLOB_S3_REQUEST_TIMEOUT_MS \
       -u BLOB_S3_ACCESS_KEY_ID -u BLOB_S3_SECRET_ACCESS_KEY -u BLOB_S3_SESSION_TOKEN \
       "${cloud_credential_scrub[@]}" \
+      "${router_runner_secret_scrub[@]}" \
       "${router_blob_env[@]}" \
       RUNNERS="${RUNNERS:-$RUNNER_URL}" \
       REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379}" \
@@ -461,6 +552,9 @@ verify() {
   pnpm run test:blob-storage-control-memory
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-storage-control-mysql
+  pnpm run test:tenant-restore-journal-memory
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-restore-journal-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:outbox-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
@@ -537,6 +631,13 @@ verify_s3() {
     S3_TEST_FORCE_PATH_STYLE=1
   )
   env "${s3_test_env[@]}" pnpm run test:blob-s3
+  local restore_journal_bucket="${RESTORE_JOURNAL_S3_BUCKET:-agent-service-local-restore-journal}"
+  [ "$restore_journal_bucket" != "${MINIO_BUCKET:-agent-service-local}" ] \
+    || die "RESTORE_JOURNAL_S3_BUCKET must differ from the Blob bucket"
+  env "${s3_test_env[@]}" S3_TEST_BUCKET="$restore_journal_bucket" \
+    node packages/store/scripts/bootstrap-s3.mjs
+  env "${s3_test_env[@]}" S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
+    pnpm run test:restore-journal-s3
   env "${s3_test_env[@]}" \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-storage-migration-mysql-s3
@@ -559,8 +660,15 @@ blob_storage_migrate() {
   node --import tsx apps/agent-runner/src/blob-storage-migrate.ts "$@"
 }
 
+restore_ledger_reconcile() {
+  require_tools
+  # Foreground, one-shot recovery entrypoint. All database/object-store authority stays in the
+  # environment; the wrapper never interpolates or prints those values.
+  node --import tsx apps/agent-runner/src/restore-ledger-reconcile.ts "$@"
+}
+
 usage() {
-  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|blob-storage-migrate|down"
+  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|down"
 }
 
 case "${1:-}" in
@@ -576,6 +684,7 @@ case "${1:-}" in
   verify-real) verify_real ;;
   cleanup-idempotency) shift; cleanup_idempotency "$@" ;;
   blob-storage-migrate) shift; blob_storage_migrate "$@" ;;
+  restore-ledger-reconcile) shift; restore_ledger_reconcile "$@" ;;
   down) stop_apps; infra stop ;;
   *) usage; exit 1 ;;
 esac

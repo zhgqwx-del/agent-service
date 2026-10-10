@@ -21,6 +21,7 @@ RUN node scripts/build-app.mjs ${APP}
 # The one-shot filesystem-to-S3 mover is an additional runner entrypoint, not another image or
 # daemon. Refuse to build a runner image if its independently executable artifact is absent.
 RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/blob-storage-migrate.js
+RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/restore-ledger-reconcile.js
 # The first install has populated pnpm's store. Deploy offline from the same frozen lockfile and skip
 # lifecycle scripts: all runtime dependencies are JavaScript-only and esbuild is build-stage-only.
 RUN pnpm --filter "./apps/${APP}" --prod --offline --ignore-scripts --trust-lockfile --frozen-lockfile deploy /app/deploy

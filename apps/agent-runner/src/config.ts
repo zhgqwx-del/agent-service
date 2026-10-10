@@ -5,6 +5,10 @@ import {
   type BlobStorageCapability,
 } from "@agent-service/protocol";
 import { z } from "zod";
+import {
+  loadTenantRestoreJournalConfig,
+  type TenantRestoreJournalRuntimeConfig,
+} from "./tenant-restore-journal-config.js";
 
 /** Transport must remain open after the Host's bounded abort window to receive its final 409/204. */
 export const ERASURE_REQUEST_TIMEOUT_MARGIN_MS = 1_000;
@@ -125,6 +129,22 @@ const Env = z.object({
   TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_BASE_MS:
     z.coerce.number().int().min(1).max(300_000).default(1_000),
   TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS:
+    z.coerce.number().int().min(1).max(600_000).default(60_000),
+  /** Embedded publisher for the independent pre-destructive restore journal. */
+  TENANT_RESTORE_JOURNAL_WORKER_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  TENANT_RESTORE_JOURNAL_WORKER_POLL_MS:
+    z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS:
+    z.coerce.number().int().min(100).max(600_000).default(30_000),
+  TENANT_RESTORE_JOURNAL_WORKER_BATCH_SIZE:
+    z.coerce.number().int().min(1).max(100).default(5),
+  TENANT_RESTORE_JOURNAL_MATERIALIZE_BATCH_SIZE:
+    z.coerce.number().int().min(1).max(100).default(25),
+  TENANT_RESTORE_JOURNAL_RETRY_BASE_MS:
+    z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_RESTORE_JOURNAL_RETRY_MAX_MS:
     z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** T3b private local fence/drain endpoint. Code awareness is advertised even while this is off. */
   TENANT_RUNTIME_DRAIN_ENABLED: z.enum(["0", "1"])
@@ -268,6 +288,8 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   dataExportArtifactsReadable: boolean;
   /** Present only for a cross-runner object namespace whose exact identity can be fleet-checked. */
   blobStorage?: BlobStorageCapability;
+  /** Independent append-only restore journal; physical locators remain runner-local. */
+  tenantRestoreJournal?: TenantRestoreJournalRuntimeConfig;
 };
 
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
@@ -406,6 +428,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (c.BLOB_STORE === "filesystem" && c.BLOB_STORAGE_CONTROL_ENABLED) {
     throw new Error("BLOB_STORAGE_CONTROL_ENABLED must be 0 when BLOB_STORE=filesystem");
   }
+  const tenantRestoreJournal = loadTenantRestoreJournalConfig(env, {
+    production,
+    store: c.STORE,
+    ...(c.BLOB_STORE === "s3" && c.BLOB_S3_BUCKET !== undefined
+      ? { blobS3Bucket: validateS3Bucket(c.BLOB_S3_BUCKET) }
+      : {}),
+  });
+  if (c.TENANT_RESTORE_JOURNAL_WORKER_ENABLED && tenantRestoreJournal === undefined) {
+    throw new Error(
+      "RESTORE_JOURNAL_ADAPTER=s3 is required before "
+        + "TENANT_RESTORE_JOURNAL_WORKER_ENABLED=1",
+    );
+  }
   if (c.TENANT_RUNTIME_DRAIN_ENABLED && !c.RUNNER_ID) {
     throw new Error(
       "RUNNER_ID is required when TENANT_RUNTIME_DRAIN_ENABLED=1 so the configured fleet slot "
@@ -527,6 +562,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.TENANT_ERASURE_REQUESTS_ENABLED
       || c.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED
       || c.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED
+      || c.TENANT_RESTORE_JOURNAL_WORKER_ENABLED
       || c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED
       || c.TENANT_PURGE_EXECUTION_WORKER_ENABLED
       || c.TENANT_DATABASE_PURGE_WORKER_ENABLED
@@ -540,6 +576,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_ERASURE_REQUESTS_ENABLED=1, or "
         + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1, or "
         + "TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED=1, or "
+        + "TENANT_RESTORE_JOURNAL_WORKER_ENABLED=1, or "
         + "TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=1, or "
         + "TENANT_PURGE_EXECUTION_WORKER_ENABLED=1, or "
         + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1, or "
@@ -602,6 +639,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     throw new Error(
       "TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS must be at least "
         + "TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_BASE_MS",
+    );
+  }
+  if (c.TENANT_RESTORE_JOURNAL_RETRY_MAX_MS
+    < c.TENANT_RESTORE_JOURNAL_RETRY_BASE_MS) {
+    throw new Error(
+      "TENANT_RESTORE_JOURNAL_RETRY_MAX_MS must be at least "
+        + "TENANT_RESTORE_JOURNAL_RETRY_BASE_MS",
+    );
+  }
+  const restoreJournalRequestTimeoutMs = tenantRestoreJournal
+    ?.targets[0].options.requestTimeoutMs ?? 0;
+  if (c.TENANT_RESTORE_JOURNAL_WORKER_ENABLED
+    && c.TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS
+      < c.TENANT_ERASURE_BARRIER_TIMEOUT_MS + restoreJournalRequestTimeoutMs + 1_000) {
+    throw new Error(
+      "TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS must cover "
+        + "TENANT_ERASURE_BARRIER_TIMEOUT_MS, the external request timeout, and 1000ms",
     );
   }
   if (
@@ -694,5 +748,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     dataExportArtifactsReadable:
       c.BLOB_STORE === "s3" || (!production && c.BLOB_FILESYSTEM_SINGLE_RUNNER),
     ...(blobStorage === undefined ? {} : { blobStorage }),
+    ...(tenantRestoreJournal === undefined ? {} : { tenantRestoreJournal }),
   };
 }

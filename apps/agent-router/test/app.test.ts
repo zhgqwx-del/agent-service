@@ -25,6 +25,9 @@ import {
   INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_VALUE,
   INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_READY_PATH,
+  INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER,
+  INTERNAL_TENANT_RESTORE_JOURNAL_ACK_VALUE,
+  INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH,
   INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
   INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
   INTERNAL_TENANT_DATABASE_PURGE_READY_PATH,
@@ -48,6 +51,7 @@ import {
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
+  TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
@@ -136,6 +140,8 @@ function fakeRegistry(
     credentialTrackingActive?: boolean;
     credentialTargetExecution?: boolean;
     credentialTargetExecutionWorker?: boolean;
+    restoreJournal?: boolean;
+    restoreJournalWorker?: boolean;
     purgeExecution?: boolean;
     purgeExecutionWorker?: boolean;
     databasePurge?: boolean;
@@ -223,6 +229,10 @@ function fakeRegistry(
       && (opts.credentialTrackingActive ?? false)
       && (opts.credentialTargetExecution ?? false)
       && (opts.credentialTargetExecutionWorker ?? false)
+    ),
+    allConfiguredSupportTenantRestoreJournal: () => opts.restoreJournal ?? false,
+    allConfiguredSupportTenantRestoreJournalWorker: () => (
+      (opts.restoreJournal ?? false) && (opts.restoreJournalWorker ?? false)
     ),
     allConfiguredSupportTenantPurgeExecution: () => opts.purgeExecution ?? false,
     allConfiguredSupportTenantPurgeExecutionWorker: () => (
@@ -970,6 +980,85 @@ describe("internal user-erasure routing", () => {
       expect(response.headers.get(INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_HEADER))
         .toBeNull();
     }
+  });
+
+  it("freshly gates restore-journal publication on exact all-configured worker support", async () => {
+    const target = "http://runner.internal:8787";
+    const refresh = vi.fn();
+    const enabled = createRouterApp({
+      registry: fakeRegistry([target], {
+        restoreJournal: true,
+        restoreJournalWorker: true,
+        refresh,
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantRestoreJournalExecutionEnabled: () => true,
+      logger: silent,
+    });
+
+    const hidden = await enabled.request(INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: "wrong-internal-token-000000000000" },
+    });
+    expect(hidden.status).toBe(404);
+    expect(hidden.headers.get(INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER)).toBeNull();
+    expect(refresh).not.toHaveBeenCalled();
+
+    const ready = await enabled.request(INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(ready.status).toBe(204);
+    expect(ready.headers.get(INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER)).toBe(
+      INTERNAL_TENANT_RESTORE_JOURNAL_ACK_VALUE,
+    );
+    expect(refresh).toHaveBeenCalledOnce();
+    expectPrivateLifecycleResponse(ready);
+
+    for (const options of [
+      { restoreJournal: false, restoreJournalWorker: true },
+      { restoreJournal: true, restoreJournalWorker: false },
+    ]) {
+      const unavailable = createRouterApp({
+        registry: fakeRegistry([target], options),
+        internalRunnerToken: INTERNAL_TOKEN,
+        tenantRestoreJournalExecutionEnabled: () => true,
+        logger: silent,
+      });
+      const response = await unavailable.request(INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH, {
+        headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+      });
+      expect(response.status).toBe(503);
+      expect(response.headers.get(INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER)).toBeNull();
+      expectPrivateLifecycleResponse(response);
+    }
+
+    const nested = await enabled.request(`${INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH}/extra`, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(nested.status).toBe(404);
+    expectPrivateLifecycleResponse(nested);
+    const wrongMethod = await enabled.request(INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH, {
+      method: "POST",
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(wrongMethod.status).toBe(404);
+    expectPrivateLifecycleResponse(wrongMethod);
+
+    const refreshFailure = createRouterApp({
+      registry: fakeRegistry([target], {
+        restoreJournal: true,
+        restoreJournalWorker: true,
+        refresh: async () => { throw new Error("unsafe fleet detail"); },
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantRestoreJournalExecutionEnabled: () => true,
+      logger: silent,
+    });
+    const unavailable = await refreshFailure.request(INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH, {
+      headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: INTERNAL_TOKEN },
+    });
+    expect(unavailable.status).toBe(503);
+    expect(unavailable.headers.get(INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER)).toBeNull();
+    expectPrivateLifecycleResponse(unavailable);
   });
 
   it("freshly gates T3f database purge on its distinct all-configured worker fleet", async () => {
@@ -2439,6 +2528,71 @@ describe("operational endpoints", () => {
         erasureJobControl: [],
         dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"],
         dataGovernanceManagement: false,
+      },
+    });
+  });
+
+  it("projects restore-journal identities only for an exact all-configured fleet", async () => {
+    const namespaceSha256 = "b".repeat(64);
+    const targetRootSha256 = "c".repeat(64);
+    const runtimeEpochSha256 = "d".repeat(64);
+    const a = await upstream(() => ({
+      body: JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        service: "agent-runner",
+        features: {
+          streaming: true,
+          replay: { persistedEvents: true, hotWindowMs: 1 },
+          approvals: true,
+          sessionLifecycle: ["archive"],
+          tenantRestoreJournal: [TENANT_RESTORE_JOURNAL_INDEPENDENT_V1],
+          tenantRestoreJournalWorker: true,
+          tenantRestoreJournalNamespaceSha256: namespaceSha256,
+          tenantRestoreJournalTargetRootSha256: targetRootSha256,
+          tenantRestoreRuntimeEpochSha256: runtimeEpochSha256,
+          dynamicTools: true,
+          mcp: [],
+          skills: false,
+          sandbox: ["none"],
+          byok: true,
+        },
+      }),
+    }));
+    const enabled = createRouterApp({
+      registry: fakeRegistry([a.url], {
+        restoreJournal: true,
+        restoreJournalWorker: true,
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantRestoreJournalExecutionEnabled: () => true,
+      logger: silent,
+    });
+    await expect((await enabled.request("/v1/capabilities")).json()).resolves.toMatchObject({
+      features: {
+        tenantRestoreJournal: [TENANT_RESTORE_JOURNAL_INDEPENDENT_V1],
+        tenantRestoreJournalWorker: true,
+        tenantRestoreJournalNamespaceSha256: namespaceSha256,
+        tenantRestoreJournalTargetRootSha256: targetRootSha256,
+        tenantRestoreRuntimeEpochSha256: runtimeEpochSha256,
+      },
+    });
+
+    const unconfigured = createRouterApp({
+      registry: fakeRegistry([a.url], {
+        restoreJournal: false,
+        restoreJournalWorker: true,
+      }),
+      internalRunnerToken: INTERNAL_TOKEN,
+      tenantRestoreJournalExecutionEnabled: () => true,
+      logger: silent,
+    });
+    await expect((await unconfigured.request("/v1/capabilities")).json()).resolves.toMatchObject({
+      features: {
+        tenantRestoreJournal: [],
+        tenantRestoreJournalWorker: false,
+        tenantRestoreJournalNamespaceSha256: null,
+        tenantRestoreJournalTargetRootSha256: null,
+        tenantRestoreRuntimeEpochSha256: null,
       },
     });
   });

@@ -23,6 +23,9 @@
     "test:blob-storage-control-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/blob-storage-control.mysql.test.ts",
     "test:blob-s3": "AGENT_SERVICE_S3_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/blob-s3.minio.test.ts",
     "test:blob-storage-migration-mysql-s3": "AGENT_SERVICE_S3_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/blob-storage-migration.mysql-s3.test.ts",
+    "test:restore-journal-s3": "AGENT_SERVICE_RESTORE_JOURNAL_S3_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/restore-journal-s3.minio.test.ts",
+    "test:tenant-restore-journal-memory": "node scripts/run-required-suite.mjs packages/store/test/tenant-restore-journal.memory.test.ts",
+    "test:tenant-restore-journal-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-restore-journal.mysql.test.ts",
     "test:app-s3-smoke": "node scripts/check-s3-app-assembly.mjs",
     "test:usage-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/usage-lifecycle.mysql.test.ts",
     "test:subject-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/subject-lifecycle.mysql.test.ts",
@@ -64,9 +67,11 @@
     "verify:real": "scripts/local-service.sh verify-real",
     "maintenance:cleanup-idempotency": "node scripts/cleanup-idempotency.mjs",
     "maintenance:blob-storage-migrate": "scripts/local-service.sh blob-storage-migrate",
+    "maintenance:restore-ledger-reconcile": "scripts/local-service.sh restore-ledger-reconcile",
     "check:blob-storage-migrate-artifact": "node scripts/check-blob-storage-migrate-artifact.mjs",
+    "check:restore-ledger-reconcile-artifact": "node scripts/check-restore-ledger-reconcile-artifact.mjs",
     "test:cluster": "AGENT_SERVICE_CLUSTER=1 vitest run test/cluster",
-    "build:check": "pnpm build && pnpm run check:sdk && pnpm run check:blob-storage-migrate-artifact && node scripts/check-dist-boot.mjs"
+    "build:check": "pnpm build && pnpm run check:sdk && pnpm run check:blob-storage-migrate-artifact && pnpm run check:restore-ledger-reconcile-artifact && node scripts/check-dist-boot.mjs"
   },
   "devDependencies": {
     "@agent-service/testkit": "workspace:*",

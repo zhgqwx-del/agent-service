@@ -361,10 +361,20 @@ try {
     supportBigNumbers: true,
     bigNumberStrings: false,
   });
+  const expectedMigrationNames = [
+    "0027_blob_storage_control.sql",
+    "0028_blob_storage_migration.sql",
+    "0029_tenant_credential_target_execution.sql",
+    "0030_tenant_restore_journal.sql",
+  ];
   const [migrationRows] = await inspection.query(
-    "SELECT name FROM schema_migrations WHERE name='0027_blob_storage_control.sql'",
+    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?) ORDER BY name",
+    expectedMigrationNames,
   );
-  if (migrationRows.length !== 1) throw new Error("runner did not apply migration 0027");
+  if (
+    migrationRows.length !== expectedMigrationNames.length
+    || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
+  ) throw new Error("runner did not apply migrations 0027 through 0030");
   const [controlRows] = await inspection.query(
     `SELECT control_generation,storage_backend,namespace_sha256,
             activated_at_db_ms,evidence_sha256
@@ -389,6 +399,34 @@ try {
     || activatedAtDbMs < 0
     || control.evidence_sha256 !== expectedEvidence
   ) throw new Error("migration 0027 control was not activated with the exact S3 namespace evidence");
+
+  const [dormantRows] = await inspection.query(
+    `SELECT
+       (SELECT COUNT(*) FROM blob_storage_migration_control
+         WHERE singleton_id=1 AND control_generation=0 AND phase='inactive') AS blob_mover_control,
+       (SELECT COUNT(*) FROM tenant_credential_target_execution_cutover
+         WHERE singleton_id=1 AND control_generation=0) AS credential_target_control,
+       (SELECT COUNT(*) FROM tenant_credential_target_execution_jobs) AS credential_target_jobs,
+       (SELECT COUNT(*) FROM tenant_restore_journal_control
+         WHERE singleton_id=1 AND control_generation=0) AS restore_journal_control,
+       (SELECT COUNT(*) FROM tenant_restore_runtime_control
+         WHERE singleton_id=1 AND state='inactive' AND control_generation=0) AS restore_runtime_control,
+       (SELECT COUNT(*) FROM tenant_restore_journal_jobs) AS restore_journal_jobs,
+       (SELECT COUNT(*) FROM tenant_restore_replay_runs) AS restore_replay_runs,
+       (SELECT COUNT(*) FROM tenant_restore_fences) AS restore_fences`,
+  );
+  const dormant = dormantRows[0];
+  if (
+    !dormant
+    || Number(dormant.blob_mover_control) !== 1
+    || Number(dormant.credential_target_control) !== 1
+    || Number(dormant.credential_target_jobs) !== 0
+    || Number(dormant.restore_journal_control) !== 1
+    || Number(dormant.restore_runtime_control) !== 1
+    || Number(dormant.restore_journal_jobs) !== 0
+    || Number(dormant.restore_replay_runs) !== 0
+    || Number(dormant.restore_fences) !== 0
+  ) throw new Error("migrations 0028 through 0030 were not applied as dormant ledgers");
 
   router = launch("router", "apps/agent-router/dist/main.js", mode, routerEnv);
   const routerUrl = `http://127.0.0.1:${routerPort}`;

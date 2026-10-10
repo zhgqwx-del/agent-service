@@ -74,7 +74,7 @@ jobs:
             if [ "$i" = "90" ]; then echo "MinIO did not become ready"; exit 1; fi
             sleep 1
           done
-      - name: Bootstrap private un-versioned MinIO bucket
+      - name: Bootstrap distinct logical private un-versioned MinIO buckets
         env:
           S3_TEST_ENDPOINT: http://127.0.0.1:9000
           S3_TEST_REGION: us-east-1
@@ -82,7 +82,10 @@ jobs:
           S3_TEST_ACCESS_KEY_ID: agentservice-ci
           S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
           S3_TEST_FORCE_PATH_STYLE: "1"
-        run: node packages/store/scripts/bootstrap-s3.mjs
+        run: |
+          node packages/store/scripts/bootstrap-s3.mjs
+          S3_TEST_BUCKET=agent-service-ci-restore-journal \
+            node packages/store/scripts/bootstrap-s3.mjs
 
       - name: Verify OpenAPI and generated SDK are current
         run: pnpm run check:api
@@ -132,6 +135,18 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:blob-storage-control-mysql
 
+      # The restore journal protects the first irreversible tenant-wide transaction. Preserve a
+      # named proof for its atomic T1 publication, runtime-head history and permanent restore fence
+      # semantics in both implementations; neither suite may silently skip.
+      - name: Tenant restore journal memory suite (must execute)
+        run: pnpm run test:tenant-restore-journal-memory
+
+      - name: Tenant restore journal real MySQL suite (must execute)
+        env:
+          AGENT_SERVICE_INTEGRATION: "1"
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-restore-journal-mysql
+
       # Exercise the actual S3 protocol against a fixed MinIO source revision. The required-suite
       # wrapper rejects a missing file, a silently skipped suite, zero assertions, or any non-passing case.
       - name: Blob S3 real MinIO suite (must execute)
@@ -144,6 +159,21 @@ jobs:
           S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:blob-s3
+
+      # Use a distinct bucket to prove namespace and credential wiring isolation from BlobStore.
+      # One local MinIO process is only a protocol/fault simulation, not proof of a physically
+      # independent production failure domain. The suite exercises concurrent immutable appends,
+      # exact response-loss inspection and sealed-prefix replay.
+      - name: Restore journal S3 real MinIO suite (must execute)
+        env:
+          AGENT_SERVICE_RESTORE_JOURNAL_S3_INTEGRATION: "1"
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_RESTORE_JOURNAL_TEST_BUCKET: agent-service-ci-restore-journal
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: pnpm run test:restore-journal-s3
 
       # The offline mover crosses both InnoDB and object-storage durability boundaries. Keep a
       # named proof with a fresh database and namespace per case; the wrapper rejects skips/zero tests.
@@ -326,7 +356,7 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0029
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0030
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority, 0016 -> 0017 user-export and 0018 -> 0019 inert tenant credential
@@ -334,8 +364,9 @@ jobs:
       # 0021 -> 0022 full-domain purge-plan, 0022 -> 0023 execution-ledger and 0023 -> 0024
       # database-content deletion, 0024 -> 0025 Redis-purge ledger, 0025 -> 0026 versioned
       # credential-lifecycle inventory, 0026 -> 0027 blob-storage control and 0027 -> 0028
-      # offline-mover ledger and 0028 -> 0029 dormant credential-target execution replay matrices.
-      - name: Historical MySQL migrations (0007 through 0029, no skips)
+      # offline-mover ledger, 0028 -> 0029 dormant credential-target execution and 0029 -> 0030
+      # independent restore-journal/runtime-lineage replay matrices.
+      - name: Historical MySQL migrations (0007 through 0030, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -362,6 +393,9 @@ jobs:
       # under plain Node. build:check also runs this gate so local verification cannot omit it.
       - name: Runner Blob migration distributable CLI (must execute)
         run: pnpm run check:blob-storage-migrate-artifact
+
+      - name: Runner restore-ledger reconciliation distributable CLI (must execute)
+        run: pnpm run check:restore-ledger-reconcile-artifact
 
       # Start the production-shaped bundles against a throwaway MySQL schema and the real MinIO
       # process above. This proves the bundled AWS SDK closure, migration 0027 storage control,
@@ -430,6 +464,12 @@ jobs:
           docker run --rm --entrypoint node agent-service/agent-runner:ci \
             dist/blob-storage-migrate.js --help | grep -F "Usage: blob-storage-migrate"
 
+      - name: Execute the one-shot restore-ledger CLI from the runner image
+        if: matrix.app == 'agent-runner'
+        run: |
+          docker run --rm --entrypoint node agent-service/agent-runner:ci \
+            dist/restore-ledger-reconcile.js --help | grep -F "Usage: restore-ledger-reconcile"
+
       # A container that starts but is unreachable, or reports healthy on the wrong port, is the exact
       # failure mode this step exists to catch.
       - name: Run the container and reach it from outside
@@ -470,6 +510,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0027_blob_storage_control.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0028_blob_storage_migration.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0029_tenant_credential_target_execution.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0030_tenant_restore_journal.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

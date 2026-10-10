@@ -33,9 +33,13 @@ function cleanEnv() {
   for (const key of [
     "API_KEY",
     "API_BASE_URL",
+    "DEFAULT_MODEL",
+    "PLATFORM_PROVIDER",
     "BOOTSTRAP_API_KEY",
+    "BOOTSTRAP_TENANT_ID",
     "ADMIN_BOOTSTRAP_TENANT",
     "MYSQL_URL",
+    "SECRETS_MASTER_KEY",
     "REDIS_URL",
     "ROUTER_ADMIN_TOKEN",
     "INTERNAL_ROUTER_TOKEN",
@@ -92,6 +96,7 @@ function cleanEnv() {
   for (const key of Object.keys(env)) {
     if ([
       "AWS_",
+      "MYSQL_",
       "BLOB_",
       "MINIO_",
       "S3_TEST_",
@@ -99,6 +104,8 @@ function cleanEnv() {
       "TENANT_CREDENTIAL_REVOCATION_",
       "TENANT_CREDENTIAL_TARGET_EXECUTION_",
       "CREDENTIAL_TARGET_EXECUTION_",
+      "RESTORE_JOURNAL_",
+      "TENANT_RESTORE_JOURNAL_",
       "TENANT_RUNTIME_",
       "TENANT_CONTENT_INVENTORY_",
       "TENANT_PURGE_PLAN_",

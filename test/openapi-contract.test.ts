@@ -247,6 +247,26 @@ describe("committed OpenAPI contract", () => {
               default: false,
               type: "boolean",
             },
+            tenantRestoreJournal: {
+              items: { enum: ["independent-restore-journal-v1"] },
+              maxItems: 1,
+            },
+            tenantRestoreJournalWorker: {
+              default: false,
+              type: "boolean",
+            },
+            tenantRestoreJournalNamespaceSha256: {
+              default: null,
+              pattern: "^[0-9a-f]{64}$",
+            },
+            tenantRestoreJournalTargetRootSha256: {
+              default: null,
+              pattern: "^[0-9a-f]{64}$",
+            },
+            tenantRestoreRuntimeEpochSha256: {
+              default: null,
+              pattern: "^[0-9a-f]{64}$",
+            },
           },
         },
       },

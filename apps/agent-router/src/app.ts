@@ -26,6 +26,9 @@ import {
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH,
   INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_VALUE,
   INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_READY_PATH,
+  INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER,
+  INTERNAL_TENANT_RESTORE_JOURNAL_ACK_VALUE,
+  INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH,
   INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
   INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
   INTERNAL_TENANT_DATABASE_PURGE_READY_PATH,
@@ -58,6 +61,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
@@ -114,6 +118,8 @@ export interface RouterAppDeps {
   credentialLifecycleTrackingEnabled?: () => boolean;
   /** Independent fleet gate for external credential target execution. */
   tenantCredentialTargetExecutionEnabled?: () => boolean;
+  /** Independent fleet gate for publishing the pre-destructive restore journal. */
+  tenantRestoreJournalExecutionEnabled?: () => boolean;
   /** Independent activation gate for local T3e execution/physical-ACK queue claims. */
   tenantPurgeExecutionEnabled?: () => boolean;
   /** Independent activation gate for T3f local database-content deletion queue claims. */
@@ -174,6 +180,7 @@ const STRIP_RESPONSE = new Set([
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_HEADER,
+  INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER,
   INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER,
   INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
@@ -317,6 +324,11 @@ export function createRouterApp(deps: RouterAppDeps) {
     && (deps.tenantCredentialTargetExecutionEnabled?.() ?? false)
     && (deps.credentialLifecycleTrackingEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportTenantCredentialTargetExecutionWorker()
+  );
+  const tenantRestoreJournalExecutionAvailable = () => (
+    !!deps.internalRunnerToken
+    && (deps.tenantRestoreJournalExecutionEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportTenantRestoreJournalWorker()
   );
   const tenantPurgeExecutionAvailable = () => (
     !!deps.internalRunnerToken
@@ -565,6 +577,24 @@ export function createRouterApp(deps: RouterAppDeps) {
                     : [],
                 tenantCredentialTargetExecutionWorker:
                   tenantCredentialTargetExecutionAvailable(),
+                tenantRestoreJournal:
+                  deps.registry.allConfiguredSupportTenantRestoreJournal()
+                    ? [TENANT_RESTORE_JOURNAL_INDEPENDENT_V1]
+                    : [],
+                tenantRestoreJournalWorker:
+                  tenantRestoreJournalExecutionAvailable(),
+                tenantRestoreJournalNamespaceSha256:
+                  deps.registry.allConfiguredSupportTenantRestoreJournal()
+                    ? parsed.data.features.tenantRestoreJournalNamespaceSha256
+                    : null,
+                tenantRestoreJournalTargetRootSha256:
+                  deps.registry.allConfiguredSupportTenantRestoreJournal()
+                    ? parsed.data.features.tenantRestoreJournalTargetRootSha256
+                    : null,
+                tenantRestoreRuntimeEpochSha256:
+                  deps.registry.allConfiguredSupportTenantRestoreJournal()
+                    ? parsed.data.features.tenantRestoreRuntimeEpochSha256
+                    : null,
                 tenantPurgeExecution:
                   [
                     ...(deps.registry.allConfiguredSupportTenantPurgeExecution()
@@ -680,6 +710,33 @@ export function createRouterApp(deps: RouterAppDeps) {
   app.all(`${INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_READY_PATH}/*`, (c) => (
     internalNotFound(c)
   ));
+
+  /** One fresh exact-fleet proof authorizes one independent restore-journal boundary. */
+  app.get(INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    try {
+      await deps.registry.refresh();
+    } catch {
+      return c.body(null, 503);
+    }
+    if (!tenantRestoreJournalExecutionAvailable()) return c.body(null, 503);
+    c.header(
+      INTERNAL_TENANT_RESTORE_JOURNAL_ACK_HEADER,
+      INTERNAL_TENANT_RESTORE_JOURNAL_ACK_VALUE,
+    );
+    return c.body(null, 204);
+  });
+  app.all(INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH, (c) => {
+    privateInternalHeaders(c);
+    return internalNotFound(c);
+  });
+  app.all(`${INTERNAL_TENANT_RESTORE_JOURNAL_READY_PATH}/*`, (c) => {
+    privateInternalHeaders(c);
+    return internalNotFound(c);
+  });
 
   /**
    * T3e has its own fresh, non-sticky all-configured barrier. Its ACK authorizes one bounded local

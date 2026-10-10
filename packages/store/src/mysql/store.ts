@@ -194,6 +194,7 @@ import {
   type TenantRuntimeState,
   type TransitionErasureJobOptions,
 } from "../subject-lifecycle.js";
+import * as RestoreJournal from "../tenant-restore-journal.js";
 import {
   validateErasureSessionAction,
   type ErasureSessionAction,
@@ -828,6 +829,40 @@ import {
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
 const parse = <T>(v: unknown): T => (typeof v === "string" ? JSON.parse(v) : (v as T));
+const TENANT_RESTORE_JOURNAL_MIGRATION_NAME = "0030_tenant_restore_journal.sql";
+const TENANT_RESTORE_JOURNAL_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-restore-journal";
+
+function mysqlMigrationStatements(sql: string): string[] {
+  return sql.replace(/^\s*--.*$/gm, "")
+    .split(/;\s*\n/)
+    .map((statement) => statement.trim())
+    .filter(Boolean);
+}
+
+function tenantRestoreJournalFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+  variable: "restore_journal_schema_ok" | "restore_journal_trigger_ok",
+): string {
+  const startMarker = `-- ${TENANT_RESTORE_JOURNAL_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker = `-- ${TENANT_RESTORE_JOURNAL_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0030 tenant restore journal ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @${variable}=`)) {
+    throw new Error(`0030 tenant restore journal ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
 const BLOB_STORAGE_CONTROL_COLUMNS = `singleton_id, control_generation, storage_backend,
   namespace_sha256, activated_at_db_ms, evidence_sha256`;
 const BLOB_COLUMNS = `blob_id, tenant_id, user_id, session_id, item_id, purpose, storage_backend,
@@ -1307,13 +1342,16 @@ const USAGE_OWNER_MATCH = "u.tenant_id=s.tenant_id AND u.user_id=s.user_id";
  * Every query using this fragment owns a `sessions s` alias. Internal erasure/lifecycle readers
  * intentionally do not use it because they must retain maintenance access to tombstoned data.
  */
-const SESSION_TENANT_ERASURE_EVIDENCE_ABSENT = `
+const sessionTenantErasureEvidenceAbsent = (restoreJournalInstalled: boolean) => `
   NOT EXISTS (
     SELECT 1 FROM tenant_erasure_admissions te WHERE te.tenant_id=s.tenant_id
   )
   AND NOT EXISTS (
     SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=s.tenant_id
-  )`;
+  )
+  ${restoreJournalInstalled ? `AND NOT EXISTS (
+    SELECT 1 FROM tenant_restore_fences rf WHERE rf.tenant_id=s.tenant_id
+  )` : ""}`;
 const usageJsonNumber = (field: string) => (
   `CASE WHEN JSON_TYPE(JSON_EXTRACT(u.usage_json,'$.${field}')) IN ('INTEGER','DOUBLE','DECIMAL') `
   + `THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(u.usage_json,'$.${field}')) AS DECIMAL(30,9)) ELSE 0 END`
@@ -4863,6 +4901,553 @@ function mysqlSafeInteger(value: unknown, label: string): number {
   throw new Error(`${label} is not a non-negative integer`);
 }
 
+const TENANT_RESTORE_JOURNAL_CONTROL_COLUMNS = `singleton_id, control_generation,
+  activated_at_db_ms, protocol, adapter_protocol, journal_namespace_sha256,
+  logical_database_namespace_sha256, target_count, target_root_sha256,
+  target_catalog_json, evidence_sha256`;
+const TENANT_RESTORE_JOURNAL_JOB_COLUMNS = `request_id, tenant_id, subject_generation,
+  publication_generation, t1_fence_sha256, control_evidence_sha256, adapter_protocol,
+  journal_namespace_sha256, logical_database_namespace_sha256, target_count,
+  target_root_sha256, source_evidence_db_ms, phase, target_ack_count,
+  target_ack_root_sha256, remote_commit_count, remote_commit_root_sha256, available_at_ms,
+  attempts, claim_token, lease_until_ms, last_error_code, created_at_ms, updated_at_ms,
+  terminal_receipt_sha256, sealed_at_db_ms, completed_claim_attempt,
+  completed_claim_token_sha256, blocked_at_db_ms, blocked_reason_code`;
+const TENANT_RESTORE_JOURNAL_TARGET_COLUMNS = `request_id, tenant_id, subject_generation,
+  publication_generation, target_ordinal, scope, target_sha256, failure_domain_sha256,
+  adapter_protocol, journal_namespace_sha256, logical_database_namespace_sha256,
+  t1_fence_sha256, operation_sha256, record_sha256, captured_at_db_ms, receipt_sha256`;
+const TENANT_RESTORE_JOURNAL_ACK_COLUMNS = `request_id, tenant_id, subject_generation,
+  publication_generation, target_ordinal, scope, target_sha256, failure_domain_sha256,
+  adapter_protocol, journal_namespace_sha256, logical_database_namespace_sha256,
+  target_receipt_sha256, operation_sha256, record_sha256, remote_sequence,
+  previous_head_root_sha256, head_root_sha256, completed_claim_attempt,
+  completed_claim_token_sha256, store_db_timestamp_ms, receipt_sha256`;
+const TENANT_RESTORE_JOURNAL_RECEIPT_COLUMNS = `request_id, tenant_id, subject_generation,
+  publication_generation, t1_fence_sha256, control_evidence_sha256, adapter_protocol,
+  journal_namespace_sha256, logical_database_namespace_sha256, target_count,
+  target_root_sha256, source_evidence_db_ms, scope, target_ack_count,
+  target_ack_root_sha256, remote_commit_count, remote_commit_root_sha256,
+  restore_fence_publication_complete, restore_fence_replay_complete,
+  physical_replay_complete, all_domains_complete, content_purge_executed,
+  completed_claim_attempt, completed_claim_token_sha256, store_db_timestamp_ms, receipt_sha256`;
+const TENANT_RESTORE_REPLAY_RUN_COLUMNS = `restore_run_id, source_backup_sha256,
+  runtime_epoch_sha256, protocol, control_evidence_sha256, adapter_protocol,
+  journal_namespace_sha256, logical_database_namespace_sha256, target_count,
+  target_root_sha256, sealed_target_catalog_json, sealed_target_root_sha256,
+  expected_entry_count, entry_count, entry_root_sha256, fence_count, fence_root_sha256,
+  phase, created_at_db_ms, updated_at_db_ms, terminal_receipt_sha256, sealed_at_db_ms,
+  activated_at_db_ms, aborted_at_db_ms`;
+const TENANT_RESTORE_FENCE_COLUMNS = `tenant_id, scope,
+  logical_database_namespace_sha256, request_id, subject_generation, t1_fence_sha256,
+  operation_sha256, record_sha256, restore_run_id, source_target_sha256,
+  source_remote_sequence, source_head_root_sha256, installed_at_db_ms, fence_sha256`;
+const TENANT_RESTORE_REPLAY_ENTRY_COLUMNS = `restore_run_id, replay_ordinal, scope,
+  target_ordinal, target_sha256, remote_sequence, previous_head_root_sha256, head_root_sha256,
+  logical_database_namespace_sha256, request_id, tenant_id, subject_generation,
+  t1_fence_sha256, operation_sha256, record_sha256, fence_disposition, fence_sha256,
+  previous_entry_root_sha256, store_db_timestamp_ms, entry_sha256`;
+const TENANT_RESTORE_RUNTIME_CONTROL_COLUMNS = `singleton_id, state, control_generation,
+  update_kind, lineage_kind, activated_at_db_ms, updated_at_db_ms, restore_run_id,
+  replay_receipt_sha256, runtime_epoch_sha256, control_evidence_sha256,
+  logical_database_namespace_sha256, target_count, target_root_sha256,
+  verified_head_root_sha256, previous_control_evidence_sha256, evidence_sha256`;
+const TENANT_RESTORE_RUNTIME_HEAD_COLUMNS = `singleton_id, target_ordinal, target_sha256,
+  failure_domain_sha256, adapter_protocol, journal_namespace_sha256,
+  logical_database_namespace_sha256, remote_sequence, head_root_sha256,
+  checkpoint_control_generation, runtime_epoch_sha256, updated_at_db_ms`;
+const TENANT_RESTORE_RUNTIME_KNOWN_COLUMNS = `singleton_id, runtime_epoch_sha256,
+  target_ordinal, target_sha256, remote_sequence, previous_head_root_sha256,
+  head_root_sha256, record_scope, record_protocol, logical_database_namespace_sha256,
+  request_id, tenant_id, subject_generation, t1_fence_sha256, operation_sha256,
+  record_sha256, control_generation, recorded_at_db_ms`;
+
+function rowToTenantRestoreJournalControl(
+  row: Row,
+): RestoreJournal.TenantRestoreJournalControlRecord {
+  const controlGeneration = mysqlSafeInteger(
+    row.control_generation,
+    "stored tenant restore journal control generation",
+  );
+  const control: RestoreJournal.TenantRestoreJournalControlRecord = controlGeneration === 0
+    ? { singletonId: 1, controlGeneration: 0 }
+    : {
+        singletonId: 1,
+        controlGeneration: 1,
+        activatedAtDbMs: mysqlSafeInteger(
+          row.activated_at_db_ms,
+          "stored tenant restore journal activation timestamp",
+        ),
+        protocol: String(row.protocol) as typeof RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+        adapterProtocol: String(row.adapter_protocol),
+        journalNamespaceSha256: String(row.journal_namespace_sha256),
+        logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+        targetCount: mysqlSafeInteger(row.target_count, "stored tenant restore target count"),
+        targetRootSha256: String(row.target_root_sha256),
+        evidenceSha256: String(row.evidence_sha256),
+      };
+  RestoreJournal.validateTenantRestoreJournalControlRecord(control);
+  return control;
+}
+
+function rowTenantRestoreJournalTargets(
+  row: Row,
+): RestoreJournal.TenantRestoreJournalTargetDescriptor[] {
+  const targets = parse<RestoreJournal.TenantRestoreJournalTargetDescriptor[]>(
+    row.target_catalog_json,
+  );
+  if (!Array.isArray(targets)) throw new Error("stored tenant restore target catalog is invalid");
+  const copy = structuredClone(targets);
+  RestoreJournal.tenantRestoreJournalTargetRootSha256(copy);
+  return copy;
+}
+
+function rowToTenantRestoreJournalJob(
+  row: Row,
+): RestoreJournal.TenantRestoreJournalPublicationJobRecord {
+  const source = {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: mysqlSafeInteger(row.subject_generation, "stored restore subject generation"),
+    publicationGeneration: mysqlSafeInteger(
+      row.publication_generation,
+      "stored restore publication generation",
+    ),
+    t1FenceSha256: String(row.t1_fence_sha256),
+    controlEvidenceSha256: String(row.control_evidence_sha256),
+    adapterProtocol: String(row.adapter_protocol),
+    journalNamespaceSha256: String(row.journal_namespace_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    targetCount: mysqlSafeInteger(row.target_count, "stored restore publication target count"),
+    targetRootSha256: String(row.target_root_sha256),
+    sourceEvidenceDbMs: mysqlSafeInteger(
+      row.source_evidence_db_ms,
+      "stored restore publication source timestamp",
+    ),
+  };
+  const common = {
+    ...source,
+    targetAckCount: mysqlSafeInteger(row.target_ack_count, "stored restore ACK count"),
+    targetAckRootSha256: String(row.target_ack_root_sha256),
+    remoteCommitCount: mysqlSafeInteger(row.remote_commit_count, "stored restore commit count"),
+    remoteCommitRootSha256: String(row.remote_commit_root_sha256),
+    attempts: mysqlSafeInteger(row.attempts, "stored restore publication attempts"),
+    createdAtMs: mysqlSafeInteger(row.created_at_ms, "stored restore publication creation time"),
+    updatedAtMs: mysqlSafeInteger(row.updated_at_ms, "stored restore publication update time"),
+  };
+  const phase = String(row.phase);
+  const job: RestoreJournal.TenantRestoreJournalPublicationJobRecord = phase === "queued"
+    ? {
+        ...common,
+        phase,
+        availableAtMs: mysqlSafeInteger(row.available_at_ms, "stored restore availability"),
+        ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+        ...(row.lease_until_ms == null
+          ? {}
+          : { leaseUntilMs: mysqlSafeInteger(row.lease_until_ms, "stored restore lease") }),
+        ...(row.last_error_code == null
+          ? {}
+          : {
+              lastErrorCode: String(row.last_error_code) as
+                RestoreJournal.TenantRestoreJournalPublicationRetryErrorCode,
+            }),
+      }
+    : phase === "published"
+      ? {
+          ...common,
+          phase,
+          terminalReceiptSha256: String(row.terminal_receipt_sha256),
+          sealedAtDbMs: mysqlSafeInteger(row.sealed_at_db_ms, "stored restore publication seal"),
+          completedClaimAttempt: mysqlSafeInteger(
+            row.completed_claim_attempt,
+            "stored restore publication completion attempt",
+          ),
+          completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+        }
+      : {
+          ...common,
+          phase: phase as "blocked",
+          blockedAtDbMs: mysqlSafeInteger(row.blocked_at_db_ms, "stored restore block time"),
+          blockedReasonCode: String(row.blocked_reason_code) as
+            RestoreJournal.TenantRestoreJournalPublicationBlockReasonCode,
+        };
+  RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(job);
+  return job;
+}
+
+function rowToTenantRestoreJournalTarget(
+  row: Row,
+): RestoreJournal.TenantRestoreJournalPublicationTarget {
+  const target: RestoreJournal.TenantRestoreJournalPublicationTarget = {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: mysqlSafeInteger(row.subject_generation, "stored restore target generation"),
+    publicationGeneration: mysqlSafeInteger(
+      row.publication_generation,
+      "stored restore target publication generation",
+    ),
+    scope: String(row.scope) as typeof RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_TARGET_SCOPE,
+    targetOrdinal: mysqlSafeInteger(row.target_ordinal, "stored restore target ordinal"),
+    targetSha256: String(row.target_sha256),
+    failureDomainSha256: String(row.failure_domain_sha256),
+    adapterProtocol: String(row.adapter_protocol),
+    journalNamespaceSha256: String(row.journal_namespace_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    t1FenceSha256: String(row.t1_fence_sha256),
+    operationSha256: String(row.operation_sha256),
+    recordSha256: String(row.record_sha256),
+    capturedAtDbMs: mysqlSafeInteger(row.captured_at_db_ms, "stored restore target capture time"),
+    receiptSha256: String(row.receipt_sha256),
+  };
+  RestoreJournal.validateTenantRestoreJournalPublicationTarget(target);
+  return target;
+}
+
+function rowToTenantRestoreJournalAck(
+  row: Row,
+): RestoreJournal.TenantRestoreJournalPublicationTargetAck {
+  const ack: RestoreJournal.TenantRestoreJournalPublicationTargetAck = {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: mysqlSafeInteger(row.subject_generation, "stored restore ACK generation"),
+    publicationGeneration: mysqlSafeInteger(
+      row.publication_generation,
+      "stored restore ACK publication generation",
+    ),
+    scope: String(row.scope) as typeof RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_TARGET_ACK_SCOPE,
+    targetOrdinal: mysqlSafeInteger(row.target_ordinal, "stored restore ACK ordinal"),
+    targetSha256: String(row.target_sha256),
+    failureDomainSha256: String(row.failure_domain_sha256),
+    adapterProtocol: String(row.adapter_protocol),
+    journalNamespaceSha256: String(row.journal_namespace_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    targetReceiptSha256: String(row.target_receipt_sha256),
+    operationSha256: String(row.operation_sha256),
+    recordSha256: String(row.record_sha256),
+    remoteSequence: mysqlSafeInteger(row.remote_sequence, "stored restore ACK remote sequence"),
+    previousHeadRootSha256: String(row.previous_head_root_sha256),
+    headRootSha256: String(row.head_root_sha256),
+    completedClaimAttempt: mysqlSafeInteger(
+      row.completed_claim_attempt,
+      "stored restore ACK claim attempt",
+    ),
+    completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+    storeDbTimestampMs: mysqlSafeInteger(
+      row.store_db_timestamp_ms,
+      "stored restore ACK timestamp",
+    ),
+    receiptSha256: String(row.receipt_sha256),
+  };
+  RestoreJournal.validateTenantRestoreJournalPublicationTargetAck(ack);
+  return ack;
+}
+
+function rowToTenantRestoreJournalReceipt(
+  row: Row,
+): RestoreJournal.TenantRestoreJournalPublicationReceipt {
+  const receipt: RestoreJournal.TenantRestoreJournalPublicationReceipt = {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: mysqlSafeInteger(row.subject_generation, "stored restore receipt generation"),
+    publicationGeneration: mysqlSafeInteger(
+      row.publication_generation,
+      "stored restore receipt publication generation",
+    ),
+    t1FenceSha256: String(row.t1_fence_sha256),
+    controlEvidenceSha256: String(row.control_evidence_sha256),
+    adapterProtocol: String(row.adapter_protocol),
+    journalNamespaceSha256: String(row.journal_namespace_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    targetCount: mysqlSafeInteger(row.target_count, "stored restore receipt target count"),
+    targetRootSha256: String(row.target_root_sha256),
+    sourceEvidenceDbMs: mysqlSafeInteger(
+      row.source_evidence_db_ms,
+      "stored restore receipt source timestamp",
+    ),
+    scope: String(row.scope) as typeof RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_RECEIPT_SCOPE,
+    targetAckCount: mysqlSafeInteger(row.target_ack_count, "stored restore receipt ACK count"),
+    targetAckRootSha256: String(row.target_ack_root_sha256),
+    remoteCommitCount: mysqlSafeInteger(row.remote_commit_count, "stored restore receipt commit count"),
+    remoteCommitRootSha256: String(row.remote_commit_root_sha256),
+    restoreFencePublicationComplete: tenantCredentialBoolean(
+      row.restore_fence_publication_complete,
+      "stored restore publication completion",
+    ) as true,
+    restoreFenceReplayComplete: tenantCredentialBoolean(
+      row.restore_fence_replay_complete,
+      "stored restore replay completion",
+    ) as false,
+    physicalReplayComplete: tenantCredentialBoolean(
+      row.physical_replay_complete,
+      "stored physical restore replay completion",
+    ) as false,
+    allDomainsComplete: tenantCredentialBoolean(
+      row.all_domains_complete,
+      "stored restore all-domains completion",
+    ) as false,
+    contentPurgeExecuted: tenantCredentialBoolean(
+      row.content_purge_executed,
+      "stored restore content-purge flag",
+    ) as false,
+    completedClaimAttempt: mysqlSafeInteger(
+      row.completed_claim_attempt,
+      "stored restore receipt claim attempt",
+    ),
+    completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+    storeDbTimestampMs: mysqlSafeInteger(
+      row.store_db_timestamp_ms,
+      "stored restore receipt timestamp",
+    ),
+    receiptSha256: String(row.receipt_sha256),
+  };
+  RestoreJournal.validateTenantRestoreJournalPublicationReceipt(receipt);
+  return receipt;
+}
+
+function rowToTenantRestoreReplayRun(row: Row): RestoreJournal.TenantRestoreReplayRunRecord {
+  const common = {
+    restoreRunId: String(row.restore_run_id),
+    sourceBackupSha256: String(row.source_backup_sha256),
+    runtimeEpochSha256: String(row.runtime_epoch_sha256),
+    protocol: String(row.protocol) as typeof RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+    controlEvidenceSha256: String(row.control_evidence_sha256),
+    adapterProtocol: String(row.adapter_protocol),
+    journalNamespaceSha256: String(row.journal_namespace_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    targetCount: mysqlSafeInteger(row.target_count, "stored restore replay target count"),
+    targetRootSha256: String(row.target_root_sha256),
+    sealedTargetRootSha256: String(row.sealed_target_root_sha256),
+    expectedEntryCount: mysqlSafeInteger(
+      row.expected_entry_count,
+      "stored restore replay expected entry count",
+    ),
+    entryCount: mysqlSafeInteger(row.entry_count, "stored restore replay entry count"),
+    entryRootSha256: String(row.entry_root_sha256),
+    fenceCount: mysqlSafeInteger(row.fence_count, "stored restore replay fence count"),
+    fenceRootSha256: String(row.fence_root_sha256),
+    createdAtDbMs: mysqlSafeInteger(row.created_at_db_ms, "stored restore replay creation time"),
+    updatedAtDbMs: mysqlSafeInteger(row.updated_at_db_ms, "stored restore replay update time"),
+  };
+  const phase = String(row.phase);
+  const run: RestoreJournal.TenantRestoreReplayRunRecord = phase === "prepared"
+    ? { ...common, phase }
+    : phase === "replay_sealed"
+      ? {
+          ...common,
+          phase,
+          terminalReceiptSha256: String(row.terminal_receipt_sha256),
+          sealedAtDbMs: mysqlSafeInteger(row.sealed_at_db_ms, "stored restore replay seal time"),
+        }
+      : phase === "active"
+        ? {
+            ...common,
+            phase,
+            terminalReceiptSha256: String(row.terminal_receipt_sha256),
+            sealedAtDbMs: mysqlSafeInteger(row.sealed_at_db_ms, "stored restore replay seal time"),
+            activatedAtDbMs: mysqlSafeInteger(
+              row.activated_at_db_ms,
+              "stored restore replay activation time",
+            ),
+          }
+        : {
+            ...common,
+            phase: phase as "aborted",
+            abortedAtDbMs: mysqlSafeInteger(row.aborted_at_db_ms, "stored restore replay abort time"),
+          };
+  RestoreJournal.validateTenantRestoreReplayRunRecord(run);
+  return run;
+}
+
+function rowTenantRestoreReplaySealedTargets(
+  row: Row,
+): RestoreJournal.TenantRestoreReplaySealedTarget[] {
+  const targets = parse<RestoreJournal.TenantRestoreReplaySealedTarget[]>(
+    row.sealed_target_catalog_json,
+  );
+  if (!Array.isArray(targets)) throw new Error("stored restore sealed target catalog is invalid");
+  const copy = structuredClone(targets);
+  RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(copy);
+  return copy;
+}
+
+function rowToTenantRestoreFence(row: Row): RestoreJournal.TenantRestoreFence {
+  const fence: RestoreJournal.TenantRestoreFence = {
+    tenantId: String(row.tenant_id),
+    scope: String(row.scope) as typeof RestoreJournal.TENANT_RESTORE_FENCE_SCOPE,
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    requestId: String(row.request_id),
+    subjectGeneration: mysqlSafeInteger(row.subject_generation, "stored restore fence generation"),
+    t1FenceSha256: String(row.t1_fence_sha256),
+    operationSha256: String(row.operation_sha256),
+    recordSha256: String(row.record_sha256),
+    restoreRunId: String(row.restore_run_id),
+    sourceTargetSha256: String(row.source_target_sha256),
+    sourceRemoteSequence: mysqlSafeInteger(
+      row.source_remote_sequence,
+      "stored restore fence remote sequence",
+    ),
+    sourceHeadRootSha256: String(row.source_head_root_sha256),
+    installedAtDbMs: mysqlSafeInteger(row.installed_at_db_ms, "stored restore fence timestamp"),
+    fenceSha256: String(row.fence_sha256),
+  };
+  RestoreJournal.validateTenantRestoreFence(fence);
+  return fence;
+}
+
+function rowToTenantRestoreReplayEntry(row: Row): RestoreJournal.TenantRestoreReplayEntry {
+  const entry: RestoreJournal.TenantRestoreReplayEntry = {
+    restoreRunId: String(row.restore_run_id),
+    replayOrdinal: mysqlSafeInteger(row.replay_ordinal, "stored restore replay ordinal"),
+    scope: String(row.scope) as typeof RestoreJournal.TENANT_RESTORE_REPLAY_ENTRY_SCOPE,
+    targetOrdinal: mysqlSafeInteger(row.target_ordinal, "stored restore replay target ordinal"),
+    targetSha256: String(row.target_sha256),
+    remoteSequence: mysqlSafeInteger(row.remote_sequence, "stored restore replay remote sequence"),
+    previousHeadRootSha256: String(row.previous_head_root_sha256),
+    headRootSha256: String(row.head_root_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: mysqlSafeInteger(row.subject_generation, "stored replay subject generation"),
+    t1FenceSha256: String(row.t1_fence_sha256),
+    operationSha256: String(row.operation_sha256),
+    recordSha256: String(row.record_sha256),
+    fenceDisposition: String(row.fence_disposition) as
+      RestoreJournal.TenantRestoreReplayFenceDisposition,
+    fenceSha256: String(row.fence_sha256),
+    previousEntryRootSha256: String(row.previous_entry_root_sha256),
+    storeDbTimestampMs: mysqlSafeInteger(
+      row.store_db_timestamp_ms,
+      "stored restore replay entry timestamp",
+    ),
+    entrySha256: String(row.entry_sha256),
+  };
+  RestoreJournal.validateTenantRestoreReplayEntry(entry);
+  return entry;
+}
+
+function tenantRestoreReplayReceiptFromRun(
+  run: Extract<RestoreJournal.TenantRestoreReplayRunRecord, { phase: "replay_sealed" | "active" }>,
+): RestoreJournal.TenantRestoreReplayReceipt {
+  const body = {
+    scope: RestoreJournal.TENANT_RESTORE_REPLAY_RECEIPT_SCOPE,
+    restoreRunId: run.restoreRunId,
+    sourceBackupSha256: run.sourceBackupSha256,
+    runtimeEpochSha256: run.runtimeEpochSha256,
+    controlEvidenceSha256: run.controlEvidenceSha256,
+    protocol: run.protocol,
+    adapterProtocol: run.adapterProtocol,
+    journalNamespaceSha256: run.journalNamespaceSha256,
+    logicalDatabaseNamespaceSha256: run.logicalDatabaseNamespaceSha256,
+    targetCount: run.targetCount,
+    targetRootSha256: run.targetRootSha256,
+    sealedTargetRootSha256: run.sealedTargetRootSha256,
+    entryCount: run.entryCount,
+    entryRootSha256: run.entryRootSha256,
+    fenceCount: run.fenceCount,
+    fenceRootSha256: run.fenceRootSha256,
+    storeDbTimestampMs: run.sealedAtDbMs,
+    restoreFenceReplayComplete: true as const,
+    physicalReplayComplete: false as const,
+    allDomainsComplete: false as const,
+    contentPurgeExecuted: false as const,
+  };
+  const receipt: RestoreJournal.TenantRestoreReplayReceipt = {
+    ...body,
+    receiptSha256: RestoreJournal.tenantRestoreReplayReceiptSha256(body),
+  };
+  if (receipt.receiptSha256 !== run.terminalReceiptSha256) {
+    throw new Error("stored restore replay receipt does not match its run");
+  }
+  RestoreJournal.validateTenantRestoreReplayReceipt(receipt);
+  return receipt;
+}
+
+function rowToTenantRestoreRuntimeControl(
+  row: Row,
+): RestoreJournal.TenantRestoreRuntimeControlRecord {
+  const state = String(row.state);
+  const control: RestoreJournal.TenantRestoreRuntimeControlRecord = state === "inactive"
+    ? { singletonId: 1, state, controlGeneration: 0 }
+    : {
+        singletonId: 1,
+        state: "active",
+        controlGeneration: mysqlSafeInteger(
+          row.control_generation,
+          "stored restore runtime generation",
+        ),
+        updateKind: String(row.update_kind) as RestoreJournal.TenantRestoreRuntimeControlUpdateKind,
+        activatedAtDbMs: mysqlSafeInteger(
+          row.activated_at_db_ms,
+          "stored restore runtime activation time",
+        ),
+        updatedAtDbMs: mysqlSafeInteger(row.updated_at_db_ms, "stored restore runtime update time"),
+        ...(String(row.lineage_kind) === "restore"
+          ? {
+              lineageKind: "restore" as const,
+              restoreRunId: String(row.restore_run_id),
+              replayReceiptSha256: String(row.replay_receipt_sha256),
+            }
+          : { lineageKind: "primary" as const }),
+        runtimeEpochSha256: String(row.runtime_epoch_sha256),
+        controlEvidenceSha256: String(row.control_evidence_sha256),
+        logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+        targetCount: mysqlSafeInteger(row.target_count, "stored restore runtime target count"),
+        targetRootSha256: String(row.target_root_sha256),
+        verifiedHeadRootSha256: String(row.verified_head_root_sha256),
+        previousControlEvidenceSha256: String(row.previous_control_evidence_sha256),
+        evidenceSha256: String(row.evidence_sha256),
+      } as RestoreJournal.TenantRestoreRuntimeControlRecord;
+  RestoreJournal.validateTenantRestoreRuntimeControlRecord(control);
+  return control;
+}
+
+function rowToTenantRestoreRuntimeHead(
+  row: Row,
+): RestoreJournal.TenantRestoreReplaySealedTarget {
+  const head: RestoreJournal.TenantRestoreReplaySealedTarget = {
+    targetOrdinal: mysqlSafeInteger(row.target_ordinal, "stored restore runtime head ordinal"),
+    targetSha256: String(row.target_sha256),
+    failureDomainSha256: String(row.failure_domain_sha256),
+    adapterProtocol: String(row.adapter_protocol),
+    journalNamespaceSha256: String(row.journal_namespace_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    sealedRemoteSequence: mysqlSafeInteger(
+      row.remote_sequence,
+      "stored restore runtime head sequence",
+    ),
+    sealedHeadRootSha256: String(row.head_root_sha256),
+  };
+  RestoreJournal.validateTenantRestoreReplaySealedTarget(head);
+  return head;
+}
+
+function rowToTenantRestoreRuntimeKnownEntry(
+  row: Row,
+): RestoreJournal.TenantRestoreJournalRemoteEntry {
+  const entry: RestoreJournal.TenantRestoreJournalRemoteEntry = {
+    targetSha256: String(row.target_sha256),
+    remoteSequence: mysqlSafeInteger(row.remote_sequence, "stored restore known sequence"),
+    previousHeadRootSha256: String(row.previous_head_root_sha256),
+    headRootSha256: String(row.head_root_sha256),
+    record: {
+      scope: String(row.record_scope) as typeof RestoreJournal.TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
+      protocol: String(row.record_protocol) as typeof RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+      logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: mysqlSafeInteger(
+        row.subject_generation,
+        "stored restore known subject generation",
+      ),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      operationSha256: String(row.operation_sha256),
+      recordSha256: String(row.record_sha256),
+    },
+  };
+  RestoreJournal.validateTenantRestoreJournalRemoteEntry(entry);
+  return entry;
+}
+
 function rowToRetentionPolicyVersion(row: Row): RetentionPolicyVersionRecord {
   const policy: RetentionPolicyDocumentV1 = {
     sessionContentRetentionMs: row.session_content_retention_ms == null
@@ -5478,6 +6063,8 @@ export interface MysqlStoreOptions {
   connectionLimit?: number;
   /** overrides migration discovery; useful in tests and unusual deployments */
   migrationsDir?: string;
+  /** Apply missing migrations by default; maintenance CLIs use verify to remain DDL-free. */
+  migrationMode?: "apply" | "verify";
   /** maximum time to wait for another runner to finish schema migration */
   migrationLockTimeoutSeconds?: number;
   /** Non-secret digest of the exact Redis deployment/database/prefix purge namespace. */
@@ -5509,6 +6096,8 @@ export class MysqlSessionStore implements
   TenantDatabasePurgeStore,
   TenantRedisPurgeStore,
   TenantCredentialTargetExecutionStore,
+  RestoreJournal.TenantRestoreJournalStore,
+  RestoreJournal.RestoreReplayStore,
   UserDataExportRequestStore,
   UserDataExportJobStore,
   UserDataExportCleanupStore
@@ -5526,6 +6115,7 @@ export class MysqlSessionStore implements
    * paths accidentally query columns that did not exist at that point in history.
    */
   private credentialLifecycleSchemaInstalled = false;
+  private tenantRestoreJournalSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -5570,12 +6160,104 @@ export class MysqlSessionStore implements
     });
     const store = new MysqlSessionStore(pool, opts.tenantRedisPurgeNamespaceSha256);
     try {
-      await store.migrate(await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir), opts.migrationLockTimeoutSeconds ?? 60);
+      const migrationsDir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir);
+      if ((opts.migrationMode ?? "apply") === "verify") {
+        await store.verifyMigrations(migrationsDir);
+      } else {
+        await store.migrate(migrationsDir, opts.migrationLockTimeoutSeconds ?? 60);
+      }
       return store;
     } catch (err) {
       // A failed startup must not strand a pool (and its advisory-lock connection) in the process.
       await pool.end().catch(() => {});
       throw err;
+    }
+  }
+
+  private async assertTenantRestoreJournalSchemaFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let fingerprintStatements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_RESTORE_JOURNAL_MIGRATION_NAME),
+        "utf8",
+      );
+      fingerprintStatements = [
+        tenantRestoreJournalFingerprintStatement(
+          migrationSql,
+          "schema",
+          "restore_journal_schema_ok",
+        ),
+        tenantRestoreJournalFingerprintStatement(
+          migrationSql,
+          "triggers",
+          "restore_journal_trigger_ok",
+        ),
+      ];
+    } catch (cause) {
+      throw new Error("0030 tenant restore journal fingerprint source is invalid", { cause });
+    }
+
+    let failure: Error | undefined;
+    try {
+      // Keep the prior value inside MySQL: group_concat_max_len is unsigned and may legally exceed
+      // JavaScript's safe-integer range, so a JS round trip could make an otherwise valid startup
+      // fail or restore a rounded session setting.
+      await conn.query(
+        "SET @agent_service_restore_journal_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of fingerprintStatements) await conn.query(statement);
+      const [fingerprintRows] = await conn.query<Row[]>(
+        `SELECT @restore_journal_schema_ok AS schema_ok,
+                @restore_journal_trigger_ok AS trigger_ok`,
+      );
+      if (Number(fingerprintRows[0]?.schema_ok) !== 1
+        || Number(fingerprintRows[0]?.trigger_ok) !== 1) {
+        throw new Error("stored schema does not match the 0030 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error(
+        "0030 tenant restore journal schema fingerprint verification failed",
+        { cause },
+      );
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_restore_journal_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error(
+        "0030 tenant restore journal fingerprint session restore failed",
+        { cause },
+      );
+    }
+    if (failure) throw failure;
+  }
+
+  private async verifyMigrations(migrationsDir: string): Promise<void> {
+    const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
+    const conn = await this.pool.getConnection();
+    try {
+      const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
+      const done = new Set(applied.map((row) => row.name as string));
+      const missing = files.filter((file) => !done.has(file));
+      if (missing.length > 0) {
+        throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
+      }
+      if (done.has(TENANT_RESTORE_JOURNAL_MIGRATION_NAME)) {
+        await this.assertTenantRestoreJournalSchemaFingerprint(conn, migrationsDir);
+      }
+      this.credentialLifecycleSchemaInstalled = done.has(
+        "0026_credential_lifecycle_inventory.sql",
+      );
+      this.tenantRestoreJournalSchemaInstalled = done.has(
+        TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
+      );
+    } finally {
+      conn.release();
     }
   }
 
@@ -5604,8 +6286,7 @@ export class MysqlSessionStore implements
       for (const f of files) {
         if (done.has(f)) continue;
         const sql = await readFile(join(dir, f), "utf8");
-        const stripped = sql.replace(/^\s*--.*$/gm, "");
-        const statements = stripped.split(/;\s*\n/).map((s) => s.trim()).filter(Boolean);
+        const statements = mysqlMigrationStatements(sql);
         for (const [i, stmt] of statements.entries()) {
           try {
             await conn.query(stmt);
@@ -5616,8 +6297,14 @@ export class MysqlSessionStore implements
         await conn.query("INSERT INTO schema_migrations (name, applied_at_ms) VALUES (?, ?)", [f, Date.now()]);
         done.add(f);
       }
+      if (done.has(TENANT_RESTORE_JOURNAL_MIGRATION_NAME)) {
+        await this.assertTenantRestoreJournalSchemaFingerprint(conn, dir);
+      }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
+      );
+      this.tenantRestoreJournalSchemaInstalled = done.has(
+        TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
     } finally {
       if (locked) {
@@ -8117,7 +8804,9 @@ export class MysqlSessionStore implements
       undefined,
       "FOR SHARE",
     );
-    if (tenant.state !== "active" || tenantAdmission !== null || tenantFence !== null) {
+    const tenantRestoreFence = await this.loadTenantRestoreFence(conn, tenantId, "FOR SHARE");
+    if (tenant.state !== "active" || tenantAdmission !== null || tenantFence !== null
+      || tenantRestoreFence !== null) {
       throw new SubjectDeletingError(tenantId);
     }
     let lifecycleRow = tenantRows[0];
@@ -8937,6 +9626,9 @@ export class MysqlSessionStore implements
           AND NOT EXISTS (
             SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=r.tenant_id
           )
+          ${this.tenantRestoreJournalSchemaInstalled ? `AND NOT EXISTS (
+            SELECT 1 FROM tenant_restore_fences rf WHERE rf.tenant_id=r.tenant_id
+          )` : ""}
           AND (
             j.request_id IS NULL
             OR (
@@ -9182,6 +9874,9 @@ export class MysqlSessionStore implements
           AND NOT EXISTS (
             SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=j.tenant_id
           )
+          ${this.tenantRestoreJournalSchemaInstalled ? `AND NOT EXISTS (
+            SELECT 1 FROM tenant_restore_fences rf WHERE rf.tenant_id=j.tenant_id
+          )` : ""}
         ORDER BY available_at_ms, request_id`,
       [options.nowMs, options.nowMs],
     );
@@ -10363,7 +11058,8 @@ export class MysqlSessionStore implements
       undefined,
       "FOR SHARE",
     );
-    return admission !== null || fence !== null;
+    const restoreFence = await this.loadTenantRestoreFence(conn, tenantId, "FOR SHARE");
+    return admission !== null || fence !== null || restoreFence !== null;
   }
 
   private async ensureTenantLifecycleRow(
@@ -10395,7 +11091,8 @@ export class MysqlSessionStore implements
       "SELECT request_id FROM tenant_credential_revocation_fences WHERE tenant_id=? LIMIT 1",
       [tenantId],
     );
-    if (legacyRequestRows[0] || admissionRows[0] || fenceRows[0]) {
+    const restoreFence = await this.loadTenantRestoreFence(conn, tenantId);
+    if (legacyRequestRows[0] || admissionRows[0] || fenceRows[0] || restoreFence) {
       throw new TenantErasureIntegrityError();
     }
     await conn.query(
@@ -10428,7 +11125,8 @@ export class MysqlSessionStore implements
     ) throw new Error("tenant lifecycle gate row is missing or invalid");
     const admission = await this.loadTenantErasureAdmission(conn, tenantId, undefined, "FOR SHARE");
     const fence = await this.loadTenantCredentialRevocationFence(conn, tenantId, undefined, "FOR SHARE");
-    if (tenant.state !== "active" || admission !== null || fence !== null) {
+    const restoreFence = await this.loadTenantRestoreFence(conn, tenantId, "FOR SHARE");
+    if (tenant.state !== "active" || admission !== null || fence !== null || restoreFence !== null) {
       throw new SubjectDeletingError(tenantId);
     }
     return tenant;
@@ -10446,6 +11144,21 @@ export class MysqlSessionStore implements
       const tenant = rows[0] ? rowToSubjectLifecycle(rows[0]) : undefined;
       const admission = await this.loadTenantErasureAdmission(conn, tenantId);
       const fence = await this.loadTenantCredentialRevocationFence(conn, tenantId);
+      const restoreFence = await this.loadTenantRestoreFence(conn, tenantId);
+      if (restoreFence) {
+        if ((admission && (admission.requestId !== restoreFence.requestId
+          || admission.generation !== restoreFence.subjectGeneration))
+          || (fence && (fence.requestId !== restoreFence.requestId
+            || fence.subjectGeneration !== restoreFence.subjectGeneration))) {
+          throw new Error("tenant restore fence conflicts with live erasure authority");
+        }
+        return {
+          tenantId,
+          state: "erased",
+          generation: restoreFence.subjectGeneration,
+          activeRequestId: restoreFence.requestId,
+        };
+      }
       if (!tenant) {
         const [legacyRequestRows] = await conn.query<Row[]>(
           `SELECT request_id FROM erasure_requests
@@ -10549,6 +11262,7 @@ export class MysqlSessionStore implements
       undefined,
       "FOR SHARE",
     );
+    const tenantRestoreFence = await this.loadTenantRestoreFence(conn, tenantId, "FOR SHARE");
     const [userRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
          FROM subject_lifecycle
@@ -10560,7 +11274,8 @@ export class MysqlSessionStore implements
     if (!tenant || !user) throw new Error("subject lifecycle gate row is missing");
     const tenantBlocked = tenant.state !== "active"
       || tenantAdmission !== null
-      || tenantFence !== null;
+      || tenantFence !== null
+      || tenantRestoreFence !== null;
     if (tenantBlocked || user.state !== "active") {
       if (blockedSessionId) throw new SessionGoneError(blockedSessionId);
       throw new SubjectDeletingError(tenantId, tenantBlocked ? undefined : userId);
@@ -10592,6 +11307,11 @@ export class MysqlSessionStore implements
         undefined,
         "FOR SHARE",
       );
+      const tenantRestoreFence = await this.loadTenantRestoreFence(
+        conn,
+        input.tenantId,
+        "FOR SHARE",
+      );
       const [userRows] = await conn.query<Row[]>(
         `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
            FROM subject_lifecycle
@@ -10601,7 +11321,8 @@ export class MysqlSessionStore implements
       const tenant = tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined;
       const user = userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined;
       if (!tenant || !user) throw new Error("subject lifecycle gate row is missing");
-      if (tenant.state !== "active" || tenantAdmission !== null || tenantFence !== null) {
+      if (tenant.state !== "active" || tenantAdmission !== null || tenantFence !== null
+        || tenantRestoreFence !== null) {
         throw new SubjectDeletingError(input.tenantId);
       }
 
@@ -10922,6 +11643,7 @@ export class MysqlSessionStore implements
       if (
         await this.loadTenantErasureAdmission(conn, input.tenantId, undefined, "FOR SHARE")
         || await this.loadTenantCredentialRevocationFence(conn, input.tenantId, undefined, "FOR SHARE")
+        || await this.loadTenantRestoreFence(conn, input.tenantId, "FOR SHARE")
       ) {
         throw new TenantErasureIntegrityError();
       }
@@ -11080,6 +11802,13 @@ export class MysqlSessionStore implements
           credentialJobNowMs,
           credentialJobNowMs,
         ],
+      );
+      await this.materializeTenantRestoreJournalPublicationForT1(
+        conn,
+        record,
+        fence,
+        audit,
+        Math.max(credentialJobNowMs, record.gatedAtMs, fence.fencedAtMs),
       );
       await conn.commit();
       return record;
@@ -27547,6 +28276,9 @@ export class MysqlSessionStore implements
             AND NOT EXISTS (
               SELECT 1 FROM tenant_credential_revocation_fences tf WHERE tf.tenant_id=r.tenant_id
             )
+            ${this.tenantRestoreJournalSchemaInstalled ? `AND NOT EXISTS (
+              SELECT 1 FROM tenant_restore_fences rf WHERE rf.tenant_id=r.tenant_id
+            )` : ""}
             AND NOT (
               r.quarantined_at_ms IS NOT NULL
               AND r.quarantine_reason_code IS NOT NULL
@@ -28759,7 +29491,11 @@ export class MysqlSessionStore implements
               AND tl.subject_id=a.tenant_id AND tl.state='active'
              LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=a.tenant_id
              LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=a.tenant_id
+             ${this.tenantRestoreJournalSchemaInstalled
+               ? "LEFT JOIN tenant_restore_fences rf ON rf.tenant_id=a.tenant_id"
+               : ""}
             WHERE a.tenant_id=? AND a.agent_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+              ${this.tenantRestoreJournalSchemaInstalled ? "AND rf.tenant_id IS NULL" : ""}
             ORDER BY a.version DESC LIMIT 1`
         : `SELECT a.definition FROM agent_versions a
              JOIN subject_lifecycle tl
@@ -28767,8 +29503,12 @@ export class MysqlSessionStore implements
               AND tl.subject_id=a.tenant_id AND tl.state='active'
              LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=a.tenant_id
              LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=a.tenant_id
+             ${this.tenantRestoreJournalSchemaInstalled
+               ? "LEFT JOIN tenant_restore_fences rf ON rf.tenant_id=a.tenant_id"
+               : ""}
             WHERE a.tenant_id=? AND a.agent_id=? AND a.version=?
-              AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
+              AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+              ${this.tenantRestoreJournalSchemaInstalled ? "AND rf.tenant_id IS NULL" : ""}`,
       version === undefined ? [tenantId, agentId] : [tenantId, agentId, version],
     );
     return rows[0] ? parse<AgentDefinition>(rows[0].definition) : null;
@@ -28783,7 +29523,12 @@ export class MysqlSessionStore implements
           AND tl.subject_id=a.tenant_id AND tl.state='active'
          LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=a.tenant_id
          LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=a.tenant_id
-        WHERE a.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL ${opts.cursor ? "AND a.agent_id < ?" : ""}
+         ${this.tenantRestoreJournalSchemaInstalled
+           ? "LEFT JOIN tenant_restore_fences rf ON rf.tenant_id=a.tenant_id"
+           : ""}
+        WHERE a.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+          ${this.tenantRestoreJournalSchemaInstalled ? "AND rf.tenant_id IS NULL" : ""}
+          ${opts.cursor ? "AND a.agent_id < ?" : ""}
         ORDER BY a.agent_id DESC LIMIT ?`,
       opts.cursor ? [tenantId, tenantId, opts.cursor, opts.limit + 1] : [tenantId, tenantId, opts.limit + 1],
     );
@@ -28870,7 +29615,7 @@ export class MysqlSessionStore implements
              ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
             AND ul.subject_id=s.user_id AND ul.state='active'
           WHERE s.session_id=? AND s.tenant_id=? AND s.deleted_at_ms IS NULL
-            AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
+            AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}`,
         [sessionId, tenantId],
       );
       if (!rows[0]) return null;
@@ -29691,7 +30436,7 @@ export class MysqlSessionStore implements
       const where = [
         "s.tenant_id=?",
         "s.deleted_at_ms IS NULL",
-        SESSION_TENANT_ERASURE_EVIDENCE_ABSENT,
+        sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled),
       ];
       const params: unknown[] = [tenantId];
       if (opts.userId) { where.push("s.user_id=?"); params.push(opts.userId); }
@@ -30109,7 +30854,7 @@ export class MysqlSessionStore implements
           AND b.state='staging' AND b.item_id IS NULL AND b.uploaded_at_ms IS NOT NULL
           AND b.sha256 IS NOT NULL AND b.size_bytes IS NOT NULL
           AND s.deleted_at_ms IS NULL AND s.archived_at_ms IS NULL
-          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
+          AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}`,
       [input.blobId, input.owner.tenantId, input.owner.userId, input.sessionId, input.purpose],
     );
     const manifest = rows[0] ? rowToBlobManifest(rows[0]) : null;
@@ -30127,7 +30872,7 @@ export class MysqlSessionStore implements
       "i.item_id=b.item_id",
       "i.session_id=b.session_id",
       "i.user_id=b.user_id",
-      SESSION_TENANT_ERASURE_EVIDENCE_ABSENT,
+      sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled),
     ];
     const params: unknown[] = [input.blobId, input.owner.tenantId, input.owner.userId, input.sessionId];
     if (input.itemId) { where.push("b.item_id=?"); params.push(input.itemId); }
@@ -30898,7 +31643,7 @@ export class MysqlSessionStore implements
              ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
             AND ul.subject_id=s.user_id AND ul.state='active'
           WHERE t.turn_id=? AND t.session_id=?
-            AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
+            AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}`,
         [turnId, sessionId],
       );
       if (!rows[0]) return null;
@@ -30919,7 +31664,7 @@ export class MysqlSessionStore implements
              ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
             AND ul.subject_id=s.user_id AND ul.state='active'
           WHERE t.session_id=? ${opts.cursor ? `AND t.turn_id ${desc ? "<" : ">"} ?` : ""}
-            AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}
+            AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}
           ORDER BY t.turn_id ${desc ? "DESC" : "ASC"} LIMIT ?`,
         opts.cursor ? [sessionId, opts.cursor, opts.limit + 1] : [sessionId, opts.limit + 1],
       );
@@ -30935,7 +31680,7 @@ export class MysqlSessionStore implements
       const where = [
         "i.session_id=?",
         "s.deleted_at_ms IS NULL",
-        SESSION_TENANT_ERASURE_EVIDENCE_ABSENT,
+        sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled),
       ];
       const params: unknown[] = [sessionId];
       if (opts.turnId) { where.push("i.turn_id=?"); params.push(opts.turnId); }
@@ -30981,7 +31726,7 @@ export class MysqlSessionStore implements
              ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
             AND ul.subject_id=s.user_id AND ul.state='active'
           WHERE i.item_id=? AND i.session_id=?
-            AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
+            AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}`,
         [itemId, sessionId],
       );
       if (!rows[0]) return null;
@@ -31001,7 +31746,7 @@ export class MysqlSessionStore implements
            ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
           AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE a.session_id=? ${opts.pendingOnly ? "AND a.status='pending'" : ""}
-          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}
+          AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}
         ORDER BY a.created_at_ms ASC`,
       [sessionId],
     );
@@ -31018,7 +31763,7 @@ export class MysqlSessionStore implements
            ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
           AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE a.approval_id=? AND a.session_id=?
-          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
+          AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}`,
       [approvalId, sessionId],
     );
     return rows[0] ? parse<Approval>(rows[0].body) : null;
@@ -32397,8 +33142,12 @@ export class MysqlSessionStore implements
             AND tl.subject_id=p.tenant_id AND tl.state='active'
            LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=p.tenant_id
            LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=p.tenant_id
+           ${this.tenantRestoreJournalSchemaInstalled
+             ? "LEFT JOIN tenant_restore_fences rf ON rf.tenant_id=p.tenant_id"
+             : ""}
           WHERE p.tenant_id=? AND p.provider_id=?
-            AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
+            AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+            ${this.tenantRestoreJournalSchemaInstalled ? "AND rf.tenant_id IS NULL" : ""}`,
         [tenantId, providerId],
       );
       const r = rows[0];
@@ -32459,7 +33208,11 @@ export class MysqlSessionStore implements
             AND tl.subject_id=p.tenant_id AND tl.state='active'
            LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=p.tenant_id
            LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=p.tenant_id
+           ${this.tenantRestoreJournalSchemaInstalled
+             ? "LEFT JOIN tenant_restore_fences rf ON rf.tenant_id=p.tenant_id"
+             : ""}
           WHERE p.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+            ${this.tenantRestoreJournalSchemaInstalled ? "AND rf.tenant_id IS NULL" : ""}
           ORDER BY p.provider_id`,
         [tenantId],
       );
@@ -32631,8 +33384,12 @@ export class MysqlSessionStore implements
           AND tl.subject_id=k.tenant_id AND tl.state='active'
          LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=k.tenant_id
          LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=k.tenant_id
+         ${this.tenantRestoreJournalSchemaInstalled
+           ? "LEFT JOIN tenant_restore_fences rf ON rf.tenant_id=k.tenant_id"
+           : ""}
         WHERE k.key_hash=? AND k.revoked_at_ms IS NULL
-          AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
+          AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+          ${this.tenantRestoreJournalSchemaInstalled ? "AND rf.tenant_id IS NULL" : ""}`,
       [hashedKey],
     );
     const r = rows[0];
@@ -32700,7 +33457,12 @@ export class MysqlSessionStore implements
           AND tl.subject_id=k.tenant_id AND tl.state='active'
          LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=k.tenant_id
          LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=k.tenant_id
-        WHERE k.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL ORDER BY k.created_at_ms`,
+         ${this.tenantRestoreJournalSchemaInstalled
+           ? "LEFT JOIN tenant_restore_fences rf ON rf.tenant_id=k.tenant_id"
+           : ""}
+        WHERE k.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+          ${this.tenantRestoreJournalSchemaInstalled ? "AND rf.tenant_id IS NULL" : ""}
+        ORDER BY k.created_at_ms`,
       [tenantId],
     );
     if (rows.some((row) => String(row.tenant_id) !== tenantId)) return [];
@@ -32776,7 +33538,11 @@ export class MysqlSessionStore implements
             AND tl.subject_id=t.tenant_id AND tl.state='active'
            LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=t.tenant_id
            LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=t.tenant_id
-          WHERE t.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
+           ${this.tenantRestoreJournalSchemaInstalled
+             ? "LEFT JOIN tenant_restore_fences rf ON rf.tenant_id=t.tenant_id"
+             : ""}
+          WHERE t.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+            ${this.tenantRestoreJournalSchemaInstalled ? "AND rf.tenant_id IS NULL" : ""}`,
         [tenantId],
       );
       const r = rows[0];
@@ -33336,7 +34102,7 @@ export class MysqlSessionStore implements
            ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
           AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE ${where.join(" AND ")}
-          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}
+          AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}
         GROUP BY k
         ORDER BY total_tokens DESC, k ASC
         LIMIT ?`,
@@ -33590,7 +34356,7 @@ export class MysqlSessionStore implements
            ON ul.tenant_id=s.tenant_id AND ul.subject_kind='user'
           AND ul.subject_id=s.user_id AND ul.state='active'
         WHERE i.tenant_id=? AND i.user_id=? AND i.session_id=? AND i.idem_key=?
-          AND ${SESSION_TENANT_ERASURE_EVIDENCE_ABSENT}`,
+          AND ${sessionTenantErasureEvidenceAbsent(this.tenantRestoreJournalSchemaInstalled)}`,
       [scope.tenantId, scope.userId, scope.sessionId, key],
     );
     const row = rows[0];
@@ -34027,6 +34793,2805 @@ export class MysqlSessionStore implements
     return rows[0] ? rowToBlobDeleteOutbox(rows[0], false) : null;
   }
 
+  // ---------- independent tenant restore journal ----------
+  private async loadTenantRestoreJournalControl(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<{
+    control: RestoreJournal.TenantRestoreJournalControlRecord;
+    targets: RestoreJournal.TenantRestoreJournalTargetDescriptor[];
+  }> {
+    if (!this.tenantRestoreJournalSchemaInstalled) {
+      return { control: { singletonId: 1, controlGeneration: 0 }, targets: [] };
+    }
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_JOURNAL_CONTROL_COLUMNS}
+         FROM tenant_restore_journal_control
+        WHERE singleton_id=1 ${lock}`,
+    );
+    if (rows.length !== 1) throw new TenantErasureIntegrityError();
+    try {
+      const control = rowToTenantRestoreJournalControl(rows[0]!);
+      const targets = control.controlGeneration === 0
+        ? []
+        : rowTenantRestoreJournalTargets(rows[0]!);
+      if (control.controlGeneration === 0) {
+        if (rows[0]!.target_catalog_json != null) throw new Error("inactive restore catalog exists");
+      } else if (targets.length !== control.targetCount
+        || RestoreJournal.tenantRestoreJournalTargetRootSha256(targets)
+          !== control.targetRootSha256
+        || targets.some((target) => target.adapterProtocol !== control.adapterProtocol
+          || target.journalNamespaceSha256 !== control.journalNamespaceSha256)) {
+        throw new Error("stored tenant restore journal catalog does not match its control");
+      }
+      return { control, targets };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async loadTenantRestoreRuntimeControl(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_RUNTIME_CONTROL_COLUMNS}
+         FROM tenant_restore_runtime_control
+        WHERE singleton_id=1 ${lock}`,
+    );
+    if (rows.length !== 1) throw new TenantErasureIntegrityError();
+    try {
+      return rowToTenantRestoreRuntimeControl(rows[0]!);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async loadTenantRestoreRuntimeHeads(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<RestoreJournal.TenantRestoreReplaySealedTarget[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_RUNTIME_HEAD_COLUMNS}
+         FROM tenant_restore_runtime_heads
+        WHERE singleton_id=1
+        ORDER BY target_ordinal ${lock}`,
+    );
+    try {
+      const heads = rows.map(rowToTenantRestoreRuntimeHead);
+      for (const [ordinal, head] of heads.entries()) {
+        if (head.targetOrdinal !== ordinal) throw new Error("restore runtime head catalog has a gap");
+      }
+      return heads;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async assertTenantRestoreRuntimeProjection(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<{
+    control: RestoreJournal.TenantRestoreRuntimeControlRecord;
+    heads: RestoreJournal.TenantRestoreReplaySealedTarget[];
+  }> {
+    // All 0030 transactions acquire the immutable journal control before the mutable runtime
+    // projection. Keeping one J -> R lock order prevents preflight/head advancement from
+    // deadlocking T1 publication, ACK persistence, or restore activation.
+    const journal = await this.loadTenantRestoreJournalControl(executor, lock === "FOR UPDATE"
+      ? "FOR SHARE"
+      : lock);
+    const control = await this.loadTenantRestoreRuntimeControl(executor, lock);
+    const heads = await this.loadTenantRestoreRuntimeHeads(executor, lock);
+    try {
+      if (control.state === "inactive") {
+        if (heads.length !== 0 || journal.control.controlGeneration !== 0) {
+          throw new Error("inactive restore runtime has active evidence");
+        }
+        const [eventRows] = await executor.query<Row[]>(
+          "SELECT control_generation FROM tenant_restore_runtime_events LIMIT 1",
+        );
+        const [knownRows] = await executor.query<Row[]>(
+          "SELECT remote_sequence FROM tenant_restore_runtime_known_entries LIMIT 1",
+        );
+        if (eventRows[0] || knownRows[0]) throw new Error("inactive restore runtime has history");
+        return { control, heads };
+      }
+      if (journal.control.controlGeneration !== 1
+        || control.controlEvidenceSha256 !== journal.control.evidenceSha256
+        || control.logicalDatabaseNamespaceSha256
+          !== journal.control.logicalDatabaseNamespaceSha256
+        || control.targetCount !== journal.control.targetCount
+        || control.targetRootSha256 !== journal.control.targetRootSha256
+        || heads.length !== control.targetCount
+        || heads.some((head, ordinal) => {
+          const configured = journal.targets[ordinal];
+          return !configured || head.targetOrdinal !== ordinal
+            || head.targetSha256 !== configured.targetSha256
+            || head.failureDomainSha256 !== configured.failureDomainSha256
+            || head.adapterProtocol !== configured.adapterProtocol
+            || head.journalNamespaceSha256 !== configured.journalNamespaceSha256
+            || head.logicalDatabaseNamespaceSha256
+              !== control.logicalDatabaseNamespaceSha256;
+        })
+        || RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(heads)
+          !== control.verifiedHeadRootSha256
+        || RestoreJournal.tenantRestoreJournalTargetRootSha256(heads.map((head) => ({
+          targetOrdinal: head.targetOrdinal,
+          targetSha256: head.targetSha256,
+          failureDomainSha256: head.failureDomainSha256,
+          adapterProtocol: head.adapterProtocol,
+          journalNamespaceSha256: head.journalNamespaceSha256,
+        }))) !== control.targetRootSha256) {
+        throw new Error("restore runtime projection does not match control");
+      }
+      const [eventRows] = await executor.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_RUNTIME_CONTROL_COLUMNS}
+           FROM (
+             SELECT singleton_id, 'active' AS state, control_generation, update_kind,
+                    lineage_kind, activated_at_db_ms, updated_at_db_ms, restore_run_id,
+                    replay_receipt_sha256, runtime_epoch_sha256, control_evidence_sha256,
+                    logical_database_namespace_sha256, target_count, target_root_sha256,
+                    verified_head_root_sha256, previous_control_evidence_sha256, evidence_sha256
+               FROM tenant_restore_runtime_events
+              WHERE singleton_id=1
+           ) e
+          ORDER BY control_generation`,
+      );
+      if (eventRows.length !== control.controlGeneration) {
+        throw new Error("restore runtime event chain has a gap");
+      }
+      let previous = RestoreJournal.EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256;
+      for (const [index, row] of eventRows.entries()) {
+        const event = rowToTenantRestoreRuntimeControl(row);
+        if (event.state !== "active" || event.controlGeneration !== index + 1
+          || event.previousControlEvidenceSha256 !== previous) {
+          throw new Error("restore runtime event chain is broken");
+        }
+        previous = event.evidenceSha256;
+      }
+      if (previous !== control.evidenceSha256) {
+        throw new Error("restore runtime control is not the event-chain head");
+      }
+      return { control, heads };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async getTenantRestoreJournalControl(
+  ): Promise<RestoreJournal.TenantRestoreJournalControlRecord> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.loadTenantRestoreJournalControl(conn)).control
+    ));
+  }
+
+  async getTenantRestoreJournalControlTargets(
+  ): Promise<RestoreJournal.TenantRestoreJournalTargetDescriptor[]> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.loadTenantRestoreJournalControl(conn)).targets
+    ));
+  }
+
+  async activateTenantRestoreJournalControl(
+    input: RestoreJournal.ActivateTenantRestoreJournalControlInput,
+  ): Promise<Extract<RestoreJournal.TenantRestoreJournalControlRecord, { controlGeneration: 1 }>> {
+    input = structuredClone(input);
+    RestoreJournal.validateActivateTenantRestoreJournalControlInput(input);
+    if (!this.tenantRestoreJournalSchemaInstalled) throw new TenantErasureIntegrityError();
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const journal = await this.loadTenantRestoreJournalControl(conn, "FOR UPDATE");
+      const runtime = await this.loadTenantRestoreRuntimeControl(conn, "FOR UPDATE");
+      const targetRootSha256 = RestoreJournal.tenantRestoreJournalTargetRootSha256(input.targets);
+      const verifiedHeadRootSha256 =
+        RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(input.observedHeads);
+      if (journal.control.controlGeneration === 1) {
+        const [eventRows] = await conn.query<Row[]>(
+          `SELECT ${TENANT_RESTORE_RUNTIME_CONTROL_COLUMNS}
+             FROM (
+               SELECT singleton_id, 'active' AS state, control_generation, update_kind,
+                      lineage_kind, activated_at_db_ms, updated_at_db_ms, restore_run_id,
+                      replay_receipt_sha256, runtime_epoch_sha256, control_evidence_sha256,
+                      logical_database_namespace_sha256, target_count, target_root_sha256,
+                      verified_head_root_sha256, previous_control_evidence_sha256, evidence_sha256
+                 FROM tenant_restore_runtime_events
+                WHERE singleton_id=1 AND control_generation=1
+             ) e`,
+        );
+        const first = eventRows[0] ? rowToTenantRestoreRuntimeControl(eventRows[0]) : undefined;
+        if (journal.control.adapterProtocol !== input.adapterProtocol
+          || journal.control.journalNamespaceSha256 !== input.journalNamespaceSha256
+          || journal.control.logicalDatabaseNamespaceSha256
+            !== input.logicalDatabaseNamespaceSha256
+          || journal.control.targetRootSha256 !== targetRootSha256
+          || journal.targets.length !== input.targets.length
+          || !first || first.state !== "active" || first.lineageKind !== "primary"
+          || first.updateKind !== "primary_activation"
+          || first.runtimeEpochSha256 !== input.runtimeEpochSha256
+          || first.verifiedHeadRootSha256 !== verifiedHeadRootSha256) {
+          throw new TenantErasureIntegrityError();
+        }
+        await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+        await conn.commit();
+        return journal.control;
+      }
+      if (runtime.state !== "inactive") throw new TenantErasureIntegrityError();
+      const [terminalRows] = await conn.query<Row[]>(
+        "SELECT request_id FROM tenant_credential_revocation_receipts LIMIT 1 FOR SHARE",
+      );
+      if (terminalRows[0]) throw new TenantErasureIntegrityError();
+      const activatedAtDbMs = await this.databaseNow(conn);
+      const journalBody = {
+        singletonId: 1 as const,
+        controlGeneration: 1 as const,
+        activatedAtDbMs,
+        protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+        adapterProtocol: input.adapterProtocol,
+        journalNamespaceSha256: input.journalNamespaceSha256,
+        logicalDatabaseNamespaceSha256: input.logicalDatabaseNamespaceSha256,
+        targetCount: input.targets.length,
+        targetRootSha256,
+      };
+      const activated: Extract<
+        RestoreJournal.TenantRestoreJournalControlRecord,
+        { controlGeneration: 1 }
+      > = {
+        ...journalBody,
+        evidenceSha256: RestoreJournal.tenantRestoreJournalControlEvidenceSha256(journalBody),
+      };
+      const runtimeBody = {
+        singletonId: 1 as const,
+        state: "active" as const,
+        controlGeneration: 1,
+        updateKind: "primary_activation" as const,
+        activatedAtDbMs,
+        updatedAtDbMs: activatedAtDbMs,
+        lineageKind: "primary" as const,
+        runtimeEpochSha256: input.runtimeEpochSha256,
+        controlEvidenceSha256: activated.evidenceSha256,
+        logicalDatabaseNamespaceSha256: activated.logicalDatabaseNamespaceSha256,
+        targetCount: activated.targetCount,
+        targetRootSha256: activated.targetRootSha256,
+        verifiedHeadRootSha256,
+        previousControlEvidenceSha256:
+          RestoreJournal.EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256,
+      };
+      const runtimeActivated: Extract<
+        RestoreJournal.TenantRestoreRuntimeControlRecord,
+        { state: "active" }
+      > = {
+        ...runtimeBody,
+        evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(runtimeBody),
+      };
+      RestoreJournal.validateTenantRestoreJournalControlRecord(activated);
+      RestoreJournal.validateTenantRestoreRuntimeControlRecord(runtimeActivated);
+      for (const head of input.observedHeads) {
+        await conn.query(
+          `INSERT INTO tenant_restore_runtime_heads
+             (singleton_id,target_ordinal,target_sha256,failure_domain_sha256,adapter_protocol,
+              journal_namespace_sha256,logical_database_namespace_sha256,remote_sequence,
+              head_root_sha256,checkpoint_control_generation,runtime_epoch_sha256,updated_at_db_ms)
+           VALUES (1,?,?,?,?,?,?,?, ?,1,?,?)`,
+          [
+            head.targetOrdinal,
+            head.targetSha256,
+            head.failureDomainSha256,
+            head.adapterProtocol,
+            head.journalNamespaceSha256,
+            head.logicalDatabaseNamespaceSha256,
+            head.sealedRemoteSequence,
+            head.sealedHeadRootSha256,
+            input.runtimeEpochSha256,
+            activatedAtDbMs,
+          ],
+        );
+      }
+      await conn.query(
+        `INSERT INTO tenant_restore_runtime_events
+           (singleton_id,control_generation,update_kind,lineage_kind,activated_at_db_ms,
+            updated_at_db_ms,restore_run_id,replay_receipt_sha256,runtime_epoch_sha256,
+            activation_epoch_sha256,control_evidence_sha256,
+            logical_database_namespace_sha256,target_count,target_root_sha256,
+            verified_head_root_sha256,previous_control_evidence_sha256,evidence_sha256)
+         VALUES (1,1,'primary_activation','primary',?,?,NULL,NULL,?,?,?, ?,?,?,?, ?,?)`,
+        [
+          activatedAtDbMs,
+          activatedAtDbMs,
+          runtimeActivated.runtimeEpochSha256,
+          runtimeActivated.runtimeEpochSha256,
+          runtimeActivated.controlEvidenceSha256,
+          runtimeActivated.logicalDatabaseNamespaceSha256,
+          runtimeActivated.targetCount,
+          runtimeActivated.targetRootSha256,
+          runtimeActivated.verifiedHeadRootSha256,
+          runtimeActivated.previousControlEvidenceSha256,
+          runtimeActivated.evidenceSha256,
+        ],
+      );
+      await conn.query(
+        `UPDATE tenant_restore_runtime_control
+            SET state='active', control_generation=1, update_kind='primary_activation',
+                lineage_kind='primary', activated_at_db_ms=?, updated_at_db_ms=?,
+                restore_run_id=NULL, replay_receipt_sha256=NULL, runtime_epoch_sha256=?,
+                control_evidence_sha256=?, logical_database_namespace_sha256=?, target_count=?,
+                target_root_sha256=?, verified_head_root_sha256=?,
+                previous_control_evidence_sha256=?, evidence_sha256=?
+          WHERE singleton_id=1 AND state='inactive' AND control_generation=0`,
+        [
+          activatedAtDbMs,
+          activatedAtDbMs,
+          runtimeActivated.runtimeEpochSha256,
+          runtimeActivated.controlEvidenceSha256,
+          runtimeActivated.logicalDatabaseNamespaceSha256,
+          runtimeActivated.targetCount,
+          runtimeActivated.targetRootSha256,
+          runtimeActivated.verifiedHeadRootSha256,
+          runtimeActivated.previousControlEvidenceSha256,
+          runtimeActivated.evidenceSha256,
+        ],
+      );
+      await conn.query(
+        `UPDATE tenant_restore_journal_control
+            SET control_generation=1, activated_at_db_ms=?, protocol=?, adapter_protocol=?,
+                journal_namespace_sha256=?, logical_database_namespace_sha256=?, target_count=?,
+                target_root_sha256=?, target_catalog_json=?, evidence_sha256=?
+          WHERE singleton_id=1 AND control_generation=0`,
+        [
+          activatedAtDbMs,
+          activated.protocol,
+          activated.adapterProtocol,
+          activated.journalNamespaceSha256,
+          activated.logicalDatabaseNamespaceSha256,
+          activated.targetCount,
+          activated.targetRootSha256,
+          json(input.targets),
+          activated.evidenceSha256,
+        ],
+      );
+      await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      await conn.commit();
+      return activated;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private stageTenantRestoreJournalPublication(
+    admission: ErasureRequestRecord,
+    fence: TenantCredentialRevocationFence,
+    firstAudit: ErasureAuditEvent | undefined,
+    control: Extract<RestoreJournal.TenantRestoreJournalControlRecord, { controlGeneration: 1 }>,
+    configuredTargets: readonly RestoreJournal.TenantRestoreJournalTargetDescriptor[],
+    sourceEvidenceDbMs: number,
+  ): {
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord;
+    targets: RestoreJournal.TenantRestoreJournalPublicationTarget[];
+  } {
+    try {
+      validateTenantErasureImmutableT1Proof({ admission, fence, firstAudit });
+      if (admission.subjectKind !== "tenant" || admission.tenantId !== admission.subjectId
+        || admission.requestId !== fence.requestId || admission.tenantId !== fence.tenantId
+        || admission.generation !== fence.subjectGeneration
+        || configuredTargets.length !== control.targetCount) {
+        throw new Error("restore publication source is not one immutable T1 proof");
+      }
+      const publicationGeneration = 1;
+      const operationSha256 = RestoreJournal.tenantRestoreJournalOperationSha256({
+        logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+        requestId: admission.requestId,
+        tenantId: admission.tenantId,
+        subjectGeneration: admission.generation,
+        t1FenceSha256: fence.evidenceSha256,
+      });
+      const recordBody: RestoreJournal.TenantRestoreJournalRecordBody = {
+        scope: RestoreJournal.TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
+        protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+        logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+        requestId: admission.requestId,
+        tenantId: admission.tenantId,
+        subjectGeneration: admission.generation,
+        t1FenceSha256: fence.evidenceSha256,
+        operationSha256,
+      };
+      const recordSha256 = RestoreJournal.tenantRestoreJournalRecordSha256(recordBody);
+      const targets = configuredTargets.map((target) => {
+        const body = {
+          requestId: admission.requestId,
+          tenantId: admission.tenantId,
+          subjectGeneration: admission.generation,
+          publicationGeneration,
+          targetOrdinal: target.targetOrdinal,
+          scope: RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_TARGET_SCOPE,
+          targetSha256: target.targetSha256,
+          failureDomainSha256: target.failureDomainSha256,
+          adapterProtocol: target.adapterProtocol,
+          journalNamespaceSha256: target.journalNamespaceSha256,
+          logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+          t1FenceSha256: fence.evidenceSha256,
+          operationSha256,
+          recordSha256,
+          capturedAtDbMs: sourceEvidenceDbMs,
+        };
+        const targetRow: RestoreJournal.TenantRestoreJournalPublicationTarget = {
+          ...body,
+          receiptSha256: RestoreJournal.tenantRestoreJournalPublicationTargetSha256(body),
+        };
+        RestoreJournal.validateTenantRestoreJournalPublicationTarget(targetRow);
+        return targetRow;
+      });
+      const job: RestoreJournal.TenantRestoreJournalPublicationJobRecord = {
+        requestId: admission.requestId,
+        tenantId: admission.tenantId,
+        subjectGeneration: admission.generation,
+        publicationGeneration,
+        t1FenceSha256: fence.evidenceSha256,
+        controlEvidenceSha256: control.evidenceSha256,
+        adapterProtocol: control.adapterProtocol,
+        journalNamespaceSha256: control.journalNamespaceSha256,
+        logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+        targetCount: control.targetCount,
+        targetRootSha256: control.targetRootSha256,
+        sourceEvidenceDbMs,
+        phase: "queued",
+        targetAckCount: 0,
+        targetAckRootSha256:
+          RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_PUBLICATION_TARGET_ACK_ROOT_SHA256,
+        remoteCommitCount: 0,
+        remoteCommitRootSha256:
+          RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_COMMIT_ROOT_SHA256,
+        attempts: 0,
+        availableAtMs: sourceEvidenceDbMs,
+        createdAtMs: sourceEvidenceDbMs,
+        updatedAtMs: sourceEvidenceDbMs,
+      };
+      RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(job);
+      return { job, targets };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async insertTenantRestoreJournalPublication(
+    conn: PoolConnection,
+    publication: {
+      job: RestoreJournal.TenantRestoreJournalPublicationJobRecord;
+      targets: RestoreJournal.TenantRestoreJournalPublicationTarget[];
+    },
+  ): Promise<void> {
+    const job = publication.job;
+    if (job.phase !== "queued") throw new TenantErasureIntegrityError();
+    await conn.query(
+      `INSERT INTO tenant_restore_journal_jobs
+         (request_id,tenant_id,subject_generation,publication_generation,t1_fence_sha256,
+          control_evidence_sha256,adapter_protocol,journal_namespace_sha256,
+          logical_database_namespace_sha256,target_count,target_root_sha256,source_evidence_db_ms,
+          phase,target_ack_count,target_ack_root_sha256,remote_commit_count,
+          remote_commit_root_sha256,available_at_ms,attempts,claim_token,lease_until_ms,
+          last_error_code,created_at_ms,updated_at_ms,terminal_receipt_sha256,sealed_at_db_ms,
+          completed_claim_attempt,completed_claim_token_sha256,blocked_at_db_ms,blocked_reason_code)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'queued',0,?,0,?, ?,0,NULL,NULL,NULL,?,?,
+               NULL,NULL,NULL,NULL,NULL,NULL)`,
+      [
+        job.requestId,
+        job.tenantId,
+        job.subjectGeneration,
+        job.publicationGeneration,
+        job.t1FenceSha256,
+        job.controlEvidenceSha256,
+        job.adapterProtocol,
+        job.journalNamespaceSha256,
+        job.logicalDatabaseNamespaceSha256,
+        job.targetCount,
+        job.targetRootSha256,
+        job.sourceEvidenceDbMs,
+        job.targetAckRootSha256,
+        job.remoteCommitRootSha256,
+        job.availableAtMs,
+        job.createdAtMs,
+        job.updatedAtMs,
+      ],
+    );
+    for (const target of publication.targets) {
+      await conn.query(
+        `INSERT INTO tenant_restore_journal_targets
+           (request_id,tenant_id,subject_generation,publication_generation,target_ordinal,scope,
+            target_sha256,failure_domain_sha256,adapter_protocol,journal_namespace_sha256,
+            logical_database_namespace_sha256,t1_fence_sha256,operation_sha256,record_sha256,
+            captured_at_db_ms,receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          target.requestId,
+          target.tenantId,
+          target.subjectGeneration,
+          target.publicationGeneration,
+          target.targetOrdinal,
+          target.scope,
+          target.targetSha256,
+          target.failureDomainSha256,
+          target.adapterProtocol,
+          target.journalNamespaceSha256,
+          target.logicalDatabaseNamespaceSha256,
+          target.t1FenceSha256,
+          target.operationSha256,
+          target.recordSha256,
+          target.capturedAtDbMs,
+          target.receiptSha256,
+        ],
+      );
+    }
+  }
+
+  private async materializeTenantRestoreJournalPublicationForT1(
+    conn: PoolConnection,
+    admission: ErasureRequestRecord,
+    fence: TenantCredentialRevocationFence,
+    firstAudit: ErasureAuditEvent | undefined,
+    sourceEvidenceDbMs: number,
+  ): Promise<boolean> {
+    if (!this.tenantRestoreJournalSchemaInstalled) return false;
+    const { control, targets } = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+    if (control.controlGeneration === 0) return false;
+    const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+    if (runtime.control.state !== "active"
+      || runtime.control.controlEvidenceSha256 !== control.evidenceSha256
+      || runtime.control.logicalDatabaseNamespaceSha256
+        !== control.logicalDatabaseNamespaceSha256
+      || runtime.control.targetRootSha256 !== control.targetRootSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const publication = this.stageTenantRestoreJournalPublication(
+      admission,
+      fence,
+      firstAudit,
+      control,
+      targets,
+      sourceEvidenceDbMs,
+    );
+    await this.insertTenantRestoreJournalPublication(conn, publication);
+    return true;
+  }
+
+  private tenantRestorePublicationSource(
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+  ): RestoreJournal.TenantRestoreJournalPublicationSource {
+    return {
+      requestId: job.requestId,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      publicationGeneration: job.publicationGeneration,
+      t1FenceSha256: job.t1FenceSha256,
+      controlEvidenceSha256: job.controlEvidenceSha256,
+      adapterProtocol: job.adapterProtocol,
+      journalNamespaceSha256: job.journalNamespaceSha256,
+      logicalDatabaseNamespaceSha256: job.logicalDatabaseNamespaceSha256,
+      targetCount: job.targetCount,
+      targetRootSha256: job.targetRootSha256,
+      sourceEvidenceDbMs: job.sourceEvidenceDbMs,
+    };
+  }
+
+  private tenantRestorePublicationAuthorized(
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    nowMs: number,
+  ): job is Extract<
+    RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+    { phase: "queued" }
+  > {
+    return job.phase === "queued"
+      && job.requestId === authorization.requestId
+      && job.tenantId === authorization.tenantId
+      && job.subjectGeneration === authorization.subjectGeneration
+      && job.publicationGeneration === authorization.publicationGeneration
+      && job.attempts === authorization.claimAttempt
+      && job.claimToken === authorization.claimToken
+      && job.leaseUntilMs !== undefined
+      && job.leaseUntilMs > nowMs;
+  }
+
+  private async loadTenantRestoreJournalPublicationJob(
+    executor: Pool | PoolConnection,
+    requestId: string,
+    tenantId?: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_JOURNAL_JOB_COLUMNS}
+         FROM tenant_restore_journal_jobs
+        WHERE request_id=?${tenantId === undefined ? "" : " AND tenant_id=?"} ${lock}`,
+      tenantId === undefined ? [requestId] : [requestId, tenantId],
+    );
+    if (!rows[0]) return null;
+    try {
+      const job = rowToTenantRestoreJournalJob(rows[0]);
+      if (job.requestId !== requestId || (tenantId !== undefined && job.tenantId !== tenantId)) {
+        return null;
+      }
+      return job;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async loadTenantRestoreJournalPublicationEvidence(
+    executor: Pool | PoolConnection,
+    job: RestoreJournal.TenantRestoreJournalPublicationJobRecord,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationBundle> {
+    try {
+      RestoreJournal.validateTenantRestoreJournalPublicationJobRecord(job);
+      const { control, targets: configuredTargets } =
+        await this.loadTenantRestoreJournalControl(executor, lock === "FOR UPDATE"
+          ? "FOR SHARE"
+          : lock);
+      if (control.controlGeneration !== 1
+        || job.controlEvidenceSha256 !== control.evidenceSha256
+        || job.adapterProtocol !== control.adapterProtocol
+        || job.journalNamespaceSha256 !== control.journalNamespaceSha256
+        || job.logicalDatabaseNamespaceSha256 !== control.logicalDatabaseNamespaceSha256
+        || job.targetCount !== control.targetCount
+        || job.targetRootSha256 !== control.targetRootSha256
+        || job.publicationGeneration !== 1) {
+        throw new Error("restore publication control binding is invalid");
+      }
+      const [targetRows] = await executor.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_JOURNAL_TARGET_COLUMNS}
+           FROM tenant_restore_journal_targets
+          WHERE request_id=? AND publication_generation=?
+          ORDER BY target_ordinal ${lock}`,
+        [job.requestId, job.publicationGeneration],
+      );
+      const targets = targetRows.map(rowToTenantRestoreJournalTarget);
+      if (targets.length !== job.targetCount || configuredTargets.length !== targets.length) {
+        throw new Error("restore publication target catalog is incomplete");
+      }
+      for (const [ordinal, target] of targets.entries()) {
+        const configured = configuredTargets[ordinal];
+        if (!configured || target.targetOrdinal !== ordinal
+          || target.targetSha256 !== configured.targetSha256
+          || target.failureDomainSha256 !== configured.failureDomainSha256
+          || target.adapterProtocol !== configured.adapterProtocol
+          || target.journalNamespaceSha256 !== configured.journalNamespaceSha256
+          || target.requestId !== job.requestId || target.tenantId !== job.tenantId
+          || target.subjectGeneration !== job.subjectGeneration
+          || target.publicationGeneration !== job.publicationGeneration
+          || target.t1FenceSha256 !== job.t1FenceSha256
+          || target.logicalDatabaseNamespaceSha256 !== job.logicalDatabaseNamespaceSha256
+          || target.capturedAtDbMs !== job.sourceEvidenceDbMs) {
+          throw new Error("restore publication target binding is invalid");
+        }
+      }
+      const [ackRows] = await executor.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_JOURNAL_ACK_COLUMNS}
+           FROM tenant_restore_journal_target_acks
+          WHERE request_id=? AND publication_generation=?
+          ORDER BY target_ordinal ${lock}`,
+        [job.requestId, job.publicationGeneration],
+      );
+      const targetAcks = ackRows.map(rowToTenantRestoreJournalAck);
+      if (targetAcks.length !== job.targetAckCount
+        || RestoreJournal.tenantRestoreJournalPublicationTargetAckRootSha256(targetAcks)
+          !== job.targetAckRootSha256
+        || RestoreJournal.tenantRestoreJournalRemoteCommitRootSha256(targetAcks)
+          !== job.remoteCommitRootSha256
+        || job.remoteCommitCount !== targetAcks.length) {
+        throw new Error("restore publication ACK roots do not match");
+      }
+      for (const ack of targetAcks) {
+        const target = targets[ack.targetOrdinal];
+        if (!target || ack.targetSha256 !== target.targetSha256
+          || ack.failureDomainSha256 !== target.failureDomainSha256
+          || ack.targetReceiptSha256 !== target.receiptSha256
+          || ack.operationSha256 !== target.operationSha256
+          || ack.recordSha256 !== target.recordSha256
+          || ack.adapterProtocol !== target.adapterProtocol
+          || ack.journalNamespaceSha256 !== target.journalNamespaceSha256
+          || ack.logicalDatabaseNamespaceSha256 !== target.logicalDatabaseNamespaceSha256
+          || ack.storeDbTimestampMs < target.capturedAtDbMs
+          || ack.completedClaimAttempt > job.attempts
+          || ack.requestId !== job.requestId || ack.tenantId !== job.tenantId
+          || ack.subjectGeneration !== job.subjectGeneration
+          || ack.publicationGeneration !== job.publicationGeneration) {
+          throw new Error("restore publication ACK binding is invalid");
+        }
+      }
+      const [receiptRows] = await executor.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_JOURNAL_RECEIPT_COLUMNS}
+           FROM tenant_restore_journal_receipts
+          WHERE request_id=? ${lock}`,
+        [job.requestId],
+      );
+      const receipt = receiptRows[0] ? rowToTenantRestoreJournalReceipt(receiptRows[0]) : undefined;
+      if (job.phase === "published") {
+        if (!receipt || receipt.receiptSha256 !== job.terminalReceiptSha256
+          || receipt.requestId !== job.requestId || receipt.tenantId !== job.tenantId
+          || receipt.subjectGeneration !== job.subjectGeneration
+          || receipt.publicationGeneration !== job.publicationGeneration
+          || receipt.t1FenceSha256 !== job.t1FenceSha256
+          || receipt.controlEvidenceSha256 !== job.controlEvidenceSha256
+          || receipt.adapterProtocol !== job.adapterProtocol
+          || receipt.journalNamespaceSha256 !== job.journalNamespaceSha256
+          || receipt.logicalDatabaseNamespaceSha256
+            !== job.logicalDatabaseNamespaceSha256
+          || receipt.targetCount !== job.targetCount
+          || receipt.targetRootSha256 !== job.targetRootSha256
+          || receipt.sourceEvidenceDbMs !== job.sourceEvidenceDbMs
+          || receipt.targetAckCount !== targetAcks.length
+          || receipt.targetAckRootSha256 !== job.targetAckRootSha256
+          || receipt.remoteCommitCount !== job.remoteCommitCount
+          || receipt.remoteCommitRootSha256 !== job.remoteCommitRootSha256
+          || receipt.completedClaimAttempt !== job.completedClaimAttempt
+          || receipt.completedClaimTokenSha256 !== job.completedClaimTokenSha256
+          || receipt.storeDbTimestampMs !== job.sealedAtDbMs) {
+          throw new Error("restore publication receipt does not match job");
+        }
+      } else if (receipt) {
+        throw new Error("nonterminal restore publication has a receipt");
+      }
+      const admission = await this.loadTenantErasureAdmission(
+        executor,
+        job.tenantId,
+        job.requestId,
+        lock === "FOR UPDATE" ? "FOR SHARE" : lock,
+      );
+      const fence = await this.loadTenantCredentialRevocationFence(
+        executor,
+        job.tenantId,
+        job.requestId,
+        lock === "FOR UPDATE" ? "FOR SHARE" : lock,
+      );
+      if (admission && fence) {
+        const firstAudit = await this.loadTenantErasureFirstAudit(
+          executor,
+          job.requestId,
+          lock === "FOR UPDATE" ? "FOR SHARE" : lock,
+        );
+        validateTenantErasureImmutableT1Proof({
+          admission,
+          fence,
+          firstAudit: firstAudit ?? undefined,
+        });
+        if (admission.generation !== job.subjectGeneration
+          || fence.evidenceSha256 !== job.t1FenceSha256) {
+          throw new Error("restore publication T1 proof does not match job");
+        }
+      } else if (job.phase !== "published" || admission || fence) {
+        throw new Error("restore publication T1 proof is incomplete");
+      }
+      return { targets, targetAcks, ...(receipt ? { receipt } : {}) };
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async materializeTenantRestoreJournalPublicationJobs(
+    options: RestoreJournal.MaterializeTenantRestoreJournalPublicationJobsOptions,
+  ): Promise<number> {
+    options = structuredClone(options);
+    RestoreJournal.validateMaterializeTenantRestoreJournalPublicationJobsOptions(options);
+    if (!this.tenantRestoreJournalSchemaInstalled) return 0;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const { control, targets } = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      if (control.controlGeneration === 0) {
+        await conn.commit();
+        return 0;
+      }
+      const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      if (runtime.control.state !== "active"
+        || runtime.control.controlEvidenceSha256 !== control.evidenceSha256
+        || runtime.control.logicalDatabaseNamespaceSha256
+          !== control.logicalDatabaseNamespaceSha256
+        || runtime.control.targetRootSha256 !== control.targetRootSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
+           FROM tenant_erasure_admissions a
+          WHERE NOT EXISTS (
+            SELECT 1 FROM tenant_restore_journal_jobs j WHERE j.request_id=a.request_id
+          )
+          ORDER BY a.request_id
+          LIMIT ? FOR UPDATE SKIP LOCKED`,
+        [options.limit],
+      );
+      const nowMs = await this.databaseNow(conn);
+      for (const row of rows) {
+        const admission = rowToTenantErasureAdmission(row);
+        const fence = await this.loadTenantCredentialRevocationFence(
+          conn,
+          admission.tenantId,
+          admission.requestId,
+          "FOR SHARE",
+        );
+        const firstAudit = await this.loadTenantErasureFirstAudit(
+          conn,
+          admission.requestId,
+          "FOR SHARE",
+        );
+        const [terminalRows] = await conn.query<Row[]>(
+          "SELECT request_id FROM tenant_credential_revocation_receipts WHERE request_id=? LIMIT 1 FOR SHARE",
+          [admission.requestId],
+        );
+        if (!fence || !firstAudit || terminalRows[0]) throw new TenantErasureIntegrityError();
+        const publication = this.stageTenantRestoreJournalPublication(
+          admission,
+          fence,
+          firstAudit,
+          control,
+          targets,
+          Math.max(nowMs, admission.gatedAtMs ?? admission.createdAtMs, fence.fencedAtMs),
+        );
+        await this.insertTenantRestoreJournalPublication(conn, publication);
+      }
+      await conn.commit();
+      return rows.length;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async claimTenantRestoreJournalPublications(
+    options: RestoreJournal.ClaimTenantRestoreJournalPublicationsOptions,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationClaim[]> {
+    options = structuredClone(options);
+    RestoreJournal.validateClaimTenantRestoreJournalPublicationsOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const nowMs = await this.databaseNow(conn);
+      const leaseUntilMs = nowMs + options.leaseMs;
+      if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("restore publication lease overflow");
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_JOURNAL_JOB_COLUMNS}
+           FROM tenant_restore_journal_jobs
+          WHERE phase='queued' AND available_at_ms<=?
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+          ORDER BY available_at_ms, request_id
+          LIMIT ? FOR UPDATE SKIP LOCKED`,
+        [nowMs, nowMs, options.limit],
+      );
+      const claims: RestoreJournal.TenantRestoreJournalPublicationClaim[] = [];
+      for (const row of rows) {
+        const job = rowToTenantRestoreJournalJob(row);
+        await this.loadTenantRestoreJournalPublicationEvidence(conn, job, "FOR SHARE");
+        const attempt = job.attempts + 1;
+        if (!Number.isSafeInteger(attempt)) throw new Error("restore publication attempts overflow");
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_restore_journal_jobs
+              SET attempts=?, claim_token=?, lease_until_ms=?, last_error_code=NULL,
+                  updated_at_ms=?
+            WHERE request_id=? AND tenant_id=? AND subject_generation=?
+              AND publication_generation=? AND phase='queued'`,
+          [
+            attempt,
+            options.claimToken,
+            leaseUntilMs,
+            Math.max(job.updatedAtMs, nowMs),
+            job.requestId,
+            job.tenantId,
+            job.subjectGeneration,
+            job.publicationGeneration,
+          ],
+        );
+        if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+        const claim: RestoreJournal.TenantRestoreJournalPublicationClaim = {
+          ...this.tenantRestorePublicationSource(job),
+          phase: "queued",
+          claimAttempt: attempt,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+        };
+        RestoreJournal.validateTenantRestoreJournalPublicationClaim(claim);
+        claims.push(claim);
+      }
+      await conn.commit();
+      return claims;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewTenantRestoreJournalPublication(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    options: RestoreJournal.RenewTenantRestoreJournalPublicationOptions,
+  ): Promise<boolean> {
+    authorization = structuredClone(authorization);
+    options = structuredClone(options);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(authorization);
+    RestoreJournal.validateRenewTenantRestoreJournalPublicationOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const job = await this.loadTenantRestoreJournalPublicationJob(
+        conn,
+        authorization.requestId,
+        authorization.tenantId,
+        "FOR UPDATE",
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!job || !this.tenantRestorePublicationAuthorized(job, authorization, nowMs)) {
+        await conn.commit();
+        return false;
+      }
+      await this.loadTenantRestoreJournalPublicationEvidence(conn, job, "FOR SHARE");
+      const leaseUntilMs = nowMs + options.leaseMs;
+      if (!Number.isSafeInteger(leaseUntilMs)) throw new Error("restore publication lease overflow");
+      await conn.query(
+        `UPDATE tenant_restore_journal_jobs
+            SET lease_until_ms=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND publication_generation=? AND phase='queued' AND attempts=? AND claim_token=?`,
+        [
+          leaseUntilMs,
+          Math.max(job.updatedAtMs, nowMs),
+          job.requestId,
+          job.tenantId,
+          job.subjectGeneration,
+          job.publicationGeneration,
+          job.attempts,
+          authorization.claimToken,
+        ],
+      );
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryTenantRestoreJournalPublication(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    options: RestoreJournal.RetryTenantRestoreJournalPublicationOptions,
+  ): Promise<boolean> {
+    authorization = structuredClone(authorization);
+    options = structuredClone(options);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(authorization);
+    RestoreJournal.validateRetryTenantRestoreJournalPublicationOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const job = await this.loadTenantRestoreJournalPublicationJob(
+        conn,
+        authorization.requestId,
+        authorization.tenantId,
+        "FOR UPDATE",
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!job || !this.tenantRestorePublicationAuthorized(job, authorization, nowMs)) {
+        await conn.commit();
+        return false;
+      }
+      await this.loadTenantRestoreJournalPublicationEvidence(conn, job, "FOR SHARE");
+      const availableAtMs = nowMs + options.delayMs;
+      if (!Number.isSafeInteger(availableAtMs)) throw new Error("restore publication retry overflow");
+      await conn.query(
+        `UPDATE tenant_restore_journal_jobs
+            SET claim_token=NULL, lease_until_ms=NULL, last_error_code=?, available_at_ms=?,
+                updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND publication_generation=? AND phase='queued' AND attempts=? AND claim_token=?`,
+        [
+          options.errorCode,
+          availableAtMs,
+          Math.max(job.updatedAtMs, nowMs),
+          job.requestId,
+          job.tenantId,
+          job.subjectGeneration,
+          job.publicationGeneration,
+          job.attempts,
+          authorization.claimToken,
+        ],
+      );
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async blockTenantRestoreJournalPublication(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    reason: RestoreJournal.TenantRestoreJournalPublicationBlockReasonCode = "remote_conflict",
+  ): Promise<boolean> {
+    authorization = structuredClone(authorization);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(authorization);
+    if (!(reason === "source_conflict" || reason === "remote_conflict")) {
+      throw new Error("restore publication block reason is invalid");
+    }
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const job = await this.loadTenantRestoreJournalPublicationJob(
+        conn,
+        authorization.requestId,
+        authorization.tenantId,
+        "FOR UPDATE",
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!job || !this.tenantRestorePublicationAuthorized(job, authorization, nowMs)) {
+        await conn.commit();
+        return false;
+      }
+      await this.loadTenantRestoreJournalPublicationEvidence(conn, job, "FOR SHARE");
+      await conn.query(
+        `UPDATE tenant_restore_journal_jobs
+            SET phase='blocked', available_at_ms=NULL, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=NULL, updated_at_ms=?, blocked_at_db_ms=?, blocked_reason_code=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND publication_generation=? AND phase='queued' AND attempts=? AND claim_token=?`,
+        [
+          Math.max(job.updatedAtMs, nowMs),
+          nowMs,
+          reason,
+          job.requestId,
+          job.tenantId,
+          job.subjectGeneration,
+          job.publicationGeneration,
+          job.attempts,
+          authorization.claimToken,
+        ],
+      );
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantRestoreJournalPublicationRecord(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    targetOrdinal: number,
+  ): Promise<{
+    target: RestoreJournal.TenantRestoreJournalPublicationTarget;
+    record: RestoreJournal.TenantRestoreJournalRecord;
+  } | null> {
+    authorization = structuredClone(authorization);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(authorization);
+    if (!Number.isSafeInteger(targetOrdinal) || targetOrdinal < 0) {
+      throw new Error("restore publication target ordinal is invalid");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRestoreJournalPublicationJob(
+        conn,
+        authorization.requestId,
+        authorization.tenantId,
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!job || !this.tenantRestorePublicationAuthorized(job, authorization, nowMs)) return null;
+      const evidence = await this.loadTenantRestoreJournalPublicationEvidence(conn, job);
+      const target = evidence.targets[targetOrdinal];
+      if (!target) return null;
+      const record: RestoreJournal.TenantRestoreJournalRecord = {
+        scope: RestoreJournal.TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
+        protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+        logicalDatabaseNamespaceSha256: target.logicalDatabaseNamespaceSha256,
+        requestId: target.requestId,
+        tenantId: target.tenantId,
+        subjectGeneration: target.subjectGeneration,
+        t1FenceSha256: target.t1FenceSha256,
+        operationSha256: target.operationSha256,
+        recordSha256: target.recordSha256,
+      };
+      RestoreJournal.validateTenantRestoreJournalRecord(record);
+      return { target, record };
+    });
+  }
+
+  async getTenantRestoreJournalPublicationJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationJobRecord | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRestoreJournalPublicationJob(conn, requestId, tenantId);
+      if (!job) return null;
+      await this.loadTenantRestoreJournalPublicationEvidence(conn, job);
+      return job;
+    });
+  }
+
+  async getTenantRestoreJournalPublicationBundle(
+    tenantId: string,
+    requestId: string,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationBundle | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantRestoreJournalPublicationJob(conn, requestId, tenantId);
+      if (!job) return null;
+      return this.loadTenantRestoreJournalPublicationEvidence(conn, job);
+    });
+  }
+
+  async hasTenantRestoreJournalPublicationWork(): Promise<boolean> {
+    if (!this.tenantRestoreJournalSchemaInstalled) return false;
+    const [rows] = await this.pool.query<Row[]>(
+      "SELECT request_id FROM tenant_restore_journal_jobs LIMIT 1",
+    );
+    return rows.length > 0;
+  }
+
+  private tenantRestoreRemoteEntryMatches(
+    left: RestoreJournal.TenantRestoreJournalRemoteEntry,
+    right: RestoreJournal.TenantRestoreJournalRemoteEntry,
+  ): boolean {
+    return left.targetSha256 === right.targetSha256
+      && left.remoteSequence === right.remoteSequence
+      && left.previousHeadRootSha256 === right.previousHeadRootSha256
+      && left.headRootSha256 === right.headRootSha256
+      && left.record.scope === right.record.scope
+      && left.record.protocol === right.record.protocol
+      && left.record.logicalDatabaseNamespaceSha256
+        === right.record.logicalDatabaseNamespaceSha256
+      && left.record.requestId === right.record.requestId
+      && left.record.tenantId === right.record.tenantId
+      && left.record.subjectGeneration === right.record.subjectGeneration
+      && left.record.t1FenceSha256 === right.record.t1FenceSha256
+      && left.record.operationSha256 === right.record.operationSha256
+      && left.record.recordSha256 === right.record.recordSha256;
+  }
+
+  private async tenantRestoreRuntimeEntryIsLocallyKnown(
+    conn: PoolConnection,
+    targetOrdinal: number,
+    entry: RestoreJournal.TenantRestoreJournalRemoteEntry,
+  ): Promise<boolean> {
+    const record = entry.record;
+    const [fenceRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_FENCE_COLUMNS}
+         FROM tenant_restore_fences
+        WHERE tenant_id=? FOR SHARE`,
+      [record.tenantId],
+    );
+    if (fenceRows[0]) {
+      const fence = rowToTenantRestoreFence(fenceRows[0]);
+      if (fence.requestId !== record.requestId
+        || fence.subjectGeneration !== record.subjectGeneration
+        || fence.t1FenceSha256 !== record.t1FenceSha256
+        || fence.operationSha256 !== record.operationSha256
+        || fence.recordSha256 !== record.recordSha256
+        || fence.logicalDatabaseNamespaceSha256
+          !== record.logicalDatabaseNamespaceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      return true;
+    }
+    const job = await this.loadTenantRestoreJournalPublicationJob(
+      conn,
+      record.requestId,
+      record.tenantId,
+      "FOR SHARE",
+    );
+    if (!job || job.subjectGeneration !== record.subjectGeneration
+      || job.t1FenceSha256 !== record.t1FenceSha256) return false;
+    const evidence = await this.loadTenantRestoreJournalPublicationEvidence(conn, job, "FOR SHARE");
+    const target = evidence.targets[targetOrdinal];
+    return !!target
+      && target.targetOrdinal === targetOrdinal
+      && target.targetSha256 === entry.targetSha256
+      && target.logicalDatabaseNamespaceSha256 === record.logicalDatabaseNamespaceSha256
+      && target.requestId === record.requestId
+      && target.tenantId === record.tenantId
+      && target.subjectGeneration === record.subjectGeneration
+      && target.t1FenceSha256 === record.t1FenceSha256
+      && target.operationSha256 === record.operationSha256
+      && target.recordSha256 === record.recordSha256;
+  }
+
+  private async assertTenantRestorePublicationAcksAreRuntimeProjected(
+    conn: PoolConnection,
+    targets: readonly RestoreJournal.TenantRestoreJournalPublicationTarget[],
+    acks: readonly RestoreJournal.TenantRestoreJournalPublicationTargetAck[],
+  ): Promise<void> {
+    const projection = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+    if (projection.control.state !== "active") {
+      throw new TenantErasureIntegrityError();
+    }
+    for (const ack of acks) {
+      const targetOrdinal = ack.targetOrdinal;
+      const target = targets[targetOrdinal];
+      const head = projection.heads[targetOrdinal];
+      if (!target || target.targetOrdinal !== targetOrdinal
+        || ack.requestId !== target.requestId
+        || ack.tenantId !== target.tenantId
+        || ack.subjectGeneration !== target.subjectGeneration
+        || ack.publicationGeneration !== target.publicationGeneration
+        || ack.targetSha256 !== target.targetSha256
+        || ack.failureDomainSha256 !== target.failureDomainSha256
+        || ack.targetReceiptSha256 !== target.receiptSha256
+        || ack.operationSha256 !== target.operationSha256
+        || ack.recordSha256 !== target.recordSha256
+        || ack.adapterProtocol !== target.adapterProtocol
+        || ack.journalNamespaceSha256 !== target.journalNamespaceSha256
+        || ack.logicalDatabaseNamespaceSha256 !== target.logicalDatabaseNamespaceSha256
+        || !head || head.targetOrdinal !== targetOrdinal
+        || head.targetSha256 !== target.targetSha256
+        || head.failureDomainSha256 !== target.failureDomainSha256
+        || head.adapterProtocol !== target.adapterProtocol
+        || head.journalNamespaceSha256 !== target.journalNamespaceSha256
+        || head.logicalDatabaseNamespaceSha256 !== target.logicalDatabaseNamespaceSha256
+        || head.sealedRemoteSequence < ack.remoteSequence
+        || (head.sealedRemoteSequence === ack.remoteSequence
+          && head.sealedHeadRootSha256 !== ack.headRootSha256)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const expected: RestoreJournal.TenantRestoreJournalRemoteEntry = {
+        targetSha256: ack.targetSha256,
+        remoteSequence: ack.remoteSequence,
+        previousHeadRootSha256: ack.previousHeadRootSha256,
+        headRootSha256: ack.headRootSha256,
+        record: {
+          scope: RestoreJournal.TENANT_RESTORE_JOURNAL_RECORD_SCOPE,
+          protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+          logicalDatabaseNamespaceSha256: target.logicalDatabaseNamespaceSha256,
+          requestId: target.requestId,
+          tenantId: target.tenantId,
+          subjectGeneration: target.subjectGeneration,
+          t1FenceSha256: target.t1FenceSha256,
+          operationSha256: target.operationSha256,
+          recordSha256: target.recordSha256,
+        },
+      };
+      const [knownRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_RUNTIME_KNOWN_COLUMNS}
+           FROM tenant_restore_runtime_known_entries
+          WHERE BINARY runtime_epoch_sha256=BINARY ?
+            AND BINARY target_sha256=BINARY ? AND remote_sequence=? FOR SHARE`,
+        [projection.control.runtimeEpochSha256, ack.targetSha256, ack.remoteSequence],
+      );
+      if (knownRows.length === 1) {
+        try {
+          if (mysqlSafeInteger(
+            knownRows[0]!.target_ordinal,
+            "stored restore known target ordinal",
+          ) !== targetOrdinal
+            || mysqlSafeInteger(
+              knownRows[0]!.control_generation,
+              "stored restore known control generation",
+            ) > projection.control.controlGeneration
+            || mysqlSafeInteger(
+              knownRows[0]!.recorded_at_db_ms,
+              "stored restore known timestamp",
+            ) < ack.storeDbTimestampMs
+            || !this.tenantRestoreRemoteEntryMatches(
+              rowToTenantRestoreRuntimeKnownEntry(knownRows[0]!),
+              expected,
+            )) {
+            throw new Error("tenant restore publication ACK runtime projection changed");
+          }
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        continue;
+      }
+      // A restored snapshot can legitimately contain a committed publication ACK while the new
+      // runtime epoch no longer has the original epoch's derived known-entry row. The active
+      // restore run's immutable replay entry is the only alternate projection proof. Do not fall
+      // back to it when a current-epoch row exists but is duplicated/corrupt, and bind every
+      // journal identity field so a same-sequence entry for another tenant/request cannot satisfy
+      // the ACK.
+      if (knownRows.length !== 0 || projection.control.lineageKind !== "restore"
+        || ack.remoteSequence > head.sealedRemoteSequence) {
+        throw new TenantErasureIntegrityError();
+      }
+      const [replayRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_REPLAY_ENTRY_COLUMNS}
+           FROM tenant_restore_replay_entries
+          WHERE BINARY restore_run_id=BINARY ? AND target_ordinal=? AND remote_sequence=?
+          FOR SHARE`,
+        [projection.control.restoreRunId, targetOrdinal, ack.remoteSequence],
+      );
+      try {
+        if (replayRows.length !== 1) {
+          throw new Error("tenant restore publication ACK replay projection is missing");
+        }
+        const replayed = rowToTenantRestoreReplayEntry(replayRows[0]!);
+        if (replayed.restoreRunId !== projection.control.restoreRunId
+          || replayed.targetOrdinal !== targetOrdinal
+          || replayed.targetSha256 !== expected.targetSha256
+          || replayed.remoteSequence !== expected.remoteSequence
+          || replayed.previousHeadRootSha256 !== expected.previousHeadRootSha256
+          || replayed.headRootSha256 !== expected.headRootSha256
+          || replayed.logicalDatabaseNamespaceSha256
+            !== expected.record.logicalDatabaseNamespaceSha256
+          || replayed.requestId !== expected.record.requestId
+          || replayed.tenantId !== expected.record.tenantId
+          || replayed.subjectGeneration !== expected.record.subjectGeneration
+          || replayed.t1FenceSha256 !== expected.record.t1FenceSha256
+          || replayed.operationSha256 !== expected.record.operationSha256
+          || replayed.recordSha256 !== expected.record.recordSha256) {
+          throw new Error("tenant restore publication ACK replay projection changed");
+        }
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+  }
+
+  private async advanceTenantRestoreRuntimeHeadInTransaction(
+    conn: PoolConnection,
+    targetOrdinal: number,
+    entry: RestoreJournal.TenantRestoreJournalRemoteEntry,
+    expectedControlGeneration?: number,
+    forwardGapIsDependency = false,
+  ): Promise<Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>> {
+    RestoreJournal.validateTenantRestoreJournalRemoteEntry(entry);
+    const current = await this.loadTenantRestoreRuntimeControl(conn, "FOR UPDATE");
+    if (current.state !== "active") throw new TenantErasureIntegrityError();
+    const heads = await this.loadTenantRestoreRuntimeHeads(conn, "FOR UPDATE");
+    const head = heads[targetOrdinal];
+    if (!head || head.targetOrdinal !== targetOrdinal
+      || entry.targetSha256 !== head.targetSha256
+      || entry.record.logicalDatabaseNamespaceSha256 !== head.logicalDatabaseNamespaceSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const [knownRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_RUNTIME_KNOWN_COLUMNS}
+         FROM tenant_restore_runtime_known_entries
+        WHERE runtime_epoch_sha256=? AND target_sha256=? AND remote_sequence=? FOR SHARE`,
+      [current.runtimeEpochSha256, entry.targetSha256, entry.remoteSequence],
+    );
+    if (knownRows[0]) {
+      const known = rowToTenantRestoreRuntimeKnownEntry(knownRows[0]);
+      if (mysqlSafeInteger(knownRows[0].target_ordinal, "stored restore known target ordinal")
+          !== targetOrdinal
+        || !this.tenantRestoreRemoteEntryMatches(known, entry)
+        || head.sealedRemoteSequence < entry.remoteSequence) {
+        throw new TenantErasureIntegrityError();
+      }
+      return current;
+    }
+    if (current.lineageKind === "restore" && entry.remoteSequence <= head.sealedRemoteSequence) {
+      const [replayRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_REPLAY_ENTRY_COLUMNS}
+           FROM tenant_restore_replay_entries
+          WHERE restore_run_id=? AND target_ordinal=? AND remote_sequence=? FOR SHARE`,
+        [current.restoreRunId, targetOrdinal, entry.remoteSequence],
+      );
+      const replayed = replayRows[0] ? rowToTenantRestoreReplayEntry(replayRows[0]) : undefined;
+      if (!replayed || replayed.targetSha256 !== entry.targetSha256
+        || replayed.previousHeadRootSha256 !== entry.previousHeadRootSha256
+        || replayed.headRootSha256 !== entry.headRootSha256
+        || replayed.recordSha256 !== entry.record.recordSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      return current;
+    }
+    if (expectedControlGeneration !== undefined
+      && expectedControlGeneration !== current.controlGeneration) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (!await this.tenantRestoreRuntimeEntryIsLocallyKnown(conn, targetOrdinal, entry)) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (entry.remoteSequence !== head.sealedRemoteSequence + 1
+      || entry.previousHeadRootSha256 !== head.sealedHeadRootSha256) {
+      if (entry.remoteSequence > head.sealedRemoteSequence + 1
+        && forwardGapIsDependency) {
+        throw new RestoreJournal.TenantRestoreJournalPublicationDependencyPendingError();
+      }
+      throw new TenantErasureIntegrityError();
+    }
+    const nowMs = await this.databaseNow(conn);
+    const nextHead: RestoreJournal.TenantRestoreReplaySealedTarget = {
+      ...head,
+      sealedRemoteSequence: entry.remoteSequence,
+      sealedHeadRootSha256: entry.headRootSha256,
+    };
+    const nextHeads = heads.map((candidate) => (
+      candidate.targetOrdinal === targetOrdinal ? nextHead : candidate
+    ));
+    const common = {
+      singletonId: 1 as const,
+      state: "active" as const,
+      controlGeneration: current.controlGeneration + 1,
+      updateKind: "journal_head_advance" as const,
+      activatedAtDbMs: current.activatedAtDbMs,
+      updatedAtDbMs: Math.max(current.updatedAtDbMs, nowMs),
+      runtimeEpochSha256: current.runtimeEpochSha256,
+      controlEvidenceSha256: current.controlEvidenceSha256,
+      logicalDatabaseNamespaceSha256: current.logicalDatabaseNamespaceSha256,
+      targetCount: current.targetCount,
+      targetRootSha256: current.targetRootSha256,
+      verifiedHeadRootSha256:
+        RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(nextHeads),
+      previousControlEvidenceSha256: current.evidenceSha256,
+    };
+    const body = current.lineageKind === "restore"
+      ? {
+          ...common,
+          lineageKind: "restore" as const,
+          restoreRunId: current.restoreRunId,
+          replayReceiptSha256: current.replayReceiptSha256,
+        }
+      : { ...common, lineageKind: "primary" as const };
+    const next: Extract<
+      RestoreJournal.TenantRestoreRuntimeControlRecord,
+      { state: "active" }
+    > = {
+      ...body,
+      evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(body),
+    };
+    RestoreJournal.validateTenantRestoreRuntimeControlRecord(next);
+    await conn.query(
+      `INSERT INTO tenant_restore_runtime_known_entries
+         (singleton_id,runtime_epoch_sha256,target_ordinal,target_sha256,remote_sequence,
+          previous_head_root_sha256,head_root_sha256,record_scope,record_protocol,
+          logical_database_namespace_sha256,request_id,tenant_id,subject_generation,
+          t1_fence_sha256,operation_sha256,record_sha256,control_generation,recorded_at_db_ms)
+       VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        current.runtimeEpochSha256,
+        targetOrdinal,
+        entry.targetSha256,
+        entry.remoteSequence,
+        entry.previousHeadRootSha256,
+        entry.headRootSha256,
+        entry.record.scope,
+        entry.record.protocol,
+        entry.record.logicalDatabaseNamespaceSha256,
+        entry.record.requestId,
+        entry.record.tenantId,
+        entry.record.subjectGeneration,
+        entry.record.t1FenceSha256,
+        entry.record.operationSha256,
+        entry.record.recordSha256,
+        next.controlGeneration,
+        nowMs,
+      ],
+    );
+    const [headUpdate] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE tenant_restore_runtime_heads
+          SET remote_sequence=?, head_root_sha256=?, checkpoint_control_generation=?,
+              updated_at_db_ms=?
+        WHERE singleton_id=1 AND target_ordinal=? AND target_sha256=?
+          AND runtime_epoch_sha256=? AND remote_sequence=? AND head_root_sha256=?`,
+      [
+        nextHead.sealedRemoteSequence,
+        nextHead.sealedHeadRootSha256,
+        next.controlGeneration,
+        next.updatedAtDbMs,
+        targetOrdinal,
+        head.targetSha256,
+        current.runtimeEpochSha256,
+        head.sealedRemoteSequence,
+        head.sealedHeadRootSha256,
+      ],
+    );
+    if (headUpdate.affectedRows !== 1) throw new TenantErasureIntegrityError();
+    await conn.query(
+      `INSERT INTO tenant_restore_runtime_events
+         (singleton_id,control_generation,update_kind,lineage_kind,activated_at_db_ms,
+          updated_at_db_ms,restore_run_id,replay_receipt_sha256,runtime_epoch_sha256,
+          activation_epoch_sha256,control_evidence_sha256,
+          logical_database_namespace_sha256,target_count,target_root_sha256,
+          verified_head_root_sha256,previous_control_evidence_sha256,evidence_sha256)
+       VALUES (1,?,'journal_head_advance',?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`,
+      [
+        next.controlGeneration,
+        next.lineageKind,
+        next.activatedAtDbMs,
+        next.updatedAtDbMs,
+        next.lineageKind === "restore" ? next.restoreRunId : null,
+        next.lineageKind === "restore" ? next.replayReceiptSha256 : null,
+        next.runtimeEpochSha256,
+        next.controlEvidenceSha256,
+        next.logicalDatabaseNamespaceSha256,
+        next.targetCount,
+        next.targetRootSha256,
+        next.verifiedHeadRootSha256,
+        next.previousControlEvidenceSha256,
+        next.evidenceSha256,
+      ],
+    );
+    const [controlUpdate] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE tenant_restore_runtime_control
+          SET control_generation=?, update_kind='journal_head_advance', lineage_kind=?,
+              updated_at_db_ms=?, restore_run_id=?, replay_receipt_sha256=?,
+              verified_head_root_sha256=?, previous_control_evidence_sha256=?, evidence_sha256=?
+        WHERE singleton_id=1 AND state='active' AND control_generation=? AND evidence_sha256=?`,
+      [
+        next.controlGeneration,
+        next.lineageKind,
+        next.updatedAtDbMs,
+        next.lineageKind === "restore" ? next.restoreRunId : null,
+        next.lineageKind === "restore" ? next.replayReceiptSha256 : null,
+        next.verifiedHeadRootSha256,
+        next.previousControlEvidenceSha256,
+        next.evidenceSha256,
+        current.controlGeneration,
+        current.evidenceSha256,
+      ],
+    );
+    if (controlUpdate.affectedRows !== 1) throw new TenantErasureIntegrityError();
+    return next;
+  }
+
+  async recordTenantRestoreJournalPublicationTargetAck(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+    result: RestoreJournal.TenantRestoreJournalAdapterResult,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationTargetAck | null> {
+    authorization = structuredClone(authorization);
+    result = structuredClone(result);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(authorization);
+    RestoreJournal.validateTenantRestoreJournalAdapterResult(result);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const job = await this.loadTenantRestoreJournalPublicationJob(
+        conn,
+        authorization.requestId,
+        authorization.tenantId,
+        "FOR UPDATE",
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!job || !this.tenantRestorePublicationAuthorized(job, authorization, nowMs)) {
+        await conn.commit();
+        return null;
+      }
+      const evidence = await this.loadTenantRestoreJournalPublicationEvidence(conn, job, "FOR SHARE");
+      const target = evidence.targets.find((candidate) => candidate.targetSha256 === result.targetSha256);
+      if (!target || result.adapterProtocol !== target.adapterProtocol
+        || result.journalNamespaceSha256 !== target.journalNamespaceSha256
+        || result.logicalDatabaseNamespaceSha256 !== target.logicalDatabaseNamespaceSha256
+        || result.record.recordSha256 !== target.recordSha256
+        || result.record.operationSha256 !== target.operationSha256
+        || result.record.requestId !== target.requestId
+        || result.record.tenantId !== target.tenantId
+        || result.record.subjectGeneration !== target.subjectGeneration
+        || result.record.t1FenceSha256 !== target.t1FenceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const existing = evidence.targetAcks.find((ack) => ack.targetOrdinal === target.targetOrdinal);
+      if (existing) {
+        const remote: RestoreJournal.TenantRestoreJournalRemoteEntry = {
+          targetSha256: result.targetSha256,
+          remoteSequence: result.remoteSequence,
+          previousHeadRootSha256: result.previousHeadRootSha256,
+          headRootSha256: result.headRootSha256,
+          record: result.record,
+        };
+        const known: RestoreJournal.TenantRestoreJournalRemoteEntry = {
+          targetSha256: existing.targetSha256,
+          remoteSequence: existing.remoteSequence,
+          previousHeadRootSha256: existing.previousHeadRootSha256,
+          headRootSha256: existing.headRootSha256,
+          record: result.record,
+        };
+        if (!this.tenantRestoreRemoteEntryMatches(known, remote)
+          || existing.recordSha256 !== result.record.recordSha256) {
+          throw new TenantErasureIntegrityError();
+        }
+        await this.assertTenantRestorePublicationAcksAreRuntimeProjected(
+          conn,
+          evidence.targets,
+          [existing],
+        );
+        await conn.commit();
+        return existing;
+      }
+      const ackBody = {
+        requestId: target.requestId,
+        tenantId: target.tenantId,
+        subjectGeneration: target.subjectGeneration,
+        publicationGeneration: target.publicationGeneration,
+        scope: RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_TARGET_ACK_SCOPE,
+        targetOrdinal: target.targetOrdinal,
+        targetSha256: target.targetSha256,
+        failureDomainSha256: target.failureDomainSha256,
+        targetReceiptSha256: target.receiptSha256,
+        operationSha256: target.operationSha256,
+        recordSha256: target.recordSha256,
+        adapterProtocol: target.adapterProtocol,
+        journalNamespaceSha256: target.journalNamespaceSha256,
+        logicalDatabaseNamespaceSha256: target.logicalDatabaseNamespaceSha256,
+        remoteSequence: result.remoteSequence,
+        previousHeadRootSha256: result.previousHeadRootSha256,
+        headRootSha256: result.headRootSha256,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256:
+          RestoreJournal.tenantRestoreJournalClaimTokenSha256(authorization.claimToken),
+        storeDbTimestampMs: nowMs,
+      };
+      const ack: RestoreJournal.TenantRestoreJournalPublicationTargetAck = {
+        ...ackBody,
+        receiptSha256: RestoreJournal.tenantRestoreJournalPublicationTargetAckSha256(ackBody),
+      };
+      RestoreJournal.validateTenantRestoreJournalPublicationTargetAck(ack);
+      await this.advanceTenantRestoreRuntimeHeadInTransaction(conn, target.targetOrdinal, {
+        targetSha256: result.targetSha256,
+        remoteSequence: result.remoteSequence,
+        previousHeadRootSha256: result.previousHeadRootSha256,
+        headRootSha256: result.headRootSha256,
+        record: result.record,
+      }, undefined, true);
+      await conn.query(
+        `INSERT INTO tenant_restore_journal_target_acks
+           (request_id,tenant_id,subject_generation,publication_generation,target_ordinal,scope,
+            target_sha256,failure_domain_sha256,adapter_protocol,journal_namespace_sha256,
+            logical_database_namespace_sha256,target_receipt_sha256,operation_sha256,record_sha256,
+            remote_sequence,previous_head_root_sha256,head_root_sha256,completed_claim_attempt,
+            completed_claim_token_sha256,store_db_timestamp_ms,receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          ack.requestId,
+          ack.tenantId,
+          ack.subjectGeneration,
+          ack.publicationGeneration,
+          ack.targetOrdinal,
+          ack.scope,
+          ack.targetSha256,
+          ack.failureDomainSha256,
+          ack.adapterProtocol,
+          ack.journalNamespaceSha256,
+          ack.logicalDatabaseNamespaceSha256,
+          ack.targetReceiptSha256,
+          ack.operationSha256,
+          ack.recordSha256,
+          ack.remoteSequence,
+          ack.previousHeadRootSha256,
+          ack.headRootSha256,
+          ack.completedClaimAttempt,
+          ack.completedClaimTokenSha256,
+          ack.storeDbTimestampMs,
+          ack.receiptSha256,
+        ],
+      );
+      const nextAcks = [...evidence.targetAcks, ack]
+        .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+      await conn.query(
+        `UPDATE tenant_restore_journal_jobs
+            SET target_ack_count=?, target_ack_root_sha256=?, remote_commit_count=?,
+                remote_commit_root_sha256=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND publication_generation=? AND phase='queued' AND attempts=? AND claim_token=?`,
+        [
+          nextAcks.length,
+          RestoreJournal.tenantRestoreJournalPublicationTargetAckRootSha256(nextAcks),
+          nextAcks.length,
+          RestoreJournal.tenantRestoreJournalRemoteCommitRootSha256(nextAcks),
+          Math.max(job.updatedAtMs, nowMs),
+          job.requestId,
+          job.tenantId,
+          job.subjectGeneration,
+          job.publicationGeneration,
+          job.attempts,
+          authorization.claimToken,
+        ],
+      );
+      await conn.commit();
+      return ack;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async sealTenantRestoreJournalPublication(
+    authorization: RestoreJournal.TenantRestoreJournalPublicationAuthorization,
+  ): Promise<RestoreJournal.TenantRestoreJournalPublicationReceipt | null> {
+    authorization = structuredClone(authorization);
+    RestoreJournal.validateTenantRestoreJournalPublicationAuthorization(authorization);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const job = await this.loadTenantRestoreJournalPublicationJob(
+        conn,
+        authorization.requestId,
+        authorization.tenantId,
+        "FOR UPDATE",
+      );
+      if (!job) {
+        await conn.commit();
+        return null;
+      }
+      const evidence = await this.loadTenantRestoreJournalPublicationEvidence(conn, job, "FOR SHARE");
+      const tokenSha256 = RestoreJournal.tenantRestoreJournalClaimTokenSha256(
+        authorization.claimToken,
+      );
+      if (job.phase === "published") {
+        const receipt = job.completedClaimAttempt === authorization.claimAttempt
+          && job.completedClaimTokenSha256 === tokenSha256
+          ? evidence.receipt ?? null
+          : null;
+        if (receipt) {
+          await this.assertTenantRestorePublicationAcksAreRuntimeProjected(
+            conn,
+            evidence.targets,
+            evidence.targetAcks,
+          );
+        }
+        await conn.commit();
+        return receipt;
+      }
+      const nowMs = await this.databaseNow(conn);
+      if (!this.tenantRestorePublicationAuthorized(job, authorization, nowMs)
+        || evidence.targetAcks.length !== job.targetCount) {
+        await conn.commit();
+        return null;
+      }
+      await this.assertTenantRestorePublicationAcksAreRuntimeProjected(
+        conn,
+        evidence.targets,
+        evidence.targetAcks,
+      );
+      const body = {
+        ...this.tenantRestorePublicationSource(job),
+        scope: RestoreJournal.TENANT_RESTORE_JOURNAL_PUBLICATION_RECEIPT_SCOPE,
+        targetAckCount: evidence.targetAcks.length,
+        targetAckRootSha256:
+          RestoreJournal.tenantRestoreJournalPublicationTargetAckRootSha256(evidence.targetAcks),
+        remoteCommitCount: evidence.targetAcks.length,
+        remoteCommitRootSha256:
+          RestoreJournal.tenantRestoreJournalRemoteCommitRootSha256(evidence.targetAcks),
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256: tokenSha256,
+        storeDbTimestampMs: nowMs,
+        restoreFencePublicationComplete: true as const,
+        restoreFenceReplayComplete: false as const,
+        physicalReplayComplete: false as const,
+        allDomainsComplete: false as const,
+        contentPurgeExecuted: false as const,
+      };
+      const receipt: RestoreJournal.TenantRestoreJournalPublicationReceipt = {
+        ...body,
+        receiptSha256: RestoreJournal.tenantRestoreJournalPublicationReceiptSha256(body),
+      };
+      RestoreJournal.validateTenantRestoreJournalPublicationReceipt(receipt);
+      await conn.query(
+        `INSERT INTO tenant_restore_journal_receipts
+           (request_id,tenant_id,subject_generation,publication_generation,t1_fence_sha256,
+            control_evidence_sha256,adapter_protocol,journal_namespace_sha256,
+            logical_database_namespace_sha256,target_count,target_root_sha256,source_evidence_db_ms,
+            scope,target_ack_count,target_ack_root_sha256,remote_commit_count,
+            remote_commit_root_sha256,restore_fence_publication_complete,
+            restore_fence_replay_complete,physical_replay_complete,all_domains_complete,
+            content_purge_executed,completed_claim_attempt,completed_claim_token_sha256,
+            store_db_timestamp_ms,receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,TRUE,FALSE,FALSE,FALSE,FALSE,?,?,?,?)`,
+        [
+          receipt.requestId,
+          receipt.tenantId,
+          receipt.subjectGeneration,
+          receipt.publicationGeneration,
+          receipt.t1FenceSha256,
+          receipt.controlEvidenceSha256,
+          receipt.adapterProtocol,
+          receipt.journalNamespaceSha256,
+          receipt.logicalDatabaseNamespaceSha256,
+          receipt.targetCount,
+          receipt.targetRootSha256,
+          receipt.sourceEvidenceDbMs,
+          receipt.scope,
+          receipt.targetAckCount,
+          receipt.targetAckRootSha256,
+          receipt.remoteCommitCount,
+          receipt.remoteCommitRootSha256,
+          receipt.completedClaimAttempt,
+          receipt.completedClaimTokenSha256,
+          receipt.storeDbTimestampMs,
+          receipt.receiptSha256,
+        ],
+      );
+      await conn.query(
+        `UPDATE tenant_restore_journal_jobs
+            SET phase='published', available_at_ms=NULL, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=NULL, updated_at_ms=?, terminal_receipt_sha256=?,
+                sealed_at_db_ms=?, completed_claim_attempt=?, completed_claim_token_sha256=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND publication_generation=? AND phase='queued' AND attempts=? AND claim_token=?`,
+        [
+          Math.max(job.updatedAtMs, nowMs),
+          receipt.receiptSha256,
+          nowMs,
+          authorization.claimAttempt,
+          tokenSha256,
+          job.requestId,
+          job.tenantId,
+          job.subjectGeneration,
+          job.publicationGeneration,
+          job.attempts,
+          authorization.claimToken,
+        ],
+      );
+      await conn.commit();
+      return receipt;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private async loadTenantRestoreReplayRun(
+    executor: Pool | PoolConnection,
+    restoreRunId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<{ run: RestoreJournal.TenantRestoreReplayRunRecord; row: Row } | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_REPLAY_RUN_COLUMNS}
+         FROM tenant_restore_replay_runs
+        WHERE restore_run_id=? ${lock}`,
+      [restoreRunId],
+    );
+    if (!rows[0]) return null;
+    try {
+      const run = rowToTenantRestoreReplayRun(rows[0]);
+      if (run.restoreRunId !== restoreRunId) return null;
+      return { run, row: rows[0] };
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async loadTenantRestoreReplayEvidence(
+    executor: Pool | PoolConnection,
+    loaded: { run: RestoreJournal.TenantRestoreReplayRunRecord; row: Row },
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<{
+    targets: RestoreJournal.TenantRestoreReplaySealedTarget[];
+    entries: RestoreJournal.TenantRestoreReplayEntry[];
+    fences: RestoreJournal.TenantRestoreFence[];
+    receipt?: RestoreJournal.TenantRestoreReplayReceipt;
+  }> {
+    try {
+      const { run, row } = loaded;
+      RestoreJournal.validateTenantRestoreReplayRunRecord(run);
+      const journal = await this.loadTenantRestoreJournalControl(
+        executor,
+        lock === "FOR UPDATE" ? "FOR SHARE" : lock,
+      );
+      if (journal.control.controlGeneration !== 1
+        || run.controlEvidenceSha256 !== journal.control.evidenceSha256
+        || run.protocol !== journal.control.protocol
+        || run.adapterProtocol !== journal.control.adapterProtocol
+        || run.journalNamespaceSha256 !== journal.control.journalNamespaceSha256
+        || run.logicalDatabaseNamespaceSha256
+          !== journal.control.logicalDatabaseNamespaceSha256
+        || run.targetCount !== journal.control.targetCount
+        || run.targetRootSha256 !== journal.control.targetRootSha256) {
+        throw new Error("restore replay journal control binding is invalid");
+      }
+      const targets = rowTenantRestoreReplaySealedTargets(row);
+      if (targets.length !== run.targetCount
+        || RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(targets)
+          !== run.sealedTargetRootSha256
+        || targets.reduce((total, target) => total + target.sealedRemoteSequence, 0)
+          !== run.expectedEntryCount) {
+        throw new Error("restore replay sealed target catalog does not match run");
+      }
+      for (const [ordinal, target] of targets.entries()) {
+        const configured = journal.targets[ordinal];
+        if (!configured || target.targetOrdinal !== ordinal
+          || target.targetSha256 !== configured.targetSha256
+          || target.failureDomainSha256 !== configured.failureDomainSha256
+          || target.adapterProtocol !== configured.adapterProtocol
+          || target.journalNamespaceSha256 !== configured.journalNamespaceSha256
+          || target.logicalDatabaseNamespaceSha256
+            !== run.logicalDatabaseNamespaceSha256) {
+          throw new Error("restore replay sealed target is not journal-control-bound");
+        }
+      }
+      const [entryRows] = await executor.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_REPLAY_ENTRY_COLUMNS}
+           FROM tenant_restore_replay_entries
+          WHERE restore_run_id=?
+          ORDER BY replay_ordinal ${lock}`,
+        [run.restoreRunId],
+      );
+      const entries = entryRows.map(rowToTenantRestoreReplayEntry);
+      if (entries.length !== run.entryCount
+        || RestoreJournal.tenantRestoreReplayEntryRootSha256(entries) !== run.entryRootSha256) {
+        throw new Error("restore replay entry chain does not match run");
+      }
+      let cursor = 0;
+      let prefixEnded = false;
+      for (const target of targets) {
+        let sequence = 0;
+        let root = RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256;
+        while (!prefixEnded && sequence < target.sealedRemoteSequence) {
+          const entry = entries[cursor];
+          if (!entry) {
+            prefixEnded = true;
+            break;
+          }
+          if (entry.targetOrdinal !== target.targetOrdinal
+            || entry.targetSha256 !== target.targetSha256
+            || entry.remoteSequence !== sequence + 1
+            || entry.previousHeadRootSha256 !== root
+            || entry.logicalDatabaseNamespaceSha256 !== run.logicalDatabaseNamespaceSha256) {
+            throw new Error("restore replay entries are not one ordered sealed prefix");
+          }
+          sequence = entry.remoteSequence;
+          root = entry.headRootSha256;
+          cursor += 1;
+        }
+        if (sequence === target.sealedRemoteSequence && root !== target.sealedHeadRootSha256) {
+          throw new Error("restore replay prefix does not reach sealed target head");
+        }
+        if (sequence < target.sealedRemoteSequence) prefixEnded = true;
+      }
+      if (cursor !== entries.length) throw new Error("restore replay has extra entries");
+      const [fenceRows] = await executor.query<Row[]>(
+        `SELECT DISTINCT ${TENANT_RESTORE_FENCE_COLUMNS.split(",").map((column) => (
+          `f.${column.trim()}`
+        )).join(",")}
+           FROM tenant_restore_fences f
+           JOIN tenant_restore_replay_entries e
+             ON e.tenant_id=f.tenant_id AND e.fence_sha256=f.fence_sha256
+          WHERE e.restore_run_id=?
+          ORDER BY f.tenant_id ${lock}`,
+        [run.restoreRunId],
+      );
+      const fences = fenceRows.map(rowToTenantRestoreFence);
+      if (fences.length !== run.fenceCount
+        || RestoreJournal.tenantRestoreFenceRootSha256(fences) !== run.fenceRootSha256) {
+        throw new Error("restore replay fence root does not match run");
+      }
+      let receipt: RestoreJournal.TenantRestoreReplayReceipt | undefined;
+      if (run.phase === "replay_sealed" || run.phase === "active") {
+        receipt = tenantRestoreReplayReceiptFromRun(run);
+      }
+      return { targets, entries, fences, ...(receipt ? { receipt } : {}) };
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async prepareTenantRestoreReplay(
+    input: RestoreJournal.PrepareTenantRestoreReplayInput,
+  ): Promise<RestoreJournal.TenantRestoreReplayRunRecord> {
+    input = structuredClone(input);
+    RestoreJournal.validatePrepareTenantRestoreReplayInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      if (journal.control.controlGeneration !== 1
+        || journal.control.evidenceSha256 !== input.controlEvidenceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const existing = await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE");
+      if (existing) {
+        const evidence = await this.loadTenantRestoreReplayEvidence(conn, existing, "FOR SHARE");
+        if (existing.run.sourceBackupSha256 !== input.sourceBackupSha256
+          || existing.run.runtimeEpochSha256 !== input.runtimeEpochSha256
+          || existing.run.controlEvidenceSha256 !== input.controlEvidenceSha256
+          || existing.run.sealedTargetRootSha256
+            !== RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(input.sealedTargets)
+          || evidence.targets.length !== input.sealedTargets.length
+          || evidence.targets.some((target, ordinal) => {
+            const replayed = input.sealedTargets[ordinal];
+            return !replayed
+              || target.targetOrdinal !== replayed.targetOrdinal
+              || target.targetSha256 !== replayed.targetSha256
+              || target.failureDomainSha256 !== replayed.failureDomainSha256
+              || target.adapterProtocol !== replayed.adapterProtocol
+              || target.journalNamespaceSha256 !== replayed.journalNamespaceSha256
+              || target.logicalDatabaseNamespaceSha256
+                !== replayed.logicalDatabaseNamespaceSha256
+              || target.sealedRemoteSequence !== replayed.sealedRemoteSequence
+              || target.sealedHeadRootSha256 !== replayed.sealedHeadRootSha256;
+          })) {
+          throw new TenantErasureIntegrityError();
+        }
+        await conn.commit();
+        return existing.run;
+      }
+      const [pendingRows] = await conn.query<Row[]>(
+        `SELECT restore_run_id FROM tenant_restore_replay_runs
+          WHERE phase IN ('prepared','replay_sealed') LIMIT 1 FOR UPDATE`,
+      );
+      if (pendingRows[0]) throw new TenantErasureIntegrityError();
+      if (input.sealedTargets.length !== journal.targets.length) {
+        throw new TenantErasureIntegrityError();
+      }
+      for (const [ordinal, sealed] of input.sealedTargets.entries()) {
+        const target = journal.targets[ordinal];
+        if (!target || sealed.targetOrdinal !== ordinal
+          || sealed.targetSha256 !== target.targetSha256
+          || sealed.failureDomainSha256 !== target.failureDomainSha256
+          || sealed.adapterProtocol !== target.adapterProtocol
+          || sealed.journalNamespaceSha256 !== target.journalNamespaceSha256
+          || sealed.logicalDatabaseNamespaceSha256
+            !== journal.control.logicalDatabaseNamespaceSha256) {
+          throw new TenantErasureIntegrityError();
+        }
+      }
+      const expectedEntryCount = input.sealedTargets.reduce(
+        (total, target) => total + target.sealedRemoteSequence,
+        0,
+      );
+      if (!Number.isSafeInteger(expectedEntryCount)) throw new Error("restore replay size overflow");
+      const nowMs = await this.databaseNow(conn);
+      const run: RestoreJournal.TenantRestoreReplayRunRecord = {
+        restoreRunId: input.restoreRunId,
+        sourceBackupSha256: input.sourceBackupSha256,
+        runtimeEpochSha256: input.runtimeEpochSha256,
+        protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL,
+        controlEvidenceSha256: journal.control.evidenceSha256,
+        adapterProtocol: journal.control.adapterProtocol,
+        journalNamespaceSha256: journal.control.journalNamespaceSha256,
+        logicalDatabaseNamespaceSha256: journal.control.logicalDatabaseNamespaceSha256,
+        targetCount: journal.control.targetCount,
+        targetRootSha256: journal.control.targetRootSha256,
+        sealedTargetRootSha256:
+          RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(input.sealedTargets),
+        expectedEntryCount,
+        entryCount: 0,
+        entryRootSha256: RestoreJournal.EMPTY_TENANT_RESTORE_REPLAY_ENTRY_ROOT_SHA256,
+        fenceCount: 0,
+        fenceRootSha256: RestoreJournal.EMPTY_TENANT_RESTORE_FENCE_ROOT_SHA256,
+        phase: "prepared",
+        createdAtDbMs: nowMs,
+        updatedAtDbMs: nowMs,
+      };
+      RestoreJournal.validateTenantRestoreReplayRunRecord(run);
+      await conn.query(
+        `INSERT INTO tenant_restore_replay_runs
+           (restore_run_id,source_backup_sha256,runtime_epoch_sha256,protocol,
+            control_evidence_sha256,adapter_protocol,journal_namespace_sha256,
+            logical_database_namespace_sha256,target_count,target_root_sha256,
+            sealed_target_catalog_json,sealed_target_root_sha256,expected_entry_count,
+            entry_count,entry_root_sha256,fence_count,fence_root_sha256,phase,
+            created_at_db_ms,updated_at_db_ms,terminal_receipt_sha256,sealed_at_db_ms,
+            activated_at_db_ms,aborted_at_db_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?, ?,?,0,?,0,?,'prepared',?,?,NULL,NULL,NULL,NULL)`,
+        [
+          run.restoreRunId,
+          run.sourceBackupSha256,
+          run.runtimeEpochSha256,
+          run.protocol,
+          run.controlEvidenceSha256,
+          run.adapterProtocol,
+          run.journalNamespaceSha256,
+          run.logicalDatabaseNamespaceSha256,
+          run.targetCount,
+          run.targetRootSha256,
+          json(input.sealedTargets),
+          run.sealedTargetRootSha256,
+          run.expectedEntryCount,
+          run.entryRootSha256,
+          run.fenceRootSha256,
+          run.createdAtDbMs,
+          run.updatedAtDbMs,
+        ],
+      );
+      await conn.commit();
+      return run;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantRestoreReplayRun(
+    restoreRunId: string,
+  ): Promise<RestoreJournal.TenantRestoreReplayRunRecord | null> {
+    return this.withConsistentRead(async (conn) => {
+      const loaded = await this.loadTenantRestoreReplayRun(conn, restoreRunId);
+      if (!loaded) return null;
+      await this.loadTenantRestoreReplayEvidence(conn, loaded);
+      return loaded.run;
+    });
+  }
+
+  async getTenantRestoreReplaySealedTargets(
+    restoreRunId: string,
+  ): Promise<RestoreJournal.TenantRestoreReplaySealedTarget[]> {
+    return this.withConsistentRead(async (conn) => {
+      const loaded = await this.loadTenantRestoreReplayRun(conn, restoreRunId);
+      if (!loaded) return [];
+      return (await this.loadTenantRestoreReplayEvidence(conn, loaded)).targets;
+    });
+  }
+
+  async listTenantRestoreReplayEntries(
+    restoreRunId: string,
+    options: RestoreJournal.ListTenantRestoreReplayEntriesOptions,
+  ): Promise<RestoreJournal.TenantRestoreReplayEntry[]> {
+    if (Object.keys(options).some((key) => key !== "limit" && key !== "afterReplayOrdinal")
+      || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1_000
+      || (options.afterReplayOrdinal !== undefined
+        && (!Number.isSafeInteger(options.afterReplayOrdinal)
+          || options.afterReplayOrdinal < 0))) {
+      throw new Error("invalid tenant restore replay entry list options");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const loaded = await this.loadTenantRestoreReplayRun(conn, restoreRunId);
+      if (!loaded) return [];
+      const evidence = await this.loadTenantRestoreReplayEvidence(conn, loaded);
+      return evidence.entries
+        .filter((entry) => entry.replayOrdinal > (options.afterReplayOrdinal ?? 0))
+        .slice(0, options.limit);
+    });
+  }
+
+  async recordTenantRestoreReplayFence(
+    input: RestoreJournal.RecordTenantRestoreReplayFenceInput,
+  ): Promise<RestoreJournal.TenantRestoreReplayEntry | null> {
+    input = structuredClone(input);
+    RestoreJournal.validateRecordTenantRestoreReplayFenceInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const loaded = await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE");
+      if (!loaded || loaded.run.phase !== "prepared") {
+        await conn.commit();
+        return null;
+      }
+      const run = loaded.run;
+      const evidence = await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
+      const target = evidence.targets[input.targetOrdinal];
+      if (!target || target.targetOrdinal !== input.targetOrdinal
+        || input.remoteEntry.targetSha256 !== target.targetSha256
+        || input.remoteEntry.record.logicalDatabaseNamespaceSha256
+          !== run.logicalDatabaseNamespaceSha256
+        || input.remoteEntry.remoteSequence > target.sealedRemoteSequence) {
+        throw new TenantErasureIntegrityError();
+      }
+      const replayed = evidence.entries.find((entry) => entry.targetOrdinal === target.targetOrdinal
+        && entry.remoteSequence === input.remoteEntry.remoteSequence);
+      if (replayed) {
+        if (replayed.targetSha256 !== input.remoteEntry.targetSha256
+          || replayed.previousHeadRootSha256 !== input.remoteEntry.previousHeadRootSha256
+          || replayed.headRootSha256 !== input.remoteEntry.headRootSha256
+          || replayed.recordSha256 !== input.remoteEntry.record.recordSha256) {
+          throw new TenantErasureIntegrityError();
+        }
+        await conn.commit();
+        return replayed;
+      }
+      const targetEntries = evidence.entries.filter(
+        (entry) => entry.targetOrdinal === target.targetOrdinal,
+      );
+      const earlierIncomplete = evidence.targets.slice(0, target.targetOrdinal)
+        .some((candidate) => evidence.entries.filter(
+          (entry) => entry.targetOrdinal === candidate.targetOrdinal,
+        ).length !== candidate.sealedRemoteSequence);
+      const previousHeadRootSha256 = targetEntries.at(-1)?.headRootSha256
+        ?? RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256;
+      if (earlierIncomplete || input.remoteEntry.remoteSequence !== targetEntries.length + 1
+        || input.remoteEntry.previousHeadRootSha256 !== previousHeadRootSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const record = input.remoteEntry.record;
+      const [fenceRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_FENCE_COLUMNS}
+           FROM tenant_restore_fences
+          WHERE tenant_id=? FOR UPDATE`,
+        [record.tenantId],
+      );
+      const existingFence = fenceRows[0] ? rowToTenantRestoreFence(fenceRows[0]) : undefined;
+      const [conflictRows] = await conn.query<Row[]>(
+        `SELECT tenant_id FROM tenant_restore_fences
+          WHERE (BINARY request_id=BINARY ? OR BINARY operation_sha256=BINARY ?)
+            AND BINARY tenant_id<>BINARY ? LIMIT 1 FOR SHARE`,
+        [record.requestId, record.operationSha256, record.tenantId],
+      );
+      if (conflictRows[0]) throw new TenantErasureIntegrityError();
+      const nowMs = await this.databaseNow(conn);
+      let fence: RestoreJournal.TenantRestoreFence;
+      let fenceDisposition: RestoreJournal.TenantRestoreReplayFenceDisposition;
+      if (existingFence) {
+        if (existingFence.requestId !== record.requestId
+          || existingFence.subjectGeneration !== record.subjectGeneration
+          || existingFence.t1FenceSha256 !== record.t1FenceSha256
+          || existingFence.operationSha256 !== record.operationSha256
+          || existingFence.recordSha256 !== record.recordSha256
+          || existingFence.logicalDatabaseNamespaceSha256
+            !== record.logicalDatabaseNamespaceSha256) {
+          throw new TenantErasureIntegrityError();
+        }
+        fence = existingFence;
+        fenceDisposition = "exact_replay";
+      } else {
+        const body = {
+          scope: RestoreJournal.TENANT_RESTORE_FENCE_SCOPE,
+          logicalDatabaseNamespaceSha256: record.logicalDatabaseNamespaceSha256,
+          requestId: record.requestId,
+          tenantId: record.tenantId,
+          subjectGeneration: record.subjectGeneration,
+          t1FenceSha256: record.t1FenceSha256,
+          operationSha256: record.operationSha256,
+          recordSha256: record.recordSha256,
+          restoreRunId: run.restoreRunId,
+          sourceTargetSha256: target.targetSha256,
+          sourceRemoteSequence: input.remoteEntry.remoteSequence,
+          sourceHeadRootSha256: input.remoteEntry.headRootSha256,
+          installedAtDbMs: nowMs,
+        };
+        fence = {
+          ...body,
+          fenceSha256: RestoreJournal.tenantRestoreFenceSha256(body),
+        };
+        RestoreJournal.validateTenantRestoreFence(fence);
+        fenceDisposition = "installed";
+        await conn.query(
+          `INSERT INTO tenant_restore_fences
+             (tenant_id,scope,logical_database_namespace_sha256,request_id,subject_generation,
+              t1_fence_sha256,operation_sha256,record_sha256,restore_run_id,
+              source_target_sha256,source_remote_sequence,source_head_root_sha256,
+              installed_at_db_ms,fence_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            fence.tenantId,
+            fence.scope,
+            fence.logicalDatabaseNamespaceSha256,
+            fence.requestId,
+            fence.subjectGeneration,
+            fence.t1FenceSha256,
+            fence.operationSha256,
+            fence.recordSha256,
+            fence.restoreRunId,
+            fence.sourceTargetSha256,
+            fence.sourceRemoteSequence,
+            fence.sourceHeadRootSha256,
+            fence.installedAtDbMs,
+            fence.fenceSha256,
+          ],
+        );
+      }
+      const entryBody = {
+        scope: RestoreJournal.TENANT_RESTORE_REPLAY_ENTRY_SCOPE,
+        restoreRunId: run.restoreRunId,
+        replayOrdinal: run.entryCount + 1,
+        targetOrdinal: target.targetOrdinal,
+        targetSha256: target.targetSha256,
+        remoteSequence: input.remoteEntry.remoteSequence,
+        previousHeadRootSha256: input.remoteEntry.previousHeadRootSha256,
+        headRootSha256: input.remoteEntry.headRootSha256,
+        logicalDatabaseNamespaceSha256: record.logicalDatabaseNamespaceSha256,
+        requestId: record.requestId,
+        tenantId: record.tenantId,
+        subjectGeneration: record.subjectGeneration,
+        t1FenceSha256: record.t1FenceSha256,
+        operationSha256: record.operationSha256,
+        recordSha256: record.recordSha256,
+        fenceDisposition,
+        fenceSha256: fence.fenceSha256,
+        previousEntryRootSha256: run.entryRootSha256,
+        storeDbTimestampMs: nowMs,
+      };
+      const entry: RestoreJournal.TenantRestoreReplayEntry = {
+        ...entryBody,
+        entrySha256: RestoreJournal.tenantRestoreReplayEntrySha256(entryBody),
+      };
+      const nextEntries = [...evidence.entries, entry];
+      const fenceMap = new Map(evidence.fences.map((candidate) => [candidate.tenantId, candidate]));
+      fenceMap.set(fence.tenantId, fence);
+      const nextFences = [...fenceMap.values()]
+        .sort((left, right) => left.tenantId.localeCompare(right.tenantId));
+      await conn.query(
+        `INSERT INTO tenant_restore_replay_entries
+           (restore_run_id,replay_ordinal,scope,target_ordinal,target_sha256,remote_sequence,
+            previous_head_root_sha256,head_root_sha256,logical_database_namespace_sha256,
+            request_id,tenant_id,subject_generation,t1_fence_sha256,operation_sha256,
+            record_sha256,fence_disposition,fence_sha256,previous_entry_root_sha256,
+            store_db_timestamp_ms,entry_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          entry.restoreRunId,
+          entry.replayOrdinal,
+          entry.scope,
+          entry.targetOrdinal,
+          entry.targetSha256,
+          entry.remoteSequence,
+          entry.previousHeadRootSha256,
+          entry.headRootSha256,
+          entry.logicalDatabaseNamespaceSha256,
+          entry.requestId,
+          entry.tenantId,
+          entry.subjectGeneration,
+          entry.t1FenceSha256,
+          entry.operationSha256,
+          entry.recordSha256,
+          entry.fenceDisposition,
+          entry.fenceSha256,
+          entry.previousEntryRootSha256,
+          entry.storeDbTimestampMs,
+          entry.entrySha256,
+        ],
+      );
+      await conn.query(
+        `UPDATE tenant_restore_replay_runs
+            SET entry_count=?, entry_root_sha256=?, fence_count=?, fence_root_sha256=?,
+                updated_at_db_ms=?
+          WHERE restore_run_id=? AND phase='prepared' AND entry_count=?`,
+        [
+          nextEntries.length,
+          RestoreJournal.tenantRestoreReplayEntryRootSha256(nextEntries),
+          nextFences.length,
+          RestoreJournal.tenantRestoreFenceRootSha256(nextFences),
+          Math.max(run.updatedAtDbMs, nowMs),
+          run.restoreRunId,
+          run.entryCount,
+        ],
+      );
+      await conn.commit();
+      return entry;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async sealTenantRestoreReplay(
+    restoreRunId: string,
+  ): Promise<RestoreJournal.TenantRestoreReplayReceipt | null> {
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const loaded = await this.loadTenantRestoreReplayRun(conn, restoreRunId, "FOR UPDATE");
+      if (!loaded) {
+        await conn.commit();
+        return null;
+      }
+      const evidence = await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
+      if (loaded.run.phase === "replay_sealed" || loaded.run.phase === "active") {
+        await conn.commit();
+        return evidence.receipt ?? null;
+      }
+      if (loaded.run.phase !== "prepared"
+        || loaded.run.entryCount !== loaded.run.expectedEntryCount) {
+        await conn.commit();
+        return null;
+      }
+      const nowMs = await this.databaseNow(conn);
+      const body = {
+        scope: RestoreJournal.TENANT_RESTORE_REPLAY_RECEIPT_SCOPE,
+        restoreRunId: loaded.run.restoreRunId,
+        sourceBackupSha256: loaded.run.sourceBackupSha256,
+        runtimeEpochSha256: loaded.run.runtimeEpochSha256,
+        controlEvidenceSha256: loaded.run.controlEvidenceSha256,
+        protocol: loaded.run.protocol,
+        adapterProtocol: loaded.run.adapterProtocol,
+        journalNamespaceSha256: loaded.run.journalNamespaceSha256,
+        logicalDatabaseNamespaceSha256: loaded.run.logicalDatabaseNamespaceSha256,
+        targetCount: loaded.run.targetCount,
+        targetRootSha256: loaded.run.targetRootSha256,
+        sealedTargetRootSha256: loaded.run.sealedTargetRootSha256,
+        entryCount: evidence.entries.length,
+        entryRootSha256: loaded.run.entryRootSha256,
+        fenceCount: evidence.fences.length,
+        fenceRootSha256: loaded.run.fenceRootSha256,
+        storeDbTimestampMs: nowMs,
+        restoreFenceReplayComplete: true as const,
+        physicalReplayComplete: false as const,
+        allDomainsComplete: false as const,
+        contentPurgeExecuted: false as const,
+      };
+      const receipt: RestoreJournal.TenantRestoreReplayReceipt = {
+        ...body,
+        receiptSha256: RestoreJournal.tenantRestoreReplayReceiptSha256(body),
+      };
+      await conn.query(
+        `UPDATE tenant_restore_replay_runs
+            SET phase='replay_sealed', terminal_receipt_sha256=?, sealed_at_db_ms=?,
+                updated_at_db_ms=?
+          WHERE restore_run_id=? AND phase='prepared' AND entry_count=expected_entry_count`,
+        [receipt.receiptSha256, nowMs, Math.max(loaded.run.updatedAtDbMs, nowMs), restoreRunId],
+      );
+      await conn.commit();
+      return receipt;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async abortTenantRestoreReplay(restoreRunId: string): Promise<boolean> {
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const loaded = await this.loadTenantRestoreReplayRun(conn, restoreRunId, "FOR UPDATE");
+      if (!loaded || loaded.run.phase !== "prepared") {
+        await conn.commit();
+        return false;
+      }
+      await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
+      const nowMs = await this.databaseNow(conn);
+      await conn.query(
+        `UPDATE tenant_restore_replay_runs
+            SET phase='aborted', aborted_at_db_ms=?, updated_at_db_ms=?
+          WHERE restore_run_id=? AND phase='prepared'`,
+        [nowMs, Math.max(loaded.run.updatedAtDbMs, nowMs), restoreRunId],
+      );
+      await conn.commit();
+      return true;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantRestoreReplayReceipt(
+    restoreRunId: string,
+  ): Promise<RestoreJournal.TenantRestoreReplayReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const loaded = await this.loadTenantRestoreReplayRun(conn, restoreRunId);
+      if (!loaded || (loaded.run.phase !== "replay_sealed" && loaded.run.phase !== "active")) {
+        return null;
+      }
+      return (await this.loadTenantRestoreReplayEvidence(conn, loaded)).receipt ?? null;
+    });
+  }
+
+  async activateTenantRestoreRuntime(
+    input: RestoreJournal.ActivateTenantRestoreRuntimeInput,
+  ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
+    input = structuredClone(input);
+    RestoreJournal.validateActivateTenantRestoreRuntimeInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const loaded = await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE");
+      if (!loaded || (loaded.run.phase !== "replay_sealed" && loaded.run.phase !== "active")) {
+        throw new TenantErasureIntegrityError();
+      }
+      const evidence = await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
+      const receipt = evidence.receipt;
+      if (!receipt) throw new TenantErasureIntegrityError();
+      // Validate the complete pre-existing primary/restore projection before it can become the
+      // predecessor of a new restore epoch. A torn control/head/event chain must not be laundered
+      // into a valid-looking restore activation merely because its mutable control row still has
+      // the expected generation.
+      const projection = await this.assertTenantRestoreRuntimeProjection(conn, "FOR UPDATE");
+      const current = projection.control;
+      const heads = projection.heads;
+      if (current.state === "active" && current.lineageKind === "restore"
+        && current.restoreRunId === loaded.run.restoreRunId
+        && current.replayReceiptSha256 === receipt.receiptSha256
+        && current.runtimeEpochSha256 === loaded.run.runtimeEpochSha256) {
+        if (loaded.run.phase !== "active") throw new TenantErasureIntegrityError();
+        if (projection.control.state !== "active"
+          || projection.control.evidenceSha256 !== current.evidenceSha256
+          || projection.control.controlEvidenceSha256 !== loaded.run.controlEvidenceSha256
+          || projection.control.logicalDatabaseNamespaceSha256
+            !== loaded.run.logicalDatabaseNamespaceSha256
+          || projection.control.targetCount !== loaded.run.targetCount
+          || projection.control.targetRootSha256 !== loaded.run.targetRootSha256
+          || projection.control.verifiedHeadRootSha256 !== loaded.run.sealedTargetRootSha256
+          || projection.heads.length !== evidence.targets.length
+          || projection.heads.some((head, ordinal) => {
+            const target = evidence.targets[ordinal];
+            return !target || head.targetOrdinal !== target.targetOrdinal
+              || head.targetSha256 !== target.targetSha256
+              || head.failureDomainSha256 !== target.failureDomainSha256
+              || head.adapterProtocol !== target.adapterProtocol
+              || head.journalNamespaceSha256 !== target.journalNamespaceSha256
+              || head.logicalDatabaseNamespaceSha256
+                !== target.logicalDatabaseNamespaceSha256
+              || head.sealedRemoteSequence !== target.sealedRemoteSequence
+              || head.sealedHeadRootSha256 !== target.sealedHeadRootSha256;
+          })) {
+          throw new TenantErasureIntegrityError();
+        }
+        await conn.commit();
+        return projection.control;
+      }
+      if (loaded.run.phase !== "replay_sealed"
+        || current.controlGeneration !== input.expectedControlGeneration
+        || current.state !== "active"
+        || current.runtimeEpochSha256 === loaded.run.runtimeEpochSha256
+        || heads.length !== evidence.targets.length) {
+        throw new TenantErasureIntegrityError();
+      }
+      const [epochRows] = await conn.query<Row[]>(
+        `SELECT control_generation FROM tenant_restore_runtime_events
+          WHERE activation_epoch_sha256=? LIMIT 1 FOR SHARE`,
+        [loaded.run.runtimeEpochSha256],
+      );
+      if (epochRows[0]) throw new TenantErasureIntegrityError();
+      const nowMs = await this.databaseNow(conn);
+      const body = {
+        singletonId: 1 as const,
+        state: "active" as const,
+        controlGeneration: current.controlGeneration + 1,
+        updateKind: "restore_activation" as const,
+        activatedAtDbMs: nowMs,
+        updatedAtDbMs: nowMs,
+        lineageKind: "restore" as const,
+        restoreRunId: loaded.run.restoreRunId,
+        replayReceiptSha256: receipt.receiptSha256,
+        runtimeEpochSha256: loaded.run.runtimeEpochSha256,
+        controlEvidenceSha256: loaded.run.controlEvidenceSha256,
+        logicalDatabaseNamespaceSha256: loaded.run.logicalDatabaseNamespaceSha256,
+        targetCount: loaded.run.targetCount,
+        targetRootSha256: loaded.run.targetRootSha256,
+        verifiedHeadRootSha256: loaded.run.sealedTargetRootSha256,
+        previousControlEvidenceSha256: current.evidenceSha256,
+      };
+      const activated: Extract<
+        RestoreJournal.TenantRestoreRuntimeControlRecord,
+        { state: "active" }
+      > = {
+        ...body,
+        evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(body),
+      };
+      RestoreJournal.validateTenantRestoreRuntimeControlRecord(activated);
+      for (const target of evidence.targets) {
+        const prior = heads[target.targetOrdinal];
+        if (!prior || prior.targetSha256 !== target.targetSha256
+          || prior.failureDomainSha256 !== target.failureDomainSha256
+          || prior.adapterProtocol !== target.adapterProtocol
+          || prior.journalNamespaceSha256 !== target.journalNamespaceSha256
+          || prior.logicalDatabaseNamespaceSha256 !== target.logicalDatabaseNamespaceSha256) {
+          throw new TenantErasureIntegrityError();
+        }
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_restore_runtime_heads
+              SET remote_sequence=?, head_root_sha256=?, checkpoint_control_generation=?,
+                  runtime_epoch_sha256=?, updated_at_db_ms=?
+            WHERE singleton_id=1 AND target_ordinal=? AND target_sha256=?`,
+          [
+            target.sealedRemoteSequence,
+            target.sealedHeadRootSha256,
+            activated.controlGeneration,
+            activated.runtimeEpochSha256,
+            nowMs,
+            target.targetOrdinal,
+            target.targetSha256,
+          ],
+        );
+        if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      }
+      await conn.query(
+        `INSERT INTO tenant_restore_runtime_events
+           (singleton_id,control_generation,update_kind,lineage_kind,activated_at_db_ms,
+            updated_at_db_ms,restore_run_id,replay_receipt_sha256,runtime_epoch_sha256,
+            activation_epoch_sha256,control_evidence_sha256,
+            logical_database_namespace_sha256,target_count,target_root_sha256,
+            verified_head_root_sha256,previous_control_evidence_sha256,evidence_sha256)
+         VALUES (1,?,'restore_activation','restore',?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          activated.controlGeneration,
+          activated.activatedAtDbMs,
+          activated.updatedAtDbMs,
+          activated.restoreRunId,
+          activated.replayReceiptSha256,
+          activated.runtimeEpochSha256,
+          activated.runtimeEpochSha256,
+          activated.controlEvidenceSha256,
+          activated.logicalDatabaseNamespaceSha256,
+          activated.targetCount,
+          activated.targetRootSha256,
+          activated.verifiedHeadRootSha256,
+          activated.previousControlEvidenceSha256,
+          activated.evidenceSha256,
+        ],
+      );
+      const [controlUpdate] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_restore_runtime_control
+            SET control_generation=?, update_kind='restore_activation', lineage_kind='restore',
+                activated_at_db_ms=?, updated_at_db_ms=?, restore_run_id=?,
+                replay_receipt_sha256=?, runtime_epoch_sha256=?, control_evidence_sha256=?,
+                logical_database_namespace_sha256=?, target_count=?, target_root_sha256=?,
+                verified_head_root_sha256=?, previous_control_evidence_sha256=?, evidence_sha256=?
+          WHERE singleton_id=1 AND state='active' AND control_generation=? AND evidence_sha256=?`,
+        [
+          activated.controlGeneration,
+          activated.activatedAtDbMs,
+          activated.updatedAtDbMs,
+          activated.restoreRunId,
+          activated.replayReceiptSha256,
+          activated.runtimeEpochSha256,
+          activated.controlEvidenceSha256,
+          activated.logicalDatabaseNamespaceSha256,
+          activated.targetCount,
+          activated.targetRootSha256,
+          activated.verifiedHeadRootSha256,
+          activated.previousControlEvidenceSha256,
+          activated.evidenceSha256,
+          current.controlGeneration,
+          current.evidenceSha256,
+        ],
+      );
+      if (controlUpdate.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      await conn.query(
+        `UPDATE tenant_restore_replay_runs
+            SET phase='active', activated_at_db_ms=?, updated_at_db_ms=?
+          WHERE restore_run_id=? AND phase='replay_sealed'`,
+        [nowMs, Math.max(loaded.run.updatedAtDbMs, nowMs), loaded.run.restoreRunId],
+      );
+      await conn.commit();
+      return activated;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantRestoreRuntimeControl(
+  ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.assertTenantRestoreRuntimeProjection(conn)).control
+    ));
+  }
+
+  async getTenantRestoreRuntimeHeads(
+  ): Promise<RestoreJournal.TenantRestoreReplaySealedTarget[]> {
+    return this.withConsistentRead(async (conn) => {
+      const projection = await this.assertTenantRestoreRuntimeProjection(conn);
+      return projection.control.state === "inactive" ? [] : projection.heads;
+    });
+  }
+
+  private async loadTenantRestoreFence(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<RestoreJournal.TenantRestoreFence | null> {
+    if (!this.tenantRestoreJournalSchemaInstalled) return null;
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_FENCE_COLUMNS}
+         FROM tenant_restore_fences
+        WHERE tenant_id=? ${lock}`,
+      [tenantId],
+    );
+    if (!rows[0]) return null;
+    try {
+      const fence = rowToTenantRestoreFence(rows[0]);
+      return fence.tenantId === tenantId ? fence : null;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async getTenantRestoreFence(tenantId: string): Promise<RestoreJournal.TenantRestoreFence | null> {
+    if (!tenantId || tenantId.length > 128) throw new Error("invalid tenant id");
+    return this.withConsistentRead((conn) => this.loadTenantRestoreFence(conn, tenantId));
+  }
+
+  async listTenantRestoreFences(
+    options: RestoreJournal.ListTenantRestoreFencesOptions,
+  ): Promise<RestoreJournal.TenantRestoreFence[]> {
+    const keys = Object.keys(options).sort();
+    const expected = options.afterTenantId === undefined ? ["limit"] : ["afterTenantId", "limit"];
+    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])
+      || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1_000
+      || (options.afterTenantId !== undefined
+        && (!options.afterTenantId || options.afterTenantId.length > 128))) {
+      throw new Error("invalid tenant restore fence list options");
+    }
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT ${TENANT_RESTORE_FENCE_COLUMNS}
+         FROM tenant_restore_fences
+        WHERE tenant_id>?
+        ORDER BY tenant_id LIMIT ?`,
+      [options.afterTenantId ?? "", options.limit],
+    );
+    try {
+      return rows.map(rowToTenantRestoreFence);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async assertTenantRestoreRuntimeJournalEntryKnown(
+    input: RestoreJournal.AssertTenantRestoreRuntimeJournalEntryKnownInput,
+  ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
+    input = structuredClone(input);
+    RestoreJournal.validateAssertTenantRestoreRuntimeJournalEntryKnownInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      if (journal.control.controlGeneration !== 1
+        || journal.control.evidenceSha256 !== input.controlEvidenceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      // Pre-lock and validate the immutable local source before taking the mutable runtime row.
+      // ACK publication takes publication job/evidence -> runtime in the same order; doing this
+      // lookup only from inside head advancement would invert those locks and deadlock a startup
+      // preflight racing an ACK commit.
+      if (!await this.tenantRestoreRuntimeEntryIsLocallyKnown(
+        conn,
+        input.targetOrdinal,
+        input.remoteEntry,
+      )) {
+        throw new TenantErasureIntegrityError();
+      }
+      const current = await this.loadTenantRestoreRuntimeControl(conn, "FOR UPDATE");
+      if (current.state !== "active"
+        || current.runtimeEpochSha256 !== input.runtimeEpochSha256
+        || current.controlEvidenceSha256 !== input.controlEvidenceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const next = await this.advanceTenantRestoreRuntimeHeadInTransaction(
+        conn,
+        input.targetOrdinal,
+        input.remoteEntry,
+        input.expectedControlGeneration,
+      );
+      await conn.commit();
+      return next;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async assertTenantRestoreRuntimeReady(
+    input: RestoreJournal.AssertTenantRestoreRuntimeReadyInput,
+  ): Promise<void> {
+    input = structuredClone(input);
+    RestoreJournal.validateAssertTenantRestoreRuntimeReadyInput(input);
+    await this.withConsistentRead(async (conn) => {
+      const projection = await this.assertTenantRestoreRuntimeProjection(conn);
+      if (projection.control.state !== "active"
+        || projection.control.runtimeEpochSha256 !== input.runtimeEpochSha256
+        || projection.control.controlEvidenceSha256 !== input.controlEvidenceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const [pendingRows] = await conn.query<Row[]>(
+        `SELECT restore_run_id FROM tenant_restore_replay_runs
+          WHERE phase IN ('prepared','replay_sealed') LIMIT 1`,
+      );
+      if (pendingRows[0] || projection.heads.length !== input.observedHeads.length
+        || RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(input.observedHeads)
+          !== projection.control.verifiedHeadRootSha256
+        || projection.heads.some((head, ordinal) => {
+          const observed = input.observedHeads[ordinal];
+          return !observed || observed.targetOrdinal !== head.targetOrdinal
+            || observed.targetSha256 !== head.targetSha256
+            || observed.failureDomainSha256 !== head.failureDomainSha256
+            || observed.adapterProtocol !== head.adapterProtocol
+            || observed.journalNamespaceSha256 !== head.journalNamespaceSha256
+            || observed.logicalDatabaseNamespaceSha256
+              !== head.logicalDatabaseNamespaceSha256
+            || observed.sealedRemoteSequence !== head.sealedRemoteSequence
+            || observed.sealedHeadRootSha256 !== head.sealedHeadRootSha256;
+        })) {
+        throw new TenantErasureIntegrityError();
+      }
+      const [fenceRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_FENCE_COLUMNS} FROM tenant_restore_fences ORDER BY tenant_id`,
+      );
+      try {
+        fenceRows.map(rowToTenantRestoreFence);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    });
+  }
+
   // ---------- user data export ----------
   private async databaseNow(executor: Pool | PoolConnection): Promise<number> {
     const [rows] = await executor.query<Row[]>(
@@ -34090,6 +37655,11 @@ export class MysqlSessionStore implements
       undefined,
       "FOR SHARE",
     );
+    const tenantRestoreFence = await this.loadTenantRestoreFence(
+      conn,
+      tenantId,
+      "FOR SHARE",
+    );
     const [userRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
          FROM subject_lifecycle
@@ -34101,7 +37671,8 @@ export class MysqlSessionStore implements
     if (!tenant || !user) throw new UserDataExportIntegrityError("data export subject gate is missing");
     const tenantBlocked = tenant.state !== "active"
       || tenantAdmission !== null
-      || tenantFence !== null;
+      || tenantFence !== null
+      || tenantRestoreFence !== null;
     if (options.requireActive && (
       tenantBlocked
       || user.state !== "active"
@@ -34825,6 +38396,28 @@ export class MysqlSessionStore implements
     try {
       await conn.beginTransaction();
       const now = await this.userExportDatabaseNow(conn);
+      // Resolve the immutable lease owner without taking a row lock, then acquire the canonical
+      // tenant -> erasure/fence -> user lock chain before touching the lease. This makes a restore
+      // fence revoke download renewal and closes the race with concurrent fence replay without
+      // introducing a lease -> subject lock-order inversion.
+      const [ownerRows] = await conn.query<Row[]>(
+        `SELECT tenant_id, user_id
+           FROM user_export_download_leases
+          WHERE artifact_id=? AND lease_token=?`,
+        [artifactId, leaseToken],
+      );
+      const owner = ownerRows[0];
+      if (!owner) {
+        await conn.commit();
+        return false;
+      }
+      await this.lockUserExportSubject(
+        conn,
+        String(owner.tenant_id),
+        String(owner.user_id),
+        now,
+        { userLock: "FOR SHARE", requireActive: true },
+      );
       const [rows] = await conn.query<Row[]>(
         `SELECT l.lease_until_ms, l.created_at_ms, l.artifact_deletion_generation,
                 a.state, a.deletion_generation
@@ -34874,6 +38467,7 @@ export class MysqlSessionStore implements
       return true;
     } catch (error) {
       await conn.rollback().catch(() => {});
+      if (error instanceof SubjectDeletingError) return false;
       throw error;
     } finally {
       conn.release();
@@ -34906,6 +38500,9 @@ export class MysqlSessionStore implements
           AND ul.generation=j.subject_generation
         WHERE j.status IN ('queued','building')
           AND r.status IN ('queued','building')
+          ${this.tenantRestoreJournalSchemaInstalled ? `AND NOT EXISTS (
+            SELECT 1 FROM tenant_restore_fences rf WHERE rf.tenant_id=j.tenant_id
+          )` : ""}
           AND ((j.status='queued' AND j.available_at_ms IS NOT NULL
                 AND j.available_at_ms<=? AND j.claim_token IS NULL
                 AND j.lease_until_ms IS NULL)

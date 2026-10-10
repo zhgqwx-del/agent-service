@@ -13,6 +13,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
@@ -552,6 +553,149 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.allConfiguredSupportTenantCredentialTargetExecution()).toBe(false);
     expect(registry.allConfiguredSupportTenantCredentialTargetExecutionWorker()).toBe(false);
     await registry.close();
+  });
+
+  it("requires every configured runner to match the restore-journal target identity", async () => {
+    const namespaceSha256 = "a".repeat(64);
+    const targetRootSha256 = "b".repeat(64);
+    const runtimeEpochSha256 = "c".repeat(64);
+    let legacyState:
+      | "down"
+      | "legacy"
+      | "namespace-mismatch"
+      | "target-mismatch"
+      | "epoch-mismatch"
+      | "code-only"
+      | "active" = "down";
+    const capabilities = (
+      aware: boolean,
+      worker: boolean,
+      namespace = namespaceSha256,
+      targetRoot = targetRootSha256,
+      runtimeEpoch = runtimeEpochSha256,
+    ) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        tenantRestoreJournal: aware ? [TENANT_RESTORE_JOURNAL_INDEPENDENT_V1] : [],
+        tenantRestoreJournalWorker: worker,
+        tenantRestoreJournalNamespaceSha256: aware ? namespace : null,
+        tenantRestoreJournalTargetRootSha256: aware ? targetRoot : null,
+        tenantRestoreRuntimeEpochSha256: aware ? runtimeEpoch : null,
+        dataPurgeExecution: false,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    const fetchMock = vi.fn(async (
+      input: string | URL | Request,
+      _init?: RequestInit,
+    ) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        if (legacyState === "legacy") return Response.json(capabilities(false, false));
+        if (legacyState === "namespace-mismatch") {
+          return Response.json(capabilities(true, true, "c".repeat(64), targetRootSha256));
+        }
+        if (legacyState === "target-mismatch") {
+          return Response.json(capabilities(
+            true,
+            true,
+            namespaceSha256,
+            "d".repeat(64),
+          ));
+        }
+        if (legacyState === "epoch-mismatch") {
+          return Response.json(capabilities(
+            true,
+            true,
+            namespaceSha256,
+            targetRootSha256,
+            "e".repeat(64),
+          ));
+        }
+        return Response.json(capabilities(
+          legacyState === "code-only" || legacyState === "active",
+          legacyState === "active",
+        ));
+      }
+      return new Response("not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      restoreJournalNamespaceSha256: namespaceSha256,
+      restoreJournalTargetRootSha256: targetRootSha256,
+      restoreRuntimeEpochSha256: runtimeEpochSha256,
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allConfiguredSupportTenantRestoreJournal()).toBe(false);
+    expect(registry.allConfiguredSupportTenantRestoreJournalWorker()).toBe(false);
+
+    for (const state of [
+      "legacy",
+      "namespace-mismatch",
+      "target-mismatch",
+      "epoch-mismatch",
+    ] as const) {
+      legacyState = state;
+      await registry.refresh();
+      expect(registry.allConfiguredSupportTenantRestoreJournal(), state).toBe(false);
+      expect(registry.allConfiguredSupportTenantRestoreJournalWorker(), state).toBe(false);
+      expect(registry.list().find((target) => target.url === "http://legacy")?.healthy, state)
+        .toBe(false);
+      expect(registry.routeableUrl("legacy"), state).toBeUndefined();
+      expect(registry.anyHealthy(), state).toBe("http://current");
+    }
+    legacyState = "code-only";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantRestoreJournal()).toBe(true);
+    expect(registry.allConfiguredSupportTenantRestoreJournalWorker()).toBe(false);
+    legacyState = "active";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantRestoreJournal()).toBe(true);
+    expect(registry.allConfiguredSupportTenantRestoreJournalWorker()).toBe(true);
+    legacyState = "down";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantRestoreJournal()).toBe(false);
+    await registry.close();
+
+    // A router which has not entered this rollout accepts old and new runners for ordinary traffic,
+    // but it cannot emit restore-journal authority without an explicit expected fleet identity.
+    legacyState = "legacy";
+    const unconfigured = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      healthIntervalMs: 60_000,
+    });
+    unconfigured.start();
+    await unconfigured.waitForFirstProbe();
+    expect(unconfigured.list().every((target) => target.healthy)).toBe(true);
+    expect(unconfigured.allConfiguredSupportTenantRestoreJournal()).toBe(false);
+    expect(unconfigured.allConfiguredSupportTenantRestoreJournalWorker()).toBe(false);
+    await unconfigured.close();
+
+    expect(fetchMock.mock.calls.every((call) => (
+      (call[1] as RequestInit | undefined)?.redirect === "manual"
+    ))).toBe(true);
   });
 
   it("requires every configured runner to be freshly healthy, T3e-aware, and worker-active", async () => {

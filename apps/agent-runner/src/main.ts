@@ -18,6 +18,7 @@ import {
   TenantCredentialTargetExecutionWorker,
   TenantDatabasePurgeWorker,
   TenantRedisPurgeWorker,
+  TenantRestoreJournalPublicationWorker,
   TenantPurgeExecutionWorker,
   TenantPurgePlanWorker,
   TenantRuntimeCoordinator,
@@ -54,11 +55,13 @@ import {
   type LifecycleOutboxStore,
   type LegacyTombstoneCompensationStore,
   type RetentionPolicyStore,
+  type RestoreReplayStore,
   type SubjectLifecycleStore,
   type TenantCredentialRevocationStore,
   type TenantCredentialTargetExecutionStore,
   type TenantDatabasePurgeStore,
   type TenantRedisPurgeStore,
+  type TenantRestoreJournalStore,
   type TenantContentInventoryStore,
   type TenantPurgeExecutionStore,
   type TenantPurgePlanStore,
@@ -83,6 +86,15 @@ import { RouterTenantCredentialRevocationGate } from "./tenant-credential-revoca
 import { RouterTenantCredentialTargetExecutionGate } from "./tenant-credential-target-execution-gate.js";
 import { RouterTenantDatabasePurgeGate } from "./tenant-database-purge-gate.js";
 import { RouterTenantRedisPurgeGate } from "./tenant-redis-purge-gate.js";
+import {
+  createTenantRestoreJournalAdapters,
+} from "./tenant-restore-journal-config.js";
+import { RouterTenantRestoreJournalGate } from "./tenant-restore-journal-gate.js";
+import {
+  TenantRestoreJournalPreflightError,
+  reconcileTenantRestoreJournalRuntimeForStartup,
+  type TenantRestoreJournalPreflightSummary,
+} from "./tenant-restore-journal-preflight.js";
 import { RouterTenantPurgeExecutionGate } from "./tenant-purge-execution-gate.js";
 import { RouterTenantRuntimeDrainClient } from "./tenant-runtime-drain-client.js";
 import { LocalTenantRuntimeDrain } from "./tenant-runtime-local-drain.js";
@@ -103,6 +115,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & TenantCredentialTargetExecutionStore
     & TenantDatabasePurgeStore
     & TenantRedisPurgeStore
+    & TenantRestoreJournalStore
+    & RestoreReplayStore
     & TenantContentInventoryStore
     & TenantPurgeExecutionStore
     & TenantPurgePlanStore
@@ -125,6 +139,74 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         : { tenantRedisPurgeNamespaceSha256: redisNamespaceSha256 }),
     })
     : new MemorySessionStore();
+
+  let tenantRestoreJournalWorker: TenantRestoreJournalPublicationWorker | undefined;
+  let tenantRestoreJournalGate: RouterTenantRestoreJournalGate | undefined;
+  let tenantRestoreJournalPreflight: TenantRestoreJournalPreflightSummary | undefined;
+  let tenantRestoreJournalAdapters: ReturnType<typeof createTenantRestoreJournalAdapters> = [];
+  let tenantRestoreJournalClosePromise: Promise<void> | undefined;
+  const closeTenantRestoreJournal = (): Promise<void> => {
+    if (tenantRestoreJournalClosePromise) return tenantRestoreJournalClosePromise;
+    tenantRestoreJournalClosePromise = tenantRestoreJournalWorker !== undefined
+      ? tenantRestoreJournalWorker.stop()
+      : Promise.allSettled(tenantRestoreJournalAdapters.map((adapter) => adapter.close()))
+        .then(() => {});
+    return tenantRestoreJournalClosePromise;
+  };
+  const workerRequiredError = new Error(
+    "TENANT_RESTORE_JOURNAL_WORKER_ENABLED=1 is required after durable restore journal activation",
+  );
+  try {
+    tenantRestoreJournalAdapters = cfg.tenantRestoreJournal === undefined
+      ? []
+      : createTenantRestoreJournalAdapters(cfg.tenantRestoreJournal);
+    tenantRestoreJournalPreflight = await reconcileTenantRestoreJournalRuntimeForStartup({
+      store,
+      ...(cfg.tenantRestoreJournal === undefined
+        ? {}
+        : {
+            config: cfg.tenantRestoreJournal,
+            adapters: tenantRestoreJournalAdapters,
+          }),
+    });
+    if (tenantRestoreJournalPreflight.state === "ready"
+      && !cfg.TENANT_RESTORE_JOURNAL_WORKER_ENABLED) {
+      throw workerRequiredError;
+    }
+    if (cfg.TENANT_RESTORE_JOURNAL_WORKER_ENABLED) {
+      tenantRestoreJournalGate = new RouterTenantRestoreJournalGate({
+        routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+        internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+        requestTimeoutMs: cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS,
+      });
+      tenantRestoreJournalWorker = new TenantRestoreJournalPublicationWorker({
+        store,
+        adapters: tenantRestoreJournalAdapters,
+        canExecute: () => tenantRestoreJournalGate!.canExecute(),
+      }, {
+        pollIntervalMs: cfg.TENANT_RESTORE_JOURNAL_WORKER_POLL_MS,
+        leaseMs: cfg.TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS,
+        batchSize: cfg.TENANT_RESTORE_JOURNAL_WORKER_BATCH_SIZE,
+        materializeBatchSize: cfg.TENANT_RESTORE_JOURNAL_MATERIALIZE_BATCH_SIZE,
+        retryBaseMs: cfg.TENANT_RESTORE_JOURNAL_RETRY_BASE_MS,
+        retryMaxMs: cfg.TENANT_RESTORE_JOURNAL_RETRY_MAX_MS,
+      });
+    } else {
+      // A dormant configuration is still validated by preflight, then releases its remote client
+      // before unrelated runtime initialization begins.
+      await closeTenantRestoreJournal();
+      tenantRestoreJournalAdapters = [];
+    }
+  } catch (error) {
+    await closeTenantRestoreJournal();
+    await store.close().catch(() => {});
+    if (error instanceof TenantRestoreJournalPreflightError || error === workerRequiredError) {
+      throw error;
+    }
+    throw new Error("tenant restore journal startup failed");
+  }
+
+  try {
   if (cfg.STORE === "mysql") {
     try {
       // The offline mover owns the whole Blob namespace while active. Read its durable control
@@ -629,6 +711,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   dataExportWorker?.start();
   dataExportCleanup?.start();
   tenantCredentialRevocationWorker?.start();
+  tenantRestoreJournalWorker?.start();
   tenantCredentialTargetExecutionWorker?.start();
   tenantContentInventoryWorker?.start();
   tenantPurgePlanWorker?.start();
@@ -669,6 +752,24 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       credentialTargetExecutionAdapter !== undefined,
     tenantCredentialTargetExecutionWorkerEnabled:
       tenantCredentialTargetExecutionWorker !== undefined,
+    tenantRestoreJournalSupported: cfg.tenantRestoreJournal !== undefined,
+    tenantRestoreJournalWorkerEnabled: tenantRestoreJournalWorker !== undefined,
+    tenantRestoreJournalNamespaceSha256:
+      cfg.tenantRestoreJournal?.journalNamespaceSha256,
+    tenantRestoreJournalTargetRootSha256:
+      cfg.tenantRestoreJournal?.targetRootSha256,
+    tenantRestoreRuntimeEpochSha256:
+      cfg.tenantRestoreJournal?.runtimeEpochSha256,
+    // Read the durable control on every acknowledgement attempt instead of freezing this decision
+    // at process startup. A current binary that was already running during the forward-only
+    // dormant -> active cutover must fail closed immediately, even before it is drained/restarted
+    // with the publisher. Generation zero preserves the pre-activation response contract.
+    tenantRestoreJournalPublicationReady: async (tenantId: string, requestId: string) => {
+      const control = await store.getTenantRestoreJournalControl();
+      if (control.controlGeneration === 0) return true;
+      return (await store.getTenantRestoreJournalPublicationBundle(tenantId, requestId))
+        ?.receipt !== undefined;
+    },
     tenantPurgeExecutionWorkerEnabled:
       tenantPurgeExecutionWorker !== undefined,
     tenantDatabasePurgeWorkerEnabled:
@@ -709,6 +810,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         dataExportWorker?.stop(),
         dataExportCleanup?.stop(),
         tenantCredentialRevocationWorker?.stop(),
+        closeTenantRestoreJournal(),
         tenantCredentialTargetExecutionWorker?.stop(),
         tenantRuntimeRevocationWorker?.stop(),
         tenantContentInventoryWorker?.stop(),
@@ -755,12 +857,13 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobStore=${cfg.BLOB_STORE} blobControl=${blobStorageControlGeneration} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} credentialTargetExecutionWorker=${cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobStore=${cfg.BLOB_STORE} blobControl=${blobStorageControlGeneration} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} restoreJournal=${cfg.tenantRestoreJournal ? "configured" : "absent"} restoreJournalWorker=${tenantRestoreJournalWorker ? "yes" : "no"} credentialTargetExecutionWorker=${cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,
     dataExportWorker, dataExportCleanup, tenantErasureAdmissionGate,
     tenantCredentialRevocationGate, tenantCredentialRevocationWorker,
+    tenantRestoreJournalGate, tenantRestoreJournalWorker, tenantRestoreJournalPreflight,
     tenantCredentialTargetExecutionGate, tenantCredentialTargetExecutionWorker,
     credentialTargetExecutionAdapter, credentialTargetExecutionState,
     tenantRuntime, tenantRuntimeDrain, tenantRuntimeDrainClient,
@@ -772,6 +875,10 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };
+  } catch (error) {
+    await closeTenantRestoreJournal();
+    throw error;
+  }
 }
 
 if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file://").href) {

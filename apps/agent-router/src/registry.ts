@@ -19,6 +19,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TenantRuntimeDrainReady,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   tenantRuntimeFleetSha256,
@@ -56,6 +57,10 @@ export interface RunnerRegistryOptions {
   redisNamespaceSha256?: string;
   /** Exact shared object namespace required before cross-runner Blob/export traffic is admitted. */
   blobStorage?: BlobStorageCapability;
+  /** Exact independent restore-journal identities required before publication may execute. */
+  restoreJournalNamespaceSha256?: string;
+  restoreJournalTargetRootSha256?: string;
+  restoreRuntimeEpochSha256?: string;
   /** how often to poll readiness and protocol compatibility */
   healthIntervalMs?: number;
   /** virtual nodes per runner on the hash ring */
@@ -283,6 +288,25 @@ export class RunnerRegistry {
       && actual.shared === expected.shared
       && actual.namespaceSha256 === expected.namespaceSha256
       && actual.controlGeneration === expected.controlGeneration;
+  }
+
+  /** A configured restore epoch is a routing invariant, not only a destructive-worker feature. */
+  private matchesConfiguredRestoreRuntime(capabilities: Capabilities): boolean {
+    const expectedNamespace = this.opts.restoreJournalNamespaceSha256;
+    const expectedTargetRoot = this.opts.restoreJournalTargetRootSha256;
+    const expectedRuntimeEpoch = this.opts.restoreRuntimeEpochSha256;
+    if (expectedNamespace === undefined
+      && expectedTargetRoot === undefined
+      && expectedRuntimeEpoch === undefined) return true;
+    return expectedNamespace !== undefined
+      && expectedTargetRoot !== undefined
+      && expectedRuntimeEpoch !== undefined
+      && capabilities.features.tenantRestoreJournal.includes(
+        TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
+      )
+      && capabilities.features.tenantRestoreJournalNamespaceSha256 === expectedNamespace
+      && capabilities.features.tenantRestoreJournalTargetRootSha256 === expectedTargetRoot
+      && capabilities.features.tenantRestoreRuntimeEpochSha256 === expectedRuntimeEpoch;
   }
 
   allHealthySupportBlobAttachments(): boolean {
@@ -536,6 +560,38 @@ export class RunnerRegistry {
       ));
   }
 
+  /** Every configured runner must prove the same independent journal and target-set identity. */
+  allConfiguredSupportTenantRestoreJournal(): boolean {
+    const configured = this.list();
+    const expectedNamespace = this.opts.restoreJournalNamespaceSha256;
+    const expectedTargetRoot = this.opts.restoreJournalTargetRootSha256;
+    const expectedRuntimeEpoch = this.opts.restoreRuntimeEpochSha256;
+    return expectedNamespace !== undefined
+      && expectedTargetRoot !== undefined
+      && expectedRuntimeEpoch !== undefined
+      && configured.length > 0
+      && configured.every((target) => (
+        target.healthy
+        && target.capabilities?.features.tenantRestoreJournal.includes(
+          TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
+        ) === true
+        && target.capabilities.features.tenantRestoreJournalNamespaceSha256
+          === expectedNamespace
+        && target.capabilities.features.tenantRestoreJournalTargetRootSha256
+          === expectedTargetRoot
+        && target.capabilities.features.tenantRestoreRuntimeEpochSha256
+          === expectedRuntimeEpoch
+      ));
+  }
+
+  /** Publication authority additionally requires an active worker on every configured runner. */
+  allConfiguredSupportTenantRestoreJournalWorker(): boolean {
+    return this.allConfiguredSupportTenantRestoreJournal()
+      && this.list().every((target) => (
+        target.capabilities?.features.tenantRestoreJournalWorker === true
+      ));
+  }
+
   /** Every configured runner must freshly prove the exact local T3e execution/ACK contract. */
   allConfiguredSupportTenantPurgeExecution(): boolean {
     const configured = this.list();
@@ -776,11 +832,16 @@ export class RunnerRegistry {
       [...this.targets.values()].map(async (t) => {
         try {
           const signal = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
-          const ready = await fetch(`${t.url}/readyz`, { signal });
-          if (!ready.ok) throw new Error(`readiness returned ${ready.status}`);
+          const request = { signal, redirect: "manual" as const };
+          const ready = await fetch(`${t.url}/readyz`, request);
+          if (!ready.ok) {
+            await ready.body?.cancel().catch(() => {});
+            throw new Error(`readiness returned ${ready.status}`);
+          }
+          await ready.body?.cancel().catch(() => {});
           let capabilities: Response;
           try {
-            capabilities = await fetch(`${t.url}/v1/capabilities`, { signal });
+            capabilities = await fetch(`${t.url}/v1/capabilities`, request);
           } catch {
             // A process that answered readiness but cannot prove its capability is not equivalent
             // to a wholly unreachable, previously attested target. Revoke until a later good probe.
@@ -788,6 +849,7 @@ export class RunnerRegistry {
             throw new Error("runner capability probe transport failed");
           }
           if (!capabilities.ok) {
+            await capabilities.body?.cancel().catch(() => {});
             this.erasureJobControlCompatible.delete(t.url);
             throw new Error(`runner capability endpoint returned ${capabilities.status}`);
           }
@@ -804,6 +866,9 @@ export class RunnerRegistry {
             // affirmative incompatibility, so it revokes the sticky observation immediately.
             this.erasureJobControlCompatible.delete(t.url);
             throw new Error("runner protocol is incompatible");
+          }
+          if (!this.matchesConfiguredRestoreRuntime(parsed.data)) {
+            throw new Error("runner restore runtime identity is incompatible");
           }
           const jobControl = parsed.data.features.erasureJobControl;
           if (

@@ -20,6 +20,10 @@ export * from "./tenant-database-purge.js";
 export * from "./tenant-redis-purge.js";
 export * from "./credential-lifecycle.js";
 export * from "./tenant-credential-target-execution.js";
+export * from "./tenant-restore-journal.js";
+export * from "./restore-journal/common.js";
+export * from "./restore-journal/memory.js";
+export * from "./restore-journal/s3.js";
 export * from "./memory.js";
 export { MysqlSessionStore, type MysqlStoreOptions } from "./mysql/store.js";
 export {

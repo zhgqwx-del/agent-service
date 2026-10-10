@@ -18,6 +18,10 @@ describe("router configuration", () => {
     expect(local.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED).toBe(false);
     expect(local.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED).toBe(false);
     expect(local.TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED).toBe(false);
+    expect(local.TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED).toBe(false);
+    expect(local.RESTORE_JOURNAL_NAMESPACE_SHA256).toBeUndefined();
+    expect(local.RESTORE_JOURNAL_TARGET_ROOT_SHA256).toBeUndefined();
+    expect(local.RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256).toBeUndefined();
     expect(local.TENANT_PURGE_EXECUTION_ENABLED).toBe(false);
     expect(local.TENANT_DATABASE_PURGE_ENABLED).toBe(false);
     expect(local.TENANT_REDIS_PURGE_ENABLED).toBe(false);
@@ -97,6 +101,26 @@ describe("router configuration", () => {
     })).toMatchObject({
       TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED: true,
       CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: true,
+    });
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED: "1",
+    })).toThrow(/namespace and target-root identities/);
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      RESTORE_JOURNAL_NAMESPACE_SHA256: "a".repeat(64),
+    })).toThrow(/must be configured together/);
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED: "1",
+      RESTORE_JOURNAL_NAMESPACE_SHA256: "a".repeat(64),
+      RESTORE_JOURNAL_TARGET_ROOT_SHA256: "b".repeat(64),
+      RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256: "c".repeat(64),
+    })).toMatchObject({
+      TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED: true,
+      RESTORE_JOURNAL_NAMESPACE_SHA256: "a".repeat(64),
+      RESTORE_JOURNAL_TARGET_ROOT_SHA256: "b".repeat(64),
+      RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256: "c".repeat(64),
     });
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",
@@ -255,6 +279,29 @@ describe("router configuration", () => {
       ["AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://169.254.170.2/credentials"],
       ["AWS_SSO_SESSION", "must-not-enter-router"],
       ["MINIO_ROOT_PASSWORD", "must-not-enter-router"],
+    ] as const) {
+      expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))
+        .toThrow(new RegExp(`${key} is runner-only`));
+    }
+    for (const [key, value] of [
+      ["RESTORE_JOURNAL_ADAPTER", "s3"],
+      ["RESTORE_JOURNAL_DATABASE_NAMESPACE_ID", "must-remain-runner-only"],
+      ["RESTORE_JOURNAL_S3_ENDPOINT", "https://journal-s3.internal"],
+      ["RESTORE_JOURNAL_S3_SECRET_ACCESS_KEY", "must-not-enter-router"],
+    ] as const) {
+      expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))
+        .toThrow(new RegExp(`${key} is runner-only restore-journal authority`));
+    }
+  });
+
+  it("rejects runner database, provider, bootstrap and test-storage authority", () => {
+    for (const [key, value] of [
+      ["API_KEY", "must-not-enter-router"],
+      ["MYSQL_URL", "mysql://runner:secret@database/agent_service"],
+      ["MYSQL_TEST_URL", "mysql://runner:secret@database/agent_service_test"],
+      ["SECRETS_MASTER_KEY", "a".repeat(64)],
+      ["BOOTSTRAP_API_KEY", "must-not-enter-router"],
+      ["S3_TEST_SECRET_ACCESS_KEY", "must-not-enter-router"],
     ] as const) {
       expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))
         .toThrow(new RegExp(`${key} is runner-only`));

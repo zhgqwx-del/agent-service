@@ -13,6 +13,7 @@ import {
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
 } from "@agent-service/protocol";
 import {
+  EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
   MemorySessionStore,
   newErasureRequestId,
   userErasureRequestHash,
@@ -26,6 +27,8 @@ async function fixture(options: {
   enabled?: boolean;
   attachStore?: boolean;
   gate?: () => Promise<boolean>;
+  publicationReady?: (tenantId: string, requestId: string) => Promise<boolean>;
+  useStorePublicationReady?: boolean;
 } = {}) {
   const store = new MemorySessionStore();
   await store.createApiKey("t_target", "admin", hashApiKey("tenant-key"), ["runtime", "admin"]);
@@ -44,6 +47,14 @@ async function fixture(options: {
     subjectLifecycle: attachStore ? store : undefined,
     tenantErasureRequestsEnabled: options.enabled ?? false,
     tenantErasureAdmissionGate: options.enabled ? { canAdmit: gate } : undefined,
+    tenantRestoreJournalPublicationReady: options.useStorePublicationReady
+      ? async (tenantId: string, requestId: string) => {
+          const control = await store.getTenantRestoreJournalControl();
+          if (control.controlGeneration === 0) return true;
+          return (await store.getTenantRestoreJournalPublicationBundle(tenantId, requestId))
+            ?.receipt !== undefined;
+        }
+      : options.publicationReady,
     ready: () => true,
     decryptSecret: async () => "unused",
     encryptSecret: async () => ({ ciphertext: Buffer.from("unused"), keyId: "unused" }),
@@ -178,6 +189,126 @@ describe("runner-only tenant erasure control", () => {
       headers: { authorization: "Bearer tenant-key" },
     });
     expect(rejectedRuntime.status).toBe(401);
+  });
+
+  it("withholds both create and replay acknowledgements until the active journal receipt exists", async () => {
+    let published = false;
+    const publicationReady = vi.fn(async () => published);
+    const { store, internal } = await fixture({ enabled: true, publicationReady });
+    const create = vi.spyOn(store, "requestTenantErasure");
+    const send = (path: string = INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX) => internal(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "journal-fenced" },
+      body: JSON.stringify({ tenantId: "t_target" }),
+    });
+
+    const first = await send();
+    expect(first.status).toBe(503);
+    expectPrivate(first);
+    expectControlAck(first);
+    expect(create).toHaveBeenCalledOnce();
+    expect(store.tenantErasureAdmissions.size).toBe(1);
+    const [committed] = [...store.tenantErasureAdmissions.values()];
+    expect(committed).toBeDefined();
+    expect(publicationReady).toHaveBeenLastCalledWith("t_target", committed!.requestId);
+
+    const pendingReplay = await send();
+    expect(pendingReplay.status).toBe(503);
+    expect(create).toHaveBeenCalledOnce();
+    expect(store.tenantErasureAdmissions.size).toBe(1);
+
+    const dedicatedPendingReplay = await send(INTERNAL_TENANT_ERASURE_REPLAY_PATH);
+    expect(dedicatedPendingReplay.status).toBe(503);
+    expectReplayAck(dedicatedPendingReplay);
+    expect(create).toHaveBeenCalledOnce();
+
+    published = true;
+    const accepted = await send();
+    expect(accepted.status).toBe(202);
+    expect(await accepted.json()).toMatchObject({
+      id: committed!.requestId,
+      tenantId: "t_target",
+      status: "gated",
+    });
+    expect(create).toHaveBeenCalledOnce();
+    expect(store.tenantErasureAdmissions.size).toBe(1);
+
+    const dedicatedAccepted = await send(INTERNAL_TENANT_ERASURE_REPLAY_PATH);
+    expect(dedicatedAccepted.status).toBe(202);
+    expectReplayAck(dedicatedAccepted);
+    expect(await dedicatedAccepted.json()).toMatchObject({ id: committed!.requestId });
+    expect(create).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a pre-activation T1 readable while its new journal publication is pending", async () => {
+    const { store, internal } = await fixture({
+      enabled: true,
+      useStorePublicationReady: true,
+    });
+    const send = (path: string = INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX) => internal(path, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "pre-journal-t1" },
+      body: JSON.stringify({ tenantId: "t_target" }),
+    });
+
+    const admitted = await send();
+    expect(admitted.status).toBe(202);
+    const admittedBody = await admitted.json() as { id: string };
+    const logicalDatabaseNamespaceSha256 = "1".repeat(64);
+    const target = {
+      targetOrdinal: 0,
+      targetSha256: "2".repeat(64),
+      failureDomainSha256: "3".repeat(64),
+      adapterProtocol: "memory-restore-journal-v1",
+      journalNamespaceSha256: "4".repeat(64),
+    };
+    await store.activateTenantRestoreJournalControl({
+      adapterProtocol: target.adapterProtocol,
+      journalNamespaceSha256: target.journalNamespaceSha256,
+      logicalDatabaseNamespaceSha256,
+      runtimeEpochSha256: "5".repeat(64),
+      targets: [target],
+      observedHeads: [{
+        ...target,
+        logicalDatabaseNamespaceSha256,
+        sealedRemoteSequence: 0,
+        sealedHeadRootSha256: EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
+      }],
+    });
+    expect(await store.getTenantRestoreJournalPublicationBundle("t_target", admittedBody.id))
+      .toBeNull();
+
+    const exactReplay = await send();
+    expect(exactReplay.status).toBe(503);
+    expectControlAck(exactReplay);
+    const dedicatedReplay = await send(INTERNAL_TENANT_ERASURE_REPLAY_PATH);
+    expect(dedicatedReplay.status).toBe(503);
+    expectReplayAck(dedicatedReplay);
+
+    const status = await internal(
+      `${INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX}/${admittedBody.id}?tenantId=t_target`,
+    );
+    expect(status.status).toBe(200);
+    expect(await status.json()).toMatchObject({ id: admittedBody.id, tenantId: "t_target" });
+  });
+
+  it("maps an active journal receipt read failure to a retryable response", async () => {
+    const publicationReady = vi.fn(async () => {
+      throw new Error("sensitive dependency failure");
+    });
+    const { store, internal } = await fixture({ enabled: true, publicationReady });
+    const create = vi.spyOn(store, "requestTenantErasure");
+    const response = await internal(INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "journal-read-error" },
+      body: JSON.stringify({ tenantId: "t_target" }),
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: { code: "draining", message: "tenant erasure journal publication is pending" },
+    });
+    expect(create).toHaveBeenCalledOnce();
+    expect(store.tenantErasureAdmissions.size).toBe(1);
   });
 
   it("keeps status readable while admission is off and confines it to the requested tenant", async () => {
