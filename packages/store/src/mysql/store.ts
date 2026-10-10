@@ -27858,6 +27858,78 @@ export class MysqlSessionStore implements
     }
   }
 
+  /**
+   * Once migration 0028 is installed, ordinary generation-1 activation must serialize before the
+   * mover's control row. This closes the startup-gate/freeze TOCTOU without reversing the mover's
+   * migration-control -> blob-control lock order. Historical fixtures that intentionally stop at
+   * 0027 have no migration table and retain the original activation contract.
+   */
+  private async lockBlobStorageMigrationActivationContext(
+    conn: PoolConnection,
+  ): Promise<{ phase: string; targetNamespaceSha256?: string } | undefined> {
+    const [tableRows] = await conn.query<Row[]>(
+      `SELECT COUNT(*) AS table_count FROM information_schema.tables
+        WHERE table_schema=DATABASE()
+          AND table_name='blob_storage_migration_control'
+          AND table_type='BASE TABLE'`,
+    );
+    const tableCount = Number(tableRows[0]?.table_count);
+    if (tableCount === 0) return undefined;
+    if (tableCount !== 1) throw new BlobStorageControlConflictError();
+
+    const [controlRows] = await conn.query<Row[]>(
+      `SELECT phase,target_namespace_sha256
+         FROM blob_storage_migration_control
+        WHERE singleton_id=1 FOR SHARE`,
+    );
+    if (controlRows.length !== 1) throw new BlobStorageControlConflictError();
+    const currentTarget = controlRows[0]?.target_namespace_sha256;
+    return {
+      phase: String(controlRows[0]?.phase ?? ""),
+      ...(currentTarget == null ? {} : { targetNamespaceSha256: String(currentTarget) }),
+    };
+  }
+
+  private async assertBlobStorageMigrationNamespaceFresh(
+    conn: PoolConnection,
+    context: { phase: string; targetNamespaceSha256?: string },
+    namespaceSha256: string,
+  ): Promise<void> {
+    if (context.phase !== "inactive" && context.phase !== "aborted") {
+      throw new BlobStorageControlConflictError();
+    }
+    if (context.targetNamespaceSha256 === namespaceSha256) {
+      throw new BlobStorageControlConflictError();
+    }
+
+    // Every attempted target is permanently fenced, even if an empty attempt produced no object
+    // inventory or a later attempt replaced the singleton's current target projection.
+    const [historyRows] = await conn.query<Row[]>(
+      `SELECT target_namespace_sha256 FROM (
+         SELECT target_namespace_sha256 FROM blob_storage_migration_inventory
+          WHERE BINARY target_namespace_sha256=BINARY ? LIMIT 1
+       ) inventory_attempt
+       UNION ALL
+       SELECT target_namespace_sha256 FROM (
+         SELECT target_namespace_sha256 FROM blob_storage_migration_object_acks
+          WHERE BINARY target_namespace_sha256=BINARY ? LIMIT 1
+       ) object_ack_attempt
+       UNION ALL
+       SELECT target_namespace_sha256 FROM (
+         SELECT target_namespace_sha256 FROM blob_storage_migration_receipts
+          WHERE BINARY target_namespace_sha256=BINARY ? LIMIT 1
+       ) receipt_attempt
+       UNION ALL
+       SELECT target_namespace_sha256 FROM (
+         SELECT target_namespace_sha256 FROM blob_storage_migration_target_cleanup_acks
+          WHERE BINARY target_namespace_sha256=BINARY ? LIMIT 1
+       ) cleanup_attempt
+       LIMIT 1`,
+      [namespaceSha256, namespaceSha256, namespaceSha256, namespaceSha256],
+    );
+    if (historyRows.length > 0) throw new BlobStorageControlConflictError();
+  }
+
   async getBlobStorageControl(): Promise<BlobStorageControlRecord> {
     return this.readBlobStorageControl(this.pool);
   }
@@ -27870,12 +27942,21 @@ export class MysqlSessionStore implements
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      // Lock migration authority before Blob control. The mover uses the same order, so a freeze
+      // and ordinary activation cannot each publish half of an unrecoverable split-brain state.
+      const migrationContext = await this.lockBlobStorageMigrationActivationContext(conn);
       const current = await this.readBlobStorageControl(conn, "FOR UPDATE");
       if (current.controlGeneration === 1) {
         if (
           current.storageBackend !== stagedInput.storageBackend
           || current.namespaceSha256 !== stagedInput.namespaceSha256
         ) throw new BlobStorageControlConflictError();
+        if (migrationContext !== undefined
+          && migrationContext.phase !== "inactive"
+          && migrationContext.phase !== "aborted"
+          && migrationContext.phase !== "source_cleaned") {
+          throw new BlobStorageControlConflictError();
+        }
         await this.assertBlobStorageInventoryMatches(
           conn,
           current.storageBackend,
@@ -27883,6 +27964,14 @@ export class MysqlSessionStore implements
         );
         await conn.commit();
         return current;
+      }
+
+      if (migrationContext !== undefined) {
+        await this.assertBlobStorageMigrationNamespaceFresh(
+          conn,
+          migrationContext,
+          stagedInput.namespaceSha256,
+        );
       }
 
       await this.assertBlobStorageInventoryMatches(

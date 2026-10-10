@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2、T3a、T3b、非破坏性 T3c/T3d、T3e 本地执行/物理 ACK、T3f 本地数据库内容/控制投影清理与 T3g session-scoped Redis状态清理均已进入本地/CI基线。`0022`固定33域plan；`0023`闭合local usage/Blob/export切片；`0024`原子清理11个本地数据库投影并留下永久session grave；`0025`以真实Redis Lua清理lease/owner、fence与stream并安装防复活marker；`0026`建立default-dormant的versioned credential lifecycle inventory；`0027`再安装default-dormant、write-once的Blob storage control，并把共享S3-compatible/MinIO adapter、跨runner namespace capability和真实MinIO行为测试接入本地/CI。S3对象以同一key上的`ASBLOB02` data/tombstone envelope配合`If-None-Match`/`If-Match`线性化发布与删除，完整请求deadline覆盖credential/endpoint provider和transport；runner在监听和worker启动前检查bucket可达、从未启用versioning、无lifecycle规则、Object Lock关闭及条件写语义，再把`BLOB_NAMESPACE_ID + bucket + prefix`的非密钥digest与MySQL generation 1精确绑定。该cutover只允许空库或全部live manifest、未释放snapshot pin和未完成delete intent已使用同一backend/namespace的库激活，激活后filesystem回退或namespace漂移都会fail closed。当前external provider/KMS实际处置、backup与独立故障域restore ledger、logs/traces、existing-filesystem bytes的受审计搬迁、managed对象存储/IAM真实环境验收、全域completion及generic user物理purge仍未闭环；公开status保持`gated`、`dataPurgeExecution=false`，因此M1仍未冻结。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2、T3a、T3b、非破坏性 T3c/T3d、T3e 本地执行/物理 ACK、T3f 本地数据库内容/控制投影清理与 T3g session-scoped Redis状态清理均已进入本地/CI基线。`0022`固定33域plan；`0023`闭合local usage/Blob/export切片；`0024`原子清理11个本地数据库投影并留下永久session grave；`0025`以真实Redis Lua清理lease/owner、fence与stream并安装防复活marker；`0026`建立default-dormant的versioned credential lifecycle inventory；`0027`安装default-dormant、write-once的Blob storage control，并把共享S3-compatible/MinIO adapter、跨runner namespace capability和真实MinIO行为测试接入本地/CI；`0028`再安装default-dormant的离线filesystem→S3迁移账本，并由runner镜像内的一次性CLI执行freeze、inventory、copy、verify、cutover、abort和source cleanup。S3对象以同一key上的`ASBLOB02` data/tombstone envelope配合`If-None-Match`/`PutObject If-Match`线性化发布与删除；abort以CAS写入永久migration-owned tombstone，不依赖MinIO不支持的conditional DELETE。完整请求deadline覆盖credential/endpoint provider和transport；runner在监听和worker启动前检查bucket可达、从未启用versioning、无lifecycle规则、Object Lock关闭及条件写语义，再把`BLOB_NAMESPACE_ID + bucket + prefix`的非密钥digest与MySQL generation 1精确绑定。迁移期间除`inactive`、`aborted`、`source_cleaned`外runtime一律fail closed；每次外部对象变更还会持有migration-control行共享锁并在变更前后复核named-lock owner，runner完成Blob identity对账后会再次读取迁移control，收口锁连接丢失和startup/cutover竞态。cutover后不能回滚，只有显式完成source cleanup才恢复服务。当前external provider/KMS实际处置、backup与独立故障域restore ledger、logs/traces、managed对象存储/IAM真实环境验收、全域completion及generic user物理purge仍未闭环；mover的大规模容量、HA和真实维护窗口也需staging验证。公开status保持`gated`、`dataPurgeExecution=false`，因此M1仍未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -42,11 +42,12 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0026 → 0027 的真实 MySQL 历史升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0027 → 0028 的真实 MySQL 历史升级夹具
 pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
 pnpm test:blob-storage-control-memory         # 强制执行 0027 Memory write-once cutover/回滚/并发套件
 pnpm test:blob-storage-control-mysql          # 强制执行 0027 真实InnoDB inventory/回滚/并发套件
-scripts/local-service.sh verify-s3            # 启动本地MinIO，执行真实S3协议与源码应用装配套件
+pnpm test:blob-storage-migration-mysql-s3     # 强制执行 0028 真实MySQL + MinIO离线搬迁/回滚/重放套件
+scripts/local-service.sh verify-s3            # 启动本地MinIO，执行真实S3协议、0028 mover与源码应用装配套件
 pnpm test:usage-lifecycle-mysql               # 强制执行 usage 双写/核对/匿名化真实 MySQL 专项套件
 pnpm test:subject-lifecycle-mysql             # 强制执行 subject gate/回滚/并发真实 MySQL 专项套件
 pnpm test:tenant-credential-revocation-mysql  # 强制执行 tenant 原子 fence、status proof、回滚、隔离和写入 race 真实 MySQL 套件
@@ -73,10 +74,11 @@ pnpm test:user-data-export-mysql              # 强制执行一致性快照、�
 pnpm test:cluster                             # + 多进程集群：2~3 runner + 1 router，SIGKILL 租约持有者
 pnpm check:api                                # OpenAPI 与生成 SDK 漂移检查
 pnpm check:sdk                                # 编译 SDK、原生 Node import，并校验 pnpm pack 内容
+pnpm check:blob-storage-migrate-artifact      # 以plain Node执行构建后的runner mover入口
 set -a; source .env; set +a; AGENT_SERVICE_REAL_E2E=1 pnpm vitest run packages/providers/test/e2e-qwen.test.ts
 pnpm typecheck
 
-# 生产构建验证（SDK 发布包 + 两个应用的单文件 bundle，原生 node 启动，不依赖 tsx）
+# 生产构建验证（SDK 发布包 + 两个长期应用 main bundle + runner 一次性 mover artifact）
 pnpm build:check
 docker build --build-arg APP=agent-runner -t agent-runner .
 docker build --build-arg APP=agent-router -t agent-router .
@@ -92,6 +94,7 @@ scripts/local-service.sh acceptance   # 使用真实模型，会产生少量费�
 scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 历史迁移 + cluster + 构建产物启动
 scripts/local-service.sh verify-real  # 仅在显式命令下读取 .env 的真实模型 key
 scripts/local-service.sh cleanup-idempotency --dry-run  # 检查/分批清理过期 completed receipt
+pnpm maintenance:blob-storage-migrate -- status          # 只读查看0028迁移状态
 scripts/local-service.sh stop
 ```
 
@@ -107,7 +110,7 @@ scripts/local-service.sh smoke
 scripts/local-service.sh verify-s3
 ```
 
-第一次以S3启动会把当前MySQL的`blob_storage_control`从generation `0`不可逆激活到`1`。请对可丢弃数据库体验；激活后不能改回filesystem，也不能仅修改bucket/prefix/namespace id来“迁移”数据。生产的`BLOB_S3_PRIVATE_BUCKET_ACK=1`只是操作者在独立验证匿名访问被拒、IAM/policy正确之后作出的确认，不是应用自动证明；本地MinIO保持`0`，真实MinIO套件会另行执行匿名raw GET拒绝检查。
+第一次以S3启动会把当前MySQL的`blob_storage_control`从generation `0`不可逆激活到`1`，因此直接切换只适合空库或所有live对象本来就已经使用该namespace的可丢弃数据库。已有filesystem对象的非空库必须完全停服并使用`0028`的一次性mover；`run`默认只推进到`verified`，只有显式`BLOB_MIGRATION_COMMIT=1`才cutover，而且source cleanup始终需要单独命令。统一脚本会让调用方显式提供的mover配置（包括显式空值和`AWS_*` provider-chain变量）优先于`.env`，避免本地默认值静默改写维护目标，同时不会打印这些值。激活后不能改回filesystem，也不能复用abort过的bucket/prefix/namespace id。详细演练见`docs/operations/development-and-ci-guide.md`，生产操作边界见`docs/operations/local-and-deployment.md`。生产的`BLOB_S3_PRIVATE_BUCKET_ACK=1`只是操作者在独立验证匿名访问被拒、IAM/policy正确之后作出的确认，不是应用自动证明；本地MinIO保持`0`，真实MinIO套件会另行执行匿名raw GET拒绝检查。
 
 详细配置与未来 staging/production 部署契约见 `docs/operations/local-and-deployment.md`；面向项目学习、手动体验和 CI 构建产物的完整说明见 `docs/operations/development-and-ci-guide.md`。
 

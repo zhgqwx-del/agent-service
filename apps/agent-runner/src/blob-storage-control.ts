@@ -45,3 +45,20 @@ export async function reconcileBlobStorageControl(
   }
   return 1;
 }
+
+/**
+ * Reconcile the write-once Blob identity, then re-read the independent migration control before
+ * runtime is allowed to start. The first startup gate runs before an S3 adapter is opened; this
+ * second gate closes the interval in which an offline mover could commit that same namespace while
+ * adapter validation was in flight. Once ordinary generation-1 activation wins instead, the mover's
+ * freeze transaction is permanently fenced by the Blob control row.
+ */
+export async function reconcileBlobStorageControlForRuntime(
+  store: BlobStorageControlStore,
+  expected: BlobStorageCapability | undefined,
+  assertMigrationRuntimeReady: () => Promise<void>,
+): Promise<0 | 1> {
+  const generation = await reconcileBlobStorageControl(store, expected);
+  await assertMigrationRuntimeReady();
+  return generation;
+}

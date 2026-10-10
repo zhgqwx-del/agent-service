@@ -1,6 +1,7 @@
 export * from "./types.js";
 export * from "./blob-lifecycle.js";
 export * from "./blob-storage-control.js";
+export * from "./blob-storage-migration.js";
 export * from "./subject-lifecycle.js";
 export * from "./erasure-session.js";
 export * from "./erasure-catalog.js";
@@ -20,6 +21,10 @@ export * from "./tenant-redis-purge.js";
 export * from "./credential-lifecycle.js";
 export * from "./memory.js";
 export { MysqlSessionStore, type MysqlStoreOptions } from "./mysql/store.js";
+export {
+  MysqlBlobStorageMigrationCoordinator,
+  type MysqlBlobStorageMigrationCoordinatorOptions,
+} from "./mysql/blob-storage-migration.js";
 export { RedisLeaseStore } from "./redis/lease.js";
 export { RedisEventBus } from "./redis/bus.js";
 export * from "./redis/keys.js";

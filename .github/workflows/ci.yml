@@ -143,6 +143,19 @@ jobs:
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:blob-s3
 
+      # The offline mover crosses both InnoDB and object-storage durability boundaries. Keep a
+      # named proof with a fresh database and namespace per case; the wrapper rejects skips/zero tests.
+      - name: Blob migration real MySQL + MinIO suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_TEST_BUCKET: agent-service-ci-test
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: pnpm run test:blob-storage-migration-mysql-s3
+
       # Keep a named, verbose, no-skip proof for the lifecycle queue. The broad coverage assertion
       # above cannot by itself prove that this dedicated real-MySQL concurrency file executed.
       - name: Lifecycle outbox real MySQL suite (must execute)
@@ -303,15 +316,16 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0027
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0028
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority, 0016 -> 0017 user-export and 0018 -> 0019 inert tenant credential
       # revocation substrate, 0019 -> 0020 runtime-proof, 0020 -> 0021 content-inventory and
       # 0021 -> 0022 full-domain purge-plan, 0022 -> 0023 execution-ledger and 0023 -> 0024
       # database-content deletion, 0024 -> 0025 Redis-purge ledger, 0025 -> 0026 versioned
-      # credential-lifecycle inventory and 0026 -> 0027 blob-storage control replay matrices.
-      - name: Historical MySQL migrations (0007 through 0027, no skips)
+      # credential-lifecycle inventory, 0026 -> 0027 blob-storage control and 0027 -> 0028
+      # offline-mover ledger replay matrices.
+      - name: Historical MySQL migrations (0007 through 0028, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -334,10 +348,15 @@ jobs:
       - name: Build distributable artifacts and boot plain Node bundles
         run: pnpm run build:check
 
+      # Keep a separate, named proof that the runner's one-shot mover artifact exists and executes
+      # under plain Node. build:check also runs this gate so local verification cannot omit it.
+      - name: Runner Blob migration distributable CLI (must execute)
+        run: pnpm run check:blob-storage-migrate-artifact
+
       # Start the production-shaped bundles against a throwaway MySQL schema and the real MinIO
-      # process above. This proves the bundled AWS SDK closure, migration 0027 activation and exact
-      # fleet namespace negotiation at the application wiring boundary; object-store credentials
-      # are scoped to this step and the smoke passes them only to the runner child.
+      # process above. This proves the bundled AWS SDK closure, migration 0027 storage control,
+      # migration 0028 mover ledger and exact fleet namespace negotiation at the application wiring
+      # boundary; object-store credentials are scoped to this step and passed only to the runner.
       - name: S3 bundled runner/router application assembly smoke (must execute)
         env:
           AGENT_SERVICE_APP_SMOKE_MODE: dist
@@ -395,6 +414,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Execute the one-shot Blob migration CLI from the runner image
+        if: matrix.app == 'agent-runner'
+        run: |
+          docker run --rm --entrypoint node agent-service/agent-runner:ci \
+            dist/blob-storage-migrate.js --help | grep -F "Usage: blob-storage-migrate"
+
       # A container that starts but is unreachable, or reports healthy on the wrong port, is the exact
       # failure mode this step exists to catch.
       - name: Run the container and reach it from outside
@@ -433,6 +458,7 @@ jobs:
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0027_blob_storage_control.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0028_blob_storage_migration.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

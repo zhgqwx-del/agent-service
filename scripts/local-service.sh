@@ -6,6 +6,50 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# The migration command is an operator-authority surface. Preserve every caller-provided setting,
+# including an explicitly empty value, before loading local defaults. The AWS SDK may use any
+# exported AWS_* setting through its default credential/endpoint provider chain, so preserve those
+# caller values as well instead of letting .env silently retarget the one-shot mover.
+caller_mover_env_names=(
+  NODE_ENV
+  MYSQL_URL
+  MIGRATION_ID
+  FLEET_DRAINED_EVIDENCE_SHA256
+  ROLLBACK_WINDOW_MS
+  SOURCE_CLEANUP_DELAY_MS
+  MAX_OBJECT_BYTES
+  BLOB_MIGRATION_COMMIT
+  BLOB_DIR
+  BLOB_NAMESPACE_ID
+  BLOB_S3_ENDPOINT
+  BLOB_S3_REGION
+  BLOB_S3_BUCKET
+  BLOB_S3_PREFIX
+  BLOB_S3_FORCE_PATH_STYLE
+  BLOB_S3_PRIVATE_BUCKET_ACK
+  BLOB_S3_REQUEST_TIMEOUT_MS
+  BLOB_S3_ACCESS_KEY_ID
+  BLOB_S3_SECRET_ACCESS_KEY
+  BLOB_S3_SESSION_TOKEN
+)
+while IFS= read -r caller_env_name; do
+  case "$caller_env_name" in
+    AWS_*) caller_mover_env_names+=("$caller_env_name") ;;
+  esac
+done < <(compgen -e)
+
+caller_mover_env_was_set=()
+caller_mover_env_values=()
+for caller_env_name in "${caller_mover_env_names[@]}"; do
+  if [ "${!caller_env_name+x}" = x ]; then
+    caller_mover_env_was_set+=(1)
+    caller_mover_env_values+=("${!caller_env_name}")
+  else
+    caller_mover_env_was_set+=(0)
+    caller_mover_env_values+=("")
+  fi
+done
+
 # Load local defaults while keeping the explicitly snapshotted topology overrides authoritative.
 caller_runner_port="${RUNNER_PORT-}"
 caller_router_port="${ROUTER_PORT-}"
@@ -67,6 +111,12 @@ if [ -f .env ]; then
   . ./.env
   set +a
 fi
+for ((caller_env_index = 0; caller_env_index < ${#caller_mover_env_names[@]}; caller_env_index++)); do
+  if [ "${caller_mover_env_was_set[$caller_env_index]}" = 1 ]; then
+    export "${caller_mover_env_names[$caller_env_index]}=${caller_mover_env_values[$caller_env_index]}"
+  fi
+done
+unset caller_env_index caller_env_name caller_mover_env_names caller_mover_env_was_set caller_mover_env_values
 [ -n "$caller_runner_port" ] && RUNNER_PORT="$caller_runner_port"
 [ -n "$caller_router_port" ] && ROUTER_PORT="$caller_router_port"
 [ -n "$caller_runner_id" ] && RUNNER_ID="$caller_runner_id"
@@ -461,6 +511,9 @@ verify_s3() {
   )
   env "${s3_test_env[@]}" pnpm run test:blob-s3
   env "${s3_test_env[@]}" \
+    MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:blob-storage-migration-mysql-s3
+  env "${s3_test_env[@]}" \
     AGENT_SERVICE_APP_SMOKE_MODE=source \
     MYSQL_APP_SMOKE_URL="${MYSQL_APP_SMOKE_URL:-${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}}" \
     pnpm run test:app-s3-smoke
@@ -472,8 +525,15 @@ cleanup_idempotency() {
   node scripts/cleanup-idempotency.mjs "$@"
 }
 
+blob_storage_migrate() {
+  require_tools
+  # This is a foreground, one-shot runner entrypoint. The command implementation validates every
+  # required source/target setting and fails closed; the wrapper never prints environment values.
+  node --import tsx apps/agent-runner/src/blob-storage-migrate.ts "$@"
+}
+
 usage() {
-  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|down"
+  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|blob-storage-migrate|down"
 }
 
 case "${1:-}" in
@@ -488,6 +548,7 @@ case "${1:-}" in
   verify-s3) verify_s3 ;;
   verify-real) verify_real ;;
   cleanup-idempotency) shift; cleanup_idempotency "$@" ;;
+  blob-storage-migrate) shift; blob_storage_migrate "$@" ;;
   down) stop_apps; infra stop ;;
   *) usage; exit 1 ;;
 esac

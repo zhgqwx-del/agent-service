@@ -67,7 +67,8 @@ import {
 } from "@agent-service/store";
 import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
-import { reconcileBlobStorageControl } from "./blob-storage-control.js";
+import { reconcileBlobStorageControlForRuntime } from "./blob-storage-control.js";
+import { assertBlobStorageMigrationRuntimeReady } from "./blob-storage-migration-gate.js";
 import { loadConfig } from "./config.js";
 import { RouterErasureSessionExecutor } from "./erasure-executor.js";
 import { RouterPurgePolicyEvaluationGate } from "./purge-policy-evaluation-gate.js";
@@ -116,6 +117,16 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         : { tenantRedisPurgeNamespaceSha256: redisNamespaceSha256 }),
     })
     : new MemorySessionStore();
+  if (cfg.STORE === "mysql") {
+    try {
+      // The offline mover owns the whole Blob namespace while active. Read its durable control
+      // through a separate connection and release that connection before any runtime work begins.
+      await assertBlobStorageMigrationRuntimeReady(cfg.MYSQL_URL);
+    } catch (error) {
+      await store.close().catch(() => {});
+      throw error;
+    }
+  }
   let redisCutover: Awaited<ReturnType<TenantRedisPurgeStore["getTenantRedisPurgeCutover"]>>;
   let hasRedisPurgeJobs: boolean;
   try {
@@ -241,7 +252,15 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         throw new Error("shared Blob storage requires an acknowledged durable control");
       }
     }
-    blobStorageControlGeneration = await reconcileBlobStorageControl(store, activeBlobStorage);
+    blobStorageControlGeneration = await reconcileBlobStorageControlForRuntime(
+      store,
+      activeBlobStorage,
+      async () => {
+        if (cfg.STORE === "mysql") {
+          await assertBlobStorageMigrationRuntimeReady(cfg.MYSQL_URL);
+        }
+      },
+    );
   } catch (error) {
     await Promise.all([
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined,

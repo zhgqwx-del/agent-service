@@ -17,6 +17,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BlobConflictError, S3BlobStore } from "../src/index.js";
 
 const MAX_BYTES = 1024 * 1024;
+const MIGRATION_OWNER_SHA256 = "a".repeat(64);
 const integrationGate = process.env.AGENT_SERVICE_S3_INTEGRATION ?? "0";
 if (integrationGate !== "0" && integrationGate !== "1") {
   throw new Error("AGENT_SERVICE_S3_INTEGRATION must be 0 or 1");
@@ -189,6 +190,56 @@ describeMinio("S3BlobStore real MinIO contract", () => {
     });
     expect(first.namespaceSha256).toBe(second.namespaceSha256);
     expect(first.backend).toBe(second.backend);
+  });
+
+  it("inspects and CAS-fences exact uncommitted data and tombstones across clients", async () => {
+    const descriptor = await first.putIfAbsent("objects/migration-discard-data", "uncommitted", {
+      uploadToken: "migration-discard-data",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await second.inspectExact("objects/migration-discard-data", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "data",
+      descriptor,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await second.discardUncommittedTarget("objects/migration-discard-data", {
+      expectedState: { kind: "data", descriptor },
+      uploadToken: "migration-discard-data",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await first.discardUncommittedTarget("objects/migration-discard-data", {
+      expectedState: { kind: "data", descriptor },
+      uploadToken: "migration-discard-data",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await first.inspectExact("objects/migration-discard-data", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+
+    await first.delete("objects/migration-discard-tombstone", {
+      uploadToken: "migration-tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await second.inspectExact("objects/migration-discard-tombstone", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await second.discardUncommittedTarget("objects/migration-discard-tombstone", {
+      expectedState: { kind: "tombstone" },
+      uploadToken: "migration-tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await first.inspectExact("objects/migration-discard-tombstone", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await expect(first.putIfAbsent("objects/migration-discard-tombstone", "after-abort", {
+      uploadToken: "migration-after-abort",
+      maxBytes: MAX_BYTES,
+    })).rejects.toThrow("cancelled before publication");
   });
 
   it("linearizes concurrent identical creates across clients", async () => {

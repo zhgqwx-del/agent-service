@@ -18,9 +18,11 @@ import {
   BlobTooLargeError,
   type BlobDeleteOptions,
   type BlobDescriptor,
+  type BlobDiscardUncommittedTargetOptions,
+  type BlobExactInspection,
+  type BlobMigrationStore,
   type BlobPutOptions,
   type BlobReadOptions,
-  type BlobStore,
 } from "../types.js";
 import {
   BLOB_ENVELOPE_HEADER_BYTES,
@@ -39,8 +41,14 @@ import {
   validateBlobContentType,
   validateBlobKey,
   validateBlobMaxBytes,
+  validateBlobMigrationOwnerSha256,
   validateBlobUploadToken,
 } from "./key.js";
+import {
+  assertExpectedMigrationState,
+  assertMigrationOwner,
+  validateBlobDiscardInput,
+} from "./migration.js";
 
 const DEFAULT_PREFIX = "blobs";
 const DEFAULT_MUTATION_ATTEMPTS = 8;
@@ -82,6 +90,16 @@ type ObjectState =
   | { kind: "missing" }
   | { kind: "tombstone"; etag: string }
   | { kind: "occupied"; etag: string };
+
+type ExactObjectState =
+  | { kind: "missing" }
+  | { kind: "tombstone"; etag?: string; migrationOwnerSha256?: string }
+  | {
+    kind: "data";
+    object: Extract<DecodedBlobEnvelope, { kind: "data" }>["object"];
+    etag?: string;
+    migrationOwnerSha256?: string;
+  };
 
 function errorStatus(error: unknown) {
   if (!error || typeof error !== "object") return undefined;
@@ -315,7 +333,7 @@ async function readExactBody(
  * Shared S3/MinIO BlobStore. Data and the permanent cancellation tombstone occupy the same key;
  * all publication and fenced deletion decisions therefore linearize through one S3 object.
  */
-export class S3BlobStore implements BlobStore {
+export class S3BlobStore implements BlobMigrationStore {
   readonly shared = true;
   readonly namespaceSha256: string;
   readonly backend: string;
@@ -400,7 +418,7 @@ export class S3BlobStore implements BlobStore {
     return `${this.prefix}/${storageKey}`;
   }
 
-  private async readDecoded(storageKey: string, maxBytes: number): Promise<DecodedBlobEnvelope | null> {
+  private async readExactObjectState(storageKey: string, maxBytes: number): Promise<ExactObjectState> {
     let output: GetObjectCommandOutput;
     try {
       output = await this.send((abortSignal) => this.client.send(
@@ -411,7 +429,7 @@ export class S3BlobStore implements BlobStore {
         { abortSignal },
       ));
     } catch (error) {
-      if (isMissingObject(error)) return null;
+      if (isMissingObject(error)) return { kind: "missing" };
       throw sanitizedS3Error("read", error);
     }
     try {
@@ -427,13 +445,49 @@ export class S3BlobStore implements BlobStore {
       maxBytes,
       this.requestTimeoutMs,
     );
-    return decodeBlobEnvelope(storageKey, envelope, maxBytes);
+    const decoded = decodeBlobEnvelope(storageKey, envelope, maxBytes);
+    return decoded.kind === "tombstone"
+      ? {
+        kind: "tombstone",
+        etag: output.ETag,
+        ...(decoded.migrationOwnerSha256 === undefined
+          ? {}
+          : { migrationOwnerSha256: decoded.migrationOwnerSha256 }),
+      }
+      : {
+        kind: "data",
+        object: decoded.object,
+        etag: output.ETag,
+        ...(decoded.migrationOwnerSha256 === undefined
+          ? {}
+          : { migrationOwnerSha256: decoded.migrationOwnerSha256 }),
+      };
+  }
+
+  private async readDecoded(storageKey: string, maxBytes: number): Promise<DecodedBlobEnvelope | null> {
+    const state = await this.readExactObjectState(storageKey, maxBytes);
+    if (state.kind === "missing") return null;
+    return state.kind === "tombstone"
+      ? {
+        kind: "tombstone",
+        ...(state.migrationOwnerSha256 === undefined
+          ? {}
+          : { migrationOwnerSha256: state.migrationOwnerSha256 }),
+      }
+      : {
+        kind: "data",
+        object: state.object,
+        ...(state.migrationOwnerSha256 === undefined
+          ? {}
+          : { migrationOwnerSha256: state.migrationOwnerSha256 }),
+      };
   }
 
   private async reconcilePut(
     storageKey: string,
     desired: BlobDescriptor,
     maxBytes: number,
+    migrationOwnerSha256?: string,
   ): Promise<BlobDescriptor | null> {
     const current = await this.readDecoded(storageKey, maxBytes);
     if (!current) return null;
@@ -441,6 +495,15 @@ export class S3BlobStore implements BlobStore {
       throw new Error(`blob upload ${storageKey} was cancelled before publication`);
     }
     if (!sameBlobDescriptor(desired, current.object)) throw new BlobConflictError(storageKey);
+    // A drained runtime may resume its exact staging write after the mover has copied it. An
+    // ownerless replay can therefore accept identical bytes without stripping the embedded mover
+    // marker. A mover-authored replay remains bound to its exact migration owner.
+    if (
+      migrationOwnerSha256 !== undefined
+      && current.migrationOwnerSha256 !== migrationOwnerSha256
+    ) {
+      throw new BlobConflictError(storageKey);
+    }
     return desired;
   }
 
@@ -450,13 +513,16 @@ export class S3BlobStore implements BlobStore {
     validateBlobUploadToken(options.uploadToken);
     const maxBytes = validateBlobMaxBytes(options.maxBytes);
     const contentType = validateBlobContentType(options.contentType);
+    const migrationOwnerSha256 = options.migrationOwnerSha256 === undefined
+      ? undefined
+      : validateBlobMigrationOwnerSha256(options.migrationOwnerSha256);
     const sizeBytes = inputByteLength(data);
     if (sizeBytes > maxBytes) throw new BlobTooLargeError(storageKey, maxBytes, sizeBytes);
 
     // Snapshot before the first await, matching the Memory/Fs adapter contract.
     const payload = Buffer.from(data);
     const desired = blobDescriptorFor(storageKey, payload, contentType);
-    const envelope = encodeBlobDataEnvelope(payload, contentType);
+    const envelope = encodeBlobDataEnvelope(payload, contentType, migrationOwnerSha256);
     const key = this.objectKey(storageKey);
 
     for (let attempt = 0; attempt < this.maxMutationAttempts; attempt += 1) {
@@ -477,7 +543,12 @@ export class S3BlobStore implements BlobStore {
       } catch (error) {
         if (error instanceof S3VersionedObjectError) throw error;
         // This also recovers a lost success response: S3 is strongly read-after-write consistent.
-        const reconciled = await this.reconcilePut(storageKey, desired, maxBytes);
+        const reconciled = await this.reconcilePut(
+          storageKey,
+          desired,
+          maxBytes,
+          migrationOwnerSha256,
+        );
         if (reconciled) return reconciled;
         if (!isConditionalConflict(error)) throw sanitizedS3Error("conditional create", error);
       }
@@ -485,7 +556,12 @@ export class S3BlobStore implements BlobStore {
       if (putSucceeded) {
         // If a concurrent manifest-driven delete already replaced the object with its tombstone,
         // do not tell the ownership layer that publication succeeded.
-        const reconciled = await this.reconcilePut(storageKey, desired, maxBytes);
+        const reconciled = await this.reconcilePut(
+          storageKey,
+          desired,
+          maxBytes,
+          migrationOwnerSha256,
+        );
         if (reconciled) return reconciled;
       }
     }
@@ -498,6 +574,111 @@ export class S3BlobStore implements BlobStore {
     const maxBytes = validateBlobMaxBytes(options.maxBytes);
     const decoded = await this.readDecoded(storageKey, maxBytes);
     return !decoded || decoded.kind === "tombstone" ? null : decoded.object;
+  }
+
+  async getExact(storageKey: string, options: BlobReadOptions) {
+    return this.get(storageKey, options);
+  }
+
+  async inspectExact(storageKey: string, options: BlobReadOptions): Promise<BlobExactInspection> {
+    this.assertOpen();
+    validateBlobKey(storageKey);
+    const state = await this.readExactObjectState(storageKey, validateBlobMaxBytes(options.maxBytes));
+    if (state.kind !== "data") {
+      return {
+        kind: state.kind,
+        ...(state.kind === "tombstone" && state.migrationOwnerSha256 !== undefined
+          ? { migrationOwnerSha256: state.migrationOwnerSha256 }
+          : {}),
+      };
+    }
+    const { data: _data, ...descriptor } = state.object;
+    return {
+      kind: "data",
+      descriptor,
+      ...(state.migrationOwnerSha256 === undefined
+        ? {}
+        : { migrationOwnerSha256: state.migrationOwnerSha256 }),
+    };
+  }
+
+  async discardUncommittedTarget(
+    storageKey: string,
+    options: BlobDiscardUncommittedTargetOptions,
+  ) {
+    this.assertOpen();
+    const expected = validateBlobDiscardInput(
+      storageKey,
+      options.expectedState,
+      options.uploadToken,
+      options.migrationOwnerSha256,
+    );
+    const key = this.objectKey(storageKey);
+    const maxBytes = expected.kind === "data" ? expected.descriptor.sizeBytes : 0;
+    const tombstone = encodeBlobTombstoneEnvelope(options.migrationOwnerSha256);
+    const readAbortFenceState = async () => {
+      let state: ExactObjectState;
+      try {
+        state = await this.readExactObjectState(storageKey, maxBytes);
+      } catch (error) {
+        if (error instanceof BlobTooLargeError) throw new BlobConflictError(storageKey);
+        throw error;
+      }
+      if (state.kind === "missing") return state;
+      if (state.kind === "tombstone") {
+        assertMigrationOwner(
+          storageKey,
+          options.migrationOwnerSha256,
+          state.migrationOwnerSha256,
+        );
+        return state;
+      }
+      assertExpectedMigrationState(
+        storageKey,
+        expected,
+        { kind: "data", descriptor: state.object },
+      );
+      assertMigrationOwner(
+        storageKey,
+        options.migrationOwnerSha256,
+        state.migrationOwnerSha256,
+      );
+      return state;
+    };
+
+    for (let attempt = 0; attempt < this.maxMutationAttempts; attempt += 1) {
+      const state = await readAbortFenceState();
+      if (state.kind === "tombstone") return;
+      if (state.kind === "data" && !state.etag) {
+        throw new Error("S3 blob object has no ETag for conditional abort fencing");
+      }
+
+      try {
+        const output = await this.send((abortSignal) => this.client.send(
+          new PutObjectCommand({
+            Bucket: this.bucket,
+            Key: key,
+            Body: tombstone,
+            ContentType: BLOB_ENVELOPE_OBJECT_CONTENT_TYPE,
+            ...(state.kind === "missing" ? { IfNoneMatch: "*" } : { IfMatch: state.etag }),
+          }),
+          { abortSignal },
+        ));
+        assertUnversionedEvidence(output);
+      } catch (error) {
+        if (error instanceof S3VersionedObjectError) throw error;
+        // A response may be lost after the CAS commits. Only the exact owner-marked tombstone is a
+        // successful replay; foreign bytes or a foreign tombstone remain a hard conflict.
+        const reconciled = await readAbortFenceState();
+        if (reconciled.kind === "tombstone") return;
+        if (isConditionalConflict(error)) continue;
+        throw sanitizedS3Error("conditional migration abort fence", error);
+      }
+
+      const verified = await readAbortFenceState();
+      if (verified.kind === "tombstone") return;
+    }
+    throw new S3BlobSafeError("S3 blob conditional migration abort fence did not converge");
   }
 
   private async currentDeleteState(key: string, tombstone: Buffer): Promise<ObjectState> {
@@ -555,6 +736,59 @@ export class S3BlobStore implements BlobStore {
       throw new Error("S3 blob deletion requires an upload token");
     }
     validateBlobUploadToken(options.uploadToken);
+    const migrationOwnerSha256 = options.migrationOwnerSha256 === undefined
+      ? undefined
+      : validateBlobMigrationOwnerSha256(options.migrationOwnerSha256);
+
+    if (migrationOwnerSha256 !== undefined) {
+      const tombstone = encodeBlobTombstoneEnvelope(migrationOwnerSha256);
+      const readMigrationTombstoneState = async () => {
+        let state: ExactObjectState;
+        try {
+          state = await this.readExactObjectState(storageKey, 0);
+        } catch (error) {
+          if (error instanceof BlobTooLargeError) throw new BlobConflictError(storageKey);
+          throw error;
+        }
+        if (state.kind === "missing") return state;
+        if (state.kind !== "tombstone") throw new BlobConflictError(storageKey);
+        assertMigrationOwner(
+          storageKey,
+          migrationOwnerSha256,
+          state.migrationOwnerSha256,
+        );
+        return state;
+      };
+
+      for (let attempt = 0; attempt < this.maxMutationAttempts; attempt += 1) {
+        const state = await readMigrationTombstoneState();
+        if (state.kind === "tombstone") return;
+        try {
+          const output = await this.send((abortSignal) => this.client.send(
+            new PutObjectCommand({
+              Bucket: this.bucket,
+              Key: key,
+              Body: tombstone,
+              ContentType: BLOB_ENVELOPE_OBJECT_CONTENT_TYPE,
+              IfNoneMatch: "*",
+            }),
+            { abortSignal },
+          ));
+          assertUnversionedEvidence(output);
+        } catch (error) {
+          if (error instanceof S3VersionedObjectError) throw error;
+          // A response may be lost after the create commits. Only this exact embedded owner is an
+          // acceptable replay result; an unmarked or foreign tombstone remains a hard conflict.
+          const reconciled = await readMigrationTombstoneState();
+          if (reconciled.kind === "tombstone") return;
+          if (isConditionalConflict(error)) continue;
+          throw sanitizedS3Error("conditional migration tombstone create", error);
+        }
+        const verified = await readMigrationTombstoneState();
+        if (verified.kind === "tombstone") return;
+      }
+      throw new S3BlobSafeError("S3 migration tombstone create did not converge");
+    }
 
     const tombstone = encodeBlobTombstoneEnvelope();
     for (let attempt = 0; attempt < this.maxMutationAttempts; attempt += 1) {

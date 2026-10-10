@@ -4,7 +4,10 @@ import {
   type BlobDescriptor,
   type BlobObject,
 } from "../types.js";
-import { validateBlobContentType } from "./key.js";
+import {
+  validateBlobContentType,
+  validateBlobMigrationOwnerSha256,
+} from "./key.js";
 
 export const BLOB_ENVELOPE_MAGIC_TEXT = "ASBLOB02";
 export const BLOB_ENVELOPE_MAX_METADATA_BYTES = 16 * 1024;
@@ -16,7 +19,6 @@ const METADATA_LENGTH_OFFSET = ENVELOPE_MAGIC.length;
 const PAYLOAD_LENGTH_OFFSET = METADATA_LENGTH_OFFSET + 4;
 const DIGEST_OFFSET = PAYLOAD_LENGTH_OFFSET + 4;
 export const BLOB_ENVELOPE_HEADER_BYTES = DIGEST_OFFSET + DIGEST_BYTES;
-const TOMBSTONE_METADATA = Buffer.from('{"kind":"tombstone"}', "utf8");
 
 export interface BlobEnvelopeLengths {
   metadataLength: number;
@@ -25,8 +27,8 @@ export interface BlobEnvelopeLengths {
 }
 
 export type DecodedBlobEnvelope =
-  | { kind: "data"; object: BlobObject }
-  | { kind: "tombstone" };
+  | { kind: "data"; object: BlobObject; migrationOwnerSha256?: string }
+  | { kind: "tombstone"; migrationOwnerSha256?: string };
 
 export function inputByteLength(data: Buffer | string) {
   return typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.byteLength;
@@ -71,8 +73,18 @@ function encodeEnvelope(payload: Buffer, metadata: Buffer) {
   return Buffer.concat([header, metadata, payload]);
 }
 
-export function encodeBlobDataEnvelope(payload: Buffer, contentType: string | undefined) {
-  const metadata = Buffer.from(JSON.stringify(contentType === undefined ? {} : { contentType }), "utf8");
+export function encodeBlobDataEnvelope(
+  payload: Buffer,
+  contentType: string | undefined,
+  migrationOwnerSha256?: string,
+) {
+  if (migrationOwnerSha256 !== undefined) {
+    validateBlobMigrationOwnerSha256(migrationOwnerSha256);
+  }
+  const metadata = Buffer.from(JSON.stringify({
+    ...(contentType === undefined ? {} : { contentType }),
+    ...(migrationOwnerSha256 === undefined ? {} : { migrationOwnerSha256 }),
+  }), "utf8");
   return encodeEnvelope(payload, metadata);
 }
 
@@ -81,8 +93,14 @@ export function encodeBlobDataEnvelope(payload: Buffer, contentType: string | un
  * replaces (or creates) this value at the data object's own key, so a later create-only write
  * cannot race between a separate marker check and publication.
  */
-export function encodeBlobTombstoneEnvelope() {
-  return encodeEnvelope(Buffer.alloc(0), TOMBSTONE_METADATA);
+export function encodeBlobTombstoneEnvelope(migrationOwnerSha256?: string) {
+  if (migrationOwnerSha256 !== undefined) {
+    validateBlobMigrationOwnerSha256(migrationOwnerSha256);
+  }
+  return encodeEnvelope(Buffer.alloc(0), Buffer.from(JSON.stringify({
+    kind: "tombstone",
+    ...(migrationOwnerSha256 === undefined ? {} : { migrationOwnerSha256 }),
+  }), "utf8"));
 }
 
 export function hasBlobEnvelopeMagic(data: Buffer) {
@@ -144,13 +162,34 @@ export function decodeBlobEnvelope(
 
   const metadata = decodeMetadata(envelope, payloadOffset);
   const keys = Object.keys(metadata);
-  if (keys.length === 1 && keys[0] === "kind" && metadata.kind === "tombstone") {
-    if (payloadLength !== 0 || !envelope.equals(encodeBlobTombstoneEnvelope())) {
+  let migrationOwnerSha256: string | undefined;
+  try {
+    const value = metadata.migrationOwnerSha256;
+    if (value !== undefined && typeof value !== "string") throw new Error("invalid blob metadata");
+    migrationOwnerSha256 = value === undefined
+      ? undefined
+      : validateBlobMigrationOwnerSha256(value);
+  } catch (error) {
+    if ((error as Error).message === "invalid blob metadata") throw error;
+    throw new Error("invalid blob metadata", { cause: error });
+  }
+
+  if (
+    metadata.kind === "tombstone"
+    && keys.every((key) => key === "kind" || key === "migrationOwnerSha256")
+    && keys.includes("kind")
+  ) {
+    if (payloadLength !== 0 || !envelope.equals(encodeBlobTombstoneEnvelope(migrationOwnerSha256))) {
       throw new Error("invalid blob tombstone");
     }
-    return { kind: "tombstone" };
+    return {
+      kind: "tombstone",
+      ...(migrationOwnerSha256 === undefined ? {} : { migrationOwnerSha256 }),
+    };
   }
-  if (keys.some((key) => key !== "contentType")) throw new Error("invalid blob metadata");
+  if (keys.some((key) => key !== "contentType" && key !== "migrationOwnerSha256")) {
+    throw new Error("invalid blob metadata");
+  }
 
   let contentType: string | undefined;
   try {
@@ -163,7 +202,11 @@ export function decodeBlobEnvelope(
   }
 
   const data = Buffer.from(envelope.subarray(payloadOffset));
-  return { kind: "data", object: { ...blobDescriptorFor(storageKey, data, contentType), data } };
+  return {
+    kind: "data",
+    object: { ...blobDescriptorFor(storageKey, data, contentType), data },
+    ...(migrationOwnerSha256 === undefined ? {} : { migrationOwnerSha256 }),
+  };
 }
 
 export function decodeBlobDataEnvelope(

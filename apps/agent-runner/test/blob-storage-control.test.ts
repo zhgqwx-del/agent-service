@@ -1,7 +1,10 @@
 import type { BlobStorageCapability } from "@agent-service/protocol";
 import { MemorySessionStore, type BlobStorageControlStore } from "@agent-service/store";
 import { describe, expect, it } from "vitest";
-import { reconcileBlobStorageControl } from "../src/blob-storage-control.js";
+import {
+  reconcileBlobStorageControl,
+  reconcileBlobStorageControlForRuntime,
+} from "../src/blob-storage-control.js";
 
 const EXPECTED: BlobStorageCapability = {
   backend: `s3-v1-${"a".repeat(24)}`,
@@ -39,6 +42,32 @@ describe("runner Blob storage startup control", () => {
       },
     };
     await expect(reconcileBlobStorageControl(responseLoss, EXPECTED)).resolves.toBe(1);
+  });
+
+  it("rechecks migration authority after an exact namespace reconciliation", async () => {
+    const store = new MemorySessionStore();
+    await store.activateBlobStorageControl({
+      expectedControlGeneration: 0,
+      storageBackend: EXPECTED.backend,
+      namespaceSha256: EXPECTED.namespaceSha256,
+    });
+    const startupRace = new Error("migration committed during S3 startup");
+    let checkedAfterReconciliation = false;
+
+    await expect(reconcileBlobStorageControlForRuntime(
+      store,
+      EXPECTED,
+      async () => {
+        await expect(store.getBlobStorageControl()).resolves.toMatchObject({
+          controlGeneration: 1,
+          storageBackend: EXPECTED.backend,
+          namespaceSha256: EXPECTED.namespaceSha256,
+        });
+        checkedAfterReconciliation = true;
+        throw startupRace;
+      },
+    )).rejects.toBe(startupRace);
+    expect(checkedAfterReconciliation).toBe(true);
   });
 
   it("rejects namespace rollback, mismatch, and filesystem fallback after activation", async () => {

@@ -3,6 +3,7 @@ const MAX_BLOB_KEY_SEGMENT_LENGTH = 128;
 const MAX_UPLOAD_TOKEN_LENGTH = 128;
 const MAX_CONTENT_TYPE_LENGTH = 255;
 const MAX_ENVELOPE_PAYLOAD_BYTES = 0xffff_ffff;
+const MIGRATION_OWNER_SHA256 = /^[0-9a-f]{64}$/;
 // Lowercase is intentional: APFS, NTFS and common macOS/Windows development volumes case-fold
 // filenames. Accepting both `Tenant` and `tenant` would make FsBlobStore alias keys that remain
 // distinct in MemoryBlobStore.
@@ -50,6 +51,17 @@ export function validateBlobUploadToken(uploadToken: string): string {
     );
   }
   return uploadToken;
+}
+
+/**
+ * Content-free ownership marker embedded in objects written by the offline namespace mover.
+ * Runtime writes deliberately omit it; abort cleanup requires the exact marker before deleting.
+ */
+export function validateBlobMigrationOwnerSha256(value: string): string {
+  if (typeof value !== "string" || !MIGRATION_OWNER_SHA256.test(value)) {
+    throw new Error("blob migration owner sha256 must be 64 lowercase hexadecimal characters");
+  }
+  return value;
 }
 
 /**

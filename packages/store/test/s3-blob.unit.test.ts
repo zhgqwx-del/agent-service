@@ -21,6 +21,8 @@ import {
 import { BLOB_ENVELOPE_HEADER_BYTES } from "../src/blob/envelope.js";
 
 const MAX_BYTES = 1024 * 1024;
+const MIGRATION_OWNER_SHA256 = "a".repeat(64);
+const OTHER_MIGRATION_OWNER_SHA256 = "b".repeat(64);
 
 function serviceError(status: number, name = status === 412 ? "PreconditionFailed" : "ServiceError") {
   return Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
@@ -194,6 +196,12 @@ describe("S3BlobStore unit contract", () => {
     const puts = client.commands.filter((command): command is PutObjectCommand => command instanceof PutObjectCommand);
     expect(puts.some((command) => command.input.IfNoneMatch === "*")).toBe(true);
     expect(puts.some((command) => command.input.IfMatch !== undefined)).toBe(true);
+    const cleanupDeletes = client.commands.filter((command): command is DeleteObjectCommand => (
+      command instanceof DeleteObjectCommand
+    ));
+    expect(cleanupDeletes).toHaveLength(1);
+    expect(cleanupDeletes[0]?.input.IfMatch).toBeUndefined();
+    expect(cleanupDeletes[0]?.input.Key).toContain("/_agent_service_probe/");
 
     for (const versioning of ["Enabled", "Suspended"] as const) {
       const fixture = makeStore();
@@ -365,6 +373,426 @@ describe("S3BlobStore unit contract", () => {
       contentType: "application/octet-stream",
     })).rejects.toBeInstanceOf(BlobConflictError);
     expect((await store.get("objects/blob-1", { maxBytes: MAX_BYTES }))?.data).toEqual(bytes);
+  });
+
+  it("persists migration ownership, recovers lost responses, and rejects foreign identical bytes", async () => {
+    const migration = makeStore();
+    migration.client.loseNextPutResponse = true;
+    const descriptor = await migration.store.putIfAbsent("objects/migration-owned", "same", {
+      uploadToken: "migration-owned",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await migration.store.inspectExact("objects/migration-owned", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "data",
+      descriptor,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await migration.store.get("objects/migration-owned", { maxBytes: MAX_BYTES })).toEqual({
+      ...descriptor,
+      data: Buffer.from("same"),
+    });
+    await expect(migration.store.putIfAbsent("objects/migration-owned", "same", {
+      uploadToken: "foreign-owner",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+      migrationOwnerSha256: OTHER_MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    await expect(migration.store.putIfAbsent("objects/migration-owned", "same", {
+      uploadToken: "ordinary-retry",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+    })).resolves.toEqual(descriptor);
+    expect(await migration.store.inspectExact("objects/migration-owned", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "data",
+      descriptor,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await expect(migration.store.delete("objects/migration-owned", {
+      uploadToken: "migration-owned-tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    expect((await migration.store.get("objects/migration-owned", { maxBytes: MAX_BYTES }))?.data.toString()).toBe(
+      "same",
+    );
+
+    const preexisting = makeStore();
+    const preexistingDescriptor = await preexisting.store.putIfAbsent("objects/preexisting", "same", {
+      uploadToken: "preexisting",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+    });
+    await expect(preexisting.store.putIfAbsent("objects/preexisting", "same", {
+      uploadToken: "migration-copy",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    await expect(preexisting.store.discardUncommittedTarget("objects/preexisting", {
+      expectedState: { kind: "data", descriptor: preexistingDescriptor },
+      uploadToken: "migration-copy",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    expect((await preexisting.store.get("objects/preexisting", { maxBytes: MAX_BYTES }))?.data.toString()).toBe("same");
+
+    const tombstone = makeStore();
+    tombstone.client.loseNextPutResponse = true;
+    await expect(tombstone.store.delete("objects/migration-tombstone-loss", {
+      uploadToken: "migration-tombstone-loss",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).resolves.toBeUndefined();
+    expect(await tombstone.store.inspectExact("objects/migration-tombstone-loss", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await expect(tombstone.store.discardUncommittedTarget("objects/migration-tombstone-loss", {
+      expectedState: { kind: "tombstone" },
+      uploadToken: "migration-tombstone-loss",
+      migrationOwnerSha256: OTHER_MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+
+    await expect(tombstone.store.delete("objects/invalid-migration-owner", {
+      uploadToken: "invalid-migration-owner",
+      migrationOwnerSha256: "A".repeat(64),
+    })).rejects.toThrow("migration owner sha256");
+  });
+
+  it("does not replace foreign data that appears after migration-tombstone pre-inspection", async () => {
+    const { client, store } = makeStore();
+    await store.putIfAbsent("objects/foreign-template", "foreign", {
+      uploadToken: "foreign-template",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+    });
+    const foreignEnvelope = Buffer.from(
+      client.objects.get("agent-service-test/tenant-blobs/objects/foreign-template")!.body,
+    );
+    client.beforeNextPut = (command) => {
+      if (!command.input.Key?.endsWith("objects/migration-tombstone-race")) {
+        throw new Error("unexpected migration tombstone race command");
+      }
+      client.seed(
+        "agent-service-test",
+        "tenant-blobs/objects/migration-tombstone-race",
+        foreignEnvelope,
+      );
+    };
+
+    await expect(store.delete("objects/migration-tombstone-race", {
+      uploadToken: "migration-tombstone-race",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    expect((await store.get("objects/migration-tombstone-race", { maxBytes: MAX_BYTES }))?.data.toString()).toBe(
+      "foreign",
+    );
+    const attempted = client.commands.findLast((command): command is PutObjectCommand => (
+      command instanceof PutObjectCommand
+      && command.input.Key?.endsWith("objects/migration-tombstone-race") === true
+    ));
+    expect(attempted?.input.IfNoneMatch).toBe("*");
+    expect(attempted?.input.IfMatch).toBeUndefined();
+  });
+
+  it("converges late owned PUT races to a final create-only abort fence", async () => {
+    // Fence wins: the PUT was already issued but has not reached its conditional-create point.
+    const fenceWinner = makeStore();
+    let releasePut!: () => void;
+    const putGate = new Promise<void>((resolve) => { releasePut = resolve; });
+    let putReached!: () => void;
+    const atPut = new Promise<void>((resolve) => { putReached = resolve; });
+    fenceWinner.client.beforeNextPut = async (command) => {
+      if (!command.input.Key?.endsWith("objects/fence-wins")) {
+        throw new Error("unexpected late-copy command");
+      }
+      putReached();
+      await putGate;
+    };
+    const delayedPut = fenceWinner.store.putIfAbsent("objects/fence-wins", "owned", {
+      uploadToken: "fence-wins-copy",
+      maxBytes: MAX_BYTES,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await atPut;
+    await fenceWinner.store.delete("objects/fence-wins", {
+      uploadToken: "fence-wins-delete",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    releasePut();
+    await expect(delayedPut).rejects.toThrow("cancelled before publication");
+    expect(await fenceWinner.store.inspectExact("objects/fence-wins", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+
+    // PUT wins after delete's missing pre-inspection: delete conflicts instead of overwriting it;
+    // the coordinator's exact discard + retry then establishes the permanent owner fence.
+    const putWinner = makeStore();
+    const templateDescriptor = await putWinner.store.putIfAbsent("objects/owned-template", "owned", {
+      uploadToken: "owned-template",
+      maxBytes: MAX_BYTES,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    const ownedEnvelope = Buffer.from(
+      putWinner.client.objects.get("agent-service-test/tenant-blobs/objects/owned-template")!.body,
+    );
+    putWinner.client.beforeNextPut = (command) => {
+      if (!command.input.Key?.endsWith("objects/put-wins")) {
+        throw new Error("unexpected abort-fence command");
+      }
+      putWinner.client.seed("agent-service-test", "tenant-blobs/objects/put-wins", ownedEnvelope);
+    };
+    await expect(putWinner.store.delete("objects/put-wins", {
+      uploadToken: "put-wins-delete",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    const observed = await putWinner.store.inspectExact("objects/put-wins", { maxBytes: MAX_BYTES });
+    expect(observed).toEqual({
+      kind: "data",
+      descriptor: { ...templateDescriptor, storageKey: "objects/put-wins" },
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    if (observed.kind !== "data") throw new Error("expected late owned PUT");
+    await putWinner.store.discardUncommittedTarget("objects/put-wins", {
+      expectedState: { kind: "data", descriptor: observed.descriptor },
+      uploadToken: "put-wins-copy",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await putWinner.store.delete("objects/put-wins", {
+      uploadToken: "put-wins-delete",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await putWinner.store.inspectExact("objects/put-wins", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await expect(putWinner.store.putIfAbsent("objects/put-wins", "owned", {
+      uploadToken: "put-wins-too-late",
+      maxBytes: MAX_BYTES,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toThrow("cancelled before publication");
+  });
+
+  it("inspects exact physical states without collapsing tombstones into missing", async () => {
+    const { store } = makeStore();
+    expect(await store.inspectExact("objects/inspect", { maxBytes: MAX_BYTES })).toEqual({ kind: "missing" });
+    const descriptor = await store.putIfAbsent("objects/inspect", "value", {
+      uploadToken: "inspect",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+    });
+    expect(await store.inspectExact("objects/inspect", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "data",
+      descriptor,
+    });
+    await store.delete("objects/inspect", { uploadToken: "inspect-delete" });
+    expect(await store.inspectExact("objects/inspect", { maxBytes: MAX_BYTES })).toEqual({ kind: "tombstone" });
+  });
+
+  it("CAS-replaces exact uncommitted data with a durable owner fence and allows safe replay", async () => {
+    const { client, store } = makeStore();
+    const dataDescriptor = await store.putIfAbsent("objects/discard-data", "uncommitted", {
+      uploadToken: "discard-data",
+      maxBytes: MAX_BYTES,
+      contentType: "text/plain",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await store.discardUncommittedTarget("objects/discard-data", {
+      expectedState: { kind: "data", descriptor: dataDescriptor },
+      uploadToken: "discard-data",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await store.discardUncommittedTarget("objects/discard-data", {
+      expectedState: { kind: "data", descriptor: dataDescriptor },
+      uploadToken: "discard-data",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await store.inspectExact("objects/discard-data", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+
+    await store.delete("objects/discard-tombstone", {
+      uploadToken: "discard-tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await store.inspectExact("objects/discard-tombstone", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await store.discardUncommittedTarget("objects/discard-tombstone", {
+      expectedState: { kind: "tombstone" },
+      uploadToken: "discard-tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await store.discardUncommittedTarget("objects/discard-tombstone", {
+      expectedState: { kind: "tombstone" },
+      uploadToken: "discard-tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await store.inspectExact("objects/discard-tombstone", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await expect(store.putIfAbsent("objects/discard-tombstone", "after-abort", {
+      uploadToken: "after-abort",
+      maxBytes: MAX_BYTES,
+    })).rejects.toThrow("cancelled before publication");
+
+    const fenceWrites = client.commands.filter((command): command is PutObjectCommand => (
+      command instanceof PutObjectCommand
+      && command.input.Key?.endsWith("objects/discard-data") === true
+      && command.input.IfMatch !== undefined
+    ));
+    expect(fenceWrites).toHaveLength(1);
+  });
+
+  it("uses exact on-object migration provenance independently of the upload token", async () => {
+    const { store } = makeStore();
+    const descriptor = await store.putIfAbsent("objects/discard-ledger-token", "uncommitted", {
+      uploadToken: "initial-write-token",
+      maxBytes: MAX_BYTES,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await expect(store.discardUncommittedTarget("objects/discard-ledger-token", {
+      expectedState: { kind: "data", descriptor },
+      uploadToken: "ledger-authorized-token",
+      migrationOwnerSha256: OTHER_MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    await store.discardUncommittedTarget("objects/discard-ledger-token", {
+      expectedState: { kind: "data", descriptor },
+      uploadToken: "ledger-authorized-token",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    expect(await store.inspectExact("objects/discard-ledger-token", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+  });
+
+  it("refuses to fence a different descriptor, state, owner, or unsafe token", async () => {
+    const { store } = makeStore();
+    const descriptor = await store.putIfAbsent("objects/discard-conflict", "original", {
+      uploadToken: "discard-conflict",
+      maxBytes: MAX_BYTES,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await expect(store.discardUncommittedTarget("objects/discard-conflict", {
+      expectedState: { kind: "data", descriptor: { ...descriptor, sha256: "0".repeat(64) } },
+      uploadToken: "discard-conflict",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    await expect(store.discardUncommittedTarget("objects/discard-conflict", {
+      expectedState: { kind: "tombstone" },
+      uploadToken: "discard-conflict",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    await expect(store.discardUncommittedTarget("objects/discard-conflict", {
+      expectedState: { kind: "data", descriptor },
+      uploadToken: "../unsafe",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toThrow("upload token");
+    expect(await store.inspectExact("objects/discard-conflict", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "data",
+      descriptor,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+
+    await store.delete("objects/discard-conflict", { uploadToken: "discard-conflict-delete" });
+    await expect(store.discardUncommittedTarget("objects/discard-conflict", {
+      expectedState: { kind: "data", descriptor },
+      uploadToken: "discard-conflict",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    expect(await store.inspectExact("objects/discard-conflict", { maxBytes: MAX_BYTES })).toEqual({
+      kind: "tombstone",
+    });
+  });
+
+  it("does not overwrite a different object that wins after exact inspection", async () => {
+    const { client, store } = makeStore();
+    const descriptor = await store.putIfAbsent("objects/discard-race", "original", {
+      uploadToken: "discard-race",
+      maxBytes: MAX_BYTES,
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    });
+    await store.putIfAbsent("objects/discard-race-replacement", "replaced", {
+      uploadToken: "discard-race-replacement",
+      maxBytes: MAX_BYTES,
+    });
+    const replacement = Buffer.from(
+      client.objects.get("agent-service-test/tenant-blobs/objects/discard-race-replacement")!.body,
+    );
+    client.beforeNextPut = (command) => {
+      if (!command.input.Key?.endsWith("objects/discard-race")) {
+        throw new Error("unexpected discard race command");
+      }
+      client.seed("agent-service-test", "tenant-blobs/objects/discard-race", replacement);
+    };
+
+    await expect(store.discardUncommittedTarget("objects/discard-race", {
+      expectedState: { kind: "data", descriptor },
+      uploadToken: "discard-race",
+      migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+    })).rejects.toBeInstanceOf(BlobConflictError);
+    expect((await store.get("objects/discard-race", { maxBytes: MAX_BYTES }))?.data.toString()).toBe("replaced");
+  });
+
+  it("reconciles lost CAS-fence responses and retries conditional or false acknowledgements", async () => {
+    for (const mode of ["response-loss", "conditional-conflict", "false-ack"] as const) {
+      const fixture = makeStore();
+      const storageKey = `objects/discard-${mode}`;
+      const descriptor = await fixture.store.putIfAbsent(storageKey, "uncommitted", {
+        uploadToken: `discard-${mode}`,
+        maxBytes: MAX_BYTES,
+        migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+      });
+      if (mode === "response-loss") fixture.client.loseNextPutResponse = true;
+      else if (mode === "conditional-conflict") fixture.client.failConditionalPuts = 1;
+      else fixture.client.acknowledgePutsWithoutCommit = 1;
+
+      await expect(fixture.store.discardUncommittedTarget(storageKey, {
+        expectedState: { kind: "data", descriptor },
+        uploadToken: `discard-${mode}`,
+        migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+      })).resolves.toBeUndefined();
+      expect(await fixture.store.inspectExact(storageKey, { maxBytes: MAX_BYTES })).toEqual({
+        kind: "tombstone",
+        migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+      });
+      const fenceWrites = fixture.client.commands.filter((command): command is PutObjectCommand => (
+        command instanceof PutObjectCommand
+        && command.input.Key?.endsWith(storageKey) === true
+        && command.input.IfMatch !== undefined
+      ));
+      expect(fenceWrites).toHaveLength(mode === "response-loss" ? 1 : 2);
+    }
+  });
+
+  it("reconstructs a missing owner fence across create response loss, conflict, and false ACK", async () => {
+    for (const mode of ["response-loss", "conditional-conflict", "false-ack"] as const) {
+      const fixture = makeStore();
+      const storageKey = `objects/discard-tombstone-${mode}`;
+      if (mode === "response-loss") fixture.client.loseNextPutResponse = true;
+      else if (mode === "conditional-conflict") fixture.client.failConditionalPuts = 1;
+      else fixture.client.acknowledgePutsWithoutCommit = 1;
+
+      await expect(fixture.store.discardUncommittedTarget(storageKey, {
+        expectedState: { kind: "tombstone" },
+        uploadToken: `tombstone-${mode}`,
+        migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+      })).resolves.toBeUndefined();
+      expect(await fixture.store.inspectExact(storageKey, { maxBytes: MAX_BYTES })).toEqual({
+        kind: "tombstone",
+        migrationOwnerSha256: MIGRATION_OWNER_SHA256,
+      });
+      const fenceWrites = fixture.client.commands.filter((command): command is PutObjectCommand => (
+        command instanceof PutObjectCommand
+        && command.input.Key?.endsWith(storageKey) === true
+        && command.input.IfNoneMatch === "*"
+      ));
+      expect(fenceWrites).toHaveLength(mode === "response-loss" ? 1 : 2);
+    }
   });
 
   it("linearizes concurrent conflicting writers through conditional create", async () => {

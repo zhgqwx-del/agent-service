@@ -695,6 +695,11 @@ export interface BlobPutOptions {
   /** Hard upper bound checked before copying/allocating the caller's payload. */
   maxBytes: number;
   contentType?: string;
+  /**
+   * Offline-migration provenance embedded in ASBLOB02 metadata. Runtime writes must omit it.
+   * It does not form part of the business BlobDescriptor.
+   */
+  migrationOwnerSha256?: string;
 }
 
 export interface BlobReadOptions {
@@ -709,6 +714,8 @@ export interface BlobDeleteOptions {
    * a manifest-driven delete cannot subsequently be published, even with a different token.
    */
   uploadToken?: string;
+  /** Offline-migration provenance for a target tombstone. Runtime deletes must omit it. */
+  migrationOwnerSha256?: string;
 }
 
 export interface BlobObject extends BlobDescriptor {
@@ -750,4 +757,50 @@ export interface BlobStore {
   /** New business paths address objects by opaque storage key, never by backend-specific URI. */
   get(storageKey: string, options: BlobReadOptions): Promise<BlobObject | null>;
   delete(storageKey: string, options?: BlobDeleteOptions): Promise<void>;
+}
+
+/** Exact physical state used only by the audited, offline blob namespace mover. */
+export type BlobExactInspection =
+  | { kind: "missing" }
+  | { kind: "tombstone"; migrationOwnerSha256?: string }
+  | { kind: "data"; descriptor: BlobDescriptor; migrationOwnerSha256?: string };
+
+export type BlobExpectedExactState =
+  | { kind: "tombstone" }
+  | { kind: "data"; descriptor: BlobDescriptor };
+
+export interface BlobDiscardUncommittedTargetOptions {
+  /** Exact data descriptor or tombstone state sealed by the migration ledger. */
+  expectedState: BlobExpectedExactState;
+  /**
+   * Migration-ledger authorization token. Adapters validate its syntax and filesystem uses it to
+   * scope recoverable temporary artifacts. The token itself is not persisted in ASBLOB02; the
+   * separate migrationOwnerSha256 field supplies content-free final-object provenance.
+   */
+  uploadToken: string;
+  /** Must exactly match the marker embedded by the migration's target write. */
+  migrationOwnerSha256: string;
+}
+
+/**
+ * Cleanup primitives reserved for an offline blob migration while its target namespace is still
+ * unactivated. The caller must prove that precondition; normal application code must depend on
+ * BlobStore and use its permanent, fenced delete path instead. The caller also binds uploadToken to
+ * expectedState through the durable ledger; adapters enforce state/descriptor equality, embedded
+ * migration ownership and CAS. An adapter may physically remove private local bytes, but a shared
+ * object store may instead CAS-replace them with a permanent owned tombstone when conditional object
+ * deletion is unavailable. In either case the attempted target namespace is never reusable.
+ */
+export interface BlobMigrationStore extends BlobStore {
+  /**
+   * Read the exact migration payload. Filesystem additionally accepts its audited pre-ASBLOB02
+   * raw-file + JSON-sidecar representation; normal runtime reads remain envelope-only.
+   */
+  getExact(storageKey: string, options: BlobReadOptions): Promise<BlobObject | null>;
+  inspectExact(storageKey: string, options: BlobReadOptions): Promise<BlobExactInspection>;
+  /** Establish an exact, owner-bound abort fence; physical absence is not part of this contract. */
+  discardUncommittedTarget(
+    storageKey: string,
+    options: BlobDiscardUncommittedTargetOptions,
+  ): Promise<void>;
 }

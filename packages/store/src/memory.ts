@@ -48,7 +48,7 @@ import {
   assignItemSeqs,
   assignTurnSeqEnd,
   backfillAssignedSequences,
-  type BlobStore,
+  type BlobMigrationStore,
   type BlobDescriptor,
   type BillingUsageFact,
   type CommitBatch,
@@ -77,8 +77,14 @@ import {
   validateBlobContentType,
   validateBlobKey,
   validateBlobMaxBytes,
+  validateBlobMigrationOwnerSha256,
   validateBlobUploadToken,
 } from "./blob/key.js";
+import {
+  assertExpectedMigrationState,
+  assertMigrationOwner,
+  validateBlobDiscardInput,
+} from "./blob/migration.js";
 import {
   assertLifecycleOutboxId,
   parseLifecycleOutboxEnvelope,
@@ -20029,10 +20035,14 @@ export class MemoryEventBus implements EventBus {
   }
 }
 
-export class MemoryBlobStore implements BlobStore {
+export class MemoryBlobStore implements BlobMigrationStore {
   readonly backend = "memory-v1";
-  private readonly blobs = new Map<string, { descriptor: BlobDescriptor; data: Buffer }>();
-  private readonly cancelledStorageKeys = new Set<string>();
+  private readonly blobs = new Map<string, {
+    descriptor: BlobDescriptor;
+    data: Buffer;
+    migrationOwnerSha256?: string;
+  }>();
+  private readonly cancelledStorageKeys = new Map<string, string | undefined>();
 
   async putIfAbsent(
     storageKey: string,
@@ -20043,6 +20053,9 @@ export class MemoryBlobStore implements BlobStore {
     validateBlobUploadToken(options.uploadToken);
     const maxBytes = validateBlobMaxBytes(options.maxBytes);
     const contentType = validateBlobContentType(options.contentType);
+    const migrationOwnerSha256 = options.migrationOwnerSha256 === undefined
+      ? undefined
+      : validateBlobMigrationOwnerSha256(options.migrationOwnerSha256);
     const sizeBytes = typeof data === "string" ? Buffer.byteLength(data, "utf8") : data.byteLength;
     if (sizeBytes > maxBytes) throw new BlobTooLargeError(storageKey, maxBytes, sizeBytes);
     if (this.cancelledStorageKeys.has(storageKey)) {
@@ -20062,10 +20075,18 @@ export class MemoryBlobStore implements BlobStore {
       const matches = existing.descriptor.sha256 === descriptor.sha256
         && existing.descriptor.sizeBytes === descriptor.sizeBytes
         && existing.descriptor.contentType === descriptor.contentType;
-      if (!matches) throw new BlobConflictError(storageKey);
+      if (
+        !matches
+        || (migrationOwnerSha256 !== undefined
+          && existing.migrationOwnerSha256 !== migrationOwnerSha256)
+      ) throw new BlobConflictError(storageKey);
       return { ...existing.descriptor };
     }
-    this.blobs.set(storageKey, { descriptor, data: snapshot });
+    this.blobs.set(storageKey, {
+      descriptor,
+      data: snapshot,
+      ...(migrationOwnerSha256 === undefined ? {} : { migrationOwnerSha256 }),
+    });
     return { ...descriptor };
   }
 
@@ -20080,13 +20101,89 @@ export class MemoryBlobStore implements BlobStore {
     return { ...blob.descriptor, data: Buffer.from(blob.data) };
   }
 
+  async getExact(storageKey: string, options: import("./types.js").BlobReadOptions) {
+    return this.get(storageKey, options);
+  }
+
+  async inspectExact(storageKey: string, options: import("./types.js").BlobReadOptions) {
+    validateBlobKey(storageKey);
+    const maxBytes = validateBlobMaxBytes(options.maxBytes);
+    if (this.cancelledStorageKeys.has(storageKey)) {
+      const migrationOwnerSha256 = this.cancelledStorageKeys.get(storageKey);
+      return {
+        kind: "tombstone",
+        ...(migrationOwnerSha256 === undefined ? {} : { migrationOwnerSha256 }),
+      } as const;
+    }
+    const blob = this.blobs.get(storageKey);
+    if (!blob) return { kind: "missing" } as const;
+    if (blob.data.byteLength > maxBytes) {
+      throw new BlobTooLargeError(storageKey, maxBytes, blob.data.byteLength);
+    }
+    return {
+      kind: "data",
+      descriptor: { ...blob.descriptor },
+      ...(blob.migrationOwnerSha256 === undefined
+        ? {}
+        : { migrationOwnerSha256: blob.migrationOwnerSha256 }),
+    } as const;
+  }
+
+  async discardUncommittedTarget(
+    storageKey: string,
+    options: import("./types.js").BlobDiscardUncommittedTargetOptions,
+  ) {
+    const expected = validateBlobDiscardInput(
+      storageKey,
+      options.expectedState,
+      options.uploadToken,
+      options.migrationOwnerSha256,
+    );
+    if (this.cancelledStorageKeys.has(storageKey)) {
+      assertExpectedMigrationState(storageKey, expected, { kind: "tombstone" });
+      assertMigrationOwner(
+        storageKey,
+        options.migrationOwnerSha256,
+        this.cancelledStorageKeys.get(storageKey),
+      );
+      this.cancelledStorageKeys.delete(storageKey);
+      return;
+    }
+    const blob = this.blobs.get(storageKey);
+    if (!blob) return;
+    assertExpectedMigrationState(storageKey, expected, { kind: "data", descriptor: blob.descriptor });
+    assertMigrationOwner(storageKey, options.migrationOwnerSha256, blob.migrationOwnerSha256);
+    // There is no await between inspection and deletion, so this is one Memory adapter boundary.
+    this.blobs.delete(storageKey);
+  }
+
   async delete(storageKey: string, options: import("./types.js").BlobDeleteOptions = {}) {
     validateBlobKey(storageKey);
+    const migrationOwnerSha256 = options.migrationOwnerSha256 === undefined
+      ? undefined
+      : validateBlobMigrationOwnerSha256(options.migrationOwnerSha256);
+    if (migrationOwnerSha256 !== undefined && options.uploadToken === undefined) {
+      throw new Error("blob migration tombstone requires an upload token");
+    }
     if (options.uploadToken !== undefined) {
       validateBlobUploadToken(options.uploadToken);
+      if (migrationOwnerSha256 !== undefined) {
+        if (this.cancelledStorageKeys.has(storageKey)) {
+          assertMigrationOwner(
+            storageKey,
+            migrationOwnerSha256,
+            this.cancelledStorageKeys.get(storageKey),
+          );
+          return;
+        }
+        const existing = this.blobs.get(storageKey);
+        // A migration tombstone is create-only. Even data written by the same migration owner is a
+        // different inventory disposition and must never be replaced by this path.
+        if (existing) throw new BlobConflictError(storageKey);
+      }
       // Mirror the durable adapter contract: a manifest-driven delete permanently fences this
       // globally unique key, including when deletion linearizes before a delayed upload begins.
-      this.cancelledStorageKeys.add(storageKey);
+      this.cancelledStorageKeys.set(storageKey, migrationOwnerSha256);
     }
     this.blobs.delete(storageKey);
   }

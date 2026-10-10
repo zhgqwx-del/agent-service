@@ -1,38 +1,61 @@
 import { createHash } from "node:crypto";
-import { chmod, link, lstat, mkdir, open, realpath, unlink } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { chmod, link, lstat, mkdir, open, realpath, stat, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   BlobConflictError,
   BlobTooLargeError,
   type BlobDeleteOptions,
   type BlobDescriptor,
+  type BlobDiscardUncommittedTargetOptions,
+  type BlobExactInspection,
+  type BlobMigrationStore,
   type BlobObject,
   type BlobPutOptions,
   type BlobReadOptions,
-  type BlobStore,
 } from "../types.js";
 import {
   BLOB_ENVELOPE_HEADER_BYTES,
+  BLOB_ENVELOPE_MAGIC_TEXT,
   BLOB_ENVELOPE_MAX_METADATA_BYTES,
   blobDescriptorFor,
   blobEnvelopeLengths,
-  decodeBlobDataEnvelope,
+  decodeBlobEnvelope,
   encodeBlobDataEnvelope,
+  encodeBlobTombstoneEnvelope,
   inputByteLength,
   sameBlobDescriptor,
+  type DecodedBlobEnvelope,
 } from "./envelope.js";
 import {
   validateBlobContentType,
   validateBlobKey,
   validateBlobMaxBytes,
+  validateBlobMigrationOwnerSha256,
   validateBlobUploadToken,
 } from "./key.js";
+import {
+  assertExpectedMigrationState,
+  assertMigrationOwner,
+  validateBlobDiscardInput,
+} from "./migration.js";
 
 const LEGACY_REF_PREFIX = "file://";
 const DIRECTORY_MODE = 0o700;
 const FILE_MODE = 0o600;
 const UPLOAD_WAIT_ATTEMPTS = 1_000;
 const UPLOAD_WAIT_MS = 5;
+const BLOB_ENVELOPE_MAGIC = Buffer.from(BLOB_ENVELOPE_MAGIC_TEXT, "ascii");
+
+type FsExactPathState =
+  | { kind: "missing" }
+  | { kind: "tombstone"; migrationOwnerSha256?: string }
+  | {
+    kind: "data";
+    descriptor: BlobDescriptor;
+    legacy: boolean;
+    migrationOwnerSha256?: string;
+  };
 
 function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
   return (error as NodeJS.ErrnoException)?.code === code;
@@ -40,6 +63,22 @@ function isErrno(error: unknown, code: string): error is NodeJS.ErrnoException {
 
 function isNotFound(error: unknown): error is NodeJS.ErrnoException {
   return isErrno(error, "ENOENT");
+}
+
+function canonicalizeRootIdentity(root: string): string {
+  let existing = root;
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      return resolve(realpathSync.native(existing), ...missingSegments);
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+      const parent = dirname(existing);
+      if (parent === existing) throw error;
+      missingSegments.unshift(basename(existing));
+      existing = parent;
+    }
+  }
 }
 
 async function unlinkIfExists(path: string) {
@@ -72,13 +111,21 @@ async function readExactly(
  * Hard links provide a create-only atomic publication point for concurrent readers/writers, but
  * this development adapter is not a power-loss durability boundary. Production swaps in OSS/S3.
  */
-export class FsBlobStore implements BlobStore {
+export class FsBlobStore implements BlobMigrationStore {
   readonly backend = "filesystem-v1";
+  readonly namespaceSha256: string;
   private readonly root: string;
+  private readonly rootIdentity: string;
 
   constructor(root: string) {
     if (!root) throw new Error("blob root must not be empty");
     this.root = resolve(root);
+    // Bind the namespace to the physical existing ancestor plus any not-yet-created suffix. This
+    // makes lexical aliases converge and lets every operation detect a retargeted parent symlink.
+    this.rootIdentity = canonicalizeRootIdentity(this.root);
+    this.namespaceSha256 = createHash("sha256")
+      .update(JSON.stringify(["blob-filesystem-namespace-v1", this.rootIdentity]))
+      .digest("hex");
   }
 
   private parseLegacyRef(ref: string) {
@@ -89,13 +136,18 @@ export class FsBlobStore implements BlobStore {
   }
 
   private async canonicalRoot(create: boolean) {
+    if (canonicalizeRootIdentity(this.root) !== this.rootIdentity) {
+      throw new Error("blob root identity changed");
+    }
     if (create) await mkdir(this.root, { recursive: true, mode: DIRECTORY_MODE });
     try {
       const stat = await lstat(this.root);
       if (stat.isSymbolicLink()) throw new Error("blob root must not be a symbolic link");
       if (!stat.isDirectory()) throw new Error("blob root must be a directory");
       await chmod(this.root, DIRECTORY_MODE);
-      return await realpath(this.root);
+      const canonical = await realpath(this.root);
+      if (canonical !== this.rootIdentity) throw new Error("blob root identity changed");
+      return canonical;
     } catch (error) {
       if (!create && isNotFound(error)) return null;
       throw error;
@@ -156,6 +208,11 @@ export class FsBlobStore implements BlobStore {
     return path;
   }
 
+  private cancellationPath(target: string) {
+    const nameHash = createHash("sha256").update(basename(target)).digest("hex");
+    return join(dirname(target), `.asblob-${nameHash}.cancelled`);
+  }
+
   private uploadPaths(target: string, uploadToken: string) {
     const nameHash = createHash("sha256").update(basename(target)).digest("hex");
     const prefix = join(dirname(target), `.asblob-${nameHash}-${uploadToken}`);
@@ -167,19 +224,49 @@ export class FsBlobStore implements BlobStore {
       // publish an object after the outbox had already been acknowledged, leaving an untracked orphan.
       // The fence is key-scoped rather than token-scoped because storage keys are globally unique and
       // must never be resurrected by a caller that accidentally supplies a different upload token.
-      cancelled: join(dirname(target), `.asblob-${nameHash}.cancelled`),
+      cancelled: this.cancellationPath(target),
     };
   }
 
-  private async createCancellationFence(path: string) {
+  private async inspectCancellationFence(
+    path: string,
+    storageKey: string,
+  ): Promise<{ exists: false } | { exists: true; migrationOwnerSha256?: string }> {
+    if (!(await this.assertSafeFile(path))) return { exists: false };
+    const fileStat = await stat(path);
+    if (fileStat.size === 0) return { exists: true };
+    const decoded = await this.readDecodedEnvelopePath(path, storageKey, 0);
+    if (!decoded || decoded.kind !== "tombstone") {
+      throw new Error("invalid blob upload cancellation fence");
+    }
+    return {
+      exists: true,
+      ...(decoded.migrationOwnerSha256 === undefined
+        ? {}
+        : { migrationOwnerSha256: decoded.migrationOwnerSha256 }),
+    };
+  }
+
+  private async createCancellationFence(
+    path: string,
+    storageKey: string,
+    migrationOwnerSha256?: string,
+  ) {
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
       handle = await open(path, "wx", FILE_MODE);
       await handle.chmod(FILE_MODE);
+      if (migrationOwnerSha256 !== undefined) {
+        await handle.writeFile(encodeBlobTombstoneEnvelope(migrationOwnerSha256));
+      }
     } catch (error) {
       if (!isErrno(error, "EEXIST")) throw error;
-      if (!(await this.assertSafeFile(path))) {
+      const existing = await this.inspectCancellationFence(path, storageKey);
+      if (!existing.exists) {
         throw new Error("blob upload cancellation fence disappeared");
+      }
+      if (migrationOwnerSha256 !== undefined) {
+        assertMigrationOwner(storageKey, migrationOwnerSha256, existing.migrationOwnerSha256);
       }
     } finally {
       await handle?.close();
@@ -227,6 +314,17 @@ export class FsBlobStore implements BlobStore {
     storageKey: string,
     maxBytes: number,
   ): Promise<BlobObject | null> {
+    const decoded = await this.readDecodedEnvelopePath(path, storageKey, maxBytes);
+    if (!decoded) return null;
+    if (decoded.kind === "tombstone") return null;
+    return decoded.object;
+  }
+
+  private async readDecodedEnvelopePath(
+    path: string,
+    storageKey: string,
+    maxBytes: number,
+  ): Promise<DecodedBlobEnvelope | null> {
     if (!(await this.assertSafeFile(path))) return null;
     let handle: Awaited<ReturnType<typeof open>>;
     try {
@@ -262,7 +360,28 @@ export class FsBlobStore implements BlobStore {
         stat.size - BLOB_ENVELOPE_HEADER_BYTES,
         BLOB_ENVELOPE_HEADER_BYTES,
       );
-      return decodeBlobDataEnvelope(storageKey, envelope);
+      return decodeBlobEnvelope(storageKey, envelope, maxBytes);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async pathUsesBlobEnvelope(path: string): Promise<boolean | null> {
+    if (!(await this.assertSafeFile(path))) return null;
+    let handle: Awaited<ReturnType<typeof open>>;
+    try {
+      handle = await open(path, "r");
+    } catch (error) {
+      if (isNotFound(error)) return null;
+      throw error;
+    }
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error("blob path is not a regular file");
+      if (stat.size < BLOB_ENVELOPE_MAGIC.length) return false;
+      const magic = Buffer.allocUnsafe(BLOB_ENVELOPE_MAGIC.length);
+      await readExactly(handle, magic, 0, magic.length, 0);
+      return magic.equals(BLOB_ENVELOPE_MAGIC);
     } finally {
       await handle.close();
     }
@@ -313,14 +432,79 @@ export class FsBlobStore implements BlobStore {
     }
   }
 
-  private assertSame(desired: BlobDescriptor, existing: BlobDescriptor) {
+  private async inspectPath(
+    path: string,
+    storageKey: string,
+    maxBytes: number,
+    allowLegacy: boolean,
+  ): Promise<FsExactPathState> {
+    const usesEnvelope = await this.pathUsesBlobEnvelope(path);
+    if (usesEnvelope === null) return { kind: "missing" };
+    if (usesEnvelope || !allowLegacy) {
+      const decoded = await this.readDecodedEnvelopePath(path, storageKey, maxBytes);
+      if (!decoded) return { kind: "missing" };
+      if (decoded.kind === "tombstone") {
+        return {
+          kind: "tombstone",
+          ...(decoded.migrationOwnerSha256 === undefined
+            ? {}
+            : { migrationOwnerSha256: decoded.migrationOwnerSha256 }),
+        };
+      }
+      const { data: _data, ...descriptor } = decoded.object;
+      return {
+        kind: "data",
+        descriptor,
+        legacy: false,
+        ...(decoded.migrationOwnerSha256 === undefined
+          ? {}
+          : { migrationOwnerSha256: decoded.migrationOwnerSha256 }),
+      };
+    }
+
+    const data = await this.readRawPath(path, storageKey, maxBytes);
+    if (!data) return { kind: "missing" };
+    const contentType = await this.legacyContentType(path, storageKey);
+    return {
+      kind: "data",
+      descriptor: blobDescriptorFor(storageKey, data, contentType),
+      legacy: true,
+    };
+  }
+
+  private assertSame(
+    desired: BlobDescriptor,
+    existing: BlobDescriptor,
+    desiredMigrationOwnerSha256?: string,
+    existingMigrationOwnerSha256?: string,
+  ) {
     if (!sameBlobDescriptor(desired, existing)) throw new BlobConflictError(desired.storageKey);
+    if (
+      desiredMigrationOwnerSha256 !== undefined
+      && desiredMigrationOwnerSha256 !== existingMigrationOwnerSha256
+    ) {
+      throw new BlobConflictError(desired.storageKey);
+    }
     return desired;
   }
 
-  private async existingTarget(target: string, desired: BlobDescriptor, maxBytes: number) {
-    const existing = await this.readEnvelopePath(target, desired.storageKey, maxBytes);
-    return existing ? this.assertSame(desired, existing) : null;
+  private async existingTarget(
+    target: string,
+    desired: BlobDescriptor,
+    maxBytes: number,
+    migrationOwnerSha256?: string,
+  ) {
+    const existing = await this.readDecodedEnvelopePath(target, desired.storageKey, maxBytes);
+    if (!existing) return null;
+    if (existing.kind === "tombstone") {
+      throw new Error(`blob upload ${desired.storageKey} was cancelled before publication`);
+    }
+    return this.assertSame(
+      desired,
+      existing.object,
+      migrationOwnerSha256,
+      existing.migrationOwnerSha256,
+    );
   }
 
   private async awaitReadyUpload(
@@ -330,14 +514,21 @@ export class FsBlobStore implements BlobStore {
     cancelled: string,
     desired: BlobDescriptor,
     maxBytes: number,
+    migrationOwnerSha256?: string,
   ): Promise<"completed" | "ready"> {
     for (let attempt = 0; attempt < UPLOAD_WAIT_ATTEMPTS; attempt += 1) {
       await this.assertUploadNotCancelled(cancelled, desired.storageKey);
-      if (await this.existingTarget(target, desired, maxBytes)) return "completed";
+      if (await this.existingTarget(target, desired, maxBytes, migrationOwnerSha256)) return "completed";
       if (await this.assertSafeFile(ready)) {
-        const candidate = await this.readEnvelopePath(ready, desired.storageKey, maxBytes);
+        const candidate = await this.readDecodedEnvelopePath(ready, desired.storageKey, maxBytes);
         if (!candidate) continue;
-        this.assertSame(desired, candidate);
+        if (candidate.kind === "tombstone") throw new BlobConflictError(desired.storageKey);
+        this.assertSame(
+          desired,
+          candidate.object,
+          migrationOwnerSha256,
+          candidate.migrationOwnerSha256,
+        );
         return "ready";
       }
       if (!(await this.assertSafeFile(writing))) {
@@ -353,19 +544,22 @@ export class FsBlobStore implements BlobStore {
     const uploadToken = validateBlobUploadToken(options.uploadToken);
     const maxBytes = validateBlobMaxBytes(options.maxBytes);
     const contentType = validateBlobContentType(options.contentType);
+    const migrationOwnerSha256 = options.migrationOwnerSha256 === undefined
+      ? undefined
+      : validateBlobMigrationOwnerSha256(options.migrationOwnerSha256);
     const sizeBytes = inputByteLength(data);
     if (sizeBytes > maxBytes) throw new BlobTooLargeError(storageKey, maxBytes, sizeBytes);
 
     // Copy only after the byte ceiling has been checked and before the first await yields control.
     const payload = Buffer.from(data);
     const desired = blobDescriptorFor(storageKey, payload, contentType);
-    const envelope = encodeBlobDataEnvelope(payload, contentType);
+    const envelope = encodeBlobDataEnvelope(payload, contentType, migrationOwnerSha256);
     const target = await this.path(storageKey, true);
     if (!target) throw new Error("blob root is unavailable");
     const upload = this.uploadPaths(target, uploadToken);
 
     await this.assertUploadNotCancelled(upload.cancelled, storageKey);
-    const existing = await this.existingTarget(target, desired, maxBytes);
+    const existing = await this.existingTarget(target, desired, maxBytes, migrationOwnerSha256);
     if (existing) return existing;
 
     let createdUpload = false;
@@ -383,12 +577,22 @@ export class FsBlobStore implements BlobStore {
           uploadState = "ready";
         } catch (error) {
           if (isErrno(error, "EEXIST")) {
-            const candidate = await this.readEnvelopePath(upload.ready, storageKey, maxBytes);
-            if (!candidate) throw error;
-            this.assertSame(desired, candidate);
+            const candidate = await this.readDecodedEnvelopePath(upload.ready, storageKey, maxBytes);
+            if (!candidate || candidate.kind === "tombstone") throw error;
+            this.assertSame(
+              desired,
+              candidate.object,
+              migrationOwnerSha256,
+              candidate.migrationOwnerSha256,
+            );
             uploadState = "ready";
           } else if (isNotFound(error)) {
-            const completed = await this.existingTarget(target, desired, maxBytes);
+            const completed = await this.existingTarget(
+              target,
+              desired,
+              maxBytes,
+              migrationOwnerSha256,
+            );
             if (!completed) throw new Error(`blob upload ${storageKey} was cancelled before publication`, { cause: error });
             uploadState = "completed";
           } else {
@@ -403,6 +607,7 @@ export class FsBlobStore implements BlobStore {
           upload.cancelled,
           desired,
           maxBytes,
+          migrationOwnerSha256,
         );
       }
 
@@ -414,10 +619,20 @@ export class FsBlobStore implements BlobStore {
           await chmod(target, FILE_MODE);
         } catch (error) {
           if (isErrno(error, "EEXIST")) {
-            const completed = await this.existingTarget(target, desired, maxBytes);
+            const completed = await this.existingTarget(
+              target,
+              desired,
+              maxBytes,
+              migrationOwnerSha256,
+            );
             if (!completed) throw error;
           } else if (isNotFound(error)) {
-            const completed = await this.existingTarget(target, desired, maxBytes);
+            const completed = await this.existingTarget(
+              target,
+              desired,
+              maxBytes,
+              migrationOwnerSha256,
+            );
             if (!completed) throw new Error(`blob upload ${storageKey} was cancelled before publication`, { cause: error });
           } else {
             throw error;
@@ -444,13 +659,133 @@ export class FsBlobStore implements BlobStore {
     const maxBytes = validateBlobMaxBytes(options.maxBytes);
     const path = await this.path(storageKey, false);
     if (!path) return null;
+    if ((await this.inspectCancellationFence(this.cancellationPath(path), storageKey)).exists) {
+      return null;
+    }
     return this.readEnvelopePath(path, storageKey, maxBytes);
+  }
+
+  async getExact(storageKey: string, options: BlobReadOptions): Promise<BlobObject | null> {
+    const maxBytes = validateBlobMaxBytes(options.maxBytes);
+    const path = await this.path(storageKey, false);
+    if (!path) return null;
+    if ((await this.inspectCancellationFence(this.cancellationPath(path), storageKey)).exists) {
+      return null;
+    }
+    const usesEnvelope = await this.pathUsesBlobEnvelope(path);
+    if (usesEnvelope === null) return null;
+    if (usesEnvelope) return this.readEnvelopePath(path, storageKey, maxBytes);
+    const data = await this.readRawPath(path, storageKey, maxBytes);
+    if (!data) return null;
+    const contentType = await this.legacyContentType(path, storageKey);
+    return { ...blobDescriptorFor(storageKey, data, contentType), data };
+  }
+
+  async inspectExact(storageKey: string, options: BlobReadOptions): Promise<BlobExactInspection> {
+    const maxBytes = validateBlobMaxBytes(options.maxBytes);
+    const target = await this.path(storageKey, false);
+    if (!target) return { kind: "missing" };
+    const cancellation = await this.inspectCancellationFence(
+      this.cancellationPath(target),
+      storageKey,
+    );
+    if (cancellation.exists) {
+      return {
+        kind: "tombstone",
+        ...(cancellation.migrationOwnerSha256 === undefined
+          ? {}
+          : { migrationOwnerSha256: cancellation.migrationOwnerSha256 }),
+      };
+    }
+    const state = await this.inspectPath(target, storageKey, maxBytes, true);
+    if (state.kind !== "data") return state;
+    return {
+      kind: "data",
+      descriptor: state.descriptor,
+      ...(state.migrationOwnerSha256 === undefined
+        ? {}
+        : { migrationOwnerSha256: state.migrationOwnerSha256 }),
+    };
+  }
+
+  async discardUncommittedTarget(
+    storageKey: string,
+    options: BlobDiscardUncommittedTargetOptions,
+  ) {
+    const expected = validateBlobDiscardInput(
+      storageKey,
+      options.expectedState,
+      options.uploadToken,
+      options.migrationOwnerSha256,
+    );
+    const target = await this.path(storageKey, false);
+    if (!target) return;
+    const upload = this.uploadPaths(target, options.uploadToken);
+
+    // A key-scoped cancellation marker is the filesystem representation of a tombstone. It wins
+    // inspection even if a failed delete left a target behind, but abort cleanup still validates all
+    // other paths before removing any evidence.
+    const cancellation = await this.inspectCancellationFence(upload.cancelled, storageKey);
+    if (cancellation.exists) {
+      assertExpectedMigrationState(storageKey, expected, { kind: "tombstone" });
+      assertMigrationOwner(
+        storageKey,
+        options.migrationOwnerSha256,
+        cancellation.migrationOwnerSha256,
+      );
+    }
+
+    // Validate every target/token-scoped artifact before unlinking any of them. This keeps a reused
+    // token or corrupt crash artifact from turning an abort into an unaudited best-effort deletion.
+    const candidates = [
+      { path: target, allowLegacy: true },
+      { path: upload.writing, allowLegacy: false },
+      { path: upload.ready, allowLegacy: false },
+    ];
+    const present: string[] = [];
+    let legacyTarget = false;
+    const maxBytes = expected.kind === "data" ? expected.descriptor.sizeBytes : 0;
+    for (const candidate of candidates) {
+      let state: FsExactPathState;
+      try {
+        state = await this.inspectPath(candidate.path, storageKey, maxBytes, candidate.allowLegacy);
+      } catch (error) {
+        if (expected.kind === "tombstone" && error instanceof BlobTooLargeError) {
+          throw new BlobConflictError(storageKey);
+        }
+        throw error;
+      }
+      if (state.kind === "missing") continue;
+      assertExpectedMigrationState(
+        storageKey,
+        expected,
+        state.kind === "tombstone"
+          ? { kind: "tombstone" }
+          : { kind: "data", descriptor: state.descriptor },
+      );
+      assertMigrationOwner(
+        storageKey,
+        options.migrationOwnerSha256,
+        state.migrationOwnerSha256,
+      );
+      if (candidate.path === target && state.kind === "data") legacyTarget = state.legacy;
+      present.push(candidate.path);
+    }
+    for (const candidate of present) await unlinkIfExists(candidate);
+    if (legacyTarget) await unlinkIfExists(`${target}.meta`);
+    if (cancellation.exists) await unlinkIfExists(upload.cancelled);
   }
 
   async delete(storageKey: string, options: BlobDeleteOptions = {}) {
     const uploadToken = options.uploadToken === undefined
       ? undefined
       : validateBlobUploadToken(options.uploadToken);
+    const migrationOwnerSha256 = options.migrationOwnerSha256 === undefined
+      ? undefined
+      : validateBlobMigrationOwnerSha256(options.migrationOwnerSha256);
+    if (migrationOwnerSha256 !== undefined && uploadToken === undefined) {
+      throw new Error("blob migration tombstone requires an upload token");
+    }
     // A manifest-driven (token-authenticated) delete is also a key-wide upload cancellation.
     // Create the private directory path even when no object/temp exists yet so the cancellation
     // fence can precede temp creation.
@@ -459,13 +794,95 @@ export class FsBlobStore implements BlobStore {
 
     if (uploadToken !== undefined) {
       const upload = this.uploadPaths(target, uploadToken);
-      // The persistent marker is the linearization point. It must exist before temporary/final paths
-      // are removed so both an already-running writer and a future late writer observe cancellation.
-      await this.createCancellationFence(upload.cancelled);
+      if (migrationOwnerSha256 !== undefined) {
+        const cancellation = await this.inspectCancellationFence(upload.cancelled, storageKey);
+        if (cancellation.exists) {
+          assertMigrationOwner(
+            storageKey,
+            migrationOwnerSha256,
+            cancellation.migrationOwnerSha256,
+          );
+        }
+        const requireOwnedTombstone = async (path: string) => {
+          let state: FsExactPathState;
+          try {
+            state = await this.inspectPath(path, storageKey, 0, path === target);
+          } catch (error) {
+            if (error instanceof BlobTooLargeError) throw new BlobConflictError(storageKey);
+            throw error;
+          }
+          if (state.kind === "missing") return false;
+          if (state.kind !== "tombstone") throw new BlobConflictError(storageKey);
+          assertMigrationOwner(storageKey, migrationOwnerSha256, state.migrationOwnerSha256);
+          return true;
+        };
+
+        const targetAlreadyOwned = await requireOwnedTombstone(target);
+        if (cancellation.exists) {
+          return;
+        }
+        if (targetAlreadyOwned) return;
+
+        // The migration tombstone is published at the final key with a create-only hard link. This
+        // is separate from the runtime cancellation sidecar: if foreign data wins after the initial
+        // missing read, link() returns EEXIST and the exact owner check fails without touching it.
+        const envelope = encodeBlobTombstoneEnvelope(migrationOwnerSha256);
+        let createdUpload = false;
+        let ownsArtifacts = false;
+        try {
+          createdUpload = await this.createUploadTemp(upload.writing, envelope);
+          ownsArtifacts = createdUpload || await requireOwnedTombstone(upload.writing);
+          if (!ownsArtifacts) throw new BlobConflictError(storageKey);
+          try {
+            await link(upload.writing, upload.ready);
+            await chmod(upload.ready, FILE_MODE);
+          } catch (error) {
+            if (isErrno(error, "EEXIST")) {
+              if (!(await requireOwnedTombstone(upload.ready))) {
+                throw new Error("blob migration tombstone temp disappeared");
+              }
+            } else if (isNotFound(error)) {
+              if (await requireOwnedTombstone(target)) return;
+              if (!(await requireOwnedTombstone(upload.ready))) throw error;
+            } else {
+              throw error;
+            }
+          }
+          try {
+            await link(upload.ready, target);
+            await chmod(target, FILE_MODE);
+          } catch (error) {
+            if (isErrno(error, "EEXIST")) {
+              await requireOwnedTombstone(target);
+            } else if (isNotFound(error)) {
+              if (!(await requireOwnedTombstone(target))) throw error;
+            } else {
+              throw error;
+            }
+          }
+          if (!(await requireOwnedTombstone(target))) {
+            throw new Error("blob migration tombstone disappeared after publication");
+          }
+          return;
+        } finally {
+          if (createdUpload || ownsArtifacts) {
+            await unlinkIfExists(upload.writing);
+            await unlinkIfExists(upload.ready);
+          }
+        }
+      }
+
+      // The persistent marker is the runtime linearization point. It must exist before temporary
+      // and final paths are removed so both an already-running writer and a future late writer see it.
+      await this.createCancellationFence(upload.cancelled, storageKey);
       await unlinkIfExists(upload.writing);
       await unlinkIfExists(upload.ready);
     }
     await unlinkIfExists(target);
+    // A manifest-driven delete also owns the pre-ASBLOB02 JSON sidecar. Always replay its unlink:
+    // after a crash the raw payload may already be gone, so format detection can no longer prove
+    // whether an otherwise orphaned `.meta` file belonged to this globally unique key.
+    if (uploadToken !== undefined) await unlinkIfExists(`${target}.meta`);
   }
 
   /** Transitional access for the pre-manifest `file://` raw-file + JSON-sidecar format only. */

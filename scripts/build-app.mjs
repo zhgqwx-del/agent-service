@@ -114,13 +114,20 @@ const externalizeThirdParty = {
   },
 };
 
-const outfile = resolve(ROOT, "apps", app, "dist", "main.js");
+const distDir = resolve(ROOT, "apps", app, "dist");
+const entryPoints = {
+  main: resolve(ROOT, "apps", app, "src", "main.ts"),
+  ...(app === "agent-runner"
+    ? { "blob-storage-migrate": resolve(ROOT, "apps", app, "src", "blob-storage-migrate.ts") }
+    : {}),
+};
 // Clean first: a stale artefact, or a migration deleted since the last build, must not ship.
-await rm(dirname(outfile), { recursive: true, force: true });
-await mkdir(dirname(outfile), { recursive: true });
+await rm(distDir, { recursive: true, force: true });
+await mkdir(distDir, { recursive: true });
 const result = await build({
-  entryPoints: [resolve(ROOT, "apps", app, "src", "main.ts")],
-  outfile,
+  entryPoints,
+  outdir: distDir,
+  entryNames: "[name]",
   bundle: true,
   platform: "node",
   target: "node24",
@@ -137,7 +144,8 @@ const result = await build({
   metafile: true,
 });
 const bytes = Object.values(result.metafile.outputs).reduce((n, o) => n + o.bytes, 0);
-await writeFile(resolve(dirname(outfile), "package.json"), JSON.stringify({ type: "module" }, null, 2));
+await writeFile(resolve(distDir, "package.json"), JSON.stringify({ type: "module" }, null, 2));
 // The store reads its .sql migrations at runtime; ship them beside the bundle.
-await cp(resolve(ROOT, "packages/store/migrations"), resolve(dirname(outfile), "migrations"), { recursive: true });
-console.log(`built apps/${app}/dist/main.js (${(bytes / 1024).toFixed(0)} KB) + migrations/`);
+await cp(resolve(ROOT, "packages/store/migrations"), resolve(distDir, "migrations"), { recursive: true });
+const artifacts = Object.keys(entryPoints).map((name) => `${name}.js`).join(", ");
+console.log(`built apps/${app}/dist/{${artifacts}} (${(bytes / 1024).toFixed(0)} KB) + migrations/`);

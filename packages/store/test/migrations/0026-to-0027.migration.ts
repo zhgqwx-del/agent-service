@@ -169,6 +169,7 @@ describe("0026 -> 0027 Blob storage control migration", () => {
   let admin: Connection;
   let base: URL;
   let pre0027Dir: string;
+  let through0027Dir: string;
 
   beforeAll(async () => {
     base = disposableBase(BASE_URL);
@@ -176,16 +177,23 @@ describe("0026 -> 0027 Blob storage control migration", () => {
     adminUrl.pathname = "/";
     admin = await mysql.createConnection(adminUrl.toString());
     pre0027Dir = await mkdtemp(join(tmpdir(), "agent-service-pre0027-"));
+    through0027Dir = await mkdtemp(join(tmpdir(), "agent-service-through0027-"));
+    // Keep this historical replay pinned at 0027: later migrations intentionally replace some
+    // shared Blob-control triggers, so deleting an older marker from a newer schema is corruption,
+    // not the partial-DDL recovery boundary this fixture proves.
     for (const [file, expectedSha256] of FROZEN_0026_MIGRATIONS) {
       const bytes = await readFile(join(MIGRATIONS_DIR, file));
       expect(createHash("sha256").update(bytes).digest("hex"), file).toBe(expectedSha256);
       await copyFile(join(MIGRATIONS_DIR, file), join(pre0027Dir, file));
+      await copyFile(join(MIGRATIONS_DIR, file), join(through0027Dir, file));
     }
+    await copyFile(join(MIGRATIONS_DIR, MIGRATION_NAME), join(through0027Dir, MIGRATION_NAME));
   });
 
   afterAll(async () => {
     await admin?.end();
     if (pre0027Dir) await rm(pre0027Dir, { recursive: true, force: true });
+    if (through0027Dir) await rm(through0027Dir, { recursive: true, force: true });
   });
 
   async function create0026(database: string): Promise<void> {
@@ -239,7 +247,10 @@ describe("0026 -> 0027 Blob storage control migration", () => {
         [BACKEND, BLOB_STORAGE_FORMAT],
       );
 
-      store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+      store = await MysqlSessionStore.connect({
+        url: databaseUrl(base, database),
+        migrationsDir: through0027Dir,
+      });
       expect(await store.getBlobStorageControl()).toEqual({
         singletonId: 1,
         controlGeneration: 0,
@@ -313,7 +324,7 @@ describe("0026 -> 0027 Blob storage control migration", () => {
         .rejects.toThrow(/rejects backend/);
 
       await conn.query("DELETE FROM schema_migrations WHERE name=?", [MIGRATION_NAME]);
-      await store.migrate(MIGRATIONS_DIR);
+      await store.migrate(through0027Dir);
       await expectInstalled(conn);
       expect(await store.getBlobStorageControl()).toEqual(active);
       const [preserved] = await conn.query<Row[]>(
@@ -351,7 +362,10 @@ describe("0026 -> 0027 Blob storage control migration", () => {
       let store: MysqlSessionStore | undefined;
       try {
         await arrange(conn);
-        store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+        store = await MysqlSessionStore.connect({
+          url: databaseUrl(base, database),
+          migrationsDir: through0027Dir,
+        });
         await expect(store.activateBlobStorageControl({
           expectedControlGeneration: 0,
           storageBackend: BACKEND,
@@ -395,7 +409,10 @@ describe("0026 -> 0027 Blob storage control migration", () => {
         [MIGRATION_NAME],
       );
       expect(Number(before[0]!.count)).toBe(0);
-      store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+      store = await MysqlSessionStore.connect({
+        url: databaseUrl(base, database),
+        migrationsDir: through0027Dir,
+      });
       await expectInstalled(conn);
       expect(await store.getBlobStorageControl()).toEqual({
         singletonId: 1,
@@ -429,7 +446,10 @@ describe("0026 -> 0027 Blob storage control migration", () => {
            evidence_sha256 CHAR(64) COLLATE utf8mb4_0900_as_cs NULL
          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs`,
       );
-      await expect(MysqlSessionStore.connect({ url: databaseUrl(base, database) }))
+      await expect(MysqlSessionStore.connect({
+        url: databaseUrl(base, database),
+        migrationsDir: through0027Dir,
+      }))
         .rejects.toThrow(/migration 0027_blob_storage_control\.sql failed/);
       const [markers] = await conn.query<Row[]>(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
