@@ -64,6 +64,7 @@ function provider(tenantId: string, id = "private-provider"): ProviderConfig {
     id,
     api: "openai-completions",
     baseUrl: "https://private-provider.invalid/v1",
+    apiKeyRef: `secret:${tenantId}:${id}`,
     headers: { Authorization: "Bearer never-copy-this-secret" },
     models: [{
       id: "private-model",

@@ -1196,6 +1196,21 @@ export const OPENAPI_DOCUMENT = {
                 ],
                 "type": "boolean"
               },
+              "tenantCredentialLifecycle": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "versioned-target-ledger-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantCredentialLifecycleTrackingActive": {
+                "default": false,
+                "type": "boolean"
+              },
               "tenantCredentialRevocation": {
                 "default": [],
                 "items": {

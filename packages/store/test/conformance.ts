@@ -997,16 +997,22 @@ export function sessionStoreConformance(name: string, make: () => Promise<Sessio
 
     it("stores provider configs with write-only secrets", async () => {
       const store = await make();
+      // This conformance suite intentionally runs against a long-lived local integration database.
+      // Use a fresh owner/slot per invocation so an earlier binary's durable provider row cannot
+      // turn a rerun into a test of legacy-repair semantics instead of the write-only secret contract.
+      const tenantId = newId("tenant_provider_secret");
+      const otherTenantId = newId("tenant_provider_other");
+      const providerId = newId("provider");
       const cfg = {
-        id: "p1", tenantId: "t_a", api: "openai-completions" as const, baseUrl: "https://x.example", headers: {}, models: [{ id: "m", contextWindow: 1, maxOutputTokens: 1, input: ["text" as const], reasoning: false }],
+        id: providerId, tenantId, api: "openai-completions" as const, baseUrl: "https://x.example", apiKeyRef: `secret:${tenantId}:${providerId}`, headers: {}, models: [{ id: "m", contextWindow: 1, maxOutputTokens: 1, input: ["text" as const], reasoning: false }],
         quota: {}, fallback: [], createdAtMs: 1, updatedAtMs: 1,
       };
       await store.upsertProviderConfig(cfg, { ciphertext: Buffer.from("cipher"), keyId: "k1" });
-      const got = await store.getProviderConfig("t_a", "p1");
+      const got = await store.getProviderConfig(tenantId, providerId);
       expect(got?.secret?.ciphertext.toString()).toBe("cipher");
       await store.upsertProviderConfig({ ...cfg, name: "renamed" }); // no secret → keep old
-      expect((await store.getProviderConfig("t_a", "p1"))?.secret?.keyId).toBe("k1");
-      expect(await store.getProviderConfig("t_b", "p1")).toBeNull();
+      expect((await store.getProviderConfig(tenantId, providerId))?.secret?.keyId).toBe("k1");
+      expect(await store.getProviderConfig(otherTenantId, providerId)).toBeNull();
       await store.close();
     });
   });

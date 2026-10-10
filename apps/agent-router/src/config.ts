@@ -55,6 +55,13 @@ const Env = z.object({
   TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /**
+   * Fleet acknowledgement for the write-once credential-lifecycle tracking cutover. The runner
+   * owns activation; the router uses this independent gate before issuing destructive T3a ACKs.
+   */
+  CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** Independent execution barrier for the T3e local execution/physical-ACK worker. */
   TENANT_PURGE_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -149,6 +156,15 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   }
   if (c.TENANT_REDIS_PURGE_ENABLED && !c.REDIS_URL) {
     throw new Error("REDIS_URL is required before TENANT_REDIS_PURGE_ENABLED=1");
+  }
+  if (
+    c.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED
+    && !c.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED
+  ) {
+    throw new Error(
+      "CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1 is required before "
+        + "TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED=1",
+    );
   }
   if (c.TENANT_REDIS_PURGE_ENABLED && !c.REDIS_NAMESPACE_ID) {
     throw new Error("REDIS_NAMESPACE_ID is required before TENANT_REDIS_PURGE_ENABLED=1");

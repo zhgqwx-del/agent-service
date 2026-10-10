@@ -1,9 +1,14 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { SignJWT, exportJWK, generateKeyPair, type JWK, type KeyObject } from "jose";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentDefinition, TenantAuthPolicy } from "@agent-service/protocol";
-import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
+import {
+  CredentialSourceConflictError,
+  MemoryEventBus,
+  MemoryLeaseStore,
+  MemorySessionStore,
+} from "@agent-service/store";
 import { SessionHost, StaticToolRegistry, newId, type ResolvedModel } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
 import { createApp } from "../src/app.js";
@@ -279,5 +284,65 @@ describe("policy administration", () => {
     await h.setPolicy({ mode: "end_user_token", tokenHeader: "x-end-user-token", verifier: { kind: "jwt", hs256: true, algorithms: ["HS256"], subjectClaim: "sub", clockToleranceSec: 5 } }, "shared-secret-value-32-bytes-min!!");
     // the same request is now refused: the switch is not advisory
     expect((await h.req("/v1/sessions", { method: "POST", body: JSON.stringify({ agentId: h.agent.id }) }, { "x-user-id": "u1" })).status).toBe(401);
+  });
+
+  it("re-reads and retries auth CAS conflicts without exposing revisions or reviving an old secret", async () => {
+    const h = await makeApp();
+    await h.store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+    const policy: TenantAuthPolicy = {
+      mode: "end_user_token",
+      tokenHeader: "x-end-user-token",
+      verifier: {
+        kind: "jwt",
+        hs256: true,
+        algorithms: ["HS256"],
+        subjectClaim: "uid",
+        clockToleranceSec: 5,
+      },
+    };
+    await h.setPolicy(policy, "first-shared-secret-at-least-32-bytes");
+
+    const cipher = new LocalAesGcmCipher(KEY);
+    const concurrentSecret = {
+      ciphertext: await cipher.encrypt("concurrent-shared-secret-at-least-32"),
+      keyId: cipher.keyId,
+    };
+    const delegate = h.store.setTenantAuth.bind(h.store);
+    let injected = false;
+    const write = vi.spyOn(h.store, "setTenantAuth").mockImplementation(async (
+      tenantId,
+      nextPolicy,
+      secret,
+      expectedSourceRevision,
+    ) => {
+      if (!injected) {
+        injected = true;
+        const winner = await delegate(
+          tenantId,
+          nextPolicy,
+          concurrentSecret,
+          expectedSourceRevision,
+        );
+        throw new CredentialSourceConflictError(
+          "tenant_auth",
+          expectedSourceRevision ?? null,
+          winner.authCredentialSourceRevision ?? null,
+        );
+      }
+      return delegate(tenantId, nextPolicy, secret, expectedSourceRevision);
+    });
+
+    const response = await h.req("/v1/tenant/auth", {
+      method: "PUT",
+      body: JSON.stringify({ policy }),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ tenantId: "t_auth", policy, hasSecret: true });
+    expect(JSON.stringify(body)).not.toContain("Revision");
+    expect(write).toHaveBeenCalledTimes(2);
+    const stored = await h.store.getTenant("t_auth");
+    expect(await cipher.decrypt(stored!.authSecret!.ciphertext, stored!.authSecret!.keyId))
+      .toBe("concurrent-shared-secret-at-least-32");
   });
 });

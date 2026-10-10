@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
@@ -10,12 +10,14 @@ import {
   DEFAULT_SCOPES,
   Event as EventSchema,
   Item as ItemSchema,
+  ProviderConfig as ProviderConfigSchema,
   Session as SessionSchema,
   SessionStatus as SessionStatusSchema,
   Turn as TurnSchema,
   isCanonicalId,
 } from "@agent-service/protocol";
 import {
+  CredentialSourceConflictError,
   FenceError,
   IdempotencyMismatchError,
   IdempotencyPendingError,
@@ -406,6 +408,39 @@ import {
   type TenantCredentialRevocationStore,
 } from "../tenant-credential-revocation.js";
 import {
+  TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS,
+  TENANT_CREDENTIAL_INVENTORY_RECEIPT_SCOPE,
+  TENANT_CREDENTIAL_TARGET_DOMAINS,
+  tenantCredentialAuthSlotEvidenceSha256,
+  tenantCredentialAuthSlotRootSha256,
+  tenantCredentialCurrentTargetDisposition,
+  tenantCredentialInventoryReceiptSha256,
+  tenantCredentialProviderSlotEvidenceSha256,
+  tenantCredentialProviderSlotRootSha256,
+  tenantCredentialSlotIdSha256,
+  tenantCredentialSubjectEvidenceSha256,
+  tenantCredentialSubjectRootSha256,
+  tenantCredentialTargetDispositionEvidenceSha256,
+  tenantCredentialTargetDispositionRootSha256,
+  tenantCredentialTrackingCutoverEvidenceSha256,
+  tenantCredentialVersionEvidenceSha256,
+  tenantCredentialVersionId,
+  tenantCredentialVersionRootSha256,
+  validateTenantCredentialInventoryReceipt,
+  validateTenantCredentialLifecycleSnapshot,
+  validateTenantCredentialTrackingCutoverRecord,
+  type ActivateTenantCredentialTrackingInput,
+  type CredentialLifecycleStore,
+  type TenantCredentialAuthSlot,
+  type TenantCredentialInventoryReceipt,
+  type TenantCredentialLifecycleSnapshot,
+  type TenantCredentialProviderSlot,
+  type TenantCredentialTargetDisposition,
+  type TenantCredentialTrackingCutoverRecord,
+  type TenantCredentialTrackingSubject,
+  type TenantCredentialVersion,
+} from "../credential-lifecycle.js";
+import {
   TENANT_RUNTIME_REVOCATION_EXTERNAL_DISPOSITION,
   TENANT_RUNTIME_REVOCATION_MEMORY_DISPOSITION,
   TENANT_RUNTIME_REVOCATION_RECEIPT_SCOPE,
@@ -772,6 +807,32 @@ const TENANT_CREDENTIAL_REVOCATION_RECEIPT_COLUMNS = `request_id, tenant_id, sub
   external_disposition, content_purge_required, receipt_sha256`;
 const TENANT_CREDENTIAL_REVOCATION_CUTOVER_COLUMNS = `singleton_id, control_generation,
   activated_at_ms, first_receipt_sha256, evidence_sha256`;
+const TENANT_CREDENTIAL_TRACKING_CUTOVER_COLUMNS = `singleton_id, control_generation,
+  activated_at_db_ms, subject_count, subject_root_sha256, provider_slot_count,
+  provider_slot_root_sha256, auth_slot_count, auth_slot_root_sha256, version_count,
+  version_root_sha256, target_disposition_count, target_disposition_root_sha256,
+  evidence_sha256`;
+const TENANT_CREDENTIAL_TRACKING_SUBJECT_COLUMNS = `tenant_id, tracking_started_at_db_ms,
+  history_status, origin, evidence_sha256`;
+const TENANT_CREDENTIAL_PROVIDER_SLOT_COLUMNS = `tenant_id, slot_id_sha256, write_generation,
+  source_present, current_credential_version_id, updated_at_db_ms, evidence_sha256`;
+const TENANT_CREDENTIAL_VERSION_COLUMNS = `credential_version_id, tenant_id, slot_kind,
+  slot_id_sha256, origin, encrypted_secret_present, secret_key_id_present,
+  custom_headers_present, endpoint_parameters_present, created_at_db_ms, retired_at_db_ms,
+  retire_reason, evidence_sha256`;
+const TENANT_CREDENTIAL_TARGET_DISPOSITION_COLUMNS = `credential_version_id, tenant_id,
+  domain, disposition, adapter_protocol, target_reference_cipher,
+  target_reference_key_id, target_reference_cipher_sha256, target_reference_sha256,
+  captured_at_db_ms, evidence_sha256`;
+const TENANT_CREDENTIAL_INVENTORY_RECEIPT_COLUMNS = `request_id, tenant_id,
+  subject_generation, scope, t3a_receipt_sha256, tracking_cutover_evidence_sha256,
+  subject_count, subject_root_sha256, provider_slot_count, provider_slot_root_sha256,
+  auth_slot_count, auth_slot_root_sha256, version_count, version_root_sha256,
+  target_disposition_count, target_disposition_root_sha256,
+  external_credential_blocker_count, kms_key_blocker_count,
+  legacy_history_unknown_subject_count, provider_source_count_before,
+  provider_source_pointer_count_before, auth_secret_present_before,
+  auth_source_pointer_present_before, store_db_timestamp_ms, receipt_sha256`;
 const TENANT_RUNTIME_REVOCATION_JOB_COLUMNS = `request_id, tenant_id, subject_generation,
   t1_fence_sha256, t3a_receipt_sha256, phase, available_at_ms, attempts, claim_token,
   lease_until_ms, last_error_code, created_at_ms, updated_at_ms,
@@ -2268,6 +2329,230 @@ function rowToTenantCredentialRevocationCutover(
   } catch {
     throw new TenantErasureIntegrityError();
   }
+}
+
+function rowToTenantCredentialTrackingCutover(row: Row): TenantCredentialTrackingCutoverRecord {
+  if (Number(row.singleton_id) !== 1) throw new TenantErasureIntegrityError();
+  const generation = storedSafeInteger(
+    row.control_generation,
+    "stored tenant credential tracking cutover generation",
+  );
+  const record: TenantCredentialTrackingCutoverRecord = generation === 0
+    ? { controlGeneration: 0 }
+    : {
+        controlGeneration: generation as 1,
+        activatedAtDbMs: storedSafeInteger(
+          row.activated_at_db_ms,
+          "stored tenant credential tracking cutover timestamp",
+        ),
+        subjectCount: storedSafeInteger(row.subject_count, "stored credential subject count"),
+        subjectRootSha256: String(row.subject_root_sha256),
+        providerSlotCount: storedSafeInteger(
+          row.provider_slot_count,
+          "stored credential provider-slot count",
+        ),
+        providerSlotRootSha256: String(row.provider_slot_root_sha256),
+        authSlotCount: storedSafeInteger(row.auth_slot_count, "stored credential auth-slot count"),
+        authSlotRootSha256: String(row.auth_slot_root_sha256),
+        versionCount: storedSafeInteger(row.version_count, "stored credential version count"),
+        versionRootSha256: String(row.version_root_sha256),
+        targetDispositionCount: storedSafeInteger(
+          row.target_disposition_count,
+          "stored credential target-disposition count",
+        ),
+        targetDispositionRootSha256: String(row.target_disposition_root_sha256),
+        evidenceSha256: String(row.evidence_sha256),
+      };
+  try {
+    validateTenantCredentialTrackingCutoverRecord(record);
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+  return record;
+}
+
+function rowToTenantCredentialTrackingSubject(row: Row): TenantCredentialTrackingSubject {
+  return {
+    tenantId: String(row.tenant_id),
+    trackingStartedAtDbMs: storedSafeInteger(
+      row.tracking_started_at_db_ms,
+      "stored credential tracking start time",
+    ),
+    historyStatus: String(row.history_status) as TenantCredentialTrackingSubject["historyStatus"],
+    origin: String(row.origin) as TenantCredentialTrackingSubject["origin"],
+    evidenceSha256: String(row.evidence_sha256),
+  };
+}
+
+function rowToTenantCredentialProviderSlot(row: Row): TenantCredentialProviderSlot {
+  return {
+    tenantId: String(row.tenant_id),
+    slotIdSha256: String(row.slot_id_sha256),
+    writeGeneration: storedSafeInteger(
+      row.write_generation,
+      "stored credential provider-slot generation",
+      1,
+    ),
+    sourcePresent: tenantCredentialBoolean(
+      row.source_present,
+      "stored credential provider source-present flag",
+    ),
+    ...(row.current_credential_version_id == null
+      ? {}
+      : { currentCredentialVersionId: String(row.current_credential_version_id) }),
+    updatedAtDbMs: storedSafeInteger(
+      row.updated_at_db_ms,
+      "stored credential provider-slot update time",
+    ),
+    evidenceSha256: String(row.evidence_sha256),
+  };
+}
+
+function rowToTenantCredentialAuthSlot(row: Row): TenantCredentialAuthSlot {
+  const body = {
+    tenantId: String(row.tenant_id),
+    writeGeneration: storedSafeInteger(
+      row.auth_write_generation,
+      "stored credential auth-slot generation",
+    ),
+    sourcePresent: row.auth_secret_cipher != null || row.auth_secret_key_id != null,
+    ...(row.auth_credential_version_id == null
+      ? {}
+      : { currentCredentialVersionId: String(row.auth_credential_version_id) }),
+    updatedAtDbMs: storedSafeInteger(
+      row.auth_credential_updated_at_db_ms,
+      "stored credential auth-slot update time",
+    ),
+  };
+  return { ...body, evidenceSha256: tenantCredentialAuthSlotEvidenceSha256(body) };
+}
+
+function rowToTenantCredentialVersion(row: Row): TenantCredentialVersion {
+  return {
+    credentialVersionId: String(row.credential_version_id),
+    tenantId: String(row.tenant_id),
+    slotKind: String(row.slot_kind) as TenantCredentialVersion["slotKind"],
+    slotIdSha256: String(row.slot_id_sha256),
+    origin: String(row.origin) as TenantCredentialVersion["origin"],
+    encryptedSecretPresent: tenantCredentialBoolean(
+      row.encrypted_secret_present,
+      "stored credential encrypted-secret flag",
+    ),
+    secretKeyIdPresent: tenantCredentialBoolean(
+      row.secret_key_id_present,
+      "stored credential secret-key-id flag",
+    ),
+    customHeadersPresent: tenantCredentialBoolean(
+      row.custom_headers_present,
+      "stored credential custom-headers flag",
+    ),
+    endpointParametersPresent: tenantCredentialBoolean(
+      row.endpoint_parameters_present,
+      "stored credential endpoint-parameters flag",
+    ),
+    createdAtDbMs: storedSafeInteger(row.created_at_db_ms, "stored credential version time"),
+    ...(row.retired_at_db_ms == null
+      ? {}
+      : { retiredAtDbMs: storedSafeInteger(row.retired_at_db_ms, "stored credential retire time") }),
+    ...(row.retire_reason == null
+      ? {}
+      : { retireReason: String(row.retire_reason) as TenantCredentialVersion["retireReason"] }),
+    evidenceSha256: String(row.evidence_sha256),
+  };
+}
+
+function rowToTenantCredentialTargetDisposition(row: Row): TenantCredentialTargetDisposition {
+  return {
+    credentialVersionId: String(row.credential_version_id),
+    tenantId: String(row.tenant_id),
+    domain: String(row.domain) as TenantCredentialTargetDisposition["domain"],
+    disposition: String(row.disposition) as TenantCredentialTargetDisposition["disposition"],
+    ...(row.adapter_protocol == null ? {} : { adapterProtocol: String(row.adapter_protocol) }),
+    ...(row.target_reference_cipher_sha256 == null
+      ? {}
+      : { targetReferenceCipherSha256: String(row.target_reference_cipher_sha256) }),
+    ...(row.target_reference_key_id == null
+      ? {}
+      : { targetReferenceKeyId: String(row.target_reference_key_id) }),
+    ...(row.target_reference_sha256 == null
+      ? {}
+      : { targetReferenceSha256: String(row.target_reference_sha256) }),
+    capturedAtDbMs: storedSafeInteger(
+      row.captured_at_db_ms,
+      "stored credential target capture time",
+    ),
+    evidenceSha256: String(row.evidence_sha256),
+  };
+}
+
+function rowToTenantCredentialInventoryReceipt(row: Row): TenantCredentialInventoryReceipt {
+  const receipt: TenantCredentialInventoryReceipt = {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: storedSafeInteger(
+      row.subject_generation,
+      "stored credential inventory subject generation",
+      1,
+    ),
+    scope: String(row.scope) as typeof TENANT_CREDENTIAL_INVENTORY_RECEIPT_SCOPE,
+    t3aReceiptSha256: String(row.t3a_receipt_sha256),
+    trackingCutoverEvidenceSha256: String(row.tracking_cutover_evidence_sha256),
+    subjectCount: storedSafeInteger(row.subject_count, "stored inventory subject count"),
+    subjectRootSha256: String(row.subject_root_sha256),
+    providerSlotCount: storedSafeInteger(
+      row.provider_slot_count,
+      "stored inventory provider-slot count",
+    ),
+    providerSlotRootSha256: String(row.provider_slot_root_sha256),
+    authSlotCount: storedSafeInteger(row.auth_slot_count, "stored inventory auth-slot count"),
+    authSlotRootSha256: String(row.auth_slot_root_sha256),
+    versionCount: storedSafeInteger(row.version_count, "stored inventory version count"),
+    versionRootSha256: String(row.version_root_sha256),
+    targetDispositionCount: storedSafeInteger(
+      row.target_disposition_count,
+      "stored inventory disposition count",
+    ),
+    targetDispositionRootSha256: String(row.target_disposition_root_sha256),
+    externalCredentialBlockerCount: storedSafeInteger(
+      row.external_credential_blocker_count,
+      "stored inventory external blocker count",
+    ),
+    kmsKeyBlockerCount: storedSafeInteger(
+      row.kms_key_blocker_count,
+      "stored inventory KMS blocker count",
+    ),
+    legacyHistoryUnknownSubjectCount: storedSafeInteger(
+      row.legacy_history_unknown_subject_count,
+      "stored inventory legacy-history count",
+    ),
+    providerSourceCountBefore: storedSafeInteger(
+      row.provider_source_count_before,
+      "stored inventory provider source count",
+    ),
+    providerSourcePointerCountBefore: storedSafeInteger(
+      row.provider_source_pointer_count_before,
+      "stored inventory provider pointer count",
+    ),
+    authSecretPresentBefore: tenantCredentialBoolean(
+      row.auth_secret_present_before,
+      "stored inventory auth-secret flag",
+    ),
+    authSourcePointerPresentBefore: tenantCredentialBoolean(
+      row.auth_source_pointer_present_before,
+      "stored inventory auth-pointer flag",
+    ),
+    storeDbTimestampMs: storedSafeInteger(
+      row.store_db_timestamp_ms,
+      "stored inventory timestamp",
+    ),
+    receiptSha256: String(row.receipt_sha256),
+  };
+  try {
+    validateTenantCredentialInventoryReceipt(receipt);
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+  return receipt;
 }
 
 function rowToTenantRuntimeRevocationJob(row: Row): TenantRuntimeRevocationJobRecord {
@@ -4695,6 +4980,7 @@ export class MysqlSessionStore implements
   LegacyTombstoneCompensationStore,
   RetentionPolicyStore,
   ErasurePolicyEvaluationStore,
+  CredentialLifecycleStore,
   TenantCredentialRevocationStore,
   TenantRuntimeRevocationStore,
   TenantContentInventoryStore,
@@ -4711,6 +4997,13 @@ export class MysqlSessionStore implements
   private tenantPurgeExecutionMaterializationCursorRequestId?: string;
   private tenantDatabasePurgeMaterializationCursorRequestId?: string;
   private tenantRedisPurgeMaterializationCursorRequestId?: string;
+  /**
+   * Historical migration fixtures intentionally open the current store against a frozen schema.
+   * Production startup always applies the complete migration set before returning the store, but
+   * keeping this bit explicit prevents a later expand migration from making those older runtime
+   * paths accidentally query columns that did not exist at that point in history.
+   */
+  private credentialLifecycleSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -4799,7 +5092,11 @@ export class MysqlSessionStore implements
           }
         }
         await conn.query("INSERT INTO schema_migrations (name, applied_at_ms) VALUES (?, ?)", [f, Date.now()]);
+        done.add(f);
       }
+      this.credentialLifecycleSchemaInstalled = done.has(
+        "0026_credential_lifecycle_inventory.sql",
+      );
     } finally {
       if (locked) {
         await conn.query("SELECT RELEASE_LOCK(CONCAT('agent-service:migrate:', LEFT(SHA2(DATABASE(), 256), 32)))").catch(() => {});
@@ -10965,6 +11262,19 @@ export class MysqlSessionStore implements
         } catch {
           throw new TenantErasureIntegrityError();
         }
+        if (this.credentialLifecycleSchemaInstalled) {
+          const inventory = await this.loadTenantCredentialInventoryReceipt(
+            conn,
+            authorization.tenantId,
+            authorization.requestId,
+            "FOR SHARE",
+          );
+          if (inventory) {
+            await this.validateTenantCredentialInventoryReadProof(conn, inventory, receipt);
+          }
+        }
+        // A completed pre-cutover T3a receipt intentionally has no synthetic sidecar: its unknown
+        // history remains a blocker. Every post-cutover completion writes both receipts atomically.
         await conn.commit();
         return tenantCredentialRevocationCompletionMatchesAuthorization(current, authorization)
           && tenantCredentialRevocationReceiptMatchesAuthorization(receipt, authorization)
@@ -10995,10 +11305,21 @@ export class MysqlSessionStore implements
         await conn.commit();
         return null;
       }
+      // This singleton interlocks activation and every tracked source mutation. Acquire it before
+      // the tenant/provider source rows to preserve the same lock order as provider/auth writes.
+      const trackingCutover: TenantCredentialTrackingCutoverRecord =
+        this.credentialLifecycleSchemaInstalled
+          ? await this.loadTenantCredentialTrackingCutover(conn, "FOR UPDATE")
+          : { controlGeneration: 0 };
+      const trackingActive = trackingCutover.controlGeneration === 1;
       // Lock the canonical registry row before all credential families. UCA-equivalent but raw
       // different tenant identities are corruption, never deletion targets.
+      const tenantCredentialProjection = this.credentialLifecycleSchemaInstalled
+        ? ", auth_write_generation, auth_credential_version_id, auth_credential_updated_at_db_ms"
+        : "";
       const [tenantRows] = await conn.query<Row[]>(
         `SELECT tenant_id, auth_policy, auth_secret_cipher, auth_secret_key_id
+                ${tenantCredentialProjection}
            FROM tenants WHERE tenant_id=? FOR UPDATE`,
         [authorization.tenantId],
       );
@@ -11035,12 +11356,71 @@ export class MysqlSessionStore implements
       if (apiKeyRows.some((row) => String(row.tenant_id) !== authorization.tenantId)) {
         throw new TenantErasureIntegrityError();
       }
+      const providerCredentialProjection = this.credentialLifecycleSchemaInstalled
+        ? ", config, secret_cipher, secret_key_id, credential_slot_id_sha256, credential_write_generation, credential_version_id"
+        : "";
       const [providerRows] = await conn.query<Row[]>(
-        "SELECT tenant_id, provider_id FROM provider_configs WHERE tenant_id=? FOR UPDATE",
+        `SELECT tenant_id, provider_id${providerCredentialProjection}
+           FROM provider_configs WHERE tenant_id=? ORDER BY provider_id FOR UPDATE`,
         [authorization.tenantId],
       );
       if (providerRows.some((row) => String(row.tenant_id) !== authorization.tenantId)) {
         throw new TenantErasureIntegrityError();
+      }
+
+      let providerSourceCountBefore = 0;
+      let providerSourcePointerCountBefore = 0;
+      let trackingTimestampHighWater = 0;
+      if (trackingActive) {
+        if (trackingCutover.evidenceSha256 === undefined) {
+          throw new TenantErasureIntegrityError();
+        }
+        const snapshotBefore = await this.loadTenantCredentialLifecycleSnapshot(
+          conn,
+          authorization.tenantId,
+          "FOR UPDATE",
+        );
+        trackingTimestampHighWater = Math.max(
+          snapshotBefore.subject.trackingStartedAtDbMs,
+          snapshotBefore.authSlot.updatedAtDbMs,
+        );
+        for (const slot of snapshotBefore.providerSlots) {
+          trackingTimestampHighWater = Math.max(trackingTimestampHighWater, slot.updatedAtDbMs);
+        }
+        for (const version of snapshotBefore.versions) {
+          trackingTimestampHighWater = Math.max(
+            trackingTimestampHighWater,
+            version.createdAtDbMs,
+            version.retiredAtDbMs ?? 0,
+          );
+        }
+        for (const target of snapshotBefore.targetDispositions) {
+          trackingTimestampHighWater = Math.max(
+            trackingTimestampHighWater,
+            target.capturedAtDbMs,
+          );
+        }
+        for (const providerRow of providerRows) {
+          if ((providerRow.secret_cipher != null) !== (providerRow.secret_key_id != null)) {
+            throw new TenantErasureIntegrityError();
+          }
+          const config = parse<ProviderConfig>(providerRow.config);
+          const materialPresent = this.credentialPresenceRequiresVersion(
+            this.providerCredentialPresence(config, providerRow.secret_cipher != null),
+          );
+          if (materialPresent) providerSourceCountBefore += 1;
+          if (providerRow.credential_version_id != null) {
+            providerSourcePointerCountBefore += 1;
+          }
+          if (materialPresent !== (providerRow.credential_version_id != null)) {
+            throw new TenantErasureIntegrityError();
+          }
+        }
+        if (
+          (tenantRow.auth_secret_cipher != null) !== (tenantRow.auth_secret_key_id != null)
+          || (tenantRow.auth_secret_cipher != null)
+            !== (tenantRow.auth_credential_version_id != null)
+        ) throw new TenantErasureIntegrityError();
       }
 
       // Every row that can make this destructive step wait is now locked. Re-read the database
@@ -11051,7 +11431,21 @@ export class MysqlSessionStore implements
         await conn.commit();
         return null;
       }
-      const completionAtMs = Math.max(current.updatedAtMs, current.createdAtMs, finalNow);
+      let completionAtMs = Math.max(current.updatedAtMs, current.createdAtMs, finalNow);
+      if (trackingActive) {
+        if (trackingTimestampHighWater >= Number.MAX_SAFE_INTEGER) {
+          throw new TenantErasureIntegrityError();
+        }
+        completionAtMs = Math.max(completionAtMs, trackingTimestampHighWater + 1);
+      }
+      if (!tenantCredentialRevocationAuthorizationMatches(
+        current,
+        authorization,
+        completionAtMs,
+      )) {
+        await conn.commit();
+        return null;
+      }
       const receiptBody: Omit<TenantCredentialRevocationReceipt, "receiptSha256"> = {
         scope: TENANT_CREDENTIAL_REVOCATION_RECEIPT_SCOPE,
         requestId: authorization.requestId,
@@ -11083,6 +11477,67 @@ export class MysqlSessionStore implements
       };
       validateTenantCredentialRevocationReceipt(receipt);
 
+      if (trackingActive) {
+        for (const providerRow of providerRows) {
+          const providerId = String(providerRow.provider_id);
+          const slotIdSha256 = tenantCredentialSlotIdSha256(
+            authorization.tenantId,
+            "provider_binding",
+            providerId,
+          );
+          const slot = await this.loadTenantCredentialProviderSlot(
+            conn,
+            authorization.tenantId,
+            slotIdSha256,
+            "FOR UPDATE",
+          );
+          const sourceGeneration = storedSafeInteger(
+            providerRow.credential_write_generation,
+            "stored provider credential source generation",
+            1,
+          );
+          const versionId = providerRow.credential_version_id == null
+            ? undefined
+            : String(providerRow.credential_version_id);
+          if (
+            !slot
+            || !slot.sourcePresent
+            || slot.writeGeneration !== sourceGeneration
+            || slot.currentCredentialVersionId !== versionId
+            || String(providerRow.credential_slot_id_sha256) !== slotIdSha256
+          ) throw new TenantErasureIntegrityError();
+          if (versionId !== undefined) {
+            await this.retireTenantCredentialVersion(
+              conn,
+              authorization.tenantId,
+              versionId,
+              completionAtMs,
+              "tenant_erasure",
+            );
+          }
+          if (sourceGeneration >= Number.MAX_SAFE_INTEGER) {
+            throw new TenantErasureIntegrityError();
+          }
+          await this.writeTenantCredentialProviderSlot(conn, {
+            tenantId: authorization.tenantId,
+            slotIdSha256,
+            writeGeneration: sourceGeneration + 1,
+            sourcePresent: false,
+            updatedAtDbMs: completionAtMs,
+          });
+        }
+
+        if (tenantRow.auth_credential_version_id != null) {
+          await this.retireTenantCredentialVersion(
+            conn,
+            authorization.tenantId,
+            String(tenantRow.auth_credential_version_id),
+            completionAtMs,
+            "tenant_erasure",
+          );
+        }
+      }
+
       const [deletedApiKeys] = await conn.query<mysql.ResultSetHeader>(
         "DELETE FROM api_keys WHERE tenant_id=?",
         [authorization.tenantId],
@@ -11095,12 +11550,31 @@ export class MysqlSessionStore implements
         deletedApiKeys.affectedRows !== apiKeyRows.length
         || deletedProviders.affectedRows !== providerRows.length
       ) throw new TenantErasureIntegrityError();
-      await conn.query(
-        `UPDATE tenants
-            SET auth_policy=NULL, auth_secret_cipher=NULL, auth_secret_key_id=NULL
-          WHERE tenant_id=?`,
-        [authorization.tenantId],
-      );
+      if (trackingActive) {
+        const authGeneration = storedSafeInteger(
+          tenantRow.auth_write_generation,
+          "stored tenant auth credential source generation",
+        );
+        if (authGeneration >= Number.MAX_SAFE_INTEGER) {
+          throw new TenantErasureIntegrityError();
+        }
+        const [cleared] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenants
+              SET auth_policy=NULL, auth_secret_cipher=NULL, auth_secret_key_id=NULL,
+                  auth_write_generation=?, auth_credential_version_id=NULL,
+                  auth_credential_updated_at_db_ms=?
+            WHERE tenant_id=? AND auth_write_generation=?`,
+          [authGeneration + 1, completionAtMs, authorization.tenantId, authGeneration],
+        );
+        if (cleared.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      } else if (!trackingActive) {
+        await conn.query(
+          `UPDATE tenants
+              SET auth_policy=NULL, auth_secret_cipher=NULL, auth_secret_key_id=NULL
+            WHERE tenant_id=?`,
+          [authorization.tenantId],
+        );
+      }
 
       const [remainingApiKeys] = await conn.query<Row[]>(
         "SELECT tenant_id FROM api_keys WHERE tenant_id=? FOR UPDATE",
@@ -11112,6 +11586,7 @@ export class MysqlSessionStore implements
       );
       const [clearedTenantRows] = await conn.query<Row[]>(
         `SELECT tenant_id, auth_policy, auth_secret_cipher, auth_secret_key_id
+                ${tenantCredentialProjection}
            FROM tenants WHERE tenant_id=? FOR UPDATE`,
         [authorization.tenantId],
       );
@@ -11124,6 +11599,7 @@ export class MysqlSessionStore implements
         || clearedTenant.auth_policy != null
         || clearedTenant.auth_secret_cipher != null
         || clearedTenant.auth_secret_key_id != null
+        || (trackingActive && clearedTenant.auth_credential_version_id != null)
       ) throw new TenantErasureIntegrityError();
 
       await conn.query(
@@ -11161,6 +11637,82 @@ export class MysqlSessionStore implements
           receipt.receiptSha256,
         ],
       );
+
+      if (trackingActive) {
+        const snapshot = await this.loadTenantCredentialLifecycleSnapshot(
+          conn,
+          authorization.tenantId,
+          "FOR SHARE",
+        );
+        const isBlockingDisposition = (target: TenantCredentialTargetDisposition): boolean => (
+          TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS.some(
+            (disposition) => disposition === target.disposition,
+          )
+        );
+        const inventoryBody = {
+          requestId: authorization.requestId,
+          tenantId: authorization.tenantId,
+          subjectGeneration: authorization.subjectGeneration,
+          scope: TENANT_CREDENTIAL_INVENTORY_RECEIPT_SCOPE,
+          t3aReceiptSha256: receipt.receiptSha256,
+          trackingCutoverEvidenceSha256: trackingCutover.evidenceSha256!,
+          subjectCount: 1,
+          subjectRootSha256: snapshot.subjectRootSha256,
+          providerSlotCount: snapshot.providerSlots.length,
+          providerSlotRootSha256: snapshot.providerSlotRootSha256,
+          authSlotCount: 1,
+          authSlotRootSha256: snapshot.authSlotRootSha256,
+          versionCount: snapshot.versions.length,
+          versionRootSha256: snapshot.versionRootSha256,
+          targetDispositionCount: snapshot.targetDispositions.length,
+          targetDispositionRootSha256: snapshot.targetDispositionRootSha256,
+          externalCredentialBlockerCount: snapshot.targetDispositions.filter((target) => (
+            target.domain === "external_credential" && isBlockingDisposition(target)
+          )).length,
+          kmsKeyBlockerCount: snapshot.targetDispositions.filter((target) => (
+            target.domain === "kms_key" && isBlockingDisposition(target)
+          )).length,
+          legacyHistoryUnknownSubjectCount:
+            snapshot.subject.historyStatus === "legacy_history_unknown" ? 1 : 0,
+          providerSourceCountBefore,
+          providerSourcePointerCountBefore,
+          authSecretPresentBefore: tenantRow.auth_secret_cipher != null,
+          authSourcePointerPresentBefore: tenantRow.auth_credential_version_id != null,
+          storeDbTimestampMs: completionAtMs,
+        };
+        const inventory: TenantCredentialInventoryReceipt = {
+          ...inventoryBody,
+          receiptSha256: tenantCredentialInventoryReceiptSha256(inventoryBody),
+        };
+        validateTenantCredentialInventoryReceipt(inventory);
+        await conn.query(
+          `INSERT INTO tenant_credential_inventory_receipts
+             (request_id, tenant_id, subject_generation, scope, t3a_receipt_sha256,
+              tracking_cutover_evidence_sha256, subject_count, subject_root_sha256,
+              provider_slot_count, provider_slot_root_sha256, auth_slot_count,
+              auth_slot_root_sha256, version_count, version_root_sha256,
+              target_disposition_count, target_disposition_root_sha256,
+              external_credential_blocker_count, kms_key_blocker_count,
+              legacy_history_unknown_subject_count, provider_source_count_before,
+              provider_source_pointer_count_before, auth_secret_present_before,
+              auth_source_pointer_present_before, store_db_timestamp_ms, receipt_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [inventory.requestId, inventory.tenantId, inventory.subjectGeneration,
+            inventory.scope, inventory.t3aReceiptSha256,
+            inventory.trackingCutoverEvidenceSha256, inventory.subjectCount,
+            inventory.subjectRootSha256, inventory.providerSlotCount,
+            inventory.providerSlotRootSha256, inventory.authSlotCount,
+            inventory.authSlotRootSha256, inventory.versionCount,
+            inventory.versionRootSha256, inventory.targetDispositionCount,
+            inventory.targetDispositionRootSha256,
+            inventory.externalCredentialBlockerCount, inventory.kmsKeyBlockerCount,
+            inventory.legacyHistoryUnknownSubjectCount,
+            inventory.providerSourceCountBefore,
+            inventory.providerSourcePointerCountBefore,
+            inventory.authSecretPresentBefore, inventory.authSourcePointerPresentBefore,
+            inventory.storeDbTimestampMs, inventory.receiptSha256],
+        );
+      }
       const [completed] = await conn.query<mysql.ResultSetHeader>(
         `UPDATE tenant_credential_revocation_jobs
             SET phase='credential_store_revoked', available_at_ms=NULL, claim_token=NULL,
@@ -11179,7 +11731,7 @@ export class MysqlSessionStore implements
           authorization.subjectGeneration,
           authorization.claimAttempt,
           authorization.claimToken,
-          finalNow,
+          completionAtMs,
         ],
       );
       if (completed.affectedRows !== 1) throw new TenantErasureIntegrityError();
@@ -28267,20 +28819,1302 @@ export class MysqlSessionStore implements
     return rows[0] ? parse<Approval>(rows[0].body) : null;
   }
 
+  // ---------- versioned credential lifecycle inventory ----------
+  private async loadTenantCredentialTrackingCutover(
+    conn: Pool | PoolConnection,
+    lock = "",
+  ): Promise<TenantCredentialTrackingCutoverRecord> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TRACKING_CUTOVER_COLUMNS}
+         FROM tenant_credential_tracking_cutover WHERE singleton_id=1 ${lock}`,
+    );
+    if (!rows[0]) throw new TenantErasureIntegrityError();
+    return rowToTenantCredentialTrackingCutover(rows[0]);
+  }
+
+  private async loadTenantCredentialTrackingSubject(
+    conn: Pool | PoolConnection,
+    tenantId: string,
+    lock = "",
+  ): Promise<TenantCredentialTrackingSubject | null> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TRACKING_SUBJECT_COLUMNS}
+         FROM tenant_credential_tracking_subjects WHERE tenant_id=? ${lock}`,
+      [tenantId],
+    );
+    if (!rows[0]) return null;
+    const subject = rowToTenantCredentialTrackingSubject(rows[0]);
+    if (subject.tenantId !== tenantId) throw new TenantErasureIntegrityError();
+    try {
+      const expected = tenantCredentialSubjectEvidenceSha256({
+        tenantId: subject.tenantId,
+        trackingStartedAtDbMs: subject.trackingStartedAtDbMs,
+        historyStatus: subject.historyStatus,
+        origin: subject.origin,
+      });
+      if (subject.evidenceSha256 !== expected) throw new Error("subject evidence mismatch");
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return subject;
+  }
+
+  private async ensureTenantCredentialTrackingSubject(
+    conn: PoolConnection,
+    tenantId: string,
+    nowMs: number,
+    historyStatus: TenantCredentialTrackingSubject["historyStatus"],
+  ): Promise<TenantCredentialTrackingSubject> {
+    const existing = await this.loadTenantCredentialTrackingSubject(conn, tenantId, "FOR UPDATE");
+    if (existing) return existing;
+    const body = {
+      tenantId,
+      trackingStartedAtDbMs: nowMs,
+      historyStatus,
+      origin: historyStatus === "complete_since_creation"
+        ? "managed_v1" as const
+        : "legacy_observed" as const,
+    };
+    const subject: TenantCredentialTrackingSubject = {
+      ...body,
+      evidenceSha256: tenantCredentialSubjectEvidenceSha256(body),
+    };
+    await conn.query(
+      `INSERT INTO tenant_credential_tracking_subjects
+         (tenant_id, tracking_started_at_db_ms, history_status, origin, evidence_sha256)
+       VALUES (?,?,?,?,?)`,
+      [subject.tenantId, subject.trackingStartedAtDbMs, subject.historyStatus,
+        subject.origin, subject.evidenceSha256],
+    );
+    return subject;
+  }
+
+  private providerCredentialPresence(
+    config: ProviderConfig,
+    secretPresent: boolean,
+  ): Pick<TenantCredentialVersion,
+    "encryptedSecretPresent" | "secretKeyIdPresent" | "customHeadersPresent"
+    | "endpointParametersPresent"> {
+    let endpoint: URL;
+    try {
+      endpoint = new URL(config.baseUrl);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    if (endpoint.username !== "" || endpoint.password !== ""
+      || (config.apiKeyRef !== undefined) !== secretPresent) {
+      // Public provider validation already forbids URL userinfo and keeps the envelope/ref pair in
+      // sync. Encountering either shape while scanning legacy/raw-writer state must stop cutover;
+      // silently calling it keyless would lose credential history.
+      throw new TenantErasureIntegrityError();
+    }
+    return {
+      encryptedSecretPresent: secretPresent,
+      secretKeyIdPresent: secretPresent,
+      customHeadersPresent: Object.keys(config.headers).length > 0,
+      endpointParametersPresent: endpoint.search.length > 0 || endpoint.hash.length > 0,
+    };
+  }
+
+  private credentialPresenceRequiresVersion(
+    presence: Pick<TenantCredentialVersion,
+      "encryptedSecretPresent" | "customHeadersPresent" | "endpointParametersPresent">,
+  ): boolean {
+    return presence.encryptedSecretPresent
+      || presence.customHeadersPresent
+      || presence.endpointParametersPresent;
+  }
+
+  private async insertTenantCredentialVersion(
+    conn: PoolConnection,
+    input: {
+      tenantId: string;
+      slotKind: TenantCredentialVersion["slotKind"];
+      slotId: string;
+      origin: TenantCredentialVersion["origin"];
+      encryptedSecretPresent: boolean;
+      secretKeyIdPresent: boolean;
+      customHeadersPresent: boolean;
+      endpointParametersPresent: boolean;
+      createdAtDbMs: number;
+    },
+  ): Promise<TenantCredentialVersion> {
+    const credentialVersionId = tenantCredentialVersionId({
+      tenantId: input.tenantId,
+      slotKind: input.slotKind,
+      slotId: input.slotId,
+      createdAtDbMs: input.createdAtDbMs,
+      nonce: randomUUID(),
+    });
+    const body = {
+      credentialVersionId,
+      tenantId: input.tenantId,
+      slotKind: input.slotKind,
+      slotIdSha256: tenantCredentialSlotIdSha256(input.tenantId, input.slotKind, input.slotId),
+      origin: input.origin,
+      encryptedSecretPresent: input.encryptedSecretPresent,
+      secretKeyIdPresent: input.secretKeyIdPresent,
+      customHeadersPresent: input.customHeadersPresent,
+      endpointParametersPresent: input.endpointParametersPresent,
+      createdAtDbMs: input.createdAtDbMs,
+    };
+    const version: TenantCredentialVersion = {
+      ...body,
+      evidenceSha256: tenantCredentialVersionEvidenceSha256(body),
+    };
+    await conn.query(
+      `INSERT INTO tenant_credential_versions
+         (credential_version_id, tenant_id, slot_kind, slot_id_sha256, origin,
+          encrypted_secret_present, secret_key_id_present, custom_headers_present,
+          endpoint_parameters_present, created_at_db_ms, retired_at_db_ms, retire_reason,
+          evidence_sha256)
+       VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL,?)`,
+      [version.credentialVersionId, version.tenantId, version.slotKind,
+        version.slotIdSha256, version.origin, version.encryptedSecretPresent,
+        version.secretKeyIdPresent, version.customHeadersPresent,
+        version.endpointParametersPresent, version.createdAtDbMs, version.evidenceSha256],
+    );
+    for (const domain of TENANT_CREDENTIAL_TARGET_DOMAINS) {
+      const targetBody = {
+        credentialVersionId: version.credentialVersionId,
+        tenantId: version.tenantId,
+        domain,
+        disposition: tenantCredentialCurrentTargetDisposition(version, domain),
+        capturedAtDbMs: input.createdAtDbMs,
+      };
+      const target: TenantCredentialTargetDisposition = {
+        ...targetBody,
+        evidenceSha256: tenantCredentialTargetDispositionEvidenceSha256(targetBody),
+      };
+      await conn.query(
+        `INSERT INTO tenant_credential_target_dispositions
+           (credential_version_id, tenant_id, domain, disposition, adapter_protocol,
+            target_reference_cipher, target_reference_key_id,
+            target_reference_cipher_sha256, target_reference_sha256,
+            captured_at_db_ms, evidence_sha256)
+         VALUES (?,?,?,?,NULL,NULL,NULL,NULL,NULL,?,?)`,
+        [target.credentialVersionId, target.tenantId, target.domain, target.disposition,
+          target.capturedAtDbMs, target.evidenceSha256],
+      );
+    }
+    return version;
+  }
+
+  private async loadTenantCredentialVersion(
+    conn: PoolConnection,
+    tenantId: string,
+    credentialVersionId: string,
+    lock = "",
+  ): Promise<TenantCredentialVersion> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_VERSION_COLUMNS}
+         FROM tenant_credential_versions
+        WHERE tenant_id=? AND credential_version_id=? ${lock}`,
+      [tenantId, credentialVersionId],
+    );
+    if (!rows[0]) throw new TenantErasureIntegrityError();
+    const version = rowToTenantCredentialVersion(rows[0]);
+    try {
+      if (version.tenantId !== tenantId
+        || version.evidenceSha256 !== tenantCredentialVersionEvidenceSha256((() => {
+          const { evidenceSha256: _evidence, ...body } = version;
+          return body;
+        })())) throw new Error("credential version evidence mismatch");
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return version;
+  }
+
+  private async retireTenantCredentialVersion(
+    conn: PoolConnection,
+    tenantId: string,
+    credentialVersionId: string,
+    retiredAtDbMs: number,
+    retireReason: NonNullable<TenantCredentialVersion["retireReason"]>,
+    expectedSlot?: Pick<TenantCredentialVersion, "slotKind" | "slotIdSha256">,
+  ): Promise<TenantCredentialVersion> {
+    const current = await this.loadTenantCredentialVersion(
+      conn,
+      tenantId,
+      credentialVersionId,
+      "FOR UPDATE",
+    );
+    if (current.retiredAtDbMs !== undefined || current.retireReason !== undefined) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (expectedSlot && (
+      current.slotKind !== expectedSlot.slotKind
+      || current.slotIdSha256 !== expectedSlot.slotIdSha256
+    )) throw new TenantErasureIntegrityError();
+    const { evidenceSha256: _evidence, ...unretired } = current;
+    const body = { ...unretired, retiredAtDbMs, retireReason };
+    const retired: TenantCredentialVersion = {
+      ...body,
+      evidenceSha256: tenantCredentialVersionEvidenceSha256(body),
+    };
+    const [result] = await conn.query<mysql.ResultSetHeader>(
+      `UPDATE tenant_credential_versions
+          SET retired_at_db_ms=?, retire_reason=?, evidence_sha256=?
+        WHERE tenant_id=? AND credential_version_id=?
+          AND retired_at_db_ms IS NULL AND retire_reason IS NULL`,
+      [retiredAtDbMs, retireReason, retired.evidenceSha256, tenantId, credentialVersionId],
+    );
+    if (result.affectedRows !== 1) throw new TenantErasureIntegrityError();
+    return retired;
+  }
+
+  private async loadTenantCredentialProviderSlot(
+    conn: PoolConnection,
+    tenantId: string,
+    slotIdSha256: string,
+    lock = "",
+  ): Promise<TenantCredentialProviderSlot | null> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_PROVIDER_SLOT_COLUMNS}
+         FROM tenant_credential_provider_slots
+        WHERE tenant_id=? AND slot_id_sha256=? ${lock}`,
+      [tenantId, slotIdSha256],
+    );
+    if (!rows[0]) return null;
+    const slot = rowToTenantCredentialProviderSlot(rows[0]);
+    try {
+      const { evidenceSha256, ...body } = slot;
+      if (slot.tenantId !== tenantId || slot.slotIdSha256 !== slotIdSha256
+        || evidenceSha256 !== tenantCredentialProviderSlotEvidenceSha256(body)) {
+        throw new Error("provider slot evidence mismatch");
+      }
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return slot;
+  }
+
+  private async validateTenantCredentialCurrentVersionProjection(
+    conn: PoolConnection,
+    input: {
+      tenantId: string;
+      credentialVersionId: string;
+      slotKind: TenantCredentialVersion["slotKind"];
+      slotIdSha256: string;
+      encryptedSecretPresent: boolean;
+      secretKeyIdPresent: boolean;
+      customHeadersPresent: boolean;
+      endpointParametersPresent: boolean;
+      updatedAtDbMs: number;
+    },
+  ): Promise<void> {
+    const version = await this.loadTenantCredentialVersion(
+      conn,
+      input.tenantId,
+      input.credentialVersionId,
+    );
+    if (
+      version.slotKind !== input.slotKind
+      || version.slotIdSha256 !== input.slotIdSha256
+      || version.encryptedSecretPresent !== input.encryptedSecretPresent
+      || version.secretKeyIdPresent !== input.secretKeyIdPresent
+      || version.customHeadersPresent !== input.customHeadersPresent
+      || version.endpointParametersPresent !== input.endpointParametersPresent
+      || version.createdAtDbMs !== input.updatedAtDbMs
+      || version.retiredAtDbMs !== undefined
+      || version.retireReason !== undefined
+    ) throw new TenantErasureIntegrityError();
+
+    const [targetRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TARGET_DISPOSITION_COLUMNS}
+         FROM tenant_credential_target_dispositions
+        WHERE tenant_id=? AND credential_version_id=? ORDER BY domain`,
+      [input.tenantId, input.credentialVersionId],
+    );
+    if (targetRows.length !== TENANT_CREDENTIAL_TARGET_DOMAINS.length) {
+      throw new TenantErasureIntegrityError();
+    }
+    const domains = new Set<TenantCredentialTargetDisposition["domain"]>();
+    for (const raw of targetRows) {
+      try {
+        const target = rowToTenantCredentialTargetDisposition(raw);
+        const { evidenceSha256, ...body } = target;
+        if (
+          target.tenantId !== input.tenantId
+          || target.credentialVersionId !== input.credentialVersionId
+          || domains.has(target.domain)
+          || target.capturedAtDbMs !== version.createdAtDbMs
+          || target.disposition !== tenantCredentialCurrentTargetDisposition(
+            version,
+            target.domain,
+          )
+          || evidenceSha256 !== tenantCredentialTargetDispositionEvidenceSha256(body)
+        ) throw new Error("credential target projection mismatch");
+        domains.add(target.domain);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    if (TENANT_CREDENTIAL_TARGET_DOMAINS.some((domain) => !domains.has(domain))) {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async validateTenantCredentialProviderReadProjection(
+    conn: PoolConnection,
+    input: {
+      tenantId: string;
+      providerId: string;
+      config: ProviderConfig;
+      secretPresent: boolean;
+      row: Row;
+    },
+  ): Promise<number> {
+    try {
+      const slotIdSha256 = tenantCredentialSlotIdSha256(
+        input.tenantId,
+        "provider_binding",
+        input.providerId,
+      );
+      const writeGeneration = storedSafeInteger(
+        input.row.credential_write_generation,
+        "stored provider credential source revision",
+        1,
+      );
+      const currentCredentialVersionId = input.row.credential_version_id == null
+        ? undefined
+        : String(input.row.credential_version_id);
+      const presence = this.providerCredentialPresence(input.config, input.secretPresent);
+      const requiresVersion = this.credentialPresenceRequiresVersion(presence);
+      const slot = await this.loadTenantCredentialProviderSlot(
+        conn,
+        input.tenantId,
+        slotIdSha256,
+      );
+      if (
+        String(input.row.credential_slot_id_sha256) !== slotIdSha256
+        || !slot?.sourcePresent
+        || slot.writeGeneration !== writeGeneration
+        || slot.currentCredentialVersionId !== currentCredentialVersionId
+        || requiresVersion !== (currentCredentialVersionId !== undefined)
+      ) throw new Error("provider credential projection mismatch");
+      if (currentCredentialVersionId !== undefined) {
+        await this.validateTenantCredentialCurrentVersionProjection(conn, {
+          tenantId: input.tenantId,
+          credentialVersionId: currentCredentialVersionId,
+          slotKind: "provider_binding",
+          slotIdSha256,
+          ...presence,
+          updatedAtDbMs: slot.updatedAtDbMs,
+        });
+      }
+      return writeGeneration;
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async validateTenantCredentialAuthReadProjection(
+    conn: PoolConnection,
+    tenantId: string,
+    row: Row,
+  ): Promise<number> {
+    try {
+      const authSlot = rowToTenantCredentialAuthSlot(row);
+      if (authSlot.tenantId !== tenantId) throw new Error("auth tenant mismatch");
+      if (authSlot.currentCredentialVersionId !== undefined) {
+        await this.validateTenantCredentialCurrentVersionProjection(conn, {
+          tenantId,
+          credentialVersionId: authSlot.currentCredentialVersionId,
+          slotKind: "tenant_auth_secret",
+          slotIdSha256: tenantCredentialSlotIdSha256(
+            tenantId,
+            "tenant_auth_secret",
+            "tenant_auth_secret",
+          ),
+          encryptedSecretPresent: true,
+          secretKeyIdPresent: true,
+          customHeadersPresent: false,
+          endpointParametersPresent: false,
+          updatedAtDbMs: authSlot.updatedAtDbMs,
+        });
+      }
+      return authSlot.writeGeneration;
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async writeTenantCredentialProviderSlot(
+    conn: PoolConnection,
+    slot: Omit<TenantCredentialProviderSlot, "evidenceSha256">,
+  ): Promise<TenantCredentialProviderSlot> {
+    const record: TenantCredentialProviderSlot = {
+      ...slot,
+      evidenceSha256: tenantCredentialProviderSlotEvidenceSha256(slot),
+    };
+    await conn.query(
+      `INSERT INTO tenant_credential_provider_slots
+         (tenant_id, slot_id_sha256, write_generation, source_present,
+          current_credential_version_id, updated_at_db_ms, evidence_sha256)
+       VALUES (?,?,?,?,?,?,?)
+       ON DUPLICATE KEY UPDATE write_generation=VALUES(write_generation),
+         source_present=VALUES(source_present),
+         current_credential_version_id=VALUES(current_credential_version_id),
+         updated_at_db_ms=VALUES(updated_at_db_ms), evidence_sha256=VALUES(evidence_sha256)`,
+      [record.tenantId, record.slotIdSha256, record.writeGeneration,
+        record.sourcePresent, record.currentCredentialVersionId ?? null,
+        record.updatedAtDbMs, record.evidenceSha256],
+    );
+    return record;
+  }
+
+  private async loadTenantCredentialLifecycleSnapshot(
+    conn: PoolConnection,
+    tenantId: string,
+    lock = "",
+  ): Promise<TenantCredentialLifecycleSnapshot> {
+    const subject = await this.loadTenantCredentialTrackingSubject(conn, tenantId, lock);
+    if (!subject) throw new TenantErasureIntegrityError();
+    const [tenantRows] = await conn.query<Row[]>(
+      `SELECT tenant_id, auth_secret_cipher, auth_secret_key_id, auth_write_generation,
+              auth_credential_version_id, auth_credential_updated_at_db_ms
+         FROM tenants WHERE tenant_id=? ${lock}`,
+      [tenantId],
+    );
+    if (!tenantRows[0] || String(tenantRows[0].tenant_id) !== tenantId) {
+      throw new TenantErasureIntegrityError();
+    }
+    if ((tenantRows[0].auth_secret_cipher != null) !== (tenantRows[0].auth_secret_key_id != null)) {
+      throw new TenantErasureIntegrityError();
+    }
+    const authSlot = rowToTenantCredentialAuthSlot(tenantRows[0]);
+    const [slotRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_PROVIDER_SLOT_COLUMNS}
+         FROM tenant_credential_provider_slots
+        WHERE tenant_id=? ORDER BY slot_id_sha256 ${lock}`,
+      [tenantId],
+    );
+    const providerSlots = slotRows.map(rowToTenantCredentialProviderSlot);
+    const [versionRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_VERSION_COLUMNS}
+         FROM tenant_credential_versions
+        WHERE tenant_id=? ORDER BY credential_version_id ${lock}`,
+      [tenantId],
+    );
+    const versions = versionRows.map(rowToTenantCredentialVersion);
+    const [targetRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TARGET_DISPOSITION_COLUMNS}
+         FROM tenant_credential_target_dispositions
+        WHERE tenant_id=? ORDER BY credential_version_id, domain ${lock}`,
+      [tenantId],
+    );
+    const targetDispositions = targetRows.map(rowToTenantCredentialTargetDisposition);
+    const snapshot: TenantCredentialLifecycleSnapshot = {
+      subject,
+      authSlot,
+      providerSlots,
+      versions,
+      targetDispositions,
+      subjectRootSha256: tenantCredentialSubjectRootSha256([subject]),
+      providerSlotRootSha256: tenantCredentialProviderSlotRootSha256(providerSlots),
+      authSlotRootSha256: tenantCredentialAuthSlotRootSha256([authSlot]),
+      versionRootSha256: tenantCredentialVersionRootSha256(versions),
+      targetDispositionRootSha256: tenantCredentialTargetDispositionRootSha256(
+        targetDispositions,
+      ),
+    };
+    try {
+      validateTenantCredentialLifecycleSnapshot(snapshot);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+
+    const liveVersionIds = new Set<string>();
+    if (authSlot.currentCredentialVersionId !== undefined) {
+      liveVersionIds.add(authSlot.currentCredentialVersionId);
+      const authVersion = versions.find((version) => (
+        version.credentialVersionId === authSlot.currentCredentialVersionId
+      ));
+      if (!authVersion || authVersion.slotIdSha256 !== tenantCredentialSlotIdSha256(
+        tenantId,
+        "tenant_auth_secret",
+        "tenant_auth_secret",
+      )) throw new TenantErasureIntegrityError();
+    }
+    for (const slot of providerSlots) {
+      if (slot.currentCredentialVersionId === undefined) continue;
+      if (liveVersionIds.has(slot.currentCredentialVersionId)) {
+        throw new TenantErasureIntegrityError();
+      }
+      liveVersionIds.add(slot.currentCredentialVersionId);
+    }
+    if (versions.some((version) => (
+      (version.retiredAtDbMs === undefined) !== liveVersionIds.has(version.credentialVersionId)
+    ))) throw new TenantErasureIntegrityError();
+    const versionById = new Map(versions.map((version) => [version.credentialVersionId, version]));
+    if (targetDispositions.some((target) => {
+      const version = versionById.get(target.credentialVersionId);
+      return !version
+        || target.disposition !== tenantCredentialCurrentTargetDisposition(version, target.domain);
+    })) throw new TenantErasureIntegrityError();
+
+    const [sourceRows] = await conn.query<Row[]>(
+      `SELECT tenant_id, provider_id, config, secret_cipher, secret_key_id,
+              credential_slot_id_sha256, credential_write_generation,
+              credential_version_id
+         FROM provider_configs WHERE tenant_id=? ORDER BY provider_id ${lock}`,
+      [tenantId],
+    );
+    const sourceSlots = new Set<string>();
+    for (const source of sourceRows) {
+      if (String(source.tenant_id) !== tenantId) throw new TenantErasureIntegrityError();
+      const providerId = String(source.provider_id);
+      if ((source.secret_cipher != null) !== (source.secret_key_id != null)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const slotIdSha256 = tenantCredentialSlotIdSha256(
+        tenantId,
+        "provider_binding",
+        providerId,
+      );
+      if (String(source.credential_slot_id_sha256) !== slotIdSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const slot = providerSlots.find((candidate) => candidate.slotIdSha256 === slotIdSha256);
+      if (!slot || !slot.sourcePresent
+        || slot.writeGeneration !== storedSafeInteger(
+          source.credential_write_generation,
+          "stored provider credential source generation",
+        )) throw new TenantErasureIntegrityError();
+      const config = parse<ProviderConfig>(source.config);
+      if (config.tenantId !== tenantId || config.id !== providerId) {
+        throw new TenantErasureIntegrityError();
+      }
+      const presence = this.providerCredentialPresence(config, source.secret_cipher != null);
+      const requiresVersion = this.credentialPresenceRequiresVersion(presence);
+      const sourceVersionId = source.credential_version_id == null
+        ? undefined
+        : String(source.credential_version_id);
+      if ((sourceVersionId !== undefined) !== requiresVersion
+        || sourceVersionId !== slot.currentCredentialVersionId) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (sourceVersionId !== undefined) {
+        const version = versionById.get(sourceVersionId);
+        if (!version
+          || version.encryptedSecretPresent !== presence.encryptedSecretPresent
+          || version.secretKeyIdPresent !== presence.secretKeyIdPresent
+          || version.customHeadersPresent !== presence.customHeadersPresent
+          || version.endpointParametersPresent !== presence.endpointParametersPresent) {
+          throw new TenantErasureIntegrityError();
+        }
+      }
+      sourceSlots.add(slotIdSha256);
+    }
+    if (providerSlots.some((slot) => slot.sourcePresent !== sourceSlots.has(slot.slotIdSha256))) {
+      throw new TenantErasureIntegrityError();
+    }
+    return snapshot;
+  }
+
+  async readTenantCredentialTrackingCutover(): Promise<TenantCredentialTrackingCutoverRecord> {
+    return this.withConsistentRead((conn) => this.loadTenantCredentialTrackingCutover(conn));
+  }
+
+  async activateTenantCredentialTrackingCutover(
+    input: ActivateTenantCredentialTrackingInput,
+  ): Promise<TenantCredentialTrackingCutoverRecord> {
+    if (input.expectedControlGeneration !== 0
+      || Object.keys(input).length !== 1) throw new Error("invalid credential cutover input");
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+      await conn.beginTransaction();
+      // Every credential writer takes its exact tenant lifecycle gate before the global cutover.
+      // Lock the complete tenant range first as well: besides removing the inverse lock order, the
+      // SERIALIZABLE next-key/supremum locks keep a concurrently-created tenant outside the frozen
+      // activation snapshot until it can observe the active cutover and publish managed coverage.
+      const [lifecycleRows] = await conn.query<Row[]>(
+        `SELECT tenant_id, subject_id
+           FROM subject_lifecycle
+          WHERE subject_kind='tenant'
+          ORDER BY tenant_id, subject_id FOR UPDATE`,
+      );
+      const current = await this.loadTenantCredentialTrackingCutover(conn, "FOR UPDATE");
+      if (current.controlGeneration === 1) {
+        await conn.commit();
+        return current;
+      }
+      let now = await this.databaseNow(conn);
+      const lifecycleTenantIds = new Set<string>();
+      for (const row of lifecycleRows) {
+        const tenantId = String(row.tenant_id);
+        if (String(row.subject_id) !== tenantId || lifecycleTenantIds.has(tenantId)) {
+          throw new TenantErasureIntegrityError();
+        }
+        lifecycleTenantIds.add(tenantId);
+      }
+      const [existingTenantRows] = await conn.query<Row[]>(
+        `SELECT tenant_id, auth_secret_cipher, auth_secret_key_id,
+                auth_write_generation, auth_credential_version_id,
+                auth_credential_updated_at_db_ms
+           FROM tenants ORDER BY tenant_id FOR UPDATE`,
+      );
+      const [providerRows] = await conn.query<Row[]>(
+        `SELECT tenant_id, provider_id, config, secret_cipher, secret_key_id,
+                credential_slot_id_sha256, credential_write_generation,
+                credential_version_id
+           FROM provider_configs ORDER BY tenant_id, provider_id FOR UPDATE`,
+      );
+      const existingTenantIds = new Set(existingTenantRows.map((row) => String(row.tenant_id)));
+      if (existingTenantIds.size !== existingTenantRows.length
+        || existingTenantRows.some((row) => !lifecycleTenantIds.has(String(row.tenant_id)))
+        || providerRows.some((row) => !lifecycleTenantIds.has(String(row.tenant_id)))) {
+        throw new TenantErasureIntegrityError();
+      }
+      for (const tenantId of lifecycleTenantIds) {
+        if (existingTenantIds.has(tenantId)) continue;
+        await conn.query(
+          "INSERT INTO tenants (tenant_id, created_at_ms) VALUES (?,?)",
+          [tenantId, now],
+        );
+      }
+      const [tenantRows] = await conn.query<Row[]>(
+        `SELECT tenant_id, auth_secret_cipher, auth_secret_key_id,
+                auth_write_generation, auth_credential_version_id,
+                auth_credential_updated_at_db_ms
+           FROM tenants ORDER BY tenant_id FOR UPDATE`,
+      );
+      const tenantIds = new Set(tenantRows.map((row) => String(row.tenant_id)));
+      if (tenantIds.size !== tenantRows.length
+        || tenantIds.size !== lifecycleTenantIds.size
+        || [...tenantIds].some((tenantId) => !lifecycleTenantIds.has(tenantId))) {
+        throw new TenantErasureIntegrityError();
+      }
+      const [ledgerClockRows] = await conn.query<Row[]>(
+        `SELECT GREATEST(
+            COALESCE((SELECT MAX(updated_at_db_ms)
+                        FROM tenant_credential_provider_slots), 0),
+            COALESCE((SELECT MAX(created_at_db_ms)
+                        FROM tenant_credential_versions), 0),
+            COALESCE((SELECT MAX(retired_at_db_ms)
+                        FROM tenant_credential_versions), 0),
+            COALESCE((SELECT MAX(captured_at_db_ms)
+                        FROM tenant_credential_target_dispositions), 0),
+            COALESCE((SELECT MAX(tracking_started_at_db_ms)
+                        FROM tenant_credential_tracking_subjects), 0)
+          ) AS high_water_ms`,
+      );
+      let ledgerHighWater = storedSafeInteger(
+        ledgerClockRows[0]?.high_water_ms ?? 0,
+        "stored credential ledger clock high-water",
+      );
+      for (const tenantRow of tenantRows) {
+        ledgerHighWater = Math.max(
+          ledgerHighWater,
+          storedSafeInteger(
+            tenantRow.auth_credential_updated_at_db_ms,
+            "stored tenant auth credential update time",
+          ),
+        );
+      }
+      now = Math.max(now, ledgerHighWater);
+
+      for (const tenantRow of tenantRows) {
+        const tenantId = String(tenantRow.tenant_id);
+        const existingSubject = await this.loadTenantCredentialTrackingSubject(
+          conn,
+          tenantId,
+          "FOR UPDATE",
+        );
+        if (existingSubject && existingSubject.historyStatus !== "legacy_history_unknown") {
+          throw new TenantErasureIntegrityError();
+        }
+        if (!existingSubject) {
+          await this.ensureTenantCredentialTrackingSubject(
+            conn,
+            tenantId,
+            now,
+            "legacy_history_unknown",
+          );
+        }
+
+        const currentAuthVersionId = tenantRow.auth_credential_version_id == null
+          ? undefined
+          : String(tenantRow.auth_credential_version_id);
+        const authSecretPresent = tenantRow.auth_secret_cipher != null
+          || tenantRow.auth_secret_key_id != null;
+        if ((tenantRow.auth_secret_cipher != null) !== (tenantRow.auth_secret_key_id != null)) {
+          throw new TenantErasureIntegrityError();
+        }
+        if (currentAuthVersionId !== undefined) {
+          const currentAuthVersion = await this.loadTenantCredentialVersion(
+            conn,
+            tenantId,
+            currentAuthVersionId,
+            "FOR UPDATE",
+          );
+          if (currentAuthVersion.slotKind !== "tenant_auth_secret"
+            || currentAuthVersion.slotIdSha256 !== tenantCredentialSlotIdSha256(
+              tenantId,
+              "tenant_auth_secret",
+              "tenant_auth_secret",
+            )) throw new TenantErasureIntegrityError();
+          await this.retireTenantCredentialVersion(
+            conn,
+            tenantId,
+            currentAuthVersionId,
+            now,
+            authSecretPresent ? "replaced" : "cleared",
+          );
+        }
+        const authVersion = authSecretPresent
+          ? await this.insertTenantCredentialVersion(conn, {
+              tenantId,
+              slotKind: "tenant_auth_secret",
+              slotId: "tenant_auth_secret",
+              origin: "legacy_observed",
+              encryptedSecretPresent: true,
+              secretKeyIdPresent: true,
+              customHeadersPresent: false,
+              endpointParametersPresent: false,
+              createdAtDbMs: now,
+            })
+          : undefined;
+        const authGeneration = storedSafeInteger(
+          tenantRow.auth_write_generation,
+          "stored tenant auth generation",
+        ) + 1;
+        if (!Number.isSafeInteger(authGeneration)) throw new TenantErasureIntegrityError();
+        await conn.query(
+          `UPDATE tenants
+              SET auth_write_generation=?, auth_credential_version_id=?,
+                  auth_credential_updated_at_db_ms=?
+            WHERE tenant_id=?`,
+          [authGeneration, authVersion?.credentialVersionId ?? null, now, tenantId],
+        );
+      }
+
+      const providerKeys = new Set<string>();
+      for (const providerRow of providerRows) {
+        const tenantId = String(providerRow.tenant_id);
+        const providerId = String(providerRow.provider_id);
+        const slotIdSha256 = tenantCredentialSlotIdSha256(
+          tenantId,
+          "provider_binding",
+          providerId,
+        );
+        providerKeys.add(`${tenantId}\u0000${slotIdSha256}`);
+        const slot = await this.loadTenantCredentialProviderSlot(
+          conn,
+          tenantId,
+          slotIdSha256,
+          "FOR UPDATE",
+        );
+        const currentVersionId = providerRow.credential_version_id == null
+          ? undefined
+          : String(providerRow.credential_version_id);
+        const projected = providerRow.credential_slot_id_sha256 != null
+          || providerRow.credential_write_generation != null
+          || currentVersionId !== undefined;
+        if (projected && (
+          !slot?.sourcePresent
+          || String(providerRow.credential_slot_id_sha256) !== slotIdSha256
+          || storedSafeInteger(
+            providerRow.credential_write_generation,
+            "stored provider credential source generation",
+            1,
+          ) !== slot.writeGeneration
+          || currentVersionId !== slot.currentCredentialVersionId
+        )) throw new TenantErasureIntegrityError();
+        const priorVersionId = slot?.currentCredentialVersionId ?? currentVersionId;
+        if (priorVersionId !== undefined) {
+          const priorVersion = await this.loadTenantCredentialVersion(
+            conn,
+            tenantId,
+            priorVersionId,
+            "FOR UPDATE",
+          );
+          if (priorVersion.slotKind !== "provider_binding"
+            || priorVersion.slotIdSha256 !== slotIdSha256) {
+            throw new TenantErasureIntegrityError();
+          }
+          await this.retireTenantCredentialVersion(
+            conn,
+            tenantId,
+            priorVersionId,
+            now,
+            "replaced",
+          );
+        }
+        const config = parse<ProviderConfig>(providerRow.config);
+        if (config.tenantId !== tenantId || config.id !== providerId
+          || (providerRow.secret_cipher != null) !== (providerRow.secret_key_id != null)) {
+          throw new TenantErasureIntegrityError();
+        }
+        const presence = this.providerCredentialPresence(
+          config,
+          providerRow.secret_cipher != null,
+        );
+        const version = this.credentialPresenceRequiresVersion(presence)
+          ? await this.insertTenantCredentialVersion(conn, {
+              tenantId,
+              slotKind: "provider_binding",
+              slotId: providerId,
+              origin: "legacy_observed",
+              ...presence,
+              createdAtDbMs: now,
+            })
+          : undefined;
+        const generation = (slot?.writeGeneration ?? 0) + 1;
+        if (!Number.isSafeInteger(generation)) throw new TenantErasureIntegrityError();
+        await this.writeTenantCredentialProviderSlot(conn, {
+          tenantId,
+          slotIdSha256,
+          writeGeneration: generation,
+          sourcePresent: true,
+          ...(version === undefined ? {} : { currentCredentialVersionId: version.credentialVersionId }),
+          updatedAtDbMs: now,
+        });
+        await conn.query(
+          `UPDATE provider_configs
+              SET credential_slot_id_sha256=?, credential_write_generation=?,
+                  credential_version_id=?
+            WHERE tenant_id=? AND provider_id=?`,
+          [slotIdSha256, generation, version?.credentialVersionId ?? null,
+            tenantId, providerId],
+        );
+      }
+
+      const [allSlotRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_CREDENTIAL_PROVIDER_SLOT_COLUMNS}
+           FROM tenant_credential_provider_slots ORDER BY tenant_id, slot_id_sha256 FOR UPDATE`,
+      );
+      for (const raw of allSlotRows) {
+        const rawSlot = rowToTenantCredentialProviderSlot(raw);
+        const slot = await this.loadTenantCredentialProviderSlot(
+          conn,
+          rawSlot.tenantId,
+          rawSlot.slotIdSha256,
+          "FOR UPDATE",
+        );
+        if (!slot || !tenantIds.has(slot.tenantId)) throw new TenantErasureIntegrityError();
+        const key = `${slot.tenantId}\u0000${slot.slotIdSha256}`;
+        if (providerKeys.has(key)) continue;
+        if (slot.currentCredentialVersionId !== undefined) {
+          await this.retireTenantCredentialVersion(
+            conn,
+            slot.tenantId,
+            slot.currentCredentialVersionId,
+            now,
+            "deleted",
+          );
+        }
+        if (slot.sourcePresent || slot.currentCredentialVersionId !== undefined) {
+          if (slot.writeGeneration >= Number.MAX_SAFE_INTEGER) {
+            throw new TenantErasureIntegrityError();
+          }
+          await this.writeTenantCredentialProviderSlot(conn, {
+            tenantId: slot.tenantId,
+            slotIdSha256: slot.slotIdSha256,
+            writeGeneration: slot.writeGeneration + 1,
+            sourcePresent: false,
+            updatedAtDbMs: now,
+          });
+        }
+      }
+
+      const subjects: TenantCredentialTrackingSubject[] = [];
+      const providerSlots: TenantCredentialProviderSlot[] = [];
+      const authSlots: TenantCredentialAuthSlot[] = [];
+      const versions: TenantCredentialVersion[] = [];
+      const targetDispositions: TenantCredentialTargetDisposition[] = [];
+      for (const tenantId of [...tenantIds].sort()) {
+        const snapshot = await this.loadTenantCredentialLifecycleSnapshot(
+          conn,
+          tenantId,
+          "FOR SHARE",
+        );
+        subjects.push(snapshot.subject);
+        providerSlots.push(...snapshot.providerSlots);
+        authSlots.push(snapshot.authSlot);
+        versions.push(...snapshot.versions);
+        targetDispositions.push(...snapshot.targetDispositions);
+      }
+      const evidenceBody = {
+        activatedAtDbMs: now,
+        subjectCount: subjects.length,
+        subjectRootSha256: tenantCredentialSubjectRootSha256(subjects),
+        providerSlotCount: providerSlots.length,
+        providerSlotRootSha256: tenantCredentialProviderSlotRootSha256(providerSlots),
+        authSlotCount: authSlots.length,
+        authSlotRootSha256: tenantCredentialAuthSlotRootSha256(authSlots),
+        versionCount: versions.length,
+        versionRootSha256: tenantCredentialVersionRootSha256(versions),
+        targetDispositionCount: targetDispositions.length,
+        targetDispositionRootSha256: tenantCredentialTargetDispositionRootSha256(
+          targetDispositions,
+        ),
+      };
+      const evidenceSha256 = tenantCredentialTrackingCutoverEvidenceSha256(evidenceBody);
+      const [activated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_credential_tracking_cutover
+            SET control_generation=1, activated_at_db_ms=?, subject_count=?,
+                subject_root_sha256=?, provider_slot_count=?, provider_slot_root_sha256=?,
+                auth_slot_count=?, auth_slot_root_sha256=?, version_count=?,
+                version_root_sha256=?, target_disposition_count=?,
+                target_disposition_root_sha256=?, evidence_sha256=?
+          WHERE singleton_id=1 AND control_generation=0`,
+        [now, evidenceBody.subjectCount, evidenceBody.subjectRootSha256,
+          evidenceBody.providerSlotCount, evidenceBody.providerSlotRootSha256,
+          evidenceBody.authSlotCount, evidenceBody.authSlotRootSha256,
+          evidenceBody.versionCount, evidenceBody.versionRootSha256,
+          evidenceBody.targetDispositionCount, evidenceBody.targetDispositionRootSha256,
+          evidenceSha256],
+      );
+      if (activated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      const record: TenantCredentialTrackingCutoverRecord = {
+        controlGeneration: 1,
+        ...evidenceBody,
+        evidenceSha256,
+      };
+      validateTenantCredentialTrackingCutoverRecord(record);
+      await conn.commit();
+      return record;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantCredentialInventorySnapshot(
+    tenantId: string,
+  ): Promise<TenantCredentialLifecycleSnapshot> {
+    if (!tenantId || tenantId.length > 128) throw new Error("invalid tenant id");
+    return this.withConsistentRead(async (conn) => {
+      const cutover = await this.loadTenantCredentialTrackingCutover(conn);
+      if (cutover.controlGeneration !== 1) throw new TenantErasureIntegrityError();
+      return this.loadTenantCredentialLifecycleSnapshot(conn, tenantId);
+    });
+  }
+
+  private async loadTenantCredentialInventoryReceipt(
+    conn: PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantCredentialInventoryReceipt | null> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_INVENTORY_RECEIPT_COLUMNS}
+         FROM tenant_credential_inventory_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    if (String(rows[0].tenant_id) !== tenantId || String(rows[0].request_id) !== requestId) {
+      throw new TenantErasureIntegrityError();
+    }
+    return rowToTenantCredentialInventoryReceipt(rows[0]);
+  }
+
+  private async validateTenantCredentialInventoryReadProof(
+    conn: PoolConnection,
+    inventory: TenantCredentialInventoryReceipt,
+    receipt: TenantCredentialRevocationReceipt,
+  ): Promise<void> {
+    const cutover = await this.loadTenantCredentialTrackingCutover(conn);
+    if (
+      cutover.controlGeneration !== 1
+      || inventory.requestId !== receipt.requestId
+      || inventory.tenantId !== receipt.tenantId
+      || inventory.subjectGeneration !== receipt.subjectGeneration
+      || inventory.t3aReceiptSha256 !== receipt.receiptSha256
+      || inventory.storeDbTimestampMs !== receipt.storeDbTimestampMs
+      || inventory.trackingCutoverEvidenceSha256 !== cutover.evidenceSha256
+    ) throw new TenantErasureIntegrityError();
+
+    const snapshot = await this.loadTenantCredentialLifecycleSnapshot(
+      conn,
+      inventory.tenantId,
+    );
+    const blockingTargetCount = (domain: TenantCredentialTargetDisposition["domain"]): number => (
+      snapshot.targetDispositions.filter((target) => (
+        target.domain === domain
+        && TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS.some(
+          (disposition) => disposition === target.disposition,
+        )
+      )).length
+    );
+    const providerSourcesRetiredByT3a = snapshot.versions.filter((version) => (
+      version.slotKind === "provider_binding"
+      && version.retireReason === "tenant_erasure"
+      && version.retiredAtDbMs === inventory.storeDbTimestampMs
+    )).length;
+    const authSourceRetiredByT3a = snapshot.versions.some((version) => (
+      version.slotKind === "tenant_auth_secret"
+      && version.retireReason === "tenant_erasure"
+      && version.retiredAtDbMs === inventory.storeDbTimestampMs
+    ));
+    if (
+      inventory.subjectCount !== 1
+      || inventory.subjectRootSha256 !== snapshot.subjectRootSha256
+      || inventory.providerSlotCount !== snapshot.providerSlots.length
+      || inventory.providerSlotRootSha256 !== snapshot.providerSlotRootSha256
+      || inventory.authSlotCount !== 1
+      || inventory.authSlotRootSha256 !== snapshot.authSlotRootSha256
+      || inventory.versionCount !== snapshot.versions.length
+      || inventory.versionRootSha256 !== snapshot.versionRootSha256
+      || inventory.targetDispositionCount !== snapshot.targetDispositions.length
+      || inventory.targetDispositionRootSha256 !== snapshot.targetDispositionRootSha256
+      || inventory.externalCredentialBlockerCount
+        !== blockingTargetCount("external_credential")
+      || inventory.kmsKeyBlockerCount !== blockingTargetCount("kms_key")
+      || inventory.legacyHistoryUnknownSubjectCount
+        !== (snapshot.subject.historyStatus === "legacy_history_unknown" ? 1 : 0)
+      || inventory.providerSourceCountBefore !== providerSourcesRetiredByT3a
+      || inventory.providerSourcePointerCountBefore !== providerSourcesRetiredByT3a
+      || inventory.authSecretPresentBefore !== authSourceRetiredByT3a
+      || inventory.authSourcePointerPresentBefore !== authSourceRetiredByT3a
+    ) throw new TenantErasureIntegrityError();
+  }
+
+  async getTenantCredentialInventoryReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialInventoryReceipt | null> {
+    if (!tenantId || tenantId.length > 128) throw new Error("invalid tenant id");
+    return this.withConsistentRead(async (conn) => {
+      const inventory = await this.loadTenantCredentialInventoryReceipt(
+        conn,
+        tenantId,
+        requestId,
+      );
+      if (!inventory) return null;
+      const job = await this.loadTenantCredentialRevocationJob(conn, tenantId, requestId);
+      if (!job) throw new TenantErasureIntegrityError();
+      const receipt = await this.validateTenantCredentialRevocationReadProof(conn, job);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      await this.validateTenantCredentialInventoryReadProof(conn, inventory, receipt);
+      return inventory;
+    });
+  }
+
   // ---------- provider configs ----------
-  async upsertProviderConfig(cfg: ProviderConfig, secret?: { ciphertext: Buffer; keyId: string }) {
+  async upsertProviderConfig(
+    cfg: ProviderConfig,
+    secret?: { ciphertext: Buffer; keyId: string },
+    expectedSourceRevision?: number | null,
+  ): Promise<ProviderConfig> {
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
       await this.lockActiveTenantGate(conn, cfg.tenantId, cfg.updatedAtMs);
+      const cutover = await this.loadTenantCredentialTrackingCutover(conn, "FOR UPDATE");
+      const now = await this.databaseNow(conn);
+      const [tenantRows] = await conn.query<Row[]>(
+        "SELECT tenant_id FROM tenants WHERE tenant_id=? FOR UPDATE",
+        [cfg.tenantId],
+      );
+      const tenantExisted = tenantRows[0] !== undefined;
+      if (tenantRows[0] && String(tenantRows[0].tenant_id) !== cfg.tenantId) {
+        throw new TenantErasureIntegrityError();
+      }
+      const existingSubject = await this.loadTenantCredentialTrackingSubject(
+        conn,
+        cfg.tenantId,
+        "FOR UPDATE",
+      );
+      if (cutover.controlGeneration === 1 && tenantExisted && !existingSubject) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!existingSubject) {
+        await this.ensureTenantCredentialTrackingSubject(
+          conn,
+          cfg.tenantId,
+          now,
+          cutover.controlGeneration === 1 && !tenantExisted
+            ? "complete_since_creation"
+            : "legacy_history_unknown",
+        );
+      }
+      // The active tenant-source trigger requires coverage to exist before the canonical auth/CAS
+      // row is inserted. Keeping both writes in this transaction makes first-use tenant creation
+      // atomic and prevents a post-cutover legacy gap.
+      if (!tenantExisted) {
+        await conn.query(
+          "INSERT INTO tenants (tenant_id, created_at_ms) VALUES (?,?)",
+          [cfg.tenantId, now],
+        );
+      }
+
+      const slotIdSha256 = tenantCredentialSlotIdSha256(
+        cfg.tenantId,
+        "provider_binding",
+        cfg.id,
+      );
+      const [providerRows] = await conn.query<Row[]>(
+        `SELECT tenant_id, provider_id, config, secret_cipher, secret_key_id,
+                credential_slot_id_sha256, credential_write_generation,
+                credential_version_id
+           FROM provider_configs WHERE tenant_id=? AND provider_id=? FOR UPDATE`,
+        [cfg.tenantId, cfg.id],
+      );
+      const providerRow = providerRows[0];
+      if (providerRow && (String(providerRow.tenant_id) !== cfg.tenantId
+        || String(providerRow.provider_id) !== cfg.id)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const existingConfig = providerRow ? parse<ProviderConfig>(providerRow.config) : undefined;
+      if (existingConfig
+        && (existingConfig.tenantId !== cfg.tenantId || existingConfig.id !== cfg.id)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const slot = await this.loadTenantCredentialProviderSlot(
+        conn,
+        cfg.tenantId,
+        slotIdSha256,
+        "FOR UPDATE",
+      );
+      if ((slot?.updatedAtDbMs ?? -1) >= Number.MAX_SAFE_INTEGER) {
+        throw new TenantErasureIntegrityError();
+      }
+      const mutationAtMs = Math.max(now, (slot?.updatedAtDbMs ?? -1) + 1);
+      const rowRevision = providerRow
+        ? storedSafeInteger(
+            providerRow.credential_write_generation,
+            "stored provider credential write generation",
+          )
+        : undefined;
+      const existingRevision = rowRevision ?? slot?.writeGeneration ?? null;
+      if (expectedSourceRevision !== undefined
+        && expectedSourceRevision !== existingRevision) {
+        throw new CredentialSourceConflictError(
+          "provider",
+          expectedSourceRevision,
+          existingRevision,
+        );
+      }
+      if (!providerRow && slot?.sourcePresent) throw new TenantErasureIntegrityError();
+      if (providerRow && (providerRow.secret_cipher != null) !== (providerRow.secret_key_id != null)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const projected = providerRow?.credential_slot_id_sha256 != null
+        || providerRow?.credential_write_generation != null
+        || providerRow?.credential_version_id != null;
+      if (providerRow && (cutover.controlGeneration === 1 || projected) && (
+        !slot?.sourcePresent
+        || String(providerRow.credential_slot_id_sha256) !== slotIdSha256
+        || slot.writeGeneration !== rowRevision
+        || slot.currentCredentialVersionId !== (providerRow.credential_version_id == null
+          ? undefined
+          : String(providerRow.credential_version_id))
+      )) {
+        throw new TenantErasureIntegrityError();
+      }
+
+      const existingSecret = providerRow?.secret_cipher == null
+        ? undefined
+        : {
+            ciphertext: Buffer.from(providerRow.secret_cipher),
+            keyId: String(providerRow.secret_key_id),
+          };
+      const finalSecret = secret ?? existingSecret;
+      const finalConfig = ProviderConfigSchema.parse({
+        ...cfg,
+        createdAtMs: existingConfig?.createdAtMs ?? cfg.createdAtMs,
+        updatedAtMs: Math.max(cfg.updatedAtMs, (existingConfig?.updatedAtMs ?? -1) + 1),
+      });
+      if ((finalSecret !== undefined) !== (finalConfig.apiKeyRef !== undefined)) {
+        throw new CredentialSourceConflictError(
+          "provider",
+          expectedSourceRevision ?? existingRevision,
+          existingRevision,
+        );
+      }
+      const oldPresence = existingConfig
+        ? this.providerCredentialPresence(existingConfig, existingSecret !== undefined)
+        : undefined;
+      const oldRequiresVersion = oldPresence
+        ? this.credentialPresenceRequiresVersion(oldPresence)
+        : false;
+      const oldVersionId = providerRow?.credential_version_id == null
+        ? undefined
+        : String(providerRow.credential_version_id);
+      if ((cutover.controlGeneration === 1 || projected)
+        && oldRequiresVersion !== (oldVersionId !== undefined)) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (oldVersionId !== undefined) {
+        await this.retireTenantCredentialVersion(
+          conn,
+          cfg.tenantId,
+          oldVersionId,
+          mutationAtMs,
+          "replaced",
+          { slotKind: "provider_binding", slotIdSha256 },
+        );
+      } else if (oldRequiresVersion && oldPresence) {
+        const legacy = await this.insertTenantCredentialVersion(conn, {
+          tenantId: cfg.tenantId,
+          slotKind: "provider_binding",
+          slotId: cfg.id,
+          origin: "legacy_observed",
+          ...oldPresence,
+          createdAtDbMs: mutationAtMs,
+        });
+        await this.retireTenantCredentialVersion(
+          conn,
+          cfg.tenantId,
+          legacy.credentialVersionId,
+          mutationAtMs,
+          "replaced",
+        );
+      }
+
+      const finalPresence = this.providerCredentialPresence(
+        finalConfig,
+        finalSecret !== undefined,
+      );
+      const currentVersion = this.credentialPresenceRequiresVersion(finalPresence)
+        ? await this.insertTenantCredentialVersion(conn, {
+            tenantId: cfg.tenantId,
+            slotKind: "provider_binding",
+            slotId: cfg.id,
+            origin: "managed_v1",
+            ...finalPresence,
+            createdAtDbMs: mutationAtMs,
+          })
+        : undefined;
+      const writeGeneration = (slot?.writeGeneration ?? 0) + 1;
+      if (!Number.isSafeInteger(writeGeneration)) throw new TenantErasureIntegrityError();
+      await this.writeTenantCredentialProviderSlot(conn, {
+        tenantId: cfg.tenantId,
+        slotIdSha256,
+        writeGeneration,
+        sourcePresent: true,
+        ...(currentVersion === undefined
+          ? {}
+          : { currentCredentialVersionId: currentVersion.credentialVersionId }),
+        updatedAtDbMs: mutationAtMs,
+      });
       await conn.query(
-        `INSERT INTO provider_configs (tenant_id, provider_id, config, secret_cipher, secret_key_id, created_at_ms, updated_at_ms)
-         VALUES (?,?,?,?,?,?,?)
+        `INSERT INTO provider_configs
+           (tenant_id, provider_id, config, secret_cipher, secret_key_id, created_at_ms,
+            updated_at_ms, credential_slot_id_sha256, credential_write_generation,
+            credential_version_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?)
          ON DUPLICATE KEY UPDATE config=VALUES(config), updated_at_ms=VALUES(updated_at_ms),
-           secret_cipher=COALESCE(VALUES(secret_cipher), secret_cipher), secret_key_id=COALESCE(VALUES(secret_key_id), secret_key_id)`,
-        [cfg.tenantId, cfg.id, json(cfg), secret?.ciphertext ?? null, secret?.keyId ?? null, cfg.createdAtMs, cfg.updatedAtMs],
+           secret_cipher=VALUES(secret_cipher), secret_key_id=VALUES(secret_key_id),
+           credential_slot_id_sha256=VALUES(credential_slot_id_sha256),
+           credential_write_generation=VALUES(credential_write_generation),
+           credential_version_id=VALUES(credential_version_id)`,
+        [cfg.tenantId, cfg.id, json(finalConfig), finalSecret?.ciphertext ?? null,
+          finalSecret?.keyId ?? null, finalConfig.createdAtMs, finalConfig.updatedAtMs,
+          slotIdSha256, writeGeneration, currentVersion?.credentialVersionId ?? null],
       );
       await conn.commit();
+      return finalConfig;
     } catch (error) {
       await conn.rollback().catch(() => {});
       throw error;
@@ -28289,42 +30123,231 @@ export class MysqlSessionStore implements
     }
   }
   async getProviderConfig(tenantId: string, providerId: string) {
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT p.config, p.secret_cipher, p.secret_key_id FROM provider_configs p
-         JOIN subject_lifecycle tl
-           ON tl.tenant_id=p.tenant_id AND tl.subject_kind='tenant'
-          AND tl.subject_id=p.tenant_id AND tl.state='active'
-         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=p.tenant_id
-         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=p.tenant_id
-        WHERE p.tenant_id=? AND p.provider_id=?
-          AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
-      [tenantId, providerId],
-    );
-    const r = rows[0];
-    if (!r) return null;
-    return {
-      config: parse<ProviderConfig>(r.config),
-      secret: r.secret_cipher ? { ciphertext: Buffer.from(r.secret_cipher), keyId: r.secret_key_id as string } : undefined,
-    };
+    return this.withConsistentRead(async (conn) => {
+      const lifecycleProjection = this.credentialLifecycleSchemaInstalled
+        ? ", p.credential_slot_id_sha256, p.credential_version_id"
+        : "";
+      const [rows] = await conn.query<Row[]>(
+        `SELECT p.tenant_id, p.provider_id, p.config, p.secret_cipher, p.secret_key_id,
+                ${this.credentialLifecycleSchemaInstalled ? "p.credential_write_generation" : "NULL AS credential_write_generation"}
+                ${lifecycleProjection}
+           FROM provider_configs p
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=p.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=p.tenant_id AND tl.state='active'
+           LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=p.tenant_id
+           LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=p.tenant_id
+          WHERE p.tenant_id=? AND p.provider_id=?
+            AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
+        [tenantId, providerId],
+      );
+      const r = rows[0];
+      if (!r) return null;
+      if (String(r.tenant_id) !== tenantId || String(r.provider_id) !== providerId) return null;
+      const config = parse<ProviderConfig>(r.config);
+      if (config.tenantId !== tenantId || config.id !== providerId
+        || (r.secret_cipher != null) !== (r.secret_key_id != null)) {
+        throw new TenantErasureIntegrityError();
+      }
+      this.providerCredentialPresence(config, r.secret_cipher != null);
+      let credentialSourceRevision = 0;
+      if (this.credentialLifecycleSchemaInstalled) {
+        const cutover = await this.loadTenantCredentialTrackingCutover(conn);
+        const projected = r.credential_slot_id_sha256 != null
+          || r.credential_write_generation != null
+          || r.credential_version_id != null;
+        if (cutover.controlGeneration === 1 || projected) {
+          const subject = await this.loadTenantCredentialTrackingSubject(conn, tenantId);
+          if (!subject) throw new TenantErasureIntegrityError();
+          credentialSourceRevision = await this.validateTenantCredentialProviderReadProjection(
+            conn,
+            {
+              tenantId,
+              providerId,
+              config,
+              secretPresent: r.secret_cipher != null,
+              row: r,
+            },
+          );
+        } else {
+          credentialSourceRevision = storedSafeInteger(
+            r.credential_write_generation,
+            "stored provider credential source revision",
+          );
+        }
+      }
+      return {
+        config,
+        secret: r.secret_cipher
+          ? { ciphertext: Buffer.from(r.secret_cipher), keyId: r.secret_key_id as string }
+          : undefined,
+        credentialSourceRevision,
+      };
+    });
   }
   async listProviderConfigs(tenantId: string) {
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT p.config FROM provider_configs p
-         JOIN subject_lifecycle tl
-           ON tl.tenant_id=p.tenant_id AND tl.subject_kind='tenant'
-          AND tl.subject_id=p.tenant_id AND tl.state='active'
-         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=p.tenant_id
-         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=p.tenant_id
-        WHERE p.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL ORDER BY p.provider_id`,
-      [tenantId],
-    );
-    return rows.map((r) => parse<ProviderConfig>(r.config));
+    return this.withConsistentRead(async (conn) => {
+      const lifecycleProjection = this.credentialLifecycleSchemaInstalled
+        ? ", p.credential_slot_id_sha256, p.credential_write_generation, p.credential_version_id"
+        : "";
+      const [rows] = await conn.query<Row[]>(
+        `SELECT p.tenant_id, p.provider_id, p.config, p.secret_cipher, p.secret_key_id
+                ${lifecycleProjection}
+           FROM provider_configs p
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=p.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=p.tenant_id AND tl.state='active'
+           LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=p.tenant_id
+           LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=p.tenant_id
+          WHERE p.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL
+          ORDER BY p.provider_id`,
+        [tenantId],
+      );
+      if (rows.some((row) => String(row.tenant_id) !== tenantId)) return [];
+      const configs = rows.map((row) => {
+        const config = parse<ProviderConfig>(row.config);
+        if (config.tenantId !== tenantId || config.id !== String(row.provider_id)
+          || (row.secret_cipher != null) !== (row.secret_key_id != null)) {
+          throw new TenantErasureIntegrityError();
+        }
+        this.providerCredentialPresence(config, row.secret_cipher != null);
+        return config;
+      });
+      if (this.credentialLifecycleSchemaInstalled && rows.length > 0) {
+        const cutover = await this.loadTenantCredentialTrackingCutover(conn);
+        const anyProjected = rows.some((row) => (
+          row.credential_slot_id_sha256 != null
+          || row.credential_write_generation != null
+          || row.credential_version_id != null
+        ));
+        if (cutover.controlGeneration === 1 || anyProjected) {
+          const subject = await this.loadTenantCredentialTrackingSubject(conn, tenantId);
+          if (!subject) throw new TenantErasureIntegrityError();
+        }
+        for (let index = 0; index < rows.length; index += 1) {
+          const row = rows[index]!;
+          const projected = row.credential_slot_id_sha256 != null
+            || row.credential_write_generation != null
+            || row.credential_version_id != null;
+          if (cutover.controlGeneration === 1 || projected) {
+            await this.validateTenantCredentialProviderReadProjection(conn, {
+              tenantId,
+              providerId: String(row.provider_id),
+              config: configs[index]!,
+              secretPresent: row.secret_cipher != null,
+              row,
+            });
+          }
+        }
+      }
+      return configs;
+    });
   }
   async deleteProviderConfig(tenantId: string, providerId: string) {
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
       await this.lockActiveTenantGate(conn, tenantId, Date.now());
+      const cutover = await this.loadTenantCredentialTrackingCutover(conn, "FOR UPDATE");
+      const now = await this.databaseNow(conn);
+      const subject = await this.loadTenantCredentialTrackingSubject(conn, tenantId, "FOR UPDATE");
+      if (cutover.controlGeneration === 1 && !subject) throw new TenantErasureIntegrityError();
+      if (!subject) {
+        await this.ensureTenantCredentialTrackingSubject(
+          conn,
+          tenantId,
+          now,
+          "legacy_history_unknown",
+        );
+      }
+      const slotIdSha256 = tenantCredentialSlotIdSha256(
+        tenantId,
+        "provider_binding",
+        providerId,
+      );
+      const slot = await this.loadTenantCredentialProviderSlot(
+        conn,
+        tenantId,
+        slotIdSha256,
+        "FOR UPDATE",
+      );
+      if ((slot?.updatedAtDbMs ?? -1) >= Number.MAX_SAFE_INTEGER) {
+        throw new TenantErasureIntegrityError();
+      }
+      const mutationAtMs = Math.max(now, (slot?.updatedAtDbMs ?? -1) + 1);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT tenant_id, provider_id, config, secret_cipher, secret_key_id,
+                credential_slot_id_sha256, credential_write_generation,
+                credential_version_id
+           FROM provider_configs WHERE tenant_id=? AND provider_id=? FOR UPDATE`,
+        [tenantId, providerId],
+      );
+      const row = rows[0];
+      if (!row) {
+        await conn.commit();
+        return false;
+      }
+      if (String(row.tenant_id) !== tenantId || String(row.provider_id) !== providerId) {
+        throw new TenantErasureIntegrityError();
+      }
+      const config = parse<ProviderConfig>(row.config);
+      if (config.tenantId !== tenantId || config.id !== providerId
+        || (row.secret_cipher != null) !== (row.secret_key_id != null)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const oldPresence = this.providerCredentialPresence(config, row.secret_cipher != null);
+      const oldRequiresVersion = this.credentialPresenceRequiresVersion(oldPresence);
+      const oldVersionId = row.credential_version_id == null
+        ? undefined
+        : String(row.credential_version_id);
+      const projected = row.credential_slot_id_sha256 != null
+        || row.credential_write_generation != null
+        || oldVersionId !== undefined;
+      if ((cutover.controlGeneration === 1 || projected) && (!slot?.sourcePresent
+        || slot.writeGeneration !== storedSafeInteger(
+          row.credential_write_generation,
+          "stored provider credential source revision",
+        )
+        || String(row.credential_slot_id_sha256) !== slotIdSha256
+        || oldRequiresVersion !== (oldVersionId !== undefined)
+        || slot.currentCredentialVersionId !== oldVersionId)) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (oldVersionId !== undefined) {
+        await this.retireTenantCredentialVersion(
+          conn,
+          tenantId,
+          oldVersionId,
+          mutationAtMs,
+          "deleted",
+          { slotKind: "provider_binding", slotIdSha256 },
+        );
+      } else if (oldRequiresVersion) {
+        const legacy = await this.insertTenantCredentialVersion(conn, {
+          tenantId,
+          slotKind: "provider_binding",
+          slotId: providerId,
+          origin: "legacy_observed",
+          ...oldPresence,
+          createdAtDbMs: mutationAtMs,
+        });
+        await this.retireTenantCredentialVersion(
+          conn,
+          tenantId,
+          legacy.credentialVersionId,
+          mutationAtMs,
+          "deleted",
+        );
+      }
+      const nextGeneration = (slot?.writeGeneration ?? 0) + 1;
+      if (!Number.isSafeInteger(nextGeneration)) throw new TenantErasureIntegrityError();
+      await this.writeTenantCredentialProviderSlot(conn, {
+        tenantId,
+        slotIdSha256,
+        writeGeneration: nextGeneration,
+        sourcePresent: false,
+        updatedAtDbMs: mutationAtMs,
+      });
       const [res] = await conn.query<mysql.ResultSetHeader>(
         "DELETE FROM provider_configs WHERE tenant_id=? AND provider_id=?",
         [tenantId, providerId],
@@ -28362,7 +30385,40 @@ export class MysqlSessionStore implements
     try {
       await conn.beginTransaction();
       await this.lockActiveTenantGate(conn, tenantId, now);
-      await conn.query("INSERT IGNORE INTO tenants (tenant_id, created_at_ms) VALUES (?,?)", [tenantId, now]);
+      const cutover = await this.loadTenantCredentialTrackingCutover(conn, "FOR UPDATE");
+      const dbNow = await this.databaseNow(conn);
+      const [tenantRows] = await conn.query<Row[]>(
+        "SELECT tenant_id FROM tenants WHERE tenant_id=? FOR UPDATE",
+        [tenantId],
+      );
+      const tenantExisted = tenantRows[0] !== undefined;
+      if (tenantRows[0] && String(tenantRows[0].tenant_id) !== tenantId) {
+        throw new TenantErasureIntegrityError();
+      }
+      const subject = await this.loadTenantCredentialTrackingSubject(
+        conn,
+        tenantId,
+        "FOR UPDATE",
+      );
+      if (cutover.controlGeneration === 1 && tenantExisted && !subject) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!subject) {
+        await this.ensureTenantCredentialTrackingSubject(
+          conn,
+          tenantId,
+          dbNow,
+          cutover.controlGeneration === 1 && !tenantExisted
+            ? "complete_since_creation"
+            : "legacy_history_unknown",
+        );
+      }
+      if (!tenantExisted) {
+        await conn.query(
+          "INSERT INTO tenants (tenant_id, created_at_ms) VALUES (?,?)",
+          [tenantId, dbNow],
+        );
+      }
       await conn.query(
         "INSERT IGNORE INTO api_keys (key_hash, key_id, tenant_id, scopes, created_at_ms) VALUES (?,?,?,?,?)",
         [hashedKey, keyId, tenantId, json(scopes), now],
@@ -28387,6 +30443,7 @@ export class MysqlSessionStore implements
         WHERE k.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL ORDER BY k.created_at_ms`,
       [tenantId],
     );
+    if (rows.some((row) => String(row.tenant_id) !== tenantId)) return [];
     return rows.map((r) => ({
       keyId: r.key_id as string,
       tenantId: r.tenant_id as string,
@@ -28400,10 +30457,40 @@ export class MysqlSessionStore implements
     const now = Date.now();
     try {
       await conn.beginTransaction();
+      // MySQL's legacy tenant columns are case-insensitive. Reject an alias before taking the
+      // canonical tenant gate so `Tenant-A` can never revoke (or even fail as if it owned) a key
+      // belonging to `tenant-a`. Exact owners are re-read with a lock after the gate below.
+      const [preflightRows] = await conn.query<Row[]>(
+        `SELECT tenant_id, key_id
+           FROM api_keys
+          WHERE tenant_id=? AND key_id=? AND revoked_at_ms IS NULL`,
+        [tenantId, keyId],
+      );
+      const preflight = preflightRows[0];
+      if (!preflight
+        || String(preflight.tenant_id) !== tenantId
+        || String(preflight.key_id) !== keyId) {
+        await conn.commit();
+        return false;
+      }
       await this.lockActiveTenantGate(conn, tenantId, now);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT key_hash, tenant_id, key_id
+           FROM api_keys
+          WHERE tenant_id=? AND key_id=? AND revoked_at_ms IS NULL FOR UPDATE`,
+        [tenantId, keyId],
+      );
+      const row = rows[0];
+      if (!row
+        || String(row.tenant_id) !== tenantId
+        || String(row.key_id) !== keyId) {
+        await conn.commit();
+        return false;
+      }
       const [res] = await conn.query<mysql.ResultSetHeader>(
-        "UPDATE api_keys SET revoked_at_ms=? WHERE tenant_id=? AND key_id=? AND revoked_at_ms IS NULL",
-        [now, tenantId, keyId],
+        `UPDATE api_keys SET revoked_at_ms=?
+          WHERE key_hash=? AND tenant_id=? AND key_id=? AND revoked_at_ms IS NULL`,
+        [now, row.key_hash, tenantId, keyId],
       );
       await conn.commit();
       return res.affectedRows > 0;
@@ -28416,46 +30503,319 @@ export class MysqlSessionStore implements
   }
 
   async getTenant(tenantId: string): Promise<TenantRecord | null> {
-    const [rows] = await this.pool.query<Row[]>(
-      `SELECT t.tenant_id, t.name, t.auth_policy, t.auth_secret_cipher, t.auth_secret_key_id,
-              t.created_at_ms
-         FROM tenants t
-         JOIN subject_lifecycle tl
-           ON tl.tenant_id=t.tenant_id AND tl.subject_kind='tenant'
-          AND tl.subject_id=t.tenant_id AND tl.state='active'
-         LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=t.tenant_id
-         LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=t.tenant_id
-        WHERE t.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
-      [tenantId],
-    );
-    const r = rows[0];
-    if (!r) return null;
-    return {
-      tenantId: r.tenant_id,
-      name: r.name ?? undefined,
-      authPolicy: r.auth_policy == null ? DEFAULT_AUTH_POLICY : parse<TenantAuthPolicy>(r.auth_policy),
-      authSecret: r.auth_secret_cipher ? { ciphertext: Buffer.from(r.auth_secret_cipher), keyId: r.auth_secret_key_id as string } : undefined,
-      createdAtMs: Number(r.created_at_ms),
-    };
+    return this.withConsistentRead(async (conn) => {
+      const credentialProjection = this.credentialLifecycleSchemaInstalled
+        ? ", t.auth_write_generation, t.auth_credential_version_id, t.auth_credential_updated_at_db_ms"
+        : "";
+      const [rows] = await conn.query<Row[]>(
+        `SELECT t.tenant_id, t.name, t.auth_policy, t.auth_secret_cipher, t.auth_secret_key_id,
+                t.created_at_ms${credentialProjection}
+           FROM tenants t
+           JOIN subject_lifecycle tl
+             ON tl.tenant_id=t.tenant_id AND tl.subject_kind='tenant'
+            AND tl.subject_id=t.tenant_id AND tl.state='active'
+           LEFT JOIN tenant_erasure_admissions te ON te.tenant_id=t.tenant_id
+           LEFT JOIN tenant_credential_revocation_fences f ON f.tenant_id=t.tenant_id
+          WHERE t.tenant_id=? AND te.tenant_id IS NULL AND f.tenant_id IS NULL`,
+        [tenantId],
+      );
+      const r = rows[0];
+      if (!r) return null;
+      if (String(r.tenant_id) !== tenantId) return null;
+      if ((r.auth_secret_cipher != null) !== (r.auth_secret_key_id != null)) {
+        throw new TenantErasureIntegrityError();
+      }
+      let authCredentialSourceRevision: number | undefined;
+      if (this.credentialLifecycleSchemaInstalled) {
+        const revision = storedSafeInteger(
+          r.auth_write_generation,
+          "stored tenant auth credential source revision",
+        );
+        const updatedAtDbMs = storedSafeInteger(
+          r.auth_credential_updated_at_db_ms,
+          "stored tenant auth credential update time",
+        );
+        const projected = revision !== 0
+          || r.auth_credential_version_id != null
+          || updatedAtDbMs !== 0;
+        const cutover = await this.loadTenantCredentialTrackingCutover(conn);
+        if (cutover.controlGeneration === 1 || projected) {
+          const subject = await this.loadTenantCredentialTrackingSubject(conn, tenantId);
+          if (!subject) throw new TenantErasureIntegrityError();
+          authCredentialSourceRevision = await this.validateTenantCredentialAuthReadProjection(
+            conn,
+            tenantId,
+            r,
+          );
+        } else {
+          authCredentialSourceRevision = revision;
+        }
+      }
+      return {
+        tenantId: r.tenant_id,
+        name: r.name ?? undefined,
+        authPolicy: r.auth_policy == null
+          ? DEFAULT_AUTH_POLICY
+          : parse<TenantAuthPolicy>(r.auth_policy),
+        authSecret: r.auth_secret_cipher
+          ? { ciphertext: Buffer.from(r.auth_secret_cipher), keyId: r.auth_secret_key_id as string }
+          : undefined,
+        ...(authCredentialSourceRevision === undefined
+          ? {}
+          : { authCredentialSourceRevision }),
+        createdAtMs: Number(r.created_at_ms),
+      };
+    });
   }
-  async setTenantAuth(tenantId: string, policy: TenantAuthPolicy, secret?: { ciphertext: Buffer; keyId: string } | null) {
-    // `undefined` keeps the stored secret; `null` clears it, so switching verifier kind cannot leave a
-    // stale key behind that would then be used to verify tokens for the new configuration.
-    const keep = secret === undefined;
+
+  private async setTenantAuthBeforeCredentialLifecycle(
+    tenantId: string,
+    policy: TenantAuthPolicy,
+    secret?: { ciphertext: Buffer; keyId: string } | null,
+    expectedSourceRevision?: number | null,
+  ): Promise<TenantRecord> {
     const conn = await this.pool.getConnection();
-    const now = Date.now();
     try {
       await conn.beginTransaction();
+      const now = await this.databaseNow(conn);
       await this.lockActiveTenantGate(conn, tenantId, now);
-      await conn.query(
-        `INSERT INTO tenants (tenant_id, auth_policy, auth_secret_cipher, auth_secret_key_id, created_at_ms)
-         VALUES (?,?,?,?,?)
-         ON DUPLICATE KEY UPDATE auth_policy=VALUES(auth_policy),
-           auth_secret_cipher=${keep ? "auth_secret_cipher" : "VALUES(auth_secret_cipher)"},
-           auth_secret_key_id=${keep ? "auth_secret_key_id" : "VALUES(auth_secret_key_id)"}`,
-        [tenantId, json(policy), secret?.ciphertext ?? null, secret?.keyId ?? null, now],
+      const [rows] = await conn.query<Row[]>(
+        `SELECT tenant_id, name, auth_policy, auth_secret_cipher, auth_secret_key_id, created_at_ms
+           FROM tenants WHERE tenant_id=? FOR UPDATE`,
+        [tenantId],
       );
+      const row = rows[0];
+      if (row && String(row.tenant_id) !== tenantId) throw new TenantErasureIntegrityError();
+      // A frozen pre-0026 schema has no durable CAS generation. It can satisfy an explicit legacy
+      // null expectation, but must never pretend that a numbered revision was observed.
+      if (expectedSourceRevision !== undefined && expectedSourceRevision !== null) {
+        throw new CredentialSourceConflictError(
+          "tenant_auth",
+          expectedSourceRevision,
+          null,
+        );
+      }
+      if (row && (row.auth_secret_cipher != null) !== (row.auth_secret_key_id != null)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const existingSecret = row?.auth_secret_cipher == null
+        ? undefined
+        : {
+            ciphertext: Buffer.from(row.auth_secret_cipher),
+            keyId: String(row.auth_secret_key_id),
+          };
+      const finalSecret = secret === null ? undefined : (secret ?? existingSecret);
+      if (row) {
+        await conn.query(
+          `UPDATE tenants
+              SET auth_policy=?, auth_secret_cipher=?, auth_secret_key_id=?
+            WHERE tenant_id=?`,
+          [json(policy), finalSecret?.ciphertext ?? null, finalSecret?.keyId ?? null, tenantId],
+        );
+      } else {
+        await conn.query(
+          `INSERT INTO tenants
+             (tenant_id, auth_policy, auth_secret_cipher, auth_secret_key_id, created_at_ms)
+           VALUES (?,?,?,?,?)`,
+          [tenantId, json(policy), finalSecret?.ciphertext ?? null,
+            finalSecret?.keyId ?? null, now],
+        );
+      }
       await conn.commit();
+      return {
+        tenantId,
+        ...(row?.name == null ? {} : { name: String(row.name) }),
+        authPolicy: structuredClone(policy),
+        ...(finalSecret === undefined ? {} : { authSecret: finalSecret }),
+        createdAtMs: row
+          ? storedSafeInteger(row.created_at_ms, "stored tenant creation time")
+          : now,
+      };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async setTenantAuth(
+    tenantId: string,
+    policy: TenantAuthPolicy,
+    secret?: { ciphertext: Buffer; keyId: string } | null,
+    expectedSourceRevision?: number | null,
+  ): Promise<TenantRecord> {
+    if (!this.credentialLifecycleSchemaInstalled) {
+      return this.setTenantAuthBeforeCredentialLifecycle(
+        tenantId,
+        policy,
+        secret,
+        expectedSourceRevision,
+      );
+    }
+    // `undefined` keeps the stored secret; `null` clears it, so switching verifier kind cannot leave a
+    // stale key behind that would then be used to verify tokens for the new configuration.
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.lockActiveTenantGate(conn, tenantId, Date.now());
+      const cutover = await this.loadTenantCredentialTrackingCutover(conn, "FOR UPDATE");
+      const now = await this.databaseNow(conn);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT tenant_id, name, auth_policy, auth_secret_cipher, auth_secret_key_id,
+                auth_write_generation, auth_credential_version_id,
+                auth_credential_updated_at_db_ms, created_at_ms
+           FROM tenants WHERE tenant_id=? FOR UPDATE`,
+        [tenantId],
+      );
+      let row = rows[0];
+      if (row && String(row.tenant_id) !== tenantId) throw new TenantErasureIntegrityError();
+      const actualRevision = row
+        ? storedSafeInteger(row.auth_write_generation, "stored tenant auth write generation")
+        : null;
+      if (expectedSourceRevision !== undefined && expectedSourceRevision !== actualRevision) {
+        throw new CredentialSourceConflictError(
+          "tenant_auth",
+          expectedSourceRevision,
+          actualRevision,
+        );
+      }
+      const tenantExisted = row !== undefined;
+      const existingSubject = await this.loadTenantCredentialTrackingSubject(
+        conn,
+        tenantId,
+        "FOR UPDATE",
+      );
+      if (cutover.controlGeneration === 1 && tenantExisted && !existingSubject) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!existingSubject) {
+        await this.ensureTenantCredentialTrackingSubject(
+          conn,
+          tenantId,
+          now,
+          cutover.controlGeneration === 1 && !tenantExisted
+            ? "complete_since_creation"
+            : "legacy_history_unknown",
+        );
+      }
+      if (!row) {
+        await conn.query(
+          `INSERT INTO tenants
+             (tenant_id, auth_policy, auth_secret_cipher, auth_secret_key_id, created_at_ms)
+           VALUES (?,NULL,NULL,NULL,?)`,
+          [tenantId, now],
+        );
+        row = {
+          tenant_id: tenantId,
+          name: null,
+          auth_policy: null,
+          auth_secret_cipher: null,
+          auth_secret_key_id: null,
+          auth_write_generation: 0,
+          auth_credential_version_id: null,
+          auth_credential_updated_at_db_ms: 0,
+          created_at_ms: now,
+        } as Row;
+      }
+
+      if ((row.auth_secret_cipher != null) !== (row.auth_secret_key_id != null)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const existingSecret = row.auth_secret_cipher == null
+        ? undefined
+        : {
+            ciphertext: Buffer.from(row.auth_secret_cipher),
+            keyId: String(row.auth_secret_key_id),
+          };
+      const oldVersionId = row.auth_credential_version_id == null
+        ? undefined
+        : String(row.auth_credential_version_id);
+      const projected = (actualRevision ?? 0) !== 0
+        || oldVersionId !== undefined
+        || storedSafeInteger(
+          row.auth_credential_updated_at_db_ms,
+          "stored tenant auth credential update time",
+        ) !== 0;
+      if ((cutover.controlGeneration === 1 || projected)
+        && (existingSecret !== undefined) !== (oldVersionId !== undefined)) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (cutover.controlGeneration === 1) {
+        await this.loadTenantCredentialLifecycleSnapshot(conn, tenantId, "FOR UPDATE");
+      }
+      const priorUpdatedAtDbMs = storedSafeInteger(
+        row.auth_credential_updated_at_db_ms,
+        "stored tenant auth credential update time",
+      );
+      if (priorUpdatedAtDbMs >= Number.MAX_SAFE_INTEGER) {
+        throw new TenantErasureIntegrityError();
+      }
+      const mutationAtMs = Math.max(now, priorUpdatedAtDbMs + 1);
+      const finalSecret = secret === null ? undefined : (secret ?? existingSecret);
+      if (oldVersionId !== undefined) {
+        await this.retireTenantCredentialVersion(
+          conn,
+          tenantId,
+          oldVersionId,
+          mutationAtMs,
+          finalSecret === undefined ? "cleared" : "replaced",
+        );
+      } else if (existingSecret !== undefined) {
+        const legacy = await this.insertTenantCredentialVersion(conn, {
+          tenantId,
+          slotKind: "tenant_auth_secret",
+          slotId: "tenant_auth_secret",
+          origin: "legacy_observed",
+          encryptedSecretPresent: true,
+          secretKeyIdPresent: true,
+          customHeadersPresent: false,
+          endpointParametersPresent: false,
+          createdAtDbMs: mutationAtMs,
+        });
+        await this.retireTenantCredentialVersion(
+          conn,
+          tenantId,
+          legacy.credentialVersionId,
+          mutationAtMs,
+          finalSecret === undefined ? "cleared" : "replaced",
+        );
+      }
+      const currentVersion = finalSecret === undefined
+        ? undefined
+        : await this.insertTenantCredentialVersion(conn, {
+            tenantId,
+            slotKind: "tenant_auth_secret",
+            slotId: "tenant_auth_secret",
+            origin: "managed_v1",
+            encryptedSecretPresent: true,
+            secretKeyIdPresent: true,
+            customHeadersPresent: false,
+            endpointParametersPresent: false,
+            createdAtDbMs: mutationAtMs,
+          });
+      const writeGeneration = (actualRevision ?? 0) + 1;
+      if (!Number.isSafeInteger(writeGeneration)) throw new TenantErasureIntegrityError();
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenants
+            SET auth_policy=?, auth_secret_cipher=?, auth_secret_key_id=?,
+                auth_write_generation=?, auth_credential_version_id=?,
+                auth_credential_updated_at_db_ms=?
+          WHERE tenant_id=? AND auth_write_generation=?`,
+        [json(policy), finalSecret?.ciphertext ?? null, finalSecret?.keyId ?? null,
+          writeGeneration, currentVersion?.credentialVersionId ?? null, mutationAtMs,
+          tenantId, actualRevision ?? 0],
+      );
+      if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      await conn.commit();
+      return {
+        tenantId,
+        ...(row.name == null ? {} : { name: String(row.name) }),
+        authPolicy: structuredClone(policy),
+        ...(finalSecret === undefined ? {} : { authSecret: finalSecret }),
+        authCredentialSourceRevision: writeGeneration,
+        createdAtMs: storedSafeInteger(row.created_at_ms, "stored tenant creation time"),
+      };
     } catch (error) {
       await conn.rollback().catch(() => {});
       throw error;

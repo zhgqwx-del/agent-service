@@ -27,10 +27,11 @@ import {
   emptyUsageAccumulator,
   isCanonicalId,
 } from "@agent-service/protocol";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   BlobConflictError,
   BlobTooLargeError,
+  CredentialSourceConflictError,
   FenceError,
   IdempotencyMismatchError,
   IdempotencyPendingError,
@@ -392,6 +393,47 @@ import {
   type UserDataExportSnapshotSummary,
 } from "./data-export.js";
 import {
+  TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS,
+  TENANT_CREDENTIAL_INVENTORY_RECEIPT_SCOPE,
+  TENANT_CREDENTIAL_TARGET_DOMAINS,
+  tenantCredentialAuthSlotEvidenceSha256,
+  tenantCredentialAuthSlotRootSha256,
+  tenantCredentialCurrentTargetDisposition,
+  tenantCredentialInventoryReceiptSha256,
+  tenantCredentialProviderSlotEvidenceSha256,
+  tenantCredentialProviderSlotRootSha256,
+  tenantCredentialSlotIdSha256,
+  tenantCredentialSubjectEvidenceSha256,
+  tenantCredentialSubjectRootSha256,
+  tenantCredentialTargetDispositionEvidenceSha256,
+  tenantCredentialTargetDispositionRootSha256,
+  tenantCredentialTrackingCutoverEvidenceSha256,
+  tenantCredentialVersionEvidenceSha256,
+  tenantCredentialVersionId,
+  tenantCredentialVersionRootSha256,
+  validateTenantCredentialAuthSlot,
+  validateTenantCredentialInventoryReceipt,
+  validateTenantCredentialLifecycleSnapshot,
+  validateTenantCredentialProviderSlot,
+  validateTenantCredentialTargetDisposition,
+  validateTenantCredentialTrackingCutoverRecord,
+  validateTenantCredentialTrackingSubject,
+  validateTenantCredentialVersion,
+  type ActivateTenantCredentialTrackingInput,
+  type CredentialLifecycleStore,
+  type TenantCredentialAuthSlot,
+  type TenantCredentialHistoryStatus,
+  type TenantCredentialInventoryReceipt,
+  type TenantCredentialLifecycleSnapshot,
+  type TenantCredentialProviderSlot,
+  type TenantCredentialRetireReason,
+  type TenantCredentialSlotKind,
+  type TenantCredentialTargetDisposition,
+  type TenantCredentialTrackingCutoverRecord,
+  type TenantCredentialTrackingSubject,
+  type TenantCredentialVersion,
+} from "./credential-lifecycle.js";
+import {
   TENANT_CREDENTIAL_REVOCATION_EXTERNAL_DISPOSITION,
   TENANT_CREDENTIAL_REVOCATION_RECEIPT_SCOPE,
   TENANT_CREDENTIAL_REVOCATION_RUNTIME_DISPOSITION,
@@ -745,9 +787,65 @@ interface MemoryUserDataExportJob {
 /** A physically revoked tenant retains registry identity but has no auth policy or secret. */
 type MemoryTenantRecord = Omit<TenantRecord, "authPolicy"> & {
   authPolicy?: TenantRecord["authPolicy"];
+  /** Internal pointer/control fields; neither is projected through getTenant. */
+  authCredentialVersionId?: string;
+  authCredentialUpdatedAtMs?: number;
 };
 
+interface MemoryProviderRecord {
+  config: ProviderConfig;
+  secret?: { ciphertext: Buffer; keyId: string };
+  credentialSlotIdSha256?: string;
+  credentialSourceRevision?: number;
+  credentialVersionId?: string;
+}
+
 const clone = <T>(v: T): T => structuredClone(v);
+
+function cloneCredentialSecret(
+  secret: { ciphertext: Buffer; keyId: string },
+): { ciphertext: Buffer; keyId: string } {
+  return { ciphertext: Buffer.from(secret.ciphertext), keyId: secret.keyId };
+}
+
+function cloneMemoryTenantRecord(tenant: MemoryTenantRecord): MemoryTenantRecord {
+  return {
+    tenantId: tenant.tenantId,
+    ...(tenant.name === undefined ? {} : { name: tenant.name }),
+    ...(tenant.authPolicy === undefined ? {} : { authPolicy: clone(tenant.authPolicy) }),
+    ...(tenant.authSecret === undefined ? {} : {
+      authSecret: cloneCredentialSecret(tenant.authSecret),
+    }),
+    ...(tenant.authCredentialSourceRevision === undefined ? {} : {
+      authCredentialSourceRevision: tenant.authCredentialSourceRevision,
+    }),
+    ...(tenant.authCredentialVersionId === undefined ? {} : {
+      authCredentialVersionId: tenant.authCredentialVersionId,
+    }),
+    ...(tenant.authCredentialUpdatedAtMs === undefined ? {} : {
+      authCredentialUpdatedAtMs: tenant.authCredentialUpdatedAtMs,
+    }),
+    createdAtMs: tenant.createdAtMs,
+  };
+}
+
+function cloneMemoryProviderRecord(provider: MemoryProviderRecord): MemoryProviderRecord {
+  return {
+    config: clone(provider.config),
+    ...(provider.secret === undefined ? {} : {
+      secret: cloneCredentialSecret(provider.secret),
+    }),
+    ...(provider.credentialSlotIdSha256 === undefined ? {} : {
+      credentialSlotIdSha256: provider.credentialSlotIdSha256,
+    }),
+    ...(provider.credentialSourceRevision === undefined ? {} : {
+      credentialSourceRevision: provider.credentialSourceRevision,
+    }),
+    ...(provider.credentialVersionId === undefined ? {} : {
+      credentialVersionId: provider.credentialVersionId,
+    }),
+  };
+}
 
 function cloneUserDataExportSnapshotRecord(
   record: UserDataExportSnapshotRecord,
@@ -785,6 +883,54 @@ function agentVersionKey(tenantId: string, agentId: string, version: number): st
 
 function providerConfigKey(tenantId: string, providerId: string): string {
   return JSON.stringify([tenantId, providerId]);
+}
+
+function tenantCredentialTargetKey(
+  credentialVersionId: string,
+  domain: (typeof TENANT_CREDENTIAL_TARGET_DOMAINS)[number],
+): string {
+  return JSON.stringify([credentialVersionId, domain]);
+}
+
+function providerCredentialMaterial(
+  config: ProviderConfig,
+  secret: { ciphertext: Buffer; keyId: string } | undefined,
+): {
+  encryptedSecretPresent: boolean;
+  secretKeyIdPresent: boolean;
+  customHeadersPresent: boolean;
+  endpointParametersPresent: boolean;
+} {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(config.baseUrl);
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+  if (
+    endpoint.username !== ""
+    || endpoint.password !== ""
+    || (config.apiKeyRef !== undefined) !== (secret !== undefined)
+  ) {
+    // Match the MySQL boundary: URL userinfo is another plaintext credential channel, while an
+    // apiKeyRef/envelope mismatch would make activation silently classify credential material as
+    // keyless. Both shapes must stop the write/cutover instead of weakening the inventory.
+    throw new TenantErasureIntegrityError();
+  }
+  return {
+    encryptedSecretPresent: secret !== undefined,
+    secretKeyIdPresent: secret !== undefined,
+    customHeadersPresent: Object.keys(config.headers).length > 0,
+    endpointParametersPresent: endpoint.search.length > 0 || endpoint.hash.length > 0,
+  };
+}
+
+function providerCredentialMaterialPresent(
+  material: ReturnType<typeof providerCredentialMaterial>,
+): boolean {
+  return material.encryptedSecretPresent
+    || material.customHeadersPresent
+    || material.endpointParametersPresent;
 }
 
 function legalHoldKey(tenantId: string, holdId: string): string {
@@ -912,14 +1058,14 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
   items = new Map<string, Item>();
   approvals = new Map<string, Approval>();
   events = new Map<string, PersistedEvent[]>();
-  providers = new Map<string, { config: ProviderConfig; secret?: { ciphertext: Buffer; keyId: string } }>();
+  providers = new Map<string, MemoryProviderRecord>();
   apiKeys = new Map<string, { tenantId: string; keyId: string; scopes: ApiKeyScope[]; createdAtMs?: number; revokedAtMs?: number }>();
   idem = new Map<string, { value: IdempotencyReceiptValue | null; requestHash?: string; expiresAt: number }>();
   deleted = new Map<string, { deletedAtMs: number; purgeAfterMs?: number; deletionGeneration: number }>();
@@ -942,6 +1088,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     1,
     { singletonId: 1, controlGeneration: 0 },
   ]]);
+  tenantCredentialTrackingCutovers = new Map<1, TenantCredentialTrackingCutoverRecord>([[
+    1,
+    { controlGeneration: 0 },
+  ]]);
+  tenantCredentialTrackingSubjects = new Map<string, TenantCredentialTrackingSubject>();
+  tenantCredentialProviderSlots = new Map<string, TenantCredentialProviderSlot>();
+  tenantCredentialVersions = new Map<string, TenantCredentialVersion>();
+  tenantCredentialTargetDispositions = new Map<string, TenantCredentialTargetDisposition>();
+  tenantCredentialInventoryReceipts = new Map<string, TenantCredentialInventoryReceipt>();
   tenantRuntimeRevocationJobs = new Map<string, TenantRuntimeRevocationJobRecord>();
   tenantRuntimeRevocationTargetReceipts = new Map<string, TenantRuntimeRevocationTargetReceipt>();
   tenantRuntimeRevocationReceipts = new Map<string, TenantRuntimeRevocationReceipt>();
@@ -1036,6 +1191,819 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new Error("memory store clock must return a non-negative safe integer");
     }
     return nowMs;
+  }
+
+  private readMemoryTenantCredentialTrackingCutover(): TenantCredentialTrackingCutoverRecord {
+    const cutover = this.tenantCredentialTrackingCutovers.get(1);
+    if (!cutover || this.tenantCredentialTrackingCutovers.size !== 1) {
+      throw new TenantErasureIntegrityError();
+    }
+    try {
+      validateTenantCredentialTrackingCutoverRecord(cutover);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return cutover;
+  }
+
+  private tenantCredentialTrackingActive(): boolean {
+    return this.readMemoryTenantCredentialTrackingCutover().controlGeneration === 1;
+  }
+
+  private assertTenantCredentialTrackingSubjectForRead(
+    tenantId: string,
+    sourceAtDbMs?: number,
+  ): TenantCredentialTrackingSubject {
+    const subject = this.tenantCredentialTrackingSubjects.get(tenantId);
+    try {
+      if (!subject) throw new Error("tenant credential tracking subject is missing");
+      validateTenantCredentialTrackingSubject(subject);
+      if (subject.tenantId !== tenantId
+        || (sourceAtDbMs !== undefined && subject.trackingStartedAtDbMs > sourceAtDbMs)) {
+        throw new Error("tenant credential tracking subject does not cover its live source");
+      }
+      return subject;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  /**
+   * Highest durable credential-ledger timestamp visible for one tenant (or the whole store while
+   * activating the global cutover). MemoryStore uses an injectable wall clock, so tests can move it
+   * backwards; the persisted ledger must still preserve the same monotonic ordering as MySQL.
+   */
+  private tenantCredentialLifecycleHighWater(tenantId?: string): number {
+    let highWater = -1;
+    const include = (value: number | undefined): void => {
+      if (value === undefined) return;
+      if (!Number.isSafeInteger(value) || value < 0) throw new TenantErasureIntegrityError();
+      highWater = Math.max(highWater, value);
+    };
+    try {
+      const cutover = this.readMemoryTenantCredentialTrackingCutover();
+      if (cutover.controlGeneration === 1) include(cutover.activatedAtDbMs);
+      for (const subject of this.tenantCredentialTrackingSubjects.values()) {
+        if (tenantId !== undefined && subject.tenantId !== tenantId) continue;
+        validateTenantCredentialTrackingSubject(subject);
+        include(subject.trackingStartedAtDbMs);
+      }
+      for (const tenant of this.tenants.values()) {
+        if (tenantId !== undefined && tenant.tenantId !== tenantId) continue;
+        include(tenant.authCredentialUpdatedAtMs ?? tenant.createdAtMs);
+      }
+      for (const slot of this.tenantCredentialProviderSlots.values()) {
+        if (tenantId !== undefined && slot.tenantId !== tenantId) continue;
+        validateTenantCredentialProviderSlot(slot);
+        include(slot.updatedAtDbMs);
+      }
+      for (const version of this.tenantCredentialVersions.values()) {
+        if (tenantId !== undefined && version.tenantId !== tenantId) continue;
+        validateTenantCredentialVersion(version);
+        include(version.createdAtDbMs);
+        include(version.retiredAtDbMs);
+      }
+      for (const target of this.tenantCredentialTargetDispositions.values()) {
+        if (tenantId !== undefined && target.tenantId !== tenantId) continue;
+        validateTenantCredentialTargetDisposition(target);
+        include(target.capturedAtDbMs);
+      }
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+    return highWater;
+  }
+
+  private tenantCredentialMutationAtMs(
+    tenantId: string,
+    observedNowMs: number,
+    advancePastMs?: number,
+  ): number {
+    const highWater = this.tenantCredentialLifecycleHighWater(tenantId);
+    let mutationAtMs = Math.max(observedNowMs, highWater);
+    if (advancePastMs !== undefined) {
+      if (!Number.isSafeInteger(advancePastMs) || advancePastMs < 0
+        || advancePastMs >= Number.MAX_SAFE_INTEGER) {
+        throw new TenantErasureIntegrityError();
+      }
+      mutationAtMs = Math.max(mutationAtMs, advancePastMs + 1);
+    }
+    return mutationAtMs;
+  }
+
+  private tenantKnownToCredentialStore(tenantId: string): boolean {
+    return this.tenants.has(tenantId)
+      || [...this.providers.values()].some((row) => row.config.tenantId === tenantId)
+      || [...this.apiKeys.values()].some((row) => row.tenantId === tenantId);
+  }
+
+  private newTenantCredentialTrackingSubject(
+    tenantId: string,
+    trackingStartedAtDbMs: number,
+    historyStatus: TenantCredentialHistoryStatus,
+  ): TenantCredentialTrackingSubject {
+    const body = {
+      tenantId,
+      trackingStartedAtDbMs,
+      historyStatus,
+      origin: historyStatus === "legacy_history_unknown"
+        ? "legacy_observed" as const
+        : "managed_v1" as const,
+    };
+    const subject: TenantCredentialTrackingSubject = {
+      ...body,
+      evidenceSha256: tenantCredentialSubjectEvidenceSha256(body),
+    };
+    validateTenantCredentialTrackingSubject(subject);
+    return subject;
+  }
+
+  private trackingSubjectForCredentialWrite(
+    tenantId: string,
+    nowMs: number,
+    tenantKnownBefore: boolean,
+  ): TenantCredentialTrackingSubject | undefined {
+    if (!this.tenantCredentialTrackingActive()) return undefined;
+    const existing = this.tenantCredentialTrackingSubjects.get(tenantId);
+    if (existing) {
+      try {
+        validateTenantCredentialTrackingSubject(existing);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (existing.tenantId !== tenantId) throw new TenantErasureIntegrityError();
+      return existing;
+    }
+    if (tenantKnownBefore) throw new TenantErasureIntegrityError();
+    return this.newTenantCredentialTrackingSubject(
+      tenantId,
+      nowMs,
+      "complete_since_creation",
+    );
+  }
+
+  private nextCredentialSourceRevision(current: number): number {
+    if (!Number.isSafeInteger(current) || current < 0 || current >= Number.MAX_SAFE_INTEGER) {
+      throw new TenantErasureIntegrityError();
+    }
+    return current + 1;
+  }
+
+  private assertCredentialSourceRevision(
+    sourceKind: "provider" | "tenant_auth",
+    expectedSourceRevision: number | null | undefined,
+    actualSourceRevision: number | null,
+  ): void {
+    if (expectedSourceRevision === undefined) return;
+    if (expectedSourceRevision !== null
+      && (!Number.isSafeInteger(expectedSourceRevision) || expectedSourceRevision < 0)) {
+      throw new Error("expected credential source revision must be null or a non-negative integer");
+    }
+    if (expectedSourceRevision !== actualSourceRevision) {
+      throw new CredentialSourceConflictError(
+        sourceKind,
+        expectedSourceRevision,
+        actualSourceRevision,
+      );
+    }
+  }
+
+  private createTenantCredentialVersion(
+    input: {
+      tenantId: string;
+      slotKind: TenantCredentialSlotKind;
+      slotId: string;
+      origin: "managed_v1" | "legacy_observed";
+      encryptedSecretPresent: boolean;
+      secretKeyIdPresent: boolean;
+      customHeadersPresent: boolean;
+      endpointParametersPresent: boolean;
+      createdAtDbMs: number;
+    },
+  ): { version: TenantCredentialVersion; targets: TenantCredentialTargetDisposition[] } {
+    const credentialVersionId = tenantCredentialVersionId({
+      tenantId: input.tenantId,
+      slotKind: input.slotKind,
+      slotId: input.slotId,
+      createdAtDbMs: input.createdAtDbMs,
+      nonce: randomUUID(),
+    });
+    if (this.tenantCredentialVersions.has(credentialVersionId)) {
+      throw new TenantErasureIntegrityError();
+    }
+    const body = {
+      credentialVersionId,
+      tenantId: input.tenantId,
+      slotKind: input.slotKind,
+      slotIdSha256: tenantCredentialSlotIdSha256(
+        input.tenantId,
+        input.slotKind,
+        input.slotId,
+      ),
+      origin: input.origin,
+      encryptedSecretPresent: input.encryptedSecretPresent,
+      secretKeyIdPresent: input.secretKeyIdPresent,
+      customHeadersPresent: input.customHeadersPresent,
+      endpointParametersPresent: input.endpointParametersPresent,
+      createdAtDbMs: input.createdAtDbMs,
+    };
+    const version: TenantCredentialVersion = {
+      ...body,
+      evidenceSha256: tenantCredentialVersionEvidenceSha256(body),
+    };
+    validateTenantCredentialVersion(version);
+    const targets = TENANT_CREDENTIAL_TARGET_DOMAINS.map((domain) => {
+      const targetBody = {
+        credentialVersionId,
+        tenantId: input.tenantId,
+        domain,
+        disposition: tenantCredentialCurrentTargetDisposition(version, domain),
+        capturedAtDbMs: input.createdAtDbMs,
+      };
+      const target: TenantCredentialTargetDisposition = {
+        ...targetBody,
+        evidenceSha256: tenantCredentialTargetDispositionEvidenceSha256(targetBody),
+      };
+      validateTenantCredentialTargetDisposition(target);
+      return target;
+    });
+    return { version, targets };
+  }
+
+  private retiredTenantCredentialVersion(
+    credentialVersionId: string,
+    tenantId: string,
+    slotKind: TenantCredentialSlotKind,
+    slotIdSha256: string,
+    retiredAtDbMs: number,
+    retireReason: TenantCredentialRetireReason,
+    versions: Map<string, TenantCredentialVersion> = this.tenantCredentialVersions,
+  ): TenantCredentialVersion {
+    const current = versions.get(credentialVersionId);
+    if (!current) throw new TenantErasureIntegrityError();
+    try {
+      validateTenantCredentialVersion(current);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    if (
+      current.tenantId !== tenantId
+      || current.slotKind !== slotKind
+      || current.slotIdSha256 !== slotIdSha256
+      || current.retiredAtDbMs !== undefined
+      || retiredAtDbMs < current.createdAtDbMs
+    ) throw new TenantErasureIntegrityError();
+    const body = {
+      credentialVersionId: current.credentialVersionId,
+      tenantId: current.tenantId,
+      slotKind: current.slotKind,
+      slotIdSha256: current.slotIdSha256,
+      origin: current.origin,
+      encryptedSecretPresent: current.encryptedSecretPresent,
+      secretKeyIdPresent: current.secretKeyIdPresent,
+      customHeadersPresent: current.customHeadersPresent,
+      endpointParametersPresent: current.endpointParametersPresent,
+      createdAtDbMs: current.createdAtDbMs,
+      retiredAtDbMs,
+      retireReason,
+    };
+    const retired: TenantCredentialVersion = {
+      ...body,
+      evidenceSha256: tenantCredentialVersionEvidenceSha256(body),
+    };
+    validateTenantCredentialVersion(retired);
+    return retired;
+  }
+
+  private assertTenantCredentialCurrentVersionTargets(
+    version: TenantCredentialVersion,
+  ): void {
+    try {
+      const targets = [...this.tenantCredentialTargetDispositions.entries()].filter(
+        ([, target]) => target.credentialVersionId === version.credentialVersionId,
+      );
+      if (targets.length !== TENANT_CREDENTIAL_TARGET_DOMAINS.length) {
+        throw new Error("current credential version target set is incomplete");
+      }
+      for (const domain of TENANT_CREDENTIAL_TARGET_DOMAINS) {
+        const key = tenantCredentialTargetKey(version.credentialVersionId, domain);
+        const entry = targets.find(([candidateKey]) => candidateKey === key);
+        if (!entry) throw new Error("current credential version target key is missing");
+        const target = entry[1];
+        validateTenantCredentialTargetDisposition(target);
+        if (
+          target.credentialVersionId !== version.credentialVersionId
+          || target.tenantId !== version.tenantId
+          || target.domain !== domain
+          || target.capturedAtDbMs !== version.createdAtDbMs
+          || target.disposition !== tenantCredentialCurrentTargetDisposition(version, domain)
+        ) throw new Error("current credential version target does not match its version");
+      }
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantCredentialAuthSlotFromRecord(
+    tenant: MemoryTenantRecord,
+  ): TenantCredentialAuthSlot {
+    const body = {
+      tenantId: tenant.tenantId,
+      writeGeneration: tenant.authCredentialSourceRevision ?? 0,
+      sourcePresent: tenant.authSecret !== undefined,
+      ...(tenant.authCredentialVersionId === undefined
+        ? {}
+        : { currentCredentialVersionId: tenant.authCredentialVersionId }),
+      updatedAtDbMs: tenant.authCredentialUpdatedAtMs ?? tenant.createdAtMs,
+    };
+    const slot: TenantCredentialAuthSlot = {
+      ...body,
+      evidenceSha256: tenantCredentialAuthSlotEvidenceSha256(body),
+    };
+    validateTenantCredentialAuthSlot(slot);
+    return slot;
+  }
+
+  private buildTenantCredentialLifecycleSnapshot(
+    tenantId: string,
+    state: {
+      tenants: Map<string, MemoryTenantRecord>;
+      providers: Map<string, MemoryProviderRecord>;
+      subjects: Map<string, TenantCredentialTrackingSubject>;
+      providerSlots: Map<string, TenantCredentialProviderSlot>;
+      versions: Map<string, TenantCredentialVersion>;
+      targets: Map<string, TenantCredentialTargetDisposition>;
+    },
+  ): TenantCredentialLifecycleSnapshot {
+    const subject = state.subjects.get(tenantId);
+    const tenant = state.tenants.get(tenantId);
+    if (!subject || !tenant) throw new TenantErasureIntegrityError();
+    const authSlot = this.tenantCredentialAuthSlotFromRecord(tenant);
+    const providerSlots = [...state.providerSlots.values()]
+      .filter((slot) => slot.tenantId === tenantId)
+      .sort((left, right) => left.slotIdSha256.localeCompare(right.slotIdSha256));
+    const versions = [...state.versions.values()]
+      .filter((version) => version.tenantId === tenantId)
+      .sort((left, right) => left.credentialVersionId.localeCompare(right.credentialVersionId));
+    const targets = [...state.targets.entries()]
+      .filter(([, target]) => target.tenantId === tenantId)
+      .sort((left, right) => left[0].localeCompare(right[0]))
+      .map(([, target]) => target);
+
+    const liveProviders = [...state.providers.entries()].filter(([, row]) => (
+      row.config.tenantId === tenantId
+    ));
+    const liveBySlot = new Map<string, MemoryProviderRecord>();
+    for (const [key, row] of liveProviders) {
+      const slotIdSha256 = tenantCredentialSlotIdSha256(
+        tenantId,
+        "provider_binding",
+        row.config.id,
+      );
+      if (
+        key !== providerConfigKey(tenantId, row.config.id)
+        || row.credentialSlotIdSha256 !== slotIdSha256
+        || liveBySlot.has(slotIdSha256)
+      ) throw new TenantErasureIntegrityError();
+      liveBySlot.set(slotIdSha256, row);
+    }
+    for (const slot of providerSlots) {
+      try {
+        validateTenantCredentialProviderSlot(slot);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      const source = liveBySlot.get(slot.slotIdSha256);
+      if (slot.sourcePresent !== (source !== undefined)) throw new TenantErasureIntegrityError();
+      if (!source) continue;
+      const material = providerCredentialMaterial(source.config, source.secret);
+      const requiresPointer = providerCredentialMaterialPresent(material);
+      if (
+        source.credentialSourceRevision !== slot.writeGeneration
+        || source.credentialVersionId !== slot.currentCredentialVersionId
+        || requiresPointer !== (slot.currentCredentialVersionId !== undefined)
+      ) throw new TenantErasureIntegrityError();
+      if (slot.currentCredentialVersionId !== undefined) {
+        const version = versions.find((candidate) => (
+          candidate.credentialVersionId === slot.currentCredentialVersionId
+        ));
+        if (!version
+          || version.encryptedSecretPresent !== material.encryptedSecretPresent
+          || version.secretKeyIdPresent !== material.secretKeyIdPresent
+          || version.customHeadersPresent !== material.customHeadersPresent
+          || version.endpointParametersPresent !== material.endpointParametersPresent) {
+          throw new TenantErasureIntegrityError();
+        }
+      }
+    }
+    if (liveBySlot.size !== providerSlots.filter((slot) => slot.sourcePresent).length) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (authSlot.sourcePresent !== (tenant.authCredentialVersionId !== undefined)) {
+      throw new TenantErasureIntegrityError();
+    }
+
+    const liveVersionIds = new Set<string>();
+    if (authSlot.currentCredentialVersionId !== undefined) {
+      liveVersionIds.add(authSlot.currentCredentialVersionId);
+    }
+    for (const slot of providerSlots) {
+      if (slot.currentCredentialVersionId !== undefined) {
+        if (liveVersionIds.has(slot.currentCredentialVersionId)) {
+          throw new TenantErasureIntegrityError();
+        }
+        liveVersionIds.add(slot.currentCredentialVersionId);
+      }
+    }
+    for (const version of versions) {
+      if ((version.retiredAtDbMs === undefined) !== liveVersionIds.has(version.credentialVersionId)) {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+
+    try {
+      const snapshot: TenantCredentialLifecycleSnapshot = clone({
+        subject,
+        authSlot,
+        providerSlots,
+        versions,
+        targetDispositions: targets,
+        subjectRootSha256: tenantCredentialSubjectRootSha256([subject]),
+        providerSlotRootSha256: tenantCredentialProviderSlotRootSha256(providerSlots),
+        authSlotRootSha256: tenantCredentialAuthSlotRootSha256([authSlot]),
+        versionRootSha256: tenantCredentialVersionRootSha256(versions),
+        targetDispositionRootSha256: tenantCredentialTargetDispositionRootSha256(targets),
+      });
+      validateTenantCredentialLifecycleSnapshot(snapshot);
+      return snapshot;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private assertTenantCredentialInventoryReceipt(
+    receipt: TenantCredentialInventoryReceipt,
+  ): void {
+    try {
+      validateTenantCredentialInventoryReceipt(receipt);
+      const t3aReceipt = this.tenantCredentialRevocationReceipts.get(receipt.requestId);
+      const job = this.tenantCredentialRevocationJobs.get(receipt.requestId);
+      if (!t3aReceipt || !job || job.phase !== "credential_store_revoked") {
+        throw new Error("credential inventory T3a source is missing");
+      }
+      validateTenantCredentialRevocationCompletionProof(job, t3aReceipt);
+      const cutover = this.readMemoryTenantCredentialTrackingCutover();
+      if (cutover.controlGeneration !== 1 || cutover.evidenceSha256 === undefined) {
+        throw new Error("credential inventory tracking cutover is inactive");
+      }
+      const snapshot = this.buildTenantCredentialLifecycleSnapshot(receipt.tenantId, {
+        tenants: this.tenants,
+        providers: this.providers,
+        subjects: this.tenantCredentialTrackingSubjects,
+        providerSlots: this.tenantCredentialProviderSlots,
+        versions: this.tenantCredentialVersions,
+        targets: this.tenantCredentialTargetDispositions,
+      });
+      const isBlocking = (target: TenantCredentialTargetDisposition): boolean => (
+        TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS.some(
+          (disposition) => disposition === target.disposition,
+        )
+      );
+      if (
+        receipt.tenantId !== t3aReceipt.tenantId
+        || receipt.tenantId !== job.tenantId
+        || receipt.subjectGeneration !== t3aReceipt.subjectGeneration
+        || receipt.subjectGeneration !== job.subjectGeneration
+        || receipt.t3aReceiptSha256 !== t3aReceipt.receiptSha256
+        || receipt.trackingCutoverEvidenceSha256 !== cutover.evidenceSha256
+        || receipt.storeDbTimestampMs !== t3aReceipt.storeDbTimestampMs
+        || receipt.subjectCount !== 1
+        || receipt.subjectRootSha256 !== snapshot.subjectRootSha256
+        || receipt.providerSlotCount !== snapshot.providerSlots.length
+        || receipt.providerSlotRootSha256 !== snapshot.providerSlotRootSha256
+        || receipt.authSlotCount !== 1
+        || receipt.authSlotRootSha256 !== snapshot.authSlotRootSha256
+        || receipt.versionCount !== snapshot.versions.length
+        || receipt.versionRootSha256 !== snapshot.versionRootSha256
+        || receipt.targetDispositionCount !== snapshot.targetDispositions.length
+        || receipt.targetDispositionRootSha256 !== snapshot.targetDispositionRootSha256
+        || receipt.externalCredentialBlockerCount !== snapshot.targetDispositions.filter(
+          (target) => target.domain === "external_credential" && isBlocking(target),
+        ).length
+        || receipt.kmsKeyBlockerCount !== snapshot.targetDispositions.filter(
+          (target) => target.domain === "kms_key" && isBlocking(target),
+        ).length
+        || receipt.legacyHistoryUnknownSubjectCount
+          !== (snapshot.subject.historyStatus === "legacy_history_unknown" ? 1 : 0)
+        || receipt.providerSourceCountBefore > t3aReceipt.providerConfigCountBefore
+        || receipt.authSecretPresentBefore !== t3aReceipt.authSecretCipherPresentBefore
+        || receipt.authSecretPresentBefore !== t3aReceipt.authSecretKeyIdPresentBefore
+      ) throw new Error("credential inventory receipt binding is invalid");
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async readTenantCredentialTrackingCutover(): Promise<TenantCredentialTrackingCutoverRecord> {
+    return clone(this.readMemoryTenantCredentialTrackingCutover());
+  }
+
+  async activateTenantCredentialTrackingCutover(
+    input: ActivateTenantCredentialTrackingInput,
+  ): Promise<TenantCredentialTrackingCutoverRecord> {
+    const stagedInput = clone(input);
+    if (
+      Object.keys(stagedInput).length !== 1
+      || stagedInput.expectedControlGeneration !== 0
+    ) throw new Error("invalid tenant credential tracking activation input");
+    const current = this.readMemoryTenantCredentialTrackingCutover();
+    if (current.controlGeneration === 1) return clone(current);
+    if (
+      this.tenantCredentialTrackingSubjects.size !== 0
+      || this.tenantCredentialVersions.size !== 0
+      || this.tenantCredentialTargetDispositions.size !== 0
+      || this.tenantCredentialInventoryReceipts.size !== 0
+    ) throw new TenantErasureIntegrityError();
+
+    const nowMs = Math.max(
+      this.storeNowMs(),
+      this.tenantCredentialLifecycleHighWater(),
+    );
+    const stagedTenants = new Map(
+      [...this.tenants].map(([key, value]) => [key, cloneMemoryTenantRecord(value)]),
+    );
+    const stagedProviders = new Map(
+      [...this.providers].map(([key, value]) => [key, cloneMemoryProviderRecord(value)]),
+    );
+    const stagedSubjects = new Map<string, TenantCredentialTrackingSubject>();
+    const stagedSlots = clone(new Map(this.tenantCredentialProviderSlots));
+    const stagedVersions = new Map<string, TenantCredentialVersion>();
+    const stagedTargets = new Map<string, TenantCredentialTargetDisposition>();
+    const tenantIds = new Set<string>([
+      ...stagedTenants.keys(),
+      ...[...stagedProviders.values()].map((row) => row.config.tenantId),
+      ...[...this.apiKeys.values()].map((row) => row.tenantId),
+      ...[...this.subjectLifecycles.values()].map((row) => row.tenantId),
+      ...[...this.tenantErasureAdmissions.values()].map((row) => row.tenantId),
+      ...[...stagedSlots.values()].map((row) => row.tenantId),
+    ]);
+    for (const tenantId of [...tenantIds].sort()) {
+      const subject = this.newTenantCredentialTrackingSubject(
+        tenantId,
+        nowMs,
+        "legacy_history_unknown",
+      );
+      stagedSubjects.set(tenantId, subject);
+      if (!stagedTenants.has(tenantId)) {
+        stagedTenants.set(tenantId, {
+          tenantId,
+          authPolicy: clone(DEFAULT_AUTH_POLICY),
+          authCredentialSourceRevision: 0,
+          authCredentialUpdatedAtMs: nowMs,
+          createdAtMs: nowMs,
+        });
+      }
+    }
+
+    for (const [key, row] of stagedProviders) {
+      const tenantId = row.config.tenantId;
+      if (
+        key !== providerConfigKey(tenantId, row.config.id)
+        || !stagedSubjects.has(tenantId)
+      ) throw new TenantErasureIntegrityError();
+      const slotIdSha256 = tenantCredentialSlotIdSha256(
+        tenantId,
+        "provider_binding",
+        row.config.id,
+      );
+      const priorSlot = stagedSlots.get(slotIdSha256);
+      if (priorSlot) {
+        try {
+          validateTenantCredentialProviderSlot(priorSlot);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+        if (
+          priorSlot.tenantId !== tenantId
+          || !priorSlot.sourcePresent
+          || priorSlot.currentCredentialVersionId !== undefined
+          || (row.credentialSlotIdSha256 !== undefined
+            && row.credentialSlotIdSha256 !== slotIdSha256)
+          || (row.credentialSourceRevision !== undefined
+            && row.credentialSourceRevision !== priorSlot.writeGeneration)
+          || row.credentialVersionId !== undefined
+        ) throw new TenantErasureIntegrityError();
+      }
+      const writeGeneration = priorSlot?.writeGeneration
+        ?? row.credentialSourceRevision
+        ?? 1;
+      if (!Number.isSafeInteger(writeGeneration) || writeGeneration <= 0) {
+        throw new TenantErasureIntegrityError();
+      }
+      const material = providerCredentialMaterial(row.config, row.secret);
+      let credentialVersionId: string | undefined;
+      if (providerCredentialMaterialPresent(material)) {
+        const created = this.createTenantCredentialVersion({
+          tenantId,
+          slotKind: "provider_binding",
+          slotId: row.config.id,
+          origin: "legacy_observed",
+          ...material,
+          createdAtDbMs: nowMs,
+        });
+        if (stagedVersions.has(created.version.credentialVersionId)) {
+          throw new TenantErasureIntegrityError();
+        }
+        stagedVersions.set(created.version.credentialVersionId, created.version);
+        for (const target of created.targets) {
+          stagedTargets.set(
+            tenantCredentialTargetKey(target.credentialVersionId, target.domain),
+            target,
+          );
+        }
+        credentialVersionId = created.version.credentialVersionId;
+      }
+      const slotBody = {
+        tenantId,
+        slotIdSha256,
+        writeGeneration,
+        sourcePresent: true,
+        ...(credentialVersionId === undefined ? {} : { currentCredentialVersionId: credentialVersionId }),
+        updatedAtDbMs: nowMs,
+      };
+      const slot: TenantCredentialProviderSlot = {
+        ...slotBody,
+        evidenceSha256: tenantCredentialProviderSlotEvidenceSha256(slotBody),
+      };
+      validateTenantCredentialProviderSlot(slot);
+      stagedSlots.set(slotIdSha256, slot);
+      stagedProviders.set(key, {
+        ...row,
+        credentialSlotIdSha256: slotIdSha256,
+        credentialSourceRevision: writeGeneration,
+        ...(credentialVersionId === undefined ? {} : { credentialVersionId }),
+      });
+    }
+    for (const slot of stagedSlots.values()) {
+      try {
+        validateTenantCredentialProviderSlot(slot);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!stagedSubjects.has(slot.tenantId)) throw new TenantErasureIntegrityError();
+      const live = [...stagedProviders.values()].some((row) => (
+        row.config.tenantId === slot.tenantId
+        && row.credentialSlotIdSha256 === slot.slotIdSha256
+      ));
+      if (slot.sourcePresent !== live) throw new TenantErasureIntegrityError();
+    }
+
+    for (const [tenantId, tenant] of stagedTenants) {
+      const writeGeneration = tenant.authCredentialSourceRevision ?? 0;
+      if (!Number.isSafeInteger(writeGeneration) || writeGeneration < 0) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (tenant.authCredentialVersionId !== undefined) {
+        throw new TenantErasureIntegrityError();
+      }
+      let authCredentialVersionId: string | undefined;
+      let nextGeneration = writeGeneration;
+      if (tenant.authSecret !== undefined) {
+        nextGeneration = Math.max(1, writeGeneration);
+        const created = this.createTenantCredentialVersion({
+          tenantId,
+          slotKind: "tenant_auth_secret",
+          slotId: "tenant_auth_secret",
+          origin: "legacy_observed",
+          encryptedSecretPresent: true,
+          secretKeyIdPresent: true,
+          customHeadersPresent: false,
+          endpointParametersPresent: false,
+          createdAtDbMs: nowMs,
+        });
+        if (stagedVersions.has(created.version.credentialVersionId)) {
+          throw new TenantErasureIntegrityError();
+        }
+        stagedVersions.set(created.version.credentialVersionId, created.version);
+        for (const target of created.targets) {
+          stagedTargets.set(
+            tenantCredentialTargetKey(target.credentialVersionId, target.domain),
+            target,
+          );
+        }
+        authCredentialVersionId = created.version.credentialVersionId;
+      }
+      stagedTenants.set(tenantId, {
+        ...tenant,
+        authCredentialSourceRevision: nextGeneration,
+        ...(authCredentialVersionId === undefined ? {} : { authCredentialVersionId }),
+        authCredentialUpdatedAtMs: nowMs,
+      });
+    }
+
+    const subjects = [...stagedSubjects.values()];
+    const slots = [...stagedSlots.values()];
+    const authSlots = [...stagedTenants.values()].map((tenant) => (
+      this.tenantCredentialAuthSlotFromRecord(tenant)
+    ));
+    const versions = [...stagedVersions.values()];
+    const targets = [...stagedTargets.values()];
+    const cutoverBody = {
+      activatedAtDbMs: nowMs,
+      subjectCount: subjects.length,
+      subjectRootSha256: tenantCredentialSubjectRootSha256(subjects),
+      providerSlotCount: slots.length,
+      providerSlotRootSha256: tenantCredentialProviderSlotRootSha256(slots),
+      authSlotCount: authSlots.length,
+      authSlotRootSha256: tenantCredentialAuthSlotRootSha256(authSlots),
+      versionCount: versions.length,
+      versionRootSha256: tenantCredentialVersionRootSha256(versions),
+      targetDispositionCount: targets.length,
+      targetDispositionRootSha256: tenantCredentialTargetDispositionRootSha256(targets),
+    };
+    const stagedCutover: TenantCredentialTrackingCutoverRecord = {
+      controlGeneration: 1,
+      ...cutoverBody,
+      evidenceSha256: tenantCredentialTrackingCutoverEvidenceSha256(cutoverBody),
+    };
+    validateTenantCredentialTrackingCutoverRecord(stagedCutover);
+    for (const tenantId of tenantIds) {
+      this.buildTenantCredentialLifecycleSnapshot(tenantId, {
+        tenants: stagedTenants,
+        providers: stagedProviders,
+        subjects: stagedSubjects,
+        providerSlots: stagedSlots,
+        versions: stagedVersions,
+        targets: stagedTargets,
+      });
+    }
+
+    const tenantsBefore = new Map(this.tenants);
+    const providersBefore = new Map(this.providers);
+    const subjectsBefore = new Map(this.tenantCredentialTrackingSubjects);
+    const slotsBefore = new Map(this.tenantCredentialProviderSlots);
+    const versionsBefore = new Map(this.tenantCredentialVersions);
+    const targetsBefore = new Map(this.tenantCredentialTargetDispositions);
+    const cutoversBefore = new Map(this.tenantCredentialTrackingCutovers);
+    try {
+      for (const [key, value] of stagedTenants) {
+        this.tenants.set(key, cloneMemoryTenantRecord(value));
+      }
+      for (const [key, value] of stagedProviders) {
+        this.providers.set(key, cloneMemoryProviderRecord(value));
+      }
+      for (const [key, value] of stagedSubjects) {
+        this.tenantCredentialTrackingSubjects.set(key, clone(value));
+      }
+      for (const [key, value] of stagedSlots) {
+        this.tenantCredentialProviderSlots.set(key, clone(value));
+      }
+      for (const [key, value] of stagedVersions) {
+        this.tenantCredentialVersions.set(key, clone(value));
+      }
+      for (const [key, value] of stagedTargets) {
+        this.tenantCredentialTargetDispositions.set(key, clone(value));
+      }
+      this.tenantCredentialTrackingCutovers.set(1, clone(stagedCutover));
+    } catch (error) {
+      restoreMapSnapshot(this.tenants, tenantsBefore);
+      restoreMapSnapshot(this.providers, providersBefore);
+      restoreMapSnapshot(this.tenantCredentialTrackingSubjects, subjectsBefore);
+      restoreMapSnapshot(this.tenantCredentialProviderSlots, slotsBefore);
+      restoreMapSnapshot(this.tenantCredentialVersions, versionsBefore);
+      restoreMapSnapshot(this.tenantCredentialTargetDispositions, targetsBefore);
+      restoreMapSnapshot(this.tenantCredentialTrackingCutovers, cutoversBefore);
+      throw error;
+    }
+    return clone(stagedCutover);
+  }
+
+  async getTenantCredentialInventorySnapshot(
+    tenantId: string,
+  ): Promise<TenantCredentialLifecycleSnapshot> {
+    if (!tenantId || tenantId.length > 128) throw new Error("invalid tenant id");
+    if (!this.tenantCredentialTrackingActive()) {
+      throw new TenantErasureIntegrityError();
+    }
+    return clone(this.buildTenantCredentialLifecycleSnapshot(tenantId, {
+      tenants: this.tenants,
+      providers: this.providers,
+      subjects: this.tenantCredentialTrackingSubjects,
+      providerSlots: this.tenantCredentialProviderSlots,
+      versions: this.tenantCredentialVersions,
+      targets: this.tenantCredentialTargetDispositions,
+    }));
+  }
+
+  async getTenantCredentialInventoryReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialInventoryReceipt | null> {
+    const receipt = this.tenantCredentialInventoryReceipts.get(requestId);
+    if (!receipt || receipt.tenantId !== tenantId) return null;
+    this.assertTenantCredentialInventoryReceipt(receipt);
+    return clone(receipt);
   }
 
   private initialRetentionPolicyControl(tenantId: string): RetentionPolicyControlRecord {
@@ -5048,6 +6016,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       } catch {
         throw new TenantErasureIntegrityError();
       }
+      const inventory = this.tenantCredentialInventoryReceipts.get(current.requestId);
+      if (inventory) {
+        this.assertTenantCredentialInventoryReceipt(inventory);
+        if (
+          inventory.requestId !== receipt.requestId
+          || inventory.tenantId !== receipt.tenantId
+          || inventory.subjectGeneration !== receipt.subjectGeneration
+          || inventory.t3aReceiptSha256 !== receipt.receiptSha256
+        ) throw new TenantErasureIntegrityError();
+      }
       return tenantCredentialRevocationCompletionMatchesAuthorization(current, stagedAuthorization)
         && tenantCredentialRevocationReceiptMatchesAuthorization(receipt, stagedAuthorization)
         ? clone(receipt)
@@ -5058,8 +6036,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       return null;
     }
 
-    const nowMs = this.storeNowMs();
-    if (!tenantCredentialRevocationAuthorizationMatches(current, stagedAuthorization, nowMs)) {
+    const observedNowMs = this.storeNowMs();
+    if (!tenantCredentialRevocationAuthorizationMatches(
+      current,
+      stagedAuthorization,
+      observedNowMs,
+    )) {
       return null;
     }
     this.assertTenantCredentialRevocationSource(current);
@@ -5074,11 +6056,50 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const tenant = this.tenants.get(current.tenantId);
     if (!tenant || tenant.tenantId !== current.tenantId) throw new TenantErasureIntegrityError();
     const cutover = this.readTenantCredentialRevocationCutover(true);
+    const trackingCutover = this.readMemoryTenantCredentialTrackingCutover();
+    const trackingActive = trackingCutover.controlGeneration === 1;
+    const lifecycleHighWater = trackingActive
+      ? this.tenantCredentialLifecycleHighWater(current.tenantId)
+      : undefined;
+    const completionFloorMs = Math.max(
+      observedNowMs,
+      current.createdAtMs,
+      current.updatedAtMs,
+    );
+    const nowMs = trackingActive
+      ? this.tenantCredentialMutationAtMs(
+          current.tenantId,
+          completionFloorMs,
+          lifecycleHighWater,
+        )
+      : completionFloorMs;
+    // The monotonic credential-ledger clock is the authoritative destructive-boundary time. A
+    // regressed wall clock may pass the first cheap check while the durable high-water is already
+    // beyond the claim lease, so revalidate before cloning or mutating any credential material.
+    if (!tenantCredentialRevocationAuthorizationMatches(current, stagedAuthorization, nowMs)) {
+      return null;
+    }
+    if (
+      this.tenantCredentialInventoryReceipts.has(current.requestId)
+      || [...this.tenantCredentialInventoryReceipts.values()].some(
+        (receipt) => receipt.tenantId === current.tenantId,
+      )
+    ) throw new TenantErasureIntegrityError();
+    if (trackingActive) {
+      this.buildTenantCredentialLifecycleSnapshot(current.tenantId, {
+        tenants: this.tenants,
+        providers: this.providers,
+        subjects: this.tenantCredentialTrackingSubjects,
+        providerSlots: this.tenantCredentialProviderSlots,
+        versions: this.tenantCredentialVersions,
+        targets: this.tenantCredentialTargetDispositions,
+      });
+    }
 
     // Clone every credential-bearing target before the first destructive mutation. Besides giving
     // MemoryStore transaction-like rollback, this makes serialization failure an all-or-nothing
     // failure and prevents an uncloneable provider/auth value from becoming partial proof.
-    const stagedTenantBefore = clone(tenant);
+    const stagedTenantBefore = cloneMemoryTenantRecord(tenant);
     const apiKeyTargets = [...this.apiKeys.entries()]
       .filter(([, value]) => value.tenantId === current.tenantId)
       .map(([key, value]) => [key, clone(value)] as const);
@@ -5098,13 +6119,119 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           || value.config.tenantId !== current.tenantId) {
           throw new TenantErasureIntegrityError();
         }
-        return [key, clone(value)] as const;
+        return [key, cloneMemoryProviderRecord(value)] as const;
       });
+    const stagedProviders = new Map(
+      [...this.providers].map(([key, value]) => [key, cloneMemoryProviderRecord(value)]),
+    );
+    const stagedTenants = new Map(
+      [...this.tenants].map(([key, value]) => [key, cloneMemoryTenantRecord(value)]),
+    );
+    const stagedSubjects = clone(new Map(this.tenantCredentialTrackingSubjects));
+    const stagedProviderSlots = clone(new Map(this.tenantCredentialProviderSlots));
+    const stagedVersions = clone(new Map(this.tenantCredentialVersions));
+    const stagedTargets = clone(new Map(this.tenantCredentialTargetDispositions));
+    let providerSourceCountBefore = 0;
+    let providerSourcePointerCountBefore = 0;
+    for (const [key, provider] of providerTargets) {
+      const slotIdSha256 = tenantCredentialSlotIdSha256(
+        current.tenantId,
+        "provider_binding",
+        provider.config.id,
+      );
+      const slot = stagedProviderSlots.get(slotIdSha256);
+      if (
+        !slot
+        || !slot.sourcePresent
+        || slot.tenantId !== current.tenantId
+        || provider.credentialSlotIdSha256 !== slotIdSha256
+        || provider.credentialSourceRevision !== slot.writeGeneration
+        || provider.credentialVersionId !== slot.currentCredentialVersionId
+      ) throw new TenantErasureIntegrityError();
+      try {
+        validateTenantCredentialProviderSlot(slot);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      const materialPresent = providerCredentialMaterialPresent(
+        providerCredentialMaterial(provider.config, provider.secret),
+      );
+      if (materialPresent) providerSourceCountBefore += 1;
+      if (slot.currentCredentialVersionId !== undefined) {
+        providerSourcePointerCountBefore += 1;
+      }
+      if (trackingActive && materialPresent !== (slot.currentCredentialVersionId !== undefined)) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (!trackingActive && slot.currentCredentialVersionId !== undefined) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (slot.currentCredentialVersionId !== undefined) {
+        const retired = this.retiredTenantCredentialVersion(
+          slot.currentCredentialVersionId,
+          current.tenantId,
+          "provider_binding",
+          slotIdSha256,
+          nowMs,
+          "tenant_erasure",
+          stagedVersions,
+        );
+        stagedVersions.set(retired.credentialVersionId, retired);
+      }
+      const nextGeneration = this.nextCredentialSourceRevision(slot.writeGeneration);
+      const slotBody = {
+        tenantId: current.tenantId,
+        slotIdSha256,
+        writeGeneration: nextGeneration,
+        sourcePresent: false,
+        updatedAtDbMs: nowMs,
+      };
+      const nextSlot: TenantCredentialProviderSlot = {
+        ...slotBody,
+        evidenceSha256: tenantCredentialProviderSlotEvidenceSha256(slotBody),
+      };
+      validateTenantCredentialProviderSlot(nextSlot);
+      stagedProviderSlots.set(slotIdSha256, nextSlot);
+      stagedProviders.delete(key);
+    }
+    const strayLiveSlot = [...stagedProviderSlots.values()].some((slot) => (
+      slot.tenantId === current.tenantId && slot.sourcePresent
+    ));
+    if (strayLiveSlot) throw new TenantErasureIntegrityError();
+
+    const authSecretPresentBefore = stagedTenantBefore.authSecret !== undefined;
+    const authSourcePointerPresentBefore = stagedTenantBefore.authCredentialVersionId !== undefined;
+    if (trackingActive && authSecretPresentBefore !== authSourcePointerPresentBefore) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (!trackingActive && authSourcePointerPresentBefore) throw new TenantErasureIntegrityError();
+    if (authSourcePointerPresentBefore) {
+      const retired = this.retiredTenantCredentialVersion(
+        stagedTenantBefore.authCredentialVersionId!,
+        current.tenantId,
+        "tenant_auth_secret",
+        tenantCredentialSlotIdSha256(
+          current.tenantId,
+          "tenant_auth_secret",
+          "tenant_auth_secret",
+        ),
+        nowMs,
+        "tenant_erasure",
+        stagedVersions,
+      );
+      stagedVersions.set(retired.credentialVersionId, retired);
+    }
+    const authSourceRevisionAfter = this.nextCredentialSourceRevision(
+      stagedTenantBefore.authCredentialSourceRevision ?? 0,
+    );
     const stagedTenantAfter = clone<MemoryTenantRecord>({
       tenantId: stagedTenantBefore.tenantId,
       ...(stagedTenantBefore.name === undefined ? {} : { name: stagedTenantBefore.name }),
+      authCredentialSourceRevision: authSourceRevisionAfter,
+      authCredentialUpdatedAtMs: nowMs,
       createdAtMs: stagedTenantBefore.createdAtMs,
     });
+    stagedTenants.set(current.tenantId, stagedTenantAfter);
     const receiptBody = {
       scope: TENANT_CREDENTIAL_REVOCATION_RECEIPT_SCOPE,
       requestId: current.requestId,
@@ -5166,9 +6293,68 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateTenantCredentialRevocationCompletionProof(stagedJob, stagedReceipt);
     validateTenantCredentialRevocationCutoverRecord(stagedCutover);
 
+    let stagedInventoryReceipt: TenantCredentialInventoryReceipt | undefined;
+    if (trackingActive) {
+      if (trackingCutover.evidenceSha256 === undefined) {
+        throw new TenantErasureIntegrityError();
+      }
+      const snapshot = this.buildTenantCredentialLifecycleSnapshot(current.tenantId, {
+        tenants: stagedTenants,
+        providers: stagedProviders,
+        subjects: stagedSubjects,
+        providerSlots: stagedProviderSlots,
+        versions: stagedVersions,
+        targets: stagedTargets,
+      });
+      const isBlockingDisposition = (target: TenantCredentialTargetDisposition): boolean => (
+        TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS.some(
+          (disposition) => disposition === target.disposition,
+        )
+      );
+      const inventoryBody = {
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        scope: TENANT_CREDENTIAL_INVENTORY_RECEIPT_SCOPE,
+        t3aReceiptSha256: stagedReceipt.receiptSha256,
+        trackingCutoverEvidenceSha256: trackingCutover.evidenceSha256,
+        subjectCount: 1,
+        subjectRootSha256: snapshot.subjectRootSha256,
+        providerSlotCount: snapshot.providerSlots.length,
+        providerSlotRootSha256: snapshot.providerSlotRootSha256,
+        authSlotCount: 1,
+        authSlotRootSha256: snapshot.authSlotRootSha256,
+        versionCount: snapshot.versions.length,
+        versionRootSha256: snapshot.versionRootSha256,
+        targetDispositionCount: snapshot.targetDispositions.length,
+        targetDispositionRootSha256: snapshot.targetDispositionRootSha256,
+        externalCredentialBlockerCount: snapshot.targetDispositions.filter((target) => (
+          target.domain === "external_credential" && isBlockingDisposition(target)
+        )).length,
+        kmsKeyBlockerCount: snapshot.targetDispositions.filter((target) => (
+          target.domain === "kms_key" && isBlockingDisposition(target)
+        )).length,
+        legacyHistoryUnknownSubjectCount:
+          snapshot.subject.historyStatus === "legacy_history_unknown" ? 1 : 0,
+        providerSourceCountBefore,
+        providerSourcePointerCountBefore,
+        authSecretPresentBefore,
+        authSourcePointerPresentBefore,
+        storeDbTimestampMs: nowMs,
+      };
+      stagedInventoryReceipt = clone<TenantCredentialInventoryReceipt>({
+        ...inventoryBody,
+        receiptSha256: tenantCredentialInventoryReceiptSha256(inventoryBody),
+      });
+      validateTenantCredentialInventoryReceipt(stagedInventoryReceipt);
+    }
+
     const apiKeysBefore = new Map(this.apiKeys);
     const providersBefore = new Map(this.providers);
     const tenantsBefore = new Map(this.tenants);
+    const providerSlotsBefore = new Map(this.tenantCredentialProviderSlots);
+    const versionsBefore = new Map(this.tenantCredentialVersions);
+    const inventoryReceiptsBefore = new Map(this.tenantCredentialInventoryReceipts);
     const jobsBefore = new Map(this.tenantCredentialRevocationJobs);
     const receiptsBefore = new Map(this.tenantCredentialRevocationReceipts);
     const cutoversBefore = new Map(this.tenantCredentialRevocationCutovers);
@@ -5176,11 +6362,27 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       for (const [key] of apiKeyTargets) this.apiKeys.delete(key);
       for (const [key] of providerTargets) this.providers.delete(key);
       this.tenants.set(current.tenantId, stagedTenantAfter);
+      for (const [slotIdSha256, slot] of stagedProviderSlots) {
+        if (slot.tenantId === current.tenantId) {
+          this.tenantCredentialProviderSlots.set(slotIdSha256, clone(slot));
+        }
+      }
+      for (const [credentialVersionId, version] of stagedVersions) {
+        if (version.tenantId === current.tenantId) {
+          this.tenantCredentialVersions.set(credentialVersionId, clone(version));
+        }
+      }
       if (
         [...this.apiKeys.values()].some((value) => value.tenantId === current.tenantId)
         || [...this.providers.values()].some((value) => value.config.tenantId === current.tenantId)
       ) throw new TenantErasureIntegrityError();
       this.tenantCredentialRevocationReceipts.set(current.requestId, stagedReceipt);
+      if (stagedInventoryReceipt) {
+        this.tenantCredentialInventoryReceipts.set(
+          current.requestId,
+          stagedInventoryReceipt,
+        );
+      }
       if (cutover.controlGeneration === 0) {
         this.tenantCredentialRevocationCutovers.set(1, stagedCutover);
       }
@@ -5189,6 +6391,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       restoreMapSnapshot(this.apiKeys, apiKeysBefore);
       restoreMapSnapshot(this.providers, providersBefore);
       restoreMapSnapshot(this.tenants, tenantsBefore);
+      restoreMapSnapshot(this.tenantCredentialProviderSlots, providerSlotsBefore);
+      restoreMapSnapshot(this.tenantCredentialVersions, versionsBefore);
+      restoreMapSnapshot(this.tenantCredentialInventoryReceipts, inventoryReceiptsBefore);
       restoreMapSnapshot(this.tenantCredentialRevocationJobs, jobsBefore);
       restoreMapSnapshot(this.tenantCredentialRevocationReceipts, receiptsBefore);
       restoreMapSnapshot(this.tenantCredentialRevocationCutovers, cutoversBefore);
@@ -11935,6 +13140,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!tenant) throw new TenantErasureIntegrityError();
     this.tenants.set(tenantId, clone<MemoryTenantRecord>({
       tenantId,
+      authCredentialSourceRevision: tenant.authCredentialSourceRevision ?? 0,
+      authCredentialUpdatedAtMs: tenant.authCredentialUpdatedAtMs ?? tenant.createdAtMs,
       createdAtMs: tenant.createdAtMs,
     }));
 
@@ -15569,25 +16776,323 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return a && a.sessionId === sessionId ? clone(a) : null;
   }
 
-  async upsertProviderConfig(cfg: ProviderConfig, secret?: { ciphertext: Buffer; keyId: string }) {
+  async upsertProviderConfig(
+    cfg: ProviderConfig,
+    secret?: { ciphertext: Buffer; keyId: string },
+    expectedSourceRevision?: number | null,
+  ): Promise<ProviderConfig> {
     const stagedConfig = clone(cfg);
+    const stagedSecret = secret === undefined ? undefined : cloneCredentialSecret(secret);
     this.assertTenantWritable(stagedConfig.tenantId);
+    const observedNowMs = this.storeNowMs();
+    const tenantKnownBefore = this.tenantKnownToCredentialStore(stagedConfig.tenantId);
     const key = providerConfigKey(stagedConfig.tenantId, stagedConfig.id);
     const prev = this.providers.get(key);
-    this.providers.set(key, { config: stagedConfig, secret: secret ?? prev?.secret });
+    const slotIdSha256 = tenantCredentialSlotIdSha256(
+      stagedConfig.tenantId,
+      "provider_binding",
+      stagedConfig.id,
+    );
+    const currentSlot = this.tenantCredentialProviderSlots.get(slotIdSha256);
+    if (currentSlot) {
+      try {
+        validateTenantCredentialProviderSlot(currentSlot);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (
+        currentSlot.tenantId !== stagedConfig.tenantId
+        || currentSlot.slotIdSha256 !== slotIdSha256
+        || currentSlot.sourcePresent !== (prev !== undefined)
+        || (prev !== undefined && (
+          prev.credentialSlotIdSha256 !== slotIdSha256
+          || prev.credentialSourceRevision !== currentSlot.writeGeneration
+          || prev.credentialVersionId !== currentSlot.currentCredentialVersionId
+        ))
+      ) throw new TenantErasureIntegrityError();
+    } else if (prev !== undefined) {
+      throw new TenantErasureIntegrityError();
+    }
+    const trackingActive = this.tenantCredentialTrackingActive();
+    const nowMs = trackingActive
+      ? this.tenantCredentialMutationAtMs(
+          stagedConfig.tenantId,
+          observedNowMs,
+          currentSlot?.updatedAtDbMs,
+        )
+      : observedNowMs;
+    this.assertCredentialSourceRevision(
+      "provider",
+      expectedSourceRevision,
+      currentSlot?.writeGeneration ?? null,
+    );
+    const nextRevision = this.nextCredentialSourceRevision(currentSlot?.writeGeneration ?? 0);
+    const finalSecret = stagedSecret ?? (prev?.secret === undefined
+      ? undefined
+      : cloneCredentialSecret(prev.secret));
+    const material = providerCredentialMaterial(stagedConfig, finalSecret);
+    const materialPresent = providerCredentialMaterialPresent(material);
+    const stagedSubject = this.trackingSubjectForCredentialWrite(
+      stagedConfig.tenantId,
+      nowMs,
+      tenantKnownBefore,
+    );
+    const storedTenant = this.tenants.get(stagedConfig.tenantId);
+    const stagedTenant = storedTenant === undefined
+      ? {
+          tenantId: stagedConfig.tenantId,
+          authPolicy: clone(DEFAULT_AUTH_POLICY),
+          authCredentialSourceRevision: 0,
+          authCredentialUpdatedAtMs: nowMs,
+          createdAtMs: nowMs,
+        }
+      : cloneMemoryTenantRecord(storedTenant);
+
+    let currentCredentialVersionId: string | undefined;
+    let retiredVersion: TenantCredentialVersion | undefined;
+    let created: ReturnType<MemorySessionStore["createTenantCredentialVersion"]> | undefined;
+    if (trackingActive) {
+      const previousMaterial = prev
+        ? providerCredentialMaterial(prev.config, prev.secret)
+        : undefined;
+      if (
+        previousMaterial !== undefined
+        && providerCredentialMaterialPresent(previousMaterial)
+        !== (currentSlot?.currentCredentialVersionId !== undefined)
+      ) throw new TenantErasureIntegrityError();
+      if (currentSlot?.currentCredentialVersionId !== undefined) {
+        retiredVersion = this.retiredTenantCredentialVersion(
+          currentSlot.currentCredentialVersionId,
+          stagedConfig.tenantId,
+          "provider_binding",
+          slotIdSha256,
+          nowMs,
+          materialPresent ? "replaced" : "cleared",
+        );
+      }
+      if (materialPresent) {
+        created = this.createTenantCredentialVersion({
+          tenantId: stagedConfig.tenantId,
+          slotKind: "provider_binding",
+          slotId: stagedConfig.id,
+          origin: "managed_v1",
+          ...material,
+          createdAtDbMs: nowMs,
+        });
+        currentCredentialVersionId = created.version.credentialVersionId;
+      }
+    } else if (
+      currentSlot?.currentCredentialVersionId !== undefined
+      || prev?.credentialVersionId !== undefined
+    ) {
+      throw new TenantErasureIntegrityError();
+    }
+
+    const slotBody = {
+      tenantId: stagedConfig.tenantId,
+      slotIdSha256,
+      writeGeneration: nextRevision,
+      sourcePresent: true,
+      ...(currentCredentialVersionId === undefined
+        ? {}
+        : { currentCredentialVersionId }),
+      updatedAtDbMs: nowMs,
+    };
+    const stagedSlot: TenantCredentialProviderSlot = {
+      ...slotBody,
+      evidenceSha256: tenantCredentialProviderSlotEvidenceSha256(slotBody),
+    };
+    validateTenantCredentialProviderSlot(stagedSlot);
+    const stagedProvider: MemoryProviderRecord = {
+      config: stagedConfig,
+      ...(finalSecret === undefined ? {} : { secret: finalSecret }),
+      credentialSlotIdSha256: slotIdSha256,
+      credentialSourceRevision: nextRevision,
+      ...(currentCredentialVersionId === undefined ? {} : { credentialVersionId: currentCredentialVersionId }),
+    };
+
+    const providersBefore = new Map(this.providers);
+    const tenantsBefore = new Map(this.tenants);
+    const subjectsBefore = new Map(this.tenantCredentialTrackingSubjects);
+    const slotsBefore = new Map(this.tenantCredentialProviderSlots);
+    const versionsBefore = new Map(this.tenantCredentialVersions);
+    const targetsBefore = new Map(this.tenantCredentialTargetDispositions);
+    try {
+      this.tenants.set(stagedConfig.tenantId, stagedTenant);
+      if (stagedSubject && !this.tenantCredentialTrackingSubjects.has(stagedConfig.tenantId)) {
+        this.tenantCredentialTrackingSubjects.set(stagedConfig.tenantId, clone(stagedSubject));
+      }
+      if (retiredVersion) {
+        this.tenantCredentialVersions.set(retiredVersion.credentialVersionId, retiredVersion);
+      }
+      if (created) {
+        this.tenantCredentialVersions.set(created.version.credentialVersionId, created.version);
+        for (const target of created.targets) {
+          this.tenantCredentialTargetDispositions.set(
+            tenantCredentialTargetKey(target.credentialVersionId, target.domain),
+            target,
+          );
+        }
+      }
+      this.tenantCredentialProviderSlots.set(slotIdSha256, stagedSlot);
+      this.providers.set(key, stagedProvider);
+    } catch (error) {
+      restoreMapSnapshot(this.providers, providersBefore);
+      restoreMapSnapshot(this.tenants, tenantsBefore);
+      restoreMapSnapshot(this.tenantCredentialTrackingSubjects, subjectsBefore);
+      restoreMapSnapshot(this.tenantCredentialProviderSlots, slotsBefore);
+      restoreMapSnapshot(this.tenantCredentialVersions, versionsBefore);
+      restoreMapSnapshot(this.tenantCredentialTargetDispositions, targetsBefore);
+      throw error;
+    }
+    return clone(stagedConfig);
   }
   async getProviderConfig(tenantId: string, providerId: string) {
     if (!this.isTenantActive(tenantId)) return null;
     const p = this.providers.get(providerConfigKey(tenantId, providerId));
-    return p ? { config: clone(p.config), secret: p.secret } : null;
+    if (!p) return null;
+    const slotIdSha256 = tenantCredentialSlotIdSha256(tenantId, "provider_binding", providerId);
+    const slot = this.tenantCredentialProviderSlots.get(slotIdSha256);
+    if (
+      !slot
+      || !slot.sourcePresent
+      || slot.tenantId !== tenantId
+      || p.credentialSlotIdSha256 !== slotIdSha256
+      || p.credentialSourceRevision !== slot.writeGeneration
+      || p.credentialVersionId !== slot.currentCredentialVersionId
+    ) throw new TenantErasureIntegrityError();
+    try {
+      validateTenantCredentialProviderSlot(slot);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    const material = providerCredentialMaterial(p.config, p.secret);
+    const materialPresent = providerCredentialMaterialPresent(material);
+    const trackingActive = this.tenantCredentialTrackingActive();
+    if (trackingActive || slot.currentCredentialVersionId !== undefined) {
+      this.assertTenantCredentialTrackingSubjectForRead(tenantId, slot.updatedAtDbMs);
+    }
+    if ((trackingActive || slot.currentCredentialVersionId !== undefined)
+      && materialPresent !== (slot.currentCredentialVersionId !== undefined)) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (slot.currentCredentialVersionId !== undefined) {
+      const version = this.tenantCredentialVersions.get(slot.currentCredentialVersionId);
+      try {
+        if (!version) throw new Error("provider credential version is missing");
+        validateTenantCredentialVersion(version);
+        if (
+          version.tenantId !== tenantId
+          || version.slotKind !== "provider_binding"
+          || version.slotIdSha256 !== slotIdSha256
+          || version.createdAtDbMs !== slot.updatedAtDbMs
+          || version.retiredAtDbMs !== undefined
+          || version.encryptedSecretPresent !== material.encryptedSecretPresent
+          || version.secretKeyIdPresent !== material.secretKeyIdPresent
+          || version.customHeadersPresent !== material.customHeadersPresent
+          || version.endpointParametersPresent !== material.endpointParametersPresent
+        ) throw new Error("provider credential version does not match its live source");
+        this.assertTenantCredentialCurrentVersionTargets(version);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    return {
+      config: clone(p.config),
+      ...(p.secret === undefined ? {} : { secret: cloneCredentialSecret(p.secret) }),
+      credentialSourceRevision: slot.writeGeneration,
+    };
   }
   async listProviderConfigs(tenantId: string) {
     if (!this.isTenantActive(tenantId)) return [];
-    return [...this.providers.values()].filter((p) => p.config.tenantId === tenantId).map((p) => clone(p.config));
+    const rows = [...this.providers.entries()].filter(([, row]) => (
+      row.config.tenantId === tenantId
+    ));
+    const reads = rows.map(([key, row]) => {
+      if (key !== providerConfigKey(tenantId, row.config.id)) {
+        throw new TenantErasureIntegrityError();
+      }
+      // Invocation performs its synchronous MemoryStore validation before yielding the promise, so
+      // every row is checked against the same event-loop turn rather than partially projecting a
+      // damaged list.
+      return this.getProviderConfig(tenantId, row.config.id);
+    });
+    const resolved = await Promise.all(reads);
+    if (resolved.some((row) => row === null)) throw new TenantErasureIntegrityError();
+    return resolved.map((row) => clone(row!.config));
   }
   async deleteProviderConfig(tenantId: string, providerId: string) {
     this.assertTenantWritable(tenantId);
-    return this.providers.delete(providerConfigKey(tenantId, providerId));
+    const key = providerConfigKey(tenantId, providerId);
+    const current = this.providers.get(key);
+    if (!current) return false;
+    const observedNowMs = this.storeNowMs();
+    const slotIdSha256 = tenantCredentialSlotIdSha256(tenantId, "provider_binding", providerId);
+    const slot = this.tenantCredentialProviderSlots.get(slotIdSha256);
+    if (
+      !slot
+      || !slot.sourcePresent
+      || slot.tenantId !== tenantId
+      || current.credentialSlotIdSha256 !== slotIdSha256
+      || current.credentialSourceRevision !== slot.writeGeneration
+      || current.credentialVersionId !== slot.currentCredentialVersionId
+    ) throw new TenantErasureIntegrityError();
+    try {
+      validateTenantCredentialProviderSlot(slot);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    const trackingActive = this.tenantCredentialTrackingActive();
+    const nowMs = trackingActive
+      ? this.tenantCredentialMutationAtMs(tenantId, observedNowMs, slot.updatedAtDbMs)
+      : observedNowMs;
+    const materialPresent = providerCredentialMaterialPresent(
+      providerCredentialMaterial(current.config, current.secret),
+    );
+    if (materialPresent !== (slot.currentCredentialVersionId !== undefined)) {
+      if (this.tenantCredentialTrackingActive()) throw new TenantErasureIntegrityError();
+      if (slot.currentCredentialVersionId !== undefined) throw new TenantErasureIntegrityError();
+    }
+    if (trackingActive && !this.tenantCredentialTrackingSubjects.has(tenantId)) {
+      throw new TenantErasureIntegrityError();
+    }
+    const retired = trackingActive && slot.currentCredentialVersionId !== undefined
+      ? this.retiredTenantCredentialVersion(
+          slot.currentCredentialVersionId,
+          tenantId,
+          "provider_binding",
+          slotIdSha256,
+          nowMs,
+          "deleted",
+        )
+      : undefined;
+    const nextRevision = this.nextCredentialSourceRevision(slot.writeGeneration);
+    const slotBody = {
+      tenantId,
+      slotIdSha256,
+      writeGeneration: nextRevision,
+      sourcePresent: false,
+      updatedAtDbMs: nowMs,
+    };
+    const nextSlot: TenantCredentialProviderSlot = {
+      ...slotBody,
+      evidenceSha256: tenantCredentialProviderSlotEvidenceSha256(slotBody),
+    };
+    validateTenantCredentialProviderSlot(nextSlot);
+    const providersBefore = new Map(this.providers);
+    const slotsBefore = new Map(this.tenantCredentialProviderSlots);
+    const versionsBefore = new Map(this.tenantCredentialVersions);
+    try {
+      this.providers.delete(key);
+      if (retired) this.tenantCredentialVersions.set(retired.credentialVersionId, retired);
+      this.tenantCredentialProviderSlots.set(slotIdSha256, nextSlot);
+    } catch (error) {
+      restoreMapSnapshot(this.providers, providersBefore);
+      restoreMapSnapshot(this.tenantCredentialProviderSlots, slotsBefore);
+      restoreMapSnapshot(this.tenantCredentialVersions, versionsBefore);
+      throw error;
+    }
+    return true;
   }
 
   async resolveApiKey(hashedKey: string) {
@@ -15602,16 +17107,31 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     // Match MySQL INSERT IGNORE semantics: a digest is permanently owned by its first row and
     // must never be transferred across tenants by a colliding/replayed bootstrap write.
     if (this.apiKeys.has(hashedKey)) return;
-    const now = Date.now();
+    const observedNowMs = this.storeNowMs();
+    const now = this.tenantCredentialTrackingActive()
+      ? this.tenantCredentialMutationAtMs(tenantId, observedNowMs)
+      : observedNowMs;
     const tenantExisted = this.tenants.has(tenantId);
     const priorTenant = this.tenants.get(tenantId);
+    const stagedSubject = this.trackingSubjectForCredentialWrite(
+      tenantId,
+      now,
+      this.tenantKnownToCredentialStore(tenantId),
+    );
+    const subjectExisted = this.tenantCredentialTrackingSubjects.has(tenantId);
+    const priorSubject = this.tenantCredentialTrackingSubjects.get(tenantId);
     try {
       if (!tenantExisted) {
         this.tenants.set(tenantId, {
           tenantId,
           authPolicy: DEFAULT_AUTH_POLICY,
+          authCredentialSourceRevision: 0,
+          authCredentialUpdatedAtMs: now,
           createdAtMs: now,
         });
+      }
+      if (stagedSubject && !subjectExisted) {
+        this.tenantCredentialTrackingSubjects.set(tenantId, stagedSubject);
       }
       this.apiKeys.set(hashedKey, {
         tenantId,
@@ -15621,6 +17141,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       });
     } catch (error) {
       restoreMapEntry(this.tenants, tenantId, tenantExisted, priorTenant);
+      restoreMapEntry(
+        this.tenantCredentialTrackingSubjects,
+        tenantId,
+        subjectExisted,
+        priorSubject,
+      );
       Map.prototype.delete.call(this.apiKeys, hashedKey);
       throw error;
     }
@@ -15647,26 +17173,186 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const t = this.tenants.get(tenantId);
     if (!t) return null;
     if (t.authPolicy === undefined) throw new Error("active tenant auth policy is missing");
+    const trackingActive = this.tenantCredentialTrackingActive();
+    if (trackingActive || t.authCredentialVersionId !== undefined) {
+      let authSlot: TenantCredentialAuthSlot;
+      try {
+        authSlot = this.tenantCredentialAuthSlotFromRecord(t);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      this.assertTenantCredentialTrackingSubjectForRead(
+        tenantId,
+        authSlot.currentCredentialVersionId === undefined
+          ? undefined
+          : authSlot.updatedAtDbMs,
+      );
+      if (authSlot.currentCredentialVersionId !== undefined) {
+        const version = this.tenantCredentialVersions.get(
+          authSlot.currentCredentialVersionId,
+        );
+        try {
+          if (!version) throw new Error("tenant auth credential version is missing");
+          validateTenantCredentialVersion(version);
+          if (
+            version.tenantId !== tenantId
+            || version.slotKind !== "tenant_auth_secret"
+            || version.slotIdSha256 !== tenantCredentialSlotIdSha256(
+              tenantId,
+              "tenant_auth_secret",
+              "tenant_auth_secret",
+            )
+            || version.createdAtDbMs !== authSlot.updatedAtDbMs
+            || version.retiredAtDbMs !== undefined
+            || !version.encryptedSecretPresent
+            || !version.secretKeyIdPresent
+            || version.customHeadersPresent
+            || version.endpointParametersPresent
+          ) throw new Error("tenant auth credential version does not match its live source");
+          this.assertTenantCredentialCurrentVersionTargets(version);
+        } catch {
+          throw new TenantErasureIntegrityError();
+        }
+      }
+    }
     const record: TenantRecord = {
       tenantId: t.tenantId,
       ...(t.name === undefined ? {} : { name: t.name }),
       authPolicy: clone(t.authPolicy),
-      ...(t.authSecret === undefined ? {} : { authSecret: t.authSecret }),
+      ...(t.authSecret === undefined ? {} : {
+        authSecret: cloneCredentialSecret(t.authSecret),
+      }),
+      authCredentialSourceRevision: t.authCredentialSourceRevision ?? 0,
       createdAtMs: t.createdAtMs,
     };
     return record;
   }
-  async setTenantAuth(tenantId: string, policy: TenantAuthPolicy, secret?: { ciphertext: Buffer; keyId: string } | null) {
+  async setTenantAuth(
+    tenantId: string,
+    policy: TenantAuthPolicy,
+    secret?: { ciphertext: Buffer; keyId: string } | null,
+    expectedSourceRevision?: number | null,
+  ): Promise<TenantRecord> {
     const stagedPolicy = clone(policy);
+    const stagedSecret = secret === undefined || secret === null
+      ? secret
+      : cloneCredentialSecret(secret);
     this.assertTenantWritable(tenantId);
+    const observedNowMs = this.storeNowMs();
+    const tenantKnownBefore = this.tenantKnownToCredentialStore(tenantId);
     const prev = this.tenants.get(tenantId);
-    this.tenants.set(tenantId, {
+    const actualRevision = prev === undefined
+      ? null
+      : (prev.authCredentialSourceRevision ?? 0);
+    this.assertCredentialSourceRevision(
+      "tenant_auth",
+      expectedSourceRevision,
+      actualRevision,
+    );
+    const nextRevision = this.nextCredentialSourceRevision(actualRevision ?? 0);
+    const finalSecret = stagedSecret === undefined
+      ? (prev?.authSecret === undefined ? undefined : cloneCredentialSecret(prev.authSecret))
+      : (stagedSecret === null ? undefined : stagedSecret);
+    const trackingActive = this.tenantCredentialTrackingActive();
+    const nowMs = trackingActive
+      ? this.tenantCredentialMutationAtMs(
+          tenantId,
+          observedNowMs,
+          prev?.authCredentialUpdatedAtMs,
+        )
+      : observedNowMs;
+    const stagedSubject = this.trackingSubjectForCredentialWrite(
       tenantId,
-      name: prev?.name,
+      nowMs,
+      tenantKnownBefore,
+    );
+    if (trackingActive && prev) {
+      if ((prev.authSecret !== undefined) !== (prev.authCredentialVersionId !== undefined)) {
+        throw new TenantErasureIntegrityError();
+      }
+    } else if (!trackingActive && prev?.authCredentialVersionId !== undefined) {
+      throw new TenantErasureIntegrityError();
+    }
+
+    let retiredVersion: TenantCredentialVersion | undefined;
+    let created: ReturnType<MemorySessionStore["createTenantCredentialVersion"]> | undefined;
+    let authCredentialVersionId: string | undefined;
+    if (trackingActive) {
+      if (prev?.authCredentialVersionId !== undefined) {
+        retiredVersion = this.retiredTenantCredentialVersion(
+          prev.authCredentialVersionId,
+          tenantId,
+          "tenant_auth_secret",
+          tenantCredentialSlotIdSha256(tenantId, "tenant_auth_secret", "tenant_auth_secret"),
+          nowMs,
+          finalSecret === undefined ? "cleared" : "replaced",
+        );
+      }
+      if (finalSecret !== undefined) {
+        created = this.createTenantCredentialVersion({
+          tenantId,
+          slotKind: "tenant_auth_secret",
+          slotId: "tenant_auth_secret",
+          origin: "managed_v1",
+          encryptedSecretPresent: true,
+          secretKeyIdPresent: true,
+          customHeadersPresent: false,
+          endpointParametersPresent: false,
+          createdAtDbMs: nowMs,
+        });
+        authCredentialVersionId = created.version.credentialVersionId;
+      }
+    }
+    const stagedTenant: MemoryTenantRecord = {
+      tenantId,
+      ...(prev?.name === undefined ? {} : { name: prev.name }),
       authPolicy: stagedPolicy,
-      authSecret: secret === null ? undefined : (secret ?? prev?.authSecret),
-      createdAtMs: prev?.createdAtMs ?? Date.now(),
-    });
+      ...(finalSecret === undefined ? {} : {
+        authSecret: cloneCredentialSecret(finalSecret),
+      }),
+      authCredentialSourceRevision: nextRevision,
+      ...(authCredentialVersionId === undefined ? {} : { authCredentialVersionId }),
+      authCredentialUpdatedAtMs: nowMs,
+      createdAtMs: prev?.createdAtMs ?? nowMs,
+    };
+    const tenantsBefore = new Map(this.tenants);
+    const subjectsBefore = new Map(this.tenantCredentialTrackingSubjects);
+    const versionsBefore = new Map(this.tenantCredentialVersions);
+    const targetsBefore = new Map(this.tenantCredentialTargetDispositions);
+    try {
+      if (stagedSubject && !this.tenantCredentialTrackingSubjects.has(tenantId)) {
+        this.tenantCredentialTrackingSubjects.set(tenantId, clone(stagedSubject));
+      }
+      if (retiredVersion) {
+        this.tenantCredentialVersions.set(retiredVersion.credentialVersionId, retiredVersion);
+      }
+      if (created) {
+        this.tenantCredentialVersions.set(created.version.credentialVersionId, created.version);
+        for (const target of created.targets) {
+          this.tenantCredentialTargetDispositions.set(
+            tenantCredentialTargetKey(target.credentialVersionId, target.domain),
+            target,
+          );
+        }
+      }
+      this.tenants.set(tenantId, stagedTenant);
+    } catch (error) {
+      restoreMapSnapshot(this.tenants, tenantsBefore);
+      restoreMapSnapshot(this.tenantCredentialTrackingSubjects, subjectsBefore);
+      restoreMapSnapshot(this.tenantCredentialVersions, versionsBefore);
+      restoreMapSnapshot(this.tenantCredentialTargetDispositions, targetsBefore);
+      throw error;
+    }
+    return {
+      tenantId,
+      ...(stagedTenant.name === undefined ? {} : { name: stagedTenant.name }),
+      authPolicy: clone(stagedPolicy),
+      ...(finalSecret === undefined ? {} : {
+        authSecret: cloneCredentialSecret(finalSecret),
+      }),
+      authCredentialSourceRevision: nextRevision,
+      createdAtMs: stagedTenant.createdAtMs,
+    };
   }
 
   usageLedger: UsageLedgerEntry[] = [];

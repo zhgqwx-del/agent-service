@@ -359,7 +359,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       try {
         await store.createSession(targetSession);
         await store.createAgent(targetAgent);
-        await store.upsertProviderConfig(provider(tenantId), {
+        await store.upsertProviderConfig({
+          ...provider(tenantId),
+          apiKeyRef: "local-provider-v1",
+        }, {
           ciphertext: Buffer.from([1, 2, 3, 4]),
           keyId: "local-provider-v1",
         });
@@ -402,7 +405,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
 
         await store.createSession(neighborSession);
         await store.createAgent(neighborAgent);
-        await store.upsertProviderConfig(provider(neighborId), {
+        await store.upsertProviderConfig({
+          ...provider(neighborId),
+          apiKeyRef: "neighbor-provider-v1",
+        }, {
           ciphertext: Buffer.from([9, 10, 11, 12]),
           keyId: "neighbor-provider-v1",
         });
@@ -1210,7 +1216,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const input = tenantRequestInput(tenantId, "rollback-key");
       try {
         await store.createApiKey(tenantId, "rollback-key", apiKeyHash, ["runtime"]);
-        await store.upsertProviderConfig(provider(tenantId), {
+        await store.upsertProviderConfig({
+          ...provider(tenantId),
+          apiKeyRef: "rollback-provider-v1",
+        }, {
           ciphertext: Buffer.from([21, 22, 23, 24]),
           keyId: "rollback-provider-v1",
         });

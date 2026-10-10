@@ -1132,6 +1132,10 @@ export type components = {
                 /** @enum {boolean} */
                 readonly streaming: true;
                 /** @default [] */
+                readonly tenantCredentialLifecycle?: readonly "versioned-target-ledger-v1"[];
+                /** @default false */
+                readonly tenantCredentialLifecycleTrackingActive?: boolean;
+                /** @default [] */
                 readonly tenantCredentialRevocation?: readonly "credential-store-v1"[];
                 /** @default false */
                 readonly tenantCredentialRevocationWorker?: boolean;

@@ -171,13 +171,19 @@ const ordinaryRaces: OrdinaryRaceCase[] = [
   {
     name: "provider secret upsert",
     async prepare(store, tenantId) {
-      await store.upsertProviderConfig(provider(tenantId, "before", NOW), {
+      await store.upsertProviderConfig({
+        ...provider(tenantId, "before", NOW),
+        apiKeyRef: "provider-before-key",
+      }, {
         ciphertext: Buffer.from("provider-before"),
         keyId: "provider-before-key",
       });
       return {};
     },
-    write: (store, tenantId) => store.upsertProviderConfig(provider(tenantId, "after", NOW + 1), {
+    write: (store, tenantId) => store.upsertProviderConfig({
+      ...provider(tenantId, "after", NOW + 1),
+      apiKeyRef: "provider-after-key",
+    }, {
       ciphertext: Buffer.from("provider-after"),
       keyId: "provider-after-key",
     }),
@@ -206,7 +212,10 @@ const ordinaryRaces: OrdinaryRaceCase[] = [
       expect(await store.getProviderConfig(tenantId, "race-provider")).toBeNull();
     },
     postGateWrite: (store, tenantId) => store.upsertProviderConfig(
-      provider(tenantId, "too-late", NOW + 2),
+      {
+        ...provider(tenantId, "too-late", NOW + 2),
+        apiKeyRef: "provider-too-late-key",
+      },
       { ciphertext: Buffer.from("provider-too-late"), keyId: "provider-too-late-key" },
     ),
     rejectedWith: "subject",
@@ -318,7 +327,10 @@ const ordinaryRaces: OrdinaryRaceCase[] = [
   {
     name: "provider delete",
     async prepare(store, tenantId) {
-      await store.upsertProviderConfig(provider(tenantId, "delete-me", NOW), {
+      await store.upsertProviderConfig({
+        ...provider(tenantId, "delete-me", NOW),
+        apiKeyRef: "provider-delete-before-key",
+      }, {
         ciphertext: Buffer.from("provider-delete-before"),
         keyId: "provider-delete-before-key",
       });

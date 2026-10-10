@@ -5,7 +5,7 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2、T3a、T3b、非破坏性 T3c/T3d、T3e 本地执行/物理 ACK、T3f 本地数据库内容/控制投影清理与 T3g session-scoped Redis状态清理均已进入本地/CI基线。`0022`固定33域plan；`0023`闭合local usage/Blob/export切片；`0024`原子清理11个本地数据库投影并留下永久session grave；`0025`再从不可变T3f/T3d证据建立精确session target/ACK，以真实Redis Lua原子删除lease（含owner目录）、fence与stream并写永久purge marker，runtime写路径在marker后拒绝复活。runner监听前只重放同一MySQL中已有durable target ACK的marker；worker轮询未ACK target时会先执行existing-marker-only同slot原子replay，exact marker存在才按原bits再次删除复活的三域并补ACK/seal，marker缺失则不创建或删除。T3g仍内嵌runner，不新增服务、进程或镜像。terminal只表示`redisPurgeComplete=true`，继续固定`allDomainsComplete=false`、`contentPurgeExecuted=false`。external provider/KMS、backup与独立故障域restore ledger、logs/traces、共享对象存储生产适配、全域completion及generic user物理purge仍未闭环。公开status保持`gated`、`dataPurgeExecution=false`，因此M1仍未冻结。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2、T3a、T3b、非破坏性 T3c/T3d、T3e 本地执行/物理 ACK、T3f 本地数据库内容/控制投影清理与 T3g session-scoped Redis状态清理均已进入本地/CI基线。`0022`固定33域plan；`0023`闭合local usage/Blob/export切片；`0024`原子清理11个本地数据库投影并留下永久session grave；`0025`以真实Redis Lua清理lease/owner、fence与stream并安装防复活marker；`0026`再为每个tenant、永久provider slot与tenant-auth CAS投影、不可变credential version及`external_credential`/`kms_key`两类target disposition建立默认休眠的版本化生命周期账本，并让T3a原子发布不含密钥、配置、header、URL或locator的inventory sidecar。legacy tenant明确记录`legacy_history_unknown`，新tenant在cutover后从创建起完整跟踪；provider/auth热读、写入CAS、删除重建ABA、T3a snapshot与terminal replay都会重验source、slot、version、时间和target集合。当前adapter没有可安全执行的远端locator或独立KMS key：有对应material、需要处置的target只会写`blocked_no_locator`、`blocked_shared_local_key`或`blocked_legacy_history`，无对应material则写`not_applicable`，从不伪造`executable_ref`。T3g及0026都不新增服务、进程或镜像。terminal继续固定`allDomainsComplete=false`、`contentPurgeExecuted=false`；external provider/KMS实际处置、backup与独立故障域restore ledger、logs/traces、共享对象存储生产适配、全域completion及generic user物理purge仍未闭环。公开status保持`gated`、`dataPurgeExecution=false`，因此M1仍未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
 - **M4 生产化**（配额、可观测性、限流）：核心范围尚未开始；Docker、CI 和本地运维脚本等交付地基已经具备。
@@ -42,12 +42,13 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0024 → 0025 的真实 MySQL 历史升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0025 → 0026 的真实 MySQL 历史升级夹具
 pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
 pnpm test:usage-lifecycle-mysql               # 强制执行 usage 双写/核对/匿名化真实 MySQL 专项套件
 pnpm test:subject-lifecycle-mysql             # 强制执行 subject gate/回滚/并发真实 MySQL 专项套件
 pnpm test:tenant-credential-revocation-mysql  # 强制执行 tenant 原子 fence、status proof、回滚、隔离和写入 race 真实 MySQL 套件
 pnpm test:tenant-credential-physical-revocation-mysql # 强制执行 T3a 物理凭据清除、全局proof、事务回滚、DB时钟/claim与隔离套件
+pnpm test:tenant-credential-lifecycle-mysql  # 强制执行 0026 tracking cutover、版本/target账本、T3a inventory、并发与回滚套件
 pnpm test:tenant-runtime-revocation-mysql     # 强制执行 T3b configured-fleet runtime receipt、并发/租约、回滚与隔离套件
 pnpm test:tenant-content-inventory-mysql      # 强制执行 T3c DB-clock owner inventory、hold、并发/回滚与隔离套件
 pnpm test:tenant-purge-plan-mysql             # 强制执行 T3d 固定33域计划、blocker、并发/回滚与隔离套件
@@ -110,6 +111,8 @@ user erasure request 也是 additive、默认关闭的 capability。只有 runne
 tenant erasure 与上述 user API 是两条不同边界。T1 的 Memory/MySQL 原子边界与 append-only fence 保持不变；T2 在 router 新增 `POST /v1/tenant-erasure-requests` 和 owner-hiding status GET，并以独立 `PlatformOperatorToken` 和窄化 SDK client 鉴权，绝不接受 tenant service key。platform token 只注入 router；runner 若在进程环境发现该 token/actor 配置会拒绝启动。router 会剥离所有客户端伪造的内部 header，再用 `INTERNAL_ROUTER_TOKEN` 和固定 operator id 改写到 runner-only 路径。只有新的 admission/create path 才要求 router gate、全部 configured stable runner 的 code-aware/local gate，以及 runner 提交前的 fresh barrier；关闭 admission 后，精确匹配已提交 tenant/key/body 的 POST 只走独立 read-only replay 路径并返回同一 `202`，未知或不同 key 返回 `503`且绝不创建，status仍可读。首次 gate 不可撤销，旧 runtime 必须先完全排空，只能 forward-fix。
 
 T3a 的 credential-store worker 内嵌于 runner，不新增服务、进程或镜像。它由 `TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED`（runner）与 `TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED`（router）两道默认关闭的 gate 控制；每次 materialize/claim 和紧邻不可逆事务前都要求独立、token-protected 的 fresh all-configured fleet ACK。新 admission 与 `0019` job 同事务创建；升级前已提交的 `0018` admission 只由显式、proof-checked materializer 补 job，migration 本身不回填、不删除。成功事务只删除本地数据库 API-key/provider 行并清空 tenant auth 三列，同时写不可变聚合 receipt、完成 job 并激活 write-once cutover；它不接触 tenant registry 或 tenant content。
+
+`0026`在这条既有T3a边界前补齐credential生命周期来源证明。migration只安装inactive cutover、coverage、永久provider slot、`tenants`行上的tenant-auth CAS投影、immutable version/target及inventory receipt sidecar，不扫描credential value、不激活tracking，也不执行T3a。安全升级固定为：先应用`0026`；以`CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=0`部署全部理解新账本的router/runner并完全排空旧writer；核对全部configured runner声明`versioned-target-ledger-v1`；再显式启用runner tracking完成一次性、forward-only cutover，确认全fleet都观察到active；随后开启router的tracking gate，最后才允许router放行T3a execution。首次cutover后不能回退pre-0026 writer。当前远端provider/KMS adapter仍是阻断性证据而非执行器，所以该账本修复了“将来应撤销什么”的可证明性，但尚未完成真正的external/KMS revoke。
 
 T3b 的 runtime-revocation worker同样内嵌于runner，不新增服务、进程或镜像。`TENANT_RUNTIME_DRAIN_ENABLED`控制每个runner的私有本地drain端点，`TENANT_RUNTIME_REVOCATION_WORKER_ENABLED`控制已有T3a完成记录的异步处理，`TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED`控制router对精确configured fleet的fan-out，三者均默认关闭。`RUNNERS`必须是每个实例的稳定直连origin，不能是负载均衡别名；启用端点还要求显式、稳定的`RUNNER_ID`。安全升级顺序是先应用`0020`，再发布execution=`0`的新router并排空旧router，滚动所有endpoint/worker=`0`的新runner，逐实例启用endpoint并核对稳定runner/boot identity，再启worker，最后才启router execution。部分fan-out可能已经fence若干runner后整体返回`503`，此时不得回滚旧binary，只能修复配置并精确重试。
 

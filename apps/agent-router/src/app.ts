@@ -51,6 +51,7 @@ import {
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
@@ -105,6 +106,8 @@ export interface RouterAppDeps {
   purgePolicyEvaluatorEnabled?: () => boolean;
   /** Independent activation gate for tenant credential-store revocation queue claims. */
   tenantCredentialRevocationExecutionEnabled?: () => boolean;
+  /** Independent deployment acknowledgement for the durable credential tracking cutover. */
+  credentialLifecycleTrackingEnabled?: () => boolean;
   /** Independent activation gate for local T3e execution/physical-ACK queue claims. */
   tenantPurgeExecutionEnabled?: () => boolean;
   /** Independent activation gate for T3f local database-content deletion queue claims. */
@@ -299,6 +302,7 @@ export function createRouterApp(deps: RouterAppDeps) {
   const tenantCredentialRevocationExecutionAvailable = () => (
     !!deps.internalRunnerToken
     && (deps.tenantCredentialRevocationExecutionEnabled?.() ?? false)
+    && (deps.credentialLifecycleTrackingEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportTenantCredentialRevocationWorker()
   );
   const tenantPurgeExecutionAvailable = () => (
@@ -536,6 +540,12 @@ export function createRouterApp(deps: RouterAppDeps) {
                     : [],
                 tenantCredentialRevocationWorker:
                   tenantCredentialRevocationExecutionAvailable(),
+                tenantCredentialLifecycle:
+                  deps.registry.allConfiguredSupportTenantCredentialLifecycle()
+                    ? [TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1]
+                    : [],
+                tenantCredentialLifecycleTrackingActive:
+                  deps.registry.allConfiguredTenantCredentialLifecycleTrackingActive(),
                 tenantPurgeExecution:
                   [
                     ...(deps.registry.allConfiguredSupportTenantPurgeExecution()

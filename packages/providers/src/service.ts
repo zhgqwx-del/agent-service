@@ -1,7 +1,11 @@
 import { createModels, createProvider, type Model, type MutableModels } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { ApiError, ProviderConfig, type ModelSpec, type Principal, type ProviderConfigInput } from "@agent-service/protocol";
-import { SubjectDeletingError, type SessionStore } from "@agent-service/store";
+import {
+  CredentialSourceConflictError,
+  SubjectDeletingError,
+  type SessionStore,
+} from "@agent-service/store";
 import {
   assertPublicHost,
   type ProviderResolver,
@@ -138,23 +142,57 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
       await this.assertBaseUrl(input.baseUrl);
       runtimeLease?.assertOpen();
       await this.assertTenantGeneration(tenantId, generation);
-      const existing = await this.opts.store.getProviderConfig(tenantId, input.id);
-      runtimeLease?.assertOpen();
-      const now = Date.now();
       const { apiKey, ...rest } = input;
-      const hasSecret = Boolean(apiKey || existing?.secret || existing?.config.apiKeyRef);
-      const config = ProviderConfig.parse({
-        ...rest,
-        tenantId,
-        apiKeyRef: hasSecret ? providerSecretRef(tenantId, input.id) : undefined,
-        createdAtMs: existing?.config.createdAtMs ?? now,
-        updatedAtMs: now,
-      });
       const secret = apiKey ? { ciphertext: await this.opts.cipher.encrypt(apiKey), keyId: this.opts.cipher.keyId } : undefined;
+      // A deleted provider has no live row to return from getProviderConfig, but its permanent slot
+      // retains a monotonic revision. The first null CAS reveals that tombstone revision; retain it
+      // only while the source remains absent so delete/recreate cannot collapse back to null (ABA).
+      let absentSourceRevision: number | null = null;
+      for (;;) {
+        runtimeLease?.assertOpen();
+        await this.assertTenantGeneration(tenantId, generation);
+        const existing = await this.opts.store.getProviderConfig(tenantId, input.id);
+        runtimeLease?.assertOpen();
+        // updatedAtMs is also the runner-local pi registration cache key, so keep it monotonic
+        // even when two accepted writes land in the same wall-clock millisecond.
+        const now = Math.max(Date.now(), (existing?.config.updatedAtMs ?? -1) + 1);
+        const hasSecret = Boolean(apiKey || existing?.secret || existing?.config.apiKeyRef);
+        const config = ProviderConfig.parse({
+          ...rest,
+          tenantId,
+          apiKeyRef: hasSecret ? providerSecretRef(tenantId, input.id) : undefined,
+          createdAtMs: existing?.config.createdAtMs ?? now,
+          updatedAtMs: now,
+        });
+        try {
+          const stored = await this.opts.store.upsertProviderConfig(
+            config,
+            secret,
+            existing?.credentialSourceRevision ?? absentSourceRevision,
+          );
+          runtimeLease?.assertOpen();
+          return stored;
+        } catch (error) {
+          if (
+            !(error instanceof CredentialSourceConflictError)
+            || error.sourceKind !== "provider"
+          ) throw error;
+          absentSourceRevision = error.actualSourceRevision;
+          // A concurrent update/delete/recreate won. Re-read the live source; if it is absent,
+          // retry against the conflict's permanent-slot revision rather than collapsing to null.
+        }
+      }
+    });
+  }
+
+  async deleteTenantProvider(tenantId: string, providerId: string): Promise<boolean> {
+    return this.withTenantOperation(tenantId, async (runtimeLease) => {
+      const generation = await this.requireActiveTenant(tenantId);
       runtimeLease?.assertOpen();
-      await this.opts.store.upsertProviderConfig(config, secret);
+      const deleted = await this.opts.store.deleteProviderConfig(tenantId, providerId);
       runtimeLease?.assertOpen();
-      return config;
+      await this.assertTenantGeneration(tenantId, generation);
+      return deleted;
     });
   }
 

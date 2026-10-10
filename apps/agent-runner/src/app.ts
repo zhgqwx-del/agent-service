@@ -59,6 +59,7 @@ import {
   RetentionPolicyParams,
   RetentionPolicyPutRequest,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+  TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -97,6 +98,7 @@ import type { SessionHost, TenantRuntimeCoordinator, ToolRegistry } from "@agent
 import { ErasureLocalTurnFencedError, newId } from "@agent-service/core";
 import {
   BLOB_STORAGE_FORMAT,
+  CredentialSourceConflictError,
   ErasureIdempotencyMismatchError,
   LegalHoldConflictError,
   LegalHoldGenerationConflictError,
@@ -168,6 +170,8 @@ export interface AppDeps {
   tenantErasureAdmissionGate?: { canAdmit: () => Promise<boolean> };
   /** Local credential-revocation worker activation; the router barrier remains separately required. */
   tenantCredentialRevocationWorkerEnabled?: boolean;
+  /** Durable write-once tracking state; code awareness is advertised independently. */
+  tenantCredentialLifecycleTrackingActive?: () => boolean | Promise<boolean>;
   /** Local T3e worker activation; code awareness remains separately advertised during rollout. */
   tenantPurgeExecutionWorkerEnabled?: boolean;
   /** Local T3f database-content worker activation; its router barrier remains independent. */
@@ -280,7 +284,7 @@ export function createApp(deps: AppDeps) {
   app.get("/healthz", (c) => c.text("ok"));
   app.get("/readyz", (c) => (deps.ready() ? c.text("ready") : c.text("not ready", 503)));
   app.get("/openapi.json", (c) => c.json(OPENAPI_DOCUMENT));
-  app.get("/v1/capabilities", (c) =>
+  app.get("/v1/capabilities", async (c) =>
     c.json({
       protocolVersion: PROTOCOL_VERSION,
       service: "agent-runner",
@@ -331,6 +335,11 @@ export function createApp(deps: AppDeps) {
         tenantCredentialRevocationWorker:
           deps.tenantCredentialRevocation !== undefined
           && deps.tenantCredentialRevocationWorkerEnabled === true,
+        tenantCredentialLifecycle: [
+          TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
+        ],
+        tenantCredentialLifecycleTrackingActive:
+          await deps.tenantCredentialLifecycleTrackingActive?.() === true,
         // Code awareness and activation are deliberately separate rolling-upgrade signals.
         tenantPurgeExecution: [
           TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
@@ -756,7 +765,7 @@ export function createApp(deps: AppDeps) {
   v1.delete("/providers/:id", async (c) => {
     requireAdmin(c);
     const { id } = await parse(ProviderIdParams, { id: c.req.param("id") });
-    const ok = await deps.store.deleteProviderConfig(c.get("tenantId"), id);
+    const ok = await deps.providers.deleteTenantProvider(c.get("tenantId"), id);
     if (!ok) throw new ApiError("not_found", "provider not found");
     return c.body(null, 204);
   });
@@ -802,13 +811,37 @@ export function createApp(deps: AppDeps) {
   v1.put("/tenant/auth", async (c) => {
     requireAdmin(c);
     const input = await parse(TenantAuthPolicyInput, await json(c));
-    const existing = await deps.store.getTenant(c.get("tenantId"));
-    const storedKind = existing?.authPolicy.mode === "end_user_token" ? existing.authPolicy.verifier.kind : undefined;
-    await validateAuthPolicy(input, !!existing?.authSecret, deps.assertPublicUrl, storedKind);
-    const secret = input.secret ? await deps.encryptSecret(input.secret) : needsSecret(input.policy) ? undefined : null;
-    await deps.store.setTenantAuth(c.get("tenantId"), input.policy, secret);
-    policyCache.invalidate(c.get("tenantId")); // effective immediately here; other runners within the TTL
-    return c.json({ tenantId: c.get("tenantId"), policy: input.policy, hasSecret: !!(secret || (await deps.store.getTenant(c.get("tenantId")))?.authSecret) });
+    const tenantId = c.get("tenantId");
+    let encryptedSecret: Awaited<ReturnType<AppDeps["encryptSecret"]>> | undefined;
+    for (;;) {
+      const existing = await deps.store.getTenant(tenantId);
+      const storedKind = existing?.authPolicy.mode === "end_user_token"
+        ? existing.authPolicy.verifier.kind
+        : undefined;
+      await validateAuthPolicy(input, !!existing?.authSecret, deps.assertPublicUrl, storedKind);
+      if (input.secret && !encryptedSecret) encryptedSecret = await deps.encryptSecret(input.secret);
+      const secret = input.secret
+        ? encryptedSecret
+        : needsSecret(input.policy)
+          ? undefined
+          : null;
+      try {
+        const stored = await deps.store.setTenantAuth(
+          tenantId,
+          input.policy,
+          secret,
+          existing?.authCredentialSourceRevision ?? null,
+        );
+        policyCache.invalidate(tenantId); // effective immediately here; other runners within the TTL
+        return c.json({ tenantId, policy: input.policy, hasSecret: !!stored.authSecret });
+      } catch (error) {
+        if (
+          !(error instanceof CredentialSourceConflictError)
+          || error.sourceKind !== "tenant_auth"
+        ) throw error;
+        // Re-validate against the new policy/secret kind before retrying the store-managed CAS.
+      }
+    }
   });
 
   // ---------- sessions ----------

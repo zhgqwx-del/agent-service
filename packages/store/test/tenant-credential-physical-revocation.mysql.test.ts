@@ -133,7 +133,10 @@ async function seedCredentialBearingTenant(
   await store.createApiKey(tenantId, `revoked-${label}`, revokedKeyHash, ["runtime"]);
   expect(await store.revokeApiKey(tenantId, `revoked-${label}`)).toBe(true);
   await store.upsertProviderConfig(
-    provider(tenantId, providerId, providerHeaderValue),
+    {
+      ...provider(tenantId, providerId, providerHeaderValue),
+      apiKeyRef: providerKeyId,
+    },
     { ciphertext: providerCipher, keyId: providerKeyId },
   );
 

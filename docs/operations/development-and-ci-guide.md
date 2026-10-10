@@ -4,7 +4,7 @@
 
 里程碑完成度以 `docs/PROGRESS.md` 顶部快照和最后一节为准；本文只描述操作方式和交付产物，不替代进度记录。
 
-先明确“本地完成”和“整个架构实现”的区别：本地能够完整启动、通过测试并不等于 M1～M4 已全部完成，更不等于生产环境已经验收。当前 M0 已完成，M2 的本地/CI 代码范围已冻结；M1 的核心运行范围、OpenAPI 和生成 SDK 已完成，数据生命周期已推进至T3g session-scoped Redis状态清理，但全域completion仍在继续闭环；M3 的 MCP/skills/hooks 主体以及 M4 的生产化主体尚未完成。仓库已经有 Docker、CI、本地运维、滚动升级门禁等 M4 地基，但这些地基不能替代真实 staging/production 验证。
+先明确“本地完成”和“整个架构实现”的区别：本地能够完整启动、通过测试并不等于 M1～M4 已全部完成，更不等于生产环境已经验收。当前 M0 已完成，M2 的本地/CI 代码范围已冻结；M1 的核心运行范围、OpenAPI 和生成 SDK 已完成，数据生命周期已推进至T3g session-scoped Redis状态清理及`0026` versioned credential lifecycle inventory，但external/KMS实际处置、共享对象存储与全域completion仍在继续闭环；M3 的 MCP/skills/hooks 主体以及 M4 的生产化主体尚未完成。仓库已经有 Docker、CI、本地运维、滚动升级门禁等 M4 地基，但这些地基不能替代真实 staging/production 验证。
 
 没有云资源时仍可以继续实现并验证：业务与协议代码、Memory/MySQL/Redis 语义、迁移、故障注入、进程和 OCI 镜像、local/CI 自动化、部署契约，以及能够用本地替身证明的安全边界。以下工作不能被本地测试冒充为“已完成”：云数据库和云 Redis 的权限/故障行为、共享对象存储与 IAM/KMS、域名/TLS、Secret 注入、Kubernetes 或 VM 网络拓扑、真实滚动升级、告警链路、备份恢复与容量压测。它们需要后续真实资源，届时应把环境参数补进部署层，而不是现在编造参数。
 
@@ -21,14 +21,14 @@
 | --- | --- | --- | --- |
 | `agent-router` | `http://127.0.0.1:8080` | 是 | 对外入口、runner 发现、session owner 路由、SSE 透传和一次安全重路由 |
 | `agent-runner` | `http://127.0.0.1:8787` | 是 | 鉴权、Agent Runtime API、模型执行、session/turn/item/event/approval 与 Blob 生命周期 |
-| MySQL | `127.0.0.1:3306` | 是，外部基础设施 | 业务真相、持久事件、配置、operational/billing usage、subject/tenant lifecycle、T3d plan、T3e execution/ACK、T3f database-purge/grave及T3g Redis-purge evidence、Blob manifest/outbox |
+| MySQL | `127.0.0.1:3306` | 是，外部基础设施 | 业务真相、持久事件、配置、operational/billing usage、subject/tenant lifecycle、T3d plan、T3e execution/ACK、T3f database-purge/grave、T3g Redis-purge evidence、0026 credential coverage/slot/version/target/inventory及Blob manifest/outbox |
 | Redis | `127.0.0.1:6379` | 是，外部基础设施 | lease hash内owner目录、fence、hot replay stream、瞬时event Pub/Sub及T3g永久purge marker |
 | `packages/sdk` | — | 否 | 供客户端使用的 TypeScript SDK |
 | `protocol/core/store/providers/testkit` | — | 否 | 被 runner/router 或测试加载的内部代码库 |
 
 正式客户端和公开OpenAPI authority都是 router 的 `8080`。runner 的 `8787` 用于开发诊断和对照，不应当成为生产环境的公网入口；runner上的`/openapi.json`只是同一已提交契约的构建/兼容性镜像，不能据此绕过router调用edge-owned platform API。
 
-当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive/tombstone/outbox、Blob ownership/业务接线、usage 财务分层、user erasure、canonical policy/multi legal hold、非破坏性purge-policy evaluator，以及异步user-export artifact/download/TTL。terminal-event dispatcher、Blob cleanup、erasure/legacy compensation/policy evaluator、export build/cleanup、T3a credential-store revocation、T3b runtime revocation、T3c content inventory、T3d full-domain purge plan、T3e local execution/physical-ACK、T3f database-purge 和 T3g Redis-purge 都属于 runner 内部工作循环，不是第三个应用服务或镜像。T3d以`0022`固定33域并保留显式blocker；`0023` T3e处理本地usage/Blob/export子集，`0024` T3f原子清理11个本地数据库投影，`0025` T3g再精确清理session lease/owner、fence与stream并安装永久防复活marker。T3g的same-MySQL startup/periodic durable-ACK replay与worker轮询existing-marker收口都不是独立故障域restore ledger；这些切片也不代表external provider/KMS、backup/restore、logs/traces、共享对象存储和全域completion已经闭环。公开 completion 必须继续以实际代码和 `docs/PROGRESS.md` 为准；设计中的目标模块不会提前伪装成可启动服务。
+当前本地拓扑覆盖已实现的 M1/M2 主链路，包括 Archive/tombstone/outbox、Blob ownership/业务接线、usage 财务分层、user erasure、canonical policy/multi legal hold、非破坏性purge-policy evaluator，以及异步user-export artifact/download/TTL。terminal-event dispatcher、Blob cleanup、erasure/legacy compensation/policy evaluator、export build/cleanup、T3a credential-store revocation、T3b runtime revocation、T3c content inventory、T3d full-domain purge plan、T3e local execution/physical-ACK、T3f database-purge 和 T3g Redis-purge 都属于 runner 内部工作循环，不是第三个应用服务或镜像；`0026` credential lifecycle tracking是store/writer能力，也不是新worker。T3d以`0022`固定33域并保留显式blocker；`0023` T3e处理本地usage/Blob/export子集，`0024` T3f原子清理11个本地数据库投影，`0025` T3g精确清理session lease/owner、fence与stream并安装永久防复活marker，`0026`再用coverage、永久slot、immutable version及external/KMS双target把T3a deletion前的credential inventory闭合。当前adapter对有material、需要处置的target只产生真实blocker，无对应material写`not_applicable`，从不执行或伪造远端撤销；T3g的same-MySQL replay也不是独立故障域restore ledger。这些切片都不代表external provider/KMS、backup/restore、logs/traces、共享对象存储和全域completion已经闭环。公开 completion 必须继续以实际代码和 `docs/PROGRESS.md` 为准；设计中的目标模块不会提前伪装成可启动服务。
 
 ## 2. 一次性准备
 
@@ -62,7 +62,7 @@ test -f .env || cp .env.example .env
 - 使用 `openssl rand -hex 32` 生成独立的 `SECRETS_MASTER_KEY`；
 - `.env` 不得提交，也不得把密钥复制到命令日志、文档或问题报告中。
 
-`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前端口/地址、`REDIS_PREFIX`、`REDIS_NAMESPACE_ID`、tombstone/Blob gate、`DATA_ERASURE_REQUESTS_ENABLED`、`TENANT_ERASURE_REQUESTS_ENABLED`、`TENANT_ERASURE_OPERATOR_TOKEN`、`TENANT_ERASURE_OPERATOR_ID`、`TENANT_ERASURE_BARRIER_TIMEOUT_MS`、`TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED`、`TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED`、`TENANT_RUNTIME_DRAIN_ENABLED`、`TENANT_RUNTIME_REVOCATION_WORKER_ENABLED`、`TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED`、`TENANT_CONTENT_INVENTORY_WORKER_ENABLED`、`TENANT_PURGE_PLAN_WORKER_ENABLED`、`TENANT_PURGE_EXECUTION_WORKER_ENABLED`、`TENANT_PURGE_EXECUTION_ENABLED`、`TENANT_DATABASE_PURGE_WORKER_ENABLED`、`TENANT_DATABASE_PURGE_ENABLED`、`TENANT_REDIS_PURGE_WORKER_ENABLED`、`TENANT_REDIS_PURGE_ENABLED`、`DATA_GOVERNANCE_MANAGEMENT_ENABLED`、`PURGE_POLICY_EVALUATOR_ENABLED`、`DATA_EXPORT_REQUESTS_ENABLED`、`DATA_EXPORT_WORKER_ENABLED`、`DATA_EXPORT_CLEANUP_ENABLED`、`ERASURE_WORKER_ENABLED`、`LEGACY_TOMBSTONE_COMPENSATION_ENABLED` 和 `ERASURE_ROUTER_URL` 等显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。platform operator token与router execution gate不会进入runner；统一脚本会在进程边界清除对方不应拥有的变量，同时让router/runner共享准确的Redis prefix/namespace身份。
+`scripts/local-service.sh` 会读取 `.env`，但不会主动打印其中的值。当前端口/地址、`REDIS_PREFIX`、`REDIS_NAMESPACE_ID`、tombstone/Blob gate、`DATA_ERASURE_REQUESTS_ENABLED`、`TENANT_ERASURE_REQUESTS_ENABLED`、`TENANT_ERASURE_OPERATOR_TOKEN`、`TENANT_ERASURE_OPERATOR_ID`、`TENANT_ERASURE_BARRIER_TIMEOUT_MS`、`CREDENTIAL_LIFECYCLE_TRACKING_ENABLED`、`TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED`、`TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED`、`TENANT_RUNTIME_DRAIN_ENABLED`、`TENANT_RUNTIME_REVOCATION_WORKER_ENABLED`、`TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED`、`TENANT_CONTENT_INVENTORY_WORKER_ENABLED`、`TENANT_PURGE_PLAN_WORKER_ENABLED`、`TENANT_PURGE_EXECUTION_WORKER_ENABLED`、`TENANT_PURGE_EXECUTION_ENABLED`、`TENANT_DATABASE_PURGE_WORKER_ENABLED`、`TENANT_DATABASE_PURGE_ENABLED`、`TENANT_REDIS_PURGE_WORKER_ENABLED`、`TENANT_REDIS_PURGE_ENABLED`、`DATA_GOVERNANCE_MANAGEMENT_ENABLED`、`PURGE_POLICY_EVALUATOR_ENABLED`、`DATA_EXPORT_REQUESTS_ENABLED`、`DATA_EXPORT_WORKER_ENABLED`、`DATA_EXPORT_CLEANUP_ENABLED`、`ERASURE_WORKER_ENABLED`、`LEGACY_TOMBSTONE_COMPENSATION_ENABLED` 和 `ERASURE_ROUTER_URL` 等显式命令行值优先；其它同名值可能被 `.env` 覆盖，使用前应检查配置来源，但不要打印密钥。platform operator token与router execution gate不会进入runner；统一脚本会在进程边界清除对方不应拥有的变量，同时让router/runner共享准确的Redis prefix/namespace身份。产品默认的credential tracking flag是`0`；统一脚本只为本地可丢弃数据库在调用方未指定时默认设为`1`，生产发布不得照抄这个便捷默认。
 
 ## 3. 启动与停止完整本地栈
 
@@ -97,7 +97,7 @@ scripts/local-service.sh stop
 2. 从 TypeScript 源码启动一个 runner；
 3. 从 TypeScript 源码启动一个 router，并等待其发现健康 runner。
 
-runner 启动后会同时启动 lifecycle outbox dispatcher、Blob cleanup、durable erasure、generation-zero compensation，以及user-export build/cleanup worker；policy evaluator、T3a credential-store worker、T3b runtime-revocation worker、T3c content-inventory worker、T3d purge-plan worker、T3e local execution worker、T3f database-purge worker和T3g Redis-purge worker只有显式开启后才启动。停止时先停有claim/lease的worker并drain SessionHost，再等待其它循环。产品配置中这些worker均默认`0`；本地脚本为已有user job的forward-fix显式开启erasure、compensation和export build/cleanup，但evaluator及T3a～T3g gate仍保持`0`。因此普通`start`不会意外gate新user/tenant、清除credential、fence runtime、生成plan、匿名化tenant usage、撤销export、调度ready Blob删除、删除数据库投影或写Redis purge marker。T3e启用还强制要求Blob/export cleanup与单runner filesystem断言；该root不能当成跨VM/Pod共享数据面。若已有任一durable T3g job或cutover，runner会要求T3g worker保持开启；监听前只重放已有durable target ACK的marker，未ACK marker随后由worker轮询收口。这类不可逆演示环境不能再用普通worker=`0`配置回退启动。
+runner 启动后会同时启动 lifecycle outbox dispatcher、Blob cleanup、durable erasure、generation-zero compensation，以及user-export build/cleanup worker；policy evaluator、T3a credential-store worker、T3b runtime-revocation worker、T3c content-inventory worker、T3d purge-plan worker、T3e local execution worker、T3f database-purge worker和T3g Redis-purge worker只有显式开启后才启动。`0026` credential tracking不是另一个worker：runner先完成T3g durable restore preflight，再在任何bootstrap mutation、worker或HTTP listener之前读取/按flag激活write-once cutover。停止时先停有claim/lease的worker并drain SessionHost，再等待其它循环。产品配置中破坏性worker和tracking flag均默认`0`；本地脚本为可丢弃本地库在调用方未显式设置tracking时默认`1`，并为已有user job的forward-fix显式开启erasure、compensation和export build/cleanup，但evaluator及T3a～T3g execution/worker gate仍保持`0`。因此普通`start`会建立/维护无敏感值的credential version/target ledger，却不会意外gate新user/tenant、执行remote revoke、清除credential、fence runtime、生成plan、匿名化tenant usage、撤销export、调度ready Blob删除、删除数据库投影或写Redis purge marker。T3e启用还强制要求Blob/export cleanup与单runner filesystem断言；该root不能当成跨VM/Pod共享数据面。若已有任一durable T3g job或cutover，runner会要求T3g worker保持开启；监听前只重放已有durable target ACK的marker，未ACK marker随后由worker轮询收口。这类不可逆演示环境不能再用普通worker=`0`配置回退启动。
 
 要专门体验当前 user erasure gate，请只对可丢弃 user 显式开启两端 gate 后重启：
 
@@ -151,6 +151,7 @@ MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:usage-
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:subject-lifecycle-mysql
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-credential-revocation-mysql
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-credential-physical-revocation-mysql
+MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-credential-lifecycle-mysql
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-runtime-revocation-mysql
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-content-inventory-mysql
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-purge-plan-mysql
@@ -473,13 +474,14 @@ curl -sS "$BASE/v1/data-erasure-requests/$ERASURE_ID" \
 
 generation `0` compensation 没有公开 API，也不应通过手工 SQL 在业务库伪造 legacy row 来体验。本地统一脚本会显式启动 compensation worker；如果数据库确有升级前留下的合法 generation `0` tombstone，它会在 v2 barrier 放行并激活 cutover后建立 durable job。成功事务保留原 `deletedAt`，把残留 active turn/approval固定结算到该历史时刻，写入 generation `1` terminal `session/deleted`、`session.tombstoned` 和不可领取的 `session.purge` intent、append-only compensation audit并完成 job。`purge_after_ms` 仍是 `NULL`，内容不会被删除。日常验证请使用 `pnpm test:legacy-tombstone-mysql`；该 named no-skip 套件使用真实 InnoDB 覆盖并发 claim/ABA、失败整事务回滚和幂等重试。
 
-### Tenant erasure T2/T3a/T3b/T3c/T3d/T3e/T3f/T3g（只对可丢弃 tenant 体验）
+### Tenant erasure T2/T3a/T3b/T3c/T3d/T3e/T3f/T3g 与 0026 inventory（只对可丢弃 tenant 体验）
 
-T2 已提供 router-only `POST /v1/tenant-erasure-requests` 和 `GET /v1/tenant-erasure-requests/{requestId}`，使用与 tenant API key/admin key 完全独立的 platform bearer。POST 会原子写入admission、tenant lifecycle gate、首条audit、credential fence和T3a job；T3a清除本地DB credential material，T3b fence configured fleet，T3c建立DB-time owner清单，T3d把33域封存为不可执行plan。T3e同样没有公开API：runner内嵌worker在fresh all-configured barrier后，只原子去身份化operational usage、撤销export/释放snapshot pin、为Blob/export bytes写exact outbox，并在原cleanup worker真正完成这些outbox后seal physical ACK。T3f再从terminal T3e receipt建独立queue，在一个事务内清理固定11个本地数据库投影、保留匿名billing facts并写永久session grave。T3g最后从T3f grave及T3d Redis plan建立精确target，用真实Redis Lua删除lease/owner、fence与stream并写永久防复活marker。T3e/T3f/T3g都始终固定`allDomainsComplete=false`、`contentPurgeExecuted=false`；external/KMS、backup与独立restore ledger、logs/traces、共享对象存储生产适配及全域completion仍未处理。所有这些gate和已提交操作都不可当作可逆功能；`status=gated`不是`completed`。
+T2 已提供 router-only `POST /v1/tenant-erasure-requests` 和 `GET /v1/tenant-erasure-requests/{requestId}`，使用与 tenant API key/admin key 完全独立的 platform bearer。POST 会原子写入admission、tenant lifecycle gate、首条audit、credential fence和T3a job；T3a清除本地DB credential material，`0026`把删除前的coverage/slot/version/external-KMS target inventory以无敏感值sidecar绑定同一事务，T3b fence configured fleet，T3c建立DB-time owner清单，T3d把33域封存为不可执行plan。T3e同样没有公开API：runner内嵌worker在fresh all-configured barrier后，只原子去身份化operational usage、撤销export/释放snapshot pin、为Blob/export bytes写exact outbox，并在原cleanup worker真正完成这些outbox后seal physical ACK。T3f再从terminal T3e receipt建独立queue，在一个事务内清理固定11个本地数据库投影、保留匿名billing facts并写永久session grave。T3g最后从T3f grave及T3d Redis plan建立精确target，用真实Redis Lua删除lease/owner、fence与stream并写永久防复活marker。当前0026 target仍是blocker而非remote executor；T3e/T3f/T3g也始终固定`allDomainsComplete=false`、`contentPurgeExecuted=false`。external/KMS实际处置、backup与独立restore ledger、logs/traces、共享对象存储生产适配及全域completion仍未处理。所有这些gate和已提交操作都不可当作可逆功能；`status=gated`不是`completed`。
 
 **只能在可丢弃的本地数据库和tenant上执行以下步骤。** 最简单的做法是先停服务，在 `.env` 中把 `BOOTSTRAP_TENANT_ID` 改成专用演示 ID（例如 `t_tenant_erasure_demo`），确认现有本地数据可删除后再运行 `deploy/local/infra.sh reset-db`。该命令会重建本地业务/测试库并对本地 Redis 执行 `FLUSHALL`，不得对需保留的数据使用。若只体验T2逻辑fence，保持T3a～T3g execution/worker/endpoint开关为`0`；若要体验T3a～T3d，必须先确认tenant可丢弃，且 `.env` 中的`RUNNER_ID=runner-local-1`为显式稳定值、`RUNNERS`直连该单runner。先保持T3e/T3f/T3g六道gate为`0`完成并检查T3d plan；T3e会真实匿名化/撤销/调度删除，T3f会真实删除本地数据库投影，T3g会真实修改Redis并留下永久marker，只能按后文分阶段开启。多runner不能照抄这些本地命令。
 
 ```bash
+CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1 \
 TENANT_ERASURE_REQUESTS_ENABLED=0 \
   TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=0 \
   TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED=0 \
@@ -495,6 +497,7 @@ TENANT_ERASURE_REQUESTS_ENABLED=0 \
   TENANT_REDIS_PURGE_WORKER_ENABLED=0 \
   TENANT_REDIS_PURGE_ENABLED=0 \
   scripts/local-service.sh start
+CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1 \
 TENANT_ERASURE_REQUESTS_ENABLED=1 \
   TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1 \
   TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED=1 \
@@ -514,7 +517,7 @@ curl -sS http://127.0.0.1:8080/v1/capabilities | python3 -m json.tool
 curl -sS http://127.0.0.1:8787/v1/capabilities | python3 -m json.tool
 ```
 
-预期 router capability 中 `tenantErasureRequests=true`、`tenantErasureControl=["platform-control-v1"]`、`tenantCredentialRevocation=["credential-store-v1"]`且`tenantCredentialRevocationWorker=true`。最后一个布尔值只表示T3a execution barrier当前可用，不代表content purge或completion。T3b的rollout/boot identity故意不从router公开capability泄露；直接看runner时应见`tenantRuntimeDrain=["runtime-drain-v1"]`和`tenantRuntimeDrainEndpoint=true`，但不会看到私有`bootId`。下面用临时权限为 `0600` 的 curl config 传递 platform token，避免密钥进入命令历史或打印到终端；在 zsh 中执行，并从本机 `.env` 查看后手工粘贴密钥：
+预期 router capability 中 `tenantErasureRequests=true`、`tenantErasureControl=["platform-control-v1"]`、`tenantCredentialRevocation=["credential-store-v1"]`、`tenantCredentialLifecycle=["versioned-target-ledger-v1"]`、`tenantCredentialLifecycleTrackingActive=true`且`tenantCredentialRevocationWorker=true`。最后一个布尔值只表示T3a execution barrier当前可用；versioned ledger也只说明inventory可追踪，不代表external/KMS、content purge或completion。T3b的rollout/boot identity故意不从router公开capability泄露；直接看runner时应见`tenantRuntimeDrain=["runtime-drain-v1"]`和`tenantRuntimeDrainEndpoint=true`，但不会看到私有`bootId`。下面用临时权限为 `0600` 的 curl config 传递 platform token，避免密钥进入命令历史或打印到终端；在 zsh 中执行，并从本机 `.env` 查看后手工粘贴密钥：
 
 ```zsh
 BASE=http://127.0.0.1:8080
@@ -543,6 +546,26 @@ curl -fsS --config "$CURL_CONFIG" \
 
 对同一 tenant 使用相同 idempotency key/body 重放 POST 应返回同一 request。idempotency key 按 tenant 隔离；另一个已注册、同样可丢弃的 tenant 可独立使用同 key，但手工体验不要借此封禁额外 tenant。对上述专用 bootstrap tenant，原 service key 再访问 `/v1/agents` 应得到 `401`。不要调用 runner 的私有路由或向 runner 传 platform token；直接访问 8787 的公开 tenant-erasure 路径不会被注册。
 
+`0026`没有新的公开API。可用下面只读取状态、计数、material-presence布尔值和disposition的查询观察tracking；它不会输出provider id、config、header、URL、cipher或key id。由迁移前已有tenant激活时，`history_status`应为`legacy_history_unknown`；cutover后通过正常API创建的新tenant才是`complete_since_creation`。每个version必须恰有`external_credential`和`kms_key`两条target，当前本地adapter通常显示blocker而不是`executable_ref`：
+
+```bash
+mysql -h 127.0.0.1 -uroot agent_service -e '
+  SELECT control_generation,activated_at_db_ms,subject_count,provider_slot_count,
+         auth_slot_count,version_count,target_disposition_count
+    FROM tenant_credential_tracking_cutover WHERE singleton_id=1;
+  SELECT history_status,origin,tracking_started_at_db_ms
+    FROM tenant_credential_tracking_subjects
+   WHERE tenant_id="t_tenant_erasure_demo";
+  SELECT slot_kind,origin,encrypted_secret_present,secret_key_id_present,
+         custom_headers_present,endpoint_parameters_present,
+         created_at_db_ms,retired_at_db_ms,retire_reason
+    FROM tenant_credential_versions
+   WHERE tenant_id="t_tenant_erasure_demo" ORDER BY created_at_db_ms;
+  SELECT domain,disposition,captured_at_db_ms
+    FROM tenant_credential_target_dispositions
+   WHERE tenant_id="t_tenant_erasure_demo" ORDER BY credential_version_id,domain;'
+```
+
 T3a与T3b worker是异步的；反复执行下面的只读查询，直到T3b job为`configured_fleet_quiesced`、target和aggregate receipt各有一行。这些表只是内部proof，不是公开API；不要手工改表来“完成”任务：
 
 ```bash
@@ -554,10 +577,16 @@ mysql -h 127.0.0.1 -uroot agent_service -e '
          active_turn_count_before,active_turn_count_after
     FROM tenant_runtime_revocation_target_receipts ORDER BY request_id,target_sha256;
   SELECT request_id,target_count,memory_disposition,external_disposition,content_purge_required
-    FROM tenant_runtime_revocation_receipts ORDER BY store_db_timestamp_ms DESC LIMIT 5;'
+    FROM tenant_runtime_revocation_receipts ORDER BY store_db_timestamp_ms DESC LIMIT 5;
+  SELECT request_id,scope,provider_slot_count,auth_slot_count,version_count,
+         target_disposition_count,external_credential_blocker_count,kms_key_blocker_count,
+         legacy_history_unknown_subject_count,provider_source_count_before,
+         auth_secret_present_before,store_db_timestamp_ms
+    FROM tenant_credential_inventory_receipts
+   WHERE tenant_id="t_tenant_erasure_demo";'
 ```
 
-aggregate receipt应显示`memory_disposition=references_dropped_not_zeroized`、`external_disposition=not_supported`、`content_purge_required=1`。它与T3a的`runtimeDisposition=not_in_scope`不冲突：前者是`0020`独立切片的configured-fleet proof，后者仍是不可改写的`0019` credential-only receipt。target内的runner completion wall clock只是诊断字段；durable terminal时间由MySQL事务记录。
+aggregate receipt应显示`memory_disposition=references_dropped_not_zeroized`、`external_disposition=not_supported`、`content_purge_required=1`。它与T3a的`runtimeDisposition=not_in_scope`不冲突：前者是`0020`独立切片的configured-fleet proof，后者仍是不可改写的`0019` credential-only receipt。`tenant_credential_inventory_receipts`应与同一T3a terminal时间原子出现，`target_disposition_count=version_count*2`；blocker count大于零是当前adapter的正确结果，不应手工改成已执行。target内的runner completion wall clock只是诊断字段；durable terminal时间由MySQL事务记录。
 
 若T1 admission绑定的immutable policy给出了非`null`的`sessionContentRetentionMs`，T3c随后会建立job；deadline未到或任一tenant/user canonical hold仍active时保持可重试，不会伪造完成。要实际体验T3c，必须在发起tenant admission之前激活这样的immutable policy；前文的`local-safe-v1`示例把该字段设为`null`，照抄只会安全停在无T3c job状态。轮询以下只读字段，直到`phase=inventory_sealed`。查询刻意不输出正文、user id、claim token或storage locator：
 
@@ -882,8 +911,8 @@ scripts/local-service.sh smoke
 
 scripts/local-service.sh verify
 # 无真实模型费用；运行 secret/API drift/typecheck、MySQL/Redis 集成、
-# 包含 Blob/usage/subject/tenant-credential逻辑、T3a物理清除、T3b runtime proof、T3c content inventory、T3d plan、T3e local execution/physical ACK、T3f database purge、T3g Memory/MySQL/真实Redis、policy/evaluator/erasure/legacy-compensation/user-export专项、
-# 0007→...→0025 历史迁移、真实多进程 cluster（含T3g mixed-worker/namespace/active-fleet精确no-skip套件）、
+# 包含 Blob/usage/subject/tenant-credential逻辑、T3a物理清除、0026 credential lifecycle、T3b runtime proof、T3c content inventory、T3d plan、T3e local execution/physical ACK、T3f database purge、T3g Memory/MySQL/真实Redis、policy/evaluator/erasure/legacy-compensation/user-export专项、
+# 0007→...→0026 历史迁移、真实多进程 cluster（含T3g mixed-worker/namespace/active-fleet精确no-skip套件）、
 # SDK 打包和两个应用 bundle 启动门禁
 
 scripts/local-service.sh verify-real
@@ -895,7 +924,7 @@ scripts/local-service.sh acceptance
 
 日常开发至少运行与修改范围匹配的定向测试；合并或里程碑冻结前运行完整 `verify`。真实模型路径只有在明确需要时运行，不能把未重跑的历史结果描述为本轮结果。
 
-手动体验不必等到 M1/M3/M4 全部完成：每个安全切片先做短smoke，能更早发现交互和运维问题；待整体架构的local/CI范围完成后，再按第3～6节做一次完整walkthrough作为阶段验收。policy/hold、non-destructive evaluator、异步user export、tenant T1/T2/T3a、T3b runtime drain、T3c owner inventory、T3d plan、T3e local usage/Blob/export execution/ACK、T3f本地数据库投影清理与T3g session-scoped Redis三域已接线；tenant流程只能用可丢弃tenant，因为其中多条边界不可逆。当前尚未接线的是external provider/KMS、backup与独立故障域restore ledger、logs/traces、共享对象存储生产适配、全域completion proof、generic user物理purge、M3扩展和M4生产化，不能提前模拟成已存在。
+手动体验不必等到 M1/M3/M4 全部完成：每个安全切片先做短smoke，能更早发现交互和运维问题；待整体架构的local/CI范围完成后，再按第3～6节做一次完整walkthrough作为阶段验收。policy/hold、non-destructive evaluator、异步user export、tenant T1/T2/T3a、`0026` versioned credential inventory、T3b runtime drain、T3c owner inventory、T3d plan、T3e local usage/Blob/export execution/ACK、T3f本地数据库投影清理与T3g session-scoped Redis三域已接线；tenant流程只能用可丢弃tenant，因为其中多条边界不可逆。当前尚未接线的是external provider/KMS实际adapter、backup与独立故障域restore ledger、logs/traces、共享对象存储生产适配、全域completion proof、generic user物理purge、M3扩展和M4生产化，不能提前模拟成已存在。
 
 ## 7. 本地源码进程与生产构建产物
 
@@ -996,23 +1025,24 @@ TypeScript 检查与发布构建不是同一件事。`pnpm typecheck` 先由根 
 10. 以 `pnpm test:subject-lifecycle-mysql` 强制执行 durable gate、request/audit 回滚、create 竞态和 Blob 写阻断；
 11. 以独立、可见且不得 skip 的 `pnpm test:tenant-credential-revocation-mysql` 依次运行tenant credential主体与race两个真实InnoDB文件，验证T1/T2原子admission/fence、不存在tenant时零残留回滚、最后job INSERT故障的完整事务回滚、idempotency、一致status snapshot/proof、tenant/user-worker互斥、普通写竞态、逻辑隐藏/拒写及跨tenant隔离；主JSON report也强制证明两个文件确实执行；
 12. 以独立、可见且不得 skip 的 `pnpm test:tenant-credential-physical-revocation-mysql` 验证T3a数据库时间claim/lease、live lifecycle拒权、API-key/provider/auth material清除与receipt同事务、SQL故障全回滚、global cutover与首receipt/terminal job/immutable T1 proof、lifecycle推进后的terminal重放、Unicode raw identity及跨tenant隔离；主JSON report也要求该文件实际执行；
-13. 以独立、可见且不得 skip 的 `pnpm test:tenant-runtime-revocation-mysql` 验证T3b materialize、DB-time claim/lease/ABA、完整target set、原子receipt/job、回滚、response-loss与隔离；
-14. 以独立、可见且不得 skip 的 `pnpm test:tenant-content-inventory-mysql` 验证T3c DB-clock、owner range/phantom、canonical关系、hold/orphan、跨lease回滚与隔离；
-15. 以独立、可见且不得 skip 的 `pnpm test:tenant-purge-plan-mysql` 验证T3d固定33域、9/10/11 blocker、source/hold、owner closure、full-range lock、claim/ABA、atomic seal、exact replay与隔离；
-16. 以独立、可见且不得 skip 的 `pnpm test:tenant-purge-execution-mysql` 验证T3e source/hold/owner/lease复验、原子usage/export/Blob cutover、exact outbox、actual completion/dead-letter、physical seal、response-loss、回滚与隔离；主JSON report也强制证明目标文件实际执行；
-17. 分别运行 `pnpm test:tenant-database-purge-memory` 与 `pnpm test:tenant-database-purge-mysql`，使后续数据库清理边界既证明 Memory 原子语义，也证明真实 InnoDB 锁、回滚、lease、replay 与 tenant isolation，且 wrapper 会拒绝缺失或全 skip 的目标文件；
-18. 以 `pnpm test:tenant-redis-purge-memory` 强制执行T3g纯契约/Memory atomic publication、source/target/ACK root与restore projection；它不是假的“真实Redis”测试；
-19. 以 `pnpm test:tenant-redis-purge-mysql` 强制执行T3g真实InnoDB materialize、claim/lease/response-loss、部分ACK接管、事务回滚与tenant隔离；
-20. 以 `pnpm test:tenant-redis-purge-redis` 强制执行真实standalone Redis上的Lua完整预检、same-slot原子删除、永久marker、operation replay、错误type/冲突与writer防复活。它没有替代真实Redis Cluster/ACL/persistence/failover验收；
-21. 以独立、可见且不得 skip 的 `pnpm test:retention-policy-mysql` 验证 canonical policy 与 multi legal hold 的 real-InnoDB CAS、immutable/audit 回滚、跨 runner 时钟单调化，以及 erasure admission/usage anonymize 竞态；
-22. 以独立、可见且不得 skip 的 `pnpm test:erasure-purge-policy-mysql` 验证0016 evaluator的原子job建立、request-bound deadline、claim/ABA、live evidence与hold ABA重评、并发锁顺序及seal回滚；
-23. 分别强制运行 `test:erasure-job-mysql`、`test:erasure-session-mysql`、`test:erasure-catalog-mysql`、`test:erasure-usage-mysql`，证明 claim/lease/audit、固定动作/回滚、无正文 completeness scan 及 claim-bound usage/ABA 事务确实执行；
-24. 以独立、可见且不得 skip 的 `pnpm test:legacy-tombstone-mysql` 验证 generation-zero compensation 的一次性 cutover、claim/ABA、原子发布、失败回滚、owner/child 隔离与幂等重试；
-25. 以独立、可见且不得 skip 的 `pnpm test:user-data-export-mysql` 验证owner隔离、RR一致性snapshot、真实core worker跨层发布、claim/download/delete lease、TTL/撤销清理与失败回滚；
-26. 运行冻结的真实历史schema夹具，逐段验证 `0007 → ... → 0025`。其中包括`0007 → 0008`重复usage安全合并/冲突阻断/legacy pending receipt继续保留；`0024 → 0025`既用全链hash固定的独立frozen schema证明业务行/dormancy/partial-DDL/marker replay/append-only guard/严格fingerprint，也在不依赖live旧迁移或当前writer的静态hash固定pre-0025 T3f evidence上，逐字段证明七张T3f证据表保持且升级后只能经显式materializer创建T3g job/target；wrapper拒绝任一必需夹具缺失或skip；
-27. broad cluster覆盖真实runner/router多进程接管及已经纳入的安全边界；另以精确JSON report运行`pnpm test:tenant-redis-purge-cluster`，明确证明mixed-worker、mixed-namespace与active exact fleet矩阵执行且零skip。它不能被描述成真实managed Redis Cluster或完整多runner全生命周期验收；
-28. `pnpm build:check`；
-29. 上传 coverage artifact。
+13. 以独立、可见且不得 skip 的 `pnpm test:tenant-credential-lifecycle-mysql` 验证`0026` tracking cutover锁序、coverage、provider/auth source-generation CAS、永久provider slot/delete-recreate ABA、immutable version/双target、热读与T3a snapshot source/material/time绑定、inventory同事务发布/回滚及terminal replay；主JSON report同样强制证明目标文件实际执行；
+14. 以独立、可见且不得 skip 的 `pnpm test:tenant-runtime-revocation-mysql` 验证T3b materialize、DB-time claim/lease/ABA、完整target set、原子receipt/job、回滚、response-loss与隔离；
+15. 以独立、可见且不得 skip 的 `pnpm test:tenant-content-inventory-mysql` 验证T3c DB-clock、owner range/phantom、canonical关系、hold/orphan、跨lease回滚与隔离；
+16. 以独立、可见且不得 skip 的 `pnpm test:tenant-purge-plan-mysql` 验证T3d固定33域、9/10/11 blocker、source/hold、owner closure、full-range lock、claim/ABA、atomic seal、exact replay与隔离；
+17. 以独立、可见且不得 skip 的 `pnpm test:tenant-purge-execution-mysql` 验证T3e source/hold/owner/lease复验、原子usage/export/Blob cutover、exact outbox、actual completion/dead-letter、physical seal、response-loss、回滚与隔离；主JSON report也强制证明目标文件实际执行；
+18. 分别运行 `pnpm test:tenant-database-purge-memory` 与 `pnpm test:tenant-database-purge-mysql`，使后续数据库清理边界既证明 Memory 原子语义，也证明真实 InnoDB 锁、回滚、lease、replay 与 tenant isolation，且 wrapper 会拒绝缺失或全 skip 的目标文件；
+19. 以 `pnpm test:tenant-redis-purge-memory` 强制执行T3g纯契约/Memory atomic publication、source/target/ACK root与restore projection；它不是假的“真实Redis”测试；
+20. 以 `pnpm test:tenant-redis-purge-mysql` 强制执行T3g真实InnoDB materialize、claim/lease/response-loss、部分ACK接管、事务回滚与tenant隔离；
+21. 以 `pnpm test:tenant-redis-purge-redis` 强制执行真实standalone Redis上的Lua完整预检、same-slot原子删除、永久marker、operation replay、错误type/冲突与writer防复活。它没有替代真实Redis Cluster/ACL/persistence/failover验收；
+22. 以独立、可见且不得 skip 的 `pnpm test:retention-policy-mysql` 验证 canonical policy 与 multi legal hold 的 real-InnoDB CAS、immutable/audit 回滚、跨 runner 时钟单调化，以及 erasure admission/usage anonymize 竞态；
+23. 以独立、可见且不得 skip 的 `pnpm test:erasure-purge-policy-mysql` 验证0016 evaluator的原子job建立、request-bound deadline、claim/ABA、live evidence与hold ABA重评、并发锁顺序及seal回滚；
+24. 分别强制运行 `test:erasure-job-mysql`、`test:erasure-session-mysql`、`test:erasure-catalog-mysql`、`test:erasure-usage-mysql`，证明 claim/lease/audit、固定动作/回滚、无正文 completeness scan 及 claim-bound usage/ABA 事务确实执行；
+25. 以独立、可见且不得 skip 的 `pnpm test:legacy-tombstone-mysql` 验证 generation-zero compensation 的一次性 cutover、claim/ABA、原子发布、失败回滚、owner/child 隔离与幂等重试；
+26. 以独立、可见且不得 skip 的 `pnpm test:user-data-export-mysql` 验证owner隔离、RR一致性snapshot、真实core worker跨层发布、claim/download/delete lease、TTL/撤销清理与失败回滚；
+27. 运行冻结的真实历史schema夹具，逐段验证 `0007 → ... → 0026`。其中`0007 → 0008`继续证明重复usage安全合并、冲突阻断且不丢账、legacy pending receipt保留；`0024 → 0025`保留frozen T3f/T3g证明；`0025 → 0026`从hash固定的frozen-0025真实MySQL历史库证明业务/credential/T3a证据原样保留、migration dormant、partial-DDL/marker-loss重放、三重guards及严格fingerprint，wrapper拒绝任一必需夹具缺失或skip；
+28. broad cluster覆盖真实runner/router多进程接管及已经纳入的安全边界；另以精确JSON report运行`pnpm test:tenant-redis-purge-cluster`，明确证明mixed-worker、mixed-namespace与active exact fleet矩阵执行且零skip。它不能被描述成真实managed Redis Cluster或完整多runner全生命周期验收；
+29. `pnpm build:check`；
+30. 上传 coverage artifact。
 
 MySQL 和 Redis 是拉取的第三方 service images，不是本仓库构建的产品服务。
 
@@ -1032,7 +1062,7 @@ agent-service/agent-runner:ci
 agent-service/agent-router:ci
 ```
 
-每个镜像都包含 Node 24 slim、该应用 bundle、迁移和 production dependencies。它们是 Linux OCI image，不是 VM磁盘或原生机器码。CI会实际启动镜像并检查 OpenAPI/healthcheck；runner还查询 `schema_migrations`，明确验证最新 `0025_tenant_redis_purge.sql` marker 已由镜像内迁移器写入，并验证 production bootstrap。migration marker只证明对应schema/guards已安装，不表示job已生成、worker/gate已开启或发生Redis删除。生命周期 worker 仍在现有 runner 进程中，因此CI不会为 T3a～T3g 构建额外 Node bundle、二进制或镜像；产品构建始终只有router与runner两份应用bundle和两个Linux OCI镜像。
+每个镜像都包含 Node 24 slim、该应用 bundle、迁移和 production dependencies。它们是 Linux OCI image，不是 VM磁盘或原生机器码。CI会实际启动镜像并检查 OpenAPI/healthcheck；runner还查询 `schema_migrations`，明确验证最新 `0026_credential_lifecycle_inventory.sql` marker 已由镜像内迁移器写入，并验证 production bootstrap。migration marker只证明default-dormant schema/guards已安装，不表示credential tracking、任何lifecycle worker/gate、external/KMS adapter或Redis删除已经激活。credential tracking和T3a～T3g worker都在现有runner进程中，因此CI不会为它们构建额外Node bundle、二进制或镜像；产品构建始终只有router与runner两份应用bundle和两个Linux OCI镜像。
 
 当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前明确上传的 GitHub Actions artifact 只有 coverage。
 
@@ -1077,6 +1107,8 @@ policy activate 是提交即生效的 generation CAS，不提供未来时间调�
 `0018` 仍是 tenant erasure 的 expand-only 存储边界：新增独立、append-only 的 `tenant_erasure_admissions` 和 `tenant_credential_revocation_fences`，不向 `erasure_requests` 写 tenant row，也不修改其历史 trigger。固定 `0017` 真实 MySQL 夹具证明旧 worker 的 claim 扫描只能看到原 user queue、旧 user scheduling 保持不变，且 partial-DDL 或 marker 丢失后重放不会失去 append-only 保护。T2 的安全 rollout 是：`0018` expand → 新 router 以 tenant gate=`0` 上线并排空旧 router → 全部新 runner 以 gate=`0` 上线 → 逐 runner 开启 local admission capability → 核对全部 configured 稳定 target → 最后开启 router gate。不得在 pre-`0018`/T2 mixed fleet 提交 tenant admission；runner 端口也必须保持内网受控。
 
 `0019` T3a使用另一条独立rollout：expand migration → 新router以`TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED=0`上线并排空旧router → 全部新runner以`TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=0`上线但声明`credential-store-v1` → 逐runner开启worker → 核对全部configured稳定target健康且worker-active → 最后开启router execution gate。worker在materialize/claim与紧邻不可逆事务前都需要fresh barrier；旧`0018` admission只由显式proof-checked materializer补job。首个receipt激活cutover后不能回退pre-`0019`，只能forward-fix。
+
+在开启上述T3a worker/execution前，`0026`还要求独立的expand→ledger-aware→old-writer-drain→tracking-activate阶段：先应用default-dormant migration；以`CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=0`部署全部新router/runner，完全排空pre-0026 writer并核对每个configured runner声明`versioned-target-ledger-v1`；再显式启用runner tracking，让一个实例完成write-once cutover，并确认所有实例观察`tenantCredentialLifecycleTrackingActive=true`；随后开启router tracking gate，最后才开放T3a execution。activation固定在T3g durable restore preflight之后、bootstrap mutation/worker/listener之前；restore、tracking读取或activation阶段失败会关闭当时已创建的store/lease/bus/adapter，commit后响应丢失只能独立重读active恢复；后续bootstrap、应用装配或listen失败不在该显式清理边界内。cutover后的provider/auth写必须CAS双写version/target ledger，旧writer只能fail closed。当前没有独立fleet-barrier activation Job，因此production误开flag会形成forward-only可用性事故；严格排空旧writer是必要条件，M4应把activation提升为显式、受审计的发布步骤。
 
 `0020` T3b再使用一条完全独立的rollout：expand-only migration → 新router以`TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED=0`上线并排空旧router → 全部新runner以`TENANT_RUNTIME_DRAIN_ENABLED=0`、`TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=0`上线 → 为每个configured slot配置唯一且重启不变的`RUNNER_ID`，并确认`RUNNERS`每项是对应实例的直连稳定URL → 逐runner开启私有endpoint → 核对所有endpoint的runner/boot identity → 开启内嵌worker → 最后开router execution gate。router每次都在fanout前后直接探测所有精确target，不使用healthy subset、owner hash ring、sticky attestation或负载均衡Service别名；任一target/runner/boot缺失、重复或变化均无aggregate proof。
 

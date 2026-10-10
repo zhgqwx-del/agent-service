@@ -13,7 +13,7 @@ export default defineConfig({
       include: ["packages/*/src/**/*.ts", "apps/*/src/**/*.ts"],
       exclude: ["**/*.d.ts", "packages/testkit/**"],
       reporter: ["text", "json-summary", "html"],
-      // Current full-verify baseline: 82.05 / 77.92 / 86.19 / 85.39 with every source file counted,
+      // Current full-verify baseline: 80.92 / 77.19 / 86.15 / 84.07 with every source file counted,
       // not only those a test happens to import. The lower floor catches a material regression without
       // failing on small instrumentation changes; raise it deliberately as coverage stabilizes.
       thresholds: { statements: 72, branches: 61, functions: 68, lines: 76 },

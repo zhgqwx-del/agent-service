@@ -48,12 +48,161 @@ import {
   UserDataExportCleanupWorker,
   UserDataExportWorker,
 } from "@agent-service/core";
+import {
+  MemoryEventBus,
+  MemoryLeaseStore,
+  MemorySessionStore,
+} from "@agent-service/store";
 import { startRunner } from "../src/main.js";
 
 const MASTER_KEY = "88".repeat(32);
 const INTERNAL_TOKEN = "runner-main-private-router-token-0001";
 
 describe("runner main blob wiring", () => {
+  it("activates the durable credential tracking cutover before advertising it", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-credential-tracking-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+      });
+      expect(await runner.store.readTenantCredentialTrackingCutover()).toMatchObject({
+        controlGeneration: 1,
+      });
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: {
+          tenantCredentialLifecycle: ["versioned-target-ledger-v1"],
+          tenantCredentialLifecycleTrackingActive: true,
+        },
+      });
+      await runner.close();
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps credential tracking dormant when the durable T3g preflight fails", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-credential-preflight-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let failedStore: MemorySessionStore | undefined;
+    const preflight = vi.spyOn(MemorySessionStore.prototype, "hasTenantRedisPurgeJobs")
+      .mockImplementationOnce(async function (this: MemorySessionStore) {
+        failedStore = this;
+        throw new Error("injected durable T3g preflight failure");
+      });
+    const activate = vi.spyOn(
+      MemorySessionStore.prototype,
+      "activateTenantCredentialTrackingCutover",
+    );
+    const close = vi.spyOn(MemorySessionStore.prototype, "close");
+    try {
+      await expect(startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+      })).rejects.toThrow("injected durable T3g preflight failure");
+      expect(failedStore).toBeDefined();
+      expect(await failedStore!.readTenantCredentialTrackingCutover()).toEqual({
+        controlGeneration: 0,
+      });
+      expect(activate).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      close.mockRestore();
+      activate.mockRestore();
+      preflight.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("closes startup resources when credential tracking activation fails before commit", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-credential-activation-failure-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let failedStore: MemorySessionStore | undefined;
+    const activate = vi.spyOn(
+      MemorySessionStore.prototype,
+      "activateTenantCredentialTrackingCutover",
+    ).mockImplementationOnce(async function (this: MemorySessionStore) {
+      failedStore = this;
+      throw new Error("injected credential activation failure");
+    });
+    const storeClose = vi.spyOn(MemorySessionStore.prototype, "close");
+    const leaseClose = vi.spyOn(MemoryLeaseStore.prototype, "close");
+    const busClose = vi.spyOn(MemoryEventBus.prototype, "close");
+    try {
+      await expect(startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+      })).rejects.toThrow("injected credential activation failure");
+      expect(failedStore).toBeDefined();
+      expect(await failedStore!.readTenantCredentialTrackingCutover()).toEqual({
+        controlGeneration: 0,
+      });
+      expect(storeClose).toHaveBeenCalledOnce();
+      expect(leaseClose).toHaveBeenCalledOnce();
+      expect(busClose).toHaveBeenCalledOnce();
+    } finally {
+      busClose.mockRestore();
+      leaseClose.mockRestore();
+      storeClose.mockRestore();
+      activate.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers an active credential cutover after the activation response is lost", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-credential-response-loss-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const activateCutover = MemorySessionStore.prototype
+      .activateTenantCredentialTrackingCutover;
+    const activate = vi.spyOn(
+      MemorySessionStore.prototype,
+      "activateTenantCredentialTrackingCutover",
+    ).mockImplementationOnce(async function (this: MemorySessionStore, input) {
+      await activateCutover.call(this, input);
+      throw new Error("injected lost activation response");
+    });
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+      });
+      expect(activate).toHaveBeenCalledOnce();
+      expect(await runner.store.readTenantCredentialTrackingCutover()).toMatchObject({
+        controlGeneration: 1,
+      });
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: { tenantCredentialLifecycleTrackingActive: true },
+      });
+      await runner.close();
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      activate.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
   it("constructs one filesystem data plane, advertises the write gate, and closes workers cleanly", async () => {
     const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-blobs-"));
     const log = vi.spyOn(console, "log").mockImplementation(() => {});

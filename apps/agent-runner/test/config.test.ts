@@ -24,6 +24,7 @@ describe("runner configuration", () => {
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED).toBe(false);
+    expect(cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED).toBe(false);
     expect(cfg.TENANT_RUNTIME_DRAIN_ENABLED).toBe(false);
     expect(cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED).toBe(false);
     expect(cfg.TENANT_RUNTIME_DRAIN_TIMEOUT_MS).toBe(10_000);
@@ -286,13 +287,15 @@ describe("runner configuration", () => {
     expect(() => loadConfig({
       SECRETS_MASTER_KEY: SECRET,
       TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: "1",
-    })).toThrow(/ERASURE_ROUTER_URL is required/);
+    })).toThrow(/CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1/);
     const enabled = loadConfig({
       SECRETS_MASTER_KEY: SECRET,
       TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: "1",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
       ERASURE_ROUTER_URL: "https://router.internal:8443/",
     });
     expect(enabled.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED).toBe(true);
+    expect(enabled.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED).toBe(true);
     expect(enabled.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(enabled.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
     expect(enabled.ERASURE_ROUTER_URL).toBe("https://router.internal:8443");

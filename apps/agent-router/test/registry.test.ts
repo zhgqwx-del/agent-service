@@ -9,6 +9,7 @@ import {
   INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
@@ -323,8 +324,13 @@ describe("RunnerRegistry owner address mapping", () => {
   });
 
   it("requires every configured runner to be freshly healthy, code-aware, and worker-active for credential revocation", async () => {
-    let legacyState: "down" | "legacy" | "code-only" | "active" = "down";
-    const capabilities = (aware: boolean, worker: boolean) => ({
+    let legacyState: "down" | "legacy" | "old-ledger" | "tracking-inactive" | "code-only" | "active" = "down";
+    const capabilities = (
+      aware: boolean,
+      worker: boolean,
+      lifecycleAware: boolean,
+      trackingActive: boolean,
+    ) => ({
       protocolVersion: PROTOCOL_VERSION,
       service: "agent-runner",
       features: {
@@ -336,6 +342,10 @@ describe("RunnerRegistry owner address mapping", () => {
           ? [TENANT_CREDENTIAL_REVOCATION_STORE_V1]
           : [],
         tenantCredentialRevocationWorker: worker,
+        tenantCredentialLifecycle: lifecycleAware
+          ? [TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1]
+          : [],
+        tenantCredentialLifecycleTrackingActive: trackingActive,
         dataPurgeExecution: false,
         dynamicTools: true,
         mcp: [],
@@ -348,7 +358,7 @@ describe("RunnerRegistry owner address mapping", () => {
       const url = String(input);
       if (url.startsWith("http://current/readyz")) return new Response("ready");
       if (url.startsWith("http://current/v1/capabilities")) {
-        return Response.json(capabilities(true, true));
+        return Response.json(capabilities(true, true, true, true));
       }
       if (url.startsWith("http://legacy/readyz")) {
         return legacyState === "down"
@@ -357,8 +367,10 @@ describe("RunnerRegistry owner address mapping", () => {
       }
       if (url.startsWith("http://legacy/v1/capabilities")) {
         return Response.json(capabilities(
+          legacyState !== "legacy",
+          legacyState === "tracking-inactive" || legacyState === "active",
+          legacyState !== "legacy" && legacyState !== "old-ledger",
           legacyState === "code-only" || legacyState === "active",
-          legacyState === "active",
         ));
       }
       return new Response("not found", { status: 404 });
@@ -371,6 +383,8 @@ describe("RunnerRegistry owner address mapping", () => {
     registry.start();
     await registry.waitForFirstProbe();
     expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(false);
+    expect(registry.allConfiguredSupportTenantCredentialLifecycle()).toBe(false);
+    expect(registry.allConfiguredTenantCredentialLifecycleTrackingActive()).toBe(false);
     expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
 
     legacyState = "legacy";
@@ -378,9 +392,23 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(false);
     expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
 
+    legacyState = "old-ledger";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(true);
+    expect(registry.allConfiguredSupportTenantCredentialLifecycle()).toBe(false);
+    expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
+
+    legacyState = "tracking-inactive";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantCredentialLifecycle()).toBe(true);
+    expect(registry.allConfiguredTenantCredentialLifecycleTrackingActive()).toBe(false);
+    expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
+
     legacyState = "code-only";
     await registry.refresh();
     expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(true);
+    expect(registry.allConfiguredSupportTenantCredentialLifecycle()).toBe(true);
+    expect(registry.allConfiguredTenantCredentialLifecycleTrackingActive()).toBe(true);
     expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
 
     legacyState = "active";

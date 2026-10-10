@@ -122,6 +122,14 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:tenant-credential-physical-revocation-mysql
 
+      # Credential source tracking is a rolling-upgrade and destructive-lifecycle boundary. Keep
+      # explicit InnoDB proof for active-cutover CAS, ABA prevention, sidecar rollback/integrity,
+      # Unicode owner isolation and wrong-slot corruption rejection.
+      - name: Tenant credential lifecycle real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-credential-lifecycle-mysql
+
       # T3b commits a complete configured-fleet proof beside the terminal queue transition. Keep
       # explicit InnoDB evidence for live-source admission, exact replay and transaction rollback.
       - name: Tenant runtime revocation real MySQL suite (must execute)
@@ -237,14 +245,15 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0025
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0026
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority, 0016 -> 0017 user-export and 0018 -> 0019 inert tenant credential
       # revocation substrate, 0019 -> 0020 runtime-proof, 0020 -> 0021 content-inventory and
       # 0021 -> 0022 full-domain purge-plan, 0022 -> 0023 execution-ledger and 0023 -> 0024
-      # database-content deletion and 0024 -> 0025 Redis-purge ledger replay matrices.
-      - name: Historical MySQL migrations (0007 through 0025, no skips)
+      # database-content deletion, 0024 -> 0025 Redis-purge ledger and 0025 -> 0026 versioned
+      # credential-lifecycle inventory replay matrices.
+      - name: Historical MySQL migrations (0007 through 0026, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -349,7 +358,7 @@ jobs:
           done
           # And the runner must have applied its migrations from inside the image.
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
-            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0025_tenant_redis_purge.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0026_credential_lifecycle_inventory.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

@@ -270,6 +270,11 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
       opts.tenantCredentialRevocationWorkerEnabledForRunner?.(runnerNumber)
         ?? opts.tenantCredentialRevocationWorkerEnabled === true
     ) ? "1" : "0",
+    CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: (
+      opts.tenantCredentialRevocationWorkerEnabled === true
+      || opts.tenantCredentialRevocationExecutionEnabled === true
+      || opts.tenantCredentialRevocationWorkerEnabledForRunner !== undefined
+    ) ? "1" : "0",
     TENANT_REDIS_PURGE_WORKER_ENABLED: (
       opts.tenantRedisPurgeWorkerEnabledForRunner?.(runnerNumber)
         ?? opts.tenantRedisPurgeWorkerEnabled === true
@@ -324,6 +329,8 @@ export async function startCluster(opts: ClusterOptions = {}): Promise<Cluster> 
     DATA_ERASURE_REQUESTS_ENABLED: opts.dataErasureRequestsEnabled ? "1" : "0",
     TENANT_ERASURE_REQUESTS_ENABLED: opts.tenantErasureRequestsEnabled ? "1" : "0",
     TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED:
+      opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
+    CREDENTIAL_LIFECYCLE_TRACKING_ENABLED:
       opts.tenantCredentialRevocationExecutionEnabled ? "1" : "0",
     TENANT_REDIS_PURGE_ENABLED: opts.tenantRedisPurgeEnabled ? "1" : "0",
     TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED:

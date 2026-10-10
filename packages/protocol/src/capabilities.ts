@@ -406,6 +406,21 @@ export type TenantCredentialRevocationCapability = z.infer<
   typeof TenantCredentialRevocationCapability
 >;
 
+/**
+ * Additive writer contract for the versioned provider/auth credential inventory. Code awareness
+ * and the durable write-once cutover are intentionally separate: a freshly deployed runner may
+ * dual-write the dormant ledger, but T3a must remain closed until every configured runner reports
+ * that the shared cutover is active.
+ */
+export const TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1 =
+  "versioned-target-ledger-v1" as const;
+export const TenantCredentialLifecycleCapability = z.literal(
+  TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
+);
+export type TenantCredentialLifecycleCapability = z.infer<
+  typeof TenantCredentialLifecycleCapability
+>;
+
 export const TENANT_PURGE_EXECUTION_LOCAL_ACK_V1 = "local-execution-ack-v1" as const;
 export const TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1 =
   "local-db-content-delete-v1" as const;
@@ -523,6 +538,10 @@ export const Capabilities = z.object({
     tenantCredentialRevocation: z.array(TenantCredentialRevocationCapability).max(1).default([]),
     /** Local worker activation; fleet execution additionally requires the router's fresh barrier. */
     tenantCredentialRevocationWorker: z.boolean().default(false),
+    /** Provider/auth writers preserve every credential generation and its two target domains. */
+    tenantCredentialLifecycle: z.array(TenantCredentialLifecycleCapability).max(1).default([]),
+    /** Durable shared tracking cutover is active; once true the fleet may only forward-fix. */
+    tenantCredentialLifecycleTrackingActive: z.boolean().default(false),
     /** Code understands the local T3e execution/physical-ACK substrate; this is not completion. */
     tenantPurgeExecution: z.array(TenantPurgeExecutionCapability).max(2).default([]),
     /** Local executor activation; fleet authority additionally requires the router's fresh barrier. */

@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  CredentialSourceConflictError,
   MemorySessionStore,
   SubjectDeletingError,
   newErasureRequestId,
@@ -58,6 +59,109 @@ describe("ProviderService", () => {
     expect(plat.provider).toBe("platform:dashscope");
     expect((await svc.listVisible("t_b")).map((c) => c.id)).toEqual(["dashscope"]);
     expect((await svc.listVisible("t_a")).map((c) => c.id)).toEqual(["mine", "dashscope"]);
+  });
+
+  it("re-reads and retries provider CAS conflicts without reviving a stale secret", async () => {
+    const store = new MemorySessionStore();
+    await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+    const cipher = new LocalAesGcmCipher(KEY);
+    const svc = new ProviderService({ store, cipher, assertBaseUrl });
+    const base = {
+      id: "mine",
+      api: "openai-completions" as const,
+      baseUrl: "https://example.com/v1",
+      headers: {},
+      quota: {},
+      fallback: [],
+      models: [{
+        id: "m1",
+        contextWindow: 1_000,
+        maxOutputTokens: 100,
+        input: ["text" as const],
+        reasoning: false,
+      }],
+    };
+    await svc.upsertTenantProvider("t_cas", { ...base, apiKey: "first-secret" });
+
+    const delegate = store.upsertProviderConfig.bind(store);
+    const concurrentSecret = {
+      ciphertext: await cipher.encrypt("concurrent-secret"),
+      keyId: cipher.keyId,
+    };
+    let injected = false;
+    const write = vi.spyOn(store, "upsertProviderConfig").mockImplementation(async (
+      config,
+      secret,
+      expectedSourceRevision,
+    ) => {
+      if (!injected) {
+        injected = true;
+        await delegate(
+          { ...config, name: "concurrent", updatedAtMs: config.updatedAtMs + 1 },
+          concurrentSecret,
+          expectedSourceRevision,
+        );
+        throw new CredentialSourceConflictError(
+          "provider",
+          expectedSourceRevision ?? null,
+          (await store.getProviderConfig(config.tenantId, config.id))!
+            .credentialSourceRevision,
+        );
+      }
+      return delegate(config, secret, expectedSourceRevision);
+    });
+
+    const result = await svc.upsertTenantProvider("t_cas", { ...base, name: "request" });
+    expect(result.name).toBe("request");
+    expect(write).toHaveBeenCalledTimes(2);
+    const stored = await store.getProviderConfig("t_cas", "mine");
+    expect(stored?.credentialSourceRevision).toBe(3);
+    expect(JSON.stringify(result)).not.toContain("credentialSourceRevision");
+    const resolved = await svc.resolve(
+      { tenantId: "t_cas", userId: "u" },
+      { provider: "mine", model: "m1" },
+    );
+    expect(await resolved.apiKey()).toBe("concurrent-secret");
+  });
+
+  it("recreates a deleted provider from its permanent slot revision without absent-state ABA", async () => {
+    const store = new MemorySessionStore();
+    await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+    const svc = new ProviderService({
+      store,
+      cipher: new LocalAesGcmCipher(KEY),
+      assertBaseUrl,
+    });
+    const config = {
+      id: "recreated",
+      api: "openai-completions" as const,
+      baseUrl: "https://example.com/v1",
+      headers: {},
+      quota: {},
+      fallback: [],
+      models: [{
+        id: "m1",
+        contextWindow: 1_000,
+        maxOutputTokens: 100,
+        input: ["text" as const],
+        reasoning: false,
+      }],
+    };
+    await svc.upsertTenantProvider("t_recreate", { ...config, apiKey: "retired-secret" });
+    expect(await svc.deleteTenantProvider("t_recreate", config.id)).toBe(true);
+    expect(await store.getProviderConfig("t_recreate", config.id)).toBeNull();
+
+    await expect(svc.upsertTenantProvider("t_recreate", {
+      ...config,
+      apiKey: "replacement-secret",
+    })).resolves.toMatchObject({ id: config.id });
+    const stored = await store.getProviderConfig("t_recreate", config.id);
+    expect(stored?.credentialSourceRevision).toBe(3);
+    const resolved = await svc.resolve(
+      { tenantId: "t_recreate", userId: "u" },
+      { provider: config.id, model: "m1" },
+    );
+    expect(await resolved.apiKey()).toBe("replacement-secret");
   });
 
   it("encodes tenant and provider registration components without cross-tenant collisions", async () => {

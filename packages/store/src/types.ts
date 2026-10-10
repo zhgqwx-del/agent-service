@@ -40,7 +40,25 @@ export interface TenantRecord {
   authPolicy: TenantAuthPolicy;
   /** encrypted HS256 key or introspection credential, if the policy needs one */
   authSecret?: { ciphertext: Buffer; keyId: string };
+  /**
+   * Internal compare-and-swap generation for the tenant-auth source. It is deliberately not part
+   * of the public HTTP projection; stores retain it after a secret is cleared so delete/recreate
+   * cannot make an old writer current again.
+   */
+  authCredentialSourceRevision?: number;
   createdAtMs: number;
+}
+
+/** A credential source changed after a caller read it. The message never includes owner ids. */
+export class CredentialSourceConflictError extends Error {
+  constructor(
+    public readonly sourceKind: "provider" | "tenant_auth",
+    public readonly expectedSourceRevision: number | null,
+    public readonly actualSourceRevision: number | null,
+  ) {
+    super("credential source revision does not match");
+    this.name = "CredentialSourceConflictError";
+  }
 }
 
 export interface UsageLedgerEntry {
@@ -571,8 +589,17 @@ export interface SessionStore {
   getApproval(sessionId: string, approvalId: string): Promise<Approval | null>;
 
   // ---- provider configs (BYOK) ----
-  upsertProviderConfig(cfg: ProviderConfig, secret?: { ciphertext: Buffer; keyId: string }): Promise<void>;
-  getProviderConfig(tenantId: string, providerId: string): Promise<{ config: ProviderConfig; secret?: { ciphertext: Buffer; keyId: string } } | null>;
+  upsertProviderConfig(
+    cfg: ProviderConfig,
+    secret?: { ciphertext: Buffer; keyId: string },
+    /** `undefined` is the rolling-upgrade legacy path; `null` requires a never-written slot. */
+    expectedSourceRevision?: number | null,
+  ): Promise<ProviderConfig>;
+  getProviderConfig(tenantId: string, providerId: string): Promise<{
+    config: ProviderConfig;
+    secret?: { ciphertext: Buffer; keyId: string };
+    credentialSourceRevision: number;
+  } | null>;
   listProviderConfigs(tenantId: string): Promise<ProviderConfig[]>;
   deleteProviderConfig(tenantId: string, providerId: string): Promise<boolean>;
 
@@ -583,7 +610,13 @@ export interface SessionStore {
   revokeApiKey(tenantId: string, keyId: string): Promise<boolean>;
   getTenant(tenantId: string): Promise<TenantRecord | null>;
   /** `undefined` keeps any stored secret, `null` clears it (used when a policy no longer needs one) */
-  setTenantAuth(tenantId: string, policy: TenantAuthPolicy, secret?: { ciphertext: Buffer; keyId: string } | null): Promise<void>;
+  setTenantAuth(
+    tenantId: string,
+    policy: TenantAuthPolicy,
+    secret?: { ciphertext: Buffer; keyId: string } | null,
+    /** `undefined` is the rolling-upgrade legacy path; `null` requires no tenant registry row. */
+    expectedSourceRevision?: number | null,
+  ): Promise<TenantRecord>;
 
   // ---- usage ledger ----
   queryUsage(tenantId: string, q: UsageQuery): Promise<{ data: UsageRollup[] }>;

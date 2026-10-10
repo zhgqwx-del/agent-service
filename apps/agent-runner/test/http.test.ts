@@ -81,6 +81,7 @@ async function makeApp(
     governance?: boolean;
     evaluation?: boolean;
     credentialWorker?: boolean;
+    credentialTrackingActive?: boolean;
     databasePurgeWorker?: boolean;
     redisPurgeSupported?: boolean;
     redisPurgeWorker?: boolean;
@@ -109,6 +110,9 @@ async function makeApp(
     dataGovernanceManagementEnabled: lifecycle.governance,
     purgePolicyEvaluationSupported: lifecycle.evaluation,
     tenantCredentialRevocationWorkerEnabled: lifecycle.credentialWorker,
+    tenantCredentialLifecycleTrackingActive: () => (
+      lifecycle.credentialTrackingActive ?? false
+    ),
     tenantDatabasePurgeWorkerEnabled: lifecycle.databasePurgeWorker,
     tenantRedisPurgeSupported: lifecycle.redisPurgeSupported,
     tenantRedisPurgeWorkerEnabled: lifecycle.redisPurgeWorker,
@@ -356,11 +360,14 @@ describe("agent-runner HTTP API", () => {
     const workerActive = await makeApp(60_000, {
       attachStore: true,
       credentialWorker: true,
+      credentialTrackingActive: true,
     });
     expect(await (await unsupported.app.request("/v1/capabilities")).json()).toMatchObject({
       features: {
         tenantCredentialRevocation: [],
         tenantCredentialRevocationWorker: false,
+        tenantCredentialLifecycle: ["versioned-target-ledger-v1"],
+        tenantCredentialLifecycleTrackingActive: false,
         dataPurgeExecution: false,
       },
     });
@@ -368,6 +375,8 @@ describe("agent-runner HTTP API", () => {
       features: {
         tenantCredentialRevocation: ["credential-store-v1"],
         tenantCredentialRevocationWorker: false,
+        tenantCredentialLifecycle: ["versioned-target-ledger-v1"],
+        tenantCredentialLifecycleTrackingActive: false,
         dataPurgeExecution: false,
       },
     });
@@ -375,6 +384,8 @@ describe("agent-runner HTTP API", () => {
       features: {
         tenantCredentialRevocation: ["credential-store-v1"],
         tenantCredentialRevocationWorker: true,
+        tenantCredentialLifecycle: ["versioned-target-ledger-v1"],
+        tenantCredentialLifecycleTrackingActive: true,
         dataPurgeExecution: false,
       },
     });

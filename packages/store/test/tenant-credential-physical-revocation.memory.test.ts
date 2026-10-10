@@ -34,6 +34,7 @@ function provider(tenantId: string, id = "provider"): ProviderConfig {
     id,
     api: "openai-completions",
     baseUrl: "https://example.invalid/v1",
+    apiKeyRef: `secret:${tenantId}:${id}`,
     headers: { Authorization: "Bearer local-test-secret" },
     models: [{
       id: "model",
@@ -143,7 +144,12 @@ describe("MemorySessionStore tenant credential physical revocation", () => {
     expect(receipt?.receiptSha256).toMatch(/^[0-9a-f]{64}$/);
     expect([...store.apiKeys.values()].some((key) => key.tenantId === tenantId)).toBe(false);
     expect([...store.providers.values()].some((row) => row.config.tenantId === tenantId)).toBe(false);
-    expect(store.tenants.get(tenantId)).toEqual({ tenantId, createdAtMs: expect.any(Number) });
+    expect(store.tenants.get(tenantId)).toEqual({
+      tenantId,
+      authCredentialSourceRevision: 2,
+      authCredentialUpdatedAtMs: 1_010,
+      createdAtMs: expect.any(Number),
+    });
 
     expect(await store.resolveApiKey("active-hash-neighbor")).toMatchObject({
       tenantId: neighborId,

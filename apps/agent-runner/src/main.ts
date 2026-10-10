@@ -37,6 +37,7 @@ import {
   SubjectDeletingError,
   type BlobCleanupStore,
   type BlobManifestStore,
+  type CredentialLifecycleStore,
   type EventBus,
   type ErasureJobStore,
   type ErasurePolicyEvaluationStore,
@@ -81,6 +82,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     : undefined;
   const store: SessionStore
     & LifecycleOutboxStore
+    & CredentialLifecycleStore
     & BlobManifestStore
     & BlobCleanupStore
     & SubjectLifecycleStore
@@ -166,6 +168,30 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     // Completed/partial durable ACKs are already-authorized permanent fences. Reapply every one
     // before any worker or HTTP listener can observe a restored Redis namespace.
     await tenantRedisPurgeWorker?.replayDurableRestoreFences();
+
+    // Credential tracking is a durable one-way cutover. Delay it until all T3g durable preflight
+    // and restore work has succeeded, but still complete it before bootstrap mutations, workers or
+    // the HTTP listener can expose this process as a writer.
+    let credentialTracking = await store.readTenantCredentialTrackingCutover();
+    if (
+      cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED
+      && credentialTracking.controlGeneration === 0
+    ) {
+      try {
+        credentialTracking = await store.activateTenantCredentialTrackingCutover({
+          expectedControlGeneration: 0,
+        });
+      } catch (error) {
+        // Another new runner may have won the one-way activation race, or the activation response
+        // may have been lost after commit. Only an independently re-read active cutover recovers it.
+        credentialTracking = await store.readTenantCredentialTrackingCutover();
+        if (credentialTracking.controlGeneration !== 1) throw error;
+      }
+    }
+    if (
+      cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED
+      && credentialTracking.controlGeneration !== 1
+    ) throw new Error("credential lifecycle tracking activation did not commit");
   } catch (error) {
     await Promise.all([
       tenantRedisPurgeAdapter?.close(),
@@ -490,6 +516,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantCredentialRevocation: store,
     tenantCredentialRevocationWorkerEnabled:
       cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED,
+    tenantCredentialLifecycleTrackingActive: async () => (
+      (await store.readTenantCredentialTrackingCutover()).controlGeneration === 1
+    ),
     tenantPurgeExecutionWorkerEnabled:
       tenantPurgeExecutionWorker !== undefined,
     tenantDatabasePurgeWorkerEnabled:
@@ -574,7 +603,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,

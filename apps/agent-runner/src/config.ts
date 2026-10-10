@@ -73,6 +73,13 @@ const Env = z.object({
   TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /**
+   * One-way activation gate for the versioned provider/auth credential ledger. Writers understand
+   * and dual-write the schema regardless; setting this to 1 may activate its durable cutover.
+   */
+  CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** T3b private local fence/drain endpoint. Code awareness is advertised even while this is off. */
   TENANT_RUNTIME_DRAIN_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -293,6 +300,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   }
   if (production && !c.INTERNAL_ROUTER_TOKEN) {
     throw new Error("INTERNAL_ROUTER_TOKEN is required in production");
+  }
+  if (
+    c.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED
+    && !c.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED
+  ) {
+    throw new Error(
+      "CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1 is required before "
+        + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1",
+    );
   }
   if (production && (c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED)) {
     throw new Error(

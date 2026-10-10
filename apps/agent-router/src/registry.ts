@@ -15,6 +15,7 @@ import {
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
+  TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TenantRuntimeDrainReady,
@@ -442,6 +443,29 @@ export class RunnerRegistry {
     ));
   }
 
+  /** Every configured writer must understand the same versioned credential-ledger protocol. */
+  allConfiguredSupportTenantCredentialLifecycle(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantCredentialLifecycle.includes(
+        TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
+      ) === true
+    ));
+  }
+
+  /** The irreversible T3a boundary additionally requires the shared cutover to be observed active. */
+  allConfiguredTenantCredentialLifecycleTrackingActive(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantCredentialLifecycle.includes(
+        TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
+      ) === true
+      && target.capabilities.features.tenantCredentialLifecycleTrackingActive === true
+    ));
+  }
+
   /** Every configured code-aware runner must also have its local worker explicitly active. */
   allConfiguredSupportTenantCredentialRevocationWorker(): boolean {
     const configured = this.list();
@@ -450,6 +474,10 @@ export class RunnerRegistry {
       && target.capabilities?.features.tenantCredentialRevocation.includes(
         TENANT_CREDENTIAL_REVOCATION_STORE_V1,
       ) === true
+      && target.capabilities.features.tenantCredentialLifecycle.includes(
+        TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
+      )
+      && target.capabilities.features.tenantCredentialLifecycleTrackingActive === true
       && target.capabilities.features.tenantCredentialRevocationWorker === true
     ));
   }

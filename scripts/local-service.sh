@@ -23,6 +23,7 @@ caller_tenant_erasure_operator_id="${TENANT_ERASURE_OPERATOR_ID-}"
 caller_tenant_erasure_barrier_timeout_ms="${TENANT_ERASURE_BARRIER_TIMEOUT_MS-}"
 caller_tenant_credential_revocation_worker_enabled="${TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED-}"
 caller_tenant_credential_revocation_execution_enabled="${TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED-}"
+caller_credential_lifecycle_tracking_enabled="${CREDENTIAL_LIFECYCLE_TRACKING_ENABLED-}"
 caller_tenant_runtime_drain_enabled="${TENANT_RUNTIME_DRAIN_ENABLED-}"
 caller_tenant_runtime_revocation_worker_enabled="${TENANT_RUNTIME_REVOCATION_WORKER_ENABLED-}"
 caller_tenant_runtime_drain_execution_enabled="${TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED-}"
@@ -69,6 +70,7 @@ fi
 [ -n "$caller_tenant_erasure_barrier_timeout_ms" ] && TENANT_ERASURE_BARRIER_TIMEOUT_MS="$caller_tenant_erasure_barrier_timeout_ms"
 [ -n "$caller_tenant_credential_revocation_worker_enabled" ] && TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED="$caller_tenant_credential_revocation_worker_enabled"
 [ -n "$caller_tenant_credential_revocation_execution_enabled" ] && TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED="$caller_tenant_credential_revocation_execution_enabled"
+[ -n "$caller_credential_lifecycle_tracking_enabled" ] && CREDENTIAL_LIFECYCLE_TRACKING_ENABLED="$caller_credential_lifecycle_tracking_enabled"
 [ -n "$caller_tenant_runtime_drain_enabled" ] && TENANT_RUNTIME_DRAIN_ENABLED="$caller_tenant_runtime_drain_enabled"
 [ -n "$caller_tenant_runtime_revocation_worker_enabled" ] && TENANT_RUNTIME_REVOCATION_WORKER_ENABLED="$caller_tenant_runtime_revocation_worker_enabled"
 [ -n "$caller_tenant_runtime_drain_execution_enabled" ] && TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED="$caller_tenant_runtime_drain_execution_enabled"
@@ -156,6 +158,7 @@ start_apps() {
       TENANT_ERASURE_REQUESTS_ENABLED="${TENANT_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_ERASURE_BARRIER_TIMEOUT_MS="${TENANT_ERASURE_BARRIER_TIMEOUT_MS:-2000}" \
       TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED="${TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED:-0}" \
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED="${CREDENTIAL_LIFECYCLE_TRACKING_ENABLED:-1}" \
       TENANT_RUNTIME_DRAIN_ENABLED="${TENANT_RUNTIME_DRAIN_ENABLED:-0}" \
       TENANT_RUNTIME_REVOCATION_WORKER_ENABLED="${TENANT_RUNTIME_REVOCATION_WORKER_ENABLED:-0}" \
       TENANT_CONTENT_INVENTORY_WORKER_ENABLED="${TENANT_CONTENT_INVENTORY_WORKER_ENABLED:-0}" \
@@ -197,6 +200,7 @@ start_apps() {
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_ERASURE_REQUESTS_ENABLED="${TENANT_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED="${TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED:-0}" \
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED="${CREDENTIAL_LIFECYCLE_TRACKING_ENABLED:-1}" \
       TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED="${TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED:-0}" \
       TENANT_PURGE_EXECUTION_ENABLED="${TENANT_PURGE_EXECUTION_ENABLED:-0}" \
       TENANT_DATABASE_PURGE_ENABLED="${TENANT_DATABASE_PURGE_ENABLED:-0}" \
@@ -297,6 +301,8 @@ verify() {
     pnpm run test:tenant-credential-revocation-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-credential-physical-revocation-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-credential-lifecycle-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-runtime-revocation-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \

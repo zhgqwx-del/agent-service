@@ -169,12 +169,17 @@ function installOrphanTenantEvidence(
   });
 }
 
-function provider(tenantId: string, id = "provider"): ProviderConfig {
+function provider(
+  tenantId: string,
+  id = "provider",
+  apiKeyRef?: string,
+): ProviderConfig {
   return {
     tenantId,
     id,
     api: "openai-completions",
     baseUrl: "https://example.com/v1",
+    ...(apiKeyRef === undefined ? {} : { apiKeyRef }),
     headers: {},
     models: [{
       id: "model",
@@ -219,7 +224,7 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
     const definition = agent(tenantId);
     await store.createSession(session);
     await store.createAgent(definition);
-    await store.upsertProviderConfig(provider(tenantId), {
+    await store.upsertProviderConfig(provider(tenantId, "provider", `secret:${tenantId}:provider`), {
       ciphertext: Buffer.from("encrypted-provider-key"),
       keyId: "local-v1",
     });

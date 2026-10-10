@@ -933,6 +933,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
               tenantId,
               id: "provider-secret-only",
               api: "openai-completions",
+              apiKeyRef: "provider-kms-key",
               baseUrl: "https://provider.invalid/v1",
               headers: {},
               models: [{
