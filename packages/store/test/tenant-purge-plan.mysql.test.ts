@@ -404,6 +404,9 @@ async function advanceThroughT3c(
   const session = mkSession(tenantId, userId);
   await store.createSession(session);
   await beforeTenantErasure?.(session);
+  if ((await store.readTenantCredentialTrackingCutover()).controlGeneration === 0) {
+    await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+  }
   const requestId = newErasureRequestId();
   await store.requestTenantErasure({
     requestId,
@@ -969,11 +972,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           claim.buildGeneration,
         );
         expect(entries.find((entry) => entry.domain === "external_provider")).toMatchObject({
-          targetCount: 1,
+          targetCount: 2,
           disposition: "blocked_legacy_external_source_unavailable",
         });
         expect(entries.find((entry) => entry.domain === "kms")).toMatchObject({
-          targetCount: 1,
+          targetCount: 2,
           disposition: "blocked_legacy_external_source_unavailable",
         });
       } finally {
@@ -1017,7 +1020,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           disposition: "not_applicable",
         });
         expect(entries.find((entry) => entry.domain === "kms")).toMatchObject({
-          targetCount: 1,
+          targetCount: 2,
           disposition: "blocked_legacy_external_source_unavailable",
         });
       } finally {

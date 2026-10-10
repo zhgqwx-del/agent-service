@@ -109,6 +109,23 @@ const Env = z.object({
   CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Local-only executable adapter. No production/provider adapter is implied by this fixture. */
+  CREDENTIAL_TARGET_EXECUTION_ADAPTER: z.enum(["fake"]).optional(),
+  TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_POLL_MS:
+    z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_LEASE_MS:
+    z.coerce.number().int().min(100).max(600_000).default(30_000),
+  TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_BATCH_SIZE:
+    z.coerce.number().int().min(1).max(100).default(5),
+  TENANT_CREDENTIAL_TARGET_EXECUTION_MATERIALIZE_BATCH_SIZE:
+    z.coerce.number().int().min(1).max(100).default(25),
+  TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_BASE_MS:
+    z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS:
+    z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** T3b private local fence/drain endpoint. Code awareness is advertised even while this is off. */
   TENANT_RUNTIME_DRAIN_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -415,6 +432,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1",
     );
   }
+  if (c.CREDENTIAL_TARGET_EXECUTION_ADAPTER !== undefined) {
+    if (production) {
+      throw new Error("CREDENTIAL_TARGET_EXECUTION_ADAPTER=fake is forbidden in production");
+    }
+    if (c.STORE !== "memory") {
+      throw new Error("STORE=memory is required for CREDENTIAL_TARGET_EXECUTION_ADAPTER=fake");
+    }
+    if (!c.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED) {
+      throw new Error(
+        "CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1 is required for credential target execution",
+      );
+    }
+    if (!c.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED) {
+      throw new Error(
+        "TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED=1 is required when "
+          + "CREDENTIAL_TARGET_EXECUTION_ADAPTER=fake",
+      );
+    }
+  }
+  if (c.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED
+    && c.CREDENTIAL_TARGET_EXECUTION_ADAPTER !== "fake") {
+    throw new Error(
+      "CREDENTIAL_TARGET_EXECUTION_ADAPTER=fake is required before enabling the local "
+        + "credential target execution worker",
+    );
+  }
   if (production && c.BLOB_STORE === "filesystem" && (c.BLOB_ATTACHMENTS_ENABLED || c.BLOB_CLEANUP_ENABLED)) {
     throw new Error(
       "filesystem Blob writes and cleanup are unsupported in production until a shared object-store adapter is configured",
@@ -483,6 +526,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.PURGE_POLICY_EVALUATOR_ENABLED
       || c.TENANT_ERASURE_REQUESTS_ENABLED
       || c.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED
+      || c.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED
       || c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED
       || c.TENANT_PURGE_EXECUTION_WORKER_ENABLED
       || c.TENANT_DATABASE_PURGE_WORKER_ENABLED
@@ -495,6 +539,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "LEGACY_TOMBSTONE_COMPENSATION_ENABLED=1, PURGE_POLICY_EVALUATOR_ENABLED=1, "
         + "TENANT_ERASURE_REQUESTS_ENABLED=1, or "
         + "TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED=1, or "
+        + "TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED=1, or "
         + "TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=1, or "
         + "TENANT_PURGE_EXECUTION_WORKER_ENABLED=1, or "
         + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1, or "
@@ -550,6 +595,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     throw new Error(
       "TENANT_PURGE_EXECUTION_RETRY_MAX_MS must be at least "
         + "TENANT_PURGE_EXECUTION_RETRY_BASE_MS",
+    );
+  }
+  if (c.TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS
+    < c.TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_BASE_MS) {
+    throw new Error(
+      "TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS must be at least "
+        + "TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_BASE_MS",
     );
   }
   if (

@@ -29,6 +29,36 @@ import { mkSession, newId } from "./conformance.js";
 
 const NOW = 20_000;
 
+interface CredentialRolloutClock {
+  advance(): void;
+  release(): void;
+}
+
+const credentialRolloutClocks = new WeakMap<MemorySessionStore, CredentialRolloutClock>();
+
+function memoryStoreWithCredentialRolloutClock(
+  storeClock: { now(): number },
+): MemorySessionStore {
+  const initialNowMs = storeClock.now();
+  let floorMs = initialNowMs - 2;
+  let released = false;
+  const clock = {
+    now: () => released ? Math.max(floorMs, storeClock.now()) : floorMs,
+  };
+  const store = new MemorySessionStore(clock);
+  credentialRolloutClocks.set(store, {
+    advance: () => { floorMs += 1; },
+    release: () => { released = true; },
+  });
+  return store;
+}
+
+function credentialRolloutClock(store: MemorySessionStore): CredentialRolloutClock {
+  const clock = credentialRolloutClocks.get(store);
+  if (!clock) throw new Error("expected credential-rollout test clock");
+  return clock;
+}
+
 function policy(): RetentionPolicyDocumentV1 {
   return {
     sessionContentRetentionMs: 0,
@@ -158,9 +188,14 @@ async function advanceToExecutionClaim(
     beforeTenantErasure?: () => Promise<void>;
   } = {},
 ) {
+  const rolloutClock = credentialRolloutClock(store);
   await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
   await installPolicy(store, tenantId);
   await options.beforeTenantErasure?.();
+  if ((await store.readTenantCredentialTrackingCutover()).controlGeneration === 0) {
+    await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+  }
+  rolloutClock.advance();
   const request = {
     requestId: newErasureRequestId(),
     tenantId,
@@ -188,6 +223,8 @@ async function advanceToExecutionClaim(
     runtimeAuthorization(runtimeClaim),
     fleetProof(runtimeClaim),
   )).not.toBeNull();
+  rolloutClock.advance();
+  rolloutClock.release();
   await store.materializeTenantContentInventoryJobs({ limit: 10 });
   const inventoryClaim = (await store.claimTenantContentInventories({
     limit: 10,
@@ -364,7 +401,7 @@ class FailOnceMap<K, V> extends Map<K, V> {
 
 describe("MemorySessionStore tenant purge execution", () => {
   it("materializes all 33 domains and seals a zero-target local execution without claiming completion", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-execution-empty";
     const source = await advanceToExecutionClaim(store, tenantId);
     expect(await store.getTenantPurgeExecutionDomains(
@@ -412,7 +449,7 @@ describe("MemorySessionStore tenant purge execution", () => {
   });
 
   it("atomically anonymizes usage, revokes exports, and binds exact Blob/export outboxes", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-execution-local";
     const userId = "tenant-execution-user";
     let targets: Awaited<ReturnType<typeof installLocalTargets>> | undefined;
@@ -478,7 +515,7 @@ describe("MemorySessionStore tenant purge execution", () => {
   });
 
   it("rolls every destructive map back on publication failure and lease loss", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-execution-rollback";
     const userId = "rollback-user";
     let targets: Awaited<ReturnType<typeof installLocalTargets>> | undefined;
@@ -501,7 +538,7 @@ describe("MemorySessionStore tenant purge execution", () => {
 
     let clockCalls = 0;
     let expire = false;
-    const leaseStore = new MemorySessionStore({
+    const leaseStore = memoryStoreWithCredentialRolloutClock({
       now: () => expire && ++clockCalls >= 3 ? NOW + 6 : NOW,
     });
     const leaseSource = await advanceToExecutionClaim(leaseStore, "tenant-execution-lease", {
@@ -516,7 +553,7 @@ describe("MemorySessionStore tenant purge execution", () => {
   });
 
   it("rechecks a canonical hold at the irreversible boundary and leaves zero partial state", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-execution-hold-race";
     const source = await advanceToExecutionClaim(store, tenantId);
     const lifecycleKey = subjectLifecycleKey(tenantId, "tenant", tenantId);
@@ -556,7 +593,7 @@ describe("MemorySessionStore tenant purge execution", () => {
   });
 
   it("atomically blocks an exact dead-lettered physical intent", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-execution-deadletter";
     const userId = "deadletter-user";
     const source = await advanceToExecutionClaim(store, tenantId, {
@@ -587,7 +624,7 @@ describe("MemorySessionStore tenant purge execution", () => {
   });
 
   it("does not cross tenant boundaries and exposes pending as a typed retry boundary", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-execution-isolation";
     const source = await advanceToExecutionClaim(store, tenantId);
     expect(await store.getTenantPurgeExecutionJob("foreign-tenant", source.request.requestId)).toBeNull();

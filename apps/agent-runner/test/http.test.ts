@@ -82,6 +82,8 @@ async function makeApp(
     evaluation?: boolean;
     credentialWorker?: boolean;
     credentialTrackingActive?: boolean;
+    credentialTargetExecutionSupported?: boolean;
+    credentialTargetExecutionWorker?: boolean;
     databasePurgeWorker?: boolean;
     redisPurgeSupported?: boolean;
     redisPurgeWorker?: boolean;
@@ -113,6 +115,10 @@ async function makeApp(
     tenantCredentialLifecycleTrackingActive: () => (
       lifecycle.credentialTrackingActive ?? false
     ),
+    tenantCredentialTargetExecutionSupported:
+      lifecycle.credentialTargetExecutionSupported,
+    tenantCredentialTargetExecutionWorkerEnabled:
+      lifecycle.credentialTargetExecutionWorker,
     tenantDatabasePurgeWorkerEnabled: lifecycle.databasePurgeWorker,
     tenantRedisPurgeSupported: lifecycle.redisPurgeSupported,
     tenantRedisPurgeWorkerEnabled: lifecycle.redisPurgeWorker,
@@ -387,6 +393,33 @@ describe("agent-runner HTTP API", () => {
         tenantCredentialLifecycle: ["versioned-target-ledger-v1"],
         tenantCredentialLifecycleTrackingActive: true,
         dataPurgeExecution: false,
+      },
+    });
+  });
+
+  it("separates external credential execution awareness from local worker activation", async () => {
+    const unsupported = await makeApp();
+    const aware = await makeApp(60_000, { credentialTargetExecutionSupported: true });
+    const worker = await makeApp(60_000, {
+      credentialTargetExecutionSupported: true,
+      credentialTargetExecutionWorker: true,
+    });
+    expect(await (await unsupported.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantCredentialTargetExecution: [],
+        tenantCredentialTargetExecutionWorker: false,
+      },
+    });
+    expect(await (await aware.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantCredentialTargetExecution: ["external-credential-execution-v1"],
+        tenantCredentialTargetExecutionWorker: false,
+      },
+    });
+    expect(await (await worker.app.request("/v1/capabilities")).json()).toMatchObject({
+      features: {
+        tenantCredentialTargetExecution: ["external-credential-execution-v1"],
+        tenantCredentialTargetExecutionWorker: true,
       },
     });
   });

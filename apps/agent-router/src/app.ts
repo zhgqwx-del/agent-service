@@ -21,8 +21,11 @@ import {
   INTERNAL_TENANT_ERASURE_ADMISSION_ACK_VALUE,
   INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
+  INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_READY_PATH,
+  INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_VALUE,
+  INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_READY_PATH,
   INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
   INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
   INTERNAL_TENANT_DATABASE_PURGE_READY_PATH,
@@ -53,6 +56,7 @@ import {
   PURGE_POLICY_EVALUATOR_V1,
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -108,6 +112,8 @@ export interface RouterAppDeps {
   tenantCredentialRevocationExecutionEnabled?: () => boolean;
   /** Independent deployment acknowledgement for the durable credential tracking cutover. */
   credentialLifecycleTrackingEnabled?: () => boolean;
+  /** Independent fleet gate for external credential target execution. */
+  tenantCredentialTargetExecutionEnabled?: () => boolean;
   /** Independent activation gate for local T3e execution/physical-ACK queue claims. */
   tenantPurgeExecutionEnabled?: () => boolean;
   /** Independent activation gate for T3f local database-content deletion queue claims. */
@@ -167,6 +173,7 @@ const STRIP_RESPONSE = new Set([
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
   INTERNAL_PURGE_POLICY_EVALUATION_ACK_HEADER,
   INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_HEADER,
+  INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_HEADER,
   INTERNAL_TENANT_PURGE_EXECUTION_ACK_HEADER,
   INTERNAL_TENANT_RUNTIME_DRAIN_ACK_HEADER,
   INTERNAL_TENANT_ERASURE_ADMISSION_ACK_HEADER,
@@ -304,6 +311,12 @@ export function createRouterApp(deps: RouterAppDeps) {
     && (deps.tenantCredentialRevocationExecutionEnabled?.() ?? false)
     && (deps.credentialLifecycleTrackingEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportTenantCredentialRevocationWorker()
+  );
+  const tenantCredentialTargetExecutionAvailable = () => (
+    !!deps.internalRunnerToken
+    && (deps.tenantCredentialTargetExecutionEnabled?.() ?? false)
+    && (deps.credentialLifecycleTrackingEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportTenantCredentialTargetExecutionWorker()
   );
   const tenantPurgeExecutionAvailable = () => (
     !!deps.internalRunnerToken
@@ -546,6 +559,12 @@ export function createRouterApp(deps: RouterAppDeps) {
                     : [],
                 tenantCredentialLifecycleTrackingActive:
                   deps.registry.allConfiguredTenantCredentialLifecycleTrackingActive(),
+                tenantCredentialTargetExecution:
+                  deps.registry.allConfiguredSupportTenantCredentialTargetExecution()
+                    ? [TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1]
+                    : [],
+                tenantCredentialTargetExecutionWorker:
+                  tenantCredentialTargetExecutionAvailable(),
                 tenantPurgeExecution:
                   [
                     ...(deps.registry.allConfiguredSupportTenantPurgeExecution()
@@ -638,6 +657,29 @@ export function createRouterApp(deps: RouterAppDeps) {
     );
     return c.body(null, 204);
   });
+
+  /** One fresh all-configured proof authorizes one external credential execution boundary. */
+  app.get(INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_READY_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    try {
+      await deps.registry.refresh();
+    } catch {
+      return c.body(null, 503);
+    }
+    if (!tenantCredentialTargetExecutionAvailable()) return c.body(null, 503);
+    c.header(
+      INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_HEADER,
+      INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_VALUE,
+    );
+    return c.body(null, 204);
+  });
+  app.all(INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_READY_PATH, (c) => internalNotFound(c));
+  app.all(`${INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_READY_PATH}/*`, (c) => (
+    internalNotFound(c)
+  ));
 
   /**
    * T3e has its own fresh, non-sticky all-configured barrier. Its ACK authorizes one bounded local

@@ -101,6 +101,18 @@ export const INTERNAL_TENANT_CREDENTIAL_REVOCATION_ACK_VALUE =
   "credential-revocation-v1" as const;
 
 /**
+ * External credential target execution is an independent irreversible boundary after T3a. One
+ * content-free ACK authorizes one immediately following worker boundary and cannot substitute for
+ * the credential-store revocation or any content-purge authority.
+ */
+export const INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_READY_PATH =
+  "/_internal/tenant-credential-target-execution-v1/ready" as const;
+export const INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_HEADER =
+  "x-agent-service-tenant-credential-target-execution" as const;
+export const INTERNAL_TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_VALUE =
+  "external-credential-execution-v1" as const;
+
+/**
  * A tenant-purge executor obtains this content-free ACK before it may touch the independent
  * execution queue or cross an irreversible local action boundary. The router emits it only after
  * a fresh, non-sticky observation of every configured runner. This ACK is deliberately narrower
@@ -421,6 +433,15 @@ export type TenantCredentialLifecycleCapability = z.infer<
   typeof TenantCredentialLifecycleCapability
 >;
 
+export const TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1 =
+  "external-credential-execution-v1" as const;
+export const TenantCredentialTargetExecutionCapability = z.literal(
+  TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
+);
+export type TenantCredentialTargetExecutionCapability = z.infer<
+  typeof TenantCredentialTargetExecutionCapability
+>;
+
 export const TENANT_PURGE_EXECUTION_LOCAL_ACK_V1 = "local-execution-ack-v1" as const;
 export const TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1 =
   "local-db-content-delete-v1" as const;
@@ -584,6 +605,11 @@ export const Capabilities = z.object({
     tenantCredentialLifecycle: z.array(TenantCredentialLifecycleCapability).max(1).default([]),
     /** Durable shared tracking cutover is active; once true the fleet may only forward-fix. */
     tenantCredentialLifecycleTrackingActive: z.boolean().default(false),
+    /** Concrete adapter support for the independently gated external credential target executor. */
+    tenantCredentialTargetExecution:
+      z.array(TenantCredentialTargetExecutionCapability).max(1).default([]),
+    /** Local target executor activation; fleet authority still requires the private fresh barrier. */
+    tenantCredentialTargetExecutionWorker: z.boolean().default(false),
     /** Code understands the local T3e execution/physical-ACK substrate; this is not completion. */
     tenantPurgeExecution: z.array(TenantPurgeExecutionCapability).max(2).default([]),
     /** Local executor activation; fleet authority additionally requires the router's fresh barrier. */

@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import { RETENTION_POLICY_SCHEMA_VERSION } from "./retention-policy.js";
+import {
+  validateTenantCredentialTargetDisposition,
+  type TenantCredentialTargetDisposition,
+} from "./credential-lifecycle.js";
 
 export const TENANT_PURGE_PLAN_ENTRY_SCOPE = "tenant-purge-plan-entry-v1" as const;
 export const TENANT_PURGE_PLAN_RECEIPT_SCOPE = "tenant-purge-plan-v1" as const;
@@ -513,6 +517,88 @@ export function tenantPurgePlanTargetRootSha256(
     throw new Error("tenant purge plan target hash is duplicated");
   }
   return sha256(["tenant-purge-plan-target-root-v1", domain, ...ordered]);
+}
+
+export type TenantCredentialPurgePlanDomain = "external_provider" | "kms";
+
+function credentialTargetDomainForPlan(
+  domain: TenantCredentialPurgePlanDomain,
+): TenantCredentialTargetDisposition["domain"] {
+  return domain === "external_provider" ? "external_credential" : "kms_key";
+}
+
+/**
+ * Reproduce the exact T3d target identity from the immutable 0026 target ledger. The tuple contains
+ * only opaque digests and ids; encrypted locators and credentials never enter a plan/read model.
+ */
+export function tenantCredentialPurgePlanTargetSha256(
+  domain: TenantCredentialPurgePlanDomain,
+  target: TenantCredentialTargetDisposition,
+): string {
+  validateTenantCredentialTargetDisposition(target);
+  if (target.domain !== credentialTargetDomainForPlan(domain)
+    || target.disposition === "not_applicable") {
+    throw new Error("tenant credential purge plan target does not match its domain");
+  }
+  return tenantPurgePlanTargetSha256(domain, [
+    target.credentialVersionId,
+    target.evidenceSha256,
+  ]);
+}
+
+/** Build the T3d external/KMS projection without guessing from coarse T3a row counts. */
+export function tenantCredentialPurgePlanTargetEvidence(
+  domain: TenantCredentialPurgePlanDomain,
+  targets: readonly TenantCredentialTargetDisposition[],
+): {
+  targetCount: number;
+  targetRootSha256: string;
+  disposition: Extract<
+    TenantPurgePlanDisposition,
+    | "revoke"
+    | "delete"
+    | "not_applicable"
+    | "blocked_legacy_external_source_unavailable"
+    | "blocked_adapter_unconfigured"
+  >;
+} {
+  const targetDomain = credentialTargetDomainForPlan(domain);
+  const relevant = targets
+    .filter((target) => target.domain === targetDomain && target.disposition !== "not_applicable")
+    .sort((left, right) => left.credentialVersionId.localeCompare(right.credentialVersionId));
+  for (const [index, target] of relevant.entries()) {
+    validateTenantCredentialTargetDisposition(target);
+    if (index > 0
+      && relevant[index - 1]!.credentialVersionId === target.credentialVersionId) {
+      throw new Error("tenant credential purge plan target is duplicated");
+    }
+  }
+  const targetHashes = relevant.map((target) => (
+    tenantCredentialPurgePlanTargetSha256(domain, target)
+  ));
+  const targetRootSha256 = tenantPurgePlanTargetRootSha256(domain, targetHashes);
+  if (relevant.length === 0) {
+    return { targetCount: 0, targetRootSha256, disposition: "not_applicable" };
+  }
+  if (relevant.some((target) => target.disposition === "blocked_legacy_history")) {
+    return {
+      targetCount: relevant.length,
+      targetRootSha256,
+      disposition: "blocked_legacy_external_source_unavailable",
+    };
+  }
+  if (relevant.some((target) => target.disposition !== "executable_ref")) {
+    return {
+      targetCount: relevant.length,
+      targetRootSha256,
+      disposition: "blocked_adapter_unconfigured",
+    };
+  }
+  return {
+    targetCount: relevant.length,
+    targetRootSha256,
+    disposition: domain === "external_provider" ? "revoke" : "delete",
+  };
 }
 
 export const EMPTY_TENANT_PURGE_PLAN_ENTRY_ROOT_SHA256 = sha256([

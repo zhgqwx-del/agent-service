@@ -34,6 +34,36 @@ import {
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
 
+interface CredentialRolloutClock {
+  advance(): void;
+  release(): void;
+}
+
+const credentialRolloutClocks = new WeakMap<MemorySessionStore, CredentialRolloutClock>();
+
+function memoryStoreWithCredentialRolloutClock(
+  storeClock: { now(): number },
+): MemorySessionStore {
+  const initialNowMs = storeClock.now();
+  let floorMs = initialNowMs - 2;
+  let released = false;
+  const clock = {
+    now: () => released ? Math.max(floorMs, storeClock.now()) : floorMs,
+  };
+  const store = new MemorySessionStore(clock);
+  credentialRolloutClocks.set(store, {
+    advance: () => { floorMs += 1; },
+    release: () => { released = true; },
+  });
+  return store;
+}
+
+function credentialRolloutClock(store: MemorySessionStore): CredentialRolloutClock {
+  const clock = credentialRolloutClocks.get(store);
+  if (!clock) throw new Error("expected credential-rollout test clock");
+  return clock;
+}
+
 const AUTH_POLICY: TenantAuthPolicy = {
   mode: "end_user_token",
   tokenHeader: "x-end-user-token",
@@ -211,6 +241,7 @@ async function advanceThroughT3c(
   tenantId: string,
   options: AdvanceOptions = {},
 ) {
+  const rolloutClock = credentialRolloutClock(store);
   if (options.credentials) {
     await store.setTenantAuth(tenantId, AUTH_POLICY, {
       ciphertext: Buffer.from("never-copy-auth-cipher"),
@@ -225,6 +256,10 @@ async function advanceThroughT3c(
   }
   await installPolicy(store, tenantId, options.contentRetentionMs ?? 0);
   await options.beforeTenantErasure?.(store, tenantId);
+  if ((await store.readTenantCredentialTrackingCutover()).controlGeneration === 0) {
+    await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+  }
+  rolloutClock.advance();
   const request = {
     requestId: options.requestId ?? newErasureRequestId(),
     tenantId,
@@ -254,6 +289,8 @@ async function advanceThroughT3c(
     fleetProof(runtimeClaim),
   );
   expect(runtimeReceipt).not.toBeNull();
+  rolloutClock.advance();
+  rolloutClock.release();
   await store.materializeTenantContentInventoryJobs({ limit: 10 });
   const inventoryClaim = (await store.claimTenantContentInventories({
     limit: 10,
@@ -396,7 +433,7 @@ class FailOnceMap<K, V> extends Map<K, V> {
 describe("MemorySessionStore tenant purge plan", () => {
   it("seals all 33 content-free domains with explicit legacy/adapter blockers and no mutation", async () => {
     let nowMs = 5_000;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const tenantId = "tenant-purge-plan-success";
     const session = mkSession(tenantId, "raw-private-user");
     await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -497,7 +534,7 @@ describe("MemorySessionStore tenant purge plan", () => {
   });
 
   it("marks proven-zero legacy provider/KMS domains not-applicable without hiding real blockers", async () => {
-    const store = new MemorySessionStore({ now: () => 5_100 });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => 5_100 });
     const source = await advanceThroughT3c(store, "tenant-purge-plan-no-external");
     await store.materializeTenantPurgePlanJobs({ limit: 1 });
     const [claim] = await store.claimTenantPurgePlans({
@@ -524,7 +561,7 @@ describe("MemorySessionStore tenant purge plan", () => {
   });
 
   it("fails KMS closed when T3a erased provider material but no tenant auth secret", async () => {
-    const store = new MemorySessionStore({ now: () => 5_200 });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => 5_200 });
     const tenantId = "tenant-purge-plan-provider-secret-only";
     const source = await advanceThroughT3c(store, tenantId, {
       beforeTenantErasure: async () => {
@@ -557,7 +594,7 @@ describe("MemorySessionStore tenant purge plan", () => {
   });
 
   it("records ten blockers for a tenant auth envelope without provider material", async () => {
-    const store = new MemorySessionStore({ now: () => 5_300 });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => 5_300 });
     const tenantId = "tenant-purge-plan-auth-secret-only";
     const source = await advanceThroughT3c(store, tenantId, {
       beforeTenantErasure: async () => {
@@ -593,7 +630,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("fails retryably on source/deadline/evidence clock rollback without publishing partial plan", async () => {
     let nowMs = 6_000;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const source = await advanceThroughT3c(store, "tenant-purge-plan-clock", {
       contentRetentionMs: 100,
       beforeContentSeal: () => { nowMs = 6_200; },
@@ -631,7 +668,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("rechecks a canonical hold at seal and never treats the plan as execution authority", async () => {
     let nowMs = 7_000;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const tenantId = "tenant-purge-plan-hold";
     const source = await advanceThroughT3c(store, tenantId);
     await store.materializeTenantPurgePlanJobs({ limit: 1 });
@@ -684,7 +721,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("rechecks canonical holds for every known tenant user before sealing", async () => {
     const nowMs = 7_100;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const tenantId = "tenant-purge-plan-user-hold";
     const userId = "held-user";
     await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -736,7 +773,7 @@ describe("MemorySessionStore tenant purge plan", () => {
   });
 
   it("detects diagnostic-page drift, and atomically rolls back direct-seal entry writes", async () => {
-    const driftStore = new MemorySessionStore({ now: () => 8_000 });
+    const driftStore = memoryStoreWithCredentialRolloutClock({ now: () => 8_000 });
     const driftTenant = "tenant-purge-plan-drift";
     const driftSource = await advanceThroughT3c(driftStore, driftTenant);
     await driftStore.materializeTenantPurgePlanJobs({ limit: 1 });
@@ -760,7 +797,7 @@ describe("MemorySessionStore tenant purge plan", () => {
       scanComplete: false,
     });
 
-    const rollbackStore = new MemorySessionStore({ now: () => 8_100 });
+    const rollbackStore = memoryStoreWithCredentialRolloutClock({ now: () => 8_100 });
     const rollbackSource = await advanceThroughT3c(rollbackStore, "tenant-purge-plan-rollback");
     await rollbackStore.materializeTenantPurgePlanJobs({ limit: 1 });
     const [rollbackClaim] = await rollbackStore.claimTenantPurgePlans({
@@ -781,7 +818,7 @@ describe("MemorySessionStore tenant purge plan", () => {
   });
 
   it("fails closed on an unattributable child row before page or aggregate publication", async () => {
-    const store = new MemorySessionStore({ now: () => 8_500 });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => 8_500 });
     const tenantId = "tenant-purge-plan-orphan";
     const source = await advanceThroughT3c(store, tenantId);
     await store.materializeTenantPurgePlanJobs({ limit: 1 });
@@ -830,7 +867,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("rejects cross-owner runtime and erasure indexes before atomic seal", async () => {
     const nowMs = 8_550;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const tenantId = "tenant-purge-plan-owner-relations";
     const session = mkSession(tenantId, "owner-user");
     await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
@@ -1108,7 +1145,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("binds every erasure request and purge target to its live lifecycle and tombstone", async () => {
     const nowMs = 8_575;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const tenantId = "tenant-purge-plan-subject-relations";
     let userSource: Awaited<ReturnType<typeof prepareUserPurgeTarget>> | undefined;
     const source = await advanceThroughT3c(store, tenantId, {
@@ -1208,7 +1245,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("atomically seals with a normal generation-zero export created before tenant erasure", async () => {
     const nowMs = 8_600;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const tenantId = "tenant-purge-plan-export-generation-zero";
     const userId = "generation-zero-user";
     const exportRequestId = newUserDataExportRequestId();
@@ -1256,7 +1293,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("distinguishes concurrent export download leases without persisting bearer tokens", async () => {
     const nowMs = 8_700;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const tenantId = "tenant-purge-plan-download-leases";
     const userId = "download-user";
     const requestId = `export_${randomUUID()}`;
@@ -1363,7 +1400,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("rolls back a page that crosses its lease and preserves claim-attempt ABA", async () => {
     let nowMs = 9_000;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const source = await advanceThroughT3c(store, "tenant-purge-plan-lease");
     await store.materializeTenantPurgePlanJobs({ limit: 1 });
     const [left, right] = await Promise.all([
@@ -1416,7 +1453,7 @@ describe("MemorySessionStore tenant purge plan", () => {
   });
 
   it("publishes a healthy neighbor before reporting a damaged T3c source", async () => {
-    const store = new MemorySessionStore({ now: () => 10_000 });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => 10_000 });
     const damaged = await advanceThroughT3c(store, "tenant-purge-plan-damaged", {
       requestId: "erase_00000000-0000-4000-8000-000000000031",
     });
@@ -1443,7 +1480,7 @@ describe("MemorySessionStore tenant purge plan", () => {
 
   it("requires every export and erasure request to retain its reverse idempotency index", async () => {
     let nowMs = 10_100;
-    const store = new MemorySessionStore({ now: () => nowMs });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
     const tenantId = "tenant-purge-plan-reverse-idempotency";
     const userId = "reverse-idempotency-user";
     const exportRequestId = newUserDataExportRequestId();

@@ -446,6 +446,25 @@ describe("real MySQL historical upgrade: frozen 0024 -> 0025", () => {
       expect(await databasePurgeSnapshot(conn)).toEqual(before);
       await expectRedisPurgeDormant(conn);
 
+      const legacyPlan = await migrated.getTenantPurgePlanJob(
+        FROZEN_T3F_TENANT_ID,
+        FROZEN_T3F_REQUEST_ID,
+      );
+      expect(legacyPlan).toMatchObject({
+        phase: "plan_sealed",
+        planEntryCount: 33,
+      });
+      const legacyPlanEntries = await migrated.getTenantPurgePlanEntries(
+        FROZEN_T3F_TENANT_ID,
+        FROZEN_T3F_REQUEST_ID,
+        1,
+      );
+      expect(legacyPlanEntries).toHaveLength(33);
+      expect(legacyPlanEntries.find((entry) => entry.domain === "external_provider"))
+        .toMatchObject({ targetCount: 0, disposition: "not_applicable" });
+      expect(legacyPlanEntries.find((entry) => entry.domain === "kms"))
+        .toMatchObject({ targetCount: 0, disposition: "not_applicable" });
+
       expect(await migrated.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
       const job = await migrated.getTenantRedisPurgeJob(
         FROZEN_T3F_TENANT_ID,

@@ -68,6 +68,9 @@ caller_tenant_erasure_barrier_timeout_ms="${TENANT_ERASURE_BARRIER_TIMEOUT_MS-}"
 caller_tenant_credential_revocation_worker_enabled="${TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED-}"
 caller_tenant_credential_revocation_execution_enabled="${TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED-}"
 caller_credential_lifecycle_tracking_enabled="${CREDENTIAL_LIFECYCLE_TRACKING_ENABLED-}"
+caller_credential_target_execution_adapter="${CREDENTIAL_TARGET_EXECUTION_ADAPTER-}"
+caller_tenant_credential_target_execution_worker_enabled="${TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED-}"
+caller_tenant_credential_target_execution_enabled="${TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED-}"
 caller_tenant_runtime_drain_enabled="${TENANT_RUNTIME_DRAIN_ENABLED-}"
 caller_tenant_runtime_revocation_worker_enabled="${TENANT_RUNTIME_REVOCATION_WORKER_ENABLED-}"
 caller_tenant_runtime_drain_execution_enabled="${TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED-}"
@@ -134,6 +137,9 @@ unset caller_env_index caller_env_name caller_mover_env_names caller_mover_env_w
 [ -n "$caller_tenant_credential_revocation_worker_enabled" ] && TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED="$caller_tenant_credential_revocation_worker_enabled"
 [ -n "$caller_tenant_credential_revocation_execution_enabled" ] && TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED="$caller_tenant_credential_revocation_execution_enabled"
 [ -n "$caller_credential_lifecycle_tracking_enabled" ] && CREDENTIAL_LIFECYCLE_TRACKING_ENABLED="$caller_credential_lifecycle_tracking_enabled"
+[ -n "$caller_credential_target_execution_adapter" ] && CREDENTIAL_TARGET_EXECUTION_ADAPTER="$caller_credential_target_execution_adapter"
+[ -n "$caller_tenant_credential_target_execution_worker_enabled" ] && TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED="$caller_tenant_credential_target_execution_worker_enabled"
+[ -n "$caller_tenant_credential_target_execution_enabled" ] && TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED="$caller_tenant_credential_target_execution_enabled"
 [ -n "$caller_tenant_runtime_drain_enabled" ] && TENANT_RUNTIME_DRAIN_ENABLED="$caller_tenant_runtime_drain_enabled"
 [ -n "$caller_tenant_runtime_revocation_worker_enabled" ] && TENANT_RUNTIME_REVOCATION_WORKER_ENABLED="$caller_tenant_runtime_revocation_worker_enabled"
 [ -n "$caller_tenant_runtime_drain_execution_enabled" ] && TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED="$caller_tenant_runtime_drain_execution_enabled"
@@ -194,6 +200,14 @@ require_tools() {
   [ "$major" -ge 24 ] || die "Node 24+ is required (current: $(node -v))"
 }
 
+require_mysql_credential_target_execution_dormant() {
+  if [ -n "${CREDENTIAL_TARGET_EXECUTION_ADAPTER:-}" ] \
+    || [ "${TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED:-0}" != "0" ] \
+    || [ "${TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED:-0}" != "0" ]; then
+    die "the standard local-service stack uses MySQL and cannot enable the memory-only credential target fake; keep the 0029 adapter unset and both execution gates at 0"
+  fi
+}
+
 infra() {
   if [ "${BLOB_STORE:-filesystem}" = "s3" ] && [ -z "${BLOB_S3_ENDPOINT:-}" ]; then
     MINIO_ENABLED="${MINIO_ENABLED:-1}" deploy/local/infra.sh "$@"
@@ -214,6 +228,7 @@ wait_http() {
 start_apps() {
   require_tools
   [ -f .env ] || die ".env is missing; copy .env.example and fill the required values"
+  require_mysql_credential_target_execution_dormant
   mkdir -p "$STATE_DIR"
   local blob_store="${BLOB_STORE:-filesystem}"
   infra start
@@ -279,6 +294,8 @@ start_apps() {
     # to ignore an authority it must never possess.
     nohup env -u TENANT_ERASURE_OPERATOR_TOKEN -u TENANT_ERASURE_OPERATOR_ID \
       -u TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED \
+      -u CREDENTIAL_TARGET_EXECUTION_ADAPTER \
+      -u TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED \
       -u TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED \
       -u TENANT_PURGE_EXECUTION_ENABLED \
       -u TENANT_DATABASE_PURGE_ENABLED \
@@ -297,6 +314,7 @@ start_apps() {
       TENANT_ERASURE_BARRIER_TIMEOUT_MS="${TENANT_ERASURE_BARRIER_TIMEOUT_MS:-2000}" \
       TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED="${TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED:-0}" \
       CREDENTIAL_LIFECYCLE_TRACKING_ENABLED="${CREDENTIAL_LIFECYCLE_TRACKING_ENABLED:-1}" \
+      TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED=0 \
       TENANT_RUNTIME_DRAIN_ENABLED="${TENANT_RUNTIME_DRAIN_ENABLED:-0}" \
       TENANT_RUNTIME_REVOCATION_WORKER_ENABLED="${TENANT_RUNTIME_REVOCATION_WORKER_ENABLED:-0}" \
       TENANT_CONTENT_INVENTORY_WORKER_ENABLED="${TENANT_CONTENT_INVENTORY_WORKER_ENABLED:-0}" \
@@ -324,6 +342,8 @@ start_apps() {
     echo "router: already running (pid $(sed -n '1p' "$ROUTER_PID_FILE"))"
   else
     nohup env -u TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED \
+      -u CREDENTIAL_TARGET_EXECUTION_ADAPTER \
+      -u TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED \
       -u TENANT_RUNTIME_DRAIN_ENABLED -u TENANT_RUNTIME_REVOCATION_WORKER_ENABLED \
       -u TENANT_CONTENT_INVENTORY_WORKER_ENABLED \
       -u TENANT_PURGE_PLAN_WORKER_ENABLED \
@@ -344,6 +364,7 @@ start_apps() {
       TENANT_ERASURE_REQUESTS_ENABLED="${TENANT_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED="${TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED:-0}" \
       CREDENTIAL_LIFECYCLE_TRACKING_ENABLED="${CREDENTIAL_LIFECYCLE_TRACKING_ENABLED:-1}" \
+      TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED=0 \
       TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED="${TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED:-0}" \
       TENANT_PURGE_EXECUTION_ENABLED="${TENANT_PURGE_EXECUTION_ENABLED:-0}" \
       TENANT_DATABASE_PURGE_ENABLED="${TENANT_DATABASE_PURGE_ENABLED:-0}" \
@@ -418,6 +439,10 @@ verify() {
   # `.env` is loaded for the local workflow, but platform authority must never be inherited by a
   # runner spawned from a test harness. Tests use their own fixed, non-production router credential.
   unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
+  # The standard verification stack is MySQL. Keep the memory-only 0029 fake out of application
+  # subprocesses; the dedicated Memory tests construct it explicitly in-process.
+  unset CREDENTIAL_TARGET_EXECUTION_ADAPTER
+  unset TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED
   infra start
   mkdir -p "$STATE_DIR"
   pnpm run check:secrets
@@ -448,6 +473,8 @@ verify() {
     pnpm run test:tenant-credential-physical-revocation-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-credential-lifecycle-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-credential-target-execution-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-runtime-revocation-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \

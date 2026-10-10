@@ -16,6 +16,13 @@ import {
   type TenantRuntimeParticipant,
 } from "@agent-service/core";
 import type { SecretCipher } from "./secrets.js";
+import {
+  protectProviderCredentialTargetReference,
+  type CredentialTargetReferenceProtector,
+  type ProtectedProviderCredentialTargetReference,
+  type ProviderCredentialTargetReferenceContext,
+  type ProviderCredentialTargetReferenceFactory,
+} from "./credential-target-reference.js";
 import { PROVIDER_PRESETS } from "./presets.js";
 
 export interface PlatformProvider {
@@ -25,7 +32,7 @@ export interface PlatformProvider {
 }
 
 export interface ProviderServiceOptions {
-  store: SessionStore;
+  store: ProviderCredentialTargetReferenceStore;
   cipher: SecretCipher;
   /** platform-level providers usable by every tenant (keys from the runner's own env / KMS) */
   platform?: PlatformProvider[];
@@ -39,6 +46,24 @@ export interface ProviderServiceOptions {
   models?: MutableModels;
   /** Shared runner-local T3b fence. Omitted while the T3b worker is disabled. */
   tenantRuntime?: TenantRuntimeCoordinator;
+  /** Trusted server-side locator source. Public provider input never supplies this value. */
+  credentialTargetReferenceFactory?: ProviderCredentialTargetReferenceFactory;
+  /** Independent from the BYOK secret cipher and required whenever the locator factory is set. */
+  credentialTargetReferenceProtector?: CredentialTargetReferenceProtector;
+}
+
+/**
+ * Additive provider-store contract. Existing stores are structurally compatible because the new
+ * argument is optional; a locator-aware store will consume it atomically with credential-version
+ * creation. The service never passes the argument unless both trusted capture components exist.
+ */
+export interface ProviderCredentialTargetReferenceStore extends SessionStore {
+  upsertProviderConfig(
+    cfg: ProviderConfig,
+    secret?: { ciphertext: Buffer; keyId: string },
+    expectedSourceRevision?: number | null,
+    targetReference?: ProtectedProviderCredentialTargetReference,
+  ): Promise<ProviderConfig>;
 }
 
 const PLATFORM_TENANT = "__platform__";
@@ -113,6 +138,12 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
   private readonly assertBaseUrl: (baseUrl: string) => Promise<void>;
 
   constructor(private readonly opts: ProviderServiceOptions) {
+    if ((opts.credentialTargetReferenceFactory === undefined)
+      !== (opts.credentialTargetReferenceProtector === undefined)) {
+      throw new Error(
+        "credential target reference factory and protector must be configured together",
+      );
+    }
     const validateBaseUrl = opts.assertBaseUrl ?? assertPublicBaseUrl;
     this.assertBaseUrl = async (baseUrl) => {
       // Credential rejection is not injectable: custom DNS guards used by tests/deployments must
@@ -164,12 +195,29 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
           createdAtMs: existing?.config.createdAtMs ?? now,
           updatedAtMs: now,
         });
+        const targetReference = await this.captureCredentialTargetReference({
+          tenantId,
+          providerId: config.id,
+          providerApi: config.api,
+          encryptedSecretPresent: hasSecret,
+          customHeadersPresent: Object.keys(config.headers).length > 0,
+          endpointParametersPresent: (() => {
+            const endpoint = new URL(config.baseUrl);
+            return endpoint.search.length > 0 || endpoint.hash.length > 0;
+          })(),
+        });
+        runtimeLease?.assertOpen();
+        await this.assertTenantGeneration(tenantId, generation);
         try {
-          const stored = await this.opts.store.upsertProviderConfig(
-            config,
-            secret,
-            existing?.credentialSourceRevision ?? absentSourceRevision,
-          );
+          const expectedRevision = existing?.credentialSourceRevision ?? absentSourceRevision;
+          const stored = targetReference === undefined
+            ? await this.opts.store.upsertProviderConfig(config, secret, expectedRevision)
+            : await this.opts.store.upsertProviderConfig(
+                config,
+                secret,
+                expectedRevision,
+                targetReference,
+              );
           runtimeLease?.assertOpen();
           return stored;
         } catch (error) {
@@ -183,6 +231,27 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
         }
       }
     });
+  }
+
+  private async captureCredentialTargetReference(
+    context: ProviderCredentialTargetReferenceContext,
+  ): Promise<ProtectedProviderCredentialTargetReference | undefined> {
+    const factory = this.opts.credentialTargetReferenceFactory;
+    const protector = this.opts.credentialTargetReferenceProtector;
+    if (!factory || !protector) return undefined;
+    if (!context.encryptedSecretPresent
+      && !context.customHeadersPresent
+      && !context.endpointParametersPresent) return undefined;
+    try {
+      const captured = await factory.capture(Object.freeze({ ...context }));
+      return captured === undefined
+        ? undefined
+        : await protectProviderCredentialTargetReference(captured, protector);
+    } catch {
+      // Trusted adapters may surface remote responses or locators in their errors. The generic
+      // runner error handler logs thrown errors, so this boundary must not retain a cause/message.
+      throw new Error("provider credential target reference capture failed");
+    }
   }
 
   async deleteTenantProvider(tenantId: string, providerId: string): Promise<boolean> {

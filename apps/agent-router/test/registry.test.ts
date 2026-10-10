@@ -11,6 +11,7 @@ import {
   PURGE_POLICY_EVALUATOR_V1,
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -477,6 +478,79 @@ describe("RunnerRegistry owner address mapping", () => {
     await registry.refresh();
     expect(registry.allConfiguredSupportTenantCredentialRevocation()).toBe(false);
     expect(registry.allConfiguredSupportTenantCredentialRevocationWorker()).toBe(false);
+    await registry.close();
+  });
+
+  it("requires every configured runner for external credential target execution", async () => {
+    let legacyState: "down" | "legacy" | "tracking-inactive" | "code-only" | "active" = "down";
+    const capabilities = (aware: boolean, worker: boolean, trackingActive: boolean) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        tenantCredentialLifecycle: [TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1],
+        tenantCredentialLifecycleTrackingActive: trackingActive,
+        tenantCredentialTargetExecution: aware
+          ? [TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1]
+          : [],
+        tenantCredentialTargetExecutionWorker: worker,
+        dataPurgeExecution: false,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true, true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        return Response.json(capabilities(
+          legacyState === "code-only" || legacyState === "active",
+          legacyState === "active",
+          legacyState !== "tracking-inactive" && legacyState !== "legacy",
+        ));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allConfiguredSupportTenantCredentialTargetExecution()).toBe(false);
+    expect(registry.allConfiguredSupportTenantCredentialTargetExecutionWorker()).toBe(false);
+
+    for (const state of ["legacy", "tracking-inactive", "code-only"] as const) {
+      legacyState = state;
+      await registry.refresh();
+      expect(registry.allConfiguredSupportTenantCredentialTargetExecution(), state)
+        .toBe(state === "code-only");
+      expect(registry.allConfiguredSupportTenantCredentialTargetExecutionWorker(), state)
+        .toBe(false);
+    }
+    legacyState = "active";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantCredentialTargetExecution()).toBe(true);
+    expect(registry.allConfiguredSupportTenantCredentialTargetExecutionWorker()).toBe(true);
+    legacyState = "down";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantCredentialTargetExecution()).toBe(false);
+    expect(registry.allConfiguredSupportTenantCredentialTargetExecutionWorker()).toBe(false);
     await registry.close();
   });
 

@@ -17,6 +17,8 @@ export * from "./lifecycle/purge-policy-evaluator.js";
 export * from "./lifecycle/user-data-export-worker.js";
 export * from "./lifecycle/user-data-export-cleanup-worker.js";
 export * from "./lifecycle/tenant-credential-revocation-worker.js";
+export * from "./lifecycle/tenant-credential-target-execution-worker.js";
+export * from "./lifecycle/fake-credential-target-execution-adapter.js";
 export * from "./lifecycle/tenant-runtime-revocation-worker.js";
 export * from "./lifecycle/tenant-content-inventory-worker.js";
 export * from "./lifecycle/tenant-purge-plan-worker.js";

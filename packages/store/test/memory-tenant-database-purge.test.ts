@@ -67,6 +67,37 @@ import { mkSession, newId } from "./conformance.js";
 
 const NOW = 40_000;
 
+interface CredentialRolloutClock {
+  advance(): void;
+  release(): void;
+}
+
+const credentialRolloutClocks = new WeakMap<MemorySessionStore, CredentialRolloutClock>();
+
+function memoryStoreWithCredentialRolloutClock(
+  storeClock: { now(): number },
+  memoryOptions: ConstructorParameters<typeof MemorySessionStore>[1] = {},
+): MemorySessionStore {
+  const initialNowMs = storeClock.now();
+  let floorMs = initialNowMs - 2;
+  let released = false;
+  const clock = {
+    now: () => released ? Math.max(floorMs, storeClock.now()) : floorMs,
+  };
+  const store = new MemorySessionStore(clock, memoryOptions);
+  credentialRolloutClocks.set(store, {
+    advance: () => { floorMs += 1; },
+    release: () => { released = true; },
+  });
+  return store;
+}
+
+function credentialRolloutClock(store: MemorySessionStore): CredentialRolloutClock {
+  const clock = credentialRolloutClocks.get(store);
+  if (!clock) throw new Error("expected credential-rollout test clock");
+  return clock;
+}
+
 function policy(): RetentionPolicyDocumentV1 {
   return {
     sessionContentRetentionMs: 0,
@@ -249,9 +280,14 @@ async function advanceToDatabaseClaim(
     databaseClaimToken?: string;
   } = {},
 ) {
+  const rolloutClock = credentialRolloutClock(store);
   await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
   await installPolicy(store, tenantId);
   await options.beforeTenantErasure?.();
+  if ((await store.readTenantCredentialTrackingCutover()).controlGeneration === 0) {
+    await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+  }
+  rolloutClock.advance();
   const lifecycleNotifications = await store.claimLifecycleOutbox({
     topics: ["session.tombstoned"],
     nowMs: NOW,
@@ -293,6 +329,8 @@ async function advanceToDatabaseClaim(
     runtimeAuthorization(runtimeClaim),
     fleetProof(runtimeClaim),
   )).not.toBeNull();
+  rolloutClock.advance();
+  rolloutClock.release();
   await store.materializeTenantContentInventoryJobs({ limit: 10 });
   const inventoryClaim = (await store.claimTenantContentInventories({
     limit: 10,
@@ -959,7 +997,7 @@ function fullyRehashT3fEvidence(
 
 describe("MemorySessionStore tenant database purge", () => {
   it("publishes the fixed zero-target catalog and exact replay without claiming global completion", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-empty";
     const source = await advanceToDatabaseClaim(store, tenantId);
     const [first, replay] = await Promise.all([
@@ -998,7 +1036,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("deletes session content, retains exact billing facts, and globally fences session ID reuse", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-content";
     const target = installSession(store, tenantId, "user-a", true);
     const source = await advanceToDatabaseClaim(store, tenantId, {
@@ -1025,7 +1063,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("preserves every neighboring tenant business projection during destructive execution", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-isolated-target";
     const neighborTenantId = "tenant-database-isolated-neighbor";
     await store.setTenantAuth(neighborTenantId, DEFAULT_AUTH_POLICY);
@@ -1051,7 +1089,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("rolls back every business/evidence map on publication failure and final lease loss", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-rollback";
     let fixture: Awaited<ReturnType<typeof installBusinessProjectionFixture>> | undefined;
     const source = await advanceToDatabaseClaim(store, tenantId, {
@@ -1091,7 +1129,7 @@ describe("MemorySessionStore tenant database purge", () => {
 
     let clockCalls = 0;
     let expire = false;
-    const leaseStore = new MemorySessionStore({
+    const leaseStore = memoryStoreWithCredentialRolloutClock({
       now: () => expire && ++clockCalls >= 3 ? NOW + 6 : NOW,
     });
     const leaseTarget = installSession(leaseStore, "tenant-database-lease", "lease-user");
@@ -1110,7 +1148,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("rejects added/replaced billing facts at the destructive boundary", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-billing-drift";
     const target = installSession(store, tenantId, "billing-user", true);
     const source = await advanceToDatabaseClaim(store, tenantId, {
@@ -1139,7 +1177,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("fails closed for pending/dead-lettered physical projections and canonical holds", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-physical";
     let target: Awaited<ReturnType<typeof installBlob>> | undefined;
     const source = await advanceToDatabaseClaim(store, tenantId, {
@@ -1195,7 +1233,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("refuses completed replay when the write-once cutover is missing or corrupt", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const source = await advanceToDatabaseClaim(store, "tenant-database-cutover");
     const receipt = await store.executeTenantDatabasePurge(source.authorization);
     expect(receipt).not.toBeNull();
@@ -1204,7 +1242,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("rejects a fully rehashed grave/session splice against the immutable T3c catalog", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-grave-splice";
     const first = installSession(store, tenantId, "user-first");
     const second = installSession(store, tenantId, "user-second");
@@ -1222,7 +1260,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("rejects a valid billing-fact replacement after every T3f hash is recomputed", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-billing-rehash";
     const first = installSession(store, tenantId, "billing-first", true);
     const second = installSession(store, tenantId, "billing-second");
@@ -1252,7 +1290,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("rejects a live Blob/outbox replacement even when its post-delete shape is self-consistent", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-blob-splice";
     let target: Awaited<ReturnType<typeof installBlob>> | undefined;
     const source = await advanceToDatabaseClaim(store, tenantId, {
@@ -1284,7 +1322,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("rejects a live export artifact/part/outbox replacement outside the T3e ACK identities", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-export-splice";
     let target: Awaited<ReturnType<typeof installExport>> | undefined;
     const source = await advanceToDatabaseClaim(store, tenantId, {
@@ -1321,7 +1359,7 @@ describe("MemorySessionStore tenant database purge", () => {
   });
 
   it("accepts an exact T3e export successor and removes its completed control/artifact rows", async () => {
-    const store = new MemorySessionStore({ now: () => NOW });
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-export-successor";
     let target: Awaited<ReturnType<typeof installExport>> | undefined;
     const source = await advanceToDatabaseClaim(store, tenantId, {
@@ -1345,7 +1383,7 @@ describe("MemorySessionStore tenant Redis purge", () => {
 
   it("reuses an exact partial ACK across lease takeover, seals once, and isolates tenants", async () => {
     let nowMs = NOW;
-    const store = new MemorySessionStore(
+    const store = memoryStoreWithCredentialRolloutClock(
       { now: () => nowMs },
       { tenantRedisPurgeNamespaceSha256: namespaceSha256 },
     );
@@ -1437,7 +1475,7 @@ describe("MemorySessionStore tenant Redis purge", () => {
   });
 
   it("freezes each restore scan while later ACKs append to the in-memory ledger", async () => {
-    const store = new MemorySessionStore(
+    const store = memoryStoreWithCredentialRolloutClock(
       { now: () => NOW },
       { tenantRedisPurgeNamespaceSha256: namespaceSha256 },
     );
@@ -1491,7 +1529,7 @@ describe("MemorySessionStore tenant Redis purge", () => {
   });
 
   it("rolls back staged publication failures without losing prior target ACKs", async () => {
-    const store = new MemorySessionStore(
+    const store = memoryStoreWithCredentialRolloutClock(
       { now: () => NOW },
       { tenantRedisPurgeNamespaceSha256: namespaceSha256 },
     );

@@ -15,6 +15,7 @@ import type {
 } from "@agent-service/protocol";
 import { blobBindingsFromItems, type BlobBinding } from "./blob-lifecycle.js";
 import type { TenantRuntimeState } from "./subject-lifecycle.js";
+import type { ProviderCredentialTargetReferenceWrite } from "./credential-lifecycle.js";
 
 export interface ApiKeyRecord {
   keyId: string;
@@ -594,6 +595,8 @@ export interface SessionStore {
     secret?: { ciphertext: Buffer; keyId: string },
     /** `undefined` is the rolling-upgrade legacy path; `null` requires a never-written slot. */
     expectedSourceRevision?: number | null,
+    /** Trusted opaque locator captured server-side and committed with the new credential version. */
+    targetReference?: ProviderCredentialTargetReferenceWrite,
   ): Promise<ProviderConfig>;
   getProviderConfig(tenantId: string, providerId: string): Promise<{
     config: ProviderConfig;

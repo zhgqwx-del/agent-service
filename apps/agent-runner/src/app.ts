@@ -60,6 +60,7 @@ import {
   RetentionPolicyPutRequest,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -175,6 +176,10 @@ export interface AppDeps {
   tenantCredentialRevocationWorkerEnabled?: boolean;
   /** Durable write-once tracking state; code awareness is advertised independently. */
   tenantCredentialLifecycleTrackingActive?: () => boolean | Promise<boolean>;
+  /** Concrete external target adapter support; distinct from the local worker activation. */
+  tenantCredentialTargetExecutionSupported?: boolean;
+  /** Local external target worker activation; the router barrier remains independently required. */
+  tenantCredentialTargetExecutionWorkerEnabled?: boolean;
   /** Local T3e worker activation; code awareness remains separately advertised during rollout. */
   tenantPurgeExecutionWorkerEnabled?: boolean;
   /** Local T3f database-content worker activation; its router barrier remains independent. */
@@ -344,6 +349,12 @@ export function createApp(deps: AppDeps) {
         ],
         tenantCredentialLifecycleTrackingActive:
           await deps.tenantCredentialLifecycleTrackingActive?.() === true,
+        tenantCredentialTargetExecution: deps.tenantCredentialTargetExecutionSupported === true
+          ? [TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1]
+          : [],
+        tenantCredentialTargetExecutionWorker:
+          deps.tenantCredentialTargetExecutionSupported === true
+          && deps.tenantCredentialTargetExecutionWorkerEnabled === true,
         // Code awareness and activation are deliberately separate rolling-upgrade signals.
         tenantPurgeExecution: [
           TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,

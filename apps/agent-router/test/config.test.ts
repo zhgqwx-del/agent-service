@@ -17,6 +17,7 @@ describe("router configuration", () => {
     expect(local.PURGE_POLICY_EVALUATOR_ENABLED).toBe(false);
     expect(local.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED).toBe(false);
     expect(local.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED).toBe(false);
+    expect(local.TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED).toBe(false);
     expect(local.TENANT_PURGE_EXECUTION_ENABLED).toBe(false);
     expect(local.TENANT_DATABASE_PURGE_ENABLED).toBe(false);
     expect(local.TENANT_REDIS_PURGE_ENABLED).toBe(false);
@@ -85,6 +86,18 @@ describe("router configuration", () => {
       RUNNERS: "http://runner:8787",
       TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED: "true",
     })).toThrow();
+    expect(() => loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED: "1",
+    })).toThrow(/CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1/);
+    expect(loadRouterConfig({
+      RUNNERS: "http://runner:8787",
+      TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED: "1",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+    })).toMatchObject({
+      TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED: true,
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: true,
+    });
     expect(loadRouterConfig({
       RUNNERS: "http://runner:8787",
       TENANT_PURGE_EXECUTION_ENABLED: "1",

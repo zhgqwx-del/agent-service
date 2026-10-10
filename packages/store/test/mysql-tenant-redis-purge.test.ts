@@ -239,6 +239,10 @@ async function advanceToDatabaseReceipt(
   ));
   for (const session of sessions) await store.createSession(session);
 
+  if ((await store.readTenantCredentialTrackingCutover()).controlGeneration === 0) {
+    await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+  }
+
   await store.requestTenantErasure({
     requestId,
     tenantId,

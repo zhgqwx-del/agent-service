@@ -2,7 +2,9 @@ import { serve } from "@hono/node-server";
 import { randomUUID } from "node:crypto";
 import {
   BlobCleanupWorker,
+  createFakeCredentialTargetExecutionAdapterState,
   ErasureWorker,
+  FakeCredentialTargetExecutionAdapter,
   LegacyTombstoneCompensationWorker,
   LifecycleOutboxDispatcher,
   PiEngine,
@@ -13,6 +15,7 @@ import {
   StaticToolRegistry,
   TenantContentInventoryWorker,
   TenantCredentialRevocationWorker,
+  TenantCredentialTargetExecutionWorker,
   TenantDatabasePurgeWorker,
   TenantRedisPurgeWorker,
   TenantPurgeExecutionWorker,
@@ -53,6 +56,7 @@ import {
   type RetentionPolicyStore,
   type SubjectLifecycleStore,
   type TenantCredentialRevocationStore,
+  type TenantCredentialTargetExecutionStore,
   type TenantDatabasePurgeStore,
   type TenantRedisPurgeStore,
   type TenantContentInventoryStore,
@@ -67,6 +71,8 @@ import {
 } from "@agent-service/store";
 import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
+import { createLocalFakeCredentialTargetReferenceCapture } from
+  "./credential-target-reference-local.js";
 import { reconcileBlobStorageControlForRuntime } from "./blob-storage-control.js";
 import { assertBlobStorageMigrationRuntimeReady } from "./blob-storage-migration-gate.js";
 import { loadConfig } from "./config.js";
@@ -74,6 +80,7 @@ import { RouterErasureSessionExecutor } from "./erasure-executor.js";
 import { RouterPurgePolicyEvaluationGate } from "./purge-policy-evaluation-gate.js";
 import { RouterTenantErasureAdmissionGate } from "./tenant-erasure-admission-gate.js";
 import { RouterTenantCredentialRevocationGate } from "./tenant-credential-revocation-gate.js";
+import { RouterTenantCredentialTargetExecutionGate } from "./tenant-credential-target-execution-gate.js";
 import { RouterTenantDatabasePurgeGate } from "./tenant-database-purge-gate.js";
 import { RouterTenantRedisPurgeGate } from "./tenant-redis-purge-gate.js";
 import { RouterTenantPurgeExecutionGate } from "./tenant-purge-execution-gate.js";
@@ -93,6 +100,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & BlobStorageControlStore
     & SubjectLifecycleStore
     & TenantCredentialRevocationStore
+    & TenantCredentialTargetExecutionStore
     & TenantDatabasePurgeStore
     & TenantRedisPurgeStore
     & TenantContentInventoryStore
@@ -142,6 +150,29 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     await store.close();
     throw new Error(
       "TENANT_REDIS_PURGE_WORKER_ENABLED=1 is required after durable T3g Redis purge work exists",
+    );
+  }
+  let credentialTargetExecutionCutover:
+    Awaited<ReturnType<TenantCredentialTargetExecutionStore[
+      "getTenantCredentialTargetExecutionCutover"
+    ]>>;
+  let hasCredentialTargetExecutionJobs: boolean;
+  try {
+    credentialTargetExecutionCutover =
+      await store.getTenantCredentialTargetExecutionCutover();
+    hasCredentialTargetExecutionJobs =
+      await store.hasTenantCredentialTargetExecutionJobs();
+  } catch (error) {
+    await store.close().catch(() => {});
+    throw error;
+  }
+  if ((hasCredentialTargetExecutionJobs
+      || credentialTargetExecutionCutover.controlGeneration === 1)
+    && (!cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED
+      || cfg.CREDENTIAL_TARGET_EXECUTION_ADAPTER !== "fake")) {
+    await store.close();
+    throw new Error(
+      "the credential target execution worker and adapter are required after durable 0029 work exists",
     );
   }
   const lease: LeaseStore = cfg.REDIS_URL
@@ -324,8 +355,28 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     platform.push({ config, apiKey: cfg.API_KEY });
   }
   const cipher = new LocalAesGcmCipher(cfg.SECRETS_MASTER_KEY);
+  const credentialTargetExecutionState = cfg.CREDENTIAL_TARGET_EXECUTION_ADAPTER === "fake"
+    ? createFakeCredentialTargetExecutionAdapterState()
+    : undefined;
+  const credentialTargetExecutionAdapter = credentialTargetExecutionState
+    ? new FakeCredentialTargetExecutionAdapter(credentialTargetExecutionState)
+    : undefined;
+  const credentialTargetReferenceCapture = credentialTargetExecutionAdapter
+    ? createLocalFakeCredentialTargetReferenceCapture(cfg.SECRETS_MASTER_KEY)
+    : undefined;
   const tenantRuntime = new TenantRuntimeCoordinator();
-  const providers = new ProviderService({ store, cipher, platform, tenantRuntime });
+  const providers = new ProviderService({
+    store,
+    cipher,
+    platform,
+    tenantRuntime,
+    ...(credentialTargetExecutionAdapter && credentialTargetReferenceCapture
+      ? {
+          credentialTargetReferenceFactory: credentialTargetReferenceCapture.factory,
+          credentialTargetReferenceProtector: credentialTargetReferenceCapture.protector,
+        }
+      : {}),
+  });
   const tools = new StaticToolRegistry(builtinTools);
   const host = new SessionHost({
     store, erasureStore: store, lease, bus, providers, tools, blobs, tenantRuntime,
@@ -461,6 +512,30 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       canExecute: () => tenantCredentialRevocationGate.canExecute(),
     })
     : undefined;
+  const tenantCredentialTargetExecutionGate =
+    cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED
+      ? new RouterTenantCredentialTargetExecutionGate({
+          routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+          internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+          requestTimeoutMs: cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS,
+        })
+      : undefined;
+  const tenantCredentialTargetExecutionWorker =
+    tenantCredentialTargetExecutionGate && credentialTargetExecutionAdapter
+      ? new TenantCredentialTargetExecutionWorker({
+          store,
+          adapter: credentialTargetExecutionAdapter,
+          canExecute: () => tenantCredentialTargetExecutionGate.canExecute(),
+        }, {
+          pollIntervalMs: cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_POLL_MS,
+          leaseMs: cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_LEASE_MS,
+          batchSize: cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_BATCH_SIZE,
+          materializeBatchSize:
+            cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_MATERIALIZE_BATCH_SIZE,
+          retryBaseMs: cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_BASE_MS,
+          retryMaxMs: cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS,
+        })
+      : undefined;
   const tenantRuntimeBootId = randomUUID();
   const tenantRuntimeDrain = new LocalTenantRuntimeDrain(store, tenantRuntime, {
     runnerId: cfg.RUNNER_ID,
@@ -554,6 +629,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   dataExportWorker?.start();
   dataExportCleanup?.start();
   tenantCredentialRevocationWorker?.start();
+  tenantCredentialTargetExecutionWorker?.start();
   tenantContentInventoryWorker?.start();
   tenantPurgePlanWorker?.start();
   tenantPurgeExecutionWorker?.start();
@@ -589,6 +665,10 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantCredentialLifecycleTrackingActive: async () => (
       (await store.readTenantCredentialTrackingCutover()).controlGeneration === 1
     ),
+    tenantCredentialTargetExecutionSupported:
+      credentialTargetExecutionAdapter !== undefined,
+    tenantCredentialTargetExecutionWorkerEnabled:
+      tenantCredentialTargetExecutionWorker !== undefined,
     tenantPurgeExecutionWorkerEnabled:
       tenantPurgeExecutionWorker !== undefined,
     tenantDatabasePurgeWorkerEnabled:
@@ -629,6 +709,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         dataExportWorker?.stop(),
         dataExportCleanup?.stop(),
         tenantCredentialRevocationWorker?.stop(),
+        tenantCredentialTargetExecutionWorker?.stop(),
         tenantRuntimeRevocationWorker?.stop(),
         tenantContentInventoryWorker?.stop(),
         tenantPurgePlanWorker?.stop(),
@@ -674,12 +755,14 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobStore=${cfg.BLOB_STORE} blobControl=${blobStorageControlGeneration} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobStore=${cfg.BLOB_STORE} blobControl=${blobStorageControlGeneration} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} credentialTargetExecutionWorker=${cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,
     dataExportWorker, dataExportCleanup, tenantErasureAdmissionGate,
     tenantCredentialRevocationGate, tenantCredentialRevocationWorker,
+    tenantCredentialTargetExecutionGate, tenantCredentialTargetExecutionWorker,
+    credentialTargetExecutionAdapter, credentialTargetExecutionState,
     tenantRuntime, tenantRuntimeDrain, tenantRuntimeDrainClient,
     tenantRuntimeRevocationWorker, tenantContentInventoryWorker, tenantPurgePlanWorker,
     tenantPurgeExecutionGate, tenantPurgeExecutionWorker,

@@ -41,6 +41,7 @@ import {
   LegacyTombstoneCompensationWorker,
   PurgePolicyEvaluator,
   TenantContentInventoryWorker,
+  TenantCredentialTargetExecutionWorker,
   TenantDatabasePurgeWorker,
   TenantPurgeExecutionWorker,
   TenantPurgePlanWorker,
@@ -59,6 +60,47 @@ const MASTER_KEY = "88".repeat(32);
 const INTERNAL_TOKEN = "runner-main-private-router-token-0001";
 
 describe("runner main blob wiring", () => {
+  it("wires the explicit local fake credential target executor without exposing references", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-credential-target-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        NODE_ENV: "test",
+        STORE: "memory",
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+        CREDENTIAL_TARGET_EXECUTION_ADAPTER: "fake",
+        TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED: "1",
+        TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_POLL_MS: "60000",
+        ERASURE_ROUTER_URL: "http://router.internal",
+      });
+      expect(runner.tenantCredentialTargetExecutionWorker)
+        .toBeInstanceOf(TenantCredentialTargetExecutionWorker);
+      expect(runner.credentialTargetExecutionAdapter).toBeDefined();
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: {
+          tenantCredentialLifecycleTrackingActive: true,
+          tenantCredentialTargetExecution: ["external-credential-execution-v1"],
+          tenantCredentialTargetExecutionWorker: true,
+        },
+      });
+      expect(JSON.stringify([...runner.credentialTargetExecutionState!.operations.values()]))
+        .not.toContain(MASTER_KEY);
+      await runner.close();
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      warn.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
   it("activates the durable credential tracking cutover before advertising it", async () => {
     const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-credential-tracking-"));
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -125,6 +167,50 @@ describe("runner main blob wiring", () => {
       await rm(blobDir, { recursive: true, force: true });
     }
   });
+
+  it.each(["job", "cutover"] as const)(
+    "fails closed before bootstrap when durable 0029 %s evidence exists without the executor",
+    async (evidence) => {
+      const blobDir = await mkdtemp(join(tmpdir(), `agent-runner-target-${evidence}-`));
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const cutover = vi.spyOn(
+        MemorySessionStore.prototype,
+        "getTenantCredentialTargetExecutionCutover",
+      ).mockResolvedValue(evidence === "cutover"
+        ? ({ singletonId: 1, controlGeneration: 1 } as never)
+        : { singletonId: 1, controlGeneration: 0 });
+      const jobs = vi.spyOn(
+        MemorySessionStore.prototype,
+        "hasTenantCredentialTargetExecutionJobs",
+      ).mockResolvedValue(evidence === "job");
+      const bootstrap = vi.spyOn(MemorySessionStore.prototype, "createApiKey");
+      const close = vi.spyOn(MemorySessionStore.prototype, "close");
+      try {
+        mockedServer.listening = false;
+        await expect(startRunner({
+          NODE_ENV: "test",
+          STORE: "memory",
+          SECRETS_MASTER_KEY: MASTER_KEY,
+          RUNNER_PORT: "0",
+          RUNNER_ADDR: "127.0.0.1:0",
+          BLOB_DIR: blobDir,
+          BOOTSTRAP_API_KEY: "must-not-be-written",
+        })).rejects.toThrow(
+          "the credential target execution worker and adapter are required after durable 0029 work exists",
+        );
+        expect(bootstrap).not.toHaveBeenCalled();
+        expect(close).toHaveBeenCalledOnce();
+        expect(mockedServer.listening).toBe(false);
+      } finally {
+        close.mockRestore();
+        bootstrap.mockRestore();
+        jobs.mockRestore();
+        cutover.mockRestore();
+        log.mockRestore();
+        await rm(blobDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("closes startup resources when credential tracking activation fails before commit", async () => {
     const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-credential-activation-failure-"));

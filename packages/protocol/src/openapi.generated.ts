@@ -1259,6 +1259,21 @@ export const OPENAPI_DOCUMENT = {
                 "default": false,
                 "type": "boolean"
               },
+              "tenantCredentialTargetExecution": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "external-credential-execution-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantCredentialTargetExecutionWorker": {
+                "default": false,
+                "type": "boolean"
+              },
               "tenantDatabasePurgeWorker": {
                 "default": false,
                 "type": "boolean"

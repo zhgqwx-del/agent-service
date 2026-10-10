@@ -29,6 +29,7 @@ import {
   mergeLimits,
   StartTurnRequest,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -699,6 +700,44 @@ describe("protocol schemas", () => {
     expect(Capabilities.safeParse({
       ...base,
       features: { ...base.features, dataPurgeExecution: true },
+    }).success).toBe(false);
+  });
+
+  it("keeps external credential target execution awareness separate from worker activation", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    expect(base.features.tenantCredentialTargetExecution).toEqual([]);
+    expect(base.features.tenantCredentialTargetExecutionWorker).toBe(false);
+    const aware = Capabilities.parse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantCredentialTargetExecution: [TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1],
+        tenantCredentialTargetExecutionWorker: true,
+      },
+    });
+    expect(aware.features.tenantCredentialTargetExecution)
+      .toEqual([TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1]);
+    expect(aware.features.tenantCredentialTargetExecutionWorker).toBe(true);
+    expect(Capabilities.safeParse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantCredentialTargetExecution: ["kms-key-destroy-v1"],
+      },
     }).success).toBe(false);
   });
 

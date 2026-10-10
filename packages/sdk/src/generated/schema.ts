@@ -1147,6 +1147,10 @@ export type components = {
                 readonly tenantCredentialRevocation?: readonly "credential-store-v1"[];
                 /** @default false */
                 readonly tenantCredentialRevocationWorker?: boolean;
+                /** @default [] */
+                readonly tenantCredentialTargetExecution?: readonly "external-credential-execution-v1"[];
+                /** @default false */
+                readonly tenantCredentialTargetExecutionWorker?: boolean;
                 /** @default false */
                 readonly tenantDatabasePurgeWorker?: boolean;
                 /** @default [] */

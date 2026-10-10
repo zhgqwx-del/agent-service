@@ -362,6 +362,9 @@ async function advanceToDatabasePurgeClaim(
     );
     completedBlob = { blobId, outboxId: inserted.insertId, createdAtMs };
   }
+  if ((await store.readTenantCredentialTrackingCutover()).controlGeneration === 0) {
+    await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+  }
   const requestId = newErasureRequestId();
   await store.requestTenantErasure({
     requestId,

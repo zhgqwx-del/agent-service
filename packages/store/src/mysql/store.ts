@@ -433,6 +433,7 @@ import {
   tenantCredentialSubjectEvidenceSha256,
   tenantCredentialSubjectRootSha256,
   tenantCredentialTargetDispositionEvidenceSha256,
+  tenantCredentialTargetDispositionMatchesVersion,
   tenantCredentialTargetDispositionRootSha256,
   tenantCredentialTrackingCutoverEvidenceSha256,
   tenantCredentialVersionEvidenceSha256,
@@ -440,12 +441,14 @@ import {
   tenantCredentialVersionRootSha256,
   validateTenantCredentialInventoryReceipt,
   validateTenantCredentialLifecycleSnapshot,
+  validateProviderCredentialTargetReferenceWrite,
   validateTenantCredentialTrackingCutoverRecord,
   type ActivateTenantCredentialTrackingInput,
   type CredentialLifecycleStore,
   type TenantCredentialAuthSlot,
   type TenantCredentialInventoryReceipt,
   type TenantCredentialLifecycleSnapshot,
+  type ProviderCredentialTargetReferenceWrite,
   type TenantCredentialProviderSlot,
   type TenantCredentialTargetDisposition,
   type TenantCredentialTrackingCutoverRecord,
@@ -541,6 +544,7 @@ import {
   isTenantPurgePlanBlockingDisposition,
   tenantPurgePlanAuthorizationMatches,
   tenantPurgePlanBlockerRootSha256,
+  tenantCredentialPurgePlanTargetEvidence,
   tenantPurgePlanClaimFromJob,
   tenantPurgePlanClaimTokenSha256,
   tenantPurgePlanDomainOrdinal,
@@ -773,6 +777,53 @@ import {
   type TenantRedisPurgeTarget,
   type TenantRedisPurgeTargetAck,
 } from "../tenant-redis-purge.js";
+import {
+  EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_ADAPTER_EVIDENCE_ROOT_SHA256,
+  EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ACK_ROOT_SHA256,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_PROTOCOL,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_RECEIPT_SCOPE,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ACK_SCOPE,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_SCOPE,
+  tenantCredentialTargetExecutionAdapterEvidenceRootSha256,
+  tenantCredentialTargetExecutionClaimTokenSha256,
+  tenantCredentialTargetExecutionCutoverEvidenceSha256,
+  tenantCredentialTargetExecutionOperationIdSha256,
+  tenantCredentialTargetExecutionReceiptSha256,
+  tenantCredentialTargetExecutionTargetAckRootSha256,
+  tenantCredentialTargetExecutionTargetAckSha256,
+  tenantCredentialTargetExecutionTargetRootSha256,
+  tenantCredentialTargetExecutionTargetSha256,
+  validateClaimTenantCredentialTargetExecutionsOptions,
+  validateMaterializeTenantCredentialTargetExecutionJobsOptions,
+  validateRenewTenantCredentialTargetExecutionOptions,
+  validateRetryTenantCredentialTargetExecutionOptions,
+  validateTenantCredentialTargetExecutionAdapterResult,
+  validateTenantCredentialTargetExecutionAuthorization,
+  validateTenantCredentialTargetExecutionClaim,
+  validateTenantCredentialTargetExecutionCutoverRecord,
+  validateTenantCredentialTargetExecutionEncryptedReference,
+  validateTenantCredentialTargetExecutionJobRecord,
+  validateTenantCredentialTargetExecutionReceipt,
+  validateTenantCredentialTargetExecutionTarget,
+  validateTenantCredentialTargetExecutionTargetAck,
+  type ClaimTenantCredentialTargetExecutionsOptions,
+  type MaterializeTenantCredentialTargetExecutionJobsOptions,
+  type RenewTenantCredentialTargetExecutionOptions,
+  type RetryTenantCredentialTargetExecutionOptions,
+  type TenantCredentialTargetExecutionAdapterResult,
+  type TenantCredentialTargetExecutionAuthorization,
+  type TenantCredentialTargetExecutionBlockReasonCode,
+  type TenantCredentialTargetExecutionClaim,
+  type TenantCredentialTargetExecutionCutoverRecord,
+  type TenantCredentialTargetExecutionEncryptedReference,
+  type TenantCredentialTargetExecutionJobRecord,
+  type TenantCredentialTargetExecutionReceipt,
+  type TenantCredentialTargetExecutionSource,
+  type TenantCredentialTargetExecutionStore,
+  type TenantCredentialTargetExecutionTarget,
+  type TenantCredentialTargetExecutionTargetAck,
+} from "../tenant-credential-target-execution.js";
 
 type Row = RowDataPacket;
 const json = (v: unknown) => JSON.stringify(v);
@@ -1048,6 +1099,48 @@ const TENANT_REDIS_PURGE_RECEIPT_COLUMNS = `scope, request_id, tenant_id,
 const TENANT_REDIS_PURGE_CUTOVER_COLUMNS = `singleton_id, control_generation,
   activated_at_db_ms, first_request_id, first_receipt_sha256,
   redis_namespace_sha256, evidence_sha256`;
+const TENANT_CREDENTIAL_TARGET_EXECUTION_JOB_COLUMNS = `request_id, tenant_id,
+  subject_generation, target_execution_generation, t3a_receipt_sha256,
+  inventory_receipt_sha256, tracking_cutover_evidence_sha256, version_count,
+  version_root_sha256, target_disposition_count, target_disposition_root_sha256,
+  external_credential_target_count, external_credential_target_root_sha256,
+  external_credential_blocker_count, kms_key_blocker_count,
+  kms_key_executable_target_count, source_evidence_db_ms, phase, target_count,
+  target_root_sha256, target_ack_count, target_ack_root_sha256,
+  adapter_evidence_count, adapter_evidence_root_sha256, unresolved_blocker_count,
+  available_at_ms, attempts, claim_token, lease_until_ms, last_error_code,
+  created_at_ms, updated_at_ms, terminal_receipt_sha256, sealed_at_db_ms,
+  completed_claim_attempt, completed_claim_token_sha256, blocked_at_db_ms,
+  blocked_reason_code`;
+const TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_COLUMNS = `request_id, tenant_id,
+  subject_generation, target_execution_generation, scope, target_ordinal,
+  credential_version_id, domain, source_disposition,
+  target_disposition_evidence_sha256, adapter_protocol,
+  target_reference_cipher_sha256, target_reference_key_id,
+  target_reference_sha256, operation_id_sha256, captured_at_db_ms, receipt_sha256`;
+const TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_COLUMNS = `request_id, tenant_id,
+  subject_generation, target_execution_generation, scope, target_ordinal,
+  credential_version_id, domain, target_receipt_sha256, operation_id_sha256,
+  adapter_protocol, target_reference_sha256, outcome, adapter_evidence_sha256,
+  completed_claim_attempt, completed_claim_token_sha256, store_db_timestamp_ms,
+  receipt_sha256`;
+const TENANT_CREDENTIAL_TARGET_EXECUTION_RECEIPT_COLUMNS = `request_id, tenant_id,
+  subject_generation, target_execution_generation, t3a_receipt_sha256,
+  inventory_receipt_sha256, tracking_cutover_evidence_sha256, version_count,
+  version_root_sha256, target_disposition_count, target_disposition_root_sha256,
+  external_credential_target_count, external_credential_target_root_sha256,
+  external_credential_blocker_count, kms_key_blocker_count,
+  kms_key_executable_target_count, source_evidence_db_ms, scope, target_count,
+  target_root_sha256, target_ack_count, target_ack_root_sha256,
+  adapter_evidence_count, adapter_evidence_root_sha256,
+  external_credential_execution_complete, kms_key_execution_complete,
+  all_domains_complete, content_purge_executed, unresolved_blocker_count,
+  completed_claim_attempt, completed_claim_token_sha256, store_db_timestamp_ms,
+  receipt_sha256`;
+const TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_COLUMNS = `singleton_id,
+  control_generation, activated_at_db_ms, first_request_id, first_receipt_sha256,
+  execution_protocol, external_credential_execution_enabled,
+  kms_key_execution_enabled, evidence_sha256`;
 type TenantContentSessionRow = {
   sessionId: string;
   tenantId: string;
@@ -3910,6 +4003,380 @@ function rowToTenantDatabasePurgeCutover(row: Row | undefined): TenantDatabasePu
   }
 }
 
+function rowTenantCredentialTargetExecutionSource(
+  row: Row,
+): TenantCredentialTargetExecutionSource {
+  return {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: storedSafeInteger(
+      row.subject_generation,
+      "stored credential target execution subject generation",
+      1,
+    ),
+    targetExecutionGeneration: storedSafeInteger(
+      row.target_execution_generation,
+      "stored credential target execution generation",
+      1,
+    ),
+    t3aReceiptSha256: String(row.t3a_receipt_sha256),
+    inventoryReceiptSha256: String(row.inventory_receipt_sha256),
+    trackingCutoverEvidenceSha256: String(row.tracking_cutover_evidence_sha256),
+    versionCount: storedSafeInteger(
+      row.version_count,
+      "stored credential target execution version count",
+    ),
+    versionRootSha256: String(row.version_root_sha256),
+    targetDispositionCount: storedSafeInteger(
+      row.target_disposition_count,
+      "stored credential target execution disposition count",
+    ),
+    targetDispositionRootSha256: String(row.target_disposition_root_sha256),
+    externalCredentialTargetCount: storedSafeInteger(
+      row.external_credential_target_count,
+      "stored credential target execution external target count",
+    ),
+    externalCredentialTargetRootSha256: String(
+      row.external_credential_target_root_sha256,
+    ),
+    externalCredentialBlockerCount: storedSafeInteger(
+      row.external_credential_blocker_count,
+      "stored credential target execution external blocker count",
+    ),
+    kmsKeyBlockerCount: storedSafeInteger(
+      row.kms_key_blocker_count,
+      "stored credential target execution KMS blocker count",
+    ),
+    kmsKeyExecutableTargetCount: storedSafeInteger(
+      row.kms_key_executable_target_count,
+      "stored credential target execution KMS executable count",
+    ) as 0,
+    sourceEvidenceDbMs: storedSafeInteger(
+      row.source_evidence_db_ms,
+      "stored credential target execution source timestamp",
+    ),
+  };
+}
+
+function tenantCredentialTargetExecutionSourceFromJob(
+  job: TenantCredentialTargetExecutionJobRecord,
+): TenantCredentialTargetExecutionSource {
+  return {
+    requestId: job.requestId,
+    tenantId: job.tenantId,
+    subjectGeneration: job.subjectGeneration,
+    targetExecutionGeneration: job.targetExecutionGeneration,
+    t3aReceiptSha256: job.t3aReceiptSha256,
+    inventoryReceiptSha256: job.inventoryReceiptSha256,
+    trackingCutoverEvidenceSha256: job.trackingCutoverEvidenceSha256,
+    versionCount: job.versionCount,
+    versionRootSha256: job.versionRootSha256,
+    targetDispositionCount: job.targetDispositionCount,
+    targetDispositionRootSha256: job.targetDispositionRootSha256,
+    externalCredentialTargetCount: job.externalCredentialTargetCount,
+    externalCredentialTargetRootSha256: job.externalCredentialTargetRootSha256,
+    externalCredentialBlockerCount: job.externalCredentialBlockerCount,
+    kmsKeyBlockerCount: job.kmsKeyBlockerCount,
+    kmsKeyExecutableTargetCount: 0,
+    sourceEvidenceDbMs: job.sourceEvidenceDbMs,
+  };
+}
+
+function rowToTenantCredentialTargetExecutionJob(
+  row: Row,
+): TenantCredentialTargetExecutionJobRecord {
+  try {
+    const common = {
+      ...rowTenantCredentialTargetExecutionSource(row),
+      targetCount: storedSafeInteger(
+        row.target_count,
+        "stored credential target execution target count",
+      ),
+      targetRootSha256: String(row.target_root_sha256),
+      targetAckCount: storedSafeInteger(
+        row.target_ack_count,
+        "stored credential target execution ACK count",
+      ),
+      targetAckRootSha256: String(row.target_ack_root_sha256),
+      adapterEvidenceCount: storedSafeInteger(
+        row.adapter_evidence_count,
+        "stored credential target execution adapter evidence count",
+      ),
+      adapterEvidenceRootSha256: String(row.adapter_evidence_root_sha256),
+      unresolvedBlockerCount: storedSafeInteger(
+        row.unresolved_blocker_count,
+        "stored credential target execution blocker count",
+      ),
+      attempts: storedSafeInteger(row.attempts, "stored credential target execution attempts"),
+      createdAtMs: storedSafeInteger(
+        row.created_at_ms,
+        "stored credential target execution creation timestamp",
+      ),
+      updatedAtMs: storedSafeInteger(
+        row.updated_at_ms,
+        "stored credential target execution update timestamp",
+      ),
+    };
+    const phase = String(row.phase);
+    let job: TenantCredentialTargetExecutionJobRecord;
+    if (phase === "queued") {
+      job = {
+        ...common,
+        phase,
+        availableAtMs: storedSafeInteger(
+          row.available_at_ms,
+          "stored credential target execution availability",
+        ),
+        ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+        ...(row.lease_until_ms == null ? {} : {
+          leaseUntilMs: storedSafeInteger(
+            row.lease_until_ms,
+            "stored credential target execution lease",
+          ),
+        }),
+        ...(row.last_error_code == null ? {} : {
+          lastErrorCode: String(row.last_error_code) as Extract<
+            TenantCredentialTargetExecutionJobRecord,
+            { phase: "queued" }
+          >["lastErrorCode"],
+        }),
+      };
+    } else if (phase === "external_credential_sealed") {
+      job = {
+        ...common,
+        phase,
+        terminalReceiptSha256: String(row.terminal_receipt_sha256),
+        sealedAtDbMs: storedSafeInteger(
+          row.sealed_at_db_ms,
+          "stored credential target execution seal timestamp",
+        ),
+        completedClaimAttempt: storedSafeInteger(
+          row.completed_claim_attempt,
+          "stored credential target execution completion attempt",
+          1,
+        ),
+        completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      };
+    } else if (phase === "blocked") {
+      job = {
+        ...common,
+        phase,
+        blockedAtDbMs: storedSafeInteger(
+          row.blocked_at_db_ms,
+          "stored credential target execution block timestamp",
+        ),
+        blockedReasonCode: String(row.blocked_reason_code) as
+          TenantCredentialTargetExecutionBlockReasonCode,
+      };
+    } else {
+      throw new Error("stored credential target execution phase is invalid");
+    }
+    validateTenantCredentialTargetExecutionJobRecord(job);
+    return job;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantCredentialTargetExecutionTarget(
+  row: Row,
+): TenantCredentialTargetExecutionTarget {
+  try {
+    const target: TenantCredentialTargetExecutionTarget = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored credential execution target subject generation",
+        1,
+      ),
+      targetExecutionGeneration: storedSafeInteger(
+        row.target_execution_generation,
+        "stored credential execution target generation",
+        1,
+      ),
+      scope: String(row.scope) as TenantCredentialTargetExecutionTarget["scope"],
+      targetOrdinal: storedSafeInteger(
+        row.target_ordinal,
+        "stored credential execution target ordinal",
+      ),
+      credentialVersionId: String(row.credential_version_id),
+      domain: String(row.domain) as TenantCredentialTargetExecutionTarget["domain"],
+      sourceDisposition: String(
+        row.source_disposition,
+      ) as TenantCredentialTargetExecutionTarget["sourceDisposition"],
+      targetDispositionEvidenceSha256: String(row.target_disposition_evidence_sha256),
+      adapterProtocol: String(row.adapter_protocol),
+      targetReferenceCipherSha256: String(row.target_reference_cipher_sha256),
+      targetReferenceKeyId: String(row.target_reference_key_id),
+      targetReferenceSha256: String(row.target_reference_sha256),
+      operationIdSha256: String(row.operation_id_sha256),
+      capturedAtDbMs: storedSafeInteger(
+        row.captured_at_db_ms,
+        "stored credential execution target timestamp",
+      ),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantCredentialTargetExecutionTarget(target);
+    return target;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantCredentialTargetExecutionTargetAck(
+  row: Row,
+): TenantCredentialTargetExecutionTargetAck {
+  try {
+    const ack: TenantCredentialTargetExecutionTargetAck = {
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(
+        row.subject_generation,
+        "stored credential execution ACK subject generation",
+        1,
+      ),
+      targetExecutionGeneration: storedSafeInteger(
+        row.target_execution_generation,
+        "stored credential execution ACK generation",
+        1,
+      ),
+      scope: String(row.scope) as TenantCredentialTargetExecutionTargetAck["scope"],
+      targetOrdinal: storedSafeInteger(
+        row.target_ordinal,
+        "stored credential execution ACK ordinal",
+      ),
+      credentialVersionId: String(row.credential_version_id),
+      domain: String(row.domain) as TenantCredentialTargetExecutionTargetAck["domain"],
+      targetReceiptSha256: String(row.target_receipt_sha256),
+      operationIdSha256: String(row.operation_id_sha256),
+      adapterProtocol: String(row.adapter_protocol),
+      targetReferenceSha256: String(row.target_reference_sha256),
+      outcome: String(row.outcome) as TenantCredentialTargetExecutionTargetAck["outcome"],
+      adapterEvidenceSha256: String(row.adapter_evidence_sha256),
+      completedClaimAttempt: storedSafeInteger(
+        row.completed_claim_attempt,
+        "stored credential execution ACK attempt",
+        1,
+      ),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      storeDbTimestampMs: storedSafeInteger(
+        row.store_db_timestamp_ms,
+        "stored credential execution ACK timestamp",
+      ),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantCredentialTargetExecutionTargetAck(ack);
+    return ack;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantCredentialTargetExecutionReceipt(
+  row: Row,
+): TenantCredentialTargetExecutionReceipt {
+  try {
+    const receipt: TenantCredentialTargetExecutionReceipt = {
+      ...rowTenantCredentialTargetExecutionSource(row),
+      scope: String(row.scope) as TenantCredentialTargetExecutionReceipt["scope"],
+      targetCount: storedSafeInteger(
+        row.target_count,
+        "stored credential execution receipt target count",
+      ),
+      targetRootSha256: String(row.target_root_sha256),
+      targetAckCount: storedSafeInteger(
+        row.target_ack_count,
+        "stored credential execution receipt ACK count",
+      ),
+      targetAckRootSha256: String(row.target_ack_root_sha256),
+      adapterEvidenceCount: storedSafeInteger(
+        row.adapter_evidence_count,
+        "stored credential execution receipt adapter evidence count",
+      ),
+      adapterEvidenceRootSha256: String(row.adapter_evidence_root_sha256),
+      externalCredentialExecutionComplete: tenantCredentialBoolean(
+        row.external_credential_execution_complete,
+        "stored external credential execution completion flag",
+      ) as true,
+      kmsKeyExecutionComplete: tenantCredentialBoolean(
+        row.kms_key_execution_complete,
+        "stored KMS execution completion flag",
+      ) as false,
+      allDomainsComplete: tenantCredentialBoolean(
+        row.all_domains_complete,
+        "stored credential execution all-domains flag",
+      ) as false,
+      contentPurgeExecuted: tenantCredentialBoolean(
+        row.content_purge_executed,
+        "stored credential execution content-purge flag",
+      ) as false,
+      unresolvedBlockerCount: storedSafeInteger(
+        row.unresolved_blocker_count,
+        "stored credential execution receipt blocker count",
+      ),
+      completedClaimAttempt: storedSafeInteger(
+        row.completed_claim_attempt,
+        "stored credential execution receipt attempt",
+        1,
+      ),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      storeDbTimestampMs: storedSafeInteger(
+        row.store_db_timestamp_ms,
+        "stored credential execution receipt timestamp",
+      ),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    validateTenantCredentialTargetExecutionReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantCredentialTargetExecutionCutover(
+  row: Row | undefined,
+): TenantCredentialTargetExecutionCutoverRecord {
+  try {
+    if (!row) throw new Error("credential target execution cutover is missing");
+    const generation = storedSafeInteger(
+      row.control_generation,
+      "stored credential target execution cutover generation",
+    );
+    const record: TenantCredentialTargetExecutionCutoverRecord = generation === 0
+      ? {
+          singletonId: TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+          controlGeneration: 0,
+        }
+      : {
+          singletonId: TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+          controlGeneration: generation as 1,
+          activatedAtDbMs: storedSafeInteger(
+            row.activated_at_db_ms,
+            "stored credential target execution cutover timestamp",
+          ),
+          firstRequestId: String(row.first_request_id),
+          firstReceiptSha256: String(row.first_receipt_sha256),
+          executionProtocol: String(
+            row.execution_protocol,
+          ) as typeof TENANT_CREDENTIAL_TARGET_EXECUTION_PROTOCOL,
+          externalCredentialExecutionEnabled: tenantCredentialBoolean(
+            row.external_credential_execution_enabled,
+            "stored external credential execution cutover flag",
+          ) as true,
+          kmsKeyExecutionEnabled: tenantCredentialBoolean(
+            row.kms_key_execution_enabled,
+            "stored KMS execution cutover flag",
+          ) as false,
+          evidenceSha256: String(row.evidence_sha256),
+        };
+    validateTenantCredentialTargetExecutionCutoverRecord(record);
+    return record;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
 function rowTenantRedisPurgeSource(row: Row): TenantRedisPurgeSource {
   return {
     requestId: String(row.request_id),
@@ -5041,6 +5508,7 @@ export class MysqlSessionStore implements
   TenantPurgeExecutionStore,
   TenantDatabasePurgeStore,
   TenantRedisPurgeStore,
+  TenantCredentialTargetExecutionStore,
   UserDataExportRequestStore,
   UserDataExportJobStore,
   UserDataExportCleanupStore
@@ -5050,6 +5518,7 @@ export class MysqlSessionStore implements
   private tenantPurgeExecutionMaterializationCursorRequestId?: string;
   private tenantDatabasePurgeMaterializationCursorRequestId?: string;
   private tenantRedisPurgeMaterializationCursorRequestId?: string;
+  private tenantCredentialTargetExecutionMaterializationCursorRequestId?: string;
   /**
    * Historical migration fixtures intentionally open the current store against a frozen schema.
    * Production startup always applies the complete migration set before returning the store, but
@@ -15367,6 +15836,42 @@ export class MysqlSessionStore implements
     return fields.every((field) => left[field] === right[field]);
   }
 
+  private legacyTenantCredentialPurgePlanTargetEvidence(
+    receipt: TenantCredentialRevocationReceipt,
+    domain: "external_provider" | "kms",
+  ): {
+    targetCount: number;
+    targetRootSha256: string;
+    disposition: TenantPurgePlanDisposition;
+  } {
+    const tuples: Array<readonly (string | number | boolean)[]> = [];
+    let targetCount: number;
+    if (domain === "external_provider") {
+      targetCount = receipt.providerConfigCountBefore;
+      if (targetCount > 0) tuples.push([receipt.receiptSha256, targetCount]);
+    } else {
+      const authPresent = receipt.authSecretCipherPresentBefore
+        || receipt.authSecretKeyIdPresentBefore;
+      targetCount = receipt.providerConfigCountBefore + (authPresent ? 1 : 0);
+      if (targetCount > 0) {
+        tuples.push([
+          receipt.receiptSha256,
+          receipt.providerConfigCountBefore,
+          receipt.authSecretCipherPresentBefore,
+          receipt.authSecretKeyIdPresentBefore,
+        ]);
+      }
+    }
+    const targetHashes = tuples.map((tuple) => tenantPurgePlanTargetSha256(domain, tuple));
+    return {
+      targetCount,
+      targetRootSha256: tenantPurgePlanTargetRootSha256(domain, targetHashes),
+      disposition: targetCount === 0
+        ? "not_applicable"
+        : "blocked_legacy_external_source_unavailable",
+    };
+  }
+
   private async validateTenantPurgePlanSource(
     conn: PoolConnection,
     job: TenantPurgePlanJobRecord,
@@ -15375,6 +15880,8 @@ export class MysqlSessionStore implements
     contentJob: Extract<TenantContentInventoryJobRecord, { phase: "inventory_sealed" }>;
     contentReceipt: TenantContentInventoryReceipt;
     credentialReceipt: TenantCredentialRevocationReceipt;
+    credentialInventoryReceipt?: TenantCredentialInventoryReceipt;
+    credentialSnapshot?: TenantCredentialLifecycleSnapshot;
     sessionReceipts: TenantSessionContentReceipt[];
   }> {
     try {
@@ -15418,6 +15925,58 @@ export class MysqlSessionStore implements
         "FOR SHARE",
       );
       if (!credentialReceipt) throw new Error("tenant purge plan T3a receipt is missing");
+      const credentialInventoryReceipt = this.credentialLifecycleSchemaInstalled
+        ? await this.loadTenantCredentialInventoryReceipt(
+            conn,
+            job.tenantId,
+            job.requestId,
+            "FOR SHARE",
+          )
+        : null;
+      let credentialSnapshot: TenantCredentialLifecycleSnapshot | undefined;
+      if (credentialInventoryReceipt) {
+        credentialSnapshot = await this.validateTenantCredentialInventoryReadProof(
+          conn,
+          credentialInventoryReceipt,
+          credentialReceipt,
+          "FOR SHARE",
+        );
+      } else {
+        if (requireLiveSource || job.phase !== "plan_sealed") {
+          throw new Error("live tenant purge plan credential inventory receipt is missing");
+        }
+        if (this.credentialLifecycleSchemaInstalled) {
+          const trackingCutover = await this.loadTenantCredentialTrackingCutover(
+            conn,
+            "FOR SHARE",
+          );
+          if (trackingCutover.controlGeneration === 1
+            && (trackingCutover.activatedAtDbMs === undefined
+              || job.planSealedAtDbMs >= trackingCutover.activatedAtDbMs)) {
+            throw new Error("post-cutover tenant purge plan lacks credential inventory");
+          }
+        }
+        const legacyEntries = await this.loadTenantPurgePlanEntries(
+          conn,
+          job.tenantId,
+          job.requestId,
+          job.buildGeneration,
+          "FOR SHARE",
+        );
+        for (const domain of ["external_provider", "kms"] as const) {
+          const entry = legacyEntries.find((candidate) => candidate.domain === domain);
+          const expected = this.legacyTenantCredentialPurgePlanTargetEvidence(
+            credentialReceipt,
+            domain,
+          );
+          if (!entry
+            || entry.targetCount !== expected.targetCount
+            || entry.targetRootSha256 !== expected.targetRootSha256
+            || entry.disposition !== expected.disposition) {
+            throw new Error("legacy tenant purge credential evidence changed");
+          }
+        }
+      }
       if (
         job.t1FenceSha256 !== contentJob.t1FenceSha256
         || job.t3aReceiptSha256 !== contentJob.t3aReceiptSha256
@@ -15468,7 +16027,16 @@ export class MysqlSessionStore implements
         }
         await this.lockAndValidateTenantContentGlobalRelations(conn);
       }
-      return { contentJob, contentReceipt, credentialReceipt, sessionReceipts };
+      return {
+        contentJob,
+        contentReceipt,
+        credentialReceipt,
+        ...(credentialInventoryReceipt === null
+          ? {}
+          : { credentialInventoryReceipt }),
+        ...(credentialSnapshot === undefined ? {} : { credentialSnapshot }),
+        sessionReceipts,
+      };
     } catch (error) {
       if (error instanceof TenantPurgePlanEvidenceChangedError) throw error;
       if (error instanceof TenantContentInventoryEvidenceChangedError) {
@@ -17004,33 +17572,16 @@ export class MysqlSessionStore implements
         break;
       }
       case "external_provider":
-        targetCount = source.credentialReceipt.providerConfigCountBefore;
-        if (targetCount > 0) {
-          add(source.credentialReceipt.receiptSha256, targetCount);
-          disposition = "blocked_legacy_external_source_unavailable";
-        } else {
-          disposition = "not_applicable";
-        }
-        break;
-      case "kms": {
-        const tenantAuthEnvelopeCount = source.credentialReceipt.authSecretCipherPresentBefore
-          || source.credentialReceipt.authSecretKeyIdPresentBefore ? 1 : 0;
-        targetCount = source.credentialReceipt.providerConfigCountBefore
-          + tenantAuthEnvelopeCount;
-        if (!Number.isSafeInteger(targetCount)) throw new TenantErasureIntegrityError();
-        if (targetCount > 0) {
-          add(
-            source.credentialReceipt.receiptSha256,
-            source.credentialReceipt.providerConfigCountBefore,
-            source.credentialReceipt.authSecretCipherPresentBefore,
-            source.credentialReceipt.authSecretKeyIdPresentBefore,
-          );
-          disposition = "blocked_legacy_external_source_unavailable";
-        } else {
-          disposition = "not_applicable";
-        }
-        break;
-      }
+      case "kms":
+        return source.credentialSnapshot === undefined
+          ? this.legacyTenantCredentialPurgePlanTargetEvidence(
+              source.credentialReceipt,
+              domain,
+            )
+          : tenantCredentialPurgePlanTargetEvidence(
+              domain,
+              source.credentialSnapshot.targetDispositions,
+            );
       case "backup_ledger":
       case "logs":
       case "traces":
@@ -22615,7 +23166,12 @@ export class MysqlSessionStore implements
           current.availableAtMs > now
           || (current.claimToken !== undefined && current.leaseUntilMs! > now)
         ) continue;
-        const attempts = current.attempts + 1;
+        // The append-only job trigger permits a first claim to increment attempts and an expired
+        // claimed row to rotate only its token/lease. The token remains part of the fence, so an
+        // N+1 claimant cannot use N's authority even when the numeric attempt is retained.
+        const attempts = current.claimToken === undefined
+          ? current.attempts + 1
+          : current.attempts;
         if (!Number.isSafeInteger(attempts) || attempts > 0xffff_ffff) {
           throw new TenantErasureIntegrityError();
         }
@@ -23637,6 +24193,1377 @@ export class MysqlSessionStore implements
         && candidate.markerSha256 === marker.markerSha256
       ))) throw new TenantErasureIntegrityError();
       return marker;
+    });
+  }
+
+  // ---------- tenant credential target execution (0029, external credentials only) ----------
+  private async beginTenantCredentialTargetExecutionTransaction(
+    conn: PoolConnection,
+  ): Promise<void> {
+    await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    await conn.beginTransaction();
+  }
+
+  private async loadTenantCredentialTargetExecutionJob(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" | "FOR UPDATE SKIP LOCKED" = "",
+  ): Promise<TenantCredentialTargetExecutionJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TARGET_EXECUTION_JOB_COLUMNS}
+         FROM tenant_credential_target_execution_jobs
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const job = rowToTenantCredentialTargetExecutionJob(rows[0]);
+    return job.tenantId === tenantId && job.requestId === requestId ? job : null;
+  }
+
+  private async loadTenantCredentialTargetExecutionTargets(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    targetExecutionGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantCredentialTargetExecutionTarget[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_COLUMNS}
+         FROM tenant_credential_target_execution_targets
+        WHERE tenant_id=? AND request_id=? AND target_execution_generation=?
+        ORDER BY target_ordinal ${lock}`,
+      [tenantId, requestId, targetExecutionGeneration],
+    );
+    return rows.map((row) => {
+      const target = rowToTenantCredentialTargetExecutionTarget(row);
+      if (target.tenantId !== tenantId || target.requestId !== requestId
+        || target.targetExecutionGeneration !== targetExecutionGeneration) {
+        throw new TenantErasureIntegrityError();
+      }
+      return target;
+    });
+  }
+
+  private async loadTenantCredentialTargetExecutionAcks(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    targetExecutionGeneration: number,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantCredentialTargetExecutionTargetAck[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TARGET_EXECUTION_ACK_COLUMNS}
+         FROM tenant_credential_target_execution_acks
+        WHERE tenant_id=? AND request_id=? AND target_execution_generation=?
+        ORDER BY target_ordinal ${lock}`,
+      [tenantId, requestId, targetExecutionGeneration],
+    );
+    return rows.map((row) => {
+      const ack = rowToTenantCredentialTargetExecutionTargetAck(row);
+      if (ack.tenantId !== tenantId || ack.requestId !== requestId
+        || ack.targetExecutionGeneration !== targetExecutionGeneration) {
+        throw new TenantErasureIntegrityError();
+      }
+      return ack;
+    });
+  }
+
+  private async loadTenantCredentialTargetExecutionReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantCredentialTargetExecutionReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TARGET_EXECUTION_RECEIPT_COLUMNS}
+         FROM tenant_credential_target_execution_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (!rows[0]) return null;
+    const receipt = rowToTenantCredentialTargetExecutionReceipt(rows[0]);
+    if (receipt.tenantId !== tenantId || receipt.requestId !== requestId) {
+      throw new TenantErasureIntegrityError();
+    }
+    return receipt;
+  }
+
+  private async validateTenantCredentialTargetExecutionCutoverState(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantCredentialTargetExecutionCutoverRecord> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_COLUMNS}
+         FROM tenant_credential_target_execution_cutover
+        WHERE singleton_id=? ${lock}`,
+      [TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID],
+    );
+    const cutover = rowToTenantCredentialTargetExecutionCutover(rows[0]);
+    if (cutover.controlGeneration === 1) {
+      const receiptLock = lock === "FOR UPDATE" ? "FOR SHARE" : lock;
+      const [receiptRows] = await executor.query<Row[]>(
+        `SELECT ${TENANT_CREDENTIAL_TARGET_EXECUTION_RECEIPT_COLUMNS}
+           FROM tenant_credential_target_execution_receipts
+          WHERE request_id=? ${receiptLock}`,
+        [cutover.firstRequestId],
+      );
+      const receipt = receiptRows[0]
+        ? rowToTenantCredentialTargetExecutionReceipt(receiptRows[0])
+        : null;
+      if (!receipt
+        || receipt.receiptSha256 !== cutover.firstReceiptSha256
+        || receipt.storeDbTimestampMs !== cutover.activatedAtDbMs) {
+        throw new TenantErasureIntegrityError();
+      }
+    } else {
+      const [receiptRows] = await executor.query<Row[]>(
+        "SELECT request_id FROM tenant_credential_target_execution_receipts LIMIT 1",
+      );
+      if (receiptRows.length !== 0) throw new TenantErasureIntegrityError();
+    }
+    return cutover;
+  }
+
+  private tenantCredentialTargetExecutionExpectedSource(
+    inventory: TenantCredentialInventoryReceipt,
+    snapshot: TenantCredentialLifecycleSnapshot,
+  ): TenantCredentialTargetExecutionSource {
+    const external = tenantCredentialPurgePlanTargetEvidence(
+      "external_provider",
+      snapshot.targetDispositions,
+    );
+    const executableExternal = snapshot.targetDispositions.filter((target) => (
+      target.domain === "external_credential" && target.disposition === "executable_ref"
+    ));
+    const executableKms = snapshot.targetDispositions.filter((target) => (
+      target.domain === "kms_key" && target.disposition === "executable_ref"
+    ));
+    if (executableKms.length !== 0
+      || external.targetCount
+        !== executableExternal.length + inventory.externalCredentialBlockerCount) {
+      throw new TenantErasureIntegrityError();
+    }
+    return {
+      requestId: inventory.requestId,
+      tenantId: inventory.tenantId,
+      subjectGeneration: inventory.subjectGeneration,
+      targetExecutionGeneration: 1,
+      t3aReceiptSha256: inventory.t3aReceiptSha256,
+      inventoryReceiptSha256: inventory.receiptSha256,
+      trackingCutoverEvidenceSha256: inventory.trackingCutoverEvidenceSha256,
+      versionCount: inventory.versionCount,
+      versionRootSha256: inventory.versionRootSha256,
+      targetDispositionCount: inventory.targetDispositionCount,
+      targetDispositionRootSha256: inventory.targetDispositionRootSha256,
+      externalCredentialTargetCount: executableExternal.length,
+      externalCredentialTargetRootSha256: external.targetRootSha256,
+      externalCredentialBlockerCount: inventory.externalCredentialBlockerCount,
+      kmsKeyBlockerCount: inventory.kmsKeyBlockerCount,
+      kmsKeyExecutableTargetCount: 0,
+      sourceEvidenceDbMs: inventory.storeDbTimestampMs,
+    };
+  }
+
+  private tenantCredentialTargetExecutionExpectedTargets(
+    source: TenantCredentialTargetExecutionSource,
+    snapshot: TenantCredentialLifecycleSnapshot,
+    capturedAtDbMs: number,
+  ): TenantCredentialTargetExecutionTarget[] {
+    return snapshot.targetDispositions
+      .filter((target) => target.domain === "external_credential"
+        && target.disposition === "executable_ref")
+      .sort((left, right) => left.credentialVersionId.localeCompare(right.credentialVersionId))
+      .map((target, targetOrdinal) => {
+        if (target.adapterProtocol === undefined
+          || target.targetReferenceCipherSha256 === undefined
+          || target.targetReferenceKeyId === undefined
+          || target.targetReferenceSha256 === undefined) {
+          throw new TenantErasureIntegrityError();
+        }
+        const identity = {
+          requestId: source.requestId,
+          tenantId: source.tenantId,
+          subjectGeneration: source.subjectGeneration,
+          targetExecutionGeneration: source.targetExecutionGeneration,
+        };
+        const operationIdSha256 = tenantCredentialTargetExecutionOperationIdSha256({
+          identity,
+          credentialVersionId: target.credentialVersionId,
+          domain: "external_credential",
+          targetDispositionEvidenceSha256: target.evidenceSha256,
+          adapterProtocol: target.adapterProtocol,
+          targetReferenceCipherSha256: target.targetReferenceCipherSha256,
+          targetReferenceKeyId: target.targetReferenceKeyId,
+          targetReferenceSha256: target.targetReferenceSha256,
+        });
+        const body = {
+          ...identity,
+          scope: TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_SCOPE,
+          targetOrdinal,
+          credentialVersionId: target.credentialVersionId,
+          domain: "external_credential" as const,
+          sourceDisposition: "executable_ref" as const,
+          targetDispositionEvidenceSha256: target.evidenceSha256,
+          adapterProtocol: target.adapterProtocol,
+          targetReferenceCipherSha256: target.targetReferenceCipherSha256,
+          targetReferenceKeyId: target.targetReferenceKeyId,
+          targetReferenceSha256: target.targetReferenceSha256,
+          operationIdSha256,
+          capturedAtDbMs,
+        };
+        return {
+          ...body,
+          receiptSha256: tenantCredentialTargetExecutionTargetSha256(body),
+        };
+      });
+  }
+
+  private async validateTenantCredentialTargetExecutionSource(
+    conn: PoolConnection,
+    job: TenantCredentialTargetExecutionJobRecord,
+    lock: "" | "FOR SHARE" = "FOR SHARE",
+  ): Promise<TenantCredentialLifecycleSnapshot> {
+    try {
+      const inventory = await this.loadTenantCredentialInventoryReceipt(
+        conn,
+        job.tenantId,
+        job.requestId,
+        lock,
+      );
+      const t3aJob = await this.loadTenantCredentialRevocationJob(
+        conn,
+        job.tenantId,
+        job.requestId,
+        lock,
+      );
+      if (!inventory || !t3aJob || t3aJob.phase !== "credential_store_revoked") {
+        throw new Error("credential target execution source is missing");
+      }
+      const t3aReceipt = await this.validateTenantCredentialRevocationReadProof(conn, t3aJob);
+      if (!t3aReceipt) throw new Error("credential target execution T3a receipt is missing");
+      const snapshot = await this.validateTenantCredentialInventoryReadProof(
+        conn,
+        inventory,
+        t3aReceipt,
+        lock,
+      );
+      const expected = this.tenantCredentialTargetExecutionExpectedSource(inventory, snapshot);
+      const actual = tenantCredentialTargetExecutionSourceFromJob(job);
+      if ((Object.keys(expected) as Array<keyof TenantCredentialTargetExecutionSource>)
+        .some((key) => expected[key] !== actual[key])) {
+        throw new Error("credential target execution source evidence changed");
+      }
+      return snapshot;
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private async validateTenantCredentialTargetExecutionReadProof(
+    conn: PoolConnection,
+    job: TenantCredentialTargetExecutionJobRecord,
+  ): Promise<{
+    snapshot: TenantCredentialLifecycleSnapshot;
+    targets: TenantCredentialTargetExecutionTarget[];
+    acks: TenantCredentialTargetExecutionTargetAck[];
+    receipt: TenantCredentialTargetExecutionReceipt | null;
+  }> {
+    try {
+      validateTenantCredentialTargetExecutionJobRecord(job);
+      const snapshot = await this.validateTenantCredentialTargetExecutionSource(
+        conn,
+        job,
+        "FOR SHARE",
+      );
+      const expectedTargets = this.tenantCredentialTargetExecutionExpectedTargets(
+        tenantCredentialTargetExecutionSourceFromJob(job),
+        snapshot,
+        job.createdAtMs,
+      );
+      const [targets, acks, receipt] = await Promise.all([
+        this.loadTenantCredentialTargetExecutionTargets(
+          conn,
+          job.tenantId,
+          job.requestId,
+          job.targetExecutionGeneration,
+          "FOR SHARE",
+        ),
+        this.loadTenantCredentialTargetExecutionAcks(
+          conn,
+          job.tenantId,
+          job.requestId,
+          job.targetExecutionGeneration,
+          "FOR SHARE",
+        ),
+        this.loadTenantCredentialTargetExecutionReceipt(
+          conn,
+          job.tenantId,
+          job.requestId,
+          "FOR SHARE",
+        ),
+      ]);
+      if (targets.length !== expectedTargets.length
+        || targets.some((target, index) => (
+          target.receiptSha256 !== expectedTargets[index]!.receiptSha256
+        ))
+        || job.targetCount !== targets.length
+        || job.targetRootSha256 !== tenantCredentialTargetExecutionTargetRootSha256(targets)
+        || job.targetAckCount !== acks.length
+        || job.targetAckRootSha256
+          !== tenantCredentialTargetExecutionTargetAckRootSha256(acks)
+        || job.adapterEvidenceCount !== acks.length
+        || job.adapterEvidenceRootSha256
+          !== tenantCredentialTargetExecutionAdapterEvidenceRootSha256(acks)) {
+        throw new Error("credential target execution projection changed");
+      }
+      const byOrdinal = new Map(targets.map((target) => [target.targetOrdinal, target]));
+      if (acks.some((ack) => {
+        const target = byOrdinal.get(ack.targetOrdinal);
+        if (!target) return true;
+        this.assertTenantCredentialTargetExecutionAckClock(
+          job,
+          target,
+          ack.storeDbTimestampMs,
+        );
+        return ack.credentialVersionId !== target.credentialVersionId
+          || ack.domain !== target.domain
+          || ack.targetReceiptSha256 !== target.receiptSha256
+          || ack.operationIdSha256 !== target.operationIdSha256
+          || ack.adapterProtocol !== target.adapterProtocol
+          || ack.targetReferenceSha256 !== target.targetReferenceSha256;
+      })) throw new Error("credential target execution ACK binding changed");
+      if (job.phase === "external_credential_sealed") {
+        const expectedSource = tenantCredentialTargetExecutionSourceFromJob(job);
+        if (!receipt || (Object.keys(expectedSource) as Array<
+          keyof TenantCredentialTargetExecutionSource
+        >).some((key) => receipt[key] !== expectedSource[key])
+          || receipt.receiptSha256 !== job.terminalReceiptSha256
+          || receipt.completedClaimAttempt !== job.completedClaimAttempt
+          || receipt.completedClaimTokenSha256 !== job.completedClaimTokenSha256
+          || receipt.storeDbTimestampMs !== job.sealedAtDbMs
+          || receipt.targetRootSha256 !== job.targetRootSha256
+          || receipt.targetAckRootSha256 !== job.targetAckRootSha256
+          || receipt.adapterEvidenceRootSha256 !== job.adapterEvidenceRootSha256) {
+          throw new Error("credential target execution terminal proof changed");
+        }
+        this.assertTenantCredentialTargetExecutionSealClock(
+          job,
+          acks,
+          receipt.storeDbTimestampMs,
+        );
+      } else if (receipt !== null) {
+        throw new Error("credential target execution receipt has no terminal job");
+      }
+      await this.validateTenantCredentialTargetExecutionCutoverState(conn, "FOR SHARE");
+      return { snapshot, targets, acks, receipt };
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantCredentialTargetExecutionAuthorized(
+    job: TenantCredentialTargetExecutionJobRecord,
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    nowMs: number,
+  ): job is Extract<TenantCredentialTargetExecutionJobRecord, { phase: "queued" }> {
+    return job.phase === "queued"
+      && this.tenantCredentialTargetExecutionAuthorizationIdentityMatches(job, authorization)
+      && job.attempts === authorization.claimAttempt
+      && job.claimToken === authorization.claimToken
+      && job.leaseUntilMs !== undefined
+      && job.leaseUntilMs > nowMs;
+  }
+
+  private tenantCredentialTargetExecutionAuthorizationIdentityMatches(
+    job: TenantCredentialTargetExecutionJobRecord,
+    authorization: TenantCredentialTargetExecutionAuthorization,
+  ): boolean {
+    return job.requestId === authorization.requestId
+      && job.tenantId === authorization.tenantId
+      && job.subjectGeneration === authorization.subjectGeneration
+      && job.targetExecutionGeneration === authorization.targetExecutionGeneration;
+  }
+
+  private assertTenantCredentialTargetExecutionAckClock(
+    job: TenantCredentialTargetExecutionJobRecord,
+    target: TenantCredentialTargetExecutionTarget,
+    nowMs: number,
+  ): void {
+    if (nowMs < job.sourceEvidenceDbMs
+      || nowMs < job.createdAtMs
+      || nowMs < target.capturedAtDbMs) {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private assertTenantCredentialTargetExecutionSealClock(
+    job: TenantCredentialTargetExecutionJobRecord,
+    acks: TenantCredentialTargetExecutionTargetAck[],
+    nowMs: number,
+  ): void {
+    if (nowMs < job.sourceEvidenceDbMs
+      || nowMs < job.createdAtMs
+      || acks.some((ack) => nowMs < ack.storeDbTimestampMs)) {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async materializeTenantCredentialTargetExecutionJobs(
+    options: MaterializeTenantCredentialTargetExecutionJobsOptions,
+  ): Promise<number> {
+    validateMaterializeTenantCredentialTargetExecutionJobsOptions(options);
+    const scanLimit = Math.min(400, Math.max(32, options.limit * 4));
+    const cursor = this.tenantCredentialTargetExecutionMaterializationCursorRequestId;
+    const load = async (after: string | undefined, through: string | undefined): Promise<Row[]> => {
+      const [rows] = await this.pool.query<Row[]>(
+        `SELECT i.request_id, i.tenant_id
+           FROM tenant_credential_inventory_receipts i
+          WHERE ${after === undefined ? "TRUE" : "i.request_id>?"}
+            ${through === undefined ? "" : "AND i.request_id<=?"}
+            AND NOT EXISTS (
+              SELECT 1 FROM tenant_credential_target_execution_jobs j
+               WHERE j.request_id=i.request_id
+            )
+          ORDER BY i.request_id LIMIT ?`,
+        [
+          ...(after === undefined ? [] : [after]),
+          ...(through === undefined ? [] : [through]),
+          scanLimit,
+        ],
+      );
+      return rows;
+    };
+    let candidates = await load(cursor, undefined);
+    if (candidates.length === 0 && cursor !== undefined) {
+      candidates = await load(undefined, cursor);
+      if (candidates.length === 0) {
+        this.tenantCredentialTargetExecutionMaterializationCursorRequestId = undefined;
+      }
+    }
+    let materialized = 0;
+    let integrity: TenantErasureIntegrityError | undefined;
+    for (const candidate of candidates) {
+      if (materialized >= options.limit) break;
+      const requestId = String(candidate.request_id);
+      const tenantId = String(candidate.tenant_id);
+      this.tenantCredentialTargetExecutionMaterializationCursorRequestId = requestId;
+      const conn = await this.pool.getConnection();
+      try {
+        await this.beginTenantCredentialTargetExecutionTransaction(conn);
+        const existing = await this.loadTenantCredentialTargetExecutionJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (existing) {
+          await conn.commit();
+          continue;
+        }
+        const inventory = await this.loadTenantCredentialInventoryReceipt(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        const t3aJob = await this.loadTenantCredentialRevocationJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (!inventory || !t3aJob || t3aJob.phase !== "credential_store_revoked") {
+          throw new TenantErasureIntegrityError();
+        }
+        const t3aReceipt = await this.validateTenantCredentialRevocationReadProof(conn, t3aJob);
+        if (!t3aReceipt) throw new TenantErasureIntegrityError();
+        const snapshot = await this.validateTenantCredentialInventoryReadProof(
+          conn,
+          inventory,
+          t3aReceipt,
+          "FOR SHARE",
+        );
+        const source = this.tenantCredentialTargetExecutionExpectedSource(inventory, snapshot);
+        const now = await this.databaseNow(conn);
+        if (now < source.sourceEvidenceDbMs) {
+          await conn.rollback();
+          continue;
+        }
+        const createdAtMs = Math.max(now, source.sourceEvidenceDbMs);
+        const targets = this.tenantCredentialTargetExecutionExpectedTargets(
+          source,
+          snapshot,
+          createdAtMs,
+        );
+        const targetRootSha256 = tenantCredentialTargetExecutionTargetRootSha256(targets);
+        const common = {
+          ...source,
+          targetCount: targets.length,
+          targetRootSha256,
+          targetAckCount: 0,
+          targetAckRootSha256:
+            EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ACK_ROOT_SHA256,
+          adapterEvidenceCount: 0,
+          adapterEvidenceRootSha256:
+            EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_ADAPTER_EVIDENCE_ROOT_SHA256,
+          unresolvedBlockerCount:
+            source.externalCredentialBlockerCount + source.kmsKeyBlockerCount,
+          attempts: 0,
+          createdAtMs,
+          updatedAtMs: createdAtMs,
+        };
+        const job: TenantCredentialTargetExecutionJobRecord =
+          source.externalCredentialBlockerCount > 0
+            ? {
+                ...common,
+                phase: "blocked",
+                blockedAtDbMs: createdAtMs,
+                blockedReasonCode: "source_blocked",
+              }
+            : { ...common, phase: "queued", availableAtMs: createdAtMs };
+        validateTenantCredentialTargetExecutionJobRecord(job);
+        const [ownerRows] = await conn.query<Row[]>(
+          `SELECT request_id FROM tenant_credential_target_execution_jobs
+            WHERE request_id=? OR tenant_id=? FOR UPDATE`,
+          [requestId, tenantId],
+        );
+        if (ownerRows.length !== 0) throw new TenantErasureIntegrityError();
+        await conn.query(
+          `INSERT INTO tenant_credential_target_execution_jobs
+             (request_id, tenant_id, subject_generation, target_execution_generation,
+              t3a_receipt_sha256, inventory_receipt_sha256,
+              tracking_cutover_evidence_sha256, version_count, version_root_sha256,
+              target_disposition_count, target_disposition_root_sha256,
+              external_credential_target_count,
+              external_credential_target_root_sha256,
+              external_credential_blocker_count, kms_key_blocker_count,
+              kms_key_executable_target_count, source_evidence_db_ms, phase,
+              target_count, target_root_sha256, target_ack_count,
+              target_ack_root_sha256, adapter_evidence_count,
+              adapter_evidence_root_sha256, unresolved_blocker_count,
+              available_at_ms, attempts, claim_token, lease_until_ms,
+              last_error_code, created_at_ms, updated_at_ms,
+              terminal_receipt_sha256, sealed_at_db_ms, completed_claim_attempt,
+              completed_claim_token_sha256, blocked_at_db_ms, blocked_reason_code)
+           VALUES (${Array.from({ length: 38 }, () => "?").join(",")})`,
+          [
+            job.requestId, job.tenantId, job.subjectGeneration,
+            job.targetExecutionGeneration, job.t3aReceiptSha256,
+            job.inventoryReceiptSha256, job.trackingCutoverEvidenceSha256,
+            job.versionCount, job.versionRootSha256, job.targetDispositionCount,
+            job.targetDispositionRootSha256, job.externalCredentialTargetCount,
+            job.externalCredentialTargetRootSha256, job.externalCredentialBlockerCount,
+            job.kmsKeyBlockerCount, job.kmsKeyExecutableTargetCount,
+            job.sourceEvidenceDbMs, job.phase, job.targetCount, job.targetRootSha256,
+            job.targetAckCount, job.targetAckRootSha256, job.adapterEvidenceCount,
+            job.adapterEvidenceRootSha256, job.unresolvedBlockerCount,
+            job.phase === "queued" ? job.availableAtMs : null,
+            job.attempts, null, null, null, job.createdAtMs, job.updatedAtMs,
+            null, null, null, null,
+            job.phase === "blocked" ? job.blockedAtDbMs : null,
+            job.phase === "blocked" ? job.blockedReasonCode : null,
+          ],
+        );
+        for (const target of targets) {
+          await conn.query(
+            `INSERT INTO tenant_credential_target_execution_targets
+               (request_id, tenant_id, subject_generation, target_execution_generation,
+                scope, target_ordinal, credential_version_id, domain,
+                source_disposition, target_disposition_evidence_sha256,
+                adapter_protocol, target_reference_cipher_sha256,
+                target_reference_key_id, target_reference_sha256,
+                operation_id_sha256, captured_at_db_ms, receipt_sha256)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              target.requestId, target.tenantId, target.subjectGeneration,
+              target.targetExecutionGeneration, target.scope, target.targetOrdinal,
+              target.credentialVersionId, target.domain, target.sourceDisposition,
+              target.targetDispositionEvidenceSha256, target.adapterProtocol,
+              target.targetReferenceCipherSha256, target.targetReferenceKeyId,
+              target.targetReferenceSha256, target.operationIdSha256,
+              target.capturedAtDbMs, target.receiptSha256,
+            ],
+          );
+        }
+        const stored = await this.loadTenantCredentialTargetExecutionJob(
+          conn,
+          tenantId,
+          requestId,
+          "FOR SHARE",
+        );
+        if (!stored) throw new TenantErasureIntegrityError();
+        await this.validateTenantCredentialTargetExecutionReadProof(conn, stored);
+        await conn.commit();
+        materialized += 1;
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        if (error instanceof TenantErasureIntegrityError) {
+          integrity ??= error;
+          continue;
+        }
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    if (integrity) throw integrity;
+    return materialized;
+  }
+
+  async claimTenantCredentialTargetExecutions(
+    options: ClaimTenantCredentialTargetExecutionsOptions,
+  ): Promise<TenantCredentialTargetExecutionClaim[]> {
+    validateClaimTenantCredentialTargetExecutionsOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantCredentialTargetExecutionTransaction(conn);
+      const scanNow = await this.databaseNow(conn);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_CREDENTIAL_TARGET_EXECUTION_JOB_COLUMNS}
+           FROM tenant_credential_target_execution_jobs
+          WHERE phase='queued' AND available_at_ms<=?
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+          ORDER BY available_at_ms, request_id LIMIT ?`,
+        [scanNow, scanNow, Math.min(400, Math.max(32, options.limit * 4))],
+      );
+      const claims: TenantCredentialTargetExecutionClaim[] = [];
+      for (const row of rows) {
+        if (claims.length >= options.limit) break;
+        const candidate = rowToTenantCredentialTargetExecutionJob(row);
+        const current = await this.loadTenantCredentialTargetExecutionJob(
+          conn,
+          candidate.tenantId,
+          candidate.requestId,
+          "FOR UPDATE SKIP LOCKED",
+        );
+        if (!current || current.phase !== "queued") continue;
+        const now = await this.databaseNow(conn);
+        if (current.availableAtMs > now
+          || (current.claimToken !== undefined && current.leaseUntilMs! > now)) continue;
+        const attempts = current.attempts + 1;
+        if (!Number.isSafeInteger(attempts) || attempts > 0xffff_ffff) {
+          throw new TenantErasureIntegrityError();
+        }
+        let valid = true;
+        try {
+          await this.validateTenantCredentialTargetExecutionReadProof(conn, current);
+          if (now < current.sourceEvidenceDbMs) valid = false;
+        } catch (error) {
+          if (!(error instanceof TenantErasureIntegrityError)) throw error;
+          valid = false;
+        }
+        const updatedAtMs = Math.max(current.updatedAtMs, now);
+        if (!valid) {
+          const [blocked] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE tenant_credential_target_execution_jobs
+                SET phase='blocked', available_at_ms=NULL, attempts=?,
+                    claim_token=NULL, lease_until_ms=NULL, last_error_code=NULL,
+                    updated_at_ms=?, blocked_at_db_ms=?,
+                    blocked_reason_code='integrity_conflict'
+              WHERE request_id=? AND tenant_id=? AND phase='queued' AND attempts=?
+                AND available_at_ms<=?
+                AND (claim_token IS NULL OR lease_until_ms<=?)`,
+            [attempts, updatedAtMs, updatedAtMs, current.requestId,
+              current.tenantId, current.attempts, now, now],
+          );
+          if (blocked.affectedRows !== 1) throw new TenantErasureIntegrityError();
+          continue;
+        }
+        const leaseUntilMs = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+          ? Number.MAX_SAFE_INTEGER
+          : now + options.leaseMs;
+        if (leaseUntilMs <= now) continue;
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_credential_target_execution_jobs
+              SET attempts=?, claim_token=?, lease_until_ms=?,
+                  last_error_code=NULL, updated_at_ms=?
+            WHERE request_id=? AND tenant_id=? AND phase='queued' AND attempts=?
+              AND available_at_ms<=?
+              AND (claim_token IS NULL OR lease_until_ms<=?)`,
+          [attempts, options.claimToken, leaseUntilMs, updatedAtMs,
+            current.requestId, current.tenantId, current.attempts, now, now],
+        );
+        if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+        const claim: TenantCredentialTargetExecutionClaim = {
+          ...tenantCredentialTargetExecutionSourceFromJob(current),
+          phase: "queued",
+          claimAttempt: attempts,
+          claimToken: options.claimToken,
+          leaseUntilMs,
+          targetCount: current.targetCount,
+          targetRootSha256: current.targetRootSha256,
+        };
+        validateTenantCredentialTargetExecutionClaim(claim);
+        claims.push(claim);
+      }
+      await conn.commit();
+      return claims;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewTenantCredentialTargetExecution(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    options: RenewTenantCredentialTargetExecutionOptions,
+  ): Promise<boolean> {
+    validateTenantCredentialTargetExecutionAuthorization(authorization);
+    validateRenewTenantCredentialTargetExecutionOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantCredentialTargetExecutionTransaction(conn);
+      const current = await this.loadTenantCredentialTargetExecutionJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      const now = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, now)) {
+        await conn.commit();
+        return false;
+      }
+      await this.validateTenantCredentialTargetExecutionReadProof(conn, current);
+      const requested = options.leaseMs > Number.MAX_SAFE_INTEGER - now
+        ? Number.MAX_SAFE_INTEGER
+        : now + options.leaseMs;
+      if (requested <= now) {
+        await conn.commit();
+        return false;
+      }
+      const leaseUntilMs = Math.max(current.leaseUntilMs!, requested);
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_credential_target_execution_jobs
+            SET lease_until_ms=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND target_execution_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [leaseUntilMs, updatedAtMs, authorization.requestId, authorization.tenantId,
+          authorization.subjectGeneration, authorization.targetExecutionGeneration,
+          authorization.claimAttempt, authorization.claimToken, now],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryTenantCredentialTargetExecution(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    options: RetryTenantCredentialTargetExecutionOptions,
+  ): Promise<boolean> {
+    validateTenantCredentialTargetExecutionAuthorization(authorization);
+    validateRetryTenantCredentialTargetExecutionOptions(options);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantCredentialTargetExecutionTransaction(conn);
+      const current = await this.loadTenantCredentialTargetExecutionJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      const now = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, now)) {
+        await conn.commit();
+        return false;
+      }
+      await this.validateTenantCredentialTargetExecutionReadProof(conn, current);
+      const base = Math.max(now, current.createdAtMs, current.updatedAtMs, current.availableAtMs);
+      const availableAtMs = options.delayMs > Number.MAX_SAFE_INTEGER - base
+        ? Number.MAX_SAFE_INTEGER
+        : base + options.delayMs;
+      const updatedAtMs = Math.max(current.updatedAtMs, now);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_credential_target_execution_jobs
+            SET available_at_ms=?, claim_token=NULL, lease_until_ms=NULL,
+                last_error_code=?, updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND target_execution_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [availableAtMs, options.errorCode, updatedAtMs, authorization.requestId,
+          authorization.tenantId, authorization.subjectGeneration,
+          authorization.targetExecutionGeneration, authorization.claimAttempt,
+          authorization.claimToken, now],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async blockTenantCredentialTargetExecution(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    reason: TenantCredentialTargetExecutionBlockReasonCode = "integrity_conflict",
+  ): Promise<boolean> {
+    validateTenantCredentialTargetExecutionAuthorization(authorization);
+    if (reason !== "integrity_conflict") {
+      throw new Error("active credential target execution can only be integrity-blocked");
+    }
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantCredentialTargetExecutionTransaction(conn);
+      const current = await this.loadTenantCredentialTargetExecutionJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return false;
+      }
+      const now = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, now)) {
+        await conn.commit();
+        return false;
+      }
+      await this.validateTenantCredentialTargetExecutionReadProof(conn, current);
+      const blockedAtDbMs = Math.max(now, current.createdAtMs, current.updatedAtMs);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_credential_target_execution_jobs
+            SET phase='blocked', available_at_ms=NULL, claim_token=NULL,
+                lease_until_ms=NULL, last_error_code=NULL, updated_at_ms=?,
+                blocked_at_db_ms=?, blocked_reason_code=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND target_execution_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [blockedAtDbMs, blockedAtDbMs, reason, authorization.requestId,
+          authorization.tenantId, authorization.subjectGeneration,
+          authorization.targetExecutionGeneration, authorization.claimAttempt,
+          authorization.claimToken, now],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantCredentialTargetExecutionReference(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    targetOrdinal: number,
+  ): Promise<TenantCredentialTargetExecutionEncryptedReference | null> {
+    validateTenantCredentialTargetExecutionAuthorization(authorization);
+    if (!Number.isSafeInteger(targetOrdinal) || targetOrdinal < 0) {
+      throw new Error("invalid tenant credential target execution ordinal");
+    }
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantCredentialTargetExecutionTransaction(conn);
+      const current = await this.loadTenantCredentialTargetExecutionJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current || current.phase !== "queued") {
+        await conn.commit();
+        return null;
+      }
+      let now = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, now)) {
+        await conn.commit();
+        return null;
+      }
+      const proof = await this.validateTenantCredentialTargetExecutionReadProof(conn, current);
+      const target = proof.targets[targetOrdinal];
+      if (!target || target.targetOrdinal !== targetOrdinal
+        || target.domain !== "external_credential") {
+        await conn.commit();
+        return null;
+      }
+      const [rows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_CREDENTIAL_TARGET_DISPOSITION_COLUMNS}
+           FROM tenant_credential_target_dispositions
+          WHERE tenant_id=? AND credential_version_id=?
+            AND domain='external_credential' FOR SHARE`,
+        [current.tenantId, target.credentialVersionId],
+      );
+      if (!rows[0] || rows.length !== 1 || rows[0].target_reference_cipher == null) {
+        throw new TenantErasureIntegrityError();
+      }
+      const disposition = rowToTenantCredentialTargetDisposition(rows[0]);
+      const cipher = Buffer.from(rows[0].target_reference_cipher);
+      if (disposition.tenantId !== current.tenantId
+        || disposition.credentialVersionId !== target.credentialVersionId
+        || disposition.domain !== target.domain
+        || disposition.disposition !== "executable_ref"
+        || disposition.evidenceSha256 !== target.targetDispositionEvidenceSha256
+        || disposition.adapterProtocol !== target.adapterProtocol
+        || disposition.targetReferenceCipherSha256 !== target.targetReferenceCipherSha256
+        || disposition.targetReferenceKeyId !== target.targetReferenceKeyId
+        || disposition.targetReferenceSha256 !== target.targetReferenceSha256
+        || createHash("sha256").update(cipher).digest("hex")
+          !== target.targetReferenceCipherSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      now = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, now)) {
+        await conn.rollback();
+        return null;
+      }
+      const reference: TenantCredentialTargetExecutionEncryptedReference = {
+        tenantId: current.tenantId,
+        credentialVersionId: target.credentialVersionId,
+        domain: "external_credential",
+        adapterProtocol: target.adapterProtocol,
+        targetDispositionEvidenceSha256: target.targetDispositionEvidenceSha256,
+        targetReferenceCipher: Buffer.from(cipher),
+        targetReferenceCipherSha256: target.targetReferenceCipherSha256,
+        targetReferenceKeyId: target.targetReferenceKeyId,
+        targetReferenceSha256: target.targetReferenceSha256,
+      };
+      validateTenantCredentialTargetExecutionEncryptedReference(reference);
+      await conn.commit();
+      return reference;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async recordTenantCredentialTargetExecutionTargetAck(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    result: TenantCredentialTargetExecutionAdapterResult,
+  ): Promise<TenantCredentialTargetExecutionTargetAck | null> {
+    validateTenantCredentialTargetExecutionAuthorization(authorization);
+    validateTenantCredentialTargetExecutionAdapterResult(result);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantCredentialTargetExecutionTransaction(conn);
+      const current = await this.loadTenantCredentialTargetExecutionJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current) {
+        await conn.commit();
+        return null;
+      }
+      if (!this.tenantCredentialTargetExecutionAuthorizationIdentityMatches(
+        current,
+        authorization,
+      )) {
+        await conn.commit();
+        return null;
+      }
+      const proof = await this.validateTenantCredentialTargetExecutionReadProof(conn, current);
+      const target = proof.targets.find((candidate) => (
+        candidate.operationIdSha256 === result.operationIdSha256
+      ));
+      if (!target || result.adapterProtocol !== target.adapterProtocol
+        || result.domain !== target.domain
+        || result.targetReferenceSha256 !== target.targetReferenceSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const existing = proof.acks.find((ack) => ack.targetOrdinal === target.targetOrdinal);
+      const authorizationTokenSha256 = tenantCredentialTargetExecutionClaimTokenSha256(
+        authorization.claimToken,
+      );
+      if (existing) {
+        if (existing.completedClaimAttempt !== authorization.claimAttempt
+          || existing.completedClaimTokenSha256 !== authorizationTokenSha256) {
+          await conn.commit();
+          return null;
+        }
+        if (existing.operationIdSha256 !== result.operationIdSha256
+          || existing.adapterEvidenceSha256 !== result.evidenceSha256
+          || existing.outcome !== result.outcome) {
+          throw new TenantErasureIntegrityError();
+        }
+        await conn.commit();
+        return existing;
+      }
+      const now = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, now)) {
+        await conn.commit();
+        return null;
+      }
+      this.assertTenantCredentialTargetExecutionAckClock(current, target, now);
+      const body = {
+        requestId: current.requestId,
+        tenantId: current.tenantId,
+        subjectGeneration: current.subjectGeneration,
+        targetExecutionGeneration: current.targetExecutionGeneration,
+        scope: TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ACK_SCOPE,
+        targetOrdinal: target.targetOrdinal,
+        credentialVersionId: target.credentialVersionId,
+        domain: "external_credential" as const,
+        targetReceiptSha256: target.receiptSha256,
+        operationIdSha256: target.operationIdSha256,
+        adapterProtocol: target.adapterProtocol,
+        targetReferenceSha256: target.targetReferenceSha256,
+        outcome: result.outcome,
+        adapterEvidenceSha256: result.evidenceSha256,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256: authorizationTokenSha256,
+        storeDbTimestampMs: now,
+      };
+      const ack: TenantCredentialTargetExecutionTargetAck = {
+        ...body,
+        receiptSha256: tenantCredentialTargetExecutionTargetAckSha256(body),
+      };
+      validateTenantCredentialTargetExecutionTargetAck(ack);
+      const nextAcks = [...proof.acks, ack]
+        .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+      const targetAckRootSha256 = tenantCredentialTargetExecutionTargetAckRootSha256(nextAcks);
+      const adapterEvidenceRootSha256 =
+        tenantCredentialTargetExecutionAdapterEvidenceRootSha256(nextAcks);
+      const publishNow = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, publishNow)) {
+        await conn.rollback();
+        return null;
+      }
+      this.assertTenantCredentialTargetExecutionAckClock(current, target, publishNow);
+      await conn.query(
+        `INSERT INTO tenant_credential_target_execution_acks
+           (request_id, tenant_id, subject_generation, target_execution_generation,
+            scope, target_ordinal, credential_version_id, domain,
+            target_receipt_sha256, operation_id_sha256, adapter_protocol,
+            target_reference_sha256, outcome, adapter_evidence_sha256,
+            completed_claim_attempt, completed_claim_token_sha256,
+            store_db_timestamp_ms, receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [ack.requestId, ack.tenantId, ack.subjectGeneration,
+          ack.targetExecutionGeneration, ack.scope, ack.targetOrdinal,
+          ack.credentialVersionId, ack.domain, ack.targetReceiptSha256,
+          ack.operationIdSha256, ack.adapterProtocol, ack.targetReferenceSha256,
+          ack.outcome, ack.adapterEvidenceSha256, ack.completedClaimAttempt,
+          ack.completedClaimTokenSha256, ack.storeDbTimestampMs, ack.receiptSha256],
+      );
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_credential_target_execution_jobs
+            SET target_ack_count=?, target_ack_root_sha256=?,
+                adapter_evidence_count=?, adapter_evidence_root_sha256=?,
+                updated_at_ms=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND target_execution_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [nextAcks.length, targetAckRootSha256, nextAcks.length,
+          adapterEvidenceRootSha256, Math.max(current.updatedAtMs, now),
+          authorization.requestId, authorization.tenantId,
+          authorization.subjectGeneration, authorization.targetExecutionGeneration,
+          authorization.claimAttempt, authorization.claimToken, publishNow],
+      );
+      if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      await conn.commit();
+      return ack;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async sealTenantCredentialTargetExecution(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+  ): Promise<TenantCredentialTargetExecutionReceipt | null> {
+    validateTenantCredentialTargetExecutionAuthorization(authorization);
+    const conn = await this.pool.getConnection();
+    try {
+      await this.beginTenantCredentialTargetExecutionTransaction(conn);
+      const current = await this.loadTenantCredentialTargetExecutionJob(
+        conn,
+        authorization.tenantId,
+        authorization.requestId,
+        "FOR UPDATE",
+      );
+      if (!current) {
+        await conn.commit();
+        return null;
+      }
+      if (!this.tenantCredentialTargetExecutionAuthorizationIdentityMatches(
+        current,
+        authorization,
+      )) {
+        await conn.commit();
+        return null;
+      }
+      if (current.phase === "external_credential_sealed") {
+        const proof = await this.validateTenantCredentialTargetExecutionReadProof(conn, current);
+        const receipt = proof.receipt;
+        const exact = receipt !== null
+          && receipt.completedClaimAttempt === authorization.claimAttempt
+          && receipt.completedClaimTokenSha256
+            === tenantCredentialTargetExecutionClaimTokenSha256(authorization.claimToken);
+        await conn.commit();
+        return exact ? receipt : null;
+      }
+      if (current.phase !== "queued") {
+        await conn.commit();
+        return null;
+      }
+      let now = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, now)) {
+        await conn.commit();
+        return null;
+      }
+      const proof = await this.validateTenantCredentialTargetExecutionReadProof(conn, current);
+      if (current.externalCredentialBlockerCount !== 0
+        || proof.acks.length !== proof.targets.length) {
+        await conn.commit();
+        return null;
+      }
+      const cutover = await this.validateTenantCredentialTargetExecutionCutoverState(
+        conn,
+        "FOR UPDATE",
+      );
+      const sealedAtDbMs = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(
+        current,
+        authorization,
+        sealedAtDbMs,
+      )) {
+        await conn.rollback();
+        return null;
+      }
+      this.assertTenantCredentialTargetExecutionSealClock(
+        current,
+        proof.acks,
+        sealedAtDbMs,
+      );
+      const completedClaimTokenSha256 = tenantCredentialTargetExecutionClaimTokenSha256(
+        authorization.claimToken,
+      );
+      const targetAckRootSha256 = tenantCredentialTargetExecutionTargetAckRootSha256(
+        proof.acks,
+      );
+      const adapterEvidenceRootSha256 =
+        tenantCredentialTargetExecutionAdapterEvidenceRootSha256(proof.acks);
+      const receiptBody = {
+        ...tenantCredentialTargetExecutionSourceFromJob(current),
+        scope: TENANT_CREDENTIAL_TARGET_EXECUTION_RECEIPT_SCOPE,
+        targetCount: proof.targets.length,
+        targetRootSha256: current.targetRootSha256,
+        targetAckCount: proof.acks.length,
+        targetAckRootSha256,
+        adapterEvidenceCount: proof.acks.length,
+        adapterEvidenceRootSha256,
+        externalCredentialExecutionComplete: true as const,
+        kmsKeyExecutionComplete: false as const,
+        allDomainsComplete: false as const,
+        contentPurgeExecuted: false as const,
+        unresolvedBlockerCount: current.kmsKeyBlockerCount,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256,
+        storeDbTimestampMs: sealedAtDbMs,
+      };
+      const receipt: TenantCredentialTargetExecutionReceipt = {
+        ...receiptBody,
+        receiptSha256: tenantCredentialTargetExecutionReceiptSha256(receiptBody),
+      };
+      validateTenantCredentialTargetExecutionReceipt(receipt);
+      await conn.query(
+        `INSERT INTO tenant_credential_target_execution_receipts
+           (request_id, tenant_id, subject_generation, target_execution_generation,
+            t3a_receipt_sha256, inventory_receipt_sha256,
+            tracking_cutover_evidence_sha256, version_count, version_root_sha256,
+            target_disposition_count, target_disposition_root_sha256,
+            external_credential_target_count,
+            external_credential_target_root_sha256,
+            external_credential_blocker_count, kms_key_blocker_count,
+            kms_key_executable_target_count, source_evidence_db_ms, scope,
+            target_count, target_root_sha256, target_ack_count,
+            target_ack_root_sha256, adapter_evidence_count,
+            adapter_evidence_root_sha256,
+            external_credential_execution_complete, kms_key_execution_complete,
+            all_domains_complete, content_purge_executed, unresolved_blocker_count,
+            completed_claim_attempt, completed_claim_token_sha256,
+            store_db_timestamp_ms, receipt_sha256)
+         VALUES (${Array.from({ length: 33 }, () => "?").join(",")})`,
+        [receipt.requestId, receipt.tenantId, receipt.subjectGeneration,
+          receipt.targetExecutionGeneration, receipt.t3aReceiptSha256,
+          receipt.inventoryReceiptSha256, receipt.trackingCutoverEvidenceSha256,
+          receipt.versionCount, receipt.versionRootSha256,
+          receipt.targetDispositionCount, receipt.targetDispositionRootSha256,
+          receipt.externalCredentialTargetCount,
+          receipt.externalCredentialTargetRootSha256,
+          receipt.externalCredentialBlockerCount, receipt.kmsKeyBlockerCount,
+          receipt.kmsKeyExecutableTargetCount, receipt.sourceEvidenceDbMs,
+          receipt.scope, receipt.targetCount, receipt.targetRootSha256,
+          receipt.targetAckCount, receipt.targetAckRootSha256,
+          receipt.adapterEvidenceCount, receipt.adapterEvidenceRootSha256,
+          receipt.externalCredentialExecutionComplete, receipt.kmsKeyExecutionComplete,
+          receipt.allDomainsComplete, receipt.contentPurgeExecuted,
+          receipt.unresolvedBlockerCount, receipt.completedClaimAttempt,
+          receipt.completedClaimTokenSha256, receipt.storeDbTimestampMs,
+          receipt.receiptSha256],
+      );
+      if (cutover.controlGeneration === 0) {
+        const cutoverBody = {
+          singletonId: TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+          controlGeneration: 1 as const,
+          activatedAtDbMs: sealedAtDbMs,
+          firstRequestId: receipt.requestId,
+          firstReceiptSha256: receipt.receiptSha256,
+          executionProtocol: TENANT_CREDENTIAL_TARGET_EXECUTION_PROTOCOL,
+          externalCredentialExecutionEnabled: true as const,
+          kmsKeyExecutionEnabled: false as const,
+        };
+        const evidenceSha256 = tenantCredentialTargetExecutionCutoverEvidenceSha256(
+          cutoverBody,
+        );
+        const [activated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_credential_target_execution_cutover
+              SET control_generation=1, activated_at_db_ms=?, first_request_id=?,
+                  first_receipt_sha256=?, execution_protocol=?,
+                  external_credential_execution_enabled=TRUE,
+                  kms_key_execution_enabled=FALSE, evidence_sha256=?
+            WHERE singleton_id=? AND control_generation=0`,
+          [sealedAtDbMs, receipt.requestId, receipt.receiptSha256,
+            TENANT_CREDENTIAL_TARGET_EXECUTION_PROTOCOL, evidenceSha256,
+            TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID],
+        );
+        if (activated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      }
+      now = await this.databaseNow(conn);
+      if (!this.tenantCredentialTargetExecutionAuthorized(current, authorization, now)) {
+        await conn.rollback();
+        return null;
+      }
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_credential_target_execution_jobs
+            SET phase='external_credential_sealed', target_ack_count=?,
+                target_ack_root_sha256=?, adapter_evidence_count=?,
+                adapter_evidence_root_sha256=?, unresolved_blocker_count=?,
+                terminal_receipt_sha256=?, available_at_ms=NULL,
+                claim_token=NULL, lease_until_ms=NULL, last_error_code=NULL,
+                updated_at_ms=?, sealed_at_db_ms=?, completed_claim_attempt=?,
+                completed_claim_token_sha256=?
+          WHERE request_id=? AND tenant_id=? AND subject_generation=?
+            AND target_execution_generation=? AND phase='queued' AND attempts=?
+            AND claim_token=? AND lease_until_ms>?`,
+        [proof.acks.length, targetAckRootSha256, proof.acks.length,
+          adapterEvidenceRootSha256, receipt.unresolvedBlockerCount,
+          receipt.receiptSha256, Math.max(current.updatedAtMs, sealedAtDbMs),
+          sealedAtDbMs, authorization.claimAttempt, completedClaimTokenSha256,
+          authorization.requestId, authorization.tenantId,
+          authorization.subjectGeneration, authorization.targetExecutionGeneration,
+          authorization.claimAttempt, authorization.claimToken, now],
+      );
+      if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      await conn.commit();
+      return receipt;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantCredentialTargetExecutionJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialTargetExecutionJobRecord | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantCredentialTargetExecutionJob(conn, tenantId, requestId);
+      if (!job) return null;
+      await this.validateTenantCredentialTargetExecutionReadProof(conn, job);
+      return job;
+    });
+  }
+
+  async getTenantCredentialTargetExecutionTargets(
+    tenantId: string,
+    requestId: string,
+    targetExecutionGeneration: number,
+  ): Promise<TenantCredentialTargetExecutionTarget[]> {
+    if (!Number.isSafeInteger(targetExecutionGeneration)
+      || targetExecutionGeneration < 1) {
+      throw new Error("invalid tenant credential target execution generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantCredentialTargetExecutionJob(conn, tenantId, requestId);
+      if (!job || job.targetExecutionGeneration !== targetExecutionGeneration) return [];
+      const proof = await this.validateTenantCredentialTargetExecutionReadProof(conn, job);
+      return proof.targets;
+    });
+  }
+
+  async getTenantCredentialTargetExecutionTargetAcks(
+    tenantId: string,
+    requestId: string,
+    targetExecutionGeneration: number,
+  ): Promise<TenantCredentialTargetExecutionTargetAck[]> {
+    if (!Number.isSafeInteger(targetExecutionGeneration)
+      || targetExecutionGeneration < 1) {
+      throw new Error("invalid tenant credential target execution generation");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantCredentialTargetExecutionJob(conn, tenantId, requestId);
+      if (!job || job.targetExecutionGeneration !== targetExecutionGeneration) return [];
+      const proof = await this.validateTenantCredentialTargetExecutionReadProof(conn, job);
+      return proof.acks;
+    });
+  }
+
+  async getTenantCredentialTargetExecutionReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialTargetExecutionReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantCredentialTargetExecutionJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "external_credential_sealed") return null;
+      const proof = await this.validateTenantCredentialTargetExecutionReadProof(conn, job);
+      return proof.receipt;
+    });
+  }
+
+  async getTenantCredentialTargetExecutionCutover(
+  ): Promise<TenantCredentialTargetExecutionCutoverRecord> {
+    return this.withConsistentRead((conn) => (
+      this.validateTenantCredentialTargetExecutionCutoverState(conn)
+    ));
+  }
+
+  async hasTenantCredentialTargetExecutionJobs(): Promise<boolean> {
+    return this.withConsistentRead(async (conn) => {
+      await this.validateTenantCredentialTargetExecutionCutoverState(conn);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT tenant_id, request_id FROM tenant_credential_target_execution_jobs ORDER BY request_id",
+      );
+      for (const row of rows) {
+        const job = await this.loadTenantCredentialTargetExecutionJob(
+          conn,
+          String(row.tenant_id),
+          String(row.request_id),
+        );
+        if (!job) throw new TenantErasureIntegrityError();
+        await this.validateTenantCredentialTargetExecutionReadProof(conn, job);
+      }
+      return rows.length > 0;
     });
   }
 
@@ -29215,6 +31142,7 @@ export class MysqlSessionStore implements
       customHeadersPresent: boolean;
       endpointParametersPresent: boolean;
       createdAtDbMs: number;
+      targetReference?: ProviderCredentialTargetReferenceWrite;
     },
   ): Promise<TenantCredentialVersion> {
     const credentialVersionId = tenantCredentialVersionId({
@@ -29240,6 +31168,12 @@ export class MysqlSessionStore implements
       ...body,
       evidenceSha256: tenantCredentialVersionEvidenceSha256(body),
     };
+    if (input.targetReference !== undefined) {
+      validateProviderCredentialTargetReferenceWrite(input.targetReference);
+      if (input.slotKind !== "provider_binding" || input.origin !== "managed_v1") {
+        throw new TenantErasureIntegrityError();
+      }
+    }
     await conn.query(
       `INSERT INTO tenant_credential_versions
          (credential_version_id, tenant_id, slot_kind, slot_id_sha256, origin,
@@ -29253,11 +31187,19 @@ export class MysqlSessionStore implements
         version.endpointParametersPresent, version.createdAtDbMs, version.evidenceSha256],
     );
     for (const domain of TENANT_CREDENTIAL_TARGET_DOMAINS) {
+      const captured = domain === "external_credential" ? input.targetReference : undefined;
       const targetBody = {
         credentialVersionId: version.credentialVersionId,
         tenantId: version.tenantId,
         domain,
-        disposition: tenantCredentialCurrentTargetDisposition(version, domain),
+        disposition: captured?.disposition
+          ?? tenantCredentialCurrentTargetDisposition(version, domain),
+        ...(captured === undefined ? {} : {
+          adapterProtocol: captured.adapterProtocol,
+          targetReferenceCipherSha256: captured.targetReferenceCipherSha256,
+          targetReferenceKeyId: captured.targetReferenceKeyId,
+          targetReferenceSha256: captured.targetReferenceSha256,
+        }),
         capturedAtDbMs: input.createdAtDbMs,
       };
       const target: TenantCredentialTargetDisposition = {
@@ -29270,8 +31212,13 @@ export class MysqlSessionStore implements
             target_reference_cipher, target_reference_key_id,
             target_reference_cipher_sha256, target_reference_sha256,
             captured_at_db_ms, evidence_sha256)
-         VALUES (?,?,?,?,NULL,NULL,NULL,NULL,NULL,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
         [target.credentialVersionId, target.tenantId, target.domain, target.disposition,
+          captured?.adapterProtocol ?? null,
+          captured?.targetReferenceCipher ?? null,
+          captured?.targetReferenceKeyId ?? null,
+          captured?.targetReferenceCipherSha256 ?? null,
+          captured?.targetReferenceSha256 ?? null,
           target.capturedAtDbMs, target.evidenceSha256],
       );
     }
@@ -29418,12 +31365,18 @@ export class MysqlSessionStore implements
           || target.credentialVersionId !== input.credentialVersionId
           || domains.has(target.domain)
           || target.capturedAtDbMs !== version.createdAtDbMs
-          || target.disposition !== tenantCredentialCurrentTargetDisposition(
-            version,
-            target.domain,
-          )
+          || !tenantCredentialTargetDispositionMatchesVersion(version, target)
           || evidenceSha256 !== tenantCredentialTargetDispositionEvidenceSha256(body)
         ) throw new Error("credential target projection mismatch");
+        const referenceExpected = target.disposition === "executable_ref"
+          || target.disposition === "blocked_adapter_unconfigured";
+        if (referenceExpected !== (raw.target_reference_cipher != null)
+          || (raw.target_reference_cipher != null
+            && createHash("sha256")
+              .update(Buffer.from(raw.target_reference_cipher))
+              .digest("hex") !== target.targetReferenceCipherSha256)) {
+          throw new Error("credential target reference projection mismatch");
+        }
         domains.add(target.domain);
       } catch {
         throw new TenantErasureIntegrityError();
@@ -29586,6 +31539,19 @@ export class MysqlSessionStore implements
       [tenantId],
     );
     const targetDispositions = targetRows.map(rowToTenantCredentialTargetDisposition);
+    for (const [index, target] of targetDispositions.entries()) {
+      const row = targetRows[index]!;
+      const referenceExpected = target.disposition === "executable_ref"
+        || target.disposition === "blocked_adapter_unconfigured";
+      if (referenceExpected !== (row.target_reference_cipher != null)) {
+        throw new TenantErasureIntegrityError();
+      }
+      if (row.target_reference_cipher != null
+        && createHash("sha256").update(Buffer.from(row.target_reference_cipher)).digest("hex")
+          !== target.targetReferenceCipherSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+    }
     const snapshot: TenantCredentialLifecycleSnapshot = {
       subject,
       authSlot,
@@ -29631,8 +31597,7 @@ export class MysqlSessionStore implements
     const versionById = new Map(versions.map((version) => [version.credentialVersionId, version]));
     if (targetDispositions.some((target) => {
       const version = versionById.get(target.credentialVersionId);
-      return !version
-        || target.disposition !== tenantCredentialCurrentTargetDisposition(version, target.domain);
+      return !version || !tenantCredentialTargetDispositionMatchesVersion(version, target);
     })) throw new TenantErasureIntegrityError();
 
     const [sourceRows] = await conn.query<Row[]>(
@@ -30100,7 +32065,8 @@ export class MysqlSessionStore implements
     conn: PoolConnection,
     inventory: TenantCredentialInventoryReceipt,
     receipt: TenantCredentialRevocationReceipt,
-  ): Promise<void> {
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantCredentialLifecycleSnapshot> {
     const cutover = await this.loadTenantCredentialTrackingCutover(conn);
     if (
       cutover.controlGeneration !== 1
@@ -30115,6 +32081,7 @@ export class MysqlSessionStore implements
     const snapshot = await this.loadTenantCredentialLifecycleSnapshot(
       conn,
       inventory.tenantId,
+      lock,
     );
     const blockingTargetCount = (domain: TenantCredentialTargetDisposition["domain"]): number => (
       snapshot.targetDispositions.filter((target) => (
@@ -30155,6 +32122,7 @@ export class MysqlSessionStore implements
       || inventory.authSecretPresentBefore !== authSourceRetiredByT3a
       || inventory.authSourcePointerPresentBefore !== authSourceRetiredByT3a
     ) throw new TenantErasureIntegrityError();
+    return snapshot;
   }
 
   async getTenantCredentialInventoryReceipt(
@@ -30183,12 +32151,23 @@ export class MysqlSessionStore implements
     cfg: ProviderConfig,
     secret?: { ciphertext: Buffer; keyId: string },
     expectedSourceRevision?: number | null,
+    targetReference?: ProviderCredentialTargetReferenceWrite,
   ): Promise<ProviderConfig> {
+    const stagedTargetReference = targetReference === undefined ? undefined : {
+      ...targetReference,
+      targetReferenceCipher: Buffer.from(targetReference.targetReferenceCipher),
+    };
+    if (stagedTargetReference !== undefined) {
+      validateProviderCredentialTargetReferenceWrite(stagedTargetReference);
+    }
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
       await this.lockActiveTenantGate(conn, cfg.tenantId, cfg.updatedAtMs);
       const cutover = await this.loadTenantCredentialTrackingCutover(conn, "FOR UPDATE");
+      if (stagedTargetReference !== undefined && cutover.controlGeneration !== 1) {
+        throw new TenantErasureIntegrityError();
+      }
       const now = await this.databaseNow(conn);
       const [tenantRows] = await conn.query<Row[]>(
         "SELECT tenant_id FROM tenants WHERE tenant_id=? FOR UPDATE",
@@ -30362,6 +32341,9 @@ export class MysqlSessionStore implements
             origin: "managed_v1",
             ...finalPresence,
             createdAtDbMs: mutationAtMs,
+            ...(stagedTargetReference === undefined
+              ? {}
+              : { targetReference: stagedTargetReference }),
           })
         : undefined;
       const writeGeneration = (slot?.writeGeneration ?? 0) + 1;

@@ -47,6 +47,17 @@ export const TENANT_CREDENTIAL_TARGET_DISPOSITIONS = [
 export type TenantCredentialTargetDispositionKind =
   (typeof TENANT_CREDENTIAL_TARGET_DISPOSITIONS)[number];
 
+/** Internal write-side locator captured by trusted server integration, never public API input. */
+export interface ProviderCredentialTargetReferenceWrite {
+  domain: "external_credential";
+  disposition: "executable_ref";
+  adapterProtocol: string;
+  targetReferenceCipher: Buffer;
+  targetReferenceKeyId: string;
+  targetReferenceCipherSha256: string;
+  targetReferenceSha256: string;
+}
+
 export const TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS = [
   "blocked_no_locator",
   "blocked_adapter_unconfigured",
@@ -110,6 +121,35 @@ function enumValue<T extends string>(
 function root(domain: string, values: readonly string[]): string {
   for (const value of values) digest(value, `${domain} member`);
   return sha256([domain, [...values].sort()]);
+}
+
+export function validateProviderCredentialTargetReferenceWrite(
+  target: ProviderCredentialTargetReferenceWrite,
+): void {
+  exactKeys(target, [
+    "domain", "disposition", "adapterProtocol", "targetReferenceCipher",
+    "targetReferenceKeyId", "targetReferenceCipherSha256", "targetReferenceSha256",
+  ], "provider credential target reference write");
+  if (target.domain !== "external_credential" || target.disposition !== "executable_ref") {
+    throw new Error("provider credential target reference write has an invalid disposition");
+  }
+  if (!IDENTIFIER.test(target.adapterProtocol)) {
+    throw new Error("provider credential target adapter protocol is invalid");
+  }
+  if (!IDENTIFIER.test(target.targetReferenceKeyId)) {
+    throw new Error("provider credential target reference key id is invalid");
+  }
+  if (!Buffer.isBuffer(target.targetReferenceCipher)
+    || target.targetReferenceCipher.length < 1
+    || target.targetReferenceCipher.length > 8_192) {
+    throw new Error("provider credential target reference ciphertext is invalid");
+  }
+  digest(target.targetReferenceCipherSha256, "provider credential target reference ciphertext");
+  digest(target.targetReferenceSha256, "provider credential target reference");
+  const cipherSha256 = createHash("sha256").update(target.targetReferenceCipher).digest("hex");
+  if (target.targetReferenceCipherSha256 !== cipherSha256) {
+    throw new Error("provider credential target reference ciphertext hash mismatch");
+  }
 }
 
 export interface TenantCredentialTrackingCutoverRecord {
@@ -551,6 +591,47 @@ export function tenantCredentialCurrentTargetDisposition(
     : "blocked_shared_local_key";
 }
 
+/**
+ * A version's target rows are immutable once captured. Legacy and non-applicable shapes therefore
+ * have exactly one valid disposition, while a newly managed version may either retain the safe
+ * local blocker or carry a trusted executable reference captured in the same source transaction.
+ * This predicate deliberately does not let an existing row transition between those shapes.
+ */
+export function tenantCredentialTargetDispositionMatchesVersion(
+  version: Pick<
+    TenantCredentialVersion,
+    | "credentialVersionId"
+    | "tenantId"
+    | "slotKind"
+    | "origin"
+    | "encryptedSecretPresent"
+    | "customHeadersPresent"
+    | "endpointParametersPresent"
+    | "createdAtDbMs"
+  >,
+  target: TenantCredentialTargetDisposition,
+): boolean {
+  validateTenantCredentialTargetDisposition(target);
+  if (
+    target.credentialVersionId !== version.credentialVersionId
+    || target.tenantId !== version.tenantId
+    || target.capturedAtDbMs !== version.createdAtDbMs
+  ) return false;
+
+  const baseline = tenantCredentialCurrentTargetDisposition(version, target.domain);
+  if (target.disposition === baseline) return true;
+  if (version.origin !== "managed_v1") return false;
+
+  if (target.domain === "external_credential") {
+    return version.slotKind === "provider_binding"
+      && (target.disposition === "executable_ref"
+        || target.disposition === "blocked_adapter_unconfigured");
+  }
+  return version.encryptedSecretPresent
+    && (target.disposition === "executable_ref"
+      || target.disposition === "blocked_adapter_unconfigured");
+}
+
 /** Permanent provider-slot CAS state; rows are updated monotonically and are never deleted. */
 export interface TenantCredentialProviderSlotBody {
   tenantId: string;
@@ -731,12 +812,7 @@ export function validateTenantCredentialLifecycleSnapshot(
   ]));
   for (const target of snapshot.targetDispositions) {
     const version = versionById.get(target.credentialVersionId);
-    if (!version
-      || target.capturedAtDbMs !== version.createdAtDbMs
-      || target.disposition !== tenantCredentialCurrentTargetDisposition(
-        version,
-        target.domain,
-      )) {
+    if (!version || !tenantCredentialTargetDispositionMatchesVersion(version, target)) {
       throw new Error("tenant credential target does not match its credential version");
     }
   }

@@ -77,6 +77,10 @@ const Env = z.object({
   CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Independent fleet gate for external credential target execution. */
+  TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
   /** Independent execution barrier for the T3e local execution/physical-ACK worker. */
   TENANT_PURGE_EXECUTION_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -245,6 +249,13 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     throw new Error(
       "CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1 is required before "
         + "TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED=1",
+    );
+  }
+  if (c.TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED
+    && !c.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED) {
+    throw new Error(
+      "CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1 is required before "
+        + "TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED=1",
     );
   }
   if (c.TENANT_REDIS_PURGE_ENABLED && !c.REDIS_NAMESPACE_ID) {

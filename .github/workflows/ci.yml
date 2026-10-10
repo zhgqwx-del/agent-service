@@ -201,6 +201,14 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:tenant-credential-lifecycle-mysql
 
+      # External credential disposition is an irreversible, claim-fenced saga. Keep independent
+      # real-InnoDB proof for atomic locator capture, source integrity, exact ACK replay, stale
+      # lease fencing and the receipt/cutover transaction. KMS completion remains impossible.
+      - name: Tenant credential target execution real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-credential-target-execution-mysql
+
       # T3b commits a complete configured-fleet proof beside the terminal queue transition. Keep
       # explicit InnoDB evidence for live-source admission, exact replay and transaction rollback.
       - name: Tenant runtime revocation real MySQL suite (must execute)
@@ -316,7 +324,7 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0028
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0029
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority, 0016 -> 0017 user-export and 0018 -> 0019 inert tenant credential
@@ -324,8 +332,8 @@ jobs:
       # 0021 -> 0022 full-domain purge-plan, 0022 -> 0023 execution-ledger and 0023 -> 0024
       # database-content deletion, 0024 -> 0025 Redis-purge ledger, 0025 -> 0026 versioned
       # credential-lifecycle inventory, 0026 -> 0027 blob-storage control and 0027 -> 0028
-      # offline-mover ledger replay matrices.
-      - name: Historical MySQL migrations (0007 through 0028, no skips)
+      # offline-mover ledger and 0028 -> 0029 dormant credential-target execution replay matrices.
+      - name: Historical MySQL migrations (0007 through 0029, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -459,6 +467,7 @@ jobs:
           if [ "${{ matrix.app }}" = "agent-runner" ]; then
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0027_blob_storage_control.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0028_blob_storage_migration.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0029_tenant_credential_target_execution.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
             CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)

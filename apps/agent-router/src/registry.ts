@@ -17,6 +17,7 @@ import {
   TENANT_RUNTIME_DRAIN_V1,
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TenantRuntimeDrainReady,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
@@ -510,6 +511,29 @@ export class RunnerRegistry {
       && target.capabilities.features.tenantCredentialLifecycleTrackingActive === true
       && target.capabilities.features.tenantCredentialRevocationWorker === true
     ));
+  }
+
+  /** External mutation is irreversible, so unavailable configured runners cannot be omitted. */
+  allConfiguredSupportTenantCredentialTargetExecution(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantCredentialLifecycle.includes(
+        TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
+      ) === true
+      && target.capabilities.features.tenantCredentialLifecycleTrackingActive === true
+      && target.capabilities.features.tenantCredentialTargetExecution.includes(
+        TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
+      )
+    ));
+  }
+
+  /** Fresh worker authority additionally requires an active executor on every configured runner. */
+  allConfiguredSupportTenantCredentialTargetExecutionWorker(): boolean {
+    return this.allConfiguredSupportTenantCredentialTargetExecution()
+      && this.list().every((target) => (
+        target.capabilities?.features.tenantCredentialTargetExecutionWorker === true
+      ));
   }
 
   /** Every configured runner must freshly prove the exact local T3e execution/ACK contract. */

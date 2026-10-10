@@ -424,6 +424,7 @@ import {
   tenantCredentialSubjectEvidenceSha256,
   tenantCredentialSubjectRootSha256,
   tenantCredentialTargetDispositionEvidenceSha256,
+  tenantCredentialTargetDispositionMatchesVersion,
   tenantCredentialTargetDispositionRootSha256,
   tenantCredentialTrackingCutoverEvidenceSha256,
   tenantCredentialVersionEvidenceSha256,
@@ -433,6 +434,7 @@ import {
   validateTenantCredentialInventoryReceipt,
   validateTenantCredentialLifecycleSnapshot,
   validateTenantCredentialProviderSlot,
+  validateProviderCredentialTargetReferenceWrite,
   validateTenantCredentialTargetDisposition,
   validateTenantCredentialTrackingCutoverRecord,
   validateTenantCredentialTrackingSubject,
@@ -444,6 +446,7 @@ import {
   type TenantCredentialInventoryReceipt,
   type TenantCredentialLifecycleSnapshot,
   type TenantCredentialProviderSlot,
+  type ProviderCredentialTargetReferenceWrite,
   type TenantCredentialRetireReason,
   type TenantCredentialSlotKind,
   type TenantCredentialTargetDisposition,
@@ -568,6 +571,7 @@ import {
   isTenantPurgePlanBlockingDisposition,
   tenantPurgePlanAuthorizationMatches,
   tenantPurgePlanBlockerRootSha256,
+  tenantCredentialPurgePlanTargetEvidence,
   tenantPurgePlanClaimFromJob,
   tenantPurgePlanClaimTokenSha256,
   tenantPurgePlanDomainOrdinal,
@@ -785,6 +789,50 @@ import {
   type TenantRedisPurgeTarget,
   type TenantRedisPurgeTargetAck,
 } from "./tenant-redis-purge.js";
+import {
+  EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_ADAPTER_EVIDENCE_ROOT_SHA256,
+  EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ACK_ROOT_SHA256,
+  EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ROOT_SHA256,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_PROTOCOL,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_RECEIPT_SCOPE,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ACK_SCOPE,
+  TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_SCOPE,
+  tenantCredentialTargetExecutionAdapterEvidenceRootSha256,
+  tenantCredentialTargetExecutionClaimTokenSha256,
+  tenantCredentialTargetExecutionCutoverEvidenceSha256,
+  tenantCredentialTargetExecutionOperationIdSha256,
+  tenantCredentialTargetExecutionReceiptSha256,
+  tenantCredentialTargetExecutionTargetAckRootSha256,
+  tenantCredentialTargetExecutionTargetAckSha256,
+  tenantCredentialTargetExecutionTargetRootSha256,
+  tenantCredentialTargetExecutionTargetSha256,
+  validateClaimTenantCredentialTargetExecutionsOptions,
+  validateMaterializeTenantCredentialTargetExecutionJobsOptions,
+  validateRenewTenantCredentialTargetExecutionOptions,
+  validateRetryTenantCredentialTargetExecutionOptions,
+  validateTenantCredentialTargetExecutionAdapterResult,
+  validateTenantCredentialTargetExecutionAuthorization,
+  validateTenantCredentialTargetExecutionCutoverRecord,
+  validateTenantCredentialTargetExecutionJobRecord,
+  validateTenantCredentialTargetExecutionReceipt,
+  type ClaimTenantCredentialTargetExecutionsOptions,
+  type MaterializeTenantCredentialTargetExecutionJobsOptions,
+  type RenewTenantCredentialTargetExecutionOptions,
+  type RetryTenantCredentialTargetExecutionOptions,
+  type TenantCredentialTargetExecutionAdapterResult,
+  type TenantCredentialTargetExecutionAuthorization,
+  type TenantCredentialTargetExecutionBlockReasonCode,
+  type TenantCredentialTargetExecutionClaim,
+  type TenantCredentialTargetExecutionCutoverRecord,
+  type TenantCredentialTargetExecutionEncryptedReference,
+  type TenantCredentialTargetExecutionJobRecord,
+  type TenantCredentialTargetExecutionReceipt,
+  type TenantCredentialTargetExecutionSource,
+  type TenantCredentialTargetExecutionStore,
+  type TenantCredentialTargetExecutionTarget,
+  type TenantCredentialTargetExecutionTargetAck,
+} from "./tenant-credential-target-execution.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -816,6 +864,11 @@ interface MemoryProviderRecord {
   credentialSlotIdSha256?: string;
   credentialSourceRevision?: number;
   credentialVersionId?: string;
+}
+
+interface MemoryTenantCredentialTargetReference {
+  tenantId: string;
+  ciphertext: Buffer;
 }
 
 const clone = <T>(v: T): T => structuredClone(v);
@@ -1076,7 +1129,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1118,7 +1171,37 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantCredentialProviderSlots = new Map<string, TenantCredentialProviderSlot>();
   tenantCredentialVersions = new Map<string, TenantCredentialVersion>();
   tenantCredentialTargetDispositions = new Map<string, TenantCredentialTargetDisposition>();
+  tenantCredentialTargetReferenceCiphers = new Map<
+    string,
+    MemoryTenantCredentialTargetReference
+  >();
   tenantCredentialInventoryReceipts = new Map<string, TenantCredentialInventoryReceipt>();
+  tenantCredentialTargetExecutionJobs = new Map<
+    string,
+    TenantCredentialTargetExecutionJobRecord
+  >();
+  tenantCredentialTargetExecutionTargets = new Map<
+    string,
+    TenantCredentialTargetExecutionTarget
+  >();
+  tenantCredentialTargetExecutionTargetAcks = new Map<
+    string,
+    TenantCredentialTargetExecutionTargetAck
+  >();
+  tenantCredentialTargetExecutionReceipts = new Map<
+    string,
+    TenantCredentialTargetExecutionReceipt
+  >();
+  tenantCredentialTargetExecutionCutovers = new Map<
+    1,
+    TenantCredentialTargetExecutionCutoverRecord
+  >([[
+    TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+    {
+      singletonId: TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+      controlGeneration: 0,
+    },
+  ]]);
   tenantRuntimeRevocationJobs = new Map<string, TenantRuntimeRevocationJobRecord>();
   tenantRuntimeRevocationTargetReceipts = new Map<string, TenantRuntimeRevocationTargetReceipt>();
   tenantRuntimeRevocationReceipts = new Map<string, TenantRuntimeRevocationReceipt>();
@@ -1402,8 +1485,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       customHeadersPresent: boolean;
       endpointParametersPresent: boolean;
       createdAtDbMs: number;
+      targetReference?: ProviderCredentialTargetReferenceWrite;
     },
-  ): { version: TenantCredentialVersion; targets: TenantCredentialTargetDisposition[] } {
+  ): {
+    version: TenantCredentialVersion;
+    targets: TenantCredentialTargetDisposition[];
+    targetReference?: { key: string; value: MemoryTenantCredentialTargetReference };
+  } {
     const credentialVersionId = tenantCredentialVersionId({
       tenantId: input.tenantId,
       slotKind: input.slotKind,
@@ -1435,12 +1523,26 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       evidenceSha256: tenantCredentialVersionEvidenceSha256(body),
     };
     validateTenantCredentialVersion(version);
+    if (input.targetReference !== undefined) {
+      validateProviderCredentialTargetReferenceWrite(input.targetReference);
+      if (input.slotKind !== "provider_binding" || input.origin !== "managed_v1") {
+        throw new TenantErasureIntegrityError();
+      }
+    }
     const targets = TENANT_CREDENTIAL_TARGET_DOMAINS.map((domain) => {
+      const captured = domain === "external_credential" ? input.targetReference : undefined;
       const targetBody = {
         credentialVersionId,
         tenantId: input.tenantId,
         domain,
-        disposition: tenantCredentialCurrentTargetDisposition(version, domain),
+        disposition: captured?.disposition
+          ?? tenantCredentialCurrentTargetDisposition(version, domain),
+        ...(captured === undefined ? {} : {
+          adapterProtocol: captured.adapterProtocol,
+          targetReferenceCipherSha256: captured.targetReferenceCipherSha256,
+          targetReferenceKeyId: captured.targetReferenceKeyId,
+          targetReferenceSha256: captured.targetReferenceSha256,
+        }),
         capturedAtDbMs: input.createdAtDbMs,
       };
       const target: TenantCredentialTargetDisposition = {
@@ -1450,7 +1552,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       validateTenantCredentialTargetDisposition(target);
       return target;
     });
-    return { version, targets };
+    const targetReference = input.targetReference === undefined
+      ? undefined
+      : {
+          key: tenantCredentialTargetKey(credentialVersionId, "external_credential"),
+          value: {
+            tenantId: input.tenantId,
+            ciphertext: Buffer.from(input.targetReference.targetReferenceCipher),
+          },
+        };
+    return { version, targets, ...(targetReference === undefined ? {} : { targetReference }) };
   }
 
   private retiredTenantCredentialVersion(
@@ -1519,8 +1630,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           || target.tenantId !== version.tenantId
           || target.domain !== domain
           || target.capturedAtDbMs !== version.createdAtDbMs
-          || target.disposition !== tenantCredentialCurrentTargetDisposition(version, domain)
+          || !tenantCredentialTargetDispositionMatchesVersion(version, target)
         ) throw new Error("current credential version target does not match its version");
+        const reference = this.tenantCredentialTargetReferenceCiphers.get(key);
+        const referenceExpected = target.disposition === "executable_ref"
+          || target.disposition === "blocked_adapter_unconfigured";
+        if (referenceExpected !== (reference !== undefined)
+          || (reference !== undefined && (
+            reference.tenantId !== version.tenantId
+            || createHash("sha256").update(reference.ciphertext).digest("hex")
+              !== target.targetReferenceCipherSha256
+          ))) throw new Error("current credential target reference is invalid");
       }
     } catch {
       throw new TenantErasureIntegrityError();
@@ -1556,6 +1676,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       providerSlots: Map<string, TenantCredentialProviderSlot>;
       versions: Map<string, TenantCredentialVersion>;
       targets: Map<string, TenantCredentialTargetDisposition>;
+      targetReferences: Map<string, MemoryTenantCredentialTargetReference>;
     },
   ): TenantCredentialLifecycleSnapshot {
     const subject = state.subjects.get(tenantId);
@@ -1572,6 +1693,25 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       .filter(([, target]) => target.tenantId === tenantId)
       .sort((left, right) => left[0].localeCompare(right[0]))
       .map(([, target]) => target);
+    const targetKeys = new Set<string>();
+    for (const target of targets) {
+      const key = tenantCredentialTargetKey(target.credentialVersionId, target.domain);
+      targetKeys.add(key);
+      const reference = state.targetReferences.get(key);
+      const referenceExpected = target.disposition === "executable_ref"
+        || target.disposition === "blocked_adapter_unconfigured";
+      if (referenceExpected !== (reference !== undefined)) throw new TenantErasureIntegrityError();
+      if (reference !== undefined && (
+        reference.tenantId !== tenantId
+        || createHash("sha256").update(reference.ciphertext).digest("hex")
+          !== target.targetReferenceCipherSha256
+      )) throw new TenantErasureIntegrityError();
+    }
+    for (const [key, reference] of state.targetReferences) {
+      if (reference.tenantId === tenantId && !targetKeys.has(key)) {
+        throw new TenantErasureIntegrityError();
+      }
+    }
 
     const liveProviders = [...state.providers.entries()].filter(([, row]) => (
       row.config.tenantId === tenantId
@@ -1666,7 +1806,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   private assertTenantCredentialInventoryReceipt(
     receipt: TenantCredentialInventoryReceipt,
-  ): void {
+  ): TenantCredentialLifecycleSnapshot {
     try {
       validateTenantCredentialInventoryReceipt(receipt);
       const t3aReceipt = this.tenantCredentialRevocationReceipts.get(receipt.requestId);
@@ -1686,6 +1826,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         providerSlots: this.tenantCredentialProviderSlots,
         versions: this.tenantCredentialVersions,
         targets: this.tenantCredentialTargetDispositions,
+        targetReferences: this.tenantCredentialTargetReferenceCiphers,
       });
       const isBlocking = (target: TenantCredentialTargetDisposition): boolean => (
         TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS.some(
@@ -1722,6 +1863,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || receipt.authSecretPresentBefore !== t3aReceipt.authSecretCipherPresentBefore
         || receipt.authSecretPresentBefore !== t3aReceipt.authSecretKeyIdPresentBefore
       ) throw new Error("credential inventory receipt binding is invalid");
+      return snapshot;
     } catch {
       throw new TenantErasureIntegrityError();
     }
@@ -1958,6 +2100,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         providerSlots: stagedSlots,
         versions: stagedVersions,
         targets: stagedTargets,
+        targetReferences: new Map(),
       });
     }
 
@@ -2015,6 +2158,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       providerSlots: this.tenantCredentialProviderSlots,
       versions: this.tenantCredentialVersions,
       targets: this.tenantCredentialTargetDispositions,
+      targetReferences: this.tenantCredentialTargetReferenceCiphers,
     }));
   }
 
@@ -6115,6 +6259,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         providerSlots: this.tenantCredentialProviderSlots,
         versions: this.tenantCredentialVersions,
         targets: this.tenantCredentialTargetDispositions,
+        targetReferences: this.tenantCredentialTargetReferenceCiphers,
       });
     }
 
@@ -6327,6 +6472,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         providerSlots: stagedProviderSlots,
         versions: stagedVersions,
         targets: stagedTargets,
+        targetReferences: this.tenantCredentialTargetReferenceCiphers,
       });
       const isBlockingDisposition = (target: TenantCredentialTargetDisposition): boolean => (
         TENANT_CREDENTIAL_BLOCKING_TARGET_DISPOSITIONS.some(
@@ -8690,6 +8836,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     contentJob: Extract<TenantContentInventoryJobRecord, { phase: "inventory_sealed" }>;
     contentReceipt: TenantContentInventoryReceipt;
     credentialReceipt: TenantCredentialRevocationReceipt;
+    credentialInventoryReceipt: TenantCredentialInventoryReceipt;
+    credentialSnapshot: TenantCredentialLifecycleSnapshot;
   } {
     try {
       validateTenantPurgePlanJobRecord(job);
@@ -8708,6 +8856,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       validateTenantContentInventoryCompletionProof(contentJob, sessionReceipts, contentReceipt);
       const credentialReceipt = this.tenantCredentialRevocationReceipts.get(job.requestId);
       if (!credentialReceipt) throw new Error("tenant purge plan T3a receipt is missing");
+      const credentialInventoryReceipt = this.tenantCredentialInventoryReceipts.get(job.requestId);
+      if (!credentialInventoryReceipt) {
+        throw new Error("tenant purge plan credential inventory receipt is missing");
+      }
+      const credentialSnapshot = this.assertTenantCredentialInventoryReceipt(
+        credentialInventoryReceipt,
+      );
       if (
         job.t1FenceSha256 !== contentJob.t1FenceSha256
         || job.t3aReceiptSha256 !== contentJob.t3aReceiptSha256
@@ -8733,7 +8888,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           || state.receipts.length !== contentReceipt.sessionReceiptCount
         ) throw new TenantPurgePlanEvidenceChangedError();
       }
-      return { contentJob, contentReceipt, credentialReceipt };
+      return {
+        contentJob,
+        contentReceipt,
+        credentialReceipt,
+        credentialInventoryReceipt,
+        credentialSnapshot,
+      };
     } catch (error) {
       if (error instanceof TenantPurgePlanEvidenceChangedError) throw error;
       if (error instanceof TenantContentInventoryEvidenceChangedError) {
@@ -8763,6 +8924,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     domain: TenantPurgePlanDomain,
     contentReceipt: TenantContentInventoryReceipt,
     credentialReceipt: TenantCredentialRevocationReceipt,
+    credentialSnapshot: TenantCredentialLifecycleSnapshot,
     holdProof: { holdControlCount: number; holdControlRootSha256: string },
   ): {
     targetCount: number;
@@ -9229,30 +9391,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         disposition = "blocked_adapter_unconfigured";
         break;
       case "external_provider":
-        targetCount = credentialReceipt.providerConfigCountBefore;
-        if (targetCount > 0) {
-          add(credentialReceipt.receiptSha256, targetCount);
-          disposition = "blocked_legacy_external_source_unavailable";
-        } else {
-          disposition = "not_applicable";
-        }
-        break;
       case "kms":
-        targetCount = credentialReceipt.providerConfigCountBefore
-          + (credentialReceipt.authSecretCipherPresentBefore
-            || credentialReceipt.authSecretKeyIdPresentBefore ? 1 : 0);
-        if (targetCount > 0) {
-          add(
-            credentialReceipt.receiptSha256,
-            credentialReceipt.providerConfigCountBefore,
-            credentialReceipt.authSecretCipherPresentBefore,
-            credentialReceipt.authSecretKeyIdPresentBefore,
-          );
-          disposition = "blocked_legacy_external_source_unavailable";
-        } else {
-          disposition = "not_applicable";
-        }
-        break;
+        return tenantCredentialPurgePlanTargetEvidence(
+          domain,
+          credentialSnapshot.targetDispositions,
+        );
       case "backup_ledger":
         disposition = "blocked_adapter_unconfigured";
         break;
@@ -9291,6 +9434,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       domain,
       source.contentReceipt,
       source.credentialReceipt,
+      source.credentialSnapshot,
       holdProof,
     );
     const body = {
@@ -11310,11 +11454,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
       // Revoke every export control row, remove download/idempotency capability, release every
       // snapshot pin, and bind each non-deleted artifact part to its exact delete outbox row.
+      const credentialInventory = this.tenantCredentialInventoryReceipts.get(current.requestId);
+      if (!credentialInventory) throw new TenantErasureIntegrityError();
+      const credentialSnapshot = this.assertTenantCredentialInventoryReceipt(
+        credentialInventory,
+      );
       const controlTargetHashes = this.tenantPurgePlanTargetEvidence(
         state.planJob,
         "user_export_control",
         this.tenantContentInventoryReceipts.get(current.requestId)!,
         this.tenantCredentialRevocationReceipts.get(current.requestId)!,
+        credentialSnapshot,
         this.tenantPurgePlanHoldProof(current.tenantId),
       );
       const snapshotTargetHashes = this.tenantPurgePlanTargetEvidence(
@@ -11322,6 +11472,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         "user_export_snapshots",
         this.tenantContentInventoryReceipts.get(current.requestId)!,
         this.tenantCredentialRevocationReceipts.get(current.requestId)!,
+        credentialSnapshot,
         this.tenantPurgePlanHoldProof(current.tenantId),
       );
       if (
@@ -16895,13 +17046,957 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return a && a.sessionId === sessionId ? clone(a) : null;
   }
 
+  private tenantCredentialTargetExecutionIdentity(
+    job: TenantCredentialTargetExecutionJobRecord,
+  ) {
+    return {
+      requestId: job.requestId,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      targetExecutionGeneration: job.targetExecutionGeneration,
+    };
+  }
+
+  private tenantCredentialTargetExecutionSource(
+    job: TenantCredentialTargetExecutionJobRecord,
+  ): TenantCredentialTargetExecutionSource {
+    return {
+      ...this.tenantCredentialTargetExecutionIdentity(job),
+      t3aReceiptSha256: job.t3aReceiptSha256,
+      inventoryReceiptSha256: job.inventoryReceiptSha256,
+      trackingCutoverEvidenceSha256: job.trackingCutoverEvidenceSha256,
+      versionCount: job.versionCount,
+      versionRootSha256: job.versionRootSha256,
+      targetDispositionCount: job.targetDispositionCount,
+      targetDispositionRootSha256: job.targetDispositionRootSha256,
+      externalCredentialTargetCount: job.externalCredentialTargetCount,
+      externalCredentialTargetRootSha256: job.externalCredentialTargetRootSha256,
+      externalCredentialBlockerCount: job.externalCredentialBlockerCount,
+      kmsKeyBlockerCount: job.kmsKeyBlockerCount,
+      kmsKeyExecutableTargetCount: 0,
+      sourceEvidenceDbMs: job.sourceEvidenceDbMs,
+    };
+  }
+
+  private tenantCredentialTargetExecutionTargetKey(
+    requestId: string,
+    generation: number,
+    ordinal: number,
+  ): string {
+    return JSON.stringify([requestId, generation, ordinal]);
+  }
+
+  private tenantCredentialTargetExecutionTargetsFor(
+    job: TenantCredentialTargetExecutionJobRecord,
+  ): TenantCredentialTargetExecutionTarget[] {
+    return [...this.tenantCredentialTargetExecutionTargets.values()]
+      .filter((target) => target.requestId === job.requestId
+        && target.targetExecutionGeneration === job.targetExecutionGeneration)
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+  }
+
+  private tenantCredentialTargetExecutionAcksFor(
+    job: TenantCredentialTargetExecutionJobRecord,
+  ): TenantCredentialTargetExecutionTargetAck[] {
+    return [...this.tenantCredentialTargetExecutionTargetAcks.values()]
+      .filter((ack) => ack.requestId === job.requestId
+        && ack.targetExecutionGeneration === job.targetExecutionGeneration)
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+  }
+
+  private assertTenantCredentialTargetExecutionCutover(
+  ): TenantCredentialTargetExecutionCutoverRecord {
+    const cutover = this.tenantCredentialTargetExecutionCutovers.get(
+      TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+    );
+    if (!cutover || this.tenantCredentialTargetExecutionCutovers.size !== 1) {
+      throw new TenantErasureIntegrityError();
+    }
+    try {
+      validateTenantCredentialTargetExecutionCutoverRecord(cutover);
+      if (cutover.controlGeneration === 1) {
+        const receipt = this.tenantCredentialTargetExecutionReceipts.get(
+          cutover.firstRequestId,
+        );
+        if (!receipt
+          || receipt.receiptSha256 !== cutover.firstReceiptSha256
+          || receipt.storeDbTimestampMs !== cutover.activatedAtDbMs) {
+          throw new Error("credential target execution cutover source is missing");
+        }
+      }
+      return cutover;
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantCredentialTargetExecutionExpectedSource(
+    inventory: TenantCredentialInventoryReceipt,
+    snapshot: TenantCredentialLifecycleSnapshot,
+  ): TenantCredentialTargetExecutionSource {
+    const external = tenantCredentialPurgePlanTargetEvidence(
+      "external_provider",
+      snapshot.targetDispositions,
+    );
+    const executableExternal = snapshot.targetDispositions.filter((target) => (
+      target.domain === "external_credential" && target.disposition === "executable_ref"
+    ));
+    const executableKms = snapshot.targetDispositions.filter((target) => (
+      target.domain === "kms_key" && target.disposition === "executable_ref"
+    ));
+    if (executableKms.length !== 0
+      || external.targetCount
+        !== executableExternal.length + inventory.externalCredentialBlockerCount) {
+      throw new TenantErasureIntegrityError();
+    }
+    return {
+      requestId: inventory.requestId,
+      tenantId: inventory.tenantId,
+      subjectGeneration: inventory.subjectGeneration,
+      targetExecutionGeneration: 1,
+      t3aReceiptSha256: inventory.t3aReceiptSha256,
+      inventoryReceiptSha256: inventory.receiptSha256,
+      trackingCutoverEvidenceSha256: inventory.trackingCutoverEvidenceSha256,
+      versionCount: inventory.versionCount,
+      versionRootSha256: inventory.versionRootSha256,
+      targetDispositionCount: inventory.targetDispositionCount,
+      targetDispositionRootSha256: inventory.targetDispositionRootSha256,
+      externalCredentialTargetCount: executableExternal.length,
+      externalCredentialTargetRootSha256: external.targetRootSha256,
+      externalCredentialBlockerCount: inventory.externalCredentialBlockerCount,
+      kmsKeyBlockerCount: inventory.kmsKeyBlockerCount,
+      kmsKeyExecutableTargetCount: 0,
+      sourceEvidenceDbMs: inventory.storeDbTimestampMs,
+    };
+  }
+
+  private tenantCredentialTargetExecutionExpectedTargets(
+    source: TenantCredentialTargetExecutionSource,
+    snapshot: TenantCredentialLifecycleSnapshot,
+    capturedAtDbMs: number,
+  ): TenantCredentialTargetExecutionTarget[] {
+    return snapshot.targetDispositions
+      .filter((target) => target.domain === "external_credential"
+        && target.disposition === "executable_ref")
+      .sort((left, right) => left.credentialVersionId.localeCompare(right.credentialVersionId))
+      .map((target, targetOrdinal) => {
+        if (target.adapterProtocol === undefined
+          || target.targetReferenceCipherSha256 === undefined
+          || target.targetReferenceKeyId === undefined
+          || target.targetReferenceSha256 === undefined) {
+          throw new TenantErasureIntegrityError();
+        }
+        const identity = {
+          requestId: source.requestId,
+          tenantId: source.tenantId,
+          subjectGeneration: source.subjectGeneration,
+          targetExecutionGeneration: source.targetExecutionGeneration,
+        };
+        const operationIdSha256 = tenantCredentialTargetExecutionOperationIdSha256({
+          identity,
+          credentialVersionId: target.credentialVersionId,
+          domain: "external_credential",
+          targetDispositionEvidenceSha256: target.evidenceSha256,
+          adapterProtocol: target.adapterProtocol,
+          targetReferenceCipherSha256: target.targetReferenceCipherSha256,
+          targetReferenceKeyId: target.targetReferenceKeyId,
+          targetReferenceSha256: target.targetReferenceSha256,
+        });
+        const body = {
+          ...identity,
+          scope: TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_SCOPE,
+          targetOrdinal,
+          credentialVersionId: target.credentialVersionId,
+          domain: "external_credential" as const,
+          sourceDisposition: "executable_ref" as const,
+          targetDispositionEvidenceSha256: target.evidenceSha256,
+          adapterProtocol: target.adapterProtocol,
+          targetReferenceCipherSha256: target.targetReferenceCipherSha256,
+          targetReferenceKeyId: target.targetReferenceKeyId,
+          targetReferenceSha256: target.targetReferenceSha256,
+          operationIdSha256,
+          capturedAtDbMs,
+        };
+        return clone<TenantCredentialTargetExecutionTarget>({
+          ...body,
+          receiptSha256: tenantCredentialTargetExecutionTargetSha256(body),
+        });
+      });
+  }
+
+  private assertTenantCredentialTargetExecutionEvidence(
+    job: TenantCredentialTargetExecutionJobRecord,
+  ): {
+    snapshot: TenantCredentialLifecycleSnapshot;
+    targets: TenantCredentialTargetExecutionTarget[];
+    acks: TenantCredentialTargetExecutionTargetAck[];
+  } {
+    try {
+      validateTenantCredentialTargetExecutionJobRecord(job);
+      const inventory = this.tenantCredentialInventoryReceipts.get(job.requestId);
+      if (!inventory || inventory.tenantId !== job.tenantId) {
+        throw new Error("credential target execution inventory is missing");
+      }
+      const snapshot = this.assertTenantCredentialInventoryReceipt(inventory);
+      const expectedSource = this.tenantCredentialTargetExecutionExpectedSource(
+        inventory,
+        snapshot,
+      );
+      const actualSource = this.tenantCredentialTargetExecutionSource(job);
+      if ((Object.keys(expectedSource) as Array<keyof TenantCredentialTargetExecutionSource>)
+        .some((key) => expectedSource[key] !== actualSource[key])) {
+        throw new Error("credential target execution source changed");
+      }
+      const expectedTargets = this.tenantCredentialTargetExecutionExpectedTargets(
+        expectedSource,
+        snapshot,
+        job.createdAtMs,
+      );
+      const targets = this.tenantCredentialTargetExecutionTargetsFor(job);
+      if (targets.length !== expectedTargets.length
+        || targets.some((target, index) => (
+          target.receiptSha256 !== expectedTargets[index]!.receiptSha256
+        ))
+        || job.targetCount !== targets.length
+        || job.targetRootSha256 !== tenantCredentialTargetExecutionTargetRootSha256(targets)) {
+        throw new Error("credential target execution target catalog changed");
+      }
+      const acks = this.tenantCredentialTargetExecutionAcksFor(job);
+      for (const ack of acks) {
+        const target = targets[ack.targetOrdinal];
+        if (!target
+          || ack.credentialVersionId !== target.credentialVersionId
+          || ack.domain !== target.domain
+          || ack.targetReceiptSha256 !== target.receiptSha256
+          || ack.operationIdSha256 !== target.operationIdSha256
+          || ack.adapterProtocol !== target.adapterProtocol
+          || ack.targetReferenceSha256 !== target.targetReferenceSha256) {
+          throw new Error("credential target execution ACK target changed");
+        }
+        this.assertTenantCredentialTargetExecutionAckClock(
+          job,
+          target,
+          ack.storeDbTimestampMs,
+        );
+      }
+      if (job.targetAckCount !== acks.length
+        || job.targetAckRootSha256
+          !== tenantCredentialTargetExecutionTargetAckRootSha256(acks)
+        || job.adapterEvidenceCount !== acks.length
+        || job.adapterEvidenceRootSha256
+          !== tenantCredentialTargetExecutionAdapterEvidenceRootSha256(acks)) {
+        throw new Error("credential target execution ACK catalog changed");
+      }
+      const receipt = this.tenantCredentialTargetExecutionReceipts.get(job.requestId);
+      if (job.phase === "external_credential_sealed") {
+        const expectedSource = this.tenantCredentialTargetExecutionSource(job);
+        if (!receipt || (Object.keys(expectedSource) as Array<
+          keyof TenantCredentialTargetExecutionSource
+        >).some((key) => receipt[key] !== expectedSource[key])
+          || receipt.receiptSha256 !== job.terminalReceiptSha256
+          || receipt.completedClaimAttempt !== job.completedClaimAttempt
+          || receipt.completedClaimTokenSha256 !== job.completedClaimTokenSha256
+          || receipt.storeDbTimestampMs !== job.sealedAtDbMs
+          || receipt.targetCount !== job.targetCount
+          || receipt.targetRootSha256 !== job.targetRootSha256
+          || receipt.targetAckCount !== job.targetAckCount
+          || receipt.targetAckRootSha256 !== job.targetAckRootSha256
+          || receipt.adapterEvidenceCount !== job.adapterEvidenceCount
+          || receipt.adapterEvidenceRootSha256 !== job.adapterEvidenceRootSha256
+          || receipt.unresolvedBlockerCount !== job.unresolvedBlockerCount) {
+          throw new Error("credential target execution terminal receipt is missing");
+        }
+        validateTenantCredentialTargetExecutionReceipt(receipt);
+        this.assertTenantCredentialTargetExecutionSealClock(
+          job,
+          acks,
+          receipt.storeDbTimestampMs,
+        );
+      } else if (receipt !== undefined) {
+        throw new Error("credential target execution receipt has no terminal job");
+      }
+      return { snapshot, targets, acks };
+    } catch (error) {
+      if (error instanceof TenantErasureIntegrityError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private tenantCredentialTargetExecutionAuthorized(
+    job: TenantCredentialTargetExecutionJobRecord,
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    nowMs: number,
+  ): job is Extract<TenantCredentialTargetExecutionJobRecord, { phase: "queued" }> {
+    return job.phase === "queued"
+      && this.tenantCredentialTargetExecutionAuthorizationIdentityMatches(job, authorization)
+      && job.attempts === authorization.claimAttempt
+      && job.claimToken === authorization.claimToken
+      && job.leaseUntilMs !== undefined
+      && job.leaseUntilMs > nowMs;
+  }
+
+  private tenantCredentialTargetExecutionAuthorizationIdentityMatches(
+    job: TenantCredentialTargetExecutionJobRecord,
+    authorization: TenantCredentialTargetExecutionAuthorization,
+  ): boolean {
+    return job.requestId === authorization.requestId
+      && job.tenantId === authorization.tenantId
+      && job.subjectGeneration === authorization.subjectGeneration
+      && job.targetExecutionGeneration === authorization.targetExecutionGeneration;
+  }
+
+  private assertTenantCredentialTargetExecutionAckClock(
+    job: TenantCredentialTargetExecutionJobRecord,
+    target: TenantCredentialTargetExecutionTarget,
+    nowMs: number,
+  ): void {
+    if (nowMs < job.sourceEvidenceDbMs
+      || nowMs < job.createdAtMs
+      || nowMs < target.capturedAtDbMs) {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private assertTenantCredentialTargetExecutionSealClock(
+    job: TenantCredentialTargetExecutionJobRecord,
+    acks: TenantCredentialTargetExecutionTargetAck[],
+    nowMs: number,
+  ): void {
+    if (nowMs < job.sourceEvidenceDbMs
+      || nowMs < job.createdAtMs
+      || acks.some((ack) => nowMs < ack.storeDbTimestampMs)) {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  private blockedTenantCredentialTargetExecutionJob(
+    current: TenantCredentialTargetExecutionJobRecord,
+    nowMs: number,
+    reason: TenantCredentialTargetExecutionBlockReasonCode,
+    attempts = current.attempts,
+  ): TenantCredentialTargetExecutionJobRecord {
+    const blockedAtDbMs = Math.max(nowMs, current.createdAtMs, current.updatedAtMs);
+    const blocked = clone<TenantCredentialTargetExecutionJobRecord>({
+      ...this.tenantCredentialTargetExecutionSource(current),
+      phase: "blocked",
+      targetCount: current.targetCount,
+      targetRootSha256: current.targetRootSha256,
+      targetAckCount: current.targetAckCount,
+      targetAckRootSha256: current.targetAckRootSha256,
+      adapterEvidenceCount: current.adapterEvidenceCount,
+      adapterEvidenceRootSha256: current.adapterEvidenceRootSha256,
+      unresolvedBlockerCount: current.externalCredentialBlockerCount
+        + current.kmsKeyBlockerCount,
+      attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: blockedAtDbMs,
+      blockedAtDbMs,
+      blockedReasonCode: reason,
+    });
+    validateTenantCredentialTargetExecutionJobRecord(blocked);
+    return blocked;
+  }
+
+  async materializeTenantCredentialTargetExecutionJobs(
+    options: MaterializeTenantCredentialTargetExecutionJobsOptions,
+  ): Promise<number> {
+    const stagedOptions = clone(options);
+    validateMaterializeTenantCredentialTargetExecutionJobsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const stagedJobs: TenantCredentialTargetExecutionJobRecord[] = [];
+    const stagedTargets: TenantCredentialTargetExecutionTarget[] = [];
+    const inventories = [...this.tenantCredentialInventoryReceipts.values()]
+      .filter((inventory) => !this.tenantCredentialTargetExecutionJobs.has(inventory.requestId))
+      .sort((left, right) => left.requestId.localeCompare(right.requestId));
+    for (const inventory of inventories) {
+      if (stagedJobs.length >= stagedOptions.limit) break;
+      if ([...this.tenantCredentialTargetExecutionJobs.values()].some(
+        (job) => job.tenantId === inventory.tenantId,
+      ) || stagedJobs.some((job) => job.tenantId === inventory.tenantId)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const snapshot = this.assertTenantCredentialInventoryReceipt(inventory);
+      const source = this.tenantCredentialTargetExecutionExpectedSource(inventory, snapshot);
+      const createdAtMs = Math.max(nowMs, source.sourceEvidenceDbMs);
+      const targets = this.tenantCredentialTargetExecutionExpectedTargets(
+        source,
+        snapshot,
+        createdAtMs,
+      );
+      const common = {
+        ...source,
+        targetCount: targets.length,
+        targetRootSha256: tenantCredentialTargetExecutionTargetRootSha256(targets),
+        targetAckCount: 0,
+        targetAckRootSha256: EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ACK_ROOT_SHA256,
+        adapterEvidenceCount: 0,
+        adapterEvidenceRootSha256:
+          EMPTY_TENANT_CREDENTIAL_TARGET_EXECUTION_ADAPTER_EVIDENCE_ROOT_SHA256,
+        unresolvedBlockerCount: source.externalCredentialBlockerCount + source.kmsKeyBlockerCount,
+        attempts: 0,
+        createdAtMs,
+        updatedAtMs: createdAtMs,
+      };
+      const job = source.externalCredentialBlockerCount > 0
+        ? clone<TenantCredentialTargetExecutionJobRecord>({
+            ...common,
+            phase: "blocked",
+            blockedAtDbMs: createdAtMs,
+            blockedReasonCode: "source_blocked",
+          })
+        : clone<TenantCredentialTargetExecutionJobRecord>({
+            ...common,
+            phase: "queued",
+            availableAtMs: createdAtMs,
+          });
+      validateTenantCredentialTargetExecutionJobRecord(job);
+      stagedJobs.push(job);
+      stagedTargets.push(...targets);
+    }
+    const jobsBefore = new Map(this.tenantCredentialTargetExecutionJobs);
+    const targetsBefore = new Map(this.tenantCredentialTargetExecutionTargets);
+    try {
+      for (const job of stagedJobs) {
+        if (this.tenantCredentialTargetExecutionJobs.has(job.requestId)) {
+          throw new TenantErasureIntegrityError();
+        }
+        this.tenantCredentialTargetExecutionJobs.set(job.requestId, job);
+      }
+      for (const target of stagedTargets) {
+        const key = this.tenantCredentialTargetExecutionTargetKey(
+          target.requestId,
+          target.targetExecutionGeneration,
+          target.targetOrdinal,
+        );
+        if (this.tenantCredentialTargetExecutionTargets.has(key)) {
+          throw new TenantErasureIntegrityError();
+        }
+        this.tenantCredentialTargetExecutionTargets.set(key, target);
+      }
+      for (const job of stagedJobs) this.assertTenantCredentialTargetExecutionEvidence(job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantCredentialTargetExecutionJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantCredentialTargetExecutionTargets, targetsBefore);
+      throw error;
+    }
+    return stagedJobs.length;
+  }
+
+  async claimTenantCredentialTargetExecutions(
+    options: ClaimTenantCredentialTargetExecutionsOptions,
+  ): Promise<TenantCredentialTargetExecutionClaim[]> {
+    const stagedOptions = clone(options);
+    validateClaimTenantCredentialTargetExecutionsOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
+      ? Number.MAX_SAFE_INTEGER
+      : nowMs + stagedOptions.leaseMs;
+    if (leaseUntilMs <= nowMs) return [];
+    const candidates = [...this.tenantCredentialTargetExecutionJobs.values()]
+      .filter((job): job is Extract<
+        TenantCredentialTargetExecutionJobRecord,
+        { phase: "queued" }
+      > => job.phase === "queued"
+        && job.availableAtMs <= nowMs
+        && (job.claimToken === undefined || job.leaseUntilMs! <= nowMs))
+      .sort((left, right) => left.availableAtMs - right.availableAtMs
+        || left.requestId.localeCompare(right.requestId))
+      .slice(0, stagedOptions.limit);
+    const nextJobs: TenantCredentialTargetExecutionJobRecord[] = [];
+    const claims: TenantCredentialTargetExecutionClaim[] = [];
+    for (const current of candidates) {
+      const attempts = current.attempts + 1;
+      if (!Number.isSafeInteger(attempts) || attempts > 0xffff_ffff) {
+        throw new TenantErasureIntegrityError();
+      }
+      try {
+        this.assertTenantCredentialTargetExecutionEvidence(current);
+      } catch {
+        nextJobs.push(this.blockedTenantCredentialTargetExecutionJob(
+          current,
+          nowMs,
+          "integrity_conflict",
+          attempts,
+        ));
+        continue;
+      }
+      const next = clone<TenantCredentialTargetExecutionJobRecord>({
+        ...current,
+        attempts,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+        updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+      });
+      delete next.lastErrorCode;
+      validateTenantCredentialTargetExecutionJobRecord(next);
+      nextJobs.push(next);
+      claims.push({
+        ...this.tenantCredentialTargetExecutionSource(next),
+        phase: "queued",
+        claimAttempt: attempts,
+        claimToken: stagedOptions.claimToken,
+        leaseUntilMs,
+        targetCount: next.targetCount,
+        targetRootSha256: next.targetRootSha256,
+      });
+    }
+    const before = new Map(this.tenantCredentialTargetExecutionJobs);
+    try {
+      for (const job of nextJobs) this.tenantCredentialTargetExecutionJobs.set(job.requestId, job);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantCredentialTargetExecutionJobs, before);
+      throw error;
+    }
+    return clone(claims);
+  }
+
+  async renewTenantCredentialTargetExecution(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    options: RenewTenantCredentialTargetExecutionOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantCredentialTargetExecutionAuthorization(stagedAuthorization);
+    validateRenewTenantCredentialTargetExecutionOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const leaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
+      ? Number.MAX_SAFE_INTEGER
+      : nowMs + stagedOptions.leaseMs;
+    const current = this.tenantCredentialTargetExecutionJobs.get(
+      stagedAuthorization.requestId,
+    );
+    if (leaseUntilMs <= nowMs || !current
+      || !this.tenantCredentialTargetExecutionAuthorized(current, stagedAuthorization, nowMs)) {
+      return false;
+    }
+    this.assertTenantCredentialTargetExecutionEvidence(current);
+    const next = clone<TenantCredentialTargetExecutionJobRecord>({
+      ...current,
+      leaseUntilMs: Math.max(current.leaseUntilMs!, leaseUntilMs),
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantCredentialTargetExecutionJobRecord(next);
+    this.tenantCredentialTargetExecutionJobs.set(current.requestId, next);
+    return true;
+  }
+
+  async retryTenantCredentialTargetExecution(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    options: RetryTenantCredentialTargetExecutionOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    validateTenantCredentialTargetExecutionAuthorization(stagedAuthorization);
+    validateRetryTenantCredentialTargetExecutionOptions(stagedOptions);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantCredentialTargetExecutionJobs.get(
+      stagedAuthorization.requestId,
+    );
+    if (!current
+      || !this.tenantCredentialTargetExecutionAuthorized(current, stagedAuthorization, nowMs)) {
+      return false;
+    }
+    this.assertTenantCredentialTargetExecutionEvidence(current);
+    const baseMs = Math.max(nowMs, current.availableAtMs, current.updatedAtMs);
+    const availableAtMs = stagedOptions.delayMs > Number.MAX_SAFE_INTEGER - baseMs
+      ? Number.MAX_SAFE_INTEGER
+      : baseMs + stagedOptions.delayMs;
+    const next = clone<TenantCredentialTargetExecutionJobRecord>({
+      ...this.tenantCredentialTargetExecutionSource(current),
+      phase: "queued",
+      targetCount: current.targetCount,
+      targetRootSha256: current.targetRootSha256,
+      targetAckCount: current.targetAckCount,
+      targetAckRootSha256: current.targetAckRootSha256,
+      adapterEvidenceCount: current.adapterEvidenceCount,
+      adapterEvidenceRootSha256: current.adapterEvidenceRootSha256,
+      unresolvedBlockerCount: current.unresolvedBlockerCount,
+      availableAtMs,
+      attempts: current.attempts,
+      lastErrorCode: stagedOptions.errorCode,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantCredentialTargetExecutionJobRecord(next);
+    this.tenantCredentialTargetExecutionJobs.set(current.requestId, next);
+    return true;
+  }
+
+  async blockTenantCredentialTargetExecution(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    reason: TenantCredentialTargetExecutionBlockReasonCode = "integrity_conflict",
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantCredentialTargetExecutionAuthorization(stagedAuthorization);
+    const nowMs = this.storeNowMs();
+    const current = this.tenantCredentialTargetExecutionJobs.get(
+      stagedAuthorization.requestId,
+    );
+    if (!current
+      || !this.tenantCredentialTargetExecutionAuthorized(current, stagedAuthorization, nowMs)) {
+      return false;
+    }
+    this.assertTenantCredentialTargetExecutionEvidence(current);
+    const next = this.blockedTenantCredentialTargetExecutionJob(current, nowMs, reason);
+    this.tenantCredentialTargetExecutionJobs.set(current.requestId, next);
+    return true;
+  }
+
+  async getTenantCredentialTargetExecutionReference(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    targetOrdinal: number,
+  ): Promise<TenantCredentialTargetExecutionEncryptedReference | null> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantCredentialTargetExecutionAuthorization(stagedAuthorization);
+    if (!Number.isSafeInteger(targetOrdinal) || targetOrdinal < 0) {
+      throw new Error("invalid tenant credential target execution ordinal");
+    }
+    const nowMs = this.storeNowMs();
+    const current = this.tenantCredentialTargetExecutionJobs.get(
+      stagedAuthorization.requestId,
+    );
+    if (!current
+      || !this.tenantCredentialTargetExecutionAuthorized(current, stagedAuthorization, nowMs)) {
+      return null;
+    }
+    const { targets } = this.assertTenantCredentialTargetExecutionEvidence(current);
+    const target = targets[targetOrdinal];
+    if (!target) return null;
+    const key = tenantCredentialTargetKey(target.credentialVersionId, target.domain);
+    const reference = this.tenantCredentialTargetReferenceCiphers.get(key);
+    if (!reference || reference.tenantId !== current.tenantId
+      || createHash("sha256").update(reference.ciphertext).digest("hex")
+        !== target.targetReferenceCipherSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    return clone({
+      tenantId: current.tenantId,
+      credentialVersionId: target.credentialVersionId,
+      domain: "external_credential" as const,
+      adapterProtocol: target.adapterProtocol,
+      targetDispositionEvidenceSha256: target.targetDispositionEvidenceSha256,
+      targetReferenceCipher: Buffer.from(reference.ciphertext),
+      targetReferenceCipherSha256: target.targetReferenceCipherSha256,
+      targetReferenceKeyId: target.targetReferenceKeyId,
+      targetReferenceSha256: target.targetReferenceSha256,
+    });
+  }
+
+  async recordTenantCredentialTargetExecutionTargetAck(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+    result: TenantCredentialTargetExecutionAdapterResult,
+  ): Promise<TenantCredentialTargetExecutionTargetAck | null> {
+    const stagedAuthorization = clone(authorization);
+    const stagedResult = clone(result);
+    validateTenantCredentialTargetExecutionAuthorization(stagedAuthorization);
+    validateTenantCredentialTargetExecutionAdapterResult(stagedResult);
+    const current = this.tenantCredentialTargetExecutionJobs.get(
+      stagedAuthorization.requestId,
+    );
+    if (!current || !this.tenantCredentialTargetExecutionAuthorizationIdentityMatches(
+      current,
+      stagedAuthorization,
+    )) return null;
+    const { targets, acks } = this.assertTenantCredentialTargetExecutionEvidence(current);
+    const target = targets.find((candidate) => (
+      candidate.operationIdSha256 === stagedResult.operationIdSha256
+    ));
+    if (!target
+      || stagedResult.adapterProtocol !== target.adapterProtocol
+      || stagedResult.domain !== target.domain
+      || stagedResult.targetReferenceSha256 !== target.targetReferenceSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    const existing = acks.find((ack) => ack.targetOrdinal === target.targetOrdinal);
+    if (existing) {
+      if (existing.completedClaimAttempt !== stagedAuthorization.claimAttempt
+        || existing.completedClaimTokenSha256
+          !== tenantCredentialTargetExecutionClaimTokenSha256(
+            stagedAuthorization.claimToken,
+          )) {
+        return null;
+      }
+      if (existing.operationIdSha256 !== stagedResult.operationIdSha256
+        || existing.adapterEvidenceSha256 !== stagedResult.evidenceSha256
+        || existing.outcome !== stagedResult.outcome) {
+        throw new TenantErasureIntegrityError();
+      }
+      return clone(existing);
+    }
+    const nowMs = this.storeNowMs();
+    if (!this.tenantCredentialTargetExecutionAuthorized(
+      current,
+      stagedAuthorization,
+      nowMs,
+    )) return null;
+    this.assertTenantCredentialTargetExecutionAckClock(current, target, nowMs);
+    const body = {
+      ...this.tenantCredentialTargetExecutionIdentity(current),
+      scope: TENANT_CREDENTIAL_TARGET_EXECUTION_TARGET_ACK_SCOPE,
+      targetOrdinal: target.targetOrdinal,
+      credentialVersionId: target.credentialVersionId,
+      domain: "external_credential" as const,
+      targetReceiptSha256: target.receiptSha256,
+      operationIdSha256: target.operationIdSha256,
+      adapterProtocol: target.adapterProtocol,
+      targetReferenceSha256: target.targetReferenceSha256,
+      outcome: stagedResult.outcome,
+      adapterEvidenceSha256: stagedResult.evidenceSha256,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256: tenantCredentialTargetExecutionClaimTokenSha256(
+        stagedAuthorization.claimToken,
+      ),
+      storeDbTimestampMs: nowMs,
+    };
+    const ack = clone<TenantCredentialTargetExecutionTargetAck>({
+      ...body,
+      receiptSha256: tenantCredentialTargetExecutionTargetAckSha256(body),
+    });
+    const nextAcks = [...acks, ack]
+      .sort((left, right) => left.targetOrdinal - right.targetOrdinal);
+    const next = clone<TenantCredentialTargetExecutionJobRecord>({
+      ...current,
+      targetAckCount: nextAcks.length,
+      targetAckRootSha256: tenantCredentialTargetExecutionTargetAckRootSha256(nextAcks),
+      adapterEvidenceCount: nextAcks.length,
+      adapterEvidenceRootSha256:
+        tenantCredentialTargetExecutionAdapterEvidenceRootSha256(nextAcks),
+      updatedAtMs: Math.max(current.updatedAtMs, nowMs),
+    });
+    validateTenantCredentialTargetExecutionJobRecord(next);
+    const key = this.tenantCredentialTargetExecutionTargetKey(
+      ack.requestId,
+      ack.targetExecutionGeneration,
+      ack.targetOrdinal,
+    );
+    const jobsBefore = new Map(this.tenantCredentialTargetExecutionJobs);
+    const acksBefore = new Map(this.tenantCredentialTargetExecutionTargetAcks);
+    try {
+      const publishNowMs = this.storeNowMs();
+      const publishCurrent = this.tenantCredentialTargetExecutionJobs.get(current.requestId);
+      if (!publishCurrent || !this.tenantCredentialTargetExecutionAuthorized(
+        publishCurrent,
+        stagedAuthorization,
+        publishNowMs,
+      )) return null;
+      this.assertTenantCredentialTargetExecutionAckClock(
+        publishCurrent,
+        target,
+        publishNowMs,
+      );
+      if (this.tenantCredentialTargetExecutionTargetAcks.has(key)) {
+        throw new TenantErasureIntegrityError();
+      }
+      this.tenantCredentialTargetExecutionTargetAcks.set(key, ack);
+      this.tenantCredentialTargetExecutionJobs.set(current.requestId, next);
+      this.assertTenantCredentialTargetExecutionEvidence(next);
+      return clone(ack);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantCredentialTargetExecutionJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantCredentialTargetExecutionTargetAcks, acksBefore);
+      throw error;
+    }
+  }
+
+  async sealTenantCredentialTargetExecution(
+    authorization: TenantCredentialTargetExecutionAuthorization,
+  ): Promise<TenantCredentialTargetExecutionReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    validateTenantCredentialTargetExecutionAuthorization(stagedAuthorization);
+    const current = this.tenantCredentialTargetExecutionJobs.get(
+      stagedAuthorization.requestId,
+    );
+    if (!current || !this.tenantCredentialTargetExecutionAuthorizationIdentityMatches(
+      current,
+      stagedAuthorization,
+    )) return null;
+    if (current.phase === "external_credential_sealed") {
+      this.assertTenantCredentialTargetExecutionEvidence(current);
+      const receipt = this.tenantCredentialTargetExecutionReceipts.get(current.requestId)!;
+      return receipt.completedClaimAttempt === stagedAuthorization.claimAttempt
+        && receipt.completedClaimTokenSha256
+          === tenantCredentialTargetExecutionClaimTokenSha256(stagedAuthorization.claimToken)
+        ? clone(receipt)
+        : null;
+    }
+    const initialNowMs = this.storeNowMs();
+    if (!this.tenantCredentialTargetExecutionAuthorized(
+      current,
+      stagedAuthorization,
+      initialNowMs,
+    )) return null;
+    const { targets, acks } = this.assertTenantCredentialTargetExecutionEvidence(current);
+    if (current.externalCredentialBlockerCount !== 0
+      || acks.length !== targets.length) return null;
+    const sealedAtDbMs = this.storeNowMs();
+    if (!this.tenantCredentialTargetExecutionAuthorized(
+      current,
+      stagedAuthorization,
+      sealedAtDbMs,
+    )) return null;
+    this.assertTenantCredentialTargetExecutionSealClock(current, acks, sealedAtDbMs);
+    const completedClaimTokenSha256 = tenantCredentialTargetExecutionClaimTokenSha256(
+      stagedAuthorization.claimToken,
+    );
+    const receiptBody = {
+      ...this.tenantCredentialTargetExecutionSource(current),
+      scope: TENANT_CREDENTIAL_TARGET_EXECUTION_RECEIPT_SCOPE,
+      targetCount: targets.length,
+      targetRootSha256: current.targetRootSha256,
+      targetAckCount: acks.length,
+      targetAckRootSha256: tenantCredentialTargetExecutionTargetAckRootSha256(acks),
+      adapterEvidenceCount: acks.length,
+      adapterEvidenceRootSha256:
+        tenantCredentialTargetExecutionAdapterEvidenceRootSha256(acks),
+      externalCredentialExecutionComplete: true as const,
+      kmsKeyExecutionComplete: false as const,
+      allDomainsComplete: false as const,
+      contentPurgeExecuted: false as const,
+      unresolvedBlockerCount: current.kmsKeyBlockerCount,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256,
+      storeDbTimestampMs: sealedAtDbMs,
+    };
+    const receipt = clone<TenantCredentialTargetExecutionReceipt>({
+      ...receiptBody,
+      receiptSha256: tenantCredentialTargetExecutionReceiptSha256(receiptBody),
+    });
+    const terminal = clone<TenantCredentialTargetExecutionJobRecord>({
+      ...this.tenantCredentialTargetExecutionSource(current),
+      phase: "external_credential_sealed",
+      targetCount: targets.length,
+      targetRootSha256: current.targetRootSha256,
+      targetAckCount: acks.length,
+      targetAckRootSha256: receipt.targetAckRootSha256,
+      adapterEvidenceCount: acks.length,
+      adapterEvidenceRootSha256: receipt.adapterEvidenceRootSha256,
+      unresolvedBlockerCount: receipt.unresolvedBlockerCount,
+      attempts: current.attempts,
+      createdAtMs: current.createdAtMs,
+      updatedAtMs: Math.max(current.updatedAtMs, sealedAtDbMs),
+      terminalReceiptSha256: receipt.receiptSha256,
+      sealedAtDbMs,
+      completedClaimAttempt: stagedAuthorization.claimAttempt,
+      completedClaimTokenSha256,
+    });
+    validateTenantCredentialTargetExecutionReceipt(receipt);
+    validateTenantCredentialTargetExecutionJobRecord(terminal);
+    const jobsBefore = new Map(this.tenantCredentialTargetExecutionJobs);
+    const receiptsBefore = new Map(this.tenantCredentialTargetExecutionReceipts);
+    const cutoversBefore = new Map(this.tenantCredentialTargetExecutionCutovers);
+    try {
+      const publishNowMs = this.storeNowMs();
+      const publishCurrent = this.tenantCredentialTargetExecutionJobs.get(current.requestId);
+      if (!publishCurrent || !this.tenantCredentialTargetExecutionAuthorized(
+        publishCurrent,
+        stagedAuthorization,
+        publishNowMs,
+      )) return null;
+      const cutover = this.assertTenantCredentialTargetExecutionCutover();
+      this.tenantCredentialTargetExecutionReceipts.set(current.requestId, receipt);
+      this.tenantCredentialTargetExecutionJobs.set(current.requestId, terminal);
+      if (cutover.controlGeneration === 0) {
+        const cutoverBody = {
+          singletonId: TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+          controlGeneration: 1 as const,
+          activatedAtDbMs: sealedAtDbMs,
+          firstRequestId: current.requestId,
+          firstReceiptSha256: receipt.receiptSha256,
+          executionProtocol: TENANT_CREDENTIAL_TARGET_EXECUTION_PROTOCOL,
+          externalCredentialExecutionEnabled: true as const,
+          kmsKeyExecutionEnabled: false as const,
+        };
+        this.tenantCredentialTargetExecutionCutovers.set(
+          TENANT_CREDENTIAL_TARGET_EXECUTION_CUTOVER_SINGLETON_ID,
+          {
+            ...cutoverBody,
+            evidenceSha256: tenantCredentialTargetExecutionCutoverEvidenceSha256(cutoverBody),
+          },
+        );
+      }
+      this.assertTenantCredentialTargetExecutionCutover();
+      this.assertTenantCredentialTargetExecutionEvidence(terminal);
+      return clone(receipt);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantCredentialTargetExecutionJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantCredentialTargetExecutionReceipts, receiptsBefore);
+      restoreMapSnapshot(this.tenantCredentialTargetExecutionCutovers, cutoversBefore);
+      throw error;
+    }
+  }
+
+  async getTenantCredentialTargetExecutionJob(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialTargetExecutionJobRecord | null> {
+    const job = this.tenantCredentialTargetExecutionJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    this.assertTenantCredentialTargetExecutionEvidence(job);
+    return clone(job);
+  }
+
+  async getTenantCredentialTargetExecutionTargets(
+    tenantId: string,
+    requestId: string,
+    targetExecutionGeneration: number,
+  ): Promise<TenantCredentialTargetExecutionTarget[]> {
+    const job = this.tenantCredentialTargetExecutionJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId
+      || job.targetExecutionGeneration !== targetExecutionGeneration) return [];
+    return this.assertTenantCredentialTargetExecutionEvidence(job).targets.map(clone);
+  }
+
+  async getTenantCredentialTargetExecutionTargetAcks(
+    tenantId: string,
+    requestId: string,
+    targetExecutionGeneration: number,
+  ): Promise<TenantCredentialTargetExecutionTargetAck[]> {
+    const job = this.tenantCredentialTargetExecutionJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId
+      || job.targetExecutionGeneration !== targetExecutionGeneration) return [];
+    return this.assertTenantCredentialTargetExecutionEvidence(job).acks.map(clone);
+  }
+
+  async getTenantCredentialTargetExecutionReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialTargetExecutionReceipt | null> {
+    const job = this.tenantCredentialTargetExecutionJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "external_credential_sealed") {
+      return null;
+    }
+    this.assertTenantCredentialTargetExecutionEvidence(job);
+    return clone(this.tenantCredentialTargetExecutionReceipts.get(requestId)!);
+  }
+
+  async getTenantCredentialTargetExecutionCutover(
+  ): Promise<TenantCredentialTargetExecutionCutoverRecord> {
+    return clone(this.assertTenantCredentialTargetExecutionCutover());
+  }
+
+  async hasTenantCredentialTargetExecutionJobs(): Promise<boolean> {
+    for (const job of this.tenantCredentialTargetExecutionJobs.values()) {
+      this.assertTenantCredentialTargetExecutionEvidence(job);
+    }
+    this.assertTenantCredentialTargetExecutionCutover();
+    return this.tenantCredentialTargetExecutionJobs.size > 0;
+  }
+
   async upsertProviderConfig(
     cfg: ProviderConfig,
     secret?: { ciphertext: Buffer; keyId: string },
     expectedSourceRevision?: number | null,
+    targetReference?: ProviderCredentialTargetReferenceWrite,
   ): Promise<ProviderConfig> {
     const stagedConfig = clone(cfg);
     const stagedSecret = secret === undefined ? undefined : cloneCredentialSecret(secret);
+    const stagedTargetReference = targetReference === undefined ? undefined : {
+      ...targetReference,
+      targetReferenceCipher: Buffer.from(targetReference.targetReferenceCipher),
+    };
+    if (stagedTargetReference !== undefined) {
+      validateProviderCredentialTargetReferenceWrite(stagedTargetReference);
+    }
     this.assertTenantWritable(stagedConfig.tenantId);
     const observedNowMs = this.storeNowMs();
     const tenantKnownBefore = this.tenantKnownToCredentialStore(stagedConfig.tenantId);
@@ -16933,6 +18028,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new TenantErasureIntegrityError();
     }
     const trackingActive = this.tenantCredentialTrackingActive();
+    if (stagedTargetReference !== undefined && !trackingActive) {
+      throw new TenantErasureIntegrityError();
+    }
     const nowMs = trackingActive
       ? this.tenantCredentialMutationAtMs(
           stagedConfig.tenantId,
@@ -16997,6 +18095,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           origin: "managed_v1",
           ...material,
           createdAtDbMs: nowMs,
+          ...(stagedTargetReference === undefined
+            ? {}
+            : { targetReference: stagedTargetReference }),
         });
         currentCredentialVersionId = created.version.credentialVersionId;
       }
@@ -17036,6 +18137,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const slotsBefore = new Map(this.tenantCredentialProviderSlots);
     const versionsBefore = new Map(this.tenantCredentialVersions);
     const targetsBefore = new Map(this.tenantCredentialTargetDispositions);
+    const targetReferencesBefore = new Map(this.tenantCredentialTargetReferenceCiphers);
     try {
       this.tenants.set(stagedConfig.tenantId, stagedTenant);
       if (stagedSubject && !this.tenantCredentialTrackingSubjects.has(stagedConfig.tenantId)) {
@@ -17052,6 +18154,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
             target,
           );
         }
+        if (created.targetReference !== undefined) {
+          this.tenantCredentialTargetReferenceCiphers.set(
+            created.targetReference.key,
+            {
+              tenantId: created.targetReference.value.tenantId,
+              ciphertext: Buffer.from(created.targetReference.value.ciphertext),
+            },
+          );
+        }
       }
       this.tenantCredentialProviderSlots.set(slotIdSha256, stagedSlot);
       this.providers.set(key, stagedProvider);
@@ -17062,6 +18173,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       restoreMapSnapshot(this.tenantCredentialProviderSlots, slotsBefore);
       restoreMapSnapshot(this.tenantCredentialVersions, versionsBefore);
       restoreMapSnapshot(this.tenantCredentialTargetDispositions, targetsBefore);
+      restoreMapSnapshot(
+        this.tenantCredentialTargetReferenceCiphers,
+        targetReferencesBefore,
+      );
       throw error;
     }
     return clone(stagedConfig);

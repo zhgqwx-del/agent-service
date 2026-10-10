@@ -309,6 +309,69 @@ describe("runner configuration", () => {
     })).toThrow();
   });
 
+  it("permits only an explicit local memory fake credential-target executor", () => {
+    const base = loadConfig({ SECRETS_MASTER_KEY: SECRET });
+    expect(base.CREDENTIAL_TARGET_EXECUTION_ADAPTER).toBeUndefined();
+    expect(base.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED).toBe(false);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      CREDENTIAL_TARGET_EXECUTION_ADAPTER: "fake",
+    })).toThrow(/CREDENTIAL_LIFECYCLE_TRACKING_ENABLED=1/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      CREDENTIAL_TARGET_EXECUTION_ADAPTER: "fake",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+    })).toThrow(/TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED=1/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED: "1",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+      ERASURE_ROUTER_URL: "http://router.internal",
+    })).toThrow(/CREDENTIAL_TARGET_EXECUTION_ADAPTER=fake/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      STORE: "mysql",
+      CREDENTIAL_TARGET_EXECUTION_ADAPTER: "fake",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+      TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "http://router.internal",
+    })).toThrow(/STORE=memory/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      NODE_ENV: "production",
+      STORE: "mysql",
+      REDIS_URL: "redis://redis.internal:6379",
+      RUNNER_ADDR: "runner.internal:8787",
+      INTERNAL_ROUTER_TOKEN: "production-internal-router-token-0001",
+      CREDENTIAL_TARGET_EXECUTION_ADAPTER: "fake",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+      TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED: "1",
+      ERASURE_ROUTER_URL: "http://router.internal",
+    })).toThrow(/forbidden in production/);
+    const enabled = loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      STORE: "memory",
+      CREDENTIAL_TARGET_EXECUTION_ADAPTER: "fake",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: "1",
+      TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED: "1",
+      TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_BATCH_SIZE: "7",
+      TENANT_CREDENTIAL_TARGET_EXECUTION_MATERIALIZE_BATCH_SIZE: "11",
+      ERASURE_ROUTER_URL: "http://router.internal",
+    });
+    expect(enabled).toMatchObject({
+      CREDENTIAL_TARGET_EXECUTION_ADAPTER: "fake",
+      CREDENTIAL_LIFECYCLE_TRACKING_ENABLED: true,
+      TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED: true,
+      TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_BATCH_SIZE: 7,
+      TENANT_CREDENTIAL_TARGET_EXECUTION_MATERIALIZE_BATCH_SIZE: 11,
+    });
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_BASE_MS: "2",
+      TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS: "1",
+    })).toThrow(/TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS/);
+  });
+
   it("separates the T3b local endpoint from its embedded claimant and validates their bounds", () => {
     expect(() => loadConfig({
       SECRETS_MASTER_KEY: SECRET,
