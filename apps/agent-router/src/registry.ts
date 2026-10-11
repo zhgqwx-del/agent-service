@@ -19,6 +19,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
   TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TenantRuntimeDrainReady,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
@@ -590,6 +591,60 @@ export class RunnerRegistry {
       && this.list().every((target) => (
         target.capabilities?.features.tenantRestoreJournalWorker === true
       ));
+  }
+
+  /** 0031 code awareness requires every configured runner; activation additionally needs consensus. */
+  allConfiguredSupportTenantBackupCatalog(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.tenantBackupCatalog.includes(
+        TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
+      ) === true
+    ));
+  }
+
+  tenantBackupCatalogConsensus(): {
+    active: boolean;
+    namespaceSha256: string | null;
+    targetSha256: string | null;
+    runtimeBindingSha256: string | null;
+  } {
+    if (!this.allConfiguredSupportTenantBackupCatalog()) {
+      return {
+        active: false,
+        namespaceSha256: null,
+        targetSha256: null,
+        runtimeBindingSha256: null,
+      };
+    }
+    const features = this.list().map((target) => target.capabilities!.features);
+    if (!features.every((value) => value.tenantBackupCatalogActive === true)) {
+      return {
+        active: false,
+        namespaceSha256: null,
+        targetSha256: null,
+        runtimeBindingSha256: null,
+      };
+    }
+    const first = features[0]!;
+    const namespaceSha256 = first.tenantBackupCatalogNamespaceSha256;
+    const targetSha256 = first.tenantBackupCatalogTargetSha256;
+    const runtimeBindingSha256 = first.tenantBackupCatalogRuntimeBindingSha256;
+    if (namespaceSha256 === null || targetSha256 === null || runtimeBindingSha256 === null
+      || !features.every((value) => (
+        value.tenantBackupCatalogNamespaceSha256 === namespaceSha256
+        && value.tenantBackupCatalogTargetSha256 === targetSha256
+        && value.tenantBackupCatalogRuntimeBindingSha256 === runtimeBindingSha256
+      ))) {
+      return {
+        active: false,
+        namespaceSha256: null,
+        targetSha256: null,
+        runtimeBindingSha256: null,
+      };
+    }
+    return { active: true, namespaceSha256, targetSha256, runtimeBindingSha256 };
   }
 
   /** Every configured runner must freshly prove the exact local T3e execution/ACK contract. */

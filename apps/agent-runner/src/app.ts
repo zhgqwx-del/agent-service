@@ -62,6 +62,7 @@ import {
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
   TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -195,6 +196,12 @@ export interface AppDeps {
   tenantRestoreJournalNamespaceSha256?: string;
   tenantRestoreJournalTargetRootSha256?: string;
   tenantRestoreRuntimeEpochSha256?: string;
+  /** 0031 code awareness is independent from durable activation and one-shot S3 credentials. */
+  tenantBackupCatalogSupported?: boolean;
+  tenantBackupCatalogActive?: boolean;
+  tenantBackupCatalogNamespaceSha256?: string;
+  tenantBackupCatalogTargetSha256?: string;
+  tenantBackupCatalogRuntimeBindingSha256?: string;
   /** Local T3e worker activation; code awareness remains separately advertised during rollout. */
   tenantPurgeExecutionWorkerEnabled?: boolean;
   /** Local T3f database-content worker activation; its router barrier remains independent. */
@@ -272,6 +279,11 @@ export function createApp(deps: AppDeps) {
     && /^[0-9a-f]{64}$/.test(deps.tenantRestoreJournalNamespaceSha256 ?? "")
     && /^[0-9a-f]{64}$/.test(deps.tenantRestoreJournalTargetRootSha256 ?? "")
     && /^[0-9a-f]{64}$/.test(deps.tenantRestoreRuntimeEpochSha256 ?? "");
+  const tenantBackupCatalogActive = deps.tenantBackupCatalogSupported === true
+    && deps.tenantBackupCatalogActive === true
+    && /^[0-9a-f]{64}$/.test(deps.tenantBackupCatalogNamespaceSha256 ?? "")
+    && /^[0-9a-f]{64}$/.test(deps.tenantBackupCatalogTargetSha256 ?? "")
+    && /^[0-9a-f]{64}$/.test(deps.tenantBackupCatalogRuntimeBindingSha256 ?? "");
   const maxBlobBytes = deps.maxBlobBytes ?? deps.maxBodyBytes;
   if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > deps.maxBodyBytes) {
     throw new Error("maxBlobBytes must be a positive safe integer no larger than maxBodyBytes");
@@ -387,6 +399,19 @@ export function createApp(deps: AppDeps) {
           : null,
         tenantRestoreRuntimeEpochSha256: tenantRestoreJournalSupported
           ? deps.tenantRestoreRuntimeEpochSha256!
+          : null,
+        tenantBackupCatalog: deps.tenantBackupCatalogSupported === true
+          ? [TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1]
+          : [],
+        tenantBackupCatalogActive,
+        tenantBackupCatalogNamespaceSha256: tenantBackupCatalogActive
+          ? deps.tenantBackupCatalogNamespaceSha256!
+          : null,
+        tenantBackupCatalogTargetSha256: tenantBackupCatalogActive
+          ? deps.tenantBackupCatalogTargetSha256!
+          : null,
+        tenantBackupCatalogRuntimeBindingSha256: tenantBackupCatalogActive
+          ? deps.tenantBackupCatalogRuntimeBindingSha256!
           : null,
         // Code awareness and activation are deliberately separate rolling-upgrade signals.
         tenantPurgeExecution: [

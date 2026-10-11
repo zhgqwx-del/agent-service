@@ -13,6 +13,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
   TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -696,6 +697,93 @@ describe("RunnerRegistry owner address mapping", () => {
     expect(fetchMock.mock.calls.every((call) => (
       (call[1] as RequestInit | undefined)?.redirect === "manual"
     ))).toBe(true);
+  });
+
+  it("requires fresh all-runner backup-catalog awareness and exact active lineage consensus", async () => {
+    const namespaceSha256 = "1".repeat(64);
+    const targetSha256 = "2".repeat(64);
+    const runtimeBindingSha256 = "3".repeat(64);
+    let legacyState: "down" | "legacy" | "inactive" | "mismatch" | "active" = "down";
+    const capabilities = (
+      aware: boolean,
+      active: boolean,
+      namespace = namespaceSha256,
+    ) => ({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        tenantBackupCatalog: aware ? [TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1] : [],
+        tenantBackupCatalogActive: aware && active,
+        tenantBackupCatalogNamespaceSha256: aware && active ? namespace : null,
+        tenantBackupCatalogTargetSha256: aware && active ? targetSha256 : null,
+        tenantBackupCatalogRuntimeBindingSha256: aware && active
+          ? runtimeBindingSha256
+          : null,
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("http://current/readyz")) return new Response("ready");
+      if (url.startsWith("http://current/v1/capabilities")) {
+        return Response.json(capabilities(true, true));
+      }
+      if (url.startsWith("http://legacy/readyz")) {
+        return legacyState === "down"
+          ? new Response("down", { status: 503 })
+          : new Response("ready");
+      }
+      if (url.startsWith("http://legacy/v1/capabilities")) {
+        if (legacyState === "legacy") return Response.json(capabilities(false, false));
+        if (legacyState === "inactive") return Response.json(capabilities(true, false));
+        if (legacyState === "mismatch") {
+          return Response.json(capabilities(true, true, "4".repeat(64)));
+        }
+        return Response.json(capabilities(true, true));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    const registry = new RunnerRegistry({
+      runners: ["http://current", "http://legacy"],
+      healthIntervalMs: 60_000,
+    });
+    registry.start();
+    await registry.waitForFirstProbe();
+    expect(registry.allConfiguredSupportTenantBackupCatalog()).toBe(false);
+    expect(registry.tenantBackupCatalogConsensus().active).toBe(false);
+
+    legacyState = "legacy";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantBackupCatalog()).toBe(false);
+    legacyState = "inactive";
+    await registry.refresh();
+    expect(registry.allConfiguredSupportTenantBackupCatalog()).toBe(true);
+    expect(registry.tenantBackupCatalogConsensus()).toEqual({
+      active: false,
+      namespaceSha256: null,
+      targetSha256: null,
+      runtimeBindingSha256: null,
+    });
+    legacyState = "mismatch";
+    await registry.refresh();
+    expect(registry.tenantBackupCatalogConsensus().active).toBe(false);
+    legacyState = "active";
+    await registry.refresh();
+    expect(registry.tenantBackupCatalogConsensus()).toEqual({
+      active: true,
+      namespaceSha256,
+      targetSha256,
+      runtimeBindingSha256,
+    });
+    await registry.close();
   });
 
   it("requires every configured runner to be freshly healthy, T3e-aware, and worker-active", async () => {

@@ -206,6 +206,14 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
       `${runnerOnlyRestoreJournalKey} is runner-only restore-journal authority and must not enter the router process`,
     );
   }
+  const oneShotBackupCatalogKey = Object.keys(env).find((key) => (
+    key.startsWith("BACKUP_CATALOG_") || key.startsWith("TENANT_BACKUP_CATALOG_")
+  ) && env[key] !== undefined);
+  if (oneShotBackupCatalogKey) {
+    throw new Error(
+      `${oneShotBackupCatalogKey} is one-shot backup-catalog authority and must not enter the router process`,
+    );
+  }
   const runnerOnlyKey = Object.keys(env).find((key) => (
     (key.startsWith("BLOB_S3_") && !ROUTER_ALLOWED_BLOB_S3_ENV.has(key))
     || key.startsWith("MINIO_ROOT_")

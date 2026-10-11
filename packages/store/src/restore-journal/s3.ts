@@ -643,10 +643,26 @@ export class S3TenantRestoreJournalAdapter implements TenantRestoreJournalAdapte
     } while (continuationToken);
 
     sequences.sort((left, right) => left - right);
-    for (const [index, sequence] of sequences.entries()) {
-      if (sequence !== index + 1) throw new TenantRestoreJournalCorruptError("chain");
+    const contiguous: number[] = [];
+    let expected = 1;
+    for (const sequence of sequences) {
+      // LIST is strongly consistent for writes completed before the request, but it is not an
+      // atomic snapshot of writes that complete while a page is being produced. A later immutable
+      // key can therefore be returned while an earlier, concurrently-created key is omitted. Use
+      // an exact GET to distinguish that transient listing hole from a durable corrupt gap.
+      while (expected < sequence) {
+        if (!(await this.readStoredHead(expected))) {
+          throw new TenantRestoreJournalCorruptError("chain");
+        }
+        contiguous.push(expected);
+        expected += 1;
+      }
+      // A live paginated listing may repeat a key when concurrent inserts move page boundaries.
+      if (sequence < expected) continue;
+      contiguous.push(sequence);
+      expected += 1;
     }
-    return sequences;
+    return contiguous;
   }
 
   private async readEntriesForSequences(

@@ -6,10 +6,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# The migration command is an operator-authority surface. Preserve every caller-provided setting,
-# including an explicitly empty value, before loading local defaults. The AWS SDK may use any
-# exported AWS_* setting through its default credential/endpoint provider chain, so preserve those
-# caller values as well instead of letting .env silently retarget the one-shot mover.
+# The one-shot migration/restore/backup commands are operator-authority surfaces. Preserve every
+# caller-provided setting, including an explicitly empty value, before loading local defaults. The
+# AWS SDK may use any exported AWS_* setting through its default credential/endpoint provider
+# chain, so preserve those caller values as well instead of letting .env silently retarget them.
 caller_mover_env_names=(
   NODE_ENV
   MYSQL_URL
@@ -21,7 +21,15 @@ caller_mover_env_names=(
   BLOB_MIGRATION_COMMIT
   RESTORE_RUN_ID
   RESTORE_FLEET_STOPPED_ACK
+  BACKUP_ID
+  BACKUP_RUNTIME_EPOCH_ID
+  SOURCE_SNAPSHOT_SHA256
   SOURCE_BACKUP_SHA256
+  BACKUP_ARTIFACT_MANIFEST_SHA256
+  BACKUP_PROVIDER_EVIDENCE_SHA256
+  BACKUP_EVICTION_ID
+  EXTERNAL_TOMBSTONE_SHA256
+  BACKUP_PHYSICAL_ABSENCE_ACK
   RESTORE_REPLAY_PAGE_SIZE
   BLOB_STORE
   BLOB_DIR
@@ -39,7 +47,7 @@ caller_mover_env_names=(
 )
 while IFS= read -r caller_env_name; do
   case "$caller_env_name" in
-    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*)
+    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*)
       caller_mover_env_names+=("$caller_env_name")
       ;;
   esac
@@ -185,6 +193,21 @@ unset caller_env_index caller_env_name caller_mover_env_names caller_mover_env_w
 [ -n "$caller_blob_attachments_enabled" ] && BLOB_ATTACHMENTS_ENABLED="$caller_blob_attachments_enabled"
 [ -n "$caller_blob_max_bytes" ] && BLOB_MAX_BYTES="$caller_blob_max_bytes"
 
+# Catalog configuration is one-shot operator authority. It may be loaded from `.env` for the
+# foreground command below, but no BACKUP_CATALOG_* or TENANT_BACKUP_CATALOG_* value may enter a
+# long-running router or runner. Build an env(1) unset list from the post-.env exported namespace.
+# Keep one harmless unset pair so macOS Bash 3.2 + `set -u` can expand the array even when no
+# catalog variable is configured. (That shell treats an otherwise empty array as unbound.)
+backup_catalog_process_scrub=(-u AGENT_SERVICE_UNUSED_BACKUP_CATALOG_ENV)
+while IFS= read -r backup_catalog_env_name; do
+  case "$backup_catalog_env_name" in
+    BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*)
+      backup_catalog_process_scrub+=(-u "$backup_catalog_env_name")
+      ;;
+  esac
+done < <(compgen -e)
+unset backup_catalog_env_name
+
 STATE_DIR="${AGENT_SERVICE_STATE_DIR:-$ROOT/.local-run}"
 RUNNER_PID_FILE="$STATE_DIR/runner.pid"
 ROUTER_PID_FILE="$STATE_DIR/router.pid"
@@ -312,7 +335,8 @@ start_apps() {
     )
   fi
 
-  runner_restore_journal_env=()
+  # Same Bash 3.2 empty-array guard as the catalog scrub list above.
+  runner_restore_journal_env=(-u AGENT_SERVICE_UNUSED_RESTORE_JOURNAL_ENV)
   if [ "$restore_journal_uses_local_minio" = 1 ]; then
     local restore_journal_bucket="${RESTORE_JOURNAL_S3_BUCKET:-agent-service-local-restore-journal}"
     if [ "$blob_store" = "s3" ] \
@@ -364,10 +388,15 @@ start_apps() {
       -u RESTORE_JOURNAL_RUNTIME_EPOCH_SHA256 \
       -u RESTORE_JOURNAL_PRIMARY_ACTIVATION_ACK \
       -u RESTORE_RUN_ID -u RESTORE_FLEET_STOPPED_ACK \
-      -u SOURCE_BACKUP_SHA256 -u RESTORE_REPLAY_PAGE_SIZE \
+      -u BACKUP_ID -u BACKUP_RUNTIME_EPOCH_ID -u SOURCE_SNAPSHOT_SHA256 \
+      -u SOURCE_BACKUP_SHA256 -u BACKUP_ARTIFACT_MANIFEST_SHA256 \
+      -u BACKUP_PROVIDER_EVIDENCE_SHA256 -u BACKUP_EVICTION_ID \
+      -u EXTERNAL_TOMBSTONE_SHA256 -u BACKUP_PHYSICAL_ABSENCE_ACK \
+      -u RESTORE_REPLAY_PAGE_SIZE \
+      "${backup_catalog_process_scrub[@]}" \
       "${cloud_credential_scrub[@]}" \
-      "${runner_blob_env[@]}" \
       "${runner_restore_journal_env[@]}" \
+      "${runner_blob_env[@]}" \
       STORE=mysql \
       RUNNER_PORT="$RUNNER_PORT" \
       RUNNER_ID="${RUNNER_ID:-runner-local-1}" \
@@ -432,7 +461,11 @@ start_apps() {
       -u RESTORE_JOURNAL_S3_SESSION_TOKEN \
       -u RESTORE_JOURNAL_PRIMARY_ACTIVATION_ACK \
       -u RESTORE_RUN_ID -u RESTORE_FLEET_STOPPED_ACK \
-      -u SOURCE_BACKUP_SHA256 -u RESTORE_REPLAY_PAGE_SIZE \
+      -u BACKUP_ID -u BACKUP_RUNTIME_EPOCH_ID -u SOURCE_SNAPSHOT_SHA256 \
+      -u SOURCE_BACKUP_SHA256 -u BACKUP_ARTIFACT_MANIFEST_SHA256 \
+      -u BACKUP_PROVIDER_EVIDENCE_SHA256 -u BACKUP_EVICTION_ID \
+      -u EXTERNAL_TOMBSTONE_SHA256 -u BACKUP_PHYSICAL_ABSENCE_ACK \
+      -u RESTORE_REPLAY_PAGE_SIZE \
       -u TENANT_RESTORE_JOURNAL_WORKER_ENABLED \
       -u TENANT_RESTORE_JOURNAL_WORKER_POLL_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS \
@@ -440,6 +473,7 @@ start_apps() {
       -u TENANT_RESTORE_JOURNAL_MATERIALIZE_BATCH_SIZE \
       -u TENANT_RESTORE_JOURNAL_RETRY_BASE_MS \
       -u TENANT_RESTORE_JOURNAL_RETRY_MAX_MS \
+      "${backup_catalog_process_scrub[@]}" \
       -u BLOB_S3_ENDPOINT -u BLOB_S3_REGION -u BLOB_S3_FORCE_PATH_STYLE \
       -u BLOB_S3_PRIVATE_BUCKET_ACK -u BLOB_S3_REQUEST_TIMEOUT_MS \
       -u BLOB_S3_ACCESS_KEY_ID -u BLOB_S3_SECRET_ACCESS_KEY -u BLOB_S3_SESSION_TOKEN \
@@ -556,6 +590,8 @@ verify() {
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-restore-journal-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-backup-catalog-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:outbox-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:usage-lifecycle-mysql
@@ -638,6 +674,23 @@ verify_s3() {
     node packages/store/scripts/bootstrap-s3.mjs
   env "${s3_test_env[@]}" S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
     pnpm run test:restore-journal-s3
+  local backup_catalog_bucket="${BACKUP_CATALOG_S3_BUCKET:-agent-service-local-backup-catalog}"
+  [ "$backup_catalog_bucket" != "${MINIO_BUCKET:-agent-service-local}" ] \
+    || die "BACKUP_CATALOG_S3_BUCKET must differ from the Blob bucket"
+  [ "$backup_catalog_bucket" != "$restore_journal_bucket" ] \
+    || die "BACKUP_CATALOG_S3_BUCKET must differ from the restore-journal bucket"
+  env "${s3_test_env[@]}" S3_TEST_BUCKET="$backup_catalog_bucket" \
+    node packages/store/scripts/bootstrap-s3.mjs
+  env "${s3_test_env[@]}" S3_BACKUP_CATALOG_TEST_BUCKET="$backup_catalog_bucket" \
+    pnpm run test:backup-catalog-s3
+  env "${s3_test_env[@]}" S3_BACKUP_CATALOG_TEST_BUCKET="$backup_catalog_bucket" \
+    MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:backup-catalog-reconcile-mysql-s3
+  env "${s3_test_env[@]}" \
+    S3_BACKUP_CATALOG_TEST_BUCKET="$backup_catalog_bucket" \
+    S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
+    MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:backup-catalog-restore-roundtrip-mysql-s3
   env "${s3_test_env[@]}" \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-storage-migration-mysql-s3
@@ -667,8 +720,15 @@ restore_ledger_reconcile() {
   node --import tsx apps/agent-runner/src/restore-ledger-reconcile.ts "$@"
 }
 
+backup_catalog() {
+  require_tools
+  # Foreground, one-shot backup authority. Configuration may come from the explicitly preserved
+  # caller environment or `.env`; the wrapper never interpolates or prints any of those values.
+  node --import tsx apps/agent-runner/src/backup-catalog.ts "$@"
+}
+
 usage() {
-  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|down"
+  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|backup-catalog|down"
 }
 
 case "${1:-}" in
@@ -685,6 +745,7 @@ case "${1:-}" in
   cleanup-idempotency) shift; cleanup_idempotency "$@" ;;
   blob-storage-migrate) shift; blob_storage_migrate "$@" ;;
   restore-ledger-reconcile) shift; restore_ledger_reconcile "$@" ;;
+  backup-catalog) shift; backup_catalog "$@" ;;
   down) stop_apps; infra stop ;;
   *) usage; exit 1 ;;
 esac

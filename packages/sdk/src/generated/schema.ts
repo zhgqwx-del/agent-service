@@ -1140,6 +1140,16 @@ export type components = {
                 /** @enum {boolean} */
                 readonly streaming: true;
                 /** @default [] */
+                readonly tenantBackupCatalog?: readonly "authoritative-backup-catalog-v1"[];
+                /** @default false */
+                readonly tenantBackupCatalogActive?: boolean;
+                /** @default null */
+                readonly tenantBackupCatalogNamespaceSha256?: string | null;
+                /** @default null */
+                readonly tenantBackupCatalogRuntimeBindingSha256?: string | null;
+                /** @default null */
+                readonly tenantBackupCatalogTargetSha256?: string | null;
+                /** @default [] */
                 readonly tenantCredentialLifecycle?: readonly "versioned-target-ledger-v1"[];
                 /** @default false */
                 readonly tenantCredentialLifecycleTrackingActive?: boolean;

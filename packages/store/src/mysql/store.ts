@@ -195,6 +195,8 @@ import {
   type TransitionErasureJobOptions,
 } from "../subject-lifecycle.js";
 import * as RestoreJournal from "../tenant-restore-journal.js";
+import * as BackupCatalog from "../backup-catalog.js";
+import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
 import {
   validateErasureSessionAction,
   type ErasureSessionAction,
@@ -832,6 +834,9 @@ const parse = <T>(v: unknown): T => (typeof v === "string" ? JSON.parse(v) : (v 
 const TENANT_RESTORE_JOURNAL_MIGRATION_NAME = "0030_tenant_restore_journal.sql";
 const TENANT_RESTORE_JOURNAL_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-restore-journal";
+const TENANT_BACKUP_CATALOG_MIGRATION_NAME = "0031_authoritative_backup_catalog.sql";
+const TENANT_BACKUP_CATALOG_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:authoritative-backup-catalog";
 
 function mysqlMigrationStatements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "")
@@ -860,6 +865,30 @@ function tenantRestoreJournalFingerprintStatement(
   if (statements.length !== 1
     || !statements[0]!.startsWith(`SET @${variable}=`)) {
     throw new Error(`0030 tenant restore journal ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
+
+function tenantBackupCatalogFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+  variable: "backup_catalog_schema_ok" | "backup_catalog_trigger_ok",
+): string {
+  const startMarker = `-- ${TENANT_BACKUP_CATALOG_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker = `-- ${TENANT_BACKUP_CATALOG_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0031 tenant backup catalog ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @${variable}=`)) {
+    throw new Error(`0031 tenant backup catalog ${marker} fingerprint block is invalid`);
   }
   return statements[0]!;
 }
@@ -4901,6 +4930,346 @@ function mysqlSafeInteger(value: unknown, label: string): number {
   throw new Error(`${label} is not a non-negative integer`);
 }
 
+const TENANT_BACKUP_CATALOG_CONTROL_COLUMNS = `singleton_id,state,control_generation,protocol,
+  adapter_protocol,catalog_namespace_sha256,catalog_target_sha256,failure_domain_sha256,
+  logical_database_namespace_sha256,journal_control_evidence_sha256,retention_policy_sha256,
+  minimum_retention_ms,minimum_recoverable_backups,activated_at_db_ms,evidence_sha256`;
+const TENANT_BACKUP_CATALOG_EXTERNAL_EVENT_COLUMNS = `catalog_sequence,singleton_id,scope,
+  protocol,adapter_protocol,catalog_namespace_sha256,catalog_target_sha256,
+  failure_domain_sha256,event_type,operation_sha256,receipt_sha256,
+  previous_catalog_event_root_sha256,catalog_event_root_sha256,catalog_event_sha256,
+  event_payload_json,event_payload_sha256`;
+const TENANT_BACKUP_SNAPSHOT_ANCHOR_COLUMNS = `backup_id,singleton_id,scope,protocol,backup_kind,
+  control_evidence_sha256,logical_database_namespace_sha256,journal_control_evidence_sha256,
+  source_runtime_epoch_sha256,source_runtime_control_generation,
+  source_runtime_control_evidence_sha256,source_runtime_target_count,
+  source_runtime_head_catalog_json,source_runtime_head_root_sha256,
+  schema_migration_root_sha256,blob_storage_control_evidence_sha256,
+  source_catalog_sequence,source_catalog_event_root_sha256,
+  retention_until_db_ms,created_at_db_ms,anchor_sha256`;
+const TENANT_BACKUP_CATALOG_ENTRY_COLUMNS = `backup_id,scope,protocol,control_evidence_sha256,
+  logical_database_namespace_sha256,retention_policy_sha256,adapter_protocol,anchor_sha256,
+  source_snapshot_sha256,source_backup_sha256,artifact_manifest_sha256,provider_evidence_sha256,
+  catalog_namespace_sha256,catalog_target_sha256,failure_domain_sha256,
+  availability_operation_sha256,availability_receipt_sha256,catalog_sequence,
+  previous_catalog_event_root_sha256,catalog_event_root_sha256,catalog_event_sha256,
+  retention_until_db_ms,registered_at_db_ms,entry_sha256`;
+const TENANT_BACKUP_RESTORE_BINDING_COLUMNS = `restore_run_id,backup_id,scope,protocol,
+  anchor_sha256,entry_sha256,source_snapshot_sha256,source_backup_sha256,
+  artifact_manifest_sha256,provider_evidence_sha256,control_evidence_sha256,
+  journal_control_evidence_sha256,sealed_target_root_sha256,runtime_epoch_sha256,
+  reservation_receipt_sha256,selected_catalog_sequence,selected_catalog_event_root_sha256,
+  bound_at_db_ms,binding_sha256`;
+const TENANT_BACKUP_RUNTIME_RESERVATION_COLUMNS = `runtime_epoch_sha256,restore_run_id,backup_id,
+  scope,protocol,entry_sha256,binding_sha256,reservation_operation_sha256,
+  reservation_receipt_sha256,catalog_sequence,previous_catalog_event_root_sha256,
+  catalog_event_root_sha256,catalog_event_sha256,phase,reserved_at_db_ms,
+  resolution_operation_sha256,resolution_receipt_sha256,resolution_catalog_sequence,
+  resolution_previous_catalog_event_root_sha256,resolution_catalog_event_root_sha256,
+  resolution_catalog_event_sha256,resolved_at_db_ms,reservation_sha256`;
+const TENANT_BACKUP_CATALOG_EVICTION_COLUMNS = `backup_id,eviction_id,scope,protocol,
+  entry_sha256,anchor_sha256,source_snapshot_sha256,source_backup_sha256,
+  artifact_manifest_sha256,provider_evidence_sha256,control_evidence_sha256,
+  retention_policy_sha256,retention_until_db_ms,expected_catalog_sequence,
+  expected_catalog_event_root_sha256,eviction_operation_sha256,plan_sha256,
+  adapter_protocol,catalog_namespace_sha256,catalog_target_sha256,
+  acknowledgement_receipt_sha256,external_tombstone_sha256,observed_absent,
+  catalog_sequence,previous_catalog_event_root_sha256,catalog_event_root_sha256,
+  catalog_event_sha256,evicted_at_db_ms,eviction_sha256`;
+
+function rowToTenantBackupCatalogControl(
+  row: Row,
+): BackupCatalog.TenantBackupCatalogControlRecord {
+  const generation = mysqlSafeInteger(
+    row.control_generation,
+    "stored tenant backup catalog control generation",
+  );
+  const state = String(row.state);
+  const control: BackupCatalog.TenantBackupCatalogControlRecord = generation === 0
+    ? { singletonId: 1, state: "inactive", controlGeneration: 0 }
+    : {
+        singletonId: 1,
+        state: state as "active",
+        controlGeneration: 1,
+        protocol: String(row.protocol) as typeof BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+        adapterProtocol: String(row.adapter_protocol),
+        catalogNamespaceSha256: String(row.catalog_namespace_sha256),
+        catalogTargetSha256: String(row.catalog_target_sha256),
+        failureDomainSha256: String(row.failure_domain_sha256),
+        logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+        journalControlEvidenceSha256: String(row.journal_control_evidence_sha256),
+        retentionPolicySha256: String(row.retention_policy_sha256),
+        minimumRetentionMs: mysqlSafeInteger(
+          row.minimum_retention_ms,
+          "stored tenant backup minimum retention",
+        ),
+        minimumRecoverableBackups: mysqlSafeInteger(
+          row.minimum_recoverable_backups,
+          "stored tenant backup minimum recoverable backups",
+        ),
+        activatedAtDbMs: mysqlSafeInteger(
+          row.activated_at_db_ms,
+          "stored tenant backup catalog activation time",
+        ),
+        evidenceSha256: String(row.evidence_sha256),
+      };
+  BackupCatalog.validateTenantBackupCatalogControlRecord(control);
+  return control;
+}
+
+function rowToTenantBackupCatalogExternalEvent(row: Row): {
+  identity: BackupCatalogAdapter.TenantBackupCatalogAdapterIdentity;
+  event: BackupCatalog.TenantBackupCatalogExternalEvent;
+} {
+  const identity = {
+    adapterProtocol: String(row.adapter_protocol),
+    catalogNamespaceSha256: String(row.catalog_namespace_sha256),
+    catalogTargetSha256: String(row.catalog_target_sha256),
+    failureDomainSha256: String(row.failure_domain_sha256),
+  };
+  const event = structuredClone(parse<BackupCatalog.TenantBackupCatalogExternalEvent>(
+    row.event_payload_json,
+  ));
+  BackupCatalogAdapter.validateTenantBackupCatalogAdapterIdentity(identity);
+  BackupCatalogAdapter.validateTenantBackupCatalogAdapterEvent(event);
+  const proof = BackupCatalogAdapter.proofOf(event);
+  if (mysqlSafeInteger(row.singleton_id, "stored tenant backup external singleton") !== 1
+    || String(row.scope) !== BackupCatalog.TENANT_BACKUP_CATALOG_EXTERNAL_EVENT_SCOPE
+    || String(row.protocol) !== BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL
+    || String(row.event_type) !== event.eventType
+    || mysqlSafeInteger(row.catalog_sequence, "stored tenant backup external sequence")
+      !== proof.catalogSequence
+    || String(row.operation_sha256) !== BackupCatalogAdapter.operationOf(event)
+    || String(row.receipt_sha256) !== BackupCatalogAdapter.receiptOf(event)
+    || String(row.previous_catalog_event_root_sha256)
+      !== proof.previousCatalogEventRootSha256
+    || String(row.catalog_event_root_sha256) !== proof.catalogEventRootSha256
+    || String(row.catalog_event_sha256) !== proof.catalogEventSha256
+    || String(row.event_payload_sha256)
+      !== BackupCatalogAdapter.tenantBackupCatalogAdapterEventSha256(event)) {
+    throw new Error("stored tenant backup external event is inconsistent");
+  }
+  return { identity, event };
+}
+
+function rowToTenantBackupSnapshotAnchor(row: Row): BackupCatalog.TenantBackupSnapshotAnchor {
+  const sourceRuntimeHeads = parse<RestoreJournal.TenantRestoreReplaySealedTarget[]>(
+    row.source_runtime_head_catalog_json,
+  );
+  if (!Array.isArray(sourceRuntimeHeads)) {
+    throw new Error("stored tenant backup runtime head catalog is invalid");
+  }
+  const anchor: BackupCatalog.TenantBackupSnapshotAnchor = {
+    scope: String(row.scope) as typeof BackupCatalog.TENANT_BACKUP_SNAPSHOT_ANCHOR_SCOPE,
+    protocol: String(row.protocol) as typeof BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+    backupKind: String(row.backup_kind) as "full",
+    backupId: String(row.backup_id),
+    controlEvidenceSha256: String(row.control_evidence_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    journalControlEvidenceSha256: String(row.journal_control_evidence_sha256),
+    sourceRuntimeEpochSha256: String(row.source_runtime_epoch_sha256),
+    sourceRuntimeControlGeneration: mysqlSafeInteger(
+      row.source_runtime_control_generation,
+      "stored tenant backup runtime control generation",
+    ),
+    sourceRuntimeControlEvidenceSha256: String(row.source_runtime_control_evidence_sha256),
+    sourceRuntimeTargetCount: mysqlSafeInteger(
+      row.source_runtime_target_count,
+      "stored tenant backup runtime target count",
+    ),
+    sourceRuntimeHeads: structuredClone(sourceRuntimeHeads),
+    sourceRuntimeHeadRootSha256: String(row.source_runtime_head_root_sha256),
+    schemaMigrationRootSha256: String(row.schema_migration_root_sha256),
+    blobStorageControlEvidenceSha256: String(row.blob_storage_control_evidence_sha256),
+    sourceCatalogSequence: mysqlSafeInteger(
+      row.source_catalog_sequence,
+      "stored tenant backup source catalog sequence",
+    ),
+    sourceCatalogEventRootSha256: String(row.source_catalog_event_root_sha256),
+    retentionUntilDbMs: mysqlSafeInteger(
+      row.retention_until_db_ms,
+      "stored tenant backup retention deadline",
+    ),
+    createdAtDbMs: mysqlSafeInteger(row.created_at_db_ms, "stored tenant backup anchor time"),
+    anchorSha256: String(row.anchor_sha256),
+  };
+  BackupCatalog.validateTenantBackupSnapshotAnchor(anchor);
+  return anchor;
+}
+
+function rowToTenantBackupCatalogEntry(row: Row): BackupCatalog.TenantBackupCatalogEntry {
+  const entry: BackupCatalog.TenantBackupCatalogEntry = {
+    scope: String(row.scope) as typeof BackupCatalog.TENANT_BACKUP_CATALOG_ENTRY_SCOPE,
+    protocol: String(row.protocol) as typeof BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+    controlEvidenceSha256: String(row.control_evidence_sha256),
+    logicalDatabaseNamespaceSha256: String(row.logical_database_namespace_sha256),
+    retentionPolicySha256: String(row.retention_policy_sha256),
+    retentionUntilDbMs: mysqlSafeInteger(
+      row.retention_until_db_ms,
+      "stored tenant backup entry retention deadline",
+    ),
+    registeredAtDbMs: mysqlSafeInteger(
+      row.registered_at_db_ms,
+      "stored tenant backup registration time",
+    ),
+    adapterProtocol: String(row.adapter_protocol),
+    catalogNamespaceSha256: String(row.catalog_namespace_sha256),
+    catalogTargetSha256: String(row.catalog_target_sha256),
+    failureDomainSha256: String(row.failure_domain_sha256),
+    backupId: String(row.backup_id),
+    anchorSha256: String(row.anchor_sha256),
+    sourceSnapshotSha256: String(row.source_snapshot_sha256),
+    sourceBackupSha256: String(row.source_backup_sha256),
+    artifactManifestSha256: String(row.artifact_manifest_sha256),
+    providerEvidenceSha256: String(row.provider_evidence_sha256),
+    availabilityOperationSha256: String(row.availability_operation_sha256),
+    availabilityReceiptSha256: String(row.availability_receipt_sha256),
+    catalogSequence: mysqlSafeInteger(row.catalog_sequence, "stored tenant backup sequence"),
+    previousCatalogEventRootSha256: String(row.previous_catalog_event_root_sha256),
+    catalogEventRootSha256: String(row.catalog_event_root_sha256),
+    catalogEventSha256: String(row.catalog_event_sha256),
+    entrySha256: String(row.entry_sha256),
+  };
+  BackupCatalog.validateTenantBackupCatalogEntry(entry);
+  return entry;
+}
+
+function rowToTenantBackupRestoreSourceBinding(
+  row: Row,
+): BackupCatalog.TenantBackupRestoreSourceBinding {
+  const binding: BackupCatalog.TenantBackupRestoreSourceBinding = {
+    scope: String(row.scope) as typeof BackupCatalog.TENANT_BACKUP_RESTORE_BINDING_SCOPE,
+    protocol: String(row.protocol) as typeof BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+    restoreRunId: String(row.restore_run_id),
+    backupId: String(row.backup_id),
+    anchorSha256: String(row.anchor_sha256),
+    entrySha256: String(row.entry_sha256),
+    sourceSnapshotSha256: String(row.source_snapshot_sha256),
+    sourceBackupSha256: String(row.source_backup_sha256),
+    artifactManifestSha256: String(row.artifact_manifest_sha256),
+    providerEvidenceSha256: String(row.provider_evidence_sha256),
+    controlEvidenceSha256: String(row.control_evidence_sha256),
+    journalControlEvidenceSha256: String(row.journal_control_evidence_sha256),
+    sealedTargetRootSha256: String(row.sealed_target_root_sha256),
+    runtimeEpochSha256: String(row.runtime_epoch_sha256),
+    reservationReceiptSha256: String(row.reservation_receipt_sha256),
+    selectedCatalogSequence: mysqlSafeInteger(
+      row.selected_catalog_sequence,
+      "stored tenant backup selected sequence",
+    ),
+    selectedCatalogEventRootSha256: String(row.selected_catalog_event_root_sha256),
+    boundAtDbMs: mysqlSafeInteger(row.bound_at_db_ms, "stored tenant backup binding time"),
+    bindingSha256: String(row.binding_sha256),
+  };
+  BackupCatalog.validateTenantBackupRestoreSourceBinding(binding);
+  return binding;
+}
+
+function rowToTenantBackupRuntimeReservation(
+  row: Row,
+): BackupCatalog.TenantBackupRuntimeReservation {
+  const common = {
+    scope: String(row.scope) as typeof BackupCatalog.TENANT_BACKUP_RUNTIME_RESERVATION_SCOPE,
+    protocol: String(row.protocol) as typeof BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+    restoreRunId: String(row.restore_run_id),
+    backupId: String(row.backup_id),
+    entrySha256: String(row.entry_sha256),
+    bindingSha256: String(row.binding_sha256),
+    runtimeEpochSha256: String(row.runtime_epoch_sha256),
+    reservationOperationSha256: String(row.reservation_operation_sha256),
+    reservationReceiptSha256: String(row.reservation_receipt_sha256),
+    catalogSequence: mysqlSafeInteger(row.catalog_sequence, "stored backup reservation sequence"),
+    previousCatalogEventRootSha256: String(row.previous_catalog_event_root_sha256),
+    catalogEventRootSha256: String(row.catalog_event_root_sha256),
+    catalogEventSha256: String(row.catalog_event_sha256),
+    reservedAtDbMs: mysqlSafeInteger(row.reserved_at_db_ms, "stored backup reservation time"),
+    reservationSha256: String(row.reservation_sha256),
+  };
+  const phase = String(row.phase);
+  const reservation: BackupCatalog.TenantBackupRuntimeReservation = phase === "reserved"
+    ? { ...common, phase }
+    : {
+        ...common,
+        phase: phase as "activated" | "aborted",
+        resolutionOperationSha256: String(row.resolution_operation_sha256),
+        resolutionReceiptSha256: String(row.resolution_receipt_sha256),
+        resolutionCatalogSequence: mysqlSafeInteger(
+          row.resolution_catalog_sequence,
+          "stored backup reservation resolution sequence",
+        ),
+        resolutionPreviousCatalogEventRootSha256:
+          String(row.resolution_previous_catalog_event_root_sha256),
+        resolutionCatalogEventRootSha256: String(row.resolution_catalog_event_root_sha256),
+        resolutionCatalogEventSha256: String(row.resolution_catalog_event_sha256),
+        resolvedAtDbMs: mysqlSafeInteger(
+          row.resolved_at_db_ms,
+          "stored backup reservation resolution time",
+        ),
+      };
+  BackupCatalog.validateTenantBackupRuntimeReservation(reservation);
+  return reservation;
+}
+
+function rowToTenantBackupCatalogEviction(
+  row: Row,
+): BackupCatalog.TenantBackupCatalogEviction {
+  const eviction: BackupCatalog.TenantBackupCatalogEviction = {
+    scope: String(row.scope) as typeof BackupCatalog.TENANT_BACKUP_CATALOG_EVICTION_SCOPE,
+    protocol: String(row.protocol) as typeof BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+    evictionId: String(row.eviction_id),
+    backupId: String(row.backup_id),
+    anchorSha256: String(row.anchor_sha256),
+    entrySha256: String(row.entry_sha256),
+    sourceSnapshotSha256: String(row.source_snapshot_sha256),
+    sourceBackupSha256: String(row.source_backup_sha256),
+    artifactManifestSha256: String(row.artifact_manifest_sha256),
+    providerEvidenceSha256: String(row.provider_evidence_sha256),
+    controlEvidenceSha256: String(row.control_evidence_sha256),
+    retentionPolicySha256: String(row.retention_policy_sha256),
+    retentionUntilDbMs: mysqlSafeInteger(
+      row.retention_until_db_ms,
+      "stored backup eviction retention deadline",
+    ),
+    expectedCatalogSequence: mysqlSafeInteger(
+      row.expected_catalog_sequence,
+      "stored backup eviction expected sequence",
+    ),
+    expectedCatalogEventRootSha256: String(row.expected_catalog_event_root_sha256),
+    evictionOperationSha256: String(row.eviction_operation_sha256),
+    planSha256: String(row.plan_sha256),
+    adapterProtocol: String(row.adapter_protocol),
+    catalogNamespaceSha256: String(row.catalog_namespace_sha256),
+    catalogTargetSha256: String(row.catalog_target_sha256),
+    acknowledgementReceiptSha256: String(row.acknowledgement_receipt_sha256),
+    externalTombstoneSha256: String(row.external_tombstone_sha256),
+    observedAbsent: tenantCredentialBoolean(
+      row.observed_absent,
+      "stored backup eviction absence proof",
+    ) as true,
+    catalogSequence: mysqlSafeInteger(row.catalog_sequence, "stored backup eviction sequence"),
+    previousCatalogEventRootSha256: String(row.previous_catalog_event_root_sha256),
+    catalogEventRootSha256: String(row.catalog_event_root_sha256),
+    catalogEventSha256: String(row.catalog_event_sha256),
+    evictedAtDbMs: mysqlSafeInteger(row.evicted_at_db_ms, "stored backup eviction time"),
+    evictionSha256: String(row.eviction_sha256),
+  };
+  BackupCatalog.validateTenantBackupCatalogEviction(eviction);
+  return eviction;
+}
+
+type TenantBackupCatalogProjection = {
+  control: BackupCatalog.TenantBackupCatalogControlRecord;
+  anchors: Map<string, BackupCatalog.TenantBackupSnapshotAnchor>;
+  entries: Map<string, BackupCatalog.TenantBackupCatalogEntry>;
+  bindings: Map<string, BackupCatalog.TenantBackupRestoreSourceBinding>;
+  reservations: Map<string, BackupCatalog.TenantBackupRuntimeReservation>;
+  evictions: Map<string, BackupCatalog.TenantBackupCatalogEviction>;
+  replayRuns: Map<string, RestoreJournal.TenantRestoreReplayRunRecord>;
+  externalEvents: Map<number, BackupCatalog.TenantBackupCatalogExternalEvent>;
+  catalogSequence: number;
+  catalogEventRootSha256: string;
+};
+
 const TENANT_RESTORE_JOURNAL_CONTROL_COLUMNS = `singleton_id, control_generation,
   activated_at_db_ms, protocol, adapter_protocol, journal_namespace_sha256,
   logical_database_namespace_sha256, target_count, target_root_sha256,
@@ -6096,6 +6465,7 @@ export class MysqlSessionStore implements
   TenantDatabasePurgeStore,
   TenantRedisPurgeStore,
   TenantCredentialTargetExecutionStore,
+  BackupCatalog.TenantBackupCatalogStore,
   RestoreJournal.TenantRestoreJournalStore,
   RestoreJournal.RestoreReplayStore,
   UserDataExportRequestStore,
@@ -6116,6 +6486,7 @@ export class MysqlSessionStore implements
    */
   private credentialLifecycleSchemaInstalled = false;
   private tenantRestoreJournalSchemaInstalled = false;
+  private tenantBackupCatalogSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -6237,6 +6608,66 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertTenantBackupCatalogSchemaFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let fingerprintStatements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_BACKUP_CATALOG_MIGRATION_NAME),
+        "utf8",
+      );
+      fingerprintStatements = [
+        tenantBackupCatalogFingerprintStatement(
+          migrationSql,
+          "schema",
+          "backup_catalog_schema_ok",
+        ),
+        tenantBackupCatalogFingerprintStatement(
+          migrationSql,
+          "triggers",
+          "backup_catalog_trigger_ok",
+        ),
+      ];
+    } catch (cause) {
+      throw new Error("0031 tenant backup catalog fingerprint source is invalid", { cause });
+    }
+
+    let failure: Error | undefined;
+    try {
+      await conn.query(
+        "SET @agent_service_backup_catalog_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of fingerprintStatements) await conn.query(statement);
+      const [fingerprintRows] = await conn.query<Row[]>(
+        `SELECT @backup_catalog_schema_ok AS schema_ok,
+                @backup_catalog_trigger_ok AS trigger_ok`,
+      );
+      if (Number(fingerprintRows[0]?.schema_ok) !== 1
+        || Number(fingerprintRows[0]?.trigger_ok) !== 1) {
+        throw new Error("stored schema does not match the 0031 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error(
+        "0031 tenant backup catalog schema fingerprint verification failed",
+        { cause },
+      );
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_backup_catalog_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error(
+        "0031 tenant backup catalog fingerprint session restore failed",
+        { cause },
+      );
+    }
+    if (failure) throw failure;
+  }
+
   private async verifyMigrations(migrationsDir: string): Promise<void> {
     const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
     const conn = await this.pool.getConnection();
@@ -6250,11 +6681,17 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_RESTORE_JOURNAL_MIGRATION_NAME)) {
         await this.assertTenantRestoreJournalSchemaFingerprint(conn, migrationsDir);
       }
+      if (done.has(TENANT_BACKUP_CATALOG_MIGRATION_NAME)) {
+        await this.assertTenantBackupCatalogSchemaFingerprint(conn, migrationsDir);
+      }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
       );
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
+      );
+      this.tenantBackupCatalogSchemaInstalled = done.has(
+        TENANT_BACKUP_CATALOG_MIGRATION_NAME,
       );
     } finally {
       conn.release();
@@ -6300,11 +6737,17 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_RESTORE_JOURNAL_MIGRATION_NAME)) {
         await this.assertTenantRestoreJournalSchemaFingerprint(conn, dir);
       }
+      if (done.has(TENANT_BACKUP_CATALOG_MIGRATION_NAME)) {
+        await this.assertTenantBackupCatalogSchemaFingerprint(conn, dir);
+      }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
       );
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
+      );
+      this.tenantBackupCatalogSchemaInstalled = done.has(
+        TENANT_BACKUP_CATALOG_MIGRATION_NAME,
       );
     } finally {
       if (locked) {
@@ -34793,6 +35236,1622 @@ export class MysqlSessionStore implements
     return rows[0] ? rowToBlobDeleteOutbox(rows[0], false) : null;
   }
 
+  // ---------- authoritative tenant backup catalog ----------
+  private async loadTenantBackupCatalogControl(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<BackupCatalog.TenantBackupCatalogControlRecord> {
+    if (!this.tenantBackupCatalogSchemaInstalled) {
+      throw new BackupCatalog.TenantBackupCatalogNotReadyError("schema_not_installed");
+    }
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_BACKUP_CATALOG_CONTROL_COLUMNS}
+         FROM backup_catalog_control WHERE singleton_id=1 ${lock}`,
+    );
+    if (rows.length !== 1) throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+    try {
+      return rowToTenantBackupCatalogControl(rows[0]!);
+    } catch {
+      throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+    }
+  }
+
+  private async assertTenantBackupCatalogProjection(
+    conn: PoolConnection,
+    controlLock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantBackupCatalogProjection> {
+    const control = await this.loadTenantBackupCatalogControl(conn, controlLock);
+    try {
+      const [externalEventRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_BACKUP_CATALOG_EXTERNAL_EVENT_COLUMNS}
+           FROM backup_catalog_external_events ORDER BY catalog_sequence`,
+      );
+      const [anchorRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_BACKUP_SNAPSHOT_ANCHOR_COLUMNS} FROM backup_snapshot_anchors`,
+      );
+      const [entryRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_BACKUP_CATALOG_ENTRY_COLUMNS} FROM backup_catalog_entries`,
+      );
+      const [bindingRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_BACKUP_RESTORE_BINDING_COLUMNS} FROM backup_restore_source_bindings`,
+      );
+      const [reservationRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_BACKUP_RUNTIME_RESERVATION_COLUMNS} FROM backup_runtime_reservations`,
+      );
+      const [evictionRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_BACKUP_CATALOG_EVICTION_COLUMNS} FROM backup_catalog_evictions`,
+      );
+      const [runRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_RESTORE_REPLAY_RUN_COLUMNS} FROM tenant_restore_replay_runs`,
+      );
+      const anchors = new Map(anchorRows.map((row) => {
+        const value = rowToTenantBackupSnapshotAnchor(row);
+        return [value.backupId, value] as const;
+      }));
+      const entries = new Map(entryRows.map((row) => {
+        const value = rowToTenantBackupCatalogEntry(row);
+        return [value.backupId, value] as const;
+      }));
+      const bindings = new Map(bindingRows.map((row) => {
+        const value = rowToTenantBackupRestoreSourceBinding(row);
+        return [value.restoreRunId, value] as const;
+      }));
+      const reservations = new Map(reservationRows.map((row) => {
+        const value = rowToTenantBackupRuntimeReservation(row);
+        return [value.restoreRunId, value] as const;
+      }));
+      const evictions = new Map(evictionRows.map((row) => {
+        const value = rowToTenantBackupCatalogEviction(row);
+        return [value.backupId, value] as const;
+      }));
+      const replayRuns = new Map(runRows.map((row) => {
+        const value = rowToTenantRestoreReplayRun(row);
+        return [value.restoreRunId, value] as const;
+      }));
+      const externalEvents = new Map(externalEventRows.map((row) => {
+        const value = rowToTenantBackupCatalogExternalEvent(row);
+        return [value.event.result.catalogSequence, value] as const;
+      }));
+      if (externalEvents.size !== externalEventRows.length
+        || anchors.size !== anchorRows.length || entries.size !== entryRows.length
+        || bindings.size !== bindingRows.length || reservations.size !== reservationRows.length
+        || evictions.size !== evictionRows.length || replayRuns.size !== runRows.length) {
+        throw new Error("tenant backup catalog contains duplicate logical identities");
+      }
+      if (control.state === "inactive") {
+        if (externalEvents.size || anchors.size || entries.size || bindings.size
+          || reservations.size || evictions.size) {
+          throw new Error("inactive tenant backup catalog has durable state");
+        }
+        return {
+          control,
+          anchors,
+          entries,
+          bindings,
+          reservations,
+          evictions,
+          replayRuns,
+          externalEvents: new Map(),
+          catalogSequence: 0,
+          catalogEventRootSha256:
+            BackupCatalog.EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
+        };
+      }
+
+      const orderedExternalEvents = [...externalEvents.values()]
+        .sort((left, right) => (
+          left.event.result.catalogSequence - right.event.result.catalogSequence
+        ));
+      for (const external of orderedExternalEvents) {
+        if (external.identity.adapterProtocol !== control.adapterProtocol
+          || external.identity.catalogNamespaceSha256 !== control.catalogNamespaceSha256
+          || external.identity.catalogTargetSha256 !== control.catalogTargetSha256
+          || external.identity.failureDomainSha256 !== control.failureDomainSha256) {
+          throw new Error("tenant backup external event identity is invalid");
+        }
+      }
+      BackupCatalogAdapter.assertEventChain({
+        adapterProtocol: control.adapterProtocol,
+        catalogNamespaceSha256: control.catalogNamespaceSha256,
+        catalogTargetSha256: control.catalogTargetSha256,
+        failureDomainSha256: control.failureDomainSha256,
+      }, orderedExternalEvents.map(({ event }) => event));
+      const availabilityEvents = new Map(orderedExternalEvents.flatMap(({ event }) => (
+        event.eventType === "backup_recoverable"
+          ? [[event.result.backupId, event] as const]
+          : []
+      )));
+      const reservationEvents = new Map(orderedExternalEvents.flatMap(({ event }) => (
+        event.eventType === "restore_reserved"
+          ? [[event.result.restoreRunId, event] as const]
+          : []
+      )));
+      const resolutionEvents = new Map(orderedExternalEvents.flatMap(({ event }) => (
+        event.eventType === "restore_resolved"
+          ? [[event.result.restoreRunId, event] as const]
+          : []
+      )));
+      const evictionEvents = new Map(orderedExternalEvents.flatMap(({ event }) => (
+        event.eventType === "backup_evicted"
+          ? [[event.result.backupId, event] as const]
+          : []
+      )));
+
+      for (const anchor of anchors.values()) {
+        const sourceCatalogRoot = anchor.sourceCatalogSequence === 0
+          ? BackupCatalog.EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256
+          : orderedExternalEvents[anchor.sourceCatalogSequence - 1]
+            ?.event.result.catalogEventRootSha256;
+        if (anchor.controlEvidenceSha256 !== control.evidenceSha256
+          || anchor.logicalDatabaseNamespaceSha256
+            !== control.logicalDatabaseNamespaceSha256
+          || anchor.journalControlEvidenceSha256 !== control.journalControlEvidenceSha256
+          || anchor.sourceRuntimeHeads.some((head) => (
+            head.logicalDatabaseNamespaceSha256
+              !== control.logicalDatabaseNamespaceSha256
+          ))
+          || sourceCatalogRoot !== anchor.sourceCatalogEventRootSha256
+          || anchor.retentionUntilDbMs - anchor.createdAtDbMs < control.minimumRetentionMs) {
+          throw new Error("tenant backup anchor control binding is invalid");
+        }
+      }
+      const sourceSnapshots = new Set<string>();
+      const sourceBackups = new Set<string>();
+      for (const entry of entries.values()) {
+        const anchor = anchors.get(entry.backupId);
+        const external = availabilityEvents.get(entry.backupId);
+        if (!external || !BackupCatalogAdapter.sameAdapterEvent(
+          { eventType: "backup_recoverable", result:
+            BackupCatalog.tenantBackupAvailabilityResultFromEntry(entry) },
+          external,
+        )
+          || entry.controlEvidenceSha256 !== control.evidenceSha256
+          || entry.logicalDatabaseNamespaceSha256
+            !== control.logicalDatabaseNamespaceSha256
+          || entry.retentionPolicySha256 !== control.retentionPolicySha256
+          || entry.retentionUntilDbMs - entry.registeredAtDbMs < control.minimumRetentionMs
+          || entry.adapterProtocol !== control.adapterProtocol
+          || entry.catalogNamespaceSha256 !== control.catalogNamespaceSha256
+          || entry.catalogTargetSha256 !== control.catalogTargetSha256
+          || entry.failureDomainSha256 !== control.failureDomainSha256
+          || sourceSnapshots.has(entry.sourceSnapshotSha256)
+          || sourceBackups.has(entry.sourceBackupSha256)
+          || (anchor !== undefined && (
+            entry.anchorSha256 !== anchor.anchorSha256
+            || entry.retentionUntilDbMs !== anchor.retentionUntilDbMs
+            || entry.registeredAtDbMs !== anchor.createdAtDbMs
+          ))) {
+          throw new Error("tenant backup entry control binding is invalid");
+        }
+        sourceSnapshots.add(entry.sourceSnapshotSha256);
+        sourceBackups.add(entry.sourceBackupSha256);
+      }
+      if (entries.size !== availabilityEvents.size) {
+        throw new Error("tenant backup availability mirror is not fully projected");
+      }
+      for (const binding of bindings.values()) {
+        const entry = entries.get(binding.backupId);
+        const anchor = anchors.get(binding.backupId);
+        const reservation = reservations.get(binding.restoreRunId);
+        const run = replayRuns.get(binding.restoreRunId);
+        if (!entry || !anchor || !reservation || !run
+          || anchor.anchorSha256 !== entry.anchorSha256
+          || binding.anchorSha256 !== entry.anchorSha256
+          || binding.entrySha256 !== entry.entrySha256
+          || binding.sourceSnapshotSha256 !== entry.sourceSnapshotSha256
+          || binding.sourceBackupSha256 !== entry.sourceBackupSha256
+          || binding.artifactManifestSha256 !== entry.artifactManifestSha256
+          || binding.providerEvidenceSha256 !== entry.providerEvidenceSha256
+          || binding.controlEvidenceSha256 !== control.evidenceSha256
+          || binding.journalControlEvidenceSha256 !== control.journalControlEvidenceSha256
+          || binding.selectedCatalogSequence !== entry.catalogSequence
+          || binding.selectedCatalogEventRootSha256 !== entry.catalogEventRootSha256
+          || binding.runtimeEpochSha256 !== run.runtimeEpochSha256
+          || binding.sourceBackupSha256 !== run.sourceBackupSha256
+          || binding.sealedTargetRootSha256 !== run.sealedTargetRootSha256
+          || binding.bindingSha256 !== reservation.bindingSha256) {
+          throw new Error("tenant backup restore binding relation is invalid");
+        }
+      }
+      for (const reservation of reservations.values()) {
+        const binding = bindings.get(reservation.restoreRunId);
+        const run = replayRuns.get(reservation.restoreRunId);
+        const external = reservationEvents.get(reservation.restoreRunId);
+        const resolution = resolutionEvents.get(reservation.restoreRunId);
+        if (!binding || !run || !external
+          || external.result.backupId !== reservation.backupId
+          || external.result.entrySha256 !== reservation.entrySha256
+          || external.result.runtimeEpochSha256 !== reservation.runtimeEpochSha256
+          || external.result.reservationOperationSha256
+            !== reservation.reservationOperationSha256
+          || external.result.reservationReceiptSha256
+            !== reservation.reservationReceiptSha256
+          || external.result.catalogSequence !== reservation.catalogSequence
+          || external.result.previousCatalogEventRootSha256
+            !== reservation.previousCatalogEventRootSha256
+          || external.result.catalogEventRootSha256 !== reservation.catalogEventRootSha256
+          || external.result.catalogEventSha256 !== reservation.catalogEventSha256
+          || reservation.backupId !== binding.backupId
+          || reservation.entrySha256 !== binding.entrySha256
+          || reservation.bindingSha256 !== binding.bindingSha256
+          || reservation.runtimeEpochSha256 !== binding.runtimeEpochSha256
+          || (reservation.phase === "activated" && run.phase !== "active")
+          || (reservation.phase === "aborted" && run.phase !== "aborted")
+          || (reservation.phase !== "reserved" && (
+            !resolution
+            || resolution.result.phase !== reservation.phase
+            || resolution.result.reservationReceiptSha256
+              !== reservation.reservationReceiptSha256
+            || resolution.result.resolutionOperationSha256
+              !== reservation.resolutionOperationSha256
+            || resolution.result.resolutionReceiptSha256
+              !== reservation.resolutionReceiptSha256
+            || resolution.result.catalogSequence !== reservation.resolutionCatalogSequence
+            || resolution.result.previousCatalogEventRootSha256
+              !== reservation.resolutionPreviousCatalogEventRootSha256
+            || resolution.result.catalogEventRootSha256
+              !== reservation.resolutionCatalogEventRootSha256
+            || resolution.result.catalogEventSha256
+              !== reservation.resolutionCatalogEventSha256
+          ))) {
+          throw new Error("tenant backup runtime reservation relation is invalid");
+        }
+      }
+      const evictionIds = new Set<string>();
+      for (const eviction of evictions.values()) {
+        const entry = entries.get(eviction.backupId);
+        const external = evictionEvents.get(eviction.backupId);
+        if (!entry || !external || eviction.entrySha256 !== entry.entrySha256
+          || external.result.adapterProtocol !== eviction.adapterProtocol
+          || external.result.catalogNamespaceSha256 !== eviction.catalogNamespaceSha256
+          || external.result.catalogTargetSha256 !== eviction.catalogTargetSha256
+          || external.result.evictionId !== eviction.evictionId
+          || external.result.planSha256 !== eviction.planSha256
+          || external.result.evictionOperationSha256 !== eviction.evictionOperationSha256
+          || external.result.acknowledgementReceiptSha256
+            !== eviction.acknowledgementReceiptSha256
+          || external.result.externalTombstoneSha256 !== eviction.externalTombstoneSha256
+          || external.result.observedAbsent !== eviction.observedAbsent
+          || external.result.catalogSequence !== eviction.catalogSequence
+          || external.result.previousCatalogEventRootSha256
+            !== eviction.previousCatalogEventRootSha256
+          || external.result.catalogEventRootSha256 !== eviction.catalogEventRootSha256
+          || external.result.catalogEventSha256 !== eviction.catalogEventSha256
+          || eviction.anchorSha256 !== entry.anchorSha256
+          || eviction.sourceSnapshotSha256 !== entry.sourceSnapshotSha256
+          || eviction.sourceBackupSha256 !== entry.sourceBackupSha256
+          || eviction.artifactManifestSha256 !== entry.artifactManifestSha256
+          || eviction.providerEvidenceSha256 !== entry.providerEvidenceSha256
+          || eviction.controlEvidenceSha256 !== control.evidenceSha256
+          || eviction.retentionPolicySha256 !== control.retentionPolicySha256
+          || evictionIds.has(eviction.evictionId)) {
+          throw new Error("tenant backup eviction relation is invalid");
+        }
+        evictionIds.add(eviction.evictionId);
+      }
+      if (evictions.size !== evictionEvents.size) {
+        throw new Error("tenant backup eviction mirror is not fully projected");
+      }
+
+      const lastExternalEvent = orderedExternalEvents.at(-1)?.event.result;
+      return {
+        control,
+        anchors,
+        entries,
+        bindings,
+        reservations,
+        evictions,
+        replayRuns,
+        externalEvents: new Map(orderedExternalEvents.map(({ event }) => (
+          [event.result.catalogSequence, event]
+        ))),
+        catalogSequence: lastExternalEvent?.catalogSequence ?? 0,
+        catalogEventRootSha256: lastExternalEvent?.catalogEventRootSha256
+          ?? BackupCatalog.EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
+      };
+    } catch (error) {
+      if (error instanceof BackupCatalog.TenantBackupCatalogIntegrityError) throw error;
+      throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+    }
+  }
+
+  private async insertTenantBackupCatalogEntryInTransaction(
+    conn: PoolConnection,
+    result: BackupCatalog.TenantBackupAvailabilityAdapterResult,
+  ): Promise<BackupCatalog.TenantBackupCatalogEntry> {
+    const entry: BackupCatalog.TenantBackupCatalogEntry = {
+      scope: BackupCatalog.TENANT_BACKUP_CATALOG_ENTRY_SCOPE,
+      protocol: BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+      ...structuredClone(result),
+    };
+    BackupCatalog.validateTenantBackupCatalogEntry(entry);
+    await conn.query(
+      `INSERT INTO backup_catalog_entries
+         (backup_id,scope,protocol,control_evidence_sha256,
+          logical_database_namespace_sha256,retention_policy_sha256,adapter_protocol,
+          anchor_sha256,source_snapshot_sha256,source_backup_sha256,
+          artifact_manifest_sha256,provider_evidence_sha256,catalog_namespace_sha256,
+          catalog_target_sha256,failure_domain_sha256,availability_operation_sha256,
+          availability_receipt_sha256,catalog_sequence,previous_catalog_event_root_sha256,
+          catalog_event_root_sha256,catalog_event_sha256,retention_until_db_ms,
+          registered_at_db_ms,entry_sha256)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        entry.backupId,
+        entry.scope,
+        entry.protocol,
+        entry.controlEvidenceSha256,
+        entry.logicalDatabaseNamespaceSha256,
+        entry.retentionPolicySha256,
+        entry.adapterProtocol,
+        entry.anchorSha256,
+        entry.sourceSnapshotSha256,
+        entry.sourceBackupSha256,
+        entry.artifactManifestSha256,
+        entry.providerEvidenceSha256,
+        entry.catalogNamespaceSha256,
+        entry.catalogTargetSha256,
+        entry.failureDomainSha256,
+        entry.availabilityOperationSha256,
+        entry.availabilityReceiptSha256,
+        entry.catalogSequence,
+        entry.previousCatalogEventRootSha256,
+        entry.catalogEventRootSha256,
+        entry.catalogEventSha256,
+        entry.retentionUntilDbMs,
+        entry.registeredAtDbMs,
+        entry.entrySha256,
+      ],
+    );
+    return entry;
+  }
+
+  private async insertTenantBackupCatalogEvictionInTransaction(
+    conn: PoolConnection,
+    eviction: BackupCatalog.TenantBackupCatalogEviction,
+  ): Promise<void> {
+    BackupCatalog.validateTenantBackupCatalogEviction(eviction);
+    await conn.query(
+      `INSERT INTO backup_catalog_evictions
+         (backup_id,eviction_id,scope,protocol,entry_sha256,anchor_sha256,
+          source_snapshot_sha256,source_backup_sha256,artifact_manifest_sha256,
+          provider_evidence_sha256,control_evidence_sha256,retention_policy_sha256,
+          retention_until_db_ms,expected_catalog_sequence,expected_catalog_event_root_sha256,
+          eviction_operation_sha256,plan_sha256,adapter_protocol,catalog_namespace_sha256,
+          catalog_target_sha256,acknowledgement_receipt_sha256,external_tombstone_sha256,
+          observed_absent,catalog_sequence,previous_catalog_event_root_sha256,
+          catalog_event_root_sha256,catalog_event_sha256,evicted_at_db_ms,eviction_sha256)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        eviction.backupId,
+        eviction.evictionId,
+        eviction.scope,
+        eviction.protocol,
+        eviction.entrySha256,
+        eviction.anchorSha256,
+        eviction.sourceSnapshotSha256,
+        eviction.sourceBackupSha256,
+        eviction.artifactManifestSha256,
+        eviction.providerEvidenceSha256,
+        eviction.controlEvidenceSha256,
+        eviction.retentionPolicySha256,
+        eviction.retentionUntilDbMs,
+        eviction.expectedCatalogSequence,
+        eviction.expectedCatalogEventRootSha256,
+        eviction.evictionOperationSha256,
+        eviction.planSha256,
+        eviction.adapterProtocol,
+        eviction.catalogNamespaceSha256,
+        eviction.catalogTargetSha256,
+        eviction.acknowledgementReceiptSha256,
+        eviction.externalTombstoneSha256,
+        eviction.observedAbsent,
+        eviction.catalogSequence,
+        eviction.previousCatalogEventRootSha256,
+        eviction.catalogEventRootSha256,
+        eviction.catalogEventSha256,
+        eviction.evictedAtDbMs,
+        eviction.evictionSha256,
+      ],
+    );
+  }
+
+  private async mirrorTenantBackupCatalogEventInTransaction(
+    conn: PoolConnection,
+    projection: TenantBackupCatalogProjection,
+    input: BackupCatalog.MirrorTenantBackupCatalogEventInput,
+  ): Promise<BackupCatalog.ExactReplay<BackupCatalog.TenantBackupCatalogExternalEvent>> {
+    BackupCatalogAdapter.validateTenantBackupCatalogAdapterIdentity(input);
+    BackupCatalogAdapter.validateTenantBackupCatalogAdapterEvent(input.event);
+    const control = projection.control;
+    if (control.state !== "active") {
+      throw new BackupCatalog.TenantBackupCatalogNotReadyError("catalog_control_inactive");
+    }
+    if (input.adapterProtocol !== control.adapterProtocol
+      || input.catalogNamespaceSha256 !== control.catalogNamespaceSha256
+      || input.catalogTargetSha256 !== control.catalogTargetSha256
+      || input.failureDomainSha256 !== control.failureDomainSha256) {
+      throw new BackupCatalog.TenantBackupCatalogConflictError();
+    }
+    const event = structuredClone(input.event);
+    const proof = BackupCatalogAdapter.proofOf(event);
+    const existing = projection.externalEvents.get(proof.catalogSequence);
+    let disposition: BackupCatalog.ExactReplay<unknown>["disposition"] = "created";
+    if (existing) {
+      if (!BackupCatalogAdapter.sameAdapterEvent(existing, event)) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      disposition = "exact_replay";
+    } else {
+      if (proof.catalogSequence !== projection.catalogSequence + 1
+        || proof.previousCatalogEventRootSha256 !== projection.catalogEventRootSha256) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError(
+          "tenant backup catalog event does not extend the durable head",
+        );
+      }
+      await conn.query(
+        `INSERT INTO backup_catalog_external_events
+           (catalog_sequence,singleton_id,scope,protocol,adapter_protocol,
+            catalog_namespace_sha256,catalog_target_sha256,failure_domain_sha256,event_type,
+            operation_sha256,receipt_sha256,previous_catalog_event_root_sha256,
+            catalog_event_root_sha256,catalog_event_sha256,event_payload_json,event_payload_sha256)
+         VALUES (?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          proof.catalogSequence,
+          BackupCatalog.TENANT_BACKUP_CATALOG_EXTERNAL_EVENT_SCOPE,
+          BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+          input.adapterProtocol,
+          input.catalogNamespaceSha256,
+          input.catalogTargetSha256,
+          input.failureDomainSha256,
+          event.eventType,
+          BackupCatalogAdapter.operationOf(event),
+          BackupCatalogAdapter.receiptOf(event),
+          proof.previousCatalogEventRootSha256,
+          proof.catalogEventRootSha256,
+          proof.catalogEventSha256,
+          json(event),
+          BackupCatalogAdapter.tenantBackupCatalogAdapterEventSha256(event),
+        ],
+      );
+    }
+    if (event.eventType === "backup_recoverable") {
+      const existingEntry = projection.entries.get(event.result.backupId);
+      if (existingEntry) {
+        if (!BackupCatalogAdapter.sameAdapterEvent(
+          { eventType: "backup_recoverable", result:
+            BackupCatalog.tenantBackupAvailabilityResultFromEntry(existingEntry) },
+          event,
+        )) throw new BackupCatalog.TenantBackupCatalogConflictError();
+      } else {
+        await this.insertTenantBackupCatalogEntryInTransaction(conn, event.result);
+      }
+    } else if (event.eventType === "restore_resolved") {
+      const reservation = projection.reservations.get(event.result.restoreRunId);
+      if (reservation?.phase === "reserved") {
+        const run = projection.replayRuns.get(event.result.restoreRunId);
+        const expectedRunPhase = event.result.phase === "activated" ? "active" : "aborted";
+        if (reservation.reservationReceiptSha256
+          !== event.result.reservationReceiptSha256) {
+          throw new BackupCatalog.TenantBackupCatalogConflictError();
+        }
+        if (run?.phase === expectedRunPhase) {
+          const [updated] = await conn.query<mysql.ResultSetHeader>(
+            `UPDATE backup_runtime_reservations
+                SET phase=?,resolution_operation_sha256=?,resolution_receipt_sha256=?,
+                    resolution_catalog_sequence=?,resolution_previous_catalog_event_root_sha256=?,
+                    resolution_catalog_event_root_sha256=?,resolution_catalog_event_sha256=?,
+                    resolved_at_db_ms=?
+              WHERE restore_run_id=? AND runtime_epoch_sha256=? AND phase='reserved'
+                AND reservation_receipt_sha256=?`,
+            [
+              event.result.phase,
+              event.result.resolutionOperationSha256,
+              event.result.resolutionReceiptSha256,
+              event.result.catalogSequence,
+              event.result.previousCatalogEventRootSha256,
+              event.result.catalogEventRootSha256,
+              event.result.catalogEventSha256,
+              await this.databaseNow(conn),
+              reservation.restoreRunId,
+              reservation.runtimeEpochSha256,
+              reservation.reservationReceiptSha256,
+            ],
+          );
+          if (updated.affectedRows !== 1) {
+            throw new BackupCatalog.TenantBackupCatalogConflictError();
+          }
+        }
+      }
+    } else if (event.eventType === "backup_evicted") {
+      const existingEviction = projection.evictions.get(event.result.backupId);
+      if (!existingEviction) {
+        const entry = projection.entries.get(event.result.backupId);
+        if (!entry) throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+        await this.insertTenantBackupCatalogEvictionInTransaction(
+          conn,
+          BackupCatalog.tenantBackupCatalogEvictionFromExternalEvent({
+            entry,
+            acknowledgement: event.result,
+            evictedAtDbMs: await this.databaseNow(conn),
+          }),
+        );
+      }
+    }
+    return { disposition, value: event };
+  }
+
+  async mirrorTenantBackupCatalogEvent(
+    input: BackupCatalog.MirrorTenantBackupCatalogEventInput,
+  ): Promise<BackupCatalog.ExactReplay<BackupCatalog.TenantBackupCatalogExternalEvent>> {
+    const staged = structuredClone(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      if (staged.event.eventType === "restore_resolved") {
+        await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+        await conn.query<Row[]>(
+          `SELECT restore_run_id FROM tenant_restore_replay_runs
+            WHERE BINARY restore_run_id=BINARY ? FOR SHARE`,
+          [staged.event.result.restoreRunId],
+        );
+      }
+      const projection = await this.assertTenantBackupCatalogProjection(conn, "FOR UPDATE");
+      const result = await this.mirrorTenantBackupCatalogEventInTransaction(
+        conn,
+        projection,
+        staged,
+      );
+      await this.assertTenantBackupCatalogProjection(conn);
+      await conn.commit();
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantBackupCatalogControl(
+  ): Promise<BackupCatalog.TenantBackupCatalogControlRecord> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.assertTenantBackupCatalogProjection(conn)).control
+    ));
+  }
+
+  async activateTenantBackupCatalogControl(
+    input: BackupCatalog.ActivateTenantBackupCatalogControlInput,
+  ): Promise<BackupCatalog.ExactReplay<BackupCatalog.ActiveTenantBackupCatalogControlRecord>> {
+    const staged = structuredClone(input);
+    BackupCatalog.validateActivateTenantBackupCatalogControlInput(staged);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      const [pendingRows] = await conn.query<Row[]>(
+        `SELECT restore_run_id FROM tenant_restore_replay_runs
+          WHERE phase IN ('prepared','replay_sealed') LIMIT 1 FOR UPDATE`,
+      );
+      const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      const blobStorageControl = await this.readBlobStorageControl(conn, "FOR SHARE");
+      const projection = await this.assertTenantBackupCatalogProjection(conn, "FOR UPDATE");
+      const current = projection.control;
+      if (current.state === "active") {
+        if (current.adapterProtocol !== staged.adapterProtocol
+          || current.catalogNamespaceSha256 !== staged.catalogNamespaceSha256
+          || current.catalogTargetSha256 !== staged.catalogTargetSha256
+          || current.failureDomainSha256 !== staged.failureDomainSha256
+          || current.logicalDatabaseNamespaceSha256
+            !== staged.logicalDatabaseNamespaceSha256
+          || current.journalControlEvidenceSha256 !== staged.journalControlEvidenceSha256
+          || current.retentionPolicySha256 !== staged.retentionPolicySha256
+          || current.minimumRetentionMs !== staged.minimumRetentionMs
+          || current.minimumRecoverableBackups !== staged.minimumRecoverableBackups) {
+          throw new BackupCatalog.TenantBackupCatalogConflictError();
+        }
+        await conn.commit();
+        return { disposition: "exact_replay", value: current };
+      }
+      if (journal.control.controlGeneration !== 1
+        || journal.control.evidenceSha256 !== staged.journalControlEvidenceSha256
+        || journal.control.logicalDatabaseNamespaceSha256
+          !== staged.logicalDatabaseNamespaceSha256
+        || runtime.control.state !== "active"
+        || runtime.control.logicalDatabaseNamespaceSha256
+          !== staged.logicalDatabaseNamespaceSha256
+        || runtime.control.controlEvidenceSha256 !== staged.journalControlEvidenceSha256
+        || blobStorageControl.controlGeneration !== 1) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError(
+          "journal_runtime_or_blob_not_ready",
+        );
+      }
+      if (pendingRows[0]) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("restore_run_pending");
+      }
+      const activatedAtDbMs = await this.databaseNow(conn);
+      const body = {
+        singletonId: BackupCatalog.TENANT_BACKUP_CATALOG_CONTROL_SINGLETON_ID,
+        state: "active" as const,
+        controlGeneration: 1 as const,
+        protocol: BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+        adapterProtocol: staged.adapterProtocol,
+        catalogNamespaceSha256: staged.catalogNamespaceSha256,
+        catalogTargetSha256: staged.catalogTargetSha256,
+        failureDomainSha256: staged.failureDomainSha256,
+        logicalDatabaseNamespaceSha256: staged.logicalDatabaseNamespaceSha256,
+        journalControlEvidenceSha256: staged.journalControlEvidenceSha256,
+        retentionPolicySha256: staged.retentionPolicySha256,
+        minimumRetentionMs: staged.minimumRetentionMs,
+        minimumRecoverableBackups: staged.minimumRecoverableBackups,
+        activatedAtDbMs,
+      };
+      const active: BackupCatalog.ActiveTenantBackupCatalogControlRecord = {
+        ...body,
+        evidenceSha256: BackupCatalog.tenantBackupCatalogControlEvidenceSha256(body),
+      };
+      BackupCatalog.validateTenantBackupCatalogControlRecord(active);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE backup_catalog_control
+            SET state='active',control_generation=1,protocol=?,adapter_protocol=?,
+                catalog_namespace_sha256=?,catalog_target_sha256=?,failure_domain_sha256=?,
+                logical_database_namespace_sha256=?,journal_control_evidence_sha256=?,
+                retention_policy_sha256=?,minimum_retention_ms=?,
+                minimum_recoverable_backups=?,activated_at_db_ms=?,evidence_sha256=?
+          WHERE singleton_id=1 AND state='inactive' AND control_generation=0`,
+        [
+          active.protocol,
+          active.adapterProtocol,
+          active.catalogNamespaceSha256,
+          active.catalogTargetSha256,
+          active.failureDomainSha256,
+          active.logicalDatabaseNamespaceSha256,
+          active.journalControlEvidenceSha256,
+          active.retentionPolicySha256,
+          active.minimumRetentionMs,
+          active.minimumRecoverableBackups,
+          active.activatedAtDbMs,
+          active.evidenceSha256,
+        ],
+      );
+      if (updated.affectedRows !== 1) throw new BackupCatalog.TenantBackupCatalogConflictError();
+      const verified = await this.assertTenantBackupCatalogProjection(conn);
+      if (verified.control.state !== "active"
+        || verified.control.evidenceSha256 !== active.evidenceSha256) {
+        throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+      }
+      await conn.commit();
+      return { disposition: "created", value: verified.control };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async createTenantBackupSnapshotAnchor(
+    input: BackupCatalog.CreateTenantBackupSnapshotAnchorInput,
+  ): Promise<BackupCatalog.ExactReplay<BackupCatalog.TenantBackupSnapshotAnchor>> {
+    const staged = structuredClone(input);
+    BackupCatalog.validateCreateTenantBackupSnapshotAnchorInput(staged);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      const [pendingRows] = await conn.query<Row[]>(
+        `SELECT restore_run_id FROM tenant_restore_replay_runs
+          WHERE phase IN ('prepared','replay_sealed') LIMIT 1 FOR UPDATE`,
+      );
+      const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      const blobControl = await this.readBlobStorageControl(conn, "FOR SHARE");
+      const [migrationRows] = await conn.query<Row[]>(
+        "SELECT name FROM schema_migrations ORDER BY BINARY name FOR SHARE",
+      );
+      const schemaMigrationRootSha256 = BackupCatalog.tenantBackupSchemaMigrationRootSha256(
+        migrationRows.map((row) => String(row.name)),
+      );
+      const projection = await this.assertTenantBackupCatalogProjection(conn, "FOR UPDATE");
+      const control = projection.control;
+      if (control.state !== "active" || staged.controlEvidenceSha256 !== control.evidenceSha256) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("catalog_control_inactive");
+      }
+      const existing = projection.anchors.get(staged.backupId);
+      if (existing) {
+        if (existing.controlEvidenceSha256 !== staged.controlEvidenceSha256) {
+          throw new BackupCatalog.TenantBackupCatalogConflictError();
+        }
+        await conn.commit();
+        return { disposition: "exact_replay", value: existing };
+      }
+      if (journal.control.controlGeneration !== 1
+        || journal.control.evidenceSha256 !== control.journalControlEvidenceSha256
+        || runtime.control.state !== "active"
+        || runtime.control.logicalDatabaseNamespaceSha256
+          !== control.logicalDatabaseNamespaceSha256
+        || runtime.control.controlEvidenceSha256 !== control.journalControlEvidenceSha256
+        || runtime.heads.length !== runtime.control.targetCount) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("runtime_lineage_mismatch");
+      }
+      if (blobControl.controlGeneration !== 1) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("blob_control_mismatch");
+      }
+      const activeExternalReservations = new Set<string>();
+      for (const event of projection.externalEvents.values()) {
+        if (event.eventType === "restore_reserved") {
+          activeExternalReservations.add(event.result.restoreRunId);
+        } else if (event.eventType === "restore_resolved") {
+          activeExternalReservations.delete(event.result.restoreRunId);
+        }
+      }
+      if (pendingRows[0] || activeExternalReservations.size > 0) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("restore_run_pending");
+      }
+      const createdAtDbMs = await this.databaseNow(conn);
+      const retentionUntilDbMs = createdAtDbMs + control.minimumRetentionMs;
+      if (!Number.isSafeInteger(retentionUntilDbMs)) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError("retention deadline overflow");
+      }
+      const body = {
+        scope: BackupCatalog.TENANT_BACKUP_SNAPSHOT_ANCHOR_SCOPE,
+        protocol: BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+        backupKind: "full" as const,
+        backupId: staged.backupId,
+        controlEvidenceSha256: control.evidenceSha256,
+        logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+        journalControlEvidenceSha256: control.journalControlEvidenceSha256,
+        sourceRuntimeEpochSha256: runtime.control.runtimeEpochSha256,
+        sourceRuntimeControlGeneration: runtime.control.controlGeneration,
+        sourceRuntimeControlEvidenceSha256: runtime.control.evidenceSha256,
+        sourceRuntimeTargetCount: runtime.control.targetCount,
+        sourceRuntimeHeads: structuredClone(runtime.heads),
+        sourceRuntimeHeadRootSha256: runtime.control.verifiedHeadRootSha256,
+        schemaMigrationRootSha256,
+        blobStorageControlEvidenceSha256: blobControl.evidenceSha256,
+        sourceCatalogSequence: projection.catalogSequence,
+        sourceCatalogEventRootSha256: projection.catalogEventRootSha256,
+        retentionUntilDbMs,
+        createdAtDbMs,
+      };
+      const anchor: BackupCatalog.TenantBackupSnapshotAnchor = {
+        ...body,
+        anchorSha256: BackupCatalog.tenantBackupSnapshotAnchorSha256(body),
+      };
+      BackupCatalog.validateTenantBackupSnapshotAnchor(anchor);
+      await conn.query(
+        `INSERT INTO backup_snapshot_anchors
+           (backup_id,singleton_id,scope,protocol,backup_kind,control_evidence_sha256,
+            logical_database_namespace_sha256,journal_control_evidence_sha256,
+            source_runtime_epoch_sha256,source_runtime_control_generation,
+            source_runtime_control_evidence_sha256,source_runtime_target_count,
+            source_runtime_head_catalog_json,source_runtime_head_root_sha256,
+            schema_migration_root_sha256,blob_storage_control_evidence_sha256,
+            source_catalog_sequence,source_catalog_event_root_sha256,
+            retention_until_db_ms,created_at_db_ms,anchor_sha256)
+         VALUES (?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          anchor.backupId,
+          anchor.scope,
+          anchor.protocol,
+          anchor.backupKind,
+          anchor.controlEvidenceSha256,
+          anchor.logicalDatabaseNamespaceSha256,
+          anchor.journalControlEvidenceSha256,
+          anchor.sourceRuntimeEpochSha256,
+          anchor.sourceRuntimeControlGeneration,
+          anchor.sourceRuntimeControlEvidenceSha256,
+          anchor.sourceRuntimeTargetCount,
+          json(anchor.sourceRuntimeHeads),
+          anchor.sourceRuntimeHeadRootSha256,
+          anchor.schemaMigrationRootSha256,
+          anchor.blobStorageControlEvidenceSha256,
+          anchor.sourceCatalogSequence,
+          anchor.sourceCatalogEventRootSha256,
+          anchor.retentionUntilDbMs,
+          anchor.createdAtDbMs,
+          anchor.anchorSha256,
+        ],
+      );
+      const verified = await this.assertTenantBackupCatalogProjection(conn);
+      const stored = verified.anchors.get(anchor.backupId);
+      if (!stored || stored.anchorSha256 !== anchor.anchorSha256) {
+        throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+      }
+      await conn.commit();
+      return { disposition: "created", value: stored };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantBackupSnapshotAnchor(
+    backupId: string,
+  ): Promise<BackupCatalog.TenantBackupSnapshotAnchor | null> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.assertTenantBackupCatalogProjection(conn)).anchors.get(backupId) ?? null
+    ));
+  }
+
+  async recordTenantBackupCatalogAvailability(
+    result: BackupCatalog.TenantBackupAvailabilityAdapterResult,
+  ): Promise<BackupCatalog.ExactReplay<BackupCatalog.TenantBackupCatalogEntry>> {
+    const staged = structuredClone(result);
+    BackupCatalog.validateTenantBackupAvailabilityAdapterResult(staged);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const projection = await this.assertTenantBackupCatalogProjection(conn, "FOR UPDATE");
+      const control = projection.control;
+      if (control.state !== "active") {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("catalog_control_inactive");
+      }
+      const anchor = projection.anchors.get(staged.backupId);
+      if (!anchor || anchor.anchorSha256 !== staged.anchorSha256
+        || staged.adapterProtocol !== control.adapterProtocol
+        || staged.catalogNamespaceSha256 !== control.catalogNamespaceSha256
+        || staged.catalogTargetSha256 !== control.catalogTargetSha256
+        || staged.failureDomainSha256 !== control.failureDomainSha256
+        || staged.controlEvidenceSha256 !== control.evidenceSha256
+        || staged.logicalDatabaseNamespaceSha256
+          !== control.logicalDatabaseNamespaceSha256
+        || staged.retentionPolicySha256 !== control.retentionPolicySha256
+        || staged.retentionUntilDbMs !== anchor.retentionUntilDbMs
+        || staged.registeredAtDbMs !== anchor.createdAtDbMs) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      const mirrored = await this.mirrorTenantBackupCatalogEventInTransaction(
+        conn,
+        projection,
+        {
+          adapterProtocol: control.adapterProtocol,
+          catalogNamespaceSha256: control.catalogNamespaceSha256,
+          catalogTargetSha256: control.catalogTargetSha256,
+          failureDomainSha256: control.failureDomainSha256,
+          event: { eventType: "backup_recoverable", result: staged },
+        },
+      );
+      const verified = await this.assertTenantBackupCatalogProjection(conn);
+      const stored = verified.entries.get(staged.backupId);
+      if (!stored || stored.entrySha256 !== staged.entrySha256) {
+        throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+      }
+      await conn.commit();
+      return { disposition: mirrored.disposition, value: stored };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantBackupCatalogEntry(
+    backupId: string,
+  ): Promise<BackupCatalog.TenantBackupCatalogEntry | null> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.assertTenantBackupCatalogProjection(conn)).entries.get(backupId) ?? null
+    ));
+  }
+
+  async listRecoverableTenantBackups(options: {
+    limit: number;
+    afterBackupId?: string;
+  }): Promise<BackupCatalog.TenantBackupCatalogEntry[]> {
+    const expected = options.afterBackupId === undefined ? ["limit"] : ["afterBackupId", "limit"];
+    const actual = Object.keys(options).sort();
+    if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])
+      || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1_000
+      || (options.afterBackupId !== undefined
+        && !options.afterBackupId.startsWith("backup_"))) {
+      throw new Error("invalid tenant backup catalog list options");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const projection = await this.assertTenantBackupCatalogProjection(conn);
+      const evictedBackupIds = new Set([...projection.externalEvents.values()].flatMap((event) => (
+        event.eventType === "backup_evicted" ? [event.result.backupId] : []
+      )));
+      return [...projection.entries.values()]
+        .filter((entry) => !evictedBackupIds.has(entry.backupId))
+        .sort((left, right) => left.backupId.localeCompare(right.backupId))
+        .filter((entry) => entry.backupId > (options.afterBackupId ?? ""))
+      .slice(0, options.limit);
+    });
+  }
+
+  async preflightTenantRestoreReplayFromBackup(
+    input: BackupCatalog.PreflightTenantRestoreReplayFromBackupInput,
+  ): Promise<BackupCatalog.TenantBackupCatalogEntry> {
+    const staged = structuredClone(input);
+    BackupCatalog.validatePreflightTenantRestoreReplayFromBackupInput(staged);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      const [legacyRunRows] = await conn.query<Row[]>(
+        `SELECT restore_run_id FROM tenant_restore_replay_runs
+          WHERE BINARY restore_run_id=BINARY ? OR runtime_epoch_sha256=?
+          LIMIT 1 FOR SHARE`,
+        [staged.restoreRunId, staged.runtimeEpochSha256],
+      );
+      const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      const [usedEpochRows] = await conn.query<Row[]>(
+        `SELECT control_generation FROM tenant_restore_runtime_events
+          WHERE activation_epoch_sha256=? LIMIT 1 FOR SHARE`,
+        [staged.runtimeEpochSha256],
+      );
+      const projection = await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE");
+      if (projection.control.state !== "active") {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("catalog_control_inactive");
+      }
+      const entry = projection.entries.get(staged.backupId);
+      const anchor = projection.anchors.get(staged.backupId);
+      const events = [...projection.externalEvents.values()]
+        .sort((left, right) => left.result.catalogSequence - right.result.catalogSequence);
+      if (!entry || !anchor || anchor.anchorSha256 !== entry.anchorSha256
+        || events.some((event) => event.eventType === "backup_evicted"
+          && event.result.backupId === staged.backupId)) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("backup_not_recoverable");
+      }
+      const activeReservations = new Map<string, Extract<
+        BackupCatalog.TenantBackupCatalogExternalEvent,
+        { eventType: "restore_reserved" }
+      >["result"]>();
+      for (const event of events) {
+        if (event.eventType === "restore_reserved") {
+          activeReservations.set(event.result.restoreRunId, event.result);
+        } else if (event.eventType === "restore_resolved") {
+          activeReservations.delete(event.result.restoreRunId);
+        }
+      }
+      const active = [...activeReservations.values()][0];
+      const activeIsExact = active !== undefined
+        && active.backupId === entry.backupId
+        && active.restoreRunId === staged.restoreRunId
+        && active.entrySha256 === entry.entrySha256
+        && active.runtimeEpochSha256 === staged.runtimeEpochSha256;
+      if (active && !activeIsExact) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("restore_reservation_active");
+      }
+      const binding = projection.bindings.get(staged.restoreRunId);
+      const reservation = projection.reservations.get(staged.restoreRunId);
+      if (binding || reservation) {
+        if (!binding || !reservation || reservation.phase !== "reserved" || !activeIsExact
+          || binding.backupId !== entry.backupId
+          || binding.entrySha256 !== entry.entrySha256
+          || binding.runtimeEpochSha256 !== staged.runtimeEpochSha256
+          || reservation.backupId !== entry.backupId
+          || reservation.entrySha256 !== entry.entrySha256
+          || reservation.runtimeEpochSha256 !== staged.runtimeEpochSha256) {
+          throw new BackupCatalog.TenantBackupCatalogConflictError();
+        }
+        await conn.commit();
+        return entry;
+      }
+      const requestedIdentityWasUsed = events.some((event) => event.eventType === "restore_reserved"
+        && (event.result.restoreRunId === staged.restoreRunId
+          || event.result.runtimeEpochSha256 === staged.runtimeEpochSha256));
+      if ((requestedIdentityWasUsed && !activeIsExact)
+        || legacyRunRows[0]
+        || usedEpochRows[0]
+        || (runtime.control.state === "active"
+          && runtime.control.runtimeEpochSha256 === staged.runtimeEpochSha256)) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      await conn.commit();
+      return entry;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async prepareTenantRestoreReplayFromBackup(
+    input: BackupCatalog.PrepareTenantRestoreReplayFromBackupInput,
+  ): Promise<BackupCatalog.ExactReplay<BackupCatalog.PrepareTenantRestoreReplayFromBackupValue>> {
+    const staged = structuredClone(input);
+    const keys = Object.keys(staged).sort();
+    const expectedKeys = [
+      "backupId", "controlEvidenceSha256", "reservation", "restoreRunId", "runtimeEpochSha256",
+      "sealedTargets",
+    ];
+    if (keys.length !== expectedKeys.length
+      || keys.some((key, index) => key !== expectedKeys[index])) {
+      throw new Error("tenant backup restore prepare input has unknown or missing fields");
+    }
+    BackupCatalog.validateTenantBackupRuntimeReservationAdapterResult(staged.reservation);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      const [legacyRunRows] = await conn.query<Row[]>(
+        `SELECT restore_run_id FROM tenant_restore_replay_runs
+          WHERE BINARY restore_run_id=BINARY ? OR runtime_epoch_sha256=?
+          LIMIT 1 FOR UPDATE`,
+        [staged.restoreRunId, staged.runtimeEpochSha256],
+      );
+      // Keep the restore lock order aligned with the legacy prepare path:
+      // journal -> exact run/epoch -> pending-run range -> catalog.  The
+      // catalog-bound helper repeats this lookup after the catalog lock, so
+      // taking it here closes the inverse pending-run/catalog deadlock window.
+      await conn.query<Row[]>(
+        `SELECT restore_run_id FROM tenant_restore_replay_runs
+          WHERE phase IN ('prepared','replay_sealed') LIMIT 1 FOR UPDATE`,
+      );
+      const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      const [usedEpochRows] = await conn.query<Row[]>(
+        `SELECT control_generation FROM tenant_restore_runtime_events
+          WHERE activation_epoch_sha256=? LIMIT 1 FOR SHARE`,
+        [staged.runtimeEpochSha256],
+      );
+      const projection = await this.assertTenantBackupCatalogProjection(conn, "FOR UPDATE");
+      const control = projection.control;
+      if (control.state !== "active"
+        || staged.controlEvidenceSha256 !== control.journalControlEvidenceSha256
+        || journal.control.controlGeneration !== 1
+        || journal.control.evidenceSha256 !== control.journalControlEvidenceSha256) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError(
+          "catalog_or_journal_control_mismatch",
+        );
+      }
+      const entry = projection.entries.get(staged.backupId);
+      const anchor = projection.anchors.get(staged.backupId);
+      const evicted = [...projection.externalEvents.values()].some((event) => (
+        event.eventType === "backup_evicted" && event.result.backupId === staged.backupId
+      ));
+      if (!entry || !anchor || anchor.anchorSha256 !== entry.anchorSha256 || evicted) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("backup_not_recoverable");
+      }
+      const adapter = staged.reservation;
+      if (adapter.adapterProtocol !== control.adapterProtocol
+        || adapter.catalogNamespaceSha256 !== control.catalogNamespaceSha256
+        || adapter.catalogTargetSha256 !== control.catalogTargetSha256
+        || adapter.backupId !== staged.backupId
+        || adapter.restoreRunId !== staged.restoreRunId
+        || adapter.entrySha256 !== entry.entrySha256
+        || adapter.runtimeEpochSha256 !== staged.runtimeEpochSha256) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      const existingBinding = projection.bindings.get(staged.restoreRunId);
+      const existingReservation = projection.reservations.get(staged.restoreRunId);
+      if (existingBinding || existingReservation) {
+        if (!existingBinding || !existingReservation
+          || existingReservation.phase !== "reserved"
+          || [...projection.externalEvents.values()].some((event) => (
+            event.eventType === "restore_resolved"
+              && event.result.restoreRunId === staged.restoreRunId
+          ))
+          || existingBinding.backupId !== staged.backupId
+          || existingBinding.entrySha256 !== entry.entrySha256
+          || existingBinding.runtimeEpochSha256 !== staged.runtimeEpochSha256
+          || existingReservation.reservationOperationSha256
+            !== adapter.reservationOperationSha256
+          || existingReservation.reservationReceiptSha256 !== adapter.reservationReceiptSha256
+          || existingReservation.catalogSequence !== adapter.catalogSequence
+          || existingReservation.previousCatalogEventRootSha256
+            !== adapter.previousCatalogEventRootSha256
+          || existingReservation.catalogEventRootSha256 !== adapter.catalogEventRootSha256
+          || existingReservation.catalogEventSha256 !== adapter.catalogEventSha256) {
+          throw new BackupCatalog.TenantBackupCatalogConflictError();
+        }
+        const replayRun = await this.prepareTenantRestoreReplayInTransaction(conn, {
+          restoreRunId: staged.restoreRunId,
+          sourceBackupSha256: entry.sourceBackupSha256,
+          runtimeEpochSha256: staged.runtimeEpochSha256,
+          controlEvidenceSha256: staged.controlEvidenceSha256,
+          sealedTargets: staged.sealedTargets,
+        }, true);
+        await conn.commit();
+        return {
+          disposition: "exact_replay",
+          value: {
+            binding: existingBinding,
+            reservation: existingReservation,
+            replayRun,
+          },
+        };
+      }
+      if (legacyRunRows[0]
+        || usedEpochRows[0]
+        || (runtime.control.state === "active"
+          && runtime.control.runtimeEpochSha256 === staged.runtimeEpochSha256)) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      const boundAtDbMs = await this.databaseNow(conn);
+      const sealedTargetRootSha256 =
+        RestoreJournal.tenantRestoreReplaySealedTargetRootSha256(staged.sealedTargets);
+      const bindingBody = {
+        scope: BackupCatalog.TENANT_BACKUP_RESTORE_BINDING_SCOPE,
+        protocol: BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+        restoreRunId: staged.restoreRunId,
+        backupId: entry.backupId,
+        anchorSha256: entry.anchorSha256,
+        entrySha256: entry.entrySha256,
+        sourceSnapshotSha256: entry.sourceSnapshotSha256,
+        sourceBackupSha256: entry.sourceBackupSha256,
+        artifactManifestSha256: entry.artifactManifestSha256,
+        providerEvidenceSha256: entry.providerEvidenceSha256,
+        controlEvidenceSha256: control.evidenceSha256,
+        journalControlEvidenceSha256: control.journalControlEvidenceSha256,
+        sealedTargetRootSha256,
+        runtimeEpochSha256: staged.runtimeEpochSha256,
+        reservationReceiptSha256: adapter.reservationReceiptSha256,
+        selectedCatalogSequence: entry.catalogSequence,
+        selectedCatalogEventRootSha256: entry.catalogEventRootSha256,
+        boundAtDbMs,
+      };
+      const binding: BackupCatalog.TenantBackupRestoreSourceBinding = {
+        ...bindingBody,
+        bindingSha256: BackupCatalog.tenantBackupRestoreSourceBindingSha256(bindingBody),
+      };
+      BackupCatalog.validateTenantBackupRestoreSourceBinding(binding);
+      const reservationBody = {
+        scope: BackupCatalog.TENANT_BACKUP_RUNTIME_RESERVATION_SCOPE,
+        protocol: BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+        restoreRunId: staged.restoreRunId,
+        backupId: entry.backupId,
+        entrySha256: entry.entrySha256,
+        bindingSha256: binding.bindingSha256,
+        runtimeEpochSha256: staged.runtimeEpochSha256,
+        reservationOperationSha256: adapter.reservationOperationSha256,
+        reservationReceiptSha256: adapter.reservationReceiptSha256,
+        catalogSequence: adapter.catalogSequence,
+        previousCatalogEventRootSha256: adapter.previousCatalogEventRootSha256,
+        catalogEventRootSha256: adapter.catalogEventRootSha256,
+        catalogEventSha256: adapter.catalogEventSha256,
+        reservedAtDbMs: boundAtDbMs,
+      };
+      const reservation: BackupCatalog.TenantBackupRuntimeReservation = {
+        ...reservationBody,
+        reservationSha256: BackupCatalog.tenantBackupRuntimeReservationSha256(reservationBody),
+        phase: "reserved",
+      };
+      BackupCatalog.validateTenantBackupRuntimeReservation(reservation);
+      await this.mirrorTenantBackupCatalogEventInTransaction(conn, projection, {
+        adapterProtocol: control.adapterProtocol,
+        catalogNamespaceSha256: control.catalogNamespaceSha256,
+        catalogTargetSha256: control.catalogTargetSha256,
+        failureDomainSha256: control.failureDomainSha256,
+        event: { eventType: "restore_reserved", result: adapter },
+      });
+      await conn.query(
+        `INSERT INTO backup_restore_source_bindings
+           (restore_run_id,backup_id,scope,protocol,anchor_sha256,entry_sha256,
+            source_snapshot_sha256,source_backup_sha256,artifact_manifest_sha256,
+            provider_evidence_sha256,control_evidence_sha256,journal_control_evidence_sha256,
+            sealed_target_root_sha256,runtime_epoch_sha256,reservation_receipt_sha256,
+            selected_catalog_sequence,selected_catalog_event_root_sha256,bound_at_db_ms,
+            binding_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          binding.restoreRunId,
+          binding.backupId,
+          binding.scope,
+          binding.protocol,
+          binding.anchorSha256,
+          binding.entrySha256,
+          binding.sourceSnapshotSha256,
+          binding.sourceBackupSha256,
+          binding.artifactManifestSha256,
+          binding.providerEvidenceSha256,
+          binding.controlEvidenceSha256,
+          binding.journalControlEvidenceSha256,
+          binding.sealedTargetRootSha256,
+          binding.runtimeEpochSha256,
+          binding.reservationReceiptSha256,
+          binding.selectedCatalogSequence,
+          binding.selectedCatalogEventRootSha256,
+          binding.boundAtDbMs,
+          binding.bindingSha256,
+        ],
+      );
+      await conn.query(
+        `INSERT INTO backup_runtime_reservations
+           (runtime_epoch_sha256,restore_run_id,backup_id,scope,protocol,entry_sha256,
+            binding_sha256,reservation_operation_sha256,reservation_receipt_sha256,
+            catalog_sequence,previous_catalog_event_root_sha256,catalog_event_root_sha256,
+            catalog_event_sha256,phase,reserved_at_db_ms,resolution_operation_sha256,
+            resolution_receipt_sha256,resolution_catalog_sequence,
+            resolution_previous_catalog_event_root_sha256,resolution_catalog_event_root_sha256,
+            resolution_catalog_event_sha256,resolved_at_db_ms,reservation_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'reserved',?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?)`,
+        [
+          reservation.runtimeEpochSha256,
+          reservation.restoreRunId,
+          reservation.backupId,
+          reservation.scope,
+          reservation.protocol,
+          reservation.entrySha256,
+          reservation.bindingSha256,
+          reservation.reservationOperationSha256,
+          reservation.reservationReceiptSha256,
+          reservation.catalogSequence,
+          reservation.previousCatalogEventRootSha256,
+          reservation.catalogEventRootSha256,
+          reservation.catalogEventSha256,
+          reservation.reservedAtDbMs,
+          reservation.reservationSha256,
+        ],
+      );
+      const replayRun = await this.prepareTenantRestoreReplayInTransaction(conn, {
+        restoreRunId: staged.restoreRunId,
+        sourceBackupSha256: entry.sourceBackupSha256,
+        runtimeEpochSha256: staged.runtimeEpochSha256,
+        controlEvidenceSha256: staged.controlEvidenceSha256,
+        sealedTargets: staged.sealedTargets,
+      }, true);
+      const verified = await this.assertTenantBackupCatalogProjection(conn);
+      const storedBinding = verified.bindings.get(binding.restoreRunId);
+      const storedReservation = verified.reservations.get(reservation.restoreRunId);
+      if (!storedBinding || !storedReservation
+        || storedBinding.bindingSha256 !== binding.bindingSha256
+        || storedReservation.reservationSha256 !== reservation.reservationSha256) {
+        throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+      }
+      await conn.commit();
+      return {
+        disposition: "created",
+        value: { binding: storedBinding, reservation: storedReservation, replayRun },
+      };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantBackupRestoreSourceBinding(
+    restoreRunId: string,
+  ): Promise<BackupCatalog.TenantBackupRestoreSourceBinding | null> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.assertTenantBackupCatalogProjection(conn)).bindings.get(restoreRunId) ?? null
+    ));
+  }
+
+  async getTenantBackupRuntimeReservation(
+    restoreRunId: string,
+  ): Promise<BackupCatalog.TenantBackupRuntimeReservation | null> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.assertTenantBackupCatalogProjection(conn)).reservations.get(restoreRunId) ?? null
+    ));
+  }
+
+  private tenantBackupRestoreBindingForTransition(
+    projection: TenantBackupCatalogProjection,
+    restoreRunId: string,
+    allowedExternalResolutionPhase?: "aborted",
+  ): BackupCatalog.TenantBackupRestoreSourceBinding | null {
+    if (projection.control.state === "inactive") return null;
+    const binding = projection.bindings.get(restoreRunId);
+    const reservation = projection.reservations.get(restoreRunId);
+    const run = projection.replayRuns.get(restoreRunId);
+    const externalResolution = [...projection.externalEvents.values()].find(
+      (event): event is Extract<BackupCatalog.TenantBackupCatalogExternalEvent, {
+        eventType: "restore_resolved";
+      }> => event.eventType === "restore_resolved"
+        && event.result.restoreRunId === restoreRunId,
+    );
+    if (!binding || !reservation || !run
+      || binding.runtimeEpochSha256 !== run.runtimeEpochSha256
+      || binding.sourceBackupSha256 !== run.sourceBackupSha256
+      || binding.sealedTargetRootSha256 !== run.sealedTargetRootSha256
+      || (run.phase !== "active" && reservation.phase !== "reserved")
+      || (run.phase === "active" && reservation.phase === "aborted")
+      || (reservation.phase === "reserved" && externalResolution !== undefined
+        && externalResolution.result.phase !== allowedExternalResolutionPhase)
+      || [...projection.externalEvents.values()].some((event) => (
+        event.eventType === "backup_evicted" && event.result.backupId === binding.backupId
+      ))) {
+      throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+    }
+    return binding;
+  }
+
+  async assertTenantBackupRestoreRunMaySeal(
+    restoreRunId: string,
+  ): Promise<BackupCatalog.TenantBackupRestoreSourceBinding | null> {
+    return this.withConsistentRead(async (conn) => this.tenantBackupRestoreBindingForTransition(
+      await this.assertTenantBackupCatalogProjection(conn),
+      restoreRunId,
+    ));
+  }
+
+  async assertTenantBackupRestoreRunMayActivate(
+    restoreRunId: string,
+  ): Promise<BackupCatalog.TenantBackupRestoreSourceBinding | null> {
+    return this.assertTenantBackupRestoreRunMaySeal(restoreRunId);
+  }
+
+  async resolveTenantBackupRuntimeReservation(
+    input: BackupCatalog.ResolveTenantBackupRuntimeReservationInput,
+  ): Promise<BackupCatalog.ExactReplay<BackupCatalog.TenantBackupRuntimeReservation>> {
+    const staged = structuredClone(input);
+    const expectedKeys = [
+      "catalogEventRootSha256", "catalogEventSha256", "catalogSequence", "phase",
+      "previousCatalogEventRootSha256", "reservationReceiptSha256",
+      "resolutionOperationSha256", "resolutionReceiptSha256", "restoreRunId",
+    ];
+    const keys = Object.keys(staged).sort();
+    if (keys.length !== expectedKeys.length
+      || keys.some((key, index) => key !== expectedKeys[index])
+      || (staged.phase !== "activated" && staged.phase !== "aborted")) {
+      throw new Error("invalid tenant backup reservation resolution input");
+    }
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      await conn.query<Row[]>(
+        `SELECT restore_run_id FROM tenant_restore_replay_runs
+          WHERE BINARY restore_run_id=BINARY ? FOR SHARE`,
+        [staged.restoreRunId],
+      );
+      const projection = await this.assertTenantBackupCatalogProjection(conn, "FOR UPDATE");
+      const reservation = projection.reservations.get(staged.restoreRunId);
+      const run = projection.replayRuns.get(staged.restoreRunId);
+      if (!reservation || !run) throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+      if (reservation.phase !== "reserved") {
+        if (reservation.phase !== staged.phase
+          || reservation.reservationReceiptSha256 !== staged.reservationReceiptSha256
+          || reservation.resolutionOperationSha256 !== staged.resolutionOperationSha256
+          || reservation.resolutionReceiptSha256 !== staged.resolutionReceiptSha256
+          || reservation.resolutionCatalogSequence !== staged.catalogSequence
+          || reservation.resolutionPreviousCatalogEventRootSha256
+            !== staged.previousCatalogEventRootSha256
+          || reservation.resolutionCatalogEventRootSha256 !== staged.catalogEventRootSha256
+          || reservation.resolutionCatalogEventSha256 !== staged.catalogEventSha256) {
+          throw new BackupCatalog.TenantBackupCatalogConflictError();
+        }
+        await conn.commit();
+        return { disposition: "exact_replay", value: reservation };
+      }
+      if ((staged.phase === "activated" && run.phase !== "active")
+        || (staged.phase === "aborted" && run.phase !== "aborted")) {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("restore_run_not_terminal");
+      }
+      const expectedOperation = BackupCatalog.tenantBackupReservationResolutionOperationSha256({
+        restoreRunId: reservation.restoreRunId,
+        reservationReceiptSha256: reservation.reservationReceiptSha256,
+        phase: staged.phase,
+      });
+      if (staged.reservationReceiptSha256 !== reservation.reservationReceiptSha256
+        || staged.resolutionOperationSha256 !== expectedOperation) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      BackupCatalog.validateTenantBackupCatalogEventProof({
+        catalogSequence: staged.catalogSequence,
+        previousCatalogEventRootSha256: staged.previousCatalogEventRootSha256,
+        catalogEventRootSha256: staged.catalogEventRootSha256,
+        catalogEventSha256: staged.catalogEventSha256,
+      }, BackupCatalog.tenantBackupCatalogEventSha256({
+        eventType: "restore_resolved",
+        operationSha256: staged.resolutionOperationSha256,
+        receiptSha256: staged.resolutionReceiptSha256,
+      }));
+      const control = projection.control;
+      if (control.state !== "active") {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("catalog_control_inactive");
+      }
+      const mirrored = await this.mirrorTenantBackupCatalogEventInTransaction(conn, projection, {
+        adapterProtocol: control.adapterProtocol,
+        catalogNamespaceSha256: control.catalogNamespaceSha256,
+        catalogTargetSha256: control.catalogTargetSha256,
+        failureDomainSha256: control.failureDomainSha256,
+        event: { eventType: "restore_resolved", result: staged },
+      });
+      const verified = await this.assertTenantBackupCatalogProjection(conn);
+      const resolved = verified.reservations.get(reservation.restoreRunId);
+      if (!resolved || resolved.phase !== staged.phase) {
+        throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+      }
+      await conn.commit();
+      return { disposition: mirrored.disposition, value: resolved };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  private async prepareTenantBackupEvictionInTransaction(
+    conn: PoolConnection,
+    input: BackupCatalog.PrepareTenantBackupEvictionInput,
+    projection: TenantBackupCatalogProjection,
+  ): Promise<BackupCatalog.TenantBackupEvictionPlan> {
+    const staged = structuredClone(input);
+    const keys = Object.keys(staged).sort();
+    if (keys.length !== 2 || keys[0] !== "backupId" || keys[1] !== "evictionId") {
+      throw new Error("invalid tenant backup eviction prepare input");
+    }
+    if (projection.control.state !== "active") {
+      throw new BackupCatalog.TenantBackupCatalogNotReadyError("catalog_control_inactive");
+    }
+    const entry = projection.entries.get(staged.backupId);
+    const events = [...projection.externalEvents.values()];
+    const evictedBackupIds = new Set(events.flatMap((event) => (
+      event.eventType === "backup_evicted" ? [event.result.backupId] : []
+    )));
+    if (!entry || evictedBackupIds.has(staged.backupId)) {
+      throw new BackupCatalog.TenantBackupCatalogNotReadyError("backup_not_recoverable");
+    }
+    if (events.some((event) => event.eventType === "backup_evicted"
+      && event.result.evictionId === staged.evictionId)) {
+      throw new BackupCatalog.TenantBackupCatalogConflictError();
+    }
+    const nowMs = await this.databaseNow(conn);
+    if (nowMs < entry.retentionUntilDbMs) {
+      throw new BackupCatalog.TenantBackupCatalogNotReadyError("retention_not_elapsed");
+    }
+    const activeReservations = new Map<string, string>();
+    for (const event of events) {
+      if (event.eventType === "restore_reserved") {
+        activeReservations.set(event.result.restoreRunId, event.result.backupId);
+      } else if (event.eventType === "restore_resolved") {
+        activeReservations.delete(event.result.restoreRunId);
+      }
+    }
+    if ([...activeReservations.values()].includes(entry.backupId)) {
+      throw new BackupCatalog.TenantBackupCatalogNotReadyError("restore_reservation_active");
+    }
+    const recoverableCount = [...projection.entries.keys()].filter(
+      (backupId) => !evictedBackupIds.has(backupId),
+    ).length;
+    if (recoverableCount - 1 < projection.control.minimumRecoverableBackups) {
+      throw new BackupCatalog.TenantBackupCatalogNotReadyError("minimum_recoverable_backups");
+    }
+    const source = {
+      evictionId: staged.evictionId,
+      backupId: entry.backupId,
+      anchorSha256: entry.anchorSha256,
+      entrySha256: entry.entrySha256,
+      sourceSnapshotSha256: entry.sourceSnapshotSha256,
+      sourceBackupSha256: entry.sourceBackupSha256,
+      artifactManifestSha256: entry.artifactManifestSha256,
+      providerEvidenceSha256: entry.providerEvidenceSha256,
+      controlEvidenceSha256: projection.control.evidenceSha256,
+      retentionPolicySha256: projection.control.retentionPolicySha256,
+      retentionUntilDbMs: entry.retentionUntilDbMs,
+      expectedCatalogSequence: projection.catalogSequence,
+      expectedCatalogEventRootSha256: projection.catalogEventRootSha256,
+    };
+    const withOperation = {
+      ...source,
+      evictionOperationSha256: BackupCatalog.tenantBackupEvictionOperationSha256(source),
+    };
+    const plan: BackupCatalog.TenantBackupEvictionPlan = {
+      ...withOperation,
+      planSha256: BackupCatalog.tenantBackupEvictionPlanSha256(withOperation),
+    };
+    BackupCatalog.validateTenantBackupEvictionPlan(plan);
+    return plan;
+  }
+
+  async prepareTenantBackupEviction(
+    input: BackupCatalog.PrepareTenantBackupEvictionInput,
+  ): Promise<BackupCatalog.TenantBackupEvictionPlan> {
+    return this.withConsistentRead(async (conn) => this.prepareTenantBackupEvictionInTransaction(
+      conn,
+      input,
+      await this.assertTenantBackupCatalogProjection(conn),
+    ));
+  }
+
+  async recordTenantBackupCatalogEviction(
+    input: BackupCatalog.RecordTenantBackupCatalogEvictionInput,
+  ): Promise<BackupCatalog.ExactReplay<BackupCatalog.TenantBackupCatalogEviction>> {
+    const staged = structuredClone(input);
+    const keys = Object.keys(staged).sort();
+    if (keys.length !== 2 || keys[0] !== "acknowledgement" || keys[1] !== "plan") {
+      throw new Error("invalid tenant backup catalog eviction input");
+    }
+    BackupCatalog.validateTenantBackupEvictionPlan(staged.plan);
+    BackupCatalog.validateTenantBackupEvictionAdapterResult(staged.acknowledgement);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const projection = await this.assertTenantBackupCatalogProjection(conn, "FOR UPDATE");
+      const control = projection.control;
+      if (control.state !== "active") {
+        throw new BackupCatalog.TenantBackupCatalogNotReadyError("catalog_control_inactive");
+      }
+      const existing = projection.evictions.get(staged.plan.backupId);
+      if (existing) {
+        const acknowledgement = staged.acknowledgement;
+        if (acknowledgement.adapterProtocol !== control.adapterProtocol
+          || acknowledgement.catalogNamespaceSha256 !== control.catalogNamespaceSha256
+          || acknowledgement.catalogTargetSha256 !== control.catalogTargetSha256
+          || existing.evictionId !== acknowledgement.evictionId
+          || existing.backupId !== acknowledgement.backupId
+          || existing.planSha256 !== staged.plan.planSha256
+          || existing.planSha256 !== acknowledgement.planSha256
+          || existing.evictionOperationSha256 !== acknowledgement.evictionOperationSha256
+          || existing.acknowledgementReceiptSha256
+            !== acknowledgement.acknowledgementReceiptSha256
+          || existing.externalTombstoneSha256
+            !== acknowledgement.externalTombstoneSha256
+          || existing.observedAbsent !== acknowledgement.observedAbsent
+          || existing.catalogSequence !== acknowledgement.catalogSequence
+          || existing.previousCatalogEventRootSha256
+            !== acknowledgement.previousCatalogEventRootSha256
+          || existing.catalogEventRootSha256
+            !== acknowledgement.catalogEventRootSha256
+          || existing.catalogEventSha256 !== acknowledgement.catalogEventSha256) {
+          throw new BackupCatalog.TenantBackupCatalogConflictError();
+        }
+        await conn.commit();
+        return { disposition: "exact_replay", value: existing };
+      }
+      const currentPlan = await this.prepareTenantBackupEvictionInTransaction(
+        conn,
+        { evictionId: staged.plan.evictionId, backupId: staged.plan.backupId },
+        projection,
+      );
+      const acknowledgement = staged.acknowledgement;
+      if (currentPlan.planSha256 !== staged.plan.planSha256
+        || acknowledgement.adapterProtocol !== control.adapterProtocol
+        || acknowledgement.catalogNamespaceSha256 !== control.catalogNamespaceSha256
+        || acknowledgement.catalogTargetSha256 !== control.catalogTargetSha256
+        || acknowledgement.evictionId !== currentPlan.evictionId
+        || acknowledgement.backupId !== currentPlan.backupId
+        || acknowledgement.planSha256 !== currentPlan.planSha256
+        || acknowledgement.evictionOperationSha256 !== currentPlan.evictionOperationSha256
+        || acknowledgement.catalogSequence !== currentPlan.expectedCatalogSequence + 1
+        || acknowledgement.previousCatalogEventRootSha256
+          !== currentPlan.expectedCatalogEventRootSha256) {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      const mirrored = await this.mirrorTenantBackupCatalogEventInTransaction(conn, projection, {
+        adapterProtocol: control.adapterProtocol,
+        catalogNamespaceSha256: control.catalogNamespaceSha256,
+        catalogTargetSha256: control.catalogTargetSha256,
+        failureDomainSha256: control.failureDomainSha256,
+        event: { eventType: "backup_evicted", result: acknowledgement },
+      });
+      const verified = await this.assertTenantBackupCatalogProjection(conn);
+      const stored = verified.evictions.get(currentPlan.backupId);
+      if (!stored || stored.planSha256 !== currentPlan.planSha256
+        || stored.catalogEventSha256 !== acknowledgement.catalogEventSha256) {
+        throw new BackupCatalog.TenantBackupCatalogIntegrityError();
+      }
+      await conn.commit();
+      return { disposition: mirrored.disposition, value: stored };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+        throw new BackupCatalog.TenantBackupCatalogConflictError();
+      }
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantBackupCatalogEviction(
+    backupId: string,
+  ): Promise<BackupCatalog.TenantBackupCatalogEviction | null> {
+    return this.withConsistentRead(async (conn) => (
+      (await this.assertTenantBackupCatalogProjection(conn)).evictions.get(backupId) ?? null
+    ));
+  }
+
   // ---------- independent tenant restore journal ----------
   private async loadTenantRestoreJournalControl(
     executor: Pool | PoolConnection,
@@ -36762,20 +38821,30 @@ export class MysqlSessionStore implements
     }
   }
 
-  async prepareTenantRestoreReplay(
+  private async prepareTenantRestoreReplayInTransaction(
+    conn: PoolConnection,
     input: RestoreJournal.PrepareTenantRestoreReplayInput,
+    catalogBound = false,
   ): Promise<RestoreJournal.TenantRestoreReplayRunRecord> {
-    input = structuredClone(input);
-    RestoreJournal.validatePrepareTenantRestoreReplayInput(input);
-    const conn = await this.pool.getConnection();
-    try {
-      await conn.beginTransaction();
       const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
       if (journal.control.controlGeneration !== 1
         || journal.control.evidenceSha256 !== input.controlEvidenceSha256) {
         throw new TenantErasureIntegrityError();
       }
       const existing = await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE");
+      let pendingRows: Row[] = [];
+      if (!existing) {
+        [pendingRows] = await conn.query<Row[]>(
+          `SELECT restore_run_id FROM tenant_restore_replay_runs
+            WHERE phase IN ('prepared','replay_sealed') LIMIT 1 FOR UPDATE`,
+        );
+      }
+      if (this.tenantBackupCatalogSchemaInstalled && !catalogBound) {
+        const backupControl = await this.loadTenantBackupCatalogControl(conn, "FOR SHARE");
+        if (backupControl.state === "active") {
+          throw new BackupCatalog.TenantBackupCatalogNotReadyError("catalog_binding_required");
+        }
+      }
       if (existing) {
         const evidence = await this.loadTenantRestoreReplayEvidence(conn, existing, "FOR SHARE");
         if (existing.run.sourceBackupSha256 !== input.sourceBackupSha256
@@ -36799,13 +38868,8 @@ export class MysqlSessionStore implements
           })) {
           throw new TenantErasureIntegrityError();
         }
-        await conn.commit();
         return existing.run;
       }
-      const [pendingRows] = await conn.query<Row[]>(
-        `SELECT restore_run_id FROM tenant_restore_replay_runs
-          WHERE phase IN ('prepared','replay_sealed') LIMIT 1 FOR UPDATE`,
-      );
       if (pendingRows[0]) throw new TenantErasureIntegrityError();
       if (input.sealedTargets.length !== journal.targets.length) {
         throw new TenantErasureIntegrityError();
@@ -36881,6 +38945,18 @@ export class MysqlSessionStore implements
           run.updatedAtDbMs,
         ],
       );
+      return run;
+  }
+
+  async prepareTenantRestoreReplay(
+    input: RestoreJournal.PrepareTenantRestoreReplayInput,
+  ): Promise<RestoreJournal.TenantRestoreReplayRunRecord> {
+    input = structuredClone(input);
+    RestoreJournal.validatePrepareTenantRestoreReplayInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const run = await this.prepareTenantRestoreReplayInTransaction(conn, input);
       await conn.commit();
       return run;
     } catch (error) {
@@ -37150,10 +39226,19 @@ export class MysqlSessionStore implements
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      if (this.tenantBackupCatalogSchemaInstalled) {
+        await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      }
       const loaded = await this.loadTenantRestoreReplayRun(conn, restoreRunId, "FOR UPDATE");
       if (!loaded) {
         await conn.commit();
         return null;
+      }
+      if (this.tenantBackupCatalogSchemaInstalled) {
+        this.tenantBackupRestoreBindingForTransition(
+          await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE"),
+          restoreRunId,
+        );
       }
       const evidence = await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
       if (loaded.run.phase === "replay_sealed" || loaded.run.phase === "active") {
@@ -37214,10 +39299,20 @@ export class MysqlSessionStore implements
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      if (this.tenantBackupCatalogSchemaInstalled) {
+        await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      }
       const loaded = await this.loadTenantRestoreReplayRun(conn, restoreRunId, "FOR UPDATE");
       if (!loaded || loaded.run.phase !== "prepared") {
         await conn.commit();
         return false;
+      }
+      if (this.tenantBackupCatalogSchemaInstalled) {
+        this.tenantBackupRestoreBindingForTransition(
+          await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE"),
+          restoreRunId,
+          "aborted",
+        );
       }
       await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
       const nowMs = await this.databaseNow(conn);
@@ -37257,6 +39352,9 @@ export class MysqlSessionStore implements
     const conn = await this.pool.getConnection();
     try {
       await conn.beginTransaction();
+      if (this.tenantBackupCatalogSchemaInstalled) {
+        await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+      }
       const loaded = await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE");
       if (!loaded || (loaded.run.phase !== "replay_sealed" && loaded.run.phase !== "active")) {
         throw new TenantErasureIntegrityError();
@@ -37269,6 +39367,12 @@ export class MysqlSessionStore implements
       // into a valid-looking restore activation merely because its mutable control row still has
       // the expected generation.
       const projection = await this.assertTenantRestoreRuntimeProjection(conn, "FOR UPDATE");
+      if (this.tenantBackupCatalogSchemaInstalled) {
+        this.tenantBackupRestoreBindingForTransition(
+          await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE"),
+          input.restoreRunId,
+        );
+      }
       const current = projection.control;
       const heads = projection.heads;
       if (current.state === "active" && current.lineageKind === "restore"

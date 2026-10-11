@@ -75,6 +75,7 @@ class FakeS3Client {
   objectLockEnabled = false;
   returnVersionId = false;
   failHeadPuts = 0;
+  omitNextListKey: ((key: string) => boolean) | undefined;
   loseNextPutFor: ((key: string) => boolean) | undefined;
   falseAckNextPutFor: ((key: string) => boolean) | undefined;
   hangNextSend = false;
@@ -135,10 +136,15 @@ class FakeS3Client {
     }
     if (command instanceof ListObjectsV2Command) {
       const prefix = command.input.Prefix ?? "";
-      const keys = [...this.objects.keys()]
+      let keys = [...this.objects.keys()]
         .filter((value) => value.startsWith(`${command.input.Bucket}/${prefix}`))
         .map((value) => value.slice(`${command.input.Bucket}/`.length))
         .sort();
+      if (this.omitNextListKey) {
+        const omit = this.omitNextListKey;
+        this.omitNextListKey = undefined;
+        keys = keys.filter((key) => !omit(key));
+      }
       const offset = command.input.ContinuationToken
         ? Number(command.input.ContinuationToken)
         : 0;
@@ -384,6 +390,29 @@ describe("S3TenantRestoreJournalAdapter unit contract", () => {
         replayed: true,
       });
     }
+  });
+
+  it("repairs a transient LIST gap by exact GET but rejects a durable gap", async () => {
+    const transient = fixture();
+    const records = [
+      record(),
+      record("erase_22345678-1234-4234-8234-123456789abc", "tenant-b", 2),
+      record("erase_32345678-1234-4234-8234-123456789abc", "tenant-c", 3),
+    ];
+    for (const value of records) await transient.store.publishRecord(value);
+    transient.client.omitNextListKey = (key) => key.endsWith("/heads/0000000000000002");
+    await expect(transient.store.readHead()).resolves.toMatchObject({ remoteSequence: 3 });
+
+    const source = fixture();
+    await source.store.publishRecord(records[0]!);
+    await source.store.publishRecord(records[1]!);
+    const secondHeadKey = `${PREFIX}/targets/${TARGET_SHA256}/heads/0000000000000002`;
+    const durableGap = fixture();
+    durableGap.client.seed(
+      secondHeadKey,
+      source.client.objects.get(`${BUCKET}/${secondHeadKey}`)!.body,
+    );
+    await expect(durableGap.store.readHead()).rejects.toThrow("chain is corrupt");
   });
 
   it("keeps an orphan record unacknowledged and resumes it without rewriting", async () => {

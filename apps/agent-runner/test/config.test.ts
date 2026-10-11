@@ -12,6 +12,18 @@ const productionEnv: NodeJS.ProcessEnv = {
 };
 
 describe("runner configuration", () => {
+  it("rejects one-shot backup-catalog authority in the long-running process", () => {
+    for (const [key, value] of [
+      ["BACKUP_CATALOG_ADAPTER", "s3"],
+      ["BACKUP_CATALOG_S3_SECRET_ACCESS_KEY", "do-not-enter-runner"],
+      ["BACKUP_CATALOG_MINIMUM_RETENTION_MS", "86400000"],
+      ["TENANT_BACKUP_CATALOG_TEST_ONLY", "do-not-enter-runner"],
+    ] as const) {
+      expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, [key]: value }))
+        .toThrow(new RegExp(`${key} is one-shot backup-catalog authority`));
+    }
+  });
+
   it("keeps the process-based development default on a locally routable bind host", () => {
     const cfg = loadConfig({ SECRETS_MASTER_KEY: SECRET });
     expect(cfg.RUNNER_ID).toBe(`runner-${process.pid}`);

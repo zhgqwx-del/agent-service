@@ -61,6 +61,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
   TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -520,6 +521,7 @@ export function createRouterApp(deps: RouterAppDeps) {
           // /openapi.json. Deployment still drains old runners before promoting the new router.
           const parsed = Capabilities.safeParse(await res.json());
           if (parsed.success) {
+            const backupCatalog = deps.registry.tenantBackupCatalogConsensus();
             const lifecycle = parsed.data.features.sessionLifecycle.filter((feature) => (
               // Physical purge is not implemented. Never forward an accidental or stale runner
               // claim, even if every runner reports it during a rolling upgrade.
@@ -595,6 +597,15 @@ export function createRouterApp(deps: RouterAppDeps) {
                   deps.registry.allConfiguredSupportTenantRestoreJournal()
                     ? parsed.data.features.tenantRestoreRuntimeEpochSha256
                     : null,
+                tenantBackupCatalog:
+                  deps.registry.allConfiguredSupportTenantBackupCatalog()
+                    ? [TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1]
+                    : [],
+                tenantBackupCatalogActive: backupCatalog.active,
+                tenantBackupCatalogNamespaceSha256: backupCatalog.namespaceSha256,
+                tenantBackupCatalogTargetSha256: backupCatalog.targetSha256,
+                tenantBackupCatalogRuntimeBindingSha256:
+                  backupCatalog.runtimeBindingSha256,
                 tenantPurgeExecution:
                   [
                     ...(deps.registry.allConfiguredSupportTenantPurgeExecution()

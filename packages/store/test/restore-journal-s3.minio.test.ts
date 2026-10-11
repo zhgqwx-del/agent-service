@@ -210,9 +210,16 @@ describeMinio("S3TenantRestoreJournalAdapter real MinIO contract", () => {
 
   it("serializes concurrent writers across independent clients into one immutable chain", async () => {
     const records = Array.from({ length: 20 }, (_, index) => record(index + 1));
-    const results = await Promise.all(records.map((value, index) => (
+    const settled = await Promise.allSettled(records.map((value, index) => (
       (index % 2 === 0 ? first : second).publishRecord(value)
     )));
+    for (const result of settled) {
+      if (result.status === "rejected") throw result.reason;
+    }
+    const results = settled.map((result) => {
+      if (result.status !== "fulfilled") throw new Error("unreachable rejected restore publisher");
+      return result.value;
+    });
     expect(new Set(results.map((result) => result.remoteSequence)).size).toBe(records.length);
     const head = await first.readHead();
     expect(head.remoteSequence).toBe(records.length);

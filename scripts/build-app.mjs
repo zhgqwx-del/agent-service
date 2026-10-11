@@ -127,6 +127,7 @@ const entryPoints = {
           "src",
           "restore-ledger-reconcile.ts",
         ),
+        "backup-catalog": resolve(ROOT, "apps", app, "src", "backup-catalog.ts"),
       }
     : {}),
 };

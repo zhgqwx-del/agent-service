@@ -464,6 +464,16 @@ export type TenantRestoreJournalCapability = z.infer<
   typeof TenantRestoreJournalCapability
 >;
 
+/** Code understands the dormant, externally serialized 0031 full-backup catalog contract. */
+export const TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1 =
+  "authoritative-backup-catalog-v1" as const;
+export const TenantBackupCatalogCapability = z.literal(
+  TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
+);
+export type TenantBackupCatalogCapability = z.infer<
+  typeof TenantBackupCatalogCapability
+>;
+
 export const TENANT_PURGE_EXECUTION_LOCAL_ACK_V1 = "local-execution-ack-v1" as const;
 export const TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1 =
   "local-db-content-delete-v1" as const;
@@ -642,6 +652,16 @@ export const Capabilities = z.object({
     tenantRestoreJournalTargetRootSha256: Sha256.nullable().default(null),
     /** Exact live database epoch; a restored database must start under a new digest. */
     tenantRestoreRuntimeEpochSha256: Sha256.nullable().default(null),
+    /** Code awareness only; catalog activation and one-shot object-store authority stay separate. */
+    tenantBackupCatalog: z.array(TenantBackupCatalogCapability).max(1).default([]),
+    /** Durable database cutover state; no long-running process receives catalog writer credentials. */
+    tenantBackupCatalogActive: z.boolean().default(false),
+    /** Content-free external catalog namespace identity; null while the control is dormant. */
+    tenantBackupCatalogNamespaceSha256: Sha256.nullable().default(null),
+    /** Content-free external catalog target identity; null while the control is dormant. */
+    tenantBackupCatalogTargetSha256: Sha256.nullable().default(null),
+    /** Digest binding catalog control to the exact live restore runtime lineage. */
+    tenantBackupCatalogRuntimeBindingSha256: Sha256.nullable().default(null),
     /** Code understands the local T3e execution/physical-ACK substrate; this is not completion. */
     tenantPurgeExecution: z.array(TenantPurgeExecutionCapability).max(2).default([]),
     /** Local executor activation; fleet authority additionally requires the router's fresh barrier. */

@@ -1229,6 +1229,45 @@ export const OPENAPI_DOCUMENT = {
                 ],
                 "type": "boolean"
               },
+              "tenantBackupCatalog": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "authoritative-backup-catalog-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "tenantBackupCatalogActive": {
+                "default": false,
+                "type": "boolean"
+              },
+              "tenantBackupCatalogNamespaceSha256": {
+                "default": null,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tenantBackupCatalogRuntimeBindingSha256": {
+                "default": null,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tenantBackupCatalogTargetSha256": {
+                "default": null,
+                "pattern": "^[0-9a-f]{64}$",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "tenantCredentialLifecycle": {
                 "default": [],
                 "items": {

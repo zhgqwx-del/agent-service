@@ -40,6 +40,7 @@ import {
   RedisLeaseStore,
   RedisSessionStatePurgeAdapter,
   SubjectDeletingError,
+  tenantBackupCatalogRuntimeBindingSha256,
   type BlobCleanupStore,
   type BlobStorageControlStore,
   type BlobStore,
@@ -59,6 +60,7 @@ import {
   type SubjectLifecycleStore,
   type TenantCredentialRevocationStore,
   type TenantCredentialTargetExecutionStore,
+  type TenantBackupCatalogStore,
   type TenantDatabasePurgeStore,
   type TenantRedisPurgeStore,
   type TenantRestoreJournalStore,
@@ -113,6 +115,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & SubjectLifecycleStore
     & TenantCredentialRevocationStore
     & TenantCredentialTargetExecutionStore
+    & TenantBackupCatalogStore
     & TenantDatabasePurgeStore
     & TenantRedisPurgeStore
     & TenantRestoreJournalStore
@@ -376,6 +379,50 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     );
   } catch (error) {
     await Promise.all([
+      blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
+      tenantRedisPurgeAdapter?.close(),
+      bus.close(),
+      lease.close(),
+      store.close(),
+    ]);
+    throw error;
+  }
+  let tenantBackupCatalogControl: Awaited<
+    ReturnType<TenantBackupCatalogStore["getTenantBackupCatalogControl"]>
+  >;
+  let tenantBackupCatalogRuntimeBinding: string | undefined;
+  try {
+    // Read and bind the durable catalog before bootstrap mutations or any worker can start. The
+    // long-running process receives no catalog object-store credentials; this is only a
+    // content-free capability proof over the already-active database/runtime lineage.
+    tenantBackupCatalogControl = await store.getTenantBackupCatalogControl();
+    if (tenantBackupCatalogControl.state === "active") {
+      const runtime = await store.getTenantRestoreRuntimeControl();
+      if (blobStorageControlGeneration !== 1
+        || runtime.state !== "active"
+        || runtime.logicalDatabaseNamespaceSha256
+          !== tenantBackupCatalogControl.logicalDatabaseNamespaceSha256
+        || runtime.controlEvidenceSha256
+          !== tenantBackupCatalogControl.journalControlEvidenceSha256) {
+        throw new Error("active backup catalog is not bound to the live durable runtime");
+      }
+      tenantBackupCatalogRuntimeBinding = tenantBackupCatalogRuntimeBindingSha256({
+        catalogControlEvidenceSha256: tenantBackupCatalogControl.evidenceSha256,
+        catalogNamespaceSha256: tenantBackupCatalogControl.catalogNamespaceSha256,
+        catalogTargetSha256: tenantBackupCatalogControl.catalogTargetSha256,
+        logicalDatabaseNamespaceSha256:
+          tenantBackupCatalogControl.logicalDatabaseNamespaceSha256,
+        journalControlEvidenceSha256:
+          tenantBackupCatalogControl.journalControlEvidenceSha256,
+        runtimeEpochSha256: runtime.runtimeEpochSha256,
+        runtimeControlGeneration: runtime.controlGeneration,
+        runtimeControlEvidenceSha256: runtime.evidenceSha256,
+        runtimeHeadRootSha256: runtime.verifiedHeadRootSha256,
+      });
+    }
+  } catch (error) {
+    await Promise.all([
+      closeTenantRestoreJournal(),
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
       tenantRedisPurgeAdapter?.close(),
       bus.close(),
@@ -760,6 +807,14 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       cfg.tenantRestoreJournal?.targetRootSha256,
     tenantRestoreRuntimeEpochSha256:
       cfg.tenantRestoreJournal?.runtimeEpochSha256,
+    tenantBackupCatalogSupported: true,
+    tenantBackupCatalogActive: tenantBackupCatalogControl.state === "active",
+    ...(tenantBackupCatalogControl.state === "active" ? {
+      tenantBackupCatalogNamespaceSha256:
+        tenantBackupCatalogControl.catalogNamespaceSha256,
+      tenantBackupCatalogTargetSha256: tenantBackupCatalogControl.catalogTargetSha256,
+      tenantBackupCatalogRuntimeBindingSha256: tenantBackupCatalogRuntimeBinding!,
+    } : {}),
     // Read the durable control on every acknowledgement attempt instead of freezing this decision
     // at process startup. A current binary that was already running during the forward-only
     // dormant -> active cutover must fail closed immediately, even before it is drained/restarted

@@ -292,6 +292,16 @@ describe("router configuration", () => {
       expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))
         .toThrow(new RegExp(`${key} is runner-only restore-journal authority`));
     }
+    for (const [key, value] of [
+      ["BACKUP_CATALOG_ADAPTER", "s3"],
+      ["BACKUP_CATALOG_DATABASE_NAMESPACE_ID", "one-shot-only"],
+      ["BACKUP_CATALOG_S3_ENDPOINT", "https://backup-catalog.internal"],
+      ["BACKUP_CATALOG_S3_SECRET_ACCESS_KEY", "must-not-enter-router"],
+      ["TENANT_BACKUP_CATALOG_TEST_ONLY", "must-not-enter-router"],
+    ] as const) {
+      expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))
+        .toThrow(new RegExp(`${key} is one-shot backup-catalog authority`));
+    }
   });
 
   it("rejects runner database, provider, bootstrap and test-storage authority", () => {

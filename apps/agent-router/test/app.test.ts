@@ -48,6 +48,7 @@ import {
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
   PROTOCOL_VERSION,
+  TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
@@ -142,6 +143,11 @@ function fakeRegistry(
     credentialTargetExecutionWorker?: boolean;
     restoreJournal?: boolean;
     restoreJournalWorker?: boolean;
+    backupCatalog?: boolean;
+    backupCatalogActive?: boolean;
+    backupCatalogNamespaceSha256?: string;
+    backupCatalogTargetSha256?: string;
+    backupCatalogRuntimeBindingSha256?: string;
     purgeExecution?: boolean;
     purgeExecutionWorker?: boolean;
     databasePurge?: boolean;
@@ -234,6 +240,19 @@ function fakeRegistry(
     allConfiguredSupportTenantRestoreJournalWorker: () => (
       (opts.restoreJournal ?? false) && (opts.restoreJournalWorker ?? false)
     ),
+    allConfiguredSupportTenantBackupCatalog: () => opts.backupCatalog ?? false,
+    tenantBackupCatalogConsensus: () => ({
+      active: (opts.backupCatalog ?? false) && (opts.backupCatalogActive ?? false),
+      namespaceSha256: (opts.backupCatalog ?? false) && (opts.backupCatalogActive ?? false)
+        ? opts.backupCatalogNamespaceSha256 ?? "a".repeat(64)
+        : null,
+      targetSha256: (opts.backupCatalog ?? false) && (opts.backupCatalogActive ?? false)
+        ? opts.backupCatalogTargetSha256 ?? "b".repeat(64)
+        : null,
+      runtimeBindingSha256: (opts.backupCatalog ?? false) && (opts.backupCatalogActive ?? false)
+        ? opts.backupCatalogRuntimeBindingSha256 ?? "c".repeat(64)
+        : null,
+    }),
     allConfiguredSupportTenantPurgeExecution: () => opts.purgeExecution ?? false,
     allConfiguredSupportTenantPurgeExecutionWorker: () => (
       (opts.purgeExecution ?? false) && (opts.purgeExecutionWorker ?? false)
@@ -2593,6 +2612,67 @@ describe("operational endpoints", () => {
         tenantRestoreJournalNamespaceSha256: null,
         tenantRestoreJournalTargetRootSha256: null,
         tenantRestoreRuntimeEpochSha256: null,
+      },
+    });
+  });
+
+  it("projects an active backup catalog only from exact all-configured fleet consensus", async () => {
+    const namespaceSha256 = "e".repeat(64);
+    const targetSha256 = "f".repeat(64);
+    const runtimeBindingSha256 = "a".repeat(64);
+    const a = await upstream(() => ({
+      body: JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        service: "agent-runner",
+        features: {
+          streaming: true,
+          replay: { persistedEvents: true, hotWindowMs: 1 },
+          approvals: true,
+          sessionLifecycle: ["archive"],
+          tenantBackupCatalog: [TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1],
+          tenantBackupCatalogActive: true,
+          tenantBackupCatalogNamespaceSha256: namespaceSha256,
+          tenantBackupCatalogTargetSha256: targetSha256,
+          tenantBackupCatalogRuntimeBindingSha256: runtimeBindingSha256,
+          dynamicTools: true,
+          mcp: [],
+          skills: false,
+          sandbox: ["none"],
+          byok: true,
+        },
+      }),
+    }));
+    const enabled = createRouterApp({
+      registry: fakeRegistry([a.url], {
+        backupCatalog: true,
+        backupCatalogActive: true,
+        backupCatalogNamespaceSha256: namespaceSha256,
+        backupCatalogTargetSha256: targetSha256,
+        backupCatalogRuntimeBindingSha256: runtimeBindingSha256,
+      }),
+      logger: silent,
+    });
+    await expect((await enabled.request("/v1/capabilities")).json()).resolves.toMatchObject({
+      features: {
+        tenantBackupCatalog: [TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1],
+        tenantBackupCatalogActive: true,
+        tenantBackupCatalogNamespaceSha256: namespaceSha256,
+        tenantBackupCatalogTargetSha256: targetSha256,
+        tenantBackupCatalogRuntimeBindingSha256: runtimeBindingSha256,
+      },
+    });
+
+    const mixed = createRouterApp({
+      registry: fakeRegistry([a.url], { backupCatalog: false, backupCatalogActive: true }),
+      logger: silent,
+    });
+    await expect((await mixed.request("/v1/capabilities")).json()).resolves.toMatchObject({
+      features: {
+        tenantBackupCatalog: [],
+        tenantBackupCatalogActive: false,
+        tenantBackupCatalogNamespaceSha256: null,
+        tenantBackupCatalogTargetSha256: null,
+        tenantBackupCatalogRuntimeBindingSha256: null,
       },
     });
   });

@@ -354,6 +354,14 @@ try {
     runnerCapabilities?.service !== "agent-runner"
     || runnerCapabilities?.features?.blobAttachments !== true
     || !sameJson(runnerCapabilities?.features?.blobStorage, expectedStorage)
+    || !sameJson(
+      runnerCapabilities?.features?.tenantBackupCatalog,
+      ["authoritative-backup-catalog-v1"],
+    )
+    || runnerCapabilities?.features?.tenantBackupCatalogActive !== false
+    || runnerCapabilities?.features?.tenantBackupCatalogNamespaceSha256 !== null
+    || runnerCapabilities?.features?.tenantBackupCatalogTargetSha256 !== null
+    || runnerCapabilities?.features?.tenantBackupCatalogRuntimeBindingSha256 !== null
   ) throw new Error("runner did not advertise the exact active S3 namespace capability");
 
   inspection = await mysql.createConnection({
@@ -366,15 +374,16 @@ try {
     "0028_blob_storage_migration.sql",
     "0029_tenant_credential_target_execution.sql",
     "0030_tenant_restore_journal.sql",
+    "0031_authoritative_backup_catalog.sql",
   ];
   const [migrationRows] = await inspection.query(
-    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?) ORDER BY name",
+    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?) ORDER BY name",
     expectedMigrationNames,
   );
   if (
     migrationRows.length !== expectedMigrationNames.length
     || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
-  ) throw new Error("runner did not apply migrations 0027 through 0030");
+  ) throw new Error("runner did not apply migrations 0027 through 0031");
   const [controlRows] = await inspection.query(
     `SELECT control_generation,storage_backend,namespace_sha256,
             activated_at_db_ms,evidence_sha256
@@ -413,7 +422,14 @@ try {
          WHERE singleton_id=1 AND state='inactive' AND control_generation=0) AS restore_runtime_control,
        (SELECT COUNT(*) FROM tenant_restore_journal_jobs) AS restore_journal_jobs,
        (SELECT COUNT(*) FROM tenant_restore_replay_runs) AS restore_replay_runs,
-       (SELECT COUNT(*) FROM tenant_restore_fences) AS restore_fences`,
+       (SELECT COUNT(*) FROM tenant_restore_fences) AS restore_fences,
+       (SELECT COUNT(*) FROM backup_catalog_control
+         WHERE singleton_id=1 AND state='inactive' AND control_generation=0) AS backup_catalog_control,
+       (SELECT COUNT(*) FROM backup_snapshot_anchors) AS backup_snapshot_anchors,
+       (SELECT COUNT(*) FROM backup_catalog_entries) AS backup_catalog_entries,
+       (SELECT COUNT(*) FROM backup_restore_source_bindings) AS backup_restore_source_bindings,
+       (SELECT COUNT(*) FROM backup_runtime_reservations) AS backup_runtime_reservations,
+       (SELECT COUNT(*) FROM backup_catalog_evictions) AS backup_catalog_evictions`,
   );
   const dormant = dormantRows[0];
   if (
@@ -426,7 +442,13 @@ try {
     || Number(dormant.restore_journal_jobs) !== 0
     || Number(dormant.restore_replay_runs) !== 0
     || Number(dormant.restore_fences) !== 0
-  ) throw new Error("migrations 0028 through 0030 were not applied as dormant ledgers");
+    || Number(dormant.backup_catalog_control) !== 1
+    || Number(dormant.backup_snapshot_anchors) !== 0
+    || Number(dormant.backup_catalog_entries) !== 0
+    || Number(dormant.backup_restore_source_bindings) !== 0
+    || Number(dormant.backup_runtime_reservations) !== 0
+    || Number(dormant.backup_catalog_evictions) !== 0
+  ) throw new Error("migrations 0028 through 0031 were not applied as dormant ledgers");
 
   router = launch("router", "apps/agent-router/dist/main.js", mode, routerEnv);
   const routerUrl = `http://127.0.0.1:${routerPort}`;
@@ -447,6 +469,14 @@ try {
     routerCapabilities?.service !== "agent-router"
     || routerCapabilities?.features?.blobAttachments !== true
     || !sameJson(routerCapabilities?.features?.blobStorage, expectedStorage)
+    || !sameJson(
+      routerCapabilities?.features?.tenantBackupCatalog,
+      ["authoritative-backup-catalog-v1"],
+    )
+    || routerCapabilities?.features?.tenantBackupCatalogActive !== false
+    || routerCapabilities?.features?.tenantBackupCatalogNamespaceSha256 !== null
+    || routerCapabilities?.features?.tenantBackupCatalogTargetSha256 !== null
+    || routerCapabilities?.features?.tenantBackupCatalogRuntimeBindingSha256 !== null
   ) throw new Error("router did not negotiate the exact runner S3 namespace capability");
 
   const capabilityText = JSON.stringify([runnerCapabilities, routerCapabilities]);
@@ -485,6 +515,6 @@ if (failure) {
 } else if (verified) {
   console.log(
     `real S3 application assembly passed (${mode} runner/router, disposable MySQL, `
-      + "0027 activation, exact namespace negotiation, credential isolation)",
+      + "0027 activation, 0031 dormant catalog, exact namespace negotiation, credential isolation)",
   );
 }

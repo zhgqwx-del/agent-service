@@ -374,6 +374,14 @@ function validateS3Endpoint(value: string, production: boolean): string {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
+  const backupCatalogAuthorityKey = Object.keys(env).find((key) => (
+    key.startsWith("BACKUP_CATALOG_") || key.startsWith("TENANT_BACKUP_CATALOG_")
+  ) && env[key] !== undefined);
+  if (backupCatalogAuthorityKey) {
+    throw new Error(
+      `${backupCatalogAuthorityKey} is one-shot backup-catalog authority and must not enter the runner process`,
+    );
+  }
   if (
     env.TENANT_ERASURE_OPERATOR_TOKEN !== undefined
     || env.TENANT_ERASURE_OPERATOR_ID !== undefined

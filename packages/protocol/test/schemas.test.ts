@@ -31,6 +31,7 @@ import {
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
+  TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
   TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
@@ -790,6 +791,52 @@ describe("protocol schemas", () => {
     expect(Capabilities.safeParse({
       ...aware,
       features: { ...aware.features, tenantRestoreJournal: ["restore-journal-v2"] },
+    }).success).toBe(false);
+  });
+
+  it("defaults the backup catalog dormant and validates its content-free lineage identity", () => {
+    const base = Capabilities.parse({
+      protocolVersion: PROTOCOL_VERSION,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive"],
+        dynamicTools: true,
+        mcp: [],
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    expect(base.features).toMatchObject({
+      tenantBackupCatalog: [],
+      tenantBackupCatalogActive: false,
+      tenantBackupCatalogNamespaceSha256: null,
+      tenantBackupCatalogTargetSha256: null,
+      tenantBackupCatalogRuntimeBindingSha256: null,
+    });
+    const aware = Capabilities.parse({
+      ...base,
+      features: {
+        ...base.features,
+        tenantBackupCatalog: [TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1],
+        tenantBackupCatalogActive: true,
+        tenantBackupCatalogNamespaceSha256: "d".repeat(64),
+        tenantBackupCatalogTargetSha256: "e".repeat(64),
+        tenantBackupCatalogRuntimeBindingSha256: "f".repeat(64),
+      },
+    });
+    expect(aware.features.tenantBackupCatalog)
+      .toEqual([TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1]);
+    expect(Capabilities.safeParse({
+      ...aware,
+      features: { ...aware.features, tenantBackupCatalog: ["backup-catalog-v2"] },
+    }).success).toBe(false);
+    expect(Capabilities.safeParse({
+      ...aware,
+      features: { ...aware.features, tenantBackupCatalogRuntimeBindingSha256: "unsafe" },
     }).success).toBe(false);
   });
 
