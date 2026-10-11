@@ -1,8 +1,9 @@
 # 可观测性、安全遥测与生命周期边界
 
-> 状态：入口安全基线、default-dormant 的 `0032` schema，以及 `0033` Memory/MySQL 原子
-> activation receipt、per-tenant coverage 与 immutable artifact inventory store 已实现；真实 sink
-> adapter、应用 writer 双写、删除 worker/ACK、restore replay 与 completion 仍待后续切片。
+> 状态：入口安全基线、default-dormant 的 `0032` schema、`0033` Memory/MySQL 原子
+> activation/inventory，以及`0034` payload-before-sink durable writer spool、external-mutation-start
+> reservation、Memory/MySQL store、Memory/HTTP create-only adapter、worker与ACK已实现。`0034`未接
+> runner配置/启动；真实sink、应用writer双写、delete/restore executor与completion仍待后续切片。
 > 本文定义 M1 数据生命周期需要的最小安全契约，以及 M4 完整可观测性平台的边界。
 
 ## 1. 目的
@@ -12,7 +13,7 @@ tenant、user、session、provider、URL、请求正文或密钥复制到应用�
 owner inventory、retention、legal hold 与删除 ACK，日志/追踪就会成为 tenant/user erasure 的
 永久 blocker。
 
-本文将问题拆成三层：
+本文将问题拆成四层：
 
 1. **入口安全基线**：router/runner 进程启动、关闭、bootstrap 和顶层失败只能向
    stdout/stderr 写固定 JSON event code 与低敏布尔/计数字段；admin bootstrap secret 必须走
@@ -20,8 +21,13 @@ owner inventory、retention、legal hold 与删除 ACK，日志/追踪就会成�
 2. **`0032`/`0033` lifecycle inventory**：`0032`安装 generation-0 control、固定 logs/traces target、
    per-tenant coverage 与 T1-bound subject evidence；`0033`补齐原子 activation receipt、既有/新 tenant
    coverage 及 immutable artifact inventory store。两条 migration 都不激活、不回填、不联网、不删除。
-3. **后续 execution lifecycle**：把应用 writer 接到 inventory，提供真实 sink adapter、删除或匿名化
-   operation、ACK、restore replay 与 terminal receipt。该层完成前，T3d 的 `logs` 和 `traces` 仍必须
+3. **`0034` durable writer substrate**：live admission先确认record来自可信structured logger，闭合schema与
+   hash再保护持久化后的读取；有界batch先进Memory/MySQL spool，
+   再由按`adapterProtocol`过滤的worker处理logs/traces可合法分布在不同adapter的混合配置。首次
+   external create前先write-once保留external-mutation-start，原子重验T1、user/session、policy/
+   hold/restore/source；之后只允许exact operation replay，terminal ACK必须绑定该reservation。
+4. **后续 execution lifecycle**：把应用 writer 接到上述substrate，提供真实sink、删除或匿名化
+   operation、restore replay 与 terminal receipt。该层完成前，T3d 的 `logs` 和 `traces` 仍必须
    保持显式 blocker，全域 completion 仍为 `false`。
 
 本文不把日志系统等同于监控系统，也不因本机输出了 JSON 就宣称 M4 可观测性已经完成。
@@ -46,7 +52,8 @@ owner inventory、retention、legal hold 与删除 ACK，日志/追踪就会成�
 
 当前 router/runner main 与应用层共同复用 `@agent-service/protocol` 的 structured telemetry。logger只接受
 闭合 event-code 与字段 allowlist：受限计数、HTTP status、attempt/retryable、固定 `errorKind`，以及由
-进程内 HMAC 生成的 `oref_*`。它不接收任意字段名、原始 tenant/session/provider 字符串或 `Error`。
+同一logger实例的`opaqueRef()`实际生成并登记的进程内 HMAC `oref_*`；仅伪造相同字符串格式会被emit拒绝。
+它不接收任意字段名、原始 tenant/session/provider 字符串或 `Error`。
 main wrapper 进一步只允许 `runnerCount`、`shutdownGraceMs` 与 gate开/关计数，不能把 tenant ID、runner
 URL、provider ID、locator、异常 message/stack 或 secret 交给 process log。
 
@@ -57,7 +64,8 @@ URL、provider ID、locator、异常 message/stack 或 secret 交给 process log
 - runner 启动摘要只保留 gate开/关数量；
 - router 启动摘要只保留 runner 数量及 gate开/关数量；
 - 顶层异常只写固定失败 event，不写 error message、stack、cause 或环境变量。
-- router request 与 runner request建立严格 W3C v00 trace context；任意 `tracestate`/`baggage` 被丢弃；
+- 公网router为每个request生成fresh internal W3C v00 root，不继承caller的trace/span ID；runner内部入口只
+  继续严格的router context；任意 `tracestate`/`baggage` 被丢弃；
 - router→runner 与 runner→provider只发送本服务生成的 `traceparent`；
 - router/runner/provider应用错误使用固定 code、固定 `errorKind` 与 HMAC opaque ref。
 - product runner给仍接受`Console`形状logger的SessionHost和内嵌worker统一注入content-free兼容层；
@@ -72,6 +80,7 @@ URL、provider ID、locator、异常 message/stack 或 secret 交给 process log
 - stdout/stderr 已经是可删除的受管日志后端；
 - trace context 已覆盖所有后台 worker、SSE resume/link、消息总线或持久任务恢复；
 - stdout/trace exporter 已接入 durable inventory，或 retention/legal hold 已形成可执行处置策略；
+- 长期router/runner已启动`0034` worker或已把应用event双写到durable spool；
 - log/trace 物理删除、ACK 或 restore replay 已实现；
 - dashboard、metrics、SLO、alert、sampling、容量或成本治理已实现。
 
@@ -106,7 +115,8 @@ URL、provider ID、locator、异常 message/stack 或 secret 交给 process log
 
 应用层当前还包含 `router.unhandled_error`、`router.tenant_erasure_target_unreachable`、
 `router.upstream_unreachable`、`router.owner_unconfigured`、`router.owner_reroute`、`runner.unhandled_error` 与
-`provider.upstream_request_failed`。这些事件只能使用 allowlisted opaque ref/error/count字段。
+`provider.upstream_request_failed`。这些事件只能使用 allowlisted error/count字段和由该logger实例生成的
+opaque ref；格式匹配本身不是ref来源证明。
 
 event code 是机器稳定接口。改变含义应新增 code，不能复用旧 code 表示另一种状态。日志采集规则
 必须以 `schema + component + code` 建索引，不能解析人类文本。
@@ -128,7 +138,8 @@ event code 是机器稳定接口。改变含义应新增 code，不能复用旧 
 
 包括 tenant/user/session/turn/request/operation ID、runner identity、对象 key、provider slot以及可与业务
 主体关联的 hash。原值当前禁止进入 stdout/stderr；应用只能输出进程内随机 HMAC key产生的固定格式
-opaque ref。随机 trace/span ID可作为短期 correlation token输出，但不能携带主体信息、充当 owner ref、
+opaque ref。公网router使用的随机 trace/span ID必须是信任边界内新生成的值；内部随机ID可作为短期
+correlation token输出，但不能携带主体信息、充当 owner ref、
 授权或 durable operation identity。未来进入受管 lifecycle adapter 时还必须满足：
 
 - 有精确 owner envelope；
@@ -218,13 +229,15 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 
 当前已实现：
 
-1. 外部入口只继承语法有效、非全零的 W3C version `00` `traceparent`；两位小写十六进制
-   `trace-flags` 的全部bit逐跳保留（不能只接受`00`/`01`或清除未知bit），无效或未来版本丢弃并生成新
-   context。
+1. 公网router把caller `traceparent`视为不可信correlation输入：即使语法有效也不继承其trace/span ID，
+   而是为每个request创建fresh internal root，初始`trace-flags=00`。这样外部可控的合法十六进制ID不会
+   进入router structured record或router→runner header。
 2. `tracestate` 与 `baggage` 当前全部删除，不记录原 header，也不向下游发送。
-3. router 向 runner 转发本服务生成的 child `traceparent`，不能透传任意外部 context、tenant/user header
-   或凭据。
-4. runner 向 provider发送本服务生成的 child `traceparent`，并再次删除 `tracestate`/`baggage`；不得把
+3. router 向 runner 转发该fresh root下由本服务生成的 child `traceparent`，不能透传任意外部 context、
+   tenant/user header或凭据。
+4. runner是内部服务；其入口只接受严格、非全零的W3C version `00` context，并为内部child保留两位小写
+   十六进制`trace-flags`的全部bit。runner向provider发送本服务生成的child，并再次删除
+   `tracestate`/`baggage`；不得把
    tenant/user ID 注入第三方 context。
 5. context使用 `AsyncLocalStorage` 限定在当前异步 request链；structured telemetry可附带当前随机
    trace/span ID，但错误仍只能使用固定 code和 `errorKind`。
@@ -241,7 +254,7 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 10. exporter 失败不能阻塞普通 runtime，也不能让 destructive lifecycle action在缺 ACK 时伪装成功；安全
     审计/erasure proof使用独立 durable ledger，不以“trace 已发送”代替。
 
-## 8. `0032`/`0033` inventory 与后续 lifecycle execution
+## 8. `0032`～`0034` inventory/writer 与后续 lifecycle execution
 
 ### 8.1 `0032` 已实现的 default-dormant substrate
 
@@ -260,7 +273,7 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 迁移包含engine/collation/column/index/CHECK/FK fingerprint和append-only/write-once triggers，并已通过
 真实 MySQL smoke验证 control、targets、coverages、subjects的约束行为。它明确不会：配置 sink、生成
 subject ref、扫描/回填历史、激活 writer、materialize purge job、调用网络、删除日志/追踪或推进任何
-erasure/completion。`0033`虽提供显式store API，长期router/runner仍未把它接成启动gate或sink writer；
+erasure/completion。`0033`/`0034`虽提供显式store/worker/adapter API，长期router/runner仍未把它们接成启动gate或sink writer；
 因此标准应用装配继续保持 generation `0`。
 
 已有 tenant不会因migration自动获得 coverage；只有显式调用`0033` activation store时，才会把当时全部
@@ -301,7 +314,70 @@ header、credential或明文locator。
 writer已双写。未登记的legacy数据、未知sink、source drift、跨owner batch或无法重建的locator仍必须形成
 blocker，不能用空集合解释成“没有日志”。
 
-### 8.3 Adapter contract
+### 8.3 `0034` 已实现的 durable writer substrate
+
+`0034_tenant_telemetry_durable_writer.sql`安装default-empty的writer job、短期payload、
+external-mutation-start reservation和immutable write ACK投影。migration本身不激活`0032` control、
+不从stdout或历史表回填payload、不创建job/reservation、不联网、不配置或请求sink，也不授予
+delete/restore/completion authority。MySQL启动对`0033` activation/inventory与`0034` writer的全部
+schema、index、CHECK、FK和trigger guard做组合指纹核对；不完整queued payload、无reservation的外部已开始状态、
+ACK/reservation/inventory关系损坏或marker-loss时的不一致投影都fail closed，不会被启动审计补造。
+
+0034同时在`tenant_credential_revocation_jobs`增加`BEFORE INSERT` mixed-writer fence。current writer在active
+telemetry generation中先写精确subject再写T1 job；stale 0033 writer会在job边界失败并回滚整个T1事务，
+因此schema安装后不能继续扩大subject gap。若升级前active 0033已经存在gap，普通startup故意fail closed。
+guard轮换使用scoped bootstrap twin；仓库迁移器只对固定bootstrap执行exact verify-or-create，随后才
+drop/recreate primary并移除bootstrap。已有bootstrap若shape/body漂移会fail closed；即使进程在drop primary后
+崩溃，重放期间也始终至少保留一道guard。未来独立migration Job必须复用这一执行语义。
+operator必须先关闭tenant-erasure admission、排空pre-0034 writer并停止全部应用writer，然后以active control
+所用的精确32-byte ref key和三个固定字面量ACK——`tenant-erasure-admission-closed-v1`、
+`pre-0034-telemetry-writers-drained-v1`、`all-application-writers-stopped-v1`——调用DDL-free
+`migrationMode: "reconcile-telemetry-subjects"`。该模式复用migration named lock，以SERIALIZABLE全量校验
+source/coverage/subject/writer projection后一次性补齐，任一异常全回滚，exact replay安全。三个ACK只是人工
+停写声明，不是自动证明；当前它只是store连接模式，没有产品CLI、bundle或`local-service`命令。
+
+live enqueue先对caller input做单次capture：顶层字段、payload字段、records引用、数组长度及每个slot都只
+读取一次，并在任何`structuredClone`或serialization前用protocol模块私有的producer标记逐条确认同一批
+原始record是`createStructuredTelemetry`实际生成且冻结的对象；进程内`WeakMap`同时保存该record的producer
+key-id，并要求它匹配active lifecycle ref key。每条record必须携带exact tenant ref，user/session owner还必须
+同时携带exact owner ref；任一其它tenant/user/session ref都会在持久化前拒绝。该logger emit又要求所有ref都
+由同一实例的`opaqueRef()`生成过。后续只使用复制的标量和该批record产生的detached canonical payload，不再
+读取或clone caller对象，因此stateful getter/Proxy不能在check与use之间换入语法合法literal。跨进程持久化后，
+进程内provenance标记本来就不会存在，read/claim/adapter改用闭合`agent-service.telemetry.v1` validator与payload/hash
+绑定做完整性校验；validator只证明schema，不声称证明producer来源。event/component/level/field必须属于
+allowlist，trace/span必须成对且符合严格W3C ID，额外JSON key仍被拒绝。artifact每批限制1～100条，
+canonical UTF-8 JSON不超过262144 bytes。live admission还要求每条record携带精确artifact owner ref，且
+其它ref字段不能出现不同的tenant/user/session lifecycle ref；跨owner batch必须在进入spool前拒绝，不能
+依靠后续单一owner inventory掩盖。Memory/MySQL在同一原子边界重验active control、target、
+coverage、owner/source/high-water，然后同时
+写job与payload。这是“payload before sink”不变量：adapter只能从已claim的durable payload取得输入，
+不能在spool提交前发生外部create。
+
+worker/store的执行边界是：
+
+1. claim按`adapterProtocol`过滤，因此`logs`/`traces`可合法绑定不同adapter，一个worker不会误领其它协议的job；
+2. 每次首次external `create`前，store以write-once reservation绑定operation、target、artifact generation、
+   payload/manifest、claim及adapter protocol，并在同一Memory原子发布或MySQL事务内重验tenant T1、
+   user/session lifecycle、canonical policy/hold、restore lineage与source high-water；
+3. reservation一旦提交，不论T1、hold或restore状态随后变化，都只能按同一exact operation继续inspect/
+   create/complete，不得换payload、target、adapter或operation；这个特例用来收口“外部可能已commit”的不可判定窗口，
+   不是T1后新增写入授权；
+4. adapter先`inspect`；absent时只发一次`create`。`createWrite`一旦被调用，任何异常——包括畸形、超限或
+   target-unbound的2xx响应——都先续租并做exact `inspect`，remote exact时收口，absent时才按原异常
+   retry/block，同一attempt不二次create。remote slot不一致时将job固定为`integrity_conflict`，临时故障则有界退避重试；
+5. terminal complete必须绑定write-once reservation和live/exact claim，并在同一原子边界发布0033 immutable
+   inventory、0034 ACK、`written` job，再删除短期payload。DB commit响应丢失时先读immutable ACK，
+   只允许原claim+reservation的exact completion replay。
+
+Memory adapter需显式`nonProductionFixture: true`且production下拒绝构造，它只证明protocol与response-loss语义。
+HTTP adapter只接受HTTPS（非production可显式放行loopback HTTP），拒绝redirect、embedded credential、query/
+fragment、超界或非JSON响应，并以整个请求deadline和有界response body收口；响应`Content-Type`去除参数后
+必须精确等于`application/json`，允许charset参数但拒绝`application/jsonp`。构造时必须显式提供
+`expectedTargets` allowlist；wire request与response必须双向绑定`targetSha256 + targetReceiptSha256`，不能因为
+共用endpoint就把一个target的ACK当成另一个target的证据。这只是endpoint/target配置绑定。它实现的是
+`agent-service.telemetry-http-sink.v1` client协议，不是真实sink server、collector或managed backend验收。
+
+### 8.4 Adapter contract
 
 adapter 至少需要固定语义：
 
@@ -315,7 +391,7 @@ adapter 至少需要固定语义：
 
 本地 fake/filesystem adapter只能证明协议、rollback、并发和 replay，不能成为 production completion proof。
 
-### 8.4 Tenant 与 user erasure 集成
+### 8.5 Tenant 与 user erasure 集成
 
 - T3d 固定 33 域中的 `logs`、`traces` 不得删除或省略；adapter未配置时继续
   `blocked_adapter_unconfigured`。
@@ -328,23 +404,24 @@ adapter 至少需要固定语义：
 - terminal receipt只证明 logs/traces域，仍固定 `allDomainsComplete=false`、
   `contentPurgeExecuted=false`，直到 backup、provider/KMS、其它外部域与最终聚合全部闭合。
 
-### 8.5 Restore 与 backup
+### 8.6 Restore 与 backup
 
 恢复后必须从独立故障域重放已 durable ACK 的永久 purge marker，防止旧日志索引、spool、export queue或
 trace batch复活。尚未 ACK 的首次外部 mutation不能从旧快照猜造。0030/0031 的 journal/catalog只提供
 数据库恢复来源与 epoch authority，不自动证明日志平台、追踪平台或它们的 backup 已删除某 tenant/user。
 
-### 8.6 rollout gate
+### 8.7 rollout gate
 
 建议沿用现有安全切片模式：
 
-1. 应用`0032`/`0033` expand-only migration，tracking/execution默认关闭；
-2. 未来发布真正双写inventory且声明对应capability的router/runner，所有gate保持`0`；
-3. 排空旧writer，核对全部configured fleet与精确32-byte protected ref key identity；
-4. 由受控one-shot operator调用现有原子activation store，确认receipt/coverage及全fleet startup audit；
-5. 开启writer tracking，再开启runner worker并验证真实adapter namespace identity；
-6. 最后开启router destructive gate；
-7. 首个activation/inventory/ACK/cutover提交后只能forward-fix。
+1. 应用`0032`/`0033`/`0034` expand-only migration，tracking/writer/execution默认关闭；
+2. 若0033已active，先由0034 guard阻断stale writer；已有subject gap时关闭tenant admission、排空pre-0034 writer、停止全部应用writer，并以精确key和三项固定ACK执行DDL-free全量reconcile；inactive或无gap历史无需该特殊模式；
+3. 未来发布真正双写spool/inventory且声明对应capability的router/runner，所有gate保持`0`；
+4. 排空旧writer，核对全部configured fleet与精确32-byte protected ref key identity；
+5. 由受控one-shot operator调用现有原子activation store，确认receipt/coverage及全fleet startup audit；
+6. 开启application durable dual-write，再按adapter protocol开启runner worker并验证真实adapter namespace identity；
+7. 最后开启router destructive gate；
+8. 首个activation/inventory/ACK/cutover提交后只能forward-fix。
 
 现有长期应用没有步骤2、5、6所需的gate/adapter装配，因此生产环境不得仅凭store API存在就执行步骤4。
 
@@ -361,10 +438,17 @@ trace batch复活。尚未 ACK 的首次外部 mutation不能从旧快照猜造�
 - router拒绝 runner-only output path；
 - runner/router started与draining只输出安全计数/布尔值。
 
-`0032/0033` content-free入口/证据helper为**6/6**；`0033` Memory原子activation/coverage/inventory为**9/9**，真实MySQL
-事务回滚、并发、启动审计与隔离为**9/9**；`0032 -> 0033`历史迁移夹具为**6/6**。CI与本地verify均以
-命名required suite和no-skip断言证明这些套件实际执行。后续仍需应用writer双写、真实本地adapter、
-delete/ACK worker、lease loss、legal-hold destructive竞态、response-loss mutation replay与restore测试。
+`0034`定向门禁分为：`pnpm test:tenant-telemetry-writer`验证payload、Memory/HTTP adapter、worker与
+Memory store；`pnpm test:tenant-telemetry-writer-mysql`验证真实InnoDB spool/claim/reservation/ACK/T1收口；
+`pnpm test:migrations`中的`0033 -> 0034`夹具验证历史升级、active gap拒绝、专用reconcile全回滚/exact
+replay，以及current/stale/in-flight writer并发与metadata-lock语义。CI与本地verify已接线这些required
+suite，要求目标文件实际pass且零skip/non-passed。0034 writer unit group为39/39、真实MySQL为13/13；
+本切片最终`verify`主报告为152 files passed / 7 skipped、1824 passed / 34 skipped / 0 failed，覆盖率为
+78.84% statements / 74.75% branches / 85.17% functions / 81.65% lines；固定历史migration为27 files /
+192 passed、其中0033→0034为15/15，cluster主套件8/8、tenant Redis purge cluster 3/3，`verify-s3`
+六组门禁分别为10/10、4/4、6/6、1/1、1/1、11/11且源码装配通过；易变的完整明细以
+`docs/PROGRESS.md`最后一节和对应CI run为准。后续仍需application dual-write、真实sink、delete/restore
+executor、legal-hold destructive竞态、全域completion与managed环境测试。
 
 ## 10. Staging / Production 边界
 

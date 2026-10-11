@@ -92,8 +92,35 @@ interface SetupExtras {
   providers?: ProviderResolver;
   summariser?: Summariser;
   blobs?: SessionBlobService;
+  logger?: Pick<Console, "info" | "warn" | "error">;
   onOwnershipLost?: () => void;
 }
+
+interface OwnershipLossTestState {
+  ownershipLossReported?: boolean;
+  fenced?: boolean;
+  closingRequested: boolean;
+  abort: AbortController;
+  pendingApprovals: Map<string, unknown>;
+}
+
+function ownershipLossSnapshot(state: OwnershipLossTestState | undefined) {
+  return {
+    fenced: state?.fenced,
+    closingRequested: state?.closingRequested,
+    ownershipLossReported: state?.ownershipLossReported,
+    aborted: state?.abort.signal.aborted,
+    pendingApprovals: state?.pendingApprovals.size,
+  };
+}
+
+const completedOwnershipLossSafety = {
+  fenced: true,
+  closingRequested: true,
+  ownershipLossReported: true,
+  aborted: true,
+  pendingApprovals: 0,
+};
 
 async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> = {}, cfg: Partial<SessionHostDeps["config"]> = {}, extras: SetupExtras = {}) {
   const store = extras.store ?? new MemorySessionStore();
@@ -111,7 +138,7 @@ async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> 
     store, lease, bus, engine, providers: extras.providers ?? providers, summariser: extras.summariser, blobs: extras.blobs,
     tools: new StaticToolRegistry([echoTool, dangerousTool, slowTool, circularDetailsTool, jsonPayloadTool]),
     config: { runnerId: "r1", runnerAddr: "127.0.0.1:1", leaseTtlMs: 2000, leaseHoldMs: 50, approvalTtlMs: 5000, ...cfg },
-    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    logger: extras.logger ?? { info: () => {}, warn: () => {}, error: () => {} },
     onOwnershipLost: extras.onOwnershipLost,
   });
   const session = await host.createSession(principal, { agentId: agent.id, metadata: {} });
@@ -1823,17 +1850,28 @@ describe("SessionHost", () => {
     await waitFor(() => ((h.host as unknown as { active: Map<string, unknown> }).active.size === 0 ? true : undefined));
   });
 
-  it("keeps ownership-loss telemetry no-throw and exactly once across repeated loss paths", async () => {
+  it("finishes lease-loss safety cleanup before no-throw, exactly-once observability", async () => {
     const lease = new ToggleRenewLeaseStore();
     let notifications = 0;
+    let activeState: OwnershipLossTestState | undefined;
+    const observations: ReturnType<typeof ownershipLossSnapshot>[] = [];
     const h = await setup(
-      [{ text: "slow response", delayMs: 500 }],
+      [{ text: "", toolCalls: [{ name: "danger", args: { text: "x" } }] }, { text: "must not run" }],
       {},
-      { leaseTtlMs: 60 },
+      { leaseTtlMs: 60, approvalTtlMs: 60_000 },
       {
         lease,
+        logger: {
+          info: () => {},
+          warn: () => {},
+          error: () => {
+            observations.push(ownershipLossSnapshot(activeState));
+            throw new Error("injected logger sink failure");
+          },
+        },
         onOwnershipLost: () => {
           notifications += 1;
+          observations.push(ownershipLossSnapshot(activeState));
           throw new Error("injected telemetry sink failure");
         },
       },
@@ -1844,21 +1882,70 @@ describe("SessionHost", () => {
       metadata: {},
     });
     begun.run();
-    await waitFor(() => (h.engine.received.length > 0 ? true : undefined));
+    await waitFor(() => h.events.find((event) => event.type === "approval/requested"));
     const internals = h.host as unknown as {
-      active: Map<string, { ownershipLossReported?: boolean }>;
-      onCommitError(state: { ownershipLossReported?: boolean }, error: unknown): void;
+      active: Map<string, OwnershipLossTestState>;
+      onCommitError(state: OwnershipLossTestState, error: unknown): void;
     };
-    const activeState = internals.active.get(h.session.id)!;
+    activeState = internals.active.get(h.session.id)!;
+    expect(activeState.pendingApprovals.size).toBe(1);
 
     lease.rejectRenewal = true;
     await waitFor(() => (internals.active.size === 0 ? true : undefined));
     expect(notifications).toBe(1);
+    expect(observations).toEqual([completedOwnershipLossSafety, completedOwnershipLossSafety]);
+    expect(ownershipLossSnapshot(activeState)).toEqual(completedOwnershipLossSafety);
 
     // A concurrent durable FenceError observation must use the same once latch.
-    internals.onCommitError(activeState, new FenceError(h.session.id, 1, 2));
+    expect(() => internals.onCommitError(activeState!, new FenceError(h.session.id, 1, 2))).not.toThrow();
     expect(notifications).toBe(1);
     expect(activeState.ownershipLossReported).toBe(true);
+  });
+
+  it("does not let a throwing logger replace a FenceError after ownership cleanup", async () => {
+    let notifications = 0;
+    let activeState: OwnershipLossTestState | undefined;
+    const observations: ReturnType<typeof ownershipLossSnapshot>[] = [];
+    const h = await setup(
+      [{ text: "", toolCalls: [{ name: "danger", args: { text: "x" } }] }, { text: "must not run" }],
+      {},
+      { approvalTtlMs: 60_000 },
+      {
+        logger: {
+          info: () => {},
+          warn: () => {},
+          error: () => {
+            observations.push(ownershipLossSnapshot(activeState));
+            throw new Error("injected logger sink failure");
+          },
+        },
+        onOwnershipLost: () => {
+          notifications += 1;
+          observations.push(ownershipLossSnapshot(activeState));
+          throw new Error("injected telemetry sink failure");
+        },
+      },
+    );
+    await h.host.startTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "start" }],
+      stream: true,
+      metadata: {},
+    });
+    await waitFor(() => h.events.find((event) => event.type === "approval/requested"));
+    const internals = h.host as unknown as {
+      active: Map<string, OwnershipLossTestState>;
+      onCommitError(state: OwnershipLossTestState, error: unknown): void;
+    };
+    activeState = internals.active.get(h.session.id)!;
+    expect(activeState.pendingApprovals.size).toBe(1);
+
+    expect(() => internals.onCommitError(activeState!, new FenceError(h.session.id, 1, 2))).not.toThrow();
+    expect(observations).toEqual([completedOwnershipLossSafety, completedOwnershipLossSafety]);
+    expect(ownershipLossSnapshot(activeState)).toEqual(completedOwnershipLossSafety);
+    expect(notifications).toBe(1);
+
+    internals.onCommitError(activeState, new FenceError(h.session.id, 1, 3));
+    expect(notifications).toBe(1);
   });
 
   it("keeps a gate-raced object inaccessible as staging and reclaims it through cleanup", async () => {

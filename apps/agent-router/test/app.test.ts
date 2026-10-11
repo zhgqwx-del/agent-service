@@ -2787,7 +2787,7 @@ describe("operational endpoints", () => {
     });
   });
 
-  it("strictly regenerates and forwards trace context without logging raw targets", async () => {
+  it("starts a fresh internal trace at public ingress without logging raw targets", async () => {
     const records: Readonly<StructuredTelemetryRecord>[] = [];
     const telemetry = createStructuredTelemetry({
       component: "router",
@@ -2803,20 +2803,19 @@ describe("operational endpoints", () => {
     });
     const app = createRouterApp({ registry: fakeRegistry([target]), telemetry });
     const parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03";
-    const inheritedResponse = await app.request("/v1/agents", {
+    const boundaryResponse = await app.request("/v1/agents", {
       headers: {
         baggage: "tenant=raw-private",
         traceparent: parent,
         tracestate: "vendor=raw-private",
       },
     });
-    expect(inheritedResponse.status).toBe(200);
-    await inheritedResponse.text();
+    expect(boundaryResponse.status).toBe(200);
+    await boundaryResponse.text();
     const forwarded = parseTraceparent(forwardedHeaders[0]!.get("traceparent"));
-    expect(forwarded).toMatchObject({
-      traceId: parseTraceparent(parent)!.traceId,
-      traceFlags: "03",
-    });
+    expect(forwarded).toBeDefined();
+    expect(forwarded!.traceId).not.toBe(parseTraceparent(parent)!.traceId);
+    expect(forwarded!.traceFlags).toBe("00");
     expect(forwarded!.spanId).not.toBe(parseTraceparent(parent)!.spanId);
     expect(forwardedHeaders[0]!.has("baggage")).toBe(false);
     expect(forwardedHeaders[0]!.has("tracestate")).toBe(false);
@@ -2828,6 +2827,7 @@ describe("operational endpoints", () => {
     await regeneratedResponse.text();
     const regenerated = parseTraceparent(forwardedHeaders[1]!.get("traceparent"));
     expect(regenerated).toBeDefined();
+    expect(regenerated!.traceId).not.toBe(forwarded!.traceId);
     expect(forwardedHeaders[1]!.get("traceparent")).not.toContain("raw-private");
 
     fetchMock.mockRejectedValueOnce(new TypeError("raw-secret https://private.invalid"));
@@ -2865,8 +2865,8 @@ describe("operational endpoints", () => {
     expect(records[1]).toMatchObject({
       code: "router.unhandled_error",
       fields: { errorKind: "unknown" },
-      traceId: parseTraceparent(parent)!.traceId,
     });
+    expect(records[1]!.traceId).not.toBe(parseTraceparent(parent)!.traceId);
     const allEncoded = JSON.stringify(records);
     expect(allEncoded).not.toContain("raw-owner");
     expect(allEncoded).not.toContain("raw-secret");

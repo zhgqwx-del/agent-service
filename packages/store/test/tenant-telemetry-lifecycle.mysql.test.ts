@@ -176,6 +176,121 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
+    it("keeps inactive T1 subject-free and atomically closes it during activation", async () => {
+      const ctx = await fixture();
+      try {
+        const session = mkSession(
+          "tenant-telemetry-preactivation-subject",
+          "user-telemetry-preactivation-subject",
+        );
+        await ctx.store.createApiKey(
+          session.tenantId,
+          "telemetry-preactivation-key",
+          digest("telemetry-preactivation-key"),
+        );
+        await ctx.store.createSession(session);
+        const input = {
+          requestId: newErasureRequestId(),
+          tenantId: session.tenantId,
+          requestedByKeyId: "telemetry-subject-test",
+          idempotencyKey: `telemetry-preactivation-${randomUUID()}`,
+          requestHash: tenantErasureRequestHash(session.tenantId),
+          atMs: Date.now(),
+        };
+        const admission = await ctx.store.requestTenantErasure(input);
+        expect(await ctx.store.getTenantTelemetryLifecycleSubject(
+          session.tenantId,
+          admission.requestId,
+        )).toBeNull();
+        const [dormantRows] = await ctx.conn.query<Row[]>(
+          "SELECT COUNT(*) AS count FROM tenant_telemetry_lifecycle_subjects",
+        );
+        expect(Number(dormantRows[0]?.count)).toBe(0);
+
+        const activated = await ctx.store.activateTenantTelemetryLifecycle(activation());
+        expect(await ctx.store.getTenantTelemetryLifecycleSubject(
+          session.tenantId,
+          admission.requestId,
+        )).toMatchObject({
+          requestId: admission.requestId,
+          tenantId: session.tenantId,
+          subjectGeneration: admission.generation,
+          targetRootSha256: activated.control.targetRootSha256,
+        });
+        expect(await ctx.store.getTenantTelemetryLifecycleSubject(
+          "tenant-telemetry-other",
+          admission.requestId,
+        )).toBeNull();
+        expect(await ctx.store.requestTenantErasure(input)).toEqual(admission);
+
+        const reopened = await MysqlSessionStore.connect({
+          url: ctx.url,
+          connectionLimit: 2,
+          tenantTelemetryRefKey: REF_KEY,
+        });
+        await reopened.close();
+      } finally {
+        await ctx.close();
+      }
+    });
+
+    it("rolls back active T1 when subject publication fails", async () => {
+      const ctx = await fixture();
+      try {
+        await ctx.store.activateTenantTelemetryLifecycle(activation());
+        const session = mkSession(
+          "tenant-telemetry-subject-rollback",
+          "user-telemetry-subject-rollback",
+        );
+        await ctx.store.createApiKey(
+          session.tenantId,
+          "telemetry-subject-rollback-key",
+          digest("telemetry-subject-rollback-key"),
+        );
+        await ctx.store.createSession(session);
+        const input = {
+          requestId: newErasureRequestId(),
+          tenantId: session.tenantId,
+          requestedByKeyId: "telemetry-subject-test",
+          idempotencyKey: `telemetry-subject-rollback-${randomUUID()}`,
+          requestHash: tenantErasureRequestHash(session.tenantId),
+          atMs: Date.now(),
+        };
+        const triggerName = `test_telemetry_subject_rollback_${randomUUID()
+          .replaceAll("-", "").slice(0, 8)}`;
+        await ctx.conn.query(
+          `CREATE TRIGGER \`${triggerName}\` BEFORE INSERT
+             ON tenant_telemetry_lifecycle_subjects FOR EACH ROW
+           SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected telemetry subject failure'`,
+        );
+        try {
+          await expect(ctx.store.requestTenantErasure(input))
+            .rejects.toThrow("injected telemetry subject failure");
+        } finally {
+          await ctx.conn.query(`DROP TRIGGER IF EXISTS \`${triggerName}\``);
+        }
+        const [rows] = await ctx.conn.query<Row[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE tenant_id=?) AS admissions,
+             (SELECT COUNT(*) FROM tenant_credential_revocation_fences WHERE tenant_id=?) AS fences,
+             (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_subjects WHERE tenant_id=?) AS subjects,
+             (SELECT state FROM subject_lifecycle
+               WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?) AS lifecycle_state`,
+          [session.tenantId, session.tenantId, session.tenantId,
+            session.tenantId, session.tenantId],
+        );
+        expect(Number(rows[0]?.admissions)).toBe(0);
+        expect(Number(rows[0]?.fences)).toBe(0);
+        expect(Number(rows[0]?.subjects)).toBe(0);
+        expect(String(rows[0]?.lifecycle_state)).toBe("active");
+        await expect(ctx.store.requestTenantErasure(input)).resolves.toMatchObject({
+          requestId: input.requestId,
+        });
+      } finally {
+        await ctx.close();
+      }
+    });
+
     it("publishes no partial state on serialization or SQL rollback failure", async () => {
       const ctx = await fixture();
       try {
@@ -334,16 +449,32 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
             tenantId: session.tenantId,
             historyStatus: "complete_since_creation",
           });
+        const subject = await ctx.store.getTenantTelemetryLifecycleSubject(
+          session.tenantId,
+          results[0]!.requestId,
+        );
+        expect(subject).toMatchObject({
+          requestId: results[0]!.requestId,
+          tenantId: session.tenantId,
+          subjectGeneration: results[0]!.generation,
+        });
+        expect(await ctx.store.getTenantTelemetryLifecycleSubject(
+          "tenant-telemetry-other",
+          results[0]!.requestId,
+        )).toBeNull();
         const [rows] = await ctx.conn.query<Row[]>(
           `SELECT
              (SELECT COUNT(*) FROM tenant_erasure_admissions WHERE tenant_id=?)
                AS admission_count,
              (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_coverages WHERE tenant_id=?)
-               AS coverage_count`,
-          [session.tenantId, session.tenantId],
+               AS coverage_count,
+             (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_subjects WHERE tenant_id=?)
+               AS subject_count`,
+          [session.tenantId, session.tenantId, session.tenantId],
         );
         expect(Number(rows[0]?.admission_count)).toBe(1);
         expect(Number(rows[0]?.coverage_count)).toBe(1);
+        expect(Number(rows[0]?.subject_count)).toBe(1);
 
         const reopened = await MysqlSessionStore.connect({
           url: ctx.url,
@@ -555,6 +686,58 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(Number(mixedRows[0]?.lifecycle_count)).toBe(0);
         expect(Number(mixedRows[0]?.coverage_count)).toBe(0);
         expect(Number(mixedRows[0]?.session_count)).toBe(0);
+      } finally {
+        await ctx.close();
+      }
+    });
+
+    it("fails closed on a missing active T1 subject during reads and startup", async () => {
+      const ctx = await fixture();
+      try {
+        await ctx.store.activateTenantTelemetryLifecycle(activation());
+        const session = mkSession(
+          "tenant-telemetry-subject-gap",
+          "user-telemetry-subject-gap",
+        );
+        await ctx.store.createApiKey(
+          session.tenantId,
+          "telemetry-subject-gap-key",
+          digest("telemetry-subject-gap-key"),
+        );
+        await ctx.store.createSession(session);
+        const admission = await ctx.store.requestTenantErasure({
+          requestId: newErasureRequestId(),
+          tenantId: session.tenantId,
+          requestedByKeyId: "telemetry-subject-test",
+          idempotencyKey: `telemetry-subject-gap-${randomUUID()}`,
+          requestHash: tenantErasureRequestHash(session.tenantId),
+          atMs: Date.now(),
+        });
+        const [triggerRows] = await ctx.conn.query<Row[]>(
+          "SHOW CREATE TRIGGER trg_tenant_telemetry_subjects_bd",
+        );
+        const triggerDdl = String(triggerRows[0]?.["SQL Original Statement"] ?? "");
+        expect(triggerDdl).toContain("CREATE");
+        await ctx.conn.query("DROP TRIGGER trg_tenant_telemetry_subjects_bd");
+        await ctx.conn.query(
+          "DELETE FROM tenant_telemetry_lifecycle_subjects WHERE request_id=?",
+          [admission.requestId],
+        );
+        await ctx.conn.query(triggerDdl);
+
+        await expect(ctx.store.getTenantTelemetryLifecycleSubject(
+          session.tenantId,
+          admission.requestId,
+        )).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+        await expect(ctx.store.getTenantErasureRequest(
+          session.tenantId,
+          admission.requestId,
+        )).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+        await expect(MysqlSessionStore.connect({
+          url: ctx.url,
+          connectionLimit: 2,
+          tenantTelemetryRefKey: REF_KEY,
+        })).rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
       } finally {
         await ctx.close();
       }

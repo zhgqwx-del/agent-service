@@ -33,6 +33,9 @@ for (const [file, minLines, hint] of required) {
 }
 
 const requiredTestFiles = [
+  "packages/protocol/test/telemetry.test.ts",
+  "packages/core/test/host.test.ts",
+  "apps/agent-router/test/app.test.ts",
   "packages/store/test/blob-lifecycle.mysql.test.ts",
   "packages/store/test/blob-storage-control.memory.test.ts",
   "packages/store/test/blob-storage-control.mysql.test.ts",

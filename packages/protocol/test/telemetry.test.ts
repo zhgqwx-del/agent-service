@@ -1,14 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertTrustedStructuredTelemetryRecord,
+  assertTrustedStructuredTelemetryRecordOwnerBinding,
   createStructuredTelemetry,
   currentTraceContext,
   formatTraceparent,
+  isTrustedStructuredTelemetryRecord,
   outgoingTraceparent,
   parseTraceparent,
+  startBoundaryTraceContext,
   startTraceContext,
   telemetryErrorKind,
   telemetryOpaqueRef,
   telemetryOpaqueRefSha256,
+  validateStructuredTelemetryRecord,
   withTraceContext,
   type StructuredTelemetryRecord,
 } from "../src/index.js";
@@ -83,9 +88,69 @@ describe("W3C trace context", () => {
     expect(parseTraceparent(formatTraceparent(context))).toEqual(context);
     expect(formatTraceparent(context)).not.toContain("private-header-value");
   });
+
+  it("starts a fresh internal root at a public boundary", () => {
+    const incoming = parseTraceparent(PARENT)!;
+    const first = startBoundaryTraceContext();
+    const second = startBoundaryTraceContext();
+    expect(parseTraceparent(formatTraceparent(first))).toEqual(first);
+    expect(first.traceId).not.toBe(incoming.traceId);
+    expect(first.spanId).not.toBe(incoming.spanId);
+    expect(second.traceId).not.toBe(first.traceId);
+    expect(first.traceFlags).toBe("00");
+  });
 });
 
 describe("structured telemetry", () => {
+  it("canonicalizes untrusted records and rejects extra or partial trace fields", () => {
+    const record = validateStructuredTelemetryRecord({
+      schema: "agent-service.telemetry.v1",
+      timestampMs: 123,
+      level: "warn",
+      component: "runner",
+      code: "runner.runtime.warning",
+      traceId: "1".repeat(32),
+      spanId: "2".repeat(16),
+      fields: {
+        ownerRef: `oref_owner_${"3".repeat(64)}`,
+        retryable: true,
+      },
+    });
+    expect(record).toEqual({
+      schema: "agent-service.telemetry.v1",
+      timestampMs: 123,
+      level: "warn",
+      component: "runner",
+      code: "runner.runtime.warning",
+      traceId: "1".repeat(32),
+      spanId: "2".repeat(16),
+      fields: {
+        ownerRef: `oref_owner_${"3".repeat(64)}`,
+        retryable: true,
+      },
+    });
+    expect(Object.isFrozen(record)).toBe(true);
+    expect(Object.isFrozen(record.fields)).toBe(true);
+    expect(isTrustedStructuredTelemetryRecord(record)).toBe(false);
+    expect(() => assertTrustedStructuredTelemetryRecord(record))
+      .toThrow(/not produced by createStructuredTelemetry/);
+
+    expect(() => validateStructuredTelemetryRecord({
+      ...record,
+      rawTenantId: "tenant-secret",
+    })).toThrow(/unknown or missing/);
+    const { spanId: _spanId, ...partialTrace } = record;
+    expect(() => validateStructuredTelemetryRecord(partialTrace)).toThrow(/provided together/);
+    expect(() => validateStructuredTelemetryRecord({
+      ...record,
+      fields: { ...record.fields, message: "secret" },
+    })).toThrow(/not allowlisted/);
+    expect(() => validateStructuredTelemetryRecord({
+      ...record,
+      component: "router",
+    })).toThrow(/match its component/);
+  });
+
   it("emits only allowlisted fields with keyed, domain-separated opaque refs", () => {
     const records: Readonly<StructuredTelemetryRecord>[] = [];
     const mutableKey = Buffer.alloc(32, 7);
@@ -132,6 +197,98 @@ describe("structured telemetry", () => {
     expect(encoded).not.toContain(rawOwner);
     expect(encoded).not.toContain("sess_private");
     expect(records[0]!.fields).not.toHaveProperty("targetRef");
+    expect(isTrustedStructuredTelemetryRecord(records[0])).toBe(true);
+    expect(() => assertTrustedStructuredTelemetryRecord(records[0])).not.toThrow();
+  });
+
+  it("binds durable record provenance to the producer key and exact lifecycle owner", () => {
+    const key = Buffer.alloc(32, 9);
+    let record: Readonly<StructuredTelemetryRecord> | undefined;
+    const telemetry = createStructuredTelemetry({
+      component: "runner",
+      opaqueRefKey: key,
+      sink: { write(value) { record = value; } },
+      now: () => 456,
+    });
+    telemetry.info("runner.runtime.info", {
+      ownerRef: telemetry.opaqueRef("tenant", "tenant-a"),
+      subjectRef: telemetry.opaqueRef("session", "session-owner"),
+    });
+    expect(record).toBeDefined();
+    expect(() => assertTrustedStructuredTelemetryRecordOwnerBinding(
+      record,
+      "tenant-a",
+      "session",
+      "session-owner",
+      Buffer.alloc(32, 9),
+    )).not.toThrow();
+    expect(() => assertTrustedStructuredTelemetryRecordOwnerBinding(
+      record,
+      "tenant-a",
+      "session",
+      "session-owner",
+      Buffer.alloc(32, 10),
+    )).toThrow(/producer key/);
+    expect(() => assertTrustedStructuredTelemetryRecordOwnerBinding(
+      record,
+      "tenant-a",
+      "session",
+      "another-session",
+      Buffer.alloc(32, 9),
+    )).toThrow(/owner binding/);
+    expect(() => assertTrustedStructuredTelemetryRecordOwnerBinding(
+      record,
+      "tenant-b",
+      "session",
+      "session-owner",
+      Buffer.alloc(32, 9),
+    )).toThrow(/tenant binding/);
+
+    let userRecord: Readonly<StructuredTelemetryRecord> | undefined;
+    const userTelemetry = createStructuredTelemetry({
+      component: "runner",
+      opaqueRefKey: key,
+      sink: { write(value) { userRecord = value; } },
+      now: () => 457,
+    });
+    userTelemetry.info("runner.runtime.info", {
+      ownerRef: userTelemetry.opaqueRef("tenant", "tenant-a"),
+      subjectRef: userTelemetry.opaqueRef("user", "shared-user"),
+    });
+    expect(() => assertTrustedStructuredTelemetryRecordOwnerBinding(
+      userRecord,
+      "tenant-a",
+      "user",
+      "shared-user",
+      key,
+    )).not.toThrow();
+    expect(() => assertTrustedStructuredTelemetryRecordOwnerBinding(
+      userRecord,
+      "tenant-b",
+      "user",
+      "shared-user",
+      key,
+    )).toThrow(/tenant binding/);
+
+    let crossOwnerRecord: Readonly<StructuredTelemetryRecord> | undefined;
+    const crossOwnerTelemetry = createStructuredTelemetry({
+      component: "runner",
+      opaqueRefKey: key,
+      sink: { write(value) { crossOwnerRecord = value; } },
+      now: () => 458,
+    });
+    crossOwnerTelemetry.info("runner.runtime.info", {
+      ownerRef: crossOwnerTelemetry.opaqueRef("tenant", "tenant-a"),
+      subjectRef: crossOwnerTelemetry.opaqueRef("session", "session-owner"),
+      targetRef: crossOwnerTelemetry.opaqueRef("session", "another-session"),
+    });
+    expect(() => assertTrustedStructuredTelemetryRecordOwnerBinding(
+      crossOwnerRecord,
+      "tenant-a",
+      "session",
+      "session-owner",
+      key,
+    )).toThrow(/cross-owner lifecycle reference/);
   });
 
   it("rejects non-allowlisted fields, codes, refs, and short keys", () => {
@@ -163,6 +320,19 @@ describe("structured telemetry", () => {
       "runner.unhandled_error",
       { ownerRef: "raw-owner" } as never,
     )).toThrow(/opaque reference/);
+    expect(() => telemetry.info(
+      "runner.unhandled_error",
+      { ownerRef: `oref_owner_${"f".repeat(64)}` },
+    )).toThrow(/not produced by this telemetry instance/);
+    const other = createStructuredTelemetry({
+      component: "runner",
+      opaqueRefKey: Buffer.alloc(32, 1),
+      sink: { write: () => {} },
+    });
+    expect(() => telemetry.info(
+      "runner.unhandled_error",
+      { ownerRef: other.opaqueRef("owner", "same-shape-different-producer") },
+    )).toThrow(/not produced by this telemetry instance/);
     expect(() => telemetry.info("secret-as-code" as never)).toThrow(/event code/);
     expect(() => telemetry.info("router.owner_reroute")).toThrow(/match its component/);
     const invalidClock = createStructuredTelemetry({

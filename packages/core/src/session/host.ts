@@ -316,6 +316,14 @@ export class SessionHost {
     }
   }
 
+  private logTurnStop(level: "warn" | "error", ...args: unknown[]): void {
+    try {
+      this.log[level](...args);
+    } catch {
+      // Observability must not escape after a safety stop transition.
+    }
+  }
+
   get cfg() {
     const c = this.deps.config;
     return {
@@ -1585,7 +1593,7 @@ export class SessionHost {
       this.failPendingApprovals(state, "cancel");
       this.reportOwnershipLost(state);
       if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
-      this.log.error(`[session ${sessionId}] lease lost; runner no longer owns the session; aborting turn ${turn.id}`);
+      this.logTurnStop("error", `[session ${sessionId}] lease lost; runner no longer owns the session; aborting turn ${turn.id}`);
     });
     if (runtimeLease) {
       const onRuntimeFence = () => {
@@ -2688,7 +2696,7 @@ export class SessionHost {
       this.failPendingApprovals(state, "cancel");
       this.reportOwnershipLost(state);
       if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
-      this.log.warn(`[session ${state.session.id}] session was ${lifecycleState} mid-turn; stopping turn ${state.turn.id}`);
+      this.logTurnStop("warn", `[session ${state.session.id}] session was ${lifecycleState} mid-turn; stopping turn ${state.turn.id}`);
       return;
     }
     const wasAlreadyFenced = state.fenced === true;
@@ -2704,9 +2712,9 @@ export class SessionHost {
     if (err instanceof FenceError) this.reportOwnershipLost(state);
     if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
     if (err instanceof FenceError) {
-      if (!wasAlreadyFenced) this.log.error(`[session ${state.session.id}] fenced out (${err.message}); aborting turn ${state.turn.id}`);
+      if (!wasAlreadyFenced) this.logTurnStop("error", `[session ${state.session.id}] fenced out (${err.message}); aborting turn ${state.turn.id}`);
     } else {
-      this.log.error(`[session ${state.session.id}] commit failed`, err);
+      this.logTurnStop("error", `[session ${state.session.id}] commit failed`, err);
     }
   }
 

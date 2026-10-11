@@ -1027,6 +1027,10 @@ export interface TenantTelemetryLifecycleStore {
   getTenantTelemetryLifecycleCoverage(
     tenantId: string,
   ): Promise<TenantTelemetryLifecycleCoverageRecord | null>;
+  getTenantTelemetryLifecycleSubject(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetryLifecycleSubjectRecord | null>;
   activateTenantTelemetryLifecycle(
     input: ActivateTenantTelemetryLifecycleInput,
   ): Promise<TenantTelemetryLifecycleActivationResult>;

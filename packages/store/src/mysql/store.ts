@@ -201,6 +201,7 @@ import {
   TENANT_TELEMETRY_LIFECYCLE_CONTROL_SINGLETON_ID,
   TENANT_TELEMETRY_LIFECYCLE_COVERAGE_SCOPE,
   TENANT_TELEMETRY_LIFECYCLE_PROTOCOL,
+  TENANT_TELEMETRY_LIFECYCLE_SUBJECT_SCOPE,
   TENANT_TELEMETRY_LIFECYCLE_TARGET_SCOPE,
   TENANT_TELEMETRY_RETENTION_CLASS,
   TENANT_TELEMETRY_WRITER_PROTOCOL,
@@ -213,6 +214,7 @@ import {
   tenantTelemetryLifecycleActivationRequestSha256,
   tenantTelemetryLifecycleCoverageEvidenceSha256,
   tenantTelemetryLifecycleCoverageRootSha256,
+  tenantTelemetryLifecycleSubjectReceiptSha256,
   tenantTelemetryLifecycleTargetReceiptSha256,
   tenantTelemetryLifecycleTargetRootSha256,
   tenantTelemetryLifecycleTargetSha256,
@@ -226,6 +228,7 @@ import {
   validateTenantTelemetryLifecycleActivationReceipt,
   validateTenantTelemetryLifecycleControl,
   validateTenantTelemetryLifecycleCoverage,
+  validateTenantTelemetryLifecycleSubject,
   validateTenantTelemetryLifecycleTarget,
   type ActivateTenantTelemetryLifecycleInput,
   type ActiveTenantTelemetryLifecycleControlRecord,
@@ -237,9 +240,12 @@ import {
   type TenantTelemetryLifecycleActivationResult,
   type TenantTelemetryLifecycleControlRecord,
   type TenantTelemetryLifecycleCoverageRecord,
+  type TenantTelemetryLifecycleSubjectBody,
+  type TenantTelemetryLifecycleSubjectRecord,
   type TenantTelemetryLifecycleStore,
   type TenantTelemetryLifecycleTargetRecord,
 } from "../tenant-telemetry-lifecycle.js";
+import * as TenantTelemetryWriter from "../tenant-telemetry-writer.js";
 import * as BackupCatalog from "../backup-catalog.js";
 import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
 import {
@@ -886,12 +892,72 @@ const TENANT_TELEMETRY_ACTIVATION_INVENTORY_MIGRATION_NAME =
   "0033_tenant_telemetry_activation_inventory.sql";
 const TENANT_TELEMETRY_ACTIVATION_INVENTORY_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-activation-inventory";
+const TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME =
+  "0034_tenant_telemetry_durable_writer.sql";
+const TENANT_TELEMETRY_DURABLE_WRITER_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-durable-writer";
 
 function mysqlMigrationStatements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "")
     .split(/;\s*\n/)
     .map((statement) => statement.trim())
     .filter(Boolean);
+}
+
+const TENANT_TELEMETRY_T1_BOOTSTRAP_TRIGGER_NAME =
+  "trg_tenant_telemetry_t1_job_bi_bootstrap";
+const TENANT_TELEMETRY_T1_BOOTSTRAP_TRIGGER_PREFIX =
+  `CREATE TRIGGER ${TENANT_TELEMETRY_T1_BOOTSTRAP_TRIGGER_NAME} `
+  + "BEFORE INSERT ON tenant_credential_revocation_jobs FOR EACH ROW ";
+
+function canonicalMysqlTriggerActionStatement(value: string): string {
+  return value
+    .replaceAll(/\s/g, "")
+    .replaceAll("`", "")
+    .replaceAll("_utf8mb4", "")
+    .toLowerCase();
+}
+
+async function executeMysqlMigrationStatement(
+  conn: PoolConnection,
+  migrationName: string,
+  statement: string,
+): Promise<void> {
+  if (migrationName !== TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME
+    || !statement.startsWith(TENANT_TELEMETRY_T1_BOOTSTRAP_TRIGGER_PREFIX)) {
+    await conn.query(statement);
+    return;
+  }
+
+  const expectedActionStatement = statement.slice(
+    TENANT_TELEMETRY_T1_BOOTSTRAP_TRIGGER_PREFIX.length,
+  );
+  if (expectedActionStatement.length === 0) {
+    throw new Error("0034 tenant telemetry T1 bootstrap trigger statement is invalid");
+  }
+  const [rows] = await conn.query<Row[]>(
+    `SELECT event_object_table AS table_name,action_timing AS timing,
+            event_manipulation AS manipulation,action_orientation AS orientation,
+            action_condition AS condition_value,action_statement AS statement_value
+       FROM information_schema.triggers
+      WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`,
+    [TENANT_TELEMETRY_T1_BOOTSTRAP_TRIGGER_NAME],
+  );
+  if (rows.length === 0) {
+    await conn.query(statement);
+    return;
+  }
+  const existing = rows[0];
+  if (rows.length !== 1
+    || existing?.table_name !== "tenant_credential_revocation_jobs"
+    || existing.timing !== "BEFORE"
+    || existing.manipulation !== "INSERT"
+    || existing.orientation !== "ROW"
+    || existing.condition_value !== null
+    || canonicalMysqlTriggerActionStatement(String(existing.statement_value))
+      !== canonicalMysqlTriggerActionStatement(expectedActionStatement)) {
+    throw new Error("0034 tenant telemetry T1 bootstrap trigger is not exact");
+  }
 }
 
 function tenantRestoreJournalFingerprintStatement(
@@ -969,6 +1035,32 @@ function tenantTelemetryActivationInventoryFingerprintStatement(
   }
   return statements[0]!;
 }
+
+function tenantTelemetryDurableWriterFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+  variable: "telemetry_durable_writer_schema_ok" | "telemetry_durable_writer_trigger_ok",
+): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_DURABLE_WRITER_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_DURABLE_WRITER_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0034 tenant telemetry writer ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @${variable}=`)) {
+    throw new Error(`0034 tenant telemetry writer ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
 const BLOB_STORAGE_CONTROL_COLUMNS = `singleton_id, control_generation, storage_backend,
   namespace_sha256, activated_at_db_ms, evidence_sha256`;
 const TENANT_TELEMETRY_CONTROL_COLUMNS = `singleton_id, control_generation,
@@ -980,6 +1072,9 @@ const TENANT_TELEMETRY_TARGET_COLUMNS = `singleton_id, control_generation, domai
 const TENANT_TELEMETRY_COVERAGE_COLUMNS = `tenant_id, control_generation, scope,
   history_status, subject_ref_sha256, target_count, target_root_sha256,
   coverage_started_at_db_ms, evidence_sha256`;
+const TENANT_TELEMETRY_SUBJECT_COLUMNS = `request_id, tenant_id, subject_generation,
+  control_generation, scope, t1_fence_sha256, coverage_evidence_sha256, history_status,
+  subject_ref_sha256, target_count, target_root_sha256, bound_at_db_ms, receipt_sha256`;
 const TENANT_TELEMETRY_ACTIVATION_RECEIPT_COLUMNS = `singleton_id, control_generation,
   scope, request_sha256, ref_key_id_sha256, target_count, target_root_sha256, coverage_count,
   coverage_root_sha256, control_evidence_sha256, activated_at_db_ms, receipt_sha256`;
@@ -992,6 +1087,24 @@ const TENANT_TELEMETRY_ARTIFACT_INVENTORY_COLUMNS = `inventory_sha256, tenant_id
   tenant_hold_control_generation, tenant_hold_projection_sha256, owner_hold_control_generation,
   owner_hold_projection_sha256, restore_control_generation, restore_lineage_kind,
   restore_updated_at_db_ms, runtime_epoch_sha256, created_at_db_ms, receipt_sha256`;
+const TENANT_TELEMETRY_WRITE_JOB_COLUMNS = `write_operation_sha256, tenant_id, protocol,
+  phase, domain, target_sha256, inventory_sha256, artifact_id_sha256, artifact_generation,
+  payload_sha256, manifest_sha256, inventory_json, record_count, payload_byte_length,
+  available_at_ms, attempts, claim_token, lease_until_ms, last_error_code,
+  mutation_adapter_protocol, mutation_started_at_db_ms, mutation_started_claim_attempt,
+  mutation_started_claim_token_sha256, mutation_reservation_receipt_sha256,
+  write_ack_receipt_sha256, written_at_db_ms, completed_claim_attempt,
+  completed_claim_token_sha256, blocked_at_db_ms, blocked_reason_code, created_at_ms,
+  updated_at_ms`;
+const TENANT_TELEMETRY_WRITE_PAYLOAD_COLUMNS = `write_operation_sha256, tenant_id, domain,
+  payload_json, payload_sha256, record_count, payload_byte_length, created_at_ms`;
+const TENANT_TELEMETRY_WRITE_ACK_COLUMNS = `write_operation_sha256, tenant_id, scope, protocol,
+  domain, target_sha256, target_receipt_sha256, inventory_sha256, inventory_receipt_sha256,
+  artifact_id_sha256, artifact_generation, payload_sha256, manifest_sha256, adapter_protocol,
+  outcome, replayed, adapter_evidence_sha256, reservation_receipt_sha256,
+  mutation_started_at_db_ms, mutation_started_claim_attempt,
+  mutation_started_claim_token_sha256, completed_claim_attempt,
+  completed_claim_token_sha256, store_db_timestamp_ms, receipt_sha256`;
 const BLOB_COLUMNS = `blob_id, tenant_id, user_id, session_id, item_id, purpose, storage_backend,
   storage_format, storage_key, upload_token, state, sha256, size_bytes, content_type,
   uploaded_at_ms, ready_at_ms, staging_expires_at_ms, delete_after_ms, deleted_at_ms,
@@ -1885,6 +1998,44 @@ function rowToTenantTelemetryLifecycleCoverage(
   }
 }
 
+function rowToTenantTelemetryLifecycleSubject(
+  row: Row,
+): TenantTelemetryLifecycleSubjectRecord {
+  const subject: TenantTelemetryLifecycleSubjectRecord = {
+    requestId: String(row.request_id),
+    tenantId: String(row.tenant_id),
+    subjectGeneration: storedSafeInteger(
+      row.subject_generation,
+      "stored tenant telemetry subject generation",
+    ),
+    controlGeneration: storedSafeInteger(
+      row.control_generation,
+      "stored tenant telemetry subject control generation",
+    ) as 1,
+    scope: String(row.scope) as typeof TENANT_TELEMETRY_LIFECYCLE_SUBJECT_SCOPE,
+    t1FenceSha256: String(row.t1_fence_sha256),
+    coverageEvidenceSha256: String(row.coverage_evidence_sha256),
+    historyStatus: String(row.history_status) as TenantTelemetryLifecycleSubjectRecord["historyStatus"],
+    subjectRefSha256: String(row.subject_ref_sha256),
+    targetCount: storedSafeInteger(
+      row.target_count,
+      "stored tenant telemetry subject target count",
+    ) as 2,
+    targetRootSha256: String(row.target_root_sha256),
+    boundAtDbMs: storedSafeInteger(
+      row.bound_at_db_ms,
+      "stored tenant telemetry subject binding time",
+    ),
+    receiptSha256: String(row.receipt_sha256),
+  };
+  try {
+    validateTenantTelemetryLifecycleSubject(subject);
+    return subject;
+  } catch {
+    throw new TenantTelemetryLifecycleIntegrityError();
+  }
+}
+
 function rowToTenantTelemetryLifecycleActivationReceipt(
   row: Row,
 ): TenantTelemetryLifecycleActivationReceipt {
@@ -2013,6 +2164,225 @@ function rowToTenantTelemetryArtifactInventory(
     return inventory;
   } catch {
     throw new TenantTelemetryLifecycleIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryWriteJob(
+  row: Row,
+  target: TenantTelemetryLifecycleTargetRecord,
+): TenantTelemetryWriter.TenantTelemetryWriteJobRecord {
+  try {
+    const inventory = parse<TenantTelemetryArtifactInventoryRecord>(row.inventory_json);
+    validateTenantTelemetryArtifactInventory(inventory);
+    const phase = String(row.phase) as TenantTelemetryWriter.TenantTelemetryWriteJobPhase;
+    const base = {
+      writeOperationSha256: String(row.write_operation_sha256),
+      tenantId: String(row.tenant_id),
+      protocol: String(row.protocol) as typeof TenantTelemetryWriter.TENANT_TELEMETRY_WRITE_PROTOCOL,
+      phase,
+      target,
+      inventory,
+      recordCount: storedSafeInteger(row.record_count, "tenant telemetry write record count", 1),
+      payloadByteLength: storedSafeInteger(
+        row.payload_byte_length,
+        "tenant telemetry write payload byte length",
+        1,
+      ),
+      attempts: storedSafeInteger(row.attempts, "tenant telemetry write attempts"),
+      createdAtMs: storedSafeInteger(row.created_at_ms, "tenant telemetry write creation time"),
+      updatedAtMs: storedSafeInteger(row.updated_at_ms, "tenant telemetry write update time"),
+      ...(row.mutation_reservation_receipt_sha256 == null ? {} : {
+        reservation: {
+          scope:
+            TenantTelemetryWriter.TENANT_TELEMETRY_EXTERNAL_MUTATION_RESERVATION_SCOPE,
+          protocol: TenantTelemetryWriter.TENANT_TELEMETRY_WRITE_PROTOCOL,
+          writeOperationSha256: String(row.write_operation_sha256),
+          tenantId: String(row.tenant_id),
+          adapterProtocol: String(row.mutation_adapter_protocol),
+          inventorySha256: String(row.inventory_sha256),
+          manifestSha256: String(row.manifest_sha256),
+          startedClaimAttempt: storedSafeInteger(
+            row.mutation_started_claim_attempt,
+            "tenant telemetry mutation-start claim attempt",
+            1,
+          ),
+          startedClaimTokenSha256: String(row.mutation_started_claim_token_sha256),
+          startedAtDbMs: storedSafeInteger(
+            row.mutation_started_at_db_ms,
+            "tenant telemetry mutation-start timestamp",
+          ),
+          receiptSha256: String(row.mutation_reservation_receipt_sha256),
+        },
+      }),
+    };
+    let job: TenantTelemetryWriter.TenantTelemetryWriteJobRecord;
+    if (phase === "queued") {
+      job = {
+        ...base,
+        phase,
+        availableAtMs: storedSafeInteger(
+          row.available_at_ms,
+          "tenant telemetry write availability",
+        ),
+        ...(row.claim_token == null ? {} : { claimToken: String(row.claim_token) }),
+        ...(row.lease_until_ms == null
+          ? {}
+          : { leaseUntilMs: storedSafeInteger(
+              row.lease_until_ms,
+              "tenant telemetry write lease",
+            ) }),
+        ...(row.last_error_code == null
+          ? {}
+          : { lastErrorCode: String(row.last_error_code) as
+              TenantTelemetryWriter.TenantTelemetryWriteRetryErrorCode }),
+      };
+    } else if (phase === "written") {
+      job = {
+        ...base,
+        phase,
+        writeAckReceiptSha256: String(row.write_ack_receipt_sha256),
+        writtenAtDbMs: storedSafeInteger(
+          row.written_at_db_ms,
+          "tenant telemetry write completion time",
+        ),
+        completedClaimAttempt: storedSafeInteger(
+          row.completed_claim_attempt,
+          "tenant telemetry write completion attempt",
+          1,
+        ),
+        completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      };
+    } else if (phase === "blocked") {
+      job = {
+        ...base,
+        phase,
+        blockedAtDbMs: storedSafeInteger(
+          row.blocked_at_db_ms,
+          "tenant telemetry write blocked time",
+        ),
+        blockedReasonCode: String(row.blocked_reason_code) as
+          TenantTelemetryWriter.TenantTelemetryWriteBlockReasonCode,
+      };
+    } else {
+      throw new Error("tenant telemetry write phase is invalid");
+    }
+    if (String(row.domain) !== inventory.domain
+      || String(row.target_sha256) !== target.targetSha256
+      || String(row.inventory_sha256) !== inventory.inventorySha256
+      || String(row.artifact_id_sha256) !== inventory.artifactIdSha256
+      || storedSafeInteger(
+        row.artifact_generation,
+        "tenant telemetry write artifact generation",
+        1,
+      ) !== inventory.artifactGeneration
+      || String(row.payload_sha256) !== inventory.payloadSha256
+      || String(row.manifest_sha256) !== inventory.manifestSha256) {
+      throw new Error("tenant telemetry write stored bindings are invalid");
+    }
+    TenantTelemetryWriter.validateTenantTelemetryWriteJobRecord(job);
+    return job;
+  } catch (error) {
+    if (error instanceof TenantTelemetryWriter.TenantTelemetryWriteIntegrityError) throw error;
+    throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryWritePayload(
+  row: Row,
+): TenantTelemetryWriter.TenantTelemetryWritePayloadRecord {
+  try {
+    const payload = TenantTelemetryWriter.canonicalizeTenantTelemetryArtifactPayload(
+      parse<unknown>(row.payload_json),
+    );
+    if (String(row.domain) !== payload.domain) {
+      throw new Error("tenant telemetry write payload domain is invalid");
+    }
+    const record: TenantTelemetryWriter.TenantTelemetryWritePayloadRecord = {
+      writeOperationSha256: String(row.write_operation_sha256),
+      tenantId: String(row.tenant_id),
+      payload,
+      payloadSha256: String(row.payload_sha256),
+      recordCount: storedSafeInteger(
+        row.record_count,
+        "tenant telemetry write payload record count",
+        1,
+      ),
+      payloadByteLength: storedSafeInteger(
+        row.payload_byte_length,
+        "tenant telemetry write payload byte length",
+        1,
+      ),
+      createdAtMs: storedSafeInteger(
+        row.created_at_ms,
+        "tenant telemetry write payload creation time",
+      ),
+    };
+    TenantTelemetryWriter.validateTenantTelemetryWritePayloadRecord(record);
+    return record;
+  } catch (error) {
+    if (error instanceof TenantTelemetryWriter.TenantTelemetryWriteIntegrityError) throw error;
+    throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryWriteAck(
+  row: Row,
+): TenantTelemetryWriter.TenantTelemetryWriteAck {
+  try {
+    const replayed = storedSafeInteger(row.replayed, "tenant telemetry write replay flag");
+    if (replayed !== 0 && replayed !== 1) {
+      throw new Error("tenant telemetry write replay flag is invalid");
+    }
+    const ack: TenantTelemetryWriter.TenantTelemetryWriteAck = {
+      writeOperationSha256: String(row.write_operation_sha256),
+      tenantId: String(row.tenant_id),
+      scope: String(row.scope) as typeof TenantTelemetryWriter.TENANT_TELEMETRY_WRITE_ACK_SCOPE,
+      protocol: String(row.protocol) as typeof TenantTelemetryWriter.TENANT_TELEMETRY_WRITE_PROTOCOL,
+      domain: String(row.domain) as TenantTelemetryDomain,
+      targetSha256: String(row.target_sha256),
+      targetReceiptSha256: String(row.target_receipt_sha256),
+      inventorySha256: String(row.inventory_sha256),
+      inventoryReceiptSha256: String(row.inventory_receipt_sha256),
+      artifactIdSha256: String(row.artifact_id_sha256),
+      artifactGeneration: storedSafeInteger(
+        row.artifact_generation,
+        "tenant telemetry write ACK artifact generation",
+        1,
+      ),
+      payloadSha256: String(row.payload_sha256),
+      manifestSha256: String(row.manifest_sha256),
+      adapterProtocol: String(row.adapter_protocol),
+      outcome: String(row.outcome) as TenantTelemetryWriter.TenantTelemetryWriteOutcome,
+      replayed: replayed === 1,
+      adapterEvidenceSha256: String(row.adapter_evidence_sha256),
+      reservationReceiptSha256: String(row.reservation_receipt_sha256),
+      mutationStartedAtDbMs: storedSafeInteger(
+        row.mutation_started_at_db_ms,
+        "tenant telemetry ACK mutation-start timestamp",
+      ),
+      mutationStartedClaimAttempt: storedSafeInteger(
+        row.mutation_started_claim_attempt,
+        "tenant telemetry ACK mutation-start claim attempt",
+        1,
+      ),
+      mutationStartedClaimTokenSha256: String(row.mutation_started_claim_token_sha256),
+      completedClaimAttempt: storedSafeInteger(
+        row.completed_claim_attempt,
+        "tenant telemetry write ACK completion attempt",
+        1,
+      ),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      storeDbTimestampMs: storedSafeInteger(
+        row.store_db_timestamp_ms,
+        "tenant telemetry write ACK timestamp",
+      ),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    TenantTelemetryWriter.validateTenantTelemetryWriteAck(ack);
+    return ack;
+  } catch (error) {
+    if (error instanceof TenantTelemetryWriter.TenantTelemetryWriteIntegrityError) throw error;
+    throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
   }
 }
 
@@ -6781,14 +7151,47 @@ export interface MysqlStoreOptions {
   connectionLimit?: number;
   /** overrides migration discovery; useful in tests and unusual deployments */
   migrationsDir?: string;
-  /** Apply missing migrations by default; maintenance CLIs use verify to remain DDL-free. */
-  migrationMode?: "apply" | "verify";
+  /** Apply missing migrations by default; maintenance modes remain DDL-free. */
+  migrationMode?: "apply" | "verify" | "reconcile-telemetry-subjects";
   /** maximum time to wait for another runner to finish schema migration */
   migrationLockTimeoutSeconds?: number;
   /** Non-secret digest of the exact Redis deployment/database/prefix purge namespace. */
   tenantRedisPurgeNamespaceSha256?: string;
   /** Stable 256-bit secret used only to derive content-free telemetry owner references. */
   tenantTelemetryRefKey?: Uint8Array;
+  /**
+   * Explicit, one-shot compatibility repair for an active 0033 database whose already committed
+   * tenant T1 admissions predate atomic telemetry-subject publication.  This is deliberately not a
+   * normal startup repair: operators must first close admission and stop/drain every pre-0034
+   * writer.  The fixed acknowledgements are intentionally verbose so an accidental boolean/env
+   * coercion cannot authorize an append-only backfill.
+   */
+  tenantTelemetryLegacySubjectReconcile?: {
+    admissionClosedAck: "tenant-erasure-admission-closed-v1";
+    legacyWriterDrainedAck: "pre-0034-telemetry-writers-drained-v1";
+    fleetStoppedAck: "all-application-writers-stopped-v1";
+  };
+}
+
+function assertTenantTelemetryLegacySubjectReconcileAcknowledgements(
+  value: unknown,
+): asserts value is NonNullable<
+  MysqlStoreOptions["tenantTelemetryLegacySubjectReconcile"]
+> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("tenant telemetry legacy subject reconcile acknowledgements are invalid");
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (keys.length !== 3
+    || keys[0] !== "admissionClosedAck"
+    || keys[1] !== "fleetStoppedAck"
+    || keys[2] !== "legacyWriterDrainedAck"
+    || record.admissionClosedAck !== "tenant-erasure-admission-closed-v1"
+    || record.legacyWriterDrainedAck !== "pre-0034-telemetry-writers-drained-v1"
+    || record.fleetStoppedAck !== "all-application-writers-stopped-v1") {
+    throw new Error("tenant telemetry legacy subject reconcile acknowledgements are invalid");
+  }
 }
 
 export class MysqlSessionStore implements
@@ -6817,6 +7220,7 @@ export class MysqlSessionStore implements
   TenantRedisPurgeStore,
   TenantCredentialTargetExecutionStore,
   TenantTelemetryLifecycleStore,
+  TenantTelemetryWriter.TenantTelemetryWriterStore,
   BackupCatalog.TenantBackupCatalogStore,
   RestoreJournal.TenantRestoreJournalStore,
   RestoreJournal.RestoreReplayStore,
@@ -6840,6 +7244,7 @@ export class MysqlSessionStore implements
   private tenantRestoreJournalSchemaInstalled = false;
   private tenantBackupCatalogSchemaInstalled = false;
   private tenantTelemetrySchemaInstalled = false;
+  private tenantTelemetryWriterSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -6881,6 +7286,17 @@ export class MysqlSessionStore implements
     if (tenantTelemetryRefKey !== undefined) {
       tenantTelemetryRefKeyIdSha256(tenantTelemetryRefKey);
     }
+    const legacySubjectReconcile = opts.tenantTelemetryLegacySubjectReconcile;
+    if (legacySubjectReconcile !== undefined) {
+      assertTenantTelemetryLegacySubjectReconcileAcknowledgements(legacySubjectReconcile);
+    }
+    const migrationMode = opts.migrationMode ?? "apply";
+    if ((migrationMode === "reconcile-telemetry-subjects")
+      !== (legacySubjectReconcile !== undefined)) {
+      throw new Error(
+        "tenant telemetry legacy subject reconcile requires its dedicated migration mode",
+      );
+    }
     const pool = mysql.createPool({
       uri: opts.url,
       connectionLimit: opts.connectionLimit ?? 20,
@@ -6896,8 +7312,17 @@ export class MysqlSessionStore implements
     );
     try {
       const migrationsDir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir);
-      if ((opts.migrationMode ?? "apply") === "verify") {
+      if (migrationMode === "verify") {
         await store.verifyMigrations(migrationsDir);
+      } else if (migrationMode === "reconcile-telemetry-subjects") {
+        // This path is intentionally DDL-free.  Operators first run the normal expand migration,
+        // observe the expected fail-closed subject gap, stop/drain writers, then invoke this exact
+        // repair against an already-complete and fingerprinted 0034 schema.
+        await store.runLegacyTenantTelemetrySubjectReconcile(
+          migrationsDir,
+          legacySubjectReconcile!,
+          opts.migrationLockTimeoutSeconds ?? 60,
+        );
       } else {
         await store.migrate(migrationsDir, opts.migrationLockTimeoutSeconds ?? 60);
       }
@@ -7035,6 +7460,7 @@ export class MysqlSessionStore implements
   private async assertTenantTelemetrySchemaFingerprint(
     conn: PoolConnection,
     migrationsDir: string,
+    includeLegacyTriggerFingerprint = true,
   ): Promise<void> {
     let fingerprintStatements: string[];
     try {
@@ -7048,11 +7474,13 @@ export class MysqlSessionStore implements
           "schema",
           "telemetry_activation_inventory_schema_ok",
         ),
-        tenantTelemetryActivationInventoryFingerprintStatement(
-          migrationSql,
-          "triggers",
-          "telemetry_activation_inventory_trigger_ok",
-        ),
+        ...(includeLegacyTriggerFingerprint
+          ? [tenantTelemetryActivationInventoryFingerprintStatement(
+              migrationSql,
+              "triggers",
+              "telemetry_activation_inventory_trigger_ok",
+            )]
+          : []),
       ];
     } catch (cause) {
       throw new Error("0033 tenant telemetry fingerprint source is invalid", { cause });
@@ -7070,7 +7498,8 @@ export class MysqlSessionStore implements
                 @telemetry_activation_inventory_trigger_ok AS trigger_ok`,
       );
       if (Number(fingerprintRows[0]?.schema_ok) !== 1
-        || Number(fingerprintRows[0]?.trigger_ok) !== 1) {
+        || (includeLegacyTriggerFingerprint
+          && Number(fingerprintRows[0]?.trigger_ok) !== 1)) {
         throw new Error("stored schema does not match the 0033 fingerprint");
       }
     } catch (cause) {
@@ -7092,6 +7521,306 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertTenantTelemetryWriterSchemaFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let fingerprintStatements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME),
+        "utf8",
+      );
+      fingerprintStatements = [
+        tenantTelemetryDurableWriterFingerprintStatement(
+          migrationSql,
+          "schema",
+          "telemetry_durable_writer_schema_ok",
+        ),
+        tenantTelemetryDurableWriterFingerprintStatement(
+          migrationSql,
+          "triggers",
+          "telemetry_durable_writer_trigger_ok",
+        ),
+      ];
+    } catch (cause) {
+      throw new Error("0034 tenant telemetry writer fingerprint source is invalid", { cause });
+    }
+
+    let failure: Error | undefined;
+    try {
+      await conn.query(
+        "SET @agent_service_telemetry_writer_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of fingerprintStatements) await conn.query(statement);
+      const [fingerprintRows] = await conn.query<Row[]>(
+        `SELECT @telemetry_durable_writer_schema_ok AS schema_ok,
+                @telemetry_durable_writer_trigger_ok AS trigger_ok`,
+      );
+      if (Number(fingerprintRows[0]?.schema_ok) !== 1
+        || Number(fingerprintRows[0]?.trigger_ok) !== 1) {
+        throw new Error("stored schema does not match the 0034 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error(
+        "0034 tenant telemetry writer schema fingerprint verification failed",
+        { cause },
+      );
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_telemetry_writer_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error(
+        "0034 tenant telemetry writer fingerprint session restore failed",
+        { cause },
+      );
+    }
+    if (failure) throw failure;
+  }
+
+  private async reconcileLegacyTenantTelemetryLifecycleSubjects(
+    conn: PoolConnection,
+    acknowledgements: NonNullable<
+      MysqlStoreOptions["tenantTelemetryLegacySubjectReconcile"]
+    >,
+  ): Promise<void> {
+    assertTenantTelemetryLegacySubjectReconcileAcknowledgements(acknowledgements);
+    if (!this.tenantTelemetrySchemaInstalled || !this.tenantTelemetryWriterSchemaInstalled) {
+      throw new TenantTelemetryLifecycleIntegrityError(
+        "tenant telemetry legacy subject reconcile requires schema 0034",
+      );
+    }
+    const refKey = this.requireTenantTelemetryRefKey();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+      await conn.beginTransaction();
+
+      // Match the ordinary tenant-admission lock order.  Locking the complete lifecycle keyspace
+      // closes both existing-tenant writes and phantoms before the global telemetry control is
+      // inspected.  The operator acknowledgements still require the fleet to be stopped: these
+      // locks are a final correctness fence, not a deployment orchestrator.
+      await conn.query(
+        `SELECT tenant_id,subject_kind,subject_id
+           FROM subject_lifecycle
+          ORDER BY tenant_id,subject_kind,subject_id FOR UPDATE`,
+      );
+      const control = await this.readTenantTelemetryLifecycleControl(conn, "FOR UPDATE");
+      if (control.state !== "active"
+        || control.refKeyIdSha256 !== tenantTelemetryRefKeyIdSha256(refKey)) {
+        throw new TenantTelemetryLifecycleConflictError(
+          "tenant telemetry legacy subject reconcile requires the exact active ref key",
+        );
+      }
+
+      const targets = await this.readTenantTelemetryLifecycleTargets(conn, "FOR SHARE");
+      const receipt = await this.readTenantTelemetryActivationReceipt(conn, "FOR SHARE");
+      this.assertTenantTelemetryActivationReceiptBindings(
+        control,
+        targets,
+        receipt,
+        tenantTelemetryRefKeyIdSha256(refKey),
+      );
+      const [coverageRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_TELEMETRY_COVERAGE_COLUMNS}
+           FROM tenant_telemetry_lifecycle_coverages
+          ORDER BY tenant_id FOR UPDATE`,
+      );
+      const coverages = coverageRows.map(rowToTenantTelemetryLifecycleCoverage);
+      const coverageByTenant = new Map<string, TenantTelemetryLifecycleCoverageRecord>();
+      for (const coverage of coverages) {
+        validateTenantTelemetryLifecycleCoverage(coverage);
+        if (coverageByTenant.has(coverage.tenantId)
+          || coverage.controlGeneration !== control.controlGeneration
+          || coverage.targetCount !== control.targetCount
+          || coverage.targetRootSha256 !== control.targetRootSha256
+          || coverage.subjectRefSha256
+            !== tenantTelemetrySubjectRefForTenantSha256(coverage.tenantId, refKey)) {
+          throw new TenantTelemetryLifecycleIntegrityError();
+        }
+        coverageByTenant.set(coverage.tenantId, coverage);
+      }
+      const activationCoverages = coverages.filter(
+        (coverage) => coverage.historyStatus === "legacy_history_unknown",
+      );
+      if (!receipt
+        || receipt.coverageCount !== activationCoverages.length
+        || receipt.coverageRootSha256
+          !== tenantTelemetryLifecycleCoverageRootSha256(activationCoverages)) {
+        throw new TenantTelemetryLifecycleIntegrityError(
+          "tenant telemetry activation coverage root is invalid",
+        );
+      }
+
+      const [admissionRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
+           FROM tenant_erasure_admissions
+          ORDER BY request_id FOR UPDATE`,
+      );
+      const admissions = admissionRows.map(rowToTenantErasureAdmission);
+      const [subjectRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_TELEMETRY_SUBJECT_COLUMNS}
+           FROM tenant_telemetry_lifecycle_subjects
+          ORDER BY request_id FOR UPDATE`,
+      );
+      const subjects = subjectRows.map(rowToTenantTelemetryLifecycleSubject);
+      const subjectByRequest = new Map(subjects.map((subject) => [
+        subject.requestId,
+        subject,
+      ] as const));
+      if (subjectByRequest.size !== subjects.length) {
+        throw new TenantTelemetryLifecycleIntegrityError();
+      }
+
+      const observedAtDbMs = await this.databaseNow(conn);
+      const missing: TenantTelemetryLifecycleSubjectRecord[] = [];
+      for (const admission of admissions) {
+        const fence = await this.loadTenantCredentialRevocationFence(
+          conn,
+          admission.tenantId,
+          admission.requestId,
+          "FOR SHARE",
+        );
+        const firstAudit = await this.loadTenantErasureFirstAudit(
+          conn,
+          admission.requestId,
+          "FOR SHARE",
+        );
+        validateTenantErasureImmutableT1Proof({
+          admission,
+          fence: fence ?? undefined,
+          firstAudit: firstAudit ?? undefined,
+        });
+        const coverage = coverageByTenant.get(admission.tenantId);
+        if (!fence || !firstAudit || !coverage) {
+          throw new TenantTelemetryLifecycleIntegrityError();
+        }
+        const existing = subjectByRequest.get(admission.requestId);
+        if (existing) {
+          this.assertTenantTelemetryLifecycleSubjectBindings(
+            existing,
+            admission,
+            fence,
+            firstAudit,
+            coverage,
+            control,
+          );
+        } else {
+          missing.push(this.buildTenantTelemetryLifecycleSubject(
+            admission,
+            fence,
+            firstAudit,
+            coverage,
+            control,
+            observedAtDbMs,
+          ));
+        }
+      }
+
+      // Orphans or mismatched existing rows are never repaired around.  Validate every source
+      // first, then publish the entire missing set and finally re-read the global closure before
+      // commit; any duplicate, trigger failure, corruption or concurrent drift rolls everything
+      // back.
+      if (subjects.length > admissions.length) {
+        throw new TenantTelemetryLifecycleIntegrityError();
+      }
+      await this.assertTenantTelemetryWriterProjection(conn);
+      for (const subject of missing) {
+        await this.insertTenantTelemetryLifecycleSubject(conn, subject);
+      }
+      await this.assertTenantTelemetryActivationProjection(
+        conn,
+        control,
+        refKey,
+        undefined,
+        "FOR SHARE",
+      );
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    }
+  }
+
+  private async runLegacyTenantTelemetrySubjectReconcile(
+    migrationsDir: string,
+    acknowledgements: NonNullable<
+      MysqlStoreOptions["tenantTelemetryLegacySubjectReconcile"]
+    >,
+    lockTimeoutSeconds: number,
+  ): Promise<void> {
+    if (!Number.isInteger(lockTimeoutSeconds) || lockTimeoutSeconds < 0) {
+      throw new Error("migrationLockTimeoutSeconds must be a non-negative integer");
+    }
+    const conn = await this.pool.getConnection();
+    let locked = false;
+    try {
+      const [lockRows] = await conn.query<Row[]>(
+        `SELECT GET_LOCK(CONCAT('agent-service:migrate:',
+          LEFT(SHA2(DATABASE(),256),32)), ?) AS acquired`,
+        [lockTimeoutSeconds],
+      );
+      locked = Number(lockRows[0]?.acquired) === 1;
+      if (!locked) {
+        throw new Error(
+          `timed out after ${lockTimeoutSeconds}s waiting for the telemetry subject reconcile lock`,
+        );
+      }
+      await this.verifyMigrations(migrationsDir, true, conn);
+      await this.reconcileLegacyTenantTelemetryLifecycleSubjects(conn, acknowledgements);
+      await this.verifyMigrations(migrationsDir, false, conn);
+    } finally {
+      if (locked) {
+        await conn.query(
+          `SELECT RELEASE_LOCK(CONCAT('agent-service:migrate:',
+            LEFT(SHA2(DATABASE(),256),32)))`,
+        ).catch(() => {});
+      }
+      conn.release();
+    }
+  }
+
+  private async assertTenantTelemetryWriterProjection(conn: PoolConnection): Promise<void> {
+    if (!this.tenantTelemetryWriterSchemaInstalled) return;
+    const [jobRows] = await conn.query<Row[]>(
+      `SELECT write_operation_sha256
+         FROM tenant_telemetry_write_jobs
+        ORDER BY write_operation_sha256`,
+    );
+    for (const row of jobRows) {
+      const operationSha256 = String(row.write_operation_sha256);
+      const job = await this.readTenantTelemetryWriteJob(conn, operationSha256);
+      if (!job || job.writeOperationSha256 !== operationSha256) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+      }
+      await this.assertTenantTelemetryWriteJobRelations(conn, job);
+    }
+    const [orphanRows] = await conn.query<Row[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM tenant_telemetry_write_payloads p
+           LEFT JOIN tenant_telemetry_write_jobs j
+             ON BINARY j.write_operation_sha256=BINARY p.write_operation_sha256
+          WHERE j.write_operation_sha256 IS NULL) AS orphan_payload_count,
+         (SELECT COUNT(*) FROM tenant_telemetry_write_acks a
+           LEFT JOIN tenant_telemetry_write_jobs j
+             ON BINARY j.write_operation_sha256=BINARY a.write_operation_sha256
+          WHERE j.write_operation_sha256 IS NULL) AS orphan_ack_count`,
+    );
+    if (!orphanRows[0]
+      || storedSafeInteger(
+        orphanRows[0].orphan_payload_count,
+        "tenant telemetry orphan payload count",
+      ) !== 0
+      || storedSafeInteger(
+        orphanRows[0].orphan_ack_count,
+        "tenant telemetry orphan ACK count",
+      ) !== 0) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    }
+  }
+
   private async assertTenantTelemetryRuntimeConfiguration(
     conn: PoolConnection,
   ): Promise<void> {
@@ -7101,13 +7830,20 @@ export class MysqlSessionStore implements
       await conn.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
       const control = await this.readTenantTelemetryLifecycleControl(conn);
       if (control.state === "inactive") {
+        const writerProjectionCounts = this.tenantTelemetryWriterSchemaInstalled
+          ? `,
+             (SELECT COUNT(*) FROM tenant_telemetry_write_jobs) AS write_job_count,
+             (SELECT COUNT(*) FROM tenant_telemetry_write_payloads) AS write_payload_count,
+             (SELECT COUNT(*) FROM tenant_telemetry_write_acks) AS write_ack_count`
+          : ", 0 AS write_job_count, 0 AS write_payload_count, 0 AS write_ack_count";
         const [rows] = await conn.query<Row[]>(
           `SELECT
              (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_targets) AS target_count,
              (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_coverages) AS coverage_count,
              (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_subjects) AS subject_count,
              (SELECT COUNT(*) FROM tenant_telemetry_activation_receipts) AS receipt_count,
-             (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory) AS inventory_count`,
+             (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory) AS inventory_count
+             ${writerProjectionCounts}`,
         );
         const projection = rows[0];
         if (!projection || [
@@ -7116,6 +7852,9 @@ export class MysqlSessionStore implements
           projection.subject_count,
           projection.receipt_count,
           projection.inventory_count,
+          projection.write_job_count,
+          projection.write_payload_count,
+          projection.write_ack_count,
         ].some((value) => storedSafeInteger(
           value,
           "stored inactive tenant telemetry projection count",
@@ -7139,6 +7878,7 @@ export class MysqlSessionStore implements
         undefined,
         "",
       );
+      await this.assertTenantTelemetryWriterProjection(conn);
       await conn.commit();
     } catch (error) {
       await conn.rollback().catch(() => {});
@@ -7146,9 +7886,13 @@ export class MysqlSessionStore implements
     }
   }
 
-  private async verifyMigrations(migrationsDir: string): Promise<void> {
+  private async verifyMigrations(
+    migrationsDir: string,
+    skipTelemetryRuntimeAudit = false,
+    existingConnection?: PoolConnection,
+  ): Promise<void> {
     const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
-    const conn = await this.pool.getConnection();
+    const conn = existingConnection ?? await this.pool.getConnection();
     try {
       const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
       const done = new Set(applied.map((row) => row.name as string));
@@ -7163,7 +7907,14 @@ export class MysqlSessionStore implements
         await this.assertTenantBackupCatalogSchemaFingerprint(conn, migrationsDir);
       }
       if (done.has(TENANT_TELEMETRY_ACTIVATION_INVENTORY_MIGRATION_NAME)) {
-        await this.assertTenantTelemetrySchemaFingerprint(conn, migrationsDir);
+        await this.assertTenantTelemetrySchemaFingerprint(
+          conn,
+          migrationsDir,
+          !done.has(TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryWriterSchemaFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -7177,9 +7928,14 @@ export class MysqlSessionStore implements
       this.tenantTelemetrySchemaInstalled = done.has(
         TENANT_TELEMETRY_ACTIVATION_INVENTORY_MIGRATION_NAME,
       );
-      await this.assertTenantTelemetryRuntimeConfiguration(conn);
+      this.tenantTelemetryWriterSchemaInstalled = done.has(
+        TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME,
+      );
+      if (!skipTelemetryRuntimeAudit) {
+        await this.assertTenantTelemetryRuntimeConfiguration(conn);
+      }
     } finally {
-      conn.release();
+      if (existingConnection === undefined) conn.release();
     }
   }
 
@@ -7211,7 +7967,7 @@ export class MysqlSessionStore implements
         const statements = mysqlMigrationStatements(sql);
         for (const [i, stmt] of statements.entries()) {
           try {
-            await conn.query(stmt);
+            await executeMysqlMigrationStatement(conn, f, stmt);
           } catch (cause) {
             throw new Error(`migration ${f} failed at statement ${i + 1}/${statements.length}`, { cause });
           }
@@ -7226,7 +7982,14 @@ export class MysqlSessionStore implements
         await this.assertTenantBackupCatalogSchemaFingerprint(conn, dir);
       }
       if (done.has(TENANT_TELEMETRY_ACTIVATION_INVENTORY_MIGRATION_NAME)) {
-        await this.assertTenantTelemetrySchemaFingerprint(conn, dir);
+        await this.assertTenantTelemetrySchemaFingerprint(
+          conn,
+          dir,
+          !done.has(TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryWriterSchemaFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -7239,6 +8002,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetrySchemaInstalled = done.has(
         TENANT_TELEMETRY_ACTIVATION_INVENTORY_MIGRATION_NAME,
+      );
+      this.tenantTelemetryWriterSchemaInstalled = done.has(
+        TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME,
       );
       await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
@@ -12571,6 +13337,11 @@ export class MysqlSessionStore implements
         fence: fence ?? undefined,
         firstAudit: firstAudit ?? undefined,
       });
+      await this.assertTenantTelemetryLifecycleSubjectForAdmission(
+        conn,
+        admission,
+        fence ?? undefined,
+      );
       return admission;
     });
   }
@@ -12649,6 +13420,12 @@ export class MysqlSessionStore implements
             fence: replayFence ?? undefined,
             firstAudit: firstAudit ?? undefined,
           });
+          await this.assertTenantTelemetryLifecycleSubjectForAdmission(
+            conn,
+            replay,
+            replayFence ?? undefined,
+            "FOR SHARE",
+          );
           await conn.commit();
           return replay;
         }
@@ -12681,6 +13458,12 @@ export class MysqlSessionStore implements
           fence: activeFence ?? undefined,
           firstAudit: firstAudit ?? undefined,
         });
+        await this.assertTenantTelemetryLifecycleSubjectForAdmission(
+          conn,
+          active,
+          activeFence ?? undefined,
+          "FOR SHARE",
+        );
         await conn.commit();
         return active;
       }
@@ -12832,6 +13615,39 @@ export class MysqlSessionStore implements
         ],
       );
       const credentialJobNowMs = await this.databaseNow(conn);
+      let telemetrySubject: TenantTelemetryLifecycleSubjectRecord | null = null;
+      if (this.tenantTelemetrySchemaInstalled) {
+        const telemetryControl = await this.readTenantTelemetryLifecycleControl(
+          conn,
+          "FOR SHARE",
+        );
+        if (telemetryControl.state === "active") {
+          const telemetryCoverage = await this.readTenantTelemetryLifecycleCoverage(
+            conn,
+            record.tenantId,
+            "FOR SHARE",
+          );
+          if (!telemetryCoverage) throw new TenantTelemetryLifecycleIntegrityError();
+          telemetrySubject = this.buildTenantTelemetryLifecycleSubject(
+            record,
+            fence,
+            audit,
+            telemetryCoverage,
+            telemetryControl,
+            credentialJobNowMs,
+          );
+          // Since 0034 the credential-job insert is the database-enforced mixed-writer fence.  The
+          // exact telemetry subject must therefore exist before crossing that boundary; a drained
+          // 0033 writer that omits this insert is rejected and its whole T1 transaction rolls back.
+          await this.insertTenantTelemetryLifecycleSubject(conn, telemetrySubject);
+          await this.assertTenantTelemetryLifecycleSubjectForAdmission(
+            conn,
+            record,
+            fence,
+            "FOR SHARE",
+          );
+        }
+      }
       await conn.query(
         `INSERT INTO tenant_credential_revocation_jobs
            (request_id, tenant_id, subject_generation, t1_fence_sha256, phase,
@@ -12910,6 +13726,11 @@ export class MysqlSessionStore implements
         fence: fence ?? undefined,
         firstAudit: firstAudit ?? undefined,
       });
+      await this.assertTenantTelemetryLifecycleSubjectForAdmission(
+        conn,
+        admission,
+        fence ?? undefined,
+      );
       return admission;
     });
   }
@@ -19634,7 +20455,7 @@ export class MysqlSessionStore implements
       const [rows] = await conn.query<Row[]>(
         `SELECT ${TENANT_PURGE_PLAN_JOB_COLUMNS}
            FROM tenant_purge_plan_jobs
-          WHERE phase='queued' AND available_at_ms<=?
+         WHERE phase='queued' AND available_at_ms<=?
             AND (claim_token IS NULL OR lease_until_ms<=?)
           ORDER BY available_at_ms, request_id LIMIT ?`,
         [scanNow, scanNow, maxCandidatesToScan],
@@ -31574,6 +32395,173 @@ export class MysqlSessionStore implements
     return coverage;
   }
 
+  private async readTenantTelemetryLifecycleSubject(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryLifecycleSubjectRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_SUBJECT_COLUMNS}
+         FROM tenant_telemetry_lifecycle_subjects
+        WHERE request_id=? AND tenant_id=? ${lock}`,
+      [requestId, tenantId],
+    );
+    if (rows.length > 1) throw new TenantTelemetryLifecycleIntegrityError();
+    if (!rows[0]
+      || String(rows[0].request_id) !== requestId
+      || String(rows[0].tenant_id) !== tenantId) return null;
+    return rowToTenantTelemetryLifecycleSubject(rows[0]);
+  }
+
+  private assertTenantTelemetryLifecycleSubjectBindings(
+    subject: TenantTelemetryLifecycleSubjectRecord,
+    admission: ErasureRequestRecord,
+    fence: TenantCredentialRevocationFence | undefined,
+    firstAudit: ErasureAuditEvent | undefined,
+    coverage: TenantTelemetryLifecycleCoverageRecord,
+    control: ActiveTenantTelemetryLifecycleControlRecord,
+  ): void {
+    try {
+      validateTenantTelemetryLifecycleSubject(subject);
+      validateTenantErasureImmutableT1Proof({ admission, fence, firstAudit });
+      if (!fence || admission.gatedAtMs === undefined
+        || subject.requestId !== admission.requestId
+        || subject.tenantId !== admission.tenantId
+        || subject.subjectGeneration !== admission.generation
+        || subject.controlGeneration !== control.controlGeneration
+        || subject.t1FenceSha256 !== fence.evidenceSha256
+        || subject.coverageEvidenceSha256 !== coverage.evidenceSha256
+        || subject.historyStatus !== coverage.historyStatus
+        || subject.subjectRefSha256 !== coverage.subjectRefSha256
+        || subject.targetCount !== control.targetCount
+        || subject.targetCount !== coverage.targetCount
+        || subject.targetRootSha256 !== control.targetRootSha256
+        || subject.targetRootSha256 !== coverage.targetRootSha256
+        || subject.boundAtDbMs < Math.max(
+          admission.gatedAtMs,
+          fence.fencedAtMs,
+          coverage.coverageStartedAtDbMs,
+          control.activatedAtDbMs,
+        )) {
+        throw new Error("tenant telemetry lifecycle subject binding is invalid");
+      }
+    } catch (error) {
+      if (error instanceof TenantTelemetryLifecycleIntegrityError) throw error;
+      throw new TenantTelemetryLifecycleIntegrityError();
+    }
+  }
+
+  private buildTenantTelemetryLifecycleSubject(
+    admission: ErasureRequestRecord,
+    fence: TenantCredentialRevocationFence,
+    firstAudit: ErasureAuditEvent,
+    coverage: TenantTelemetryLifecycleCoverageRecord,
+    control: ActiveTenantTelemetryLifecycleControlRecord,
+    observedAtDbMs: number,
+  ): TenantTelemetryLifecycleSubjectRecord {
+    const body: TenantTelemetryLifecycleSubjectBody = {
+      requestId: admission.requestId,
+      tenantId: admission.tenantId,
+      subjectGeneration: admission.generation,
+      controlGeneration: 1,
+      scope: TENANT_TELEMETRY_LIFECYCLE_SUBJECT_SCOPE,
+      t1FenceSha256: fence.evidenceSha256,
+      coverageEvidenceSha256: coverage.evidenceSha256,
+      historyStatus: coverage.historyStatus,
+      subjectRefSha256: coverage.subjectRefSha256,
+      targetCount: 2,
+      targetRootSha256: coverage.targetRootSha256,
+      boundAtDbMs: Math.max(
+        observedAtDbMs,
+        admission.gatedAtMs ?? 0,
+        fence.fencedAtMs,
+        coverage.coverageStartedAtDbMs,
+        control.activatedAtDbMs,
+      ),
+    };
+    const subject: TenantTelemetryLifecycleSubjectRecord = {
+      ...body,
+      receiptSha256: tenantTelemetryLifecycleSubjectReceiptSha256(body),
+    };
+    this.assertTenantTelemetryLifecycleSubjectBindings(
+      subject,
+      admission,
+      fence,
+      firstAudit,
+      coverage,
+      control,
+    );
+    return subject;
+  }
+
+  private async insertTenantTelemetryLifecycleSubject(
+    conn: PoolConnection,
+    subject: TenantTelemetryLifecycleSubjectRecord,
+  ): Promise<void> {
+    await conn.query(
+      `INSERT INTO tenant_telemetry_lifecycle_subjects
+         (request_id,tenant_id,subject_generation,control_generation,scope,t1_fence_sha256,
+          coverage_evidence_sha256,history_status,subject_ref_sha256,target_count,
+          target_root_sha256,bound_at_db_ms,receipt_sha256)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        subject.requestId,
+        subject.tenantId,
+        subject.subjectGeneration,
+        subject.controlGeneration,
+        subject.scope,
+        subject.t1FenceSha256,
+        subject.coverageEvidenceSha256,
+        subject.historyStatus,
+        subject.subjectRefSha256,
+        subject.targetCount,
+        subject.targetRootSha256,
+        subject.boundAtDbMs,
+        subject.receiptSha256,
+      ],
+    );
+  }
+
+  private async assertTenantTelemetryLifecycleSubjectForAdmission(
+    executor: Pool | PoolConnection,
+    admission: ErasureRequestRecord,
+    fence: TenantCredentialRevocationFence | undefined,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryLifecycleSubjectRecord | null> {
+    const control = await this.readTenantTelemetryLifecycleControl(executor, lock);
+    const subject = await this.readTenantTelemetryLifecycleSubject(
+      executor,
+      admission.tenantId,
+      admission.requestId,
+      lock,
+    );
+    if (control.state === "inactive") {
+      if (subject) throw new TenantTelemetryLifecycleIntegrityError();
+      return null;
+    }
+    const coverage = await this.readTenantTelemetryLifecycleCoverage(
+      executor,
+      admission.tenantId,
+      lock,
+    );
+    const firstAudit = await this.loadTenantErasureFirstAudit(
+      executor,
+      admission.requestId,
+      lock === "FOR UPDATE" ? "FOR SHARE" : lock,
+    );
+    if (!subject || !coverage) throw new TenantTelemetryLifecycleIntegrityError();
+    this.assertTenantTelemetryLifecycleSubjectBindings(
+      subject,
+      admission,
+      fence,
+      firstAudit ?? undefined,
+      coverage,
+      control,
+    );
+    return subject;
+  }
+
   private async readTenantTelemetryActivationReceipt(
     executor: Pool | PoolConnection,
     lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
@@ -31728,6 +32716,59 @@ export class MysqlSessionStore implements
         "tenant telemetry activation coverage root is invalid",
       );
     }
+
+    const [admissionRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
+         FROM tenant_erasure_admissions
+        ORDER BY request_id ${lock}`,
+    );
+    const admissions = admissionRows.map(rowToTenantErasureAdmission);
+    const [subjectRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_SUBJECT_COLUMNS}
+         FROM tenant_telemetry_lifecycle_subjects
+        ORDER BY request_id ${lock}`,
+    );
+    const subjects = subjectRows.map(rowToTenantTelemetryLifecycleSubject);
+    if (subjects.length !== admissions.length) {
+      throw new TenantTelemetryLifecycleIntegrityError(
+        "tenant telemetry lifecycle subject set is incomplete",
+      );
+    }
+    const subjectByRequest = new Map(subjects.map((subject) => [
+      subject.requestId,
+      subject,
+    ] as const));
+    const coverageByTenant = new Map(coverages.map((coverage) => [
+      coverage.tenantId,
+      coverage,
+    ] as const));
+    if (subjectByRequest.size !== subjects.length) {
+      throw new TenantTelemetryLifecycleIntegrityError();
+    }
+    for (const admission of admissions) {
+      const subject = subjectByRequest.get(admission.requestId);
+      const coverage = coverageByTenant.get(admission.tenantId);
+      const fence = await this.loadTenantCredentialRevocationFence(
+        conn,
+        admission.tenantId,
+        admission.requestId,
+        lock,
+      );
+      const firstAudit = await this.loadTenantErasureFirstAudit(
+        conn,
+        admission.requestId,
+        lock,
+      );
+      if (!subject || !coverage) throw new TenantTelemetryLifecycleIntegrityError();
+      this.assertTenantTelemetryLifecycleSubjectBindings(
+        subject,
+        admission,
+        fence ?? undefined,
+        firstAudit ?? undefined,
+        coverage,
+        control,
+      );
+    }
     return { control, targets, receipt };
   }
 
@@ -31780,6 +32821,41 @@ export class MysqlSessionStore implements
         throw new TenantTelemetryLifecycleIntegrityError();
       }
       return coverage;
+    });
+  }
+
+  async getTenantTelemetryLifecycleSubject(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetryLifecycleSubjectRecord | null> {
+    if (!tenantId || tenantId.length > 128 || !requestId || requestId.length > 64) {
+      throw new Error("invalid tenant telemetry lifecycle subject lookup");
+    }
+    return this.withConsistentRead(async (conn) => {
+      const subject = await this.readTenantTelemetryLifecycleSubject(
+        conn,
+        tenantId,
+        requestId,
+      );
+      const admission = await this.loadTenantErasureAdmission(conn, tenantId, requestId);
+      if (!subject) {
+        const control = await this.readTenantTelemetryLifecycleControl(conn);
+        if (admission && control.state === "active") {
+          throw new TenantTelemetryLifecycleIntegrityError();
+        }
+        return null;
+      }
+      if (!admission) throw new TenantTelemetryLifecycleIntegrityError();
+      const fence = await this.loadTenantCredentialRevocationFence(
+        conn,
+        tenantId,
+        requestId,
+      );
+      return this.assertTenantTelemetryLifecycleSubjectForAdmission(
+        conn,
+        admission,
+        fence ?? undefined,
+      );
     });
   }
 
@@ -31874,6 +32950,38 @@ export class MysqlSessionStore implements
         throw new TenantTelemetryLifecycleIntegrityError();
       }
 
+      const [admissionRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_ERASURE_ADMISSION_COLUMNS}
+           FROM tenant_erasure_admissions
+          ORDER BY request_id FOR SHARE`,
+      );
+      const admissionProofs: Array<{
+        admission: ErasureRequestRecord;
+        fence: TenantCredentialRevocationFence;
+        firstAudit: ErasureAuditEvent;
+      }> = [];
+      for (const row of admissionRows) {
+        const admission = rowToTenantErasureAdmission(row);
+        const fence = await this.loadTenantCredentialRevocationFence(
+          conn,
+          admission.tenantId,
+          admission.requestId,
+          "FOR SHARE",
+        );
+        const firstAudit = await this.loadTenantErasureFirstAudit(
+          conn,
+          admission.requestId,
+          "FOR SHARE",
+        );
+        validateTenantErasureImmutableT1Proof({
+          admission,
+          fence: fence ?? undefined,
+          firstAudit: firstAudit ?? undefined,
+        });
+        if (!fence || !firstAudit) throw new TenantTelemetryLifecycleIntegrityError();
+        admissionProofs.push({ admission, fence, firstAudit });
+      }
+
       const activatedAtDbMs = await this.databaseNow(conn);
       const targets = [...stagedInput.targets]
         .sort((left, right) => (left.domain === "logs" ? -1 : right.domain === "logs" ? 1 : 0))
@@ -31954,6 +33062,22 @@ export class MysqlSessionStore implements
         ...receiptBody,
         receiptSha256: tenantTelemetryLifecycleActivationReceiptSha256(receiptBody),
       };
+      const coverageByTenant = new Map(activationCoverages.map((coverage) => [
+        coverage.tenantId,
+        coverage,
+      ] as const));
+      const activationSubjects = admissionProofs.map(({ admission, fence, firstAudit }) => {
+        const coverage = coverageByTenant.get(admission.tenantId);
+        if (!coverage) throw new TenantTelemetryLifecycleIntegrityError();
+        return this.buildTenantTelemetryLifecycleSubject(
+          admission,
+          fence,
+          firstAudit,
+          coverage,
+          control,
+          activatedAtDbMs,
+        );
+      });
       for (const target of targets) {
         await conn.query(
           `INSERT INTO tenant_telemetry_lifecycle_targets
@@ -32037,6 +33161,15 @@ export class MysqlSessionStore implements
         ],
       );
       if (updated.affectedRows !== 1) throw new TenantTelemetryLifecycleConflictError();
+      for (const subject of activationSubjects) {
+        await this.insertTenantTelemetryLifecycleSubject(conn, subject);
+      }
+      await this.assertTenantTelemetryActivationProjection(
+        conn,
+        control,
+        refKey,
+        requestSha256,
+      );
       await conn.commit();
       return { control, targets, receipt };
     } catch (error) {
@@ -32478,6 +33611,1348 @@ export class MysqlSessionStore implements
       artifactGeneration,
     );
     return record?.tenantId === tenantId ? record : null;
+  }
+
+  // ---------- durable tenant telemetry writer ----------
+  private requireTenantTelemetryWriterSchema(): void {
+    if (!this.tenantTelemetryWriterSchemaInstalled) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError(
+        "tenant telemetry durable writer schema is not installed",
+      );
+    }
+  }
+
+  private async readTenantTelemetryWriteJob(
+    executor: Pool | PoolConnection,
+    writeOperationSha256: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" | "FOR UPDATE SKIP LOCKED" = "",
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWriteJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_WRITE_JOB_COLUMNS}
+         FROM tenant_telemetry_write_jobs
+        WHERE write_operation_sha256=? ${lock}`,
+      [writeOperationSha256],
+    );
+    if (rows.length > 1) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    if (!rows[0]) return null;
+    const [targetRows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_TARGET_COLUMNS}
+         FROM tenant_telemetry_lifecycle_targets
+        WHERE target_sha256=?`,
+      [rows[0].target_sha256],
+    );
+    if (targetRows.length !== 1) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    }
+    return rowToTenantTelemetryWriteJob(
+      rows[0],
+      rowToTenantTelemetryLifecycleTarget(targetRows[0]!),
+    );
+  }
+
+  private async readTenantTelemetryWriteJobByExternalIdentity(
+    executor: Pool | PoolConnection,
+    domain: TenantTelemetryDomain,
+    artifactIdSha256: string,
+    artifactGeneration: number,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWriteJobRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT write_operation_sha256
+         FROM tenant_telemetry_write_jobs
+        WHERE domain=? AND artifact_id_sha256=? AND artifact_generation=? ${lock}`,
+      [domain, artifactIdSha256, artifactGeneration],
+    );
+    if (rows.length > 1) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    return rows[0]
+      ? this.readTenantTelemetryWriteJob(
+          executor,
+          String(rows[0].write_operation_sha256),
+          lock === "FOR UPDATE" ? "FOR UPDATE" : lock,
+        )
+      : null;
+  }
+
+  private async readTenantTelemetryWritePayload(
+    executor: Pool | PoolConnection,
+    writeOperationSha256: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWritePayloadRecord | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_WRITE_PAYLOAD_COLUMNS}
+         FROM tenant_telemetry_write_payloads
+        WHERE write_operation_sha256=? ${lock}`,
+      [writeOperationSha256],
+    );
+    if (rows.length > 1) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    return rows[0] ? rowToTenantTelemetryWritePayload(rows[0]) : null;
+  }
+
+  private async readTenantTelemetryWriteAck(
+    executor: Pool | PoolConnection,
+    writeOperationSha256: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWriteAck | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_WRITE_ACK_COLUMNS}
+         FROM tenant_telemetry_write_acks
+        WHERE write_operation_sha256=? ${lock}`,
+      [writeOperationSha256],
+    );
+    if (rows.length > 1) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    return rows[0] ? rowToTenantTelemetryWriteAck(rows[0]) : null;
+  }
+
+  private async assertTenantTelemetryWriteJobRelations(
+    executor: Pool | PoolConnection,
+    job: TenantTelemetryWriter.TenantTelemetryWriteJobRecord,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<void> {
+    try {
+      TenantTelemetryWriter.validateTenantTelemetryWriteJobRecord(job);
+      const payload = await this.readTenantTelemetryWritePayload(
+        executor,
+        job.writeOperationSha256,
+        lock,
+      );
+      const ack = await this.readTenantTelemetryWriteAck(
+        executor,
+        job.writeOperationSha256,
+        lock,
+      );
+      const inventory = await this.readTenantTelemetryArtifactByExternalIdentity(
+        executor,
+        job.inventory.domain,
+        job.inventory.artifactIdSha256,
+        job.inventory.artifactGeneration,
+        lock,
+      );
+      if (job.phase === "written") {
+        if (payload || !ack || !inventory || !job.reservation
+          || ack.tenantId !== job.tenantId
+          || ack.writeOperationSha256 !== job.writeOperationSha256
+          || ack.receiptSha256 !== job.writeAckReceiptSha256
+          || ack.reservationReceiptSha256 !== job.reservation.receiptSha256
+          || ack.mutationStartedAtDbMs !== job.reservation.startedAtDbMs
+          || ack.mutationStartedClaimAttempt !== job.reservation.startedClaimAttempt
+          || ack.mutationStartedClaimTokenSha256
+            !== job.reservation.startedClaimTokenSha256
+          || ack.inventorySha256 !== job.inventory.inventorySha256
+          || ack.inventoryReceiptSha256 !== job.inventory.receiptSha256
+          || inventory.inventorySha256 !== job.inventory.inventorySha256
+          || inventory.receiptSha256 !== job.inventory.receiptSha256) {
+          throw new Error("written tenant telemetry projections are incomplete");
+        }
+        return;
+      }
+      if (!payload || ack || inventory
+        || payload.writeOperationSha256 !== job.writeOperationSha256
+        || payload.tenantId !== job.tenantId
+        || payload.payloadSha256 !== job.inventory.payloadSha256
+        || payload.recordCount !== job.recordCount
+        || payload.payloadByteLength !== job.payloadByteLength) {
+        throw new Error("pending tenant telemetry projections are incomplete");
+      }
+    } catch (error) {
+      if (error instanceof TenantTelemetryWriter.TenantTelemetryWriteIntegrityError) throw error;
+      throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    }
+  }
+
+  private tenantTelemetryWriteAuthorizationMatches(
+    job: TenantTelemetryWriter.TenantTelemetryWriteJobRecord,
+    authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
+    nowMs: number,
+  ): boolean {
+    return job.phase === "queued"
+      && job.writeOperationSha256 === authorization.writeOperationSha256
+      && job.tenantId === authorization.tenantId
+      && job.attempts === authorization.claimAttempt
+      && job.claimToken === authorization.claimToken
+      && job.leaseUntilMs !== undefined
+      && job.leaseUntilMs > nowMs;
+  }
+
+  private async insertTenantTelemetryArtifactInventory(
+    conn: PoolConnection,
+    inventory: TenantTelemetryArtifactInventoryRecord,
+  ): Promise<void> {
+    validateTenantTelemetryArtifactInventory(inventory);
+    await conn.query(
+      `INSERT INTO tenant_telemetry_artifact_inventory
+         (inventory_sha256,tenant_id,control_generation,scope,domain,target_sha256,
+          artifact_id_sha256,artifact_generation,owner_kind,tenant_ref_sha256,owner_ref_sha256,
+          hold_subject_ref_sha256,coverage_evidence_sha256,history_status,writer_protocol,
+          writer_generation,source_schema,source_generation,source_high_water_db_ms,payload_sha256,
+          manifest_sha256,retention_class,retention_policy_control_generation,
+          retention_policy_sha256,dispose_after_db_ms,tenant_hold_control_generation,
+          tenant_hold_projection_sha256,owner_hold_control_generation,owner_hold_projection_sha256,
+          restore_control_generation,restore_lineage_kind,restore_updated_at_db_ms,
+          runtime_epoch_sha256,created_at_db_ms,receipt_sha256)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        inventory.inventorySha256,
+        inventory.tenantId,
+        inventory.controlGeneration,
+        inventory.scope,
+        inventory.domain,
+        inventory.targetSha256,
+        inventory.artifactIdSha256,
+        inventory.artifactGeneration,
+        inventory.ownerKind,
+        inventory.tenantRefSha256,
+        inventory.ownerRefSha256,
+        inventory.holdSubjectRefSha256,
+        inventory.coverageEvidenceSha256,
+        inventory.historyStatus,
+        inventory.writerProtocol,
+        inventory.writerGeneration,
+        inventory.sourceSchema,
+        inventory.sourceGeneration,
+        inventory.sourceHighWaterDbMs,
+        inventory.payloadSha256,
+        inventory.manifestSha256,
+        inventory.retentionClass,
+        inventory.retentionPolicyControlGeneration,
+        inventory.retentionPolicySha256,
+        inventory.disposeAfterDbMs,
+        inventory.tenantHoldControlGeneration,
+        inventory.tenantHoldProjectionSha256,
+        inventory.ownerHoldControlGeneration,
+        inventory.ownerHoldProjectionSha256,
+        inventory.restoreControlGeneration,
+        inventory.restoreLineageKind,
+        inventory.restoreUpdatedAtDbMs,
+        inventory.runtimeEpochSha256,
+        inventory.createdAtDbMs,
+        inventory.receiptSha256,
+      ],
+    );
+  }
+
+  private async stageTenantTelemetryWrite(
+    conn: PoolConnection,
+    input: Readonly<TenantTelemetryWriter.EnqueueTenantTelemetryArtifactInput>,
+    payload: Readonly<TenantTelemetryWriter.TenantTelemetryArtifactPayload>,
+    refKey: Buffer,
+  ): Promise<{
+      target: TenantTelemetryLifecycleTargetRecord;
+      inventory: TenantTelemetryArtifactInventoryRecord;
+      operationSha256: string;
+      payloadSha256: string;
+      payloadByteLength: number;
+    }> {
+    const [tenantLifecycleRows] = await conn.query<Row[]>(
+      `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [input.tenantId, input.tenantId],
+    );
+    const tenantLifecycle = tenantLifecycleRows[0]
+      ? rowToSubjectLifecycle(tenantLifecycleRows[0])
+      : undefined;
+    const control = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
+    if (control.state !== "active"
+      || control.refKeyIdSha256 !== tenantTelemetryRefKeyIdSha256(refKey)) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+        "tenant telemetry lifecycle is inactive",
+      );
+    }
+    if (!tenantLifecycle) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+        "tenant telemetry write tenant lifecycle is missing",
+      );
+    }
+    await this.lockActiveTenantGate(conn, input.tenantId, Date.now());
+    const targets = await this.readTenantTelemetryLifecycleTargets(conn, "FOR SHARE");
+    const target = targets.find((candidate) => candidate.domain === input.domain);
+    if (!target
+      || tenantTelemetryLifecycleTargetRootSha256(targets) !== control.targetRootSha256) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    }
+    const activationReceipt = await this.readTenantTelemetryActivationReceipt(
+      conn,
+      "FOR SHARE",
+    );
+    this.assertTenantTelemetryActivationReceiptBindings(
+      control,
+      targets,
+      activationReceipt,
+      tenantTelemetryRefKeyIdSha256(refKey),
+    );
+    const coverage = await this.readTenantTelemetryLifecycleCoverage(
+      conn,
+      input.tenantId,
+      "FOR SHARE",
+    );
+    const tenantRefSha256 = tenantTelemetrySubjectRefForTenantSha256(input.tenantId, refKey);
+    if (!coverage
+      || coverage.historyStatus !== "complete_since_creation"
+      || coverage.subjectRefSha256 !== tenantRefSha256
+      || coverage.targetRootSha256 !== control.targetRootSha256) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+        "tenant telemetry durable writer requires complete-since-creation coverage",
+      );
+    }
+    let userLifecycle: SubjectLifecycleRecord | undefined;
+    if (input.ownerKind !== "tenant") {
+      await this.lockActiveSubjectGate(
+        conn,
+        input.tenantId,
+        input.ownerUserId!,
+        Date.now(),
+        input.ownerKind === "session" ? input.ownerId : undefined,
+      );
+      const [userLifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR SHARE`,
+        [input.tenantId, input.ownerUserId],
+      );
+      userLifecycle = userLifecycleRows[0]
+        ? rowToSubjectLifecycle(userLifecycleRows[0])
+        : undefined;
+      if (!userLifecycle || userLifecycle.state !== "active") {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
+      }
+    }
+    if (input.ownerKind === "session") {
+      const [sessionRows] = await conn.query<Row[]>(
+        `SELECT tenant_id,user_id,deleted_at_ms FROM sessions
+          WHERE session_id=? FOR SHARE`,
+        [input.ownerId],
+      );
+      const session = sessionRows[0];
+      if (!session
+        || String(session.tenant_id) !== input.tenantId
+        || String(session.user_id) !== input.ownerUserId
+        || session.deleted_at_ms != null) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+          "tenant telemetry write session owner does not match",
+        );
+      }
+    }
+    const ownerRefSha256 = tenantTelemetryOwnerRefSha256(
+      input.ownerKind,
+      input.ownerId,
+      refKey,
+    );
+    const holdSubjectRefSha256 = input.ownerKind === "tenant"
+      ? tenantRefSha256
+      : tenantTelemetryOwnerRefSha256("user", input.ownerUserId!, refKey);
+    const payloadSha256 = TenantTelemetryWriter.tenantTelemetryArtifactPayloadSha256(payload);
+    const manifestSha256 = TenantTelemetryWriter.tenantTelemetryArtifactManifestSha256({
+      tenantId: input.tenantId,
+      controlGeneration: 1,
+      domain: input.domain,
+      targetSha256: target.targetSha256,
+      artifactIdSha256: input.artifactIdSha256,
+      artifactGeneration: input.artifactGeneration,
+      ownerKind: input.ownerKind,
+      tenantRefSha256,
+      ownerRefSha256,
+      holdSubjectRefSha256,
+      coverageEvidenceSha256: coverage.evidenceSha256,
+      sourceSchema: input.sourceSchema,
+      sourceGeneration: input.sourceGeneration,
+      sourceHighWaterDbMs: input.sourceHighWaterDbMs,
+      payloadSha256,
+    });
+    const tenantHold = await this.loadLegalHoldContextForLifecycle(
+      conn,
+      input.tenantId,
+      "tenant",
+      input.tenantId,
+      tenantLifecycle,
+      "FOR SHARE",
+    );
+    const ownerHold = input.ownerKind === "tenant"
+      ? tenantHold
+      : await this.loadLegalHoldContextForLifecycle(
+          conn,
+          input.tenantId,
+          "user",
+          input.ownerUserId!,
+          userLifecycle,
+          "FOR SHARE",
+        );
+    const activePolicy = await this.loadValidatedActiveRetentionPolicy(
+      conn,
+      input.tenantId,
+      "FOR SHARE",
+    );
+    const restoreControl = await this.loadTenantRestoreRuntimeControl(conn, "FOR SHARE");
+    const dbNow = await this.databaseNow(conn);
+    const restoreUpdatedAtDbMs = restoreControl.state === "inactive"
+      ? 0
+      : restoreControl.updatedAtDbMs;
+    const createdAtDbMs = Math.max(
+      dbNow,
+      control.activatedAtDbMs,
+      coverage.coverageStartedAtDbMs,
+      tenantLifecycle.createdAtMs,
+      input.sourceHighWaterDbMs,
+      activePolicy?.control.updatedAtMs ?? 0,
+      tenantHold.control.updatedAtMs,
+      ownerHold.control.updatedAtMs,
+      restoreUpdatedAtDbMs,
+    );
+    const identity = {
+      tenantId: input.tenantId,
+      controlGeneration: 1 as const,
+      domain: input.domain,
+      targetSha256: target.targetSha256,
+      artifactIdSha256: input.artifactIdSha256,
+      artifactGeneration: input.artifactGeneration,
+      ownerKind: input.ownerKind,
+      tenantRefSha256,
+      ownerRefSha256,
+    };
+    const body = {
+      inventorySha256: tenantTelemetryArtifactInventorySha256(identity),
+      ...identity,
+      scope: TENANT_TELEMETRY_ARTIFACT_INVENTORY_SCOPE,
+      holdSubjectRefSha256,
+      coverageEvidenceSha256: coverage.evidenceSha256,
+      historyStatus: coverage.historyStatus,
+      writerProtocol: TENANT_TELEMETRY_WRITER_PROTOCOL,
+      writerGeneration: 1 as const,
+      sourceSchema: input.sourceSchema,
+      sourceGeneration: input.sourceGeneration,
+      sourceHighWaterDbMs: input.sourceHighWaterDbMs,
+      payloadSha256,
+      manifestSha256,
+      retentionClass: TENANT_TELEMETRY_RETENTION_CLASS,
+      retentionPolicyControlGeneration: activePolicy?.control.controlGeneration ?? 0,
+      retentionPolicySha256: activePolicy?.policy.policySha256 ?? null,
+      disposeAfterDbMs: null,
+      tenantHoldControlGeneration: tenantHold.control.controlGeneration,
+      tenantHoldProjectionSha256: tenantHold.control.activeProjectionSha256,
+      ownerHoldControlGeneration: ownerHold.control.controlGeneration,
+      ownerHoldProjectionSha256: ownerHold.control.activeProjectionSha256,
+      restoreControlGeneration: restoreControl.controlGeneration,
+      restoreLineageKind: restoreControl.state === "inactive"
+        ? "inactive" as const
+        : restoreControl.lineageKind,
+      restoreUpdatedAtDbMs,
+      runtimeEpochSha256: restoreControl.state === "inactive"
+        ? null
+        : restoreControl.runtimeEpochSha256,
+      createdAtDbMs,
+    };
+    const inventory: TenantTelemetryArtifactInventoryRecord = {
+      ...body,
+      receiptSha256: tenantTelemetryArtifactInventoryReceiptSha256(body),
+    };
+    validateTenantTelemetryArtifactInventory(inventory);
+    return {
+      target,
+      inventory,
+      operationSha256: TenantTelemetryWriter.tenantTelemetryWriteOperationSha256(
+        manifestSha256,
+      ),
+      payloadSha256,
+      payloadByteLength: TenantTelemetryWriter.tenantTelemetryArtifactPayloadByteLength(payload),
+    };
+  }
+
+  async enqueueTenantTelemetryArtifact(
+    input: TenantTelemetryWriter.EnqueueTenantTelemetryArtifactInput,
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWriteJobRecord> {
+    this.requireTenantTelemetryWriterSchema();
+    const refKey = this.requireTenantTelemetryRefKey();
+    const { input: stagedInput, payload } =
+      TenantTelemetryWriter.captureTrustedEnqueueTenantTelemetryArtifactInput(input, refKey);
+    for (let transactionAttempt = 0; transactionAttempt < 5; transactionAttempt += 1) {
+      const conn = await this.pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const staged = await this.stageTenantTelemetryWrite(
+          conn,
+          stagedInput,
+          payload,
+          refKey,
+        );
+        const existing = await this.readTenantTelemetryWriteJob(
+          conn,
+          staged.operationSha256,
+          "FOR UPDATE",
+        );
+        if (existing) {
+          await this.assertTenantTelemetryWriteJobRelations(conn, existing, "FOR SHARE");
+          if (existing.tenantId !== stagedInput.tenantId
+            || existing.target.receiptSha256 !== staged.target.receiptSha256
+            || existing.inventory.manifestSha256 !== staged.inventory.manifestSha256
+            || existing.inventory.payloadSha256 !== staged.payloadSha256
+            || existing.inventory.artifactIdSha256 !== stagedInput.artifactIdSha256
+            || existing.inventory.artifactGeneration !== stagedInput.artifactGeneration) {
+            throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
+          }
+          await conn.commit();
+          return existing;
+        }
+        const externalJob = await this.readTenantTelemetryWriteJobByExternalIdentity(
+          conn,
+          stagedInput.domain,
+          stagedInput.artifactIdSha256,
+          stagedInput.artifactGeneration,
+          "FOR UPDATE",
+        );
+        if (externalJob) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
+        }
+        const existingInventory = await this.readTenantTelemetryArtifactByExternalIdentity(
+          conn,
+          stagedInput.domain,
+          stagedInput.artifactIdSha256,
+          stagedInput.artifactGeneration,
+          "FOR UPDATE",
+        );
+        if (existingInventory) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+            "tenant telemetry artifact is already registered outside this write operation",
+          );
+        }
+        const createdAtMs = staged.inventory.createdAtDbMs;
+        const job: TenantTelemetryWriter.TenantTelemetryWriteJobRecord = {
+          writeOperationSha256: staged.operationSha256,
+          tenantId: stagedInput.tenantId,
+          protocol: TenantTelemetryWriter.TENANT_TELEMETRY_WRITE_PROTOCOL,
+          phase: "queued",
+          target: staged.target,
+          inventory: staged.inventory,
+          recordCount: payload.records.length,
+          payloadByteLength: staged.payloadByteLength,
+          attempts: 0,
+          availableAtMs: createdAtMs,
+          createdAtMs,
+          updatedAtMs: createdAtMs,
+        };
+        const payloadRecord: TenantTelemetryWriter.TenantTelemetryWritePayloadRecord = {
+          writeOperationSha256: staged.operationSha256,
+          tenantId: stagedInput.tenantId,
+          payload,
+          payloadSha256: staged.payloadSha256,
+          recordCount: payload.records.length,
+          payloadByteLength: staged.payloadByteLength,
+          createdAtMs,
+        };
+        TenantTelemetryWriter.validateTenantTelemetryWriteJobRecord(job);
+        TenantTelemetryWriter.validateTenantTelemetryWritePayloadRecord(payloadRecord);
+        await conn.query(
+          `INSERT INTO tenant_telemetry_write_jobs
+             (write_operation_sha256,tenant_id,protocol,phase,domain,target_sha256,
+              inventory_sha256,artifact_id_sha256,artifact_generation,payload_sha256,
+              manifest_sha256,inventory_json,record_count,payload_byte_length,available_at_ms,
+              attempts,claim_token,lease_until_ms,last_error_code,write_ack_receipt_sha256,
+              written_at_db_ms,completed_claim_attempt,completed_claim_token_sha256,
+              blocked_at_db_ms,blocked_reason_code,created_at_ms,updated_at_ms)
+           VALUES (?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+                   NULL,NULL,?,?)`,
+          [
+            job.writeOperationSha256,
+            job.tenantId,
+            job.protocol,
+            job.inventory.domain,
+            job.target.targetSha256,
+            job.inventory.inventorySha256,
+            job.inventory.artifactIdSha256,
+            job.inventory.artifactGeneration,
+            job.inventory.payloadSha256,
+            job.inventory.manifestSha256,
+            JSON.stringify(job.inventory),
+            job.recordCount,
+            job.payloadByteLength,
+            job.availableAtMs,
+            job.createdAtMs,
+            job.updatedAtMs,
+          ],
+        );
+        await conn.query(
+          `INSERT INTO tenant_telemetry_write_payloads
+             (write_operation_sha256,tenant_id,domain,payload_json,payload_sha256,
+              record_count,payload_byte_length,created_at_ms)
+           VALUES (?,?,?,?,?,?,?,?)`,
+          [
+            payloadRecord.writeOperationSha256,
+            payloadRecord.tenantId,
+            payloadRecord.payload.domain,
+            TenantTelemetryWriter.tenantTelemetryArtifactPayloadCanonicalJson(
+              payloadRecord.payload,
+            ),
+            payloadRecord.payloadSha256,
+            payloadRecord.recordCount,
+            payloadRecord.payloadByteLength,
+            payloadRecord.createdAtMs,
+          ],
+        );
+        await conn.commit();
+        return job;
+      } catch (error) {
+        await conn.rollback().catch(() => {});
+        const code = (error as { code?: string }).code;
+        if ((code === "ER_DUP_ENTRY"
+            || code === "ER_LOCK_DEADLOCK"
+            || code === "ER_LOCK_WAIT_TIMEOUT")
+          && transactionAttempt < 4) {
+          continue;
+        }
+        if (code === "ER_DUP_ENTRY") {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
+        }
+        throw error;
+      } finally {
+        conn.release();
+      }
+    }
+    throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
+  }
+
+  async claimTenantTelemetryWriteJobs(
+    options: TenantTelemetryWriter.ClaimTenantTelemetryWriteJobsOptions,
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWriteClaim[]> {
+    const stagedOptions = structuredClone(options);
+    TenantTelemetryWriter.validateClaimTenantTelemetryWriteJobsOptions(stagedOptions);
+    this.requireTenantTelemetryWriterSchema();
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await conn.beginTransaction();
+      const nowMs = await this.databaseNow(conn);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT write_operation_sha256
+           FROM tenant_telemetry_write_jobs
+         WHERE phase='queued' AND available_at_ms<=?
+            AND (claim_token IS NULL OR lease_until_ms<=?)
+            AND EXISTS (SELECT 1 FROM tenant_telemetry_lifecycle_targets t
+                         WHERE t.target_sha256=tenant_telemetry_write_jobs.target_sha256
+                           AND t.adapter_protocol=?)
+          ORDER BY created_at_ms,write_operation_sha256
+          LIMIT ? FOR UPDATE SKIP LOCKED`,
+        [nowMs, nowMs, stagedOptions.adapterProtocol, stagedOptions.limit],
+      );
+      const claims: TenantTelemetryWriter.TenantTelemetryWriteClaim[] = [];
+      for (const row of rows) {
+        const current = await this.readTenantTelemetryWriteJob(
+          conn,
+          String(row.write_operation_sha256),
+          "FOR UPDATE",
+        );
+        if (!current || current.phase !== "queued") {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+        }
+        await this.assertTenantTelemetryWriteJobRelations(conn, current, "FOR SHARE");
+        const claimNowMs = await this.databaseNow(conn);
+        if (current.availableAtMs > claimNowMs
+          || (current.leaseUntilMs !== undefined && current.leaseUntilMs > claimNowMs)) {
+          continue;
+        }
+        if (current.attempts >= Number.MAX_SAFE_INTEGER) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+        }
+        const payload = await this.readTenantTelemetryWritePayload(
+          conn,
+          current.writeOperationSha256,
+          "FOR SHARE",
+        );
+        if (!payload) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+        const leaseUntilMs = Math.min(
+          Number.MAX_SAFE_INTEGER,
+          claimNowMs + stagedOptions.leaseMs,
+        );
+        const updatedAtMs = Math.max(current.updatedAtMs, claimNowMs);
+        const [updated] = await conn.query<mysql.ResultSetHeader>(
+          `UPDATE tenant_telemetry_write_jobs
+              SET attempts=attempts+1,claim_token=?,lease_until_ms=?,last_error_code=NULL,
+                  updated_at_ms=?
+            WHERE write_operation_sha256=? AND tenant_id=? AND phase='queued' AND attempts=?
+              AND available_at_ms<=? AND (claim_token IS NULL OR lease_until_ms<=?)`,
+          [
+            stagedOptions.claimToken,
+            leaseUntilMs,
+            updatedAtMs,
+            current.writeOperationSha256,
+            current.tenantId,
+            current.attempts,
+            claimNowMs,
+            claimNowMs,
+          ],
+        );
+        if (updated.affectedRows !== 1) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+        }
+        const claim: TenantTelemetryWriter.TenantTelemetryWriteClaim = {
+          writeOperationSha256: current.writeOperationSha256,
+          tenantId: current.tenantId,
+          protocol: current.protocol,
+          phase: "queued",
+          target: current.target,
+          inventory: current.inventory,
+          payload: payload.payload,
+          recordCount: current.recordCount,
+          payloadByteLength: current.payloadByteLength,
+          claimAttempt: current.attempts + 1,
+          claimToken: stagedOptions.claimToken,
+          leaseUntilMs,
+          ...(current.reservation === undefined
+            ? {}
+            : { reservation: structuredClone(current.reservation) }),
+        };
+        TenantTelemetryWriter.validateTenantTelemetryWriteClaim(claim);
+        claims.push(claim);
+      }
+      await conn.commit();
+      return claims;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async renewTenantTelemetryWrite(
+    authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
+    options: TenantTelemetryWriter.RenewTenantTelemetryWriteOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedOptions = structuredClone(options);
+    TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
+    TenantTelemetryWriter.validateRenewTenantTelemetryWriteOptions(stagedOptions);
+    this.requireTenantTelemetryWriterSchema();
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const current = await this.readTenantTelemetryWriteJob(
+        conn,
+        stagedAuthorization.writeOperationSha256,
+        "FOR UPDATE",
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!current || !this.tenantTelemetryWriteAuthorizationMatches(
+        current,
+        stagedAuthorization,
+        nowMs,
+      )) {
+        await conn.commit();
+        return false;
+      }
+      await this.assertTenantTelemetryWriteJobRelations(conn, current, "FOR SHARE");
+      const requestedLeaseUntilMs = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        nowMs + stagedOptions.leaseMs,
+      );
+      const leaseUntilMs = Math.max(current.leaseUntilMs!, requestedLeaseUntilMs);
+      const updatedAtMs = Math.max(current.updatedAtMs, nowMs);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_telemetry_write_jobs
+            SET lease_until_ms=?,updated_at_ms=?
+          WHERE write_operation_sha256=? AND tenant_id=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          leaseUntilMs,
+          updatedAtMs,
+          current.writeOperationSha256,
+          current.tenantId,
+          stagedAuthorization.claimAttempt,
+          stagedAuthorization.claimToken,
+          nowMs,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async reserveTenantTelemetryExternalMutation(
+    authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
+    adapterProtocol: string,
+  ): Promise<TenantTelemetryWriter.TenantTelemetryExternalMutationReservation | null> {
+    const stagedAuthorization = structuredClone(authorization);
+    TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
+    TenantTelemetryWriter.validateClaimTenantTelemetryWriteJobsOptions({
+      limit: 1, leaseMs: 1, claimToken: stagedAuthorization.claimToken, adapterProtocol,
+    });
+    this.requireTenantTelemetryWriterSchema();
+    const refKey = this.requireTenantTelemetryRefKey();
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const hint = await this.readTenantTelemetryWriteJob(
+        conn,
+        stagedAuthorization.writeOperationSha256,
+      );
+      if (!hint || hint.tenantId !== stagedAuthorization.tenantId
+        || hint.target.adapterProtocol !== adapterProtocol) {
+        await conn.commit();
+        return null;
+      }
+      if (hint.reservation) {
+        const current = await this.readTenantTelemetryWriteJob(
+          conn, hint.writeOperationSha256, "FOR UPDATE",
+        );
+        const nowMs = await this.databaseNow(conn);
+        if (!current || !current.reservation
+          || !this.tenantTelemetryWriteAuthorizationMatches(
+            current, stagedAuthorization, nowMs,
+          )) {
+          await conn.commit();
+          return null;
+        }
+        await conn.commit();
+        return current.reservation;
+      }
+
+      // This is the only authorization boundary before first external mutation. Keep the same
+      // lock hierarchy as lifecycle admission: tenant gate, owner/source rows, then the job.
+      await this.lockActiveTenantGate(conn, hint.tenantId, Date.now());
+      let ownerUserId: string | undefined;
+      let ownerSessionId: string | undefined;
+      if (hint.inventory.ownerKind === "user") {
+        const [rows] = await conn.query<Row[]>(
+          `SELECT ${SUBJECT_LIFECYCLE_COLUMNS} FROM subject_lifecycle
+            WHERE tenant_id=? AND subject_kind='user' FOR SHARE`,
+          [hint.tenantId],
+        );
+        ownerUserId = rows.map(rowToSubjectLifecycle).find((candidate) => (
+          candidate.state === "active"
+          && tenantTelemetryOwnerRefSha256("user", candidate.subjectId, refKey)
+            === hint.inventory.ownerRefSha256
+        ))?.subjectId;
+      } else if (hint.inventory.ownerKind === "session") {
+        const [rows] = await conn.query<Row[]>(
+          `SELECT session_id,user_id,deleted_at_ms FROM sessions
+            WHERE tenant_id=? FOR SHARE`,
+          [hint.tenantId],
+        );
+        const session = rows.find((candidate) => (
+          candidate.deleted_at_ms == null
+          && tenantTelemetryOwnerRefSha256("session", String(candidate.session_id), refKey)
+            === hint.inventory.ownerRefSha256
+        ));
+        ownerUserId = session === undefined ? undefined : String(session.user_id);
+        ownerSessionId = session === undefined ? undefined : String(session.session_id);
+      }
+      if (hint.inventory.ownerKind !== "tenant") {
+        if (!ownerUserId) {
+          await conn.commit();
+          return null;
+        }
+        await this.lockActiveSubjectGate(
+          conn,
+          hint.tenantId,
+          ownerUserId,
+          Date.now(),
+          hint.inventory.ownerKind === "session" ? ownerSessionId : undefined,
+        );
+        if (tenantTelemetryOwnerRefSha256("user", ownerUserId, refKey)
+          !== hint.inventory.holdSubjectRefSha256) {
+          await conn.commit();
+          return null;
+        }
+      }
+
+      const control = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
+      const targets = control.state === "active"
+        ? await this.readTenantTelemetryLifecycleTargets(conn, "FOR SHARE")
+        : [];
+      const target = targets.find((candidate) => candidate.domain === hint.inventory.domain);
+      const coverage = control.state === "active"
+        ? await this.readTenantTelemetryLifecycleCoverage(conn, hint.tenantId, "FOR SHARE")
+        : null;
+      const activePolicy = await this.loadValidatedActiveRetentionPolicy(
+        conn, hint.tenantId, "FOR SHARE",
+      );
+      const [tenantLifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS} FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+        [hint.tenantId, hint.tenantId],
+      );
+      const tenantLifecycle = tenantLifecycleRows[0]
+        ? rowToSubjectLifecycle(tenantLifecycleRows[0])
+        : undefined;
+      const tenantHold = tenantLifecycle
+        ? await this.loadLegalHoldContextForLifecycle(
+            conn, hint.tenantId, "tenant", hint.tenantId, tenantLifecycle, "FOR SHARE",
+          )
+        : undefined;
+      let ownerHold = tenantHold;
+      if (hint.inventory.ownerKind !== "tenant" && ownerUserId) {
+        const [ownerRows] = await conn.query<Row[]>(
+          `SELECT ${SUBJECT_LIFECYCLE_COLUMNS} FROM subject_lifecycle
+            WHERE tenant_id=? AND subject_kind='user' AND subject_id=? FOR SHARE`,
+          [hint.tenantId, ownerUserId],
+        );
+        const ownerLifecycle = ownerRows[0] ? rowToSubjectLifecycle(ownerRows[0]) : undefined;
+        ownerHold = ownerLifecycle
+          ? await this.loadLegalHoldContextForLifecycle(
+              conn, hint.tenantId, "user", ownerUserId, ownerLifecycle, "FOR SHARE",
+            )
+          : undefined;
+      }
+      const restore = await this.loadTenantRestoreRuntimeControl(conn, "FOR SHARE");
+      const current = await this.readTenantTelemetryWriteJob(
+        conn, hint.writeOperationSha256, "FOR UPDATE",
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!current || current.reservation
+        || !this.tenantTelemetryWriteAuthorizationMatches(current, stagedAuthorization, nowMs)
+        || control.state !== "active"
+        || !tenantLifecycle || tenantLifecycle.state !== "active"
+        || !target || target.receiptSha256 !== current.target.receiptSha256
+        || !coverage || coverage.evidenceSha256 !== current.inventory.coverageEvidenceSha256
+        || (activePolicy?.control.controlGeneration ?? 0)
+          !== current.inventory.retentionPolicyControlGeneration
+        || (activePolicy?.policy.policySha256 ?? null)
+          !== current.inventory.retentionPolicySha256
+        || !tenantHold || !ownerHold
+        || tenantHold.control.controlGeneration
+          !== current.inventory.tenantHoldControlGeneration
+        || tenantHold.control.activeProjectionSha256
+          !== current.inventory.tenantHoldProjectionSha256
+        || ownerHold.control.controlGeneration !== current.inventory.ownerHoldControlGeneration
+        || ownerHold.control.activeProjectionSha256
+          !== current.inventory.ownerHoldProjectionSha256
+        || restore.controlGeneration !== current.inventory.restoreControlGeneration
+        || (restore.state === "active" ? restore.lineageKind : "inactive")
+          !== current.inventory.restoreLineageKind
+        || (restore.state === "active" ? restore.updatedAtDbMs : 0)
+          !== current.inventory.restoreUpdatedAtDbMs
+        || (restore.state === "active" ? restore.runtimeEpochSha256 : null)
+          !== current.inventory.runtimeEpochSha256) {
+        await conn.commit();
+        return null;
+      }
+      const body: TenantTelemetryWriter.TenantTelemetryExternalMutationReservationBody = {
+        scope: TenantTelemetryWriter.TENANT_TELEMETRY_EXTERNAL_MUTATION_RESERVATION_SCOPE,
+        protocol: TenantTelemetryWriter.TENANT_TELEMETRY_WRITE_PROTOCOL,
+        writeOperationSha256: current.writeOperationSha256,
+        tenantId: current.tenantId,
+        adapterProtocol,
+        inventorySha256: current.inventory.inventorySha256,
+        manifestSha256: current.inventory.manifestSha256,
+        startedClaimAttempt: stagedAuthorization.claimAttempt,
+        startedClaimTokenSha256: TenantTelemetryWriter.tenantTelemetryWriteClaimTokenSha256(
+          stagedAuthorization.claimToken,
+        ),
+        startedAtDbMs: Math.max(nowMs, current.createdAtMs),
+      };
+      const reservation: TenantTelemetryWriter.TenantTelemetryExternalMutationReservation = {
+        ...body,
+        receiptSha256:
+          TenantTelemetryWriter.tenantTelemetryExternalMutationReservationSha256(body),
+      };
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_telemetry_write_jobs
+            SET mutation_adapter_protocol=?,mutation_started_at_db_ms=?,
+                mutation_started_claim_attempt=?,mutation_started_claim_token_sha256=?,
+                mutation_reservation_receipt_sha256=?,updated_at_ms=?
+          WHERE write_operation_sha256=? AND tenant_id=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?
+            AND mutation_reservation_receipt_sha256 IS NULL`,
+        [
+          reservation.adapterProtocol,
+          reservation.startedAtDbMs,
+          reservation.startedClaimAttempt,
+          reservation.startedClaimTokenSha256,
+          reservation.receiptSha256,
+          Math.max(current.updatedAtMs, reservation.startedAtDbMs),
+          current.writeOperationSha256,
+          current.tenantId,
+          stagedAuthorization.claimAttempt,
+          stagedAuthorization.claimToken,
+          nowMs,
+        ],
+      );
+      if (updated.affectedRows !== 1) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+      }
+      await conn.commit();
+      return reservation;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryTenantTelemetryWrite(
+    authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
+    options: TenantTelemetryWriter.RetryTenantTelemetryWriteOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedOptions = structuredClone(options);
+    TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
+    TenantTelemetryWriter.validateRetryTenantTelemetryWriteOptions(stagedOptions);
+    this.requireTenantTelemetryWriterSchema();
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const current = await this.readTenantTelemetryWriteJob(
+        conn,
+        stagedAuthorization.writeOperationSha256,
+        "FOR UPDATE",
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!current || current.phase !== "queued"
+        || !this.tenantTelemetryWriteAuthorizationMatches(
+          current,
+          stagedAuthorization,
+          nowMs,
+        )) {
+        await conn.commit();
+        return false;
+      }
+      await this.assertTenantTelemetryWriteJobRelations(conn, current, "FOR SHARE");
+      const baseMs = Math.max(nowMs, current.updatedAtMs, current.availableAtMs);
+      const availableAtMs = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        baseMs + stagedOptions.delayMs,
+      );
+      const updatedAtMs = Math.max(current.updatedAtMs, nowMs);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_telemetry_write_jobs
+            SET available_at_ms=?,claim_token=NULL,lease_until_ms=NULL,last_error_code=?,
+                updated_at_ms=?
+          WHERE write_operation_sha256=? AND tenant_id=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          availableAtMs,
+          stagedOptions.errorCode,
+          updatedAtMs,
+          current.writeOperationSha256,
+          current.tenantId,
+          stagedAuthorization.claimAttempt,
+          stagedAuthorization.claimToken,
+          nowMs,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async blockTenantTelemetryWrite(
+    authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
+    reason: TenantTelemetryWriter.TenantTelemetryWriteBlockReasonCode = "integrity_conflict",
+  ): Promise<boolean> {
+    const stagedAuthorization = structuredClone(authorization);
+    TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
+    if (reason !== "integrity_conflict") {
+      throw new Error("tenant telemetry write block reason is invalid");
+    }
+    this.requireTenantTelemetryWriterSchema();
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const current = await this.readTenantTelemetryWriteJob(
+        conn,
+        stagedAuthorization.writeOperationSha256,
+        "FOR UPDATE",
+      );
+      const nowMs = await this.databaseNow(conn);
+      if (!current || current.phase !== "queued"
+        || !this.tenantTelemetryWriteAuthorizationMatches(
+          current,
+          stagedAuthorization,
+          nowMs,
+        )) {
+        await conn.commit();
+        return false;
+      }
+      await this.assertTenantTelemetryWriteJobRelations(conn, current, "FOR SHARE");
+      const blockedAtDbMs = Math.max(current.createdAtMs, current.updatedAtMs, nowMs);
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_telemetry_write_jobs
+            SET phase='blocked',available_at_ms=NULL,claim_token=NULL,lease_until_ms=NULL,
+                last_error_code=NULL,blocked_at_db_ms=?,blocked_reason_code=?,updated_at_ms=?
+          WHERE write_operation_sha256=? AND tenant_id=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          blockedAtDbMs,
+          reason,
+          blockedAtDbMs,
+          current.writeOperationSha256,
+          current.tenantId,
+          stagedAuthorization.claimAttempt,
+          stagedAuthorization.claimToken,
+          nowMs,
+        ],
+      );
+      await conn.commit();
+      return updated.affectedRows === 1;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async completeTenantTelemetryWrite(
+    authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
+    result: TenantTelemetryWriter.TenantTelemetryWriteAdapterResult,
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWriteAck | null> {
+    const stagedAuthorization = structuredClone(authorization);
+    const stagedResult = structuredClone(result);
+    TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
+    TenantTelemetryWriter.validateTenantTelemetryWriteAdapterResult(stagedResult);
+    this.requireTenantTelemetryWriterSchema();
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const current = await this.readTenantTelemetryWriteJob(
+        conn,
+        stagedAuthorization.writeOperationSha256,
+        "FOR UPDATE",
+      );
+      if (!current || current.tenantId !== stagedAuthorization.tenantId) {
+        await conn.commit();
+        return null;
+      }
+      if (current.phase === "written") {
+        await this.assertTenantTelemetryWriteJobRelations(conn, current, "FOR SHARE");
+        const ack = await this.readTenantTelemetryWriteAck(
+          conn,
+          current.writeOperationSha256,
+          "FOR SHARE",
+        );
+        if (!ack
+          || current.completedClaimAttempt !== stagedAuthorization.claimAttempt
+          || current.completedClaimTokenSha256
+            !== TenantTelemetryWriter.tenantTelemetryWriteClaimTokenSha256(
+              stagedAuthorization.claimToken,
+            )) {
+          await conn.commit();
+          return null;
+        }
+        if (ack.adapterEvidenceSha256 !== stagedResult.evidenceSha256) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+            "tenant telemetry write exact replay evidence changed",
+          );
+        }
+        await conn.commit();
+        return ack;
+      }
+      const nowMs = await this.databaseNow(conn);
+      if (current.phase !== "queued"
+        || !this.tenantTelemetryWriteAuthorizationMatches(
+          current,
+          stagedAuthorization,
+          nowMs,
+        )) {
+        await conn.commit();
+        return null;
+      }
+      if (!current.reservation) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+          "tenant telemetry external mutation was not durably reserved",
+        );
+      }
+      await this.assertTenantTelemetryWriteJobRelations(conn, current, "FOR SHARE");
+      if (stagedResult.adapterProtocol !== current.target.adapterProtocol
+        || stagedResult.domain !== current.inventory.domain
+        || stagedResult.targetSha256 !== current.target.targetSha256
+        || stagedResult.writeOperationSha256 !== current.writeOperationSha256
+        || stagedResult.artifactIdSha256 !== current.inventory.artifactIdSha256
+        || stagedResult.artifactGeneration !== current.inventory.artifactGeneration
+        || stagedResult.payloadSha256 !== current.inventory.payloadSha256
+        || stagedResult.manifestSha256 !== current.inventory.manifestSha256) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+          "tenant telemetry adapter result does not match the claimed write",
+        );
+      }
+      const payload = await this.readTenantTelemetryWritePayload(
+        conn,
+        current.writeOperationSha256,
+        "FOR UPDATE",
+      );
+      if (!payload) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+      const existingInventory = await this.readTenantTelemetryArtifactByExternalIdentity(
+        conn,
+        current.inventory.domain,
+        current.inventory.artifactIdSha256,
+        current.inventory.artifactGeneration,
+        "FOR UPDATE",
+      );
+      const existingAck = await this.readTenantTelemetryWriteAck(
+        conn,
+        current.writeOperationSha256,
+        "FOR UPDATE",
+      );
+      if (existingInventory || existingAck) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
+      }
+      const completedAtDbMs = Math.max(
+        nowMs,
+        current.createdAtMs,
+        current.inventory.createdAtDbMs,
+        current.inventory.sourceHighWaterDbMs,
+      );
+      const completedClaimTokenSha256 =
+        TenantTelemetryWriter.tenantTelemetryWriteClaimTokenSha256(
+          stagedAuthorization.claimToken,
+        );
+      const ackBody: TenantTelemetryWriter.TenantTelemetryWriteAckBody = {
+        scope: TenantTelemetryWriter.TENANT_TELEMETRY_WRITE_ACK_SCOPE,
+        protocol: TenantTelemetryWriter.TENANT_TELEMETRY_WRITE_PROTOCOL,
+        writeOperationSha256: current.writeOperationSha256,
+        tenantId: current.tenantId,
+        domain: current.inventory.domain,
+        targetSha256: current.target.targetSha256,
+        targetReceiptSha256: current.target.receiptSha256,
+        inventorySha256: current.inventory.inventorySha256,
+        inventoryReceiptSha256: current.inventory.receiptSha256,
+        artifactIdSha256: current.inventory.artifactIdSha256,
+        artifactGeneration: current.inventory.artifactGeneration,
+        payloadSha256: current.inventory.payloadSha256,
+        manifestSha256: current.inventory.manifestSha256,
+        adapterProtocol: stagedResult.adapterProtocol,
+        outcome: stagedResult.outcome,
+        replayed: stagedResult.replayed,
+        adapterEvidenceSha256: stagedResult.evidenceSha256,
+        reservationReceiptSha256: current.reservation.receiptSha256,
+        mutationStartedAtDbMs: current.reservation.startedAtDbMs,
+        mutationStartedClaimAttempt: current.reservation.startedClaimAttempt,
+        mutationStartedClaimTokenSha256: current.reservation.startedClaimTokenSha256,
+        completedClaimAttempt: stagedAuthorization.claimAttempt,
+        completedClaimTokenSha256,
+        storeDbTimestampMs: completedAtDbMs,
+      };
+      const ack: TenantTelemetryWriter.TenantTelemetryWriteAck = {
+        ...ackBody,
+        receiptSha256: TenantTelemetryWriter.tenantTelemetryWriteAckSha256(ackBody),
+      };
+      TenantTelemetryWriter.validateTenantTelemetryWriteAck(ack);
+      await this.insertTenantTelemetryArtifactInventory(conn, current.inventory);
+      await conn.query(
+        `INSERT INTO tenant_telemetry_write_acks
+           (write_operation_sha256,tenant_id,scope,protocol,domain,target_sha256,
+            target_receipt_sha256,inventory_sha256,inventory_receipt_sha256,artifact_id_sha256,
+            artifact_generation,payload_sha256,manifest_sha256,adapter_protocol,outcome,replayed,
+            adapter_evidence_sha256,reservation_receipt_sha256,mutation_started_at_db_ms,
+            mutation_started_claim_attempt,mutation_started_claim_token_sha256,
+            completed_claim_attempt,completed_claim_token_sha256,
+            store_db_timestamp_ms,receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          ack.writeOperationSha256,
+          ack.tenantId,
+          ack.scope,
+          ack.protocol,
+          ack.domain,
+          ack.targetSha256,
+          ack.targetReceiptSha256,
+          ack.inventorySha256,
+          ack.inventoryReceiptSha256,
+          ack.artifactIdSha256,
+          ack.artifactGeneration,
+          ack.payloadSha256,
+          ack.manifestSha256,
+          ack.adapterProtocol,
+          ack.outcome,
+          ack.replayed,
+          ack.adapterEvidenceSha256,
+          ack.reservationReceiptSha256,
+          ack.mutationStartedAtDbMs,
+          ack.mutationStartedClaimAttempt,
+          ack.mutationStartedClaimTokenSha256,
+          ack.completedClaimAttempt,
+          ack.completedClaimTokenSha256,
+          ack.storeDbTimestampMs,
+          ack.receiptSha256,
+        ],
+      );
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_telemetry_write_jobs
+            SET phase='written',available_at_ms=NULL,claim_token=NULL,lease_until_ms=NULL,
+                last_error_code=NULL,write_ack_receipt_sha256=?,written_at_db_ms=?,
+                completed_claim_attempt=?,completed_claim_token_sha256=?,updated_at_ms=?
+          WHERE write_operation_sha256=? AND tenant_id=? AND phase='queued'
+            AND attempts=? AND claim_token=? AND lease_until_ms>?`,
+        [
+          ack.receiptSha256,
+          completedAtDbMs,
+          stagedAuthorization.claimAttempt,
+          completedClaimTokenSha256,
+          completedAtDbMs,
+          current.writeOperationSha256,
+          current.tenantId,
+          stagedAuthorization.claimAttempt,
+          stagedAuthorization.claimToken,
+          nowMs,
+        ],
+      );
+      if (updated.affectedRows !== 1) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+      }
+      const [deleted] = await conn.query<mysql.ResultSetHeader>(
+        `DELETE FROM tenant_telemetry_write_payloads
+          WHERE write_operation_sha256=? AND tenant_id=?`,
+        [current.writeOperationSha256, current.tenantId],
+      );
+      if (deleted.affectedRows !== 1) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+      }
+      await conn.commit();
+      return ack;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
+      }
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantTelemetryWriteJob(
+    tenantId: string,
+    writeOperationSha256: string,
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWriteJobRecord | null> {
+    if (typeof tenantId !== "string" || tenantId.length < 1 || tenantId.length > 128
+      || !/^[0-9a-f]{64}$/.test(writeOperationSha256)) {
+      throw new Error("tenant telemetry write job lookup is invalid");
+    }
+    this.requireTenantTelemetryWriterSchema();
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.readTenantTelemetryWriteJob(conn, writeOperationSha256);
+      if (!job) return null;
+      await this.assertTenantTelemetryWriteJobRelations(conn, job);
+      return job.tenantId === tenantId ? job : null;
+    });
+  }
+
+  async getTenantTelemetryWriteAck(
+    tenantId: string,
+    writeOperationSha256: string,
+  ): Promise<TenantTelemetryWriter.TenantTelemetryWriteAck | null> {
+    if (typeof tenantId !== "string" || tenantId.length < 1 || tenantId.length > 128
+      || !/^[0-9a-f]{64}$/.test(writeOperationSha256)) {
+      throw new Error("tenant telemetry write ACK lookup is invalid");
+    }
+    this.requireTenantTelemetryWriterSchema();
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.readTenantTelemetryWriteJob(conn, writeOperationSha256);
+      if (!job) return null;
+      await this.assertTenantTelemetryWriteJobRelations(conn, job);
+      if (job.tenantId !== tenantId || job.phase !== "written") return null;
+      const ack = await this.readTenantTelemetryWriteAck(conn, writeOperationSha256);
+      if (!ack) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+      return ack;
+    });
   }
 
   // ---------- blob storage write-once control ----------

@@ -81,7 +81,7 @@ import {
   createEphemeralStructuredTelemetry,
   isCanonicalId,
   outgoingTraceparent,
-  startTraceContext,
+  startBoundaryTraceContext,
   telemetryErrorKind,
   tenantRuntimeFleetSha256,
   tenantRuntimeTargetReceiptsSha256,
@@ -399,10 +399,10 @@ export function createRouterApp(deps: RouterAppDeps) {
     },
   }, 503);
 
-  // Every request gets a new local span. Only a strictly valid W3C v00 trace id is inherited;
-  // malformed/future input starts a fresh trace and is never relayed to a runner.
+  // The public boundary always starts a fresh internal root. A syntactically valid caller trace id
+  // is still untrusted input and must not enter structured records or router-to-runner propagation.
   app.use("*", async (c, next) => withTraceContext(
-    startTraceContext(c.req.header(TRACEPARENT_HEADER)),
+    startBoundaryTraceContext(),
     next,
   ));
   app.onError((error, c) => {

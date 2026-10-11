@@ -9,8 +9,10 @@ if (!requested) throw new Error("usage: run-required-suite.mjs <test-file>");
 
 const testFile = resolve(ROOT, requested);
 const relativeTestFile = relative(ROOT, testFile).split(sep).join("/");
-if (!relativeTestFile.startsWith("packages/store/test/") || !relativeTestFile.endsWith(".test.ts")) {
-  throw new Error(`refusing test suite outside packages/store/test: ${relativeTestFile}`);
+if (!(relativeTestFile.startsWith("packages/store/test/")
+    || relativeTestFile.startsWith("packages/core/test/"))
+  || !relativeTestFile.endsWith(".test.ts")) {
+  throw new Error(`refusing test suite outside approved package tests: ${relativeTestFile}`);
 }
 
 const reportDir = resolve(ROOT, ".local-run");

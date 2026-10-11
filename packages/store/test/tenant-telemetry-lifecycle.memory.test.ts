@@ -6,6 +6,7 @@ import {
   TenantTelemetryLifecycleIntegrityError,
   newErasureRequestId,
   newUserDataExportRequestId,
+  tenantErasureRequestHash,
   tenantTelemetryRefKeyIdSha256,
   userDataExportRequestHash,
   userErasureRequestHash,
@@ -206,6 +207,121 @@ describe("MemorySessionStore tenant telemetry lifecycle", () => {
     await expect(store.getTenant("tenant-failed")).resolves.toBeNull();
     await expect(store.resolveApiKey("hash-failed")).resolves.toBeNull();
     expect(store.tenantTelemetryLifecycleCoverages.has("tenant-failed")).toBe(false);
+  });
+
+  it("keeps dormant T1 subject-free and backfills its exact proof during activation", async () => {
+    let nowMs = 1_000;
+    const store = new MemorySessionStore(
+      { now: () => nowMs },
+      { tenantTelemetryRefKey: new Uint8Array(32).fill(13) },
+    );
+    const tenantId = "tenant-telemetry-preactivation-t1";
+    await store.createApiKey(tenantId, "key-preactivation", "hash-preactivation");
+    nowMs = 1_100;
+    const input = {
+      requestId: newErasureRequestId(),
+      tenantId,
+      requestedByKeyId: "telemetry-subject-test",
+      idempotencyKey: "telemetry-preactivation-subject",
+      requestHash: tenantErasureRequestHash(tenantId),
+      atMs: nowMs,
+    };
+    const admission = await store.requestTenantErasure(input);
+    await expect(store.getTenantTelemetryLifecycleSubject(tenantId, admission.requestId))
+      .resolves.toBeNull();
+    expect(store.tenantTelemetryLifecycleSubjects).toHaveLength(0);
+
+    nowMs = 1_200;
+    const activated = await store.activateTenantTelemetryLifecycle(activation());
+    const subject = await store.getTenantTelemetryLifecycleSubject(tenantId, admission.requestId);
+    expect(subject).toMatchObject({
+      requestId: admission.requestId,
+      tenantId,
+      subjectGeneration: admission.generation,
+      t1FenceSha256: store.tenantCredentialRevocationFences.get(tenantId)?.evidenceSha256,
+      targetRootSha256: activated.control.targetRootSha256,
+    });
+    await expect(store.getTenantTelemetryLifecycleSubject(
+      "other-tenant",
+      admission.requestId,
+    )).resolves.toBeNull();
+    await expect(store.requestTenantErasure(input)).resolves.toEqual(admission);
+  });
+
+  it("publishes active T1 subject atomically and fails closed on missing evidence", async () => {
+    let nowMs = 1_000;
+    const store = new MemorySessionStore(
+      { now: () => nowMs },
+      { tenantTelemetryRefKey: new Uint8Array(32).fill(14) },
+    );
+    await store.activateTenantTelemetryLifecycle(activation());
+    nowMs = 1_100;
+    const tenantId = "tenant-telemetry-active-t1";
+    await store.createApiKey(tenantId, "key-active-t1", "hash-active-t1");
+    const inputs = ["a", "b"].map((suffix) => ({
+      requestId: newErasureRequestId(),
+      tenantId,
+      requestedByKeyId: "telemetry-subject-test",
+      idempotencyKey: `telemetry-active-subject-${suffix}`,
+      requestHash: tenantErasureRequestHash(tenantId),
+      atMs: nowMs,
+    }));
+    const results = await Promise.all(inputs.map((input) => store.requestTenantErasure(input)));
+    expect(new Set(results.map((result) => result.requestId))).toHaveLength(1);
+    const requestId = results[0]!.requestId;
+    await expect(store.getTenantTelemetryLifecycleSubject(tenantId, requestId))
+      .resolves.toMatchObject({ requestId, tenantId });
+    expect(store.tenantTelemetryLifecycleSubjects).toHaveLength(1);
+
+    store.tenantTelemetryLifecycleSubjects.delete(requestId);
+    await expect(store.getTenantTelemetryLifecycleSubject(tenantId, requestId))
+      .rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+    await expect(store.getTenantTelemetryLifecycleControl())
+      .rejects.toBeInstanceOf(TenantTelemetryLifecycleIntegrityError);
+  });
+
+  it("rolls back every T1 projection when active subject publication fails", async () => {
+    let nowMs = 1_000;
+    const store = new MemorySessionStore(
+      { now: () => nowMs },
+      { tenantTelemetryRefKey: new Uint8Array(32).fill(15) },
+    );
+    await store.activateTenantTelemetryLifecycle(activation());
+    nowMs = 1_100;
+    const tenantId = "tenant-telemetry-subject-rollback";
+    await store.createApiKey(tenantId, "key-subject-rollback", "hash-subject-rollback");
+    const input = {
+      requestId: newErasureRequestId(),
+      tenantId,
+      requestedByKeyId: "telemetry-subject-test",
+      idempotencyKey: "telemetry-subject-rollback",
+      requestHash: tenantErasureRequestHash(tenantId),
+      atMs: nowMs,
+    };
+    const originalSet = store.tenantTelemetryLifecycleSubjects.set.bind(
+      store.tenantTelemetryLifecycleSubjects,
+    );
+    let fail = true;
+    Object.defineProperty(store.tenantTelemetryLifecycleSubjects, "set", {
+      configurable: true,
+      value: (key: string, value: Parameters<typeof originalSet>[1]) => {
+        if (fail) {
+          fail = false;
+          throw new Error("injected telemetry subject publication failure");
+        }
+        return originalSet(key, value);
+      },
+    });
+
+    await expect(store.requestTenantErasure(input))
+      .rejects.toThrow("injected telemetry subject publication failure");
+    await expect(store.getTenantErasureRequest(tenantId, input.requestId)).resolves.toBeNull();
+    await expect(store.getTenantTelemetryLifecycleSubject(tenantId, input.requestId))
+      .resolves.toBeNull();
+    expect(store.tenantCredentialRevocationFences.has(tenantId)).toBe(false);
+    await expect(store.requestTenantErasure(input)).resolves.toMatchObject({
+      requestId: input.requestId,
+    });
   });
 
   it("covers first-tenant governance writers and preserves coverage through policy/export writes", async () => {

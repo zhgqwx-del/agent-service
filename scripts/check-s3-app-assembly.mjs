@@ -377,15 +377,16 @@ try {
     "0031_authoritative_backup_catalog.sql",
     "0032_tenant_telemetry_lifecycle.sql",
     "0033_tenant_telemetry_activation_inventory.sql",
+    "0034_tenant_telemetry_durable_writer.sql",
   ];
   const [migrationRows] = await inspection.query(
-    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?,?) ORDER BY name",
+    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?,?,?) ORDER BY name",
     expectedMigrationNames,
   );
   if (
     migrationRows.length !== expectedMigrationNames.length
     || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
-  ) throw new Error("runner did not apply migrations 0027 through 0033");
+  ) throw new Error("runner did not apply migrations 0027 through 0034");
   const [telemetryControlRows] = await inspection.query(
     `SELECT control_generation,activated_at_db_ms,lifecycle_protocol,writer_protocol,
             ref_key_id_sha256,target_count,target_root_sha256,activation_evidence_sha256
@@ -407,12 +408,23 @@ try {
        (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_targets) AS target_count,
        (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_coverages) AS coverage_count,
        (SELECT COUNT(*) FROM tenant_telemetry_activation_receipts) AS activation_count,
-       (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory) AS artifact_count`,
+       (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory) AS artifact_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_write_jobs) AS write_job_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_write_payloads) AS write_payload_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_write_acks) AS write_ack_count`,
   );
   if (telemetryEvidenceRows.length !== 1
-    || ["target_count", "coverage_count", "activation_count", "artifact_count"]
+    || [
+      "target_count",
+      "coverage_count",
+      "activation_count",
+      "artifact_count",
+      "write_job_count",
+      "write_payload_count",
+      "write_ack_count",
+    ]
       .some((field) => Number(telemetryEvidenceRows[0][field]) !== 0)) {
-    throw new Error("0033 telemetry activation/inventory was not installed empty");
+    throw new Error("0033/0034 telemetry activation, inventory and writer spool were not installed empty");
   }
   const [controlRows] = await inspection.query(
     `SELECT control_generation,storage_backend,namespace_sha256,
@@ -545,6 +557,7 @@ if (failure) {
 } else if (verified) {
   console.log(
     `real S3 application assembly passed (${mode} runner/router, disposable MySQL, `
-      + "0027 activation, 0031 dormant catalog, exact namespace negotiation, credential isolation)",
+      + "0027 activation, 0031 dormant catalog, 0034 dormant telemetry writer, "
+      + "exact namespace negotiation, credential isolation)",
   );
 }

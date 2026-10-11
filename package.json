@@ -21,6 +21,8 @@
     "test:tenant-telemetry-lifecycle": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-lifecycle.test.ts",
     "test:tenant-telemetry-lifecycle-memory": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-lifecycle.memory.test.ts",
     "test:tenant-telemetry-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-telemetry-lifecycle.mysql.test.ts",
+    "test:tenant-telemetry-writer": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-writer.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-writer.memory.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-adapter-memory.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-adapter-http.test.ts && node scripts/run-required-suite.mjs packages/core/test/tenant-telemetry-writer-worker.test.ts",
+    "test:tenant-telemetry-writer-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-telemetry-writer.mysql.test.ts",
     "test:blob-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/blob-lifecycle.mysql.test.ts",
     "test:blob-storage-control-memory": "node scripts/run-required-suite.mjs packages/store/test/blob-storage-control.memory.test.ts",
     "test:blob-storage-control-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/blob-storage-control.mysql.test.ts",
