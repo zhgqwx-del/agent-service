@@ -48,6 +48,12 @@ const CATALOG_PROCESS_AUTHORITY_ENV = [
   "RESTORE_FLEET_STOPPED_ACK",
 ] as const;
 
+const LONG_RUNNING_PROCESS_AUTHORITY_ENV = [
+  ...CATALOG_PROCESS_AUTHORITY_ENV,
+  "ADMIN_BOOTSTRAP_TENANT",
+  "ADMIN_BOOTSTRAP_OUTPUT_FILE",
+] as const;
+
 const CATALOG_COMMAND_AUTHORITY_ENV = [
   "NODE_ENV",
   "MYSQL_URL",
@@ -173,14 +179,14 @@ printf 'backup-catalog-wrapper-ok\\n'
       await mkdir(deployDir, { recursive: true });
       await writeFile(join(deployDir, "infra.sh"), "#!/bin/bash\nexit 0\n", { mode: 0o755 });
       const sentinels = Object.fromEntries(
-        CATALOG_PROCESS_AUTHORITY_ENV.map((name, index) => [
+        LONG_RUNNING_PROCESS_AUTHORITY_ENV.map((name, index) => [
           name,
           `must-not-reach-service-${index}`,
         ]),
       );
       await writeFile(
         join(root, ".env"),
-        `${CATALOG_PROCESS_AUTHORITY_ENV.map((name) => `${name}=${sentinels[name]}`).join("\n")}\n`,
+        `${LONG_RUNNING_PROCESS_AUTHORITY_ENV.map((name) => `${name}=${sentinels[name]}`).join("\n")}\n`,
         { mode: 0o600 },
       );
 
@@ -197,7 +203,7 @@ case "\${3-}" in
   apps/agent-router/src/main.ts) result_file="$TEST_ROUTER_RESULT" ;;
   *) exit 43 ;;
 esac
-for name in ${CATALOG_PROCESS_AUTHORITY_ENV.join(" ")}; do
+for name in ${LONG_RUNNING_PROCESS_AUTHORITY_ENV.join(" ")}; do
   if [ "\${!name+x}" = x ]; then
     printf 'leaked:%s\\n' "\${name}" >"$result_file"
     exit 44

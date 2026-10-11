@@ -156,6 +156,7 @@ const ROUTER_FORBIDDEN_RUNNER_SECRET_ENV = new Set([
   "BOOTSTRAP_API_KEY",
   "BOOTSTRAP_TENANT_ID",
   "ADMIN_BOOTSTRAP_TENANT",
+  "ADMIN_BOOTSTRAP_OUTPUT_FILE",
 ]);
 
 function validateRunnerUrl(value: string): string {

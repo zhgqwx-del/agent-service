@@ -92,6 +92,7 @@ interface SetupExtras {
   providers?: ProviderResolver;
   summariser?: Summariser;
   blobs?: SessionBlobService;
+  onOwnershipLost?: () => void;
 }
 
 async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> = {}, cfg: Partial<SessionHostDeps["config"]> = {}, extras: SetupExtras = {}) {
@@ -111,6 +112,7 @@ async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> 
     tools: new StaticToolRegistry([echoTool, dangerousTool, slowTool, circularDetailsTool, jsonPayloadTool]),
     config: { runnerId: "r1", runnerAddr: "127.0.0.1:1", leaseTtlMs: 2000, leaseHoldMs: 50, approvalTtlMs: 5000, ...cfg },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
+    onOwnershipLost: extras.onOwnershipLost,
   });
   const session = await host.createSession(principal, { agentId: agent.id, metadata: {} });
   const events: Event[] = [];
@@ -1819,6 +1821,44 @@ describe("SessionHost", () => {
       objects.allowWriteToFinish();
     }
     await waitFor(() => ((h.host as unknown as { active: Map<string, unknown> }).active.size === 0 ? true : undefined));
+  });
+
+  it("keeps ownership-loss telemetry no-throw and exactly once across repeated loss paths", async () => {
+    const lease = new ToggleRenewLeaseStore();
+    let notifications = 0;
+    const h = await setup(
+      [{ text: "slow response", delayMs: 500 }],
+      {},
+      { leaseTtlMs: 60 },
+      {
+        lease,
+        onOwnershipLost: () => {
+          notifications += 1;
+          throw new Error("injected telemetry sink failure");
+        },
+      },
+    );
+    const begun = await h.host.beginTurn(principal, h.session.id, {
+      input: [{ type: "text", text: "start" }],
+      stream: true,
+      metadata: {},
+    });
+    begun.run();
+    await waitFor(() => (h.engine.received.length > 0 ? true : undefined));
+    const internals = h.host as unknown as {
+      active: Map<string, { ownershipLossReported?: boolean }>;
+      onCommitError(state: { ownershipLossReported?: boolean }, error: unknown): void;
+    };
+    const activeState = internals.active.get(h.session.id)!;
+
+    lease.rejectRenewal = true;
+    await waitFor(() => (internals.active.size === 0 ? true : undefined));
+    expect(notifications).toBe(1);
+
+    // A concurrent durable FenceError observation must use the same once latch.
+    internals.onCommitError(activeState, new FenceError(h.session.id, 1, 2));
+    expect(notifications).toBe(1);
+    expect(activeState.ownershipLossReported).toBe(true);
   });
 
   it("keeps a gate-raced object inaccessible as staging and reclaims it through cleanup", async () => {

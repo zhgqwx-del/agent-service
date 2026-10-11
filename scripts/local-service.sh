@@ -290,7 +290,7 @@ start_apps() {
     -u API_KEY -u API_BASE_URL -u DEFAULT_MODEL -u PLATFORM_PROVIDER
     -u MYSQL_URL -u MYSQL_TEST_URL -u MYSQL_MIGRATION_TEST_URL -u MYSQL_PWD
     -u SECRETS_MASTER_KEY -u BOOTSTRAP_API_KEY -u BOOTSTRAP_TENANT_ID
-    -u ADMIN_BOOTSTRAP_TENANT
+    -u ADMIN_BOOTSTRAP_TENANT -u ADMIN_BOOTSTRAP_OUTPUT_FILE
     -u S3_TEST_ENDPOINT -u S3_TEST_REGION -u S3_TEST_BUCKET
     -u S3_TEST_ACCESS_KEY_ID -u S3_TEST_SECRET_ACCESS_KEY -u S3_TEST_SESSION_TOKEN
     -u S3_TEST_FORCE_PATH_STYLE
@@ -375,6 +375,7 @@ start_apps() {
     # local stack, so explicitly scrub it from the runner process rather than relying on app config
     # to ignore an authority it must never possess.
     nohup env -u TENANT_ERASURE_OPERATOR_TOKEN -u TENANT_ERASURE_OPERATOR_ID \
+      -u ADMIN_BOOTSTRAP_TENANT -u ADMIN_BOOTSTRAP_OUTPUT_FILE \
       -u TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED \
       -u CREDENTIAL_TARGET_EXECUTION_ADAPTER \
       -u TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED \
@@ -564,6 +565,9 @@ verify() {
   # `.env` is loaded for the local workflow, but platform authority must never be inherited by a
   # runner spawned from a test harness. Tests use their own fixed, non-production router credential.
   unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
+  # First-admin bootstrap is an explicit one-shot operator action, never an ambient verification
+  # side effect. Keep both halves out of test/app-smoke subprocesses even if `.env` contains them.
+  unset ADMIN_BOOTSTRAP_TENANT ADMIN_BOOTSTRAP_OUTPUT_FILE
   # The standard verification stack is MySQL. Keep the memory-only 0029 fake out of application
   # subprocesses; the dedicated Memory tests construct it explicitly in-process.
   unset CREDENTIAL_TARGET_EXECUTION_ADAPTER
@@ -573,6 +577,7 @@ verify() {
   pnpm run check:secrets
   pnpm run check:api
   pnpm typecheck
+  pnpm run test:tenant-telemetry-lifecycle
   AGENT_SERVICE_INTEGRATION=1 \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \

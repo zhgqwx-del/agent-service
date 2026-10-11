@@ -22,6 +22,7 @@ export * from "./credential-lifecycle.js";
 export * from "./tenant-credential-target-execution.js";
 export * from "./tenant-restore-journal.js";
 export * from "./backup-catalog.js";
+export * from "./tenant-telemetry-lifecycle.js";
 export * from "./backup-catalog-adapter/common.js";
 export * from "./backup-catalog-adapter/memory.js";
 export * from "./backup-catalog-adapter/codec.js";

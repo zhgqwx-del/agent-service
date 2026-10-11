@@ -1,8 +1,46 @@
 import { serve } from "@hono/node-server";
-import { tenantRedisNamespaceSha256 } from "@agent-service/protocol";
+import {
+  createEphemeralStructuredTelemetry,
+  tenantRedisNamespaceSha256,
+  type StructuredTelemetryFields,
+} from "@agent-service/protocol";
 import { createRouterApp } from "./app.js";
 import { loadRouterConfig } from "./config.js";
 import { RunnerRegistry } from "./registry.js";
+
+const ROUTER_TELEMETRY_LEVEL = {
+  "router.lifecycle.draining": "info",
+  "router.lifecycle.started": "info",
+  "router.process.start_failed": "error",
+} as const;
+
+export type RouterTelemetryEventCode = keyof typeof ROUTER_TELEMETRY_LEVEL;
+type RouterMainTelemetryFields = Pick<
+  StructuredTelemetryFields,
+  "runnerCount" | "shutdownGraceMs" | "gateEnabledCount" | "gateDisabledCount"
+>;
+const ROUTER_TELEMETRY_OUTPUT: Pick<Console, "info" | "warn" | "error"> = {
+  info: (...args: unknown[]) => console.log(...args),
+  warn: (...args: unknown[]) => console.warn(...args),
+  error: (...args: unknown[]) => console.error(...args),
+};
+const routerProcessTelemetry = createEphemeralStructuredTelemetry(
+  "router",
+  ROUTER_TELEMETRY_OUTPUT,
+);
+
+/**
+ * Bootstrap-safe telemetry boundary. Only fixed event codes and boolean/numeric fields are
+ * accepted, so runner URLs, tenant data, provider configuration and dependency errors cannot be
+ * serialized into stdout/stderr. A later durable adapter can consume this envelope unchanged.
+ */
+export function emitRouterTelemetryEvent(
+  event: RouterTelemetryEventCode,
+  fields: RouterMainTelemetryFields = {},
+): void {
+  const level = ROUTER_TELEMETRY_LEVEL[event];
+  routerProcessTelemetry[level](event, fields);
+}
 
 export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadRouterConfig(env);
@@ -30,6 +68,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   let ready = true;
   const app = createRouterApp({
     registry,
+    telemetry: routerProcessTelemetry,
     maxAttempts: cfg.MAX_ATTEMPTS,
     maxBodyBytes: cfg.MAX_BODY_BYTES,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
@@ -72,7 +111,10 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
    */
   const shutdown = async () => {
     ready = false;
-    console.log(`[router] draining for ${cfg.SHUTDOWN_GRACE_MS}ms`);
+    emitRouterTelemetryEvent(
+      "router.lifecycle.draining",
+      cfg.SHUTDOWN_GRACE_MS > 0 ? { shutdownGraceMs: cfg.SHUTDOWN_GRACE_MS } : {},
+    );
     await new Promise((r) => setTimeout(r, cfg.SHUTDOWN_GRACE_MS));
     server.close();
     await registry.close();
@@ -80,13 +122,35 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   };
   process.once("SIGTERM", () => void shutdown());
   process.once("SIGINT", () => void shutdown());
-  console.log(`[router] listening on http://${cfg.ROUTER_HOST}:${cfg.ROUTER_PORT} → ${cfg.runnerList.join(", ")} directory=${cfg.REDIS_URL ? "redis" : "hash-only"} tombstone=${cfg.SESSION_TOMBSTONE_ENABLED ? "enabled" : "gated"} blobs=${cfg.BLOB_ATTACHMENTS_ENABLED ? "enabled" : "gated"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocation=${cfg.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED ? "enabled" : "gated"} credentialTargetExecution=${cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED ? "enabled" : "gated"} restoreJournal=${cfg.TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED ? "enabled" : "gated"} tenantPurgeExecution=${cfg.TENANT_PURGE_EXECUTION_ENABLED ? "enabled" : "gated"} tenantDatabasePurge=${cfg.TENANT_DATABASE_PURGE_ENABLED ? "enabled" : "gated"} tenantRedisPurge=${cfg.TENANT_REDIS_PURGE_ENABLED ? "enabled" : "gated"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED ? "enabled" : "gated"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "enabled" : "gated"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"}`);
+  const gateStates = [
+    cfg.SESSION_TOMBSTONE_ENABLED,
+    cfg.BLOB_ATTACHMENTS_ENABLED,
+    cfg.DATA_ERASURE_REQUESTS_ENABLED,
+    cfg.TENANT_ERASURE_REQUESTS_ENABLED,
+    cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED,
+    cfg.TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED,
+    cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED,
+    cfg.TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED,
+    cfg.TENANT_PURGE_EXECUTION_ENABLED,
+    cfg.TENANT_DATABASE_PURGE_ENABLED,
+    cfg.TENANT_REDIS_PURGE_ENABLED,
+    cfg.TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED,
+    cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
+    cfg.PURGE_POLICY_EVALUATOR_ENABLED,
+    cfg.DATA_EXPORT_REQUESTS_ENABLED,
+  ];
+  const gateEnabledCount = gateStates.filter(Boolean).length;
+  emitRouterTelemetryEvent("router.lifecycle.started", {
+    runnerCount: cfg.runnerList.length,
+    gateEnabledCount,
+    gateDisabledCount: gateStates.length - gateEnabledCount,
+  });
   return { app, server, registry, cfg, close: shutdown };
 }
 
 if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file://").href) {
-  startRouter().catch((err) => {
-    console.error(err);
+  startRouter().catch(() => {
+    emitRouterTelemetryEvent("router.process.start_failed");
     process.exit(1);
   });
 }

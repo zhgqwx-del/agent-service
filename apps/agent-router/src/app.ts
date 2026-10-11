@@ -75,11 +75,18 @@ import {
   TenantRuntimeDrainRunnerRequest,
   TenantRuntimeRevocationFleetProof,
   TenantRuntimeRevocationLocalReceipt,
+  TRACEPARENT_HEADER,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   UserErasureDrainRequest,
+  createEphemeralStructuredTelemetry,
   isCanonicalId,
+  outgoingTraceparent,
+  startTraceContext,
+  telemetryErrorKind,
   tenantRuntimeFleetSha256,
   tenantRuntimeTargetReceiptsSha256,
+  withTraceContext,
+  type StructuredTelemetry,
 } from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
 
@@ -139,6 +146,9 @@ export interface RouterAppDeps {
   internalRunnerToken?: string;
   /** Injectable transport for the all-configured T3b broadcast. */
   fetchImpl?: typeof globalThis.fetch;
+  /** Structured, allowlisted telemetry. Omit to use a process-local opaque-ref key and JSON console sink. */
+  telemetry?: StructuredTelemetry;
+  /** @deprecated Compatibility sink used only to serialize structured telemetry records. */
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
@@ -164,7 +174,20 @@ function sessionIdFrom(pathname: string): string | undefined {
 }
 
 /** Hop-by-hop headers must not be forwarded, and the upstream sets its own content headers. */
-const STRIP_REQUEST = new Set(["host", "connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-authorization", "te", "content-length", INTERNAL_ROUTER_TOKEN_HEADER]);
+const STRIP_REQUEST = new Set([
+  "host",
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "upgrade",
+  "proxy-authorization",
+  "te",
+  "content-length",
+  TRACEPARENT_HEADER,
+  "tracestate",
+  "baggage",
+  INTERNAL_ROUTER_TOKEN_HEADER,
+]);
 /** `x-owner` is internal topology: the runner needs it, an external client must not see it. */
 const STRIP_RESPONSE = new Set([
   "connection",
@@ -272,7 +295,8 @@ function internalNotFound(c: { json: (body: object, status: 404) => Response }):
  */
 export function createRouterApp(deps: RouterAppDeps) {
   const app = new Hono();
-  const log = deps.logger ?? console;
+  const telemetry = deps.telemetry
+    ?? createEphemeralStructuredTelemetry("router", deps.logger ?? console);
   const maxAttempts = deps.maxAttempts ?? 2;
   const fetchRuntimeTarget = deps.fetchImpl ?? globalThis.fetch;
   const maxBodyBytes = deps.maxBodyBytes ?? 1_000_000;
@@ -374,6 +398,18 @@ export function createRouterApp(deps: RouterAppDeps) {
       retryable: true,
     },
   }, 503);
+
+  // Every request gets a new local span. Only a strictly valid W3C v00 trace id is inherited;
+  // malformed/future input starts a fresh trace and is never relayed to a runner.
+  app.use("*", async (c, next) => withTraceContext(
+    startTraceContext(c.req.header(TRACEPARENT_HEADER)),
+    next,
+  ));
+  app.onError((error, c) => {
+    telemetry.error("router.unhandled_error", { errorKind: telemetryErrorKind(error) });
+    return c.json({ error: { code: "internal_error", message: "internal error" } }, 500);
+  });
+
   const proxyTenantErasureControl = async (
     c: Context,
     input: (
@@ -449,8 +485,11 @@ export function createRouterApp(deps: RouterAppDeps) {
         );
       } catch (error) {
         deps.registry.markFailure(target);
-        const name = error instanceof Error ? error.name : "unknown error";
-        log.warn(`[router] tenant erasure target unreachable (${name})`);
+        telemetry.warn("router.tenant_erasure_target_unreachable", {
+          targetRef: telemetry.opaqueRef("runner", target),
+          errorKind: telemetryErrorKind(error),
+          attempt,
+        });
         const next = pickOther(deps, undefined, tried);
         if (!next || attempt >= maxAttempts) return tenantErasureUnavailable(c);
         target = next;
@@ -515,7 +554,10 @@ export function createRouterApp(deps: RouterAppDeps) {
     const target = deps.registry.anyHealthy();
     if (target) {
       try {
-        const res = await fetch(`${target}/v1/capabilities`, { signal: AbortSignal.timeout(2_000) });
+        const res = await fetch(`${target}/v1/capabilities`, {
+          headers: { [TRACEPARENT_HEADER]: outgoingTraceparent() },
+          signal: AbortSignal.timeout(2_000),
+        });
         if (res.ok) {
           // A mixed or malformed runner must not make this router violate the contract it serves at
           // /openapi.json. Deployment still drains old runners before promoting the new router.
@@ -864,6 +906,7 @@ export function createRouterApp(deps: RouterAppDeps) {
           headers: {
             "content-type": "application/json",
             [INTERNAL_ROUTER_TOKEN_HEADER]: deps.internalRunnerToken!,
+            [TRACEPARENT_HEADER]: outgoingTraceparent(),
           },
           body: JSON.stringify(input),
           signal: AbortSignal.timeout(deps.upstreamHeaderTimeoutMs ?? 15_000),
@@ -1493,8 +1536,14 @@ export function createRouterApp(deps: RouterAppDeps) {
         res = await forward(target, upstreamUrl, upstreamMethod, upstreamHeaders, body, deps.upstreamHeaderTimeoutMs);
       } catch (err) {
         deps.registry.markFailure(target);
-        const name = err instanceof Error ? err.name : "unknown error";
-        log.warn(`[router] ${target} unreachable (${name})`);
+        telemetry.warn("router.upstream_unreachable", {
+          targetRef: telemetry.opaqueRef("runner", target),
+          subjectRef: sessionId
+            ? telemetry.opaqueRef("session", sessionId)
+            : undefined,
+          errorKind: telemetryErrorKind(err),
+          attempt,
+        });
         // Only this exact POST is deduplicated by the runner. A caller-provided Idempotency-Key on an
         // agent/session/api-key POST does not magically make that endpoint safe to replay.
         const safeToRetry = REPLAYABLE.has(method) ||
@@ -1527,9 +1576,19 @@ export function createRouterApp(deps: RouterAppDeps) {
       if (res.status === 409 && sessionId && reroutes < 1 && attempt < maxAttempts) {
         const owner = res.headers.get("x-owner");
         const ownerUrl = owner ? deps.registry.routeableUrl(owner) : undefined;
-        if (owner && !ownerUrl) log.warn(`[router] session ${sessionId}: owner "${owner}" is not a configured runner; check RUNNER_ADDR matches RUNNERS`);
+        if (owner && !ownerUrl) {
+          telemetry.warn("router.owner_unconfigured", {
+            ownerRef: telemetry.opaqueRef("owner", owner),
+            subjectRef: telemetry.opaqueRef("session", sessionId),
+            errorKind: "unavailable",
+          });
+        }
         if (ownerUrl && !tried.has(ownerUrl)) {
-          log.info(`[router] session ${sessionId}: re-routing to owner ${ownerUrl}`);
+          telemetry.info("router.owner_reroute", {
+            ownerRef: telemetry.opaqueRef("owner", ownerUrl),
+            subjectRef: telemetry.opaqueRef("session", sessionId),
+            attempt,
+          });
           reroutes += 1;
           target = ownerUrl;
           continue;
@@ -1606,6 +1665,7 @@ function requestHeaders(from: Headers): Headers {
 
 async function forward(target: string, url: URL, method: string, headers: Headers, body: Uint8Array | undefined, headerTimeoutMs?: number): Promise<Response> {
   const dest = `${target}${url.pathname}${url.search}`;
+  headers.set(TRACEPARENT_HEADER, outgoingTraceparent());
   const controller = headerTimeoutMs ? new AbortController() : undefined;
   let timer: NodeJS.Timeout | undefined;
   if (controller) timer = setTimeout(() => controller.abort(new Error(`upstream did not send headers within ${headerTimeoutMs}ms`)), headerTimeoutMs);

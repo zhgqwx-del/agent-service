@@ -1,7 +1,11 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import {
+  createStructuredTelemetry,
+  type StructuredTelemetryRecord,
+} from "@agent-service/protocol";
 import {
   INTERNAL_ERASURE_JOB_CONTROL_ACK_HEADER,
   INTERNAL_ERASURE_JOB_CONTROL_ACK_VALUE,
@@ -54,10 +58,182 @@ import {
   MemoryLeaseStore,
   MemorySessionStore,
 } from "@agent-service/store";
-import { startRunner } from "../src/main.js";
+import {
+  createContentFreeRunnerLogger,
+  startRunner,
+  writeAdminBootstrapOutputFile,
+} from "../src/main.js";
 
 const MASTER_KEY = "88".repeat(32);
 const INTERNAL_TOKEN = "runner-main-private-router-token-0001";
+
+describe("runner bootstrap telemetry", () => {
+  it("drops every dynamic argument at the legacy core logger boundary", () => {
+    const records: Readonly<StructuredTelemetryRecord>[] = [];
+    const telemetry = createStructuredTelemetry({
+      component: "runner",
+      opaqueRefKey: Buffer.alloc(32, 6),
+      sink: { write: (record) => records.push(record) },
+      now: () => 1,
+    });
+    const logger = createContentFreeRunnerLogger(telemetry);
+    logger.info("session-private", { tenantId: "tenant-private" });
+    logger.warn("https://private.invalid", new Error("secret warning"));
+    logger.error("ask_private", new Error("secret error"));
+
+    expect(records.map((record) => record.code)).toEqual([
+      "runner.runtime.info",
+      "runner.runtime.warning",
+      "runner.runtime.error",
+    ]);
+    expect(records.every((record) => Object.keys(record.fields).length === 0)).toBe(true);
+    const encoded = JSON.stringify(records);
+    expect(encoded).not.toContain("session-private");
+    expect(encoded).not.toContain("tenant-private");
+    expect(encoded).not.toContain("private.invalid");
+    expect(encoded).not.toContain("ask_private");
+    expect(encoded).not.toContain("secret");
+  });
+
+  it("does not let a failing telemetry sink escape the legacy core logger boundary", () => {
+    const telemetry = createStructuredTelemetry({
+      component: "runner",
+      opaqueRefKey: Buffer.alloc(32, 7),
+      sink: { write: () => { throw new Error("sink unavailable"); } },
+      now: () => 1,
+    });
+    const logger = createContentFreeRunnerLogger(telemetry);
+
+    expect(() => logger.info("private-info")).not.toThrow();
+    expect(() => logger.warn("private-warning")).not.toThrow();
+    expect(() => logger.error("private-error")).not.toThrow();
+  });
+
+  it("writes the first admin key only to an owner-readable create-only file", async () => {
+    const workDir = await mkdtemp(join(tmpdir(), "agent-runner-admin-bootstrap-"));
+    const blobDir = join(workDir, "blobs");
+    const outputFile = join(workDir, "first-admin-key");
+    const tenantId = "t_sensitive_admin_bootstrap";
+    const providerSecret = "provider-secret-must-not-enter-logs";
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        NODE_ENV: "test",
+        STORE: "memory",
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "runner-sensitive.internal:8787",
+        BLOB_DIR: blobDir,
+        ADMIN_BOOTSTRAP_TENANT: tenantId,
+        ADMIN_BOOTSTRAP_OUTPUT_FILE: outputFile,
+        API_KEY: providerSecret,
+        PLATFORM_PROVIDER: "dashscope",
+      });
+
+      const key = (await readFile(outputFile, "utf8")).trim();
+      expect(key).toMatch(/^ask_[A-Za-z0-9_-]+$/);
+      expect((await stat(outputFile)).mode & 0o777).toBe(0o600);
+      const output = [...log.mock.calls, ...warn.mock.calls, ...error.mock.calls]
+        .flat().join("\n");
+      expect(output).toContain('"code":"runner.bootstrap.admin_key_written"');
+      expect(output).toContain('"code":"runner.lifecycle.started"');
+      expect(output).not.toContain(key);
+      expect(output).not.toContain(tenantId);
+      expect(output).not.toContain(outputFile);
+      expect(output).not.toContain(providerSecret);
+      expect(output).not.toContain("dashscope");
+      expect(output).not.toContain("runner-sensitive.internal");
+      expect(error).not.toHaveBeenCalled();
+      await runner.close();
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      error.mockRestore();
+      warn.mockRestore();
+      log.mockRestore();
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("never overwrites a pre-existing admin bootstrap output file", async () => {
+    const workDir = await mkdtemp(join(tmpdir(), "agent-runner-admin-existing-"));
+    const outputFile = join(workDir, "first-admin-key");
+    try {
+      await writeFile(outputFile, "operator-owned-content\n", { mode: 0o600 });
+      await expect(writeAdminBootstrapOutputFile(outputFile, "ask_replacement"))
+        .rejects.toThrow("admin bootstrap output file could not be created safely");
+      expect(await readFile(outputFile, "utf8")).toBe("operator-owned-content\n");
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("allows exactly one concurrent writer for the same admin bootstrap output file", async () => {
+    const workDir = await mkdtemp(join(tmpdir(), "agent-runner-admin-concurrent-"));
+    const outputFile = join(workDir, "first-admin-key");
+    try {
+      const results = await Promise.allSettled([
+        writeAdminBootstrapOutputFile(outputFile, "ask_concurrent_a"),
+        writeAdminBootstrapOutputFile(outputFile, "ask_concurrent_b"),
+      ]);
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+      expect((await readFile(outputFile, "utf8")).trim())
+        .toMatch(/^ask_concurrent_[ab]$/);
+      expect((await stat(outputFile)).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves the one-time file but redacts a database failure after output reservation", async () => {
+    const workDir = await mkdtemp(join(tmpdir(), "agent-runner-admin-store-failure-"));
+    const outputFile = join(workDir, "first-admin-key");
+    const tenantId = "t_sensitive_store_failure";
+    const rawFailure = "mysql://user:password@db/internal-sensitive-error";
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const create = vi.spyOn(MemorySessionStore.prototype, "createApiKey")
+      .mockRejectedValueOnce(new Error(rawFailure));
+    const close = vi.spyOn(MemorySessionStore.prototype, "close");
+    try {
+      await expect(startRunner({
+        NODE_ENV: "test",
+        STORE: "memory",
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: join(workDir, "blobs"),
+        ADMIN_BOOTSTRAP_TENANT: tenantId,
+        ADMIN_BOOTSTRAP_OUTPUT_FILE: outputFile,
+      })).rejects.toThrow("admin bootstrap store write failed after output reservation");
+
+      const key = (await readFile(outputFile, "utf8")).trim();
+      expect(key).toMatch(/^ask_[A-Za-z0-9_-]+$/);
+      expect((await stat(outputFile)).mode & 0o777).toBe(0o600);
+      expect(create).toHaveBeenCalledOnce();
+      expect(close).toHaveBeenCalledOnce();
+      const output = [...log.mock.calls, ...warn.mock.calls, ...error.mock.calls]
+        .flat().join("\n");
+      expect(output).toContain('"code":"runner.bootstrap.admin_key_store_failed"');
+      expect(output).not.toContain(key);
+      expect(output).not.toContain(tenantId);
+      expect(output).not.toContain(outputFile);
+      expect(output).not.toContain(rawFailure);
+    } finally {
+      close.mockRestore();
+      create.mockRestore();
+      error.mockRestore();
+      warn.mockRestore();
+      log.mockRestore();
+      await rm(workDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("runner main blob wiring", () => {
   it("wires the explicit local fake credential target executor without exposing references", async () => {
@@ -484,6 +660,10 @@ describe("runner main blob wiring", () => {
         INTERNAL_ROUTER_TOKEN: INTERNAL_TOKEN,
       });
       expect(runner.tenantErasureAdmissionGate).toBeDefined();
+      const bootstrapOutput = [...log.mock.calls, ...warn.mock.calls].flat().join("\n");
+      expect(bootstrapOutput).toContain('"code":"runner.bootstrap.dev_key_seeded"');
+      expect(bootstrapOutput).not.toContain("tenant-bootstrap-key");
+      expect(bootstrapOutput).not.toContain("t_tenant_erasure");
       expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
         features: {
           tenantErasureControl: ["platform-control-v1"],

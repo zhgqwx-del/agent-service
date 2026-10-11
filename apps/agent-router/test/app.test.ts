@@ -57,6 +57,9 @@ import {
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+  createStructuredTelemetry,
+  parseTraceparent,
+  type StructuredTelemetryRecord,
 } from "@agent-service/protocol";
 import { createRouterApp } from "../src/app.js";
 import type { RunnerRegistry, RunnerTarget } from "../src/registry.js";
@@ -2782,5 +2785,93 @@ describe("operational endpoints", () => {
     expect(await response.json()).toMatchObject({
       error: { code: "draining", retryable: true },
     });
+  });
+
+  it("strictly regenerates and forwards trace context without logging raw targets", async () => {
+    const records: Readonly<StructuredTelemetryRecord>[] = [];
+    const telemetry = createStructuredTelemetry({
+      component: "router",
+      opaqueRefKey: Buffer.alloc(32, 5),
+      sink: { write: (record) => records.push(record) },
+      now: () => 1,
+    });
+    const target = "http://runner.internal:9000";
+    const forwardedHeaders: Headers[] = [];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      forwardedHeaders.push(new Headers(init?.headers));
+      return new Response("{}", { headers: { "content-type": "application/json" } });
+    });
+    const app = createRouterApp({ registry: fakeRegistry([target]), telemetry });
+    const parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03";
+    const inheritedResponse = await app.request("/v1/agents", {
+      headers: {
+        baggage: "tenant=raw-private",
+        traceparent: parent,
+        tracestate: "vendor=raw-private",
+      },
+    });
+    expect(inheritedResponse.status).toBe(200);
+    await inheritedResponse.text();
+    const forwarded = parseTraceparent(forwardedHeaders[0]!.get("traceparent"));
+    expect(forwarded).toMatchObject({
+      traceId: parseTraceparent(parent)!.traceId,
+      traceFlags: "03",
+    });
+    expect(forwarded!.spanId).not.toBe(parseTraceparent(parent)!.spanId);
+    expect(forwardedHeaders[0]!.has("baggage")).toBe(false);
+    expect(forwardedHeaders[0]!.has("tracestate")).toBe(false);
+
+    const regeneratedResponse = await app.request("/v1/agents", {
+      headers: { traceparent: "raw-private-invalid-trace" },
+    });
+    expect(regeneratedResponse.status).toBe(200);
+    await regeneratedResponse.text();
+    const regenerated = parseTraceparent(forwardedHeaders[1]!.get("traceparent"));
+    expect(regenerated).toBeDefined();
+    expect(forwardedHeaders[1]!.get("traceparent")).not.toContain("raw-private");
+
+    fetchMock.mockRejectedValueOnce(new TypeError("raw-secret https://private.invalid"));
+    const failing = createRouterApp({
+      registry: fakeRegistry([target]),
+      maxAttempts: 1,
+      telemetry,
+    });
+    expect((await failing.request(`/v1/sessions/${SID}`)).status).toBe(502);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      code: "router.upstream_unreachable",
+      fields: { attempt: 1, errorKind: "network" },
+    });
+    expect(records[0]!.fields.targetRef).toMatch(/^oref_runner_[0-9a-f]{64}$/);
+    expect(records[0]!.fields.subjectRef).toMatch(/^oref_session_[0-9a-f]{64}$/);
+    const encoded = JSON.stringify(records);
+    expect(encoded).not.toContain(target);
+    expect(encoded).not.toContain(SID);
+    expect(encoded).not.toContain("raw-private");
+    expect(encoded).not.toContain("private.invalid");
+
+    const crashingRegistry = fakeRegistry([target]);
+    const anyHealthy = vi.spyOn(crashingRegistry, "anyHealthy").mockImplementation(() => {
+      throw new Error("raw-owner raw-secret https://private.invalid");
+    });
+    const crashing = createRouterApp({ registry: crashingRegistry, telemetry });
+    const internalError = await crashing.request("/v1/agents", {
+      headers: { traceparent: parent },
+    });
+    expect(internalError.status).toBe(500);
+    expect(await internalError.json()).toEqual({
+      error: { code: "internal_error", message: "internal error" },
+    });
+    expect(records[1]).toMatchObject({
+      code: "router.unhandled_error",
+      fields: { errorKind: "unknown" },
+      traceId: parseTraceparent(parent)!.traceId,
+    });
+    const allEncoded = JSON.stringify(records);
+    expect(allEncoded).not.toContain("raw-owner");
+    expect(allEncoded).not.toContain("raw-secret");
+    expect(allEncoded).not.toContain("private.invalid");
+    anyHealthy.mockRestore();
+    fetchMock.mockRestore();
   });
 });

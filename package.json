@@ -18,6 +18,7 @@
     "typecheck": "tsc -b tsconfig.json && tsc -p tsconfig.typecheck.json",
     "test": "vitest run",
     "test:migrations": "node scripts/run-required-migration-suites.mjs",
+    "test:tenant-telemetry-lifecycle": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-lifecycle.test.ts",
     "test:blob-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/blob-lifecycle.mysql.test.ts",
     "test:blob-storage-control-memory": "node scripts/run-required-suite.mjs packages/store/test/blob-storage-control.memory.test.ts",
     "test:blob-storage-control-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/blob-storage-control.mysql.test.ts",

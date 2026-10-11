@@ -6,7 +6,14 @@ import {
   newErasureRequestId,
   tenantErasureRequestHash,
 } from "@agent-service/store";
-import { DEFAULT_AUTH_POLICY } from "@agent-service/protocol";
+import {
+  DEFAULT_AUTH_POLICY,
+  createStructuredTelemetry,
+  parseTraceparent,
+  startTraceContext,
+  withTraceContext,
+  type StructuredTelemetryRecord,
+} from "@agent-service/protocol";
 import {
   TenantRuntimeCoordinator,
   TenantRuntimeDrainTimeoutError,
@@ -589,5 +596,76 @@ describe("ProviderService", () => {
     releaseDecrypt();
     await expect(key).rejects.toBeInstanceOf(SubjectDeletingError);
     await expect(drain).resolves.toMatchObject({ activeOperationCountBefore: 1, activeOperationCountAfter: 0 });
+  });
+
+  it("forwards a generated traceparent and logs provider failures without raw owner or error data", async () => {
+    const records: Readonly<StructuredTelemetryRecord>[] = [];
+    const telemetry = createStructuredTelemetry({
+      component: "provider",
+      opaqueRefKey: Buffer.alloc(32, 9),
+      sink: { write: (record) => records.push(record) },
+      now: () => 1,
+    });
+    const observed: Headers[] = [];
+    const store = new MemorySessionStore();
+    const svc = new ProviderService({
+      store,
+      cipher: new LocalAesGcmCipher(KEY),
+      assertBaseUrl,
+      platform: [ProviderService.preset("deepseek", "platform-key")],
+      telemetry,
+      fetch: async (input, init) => {
+        const headers = new Headers(
+          init?.headers ?? (input instanceof Request ? input.headers : undefined),
+        );
+        observed.push(headers);
+        const url = input instanceof Request ? input.url : String(input);
+        if (url.includes("fail")) throw new TypeError("raw-secret from https://private.invalid");
+        return new Response("ok");
+      },
+    });
+    const tenantId = "tenant-private-owner";
+    const model = await svc.resolve(
+      { tenantId, userId: "user-private" },
+      { provider: "deepseek", model: "deepseek-chat" },
+    );
+    const parent = startTraceContext(
+      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-ff",
+    );
+
+    await withTraceContext(parent, () => model.fetch!(new Request(
+      "https://provider.example/pass",
+      {
+        headers: {
+          authorization: "Bearer provider-secret",
+          baggage: "tenant=raw-private",
+          traceparent: "attacker-controlled",
+          tracestate: "vendor=raw-private",
+        },
+      },
+    )));
+    const forwarded = parseTraceparent(observed[0]!.get("traceparent"));
+    expect(forwarded).toMatchObject({ traceId: parent.traceId, traceFlags: parent.traceFlags });
+    expect(forwarded!.spanId).not.toBe(parent.spanId);
+    expect(observed[0]!.get("authorization")).toBe("Bearer provider-secret");
+    expect(observed[0]!.has("baggage")).toBe(false);
+    expect(observed[0]!.has("tracestate")).toBe(false);
+
+    await expect(withTraceContext(parent, () => model.fetch!(
+      "https://provider.example/fail?token=raw-secret",
+    ))).rejects.toThrow("raw-secret");
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      code: "provider.upstream_request_failed",
+      fields: { errorKind: "network" },
+      traceId: parent.traceId,
+    });
+    expect(records[0]!.fields.ownerRef).toMatch(/^oref_tenant_[0-9a-f]{64}$/);
+    const encoded = JSON.stringify(records);
+    expect(encoded).not.toContain(tenantId);
+    expect(encoded).not.toContain("user-private");
+    expect(encoded).not.toContain("raw-secret");
+    expect(encoded).not.toContain("private.invalid");
+    expect(encoded).not.toContain("provider-secret");
   });
 });

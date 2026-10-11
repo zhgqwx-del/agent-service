@@ -311,6 +311,7 @@ describe("router configuration", () => {
       ["MYSQL_TEST_URL", "mysql://runner:secret@database/agent_service_test"],
       ["SECRETS_MASTER_KEY", "a".repeat(64)],
       ["BOOTSTRAP_API_KEY", "must-not-enter-router"],
+      ["ADMIN_BOOTSTRAP_OUTPUT_FILE", "/run/secrets/admin-key"],
       ["S3_TEST_SECRET_ACCESS_KEY", "must-not-enter-router"],
     ] as const) {
       expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))

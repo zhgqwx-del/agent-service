@@ -10,6 +10,10 @@ import { api, openSse, queryDb, startCluster, waitFor, type Cluster } from "./ha
 const enabled = !!process.env.AGENT_SERVICE_CLUSTER;
 let cluster: Cluster | undefined;
 
+function runtimeStopTelemetryCount(lines: readonly string[]): number {
+  return lines.filter((line) => line.includes('"code":"runner.runtime.ownership_lost"')).length;
+}
+
 afterEach(async () => {
   await cluster?.stop();
   cluster = undefined;
@@ -178,6 +182,8 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     await waitFor(() => stream.events.find((e) => e.event === "turn/started"), 15_000, "turn/started");
     const ownerAddr = await waitFor(async () => (await redis.hget(`as:lease:{${session.id}}`, "addr")) ?? undefined, 5_000, "owner");
     const survivor = runners.find((r) => !r.url.includes(ownerAddr))!;
+    const fenced = runners.find((r) => r.url.includes(ownerAddr))!;
+    const runtimeStopTelemetryBefore = runtimeStopTelemetryCount(fenced.log);
 
     // forcibly hand the lease to the survivor while the first turn is still streaming
     await redis.del(`as:lease:{${session.id}}`);
@@ -195,10 +201,13 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     expect(taken.status).toBe(202);
     stream.cancel();
 
-    // The FENCED runner must be the one that logged it; searching every process's log would also pass
-    // when the survivor printed something similar.
-    const fenced = runners.find((r) => r.url.includes(ownerAddr))!;
-    await waitFor(() => (fenced.log.some((l) => /fenced out|no longer owns/i.test(l)) ? true : undefined), 20_000, "the fenced runner logs it");
+    // The fenced runner must emit a new content-free runtime stop signal. Searching every process,
+    // or accepting an event that predates the takeover, would let the survivor satisfy this proof.
+    await waitFor(
+      () => (runtimeStopTelemetryCount(fenced.log) > runtimeStopTelemetryBefore ? true : undefined),
+      20_000,
+      "the fenced runner emits stop telemetry",
+    );
     const rows = await queryDb<{ seq: number }>("SELECT seq FROM events WHERE session_id=? ORDER BY seq", [session.id]);
     const seqs = rows.map((r) => Number(r.seq));
     expect(seqs).toEqual(Array.from({ length: seqs.length }, (_, i) => i + 1));
@@ -231,6 +240,7 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     const staleOwner = runners.find((runner) => runner.url.includes(ownerAddr))!;
     const successor = runners.find((runner) => runner !== staleOwner)!;
     const fenceBefore = Number(await redis.get(`as:fence:{${session.id}}`));
+    const runtimeStopTelemetryBefore = runtimeStopTelemetryCount(staleOwner.log);
 
     // Simulate a lost Redis lease without killing the process. The successor must use the higher
     // fence to repair the durable active turn before it can atomically archive the session.
@@ -248,9 +258,9 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     expect(fenceAfter).toBeGreaterThan(fenceBefore);
 
     await waitFor(
-      () => (staleOwner.log.some((line) => /lease lost|fenced out|no longer owns/i.test(line)) ? true : undefined),
+      () => (runtimeStopTelemetryCount(staleOwner.log) > runtimeStopTelemetryBefore ? true : undefined),
       15_000,
-      "stale lifecycle owner stops",
+      "stale lifecycle owner emits stop telemetry",
     );
     stream.cancel();
 
@@ -304,6 +314,7 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     const staleOwner = runners.find((runner) => runner.url.includes(ownerAddr))!;
     const successor = runners.find((runner) => runner !== staleOwner)!;
     const fenceBefore = Number(await redis.get(`as:fence:{${session.id}}`));
+    const runtimeStopTelemetryBefore = runtimeStopTelemetryCount(staleOwner.log);
 
     // Lose only the Redis lease: runner A remains alive and would still finish its slow model call if
     // the lease guard and durable fence did not stop it. Runner B must directly repair + tombstone.
@@ -321,13 +332,9 @@ describe.skipIf(!enabled)("cluster: ownership, takeover and replay across proces
     const fenceAfter = Number(await redis.get(`as:fence:{${session.id}}`));
     expect(fenceAfter).toBeGreaterThan(fenceBefore);
     await waitFor(
-      () => (
-        staleOwner.log.some((line) => /lease lost|fenced out|no longer owns|session was deleted/i.test(line))
-          ? true
-          : undefined
-      ),
+      () => (runtimeStopTelemetryCount(staleOwner.log) > runtimeStopTelemetryBefore ? true : undefined),
       15_000,
-      "stale tombstone owner stops",
+      "stale tombstone owner emits stop telemetry",
     );
     // This is a turn-scoped stream, so orphan repair legitimately closes it on turn/completed + idle
     // before the following terminal lifecycle event. The durable log below proves session/deleted.

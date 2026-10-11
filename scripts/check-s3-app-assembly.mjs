@@ -375,15 +375,32 @@ try {
     "0029_tenant_credential_target_execution.sql",
     "0030_tenant_restore_journal.sql",
     "0031_authoritative_backup_catalog.sql",
+    "0032_tenant_telemetry_lifecycle.sql",
   ];
   const [migrationRows] = await inspection.query(
-    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?) ORDER BY name",
+    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?) ORDER BY name",
     expectedMigrationNames,
   );
   if (
     migrationRows.length !== expectedMigrationNames.length
     || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
-  ) throw new Error("runner did not apply migrations 0027 through 0031");
+  ) throw new Error("runner did not apply migrations 0027 through 0032");
+  const [telemetryControlRows] = await inspection.query(
+    `SELECT control_generation,activated_at_db_ms,lifecycle_protocol,writer_protocol,
+            ref_key_id_sha256,target_count,target_root_sha256,activation_evidence_sha256
+       FROM tenant_telemetry_lifecycle_control WHERE singleton_id=1`,
+  );
+  if (telemetryControlRows.length !== 1
+    || Number(telemetryControlRows[0].control_generation) !== 0
+    || telemetryControlRows[0].activated_at_db_ms !== null
+    || telemetryControlRows[0].lifecycle_protocol !== null
+    || telemetryControlRows[0].writer_protocol !== null
+    || telemetryControlRows[0].ref_key_id_sha256 !== null
+    || telemetryControlRows[0].target_count !== null
+    || telemetryControlRows[0].target_root_sha256 !== null
+    || telemetryControlRows[0].activation_evidence_sha256 !== null) {
+    throw new Error("0032 telemetry lifecycle control was not installed dormant");
+  }
   const [controlRows] = await inspection.query(
     `SELECT control_generation,storage_backend,namespace_sha256,
             activated_at_db_ms,evidence_sha256

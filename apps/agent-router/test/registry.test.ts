@@ -19,7 +19,9 @@ import {
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
+  TRACEPARENT_HEADER,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+  parseTraceparent,
   tenantRuntimeFleetSha256,
   tenantRuntimeTargetSha256,
 } from "@agent-service/protocol";
@@ -1181,7 +1183,10 @@ describe("RunnerRegistry owner address mapping", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+    const fetchMock = vi.fn(async (
+      input: string | URL | Request,
+      _init?: RequestInit,
+    ) => {
       await gate;
       return String(input).endsWith("/readyz")
         ? new Response("ready")
@@ -1217,6 +1222,9 @@ describe("RunnerRegistry owner address mapping", () => {
     release();
     await Promise.all([first, second]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.every((call) => (
+      parseTraceparent(new Headers(call[1]?.headers).get(TRACEPARENT_HEADER)) !== undefined
+    ))).toBe(true);
     expect(registry.allConfiguredSupportErasureJobControl()).toBe(true);
     await registry.close();
   });
@@ -1247,6 +1255,7 @@ describe("RunnerRegistry tenant runtime drain fleet snapshot", () => {
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
       calls.push(url);
+      expect(parseTraceparent(new Headers(init?.headers).get(TRACEPARENT_HEADER))).toBeDefined();
       if (url.endsWith("/readyz")) return new Response("ready");
       if (url.endsWith("/v1/capabilities")) return Response.json(capability());
       if (url.endsWith(INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH)) {

@@ -140,6 +140,8 @@ export interface SessionHostDeps {
   tenantRuntime?: TenantRuntimeCoordinator;
   config: SessionHostConfig;
   logger?: Pick<Console, "info" | "warn" | "error">;
+  /** Content-free ownership-loss signal for structured process telemetry. */
+  onOwnershipLost?: () => void;
 }
 
 /**
@@ -169,6 +171,8 @@ interface ActiveTurn {
   limits: ReturnType<typeof mergeLimits>;
   /** set when a commit was rejected by the store's fence check: this runner no longer owns the session */
   fenced?: boolean;
+  /** Best-effort process telemetry must be emitted at most once for one local turn. */
+  ownershipLossReported?: boolean;
   stopReason?: StopReason;
   limitHit?: StopReason;
   stepUsage: Usage;
@@ -300,6 +304,16 @@ export class SessionHost {
       deps.config.erasureDrainTimeoutMs !== undefined
       && (!Number.isSafeInteger(deps.config.erasureDrainTimeoutMs) || deps.config.erasureDrainTimeoutMs <= 0)
     ) throw new Error("erasureDrainTimeoutMs must be a positive safe integer");
+  }
+
+  private reportOwnershipLost(state: ActiveTurn): void {
+    if (state.ownershipLossReported) return;
+    state.ownershipLossReported = true;
+    try {
+      this.deps.onOwnershipLost?.();
+    } catch {
+      // Observability is best-effort and must never interrupt the fence/abort safety path.
+    }
   }
 
   get cfg() {
@@ -1563,14 +1577,15 @@ export class SessionHost {
     if (this.draining) throw new ApiError("draining", "runner is draining");
     runtimeLease?.assertOpen();
     leaseGuard.attach(() => {
-      this.log.error(`[session ${sessionId}] lease lost; runner no longer owns the session; aborting turn ${turn.id}`);
       const wasReserved = state.phase === "reserved";
       state.fenced = true;
       state.closingRequested = true;
       state.phase = "finishing";
       state.stopReason = "error";
       this.failPendingApprovals(state, "cancel");
+      this.reportOwnershipLost(state);
       if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
+      this.log.error(`[session ${sessionId}] lease lost; runner no longer owns the session; aborting turn ${turn.id}`);
     });
     if (runtimeLease) {
       const onRuntimeFence = () => {
@@ -2665,21 +2680,18 @@ export class SessionHost {
     const wasReserved = state.phase === "reserved";
     if (err instanceof SessionGoneError || err instanceof SessionArchivedError) {
       const lifecycleState = err instanceof SessionGoneError ? "deleted" : "archived";
-      this.log.warn(`[session ${state.session.id}] session was ${lifecycleState} mid-turn; stopping turn ${state.turn.id}`);
       state.fenced = true; // same handling: stop writing, stop stepping
       state.closingRequested = true;
       state.phase = "finishing";
       state.stopReason = "error";
       state.abort.abort();
       this.failPendingApprovals(state, "cancel");
+      this.reportOwnershipLost(state);
       if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
+      this.log.warn(`[session ${state.session.id}] session was ${lifecycleState} mid-turn; stopping turn ${state.turn.id}`);
       return;
     }
-    if (err instanceof FenceError) {
-      if (!state.fenced) this.log.error(`[session ${state.session.id}] fenced out (${err.message}); aborting turn ${state.turn.id}`);
-    } else {
-      this.log.error(`[session ${state.session.id}] commit failed`, err);
-    }
+    const wasAlreadyFenced = state.fenced === true;
     // An unknown commit outcome is not safe to continue past: executing another model/tool step can
     // double bill or duplicate side effects. Leave the durable in-progress turn for the next owner to
     // reconcile instead of trying to finish it from possibly dirty in-memory state.
@@ -2689,7 +2701,13 @@ export class SessionHost {
     state.stopReason = "error";
     state.abort.abort();
     this.failPendingApprovals(state, "cancel");
+    if (err instanceof FenceError) this.reportOwnershipLost(state);
     if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
+    if (err instanceof FenceError) {
+      if (!wasAlreadyFenced) this.log.error(`[session ${state.session.id}] fenced out (${err.message}); aborting turn ${state.turn.id}`);
+    } else {
+      this.log.error(`[session ${state.session.id}] commit failed`, err);
+    }
   }
 
   /** Resolve every waiting approval now. Used on abort, fence loss and drain. */

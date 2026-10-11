@@ -21,8 +21,10 @@ import {
   TENANT_ERASURE_PLATFORM_CONTROL_V1,
   TENANT_BACKUP_CATALOG_AUTHORITATIVE_V1,
   TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
+  TRACEPARENT_HEADER,
   TenantRuntimeDrainReady,
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
+  outgoingTraceparent,
   tenantRuntimeFleetSha256,
   tenantRuntimeTargetSha256,
   type BlobStorageCapability,
@@ -763,15 +765,19 @@ export class RunnerRegistry {
 
     const targets = await Promise.all(configured.map(async (target) => {
       const signal = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
-      const request = { signal, redirect: "manual" as const };
-      const ready = await fetch(`${target.url}/readyz`, request);
+      const request = () => ({
+        signal,
+        redirect: "manual" as const,
+        headers: { [TRACEPARENT_HEADER]: outgoingTraceparent() },
+      });
+      const ready = await fetch(`${target.url}/readyz`, request());
       if (!ready.ok) {
         await ready.body?.cancel().catch(() => {});
         throw new Error("configured tenant runtime target is not ready");
       }
       await ready.body?.cancel().catch(() => {});
 
-      const capabilitiesResponse = await fetch(`${target.url}/v1/capabilities`, request);
+      const capabilitiesResponse = await fetch(`${target.url}/v1/capabilities`, request());
       if (!capabilitiesResponse.ok) {
         await capabilitiesResponse.body?.cancel().catch(() => {});
         throw new Error("configured tenant runtime target has no capability document");
@@ -791,8 +797,12 @@ export class RunnerRegistry {
       const identityResponse = await fetch(
         `${target.url}${INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH}`,
         {
-          ...request,
-          headers: { [INTERNAL_ROUTER_TOKEN_HEADER]: token },
+          signal,
+          redirect: "manual" as const,
+          headers: {
+            [INTERNAL_ROUTER_TOKEN_HEADER]: token,
+            [TRACEPARENT_HEADER]: outgoingTraceparent(),
+          },
         },
       );
       if (
@@ -887,8 +897,12 @@ export class RunnerRegistry {
       [...this.targets.values()].map(async (t) => {
         try {
           const signal = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
-          const request = { signal, redirect: "manual" as const };
-          const ready = await fetch(`${t.url}/readyz`, request);
+          const request = () => ({
+            signal,
+            redirect: "manual" as const,
+            headers: { [TRACEPARENT_HEADER]: outgoingTraceparent() },
+          });
+          const ready = await fetch(`${t.url}/readyz`, request());
           if (!ready.ok) {
             await ready.body?.cancel().catch(() => {});
             throw new Error(`readiness returned ${ready.status}`);
@@ -896,7 +910,7 @@ export class RunnerRegistry {
           await ready.body?.cancel().catch(() => {});
           let capabilities: Response;
           try {
-            capabilities = await fetch(`${t.url}/v1/capabilities`, request);
+            capabilities = await fetch(`${t.url}/v1/capabilities`, request());
           } catch {
             // A process that answered readiness but cannot prove its capability is not equivalent
             // to a wholly unreachable, previously attested target. Revoke until a later good probe.

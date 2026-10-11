@@ -75,7 +75,12 @@ import {
   TenantRuntimeDrainReady,
   TenantRuntimeDrainRunnerRequest,
   TenantRuntimeRevocationLocalReceipt,
+  TRACEPARENT_HEADER,
   isCanonicalId,
+  createEphemeralStructuredTelemetry,
+  startTraceContext,
+  telemetryErrorKind,
+  withTraceContext,
   type IdPrefix,
   ProviderIdParams,
   SessionListQuery,
@@ -96,6 +101,7 @@ import {
   type ErasureRequest,
   type TenantErasureRequest,
   type DataExportRequest,
+  type StructuredTelemetry,
   UserId,
 } from "@agent-service/protocol";
 import type { SessionHost, TenantRuntimeCoordinator, ToolRegistry } from "@agent-service/core";
@@ -234,6 +240,8 @@ export interface AppDeps {
   policyCacheMs?: number;
   /** rejects a tenant-supplied URL that is not a public http(s) endpoint (SSRF guard); injectable for tests */
   assertPublicUrl?: (url: string) => Promise<void>;
+  /** Structured, allowlisted telemetry. Omit to use a process-local opaque-ref key and JSON console sink. */
+  telemetry?: StructuredTelemetry;
 }
 
 const parse = async <T extends z.ZodTypeAny>(schema: T, body: unknown): Promise<z.infer<T>> => {
@@ -273,6 +281,7 @@ function governanceApiError(error: unknown): never {
 
 export function createApp(deps: AppDeps) {
   const app = new Hono<AuthEnv>();
+  const telemetry = deps.telemetry ?? createEphemeralStructuredTelemetry("runner");
   const tenantRedisPurgeSupported = deps.tenantRedisPurgeSupported === true
     && /^[0-9a-f]{64}$/.test(deps.tenantRedisPurgeNamespaceSha256 ?? "");
   const tenantRestoreJournalSupported = deps.tenantRestoreJournalSupported === true
@@ -299,6 +308,13 @@ export function createApp(deps: AppDeps) {
     throw new Error("maxDataExportPartBytes must be a positive safe integer");
   }
 
+  // The runner never trusts or echoes arbitrary trace headers. A canonical v00 parent keeps its
+  // trace id; malformed/future input starts a fresh local trace before auth or business handlers.
+  app.use("*", async (c, next) => withTraceContext(
+    startTraceContext(c.req.header(TRACEPARENT_HEADER)),
+    next,
+  ));
+
   app.onError((err, c) => {
     if (err instanceof SubjectDeletingError) {
       const apiError = new ApiError("subject_deleting", err.message);
@@ -315,7 +331,7 @@ export function createApp(deps: AppDeps) {
       }
       return c.json(err.toBody() satisfies ErrorBody, err.status as 400);
     }
-    console.error(err);
+    telemetry.error("runner.unhandled_error", { errorKind: telemetryErrorKind(err) });
     return c.json({ error: { code: "internal_error", message: "internal error" } } satisfies ErrorBody, 500);
   });
 

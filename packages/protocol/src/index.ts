@@ -10,4 +10,5 @@ export * from "./capabilities.js";
 export * from "./auth.js";
 export * from "./lifecycle.js";
 export * from "./http.js";
+export * from "./telemetry.js";
 export * from "./openapi.generated.js";

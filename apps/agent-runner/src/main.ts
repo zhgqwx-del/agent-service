@@ -1,5 +1,7 @@
 import { serve } from "@hono/node-server";
 import { randomUUID } from "node:crypto";
+import { open } from "node:fs/promises";
+import { dirname } from "node:path";
 import {
   BlobCleanupWorker,
   createFakeCredentialTargetExecutionAdapterState,
@@ -27,7 +29,12 @@ import {
   UserDataExportWorker,
   builtinTools,
 } from "@agent-service/core";
-import { tenantRedisNamespaceSha256 } from "@agent-service/protocol";
+import {
+  createEphemeralStructuredTelemetry,
+  tenantRedisNamespaceSha256,
+  type StructuredTelemetry,
+  type StructuredTelemetryFields,
+} from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService, PROVIDER_PRESETS } from "@agent-service/providers";
 import {
   FsBlobStore,
@@ -100,6 +107,121 @@ import {
 import { RouterTenantPurgeExecutionGate } from "./tenant-purge-execution-gate.js";
 import { RouterTenantRuntimeDrainClient } from "./tenant-runtime-drain-client.js";
 import { LocalTenantRuntimeDrain } from "./tenant-runtime-local-drain.js";
+
+const RUNNER_TELEMETRY_LEVEL = {
+  "runner.bootstrap.dev_key_skipped": "warn",
+  "runner.bootstrap.dev_key_seeded": "warn",
+  "runner.bootstrap.admin_key_inactive": "warn",
+  "runner.bootstrap.admin_key_present": "info",
+  "runner.bootstrap.admin_key_output_rejected": "error",
+  "runner.bootstrap.admin_key_store_failed": "error",
+  "runner.bootstrap.admin_key_written": "info",
+  "runner.lifecycle.draining": "info",
+  "runner.lifecycle.started": "info",
+  "runner.process.start_failed": "error",
+  "runner.runtime.ownership_lost": "warn",
+} as const;
+
+export type RunnerTelemetryEventCode = keyof typeof RUNNER_TELEMETRY_LEVEL;
+type RunnerMainTelemetryFields = Pick<
+  StructuredTelemetryFields,
+  "gateEnabledCount" | "gateDisabledCount"
+>;
+const RUNNER_TELEMETRY_OUTPUT: Pick<Console, "info" | "warn" | "error"> = {
+  info: (...args: unknown[]) => console.log(...args),
+  warn: (...args: unknown[]) => console.warn(...args),
+  error: (...args: unknown[]) => console.error(...args),
+};
+const runnerProcessTelemetry = createEphemeralStructuredTelemetry(
+  "runner",
+  RUNNER_TELEMETRY_OUTPUT,
+);
+
+/**
+ * Compatibility boundary for core components that still accept a Console-shaped logger. Dynamic
+ * arguments are intentionally discarded: session/turn/outbox IDs and arbitrary Error objects must
+ * not bypass the structured telemetry schema while those components migrate to native events.
+ */
+export function createContentFreeRunnerLogger(
+  telemetry: StructuredTelemetry,
+): Pick<Console, "info" | "warn" | "error"> {
+  const emit = (level: "info" | "warn" | "error", code: "runner.runtime.info" | "runner.runtime.warning" | "runner.runtime.error") => {
+    try {
+      telemetry[level](code);
+    } catch {
+      // A failed telemetry sink must not alter runtime, fence, or cleanup behavior.
+    }
+  };
+  return Object.freeze({
+    info: (..._values: unknown[]) => emit("info", "runner.runtime.info"),
+    warn: (..._values: unknown[]) => emit("warn", "runner.runtime.warning"),
+    error: (..._values: unknown[]) => emit("error", "runner.runtime.error"),
+  });
+}
+
+const runnerRuntimeLogger = createContentFreeRunnerLogger(runnerProcessTelemetry);
+
+/**
+ * Bootstrap-safe telemetry boundary. String-valued fields are intentionally impossible here: raw
+ * tenant IDs, runner addresses, provider IDs, URLs, locators and dependency errors must never
+ * reach the process log. The future durable telemetry adapter can consume this exact envelope.
+ */
+export function emitRunnerTelemetryEvent(
+  event: RunnerTelemetryEventCode,
+  fields: RunnerMainTelemetryFields = {},
+): void {
+  const level = RUNNER_TELEMETRY_LEVEL[event];
+  runnerProcessTelemetry[level](event, fields);
+}
+
+/**
+ * Writes the first admin key through a create-only, owner-readable channel. The path and the key
+ * are never included in an error. A file left behind after an ambiguous database failure is
+ * intentional: operators must reconcile it rather than risk silently minting a second secret.
+ */
+export async function writeAdminBootstrapOutputFile(
+  outputPath: string,
+  key: string,
+): Promise<void> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  let directoryHandle: Awaited<ReturnType<typeof open>> | undefined;
+  let failed = false;
+  try {
+    handle = await open(outputPath, "wx", 0o600);
+    await handle.chmod(0o600);
+    await handle.writeFile(`${key}\n`, { encoding: "utf8" });
+    await handle.sync();
+  } catch {
+    failed = true;
+  }
+  if (handle) {
+    try {
+      await handle.close();
+    } catch {
+      failed = true;
+    }
+  }
+  // fsyncing only the file does not make the newly created directory entry durable across a
+  // power loss. Persist the parent before the key can be committed to the database. A platform or
+  // filesystem that cannot provide this guarantee fails closed and leaves the create-only file for
+  // operator reconciliation.
+  try {
+    directoryHandle = await open(dirname(outputPath), "r");
+    await directoryHandle.sync();
+  } catch {
+    failed = true;
+  }
+  if (directoryHandle) {
+    try {
+      await directoryHandle.close();
+    } catch {
+      failed = true;
+    }
+  }
+  if (failed) {
+    throw new Error("admin bootstrap output file could not be created safely");
+  }
+}
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
@@ -186,6 +308,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         store,
         adapters: tenantRestoreJournalAdapters,
         canExecute: () => tenantRestoreJournalGate!.canExecute(),
+        logger: runnerRuntimeLogger,
       }, {
         pollIntervalMs: cfg.TENANT_RESTORE_JOURNAL_WORKER_POLL_MS,
         leaseMs: cfg.TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS,
@@ -284,6 +407,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       store,
       adapter: tenantRedisPurgeAdapter,
       canExecute: () => tenantRedisPurgeGate.canExecute(),
+      logger: runnerRuntimeLogger,
     }, {
       pollIntervalMs: cfg.TENANT_REDIS_PURGE_WORKER_POLL_MS,
       leaseMs: cfg.TENANT_REDIS_PURGE_WORKER_LEASE_MS,
@@ -437,40 +561,69 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     stagingTtlMs: cfg.BLOB_STAGING_TTL_MS,
   });
 
-  if (cfg.BOOTSTRAP_API_KEY) {
-    const state = await store.getTenantRuntimeState(cfg.BOOTSTRAP_TENANT_ID);
-    if (state.state !== "active") {
-      console.warn(`[runner ${cfg.RUNNER_ID}] skipped bootstrap api key for inactive tenant ${cfg.BOOTSTRAP_TENANT_ID}`);
-    } else {
-      try {
-        await store.createApiKey(cfg.BOOTSTRAP_TENANT_ID, "bootstrap", hashApiKey(cfg.BOOTSTRAP_API_KEY), ["runtime", "admin"]);
-        console.warn(`[runner ${cfg.RUNNER_ID}] seeded bootstrap api key for tenant ${cfg.BOOTSTRAP_TENANT_ID} (dev only)`);
-      } catch (error) {
-        if (!(error instanceof SubjectDeletingError)) throw error;
-        console.warn(`[runner ${cfg.RUNNER_ID}] skipped bootstrap api key for inactive tenant ${cfg.BOOTSTRAP_TENANT_ID}`);
-      }
-    }
-  } else if (cfg.ADMIN_BOOTSTRAP_TENANT) {
-    // Production path for a fresh install: mint ONE admin key, print it once, then never again. Without
-    // this there is no way to obtain the first admin key except editing the database by hand.
-    const state = await store.getTenantRuntimeState(cfg.ADMIN_BOOTSTRAP_TENANT);
-    if (state.state !== "active") {
-      console.warn(`[runner ${cfg.RUNNER_ID}] skipped first admin key for inactive tenant ${cfg.ADMIN_BOOTSTRAP_TENANT}`);
-    } else {
-      const keys = await store.listApiKeys(cfg.ADMIN_BOOTSTRAP_TENANT);
-      if (keys.some((k) => !k.revokedAtMs && k.scopes.includes("admin"))) {
-        console.log(`[runner ${cfg.RUNNER_ID}] tenant ${cfg.ADMIN_BOOTSTRAP_TENANT} already has an admin key; nothing to do`);
+  try {
+    if (cfg.BOOTSTRAP_API_KEY) {
+      const state = await store.getTenantRuntimeState(cfg.BOOTSTRAP_TENANT_ID);
+      if (state.state !== "active") {
+        emitRunnerTelemetryEvent("runner.bootstrap.dev_key_skipped");
       } else {
-        const key = generateApiKey();
         try {
-          await store.createApiKey(cfg.ADMIN_BOOTSTRAP_TENANT, `admin-${Date.now()}`, hashApiKey(key), ["runtime", "admin"]);
-          console.log(`[runner ${cfg.RUNNER_ID}] minted the first admin key for ${cfg.ADMIN_BOOTSTRAP_TENANT}. Store it now, it is not recoverable:\n  ${key}`);
+          await store.createApiKey(
+            cfg.BOOTSTRAP_TENANT_ID,
+            "bootstrap",
+            hashApiKey(cfg.BOOTSTRAP_API_KEY),
+            ["runtime", "admin"],
+          );
+          emitRunnerTelemetryEvent("runner.bootstrap.dev_key_seeded");
         } catch (error) {
           if (!(error instanceof SubjectDeletingError)) throw error;
-          console.warn(`[runner ${cfg.RUNNER_ID}] skipped first admin key for inactive tenant ${cfg.ADMIN_BOOTSTRAP_TENANT}`);
+          emitRunnerTelemetryEvent("runner.bootstrap.dev_key_skipped");
+        }
+      }
+    } else if (cfg.ADMIN_BOOTSTRAP_TENANT) {
+      const state = await store.getTenantRuntimeState(cfg.ADMIN_BOOTSTRAP_TENANT);
+      if (state.state !== "active") {
+        emitRunnerTelemetryEvent("runner.bootstrap.admin_key_inactive");
+      } else {
+        const keys = await store.listApiKeys(cfg.ADMIN_BOOTSTRAP_TENANT);
+        if (keys.some((key) => !key.revokedAtMs && key.scopes.includes("admin"))) {
+          emitRunnerTelemetryEvent("runner.bootstrap.admin_key_present");
+        } else {
+          const key = generateApiKey();
+          try {
+            await writeAdminBootstrapOutputFile(cfg.ADMIN_BOOTSTRAP_OUTPUT_FILE!, key);
+          } catch {
+            emitRunnerTelemetryEvent("runner.bootstrap.admin_key_output_rejected");
+            throw new Error("admin bootstrap output file could not be created safely");
+          }
+          try {
+            await store.createApiKey(
+              cfg.ADMIN_BOOTSTRAP_TENANT,
+              `admin-${Date.now()}`,
+              hashApiKey(key),
+              ["runtime", "admin"],
+            );
+          } catch (error) {
+            emitRunnerTelemetryEvent("runner.bootstrap.admin_key_store_failed");
+            if (error instanceof SubjectDeletingError) {
+              throw new Error("admin bootstrap tenant became inactive after output reservation");
+            }
+            throw new Error("admin bootstrap store write failed after output reservation");
+          }
+          emitRunnerTelemetryEvent("runner.bootstrap.admin_key_written");
         }
       }
     }
+  } catch (error) {
+    await Promise.all([
+      closeTenantRestoreJournal(),
+      blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
+      tenantRedisPurgeAdapter?.close(),
+      bus.close(),
+      lease.close(),
+      store.close(),
+    ]);
+    throw error;
   }
 
   const platform = [];
@@ -509,6 +662,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const tools = new StaticToolRegistry(builtinTools);
   const host = new SessionHost({
     store, erasureStore: store, lease, bus, providers, tools, blobs, tenantRuntime,
+    logger: runnerRuntimeLogger,
+    onOwnershipLost: () => emitRunnerTelemetryEvent("runner.runtime.ownership_lost"),
     engine: new PiEngine(providers.models),
     summariser: new PiSummariser(providers.models),
     config: {
@@ -523,7 +678,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       erasureDrainTimeoutMs: cfg.ERASURE_DRAIN_TIMEOUT_MS,
     },
   });
-  const lifecycleOutbox = new LifecycleOutboxDispatcher({ store, bus }, {
+  const lifecycleOutbox = new LifecycleOutboxDispatcher({
+    store, bus, logger: runnerRuntimeLogger,
+  }, {
     pollIntervalMs: cfg.LIFECYCLE_OUTBOX_POLL_MS,
     leaseMs: cfg.LIFECYCLE_OUTBOX_LEASE_MS,
     batchSize: cfg.LIFECYCLE_OUTBOX_BATCH_SIZE,
@@ -531,7 +688,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     retryMaxMs: cfg.LIFECYCLE_OUTBOX_RETRY_MAX_MS,
   });
   lifecycleOutbox.start();
-  const blobCleanup = new BlobCleanupWorker({ store, blob: blobStore }, {
+  const blobCleanup = new BlobCleanupWorker({
+    store, blob: blobStore, logger: runnerRuntimeLogger,
+  }, {
     pollIntervalMs: cfg.BLOB_CLEANUP_POLL_MS,
     leaseMs: cfg.BLOB_CLEANUP_LEASE_MS,
     batchSize: cfg.BLOB_CLEANUP_BATCH_SIZE,
@@ -556,6 +715,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       legacyTombstones: store,
       executor: erasureExecutor,
       canClaim: () => erasureExecutor.canClaimErasureJobs(),
+      logger: runnerRuntimeLogger,
     }, {
       pollIntervalMs: cfg.ERASURE_WORKER_POLL_MS,
       leaseMs: cfg.ERASURE_WORKER_LEASE_MS,
@@ -570,6 +730,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ? new LegacyTombstoneCompensationWorker({
       store,
       canClaim: () => erasureExecutor.canClaimErasureJobs(),
+      logger: runnerRuntimeLogger,
     }, {
       pollIntervalMs: cfg.LEGACY_TOMBSTONE_COMPENSATION_POLL_MS,
       leaseMs: cfg.LEGACY_TOMBSTONE_COMPENSATION_LEASE_MS,
@@ -589,6 +750,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ? new PurgePolicyEvaluator({
       store,
       canClaim: () => purgePolicyEvaluationGate.canClaim(),
+      logger: runnerRuntimeLogger,
     }, {
       pollIntervalMs: cfg.PURGE_POLICY_EVALUATOR_POLL_MS,
       leaseMs: cfg.PURGE_POLICY_EVALUATOR_LEASE_MS,
@@ -599,7 +761,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     })
     : undefined;
   const dataExportWorker = cfg.DATA_EXPORT_WORKER_ENABLED
-    ? new UserDataExportWorker({ store, blob: blobStore }, {
+    ? new UserDataExportWorker({
+      store, blob: blobStore, logger: runnerRuntimeLogger,
+    }, {
       pollIntervalMs: cfg.DATA_EXPORT_WORKER_POLL_MS,
       leaseMs: cfg.DATA_EXPORT_WORKER_LEASE_MS,
       batchSize: cfg.DATA_EXPORT_WORKER_BATCH_SIZE,
@@ -612,7 +776,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     })
     : undefined;
   const dataExportCleanup = cfg.DATA_EXPORT_CLEANUP_ENABLED
-    ? new UserDataExportCleanupWorker({ store, blob: blobStore }, {
+    ? new UserDataExportCleanupWorker({
+      store, blob: blobStore, logger: runnerRuntimeLogger,
+    }, {
       pollIntervalMs: cfg.DATA_EXPORT_CLEANUP_POLL_MS,
       leaseMs: cfg.DATA_EXPORT_CLEANUP_LEASE_MS,
       batchSize: cfg.DATA_EXPORT_CLEANUP_BATCH_SIZE,
@@ -639,6 +805,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ? new TenantCredentialRevocationWorker({
       store,
       canExecute: () => tenantCredentialRevocationGate.canExecute(),
+      logger: runnerRuntimeLogger,
     })
     : undefined;
   const tenantCredentialTargetExecutionGate =
@@ -655,6 +822,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
           store,
           adapter: credentialTargetExecutionAdapter,
           canExecute: () => tenantCredentialTargetExecutionGate.canExecute(),
+          logger: runnerRuntimeLogger,
         }, {
           pollIntervalMs: cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_POLL_MS,
           leaseMs: cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_LEASE_MS,
@@ -682,6 +850,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ? new TenantRuntimeRevocationWorker({
       store,
       drainFleet: (request) => tenantRuntimeDrainClient.drain(request),
+      logger: runnerRuntimeLogger,
     }, {
       pollIntervalMs: cfg.TENANT_RUNTIME_REVOCATION_WORKER_POLL_MS,
       leaseMs: cfg.TENANT_RUNTIME_REVOCATION_WORKER_LEASE_MS,
@@ -692,7 +861,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     })
     : undefined;
   const tenantContentInventoryWorker = cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED
-    ? new TenantContentInventoryWorker({ store }, {
+    ? new TenantContentInventoryWorker({ store, logger: runnerRuntimeLogger }, {
       pollIntervalMs: cfg.TENANT_CONTENT_INVENTORY_WORKER_POLL_MS,
       leaseMs: cfg.TENANT_CONTENT_INVENTORY_WORKER_LEASE_MS,
       batchSize: cfg.TENANT_CONTENT_INVENTORY_WORKER_BATCH_SIZE,
@@ -703,7 +872,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     })
     : undefined;
   const tenantPurgePlanWorker = cfg.TENANT_PURGE_PLAN_WORKER_ENABLED
-    ? new TenantPurgePlanWorker({ store }, {
+    ? new TenantPurgePlanWorker({ store, logger: runnerRuntimeLogger }, {
       pollIntervalMs: cfg.TENANT_PURGE_PLAN_WORKER_POLL_MS,
       leaseMs: cfg.TENANT_PURGE_PLAN_WORKER_LEASE_MS,
       batchSize: cfg.TENANT_PURGE_PLAN_WORKER_BATCH_SIZE,
@@ -723,6 +892,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ? new TenantPurgeExecutionWorker({
       store,
       canExecute: () => tenantPurgeExecutionGate.canExecute(),
+      logger: runnerRuntimeLogger,
     }, {
       pollIntervalMs: cfg.TENANT_PURGE_EXECUTION_WORKER_POLL_MS,
       leaseMs: cfg.TENANT_PURGE_EXECUTION_WORKER_LEASE_MS,
@@ -743,6 +913,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ? new TenantDatabasePurgeWorker({
       store,
       canExecute: () => tenantDatabasePurgeGate.canExecute(),
+      logger: runnerRuntimeLogger,
     }, {
       pollIntervalMs: cfg.TENANT_DATABASE_PURGE_WORKER_POLL_MS,
       leaseMs: cfg.TENANT_DATABASE_PURGE_WORKER_LEASE_MS,
@@ -769,6 +940,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let ready = true;
   const app = createApp({
     store, host, providers, tools,
+    telemetry: runnerProcessTelemetry,
     runnerId: cfg.RUNNER_ID,
     internalRouterToken: cfg.INTERNAL_ROUTER_TOKEN,
     heartbeatMs: cfg.SSE_HEARTBEAT_MS,
@@ -846,12 +1018,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   tenantRuntimeRevocationWorker?.start();
 
   let shutdownPromise: Promise<void> | undefined;
-  const shutdown = (signal: string, exitProcess: boolean): Promise<void> => {
+  const shutdown = (_signal: string, exitProcess: boolean): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
       process.off("SIGTERM", onSigterm);
       process.off("SIGINT", onSigint);
-      console.log(`[runner ${cfg.RUNNER_ID}] ${signal}: draining`);
+      emitRunnerTelemetryEvent("runner.lifecycle.draining");
       ready = false;
       // Stop accepting new connections while allowing existing requests/streams to finish during
       // the host drain. Stores stay available until workers and HTTP have both quiesced.
@@ -912,7 +1084,35 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   process.once("SIGTERM", onSigterm);
   process.once("SIGINT", onSigint);
 
-  console.log(`[runner ${cfg.RUNNER_ID}] listening on http://${cfg.RUNNER_HOST}:${cfg.RUNNER_PORT} store=${cfg.STORE} redis=${cfg.REDIS_URL ? "yes" : "memory"} platform=${platform.map((p) => p.config.id).join(",") || "none"} blobStore=${cfg.BLOB_STORE} blobControl=${blobStorageControlGeneration} blobWrites=${cfg.BLOB_ATTACHMENTS_ENABLED ? "yes" : "no"} blobCleanup=${cfg.BLOB_CLEANUP_ENABLED ? "yes" : "no"} erasureRequests=${cfg.DATA_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} erasureWorker=${cfg.ERASURE_WORKER_ENABLED ? "yes" : "no"} legacyTombstoneCompensation=${cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED ? "yes" : "no"} tenantErasureRequests=${cfg.TENANT_ERASURE_REQUESTS_ENABLED ? "enabled" : "gated"} credentialLifecycleTracking=${cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED ? "enabled" : "gated"} tenantCredentialRevocationWorker=${cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED ? "yes" : "no"} restoreJournal=${cfg.tenantRestoreJournal ? "configured" : "absent"} restoreJournalWorker=${tenantRestoreJournalWorker ? "yes" : "no"} credentialTargetExecutionWorker=${cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantRuntimeDrain=${cfg.TENANT_RUNTIME_DRAIN_ENABLED ? "enabled" : "gated"} tenantRuntimeRevocationWorker=${cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED ? "yes" : "no"} tenantContentInventoryWorker=${cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED ? "yes" : "no"} tenantPurgePlanWorker=${cfg.TENANT_PURGE_PLAN_WORKER_ENABLED ? "yes" : "no"} tenantPurgeExecutionWorker=${cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED ? "yes" : "no"} tenantDatabasePurgeWorker=${cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED ? "yes" : "no"} tenantRedisPurgeWorker=${cfg.TENANT_REDIS_PURGE_WORKER_ENABLED ? "yes" : "no"} dataGovernance=${cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED ? "enabled" : "gated"} purgePolicyEvaluator=${cfg.PURGE_POLICY_EVALUATOR_ENABLED ? "yes" : "no"} dataExportRequests=${cfg.DATA_EXPORT_REQUESTS_ENABLED ? "enabled" : "gated"} dataExportWorker=${cfg.DATA_EXPORT_WORKER_ENABLED ? "yes" : "no"} dataExportCleanup=${cfg.DATA_EXPORT_CLEANUP_ENABLED ? "yes" : "no"}`);
+  const gateStates = [
+    cfg.BLOB_ATTACHMENTS_ENABLED,
+    cfg.BLOB_CLEANUP_ENABLED,
+    cfg.DATA_ERASURE_REQUESTS_ENABLED,
+    cfg.ERASURE_WORKER_ENABLED,
+    cfg.LEGACY_TOMBSTONE_COMPENSATION_ENABLED,
+    cfg.TENANT_ERASURE_REQUESTS_ENABLED,
+    cfg.CREDENTIAL_LIFECYCLE_TRACKING_ENABLED,
+    cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED,
+    tenantRestoreJournalWorker !== undefined,
+    cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED,
+    cfg.TENANT_RUNTIME_DRAIN_ENABLED,
+    cfg.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED,
+    cfg.TENANT_CONTENT_INVENTORY_WORKER_ENABLED,
+    cfg.TENANT_PURGE_PLAN_WORKER_ENABLED,
+    cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED,
+    cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED,
+    cfg.TENANT_REDIS_PURGE_WORKER_ENABLED,
+    cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
+    cfg.PURGE_POLICY_EVALUATOR_ENABLED,
+    cfg.DATA_EXPORT_REQUESTS_ENABLED,
+    cfg.DATA_EXPORT_WORKER_ENABLED,
+    cfg.DATA_EXPORT_CLEANUP_ENABLED,
+  ];
+  const gateEnabledCount = gateStates.filter(Boolean).length;
+  emitRunnerTelemetryEvent("runner.lifecycle.started", {
+    gateEnabledCount,
+    gateDisabledCount: gateStates.length - gateEnabledCount,
+  });
   return {
     app, server, host, lifecycleOutbox, blobCleanup, erasureWorker,
     legacyTombstoneCompensationWorker, purgePolicyEvaluator,
@@ -937,8 +1137,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
 }
 
 if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file://").href) {
-  startRunner().catch((err) => {
-    console.error(err);
+  startRunner().catch(() => {
+    emitRunnerTelemetryEvent("runner.process.start_failed");
     process.exit(1);
   });
 }

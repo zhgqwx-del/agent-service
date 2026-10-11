@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 import {
   blobS3Backend,
   blobS3NamespaceSha256,
@@ -259,6 +260,11 @@ const Env = z.object({
   BOOTSTRAP_TENANT_ID: z.string().default("t_dev"),
   /** mint the first admin key for this tenant if it has none; subsequent boots do not mint another */
   ADMIN_BOOTSTRAP_TENANT: z.string().optional(),
+  /**
+   * Create-only destination for the first admin key. The value is runner-only authority and must
+   * never be written to stdout/stderr or forwarded to the router.
+   */
+  ADMIN_BOOTSTRAP_OUTPUT_FILE: z.string().min(1).optional(),
   /** Shared only with routers; protects versioned runner-internal lifecycle routes. */
   INTERNAL_ROUTER_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
   NODE_ENV: z.string().optional(),
@@ -457,6 +463,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   }
   if (production && c.BOOTSTRAP_API_KEY) {
     throw new Error("BOOTSTRAP_API_KEY must not be set when NODE_ENV=production: seed tenants through an admin path instead");
+  }
+  if (c.BOOTSTRAP_API_KEY && c.ADMIN_BOOTSTRAP_TENANT) {
+    throw new Error(
+      "BOOTSTRAP_API_KEY and ADMIN_BOOTSTRAP_TENANT are mutually exclusive bootstrap paths",
+    );
+  }
+  if (c.ADMIN_BOOTSTRAP_OUTPUT_FILE && !c.ADMIN_BOOTSTRAP_TENANT) {
+    throw new Error(
+      "ADMIN_BOOTSTRAP_OUTPUT_FILE requires ADMIN_BOOTSTRAP_TENANT",
+    );
+  }
+  if (c.ADMIN_BOOTSTRAP_TENANT && !c.ADMIN_BOOTSTRAP_OUTPUT_FILE) {
+    throw new Error(
+      "ADMIN_BOOTSTRAP_OUTPUT_FILE is required with ADMIN_BOOTSTRAP_TENANT; admin keys are never emitted to process logs",
+    );
+  }
+  if (c.ADMIN_BOOTSTRAP_OUTPUT_FILE && !isAbsolute(c.ADMIN_BOOTSTRAP_OUTPUT_FILE)) {
+    throw new Error("ADMIN_BOOTSTRAP_OUTPUT_FILE must be an absolute path");
   }
   if (production && c.STORE === "memory") throw new Error("STORE=memory loses all state on restart; set STORE=mysql in production");
   if (production && !c.REDIS_URL) throw new Error("REDIS_URL is required in production: leases and event fan-out depend on it");

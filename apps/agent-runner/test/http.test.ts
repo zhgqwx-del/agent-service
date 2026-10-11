@@ -21,7 +21,12 @@ import {
   INTERNAL_TOMBSTONE_ACK_VALUE,
   INTERNAL_TOMBSTONE_PATH_PREFIX,
   INTERNAL_ROUTER_TOKEN_HEADER,
+  createStructuredTelemetry,
   emptyUsage,
+  outgoingTraceparent,
+  parseTraceparent,
+  type StructuredTelemetry,
+  type StructuredTelemetryRecord,
   type UserErasureDrainRequest,
 } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
@@ -93,6 +98,8 @@ async function makeApp(
     redisPurgeSupported?: boolean;
     redisPurgeWorker?: boolean;
     redisPurgeNamespaceSha256?: string;
+    telemetry?: StructuredTelemetry;
+    ready?: () => boolean;
   } = {},
 ) {
   const store = new MemorySessionStore();
@@ -109,7 +116,8 @@ async function makeApp(
   const cipher = new LocalAesGcmCipher("33".repeat(32));
   const app = createApp({
     store, host, providers, tools, runnerId: "r", internalRouterToken: INTERNAL_ROUTER_TOKEN,
-    heartbeatMs, maxBodyBytes: 1_000_000, ready: () => true,
+    heartbeatMs, maxBodyBytes: 1_000_000, ready: lifecycle.ready ?? (() => true),
+    telemetry: lifecycle.telemetry,
     erasureRequestsEnabled: lifecycle.enabled,
     legacyTombstoneCompensationEnabled: lifecycle.legacyCompensation,
     subjectLifecycle: lifecycle.attachStore ? store : undefined,
@@ -1303,5 +1311,52 @@ describe("agent-runner HTTP API", () => {
     }
     const listed = await j<{ data: { id: string }[] }>(await call("/v1/providers"));
     expect(listed.data.some((provider) => provider.id.startsWith("invalid-"))).toBe(false);
+  });
+
+  it("logs unhandled errors with the inherited trace id but without raw error text", async () => {
+    const records: Readonly<StructuredTelemetryRecord>[] = [];
+    const telemetry = createStructuredTelemetry({
+      component: "runner",
+      opaqueRefKey: Buffer.alloc(32, 4),
+      sink: { write: (record) => records.push(record) },
+      now: () => 1,
+    });
+    const parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    const { app } = await makeApp(60_000, {
+      telemetry,
+      ready: () => { throw new Error("raw-secret https://private.invalid"); },
+    });
+    const response = await app.request("/readyz", { headers: { traceparent: parent } });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({
+      error: { code: "internal_error", message: "internal error" },
+    });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      code: "runner.unhandled_error",
+      fields: { errorKind: "unknown" },
+      traceId: parseTraceparent(parent)!.traceId,
+    });
+    const encoded = JSON.stringify(records);
+    expect(encoded).not.toContain("raw-secret");
+    expect(encoded).not.toContain("private.invalid");
+  });
+
+  it("creates a downstream child context from a strict router traceparent", async () => {
+    const parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02";
+    let downstream: string | undefined;
+    const { app } = await makeApp(60_000, {
+      ready: () => {
+        downstream = outgoingTraceparent();
+        return true;
+      },
+    });
+    expect((await app.request("/readyz", { headers: { traceparent: parent } })).status).toBe(200);
+    const parsed = parseTraceparent(downstream);
+    expect(parsed).toMatchObject({
+      traceId: parseTraceparent(parent)!.traceId,
+      traceFlags: "02",
+    });
+    expect(parsed!.spanId).not.toBe(parseTraceparent(parent)!.spanId);
   });
 });

@@ -34,6 +34,7 @@ describe("runner configuration", () => {
     expect(cfg.BLOB_STORE).toBe("filesystem");
     expect(cfg.BLOB_S3_PRIVATE_BUCKET_ACK).toBe(false);
     expect(cfg.BLOB_S3_REQUEST_TIMEOUT_MS).toBe(5_000);
+    expect(cfg.ADMIN_BOOTSTRAP_OUTPUT_FILE).toBeUndefined();
     expect(cfg.blobStorage).toBeUndefined();
     expect(cfg.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
@@ -955,5 +956,42 @@ describe("runner configuration", () => {
 
   it("rejects the development bootstrap key in production", () => {
     expect(() => loadConfig({ ...productionEnv, BOOTSTRAP_API_KEY: "must-not-work" })).toThrow(/BOOTSTRAP_API_KEY must not be set/);
+  });
+
+  it("requires an absolute create-only channel for every first-admin bootstrap", () => {
+    expect(() => loadConfig({
+      ...productionEnv,
+      ADMIN_BOOTSTRAP_TENANT: "t_bootstrap",
+    })).toThrow(/ADMIN_BOOTSTRAP_OUTPUT_FILE is required/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      ADMIN_BOOTSTRAP_TENANT: "t_bootstrap",
+    })).toThrow(/ADMIN_BOOTSTRAP_OUTPUT_FILE is required/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      ADMIN_BOOTSTRAP_TENANT: "t_bootstrap",
+      ADMIN_BOOTSTRAP_OUTPUT_FILE: "relative/admin-key",
+    })).toThrow(/must be an absolute path/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      ADMIN_BOOTSTRAP_OUTPUT_FILE: "/run/secrets/agent-service-admin-key",
+    })).toThrow(/requires ADMIN_BOOTSTRAP_TENANT/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      BOOTSTRAP_API_KEY: "development-key",
+      ADMIN_BOOTSTRAP_TENANT: "t_bootstrap",
+      ADMIN_BOOTSTRAP_OUTPUT_FILE: "/run/secrets/agent-service-admin-key",
+    })).toThrow(/mutually exclusive/);
+
+    expect(loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      ADMIN_BOOTSTRAP_TENANT: "t_bootstrap",
+      ADMIN_BOOTSTRAP_OUTPUT_FILE: "/run/secrets/agent-service-admin-key",
+    }).ADMIN_BOOTSTRAP_OUTPUT_FILE).toBe("/run/secrets/agent-service-admin-key");
+    expect(loadConfig({
+      ...productionEnv,
+      ADMIN_BOOTSTRAP_TENANT: "t_bootstrap",
+      ADMIN_BOOTSTRAP_OUTPUT_FILE: "/run/secrets/agent-service-admin-key",
+    }).ADMIN_BOOTSTRAP_TENANT).toBe("t_bootstrap");
   });
 });

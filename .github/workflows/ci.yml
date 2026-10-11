@@ -95,6 +95,11 @@ jobs:
       - name: Typecheck (sources and tests)
         run: pnpm typecheck
 
+      # Keep the content-free logs/traces ownership contract visible. This is the default-dormant
+      # 0032 inventory/evidence layer only; external sink deletion remains deliberately unclaimed.
+      - name: Tenant telemetry lifecycle evidence suite (must execute)
+        run: pnpm run test:tenant-telemetry-lifecycle
+
       - name: Create test databases
         run: |
           mysql -h 127.0.0.1 -uroot -e "
@@ -411,7 +416,7 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0031
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0032
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority, 0016 -> 0017 user-export and 0018 -> 0019 inert tenant credential
@@ -420,9 +425,9 @@ jobs:
       # database-content deletion, 0024 -> 0025 Redis-purge ledger, 0025 -> 0026 versioned
       # credential-lifecycle inventory, 0026 -> 0027 blob-storage control and 0027 -> 0028
       # offline-mover ledger, 0028 -> 0029 dormant credential-target execution, 0029 -> 0030
-      # independent restore-journal/runtime-lineage and 0030 -> 0031 authoritative backup-catalog
-      # replay matrices.
-      - name: Historical MySQL migrations (0007 through 0031, no skips)
+      # independent restore-journal/runtime-lineage, 0030 -> 0031 authoritative backup-catalog and
+      # 0031 -> 0032 default-dormant telemetry inventory replay matrices.
+      - name: Historical MySQL migrations (0007 through 0032, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -547,6 +552,7 @@ jobs:
               -e STORE=mysql -e MYSQL_URL=mysql://root@127.0.0.1:3306/agent_service \
               -e REDIS_URL=redis://127.0.0.1:6379 \
               -e ADMIN_BOOTSTRAP_TENANT=t_ci \
+              -e ADMIN_BOOTSTRAP_OUTPUT_FILE=/app/.data/admin-bootstrap-key \
               -e RUNNER_ADDR=127.0.0.1:8787 -e RUNNER_PORT=8787 \
               agent-service/${{ matrix.app }}:ci
             PORT=8787
@@ -577,10 +583,20 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0029_tenant_credential_target_execution.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0030_tenant_restore_journal.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0031_authoritative_backup_catalog.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0032_tenant_telemetry_lifecycle.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
-            # guard by injecting BOOTSTRAP_API_KEY (that variable is intentionally development-only).
-            CI_KEY=$(docker logs app 2>&1 | sed -n 's/^  \(ask_[A-Za-z0-9_-]*\)$/\1/p' | tail -n 1)
-            if [ -z "$CI_KEY" ]; then echo "production admin bootstrap did not emit a key"; docker logs app; exit 1; fi
+            # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
+            # file inside the container and must never be present in docker logs.
+            [ "$(docker exec app stat -c '%a' /app/.data/admin-bootstrap-key)" = "600" ]
+            CI_KEY=$(docker exec app cat /app/.data/admin-bootstrap-key)
+            if ! printf '%s' "$CI_KEY" | grep -Eq '^ask_[A-Za-z0-9_-]+$'; then
+              echo "production admin bootstrap file did not contain a valid key"
+              exit 1
+            fi
+            if docker logs app 2>&1 | grep -Eq 'ask_[A-Za-z0-9_-]+|t_ci'; then
+              echo "production bootstrap secret or tenant leaked to docker logs"
+              exit 1
+            fi
             curl -fsS -X POST http://127.0.0.1:8787/v1/agents \
               -H "Authorization: Bearer $CI_KEY" -H 'X-User-Id: u1' -H 'content-type: application/json' \
               -d '{"name":"ci","instructions":"x","model":{"provider":"dashscope","model":"qwen-plus"}}' >/dev/null

@@ -1,6 +1,17 @@
 import { createModels, createProvider, type Model, type MutableModels } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { ApiError, ProviderConfig, type ModelSpec, type Principal, type ProviderConfigInput } from "@agent-service/protocol";
+import {
+  ApiError,
+  ProviderConfig,
+  TRACEPARENT_HEADER,
+  createEphemeralStructuredTelemetry,
+  outgoingTraceparent,
+  telemetryErrorKind,
+  type ModelSpec,
+  type Principal,
+  type ProviderConfigInput,
+  type StructuredTelemetry,
+} from "@agent-service/protocol";
 import {
   CredentialSourceConflictError,
   SubjectDeletingError,
@@ -50,6 +61,8 @@ export interface ProviderServiceOptions {
   credentialTargetReferenceFactory?: ProviderCredentialTargetReferenceFactory;
   /** Independent from the BYOK secret cipher and required whenever the locator factory is set. */
   credentialTargetReferenceProtector?: CredentialTargetReferenceProtector;
+  /** Structured, allowlisted telemetry. Omit to use a process-local opaque-ref key and JSON console sink. */
+  telemetry?: StructuredTelemetry;
 }
 
 /**
@@ -136,8 +149,10 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
   private readonly tenantRegistrations = new Map<string, Set<string>>();
 
   private readonly assertBaseUrl: (baseUrl: string) => Promise<void>;
+  private readonly telemetry: StructuredTelemetry;
 
   constructor(private readonly opts: ProviderServiceOptions) {
+    this.telemetry = opts.telemetry ?? createEphemeralStructuredTelemetry("provider");
     if ((opts.credentialTargetReferenceFactory === undefined)
       !== (opts.credentialTargetReferenceProtector === undefined)) {
       throw new Error(
@@ -363,7 +378,29 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
         lease?.assertOpen();
         const inputSignal = args[0] instanceof Request ? args[0].signal : undefined;
         const signal = combineSignals(args[1]?.signal, inputSignal, lease?.signal);
-        const response = await delegate(args[0], { ...args[1], ...(signal ? { signal } : {}) });
+        const headers = new Headers(
+          args[1]?.headers
+            ?? (args[0] instanceof Request ? args[0].headers : undefined),
+        );
+        // Only the strictly generated W3C header crosses the provider boundary. Vendor state and
+        // baggage are caller-controlled and may contain owner identifiers or other sensitive text.
+        headers.delete("tracestate");
+        headers.delete("baggage");
+        headers.set(TRACEPARENT_HEADER, outgoingTraceparent());
+        let response: Response;
+        try {
+          response = await delegate(args[0], {
+            ...args[1],
+            headers,
+            ...(signal ? { signal } : {}),
+          });
+        } catch (error) {
+          this.telemetry.warn("provider.upstream_request_failed", {
+            ownerRef: this.telemetry.opaqueRef("tenant", tenantId),
+            errorKind: telemetryErrorKind(error),
+          });
+          throw error;
+        }
         try {
           lease?.assertOpen();
         } catch (error) {
