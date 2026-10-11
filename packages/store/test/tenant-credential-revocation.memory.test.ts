@@ -601,6 +601,15 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
     const store = new MemorySessionStore();
     const input = requestInput("tenant-rollback");
     await store.setTenantAuth(input.tenantId, DEFAULT_AUTH_POLICY);
+    const lifecycleBefore = await store.getSubjectLifecycle(
+      input.tenantId,
+      "tenant",
+      input.tenantId,
+    );
+    expect(lifecycleBefore).not.toBeNull();
+    const telemetryCoveragesBefore = structuredClone([
+      ...store.tenantTelemetryLifecycleCoverages.entries(),
+    ]);
     const lifecycle = store.subjectLifecycles;
     const originalSet = lifecycle.set.bind(lifecycle);
     let fail = true;
@@ -617,7 +626,10 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
 
     await expect(store.requestTenantErasure(input))
       .rejects.toThrow("injected tenant gate publication failure");
-    expect(store.subjectLifecycles).toHaveLength(0);
+    expect(await store.getSubjectLifecycle(input.tenantId, "tenant", input.tenantId))
+      .toEqual(lifecycleBefore);
+    expect([...store.tenantTelemetryLifecycleCoverages.entries()])
+      .toEqual(telemetryCoveragesBefore);
     expect(store.erasureRequests).toHaveLength(0);
     expect(store.tenantErasureAdmissions).toHaveLength(0);
     expect(store.erasureAuditEvents).toHaveLength(0);
@@ -660,6 +672,9 @@ describe("MemorySessionStore tenant credential revocation fence", () => {
       fencedAtMs: NOW,
     };
     await store.createApiKey(tenantId, "fenced-key", "fenced-key-hash");
+    // Simulate a corrupt restore where append-only fence evidence survived but its mutable
+    // lifecycle projection did not. Credential writers now create that projection atomically.
+    store.subjectLifecycles.delete(subjectLifecycleKey(tenantId, "tenant", tenantId));
     store.tenantCredentialRevocationFences.set(tenantId, {
       ...fenceBase,
       evidenceSha256: tenantCredentialRevocationFenceSha256(fenceBase),

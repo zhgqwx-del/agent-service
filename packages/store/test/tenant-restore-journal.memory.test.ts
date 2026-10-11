@@ -330,6 +330,11 @@ describe("MemorySessionStore tenant restore journal", () => {
     await activate(store);
     const tenantId = "tenant-runtime-control-torn";
     await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
+    const lifecycleBefore = await store.getSubjectLifecycle(tenantId, "tenant", tenantId);
+    expect(lifecycleBefore).not.toBeNull();
+    const telemetryCoveragesBefore = structuredClone([
+      ...store.tenantTelemetryLifecycleCoverages.entries(),
+    ]);
     store.tenantRestoreRuntimeControls.clear();
     const input = requestInput(tenantId, nowMs);
 
@@ -341,8 +346,10 @@ describe("MemorySessionStore tenant restore journal", () => {
     expect(store.tenantCredentialRevocationJobs.size).toBe(0);
     expect(store.tenantRestoreJournalPublicationJobs.size).toBe(0);
     expect(store.tenantRestoreJournalPublicationTargets.size).toBe(0);
-    expect(store.subjectLifecycles.get(JSON.stringify([tenantId, "tenant", tenantId])))
-      .toBeUndefined();
+    expect(await store.getSubjectLifecycle(tenantId, "tenant", tenantId))
+      .toEqual(lifecycleBefore);
+    expect([...store.tenantTelemetryLifecycleCoverages.entries()])
+      .toEqual(telemetryCoveragesBefore);
   });
 
   it("enforces lease ABA, all-target ACKs and publication before T3a", async () => {

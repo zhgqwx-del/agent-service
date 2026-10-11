@@ -578,6 +578,9 @@ verify() {
   pnpm run check:api
   pnpm typecheck
   pnpm run test:tenant-telemetry-lifecycle
+  pnpm run test:tenant-telemetry-lifecycle-memory
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-telemetry-lifecycle-mysql
   AGENT_SERVICE_INTEGRATION=1 \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \

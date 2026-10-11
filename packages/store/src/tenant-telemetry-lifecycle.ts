@@ -14,6 +14,12 @@ export const TENANT_TELEMETRY_LIFECYCLE_COVERAGE_SCOPE =
   "tenant-telemetry-lifecycle-coverage-v1" as const;
 export const TENANT_TELEMETRY_LIFECYCLE_SUBJECT_SCOPE =
   "tenant-telemetry-lifecycle-subject-v1" as const;
+export const TENANT_TELEMETRY_LIFECYCLE_ACTIVATION_SCOPE =
+  "tenant-telemetry-lifecycle-activation-v1" as const;
+export const TENANT_TELEMETRY_ARTIFACT_INVENTORY_SCOPE =
+  "tenant-telemetry-artifact-inventory-v1" as const;
+export const TENANT_TELEMETRY_RETENTION_CLASS =
+  "telemetry_policy_unconfigured" as const;
 
 export const TENANT_TELEMETRY_DOMAINS = ["logs", "traces"] as const;
 export type TenantTelemetryDomain = (typeof TENANT_TELEMETRY_DOMAINS)[number];
@@ -31,6 +37,7 @@ const ADAPTER_PROTOCOL = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
 const TENANT_REF = /^oref_tenant_([0-9a-f]{64})$/;
 const REQUEST_ID =
   /^erase_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const SOURCE_SCHEMA = /^[a-z0-9][a-z0-9._:-]{0,127}$/;
 
 function sha256(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -60,6 +67,12 @@ function timestamp(value: unknown, name: string): asserts value is number {
 function positive(value: unknown, name: string): asserts value is number {
   if (!Number.isSafeInteger(value) || (value as number) < 1) {
     throw new Error(`${name} must be a positive safe integer`);
+  }
+}
+
+function nonNegative(value: unknown, name: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(`${name} must be a non-negative safe integer`);
   }
 }
 
@@ -446,4 +459,587 @@ export function validateTenantTelemetryLifecycleSubject(
   if (receiptSha256 !== tenantTelemetryLifecycleSubjectReceiptSha256(body)) {
     throw new Error("tenant telemetry subject receipt mismatch");
   }
+}
+
+export class TenantTelemetryLifecycleConflictError extends Error {
+  constructor(message = "tenant telemetry lifecycle state conflicts with the requested operation") {
+    super(message);
+    this.name = "TenantTelemetryLifecycleConflictError";
+  }
+}
+
+export class TenantTelemetryLifecycleIntegrityError extends Error {
+  constructor(message = "tenant telemetry lifecycle evidence is invalid") {
+    super(message);
+    this.name = "TenantTelemetryLifecycleIntegrityError";
+  }
+}
+
+export interface ActivateTenantTelemetryTargetInput {
+  domain: TenantTelemetryDomain;
+  backendKind: string;
+  adapterProtocol: string;
+  namespaceSha256: string;
+  failureDomainSha256: string;
+}
+
+export interface ActivateTenantTelemetryLifecycleInput {
+  expectedControlGeneration: 0;
+  targets: ActivateTenantTelemetryTargetInput[];
+}
+
+const ACTIVATION_TARGET_INPUT_KEYS = [
+  "domain",
+  "backendKind",
+  "adapterProtocol",
+  "namespaceSha256",
+  "failureDomainSha256",
+] as const;
+
+const ACTIVATION_INPUT_KEYS = [
+  "expectedControlGeneration",
+  "targets",
+] as const;
+
+export function validateActivateTenantTelemetryLifecycleInput(
+  input: ActivateTenantTelemetryLifecycleInput,
+): void {
+  exactKeys(input, ACTIVATION_INPUT_KEYS, "tenant telemetry lifecycle activation input");
+  if (input.expectedControlGeneration !== 0) {
+    throw new Error("tenant telemetry activation expected generation must be zero");
+  }
+  if (!Array.isArray(input.targets) || input.targets.length !== 2) {
+    throw new Error("tenant telemetry activation requires exactly two targets");
+  }
+  const domains = new Set<TenantTelemetryDomain>();
+  const namespaces = new Set<string>();
+  for (const target of input.targets) {
+    exactKeys(target, ACTIVATION_TARGET_INPUT_KEYS, "tenant telemetry activation target input");
+    if (!(TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(target.domain)) {
+      throw new Error("tenant telemetry activation target domain is invalid");
+    }
+    if (!BACKEND_KIND.test(target.backendKind)) {
+      throw new Error("tenant telemetry activation backend kind is invalid");
+    }
+    if (!ADAPTER_PROTOCOL.test(target.adapterProtocol)) {
+      throw new Error("tenant telemetry activation adapter protocol is invalid");
+    }
+    digest(target.namespaceSha256, "tenant telemetry activation namespace");
+    digest(target.failureDomainSha256, "tenant telemetry activation failure domain");
+    if (domains.has(target.domain)) {
+      throw new Error("tenant telemetry activation target domain is duplicated");
+    }
+    if (namespaces.has(target.namespaceSha256)) {
+      throw new Error("tenant telemetry activation target namespace is duplicated");
+    }
+    domains.add(target.domain);
+    namespaces.add(target.namespaceSha256);
+  }
+  if (!domains.has("logs") || !domains.has("traces")) {
+    throw new Error("tenant telemetry activation target set is incomplete");
+  }
+}
+
+function activationTargetSortKey(target: ActivateTenantTelemetryTargetInput): number {
+  return target.domain === "logs" ? 0 : 1;
+}
+
+export function tenantTelemetryLifecycleActivationRequestSha256(
+  input: ActivateTenantTelemetryLifecycleInput,
+  refKeyIdSha256: string,
+): string {
+  validateActivateTenantTelemetryLifecycleInput(input);
+  digest(refKeyIdSha256, "tenant telemetry activation ref key id");
+  const targets = [...input.targets]
+    .sort((left, right) => activationTargetSortKey(left) - activationTargetSortKey(right));
+  return sha256([
+    "tenant-telemetry-lifecycle-activation-request-v1",
+    input.expectedControlGeneration,
+    refKeyIdSha256,
+    targets.map((target) => [
+      target.domain,
+      target.backendKind,
+      target.adapterProtocol,
+      target.namespaceSha256,
+      target.failureDomainSha256,
+    ]),
+  ]);
+}
+
+export function tenantTelemetryLifecycleCoverageRootSha256(
+  coverages: readonly TenantTelemetryLifecycleCoverageRecord[],
+): string {
+  if (!Array.isArray(coverages)) {
+    throw new Error("tenant telemetry lifecycle coverage set is invalid");
+  }
+  const tenants = new Set<string>();
+  const refs = new Set<string>();
+  const ordered = [...coverages].sort((left, right) =>
+    Buffer.compare(Buffer.from(left.tenantId, "utf8"), Buffer.from(right.tenantId, "utf8")));
+  for (const coverage of ordered) {
+    validateTenantTelemetryLifecycleCoverage(coverage);
+    if (tenants.has(coverage.tenantId) || refs.has(coverage.subjectRefSha256)) {
+      throw new Error("tenant telemetry lifecycle coverage set is duplicated");
+    }
+    tenants.add(coverage.tenantId);
+    refs.add(coverage.subjectRefSha256);
+  }
+  return sha256([
+    "tenant-telemetry-lifecycle-coverage-root-v1",
+    ...ordered.map((coverage) => coverage.evidenceSha256),
+  ]);
+}
+
+export interface TenantTelemetryLifecycleActivationReceiptBody {
+  singletonId: typeof TENANT_TELEMETRY_LIFECYCLE_CONTROL_SINGLETON_ID;
+  controlGeneration: 1;
+  scope: typeof TENANT_TELEMETRY_LIFECYCLE_ACTIVATION_SCOPE;
+  requestSha256: string;
+  refKeyIdSha256: string;
+  targetCount: 2;
+  targetRootSha256: string;
+  coverageCount: number;
+  coverageRootSha256: string;
+  controlEvidenceSha256: string;
+  activatedAtDbMs: number;
+}
+
+export interface TenantTelemetryLifecycleActivationReceipt
+  extends TenantTelemetryLifecycleActivationReceiptBody {
+  receiptSha256: string;
+}
+
+const ACTIVATION_RECEIPT_BODY_KEYS = [
+  "singletonId",
+  "controlGeneration",
+  "scope",
+  "requestSha256",
+  "refKeyIdSha256",
+  "targetCount",
+  "targetRootSha256",
+  "coverageCount",
+  "coverageRootSha256",
+  "controlEvidenceSha256",
+  "activatedAtDbMs",
+] as const;
+
+export function tenantTelemetryLifecycleActivationReceiptSha256(
+  receipt: TenantTelemetryLifecycleActivationReceiptBody,
+): string {
+  exactKeys(
+    receipt,
+    ACTIVATION_RECEIPT_BODY_KEYS,
+    "tenant telemetry lifecycle activation receipt",
+  );
+  if (receipt.singletonId !== TENANT_TELEMETRY_LIFECYCLE_CONTROL_SINGLETON_ID
+    || receipt.controlGeneration !== 1
+    || receipt.scope !== TENANT_TELEMETRY_LIFECYCLE_ACTIVATION_SCOPE
+    || receipt.targetCount !== 2) {
+    throw new Error("tenant telemetry lifecycle activation receipt protocol is invalid");
+  }
+  digest(receipt.requestSha256, "tenant telemetry activation request");
+  digest(receipt.refKeyIdSha256, "tenant telemetry activation ref key id");
+  digest(receipt.targetRootSha256, "tenant telemetry activation target root");
+  nonNegative(receipt.coverageCount, "tenant telemetry activation coverage count");
+  digest(receipt.coverageRootSha256, "tenant telemetry activation coverage root");
+  digest(receipt.controlEvidenceSha256, "tenant telemetry activation control evidence");
+  timestamp(receipt.activatedAtDbMs, "tenant telemetry activation receipt time");
+  return sha256([
+    "tenant-telemetry-lifecycle-activation-receipt-v1",
+    ...ACTIVATION_RECEIPT_BODY_KEYS.map((key) => receipt[key]),
+  ]);
+}
+
+export function validateTenantTelemetryLifecycleActivationReceipt(
+  receipt: TenantTelemetryLifecycleActivationReceipt,
+): void {
+  exactKeys(
+    receipt,
+    [...ACTIVATION_RECEIPT_BODY_KEYS, "receiptSha256"],
+    "tenant telemetry lifecycle activation receipt record",
+  );
+  digest(receipt.receiptSha256, "tenant telemetry activation receipt");
+  const { receiptSha256, ...body } = receipt;
+  if (receiptSha256 !== tenantTelemetryLifecycleActivationReceiptSha256(body)) {
+    throw new Error("tenant telemetry activation receipt mismatch");
+  }
+}
+
+export interface TenantTelemetryLifecycleActivationResult {
+  control: ActiveTenantTelemetryLifecycleControlRecord;
+  targets: TenantTelemetryLifecycleTargetRecord[];
+  receipt: TenantTelemetryLifecycleActivationReceipt;
+}
+
+export interface RegisterTenantTelemetryCoverageInput {
+  tenantId: string;
+  expectedControlGeneration: 1;
+  historyStatus: "complete_since_creation";
+}
+
+const REGISTER_COVERAGE_INPUT_KEYS = [
+  "tenantId",
+  "expectedControlGeneration",
+  "historyStatus",
+] as const;
+
+export function validateRegisterTenantTelemetryCoverageInput(
+  input: RegisterTenantTelemetryCoverageInput,
+): void {
+  exactKeys(input, REGISTER_COVERAGE_INPUT_KEYS, "tenant telemetry coverage registration input");
+  tenantId(input.tenantId);
+  if (input.expectedControlGeneration !== 1
+    || input.historyStatus !== "complete_since_creation") {
+    throw new Error("tenant telemetry coverage registration protocol is invalid");
+  }
+}
+
+export const TENANT_TELEMETRY_OWNER_KINDS = ["tenant", "user", "session"] as const;
+export type TenantTelemetryOwnerKind = (typeof TENANT_TELEMETRY_OWNER_KINDS)[number];
+
+export interface RegisterTenantTelemetryArtifactInput {
+  tenantId: string;
+  expectedControlGeneration: 1;
+  domain: TenantTelemetryDomain;
+  artifactIdSha256: string;
+  artifactGeneration: number;
+  ownerKind: TenantTelemetryOwnerKind;
+  ownerId: string;
+  ownerUserId: string | null;
+  sourceSchema: string;
+  sourceGeneration: number;
+  sourceHighWaterDbMs: number;
+  payloadSha256: string;
+  manifestSha256: string;
+}
+
+const REGISTER_ARTIFACT_INPUT_KEYS = [
+  "tenantId",
+  "expectedControlGeneration",
+  "domain",
+  "artifactIdSha256",
+  "artifactGeneration",
+  "ownerKind",
+  "ownerId",
+  "ownerUserId",
+  "sourceSchema",
+  "sourceGeneration",
+  "sourceHighWaterDbMs",
+  "payloadSha256",
+  "manifestSha256",
+] as const;
+
+export function validateRegisterTenantTelemetryArtifactInput(
+  input: RegisterTenantTelemetryArtifactInput,
+): void {
+  exactKeys(input, REGISTER_ARTIFACT_INPUT_KEYS, "tenant telemetry artifact registration input");
+  tenantId(input.tenantId);
+  if (input.expectedControlGeneration !== 1
+    || !(TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(input.domain)) {
+    throw new Error("tenant telemetry artifact registration protocol is invalid");
+  }
+  digest(input.artifactIdSha256, "tenant telemetry artifact id");
+  positive(input.artifactGeneration, "tenant telemetry artifact generation");
+  if (!(TENANT_TELEMETRY_OWNER_KINDS as readonly unknown[]).includes(input.ownerKind)) {
+    throw new Error("tenant telemetry artifact owner kind is invalid");
+  }
+  if (typeof input.ownerId !== "string" || input.ownerId.length < 1 || input.ownerId.length > 128) {
+    throw new Error("tenant telemetry artifact owner id is invalid");
+  }
+  if (input.ownerKind === "tenant") {
+    if (input.ownerId !== input.tenantId || input.ownerUserId !== null) {
+      throw new Error("tenant telemetry tenant owner must match the tenant id");
+    }
+  } else {
+    if (typeof input.ownerUserId !== "string"
+      || input.ownerUserId.length < 1
+      || input.ownerUserId.length > 128) {
+      throw new Error("tenant telemetry artifact owner user id is invalid");
+    }
+    if (input.ownerKind === "user" && input.ownerUserId !== input.ownerId) {
+      throw new Error("tenant telemetry user owner must match the owner user id");
+    }
+  }
+  if (!SOURCE_SCHEMA.test(input.sourceSchema)) {
+    throw new Error("tenant telemetry artifact source schema is invalid");
+  }
+  nonNegative(input.sourceGeneration, "tenant telemetry artifact source generation");
+  timestamp(input.sourceHighWaterDbMs, "tenant telemetry artifact source high-water");
+  digest(input.payloadSha256, "tenant telemetry artifact payload");
+  digest(input.manifestSha256, "tenant telemetry artifact manifest");
+}
+
+export function tenantTelemetryRefKeyIdSha256(refKey: Uint8Array): string {
+  if (!(refKey instanceof Uint8Array) || refKey.byteLength !== 32) {
+    throw new Error("tenant telemetry ref key must contain exactly 32 bytes");
+  }
+  return createHash("sha256")
+    .update("agent-service/tenant-telemetry-ref-key-id/v1\0", "utf8")
+    .update(refKey)
+    .digest("hex");
+}
+
+export function tenantTelemetryOwnerRefSha256(
+  ownerKind: TenantTelemetryOwnerKind,
+  rawOwnerId: string,
+  refKey: Uint8Array,
+): string {
+  if (!(TENANT_TELEMETRY_OWNER_KINDS as readonly unknown[]).includes(ownerKind)) {
+    throw new Error("tenant telemetry owner kind is invalid");
+  }
+  if (typeof rawOwnerId !== "string" || rawOwnerId.length < 1 || rawOwnerId.length > 128) {
+    throw new Error("tenant telemetry owner id is invalid");
+  }
+  tenantTelemetryRefKeyIdSha256(refKey);
+  return telemetryOpaqueRefSha256(ownerKind, rawOwnerId, refKey);
+}
+
+export interface TenantTelemetryArtifactInventoryBody {
+  inventorySha256: string;
+  tenantId: string;
+  controlGeneration: 1;
+  scope: typeof TENANT_TELEMETRY_ARTIFACT_INVENTORY_SCOPE;
+  domain: TenantTelemetryDomain;
+  targetSha256: string;
+  artifactIdSha256: string;
+  artifactGeneration: number;
+  ownerKind: TenantTelemetryOwnerKind;
+  tenantRefSha256: string;
+  ownerRefSha256: string;
+  holdSubjectRefSha256: string;
+  coverageEvidenceSha256: string;
+  historyStatus: TenantTelemetryHistoryStatus;
+  writerProtocol: typeof TENANT_TELEMETRY_WRITER_PROTOCOL;
+  writerGeneration: 1;
+  sourceSchema: string;
+  sourceGeneration: number;
+  sourceHighWaterDbMs: number;
+  payloadSha256: string;
+  manifestSha256: string;
+  retentionClass: typeof TENANT_TELEMETRY_RETENTION_CLASS;
+  retentionPolicyControlGeneration: number;
+  retentionPolicySha256: string | null;
+  disposeAfterDbMs: number | null;
+  tenantHoldControlGeneration: number;
+  tenantHoldProjectionSha256: string;
+  ownerHoldControlGeneration: number;
+  ownerHoldProjectionSha256: string;
+  restoreControlGeneration: number;
+  restoreLineageKind: "inactive" | "primary" | "restore";
+  restoreUpdatedAtDbMs: number;
+  runtimeEpochSha256: string | null;
+  createdAtDbMs: number;
+}
+
+export interface TenantTelemetryArtifactInventoryRecord
+  extends TenantTelemetryArtifactInventoryBody {
+  receiptSha256: string;
+}
+
+const ARTIFACT_INVENTORY_BODY_KEYS = [
+  "inventorySha256",
+  "tenantId",
+  "controlGeneration",
+  "scope",
+  "domain",
+  "targetSha256",
+  "artifactIdSha256",
+  "artifactGeneration",
+  "ownerKind",
+  "tenantRefSha256",
+  "ownerRefSha256",
+  "holdSubjectRefSha256",
+  "coverageEvidenceSha256",
+  "historyStatus",
+  "writerProtocol",
+  "writerGeneration",
+  "sourceSchema",
+  "sourceGeneration",
+  "sourceHighWaterDbMs",
+  "payloadSha256",
+  "manifestSha256",
+  "retentionClass",
+  "retentionPolicyControlGeneration",
+  "retentionPolicySha256",
+  "disposeAfterDbMs",
+  "tenantHoldControlGeneration",
+  "tenantHoldProjectionSha256",
+  "ownerHoldControlGeneration",
+  "ownerHoldProjectionSha256",
+  "restoreControlGeneration",
+  "restoreLineageKind",
+  "restoreUpdatedAtDbMs",
+  "runtimeEpochSha256",
+  "createdAtDbMs",
+] as const;
+
+export function tenantTelemetryArtifactInventorySha256(input: Pick<
+  TenantTelemetryArtifactInventoryBody,
+  | "tenantId"
+  | "controlGeneration"
+  | "domain"
+  | "targetSha256"
+  | "artifactIdSha256"
+  | "artifactGeneration"
+  | "ownerKind"
+  | "tenantRefSha256"
+  | "ownerRefSha256"
+>): string {
+  if (input.controlGeneration !== 1
+    || !(TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(input.domain)) {
+    throw new Error("tenant telemetry artifact inventory identity protocol is invalid");
+  }
+  digest(input.targetSha256, "tenant telemetry inventory target");
+  digest(input.artifactIdSha256, "tenant telemetry inventory artifact id");
+  tenantId(input.tenantId);
+  if (!(TENANT_TELEMETRY_OWNER_KINDS as readonly unknown[]).includes(input.ownerKind)) {
+    throw new Error("tenant telemetry inventory owner kind is invalid");
+  }
+  digest(input.tenantRefSha256, "tenant telemetry inventory tenant ref");
+  digest(input.ownerRefSha256, "tenant telemetry inventory owner ref");
+  positive(input.artifactGeneration, "tenant telemetry inventory artifact generation");
+  return sha256([
+    "tenant-telemetry-artifact-inventory-identity-v1",
+    input.tenantId,
+    input.controlGeneration,
+    input.domain,
+    input.targetSha256,
+    input.artifactIdSha256,
+    input.artifactGeneration,
+    input.ownerKind,
+    input.tenantRefSha256,
+    input.ownerRefSha256,
+  ]);
+}
+
+export function tenantTelemetryArtifactInventoryReceiptSha256(
+  inventory: TenantTelemetryArtifactInventoryBody,
+): string {
+  exactKeys(inventory, ARTIFACT_INVENTORY_BODY_KEYS, "tenant telemetry artifact inventory receipt");
+  digest(inventory.inventorySha256, "tenant telemetry inventory identity");
+  tenantId(inventory.tenantId);
+  if (inventory.controlGeneration !== 1
+    || inventory.scope !== TENANT_TELEMETRY_ARTIFACT_INVENTORY_SCOPE
+    || !(TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(inventory.domain)
+    || !(TENANT_TELEMETRY_OWNER_KINDS as readonly unknown[]).includes(inventory.ownerKind)
+    || inventory.writerProtocol !== TENANT_TELEMETRY_WRITER_PROTOCOL
+    || inventory.writerGeneration !== 1
+    || inventory.retentionClass !== TENANT_TELEMETRY_RETENTION_CLASS) {
+    throw new Error("tenant telemetry artifact inventory protocol is invalid");
+  }
+  digest(inventory.targetSha256, "tenant telemetry inventory target");
+  digest(inventory.artifactIdSha256, "tenant telemetry inventory artifact id");
+  positive(inventory.artifactGeneration, "tenant telemetry inventory artifact generation");
+  digest(inventory.tenantRefSha256, "tenant telemetry inventory tenant ref");
+  digest(inventory.ownerRefSha256, "tenant telemetry inventory owner ref");
+  digest(inventory.holdSubjectRefSha256, "tenant telemetry inventory hold subject ref");
+  digest(inventory.coverageEvidenceSha256, "tenant telemetry inventory coverage evidence");
+  historyStatus(inventory.historyStatus);
+  if (inventory.ownerKind === "tenant") {
+    if (inventory.ownerRefSha256 !== inventory.tenantRefSha256
+      || inventory.holdSubjectRefSha256 !== inventory.tenantRefSha256) {
+      throw new Error("tenant telemetry inventory tenant owner ref is invalid");
+    }
+  } else if (inventory.ownerKind === "user"
+    && inventory.ownerRefSha256 !== inventory.holdSubjectRefSha256) {
+    throw new Error("tenant telemetry inventory user hold subject ref is invalid");
+  }
+  if (!SOURCE_SCHEMA.test(inventory.sourceSchema)) {
+    throw new Error("tenant telemetry inventory source schema is invalid");
+  }
+  nonNegative(inventory.sourceGeneration, "tenant telemetry inventory source generation");
+  timestamp(inventory.sourceHighWaterDbMs, "tenant telemetry inventory source high-water");
+  digest(inventory.payloadSha256, "tenant telemetry inventory payload");
+  digest(inventory.manifestSha256, "tenant telemetry inventory manifest");
+  nonNegative(
+    inventory.retentionPolicyControlGeneration,
+    "tenant telemetry inventory retention generation",
+  );
+  if (inventory.disposeAfterDbMs !== null) {
+    throw new Error("tenant telemetry retention is not configured for disposal");
+  }
+  if (inventory.retentionPolicySha256 === null) {
+    if (inventory.retentionPolicyControlGeneration !== 0) {
+      throw new Error("tenant telemetry inventory inactive retention binding is invalid");
+    }
+  } else {
+    positive(
+      inventory.retentionPolicyControlGeneration,
+      "tenant telemetry inventory active retention generation",
+    );
+    digest(inventory.retentionPolicySha256, "tenant telemetry inventory retention policy");
+  }
+  nonNegative(inventory.tenantHoldControlGeneration, "tenant telemetry tenant hold generation");
+  digest(inventory.tenantHoldProjectionSha256, "tenant telemetry tenant hold projection");
+  nonNegative(inventory.ownerHoldControlGeneration, "tenant telemetry owner hold generation");
+  digest(inventory.ownerHoldProjectionSha256, "tenant telemetry owner hold projection");
+  nonNegative(inventory.restoreControlGeneration, "tenant telemetry restore generation");
+  timestamp(inventory.restoreUpdatedAtDbMs, "tenant telemetry restore update time");
+  if (inventory.runtimeEpochSha256 === null) {
+    if (inventory.restoreControlGeneration !== 0
+      || inventory.restoreLineageKind !== "inactive"
+      || inventory.restoreUpdatedAtDbMs !== 0) {
+      throw new Error("tenant telemetry inactive restore binding is invalid");
+    }
+  } else {
+    positive(inventory.restoreControlGeneration, "tenant telemetry active restore generation");
+    digest(inventory.runtimeEpochSha256, "tenant telemetry runtime epoch");
+    if (inventory.restoreLineageKind !== "primary"
+      && inventory.restoreLineageKind !== "restore") {
+      throw new Error("tenant telemetry active restore lineage is invalid");
+    }
+    if (inventory.restoreUpdatedAtDbMs > inventory.createdAtDbMs) {
+      throw new Error("tenant telemetry restore high-water exceeds creation time");
+    }
+  }
+  timestamp(inventory.createdAtDbMs, "tenant telemetry inventory creation time");
+  if (inventory.sourceHighWaterDbMs > inventory.createdAtDbMs) {
+    throw new Error("tenant telemetry inventory source high-water exceeds creation time");
+  }
+  const expectedIdentity = tenantTelemetryArtifactInventorySha256(inventory);
+  if (inventory.inventorySha256 !== expectedIdentity) {
+    throw new Error("tenant telemetry artifact inventory identity mismatch");
+  }
+  return sha256([
+    "tenant-telemetry-artifact-inventory-receipt-v1",
+    ...ARTIFACT_INVENTORY_BODY_KEYS.map((key) => inventory[key]),
+  ]);
+}
+
+export function validateTenantTelemetryArtifactInventory(
+  inventory: TenantTelemetryArtifactInventoryRecord,
+): void {
+  exactKeys(
+    inventory,
+    [...ARTIFACT_INVENTORY_BODY_KEYS, "receiptSha256"],
+    "tenant telemetry artifact inventory record",
+  );
+  digest(inventory.receiptSha256, "tenant telemetry artifact inventory receipt");
+  const { receiptSha256, ...body } = inventory;
+  if (receiptSha256 !== tenantTelemetryArtifactInventoryReceiptSha256(body)) {
+    throw new Error("tenant telemetry artifact inventory receipt mismatch");
+  }
+}
+
+export interface TenantTelemetryLifecycleStore {
+  getTenantTelemetryLifecycleControl(): Promise<TenantTelemetryLifecycleControlRecord>;
+  listTenantTelemetryLifecycleTargets(): Promise<TenantTelemetryLifecycleTargetRecord[]>;
+  getTenantTelemetryLifecycleCoverage(
+    tenantId: string,
+  ): Promise<TenantTelemetryLifecycleCoverageRecord | null>;
+  activateTenantTelemetryLifecycle(
+    input: ActivateTenantTelemetryLifecycleInput,
+  ): Promise<TenantTelemetryLifecycleActivationResult>;
+  registerTenantTelemetryCoverage(
+    input: RegisterTenantTelemetryCoverageInput,
+  ): Promise<TenantTelemetryLifecycleCoverageRecord>;
+  registerTenantTelemetryArtifact(
+    input: RegisterTenantTelemetryArtifactInput,
+  ): Promise<TenantTelemetryArtifactInventoryRecord>;
+  getTenantTelemetryArtifact(
+    tenantId: string,
+    domain: TenantTelemetryDomain,
+    artifactIdSha256: string,
+    artifactGeneration: number,
+  ): Promise<TenantTelemetryArtifactInventoryRecord | null>;
 }

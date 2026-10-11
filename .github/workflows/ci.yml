@@ -95,16 +95,25 @@ jobs:
       - name: Typecheck (sources and tests)
         run: pnpm typecheck
 
-      # Keep the content-free logs/traces ownership contract visible. This is the default-dormant
-      # 0032 inventory/evidence layer only; external sink deletion remains deliberately unclaimed.
+      # Keep the content-free logs/traces ownership contract visible. The 0033 activation/store
+      # substrate remains default-dormant; external sink deletion remains deliberately unclaimed.
       - name: Tenant telemetry lifecycle evidence suite (must execute)
-        run: pnpm run test:tenant-telemetry-lifecycle
+        run: |
+          pnpm run test:tenant-telemetry-lifecycle
+          pnpm run test:tenant-telemetry-lifecycle-memory
 
       - name: Create test databases
         run: |
           mysql -h 127.0.0.1 -uroot -e "
             CREATE DATABASE IF NOT EXISTS agent_service_test CHARACTER SET utf8mb4;
             CREATE DATABASE IF NOT EXISTS agent_service_cluster CHARACTER SET utf8mb4;"
+
+      # 0033 activation/coverage/inventory correctness must execute against real InnoDB; the
+      # unit evidence suite above cannot prove transaction rollback or cross-connection races.
+      - name: Tenant telemetry lifecycle real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-telemetry-lifecycle-mysql
 
       # Unit + store conformance (both backends) + HTTP + dialect tests against the fake vendor.
       # Coverage thresholds live in vitest.config.ts and fail the job on a regression.
@@ -416,7 +425,7 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:user-data-export-mysql
 
-      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0032
+      # These are historical-database upgrades, not fresh-schema tests. The 0007 through 0033
       # baselines used by each upgrade are frozen SQL snapshots; the wrapper rejects any
       # missing/skipped fixture, including the 0014 -> 0015 policy/hold, 0015 -> 0016
       # purge-policy authority, 0016 -> 0017 user-export and 0018 -> 0019 inert tenant credential
@@ -426,8 +435,9 @@ jobs:
       # credential-lifecycle inventory, 0026 -> 0027 blob-storage control and 0027 -> 0028
       # offline-mover ledger, 0028 -> 0029 dormant credential-target execution, 0029 -> 0030
       # independent restore-journal/runtime-lineage, 0030 -> 0031 authoritative backup-catalog and
-      # 0031 -> 0032 default-dormant telemetry inventory replay matrices.
-      - name: Historical MySQL migrations (0007 through 0032, no skips)
+      # 0031 -> 0032 default-dormant telemetry inventory and 0032 -> 0033 receipt/inventory
+      # activation replay matrices.
+      - name: Historical MySQL migrations (0007 through 0033, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -584,6 +594,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0030_tenant_restore_journal.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0031_authoritative_backup_catalog.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0032_tenant_telemetry_lifecycle.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0033_tenant_telemetry_activation_inventory.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

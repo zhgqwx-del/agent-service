@@ -5,10 +5,10 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2、T3a、T3b、非破坏性 T3c/T3d、T3e 本地执行/物理 ACK、T3f 本地数据库内容/控制投影清理与 T3g session-scoped Redis状态清理均已进入本地/CI基线。`0022`固定33域plan；`0023`闭合local usage/Blob/export切片；`0024`原子清理11个本地数据库投影并留下永久session grave；`0025`以真实Redis Lua清理lease/owner、fence与stream并安装防复活marker；`0026`建立default-dormant的versioned credential lifecycle inventory；`0027`安装write-once Blob storage control与共享S3-compatible/MinIO adapter；`0028`安装default-dormant的离线filesystem→S3迁移账本及runner镜像内的一次性mover；`0029`安装default-dormant external-credential目标执行账本、runner worker和fresh fleet gate；`0030`安装default-dormant的独立tenant restore journal、runtime lineage、永久恢复fence和一次性reconcile CLI；`0031`安装default-dormant权威backup catalog；`0032`再安装default-dormant、expand-only的logs/traces target、tenant coverage与T1-bound subject inventory substrate。runtime入口同时改为固定event/字段allowlist、keyed opaque owner ref和严格W3C v00 trace propagation，默认runner组合也丢弃旧core logger的全部动态参数；失权安全记账先于无字段、单次`runner.runtime.ownership_lost`，观测异常不会改变fence/abort语义；first-admin key只写create-only `0600`且完成文件/父目录fsync，不再进入stdout/stderr。0031不负责创建物理数据库备份，0032也不激活writer tracking、不连接sink、不删除遥测。当前0029仍只有`STORE=memory`可用的非生产fake adapter；真实provider/KMS、telemetry activation/adapter/delete ACK/restore replay、generic user物理purge、备份生产器和真实独立故障域/managed IAM/KMS/容量/维护窗口验收，以及全域completion仍未闭环。公开status保持`gated`、`dataPurgeExecution=false`，因此M1仍未冻结。
+- **M1 单节点 runner MVP**：核心运行链路、OpenAPI/SDK、Archive/tombstone/outbox/Blob lifecycle、usage 财务分层、canonical retention policy / multi legal hold、非破坏性 purge-policy evaluator，以及异步 user export artifact/download/TTL 均已完成。tenant erasure 的 T1/T2、T3a、T3b、非破坏性 T3c/T3d、T3e 本地执行/物理 ACK、T3f 本地数据库内容/控制投影清理与 T3g session-scoped Redis状态清理均已进入本地/CI基线。`0022`固定33域plan；`0023`闭合local usage/Blob/export切片；`0024`原子清理11个本地数据库投影并留下永久session grave；`0025`以真实Redis Lua清理lease/owner、fence与stream并安装防复活marker；`0026`建立default-dormant的versioned credential lifecycle inventory；`0027`安装write-once Blob storage control与共享S3-compatible/MinIO adapter；`0028`安装default-dormant的离线filesystem→S3迁移账本及runner镜像内的一次性mover；`0029`安装default-dormant external-credential目标执行账本、runner worker和fresh fleet gate；`0030`安装default-dormant的独立tenant restore journal、runtime lineage、永久恢复fence和一次性reconcile CLI；`0031`安装default-dormant权威backup catalog；`0032`安装logs/traces lifecycle schema，`0033`再补齐Memory/MySQL原子activation、receipt、per-tenant coverage与immutable artifact inventory。activation绑定精确32-byte受保护ref key、固定logs/traces双target和全部既有tenant的legacy gap；激活后每个新tenant必须与coverage同一原子边界创建，mixed-writer缺口、receipt丢失、跨owner或跨tenant写入均fail closed。runtime入口同时使用固定event/字段allowlist、keyed opaque owner ref和严格W3C v00 trace propagation；first-admin key只写create-only `0600`文件。0033仍默认休眠，不连接sink、不执行删除或恢复，也不新增服务、进程、bundle或镜像。当前0029仍只有`STORE=memory`可用的非生产fake adapter；真实provider/KMS、telemetry sink adapter/delete ACK/restore replay、generic user物理purge、备份生产器和真实独立故障域/managed IAM/KMS/容量/维护窗口验收，以及全域completion仍未闭环。公开status保持`gated`、`dataPurgeExecution=false`，因此M1仍未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
-- **M4 生产化**（配额、可观测性、限流）：主体尚未开始；Docker、CI、本地运维，以及安全结构化遥测/trace入口和0032 inventory地基已经具备，但还没有受管sink、metrics/SLO/alert、限流/配额或生产环境验收。
+- **M4 生产化**（配额、可观测性、限流）：主体尚未开始；Docker、CI、本地运维，以及安全结构化遥测/trace入口和0032/0033 lifecycle inventory地基已经具备，但还没有受管sink、metrics/SLO/alert、限流/配额或生产环境验收。
 
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
@@ -62,8 +62,10 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0031 → 0032 的真实 MySQL 历史升级夹具
-pnpm test:tenant-telemetry-lifecycle          # 强制执行0032 content-free target/control/coverage/subject证据契约
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0032 → 0033 的真实 MySQL 历史升级夹具
+pnpm test:tenant-telemetry-lifecycle          # 0032/0033 content-free evidence helper
+pnpm test:tenant-telemetry-lifecycle-memory   # 0033 Memory activation/coverage/inventory原子语义
+pnpm test:tenant-telemetry-lifecycle-mysql    # 0033真实InnoDB回滚、并发、重启与隔离语义
 pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
 pnpm test:blob-storage-control-memory         # 强制执行 0027 Memory write-once cutover/回滚/并发套件
 pnpm test:blob-storage-control-mysql          # 强制执行 0027 真实InnoDB inventory/回滚/并发套件
@@ -145,7 +147,7 @@ scripts/local-service.sh verify-s3
 
 第一次以S3启动会把当前MySQL的`blob_storage_control`从generation `0`不可逆激活到`1`，因此直接切换只适合空库或所有live对象本来就已经使用该namespace的可丢弃数据库。已有filesystem对象的非空库必须完全停服并使用`0028`的一次性mover；`run`默认只推进到`verified`，只有显式`BLOB_MIGRATION_COMMIT=1`才cutover，而且source cleanup始终需要单独命令。统一脚本会让调用方显式提供的mover配置（包括显式空值和`AWS_*` provider-chain变量）优先于`.env`，避免本地默认值静默改写维护目标，同时不会打印这些值。激活后不能改回filesystem，也不能复用abort过的bucket/prefix/namespace id。详细演练见`docs/operations/development-and-ci-guide.md`，生产操作边界见`docs/operations/local-and-deployment.md`。生产的`BLOB_S3_PRIVATE_BUCKET_ACK=1`只是操作者在独立验证匿名访问被拒、IAM/policy正确之后作出的确认，不是应用自动证明；本地MinIO保持`0`，真实MinIO套件会另行执行匿名raw GET拒绝检查。
 
-详细配置与未来 staging/production 部署契约见 `docs/operations/local-and-deployment.md`；安全日志、trace和0032生命周期边界见`docs/design/05-observability.md`；面向项目学习、手动体验和 CI 构建产物的完整说明见 `docs/operations/development-and-ci-guide.md`。
+详细配置与未来 staging/production 部署契约见 `docs/operations/local-and-deployment.md`；安全日志、trace和0032/0033生命周期边界见`docs/design/05-observability.md`；面向项目学习、手动体验和 CI 构建产物的完整说明见 `docs/operations/development-and-ci-guide.md`。
 
 ## 部署形态
 

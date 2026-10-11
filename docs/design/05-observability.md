@@ -1,7 +1,8 @@
 # 可观测性、安全遥测与生命周期边界
 
-> 状态：入口安全基线与 default-dormant、expand-only 的 `0032` inventory substrate 已实现；
-> activation/store API、sink adapter、删除 worker/ACK 与 completion 仍待后续 `0033+` 切片。
+> 状态：入口安全基线、default-dormant 的 `0032` schema，以及 `0033` Memory/MySQL 原子
+> activation receipt、per-tenant coverage 与 immutable artifact inventory store 已实现；真实 sink
+> adapter、应用 writer 双写、删除 worker/ACK、restore replay 与 completion 仍待后续切片。
 > 本文定义 M1 数据生命周期需要的最小安全契约，以及 M4 完整可观测性平台的边界。
 
 ## 1. 目的
@@ -16,11 +17,12 @@ owner inventory、retention、legal hold 与删除 ACK，日志/追踪就会成�
 1. **入口安全基线**：router/runner 进程启动、关闭、bootstrap 和顶层失败只能向
    stdout/stderr 写固定 JSON event code 与低敏布尔/计数字段；admin bootstrap secret 必须走
    create-only 文件通道。
-2. **`0032` inventory substrate**：已经安装 generation-0 control、固定 logs/traces target、per-tenant
-   coverage 与 T1-bound subject evidence 表及不可变 guards；migration不激活、不回填、不联网、不删除。
-3. **后续 `0033+` execution lifecycle**：实现原子 activation/store API、writer tracking、sink adapter、
-   删除或匿名化 operation、ACK、restore replay 与 terminal receipt。该层完成前，T3d 的 `logs` 和
-   `traces` 仍必须保持显式 blocker，全域 completion 仍为 `false`。
+2. **`0032`/`0033` lifecycle inventory**：`0032`安装 generation-0 control、固定 logs/traces target、
+   per-tenant coverage 与 T1-bound subject evidence；`0033`补齐原子 activation receipt、既有/新 tenant
+   coverage 及 immutable artifact inventory store。两条 migration 都不激活、不回填、不联网、不删除。
+3. **后续 execution lifecycle**：把应用 writer 接到 inventory，提供真实 sink adapter、删除或匿名化
+   operation、ACK、restore replay 与 terminal receipt。该层完成前，T3d 的 `logs` 和 `traces` 仍必须
+   保持显式 blocker，全域 completion 仍为 `false`。
 
 本文不把日志系统等同于监控系统，也不因本机输出了 JSON 就宣称 M4 可观测性已经完成。
 
@@ -69,7 +71,8 @@ URL、provider ID、locator、异常 message/stack 或 secret 交给 process log
 - 所有第三方provider SDK、Node runtime或依赖库绕过应用logger的输出都已经迁移；
 - stdout/stderr 已经是可删除的受管日志后端；
 - trace context 已覆盖所有后台 worker、SSE resume/link、消息总线或持久任务恢复；
-- log/trace owner inventory、retention、legal hold、物理删除或 restore replay 已实现；
+- stdout/trace exporter 已接入 durable inventory，或 retention/legal hold 已形成可执行处置策略；
+- log/trace 物理删除、ACK 或 restore replay 已实现；
 - dashboard、metrics、SLO、alert、sampling、容量或成本治理已实现。
 
 ## 3. 入口事件目录
@@ -226,7 +229,7 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 5. context使用 `AsyncLocalStorage` 限定在当前异步 request链；structured telemetry可附带当前随机
    trace/span ID，但错误仍只能使用固定 code和 `errorKind`。
 
-后续 `0033+`/M4 仍需完成：
+后续 lifecycle execution / M4 仍需完成：
 
 6. SSE reconnect、turn resume 与队列 worker 使用 span link 连接旧 context；durable operation identity 仍由
    store 协议定义，不能用 trace ID 充当 idempotency key、claim token 或授权证明。
@@ -238,7 +241,7 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 10. exporter 失败不能阻塞普通 runtime，也不能让 destructive lifecycle action在缺 ACK 时伪装成功；安全
     审计/erasure proof使用独立 durable ledger，不以“trace 已发送”代替。
 
-## 8. `0032` 基座与后续 lifecycle execution
+## 8. `0032`/`0033` inventory 与后续 lifecycle execution
 
 ### 8.1 `0032` 已实现的 default-dormant substrate
 
@@ -257,18 +260,28 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 迁移包含engine/collation/column/index/CHECK/FK fingerprint和append-only/write-once triggers，并已通过
 真实 MySQL smoke验证 control、targets、coverages、subjects的约束行为。它明确不会：配置 sink、生成
 subject ref、扫描/回填历史、激活 writer、materialize purge job、调用网络、删除日志/追踪或推进任何
-erasure/completion。当前长期进程也没有对应 activation/store API，因此 generation `0`是唯一可用状态。
+erasure/completion。`0033`虽提供显式store API，长期router/runner仍未把它接成启动gate或sink writer；
+因此标准应用装配继续保持 generation `0`。
 
-已有 tenant不会自动获得 coverage；未来 activation必须显式记录 legacy gap，不能把 migration成功解释成
-“历史日志完整可枚举”。T3d 当前继续输出 logs/traces blocker是正确行为。
+已有 tenant不会因migration自动获得 coverage；只有显式调用`0033` activation store时，才会把当时全部
+canonical tenant记为`legacy_history_unknown`。不能把migration成功或legacy coverage解释成“历史日志完整
+可枚举”。T3d 当前继续输出 logs/traces blocker是正确行为。
 
-### 8.2 后续 activation 与 durable inventory
+### 8.2 `0033` 已实现的原子 activation 与 durable inventory
 
-后续 `0033+` 先实现 Memory/MySQL原子 store：在同一Memory publication或InnoDB事务中写入两个精确
-target、所有 activation-required coverage，再 CAS control `0 -> 1`。失败、并发 loser、SQL rollback或
-响应丢失不能留下部分 target/coverage/control；只允许 exact replay。
+`0033_tenant_telemetry_activation_inventory.sql`新增write-once activation receipt和immutable artifact
+inventory。Memory/MySQL store在同一Memory publication或`SERIALIZABLE` InnoDB事务中写入固定
+`logs`/`traces`双target、当时全部canonical tenant的`legacy_history_unknown` coverage、activation receipt，
+再推进control `0 -> 1`；activation绑定调用方持有的精确32-byte protected ref key及其key-id digest。失败、
+并发loser、序列化异常、SQL rollback或响应丢失不会留下部分target/coverage/receipt/control，只允许exact
+replay。
 
-tracking激活后，每个可持久化 log/trace artifact 或不可分割 batch至少登记：
+激活后，首次创建tenant的writer必须把tenant lifecycle和`complete_since_creation` coverage放在同一
+原子边界；已存在durable footprint却没有lifecycle、缺coverage、receipt丢失或key漂移均fail closed，公开
+coverage getter不会“顺手修复”缺口。MySQL启动会在一致性快照中重建activation request、target root、
+coverage root与source closure，并校验六张表的精确schema/trigger fingerprint。
+
+store contract允许tracking激活后为每个可持久化log/trace artifact或不可分割batch登记：
 
 - sink namespace/target 的 content-free identity；
 - artifact/batch immutable identity 与 generation；
@@ -279,9 +292,14 @@ tracking激活后，每个可持久化 log/trace artifact 或不可分割 batch�
 - legal-hold/retention policy binding；
 - restore lineage 与 source high-water。
 
-激活 tracking cutover 后，每个 durable writer必须以原子写或 exact-idempotent saga同步登记 inventory。
-未登记的 legacy 数据、未知 sink、source drift、跨 owner batch或无法重建的 locator 一律形成 blocker，不能
-用空集合解释成“没有日志”。
+artifact注册会重新核对active control、activation receipt、target、tenant coverage、owner/tenant隔离、
+retention/hold/restore binding及source high-water；同一external identity只允许exact replay。owner已gated/
+deleted后不得登记新artifact，但响应丢失后的exact replay仍可读取原receipt。inventory不保存正文、URL、
+header、credential或明文locator。
+
+当前应用logger/exporter尚未调用这个store contract，也没有真实sink adapter；所以还不能声称所有durable
+writer已双写。未登记的legacy数据、未知sink、source drift、跨owner batch或无法重建的locator仍必须形成
+blocker，不能用空集合解释成“没有日志”。
 
 ### 8.3 Adapter contract
 
@@ -316,17 +334,19 @@ adapter 至少需要固定语义：
 trace batch复活。尚未 ACK 的首次外部 mutation不能从旧快照猜造。0030/0031 的 journal/catalog只提供
 数据库恢复来源与 epoch authority，不自动证明日志平台、追踪平台或它们的 backup 已删除某 tenant/user。
 
-### 8.6 后续 rollout gate
+### 8.6 rollout gate
 
 建议沿用现有安全切片模式：
 
-1. expand-only migration，tracking/execution默认关闭；
-2. 发布理解 inventory 的 router/runner，执行 gate保持 `0`；
-3. 排空旧 writer，核对全部 configured fleet capability；
-4. 激活 writer tracking cutover，确认不存在未登记写入；
-5. 开启 runner worker并验证 adapter namespace identity；
-6. 最后开启 router destructive gate；
-7. 首个 inventory/ACK/cutover提交后只能 forward-fix。
+1. 应用`0032`/`0033` expand-only migration，tracking/execution默认关闭；
+2. 未来发布真正双写inventory且声明对应capability的router/runner，所有gate保持`0`；
+3. 排空旧writer，核对全部configured fleet与精确32-byte protected ref key identity；
+4. 由受控one-shot operator调用现有原子activation store，确认receipt/coverage及全fleet startup audit；
+5. 开启writer tracking，再开启runner worker并验证真实adapter namespace identity；
+6. 最后开启router destructive gate；
+7. 首个activation/inventory/ACK/cutover提交后只能forward-fix。
+
+现有长期应用没有步骤2、5、6所需的gate/adapter装配，因此生产环境不得仅凭store API存在就执行步骤4。
 
 ## 9. 本地与 CI 验收
 
@@ -341,9 +361,10 @@ trace batch复活。尚未 ACK 的首次外部 mutation不能从旧快照猜造�
 - router拒绝 runner-only output path；
 - runner/router started与draining只输出安全计数/布尔值。
 
-`0032` migration substrate已经有真实 MySQL smoke；它不能替代后续 store/executor测试。`0033+` 仍需
-Memory/MySQL activation成功、序列化失败、SQL rollback、concurrent winner、lease loss、legal-hold竞态、
-response-loss exact replay、cross-owner拒绝、历史升级、真实本地 adapter与required no-skip CI套件。
+`0032/0033` content-free入口/证据helper为**6/6**；`0033` Memory原子activation/coverage/inventory为**9/9**，真实MySQL
+事务回滚、并发、启动审计与隔离为**9/9**；`0032 -> 0033`历史迁移夹具为**6/6**。CI与本地verify均以
+命名required suite和no-skip断言证明这些套件实际执行。后续仍需应用writer双写、真实本地adapter、
+delete/ACK worker、lease loss、legal-hold destructive竞态、response-loss mutation replay与restore测试。
 
 ## 10. Staging / Production 边界
 

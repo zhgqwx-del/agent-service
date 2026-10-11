@@ -405,6 +405,11 @@ describe("MemorySessionStore tenant credential physical revocation", () => {
     const store = new MemorySessionStore({ now: () => 5_000 });
     const tenantId = "tenant-physical-admission-rollback";
     await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
+    const lifecycleBefore = await store.getSubjectLifecycle(tenantId, "tenant", tenantId);
+    expect(lifecycleBefore).not.toBeNull();
+    const telemetryCoveragesBefore = structuredClone([
+      ...store.tenantTelemetryLifecycleCoverages.entries(),
+    ]);
     const input = requestInput(tenantId, 4_900);
     const jobs = store.tenantCredentialRevocationJobs;
     const originalSet = jobs.set;
@@ -420,7 +425,10 @@ describe("MemorySessionStore tenant credential physical revocation", () => {
     expect(store.tenantCredentialRevocationFences).toHaveLength(0);
     expect(store.erasureAuditEvents).toHaveLength(0);
     expect(store.tenantCredentialRevocationJobs).toHaveLength(0);
-    expect(store.subjectLifecycles).toHaveLength(0);
+    expect(await store.getSubjectLifecycle(tenantId, "tenant", tenantId))
+      .toEqual(lifecycleBefore);
+    expect([...store.tenantTelemetryLifecycleCoverages.entries()])
+      .toEqual(telemetryCoveragesBefore);
     expect(await store.getTenantRuntimeState(tenantId)).toEqual({
       tenantId,
       state: "active",

@@ -378,6 +378,11 @@ describe("MemorySessionStore user data export", () => {
     const tenantId = "tenant-export-admission-rollback";
     const userId = "user-export-admission-rollback";
     await activatePolicy(store, tenantId);
+    const tenantLifecycleBefore = await store.getSubjectLifecycle(tenantId, "tenant", tenantId);
+    expect(tenantLifecycleBefore).not.toBeNull();
+    const telemetryCoveragesBefore = structuredClone([
+      ...store.tenantTelemetryLifecycleCoverages.entries(),
+    ]);
     const input = exportInput(tenantId, userId, "admission-rollback");
     const jobs = store.userDataExportJobs;
     const originalSet = jobs.set.bind(jobs);
@@ -398,7 +403,10 @@ describe("MemorySessionStore user data export", () => {
 
     expect(store.userDataExportRequests).toHaveLength(0);
     expect(store.userDataExportJobs).toHaveLength(0);
-    expect(await store.getSubjectLifecycle(tenantId, "tenant", tenantId)).toBeNull();
+    expect(await store.getSubjectLifecycle(tenantId, "tenant", tenantId))
+      .toEqual(tenantLifecycleBefore);
+    expect([...store.tenantTelemetryLifecycleCoverages.entries()])
+      .toEqual(telemetryCoveragesBefore);
     expect(await store.getSubjectLifecycle(tenantId, "user", userId)).toBeNull();
     await expect(store.requestUserDataExport(input)).resolves.toMatchObject({
       requestId: input.requestId,

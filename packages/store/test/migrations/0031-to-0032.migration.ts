@@ -12,6 +12,7 @@ const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = resolve(HERE, "../../migrations");
 const MIGRATION_NAME = "0032_tenant_telemetry_lifecycle.sql";
+const MIGRATION_SHA256 = "cce4794c74ed4cee7e0b7d57a4e90c44abc0f078e26a70b6c558e40ab3fba4a9";
 
 const FROZEN_0031_MIGRATIONS = [
   ["0001_init.sql", "4ddae03c6822ae65b8defc65d7c1a96f053f2b56e5442ac7ca9aacb2331d5026"],
@@ -96,6 +97,7 @@ describe("0031 -> 0032 tenant telemetry lifecycle migration", () => {
   let admin: Connection;
   let base: URL;
   let pre0032Dir: string;
+  let through0032Dir: string;
   let migrationSql: string;
   const disposableDatabases = new Set<string>();
 
@@ -105,12 +107,18 @@ describe("0031 -> 0032 tenant telemetry lifecycle migration", () => {
     adminUrl.pathname = "/";
     admin = await mysql.createConnection(adminUrl.toString());
     pre0032Dir = await mkdtemp(join(tmpdir(), "agent-service-pre0032-"));
+    through0032Dir = await mkdtemp(join(tmpdir(), "agent-service-through0032-"));
     for (const [file, expectedSha256] of FROZEN_0031_MIGRATIONS) {
       const bytes = await readFile(join(MIGRATIONS_DIR, file));
       expect(createHash("sha256").update(bytes).digest("hex"), file).toBe(expectedSha256);
       await copyFile(join(MIGRATIONS_DIR, file), join(pre0032Dir, file));
+      await copyFile(join(MIGRATIONS_DIR, file), join(through0032Dir, file));
     }
-    migrationSql = await readFile(join(MIGRATIONS_DIR, MIGRATION_NAME), "utf8");
+    const migrationBytes = await readFile(join(MIGRATIONS_DIR, MIGRATION_NAME));
+    expect(createHash("sha256").update(migrationBytes).digest("hex"), MIGRATION_NAME)
+      .toBe(MIGRATION_SHA256);
+    await copyFile(join(MIGRATIONS_DIR, MIGRATION_NAME), join(through0032Dir, MIGRATION_NAME));
+    migrationSql = migrationBytes.toString("utf8");
   });
 
   afterAll(async () => {
@@ -121,6 +129,7 @@ describe("0031 -> 0032 tenant telemetry lifecycle migration", () => {
       await admin.end();
     }
     if (pre0032Dir) await rm(pre0032Dir, { recursive: true, force: true });
+    if (through0032Dir) await rm(through0032Dir, { recursive: true, force: true });
   });
 
   async function create0031(database: string): Promise<void> {
@@ -139,7 +148,10 @@ describe("0031 -> 0032 tenant telemetry lifecycle migration", () => {
   }
 
   async function upgrade(database: string): Promise<void> {
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    const store = await MysqlSessionStore.connect({
+      url: databaseUrl(base, database),
+      migrationsDir: through0032Dir,
+    });
     await store.close();
   }
 

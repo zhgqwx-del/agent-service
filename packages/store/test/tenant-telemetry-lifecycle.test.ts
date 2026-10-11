@@ -5,24 +5,32 @@ import {
   TENANT_TELEMETRY_LIFECYCLE_PROTOCOL,
   TENANT_TELEMETRY_LIFECYCLE_SUBJECT_SCOPE,
   TENANT_TELEMETRY_LIFECYCLE_TARGET_SCOPE,
+  TENANT_TELEMETRY_ARTIFACT_INVENTORY_SCOPE,
+  TENANT_TELEMETRY_RETENTION_CLASS,
   TENANT_TELEMETRY_WRITER_PROTOCOL,
+  tenantTelemetryArtifactInventoryReceiptSha256,
+  tenantTelemetryArtifactInventorySha256,
   tenantTelemetryLifecycleActivationEvidenceSha256,
+  tenantTelemetryLifecycleActivationRequestSha256,
   tenantTelemetryLifecycleCoverageEvidenceSha256,
   tenantTelemetryLifecycleSubjectReceiptSha256,
   tenantTelemetryLifecycleTargetReceiptSha256,
   tenantTelemetryLifecycleTargetRootSha256,
   tenantTelemetryLifecycleTargetSha256,
+  tenantTelemetryRefKeyIdSha256,
   tenantTelemetrySubjectRefForTenantSha256,
   tenantTelemetrySubjectRefSha256,
   validateTenantTelemetryLifecycleControl,
   validateTenantTelemetryLifecycleCoverage,
   validateTenantTelemetryLifecycleSubject,
   validateTenantTelemetryLifecycleTarget,
+  validateTenantTelemetryArtifactInventory,
   type ActiveTenantTelemetryLifecycleControlRecord,
   type TenantTelemetryLifecycleCoverageRecord,
   type TenantTelemetryLifecycleSubjectRecord,
   type TenantTelemetryLifecycleTargetBody,
   type TenantTelemetryLifecycleTargetRecord,
+  type TenantTelemetryArtifactInventoryBody,
 } from "../src/index.js";
 import { telemetryOpaqueRef } from "@agent-service/protocol";
 
@@ -181,5 +189,91 @@ describe("tenant telemetry lifecycle evidence", () => {
       ...subject,
       coverageEvidenceSha256: D("9"),
     })).toThrow(/receipt mismatch/);
+  });
+
+  it("derives activation identity from the stable key and canonical target order", () => {
+    const key = Buffer.alloc(32, 9);
+    const refKeyId = tenantTelemetryRefKeyIdSha256(key);
+    const input = {
+      expectedControlGeneration: 0 as const,
+      targets: [
+        {
+          domain: "traces" as const,
+          backendKind: "fixture",
+          adapterProtocol: "telemetry-fixture-v1",
+          namespaceSha256: D("1"),
+          failureDomainSha256: D("2"),
+        },
+        {
+          domain: "logs" as const,
+          backendKind: "fixture",
+          adapterProtocol: "telemetry-fixture-v1",
+          namespaceSha256: D("3"),
+          failureDomainSha256: D("4"),
+        },
+      ],
+    };
+    expect(tenantTelemetryLifecycleActivationRequestSha256(input, refKeyId)).toBe(
+      tenantTelemetryLifecycleActivationRequestSha256({
+        ...input,
+        targets: [...input.targets].reverse(),
+      }, refKeyId),
+    );
+    expect(() => tenantTelemetryRefKeyIdSha256(Buffer.alloc(31))).toThrow(/32 bytes/);
+  });
+
+  it("keeps artifact inventory content-free, owner-bound, and disposal-dormant", () => {
+    const identity = {
+      tenantId: "tenant-a",
+      controlGeneration: 1 as const,
+      domain: "logs" as const,
+      targetSha256: D("1"),
+      artifactIdSha256: D("2"),
+      artifactGeneration: 1,
+      ownerKind: "session" as const,
+      tenantRefSha256: D("3"),
+      ownerRefSha256: D("4"),
+    };
+    const body: TenantTelemetryArtifactInventoryBody = {
+      inventorySha256: tenantTelemetryArtifactInventorySha256(identity),
+      ...identity,
+      scope: TENANT_TELEMETRY_ARTIFACT_INVENTORY_SCOPE,
+      holdSubjectRefSha256: D("5"),
+      coverageEvidenceSha256: D("6"),
+      historyStatus: "complete_since_creation",
+      writerProtocol: TENANT_TELEMETRY_WRITER_PROTOCOL,
+      writerGeneration: 1,
+      sourceSchema: "fixture-v1",
+      sourceGeneration: 1,
+      sourceHighWaterDbMs: 10,
+      payloadSha256: D("7"),
+      manifestSha256: D("8"),
+      retentionClass: TENANT_TELEMETRY_RETENTION_CLASS,
+      retentionPolicyControlGeneration: 0,
+      retentionPolicySha256: null,
+      disposeAfterDbMs: null,
+      tenantHoldControlGeneration: 0,
+      tenantHoldProjectionSha256: D("9"),
+      ownerHoldControlGeneration: 0,
+      ownerHoldProjectionSha256: D("a"),
+      restoreControlGeneration: 0,
+      restoreLineageKind: "inactive",
+      restoreUpdatedAtDbMs: 0,
+      runtimeEpochSha256: null,
+      createdAtDbMs: 10,
+    };
+    const record = {
+      ...body,
+      receiptSha256: tenantTelemetryArtifactInventoryReceiptSha256(body),
+    };
+    validateTenantTelemetryArtifactInventory(record);
+    expect(tenantTelemetryArtifactInventorySha256({
+      ...identity,
+      ownerRefSha256: D("b"),
+    })).not.toBe(body.inventorySha256);
+    expect(() => validateTenantTelemetryArtifactInventory({
+      ...record,
+      disposeAfterDbMs: 20,
+    })).toThrow(/not configured for disposal/);
   });
 });

@@ -376,15 +376,16 @@ try {
     "0030_tenant_restore_journal.sql",
     "0031_authoritative_backup_catalog.sql",
     "0032_tenant_telemetry_lifecycle.sql",
+    "0033_tenant_telemetry_activation_inventory.sql",
   ];
   const [migrationRows] = await inspection.query(
-    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?) ORDER BY name",
+    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?,?) ORDER BY name",
     expectedMigrationNames,
   );
   if (
     migrationRows.length !== expectedMigrationNames.length
     || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
-  ) throw new Error("runner did not apply migrations 0027 through 0032");
+  ) throw new Error("runner did not apply migrations 0027 through 0033");
   const [telemetryControlRows] = await inspection.query(
     `SELECT control_generation,activated_at_db_ms,lifecycle_protocol,writer_protocol,
             ref_key_id_sha256,target_count,target_root_sha256,activation_evidence_sha256
@@ -399,7 +400,19 @@ try {
     || telemetryControlRows[0].target_count !== null
     || telemetryControlRows[0].target_root_sha256 !== null
     || telemetryControlRows[0].activation_evidence_sha256 !== null) {
-    throw new Error("0032 telemetry lifecycle control was not installed dormant");
+    throw new Error("0033 telemetry lifecycle control was not installed dormant");
+  }
+  const [telemetryEvidenceRows] = await inspection.query(
+    `SELECT
+       (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_targets) AS target_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_coverages) AS coverage_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_activation_receipts) AS activation_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory) AS artifact_count`,
+  );
+  if (telemetryEvidenceRows.length !== 1
+    || ["target_count", "coverage_count", "activation_count", "artifact_count"]
+      .some((field) => Number(telemetryEvidenceRows[0][field]) !== 0)) {
+    throw new Error("0033 telemetry activation/inventory was not installed empty");
   }
   const [controlRows] = await inspection.query(
     `SELECT control_generation,storage_backend,namespace_sha256,
