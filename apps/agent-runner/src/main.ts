@@ -4,6 +4,9 @@ import { open } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
   BlobCleanupWorker,
+  createTenantTelemetryApplicationDualWrite,
+  TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_CONTRACT_SHA256,
+  TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_PROTOCOL,
   createFakeCredentialTargetExecutionAdapterState,
   ErasureWorker,
   FakeCredentialTargetExecutionAdapter,
@@ -21,6 +24,7 @@ import {
   TenantDatabasePurgeWorker,
   TenantRedisPurgeWorker,
   TenantRestoreJournalPublicationWorker,
+  type TenantTelemetryApplicationDualWrite,
   TenantPurgeExecutionWorker,
   TenantPurgePlanWorker,
   TenantRuntimeCoordinator,
@@ -30,6 +34,7 @@ import {
   builtinTools,
 } from "@agent-service/core";
 import {
+  consoleTelemetrySink,
   createEphemeralStructuredTelemetry,
   tenantRedisNamespaceSha256,
   type StructuredTelemetry,
@@ -71,6 +76,9 @@ import {
   type TenantDatabasePurgeStore,
   type TenantRedisPurgeStore,
   type TenantRestoreJournalStore,
+  type TenantTelemetryLifecycleStore,
+  type TenantTelemetryApplicationCaptureStore,
+  type TenantTelemetryWriterStore,
   type TenantContentInventoryStore,
   type TenantPurgeExecutionStore,
   type TenantPurgePlanStore,
@@ -107,6 +115,10 @@ import {
 import { RouterTenantPurgeExecutionGate } from "./tenant-purge-execution-gate.js";
 import { RouterTenantRuntimeDrainClient } from "./tenant-runtime-drain-client.js";
 import { LocalTenantRuntimeDrain } from "./tenant-runtime-local-drain.js";
+import {
+  reconcileTenantTelemetryWriterForStartup,
+  type TenantTelemetryWriterRuntime,
+} from "./tenant-telemetry-writer-config.js";
 
 const RUNNER_TELEMETRY_LEVEL = {
   "runner.bootstrap.dev_key_skipped": "warn",
@@ -225,6 +237,9 @@ export async function writeAdminBootstrapOutputFile(
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
+  const tenantTelemetryRefKey = cfg.TENANT_TELEMETRY_REF_KEY === undefined
+    ? undefined
+    : Buffer.from(cfg.TENANT_TELEMETRY_REF_KEY, "hex");
   const redisNamespaceSha256 = cfg.REDIS_URL && cfg.REDIS_NAMESPACE_ID
     ? tenantRedisNamespaceSha256(cfg.REDIS_NAMESPACE_ID, cfg.REDIS_PREFIX)
     : undefined;
@@ -256,20 +271,32 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & ErasureSessionStore
     & UserDataExportRequestStore
     & UserDataExportJobStore
-    & UserDataExportCleanupStore = cfg.STORE === "mysql"
+    & UserDataExportCleanupStore
+    & TenantTelemetryLifecycleStore
+    & TenantTelemetryApplicationCaptureStore
+    & TenantTelemetryWriterStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({
       url: cfg.MYSQL_URL,
       ...(redisNamespaceSha256 === undefined
         ? {}
         : { tenantRedisPurgeNamespaceSha256: redisNamespaceSha256 }),
+      ...(tenantTelemetryRefKey === undefined
+        ? {}
+        : { tenantTelemetryRefKey }),
     })
-    : new MemorySessionStore();
+    : new MemorySessionStore(
+      { now: () => Date.now() },
+      tenantTelemetryRefKey === undefined ? {} : { tenantTelemetryRefKey },
+    );
 
   let tenantRestoreJournalWorker: TenantRestoreJournalPublicationWorker | undefined;
   let tenantRestoreJournalGate: RouterTenantRestoreJournalGate | undefined;
   let tenantRestoreJournalPreflight: TenantRestoreJournalPreflightSummary | undefined;
   let tenantRestoreJournalAdapters: ReturnType<typeof createTenantRestoreJournalAdapters> = [];
   let tenantRestoreJournalClosePromise: Promise<void> | undefined;
+  let tenantTelemetryWriterRuntime: TenantTelemetryWriterRuntime | undefined;
+  let providerTenantTelemetry: TenantTelemetryApplicationDualWrite | undefined;
+  let tenantTelemetryRetryTimer: ReturnType<typeof setInterval> | undefined;
   const closeTenantRestoreJournal = (): Promise<void> => {
     if (tenantRestoreJournalClosePromise) return tenantRestoreJournalClosePromise;
     tenantRestoreJournalClosePromise = tenantRestoreJournalWorker !== undefined
@@ -626,6 +653,44 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     throw error;
   }
 
+  try {
+    tenantTelemetryWriterRuntime = await reconcileTenantTelemetryWriterForStartup(
+      store,
+      cfg,
+      runnerRuntimeLogger,
+    );
+  } catch (error) {
+    await Promise.all([
+      closeTenantRestoreJournal(),
+      blobStore instanceof S3BlobStore ? blobStore.close() : undefined,
+      tenantRedisPurgeAdapter?.close(),
+      bus.close(),
+      lease.close(),
+      store.close(),
+    ]);
+    throw error;
+  }
+
+  if (tenantTelemetryRefKey !== undefined) {
+    providerTenantTelemetry = createTenantTelemetryApplicationDualWrite({
+      component: "provider",
+      producerProtocol: TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_PROTOCOL,
+      producerContractSha256: TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_CONTRACT_SHA256,
+      opaqueRefKey: tenantTelemetryRefKey,
+      processSink: consoleTelemetrySink(),
+      store,
+      durableEnabled: () => tenantTelemetryWriterRuntime?.captureActive === true,
+    });
+    if (tenantTelemetryWriterRuntime.active) {
+      tenantTelemetryRetryTimer = setInterval(() => {
+        if (providerTenantTelemetry!.failedCount > 0) {
+          void providerTenantTelemetry!.retryFailed();
+        }
+      }, cfg.TENANT_TELEMETRY_WRITER_POLL_MS);
+      tenantTelemetryRetryTimer.unref?.();
+    }
+  }
+
   const platform = [];
   if (cfg.API_KEY) {
     const preset = PROVIDER_PRESETS[cfg.PLATFORM_PROVIDER];
@@ -652,6 +717,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     cipher,
     platform,
     tenantRuntime,
+    ...(providerTenantTelemetry === undefined
+      ? {}
+      : {
+          telemetry: providerTenantTelemetry.telemetry,
+          tenantTelemetry: providerTenantTelemetry,
+        }),
     ...(credentialTargetExecutionAdapter && credentialTargetReferenceCapture
       ? {
           credentialTargetReferenceFactory: credentialTargetReferenceCapture.factory,
@@ -936,6 +1007,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   tenantPurgeExecutionWorker?.start();
   tenantDatabasePurgeWorker?.start();
   tenantRedisPurgeWorker?.start();
+  tenantTelemetryWriterRuntime.worker?.start();
 
   let ready = true;
   const app = createApp({
@@ -1008,7 +1080,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantRuntimeDrain,
     tenantRuntimeDrainEnabled: cfg.TENANT_RUNTIME_DRAIN_ENABLED,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,
-    ready: () => ready,
+    ready: () => ready && (providerTenantTelemetry?.durableReady ?? true),
     decryptSecret: (s) => cipher.decrypt(s.ciphertext, s.keyId),
     encryptSecret: async (p) => ({ ciphertext: await cipher.encrypt(p), keyId: cipher.keyId }),
   });
@@ -1047,6 +1119,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         tenantRedisPurgeWorker?.stop(),
       ]);
       await host.drain(30_000);
+      if (tenantTelemetryRetryTimer !== undefined) {
+        clearInterval(tenantTelemetryRetryTimer);
+        tenantTelemetryRetryTimer = undefined;
+      }
+      await providerTenantTelemetry?.close();
+      await tenantTelemetryWriterRuntime?.worker?.stop();
       await Promise.all([lifecycleOutbox.stop(), blobCleanup.stop()]);
 
       // `server.close()` deliberately waits for active HTTP connections. A long-lived SSE subscriber
@@ -1107,6 +1185,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     cfg.DATA_EXPORT_REQUESTS_ENABLED,
     cfg.DATA_EXPORT_WORKER_ENABLED,
     cfg.DATA_EXPORT_CLEANUP_ENABLED,
+    tenantTelemetryWriterRuntime.worker !== undefined,
   ];
   const gateEnabledCount = gateStates.filter(Boolean).length;
   emitRunnerTelemetryEvent("runner.lifecycle.started", {
@@ -1126,11 +1205,15 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantPurgeExecutionGate, tenantPurgeExecutionWorker,
     tenantDatabasePurgeGate, tenantDatabasePurgeWorker,
     tenantRedisPurgeGate, tenantRedisPurgeWorker, tenantRedisPurgeAdapter,
+    tenantTelemetryWriterRuntime, providerTenantTelemetry,
     tenantRuntimeBootId,
     blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),
   };
   } catch (error) {
+    if (tenantTelemetryRetryTimer !== undefined) clearInterval(tenantTelemetryRetryTimer);
+    await providerTenantTelemetry?.close();
+    await tenantTelemetryWriterRuntime?.worker?.stop();
     await closeTenantRestoreJournal();
     throw error;
   }

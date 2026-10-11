@@ -1,9 +1,10 @@
 # 可观测性、安全遥测与生命周期边界
 
-> 状态：入口安全基线、default-dormant 的 `0032` schema、`0033` Memory/MySQL 原子
-> activation/inventory，以及`0034` payload-before-sink durable writer spool、external-mutation-start
-> reservation、Memory/MySQL store、Memory/HTTP create-only adapter、worker与ACK已实现。`0034`未接
-> runner配置/启动；真实sink、应用writer双写、delete/restore executor与completion仍待后续切片。
+> 状态：`0034` durable writer已接runner并提供默认关闭的本地filesystem sink；`0035`把0033 lifecycle
+> target activation与per-domain application producer capture分离。当前只支持
+> `provider.upstream_request_failed` logs exact contract，traces必须inactive。filesystem仅限本地单runner，
+> 无OS lock且人工ACK不是证明，production禁用；managed sink、delete/restore/retention executor、
+> activation/operator CLI与完整coverage仍未实现。
 > 本文定义 M1 数据生命周期需要的最小安全契约，以及 M4 完整可观测性平台的边界。
 
 ## 1. 目的
@@ -26,7 +27,9 @@ owner inventory、retention、legal hold 与删除 ACK，日志/追踪就会成�
    再由按`adapterProtocol`过滤的worker处理logs/traces可合法分布在不同adapter的混合配置。首次
    external create前先write-once保留external-mutation-start，原子重验T1、user/session、policy/
    hold/restore/source；之后只允许exact operation replay，terminal ACK必须绑定该reservation。
-4. **后续 execution lifecycle**：把应用 writer 接到上述substrate，提供真实sink、删除或匿名化
+4. **`0035` application capture**：以domain独立control/receipt/coverage/binding冻结producer cutover；
+   pre-cutover保持unknown/unbound，post-cutover只接受exact producer。当前只接provider failure logs。
+5. **后续 execution lifecycle**：提供managed sink、删除或匿名化
    operation、restore replay 与 terminal receipt。该层完成前，T3d 的 `logs` 和 `traces` 仍必须
    保持显式 blocker，全域 completion 仍为 `false`。
 
@@ -80,7 +83,7 @@ URL、provider ID、locator、异常 message/stack 或 secret 交给 process log
 - stdout/stderr 已经是可删除的受管日志后端；
 - trace context 已覆盖所有后台 worker、SSE resume/link、消息总线或持久任务恢复；
 - stdout/trace exporter 已接入 durable inventory，或 retention/legal hold 已形成可执行处置策略；
-- 长期router/runner已启动`0034` worker或已把应用event双写到durable spool；
+- 任意应用event都已双写到durable spool；当前只有一个provider failure logs contract；
 - log/trace 物理删除、ACK 或 restore replay 已实现；
 - dashboard、metrics、SLO、alert、sampling、容量或成本治理已实现。
 
@@ -254,7 +257,7 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 10. exporter 失败不能阻塞普通 runtime，也不能让 destructive lifecycle action在缺 ACK 时伪装成功；安全
     审计/erasure proof使用独立 durable ledger，不以“trace 已发送”代替。
 
-## 8. `0032`～`0034` inventory/writer 与后续 lifecycle execution
+## 8. `0032`～`0035` inventory/writer/capture 与后续 lifecycle execution
 
 ### 8.1 `0032` 已实现的 default-dormant substrate
 
@@ -274,7 +277,7 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 真实 MySQL smoke验证 control、targets、coverages、subjects的约束行为。它明确不会：配置 sink、生成
 subject ref、扫描/回填历史、激活 writer、materialize purge job、调用网络、删除日志/追踪或推进任何
 erasure/completion。`0033`/`0034`虽提供显式store/worker/adapter API，长期router/runner仍未把它们接成启动gate或sink writer；
-因此标准应用装配继续保持 generation `0`。
+因此0033 lifecycle control与0035 application capture都继续默认inactive；两者必须分别判断。
 
 已有 tenant不会因migration自动获得 coverage；只有显式调用`0033` activation store时，才会把当时全部
 canonical tenant记为`legacy_history_unknown`。不能把migration成功或legacy coverage解释成“历史日志完整
@@ -310,8 +313,8 @@ retention/hold/restore binding及source high-water；同一external identity只�
 deleted后不得登记新artifact，但响应丢失后的exact replay仍可读取原receipt。inventory不保存正文、URL、
 header、credential或明文locator。
 
-当前应用logger/exporter尚未调用这个store contract，也没有真实sink adapter；所以还不能声称所有durable
-writer已双写。未登记的legacy数据、未知sink、source drift、跨owner batch或无法重建的locator仍必须形成
+当前只有`provider.upstream_request_failed` logs通过0035 exact producer contract调用writer；没有真实managed
+sink，也不能声称所有应用event已双写。未登记的legacy数据、未知sink、source drift、跨owner batch或无法重建的locator仍必须形成
 blocker，不能用空集合解释成“没有日志”。
 
 ### 8.3 `0034` 已实现的 durable writer substrate
@@ -377,7 +380,28 @@ fragment、超界或非JSON响应，并以整个请求deadline和有界response 
 共用endpoint就把一个target的ACK当成另一个target的证据。这只是endpoint/target配置绑定。它实现的是
 `agent-service.telemetry-http-sink.v1` client协议，不是真实sink server、collector或managed backend验收。
 
-### 8.4 Adapter contract
+### 8.4 `0035` 已实现的 per-domain application capture
+
+`0035_tenant_telemetry_application_capture.sql`新增logs/traces独立的application control、activation receipt、
+tenant coverage与post-cutover write binding。它把“0033 target/owner lifecycle已激活”与“某domain的应用producer
+已经无遗漏切换”拆成两个事实：既有tenant标记`capture_since_cutover/pre_cutover_history_unknown`，既有job
+冻结在pre-cutover unbound root中；旧job只允许原无producer输入exact replay，不能事后重标。新tenant必须在
+canonical subject、0033 lifecycle coverage和0035 application coverage同一事务创建；active domain的新job必须
+先写exact binding再写job，binding/job/payload任一失败全回滚。startup重建coverage/pre-cutover/binding root，
+缺行、跨tenant、producer/target漂移均fail closed。
+
+当前唯一产品producer是`provider.upstream_request_failed`的logs事件。它在capture active时只进入durable
+writer，不再复制到stdout；capture inactive时，owner-scoped helper会剥离全部owner/subject/target refs，
+router/provider其它fallback也使用相同的无主体引用边界。traces没有实现producer contract，必须保持inactive。
+runner可显式开启0034 worker和本地filesystem adapter，但该adapter只允许单runner私有目录，没有OS级跨进程锁；
+single-runner/private-root ACK是人工声明，不是环境证明，production配置会拒绝。deterministic operation staging
+会在exact ACK前清理并fsync，正常durable job replay可恢复；但当前没有全目录startup sweeper，DB/job投影
+非原子丢失时仍可能留下staging，这继续属于restore/delete生命周期边界。仓库没有0035 activation/operator CLI、managed sink、
+telemetry delete/restore/retention executor。`captureTenantTelemetryApplicationRecord`一类helper只保护它包围的
+enqueue调用，不能让任意业务数据库事务与spool跨store crash-atomic；因此目前不得实际activation后宣称完整
+application coverage或擦除闭环。
+
+### 8.5 Adapter contract
 
 adapter 至少需要固定语义：
 
@@ -391,7 +415,7 @@ adapter 至少需要固定语义：
 
 本地 fake/filesystem adapter只能证明协议、rollback、并发和 replay，不能成为 production completion proof。
 
-### 8.5 Tenant 与 user erasure 集成
+### 8.6 Tenant 与 user erasure 集成
 
 - T3d 固定 33 域中的 `logs`、`traces` 不得删除或省略；adapter未配置时继续
   `blocked_adapter_unconfigured`。
@@ -404,26 +428,24 @@ adapter 至少需要固定语义：
 - terminal receipt只证明 logs/traces域，仍固定 `allDomainsComplete=false`、
   `contentPurgeExecuted=false`，直到 backup、provider/KMS、其它外部域与最终聚合全部闭合。
 
-### 8.6 Restore 与 backup
+### 8.7 Restore 与 backup
 
 恢复后必须从独立故障域重放已 durable ACK 的永久 purge marker，防止旧日志索引、spool、export queue或
 trace batch复活。尚未 ACK 的首次外部 mutation不能从旧快照猜造。0030/0031 的 journal/catalog只提供
 数据库恢复来源与 epoch authority，不自动证明日志平台、追踪平台或它们的 backup 已删除某 tenant/user。
 
-### 8.7 rollout gate
+### 8.8 rollout gate
 
 建议沿用现有安全切片模式：
 
-1. 应用`0032`/`0033`/`0034` expand-only migration，tracking/writer/execution默认关闭；
-2. 若0033已active，先由0034 guard阻断stale writer；已有subject gap时关闭tenant admission、排空pre-0034 writer、停止全部应用writer，并以精确key和三项固定ACK执行DDL-free全量reconcile；inactive或无gap历史无需该特殊模式；
-3. 未来发布真正双写spool/inventory且声明对应capability的router/runner，所有gate保持`0`；
-4. 排空旧writer，核对全部configured fleet与精确32-byte protected ref key identity；
-5. 由受控one-shot operator调用现有原子activation store，确认receipt/coverage及全fleet startup audit；
-6. 开启application durable dual-write，再按adapter protocol开启runner worker并验证真实adapter namespace identity；
-7. 最后开启router destructive gate；
-8. 首个activation/inventory/ACK/cutover提交后只能forward-fix。
+1. 应用`0032`～`0035` expand-only migration，lifecycle/application capture/writer/execution全部保持默认关闭；
+2. 若0033已active，先按0034既有停写/reconcile契约处理历史subject gap；inactive或无gap历史无需该特殊模式；
+3. 部署全部0035-aware router/runner并排空旧writer，核对精确ref key、target、producer contract与全fleet startup audit；
+4. 只对已证明无遗漏且与业务事务边界相容的domain，由受控one-shot operator激活application capture；
+5. 再按adapter protocol开启runner worker、验证真实managed adapter namespace与故障域，最后才考虑delete/restore/retention executor及destructive gate；
+6. 首个activation/binding/ACK/cutover提交后只能forward-fix。
 
-现有长期应用没有步骤2、5、6所需的gate/adapter装配，因此生产环境不得仅凭store API存在就执行步骤4。
+当前没有activation/operator CLI、managed sink和完整业务事务crash-atomic capture；唯一producer只覆盖一个provider failure logs事件，traces明确不支持。因此production不得执行步骤4，本地filesystem也只能在可丢弃的单runner环境验证worker协议，不能作为rollout证明。
 
 ## 9. 本地与 CI 验收
 
@@ -449,6 +471,14 @@ suite，要求目标文件实际pass且零skip/non-passed。0034 writer unit gro
 六组门禁分别为10/10、4/4、6/6、1/1、1/1、11/11且源码装配通过；易变的完整明细以
 `docs/PROGRESS.md`最后一节和对应CI run为准。后续仍需application dual-write、真实sink、delete/restore
 executor、legal-hold destructive竞态、全域completion与managed环境测试。
+
+`0035`另由`pnpm test:tenant-telemetry-application-capture`和
+`pnpm test:tenant-telemetry-application-capture-mysql`独立门禁。真实MySQL套件覆盖分域activation、并发
+exact replay/conflict、activation与tenant/enqueue线性化、Unicode tenant ID二进制隔离、pre-cutover
+unbound exact replay、post-cutover binding、事务回滚和startup drift。`pnpm test:migrations`中的
+`0034 -> 0035`夹具证明历史ledger保持、default dormancy、legacy语义、partial-DDL/marker-loss收敛和严格
+fingerprint；GitHub Actions单独执行Memory与MySQL capture suite，并验证dist/runner image包含0035 marker。
+这些测试只证明默认关闭的协议与实现，不证明实际activation、managed sink或删除/恢复能力。
 
 ## 10. Staging / Production 边界
 

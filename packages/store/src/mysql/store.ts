@@ -197,6 +197,7 @@ import {
 import * as RestoreJournal from "../tenant-restore-journal.js";
 import {
   TENANT_TELEMETRY_ARTIFACT_INVENTORY_SCOPE,
+  TENANT_TELEMETRY_DOMAINS,
   TENANT_TELEMETRY_LIFECYCLE_ACTIVATION_SCOPE,
   TENANT_TELEMETRY_LIFECYCLE_CONTROL_SINGLETON_ID,
   TENANT_TELEMETRY_LIFECYCLE_COVERAGE_SCOPE,
@@ -246,6 +247,7 @@ import {
   type TenantTelemetryLifecycleTargetRecord,
 } from "../tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "../tenant-telemetry-writer.js";
+import * as TenantTelemetryApplicationCapture from "../tenant-telemetry-application-capture.js";
 import * as BackupCatalog from "../backup-catalog.js";
 import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
 import {
@@ -896,6 +898,10 @@ const TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME =
   "0034_tenant_telemetry_durable_writer.sql";
 const TENANT_TELEMETRY_DURABLE_WRITER_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-durable-writer";
+const TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME =
+  "0035_tenant_telemetry_application_capture.sql";
+const TENANT_TELEMETRY_APPLICATION_CAPTURE_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-application-capture";
 
 function mysqlMigrationStatements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "")
@@ -1061,6 +1067,32 @@ function tenantTelemetryDurableWriterFingerprintStatement(
   }
   return statements[0]!;
 }
+
+function tenantTelemetryApplicationCaptureFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+  variable: "tt_app_capture_schema_ok" | "tt_app_capture_trigger_ok",
+): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_APPLICATION_CAPTURE_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_APPLICATION_CAPTURE_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0035 tenant telemetry application ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @${variable}=`)) {
+    throw new Error(`0035 tenant telemetry application ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
 const BLOB_STORAGE_CONTROL_COLUMNS = `singleton_id, control_generation, storage_backend,
   namespace_sha256, activated_at_db_ms, evidence_sha256`;
 const TENANT_TELEMETRY_CONTROL_COLUMNS = `singleton_id, control_generation,
@@ -1078,6 +1110,29 @@ const TENANT_TELEMETRY_SUBJECT_COLUMNS = `request_id, tenant_id, subject_generat
 const TENANT_TELEMETRY_ACTIVATION_RECEIPT_COLUMNS = `singleton_id, control_generation,
   scope, request_sha256, ref_key_id_sha256, target_count, target_root_sha256, coverage_count,
   coverage_root_sha256, control_evidence_sha256, activated_at_db_ms, receipt_sha256`;
+const TENANT_TELEMETRY_APPLICATION_CONTROL_COLUMNS = `domain, control_generation, state,
+  scope, activated_at_db_ms, capture_protocol, producer_protocol, producer_contract_sha256,
+  ref_key_id_sha256, lifecycle_control_generation, lifecycle_control_evidence_sha256,
+  lifecycle_target_sha256, lifecycle_target_receipt_sha256, coverage_count,
+  coverage_root_sha256, pre_cutover_write_count, pre_cutover_write_root_sha256,
+  activation_evidence_sha256`;
+const TENANT_TELEMETRY_APPLICATION_RECEIPT_COLUMNS = `domain, control_generation, scope,
+  request_sha256, producer_protocol, producer_contract_sha256, ref_key_id_sha256,
+  lifecycle_control_evidence_sha256, lifecycle_target_sha256,
+  lifecycle_target_receipt_sha256, coverage_count, coverage_root_sha256,
+  pre_cutover_write_count, pre_cutover_write_root_sha256, fleet_stopped_ack,
+  legacy_writers_drained_ack, producer_ready_ack, activated_at_db_ms,
+  control_evidence_sha256, receipt_sha256`;
+const TENANT_TELEMETRY_APPLICATION_COVERAGE_COLUMNS = `tenant_id, domain,
+  control_generation, scope, capture_status, pre_cutover_history_status,
+  lifecycle_coverage_evidence_sha256, lifecycle_history_status, subject_ref_sha256,
+  target_sha256, target_receipt_sha256, producer_protocol, producer_contract_sha256,
+  coverage_started_at_db_ms, evidence_sha256`;
+const TENANT_TELEMETRY_APPLICATION_WRITE_BINDING_COLUMNS = `write_operation_sha256,
+  scope, protocol, tenant_id, domain, control_generation, control_evidence_sha256,
+  coverage_evidence_sha256, lifecycle_coverage_evidence_sha256, target_sha256,
+  target_receipt_sha256, producer_protocol, producer_contract_sha256, inventory_sha256,
+  manifest_sha256, payload_sha256, bound_at_db_ms, receipt_sha256`;
 const TENANT_TELEMETRY_ARTIFACT_INVENTORY_COLUMNS = `inventory_sha256, tenant_id,
   control_generation, scope, domain, target_sha256, artifact_id_sha256, artifact_generation,
   owner_kind, tenant_ref_sha256, owner_ref_sha256, hold_subject_ref_sha256,
@@ -2164,6 +2219,207 @@ function rowToTenantTelemetryArtifactInventory(
     return inventory;
   } catch {
     throw new TenantTelemetryLifecycleIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryApplicationDomainControl(
+  row: Row,
+): TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl {
+  try {
+    const domain = String(row.domain) as TenantTelemetryDomain;
+    const state = String(row.state);
+    const controlGeneration = storedSafeInteger(
+      row.control_generation,
+      "stored tenant telemetry application control generation",
+    );
+    const control: TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl =
+      state === "inactive"
+        ? { domain, state, controlGeneration: controlGeneration as 0 }
+        : {
+            domain,
+            state: "active",
+            controlGeneration: controlGeneration as 1,
+            scope: String(row.scope) as
+              typeof TenantTelemetryApplicationCapture
+                .TENANT_TELEMETRY_APPLICATION_DOMAIN_CONTROL_SCOPE,
+            activatedAtDbMs: storedSafeInteger(
+              row.activated_at_db_ms,
+              "stored tenant telemetry application activation time",
+            ),
+            captureProtocol: String(row.capture_protocol) as
+              typeof TenantTelemetryApplicationCapture
+                .TENANT_TELEMETRY_APPLICATION_CAPTURE_PROTOCOL,
+            producerProtocol: String(row.producer_protocol),
+            producerContractSha256: String(row.producer_contract_sha256),
+            refKeyIdSha256: String(row.ref_key_id_sha256),
+            lifecycleControlGeneration: storedSafeInteger(
+              row.lifecycle_control_generation,
+              "stored tenant telemetry application lifecycle generation",
+            ) as 1,
+            lifecycleControlEvidenceSha256: String(
+              row.lifecycle_control_evidence_sha256,
+            ),
+            lifecycleTargetSha256: String(row.lifecycle_target_sha256),
+            lifecycleTargetReceiptSha256: String(row.lifecycle_target_receipt_sha256),
+            coverageCount: storedSafeInteger(
+              row.coverage_count,
+              "stored tenant telemetry application coverage count",
+            ),
+            coverageRootSha256: String(row.coverage_root_sha256),
+            preCutoverWriteCount: storedSafeInteger(
+              row.pre_cutover_write_count,
+              "stored tenant telemetry application pre-cutover write count",
+            ),
+            preCutoverWriteRootSha256: String(row.pre_cutover_write_root_sha256),
+            activationEvidenceSha256: String(row.activation_evidence_sha256),
+          };
+    TenantTelemetryApplicationCapture.validateTenantTelemetryApplicationDomainControl(control);
+    return control;
+  } catch (error) {
+    if (error instanceof TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationCaptureIntegrityError) throw error;
+    throw new TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationCaptureIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryApplicationActivationReceipt(
+  row: Row,
+): TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceipt {
+  try {
+    const receipt: TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationActivationReceipt = {
+      domain: String(row.domain) as TenantTelemetryDomain,
+      controlGeneration: storedSafeInteger(
+        row.control_generation,
+        "stored tenant telemetry application receipt generation",
+      ) as 1,
+      scope: String(row.scope) as
+        typeof TenantTelemetryApplicationCapture
+          .TENANT_TELEMETRY_APPLICATION_ACTIVATION_RECEIPT_SCOPE,
+      requestSha256: String(row.request_sha256),
+      producerProtocol: String(row.producer_protocol),
+      producerContractSha256: String(row.producer_contract_sha256),
+      refKeyIdSha256: String(row.ref_key_id_sha256),
+      lifecycleControlEvidenceSha256: String(row.lifecycle_control_evidence_sha256),
+      lifecycleTargetSha256: String(row.lifecycle_target_sha256),
+      lifecycleTargetReceiptSha256: String(row.lifecycle_target_receipt_sha256),
+      coverageCount: storedSafeInteger(
+        row.coverage_count,
+        "stored tenant telemetry application receipt coverage count",
+      ),
+      coverageRootSha256: String(row.coverage_root_sha256),
+      preCutoverWriteCount: storedSafeInteger(
+        row.pre_cutover_write_count,
+        "stored tenant telemetry application receipt pre-cutover write count",
+      ),
+      preCutoverWriteRootSha256: String(row.pre_cutover_write_root_sha256),
+      fleetStoppedAck: String(row.fleet_stopped_ack) as
+        typeof TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_FLEET_STOPPED_ACK,
+      legacyWritersDrainedAck: String(row.legacy_writers_drained_ack) as
+        typeof TenantTelemetryApplicationCapture
+          .TENANT_TELEMETRY_APPLICATION_LEGACY_WRITERS_DRAINED_ACK,
+      producerReadyAck: String(row.producer_ready_ack) as
+        typeof TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_PRODUCER_READY_ACK,
+      activatedAtDbMs: storedSafeInteger(
+        row.activated_at_db_ms,
+        "stored tenant telemetry application receipt time",
+      ),
+      controlEvidenceSha256: String(row.control_evidence_sha256),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    TenantTelemetryApplicationCapture
+      .validateTenantTelemetryApplicationActivationReceipt(receipt);
+    return receipt;
+  } catch (error) {
+    if (error instanceof TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationCaptureIntegrityError) throw error;
+    throw new TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationCaptureIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryApplicationCoverage(
+  row: Row,
+): TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage {
+  try {
+    const coverage: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage = {
+      tenantId: String(row.tenant_id),
+      domain: String(row.domain) as TenantTelemetryDomain,
+      controlGeneration: storedSafeInteger(
+        row.control_generation,
+        "stored tenant telemetry application coverage generation",
+      ) as 1,
+      scope: String(row.scope) as
+        typeof TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_COVERAGE_SCOPE,
+      captureStatus: String(row.capture_status) as
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStatus,
+      preCutoverHistoryStatus: String(row.pre_cutover_history_status) as
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationPreCutoverHistoryStatus,
+      lifecycleCoverageEvidenceSha256: String(row.lifecycle_coverage_evidence_sha256),
+      lifecycleHistoryStatus: String(row.lifecycle_history_status) as
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage["lifecycleHistoryStatus"],
+      subjectRefSha256: String(row.subject_ref_sha256),
+      targetSha256: String(row.target_sha256),
+      targetReceiptSha256: String(row.target_receipt_sha256),
+      producerProtocol: String(row.producer_protocol),
+      producerContractSha256: String(row.producer_contract_sha256),
+      coverageStartedAtDbMs: storedSafeInteger(
+        row.coverage_started_at_db_ms,
+        "stored tenant telemetry application coverage start time",
+      ),
+      evidenceSha256: String(row.evidence_sha256),
+    };
+    TenantTelemetryApplicationCapture.validateTenantTelemetryApplicationCoverage(coverage);
+    return coverage;
+  } catch (error) {
+    if (error instanceof TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationCaptureIntegrityError) throw error;
+    throw new TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationCaptureIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryApplicationWriteBinding(
+  row: Row,
+): TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding {
+  try {
+    const binding: TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding = {
+      writeOperationSha256: String(row.write_operation_sha256),
+      scope: String(row.scope) as
+        typeof TenantTelemetryApplicationCapture
+          .TENANT_TELEMETRY_APPLICATION_WRITE_BINDING_SCOPE,
+      protocol: String(row.protocol) as
+        typeof TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_CAPTURE_PROTOCOL,
+      tenantId: String(row.tenant_id),
+      domain: String(row.domain) as TenantTelemetryDomain,
+      controlGeneration: storedSafeInteger(
+        row.control_generation,
+        "stored tenant telemetry application binding generation",
+      ) as 1,
+      controlEvidenceSha256: String(row.control_evidence_sha256),
+      coverageEvidenceSha256: String(row.coverage_evidence_sha256),
+      lifecycleCoverageEvidenceSha256: String(row.lifecycle_coverage_evidence_sha256),
+      targetSha256: String(row.target_sha256),
+      targetReceiptSha256: String(row.target_receipt_sha256),
+      producerProtocol: String(row.producer_protocol),
+      producerContractSha256: String(row.producer_contract_sha256),
+      inventorySha256: String(row.inventory_sha256),
+      manifestSha256: String(row.manifest_sha256),
+      payloadSha256: String(row.payload_sha256),
+      boundAtDbMs: storedSafeInteger(
+        row.bound_at_db_ms,
+        "stored tenant telemetry application binding time",
+      ),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    TenantTelemetryApplicationCapture.validateTenantTelemetryApplicationWriteBinding(binding);
+    return binding;
+  } catch (error) {
+    if (error instanceof TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationCaptureIntegrityError) throw error;
+    throw new TenantTelemetryApplicationCapture
+      .TenantTelemetryApplicationCaptureIntegrityError();
   }
 }
 
@@ -7220,6 +7476,7 @@ export class MysqlSessionStore implements
   TenantRedisPurgeStore,
   TenantCredentialTargetExecutionStore,
   TenantTelemetryLifecycleStore,
+  TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore,
   TenantTelemetryWriter.TenantTelemetryWriterStore,
   BackupCatalog.TenantBackupCatalogStore,
   RestoreJournal.TenantRestoreJournalStore,
@@ -7245,6 +7502,7 @@ export class MysqlSessionStore implements
   private tenantBackupCatalogSchemaInstalled = false;
   private tenantTelemetrySchemaInstalled = false;
   private tenantTelemetryWriterSchemaInstalled = false;
+  private tenantTelemetryApplicationCaptureSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -7524,6 +7782,7 @@ export class MysqlSessionStore implements
   private async assertTenantTelemetryWriterSchemaFingerprint(
     conn: PoolConnection,
     migrationsDir: string,
+    includeLegacyTriggerFingerprint = true,
   ): Promise<void> {
     let fingerprintStatements: string[];
     try {
@@ -7537,11 +7796,13 @@ export class MysqlSessionStore implements
           "schema",
           "telemetry_durable_writer_schema_ok",
         ),
-        tenantTelemetryDurableWriterFingerprintStatement(
-          migrationSql,
-          "triggers",
-          "telemetry_durable_writer_trigger_ok",
-        ),
+        ...(includeLegacyTriggerFingerprint
+          ? [tenantTelemetryDurableWriterFingerprintStatement(
+              migrationSql,
+              "triggers",
+              "telemetry_durable_writer_trigger_ok",
+            )]
+          : []),
       ];
     } catch (cause) {
       throw new Error("0034 tenant telemetry writer fingerprint source is invalid", { cause });
@@ -7559,7 +7820,8 @@ export class MysqlSessionStore implements
                 @telemetry_durable_writer_trigger_ok AS trigger_ok`,
       );
       if (Number(fingerprintRows[0]?.schema_ok) !== 1
-        || Number(fingerprintRows[0]?.trigger_ok) !== 1) {
+        || (includeLegacyTriggerFingerprint
+          && Number(fingerprintRows[0]?.trigger_ok) !== 1)) {
         throw new Error("stored schema does not match the 0034 fingerprint");
       }
     } catch (cause) {
@@ -7575,6 +7837,69 @@ export class MysqlSessionStore implements
     } catch (cause) {
       failure ??= new Error(
         "0034 tenant telemetry writer fingerprint session restore failed",
+        { cause },
+      );
+    }
+    if (failure) throw failure;
+  }
+
+  private async assertTenantTelemetryApplicationCaptureSchemaFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let fingerprintStatements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME),
+        "utf8",
+      );
+      fingerprintStatements = [
+        tenantTelemetryApplicationCaptureFingerprintStatement(
+          migrationSql,
+          "schema",
+          "tt_app_capture_schema_ok",
+        ),
+        tenantTelemetryApplicationCaptureFingerprintStatement(
+          migrationSql,
+          "triggers",
+          "tt_app_capture_trigger_ok",
+        ),
+      ];
+    } catch (cause) {
+      throw new Error(
+        "0035 tenant telemetry application capture fingerprint source is invalid",
+        { cause },
+      );
+    }
+
+    let failure: Error | undefined;
+    try {
+      await conn.query(
+        "SET @agent_service_tt_app_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of fingerprintStatements) await conn.query(statement);
+      const [fingerprintRows] = await conn.query<Row[]>(
+        `SELECT @tt_app_capture_schema_ok AS schema_ok,
+                @tt_app_capture_trigger_ok AS trigger_ok`,
+      );
+      if (Number(fingerprintRows[0]?.schema_ok) !== 1
+        || Number(fingerprintRows[0]?.trigger_ok) !== 1) {
+        throw new Error("stored schema does not match the 0035 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error(
+        "0035 tenant telemetry application capture schema fingerprint verification failed",
+        { cause },
+      );
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_tt_app_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error(
+        "0035 tenant telemetry application capture fingerprint session restore failed",
         { cause },
       );
     }
@@ -7821,6 +8146,65 @@ export class MysqlSessionStore implements
     }
   }
 
+  private async assertTenantTelemetryApplicationCaptureProjection(
+    conn: PoolConnection,
+  ): Promise<void> {
+    if (!this.tenantTelemetryApplicationCaptureSchemaInstalled) return;
+    const controls = await this.readTenantTelemetryApplicationDomainControls(conn);
+    for (const control of controls) {
+      if (control.state === "inactive") {
+        const captureGenerationColumn = control.domain === "logs"
+          ? "telemetry_logs_capture_generation"
+          : "telemetry_traces_capture_generation";
+        const [rows] = await conn.query<Row[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_telemetry_application_activation_receipts
+               WHERE domain=?) AS receipt_count,
+             (SELECT COUNT(*) FROM tenant_telemetry_application_coverages
+               WHERE domain=?) AS coverage_count,
+             (SELECT COUNT(*) FROM tenant_telemetry_application_write_bindings
+               WHERE domain=?) AS binding_count,
+             (SELECT COUNT(*) FROM subject_lifecycle
+               WHERE subject_kind='tenant' AND BINARY subject_id=BINARY tenant_id
+                 AND ${captureGenerationColumn}<>0) AS stale_generation_count`,
+          [control.domain, control.domain, control.domain],
+        );
+        if (!rows[0] || [
+          rows[0].receipt_count,
+          rows[0].coverage_count,
+          rows[0].binding_count,
+          rows[0].stale_generation_count,
+        ]
+          .some((value) => storedSafeInteger(
+            value,
+            "stored tenant telemetry application inactive projection count",
+          ) !== 0)) {
+          throw new TenantTelemetryApplicationCapture
+            .TenantTelemetryApplicationCaptureIntegrityError(
+              "inactive tenant telemetry application domain has durable evidence",
+            );
+        }
+        continue;
+      }
+      await this.assertTenantTelemetryApplicationDomainProjection(conn, control, undefined, "");
+    }
+    const [orphanRows] = await conn.query<Row[]>(
+      `SELECT COUNT(*) AS orphan_count
+         FROM tenant_telemetry_application_write_bindings b
+         LEFT JOIN tenant_telemetry_write_jobs j
+           ON BINARY j.write_operation_sha256=BINARY b.write_operation_sha256
+        WHERE j.write_operation_sha256 IS NULL`,
+    );
+    if (!orphanRows[0]
+      || storedSafeInteger(
+        orphanRows[0].orphan_count,
+        "stored tenant telemetry application orphan binding count",
+      ) !== 0) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+  }
+
   private async assertTenantTelemetryRuntimeConfiguration(
     conn: PoolConnection,
   ): Promise<void> {
@@ -7863,6 +8247,7 @@ export class MysqlSessionStore implements
             "inactive tenant telemetry lifecycle has durable projections",
           );
         }
+        await this.assertTenantTelemetryApplicationCaptureProjection(conn);
         await conn.commit();
         return;
       }
@@ -7879,6 +8264,7 @@ export class MysqlSessionStore implements
         "",
       );
       await this.assertTenantTelemetryWriterProjection(conn);
+      await this.assertTenantTelemetryApplicationCaptureProjection(conn);
       await conn.commit();
     } catch (error) {
       await conn.rollback().catch(() => {});
@@ -7914,7 +8300,17 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryWriterSchemaFingerprint(conn, migrationsDir);
+        await this.assertTenantTelemetryWriterSchemaFingerprint(
+          conn,
+          migrationsDir,
+          !done.has(TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryApplicationCaptureSchemaFingerprint(
+          conn,
+          migrationsDir,
+        );
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -7930,6 +8326,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryWriterSchemaInstalled = done.has(
         TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME,
+      );
+      this.tenantTelemetryApplicationCaptureSchemaInstalled = done.has(
+        TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME,
       );
       if (!skipTelemetryRuntimeAudit) {
         await this.assertTenantTelemetryRuntimeConfiguration(conn);
@@ -7965,8 +8364,42 @@ export class MysqlSessionStore implements
         if (done.has(f)) continue;
         const sql = await readFile(join(dir, f), "utf8");
         const statements = mysqlMigrationStatements(sql);
+        let tenantTelemetryApplicationTriggerPreflightComplete = false;
+        let skipTenantTelemetryApplicationTriggerRotation = false;
         for (const [i, stmt] of statements.entries()) {
           try {
+            const is0035TriggerRotation = f
+                === TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME
+              && (stmt.startsWith("DROP TRIGGER IF EXISTS ")
+                || stmt.startsWith("CREATE TRIGGER "));
+            if (is0035TriggerRotation
+              && !tenantTelemetryApplicationTriggerPreflightComplete) {
+              tenantTelemetryApplicationTriggerPreflightComplete = true;
+              try {
+                // Marker-loss replay over an exact 0035 database must never create a guard gap.
+                // If the latest fingerprint is already exact, every trigger rotation is a no-op.
+                await this.assertTenantTelemetryApplicationCaptureSchemaFingerprint(conn, dir);
+                skipTenantTelemetryApplicationTriggerRotation = true;
+              } catch (fingerprintCause) {
+                const [activeRows] = await conn.query<Row[]>(
+                  `SELECT COUNT(*) AS active_count
+                     FROM tenant_telemetry_application_domain_controls
+                    WHERE state='active' AND control_generation=1`,
+                );
+                if (!activeRows[0]
+                  || storedSafeInteger(
+                    activeRows[0].active_count,
+                    "stored tenant telemetry active application domain count",
+                  ) !== 0) {
+                  throw new Error(
+                    "active 0035 marker-loss replay requires the exact trigger/schema fingerprint",
+                    { cause: fingerprintCause },
+                  );
+                }
+              }
+            }
+            if (is0035TriggerRotation
+              && skipTenantTelemetryApplicationTriggerRotation) continue;
             await executeMysqlMigrationStatement(conn, f, stmt);
           } catch (cause) {
             throw new Error(`migration ${f} failed at statement ${i + 1}/${statements.length}`, { cause });
@@ -7989,7 +8422,14 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryWriterSchemaFingerprint(conn, dir);
+        await this.assertTenantTelemetryWriterSchemaFingerprint(
+          conn,
+          dir,
+          !done.has(TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryApplicationCaptureSchemaFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -8005,6 +8445,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryWriterSchemaInstalled = done.has(
         TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME,
+      );
+      this.tenantTelemetryApplicationCaptureSchemaInstalled = done.has(
+        TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME,
       );
       await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
@@ -12782,7 +13225,19 @@ export class MysqlSessionStore implements
           "tenant lifecycle raw identity changed while acquiring the telemetry coverage gate",
         );
       }
-      await this.ensureTenantTelemetryCoverageForLifecycle(conn, tenantId, atMs, false);
+      const lifecycleCoverage = await this.ensureTenantTelemetryCoverageForLifecycle(
+        conn,
+        tenantId,
+        atMs,
+        false,
+      );
+      await this.ensureTenantTelemetryApplicationCoveragesForLifecycle(
+        conn,
+        tenantId,
+        atMs,
+        false,
+        lifecycleCoverage,
+      );
       return;
     }
 
@@ -12861,15 +13316,71 @@ export class MysqlSessionStore implements
         );
       }
     }
-    const [inserted] = await conn.query<mysql.ResultSetHeader>(
-      `INSERT IGNORE INTO subject_lifecycle
-         (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
-          legal_hold_at_ms, created_at_ms, updated_at_ms)
-       VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?)`,
-      [tenantId, tenantId, atMs, atMs],
-    );
+    // Do not take a next-key lock on a missing canonical subject before inserting it. Distinct
+    // first writers can occupy the same InnoDB gap and then deadlock when both request an insert
+    // intention. A blind insert is the tenant-creation linearization point: either it wins before
+    // a lifecycle/application cutover range lock, or it waits for that cutover and the 0035
+    // generation trigger rejects every stale candidate. Both application generations are
+    // write-once 0 -> 1, so the four candidates cover every possible interleaving without taking
+    // a control lock before the exact subject row exists.
+    let inserted: mysql.ResultSetHeader;
+    if (this.tenantTelemetryApplicationCaptureSchemaInstalled) {
+      const generationCandidates = [
+        [0, 0],
+        [1, 0],
+        [0, 1],
+        [1, 1],
+      ] as const;
+      let result: mysql.ResultSetHeader | undefined;
+      for (const [logsCaptureGeneration, tracesCaptureGeneration] of generationCandidates) {
+        try {
+          [result] = await conn.query<mysql.ResultSetHeader>(
+            `INSERT IGNORE INTO subject_lifecycle
+               (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
+                legal_hold_at_ms, created_at_ms, updated_at_ms,
+                telemetry_logs_capture_generation,telemetry_traces_capture_generation)
+             VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?, ?, ?)`,
+            [
+              tenantId,
+              tenantId,
+              atMs,
+              atMs,
+              logsCaptureGeneration,
+              tracesCaptureGeneration,
+            ],
+          );
+          break;
+        } catch (error) {
+          const mysqlError = error as { code?: string; errno?: number; sqlMessage?: string };
+          if (mysqlError.code !== "ER_SIGNAL_EXCEPTION"
+            || mysqlError.errno !== 1644
+            || mysqlError.sqlMessage
+              !== "tenant telemetry application capture generation is stale") {
+            throw error;
+          }
+        }
+      }
+      if (!result) {
+        throw new TenantTelemetryLifecycleIntegrityError(
+          "tenant telemetry application capture generation did not stabilize",
+        );
+      }
+      inserted = result;
+    } else {
+      [inserted] = await conn.query<mysql.ResultSetHeader>(
+        `INSERT IGNORE INTO subject_lifecycle
+           (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
+            legal_hold_at_ms, created_at_ms, updated_at_ms)
+         VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?)`,
+        [tenantId, tenantId, atMs, atMs],
+      );
+    }
     const [locked] = await conn.query<Row[]>(
-      `SELECT tenant_id, subject_id FROM subject_lifecycle
+      `SELECT tenant_id,subject_id,created_at_ms
+         ${this.tenantTelemetryApplicationCaptureSchemaInstalled
+           ? ",telemetry_logs_capture_generation,telemetry_traces_capture_generation"
+           : ""}
+         FROM subject_lifecycle
         WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? ${lockIntent}`,
       [tenantId, tenantId],
     );
@@ -12889,11 +13400,40 @@ export class MysqlSessionStore implements
         "tenant lifecycle raw identity changed during first-writer serialization",
       );
     }
-    let coverageAtDbMs = atMs;
-    if (inserted.affectedRows === 1 && this.tenantTelemetrySchemaInstalled) {
-      const control = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
-      if (control.state === "active" && coverageAtDbMs < control.activatedAtDbMs) {
-        coverageAtDbMs = control.activatedAtDbMs;
+    let coverageAtDbMs = storedSafeInteger(
+      locked[0]!.created_at_ms,
+      "stored tenant lifecycle creation time",
+    );
+    if (inserted.affectedRows === 1) {
+      if (this.tenantTelemetrySchemaInstalled) {
+        const lifecycleControl = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
+        if (lifecycleControl.state === "active") {
+          coverageAtDbMs = Math.max(coverageAtDbMs, lifecycleControl.activatedAtDbMs);
+        }
+      }
+      if (this.tenantTelemetryApplicationCaptureSchemaInstalled) {
+        const controls = await this.readTenantTelemetryApplicationDomainControls(conn, "FOR SHARE");
+        for (const control of controls) {
+          const storedGeneration = storedSafeInteger(
+            locked[0]![control.domain === "logs"
+              ? "telemetry_logs_capture_generation"
+              : "telemetry_traces_capture_generation"],
+            "stored tenant telemetry application capture generation",
+          );
+          if (storedGeneration !== control.controlGeneration) {
+            throw new TenantTelemetryLifecycleIntegrityError(
+              "tenant telemetry application capture generation changed after creation",
+            );
+          }
+          if (control.state === "active") {
+            coverageAtDbMs = Math.max(coverageAtDbMs, control.activatedAtDbMs);
+          }
+        }
+      }
+      if (coverageAtDbMs !== storedSafeInteger(
+        locked[0]!.created_at_ms,
+        "stored tenant lifecycle creation time",
+      )) {
         await conn.query(
           `UPDATE subject_lifecycle
               SET created_at_ms=?,updated_at_ms=GREATEST(updated_at_ms,?)
@@ -12902,11 +13442,18 @@ export class MysqlSessionStore implements
         );
       }
     }
-    await this.ensureTenantTelemetryCoverageForLifecycle(
+    const lifecycleCoverage = await this.ensureTenantTelemetryCoverageForLifecycle(
       conn,
       tenantId,
       coverageAtDbMs,
       inserted.affectedRows === 1,
+    );
+    await this.ensureTenantTelemetryApplicationCoveragesForLifecycle(
+      conn,
+      tenantId,
+      coverageAtDbMs,
+      inserted.affectedRows === 1,
+      lifecycleCoverage,
     );
   }
 
@@ -33191,7 +33738,11 @@ export class MysqlSessionStore implements
     const existing = await this.readTenantTelemetryLifecycleCoverage(
       conn,
       tenantId,
-      "FOR SHARE",
+      // The exact newly-created subject row already serializes this tenant. A locking read of a
+      // missing coverage row would take another next-key lock and recreate the distinct-tenant
+      // insert-intention deadlock this path is designed to avoid. Existing tenants still require
+      // the locking integrity read.
+      newlyCreated ? "" : "FOR SHARE",
     );
     if (control.state === "inactive") {
       if (existing) throw new TenantTelemetryLifecycleIntegrityError();
@@ -33243,6 +33794,95 @@ export class MysqlSessionStore implements
       ],
     );
     return coverage;
+  }
+
+  private async ensureTenantTelemetryApplicationCoveragesForLifecycle(
+    conn: PoolConnection,
+    tenantId: string,
+    tenantCreatedAtDbMs: number,
+    newlyCreated: boolean,
+    lifecycleCoverage: TenantTelemetryLifecycleCoverageRecord | null,
+  ): Promise<void> {
+    if (!this.tenantTelemetryApplicationCaptureSchemaInstalled) return;
+    const controls = await this.readTenantTelemetryApplicationDomainControls(conn, "FOR SHARE");
+    const [generationRows] = await conn.query<Row[]>(
+      `SELECT telemetry_logs_capture_generation,telemetry_traces_capture_generation
+         FROM subject_lifecycle
+        WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE`,
+      [tenantId, tenantId],
+    );
+    if (generationRows.length !== 1) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+    const targets = await this.readTenantTelemetryLifecycleTargets(conn, "FOR SHARE");
+    for (const control of controls) {
+      const existing = await this.readTenantTelemetryApplicationCoverage(
+        conn,
+        tenantId,
+        control.domain,
+        // As above, the new canonical subject is the per-tenant serialization point. Do not lock
+        // a missing application-coverage gap before its first insert.
+        newlyCreated ? "" : "FOR SHARE",
+      );
+      const generation = storedSafeInteger(
+        generationRows[0]![control.domain === "logs"
+          ? "telemetry_logs_capture_generation"
+          : "telemetry_traces_capture_generation"],
+        "stored tenant telemetry application capture generation",
+      );
+      if (control.state === "inactive") {
+        if (existing || generation !== 0) {
+          throw new TenantTelemetryApplicationCapture
+            .TenantTelemetryApplicationCaptureIntegrityError();
+        }
+        continue;
+      }
+      if (!lifecycleCoverage) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+      const target = targets.find((candidate) => candidate.domain === control.domain);
+      if (!target) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+      if (existing) {
+        if (generation !== (existing.captureStatus === "capture_since_cutover" ? 0 : 1)
+          || existing.controlGeneration !== control.controlGeneration
+          || existing.lifecycleCoverageEvidenceSha256 !== lifecycleCoverage.evidenceSha256
+          || existing.lifecycleHistoryStatus !== lifecycleCoverage.historyStatus
+          || existing.subjectRefSha256 !== lifecycleCoverage.subjectRefSha256
+          || existing.targetSha256 !== target.targetSha256
+          || existing.targetReceiptSha256 !== target.receiptSha256
+          || existing.producerProtocol !== control.producerProtocol
+          || existing.producerContractSha256 !== control.producerContractSha256) {
+          throw new TenantTelemetryApplicationCapture
+            .TenantTelemetryApplicationCaptureIntegrityError();
+        }
+        continue;
+      }
+      if (!newlyCreated || generation !== 1
+        || lifecycleCoverage.historyStatus !== "complete_since_creation"
+        || tenantCreatedAtDbMs < control.activatedAtDbMs) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError(
+            "active tenant telemetry application domain has an uncovered tenant",
+          );
+      }
+      const coverage = this.buildTenantTelemetryApplicationCoverage(
+        tenantId,
+        control.domain,
+        "capture_since_tenant_creation",
+        "pre_cutover_not_applicable",
+        tenantCreatedAtDbMs,
+        lifecycleCoverage,
+        target,
+        control.producerProtocol,
+        control.producerContractSha256,
+      );
+      await this.insertTenantTelemetryApplicationCoverage(conn, coverage);
+    }
   }
 
   async registerTenantTelemetryCoverage(
@@ -33400,6 +34040,20 @@ export class MysqlSessionStore implements
         }
         await conn.commit();
         return existing;
+      }
+
+      if (this.tenantTelemetryApplicationCaptureSchemaInstalled) {
+        const applicationControl = await this.readTenantTelemetryApplicationDomainControl(
+          conn,
+          stagedInput.domain,
+          "FOR SHARE",
+        );
+        if (applicationControl.state === "active") {
+          throw new TenantTelemetryApplicationCapture
+            .TenantTelemetryApplicationCaptureConflictError(
+            "active application capture requires the durable writer binding path",
+          );
+        }
       }
 
       if (!tenantLifecycle || tenantLifecycle.state !== "active") {
@@ -33613,6 +34267,793 @@ export class MysqlSessionStore implements
     return record?.tenantId === tenantId ? record : null;
   }
 
+  // ---------- tenant telemetry application capture cutover ----------
+  private requireTenantTelemetryApplicationCaptureSchema(): void {
+    if (!this.tenantTelemetryApplicationCaptureSchemaInstalled) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError(
+          "tenant telemetry application capture schema is not installed",
+        );
+    }
+  }
+
+  private async readTenantTelemetryApplicationDomainControls(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl[]> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_APPLICATION_CONTROL_COLUMNS}
+         FROM tenant_telemetry_application_domain_controls
+        ORDER BY domain ${lock}`,
+    );
+    const controls = rows.map(rowToTenantTelemetryApplicationDomainControl);
+    if (controls.length !== 2
+      || controls[0]?.domain !== "logs"
+      || controls[1]?.domain !== "traces") {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError(
+          "tenant telemetry application domain control set is incomplete",
+        );
+    }
+    return controls;
+  }
+
+  private async readTenantTelemetryApplicationDomainControl(
+    executor: Pool | PoolConnection,
+    domain: TenantTelemetryDomain,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl> {
+    const controls = await this.readTenantTelemetryApplicationDomainControls(executor, lock);
+    const control = controls.find((candidate) => candidate.domain === domain);
+    if (!control) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+    return control;
+  }
+
+  private async readTenantTelemetryApplicationActivationReceipt(
+    executor: Pool | PoolConnection,
+    domain: TenantTelemetryDomain,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_APPLICATION_RECEIPT_COLUMNS}
+         FROM tenant_telemetry_application_activation_receipts
+        WHERE domain=? ${lock}`,
+      [domain],
+    );
+    if (rows.length > 1) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+    return rows[0] ? rowToTenantTelemetryApplicationActivationReceipt(rows[0]) : null;
+  }
+
+  private async readTenantTelemetryApplicationCoverage(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    domain: TenantTelemetryDomain,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_APPLICATION_COVERAGE_COLUMNS}
+         FROM tenant_telemetry_application_coverages
+        WHERE tenant_id=? AND domain=?
+          AND BINARY tenant_id=BINARY ? AND BINARY domain=BINARY ? ${lock}`,
+      [tenantId, domain, tenantId, domain],
+    );
+    if (rows.length > 1) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+    if (!rows[0]) return null;
+    const coverage = rowToTenantTelemetryApplicationCoverage(rows[0]);
+    if (coverage.tenantId !== tenantId || coverage.domain !== domain) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError(
+          "tenant telemetry application coverage identity changed during lookup",
+        );
+    }
+    return coverage;
+  }
+
+  private async readTenantTelemetryApplicationWriteBinding(
+    executor: Pool | PoolConnection,
+    writeOperationSha256: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding | null> {
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_APPLICATION_WRITE_BINDING_COLUMNS}
+         FROM tenant_telemetry_application_write_bindings
+        WHERE write_operation_sha256=? ${lock}`,
+      [writeOperationSha256],
+    );
+    if (rows.length > 1) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+    return rows[0] ? rowToTenantTelemetryApplicationWriteBinding(rows[0]) : null;
+  }
+
+  private buildTenantTelemetryApplicationCoverage(
+    tenantId: string,
+    domain: TenantTelemetryDomain,
+    captureStatus: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStatus,
+    preCutoverHistoryStatus:
+      TenantTelemetryApplicationCapture.TenantTelemetryApplicationPreCutoverHistoryStatus,
+    coverageStartedAtDbMs: number,
+    lifecycleCoverage: TenantTelemetryLifecycleCoverageRecord,
+    target: TenantTelemetryLifecycleTargetRecord,
+    producerProtocol: string,
+    producerContractSha256: string,
+  ): TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage {
+    const body: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverageBody = {
+      tenantId,
+      domain,
+      controlGeneration: 1,
+      scope: TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_COVERAGE_SCOPE,
+      captureStatus,
+      preCutoverHistoryStatus,
+      lifecycleCoverageEvidenceSha256: lifecycleCoverage.evidenceSha256,
+      lifecycleHistoryStatus: lifecycleCoverage.historyStatus,
+      subjectRefSha256: lifecycleCoverage.subjectRefSha256,
+      targetSha256: target.targetSha256,
+      targetReceiptSha256: target.receiptSha256,
+      producerProtocol,
+      producerContractSha256,
+      coverageStartedAtDbMs,
+    };
+    const coverage: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage = {
+      ...body,
+      evidenceSha256: TenantTelemetryApplicationCapture
+        .tenantTelemetryApplicationCoverageEvidenceSha256(body),
+    };
+    TenantTelemetryApplicationCapture.validateTenantTelemetryApplicationCoverage(coverage);
+    return coverage;
+  }
+
+  private async insertTenantTelemetryApplicationCoverage(
+    conn: PoolConnection,
+    coverage: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage,
+  ): Promise<void> {
+    TenantTelemetryApplicationCapture.validateTenantTelemetryApplicationCoverage(coverage);
+    await conn.query(
+      `INSERT INTO tenant_telemetry_application_coverages
+         (tenant_id,domain,control_generation,scope,capture_status,
+          pre_cutover_history_status,lifecycle_coverage_evidence_sha256,
+          lifecycle_history_status,subject_ref_sha256,target_sha256,target_receipt_sha256,
+          producer_protocol,producer_contract_sha256,coverage_started_at_db_ms,evidence_sha256)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        coverage.tenantId,
+        coverage.domain,
+        coverage.controlGeneration,
+        coverage.scope,
+        coverage.captureStatus,
+        coverage.preCutoverHistoryStatus,
+        coverage.lifecycleCoverageEvidenceSha256,
+        coverage.lifecycleHistoryStatus,
+        coverage.subjectRefSha256,
+        coverage.targetSha256,
+        coverage.targetReceiptSha256,
+        coverage.producerProtocol,
+        coverage.producerContractSha256,
+        coverage.coverageStartedAtDbMs,
+        coverage.evidenceSha256,
+      ],
+    );
+  }
+
+  private async assertTenantTelemetryApplicationDomainProjection(
+    conn: PoolConnection,
+    control: TenantTelemetryApplicationCapture.ActiveTenantTelemetryApplicationDomainControl,
+    expectedRequestSha256?: string,
+    lock: "" | "FOR SHARE" = "FOR SHARE",
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationResult> {
+    try {
+      const lifecycleControl = await this.readTenantTelemetryLifecycleControl(conn, lock);
+      const lifecycleTargets = await this.readTenantTelemetryLifecycleTargets(conn, lock);
+      const target = lifecycleTargets.find((candidate) => candidate.domain === control.domain);
+      const receipt = await this.readTenantTelemetryApplicationActivationReceipt(
+        conn,
+        control.domain,
+        lock,
+      );
+      if (lifecycleControl.state !== "active" || !target || !receipt) {
+        throw new Error("tenant telemetry application activation source is incomplete");
+      }
+      const requestInput:
+        TenantTelemetryApplicationCapture.ActivateTenantTelemetryApplicationCaptureInput = {
+        domain: control.domain,
+        expectedControlGeneration: 0,
+        expectedLifecycleControlGeneration: 1,
+        lifecycleControlEvidenceSha256: receipt.lifecycleControlEvidenceSha256,
+        lifecycleTargetSha256: receipt.lifecycleTargetSha256,
+        lifecycleTargetReceiptSha256: receipt.lifecycleTargetReceiptSha256,
+        producerProtocol: receipt.producerProtocol,
+        producerContractSha256: receipt.producerContractSha256,
+        fleetStoppedAck: receipt.fleetStoppedAck,
+        legacyWritersDrainedAck: receipt.legacyWritersDrainedAck,
+        producerReadyAck: receipt.producerReadyAck,
+      };
+      const requestSha256 = TenantTelemetryApplicationCapture
+        .tenantTelemetryApplicationActivationRequestSha256(requestInput);
+      if (expectedRequestSha256 !== undefined && requestSha256 !== expectedRequestSha256) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureConflictError();
+      }
+      if (receipt.requestSha256 !== requestSha256
+        || receipt.domain !== control.domain
+        || receipt.controlGeneration !== control.controlGeneration
+        || receipt.controlEvidenceSha256 !== control.activationEvidenceSha256
+        || receipt.producerProtocol !== control.producerProtocol
+        || receipt.producerContractSha256 !== control.producerContractSha256
+        || receipt.refKeyIdSha256 !== control.refKeyIdSha256
+        || receipt.lifecycleControlEvidenceSha256
+          !== control.lifecycleControlEvidenceSha256
+        || receipt.lifecycleTargetSha256 !== control.lifecycleTargetSha256
+        || receipt.lifecycleTargetReceiptSha256
+          !== control.lifecycleTargetReceiptSha256
+        || receipt.coverageCount !== control.coverageCount
+        || receipt.coverageRootSha256 !== control.coverageRootSha256
+        || receipt.preCutoverWriteCount !== control.preCutoverWriteCount
+        || receipt.preCutoverWriteRootSha256 !== control.preCutoverWriteRootSha256
+        || receipt.activatedAtDbMs !== control.activatedAtDbMs
+        || lifecycleControl.controlGeneration !== control.lifecycleControlGeneration
+        || lifecycleControl.activationEvidenceSha256
+          !== control.lifecycleControlEvidenceSha256
+        || lifecycleControl.refKeyIdSha256 !== control.refKeyIdSha256
+        || target.targetSha256 !== control.lifecycleTargetSha256
+        || target.receiptSha256 !== control.lifecycleTargetReceiptSha256) {
+        throw new Error("tenant telemetry application activation binding is invalid");
+      }
+
+      const captureGenerationColumn = control.domain === "logs"
+        ? "telemetry_logs_capture_generation"
+        : "telemetry_traces_capture_generation";
+      const [tenantRows] = await conn.query<Row[]>(
+        `SELECT tenant_id,subject_id,created_at_ms,${captureGenerationColumn} AS capture_generation
+           FROM subject_lifecycle
+          WHERE subject_kind='tenant'
+          ORDER BY tenant_id ${lock}`,
+      );
+      const canonicalTenants = new Map<string, { createdAtMs: number; generation: number }>();
+      for (const row of tenantRows) {
+        const tenantId = String(row.tenant_id);
+        if (String(row.subject_id) !== tenantId || canonicalTenants.has(tenantId)) {
+          throw new Error("tenant telemetry canonical tenant set is invalid");
+        }
+        canonicalTenants.set(tenantId, {
+          createdAtMs: storedSafeInteger(
+            row.created_at_ms,
+            "stored tenant telemetry application tenant creation time",
+          ),
+          generation: storedSafeInteger(
+            row.capture_generation,
+            "stored tenant telemetry application tenant capture generation",
+          ),
+        });
+      }
+      const [coverageRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_TELEMETRY_APPLICATION_COVERAGE_COLUMNS}
+           FROM tenant_telemetry_application_coverages
+          WHERE domain=? ORDER BY tenant_id ${lock}`,
+        [control.domain],
+      );
+      const coverages = coverageRows.map(rowToTenantTelemetryApplicationCoverage);
+      const coveredTenants = new Set<string>();
+      const activationCoverages:
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage[] = [];
+      for (const coverage of coverages) {
+        const tenant = canonicalTenants.get(coverage.tenantId);
+        const lifecycleCoverage = await this.readTenantTelemetryLifecycleCoverage(
+          conn,
+          coverage.tenantId,
+          lock,
+        );
+        if (!tenant || coveredTenants.has(coverage.tenantId) || !lifecycleCoverage
+          || coverage.controlGeneration !== control.controlGeneration
+          || coverage.lifecycleCoverageEvidenceSha256 !== lifecycleCoverage.evidenceSha256
+          || coverage.lifecycleHistoryStatus !== lifecycleCoverage.historyStatus
+          || coverage.subjectRefSha256 !== lifecycleCoverage.subjectRefSha256
+          || coverage.targetSha256 !== target.targetSha256
+          || coverage.targetReceiptSha256 !== target.receiptSha256
+          || coverage.producerProtocol !== control.producerProtocol
+          || coverage.producerContractSha256 !== control.producerContractSha256) {
+          throw new Error("tenant telemetry application coverage binding is invalid");
+        }
+        coveredTenants.add(coverage.tenantId);
+        if (coverage.captureStatus === "capture_since_cutover") {
+          if (tenant.generation !== 0
+            || coverage.coverageStartedAtDbMs !== control.activatedAtDbMs) {
+            throw new Error("tenant telemetry application cutover coverage is invalid");
+          }
+          activationCoverages.push(coverage);
+        } else if (tenant.generation !== 1
+          || coverage.coverageStartedAtDbMs !== tenant.createdAtMs
+          || coverage.coverageStartedAtDbMs < control.activatedAtDbMs) {
+          throw new Error("tenant telemetry application creation coverage is invalid");
+        }
+      }
+      if (coveredTenants.size !== canonicalTenants.size
+        || [...canonicalTenants.keys()].some((tenantId) => !coveredTenants.has(tenantId))
+        || control.coverageCount !== activationCoverages.length
+        || control.coverageRootSha256 !== TenantTelemetryApplicationCapture
+          .tenantTelemetryApplicationCoverageRootSha256(
+            control.domain,
+            activationCoverages,
+          )) {
+        throw new Error("tenant telemetry application coverage set is incomplete");
+      }
+
+      const [unboundRows] = await conn.query<Row[]>(
+        `SELECT j.write_operation_sha256
+           FROM tenant_telemetry_write_jobs j
+           LEFT JOIN tenant_telemetry_application_write_bindings b
+             ON BINARY b.write_operation_sha256=BINARY j.write_operation_sha256
+          WHERE j.domain=? AND b.write_operation_sha256 IS NULL
+          ORDER BY j.write_operation_sha256 ${lock}`,
+        [control.domain],
+      );
+      const unboundOperations = unboundRows.map((row) => String(row.write_operation_sha256));
+      if (control.preCutoverWriteCount !== unboundOperations.length
+        || control.preCutoverWriteRootSha256 !== TenantTelemetryApplicationCapture
+          .tenantTelemetryApplicationPreCutoverWriteRootSha256(
+            control.domain,
+            unboundOperations,
+          )) {
+        throw new Error("tenant telemetry application pre-cutover write set changed");
+      }
+
+      const [bindingRows] = await conn.query<Row[]>(
+        `SELECT ${TENANT_TELEMETRY_APPLICATION_WRITE_BINDING_COLUMNS}
+           FROM tenant_telemetry_application_write_bindings
+          WHERE domain=? ORDER BY write_operation_sha256 ${lock}`,
+        [control.domain],
+      );
+      for (const row of bindingRows) {
+        const binding = rowToTenantTelemetryApplicationWriteBinding(row);
+        const job = await this.readTenantTelemetryWriteJob(
+          conn,
+          binding.writeOperationSha256,
+          lock,
+        );
+        const coverage = await this.readTenantTelemetryApplicationCoverage(
+          conn,
+          binding.tenantId,
+          binding.domain,
+          lock,
+        );
+        if (!job || !coverage
+          || job.tenantId !== binding.tenantId
+          || job.inventory.domain !== binding.domain
+          || job.inventory.targetSha256 !== binding.targetSha256
+          || job.target.receiptSha256 !== binding.targetReceiptSha256
+          || job.inventory.inventorySha256 !== binding.inventorySha256
+          || job.inventory.manifestSha256 !== binding.manifestSha256
+          || job.inventory.payloadSha256 !== binding.payloadSha256
+          || binding.controlEvidenceSha256 !== control.activationEvidenceSha256
+          || binding.coverageEvidenceSha256 !== coverage.evidenceSha256
+          || binding.lifecycleCoverageEvidenceSha256
+            !== coverage.lifecycleCoverageEvidenceSha256
+          || binding.producerProtocol !== control.producerProtocol
+          || binding.producerContractSha256 !== control.producerContractSha256
+          || binding.boundAtDbMs < control.activatedAtDbMs
+          || binding.boundAtDbMs < coverage.coverageStartedAtDbMs
+          || binding.boundAtDbMs < job.createdAtMs) {
+          throw new Error("tenant telemetry application write binding is invalid");
+        }
+      }
+      return { control, receipt };
+    } catch (error) {
+      if (error instanceof TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureConflictError
+        || error instanceof TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError) throw error;
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+  }
+
+  async listTenantTelemetryApplicationDomainControls(
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl[]> {
+    this.requireTenantTelemetryApplicationCaptureSchema();
+    return this.readTenantTelemetryApplicationDomainControls(this.pool);
+  }
+
+  async getTenantTelemetryApplicationDomainControl(
+    domain: TenantTelemetryDomain,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl> {
+    if (!(TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(domain)) {
+      throw new Error("tenant telemetry application domain is invalid");
+    }
+    this.requireTenantTelemetryApplicationCaptureSchema();
+    return this.readTenantTelemetryApplicationDomainControl(this.pool, domain);
+  }
+
+  async getTenantTelemetryApplicationActivationReceipt(
+    domain: TenantTelemetryDomain,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceipt | null> {
+    if (!(TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(domain)) {
+      throw new Error("tenant telemetry application domain is invalid");
+    }
+    this.requireTenantTelemetryApplicationCaptureSchema();
+    return this.readTenantTelemetryApplicationActivationReceipt(this.pool, domain);
+  }
+
+  async getTenantTelemetryApplicationCoverage(
+    tenantId: string,
+    domain: TenantTelemetryDomain,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage | null> {
+    if (!tenantId || tenantId.length > 128
+      || !(TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(domain)) {
+      throw new Error("tenant telemetry application coverage lookup is invalid");
+    }
+    this.requireTenantTelemetryApplicationCaptureSchema();
+    return this.readTenantTelemetryApplicationCoverage(this.pool, tenantId, domain);
+  }
+
+  async getTenantTelemetryApplicationWriteBinding(
+    tenantId: string,
+    writeOperationSha256: string,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding | null> {
+    if (!tenantId || tenantId.length > 128 || !/^[0-9a-f]{64}$/.test(writeOperationSha256)) {
+      throw new Error("tenant telemetry application write binding lookup is invalid");
+    }
+    this.requireTenantTelemetryApplicationCaptureSchema();
+    const binding = await this.readTenantTelemetryApplicationWriteBinding(
+      this.pool,
+      writeOperationSha256,
+    );
+    return binding?.tenantId === tenantId ? binding : null;
+  }
+
+  async activateTenantTelemetryApplicationCapture(
+    input: TenantTelemetryApplicationCapture.ActivateTenantTelemetryApplicationCaptureInput,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationResult> {
+    const stagedInput = structuredClone(input);
+    TenantTelemetryApplicationCapture
+      .validateActivateTenantTelemetryApplicationCaptureInput(stagedInput);
+    this.requireTenantTelemetryApplicationCaptureSchema();
+    const refKey = this.requireTenantTelemetryRefKey();
+    const refKeyIdSha256 = tenantTelemetryRefKeyIdSha256(refKey);
+    const requestSha256 = TenantTelemetryApplicationCapture
+      .tenantTelemetryApplicationActivationRequestSha256(stagedInput);
+    const conn = await this.pool.getConnection();
+    let migrationLocked = false;
+    try {
+      const [migrationLockRows] = await conn.query<Row[]>(
+        `SELECT GET_LOCK(CONCAT('agent-service:migrate:',
+          LEFT(SHA2(DATABASE(),256),32)),60) AS acquired`,
+      );
+      migrationLocked = Number(migrationLockRows[0]?.acquired) === 1;
+      if (!migrationLocked) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureConflictError(
+            "tenant telemetry application activation could not acquire the migration fence",
+          );
+      }
+      await conn.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+      await conn.beginTransaction();
+
+      // This range lock is intentionally first. It serializes the cutover with canonical tenant
+      // creation, whose insert trigger starts enforcing the per-domain generation immediately
+      // after the control flips active.
+      const [lifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          ORDER BY tenant_id,subject_kind,subject_id FOR UPDATE`,
+      );
+      const canonicalTenantIds: string[] = [];
+      const canonicalTenants = new Set<string>();
+      const referencedTenants = new Set<string>();
+      for (const row of lifecycleRows) {
+        const lifecycle = rowToSubjectLifecycle(row);
+        referencedTenants.add(lifecycle.tenantId);
+        if (lifecycle.subjectKind === "tenant") {
+          if (lifecycle.subjectId !== lifecycle.tenantId
+            || canonicalTenants.has(lifecycle.tenantId)) {
+            throw new TenantTelemetryApplicationCapture
+              .TenantTelemetryApplicationCaptureIntegrityError();
+          }
+          canonicalTenants.add(lifecycle.tenantId);
+          canonicalTenantIds.push(lifecycle.tenantId);
+        }
+      }
+      if ([...referencedTenants].some((tenantId) => !canonicalTenants.has(tenantId))) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+      const [tenantSourceRows] = await conn.query<Row[]>(
+        `SELECT tenant_id FROM tenants
+         UNION ALL SELECT tenant_id FROM agent_versions
+         UNION ALL SELECT tenant_id FROM sessions
+         UNION ALL SELECT tenant_id FROM provider_configs
+         UNION ALL SELECT tenant_id FROM api_keys
+         UNION ALL SELECT tenant_id FROM erasure_requests
+         UNION ALL SELECT tenant_id FROM tenant_erasure_admissions
+         UNION ALL SELECT tenant_id FROM tenant_credential_revocation_fences
+         UNION ALL SELECT tenant_id FROM tenant_restore_fences
+         UNION ALL SELECT tenant_id FROM retention_policy_versions
+         UNION ALL SELECT tenant_id FROM retention_policy_controls
+         UNION ALL SELECT tenant_id FROM legal_holds
+         UNION ALL SELECT tenant_id FROM legal_hold_controls
+         UNION ALL SELECT tenant_id FROM user_export_requests`,
+      );
+      if (tenantSourceRows.some((row) => !canonicalTenants.has(String(row.tenant_id)))) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+
+      const lifecycleControl = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
+      const targets = await this.readTenantTelemetryLifecycleTargets(conn, "FOR SHARE");
+      const target = targets.find((candidate) => candidate.domain === stagedInput.domain);
+      const lifecycleReceipt = await this.readTenantTelemetryActivationReceipt(
+        conn,
+        "FOR SHARE",
+      );
+      if (lifecycleControl.state !== "active"
+        || lifecycleControl.refKeyIdSha256 !== refKeyIdSha256
+        || !target || !lifecycleReceipt
+        || stagedInput.lifecycleControlEvidenceSha256
+          !== lifecycleControl.activationEvidenceSha256
+        || stagedInput.lifecycleTargetSha256 !== target.targetSha256
+        || stagedInput.lifecycleTargetReceiptSha256 !== target.receiptSha256) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureConflictError(
+            "tenant telemetry application activation source changed",
+          );
+      }
+      this.assertTenantTelemetryActivationReceiptBindings(
+        lifecycleControl,
+        targets,
+        lifecycleReceipt,
+        refKeyIdSha256,
+      );
+      const lifecycleCoverages: TenantTelemetryLifecycleCoverageRecord[] = [];
+      for (const tenantId of canonicalTenantIds) {
+        const coverage = await this.readTenantTelemetryLifecycleCoverage(
+          conn,
+          tenantId,
+          "FOR SHARE",
+        );
+        if (!coverage) {
+          throw new TenantTelemetryApplicationCapture
+            .TenantTelemetryApplicationCaptureIntegrityError();
+        }
+        lifecycleCoverages.push(coverage);
+      }
+      // Keep the cutover lock order aligned with enqueue: canonical subject range, lifecycle
+      // authority, application domain controls, then the domain job range.  Taking the job range
+      // first would deadlock with an enqueue that already holds the control share lock and is
+      // about to insert/lock its job.
+      const current = await this.readTenantTelemetryApplicationDomainControl(
+        conn,
+        stagedInput.domain,
+        "FOR UPDATE",
+      );
+      if (current.state === "active") {
+        const result = await this.assertTenantTelemetryApplicationDomainProjection(
+          conn,
+          current,
+          requestSha256,
+        );
+        await conn.commit();
+        return result;
+      }
+      const [preCutoverRows] = await conn.query<Row[]>(
+        `SELECT write_operation_sha256,updated_at_ms
+           FROM tenant_telemetry_write_jobs
+          WHERE domain=? ORDER BY write_operation_sha256 FOR UPDATE`,
+        [stagedInput.domain],
+      );
+
+      const [existingRows] = await conn.query<Row[]>(
+        `SELECT
+           (SELECT COUNT(*) FROM tenant_telemetry_application_activation_receipts
+             WHERE domain=?) AS receipt_count,
+           (SELECT COUNT(*) FROM tenant_telemetry_application_coverages
+             WHERE domain=?) AS coverage_count,
+           (SELECT COUNT(*) FROM tenant_telemetry_application_write_bindings
+             WHERE domain=?) AS binding_count`,
+        [stagedInput.domain, stagedInput.domain, stagedInput.domain],
+      );
+      const existing = existingRows[0];
+      if (!existing || [existing.receipt_count, existing.coverage_count, existing.binding_count]
+        .some((value) => storedSafeInteger(
+          value,
+          "stored tenant telemetry application inactive projection count",
+        ) !== 0)) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+
+      const activatedAtDbMs = Math.max(
+        await this.databaseNow(conn),
+        lifecycleControl.activatedAtDbMs,
+        ...lifecycleCoverages.map((coverage) => coverage.coverageStartedAtDbMs),
+        ...preCutoverRows.map((row) => storedSafeInteger(
+          row.updated_at_ms,
+          "stored tenant telemetry pre-cutover write update time",
+        )),
+      );
+      const coverages = canonicalTenantIds.map((tenantId, index) =>
+        this.buildTenantTelemetryApplicationCoverage(
+          tenantId,
+          stagedInput.domain,
+          "capture_since_cutover",
+          "pre_cutover_history_unknown",
+          activatedAtDbMs,
+          lifecycleCoverages[index]!,
+          target,
+          stagedInput.producerProtocol,
+          stagedInput.producerContractSha256,
+        ));
+      const preCutoverOperations = preCutoverRows.map(
+        (row) => String(row.write_operation_sha256),
+      );
+      const coverageRootSha256 = TenantTelemetryApplicationCapture
+        .tenantTelemetryApplicationCoverageRootSha256(stagedInput.domain, coverages);
+      const preCutoverWriteRootSha256 = TenantTelemetryApplicationCapture
+        .tenantTelemetryApplicationPreCutoverWriteRootSha256(
+          stagedInput.domain,
+          preCutoverOperations,
+        );
+      const controlBody:
+        TenantTelemetryApplicationCapture.ActiveTenantTelemetryApplicationDomainControlBody = {
+        domain: stagedInput.domain,
+        state: "active",
+        controlGeneration: 1,
+        scope: TenantTelemetryApplicationCapture
+          .TENANT_TELEMETRY_APPLICATION_DOMAIN_CONTROL_SCOPE,
+        captureProtocol: TenantTelemetryApplicationCapture
+          .TENANT_TELEMETRY_APPLICATION_CAPTURE_PROTOCOL,
+        producerProtocol: stagedInput.producerProtocol,
+        producerContractSha256: stagedInput.producerContractSha256,
+        refKeyIdSha256,
+        lifecycleControlGeneration: 1,
+        lifecycleControlEvidenceSha256: lifecycleControl.activationEvidenceSha256,
+        lifecycleTargetSha256: target.targetSha256,
+        lifecycleTargetReceiptSha256: target.receiptSha256,
+        coverageCount: coverages.length,
+        coverageRootSha256,
+        preCutoverWriteCount: preCutoverOperations.length,
+        preCutoverWriteRootSha256,
+        activatedAtDbMs,
+      };
+      const control:
+        TenantTelemetryApplicationCapture.ActiveTenantTelemetryApplicationDomainControl = {
+        ...controlBody,
+        activationEvidenceSha256: TenantTelemetryApplicationCapture
+          .tenantTelemetryApplicationDomainControlEvidenceSha256(controlBody),
+      };
+      const receiptBody:
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceiptBody = {
+        domain: stagedInput.domain,
+        controlGeneration: 1,
+        scope: TenantTelemetryApplicationCapture
+          .TENANT_TELEMETRY_APPLICATION_ACTIVATION_RECEIPT_SCOPE,
+        requestSha256,
+        producerProtocol: stagedInput.producerProtocol,
+        producerContractSha256: stagedInput.producerContractSha256,
+        refKeyIdSha256,
+        lifecycleControlEvidenceSha256: lifecycleControl.activationEvidenceSha256,
+        lifecycleTargetSha256: target.targetSha256,
+        lifecycleTargetReceiptSha256: target.receiptSha256,
+        coverageCount: coverages.length,
+        coverageRootSha256,
+        preCutoverWriteCount: preCutoverOperations.length,
+        preCutoverWriteRootSha256,
+        fleetStoppedAck: stagedInput.fleetStoppedAck,
+        legacyWritersDrainedAck: stagedInput.legacyWritersDrainedAck,
+        producerReadyAck: stagedInput.producerReadyAck,
+        activatedAtDbMs,
+        controlEvidenceSha256: control.activationEvidenceSha256,
+      };
+      const receipt:
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceipt = {
+        ...receiptBody,
+        receiptSha256: TenantTelemetryApplicationCapture
+          .tenantTelemetryApplicationActivationReceiptSha256(receiptBody),
+      };
+      for (const coverage of coverages) {
+        await this.insertTenantTelemetryApplicationCoverage(conn, coverage);
+      }
+      await conn.query(
+        `INSERT INTO tenant_telemetry_application_activation_receipts
+           (domain,control_generation,scope,request_sha256,producer_protocol,
+            producer_contract_sha256,ref_key_id_sha256,lifecycle_control_evidence_sha256,
+            lifecycle_target_sha256,lifecycle_target_receipt_sha256,coverage_count,
+            coverage_root_sha256,pre_cutover_write_count,pre_cutover_write_root_sha256,
+            fleet_stopped_ack,legacy_writers_drained_ack,producer_ready_ack,
+            activated_at_db_ms,control_evidence_sha256,receipt_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          receipt.domain,
+          receipt.controlGeneration,
+          receipt.scope,
+          receipt.requestSha256,
+          receipt.producerProtocol,
+          receipt.producerContractSha256,
+          receipt.refKeyIdSha256,
+          receipt.lifecycleControlEvidenceSha256,
+          receipt.lifecycleTargetSha256,
+          receipt.lifecycleTargetReceiptSha256,
+          receipt.coverageCount,
+          receipt.coverageRootSha256,
+          receipt.preCutoverWriteCount,
+          receipt.preCutoverWriteRootSha256,
+          receipt.fleetStoppedAck,
+          receipt.legacyWritersDrainedAck,
+          receipt.producerReadyAck,
+          receipt.activatedAtDbMs,
+          receipt.controlEvidenceSha256,
+          receipt.receiptSha256,
+        ],
+      );
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_telemetry_application_domain_controls
+            SET control_generation=1,state='active',activated_at_db_ms=?,capture_protocol=?,
+                producer_protocol=?,producer_contract_sha256=?,ref_key_id_sha256=?,
+                lifecycle_control_generation=1,lifecycle_control_evidence_sha256=?,
+                lifecycle_target_sha256=?,lifecycle_target_receipt_sha256=?,coverage_count=?,
+                coverage_root_sha256=?,pre_cutover_write_count=?,pre_cutover_write_root_sha256=?,
+                activation_evidence_sha256=?
+          WHERE domain=? AND control_generation=0 AND state='inactive'
+            AND activated_at_db_ms IS NULL AND capture_protocol IS NULL
+            AND producer_protocol IS NULL AND producer_contract_sha256 IS NULL
+            AND ref_key_id_sha256 IS NULL AND lifecycle_control_generation IS NULL
+            AND lifecycle_control_evidence_sha256 IS NULL AND lifecycle_target_sha256 IS NULL
+            AND lifecycle_target_receipt_sha256 IS NULL AND coverage_count IS NULL
+            AND coverage_root_sha256 IS NULL AND pre_cutover_write_count IS NULL
+            AND pre_cutover_write_root_sha256 IS NULL AND activation_evidence_sha256 IS NULL`,
+        [
+          control.activatedAtDbMs,
+          control.captureProtocol,
+          control.producerProtocol,
+          control.producerContractSha256,
+          control.refKeyIdSha256,
+          control.lifecycleControlEvidenceSha256,
+          control.lifecycleTargetSha256,
+          control.lifecycleTargetReceiptSha256,
+          control.coverageCount,
+          control.coverageRootSha256,
+          control.preCutoverWriteCount,
+          control.preCutoverWriteRootSha256,
+          control.activationEvidenceSha256,
+          control.domain,
+        ],
+      );
+      if (updated.affectedRows !== 1) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureConflictError();
+      }
+      const result = await this.assertTenantTelemetryApplicationDomainProjection(
+        conn,
+        control,
+        requestSha256,
+      );
+      await conn.commit();
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      if ((error as { code?: string }).code === "ER_DUP_ENTRY") {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureConflictError();
+      }
+      throw error;
+    } finally {
+      if (migrationLocked) {
+        await conn.query(
+          `SELECT RELEASE_LOCK(CONCAT('agent-service:migrate:',
+            LEFT(SHA2(DATABASE(),256),32)))`,
+        ).catch(() => {});
+      }
+      conn.release();
+    }
+  }
+
   // ---------- durable tenant telemetry writer ----------
   private requireTenantTelemetryWriterSchema(): void {
     if (!this.tenantTelemetryWriterSchemaInstalled) {
@@ -33727,6 +35168,69 @@ export class MysqlSessionStore implements
         job.inventory.artifactGeneration,
         lock,
       );
+      if (this.tenantTelemetryApplicationCaptureSchemaInstalled) {
+        const applicationControl = await this.readTenantTelemetryApplicationDomainControl(
+          executor,
+          job.inventory.domain,
+          lock,
+        );
+        const binding = await this.readTenantTelemetryApplicationWriteBinding(
+          executor,
+          job.writeOperationSha256,
+          lock,
+        );
+        if (applicationControl.state === "inactive") {
+          if (binding) throw new Error("inactive application domain has a write binding");
+        } else if (binding) {
+          const applicationCoverage = await this.readTenantTelemetryApplicationCoverage(
+            executor,
+            job.tenantId,
+            job.inventory.domain,
+            lock,
+          );
+          if (!applicationCoverage
+            || binding.tenantId !== job.tenantId
+            || binding.domain !== job.inventory.domain
+            || binding.controlEvidenceSha256
+              !== applicationControl.activationEvidenceSha256
+            || binding.coverageEvidenceSha256 !== applicationCoverage.evidenceSha256
+            || binding.lifecycleCoverageEvidenceSha256
+              !== applicationCoverage.lifecycleCoverageEvidenceSha256
+            || binding.targetSha256 !== job.target.targetSha256
+            || binding.targetReceiptSha256 !== job.target.receiptSha256
+            || binding.inventorySha256 !== job.inventory.inventorySha256
+            || binding.manifestSha256 !== job.inventory.manifestSha256
+            || binding.payloadSha256 !== job.inventory.payloadSha256
+            || binding.producerProtocol !== applicationControl.producerProtocol
+            || binding.producerContractSha256
+              !== applicationControl.producerContractSha256) {
+            throw new Error("tenant telemetry application write binding is invalid");
+          }
+        } else {
+          const [unboundRows] = await executor.query<Row[]>(
+            `SELECT j.write_operation_sha256
+               FROM tenant_telemetry_write_jobs j
+               LEFT JOIN tenant_telemetry_application_write_bindings b
+                 ON BINARY b.write_operation_sha256=BINARY j.write_operation_sha256
+              WHERE j.domain=? AND b.write_operation_sha256 IS NULL
+              ORDER BY j.write_operation_sha256 ${lock}`,
+            [job.inventory.domain],
+          );
+          const unboundOperations = unboundRows.map(
+            (row) => String(row.write_operation_sha256),
+          );
+          if (job.createdAtMs > applicationControl.activatedAtDbMs
+            || !unboundOperations.includes(job.writeOperationSha256)
+            || unboundOperations.length !== applicationControl.preCutoverWriteCount
+            || TenantTelemetryApplicationCapture
+              .tenantTelemetryApplicationPreCutoverWriteRootSha256(
+                job.inventory.domain,
+                unboundOperations,
+              ) !== applicationControl.preCutoverWriteRootSha256) {
+            throw new Error("tenant telemetry pre-cutover write projection is invalid");
+          }
+        }
+      }
       if (job.phase === "written") {
         if (payload || !ack || !inventory || !job.reservation
           || ack.tenantId !== job.tenantId
@@ -33841,6 +35345,9 @@ export class MysqlSessionStore implements
       operationSha256: string;
       payloadSha256: string;
       payloadByteLength: number;
+      applicationControl?:
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl;
+      applicationCoverage?: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage;
     }> {
     const [tenantLifecycleRows] = await conn.query<Row[]>(
       `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
@@ -33887,9 +35394,48 @@ export class MysqlSessionStore implements
     );
     const tenantRefSha256 = tenantTelemetrySubjectRefForTenantSha256(input.tenantId, refKey);
     if (!coverage
-      || coverage.historyStatus !== "complete_since_creation"
       || coverage.subjectRefSha256 !== tenantRefSha256
       || coverage.targetRootSha256 !== control.targetRootSha256) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+        "tenant telemetry durable writer requires lifecycle coverage",
+      );
+    }
+    let applicationControl:
+      TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl | undefined;
+    let applicationCoverage:
+      TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage | undefined;
+    if (this.tenantTelemetryApplicationCaptureSchemaInstalled) {
+      applicationControl = await this.readTenantTelemetryApplicationDomainControl(
+        conn,
+        input.domain,
+        "FOR SHARE",
+      );
+      applicationCoverage = await this.readTenantTelemetryApplicationCoverage(
+        conn,
+        input.tenantId,
+        input.domain,
+        "FOR SHARE",
+      ) ?? undefined;
+      if (applicationControl.state === "active") {
+        if (!applicationCoverage
+          || applicationCoverage.lifecycleCoverageEvidenceSha256 !== coverage.evidenceSha256
+          || applicationCoverage.lifecycleHistoryStatus !== coverage.historyStatus
+          || applicationCoverage.subjectRefSha256 !== coverage.subjectRefSha256
+          || applicationCoverage.targetSha256 !== target.targetSha256
+          || applicationCoverage.targetReceiptSha256 !== target.receiptSha256
+          || applicationCoverage.producerProtocol !== applicationControl.producerProtocol
+          || applicationCoverage.producerContractSha256
+            !== applicationControl.producerContractSha256) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError(
+            "tenant telemetry application capture coverage is missing",
+          );
+        }
+      } else if (applicationCoverage || coverage.historyStatus !== "complete_since_creation") {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+          "legacy tenant telemetry writes require an active application capture cutover",
+        );
+      }
+    } else if (coverage.historyStatus !== "complete_since_creation") {
       throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
         "tenant telemetry durable writer requires complete-since-creation coverage",
       );
@@ -34053,6 +35599,8 @@ export class MysqlSessionStore implements
       ),
       payloadSha256,
       payloadByteLength: TenantTelemetryWriter.tenantTelemetryArtifactPayloadByteLength(payload),
+      ...(applicationControl === undefined ? {} : { applicationControl }),
+      ...(applicationCoverage === undefined ? {} : { applicationCoverage }),
     };
   }
 
@@ -34088,8 +35636,87 @@ export class MysqlSessionStore implements
             || existing.inventory.artifactGeneration !== stagedInput.artifactGeneration) {
             throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
           }
+          const existingBinding = this.tenantTelemetryApplicationCaptureSchemaInstalled
+            ? await this.readTenantTelemetryApplicationWriteBinding(
+                conn,
+                staged.operationSha256,
+                "FOR SHARE",
+              )
+            : null;
+          if (existingBinding) {
+            if (staged.applicationControl?.state !== "active"
+              || stagedInput.producerProtocol !== staged.applicationControl.producerProtocol
+              || stagedInput.producerContractSha256
+                !== staged.applicationControl.producerContractSha256
+              || !staged.applicationCoverage
+              || existingBinding.tenantId !== existing.tenantId
+              || existingBinding.domain !== existing.inventory.domain
+              || existingBinding.controlEvidenceSha256
+                !== staged.applicationControl.activationEvidenceSha256
+              || existingBinding.coverageEvidenceSha256
+                !== staged.applicationCoverage.evidenceSha256
+              || existingBinding.lifecycleCoverageEvidenceSha256
+                !== staged.applicationCoverage.lifecycleCoverageEvidenceSha256
+              || existingBinding.targetSha256 !== existing.target.targetSha256
+              || existingBinding.targetReceiptSha256 !== existing.target.receiptSha256
+              || existingBinding.inventorySha256 !== existing.inventory.inventorySha256
+              || existingBinding.manifestSha256 !== existing.inventory.manifestSha256
+              || existingBinding.payloadSha256 !== existing.inventory.payloadSha256) {
+              throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+                "tenant telemetry application producer contract changed on exact replay",
+              );
+            }
+          } else {
+            if (stagedInput.producerProtocol !== undefined
+              || stagedInput.producerContractSha256 !== undefined) {
+              throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+                "pre-cutover tenant telemetry replay cannot gain a producer binding",
+              );
+            }
+            if (staged.applicationControl?.state === "active") {
+              const [unboundRows] = await conn.query<Row[]>(
+                `SELECT j.write_operation_sha256
+                   FROM tenant_telemetry_write_jobs j
+                   LEFT JOIN tenant_telemetry_application_write_bindings b
+                     ON BINARY b.write_operation_sha256=BINARY j.write_operation_sha256
+                  WHERE j.domain=? AND b.write_operation_sha256 IS NULL
+                  ORDER BY j.write_operation_sha256 FOR SHARE`,
+                [stagedInput.domain],
+              );
+              const unboundOperations = unboundRows.map(
+                (row) => String(row.write_operation_sha256),
+              );
+              if (!unboundOperations.includes(staged.operationSha256)
+                || unboundOperations.length
+                  !== staged.applicationControl.preCutoverWriteCount
+                || TenantTelemetryApplicationCapture
+                  .tenantTelemetryApplicationPreCutoverWriteRootSha256(
+                    stagedInput.domain,
+                    unboundOperations,
+                  ) !== staged.applicationControl.preCutoverWriteRootSha256) {
+                throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError(
+                  "tenant telemetry pre-cutover write projection changed",
+                );
+              }
+            }
+          }
           await conn.commit();
           return existing;
+        }
+        if (staged.applicationControl?.state === "active") {
+          if (stagedInput.producerProtocol !== staged.applicationControl.producerProtocol
+            || stagedInput.producerContractSha256
+              !== staged.applicationControl.producerContractSha256
+            || !staged.applicationCoverage) {
+            throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+              "tenant telemetry application producer contract does not match the active cutover",
+            );
+          }
+        } else if (stagedInput.producerProtocol !== undefined
+          || stagedInput.producerContractSha256 !== undefined) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+            "tenant telemetry application producer binding requires an active cutover",
+          );
         }
         const externalJob = await this.readTenantTelemetryWriteJobByExternalIdentity(
           conn,
@@ -34139,6 +35766,69 @@ export class MysqlSessionStore implements
         };
         TenantTelemetryWriter.validateTenantTelemetryWriteJobRecord(job);
         TenantTelemetryWriter.validateTenantTelemetryWritePayloadRecord(payloadRecord);
+        if (staged.applicationControl?.state === "active") {
+          const applicationCoverage = staged.applicationCoverage!;
+          const bindingBody:
+            TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBindingBody = {
+            scope: TenantTelemetryApplicationCapture
+              .TENANT_TELEMETRY_APPLICATION_WRITE_BINDING_SCOPE,
+            protocol: TenantTelemetryApplicationCapture
+              .TENANT_TELEMETRY_APPLICATION_CAPTURE_PROTOCOL,
+            writeOperationSha256: staged.operationSha256,
+            tenantId: stagedInput.tenantId,
+            domain: stagedInput.domain,
+            controlGeneration: 1,
+            controlEvidenceSha256: staged.applicationControl.activationEvidenceSha256,
+            coverageEvidenceSha256: applicationCoverage.evidenceSha256,
+            lifecycleCoverageEvidenceSha256:
+              applicationCoverage.lifecycleCoverageEvidenceSha256,
+            targetSha256: staged.target.targetSha256,
+            targetReceiptSha256: staged.target.receiptSha256,
+            producerProtocol: staged.applicationControl.producerProtocol,
+            producerContractSha256: staged.applicationControl.producerContractSha256,
+            inventorySha256: staged.inventory.inventorySha256,
+            manifestSha256: staged.inventory.manifestSha256,
+            payloadSha256: staged.inventory.payloadSha256,
+            boundAtDbMs: createdAtMs,
+          };
+          const binding:
+            TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding = {
+            ...bindingBody,
+            receiptSha256: TenantTelemetryApplicationCapture
+              .tenantTelemetryApplicationWriteBindingReceiptSha256(bindingBody),
+          };
+          TenantTelemetryApplicationCapture
+            .validateTenantTelemetryApplicationWriteBinding(binding);
+          await conn.query(
+            `INSERT INTO tenant_telemetry_application_write_bindings
+               (write_operation_sha256,scope,protocol,tenant_id,domain,control_generation,
+                control_evidence_sha256,coverage_evidence_sha256,
+                lifecycle_coverage_evidence_sha256,target_sha256,target_receipt_sha256,
+                producer_protocol,producer_contract_sha256,inventory_sha256,manifest_sha256,
+                payload_sha256,bound_at_db_ms,receipt_sha256)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [
+              binding.writeOperationSha256,
+              binding.scope,
+              binding.protocol,
+              binding.tenantId,
+              binding.domain,
+              binding.controlGeneration,
+              binding.controlEvidenceSha256,
+              binding.coverageEvidenceSha256,
+              binding.lifecycleCoverageEvidenceSha256,
+              binding.targetSha256,
+              binding.targetReceiptSha256,
+              binding.producerProtocol,
+              binding.producerContractSha256,
+              binding.inventorySha256,
+              binding.manifestSha256,
+              binding.payloadSha256,
+              binding.boundAtDbMs,
+              binding.receiptSha256,
+            ],
+          );
+        }
         await conn.query(
           `INSERT INTO tenant_telemetry_write_jobs
              (write_operation_sha256,tenant_id,protocol,phase,domain,target_sha256,

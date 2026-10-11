@@ -288,10 +288,14 @@ export type EnqueueTenantTelemetryArtifactInput = Omit<
   RegisterTenantTelemetryArtifactInput,
   "payloadSha256" | "manifestSha256"
 > & {
+  /** Present only after a 0035 per-domain application capture cutover. */
+  producerProtocol?: string;
+  /** Immutable digest of the exact producer/call-site contract admitted by that cutover. */
+  producerContractSha256?: string;
   payload: TenantTelemetryArtifactPayload;
 };
 
-const ENQUEUE_KEYS = [
+const ENQUEUE_REQUIRED_KEYS = [
   "tenantId",
   "expectedControlGeneration",
   "domain",
@@ -306,6 +310,32 @@ const ENQUEUE_KEYS = [
   "payload",
 ] as const;
 
+function enqueueKeys(
+  producerProtocolValue: unknown,
+  producerContractSha256: unknown,
+): string[] {
+  return [
+    ...ENQUEUE_REQUIRED_KEYS,
+    ...(producerProtocolValue === undefined ? [] : ["producerProtocol"]),
+    ...(producerContractSha256 === undefined ? [] : ["producerContractSha256"]),
+  ];
+}
+
+function validateApplicationProducerBinding(
+  producerProtocolValue: unknown,
+  producerContractSha256: unknown,
+): void {
+  if ((producerProtocolValue === undefined) !== (producerContractSha256 === undefined)) {
+    throw new Error("tenant telemetry application producer binding is incomplete");
+  }
+  if (producerProtocolValue === undefined) return;
+  if (typeof producerProtocolValue !== "string"
+    || !ADAPTER_PROTOCOL.test(producerProtocolValue)) {
+    throw new Error("tenant telemetry application producer protocol is invalid");
+  }
+  digest(producerContractSha256, "tenant telemetry application producer contract");
+}
+
 function validateCapturedEnqueueTenantTelemetryArtifactInput(
   input: EnqueueTenantTelemetryArtifactInput,
   payload: Readonly<TenantTelemetryArtifactPayload>,
@@ -316,6 +346,10 @@ function validateCapturedEnqueueTenantTelemetryArtifactInput(
   if (typeof input.sourceSchema !== "string") {
     throw new Error("tenant telemetry artifact source schema is invalid");
   }
+  validateApplicationProducerBinding(
+    input.producerProtocol,
+    input.producerContractSha256,
+  );
   // Reuse the 0033 owner/source validator with hashes computed only after protected staging.
   const placeholder = "0".repeat(64);
   const registration: RegisterTenantTelemetryArtifactInput = {
@@ -340,7 +374,11 @@ function validateCapturedEnqueueTenantTelemetryArtifactInput(
 export function validateEnqueueTenantTelemetryArtifactInput(
   input: EnqueueTenantTelemetryArtifactInput,
 ): Readonly<TenantTelemetryArtifactPayload> {
-  exactKeys(input, ENQUEUE_KEYS, "enqueue tenant telemetry artifact input");
+  exactKeys(
+    input,
+    enqueueKeys(input.producerProtocol, input.producerContractSha256),
+    "enqueue tenant telemetry artifact input",
+  );
   const payload = canonicalizeTenantTelemetryArtifactPayload(input.payload);
   validateCapturedEnqueueTenantTelemetryArtifactInput(input, payload);
   return payload;
@@ -363,7 +401,6 @@ export function captureTrustedEnqueueTenantTelemetryArtifactInput(
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError("enqueue tenant telemetry artifact input must be an object");
   }
-  exactKeys(value, ENQUEUE_KEYS, "enqueue tenant telemetry artifact input");
   const source = value as EnqueueTenantTelemetryArtifactInput;
   const tenantId = source.tenantId;
   const expectedControlGeneration = source.expectedControlGeneration;
@@ -376,7 +413,14 @@ export function captureTrustedEnqueueTenantTelemetryArtifactInput(
   const sourceSchema = source.sourceSchema;
   const sourceGeneration = source.sourceGeneration;
   const sourceHighWaterDbMs = source.sourceHighWaterDbMs;
+  const producerProtocolValue = source.producerProtocol;
+  const producerContractSha256 = source.producerContractSha256;
   const sourcePayload = source.payload;
+  exactKeys(
+    value,
+    enqueueKeys(producerProtocolValue, producerContractSha256),
+    "enqueue tenant telemetry artifact input",
+  );
   const payload = captureTrustedTenantTelemetryArtifactPayloadAdmission(sourcePayload, {
     tenantId,
     ownerKind,
@@ -395,6 +439,12 @@ export function captureTrustedEnqueueTenantTelemetryArtifactInput(
     sourceSchema,
     sourceGeneration,
     sourceHighWaterDbMs,
+    ...(producerProtocolValue === undefined
+      ? {}
+      : { producerProtocol: producerProtocolValue }),
+    ...(producerContractSha256 === undefined
+      ? {}
+      : { producerContractSha256 }),
     payload,
   };
   validateCapturedEnqueueTenantTelemetryArtifactInput(input, payload);

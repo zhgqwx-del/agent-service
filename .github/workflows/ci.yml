@@ -102,6 +102,12 @@ jobs:
           pnpm run test:tenant-telemetry-lifecycle
           pnpm run test:tenant-telemetry-lifecycle-memory
 
+      # 0035 separates per-domain application capture from the 0033 sink lifecycle control.
+      # Existing tenants retain an explicit pre-cutover gap and post-cutover writes carry the
+      # exact producer contract; keep the protocol and Memory rollback/concurrency proofs named.
+      - name: Tenant telemetry application capture unit suites (must execute)
+        run: pnpm run test:tenant-telemetry-application-capture
+
       # 0034 persists a closed payload before any external mutation, then uses create-only
       # adapter inspection and a claim-bound ACK to publish inventory and remove the spool.
       - name: Durable tenant telemetry writer unit suites (must execute)
@@ -119,6 +125,11 @@ jobs:
         env:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:tenant-telemetry-lifecycle-mysql
+
+      - name: Tenant telemetry application capture real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-telemetry-application-capture-mysql
 
       - name: Durable tenant telemetry writer real MySQL suite (must execute)
         env:
@@ -446,8 +457,9 @@ jobs:
       # offline-mover ledger, 0028 -> 0029 dormant credential-target execution, 0029 -> 0030
       # independent restore-journal/runtime-lineage, 0030 -> 0031 authoritative backup-catalog and
       # 0031 -> 0032 default-dormant telemetry inventory, 0032 -> 0033 receipt/inventory
-      # activation and 0033 -> 0034 durable writer replay matrices.
-      - name: Historical MySQL migrations (0007 through 0034, no skips)
+      # activation, 0033 -> 0034 durable writer and 0034 -> 0035 application-capture
+      # cutover/replay matrices.
+      - name: Historical MySQL migrations (0007 through 0035, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -606,6 +618,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0032_tenant_telemetry_lifecycle.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0033_tenant_telemetry_activation_inventory.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0034_tenant_telemetry_durable_writer.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0035_tenant_telemetry_application_capture.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

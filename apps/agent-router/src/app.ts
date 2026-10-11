@@ -1538,9 +1538,6 @@ export function createRouterApp(deps: RouterAppDeps) {
         deps.registry.markFailure(target);
         telemetry.warn("router.upstream_unreachable", {
           targetRef: telemetry.opaqueRef("runner", target),
-          subjectRef: sessionId
-            ? telemetry.opaqueRef("session", sessionId)
-            : undefined,
           errorKind: telemetryErrorKind(err),
           attempt,
         });
@@ -1578,15 +1575,11 @@ export function createRouterApp(deps: RouterAppDeps) {
         const ownerUrl = owner ? deps.registry.routeableUrl(owner) : undefined;
         if (owner && !ownerUrl) {
           telemetry.warn("router.owner_unconfigured", {
-            ownerRef: telemetry.opaqueRef("owner", owner),
-            subjectRef: telemetry.opaqueRef("session", sessionId),
             errorKind: "unavailable",
           });
         }
         if (ownerUrl && !tried.has(ownerUrl)) {
           telemetry.info("router.owner_reroute", {
-            ownerRef: telemetry.opaqueRef("owner", ownerUrl),
-            subjectRef: telemetry.opaqueRef("session", sessionId),
             attempt,
           });
           reroutes += 1;

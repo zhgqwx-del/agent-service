@@ -378,15 +378,16 @@ try {
     "0032_tenant_telemetry_lifecycle.sql",
     "0033_tenant_telemetry_activation_inventory.sql",
     "0034_tenant_telemetry_durable_writer.sql",
+    "0035_tenant_telemetry_application_capture.sql",
   ];
   const [migrationRows] = await inspection.query(
-    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?,?,?) ORDER BY name",
+    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?,?,?,?) ORDER BY name",
     expectedMigrationNames,
   );
   if (
     migrationRows.length !== expectedMigrationNames.length
     || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
-  ) throw new Error("runner did not apply migrations 0027 through 0034");
+  ) throw new Error("runner did not apply migrations 0027 through 0035");
   const [telemetryControlRows] = await inspection.query(
     `SELECT control_generation,activated_at_db_ms,lifecycle_protocol,writer_protocol,
             ref_key_id_sha256,target_count,target_root_sha256,activation_evidence_sha256
@@ -425,6 +426,34 @@ try {
     ]
       .some((field) => Number(telemetryEvidenceRows[0][field]) !== 0)) {
     throw new Error("0033/0034 telemetry activation, inventory and writer spool were not installed empty");
+  }
+  const [telemetryApplicationControlRows] = await inspection.query(
+    `SELECT domain,control_generation,state,activated_at_db_ms,capture_protocol,
+            producer_protocol,producer_contract_sha256,activation_evidence_sha256
+       FROM tenant_telemetry_application_domain_controls ORDER BY domain`,
+  );
+  if (telemetryApplicationControlRows.length !== 2
+    || telemetryApplicationControlRows[0].domain !== "logs"
+    || telemetryApplicationControlRows[1].domain !== "traces"
+    || telemetryApplicationControlRows.some((row) => Number(row.control_generation) !== 0
+      || row.state !== "inactive"
+      || row.activated_at_db_ms !== null
+      || row.capture_protocol !== null
+      || row.producer_protocol !== null
+      || row.producer_contract_sha256 !== null
+      || row.activation_evidence_sha256 !== null)) {
+    throw new Error("0035 telemetry application capture controls were not installed dormant");
+  }
+  const [telemetryApplicationEvidenceRows] = await inspection.query(
+    `SELECT
+       (SELECT COUNT(*) FROM tenant_telemetry_application_activation_receipts) AS activation_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_application_coverages) AS coverage_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_application_write_bindings) AS binding_count`,
+  );
+  if (telemetryApplicationEvidenceRows.length !== 1
+    || ["activation_count", "coverage_count", "binding_count"]
+      .some((field) => Number(telemetryApplicationEvidenceRows[0][field]) !== 0)) {
+    throw new Error("0035 telemetry application capture evidence was not installed empty");
   }
   const [controlRows] = await inspection.query(
     `SELECT control_generation,storage_backend,namespace_sha256,
@@ -557,7 +586,7 @@ if (failure) {
 } else if (verified) {
   console.log(
     `real S3 application assembly passed (${mode} runner/router, disposable MySQL, `
-      + "0027 activation, 0031 dormant catalog, 0034 dormant telemetry writer, "
+      + "0027 activation, 0031 dormant catalog, 0034/0035 dormant telemetry capture, "
       + "exact namespace negotiation, credential isolation)",
   );
 }

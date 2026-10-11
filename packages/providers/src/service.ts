@@ -21,6 +21,7 @@ import {
   assertPublicHost,
   type ProviderResolver,
   type ResolvedModel,
+  type TenantTelemetryApplicationDualWrite,
   type TenantRuntimeCoordinator,
   type TenantRuntimeDrainIdentity,
   type TenantRuntimeLease,
@@ -63,6 +64,11 @@ export interface ProviderServiceOptions {
   credentialTargetReferenceProtector?: CredentialTargetReferenceProtector;
   /** Structured, allowlisted telemetry. Omit to use a process-local opaque-ref key and JSON console sink. */
   telemetry?: StructuredTelemetry;
+  /**
+   * Optional default-dormant durable application boundary. When present, tenant-scoped provider
+   * events use its producer-authenticated owner admission instead of process-only logging.
+   */
+  tenantTelemetry?: Pick<TenantTelemetryApplicationDualWrite, "warn">;
 }
 
 /**
@@ -395,10 +401,27 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
             ...(signal ? { signal } : {}),
           });
         } catch (error) {
-          this.telemetry.warn("provider.upstream_request_failed", {
-            ownerRef: this.telemetry.opaqueRef("tenant", tenantId),
-            errorKind: telemetryErrorKind(error),
-          });
+          const fields = { errorKind: telemetryErrorKind(error) } as const;
+          try {
+            if (this.opts.tenantTelemetry) {
+              await this.opts.tenantTelemetry.warn({
+                tenantId,
+                ownerKind: "tenant",
+                ownerId: tenantId,
+                ownerUserId: null,
+              }, "provider.upstream_request_failed", fields);
+            } else {
+              // Without the managed owner-scoped capture boundary, retain only a content-free
+              // operational signal. An opaque tenant ref is still durable owner data and must not
+              // escape into an unmanaged process log.
+              this.telemetry.warn("provider.upstream_request_failed", {
+                ...fields,
+              });
+            }
+          } catch {
+            // Telemetry is diagnostic. A broken sink must not replace the provider failure that
+            // controls the caller-visible retry/error semantics.
+          }
           throw error;
         }
         try {

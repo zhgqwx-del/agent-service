@@ -93,6 +93,18 @@ describe("runner configuration", () => {
     expect(cfg.DATA_EXPORT_REQUESTS_ENABLED).toBe(false);
     expect(cfg.DATA_EXPORT_WORKER_ENABLED).toBe(false);
     expect(cfg.DATA_EXPORT_CLEANUP_ENABLED).toBe(false);
+    expect(cfg.TENANT_TELEMETRY_REF_KEY).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_WRITER_ENABLED).toBe(false);
+    expect(cfg.TENANT_TELEMETRY_WRITER_ADAPTER).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_FILESYSTEM_DIR).toBe("./.data/telemetry");
+    expect(cfg.TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER).toBe(false);
+    expect(cfg.TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_WRITER_POLL_MS).toBe(1_000);
+    expect(cfg.TENANT_TELEMETRY_WRITER_LEASE_MS).toBe(30_000);
+    expect(cfg.TENANT_TELEMETRY_WRITER_BATCH_SIZE).toBe(25);
+    expect(cfg.TENANT_TELEMETRY_WRITER_RETRY_BASE_MS).toBe(1_000);
+    expect(cfg.TENANT_TELEMETRY_WRITER_RETRY_MAX_MS).toBe(60_000);
     expect(cfg.dataExportArtifactsReadable).toBe(false);
     expect(cfg.DATA_EXPORT_WORKER_POLL_MS).toBe(1_000);
     expect(cfg.DATA_EXPORT_WORKER_LEASE_MS).toBe(30_000);
@@ -125,6 +137,92 @@ describe("runner configuration", () => {
     expect(cfg.ERASURE_WORKER_REQUEST_TIMEOUT_MS).toBe(20_000);
     expect(cfg.BLOB_MAX_BYTES).toBe(1_000_000);
     expect(cfg.BLOB_MAX_HYDRATED_BYTES).toBe(4_000_000);
+  });
+
+  it("keeps durable telemetry writing default-off and local filesystem explicitly non-production", () => {
+    const base = {
+      SECRETS_MASTER_KEY: SECRET,
+      STORE: "mysql",
+      TENANT_TELEMETRY_WRITER_ENABLED: "1",
+    };
+    expect(() => loadConfig(base)).toThrow(/TENANT_TELEMETRY_WRITER_ADAPTER=filesystem/);
+    expect(() => loadConfig({
+      ...base,
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+    })).toThrow(/TENANT_TELEMETRY_REF_KEY/);
+    expect(() => loadConfig({
+      ...base,
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+      TENANT_TELEMETRY_REF_KEY: "12".repeat(32),
+    })).toThrow(/namespace and failure-domain/);
+
+    const enabled = loadConfig({
+      ...base,
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+      TENANT_TELEMETRY_REF_KEY: "12".repeat(32),
+      TENANT_TELEMETRY_FILESYSTEM_DIR: "./private-telemetry",
+      TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER: "1",
+      TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID: "local-telemetry-v1",
+      TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID: "developer-host-v1",
+      TENANT_TELEMETRY_WRITER_POLL_MS: "11",
+      TENANT_TELEMETRY_WRITER_LEASE_MS: "1200",
+      TENANT_TELEMETRY_WRITER_BATCH_SIZE: "7",
+      TENANT_TELEMETRY_WRITER_RETRY_BASE_MS: "13",
+      TENANT_TELEMETRY_WRITER_RETRY_MAX_MS: "17",
+    });
+    expect(enabled).toMatchObject({
+      TENANT_TELEMETRY_WRITER_ENABLED: true,
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+      TENANT_TELEMETRY_FILESYSTEM_DIR: "./private-telemetry",
+      TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER: true,
+      TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID: "local-telemetry-v1",
+      TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID: "developer-host-v1",
+      TENANT_TELEMETRY_WRITER_POLL_MS: 11,
+      TENANT_TELEMETRY_WRITER_LEASE_MS: 1_200,
+      TENANT_TELEMETRY_WRITER_BATCH_SIZE: 7,
+      TENANT_TELEMETRY_WRITER_RETRY_BASE_MS: 13,
+      TENANT_TELEMETRY_WRITER_RETRY_MAX_MS: 17,
+    });
+
+    expect(() => loadConfig({
+      ...base,
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+      TENANT_TELEMETRY_REF_KEY: "12".repeat(32),
+      TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID: "local-telemetry-v1",
+      TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID: "developer-host-v1",
+      TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER: "1",
+      TENANT_TELEMETRY_WRITER_RETRY_BASE_MS: "18",
+      TENANT_TELEMETRY_WRITER_RETRY_MAX_MS: "17",
+    })).toThrow(/TENANT_TELEMETRY_WRITER_RETRY_MAX_MS/);
+    expect(() => loadConfig({
+      ...base,
+      STORE: "memory",
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+      TENANT_TELEMETRY_REF_KEY: "12".repeat(32),
+      TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID: "local-telemetry-v1",
+      TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID: "developer-host-v1",
+      TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER: "1",
+    })).toThrow(/STORE=mysql/);
+    expect(() => loadConfig({
+      ...base,
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+      TENANT_TELEMETRY_REF_KEY: "12".repeat(32),
+      TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID: "local-telemetry-v1",
+      TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID: "developer-host-v1",
+    })).toThrow(/SINGLE_RUNNER=1/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID: "orphan-config",
+    })).toThrow(/require TENANT_TELEMETRY_WRITER_ADAPTER/);
+    expect(() => loadConfig({
+      NODE_ENV: "production",
+      STORE: "mysql",
+      REDIS_URL: "redis://redis:6379",
+      RUNNER_ADDR: "runner.internal:8787",
+      INTERNAL_ROUTER_TOKEN: "runner-private-router-token-0000000001",
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+    })).toThrow(/local-only and forbidden in production/);
   });
 
   it("keeps Redis purge behind MySQL, Redis, namespace, and router gates", () => {

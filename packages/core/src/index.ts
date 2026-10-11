@@ -28,3 +28,4 @@ export * from "./lifecycle/tenant-database-purge-worker.js";
 export * from "./lifecycle/tenant-redis-purge-worker.js";
 export * from "./lifecycle/tenant-telemetry-writer-worker.js";
 export * from "./lifecycle/tenant-runtime-coordinator.js";
+export * from "./telemetry/tenant-telemetry-application-dual-write.js";

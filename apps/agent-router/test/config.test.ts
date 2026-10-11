@@ -312,6 +312,14 @@ describe("router configuration", () => {
       ["SECRETS_MASTER_KEY", "a".repeat(64)],
       ["BOOTSTRAP_API_KEY", "must-not-enter-router"],
       ["ADMIN_BOOTSTRAP_OUTPUT_FILE", "/run/secrets/admin-key"],
+      ["TENANT_TELEMETRY_REF_KEY", "12".repeat(32)],
+      ["TENANT_TELEMETRY_WRITER_ENABLED", "1"],
+      ["TENANT_TELEMETRY_WRITER_ADAPTER", "filesystem"],
+      ["TENANT_TELEMETRY_FILESYSTEM_DIR", "/private/telemetry"],
+      ["TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER", "1"],
+      ["TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID", "local-v1"],
+      ["TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID", "host-v1"],
+      ["TENANT_TELEMETRY_WRITER_POLL_MS", "1000"],
       ["S3_TEST_SECRET_ACCESS_KEY", "must-not-enter-router"],
     ] as const) {
       expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))

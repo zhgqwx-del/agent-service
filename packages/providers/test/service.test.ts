@@ -660,12 +660,35 @@ describe("ProviderService", () => {
       fields: { errorKind: "network" },
       traceId: parent.traceId,
     });
-    expect(records[0]!.fields.ownerRef).toMatch(/^oref_tenant_[0-9a-f]{64}$/);
+    expect(records[0]!.fields.ownerRef).toBeUndefined();
     const encoded = JSON.stringify(records);
     expect(encoded).not.toContain(tenantId);
     expect(encoded).not.toContain("user-private");
     expect(encoded).not.toContain("raw-secret");
     expect(encoded).not.toContain("private.invalid");
     expect(encoded).not.toContain("provider-secret");
+  });
+
+  it("preserves the upstream provider error when the fallback telemetry sink throws", async () => {
+    const upstreamFailure = new TypeError("upstream unavailable");
+    const telemetry = createStructuredTelemetry({
+      component: "provider",
+      opaqueRefKey: Buffer.alloc(32, 10),
+      sink: { write: () => { throw new Error("telemetry sink failed"); } },
+    });
+    const svc = new ProviderService({
+      store: new MemorySessionStore(),
+      cipher: new LocalAesGcmCipher(KEY),
+      assertBaseUrl,
+      platform: [ProviderService.preset("deepseek", "platform-key")],
+      telemetry,
+      fetch: async () => { throw upstreamFailure; },
+    });
+    const model = await svc.resolve(
+      { tenantId: "tenant-a", userId: "user-a" },
+      { provider: "deepseek", model: "deepseek-chat" },
+    );
+
+    await expect(model.fetch!("https://provider.example/fail")).rejects.toBe(upstreamFailure);
   });
 });

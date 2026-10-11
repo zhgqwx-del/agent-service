@@ -838,6 +838,7 @@ import * as BackupCatalog from "./backup-catalog.js";
 import * as BackupCatalogAdapter from "./backup-catalog-adapter/common.js";
 import * as TenantTelemetry from "./tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "./tenant-telemetry-writer.js";
+import * as TenantTelemetryApplicationCapture from "./tenant-telemetry-application-capture.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -1144,7 +1145,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1352,6 +1353,25 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     string,
     TenantTelemetryWriter.TenantTelemetryWriteAck
   >();
+  tenantTelemetryApplicationDomainControls = new Map<
+    TenantTelemetry.TenantTelemetryDomain,
+    TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl
+  >(TenantTelemetry.TENANT_TELEMETRY_DOMAINS.map((domain) => [
+    domain,
+    { domain, state: "inactive" as const, controlGeneration: 0 as const },
+  ]));
+  tenantTelemetryApplicationActivationReceipts = new Map<
+    TenantTelemetry.TenantTelemetryDomain,
+    TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceipt
+  >();
+  tenantTelemetryApplicationCoverages = new Map<
+    string,
+    TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage
+  >();
+  tenantTelemetryApplicationWriteBindings = new Map<
+    string,
+    TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding
+  >();
   tenantRuntimeRevocationJobs = new Map<string, TenantRuntimeRevocationJobRecord>();
   tenantRuntimeRevocationTargetReceipts = new Map<string, TenantRuntimeRevocationTargetReceipt>();
   tenantRuntimeRevocationReceipts = new Map<string, TenantRuntimeRevocationReceipt>();
@@ -1473,6 +1493,140 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     // two tenants from claiming the same immutable external object generation while scoped reads
     // below still avoid turning that global uniqueness fence into a cross-tenant oracle.
     return JSON.stringify([domain, artifactIdSha256, artifactGeneration]);
+  }
+
+  private tenantTelemetryApplicationCoverageMapKey(
+    tenantId: string,
+    domain: TenantTelemetry.TenantTelemetryDomain,
+  ): string {
+    return JSON.stringify([tenantId, domain]);
+  }
+
+  private readMemoryTenantTelemetryApplicationDomainControl(
+    domain: TenantTelemetry.TenantTelemetryDomain,
+  ): TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl {
+    const control = this.tenantTelemetryApplicationDomainControls.get(domain);
+    try {
+      if (!control
+        || control.domain !== domain
+        || this.tenantTelemetryApplicationDomainControls.size !== 2) {
+        throw new Error("tenant telemetry application domain control is missing");
+      }
+      TenantTelemetryApplicationCapture
+        .validateTenantTelemetryApplicationDomainControl(control);
+      return control;
+    } catch (error) {
+      if (error instanceof TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError) throw error;
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+  }
+
+  private buildMemoryTenantTelemetryApplicationCoverage(
+    tenantId: string,
+    domain: TenantTelemetry.TenantTelemetryDomain,
+    captureStatus: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStatus,
+    preCutoverHistoryStatus:
+      TenantTelemetryApplicationCapture.TenantTelemetryApplicationPreCutoverHistoryStatus,
+    coverageStartedAtDbMs: number,
+    lifecycleCoverage: TenantTelemetry.TenantTelemetryLifecycleCoverageRecord,
+    target: TenantTelemetry.TenantTelemetryLifecycleTargetRecord,
+    producerProtocol: string,
+    producerContractSha256: string,
+  ): TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage {
+    const body: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverageBody = {
+      tenantId,
+      domain,
+      controlGeneration: 1,
+      scope: TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_COVERAGE_SCOPE,
+      captureStatus,
+      preCutoverHistoryStatus,
+      lifecycleCoverageEvidenceSha256: lifecycleCoverage.evidenceSha256,
+      lifecycleHistoryStatus: lifecycleCoverage.historyStatus,
+      subjectRefSha256: lifecycleCoverage.subjectRefSha256,
+      targetSha256: target.targetSha256,
+      targetReceiptSha256: target.receiptSha256,
+      producerProtocol,
+      producerContractSha256,
+      coverageStartedAtDbMs,
+    };
+    const coverage: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage = {
+      ...body,
+      evidenceSha256:
+        TenantTelemetryApplicationCapture
+          .tenantTelemetryApplicationCoverageEvidenceSha256(body),
+    };
+    TenantTelemetryApplicationCapture.validateTenantTelemetryApplicationCoverage(coverage);
+    return coverage;
+  }
+
+  private stageTenantTelemetryApplicationCoveragesForTenantMutation(
+    tenantId: string,
+    canonicalTenantExisted: boolean,
+    tenantCreatedAtMs: number,
+    lifecycleCoverage: TenantTelemetry.TenantTelemetryLifecycleCoverageRecord | undefined,
+  ): TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage[] {
+    const staged: TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage[] = [];
+    for (const domain of TenantTelemetry.TENANT_TELEMETRY_DOMAINS) {
+      const control = this.readMemoryTenantTelemetryApplicationDomainControl(domain);
+      const key = this.tenantTelemetryApplicationCoverageMapKey(tenantId, domain);
+      const existing = this.tenantTelemetryApplicationCoverages.get(key);
+      if (control.state === "inactive") {
+        if (existing) {
+          throw new TenantTelemetryApplicationCapture
+            .TenantTelemetryApplicationCaptureIntegrityError();
+        }
+        continue;
+      }
+      if (canonicalTenantExisted) {
+        if (!existing) {
+          throw new TenantTelemetryApplicationCapture
+            .TenantTelemetryApplicationCaptureIntegrityError(
+              "active application capture domain has an uncovered tenant",
+            );
+        }
+        continue;
+      }
+      if (existing || !lifecycleCoverage) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+      if (tenantCreatedAtMs < control.activatedAtDbMs) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError(
+            "tenant telemetry application trusted clock precedes activation",
+          );
+      }
+      const target = this.tenantTelemetryLifecycleTargets.get(domain);
+      if (!target) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+      staged.push(this.buildMemoryTenantTelemetryApplicationCoverage(
+        tenantId,
+        domain,
+        "capture_since_tenant_creation",
+        "pre_cutover_not_applicable",
+        tenantCreatedAtMs,
+        lifecycleCoverage,
+        target,
+        control.producerProtocol,
+        control.producerContractSha256,
+      ));
+    }
+    return staged;
+  }
+
+  private publishMemoryTenantTelemetryApplicationCoverages(
+    coverages: readonly TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage[],
+  ): void {
+    for (const coverage of coverages) {
+      this.tenantTelemetryApplicationCoverages.set(
+        this.tenantTelemetryApplicationCoverageMapKey(coverage.tenantId, coverage.domain),
+        clone(coverage),
+      );
+    }
   }
 
   private canonicalTenantTelemetryTenantIds(): string[] {
@@ -1961,6 +2115,196 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     }
   }
 
+  private assertTenantTelemetryApplicationCaptureGlobalRelations(): void {
+    try {
+      const lifecycleControl = this.readMemoryTenantTelemetryLifecycleControl();
+      const canonicalTenantIds = lifecycleControl.state === "active"
+        ? this.canonicalTenantTelemetryTenantIds()
+        : [];
+      const canonicalTenants = new Set(canonicalTenantIds);
+
+      for (const domain of TenantTelemetry.TENANT_TELEMETRY_DOMAINS) {
+        const control = this.readMemoryTenantTelemetryApplicationDomainControl(domain);
+        const receipt = this.tenantTelemetryApplicationActivationReceipts.get(domain);
+        const domainCoverages = [...this.tenantTelemetryApplicationCoverages.values()]
+          .filter((coverage) => coverage.domain === domain);
+        const domainBindings = [...this.tenantTelemetryApplicationWriteBindings.values()]
+          .filter((binding) => binding.domain === domain);
+        if (control.state === "inactive") {
+          if (receipt || domainCoverages.length !== 0 || domainBindings.length !== 0) {
+            throw new Error("inactive application capture domain has durable evidence");
+          }
+          continue;
+        }
+        if (lifecycleControl.state !== "active" || !receipt) {
+          throw new Error("active application capture lacks lifecycle or receipt");
+        }
+        TenantTelemetryApplicationCapture
+          .validateTenantTelemetryApplicationActivationReceipt(receipt);
+        const target = this.tenantTelemetryLifecycleTargets.get(domain);
+        if (!target) throw new Error("application capture target is missing");
+        const requestInput: TenantTelemetryApplicationCapture
+          .ActivateTenantTelemetryApplicationCaptureInput = {
+          domain,
+          expectedControlGeneration: 0,
+          expectedLifecycleControlGeneration: 1,
+          lifecycleControlEvidenceSha256: receipt.lifecycleControlEvidenceSha256,
+          lifecycleTargetSha256: receipt.lifecycleTargetSha256,
+          lifecycleTargetReceiptSha256: receipt.lifecycleTargetReceiptSha256,
+          producerProtocol: receipt.producerProtocol,
+          producerContractSha256: receipt.producerContractSha256,
+          fleetStoppedAck: receipt.fleetStoppedAck,
+          legacyWritersDrainedAck: receipt.legacyWritersDrainedAck,
+          producerReadyAck: receipt.producerReadyAck,
+        };
+        if (receipt.requestSha256
+            !== TenantTelemetryApplicationCapture
+              .tenantTelemetryApplicationActivationRequestSha256(requestInput)
+          || receipt.controlEvidenceSha256 !== control.activationEvidenceSha256
+          || receipt.domain !== control.domain
+          || receipt.controlGeneration !== control.controlGeneration
+          || receipt.producerProtocol !== control.producerProtocol
+          || receipt.producerContractSha256 !== control.producerContractSha256
+          || receipt.refKeyIdSha256 !== control.refKeyIdSha256
+          || receipt.lifecycleControlEvidenceSha256
+            !== control.lifecycleControlEvidenceSha256
+          || receipt.lifecycleTargetSha256 !== control.lifecycleTargetSha256
+          || receipt.lifecycleTargetReceiptSha256
+            !== control.lifecycleTargetReceiptSha256
+          || receipt.coverageCount !== control.coverageCount
+          || receipt.coverageRootSha256 !== control.coverageRootSha256
+          || receipt.preCutoverWriteCount !== control.preCutoverWriteCount
+          || receipt.preCutoverWriteRootSha256 !== control.preCutoverWriteRootSha256
+          || receipt.activatedAtDbMs !== control.activatedAtDbMs
+          || control.refKeyIdSha256 !== lifecycleControl.refKeyIdSha256
+          || control.lifecycleControlEvidenceSha256
+            !== lifecycleControl.activationEvidenceSha256
+          || control.lifecycleTargetSha256 !== target.targetSha256
+          || control.lifecycleTargetReceiptSha256 !== target.receiptSha256) {
+          throw new Error("application capture activation binding is invalid");
+        }
+
+        const activationCoverages:
+          TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage[] = [];
+        const coveredTenants = new Set<string>();
+        for (const coverage of domainCoverages) {
+          TenantTelemetryApplicationCapture.validateTenantTelemetryApplicationCoverage(coverage);
+          const key = this.tenantTelemetryApplicationCoverageMapKey(
+            coverage.tenantId,
+            coverage.domain,
+          );
+          const lifecycleCoverage = this.tenantTelemetryLifecycleCoverages.get(
+            coverage.tenantId,
+          );
+          if (this.tenantTelemetryApplicationCoverages.get(key) !== coverage
+            || !canonicalTenants.has(coverage.tenantId)
+            || coveredTenants.has(coverage.tenantId)
+            || !lifecycleCoverage
+            || coverage.controlGeneration !== control.controlGeneration
+            || coverage.lifecycleCoverageEvidenceSha256
+              !== lifecycleCoverage.evidenceSha256
+            || coverage.lifecycleHistoryStatus !== lifecycleCoverage.historyStatus
+            || coverage.subjectRefSha256 !== lifecycleCoverage.subjectRefSha256
+            || coverage.targetSha256 !== target.targetSha256
+            || coverage.targetReceiptSha256 !== target.receiptSha256
+            || coverage.producerProtocol !== control.producerProtocol
+            || coverage.producerContractSha256 !== control.producerContractSha256) {
+            throw new Error("application capture coverage binding is invalid");
+          }
+          coveredTenants.add(coverage.tenantId);
+          if (coverage.captureStatus === "capture_since_cutover") {
+            if (coverage.coverageStartedAtDbMs !== control.activatedAtDbMs) {
+              throw new Error("application cutover coverage timestamp is invalid");
+            }
+            activationCoverages.push(coverage);
+          } else {
+            const tenantLifecycle = this.subjectLifecycles.get(subjectLifecycleKey(
+              coverage.tenantId,
+              "tenant",
+              coverage.tenantId,
+            ));
+            if (!tenantLifecycle
+              || coverage.coverageStartedAtDbMs !== tenantLifecycle.createdAtMs
+              || coverage.coverageStartedAtDbMs < control.activatedAtDbMs) {
+              throw new Error("application creation coverage timestamp is invalid");
+            }
+          }
+        }
+        if (coveredTenants.size !== canonicalTenantIds.length
+          || canonicalTenantIds.some((tenantId) => !coveredTenants.has(tenantId))
+          || control.coverageCount !== activationCoverages.length
+          || control.coverageRootSha256
+            !== TenantTelemetryApplicationCapture
+              .tenantTelemetryApplicationCoverageRootSha256(domain, activationCoverages)) {
+          throw new Error("application capture coverage set is incomplete");
+        }
+
+        const unboundOperations = [...this.tenantTelemetryWriteJobs.values()]
+          .filter((job) => job.inventory.domain === domain
+            && !this.tenantTelemetryApplicationWriteBindings.has(job.writeOperationSha256))
+          .map((job) => job.writeOperationSha256);
+        if (control.preCutoverWriteCount !== unboundOperations.length
+          || control.preCutoverWriteRootSha256
+            !== TenantTelemetryApplicationCapture
+              .tenantTelemetryApplicationPreCutoverWriteRootSha256(
+                domain,
+                unboundOperations,
+              )) {
+          throw new Error("application capture pre-cutover write set changed");
+        }
+      }
+
+      for (const [key, coverage] of this.tenantTelemetryApplicationCoverages) {
+        if (key !== this.tenantTelemetryApplicationCoverageMapKey(
+          coverage.tenantId,
+          coverage.domain,
+        )) throw new Error("application capture coverage index is invalid");
+        const control = this.readMemoryTenantTelemetryApplicationDomainControl(coverage.domain);
+        if (control.state !== "active") {
+          throw new Error("application capture coverage belongs to an inactive domain");
+        }
+      }
+
+      for (const [operationSha256, binding]
+        of this.tenantTelemetryApplicationWriteBindings) {
+        TenantTelemetryApplicationCapture
+          .validateTenantTelemetryApplicationWriteBinding(binding);
+        const job = this.tenantTelemetryWriteJobs.get(operationSha256);
+        const control = this.readMemoryTenantTelemetryApplicationDomainControl(binding.domain);
+        const coverage = this.tenantTelemetryApplicationCoverages.get(
+          this.tenantTelemetryApplicationCoverageMapKey(binding.tenantId, binding.domain),
+        );
+        if (operationSha256 !== binding.writeOperationSha256
+          || !job
+          || control.state !== "active"
+          || !coverage
+          || job.tenantId !== binding.tenantId
+          || job.inventory.domain !== binding.domain
+          || job.inventory.targetSha256 !== binding.targetSha256
+          || job.target.receiptSha256 !== binding.targetReceiptSha256
+          || job.inventory.inventorySha256 !== binding.inventorySha256
+          || job.inventory.manifestSha256 !== binding.manifestSha256
+          || job.inventory.payloadSha256 !== binding.payloadSha256
+          || binding.controlEvidenceSha256 !== control.activationEvidenceSha256
+          || binding.coverageEvidenceSha256 !== coverage.evidenceSha256
+          || binding.lifecycleCoverageEvidenceSha256
+            !== coverage.lifecycleCoverageEvidenceSha256
+          || binding.producerProtocol !== control.producerProtocol
+          || binding.producerContractSha256 !== control.producerContractSha256
+          || binding.boundAtDbMs < control.activatedAtDbMs
+          || binding.boundAtDbMs < coverage.coverageStartedAtDbMs
+          || binding.boundAtDbMs < job.createdAtMs) {
+          throw new Error("application capture write binding is invalid");
+        }
+      }
+    } catch (error) {
+      if (error instanceof TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError) throw error;
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureIntegrityError();
+    }
+  }
+
   private assertTenantTelemetryLifecycleGlobalRelations(): void {
     const control = this.readMemoryTenantTelemetryLifecycleControl();
     if (control.state === "inactive") {
@@ -1971,6 +2315,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || this.tenantTelemetryArtifactInventories.size !== 0) {
         throw new TenantTelemetry.TenantTelemetryLifecycleIntegrityError();
       }
+      this.assertTenantTelemetryApplicationCaptureGlobalRelations();
       return;
     }
     try {
@@ -2088,6 +2433,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (error instanceof TenantTelemetry.TenantTelemetryLifecycleIntegrityError) throw error;
       throw new TenantTelemetry.TenantTelemetryLifecycleIntegrityError();
     }
+    this.assertTenantTelemetryApplicationCaptureGlobalRelations();
   }
 
   private assertTenantTelemetryWriterGlobalRelations(): void {
@@ -2221,9 +2567,31 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const target = targets.find((candidate) => candidate.domain === input.domain);
     if (!target) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
     const coverage = this.tenantTelemetryCoverageForRead(input.tenantId, control, refKey);
-    if (!coverage || coverage.historyStatus !== "complete_since_creation") {
+    if (!coverage) {
       throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
-        "tenant telemetry durable writer requires complete-since-creation coverage",
+        "tenant telemetry durable writer requires lifecycle coverage",
+      );
+    }
+    const applicationControl = this.readMemoryTenantTelemetryApplicationDomainControl(
+      input.domain,
+    );
+    const applicationCoverage = this.tenantTelemetryApplicationCoverages.get(
+      this.tenantTelemetryApplicationCoverageMapKey(input.tenantId, input.domain),
+    );
+    if (applicationControl.state === "active") {
+      if (!applicationCoverage
+        || applicationCoverage.lifecycleCoverageEvidenceSha256 !== coverage.evidenceSha256
+        || applicationCoverage.targetSha256 !== target.targetSha256
+        || applicationCoverage.producerProtocol !== applicationControl.producerProtocol
+        || applicationCoverage.producerContractSha256
+          !== applicationControl.producerContractSha256) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError(
+          "tenant telemetry application capture coverage is missing",
+        );
+      }
+    } else if (coverage.historyStatus !== "complete_since_creation") {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+        "legacy tenant telemetry writes require an active application capture cutover",
       );
     }
     const tenantRefSha256 = TenantTelemetry.tenantTelemetryOwnerRefSha256(
@@ -2395,19 +2763,30 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     key: string;
     lifecycle: SubjectLifecycleRecord | undefined;
     coverage: TenantTelemetry.TenantTelemetryLifecycleCoverageRecord | undefined;
+    applicationCoverages:
+      TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage[];
   } {
     const key = subjectLifecycleKey(tenantId, "tenant", tenantId);
     const existing = this.subjectLifecycles.get(key);
+    const coverage = this.stageTenantTelemetryCoverageForTenantMutation(
+      tenantId,
+      existing !== undefined,
+      existing?.createdAtMs ?? createdAtMs,
+    );
+    const applicationCoverages =
+      this.stageTenantTelemetryApplicationCoveragesForTenantMutation(
+        tenantId,
+        existing !== undefined,
+        existing?.createdAtMs ?? createdAtMs,
+        coverage ?? this.tenantTelemetryLifecycleCoverages.get(tenantId),
+      );
     return {
       key,
       lifecycle: existing === undefined
         ? clone(this.activeSubjectRecord(tenantId, "tenant", tenantId, createdAtMs))
         : undefined,
-      coverage: this.stageTenantTelemetryCoverageForTenantMutation(
-        tenantId,
-        existing !== undefined,
-        existing?.createdAtMs ?? createdAtMs,
-      ),
+      coverage,
+      applicationCoverages,
     };
   }
 
@@ -3418,6 +3797,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const prior = this.retentionPolicies.get(key);
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     const coveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
+    const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     try {
       if (tenantStage.lifecycle) {
         this.subjectLifecycles.set(tenantStage.key, tenantStage.lifecycle);
@@ -3428,9 +3808,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           tenantStage.coverage,
         );
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantStage.applicationCoverages,
+      );
       this.retentionPolicies.set(key, record);
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        applicationCoveragesBefore,
+      );
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, coveragesBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
       restoreMapEntry(this.retentionPolicies, key, existed, prior);
@@ -3527,6 +3914,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const priorEvents = this.retentionPolicyActivationEvents.get(stagedInput.tenantId);
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     const coveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
+    const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     try {
       if (tenantStage.lifecycle) {
         this.subjectLifecycles.set(tenantStage.key, tenantStage.lifecycle);
@@ -3537,10 +3925,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           tenantStage.coverage,
         );
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantStage.applicationCoverages,
+      );
       this.retentionPolicyControls.set(stagedInput.tenantId, next);
       this.retentionPolicyActivationEvents.set(stagedInput.tenantId, nextEvents);
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        applicationCoveragesBefore,
+      );
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, coveragesBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
       restoreMapEntry(
@@ -6756,12 +7151,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const priorIdempotency = this.erasureIdempotency.get(idempotencyKey);
     const coverageExisted = this.tenantTelemetryLifecycleCoverages.has(input.tenantId);
     const priorCoverage = this.tenantTelemetryLifecycleCoverages.get(input.tenantId);
+    const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     const priorExportState = this.captureUserDataExportState();
     try {
       if (stagedTenant) this.subjectLifecycles.set(tenantKey, stagedTenant);
       if (tenantStage.coverage) {
         this.tenantTelemetryLifecycleCoverages.set(input.tenantId, tenantStage.coverage);
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantStage.applicationCoverages,
+      );
       this.subjectLifecycles.set(userKey, stagedUser);
       this.erasureRequests.set(input.requestId, stagedRequest);
       this.erasureAuditEvents.set(input.requestId, [stagedAudit]);
@@ -6770,6 +7169,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
       this.restoreUserDataExportState(priorExportState);
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        applicationCoveragesBefore,
+      );
       restoreMapEntry(
         this.tenantTelemetryLifecycleCoverages,
         input.tenantId,
@@ -10492,6 +10895,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const restoreJobsBefore = new Map(this.tenantRestoreJournalPublicationJobs);
     const restoreTargetsBefore = new Map(this.tenantRestoreJournalPublicationTargets);
     const coveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
+    const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     const telemetrySubjectsBefore = new Map(this.tenantTelemetryLifecycleSubjects);
     try {
       this.tenantErasureAdmissions.set(stagedInput.requestId, stagedRequest);
@@ -10530,9 +10934,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           tenantStage.coverage,
         );
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantStage.applicationCoverages,
+      );
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
       restoreMapSnapshot(this.tenantTelemetryLifecycleSubjects, telemetrySubjectsBefore);
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        applicationCoveragesBefore,
+      );
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, coveragesBefore);
       restoreMapSnapshot(this.tenantRestoreJournalPublicationTargets, restoreTargetsBefore);
       restoreMapSnapshot(this.tenantRestoreJournalPublicationJobs, restoreJobsBefore);
@@ -21120,6 +21531,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const agentsBefore = new Map(this.agents);
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     const coveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
+    const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     try {
       if (tenantStage.lifecycle) {
         this.subjectLifecycles.set(tenantStage.key, tenantStage.lifecycle);
@@ -21127,11 +21539,18 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (tenantStage.coverage) {
         this.tenantTelemetryLifecycleCoverages.set(staged.tenantId, tenantStage.coverage);
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantStage.applicationCoverages,
+      );
       this.agents.set(agentKey, staged);
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
       restoreMapSnapshot(this.agents, agentsBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        applicationCoveragesBefore,
+      );
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, coveragesBefore);
       throw error;
     }
@@ -21217,6 +21636,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const priorEvents = this.events.get(session.id);
     const coverageExisted = this.tenantTelemetryLifecycleCoverages.has(session.tenantId);
     const priorCoverage = this.tenantTelemetryLifecycleCoverages.get(session.tenantId);
+    const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     try {
       if (tenantStage.lifecycle ?? stagedTenant) {
         this.subjectLifecycles.set(tenantKey, (tenantStage.lifecycle ?? stagedTenant)!);
@@ -21224,11 +21644,18 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (tenantStage.coverage) {
         this.tenantTelemetryLifecycleCoverages.set(session.tenantId, tenantStage.coverage);
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantStage.applicationCoverages,
+      );
       if (stagedUser) this.subjectLifecycles.set(userKey, stagedUser);
       this.sessions.set(session.id, stagedSession);
       this.events.set(session.id, [stagedEvent]);
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        applicationCoveragesBefore,
+      );
       restoreMapEntry(this.events, session.id, eventsExisted, priorEvents);
       restoreMapEntry(this.sessions, session.id, sessionExisted, priorSession);
       restoreMapEntry(this.subjectLifecycles, userKey, userExisted, priorUser);
@@ -21588,6 +22015,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       return clone(existing);
     }
 
+    if (this.readMemoryTenantTelemetryApplicationDomainControl(
+      stagedInput.domain,
+    ).state === "active") {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureConflictError(
+          "active application capture requires durable writer enqueue",
+        );
+    }
+
     const ownerTenantLifecycle = this.assertTenantWritable(stagedInput.tenantId);
     if (!ownerTenantLifecycle
       || ownerTenantLifecycle.subjectKind !== "tenant"
@@ -21716,6 +22152,239 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return clone(inventory?.tenantId === tenantId ? inventory : null);
   }
 
+  // ---------- tenant telemetry application capture cutover ----------
+  async listTenantTelemetryApplicationDomainControls(
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl[]> {
+    this.assertTenantTelemetryLifecycleGlobalRelations();
+    return TenantTelemetry.TENANT_TELEMETRY_DOMAINS.map((domain) =>
+      clone(this.readMemoryTenantTelemetryApplicationDomainControl(domain)));
+  }
+
+  async getTenantTelemetryApplicationDomainControl(
+    domain: TenantTelemetry.TenantTelemetryDomain,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationDomainControl> {
+    if (!(TenantTelemetry.TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(domain)) {
+      throw new Error("tenant telemetry application domain is invalid");
+    }
+    this.assertTenantTelemetryLifecycleGlobalRelations();
+    return clone(this.readMemoryTenantTelemetryApplicationDomainControl(domain));
+  }
+
+  async getTenantTelemetryApplicationActivationReceipt(
+    domain: TenantTelemetry.TenantTelemetryDomain,
+  ): Promise<
+    TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceipt | null
+  > {
+    if (!(TenantTelemetry.TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(domain)) {
+      throw new Error("tenant telemetry application domain is invalid");
+    }
+    this.assertTenantTelemetryLifecycleGlobalRelations();
+    return clone(this.tenantTelemetryApplicationActivationReceipts.get(domain) ?? null);
+  }
+
+  async getTenantTelemetryApplicationCoverage(
+    tenantId: string,
+    domain: TenantTelemetry.TenantTelemetryDomain,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage | null> {
+    if (typeof tenantId !== "string" || tenantId.length < 1 || tenantId.length > 128
+      || !(TenantTelemetry.TENANT_TELEMETRY_DOMAINS as readonly unknown[]).includes(domain)) {
+      throw new Error("tenant telemetry application coverage lookup is invalid");
+    }
+    this.assertTenantTelemetryLifecycleGlobalRelations();
+    return clone(this.tenantTelemetryApplicationCoverages.get(
+      this.tenantTelemetryApplicationCoverageMapKey(tenantId, domain),
+    ) ?? null);
+  }
+
+  async getTenantTelemetryApplicationWriteBinding(
+    tenantId: string,
+    writeOperationSha256: string,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding | null> {
+    if (typeof tenantId !== "string" || tenantId.length < 1 || tenantId.length > 128
+      || !/^[0-9a-f]{64}$/.test(writeOperationSha256)) {
+      throw new Error("tenant telemetry application write binding lookup is invalid");
+    }
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const binding = this.tenantTelemetryApplicationWriteBindings.get(writeOperationSha256);
+    return clone(binding?.tenantId === tenantId ? binding : null);
+  }
+
+  async activateTenantTelemetryApplicationCapture(
+    input: TenantTelemetryApplicationCapture.ActivateTenantTelemetryApplicationCaptureInput,
+  ): Promise<TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationResult> {
+    const stagedInput = clone(input);
+    TenantTelemetryApplicationCapture
+      .validateActivateTenantTelemetryApplicationCaptureInput(stagedInput);
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const current = this.readMemoryTenantTelemetryApplicationDomainControl(
+      stagedInput.domain,
+    );
+    const requestSha256 = TenantTelemetryApplicationCapture
+      .tenantTelemetryApplicationActivationRequestSha256(stagedInput);
+    if (current.state === "active") {
+      const receipt = this.tenantTelemetryApplicationActivationReceipts.get(
+        stagedInput.domain,
+      );
+      if (!receipt || receipt.requestSha256 !== requestSha256) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureConflictError();
+      }
+      return clone({ control: current, receipt });
+    }
+
+    const lifecycleControl = this.readMemoryTenantTelemetryLifecycleControl();
+    if (lifecycleControl.state !== "active") {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureConflictError(
+          "tenant telemetry lifecycle must be active before application capture",
+        );
+    }
+    const refKeyIdSha256 = TenantTelemetry.tenantTelemetryRefKeyIdSha256(
+      this.tenantTelemetryRefKeyForUse(),
+    );
+    const target = this.tenantTelemetryLifecycleTargets.get(stagedInput.domain);
+    if (!target
+      || stagedInput.lifecycleControlEvidenceSha256
+        !== lifecycleControl.activationEvidenceSha256
+      || stagedInput.lifecycleTargetSha256 !== target.targetSha256
+      || stagedInput.lifecycleTargetReceiptSha256 !== target.receiptSha256) {
+      throw new TenantTelemetryApplicationCapture
+        .TenantTelemetryApplicationCaptureConflictError(
+          "tenant telemetry application activation source changed",
+        );
+    }
+
+    const tenantIds = this.canonicalTenantTelemetryTenantIds();
+    const lifecycleCoverages = tenantIds.map((tenantId) => {
+      const coverage = this.tenantTelemetryLifecycleCoverages.get(tenantId);
+      if (!coverage) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+      return coverage;
+    });
+    const preCutoverOperations = [...this.tenantTelemetryWriteJobs.values()]
+      .filter((job) => job.inventory.domain === stagedInput.domain)
+      .map((job) => job.writeOperationSha256);
+    const activatedAtDbMs = Math.max(
+      this.storeNowMs(),
+      lifecycleControl.activatedAtDbMs,
+      ...lifecycleCoverages.map((coverage) => coverage.coverageStartedAtDbMs),
+      ...[...this.tenantTelemetryWriteJobs.values()]
+        .filter((job) => job.inventory.domain === stagedInput.domain)
+        .map((job) => job.updatedAtMs),
+    );
+    const coverages = tenantIds.map((tenantId, index) =>
+      this.buildMemoryTenantTelemetryApplicationCoverage(
+        tenantId,
+        stagedInput.domain,
+        "capture_since_cutover",
+        "pre_cutover_history_unknown",
+        activatedAtDbMs,
+        lifecycleCoverages[index]!,
+        target,
+        stagedInput.producerProtocol,
+        stagedInput.producerContractSha256,
+      ));
+    const coverageRootSha256 = TenantTelemetryApplicationCapture
+      .tenantTelemetryApplicationCoverageRootSha256(stagedInput.domain, coverages);
+    const preCutoverWriteRootSha256 = TenantTelemetryApplicationCapture
+      .tenantTelemetryApplicationPreCutoverWriteRootSha256(
+        stagedInput.domain,
+        preCutoverOperations,
+      );
+    const controlBody:
+      TenantTelemetryApplicationCapture.ActiveTenantTelemetryApplicationDomainControlBody = {
+      domain: stagedInput.domain,
+      state: "active",
+      controlGeneration: 1,
+      scope:
+        TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_DOMAIN_CONTROL_SCOPE,
+      captureProtocol:
+        TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_CAPTURE_PROTOCOL,
+      producerProtocol: stagedInput.producerProtocol,
+      producerContractSha256: stagedInput.producerContractSha256,
+      refKeyIdSha256,
+      lifecycleControlGeneration: 1,
+      lifecycleControlEvidenceSha256: lifecycleControl.activationEvidenceSha256,
+      lifecycleTargetSha256: target.targetSha256,
+      lifecycleTargetReceiptSha256: target.receiptSha256,
+      coverageCount: coverages.length,
+      coverageRootSha256,
+      preCutoverWriteCount: preCutoverOperations.length,
+      preCutoverWriteRootSha256,
+      activatedAtDbMs,
+    };
+    const control:
+      TenantTelemetryApplicationCapture.ActiveTenantTelemetryApplicationDomainControl = {
+      ...controlBody,
+      activationEvidenceSha256: TenantTelemetryApplicationCapture
+        .tenantTelemetryApplicationDomainControlEvidenceSha256(controlBody),
+    };
+    const receiptBody:
+      TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceiptBody = {
+      domain: stagedInput.domain,
+      controlGeneration: 1,
+      scope:
+        TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_ACTIVATION_RECEIPT_SCOPE,
+      requestSha256,
+      producerProtocol: stagedInput.producerProtocol,
+      producerContractSha256: stagedInput.producerContractSha256,
+      refKeyIdSha256,
+      lifecycleControlEvidenceSha256: lifecycleControl.activationEvidenceSha256,
+      lifecycleTargetSha256: target.targetSha256,
+      lifecycleTargetReceiptSha256: target.receiptSha256,
+      coverageCount: coverages.length,
+      coverageRootSha256,
+      preCutoverWriteCount: preCutoverOperations.length,
+      preCutoverWriteRootSha256,
+      fleetStoppedAck: stagedInput.fleetStoppedAck,
+      legacyWritersDrainedAck: stagedInput.legacyWritersDrainedAck,
+      producerReadyAck: stagedInput.producerReadyAck,
+      activatedAtDbMs,
+      controlEvidenceSha256: control.activationEvidenceSha256,
+    };
+    const receipt:
+      TenantTelemetryApplicationCapture.TenantTelemetryApplicationActivationReceipt = {
+      ...receiptBody,
+      receiptSha256: TenantTelemetryApplicationCapture
+        .tenantTelemetryApplicationActivationReceiptSha256(receiptBody),
+    };
+    TenantTelemetryApplicationCapture.validateTenantTelemetryApplicationDomainControl(control);
+    TenantTelemetryApplicationCapture
+      .validateTenantTelemetryApplicationActivationReceipt(receipt);
+
+    const controlsBefore = new Map(this.tenantTelemetryApplicationDomainControls);
+    const receiptsBefore = new Map(this.tenantTelemetryApplicationActivationReceipts);
+    const coveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    try {
+      for (const coverage of coverages) {
+        this.tenantTelemetryApplicationCoverages.set(
+          this.tenantTelemetryApplicationCoverageMapKey(
+            coverage.tenantId,
+            coverage.domain,
+          ),
+          clone(coverage),
+        );
+      }
+      this.tenantTelemetryApplicationActivationReceipts.set(
+        stagedInput.domain,
+        clone(receipt),
+      );
+      this.tenantTelemetryApplicationDomainControls.set(
+        stagedInput.domain,
+        clone(control),
+      );
+      this.assertTenantTelemetryLifecycleGlobalRelations();
+    } catch (error) {
+      restoreMapSnapshot(this.tenantTelemetryApplicationCoverages, coveragesBefore);
+      restoreMapSnapshot(this.tenantTelemetryApplicationActivationReceipts, receiptsBefore);
+      restoreMapSnapshot(this.tenantTelemetryApplicationDomainControls, controlsBefore);
+      throw error;
+    }
+    return clone({ control, receipt });
+  }
+
   // ---------- durable tenant telemetry writer ----------
   async enqueueTenantTelemetryArtifact(
     input: TenantTelemetryWriter.EnqueueTenantTelemetryArtifactInput,
@@ -21725,6 +22394,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       TenantTelemetryWriter.captureTrustedEnqueueTenantTelemetryArtifactInput(input, refKey);
     this.assertTenantTelemetryWriterGlobalRelations();
     const staged = this.stageMemoryTenantTelemetryWrite(stagedInput, payload);
+    const applicationControl = this.readMemoryTenantTelemetryApplicationDomainControl(
+      stagedInput.domain,
+    );
     const existing = this.tenantTelemetryWriteJobs.get(staged.operationSha256);
     if (existing) {
       if (existing.tenantId !== stagedInput.tenantId
@@ -21735,7 +22407,39 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || existing.inventory.artifactGeneration !== stagedInput.artifactGeneration) {
         throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError();
       }
+      const existingBinding = this.tenantTelemetryApplicationWriteBindings.get(
+        staged.operationSha256,
+      );
+      if (existingBinding) {
+        if (applicationControl.state !== "active"
+          || stagedInput.producerProtocol !== applicationControl.producerProtocol
+          || stagedInput.producerContractSha256
+            !== applicationControl.producerContractSha256) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+            "tenant telemetry application producer contract changed on exact replay",
+          );
+        }
+      } else if (stagedInput.producerProtocol !== undefined
+        || stagedInput.producerContractSha256 !== undefined) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+          "pre-cutover tenant telemetry replay cannot gain a producer binding",
+        );
+      }
       return clone(existing);
+    }
+    if (applicationControl.state === "active") {
+      if (stagedInput.producerProtocol !== applicationControl.producerProtocol
+        || stagedInput.producerContractSha256
+          !== applicationControl.producerContractSha256) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+          "tenant telemetry application producer contract does not match the active cutover",
+        );
+      }
+    } else if (stagedInput.producerProtocol !== undefined
+      || stagedInput.producerContractSha256 !== undefined) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+        "tenant telemetry application producer binding requires an active cutover",
+      );
     }
     const inventoryKey = this.tenantTelemetryArtifactMapKey(
       staged.inventory.domain,
@@ -21773,13 +22477,65 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     };
     TenantTelemetryWriter.validateTenantTelemetryWriteJobRecord(job);
     TenantTelemetryWriter.validateTenantTelemetryWritePayloadRecord(payloadRecord);
+    let applicationBinding:
+      TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding | undefined;
+    if (applicationControl.state === "active") {
+      const applicationCoverage = this.tenantTelemetryApplicationCoverages.get(
+        this.tenantTelemetryApplicationCoverageMapKey(
+          stagedInput.tenantId,
+          stagedInput.domain,
+        ),
+      );
+      if (!applicationCoverage) {
+        throw new TenantTelemetryApplicationCapture
+          .TenantTelemetryApplicationCaptureIntegrityError();
+      }
+      const bindingBody:
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBindingBody = {
+        scope:
+          TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_WRITE_BINDING_SCOPE,
+        protocol:
+          TenantTelemetryApplicationCapture.TENANT_TELEMETRY_APPLICATION_CAPTURE_PROTOCOL,
+        writeOperationSha256: staged.operationSha256,
+        tenantId: stagedInput.tenantId,
+        domain: stagedInput.domain,
+        controlGeneration: 1,
+        controlEvidenceSha256: applicationControl.activationEvidenceSha256,
+        coverageEvidenceSha256: applicationCoverage.evidenceSha256,
+        lifecycleCoverageEvidenceSha256:
+          applicationCoverage.lifecycleCoverageEvidenceSha256,
+        targetSha256: staged.target.targetSha256,
+        targetReceiptSha256: staged.target.receiptSha256,
+        producerProtocol: applicationControl.producerProtocol,
+        producerContractSha256: applicationControl.producerContractSha256,
+        inventorySha256: staged.inventory.inventorySha256,
+        manifestSha256: staged.inventory.manifestSha256,
+        payloadSha256: staged.inventory.payloadSha256,
+        boundAtDbMs: createdAtMs,
+      };
+      applicationBinding = {
+        ...bindingBody,
+        receiptSha256: TenantTelemetryApplicationCapture
+          .tenantTelemetryApplicationWriteBindingReceiptSha256(bindingBody),
+      };
+      TenantTelemetryApplicationCapture
+        .validateTenantTelemetryApplicationWriteBinding(applicationBinding);
+    }
     const jobsBefore = new Map(this.tenantTelemetryWriteJobs);
     const payloadsBefore = new Map(this.tenantTelemetryWritePayloads);
+    const bindingsBefore = new Map(this.tenantTelemetryApplicationWriteBindings);
     try {
       this.tenantTelemetryWritePayloads.set(staged.operationSha256, clone(payloadRecord));
       this.tenantTelemetryWriteJobs.set(staged.operationSha256, clone(job));
+      if (applicationBinding) {
+        this.tenantTelemetryApplicationWriteBindings.set(
+          staged.operationSha256,
+          clone(applicationBinding),
+        );
+      }
       this.assertTenantTelemetryWriterGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(this.tenantTelemetryApplicationWriteBindings, bindingsBefore);
       restoreMapSnapshot(this.tenantTelemetryWriteJobs, jobsBefore);
       restoreMapSnapshot(this.tenantTelemetryWritePayloads, payloadsBefore);
       throw error;
@@ -23974,6 +24730,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const targetsBefore = new Map(this.tenantCredentialTargetDispositions);
     const targetReferencesBefore = new Map(this.tenantCredentialTargetReferenceCiphers);
     const telemetryCoveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
+    const telemetryApplicationCoveragesBefore = new Map(
+      this.tenantTelemetryApplicationCoverages,
+    );
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     try {
       if (tenantLifecycleStage.lifecycle) {
@@ -23986,6 +24745,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           clone(tenantLifecycleStage.coverage),
         );
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantLifecycleStage.applicationCoverages,
+      );
       if (stagedSubject && !this.tenantCredentialTrackingSubjects.has(stagedConfig.tenantId)) {
         this.tenantCredentialTrackingSubjects.set(stagedConfig.tenantId, clone(stagedSubject));
       }
@@ -24014,6 +24776,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       this.providers.set(key, stagedProvider);
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        telemetryApplicationCoveragesBefore,
+      );
       restoreMapSnapshot(this.providers, providersBefore);
       restoreMapSnapshot(this.tenants, tenantsBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
@@ -24209,6 +24975,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     );
     const coverageExisted = this.tenantTelemetryLifecycleCoverages.has(tenantId);
     const priorCoverage = this.tenantTelemetryLifecycleCoverages.get(tenantId);
+    const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     try {
       if (tenantLifecycleStage.lifecycle) {
@@ -24229,6 +24996,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           clone(tenantLifecycleStage.coverage),
         );
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantLifecycleStage.applicationCoverages,
+      );
       if (stagedSubject && !subjectExisted) {
         this.tenantCredentialTrackingSubjects.set(tenantId, stagedSubject);
       }
@@ -24240,6 +25010,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       });
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        applicationCoveragesBefore,
+      );
       restoreMapEntry(this.tenants, tenantId, tenantExisted, priorTenant);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
       restoreMapEntry(
@@ -24431,6 +25205,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const versionsBefore = new Map(this.tenantCredentialVersions);
     const targetsBefore = new Map(this.tenantCredentialTargetDispositions);
     const telemetryCoveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
+    const telemetryApplicationCoveragesBefore = new Map(
+      this.tenantTelemetryApplicationCoverages,
+    );
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     try {
       if (tenantLifecycleStage.lifecycle) {
@@ -24458,8 +25235,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           clone(tenantLifecycleStage.coverage),
         );
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantLifecycleStage.applicationCoverages,
+      );
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        telemetryApplicationCoveragesBefore,
+      );
       restoreMapSnapshot(this.tenants, tenantsBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
       restoreMapSnapshot(this.tenantCredentialTrackingSubjects, subjectsBefore);
@@ -25347,6 +26131,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const priorUser = this.subjectLifecycles.get(userKey);
     const coverageExisted = this.tenantTelemetryLifecycleCoverages.has(stagedInput.tenantId);
     const priorCoverage = this.tenantTelemetryLifecycleCoverages.get(stagedInput.tenantId);
+    const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     try {
       if (!tenant) this.subjectLifecycles.set(tenantKey, clone(stagedTenant));
       if (tenantStage.coverage) {
@@ -25355,6 +26140,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           clone(tenantStage.coverage),
         );
       }
+      this.publishMemoryTenantTelemetryApplicationCoverages(
+        tenantStage.applicationCoverages,
+      );
       if (!user) this.subjectLifecycles.set(userKey, clone(stagedUser));
       this.userDataExportRequests.set(request.requestId, request);
       this.userDataExportJobs.set(request.requestId, job);
@@ -25362,6 +26150,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
       this.restoreUserDataExportState(prior);
+      restoreMapSnapshot(
+        this.tenantTelemetryApplicationCoverages,
+        applicationCoveragesBefore,
+      );
       restoreMapEntry(
         this.tenantTelemetryLifecycleCoverages,
         stagedInput.tenantId,

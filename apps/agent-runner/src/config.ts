@@ -253,6 +253,33 @@ const Env = z.object({
   DATA_EXPORT_CLEANUP_RETRY_MAX_MS: z.coerce.number().int().min(1).max(600_000).default(60_000),
   DATA_EXPORT_CLEANUP_POISON_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(100).default(3),
   DATA_EXPORT_DOWNLOAD_LEASE_MS: z.coerce.number().int().min(1_000).max(60_000).default(30_000),
+  /** Exact 32-byte HMAC key bound by the generation-1 telemetry lifecycle control. */
+  TENANT_TELEMETRY_REF_KEY: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+  /** Embedded durable writer. Once lifecycle generation 1 is active every runner must enable it. */
+  TENANT_TELEMETRY_WRITER_ENABLED: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  /** Local filesystem is a real restart-durable development sink, never a production backend. */
+  TENANT_TELEMETRY_WRITER_ADAPTER: z.enum(["filesystem"]).optional(),
+  TENANT_TELEMETRY_FILESYSTEM_DIR: z.string().min(1).default("./.data/telemetry"),
+  /** Explicit acknowledgement that exactly one runner owns this host-local namespace. */
+  TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER: z.enum(["0", "1"])
+    .default("0")
+    .transform((value) => value === "1"),
+  TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID:
+    z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/).optional(),
+  TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID:
+    z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/).optional(),
+  TENANT_TELEMETRY_WRITER_POLL_MS:
+    z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_TELEMETRY_WRITER_LEASE_MS:
+    z.coerce.number().int().min(100).max(600_000).default(30_000),
+  TENANT_TELEMETRY_WRITER_BATCH_SIZE:
+    z.coerce.number().int().min(1).max(100).default(25),
+  TENANT_TELEMETRY_WRITER_RETRY_BASE_MS:
+    z.coerce.number().int().min(1).max(300_000).default(1_000),
+  TENANT_TELEMETRY_WRITER_RETRY_MAX_MS:
+    z.coerce.number().int().min(1).max(600_000).default(60_000),
   /** 32-byte hex key that encrypts BYOK secrets at rest. No default: a silent all-zero key is worse than a crash. */
   SECRETS_MASTER_KEY: z.string().regex(/^[0-9a-f]{64}$/i, "SECRETS_MASTER_KEY must be 64 hex chars (32 bytes)"),
   /** Dev convenience: seeds a tenant + api key on boot. Refused when NODE_ENV=production. */
@@ -539,6 +566,44 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       "filesystem user-export artifacts are unsupported in production until a shared object-store adapter is configured",
     );
   }
+  if (production && c.TENANT_TELEMETRY_WRITER_ADAPTER === "filesystem") {
+    throw new Error(
+      "TENANT_TELEMETRY_WRITER_ADAPTER=filesystem is local-only and forbidden in production",
+    );
+  }
+  if (c.TENANT_TELEMETRY_WRITER_ENABLED) {
+    if (c.TENANT_TELEMETRY_WRITER_ADAPTER !== "filesystem") {
+      throw new Error(
+        "TENANT_TELEMETRY_WRITER_ADAPTER=filesystem is required before enabling the local telemetry writer",
+      );
+    }
+    if (!c.TENANT_TELEMETRY_REF_KEY) {
+      throw new Error(
+        "TENANT_TELEMETRY_REF_KEY is required before TENANT_TELEMETRY_WRITER_ENABLED=1",
+      );
+    }
+    if (!c.TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID
+      || !c.TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID) {
+      throw new Error(
+        "filesystem telemetry writer requires namespace and failure-domain identities",
+      );
+    }
+    if (c.STORE !== "mysql") {
+      throw new Error("STORE=mysql is required before TENANT_TELEMETRY_WRITER_ENABLED=1");
+    }
+    if (!c.TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER) {
+      throw new Error(
+        "TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER=1 is required for the local filesystem sink",
+      );
+    }
+  }
+  if (c.TENANT_TELEMETRY_WRITER_ADAPTER === undefined
+    && (c.TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID !== undefined
+      || c.TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID !== undefined)) {
+    throw new Error(
+      "filesystem telemetry identities require TENANT_TELEMETRY_WRITER_ADAPTER=filesystem",
+    );
+  }
   if (!c.RUNNER_ADDR && WILDCARD_HOSTS.has(c.RUNNER_HOST)) {
     throw new Error("RUNNER_ADDR is required when RUNNER_HOST is a wildcard bind address");
   }
@@ -577,6 +642,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   }
   if (c.DATA_EXPORT_CLEANUP_RETRY_MAX_MS < c.DATA_EXPORT_CLEANUP_RETRY_BASE_MS) {
     throw new Error("DATA_EXPORT_CLEANUP_RETRY_MAX_MS must be at least DATA_EXPORT_CLEANUP_RETRY_BASE_MS");
+  }
+  if (c.TENANT_TELEMETRY_WRITER_RETRY_MAX_MS
+    < c.TENANT_TELEMETRY_WRITER_RETRY_BASE_MS) {
+    throw new Error(
+      "TENANT_TELEMETRY_WRITER_RETRY_MAX_MS must be at least "
+        + "TENANT_TELEMETRY_WRITER_RETRY_BASE_MS",
+    );
   }
   if (c.ERASURE_WORKER_REQUEST_TIMEOUT_MS <= c.ERASURE_DRAIN_TIMEOUT_MS + ERASURE_REQUEST_TIMEOUT_MARGIN_MS) {
     throw new Error(

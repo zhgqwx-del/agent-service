@@ -468,6 +468,18 @@ start_apps() {
       -u EXTERNAL_TOMBSTONE_SHA256 -u BACKUP_PHYSICAL_ABSENCE_ACK \
       -u RESTORE_REPLAY_PAGE_SIZE \
       -u TENANT_RESTORE_JOURNAL_WORKER_ENABLED \
+      -u TENANT_TELEMETRY_REF_KEY \
+      -u TENANT_TELEMETRY_WRITER_ENABLED \
+      -u TENANT_TELEMETRY_WRITER_ADAPTER \
+      -u TENANT_TELEMETRY_FILESYSTEM_DIR \
+      -u TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER \
+      -u TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID \
+      -u TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID \
+      -u TENANT_TELEMETRY_WRITER_POLL_MS \
+      -u TENANT_TELEMETRY_WRITER_LEASE_MS \
+      -u TENANT_TELEMETRY_WRITER_BATCH_SIZE \
+      -u TENANT_TELEMETRY_WRITER_RETRY_BASE_MS \
+      -u TENANT_TELEMETRY_WRITER_RETRY_MAX_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_POLL_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_BATCH_SIZE \
@@ -572,6 +584,16 @@ verify() {
   # subprocesses; the dedicated Memory tests construct it explicitly in-process.
   unset CREDENTIAL_TARGET_EXECUTION_ADAPTER
   unset TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED
+  # Telemetry lifecycle activation remains a controlled, stopped-fleet action. Ambient `.env`
+  # values must not make the standard verification stack activate or publish local artifacts.
+  unset TENANT_TELEMETRY_REF_KEY TENANT_TELEMETRY_WRITER_ENABLED
+  unset TENANT_TELEMETRY_WRITER_ADAPTER TENANT_TELEMETRY_FILESYSTEM_DIR
+  unset TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER
+  unset TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID
+  unset TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID
+  unset TENANT_TELEMETRY_WRITER_POLL_MS TENANT_TELEMETRY_WRITER_LEASE_MS
+  unset TENANT_TELEMETRY_WRITER_BATCH_SIZE
+  unset TENANT_TELEMETRY_WRITER_RETRY_BASE_MS TENANT_TELEMETRY_WRITER_RETRY_MAX_MS
   infra start
   mkdir -p "$STATE_DIR"
   pnpm run check:secrets
@@ -581,6 +603,9 @@ verify() {
   pnpm run test:tenant-telemetry-lifecycle-memory
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-lifecycle-mysql
+  pnpm run test:tenant-telemetry-application-capture
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-telemetry-application-capture-mysql
   pnpm run test:tenant-telemetry-writer
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-writer-mysql

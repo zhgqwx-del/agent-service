@@ -2843,7 +2843,7 @@ describe("operational endpoints", () => {
       fields: { attempt: 1, errorKind: "network" },
     });
     expect(records[0]!.fields.targetRef).toMatch(/^oref_runner_[0-9a-f]{64}$/);
-    expect(records[0]!.fields.subjectRef).toMatch(/^oref_session_[0-9a-f]{64}$/);
+    expect(records[0]!.fields.subjectRef).toBeUndefined();
     const encoded = JSON.stringify(records);
     expect(encoded).not.toContain(target);
     expect(encoded).not.toContain(SID);

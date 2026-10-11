@@ -8,9 +8,11 @@ import {
   tenantTelemetryArtifactPayloadSha256,
   tenantTelemetryWriteAdapterEvidenceSha256,
   tenantTelemetryWriteOperationSha256,
+  validateEnqueueTenantTelemetryArtifactInput,
   validateTenantTelemetryWriteAdapterResult,
   type TenantTelemetryArtifactManifestInput,
   type TenantTelemetryArtifactPayload,
+  type EnqueueTenantTelemetryArtifactInput,
 } from "../src/index.js";
 
 const D = (character: string) => character.repeat(64);
@@ -49,6 +51,37 @@ const manifestInput = (): TenantTelemetryArtifactManifestInput => ({
 });
 
 describe("durable tenant telemetry writer evidence", () => {
+  it("accepts only a complete optional application producer binding", () => {
+    const base: EnqueueTenantTelemetryArtifactInput = {
+      tenantId: "tenant-a",
+      expectedControlGeneration: 1,
+      domain: "logs",
+      artifactIdSha256: D("1"),
+      artifactGeneration: 1,
+      ownerKind: "tenant",
+      ownerId: "tenant-a",
+      ownerUserId: null,
+      sourceSchema: "structured-log-batch-v1",
+      sourceGeneration: 1,
+      sourceHighWaterDbMs: 100,
+      payload: payload(),
+    };
+    expect(() => validateEnqueueTenantTelemetryArtifactInput(base)).not.toThrow();
+    expect(() => validateEnqueueTenantTelemetryArtifactInput({
+      ...base,
+      producerProtocol: "application-dual-write-v1",
+      producerContractSha256: D("2"),
+    })).not.toThrow();
+    expect(() => validateEnqueueTenantTelemetryArtifactInput({
+      ...base,
+      producerProtocol: "application-dual-write-v1",
+    })).toThrow(/producer binding is incomplete/);
+    expect(() => validateEnqueueTenantTelemetryArtifactInput({
+      ...base,
+      producerContractSha256: D("2"),
+    })).toThrow(/producer binding is incomplete/);
+  });
+
   it("canonicalizes the closed telemetry vocabulary and hashes UTF-8 bytes", () => {
     const left = payload({
       ownerRef: `oref_owner_${D("a")}`,
