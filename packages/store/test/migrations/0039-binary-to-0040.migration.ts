@@ -299,6 +299,9 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
       expect(await upgraded.getTenantTelemetrySourceAccountingEntries(
         oldResult.tenantId, oldResult.requestId,
       )).toEqual([]);
+      expect(await upgraded.getTenantTelemetryPlanArtifactTargetReceipt(
+        oldResult.tenantId, oldResult.requestId,
+      )).toBeNull();
       const foreignTenant = `foreign-${oldResult.tenantId}`;
       expect(await upgraded.getTenantPurgePlanReceipt(
         foreignTenant, oldResult.requestId,
@@ -315,8 +318,9 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
       const [markers] = await afterConn.query<Row[]>(
         "SELECT name FROM schema_migrations ORDER BY name",
       );
-      expect(markers).toHaveLength(40);
-      expect(markers.at(-1)?.name).toBe(MIGRATION_0040);
+      expect(markers).toHaveLength(42);
+      expect(markers.some((row) => row.name === MIGRATION_0040)).toBe(true);
+      expect(markers.at(-1)?.name).toBe("0042_tenant_telemetry_plan_artifact_target.sql");
       for (const [table, orderBy] of [
         ["tenant_erasure_admissions", "request_id"],
         ["tenant_content_inventory_receipts", "request_id"],

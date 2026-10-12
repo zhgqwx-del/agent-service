@@ -123,7 +123,7 @@ async function frozenWorkspace(directory: string, temp: string): Promise<void> {
   await rm(archive);
 
   const frozenManifests = [
-    "pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json",
+    "pnpm-lock.yaml", "pnpm-workspace.yaml",
     "packages/core/package.json", "packages/protocol/package.json",
     "packages/providers/package.json", "packages/sdk/package.json",
     "packages/store/package.json", "packages/testkit/package.json",
@@ -135,6 +135,15 @@ async function frozenWorkspace(directory: string, temp: string): Promise<void> {
     if (!oldBytes.equals(currentBytes)) {
       throw new Error(`frozen 0038 dependency manifest ${manifest} has changed`);
     }
+  }
+  // Later milestones may register new test scripts in the root manifest without
+  // changing the frozen dependency graph. Compare every other root field exactly.
+  const oldRootPackage = JSON.parse(await readFile(join(directory, "package.json"), "utf8")) as Record<string, unknown>;
+  const currentRootPackage = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as Record<string, unknown>;
+  delete oldRootPackage.scripts;
+  delete currentRootPackage.scripts;
+  if (JSON.stringify(oldRootPackage) !== JSON.stringify(currentRootPackage)) {
+    throw new Error("frozen 0038 root dependency manifest has changed");
   }
   const oldPackage = JSON.parse(await readFile(join(directory, "package.json"), "utf8")) as {
     packageManager?: string;

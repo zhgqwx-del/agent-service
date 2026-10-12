@@ -188,20 +188,22 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
     }
   }
 
-  async function current0041StartupTriggerFingerprint(conn: Connection): Promise<boolean> {
-    const prefix = "agent-service-runtime-fingerprint:tenant-telemetry-target-manifest-triggers";
-    const start = migrationSql.indexOf(`-- ${prefix}:start`);
-    const end = migrationSql.indexOf(`-- ${prefix}:end`);
+  async function current0042StartupTriggerFingerprint(conn: Connection): Promise<boolean> {
+    const sql = await readFile(join(MIGRATIONS_DIR,
+      "0042_tenant_telemetry_plan_artifact_target.sql"), "utf8");
+    const prefix = "agent-service-runtime-fingerprint:tenant-telemetry-plan-artifact-target-triggers";
+    const start = sql.indexOf(`-- ${prefix}:start`);
+    const end = sql.indexOf(`-- ${prefix}:end`);
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
-    const [statement] = statements(migrationSql.slice(start + `-- ${prefix}:start`.length, end));
-    expect(statement).toMatch(/^SET @tt_target_manifest_triggers_ok=/);
+    const [statement] = statements(sql.slice(start + `-- ${prefix}:start`.length, end));
+    expect(statement).toMatch(/^SET @tt_plan_artifact_target_triggers_ok=/);
     await conn.query("SET @fixture_previous_group_concat_max_len=@@SESSION.group_concat_max_len");
     try {
       await conn.query("SET SESSION group_concat_max_len=1048576");
       await conn.query(statement!);
       const [rows] = await conn.query<Row[]>(
-        "SELECT @tt_target_manifest_triggers_ok AS fingerprint_ok",
+        "SELECT @tt_plan_artifact_target_triggers_ok AS fingerprint_ok",
       );
       return Number(rows[0]?.fingerprint_ok) === 1;
     } finally {
@@ -446,14 +448,16 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
     }
   }, 120_000);
 
-  it("audits orphan 0041 projection on inactive startup even with the exact 111-trigger fingerprint", async () => {
+  it("audits orphan 0041 projection on inactive 0042 startup with the exact 119-trigger fingerprint", async () => {
     const database = databaseName();
     const url = databaseUrl(base, database);
     let conn: Connection | undefined;
     try {
       await create0040(database);
       await upgrade(database);
-      const healthy = await MysqlSessionStore.connect({ url, migrationMode: "verify" });
+      // The current binary requires 0042; advance only this disposable database after
+      // the frozen 0040 -> 0041 upgrade before testing the retained 0041 projection.
+      const healthy = await MysqlSessionStore.connect({ url, tenantTelemetryRefKey: REF_KEY });
       await healthy.close();
       conn = await mysql.createConnection(url);
       const [control] = await conn.query<Row[]>(
@@ -484,7 +488,7 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
         await conn.query("SET FOREIGN_KEY_CHECKS=1");
         await conn.query(insertGuard!);
       }
-      expect(await current0041StartupTriggerFingerprint(conn)).toBe(true);
+      expect(await current0042StartupTriggerFingerprint(conn)).toBe(true);
       const [marker] = await conn.query<Row[]>(
         "SELECT COUNT(*) AS n FROM schema_migrations WHERE name=?", [MIGRATION_NAME],
       );

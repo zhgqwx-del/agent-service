@@ -31,6 +31,7 @@ import {
   newUserDataExportArtifactId,
   newUserDataExportRequestId,
   tenantErasureRequestHash,
+  tenantPurgePlanClaimTokenSha256,
   tenantTelemetryWriteAdapterEvidenceSha256,
   userErasureRequestHash,
   userDataExportAuthorization,
@@ -596,6 +597,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const userId = `private-user-${randomUUID()}`;
       const failureTrigger = "trg_test_source_accounting_receipt_failure";
       const manifestFailureTrigger = "trg_test_target_manifest_receipt_failure";
+      const catalogFailureTrigger = "trg_test_plan_artifact_target_receipt_failure";
       try {
         const source = await advanceThroughT3c(store, tenantId, userId);
         const [before] = await conn.query<RowDataPacket[]>(
@@ -697,6 +699,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(manifestRollback[0]).toMatchObject({ plans: 0, sources: 0,
           manifest_entries: 0, manifests: 0, phase: "queued" });
         await conn.query(`DROP TRIGGER ${manifestFailureTrigger}`);
+        await conn.query(
+          `CREATE TRIGGER ${catalogFailureTrigger} BEFORE INSERT
+             ON tenant_telemetry_plan_artifact_target_receipts FOR EACH ROW
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected catalog receipt failure'`,
+        );
+        await expect(store.sealTenantPurgePlan(authorization))
+          .rejects.toThrow("injected catalog receipt failure");
+        const [catalogRollback] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_purge_plan_receipts WHERE request_id=?) AS plans,
+             (SELECT COUNT(*) FROM tenant_telemetry_source_accounting_receipts
+               WHERE request_id=?) AS sources,
+             (SELECT COUNT(*) FROM tenant_telemetry_target_manifest_receipts
+               WHERE request_id=?) AS manifests,
+             (SELECT COUNT(*) FROM tenant_telemetry_plan_artifact_target_receipts
+               WHERE request_id=?) AS catalogs,
+             (SELECT phase FROM tenant_purge_plan_jobs WHERE request_id=?) AS phase`,
+          [source.requestId, source.requestId, source.requestId,
+            source.requestId, source.requestId],
+        );
+        expect(catalogRollback[0]).toMatchObject({ plans: 0, sources: 0,
+          manifests: 0, catalogs: 0, phase: "queued" });
+        await conn.query(`DROP TRIGGER ${catalogFailureTrigger}`);
         const receipt = await store.sealTenantPurgePlan(authorization);
         expect(receipt).toMatchObject({
           tenantId,
@@ -736,6 +761,22 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await store.getTenantTelemetryTargetManifestReceipt(
           `wrong-${tenantId}`, source.requestId,
         )).toBeNull();
+        expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+          tenantId, source.requestId,
+        )).toMatchObject({ targetCount: 0, logsTargetCount: 0,
+          tracesTargetCount: 0, executionReady: false });
+        expect(await store.getTenantTelemetryPlanArtifactTargets(
+          tenantId, source.requestId,
+        )).toEqual([]);
+        expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+          `wrong-${tenantId}`, source.requestId,
+        )).toBeNull();
+        await expect(conn.query(
+          `INSERT INTO tenant_telemetry_plan_artifact_target_receipts
+             SELECT * FROM tenant_telemetry_plan_artifact_target_receipts
+              WHERE request_id=?`,
+          [source.requestId],
+        )).rejects.toThrow("telemetry plan artifact receipt lacks complete target catalog");
         expect(await store.sealTenantPurgePlan(authorization)).toEqual(receipt);
         expect(await store.sealTenantPurgePlan({
           ...authorization,
@@ -760,6 +801,50 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       } finally {
         await conn.query(`DROP TRIGGER IF EXISTS ${failureTrigger}`).catch(() => {});
         await conn.query(`DROP TRIGGER IF EXISTS ${manifestFailureTrigger}`).catch(() => {});
+        await conn.query(`DROP TRIGGER IF EXISTS ${catalogFailureTrigger}`).catch(() => {});
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("rejects a direct SQL terminal transition without the 0042 catalog receipt", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 4 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-plan-catalog-guard-${randomUUID()}`;
+      try {
+        const source = await advanceThroughT3c(store, tenantId, `user-${randomUUID()}`);
+        expect(await store.materializeTenantPurgePlanJobs({ limit: 1 })).toBe(1);
+        const claim = await claimPlan(store, source.requestId);
+        const authorization = planAuthorization(claim);
+        let done = false;
+        while (!done) {
+          done = (await store.buildTenantPurgePlanPage(authorization, { limit: 33 })).done;
+        }
+        const job = await store.getTenantPurgePlanJob(tenantId, source.requestId);
+        if (!job || job.phase !== "queued") throw new Error("missing queued plan");
+        // Isolate the new guard: older guards are removed only in this disposable database.
+        await conn.query("DROP TRIGGER trg_tt_source_accounting_t3d_terminal_bu");
+        await conn.query("DROP TRIGGER trg_tt_target_manifest_t3d_terminal_bu");
+        const [clockRows] = await conn.query<RowDataPacket[]>(
+          "SELECT CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000 AS UNSIGNED) AS now_ms",
+        );
+        const now = Math.max(Number(clockRows[0]?.now_ms), job.sourceEvidenceDbMs);
+        await expect(conn.query(
+          `UPDATE tenant_purge_plan_jobs
+              SET phase='plan_sealed',available_at_ms=NULL,claim_token=NULL,
+                  lease_until_ms=NULL,last_error_code=NULL,updated_at_ms=?,sealed_at_ms=?,
+                  completed_claim_attempt=?,completed_claim_token_sha256=?,
+                  aggregate_receipt_sha256=?
+            WHERE request_id=? AND tenant_id=?`,
+          [now, now, authorization.claimAttempt,
+            tenantPurgePlanClaimTokenSha256(authorization.claimToken),
+            "f".repeat(64), source.requestId, tenantId],
+        )).rejects.toThrow("terminal T3d lacks immutable telemetry plan artifact target catalog");
+        const [rows] = await conn.query<RowDataPacket[]>(
+          "SELECT phase FROM tenant_purge_plan_jobs WHERE request_id=?", [source.requestId],
+        );
+        expect(rows[0]?.phase).toBe("queued");
+      } finally {
         await conn.end();
         await store.close();
       }
@@ -1027,8 +1112,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect((await store.getTenantPurgePlanEntries(
           tenantId, source.requestId, planClaim.buildGeneration,
         )).find((entry) => entry.domain === "logs")).toMatchObject({
-          targetCount: 0, disposition: "blocked_adapter_unconfigured",
+          targetCount: 1, disposition: "blocked_adapter_unconfigured",
         });
+        expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+          tenantId, source.requestId,
+        )).toMatchObject({ targetCount: 1, logsTargetCount: 1,
+          tracesTargetCount: 0, unknownGroupCount: 3, executionReady: false });
+        expect(await store.getTenantTelemetryPlanArtifactTargets(
+          tenantId, source.requestId,
+        )).toHaveLength(1);
         expect(JSON.stringify({ accounting, entries })).not.toContain(claim.claimToken);
         await observer.query("DROP TRIGGER trg_tt_source_accounting_entry_bu");
         await observer.query(
@@ -1145,8 +1237,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect((await store.getTenantPurgePlanEntries(
           tenantId, source.requestId, claim.buildGeneration,
         )).find((entry) => entry.domain === "logs")).toMatchObject({
-          targetCount: 0, disposition: "blocked_adapter_unconfigured",
+          targetCount: 2, disposition: "blocked_adapter_unconfigured",
         });
+        expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+          tenantId, source.requestId,
+        )).toMatchObject({ targetCount: 2, logsTargetCount: 2,
+          unknownGroupCount: 0, executionReady: false });
+        expect(await store.getTenantTelemetryPlanArtifactTargets(
+          tenantId, source.requestId,
+        )).toHaveLength(2);
         const forged = entries[0]!;
         await expect(conn.query(
           `INSERT INTO tenant_telemetry_target_manifest_entries
@@ -1180,6 +1279,32 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         )).rejects.toThrow("telemetry target receipt is append-only");
         expect(JSON.stringify({ manifest, entries })).not.toContain(userId);
         expect(JSON.stringify({ manifest, entries })).not.toContain(source.session.id);
+        // A privileged receipt loss cannot make a new nonzero target catalog look like an
+        // honest pre-0042 terminal. This corruption is confined to this disposable database.
+        await conn.query("DROP TRIGGER trg_tt_plan_artifact_target_bd");
+        await conn.query("DROP TRIGGER trg_tt_plan_artifact_target_receipt_bd");
+        await conn.query(
+          "DELETE FROM tenant_telemetry_plan_artifact_targets WHERE request_id=?",
+          [source.requestId],
+        );
+        await conn.query(
+          "DELETE FROM tenant_telemetry_plan_artifact_target_receipts WHERE request_id=?",
+          [source.requestId],
+        );
+        await expect(store.getTenantPurgePlanReceipt(
+          tenantId, source.requestId,
+        )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        // Restore the exact append-only trigger shape so startup reaches the
+        // projection audit, rather than merely failing on a missing trigger.
+        await conn.query(`CREATE TRIGGER trg_tt_plan_artifact_target_bd BEFORE DELETE
+          ON tenant_telemetry_plan_artifact_targets FOR EACH ROW SIGNAL SQLSTATE '45000'
+          SET MESSAGE_TEXT='telemetry plan artifact target is append-only'`);
+        await conn.query(`CREATE TRIGGER trg_tt_plan_artifact_target_receipt_bd BEFORE DELETE
+          ON tenant_telemetry_plan_artifact_target_receipts FOR EACH ROW SIGNAL SQLSTATE '45000'
+          SET MESSAGE_TEXT='telemetry plan artifact receipt is append-only'`);
+        await expect(MysqlSessionStore.connect({
+          url: mysqlUrl, connectionLimit: 1, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+        })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
       } finally {
         await conn.end();
         await store.close();
@@ -1312,7 +1437,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect((await owner.buildTenantPurgePlanPage(authorization, { limit: 33 })).done).toBe(true);
         await expect(withDatabaseClockSequence(
           owner,
-          [claim.leaseUntilMs - 1, claim.leaseUntilMs - 1, claim.leaseUntilMs],
+          [claim.leaseUntilMs - 1, claim.leaseUntilMs - 1,
+            claim.leaseUntilMs - 1, claim.leaseUntilMs - 1, claim.leaseUntilMs],
           () => owner.sealTenantPurgePlan(authorization),
         )).rejects.toThrow("lease expired");
         expect(await owner.getTenantPurgePlanReceipt(tenantId, source.requestId)).toBeNull();
@@ -1752,9 +1878,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const beforeExpiry = claim.leaseUntilMs - 1;
         await expect(withDatabaseClockSequence(
           store,
-          [beforeExpiry, beforeExpiry, beforeExpiry, claim.leaseUntilMs],
+          [beforeExpiry, beforeExpiry, beforeExpiry, beforeExpiry,
+            beforeExpiry, claim.leaseUntilMs],
           () => store.sealTenantPurgePlan(planAuthorization(claim)),
-        )).rejects.toThrow("lease expired while publishing the aggregate");
+        )).rejects.toThrow("lease expired while publishing telemetry accounting");
         const [rows] = await conn.query<RowDataPacket[]>(
           `SELECT
              (SELECT COUNT(*) FROM tenant_purge_plan_entries WHERE request_id=?) AS entry_count,

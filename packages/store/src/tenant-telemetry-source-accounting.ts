@@ -287,7 +287,9 @@ export function validateTenantTelemetrySourceAccountingProof(
   }
 }
 
-function jobEvidenceSha256(job: TenantTelemetryWriteJobRecord): string {
+export function tenantTelemetrySourceAccountingJobEvidenceSha256(
+  job: TenantTelemetryWriteJobRecord,
+): string {
   validateTenantTelemetryWriteJobRecord(job);
   // The job is mutable until seal. Capture every validated field, including the exact target,
   // reservation, claim/lease, and terminal state, without persisting the raw record itself.
@@ -466,7 +468,8 @@ export function createTenantTelemetrySourceAccountingSnapshot(input: {
   for (const write of sources.jobs) rows.push({
     kind: "write_job", identity: write.writeOperationSha256,
     operation: write.writeOperationSha256, tenantId: write.tenantId,
-    domain: write.inventory.domain, evidence: jobEvidenceSha256(write),
+    domain: write.inventory.domain,
+    evidence: tenantTelemetrySourceAccountingJobEvidenceSha256(write),
     reason: reasonByOperation.get(write.writeOperationSha256)!,
   });
   for (const ack of sources.acks) rows.push({

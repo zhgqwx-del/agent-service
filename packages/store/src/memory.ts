@@ -843,6 +843,7 @@ import * as TenantTelemetryArtifactMembership from "./tenant-telemetry-artifact-
 import * as TenantTelemetryOwnerClosure from "./tenant-telemetry-owner-closure.js";
 import * as TenantTelemetrySourceAccounting from "./tenant-telemetry-source-accounting.js";
 import * as TenantTelemetryTargetManifest from "./tenant-telemetry-target-manifest.js";
+import * as TenantTelemetryPlanArtifactTarget from "./tenant-telemetry-plan-artifact-target.js";
 import * as TenantTelemetryDisposition from "./tenant-telemetry-disposition.js";
 
 interface MemoryUserDataExportJob {
@@ -1150,7 +1151,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1385,6 +1386,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantTelemetryTargetManifestReceipts = new Map<
     string,
     TenantTelemetryTargetManifest.TenantTelemetryTargetManifestReceipt
+  >();
+  tenantTelemetryPlanArtifactTargets = new Map<
+    string,
+    TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTarget
+  >();
+  tenantTelemetryPlanArtifactTargetReceipts = new Map<
+    string,
+    TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetReceipt
   >();
   tenantTelemetryApplicationDomainControls = new Map<
     TenantTelemetry.TenantTelemetryDomain,
@@ -14162,6 +14171,52 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     }
   }
 
+  private tenantTelemetryPlanArtifactTargetsFor(
+    requestId: string,
+  ): TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTarget[] {
+    return [...this.tenantTelemetryPlanArtifactTargets.values()]
+      .filter((entry) => entry.requestId === requestId)
+      .sort((left, right) => left.artifactGroupSha256.localeCompare(right.artifactGroupSha256));
+  }
+
+  private validateTenantTelemetryPlanArtifactTargetsForPlan(
+    job: TenantPurgePlanJobRecord,
+    planReceipt: TenantPurgePlanReceipt,
+  ): void {
+    const targetReceipt = this.tenantTelemetryPlanArtifactTargetReceipts.get(job.requestId);
+    const targetEntries = this.tenantTelemetryPlanArtifactTargetsFor(job.requestId);
+    // A pre-0042 terminal has unknown catalog provenance, not a proven empty set.
+    if (!targetReceipt) {
+      if (targetEntries.length !== 0) throw new TenantErasureIntegrityError();
+      const planEntries = this.tenantPurgePlanEntriesFor(job);
+      if (planEntries.some((entry) => (entry.domain === "logs" || entry.domain === "traces")
+        && entry.targetCount !== 0)) throw new TenantErasureIntegrityError();
+      return;
+    }
+    const sourceReceipt = this.tenantTelemetrySourceAccountingReceipts.get(job.requestId);
+    const manifestReceipt = this.tenantTelemetryTargetManifestReceipts.get(job.requestId);
+    if (!sourceReceipt || !manifestReceipt) throw new TenantErasureIntegrityError();
+    try {
+      TenantTelemetryPlanArtifactTarget.validateTenantTelemetryPlanArtifactTargetProof({
+        job, planReceipt, planEntries: this.tenantPurgePlanEntriesFor(job),
+        sourceEntries: this.tenantTelemetrySourceAccountingEntriesFor(job.requestId),
+        sourceReceipt,
+        manifestEntries: this.tenantTelemetryTargetManifestEntriesFor(job.requestId),
+        manifestReceipt,
+        sources: {
+          inventories: [...this.tenantTelemetryArtifactInventories.values()],
+          jobs: [...this.tenantTelemetryWriteJobs.values()],
+          acks: [...this.tenantTelemetryWriteAcks.values()],
+          memberships: [...this.tenantTelemetryArtifactMemberships.values()],
+          bindings: [...this.tenantTelemetryApplicationWriteBindings.values()],
+        },
+        entries: targetEntries, receipt: targetReceipt,
+      });
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
   private verifiedTenantTelemetryLiveOwnerOperations(
     tenantId: string,
   ): Set<string> {
@@ -14814,8 +14869,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     capturedAtDbMs: number,
     source: ReturnType<MemorySessionStore["assertTenantPurgePlanSource"]>,
     holdProof: { holdControlCount: number; holdControlRootSha256: string },
+    telemetryTargets?: { logs: readonly TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[];
+      traces: readonly TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[] },
   ): TenantPurgePlanEntry {
-    const target = this.tenantPurgePlanTargetEvidence(
+    const target = telemetryTargets && (domain === "logs" || domain === "traces")
+      ? { targetCount: telemetryTargets[domain].length,
+        targetRootSha256: TenantTelemetryDisposition
+          .tenantTelemetryDispositionInventoryTargetRootSha256(
+            domain, telemetryTargets[domain],
+          ),
+        disposition: "blocked_adapter_unconfigured" as const }
+      : this.tenantPurgePlanTargetEvidence(
       job,
       domain,
       source.contentReceipt,
@@ -14846,8 +14910,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     job: TenantPurgePlanJobRecord,
     source: ReturnType<MemorySessionStore["assertTenantPurgePlanSource"]>,
     holdProof: { holdControlCount: number; holdControlRootSha256: string },
+    telemetryTargets?: { logs: readonly TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[];
+      traces: readonly TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[] },
   ): TenantPurgePlanEntry[] {
     const entries = this.tenantPurgePlanEntriesFor(job);
+    const catalogSealed = job.phase === "plan_sealed"
+      && this.tenantTelemetryPlanArtifactTargetReceipts.has(job.requestId);
+    if (catalogSealed) {
+      const receipt = this.tenantPurgePlanReceipts.get(job.requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
+    }
     if (
       entries.length !== job.planEntryCount
       || entries.length > TENANT_PURGE_PLAN_DOMAINS.length
@@ -14857,13 +14930,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         !== job.blockerCount
       || entries.some((entry, index) => (
         entry.domain !== TENANT_PURGE_PLAN_DOMAINS[index]
-        || entry.receiptSha256 !== this.memoryTenantPurgePlanEntry(
+        || (!(catalogSealed && (entry.domain === "logs" || entry.domain === "traces"))
+          && entry.receiptSha256 !== this.memoryTenantPurgePlanEntry(
           job,
           entry.domain,
           entry.capturedAtDbMs,
           source,
           holdProof,
-        ).receiptSha256
+          telemetryTargets,
+        ).receiptSha256)
       ))
       || (entries.length === 0
         ? job.cursorDomain !== undefined
@@ -15321,6 +15396,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
       this.validateTenantTelemetrySourceAccountingForPlan(current, receipt);
       this.validateTenantTelemetryTargetManifestForPlan(current, receipt);
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(current, receipt);
       if (!tenantPurgePlanReceiptMatchesAuthorization(receipt, stagedAuthorization)) return null;
       return clone(receipt);
     }
@@ -15345,7 +15421,26 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const source = this.assertTenantPurgePlanSource(current, true);
     this.assertTenantPurgePlanGlobalRelations();
     const holdProof = this.tenantPurgePlanHoldProof(current.tenantId);
-    let entries = this.assertTenantPurgePlanBuildState(current, source, holdProof);
+    // The source projection and owner proof are captured before the T3d entry roots.
+    // 0040/0041/0042 later reuse these exact rows; no downstream receipt enters the
+    // logs/traces target root and no second snapshot can silently change its set.
+    const telemetrySources = {
+      inventories: [...this.tenantTelemetryArtifactInventories.values()],
+      jobs: [...this.tenantTelemetryWriteJobs.values()],
+      acks: [...this.tenantTelemetryWriteAcks.values()],
+      memberships: [...this.tenantTelemetryArtifactMemberships.values()],
+      bindings: [...this.tenantTelemetryApplicationWriteBindings.values()],
+    };
+    const liveOwnerOperations = this.verifiedTenantTelemetryLiveOwnerOperations(
+      current.tenantId,
+    );
+    const telemetryTargets = TenantTelemetryPlanArtifactTarget
+      .projectTenantTelemetryPreplanTargets({
+        tenantId: current.tenantId, sources: telemetrySources, liveOwnerOperations,
+      });
+    let entries = this.assertTenantPurgePlanBuildState(
+      current, source, holdProof, telemetryTargets,
+    );
     let working: TenantPurgePlanJobRecord = current;
     const stagedEntries: TenantPurgePlanEntry[] = [];
     if (!current.scanComplete) {
@@ -15364,6 +15459,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           initialNowMs,
           source,
           holdProof,
+          telemetryTargets,
         );
         stagedEntries.push(entry);
         planEntryRootSha256 = tenantPurgePlanNextEntryRootSha256(
@@ -15461,6 +15557,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const sourceReceiptsBefore = new Map(this.tenantTelemetrySourceAccountingReceipts);
     const manifestEntriesBefore = new Map(this.tenantTelemetryTargetManifestEntries);
     const manifestReceiptsBefore = new Map(this.tenantTelemetryTargetManifestReceipts);
+    const targetEntriesBefore = new Map(this.tenantTelemetryPlanArtifactTargets);
+    const targetReceiptsBefore = new Map(this.tenantTelemetryPlanArtifactTargetReceipts);
     try {
       if (this.tenantPurgePlanReceipts.has(working.requestId)) {
         throw new TenantErasureIntegrityError();
@@ -15484,6 +15582,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         restoreMapSnapshot(this.tenantTelemetrySourceAccountingReceipts, sourceReceiptsBefore);
         restoreMapSnapshot(this.tenantTelemetryTargetManifestEntries, manifestEntriesBefore);
         restoreMapSnapshot(this.tenantTelemetryTargetManifestReceipts, manifestReceiptsBefore);
+        restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargets, targetEntriesBefore);
+        restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargetReceipts, targetReceiptsBefore);
         return null;
       }
       if (publishNowMs < latestCapturedAtDbMs) {
@@ -15520,13 +15620,6 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         aggregateReceiptSha256: receipt.receiptSha256,
       });
       validateTenantPurgePlanCompletionProof(next, entries, receipt);
-      const telemetrySources = {
-        inventories: [...this.tenantTelemetryArtifactInventories.values()],
-        jobs: [...this.tenantTelemetryWriteJobs.values()],
-        acks: [...this.tenantTelemetryWriteAcks.values()],
-        memberships: [...this.tenantTelemetryArtifactMemberships.values()],
-        bindings: [...this.tenantTelemetryApplicationWriteBindings.values()],
-      };
       const sourceSnapshot = TenantTelemetrySourceAccounting
         .createTenantTelemetrySourceAccountingSnapshot({
           job: next,
@@ -15538,8 +15631,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         .createTenantTelemetryTargetManifestSnapshot({
           job: next, planReceipt: receipt,
           sourceEntries: sourceSnapshot.entries, sourceReceipt: sourceSnapshot.receipt,
-          sources: telemetrySources,
-          liveOwnerOperations: this.verifiedTenantTelemetryLiveOwnerOperations(next.tenantId),
+          sources: telemetrySources, liveOwnerOperations,
+        });
+      const targetSnapshot = TenantTelemetryPlanArtifactTarget
+        .createTenantTelemetryPlanArtifactTargetSnapshot({
+          job: next, planReceipt: receipt, planEntries: entries,
+          sourceEntries: sourceSnapshot.entries, sourceReceipt: sourceSnapshot.receipt,
+          manifestEntries: manifestSnapshot.entries, manifestReceipt: manifestSnapshot.receipt,
+          sources: telemetrySources, liveOwnerOperations,
         });
       if (this.tenantTelemetrySourceAccountingReceipts.has(next.requestId)
         || this.tenantTelemetrySourceAccountingEntriesFor(next.requestId).length !== 0) {
@@ -15570,6 +15669,18 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryTargetManifestEntries.set(key, manifestEntry);
       }
       this.tenantTelemetryTargetManifestReceipts.set(next.requestId, manifestSnapshot.receipt);
+      if (this.tenantTelemetryPlanArtifactTargetReceipts.has(next.requestId)
+        || this.tenantTelemetryPlanArtifactTargetsFor(next.requestId).length !== 0) {
+        throw new TenantErasureIntegrityError();
+      }
+      for (const targetEntry of targetSnapshot.entries) {
+        const key = JSON.stringify([targetEntry.requestId, targetEntry.artifactGroupSha256]);
+        if (this.tenantTelemetryPlanArtifactTargets.has(key)) {
+          throw new TenantErasureIntegrityError();
+        }
+        this.tenantTelemetryPlanArtifactTargets.set(key, targetEntry);
+      }
+      this.tenantTelemetryPlanArtifactTargetReceipts.set(next.requestId, targetSnapshot.receipt);
       this.tenantPurgePlanJobs.set(working.requestId, next);
     } catch (error) {
       restoreMapSnapshot(this.tenantPurgePlanJobs, jobsBefore);
@@ -15579,6 +15690,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       restoreMapSnapshot(this.tenantTelemetrySourceAccountingReceipts, sourceReceiptsBefore);
       restoreMapSnapshot(this.tenantTelemetryTargetManifestEntries, manifestEntriesBefore);
       restoreMapSnapshot(this.tenantTelemetryTargetManifestReceipts, manifestReceiptsBefore);
+      restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargets, targetEntriesBefore);
+      restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargetReceipts, targetReceiptsBefore);
       throw error;
     }
     return clone(receipt);
@@ -15601,6 +15714,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         throw new TenantErasureIntegrityError();
       }
       this.validateTenantTelemetrySourceAccountingForPlan(job, receipt);
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
     }
     return clone(job);
   }
@@ -15623,6 +15737,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         throw new TenantErasureIntegrityError();
       }
       this.validateTenantTelemetrySourceAccountingForPlan(job, receipt);
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
     } else {
       for (const entry of entries) validateTenantPurgePlanEntry(entry);
       if (
@@ -15651,6 +15766,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     }
     this.validateTenantTelemetrySourceAccountingForPlan(job, receipt);
     this.validateTenantTelemetryTargetManifestForPlan(job, receipt);
+    this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
     return clone(receipt);
   }
 
@@ -15696,6 +15812,26 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       tenantId, requestId,
     );
     return manifestReceipt ? this.tenantTelemetryTargetManifestEntriesFor(requestId).map(clone) : [];
+  }
+
+  async getTenantTelemetryPlanArtifactTargetReceipt(
+    tenantId: string, requestId: string,
+  ): Promise<TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetReceipt | null> {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "plan_sealed") return null;
+    const planReceipt = await this.getTenantPurgePlanReceipt(tenantId, requestId);
+    if (!planReceipt) throw new TenantErasureIntegrityError();
+    this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, planReceipt);
+    return clone(this.tenantTelemetryPlanArtifactTargetReceipts.get(requestId) ?? null);
+  }
+
+  async getTenantTelemetryPlanArtifactTargets(
+    tenantId: string, requestId: string,
+  ): Promise<TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTarget[]> {
+    const targetReceipt = await this.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, requestId,
+    );
+    return targetReceipt ? this.tenantTelemetryPlanArtifactTargetsFor(requestId).map(clone) : [];
   }
 
   async getTenantTelemetryTargetSourceReadiness(

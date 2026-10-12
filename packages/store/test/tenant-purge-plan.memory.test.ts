@@ -325,6 +325,88 @@ async function advanceThroughT3c(
   };
 }
 
+async function prepareBoundTelemetryCatalogFixture(artifactCount: number) {
+  const nowMs = 7_700;
+  const refKey = new Uint8Array(32).fill(41);
+  const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs }, refKey);
+  await store.activateTenantTelemetryLifecycle({
+    expectedControlGeneration: 0,
+    targets: [
+      { domain: "logs", backendKind: "memory", adapterProtocol: "telemetry-memory-v1",
+        namespaceSha256: "1".repeat(64), failureDomainSha256: "2".repeat(64) },
+      { domain: "traces", backendKind: "memory", adapterProtocol: "telemetry-memory-v1",
+        namespaceSha256: "3".repeat(64), failureDomainSha256: "4".repeat(64) },
+    ],
+  });
+  const lifecycle = await store.getTenantTelemetryLifecycleControl();
+  if (lifecycle.state !== "active") throw new Error("missing telemetry lifecycle activation");
+  const target = (await store.listTenantTelemetryLifecycleTargets())
+    .find((candidate) => candidate.domain === "logs")!;
+  const producerProtocol = "application-dual-write-v1";
+  const producerContractSha256 = "9".repeat(64);
+  await store.activateTenantTelemetryApplicationCapture({
+    domain: "logs", expectedControlGeneration: 0,
+    expectedLifecycleControlGeneration: 1,
+    lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256,
+    lifecycleTargetSha256: target.targetSha256,
+    lifecycleTargetReceiptSha256: target.receiptSha256,
+    producerProtocol, producerContractSha256,
+    fleetStoppedAck: TENANT_TELEMETRY_APPLICATION_FLEET_STOPPED_ACK,
+    legacyWritersDrainedAck: TENANT_TELEMETRY_APPLICATION_LEGACY_WRITERS_DRAINED_ACK,
+    producerReadyAck: TENANT_TELEMETRY_APPLICATION_PRODUCER_READY_ACK,
+  });
+  const tenantId = `tenant-plan-catalog-${randomUUID()}`;
+  const source = await advanceThroughT3c(store, tenantId, {
+    beforeTenantErasure: async () => {
+      for (let index = 0; index < artifactCount; index += 1) {
+        await store.enqueueTenantTelemetryArtifact({
+          tenantId, expectedControlGeneration: 1, domain: "logs",
+          artifactIdSha256: (index + 1).toString(16).repeat(64), artifactGeneration: 1,
+          ownerKind: "tenant", ownerId: tenantId, ownerUserId: null,
+          sourceSchema: "structured-log-batch-v1", sourceGeneration: 1,
+          sourceHighWaterDbMs: nowMs - 2, producerProtocol, producerContractSha256,
+          payload: { schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, domain: "logs",
+            records: [trustedRunnerTelemetryRecord(nowMs - 2, {
+              opaqueRefKey: refKey, tenantValue: tenantId, ownerKind: "tenant",
+              ownerValue: tenantId, attempt: index + 1,
+            })] },
+        });
+        const [claim] = await store.claimTenantTelemetryWriteJobs({
+          limit: 1, leaseMs: 120_000, claimToken: `catalog-write-${index}`,
+          adapterProtocol: "telemetry-memory-v1",
+        });
+        if (!claim) throw new Error("missing catalog write claim");
+        const authorization = {
+          tenantId, writeOperationSha256: claim.writeOperationSha256,
+          claimAttempt: claim.claimAttempt, claimToken: claim.claimToken,
+        };
+        await store.reserveTenantTelemetryExternalMutation(
+          authorization, claim.target.adapterProtocol,
+        );
+        const evidence = {
+          adapterProtocol: claim.target.adapterProtocol, domain: claim.inventory.domain,
+          targetSha256: claim.target.targetSha256,
+          writeOperationSha256: claim.writeOperationSha256,
+          artifactIdSha256: claim.inventory.artifactIdSha256,
+          artifactGeneration: claim.inventory.artifactGeneration,
+          payloadSha256: claim.inventory.payloadSha256,
+          manifestSha256: claim.inventory.manifestSha256,
+          outcome: "written" as const, replayed: false,
+        };
+        await store.completeTenantTelemetryWrite(authorization, {
+          ...evidence, evidenceSha256: tenantTelemetryWriteAdapterEvidenceSha256(evidence),
+        });
+      }
+    },
+  });
+  await store.materializeTenantPurgePlanJobs({ limit: 1 });
+  const [claim] = await store.claimTenantPurgePlans({
+    limit: 1, leaseMs: 120_000, claimToken: "catalog-plan-claim",
+  });
+  if (!claim) throw new Error("missing catalog plan claim");
+  return { store, source, claim, tenantId };
+}
+
 async function prepareUserPurgeTarget(
   store: MemorySessionStore,
   tenantId: string,
@@ -446,6 +528,122 @@ class FailOnceMap<K, V> extends Map<K, V> {
 }
 
 describe("MemorySessionStore tenant purge plan", () => {
+  for (const artifactCount of [0, 1, 3]) {
+    it(`seals an exact ${artifactCount}-artifact telemetry target catalog without enabling execution`, async () => {
+      const { store, source, claim, tenantId } =
+        await prepareBoundTelemetryCatalogFixture(artifactCount);
+      const receipt = await store.sealTenantPurgePlan(planAuthorization(claim));
+      expect(receipt).toMatchObject({ executionReady: false, contentPurgeExecuted: false });
+      const planEntries = await store.getTenantPurgePlanEntries(
+        tenantId, source.request.requestId, 1,
+      );
+      const logs = planEntries.find((entry) => entry.domain === "logs");
+      const traces = planEntries.find((entry) => entry.domain === "traces");
+      const catalog = await store.getTenantTelemetryPlanArtifactTargetReceipt(
+        tenantId, source.request.requestId,
+      );
+      const targets = await store.getTenantTelemetryPlanArtifactTargets(
+        tenantId, source.request.requestId,
+      );
+      expect(catalog).toMatchObject({
+        planReceiptSha256: receipt?.receiptSha256,
+        targetCount: artifactCount,
+        logsTargetCount: artifactCount,
+        tracesTargetCount: 0,
+        unknownGroupCount: 0,
+        executionReady: false,
+      });
+      expect(logs).toMatchObject({
+        targetCount: artifactCount, targetRootSha256: catalog?.logsTargetRootSha256,
+        disposition: "blocked_adapter_unconfigured",
+      });
+      expect(traces).toMatchObject({
+        targetCount: 0, targetRootSha256: catalog?.tracesTargetRootSha256,
+        disposition: "blocked_adapter_unconfigured",
+      });
+      expect(targets).toHaveLength(artifactCount);
+      expect(new Set(targets.map((target) => target.artifactIdSha256)).size)
+        .toBe(artifactCount);
+      expect(targets.every((target) => target.domain === "logs"
+        && target.tenantId === tenantId)).toBe(true);
+      expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+        "neighbor", source.request.requestId,
+      )).toBeNull();
+      expect(await store.getTenantTelemetryPlanArtifactTargets(
+        "neighbor", source.request.requestId,
+      )).toEqual([]);
+
+      if (artifactCount === 0) {
+        const manifest = await store.getTenantTelemetryTargetManifestReceipt(
+          tenantId, source.request.requestId,
+        );
+        expect(manifest).toMatchObject({ observedTargetCount: 0, unknownGroupCount: 0 });
+        // Simulate a terminal created by a pre-0042 writer: absent catalog is unknown,
+        // not the explicit zero-target receipt that a 0042 writer publishes.
+        const publishedCatalog = store.tenantTelemetryPlanArtifactTargetReceipts;
+        store.tenantTelemetryPlanArtifactTargetReceipts = new Map();
+        expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+          tenantId, source.request.requestId,
+        )).toBeNull();
+        expect(await store.getTenantPurgePlanReceipt(
+          tenantId, source.request.requestId,
+        )).toEqual(receipt);
+        store.tenantTelemetryPlanArtifactTargetReceipts = publishedCatalog;
+      }
+    });
+  }
+
+  it("rejects sealed telemetry catalog reads after retained job, ACK, or owner proof drift", async () => {
+    const { store, source, claim, tenantId } = await prepareBoundTelemetryCatalogFixture(1);
+    await store.sealTenantPurgePlan(planAuthorization(claim));
+    const requestId = source.request.requestId;
+    const originalCatalog = await store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, requestId,
+    );
+    expect(originalCatalog).toMatchObject({ targetCount: 1, unknownGroupCount: 0 });
+
+    const [jobKey, originalJob] = [...store.tenantTelemetryWriteJobs.entries()]
+      .find(([, row]) => row.tenantId === tenantId)!;
+    store.tenantTelemetryWriteJobs.set(jobKey, {
+      ...originalJob, recordCount: originalJob.recordCount + 1,
+    });
+    await expect(store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, requestId,
+    )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    store.tenantTelemetryWriteJobs.set(jobKey, originalJob);
+
+    const [ackKey, originalAck] = [...store.tenantTelemetryWriteAcks.entries()]
+      .find(([, row]) => row.tenantId === tenantId)!;
+    const { receiptSha256: _oldAckReceipt, ...changedAckBody } = originalAck;
+    changedAckBody.completedClaimTokenSha256 = "f".repeat(64);
+    store.tenantTelemetryWriteAcks.set(ackKey, {
+      ...changedAckBody,
+      receiptSha256: tenantTelemetryWriteAckSha256(changedAckBody),
+    });
+    await expect(store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, requestId,
+    )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    store.tenantTelemetryWriteAcks.set(ackKey, originalAck);
+
+    const [membershipKey, originalMembership] =
+      [...store.tenantTelemetryArtifactMemberships.entries()]
+        .find(([, row]) => row.tenantId === tenantId)!;
+    const { membershipSha256: _oldMembershipSha256, ...changedMembershipBody } =
+      originalMembership;
+    changedMembershipBody.ownerBindingSha256 = "f".repeat(64);
+    store.tenantTelemetryArtifactMemberships.set(membershipKey, {
+      ...changedMembershipBody,
+      membershipSha256: tenantTelemetryArtifactMembershipSha256(changedMembershipBody),
+    });
+    await expect(store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, requestId,
+    )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    store.tenantTelemetryArtifactMemberships.set(membershipKey, originalMembership);
+    expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, requestId,
+    )).toEqual(originalCatalog);
+  });
+
   it("seals all 33 content-free domains with explicit legacy/adapter blockers and no mutation", async () => {
     let nowMs = 5_000;
     const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs });
@@ -550,11 +748,28 @@ describe("MemorySessionStore tenant purge plan", () => {
       tenantId, source.request.requestId,
     )).toMatchObject({ sourceAccountingReceiptSha256: sourceAccounting?.receiptSha256,
       entryCount: 0, artifactGroupCount: 0, observedTargetCount: 0 });
+    expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, source.request.requestId,
+    )).toMatchObject({ planReceiptSha256: receipt?.receiptSha256,
+      targetCount: 0, logsTargetCount: 0, tracesTargetCount: 0,
+      unknownGroupCount: 0, executionReady: false });
+    expect(await store.getTenantTelemetryPlanArtifactTargets(
+      tenantId, source.request.requestId,
+    )).toEqual([]);
+    const newCatalogReceipts = store.tenantTelemetryPlanArtifactTargetReceipts;
+    store.tenantTelemetryPlanArtifactTargetReceipts = new Map();
+    expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, source.request.requestId,
+    )).toBeNull();
+    store.tenantTelemetryPlanArtifactTargetReceipts = newCatalogReceipts;
     expect(await store.getTenantTelemetryTargetSourceReadiness(
       tenantId, source.request.requestId,
     )).toMatchObject({ sourceRelationsComplete: true, ownerClosureComplete: false,
       observedTargetCount: 0, executionReady: false });
     expect(await store.getTenantTelemetryTargetManifestReceipt(
+      "neighbor", source.request.requestId,
+    )).toBeNull();
+    expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
       "neighbor", source.request.requestId,
     )).toBeNull();
     expect(await store.sealTenantPurgePlan(authorization)).toEqual(receipt);
@@ -681,6 +896,16 @@ describe("MemorySessionStore tenant purge plan", () => {
       tenantId, source.request.requestId,
     )).toBeNull();
     store.tenantTelemetryTargetManifestEntries = new Map();
+    store.tenantTelemetryPlanArtifactTargetReceipts = new FailOnceMap(
+      [...store.tenantTelemetryPlanArtifactTargetReceipts], 1,
+    );
+    await expect(store.sealTenantPurgePlan(planAuthorization(planClaim!)))
+      .rejects.toThrow("injected plan entry write failure");
+    expect(await store.getTenantPurgePlanReceipt(tenantId, source.request.requestId)).toBeNull();
+    expect(store.tenantTelemetrySourceAccountingReceipts.size).toBe(0);
+    expect(store.tenantTelemetryTargetManifestReceipts.size).toBe(0);
+    expect(store.tenantTelemetryPlanArtifactTargetReceipts.size).toBe(0);
+    store.tenantTelemetryPlanArtifactTargetReceipts = new Map();
     const sealed = await store.sealTenantPurgePlan(planAuthorization(planClaim!));
     expect(sealed).not.toBeNull();
     const frozen = await store.getTenantTelemetrySourceAccountingEntries(
@@ -701,6 +926,13 @@ describe("MemorySessionStore tenant purge plan", () => {
     );
     expect(frozenManifest).toMatchObject({ entryCount: 2, artifactGroupCount: 1,
       observedTargetCount: 0, unknownGroupCount: 1 });
+    expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, source.request.requestId,
+    )).toMatchObject({ targetCount: 0, unknownGroupCount: 1,
+      executionReady: false });
+    expect(await store.getTenantTelemetryPlanArtifactTargets(
+      tenantId, source.request.requestId,
+    )).toEqual([]);
     expect((await store.getTenantTelemetryTargetManifestEntries(
       tenantId, source.request.requestId,
     )).every((entry) => entry.inventorySha256 === null
@@ -923,6 +1155,17 @@ describe("MemorySessionStore tenant purge plan", () => {
     const [claim] = await store.claimTenantPurgePlans({
       limit: 1, leaseMs: 120_000, claimToken: "bound-source-plan",
     });
+    store.tenantTelemetryPlanArtifactTargets = new FailOnceMap(
+      [...store.tenantTelemetryPlanArtifactTargets], 1,
+    );
+    await expect(store.sealTenantPurgePlan(planAuthorization(claim!)))
+      .rejects.toThrow("injected plan entry write failure");
+    expect(await store.getTenantPurgePlanReceipt(tenantId, source.request.requestId)).toBeNull();
+    expect(store.tenantTelemetrySourceAccountingReceipts.size).toBe(0);
+    expect(store.tenantTelemetryTargetManifestReceipts.size).toBe(0);
+    expect(store.tenantTelemetryPlanArtifactTargetReceipts.size).toBe(0);
+    expect(store.tenantPurgePlanJobs.get(source.request.requestId)).toMatchObject({ phase: "queued" });
+    store.tenantTelemetryPlanArtifactTargets = new Map();
     const receipt = await store.sealTenantPurgePlan(planAuthorization(claim!));
     const accounting = await store.getTenantTelemetrySourceAccountingReceipt(
       tenantId, source.request.requestId,
@@ -946,11 +1189,35 @@ describe("MemorySessionStore tenant purge plan", () => {
     )).toMatchObject({ sourceRelationsComplete: true, ownerClosureComplete: false,
       observedTargetCount: 1, unknownArtifactGroupCount: 0, executionReady: false });
     expect(receipt).toMatchObject({ executionReady: false, contentPurgeExecuted: false });
-    expect((await store.getTenantPurgePlanEntries(
+    const logsPlanEntry = (await store.getTenantPurgePlanEntries(
       tenantId, source.request.requestId, 1,
-    )).find((entry) => entry.domain === "logs")).toMatchObject({
-      targetCount: 0, disposition: "blocked_adapter_unconfigured",
+    )).find((entry) => entry.domain === "logs");
+    expect(logsPlanEntry).toMatchObject({
+      targetCount: 1, disposition: "blocked_adapter_unconfigured",
     });
+    const targetCatalogReceipt = await store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, source.request.requestId,
+    );
+    expect(targetCatalogReceipt).toMatchObject({
+      planReceiptSha256: receipt?.receiptSha256, targetCount: 1,
+      logsTargetCount: 1, tracesTargetCount: 0, unknownGroupCount: 0,
+      executionReady: false,
+    });
+    expect(logsPlanEntry?.targetRootSha256).toBe(targetCatalogReceipt?.logsTargetRootSha256);
+    const catalogTargets = await store.getTenantTelemetryPlanArtifactTargets(
+      tenantId, source.request.requestId,
+    );
+    expect(catalogTargets).toHaveLength(1);
+    expect(catalogTargets[0]).toMatchObject({
+      tenantId, domain: "logs", inventorySha256: entries.find((entry) =>
+        entry.sourceKind === "inventory")?.sourceIdentitySha256,
+    });
+    expect(await store.getTenantTelemetryPlanArtifactTargetReceipt(
+      "neighbor", source.request.requestId,
+    )).toBeNull();
+    expect(await store.getTenantTelemetryPlanArtifactTargets(
+      "neighbor", source.request.requestId,
+    )).toEqual([]);
     const planJob = await store.getTenantPurgePlanJob(tenantId, source.request.requestId);
     if (!planJob || !receipt || !accounting) throw new Error("missing bound plan source");
     const boundSources = {
@@ -1030,16 +1297,31 @@ describe("MemorySessionStore tenant purge plan", () => {
       tenantId, source.request.requestId,
     )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
     store.tenantTelemetryTargetManifestEntries.set(manifestKey, originalManifest);
+    const [catalogKey, originalCatalogTarget] = [...store.tenantTelemetryPlanArtifactTargets]
+      .find(([, entry]) => entry.requestId === source.request.requestId)!;
+    store.tenantTelemetryPlanArtifactTargets.set(catalogKey, {
+      ...originalCatalogTarget, targetSha256: "f".repeat(64),
+    });
+    await expect(store.getTenantTelemetryPlanArtifactTargetReceipt(
+      tenantId, source.request.requestId,
+    )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    store.tenantTelemetryPlanArtifactTargets.set(catalogKey, originalCatalogTarget);
+    const catalogReceiptBefore = store.tenantTelemetryPlanArtifactTargetReceipts;
+    store.tenantTelemetryPlanArtifactTargetReceipts = new Map();
+    await expect(store.getTenantPurgePlanReceipt(
+      tenantId, source.request.requestId,
+    )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    store.tenantTelemetryPlanArtifactTargetReceipts = catalogReceiptBefore;
     const oldEntries = store.tenantTelemetryTargetManifestEntries;
     const oldReceipts = store.tenantTelemetryTargetManifestReceipts;
     store.tenantTelemetryTargetManifestEntries = new Map();
     store.tenantTelemetryTargetManifestReceipts = new Map();
-    expect(await store.getTenantTelemetryTargetManifestReceipt(
+    await expect(store.getTenantTelemetryTargetManifestReceipt(
       tenantId, source.request.requestId,
-    )).toBeNull();
-    expect(await store.getTenantTelemetryTargetSourceReadiness(
+    )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    await expect(store.getTenantTelemetryTargetSourceReadiness(
       tenantId, source.request.requestId,
-    )).toBeNull();
+    )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
     store.tenantTelemetryTargetManifestEntries = oldEntries;
     store.tenantTelemetryTargetManifestReceipts = oldReceipts;
   });
