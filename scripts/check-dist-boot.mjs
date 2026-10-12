@@ -113,6 +113,8 @@ function cleanEnv() {
       "TENANT_PURGE_EXECUTION_",
       "TENANT_DATABASE_PURGE_",
       "TENANT_REDIS_PURGE_",
+      "TENANT_TELEMETRY_",
+      "TELEMETRY_LIFECYCLE_",
     ].some((prefix) => key.startsWith(prefix))) delete env[key];
   }
   return env;

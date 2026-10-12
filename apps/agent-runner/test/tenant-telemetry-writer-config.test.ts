@@ -1,7 +1,7 @@
 import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_CONTRACT_SHA256,
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_PROTOCOL,
@@ -10,9 +10,12 @@ import {
   FILESYSTEM_TENANT_TELEMETRY_BACKEND_KIND,
   FILESYSTEM_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL,
   MemorySessionStore,
+  S3_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL,
+  S3TenantTelemetryWriteAdapter,
   TENANT_TELEMETRY_APPLICATION_FLEET_STOPPED_ACK,
   TENANT_TELEMETRY_APPLICATION_LEGACY_WRITERS_DRAINED_ACK,
   TENANT_TELEMETRY_APPLICATION_PRODUCER_READY_ACK,
+  s3TenantTelemetryTargetIdentity,
   tenantTelemetryFilesystemFailureDomainSha256,
   tenantTelemetryFilesystemNamespaceSha256,
 } from "@agent-service/store";
@@ -27,6 +30,7 @@ const FAILURE_DOMAIN_ID = "local-workstation-v1";
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.allSettled(roots.splice(0).map((root) => rm(root, {
     recursive: true,
     force: true,
@@ -37,6 +41,55 @@ async function rootPath(suffix = "sink"): Promise<string> {
   const parent = await mkdtemp(join(tmpdir(), "agent-runner-telemetry-config-"));
   roots.push(parent);
   return join(parent, suffix);
+}
+
+function s3EnabledConfig(overrides: NodeJS.ProcessEnv = {}) {
+  return loadConfig({
+    NODE_ENV: "test",
+    STORE: "mysql",
+    SECRETS_MASTER_KEY: MASTER_KEY,
+    TENANT_TELEMETRY_REF_KEY: REF_KEY_HEX,
+    TENANT_TELEMETRY_WRITER_ENABLED: "1",
+    TENANT_TELEMETRY_WRITER_ADAPTER: "s3",
+    TENANT_TELEMETRY_S3_NAMESPACE_ID: "managed-telemetry-runtime-v1",
+    TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID: "local-minio-fixture",
+    TENANT_TELEMETRY_S3_ENDPOINT: "http://127.0.0.1:9000",
+    TENANT_TELEMETRY_S3_REGION: "us-east-1",
+    TENANT_TELEMETRY_S3_BUCKET: "agent-service-telemetry-test",
+    TENANT_TELEMETRY_S3_PREFIX: "managed/v1",
+    TENANT_TELEMETRY_S3_FORCE_PATH_STYLE: "1",
+    TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK: "1",
+    TENANT_TELEMETRY_S3_ACCESS_KEY_ID: "fixture-access",
+    TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY: "fixture-secret",
+    ...overrides,
+  });
+}
+
+async function activeS3Store(
+  config = s3EnabledConfig(),
+): Promise<MemorySessionStore> {
+  const store = new MemorySessionStore(
+    { now: () => Date.now() },
+    { tenantTelemetryRefKey: Buffer.from(REF_KEY_HEX, "hex") },
+  );
+  await store.activateTenantTelemetryLifecycle({
+    expectedControlGeneration: 0,
+    targets: (["logs", "traces"] as const).map((domain) => ({
+      domain,
+      ...s3TenantTelemetryTargetIdentity({
+        namespaceId: config.TENANT_TELEMETRY_S3_NAMESPACE_ID!,
+        failureDomainId: config.TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID!,
+        bucket: config.TENANT_TELEMETRY_S3_BUCKET!,
+        prefix: config.TENANT_TELEMETRY_S3_PREFIX,
+        region: config.TENANT_TELEMETRY_S3_REGION,
+        endpoint: config.TENANT_TELEMETRY_S3_ENDPOINT ?? null,
+        forcePathStyle: config.TENANT_TELEMETRY_S3_FORCE_PATH_STYLE,
+        domain,
+        allowInsecureHttpForLocalTest: true,
+      }),
+    })),
+  });
+  return store;
 }
 
 function enabledConfig(root: string) {
@@ -160,6 +213,64 @@ describe("tenant telemetry writer runner startup", () => {
     await expect(access(root)).rejects.toMatchObject({ code: "ENOENT" });
     await runtime.worker!.stop();
     await store.close();
+  });
+
+  it("validates and assembles the embedded worker for an exact managed S3 target set", async () => {
+    const config = s3EnabledConfig();
+    const store = await activeS3Store(config);
+    const validateStartup = vi.spyOn(
+      S3TenantTelemetryWriteAdapter.prototype,
+      "validateStartup",
+    ).mockResolvedValue();
+    const runtime = await reconcileTenantTelemetryWriterForStartup(
+      store,
+      config,
+      { warn: () => {} },
+    );
+    expect(runtime.active).toBe(true);
+    expect(runtime.captureActive).toBe(false);
+    expect(runtime.adapter).toBeInstanceOf(S3TenantTelemetryWriteAdapter);
+    expect(runtime.adapter?.adapterProtocol).toBe(S3_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL);
+    expect(validateStartup).toHaveBeenCalledOnce();
+    await runtime.worker!.stop();
+    await store.close();
+  });
+
+  it("fails S3 startup on target drift or backend validation without leaking backend detail", async () => {
+    const config = s3EnabledConfig();
+    const drifted = await activeS3Store(config);
+    const validateStartup = vi.spyOn(
+      S3TenantTelemetryWriteAdapter.prototype,
+      "validateStartup",
+    ).mockResolvedValue();
+    await expect(reconcileTenantTelemetryWriterForStartup(
+      drifted,
+      s3EnabledConfig({ TENANT_TELEMETRY_S3_PREFIX: "other/v1" }),
+      { warn: () => {} },
+    )).rejects.toThrow(/S3 target binding or startup is invalid/);
+    expect(validateStartup).not.toHaveBeenCalled();
+    await drifted.close();
+
+    vi.restoreAllMocks();
+    const unavailable = await activeS3Store(config);
+    const privateDetail = "do-not-echo-s3-backend-detail";
+    vi.spyOn(S3TenantTelemetryWriteAdapter.prototype, "validateStartup")
+      .mockRejectedValue(new Error(privateDetail));
+    const destroy = vi.spyOn(S3TenantTelemetryWriteAdapter.prototype, "destroy");
+    let message = "";
+    try {
+      await reconcileTenantTelemetryWriterForStartup(
+        unavailable,
+        config,
+        { warn: () => {} },
+      );
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/S3 target binding or startup is invalid/);
+    expect(message).not.toContain(privateDetail);
+    expect(destroy).toHaveBeenCalledOnce();
+    await unavailable.close();
   });
 
   it("grants owner capture only for the exact active 0035 logs producer contract", async () => {

@@ -1,10 +1,10 @@
 # 可观测性、安全遥测与生命周期边界
 
-> 状态：`0034` durable writer已接runner并提供默认关闭的本地filesystem sink；`0035`把0033 lifecycle
+> 状态：`0034` durable writer已接runner并提供默认关闭的filesystem或S3-compatible writer；`0035`把0033 lifecycle
 > target activation与per-domain application producer capture分离。当前只支持
 > `provider.upstream_request_failed` logs exact contract，traces必须inactive。filesystem仅限本地单runner，
-> 无OS lock且人工ACK不是证明，production禁用；managed sink、delete/restore/retention executor、
-> activation/operator CLI与完整coverage仍未实现。
+> 无OS lock且人工ACK不是证明，production禁用；`telemetry-s3-object-v1`已经闭合共享对象写入协议，
+> 但真实managed环境验收、delete/restore/retention executor、activation/operator CLI与完整coverage仍未实现。
 > 本文定义 M1 数据生命周期需要的最小安全契约，以及 M4 完整可观测性平台的边界。
 
 ## 1. 目的
@@ -29,7 +29,10 @@ owner inventory、retention、legal hold 与删除 ACK，日志/追踪就会成�
    hold/restore/source；之后只允许exact operation replay，terminal ACK必须绑定该reservation。
 4. **`0035` application capture**：以domain独立control/receipt/coverage/binding冻结producer cutover；
    pre-cutover保持unknown/unbound，post-cutover只接受exact producer。当前只接provider failure logs。
-5. **后续 execution lifecycle**：提供managed sink、删除或匿名化
+5. **S3-compatible writer target**：`telemetry-s3-object-v1`用create-only对象、闭合checksum envelope、
+   有界read-after-write和startup bucket capability preflight提供managed-capable写入目标；它不授予删除、
+   retention、restore或completion authority。
+6. **后续 execution lifecycle**：在新的`0036` default-dormant ledger中提供disposition、删除或匿名化
    operation、restore replay 与 terminal receipt。该层完成前，T3d 的 `logs` 和 `traces` 仍必须
    保持显式 blocker，全域 completion 仍为 `false`。
 
@@ -276,8 +279,8 @@ key。它仍是开发便利入口，不是生产 secret distribution 机制。
 迁移包含engine/collation/column/index/CHECK/FK fingerprint和append-only/write-once triggers，并已通过
 真实 MySQL smoke验证 control、targets、coverages、subjects的约束行为。它明确不会：配置 sink、生成
 subject ref、扫描/回填历史、激活 writer、materialize purge job、调用网络、删除日志/追踪或推进任何
-erasure/completion。`0033`/`0034`虽提供显式store/worker/adapter API，长期router/runner仍未把它们接成启动gate或sink writer；
-因此0033 lifecycle control与0035 application capture都继续默认inactive；两者必须分别判断。
+erasure/completion。`0034` worker已经接入长期runner，但默认关闭；0033 lifecycle control与0035
+application capture也继续默认inactive，三者必须分别判断，不能把adapter可用解释为activation完成。
 
 已有 tenant不会因migration自动获得 coverage；只有显式调用`0033` activation store时，才会把当时全部
 canonical tenant记为`legacy_history_unknown`。不能把migration成功或legacy coverage解释成“历史日志完整
@@ -313,8 +316,9 @@ retention/hold/restore binding及source high-water；同一external identity只�
 deleted后不得登记新artifact，但响应丢失后的exact replay仍可读取原receipt。inventory不保存正文、URL、
 header、credential或明文locator。
 
-当前只有`provider.upstream_request_failed` logs通过0035 exact producer contract调用writer；没有真实managed
-sink，也不能声称所有应用event已双写。未登记的legacy数据、未知sink、source drift、跨owner batch或无法重建的locator仍必须形成
+当前只有`provider.upstream_request_failed` logs通过0035 exact producer contract调用writer；S3-compatible
+adapter已可作为共享对象writer target，但尚未在真实managed环境中验证，也不能声称所有应用event已双写。
+未登记的legacy数据、未知sink、source drift、跨owner batch或无法重建的locator仍必须形成
 blocker，不能用空集合解释成“没有日志”。
 
 ### 8.3 `0034` 已实现的 durable writer substrate
@@ -380,6 +384,24 @@ fragment、超界或非JSON响应，并以整个请求deadline和有界response 
 共用endpoint就把一个target的ACK当成另一个target的证据。这只是endpoint/target配置绑定。它实现的是
 `agent-service.telemetry-http-sink.v1` client协议，不是真实sink server、collector或managed backend验收。
 
+S3-compatible adapter实现`telemetry-s3-object-v1`：object key只由已校验的content-free
+tenant/target/artifact identity导出，payload使用`ASTELM01`闭合envelope绑定metadata与payload长度及各自SHA-256。
+发布使用`If-None-Match: *`；超时或模糊响应后执行有界read-after-write，只有完整identity、payload与receipt
+精确匹配才收口，冲突对象与versioned response均fail closed。读取在stream阶段也受字节上限与request deadline
+约束，不能用`Content-Length`缺失或伪造绕过。
+
+adapter startup会验证bucket可达、versioning从未启用、lifecycle配置不存在、Object Lock关闭，以及
+create-only conditional PUT和陈旧冲突语义。target identity绑定bucket、prefix、受控region、规范化custom
+endpoint或`standard-endpoint`模式、addressing mode、namespace与failure-domain；credential、header和明文secret
+不进入identity、日志或错误。production custom endpoint必须为credential-free HTTPS origin，并要求operator在独立
+验证private access/IAM后设置private-bucket ACK；ACK本身不是自动证明。该adapter当前只有create/inspect，
+没有same-key CAS tombstone、delete marker、retention或restore接口。
+
+startup conditional-PUT探针会在`<prefix>/_agent_service_probe/`下创建随机无正文身份对象并随后删除，
+所以writer principal的`DeleteObject`只能授权到这个probe子前缀，不能扩展到artifact key；未来0036的处置凭据
+必须另行最小化。首次PUT响应丢失或整个共享deadline耗尽仍可能留下content-free probe orphan，当前没有自动sweeper，
+需要监控并以该受限前缀的operator流程清理；这不等于telemetry artifact delete能力。
+
 ### 8.4 `0035` 已实现的 per-domain application capture
 
 `0035_tenant_telemetry_application_capture.sql`新增logs/traces独立的application control、activation receipt、
@@ -393,11 +415,13 @@ canonical subject、0033 lifecycle coverage和0035 application coverage同一事
 当前唯一产品producer是`provider.upstream_request_failed`的logs事件。它在capture active时只进入durable
 writer，不再复制到stdout；capture inactive时，owner-scoped helper会剥离全部owner/subject/target refs，
 router/provider其它fallback也使用相同的无主体引用边界。traces没有实现producer contract，必须保持inactive。
-runner可显式开启0034 worker和本地filesystem adapter，但该adapter只允许单runner私有目录，没有OS级跨进程锁；
-single-runner/private-root ACK是人工声明，不是环境证明，production配置会拒绝。deterministic operation staging
+runner可显式开启0034 worker，并选择本地filesystem或S3-compatible adapter。filesystem只允许单runner私有
+目录，没有OS级跨进程锁；single-runner/private-root ACK是人工声明，不是环境证明，production配置会拒绝。
+S3使用独立`TENANT_TELEMETRY_S3_*`配置，适用于共享writer target，但production仍须完成真实bucket/IAM/TLS/
+容量验收。deterministic filesystem operation staging
 会在exact ACK前清理并fsync，正常durable job replay可恢复；但当前没有全目录startup sweeper，DB/job投影
-非原子丢失时仍可能留下staging，这继续属于restore/delete生命周期边界。仓库没有0035 activation/operator CLI、managed sink、
-telemetry delete/restore/retention executor。`captureTenantTelemetryApplicationRecord`一类helper只保护它包围的
+非原子丢失时仍可能留下staging，这继续属于restore/delete生命周期边界。仓库没有0035 activation/operator CLI、
+telemetry delete/CAS tombstone、external deletion journal或restore/retention executor。`captureTenantTelemetryApplicationRecord`一类helper只保护它包围的
 enqueue调用，不能让任意业务数据库事务与spool跨store crash-atomic；因此目前不得实际activation后宣称完整
 application coverage或擦除闭环。
 
@@ -413,7 +437,11 @@ adapter 至少需要固定语义：
 - provider返回模糊成功、分页漂移、额外 artifact或 identity不匹配时 fail closed；
 - dead-letter不等于物理完成。
 
-本地 fake/filesystem adapter只能证明协议、rollback、并发和 replay，不能成为 production completion proof。
+本地 fake/filesystem adapter与同机MinIO只能证明协议、rollback、并发和 replay，不能成为production
+completion或独立故障域proof。下一步必须在新的`0036` expand-only、default-dormant migration中建立精确
+disposition/delete/restore ledger；外部对象删除采用same-key `If-Match` CAS tombstone，并先把content-free
+intent写入独立create-only event chain + CAS authority head journal，恢复旧数据库快照后再由该journal exact replay
+永久marker，不能用S3 LIST猜测head或把DeleteObject成功当成可恢复证明。
 
 ### 8.6 Tenant 与 user erasure 集成
 
@@ -438,14 +466,18 @@ trace batch复活。尚未 ACK 的首次外部 mutation不能从旧快照猜造�
 
 建议沿用现有安全切片模式：
 
-1. 应用`0032`～`0035` expand-only migration，lifecycle/application capture/writer/execution全部保持默认关闭；
+1. 应用`0032`～`0035` expand-only migration，lifecycle/application capture/writer全部保持默认关闭；后续0036
+   execution ledger也必须default-dormant；
 2. 若0033已active，先按0034既有停写/reconcile契约处理历史subject gap；inactive或无gap历史无需该特殊模式；
 3. 部署全部0035-aware router/runner并排空旧writer，核对精确ref key、target、producer contract与全fleet startup audit；
 4. 只对已证明无遗漏且与业务事务边界相容的domain，由受控one-shot operator激活application capture；
-5. 再按adapter protocol开启runner worker、验证真实managed adapter namespace与故障域，最后才考虑delete/restore/retention executor及destructive gate；
+5. 再按adapter protocol开启runner worker、验证真实managed adapter namespace与故障域；0036 ledger、same-key
+   CAS tombstone与独立CAS-head journal闭合后，才考虑delete/restore/retention executor及destructive gate；
 6. 首个activation/binding/ACK/cutover提交后只能forward-fix。
 
-当前没有activation/operator CLI、managed sink和完整业务事务crash-atomic capture；唯一producer只覆盖一个provider failure logs事件，traces明确不支持。因此production不得执行步骤4，本地filesystem也只能在可丢弃的单runner环境验证worker协议，不能作为rollout证明。
+当前没有activation/operator CLI和完整业务事务crash-atomic capture；唯一producer只覆盖一个provider failure
+logs事件，traces明确不支持。S3 adapter可证明managed-capable object writer协议，但没有0036 execution lifecycle。
+因此production不得执行步骤4，本地filesystem或MinIO都不能作为rollout/删除证明。
 
 ## 9. 本地与 CI 验收
 
@@ -460,17 +492,18 @@ trace batch复活。尚未 ACK 的首次外部 mutation不能从旧快照猜造�
 - router拒绝 runner-only output path；
 - runner/router started与draining只输出安全计数/布尔值。
 
-`0034`定向门禁分为：`pnpm test:tenant-telemetry-writer`验证payload、Memory/HTTP adapter、worker与
-Memory store；`pnpm test:tenant-telemetry-writer-mysql`验证真实InnoDB spool/claim/reservation/ACK/T1收口；
+`0034`定向门禁分为：`pnpm test:tenant-telemetry-writer`验证payload、Memory/HTTP/filesystem/S3 unit adapter、
+worker、配置与Memory store；其中S3 unit故障注入覆盖bounded stream、整次操作deadline、response-loss、
+corruption及preflight负例。`pnpm test:tenant-telemetry-writer-mysql`验证真实InnoDB
+spool/claim/reservation/ACK/T1收口；`pnpm test:tenant-telemetry-writer-s3`使用两个独立client和真实MinIO验证
+create-only、闭合envelope、cross-client可见性、冲突不覆盖、positive startup preflight及anonymous GET拒绝；
 `pnpm test:migrations`中的`0033 -> 0034`夹具验证历史升级、active gap拒绝、专用reconcile全回滚/exact
 replay，以及current/stale/in-flight writer并发与metadata-lock语义。CI与本地verify已接线这些required
-suite，要求目标文件实际pass且零skip/non-passed。0034 writer unit group为39/39、真实MySQL为13/13；
-本切片最终`verify`主报告为152 files passed / 7 skipped、1824 passed / 34 skipped / 0 failed，覆盖率为
-78.84% statements / 74.75% branches / 85.17% functions / 81.65% lines；固定历史migration为27 files /
-192 passed、其中0033→0034为15/15，cluster主套件8/8、tenant Redis purge cluster 3/3，`verify-s3`
-六组门禁分别为10/10、4/4、6/6、1/1、1/1、11/11且源码装配通过；易变的完整明细以
-`docs/PROGRESS.md`最后一节和对应CI run为准。后续仍需application dual-write、真实sink、delete/restore
-executor、legal-hold destructive竞态、全域completion与managed环境测试。
+suite，要求目标文件实际pass且零skip/non-passed。`verify-s3`使用与Blob、restore journal、backup catalog都不同
+的第四个telemetry bucket运行真实adapter；同一命令的源码应用smoke只证明Blob S3装配及0034/0035 dormant
+schema，不会激活或构造telemetry S3 writer。这个布局只证明协议和配置隔离，不证明云IAM/KMS
+或独立故障域。易变的完整数量以`docs/PROGRESS.md`最后一节和对应CI run为准。后续仍需0036
+delete/restore ledger、legal-hold destructive竞态、全域completion与managed环境测试。
 
 `0035`另由`pnpm test:tenant-telemetry-application-capture`和
 `pnpm test:tenant-telemetry-application-capture-mysql`独立门禁。真实MySQL套件覆盖分域activation、并发
@@ -478,7 +511,7 @@ exact replay/conflict、activation与tenant/enqueue线性化、Unicode tenant ID
 unbound exact replay、post-cutover binding、事务回滚和startup drift。`pnpm test:migrations`中的
 `0034 -> 0035`夹具证明历史ledger保持、default dormancy、legacy语义、partial-DDL/marker-loss收敛和严格
 fingerprint；GitHub Actions单独执行Memory与MySQL capture suite，并验证dist/runner image包含0035 marker。
-这些测试只证明默认关闭的协议与实现，不证明实际activation、managed sink或删除/恢复能力。
+这些测试只证明默认关闭的协议与writer实现，不证明实际activation、managed环境或删除/恢复能力。
 
 ## 10. Staging / Production 边界
 

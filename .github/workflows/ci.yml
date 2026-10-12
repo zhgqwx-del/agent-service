@@ -88,6 +88,8 @@ jobs:
             node packages/store/scripts/bootstrap-s3.mjs
           S3_TEST_BUCKET=agent-service-ci-backup-catalog \
             node packages/store/scripts/bootstrap-s3.mjs
+          S3_TEST_BUCKET=agent-service-ci-tenant-telemetry \
+            node packages/store/scripts/bootstrap-s3.mjs
 
       - name: Verify OpenAPI and generated SDK are current
         run: pnpm run check:api
@@ -234,6 +236,20 @@ jobs:
           S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:backup-catalog-s3
+
+      # Use a fourth bucket so managed telemetry artifacts cannot share the Blob, restore-journal,
+      # or backup-catalog namespace. This proves the S3 protocol against real MinIO only; it does
+      # not prove a physically independent production failure domain, IAM policy, or managed sink.
+      - name: Tenant telemetry writer S3 real MinIO suite (must execute)
+        env:
+          AGENT_SERVICE_TENANT_TELEMETRY_S3_INTEGRATION: "1"
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_TENANT_TELEMETRY_TEST_BUCKET: agent-service-ci-tenant-telemetry
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: pnpm run test:tenant-telemetry-writer-s3
 
       # Exercise the actual one-shot CLI across both durability systems. The fixture creates a
       # random disposable database and S3 prefix, proves paged/exact replay and complete external

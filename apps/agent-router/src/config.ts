@@ -192,6 +192,7 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     || key.startsWith("MYSQL_")
     || key.startsWith("S3_TEST_")
     || key.startsWith("TENANT_TELEMETRY_")
+    || key.startsWith("TELEMETRY_LIFECYCLE_")
   ) && env[key] !== undefined);
   if (runnerOnlySecretKey) {
     throw new Error(

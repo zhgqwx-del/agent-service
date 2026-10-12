@@ -29,6 +29,7 @@ export * from "./tenant-telemetry-adapter/common.js";
 export * from "./tenant-telemetry-adapter/memory.js";
 export * from "./tenant-telemetry-adapter/http.js";
 export * from "./tenant-telemetry-adapter/filesystem.js";
+export * from "./tenant-telemetry-adapter/s3.js";
 export * from "./backup-catalog-adapter/common.js";
 export * from "./backup-catalog-adapter/memory.js";
 export * from "./backup-catalog-adapter/codec.js";

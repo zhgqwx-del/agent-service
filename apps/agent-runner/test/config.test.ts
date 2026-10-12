@@ -24,6 +24,17 @@ describe("runner configuration", () => {
     }
   });
 
+  it("rejects one-shot telemetry-lifecycle authority in the long-running process", () => {
+    for (const [key, value] of [
+      ["TELEMETRY_LIFECYCLE_COMMAND", "activate"],
+      ["TELEMETRY_LIFECYCLE_OPERATOR_TOKEN", "do-not-enter-runner"],
+      ["TELEMETRY_LIFECYCLE_S3_SECRET_ACCESS_KEY", "do-not-enter-runner"],
+    ] as const) {
+      expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, [key]: value }))
+        .toThrow(new RegExp(`${key} is one-shot telemetry-lifecycle authority`));
+    }
+  });
+
   it("keeps the process-based development default on a locally routable bind host", () => {
     const cfg = loadConfig({ SECRETS_MASTER_KEY: SECRET });
     expect(cfg.RUNNER_ID).toBe(`runner-${process.pid}`);
@@ -100,6 +111,18 @@ describe("runner configuration", () => {
     expect(cfg.TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER).toBe(false);
     expect(cfg.TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID).toBeUndefined();
     expect(cfg.TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_S3_NAMESPACE_ID).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_S3_ENDPOINT).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_S3_REGION).toBe("us-east-1");
+    expect(cfg.TENANT_TELEMETRY_S3_BUCKET).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_S3_PREFIX).toBe("tenant-telemetry");
+    expect(cfg.TENANT_TELEMETRY_S3_FORCE_PATH_STYLE).toBe(false);
+    expect(cfg.TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK).toBe(false);
+    expect(cfg.TENANT_TELEMETRY_S3_REQUEST_TIMEOUT_MS).toBe(5_000);
+    expect(cfg.TENANT_TELEMETRY_S3_ACCESS_KEY_ID).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(cfg.TENANT_TELEMETRY_S3_SESSION_TOKEN).toBeUndefined();
     expect(cfg.TENANT_TELEMETRY_WRITER_POLL_MS).toBe(1_000);
     expect(cfg.TENANT_TELEMETRY_WRITER_LEASE_MS).toBe(30_000);
     expect(cfg.TENANT_TELEMETRY_WRITER_BATCH_SIZE).toBe(25);
@@ -223,6 +246,134 @@ describe("runner configuration", () => {
       SECRETS_MASTER_KEY: SECRET,
       TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
     })).toThrow(/local-only and forbidden in production/);
+  });
+
+  it("accepts an exact managed S3 telemetry writer and rejects mixed or unsafe authority", () => {
+    const s3 = {
+      SECRETS_MASTER_KEY: SECRET,
+      STORE: "mysql",
+      TENANT_TELEMETRY_REF_KEY: "12".repeat(32),
+      TENANT_TELEMETRY_WRITER_ENABLED: "1",
+      TENANT_TELEMETRY_WRITER_ADAPTER: "s3",
+      TENANT_TELEMETRY_S3_NAMESPACE_ID: "managed-telemetry-v1",
+      TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID: "local-minio-fixture",
+      TENANT_TELEMETRY_S3_ENDPOINT: "http://127.0.0.1:9000/",
+      TENANT_TELEMETRY_S3_REGION: "us-test-1",
+      TENANT_TELEMETRY_S3_BUCKET: "agent-service-telemetry-test",
+      TENANT_TELEMETRY_S3_PREFIX: "managed/v1",
+      TENANT_TELEMETRY_S3_FORCE_PATH_STYLE: "1",
+      TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK: "1",
+      TENANT_TELEMETRY_S3_REQUEST_TIMEOUT_MS: "1700",
+      TENANT_TELEMETRY_S3_ACCESS_KEY_ID: "fixture-access",
+      TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY: "fixture-secret",
+      TENANT_TELEMETRY_S3_SESSION_TOKEN: "fixture-session",
+    } satisfies NodeJS.ProcessEnv;
+    expect(loadConfig({ NODE_ENV: "test", ...s3 })).toMatchObject({
+      TENANT_TELEMETRY_WRITER_ADAPTER: "s3",
+      TENANT_TELEMETRY_S3_NAMESPACE_ID: "managed-telemetry-v1",
+      TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID: "local-minio-fixture",
+      TENANT_TELEMETRY_S3_ENDPOINT: "http://127.0.0.1:9000",
+      TENANT_TELEMETRY_S3_REGION: "us-test-1",
+      TENANT_TELEMETRY_S3_BUCKET: "agent-service-telemetry-test",
+      TENANT_TELEMETRY_S3_PREFIX: "managed/v1",
+      TENANT_TELEMETRY_S3_FORCE_PATH_STYLE: true,
+      TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK: true,
+      TENANT_TELEMETRY_S3_REQUEST_TIMEOUT_MS: 1_700,
+      TENANT_TELEMETRY_S3_ACCESS_KEY_ID: "fixture-access",
+      TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY: "fixture-secret",
+      TENANT_TELEMETRY_S3_SESSION_TOKEN: "fixture-session",
+    });
+
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID: "mixed-filesystem",
+    })).toThrow(/cannot be combined.*ADAPTER=s3/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_TELEMETRY_WRITER_ADAPTER: "filesystem",
+      TENANT_TELEMETRY_S3_BUCKET: "mixed-s3-bucket",
+    })).toThrow(/cannot be combined.*ADAPTER=filesystem/);
+    expect(() => loadConfig({
+      SECRETS_MASTER_KEY: SECRET,
+      TENANT_TELEMETRY_S3_BUCKET: "orphan-s3-bucket",
+    })).toThrow(/require TENANT_TELEMETRY_WRITER_ADAPTER/);
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY: undefined,
+      TENANT_TELEMETRY_S3_SESSION_TOKEN: undefined,
+    })).toThrow(/must be configured together/);
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      TENANT_TELEMETRY_S3_ACCESS_KEY_ID: undefined,
+      TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY: undefined,
+    })).toThrow(/SESSION_TOKEN requires static S3 credentials/);
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      TENANT_TELEMETRY_S3_ENDPOINT: "http://objects.internal:9000",
+    })).toThrow(/http only.*loopback/);
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      BLOB_S3_BUCKET: s3.TENANT_TELEMETRY_S3_BUCKET,
+    })).toThrow(/distinct from BLOB_S3_BUCKET/);
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      RESTORE_JOURNAL_S3_BUCKET: s3.TENANT_TELEMETRY_S3_BUCKET,
+    })).toThrow(/distinct from RESTORE_JOURNAL_S3_BUCKET/);
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK: "0",
+    })).toThrow(/PRIVATE_BUCKET_ACK=1/);
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      STORE: "memory",
+    })).toThrow(/STORE=mysql/);
+    expect(() => loadConfig({
+      NODE_ENV: "test",
+      ...s3,
+      TENANT_TELEMETRY_REF_KEY: undefined,
+    })).toThrow(/TENANT_TELEMETRY_REF_KEY/);
+
+    expect(() => loadConfig({
+      ...productionEnv,
+      ...s3,
+      NODE_ENV: "production",
+      TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK: "0",
+      TENANT_TELEMETRY_S3_ENDPOINT: "https://objects.internal",
+    })).toThrow(/PRIVATE_BUCKET_ACK=1/);
+    expect(() => loadConfig({
+      ...productionEnv,
+      ...s3,
+      NODE_ENV: "production",
+      TENANT_TELEMETRY_S3_ENDPOINT: "http://127.0.0.1:9000",
+    })).toThrow(/must use https in production/);
+    expect(loadConfig({
+      ...productionEnv,
+      ...s3,
+      NODE_ENV: "production",
+      TENANT_TELEMETRY_S3_ENDPOINT: "https://objects.internal",
+    }).TENANT_TELEMETRY_WRITER_ADAPTER).toBe("s3");
+
+    const privateValue = "do-not-echo-private-telemetry-value";
+    let message = "";
+    try {
+      loadConfig({
+        NODE_ENV: "test",
+        ...s3,
+        TENANT_TELEMETRY_S3_ENDPOINT: `https://user:${privateValue}@objects.invalid`,
+      });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toMatch(/credential-free/);
+    expect(message).not.toContain(privateValue);
   });
 
   it("keeps Redis purge behind MySQL, Redis, namespace, and router gates", () => {

@@ -208,6 +208,19 @@ while IFS= read -r backup_catalog_env_name; do
 done < <(compgen -e)
 unset backup_catalog_env_name
 
+# Telemetry sink/lifecycle settings are runner-only. Keep the router environment closed over the
+# whole prefix so adding a managed adapter option cannot accidentally leak its credentials or
+# one-shot authority through an incomplete hand-maintained list.
+tenant_telemetry_process_scrub=(-u AGENT_SERVICE_UNUSED_TENANT_TELEMETRY_ENV)
+while IFS= read -r tenant_telemetry_env_name; do
+  case "$tenant_telemetry_env_name" in
+    TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*)
+      tenant_telemetry_process_scrub+=(-u "$tenant_telemetry_env_name")
+      ;;
+  esac
+done < <(compgen -e)
+unset tenant_telemetry_env_name
+
 STATE_DIR="${AGENT_SERVICE_STATE_DIR:-$ROOT/.local-run}"
 RUNNER_PID_FILE="$STATE_DIR/runner.pid"
 ROUTER_PID_FILE="$STATE_DIR/router.pid"
@@ -468,18 +481,7 @@ start_apps() {
       -u EXTERNAL_TOMBSTONE_SHA256 -u BACKUP_PHYSICAL_ABSENCE_ACK \
       -u RESTORE_REPLAY_PAGE_SIZE \
       -u TENANT_RESTORE_JOURNAL_WORKER_ENABLED \
-      -u TENANT_TELEMETRY_REF_KEY \
-      -u TENANT_TELEMETRY_WRITER_ENABLED \
-      -u TENANT_TELEMETRY_WRITER_ADAPTER \
-      -u TENANT_TELEMETRY_FILESYSTEM_DIR \
-      -u TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER \
-      -u TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID \
-      -u TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID \
-      -u TENANT_TELEMETRY_WRITER_POLL_MS \
-      -u TENANT_TELEMETRY_WRITER_LEASE_MS \
-      -u TENANT_TELEMETRY_WRITER_BATCH_SIZE \
-      -u TENANT_TELEMETRY_WRITER_RETRY_BASE_MS \
-      -u TENANT_TELEMETRY_WRITER_RETRY_MAX_MS \
+      "${tenant_telemetry_process_scrub[@]}" \
       -u TENANT_RESTORE_JOURNAL_WORKER_POLL_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_BATCH_SIZE \
@@ -586,14 +588,12 @@ verify() {
   unset TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED
   # Telemetry lifecycle activation remains a controlled, stopped-fleet action. Ambient `.env`
   # values must not make the standard verification stack activate or publish local artifacts.
-  unset TENANT_TELEMETRY_REF_KEY TENANT_TELEMETRY_WRITER_ENABLED
-  unset TENANT_TELEMETRY_WRITER_ADAPTER TENANT_TELEMETRY_FILESYSTEM_DIR
-  unset TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER
-  unset TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID
-  unset TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID
-  unset TENANT_TELEMETRY_WRITER_POLL_MS TENANT_TELEMETRY_WRITER_LEASE_MS
-  unset TENANT_TELEMETRY_WRITER_BATCH_SIZE
-  unset TENANT_TELEMETRY_WRITER_RETRY_BASE_MS TENANT_TELEMETRY_WRITER_RETRY_MAX_MS
+  while IFS= read -r tenant_telemetry_env_name; do
+    case "$tenant_telemetry_env_name" in
+      TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*) unset "$tenant_telemetry_env_name" ;;
+    esac
+  done < <(compgen -e)
+  unset tenant_telemetry_env_name
   infra start
   mkdir -p "$STATE_DIR"
   pnpm run check:secrets
@@ -727,6 +727,17 @@ verify_s3() {
     S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:backup-catalog-restore-roundtrip-mysql-s3
+  local tenant_telemetry_bucket="${TENANT_TELEMETRY_S3_BUCKET:-agent-service-local-tenant-telemetry}"
+  [ "$tenant_telemetry_bucket" != "${MINIO_BUCKET:-agent-service-local}" ] \
+    || die "TENANT_TELEMETRY_S3_BUCKET must differ from the Blob bucket"
+  [ "$tenant_telemetry_bucket" != "$restore_journal_bucket" ] \
+    || die "TENANT_TELEMETRY_S3_BUCKET must differ from the restore-journal bucket"
+  [ "$tenant_telemetry_bucket" != "$backup_catalog_bucket" ] \
+    || die "TENANT_TELEMETRY_S3_BUCKET must differ from the backup-catalog bucket"
+  env "${s3_test_env[@]}" S3_TEST_BUCKET="$tenant_telemetry_bucket" \
+    node packages/store/scripts/bootstrap-s3.mjs
+  env "${s3_test_env[@]}" S3_TENANT_TELEMETRY_TEST_BUCKET="$tenant_telemetry_bucket" \
+    pnpm run test:tenant-telemetry-writer-s3
   env "${s3_test_env[@]}" \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-storage-migration-mysql-s3

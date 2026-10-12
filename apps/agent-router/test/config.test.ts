@@ -319,7 +319,10 @@ describe("router configuration", () => {
       ["TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER", "1"],
       ["TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID", "local-v1"],
       ["TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID", "host-v1"],
+      ["TENANT_TELEMETRY_S3_BUCKET", "private-telemetry"],
+      ["TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY", "must-not-enter-router"],
       ["TENANT_TELEMETRY_WRITER_POLL_MS", "1000"],
+      ["TELEMETRY_LIFECYCLE_OPERATOR_TOKEN", "must-not-enter-router"],
       ["S3_TEST_SECRET_ACCESS_KEY", "must-not-enter-router"],
     ] as const) {
       expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))

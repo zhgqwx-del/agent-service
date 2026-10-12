@@ -259,8 +259,8 @@ const Env = z.object({
   TENANT_TELEMETRY_WRITER_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
-  /** Local filesystem is a real restart-durable development sink, never a production backend. */
-  TENANT_TELEMETRY_WRITER_ADAPTER: z.enum(["filesystem"]).optional(),
+  /** Filesystem is local-only; S3 is the shared managed-object writer target. */
+  TENANT_TELEMETRY_WRITER_ADAPTER: z.enum(["filesystem", "s3"]).optional(),
   TENANT_TELEMETRY_FILESYSTEM_DIR: z.string().min(1).default("./.data/telemetry"),
   /** Explicit acknowledgement that exactly one runner owns this host-local namespace. */
   TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER: z.enum(["0", "1"])
@@ -270,6 +270,27 @@ const Env = z.object({
     z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/).optional(),
   TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID:
     z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/).optional(),
+  TENANT_TELEMETRY_S3_NAMESPACE_ID:
+    z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:~-]{0,127}$/).optional(),
+  TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID:
+    z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:~-]{0,127}$/).optional(),
+  TENANT_TELEMETRY_S3_ENDPOINT: z.string().trim().min(1).optional(),
+  TENANT_TELEMETRY_S3_REGION:
+    z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/).default("us-east-1"),
+  TENANT_TELEMETRY_S3_BUCKET: z.string().min(3).max(63).optional(),
+  TENANT_TELEMETRY_S3_PREFIX: z.string()
+    .regex(/^[a-z0-9][a-z0-9._-]{0,127}(?:\/[a-z0-9][a-z0-9._-]{0,127})*$/)
+    .max(512)
+    .default("tenant-telemetry"),
+  TENANT_TELEMETRY_S3_FORCE_PATH_STYLE:
+    z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK:
+    z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  TENANT_TELEMETRY_S3_REQUEST_TIMEOUT_MS:
+    z.coerce.number().int().min(100).max(30_000).default(5_000),
+  TENANT_TELEMETRY_S3_ACCESS_KEY_ID: z.string().min(1).max(128).optional(),
+  TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY: z.string().min(1).max(512).optional(),
+  TENANT_TELEMETRY_S3_SESSION_TOKEN: z.string().min(1).max(4_096).optional(),
   TENANT_TELEMETRY_WRITER_POLL_MS:
     z.coerce.number().int().min(1).max(300_000).default(1_000),
   TENANT_TELEMETRY_WRITER_LEASE_MS:
@@ -328,6 +349,27 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
 
 const WILDCARD_HOSTS = new Set(["0.0.0.0", "::", "[::]"]);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+const TENANT_TELEMETRY_FILESYSTEM_ENV_KEYS = [
+  "TENANT_TELEMETRY_FILESYSTEM_DIR",
+  "TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER",
+  "TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID",
+  "TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID",
+] as const;
+const TENANT_TELEMETRY_S3_ENV_KEYS = [
+  "TENANT_TELEMETRY_S3_NAMESPACE_ID",
+  "TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID",
+  "TENANT_TELEMETRY_S3_ENDPOINT",
+  "TENANT_TELEMETRY_S3_REGION",
+  "TENANT_TELEMETRY_S3_BUCKET",
+  "TENANT_TELEMETRY_S3_PREFIX",
+  "TENANT_TELEMETRY_S3_FORCE_PATH_STYLE",
+  "TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK",
+  "TENANT_TELEMETRY_S3_REQUEST_TIMEOUT_MS",
+  "TENANT_TELEMETRY_S3_ACCESS_KEY_ID",
+  "TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY",
+  "TENANT_TELEMETRY_S3_SESSION_TOKEN",
+] as const;
 
 function validateAdvertisedAddress(value: string): string {
   let parsed: URL;
@@ -406,6 +448,55 @@ function validateS3Endpoint(value: string, production: boolean): string {
   return parsed.origin;
 }
 
+function validateTenantTelemetryS3Bucket(value: string): string {
+  if (
+    value.length < 3
+    || value.length > 63
+    || !/^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(value)
+    || value.includes("..")
+    || value.includes(".-")
+    || value.includes("-.")
+    || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)
+  ) throw new Error("TENANT_TELEMETRY_S3_BUCKET must be a safe DNS-style bucket name");
+  return value;
+}
+
+function validateTenantTelemetryS3Endpoint(value: string, production: boolean): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("TENANT_TELEMETRY_S3_ENDPOINT must be a credential-free http(s) origin");
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    || !parsed.hostname
+    || parsed.username
+    || parsed.password
+    || (parsed.pathname && parsed.pathname !== "/")
+    || parsed.search
+    || parsed.hash
+  ) {
+    throw new Error("TENANT_TELEMETRY_S3_ENDPOINT must be a credential-free http(s) origin");
+  }
+  if (production && parsed.protocol !== "https:") {
+    throw new Error("TENANT_TELEMETRY_S3_ENDPOINT must use https in production");
+  }
+  if (!production && parsed.protocol === "http:" && !LOOPBACK_HOSTS.has(parsed.hostname)) {
+    throw new Error(
+      "TENANT_TELEMETRY_S3_ENDPOINT may use http only for an explicit loopback local test",
+    );
+  }
+  return parsed.origin;
+}
+
+function firstConfiguredKey(
+  env: NodeJS.ProcessEnv,
+  keys: readonly string[],
+): string | undefined {
+  return keys.find((key) => env[key] !== undefined);
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const backupCatalogAuthorityKey = Object.keys(env).find((key) => (
     key.startsWith("BACKUP_CATALOG_") || key.startsWith("TENANT_BACKUP_CATALOG_")
@@ -413,6 +504,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   if (backupCatalogAuthorityKey) {
     throw new Error(
       `${backupCatalogAuthorityKey} is one-shot backup-catalog authority and must not enter the runner process`,
+    );
+  }
+  const telemetryLifecycleAuthorityKey = Object.keys(env).find((key) => (
+    key.startsWith("TELEMETRY_LIFECYCLE_") && env[key] !== undefined
+  ));
+  if (telemetryLifecycleAuthorityKey) {
+    throw new Error(
+      `${telemetryLifecycleAuthorityKey} is one-shot telemetry-lifecycle authority and must not enter the runner process`,
     );
   }
   if (
@@ -428,6 +527,78 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const s3Endpoint = c.BLOB_S3_ENDPOINT === undefined
     ? undefined
     : validateS3Endpoint(c.BLOB_S3_ENDPOINT, production);
+  const telemetryFilesystemSetting = firstConfiguredKey(
+    env,
+    TENANT_TELEMETRY_FILESYSTEM_ENV_KEYS,
+  );
+  const telemetryS3Setting = firstConfiguredKey(env, TENANT_TELEMETRY_S3_ENV_KEYS);
+  if (c.TENANT_TELEMETRY_WRITER_ADAPTER === "filesystem"
+    && telemetryS3Setting !== undefined) {
+    throw new Error(
+      `${telemetryS3Setting} cannot be combined with TENANT_TELEMETRY_WRITER_ADAPTER=filesystem`,
+    );
+  }
+  if (c.TENANT_TELEMETRY_WRITER_ADAPTER === "s3"
+    && telemetryFilesystemSetting !== undefined) {
+    throw new Error(
+      `${telemetryFilesystemSetting} cannot be combined with TENANT_TELEMETRY_WRITER_ADAPTER=s3`,
+    );
+  }
+  if (c.TENANT_TELEMETRY_WRITER_ADAPTER === undefined
+    && (telemetryFilesystemSetting !== undefined || telemetryS3Setting !== undefined)) {
+    throw new Error(
+      "telemetry adapter settings require TENANT_TELEMETRY_WRITER_ADAPTER=filesystem or s3",
+    );
+  }
+  const tenantTelemetryS3Endpoint = c.TENANT_TELEMETRY_S3_ENDPOINT === undefined
+    ? undefined
+    : validateTenantTelemetryS3Endpoint(c.TENANT_TELEMETRY_S3_ENDPOINT, production);
+  if ((c.TENANT_TELEMETRY_S3_ACCESS_KEY_ID === undefined)
+    !== (c.TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY === undefined)) {
+    throw new Error(
+      "TENANT_TELEMETRY_S3_ACCESS_KEY_ID and TENANT_TELEMETRY_S3_SECRET_ACCESS_KEY "
+        + "must be configured together",
+    );
+  }
+  if (c.TENANT_TELEMETRY_S3_SESSION_TOKEN !== undefined
+    && c.TENANT_TELEMETRY_S3_ACCESS_KEY_ID === undefined) {
+    throw new Error("TENANT_TELEMETRY_S3_SESSION_TOKEN requires static S3 credentials");
+  }
+  let tenantTelemetryS3Bucket: string | undefined;
+  if (c.TENANT_TELEMETRY_WRITER_ADAPTER === "s3") {
+    if (!c.TENANT_TELEMETRY_S3_NAMESPACE_ID
+      || !c.TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID
+      || !c.TENANT_TELEMETRY_S3_BUCKET) {
+      throw new Error(
+        "S3 telemetry writer requires bucket, namespace, and failure-domain identities",
+      );
+    }
+    tenantTelemetryS3Bucket = validateTenantTelemetryS3Bucket(
+      c.TENANT_TELEMETRY_S3_BUCKET,
+    );
+    if (tenantTelemetryS3Bucket === c.BLOB_S3_BUCKET) {
+      throw new Error("TENANT_TELEMETRY_S3_BUCKET must be distinct from BLOB_S3_BUCKET");
+    }
+    if (tenantTelemetryS3Bucket === env.RESTORE_JOURNAL_S3_BUCKET) {
+      throw new Error(
+        "TENANT_TELEMETRY_S3_BUCKET must be distinct from RESTORE_JOURNAL_S3_BUCKET",
+      );
+    }
+    if (!c.TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK) {
+      throw new Error(
+        "TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK=1 is required after verifying that "
+          + "anonymous/public access is denied",
+      );
+    }
+    if (c.STORE !== "mysql") {
+      throw new Error("STORE=mysql is required when TENANT_TELEMETRY_WRITER_ADAPTER=s3");
+    }
+    if (!c.TENANT_TELEMETRY_REF_KEY) {
+      throw new Error(
+        "TENANT_TELEMETRY_REF_KEY is required when TENANT_TELEMETRY_WRITER_ADAPTER=s3",
+      );
+    }
+  }
   if ((c.BLOB_S3_ACCESS_KEY_ID === undefined) !== (c.BLOB_S3_SECRET_ACCESS_KEY === undefined)) {
     throw new Error("BLOB_S3_ACCESS_KEY_ID and BLOB_S3_SECRET_ACCESS_KEY must be configured together");
   }
@@ -572,9 +743,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     );
   }
   if (c.TENANT_TELEMETRY_WRITER_ENABLED) {
-    if (c.TENANT_TELEMETRY_WRITER_ADAPTER !== "filesystem") {
+    if (c.TENANT_TELEMETRY_WRITER_ADAPTER === undefined) {
       throw new Error(
-        "TENANT_TELEMETRY_WRITER_ADAPTER=filesystem is required before enabling the local telemetry writer",
+        "TENANT_TELEMETRY_WRITER_ADAPTER=filesystem or s3 is required before enabling the telemetry writer",
       );
     }
     if (!c.TENANT_TELEMETRY_REF_KEY) {
@@ -582,27 +753,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         "TENANT_TELEMETRY_REF_KEY is required before TENANT_TELEMETRY_WRITER_ENABLED=1",
       );
     }
-    if (!c.TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID
-      || !c.TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID) {
-      throw new Error(
-        "filesystem telemetry writer requires namespace and failure-domain identities",
-      );
-    }
     if (c.STORE !== "mysql") {
       throw new Error("STORE=mysql is required before TENANT_TELEMETRY_WRITER_ENABLED=1");
     }
-    if (!c.TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER) {
-      throw new Error(
-        "TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER=1 is required for the local filesystem sink",
-      );
+    if (c.TENANT_TELEMETRY_WRITER_ADAPTER === "filesystem") {
+      if (!c.TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID
+        || !c.TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID) {
+        throw new Error(
+          "filesystem telemetry writer requires namespace and failure-domain identities",
+        );
+      }
+      if (!c.TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER) {
+        throw new Error(
+          "TENANT_TELEMETRY_FILESYSTEM_SINGLE_RUNNER=1 is required for the local filesystem sink",
+        );
+      }
     }
-  }
-  if (c.TENANT_TELEMETRY_WRITER_ADAPTER === undefined
-    && (c.TENANT_TELEMETRY_FILESYSTEM_NAMESPACE_ID !== undefined
-      || c.TENANT_TELEMETRY_FILESYSTEM_FAILURE_DOMAIN_ID !== undefined)) {
-    throw new Error(
-      "filesystem telemetry identities require TENANT_TELEMETRY_WRITER_ADAPTER=filesystem",
-    );
   }
   if (!c.RUNNER_ADDR && WILDCARD_HOSTS.has(c.RUNNER_HOST)) {
     throw new Error("RUNNER_ADDR is required when RUNNER_HOST is a wildcard bind address");
@@ -845,6 +1011,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   return {
     ...c,
     BLOB_S3_ENDPOINT: s3Endpoint,
+    TENANT_TELEMETRY_S3_ENDPOINT: tenantTelemetryS3Endpoint,
+    TENANT_TELEMETRY_S3_BUCKET: tenantTelemetryS3Bucket,
     ERASURE_ROUTER_URL: erasureRouterUrl,
     INTERNAL_ROUTER_TOKEN: c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
     RUNNER_ID: runnerId,
