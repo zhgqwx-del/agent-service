@@ -114,10 +114,36 @@ function nameOf(error: unknown): string | undefined {
   return typeof name === "string" ? name : undefined;
 }
 
+function hasVersionedMissingEvidence(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const value = error as Record<string, unknown>;
+  for (const candidate of [value, value.$metadata, value.$response]) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const record = candidate as Record<string, unknown>;
+    if (["VersionId", "versionId", "DeleteMarker", "deleteMarker"]
+      .some((key) => record[key] !== undefined)) return true;
+    const headers = record.headers ?? record.httpHeaders;
+    if (!headers || typeof headers !== "object") continue;
+    const get = (headers as { get?: unknown }).get;
+    if (typeof get === "function") {
+      const versionId = get.call(headers, "x-amz-version-id");
+      const deleteMarker = get.call(headers, "x-amz-delete-marker");
+      if (versionId != null || deleteMarker != null) return true;
+    }
+    if (Object.entries(headers).some(([key, header]) =>
+      (key.toLowerCase() === "x-amz-version-id"
+        || key.toLowerCase() === "x-amz-delete-marker")
+      && header !== undefined)) return true;
+  }
+  return false;
+}
+
 function missingObject(error: unknown): boolean {
-  // A generic 404 can mean NoSuchBucket. Only an explicit missing-key code
-  // can establish absence of the pending slot.
-  return nameOf(error) === "NoSuchKey" || nameOf(error) === "NoSuchObject";
+  // Both the named key error and 404 are necessary. A compatible backend may
+  // reuse a missing-key name for transport failures or a versioned delete marker.
+  return statusOf(error) === 404
+    && (nameOf(error) === "NoSuchKey" || nameOf(error) === "NoSuchObject")
+    && !hasVersionedMissingEvidence(error);
 }
 
 function sanitizedError(operation: string, error: unknown): Error {

@@ -52,6 +52,7 @@ class ReadOnlyFakeS3 {
   afterFirstHeadRead?: () => void;
   afterSecondHeadRead?: () => void;
   failSecondPendingWithBucket404 = false;
+  secondPendingError?: Error;
   pendingReads = 0;
   forbiddenMutation = false;
 
@@ -63,6 +64,9 @@ class ReadOnlyFakeS3 {
       if (!object) {
         if (key.includes("/events-v2/")) {
           this.pendingReads += 1;
+          if (this.pendingReads === 2 && this.secondPendingError) {
+            throw this.secondPendingError;
+          }
           if (this.failSecondPendingWithBucket404 && this.pendingReads === 2) {
             throw Object.assign(new Error("private bucket name"), {
               name: "NoSuchBucket",
@@ -332,6 +336,40 @@ describe("v2 S3 telemetry grant journal sealed-chain observer", () => {
       .rejects.toBeInstanceOf(S3TenantTelemetryGrantJournalObserverError);
     expect(f.client.commands).toEqual(Array(4).fill("GetObjectCommand"));
     expect(f.client.forbiddenMutation).toBe(false);
+  });
+
+  it("rejects a named missing-key error unless its HTTP status is 404", async () => {
+    const f = fixture();
+    f.publish([]);
+    f.client.secondPendingError = Object.assign(new Error("private upstream detail"), {
+      name: "NoSuchKey",
+      $metadata: { httpStatusCode: 503 },
+    });
+    await expect(f.observer.observeSealedChain())
+      .rejects.toBeInstanceOf(S3TenantTelemetryGrantJournalObserverError);
+    expect(f.client.commands).toEqual(Array(4).fill("GetObjectCommand"));
+    expect(f.client.forbiddenMutation).toBe(false);
+  });
+
+  it("rejects 404 missing-key responses carrying delete-marker or version metadata", async () => {
+    for (const evidence of [
+      { DeleteMarker: true },
+      { VersionId: "hidden-version" },
+      { $response: { headers: { "x-amz-delete-marker": "true" } } },
+      { $metadata: { httpStatusCode: 404, versionId: "hidden-version" } },
+    ]) {
+      const f = fixture();
+      f.publish([]);
+      f.client.secondPendingError = Object.assign(new Error("private marker detail"), {
+        name: "NoSuchKey",
+        $metadata: { httpStatusCode: 404 },
+        ...evidence,
+      });
+      await expect(f.observer.observeSealedChain())
+        .rejects.toBeInstanceOf(S3TenantTelemetryGrantJournalObserverError);
+      expect(f.client.commands).toEqual(Array(4).fill("GetObjectCommand"));
+      expect(f.client.forbiddenMutation).toBe(false);
+    }
   });
 
   it("uses a separate v2 envelope and fails closed after close", async () => {
