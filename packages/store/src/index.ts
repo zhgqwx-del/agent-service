@@ -33,6 +33,7 @@ export * from "./tenant-telemetry-plan-artifact-target.js";
 export * from "./tenant-telemetry-source-eligibility.js";
 export * from "./tenant-telemetry-pregrant-intent.js";
 export * from "./tenant-telemetry-disposition.js";
+export * from "./tenant-telemetry-disposition-adapter/grant-v2-s3-observer.js";
 export * from "./tenant-telemetry-adapter/common.js";
 export * from "./tenant-telemetry-adapter/memory.js";
 export * from "./tenant-telemetry-adapter/http.js";
