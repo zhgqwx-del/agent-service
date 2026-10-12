@@ -2,7 +2,7 @@
 
 > 状态：**已采用的 2026-09-22 架构基线**。本文保留调研阶段（`docs/research/01–07`）形成设计时的目标态与原始缺口；核心决策已经实施并经过后续评审。当前实现范围、验证结果和剩余事项以 `docs/PROGRESS.md` 的顶部快照及最后一节为准。
 >
-> 当前实现仍保持两个长期应用边界：对外入口是无状态`agent-router`，实际Agent Runtime和生命周期worker位于`agent-runner`。`0034`默认关闭的telemetry writer已接runner，可选本地单runner filesystem或S3-compatible target；`0035`只为`provider.upstream_request_failed` logs建立exact producer contract，traces必须inactive。`0036`为默认休眠的非生产disposition协议；`0037`继续硬拒真实grant，`0038`～`0041`依次封存新write membership、T3f owner/grave、T3d五类source与逐source观察目标。`0042`从同一次source/owner快照为**新**T3d plan封存逐artifact目录和logs/traces精确count/root；旧0041 terminal仍为原零target plan、缺catalog为unknown。新目录不是执行许可，两域仍为`blocked_adapter_unconfigured`，真实grant和产品外部处置继续关闭；没有产品v2 S3 mutation、受控telemetry disposition activation/worker/CLI或旧快照恢复门禁。第五个同机MinIO bucket只证明0036协议，不证明云IAM/KMS和独立故障域。M1仍未冻结、M2冻结、M3/M4主体未开始；这些切片不新增常驻服务、进程、JavaScript入口或产品镜像。
+> 当前实现仍保持两个长期应用边界：对外入口是无状态`agent-router`，实际Agent Runtime和生命周期worker位于`agent-runner`。`0034`默认关闭的telemetry writer已接runner，可选本地单runner filesystem或S3-compatible target；`0035`只为`provider.upstream_request_failed` logs建立exact producer contract，traces必须inactive。`0036`为默认休眠的非生产disposition协议；`0037`继续硬拒真实grant，`0038`～`0041`依次封存新write membership、T3f owner/grave、T3d五类source与逐source观察目标。`0042`从同一次source/owner快照为**新**T3d plan封存逐artifact目录和logs/traces精确count/root；旧0041 terminal仍为原零target plan、缺catalog为unknown。`0043`无schema变更，仅修复新plan非零target的T3e实时复核并给terminal T3f后的本地来源提供只读候选诊断；候选固定`executionReady=false`、`externalAuthorityVerified=false`，不能当作grant。新目录不是执行许可，两域仍为`blocked_adapter_unconfigured`，真实grant和产品外部处置继续关闭；没有产品v2 S3 mutation、受控telemetry disposition activation/worker/CLI或旧快照恢复门禁。第五个同机MinIO bucket只证明0036协议，不证明云IAM/KMS和独立故障域。M1仍未冻结、M2冻结、M3/M4主体未开始；这些切片不新增常驻服务、进程、JavaScript入口或产品镜像。
 
 ---
 
@@ -527,6 +527,8 @@ T3d owner closure还包括Memory中export request、user erasure request与tenan
 
 `0042`只对新T3d plan增加逐artifact target catalog，与0041观察目标和外部可执行删除target严格分开。seal在同一次全范围锁内捕获inventory/job/ACK/membership/binding和真实canonical owner，先投影logs/traces精确count/root，再在同一Memory原子发布或MySQL RR事务里提交33域plan、0040/0041、0042逐项目录/aggregate与terminal；这个顺序避免T3d receipt和0041/0042 root循环。只为五源、target tuple和owner/ref均闭合的group入目录；unknown/孤立项不推断locator。零目标也显式receipt；pre-0042旧0041 plan保持原零target/hash，缺catalog是unknown而非已证明空集。新logs/traces entry即使非零仍`blocked_adapter_unconfigured`、`executionReady=false`。MySQL两张append-only表、terminal guard和严格119-trigger指纹要求排空pre-0042 T3d writer、独立迁移并只运行0042-aware进程；冻结0041旧二进制非空terminal升级已有独立夹具。grant、产品mutation/restore和全域completion继续拒绝；全表锁/lease与真实N-1排空仍须staging验收。
 
+`0043`不增加表或迁移，只修正T3e对0042新plan非零logs/traces target的live recheck：Memory/MySQL重新核对锁定的五类source、真实canonical owner、0040～0042证据与原plan count/root；MySQL 1205/1213锁争用必须保持可重试，而非永久integrity conflict。另有只读`getTenantTelemetrySourceEligibility`在terminal T3f、0039 closure/grave、0040～0042和当前T1/hold/control/DB时钟/restore gate全部闭合时返回`local_source_candidate`及managed artifact数量，证据缺口为unknown，跨tenant不可见。它只诊断本地source，不锁定未来mutation时刻的外部journal head，不验同keymarker；两个授权标志固定false。旧0042二进制已写成blocked的非零T3e job不会被诊断自动解封。下一安全切片须先建立versioned source-bound pre-grant intent，再独立闭合可信DB grant、physical ACK与旧快照恢复fence，不能直接打开0037 hard-deny。
+
 ### 8.2 Redis 键
 
 session key的实际grammar为`${prefix}:lease:{sid}`、`${prefix}:fence:{sid}`、`${prefix}:stream:{sid}`、`${prefix}:evt:{sid}`与`${prefix}:purge:{sid}`；`{sid}`是Redis Cluster hash tag，使T3g Lua涉及的key落在同一slot。owner目录直接保存在lease hash的`owner/addr/fence`字段，不存在独立`owner:{sid}` key。`evt`是瞬时Pub/Sub channel，不是持久清理domain；`purge`是无TTL、无正文的永久防复活marker。`REDIS_NAMESPACE_ID + REDIS_PREFIX`的SHA-256是rollout/restore身份承诺，URL故意不进入digest，因此operator必须保证它唯一、准确地代表logical cluster/database/prefix。未来的`quota:{scope}:{id}`、`keypool:{provider}`、`mcp:catalog:{principal}:{serverId}`仍是目标态且不属于T3g；幂等completed receipt是MySQL业务真相，不在Redis预留。
@@ -598,6 +600,8 @@ agent-service/
 当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038～0042再依次补新write membership、T3f owner closure、T3d source/观察目标/逐artifact目录。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry delete/restore/retention、operator activation与任意业务事务crash-atomic dual-write仍缺失。物理backup producer、真实provider/KMS、generic user purge及全域completion也未闭环，所以M1尚未冻结；M3尚未正式开始，M4主体和云环境验收尚未开始。
 
 ---
+
+`0043`提供的是code-only本地来源候选与T3e复核正确性收尾，不是M1完成条件的替代。尤其`local_source_candidate`没有外部authority、物理marker或旧快照replay证明，不能据此改变上表M1/M3/M4判定或解除T3d blocker；冻结0042旧二进制真实MySQL夹具只证明旧非空T3e阻断及旧零目标T3f的兼容性。
 
 ## 12. 风险
 

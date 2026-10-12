@@ -22,7 +22,7 @@ scripts/local-service.sh down        # 停应用和脚本拥有的本地基础�
 scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 0007→0042 历史迁移 + credential/blob/restore/backup/telemetry/tenant lifecycle 专项 + cluster + SDK/应用构建产物
 scripts/local-service.sh verify-s3    # 启动本地MinIO，运行真实Blob、restore、catalog、telemetry S3、0028 mover及源码runner/router装配套件
 scripts/local-service.sh verify-real  # 使用本机 .env，仅跑真实模型 E2E
-pnpm test:migrations                  # 独立真实 MySQL：固定 0007→0008→...→0041→0042 历史升级及冻结0041旧二进制terminal；逐夹具证明实际执行且无skip
+pnpm test:migrations                  # 独立真实 MySQL：固定 0007→...→0042 schema历史升级、冻结旧terminal与0042→0043代码兼容夹具；逐夹具证明实际执行且无skip
 pnpm test:blob-mysql                  # 强制执行并验明 Blob ownership/绑定/cleanup 的独立真实 MySQL 套件
 pnpm test:blob-storage-control-memory # 强制执行0027 Memory cutover/回滚/并发语义
 pnpm test:blob-storage-control-mysql  # 强制执行0027真实InnoDB inventory/回滚/并发语义
@@ -446,6 +446,8 @@ T3b的紧急回滚首先关闭router execution gate，再让worker在当前job�
 `0040→0041`仍是strict fingerprint边界，不能让pre-0041 T3d writer在新schema上热混跑。保持T3d、telemetry capture/disposition和grant gate关闭，摘流并排空旧router/runner及在途plan事务；由独立migration Job安装逐source观察目标entry/aggregate、append-only和terminal双receipt guard，核对111-trigger指纹、旧terminal未回填、grant与外部事件零新增，再只启动0041-aware进程，之后forward-fix。新T3d在0040同一事务逐源精确覆盖，只有inventory/job/ACK/membership/binding/owner闭合才有一个**观察**目标；unknown和孤立源为零观察目标。它不是33域可执行target，readiness固定`executionReady=false`，不能启用grant或产品外部mutation/restore。冻结0040旧二进制已在旧schema完成真实T3d terminal再升级，验证旧receipt保持、缺0041 manifest为unknown；该旧terminal没有非空telemetry artifact。全表锁/lease预算、真实旧版本排空及容量仍待staging验收。
 
 `0041→0042`再次改变strict fingerprint，不能让pre-0042 T3d writer在新schema上热混跑。保持T3d、telemetry capture/disposition/grant gate关闭，摘流并排空旧router/runner与在途plan事务；独立migration Job安装逐artifact目录/receipt、append-only和terminal三receipt guard，核对119-trigger指纹、旧plan/hash不回填及零外部执行footprint，再只启动0042-aware进程并forward-fix。新T3d在同一次锁定的五源/owner快照上先推导logs/traces精确count/root，再与0040/0041、独立catalog receipt及terminal原子发布；零目标也写显式receipt。旧0041 terminal保留原零target plan、缺0042 catalog为unknown，不从观察目标反推。新plan即使目标非零也仍`blocked_adapter_unconfigured`、`executionReady=false`，不能启用grant或产品外部mutation/restore。冻结0041旧二进制非空terminal升级夹具只证明本地兼容；真实N-1排空、全表锁/lease预算与容量仍待staging验收。
+
+`0043`不引入新migration或部署组件，在已安装0042 schema上是代码级升级。新T3e live recheck会在锁定的五类source与真实canonical owner上复算0040～0042证据及原plan的非零logs/traces count/root，避免把合法新plan错误地按旧零target处理；MySQL 1205/1213锁等待或死锁保持可重试，不应被持久化为永久`integrity_conflict`。T3f后新增的只读本地来源诊断仅在terminal T3f、0039 owner closure/grave、0040～0042目录、当前T1/hold/control、DB clock及restore runtime均闭合时返回`local_source_candidate`和content-free artifact count，其余为`unknown`；无论结果如何都固定`executionReady=false`、`externalAuthorityVerified=false`。它不授予0037 grant、不调用外部journal、marker或adapter，也不收口物理ACK/全域completion。冻结0042旧二进制的真实MySQL夹具核对旧非空T3e的已知阻断及旧零target T3f终态的只读兼容；旧代码已持久化为blocked的job不会自动解封，必须另设计受审计的operator修复协议，不能手改状态。0043没有strict fingerprint变化，但如果实际库尚未安装0042，仍须先按上面的停旧writer/独立迁移流程完成0042；不能因为0043只改代码就放松之前的滚动升级门禁。
 
 T3g restore不是完整Redis-loss保证：same-MySQL keyset只枚举已经写入durable target ACK的marker。正常marker-only窗口可由worker轮询中的existing-marker-only replay在gate关闭时收口；但若Lua已写marker而MySQL ACK尚未提交，且该marker在worker成功replay并持久化ACK前又从Redis丢失，首次lease/fence/stream existence bits无法恢复。MySQL和Redis同时恢复到旧snapshot也不受保护。大tenant restore keyset扫描/重放性能、独立故障域ledger、永久marker容量和普通live-session fence灾备仍待设计/压测。当前真实Redis自动测试使用standalone ioredis并验证same-slot key grammar，但真实Redis Cluster、ACL、persistence与failover只能在staging/production资源就绪后验收。
 

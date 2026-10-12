@@ -12,6 +12,8 @@
 
 `0040`/`0041`封存source与观察目标，`0042`仅让新plan拥有精确、不可变的logs/traces逐artifact目标count/root；目录条目含受保护身份和来源摘要，不含原始owner或外部locator。旧terminal缺0042 receipt仍是`unknown`，不能借0041观察目标推断其T3d目标。即使新plan有非零目标，两域仍保持blocker，`executionReady=false`；0037 grant硬拒、外部删除/恢复与全域completion门禁不变。最新验证与剩余工作以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。
 
+`0043`无新migration、服务或镜像：修复0042非零目标在T3e实时复核时的错误零目标重算，并提供T3f后只读的本地managed artifact来源候选。该诊断只返回`local_source_candidate`或`unknown`及content-free数量，固定`executionReady=false`、`externalAuthorityVerified=false`；不能当作grant、外部删除或全域完成证明。旧0042代码已写成blocked的非空T3e job不会自动解封。进入真实授权前还需版本化来源绑定、外部authority head/marker验真、恢复fence和物理ACK。
+
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
 ## 本机运行
