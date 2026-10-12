@@ -114,6 +114,8 @@ jobs:
 
       # 0034 persists a closed payload before any external mutation, then uses create-only
       # adapter inspection and a claim-bound ACK to publish inventory and remove the spool.
+      # 0038 also requires each new job to carry an immutable same-transaction source
+      # membership; the existing named Memory/MySQL suites prove rollback and isolation.
       - name: Durable tenant telemetry writer unit suites (must execute)
         run: pnpm run test:tenant-telemetry-writer
 
@@ -510,8 +512,9 @@ jobs:
       # independent restore-journal/runtime-lineage, 0030 -> 0031 authoritative backup-catalog and
       # 0031 -> 0032 default-dormant telemetry inventory, 0032 -> 0033 receipt/inventory
       # activation, 0033 -> 0034 durable writer, 0034 -> 0035 application-capture
-      # 0035 -> 0036 dormant disposition and 0036 -> 0037 grant guard matrices.
-      - name: Historical MySQL migrations (0007 through 0037, no skips)
+      # 0035 -> 0036 dormant disposition, 0036 -> 0037 grant guard, and 0037 -> 0038
+      # immutable telemetry membership matrices all run against real MySQL.
+      - name: Historical MySQL migrations (0007 through 0038, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -673,6 +676,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0035_tenant_telemetry_application_capture.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0036_tenant_telemetry_disposition.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0037_tenant_telemetry_disposition_grant_guard.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0038_tenant_telemetry_artifact_membership.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

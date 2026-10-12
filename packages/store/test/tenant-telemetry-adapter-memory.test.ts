@@ -2,14 +2,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   MEMORY_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL,
   MemoryTenantTelemetryWriteAdapter,
-  TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
   TenantTelemetryWriteAdapterConflictError,
   createMemoryTenantTelemetryWriteAdapterState,
 } from "../src/index.js";
-import {
-  telemetryAdapterFixture,
-  trustedRunnerTelemetryRecord,
-} from "./tenant-telemetry-adapter.fixture.js";
+import { telemetryAdapterFixture } from "./tenant-telemetry-adapter.fixture.js";
 
 const adapters: MemoryTenantTelemetryWriteAdapter[] = [];
 
@@ -85,43 +81,16 @@ describe("MemoryTenantTelemetryWriteAdapter", () => {
       MEMORY_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL,
       "telemetry-slot-first",
     );
-    await first.store.enqueueTenantTelemetryArtifact({
-      tenantId: first.claim.tenantId,
-      expectedControlGeneration: 1,
-      domain: "logs",
-      artifactIdSha256: first.claim.inventory.artifactIdSha256,
-      artifactGeneration: first.claim.inventory.artifactGeneration,
-      ownerKind: "tenant",
-      ownerId: first.claim.tenantId,
-      ownerUserId: null,
-      sourceSchema: "structured-log-batch-v1",
-      sourceGeneration: 2,
-      sourceHighWaterDbMs: 1_100,
-      payload: {
-        schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
-        domain: "logs",
-        records: [trustedRunnerTelemetryRecord(1_100, {
-          opaqueRefKey: new Uint8Array(32).fill(21),
-          ownerKind: "tenant",
-          ownerValue: first.claim.tenantId,
-          level: "warn",
-          statusCode: 503,
-        })],
-      },
-    });
-    const [second] = await first.store.claimTenantTelemetryWriteJobs({
-      limit: 1,
-      leaseMs: 10_000,
-      claimToken: "telemetry-adapter-second-claim",
-      adapterProtocol: MEMORY_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL,
-    });
-    expect(second).toBeDefined();
-    const conflictInput = {
-      writeOperationSha256: second!.writeOperationSha256,
-      target: second!.target,
-      inventory: second!.inventory,
-      payload: second!.payload,
-    };
+    // Separate source stores can legitimately race for one external artifact slot;
+    // a single store now rejects duplicate inventory membership before enqueue.
+    const second = await telemetryAdapterFixture(
+      MEMORY_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL,
+      "telemetry-slot-first",
+      first.claim.inventory.artifactIdSha256,
+      503,
+    );
+    expect(second.input.writeOperationSha256).not.toBe(first.input.writeOperationSha256);
+    const conflictInput = second.input;
     const sink = adapter();
     await sink.createWrite(first.input);
     await expect(sink.inspectWrite(conflictInput)).resolves.toEqual({ status: "conflict" });

@@ -323,6 +323,15 @@ describe("MemorySessionStore tenant telemetry application capture", () => {
       manifestSha256: after.inventory.manifestSha256,
       payloadSha256: after.inventory.payloadSha256,
     });
+    const binding = await store.getTenantTelemetryApplicationWriteBinding(
+      tenantId, after.writeOperationSha256,
+    );
+    await expect(store.getTenantTelemetryArtifactMembership(
+      tenantId, after.writeOperationSha256,
+    )).resolves.toMatchObject({
+      inventorySha256: after.inventory.inventorySha256,
+      applicationBindingReceiptSha256: binding!.receiptSha256,
+    });
     await expect(store.getTenantTelemetryApplicationWriteBinding(
       "another-tenant",
       after.writeOperationSha256,

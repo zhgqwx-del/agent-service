@@ -381,6 +381,7 @@ try {
     "0035_tenant_telemetry_application_capture.sql",
     "0036_tenant_telemetry_disposition.sql",
     "0037_tenant_telemetry_disposition_grant_guard.sql",
+    "0038_tenant_telemetry_artifact_membership.sql",
   ];
   const [migrationRows] = await inspection.query(
     `SELECT name FROM schema_migrations WHERE name IN (${expectedMigrationNames.map(() => "?").join(",")}) ORDER BY name`,
@@ -389,7 +390,7 @@ try {
   if (
     migrationRows.length !== expectedMigrationNames.length
     || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
-  ) throw new Error("runner did not apply migrations 0027 through 0037");
+  ) throw new Error("runner did not apply migrations 0027 through 0038");
   const [telemetryControlRows] = await inspection.query(
     `SELECT control_generation,activated_at_db_ms,lifecycle_protocol,writer_protocol,
             ref_key_id_sha256,target_count,target_root_sha256,activation_evidence_sha256
@@ -618,7 +619,7 @@ if (failure) {
 } else if (verified) {
   console.log(
     `real S3 application assembly passed (${mode} runner/router, disposable MySQL, `
-      + "0027 activation, 0031 dormant catalog, 0034/0035/0036/0037 dormant telemetry lifecycle, "
+      + "0027 activation, 0031 dormant catalog, 0034/0035/0036/0037/0038 dormant telemetry lifecycle, "
       + "exact namespace negotiation, credential isolation)",
   );
 }

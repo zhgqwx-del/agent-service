@@ -8,6 +8,7 @@ import {
   TenantTelemetryWriteConflictError,
   newErasureRequestId,
   tenantErasureRequestHash,
+  tenantTelemetryArtifactMembershipSha256,
   tenantTelemetryWriteAdapterEvidenceSha256,
   type EnqueueTenantTelemetryArtifactInput,
   type TenantTelemetryWriteAdapterResult,
@@ -404,6 +405,23 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         ]);
         expect(right).toEqual(left);
         expect(left).toMatchObject({ phase: "queued", attempts: 0, recordCount: 1 });
+        const membership = await ctx.store.getTenantTelemetryArtifactMembership(
+          session.tenantId,
+          left.writeOperationSha256,
+        );
+        expect(membership).toMatchObject({
+          writeOperationSha256: left.writeOperationSha256,
+          inventorySha256: left.inventory.inventorySha256,
+          ownerKind: "session",
+          lifecycleCoverageEvidenceSha256: left.inventory.coverageEvidenceSha256,
+          lifecycleHistoryStatus: left.inventory.historyStatus,
+          applicationBindingReceiptSha256: null,
+        });
+        expect(JSON.stringify(membership)).not.toContain(session.id);
+        expect(JSON.stringify(membership)).not.toContain(session.userId);
+        await expect(ctx.store.getTenantTelemetryArtifactMembership(
+          "other-tenant", left.writeOperationSha256,
+        )).resolves.toBeNull();
         expect(JSON.stringify(left)).not.toContain(session.id);
         expect(JSON.stringify(left)).not.toContain(session.userId);
         const [storedPayload] = await ctx.conn.query<Row[]>(
@@ -469,12 +487,19 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
              (SELECT COUNT(*) FROM tenant_telemetry_write_acks
                WHERE write_operation_sha256=?) AS acks,
              (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory
-               WHERE inventory_sha256=?) AS inventories`,
-          [left.writeOperationSha256, left.writeOperationSha256, left.inventory.inventorySha256],
+               WHERE inventory_sha256=?) AS inventories,
+             (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships
+               WHERE write_operation_sha256=?) AS memberships`,
+          [left.writeOperationSha256, left.writeOperationSha256,
+            left.inventory.inventorySha256, left.writeOperationSha256],
         );
         expect(Number(projection[0]?.payloads)).toBe(0);
         expect(Number(projection[0]?.acks)).toBe(1);
         expect(Number(projection[0]?.inventories)).toBe(1);
+        expect(Number(projection[0]?.memberships)).toBe(1);
+        await expect(ctx.store.getTenantTelemetryArtifactMembership(
+          session.tenantId, left.writeOperationSha256,
+        )).resolves.toEqual(membership);
       } finally {
         await ctx.close();
       }
@@ -511,9 +536,71 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
              (SELECT COUNT(*) FROM tenant_telemetry_write_jobs) AS jobs,
              (SELECT COUNT(*) FROM tenant_telemetry_write_payloads) AS payloads,
              (SELECT COUNT(*) FROM tenant_telemetry_write_acks) AS acks,
-             (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory) AS inventories`,
+             (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory) AS inventories,
+             (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships) AS memberships`,
         );
-        expect(counts[0]).toMatchObject({ jobs: 0, payloads: 0, acks: 0, inventories: 0 });
+        expect(counts[0]).toMatchObject({
+          jobs: 0, payloads: 0, acks: 0, inventories: 0, memberships: 0,
+        });
+      } finally {
+        await ctx.close();
+      }
+    });
+
+    it("rejects a direct cross-tenant sidecar and fails closed on an orphan footprint", async () => {
+      const ctx = await fixture();
+      try {
+        const tenantId = "mysql-writer-membership-footprint";
+        await ctx.store.createApiKey(tenantId, "key", digest("membership-footprint-key"));
+        const job = await ctx.store.enqueueTenantTelemetryArtifact(
+          input(tenantId, "membership-footprint"),
+        );
+        const source = await ctx.store.getTenantTelemetryArtifactMembership(
+          tenantId, job.writeOperationSha256,
+        );
+        expect(source).not.toBeNull();
+        const { membershipSha256: _sourceReceipt, ...body } = source!;
+        const insert = async (replacementTenantId: string, marker: string): Promise<string> => {
+          const changed = {
+            ...body,
+            tenantId: replacementTenantId,
+            writeOperationSha256: digest(`membership-footprint:${marker}:operation`),
+            inventorySha256: digest(`membership-footprint:${marker}:inventory`),
+          };
+          await ctx.conn.query(
+            `INSERT INTO tenant_telemetry_artifact_memberships
+               (write_operation_sha256,membership_sha256,tenant_id,scope,domain,
+                target_sha256,inventory_sha256,artifact_id_sha256,artifact_generation,
+                manifest_sha256,payload_sha256,owner_kind,tenant_ref_sha256,
+                owner_ref_sha256,hold_subject_ref_sha256,ref_key_id_sha256,
+                owner_binding_sha256,lifecycle_coverage_evidence_sha256,
+                lifecycle_history_status,application_binding_receipt_sha256,
+                source_schema,source_generation,source_high_water_db_ms,
+                inventory_created_at_db_ms)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [changed.writeOperationSha256, tenantTelemetryArtifactMembershipSha256(changed),
+              changed.tenantId, changed.scope, changed.domain, changed.targetSha256,
+              changed.inventorySha256, changed.artifactIdSha256, changed.artifactGeneration,
+              changed.manifestSha256, changed.payloadSha256, changed.ownerKind,
+              changed.tenantRefSha256, changed.ownerRefSha256,
+              changed.holdSubjectRefSha256, changed.refKeyIdSha256,
+              changed.ownerBindingSha256, changed.lifecycleCoverageEvidenceSha256,
+              changed.lifecycleHistoryStatus, changed.applicationBindingReceiptSha256,
+              changed.sourceSchema, changed.sourceGeneration, changed.sourceHighWaterDbMs,
+              changed.inventoryCreatedAtDbMs],
+          );
+          return changed.writeOperationSha256;
+        };
+        await expect(insert("mysql-writer-foreign-tenant", "foreign"))
+          .rejects.toThrow(/membership is not exact active-source-bound/);
+        const orphanOperation = await insert(tenantId, "orphan");
+        await expect(ctx.store.getTenantTelemetryArtifactMembership(
+          tenantId, orphanOperation,
+        )).rejects.toThrow(/orphaned/);
+        await expect(MysqlSessionStore.connect({
+          url: ctx.url,
+          tenantTelemetryRefKey: REF_KEY,
+        })).rejects.toThrow(/orphan|membership/i);
       } finally {
         await ctx.close();
       }

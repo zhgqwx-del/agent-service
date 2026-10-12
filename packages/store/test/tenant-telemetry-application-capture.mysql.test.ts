@@ -769,6 +769,14 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           manifestSha256: queued.inventory.manifestSha256,
           payloadSha256: queued.inventory.payloadSha256,
         });
+        expect(await ctx.store.getTenantTelemetryArtifactMembership(
+          tenantId,
+          queued.writeOperationSha256,
+        )).toMatchObject({
+          writeOperationSha256: queued.writeOperationSha256,
+          inventorySha256: queued.inventory.inventorySha256,
+          applicationBindingReceiptSha256: binding!.receiptSha256,
+        });
         expect(await ctx.store.enqueueTenantTelemetryArtifact(boundInput)).toEqual(queued);
         expect(await ctx.store.getTenantTelemetryApplicationWriteBinding(
           "mysql-app-another-tenant",
@@ -872,10 +880,22 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         const triggerDdl = String(triggerRows[0]?.["SQL Original Statement"] ?? "");
         expect(triggerDdl).toContain("CREATE");
         await ctx.conn.query("DROP TRIGGER trg_tt_app_write_binding_bd");
-        await ctx.conn.query(
+        await expect(ctx.conn.query(
           "DELETE FROM tenant_telemetry_application_write_bindings WHERE write_operation_sha256=?",
           [queued.writeOperationSha256],
-        );
+        )).rejects.toMatchObject({ code: "ER_ROW_IS_REFERENCED_2" });
+        // Corrupt only this disposable fixture: 0038's FK now guards the same
+        // parent row, so the old deletion fault injection needs to bypass it.
+        // Re-enable FK checks before startup to exercise integrity validation.
+        await ctx.conn.query("SET FOREIGN_KEY_CHECKS=0");
+        try {
+          await ctx.conn.query(
+            "DELETE FROM tenant_telemetry_application_write_bindings WHERE write_operation_sha256=?",
+            [queued.writeOperationSha256],
+          );
+        } finally {
+          await ctx.conn.query("SET FOREIGN_KEY_CHECKS=1");
+        }
         await ctx.conn.query(triggerDdl);
 
         await expect(MysqlSessionStore.connect({

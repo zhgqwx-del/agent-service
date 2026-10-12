@@ -237,6 +237,7 @@ import {
   type RegisterTenantTelemetryCoverageInput,
   type TenantTelemetryArtifactInventoryRecord,
   type TenantTelemetryDomain,
+  type TenantTelemetryHistoryStatus,
   type TenantTelemetryLifecycleActivationReceipt,
   type TenantTelemetryLifecycleActivationResult,
   type TenantTelemetryLifecycleControlRecord,
@@ -245,9 +246,11 @@ import {
   type TenantTelemetryLifecycleSubjectRecord,
   type TenantTelemetryLifecycleStore,
   type TenantTelemetryLifecycleTargetRecord,
+  type TenantTelemetryOwnerKind,
 } from "../tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "../tenant-telemetry-writer.js";
 import * as TenantTelemetryApplicationCapture from "../tenant-telemetry-application-capture.js";
+import * as TenantTelemetryArtifactMembership from "../tenant-telemetry-artifact-membership.js";
 import * as TenantTelemetryDisposition from "../tenant-telemetry-disposition.js";
 import * as BackupCatalog from "../backup-catalog.js";
 import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
@@ -911,10 +914,20 @@ const TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME =
   "0037_tenant_telemetry_disposition_grant_guard.sql";
 const TENANT_TELEMETRY_GRANT_GUARD_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-grant-guard";
+const TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME =
+  "0038_tenant_telemetry_artifact_membership.sql";
+const TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-artifact-membership";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME = "trg_tt_disposition_grant_bi_v2";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX =
   `CREATE TRIGGER ${TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME} `
   + "BEFORE INSERT ON tenant_telemetry_disposition_authorization_grants FOR EACH ROW ";
+const TENANT_TELEMETRY_MEMBERSHIP_TRIGGER_SHAPES = [
+  ["trg_tt_membership_bi", "tenant_telemetry_artifact_memberships", "INSERT"],
+  ["trg_tt_membership_bu", "tenant_telemetry_artifact_memberships", "UPDATE"],
+  ["trg_tt_membership_bd", "tenant_telemetry_artifact_memberships", "DELETE"],
+  ["trg_tt_membership_write_job_bi", "tenant_telemetry_write_jobs", "INSERT"],
+] as const;
 
 function mysqlMigrationStatements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "")
@@ -942,6 +955,40 @@ async function executeMysqlMigrationStatement(
   migrationName: string,
   statement: string,
 ): Promise<void> {
+  if (migrationName === TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME) {
+    const trigger = TENANT_TELEMETRY_MEMBERSHIP_TRIGGER_SHAPES.find(
+      ([name, table, manipulation]) => statement.startsWith(
+        `CREATE TRIGGER ${name} BEFORE ${manipulation} ON ${table} FOR EACH ROW `,
+      ),
+    );
+    if (trigger) {
+      const [name, table, manipulation] = trigger;
+      const prefix = `CREATE TRIGGER ${name} BEFORE ${manipulation} ON ${table} FOR EACH ROW `;
+      const expectedAction = statement.slice(prefix.length);
+      if (!expectedAction) throw new Error("0038 tenant telemetry membership trigger action is empty");
+      const [rows] = await conn.query<Row[]>(
+        `SELECT event_object_table AS table_name,action_timing AS timing,
+                event_manipulation AS manipulation,action_orientation AS orientation,
+                action_condition AS condition_value,action_statement AS statement_value
+           FROM information_schema.triggers
+          WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`,
+        [name],
+      );
+      if (rows.length === 0) {
+        await conn.query(statement);
+        return;
+      }
+      const existing = rows[0];
+      if (rows.length !== 1 || existing?.table_name !== table
+        || existing.timing !== "BEFORE" || existing.manipulation !== manipulation
+        || existing.orientation !== "ROW" || existing.condition_value !== null
+        || canonicalMysqlTriggerActionStatement(String(existing.statement_value))
+          !== canonicalMysqlTriggerActionStatement(expectedAction)) {
+        throw new Error(`0038 tenant telemetry membership trigger ${name} is not exact`);
+      }
+      return;
+    }
+  }
   if (migrationName === TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME
     && statement.startsWith(TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX)) {
     const expectedActionStatement = statement.slice(
@@ -1186,6 +1233,33 @@ function tenantTelemetryGrantGuardFingerprintStatement(migrationSql: string): st
   }
   return statements[0]!;
 }
+
+function tenantTelemetryArtifactMembershipFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0038 tenant telemetry membership ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(
+      `SET @tt_membership_${marker === "schema" ? "schema" : "triggers"}_ok=`,
+    )) {
+    throw new Error(`0038 tenant telemetry membership ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
 const BLOB_STORAGE_CONTROL_COLUMNS = `singleton_id, control_generation, storage_backend,
   namespace_sha256, activated_at_db_ms, evidence_sha256`;
 const TENANT_TELEMETRY_CONTROL_COLUMNS = `singleton_id, control_generation,
@@ -1253,6 +1327,13 @@ const TENANT_TELEMETRY_WRITE_ACK_COLUMNS = `write_operation_sha256, tenant_id, s
   mutation_started_at_db_ms, mutation_started_claim_attempt,
   mutation_started_claim_token_sha256, completed_claim_attempt,
   completed_claim_token_sha256, store_db_timestamp_ms, receipt_sha256`;
+const TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_COLUMNS = `write_operation_sha256,
+  membership_sha256, tenant_id, scope, domain, target_sha256, inventory_sha256,
+  artifact_id_sha256, artifact_generation, manifest_sha256, payload_sha256, owner_kind,
+  tenant_ref_sha256, owner_ref_sha256, hold_subject_ref_sha256, ref_key_id_sha256,
+  owner_binding_sha256, lifecycle_coverage_evidence_sha256, lifecycle_history_status,
+  application_binding_receipt_sha256, source_schema, source_generation,
+  source_high_water_db_ms, inventory_created_at_db_ms`;
 const BLOB_COLUMNS = `blob_id, tenant_id, user_id, session_id, item_id, purpose, storage_backend,
   storage_format, storage_key, upload_token, state, sha256, size_bytes, content_type,
   uploaded_at_ms, ready_at_ms, staging_expires_at_ms, delete_after_ms, deleted_at_ms,
@@ -2732,6 +2813,61 @@ function rowToTenantTelemetryWriteAck(
   } catch (error) {
     if (error instanceof TenantTelemetryWriter.TenantTelemetryWriteIntegrityError) throw error;
     throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryArtifactMembership(
+  row: Row,
+): TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipRecord {
+  try {
+    const membership: TenantTelemetryArtifactMembership
+      .TenantTelemetryArtifactMembershipRecord = {
+      writeOperationSha256: String(row.write_operation_sha256),
+      membershipSha256: String(row.membership_sha256),
+      tenantId: String(row.tenant_id),
+      scope: String(row.scope) as typeof TenantTelemetryArtifactMembership
+        .TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_SCOPE,
+      domain: String(row.domain) as TenantTelemetryDomain,
+      targetSha256: String(row.target_sha256),
+      inventorySha256: String(row.inventory_sha256),
+      artifactIdSha256: String(row.artifact_id_sha256),
+      artifactGeneration: storedSafeInteger(
+        row.artifact_generation,
+        "tenant telemetry membership artifact generation",
+        1,
+      ),
+      manifestSha256: String(row.manifest_sha256),
+      payloadSha256: String(row.payload_sha256),
+      ownerKind: String(row.owner_kind) as TenantTelemetryOwnerKind,
+      tenantRefSha256: String(row.tenant_ref_sha256),
+      ownerRefSha256: String(row.owner_ref_sha256),
+      holdSubjectRefSha256: String(row.hold_subject_ref_sha256),
+      refKeyIdSha256: String(row.ref_key_id_sha256),
+      ownerBindingSha256: String(row.owner_binding_sha256),
+      lifecycleCoverageEvidenceSha256: String(row.lifecycle_coverage_evidence_sha256),
+      lifecycleHistoryStatus: String(row.lifecycle_history_status) as TenantTelemetryHistoryStatus,
+      applicationBindingReceiptSha256: row.application_binding_receipt_sha256 === null
+        ? null : String(row.application_binding_receipt_sha256),
+      sourceSchema: String(row.source_schema),
+      sourceGeneration: storedSafeInteger(
+        row.source_generation,
+        "tenant telemetry membership source generation",
+      ),
+      sourceHighWaterDbMs: storedSafeInteger(
+        row.source_high_water_db_ms,
+        "tenant telemetry membership source high-water",
+      ),
+      inventoryCreatedAtDbMs: storedSafeInteger(
+        row.inventory_created_at_db_ms,
+        "tenant telemetry membership inventory creation high-water",
+      ),
+    };
+    TenantTelemetryArtifactMembership.validateTenantTelemetryArtifactMembership(membership);
+    return membership;
+  } catch {
+    throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError(
+      "tenant telemetry artifact membership is invalid",
+    );
   }
 }
 
@@ -7570,6 +7706,7 @@ export class MysqlSessionStore implements
   TenantCredentialTargetExecutionStore,
   TenantTelemetryLifecycleStore,
   TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore,
+  TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore,
   TenantTelemetryWriter.TenantTelemetryWriterStore,
   TenantTelemetryDisposition.TenantTelemetryDispositionStore,
   BackupCatalog.TenantBackupCatalogStore,
@@ -7598,6 +7735,7 @@ export class MysqlSessionStore implements
   private tenantTelemetryWriterSchemaInstalled = false;
   private tenantTelemetryApplicationCaptureSchemaInstalled = false;
   private tenantTelemetryDispositionSchemaInstalled = false;
+  private tenantTelemetryArtifactMembershipSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -8113,6 +8251,59 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertTenantTelemetryArtifactMembershipFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+    includeTriggers = true,
+  ): Promise<void> {
+    let statements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME),
+        "utf8",
+      );
+      statements = [
+        tenantTelemetryArtifactMembershipFingerprintStatement(migrationSql, "schema"),
+        ...(includeTriggers
+          ? [tenantTelemetryArtifactMembershipFingerprintStatement(migrationSql, "triggers")]
+          : []),
+      ];
+    } catch (cause) {
+      throw new Error("0038 tenant telemetry membership fingerprint source is invalid", { cause });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query(
+        "SET @agent_service_tt_membership_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @tt_membership_schema_ok AS schema_ok,@tt_membership_triggers_ok AS trigger_ok",
+      );
+      if (Number(rows[0]?.schema_ok) !== 1
+        || (includeTriggers && Number(rows[0]?.trigger_ok) !== 1)) {
+        throw new Error("stored schema/triggers do not match the 0038 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error(
+        "0038 tenant telemetry membership fingerprint verification failed",
+        { cause },
+      );
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_tt_membership_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error(
+        "0038 tenant telemetry membership fingerprint session restore failed",
+        { cause },
+      );
+    }
+    if (failure) throw failure;
+  }
+
   private async reconcileLegacyTenantTelemetryLifecycleSubjects(
     conn: PoolConnection,
     acknowledgements: NonNullable<
@@ -8316,6 +8507,22 @@ export class MysqlSessionStore implements
 
   private async assertTenantTelemetryWriterProjection(conn: PoolConnection): Promise<void> {
     if (!this.tenantTelemetryWriterSchemaInstalled) return;
+    if (this.tenantTelemetryArtifactMembershipSchemaInstalled) {
+      const [membershipOrphans] = await conn.query<Row[]>(
+        `SELECT COUNT(*) AS orphan_count
+           FROM tenant_telemetry_artifact_memberships m
+           LEFT JOIN tenant_telemetry_write_jobs j
+             ON BINARY j.write_operation_sha256=BINARY m.write_operation_sha256
+          WHERE j.write_operation_sha256 IS NULL`,
+      );
+      if (!membershipOrphans[0]
+        || storedSafeInteger(membershipOrphans[0].orphan_count,
+          "tenant telemetry orphan membership count") !== 0) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError(
+          "tenant telemetry artifact membership is orphaned",
+        );
+      }
+    }
     const [jobRows] = await conn.query<Row[]>(
       `SELECT write_operation_sha256
          FROM tenant_telemetry_write_jobs
@@ -8424,6 +8631,10 @@ export class MysqlSessionStore implements
       }
       const control = await this.readTenantTelemetryLifecycleControl(conn);
       if (control.state === "inactive") {
+        const membershipProjectionCount = this.tenantTelemetryArtifactMembershipSchemaInstalled
+          ? `, (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships)
+              AS membership_count`
+          : ", 0 AS membership_count";
         const writerProjectionCounts = this.tenantTelemetryWriterSchemaInstalled
           ? `,
              (SELECT COUNT(*) FROM tenant_telemetry_write_jobs) AS write_job_count,
@@ -8437,7 +8648,8 @@ export class MysqlSessionStore implements
              (SELECT COUNT(*) FROM tenant_telemetry_lifecycle_subjects) AS subject_count,
              (SELECT COUNT(*) FROM tenant_telemetry_activation_receipts) AS receipt_count,
              (SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory) AS inventory_count
-             ${writerProjectionCounts}`,
+             ${writerProjectionCounts}
+             ${membershipProjectionCount}`,
         );
         const projection = rows[0];
         if (!projection || [
@@ -8449,6 +8661,7 @@ export class MysqlSessionStore implements
           projection.write_job_count,
           projection.write_payload_count,
           projection.write_ack_count,
+          projection.membership_count,
         ].some((value) => storedSafeInteger(
           value,
           "stored inactive tenant telemetry projection count",
@@ -8496,6 +8709,10 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)) {
+        throw new Error("0038 membership marker is missing its 0037 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -8532,8 +8749,12 @@ export class MysqlSessionStore implements
           conn, migrationsDir, !done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME),
         );
       }
-      if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)) {
+      if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
         await this.assertTenantTelemetryGrantGuardFingerprint(conn, migrationsDir);
+      }
+      if (done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryArtifactMembershipFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -8555,6 +8776,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryDispositionSchemaInstalled = done.has(
         TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME,
+      );
+      this.tenantTelemetryArtifactMembershipSchemaInstalled = done.has(
+        TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME,
       );
       if (!skipTelemetryRuntimeAudit) {
         await this.assertTenantTelemetryRuntimeConfiguration(conn);
@@ -8589,9 +8813,27 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)) {
+        throw new Error("0038 membership marker is missing its 0037 predecessor");
+      }
       const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME) {
+          const [rows] = await conn.query<Row[]>(
+            `SELECT COUNT(*) AS trigger_count FROM information_schema.triggers
+              WHERE trigger_schema=DATABASE() AND trigger_name IN
+                ('trg_tt_membership_bi','trg_tt_membership_bu',
+                 'trg_tt_membership_bd','trg_tt_membership_write_job_bi')`,
+          );
+          if (storedSafeInteger(rows[0]?.trigger_count,
+            "existing 0038 membership trigger count") === 0) {
+            // Before the first 0038 trigger, require the exact published 0037 guard. The 0038
+            // migration only adds triggers, so a writer never sees a dropped 0035 job guard.
+            await this.assertTenantTelemetryGrantGuardFingerprint(conn, dir);
+          }
+        }
         if (f === TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME) {
           const [guardRows] = await conn.query<Row[]>(
             `SELECT COUNT(*) AS guard_count FROM information_schema.triggers
@@ -8696,6 +8938,12 @@ export class MysqlSessionStore implements
             }
             if (is0036TriggerRotation
               && skipTenantTelemetryDispositionTriggerRotation) continue;
+            if (f === TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME
+              && stmt.startsWith("CREATE TRIGGER trg_tt_membership_bi ")) {
+              // CREATE TABLE IF NOT EXISTS and a column/index probe cannot validate CHECK/FK
+              // shape. Verify the exact table before installing any trigger.
+              await this.assertTenantTelemetryArtifactMembershipFingerprint(conn, dir, false);
+            }
             await executeMysqlMigrationStatement(conn, f, stmt);
           } catch (cause) {
             throw new Error(`migration ${f} failed at statement ${i + 1}/${statements.length}`, { cause });
@@ -8734,8 +8982,12 @@ export class MysqlSessionStore implements
           conn, dir, !done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME),
         );
       }
-      if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)) {
+      if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
         await this.assertTenantTelemetryGrantGuardFingerprint(conn, dir);
+      }
+      if (done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryArtifactMembershipFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -8757,6 +9009,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryDispositionSchemaInstalled = done.has(
         TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME,
+      );
+      this.tenantTelemetryArtifactMembershipSchemaInstalled = done.has(
+        TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME,
       );
       await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
@@ -35400,6 +35655,61 @@ export class MysqlSessionStore implements
     );
   }
 
+  private async readTenantTelemetryArtifactMembership(
+    executor: Pool | PoolConnection,
+    writeOperationSha256: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipRecord | null> {
+    if (!this.tenantTelemetryArtifactMembershipSchemaInstalled) return null;
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_COLUMNS}
+         FROM tenant_telemetry_artifact_memberships
+        WHERE write_operation_sha256=? ${lock}`,
+      [writeOperationSha256],
+    );
+    if (rows.length > 1) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
+    return rows[0] ? rowToTenantTelemetryArtifactMembership(rows[0]) : null;
+  }
+
+  private async insertTenantTelemetryArtifactMembership(
+    conn: PoolConnection,
+    membership: TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipRecord,
+  ): Promise<void> {
+    TenantTelemetryArtifactMembership.validateTenantTelemetryArtifactMembership(membership);
+    const values = [
+      membership.writeOperationSha256,
+      membership.membershipSha256,
+      membership.tenantId,
+      membership.scope,
+      membership.domain,
+      membership.targetSha256,
+      membership.inventorySha256,
+      membership.artifactIdSha256,
+      membership.artifactGeneration,
+      membership.manifestSha256,
+      membership.payloadSha256,
+      membership.ownerKind,
+      membership.tenantRefSha256,
+      membership.ownerRefSha256,
+      membership.holdSubjectRefSha256,
+      membership.refKeyIdSha256,
+      membership.ownerBindingSha256,
+      membership.lifecycleCoverageEvidenceSha256,
+      membership.lifecycleHistoryStatus,
+      membership.applicationBindingReceiptSha256,
+      membership.sourceSchema,
+      membership.sourceGeneration,
+      membership.sourceHighWaterDbMs,
+      membership.inventoryCreatedAtDbMs,
+    ];
+    await conn.query(
+      `INSERT INTO tenant_telemetry_artifact_memberships
+         (${TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_COLUMNS})
+       VALUES (${values.map(() => "?").join(",")})`,
+      values,
+    );
+  }
+
   private async readTenantTelemetryWriteJobByExternalIdentity(
     executor: Pool | PoolConnection,
     domain: TenantTelemetryDomain,
@@ -35477,6 +35787,8 @@ export class MysqlSessionStore implements
         job.inventory.artifactGeneration,
         lock,
       );
+      let applicationBinding:
+        TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding | null = null;
       if (this.tenantTelemetryApplicationCaptureSchemaInstalled) {
         const applicationControl = await this.readTenantTelemetryApplicationDomainControl(
           executor,
@@ -35488,6 +35800,7 @@ export class MysqlSessionStore implements
           job.writeOperationSha256,
           lock,
         );
+        applicationBinding = binding;
         if (applicationControl.state === "inactive") {
           if (binding) throw new Error("inactive application domain has a write binding");
         } else if (binding) {
@@ -35539,6 +35852,27 @@ export class MysqlSessionStore implements
             throw new Error("tenant telemetry pre-cutover write projection is invalid");
           }
         }
+      }
+      const membership = await this.readTenantTelemetryArtifactMembership(
+        executor,
+        job.writeOperationSha256,
+        lock,
+      );
+      if (membership) {
+        const lifecycleControl = await this.readTenantTelemetryLifecycleControl(executor, lock);
+        if (lifecycleControl.state !== "active") {
+          throw new Error("telemetry membership has no active lifecycle control");
+        }
+        TenantTelemetryArtifactMembership.validateTenantTelemetryArtifactMembershipSource(
+          membership,
+          {
+            writeOperationSha256: job.writeOperationSha256,
+            jobCreatedAtMs: job.createdAtMs,
+            inventory: job.inventory,
+            refKeyIdSha256: lifecycleControl.refKeyIdSha256,
+            applicationBinding,
+          },
+        );
       }
       if (job.phase === "written") {
         if (payload || !ack || !inventory || !job.reservation
@@ -35937,6 +36271,23 @@ export class MysqlSessionStore implements
         );
         if (existing) {
           await this.assertTenantTelemetryWriteJobRelations(conn, existing, "FOR SHARE");
+          const existingMembership = await this.readTenantTelemetryArtifactMembership(
+            conn,
+            staged.operationSha256,
+            "FOR SHARE",
+          );
+          if (existingMembership
+            && existingMembership.ownerBindingSha256 !== TenantTelemetryArtifactMembership
+              .tenantTelemetryArtifactOwnerBindingSha256({
+                tenantId: stagedInput.tenantId,
+                ownerKind: stagedInput.ownerKind,
+                ownerId: stagedInput.ownerId,
+                ownerUserId: stagedInput.ownerUserId,
+              }, refKey)) {
+            throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+              "tenant telemetry artifact membership owner changed on exact replay",
+            );
+          }
           if (existing.tenantId !== stagedInput.tenantId
             || existing.target.receiptSha256 !== staged.target.receiptSha256
             || existing.inventory.manifestSha256 !== staged.inventory.manifestSha256
@@ -36075,6 +36426,8 @@ export class MysqlSessionStore implements
         };
         TenantTelemetryWriter.validateTenantTelemetryWriteJobRecord(job);
         TenantTelemetryWriter.validateTenantTelemetryWritePayloadRecord(payloadRecord);
+        let applicationBinding:
+          TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding | null = null;
         if (staged.applicationControl?.state === "active") {
           const applicationCoverage = staged.applicationCoverage!;
           const bindingBody:
@@ -36108,6 +36461,7 @@ export class MysqlSessionStore implements
           };
           TenantTelemetryApplicationCapture
             .validateTenantTelemetryApplicationWriteBinding(binding);
+          applicationBinding = binding;
           await conn.query(
             `INSERT INTO tenant_telemetry_application_write_bindings
                (write_operation_sha256,scope,protocol,tenant_id,domain,control_generation,
@@ -36137,6 +36491,18 @@ export class MysqlSessionStore implements
               binding.receiptSha256,
             ],
           );
+        }
+        if (this.tenantTelemetryArtifactMembershipSchemaInstalled) {
+          const membership = TenantTelemetryArtifactMembership
+            .createTenantTelemetryArtifactMembership({
+              writeOperationSha256: staged.operationSha256,
+              inventory: staged.inventory,
+              ownerId: stagedInput.ownerId,
+              ownerUserId: stagedInput.ownerUserId,
+              refKey,
+              applicationBinding,
+            });
+          await this.insertTenantTelemetryArtifactMembership(conn, membership);
         }
         await conn.query(
           `INSERT INTO tenant_telemetry_write_jobs
@@ -36931,6 +37297,34 @@ export class MysqlSessionStore implements
       if (!job) return null;
       await this.assertTenantTelemetryWriteJobRelations(conn, job);
       return job.tenantId === tenantId ? job : null;
+    });
+  }
+
+  async getTenantTelemetryArtifactMembership(
+    tenantId: string,
+    writeOperationSha256: string,
+  ): Promise<TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipRecord | null> {
+    if (typeof tenantId !== "string" || tenantId.length < 1 || tenantId.length > 128
+      || !/^[0-9a-f]{64}$/.test(writeOperationSha256)) {
+      throw new Error("tenant telemetry artifact membership lookup is invalid");
+    }
+    if (!this.tenantTelemetryArtifactMembershipSchemaInstalled) return null;
+    return this.withConsistentRead(async (conn) => {
+      const membership = await this.readTenantTelemetryArtifactMembership(
+        conn,
+        writeOperationSha256,
+      );
+      const job = await this.readTenantTelemetryWriteJob(conn, writeOperationSha256);
+      if (!job) {
+        if (membership) {
+          throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError(
+            "tenant telemetry artifact membership is orphaned",
+          );
+        }
+        return null;
+      }
+      await this.assertTenantTelemetryWriteJobRelations(conn, job);
+      return job.tenantId === tenantId ? membership : null;
     });
   }
 

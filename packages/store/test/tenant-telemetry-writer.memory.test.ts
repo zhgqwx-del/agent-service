@@ -8,6 +8,9 @@ import {
   newErasureRequestId,
   tenantErasureRequestHash,
   tenantTelemetryWriteAdapterEvidenceSha256,
+  tenantTelemetryArtifactMembershipSha256,
+  tenantTelemetryArtifactOwnerBindingSha256,
+  tenantTelemetryRefKeyIdSha256,
   type EnqueueTenantTelemetryArtifactInput,
   type TenantTelemetryWriteAdapterResult,
   type TenantTelemetryWriteAuthorization,
@@ -118,6 +121,118 @@ async function activeStore(now: () => number): Promise<MemorySessionStore> {
 }
 
 describe("MemorySessionStore durable tenant telemetry writer", () => {
+  it("atomically preserves a content-free per-write membership without granting deletion", async () => {
+    let nowMs = 1_000;
+    const store = await activeStore(() => nowMs);
+    nowMs = 1_100;
+    const tenantId = "writer-membership";
+    await store.createApiKey(tenantId, "key", "hash");
+    const writeInput = input(tenantId);
+    const job = await store.enqueueTenantTelemetryArtifact(writeInput);
+    const membership = await store.getTenantTelemetryArtifactMembership(
+      tenantId,
+      job.writeOperationSha256,
+    );
+    expect(membership).toMatchObject({
+      writeOperationSha256: job.writeOperationSha256,
+      tenantId,
+      inventorySha256: job.inventory.inventorySha256,
+      applicationBindingReceiptSha256: null,
+      ownerBindingSha256: tenantTelemetryArtifactOwnerBindingSha256({
+        tenantId,
+        ownerKind: "tenant",
+        ownerId: tenantId,
+        ownerUserId: null,
+      }, REF_KEY),
+      refKeyIdSha256: tenantTelemetryRefKeyIdSha256(REF_KEY),
+    });
+    expect(membership?.membershipSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify(membership)).not.toContain("claimToken");
+    await expect(store.getTenantTelemetryArtifactMembership(
+      "foreign-tenant",
+      job.writeOperationSha256,
+    )).resolves.toBeNull();
+    await expect(store.enqueueTenantTelemetryArtifact(writeInput)).resolves.toEqual(job);
+    await expect(store.getTenantTelemetryArtifactMembership(
+      tenantId,
+      job.writeOperationSha256,
+    )).resolves.toEqual(membership);
+    // There is no T3f owner-closure proof, no executable T3d target and no grant issuance.
+    expect(store.tenantTelemetryDispositionAuthorizationGrants).toHaveLength(0);
+  });
+
+  it("rejects a second pending operation for the same artifact slot without changing its sidecar", async () => {
+    let nowMs = 1_000;
+    const store = await activeStore(() => nowMs);
+    nowMs = 1_100;
+    const tenantId = "writer-membership-duplicate-slot";
+    await store.createApiKey(tenantId, "key", "hash");
+    const first = await store.enqueueTenantTelemetryArtifact(input(tenantId));
+    const membership = await store.getTenantTelemetryArtifactMembership(
+      tenantId, first.writeOperationSha256,
+    );
+    await expect(store.enqueueTenantTelemetryArtifact(input(tenantId, {
+      sourceGeneration: 2,
+    }))).rejects.toBeInstanceOf(TenantTelemetryWriteConflictError);
+    expect(store.tenantTelemetryWriteJobs.size).toBe(1);
+    expect(store.tenantTelemetryArtifactMemberships.size).toBe(1);
+    await expect(store.getTenantTelemetryArtifactMembership(
+      tenantId, first.writeOperationSha256,
+    )).resolves.toEqual(membership);
+  });
+
+  it("fails closed on an orphan or forged membership without rewriting legacy absence", async () => {
+    let nowMs = 1_000;
+    const store = await activeStore(() => nowMs);
+    nowMs = 1_100;
+    await store.createApiKey("writer-membership-corrupt", "key", "hash");
+    const job = await store.enqueueTenantTelemetryArtifact(input("writer-membership-corrupt"));
+    const original = store.tenantTelemetryArtifactMemberships.get(job.writeOperationSha256)!;
+    store.tenantTelemetryArtifactMemberships.delete(job.writeOperationSha256);
+    await expect(store.getTenantTelemetryArtifactMembership(
+      job.tenantId,
+      job.writeOperationSha256,
+    )).resolves.toBeNull(); // A pre-0038 job is unknown, never reconstructed.
+    const { membershipSha256: _receipt, ...body } = original;
+    store.tenantTelemetryArtifactMemberships.set(job.writeOperationSha256, {
+      ...original,
+      targetSha256: D("a"),
+      membershipSha256: tenantTelemetryArtifactMembershipSha256({
+        ...body,
+        targetSha256: D("a"),
+      }),
+    });
+    await expect(store.getTenantTelemetryArtifactMembership(
+      job.tenantId,
+      job.writeOperationSha256,
+    )).rejects.toThrow();
+    store.tenantTelemetryArtifactMemberships.set(job.writeOperationSha256, original);
+    store.tenantTelemetryWriteJobs.delete(job.writeOperationSha256);
+    await expect(store.getTenantTelemetryArtifactMembership(
+      job.tenantId,
+      job.writeOperationSha256,
+    )).rejects.toThrow();
+  });
+
+  it("rejects a valid-shaped job whose creation time drifts from its membership", async () => {
+    let nowMs = 1_000;
+    const store = await activeStore(() => nowMs);
+    nowMs = 1_100;
+    await store.createApiKey("writer-membership-time-drift", "key", "hash");
+    const job = await store.enqueueTenantTelemetryArtifact(input("writer-membership-time-drift"));
+    const stored = store.tenantTelemetryWriteJobs.get(job.writeOperationSha256)!;
+    if (stored.phase !== "queued") throw new Error("expected a queued telemetry job");
+    store.tenantTelemetryWriteJobs.set(job.writeOperationSha256, {
+      ...stored,
+      createdAtMs: stored.createdAtMs + 1,
+      updatedAtMs: stored.updatedAtMs + 1,
+      availableAtMs: stored.availableAtMs + 1,
+    });
+    await expect(store.getTenantTelemetryArtifactMembership(
+      job.tenantId, job.writeOperationSha256,
+    )).rejects.toThrow();
+  });
+
   it("rejects a syntax-valid literal record at live enqueue capture", async () => {
     let nowMs = 1_000;
     const store = await activeStore(() => nowMs);
@@ -391,6 +506,33 @@ describe("MemorySessionStore durable tenant telemetry writer", () => {
     expect(store.tenantTelemetryWriteJobs).toHaveLength(0);
     expect(store.tenantTelemetryWritePayloads).toHaveLength(0);
     expect(store.tenantTelemetryWriteAcks).toHaveLength(0);
+    expect(store.tenantTelemetryArtifactMemberships).toHaveLength(0);
+  });
+
+  it("rolls back job, payload and application-independent membership on late sidecar failure", async () => {
+    let nowMs = 1_000;
+    const store = await activeStore(() => nowMs);
+    nowMs = 1_100;
+    await store.createApiKey("writer-membership-rollback", "key", "hash");
+    const originalSet = store.tenantTelemetryArtifactMemberships.set.bind(
+      store.tenantTelemetryArtifactMemberships,
+    );
+    let fail = true;
+    Object.defineProperty(store.tenantTelemetryArtifactMemberships, "set", {
+      configurable: true,
+      value: (key: string, value: Parameters<typeof originalSet>[1]) => {
+        if (fail) {
+          fail = false;
+          throw new Error("injected membership publication failure");
+        }
+        return originalSet(key, value);
+      },
+    });
+    await expect(store.enqueueTenantTelemetryArtifact(input("writer-membership-rollback")))
+      .rejects.toThrow("injected membership publication failure");
+    expect(store.tenantTelemetryWriteJobs).toHaveLength(0);
+    expect(store.tenantTelemetryWritePayloads).toHaveLength(0);
+    expect(store.tenantTelemetryArtifactMemberships).toHaveLength(0);
   });
 
   it("rolls back inventory, ACK, terminal job and payload cleanup together", async () => {

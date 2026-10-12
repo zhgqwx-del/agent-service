@@ -25,6 +25,7 @@ export * from "./backup-catalog.js";
 export * from "./tenant-telemetry-lifecycle.js";
 export * from "./tenant-telemetry-writer.js";
 export * from "./tenant-telemetry-application-capture.js";
+export * from "./tenant-telemetry-artifact-membership.js";
 export * from "./tenant-telemetry-disposition.js";
 export * from "./tenant-telemetry-adapter/common.js";
 export * from "./tenant-telemetry-adapter/memory.js";

@@ -839,6 +839,7 @@ import * as BackupCatalogAdapter from "./backup-catalog-adapter/common.js";
 import * as TenantTelemetry from "./tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "./tenant-telemetry-writer.js";
 import * as TenantTelemetryApplicationCapture from "./tenant-telemetry-application-capture.js";
+import * as TenantTelemetryArtifactMembership from "./tenant-telemetry-artifact-membership.js";
 import * as TenantTelemetryDisposition from "./tenant-telemetry-disposition.js";
 
 interface MemoryUserDataExportJob {
@@ -1146,7 +1147,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1353,6 +1354,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantTelemetryWriteAcks = new Map<
     string,
     TenantTelemetryWriter.TenantTelemetryWriteAck
+  >();
+  tenantTelemetryArtifactMemberships = new Map<
+    string,
+    TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipRecord
   >();
   tenantTelemetryApplicationDomainControls = new Map<
     TenantTelemetry.TenantTelemetryDomain,
@@ -2486,7 +2491,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (control.state === "inactive") {
       if (this.tenantTelemetryWriteJobs.size !== 0
         || this.tenantTelemetryWritePayloads.size !== 0
-        || this.tenantTelemetryWriteAcks.size !== 0) {
+        || this.tenantTelemetryWriteAcks.size !== 0
+        || this.tenantTelemetryArtifactMemberships.size !== 0) {
         throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
       }
       return;
@@ -2509,6 +2515,19 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           targets,
           refKey,
         );
+        const membership = this.tenantTelemetryArtifactMemberships.get(operationSha256);
+        if (membership) {
+          TenantTelemetryArtifactMembership
+            .validateTenantTelemetryArtifactMembershipSource(membership, {
+              writeOperationSha256: operationSha256,
+              jobCreatedAtMs: job.createdAtMs,
+              inventory: job.inventory,
+              refKeyIdSha256: control.refKeyIdSha256,
+              applicationBinding: this.tenantTelemetryApplicationWriteBindings.get(
+                operationSha256,
+              ) ?? null,
+            });
+        }
         const payload = this.tenantTelemetryWritePayloads.get(operationSha256);
         const ack = this.tenantTelemetryWriteAcks.get(operationSha256);
         const inventory = this.tenantTelemetryArtifactInventories.get(
@@ -2560,6 +2579,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           || !this.tenantTelemetryWriteJobs.has(operationSha256)) {
           throw new Error("tenant telemetry write ACK is orphaned");
         }
+      }
+      const membershipInventories = new Set<string>();
+      for (const [operationSha256, membership] of this.tenantTelemetryArtifactMemberships) {
+        if (operationSha256 !== membership.writeOperationSha256
+          || !this.tenantTelemetryWriteJobs.has(operationSha256)
+          || membershipInventories.has(membership.inventorySha256)) {
+          throw new Error("tenant telemetry artifact membership is orphaned or duplicated");
+        }
+        membershipInventories.add(membership.inventorySha256);
       }
     } catch (error) {
       if (error instanceof TenantTelemetryWriter.TenantTelemetryWriteIntegrityError) throw error;
@@ -22459,6 +22487,21 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       const existingBinding = this.tenantTelemetryApplicationWriteBindings.get(
         staged.operationSha256,
       );
+      const existingMembership = this.tenantTelemetryArtifactMemberships.get(
+        staged.operationSha256,
+      );
+      if (existingMembership
+        && existingMembership.ownerBindingSha256 !== TenantTelemetryArtifactMembership
+          .tenantTelemetryArtifactOwnerBindingSha256({
+            tenantId: stagedInput.tenantId,
+            ownerKind: stagedInput.ownerKind,
+            ownerId: stagedInput.ownerId,
+            ownerUserId: stagedInput.ownerUserId,
+          }, refKey)) {
+        throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+          "tenant telemetry artifact membership owner changed on exact replay",
+        );
+      }
       if (existingBinding) {
         if (applicationControl.state !== "active"
           || stagedInput.producerProtocol !== applicationControl.producerProtocol
@@ -22488,6 +22531,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || stagedInput.producerContractSha256 !== undefined) {
       throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
         "tenant telemetry application producer binding requires an active cutover",
+      );
+    }
+    if ([...this.tenantTelemetryWriteJobs.values()].some((job) =>
+      job.inventory.domain === staged.inventory.domain
+        && job.inventory.artifactIdSha256 === staged.inventory.artifactIdSha256
+        && job.inventory.artifactGeneration === staged.inventory.artifactGeneration)) {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+        "tenant telemetry artifact already has a write operation",
       );
     }
     const inventoryKey = this.tenantTelemetryArtifactMapKey(
@@ -22570,12 +22621,26 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       TenantTelemetryApplicationCapture
         .validateTenantTelemetryApplicationWriteBinding(applicationBinding);
     }
+    const membership = TenantTelemetryArtifactMembership
+      .createTenantTelemetryArtifactMembership({
+        writeOperationSha256: staged.operationSha256,
+        inventory: staged.inventory,
+        ownerId: stagedInput.ownerId,
+        ownerUserId: stagedInput.ownerUserId,
+        refKey,
+        applicationBinding: applicationBinding ?? null,
+      });
     const jobsBefore = new Map(this.tenantTelemetryWriteJobs);
     const payloadsBefore = new Map(this.tenantTelemetryWritePayloads);
     const bindingsBefore = new Map(this.tenantTelemetryApplicationWriteBindings);
+    const membershipsBefore = new Map(this.tenantTelemetryArtifactMemberships);
     try {
       this.tenantTelemetryWritePayloads.set(staged.operationSha256, clone(payloadRecord));
       this.tenantTelemetryWriteJobs.set(staged.operationSha256, clone(job));
+      this.tenantTelemetryArtifactMemberships.set(
+        staged.operationSha256,
+        clone(membership),
+      );
       if (applicationBinding) {
         this.tenantTelemetryApplicationWriteBindings.set(
           staged.operationSha256,
@@ -22584,6 +22649,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
       this.assertTenantTelemetryWriterGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(this.tenantTelemetryArtifactMemberships, membershipsBefore);
       restoreMapSnapshot(this.tenantTelemetryApplicationWriteBindings, bindingsBefore);
       restoreMapSnapshot(this.tenantTelemetryWriteJobs, jobsBefore);
       restoreMapSnapshot(this.tenantTelemetryWritePayloads, payloadsBefore);
@@ -23096,6 +23162,21 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     this.assertTenantTelemetryWriterGlobalRelations();
     const job = this.tenantTelemetryWriteJobs.get(writeOperationSha256);
     return clone(job?.tenantId === tenantId ? job : null);
+  }
+
+  async getTenantTelemetryArtifactMembership(
+    tenantId: string,
+    writeOperationSha256: string,
+  ): Promise<TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipRecord | null> {
+    if (typeof tenantId !== "string" || tenantId.length < 1 || tenantId.length > 128
+      || !/^[0-9a-f]{64}$/.test(writeOperationSha256)) {
+      throw new Error("tenant telemetry artifact membership lookup is invalid");
+    }
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const job = this.tenantTelemetryWriteJobs.get(writeOperationSha256);
+    if (!job || job.tenantId !== tenantId) return null;
+    const membership = this.tenantTelemetryArtifactMemberships.get(writeOperationSha256);
+    return clone(membership ?? null);
   }
 
   async getTenantTelemetryWriteAck(
