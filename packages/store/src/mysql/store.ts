@@ -24909,10 +24909,21 @@ export class MysqlSessionStore implements
         throw new TenantErasureIntegrityError();
       }
       const claims = await this.loadTenantTelemetryPregrantClaims(conn, intent);
+      // The 0043 source proof clock may be stale after lock waits. Use a fresh trusted
+      // DB time for replay/expiry and the new lease, then recheck after INSERT below.
+      const claimNowMs = await this.databaseNow(conn);
+      if (claimNowMs < nowMs) {
+        throw new TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaimLeaseExpiredError();
+      }
       const prior = claims.at(-1);
       if (prior) {
-        if (prior.leaseUntilDbMs > nowMs) {
-          return prior.claimTokenSha256 === tokenSha256 ? prior : null;
+        if (prior.leaseUntilDbMs > claimNowMs) {
+          if (prior.claimTokenSha256 !== tokenSha256) return null;
+          const replayNowMs = await this.databaseNow(conn);
+          if (replayNowMs < claimNowMs) {
+            throw new TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaimLeaseExpiredError();
+          }
+          return replayNowMs < prior.leaseUntilDbMs ? prior : null;
         }
       }
       if (claims.some((row) => row.claimTokenSha256 === tokenSha256)) return null;
@@ -24920,8 +24931,8 @@ export class MysqlSessionStore implements
         scope: TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_CLAIM_SCOPE,
         tenantId, requestId, intentSha256: intent.intentSha256,
         attempt: (prior?.attempt ?? 0) + 1,
-        claimTokenSha256: tokenSha256, claimedAtDbMs: nowMs,
-        leaseUntilDbMs: nowMs + leaseMs, grantReady: false,
+        claimTokenSha256: tokenSha256, claimedAtDbMs: claimNowMs,
+        leaseUntilDbMs: claimNowMs + leaseMs, grantReady: false,
       };
       const claim: TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim = {
         ...body, claimSha256: TenantTelemetryPregrantIntent.tenantTelemetryPregrantClaimSha256(body),
@@ -24936,6 +24947,12 @@ export class MysqlSessionStore implements
           claim.attempt, claim.claimTokenSha256, claim.claimedAtDbMs,
           claim.leaseUntilDbMs, claim.claimSha256],
       );
+      const afterInsertNowMs = await this.databaseNow(conn);
+      if (afterInsertNowMs < claimNowMs || afterInsertNowMs >= claim.leaseUntilDbMs) {
+        // Throw rather than return null: the common transaction wrapper rolls back the
+        // already-inserted row before exposing a retryable response.
+        throw new TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaimLeaseExpiredError();
+      }
       return claim;
     }, artifactGroupSha256);
     return outcome && "claimSha256" in outcome ? outcome : null;

@@ -17,6 +17,7 @@ import {
   SessionGoneError,
   TenantDatabasePurgeEvidenceChangedError,
   TenantErasureIntegrityError,
+  TenantTelemetryPregrantClaimLeaseExpiredError,
   TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
   TENANT_TELEMETRY_APPLICATION_FLEET_STOPPED_ACK,
   TENANT_TELEMETRY_APPLICATION_LEGACY_WRITERS_DRAINED_ACK,
@@ -1472,6 +1473,18 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         );
         expect(Number(failedClaimRows[0]?.n)).toBe(0);
         await conn.query("DROP TRIGGER test_pregrant_claim_abort");
+        await conn.query(`CREATE TRIGGER test_pregrant_claim_expire AFTER INSERT
+          ON tenant_telemetry_pregrant_claims FOR EACH ROW
+          BEGIN DECLARE waited INT; SET waited = SLEEP(1.25); END`);
+        await expect(store.claimTenantTelemetryPregrantIntent(
+          tenantId, requestId, group, intent.intentSha256, "claim-after-rollback", 1_000,
+        )).rejects.toBeInstanceOf(TenantTelemetryPregrantClaimLeaseExpiredError);
+        const [expiredClaimRows] = await conn.query<RowDataPacket[]>(
+          "SELECT COUNT(*) AS n FROM tenant_telemetry_pregrant_claims WHERE tenant_id=?",
+          [tenantId],
+        );
+        expect(Number(expiredClaimRows[0]?.n)).toBe(0);
+        await conn.query("DROP TRIGGER test_pregrant_claim_expire");
         expect(await store.claimTenantTelemetryPregrantIntent(
           tenantId, requestId, group, intent.intentSha256, "claim-after-rollback", 1_000,
         )).toMatchObject({ attempt: 1, grantReady: false });

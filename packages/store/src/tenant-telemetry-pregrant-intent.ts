@@ -6,6 +6,16 @@ export const TENANT_TELEMETRY_PREGRANT_INTENT_SCOPE =
 export const TENANT_TELEMETRY_PREGRANT_CLAIM_SCOPE =
   "tenant-telemetry-pregrant-claim-v1" as const;
 
+/** Retry with the same intent version; no new claim was committed. */
+export class TenantTelemetryPregrantClaimLeaseExpiredError extends Error {
+  readonly retryable = true as const;
+
+  constructor() {
+    super("telemetry pregrant claim lease expired or database clock regressed");
+    this.name = "TenantTelemetryPregrantClaimLeaseExpiredError";
+  }
+}
+
 const SHA256 = /^[0-9a-f]{64}$/;
 const digest = (value: unknown): value is string =>
   typeof value === "string" && SHA256.test(value);
