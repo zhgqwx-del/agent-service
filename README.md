@@ -5,12 +5,12 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`分离logs/traces lifecycle与应用capture，当前只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`增加默认休眠的disposition迁移/原子store、独立S3 CAS-head journal与同keyCAS tombstone非生产协议夹具；`0037`修正grant claim-hash trigger并增加非生产grant-bound v2 Memory协议；`0038`给新受管telemetry write原子保存不可变逐项artifact membership/source sidecar，旧write不回填；`0039`在T3f删除canonical owner前封存逐项owner/session grave closure；`0040`在新T3d同事务封存五类telemetry来源；`0041`再在同一T3d事务封存与每条0040来源精确对应的逐artifact观察目标集合与独立receipt。legacy、未完成或孤立来源只能是unknown/零观察目标，旧terminal缺sidecar不回填。0041只读source-readiness固定`executionReady=false`，不是33域执行target、locator或grant。真实grant在Memory/MySQL及MySQL trigger两层仍硬拒，v2没有产品S3写入、外部mutation/ACK或旧快照恢复权限。T3d logs/traces仍是零target blocker，也没有telemetry disposition activation/worker/CLI；第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS、私有访问或独立故障域。真实provider/KMS、generic user物理purge、物理backup producer、telemetry delete/restore/retention与全域completion仍未闭环，所以M1未冻结。
+- **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`/`0037`仍是默认休眠的非生产disposition协议与真实grant硬拒；`0038`～`0041`依次封存新受管write membership、T3f owner closure、T3d五类source和观察目标。`0042`再为**新**T3d plan从同一次source/owner快照构建逐artifact目标目录，把logs/traces的精确count/root写入33域plan entry，并与0040/0041账本、独立catalog receipt及terminal在一个Memory原子发布或MySQL事务中封存。legacy、未完成、孤立来源保持unknown，旧0041 terminal缺catalog不能重释为新目标。新目标仍为`blocked_adapter_unconfigured`，不是删除许可；真实grant、产品外部mutation/restore和全域completion仍关闭。第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS或独立故障域。真实provider/KMS、generic user物理purge、物理backup producer、telemetry delete/restore/retention与全域completion仍未闭环，所以M1未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
-- **M4 生产化**（配额、可观测性、限流）：主体尚未开始；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0041默认休眠基座已具备，但还没有真实managed环境验收、完整telemetry执行生命周期、metrics/SLO/alert、限流/配额或生产环境验收。
+- **M4 生产化**（配额、可观测性、限流）：主体尚未开始；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0042默认休眠基座已具备，但还没有真实managed环境验收、完整telemetry执行生命周期、metrics/SLO/alert、限流/配额或生产环境验收。
 
-`0040`只为新T3d封存logs/traces来源账本；`0041`为每个来源封存所属artifact group与观察目标，并精确核对来源关系。只有inventory、written job、ACK、membership、binding及真实owner同事务闭合，才能记一个观察目标；孤立或不完整项是unknown/零观察目标。该观察目标绝非可执行删除target。旧sealed plan缺任一receipt仍为`unknown`，两者都不解除零执行target blocker、0037 grant硬拒或外部删除/恢复与全域completion门禁。最新验证与剩余工作以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。
+`0040`/`0041`封存source与观察目标，`0042`仅让新plan拥有精确、不可变的logs/traces逐artifact目标count/root；目录条目含受保护身份和来源摘要，不含原始owner或外部locator。旧terminal缺0042 receipt仍是`unknown`，不能借0041观察目标推断其T3d目标。即使新plan有非零目标，两域仍保持blocker，`executionReady=false`；0037 grant硬拒、外部删除/恢复与全域completion门禁不变。最新验证与剩余工作以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。
 
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
@@ -64,7 +64,7 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0039 → 0040 → 0041 的真实 MySQL 历史升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0041 → 0042 的真实 MySQL 历史升级夹具
 # 以下单独列出的 S3 套件需先配置各自的 S3_TEST_* 测试环境；本地优先用 verify-s3 自动准备 MinIO 与 bucket。
 pnpm test:tenant-telemetry-lifecycle          # 0032/0033 content-free evidence helper
 pnpm test:tenant-telemetry-lifecycle-memory   # 0033 Memory activation/coverage/inventory原子语义
@@ -99,8 +99,8 @@ pnpm test:backup-catalog-reconcile-mysql-s3   # 强制执行 0031 真实MySQL+Mi
 pnpm test:backup-catalog-restore-roundtrip-mysql-s3 # 强制执行真实mysqldump旧快照恢复/authority重建套件
 pnpm test:tenant-runtime-revocation-mysql     # 强制执行 T3b configured-fleet runtime receipt、并发/租约、回滚与隔离套件
 pnpm test:tenant-content-inventory-mysql      # 强制执行 T3c DB-clock owner inventory、hold、并发/回滚与隔离套件
-pnpm test:tenant-purge-plan-memory            # 强制执行 T3d/0040/0041 Memory 原子封存、unknown 与回滚套件
-pnpm test:tenant-purge-plan-mysql             # 强制执行 T3d 固定33域计划、blocker、并发/回滚与隔离套件
+pnpm test:tenant-purge-plan-memory            # 强制执行 T3d/0040～0042 Memory 原子封存、unknown 与回滚套件
+pnpm test:tenant-purge-plan-mysql             # 强制执行 T3d/0042 真实InnoDB count/root、并发/回滚与隔离套件
 pnpm test:tenant-purge-execution-mysql        # 强制执行 T3e 本地cutover、exact outbox/physical ACK、回滚与隔离套件
 pnpm test:tenant-database-purge-memory        # 强制执行 T3f Memory原子发布、回滚、grave与0039 owner-closure对抗套件
 pnpm test:tenant-database-purge-mysql         # 强制执行 T3f 真实InnoDB单事务、并发、回滚、隔离与0039 owner-closure套件
@@ -196,7 +196,7 @@ T3a 的 credential-store worker 内嵌于 runner，不新增服务、进程或�
 
 `0035`在0034之上增加按domain分离的application capture control/receipt/tenant coverage/write binding，明确区分0033 lifecycle target已激活与应用producer已无遗漏切换。既有tenant/pre-cutover job保持unknown/unbound；active后新job必须同事务写exact producer binding。当前只实现`provider.upstream_request_failed` logs contract：active owner log durable-only、不重复stdout，inactive owner-scoped helper及普通provider/router fallback剥离全部owner/subject/target refs；traces必须inactive。没有activation/operator CLI，capture helper也不能让任意业务事务与spool跨store crash-atomic，因此不能实际激活并宣称完整coverage。CI通过两个独立application-capture命名套件、`0034 → 0035`真实MySQL迁移夹具和runner image marker证明代码路径确实执行，但不代表managed环境或生命周期executor已经完成。
 
-`0036`是default-dormant、expand-only telemetry disposition substrate：迁移安装9张control/activation/grant/job/外部事件/ACK/receipt/replay-fence表和精确schema/trigger指纹，不回填、不联网、不删除或激活。Memory/MySQL把control与activation receipt原子提交，安装content-free external event mirror/fence表与验证类型，但mirror/fence方法因缺可信外部head/restore绑定而默认拒绝；真实MySQL `0035 → 0036`历史夹具验证旧spool保留、partial-DDL/marker-loss与冲突阻断。独立S3-compatible journal用create-only event object和`If-Match` CAS head，不以LIST推断authority；telemetry artifact非生产夹具用同key`If-Match` CAS写入带checksum的永久tombstone，exact replay不把missing object当physical ACK。第五个独立MinIO bucket及两个真实S3套件只证明各自协议，不证明数据库授权到旧快照恢复的端到端链路。现有T3d logs/traces仍是零target blocker；没有source-valid DB grant发行、外部marker验真、fresh external head与0030/0031 restore绑定、恢复后startup gate、executor或activation CLI。两个外部adapter处置操作默认拒绝且production拒绝fixture，所以0036不能称为可启用的telemetry删除、恢复或retention功能，也不推进全域completion。后续独立切片仍须补完整授权/恢复/执行链，之后才能讨论M1冻结和M3。
+`0036`是default-dormant、expand-only telemetry disposition substrate：迁移安装9张control/activation/grant/job/外部事件/ACK/receipt/replay-fence表和精确schema/trigger指纹，不回填、不联网、不删除或激活。Memory/MySQL把control与activation receipt原子提交，安装content-free external event mirror/fence表与验证类型，但mirror/fence方法因缺可信外部head/restore绑定而默认拒绝；真实MySQL `0035 → 0036`历史夹具验证旧spool保留、partial-DDL/marker-loss与冲突阻断。独立S3-compatible journal用create-only event object和`If-Match` CAS head，不以LIST推断authority；telemetry artifact非生产夹具用同key`If-Match` CAS写入带checksum的永久tombstone，exact replay不把missing object当physical ACK。第五个独立MinIO bucket及两个真实S3套件只证明各自协议，不证明数据库授权到旧快照恢复的端到端链路。在0036阶段T3d logs/traces仍是零target blocker；没有source-valid DB grant发行、外部marker验真、fresh external head与0030/0031 restore绑定、恢复后startup gate、executor或activation CLI。两个外部adapter处置操作默认拒绝且production拒绝fixture，所以0036不能称为可启用的telemetry删除、恢复或retention功能，也不推进全域completion。后续独立切片仍须补完整授权/恢复/执行链，之后才能讨论M1冻结和M3。
 
 `0037`是前置正确性收尾，不开启删除。新迁移保持已发布0036不可变，轮换grant trigger以匹配TypeScript domain-separated claim hash并更新严格指纹；即使hash/claim匹配，最终trigger仍无条件拒绝grant INSERT。Memory/MySQL的issue/get API也只返回`null`或在发现异常grant footprint时fail closed。独立v2事件codec与Memory CAS/响应丢失夹具把完整grant receipt及claim、operation、artifact身份绑定到sealed chain；事件不保存原始tenant/request，且仅凭receipt不能证明数据库来源或重建旧快照。v1 caller-evidence S3 journal继续只作0036非生产夹具，尚无产品v2 S3 adapter、可信DB-time grant verifier、physical ACK saga或0030/0031恢复门禁。`0036→0037`真实MySQL历史夹具、grant Memory/真实MySQL命名测试已接本地verify与CI；它们证明默认拒绝和协议，不证明产品telemetry处置可用。
 
