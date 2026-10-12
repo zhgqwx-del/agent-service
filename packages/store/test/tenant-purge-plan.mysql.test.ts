@@ -15,6 +15,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import {
   BLOB_STORAGE_FORMAT,
   MysqlSessionStore,
+  TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
+  TENANT_TELEMETRY_APPLICATION_FLEET_STOPPED_ACK,
+  TENANT_TELEMETRY_APPLICATION_LEGACY_WRITERS_DRAINED_ACK,
+  TENANT_TELEMETRY_APPLICATION_PRODUCER_READY_ACK,
   TENANT_PURGE_PLAN_DOMAINS,
   TenantErasureIntegrityError,
   TenantPurgePlanEvidenceChangedError,
@@ -27,6 +31,7 @@ import {
   newUserDataExportArtifactId,
   newUserDataExportRequestId,
   tenantErasureRequestHash,
+  tenantTelemetryWriteAdapterEvidenceSha256,
   userErasureRequestHash,
   userDataExportAuthorization,
   userDataExportIdempotencyKeySha256,
@@ -44,6 +49,9 @@ import {
   type UserDataExportAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
+
+const TELEMETRY_REF_KEY = Buffer.alloc(32, 0x45);
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -222,6 +230,28 @@ async function waitForIdempotencyLockWait(
   throw new Error(
     `timed out waiting for idempotency lock held against writer ${writerConnectionId}`,
   );
+}
+
+async function waitForTelemetryWriteJobLockWait(
+  observer: Connection,
+  database: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [rows] = await observer.query<(RowDataPacket & { waiters: number })[]>(
+      `SELECT COUNT(DISTINCT waits.REQUESTING_ENGINE_TRANSACTION_ID) AS waiters
+         FROM performance_schema.data_lock_waits waits
+         JOIN performance_schema.data_locks requested
+           ON requested.ENGINE_LOCK_ID=waits.REQUESTING_ENGINE_LOCK_ID
+        WHERE requested.OBJECT_SCHEMA=?
+          AND requested.OBJECT_NAME='tenant_telemetry_write_jobs'`,
+      [database],
+    );
+    if (Number(rows[0]?.waiters ?? 0) > 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for T3d to serialize behind telemetry ACK job lock");
 }
 
 const LEGACY_EVENT_UPDATE_GUARDS = [
@@ -564,6 +594,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const conn = await mysql.createConnection(mysqlUrl);
       const tenantId = `tenant-plan-success-${randomUUID()}`;
       const userId = `private-user-${randomUUID()}`;
+      const failureTrigger = "trg_test_source_accounting_receipt_failure";
       try {
         const source = await advanceThroughT3c(store, tenantId, userId);
         const [before] = await conn.query<RowDataPacket[]>(
@@ -620,6 +651,28 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(serialized).not.toContain(source.session.id);
         expect(serialized).not.toContain(authorization.claimToken);
 
+        await conn.query(
+          `CREATE TRIGGER ${failureTrigger} BEFORE INSERT
+             ON tenant_telemetry_source_accounting_receipts FOR EACH ROW
+             FOLLOWS trg_tt_source_accounting_receipt_bi
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected source receipt failure'`,
+        );
+        await expect(store.sealTenantPurgePlan(authorization))
+          .rejects.toThrow("injected source receipt failure");
+        const [rolledBack] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_purge_plan_receipts WHERE request_id=?) AS plan_receipts,
+             (SELECT COUNT(*) FROM tenant_telemetry_source_accounting_receipts
+               WHERE request_id=?) AS source_receipts,
+             (SELECT COUNT(*) FROM tenant_telemetry_source_accounting_entries
+               WHERE request_id=?) AS source_entries,
+             (SELECT phase FROM tenant_purge_plan_jobs WHERE request_id=?) AS phase`,
+          [source.requestId, source.requestId, source.requestId, source.requestId],
+        );
+        expect(rolledBack[0]).toMatchObject({
+          plan_receipts: 0, source_receipts: 0, source_entries: 0, phase: "queued",
+        });
+        await conn.query(`DROP TRIGGER ${failureTrigger}`);
         const receipt = await store.sealTenantPurgePlan(authorization);
         expect(receipt).toMatchObject({
           tenantId,
@@ -629,6 +682,25 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           executionReady: false,
           contentPurgeExecuted: false,
         });
+        const sourceAccounting = await store.getTenantTelemetrySourceAccountingReceipt(
+          tenantId, source.requestId,
+        );
+        expect(sourceAccounting).toMatchObject({
+          planReceiptSha256: receipt?.receiptSha256,
+          inventoryCount: 0,
+          writeJobCount: 0,
+          writeAckCount: 0,
+          membershipCount: 0,
+          applicationBindingCount: 0,
+          entryCount: 0,
+          unknownCount: 0,
+        });
+        expect(await store.getTenantTelemetrySourceAccountingEntries(
+          tenantId, source.requestId,
+        )).toEqual([]);
+        expect(await store.getTenantTelemetrySourceAccountingReceipt(
+          `wrong-${tenantId}`, source.requestId,
+        )).toBeNull();
         expect(await store.sealTenantPurgePlan(authorization)).toEqual(receipt);
         expect(await store.sealTenantPurgePlan({
           ...authorization,
@@ -651,7 +723,273 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(after[0]).toMatchObject(before[0]!);
         expect(String(after[0]?.lifecycle_state)).toBe("deleting");
       } finally {
+        await conn.query(`DROP TRIGGER IF EXISTS ${failureTrigger}`).catch(() => {});
         await conn.end();
+        await store.close();
+      }
+    });
+
+    it("serializes a racing ACK and accounts complete plus orphan telemetry sources", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      let writer: MysqlSessionStore | undefined;
+      const observer = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-plan-telemetry-race-${randomUUID()}`;
+      let releaseWriter = () => {};
+      let writeClaim: Awaited<ReturnType<MysqlSessionStore["claimTenantTelemetryWriteJobs"]>>[number]
+        | undefined;
+      let orphanOperation: string | undefined;
+      let legacyOperation: string | undefined;
+      try {
+        await store.activateTenantTelemetryLifecycle({
+          expectedControlGeneration: 0,
+          targets: [
+            { domain: "logs", backendKind: "test_sink", adapterProtocol: "telemetry-test-v1",
+              namespaceSha256: "1".repeat(64), failureDomainSha256: "2".repeat(64) },
+            { domain: "traces", backendKind: "test_sink", adapterProtocol: "telemetry-test-v1",
+              namespaceSha256: "3".repeat(64), failureDomainSha256: "4".repeat(64) },
+          ],
+        });
+        const lifecycle = await store.getTenantTelemetryLifecycleControl();
+        if (lifecycle.state !== "active") throw new Error("missing telemetry lifecycle activation");
+        const target = (await store.listTenantTelemetryLifecycleTargets())
+          .find((candidate) => candidate.domain === "logs")!;
+        const producerProtocol = "application-dual-write-v1";
+        const producerContractSha256 = "9".repeat(64);
+        await store.activateTenantTelemetryApplicationCapture({
+          domain: "logs", expectedControlGeneration: 0,
+          expectedLifecycleControlGeneration: 1,
+          lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256,
+          lifecycleTargetSha256: target.targetSha256,
+          lifecycleTargetReceiptSha256: target.receiptSha256,
+          producerProtocol, producerContractSha256,
+          fleetStoppedAck: TENANT_TELEMETRY_APPLICATION_FLEET_STOPPED_ACK,
+          legacyWritersDrainedAck: TENANT_TELEMETRY_APPLICATION_LEGACY_WRITERS_DRAINED_ACK,
+          producerReadyAck: TENANT_TELEMETRY_APPLICATION_PRODUCER_READY_ACK,
+        });
+        const source = await advanceThroughT3c(
+          store, tenantId, `telemetry-race-user-${randomUUID()}`, 0,
+          async () => {
+            await store.enqueueTenantTelemetryArtifact({
+              tenantId, expectedControlGeneration: 1, domain: "logs",
+              artifactIdSha256: "5".repeat(64), artifactGeneration: 1,
+              ownerKind: "tenant", ownerId: tenantId, ownerUserId: null,
+              sourceSchema: "structured-log-batch-v1", sourceGeneration: 1,
+              sourceHighWaterDbMs: Date.now(),
+              producerProtocol, producerContractSha256,
+              payload: { schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
+                domain: "logs", records: [trustedRunnerTelemetryRecord(Date.now(), {
+                  opaqueRefKey: TELEMETRY_REF_KEY, tenantValue: tenantId,
+                  ownerKind: "tenant", ownerValue: tenantId, attempt: 1,
+                })] },
+            });
+            [writeClaim] = await store.claimTenantTelemetryWriteJobs({
+              limit: 1, leaseMs: 120_000, claimToken: "pre-t1-racing-write",
+              adapterProtocol: "telemetry-test-v1",
+            });
+            if (!writeClaim) throw new Error("missing pre-T1 telemetry write claim");
+            await store.reserveTenantTelemetryExternalMutation({
+              tenantId, writeOperationSha256: writeClaim.writeOperationSha256,
+              claimAttempt: writeClaim.claimAttempt, claimToken: writeClaim.claimToken,
+            }, writeClaim.target.adapterProtocol);
+            const orphanJob = await store.enqueueTenantTelemetryArtifact({
+              tenantId, expectedControlGeneration: 1, domain: "logs",
+              artifactIdSha256: "6".repeat(64), artifactGeneration: 1,
+              ownerKind: "tenant", ownerId: tenantId, ownerUserId: null,
+              sourceSchema: "structured-log-batch-v1", sourceGeneration: 1,
+              sourceHighWaterDbMs: Date.now(),
+              producerProtocol, producerContractSha256,
+              payload: { schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
+                domain: "logs", records: [trustedRunnerTelemetryRecord(Date.now(), {
+                  opaqueRefKey: TELEMETRY_REF_KEY, tenantValue: tenantId,
+                  ownerKind: "tenant", ownerValue: tenantId, attempt: 1,
+                })] },
+            });
+            const [orphanClaim] = await store.claimTenantTelemetryWriteJobs({
+              limit: 1, leaseMs: 120_000, claimToken: "pre-t1-orphan-source",
+              adapterProtocol: "telemetry-test-v1",
+            });
+            if (!orphanClaim
+              || orphanClaim.writeOperationSha256 !== orphanJob.writeOperationSha256) {
+              throw new Error("missing second telemetry write claim");
+            }
+            const orphanAuth = {
+              tenantId, writeOperationSha256: orphanClaim.writeOperationSha256,
+              claimAttempt: orphanClaim.claimAttempt, claimToken: orphanClaim.claimToken,
+            };
+            await store.reserveTenantTelemetryExternalMutation(
+              orphanAuth, orphanClaim.target.adapterProtocol,
+            );
+            const orphanEvidence = {
+              adapterProtocol: orphanClaim.target.adapterProtocol,
+              domain: orphanClaim.inventory.domain,
+              targetSha256: orphanClaim.target.targetSha256,
+              writeOperationSha256: orphanClaim.writeOperationSha256,
+              artifactIdSha256: orphanClaim.inventory.artifactIdSha256,
+              artifactGeneration: orphanClaim.inventory.artifactGeneration,
+              payloadSha256: orphanClaim.inventory.payloadSha256,
+              manifestSha256: orphanClaim.inventory.manifestSha256,
+              outcome: "written" as const, replayed: false,
+            };
+            expect(await store.completeTenantTelemetryWrite(orphanAuth, {
+              ...orphanEvidence,
+              evidenceSha256: tenantTelemetryWriteAdapterEvidenceSha256(orphanEvidence),
+            })).not.toBeNull();
+            orphanOperation = orphanJob.writeOperationSha256;
+            const legacyJob = await store.enqueueTenantTelemetryArtifact({
+              tenantId, expectedControlGeneration: 1, domain: "logs",
+              artifactIdSha256: "8".repeat(64), artifactGeneration: 1,
+              ownerKind: "tenant", ownerId: tenantId, ownerUserId: null,
+              sourceSchema: "structured-log-batch-v1", sourceGeneration: 1,
+              sourceHighWaterDbMs: Date.now(),
+              producerProtocol, producerContractSha256,
+              payload: { schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
+                domain: "logs", records: [trustedRunnerTelemetryRecord(Date.now(), {
+                  opaqueRefKey: TELEMETRY_REF_KEY, tenantValue: tenantId,
+                  ownerKind: "tenant", ownerValue: tenantId, attempt: 1,
+                })] },
+            });
+            const [legacyClaim] = await store.claimTenantTelemetryWriteJobs({
+              limit: 1, leaseMs: 120_000, claimToken: "pre-t1-legacy-shaped-source",
+              adapterProtocol: "telemetry-test-v1",
+            });
+            if (!legacyClaim
+              || legacyClaim.writeOperationSha256 !== legacyJob.writeOperationSha256) {
+              throw new Error("missing third telemetry write claim");
+            }
+            const legacyAuth = {
+              tenantId, writeOperationSha256: legacyClaim.writeOperationSha256,
+              claimAttempt: legacyClaim.claimAttempt, claimToken: legacyClaim.claimToken,
+            };
+            await store.reserveTenantTelemetryExternalMutation(
+              legacyAuth, legacyClaim.target.adapterProtocol,
+            );
+            const legacyEvidence = {
+              adapterProtocol: legacyClaim.target.adapterProtocol,
+              domain: legacyClaim.inventory.domain,
+              targetSha256: legacyClaim.target.targetSha256,
+              writeOperationSha256: legacyClaim.writeOperationSha256,
+              artifactIdSha256: legacyClaim.inventory.artifactIdSha256,
+              artifactGeneration: legacyClaim.inventory.artifactGeneration,
+              payloadSha256: legacyClaim.inventory.payloadSha256,
+              manifestSha256: legacyClaim.inventory.manifestSha256,
+              outcome: "written" as const, replayed: false,
+            };
+            expect(await store.completeTenantTelemetryWrite(legacyAuth, {
+              ...legacyEvidence,
+              evidenceSha256: tenantTelemetryWriteAdapterEvidenceSha256(legacyEvidence),
+            })).not.toBeNull();
+            legacyOperation = legacyJob.writeOperationSha256;
+          },
+        );
+        if (!writeClaim) throw new Error("missing reserved telemetry write");
+        const claim = writeClaim;
+        writer = await MysqlSessionStore.connect({
+          url: mysqlUrl, connectionLimit: 2, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+        });
+        if (!orphanOperation || !legacyOperation) {
+          throw new Error("missing orphan or legacy-shaped source operation");
+        }
+        // A privileged corruption fixture leaves four valid source rows without their job.
+        // T3d must account them as unknown rather than silently intersecting through jobs.
+        await observer.query("DROP TRIGGER trg_managed_telemetry_write_jobs_bd");
+        await observer.query("SET SESSION FOREIGN_KEY_CHECKS=0");
+        try {
+          await observer.query(
+            "DELETE FROM tenant_telemetry_write_jobs WHERE write_operation_sha256=?",
+            [orphanOperation],
+          );
+        } finally {
+          await observer.query("SET SESSION FOREIGN_KEY_CHECKS=1");
+        }
+        // A second privileged fixture models an old write with no 0038 membership.
+        // It is deliberately not claimed to be a historical pre-0038 binary execution.
+        await observer.query("DROP TRIGGER trg_tt_membership_bd");
+        await observer.query(
+          "DELETE FROM tenant_telemetry_artifact_memberships WHERE write_operation_sha256=?",
+          [legacyOperation],
+        );
+        let notifyWriterLocked = () => {};
+        const writerLocked = new Promise<void>((resolve) => { notifyWriterLocked = resolve; });
+        const resumeWriter = new Promise<void>((resolve) => { releaseWriter = resolve; });
+        const hooked = writer as unknown as {
+          readTenantTelemetryWriteJob: (...args: unknown[]) => Promise<unknown>;
+        };
+        const originalRead = hooked.readTenantTelemetryWriteJob.bind(writer);
+        hooked.readTenantTelemetryWriteJob = async (...args: unknown[]) => {
+          const result = await originalRead(...args);
+          if (args[1] === claim.writeOperationSha256 && args[2] === "FOR UPDATE") {
+            notifyWriterLocked();
+            await resumeWriter;
+          }
+          return result;
+        };
+        await store.materializeTenantPurgePlanJobs({ limit: 1 });
+        const planClaim = await claimPlan(store, source.requestId);
+        const evidence = {
+          adapterProtocol: claim.target.adapterProtocol,
+          domain: claim.inventory.domain,
+          targetSha256: claim.target.targetSha256,
+          writeOperationSha256: claim.writeOperationSha256,
+          artifactIdSha256: claim.inventory.artifactIdSha256,
+          artifactGeneration: claim.inventory.artifactGeneration,
+          payloadSha256: claim.inventory.payloadSha256,
+          manifestSha256: claim.inventory.manifestSha256,
+          outcome: "written" as const, replayed: false,
+        };
+        const ackPending = writer.completeTenantTelemetryWrite({
+          tenantId, writeOperationSha256: claim.writeOperationSha256,
+          claimAttempt: claim.claimAttempt, claimToken: claim.claimToken,
+        }, { ...evidence, evidenceSha256: tenantTelemetryWriteAdapterEvidenceSha256(evidence) });
+        await Promise.race([
+          writerLocked,
+          new Promise<never>((_, reject) => setTimeout(
+            () => reject(new Error("telemetry ACK did not hold its write-job lock")), 5_000,
+          )),
+        ]);
+        const sealPending = store.sealTenantPurgePlan(planAuthorization(planClaim));
+        await waitForTelemetryWriteJobLockWait(observer, database);
+        releaseWriter();
+        expect(await ackPending).toMatchObject({ tenantId });
+        const sealed = await sealPending;
+        expect(sealed).not.toBeNull();
+        const accounting = await store.getTenantTelemetrySourceAccountingReceipt(
+          tenantId, source.requestId,
+        );
+        const entries = await store.getTenantTelemetrySourceAccountingEntries(
+          tenantId, source.requestId,
+        );
+        expect(accounting).toMatchObject({
+          inventoryCount: 3, writeJobCount: 2, writeAckCount: 3,
+          membershipCount: 2, applicationBindingCount: 3,
+          entryCount: 13, unknownCount: 8,
+        });
+        expect(entries.filter((entry) => entry.reason === "complete")).toHaveLength(5);
+        expect(entries.filter((entry) => entry.reason === "orphan_source")).toHaveLength(4);
+        expect(entries.filter((entry) => entry.reason === "legacy_missing_membership"))
+          .toHaveLength(4);
+        expect(entries.filter((entry) => entry.classification === "unknown")).toHaveLength(8);
+        expect((await store.getTenantPurgePlanEntries(
+          tenantId, source.requestId, planClaim.buildGeneration,
+        )).find((entry) => entry.domain === "logs")).toMatchObject({
+          targetCount: 0, disposition: "blocked_adapter_unconfigured",
+        });
+        expect(JSON.stringify({ accounting, entries })).not.toContain(claim.claimToken);
+        await observer.query("DROP TRIGGER trg_tt_source_accounting_entry_bu");
+        await observer.query(
+          `UPDATE tenant_telemetry_source_accounting_entries
+              SET source_evidence_sha256=?
+            WHERE request_id=? AND source_kind='write_job'`,
+          ["e".repeat(64), source.requestId],
+        );
+        await expect(store.getTenantTelemetrySourceAccountingReceipt(
+          tenantId, source.requestId,
+        )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      } finally {
+        releaseWriter();
+        await observer.end();
+        await writer?.close();
         await store.close();
       }
     });

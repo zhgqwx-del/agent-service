@@ -841,6 +841,7 @@ import * as TenantTelemetryWriter from "./tenant-telemetry-writer.js";
 import * as TenantTelemetryApplicationCapture from "./tenant-telemetry-application-capture.js";
 import * as TenantTelemetryArtifactMembership from "./tenant-telemetry-artifact-membership.js";
 import * as TenantTelemetryOwnerClosure from "./tenant-telemetry-owner-closure.js";
+import * as TenantTelemetrySourceAccounting from "./tenant-telemetry-source-accounting.js";
 import * as TenantTelemetryDisposition from "./tenant-telemetry-disposition.js";
 
 interface MemoryUserDataExportJob {
@@ -1148,7 +1149,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1367,6 +1368,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantTelemetryOwnerClosureReceipts = new Map<
     string,
     TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt
+  >();
+  tenantTelemetrySourceAccountingEntries = new Map<
+    string,
+    TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry
+  >();
+  tenantTelemetrySourceAccountingReceipts = new Map<
+    string,
+    TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt
   >();
   tenantTelemetryApplicationDomainControls = new Map<
     TenantTelemetry.TenantTelemetryDomain,
@@ -14078,6 +14087,37 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       ));
   }
 
+  private tenantTelemetrySourceAccountingEntriesFor(
+    requestId: string,
+  ): TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry[] {
+    return [...this.tenantTelemetrySourceAccountingEntries.values()]
+      .filter((entry) => entry.requestId === requestId)
+      .sort((a, b) => TenantTelemetrySourceAccounting.TENANT_TELEMETRY_SOURCE_KINDS
+        .indexOf(a.sourceKind)
+        - TenantTelemetrySourceAccounting.TENANT_TELEMETRY_SOURCE_KINDS.indexOf(b.sourceKind)
+        || a.sourceIdentitySha256.localeCompare(b.sourceIdentitySha256));
+  }
+
+  private validateTenantTelemetrySourceAccountingForPlan(
+    job: TenantPurgePlanJobRecord,
+    receipt: TenantPurgePlanReceipt,
+  ): void {
+    const sourceReceipt = this.tenantTelemetrySourceAccountingReceipts.get(job.requestId);
+    const sourceEntries = this.tenantTelemetrySourceAccountingEntriesFor(job.requestId);
+    // A terminal plan written by a pre-0040 binary is unknown, not an empty source set.
+    if (!sourceReceipt) {
+      if (sourceEntries.length !== 0) throw new TenantErasureIntegrityError();
+      return;
+    }
+    try {
+      TenantTelemetrySourceAccounting.validateTenantTelemetrySourceAccountingProof(
+        job, receipt, sourceEntries, sourceReceipt,
+      );
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
   /**
    * Bind T3d only to a complete immutable T1/T3a/T3b/T3c chain. Advancing operations also
    * require the live deleting lifecycle and re-scan the current session topology against T3c.
@@ -15186,6 +15226,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       } catch {
         throw new TenantErasureIntegrityError();
       }
+      this.validateTenantTelemetrySourceAccountingForPlan(current, receipt);
       if (!tenantPurgePlanReceiptMatchesAuthorization(receipt, stagedAuthorization)) return null;
       return clone(receipt);
     }
@@ -15322,6 +15363,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const jobsBefore = new Map(this.tenantPurgePlanJobs);
     const entriesBefore = new Map(this.tenantPurgePlanEntries);
     const receiptsBefore = new Map(this.tenantPurgePlanReceipts);
+    const sourceEntriesBefore = new Map(this.tenantTelemetrySourceAccountingEntries);
+    const sourceReceiptsBefore = new Map(this.tenantTelemetrySourceAccountingReceipts);
     try {
       if (this.tenantPurgePlanReceipts.has(working.requestId)) {
         throw new TenantErasureIntegrityError();
@@ -15341,6 +15384,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         restoreMapSnapshot(this.tenantPurgePlanJobs, jobsBefore);
         restoreMapSnapshot(this.tenantPurgePlanEntries, entriesBefore);
         restoreMapSnapshot(this.tenantPurgePlanReceipts, receiptsBefore);
+        restoreMapSnapshot(this.tenantTelemetrySourceAccountingEntries, sourceEntriesBefore);
+        restoreMapSnapshot(this.tenantTelemetrySourceAccountingReceipts, sourceReceiptsBefore);
         return null;
       }
       if (publishNowMs < latestCapturedAtDbMs) {
@@ -15377,11 +15422,42 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         aggregateReceiptSha256: receipt.receiptSha256,
       });
       validateTenantPurgePlanCompletionProof(next, entries, receipt);
+      const sourceSnapshot = TenantTelemetrySourceAccounting
+        .createTenantTelemetrySourceAccountingSnapshot({
+          job: next,
+          planReceipt: receipt,
+          capturedAtDbMs: publishNowMs,
+          sources: {
+            inventories: [...this.tenantTelemetryArtifactInventories.values()],
+            jobs: [...this.tenantTelemetryWriteJobs.values()],
+            acks: [...this.tenantTelemetryWriteAcks.values()],
+            memberships: [...this.tenantTelemetryArtifactMemberships.values()],
+            bindings: [...this.tenantTelemetryApplicationWriteBindings.values()],
+          },
+        });
+      if (this.tenantTelemetrySourceAccountingReceipts.has(next.requestId)
+        || this.tenantTelemetrySourceAccountingEntriesFor(next.requestId).length !== 0) {
+        throw new TenantErasureIntegrityError();
+      }
+      for (const sourceEntry of sourceSnapshot.entries) {
+        const key = JSON.stringify([
+          sourceEntry.requestId, sourceEntry.sourceKind, sourceEntry.sourceIdentitySha256,
+        ]);
+        if (this.tenantTelemetrySourceAccountingEntries.has(key)) {
+          throw new TenantErasureIntegrityError();
+        }
+        this.tenantTelemetrySourceAccountingEntries.set(key, sourceEntry);
+      }
+      this.tenantTelemetrySourceAccountingReceipts.set(
+        next.requestId, sourceSnapshot.receipt,
+      );
       this.tenantPurgePlanJobs.set(working.requestId, next);
     } catch (error) {
       restoreMapSnapshot(this.tenantPurgePlanJobs, jobsBefore);
       restoreMapSnapshot(this.tenantPurgePlanEntries, entriesBefore);
       restoreMapSnapshot(this.tenantPurgePlanReceipts, receiptsBefore);
+      restoreMapSnapshot(this.tenantTelemetrySourceAccountingEntries, sourceEntriesBefore);
+      restoreMapSnapshot(this.tenantTelemetrySourceAccountingReceipts, sourceReceiptsBefore);
       throw error;
     }
     return clone(receipt);
@@ -15403,6 +15479,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       } catch {
         throw new TenantErasureIntegrityError();
       }
+      this.validateTenantTelemetrySourceAccountingForPlan(job, receipt);
     }
     return clone(job);
   }
@@ -15424,6 +15501,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       } catch {
         throw new TenantErasureIntegrityError();
       }
+      this.validateTenantTelemetrySourceAccountingForPlan(job, receipt);
     } else {
       for (const entry of entries) validateTenantPurgePlanEntry(entry);
       if (
@@ -15450,7 +15528,32 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     } catch {
       throw new TenantErasureIntegrityError();
     }
+    this.validateTenantTelemetrySourceAccountingForPlan(job, receipt);
     return clone(receipt);
+  }
+
+  async getTenantTelemetrySourceAccountingReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt | null> {
+    const plan = this.tenantPurgePlanJobs.get(requestId);
+    if (!plan || plan.tenantId !== tenantId || plan.phase !== "plan_sealed") return null;
+    const receipt = await this.getTenantPurgePlanReceipt(tenantId, requestId);
+    if (!receipt) throw new TenantErasureIntegrityError();
+    this.validateTenantTelemetrySourceAccountingForPlan(plan, receipt);
+    return clone(this.tenantTelemetrySourceAccountingReceipts.get(requestId) ?? null);
+  }
+
+  async getTenantTelemetrySourceAccountingEntries(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry[]> {
+    const plan = this.tenantPurgePlanJobs.get(requestId);
+    if (!plan || plan.tenantId !== tenantId || plan.phase !== "plan_sealed") return [];
+    const receipt = await this.getTenantPurgePlanReceipt(tenantId, requestId);
+    if (!receipt) throw new TenantErasureIntegrityError();
+    this.validateTenantTelemetrySourceAccountingForPlan(plan, receipt);
+    return this.tenantTelemetrySourceAccountingEntriesFor(requestId).map(clone);
   }
 
   // ---------- tenant purge execution + local physical ACK ledger ----------

@@ -52,6 +52,7 @@
     "test:tenant-credential-target-execution-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-target-execution.mysql.test.ts",
     "test:tenant-runtime-revocation-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-runtime-revocation.mysql.test.ts",
     "test:tenant-content-inventory-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-content-inventory.mysql.test.ts",
+    "test:tenant-purge-plan-memory": "node scripts/run-required-suite.mjs packages/store/test/tenant-purge-plan.memory.test.ts",
     "test:tenant-purge-plan-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-purge-plan.mysql.test.ts",
     "test:tenant-purge-execution-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-purge-execution.mysql.test.ts",
     "test:tenant-database-purge-memory": "node scripts/run-required-suite.mjs packages/store/test/memory-tenant-database-purge.test.ts",

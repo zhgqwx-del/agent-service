@@ -252,6 +252,7 @@ import * as TenantTelemetryWriter from "../tenant-telemetry-writer.js";
 import * as TenantTelemetryApplicationCapture from "../tenant-telemetry-application-capture.js";
 import * as TenantTelemetryArtifactMembership from "../tenant-telemetry-artifact-membership.js";
 import * as TenantTelemetryOwnerClosure from "../tenant-telemetry-owner-closure.js";
+import * as TenantTelemetrySourceAccounting from "../tenant-telemetry-source-accounting.js";
 import * as TenantTelemetryDisposition from "../tenant-telemetry-disposition.js";
 import * as BackupCatalog from "../backup-catalog.js";
 import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
@@ -924,6 +925,10 @@ const TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME =
   "0039_tenant_telemetry_owner_closure.sql";
 const TENANT_TELEMETRY_OWNER_CLOSURE_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-owner-closure";
+const TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME =
+  "0040_tenant_telemetry_source_accounting.sql";
+const TENANT_TELEMETRY_SOURCE_ACCOUNTING_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-source-accounting";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME = "trg_tt_disposition_grant_bi_v2";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX =
   `CREATE TRIGGER ${TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME} `
@@ -943,6 +948,16 @@ const TENANT_TELEMETRY_OWNER_CLOSURE_TRIGGER_SHAPES = [
   ["trg_tt_owner_closure_receipt_bd", "tenant_telemetry_owner_closure_receipts", "DELETE"],
   ["trg_tt_owner_closure_t3f_terminal_bu", "tenant_database_purge_jobs", "UPDATE"],
   ["trg_tt_owner_closure_write_job_bu", "tenant_telemetry_write_jobs", "UPDATE"],
+] as const;
+const TENANT_TELEMETRY_SOURCE_ACCOUNTING_TRIGGER_SHAPES = [
+  ["trg_tt_source_accounting_entry_bi", "tenant_telemetry_source_accounting_entries", "INSERT"],
+  ["trg_tt_source_accounting_entry_bu", "tenant_telemetry_source_accounting_entries", "UPDATE"],
+  ["trg_tt_source_accounting_entry_bd", "tenant_telemetry_source_accounting_entries", "DELETE"],
+  ["trg_tt_source_accounting_receipt_bi", "tenant_telemetry_source_accounting_receipts", "INSERT"],
+  ["trg_tt_source_accounting_receipt_bu", "tenant_telemetry_source_accounting_receipts", "UPDATE"],
+  ["trg_tt_source_accounting_receipt_bd", "tenant_telemetry_source_accounting_receipts", "DELETE"],
+  ["trg_tt_source_accounting_t3d_terminal_bu", "tenant_purge_plan_jobs", "UPDATE"],
+  ["trg_tt_source_accounting_owner_closure_receipt_bu", "tenant_telemetry_owner_closure_receipts", "UPDATE"],
 ] as const;
 
 function mysqlMigrationStatements(sql: string): string[] {
@@ -971,8 +986,12 @@ async function executeMysqlMigrationStatement(
   migrationName: string,
   statement: string,
 ): Promise<void> {
-  if (migrationName === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME) {
-    const trigger = TENANT_TELEMETRY_OWNER_CLOSURE_TRIGGER_SHAPES.find(
+  if (migrationName === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME
+    || migrationName === TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME) {
+    const shapes = migrationName === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME
+      ? TENANT_TELEMETRY_OWNER_CLOSURE_TRIGGER_SHAPES
+      : TENANT_TELEMETRY_SOURCE_ACCOUNTING_TRIGGER_SHAPES;
+    const trigger = shapes.find(
       ([name, table, manipulation]) => statement.startsWith(
         `CREATE TRIGGER ${name} BEFORE ${manipulation} ON ${table} FOR EACH ROW `,
       ),
@@ -981,7 +1000,7 @@ async function executeMysqlMigrationStatement(
       const [name, table, manipulation] = trigger;
       const prefix = `CREATE TRIGGER ${name} BEFORE ${manipulation} ON ${table} FOR EACH ROW `;
       const expectedAction = statement.slice(prefix.length);
-      if (!expectedAction) throw new Error("0039 telemetry owner closure trigger action is empty");
+      if (!expectedAction) throw new Error("telemetry lifecycle trigger action is empty");
       const [rows] = await conn.query<Row[]>(
         `SELECT event_object_table AS table_name,action_timing AS timing,
                 event_manipulation AS manipulation,action_orientation AS orientation,
@@ -1000,7 +1019,7 @@ async function executeMysqlMigrationStatement(
         || existing.orientation !== "ROW" || existing.condition_value !== null
         || canonicalMysqlTriggerActionStatement(String(existing.statement_value))
           !== canonicalMysqlTriggerActionStatement(expectedAction)) {
-        throw new Error(`0039 telemetry owner closure trigger ${name} is not exact`);
+        throw new Error(`telemetry lifecycle trigger ${name} is not exact`);
       }
       return;
     }
@@ -1334,6 +1353,30 @@ function tenantTelemetryOwnerClosureFingerprintStatement(
   }
   return statements[0]!;
 }
+function tenantTelemetrySourceAccountingFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_SOURCE_ACCOUNTING_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_SOURCE_ACCOUNTING_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0040 telemetry source ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @tt_source_accounting_${marker}_ok=`)) {
+    throw new Error(`0040 telemetry source ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
 const BLOB_STORAGE_CONTROL_COLUMNS = `singleton_id, control_generation, storage_backend,
   namespace_sha256, activated_at_db_ms, evidence_sha256`;
 const TENANT_TELEMETRY_CONTROL_COLUMNS = `singleton_id, control_generation,
@@ -1420,6 +1463,16 @@ const TENANT_TELEMETRY_OWNER_CLOSURE_RECEIPT_COLUMNS = `scope,request_id,tenant_
   local_physical_ack_receipt_sha256,predelete_receipt_sha256,grave_marker_root_sha256,
   t3f_receipt_sha256,entry_count,entry_root_sha256,store_db_timestamp_ms,
   completed_claim_attempt,completed_claim_token_sha256,receipt_sha256`;
+const TENANT_TELEMETRY_SOURCE_ACCOUNTING_ENTRY_COLUMNS = `scope,request_id,tenant_id,
+  subject_generation,build_generation,source_kind,source_identity_sha256,
+  write_operation_sha256,domain,source_evidence_sha256,classification,reason,
+  captured_at_db_ms,receipt_sha256`;
+const TENANT_TELEMETRY_SOURCE_ACCOUNTING_RECEIPT_COLUMNS = `scope,request_id,tenant_id,
+  subject_generation,build_generation,t1_fence_sha256,t3c_receipt_sha256,
+  plan_receipt_sha256,inventory_count,write_job_count,write_ack_count,membership_count,
+  application_binding_count,entry_count,entry_root_sha256,unknown_count,
+  unknown_root_sha256,store_db_timestamp_ms,completed_claim_attempt,
+  completed_claim_token_sha256,receipt_sha256`;
 const BLOB_COLUMNS = `blob_id, tenant_id, user_id, session_id, item_id, purpose, storage_backend,
   storage_format, storage_key, upload_token, state, sha256, size_bytes, content_type,
   uploaded_at_ms, ready_at_ms, staging_expires_at_ms, delete_after_ms, deleted_at_ms,
@@ -3020,6 +3073,73 @@ function rowToTenantTelemetryOwnerClosureReceipt(
       receiptSha256: String(row.receipt_sha256),
     };
     TenantTelemetryOwnerClosure.validateTenantTelemetryOwnerClosureReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantTelemetrySourceAccountingEntry(
+  row: Row,
+): TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry {
+  try {
+    const entry: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry = {
+      scope: String(row.scope) as typeof TenantTelemetrySourceAccounting
+        .TENANT_TELEMETRY_SOURCE_ACCOUNTING_ENTRY_SCOPE,
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "telemetry source subject", 1),
+      buildGeneration: storedSafeInteger(row.build_generation, "telemetry source build", 1),
+      sourceKind: String(row.source_kind) as TenantTelemetrySourceAccounting.TenantTelemetrySourceKind,
+      sourceIdentitySha256: String(row.source_identity_sha256),
+      writeOperationSha256: row.write_operation_sha256 == null
+        ? null : String(row.write_operation_sha256),
+      domain: String(row.domain) as TenantTelemetryDomain,
+      sourceEvidenceSha256: String(row.source_evidence_sha256),
+      classification: String(row.classification) as TenantTelemetrySourceAccounting
+        .TenantTelemetrySourceClassification,
+      reason: String(row.reason) as TenantTelemetrySourceAccounting.TenantTelemetrySourceReason,
+      capturedAtDbMs: storedSafeInteger(row.captured_at_db_ms, "telemetry source capture time"),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    TenantTelemetrySourceAccounting.validateTenantTelemetrySourceAccountingEntry(entry);
+    return entry;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantTelemetrySourceAccountingReceipt(
+  row: Row,
+): TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt {
+  try {
+    const receipt: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt = {
+      scope: String(row.scope) as typeof TenantTelemetrySourceAccounting
+        .TENANT_TELEMETRY_SOURCE_ACCOUNTING_RECEIPT_SCOPE,
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "telemetry source subject", 1),
+      buildGeneration: storedSafeInteger(row.build_generation, "telemetry source build", 1),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3cReceiptSha256: String(row.t3c_receipt_sha256),
+      planReceiptSha256: String(row.plan_receipt_sha256),
+      inventoryCount: storedSafeInteger(row.inventory_count, "telemetry inventory count"),
+      writeJobCount: storedSafeInteger(row.write_job_count, "telemetry write job count"),
+      writeAckCount: storedSafeInteger(row.write_ack_count, "telemetry write ACK count"),
+      membershipCount: storedSafeInteger(row.membership_count, "telemetry membership count"),
+      applicationBindingCount: storedSafeInteger(
+        row.application_binding_count, "telemetry application binding count",
+      ),
+      entryCount: storedSafeInteger(row.entry_count, "telemetry source entry count"),
+      entryRootSha256: String(row.entry_root_sha256),
+      unknownCount: storedSafeInteger(row.unknown_count, "telemetry unknown source count"),
+      unknownRootSha256: String(row.unknown_root_sha256),
+      storeDbTimestampMs: storedSafeInteger(row.store_db_timestamp_ms, "telemetry source time"),
+      completedClaimAttempt: storedSafeInteger(row.completed_claim_attempt, "telemetry source attempt", 1),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    TenantTelemetrySourceAccounting.validateTenantTelemetrySourceAccountingReceipt(receipt);
     return receipt;
   } catch {
     throw new TenantErasureIntegrityError();
@@ -7863,6 +7983,7 @@ export class MysqlSessionStore implements
   TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore,
   TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore,
   TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore,
+  TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore,
   TenantTelemetryWriter.TenantTelemetryWriterStore,
   TenantTelemetryDisposition.TenantTelemetryDispositionStore,
   BackupCatalog.TenantBackupCatalogStore,
@@ -7893,6 +8014,7 @@ export class MysqlSessionStore implements
   private tenantTelemetryDispositionSchemaInstalled = false;
   private tenantTelemetryArtifactMembershipSchemaInstalled = false;
   private tenantTelemetryOwnerClosureSchemaInstalled = false;
+  private tenantTelemetrySourceAccountingSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -8514,6 +8636,53 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertTenantTelemetrySourceAccountingFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+    includeTriggers = true,
+  ): Promise<void> {
+    let statements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME),
+        "utf8",
+      );
+      statements = [
+        tenantTelemetrySourceAccountingFingerprintStatement(migrationSql, "schema"),
+        ...(includeTriggers
+          ? [tenantTelemetrySourceAccountingFingerprintStatement(migrationSql, "triggers")]
+          : []),
+      ];
+    } catch (cause) {
+      throw new Error("0040 telemetry source fingerprint source is invalid", { cause });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query(
+        "SET @agent_service_tt_source_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @tt_source_accounting_schema_ok AS schema_ok,@tt_source_accounting_triggers_ok AS trigger_ok",
+      );
+      if (Number(rows[0]?.schema_ok) !== 1
+        || (includeTriggers && Number(rows[0]?.trigger_ok) !== 1)) {
+        throw new Error("stored schema/triggers do not match the 0040 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error("0040 telemetry source fingerprint verification failed", { cause });
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_tt_source_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error("0040 telemetry source fingerprint session restore failed", { cause });
+    }
+    if (failure) throw failure;
+  }
+
   private async reconcileLegacyTenantTelemetryLifecycleSubjects(
     conn: PoolConnection,
     acknowledgements: NonNullable<
@@ -8857,6 +9026,37 @@ export class MysqlSessionStore implements
     }
   }
 
+  private async assertTenantTelemetrySourceAccountingProjection(
+    conn: PoolConnection,
+  ): Promise<void> {
+    if (!this.tenantTelemetrySourceAccountingSchemaInstalled) return;
+    const [orphans] = await conn.query<Row[]>(
+      `SELECT e.request_id FROM tenant_telemetry_source_accounting_entries e
+         LEFT JOIN tenant_telemetry_source_accounting_receipts r
+           ON BINARY r.request_id=BINARY e.request_id
+          AND BINARY r.tenant_id=BINARY e.tenant_id
+         LEFT JOIN tenant_purge_plan_jobs j
+           ON BINARY j.request_id=BINARY e.request_id
+          AND BINARY j.tenant_id=BINARY e.tenant_id
+        WHERE r.request_id IS NULL OR j.request_id IS NULL OR j.phase<>'plan_sealed'
+        LIMIT 1`,
+    );
+    if (orphans[0]) throw new TenantErasureIntegrityError();
+    const [rows] = await conn.query<Row[]>(
+      `SELECT request_id,tenant_id
+         FROM tenant_telemetry_source_accounting_receipts ORDER BY request_id`,
+    );
+    for (const row of rows) {
+      const requestId = String(row.request_id);
+      const tenantId = String(row.tenant_id);
+      const job = await this.loadTenantPurgePlanJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "plan_sealed") {
+        throw new TenantErasureIntegrityError();
+      }
+      await this.validateTenantPurgePlanReadProof(conn, job);
+    }
+  }
+
   private async assertTenantTelemetryRuntimeConfiguration(
     conn: PoolConnection,
   ): Promise<void> {
@@ -8910,6 +9110,7 @@ export class MysqlSessionStore implements
         }
         await this.assertTenantTelemetryApplicationCaptureProjection(conn);
         await this.assertTenantTelemetryOwnerClosureProjection(conn);
+        await this.assertTenantTelemetrySourceAccountingProjection(conn);
         await conn.commit();
         return;
       }
@@ -8928,6 +9129,7 @@ export class MysqlSessionStore implements
       await this.assertTenantTelemetryWriterProjection(conn);
       await this.assertTenantTelemetryApplicationCaptureProjection(conn);
       await this.assertTenantTelemetryOwnerClosureProjection(conn);
+      await this.assertTenantTelemetrySourceAccountingProjection(conn);
       await conn.commit();
     } catch (error) {
       await conn.rollback().catch(() => {});
@@ -8956,6 +9158,10 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
         throw new Error("0039 owner closure marker is missing its 0038 predecessor");
+      }
+      if (done.has(TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)) {
+        throw new Error("0040 source accounting marker is missing its 0039 predecessor");
       }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
@@ -9003,7 +9209,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryOwnerClosureFingerprint(conn, migrationsDir);
+        await this.assertTenantTelemetryOwnerClosureFingerprint(
+          conn, migrationsDir, !done.has(TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME)) {
+        await this.assertTenantTelemetrySourceAccountingFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -9031,6 +9242,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryOwnerClosureSchemaInstalled = done.has(
         TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME,
+      );
+      this.tenantTelemetrySourceAccountingSchemaInstalled = done.has(
+        TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME,
       );
       if (!skipTelemetryRuntimeAudit) {
         await this.assertTenantTelemetryRuntimeConfiguration(conn);
@@ -9074,8 +9288,27 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
         throw new Error("0039 owner closure marker is missing its 0038 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)) {
+        throw new Error("0040 source accounting marker is missing its 0039 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME) {
+          const [rows] = await conn.query<Row[]>(
+            `SELECT COUNT(*) AS trigger_count FROM information_schema.triggers
+              WHERE trigger_schema=DATABASE() AND trigger_name IN
+                ('trg_tt_source_accounting_entry_bi','trg_tt_source_accounting_entry_bu',
+                 'trg_tt_source_accounting_entry_bd','trg_tt_source_accounting_receipt_bi',
+                 'trg_tt_source_accounting_receipt_bu','trg_tt_source_accounting_receipt_bd',
+                 'trg_tt_source_accounting_t3d_terminal_bu',
+                 'trg_tt_source_accounting_owner_closure_receipt_bu')`,
+          );
+          if (storedSafeInteger(rows[0]?.trigger_count,
+            "existing 0040 source accounting trigger count") === 0) {
+            await this.assertTenantTelemetryOwnerClosureFingerprint(conn, dir);
+          }
+        }
         if (f === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME) {
           const [rows] = await conn.query<Row[]>(
             `SELECT COUNT(*) AS trigger_count FROM information_schema.triggers
@@ -9219,6 +9452,10 @@ export class MysqlSessionStore implements
               && stmt.startsWith("CREATE TRIGGER trg_tt_owner_closure_entry_bi ")) {
               await this.assertTenantTelemetryOwnerClosureFingerprint(conn, dir, false);
             }
+            if (f === TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME
+              && stmt.startsWith("CREATE TRIGGER trg_tt_source_accounting_entry_bi ")) {
+              await this.assertTenantTelemetrySourceAccountingFingerprint(conn, dir, false);
+            }
             await executeMysqlMigrationStatement(conn, f, stmt);
           } catch (cause) {
             throw new Error(`migration ${f} failed at statement ${i + 1}/${statements.length}`, { cause });
@@ -9267,7 +9504,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryOwnerClosureFingerprint(conn, dir);
+        await this.assertTenantTelemetryOwnerClosureFingerprint(
+          conn, dir, !done.has(TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME)) {
+        await this.assertTenantTelemetrySourceAccountingFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -9295,6 +9537,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryOwnerClosureSchemaInstalled = done.has(
         TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME,
+      );
+      this.tenantTelemetrySourceAccountingSchemaInstalled = done.has(
+        TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME,
       );
       await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
@@ -19814,6 +20059,134 @@ export class MysqlSessionStore implements
     return receipt.tenantId === tenantId && receipt.requestId === requestId ? receipt : null;
   }
 
+  private async loadTenantTelemetrySourceAccountingEntries(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry[]> {
+    if (!this.tenantTelemetrySourceAccountingSchemaInstalled) return [];
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_SOURCE_ACCOUNTING_ENTRY_COLUMNS}
+         FROM tenant_telemetry_source_accounting_entries
+        WHERE tenant_id=? AND request_id=?
+        ORDER BY source_kind,source_identity_sha256 ${lock}`,
+      [tenantId, requestId],
+    );
+    return rows.map(rowToTenantTelemetrySourceAccountingEntry);
+  }
+
+  private async loadTenantTelemetrySourceAccountingReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt | null> {
+    if (!this.tenantTelemetrySourceAccountingSchemaInstalled) return null;
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_SOURCE_ACCOUNTING_RECEIPT_COLUMNS}
+         FROM tenant_telemetry_source_accounting_receipts
+        WHERE tenant_id=? AND request_id=? ${lock}`,
+      [tenantId, requestId],
+    );
+    return rows[0] ? rowToTenantTelemetrySourceAccountingReceipt(rows[0]) : null;
+  }
+
+  private async validateTenantTelemetrySourceAccountingReadProof(
+    conn: PoolConnection,
+    job: TenantPurgePlanJobRecord,
+    planReceipt: TenantPurgePlanReceipt,
+  ): Promise<{
+    entries: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry[];
+    receipt: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt;
+  } | null> {
+    if (!this.tenantTelemetrySourceAccountingSchemaInstalled) return null;
+    const receipt = await this.loadTenantTelemetrySourceAccountingReceipt(
+      conn, job.tenantId, job.requestId,
+    );
+    const entries = await this.loadTenantTelemetrySourceAccountingEntries(
+      conn, job.tenantId, job.requestId,
+    );
+    // A pre-0040 terminal plan cannot be reconstructed after the fact.
+    if (!receipt) {
+      if (entries.length !== 0) throw new TenantErasureIntegrityError();
+      return null;
+    }
+    try {
+      TenantTelemetrySourceAccounting.validateTenantTelemetrySourceAccountingProof(
+        job, planReceipt, entries, receipt,
+      );
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    return { entries, receipt };
+  }
+
+  private async captureTenantTelemetrySourceAccounting(
+    conn: PoolConnection,
+    job: TenantPurgePlanJobRecord,
+    planReceipt: TenantPurgePlanReceipt,
+  ): Promise<{
+    entries: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry[];
+    receipt: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt;
+  }> {
+    if (!this.tenantTelemetrySourceAccountingSchemaInstalled) {
+      throw new TenantErasureIntegrityError();
+    }
+    // Full ordered locking reads intentionally include orphan rows and close all five insert
+    // ranges. A reserved pre-T1 writer ACK that races this snapshot is serialized at the row
+    // lock: before the scan it is included, after the scan it remains an immutable unknown.
+    const targets = await this.readTenantTelemetryLifecycleTargets(conn, "FOR SHARE");
+    const targetById = new Map(targets.map((target) => [target.targetSha256, target]));
+    const [jobRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_WRITE_JOB_COLUMNS}
+         FROM tenant_telemetry_write_jobs
+        ORDER BY write_operation_sha256 FOR SHARE`,
+    );
+    const [ackRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_WRITE_ACK_COLUMNS}
+         FROM tenant_telemetry_write_acks
+        ORDER BY write_operation_sha256 FOR SHARE`,
+    );
+    const [inventoryRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_ARTIFACT_INVENTORY_COLUMNS}
+         FROM tenant_telemetry_artifact_inventory
+        ORDER BY inventory_sha256 FOR SHARE`,
+    );
+    const [membershipRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_COLUMNS}
+         FROM tenant_telemetry_artifact_memberships
+        ORDER BY write_operation_sha256 FOR SHARE`,
+    );
+    const [bindingRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_APPLICATION_WRITE_BINDING_COLUMNS}
+         FROM tenant_telemetry_application_write_bindings
+        ORDER BY write_operation_sha256 FOR SHARE`,
+    );
+    const capturedAtDbMs = await this.databaseNow(conn);
+    try {
+      return TenantTelemetrySourceAccounting.createTenantTelemetrySourceAccountingSnapshot({
+        job,
+        planReceipt,
+        capturedAtDbMs,
+        sources: {
+          inventories: inventoryRows.map(rowToTenantTelemetryArtifactInventory),
+          jobs: jobRows.map((row) => {
+            const target = targetById.get(String(row.target_sha256));
+            if (!target) throw new TenantErasureIntegrityError();
+            return rowToTenantTelemetryWriteJob(row, target);
+          }),
+          acks: ackRows.map(rowToTenantTelemetryWriteAck),
+          memberships: membershipRows.map(rowToTenantTelemetryArtifactMembership),
+          bindings: bindingRows.map(rowToTenantTelemetryApplicationWriteBinding),
+        },
+      });
+    } catch (error) {
+      if (error instanceof TenantPurgePlanNotReadyError) throw error;
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
   private tenantPurgePlanSameSource(
     left: TenantPurgePlanJobRecord,
     right: TenantPurgePlanJobRecord,
@@ -22401,6 +22774,7 @@ export class MysqlSessionStore implements
         } catch {
           throw new TenantErasureIntegrityError();
         }
+        await this.validateTenantTelemetrySourceAccountingReadProof(conn, terminal, receipt);
         if (!tenantPurgePlanReceiptMatchesAuthorization(receipt, authorization)) {
           await conn.commit();
           return null;
@@ -22688,7 +23062,7 @@ export class MysqlSessionStore implements
       if (publishNow < latestCapturedAtDbMs) {
         throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
       }
-      const updatedAtMs = Math.max(current.updatedAtMs, publishNow);
+      let updatedAtMs = Math.max(current.updatedAtMs, publishNow);
       const terminalJob: TenantPurgePlanJobRecord = {
         requestId: current.requestId,
         tenantId: current.tenantId,
@@ -22724,6 +23098,53 @@ export class MysqlSessionStore implements
       } catch {
         throw new TenantErasureIntegrityError();
       }
+      const sourceSnapshot = await this.captureTenantTelemetrySourceAccounting(
+        conn, terminalJob, receipt,
+      );
+      for (const sourceEntry of sourceSnapshot.entries) {
+        await conn.query(
+          `INSERT INTO tenant_telemetry_source_accounting_entries
+             (${TENANT_TELEMETRY_SOURCE_ACCOUNTING_ENTRY_COLUMNS})
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [
+            sourceEntry.scope, sourceEntry.requestId, sourceEntry.tenantId,
+            sourceEntry.subjectGeneration, sourceEntry.buildGeneration,
+            sourceEntry.sourceKind, sourceEntry.sourceIdentitySha256,
+            sourceEntry.writeOperationSha256, sourceEntry.domain,
+            sourceEntry.sourceEvidenceSha256, sourceEntry.classification,
+            sourceEntry.reason, sourceEntry.capturedAtDbMs, sourceEntry.receiptSha256,
+          ],
+        );
+      }
+      const sourceReceipt = sourceSnapshot.receipt;
+      await conn.query(
+        `INSERT INTO tenant_telemetry_source_accounting_receipts
+           (${TENANT_TELEMETRY_SOURCE_ACCOUNTING_RECEIPT_COLUMNS})
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          sourceReceipt.scope, sourceReceipt.requestId, sourceReceipt.tenantId,
+          sourceReceipt.subjectGeneration, sourceReceipt.buildGeneration,
+          sourceReceipt.t1FenceSha256, sourceReceipt.t3cReceiptSha256,
+          sourceReceipt.planReceiptSha256, sourceReceipt.inventoryCount,
+          sourceReceipt.writeJobCount, sourceReceipt.writeAckCount,
+          sourceReceipt.membershipCount, sourceReceipt.applicationBindingCount,
+          sourceReceipt.entryCount, sourceReceipt.entryRootSha256,
+          sourceReceipt.unknownCount, sourceReceipt.unknownRootSha256,
+          sourceReceipt.storeDbTimestampMs, sourceReceipt.completedClaimAttempt,
+          sourceReceipt.completedClaimTokenSha256, sourceReceipt.receiptSha256,
+        ],
+      );
+      // Full-range source reads and receipt inserts may wait on a concurrent writer. Recheck
+      // lease after every write, and publish T3d + sidecar only if the same claim still owns it.
+      const finalNow = await this.databaseNow(conn);
+      if (!tenantPurgePlanAuthorizationMatches(current, authorization, finalNow)) {
+        throw new Error("tenant purge plan lease expired while publishing telemetry accounting");
+      }
+      if (finalNow < sourceReceipt.storeDbTimestampMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+      }
+      updatedAtMs = Math.max(updatedAtMs, finalNow);
+      terminalJob.updatedAtMs = updatedAtMs;
       const [completed] = await conn.query<mysql.ResultSetHeader>(
         `UPDATE tenant_purge_plan_jobs
             SET phase='plan_sealed', available_at_ms=NULL, claim_token=NULL,
@@ -22745,7 +23166,7 @@ export class MysqlSessionStore implements
           authorization.buildGeneration,
           authorization.claimAttempt,
           authorization.claimToken,
-          publishNow,
+          finalNow,
         ],
       );
       if (completed.affectedRows !== 1) throw new TenantErasureIntegrityError();
@@ -22778,6 +23199,7 @@ export class MysqlSessionStore implements
       } catch {
         throw new TenantErasureIntegrityError();
       }
+      await this.validateTenantTelemetrySourceAccountingReadProof(conn, job, receipt);
     } else {
       if (receipt) throw new TenantErasureIntegrityError();
       this.tenantPurgePlanEntryState(job, entries);
@@ -22826,6 +23248,38 @@ export class MysqlSessionStore implements
       }
       const proof = await this.validateTenantPurgePlanReadProof(conn, job);
       return proof.receipt;
+    });
+  }
+
+  async getTenantTelemetrySourceAccountingReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantPurgePlanJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "plan_sealed") return null;
+      const { receipt: planReceipt } = await this.validateTenantPurgePlanReadProof(conn, job);
+      if (!planReceipt) throw new TenantErasureIntegrityError();
+      const proof = await this.validateTenantTelemetrySourceAccountingReadProof(
+        conn, job, planReceipt,
+      );
+      return proof?.receipt ?? null;
+    });
+  }
+
+  async getTenantTelemetrySourceAccountingEntries(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry[]> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantPurgePlanJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "plan_sealed") return [];
+      const { receipt: planReceipt } = await this.validateTenantPurgePlanReadProof(conn, job);
+      if (!planReceipt) throw new TenantErasureIntegrityError();
+      const proof = await this.validateTenantTelemetrySourceAccountingReadProof(
+        conn, job, planReceipt,
+      );
+      return proof?.entries ?? [];
     });
   }
 
