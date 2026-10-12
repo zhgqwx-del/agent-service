@@ -9,6 +9,7 @@ import { createStructuredTelemetry, type StructuredTelemetryRecord } from "@agen
 import {
   MysqlSessionStore,
   TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
+  TenantErasureIntegrityError,
   type EnqueueTenantTelemetryArtifactInput,
 } from "../../src/index.js";
 
@@ -28,8 +29,14 @@ function digest(value: string): string {
 }
 
 function disposableBase(raw: string): URL {
-  const url = new URL(raw);
-  const database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
+  let url: URL;
+  let database: string;
+  try {
+    url = new URL(raw);
+    database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
+  } catch {
+    throw new Error("MYSQL_MIGRATION_TEST_URL must be a valid disposable MySQL test URL");
+  }
   if (url.protocol !== "mysql:"
     || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)
     || !/(?:^|[_-])(test|migration)(?:$|[_-])/i.test(database)) {
@@ -181,7 +188,30 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
     }
   }
 
+  async function current0041StartupTriggerFingerprint(conn: Connection): Promise<boolean> {
+    const prefix = "agent-service-runtime-fingerprint:tenant-telemetry-target-manifest-triggers";
+    const start = migrationSql.indexOf(`-- ${prefix}:start`);
+    const end = migrationSql.indexOf(`-- ${prefix}:end`);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const [statement] = statements(migrationSql.slice(start + `-- ${prefix}:start`.length, end));
+    expect(statement).toMatch(/^SET @tt_target_manifest_triggers_ok=/);
+    await conn.query("SET @fixture_previous_group_concat_max_len=@@SESSION.group_concat_max_len");
+    try {
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      await conn.query(statement!);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @tt_target_manifest_triggers_ok AS fingerprint_ok",
+      );
+      return Number(rows[0]?.fingerprint_ok) === 1;
+    } finally {
+      await conn.query("SET SESSION group_concat_max_len=@fixture_previous_group_concat_max_len");
+    }
+  }
+
   it("refuses remote targets and never registers a pre-existing database for cleanup", async () => {
+    expect(() => disposableBase("mysql://user:fixture-only@["))
+      .toThrow("MYSQL_MIGRATION_TEST_URL must be a valid disposable MySQL test URL");
     expect(() => disposableBase("mysql://root@prod.example:3306/agent_service_test"))
       .toThrow("must target local MySQL");
     const database = databaseName();
@@ -410,6 +440,59 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
       await conn.end();
       conn = undefined;
       await expect(upgrade(database)).rejects.toThrow();
+    } finally {
+      await conn?.end();
+      await cleanup(database);
+    }
+  }, 120_000);
+
+  it("audits orphan 0041 projection on inactive startup even with the exact 111-trigger fingerprint", async () => {
+    const database = databaseName();
+    const url = databaseUrl(base, database);
+    let conn: Connection | undefined;
+    try {
+      await create0040(database);
+      await upgrade(database);
+      const healthy = await MysqlSessionStore.connect({ url, migrationMode: "verify" });
+      await healthy.close();
+      conn = await mysql.createConnection(url);
+      const [control] = await conn.query<Row[]>(
+        "SELECT control_generation FROM tenant_telemetry_lifecycle_control WHERE singleton_id=1",
+      );
+      expect(Number(control[0]?.control_generation)).toBe(0);
+      const insertGuard = statements(migrationSql).find((statement) =>
+        statement.startsWith("CREATE TRIGGER trg_tt_target_manifest_receipt_bi "));
+      expect(insertGuard).toBeDefined();
+      await conn.query("DROP TRIGGER trg_tt_target_manifest_receipt_bi");
+      await conn.query("SET FOREIGN_KEY_CHECKS=0");
+      try {
+        await conn.query(
+          `INSERT INTO tenant_telemetry_target_manifest_receipts
+             (scope,request_id,tenant_id,subject_generation,build_generation,
+              plan_receipt_sha256,source_accounting_receipt_sha256,entry_count,
+              entry_root_sha256,artifact_group_count,artifact_group_root_sha256,
+              observed_target_count,observed_target_root_sha256,unknown_group_count,
+              unknown_group_root_sha256,store_db_timestamp_ms,completed_claim_attempt,
+              completed_claim_token_sha256,receipt_sha256)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          ["tenant-telemetry-target-manifest-receipt-v1", `orphan-${randomUUID()}`,
+            "tenant-orphan-manifest", 1, 1, "a".repeat(64), "b".repeat(64), 0,
+            "c".repeat(64), 0, "d".repeat(64), 0, "e".repeat(64), 0,
+            "f".repeat(64), 1, 1, "0".repeat(64), "1".repeat(64)],
+        );
+      } finally {
+        await conn.query("SET FOREIGN_KEY_CHECKS=1");
+        await conn.query(insertGuard!);
+      }
+      expect(await current0041StartupTriggerFingerprint(conn)).toBe(true);
+      const [marker] = await conn.query<Row[]>(
+        "SELECT COUNT(*) AS n FROM schema_migrations WHERE name=?", [MIGRATION_NAME],
+      );
+      expect(Number(marker[0]?.n)).toBe(1);
+      await conn.end();
+      conn = undefined;
+      await expect(MysqlSessionStore.connect({ url, migrationMode: "verify" }))
+        .rejects.toBeInstanceOf(TenantErasureIntegrityError);
     } finally {
       await conn?.end();
       await cleanup(database);

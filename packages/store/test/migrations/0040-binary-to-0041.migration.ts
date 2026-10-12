@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
@@ -19,8 +19,14 @@ const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_
 type Row = RowDataPacket;
 
 function disposableBase(raw: string): URL {
-  const url = new URL(raw);
-  const database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
+  let url: URL;
+  let database: string;
+  try {
+    url = new URL(raw);
+    database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
+  } catch {
+    throw new Error("MYSQL_MIGRATION_TEST_URL must be a valid disposable MySQL test URL");
+  }
   if (url.protocol !== "mysql:"
     || !new Set(["localhost", "127.0.0.1", "[::1]", "::1"]).has(url.hostname)
     || !/(?:^|[_-])(test|migration)(?:$|[_-])/i.test(database)) {
@@ -39,15 +45,71 @@ function exactDatabaseName(): string {
   return `agent_service_migration_test_pre0041_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
 }
 
-function processEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+function processEnv(temp: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   // No provider credentials, .env contents, or destructive gates reach historical processes.
   return {
     PATH: process.env.PATH,
-    HOME: process.env.HOME,
-    TMPDIR: process.env.TMPDIR,
-    CI: process.env.CI,
+    HOME: temp,
+    TMPDIR: temp,
+    CI: "1",
+    NO_COLOR: "1",
+    COREPACK_ENABLE_NETWORK: "0",
     ...extra,
   };
+}
+
+async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
+  // The published 0040 lockfile and dependency declarations match this checkout. Copy only
+  // installed dependencies, keeping old code isolated from the real HOME, pnpm cache and network.
+  const manifests = [
+    "pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json",
+    "packages/core/package.json", "packages/protocol/package.json",
+    "packages/providers/package.json", "packages/sdk/package.json",
+    "packages/store/package.json", "packages/testkit/package.json",
+    "apps/agent-router/package.json", "apps/agent-runner/package.json",
+  ];
+  for (const manifest of manifests) {
+    const oldBytes = await readFile(join(oldCheckout, manifest));
+    const currentBytes = await readFile(join(ROOT, manifest));
+    if (!oldBytes.equals(currentBytes)) {
+      throw new Error(`frozen 0040 dependency manifest changed: ${manifest}`);
+    }
+  }
+  const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
+  await cp(join(ROOT, "node_modules"), join(oldCheckout, "node_modules"), options);
+  for (const project of [
+    "packages/core", "packages/providers", "packages/protocol", "packages/sdk",
+    "packages/store", "apps/agent-router", "apps/agent-runner",
+  ]) {
+    await cp(join(ROOT, project, "node_modules"), join(oldCheckout, project, "node_modules"),
+      options);
+  }
+  const virtualStore = await lstat(join(oldCheckout, "node_modules/.pnpm"));
+  if (!virtualStore.isDirectory() || virtualStore.isSymbolicLink()) {
+    throw new Error("frozen 0040 dependency store is not self-contained");
+  }
+  const realCheckout = await realpath(oldCheckout);
+  let workspaceLinks = 0;
+  for (const project of [
+    "", "node_modules/.pnpm", "packages/core", "packages/providers", "packages/protocol",
+    "packages/sdk", "packages/store", "apps/agent-router", "apps/agent-runner",
+  ]) {
+    const scope = join(oldCheckout, project, "node_modules/@agent-service");
+    const names = await readdir(scope).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const name of names) {
+      const link = join(scope, name);
+      const target = await readlink(link);
+      const resolved = await realpath(link);
+      if (target.startsWith("/") || !resolved.startsWith(realCheckout + sep)) {
+        throw new Error("frozen 0040 workspace dependency points outside its archive");
+      }
+      workspaceLinks += 1;
+    }
+  }
+  if (workspaceLinks === 0) throw new Error("frozen 0040 workspace package links are missing");
 }
 
 async function runFixed(
@@ -106,23 +168,24 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
     await mkdir(oldCheckout);
     const archive = join(archiveRoot, "frozen-0040.tar");
     const resolvedCommit = (await runFixed(
-      "resolve commit", "git", ["rev-parse", FROZEN_0040_COMMIT], ROOT, processEnv(), 10_000,
+      "resolve commit", "git", ["rev-parse", FROZEN_0040_COMMIT], ROOT,
+      processEnv(archiveRoot), 10_000,
     )).trim();
     expect(resolvedCommit).toBe(FROZEN_0040_COMMIT);
     await runFixed("archive", "git", [
       "archive", "--format=tar", `--output=${archive}`, FROZEN_0040_COMMIT,
-    ], ROOT, processEnv(), 30_000);
+    ], ROOT, processEnv(archiveRoot), 30_000);
     await runFixed("extract", "tar", ["-xf", archive, "-C", oldCheckout],
-      ROOT, processEnv(), 30_000);
+      ROOT, processEnv(archiveRoot), 30_000);
     const driverDir = join(oldCheckout, "packages/store/test/migrations/fixtures");
     await mkdir(driverDir, { recursive: true });
     await copyFile(join(HERE, "fixtures/pre0041-old-plan-driver.ts"),
       join(driverDir, "pre0041-old-plan-driver.ts"));
     await copyFile(join(HERE, "fixtures/pre0041-old-verify-probe.ts"),
       join(driverDir, "pre0041-old-verify-probe.ts"));
-    await runFixed("offline install", "pnpm", ["install", "--offline", "--frozen-lockfile"],
-      oldCheckout, processEnv(), 180_000);
-    await runFixed("old build", "pnpm", ["build"], oldCheckout, processEnv(), 180_000);
+    await copyInstalledDependencies(oldCheckout);
+    await runFixed("old build", "pnpm", ["build"], oldCheckout,
+      processEnv(archiveRoot), 180_000);
   }, 420_000);
 
   afterAll(async () => {
@@ -149,7 +212,7 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
     const url = databaseUrl(base, database);
     const stdout = await runFixed("old T3d worker", process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-plan-driver.ts",
-    ], oldCheckout, processEnv({ MYSQL_URL: url }), 180_000);
+    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url }), 180_000);
     let oldResult: {
       sourceCommit: string;
       requestId: string;
@@ -166,13 +229,13 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
     } catch {
       throw new Error("frozen 0040 driver output was not valid JSON");
     }
-    expect(oldResult.sourceCommit).toBe(FROZEN_0040_COMMIT);
-    expect(oldResult.entries).toBe(33);
-    expect(oldResult.sourceEntries).toBe(0);
-    expect(oldResult.upstreamReceiptsPresent).toBe(true);
+    expect(oldResult.sourceCommit === FROZEN_0040_COMMIT).toBe(true);
+    expect(oldResult.entries === 33).toBe(true);
+    expect(oldResult.sourceEntries === 0).toBe(true);
+    expect(oldResult.upstreamReceiptsPresent === true).toBe(true);
     const oldVerifyAccepted = await runFixed("old verify accepted", process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-verify-probe.ts",
-    ], oldCheckout, processEnv({ MYSQL_URL: url,
+    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
       EXPECT_0040_FINGERPRINT_REJECTION: "0" }), 15_000);
     expect(oldVerifyAccepted === "frozen-0040-verify-accepted").toBe(true);
 
@@ -265,7 +328,7 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
 
     const oldVerifyRejected = await runFixed("old verify rejected", process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-verify-probe.ts",
-    ], oldCheckout, processEnv({ MYSQL_URL: url,
+    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
       EXPECT_0040_FINGERPRINT_REJECTION: "1" }), 15_000);
     expect(oldVerifyRejected === "frozen-0040-verify-fingerprint-rejected").toBe(true);
   }, 240_000);

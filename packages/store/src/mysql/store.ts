@@ -9321,6 +9321,7 @@ export class MysqlSessionStore implements
         await this.assertTenantTelemetryApplicationCaptureProjection(conn);
         await this.assertTenantTelemetryOwnerClosureProjection(conn);
         await this.assertTenantTelemetrySourceAccountingProjection(conn);
+        await this.assertTenantTelemetryTargetManifestProjection(conn);
         await conn.commit();
         return;
       }
