@@ -31,6 +31,7 @@ export * from "./tenant-telemetry-source-accounting.js";
 export * from "./tenant-telemetry-target-manifest.js";
 export * from "./tenant-telemetry-plan-artifact-target.js";
 export * from "./tenant-telemetry-source-eligibility.js";
+export * from "./tenant-telemetry-pregrant-intent.js";
 export * from "./tenant-telemetry-disposition.js";
 export * from "./tenant-telemetry-adapter/common.js";
 export * from "./tenant-telemetry-adapter/memory.js";

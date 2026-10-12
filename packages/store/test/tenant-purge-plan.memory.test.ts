@@ -607,6 +607,125 @@ describe("MemorySessionStore tenant purge plan", () => {
     });
   }
 
+  it("prepares one source-bound 0044 intent and serializes exact-version claims without granting execution", async () => {
+    const fixture = await prepareBoundTelemetryCatalogFixture(1, "session");
+    const { store, source, claim, tenantId, wallClock } = fixture;
+    const requestId = source.request.requestId;
+    await store.sealTenantPurgePlan(planAuthorization(claim));
+    const [target] = await store.getTenantTelemetryPlanArtifactTargets(tenantId, requestId);
+    if (!target) throw new Error("missing 0044 target fixture");
+    const group = target.artifactGroupSha256;
+    expect(await store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group))
+      .toBeNull();
+    await advanceBoundTelemetryCatalogThroughT3f(fixture);
+
+    const [intent, replay] = await Promise.all([
+      store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group),
+      store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group),
+    ]);
+    expect(intent).not.toBeNull();
+    expect(replay).toEqual(intent);
+    expect(intent).toMatchObject({ tenantId, requestId, artifactGroupSha256: group,
+      catalogEntryReceiptSha256: target.receiptSha256, grantReady: false });
+    expect(store.tenantTelemetryPregrantIntents.size).toBe(1);
+    expect(await store.getTenantTelemetryPregrantIntent(tenantId, requestId, group))
+      .toEqual(intent);
+    expect(await store.prepareTenantTelemetryPregrantIntent("another-tenant", requestId, group))
+      .toBeNull();
+    expect(await store.getTenantTelemetryPregrantIntent("another-tenant", requestId, group))
+      .toBeNull();
+    expect(await store.prepareTenantTelemetryPregrantIntent(
+      tenantId, requestId, "f".repeat(64),
+    )).toBeNull();
+    expect(await store.claimTenantTelemetryPregrantIntent(
+      tenantId, requestId, group, "f".repeat(64), "wrong-version", 1_000,
+    )).toBeNull();
+    expect(await store.claimTenantTelemetryPregrantIntent(
+      "another-tenant", requestId, group, intent!.intentSha256, "cross-tenant", 1_000,
+    )).toBeNull();
+
+    const [first, contender] = await Promise.all([
+      store.claimTenantTelemetryPregrantIntent(
+        tenantId, requestId, group, intent!.intentSha256, "claim-1", 1_000,
+      ),
+      store.claimTenantTelemetryPregrantIntent(
+        tenantId, requestId, group, intent!.intentSha256, "claim-2", 1_000,
+      ),
+    ]);
+    expect(first).toMatchObject({ intentSha256: intent!.intentSha256,
+      attempt: 1, grantReady: false });
+    expect(contender).toBeNull();
+    expect(await store.claimTenantTelemetryPregrantIntent(
+      tenantId, requestId, group, intent!.intentSha256, "claim-1", 1_000,
+    )).toEqual(first);
+    expect(store.tenantTelemetryPregrantClaims.size).toBe(1);
+
+    wallClock.nowMs += 1_001;
+    expect(await store.claimTenantTelemetryPregrantIntent(
+      tenantId, requestId, group, intent!.intentSha256, "claim-1", 1_000,
+    )).toBeNull();
+    const second = await store.claimTenantTelemetryPregrantIntent(
+      tenantId, requestId, group, intent!.intentSha256, "claim-2", 1_000,
+    );
+    expect(second).toMatchObject({ intentSha256: intent!.intentSha256,
+      attempt: 2, grantReady: false });
+    expect(store.tenantTelemetryPregrantClaims.size).toBe(2);
+    wallClock.nowMs += 1_001;
+    expect(await store.claimTenantTelemetryPregrantIntent(
+      tenantId, requestId, group, intent!.intentSha256, "claim-1", 1_000,
+    )).toBeNull();
+    expect(store.tenantTelemetryPregrantClaims.size).toBe(2);
+    expect(store.tenantTelemetryDispositionAuthorizationGrants).toHaveLength(0);
+  });
+
+  it("does not publish a partial 0044 intent or claim when local proof or publication fails", async () => {
+    const fixture = await prepareBoundTelemetryCatalogFixture(1);
+    const { store, source, claim, tenantId } = fixture;
+    const requestId = source.request.requestId;
+    await store.sealTenantPurgePlan(planAuthorization(claim));
+    await advanceBoundTelemetryCatalogThroughT3f(fixture);
+    const [target] = await store.getTenantTelemetryPlanArtifactTargets(tenantId, requestId);
+    if (!target) throw new Error("missing 0044 target fixture");
+    const group = target.artifactGroupSha256;
+
+    const targetMapEntry = [...store.tenantTelemetryPlanArtifactTargets.entries()]
+      .find(([, row]) => row.requestId === requestId)!;
+    store.tenantTelemetryPlanArtifactTargets.set(targetMapEntry[0], {
+      ...targetMapEntry[1], ownerRefSha256: "f".repeat(64),
+    });
+    await expect(store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group))
+      .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    expect(store.tenantTelemetryPregrantIntents.size).toBe(0);
+    store.tenantTelemetryPlanArtifactTargets.set(...targetMapEntry);
+
+    const intentMap = store.tenantTelemetryPregrantIntents;
+    const originalIntentSet = intentMap.set;
+    intentMap.set = function () { throw new Error("injected 0044 intent publication failure"); };
+    try {
+      await expect(store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group))
+        .rejects.toThrow("injected 0044 intent publication failure");
+      expect(intentMap.size).toBe(0);
+    } finally {
+      intentMap.set = originalIntentSet;
+    }
+    const intent = await store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group);
+    if (!intent) throw new Error("missing 0044 intent after retry");
+    const claimMap = store.tenantTelemetryPregrantClaims;
+    const originalClaimSet = claimMap.set;
+    claimMap.set = function () { throw new Error("injected 0044 claim publication failure"); };
+    try {
+      await expect(store.claimTenantTelemetryPregrantIntent(
+        tenantId, requestId, group, intent.intentSha256, "claim-after-failure", 1_000,
+      )).rejects.toThrow("injected 0044 claim publication failure");
+      expect(claimMap.size).toBe(0);
+    } finally {
+      claimMap.set = originalClaimSet;
+    }
+    expect(await store.claimTenantTelemetryPregrantIntent(
+      tenantId, requestId, group, intent.intentSha256, "claim-after-failure", 1_000,
+    )).toMatchObject({ attempt: 1, grantReady: false });
+  });
+
   it("binds a session-owned managed artifact to the T3f closure and permanent grave", async () => {
     const fixture = await prepareBoundTelemetryCatalogFixture(1, "session");
     const { store, source, claim, tenantId, ownedSession } = fixture;
@@ -634,6 +753,14 @@ describe("MemorySessionStore tenant purge plan", () => {
     await advanceBoundTelemetryCatalogThroughT3f(fixture);
     expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
       .toMatchObject({ status: "local_source_candidate", managedArtifactCount: 0 });
+    const fakeGroup = "f".repeat(64);
+    expect(await store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, fakeGroup))
+      .toBeNull();
+    expect(await store.claimTenantTelemetryPregrantIntent(
+      tenantId, requestId, fakeGroup, "e".repeat(64), "zero-target", 1_000,
+    )).toBeNull();
+    expect(store.tenantTelemetryPregrantIntents.size).toBe(0);
+    expect(store.tenantTelemetryPregrantClaims.size).toBe(0);
     const catalog = store.tenantTelemetryPlanArtifactTargetReceipts.get(requestId)!;
     store.tenantTelemetryPlanArtifactTargetReceipts.delete(requestId);
     expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
@@ -642,6 +769,8 @@ describe("MemorySessionStore tenant purge plan", () => {
     store.tenantTelemetryPlanArtifactTargetReceipts.set(requestId, catalog);
     expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
       .toMatchObject({ status: "local_source_candidate", managedArtifactCount: 0 });
+    expect(await store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, fakeGroup))
+      .toBeNull();
   });
 
   it("fails closed when a post-T3f catalog target or retained telemetry source drifts", async () => {

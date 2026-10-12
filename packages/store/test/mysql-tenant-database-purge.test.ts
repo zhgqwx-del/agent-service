@@ -637,6 +637,42 @@ async function advanceToDatabasePurgeClaim(
   };
 }
 
+async function advanceToTelemetryPregrantSource(
+  store: MysqlSessionStore, conn: Connection, tenantId: string,
+) {
+  await activateTelemetryForT3f(store);
+  const producer = await activateLogsCaptureForT3f(store);
+  const userId = `pregrant-user-${randomUUID()}`;
+  const source = await advanceToDatabasePurgeClaim(
+    store, conn, tenantId, userId, {
+      beforeTenantErasure: async (sessionId) => {
+        await queueTelemetryForT3f(store, tenantId, `pregrant-${randomUUID()}`,
+          { kind: "session", id: sessionId, userId }, producer);
+        const [claim] = await store.claimTenantTelemetryWriteJobs({
+          limit: 1, leaseMs: 120_000,
+          claimToken: `pregrant-write-${randomUUID()}`,
+          adapterProtocol: "telemetry-test-v1",
+        });
+        if (!claim) throw new Error("missing pregrant write claim");
+        const authorization = telemetryAuthorization(claim);
+        if (!await store.reserveTenantTelemetryExternalMutation(
+          authorization, "telemetry-test-v1",
+        ) || !await store.completeTenantTelemetryWrite(
+          authorization, telemetryAdapterResult(claim),
+        )) throw new Error("missing pregrant write completion");
+      },
+    },
+  );
+  const [target] = await store.getTenantTelemetryPlanArtifactTargets(
+    tenantId, source.requestId,
+  );
+  if (!target) throw new Error("missing pregrant target");
+  if (!await store.executeTenantDatabasePurge(source.authorization)) {
+    throw new Error("missing pregrant T3f terminal");
+  }
+  return { source, target };
+}
+
 async function rewriteSelfConsistentT3fBillingEvidence(
   store: MysqlSessionStore,
   conn: Connection,
@@ -1250,6 +1286,201 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
+    it("serializes 0044 source-bound intent and exact-version claim across MySQL clients", async () => {
+      const first = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const second = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+        migrationMode: "verify",
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-0044-${randomUUID()}`;
+      try {
+        const { source, target } = await advanceToTelemetryPregrantSource(
+          first, conn, tenantId,
+        );
+        const requestId = source.requestId;
+        const group = target.artifactGroupSha256;
+        const [intent, replay] = await within(Promise.all([
+          first.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group),
+          second.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group),
+        ]), 20_000, "concurrent pregrant prepare");
+        expect(intent).not.toBeNull();
+        expect(replay).toEqual(intent);
+        expect(intent).toMatchObject({ tenantId, requestId, artifactGroupSha256: group,
+          catalogEntryReceiptSha256: target.receiptSha256, grantReady: false });
+        expect(await second.getTenantTelemetryPregrantIntent(tenantId, requestId, group))
+          .toEqual(intent);
+        expect(await first.prepareTenantTelemetryPregrantIntent(
+          "another-tenant", requestId, group,
+        )).toBeNull();
+        expect(await second.getTenantTelemetryPregrantIntent(
+          "another-tenant", requestId, group,
+        )).toBeNull();
+        expect(await first.prepareTenantTelemetryPregrantIntent(
+          tenantId, requestId, "f".repeat(64),
+        )).toBeNull();
+        expect(await first.claimTenantTelemetryPregrantIntent(
+          tenantId, requestId, group, "f".repeat(64), "wrong-version", 1_000,
+        )).toBeNull();
+        expect(await first.claimTenantTelemetryPregrantIntent(
+          "another-tenant", requestId, group, intent!.intentSha256, "cross-tenant", 1_000,
+        )).toBeNull();
+
+        const [firstClaim, secondClaim] = await within(Promise.all([
+          first.claimTenantTelemetryPregrantIntent(
+            tenantId, requestId, group, intent!.intentSha256, "claim-first", 10_000,
+          ),
+          second.claimTenantTelemetryPregrantIntent(
+            tenantId, requestId, group, intent!.intentSha256, "claim-second", 10_000,
+          ),
+        ]), 20_000, "concurrent pregrant claim");
+        expect([firstClaim, secondClaim].filter(Boolean)).toHaveLength(1);
+        const winner = firstClaim ?? secondClaim;
+        const winnerToken = firstClaim ? "claim-first" : "claim-second";
+        expect(winner).toMatchObject({ intentSha256: intent!.intentSha256,
+          attempt: 1, grantReady: false });
+        expect(JSON.stringify(winner)).not.toContain(winnerToken);
+        expect(await first.claimTenantTelemetryPregrantIntent(
+          tenantId, requestId, group, intent!.intentSha256, winnerToken, 10_000,
+        )).toEqual(winner);
+        const [rows] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_telemetry_pregrant_intents WHERE tenant_id=?) AS intents,
+             (SELECT COUNT(*) FROM tenant_telemetry_pregrant_claims WHERE tenant_id=?) AS claims,
+             (SELECT COUNT(*) FROM tenant_telemetry_disposition_authorization_grants WHERE tenant_id=?) AS grants`,
+          [tenantId, tenantId, tenantId],
+        );
+        expect(rows[0]).toMatchObject({ intents: 1, claims: 1, grants: 0 });
+        expect(JSON.stringify({ intent, winner })).not.toContain(source.session.id);
+
+        const restarted = await MysqlSessionStore.connect({
+          url: mysqlUrl, migrationMode: "verify", tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+        });
+        try {
+          expect(await restarted.getTenantTelemetryPregrantIntent(
+            tenantId, requestId, group,
+          )).toEqual(intent);
+        } finally {
+          await restarted.close();
+        }
+
+        // A changed local source invalidates every read/replay path; durable intent/claim
+        // remain evidence, never authority to continue through the drift.
+        await conn.query("DROP TRIGGER trg_managed_telemetry_write_acks_bu");
+        await conn.query(
+          "UPDATE tenant_telemetry_write_acks SET adapter_evidence_sha256=? WHERE tenant_id=? LIMIT 1",
+          ["e".repeat(64), tenantId],
+        );
+        await expect(first.getTenantTelemetryPregrantIntent(tenantId, requestId, group))
+          .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        await expect(first.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group))
+          .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        await expect(second.claimTenantTelemetryPregrantIntent(
+          tenantId, requestId, group, intent!.intentSha256, winnerToken, 10_000,
+        )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      } finally {
+        await conn.end();
+        await first.close();
+        await second.close();
+      }
+    });
+
+    it("refuses 0044 marker-loss migration replay once a durable intent and claim exist", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-0044-marker-${randomUUID()}`;
+      try {
+        const { source, target } = await advanceToTelemetryPregrantSource(
+          store, conn, tenantId,
+        );
+        const intent = await store.prepareTenantTelemetryPregrantIntent(
+          tenantId, source.requestId, target.artifactGroupSha256,
+        );
+        if (!intent) throw new Error("missing pregrant intent for marker-loss fixture");
+        expect(await store.claimTenantTelemetryPregrantIntent(
+          tenantId, source.requestId, target.artifactGroupSha256,
+          intent.intentSha256, "marker-loss-claim", 10_000,
+        )).toMatchObject({ attempt: 1, grantReady: false });
+
+        // This test owns the whole disposable database. Marker deletion is deliberate
+        // corruption, not a production recovery procedure.
+        const [deleted] = await conn.query<mysql.ResultSetHeader>(
+          "DELETE FROM schema_migrations WHERE name=?",
+          ["0044_tenant_telemetry_pregrant_intent.sql"],
+        );
+        expect(deleted.affectedRows).toBe(1);
+        await expect(MysqlSessionStore.connect({
+          url: mysqlUrl, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+        })).rejects.toThrow("0044 marker-loss replay with durable intent/claim is forbidden");
+        const [rows] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_telemetry_pregrant_intents WHERE tenant_id=?) AS intents,
+             (SELECT COUNT(*) FROM tenant_telemetry_pregrant_claims WHERE tenant_id=?) AS claims,
+             (SELECT COUNT(*) FROM schema_migrations WHERE name=?) AS marker`,
+          [tenantId, tenantId, "0044_tenant_telemetry_pregrant_intent.sql"],
+        );
+        expect(rows[0]).toMatchObject({ intents: 1, claims: 1, marker: 0 });
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("rolls back 0044 intent and claim insert failures without publishing partial rows", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-0044-rollback-${randomUUID()}`;
+      try {
+        const { source, target } = await advanceToTelemetryPregrantSource(
+          store, conn, tenantId,
+        );
+        const requestId = source.requestId;
+        const group = target.artifactGroupSha256;
+        await conn.query(`CREATE TRIGGER test_pregrant_intent_abort AFTER INSERT
+          ON tenant_telemetry_pregrant_intents FOR EACH ROW
+          SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected pregrant intent failure'`);
+        await expect(store.prepareTenantTelemetryPregrantIntent(tenantId, requestId, group))
+          .rejects.toThrow("injected pregrant intent failure");
+        const [failedIntentRows] = await conn.query<RowDataPacket[]>(
+          "SELECT COUNT(*) AS n FROM tenant_telemetry_pregrant_intents WHERE tenant_id=?",
+          [tenantId],
+        );
+        expect(Number(failedIntentRows[0]?.n)).toBe(0);
+        expect(await store.getTenantTelemetryPregrantIntent(tenantId, requestId, group))
+          .toBeNull();
+        await conn.query("DROP TRIGGER test_pregrant_intent_abort");
+
+        const intent = await store.prepareTenantTelemetryPregrantIntent(
+          tenantId, requestId, group,
+        );
+        if (!intent) throw new Error("missing pregrant intent after rollback retry");
+        await conn.query(`CREATE TRIGGER test_pregrant_claim_abort AFTER INSERT
+          ON tenant_telemetry_pregrant_claims FOR EACH ROW
+          SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected pregrant claim failure'`);
+        await expect(store.claimTenantTelemetryPregrantIntent(
+          tenantId, requestId, group, intent.intentSha256, "claim-after-rollback", 1_000,
+        )).rejects.toThrow("injected pregrant claim failure");
+        const [failedClaimRows] = await conn.query<RowDataPacket[]>(
+          "SELECT COUNT(*) AS n FROM tenant_telemetry_pregrant_claims WHERE tenant_id=?",
+          [tenantId],
+        );
+        expect(Number(failedClaimRows[0]?.n)).toBe(0);
+        await conn.query("DROP TRIGGER test_pregrant_claim_abort");
+        expect(await store.claimTenantTelemetryPregrantIntent(
+          tenantId, requestId, group, intent.intentSha256, "claim-after-rollback", 1_000,
+        )).toMatchObject({ attempt: 1, grantReady: false });
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
     it("treats a lost zero-target 0042 receipt as unknown, not an empty-source candidate", async () => {
       const store = await MysqlSessionStore.connect({
         url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
@@ -1270,6 +1501,21 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           tenantId, source.requestId,
         )).toEqual({ status: "local_source_candidate", managedArtifactCount: 0,
           executionReady: false, externalAuthorityVerified: false });
+        const fakeGroup = "f".repeat(64);
+        expect(await store.prepareTenantTelemetryPregrantIntent(
+          tenantId, source.requestId, fakeGroup,
+        )).toBeNull();
+        expect(await store.claimTenantTelemetryPregrantIntent(
+          tenantId, source.requestId, fakeGroup,
+          "e".repeat(64), "zero-target", 1_000,
+        )).toBeNull();
+        const [pregrantRows] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_telemetry_pregrant_intents WHERE tenant_id=?) AS intents,
+             (SELECT COUNT(*) FROM tenant_telemetry_pregrant_claims WHERE tenant_id=?) AS claims`,
+          [tenantId, tenantId],
+        );
+        expect(pregrantRows[0]).toMatchObject({ intents: 0, claims: 0 });
         await expect(conn.query(
           "DELETE FROM tenant_telemetry_plan_artifact_target_receipts WHERE request_id=?",
           [source.requestId],
@@ -1285,6 +1531,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           tenantId, source.requestId,
         )).toEqual({ status: "unknown", managedArtifactCount: null,
           executionReady: false, externalAuthorityVerified: false });
+        expect(await store.prepareTenantTelemetryPregrantIntent(
+          tenantId, source.requestId, fakeGroup,
+        )).toBeNull();
       } finally {
         await conn.end();
         await store.close();

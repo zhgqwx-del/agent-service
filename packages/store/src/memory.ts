@@ -845,6 +845,7 @@ import * as TenantTelemetrySourceAccounting from "./tenant-telemetry-source-acco
 import * as TenantTelemetryTargetManifest from "./tenant-telemetry-target-manifest.js";
 import * as TenantTelemetryPlanArtifactTarget from "./tenant-telemetry-plan-artifact-target.js";
 import * as TenantTelemetrySourceEligibility from "./tenant-telemetry-source-eligibility.js";
+import * as TenantTelemetryPregrantIntent from "./tenant-telemetry-pregrant-intent.js";
 import * as TenantTelemetryDisposition from "./tenant-telemetry-disposition.js";
 
 interface MemoryUserDataExportJob {
@@ -1152,7 +1153,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1395,6 +1396,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantTelemetryPlanArtifactTargetReceipts = new Map<
     string,
     TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetReceipt
+  >();
+  tenantTelemetryPregrantIntents = new Map<
+    string,
+    TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent
+  >();
+  tenantTelemetryPregrantClaims = new Map<
+    string,
+    TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim
   >();
   tenantTelemetryApplicationDomainControls = new Map<
     TenantTelemetry.TenantTelemetryDomain,
@@ -15892,9 +15901,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     }
   }
 
-  async getTenantTelemetrySourceEligibility(
+  private readTenantTelemetrySourceEligibilitySync(
     tenantId: string, requestId: string,
-  ): Promise<TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility | null> {
+  ): TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility | null {
     // Deliberately no await: all Memory evidence and current gates are read in one synchronous
     // boundary. A pending T3f or any historical sidecar absence remains unknown.
     const job = this.tenantPurgePlanJobs.get(requestId);
@@ -15977,6 +15986,156 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     } catch {
       throw new TenantErasureIntegrityError();
     }
+  }
+
+  async getTenantTelemetrySourceEligibility(
+    tenantId: string, requestId: string,
+  ): Promise<TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility | null> {
+    return this.readTenantTelemetrySourceEligibilitySync(tenantId, requestId);
+  }
+
+  private tenantTelemetryPregrantIntentKey(requestId: string, artifactGroupSha256: string): string {
+    return JSON.stringify([requestId, artifactGroupSha256]);
+  }
+
+  private deriveTenantTelemetryPregrantIntentBody(
+    tenantId: string, requestId: string, artifactGroupSha256: string, createdAtDbMs: number,
+  ): TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentBody | null {
+    // This is a fresh synchronous proof, never a caller-supplied 0043 diagnostic result.
+    const eligibility = this.readTenantTelemetrySourceEligibilitySync(tenantId, requestId);
+    if (eligibility?.status !== "local_source_candidate") return null;
+    const target = this.tenantTelemetryPlanArtifactTargetsFor(requestId)
+      .find((row) => row.artifactGroupSha256 === artifactGroupSha256);
+    if (!target || target.tenantId !== tenantId) return null;
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    const t3fJob = this.tenantDatabasePurgeJobs.get(requestId);
+    const catalogReceipt = this.tenantTelemetryPlanArtifactTargetReceipts.get(requestId);
+    const sourceReceipt = this.tenantTelemetrySourceAccountingReceipts.get(requestId);
+    const manifestReceipt = this.tenantTelemetryTargetManifestReceipts.get(requestId);
+    const closureReceipt = this.tenantTelemetryOwnerClosureReceipts.get(requestId);
+    if (!job || !t3fJob || t3fJob.phase !== "database_purged"
+      || !catalogReceipt || !sourceReceipt || !manifestReceipt
+      || !closureReceipt) throw new TenantErasureIntegrityError();
+    const t3fReceipt = this.tenantDatabasePurgeBundle(t3fJob).receipt;
+    return {
+      scope: TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_INTENT_SCOPE,
+      tenantId, requestId, subjectGeneration: job.subjectGeneration,
+      buildGeneration: job.buildGeneration, artifactGroupSha256,
+      catalogEntryReceiptSha256: target.receiptSha256,
+      catalogReceiptSha256: catalogReceipt.receiptSha256,
+      sourceAccountingReceiptSha256: sourceReceipt.receiptSha256,
+      targetManifestReceiptSha256: manifestReceipt.receiptSha256,
+      ownerClosureReceiptSha256: closureReceipt.receiptSha256,
+      databasePurgeReceiptSha256: t3fReceipt.receiptSha256,
+      createdAtDbMs, grantReady: false,
+    };
+  }
+
+  async prepareTenantTelemetryPregrantIntent(
+    tenantId: string, requestId: string, artifactGroupSha256: string,
+  ): Promise<TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent | null> {
+    const key = this.tenantTelemetryPregrantIntentKey(requestId, artifactGroupSha256);
+    const existing = this.tenantTelemetryPregrantIntents.get(key);
+    if (existing) TenantTelemetryPregrantIntent.validateTenantTelemetryPregrantIntent(existing);
+    const nowMs = this.storeNowMs();
+    if (existing && existing.createdAtDbMs > nowMs) return null;
+    const body = this.deriveTenantTelemetryPregrantIntentBody(
+      tenantId, requestId, artifactGroupSha256, existing?.createdAtDbMs ?? nowMs,
+    );
+    if (!body) return null;
+    const intent: TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent = {
+      ...body, intentSha256: TenantTelemetryPregrantIntent.tenantTelemetryPregrantIntentSha256(body),
+    };
+    if (existing && JSON.stringify(existing) !== JSON.stringify(intent)) {
+      throw new TenantErasureIntegrityError();
+    }
+    if (!existing) this.tenantTelemetryPregrantIntents.set(key, intent);
+    return clone(existing ?? intent);
+  }
+
+  async getTenantTelemetryPregrantIntent(
+    tenantId: string, requestId: string, artifactGroupSha256: string,
+  ): Promise<TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent | null> {
+    const eligibility = this.readTenantTelemetrySourceEligibilitySync(tenantId, requestId);
+    if (eligibility?.status !== "local_source_candidate") return null;
+    const intent = this.tenantTelemetryPregrantIntents.get(
+      this.tenantTelemetryPregrantIntentKey(requestId, artifactGroupSha256),
+    );
+    if (!intent || intent.tenantId !== tenantId) return null;
+    TenantTelemetryPregrantIntent.validateTenantTelemetryPregrantIntent(intent);
+    if (intent.createdAtDbMs > this.storeNowMs()) return null;
+    const expected = this.deriveTenantTelemetryPregrantIntentBody(
+      tenantId, requestId, artifactGroupSha256, intent.createdAtDbMs,
+    );
+    if (!expected || intent.intentSha256
+      !== TenantTelemetryPregrantIntent.tenantTelemetryPregrantIntentSha256(expected)) {
+      throw new TenantErasureIntegrityError();
+    }
+    return clone(intent);
+  }
+
+  async claimTenantTelemetryPregrantIntent(
+    tenantId: string, requestId: string, artifactGroupSha256: string,
+    expectedIntentSha256: string, claimToken: string, leaseMs: number,
+  ): Promise<TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim | null> {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 60_000) {
+      throw new Error("invalid telemetry pregrant lease");
+    }
+    if (!/^[0-9a-f]{64}$/.test(expectedIntentSha256)) {
+      throw new Error("invalid telemetry pregrant intent version");
+    }
+    const tokenSha256 = TenantTelemetryPregrantIntent
+      .tenantTelemetryPregrantClaimTokenSha256(claimToken);
+    const nowMs = this.storeNowMs();
+    const expected = this.deriveTenantTelemetryPregrantIntentBody(
+      tenantId, requestId, artifactGroupSha256,
+      this.tenantTelemetryPregrantIntents.get(
+        this.tenantTelemetryPregrantIntentKey(requestId, artifactGroupSha256),
+      )?.createdAtDbMs ?? nowMs,
+    );
+    if (!expected) return null;
+    const intent = this.tenantTelemetryPregrantIntents.get(
+      this.tenantTelemetryPregrantIntentKey(requestId, artifactGroupSha256),
+    );
+    if (!intent || intent.tenantId !== tenantId) return null;
+    TenantTelemetryPregrantIntent.validateTenantTelemetryPregrantIntent(intent);
+    if (intent.createdAtDbMs > nowMs) return null;
+    if (intent.intentSha256 !== expectedIntentSha256) return null;
+    if (intent.intentSha256
+      !== TenantTelemetryPregrantIntent.tenantTelemetryPregrantIntentSha256(expected)) {
+      throw new TenantErasureIntegrityError();
+    }
+    const claims = [...this.tenantTelemetryPregrantClaims.values()]
+      .filter((row) => row.intentSha256 === intent.intentSha256)
+      .sort((left, right) => left.attempt - right.attempt);
+    for (const [index, claim] of claims.entries()) {
+      TenantTelemetryPregrantIntent.validateTenantTelemetryPregrantClaim(claim);
+      if (claim.tenantId !== tenantId || claim.requestId !== requestId
+        || claim.intentSha256 !== intent.intentSha256 || claim.attempt !== index + 1) {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    const prior = claims.at(-1);
+    if (prior) {
+      if (prior.leaseUntilDbMs > nowMs) {
+        return prior.claimTokenSha256 === tokenSha256 ? clone(prior) : null;
+      }
+    }
+    // A token already consumed by any expired attempt cannot be revived under a later version.
+    if (claims.some((row) => row.claimTokenSha256 === tokenSha256)) return null;
+    const body: TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaimBody = {
+      scope: TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_CLAIM_SCOPE,
+      tenantId, requestId, intentSha256: intent.intentSha256,
+      attempt: (prior?.attempt ?? 0) + 1, claimTokenSha256: tokenSha256,
+      claimedAtDbMs: nowMs, leaseUntilDbMs: nowMs + leaseMs, grantReady: false,
+    };
+    const claim: TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim = {
+      ...body, claimSha256: TenantTelemetryPregrantIntent.tenantTelemetryPregrantClaimSha256(body),
+    };
+    this.tenantTelemetryPregrantClaims.set(
+      JSON.stringify([intent.intentSha256, claim.attempt]), claim,
+    );
+    return clone(claim);
   }
 
   // ---------- tenant purge execution + local physical ACK ledger ----------

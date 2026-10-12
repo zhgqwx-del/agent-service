@@ -256,6 +256,7 @@ import * as TenantTelemetrySourceAccounting from "../tenant-telemetry-source-acc
 import * as TenantTelemetryTargetManifest from "../tenant-telemetry-target-manifest.js";
 import * as TenantTelemetryPlanArtifactTarget from "../tenant-telemetry-plan-artifact-target.js";
 import * as TenantTelemetrySourceEligibility from "../tenant-telemetry-source-eligibility.js";
+import * as TenantTelemetryPregrantIntent from "../tenant-telemetry-pregrant-intent.js";
 import * as TenantTelemetryDisposition from "../tenant-telemetry-disposition.js";
 import * as BackupCatalog from "../backup-catalog.js";
 import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
@@ -940,6 +941,10 @@ const TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME =
   "0042_tenant_telemetry_plan_artifact_target.sql";
 const TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-plan-artifact-target";
+const TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME =
+  "0044_tenant_telemetry_pregrant_intent.sql";
+const TENANT_TELEMETRY_PREGRANT_INTENT_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-pregrant-intent";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME = "trg_tt_disposition_grant_bi_v2";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX =
   `CREATE TRIGGER ${TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME} `
@@ -990,6 +995,15 @@ const TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_TRIGGER_SHAPES = [
   ["trg_tt_plan_artifact_target_t3d_terminal_bu", "tenant_purge_plan_jobs", "UPDATE"],
   ["trg_tt_plan_artifact_target_manifest_receipt_bu", "tenant_telemetry_target_manifest_receipts", "UPDATE"],
 ] as const;
+const TENANT_TELEMETRY_PREGRANT_INTENT_TRIGGER_SHAPES = [
+  ["trg_tt_pregrant_intent_bi", "tenant_telemetry_pregrant_intents", "INSERT"],
+  ["trg_tt_pregrant_intent_bu", "tenant_telemetry_pregrant_intents", "UPDATE"],
+  ["trg_tt_pregrant_intent_bd", "tenant_telemetry_pregrant_intents", "DELETE"],
+  ["trg_tt_pregrant_claim_bi", "tenant_telemetry_pregrant_claims", "INSERT"],
+  ["trg_tt_pregrant_claim_bu", "tenant_telemetry_pregrant_claims", "UPDATE"],
+  ["trg_tt_pregrant_claim_bd", "tenant_telemetry_pregrant_claims", "DELETE"],
+  ["trg_tt_pregrant_catalog_receipt_bu", "tenant_telemetry_plan_artifact_target_receipts", "UPDATE"],
+] as const;
 
 function mysqlMigrationStatements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "")
@@ -1020,14 +1034,17 @@ async function executeMysqlMigrationStatement(
   if (migrationName === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME
     || migrationName === TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME
     || migrationName === TENANT_TELEMETRY_TARGET_MANIFEST_MIGRATION_NAME
-    || migrationName === TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME) {
+    || migrationName === TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME
+    || migrationName === TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME) {
     const shapes = migrationName === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME
       ? TENANT_TELEMETRY_OWNER_CLOSURE_TRIGGER_SHAPES
       : migrationName === TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME
         ? TENANT_TELEMETRY_SOURCE_ACCOUNTING_TRIGGER_SHAPES
         : migrationName === TENANT_TELEMETRY_TARGET_MANIFEST_MIGRATION_NAME
           ? TENANT_TELEMETRY_TARGET_MANIFEST_TRIGGER_SHAPES
-          : TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_TRIGGER_SHAPES;
+          : migrationName === TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME
+            ? TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_TRIGGER_SHAPES
+            : TENANT_TELEMETRY_PREGRANT_INTENT_TRIGGER_SHAPES;
     const trigger = shapes.find(
       ([name, table, manipulation]) => statement.startsWith(
         `CREATE TRIGGER ${name} BEFORE ${manipulation} ON ${table} FOR EACH ROW `,
@@ -1459,6 +1476,30 @@ function tenantTelemetryPlanArtifactTargetFingerprintStatement(
   if (statements.length !== 1
     || !statements[0]!.startsWith(`SET @tt_plan_artifact_target_${marker}_ok=`)) {
     throw new Error(`0042 plan artifact target ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
+function tenantTelemetryPregrantIntentFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_PREGRANT_INTENT_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_PREGRANT_INTENT_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0044 pregrant intent ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @tt_pregrant_${marker}_ok=`)) {
+    throw new Error(`0044 pregrant intent ${marker} fingerprint block is invalid`);
   }
   return statements[0]!;
 }
@@ -8261,6 +8302,7 @@ export class MysqlSessionStore implements
   TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore,
   TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore,
   TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore,
+  TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore,
   TenantTelemetryWriter.TenantTelemetryWriterStore,
   TenantTelemetryDisposition.TenantTelemetryDispositionStore,
   BackupCatalog.TenantBackupCatalogStore,
@@ -8294,6 +8336,7 @@ export class MysqlSessionStore implements
   private tenantTelemetrySourceAccountingSchemaInstalled = false;
   private tenantTelemetryTargetManifestSchemaInstalled = false;
   private tenantTelemetryPlanArtifactTargetSchemaInstalled = false;
+  private tenantTelemetryPregrantIntentSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -9050,6 +9093,46 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertTenantTelemetryPregrantIntentFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+    includeTriggers = true,
+  ): Promise<void> {
+    let statements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME), "utf8",
+      );
+      statements = [tenantTelemetryPregrantIntentFingerprintStatement(migrationSql, "schema"),
+        ...(includeTriggers
+          ? [tenantTelemetryPregrantIntentFingerprintStatement(migrationSql, "triggers")]
+          : [])];
+    } catch (cause) {
+      throw new Error("0044 pregrant intent fingerprint source is invalid", { cause });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query("SET @tt_pregrant_prev_gcml=@@SESSION.group_concat_max_len");
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @tt_pregrant_schema_ok AS schema_ok,@tt_pregrant_triggers_ok AS trigger_ok",
+      );
+      if (Number(rows[0]?.schema_ok) !== 1
+        || (includeTriggers && Number(rows[0]?.trigger_ok) !== 1)) {
+        throw new Error("stored schema/triggers do not match the 0044 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error("0044 pregrant intent fingerprint verification failed", { cause });
+    }
+    try {
+      await conn.query("SET SESSION group_concat_max_len=@tt_pregrant_prev_gcml");
+    } catch (cause) {
+      failure ??= new Error("0044 pregrant intent fingerprint session restore failed", { cause });
+    }
+    if (failure) throw failure;
+  }
+
   private async reconcileLegacyTenantTelemetryLifecycleSubjects(
     conn: PoolConnection,
     acknowledgements: NonNullable<
@@ -9500,6 +9583,87 @@ export class MysqlSessionStore implements
     }
   }
 
+  private async assertTenantTelemetryPregrantIntentProjection(
+    conn: PoolConnection,
+    lifecycleActive: boolean,
+  ): Promise<void> {
+    if (!this.tenantTelemetryPregrantIntentSchemaInstalled) return;
+    const [orphans] = await conn.query<Row[]>(
+      `SELECT i.intent_sha256
+         FROM tenant_telemetry_pregrant_intents i
+         LEFT JOIN tenant_telemetry_plan_artifact_targets e
+           ON BINARY e.request_id=BINARY i.request_id
+          AND BINARY e.artifact_group_sha256=BINARY i.artifact_group_sha256
+         LEFT JOIN tenant_telemetry_plan_artifact_target_receipts c
+           ON BINARY c.receipt_sha256=BINARY i.catalog_receipt_sha256
+         LEFT JOIN tenant_telemetry_source_accounting_receipts s
+           ON BINARY s.receipt_sha256=BINARY i.source_accounting_receipt_sha256
+         LEFT JOIN tenant_telemetry_target_manifest_receipts m
+           ON BINARY m.receipt_sha256=BINARY i.target_manifest_receipt_sha256
+         LEFT JOIN tenant_telemetry_owner_closure_receipts o
+           ON BINARY o.receipt_sha256=BINARY i.owner_closure_receipt_sha256
+         LEFT JOIN tenant_database_purge_receipts r
+           ON BINARY r.receipt_sha256=BINARY i.database_purge_receipt_sha256
+         LEFT JOIN tenant_database_purge_jobs j
+           ON BINARY j.request_id=BINARY i.request_id
+        WHERE e.request_id IS NULL OR c.request_id IS NULL OR s.request_id IS NULL
+          OR m.request_id IS NULL OR o.request_id IS NULL OR r.request_id IS NULL
+          OR j.request_id IS NULL OR j.phase<>'database_purged'
+          OR BINARY e.tenant_id<>BINARY i.tenant_id
+          OR BINARY e.receipt_sha256<>BINARY i.catalog_entry_receipt_sha256
+          OR e.subject_generation<>i.subject_generation
+          OR e.build_generation<>i.build_generation
+          OR BINARY c.request_id<>BINARY i.request_id
+          OR BINARY c.tenant_id<>BINARY i.tenant_id
+          OR c.subject_generation<>i.subject_generation
+          OR c.build_generation<>i.build_generation
+          OR BINARY c.source_accounting_receipt_sha256<>BINARY i.source_accounting_receipt_sha256
+          OR BINARY c.target_manifest_receipt_sha256<>BINARY i.target_manifest_receipt_sha256
+          OR c.execution_ready<>0
+          OR BINARY s.request_id<>BINARY i.request_id
+          OR BINARY s.tenant_id<>BINARY i.tenant_id
+          OR BINARY m.request_id<>BINARY i.request_id
+          OR BINARY m.tenant_id<>BINARY i.tenant_id
+          OR BINARY o.request_id<>BINARY i.request_id
+          OR BINARY o.tenant_id<>BINARY i.tenant_id
+          OR BINARY o.t3f_receipt_sha256<>BINARY i.database_purge_receipt_sha256
+          OR BINARY r.request_id<>BINARY i.request_id
+          OR BINARY r.tenant_id<>BINARY i.tenant_id
+          OR r.local_database_purge_complete<>1
+          OR r.session_content_deleted<>1
+          OR r.all_domains_complete<>0 OR r.content_purge_executed<>0
+          OR BINARY j.tenant_id<>BINARY i.tenant_id
+          OR BINARY j.terminal_receipt_sha256<>BINARY i.database_purge_receipt_sha256
+          OR r.store_db_timestamp_ms>i.created_at_db_ms
+        LIMIT 1`,
+    );
+    if (orphans[0]) throw new TenantErasureIntegrityError();
+    const [claimOrphans] = await conn.query<Row[]>(
+      `SELECT c.claim_sha256 FROM tenant_telemetry_pregrant_claims c
+         LEFT JOIN tenant_telemetry_pregrant_intents i
+           ON BINARY i.intent_sha256=BINARY c.intent_sha256
+        WHERE i.intent_sha256 IS NULL
+           OR BINARY i.tenant_id<>BINARY c.tenant_id
+           OR BINARY i.request_id<>BINARY c.request_id
+           OR i.created_at_db_ms>c.claimed_at_db_ms LIMIT 1`,
+    );
+    if (claimOrphans[0]) throw new TenantErasureIntegrityError();
+    const [rows] = await conn.query<Row[]>(
+      `SELECT tenant_id,request_id,artifact_group_sha256
+         FROM tenant_telemetry_pregrant_intents
+        ORDER BY request_id,artifact_group_sha256`,
+    );
+    if (!lifecycleActive && rows.length > 0) throw new TenantErasureIntegrityError();
+    for (const row of rows) {
+      const intent = await this.loadTenantTelemetryPregrantIntent(
+        conn, String(row.tenant_id), String(row.request_id),
+        String(row.artifact_group_sha256), "",
+      );
+      if (!intent) throw new TenantErasureIntegrityError();
+      await this.loadTenantTelemetryPregrantClaims(conn, intent, "");
+    }
+  }
+
   private async assertTenantTelemetryRuntimeConfiguration(
     conn: PoolConnection,
   ): Promise<void> {
@@ -9556,6 +9720,7 @@ export class MysqlSessionStore implements
         await this.assertTenantTelemetrySourceAccountingProjection(conn);
         await this.assertTenantTelemetryTargetManifestProjection(conn);
         await this.assertTenantTelemetryPlanArtifactTargetProjection(conn);
+        await this.assertTenantTelemetryPregrantIntentProjection(conn, false);
         await conn.commit();
         return;
       }
@@ -9577,6 +9742,7 @@ export class MysqlSessionStore implements
       await this.assertTenantTelemetrySourceAccountingProjection(conn);
       await this.assertTenantTelemetryTargetManifestProjection(conn);
       await this.assertTenantTelemetryPlanArtifactTargetProjection(conn);
+      await this.assertTenantTelemetryPregrantIntentProjection(conn, true);
       await conn.commit();
     } catch (error) {
       await conn.rollback().catch(() => {});
@@ -9617,6 +9783,10 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_TARGET_MANIFEST_MIGRATION_NAME)) {
         throw new Error("0042 plan artifact target marker is missing its 0041 predecessor");
+      }
+      if (done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME)) {
+        throw new Error("0044 pregrant intent marker is missing its 0042 predecessor");
       }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
@@ -9679,7 +9849,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryPlanArtifactTargetFingerprint(conn, migrationsDir);
+        await this.assertTenantTelemetryPlanArtifactTargetFingerprint(
+          conn, migrationsDir, !done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryPregrantIntentFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -9716,6 +9891,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryPlanArtifactTargetSchemaInstalled = done.has(
         TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME,
+      );
+      this.tenantTelemetryPregrantIntentSchemaInstalled = done.has(
+        TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME,
       );
       if (!skipTelemetryRuntimeAudit) {
         await this.assertTenantTelemetryRuntimeConfiguration(conn);
@@ -9771,8 +9949,44 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_TARGET_MANIFEST_MIGRATION_NAME)) {
         throw new Error("0042 plan artifact target marker is missing its 0041 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME)) {
+        throw new Error("0044 pregrant intent marker is missing its 0042 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME) {
+          const [rows] = await conn.query<Row[]>(
+            `SELECT COUNT(*) AS trigger_count FROM information_schema.triggers
+              WHERE trigger_schema=DATABASE() AND trigger_name IN
+                ('trg_tt_pregrant_intent_bi','trg_tt_pregrant_intent_bu',
+                 'trg_tt_pregrant_intent_bd','trg_tt_pregrant_claim_bi',
+                 'trg_tt_pregrant_claim_bu','trg_tt_pregrant_claim_bd',
+                 'trg_tt_pregrant_catalog_receipt_bu')`,
+          );
+          if (storedSafeInteger(rows[0]?.trigger_count,
+            "existing 0044 pregrant intent trigger count") === 0) {
+            await this.assertTenantTelemetryPlanArtifactTargetFingerprint(conn, dir);
+          } else {
+            await this.assertTenantTelemetryPlanArtifactTargetFingerprint(conn, dir, false);
+          }
+          const [footprint] = await conn.query<Row[]>(
+            `SELECT table_name AS table_name FROM information_schema.tables
+              WHERE table_schema=DATABASE() AND table_name IN
+                ('tenant_telemetry_pregrant_intents','tenant_telemetry_pregrant_claims')`,
+          );
+          for (const row of footprint) {
+            const table = String(row.table_name);
+            if (table !== "tenant_telemetry_pregrant_intents"
+              && table !== "tenant_telemetry_pregrant_claims") {
+              throw new Error("unexpected markerless 0044 table");
+            }
+            const [countRows] = await conn.query<Row[]>(`SELECT COUNT(*) AS n FROM ${table}`);
+            if (storedSafeInteger(countRows[0]?.n, "markerless 0044 evidence count") !== 0) {
+              throw new Error("0044 marker-loss replay with durable intent/claim is forbidden");
+            }
+          }
+        }
         if (f === TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME) {
           const [rows] = await conn.query<Row[]>(
             `SELECT COUNT(*) AS trigger_count FROM information_schema.triggers
@@ -9979,6 +10193,10 @@ export class MysqlSessionStore implements
               && stmt.startsWith("CREATE TRIGGER trg_tt_plan_artifact_target_bi ")) {
               await this.assertTenantTelemetryPlanArtifactTargetFingerprint(conn, dir, false);
             }
+            if (f === TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME
+              && stmt.startsWith("CREATE TRIGGER trg_tt_pregrant_intent_bi ")) {
+              await this.assertTenantTelemetryPregrantIntentFingerprint(conn, dir, false);
+            }
             await executeMysqlMigrationStatement(conn, f, stmt);
           } catch (cause) {
             throw new Error(`migration ${f} failed at statement ${i + 1}/${statements.length}`, { cause });
@@ -10042,7 +10260,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryPlanArtifactTargetFingerprint(conn, dir);
+        await this.assertTenantTelemetryPlanArtifactTargetFingerprint(
+          conn, dir, !done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryPregrantIntentFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -10079,6 +10302,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryPlanArtifactTargetSchemaInstalled = done.has(
         TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME,
+      );
+      this.tenantTelemetryPregrantIntentSchemaInstalled = done.has(
+        TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME,
       );
       await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
@@ -24322,13 +24548,18 @@ export class MysqlSessionStore implements
     });
   }
 
-  async getTenantTelemetrySourceEligibility(
+  private async withFreshTenantTelemetrySourceEligibility<T>(
     tenantId: string, requestId: string,
-  ): Promise<TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility | null> {
+    candidateAction?: (conn: PoolConnection, source: Omit<
+      TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentBody,
+      "scope" | "createdAtDbMs" | "grantReady"
+    >, nowMs: number) => Promise<T>,
+    artifactGroupSha256?: string,
+  ): Promise<TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility | T | null> {
     const unknown = TenantTelemetrySourceEligibility.UNKNOWN_TENANT_TELEMETRY_SOURCE_ELIGIBILITY;
     const conn = await this.pool.getConnection();
     try {
-      // This is a diagnostic transaction, not a grant. T3f's job is the first lock because
+      // This is a local source transaction, not a grant. T3f's job is the first lock because
       // its destructive writer takes that row first. The live T1/hold/restore projection and
       // all five telemetry source ranges are then held before deriving any affirmative result.
       // Unlike the older observational getter, this does not start an MVCC snapshot first and
@@ -24336,7 +24567,7 @@ export class MysqlSessionStore implements
       await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       await conn.beginTransaction();
       const t3fJob = await this.loadTenantDatabasePurgeJob(
-        conn, tenantId, requestId, "FOR SHARE",
+        conn, tenantId, requestId, candidateAction ? "FOR UPDATE" : "FOR SHARE",
       );
       if (!t3fJob) {
         const plan = await this.loadTenantPurgePlanJob(conn, tenantId, requestId, "FOR SHARE");
@@ -24455,6 +24686,26 @@ export class MysqlSessionStore implements
       } catch {
         throw new TenantErasureIntegrityError();
       }
+      if (candidateAction && result.status === "local_source_candidate") {
+        const target = catalog.entries.find((row) =>
+          row.artifactGroupSha256 === artifactGroupSha256);
+        if (!target || target.tenantId !== tenantId || !artifactGroupSha256) {
+          await conn.commit();
+          return null;
+        }
+        const actionResult = await candidateAction(conn, {
+          tenantId, requestId, subjectGeneration: planJob.subjectGeneration,
+          buildGeneration: planJob.buildGeneration, artifactGroupSha256,
+          catalogEntryReceiptSha256: target.receiptSha256,
+          catalogReceiptSha256: catalog.receipt.receiptSha256,
+          sourceAccountingReceiptSha256: source.receipt.receiptSha256,
+          targetManifestReceiptSha256: manifest.receipt.receiptSha256,
+          ownerClosureReceiptSha256: closureReceipt.receiptSha256,
+          databasePurgeReceiptSha256: t3fBundle.receipt.receiptSha256,
+        }, nowMs);
+        await conn.commit();
+        return actionResult;
+      }
       await conn.commit();
       return result;
     } catch (error) {
@@ -24463,6 +24714,231 @@ export class MysqlSessionStore implements
     } finally {
       conn.release();
     }
+  }
+
+  async getTenantTelemetrySourceEligibility(
+    tenantId: string, requestId: string,
+  ): Promise<TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility | null> {
+    return this.withFreshTenantTelemetrySourceEligibility<never>(tenantId, requestId);
+  }
+
+  private async loadTenantTelemetryPregrantIntent(
+    conn: PoolConnection, tenantId: string, requestId: string,
+    artifactGroupSha256: string, lock: "" | "FOR UPDATE" = "FOR UPDATE",
+  ): Promise<TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent | null> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT scope, tenant_id, request_id, subject_generation, build_generation,
+              artifact_group_sha256, catalog_entry_receipt_sha256,
+              catalog_receipt_sha256, source_accounting_receipt_sha256,
+              target_manifest_receipt_sha256, owner_closure_receipt_sha256,
+              database_purge_receipt_sha256, created_at_db_ms, grant_ready,
+              intent_sha256
+         FROM tenant_telemetry_pregrant_intents
+        WHERE tenant_id=? AND request_id=? AND artifact_group_sha256=? ${lock}`,
+      [tenantId, requestId, artifactGroupSha256],
+    );
+    if (!rows[0]) return null;
+    if (rows.length !== 1 || Number(rows[0].grant_ready) !== 0) {
+      throw new TenantErasureIntegrityError();
+    }
+    const row = rows[0];
+    const intent: TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent = {
+      scope: String(row.scope) as typeof TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_INTENT_SCOPE,
+      tenantId: String(row.tenant_id), requestId: String(row.request_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "pregrant subject generation"),
+      buildGeneration: storedSafeInteger(row.build_generation, "pregrant build generation"),
+      artifactGroupSha256: String(row.artifact_group_sha256),
+      catalogEntryReceiptSha256: String(row.catalog_entry_receipt_sha256),
+      catalogReceiptSha256: String(row.catalog_receipt_sha256),
+      sourceAccountingReceiptSha256: String(row.source_accounting_receipt_sha256),
+      targetManifestReceiptSha256: String(row.target_manifest_receipt_sha256),
+      ownerClosureReceiptSha256: String(row.owner_closure_receipt_sha256),
+      databasePurgeReceiptSha256: String(row.database_purge_receipt_sha256),
+      createdAtDbMs: storedSafeInteger(row.created_at_db_ms, "pregrant intent time"),
+      grantReady: false, intentSha256: String(row.intent_sha256),
+    };
+    try {
+      TenantTelemetryPregrantIntent.validateTenantTelemetryPregrantIntent(intent);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    if (intent.tenantId !== tenantId || intent.requestId !== requestId
+      || intent.artifactGroupSha256 !== artifactGroupSha256) {
+      throw new TenantErasureIntegrityError();
+    }
+    return intent;
+  }
+
+  private async loadTenantTelemetryPregrantClaims(
+    conn: PoolConnection, intent: TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent,
+    lock: "" | "FOR UPDATE" = "FOR UPDATE",
+  ): Promise<TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim[]> {
+    const [rows] = await conn.query<Row[]>(
+      `SELECT scope, tenant_id, request_id, intent_sha256, attempt,
+              claim_token_sha256, claimed_at_db_ms, lease_until_db_ms,
+              grant_ready, claim_sha256
+         FROM tenant_telemetry_pregrant_claims
+        WHERE tenant_id=? AND request_id=? AND intent_sha256=?
+        ORDER BY attempt ${lock}`,
+      [intent.tenantId, intent.requestId, intent.intentSha256],
+    );
+    return rows.map((row, index) => {
+      if (Number(row.grant_ready) !== 0) throw new TenantErasureIntegrityError();
+      const claim: TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim = {
+        scope: String(row.scope) as typeof TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_CLAIM_SCOPE,
+        tenantId: String(row.tenant_id), requestId: String(row.request_id),
+        intentSha256: String(row.intent_sha256),
+        attempt: storedSafeInteger(row.attempt, "pregrant claim attempt"),
+        claimTokenSha256: String(row.claim_token_sha256),
+        claimedAtDbMs: storedSafeInteger(row.claimed_at_db_ms, "pregrant claim time"),
+        leaseUntilDbMs: storedSafeInteger(row.lease_until_db_ms, "pregrant claim lease"),
+        grantReady: false, claimSha256: String(row.claim_sha256),
+      };
+      try {
+        TenantTelemetryPregrantIntent.validateTenantTelemetryPregrantClaim(claim);
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      if (claim.tenantId !== intent.tenantId || claim.requestId !== intent.requestId
+        || claim.intentSha256 !== intent.intentSha256 || claim.attempt !== index + 1) {
+        throw new TenantErasureIntegrityError();
+      }
+      return claim;
+    });
+  }
+
+  async prepareTenantTelemetryPregrantIntent(
+    tenantId: string, requestId: string, artifactGroupSha256: string,
+  ): Promise<TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent | null> {
+    if (!this.tenantTelemetryPregrantIntentSchemaInstalled) return null;
+    const outcome = await this.withFreshTenantTelemetrySourceEligibility<
+      TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent | null
+    >(tenantId, requestId, async (conn, source, nowMs) => {
+      const existing = await this.loadTenantTelemetryPregrantIntent(
+        conn, tenantId, requestId, artifactGroupSha256,
+      );
+      if (existing && existing.createdAtDbMs > nowMs) return null;
+      const body: TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentBody = {
+        scope: TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_INTENT_SCOPE,
+        ...source, createdAtDbMs: existing?.createdAtDbMs ?? nowMs, grantReady: false,
+      };
+      const intent: TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent = {
+        ...body, intentSha256: TenantTelemetryPregrantIntent
+          .tenantTelemetryPregrantIntentSha256(body),
+      };
+      if (existing) {
+        if (existing.intentSha256 !== intent.intentSha256) {
+          throw new TenantErasureIntegrityError();
+        }
+        return existing;
+      }
+      await conn.query(
+        `INSERT INTO tenant_telemetry_pregrant_intents
+           (scope, tenant_id, request_id, subject_generation, build_generation,
+            artifact_group_sha256, catalog_entry_receipt_sha256,
+            catalog_receipt_sha256, source_accounting_receipt_sha256,
+            target_manifest_receipt_sha256, owner_closure_receipt_sha256,
+            database_purge_receipt_sha256, created_at_db_ms, grant_ready,
+            intent_sha256)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)`,
+        [intent.scope, intent.tenantId, intent.requestId, intent.subjectGeneration,
+          intent.buildGeneration, intent.artifactGroupSha256,
+          intent.catalogEntryReceiptSha256, intent.catalogReceiptSha256,
+          intent.sourceAccountingReceiptSha256, intent.targetManifestReceiptSha256,
+          intent.ownerClosureReceiptSha256, intent.databasePurgeReceiptSha256,
+          intent.createdAtDbMs, intent.intentSha256],
+      );
+      return intent;
+    }, artifactGroupSha256);
+    return outcome && "intentSha256" in outcome ? outcome : null;
+  }
+
+  async getTenantTelemetryPregrantIntent(
+    tenantId: string, requestId: string, artifactGroupSha256: string,
+  ): Promise<TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent | null> {
+    if (!this.tenantTelemetryPregrantIntentSchemaInstalled) return null;
+    const outcome = await this.withFreshTenantTelemetrySourceEligibility<
+      TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntent | null
+    >(tenantId, requestId, async (conn, source, nowMs) => {
+      const intent = await this.loadTenantTelemetryPregrantIntent(
+        conn, tenantId, requestId, artifactGroupSha256,
+      );
+      if (!intent) return null;
+      if (intent.createdAtDbMs > nowMs) return null;
+      const body: TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentBody = {
+        scope: TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_INTENT_SCOPE,
+        ...source, createdAtDbMs: intent.createdAtDbMs, grantReady: false,
+      };
+      if (intent.intentSha256 !== TenantTelemetryPregrantIntent
+        .tenantTelemetryPregrantIntentSha256(body)) {
+        throw new TenantErasureIntegrityError();
+      }
+      return intent;
+    }, artifactGroupSha256);
+    return outcome && "intentSha256" in outcome ? outcome : null;
+  }
+
+  async claimTenantTelemetryPregrantIntent(
+    tenantId: string, requestId: string, artifactGroupSha256: string,
+    expectedIntentSha256: string, claimToken: string, leaseMs: number,
+  ): Promise<TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim | null> {
+    if (!this.tenantTelemetryPregrantIntentSchemaInstalled) return null;
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 60_000) {
+      throw new Error("invalid telemetry pregrant lease");
+    }
+    if (!/^[0-9a-f]{64}$/.test(expectedIntentSha256)) {
+      throw new Error("invalid telemetry pregrant intent version");
+    }
+    const tokenSha256 = TenantTelemetryPregrantIntent
+      .tenantTelemetryPregrantClaimTokenSha256(claimToken);
+    const outcome = await this.withFreshTenantTelemetrySourceEligibility<
+      TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim | null
+    >(tenantId, requestId, async (conn, source, nowMs) => {
+      const intent = await this.loadTenantTelemetryPregrantIntent(
+        conn, tenantId, requestId, artifactGroupSha256,
+      );
+      if (!intent) return null;
+      if (intent.createdAtDbMs > nowMs) return null;
+      if (intent.intentSha256 !== expectedIntentSha256) return null;
+      const intentBody: TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentBody = {
+        scope: TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_INTENT_SCOPE,
+        ...source, createdAtDbMs: intent.createdAtDbMs, grantReady: false,
+      };
+      if (intent.intentSha256 !== TenantTelemetryPregrantIntent
+        .tenantTelemetryPregrantIntentSha256(intentBody)) {
+        throw new TenantErasureIntegrityError();
+      }
+      const claims = await this.loadTenantTelemetryPregrantClaims(conn, intent);
+      const prior = claims.at(-1);
+      if (prior) {
+        if (prior.leaseUntilDbMs > nowMs) {
+          return prior.claimTokenSha256 === tokenSha256 ? prior : null;
+        }
+      }
+      if (claims.some((row) => row.claimTokenSha256 === tokenSha256)) return null;
+      const body: TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaimBody = {
+        scope: TenantTelemetryPregrantIntent.TENANT_TELEMETRY_PREGRANT_CLAIM_SCOPE,
+        tenantId, requestId, intentSha256: intent.intentSha256,
+        attempt: (prior?.attempt ?? 0) + 1,
+        claimTokenSha256: tokenSha256, claimedAtDbMs: nowMs,
+        leaseUntilDbMs: nowMs + leaseMs, grantReady: false,
+      };
+      const claim: TenantTelemetryPregrantIntent.TenantTelemetryPregrantClaim = {
+        ...body, claimSha256: TenantTelemetryPregrantIntent.tenantTelemetryPregrantClaimSha256(body),
+      };
+      await conn.query(
+        `INSERT INTO tenant_telemetry_pregrant_claims
+           (scope, tenant_id, request_id, intent_sha256, attempt,
+            claim_token_sha256, claimed_at_db_ms, lease_until_db_ms,
+            grant_ready, claim_sha256)
+         VALUES (?,?,?,?,?,?,?,?,0,?)`,
+        [claim.scope, claim.tenantId, claim.requestId, claim.intentSha256,
+          claim.attempt, claim.claimTokenSha256, claim.claimedAtDbMs,
+          claim.leaseUntilDbMs, claim.claimSha256],
+      );
+      return claim;
+    }, artifactGroupSha256);
+    return outcome && "claimSha256" in outcome ? outcome : null;
   }
 
   // ---------- tenant purge execution (T3e, local/CI destructive slice) ----------

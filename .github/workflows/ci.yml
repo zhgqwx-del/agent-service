@@ -524,10 +524,11 @@ jobs:
       # membership, 0038 -> 0039 T3f owner closure, 0039 -> 0040 T3d
       # source accounting, 0040 -> 0041 target manifest, and 0041 -> 0042 exact
       # per-artifact target catalog, then frozen 0042 -> code-only 0043 read
-      # compatibility all run against real MySQL.
+      # compatibility and 0042 -> 0044 default-dormant source-bound intent/claim
+      # all run against real MySQL.
       # Frozen 0038/0039/0040/0041 binaries produce genuine old terminal records before upgrade;
       # old-code startup must reject each new strict fingerprint.
-      - name: Historical MySQL migrations (0007 through 0042 + 0043 read compatibility, frozen terminals, no skips)
+      - name: Historical MySQL migrations (0007 through 0044 + 0043 read compatibility, frozen terminals, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -694,6 +695,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0040_tenant_telemetry_source_accounting.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0041_tenant_telemetry_target_manifest.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0042_tenant_telemetry_plan_artifact_target.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0044_tenant_telemetry_pregrant_intent.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.
