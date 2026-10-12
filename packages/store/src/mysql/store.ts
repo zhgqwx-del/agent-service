@@ -8172,6 +8172,13 @@ async function insertBillingUsageFact(conn: PoolConnection, fact: BillingUsageFa
   }
 }
 
+function isMysqlTransientLockError(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const { code, errno } = error as { code?: unknown; errno?: unknown };
+  return code === "ER_LOCK_DEADLOCK" || code === "ER_LOCK_WAIT_TIMEOUT"
+    || errno === 1213 || errno === 1205;
+}
+
 export interface MysqlStoreOptions {
   url: string;
   connectionLimit?: number;
@@ -18263,7 +18270,8 @@ export class MysqlSessionStore implements
         job.policyVersion,
         lock,
       );
-    } catch {
+    } catch (error) {
+      if (isMysqlTransientLockError(error)) throw error;
       throw new TenantErasureIntegrityError();
     }
     const deadline = policy === null
@@ -18816,6 +18824,7 @@ export class MysqlSessionStore implements
         contentRootSha256: tenantSessionContentRootSha256(content),
       };
     } catch (error) {
+      if (isMysqlTransientLockError(error)) throw error;
       if (error instanceof TenantErasureIntegrityError) throw error;
       throw new TenantContentInventoryEvidenceChangedError();
     }
@@ -19159,6 +19168,7 @@ export class MysqlSessionStore implements
         );
       }
     } catch (error) {
+      if (isMysqlTransientLockError(error)) throw error;
       if (error instanceof TenantErasureIntegrityError) throw error;
       throw new TenantErasureIntegrityError();
     }
@@ -19260,6 +19270,7 @@ export class MysqlSessionStore implements
         holdControlRootSha256: tenantContentInventoryHoldControlRootSha256(controls),
       };
     } catch (error) {
+      if (isMysqlTransientLockError(error)) throw error;
       if (error instanceof TenantContentInventoryNotReadyError) throw error;
       throw new TenantErasureIntegrityError();
     }
@@ -20736,6 +20747,7 @@ export class MysqlSessionStore implements
   private async validateTenantTelemetryPlanArtifactTargetReadProof(
     conn: PoolConnection, job: TenantPurgePlanJobRecord,
     planReceipt: TenantPurgePlanReceipt,
+    lockedSources?: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingInputs,
   ): Promise<{ entries: TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTarget[];
     receipt: TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetReceipt } | null> {
     if (!this.tenantTelemetryPlanArtifactTargetSchemaInstalled) return null;
@@ -20770,10 +20782,13 @@ export class MysqlSessionStore implements
         ),
         sourceEntries: source.entries, sourceReceipt: source.receipt,
         manifestEntries: manifest.entries, manifestReceipt: manifest.receipt,
-        sources: await this.loadTenantTelemetryObservedSourceRows(conn, job.tenantId),
+        sources: lockedSources ?? await this.loadTenantTelemetryObservedSourceRows(
+          conn, job.tenantId,
+        ),
         entries, receipt,
       });
-    } catch {
+    } catch (error) {
+      if (isMysqlTransientLockError(error)) throw error;
       throw new TenantErasureIntegrityError();
     }
     return { entries, receipt };
@@ -21197,6 +21212,7 @@ export class MysqlSessionStore implements
         sessionReceipts,
       };
     } catch (error) {
+      if (isMysqlTransientLockError(error)) throw error;
       if (error instanceof TenantPurgePlanEvidenceChangedError) throw error;
       if (error instanceof TenantContentInventoryEvidenceChangedError) {
         throw new TenantPurgePlanEvidenceChangedError();
@@ -22010,6 +22026,7 @@ export class MysqlSessionStore implements
         ) throw new Error("purge authority owner relation is invalid");
       }
     } catch (error) {
+      if (isMysqlTransientLockError(error)) throw error;
       if (error instanceof TenantErasureIntegrityError) throw error;
       throw new TenantErasureIntegrityError();
     }
@@ -24538,11 +24555,32 @@ export class MysqlSessionStore implements
       if (requireLiveSource) {
         const holdProof = await this.lockTenantPurgePlanHoldProof(conn, job.tenantId);
         await this.lockAndValidateTenantPurgePlanGlobalRelations(conn);
+        let telemetryTargets: { logs: TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[];
+          traces: TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[] } | undefined;
+        if (this.tenantTelemetryPlanArtifactTargetSchemaInstalled) {
+          // 0042 T3d sealed these roots from the locked five-source projection. Recompute the
+          // same source-valid tuples under fresh locks before T3e's live-plan comparison.
+          // A pre-0042 zero-target plan has no catalog and keeps its legacy zero projection;
+          // a new plan must validate its immutable catalog even when the target set is empty.
+          const projection = await this.readTenantTelemetrySourceProjection(conn);
+          const catalog = await this.validateTenantTelemetryPlanArtifactTargetReadProof(
+            conn, planJob, planReceipt, projection.sources,
+          );
+          if (catalog) {
+            telemetryTargets = TenantTelemetryPlanArtifactTarget
+              .projectTenantTelemetryPreplanTargets({ tenantId: job.tenantId,
+                sources: projection.sources,
+                liveOwnerOperations: await this.verifiedTenantTelemetryLiveOwnerOperations(
+                  conn, job.tenantId, projection.sources.memberships,
+                ) });
+          }
+        }
         const liveEntries = await this.validateTenantPurgePlanBuildState(
           conn,
           planJob,
           source,
           holdProof,
+          telemetryTargets,
         );
         if (
           liveEntries.length !== planEntries.length
@@ -24551,6 +24589,9 @@ export class MysqlSessionStore implements
       }
       return { planJob, planEntries, planReceipt };
     } catch (error) {
+      // Full-range source locks can contend with the telemetry writer. A deadlock or lock
+      // timeout is transient, never evidence that this T3e plan is permanently corrupt.
+      if (isMysqlTransientLockError(error)) throw error;
       if (
         error instanceof TenantPurgeExecutionNotReadyError
         || error instanceof TenantPurgeExecutionEvidenceChangedError

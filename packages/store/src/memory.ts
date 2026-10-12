@@ -14916,10 +14916,30 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const entries = this.tenantPurgePlanEntriesFor(job);
     const catalogSealed = job.phase === "plan_sealed"
       && this.tenantTelemetryPlanArtifactTargetReceipts.has(job.requestId);
+    let currentTelemetryTargets = telemetryTargets;
     if (catalogSealed) {
       const receipt = this.tenantPurgePlanReceipts.get(job.requestId);
       if (!receipt) throw new TenantErasureIntegrityError();
       this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
+      // A sealed 0042 catalog is immutable, but live T3e/T3f checks must also prove that
+      // its target root still matches the current five source sets and canonical owners.
+      // The older zero-target plan without a catalog keeps its pre-0042 root grammar.
+      try {
+        const liveSources = {
+          inventories: [...this.tenantTelemetryArtifactInventories.values()],
+          jobs: [...this.tenantTelemetryWriteJobs.values()],
+          acks: [...this.tenantTelemetryWriteAcks.values()],
+          memberships: [...this.tenantTelemetryArtifactMemberships.values()],
+          bindings: [...this.tenantTelemetryApplicationWriteBindings.values()],
+        };
+        currentTelemetryTargets = TenantTelemetryPlanArtifactTarget
+          .projectTenantTelemetryPreplanTargets({
+            tenantId: job.tenantId, sources: liveSources,
+            liveOwnerOperations: this.verifiedTenantTelemetryLiveOwnerOperations(job.tenantId),
+          });
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
     }
     if (
       entries.length !== job.planEntryCount
@@ -14930,15 +14950,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         !== job.blockerCount
       || entries.some((entry, index) => (
         entry.domain !== TENANT_PURGE_PLAN_DOMAINS[index]
-        || (!(catalogSealed && (entry.domain === "logs" || entry.domain === "traces"))
-          && entry.receiptSha256 !== this.memoryTenantPurgePlanEntry(
+        || entry.receiptSha256 !== this.memoryTenantPurgePlanEntry(
           job,
           entry.domain,
           entry.capturedAtDbMs,
           source,
           holdProof,
-          telemetryTargets,
-        ).receiptSha256)
+          currentTelemetryTargets,
+        ).receiptSha256
       ))
       || (entries.length === 0
         ? job.cursorDomain !== undefined
