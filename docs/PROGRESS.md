@@ -1045,4 +1045,5 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 ### 当前边界与下一步
 
 - 现有T3d `logs`/`traces`仍为`blocked_adapter_unconfigured`、零target；0036不会凭空产生grant或执行权。没有真实source-valid DB grant、外部物理marker验真、fresh journal head与0030/0031 restore run/epoch绑定、旧快照replay/startup gate、跨MySQL/S3端到端证明或受控activation/operator/worker。0036所有产品外部处置入口默认拒绝，不能说telemetry删除、恢复、retention或旧快照防复活已完成。下一切片0037必须先闭合这些authority，再考虑任何destructive gate。
+- 新发现的0037必修约束：已发布0036 grant trigger使用裸`SHA2(claim_token)`，TypeScript使用domain-separated claim hash；当前默认休眠路径不会发grant，但真实授权前必须用新migration轮换trigger/指纹，不能修改0036。非生产journal `authorizeDeletion`目前只接受caller evidence，外部事件没有可信DB grant绑定；必须升级为grant-bound v2协议，不能直接把夹具开放给产品。0037宜先闭合可信源与不可扩权grant，物理CAS/ACK saga及0030/0031旧快照恢复门禁应分切片，全部完成前保持产品mutation关闭。
 - 同机MinIO不能证明私有IAM/KMS、独立故障域、真实managed sink或容量/故障恢复；schema fingerprint仍不覆盖`DEFINER`、session`sql_mode`等特权元数据。滚动升级需彻底排空pre-0036 writer，并在真实staging测量control全范围锁、迁移和启动扫描的容量/延迟。真实provider/KMS、backup内tenant erasure/其它domain恢复、generic user物理purge及全域completion仍缺失，M1未冻结；M2保持冻结，M3/M4主体尚未开始。没有云资源可以继续本地/CI代码与协议开发，但不能把本地替身当作预发/生产验收。

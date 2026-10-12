@@ -351,7 +351,7 @@ scripts/local-service.sh down  # 停 router/runner及脚本拥有的MySQL/Redis/
 - S3模式下的`.local-run/tooling/minio`；
 - `~/.local/var` 下的数据目录。
 
-其它机器可用 `REDIS_BIN`、`REDIS_CLI`、`MYSQLD`、`MYSQL`、`MINIO_BIN`覆盖路径。`deploy/local/compose.yaml`启动MySQL、Redis和由固定官方源码构建的MinIO/bootstrap辅助容器，应用仍从宿主机启动；使用Compose或其它兼容实例时不要执行会再次调用`infra.sh`的`local-service.sh start`、`verify`或`verify-s3`，而应按第7节的两条源码命令启动应用，并直接运行下面的等价门禁。先显式创建`agent_service_test`与`agent_service_cluster`两个可丢弃数据库，并bootstrap普通`S3_TEST_BUCKET`、`S3_RESTORE_JOURNAL_TEST_BUCKET`和`S3_BACKUP_CATALOG_TEST_BUCKET`三个彼此不同的bucket；测试安全门会拒绝把业务库`agent_service`当删除/重建目标，缺失或复用任一restore/catalog bucket也必须fail closed。后续会为统一入口增加显式的外部基础设施模式。
+其它机器可用 `REDIS_BIN`、`REDIS_CLI`、`MYSQLD`、`MYSQL`、`MINIO_BIN`覆盖路径。`deploy/local/compose.yaml`启动MySQL、Redis和由固定官方源码构建的MinIO/bootstrap辅助容器，应用仍从宿主机启动；使用Compose或其它兼容实例时不要执行会再次调用`infra.sh`的`local-service.sh start`、`verify`或`verify-s3`，而应按第7节的两条源码命令启动应用，并直接运行下面的等价门禁。先显式创建`agent_service_test`与`agent_service_cluster`两个可丢弃数据库，并bootstrap普通`S3_TEST_BUCKET`、`S3_RESTORE_JOURNAL_TEST_BUCKET`、`S3_BACKUP_CATALOG_TEST_BUCKET`、`S3_TENANT_TELEMETRY_TEST_BUCKET`和`S3_TELEMETRY_DISPOSITION_TEST_BUCKET`五个彼此不同的bucket；测试安全门会拒绝把业务库`agent_service`当删除/重建目标，缺失对应测试bucket配置也会fail closed。外部模式下逐条运行S3命令前，操作者须核对这五个bucket确实各不相同；单条套件并不知道其它套件的全部bucket。即使彼此不同，同机bucket也只证明协议隔离，不是独立故障域。后续会为统一入口增加显式的外部基础设施模式。
 
 ```bash
 pnpm check:secrets
@@ -364,6 +364,8 @@ pnpm test:tenant-telemetry-application-capture
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-telemetry-application-capture-mysql
 pnpm test:tenant-telemetry-writer
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-telemetry-writer-mysql
+pnpm test:tenant-telemetry-disposition
+MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-telemetry-disposition-mysql
 mkdir -p .local-run
 AGENT_SERVICE_INTEGRATION=1 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" REDIS_TEST_URL="redis://127.0.0.1:6379/1" \
   pnpm vitest run --coverage --exclude 'test/cluster/**' \
@@ -392,6 +394,16 @@ env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
   S3_TEST_BUCKET="$S3_TEST_BUCKET" S3_BACKUP_CATALOG_TEST_BUCKET="$S3_BACKUP_CATALOG_TEST_BUCKET" \
   S3_TEST_ACCESS_KEY_ID="$S3_TEST_ACCESS_KEY_ID" S3_TEST_SECRET_ACCESS_KEY="$S3_TEST_SECRET_ACCESS_KEY" \
   S3_TEST_FORCE_PATH_STYLE="$S3_TEST_FORCE_PATH_STYLE" pnpm test:backup-catalog-s3
+# telemetry writer使用独立的第四个artifact bucket，不复用Blob、restore或catalog。
+env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
+  S3_TENANT_TELEMETRY_TEST_BUCKET="$S3_TENANT_TELEMETRY_TEST_BUCKET" \
+  S3_TEST_ACCESS_KEY_ID="$S3_TEST_ACCESS_KEY_ID" S3_TEST_SECRET_ACCESS_KEY="$S3_TEST_SECRET_ACCESS_KEY" \
+  S3_TEST_FORCE_PATH_STYLE="$S3_TEST_FORCE_PATH_STYLE" pnpm test:tenant-telemetry-writer-s3
+# 0036独立disposition journal使用第五个bucket；这仅是非生产协议夹具。
+env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
+  S3_TELEMETRY_DISPOSITION_TEST_BUCKET="$S3_TELEMETRY_DISPOSITION_TEST_BUCKET" \
+  S3_TEST_ACCESS_KEY_ID="$S3_TEST_ACCESS_KEY_ID" S3_TEST_SECRET_ACCESS_KEY="$S3_TEST_SECRET_ACCESS_KEY" \
+  S3_TEST_FORCE_PATH_STYLE="$S3_TEST_FORCE_PATH_STYLE" pnpm test:tenant-telemetry-disposition-s3
 env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
   S3_TEST_BUCKET="$S3_TEST_BUCKET" S3_BACKUP_CATALOG_TEST_BUCKET="$S3_BACKUP_CATALOG_TEST_BUCKET" \
   S3_TEST_ACCESS_KEY_ID="$S3_TEST_ACCESS_KEY_ID" S3_TEST_SECRET_ACCESS_KEY="$S3_TEST_SECRET_ACCESS_KEY" \
@@ -1357,7 +1369,7 @@ router拒绝raw restore-journal identity、endpoint与credential的配置边界�
 
 | 形态 | 实际内容 | 适用场景 |
 | --- | --- | --- |
-| 本地源码进程 | `tsx` 直接加载 `apps/*/src/main.ts` | 日常开发、调试、热重载 |
+| 本地源码进程 | `node --import tsx` 直接加载 `apps/*/src/main.ts` | 日常开发、调试；本节的直接启动和`local-service.sh start`不会自动热重载。包级`pnpm dev`使用`tsx watch`，但会整体加载`.env`，须先满足前述authority隔离要求 |
 | Node 应用 bundle | runner `main.js` + `blob-storage-migrate.js` + `restore-ledger-reconcile.js` + `backup-catalog.js`、router `main.js`，外加 production dependencies 与 migrations | 裸 Linux VM 上以两个长期进程运行；三个维护CLI只在受控维护时前台调用。仓库当前尚未生成完整发布归档/systemd 单元 |
 | Linux OCI 镜像 | Node 24 slim + 对应应用入口 + production dependencies + migrations；runner镜像额外包含三个one-shot CLI | staging/production 推荐交付物，可分别部署到不同 VM、容器平台或 Kubernetes workload |
 
