@@ -47,6 +47,7 @@ const requiredTestFiles = [
   "packages/store/test/tenant-telemetry-disposition.mysql.test.ts",
   "packages/store/test/tenant-telemetry-disposition-grant-v2-memory-fixture.test.ts",
   "packages/store/test/tenant-telemetry-grant-v2-s3-observer.unit.test.ts",
+  "packages/store/test/tenant-telemetry-artifact-observer.unit.test.ts",
   "packages/store/test/tenant-telemetry-disposition-grant.mysql.test.ts",
   "packages/store/test/lifecycle-outbox.mysql.test.ts",
   "packages/store/test/usage-lifecycle.mysql.test.ts",

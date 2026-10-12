@@ -30,6 +30,8 @@
     "test:tenant-telemetry-disposition-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-telemetry-disposition.mysql.test.ts",
     "test:tenant-telemetry-disposition-s3": "AGENT_SERVICE_TELEMETRY_DISPOSITION_S3_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-disposition-s3.minio.test.ts && AGENT_SERVICE_TELEMETRY_DISPOSITION_S3_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-grant-v2-s3-observer.minio.test.ts",
     "test:tenant-telemetry-disposition-grant": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-disposition-grant-v2-memory-fixture.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-grant-v2-s3-observer.unit.test.ts",
+    "test:tenant-telemetry-artifact-observer": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-artifact-observer.unit.test.ts",
+    "test:tenant-telemetry-artifact-observer-s3": "AGENT_SERVICE_TELEMETRY_DISPOSITION_S3_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-artifact-observer.minio.test.ts",
     "test:tenant-telemetry-disposition-grant-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-telemetry-disposition-grant.mysql.test.ts",
     "test:blob-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/blob-lifecycle.mysql.test.ts",
     "test:blob-storage-control-memory": "node scripts/run-required-suite.mjs packages/store/test/blob-storage-control.memory.test.ts",

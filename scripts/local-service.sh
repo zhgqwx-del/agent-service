@@ -759,6 +759,10 @@ verify_s3() {
   env "${s3_test_env[@]}" S3_TELEMETRY_DISPOSITION_TEST_BUCKET="$telemetry_disposition_bucket" \
     pnpm run test:tenant-telemetry-disposition-s3
   env "${s3_test_env[@]}" \
+    S3_TELEMETRY_DISPOSITION_TEST_BUCKET="$telemetry_disposition_bucket" \
+    S3_TENANT_TELEMETRY_TEST_BUCKET="$tenant_telemetry_bucket" \
+    pnpm run test:tenant-telemetry-artifact-observer-s3
+  env "${s3_test_env[@]}" \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-storage-migration-mysql-s3
   env "${s3_test_env[@]}" \

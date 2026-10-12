@@ -133,6 +133,9 @@ jobs:
       - name: Tenant telemetry disposition grant protocol suite (must execute)
         run: pnpm run test:tenant-telemetry-disposition-grant
 
+      - name: Tenant telemetry artifact GET-only observer unit suite (must execute)
+        run: pnpm run test:tenant-telemetry-artifact-observer
+
       - name: Create test databases
         run: |
           mysql -h 127.0.0.1 -uroot -e "
@@ -279,8 +282,8 @@ jobs:
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:tenant-telemetry-writer-s3
 
-      # The fifth logical bucket exercises v1 fixture CAS and the v2 observer's real
-      # GET-only sealed-chain path as separate required, no-skip files.
+      # The fifth logical bucket exercises v1 fixture CAS, the v2 journal observer, and
+      # the 0046 artifact observer under separate random prefixes and required no-skip files.
       # Same-host MinIO does not prove a production fault domain or a DB grant.
       - name: Tenant telemetry disposition S3 and v2 read-only observer real MinIO suites (must execute)
         env:
@@ -292,6 +295,20 @@ jobs:
           S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:tenant-telemetry-disposition-s3
+
+      # Read real writer bytes in the fourth bucket, and fixture markers in the fifth;
+      # both use separate random prefixes and the observer itself issues GET only.
+      - name: Tenant telemetry artifact GET-only observer real MinIO suite (must execute)
+        env:
+          AGENT_SERVICE_TELEMETRY_DISPOSITION_S3_INTEGRATION: "1"
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_TELEMETRY_DISPOSITION_TEST_BUCKET: agent-service-ci-telemetry-disposition
+          S3_TENANT_TELEMETRY_TEST_BUCKET: agent-service-ci-tenant-telemetry
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: pnpm run test:tenant-telemetry-artifact-observer-s3
 
       # Exercise the actual one-shot CLI across both durability systems. The fixture creates a
       # random disposable database and S3 prefix, proves paged/exact replay and complete external
