@@ -50,6 +50,7 @@ import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture
 interface CredentialRolloutClock {
   advance(): void;
   release(): void;
+  regress(toMs: number): void;
 }
 
 const credentialRolloutClocks = new WeakMap<MemorySessionStore, CredentialRolloutClock>();
@@ -69,6 +70,7 @@ function memoryStoreWithCredentialRolloutClock(
   credentialRolloutClocks.set(store, {
     advance: () => { floorMs += 1; },
     release: () => { released = true; },
+    regress: (toMs) => { floorMs = toMs; released = true; },
   });
   return store;
 }
@@ -325,10 +327,14 @@ async function advanceThroughT3c(
   };
 }
 
-async function prepareBoundTelemetryCatalogFixture(artifactCount: number) {
+async function prepareBoundTelemetryCatalogFixture(
+  artifactCount: number,
+  ownerKind: "tenant" | "session" = "tenant",
+) {
   const nowMs = 7_700;
   const refKey = new Uint8Array(32).fill(41);
-  const store = memoryStoreWithCredentialRolloutClock({ now: () => nowMs }, refKey);
+  const wallClock = { nowMs };
+  const store = memoryStoreWithCredentialRolloutClock({ now: () => wallClock.nowMs }, refKey);
   await store.activateTenantTelemetryLifecycle({
     expectedControlGeneration: 0,
     targets: [
@@ -356,19 +362,25 @@ async function prepareBoundTelemetryCatalogFixture(artifactCount: number) {
     producerReadyAck: TENANT_TELEMETRY_APPLICATION_PRODUCER_READY_ACK,
   });
   const tenantId = `tenant-plan-catalog-${randomUUID()}`;
+  const ownedSession = ownerKind === "session" ? {
+    ...mkSession(tenantId, `user-catalog-${randomUUID()}`),
+    createdAtMs: nowMs - 10, updatedAtMs: nowMs - 10,
+  } : null;
   const source = await advanceThroughT3c(store, tenantId, {
     beforeTenantErasure: async () => {
+      if (ownedSession) await store.createSession(ownedSession);
       for (let index = 0; index < artifactCount; index += 1) {
         await store.enqueueTenantTelemetryArtifact({
           tenantId, expectedControlGeneration: 1, domain: "logs",
           artifactIdSha256: (index + 1).toString(16).repeat(64), artifactGeneration: 1,
-          ownerKind: "tenant", ownerId: tenantId, ownerUserId: null,
+          ownerKind, ownerId: ownedSession?.id ?? tenantId,
+          ownerUserId: ownedSession?.userId ?? null,
           sourceSchema: "structured-log-batch-v1", sourceGeneration: 1,
           sourceHighWaterDbMs: nowMs - 2, producerProtocol, producerContractSha256,
           payload: { schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, domain: "logs",
             records: [trustedRunnerTelemetryRecord(nowMs - 2, {
-              opaqueRefKey: refKey, tenantValue: tenantId, ownerKind: "tenant",
-              ownerValue: tenantId, attempt: index + 1,
+              opaqueRefKey: refKey, tenantValue: tenantId, ownerKind,
+              ownerValue: ownedSession?.id ?? tenantId, attempt: index + 1,
             })] },
         });
         const [claim] = await store.claimTenantTelemetryWriteJobs({
@@ -404,7 +416,44 @@ async function prepareBoundTelemetryCatalogFixture(artifactCount: number) {
     limit: 1, leaseMs: 120_000, claimToken: "catalog-plan-claim",
   });
   if (!claim) throw new Error("missing catalog plan claim");
-  return { store, source, claim, tenantId };
+  return { store, source, claim, tenantId, wallClock, ownedSession };
+}
+
+async function advanceBoundTelemetryCatalogThroughT3f(
+  fixture: Awaited<ReturnType<typeof prepareBoundTelemetryCatalogFixture>>,
+): Promise<void> {
+  const { store, source, claim } = fixture;
+  expect(await store.getTenantPurgePlanReceipt(
+    fixture.tenantId, source.request.requestId,
+  )).not.toBeNull();
+  expect(await store.materializeTenantPurgeExecutionJobs({ limit: 1 })).toBe(1);
+  const [executionClaim] = await store.claimTenantPurgeExecutions({
+    limit: 1, leaseMs: 120_000, claimToken: "catalog-execution-claim",
+  });
+  if (!executionClaim) throw new Error("missing catalog execution claim");
+  const executionAuthorization = {
+    requestId: executionClaim.requestId, tenantId: executionClaim.tenantId,
+    subjectGeneration: executionClaim.subjectGeneration,
+    planBuildGeneration: executionClaim.planBuildGeneration,
+    executionGeneration: executionClaim.executionGeneration,
+    claimAttempt: executionClaim.claimAttempt, claimToken: executionClaim.claimToken,
+  };
+  expect(await store.executeTenantPurgeLocalCutover(executionAuthorization)).not.toBeNull();
+  expect(await store.sealTenantPurgeLocalPhysicalAcks(executionAuthorization)).not.toBeNull();
+  expect(await store.materializeTenantDatabasePurgeJobs({ limit: 1 })).toBe(1);
+  const [databaseClaim] = await store.claimTenantDatabasePurges({
+    limit: 1, leaseMs: 120_000, claimToken: "catalog-database-claim",
+  });
+  if (!databaseClaim) throw new Error("missing catalog database claim");
+  expect(databaseClaim.requestId).toBe(source.request.requestId);
+  expect(await store.executeTenantDatabasePurge({
+    requestId: databaseClaim.requestId, tenantId: databaseClaim.tenantId,
+    subjectGeneration: databaseClaim.subjectGeneration,
+    planBuildGeneration: databaseClaim.planBuildGeneration,
+    executionGeneration: databaseClaim.executionGeneration,
+    databasePurgeGeneration: databaseClaim.databasePurgeGeneration,
+    claimAttempt: databaseClaim.claimAttempt, claimToken: databaseClaim.claimToken,
+  })).not.toBeNull();
 }
 
 async function prepareUserPurgeTarget(
@@ -528,6 +577,127 @@ class FailOnceMap<K, V> extends Map<K, V> {
 }
 
 describe("MemorySessionStore tenant purge plan", () => {
+  for (const artifactCount of [0, 1]) {
+    it(`keeps the ${artifactCount}-artifact local telemetry source candidate read-only and T3f-bound`, async () => {
+      const fixture = await prepareBoundTelemetryCatalogFixture(artifactCount);
+      const { store, source, claim, tenantId } = fixture;
+      const requestId = source.request.requestId;
+      expect(await store.sealTenantPurgePlan(planAuthorization(claim))).not.toBeNull();
+      expect(await store.getTenantTelemetrySourceEligibility(
+        tenantId, requestId,
+      )).toEqual({
+        status: "unknown", managedArtifactCount: null,
+        executionReady: false, externalAuthorityVerified: false,
+      });
+      expect(await store.getTenantTelemetrySourceEligibility(
+        "neighbor-tenant", requestId,
+      )).toBeNull();
+
+      await advanceBoundTelemetryCatalogThroughT3f(fixture);
+      const eligibility = await store.getTenantTelemetrySourceEligibility(tenantId, requestId);
+      expect(eligibility).toEqual({
+        status: "local_source_candidate", managedArtifactCount: artifactCount,
+        executionReady: false, externalAuthorityVerified: false,
+      });
+      expect(await store.getTenantTelemetrySourceEligibility(
+        "neighbor-tenant", requestId,
+      )).toBeNull();
+      expect(store.tenantTelemetryDispositionAuthorizationGrants).toHaveLength(0);
+      expect(JSON.stringify(eligibility)).not.toContain(tenantId);
+    });
+  }
+
+  it("binds a session-owned managed artifact to the T3f closure and permanent grave", async () => {
+    const fixture = await prepareBoundTelemetryCatalogFixture(1, "session");
+    const { store, source, claim, tenantId, ownedSession } = fixture;
+    if (!ownedSession) throw new Error("expected session-scoped fixture");
+    const requestId = source.request.requestId;
+    await store.sealTenantPurgePlan(planAuthorization(claim));
+    await advanceBoundTelemetryCatalogThroughT3f(fixture);
+    expect(store.sessions.has(ownedSession.id)).toBe(false);
+    const grave = await store.getTenantPurgeSessionGraveMarker(tenantId, ownedSession.id);
+    const closure = await store.getTenantTelemetryOwnerClosureEntries(tenantId, requestId);
+    expect(closure).toHaveLength(1);
+    expect(closure[0]).toMatchObject({
+      ownerKind: "session", sessionGraveMarkerSha256: grave?.markerSha256,
+    });
+    expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .toEqual({ status: "local_source_candidate", managedArtifactCount: 1,
+        executionReady: false, externalAuthorityVerified: false });
+  });
+
+  it("treats missing 0042 evidence as unknown, including a privileged zero-catalog receipt loss", async () => {
+    const fixture = await prepareBoundTelemetryCatalogFixture(0);
+    const { store, source, claim, tenantId } = fixture;
+    const requestId = source.request.requestId;
+    await store.sealTenantPurgePlan(planAuthorization(claim));
+    await advanceBoundTelemetryCatalogThroughT3f(fixture);
+    expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .toMatchObject({ status: "local_source_candidate", managedArtifactCount: 0 });
+    const catalog = store.tenantTelemetryPlanArtifactTargetReceipts.get(requestId)!;
+    store.tenantTelemetryPlanArtifactTargetReceipts.delete(requestId);
+    expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .toEqual({ status: "unknown", managedArtifactCount: null,
+        executionReady: false, externalAuthorityVerified: false });
+    store.tenantTelemetryPlanArtifactTargetReceipts.set(requestId, catalog);
+    expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .toMatchObject({ status: "local_source_candidate", managedArtifactCount: 0 });
+  });
+
+  it("fails closed when a post-T3f catalog target or retained telemetry source drifts", async () => {
+    const fixture = await prepareBoundTelemetryCatalogFixture(1);
+    const { store, source, claim, tenantId } = fixture;
+    const requestId = source.request.requestId;
+    await store.sealTenantPurgePlan(planAuthorization(claim));
+    await advanceBoundTelemetryCatalogThroughT3f(fixture);
+    const [targetKey, target] = [...store.tenantTelemetryPlanArtifactTargets.entries()]
+      .find(([, row]) => row.requestId === requestId)!;
+    store.tenantTelemetryPlanArtifactTargets.set(targetKey, {
+      ...target, ownerRefSha256: "f".repeat(64),
+    });
+    await expect(store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    store.tenantTelemetryPlanArtifactTargets.set(targetKey, target);
+
+    const [jobKey, job] = [...store.tenantTelemetryWriteJobs.entries()]
+      .find(([, row]) => row.tenantId === tenantId)!;
+    store.tenantTelemetryWriteJobs.set(jobKey, { ...job, recordCount: job.recordCount + 1 });
+    await expect(store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    store.tenantTelemetryWriteJobs.set(jobKey, job);
+    expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .toMatchObject({ status: "local_source_candidate", managedArtifactCount: 1 });
+  });
+
+  it("downgrades the post-T3f candidate when the trusted clock regresses", async () => {
+    const fixture = await prepareBoundTelemetryCatalogFixture(0);
+    const { store, source, claim, tenantId, wallClock } = fixture;
+    const requestId = source.request.requestId;
+    await store.sealTenantPurgePlan(planAuthorization(claim));
+    await advanceBoundTelemetryCatalogThroughT3f(fixture);
+    expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .toMatchObject({ status: "local_source_candidate" });
+
+    wallClock.nowMs = 0;
+    credentialRolloutClock(store).regress(0);
+    expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .toMatchObject({ status: "unknown", executionReady: false });
+    wallClock.nowMs = 7_700;
+    expect(await store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .toMatchObject({ status: "local_source_candidate", executionReady: false });
+  });
+
+  it("rejects malformed restore lineage instead of treating it as an inactive clean source", async () => {
+    const fixture = await prepareBoundTelemetryCatalogFixture(0);
+    const { store, source, claim, tenantId } = fixture;
+    const requestId = source.request.requestId;
+    await store.sealTenantPurgePlan(planAuthorization(claim));
+    await advanceBoundTelemetryCatalogThroughT3f(fixture);
+    store.tenantRestoreRuntimeControls.clear();
+    await expect(store.getTenantTelemetrySourceEligibility(tenantId, requestId))
+      .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+  });
+
   for (const artifactCount of [0, 1, 3]) {
     it(`seals an exact ${artifactCount}-artifact telemetry target catalog without enabling execution`, async () => {
       const { store, source, claim, tenantId } =

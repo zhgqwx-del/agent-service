@@ -255,6 +255,7 @@ import * as TenantTelemetryOwnerClosure from "../tenant-telemetry-owner-closure.
 import * as TenantTelemetrySourceAccounting from "../tenant-telemetry-source-accounting.js";
 import * as TenantTelemetryTargetManifest from "../tenant-telemetry-target-manifest.js";
 import * as TenantTelemetryPlanArtifactTarget from "../tenant-telemetry-plan-artifact-target.js";
+import * as TenantTelemetrySourceEligibility from "../tenant-telemetry-source-eligibility.js";
 import * as TenantTelemetryDisposition from "../tenant-telemetry-disposition.js";
 import * as BackupCatalog from "../backup-catalog.js";
 import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
@@ -8259,6 +8260,7 @@ export class MysqlSessionStore implements
   TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore,
   TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore,
   TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore,
+  TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore,
   TenantTelemetryWriter.TenantTelemetryWriterStore,
   TenantTelemetryDisposition.TenantTelemetryDispositionStore,
   BackupCatalog.TenantBackupCatalogStore,
@@ -24318,6 +24320,149 @@ export class MysqlSessionStore implements
         throw new TenantErasureIntegrityError();
       }
     });
+  }
+
+  async getTenantTelemetrySourceEligibility(
+    tenantId: string, requestId: string,
+  ): Promise<TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility | null> {
+    const unknown = TenantTelemetrySourceEligibility.UNKNOWN_TENANT_TELEMETRY_SOURCE_ELIGIBILITY;
+    const conn = await this.pool.getConnection();
+    try {
+      // This is a diagnostic transaction, not a grant. T3f's job is the first lock because
+      // its destructive writer takes that row first. The live T1/hold/restore projection and
+      // all five telemetry source ranges are then held before deriving any affirmative result.
+      // Unlike the older observational getter, this does not start an MVCC snapshot first and
+      // then treat later FOR SHARE reads as though they belonged to that snapshot.
+      await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.beginTransaction();
+      const t3fJob = await this.loadTenantDatabasePurgeJob(
+        conn, tenantId, requestId, "FOR SHARE",
+      );
+      if (!t3fJob) {
+        const plan = await this.loadTenantPurgePlanJob(conn, tenantId, requestId, "FOR SHARE");
+        await conn.commit();
+        return plan ? unknown : null;
+      }
+      if (t3fJob.phase !== "database_purged") {
+        await conn.commit();
+        return unknown;
+      }
+      const contentJob = await this.loadTenantContentInventoryJob(
+        conn, tenantId, requestId, "FOR SHARE",
+      );
+      if (!contentJob || contentJob.phase !== "inventory_sealed") {
+        throw new TenantErasureIntegrityError();
+      }
+      await this.lockAndValidateTenantContentInventoryCurrentSource(conn, contentJob);
+      try {
+        await this.lockTenantPurgePlanHoldProof(conn, tenantId);
+      } catch (error) {
+        if (error instanceof TenantPurgePlanNotReadyError
+          && error.reason === "active_legal_hold") {
+          await conn.commit();
+          return unknown;
+        }
+        throw error;
+      }
+      const restore = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      if (restore.control.state !== "inactive") {
+        // The local projection cannot prove a fresh external authority head after restore.
+        await conn.commit();
+        return unknown;
+      }
+      const lockedProjection = await this.readTenantTelemetrySourceProjection(conn);
+      const planJob = await this.loadTenantPurgePlanJob(
+        conn, tenantId, requestId, "FOR SHARE",
+      );
+      if (!planJob || planJob.phase !== "plan_sealed") {
+        throw new TenantErasureIntegrityError();
+      }
+      const { receipt: planReceipt } = await this.validateTenantPurgePlanReadProof(conn, planJob);
+      if (!planReceipt) throw new TenantErasureIntegrityError();
+      const t3fBundle = await this.validateTenantDatabasePurgeReadProof(conn, t3fJob);
+      if (!t3fBundle) throw new TenantErasureIntegrityError();
+      const source = await this.validateTenantTelemetrySourceAccountingReadProof(
+        conn, planJob, planReceipt,
+      );
+      const manifest = await this.validateTenantTelemetryTargetManifestReadProof(
+        conn, planJob, planReceipt,
+      );
+      const catalog = await this.validateTenantTelemetryPlanArtifactTargetReadProof(
+        conn, planJob, planReceipt, lockedProjection.sources,
+      );
+      const closureReceipt = await this.loadTenantTelemetryOwnerClosureReceipt(
+        conn, tenantId, requestId, "FOR SHARE",
+      );
+      const closureEntries = await this.loadTenantTelemetryOwnerClosureEntries(
+        conn, tenantId, requestId, "FOR SHARE",
+      );
+      if (!source || !manifest || !catalog || !closureReceipt) {
+        if (!closureReceipt && closureEntries.length !== 0) {
+          throw new TenantErasureIntegrityError();
+        }
+        await conn.commit();
+        return unknown;
+      }
+      const t1 = await this.validateTenantContentInventoryImmutableSource(
+        conn, contentJob, "FOR SHARE",
+      );
+      const lifecycleControl = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
+      if (lifecycleControl.state !== "active") {
+        await conn.commit();
+        return unknown;
+      }
+      this.assertTenantTelemetryActivationReceiptBindings(
+        lifecycleControl,
+        await this.readTenantTelemetryLifecycleTargets(conn, "FOR SHARE"),
+        await this.readTenantTelemetryActivationReceipt(conn, "FOR SHARE"),
+        tenantTelemetryRefKeyIdSha256(this.requireTenantTelemetryRefKey()),
+      );
+      if (!await this.assertTenantTelemetryLifecycleSubjectForAdmission(
+        conn, t1.admission, t1.fence, "FOR SHARE",
+      )) {
+        await conn.commit();
+        return unknown;
+      }
+      const nowMs = await this.databaseNow(conn);
+      if (nowMs < Math.max(
+        planJob.purgeNotBeforeDbMs, planReceipt.storeDbTimestampMs,
+        source.receipt.storeDbTimestampMs, catalog.receipt.storeDbTimestampMs,
+        closureReceipt.storeDbTimestampMs, t3fBundle.receipt.storeDbTimestampMs,
+        lockedProjection.capturedAtDbMs,
+      )) {
+        await conn.commit();
+        return unknown;
+      }
+      let result: TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility;
+      try {
+        TenantTelemetryTargetManifest.validateTenantTelemetryObservedTargetRelations(
+          manifest.entries, lockedProjection.sources,
+        );
+        const readiness = TenantTelemetryTargetManifest
+          .verifyTenantTelemetryTargetSourceReadiness({
+            job: planJob, planReceipt, sourceEntries: source.entries,
+            sourceReceipt: source.receipt, entries: manifest.entries,
+            receipt: manifest.receipt, closureReceipt, closureEntries,
+            graveMarkerSha256s: new Set(t3fBundle.graveMarkers.map(
+              (marker) => marker.markerSha256,
+            )),
+            t3fReceiptSha256: t3fBundle.receipt.receiptSha256,
+          });
+        result = TenantTelemetrySourceEligibility
+          .evaluateTenantTelemetryLocalSourceEligibility({
+            readiness, catalog, closureEntries, currentLocalSourceVerified: true,
+          });
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      await conn.commit();
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
   }
 
   // ---------- tenant purge execution (T3e, local/CI destructive slice) ----------

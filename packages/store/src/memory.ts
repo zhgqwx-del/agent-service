@@ -844,6 +844,7 @@ import * as TenantTelemetryOwnerClosure from "./tenant-telemetry-owner-closure.j
 import * as TenantTelemetrySourceAccounting from "./tenant-telemetry-source-accounting.js";
 import * as TenantTelemetryTargetManifest from "./tenant-telemetry-target-manifest.js";
 import * as TenantTelemetryPlanArtifactTarget from "./tenant-telemetry-plan-artifact-target.js";
+import * as TenantTelemetrySourceEligibility from "./tenant-telemetry-source-eligibility.js";
 import * as TenantTelemetryDisposition from "./tenant-telemetry-disposition.js";
 
 interface MemoryUserDataExportJob {
@@ -1151,7 +1152,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -15885,6 +15886,93 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         receipt: manifestReceipt, closureReceipt, closureEntries,
         graveMarkerSha256s: graves,
         t3fReceiptSha256: t3fReceipt?.receiptSha256 ?? null,
+      });
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+  }
+
+  async getTenantTelemetrySourceEligibility(
+    tenantId: string, requestId: string,
+  ): Promise<TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibility | null> {
+    // Deliberately no await: all Memory evidence and current gates are read in one synchronous
+    // boundary. A pending T3f or any historical sidecar absence remains unknown.
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) return null;
+    const unknown = TenantTelemetrySourceEligibility.UNKNOWN_TENANT_TELEMETRY_SOURCE_ELIGIBILITY;
+    const t3fJob = this.tenantDatabasePurgeJobs.get(requestId);
+    if (job.phase !== "plan_sealed" || !t3fJob || t3fJob.tenantId !== tenantId
+      || t3fJob.phase !== "database_purged") return unknown;
+
+    this.assertTenantDatabasePurgeGlobalRelations();
+    const bundle = this.tenantDatabasePurgeBundle(t3fJob);
+    const planReceipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!planReceipt) throw new TenantErasureIntegrityError();
+    this.assertTenantPurgePlanSource(job, false);
+    try {
+      validateTenantPurgePlanCompletionProof(job, this.tenantPurgePlanEntriesFor(job), planReceipt);
+    } catch {
+      throw new TenantErasureIntegrityError();
+    }
+    this.validateTenantTelemetrySourceAccountingForPlan(job, planReceipt);
+    this.validateTenantTelemetryTargetManifestForPlan(job, planReceipt);
+    this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, planReceipt);
+    const sourceReceipt = this.tenantTelemetrySourceAccountingReceipts.get(requestId);
+    const manifestReceipt = this.tenantTelemetryTargetManifestReceipts.get(requestId);
+    const catalogReceipt = this.tenantTelemetryPlanArtifactTargetReceipts.get(requestId);
+    const closureReceipt = this.tenantTelemetryOwnerClosureReceipts.get(requestId);
+    if (!sourceReceipt || !manifestReceipt || !catalogReceipt || !closureReceipt) return unknown;
+
+    const contentJob = this.tenantContentInventoryJobs.get(requestId);
+    const admission = this.tenantErasureAdmissions.get(requestId);
+    if (!contentJob || !admission) throw new TenantErasureIntegrityError();
+    this.assertTenantContentInventorySource(contentJob, true);
+    try {
+      this.tenantPurgePlanHoldProof(tenantId);
+    } catch (error) {
+      if (error instanceof TenantPurgePlanNotReadyError
+        && error.reason === "active_legal_hold") return unknown;
+      throw error;
+    }
+    this.assertTenantRestoreJournalGlobalRelations();
+    this.assertTenantRestoreReplayGlobalRelations();
+    const restore = this.readTenantRestoreRuntimeControl();
+    if (restore.state !== "inactive") return unknown;
+    this.assertTenantTelemetryLifecycleGlobalRelations();
+    if (!this.tenantTelemetryLifecycleSubjectForAdmission(
+      admission, this.tenantCredentialRevocationFences.get(tenantId),
+    )) return unknown;
+    const nowMs = this.storeClock.now();
+    if (!Number.isSafeInteger(nowMs) || nowMs < Math.max(
+      job.purgeNotBeforeDbMs, planReceipt.storeDbTimestampMs,
+      sourceReceipt.storeDbTimestampMs, catalogReceipt.storeDbTimestampMs,
+      closureReceipt.storeDbTimestampMs, bundle.receipt.storeDbTimestampMs,
+    )) return unknown;
+
+    const manifestEntries = this.tenantTelemetryTargetManifestEntriesFor(requestId);
+    try {
+      TenantTelemetryTargetManifest.validateTenantTelemetryObservedTargetRelations(
+        manifestEntries,
+        { inventories: [...this.tenantTelemetryArtifactInventories.values()],
+          jobs: [...this.tenantTelemetryWriteJobs.values()],
+          acks: [...this.tenantTelemetryWriteAcks.values()],
+          memberships: [...this.tenantTelemetryArtifactMemberships.values()],
+          bindings: [...this.tenantTelemetryApplicationWriteBindings.values()] },
+      );
+      const closureEntries = this.tenantTelemetryOwnerClosureEntriesFor(requestId);
+      const readiness = TenantTelemetryTargetManifest.verifyTenantTelemetryTargetSourceReadiness({
+        job, planReceipt, sourceEntries: this.tenantTelemetrySourceAccountingEntriesFor(requestId),
+        sourceReceipt, entries: manifestEntries, receipt: manifestReceipt,
+        closureReceipt, closureEntries,
+        graveMarkerSha256s: new Set(bundle.graveMarkers.map((marker) => marker.markerSha256)),
+        t3fReceiptSha256: bundle.receipt.receiptSha256,
+      });
+      return TenantTelemetrySourceEligibility.evaluateTenantTelemetryLocalSourceEligibility({
+        readiness,
+        catalog: { entries: this.tenantTelemetryPlanArtifactTargetsFor(requestId),
+          receipt: catalogReceipt },
+        closureEntries,
+        currentLocalSourceVerified: true,
       });
     } catch {
       throw new TenantErasureIntegrityError();
