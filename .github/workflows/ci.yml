@@ -43,7 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # frozen 0039 binary migration fixture archives an exact historical commit
+          # Frozen 0038 and 0039 binary fixtures archive exact published commits.
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 12.5.1
@@ -520,9 +521,10 @@ jobs:
       # 0031 -> 0032 default-dormant telemetry inventory, 0032 -> 0033 receipt/inventory
       # activation, 0033 -> 0034 durable writer, 0034 -> 0035 application-capture
       # 0035 -> 0036 dormant disposition, 0036 -> 0037 grant guard, 0037 -> 0038
-      # membership, 0038 -> 0039 T3f owner closure, and 0039 -> 0040 T3d
-      # source accounting all run against real MySQL.
-      - name: Historical MySQL migrations (0007 through 0040, no skips)
+      # membership, 0038 -> 0039 T3f owner closure, and 0039 -> 0040 T3d source accounting
+      # all run against real MySQL. Frozen 0038/0039 binaries also produce genuine old terminal
+      # records before upgrade, and old-code startup must reject each new strict fingerprint.
+      - name: Historical MySQL migrations (0007 through 0040, frozen terminals, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
