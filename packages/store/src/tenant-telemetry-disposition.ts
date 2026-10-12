@@ -8,6 +8,8 @@ export const TENANT_TELEMETRY_DISPOSITION_PROTOCOL =
   "tenant-telemetry-disposition-v1" as const;
 export const TENANT_TELEMETRY_DISPOSITION_JOB_SCOPE =
   "tenant-telemetry-disposition-job-v1" as const;
+export const TENANT_TELEMETRY_DISPOSITION_AUTHORIZATION_GRANT_SCOPE =
+  "tenant-telemetry-disposition-authorization-grant-v1" as const;
 export const TENANT_TELEMETRY_EXTERNAL_AUTHORIZATION_SCOPE =
   "tenant-telemetry-external-delete-authorization-v1" as const;
 export const TENANT_TELEMETRY_SAME_KEY_TOMBSTONE_ACK_SCOPE =
@@ -1399,6 +1401,88 @@ export function validateTenantTelemetryDispositionAuthorization(
   tenantTelemetryDispositionClaimTokenSha256(authorization.claimToken);
 }
 
+/**
+ * An exact, single managed-artifact grant, never whole-domain erasure authority.
+ * It can only be issued from a live store claim after revalidating the canonical
+ * 0033 inventory, 0034 ACK, 0035 binding and T3c/T3d source. In particular the
+ * current zero-target logs/traces T3d blocker cannot produce one.
+ */
+export interface TenantTelemetryDispositionAuthorizationGrantBody
+  extends TenantTelemetryDispositionEvidence {
+  scope: typeof TENANT_TELEMETRY_DISPOSITION_AUTHORIZATION_GRANT_SCOPE;
+  protocol: typeof TENANT_TELEMETRY_DISPOSITION_PROTOCOL;
+  tenantId: string;
+  requestId: string;
+  claimAttempt: number;
+  claimTokenSha256: string;
+  grantedAtDbMs: number;
+  leaseUntilDbMs: number;
+}
+
+export interface TenantTelemetryDispositionAuthorizationGrant
+  extends TenantTelemetryDispositionAuthorizationGrantBody {
+  grantReceiptSha256: string;
+}
+
+const AUTHORIZATION_GRANT_BODY_KEYS = [
+  "scope",
+  "protocol",
+  "tenantId",
+  "requestId",
+  ...DISPOSITION_EVIDENCE_KEYS,
+  "claimAttempt",
+  "claimTokenSha256",
+  "grantedAtDbMs",
+  "leaseUntilDbMs",
+] as const;
+
+export function tenantTelemetryDispositionAuthorizationGrantSha256(
+  grant: TenantTelemetryDispositionAuthorizationGrantBody,
+): string {
+  exactKeys(grant, AUTHORIZATION_GRANT_BODY_KEYS,
+    "tenant telemetry disposition authorization grant body");
+  if (grant.scope !== TENANT_TELEMETRY_DISPOSITION_AUTHORIZATION_GRANT_SCOPE
+    || grant.protocol !== TENANT_TELEMETRY_DISPOSITION_PROTOCOL
+    || !validTenantId(grant.tenantId)
+    || !REQUEST_ID.test(grant.requestId)) {
+    throw new Error("tenant telemetry disposition authorization grant owner or protocol is invalid");
+  }
+  const evidence = Object.fromEntries(DISPOSITION_EVIDENCE_KEYS.map(
+    (key) => [key, grant[key]],
+  )) as unknown as TenantTelemetryDispositionEvidence;
+  validateTenantTelemetryDispositionEvidence(evidence);
+  if (grant.applicationCoverageEvidenceSha256 === null
+    || grant.applicationWriteBindingReceiptSha256 === null) {
+    throw new Error("tenant telemetry disposition authorization grant lacks bound application capture");
+  }
+  positive(grant.claimAttempt, "tenant telemetry disposition authorization grant claim attempt");
+  digest(grant.claimTokenSha256,
+    "tenant telemetry disposition authorization grant claim token hash");
+  nonNegative(grant.grantedAtDbMs,
+    "tenant telemetry disposition authorization grant DB time");
+  if (!Number.isSafeInteger(grant.leaseUntilDbMs)
+    || grant.leaseUntilDbMs <= grant.grantedAtDbMs) {
+    throw new Error("tenant telemetry disposition authorization grant lease is invalid");
+  }
+  return sha256([
+    TENANT_TELEMETRY_DISPOSITION_AUTHORIZATION_GRANT_SCOPE,
+    ...AUTHORIZATION_GRANT_BODY_KEYS.map((key) => grant[key]),
+  ]);
+}
+
+export function validateTenantTelemetryDispositionAuthorizationGrant(
+  grant: TenantTelemetryDispositionAuthorizationGrant,
+): void {
+  exactKeys(grant, [...AUTHORIZATION_GRANT_BODY_KEYS, "grantReceiptSha256"],
+    "tenant telemetry disposition authorization grant");
+  const { grantReceiptSha256, ...body } = grant;
+  digest(grantReceiptSha256,
+    "tenant telemetry disposition authorization grant receipt");
+  if (grantReceiptSha256 !== tenantTelemetryDispositionAuthorizationGrantSha256(body)) {
+    throw new Error("tenant telemetry disposition authorization grant receipt does not match");
+  }
+}
+
 export interface ScanTenantTelemetryDispositionEventsOptions {
   afterJournalSequence: number;
   afterJournalEventRootSha256: string;
@@ -1459,6 +1543,13 @@ export interface TenantTelemetryDispositionStore {
   blockTenantTelemetryDisposition(
     authorization: TenantTelemetryDispositionAuthorization,
   ): Promise<boolean>;
+  issueTenantTelemetryDispositionAuthorizationGrant(
+    authorization: TenantTelemetryDispositionAuthorization,
+  ): Promise<TenantTelemetryDispositionAuthorizationGrant | null>;
+  getTenantTelemetryDispositionAuthorizationGrant(
+    tenantId: string,
+    dispositionOperationSha256: string,
+  ): Promise<TenantTelemetryDispositionAuthorizationGrant | null>;
   recordTenantTelemetryExternalAuthorization(
     authorization: TenantTelemetryDispositionAuthorization,
     proof: TenantTelemetryExternalAuthorizationProof,

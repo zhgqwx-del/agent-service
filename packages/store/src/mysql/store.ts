@@ -907,6 +907,14 @@ const TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME =
   "0036_tenant_telemetry_disposition.sql";
 const TENANT_TELEMETRY_DISPOSITION_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-disposition";
+const TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME =
+  "0037_tenant_telemetry_disposition_grant_guard.sql";
+const TENANT_TELEMETRY_GRANT_GUARD_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-grant-guard";
+const TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME = "trg_tt_disposition_grant_bi_v2";
+const TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX =
+  `CREATE TRIGGER ${TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME} `
+  + "BEFORE INSERT ON tenant_telemetry_disposition_authorization_grants FOR EACH ROW ";
 
 function mysqlMigrationStatements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "")
@@ -934,6 +942,39 @@ async function executeMysqlMigrationStatement(
   migrationName: string,
   statement: string,
 ): Promise<void> {
+  if (migrationName === TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME
+    && statement.startsWith(TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX)) {
+    const expectedActionStatement = statement.slice(
+      TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX.length,
+    );
+    if (expectedActionStatement.length === 0) {
+      throw new Error("0037 tenant telemetry grant guard action is empty");
+    }
+    const [rows] = await conn.query<Row[]>(
+      `SELECT event_object_table AS table_name,action_timing AS timing,
+              event_manipulation AS manipulation,action_orientation AS orientation,
+              action_condition AS condition_value,action_statement AS statement_value
+         FROM information_schema.triggers
+        WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`,
+      [TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME],
+    );
+    if (rows.length === 0) {
+      await conn.query(statement);
+      return;
+    }
+    const existing = rows[0];
+    if (rows.length !== 1
+      || existing?.table_name !== "tenant_telemetry_disposition_authorization_grants"
+      || existing.timing !== "BEFORE"
+      || existing.manipulation !== "INSERT"
+      || existing.orientation !== "ROW"
+      || existing.condition_value !== null
+      || canonicalMysqlTriggerActionStatement(String(existing.statement_value))
+        !== canonicalMysqlTriggerActionStatement(expectedActionStatement)) {
+      throw new Error("0037 tenant telemetry grant guard is not exact");
+    }
+    return;
+  }
   if (migrationName !== TENANT_TELEMETRY_DURABLE_WRITER_MIGRATION_NAME
     || !statement.startsWith(TENANT_TELEMETRY_T1_BOOTSTRAP_TRIGGER_PREFIX)) {
     await conn.query(statement);
@@ -1120,6 +1161,28 @@ function tenantTelemetryDispositionFingerprintStatement(
   );
   if (statements.length !== 1 || !statements[0]!.startsWith(`SET @${variable}=`)) {
     throw new Error(`0036 tenant telemetry disposition ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
+
+function tenantTelemetryGrantGuardFingerprintStatement(migrationSql: string): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_GRANT_GUARD_FINGERPRINT_MARKER_PREFIX}-triggers:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_GRANT_GUARD_FINGERPRINT_MARKER_PREFIX}-triggers:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error("0037 tenant telemetry grant guard fingerprint markers are invalid");
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith("SET @tt_grant_guard_triggers_ok=")) {
+    throw new Error("0037 tenant telemetry grant guard fingerprint block is invalid");
   }
   return statements[0]!;
 }
@@ -7945,6 +8008,7 @@ export class MysqlSessionStore implements
   private async assertTenantTelemetryDispositionSchemaFingerprint(
     conn: PoolConnection,
     migrationsDir: string,
+    includeLegacyTriggerFingerprint = true,
   ): Promise<void> {
     let fingerprintStatements: string[];
     try {
@@ -7956,9 +8020,11 @@ export class MysqlSessionStore implements
         tenantTelemetryDispositionFingerprintStatement(
           migrationSql, "schema", "tt_disposition_schema_ok",
         ),
-        tenantTelemetryDispositionFingerprintStatement(
-          migrationSql, "triggers", "tt_disposition_trigger_ok",
-        ),
+        ...(includeLegacyTriggerFingerprint ? [
+          tenantTelemetryDispositionFingerprintStatement(
+            migrationSql, "triggers", "tt_disposition_trigger_ok",
+          ),
+        ] : []),
       ];
     } catch (cause) {
       throw new Error("0036 tenant telemetry disposition fingerprint source is invalid", {
@@ -7976,7 +8042,8 @@ export class MysqlSessionStore implements
         `SELECT @tt_disposition_schema_ok AS schema_ok,
                 @tt_disposition_trigger_ok AS trigger_ok`,
       );
-      if (Number(rows[0]?.schema_ok) !== 1 || Number(rows[0]?.trigger_ok) !== 1) {
+      if (Number(rows[0]?.schema_ok) !== 1
+        || (includeLegacyTriggerFingerprint && Number(rows[0]?.trigger_ok) !== 1)) {
         throw new Error("stored schema does not match the 0036 fingerprint");
       }
     } catch (cause) {
@@ -7992,6 +8059,54 @@ export class MysqlSessionStore implements
     } catch (cause) {
       failure ??= new Error(
         "0036 tenant telemetry disposition fingerprint session restore failed",
+        { cause },
+      );
+    }
+    if (failure) throw failure;
+  }
+
+  private async assertTenantTelemetryGrantGuardFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let statement: string;
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME),
+        "utf8",
+      );
+      statement = tenantTelemetryGrantGuardFingerprintStatement(migrationSql);
+    } catch (cause) {
+      throw new Error("0037 tenant telemetry grant guard fingerprint source is invalid", {
+        cause,
+      });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query(
+        "SET @agent_service_tt_grant_guard_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @tt_grant_guard_triggers_ok AS trigger_ok",
+      );
+      if (Number(rows[0]?.trigger_ok) !== 1) {
+        throw new Error("stored triggers do not match the 0037 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error(
+        "0037 tenant telemetry grant guard fingerprint verification failed",
+        { cause },
+      );
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_tt_grant_guard_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error(
+        "0037 tenant telemetry grant guard fingerprint session restore failed",
         { cause },
       );
     }
@@ -8377,6 +8492,10 @@ export class MysqlSessionStore implements
     try {
       const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
       const done = new Set(applied.map((row) => row.name as string));
+      if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
+        throw new Error("0037 grant guard marker is missing its 0036 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -8409,7 +8528,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryDispositionSchemaFingerprint(conn, migrationsDir);
+        await this.assertTenantTelemetryDispositionSchemaFingerprint(
+          conn, migrationsDir, !done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryGrantGuardFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -8461,9 +8585,26 @@ export class MysqlSessionStore implements
       );
       const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
       const done = new Set(applied.map((r) => r.name as string));
+      if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
+        throw new Error("0037 grant guard marker is missing its 0036 predecessor");
+      }
       const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME) {
+          const [guardRows] = await conn.query<Row[]>(
+            `SELECT COUNT(*) AS guard_count FROM information_schema.triggers
+              WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`,
+            [TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME],
+          );
+          if (storedSafeInteger(guardRows[0]?.guard_count,
+            "existing 0037 grant guard count") === 0) {
+            // Before the first DDL, require an exact published 0036 substrate. A replay after
+            // installing the twin verifies its exact body in executeMysqlMigrationStatement.
+            await this.assertTenantTelemetryDispositionSchemaFingerprint(conn, dir);
+          }
+        }
         if (f === TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME) {
           const [tables] = await conn.query<Row[]>(
             `SELECT COUNT(*) AS table_count FROM information_schema.tables
@@ -8589,7 +8730,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryDispositionSchemaFingerprint(conn, dir);
+        await this.assertTenantTelemetryDispositionSchemaFingerprint(
+          conn, dir, !done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryGrantGuardFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -49125,6 +49271,52 @@ export class MysqlSessionStore implements
     TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(authorization);
     await this.loadTenantTelemetryDispositionControl(this.pool);
     return false;
+  }
+
+  async issueTenantTelemetryDispositionAuthorizationGrant(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionAuthorizationGrant | null> {
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(authorization);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await this.loadTenantTelemetryDispositionControl(conn, "FOR SHARE");
+      const [rows] = await conn.query<Row[]>(
+        "SELECT COUNT(*) AS grant_count FROM tenant_telemetry_disposition_authorization_grants",
+      );
+      if (storedSafeInteger(rows[0]?.grant_count, "unsupported telemetry grant count") !== 0) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError(
+          "0037 source-valid telemetry grant issuance is not enabled",
+        );
+      }
+      // This is an intentional deny boundary, not a deferred plan check. The current T3d
+      // logs/traces entries are zero-target blockers. A future migration must implement the
+      // complete claim/owner/T1/policy/hold/0033-35/T3c/T3d source closure and atomically
+      // replace the 0037 hard-deny trigger before a grant can ever be published.
+      await conn.commit();
+      return null;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async getTenantTelemetryDispositionAuthorizationGrant(
+    _tenantId: string,
+    _dispositionOperationSha256: string,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionAuthorizationGrant | null> {
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    const [rows] = await this.pool.query<Row[]>(
+      "SELECT COUNT(*) AS grant_count FROM tenant_telemetry_disposition_authorization_grants",
+    );
+    if (storedSafeInteger(rows[0]?.grant_count, "unsupported telemetry grant count") !== 0) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError(
+        "0037 contains unsupported telemetry grant evidence",
+      );
+    }
+    return null;
   }
 
   async recordTenantTelemetryExternalAuthorization(

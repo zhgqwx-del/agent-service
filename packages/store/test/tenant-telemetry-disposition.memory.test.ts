@@ -5,19 +5,25 @@ import {
   EMPTY_TENANT_TELEMETRY_DISPOSITION_EVENT_ROOT_SHA256,
   MemorySessionStore,
   TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+  TENANT_TELEMETRY_DISPOSITION_AUTHORIZATION_GRANT_SCOPE,
   TENANT_TELEMETRY_DISPOSITION_JOB_SCOPE,
   TENANT_TELEMETRY_DISPOSITION_FLEET_STOPPED_ACK,
   TENANT_TELEMETRY_DISPOSITION_LEGACY_WRITERS_DRAINED_ACK,
   TENANT_TELEMETRY_DISPOSITION_REPLAY_FENCE_SCOPE,
   TENANT_TELEMETRY_EXTERNAL_AUTHORIZATION_SCOPE,
   tenantTelemetryDispositionExternalEventSha256,
+  tenantTelemetryDispositionAuthorizationGrantSha256,
+  tenantTelemetryDispositionClaimTokenSha256,
+  tenantTelemetryDispositionOperationSha256,
   tenantTelemetryDispositionNextEventRootSha256,
   tenantTelemetryExternalAuthorizationReceiptSha256,
   validateTenantTelemetryDispositionAuthorization,
+  validateTenantTelemetryDispositionAuthorizationGrant,
   validateTenantTelemetryDispositionJobRecord,
   tenantRestoreLogicalDatabaseNamespaceSha256,
   tenantRestoreRuntimeEpochSha256,
   type TenantTelemetryDispositionActivationReceipt,
+  type TenantTelemetryDispositionAuthorizationGrant,
   type TenantTelemetryDispositionJobRecord,
 } from "../src/index.js";
 import { dispositionEvidence } from "./tenant-telemetry-disposition.fixture.js";
@@ -124,6 +130,115 @@ async function fixture(): Promise<{
 }
 
 describe("MemorySessionStore tenant telemetry disposition substrate", () => {
+  it("binds the grant envelope to exact owner, artifact evidence and domain-separated claim hash without granting authority", () => {
+    const claimToken = "grant-contract-claim";
+    const body = {
+      scope: TENANT_TELEMETRY_DISPOSITION_AUTHORIZATION_GRANT_SCOPE,
+      protocol: TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+      tenantId: "tenant-a",
+      requestId: "request-a",
+      ...dispositionEvidence(),
+      claimAttempt: 1,
+      claimTokenSha256: tenantTelemetryDispositionClaimTokenSha256(claimToken),
+      grantedAtDbMs: 10_000,
+      leaseUntilDbMs: 11_000,
+    };
+    const grant: TenantTelemetryDispositionAuthorizationGrant = {
+      ...body,
+      grantReceiptSha256: tenantTelemetryDispositionAuthorizationGrantSha256(body),
+    };
+    expect(grant.claimTokenSha256).not.toBe(D(claimToken));
+    expect(() => validateTenantTelemetryDispositionAuthorizationGrant(grant)).not.toThrow();
+    for (const altered of [
+      { ...grant, tenantId: "tenant-b" },
+      { ...grant, requestId: "request-b" },
+      { ...grant, claimAttempt: 2 },
+      { ...grant, claimTokenSha256: D(claimToken) },
+      { ...grant, writeAckReceiptSha256: D("other-writer-ack") },
+      { ...grant, leaseUntilDbMs: 10_500 },
+    ]) {
+      expect(() => validateTenantTelemetryDispositionAuthorizationGrant(altered))
+        .toThrow();
+    }
+    expect(() => validateTenantTelemetryDispositionAuthorizationGrant({
+      ...grant, leaseUntilDbMs: 10_000,
+    })).toThrow(/lease is invalid/);
+    const { dispositionOperationSha256: _priorOperation, ...evidenceSource } =
+      dispositionEvidence();
+    const unboundSource = {
+      ...evidenceSource,
+      applicationCoverageEvidenceSha256: null,
+      applicationWriteBindingReceiptSha256: null,
+    };
+    expect(() => tenantTelemetryDispositionAuthorizationGrantSha256({
+      ...body,
+      ...unboundSource,
+      dispositionOperationSha256: tenantTelemetryDispositionOperationSha256(unboundSource),
+    })).toThrow(/bound application capture/);
+    expect(() => validateTenantTelemetryDispositionAuthorizationGrant({
+      ...grant, extra: D("extra"),
+    } as TenantTelemetryDispositionAuthorizationGrant)).toThrow(/unknown or missing fields/);
+  });
+
+  it("keeps grant issuance dormant under zero-target T3d even for concurrent caller claims", async () => {
+    const { store, input } = await fixture();
+    const evidence = dispositionEvidence();
+    const authorization = {
+      tenantId: "tenant-a",
+      requestId: "request-a",
+      dispositionOperationSha256: evidence.dispositionOperationSha256,
+      claimAttempt: 1,
+      claimToken: "grant-test-claim",
+    };
+    expect(await store.issueTenantTelemetryDispositionAuthorizationGrant(authorization))
+      .toBeNull();
+    await store.activateTenantTelemetryDisposition(input);
+    expect(await Promise.all(Array.from({ length: 8 }, () =>
+      store.issueTenantTelemetryDispositionAuthorizationGrant(authorization)))).toEqual(
+      Array(8).fill(null),
+    );
+    expect(await store.getTenantTelemetryDispositionAuthorizationGrant(
+      authorization.tenantId, authorization.dispositionOperationSha256,
+    )).toBeNull();
+    expect(await store.getTenantTelemetryDispositionAuthorizationGrant(
+      "other-tenant", authorization.dispositionOperationSha256,
+    )).toBeNull();
+    expect(store.tenantTelemetryDispositionAuthorizationGrants.size).toBe(0);
+    expect(store.tenantTelemetryDispositionExternalAuthorizations.size).toBe(0);
+    expect(store.tenantTelemetryDispositionExternalEvents.size).toBe(0);
+  });
+
+  it("detects injected grant footprint rather than treating a receipt as trusted source", async () => {
+    const { store, input } = await fixture();
+    await store.activateTenantTelemetryDisposition(input);
+    const evidence = dispositionEvidence();
+    const body = {
+      scope: TENANT_TELEMETRY_DISPOSITION_AUTHORIZATION_GRANT_SCOPE,
+      protocol: TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+      tenantId: "tenant-a",
+      requestId: "request-a",
+      ...evidence,
+      claimAttempt: 1,
+      claimTokenSha256: tenantTelemetryDispositionClaimTokenSha256("forged"),
+      grantedAtDbMs: 10_000,
+      leaseUntilDbMs: 11_000,
+    };
+    store.tenantTelemetryDispositionAuthorizationGrants.set(
+      evidence.dispositionOperationSha256,
+      { ...body, grantReceiptSha256: tenantTelemetryDispositionAuthorizationGrantSha256(body) },
+    );
+    await expect(store.getTenantTelemetryDispositionAuthorizationGrant(
+      "tenant-a", evidence.dispositionOperationSha256,
+    )).rejects.toThrow(/corrupt/);
+    await expect(store.issueTenantTelemetryDispositionAuthorizationGrant({
+      tenantId: "tenant-a",
+      requestId: "request-a",
+      dispositionOperationSha256: evidence.dispositionOperationSha256,
+      claimAttempt: 1,
+      claimToken: "forged",
+    })).rejects.toThrow();
+  });
+
   it("accepts Unicode tenant IDs under the existing core length boundary", () => {
     const tenantId = "租户🌟";
     const evidence = dispositionEvidence();

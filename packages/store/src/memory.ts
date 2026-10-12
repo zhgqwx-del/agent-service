@@ -1392,6 +1392,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     string,
     TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord
   >();
+  tenantTelemetryDispositionAuthorizationGrants = new Map<
+    string,
+    TenantTelemetryDisposition.TenantTelemetryDispositionAuthorizationGrant
+  >();
   tenantTelemetryDispositionExternalAuthorizations = new Map<
     string,
     TenantTelemetryDisposition.TenantTelemetryExternalAuthorizationProof
@@ -27836,6 +27840,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (control.state === "inactive") {
         if (receipt || this.tenantTelemetryDispositionActivationReceipts.size !== 0
           || this.tenantTelemetryDispositionJobs.size !== 0
+          || this.tenantTelemetryDispositionAuthorizationGrants.size !== 0
           || this.tenantTelemetryDispositionExternalAuthorizations.size !== 0
           || this.tenantTelemetryDispositionExternalEvents.size !== 0
           || this.tenantTelemetryDispositionTombstoneAcks.size !== 0
@@ -27859,6 +27864,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           throw new Error("tenant telemetry disposition activation receipt drifted");
         }
         if (this.tenantTelemetryDispositionJobs.size !== 0
+          || this.tenantTelemetryDispositionAuthorizationGrants.size !== 0
           || this.tenantTelemetryDispositionExternalAuthorizations.size !== 0
           || this.tenantTelemetryDispositionExternalEvents.size !== 0
           || this.tenantTelemetryDispositionTombstoneAcks.size !== 0
@@ -28375,6 +28381,31 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(next);
     this.tenantTelemetryDispositionJobs.set(job.dispositionOperationSha256, next);
     return true;
+  }
+
+  async issueTenantTelemetryDispositionAuthorizationGrant(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionAuthorizationGrant | null> {
+    const stagedAuthorization = clone(authorization);
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(
+      stagedAuthorization,
+    );
+    // 0037 repairs the immutable grant contract but does not add a trusted
+    // source that can overcome today's zero-target T3d logs/traces blocker.
+    // In particular, neither a caller-supplied claim nor an injected job is
+    // permission to materialize a grant or invoke an external deletion.
+    this.readMemoryTenantTelemetryDispositionControl();
+    return null;
+  }
+
+  async getTenantTelemetryDispositionAuthorizationGrant(
+    _tenantId: string,
+    _dispositionOperationSha256: string,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionAuthorizationGrant | null> {
+    // This read intentionally audits the dormant footprint before any lookup.
+    // A grant cannot exist while the 0037 source-issuance gate is closed.
+    this.readMemoryTenantTelemetryDispositionControl();
+    return null;
   }
 
   async recordTenantTelemetryExternalAuthorization(

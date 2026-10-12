@@ -612,6 +612,9 @@ verify() {
   pnpm run test:tenant-telemetry-disposition
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-disposition-mysql
+  pnpm run test:tenant-telemetry-disposition-grant
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-telemetry-disposition-grant-mysql
   AGENT_SERVICE_INTEGRATION=1 \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \
