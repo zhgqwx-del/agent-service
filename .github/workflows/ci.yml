@@ -403,8 +403,8 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:tenant-content-inventory-mysql
 
-      # 0040 seals a five-source telemetry accounting sidecar in the same T3d publication;
-      # Memory rollback/unknown classifications and real InnoDB locks must both execute by name.
+      # 0041 seals the observed target set over all five 0040 telemetry sources in the
+      # same T3d publication; Memory rollback and real InnoDB locks must execute by name.
       - name: Tenant purge plan Memory suite (must execute)
         run: pnpm run test:tenant-purge-plan-memory
 
@@ -521,10 +521,11 @@ jobs:
       # 0031 -> 0032 default-dormant telemetry inventory, 0032 -> 0033 receipt/inventory
       # activation, 0033 -> 0034 durable writer, 0034 -> 0035 application-capture
       # 0035 -> 0036 dormant disposition, 0036 -> 0037 grant guard, 0037 -> 0038
-      # membership, 0038 -> 0039 T3f owner closure, and 0039 -> 0040 T3d source accounting
-      # all run against real MySQL. Frozen 0038/0039 binaries also produce genuine old terminal
-      # records before upgrade, and old-code startup must reject each new strict fingerprint.
-      - name: Historical MySQL migrations (0007 through 0040, frozen terminals, no skips)
+      # membership, 0038 -> 0039 T3f owner closure, 0039 -> 0040 T3d
+      # source accounting, and 0040 -> 0041 target manifest all run against real MySQL.
+      # Frozen 0038/0039 binaries also produce genuine old terminal records before upgrade;
+      # old-code startup must reject each new strict fingerprint.
+      - name: Historical MySQL migrations (0007 through 0041, frozen terminals, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -689,6 +690,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0038_tenant_telemetry_artifact_membership.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0039_tenant_telemetry_owner_closure.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0040_tenant_telemetry_source_accounting.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0041_tenant_telemetry_target_manifest.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

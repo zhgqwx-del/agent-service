@@ -274,10 +274,10 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
              ON tenant_telemetry_disposition_authorization_grants FOR EACH ROW
            BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='tampered'; END`,
         );
-        // The latest 0040 fingerprint covers all 103 triggers, including this 0037 guard.
+        // The latest 0041 fingerprint covers all 111 triggers, including this 0037 guard.
         await expect(MysqlSessionStore.connect({
           url: f.url, tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toThrow("0040 telemetry source fingerprint verification failed");
+        })).rejects.toThrow("0041 target manifest fingerprint verification failed");
       } finally {
         await f.close();
       }

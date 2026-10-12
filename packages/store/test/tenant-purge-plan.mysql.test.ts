@@ -595,6 +595,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const tenantId = `tenant-plan-success-${randomUUID()}`;
       const userId = `private-user-${randomUUID()}`;
       const failureTrigger = "trg_test_source_accounting_receipt_failure";
+      const manifestFailureTrigger = "trg_test_target_manifest_receipt_failure";
       try {
         const source = await advanceThroughT3c(store, tenantId, userId);
         const [before] = await conn.query<RowDataPacket[]>(
@@ -673,6 +674,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           plan_receipts: 0, source_receipts: 0, source_entries: 0, phase: "queued",
         });
         await conn.query(`DROP TRIGGER ${failureTrigger}`);
+        await conn.query(
+          `CREATE TRIGGER ${manifestFailureTrigger} BEFORE INSERT
+             ON tenant_telemetry_target_manifest_receipts FOR EACH ROW
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='injected manifest receipt failure'`,
+        );
+        await expect(store.sealTenantPurgePlan(authorization))
+          .rejects.toThrow("injected manifest receipt failure");
+        const [manifestRollback] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_purge_plan_receipts WHERE request_id=?) AS plans,
+             (SELECT COUNT(*) FROM tenant_telemetry_source_accounting_receipts
+               WHERE request_id=?) AS sources,
+             (SELECT COUNT(*) FROM tenant_telemetry_target_manifest_entries
+               WHERE request_id=?) AS manifest_entries,
+             (SELECT COUNT(*) FROM tenant_telemetry_target_manifest_receipts
+               WHERE request_id=?) AS manifests,
+             (SELECT phase FROM tenant_purge_plan_jobs WHERE request_id=?) AS phase`,
+          [source.requestId, source.requestId, source.requestId,
+            source.requestId, source.requestId],
+        );
+        expect(manifestRollback[0]).toMatchObject({ plans: 0, sources: 0,
+          manifest_entries: 0, manifests: 0, phase: "queued" });
+        await conn.query(`DROP TRIGGER ${manifestFailureTrigger}`);
         const receipt = await store.sealTenantPurgePlan(authorization);
         expect(receipt).toMatchObject({
           tenantId,
@@ -701,6 +725,17 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await store.getTenantTelemetrySourceAccountingReceipt(
           `wrong-${tenantId}`, source.requestId,
         )).toBeNull();
+        expect(await store.getTenantTelemetryTargetManifestReceipt(
+          tenantId, source.requestId,
+        )).toMatchObject({ sourceAccountingReceiptSha256: sourceAccounting?.receiptSha256,
+          entryCount: 0, artifactGroupCount: 0, observedTargetCount: 0 });
+        expect(await store.getTenantTelemetryTargetSourceReadiness(
+          tenantId, source.requestId,
+        )).toMatchObject({ sourceRelationsComplete: true, ownerClosureComplete: false,
+          observedTargetCount: 0, executionReady: false });
+        expect(await store.getTenantTelemetryTargetManifestReceipt(
+          `wrong-${tenantId}`, source.requestId,
+        )).toBeNull();
         expect(await store.sealTenantPurgePlan(authorization)).toEqual(receipt);
         expect(await store.sealTenantPurgePlan({
           ...authorization,
@@ -724,6 +759,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(String(after[0]?.lifecycle_state)).toBe("deleting");
       } finally {
         await conn.query(`DROP TRIGGER IF EXISTS ${failureTrigger}`).catch(() => {});
+        await conn.query(`DROP TRIGGER IF EXISTS ${manifestFailureTrigger}`).catch(() => {});
         await conn.end();
         await store.close();
       }
@@ -970,6 +1006,24 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(entries.filter((entry) => entry.reason === "legacy_missing_membership"))
           .toHaveLength(4);
         expect(entries.filter((entry) => entry.classification === "unknown")).toHaveLength(8);
+        const targetManifest = await store.getTenantTelemetryTargetManifestReceipt(
+          tenantId, source.requestId,
+        );
+        expect(targetManifest).toMatchObject({
+          sourceAccountingReceiptSha256: accounting?.receiptSha256,
+          entryCount: 13, observedTargetCount: 1,
+        });
+        const manifestEntries = await store.getTenantTelemetryTargetManifestEntries(
+          tenantId, source.requestId,
+        );
+        expect(manifestEntries).toHaveLength(13);
+        expect(manifestEntries.filter((entry) => entry.classification === "accounted"))
+          .toHaveLength(5);
+        expect(await store.getTenantTelemetryTargetSourceReadiness(
+          tenantId, source.requestId,
+        )).toMatchObject({ sourceRelationsComplete: false,
+          ownerClosureComplete: false, observedTargetCount: 1,
+          executionReady: false });
         expect((await store.getTenantPurgePlanEntries(
           tenantId, source.requestId, planClaim.buildGeneration,
         )).find((entry) => entry.domain === "logs")).toMatchObject({
@@ -990,6 +1044,144 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         releaseWriter();
         await observer.end();
         await writer?.close();
+        await store.close();
+      }
+    });
+
+    it("binds 0041 observed targets to real user and session owners under T3d", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-plan-owner-manifest-${randomUUID()}`;
+      const userId = `owner-user-${randomUUID()}`;
+      try {
+        await store.activateTenantTelemetryLifecycle({
+          expectedControlGeneration: 0,
+          targets: [
+            { domain: "logs", backendKind: "test_sink", adapterProtocol: "telemetry-test-v1",
+              namespaceSha256: "1".repeat(64), failureDomainSha256: "2".repeat(64) },
+            { domain: "traces", backendKind: "test_sink", adapterProtocol: "telemetry-test-v1",
+              namespaceSha256: "3".repeat(64), failureDomainSha256: "4".repeat(64) },
+          ],
+        });
+        const lifecycle = await store.getTenantTelemetryLifecycleControl();
+        if (lifecycle.state !== "active") throw new Error("missing telemetry lifecycle activation");
+        const target = (await store.listTenantTelemetryLifecycleTargets())
+          .find((candidate) => candidate.domain === "logs")!;
+        const producerProtocol = "application-dual-write-v1";
+        const producerContractSha256 = "9".repeat(64);
+        await store.activateTenantTelemetryApplicationCapture({
+          domain: "logs", expectedControlGeneration: 0,
+          expectedLifecycleControlGeneration: 1,
+          lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256,
+          lifecycleTargetSha256: target.targetSha256,
+          lifecycleTargetReceiptSha256: target.receiptSha256,
+          producerProtocol, producerContractSha256,
+          fleetStoppedAck: TENANT_TELEMETRY_APPLICATION_FLEET_STOPPED_ACK,
+          legacyWritersDrainedAck: TENANT_TELEMETRY_APPLICATION_LEGACY_WRITERS_DRAINED_ACK,
+          producerReadyAck: TENANT_TELEMETRY_APPLICATION_PRODUCER_READY_ACK,
+        });
+        const source = await advanceThroughT3c(store, tenantId, userId, 0, async (session) => {
+          for (const [index, ownerKind, ownerId] of [
+            [0, "user", userId], [1, "session", session.id],
+          ] as const) {
+            await store.enqueueTenantTelemetryArtifact({
+              tenantId, expectedControlGeneration: 1, domain: "logs",
+              artifactIdSha256: index === 0 ? "a".repeat(64) : "b".repeat(64),
+              artifactGeneration: 1, ownerKind, ownerId, ownerUserId: userId,
+              sourceSchema: "structured-log-batch-v1", sourceGeneration: 1,
+              sourceHighWaterDbMs: Date.now(), producerProtocol, producerContractSha256,
+              payload: { schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, domain: "logs",
+                records: [trustedRunnerTelemetryRecord(Date.now(), {
+                  opaqueRefKey: TELEMETRY_REF_KEY, tenantValue: tenantId,
+                  ownerKind, ownerValue: ownerId, attempt: index + 1,
+                })] },
+            });
+            const [claim] = await store.claimTenantTelemetryWriteJobs({
+              limit: 1, leaseMs: 120_000, claimToken: `owner-manifest-${index}`,
+              adapterProtocol: "telemetry-test-v1",
+            });
+            if (!claim) throw new Error("missing owner-scoped telemetry claim");
+            const auth = { tenantId, writeOperationSha256: claim.writeOperationSha256,
+              claimAttempt: claim.claimAttempt, claimToken: claim.claimToken };
+            await store.reserveTenantTelemetryExternalMutation(auth, claim.target.adapterProtocol);
+            const evidence = {
+              adapterProtocol: claim.target.adapterProtocol, domain: claim.inventory.domain,
+              targetSha256: claim.target.targetSha256,
+              writeOperationSha256: claim.writeOperationSha256,
+              artifactIdSha256: claim.inventory.artifactIdSha256,
+              artifactGeneration: claim.inventory.artifactGeneration,
+              payloadSha256: claim.inventory.payloadSha256,
+              manifestSha256: claim.inventory.manifestSha256,
+              outcome: "written" as const, replayed: false,
+            };
+            expect(await store.completeTenantTelemetryWrite(auth, {
+              ...evidence, evidenceSha256: tenantTelemetryWriteAdapterEvidenceSha256(evidence),
+            })).not.toBeNull();
+          }
+        });
+        await store.materializeTenantPurgePlanJobs({ limit: 1 });
+        const claim = await claimPlan(store, source.requestId);
+        expect(await store.sealTenantPurgePlan(planAuthorization(claim))).not.toBeNull();
+        const manifest = await store.getTenantTelemetryTargetManifestReceipt(
+          tenantId, source.requestId,
+        );
+        expect(manifest).toMatchObject({ entryCount: 10, artifactGroupCount: 2,
+          observedTargetCount: 2, unknownGroupCount: 0 });
+        const entries = await store.getTenantTelemetryTargetManifestEntries(
+          tenantId, source.requestId,
+        );
+        expect(entries).toHaveLength(10);
+        expect([...new Set(entries.map((entry) => entry.ownerKind))].sort())
+          .toEqual(["session", "user"]);
+        expect(entries.every((entry) => entry.classification === "accounted"
+          && entry.observedTargetSha256 !== null && entry.liveOwnerClaimSha256 !== null))
+          .toBe(true);
+        expect(await store.getTenantTelemetryTargetSourceReadiness(
+          tenantId, source.requestId,
+        )).toMatchObject({ sourceRelationsComplete: true, ownerClosureComplete: false,
+          observedTargetCount: 2, executionReady: false });
+        expect((await store.getTenantPurgePlanEntries(
+          tenantId, source.requestId, claim.buildGeneration,
+        )).find((entry) => entry.domain === "logs")).toMatchObject({
+          targetCount: 0, disposition: "blocked_adapter_unconfigured",
+        });
+        const forged = entries[0]!;
+        await expect(conn.query(
+          `INSERT INTO tenant_telemetry_target_manifest_entries
+             (scope,request_id,tenant_id,subject_generation,build_generation,source_kind,
+              source_identity_sha256,source_receipt_sha256,domain,artifact_group_sha256,
+              inventory_sha256,write_operation_sha256,artifact_id_sha256,artifact_generation,
+              observed_target_sha256,owner_kind,owner_ref_sha256,hold_subject_ref_sha256,
+              owner_binding_sha256,live_owner_claim_sha256,classification,group_source_count,
+              group_source_root_sha256,group_observed_target_count,
+              group_observed_target_root_sha256,captured_at_db_ms,receipt_sha256)
+           VALUES (${new Array(27).fill("?").join(",")})`,
+          [forged.scope, forged.requestId, forged.tenantId,
+            forged.subjectGeneration, forged.buildGeneration, forged.sourceKind,
+            "f".repeat(64), forged.sourceReceiptSha256, forged.domain,
+            forged.artifactGroupSha256, forged.inventorySha256,
+            forged.writeOperationSha256, forged.artifactIdSha256, forged.artifactGeneration,
+            forged.observedTargetSha256, forged.ownerKind, forged.ownerRefSha256,
+            forged.holdSubjectRefSha256, forged.ownerBindingSha256,
+            forged.liveOwnerClaimSha256, forged.classification,
+            forged.groupSourceCount, forged.groupSourceRootSha256,
+            forged.groupObservedTargetCount, forged.groupObservedTargetRootSha256,
+            forged.capturedAtDbMs, "e".repeat(64)],
+        )).rejects.toThrow("telemetry target entry lacks exact T3d/0040 source");
+        await expect(conn.query(
+          "UPDATE tenant_telemetry_target_manifest_entries SET group_source_count=group_source_count WHERE request_id=?",
+          [source.requestId],
+        )).rejects.toThrow("telemetry target entry is immutable");
+        await expect(conn.query(
+          "DELETE FROM tenant_telemetry_target_manifest_receipts WHERE request_id=?",
+          [source.requestId],
+        )).rejects.toThrow("telemetry target receipt is append-only");
+        expect(JSON.stringify({ manifest, entries })).not.toContain(userId);
+        expect(JSON.stringify({ manifest, entries })).not.toContain(source.session.id);
+      } finally {
+        await conn.end();
         await store.close();
       }
     });

@@ -2,7 +2,7 @@
 
 > 状态：**已采用的 2026-09-22 架构基线**。本文保留调研阶段（`docs/research/01–07`）形成设计时的目标态与原始缺口；核心决策已经实施并经过后续评审。当前实现范围、验证结果和剩余事项以 `docs/PROGRESS.md` 的顶部快照及最后一节为准。
 >
-> 当前实现仍保持两个长期应用边界：对外入口是无状态`agent-router`，实际Agent Runtime和生命周期worker位于`agent-runner`。`0034`默认关闭的telemetry writer已接runner，可选本地单runner filesystem或S3-compatible target；`0035`只为`provider.upstream_request_failed` logs建立exact producer contract，traces必须inactive。`0036`增加默认休眠的disposition账本与非生产S3协议；`0037`继续硬拒真实grant，`0038`为新write封存membership/source，`0039`在新T3f前封存真实owner/session grave。`0040`在新T3d terminal同事务封存inventory、job、ACK、membership和binding的逐源快照及aggregate；旧terminal或历史缺证据、未完成、孤立项均只能为unknown，不可事后重标。T3d logs/traces仍是零target blocker，真实grant与产品外部处置继续关闭；没有产品v2 S3 mutation、受控telemetry disposition activation/worker/CLI或旧快照恢复门禁。第五个同机MinIO bucket只证明0036协议，不证明云IAM/KMS和独立故障域。M1仍未冻结、M2冻结、M3/M4主体未开始；这些切片不新增常驻服务、进程、JavaScript入口或产品镜像。
+> 当前实现仍保持两个长期应用边界：对外入口是无状态`agent-router`，实际Agent Runtime和生命周期worker位于`agent-runner`。`0034`默认关闭的telemetry writer已接runner，可选本地单runner filesystem或S3-compatible target；`0035`只为`provider.upstream_request_failed` logs建立exact producer contract，traces必须inactive。`0036`为默认休眠的非生产disposition协议；`0037`继续硬拒真实grant，`0038`封存新write的membership/source，`0039`在新T3f前封存真实owner/session grave，`0040`在新T3d同事务封存五类source，`0041`再逐source封存artifact group与不可变观察目标集合。旧terminal或legacy/未完成/孤立项均只能为unknown/零观察目标，不事后重标；观察目标不是T3d执行target。T3d logs/traces仍是零执行target blocker，真实grant与产品外部处置继续关闭；没有产品v2 S3 mutation、受控telemetry disposition activation/worker/CLI或旧快照恢复门禁。第五个同机MinIO bucket只证明0036协议，不证明云IAM/KMS和独立故障域。M1仍未冻结、M2冻结、M3/M4主体未开始；这些切片不新增常驻服务、进程、JavaScript入口或产品镜像。
 
 ---
 
@@ -521,6 +521,8 @@ T3d owner closure还包括Memory中export request、user erasure request与tenan
 `0039`将上述写时membership与T3f删除前的canonical owner线性化：T3f同一Memory原子发布/MySQL RR事务先完整扫描tenant的queued、reserved、blocked、written受管write和membership，用受保护ref key核对真实tenant/user/session owner，session owner还绑定同事务创建的永久grave；逐项entry和aggregate receipt与11域数据库删除及terminal job一同提交，空集合也有显式receipt。缺membership、owner不闭合、租约/SQL失败均回滚T3f，不允许删除后借可变job重建owner。旧terminal缺0039 sidecar只表示unknown，不是零write；未来grant不得把null作为授权。0039新增两张append-only表、同事务terminal guard与95-trigger严格指纹，必须排空pre-0039 T3f writer再独立迁移，旧进程不能与新schema混跑。它不签发grant、不执行telemetry删除/恢复、不中断T3d零target blocker，也不修改全域completion；真实pre-0039 binary terminal历史升级仍缺独立CI夹具。由于没有冻结历史terminal集合的外部cutover root，特权DDL删除完整closure投影后本地无法区分历史null与篡改，生产必须依赖最小权限、schema drift监控和后续独立恢复证据。
 
 `0040`把T3d的telemetry来源判定固化在plan提交边界：Memory单一原子发布/MySQL RR事务对inventory、write job、ACK、0038 membership和0035 application binding做全范围核对，逐项封存content-free entry并追加绑定T3d terminal receipt/claim的aggregate。legacy、未完成、缺失或孤立source保持unknown，pre-0040 sealed plan缺aggregate也不是“零项”。新schema的103-trigger严格指纹要求排空pre-0040 T3d writer再独立迁移，旧进程不能热混跑；该证据不改变T3d零target blocker、grant硬拒、产品外部mutation/restore拒绝和全域completion=false。大表范围锁与lease预算仍须在staging压测。
+
+`0041`在同一T3d原子发布边界把每条0040 source精确覆盖到一个不可变artifact group，另封存观察目标集合和独立aggregate，不改33域plan receipt或T3d执行target。只有inventory、written job、ACK、0038 membership、0035 binding、精确target tuple及当时canonical owner/opaque ref均闭合，group才有一个观察目标；legacy、未完成、缺job的inventory及其它孤立source仅为unknown/零观察目标，不能推断外部locator或owner。旧terminal缺0041 receipt仍为unknown；T3f后只读关系核对还要与已验证的0039 closure/grave匹配，但返回`executionReady=false`且无grant/delete方法。MySQL增两张append-only表、terminal receipt guard和严格111-trigger指纹，必须排空pre-0041 T3d writer、独立迁移并只启动0041-aware进程。0037硬拒、产品外部mutation/restore拒绝及全域completion=false不变；全表锁/lease和真实N-1发布仍需staging验证。
 
 ### 8.2 Redis 键
 

@@ -1161,6 +1161,10 @@ describe("MemorySessionStore tenant database purge", () => {
     expect(sessionEntry?.sessionGraveMarkerSha256).toBe(grave?.markerSha256);
     expect(entries.every((entry) => entry.refKeyIdSha256
       === tenantTelemetryRefKeyIdSha256(TELEMETRY_REF_KEY))).toBe(true);
+    expect(await store.getTenantTelemetryTargetSourceReadiness(
+      tenantId, source.request.requestId,
+    )).toMatchObject({ sourceRelationsComplete: false,
+      ownerClosureComplete: true, observedTargetCount: 0, executionReady: false });
     expect(JSON.stringify({ closure, entries })).not.toContain(target.session.userId);
     expect(store.tenantTelemetryDispositionAuthorizationGrants).toHaveLength(0);
   });

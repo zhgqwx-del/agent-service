@@ -546,6 +546,17 @@ describe("MemorySessionStore tenant purge plan", () => {
     expect(await store.getTenantTelemetrySourceAccountingReceipt(
       "neighbor", source.request.requestId,
     )).toBeNull();
+    expect(await store.getTenantTelemetryTargetManifestReceipt(
+      tenantId, source.request.requestId,
+    )).toMatchObject({ sourceAccountingReceiptSha256: sourceAccounting?.receiptSha256,
+      entryCount: 0, artifactGroupCount: 0, observedTargetCount: 0 });
+    expect(await store.getTenantTelemetryTargetSourceReadiness(
+      tenantId, source.request.requestId,
+    )).toMatchObject({ sourceRelationsComplete: true, ownerClosureComplete: false,
+      observedTargetCount: 0, executionReady: false });
+    expect(await store.getTenantTelemetryTargetManifestReceipt(
+      "neighbor", source.request.requestId,
+    )).toBeNull();
     expect(await store.sealTenantPurgePlan(authorization)).toEqual(receipt);
     expect(await store.sealTenantPurgePlan({
       ...authorization,
@@ -651,9 +662,25 @@ describe("MemorySessionStore tenant purge plan", () => {
     expect(await store.getTenantTelemetrySourceAccountingEntries(
       tenantId, source.request.requestId,
     )).toEqual([]);
+    expect(await store.getTenantTelemetryTargetManifestReceipt(
+      tenantId, source.request.requestId,
+    )).toBeNull();
     expect(await store.getTenantPurgePlanJob(tenantId, source.request.requestId))
       .toMatchObject({ phase: "queued" });
     store.tenantTelemetrySourceAccountingEntries = new Map();
+    store.tenantTelemetryTargetManifestEntries = new FailOnceMap(
+      [...store.tenantTelemetryTargetManifestEntries], 2,
+    );
+    await expect(store.sealTenantPurgePlan(planAuthorization(planClaim!)))
+      .rejects.toThrow("injected plan entry write failure");
+    expect(await store.getTenantPurgePlanReceipt(tenantId, source.request.requestId)).toBeNull();
+    expect(await store.getTenantTelemetrySourceAccountingReceipt(
+      tenantId, source.request.requestId,
+    )).toBeNull();
+    expect(await store.getTenantTelemetryTargetManifestReceipt(
+      tenantId, source.request.requestId,
+    )).toBeNull();
+    store.tenantTelemetryTargetManifestEntries = new Map();
     const sealed = await store.sealTenantPurgePlan(planAuthorization(planClaim!));
     expect(sealed).not.toBeNull();
     const frozen = await store.getTenantTelemetrySourceAccountingEntries(
@@ -669,6 +696,16 @@ describe("MemorySessionStore tenant purge plan", () => {
     expect(frozen.map((entry) => entry.reason)).toEqual([
       "missing_inventory", "missing_inventory",
     ]);
+    const frozenManifest = await store.getTenantTelemetryTargetManifestReceipt(
+      tenantId, source.request.requestId,
+    );
+    expect(frozenManifest).toMatchObject({ entryCount: 2, artifactGroupCount: 1,
+      observedTargetCount: 0, unknownGroupCount: 1 });
+    expect((await store.getTenantTelemetryTargetManifestEntries(
+      tenantId, source.request.requestId,
+    )).every((entry) => entry.inventorySha256 === null
+      && entry.observedTargetSha256 === null && entry.classification === "unknown"))
+      .toBe(true);
     const claim = writeClaim!;
     const evidence = {
       adapterProtocol: claim.target.adapterProtocol, domain: claim.inventory.domain,
@@ -900,6 +937,14 @@ describe("MemorySessionStore tenant purge plan", () => {
     });
     expect(entries.every((entry) => entry.classification === "accounted"
       && entry.reason === "complete")).toBe(true);
+    expect(await store.getTenantTelemetryTargetManifestReceipt(
+      tenantId, source.request.requestId,
+    )).toMatchObject({ entryCount: 5, artifactGroupCount: 1,
+      observedTargetCount: 1, unknownGroupCount: 0 });
+    expect(await store.getTenantTelemetryTargetSourceReadiness(
+      tenantId, source.request.requestId,
+    )).toMatchObject({ sourceRelationsComplete: true, ownerClosureComplete: false,
+      observedTargetCount: 1, unknownArtifactGroupCount: 0, executionReady: false });
     expect(receipt).toMatchObject({ executionReady: false, contentPurgeExecuted: false });
     expect((await store.getTenantPurgePlanEntries(
       tenantId, source.request.requestId, 1,
@@ -976,6 +1021,27 @@ describe("MemorySessionStore tenant purge plan", () => {
       tenantId, source.request.requestId,
     )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
     store.tenantTelemetrySourceAccountingEntries.set(tamperKey, originalEntry);
+    const [manifestKey, originalManifest] = [...store.tenantTelemetryTargetManifestEntries]
+      .find(([, entry]) => entry.requestId === source.request.requestId)!;
+    store.tenantTelemetryTargetManifestEntries.set(manifestKey, {
+      ...originalManifest, observedTargetSha256: "f".repeat(64),
+    });
+    await expect(store.getTenantTelemetryTargetManifestReceipt(
+      tenantId, source.request.requestId,
+    )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+    store.tenantTelemetryTargetManifestEntries.set(manifestKey, originalManifest);
+    const oldEntries = store.tenantTelemetryTargetManifestEntries;
+    const oldReceipts = store.tenantTelemetryTargetManifestReceipts;
+    store.tenantTelemetryTargetManifestEntries = new Map();
+    store.tenantTelemetryTargetManifestReceipts = new Map();
+    expect(await store.getTenantTelemetryTargetManifestReceipt(
+      tenantId, source.request.requestId,
+    )).toBeNull();
+    expect(await store.getTenantTelemetryTargetSourceReadiness(
+      tenantId, source.request.requestId,
+    )).toBeNull();
+    store.tenantTelemetryTargetManifestEntries = oldEntries;
+    store.tenantTelemetryTargetManifestReceipts = oldReceipts;
   });
 
   it("fails KMS closed when T3a erased provider material but no tenant auth secret", async () => {

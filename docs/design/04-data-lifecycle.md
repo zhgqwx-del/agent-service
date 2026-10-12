@@ -167,6 +167,8 @@ Redis mutation与MySQL ACK不是一个分布式事务，而是exact marker + res
 
 `0040_tenant_telemetry_source_accounting.sql`只为新T3d seal增加content-free来源账本，不是外部删除目录或授权。Memory单一原子发布/MySQL同一RR事务把当时的inventory、write job、ACK、0038 membership及0035 producer binding逐行封存，另写绑定T3d terminal receipt、count/root和unknown集合的aggregate；没有任何源也必须seal空集合。legacy缺membership、unfinished write、缺binding或孤立源均记为`unknown`，后续job/ACK推进不得回写旧快照。pre-0040 terminal缺aggregate只能是unknown，不能按零源解释或事后补造。MySQL用五表full-range locking read、append-only guards和同事务terminal guard关闭并发遗漏；新增位于0039旧指纹范围内的冗余hard-deny trigger，让pre-0040 binary在新schema启动时fail closed。独立migration前须停写并排空旧T3d writer，之后只forward-fix；migration不回填、不联网、不激活、不发grant、不删除/恢复外部对象。T3d logs/traces继续零target blocker，0037 grant hard-deny、产品外部mutation拒绝和全域completion=false不变。当前全库locking scan仍需真实staging容量、写阻塞、lease和死锁验证。
 
+`0041_tenant_telemetry_target_manifest.sql`只给新T3d封存逐artifact**观察**目标集合，与33域零执行target严格分开。Memory单一原子发布/MySQL同一RR事务为每条0040 source写精确对应的manifest entry，并将group/source/观察目标/unknown count与root绑定0040 receipt和T3d terminal receipt；零源也显式封存空receipt。只有完整五源、written job/ACK、精确target tuple及当时canonical owner与keyed ref闭合才记录一个观察目标；缺job inventory、legacy/未完成及孤立来源均为unknown/零观察目标，不派生locator或owner。pre-0041 terminal缺receipt不能解释为空集合或事后补造；T3f后的只读source-readiness还对账已验证0039 owner closure与session grave，固定`executionReady=false`，不返回删除authority。MySQL严格111-trigger指纹和terminal guard要求先排空pre-0041 T3d writer再独立迁移，旧binary不能在新schema热混跑；grant hard-deny、产品外部mutation/restore拒绝和全域completion=false保持。历史旧terminal的真实pre-0041 binary升级仍需单独验证，staging还须检查锁范围、lease和N-1发布。
+
 ## 2. 生命周期模型与不变量
 
 运行状态与生命周期状态正交：
