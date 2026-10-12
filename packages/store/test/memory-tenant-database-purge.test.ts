@@ -15,12 +15,14 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   BLOB_STORAGE_FORMAT,
+  TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
   EMPTY_TENANT_DATABASE_PURGE_DOMAIN_ACK_ROOT_SHA256,
   MemorySessionStore,
   SessionGoneError,
   TENANT_REDIS_PURGE_ADAPTER_PROTOCOL,
   TenantDatabasePurgeEvidenceChangedError,
   TenantDatabasePurgeNotReadyError,
+  TenantErasureIntegrityError,
   computeBillingUsageFactSha256,
   newErasureRequestId,
   newUserDataExportRequestId,
@@ -44,6 +46,13 @@ import {
   tenantDatabasePurgeTargetSha256,
   tenantErasureRequestHash,
   tenantRedisPurgeMarkerSha256,
+  tenantTelemetryWriteAdapterEvidenceSha256,
+  createTenantTelemetryOwnerClosureEntry,
+  tenantTelemetryCanonicalOwnerProofSha256,
+  tenantTelemetryOwnerClosureEntrySha256,
+  tenantTelemetryOwnerClosureEntryRootSha256,
+  tenantTelemetryOwnerClosureReceiptSha256,
+  tenantTelemetryRefKeyIdSha256,
   userDataExportRequestHash,
   type RetentionPolicyDocumentV1,
   type TenantContentInventoryAuthorization,
@@ -59,13 +68,76 @@ import {
   type TenantRedisPurgeAuthorization,
   type TenantRedisPurgeJobRecord,
   type TenantRedisPurgeTarget,
+  type TenantTelemetryWriteClaim,
   type TenantPurgeExecutionAuthorization,
   type TenantPurgePlanAuthorization,
   type TenantRuntimeRevocationAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
 
 const NOW = 40_000;
+const TELEMETRY_REF_KEY = new Uint8Array(32).fill(27);
+const telemetryDigest = (digit: string) => digit.repeat(64);
+
+async function activateTelemetryForT3f(store: MemorySessionStore): Promise<void> {
+  await store.activateTenantTelemetryLifecycle({
+    expectedControlGeneration: 0,
+    targets: [
+      {
+        domain: "logs", backendKind: "memory", adapterProtocol: "telemetry-memory-v1",
+        namespaceSha256: telemetryDigest("1"), failureDomainSha256: telemetryDigest("2"),
+      },
+      {
+        domain: "traces", backendKind: "memory", adapterProtocol: "telemetry-memory-v1",
+        namespaceSha256: telemetryDigest("3"), failureDomainSha256: telemetryDigest("4"),
+      },
+    ],
+  });
+}
+
+async function queueTelemetryForT3f(
+  store: MemorySessionStore,
+  tenantId: string,
+  owner: { kind: "tenant"; id: string; userId: null }
+    | { kind: "user"; id: string; userId: string }
+    | { kind: "session"; id: string; userId: string },
+  artifactIdSha256 = telemetryDigest("5"),
+) {
+  return store.enqueueTenantTelemetryArtifact({
+    tenantId,
+    expectedControlGeneration: 1,
+    domain: "logs",
+    artifactIdSha256,
+    artifactGeneration: 1,
+    ownerKind: owner.kind,
+    ownerId: owner.id,
+    ownerUserId: owner.userId,
+    sourceSchema: "structured-log-batch-v1",
+    sourceGeneration: 0,
+    sourceHighWaterDbMs: 1_100,
+    payload: {
+      schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
+      domain: "logs",
+      records: [trustedRunnerTelemetryRecord(1_100, {
+        opaqueRefKey: TELEMETRY_REF_KEY,
+        tenantValue: tenantId,
+        ownerKind: owner.kind,
+        ownerValue: owner.id,
+        attempt: 1,
+      })],
+    },
+  });
+}
+
+function telemetryWriteAuthorization(claim: TenantTelemetryWriteClaim) {
+  return {
+    writeOperationSha256: claim.writeOperationSha256,
+    tenantId: claim.tenantId,
+    claimAttempt: claim.claimAttempt,
+    claimToken: claim.claimToken,
+  };
+}
 
 interface CredentialRolloutClock {
   advance(): void;
@@ -996,6 +1068,298 @@ function fullyRehashT3fEvidence(
 }
 
 describe("MemorySessionStore tenant database purge", () => {
+  it("atomically seals an empty telemetry owner-closure receipt on a new T3f execution", async () => {
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
+    const tenantId = "tenant-database-empty-telemetry-closure";
+    const source = await advanceToDatabaseClaim(store, tenantId);
+    expect(await store.getTenantTelemetryOwnerClosureReceipt(
+      tenantId, source.request.requestId,
+    )).toBeNull();
+    expect(await store.executeTenantDatabasePurge(source.authorization)).not.toBeNull();
+    const closure = await store.getTenantTelemetryOwnerClosureReceipt(
+      tenantId, source.request.requestId,
+    );
+    expect(closure).toMatchObject({
+      tenantId, requestId: source.request.requestId,
+      entryCount: 0,
+      entryRootSha256: tenantTelemetryOwnerClosureEntryRootSha256([]),
+    });
+    expect(await store.getTenantTelemetryOwnerClosureEntries(
+      tenantId, source.request.requestId,
+    )).toEqual([]);
+    expect(await store.getTenantTelemetryOwnerClosureReceipt(
+      "another-tenant", source.request.requestId,
+    )).toBeNull();
+    expect(await store.executeTenantDatabasePurge(source.authorization)).not.toBeNull();
+    expect(await store.getTenantTelemetryOwnerClosureReceipt(
+      tenantId, source.request.requestId,
+    )).toEqual(closure);
+  });
+
+  it("binds queued tenant/session telemetry jobs to live owners and T3f graves before deletion", async () => {
+    const store = memoryStoreWithCredentialRolloutClock(
+      { now: () => NOW }, { tenantTelemetryRefKey: TELEMETRY_REF_KEY },
+    );
+    await activateTelemetryForT3f(store);
+    const tenantId = "tenant-database-telemetry-membership";
+    const target = installSession(store, tenantId, "telemetry-owner-user");
+    const operations: string[] = [];
+    const source = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: async () => {
+        await target.install();
+        const tenantJob = await queueTelemetryForT3f(
+          store, tenantId, { kind: "tenant", id: tenantId, userId: null },
+        );
+        const sessionJob = await queueTelemetryForT3f(
+          store, tenantId,
+          { kind: "session", id: target.session.id, userId: target.session.userId },
+          telemetryDigest("6"),
+        );
+        const userJob = await queueTelemetryForT3f(
+          store, tenantId,
+          { kind: "user", id: target.session.userId, userId: target.session.userId },
+          telemetryDigest("7"),
+        );
+        operations.push(
+          tenantJob.writeOperationSha256,
+          sessionJob.writeOperationSha256,
+          userJob.writeOperationSha256,
+        );
+      },
+    });
+    const membership = store.tenantTelemetryArtifactMemberships.get(operations[0]!)!;
+    expect(membership.inventoryCreatedAtDbMs).toBeGreaterThan(0);
+    const { claimAttempt: _attempt, claimToken: _token, ...identity } = source.authorization;
+    expect(() => createTenantTelemetryOwnerClosureEntry({
+      identity,
+      membership,
+      canonicalOwnerId: tenantId,
+      canonicalOwnerUserId: null,
+      refKey: TELEMETRY_REF_KEY,
+      sessionGraveMarkerSha256: null,
+      preDeleteReceiptSha256: telemetryDigest("a"),
+      capturedAtDbMs: membership.inventoryCreatedAtDbMs - 1,
+    })).toThrow();
+    const receipt = await store.executeTenantDatabasePurge(source.authorization);
+    expect(receipt).not.toBeNull();
+    expect(store.sessions.has(target.session.id)).toBe(false);
+    const closure = await store.getTenantTelemetryOwnerClosureReceipt(
+      tenantId, source.request.requestId,
+    );
+    const entries = await store.getTenantTelemetryOwnerClosureEntries(
+      tenantId, source.request.requestId,
+    );
+    expect(closure).toMatchObject({
+      entryCount: 3,
+      entryRootSha256: tenantTelemetryOwnerClosureEntryRootSha256(entries),
+      t3fReceiptSha256: receipt?.receiptSha256,
+    });
+    expect(entries.map((entry) => entry.writeOperationSha256).sort())
+      .toEqual(operations.sort());
+    const sessionEntry = entries.find((entry) => entry.ownerKind === "session");
+    const grave = await store.getTenantPurgeSessionGraveMarker(tenantId, target.session.id);
+    expect(sessionEntry?.sessionGraveMarkerSha256).toBe(grave?.markerSha256);
+    expect(entries.every((entry) => entry.refKeyIdSha256
+      === tenantTelemetryRefKeyIdSha256(TELEMETRY_REF_KEY))).toBe(true);
+    expect(JSON.stringify({ closure, entries })).not.toContain(target.session.userId);
+    expect(store.tenantTelemetryDispositionAuthorizationGrants).toHaveLength(0);
+  });
+
+  it("rejects a closure when non-owner membership source fields change after T3f", async () => {
+    const store = memoryStoreWithCredentialRolloutClock(
+      { now: () => NOW }, { tenantTelemetryRefKey: TELEMETRY_REF_KEY },
+    );
+    await activateTelemetryForT3f(store);
+    const tenantId = "tenant-database-telemetry-source-drift";
+    let operationSha256 = "";
+    const source = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: async () => {
+        const job = await queueTelemetryForT3f(
+          store, tenantId, { kind: "tenant", id: tenantId, userId: null },
+        );
+        operationSha256 = job.writeOperationSha256;
+      },
+    });
+    await store.executeTenantDatabasePurge(source.authorization);
+    const original = store.tenantTelemetryArtifactMemberships.get(operationSha256)!;
+    const readClosure = () => store.getTenantTelemetryOwnerClosureReceipt(
+      tenantId, source.request.requestId,
+    );
+    expect(await readClosure()).toMatchObject({ entryCount: 1 });
+
+    for (const altered of [
+      { ...original, sourceHighWaterDbMs: original.sourceHighWaterDbMs + 1 },
+      { ...original, applicationBindingReceiptSha256: telemetryDigest("b") },
+    ]) {
+      store.tenantTelemetryArtifactMemberships.set(operationSha256, altered);
+      await expect(readClosure()).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      store.tenantTelemetryArtifactMemberships.set(operationSha256, original);
+      expect(await readClosure()).toMatchObject({ entryCount: 1 });
+    }
+  });
+
+  it("rejects a rehashed closure redirected to another valid session grave", async () => {
+    const store = memoryStoreWithCredentialRolloutClock(
+      { now: () => NOW }, { tenantTelemetryRefKey: TELEMETRY_REF_KEY },
+    );
+    await activateTelemetryForT3f(store);
+    const tenantId = "tenant-database-telemetry-grave-redirect";
+    const first = installSession(store, tenantId, "telemetry-first-user");
+    const second = installSession(store, tenantId, "telemetry-second-user");
+    const source = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: async () => {
+        await first.install();
+        await second.install();
+        await queueTelemetryForT3f(store, tenantId, {
+          kind: "session", id: first.session.id, userId: first.session.userId,
+        });
+      },
+    });
+    await store.executeTenantDatabasePurge(source.authorization);
+    const entry = (await store.getTenantTelemetryOwnerClosureEntries(
+      tenantId, source.request.requestId,
+    ))[0]!;
+    const closure = (await store.getTenantTelemetryOwnerClosureReceipt(
+      tenantId, source.request.requestId,
+    ))!;
+    const otherGrave = (await store.getTenantPurgeSessionGraveMarker(
+      tenantId, second.session.id,
+    ))!;
+    const { receiptSha256: _entryHash, ...entryBody } = entry;
+    const redirectedBody = {
+      ...entryBody,
+      sessionGraveMarkerSha256: otherGrave.markerSha256,
+    };
+    redirectedBody.canonicalOwnerProofSha256 = tenantTelemetryCanonicalOwnerProofSha256(
+      redirectedBody,
+    );
+    const redirected = {
+      ...redirectedBody,
+      receiptSha256: tenantTelemetryOwnerClosureEntrySha256(redirectedBody),
+    };
+    store.tenantTelemetryOwnerClosureEntries.set(
+      JSON.stringify([entry.requestId, entry.writeOperationSha256]), redirected,
+    );
+    const { receiptSha256: _closureHash, ...closureBody } = closure;
+    const redirectedClosureBody = {
+      ...closureBody,
+      entryRootSha256: tenantTelemetryOwnerClosureEntryRootSha256([redirected]),
+    };
+    store.tenantTelemetryOwnerClosureReceipts.set(source.request.requestId, {
+      ...redirectedClosureBody,
+      receiptSha256: tenantTelemetryOwnerClosureReceiptSha256(redirectedClosureBody),
+    });
+    await expect(store.getTenantTelemetryOwnerClosureReceipt(
+      tenantId, source.request.requestId,
+    )).rejects.toThrow();
+  });
+
+  it("includes queued, reserved, blocked and written telemetry operations in one closure", async () => {
+    const store = memoryStoreWithCredentialRolloutClock(
+      { now: () => NOW }, { tenantTelemetryRefKey: TELEMETRY_REF_KEY },
+    );
+    await activateTelemetryForT3f(store);
+    const tenantId = "tenant-database-telemetry-all-phases";
+    const operations: string[] = [];
+    const source = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: async () => {
+        for (const digit of ["5", "6", "7", "8"]) {
+          const job = await queueTelemetryForT3f(
+            store, tenantId, { kind: "tenant", id: tenantId, userId: null },
+            telemetryDigest(digit),
+          );
+          operations.push(job.writeOperationSha256);
+        }
+        const claims = await store.claimTenantTelemetryWriteJobs({
+          limit: 3, leaseMs: 100_000, claimToken: "telemetry-all-phases",
+          adapterProtocol: "telemetry-memory-v1",
+        });
+        expect(claims).toHaveLength(3);
+        const written = claims[0]!;
+        const writtenAuth = telemetryWriteAuthorization(written);
+        expect(await store.reserveTenantTelemetryExternalMutation(
+          writtenAuth, "telemetry-memory-v1",
+        ))
+          .not.toBeNull();
+        const evidence = {
+          adapterProtocol: written.target.adapterProtocol,
+          domain: written.inventory.domain,
+          targetSha256: written.target.targetSha256,
+          writeOperationSha256: written.writeOperationSha256,
+          artifactIdSha256: written.inventory.artifactIdSha256,
+          artifactGeneration: written.inventory.artifactGeneration,
+          payloadSha256: written.inventory.payloadSha256,
+          manifestSha256: written.inventory.manifestSha256,
+          outcome: "written" as const,
+          replayed: false,
+        };
+        expect(await store.completeTenantTelemetryWrite(writtenAuth, {
+          ...evidence,
+          evidenceSha256: tenantTelemetryWriteAdapterEvidenceSha256(evidence),
+        })).not.toBeNull();
+        expect(await store.reserveTenantTelemetryExternalMutation(
+          telemetryWriteAuthorization(claims[1]!), "telemetry-memory-v1",
+        )).not.toBeNull();
+        expect(await store.blockTenantTelemetryWrite(
+          telemetryWriteAuthorization(claims[2]!),
+        )).toBe(true);
+      },
+    });
+    const phases = [...store.tenantTelemetryWriteJobs.values()]
+      .filter((job) => job.tenantId === tenantId);
+    expect(phases.filter((job) => job.phase === "written")).toHaveLength(1);
+    expect(phases.filter((job) => job.phase === "blocked")).toHaveLength(1);
+    expect(phases.filter((job) => job.phase === "queued" && job.reservation)).toHaveLength(1);
+    expect(phases.filter((job) => job.phase === "queued" && !job.reservation)).toHaveLength(1);
+    expect(await store.executeTenantDatabasePurge(source.authorization)).not.toBeNull();
+    const entries = await store.getTenantTelemetryOwnerClosureEntries(
+      tenantId, source.request.requestId,
+    );
+    expect(entries).toHaveLength(4);
+    expect(entries.map((entry) => entry.writeOperationSha256).sort()).toEqual(operations.sort());
+    expect((await store.getTenantTelemetryOwnerClosureReceipt(
+      tenantId, source.request.requestId,
+    ))?.entryCount).toBe(4);
+  });
+
+  it("rolls back T3f when a legacy telemetry job lacks membership or closure publication fails", async () => {
+    const store = memoryStoreWithCredentialRolloutClock(
+      { now: () => NOW }, { tenantTelemetryRefKey: TELEMETRY_REF_KEY },
+    );
+    await activateTelemetryForT3f(store);
+    const tenantId = "tenant-database-telemetry-rollback";
+    const target = installSession(store, tenantId, "telemetry-rollback-user");
+    let operationSha256 = "";
+    const source = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: async () => {
+        await target.install();
+        const telemetryJob = await queueTelemetryForT3f(
+          store, tenantId,
+          { kind: "session", id: target.session.id, userId: target.session.userId },
+        );
+        operationSha256 = telemetryJob.writeOperationSha256;
+      },
+    });
+    const sidecar = store.tenantTelemetryArtifactMemberships.get(operationSha256)!;
+    store.tenantTelemetryArtifactMemberships.delete(operationSha256);
+    await expect(store.executeTenantDatabasePurge(source.authorization)).rejects.toThrow();
+    expect(store.sessions.has(target.session.id)).toBe(true);
+    expect(store.tenantDatabasePurgeReceipts.size).toBe(0);
+    expect(store.tenantTelemetryOwnerClosureReceipts.size).toBe(0);
+    store.tenantTelemetryArtifactMemberships.set(operationSha256, sidecar);
+
+    store.tenantTelemetryOwnerClosureReceipts = new FailOnceMap(
+      store.tenantTelemetryOwnerClosureReceipts,
+    );
+    await expect(store.executeTenantDatabasePurge(source.authorization))
+      .rejects.toThrow("injected database purge publication failure");
+    expect(store.sessions.has(target.session.id)).toBe(true);
+    expect(store.tenantTelemetryOwnerClosureEntries.size).toBe(0);
+    expect(store.tenantTelemetryOwnerClosureReceipts.size).toBe(0);
+    expect(store.tenantDatabasePurgeReceipts.size).toBe(0);
+    expect(await store.executeTenantDatabasePurge(source.authorization)).not.toBeNull();
+  });
+
   it("publishes the fixed zero-target catalog and exact replay without claiming global completion", async () => {
     const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
     const tenantId = "tenant-database-empty";

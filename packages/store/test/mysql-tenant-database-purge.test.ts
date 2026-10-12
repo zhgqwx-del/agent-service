@@ -17,6 +17,7 @@ import {
   SessionGoneError,
   TenantDatabasePurgeEvidenceChangedError,
   TenantErasureIntegrityError,
+  TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
   USER_DATA_EXPORT_CONTENT_TYPE,
   newErasureRequestId,
   newUserDataExportArtifactId,
@@ -33,6 +34,9 @@ import {
   tenantDatabasePurgeSessionGraveMarkerRootSha256,
   tenantDatabasePurgeSessionGraveMarkerSha256,
   tenantErasureRequestHash,
+  tenantTelemetryOwnerClosureEntryRootSha256,
+  tenantTelemetryRefKeyIdSha256,
+  tenantTelemetryWriteAdapterEvidenceSha256,
   userDataExportAuthorization,
   userDataExportIdempotencyKeySha256,
   userDataExportManifestSha256,
@@ -46,12 +50,117 @@ import {
   type TenantPurgePlanAuthorization,
   type TenantRuntimeRevocationAuthorization,
   type TenantRuntimeRevocationClaim,
+  type TenantTelemetryWriteClaim,
   type UserDataExportAuthorization,
 } from "../src/index.js";
 import { mkSession, newId } from "./conformance.js";
+import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
 
 const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
+const TELEMETRY_REF_KEY = Buffer.alloc(32, 0x45);
+
+function telemetryDigest(label: string): string {
+  return createHash("sha256").update(label).digest("hex");
+}
+
+async function activateTelemetryForT3f(store: MysqlSessionStore): Promise<void> {
+  await store.activateTenantTelemetryLifecycle({
+    expectedControlGeneration: 0,
+    targets: ["logs", "traces"].map((domain) => ({
+      domain: domain as "logs" | "traces",
+      backendKind: "test_sink",
+      adapterProtocol: "telemetry-test-v1",
+      namespaceSha256: telemetryDigest(`${domain}:namespace`),
+      failureDomainSha256: telemetryDigest(`${domain}:failure-domain`),
+    })),
+  });
+}
+
+async function queueTelemetryForT3f(
+  store: MysqlSessionStore,
+  tenantId: string,
+  marker: string,
+  owner: { kind: "tenant"; id: string; userId: null }
+    | { kind: "user"; id: string; userId: string }
+    | { kind: "session"; id: string; userId: string },
+) {
+  const atMs = Date.now() - 1_000;
+  return store.enqueueTenantTelemetryArtifact({
+    tenantId,
+    expectedControlGeneration: 1,
+    domain: "logs",
+    artifactIdSha256: telemetryDigest(`${marker}:artifact`),
+    artifactGeneration: 1,
+    ownerKind: owner.kind,
+    ownerId: owner.id,
+    ownerUserId: owner.userId,
+    sourceSchema: "structured-log-batch-v1",
+    sourceGeneration: 0,
+    sourceHighWaterDbMs: atMs,
+    payload: {
+      schema: TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
+      domain: "logs",
+      records: [trustedRunnerTelemetryRecord(atMs, {
+        opaqueRefKey: TELEMETRY_REF_KEY,
+        tenantValue: tenantId,
+        ownerKind: owner.kind,
+        ownerValue: owner.id,
+        attempt: 1,
+      })],
+    },
+  });
+}
+
+function telemetryAuthorization(claim: TenantTelemetryWriteClaim) {
+  return {
+    writeOperationSha256: claim.writeOperationSha256,
+    tenantId: claim.tenantId,
+    claimAttempt: claim.claimAttempt,
+    claimToken: claim.claimToken,
+  };
+}
+
+function telemetryAdapterResult(claim: TenantTelemetryWriteClaim) {
+  const evidence = {
+    adapterProtocol: claim.target.adapterProtocol,
+    domain: claim.inventory.domain,
+    targetSha256: claim.target.targetSha256,
+    writeOperationSha256: claim.writeOperationSha256,
+    artifactIdSha256: claim.inventory.artifactIdSha256,
+    artifactGeneration: claim.inventory.artifactGeneration,
+    payloadSha256: claim.inventory.payloadSha256,
+    manifestSha256: claim.inventory.manifestSha256,
+    outcome: "written" as const,
+    replayed: false,
+  };
+  return {
+    ...evidence,
+    evidenceSha256: tenantTelemetryWriteAdapterEvidenceSha256(evidence),
+  };
+}
+
+async function waitForTelemetryWriteLockWaiter(
+  observer: Connection,
+  database: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [rows] = await observer.query<RowDataPacket[]>(
+      `SELECT COUNT(DISTINCT waits.REQUESTING_ENGINE_TRANSACTION_ID) AS waiters
+         FROM performance_schema.data_lock_waits waits
+         JOIN performance_schema.data_locks requested
+           ON requested.ENGINE_LOCK_ID=waits.REQUESTING_ENGINE_LOCK_ID
+        WHERE requested.OBJECT_SCHEMA=?
+          AND requested.OBJECT_NAME='tenant_telemetry_write_jobs'`,
+      [database],
+    );
+    if (Number(rows[0]?.waiters ?? 0) > 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for telemetry write job lock");
+}
 
 function assertDisposableTestTarget(rawUrl: string): URL {
   const url = new URL(rawUrl);
@@ -286,7 +395,11 @@ async function advanceToDatabasePurgeClaim(
   conn: Connection,
   tenantId: string,
   userId: string,
-  options: { seedCompletedBlob?: boolean; seedReadyExport?: boolean } = {},
+  options: {
+    seedCompletedBlob?: boolean;
+    seedReadyExport?: boolean;
+    beforeTenantErasure?: (sessionId: string) => Promise<void>;
+  } = {},
 ) {
   await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
   await installPolicy(store, tenantId);
@@ -362,6 +475,7 @@ async function advanceToDatabasePurgeClaim(
     );
     completedBlob = { blobId, outboxId: inserted.insertId, createdAtMs };
   }
+  await options.beforeTenantErasure?.(session.id);
   if ((await store.readTenantCredentialTrackingCutover()).controlGeneration === 0) {
     await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
   }
@@ -794,6 +908,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         )).toHaveLength(11);
         expect(await first.getTenantPurgeSessionGraveMarker(tenantId, source.session.id))
           .toMatchObject({ sessionId: source.session.id, deletionGeneration: 1 });
+        expect(await first.getTenantTelemetryOwnerClosureEntries(
+          tenantId, source.requestId,
+        )).toEqual([]);
+        expect(await first.getTenantTelemetryOwnerClosureReceipt(
+          tenantId, source.requestId,
+        )).toMatchObject({
+          entryCount: 0,
+          t3fReceiptSha256: receipt?.receiptSha256,
+        });
         const [rows] = await conn.query<RowDataPacket[]>(
           `SELECT t.name, t.auth_policy, t.auth_secret_cipher, t.auth_secret_key_id,
              (SELECT COUNT(*) FROM sessions WHERE tenant_id=?) AS sessions,
@@ -810,10 +933,404 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           billing: 1,
         });
         expect(await first.executeTenantDatabasePurge(source.authorization)).toEqual(receipt);
+        const verified = await MysqlSessionStore.connect({
+          url: mysqlUrl, migrationMode: "verify",
+        });
+        await verified.close();
       } finally {
         await conn.end();
         await first.close();
         await second.close();
+      }
+    });
+
+    it("captures every telemetry phase from canonical tenant, user and session owners before T3f delete", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-telemetry-${randomUUID()}`;
+      const userId = `telemetry-user-${randomUUID()}`;
+      const operations: string[] = [];
+      try {
+        await activateTelemetryForT3f(store);
+        const source = await advanceToDatabasePurgeClaim(store, conn, tenantId, userId, {
+          beforeTenantErasure: async (sessionId) => {
+            for (const [marker, owner] of [
+              ["queued", { kind: "tenant", id: tenantId, userId: null }],
+              ["reserved", { kind: "user", id: userId, userId }],
+              ["written", { kind: "session", id: sessionId, userId }],
+              ["blocked", { kind: "tenant", id: tenantId, userId: null }],
+            ] as const) {
+              const job = await queueTelemetryForT3f(store, tenantId, marker, owner);
+              operations.push(job.writeOperationSha256);
+            }
+            const claims = await store.claimTenantTelemetryWriteJobs({
+              limit: 3,
+              leaseMs: 120_000,
+              claimToken: `telemetry-closure-${randomUUID()}`,
+              adapterProtocol: "telemetry-test-v1",
+            });
+            expect(claims).toHaveLength(3);
+            expect(await store.reserveTenantTelemetryExternalMutation(
+              telemetryAuthorization(claims[0]!), "telemetry-test-v1",
+            )).not.toBeNull();
+            expect(await store.reserveTenantTelemetryExternalMutation(
+              telemetryAuthorization(claims[1]!), "telemetry-test-v1",
+            )).not.toBeNull();
+            const written = claims[1]!;
+            expect(await store.completeTenantTelemetryWrite(
+              telemetryAuthorization(written), telemetryAdapterResult(written),
+            )).not.toBeNull();
+            expect(await store.blockTenantTelemetryWrite(
+              telemetryAuthorization(claims[2]!),
+            )).toBe(true);
+          },
+        });
+        const [phases] = await conn.query<RowDataPacket[]>(
+          "SELECT phase,mutation_reservation_receipt_sha256 FROM tenant_telemetry_write_jobs WHERE tenant_id=?",
+          [tenantId],
+        );
+        expect(phases.filter((row) => row.phase === "written")).toHaveLength(1);
+        expect(phases.filter((row) => row.phase === "blocked")).toHaveLength(1);
+        expect(phases.filter((row) => row.phase === "queued"
+          && row.mutation_reservation_receipt_sha256))
+          .toHaveLength(1);
+        expect(phases.filter((row) => row.phase === "queued"
+          && !row.mutation_reservation_receipt_sha256))
+          .toHaveLength(1);
+
+        const terminal = await store.executeTenantDatabasePurge(source.authorization);
+        expect(terminal?.allDomainsComplete).toBe(false);
+        const entries = await store.getTenantTelemetryOwnerClosureEntries(
+          tenantId, source.requestId,
+        );
+        const closure = await store.getTenantTelemetryOwnerClosureReceipt(
+          tenantId, source.requestId,
+        );
+        expect(entries.map((entry) => entry.writeOperationSha256).sort())
+          .toEqual(operations.sort());
+        expect(entries.map((entry) => entry.ownerKind).sort())
+          .toEqual(["session", "tenant", "tenant", "user"]);
+        expect(closure).toMatchObject({
+          entryCount: 4,
+          entryRootSha256: tenantTelemetryOwnerClosureEntryRootSha256(entries),
+          t3fReceiptSha256: terminal?.receiptSha256,
+        });
+        const grave = await store.getTenantPurgeSessionGraveMarker(tenantId, source.session.id);
+        expect(entries.find((entry) => entry.ownerKind === "session")
+          ?.sessionGraveMarkerSha256).toBe(grave?.markerSha256);
+        expect(entries.every((entry) => entry.refKeyIdSha256
+          === tenantTelemetryRefKeyIdSha256(TELEMETRY_REF_KEY))).toBe(true);
+        expect(JSON.stringify({ entries, closure })).not.toContain(userId);
+        expect(JSON.stringify({ entries, closure })).not.toContain(source.session.id);
+        expect(await store.getTenantTelemetryOwnerClosureReceipt(
+          "another-tenant", source.requestId,
+        )).toBeNull();
+        expect(await store.getTenantTelemetryOwnerClosureEntries(
+          "another-tenant", source.requestId,
+        )).toEqual([]);
+        expect(await store.executeTenantDatabasePurge(source.authorization)).toEqual(terminal);
+        const restarted = await MysqlSessionStore.connect({
+          url: mysqlUrl,
+          migrationMode: "verify",
+          tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+        });
+        try {
+          expect(await restarted.getTenantTelemetryOwnerClosureReceipt(
+            tenantId, source.requestId,
+          )).toEqual(closure);
+        } finally {
+          await restarted.close();
+        }
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("serializes a reserved telemetry write completion behind the T3f closure range lock", async () => {
+      const purger = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const writer = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const observer = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-telemetry-race-${randomUUID()}`;
+      const userId = `telemetry-race-user-${randomUUID()}`;
+      let releaseDelete!: () => void;
+      let deletionReached!: () => void;
+      const holdDelete = new Promise<void>((resolve) => { releaseDelete = resolve; });
+      const atDelete = new Promise<void>((resolve) => { deletionReached = resolve; });
+      let purge: Promise<unknown> | undefined;
+      let completion: Promise<unknown> | undefined;
+      try {
+        await activateTelemetryForT3f(purger);
+        let claim: TenantTelemetryWriteClaim | undefined;
+        const source = await advanceToDatabasePurgeClaim(
+          purger, observer, tenantId, userId, {
+            beforeTenantErasure: async (sessionId) => {
+              await queueTelemetryForT3f(purger, tenantId, "race-reserved", {
+                kind: "session", id: sessionId, userId,
+              });
+              [claim] = await purger.claimTenantTelemetryWriteJobs({
+                limit: 1,
+                leaseMs: 120_000,
+                claimToken: `telemetry-race-${randomUUID()}`,
+                adapterProtocol: "telemetry-test-v1",
+              });
+              if (!claim || !await purger.reserveTenantTelemetryExternalMutation(
+                telemetryAuthorization(claim), "telemetry-test-v1",
+              )) throw new Error("missing reserved telemetry write fixture");
+            },
+          },
+        );
+        if (!claim) throw new Error("missing telemetry write claim fixture");
+        const reserved = claim;
+        const internal = purger as unknown as {
+          deleteTenantDatabasePurgeTargets: (...args: unknown[]) => Promise<void>;
+        };
+        const original = internal.deleteTenantDatabasePurgeTargets;
+        internal.deleteTenantDatabasePurgeTargets = async (...args: unknown[]) => {
+          deletionReached();
+          await holdDelete;
+          await original.apply(purger, args);
+        };
+        purge = purger.executeTenantDatabasePurge(source.authorization);
+        await within(atDelete, 5_000, "telemetry closure pre-delete interleaving");
+        completion = writer.completeTenantTelemetryWrite(
+          telemetryAuthorization(reserved), telemetryAdapterResult(reserved),
+        );
+        await waitForTelemetryWriteLockWaiter(observer, database);
+        releaseDelete();
+        await expect(within(purge, 5_000, "telemetry closure commit"))
+          .resolves.toMatchObject({ localDatabasePurgeComplete: true });
+        await expect(within(completion, 5_000, "reserved telemetry write completion"))
+          .resolves.toMatchObject({ writeOperationSha256: reserved.writeOperationSha256 });
+        const entries = await purger.getTenantTelemetryOwnerClosureEntries(
+          tenantId, source.requestId,
+        );
+        expect(entries.map((entry) => entry.writeOperationSha256))
+          .toEqual([reserved.writeOperationSha256]);
+        expect((await purger.getTenantTelemetryOwnerClosureReceipt(
+          tenantId, source.requestId,
+        ))?.entryCount).toBe(1);
+        expect((await writer.getTenantTelemetryWriteJob(
+          tenantId, reserved.writeOperationSha256,
+        ))?.phase).toBe("written");
+      } finally {
+        releaseDelete?.();
+        await Promise.allSettled([...(purge ? [purge] : []), ...(completion ? [completion] : [])]);
+        await observer.end();
+        await purger.close();
+        await writer.close();
+      }
+    });
+
+    it("rolls back a post-closure-publication failure and replays without partial evidence", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-closure-fault-${randomUUID()}`;
+      const sourceUserId = `closure-fault-user-${randomUUID()}`;
+      try {
+        await activateTelemetryForT3f(store);
+        const source = await advanceToDatabasePurgeClaim(
+          store, conn, tenantId, sourceUserId, {
+            beforeTenantErasure: async (sessionId) => {
+              await queueTelemetryForT3f(store, tenantId, "publication-fault", {
+                kind: "session", id: sessionId, userId: sourceUserId,
+              });
+            },
+          },
+        );
+        const internal = store as unknown as {
+          lockTenantPurgePlanHoldProof: (...args: unknown[]) => Promise<void>;
+        };
+        const original = internal.lockTenantPurgePlanHoldProof;
+        internal.lockTenantPurgePlanHoldProof = async (...args: unknown[]) => {
+          const [rows] = await (args[0] as Connection).query<RowDataPacket[]>(
+            "SELECT COUNT(*) AS receipts FROM tenant_telemetry_owner_closure_receipts WHERE tenant_id=?",
+            [tenantId],
+          );
+          if (Number(rows[0]?.receipts ?? 0) > 0) {
+            throw new Error("injected post-closure-publication failure");
+          }
+          await original.apply(store, args);
+        };
+        await expect(store.executeTenantDatabasePurge(source.authorization))
+          .rejects.toThrow("injected post-closure-publication failure");
+        internal.lockTenantPurgePlanHoldProof = original;
+        const [rows] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM sessions WHERE tenant_id=?) AS sessions,
+             (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_entries
+               WHERE tenant_id=?) AS closure_entries,
+             (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_receipts
+               WHERE tenant_id=?) AS closure_receipts,
+             (SELECT COUNT(*) FROM tenant_database_purge_receipts
+               WHERE tenant_id=?) AS t3f_receipts,
+             (SELECT phase FROM tenant_database_purge_jobs WHERE tenant_id=?) AS phase`,
+          [tenantId, tenantId, tenantId, tenantId, tenantId],
+        );
+        expect(rows[0]).toMatchObject({
+          sessions: 1,
+          closure_entries: 0,
+          closure_receipts: 0,
+          t3f_receipts: 0,
+          phase: "queued",
+        });
+        const receipt = await store.executeTenantDatabasePurge(source.authorization);
+        expect(receipt).not.toBeNull();
+        expect((await store.getTenantTelemetryOwnerClosureReceipt(
+          tenantId, source.requestId,
+        ))?.entryCount).toBe(1);
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("preserves a transient MySQL relation-query timeout for retry instead of an integrity block", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-closure-timeout-${randomUUID()}`;
+      try {
+        await activateTelemetryForT3f(store);
+        const source = await advanceToDatabasePurgeClaim(
+          store, conn, tenantId, `closure-timeout-user-${randomUUID()}`, {
+            beforeTenantErasure: async () => {
+              await queueTelemetryForT3f(store, tenantId, "query-timeout", {
+                kind: "tenant", id: tenantId, userId: null,
+              });
+            },
+          },
+        );
+        const timeout = Object.assign(new Error("injected MySQL lock wait timeout"), {
+          code: "ER_LOCK_WAIT_TIMEOUT", errno: 1205, sqlState: "HY000",
+        });
+        const internal = store as unknown as {
+          readTenantTelemetryWritePayload: (...args: unknown[]) => Promise<unknown>;
+        };
+        const original = internal.readTenantTelemetryWritePayload;
+        internal.readTenantTelemetryWritePayload = async () => { throw timeout; };
+        await expect(store.executeTenantDatabasePurge(source.authorization)).rejects.toBe(timeout);
+        internal.readTenantTelemetryWritePayload = original;
+        const [rows] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM sessions WHERE tenant_id=?) AS sessions,
+             (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_entries
+               WHERE tenant_id=?) AS closure_entries,
+             (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_receipts
+               WHERE tenant_id=?) AS closure_receipts,
+             (SELECT phase FROM tenant_database_purge_jobs WHERE tenant_id=?) AS phase`,
+          [tenantId, tenantId, tenantId, tenantId],
+        );
+        expect(rows[0]).toMatchObject({
+          sessions: 1, closure_entries: 0, closure_receipts: 0, phase: "queued",
+        });
+        expect(await store.executeTenantDatabasePurge(source.authorization)).not.toBeNull();
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("refuses T3f when a legacy or corrupted telemetry job has no immutable membership", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-no-membership-${randomUUID()}`;
+      try {
+        await activateTelemetryForT3f(store);
+        let operationSha256 = "";
+        const source = await advanceToDatabasePurgeClaim(
+          store, conn, tenantId, `no-membership-user-${randomUUID()}`, {
+            beforeTenantErasure: async () => {
+              const job = await queueTelemetryForT3f(store, tenantId, "legacy-job", {
+                kind: "tenant", id: tenantId, userId: null,
+              });
+              operationSha256 = job.writeOperationSha256;
+            },
+          },
+        );
+        // Disposable fixture only: privileged corruption simulates a pre-0038 or missing sidecar.
+        await conn.query("DROP TRIGGER trg_tt_membership_bd");
+        await conn.query(
+          "DELETE FROM tenant_telemetry_artifact_memberships WHERE write_operation_sha256=?",
+          [operationSha256],
+        );
+        await expect(store.executeTenantDatabasePurge(source.authorization))
+          .rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        const [rows] = await conn.query<RowDataPacket[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM sessions WHERE tenant_id=?) AS sessions,
+             (SELECT COUNT(*) FROM tenant_database_purge_predelete_receipts
+               WHERE tenant_id=?) AS predelete_receipts,
+             (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_entries
+               WHERE tenant_id=?) AS closure_entries,
+             (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_receipts
+               WHERE tenant_id=?) AS closure_receipts,
+             (SELECT phase FROM tenant_database_purge_jobs WHERE tenant_id=?) AS phase`,
+          [tenantId, tenantId, tenantId, tenantId, tenantId],
+        );
+        expect(rows[0]).toMatchObject({
+          sessions: 1,
+          predelete_receipts: 0,
+          closure_entries: 0,
+          closure_receipts: 0,
+          phase: "queued",
+        });
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it("rejects a detached closure entry on read and verify-only startup", async () => {
+      const store = await MysqlSessionStore.connect({
+        url: mysqlUrl, connectionLimit: 8, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+      });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-database-closure-orphan-${randomUUID()}`;
+      try {
+        await activateTelemetryForT3f(store);
+        const source = await advanceToDatabasePurgeClaim(
+          store, conn, tenantId, `closure-orphan-user-${randomUUID()}`, {
+            beforeTenantErasure: async () => {
+              await queueTelemetryForT3f(store, tenantId, "orphan", {
+                kind: "tenant", id: tenantId, userId: null,
+              });
+            },
+          },
+        );
+        expect(await store.executeTenantDatabasePurge(source.authorization)).not.toBeNull();
+        const createTrigger = `CREATE TRIGGER trg_tt_owner_closure_receipt_bd
+          BEFORE DELETE ON tenant_telemetry_owner_closure_receipts FOR EACH ROW
+          SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='telemetry owner closure receipt is append-only'`;
+        // Disposable privileged-corruption fixture; immediately restore the exact guard body.
+        await conn.query("DROP TRIGGER trg_tt_owner_closure_receipt_bd");
+        await conn.query(
+          "DELETE FROM tenant_telemetry_owner_closure_receipts WHERE request_id=?",
+          [source.requestId],
+        );
+        await conn.query(createTrigger);
+        await expect(store.getTenantTelemetryOwnerClosureEntries(
+          tenantId, source.requestId,
+        )).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+        await expect(MysqlSessionStore.connect({
+          url: mysqlUrl,
+          migrationMode: "verify",
+          tenantTelemetryRefKey: TELEMETRY_REF_KEY,
+        })).rejects.toBeInstanceOf(TenantErasureIntegrityError);
+      } finally {
+        await conn.end();
+        await store.close();
       }
     });
 
@@ -847,16 +1364,22 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
                WHERE tenant_id=?) AS entries,
              (SELECT COUNT(*) FROM tenant_database_purge_receipts
                WHERE tenant_id=?) AS receipts,
+             (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_entries
+               WHERE tenant_id=?) AS closure_entries,
+             (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_receipts
+               WHERE tenant_id=?) AS closure_receipts,
              (SELECT COUNT(*) FROM tenant_purge_session_grave_markers
                WHERE tenant_id=?) AS graves,
              (SELECT phase FROM tenant_database_purge_jobs
                WHERE tenant_id=?) AS phase`,
-          [tenantId, tenantId, tenantId, tenantId, tenantId],
+          [tenantId, tenantId, tenantId, tenantId, tenantId, tenantId, tenantId],
         );
         expect(rows[0]).toMatchObject({
           sessions: 1,
           entries: 0,
           receipts: 0,
+          closure_entries: 0,
+          closure_receipts: 0,
           graves: 0,
           phase: "queued",
         });

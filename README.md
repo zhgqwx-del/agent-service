@@ -5,10 +5,10 @@
 ## 状态
 
 - **M0 调研**：完成。
-- **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`分离logs/traces lifecycle与应用capture，当前只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`增加默认休眠的disposition迁移/原子store、独立S3 CAS-head journal与同keyCAS tombstone非生产协议夹具；`0037`修正grant claim-hash trigger并增加非生产grant-bound v2 Memory协议；`0038`给新受管telemetry write原子保存不可变逐项artifact membership/source sidecar，旧write不回填，缺失只能解释为unknown。该写时owner tuple claim不证明T3f删除后的owner闭包，真实grant在Memory/MySQL及MySQL trigger两层仍硬拒，v2没有产品S3写入、外部mutation/ACK或旧快照恢复权限。T3d logs/traces仍是零target blocker，也没有telemetry disposition activation/worker/CLI；第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS、私有访问或独立故障域。真实provider/KMS、generic user物理purge、物理backup producer、telemetry delete/restore/retention与全域completion仍未闭环，所以M1未冻结。
+- **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`分离logs/traces lifecycle与应用capture，当前只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`增加默认休眠的disposition迁移/原子store、独立S3 CAS-head journal与同keyCAS tombstone非生产协议夹具；`0037`修正grant claim-hash trigger并增加非生产grant-bound v2 Memory协议；`0038`给新受管telemetry write原子保存不可变逐项artifact membership/source sidecar，旧write不回填；`0039`在T3f删除canonical owner前，把新write的逐项membership与当时真实owner/session grave原子封存为独立closure receipt。旧write缺membership、旧terminal缺closure仍是unknown，不得补造。真实grant在Memory/MySQL及MySQL trigger两层仍硬拒，v2没有产品S3写入、外部mutation/ACK或旧快照恢复权限。T3d logs/traces仍是零target blocker，也没有telemetry disposition activation/worker/CLI；第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS、私有访问或独立故障域。真实provider/KMS、generic user物理purge、物理backup producer、telemetry delete/restore/retention与全域completion仍未闭环，所以M1未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
-- **M4 生产化**（配额、可观测性、限流）：主体尚未开始；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0038默认休眠基座已具备，但还没有真实managed环境验收、完整telemetry执行生命周期、metrics/SLO/alert、限流/配额或生产环境验收。
+- **M4 生产化**（配额、可观测性、限流）：主体尚未开始；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0039默认休眠基座已具备，但还没有真实managed环境验收、完整telemetry执行生命周期、metrics/SLO/alert、限流/配额或生产环境验收。
 
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
@@ -62,7 +62,7 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0037 → 0038 的真实 MySQL 历史升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0038 → 0039 的真实 MySQL 历史升级夹具
 pnpm test:tenant-telemetry-lifecycle          # 0032/0033 content-free evidence helper
 pnpm test:tenant-telemetry-lifecycle-memory   # 0033 Memory activation/coverage/inventory原子语义
 pnpm test:tenant-telemetry-lifecycle-mysql    # 0033真实InnoDB回滚、并发、重启与隔离语义
@@ -98,8 +98,8 @@ pnpm test:tenant-runtime-revocation-mysql     # 强制执行 T3b configured-flee
 pnpm test:tenant-content-inventory-mysql      # 强制执行 T3c DB-clock owner inventory、hold、并发/回滚与隔离套件
 pnpm test:tenant-purge-plan-mysql             # 强制执行 T3d 固定33域计划、blocker、并发/回滚与隔离套件
 pnpm test:tenant-purge-execution-mysql        # 强制执行 T3e 本地cutover、exact outbox/physical ACK、回滚与隔离套件
-pnpm test:tenant-database-purge-memory        # 强制执行 T3f Memory原子发布、回滚、grave与对抗套件
-pnpm test:tenant-database-purge-mysql         # 强制执行 T3f 真实InnoDB单事务、并发、回滚与隔离套件
+pnpm test:tenant-database-purge-memory        # 强制执行 T3f Memory原子发布、回滚、grave与0039 owner-closure对抗套件
+pnpm test:tenant-database-purge-mysql         # 强制执行 T3f 真实InnoDB单事务、并发、回滚、隔离与0039 owner-closure套件
 pnpm test:tenant-redis-purge-memory           # 强制执行 T3g 纯契约/Memory证据原子发布与restore projection套件
 pnpm test:tenant-redis-purge-mysql            # 强制执行 T3g 真实InnoDB ledger、claim/lease、回滚与隔离套件
 pnpm test:tenant-redis-purge-redis            # 强制执行 T3g 真实Redis Lua原子删除、marker/replay与防复活套件

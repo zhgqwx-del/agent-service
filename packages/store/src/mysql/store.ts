@@ -251,6 +251,7 @@ import {
 import * as TenantTelemetryWriter from "../tenant-telemetry-writer.js";
 import * as TenantTelemetryApplicationCapture from "../tenant-telemetry-application-capture.js";
 import * as TenantTelemetryArtifactMembership from "../tenant-telemetry-artifact-membership.js";
+import * as TenantTelemetryOwnerClosure from "../tenant-telemetry-owner-closure.js";
 import * as TenantTelemetryDisposition from "../tenant-telemetry-disposition.js";
 import * as BackupCatalog from "../backup-catalog.js";
 import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
@@ -759,6 +760,7 @@ import {
   type TenantDatabasePurgeDomain,
   type TenantDatabasePurgeDomainAck,
   type TenantDatabasePurgeEvidenceBundle,
+  type TenantDatabasePurgeIdentity,
   type TenantDatabasePurgeJobRecord,
   type TenantDatabasePurgePreDeleteEntry,
   type TenantDatabasePurgePreDeleteReceipt,
@@ -918,6 +920,10 @@ const TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME =
   "0038_tenant_telemetry_artifact_membership.sql";
 const TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-artifact-membership";
+const TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME =
+  "0039_tenant_telemetry_owner_closure.sql";
+const TENANT_TELEMETRY_OWNER_CLOSURE_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-owner-closure";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME = "trg_tt_disposition_grant_bi_v2";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX =
   `CREATE TRIGGER ${TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME} `
@@ -927,6 +933,16 @@ const TENANT_TELEMETRY_MEMBERSHIP_TRIGGER_SHAPES = [
   ["trg_tt_membership_bu", "tenant_telemetry_artifact_memberships", "UPDATE"],
   ["trg_tt_membership_bd", "tenant_telemetry_artifact_memberships", "DELETE"],
   ["trg_tt_membership_write_job_bi", "tenant_telemetry_write_jobs", "INSERT"],
+] as const;
+const TENANT_TELEMETRY_OWNER_CLOSURE_TRIGGER_SHAPES = [
+  ["trg_tt_owner_closure_entry_bi", "tenant_telemetry_owner_closure_entries", "INSERT"],
+  ["trg_tt_owner_closure_entry_bu", "tenant_telemetry_owner_closure_entries", "UPDATE"],
+  ["trg_tt_owner_closure_entry_bd", "tenant_telemetry_owner_closure_entries", "DELETE"],
+  ["trg_tt_owner_closure_receipt_bi", "tenant_telemetry_owner_closure_receipts", "INSERT"],
+  ["trg_tt_owner_closure_receipt_bu", "tenant_telemetry_owner_closure_receipts", "UPDATE"],
+  ["trg_tt_owner_closure_receipt_bd", "tenant_telemetry_owner_closure_receipts", "DELETE"],
+  ["trg_tt_owner_closure_t3f_terminal_bu", "tenant_database_purge_jobs", "UPDATE"],
+  ["trg_tt_owner_closure_write_job_bu", "tenant_telemetry_write_jobs", "UPDATE"],
 ] as const;
 
 function mysqlMigrationStatements(sql: string): string[] {
@@ -955,6 +971,40 @@ async function executeMysqlMigrationStatement(
   migrationName: string,
   statement: string,
 ): Promise<void> {
+  if (migrationName === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME) {
+    const trigger = TENANT_TELEMETRY_OWNER_CLOSURE_TRIGGER_SHAPES.find(
+      ([name, table, manipulation]) => statement.startsWith(
+        `CREATE TRIGGER ${name} BEFORE ${manipulation} ON ${table} FOR EACH ROW `,
+      ),
+    );
+    if (trigger) {
+      const [name, table, manipulation] = trigger;
+      const prefix = `CREATE TRIGGER ${name} BEFORE ${manipulation} ON ${table} FOR EACH ROW `;
+      const expectedAction = statement.slice(prefix.length);
+      if (!expectedAction) throw new Error("0039 telemetry owner closure trigger action is empty");
+      const [rows] = await conn.query<Row[]>(
+        `SELECT event_object_table AS table_name,action_timing AS timing,
+                event_manipulation AS manipulation,action_orientation AS orientation,
+                action_condition AS condition_value,action_statement AS statement_value
+           FROM information_schema.triggers
+          WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`,
+        [name],
+      );
+      if (rows.length === 0) {
+        await conn.query(statement);
+        return;
+      }
+      const existing = rows[0];
+      if (rows.length !== 1 || existing?.table_name !== table
+        || existing.timing !== "BEFORE" || existing.manipulation !== manipulation
+        || existing.orientation !== "ROW" || existing.condition_value !== null
+        || canonicalMysqlTriggerActionStatement(String(existing.statement_value))
+          !== canonicalMysqlTriggerActionStatement(expectedAction)) {
+        throw new Error(`0039 telemetry owner closure trigger ${name} is not exact`);
+      }
+      return;
+    }
+  }
   if (migrationName === TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME) {
     const trigger = TENANT_TELEMETRY_MEMBERSHIP_TRIGGER_SHAPES.find(
       ([name, table, manipulation]) => statement.startsWith(
@@ -1260,6 +1310,30 @@ function tenantTelemetryArtifactMembershipFingerprintStatement(
   }
   return statements[0]!;
 }
+function tenantTelemetryOwnerClosureFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_OWNER_CLOSURE_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_OWNER_CLOSURE_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0039 tenant telemetry owner closure ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @tt_owner_closure_${marker}_ok=`)) {
+    throw new Error(`0039 tenant telemetry owner closure ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
 const BLOB_STORAGE_CONTROL_COLUMNS = `singleton_id, control_generation, storage_backend,
   namespace_sha256, activated_at_db_ms, evidence_sha256`;
 const TENANT_TELEMETRY_CONTROL_COLUMNS = `singleton_id, control_generation,
@@ -1334,6 +1408,18 @@ const TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_COLUMNS = `write_operation_sha256,
   owner_binding_sha256, lifecycle_coverage_evidence_sha256, lifecycle_history_status,
   application_binding_receipt_sha256, source_schema, source_generation,
   source_high_water_db_ms, inventory_created_at_db_ms`;
+const TENANT_TELEMETRY_OWNER_CLOSURE_ENTRY_COLUMNS = `scope,request_id,tenant_id,
+  subject_generation,plan_build_generation,execution_generation,database_purge_generation,
+  write_operation_sha256,membership_sha256,inventory_sha256,owner_kind,owner_ref_sha256,
+  hold_subject_ref_sha256,ref_key_id_sha256,owner_binding_sha256,
+  canonical_owner_proof_sha256,session_grave_marker_sha256,predelete_receipt_sha256,
+  captured_at_db_ms,receipt_sha256`;
+const TENANT_TELEMETRY_OWNER_CLOSURE_RECEIPT_COLUMNS = `scope,request_id,tenant_id,
+  subject_generation,plan_build_generation,execution_generation,database_purge_generation,
+  t1_fence_sha256,t3c_receipt_sha256,plan_receipt_sha256,
+  local_physical_ack_receipt_sha256,predelete_receipt_sha256,grave_marker_root_sha256,
+  t3f_receipt_sha256,entry_count,entry_root_sha256,store_db_timestamp_ms,
+  completed_claim_attempt,completed_claim_token_sha256,receipt_sha256`;
 const BLOB_COLUMNS = `blob_id, tenant_id, user_id, session_id, item_id, purpose, storage_backend,
   storage_format, storage_key, upload_token, state, sha256, size_bytes, content_type,
   uploaded_at_ms, ready_at_ms, staging_expires_at_ms, delete_after_ms, deleted_at_ms,
@@ -2868,6 +2954,75 @@ function rowToTenantTelemetryArtifactMembership(
     throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError(
       "tenant telemetry artifact membership is invalid",
     );
+  }
+}
+
+function rowToTenantTelemetryOwnerClosureEntry(
+  row: Row,
+): TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry {
+  try {
+    const entry: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry = {
+      scope: String(row.scope) as typeof TenantTelemetryOwnerClosure
+        .TENANT_TELEMETRY_OWNER_CLOSURE_ENTRY_SCOPE,
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "telemetry closure subject", 1),
+      planBuildGeneration: storedSafeInteger(row.plan_build_generation, "telemetry closure plan", 1),
+      executionGeneration: storedSafeInteger(row.execution_generation, "telemetry closure execution", 1),
+      databasePurgeGeneration: storedSafeInteger(row.database_purge_generation, "telemetry closure T3f", 1),
+      writeOperationSha256: String(row.write_operation_sha256),
+      membershipSha256: String(row.membership_sha256),
+      inventorySha256: String(row.inventory_sha256),
+      ownerKind: String(row.owner_kind) as TenantTelemetryOwnerKind,
+      ownerRefSha256: String(row.owner_ref_sha256),
+      holdSubjectRefSha256: String(row.hold_subject_ref_sha256),
+      refKeyIdSha256: String(row.ref_key_id_sha256),
+      ownerBindingSha256: String(row.owner_binding_sha256),
+      canonicalOwnerProofSha256: String(row.canonical_owner_proof_sha256),
+      sessionGraveMarkerSha256: row.session_grave_marker_sha256 == null
+        ? null : String(row.session_grave_marker_sha256),
+      preDeleteReceiptSha256: String(row.predelete_receipt_sha256),
+      capturedAtDbMs: storedSafeInteger(row.captured_at_db_ms, "telemetry closure capture time"),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    TenantTelemetryOwnerClosure.validateTenantTelemetryOwnerClosureEntry(entry);
+    return entry;
+  } catch {
+    throw new TenantErasureIntegrityError();
+  }
+}
+
+function rowToTenantTelemetryOwnerClosureReceipt(
+  row: Row,
+): TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt {
+  try {
+    const receipt: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt = {
+      scope: String(row.scope) as typeof TenantTelemetryOwnerClosure
+        .TENANT_TELEMETRY_OWNER_CLOSURE_RECEIPT_SCOPE,
+      requestId: String(row.request_id),
+      tenantId: String(row.tenant_id),
+      subjectGeneration: storedSafeInteger(row.subject_generation, "telemetry closure subject", 1),
+      planBuildGeneration: storedSafeInteger(row.plan_build_generation, "telemetry closure plan", 1),
+      executionGeneration: storedSafeInteger(row.execution_generation, "telemetry closure execution", 1),
+      databasePurgeGeneration: storedSafeInteger(row.database_purge_generation, "telemetry closure T3f", 1),
+      t1FenceSha256: String(row.t1_fence_sha256),
+      t3cReceiptSha256: String(row.t3c_receipt_sha256),
+      planReceiptSha256: String(row.plan_receipt_sha256),
+      localPhysicalAckReceiptSha256: String(row.local_physical_ack_receipt_sha256),
+      preDeleteReceiptSha256: String(row.predelete_receipt_sha256),
+      graveMarkerRootSha256: String(row.grave_marker_root_sha256),
+      t3fReceiptSha256: String(row.t3f_receipt_sha256),
+      entryCount: storedSafeInteger(row.entry_count, "telemetry closure entry count"),
+      entryRootSha256: String(row.entry_root_sha256),
+      storeDbTimestampMs: storedSafeInteger(row.store_db_timestamp_ms, "telemetry closure time"),
+      completedClaimAttempt: storedSafeInteger(row.completed_claim_attempt, "telemetry closure attempt", 1),
+      completedClaimTokenSha256: String(row.completed_claim_token_sha256),
+      receiptSha256: String(row.receipt_sha256),
+    };
+    TenantTelemetryOwnerClosure.validateTenantTelemetryOwnerClosureReceipt(receipt);
+    return receipt;
+  } catch {
+    throw new TenantErasureIntegrityError();
   }
 }
 
@@ -7707,6 +7862,7 @@ export class MysqlSessionStore implements
   TenantTelemetryLifecycleStore,
   TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore,
   TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore,
+  TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore,
   TenantTelemetryWriter.TenantTelemetryWriterStore,
   TenantTelemetryDisposition.TenantTelemetryDispositionStore,
   BackupCatalog.TenantBackupCatalogStore,
@@ -7736,6 +7892,7 @@ export class MysqlSessionStore implements
   private tenantTelemetryApplicationCaptureSchemaInstalled = false;
   private tenantTelemetryDispositionSchemaInstalled = false;
   private tenantTelemetryArtifactMembershipSchemaInstalled = false;
+  private tenantTelemetryOwnerClosureSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -8304,6 +8461,59 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertTenantTelemetryOwnerClosureFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+    includeTriggers = true,
+  ): Promise<void> {
+    let statements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME),
+        "utf8",
+      );
+      statements = [
+        tenantTelemetryOwnerClosureFingerprintStatement(migrationSql, "schema"),
+        ...(includeTriggers
+          ? [tenantTelemetryOwnerClosureFingerprintStatement(migrationSql, "triggers")]
+          : []),
+      ];
+    } catch (cause) {
+      throw new Error("0039 tenant telemetry owner closure fingerprint source is invalid", { cause });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query(
+        "SET @agent_service_tt_owner_closure_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @tt_owner_closure_schema_ok AS schema_ok,@tt_owner_closure_triggers_ok AS trigger_ok",
+      );
+      if (Number(rows[0]?.schema_ok) !== 1
+        || (includeTriggers && Number(rows[0]?.trigger_ok) !== 1)) {
+        throw new Error("stored schema/triggers do not match the 0039 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error(
+        "0039 tenant telemetry owner closure fingerprint verification failed",
+        { cause },
+      );
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_tt_owner_closure_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error(
+        "0039 tenant telemetry owner closure fingerprint session restore failed",
+        { cause },
+      );
+    }
+    if (failure) throw failure;
+  }
+
   private async reconcileLegacyTenantTelemetryLifecycleSubjects(
     conn: PoolConnection,
     acknowledgements: NonNullable<
@@ -8619,6 +8829,34 @@ export class MysqlSessionStore implements
     }
   }
 
+  private async assertTenantTelemetryOwnerClosureProjection(
+    conn: PoolConnection,
+  ): Promise<void> {
+    if (!this.tenantTelemetryOwnerClosureSchemaInstalled) return;
+    // A pre-0039 terminal may lack closure evidence, but no entry may be detached from its
+    // receipt. Every present receipt must pass the T3f/source/sidecar read proof at startup.
+    const [orphans] = await conn.query<Row[]>(
+      `SELECT e.request_id
+         FROM tenant_telemetry_owner_closure_entries e
+         LEFT JOIN tenant_telemetry_owner_closure_receipts r
+           ON BINARY r.request_id=BINARY e.request_id
+          AND BINARY r.tenant_id=BINARY e.tenant_id
+        WHERE r.request_id IS NULL LIMIT 1`,
+    );
+    if (orphans[0]) throw new TenantErasureIntegrityError();
+    const [rows] = await conn.query<Row[]>(
+      `SELECT request_id,tenant_id
+         FROM tenant_telemetry_owner_closure_receipts ORDER BY request_id`,
+    );
+    for (const row of rows) {
+      const requestId = String(row.request_id);
+      const tenantId = String(row.tenant_id);
+      const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
+      if (!job || job.phase !== "database_purged") throw new TenantErasureIntegrityError();
+      await this.validateTenantDatabasePurgeReadProof(conn, job);
+    }
+  }
+
   private async assertTenantTelemetryRuntimeConfiguration(
     conn: PoolConnection,
   ): Promise<void> {
@@ -8671,6 +8909,7 @@ export class MysqlSessionStore implements
           );
         }
         await this.assertTenantTelemetryApplicationCaptureProjection(conn);
+        await this.assertTenantTelemetryOwnerClosureProjection(conn);
         await conn.commit();
         return;
       }
@@ -8688,6 +8927,7 @@ export class MysqlSessionStore implements
       );
       await this.assertTenantTelemetryWriterProjection(conn);
       await this.assertTenantTelemetryApplicationCaptureProjection(conn);
+      await this.assertTenantTelemetryOwnerClosureProjection(conn);
       await conn.commit();
     } catch (error) {
       await conn.rollback().catch(() => {});
@@ -8712,6 +8952,10 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)) {
         throw new Error("0038 membership marker is missing its 0037 predecessor");
+      }
+      if (done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
+        throw new Error("0039 owner closure marker is missing its 0038 predecessor");
       }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
@@ -8754,7 +8998,12 @@ export class MysqlSessionStore implements
         await this.assertTenantTelemetryGrantGuardFingerprint(conn, migrationsDir);
       }
       if (done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryArtifactMembershipFingerprint(conn, migrationsDir);
+        await this.assertTenantTelemetryArtifactMembershipFingerprint(
+          conn, migrationsDir, !done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryOwnerClosureFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -8779,6 +9028,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryArtifactMembershipSchemaInstalled = done.has(
         TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME,
+      );
+      this.tenantTelemetryOwnerClosureSchemaInstalled = done.has(
+        TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME,
       );
       if (!skipTelemetryRuntimeAudit) {
         await this.assertTenantTelemetryRuntimeConfiguration(conn);
@@ -8818,8 +9070,27 @@ export class MysqlSessionStore implements
         throw new Error("0038 membership marker is missing its 0037 predecessor");
       }
       const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
+      if (done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
+        throw new Error("0039 owner closure marker is missing its 0038 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME) {
+          const [rows] = await conn.query<Row[]>(
+            `SELECT COUNT(*) AS trigger_count FROM information_schema.triggers
+              WHERE trigger_schema=DATABASE() AND trigger_name IN
+                ('trg_tt_owner_closure_entry_bi','trg_tt_owner_closure_entry_bu',
+                 'trg_tt_owner_closure_entry_bd','trg_tt_owner_closure_receipt_bi',
+                 'trg_tt_owner_closure_receipt_bu','trg_tt_owner_closure_receipt_bd',
+                 'trg_tt_owner_closure_t3f_terminal_bu',
+                 'trg_tt_owner_closure_write_job_bu')`,
+          );
+          if (storedSafeInteger(rows[0]?.trigger_count,
+            "existing 0039 owner closure trigger count") === 0) {
+            await this.assertTenantTelemetryArtifactMembershipFingerprint(conn, dir);
+          }
+        }
         if (f === TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME) {
           const [rows] = await conn.query<Row[]>(
             `SELECT COUNT(*) AS trigger_count FROM information_schema.triggers
@@ -8944,6 +9215,10 @@ export class MysqlSessionStore implements
               // shape. Verify the exact table before installing any trigger.
               await this.assertTenantTelemetryArtifactMembershipFingerprint(conn, dir, false);
             }
+            if (f === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME
+              && stmt.startsWith("CREATE TRIGGER trg_tt_owner_closure_entry_bi ")) {
+              await this.assertTenantTelemetryOwnerClosureFingerprint(conn, dir, false);
+            }
             await executeMysqlMigrationStatement(conn, f, stmt);
           } catch (cause) {
             throw new Error(`migration ${f} failed at statement ${i + 1}/${statements.length}`, { cause });
@@ -8987,7 +9262,12 @@ export class MysqlSessionStore implements
         await this.assertTenantTelemetryGrantGuardFingerprint(conn, dir);
       }
       if (done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryArtifactMembershipFingerprint(conn, dir);
+        await this.assertTenantTelemetryArtifactMembershipFingerprint(
+          conn, dir, !done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryOwnerClosureFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -9012,6 +9292,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryArtifactMembershipSchemaInstalled = done.has(
         TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME,
+      );
+      this.tenantTelemetryOwnerClosureSchemaInstalled = done.has(
+        TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME,
       );
       await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
@@ -25314,6 +25597,50 @@ export class MysqlSessionStore implements
     });
   }
 
+  private async loadTenantTelemetryOwnerClosureEntries(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[]> {
+    if (!this.tenantTelemetryOwnerClosureSchemaInstalled) return [];
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_OWNER_CLOSURE_ENTRY_COLUMNS}
+         FROM tenant_telemetry_owner_closure_entries
+        WHERE request_id=? AND tenant_id=? ORDER BY write_operation_sha256 ${lock}`,
+      [requestId, tenantId],
+    );
+    return rows.map((row) => {
+      const entry = rowToTenantTelemetryOwnerClosureEntry(row);
+      if (entry.requestId !== requestId || entry.tenantId !== tenantId) {
+        throw new TenantErasureIntegrityError();
+      }
+      return entry;
+    });
+  }
+
+  private async loadTenantTelemetryOwnerClosureReceipt(
+    executor: Pool | PoolConnection,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt | null> {
+    if (!this.tenantTelemetryOwnerClosureSchemaInstalled) return null;
+    const [rows] = await executor.query<Row[]>(
+      `SELECT ${TENANT_TELEMETRY_OWNER_CLOSURE_RECEIPT_COLUMNS}
+         FROM tenant_telemetry_owner_closure_receipts
+        WHERE request_id=? AND tenant_id=? ${lock}`,
+      [requestId, tenantId],
+    );
+    if (rows.length > 1) throw new TenantErasureIntegrityError();
+    if (!rows[0]) return null;
+    const receipt = rowToTenantTelemetryOwnerClosureReceipt(rows[0]);
+    if (receipt.requestId !== requestId || receipt.tenantId !== tenantId) {
+      throw new TenantErasureIntegrityError();
+    }
+    return receipt;
+  }
+
   private async loadTenantDatabasePurgeBundle(
     conn: PoolConnection,
     job: Extract<TenantDatabasePurgeJobRecord, { phase: "database_purged" }>,
@@ -25356,6 +25683,249 @@ export class MysqlSessionStore implements
       ]);
     if (!preDeleteReceipt || !receipt) throw new TenantErasureIntegrityError();
     return { preDeleteEntries, preDeleteReceipt, domainAcks, graveMarkers, receipt };
+  }
+
+  private async validateTenantTelemetryOwnerClosureReadProof(
+    conn: PoolConnection,
+    job: Extract<TenantDatabasePurgeJobRecord, { phase: "database_purged" }>,
+    bundle: TenantDatabasePurgeEvidenceBundle,
+    source: Awaited<ReturnType<MysqlSessionStore["validateTenantDatabasePurgeSource"]>>,
+  ): Promise<{
+    entries: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[];
+    receipt: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt;
+  } | null> {
+    if (!this.tenantTelemetryOwnerClosureSchemaInstalled) return null;
+    const receipt = await this.loadTenantTelemetryOwnerClosureReceipt(
+      conn, job.tenantId, job.requestId, "FOR SHARE",
+    );
+    const entries = await this.loadTenantTelemetryOwnerClosureEntries(
+      conn, job.tenantId, job.requestId, "FOR SHARE",
+    );
+    // A pre-0039 terminal may have no sidecar. Absence is unknown, never proof of an empty set.
+    // A partial sidecar is never a valid historical exception.
+    if (!receipt) {
+      if (entries.length !== 0) throw new TenantErasureIntegrityError();
+      return null;
+    }
+    const identity = {
+      requestId: job.requestId,
+      tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration,
+      planBuildGeneration: job.planBuildGeneration,
+      executionGeneration: job.executionGeneration,
+      databasePurgeGeneration: job.databasePurgeGeneration,
+    };
+    const receiptIdentityMatches = (Object.keys(identity) as Array<keyof typeof identity>)
+      .every((key) => receipt[key] === identity[key]);
+    if (!receiptIdentityMatches
+      || receipt.t1FenceSha256 !== source.contentReceipt.t1FenceSha256
+      || receipt.t3cReceiptSha256 !== job.t3cReceiptSha256
+      || receipt.planReceiptSha256 !== job.planReceiptSha256
+      || receipt.localPhysicalAckReceiptSha256 !== job.localPhysicalAckReceiptSha256
+      || receipt.preDeleteReceiptSha256 !== bundle.preDeleteReceipt.receiptSha256
+      || receipt.t3fReceiptSha256 !== bundle.receipt.receiptSha256
+      || receipt.graveMarkerRootSha256 !== bundle.receipt.graveMarkerRootSha256
+      || receipt.storeDbTimestampMs !== job.purgedAtDbMs
+      || receipt.completedClaimAttempt !== job.completedClaimAttempt
+      || receipt.completedClaimTokenSha256 !== job.completedClaimTokenSha256
+      || receipt.entryCount !== entries.length
+      || receipt.entryRootSha256
+        !== TenantTelemetryOwnerClosure.tenantTelemetryOwnerClosureEntryRootSha256(entries)) {
+      throw new TenantErasureIntegrityError();
+    }
+    const [jobRows] = await conn.query<Row[]>(
+      `SELECT write_operation_sha256
+         FROM tenant_telemetry_write_jobs FORCE INDEX (idx_tenant_telemetry_write_tenant)
+        WHERE tenant_id=? ORDER BY phase,created_at_ms,write_operation_sha256 FOR SHARE`,
+      [job.tenantId],
+    );
+    const [membershipRows] = await conn.query<Row[]>(
+      `SELECT write_operation_sha256
+         FROM tenant_telemetry_artifact_memberships FORCE INDEX (idx_tt_membership_tenant_owner)
+        WHERE tenant_id=? ORDER BY owner_kind,owner_ref_sha256,write_operation_sha256 FOR SHARE`,
+      [job.tenantId],
+    );
+    const jobOperations = jobRows.map((row) => String(row.write_operation_sha256)).sort();
+    const membershipOperations = membershipRows
+      .map((row) => String(row.write_operation_sha256)).sort();
+    const entryOperations = entries.map((entry) => entry.writeOperationSha256).sort();
+    if (jobOperations.length !== entries.length
+      || membershipOperations.length !== entries.length
+      || jobOperations.some((operation, index) => operation !== entryOperations[index]
+        || operation !== membershipOperations[index])) {
+      throw new TenantErasureIntegrityError();
+    }
+    const graveByHash = new Map(bundle.graveMarkers.map((marker) => [
+      marker.markerSha256, marker,
+    ] as const));
+    const refKey = entries.length > 0 ? this.requireTenantTelemetryRefKey() : undefined;
+    for (const entry of entries) {
+      if ((Object.keys(identity) as Array<keyof typeof identity>)
+        .some((key) => entry[key] !== identity[key])
+        || entry.preDeleteReceiptSha256 !== receipt.preDeleteReceiptSha256
+        || entry.capturedAtDbMs !== receipt.storeDbTimestampMs) {
+        throw new TenantErasureIntegrityError();
+      }
+      const membership = await this.readTenantTelemetryArtifactMembership(
+        conn, entry.writeOperationSha256, "FOR SHARE",
+      );
+      const writeJob = await this.readTenantTelemetryWriteJob(
+        conn, entry.writeOperationSha256, "FOR SHARE",
+      );
+      if (!membership || !writeJob
+        || membership.tenantId !== job.tenantId
+        || writeJob.tenantId !== job.tenantId
+        || entry.membershipSha256 !== membership.membershipSha256
+        || entry.inventorySha256 !== membership.inventorySha256
+        || entry.ownerKind !== membership.ownerKind
+        || entry.ownerRefSha256 !== membership.ownerRefSha256
+        || entry.holdSubjectRefSha256 !== membership.holdSubjectRefSha256
+        || entry.refKeyIdSha256 !== membership.refKeyIdSha256
+        || entry.ownerBindingSha256 !== membership.ownerBindingSha256
+        || membership.inventoryCreatedAtDbMs > entry.capturedAtDbMs
+        || (refKey && (membership.refKeyIdSha256 !== tenantTelemetryRefKeyIdSha256(refKey)
+          || membership.tenantRefSha256
+            !== tenantTelemetrySubjectRefForTenantSha256(job.tenantId, refKey)))) {
+        throw new TenantErasureIntegrityError();
+      }
+      await this.assertTenantTelemetryWriteJobRelations(conn, writeJob, "FOR SHARE");
+      if (entry.ownerKind === "session") {
+        const marker = graveByHash.get(entry.sessionGraveMarkerSha256!);
+        if (!marker || marker.tenantId !== job.tenantId
+          || marker.requestId !== job.requestId
+          || !refKey || tenantTelemetryOwnerRefSha256("session", marker.sessionId, refKey)
+            !== entry.ownerRefSha256) throw new TenantErasureIntegrityError();
+      } else if (entry.sessionGraveMarkerSha256 !== null) {
+        throw new TenantErasureIntegrityError();
+      }
+    }
+    return { entries, receipt };
+  }
+
+  private async captureTenantTelemetryOwnerClosureEntries(
+    conn: PoolConnection,
+    identity: TenantDatabasePurgeIdentity,
+    sessions: readonly MysqlTenantDatabasePurgeSession[],
+    graveMarkers: readonly TenantPurgeSessionGraveMarker[],
+    preDeleteReceiptSha256: string,
+    capturedAtDbMs: number,
+  ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[]> {
+    if (!this.tenantTelemetryOwnerClosureSchemaInstalled) {
+      throw new TenantErasureIntegrityError();
+    }
+    // A tenant-range locking read covers queued, reserved, written and blocked operations.
+    // It closes the phantom window with a concurrent enqueue even if an older writer somehow
+    // reaches this point after the tenant's T1 gate. T1 itself has already drained the normal
+    // enqueue path before T3f can be materialized.
+    const [jobRows] = await conn.query<Row[]>(
+      `SELECT write_operation_sha256
+         FROM tenant_telemetry_write_jobs FORCE INDEX (idx_tenant_telemetry_write_tenant)
+        WHERE tenant_id=? ORDER BY phase,created_at_ms,write_operation_sha256 FOR UPDATE`,
+      [identity.tenantId],
+    );
+    const [membershipRows] = await conn.query<Row[]>(
+      `SELECT write_operation_sha256
+         FROM tenant_telemetry_artifact_memberships FORCE INDEX (idx_tt_membership_tenant_owner)
+        WHERE tenant_id=? ORDER BY owner_kind,owner_ref_sha256,write_operation_sha256 FOR SHARE`,
+      [identity.tenantId],
+    );
+    const operations = jobRows.map((row) => String(row.write_operation_sha256)).sort();
+    const memberships = membershipRows.map((row) => String(row.write_operation_sha256)).sort();
+    if (operations.length !== memberships.length
+      || operations.some((operation, index) => operation !== memberships[index])) {
+      // A pre-0038 job is unknown, not reconstructible from mutable job JSON. Do not destroy
+      // canonical owners without a trustworthy source sidecar for every retained operation.
+      throw new TenantErasureIntegrityError();
+    }
+    if (operations.length === 0) return [];
+    const refKey = this.requireTenantTelemetryRefKey();
+    const keyIdSha256 = tenantTelemetryRefKeyIdSha256(refKey);
+    const tenantRefSha256 = tenantTelemetrySubjectRefForTenantSha256(identity.tenantId, refKey);
+    const graveBySessionId = new Map(graveMarkers.map((marker) => [marker.sessionId, marker]));
+    const sessionByRef = new Map<string, {
+      session: MysqlTenantDatabasePurgeSession;
+      grave: TenantPurgeSessionGraveMarker;
+    }>();
+    for (const session of sessions) {
+      const grave = graveBySessionId.get(session.sessionId);
+      if (!grave || grave.tenantId !== identity.tenantId
+        || grave.requestId !== identity.requestId
+        || grave.preDeleteReceiptSha256 !== preDeleteReceiptSha256) {
+        throw new TenantErasureIntegrityError();
+      }
+      const ref = tenantTelemetryOwnerRefSha256("session", session.sessionId, refKey);
+      if (sessionByRef.has(ref)) throw new TenantErasureIntegrityError();
+      sessionByRef.set(ref, { session, grave });
+    }
+    const [userRows] = await conn.query<Row[]>(
+      `SELECT tenant_id,subject_id
+         FROM subject_lifecycle FORCE INDEX (PRIMARY)
+        WHERE tenant_id=? AND subject_kind='user' ORDER BY subject_id FOR SHARE`,
+      [identity.tenantId],
+    );
+    const userByRef = new Map<string, string>();
+    for (const row of userRows) {
+      const tenantId = String(row.tenant_id);
+      const userId = String(row.subject_id);
+      if (tenantId !== identity.tenantId || !userId || userId.length > 128) {
+        throw new TenantErasureIntegrityError();
+      }
+      const ref = tenantTelemetryOwnerRefSha256("user", userId, refKey);
+      if (userByRef.has(ref)) throw new TenantErasureIntegrityError();
+      userByRef.set(ref, userId);
+    }
+    const entries: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[] = [];
+    for (const operation of operations) {
+      const job = await this.readTenantTelemetryWriteJob(conn, operation, "FOR UPDATE");
+      const membership = await this.readTenantTelemetryArtifactMembership(
+        conn, operation, "FOR SHARE",
+      );
+      if (!job || !membership || job.tenantId !== identity.tenantId
+        || membership.tenantId !== identity.tenantId
+        || membership.tenantRefSha256 !== tenantRefSha256
+        || membership.refKeyIdSha256 !== keyIdSha256
+        || membership.inventoryCreatedAtDbMs > capturedAtDbMs) {
+        throw new TenantErasureIntegrityError();
+      }
+      await this.assertTenantTelemetryWriteJobRelations(conn, job, "FOR SHARE");
+      let canonicalOwnerId: string;
+      let canonicalOwnerUserId: string | null;
+      let sessionGraveMarkerSha256: string | null = null;
+      if (membership.ownerKind === "tenant") {
+        canonicalOwnerId = identity.tenantId;
+        canonicalOwnerUserId = null;
+      } else if (membership.ownerKind === "user") {
+        const userId = userByRef.get(membership.ownerRefSha256);
+        if (!userId) throw new TenantErasureIntegrityError();
+        canonicalOwnerId = userId;
+        canonicalOwnerUserId = userId;
+      } else {
+        const owner = sessionByRef.get(membership.ownerRefSha256);
+        if (!owner || !userByRef.has(tenantTelemetryOwnerRefSha256(
+          "user", owner.session.userId, refKey,
+        ))) throw new TenantErasureIntegrityError();
+        canonicalOwnerId = owner.session.sessionId;
+        canonicalOwnerUserId = owner.session.userId;
+        sessionGraveMarkerSha256 = owner.grave.markerSha256;
+      }
+      let entry: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry;
+      try {
+        entry = TenantTelemetryOwnerClosure.createTenantTelemetryOwnerClosureEntry({
+          identity,
+          membership,
+          canonicalOwnerId,
+          canonicalOwnerUserId,
+          refKey,
+          sessionGraveMarkerSha256,
+          preDeleteReceiptSha256,
+          capturedAtDbMs,
+        });
+      } catch {
+        throw new TenantErasureIntegrityError();
+      }
+      entries.push(entry);
+    }
+    return entries;
   }
 
   private async validateTenantDatabasePurgeCutoverState(
@@ -26642,7 +27212,25 @@ export class MysqlSessionStore implements
           `database purge terminal residue ${field}`,
         ) !== 0)
       ) throw new TenantErasureIntegrityError();
+      await this.validateTenantTelemetryOwnerClosureReadProof(conn, job, bundle, source);
       return bundle;
+    }
+    if (this.tenantTelemetryOwnerClosureSchemaInstalled) {
+      const [closureRows] = await conn.query<Row[]>(
+        `SELECT
+           (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_entries
+             WHERE request_id=? OR tenant_id=?) AS entries_count,
+           (SELECT COUNT(*) FROM tenant_telemetry_owner_closure_receipts
+             WHERE request_id=? OR tenant_id=?) AS receipt_count`,
+        [job.requestId, job.tenantId, job.requestId, job.tenantId],
+      );
+      if (!closureRows[0]
+        || storedSafeInteger(closureRows[0].entries_count,
+          "queued telemetry owner closure entry count") !== 0
+        || storedSafeInteger(closureRows[0].receipt_count,
+          "queued telemetry owner closure receipt count") !== 0) {
+        throw new TenantErasureIntegrityError();
+      }
     }
     const [rows] = await conn.query<Row[]>(
       `SELECT
@@ -27437,6 +28025,33 @@ export class MysqlSessionStore implements
         );
       }
 
+      const ownerClosureEntries = await this.captureTenantTelemetryOwnerClosureEntries(
+        conn,
+        identity,
+        targetState.sessions,
+        graveMarkers,
+        preDeleteReceipt.receiptSha256,
+        purgeAtMs,
+      );
+      for (const entry of ownerClosureEntries) {
+        const values = [
+          entry.scope, entry.requestId, entry.tenantId, entry.subjectGeneration,
+          entry.planBuildGeneration, entry.executionGeneration,
+          entry.databasePurgeGeneration, entry.writeOperationSha256,
+          entry.membershipSha256, entry.inventorySha256, entry.ownerKind,
+          entry.ownerRefSha256, entry.holdSubjectRefSha256, entry.refKeyIdSha256,
+          entry.ownerBindingSha256, entry.canonicalOwnerProofSha256,
+          entry.sessionGraveMarkerSha256, entry.preDeleteReceiptSha256,
+          entry.capturedAtDbMs, entry.receiptSha256,
+        ];
+        await conn.query(
+          `INSERT INTO tenant_telemetry_owner_closure_entries
+             (${TENANT_TELEMETRY_OWNER_CLOSURE_ENTRY_COLUMNS})
+           VALUES (${values.map(() => "?").join(",")})`,
+          values,
+        );
+      }
+
       await this.deleteTenantDatabasePurgeTargets(conn, current.tenantId, targetState.targets);
 
       const clearedProfileHash = tenantDatabasePurgeTargetSha256("tenant_profile", [
@@ -27618,6 +28233,49 @@ export class MysqlSessionStore implements
           receipt.localDatabasePurgeComplete, receipt.sessionContentDeleted,
           receipt.allDomainsComplete, receipt.contentPurgeExecuted, receipt.receiptSha256,
         ],
+      );
+
+      const ownerClosureReceipt = TenantTelemetryOwnerClosure
+        .createTenantTelemetryOwnerClosureReceipt({
+          scope: TenantTelemetryOwnerClosure.TENANT_TELEMETRY_OWNER_CLOSURE_RECEIPT_SCOPE,
+          ...identity,
+          t1FenceSha256: source.contentReceipt.t1FenceSha256,
+          t3cReceiptSha256: current.t3cReceiptSha256,
+          planReceiptSha256: current.planReceiptSha256,
+          localPhysicalAckReceiptSha256: current.localPhysicalAckReceiptSha256,
+          preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+          t3fReceiptSha256: receipt.receiptSha256,
+          graveMarkerRootSha256,
+          entryCount: ownerClosureEntries.length,
+          entryRootSha256: TenantTelemetryOwnerClosure
+            .tenantTelemetryOwnerClosureEntryRootSha256(ownerClosureEntries),
+          storeDbTimestampMs: purgeAtMs,
+          completedClaimAttempt: staged.claimAttempt,
+          completedClaimTokenSha256,
+          entries: ownerClosureEntries,
+        });
+      const closureReceiptValues = [
+        ownerClosureReceipt.scope, ownerClosureReceipt.requestId,
+        ownerClosureReceipt.tenantId, ownerClosureReceipt.subjectGeneration,
+        ownerClosureReceipt.planBuildGeneration, ownerClosureReceipt.executionGeneration,
+        ownerClosureReceipt.databasePurgeGeneration,
+        ownerClosureReceipt.t1FenceSha256, ownerClosureReceipt.t3cReceiptSha256,
+        ownerClosureReceipt.planReceiptSha256,
+        ownerClosureReceipt.localPhysicalAckReceiptSha256,
+        ownerClosureReceipt.preDeleteReceiptSha256,
+        ownerClosureReceipt.graveMarkerRootSha256,
+        ownerClosureReceipt.t3fReceiptSha256,
+        ownerClosureReceipt.entryCount, ownerClosureReceipt.entryRootSha256,
+        ownerClosureReceipt.storeDbTimestampMs,
+        ownerClosureReceipt.completedClaimAttempt,
+        ownerClosureReceipt.completedClaimTokenSha256,
+        ownerClosureReceipt.receiptSha256,
+      ];
+      await conn.query(
+        `INSERT INTO tenant_telemetry_owner_closure_receipts
+           (${TENANT_TELEMETRY_OWNER_CLOSURE_RECEIPT_COLUMNS})
+         VALUES (${closureReceiptValues.map(() => "?").join(",")})`,
+        closureReceiptValues,
       );
 
       now = await this.databaseNow(conn);
@@ -27869,6 +28527,46 @@ export class MysqlSessionStore implements
       if (!job || job.phase !== "database_purged") return null;
       const proof = await this.validateTenantDatabasePurgeReadProof(conn, job);
       return proof?.receipt ?? null;
+    });
+  }
+
+  async getTenantTelemetryOwnerClosureReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt | null> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
+      if (!job) {
+        if (await this.loadTenantTelemetryOwnerClosureReceipt(conn, tenantId, requestId)
+          || (await this.loadTenantTelemetryOwnerClosureEntries(conn, tenantId, requestId)).length
+            !== 0) throw new TenantErasureIntegrityError();
+        return null;
+      }
+      if (job.phase !== "database_purged") {
+        await this.validateTenantDatabasePurgeReadProof(conn, job);
+        return null;
+      }
+      await this.validateTenantDatabasePurgeReadProof(conn, job);
+      return this.loadTenantTelemetryOwnerClosureReceipt(conn, tenantId, requestId);
+    });
+  }
+
+  async getTenantTelemetryOwnerClosureEntries(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[]> {
+    return this.withConsistentRead(async (conn) => {
+      const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
+      if (!job) {
+        if (await this.loadTenantTelemetryOwnerClosureReceipt(conn, tenantId, requestId)
+          || (await this.loadTenantTelemetryOwnerClosureEntries(conn, tenantId, requestId)).length
+            !== 0) throw new TenantErasureIntegrityError();
+        return [];
+      }
+      await this.validateTenantDatabasePurgeReadProof(conn, job);
+      return job.phase === "database_purged"
+        ? this.loadTenantTelemetryOwnerClosureEntries(conn, tenantId, requestId)
+        : [];
     });
   }
 
@@ -35902,6 +36600,15 @@ export class MysqlSessionStore implements
       }
     } catch (error) {
       if (error instanceof TenantTelemetryWriter.TenantTelemetryWriteIntegrityError) throw error;
+      // A lock wait/deadlock/connection failure is retryable, not evidence corruption.
+      // mysql2 preserves driver codes/errno/sqlState on those errors; do not convert them
+      // into a durable integrity block at a T3f worker boundary.
+      if (error && typeof error === "object"
+        && (typeof (error as { code?: unknown }).code === "string"
+          || typeof (error as { errno?: unknown }).errno === "number"
+          || typeof (error as { sqlState?: unknown }).sqlState === "string")) {
+        throw error;
+      }
       throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
     }
   }

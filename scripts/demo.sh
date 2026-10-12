@@ -11,10 +11,15 @@ cd "$(dirname "$0")/.."
 
 FAILURES=0
 
-BASE=${BASE:-http://127.0.0.1:8787}
+DEMO_EXPLICIT_BASE_SET=${BASE+x}
+DEMO_EXPLICIT_BASE=${BASE-}
 KEY=${KEY:-dev-key}
 USER_ID=${DEMO_USER:-u_demo}
 [ -f .env ] && set -a && . ./.env && set +a
+# local-service.sh acceptance supplies the router URL explicitly. A BASE in .env must
+# not silently redirect its verification traffic to a runner or another endpoint.
+if [ "$DEMO_EXPLICIT_BASE_SET" = x ]; then BASE=$DEMO_EXPLICIT_BASE; fi
+BASE=${BASE:-http://127.0.0.1:8787}
 MODEL=${MODEL:-${DEFAULT_MODEL:-qwen3.8-max}}
 H=(-H "Authorization: Bearer $KEY" -H "X-User-Id: $USER_ID" -H "Content-Type: application/json")
 PY=${PY:-python3}

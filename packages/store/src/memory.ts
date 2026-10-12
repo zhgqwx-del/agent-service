@@ -840,6 +840,7 @@ import * as TenantTelemetry from "./tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "./tenant-telemetry-writer.js";
 import * as TenantTelemetryApplicationCapture from "./tenant-telemetry-application-capture.js";
 import * as TenantTelemetryArtifactMembership from "./tenant-telemetry-artifact-membership.js";
+import * as TenantTelemetryOwnerClosure from "./tenant-telemetry-owner-closure.js";
 import * as TenantTelemetryDisposition from "./tenant-telemetry-disposition.js";
 
 interface MemoryUserDataExportJob {
@@ -1147,7 +1148,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1358,6 +1359,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantTelemetryArtifactMemberships = new Map<
     string,
     TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipRecord
+  >();
+  tenantTelemetryOwnerClosureEntries = new Map<
+    string,
+    TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry
+  >();
+  tenantTelemetryOwnerClosureReceipts = new Map<
+    string,
+    TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt
   >();
   tenantTelemetryApplicationDomainControls = new Map<
     TenantTelemetry.TenantTelemetryDomain,
@@ -17346,6 +17355,109 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
   }
 
+  private tenantTelemetryOwnerClosureEntriesFor(
+    requestId: string,
+  ): TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[] {
+    return [...this.tenantTelemetryOwnerClosureEntries.values()]
+      .filter((entry) => entry.requestId === requestId)
+      .sort((left, right) => left.writeOperationSha256 < right.writeOperationSha256
+        ? -1 : left.writeOperationSha256 > right.writeOperationSha256 ? 1 : 0);
+  }
+
+  private buildTenantTelemetryOwnerClosureEntries(
+    job: TenantDatabasePurgeJobRecord,
+    preDeleteReceipt: TenantDatabasePurgePreDeleteReceipt,
+    graves: readonly TenantPurgeSessionGraveMarker[],
+    capturedAtDbMs: number,
+  ): TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[] {
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const identity = this.tenantDatabasePurgeIdentity(job);
+    const telemetryJobs = [...this.tenantTelemetryWriteJobs.values()]
+      .filter((row) => row.tenantId === job.tenantId)
+      .sort((left, right) => left.writeOperationSha256 < right.writeOperationSha256
+        ? -1 : left.writeOperationSha256 > right.writeOperationSha256 ? 1 : 0);
+    for (const membership of this.tenantTelemetryArtifactMemberships.values()) {
+      if (membership.tenantId === job.tenantId
+        && !telemetryJobs.some((row) => row.writeOperationSha256
+          === membership.writeOperationSha256)) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+    }
+    if (telemetryJobs.length === 0) return [];
+    const refKey = this.tenantTelemetryRefKeyForUse();
+    const graveBySession = new Map(graves.map((grave) => [grave.sessionId, grave] as const));
+    const candidates = new Set<string>();
+    for (const session of this.sessions.values()) {
+      if (session.tenantId === job.tenantId) candidates.add(session.userId);
+    }
+    for (const lifecycle of this.subjectLifecycles.values()) {
+      if (lifecycle.tenantId === job.tenantId && lifecycle.subjectKind === "user") {
+        candidates.add(lifecycle.subjectId);
+      }
+    }
+    const entries: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[] = [];
+    for (const telemetryJob of telemetryJobs) {
+      const membership = this.tenantTelemetryArtifactMemberships.get(
+        telemetryJob.writeOperationSha256,
+      );
+      // A pre-0038 job has no immutable membership. It must remain unknown rather than
+      // borrowing mutable inventory JSON as a deletion-source proof.
+      if (!membership || membership.tenantId !== job.tenantId) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+      const ownerCandidates: Array<{
+        ownerId: string;
+        ownerUserId: string | null;
+        graveSha256: string | null;
+      }> = [];
+      if (membership.ownerKind === "tenant") {
+        if (this.tenants.has(job.tenantId)) {
+          ownerCandidates.push({ ownerId: job.tenantId, ownerUserId: null, graveSha256: null });
+        }
+      } else if (membership.ownerKind === "user") {
+        for (const userId of candidates) {
+          ownerCandidates.push({ ownerId: userId, ownerUserId: userId, graveSha256: null });
+        }
+      } else {
+        for (const session of this.sessions.values()) {
+          if (session.tenantId !== job.tenantId) continue;
+          const grave = graveBySession.get(session.id);
+          if (!grave || grave.tenantId !== job.tenantId
+            || grave.ownerSha256 !== tenantDatabasePurgeSessionGraveOwnerSha256({
+              tenantId: session.tenantId,
+              userId: session.userId,
+              sessionId: session.id,
+            })) continue;
+          ownerCandidates.push({
+            ownerId: session.id,
+            ownerUserId: session.userId,
+            graveSha256: grave.markerSha256,
+          });
+        }
+      }
+      const matches: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[] = [];
+      for (const owner of ownerCandidates) {
+        try {
+          matches.push(TenantTelemetryOwnerClosure.createTenantTelemetryOwnerClosureEntry({
+            identity,
+            membership,
+            canonicalOwnerId: owner.ownerId,
+            canonicalOwnerUserId: owner.ownerUserId,
+            refKey,
+            sessionGraveMarkerSha256: owner.graveSha256,
+            preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+            capturedAtDbMs,
+          }));
+        } catch {
+          // A different canonical owner is not evidence for this membership.
+        }
+      }
+      if (matches.length !== 1) throw new TenantDatabasePurgeEvidenceChangedError();
+      entries.push(matches[0]!);
+    }
+    return entries;
+  }
+
   private tenantDatabasePurgeBundle(
     job: Extract<TenantDatabasePurgeJobRecord, { phase: "database_purged" }>,
   ) {
@@ -17505,12 +17617,113 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
               facts.map((fact) => fact.factSha256),
             )
           ) throw new Error("tenant database purge billing facts do not match T3e");
+          const closure = this.tenantTelemetryOwnerClosureReceipts.get(job.requestId);
+          if (closure) {
+            TenantTelemetryOwnerClosure.validateTenantTelemetryOwnerClosureReceipt(closure);
+            const entries = this.tenantTelemetryOwnerClosureEntriesFor(job.requestId);
+            const planReceipt = this.tenantPurgePlanReceipts.get(job.requestId);
+            const telemetryJobs = [...this.tenantTelemetryWriteJobs.values()]
+              .filter((row) => row.tenantId === job.tenantId);
+            if (!planReceipt
+              || closure.requestId !== job.requestId
+              || closure.tenantId !== job.tenantId
+              || closure.subjectGeneration !== job.subjectGeneration
+              || closure.planBuildGeneration !== job.planBuildGeneration
+              || closure.executionGeneration !== job.executionGeneration
+              || closure.databasePurgeGeneration !== job.databasePurgeGeneration
+              || closure.t1FenceSha256 !== planReceipt.t1FenceSha256
+              || closure.t3cReceiptSha256 !== job.t3cReceiptSha256
+              || closure.planReceiptSha256 !== job.planReceiptSha256
+              || closure.localPhysicalAckReceiptSha256 !== job.localPhysicalAckReceiptSha256
+              || closure.preDeleteReceiptSha256 !== bundle.preDeleteReceipt.receiptSha256
+              || closure.t3fReceiptSha256 !== bundle.receipt.receiptSha256
+              || closure.graveMarkerRootSha256 !== bundle.receipt.graveMarkerRootSha256
+              || closure.entryCount !== entries.length
+              || closure.entryCount !== telemetryJobs.length
+              || closure.entryRootSha256 !== TenantTelemetryOwnerClosure
+                .tenantTelemetryOwnerClosureEntryRootSha256(entries)
+              || closure.storeDbTimestampMs !== bundle.receipt.storeDbTimestampMs
+              || closure.completedClaimAttempt !== bundle.receipt.completedClaimAttempt
+              || closure.completedClaimTokenSha256 !== bundle.receipt.completedClaimTokenSha256) {
+              throw new Error("tenant telemetry owner closure receipt is not bound to T3f");
+            }
+            const graveByHash = new Map(bundle.graveMarkers.map((grave) => [
+              grave.markerSha256, grave,
+            ] as const));
+            const refKey = entries.length > 0 ? this.tenantTelemetryRefKeyForUse() : undefined;
+            const entryByOperation = new Map(entries.map((entry) => [
+              entry.writeOperationSha256, entry,
+            ] as const));
+            if (entryByOperation.size !== entries.length) {
+              throw new Error("tenant telemetry owner closure contains duplicate operations");
+            }
+            for (const telemetryJob of telemetryJobs) {
+              const entry = entryByOperation.get(telemetryJob.writeOperationSha256);
+              const membership = this.tenantTelemetryArtifactMemberships.get(
+                telemetryJob.writeOperationSha256,
+              );
+              if (membership && refKey) {
+                // The closure compares only its owner fields; also recheck every immutable
+                // 0038 membership/source field against the retained writer projection.
+                TenantTelemetryArtifactMembership.validateTenantTelemetryArtifactMembershipSource(
+                  membership,
+                  {
+                    writeOperationSha256: telemetryJob.writeOperationSha256,
+                    jobCreatedAtMs: telemetryJob.createdAtMs,
+                    inventory: telemetryJob.inventory,
+                    refKeyIdSha256: TenantTelemetry.tenantTelemetryRefKeyIdSha256(refKey),
+                    applicationBinding: this.tenantTelemetryApplicationWriteBindings.get(
+                      telemetryJob.writeOperationSha256,
+                    ) ?? null,
+                  },
+                );
+              }
+              if (!entry || !membership
+                || entry.requestId !== job.requestId
+                || entry.tenantId !== job.tenantId
+                || entry.subjectGeneration !== job.subjectGeneration
+                || entry.planBuildGeneration !== job.planBuildGeneration
+                || entry.executionGeneration !== job.executionGeneration
+                || entry.databasePurgeGeneration !== job.databasePurgeGeneration
+                || membership.tenantId !== job.tenantId
+                || membership.writeOperationSha256 !== telemetryJob.writeOperationSha256
+                || entry.membershipSha256 !== membership.membershipSha256
+                || entry.inventorySha256 !== telemetryJob.inventory.inventorySha256
+                || entry.inventorySha256 !== membership.inventorySha256
+                || entry.ownerKind !== membership.ownerKind
+                || entry.ownerRefSha256 !== membership.ownerRefSha256
+                || entry.holdSubjectRefSha256 !== membership.holdSubjectRefSha256
+                || entry.refKeyIdSha256 !== membership.refKeyIdSha256
+                || entry.ownerBindingSha256 !== membership.ownerBindingSha256
+                || (refKey && entry.refKeyIdSha256
+                  !== TenantTelemetry.tenantTelemetryRefKeyIdSha256(refKey))
+                || entry.preDeleteReceiptSha256 !== closure.preDeleteReceiptSha256
+                || entry.capturedAtDbMs !== closure.storeDbTimestampMs
+                || (entry.ownerKind === "session"
+                  && (!graveByHash.has(entry.sessionGraveMarkerSha256!)
+                    || graveByHash.get(entry.sessionGraveMarkerSha256!)?.tenantId
+                      !== job.tenantId
+                    || graveByHash.get(entry.sessionGraveMarkerSha256!)?.requestId
+                      !== job.requestId
+                    || !refKey
+                    || TenantTelemetry.tenantTelemetryOwnerRefSha256(
+                      "session",
+                      graveByHash.get(entry.sessionGraveMarkerSha256!)!.sessionId,
+                      refKey,
+                    ) !== entry.ownerRefSha256))
+                || (entry.ownerKind !== "session" && entry.sessionGraveMarkerSha256 !== null)) {
+                throw new Error("tenant telemetry owner closure entry source changed");
+              }
+            }
+          }
         } else if (
           this.tenantDatabasePurgeEntriesFor(job).length !== 0
           || this.tenantDatabasePurgeAcksFor(job).length !== 0
           || this.tenantDatabasePurgePreDeleteReceipts.has(job.requestId)
           || this.tenantDatabasePurgeReceipts.has(job.requestId)
           || this.tenantDatabasePurgeGraveMarkersFor(job).length !== 0
+          || this.tenantTelemetryOwnerClosureReceipts.has(job.requestId)
+          || this.tenantTelemetryOwnerClosureEntriesFor(job.requestId).length !== 0
         ) throw new Error("non-terminal tenant database purge job has destructive evidence");
       }
       for (const [key, entry] of this.tenantDatabasePurgePreDeleteEntries) {
@@ -17551,6 +17764,21 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         if (!job || job.phase !== "database_purged"
           || receipt.requestId !== requestId || receipt.tenantId !== job.tenantId) {
           throw new Error("tenant database purge receipt owner relation is invalid");
+        }
+      }
+      for (const [key, entry] of this.tenantTelemetryOwnerClosureEntries) {
+        const job = this.tenantDatabasePurgeJobs.get(entry.requestId);
+        if (!job || job.phase !== "database_purged"
+          || key !== JSON.stringify([entry.requestId, entry.writeOperationSha256])
+          || !this.tenantTelemetryOwnerClosureReceipts.has(entry.requestId)) {
+          throw new Error("tenant telemetry owner closure entry is orphaned");
+        }
+      }
+      for (const [requestId, receipt] of this.tenantTelemetryOwnerClosureReceipts) {
+        const job = this.tenantDatabasePurgeJobs.get(requestId);
+        if (!job || job.phase !== "database_purged"
+          || receipt.requestId !== requestId || receipt.tenantId !== job.tenantId) {
+          throw new Error("tenant telemetry owner closure receipt is orphaned");
         }
       }
     } catch (error) {
@@ -18508,6 +18736,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       acks: copy(this.tenantDatabasePurgeDomainAcks),
       receipts: copy(this.tenantDatabasePurgeReceipts),
       graves: copy(this.tenantPurgeSessionGraveMarkers),
+      telemetryClosureEntries: copy(this.tenantTelemetryOwnerClosureEntries),
+      telemetryClosureReceipts: copy(this.tenantTelemetryOwnerClosureReceipts),
       cutovers: copy(this.tenantDatabasePurgeCutovers),
       tenants: copy(this.tenants),
       agents: copy(this.agents),
@@ -18535,6 +18765,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     restoreMapSnapshot(this.tenantDatabasePurgeDomainAcks, state.acks);
     restoreMapSnapshot(this.tenantDatabasePurgeReceipts, state.receipts);
     restoreMapSnapshot(this.tenantPurgeSessionGraveMarkers, state.graves);
+    restoreMapSnapshot(this.tenantTelemetryOwnerClosureEntries,
+      state.telemetryClosureEntries);
+    restoreMapSnapshot(this.tenantTelemetryOwnerClosureReceipts,
+      state.telemetryClosureReceipts);
     restoreMapSnapshot(this.tenantDatabasePurgeCutovers, state.cutovers);
     restoreMapSnapshot(this.tenants, state.tenants);
     restoreMapSnapshot(this.agents, state.agents);
@@ -18813,6 +19047,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         throw new TenantDatabasePurgeEvidenceChangedError();
       }
       const graveRootSha256 = tenantDatabasePurgeSessionGraveMarkerRootSha256(graves);
+      const telemetryClosureEntries = this.buildTenantTelemetryOwnerClosureEntries(
+        current,
+        preDeleteReceipt,
+        graves,
+        purgeAtMs,
+      );
       const billingEvidenceHashes = reconciliationEntry.preDeleteTargetCount === 0
         ? []
         : [tenantDatabasePurgeTargetSha256("billing_reconciliation", [
@@ -18943,6 +19183,29 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         ...receiptBody,
         receiptSha256: tenantDatabasePurgeReceiptSha256(receiptBody),
       });
+      const planReceipt = this.tenantPurgePlanReceipts.get(current.requestId);
+      if (!planReceipt || planReceipt.receiptSha256 !== current.planReceiptSha256) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+      const telemetryClosureReceipt = TenantTelemetryOwnerClosure
+        .createTenantTelemetryOwnerClosureReceipt({
+          ...identity,
+          scope: TenantTelemetryOwnerClosure.TENANT_TELEMETRY_OWNER_CLOSURE_RECEIPT_SCOPE,
+          t1FenceSha256: planReceipt.t1FenceSha256,
+          t3cReceiptSha256: current.t3cReceiptSha256,
+          planReceiptSha256: current.planReceiptSha256,
+          localPhysicalAckReceiptSha256: current.localPhysicalAckReceiptSha256,
+          preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+          t3fReceiptSha256: receipt.receiptSha256,
+          graveMarkerRootSha256: graveRootSha256,
+          entryCount: telemetryClosureEntries.length,
+          entryRootSha256: TenantTelemetryOwnerClosure
+            .tenantTelemetryOwnerClosureEntryRootSha256(telemetryClosureEntries),
+          storeDbTimestampMs: purgeAtMs,
+          completedClaimAttempt: stagedAuthorization.claimAttempt,
+          completedClaimTokenSha256,
+          entries: telemetryClosureEntries,
+        });
       const terminal = clone<TenantDatabasePurgeJobRecord>({
         ...sourceFields,
         phase: "database_purged",
@@ -19019,6 +19282,20 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantDatabasePurgeDomainAcks.set(key, ack);
       }
       this.tenantDatabasePurgeReceipts.set(current.requestId, receipt);
+      for (const entry of telemetryClosureEntries) {
+        const key = JSON.stringify([entry.requestId, entry.writeOperationSha256]);
+        if (this.tenantTelemetryOwnerClosureEntries.has(key)) {
+          throw new TenantErasureIntegrityError();
+        }
+        this.tenantTelemetryOwnerClosureEntries.set(key, clone(entry));
+      }
+      if (this.tenantTelemetryOwnerClosureReceipts.has(current.requestId)) {
+        throw new TenantErasureIntegrityError();
+      }
+      this.tenantTelemetryOwnerClosureReceipts.set(
+        current.requestId,
+        clone(telemetryClosureReceipt),
+      );
       this.tenantDatabasePurgeJobs.set(current.requestId, terminal);
       if (cutover.controlGeneration === 0) {
         const cutoverBody = {
@@ -19107,6 +19384,28 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!job || job.tenantId !== tenantId || job.phase !== "database_purged") return null;
     this.assertTenantDatabasePurgeGlobalRelations();
     return clone(this.tenantDatabasePurgeBundle(job).receipt);
+  }
+
+  async getTenantTelemetryOwnerClosureReceipt(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt | null> {
+    const job = this.tenantDatabasePurgeJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "database_purged") return null;
+    this.assertTenantDatabasePurgeGlobalRelations();
+    // A pre-0039 terminal T3f receipt has no closure receipt: unknown, not empty.
+    return clone(this.tenantTelemetryOwnerClosureReceipts.get(requestId) ?? null);
+  }
+
+  async getTenantTelemetryOwnerClosureEntries(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[]> {
+    const job = this.tenantDatabasePurgeJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "database_purged") return [];
+    this.assertTenantDatabasePurgeGlobalRelations();
+    if (!this.tenantTelemetryOwnerClosureReceipts.has(requestId)) return [];
+    return this.tenantTelemetryOwnerClosureEntriesFor(requestId).map(clone);
   }
 
   async getTenantDatabasePurgeCutover(): Promise<TenantDatabasePurgeCutoverRecord> {

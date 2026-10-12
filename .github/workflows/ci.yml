@@ -512,9 +512,9 @@ jobs:
       # independent restore-journal/runtime-lineage, 0030 -> 0031 authoritative backup-catalog and
       # 0031 -> 0032 default-dormant telemetry inventory, 0032 -> 0033 receipt/inventory
       # activation, 0033 -> 0034 durable writer, 0034 -> 0035 application-capture
-      # 0035 -> 0036 dormant disposition, 0036 -> 0037 grant guard, and 0037 -> 0038
-      # immutable telemetry membership matrices all run against real MySQL.
-      - name: Historical MySQL migrations (0007 through 0038, no skips)
+      # 0035 -> 0036 dormant disposition, 0036 -> 0037 grant guard, 0037 -> 0038
+      # membership, and 0038 -> 0039 T3f owner closure all run against real MySQL.
+      - name: Historical MySQL migrations (0007 through 0039, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -677,6 +677,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0036_tenant_telemetry_disposition.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0037_tenant_telemetry_disposition_grant_guard.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0038_tenant_telemetry_artifact_membership.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0039_tenant_telemetry_owner_closure.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

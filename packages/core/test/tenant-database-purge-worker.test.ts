@@ -3,6 +3,7 @@ import {
   TenantDatabasePurgeEvidenceChangedError,
   TenantDatabasePurgeNotReadyError,
   TenantErasureIntegrityError,
+  TenantTelemetryWriteIntegrityError,
   type ClaimTenantDatabasePurgesOptions,
   type TenantDatabasePurgeClaim,
   type TenantDatabasePurgeReceipt,
@@ -164,6 +165,7 @@ describe("TenantDatabasePurgeWorker", () => {
     for (const error of [
       new TenantErasureIntegrityError(),
       new TenantDatabasePurgeEvidenceChangedError(),
+      new TenantTelemetryWriteIntegrityError(),
     ]) {
       const state = fixture();
       state.execute.mockRejectedValue(error);
@@ -175,6 +177,20 @@ describe("TenantDatabasePurgeWorker", () => {
       expect(state.block).toHaveBeenCalledWith(expect.any(Object), "integrity_conflict");
       expect(state.retry).not.toHaveBeenCalled();
     }
+
+    const transient = fixture();
+    transient.execute.mockRejectedValue(Object.assign(new Error("lock timed out"), {
+      code: "ER_LOCK_WAIT_TIMEOUT", errno: 1205, sqlState: "HY000",
+    }));
+    const transientWorker = new TenantDatabasePurgeWorker({
+      store: transient.store,
+      canExecute: vi.fn(async () => true),
+    });
+    await expect(transientWorker.processOnce()).resolves.toBe(0);
+    expect(transient.block).not.toHaveBeenCalled();
+    expect(transient.retry).toHaveBeenCalledWith(
+      expect.any(Object), expect.objectContaining({ errorCode: "temporary_failure" }),
+    );
   });
 
   it("fails closed on invalid worker bounds", () => {

@@ -3,6 +3,7 @@ import {
   TenantDatabasePurgeEvidenceChangedError,
   TenantDatabasePurgeNotReadyError,
   TenantErasureIntegrityError,
+  TenantTelemetryWriteIntegrityError,
   type TenantDatabasePurgeAuthorization,
   type TenantDatabasePurgeClaim,
   type TenantDatabasePurgeReceipt,
@@ -57,7 +58,8 @@ function authorization(claim: TenantDatabasePurgeClaim): TenantDatabasePurgeAuth
 
 function blocksExecution(error: unknown): boolean {
   return error instanceof TenantErasureIntegrityError
-    || error instanceof TenantDatabasePurgeEvidenceChangedError;
+    || error instanceof TenantDatabasePurgeEvidenceChangedError
+    || error instanceof TenantTelemetryWriteIntegrityError;
 }
 
 /**
