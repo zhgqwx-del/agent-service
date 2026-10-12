@@ -24,6 +24,14 @@ import {
   type TenantTelemetryLifecycleTargetRecord,
   type TenantTelemetryWriteAdapterInput,
 } from "../src/index.js";
+import { tenantTelemetryDispositionOperationSha256 } from "../src/tenant-telemetry-disposition.js";
+import { MemoryTenantTelemetryDispositionAdapter } from "../src/tenant-telemetry-disposition-adapter/memory.js";
+import { tenantTelemetryS3ArtifactObjectKey } from "../src/tenant-telemetry-adapter/s3.js";
+import {
+  TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE,
+  decodeTenantTelemetryS3Tombstone,
+  encodeTenantTelemetryS3Tombstone,
+} from "../src/tenant-telemetry-adapter/s3-tombstone-codec.js";
 import {
   TENANT_TELEMETRY_S3_ENVELOPE_HEADER_BYTES,
   TENANT_TELEMETRY_S3_OBJECT_CONTENT_TYPE,
@@ -69,6 +77,7 @@ class FakeS3Client {
   lifecycleRules: Array<Record<string, unknown>> = [];
   objectLockEnabled = false;
   ignoreIfNoneMatch = false;
+  ignoreIfMatch = false;
   returnVersionId = false;
   returnDeleteMarker = false;
   loseNextPutResponse = false;
@@ -93,7 +102,7 @@ class FakeS3Client {
       .digest("hex")}"`;
   }
 
-  seed(key: string, body: Buffer, contentType = TENANT_TELEMETRY_S3_OBJECT_CONTENT_TYPE): void {
+  seed(key: string, body: Buffer, contentType: string = TENANT_TELEMETRY_S3_OBJECT_CONTENT_TYPE): void {
     this.state.objects.set(this.key(BUCKET, key), {
       body: Buffer.from(body),
       etag: this.nextEtag(body),
@@ -171,6 +180,10 @@ class FakeS3Client {
       const key = this.key(command.input.Bucket, command.input.Key);
       const current = this.state.objects.get(key);
       if (!this.ignoreIfNoneMatch && command.input.IfNoneMatch === "*" && current) {
+        throw serviceError(412);
+      }
+      if (!this.ignoreIfMatch && command.input.IfMatch !== undefined
+        && current?.etag !== command.input.IfMatch) {
         throw serviceError(412);
       }
       if (this.falseAckNextPut) {
@@ -283,6 +296,141 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+describe("S3 tenant telemetry same-key disposition", () => {
+  it("keeps a checksummed content-free marker distinct from artifact bytes", () => {
+    const encoded = encodeTenantTelemetryS3Tombstone('{"safe":true}');
+    expect(decodeTenantTelemetryS3Tombstone(encoded)).toBe('{"safe":true}');
+    expect(() => decodeTenantTelemetryS3Tombstone(encoded.subarray(0, -1)))
+      .toThrow("length");
+    const corrupt = Buffer.from(encoded);
+    corrupt[corrupt.length - 1] = corrupt[corrupt.length - 1]! ^ 1;
+    expect(() => decodeTenantTelemetryS3Tombstone(corrupt)).toThrow("checksum");
+  });
+
+  it("denies product mutation by default and rejects the fixture in production", async () => {
+    const prepared = await preparedFixture();
+    const client = new FakeS3Client();
+    const ordinaryWriter = adapter(client, prepared.targets);
+    await expect(ordinaryWriter.validateDispositionStartup())
+      .rejects.toBeInstanceOf(TenantTelemetryWriteAdapterConflictError);
+    expect(client.commands).toHaveLength(0);
+    try {
+      vi.stubEnv("NODE_ENV", "production");
+      expect(() => adapter(new FakeS3Client(), prepared.targets, {
+        nonProductionDispositionFixture: true,
+      })).toThrow("forbidden in production");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("requires disposition preflight and enforces If-Match", async () => {
+    const prepared = await preparedFixture();
+    const { journal, proof } = await authorizedDisposition(prepared.input);
+    const client = new FakeS3Client();
+    const writer = adapter(client, prepared.targets, {
+      nonProductionDispositionFixture: true,
+    });
+    await writer.createWrite(prepared.input);
+    await expect(writer.tombstoneAuthorized(proof, journal))
+      .rejects.toBeInstanceOf(TenantTelemetryWriteAdapterTemporaryError);
+    client.ignoreIfMatch = true;
+    await expect(writer.validateDispositionStartup()).rejects.toThrow("ignored If-Match");
+    client.ignoreIfMatch = false;
+    await writer.validateDispositionStartup();
+    expect(client.state.objects.get(`${BUCKET}/${artifactKey(prepared.input)}`)?.contentType)
+      .toBe(TENANT_TELEMETRY_S3_OBJECT_CONTENT_TYPE);
+    await journal.close();
+  });
+
+  it("re-checks the fixture gate at the CAS boundary after preflight", async () => {
+    const prepared = await preparedFixture();
+    const { journal, proof } = await authorizedDisposition(prepared.input);
+    const client = new FakeS3Client();
+    const writer = adapter(client, prepared.targets, {
+      nonProductionDispositionFixture: true,
+    });
+    await writer.createWrite(prepared.input);
+    await writer.validateDispositionStartup();
+    const commandsBefore = client.commands.length;
+    try {
+      vi.stubEnv("NODE_ENV", "production");
+      await expect(writer.tombstoneAuthorized(proof, journal))
+        .rejects.toBeInstanceOf(TenantTelemetryWriteAdapterConflictError);
+      expect(client.commands).toHaveLength(commandsBefore);
+      expect(client.state.objects.get(`${BUCKET}/${artifactKey(prepared.input)}`)?.contentType)
+        .toBe(TENANT_TELEMETRY_S3_OBJECT_CONTENT_TYPE);
+    } finally {
+      vi.unstubAllEnvs();
+      await journal.close();
+    }
+  });
+
+  it("CAS-replaces the exact artifact, exact-replays across clients, and blocks re-creation", async () => {
+    const prepared = await preparedFixture();
+    const { journal, proof } = await authorizedDisposition(prepared.input);
+    const client = new FakeS3Client();
+    const first = adapter(client, prepared.targets, {
+      nonProductionDispositionFixture: true,
+    });
+    await first.createWrite(prepared.input);
+    await first.validateDispositionStartup();
+    const uncommittedJournal = new MemoryTenantTelemetryDispositionAdapter({
+      nonProductionFixture: true,
+      namespaceId: "unit-disposition-journal",
+      targetId: "unit-disposition-target",
+      failureDomainId: "unit-independent-failure-domain",
+      logicalDatabaseNamespaceSha256:
+        createHash("sha256").update("logical-database").digest("hex"),
+    });
+    await expect(first.tombstoneAuthorized(proof, uncommittedJournal))
+      .rejects.toBeInstanceOf(TenantTelemetryWriteAdapterTemporaryError);
+    expect(client.state.objects.get(`${BUCKET}/${artifactKey(prepared.input)}`)?.contentType)
+      .toBe(TENANT_TELEMETRY_S3_OBJECT_CONTENT_TYPE);
+    await uncommittedJournal.close();
+    const key = tenantTelemetryS3ArtifactObjectKey(PREFIX, proof);
+    expect(key).toBe(artifactKey(prepared.input));
+    const firstAck = await first.tombstoneAuthorized(proof, journal);
+    const stored = client.state.objects.get(`${BUCKET}/${key}`);
+    expect(stored?.contentType).toBe(TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE);
+    expect(stored?.body.toString("utf8")).not.toContain(prepared.input.inventory.tenantId);
+    expect(stored?.body.toString("utf8")).not.toContain("records");
+    const second = adapter(new FakeS3Client(client.state), prepared.targets, {
+      nonProductionDispositionFixture: true,
+    });
+    await second.validateDispositionStartup();
+    expect(await second.tombstoneAuthorized(proof, journal)).toEqual(firstAck);
+    await expect(second.createWrite(prepared.input))
+      .rejects.toBeInstanceOf(TenantTelemetryWriteAdapterConflictError);
+    expect(client.commands.filter((command) => command instanceof DeleteObjectCommand
+      && command.input.Key === key)).toHaveLength(0);
+    await journal.close();
+  });
+
+  it("reconciles a lost CAS response and rejects missing or foreign slots", async () => {
+    const prepared = await preparedFixture();
+    const { journal, proof } = await authorizedDisposition(prepared.input);
+    const client = new FakeS3Client();
+    const writer = adapter(client, prepared.targets, {
+      nonProductionDispositionFixture: true,
+    });
+    await writer.createWrite(prepared.input);
+    await writer.validateDispositionStartup();
+    client.loseNextPutResponse = true;
+    const ack = await writer.tombstoneAuthorized(proof, journal);
+    expect(await writer.tombstoneAuthorized(proof, journal)).toEqual(ack);
+    const key = tenantTelemetryS3ArtifactObjectKey(PREFIX, proof);
+    client.state.objects.delete(`${BUCKET}/${key}`);
+    await expect(writer.tombstoneAuthorized(proof, journal))
+      .rejects.toBeInstanceOf(TenantTelemetryWriteAdapterConflictError);
+    const foreign = encodeTenantTelemetryS3Tombstone('{"foreign":true}');
+    client.seed(key, foreign, TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE);
+    await expect(writer.tombstoneAuthorized(proof, journal))
+      .rejects.toBeInstanceOf(TenantTelemetryWriteAdapterConflictError);
+    await journal.close();
+  });
+});
+
 function adapter(
   client: FakeS3Client,
   targets: readonly TenantTelemetryLifecycleTargetRecord[],
@@ -316,6 +464,40 @@ function artifactKey(input: TenantTelemetryWriteAdapterInput): string {
     input.inventory.artifactIdSha256,
     `${input.inventory.artifactGeneration}.astelm`,
   ].join("/");
+}
+
+async function authorizedDisposition(input: TenantTelemetryWriteAdapterInput) {
+  const digest = (label: string) => createHash("sha256").update(label).digest("hex");
+  const source = {
+    domain: input.inventory.domain,
+    targetSha256: input.target.targetSha256,
+    artifactIdSha256: input.inventory.artifactIdSha256,
+    artifactGeneration: input.inventory.artifactGeneration,
+    inventorySha256: input.inventory.inventorySha256,
+    inventoryReceiptSha256: input.inventory.receiptSha256,
+    writeOperationSha256: input.writeOperationSha256,
+    writeAckReceiptSha256: digest("durable-write-ack"),
+    payloadSha256: input.inventory.payloadSha256,
+    manifestSha256: input.inventory.manifestSha256,
+    lifecycleCoverageEvidenceSha256: input.inventory.coverageEvidenceSha256,
+    applicationCoverageEvidenceSha256: null,
+    applicationWriteBindingReceiptSha256: null,
+    t3cReceiptSha256: digest("exact-t3c-receipt"),
+    t3dPlanReceiptSha256: digest("exact-t3d-plan-receipt"),
+    t3dPlanEntryReceiptSha256: digest("exact-t3d-entry-receipt"),
+  };
+  const journal = new MemoryTenantTelemetryDispositionAdapter({
+    nonProductionFixture: true,
+    namespaceId: "unit-disposition-journal",
+    targetId: "unit-disposition-target",
+    failureDomainId: "unit-independent-failure-domain",
+    logicalDatabaseNamespaceSha256: digest("logical-database"),
+  });
+  const proof = await journal.authorizeDeletion({
+    ...source,
+    dispositionOperationSha256: tenantTelemetryDispositionOperationSha256(source),
+  });
+  return { journal, proof };
 }
 
 describe("tenant telemetry S3 envelope", () => {

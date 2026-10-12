@@ -4,7 +4,8 @@
 > target activation与per-domain application producer capture分离。当前只支持
 > `provider.upstream_request_failed` logs exact contract，traces必须inactive。filesystem仅限本地单runner，
 > 无OS lock且人工ACK不是证明，production禁用；`telemetry-s3-object-v1`已经闭合共享对象写入协议，
-> 但真实managed环境验收、delete/restore/retention executor、activation/operator CLI与完整coverage仍未实现。
+> `0036`已安装默认休眠的disposition账本与非生产same-key CAS tombstone/CAS-head journal协议夹具；产品处置仍默认拒绝。
+> 真实DB授权、旧快照replay/startup gate、managed环境验收、delete/restore/retention executor、activation/operator CLI与完整coverage仍未实现。
 > 本文定义 M1 数据生命周期需要的最小安全契约，以及 M4 完整可观测性平台的边界。
 
 ## 1. 目的
@@ -32,9 +33,10 @@ owner inventory、retention、legal hold 与删除 ACK，日志/追踪就会成�
 5. **S3-compatible writer target**：`telemetry-s3-object-v1`用create-only对象、闭合checksum envelope、
    有界read-after-write和startup bucket capability preflight提供managed-capable写入目标；它不授予删除、
    retention、restore或completion authority。
-6. **后续 execution lifecycle**：在新的`0036` default-dormant ledger中提供disposition、删除或匿名化
-   operation、restore replay 与 terminal receipt。该层完成前，T3d 的 `logs` 和 `traces` 仍必须
-   保持显式 blocker，全域 completion 仍为 `false`。
+6. **`0036`与后续 execution lifecycle**：`0036`只安装default-dormant disposition control、future-only
+   grant/job/event/ACK/receipt/replay-fence账本及非生产外部协议夹具，不发行source-valid grant、不执行删除或恢复。
+   后续仍须闭合DB授权、物理marker验真、最新external head与0030/0031 restore绑定、旧快照replay/startup gate
+   及跨MySQL/S3端到端测试。完成前T3d的`logs`和`traces`仍为显式blocker，全域completion固定`false`。
 
 本文不把日志系统等同于监控系统，也不因本机输出了 JSON 就宣称 M4 可观测性已经完成。
 
@@ -394,11 +396,11 @@ adapter startup会验证bucket可达、versioning从未启用、lifecycle配置�
 create-only conditional PUT和陈旧冲突语义。target identity绑定bucket、prefix、受控region、规范化custom
 endpoint或`standard-endpoint`模式、addressing mode、namespace与failure-domain；credential、header和明文secret
 不进入identity、日志或错误。production custom endpoint必须为credential-free HTTPS origin，并要求operator在独立
-验证private access/IAM后设置private-bucket ACK；ACK本身不是自动证明。该adapter当前只有create/inspect，
-没有same-key CAS tombstone、delete marker、retention或restore接口。
+验证private access/IAM后设置private-bucket ACK；ACK本身不是自动证明。产品writer路径仍只有create/inspect；
+`0036`虽增加非生产same-key CAS tombstone协议夹具，但没有可启用的delete、retention或restore接口。
 
 startup conditional-PUT探针会在`<prefix>/_agent_service_probe/`下创建随机无正文身份对象并随后删除，
-所以writer principal的`DeleteObject`只能授权到这个probe子前缀，不能扩展到artifact key；未来0036的处置凭据
+所以writer principal的`DeleteObject`只能授权到这个probe子前缀，不能扩展到artifact key；未来真正执行处置的凭据
 必须另行最小化。首次PUT响应丢失或整个共享deadline耗尽仍可能留下content-free probe orphan，当前没有自动sweeper，
 需要监控并以该受限前缀的operator流程清理；这不等于telemetry artifact delete能力。
 
@@ -438,10 +440,11 @@ adapter 至少需要固定语义：
 - dead-letter不等于物理完成。
 
 本地 fake/filesystem adapter与同机MinIO只能证明协议、rollback、并发和 replay，不能成为production
-completion或独立故障域proof。下一步必须在新的`0036` expand-only、default-dormant migration中建立精确
-disposition/delete/restore ledger；外部对象删除采用same-key `If-Match` CAS tombstone，并先把content-free
-intent写入独立create-only event chain + CAS authority head journal，恢复旧数据库快照后再由该journal exact replay
-永久marker，不能用S3 LIST猜测head或把DeleteObject成功当成可恢复证明。
+completion或独立故障域proof。`0036`已安装expand-only、default-dormant disposition账本，并在显式非生产fixture
+验证same-key `If-Match` CAS tombstone、content-free create-only event chain与CAS authority head；产品处置和
+store mirror/fence仍默认拒绝。下一步必须先将source-valid DB grant、外部terminal marker与最新head验真、
+0030/0031恢复绑定及旧快照replay/startup gate做成端到端authority，不能用S3 LIST猜测head，也不能把
+DeleteObject成功或非生产fixture结果当成可恢复删除证明。
 
 ### 8.6 Tenant 与 user erasure 集成
 
@@ -466,17 +469,19 @@ trace batch复活。尚未 ACK 的首次外部 mutation不能从旧快照猜造�
 
 建议沿用现有安全切片模式：
 
-1. 应用`0032`～`0035` expand-only migration，lifecycle/application capture/writer全部保持默认关闭；后续0036
-   execution ledger也必须default-dormant；
+1. 应用`0032`～`0036` expand-only migration，lifecycle/application capture/writer和0036 execution ledger
+   全部保持默认关闭；
 2. 若0033已active，先按0034既有停写/reconcile契约处理历史subject gap；inactive或无gap历史无需该特殊模式；
 3. 部署全部0035-aware router/runner并排空旧writer，核对精确ref key、target、producer contract与全fleet startup audit；
 4. 只对已证明无遗漏且与业务事务边界相容的domain，由受控one-shot operator激活application capture；
-5. 再按adapter protocol开启runner worker、验证真实managed adapter namespace与故障域；0036 ledger、same-key
-   CAS tombstone与独立CAS-head journal闭合后，才考虑delete/restore/retention executor及destructive gate；
+5. 再按adapter protocol开启runner writer worker、验证真实managed adapter namespace与故障域；0036的非生产
+   same-key CAS tombstone/CAS-head journal协议不能授权destructive gate，必须先补source-valid grant、旧快照恢复
+   replay及完整执行链，才考虑delete/restore/retention executor；
 6. 首个activation/binding/ACK/cutover提交后只能forward-fix。
 
 当前没有activation/operator CLI和完整业务事务crash-atomic capture；唯一producer只覆盖一个provider failure
-logs事件，traces明确不支持。S3 adapter可证明managed-capable object writer协议，但没有0036 execution lifecycle。
+logs事件，traces明确不支持。S3 writer可证明managed-capable对象写入协议；0036处置只有默认拒绝的非生产协议夹具，
+没有产品execution lifecycle。
 因此production不得执行步骤4，本地filesystem或MinIO都不能作为rollout/删除证明。
 
 ## 9. 本地与 CI 验收
@@ -502,8 +507,10 @@ replay，以及current/stale/in-flight writer并发与metadata-lock语义。CI�
 suite，要求目标文件实际pass且零skip/non-passed。`verify-s3`使用与Blob、restore journal、backup catalog都不同
 的第四个telemetry bucket运行真实adapter；同一命令的源码应用smoke只证明Blob S3装配及0034/0035 dormant
 schema，不会激活或构造telemetry S3 writer。这个布局只证明协议和配置隔离，不证明云IAM/KMS
-或独立故障域。易变的完整数量以`docs/PROGRESS.md`最后一节和对应CI run为准。后续仍需0036
-delete/restore ledger、legal-hold destructive竞态、全域completion与managed环境测试。
+或独立故障域。易变的完整数量以`docs/PROGRESS.md`最后一节和对应CI run为准。0036另有独立protocol/Memory/
+真实MySQL与第五个MinIO bucket的required suite、固定`0035→0036`真实历史升级夹具，但这些只验证默认休眠账本和
+非生产外部协议；后续仍需真实DB授权、delete/restore执行与旧快照replay、legal-hold destructive竞态、
+全域completion与managed环境测试。
 
 `0035`另由`pnpm test:tenant-telemetry-application-capture`和
 `pnpm test:tenant-telemetry-application-capture-mysql`独立门禁。真实MySQL套件覆盖分域activation、并发

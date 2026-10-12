@@ -13,9 +13,21 @@ import {
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
 import {
+  tenantTelemetryArtifactPayloadSha256,
   tenantTelemetryArtifactPayloadCanonicalJson,
   type TenantTelemetryWriteAdapterResult,
 } from "../tenant-telemetry-writer.js";
+import {
+  TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+  TENANT_TELEMETRY_SAME_KEY_TOMBSTONE_ACK_SCOPE,
+  tenantTelemetrySameKeyTombstoneAckSha256,
+  validateTenantTelemetryExternalAuthorizationProof,
+  validateTenantTelemetrySameKeyTombstoneAck,
+  type TenantTelemetryDispositionExternalAdapter,
+  type TenantTelemetryExternalAuthorizationProof,
+  type TenantTelemetrySameKeyTombstoneAck,
+  type TenantTelemetrySameKeyTombstoneAckBody,
+} from "../tenant-telemetry-disposition.js";
 import {
   validateTenantTelemetryLifecycleTarget,
   type TenantTelemetryDomain,
@@ -38,6 +50,13 @@ import {
   decodeTenantTelemetryS3Envelope,
   encodeTenantTelemetryS3Envelope,
 } from "./s3-codec.js";
+import {
+  TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE,
+  TENANT_TELEMETRY_S3_TOMBSTONE_HEADER_BYTES,
+  TENANT_TELEMETRY_S3_TOMBSTONE_MAX_BODY_BYTES,
+  decodeTenantTelemetryS3Tombstone,
+  encodeTenantTelemetryS3Tombstone,
+} from "./s3-tombstone-codec.js";
 
 export const S3_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL =
   "telemetry-s3-object-v1" as const;
@@ -56,6 +75,8 @@ const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 const MAX_ENVELOPE_BYTES = TENANT_TELEMETRY_S3_ENVELOPE_HEADER_BYTES
   + TENANT_TELEMETRY_S3_ENVELOPE_MAX_METADATA_BYTES
   + TENANT_TELEMETRY_S3_ENVELOPE_MAX_PAYLOAD_BYTES;
+const MAX_READ_BYTES = Math.max(MAX_ENVELOPE_BYTES,
+  TENANT_TELEMETRY_S3_TOMBSTONE_HEADER_BYTES + TENANT_TELEMETRY_S3_TOMBSTONE_MAX_BODY_BYTES);
 const SAFE_S3_ERROR_NAMES = new Set([
   "AbortError",
   "AccessDenied",
@@ -103,6 +124,8 @@ export interface S3TenantTelemetryWriteAdapterOptions
   credentials?: S3ClientConfig["credentials"];
   client?: S3Client;
   requestTimeoutMs?: number;
+  /** 0036 is not a product executor. Only disposable protocol tests may enable mutation. */
+  nonProductionDispositionFixture?: true;
 }
 
 interface StoredTenantTelemetryObjectMetadata {
@@ -162,6 +185,94 @@ class S3TenantTelemetryOperationDeadline {
 
 function sha256(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function sha256Bytes(value: Uint8Array | string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function dispositionEvidence(proof: TenantTelemetryExternalAuthorizationProof) {
+  return {
+    domain: proof.domain,
+    targetSha256: proof.targetSha256,
+    artifactIdSha256: proof.artifactIdSha256,
+    artifactGeneration: proof.artifactGeneration,
+    inventorySha256: proof.inventorySha256,
+    inventoryReceiptSha256: proof.inventoryReceiptSha256,
+    writeOperationSha256: proof.writeOperationSha256,
+    writeAckReceiptSha256: proof.writeAckReceiptSha256,
+    payloadSha256: proof.payloadSha256,
+    manifestSha256: proof.manifestSha256,
+    lifecycleCoverageEvidenceSha256: proof.lifecycleCoverageEvidenceSha256,
+    applicationCoverageEvidenceSha256: proof.applicationCoverageEvidenceSha256,
+    applicationWriteBindingReceiptSha256: proof.applicationWriteBindingReceiptSha256,
+    t3cReceiptSha256: proof.t3cReceiptSha256,
+    t3dPlanReceiptSha256: proof.t3dPlanReceiptSha256,
+    t3dPlanEntryReceiptSha256: proof.t3dPlanEntryReceiptSha256,
+    dispositionOperationSha256: proof.dispositionOperationSha256,
+  };
+}
+
+function sameKeyTombstoneJson(
+  proof: TenantTelemetryExternalAuthorizationProof,
+  originalObjectEtagSha256: string,
+): string {
+  return JSON.stringify({
+    protocol: "telemetry-s3-same-key-tombstone-v1",
+    ...dispositionEvidence(proof),
+    authorizationReceiptSha256: proof.authorizationReceiptSha256,
+    originalObjectEtagSha256,
+  });
+}
+
+function sameKeyTombstoneAck(
+  proof: TenantTelemetryExternalAuthorizationProof,
+  tombstone: Buffer,
+  originalObjectEtagSha256: string,
+): TenantTelemetrySameKeyTombstoneAck {
+  const tombstoneSha256 = sha256Bytes(tombstone);
+  const body: TenantTelemetrySameKeyTombstoneAckBody = {
+    scope: TENANT_TELEMETRY_SAME_KEY_TOMBSTONE_ACK_SCOPE,
+    protocol: TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+    ...dispositionEvidence(proof),
+    authorizationReceiptSha256: proof.authorizationReceiptSha256,
+    outcome: "tombstoned",
+    tombstoneSha256,
+    objectEtagSha256: originalObjectEtagSha256,
+    adapterEvidenceSha256: sha256([
+      "telemetry-s3-same-key-tombstone-adapter-evidence-v1",
+      proof.targetSha256,
+      proof.dispositionOperationSha256,
+      proof.authorizationReceiptSha256,
+      tombstoneSha256,
+      originalObjectEtagSha256,
+    ]),
+  };
+  const ack = { ...body, receiptSha256: tenantTelemetrySameKeyTombstoneAckSha256(body) };
+  validateTenantTelemetrySameKeyTombstoneAck(ack);
+  return ack;
+}
+
+/** The artifact and permanent tombstone share this exact key. No LIST or delete-marker fallback. */
+export function tenantTelemetryS3ArtifactObjectKey(
+  prefix: string,
+  identity: {
+    domain: TenantTelemetryDomain;
+    targetSha256: string;
+    artifactIdSha256: string;
+    artifactGeneration: number;
+  },
+): string {
+  return [
+    validatePrefix(prefix),
+    "v1",
+    identity.domain,
+    identity.targetSha256.slice(0, 2),
+    identity.targetSha256,
+    identity.artifactIdSha256.slice(0, 2),
+    identity.artifactIdSha256,
+    `${identity.artifactGeneration}.astelm`,
+  ].join("/");
 }
 
 function errorStatus(error: unknown): number | undefined {
@@ -461,7 +572,7 @@ async function readBoundedBody(
 ): Promise<Buffer> {
   if (contentLength !== undefined
     && (!Number.isSafeInteger(contentLength) || contentLength < 0
-      || contentLength > MAX_ENVELOPE_BYTES)) {
+      || contentLength > MAX_READ_BYTES)) {
     destroyBody(body);
     throw new TenantTelemetryWriteAdapterConflictError();
   }
@@ -482,7 +593,7 @@ async function readBoundedBody(
         throw new TenantTelemetryWriteAdapterConflictError();
       }
       total += chunk.byteLength;
-      if (total > MAX_ENVELOPE_BYTES) {
+      if (total > MAX_READ_BYTES) {
         throw new TenantTelemetryWriteAdapterConflictError();
       }
       // Copy each chunk immediately. Some SDK/body implementations reuse a mutable backing
@@ -509,11 +620,8 @@ async function readBoundedBody(
   return Buffer.concat(chunks, total);
 }
 
-/**
- * Managed S3-compatible write adapter. Artifact publication is create-only. This class deliberately
- * exposes no artifact delete/tombstone operation; that protocol belongs to the later lifecycle
- * execution ledger and cannot be inferred from a successful write.
- */
+/** Managed S3-compatible writer; the dormant disposition entrypoint requires separate preflight
+ * and a committed independent-journal authorization proof before touching an artifact key. */
 export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapter {
   readonly adapterProtocol = S3_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL;
   readonly bucket: string;
@@ -522,10 +630,17 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
   private readonly client: S3Client;
   private readonly ownsClient: boolean;
   private readonly requestTimeoutMs: number;
+  private readonly nonProductionDispositionFixture: boolean;
   private readonly expectedTargets = new Map<string, TenantTelemetryLifecycleTargetRecord>();
   private closed = false;
+  private dispositionReady = false;
 
   constructor(options: S3TenantTelemetryWriteAdapterOptions) {
+    if (options.nonProductionDispositionFixture === true
+      && process.env.NODE_ENV === "production") {
+      throw new Error("tenant telemetry disposition fixture is forbidden in production");
+    }
+    this.nonProductionDispositionFixture = options.nonProductionDispositionFixture === true;
     if (options.privateBucketAcknowledged !== true) {
       throw new Error("S3 tenant telemetry requires a private-bucket acknowledgement");
     }
@@ -623,16 +738,12 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
   }
 
   private objectKey(input: TenantTelemetryWriteAdapterInput): string {
-    return [
-      this.prefix,
-      "v1",
-      input.inventory.domain,
-      input.target.targetSha256.slice(0, 2),
-      input.target.targetSha256,
-      input.inventory.artifactIdSha256.slice(0, 2),
-      input.inventory.artifactIdSha256,
-      `${input.inventory.artifactGeneration}.astelm`,
-    ].join("/");
+    return tenantTelemetryS3ArtifactObjectKey(this.prefix, {
+      domain: input.inventory.domain,
+      targetSha256: input.target.targetSha256,
+      artifactIdSha256: input.inventory.artifactIdSha256,
+      artifactGeneration: input.inventory.artifactGeneration,
+    });
   }
 
   private async send<Output>(
@@ -799,9 +910,272 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
     }
   }
 
+  private assertDispositionProof(proof: TenantTelemetryExternalAuthorizationProof): void {
+    this.assertOpen();
+    // Fixture authorization is not a product capability. Re-check at the mutation boundary so
+    // a long-lived adapter preflighted before an environment switch cannot write in production.
+    if (!this.nonProductionDispositionFixture || process.env.NODE_ENV === "production") {
+      throw new TenantTelemetryWriteAdapterConflictError();
+    }
+    if (!this.dispositionReady) throw new TenantTelemetryWriteAdapterTemporaryError();
+    try {
+      validateTenantTelemetryExternalAuthorizationProof(proof);
+      const target = this.expectedTargets.get(proof.targetSha256);
+      if (!target || target.domain !== proof.domain
+        || target.adapterProtocol !== this.adapterProtocol) {
+        throw new Error("target mismatch");
+      }
+    } catch {
+      throw new TenantTelemetryWriteAdapterConflictError();
+    }
+  }
+
+  private async assertCommittedDispositionProof(
+    proof: TenantTelemetryExternalAuthorizationProof,
+    journal: TenantTelemetryDispositionExternalAdapter,
+  ): Promise<void> {
+    try {
+      if (journal.adapterProtocol !== proof.adapterProtocol
+        || journal.journalNamespaceSha256 !== proof.journalNamespaceSha256
+        || journal.journalTargetSha256 !== proof.journalTargetSha256
+        || journal.failureDomainSha256 !== proof.failureDomainSha256
+        || journal.logicalDatabaseNamespaceSha256
+          !== proof.logicalDatabaseNamespaceSha256) {
+        throw new Error("journal identity mismatch");
+      }
+      const head = await journal.readHead();
+      if (head.journalSequence < proof.journalSequence) {
+        throw new Error("authorization is not committed");
+      }
+      const page = await journal.scanEvents({
+        afterJournalSequence: proof.journalSequence - 1,
+        afterJournalEventRootSha256: proof.previousJournalEventRootSha256,
+        sealedHead: head,
+        limit: 1,
+      });
+      const event = page.events[0];
+      if (event?.eventType !== "delete_authorized"
+        || event.result.authorizationReceiptSha256 !== proof.authorizationReceiptSha256
+        || event.result.journalSequence !== proof.journalSequence
+        || event.result.journalEventSha256 !== proof.journalEventSha256
+        || event.result.journalEventRootSha256 !== proof.journalEventRootSha256) {
+        throw new Error("authorization event does not match");
+      }
+    } catch (error) {
+      if (error instanceof TenantTelemetryWriteAdapterConflictError) throw error;
+      // A missing/foreign event is a permanent conflict; a transient journal read failure must
+      // not mutate the object either. The worker retries from its durable authorization state.
+      throw new TenantTelemetryWriteAdapterTemporaryError();
+    }
+  }
+
+  private async dispositionState(
+    proof: TenantTelemetryExternalAuthorizationProof,
+    key: string,
+    deadline: S3TenantTelemetryOperationDeadline,
+  ): Promise<
+    | { kind: "data"; etag: string }
+    | { kind: "tombstone"; ack: TenantTelemetrySameKeyTombstoneAck }
+  > {
+    const output = await this.readObject(key, deadline);
+    // An absent slot does not prove that a permanent fence exists. In particular, a missing
+    // external object after a backup restore must never become a physical-deletion ACK.
+    if (!output) throw new TenantTelemetryWriteAdapterConflictError();
+    try {
+      assertUnversionedEvidence(output);
+      if (typeof output.ETag !== "string"
+        || output.ETag.length < 1 || output.ETag.length > 512) {
+        throw new TenantTelemetryWriteAdapterConflictError();
+      }
+      if (output.ContentType !== TENANT_TELEMETRY_S3_OBJECT_CONTENT_TYPE
+        && output.ContentType !== TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE) {
+        throw new TenantTelemetryWriteAdapterConflictError();
+      }
+      const bytes = await readBoundedBody(output.Body, output.ContentLength, deadline);
+      if (output.ContentType === TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE) {
+        const bodyJson = decodeTenantTelemetryS3Tombstone(bytes);
+        const parsed = JSON.parse(bodyJson) as Record<string, unknown>;
+        const originalObjectEtagSha256 = parsed.originalObjectEtagSha256;
+        if (typeof originalObjectEtagSha256 !== "string"
+          || !SHA256.test(originalObjectEtagSha256)
+          || bodyJson !== sameKeyTombstoneJson(proof, originalObjectEtagSha256)) {
+          throw new TenantTelemetryWriteAdapterConflictError();
+        }
+        return {
+          kind: "tombstone",
+          ack: sameKeyTombstoneAck(proof, bytes, originalObjectEtagSha256),
+        };
+      }
+      const decoded = decodeTenantTelemetryS3Envelope(bytes);
+      const metadata = parseMetadata(decoded.metadataJson);
+      const target = this.expectedTargets.get(proof.targetSha256);
+      if (!target
+        || metadata.targetSha256 !== proof.targetSha256
+        || metadata.targetReceiptSha256 !== target.receiptSha256
+        || metadata.domain !== proof.domain
+        || metadata.writeOperationSha256 !== proof.writeOperationSha256
+        || metadata.artifactIdSha256 !== proof.artifactIdSha256
+        || metadata.artifactGeneration !== proof.artifactGeneration
+        || metadata.inventorySha256 !== proof.inventorySha256
+        || metadata.inventoryReceiptSha256 !== proof.inventoryReceiptSha256
+        || metadata.payloadSha256 !== proof.payloadSha256
+        || metadata.manifestSha256 !== proof.manifestSha256) {
+        throw new TenantTelemetryWriteAdapterConflictError();
+      }
+      const payload = JSON.parse(decoded.payloadJson);
+      if (tenantTelemetryArtifactPayloadCanonicalJson(payload) !== decoded.payloadJson
+        || tenantTelemetryArtifactPayloadSha256(payload) !== proof.payloadSha256) {
+        throw new TenantTelemetryWriteAdapterConflictError();
+      }
+      return { kind: "data", etag: output.ETag };
+    } catch (error) {
+      destroyBody(output.Body);
+      if (error instanceof TenantTelemetryWriteAdapterConflictError
+        || error instanceof TenantTelemetryWriteAdapterTemporaryError) throw error;
+      throw new TenantTelemetryWriteAdapterConflictError();
+    }
+  }
+
+  /**
+   * Replace only the exact authenticated artifact with a content-free permanent marker. The
+   * journal authorization has already committed externally; this method cannot grant deletion
+   * authority by itself. A replay returns the original deterministic ACK, not a new outcome.
+   */
+  async tombstoneAuthorized(
+    proof: TenantTelemetryExternalAuthorizationProof,
+    journal: TenantTelemetryDispositionExternalAdapter,
+  ): Promise<TenantTelemetrySameKeyTombstoneAck> {
+    this.assertDispositionProof(proof);
+    await this.assertCommittedDispositionProof(proof, journal);
+    const deadline = new S3TenantTelemetryOperationDeadline(this.requestTimeoutMs);
+    const key = tenantTelemetryS3ArtifactObjectKey(this.prefix, proof);
+    try {
+      const current = await this.dispositionState(proof, key, deadline);
+      if (current.kind === "tombstone") return current.ack;
+      const originalObjectEtagSha256 = sha256Bytes(current.etag);
+      const tombstone = encodeTenantTelemetryS3Tombstone(
+        sameKeyTombstoneJson(proof, originalObjectEtagSha256),
+      );
+      let putError: unknown;
+      try {
+        const output = await this.send(deadline, (abortSignal) => this.client.send(
+          new PutObjectCommand({
+            Bucket: this.bucket,
+            Key: key,
+            Body: tombstone,
+            ContentLength: tombstone.byteLength,
+            ContentType: TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE,
+            IfMatch: current.etag,
+          }),
+          { abortSignal },
+        ));
+        assertUnversionedEvidence(output);
+      } catch (error) {
+        if (error instanceof S3TenantTelemetryVersionedObjectError) throw error;
+        putError = error;
+      }
+      const observed = await this.dispositionState(proof, key, deadline);
+      if (observed.kind === "tombstone") return observed.ack;
+      if (putError !== undefined && isConditionalConflict(putError)) {
+        throw new TenantTelemetryWriteAdapterConflictError();
+      }
+      throw new TenantTelemetryWriteAdapterTemporaryError();
+    } catch (error) {
+      if (error instanceof TenantTelemetryWriteAdapterConflictError
+        || error instanceof TenantTelemetryWriteAdapterTemporaryError) throw error;
+      throw new TenantTelemetryWriteAdapterTemporaryError();
+    }
+  }
+
+  /** Separate preflight for the dormant destructive path; ordinary writer startup does not enable it. */
+  async validateDispositionStartup(): Promise<void> {
+    this.dispositionReady = false;
+    if (!this.nonProductionDispositionFixture || process.env.NODE_ENV === "production") {
+      throw new TenantTelemetryWriteAdapterConflictError();
+    }
+    await this.validateStartup();
+    const deadline = new S3TenantTelemetryOperationDeadline(this.requestTimeoutMs);
+    const key = `${this.prefix}/_agent_service_probe/${randomBytes(16).toString("hex")}`;
+    const initial = Buffer.from("agent-service-telemetry-disposition-cas-v1", "utf8");
+    const replacement = Buffer.from("agent-service-telemetry-disposition-cas-v2", "utf8");
+    let created = false;
+    try {
+      const first = await this.send(deadline, (abortSignal) => this.client.send(
+        new PutObjectCommand({
+          Bucket: this.bucket, Key: key, Body: initial,
+          ContentLength: initial.byteLength, IfNoneMatch: "*",
+        }), { abortSignal },
+      ));
+      assertUnversionedEvidence(first);
+      created = true;
+      const head = await this.send(deadline, (abortSignal) => this.client.send(
+        new HeadObjectCommand({ Bucket: this.bucket, Key: key }), { abortSignal },
+      ));
+      assertUnversionedEvidence(head);
+      if (typeof head.ETag !== "string" || head.ETag.length < 1
+        || head.ETag.length > 512 || head.ContentLength !== initial.length) {
+        throw new S3TenantTelemetrySafeError("S3 tenant telemetry disposition CAS probe is invalid");
+      }
+      let ignoredConditional = false;
+      try {
+        const rejected = await this.send(deadline, (abortSignal) => this.client.send(
+          new PutObjectCommand({
+            Bucket: this.bucket, Key: key, Body: replacement,
+            ContentLength: replacement.byteLength, IfMatch: '"invalid-cas-etag"',
+          }), { abortSignal },
+        ));
+        assertUnversionedEvidence(rejected);
+        ignoredConditional = true;
+      } catch (error) {
+        if (!isConditionalConflict(error)) throw error;
+      }
+      if (ignoredConditional) {
+        throw new S3TenantTelemetrySafeError("S3 tenant telemetry endpoint ignored If-Match");
+      }
+      const original = await this.readObject(key, deadline);
+      if (!original) throw new S3TenantTelemetrySafeError("S3 telemetry CAS probe disappeared");
+      assertUnversionedEvidence(original);
+      const originalBytes = await readBoundedBody(original.Body, original.ContentLength, deadline);
+      if (original.ETag !== head.ETag || !originalBytes.equals(initial)) {
+        throw new S3TenantTelemetrySafeError("S3 telemetry CAS probe was overwritten");
+      }
+      const second = await this.send(deadline, (abortSignal) => this.client.send(
+        new PutObjectCommand({
+          Bucket: this.bucket, Key: key, Body: replacement,
+          ContentLength: replacement.byteLength, IfMatch: head.ETag,
+        }), { abortSignal },
+      ));
+      assertUnversionedEvidence(second);
+      const replaced = await this.readObject(key, deadline);
+      if (!replaced) throw new S3TenantTelemetrySafeError("S3 telemetry CAS probe disappeared");
+      assertUnversionedEvidence(replaced);
+      const replacedBytes = await readBoundedBody(replaced.Body, replaced.ContentLength, deadline);
+      if (!replacedBytes.equals(replacement)) {
+        throw new S3TenantTelemetrySafeError("S3 telemetry CAS probe did not replace the object");
+      }
+      this.dispositionReady = true;
+    } catch (error) {
+      if (error instanceof S3TenantTelemetrySafeError) throw error;
+      throw sanitizedS3Error("disposition CAS probe", error);
+    } finally {
+      if (created) {
+        try {
+          const removed = await this.send(deadline, (abortSignal) => this.client.send(
+            new DeleteObjectCommand({ Bucket: this.bucket, Key: key }), { abortSignal },
+          ));
+          assertUnversionedEvidence(removed);
+        } catch (error) {
+          this.dispositionReady = false;
+          throw sanitizedS3Error("disposition probe cleanup", error);
+        }
+      }
+    }
+  }
+
   /** Validate the bucket contract and prove that create-only conditional PUT is enforced. */
   async validateStartup(): Promise<void> {
     this.assertOpen();
+    this.dispositionReady = false;
     const deadline = new S3TenantTelemetryOperationDeadline(this.requestTimeoutMs);
     try {
       await this.send(deadline, (abortSignal) => this.client.send(

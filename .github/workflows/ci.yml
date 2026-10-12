@@ -90,6 +90,8 @@ jobs:
             node packages/store/scripts/bootstrap-s3.mjs
           S3_TEST_BUCKET=agent-service-ci-tenant-telemetry \
             node packages/store/scripts/bootstrap-s3.mjs
+          S3_TEST_BUCKET=agent-service-ci-telemetry-disposition \
+            node packages/store/scripts/bootstrap-s3.mjs
 
       - name: Verify OpenAPI and generated SDK are current
         run: pnpm run check:api
@@ -115,6 +117,12 @@ jobs:
       - name: Durable tenant telemetry writer unit suites (must execute)
         run: pnpm run test:tenant-telemetry-writer
 
+      # 0036 is a default-dormant disposition substrate. Its non-production journal/CAS-marker
+      # fixtures and Memory rollback must run by name; they do not make the current blocked
+      # T3d logs/traces targets executable or authorize product deletion.
+      - name: Tenant telemetry disposition unit suites (must execute)
+        run: pnpm run test:tenant-telemetry-disposition
+
       - name: Create test databases
         run: |
           mysql -h 127.0.0.1 -uroot -e "
@@ -137,6 +145,11 @@ jobs:
         env:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:tenant-telemetry-writer-mysql
+
+      - name: Tenant telemetry disposition real MySQL suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-telemetry-disposition-mysql
 
       # Unit + store conformance (both backends) + HTTP + dialect tests against the fake vendor.
       # Coverage thresholds live in vitest.config.ts and fail the job on a regression.
@@ -250,6 +263,19 @@ jobs:
           S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:tenant-telemetry-writer-s3
+
+      # The fifth logical bucket exercises the independent deletion journal protocol separately
+      # from the artifact bucket. Same-host MinIO proves CAS semantics, not a production fault domain.
+      - name: Tenant telemetry disposition S3 real MinIO suite (must execute)
+        env:
+          AGENT_SERVICE_TELEMETRY_DISPOSITION_S3_INTEGRATION: "1"
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_TELEMETRY_DISPOSITION_TEST_BUCKET: agent-service-ci-telemetry-disposition
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: pnpm run test:tenant-telemetry-disposition-s3
 
       # Exercise the actual one-shot CLI across both durability systems. The fixture creates a
       # random disposable database and S3 prefix, proves paged/exact replay and complete external
@@ -473,9 +499,9 @@ jobs:
       # offline-mover ledger, 0028 -> 0029 dormant credential-target execution, 0029 -> 0030
       # independent restore-journal/runtime-lineage, 0030 -> 0031 authoritative backup-catalog and
       # 0031 -> 0032 default-dormant telemetry inventory, 0032 -> 0033 receipt/inventory
-      # activation, 0033 -> 0034 durable writer and 0034 -> 0035 application-capture
-      # cutover/replay matrices.
-      - name: Historical MySQL migrations (0007 through 0035, no skips)
+      # activation, 0033 -> 0034 durable writer, 0034 -> 0035 application-capture
+      # and 0035 -> 0036 dormant disposition/replay matrices.
+      - name: Historical MySQL migrations (0007 through 0036, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -635,6 +661,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0033_tenant_telemetry_activation_inventory.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0034_tenant_telemetry_durable_writer.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0035_tenant_telemetry_application_capture.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0036_tenant_telemetry_disposition.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

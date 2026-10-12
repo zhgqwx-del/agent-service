@@ -248,6 +248,7 @@ import {
 } from "../tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "../tenant-telemetry-writer.js";
 import * as TenantTelemetryApplicationCapture from "../tenant-telemetry-application-capture.js";
+import * as TenantTelemetryDisposition from "../tenant-telemetry-disposition.js";
 import * as BackupCatalog from "../backup-catalog.js";
 import * as BackupCatalogAdapter from "../backup-catalog-adapter/common.js";
 import {
@@ -902,6 +903,10 @@ const TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME =
   "0035_tenant_telemetry_application_capture.sql";
 const TENANT_TELEMETRY_APPLICATION_CAPTURE_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-application-capture";
+const TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME =
+  "0036_tenant_telemetry_disposition.sql";
+const TENANT_TELEMETRY_DISPOSITION_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-disposition";
 
 function mysqlMigrationStatements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "")
@@ -1090,6 +1095,31 @@ function tenantTelemetryApplicationCaptureFingerprintStatement(
   if (statements.length !== 1
     || !statements[0]!.startsWith(`SET @${variable}=`)) {
     throw new Error(`0035 tenant telemetry application ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
+
+function tenantTelemetryDispositionFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+  variable: "tt_disposition_schema_ok" | "tt_disposition_trigger_ok",
+): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_DISPOSITION_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_DISPOSITION_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0036 tenant telemetry disposition ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1 || !statements[0]!.startsWith(`SET @${variable}=`)) {
+    throw new Error(`0036 tenant telemetry disposition ${marker} fingerprint block is invalid`);
   }
   return statements[0]!;
 }
@@ -7478,6 +7508,7 @@ export class MysqlSessionStore implements
   TenantTelemetryLifecycleStore,
   TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore,
   TenantTelemetryWriter.TenantTelemetryWriterStore,
+  TenantTelemetryDisposition.TenantTelemetryDispositionStore,
   BackupCatalog.TenantBackupCatalogStore,
   RestoreJournal.TenantRestoreJournalStore,
   RestoreJournal.RestoreReplayStore,
@@ -7503,6 +7534,7 @@ export class MysqlSessionStore implements
   private tenantTelemetrySchemaInstalled = false;
   private tenantTelemetryWriterSchemaInstalled = false;
   private tenantTelemetryApplicationCaptureSchemaInstalled = false;
+  private tenantTelemetryDispositionSchemaInstalled = false;
 
   private constructor(
     private readonly pool: Pool,
@@ -7846,6 +7878,7 @@ export class MysqlSessionStore implements
   private async assertTenantTelemetryApplicationCaptureSchemaFingerprint(
     conn: PoolConnection,
     migrationsDir: string,
+    includeLegacyTriggerFingerprint = true,
   ): Promise<void> {
     let fingerprintStatements: string[];
     try {
@@ -7859,11 +7892,13 @@ export class MysqlSessionStore implements
           "schema",
           "tt_app_capture_schema_ok",
         ),
-        tenantTelemetryApplicationCaptureFingerprintStatement(
-          migrationSql,
-          "triggers",
-          "tt_app_capture_trigger_ok",
-        ),
+        ...(includeLegacyTriggerFingerprint
+          ? [tenantTelemetryApplicationCaptureFingerprintStatement(
+              migrationSql,
+              "triggers",
+              "tt_app_capture_trigger_ok",
+            )]
+          : []),
       ];
     } catch (cause) {
       throw new Error(
@@ -7884,7 +7919,8 @@ export class MysqlSessionStore implements
                 @tt_app_capture_trigger_ok AS trigger_ok`,
       );
       if (Number(fingerprintRows[0]?.schema_ok) !== 1
-        || Number(fingerprintRows[0]?.trigger_ok) !== 1) {
+        || (includeLegacyTriggerFingerprint
+          && Number(fingerprintRows[0]?.trigger_ok) !== 1)) {
         throw new Error("stored schema does not match the 0035 fingerprint");
       }
     } catch (cause) {
@@ -7900,6 +7936,62 @@ export class MysqlSessionStore implements
     } catch (cause) {
       failure ??= new Error(
         "0035 tenant telemetry application capture fingerprint session restore failed",
+        { cause },
+      );
+    }
+    if (failure) throw failure;
+  }
+
+  private async assertTenantTelemetryDispositionSchemaFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let fingerprintStatements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME),
+        "utf8",
+      );
+      fingerprintStatements = [
+        tenantTelemetryDispositionFingerprintStatement(
+          migrationSql, "schema", "tt_disposition_schema_ok",
+        ),
+        tenantTelemetryDispositionFingerprintStatement(
+          migrationSql, "triggers", "tt_disposition_trigger_ok",
+        ),
+      ];
+    } catch (cause) {
+      throw new Error("0036 tenant telemetry disposition fingerprint source is invalid", {
+        cause,
+      });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query(
+        "SET @agent_service_tt_disposition_previous_group_concat_max_len=@@SESSION.group_concat_max_len",
+      );
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of fingerprintStatements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        `SELECT @tt_disposition_schema_ok AS schema_ok,
+                @tt_disposition_trigger_ok AS trigger_ok`,
+      );
+      if (Number(rows[0]?.schema_ok) !== 1 || Number(rows[0]?.trigger_ok) !== 1) {
+        throw new Error("stored schema does not match the 0036 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error(
+        "0036 tenant telemetry disposition schema fingerprint verification failed",
+        { cause },
+      );
+    }
+    try {
+      await conn.query(
+        "SET SESSION group_concat_max_len=@agent_service_tt_disposition_previous_group_concat_max_len",
+      );
+    } catch (cause) {
+      failure ??= new Error(
+        "0036 tenant telemetry disposition fingerprint session restore failed",
         { cause },
       );
     }
@@ -8212,6 +8304,9 @@ export class MysqlSessionStore implements
     try {
       await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       await conn.query("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY");
+      if (this.tenantTelemetryDispositionSchemaInstalled) {
+        await this.assertTenantTelemetryDispositionProjection(conn);
+      }
       const control = await this.readTenantTelemetryLifecycleControl(conn);
       if (control.state === "inactive") {
         const writerProjectionCounts = this.tenantTelemetryWriterSchemaInstalled
@@ -8310,7 +8405,11 @@ export class MysqlSessionStore implements
         await this.assertTenantTelemetryApplicationCaptureSchemaFingerprint(
           conn,
           migrationsDir,
+          !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME),
         );
+      }
+      if (done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryDispositionSchemaFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -8329,6 +8428,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryApplicationCaptureSchemaInstalled = done.has(
         TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME,
+      );
+      this.tenantTelemetryDispositionSchemaInstalled = done.has(
+        TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME,
       );
       if (!skipTelemetryRuntimeAudit) {
         await this.assertTenantTelemetryRuntimeConfiguration(conn);
@@ -8362,10 +8464,33 @@ export class MysqlSessionStore implements
       const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME) {
+          const [tables] = await conn.query<Row[]>(
+            `SELECT COUNT(*) AS table_count FROM information_schema.tables
+              WHERE table_schema=DATABASE()
+                AND table_name='tenant_telemetry_disposition_control'`,
+          );
+          if (storedSafeInteger(tables[0]?.table_count,
+            "existing disposition control table count") === 1) {
+            const [controlRows] = await conn.query<Row[]>(
+              `SELECT state,control_generation
+                 FROM tenant_telemetry_disposition_control WHERE singleton_id=1`,
+            );
+            if (controlRows.some((row) => row.state === "active"
+              || storedSafeInteger(row.control_generation,
+                "existing disposition control generation") !== 0)) {
+              throw new Error(
+                "active 0036 marker-loss replay is forbidden; restore exact migration marker under controlled maintenance",
+              );
+            }
+          }
+        }
         const sql = await readFile(join(dir, f), "utf8");
         const statements = mysqlMigrationStatements(sql);
         let tenantTelemetryApplicationTriggerPreflightComplete = false;
         let skipTenantTelemetryApplicationTriggerRotation = false;
+        let tenantTelemetryDispositionTriggerPreflightComplete = false;
+        let skipTenantTelemetryDispositionTriggerRotation = false;
         for (const [i, stmt] of statements.entries()) {
           try {
             const is0035TriggerRotation = f
@@ -8400,6 +8525,36 @@ export class MysqlSessionStore implements
             }
             if (is0035TriggerRotation
               && skipTenantTelemetryApplicationTriggerRotation) continue;
+            const is0036TriggerRotation = f
+                === TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME
+              && (stmt.startsWith("DROP TRIGGER IF EXISTS ")
+                || stmt.startsWith("CREATE TRIGGER "));
+            if (is0036TriggerRotation
+              && !tenantTelemetryDispositionTriggerPreflightComplete) {
+              tenantTelemetryDispositionTriggerPreflightComplete = true;
+              try {
+                await this.assertTenantTelemetryDispositionSchemaFingerprint(conn, dir);
+                skipTenantTelemetryDispositionTriggerRotation = true;
+              } catch (fingerprintCause) {
+                const [activeRows] = await conn.query<Row[]>(
+                  `SELECT COUNT(*) AS active_count
+                     FROM tenant_telemetry_disposition_control
+                    WHERE state='active' AND control_generation=1`,
+                );
+                if (!activeRows[0]
+                  || storedSafeInteger(
+                    activeRows[0].active_count,
+                    "stored tenant telemetry disposition active control count",
+                  ) !== 0) {
+                  throw new Error(
+                    "active 0036 marker-loss replay requires the exact trigger/schema fingerprint",
+                    { cause: fingerprintCause },
+                  );
+                }
+              }
+            }
+            if (is0036TriggerRotation
+              && skipTenantTelemetryDispositionTriggerRotation) continue;
             await executeMysqlMigrationStatement(conn, f, stmt);
           } catch (cause) {
             throw new Error(`migration ${f} failed at statement ${i + 1}/${statements.length}`, { cause });
@@ -8429,7 +8584,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryApplicationCaptureSchemaFingerprint(conn, dir);
+        await this.assertTenantTelemetryApplicationCaptureSchemaFingerprint(
+          conn, dir, !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryDispositionSchemaFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -8448,6 +8608,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryApplicationCaptureSchemaInstalled = done.has(
         TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME,
+      );
+      this.tenantTelemetryDispositionSchemaInstalled = done.has(
+        TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME,
       );
       await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
@@ -48567,6 +48730,539 @@ export class MysqlSessionStore implements
       ],
     );
     return result.affectedRows === 1;
+  }
+
+  // ---------- default-dormant tenant telemetry disposition ----------
+  private async loadTenantTelemetryDispositionControl(
+    executor: Pool | PoolConnection,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionControl> {
+    if (!this.tenantTelemetryDispositionSchemaInstalled) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError(
+        "tenant telemetry disposition schema is not installed",
+      );
+    }
+    const [rows] = await executor.query<Row[]>(
+      `SELECT * FROM tenant_telemetry_disposition_control WHERE singleton_id=1 ${lock}`,
+    );
+    if (rows.length !== 1) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+    }
+    const row = rows[0]!;
+    try {
+      const control: TenantTelemetryDisposition.TenantTelemetryDispositionControl =
+        row.state === "inactive"
+          ? {
+              singletonId:
+                TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SINGLETON_ID,
+              state: "inactive",
+              controlGeneration: 0,
+            }
+          : {
+              singletonId:
+                TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SINGLETON_ID,
+              state: "active",
+              controlGeneration: 1,
+              scope: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SCOPE,
+              protocol: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+              lifecycleControlGeneration: storedSafeInteger(
+                row.lifecycle_control_generation, "disposition lifecycle generation",
+              ) as 1,
+              lifecycleTargetRootSha256: String(row.lifecycle_target_root_sha256),
+              adapterProtocol: String(row.adapter_protocol),
+              journalNamespaceSha256: String(row.journal_namespace_sha256),
+              journalTargetSha256: String(row.journal_target_sha256),
+              failureDomainSha256: String(row.failure_domain_sha256),
+              logicalDatabaseNamespaceSha256:
+                String(row.logical_database_namespace_sha256),
+              activatedAtDbMs: storedSafeInteger(
+                row.activated_at_db_ms, "disposition activation time",
+              ),
+              activationEvidenceSha256: String(row.activation_evidence_sha256),
+            };
+      if (storedSafeInteger(row.singleton_id, "disposition singleton") !== 1
+        || row.state !== control.state
+        || String(row.scope) !== TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SCOPE
+        || storedSafeInteger(row.control_generation, "disposition control generation")
+          !== control.controlGeneration
+        || (control.state === "inactive"
+          ? row.protocol !== null
+            || row.lifecycle_control_generation !== null
+            || row.lifecycle_target_root_sha256 !== null
+            || row.adapter_protocol !== null
+            || row.journal_namespace_sha256 !== null
+            || row.journal_target_sha256 !== null
+            || row.failure_domain_sha256 !== null
+            || row.logical_database_namespace_sha256 !== null
+            || row.activated_at_db_ms !== null
+            || row.activation_evidence_sha256 !== null
+          : String(row.protocol) !== control.protocol)) {
+        throw new Error("disposition control columns drifted");
+      }
+      TenantTelemetryDisposition.validateTenantTelemetryDispositionControl(control);
+      return control;
+    } catch {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+    }
+  }
+
+  private async loadTenantTelemetryDispositionActivationReceipt(
+    executor: Pool | PoolConnection,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceipt | null> {
+    const [rows] = await executor.query<Row[]>(
+      "SELECT * FROM tenant_telemetry_disposition_activation_receipts WHERE singleton_id=1",
+    );
+    if (rows.length > 1) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+    }
+    if (!rows[0]) return null;
+    const row = rows[0];
+    try {
+      const receipt = parse<TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceipt>(
+        row.receipt_json,
+      );
+      TenantTelemetryDisposition.validateTenantTelemetryDispositionActivationReceipt(receipt);
+      if (storedSafeInteger(row.singleton_id, "disposition receipt singleton") !== 1
+        || receipt.scope !== row.scope || receipt.protocol !== row.protocol
+        || receipt.controlGeneration !== storedSafeInteger(
+          row.control_generation, "disposition receipt generation",
+        )
+        || receipt.activationEvidenceSha256 !== row.activation_evidence_sha256
+        || receipt.lifecycleTargetRootSha256 !== row.lifecycle_target_root_sha256
+        || receipt.journalNamespaceSha256 !== row.journal_namespace_sha256
+        || receipt.journalTargetSha256 !== row.journal_target_sha256
+        || receipt.failureDomainSha256 !== row.failure_domain_sha256
+        || receipt.logicalDatabaseNamespaceSha256
+          !== row.logical_database_namespace_sha256
+        || receipt.activatedAtDbMs !== storedSafeInteger(
+          row.activated_at_db_ms, "disposition receipt activation time",
+        ) || receipt.receiptSha256 !== row.receipt_sha256) {
+        throw new Error("disposition receipt columns drifted");
+      }
+      return receipt;
+    } catch {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+    }
+  }
+
+  private async assertTenantTelemetryDispositionProjection(
+    conn: PoolConnection,
+  ): Promise<void> {
+    const control = await this.loadTenantTelemetryDispositionControl(conn);
+    const receipt = await this.loadTenantTelemetryDispositionActivationReceipt(conn);
+    if (control.state === "inactive") {
+      const [rows] = await conn.query<Row[]>(
+        `SELECT
+           (SELECT COUNT(*) FROM tenant_telemetry_disposition_activation_receipts) AS receipts,
+           (SELECT COUNT(*) FROM tenant_telemetry_disposition_jobs) AS jobs,
+           (SELECT COUNT(*) FROM tenant_telemetry_disposition_authorization_grants) AS grants,
+           (SELECT COUNT(*) FROM tenant_telemetry_disposition_external_authorizations) AS authorizations,
+           (SELECT COUNT(*) FROM tenant_telemetry_disposition_external_events) AS events,
+           (SELECT COUNT(*) FROM tenant_telemetry_disposition_tombstone_acks) AS acks,
+           (SELECT COUNT(*) FROM tenant_telemetry_disposition_receipts) AS terminal_receipts,
+           (SELECT COUNT(*) FROM tenant_telemetry_disposition_replay_fences) AS fences`,
+      );
+      if (receipt || !rows[0] || Object.values(rows[0]).some((value) =>
+        storedSafeInteger(value, "inactive disposition projection count") !== 0)) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError(
+          "inactive tenant telemetry disposition has durable projection",
+        );
+      }
+      return;
+    }
+    if (!receipt || control.activationEvidenceSha256 !== receipt.activationEvidenceSha256
+      || control.lifecycleTargetRootSha256 !== receipt.lifecycleTargetRootSha256
+      || control.journalNamespaceSha256 !== receipt.journalNamespaceSha256
+      || control.journalTargetSha256 !== receipt.journalTargetSha256
+      || control.failureDomainSha256 !== receipt.failureDomainSha256
+      || control.logicalDatabaseNamespaceSha256
+        !== receipt.logicalDatabaseNamespaceSha256
+      || control.activatedAtDbMs !== receipt.activatedAtDbMs) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError(
+        "active tenant telemetry disposition activation receipt drifted",
+      );
+    }
+    const lifecycle = await this.readTenantTelemetryLifecycleControl(conn);
+    const restore = (await this.loadTenantRestoreJournalControl(conn)).control;
+    const restoreRuntime = await this.loadTenantRestoreRuntimeControl(conn);
+    const backup = await this.loadTenantBackupCatalogControl(conn);
+    if (lifecycle.state !== "active"
+      || lifecycle.targetRootSha256 !== control.lifecycleTargetRootSha256
+      || restore.controlGeneration !== 1
+      || restore.logicalDatabaseNamespaceSha256
+        !== control.logicalDatabaseNamespaceSha256
+      || restoreRuntime.state !== "active"
+      || restoreRuntime.logicalDatabaseNamespaceSha256
+        !== control.logicalDatabaseNamespaceSha256
+      || backup.state !== "active"
+      || backup.logicalDatabaseNamespaceSha256
+        !== control.logicalDatabaseNamespaceSha256) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError(
+        "tenant telemetry disposition source authority drifted",
+      );
+    }
+    const [pending] = await conn.query<Row[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM tenant_telemetry_write_jobs
+           WHERE phase<>'written' OR write_ack_receipt_sha256 IS NULL) AS jobs,
+         (SELECT COUNT(*) FROM tenant_telemetry_write_payloads) AS payloads`,
+    );
+    if (!pending[0] || Object.values(pending[0]).some((value) =>
+      storedSafeInteger(value, "active disposition pending writer count") !== 0)) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError(
+        "active tenant telemetry disposition has pending telemetry writes",
+      );
+    }
+    // The 0036 MySQL implementation does not issue source-validated grants. Reject any local
+    // execution footprint at startup, even if a privileged actor inserted plausible JSON rows.
+    const [execution] = await conn.query<Row[]>(
+      `SELECT
+         (SELECT COUNT(*) FROM tenant_telemetry_disposition_jobs) AS jobs,
+         (SELECT COUNT(*) FROM tenant_telemetry_disposition_authorization_grants) AS grants,
+         (SELECT COUNT(*) FROM tenant_telemetry_disposition_external_authorizations)
+           AS authorizations,
+         (SELECT COUNT(*) FROM tenant_telemetry_disposition_tombstone_acks) AS acks,
+         (SELECT COUNT(*) FROM tenant_telemetry_disposition_receipts) AS receipts,
+         (SELECT COUNT(*) FROM tenant_telemetry_disposition_external_events) AS events,
+         (SELECT COUNT(*) FROM tenant_telemetry_disposition_replay_fences) AS fences`,
+    );
+    if (!execution[0] || Object.values(execution[0]).some((value) =>
+      storedSafeInteger(value, "unsupported disposition execution count") !== 0)) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError(
+        "0036 execution footprint exists without a source-validated grant path",
+      );
+    }
+  }
+
+  async getTenantTelemetryDispositionControl(
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionControl> {
+    return this.loadTenantTelemetryDispositionControl(this.pool);
+  }
+
+  async getTenantTelemetryDispositionActivationReceipt(
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceipt | null> {
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    return this.loadTenantTelemetryDispositionActivationReceipt(this.pool);
+  }
+
+  async activateTenantTelemetryDisposition(
+    input: TenantTelemetryDisposition.ActivateTenantTelemetryDispositionInput,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionActivationResult> {
+    TenantTelemetryDisposition.validateActivateTenantTelemetryDispositionInput(input);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.beginTransaction();
+      const current = await this.loadTenantTelemetryDispositionControl(conn, "FOR UPDATE");
+      if (current.state !== "inactive") {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+          "tenant telemetry disposition is already activated",
+        );
+      }
+      const lifecycle = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
+      const restore = (await this.loadTenantRestoreJournalControl(conn, "FOR SHARE")).control;
+      const restoreRuntime = await this.loadTenantRestoreRuntimeControl(conn, "FOR SHARE");
+      const backup = await this.loadTenantBackupCatalogControl(conn, "FOR SHARE");
+      // Full-index locking reads close the 0034 job/payload and direct-inventory phantom window
+      // while 0036's active trigger guards are installed. This is a maintenance-mode cutover.
+      const [writerRows] = await conn.query<Row[]>(
+        `SELECT write_operation_sha256,phase,write_ack_receipt_sha256
+           FROM tenant_telemetry_write_jobs ORDER BY write_operation_sha256 FOR UPDATE`,
+      );
+      const [payloadRows] = await conn.query<Row[]>(
+        `SELECT write_operation_sha256 FROM tenant_telemetry_write_payloads
+          ORDER BY write_operation_sha256 FOR UPDATE`,
+      );
+      await conn.query(
+        `SELECT inventory_sha256 FROM tenant_telemetry_artifact_inventory
+          ORDER BY inventory_sha256 FOR UPDATE`,
+      );
+      if (lifecycle.state !== "active"
+        || lifecycle.targetRootSha256 !== input.lifecycleTargetRootSha256
+        || restore.controlGeneration !== 1
+        || restore.logicalDatabaseNamespaceSha256
+          !== input.logicalDatabaseNamespaceSha256
+        || restoreRuntime.state !== "active"
+        || restoreRuntime.logicalDatabaseNamespaceSha256
+          !== input.logicalDatabaseNamespaceSha256
+        || backup.state !== "active"
+        || backup.logicalDatabaseNamespaceSha256
+          !== input.logicalDatabaseNamespaceSha256
+        || writerRows.some((row) => row.phase !== "written"
+          || row.write_ack_receipt_sha256 == null)
+        || payloadRows.length !== 0) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+          "tenant telemetry disposition activation source is incomplete",
+        );
+      }
+      const activatedAtDbMs = Math.max(
+        await this.databaseNow(conn), lifecycle.activatedAtDbMs,
+        restore.activatedAtDbMs, backup.activatedAtDbMs,
+      );
+      const body: TenantTelemetryDisposition.ActiveTenantTelemetryDispositionControlBody = {
+        singletonId:
+          TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SINGLETON_ID,
+        state: "active",
+        controlGeneration: 1,
+        scope: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SCOPE,
+        protocol: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+        lifecycleControlGeneration: 1,
+        lifecycleTargetRootSha256: input.lifecycleTargetRootSha256,
+        adapterProtocol: input.adapterProtocol,
+        journalNamespaceSha256: input.journalNamespaceSha256,
+        journalTargetSha256: input.journalTargetSha256,
+        failureDomainSha256: input.failureDomainSha256,
+        logicalDatabaseNamespaceSha256: input.logicalDatabaseNamespaceSha256,
+        activatedAtDbMs,
+      };
+      const control: TenantTelemetryDisposition.ActiveTenantTelemetryDispositionControl = {
+        ...body,
+        activationEvidenceSha256:
+          TenantTelemetryDisposition.tenantTelemetryDispositionActivationEvidenceSha256(body),
+      };
+      const receiptBody:
+        TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceiptBody = {
+          scope:
+            TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_ACTIVATION_RECEIPT_SCOPE,
+          protocol: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+          controlGeneration: 1,
+          activationEvidenceSha256: control.activationEvidenceSha256,
+          lifecycleTargetRootSha256: control.lifecycleTargetRootSha256,
+          journalNamespaceSha256: control.journalNamespaceSha256,
+          journalTargetSha256: control.journalTargetSha256,
+          failureDomainSha256: control.failureDomainSha256,
+          logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+          activatedAtDbMs,
+        };
+      const receipt: TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceipt = {
+        ...receiptBody,
+        receiptSha256:
+          TenantTelemetryDisposition.tenantTelemetryDispositionActivationReceiptSha256(
+            receiptBody,
+          ),
+      };
+      await conn.query(
+        `INSERT INTO tenant_telemetry_disposition_activation_receipts
+         (singleton_id,scope,protocol,control_generation,activation_evidence_sha256,
+          lifecycle_target_root_sha256,journal_namespace_sha256,journal_target_sha256,
+          failure_domain_sha256,logical_database_namespace_sha256,activated_at_db_ms,
+          receipt_sha256,receipt_json)
+         VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [receipt.scope, receipt.protocol, 1, receipt.activationEvidenceSha256,
+          receipt.lifecycleTargetRootSha256, receipt.journalNamespaceSha256,
+          receipt.journalTargetSha256, receipt.failureDomainSha256,
+          receipt.logicalDatabaseNamespaceSha256, receipt.activatedAtDbMs,
+          receipt.receiptSha256, json(receipt)],
+      );
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE tenant_telemetry_disposition_control
+            SET state='active',control_generation=1,protocol=?,
+                lifecycle_control_generation=1,lifecycle_target_root_sha256=?,
+                adapter_protocol=?,journal_namespace_sha256=?,journal_target_sha256=?,
+                failure_domain_sha256=?,logical_database_namespace_sha256=?,
+                activated_at_db_ms=?,activation_evidence_sha256=?
+          WHERE singleton_id=1 AND state='inactive' AND control_generation=0`,
+        [control.protocol, control.lifecycleTargetRootSha256, control.adapterProtocol,
+          control.journalNamespaceSha256, control.journalTargetSha256,
+          control.failureDomainSha256, control.logicalDatabaseNamespaceSha256,
+          activatedAtDbMs, control.activationEvidenceSha256],
+      );
+      if (updated.affectedRows !== 1) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+      }
+      await conn.commit();
+      return { control, receipt };
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  // T3d currently emits zero-target logs/traces blockers, not executable artifact targets.
+  // Until a future plan protocol and source-validated grant/recovery gate exist, MySQL must not
+  // turn a caller-provided digest or mirrored external event into deletion authority.
+  async materializeTenantTelemetryDispositionJobs(
+    options: TenantTelemetryDisposition.MaterializeTenantTelemetryDispositionJobsOptions,
+  ): Promise<number> {
+    TenantTelemetryDisposition.validateMaterializeTenantTelemetryDispositionJobsOptions(options);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    return 0;
+  }
+
+  async claimTenantTelemetryDispositions(
+    options: TenantTelemetryDisposition.ClaimTenantTelemetryDispositionsOptions,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionClaim[]> {
+    TenantTelemetryDisposition.validateClaimTenantTelemetryDispositionsOptions(options);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    return [];
+  }
+
+  async renewTenantTelemetryDisposition(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    options: TenantTelemetryDisposition.RenewTenantTelemetryDispositionOptions,
+  ): Promise<boolean> {
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(authorization);
+    TenantTelemetryDisposition.validateRenewTenantTelemetryDispositionOptions(options);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    return false;
+  }
+
+  async retryTenantTelemetryDisposition(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    options: TenantTelemetryDisposition.RetryTenantTelemetryDispositionOptions,
+  ): Promise<boolean> {
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(authorization);
+    TenantTelemetryDisposition.validateRetryTenantTelemetryDispositionOptions(options);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    return false;
+  }
+
+  async blockTenantTelemetryDisposition(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+  ): Promise<boolean> {
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(authorization);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    return false;
+  }
+
+  async recordTenantTelemetryExternalAuthorization(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    proof: TenantTelemetryDisposition.TenantTelemetryExternalAuthorizationProof,
+  ): Promise<boolean> {
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(authorization);
+    TenantTelemetryDisposition.validateTenantTelemetryExternalAuthorizationProof(proof);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    return false;
+  }
+
+  async completeTenantTelemetryDisposition(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    tombstoneAck: TenantTelemetryDisposition.TenantTelemetrySameKeyTombstoneAck,
+    terminalProof: TenantTelemetryDisposition.TenantTelemetryExternalTombstoneProof,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionReceipt | null> {
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(authorization);
+    TenantTelemetryDisposition.validateTenantTelemetrySameKeyTombstoneAck(tombstoneAck);
+    TenantTelemetryDisposition.validateTenantTelemetryExternalTombstoneProof(terminalProof);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    return null;
+  }
+
+  async getTenantTelemetryDispositionJob(
+    tenantId: string,
+    dispositionOperationSha256: string,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord | null> {
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT * FROM tenant_telemetry_disposition_jobs
+        WHERE BINARY tenant_id=BINARY ? AND disposition_operation_sha256=?`,
+      [tenantId, dispositionOperationSha256],
+    );
+    if (!rows[0]) return null;
+    try {
+      const job = parse<TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord>(
+        rows[0].job_json,
+      );
+      TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(job);
+      if (job.tenantId !== tenantId
+        || job.dispositionOperationSha256 !== dispositionOperationSha256
+        || job.phase !== rows[0].phase
+        || job.requestId !== rows[0].request_id
+        || job.inventorySha256 !== rows[0].inventory_sha256
+        || job.writeOperationSha256 !== rows[0].write_operation_sha256) {
+        throw new Error("disposition job columns drifted");
+      }
+      return job;
+    } catch {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+    }
+  }
+
+  async getTenantTelemetryDispositionReceipt(
+    tenantId: string,
+    dispositionOperationSha256: string,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionReceipt | null> {
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT * FROM tenant_telemetry_disposition_receipts
+        WHERE BINARY tenant_id=BINARY ? AND disposition_operation_sha256=?`,
+      [tenantId, dispositionOperationSha256],
+    );
+    if (!rows[0]) return null;
+    try {
+      const receipt = parse<TenantTelemetryDisposition.TenantTelemetryDispositionReceipt>(
+        rows[0].receipt_json,
+      );
+      TenantTelemetryDisposition.validateTenantTelemetryDispositionReceipt(receipt);
+      if (receipt.tenantId !== tenantId
+        || receipt.dispositionOperationSha256 !== dispositionOperationSha256
+        || receipt.receiptSha256 !== rows[0].receipt_sha256
+        || receipt.requestId !== rows[0].request_id
+        || receipt.storeDbTimestampMs !== storedSafeInteger(
+          rows[0].store_db_timestamp_ms, "disposition receipt DB timestamp",
+        )) {
+        throw new Error("disposition receipt columns drifted");
+      }
+      return receipt;
+    } catch {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+    }
+  }
+
+  async mirrorTenantTelemetryDispositionExternalEvent(
+    event: TenantTelemetryDisposition.TenantTelemetryDispositionExternalEvent,
+  ): Promise<void> {
+    const staged = parse<TenantTelemetryDisposition.TenantTelemetryDispositionExternalEvent>(
+      json(event),
+    );
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionExternalEvent(staged);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+      "0036 cannot mirror an unverified external authority head",
+    );
+  }
+
+  async sealTenantTelemetryDispositionReplayFence(
+    input: TenantTelemetryDisposition.TenantTelemetryDispositionReplayFenceBody,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionReplayFence> {
+    const staged = parse<TenantTelemetryDisposition.TenantTelemetryDispositionReplayFenceBody>(
+      json(input),
+    );
+    TenantTelemetryDisposition.tenantTelemetryDispositionReplayFenceSha256(staged);
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+      "0036 cannot seal a replay fence without verified external head and restore run",
+    );
+  }
+
+  async getTenantTelemetryDispositionReplayFence(
+    targetSha256: string,
+    artifactIdSha256: string,
+    artifactGeneration: number,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionReplayFence | null> {
+    await this.loadTenantTelemetryDispositionControl(this.pool);
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT * FROM tenant_telemetry_disposition_replay_fences
+        WHERE target_sha256=? AND artifact_id_sha256=? AND artifact_generation=?`,
+      [targetSha256, artifactIdSha256, artifactGeneration],
+    );
+    if (!rows[0]) return null;
+    try {
+      const fence = parse<TenantTelemetryDisposition.TenantTelemetryDispositionReplayFence>(
+        rows[0].fence_json,
+      );
+      TenantTelemetryDisposition.validateTenantTelemetryDispositionReplayFence(fence);
+      if (fence.targetSha256 !== targetSha256
+        || fence.artifactIdSha256 !== artifactIdSha256
+        || fence.artifactGeneration !== artifactGeneration
+        || fence.receiptSha256 !== rows[0].receipt_sha256) {
+        throw new Error("disposition replay fence columns drifted");
+      }
+      return fence;
+    } catch {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+    }
   }
 
   async close() {

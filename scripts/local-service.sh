@@ -609,6 +609,9 @@ verify() {
   pnpm run test:tenant-telemetry-writer
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-writer-mysql
+  pnpm run test:tenant-telemetry-disposition
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-telemetry-disposition-mysql
   AGENT_SERVICE_INTEGRATION=1 \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \
@@ -738,6 +741,19 @@ verify_s3() {
     node packages/store/scripts/bootstrap-s3.mjs
   env "${s3_test_env[@]}" S3_TENANT_TELEMETRY_TEST_BUCKET="$tenant_telemetry_bucket" \
     pnpm run test:tenant-telemetry-writer-s3
+  local telemetry_disposition_bucket="${TELEMETRY_DISPOSITION_S3_BUCKET:-agent-service-local-telemetry-disposition}"
+  [ "$telemetry_disposition_bucket" != "${MINIO_BUCKET:-agent-service-local}" ] \
+    || die "TELEMETRY_DISPOSITION_S3_BUCKET must differ from the Blob bucket"
+  [ "$telemetry_disposition_bucket" != "$restore_journal_bucket" ] \
+    || die "TELEMETRY_DISPOSITION_S3_BUCKET must differ from the restore-journal bucket"
+  [ "$telemetry_disposition_bucket" != "$backup_catalog_bucket" ] \
+    || die "TELEMETRY_DISPOSITION_S3_BUCKET must differ from the backup-catalog bucket"
+  [ "$telemetry_disposition_bucket" != "$tenant_telemetry_bucket" ] \
+    || die "TELEMETRY_DISPOSITION_S3_BUCKET must differ from the telemetry artifact bucket"
+  env "${s3_test_env[@]}" S3_TEST_BUCKET="$telemetry_disposition_bucket" \
+    node packages/store/scripts/bootstrap-s3.mjs
+  env "${s3_test_env[@]}" S3_TELEMETRY_DISPOSITION_TEST_BUCKET="$telemetry_disposition_bucket" \
+    pnpm run test:tenant-telemetry-disposition-s3
   env "${s3_test_env[@]}" \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-storage-migration-mysql-s3

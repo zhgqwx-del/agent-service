@@ -839,6 +839,7 @@ import * as BackupCatalogAdapter from "./backup-catalog-adapter/common.js";
 import * as TenantTelemetry from "./tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "./tenant-telemetry-writer.js";
 import * as TenantTelemetryApplicationCapture from "./tenant-telemetry-application-capture.js";
+import * as TenantTelemetryDisposition from "./tenant-telemetry-disposition.js";
 
 interface MemoryUserDataExportJob {
   requestId: string;
@@ -1145,7 +1146,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1371,6 +1372,45 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   tenantTelemetryApplicationWriteBindings = new Map<
     string,
     TenantTelemetryApplicationCapture.TenantTelemetryApplicationWriteBinding
+  >();
+  tenantTelemetryDispositionControls = new Map<
+    string,
+    TenantTelemetryDisposition.TenantTelemetryDispositionControl
+  >([[
+    TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SINGLETON_ID,
+    {
+      singletonId: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SINGLETON_ID,
+      state: "inactive",
+      controlGeneration: 0,
+    },
+  ]]);
+  tenantTelemetryDispositionActivationReceipts = new Map<
+    string,
+    TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceipt
+  >();
+  tenantTelemetryDispositionJobs = new Map<
+    string,
+    TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord
+  >();
+  tenantTelemetryDispositionExternalAuthorizations = new Map<
+    string,
+    TenantTelemetryDisposition.TenantTelemetryExternalAuthorizationProof
+  >();
+  tenantTelemetryDispositionExternalEvents = new Map<
+    number,
+    TenantTelemetryDisposition.TenantTelemetryDispositionExternalEvent
+  >();
+  tenantTelemetryDispositionTombstoneAcks = new Map<
+    string,
+    TenantTelemetryDisposition.TenantTelemetrySameKeyTombstoneAck
+  >();
+  tenantTelemetryDispositionReceipts = new Map<
+    string,
+    TenantTelemetryDisposition.TenantTelemetryDispositionReceipt
+  >();
+  tenantTelemetryDispositionReplayFences = new Map<
+    string,
+    TenantTelemetryDisposition.TenantTelemetryDispositionReplayFence
   >();
   tenantRuntimeRevocationJobs = new Map<string, TenantRuntimeRevocationJobRecord>();
   tenantRuntimeRevocationTargetReceipts = new Map<string, TenantRuntimeRevocationTargetReceipt>();
@@ -2533,6 +2573,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       payloadSha256: string;
       payloadByteLength: number;
     } {
+    if (this.readMemoryTenantTelemetryDispositionControl().state === "active") {
+      throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
+        "tenant telemetry disposition maintenance cutover forbids legacy writer admission",
+      );
+    }
     const control = this.readMemoryTenantTelemetryLifecycleControl();
     if (control.state !== "active") {
       throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
@@ -27775,6 +27820,834 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       row.availableAtMs = options.availableAtMs;
     }
     return true;
+  }
+
+  private readMemoryTenantTelemetryDispositionControl(
+  ): TenantTelemetryDisposition.TenantTelemetryDispositionControl {
+    const control = this.tenantTelemetryDispositionControls.get(
+      TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SINGLETON_ID,
+    );
+    try {
+      if (!control || this.tenantTelemetryDispositionControls.size !== 1) {
+        throw new Error("tenant telemetry disposition control is missing");
+      }
+      TenantTelemetryDisposition.validateTenantTelemetryDispositionControl(control);
+      const receipt = this.tenantTelemetryDispositionActivationReceipts.get(control.singletonId);
+      if (control.state === "inactive") {
+        if (receipt || this.tenantTelemetryDispositionActivationReceipts.size !== 0
+          || this.tenantTelemetryDispositionJobs.size !== 0
+          || this.tenantTelemetryDispositionExternalAuthorizations.size !== 0
+          || this.tenantTelemetryDispositionExternalEvents.size !== 0
+          || this.tenantTelemetryDispositionTombstoneAcks.size !== 0
+          || this.tenantTelemetryDispositionReceipts.size !== 0
+          || this.tenantTelemetryDispositionReplayFences.size !== 0) {
+          throw new Error("inactive tenant telemetry disposition has durable evidence");
+        }
+      } else {
+        if (!receipt || this.tenantTelemetryDispositionActivationReceipts.size !== 1) {
+          throw new Error("active tenant telemetry disposition receipt is missing");
+        }
+        TenantTelemetryDisposition.validateTenantTelemetryDispositionActivationReceipt(receipt);
+        if (receipt.activationEvidenceSha256 !== control.activationEvidenceSha256
+          || receipt.lifecycleTargetRootSha256 !== control.lifecycleTargetRootSha256
+          || receipt.journalNamespaceSha256 !== control.journalNamespaceSha256
+          || receipt.journalTargetSha256 !== control.journalTargetSha256
+          || receipt.failureDomainSha256 !== control.failureDomainSha256
+          || receipt.logicalDatabaseNamespaceSha256
+            !== control.logicalDatabaseNamespaceSha256
+          || receipt.activatedAtDbMs !== control.activatedAtDbMs) {
+          throw new Error("tenant telemetry disposition activation receipt drifted");
+        }
+        if (this.tenantTelemetryDispositionJobs.size !== 0
+          || this.tenantTelemetryDispositionExternalAuthorizations.size !== 0
+          || this.tenantTelemetryDispositionExternalEvents.size !== 0
+          || this.tenantTelemetryDispositionTombstoneAcks.size !== 0
+          || this.tenantTelemetryDispositionReceipts.size !== 0
+          || this.tenantTelemetryDispositionReplayFences.size !== 0) {
+          throw new Error("0036 execution/replay footprint is unsupported without external authority");
+        }
+      }
+      return control;
+    } catch (error) {
+      if (error instanceof TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError) {
+        throw error;
+      }
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+    }
+  }
+
+  async getTenantTelemetryDispositionControl(
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionControl> {
+    return clone(this.readMemoryTenantTelemetryDispositionControl());
+  }
+
+  async getTenantTelemetryDispositionActivationReceipt(
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceipt | null> {
+    const control = this.readMemoryTenantTelemetryDispositionControl();
+    return clone(this.tenantTelemetryDispositionActivationReceipts.get(control.singletonId) ?? null);
+  }
+
+  async activateTenantTelemetryDisposition(
+    input: TenantTelemetryDisposition.ActivateTenantTelemetryDispositionInput,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionActivationResult> {
+    const staged = clone(input);
+    TenantTelemetryDisposition.validateActivateTenantTelemetryDispositionInput(staged);
+    const existing = this.readMemoryTenantTelemetryDispositionControl();
+    if (existing.state !== "inactive") {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+        "tenant telemetry disposition is already activated",
+      );
+    }
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
+    const restore = this.readTenantRestoreJournalControl();
+    const restoreRuntime = this.readTenantRestoreRuntimeControl();
+    const backup = this.readTenantBackupCatalogControl();
+    if (lifecycle.state !== "active"
+      || lifecycle.targetRootSha256 !== staged.lifecycleTargetRootSha256
+      || restore.controlGeneration !== 1
+      || restore.logicalDatabaseNamespaceSha256 !== staged.logicalDatabaseNamespaceSha256
+      || restoreRuntime.state !== "active"
+      || restoreRuntime.logicalDatabaseNamespaceSha256
+        !== staged.logicalDatabaseNamespaceSha256
+      || backup.state !== "active"
+      || backup.logicalDatabaseNamespaceSha256 !== staged.logicalDatabaseNamespaceSha256
+      || [...this.tenantTelemetryWriteJobs.values()].some((job) => job.phase !== "written")
+      || this.tenantTelemetryWritePayloads.size !== 0) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+        "tenant telemetry disposition activation source is incomplete",
+      );
+    }
+    // These explicit acknowledgements are protocol preconditions, not automatic proof that the
+    // fleet stopped. This store-only cutover neither calls a journal nor starts deletion.
+    const activatedAtDbMs = Math.max(
+      this.storeNowMs(), lifecycle.activatedAtDbMs, restore.activatedAtDbMs,
+      backup.activatedAtDbMs,
+    );
+    const body: TenantTelemetryDisposition.ActiveTenantTelemetryDispositionControlBody = {
+      singletonId: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SINGLETON_ID,
+      state: "active",
+      controlGeneration: 1,
+      scope: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_CONTROL_SCOPE,
+      protocol: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+      lifecycleControlGeneration: 1,
+      lifecycleTargetRootSha256: staged.lifecycleTargetRootSha256,
+      adapterProtocol: staged.adapterProtocol,
+      journalNamespaceSha256: staged.journalNamespaceSha256,
+      journalTargetSha256: staged.journalTargetSha256,
+      failureDomainSha256: staged.failureDomainSha256,
+      logicalDatabaseNamespaceSha256: staged.logicalDatabaseNamespaceSha256,
+      activatedAtDbMs,
+    };
+    const control: TenantTelemetryDisposition.ActiveTenantTelemetryDispositionControl = {
+      ...body,
+      activationEvidenceSha256:
+        TenantTelemetryDisposition.tenantTelemetryDispositionActivationEvidenceSha256(body),
+    };
+    const receiptBody: TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceiptBody = {
+      scope: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_ACTIVATION_RECEIPT_SCOPE,
+      protocol: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+      controlGeneration: 1,
+      activationEvidenceSha256: control.activationEvidenceSha256,
+      lifecycleTargetRootSha256: control.lifecycleTargetRootSha256,
+      journalNamespaceSha256: control.journalNamespaceSha256,
+      journalTargetSha256: control.journalTargetSha256,
+      failureDomainSha256: control.failureDomainSha256,
+      logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+      activatedAtDbMs: control.activatedAtDbMs,
+    };
+    const receipt: TenantTelemetryDisposition.TenantTelemetryDispositionActivationReceipt = {
+      ...receiptBody,
+      receiptSha256:
+        TenantTelemetryDisposition.tenantTelemetryDispositionActivationReceiptSha256(receiptBody),
+    };
+    const controlsBefore = new Map(this.tenantTelemetryDispositionControls);
+    const receiptsBefore = new Map(this.tenantTelemetryDispositionActivationReceipts);
+    try {
+      this.tenantTelemetryDispositionControls.set(control.singletonId, clone(control));
+      this.tenantTelemetryDispositionActivationReceipts.set(control.singletonId, clone(receipt));
+      this.readMemoryTenantTelemetryDispositionControl();
+      return { control: clone(control), receipt: clone(receipt) };
+    } catch (error) {
+      restoreMapSnapshot(this.tenantTelemetryDispositionControls, controlsBefore);
+      restoreMapSnapshot(this.tenantTelemetryDispositionActivationReceipts, receiptsBefore);
+      throw error;
+    }
+  }
+
+  private memoryTenantTelemetryDispositionCandidate(
+    tenantId: string,
+    requestId: string,
+    ack: TenantTelemetryWriter.TenantTelemetryWriteAck,
+  ): TenantTelemetryDisposition.TenantTelemetryDispositionEvidence | null {
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const control = this.readMemoryTenantTelemetryDispositionControl();
+    if (control.state !== "active" || ack.tenantId !== tenantId
+      || ack.adapterProtocol !== "telemetry-s3-object-v1") return null;
+    const planJob = this.tenantPurgePlanJobs.get(requestId);
+    const planReceipt = this.tenantPurgePlanReceipts.get(requestId);
+    const contentReceipt = this.tenantContentInventoryReceipts.get(requestId);
+    if (!planJob || planJob.phase !== "plan_sealed" || !planReceipt || !contentReceipt
+      || planJob.tenantId !== tenantId || planReceipt.tenantId !== tenantId
+      || contentReceipt.tenantId !== tenantId) return null;
+    const planSource = this.assertTenantPurgePlanSource(planJob, true);
+    const planEntries = this.tenantPurgePlanEntriesFor(planJob);
+    validateTenantPurgePlanCompletionProof(planJob, planEntries, planReceipt);
+    const planEntry = planEntries.find((entry) => entry.domain === ack.domain);
+    if (!planEntry || planEntry.disposition !== "delete") return null;
+    this.assertTenantPurgePlanBuildState(
+      planJob, planSource, this.tenantPurgePlanHoldProof(tenantId),
+    );
+    const nowMs = this.storeNowMs();
+    if (nowMs < planReceipt.purgeNotBeforeDbMs
+      || this.assertLegalHoldState(tenantId, "tenant", tenantId).control.activeHoldCount > 0) {
+      return null;
+    }
+    const domainInventories = [...this.tenantTelemetryArtifactInventories.values()]
+      .filter((inventory) => inventory.tenantId === tenantId
+        && inventory.domain === ack.domain);
+    const domainAcks = [...this.tenantTelemetryWriteAcks.values()]
+      .filter((candidate) => candidate.tenantId === tenantId
+        && candidate.domain === ack.domain);
+    if (domainInventories.length !== domainAcks.length) return null;
+    const targets: TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[] = [];
+    for (const inventory of domainInventories) {
+      const writeAck = domainAcks.find((candidate) =>
+        candidate.inventoryReceiptSha256 === inventory.receiptSha256);
+      if (!writeAck || writeAck.inventorySha256 !== inventory.inventorySha256
+        || writeAck.targetSha256 !== inventory.targetSha256
+        || writeAck.artifactIdSha256 !== inventory.artifactIdSha256
+        || writeAck.artifactGeneration !== inventory.artifactGeneration) return null;
+      targets.push({
+        domain: inventory.domain,
+        targetSha256: inventory.targetSha256,
+        artifactIdSha256: inventory.artifactIdSha256,
+        artifactGeneration: inventory.artifactGeneration,
+        inventoryReceiptSha256: inventory.receiptSha256,
+        writeAckReceiptSha256: writeAck.receiptSha256,
+      });
+    }
+    if (planEntry.targetCount !== targets.length
+      || planEntry.targetRootSha256
+        !== TenantTelemetryDisposition.tenantTelemetryDispositionInventoryTargetRootSha256(
+          ack.domain, targets,
+        )) return null;
+    const inventory = domainInventories.find((candidate) =>
+      candidate.receiptSha256 === ack.inventoryReceiptSha256);
+    if (!inventory || inventory.targetSha256 !== ack.targetSha256
+      || inventory.artifactIdSha256 !== ack.artifactIdSha256
+      || inventory.artifactGeneration !== ack.artifactGeneration) return null;
+    const coverage = this.tenantTelemetryLifecycleCoverages.get(tenantId);
+    if (!coverage || coverage.evidenceSha256 !== inventory.coverageEvidenceSha256) return null;
+    const applicationCoverage = this.tenantTelemetryApplicationCoverages.get(
+      this.tenantTelemetryApplicationCoverageMapKey(tenantId, ack.domain),
+    );
+    const binding = this.tenantTelemetryApplicationWriteBindings.get(ack.writeOperationSha256);
+    if ((applicationCoverage === undefined) !== (binding === undefined)) return null;
+    if (binding && (binding.coverageEvidenceSha256 !== applicationCoverage!.evidenceSha256
+      || binding.inventorySha256 !== inventory.inventorySha256
+      || binding.manifestSha256 !== inventory.manifestSha256
+      || binding.payloadSha256 !== inventory.payloadSha256)) return null;
+    const refKey = this.tenantTelemetryRefKeyForUse();
+    if (inventory.ownerKind !== "tenant") {
+      const ownerCandidates = [...this.subjectLifecycles.values()].filter((candidate) =>
+        candidate.tenantId === tenantId && candidate.subjectKind === "user"
+        && TenantTelemetry.tenantTelemetryOwnerRefSha256(
+          "user", candidate.subjectId, refKey,
+        ) === inventory.holdSubjectRefSha256);
+      if (ownerCandidates.length !== 1
+        || this.assertLegalHoldState(
+          tenantId, "user", ownerCandidates[0]!.subjectId,
+        ).control.activeHoldCount > 0) return null;
+    }
+    const restore = this.readTenantRestoreRuntimeControl();
+    if (restore.state !== "active"
+      || this.readTenantRestoreJournalControl().controlGeneration !== 1) return null;
+    const source: Omit<TenantTelemetryDisposition.TenantTelemetryDispositionEvidence,
+      "dispositionOperationSha256"> = {
+        domain: ack.domain,
+        targetSha256: ack.targetSha256,
+        artifactIdSha256: ack.artifactIdSha256,
+        artifactGeneration: ack.artifactGeneration,
+        inventorySha256: inventory.inventorySha256,
+        inventoryReceiptSha256: inventory.receiptSha256,
+        writeOperationSha256: ack.writeOperationSha256,
+        writeAckReceiptSha256: ack.receiptSha256,
+        payloadSha256: inventory.payloadSha256,
+        manifestSha256: inventory.manifestSha256,
+        lifecycleCoverageEvidenceSha256: coverage.evidenceSha256,
+        applicationCoverageEvidenceSha256: applicationCoverage?.evidenceSha256 ?? null,
+        applicationWriteBindingReceiptSha256: binding?.receiptSha256 ?? null,
+        t3cReceiptSha256: contentReceipt.receiptSha256,
+        t3dPlanReceiptSha256: planReceipt.receiptSha256,
+        t3dPlanEntryReceiptSha256: planEntry.receiptSha256,
+      };
+    return {
+      ...source,
+      dispositionOperationSha256:
+        TenantTelemetryDisposition.tenantTelemetryDispositionOperationSha256(source),
+    };
+  }
+
+  private memoryTenantTelemetryDispositionClaimMatches(
+    job: TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord,
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    nowMs: number,
+  ): boolean {
+    return (job.phase === "queued" || job.phase === "authorized")
+      && job.tenantId === authorization.tenantId
+      && job.requestId === authorization.requestId
+      && job.dispositionOperationSha256 === authorization.dispositionOperationSha256
+      && job.attempts === authorization.claimAttempt
+      && job.claimToken === authorization.claimToken
+      && job.leaseUntilDbMs !== undefined
+      && job.leaseUntilDbMs > nowMs;
+  }
+
+  async materializeTenantTelemetryDispositionJobs(
+    options: TenantTelemetryDisposition.MaterializeTenantTelemetryDispositionJobsOptions,
+  ): Promise<number> {
+    const stagedOptions = clone(options);
+    TenantTelemetryDisposition.validateMaterializeTenantTelemetryDispositionJobsOptions(
+      stagedOptions,
+    );
+    const control = this.readMemoryTenantTelemetryDispositionControl();
+    if (control.state === "inactive") return 0;
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const stagedJobs: TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord[] = [];
+    for (const planReceipt of [...this.tenantPurgePlanReceipts.values()]
+      .sort((left, right) => left.requestId.localeCompare(right.requestId))) {
+      for (const ack of [...this.tenantTelemetryWriteAcks.values()]
+        .filter((candidate) => candidate.tenantId === planReceipt.tenantId)
+        .sort((left, right) => left.writeOperationSha256.localeCompare(right.writeOperationSha256))) {
+        const evidence = this.memoryTenantTelemetryDispositionCandidate(
+          planReceipt.tenantId, planReceipt.requestId, ack,
+        );
+        if (!evidence) continue;
+        const old = this.tenantTelemetryDispositionJobs.get(evidence.dispositionOperationSha256);
+        if (old) {
+          TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(old);
+          if (old.tenantId !== planReceipt.tenantId || old.requestId !== planReceipt.requestId) {
+            throw new TenantTelemetryDisposition.TenantTelemetryDispositionCorruptError();
+          }
+          continue;
+        }
+        const artifactKey = this.tenantTelemetryArtifactMapKey(
+          evidence.domain, evidence.artifactIdSha256, evidence.artifactGeneration,
+        );
+        if (this.tenantTelemetryDispositionReplayFences.has(artifactKey)
+          || [...this.tenantTelemetryDispositionJobs.values()].some((candidate) =>
+            candidate.domain === evidence.domain
+            && candidate.artifactIdSha256 === evidence.artifactIdSha256
+            && candidate.artifactGeneration === evidence.artifactGeneration)
+          || stagedJobs.some((candidate) =>
+            candidate.domain === evidence.domain
+            && candidate.artifactIdSha256 === evidence.artifactIdSha256
+            && candidate.artifactGeneration === evidence.artifactGeneration)) {
+          throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+            "tenant telemetry artifact already has a disposition authority",
+          );
+        }
+        const nowMs = this.storeNowMs();
+        const job: TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord = {
+          scope: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_JOB_SCOPE,
+          protocol: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+          tenantId: planReceipt.tenantId,
+          requestId: planReceipt.requestId,
+          ...evidence,
+          phase: "queued",
+          attempts: 0,
+          availableAtDbMs: nowMs,
+          createdAtDbMs: nowMs,
+          updatedAtDbMs: nowMs,
+        };
+        TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(job);
+        stagedJobs.push(job);
+        if (stagedJobs.length >= stagedOptions.limit) break;
+      }
+      if (stagedJobs.length >= stagedOptions.limit) break;
+    }
+    const before = new Map(this.tenantTelemetryDispositionJobs);
+    try {
+      for (const job of stagedJobs) {
+        this.tenantTelemetryDispositionJobs.set(job.dispositionOperationSha256, clone(job));
+      }
+      return stagedJobs.length;
+    } catch (error) {
+      restoreMapSnapshot(this.tenantTelemetryDispositionJobs, before);
+      throw error;
+    }
+  }
+
+  private memoryTenantTelemetryDispositionEvidence(
+    job: TenantTelemetryDisposition.TenantTelemetryDispositionEvidence,
+  ): TenantTelemetryDisposition.TenantTelemetryDispositionEvidence {
+    return {
+      domain: job.domain,
+      targetSha256: job.targetSha256,
+      artifactIdSha256: job.artifactIdSha256,
+      artifactGeneration: job.artifactGeneration,
+      inventorySha256: job.inventorySha256,
+      inventoryReceiptSha256: job.inventoryReceiptSha256,
+      writeOperationSha256: job.writeOperationSha256,
+      writeAckReceiptSha256: job.writeAckReceiptSha256,
+      payloadSha256: job.payloadSha256,
+      manifestSha256: job.manifestSha256,
+      lifecycleCoverageEvidenceSha256: job.lifecycleCoverageEvidenceSha256,
+      applicationCoverageEvidenceSha256: job.applicationCoverageEvidenceSha256,
+      applicationWriteBindingReceiptSha256: job.applicationWriteBindingReceiptSha256,
+      t3cReceiptSha256: job.t3cReceiptSha256,
+      t3dPlanReceiptSha256: job.t3dPlanReceiptSha256,
+      t3dPlanEntryReceiptSha256: job.t3dPlanEntryReceiptSha256,
+      dispositionOperationSha256: job.dispositionOperationSha256,
+    };
+  }
+
+  private assertMemoryTenantTelemetryDispositionJobSource(
+    job: TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord,
+  ): void {
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(job);
+    const ack = this.tenantTelemetryWriteAcks.get(job.writeOperationSha256);
+    const candidate = ack && this.memoryTenantTelemetryDispositionCandidate(
+      job.tenantId, job.requestId, ack,
+    );
+    if (!candidate || JSON.stringify(candidate)
+      !== JSON.stringify(this.memoryTenantTelemetryDispositionEvidence(job))) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+        "tenant telemetry disposition source is no longer executable",
+      );
+    }
+  }
+
+  async claimTenantTelemetryDispositions(
+    options: TenantTelemetryDisposition.ClaimTenantTelemetryDispositionsOptions,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionClaim[]> {
+    const stagedOptions = clone(options);
+    TenantTelemetryDisposition.validateClaimTenantTelemetryDispositionsOptions(stagedOptions);
+    const control = this.readMemoryTenantTelemetryDispositionControl();
+    if (control.state === "inactive") return [];
+    const claims: TenantTelemetryDisposition.TenantTelemetryDispositionClaim[] = [];
+    const before = new Map(this.tenantTelemetryDispositionJobs);
+    try {
+      for (const job of [...this.tenantTelemetryDispositionJobs.values()]
+        .sort((left, right) => left.createdAtDbMs - right.createdAtDbMs
+          || left.dispositionOperationSha256.localeCompare(right.dispositionOperationSha256))) {
+        if (claims.length >= stagedOptions.limit) break;
+        if (job.phase !== "queued" && job.phase !== "authorized") continue;
+        const nowMs = this.storeNowMs();
+        if (job.availableAtDbMs > nowMs
+          || (job.leaseUntilDbMs !== undefined && job.leaseUntilDbMs > nowMs)) continue;
+        this.assertMemoryTenantTelemetryDispositionJobSource(job);
+        const updatedAtDbMs = Math.max(nowMs, job.updatedAtDbMs);
+        const leaseUntilDbMs = updatedAtDbMs + stagedOptions.leaseMs;
+        if (!Number.isSafeInteger(leaseUntilDbMs)) {
+          throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+        }
+        const next: TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord = {
+          ...job,
+          attempts: job.attempts + 1,
+          claimToken: stagedOptions.claimToken,
+          leaseUntilDbMs,
+          updatedAtDbMs,
+          lastErrorCode: undefined,
+        };
+        delete next.lastErrorCode;
+        TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(next);
+        this.tenantTelemetryDispositionJobs.set(job.dispositionOperationSha256, next);
+        const claim: TenantTelemetryDisposition.TenantTelemetryDispositionClaim = {
+          tenantId: job.tenantId,
+          requestId: job.requestId,
+          ...this.memoryTenantTelemetryDispositionEvidence(job),
+          phase: job.phase,
+          claimAttempt: next.attempts,
+          claimToken: stagedOptions.claimToken,
+          leaseUntilDbMs,
+          ...(job.phase === "authorized"
+            ? { externalAuthorizationProof: job.externalAuthorizationProof }
+            : {}),
+        };
+        TenantTelemetryDisposition.validateTenantTelemetryDispositionClaim(claim);
+        claims.push(claim);
+      }
+      return clone(claims);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantTelemetryDispositionJobs, before);
+      throw error;
+    }
+  }
+
+  async renewTenantTelemetryDisposition(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    options: TenantTelemetryDisposition.RenewTenantTelemetryDispositionOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(
+      stagedAuthorization,
+    );
+    TenantTelemetryDisposition.validateRenewTenantTelemetryDispositionOptions(stagedOptions);
+    const job = this.tenantTelemetryDispositionJobs.get(
+      stagedAuthorization.dispositionOperationSha256,
+    );
+    const nowMs = this.storeNowMs();
+    if (!job || (job.phase !== "queued" && job.phase !== "authorized")
+      || !this.memoryTenantTelemetryDispositionClaimMatches(
+      job, stagedAuthorization, nowMs,
+    )) return false;
+    this.assertMemoryTenantTelemetryDispositionJobSource(job);
+    const updatedAtDbMs = Math.max(nowMs, job.updatedAtDbMs);
+    const leaseUntilDbMs = Math.max(job.leaseUntilDbMs!, updatedAtDbMs + stagedOptions.leaseMs);
+    if (!Number.isSafeInteger(leaseUntilDbMs)) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+    }
+    const next = { ...job, updatedAtDbMs, leaseUntilDbMs };
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(next);
+    this.tenantTelemetryDispositionJobs.set(job.dispositionOperationSha256, next);
+    return true;
+  }
+
+  async retryTenantTelemetryDisposition(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    options: TenantTelemetryDisposition.RetryTenantTelemetryDispositionOptions,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedOptions = clone(options);
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(
+      stagedAuthorization,
+    );
+    TenantTelemetryDisposition.validateRetryTenantTelemetryDispositionOptions(stagedOptions);
+    const job = this.tenantTelemetryDispositionJobs.get(
+      stagedAuthorization.dispositionOperationSha256,
+    );
+    const nowMs = this.storeNowMs();
+    if (!job || (job.phase !== "queued" && job.phase !== "authorized")
+      || !this.memoryTenantTelemetryDispositionClaimMatches(
+      job, stagedAuthorization, nowMs,
+    )) return false;
+    this.assertMemoryTenantTelemetryDispositionJobSource(job);
+    const updatedAtDbMs = Math.max(nowMs, job.updatedAtDbMs);
+    const availableAtDbMs = updatedAtDbMs + stagedOptions.delayMs;
+    if (!Number.isSafeInteger(availableAtDbMs)) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+    }
+    const next = {
+      ...job,
+      updatedAtDbMs,
+      availableAtDbMs,
+      lastErrorCode: stagedOptions.errorCode,
+    } as TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord;
+    delete next.claimToken;
+    delete next.leaseUntilDbMs;
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(next);
+    this.tenantTelemetryDispositionJobs.set(job.dispositionOperationSha256, next);
+    return true;
+  }
+
+  async blockTenantTelemetryDisposition(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(
+      stagedAuthorization,
+    );
+    const job = this.tenantTelemetryDispositionJobs.get(
+      stagedAuthorization.dispositionOperationSha256,
+    );
+    const nowMs = this.storeNowMs();
+    if (!job || job.phase !== "queued"
+      || !this.memoryTenantTelemetryDispositionClaimMatches(
+        job, stagedAuthorization, nowMs,
+      )) return false;
+    const blockedAtDbMs = Math.max(nowMs, job.updatedAtDbMs);
+    const next: TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord = {
+      scope: job.scope,
+      protocol: job.protocol,
+      tenantId: job.tenantId,
+      requestId: job.requestId,
+      ...this.memoryTenantTelemetryDispositionEvidence(job),
+      phase: "blocked",
+      attempts: job.attempts,
+      createdAtDbMs: job.createdAtDbMs,
+      updatedAtDbMs: blockedAtDbMs,
+      blockedAtDbMs,
+      blockedReasonCode: "integrity_conflict",
+    };
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(next);
+    this.tenantTelemetryDispositionJobs.set(job.dispositionOperationSha256, next);
+    return true;
+  }
+
+  async recordTenantTelemetryExternalAuthorization(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    proof: TenantTelemetryDisposition.TenantTelemetryExternalAuthorizationProof,
+  ): Promise<boolean> {
+    const stagedAuthorization = clone(authorization);
+    const stagedProof = clone(proof);
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(
+      stagedAuthorization,
+    );
+    TenantTelemetryDisposition.validateTenantTelemetryExternalAuthorizationProof(stagedProof);
+    const control = this.readMemoryTenantTelemetryDispositionControl();
+    if (control.state !== "active") return false;
+    const job = this.tenantTelemetryDispositionJobs.get(
+      stagedAuthorization.dispositionOperationSha256,
+    );
+    const nowMs = this.storeNowMs();
+    if (!job || job.phase !== "queued"
+      || !this.memoryTenantTelemetryDispositionClaimMatches(
+        job, stagedAuthorization, nowMs,
+      )) return false;
+    this.assertMemoryTenantTelemetryDispositionJobSource(job);
+    for (const key of ["adapterProtocol", "journalNamespaceSha256", "journalTargetSha256",
+      "failureDomainSha256", "logicalDatabaseNamespaceSha256"] as const) {
+      if (stagedProof[key] !== control[key]) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+      }
+    }
+    const evidence = this.memoryTenantTelemetryDispositionEvidence(job);
+    for (const key of Object.keys(evidence) as (keyof typeof evidence)[]) {
+      if (stagedProof[key] !== evidence[key]) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+          "tenant telemetry external authorization source drifted",
+        );
+      }
+    }
+    const event = this.tenantTelemetryDispositionExternalEvents.get(stagedProof.journalSequence);
+    if (!event || event.eventType !== "delete_authorized"
+      || JSON.stringify(event.result) !== JSON.stringify(stagedProof)) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+        "external deletion authorization has not been mirrored from the journal",
+      );
+    }
+    const old = this.tenantTelemetryDispositionExternalAuthorizations.get(
+      job.dispositionOperationSha256,
+    );
+    if (old) {
+      if (old.authorizationReceiptSha256 !== stagedProof.authorizationReceiptSha256) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+      }
+      return true;
+    }
+    const next: TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord = {
+      ...job,
+      phase: "authorized",
+      externalAuthorizationProof: stagedProof,
+      updatedAtDbMs: Math.max(nowMs, job.updatedAtDbMs),
+    };
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(next);
+    const jobsBefore = new Map(this.tenantTelemetryDispositionJobs);
+    const authorizationsBefore = new Map(this.tenantTelemetryDispositionExternalAuthorizations);
+    try {
+      this.tenantTelemetryDispositionExternalAuthorizations.set(
+        job.dispositionOperationSha256, stagedProof,
+      );
+      this.tenantTelemetryDispositionJobs.set(job.dispositionOperationSha256, next);
+      return true;
+    } catch (error) {
+      restoreMapSnapshot(this.tenantTelemetryDispositionJobs, jobsBefore);
+      restoreMapSnapshot(
+        this.tenantTelemetryDispositionExternalAuthorizations, authorizationsBefore,
+      );
+      throw error;
+    }
+  }
+
+  async completeTenantTelemetryDisposition(
+    authorization: TenantTelemetryDisposition.TenantTelemetryDispositionAuthorization,
+    tombstoneAck: TenantTelemetryDisposition.TenantTelemetrySameKeyTombstoneAck,
+    terminalProof: TenantTelemetryDisposition.TenantTelemetryExternalTombstoneProof,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionReceipt | null> {
+    const stagedAuthorization = clone(authorization);
+    const stagedAck = clone(tombstoneAck);
+    const stagedTerminal = clone(terminalProof);
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionAuthorization(
+      stagedAuthorization,
+    );
+    TenantTelemetryDisposition.validateTenantTelemetrySameKeyTombstoneAck(stagedAck);
+    TenantTelemetryDisposition.validateTenantTelemetryExternalTombstoneProof(stagedTerminal);
+    const job = this.tenantTelemetryDispositionJobs.get(
+      stagedAuthorization.dispositionOperationSha256,
+    );
+    if (!job || job.tenantId !== stagedAuthorization.tenantId
+      || job.requestId !== stagedAuthorization.requestId) return null;
+    if (job.phase === "tombstoned") {
+      const receipt = this.tenantTelemetryDispositionReceipts.get(job.dispositionOperationSha256);
+      if (!receipt || receipt.receiptSha256 !== job.terminalReceiptSha256
+        || receipt.completedClaimAttempt !== stagedAuthorization.claimAttempt
+        || receipt.completedClaimTokenSha256
+          !== TenantTelemetryDisposition.tenantTelemetryDispositionClaimTokenSha256(
+            stagedAuthorization.claimToken,
+          )
+        || receipt.tombstoneAck.receiptSha256 !== stagedAck.receiptSha256
+        || receipt.terminalProof.terminalReceiptSha256
+          !== stagedTerminal.terminalReceiptSha256) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+      }
+      return clone(receipt);
+    }
+    const nowMs = this.storeNowMs();
+    if (job.phase !== "authorized"
+      || !this.memoryTenantTelemetryDispositionClaimMatches(
+        job, stagedAuthorization, nowMs,
+      )) return null;
+    this.assertMemoryTenantTelemetryDispositionJobSource(job);
+    const control = this.readMemoryTenantTelemetryDispositionControl();
+    if (control.state !== "active") return null;
+    const evidence = this.memoryTenantTelemetryDispositionEvidence(job);
+    const externalAuthorization = this.tenantTelemetryDispositionExternalAuthorizations.get(
+      job.dispositionOperationSha256,
+    );
+    if (!externalAuthorization || !job.externalAuthorizationProof
+      || externalAuthorization.authorizationReceiptSha256
+        !== job.externalAuthorizationProof.authorizationReceiptSha256
+      || stagedAck.authorizationReceiptSha256
+        !== externalAuthorization.authorizationReceiptSha256
+      || stagedTerminal.authorization.authorizationReceiptSha256
+        !== externalAuthorization.authorizationReceiptSha256
+      || stagedTerminal.tombstoneAck.receiptSha256 !== stagedAck.receiptSha256) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+    }
+    for (const key of Object.keys(evidence) as (keyof typeof evidence)[]) {
+      if (stagedAck[key] !== evidence[key]
+        || stagedTerminal.authorization[key] !== evidence[key]) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+      }
+    }
+    for (const key of ["adapterProtocol", "journalNamespaceSha256", "journalTargetSha256",
+      "failureDomainSha256", "logicalDatabaseNamespaceSha256"] as const) {
+      if (stagedTerminal[key] !== control[key]) {
+        throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError();
+      }
+    }
+    const externalEvent = this.tenantTelemetryDispositionExternalEvents.get(
+      stagedTerminal.journalSequence,
+    );
+    if (!externalEvent || externalEvent.eventType !== "delete_tombstoned"
+      || JSON.stringify(externalEvent.result) !== JSON.stringify(stagedTerminal)) {
+      throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+        "external tombstone is not in the mirrored authority chain",
+      );
+    }
+    const storeDbTimestampMs = Math.max(nowMs, job.updatedAtDbMs);
+    const receiptBody: TenantTelemetryDisposition.TenantTelemetryDispositionReceiptBody = {
+      scope: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_RECEIPT_SCOPE,
+      protocol: TenantTelemetryDisposition.TENANT_TELEMETRY_DISPOSITION_PROTOCOL,
+      tenantId: job.tenantId,
+      requestId: job.requestId,
+      ...evidence,
+      externalAuthorizationProof: externalAuthorization,
+      tombstoneAck: stagedAck,
+      terminalProof: stagedTerminal,
+      storeDbTimestampMs,
+      completedClaimAttempt: job.attempts,
+      completedClaimTokenSha256:
+        TenantTelemetryDisposition.tenantTelemetryDispositionClaimTokenSha256(
+          stagedAuthorization.claimToken,
+        ),
+      telemetryDispositionComplete: true,
+      contentPurgeExecuted: false,
+      allDomainsComplete: false,
+    };
+    const receipt: TenantTelemetryDisposition.TenantTelemetryDispositionReceipt = {
+      ...receiptBody,
+      receiptSha256: TenantTelemetryDisposition.tenantTelemetryDispositionReceiptSha256(
+        receiptBody,
+      ),
+    };
+    const next: TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord = {
+      scope: job.scope,
+      protocol: job.protocol,
+      tenantId: job.tenantId,
+      requestId: job.requestId,
+      ...evidence,
+      phase: "tombstoned",
+      attempts: job.attempts,
+      createdAtDbMs: job.createdAtDbMs,
+      updatedAtDbMs: storeDbTimestampMs,
+      externalAuthorizationProof: externalAuthorization,
+      terminalReceiptSha256: receipt.receiptSha256,
+      tombstonedAtDbMs: storeDbTimestampMs,
+    };
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionReceipt(receipt);
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(next);
+    const jobsBefore = new Map(this.tenantTelemetryDispositionJobs);
+    const acksBefore = new Map(this.tenantTelemetryDispositionTombstoneAcks);
+    const receiptsBefore = new Map(this.tenantTelemetryDispositionReceipts);
+    try {
+      this.tenantTelemetryDispositionTombstoneAcks.set(
+        job.dispositionOperationSha256, stagedAck,
+      );
+      this.tenantTelemetryDispositionReceipts.set(job.dispositionOperationSha256, receipt);
+      this.tenantTelemetryDispositionJobs.set(job.dispositionOperationSha256, next);
+      return clone(receipt);
+    } catch (error) {
+      restoreMapSnapshot(this.tenantTelemetryDispositionJobs, jobsBefore);
+      restoreMapSnapshot(this.tenantTelemetryDispositionTombstoneAcks, acksBefore);
+      restoreMapSnapshot(this.tenantTelemetryDispositionReceipts, receiptsBefore);
+      throw error;
+    }
+  }
+
+  async getTenantTelemetryDispositionJob(
+    tenantId: string,
+    dispositionOperationSha256: string,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionJobRecord | null> {
+    this.readMemoryTenantTelemetryDispositionControl();
+    const job = this.tenantTelemetryDispositionJobs.get(dispositionOperationSha256);
+    if (!job || job.tenantId !== tenantId) return null;
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionJobRecord(job);
+    return clone(job);
+  }
+
+  async getTenantTelemetryDispositionReceipt(
+    tenantId: string,
+    dispositionOperationSha256: string,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionReceipt | null> {
+    this.readMemoryTenantTelemetryDispositionControl();
+    const receipt = this.tenantTelemetryDispositionReceipts.get(dispositionOperationSha256);
+    if (!receipt || receipt.tenantId !== tenantId) return null;
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionReceipt(receipt);
+    return clone(receipt);
+  }
+
+  async mirrorTenantTelemetryDispositionExternalEvent(
+    event: TenantTelemetryDisposition.TenantTelemetryDispositionExternalEvent,
+  ): Promise<void> {
+    const staged = clone(event);
+    TenantTelemetryDisposition.validateTenantTelemetryDispositionExternalEvent(staged);
+    this.readMemoryTenantTelemetryDispositionControl();
+    throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+      "0036 cannot mirror an unverified external authority head",
+    );
+  }
+
+  async sealTenantTelemetryDispositionReplayFence(
+    input: TenantTelemetryDisposition.TenantTelemetryDispositionReplayFenceBody,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionReplayFence> {
+    const staged = clone(input);
+    TenantTelemetryDisposition.tenantTelemetryDispositionReplayFenceSha256(staged);
+    this.readMemoryTenantTelemetryDispositionControl();
+    throw new TenantTelemetryDisposition.TenantTelemetryDispositionConflictError(
+      "0036 cannot seal a replay fence without verified external head and restore run",
+    );
+  }
+
+  async getTenantTelemetryDispositionReplayFence(
+    targetSha256: string,
+    artifactIdSha256: string,
+    artifactGeneration: number,
+  ): Promise<TenantTelemetryDisposition.TenantTelemetryDispositionReplayFence | null> {
+    this.readMemoryTenantTelemetryDispositionControl();
+    for (const domain of TenantTelemetry.TENANT_TELEMETRY_DOMAINS) {
+      const fence = this.tenantTelemetryDispositionReplayFences.get(
+        this.tenantTelemetryArtifactMapKey(domain, artifactIdSha256, artifactGeneration),
+      );
+      if (fence && fence.targetSha256 === targetSha256) {
+        TenantTelemetryDisposition.validateTenantTelemetryDispositionReplayFence(fence);
+        return clone(fence);
+      }
+    }
+    return null;
   }
 
   async close() {}

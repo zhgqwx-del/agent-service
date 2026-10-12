@@ -379,15 +379,16 @@ try {
     "0033_tenant_telemetry_activation_inventory.sql",
     "0034_tenant_telemetry_durable_writer.sql",
     "0035_tenant_telemetry_application_capture.sql",
+    "0036_tenant_telemetry_disposition.sql",
   ];
   const [migrationRows] = await inspection.query(
-    "SELECT name FROM schema_migrations WHERE name IN (?,?,?,?,?,?,?,?,?) ORDER BY name",
+    `SELECT name FROM schema_migrations WHERE name IN (${expectedMigrationNames.map(() => "?").join(",")}) ORDER BY name`,
     expectedMigrationNames,
   );
   if (
     migrationRows.length !== expectedMigrationNames.length
     || migrationRows.some((row, index) => row.name !== expectedMigrationNames[index])
-  ) throw new Error("runner did not apply migrations 0027 through 0035");
+  ) throw new Error("runner did not apply migrations 0027 through 0036");
   const [telemetryControlRows] = await inspection.query(
     `SELECT control_generation,activated_at_db_ms,lifecycle_protocol,writer_protocol,
             ref_key_id_sha256,target_count,target_root_sha256,activation_evidence_sha256
@@ -454,6 +455,36 @@ try {
     || ["activation_count", "coverage_count", "binding_count"]
       .some((field) => Number(telemetryApplicationEvidenceRows[0][field]) !== 0)) {
     throw new Error("0035 telemetry application capture evidence was not installed empty");
+  }
+  const [telemetryDispositionControlRows] = await inspection.query(
+    `SELECT state,control_generation,protocol,journal_target_sha256,
+            activation_evidence_sha256
+       FROM tenant_telemetry_disposition_control WHERE singleton_id=1`,
+  );
+  if (telemetryDispositionControlRows.length !== 1
+    || telemetryDispositionControlRows[0].state !== "inactive"
+    || Number(telemetryDispositionControlRows[0].control_generation) !== 0
+    || telemetryDispositionControlRows[0].protocol !== null
+    || telemetryDispositionControlRows[0].journal_target_sha256 !== null
+    || telemetryDispositionControlRows[0].activation_evidence_sha256 !== null) {
+    throw new Error("0036 telemetry disposition control was not installed dormant");
+  }
+  const [telemetryDispositionEvidenceRows] = await inspection.query(
+    `SELECT
+       (SELECT COUNT(*) FROM tenant_telemetry_disposition_activation_receipts) AS activation_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_disposition_jobs) AS job_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_disposition_external_authorizations) AS authorization_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_disposition_external_events) AS event_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_disposition_tombstone_acks) AS tombstone_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_disposition_receipts) AS receipt_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_disposition_replay_fences) AS replay_fence_count,
+       (SELECT COUNT(*) FROM tenant_telemetry_disposition_authorization_grants) AS grant_count`,
+  );
+  if (telemetryDispositionEvidenceRows.length !== 1
+    || ["activation_count", "job_count", "authorization_count", "event_count",
+      "tombstone_count", "receipt_count", "replay_fence_count", "grant_count"]
+      .some((field) => Number(telemetryDispositionEvidenceRows[0][field]) !== 0)) {
+    throw new Error("0036 telemetry disposition ledger was not installed empty");
   }
   const [controlRows] = await inspection.query(
     `SELECT control_generation,storage_backend,namespace_sha256,
@@ -586,7 +617,7 @@ if (failure) {
 } else if (verified) {
   console.log(
     `real S3 application assembly passed (${mode} runner/router, disposable MySQL, `
-      + "0027 activation, 0031 dormant catalog, 0034/0035 dormant telemetry capture, "
+      + "0027 activation, 0031 dormant catalog, 0034/0035/0036 dormant telemetry lifecycle, "
       + "exact namespace negotiation, credential isolation)",
   );
 }

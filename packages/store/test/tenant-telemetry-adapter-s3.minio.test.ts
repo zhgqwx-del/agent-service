@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   DeleteObjectsCommand,
   GetObjectCommand,
@@ -17,6 +17,9 @@ import {
   type TenantTelemetryLifecycleTargetRecord,
   type TenantTelemetryWriteAdapterInput,
 } from "../src/index.js";
+import { tenantTelemetryDispositionOperationSha256 } from "../src/tenant-telemetry-disposition.js";
+import { MemoryTenantTelemetryDispositionAdapter } from "../src/tenant-telemetry-disposition-adapter/memory.js";
+import { TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE } from "../src/tenant-telemetry-adapter/s3-tombstone-codec.js";
 import { trustedRunnerTelemetryRecord } from "./tenant-telemetry-adapter.fixture.js";
 
 const integrationGate = process.env.AGENT_SERVICE_TENANT_TELEMETRY_S3_INTEGRATION ?? "0";
@@ -163,6 +166,7 @@ async function preparedFixture(statusCode: number): Promise<{
 function adapter(
   client: S3Client,
   targets: readonly TenantTelemetryLifecycleTargetRecord[],
+  nonProductionDispositionFixture = false,
 ): S3TenantTelemetryWriteAdapter {
   const result = new S3TenantTelemetryWriteAdapter({
     privateBucketAcknowledged: true,
@@ -175,6 +179,9 @@ function adapter(
     forcePathStyle,
     expectedTargets: targets,
     client,
+    ...(nonProductionDispositionFixture
+      ? { nonProductionDispositionFixture: true as const }
+      : {}),
     ...(endpoint.protocol === "http:"
       ? { allowInsecureHttpForLocalTest: true as const }
       : {}),
@@ -341,4 +348,59 @@ describeMinio("S3TenantTelemetryWriteAdapter real MinIO contract", () => {
     await response.body?.cancel();
     expect([401, 403]).toContain(response.status);
   });
+
+  it("CAS-tombstones at the same key and exactly replays the original ACK across real clients", async () => {
+    await first.createWrite(exact.input);
+    const dispositionFirst = adapter(firstClient, exact.targets, true);
+    const dispositionSecond = adapter(secondClient, exact.targets, true);
+    await dispositionFirst.validateDispositionStartup();
+    await dispositionSecond.validateDispositionStartup();
+    const digest = (label: string) => createHash("sha256").update(label).digest("hex");
+    const source = {
+      domain: exact.input.inventory.domain,
+      targetSha256: exact.input.target.targetSha256,
+      artifactIdSha256: exact.input.inventory.artifactIdSha256,
+      artifactGeneration: exact.input.inventory.artifactGeneration,
+      inventorySha256: exact.input.inventory.inventorySha256,
+      inventoryReceiptSha256: exact.input.inventory.receiptSha256,
+      writeOperationSha256: exact.input.writeOperationSha256,
+      writeAckReceiptSha256: digest("durable-minio-write-ack"),
+      payloadSha256: exact.input.inventory.payloadSha256,
+      manifestSha256: exact.input.inventory.manifestSha256,
+      lifecycleCoverageEvidenceSha256: exact.input.inventory.coverageEvidenceSha256,
+      applicationCoverageEvidenceSha256: null,
+      applicationWriteBindingReceiptSha256: null,
+      t3cReceiptSha256: digest("minio-t3c"),
+      t3dPlanReceiptSha256: digest("minio-t3d-plan"),
+      t3dPlanEntryReceiptSha256: digest("minio-t3d-entry"),
+    };
+    const journal = new MemoryTenantTelemetryDispositionAdapter({
+      nonProductionFixture: true,
+      namespaceId: `minio-journal-${runId}`,
+      targetId: `minio-journal-target-${runId}`,
+      failureDomainId: `minio-journal-domain-${runId}`,
+      logicalDatabaseNamespaceSha256: digest(`logical-db-${runId}`),
+    });
+    try {
+      const proof = await journal.authorizeDeletion({
+        ...source,
+        dispositionOperationSha256: tenantTelemetryDispositionOperationSha256(source),
+      });
+      const firstAck = await dispositionFirst.tombstoneAuthorized(proof, journal);
+      const secondAck = await dispositionSecond.tombstoneAuthorized(proof, journal);
+      expect(secondAck).toEqual(firstAck);
+      const object = await secondClient.send(new GetObjectCommand({
+        Bucket: bucket,
+        Key: artifactKey(exact.input),
+      }));
+      expect(object.ContentType).toBe(TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE);
+      const bytes = await readBody(object.Body);
+      expect(bytes.subarray(0, 8).toString("ascii")).toBe("ASTOMB01");
+      expect(bytes.toString("utf8")).not.toContain("raw-real-minio-tenant-must-not-appear");
+      await expect(first.createWrite(exact.input))
+        .rejects.toBeInstanceOf(TenantTelemetryWriteAdapterConflictError);
+    } finally {
+      await journal.close();
+    }
+  }, 30_000);
 });
