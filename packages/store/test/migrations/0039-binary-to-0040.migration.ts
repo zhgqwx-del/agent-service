@@ -1,8 +1,8 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
@@ -19,8 +19,14 @@ const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_
 type Row = RowDataPacket;
 
 function disposableBase(raw: string): URL {
-  const url = new URL(raw);
-  const database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
+  let url: URL;
+  let database: string;
+  try {
+    url = new URL(raw);
+    database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
+  } catch {
+    throw new Error("MYSQL_MIGRATION_TEST_URL must be a valid disposable MySQL test URL");
+  }
   if (url.protocol !== "mysql:"
     || !new Set(["localhost", "127.0.0.1", "[::1]", "::1"]).has(url.hostname)
     || !/(?:^|[_-])(test|migration)(?:$|[_-])/i.test(database)) {
@@ -39,15 +45,71 @@ function exactDatabaseName(): string {
   return `agent_service_migration_test_pre0040_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
 }
 
-function processEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+function processEnv(temp: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   // Never inherit .env/provider credentials or test-only destructive gates into the old process.
   return {
     PATH: process.env.PATH,
-    HOME: process.env.HOME,
-    TMPDIR: process.env.TMPDIR,
-    CI: process.env.CI,
+    HOME: temp,
+    TMPDIR: temp,
+    CI: "1",
+    NO_COLOR: "1",
+    COREPACK_ENABLE_NETWORK: "0",
     ...extra,
   };
+}
+
+async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
+  // The frozen revision has the same lockfile and dependency declarations as this checkout.
+  // Reuse its already-installed packages without giving old code access to the real HOME,
+  // pnpm cache, network, or current source packages through workspace symlinks.
+  const frozenLock = await readFile(join(oldCheckout, "pnpm-lock.yaml"));
+  const currentLock = await readFile(join(ROOT, "pnpm-lock.yaml"));
+  if (!frozenLock.equals(currentLock)) throw new Error("frozen 0039 dependency lock changed");
+  for (const manifest of [
+    "pnpm-workspace.yaml", "packages/core/package.json", "packages/protocol/package.json",
+    "packages/providers/package.json", "packages/sdk/package.json", "packages/store/package.json",
+    "packages/testkit/package.json", "apps/agent-router/package.json",
+    "apps/agent-runner/package.json",
+  ]) {
+    const frozen = await readFile(join(oldCheckout, manifest));
+    const current = await readFile(join(ROOT, manifest));
+    if (!frozen.equals(current)) throw new Error(`frozen 0039 dependency manifest changed: ${manifest}`);
+  }
+  const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
+  await cp(join(ROOT, "node_modules"), join(oldCheckout, "node_modules"), options);
+  for (const project of [
+    "packages/core", "packages/providers", "packages/protocol", "packages/sdk",
+    "packages/store", "apps/agent-router", "apps/agent-runner",
+  ]) {
+    await cp(join(ROOT, project, "node_modules"), join(oldCheckout, project, "node_modules"),
+      options);
+  }
+  const virtualStore = await lstat(join(oldCheckout, "node_modules/.pnpm"));
+  if (!virtualStore.isDirectory() || virtualStore.isSymbolicLink()) {
+    throw new Error("frozen 0039 dependency store is not self-contained");
+  }
+  const realCheckout = await realpath(oldCheckout);
+  let workspaceLinks = 0;
+  for (const project of [
+    "", "node_modules/.pnpm", "packages/core", "packages/providers", "packages/protocol",
+    "packages/sdk", "packages/store", "apps/agent-router", "apps/agent-runner",
+  ]) {
+    const scope = join(oldCheckout, project, "node_modules/@agent-service");
+    const names = await readdir(scope).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    for (const name of names) {
+      const link = join(scope, name);
+      const target = await readlink(link);
+      const resolved = await realpath(link);
+      if (target.startsWith("/") || !resolved.startsWith(realCheckout + sep)) {
+        throw new Error("frozen 0039 workspace dependency points outside its archive");
+      }
+      workspaceLinks += 1;
+    }
+  }
+  if (workspaceLinks === 0) throw new Error("frozen 0039 workspace package links are missing");
 }
 
 async function runFixed(
@@ -77,10 +139,10 @@ async function rowDigest(conn: Connection, table: string, orderBy: string): Prom
   return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 }
 
-async function assertFrozenRunnerStarts(cwd: string, url: string): Promise<void> {
+async function assertFrozenRunnerStarts(cwd: string, temp: string, url: string): Promise<void> {
   const child = spawn(process.execPath, ["apps/agent-runner/dist/main.js"], {
     cwd,
-    env: processEnv({
+    env: processEnv(temp, {
       STORE: "mysql", MYSQL_URL: url,
       SECRETS_MASTER_KEY: "0".repeat(64),
       BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
@@ -130,21 +192,21 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     await mkdir(oldCheckout);
     const archive = join(archiveRoot, "frozen-0039.tar");
     const resolvedCommit = (await runFixed(
-      "git", ["rev-parse", FROZEN_0039_COMMIT], ROOT, processEnv(), 10_000,
+      "git", ["rev-parse", FROZEN_0039_COMMIT], ROOT, processEnv(archiveRoot), 10_000,
     )).trim();
     expect(resolvedCommit).toBe(FROZEN_0039_COMMIT);
     await runFixed("git", ["archive", "--format=tar", `--output=${archive}`, FROZEN_0039_COMMIT],
-      ROOT, processEnv(), 30_000);
-    await runFixed("tar", ["-xf", archive, "-C", oldCheckout], ROOT, processEnv(), 30_000);
+      ROOT, processEnv(archiveRoot), 30_000);
+    await runFixed("tar", ["-xf", archive, "-C", oldCheckout], ROOT,
+      processEnv(archiveRoot), 30_000);
     const driverDir = join(oldCheckout, "packages/store/test/migrations/fixtures");
     await mkdir(driverDir, { recursive: true });
     await copyFile(join(HERE, "fixtures/pre0040-old-plan-driver.ts"),
       join(driverDir, "pre0040-old-plan-driver.ts"));
     await copyFile(join(HERE, "fixtures/pre0040-old-fingerprint-probe.ts"),
       join(driverDir, "pre0040-old-fingerprint-probe.ts"));
-    await runFixed("pnpm", ["install", "--offline", "--frozen-lockfile"], oldCheckout,
-      processEnv(), 180_000);
-    await runFixed("pnpm", ["build"], oldCheckout, processEnv(), 180_000);
+    await copyInstalledDependencies(oldCheckout);
+    await runFixed("pnpm", ["build"], oldCheckout, processEnv(archiveRoot), 180_000);
   }, 420_000);
 
   afterAll(async () => {
@@ -173,8 +235,8 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     const stdout = await runFixed(process.execPath,
       ["--import", "tsx", "packages/store/test/migrations/fixtures/pre0040-old-plan-driver.ts"],
       oldCheckout,
-      processEnv({ MYSQL_URL: url }), 180_000);
-    const oldResult = JSON.parse(stdout) as {
+      processEnv(archiveRoot, { MYSQL_URL: url }), 180_000);
+    let oldResult: {
       sourceCommit: string;
       requestId: string;
       tenantId: string;
@@ -183,10 +245,16 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
       entries: number;
       evidenceSha256: string;
     };
-    expect(oldResult.sourceCommit).toBe(FROZEN_0039_COMMIT);
-    expect(oldResult.entries).toBe(33);
-    expect(oldResult.evidenceSha256).toMatch(/^[0-9a-f]{64}$/);
-    await assertFrozenRunnerStarts(oldCheckout, url);
+    try {
+      oldResult = JSON.parse(stdout) as typeof oldResult;
+    } catch {
+      throw new Error("frozen 0039 fixture returned an invalid result");
+    }
+    expect(oldResult.sourceCommit === FROZEN_0039_COMMIT).toBe(true);
+    expect(oldResult.entries === 33).toBe(true);
+    expect(typeof oldResult.evidenceSha256 === "string"
+      && /^[0-9a-f]{64}$/.test(oldResult.evidenceSha256)).toBe(true);
+    await assertFrozenRunnerStarts(oldCheckout, archiveRoot, url);
     const conn = await mysql.createConnection(url);
     const before = new Map<string, string>();
     try {
@@ -269,14 +337,14 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
 
     const oldStoreProbe = await runFixed(process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0040-old-fingerprint-probe.ts",
-    ], oldCheckout, processEnv({ MYSQL_URL: url }), 15_000);
-    expect(oldStoreProbe).toBe("frozen-0039-fingerprint-rejected");
+    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url }), 15_000);
+    expect(oldStoreProbe === "frozen-0039-fingerprint-rejected").toBe(true);
 
     // The frozen runner bundle, not a copied fingerprint SQL statement, must reject the new
     // trigger/schema shape before binding its listener. A bounded child prevents a false pass.
     const frozenStartup = spawnSync(process.execPath, ["apps/agent-runner/dist/main.js"], {
       cwd: oldCheckout,
-      env: processEnv({
+      env: processEnv(archiveRoot, {
         STORE: "mysql", MYSQL_URL: url,
         SECRETS_MASTER_KEY: "0".repeat(64),
         BLOB_FILESYSTEM_SINGLE_RUNNER: "1",
