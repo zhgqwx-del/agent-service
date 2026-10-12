@@ -42,6 +42,8 @@ jobs:
           --health-interval=5s --health-timeout=5s --health-retries=20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # frozen 0039 binary migration fixture archives an exact historical commit
       - uses: pnpm/action-setup@v4
         with:
           version: 12.5.1
