@@ -17,9 +17,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     # The required lifecycle and frozen-migration matrices intentionally run serially against
-    # shared real services. Keep enough headroom for slower hosted runners without weakening or
-    # skipping any named proof; the job still exits as soon as the matrix completes.
-    timeout-minutes: 120
+    # shared real services. The 0041 frozen-binary fixtures add real historical upgrades to a
+    # job already near two hours; retain headroom without weakening or skipping any named proof.
+    timeout-minutes: 150
     env:
       MINIO_SOURCE_COMMIT: 07c3a429bfed433e49018cb0f78a52145d4bedeb
     services:
@@ -43,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Frozen 0038 and 0039 binary fixtures archive exact published commits.
+          # Frozen 0038, 0039 and 0040 binary fixtures archive exact published commits.
           fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
@@ -523,7 +523,7 @@ jobs:
       # 0035 -> 0036 dormant disposition, 0036 -> 0037 grant guard, 0037 -> 0038
       # membership, 0038 -> 0039 T3f owner closure, 0039 -> 0040 T3d
       # source accounting, and 0040 -> 0041 target manifest all run against real MySQL.
-      # Frozen 0038/0039 binaries also produce genuine old terminal records before upgrade;
+      # Frozen 0038/0039/0040 binaries also produce genuine old terminal records before upgrade;
       # old-code startup must reject each new strict fingerprint.
       - name: Historical MySQL migrations (0007 through 0041, frozen terminals, no skips)
         env:

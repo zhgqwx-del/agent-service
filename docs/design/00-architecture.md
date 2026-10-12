@@ -592,7 +592,7 @@ agent-service/
 | **M3 扩展性**（2–3 周） | 远程 MCP 注册与桥接；skills 上传/注入/guard；hooks/middleware + webhook hook；动态工具反向委托 | MCP 工具在 turn 中被调用并落 item；skill 目录注入去重；hook 超时 fail-open/closed 行为；SSRF 用例被拒 |
 | **M4 生产化**（2–3 周） | 配额/key 池/熔断；OTel + 指标；压测（单进程并发 turn 上限实测）；Streams 分片；k8s 清单；重池/exec-server 设计评审 | 单 runner 1,000 并发 turn 压测报告；`prompt_cache_hit_ratio` 面板；混沌测试（Redis 抖动、厂商 5xx） |
 
-当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038只为迁移后新write增加逐项不可变membership/source证据；0039再于T3f同事务封存删除前真实owner-closure；0040为新T3d同事务封存五类telemetry来源核对。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry delete/restore/retention、operator activation与任意业务事务crash-atomic dual-write仍缺失。物理backup producer、真实provider/KMS、generic user purge及全域completion也未闭环，所以M1尚未冻结；M3尚未正式开始，M4主体和云环境验收尚未开始。
+当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038只为迁移后新write增加逐项不可变membership/source证据；0039再于T3f同事务封存删除前真实owner-closure；0040为新T3d同事务封存五类telemetry来源核对，0041再精确封存逐source观察目标清单；两者都不是可执行删除target或grant。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry delete/restore/retention、operator activation与任意业务事务crash-atomic dual-write仍缺失。物理backup producer、真实provider/KMS、generic user purge及全域completion也未闭环，所以M1尚未冻结；M3尚未正式开始，M4主体和云环境验收尚未开始。
 
 ---
 
