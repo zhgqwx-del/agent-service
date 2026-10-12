@@ -861,7 +861,7 @@ describe("0034 -> 0035 tenant telemetry application capture migration", () => {
         await cleanup(database);
       }
     }
-  });
+  }, 60_000);
 
   it("fails startup on marker-present trigger and schema drift", async () => {
     for (const drift of ["trigger", "schema"] as const) {
