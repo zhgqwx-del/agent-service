@@ -13,8 +13,7 @@ const exec = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../../..");
 // Pin the published 0042 source, not HEAD: old product writers must create genuine evidence.
-// Replace this SHA with the main-line 0042 commit if the integration cherry-picks it.
-const FROZEN_0042_COMMIT = "4feddc8ee0c239f17e427349e1cfcb2ad9e8cba8";
+const FROZEN_0042_COMMIT = "cefb498929854f9132611ba03ade0c495cb475b1";
 const MIGRATION_0042 = "0042_tenant_telemetry_plan_artifact_target.sql";
 const REF_KEY = Buffer.alloc(32, 0x42);
 const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_URL
