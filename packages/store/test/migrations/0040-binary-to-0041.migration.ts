@@ -1,0 +1,272 @@
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
+import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { MysqlSessionStore } from "../../src/index.js";
+
+const exec = promisify(execFile);
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(HERE, "../../../..");
+const FROZEN_0040_COMMIT = "3680cfe276756f5f39823f8d3ae2667832dc7b8f";
+const MIGRATION_0041 = "0041_tenant_telemetry_target_manifest.sql";
+const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_URL
+  ?? "mysql://root@127.0.0.1:3306/agent_service_test";
+type Row = RowDataPacket;
+
+function disposableBase(raw: string): URL {
+  const url = new URL(raw);
+  const database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
+  if (url.protocol !== "mysql:"
+    || !new Set(["localhost", "127.0.0.1", "[::1]", "::1"]).has(url.hostname)
+    || !/(?:^|[_-])(test|migration)(?:$|[_-])/i.test(database)) {
+    throw new Error("MYSQL_MIGRATION_TEST_URL must target loopback MySQL and a test/migration database");
+  }
+  return url;
+}
+
+function databaseUrl(base: URL, database: string): string {
+  const url = new URL(base);
+  url.pathname = `/${database}`;
+  return url.toString();
+}
+
+function exactDatabaseName(): string {
+  return `agent_service_migration_test_pre0041_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+}
+
+function processEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  // No provider credentials, .env contents, or destructive gates reach historical processes.
+  return {
+    PATH: process.env.PATH,
+    HOME: process.env.HOME,
+    TMPDIR: process.env.TMPDIR,
+    CI: process.env.CI,
+    ...extra,
+  };
+}
+
+async function runFixed(
+  stage: string,
+  file: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  timeout = 180_000,
+): Promise<string> {
+  try {
+    const result = await exec(file, args, { cwd, env, timeout, maxBuffer: 8 * 1024 * 1024 });
+    return result.stdout;
+  } catch {
+    // Subprocess output may include a MySQL DSN; never let Vitest print that output.
+    throw new Error(`frozen 0040 fixture stage failed: ${stage}`);
+  }
+}
+
+async function rowDigest(conn: Connection, table: string, orderBy: string): Promise<string> {
+  const allowed = new Set([
+    "tenant_erasure_admissions", "tenant_content_inventory_receipts",
+    "tenant_purge_plan_jobs", "tenant_purge_plan_entries", "tenant_purge_plan_receipts",
+    "tenant_telemetry_source_accounting_entries",
+    "tenant_telemetry_source_accounting_receipts",
+  ]);
+  if (!allowed.has(table)) throw new Error("unsafe snapshot table");
+  const [rows] = await conn.query<Row[]>(`SELECT * FROM \`${table}\` ORDER BY ${orderBy}`);
+  return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
+}
+
+const OLD_TABLES = [
+  ["tenant_erasure_admissions", "request_id"],
+  ["tenant_content_inventory_receipts", "request_id"],
+  ["tenant_purge_plan_jobs", "request_id"],
+  ["tenant_purge_plan_entries", "request_id,domain"],
+  ["tenant_purge_plan_receipts", "request_id"],
+  ["tenant_telemetry_source_accounting_entries", "request_id,source_kind,source_identity_sha256"],
+  ["tenant_telemetry_source_accounting_receipts", "request_id"],
+] as const;
+
+describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
+  let admin: Connection;
+  let base: URL;
+  let archiveRoot: string;
+  let oldCheckout: string;
+  const databases = new Set<string>();
+
+  beforeAll(async () => {
+    base = disposableBase(BASE_URL);
+    const adminUrl = new URL(base);
+    adminUrl.pathname = "/";
+    admin = await mysql.createConnection(adminUrl.toString());
+    archiveRoot = await mkdtemp(join(tmpdir(), "agent-service-frozen-0040-"));
+    oldCheckout = join(archiveRoot, "checkout");
+    await mkdir(oldCheckout);
+    const archive = join(archiveRoot, "frozen-0040.tar");
+    const resolvedCommit = (await runFixed(
+      "resolve commit", "git", ["rev-parse", FROZEN_0040_COMMIT], ROOT, processEnv(), 10_000,
+    )).trim();
+    expect(resolvedCommit).toBe(FROZEN_0040_COMMIT);
+    await runFixed("archive", "git", [
+      "archive", "--format=tar", `--output=${archive}`, FROZEN_0040_COMMIT,
+    ], ROOT, processEnv(), 30_000);
+    await runFixed("extract", "tar", ["-xf", archive, "-C", oldCheckout],
+      ROOT, processEnv(), 30_000);
+    const driverDir = join(oldCheckout, "packages/store/test/migrations/fixtures");
+    await mkdir(driverDir, { recursive: true });
+    await copyFile(join(HERE, "fixtures/pre0041-old-plan-driver.ts"),
+      join(driverDir, "pre0041-old-plan-driver.ts"));
+    await copyFile(join(HERE, "fixtures/pre0041-old-verify-probe.ts"),
+      join(driverDir, "pre0041-old-verify-probe.ts"));
+    await runFixed("offline install", "pnpm", ["install", "--offline", "--frozen-lockfile"],
+      oldCheckout, processEnv(), 180_000);
+    await runFixed("old build", "pnpm", ["build"], oldCheckout, processEnv(), 180_000);
+  }, 420_000);
+
+  afterAll(async () => {
+    if (admin) {
+      for (const database of databases) {
+        if (!/^agent_service_migration_test_pre0041_[0-9]+_[0-9a-f]{8}$/.test(database)) {
+          throw new Error("unsafe test database cleanup target");
+        }
+        await admin.query(`DROP DATABASE IF EXISTS \`${database}\``);
+      }
+      await admin.end();
+    }
+    if (archiveRoot) await rm(archiveRoot, { recursive: true, force: true });
+  });
+
+  it("preserves genuine old-worker 33-domain T3d and 0040 source receipt; 0041 missing means unknown", async () => {
+    const database = exactDatabaseName();
+    const [existing] = await admin.query<Row[]>(
+      "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [database],
+    );
+    expect(existing).toHaveLength(0);
+    await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
+    databases.add(database);
+    const url = databaseUrl(base, database);
+    const stdout = await runFixed("old T3d worker", process.execPath, [
+      "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-plan-driver.ts",
+    ], oldCheckout, processEnv({ MYSQL_URL: url }), 180_000);
+    let oldResult: {
+      sourceCommit: string;
+      requestId: string;
+      tenantId: string;
+      planReceiptSha256: string;
+      planEntryRootSha256: string;
+      sourceReceiptSha256: string;
+      entries: number;
+      sourceEntries: number;
+      upstreamReceiptsPresent: boolean;
+    };
+    try {
+      oldResult = JSON.parse(stdout) as typeof oldResult;
+    } catch {
+      throw new Error("frozen 0040 driver output was not valid JSON");
+    }
+    expect(oldResult.sourceCommit).toBe(FROZEN_0040_COMMIT);
+    expect(oldResult.entries).toBe(33);
+    expect(oldResult.sourceEntries).toBe(0);
+    expect(oldResult.upstreamReceiptsPresent).toBe(true);
+    const oldVerifyAccepted = await runFixed("old verify accepted", process.execPath, [
+      "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-verify-probe.ts",
+    ], oldCheckout, processEnv({ MYSQL_URL: url,
+      EXPECT_0040_FINGERPRINT_REJECTION: "0" }), 15_000);
+    expect(oldVerifyAccepted === "frozen-0040-verify-accepted").toBe(true);
+
+    const before = new Map<string, string>();
+    const conn = await mysql.createConnection(url);
+    try {
+      const [markers] = await conn.query<Row[]>("SELECT name FROM schema_migrations ORDER BY name");
+      expect(markers).toHaveLength(40);
+      expect(markers.at(-1)?.name).toBe("0040_tenant_telemetry_source_accounting.sql");
+      const [oldJob] = await conn.query<Row[]>(
+        "SELECT phase,aggregate_receipt_sha256 FROM tenant_purge_plan_jobs WHERE request_id=?",
+        [oldResult.requestId],
+      );
+      expect(oldJob).toHaveLength(1);
+      expect(oldJob[0]?.phase).toBe("plan_sealed");
+      expect(oldJob[0]?.aggregate_receipt_sha256).toBe(oldResult.planReceiptSha256);
+      const [source] = await conn.query<Row[]>(
+        "SELECT receipt_sha256,plan_receipt_sha256 FROM tenant_telemetry_source_accounting_receipts WHERE request_id=?",
+        [oldResult.requestId],
+      );
+      expect(source).toHaveLength(1);
+      expect(source[0]?.receipt_sha256).toBe(oldResult.sourceReceiptSha256);
+      expect(source[0]?.plan_receipt_sha256).toBe(oldResult.planReceiptSha256);
+      for (const [table, orderBy] of OLD_TABLES) {
+        before.set(table, await rowDigest(conn, table, orderBy));
+      }
+    } finally {
+      await conn.end();
+    }
+
+    const upgraded = await MysqlSessionStore.connect({ url });
+    try {
+      const plan = await upgraded.getTenantPurgePlanReceipt(
+        oldResult.tenantId, oldResult.requestId,
+      );
+      expect(plan?.receiptSha256).toBe(oldResult.planReceiptSha256);
+      expect(plan?.planEntryRootSha256).toBe(oldResult.planEntryRootSha256);
+      expect(await upgraded.getTenantPurgePlanEntries(
+        oldResult.tenantId, oldResult.requestId, 1,
+      )).toHaveLength(33);
+      const source = await upgraded.getTenantTelemetrySourceAccountingReceipt(
+        oldResult.tenantId, oldResult.requestId,
+      );
+      expect(source?.receiptSha256).toBe(oldResult.sourceReceiptSha256);
+      expect(source?.entryCount).toBe(0);
+      expect(await upgraded.getTenantTelemetryTargetManifestReceipt(
+        oldResult.tenantId, oldResult.requestId,
+      )).toBeNull();
+      expect(await upgraded.getTenantTelemetryTargetManifestEntries(
+        oldResult.tenantId, oldResult.requestId,
+      )).toEqual([]);
+      expect(await upgraded.getTenantTelemetryTargetSourceReadiness(
+        oldResult.tenantId, oldResult.requestId,
+      )).toBeNull();
+      const foreignTenant = `foreign-${oldResult.tenantId}`;
+      expect(await upgraded.getTenantPurgePlanReceipt(
+        foreignTenant, oldResult.requestId,
+      )).toBeNull();
+      expect(await upgraded.getTenantTelemetrySourceAccountingReceipt(
+        foreignTenant, oldResult.requestId,
+      )).toBeNull();
+      expect(await upgraded.getTenantTelemetryTargetManifestReceipt(
+        foreignTenant, oldResult.requestId,
+      )).toBeNull();
+      expect(await upgraded.getTenantTelemetryTargetManifestEntries(
+        foreignTenant, oldResult.requestId,
+      )).toEqual([]);
+    } finally {
+      await upgraded.close();
+    }
+
+    const afterConn = await mysql.createConnection(url);
+    try {
+      const [markers] = await afterConn.query<Row[]>(
+        "SELECT name FROM schema_migrations ORDER BY name",
+      );
+      expect(markers).toHaveLength(41);
+      expect(markers.at(-1)?.name).toBe(MIGRATION_0041);
+      for (const [table, orderBy] of OLD_TABLES) {
+        expect(await rowDigest(afterConn, table, orderBy)).toBe(before.get(table));
+      }
+      const [newRows] = await afterConn.query<Row[]>(
+        `SELECT (SELECT COUNT(*) FROM tenant_telemetry_target_manifest_entries) AS entries,
+                (SELECT COUNT(*) FROM tenant_telemetry_target_manifest_receipts) AS receipts`,
+      );
+      expect(newRows[0]).toMatchObject({ entries: 0, receipts: 0 });
+    } finally {
+      await afterConn.end();
+    }
+
+    const oldVerifyRejected = await runFixed("old verify rejected", process.execPath, [
+      "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-verify-probe.ts",
+    ], oldCheckout, processEnv({ MYSQL_URL: url,
+      EXPECT_0040_FINGERPRINT_REJECTION: "1" }), 15_000);
+    expect(oldVerifyRejected === "frozen-0040-verify-fingerprint-rejected").toBe(true);
+  }, 240_000);
+});
