@@ -80,6 +80,6 @@ Blob `0010` manifest、图片/大工具输出 opaque id、staging→ready 原子
 
 0031的S3 authority由create-only不可变event objects与单一可变`If-Match` CAS head组成，LIST不参与head判定；event已落盘但head未推进时以精确下一sequence读取收敛。启动同时探测`If-None-Match: *`和陈旧ETag拒绝；生产IAM必须允许受控head条件覆盖并禁止其它writer覆盖event/head，兼容存储忽略条件header时fail closed。
 
-产品交付仍只有`agent-router`与`agent-runner`两个长期服务和两个Linux OCI镜像；构建共有五个JavaScript入口：router的`main.js`，runner的`main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`与`backup-catalog.js`。0032∼0035只增加migration、共享store/worker/adapter代码和测试，不新增服务、daemon、entrypoint或镜像；0034 worker已接runner但默认关闭，当前仅支持production拒绝的本地单runner filesystem adapter。任何手工源码启动或verify都不得把first-admin两个变量当ambient配置；仅在明确的一次性bootstrap操作中同时提供tenant和绝对output path，使用后撤销并按安全策略处理文件。
+产品交付仍只有`agent-router`与`agent-runner`两个长期服务和两个Linux OCI镜像；构建共有五个JavaScript入口：router的`main.js`，runner的`main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`与`backup-catalog.js`。0032∼0035及本轮S3-compatible writer只增加migration、共享store/worker/adapter代码和测试，不新增服务、daemon、entrypoint或镜像；0034 worker已接runner但默认关闭，支持filesystem或S3-compatible adapter。filesystem只用于本地单runner且production拒绝；S3是managed-capable writer协议，但尚无0036 delete/restore生命周期或真实云IAM/KMS、故障域和容量验收。任何手工源码启动或verify都不得把first-admin两个变量当ambient配置；仅在明确的一次性bootstrap操作中同时提供tenant和绝对output path，使用后撤销并按安全策略处理文件。
 
 本机 `.env` 可按用户授权用于本地验证，但不得提交、打印或回显任何密钥。预发/生产部署等待用户提供真实 Kubernetes、MySQL、Redis、共享对象存储、域名/TLS、Secret/KMS 和资源配额后再落地，不能编造云参数。

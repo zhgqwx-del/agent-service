@@ -75,7 +75,7 @@ pnpm test:blob-mysql                          # 强制执行并验明 ownership/
 pnpm test:blob-storage-control-memory         # 强制执行 0027 Memory write-once cutover/回滚/并发套件
 pnpm test:blob-storage-control-mysql          # 强制执行 0027 真实InnoDB inventory/回滚/并发套件
 pnpm test:blob-storage-migration-mysql-s3     # 强制执行 0028 真实MySQL + MinIO离线搬迁/回滚/重放套件
-scripts/local-service.sh verify-s3            # 真实S3协议、0028 mover、Blob应用装配及telemetry dormant-schema检查
+scripts/local-service.sh verify-s3            # 真实S3协议、0028 mover、Blob应用装配、telemetry S3 required suite及dormant-schema检查
 pnpm test:usage-lifecycle-mysql               # 强制执行 usage 双写/核对/匿名化真实 MySQL 专项套件
 pnpm test:subject-lifecycle-mysql             # 强制执行 subject gate/回滚/并发真实 MySQL 专项套件
 pnpm test:tenant-credential-revocation-mysql  # 强制执行 tenant 原子 fence、status proof、回滚、隔离和写入 race 真实 MySQL 套件
