@@ -16,7 +16,9 @@
 
 `0044`完成版本化来源绑定的第一步：新增默认休眠、逐artifact的content-free pre-grant intent/claim。Memory以同步原子边界、MySQL以RR事务独立重验当前0039～0042、T3f grave和T1/hold/control/restore等本地来源；0043只读候选不能直接充当授权。intent绑定精确artifact group与来源receipt，claim按同一key/version CAS、DB-time lease及一次性token hash串行化；MySQL写入后若lease已过期会整事务回滚。`grantReady=false`固定，0037 grant硬拒、0042 logs/traces blocker、产品外部mutation/restore及全域completion不变。`0044`独立migration只增加两张账本表、guards与严格126-trigger启动指纹，不回填旧terminal、不联网或激活；升级需先排空旧writer，独立迁移后只运行0044-aware进程。历史升级夹具是在真实MySQL上的SQL-shaped 0042状态，不等同于冻结旧binary生成的非空terminal。完整本地verify与推送后CI以[进度记录](docs/PROGRESS.md)最后一节为准。
 
-`0045`/`0046`分别增加默认未接入产品路径、只执行GET的v2 grant-journal sealed-chain观察器和telemetry artifact对象观察器；观察到链或精确data/tombstone也不证明DB grant、物理ACK或恢复围栏。`0047`提供独立v3 disposition事件链及S3 CAS-head的**显式非生产夹具**，`0048`再增加只读v3 sealed-chain观察器；这些代码不替代0036/0037产品硬拒，也不会在普通启动中读写外部对象。`0049`新增default-dormant的persisted provider-step failure capture v2结构：logs控制保持inactive/generation 0、traces无producer，coverage与逐write source binding都由SQL guard硬拒；未来source session/turn/item仅可用tenant-bound、kind-separated keyed HMAC ref，不保存原始ID。三张表、13个新增guard及严格139-trigger指纹不激活producer、不回填v1或授予删除权；新T3d/T3f遇active或异常v2 footprint会fail closed。升级须先排空pre-0049 writer再独立迁移。`0050`只为**新普通session DELETE**建立30天宽限期的来源与post-COMMIT数据库时间floor：首事务把来源与tombstone/event/outbox原子写到session行，第二事务封存不早于commit后观测时刻加30天的下限；旧/erasure/legacy删除仍为unknown。尚无自动恢复调度或物理清理，`purge_after_ms`仍为`NULL`，`session.purge`仍不可领取。完整验证与CI状态以[进度记录](docs/PROGRESS.md)最新一节为准。
+`0045`/`0046`分别增加默认未接入产品路径、只执行GET的v2 grant-journal sealed-chain观察器和telemetry artifact对象观察器；观察到链或精确data/tombstone也不证明DB grant、物理ACK或恢复围栏。`0047`提供独立v3 disposition事件链及S3 CAS-head的**显式非生产夹具**，`0048`再增加只读v3 sealed-chain观察器；这些代码不替代0036/0037产品硬拒，也不会在普通启动中读写外部对象。`0049`新增default-dormant的persisted provider-step failure capture v2结构：logs控制保持inactive/generation 0、traces无producer，coverage与逐write source binding都由SQL guard硬拒；未来source session/turn/item仅可用tenant-bound、kind-separated keyed HMAC ref，不保存原始ID。三张表、13个新增guard及严格139-trigger指纹不激活producer、不回填v1或授予删除权；新T3d/T3f遇active或异常v2 footprint会fail closed。升级须先排空pre-0049 writer再独立迁移。`0050`只为**新普通session DELETE**建立30天宽限期的来源与post-COMMIT数据库时间floor：首事务把来源与tombstone/event/outbox原子写到session行，第二事务封存不早于commit后观测时刻加30天的下限；旧/erasure/legacy删除仍为unknown。后续runner内嵌未seal来源恢复caller，但独立gate`SESSION_DELETE_GRACE_RECOVERY_ENABLED`默认`0`；显式开启才按默认30秒/25条扫描并重验补seal，不新增服务、入口或镜像。它不排期或执行物理清理，`purge_after_ms`仍为`NULL`，`session.purge`仍不可领取。新provider失败的turn/error event/SSE消息也已固定为`provider_error`和`Provider request failed.`，不再回显上游原始错误；这是公开message兼容性变化，历史已落库错误没有清除。完整验证与CI状态以[进度记录](docs/PROGRESS.md)最新一节为准。
+
+`0051`再新增独立MySQL write-once trigger：已有0050 origin只能随首次tombstone写入，写成后来源、BINARY owner身份、删除generation/time和event cursor不可变；seal仅能在旧行已有origin后写入并保持不可变。迁移可对精确已装trigger作create-only marker恢复，启动严格核对完整动作；相关启动指纹集合为140（不是全库trigger总数）（0049自身是139）。它不强制旧普通DELETE双写，也不证明两次COMMIT或来源真实；旧/erasure/legacy无origin仍为unknown，T3f仍可删除整行。`purge_after_ms=NULL`、`session.purge`不可领取，自动物理清理与全域completion继续关闭。0051真实MySQL历史夹具已纳入required wrapper与CI，完整结果以[进度记录](docs/PROGRESS.md)最新一节为准。
 
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
@@ -53,6 +55,8 @@ unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID \
   TENANT_DATABASE_PURGE_WORKER_ENABLED TENANT_REDIS_PURGE_WORKER_ENABLED \
   TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED \
   TENANT_PURGE_EXECUTION_ENABLED TENANT_DATABASE_PURGE_ENABLED TENANT_REDIS_PURGE_ENABLED \
+  SESSION_DELETE_GRACE_RECOVERY_ENABLED SESSION_DELETE_GRACE_RECOVERY_POLL_MS \
+  SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE \
   CREDENTIAL_TARGET_EXECUTION_ADAPTER TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED \
   TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED \
   RESTORE_RUN_ID RESTORE_FLEET_STOPPED_ACK SOURCE_BACKUP_SHA256 RESTORE_REPLAY_PAGE_SIZE \
@@ -72,7 +76,7 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0042 → 0044 → 0049 → 0050 的真实 MySQL 历史升级夹具（0043/0045～0048 code-only）
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0042 → 0044 → 0049 → 0050 → 0051 的真实 MySQL 历史升级夹具（0043/0045～0048 code-only）
 # 以下单独列出的 S3 套件需先配置各自的 S3_TEST_* 测试环境；本地优先用 verify-s3 自动准备 MinIO 与 bucket。
 pnpm test:tenant-telemetry-lifecycle          # 0032/0033 content-free evidence helper
 pnpm test:tenant-telemetry-lifecycle-memory   # 0033 Memory activation/coverage/inventory原子语义
@@ -92,6 +96,8 @@ pnpm test:tenant-telemetry-disposition-journal-v3-observer # 0048 GET-only v3 se
 pnpm test:tenant-telemetry-artifact-observer # 0046 GET-only artifact观察器unit套件
 pnpm test:session-delete-grace-memory         # 0050 ordinary DELETE来源/30天floor Memory原子与回滚套件
 pnpm test:session-delete-grace-mysql          # 0050真实InnoDB post-COMMIT seal、并发/回滚/隔离套件
+pnpm test:session-delete-grace-recovery-memory # 默认关闭的runner恢复caller轮询、停机与脱敏日志套件
+pnpm test:session-delete-grace-recovery-mysql  # 真实InnoDB未seal来源扫描/隔离与原子补seal套件
 pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
 pnpm test:blob-storage-control-memory         # 强制执行 0027 Memory write-once cutover/回滚/并发套件
 pnpm test:blob-storage-control-mysql          # 强制执行 0027 真实InnoDB inventory/回滚/并发套件

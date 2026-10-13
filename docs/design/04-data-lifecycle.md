@@ -223,7 +223,7 @@ turn 与 archive 竞态只允许两种结果：archive 先提交时 turn 不产�
 6. 普通 `commit` 永远拒绝 tombstoned session；任何 purge worker（包括T3e本地受限切片）都必须使用独立、最小权限的生命周期接口并可重入。
 7. 未来最终删除 session 行，或仅保留不含个人信息的最小 grave marker；任何情况下 ID 不复用。
 
-在保留期未确认前，安全默认是 `purge_after_ms = NULL` 且 purge worker 关闭。当前 dispatcher 仅领取立即可用的 `session.tombstoned` intent；`session.purge` intent 的 `available_at_ms = NULL`，不可领取。terminal event 完成投递也不等于已经执行任何物理清理。
+虽然普通 session DELETE 的保留宽限期现已确认为 30 天，自动物理清理仍未获启用；安全默认继续是 `purge_after_ms = NULL` 且 purge worker 关闭。`0050` 及其默认关闭的恢复 caller 只封存来源与保留 floor，`0051`只冻结已存在的来源/seal，不会排期或领取 purge。当前 dispatcher 仅领取立即可用的 `session.tombstoned` intent；`session.purge` intent 的 `available_at_ms = NULL`，不可领取。terminal event 完成投递也不等于已经执行任何物理清理。
 
 `0009` 对升级前已经 deleted 的行保留 `deletion_generation = 0` 且不伪造 outbox。`0014` 已增加默认休眠、可审计且幂等的补偿流程；它只有在v2 fleet barrier通过并单向激活cutover后，才把可证明安全的历史行推进到generation 1并原子补齐terminal event与两条intent。terminal incident或仍为generation `0` 的行都不是已完成清理，T3e及后续完整purge都必须继续拒绝它们。
 
@@ -371,9 +371,13 @@ T3d seal的owner closure还要求Memory export/user-erasure/tenant-admission req
 | user/tenant erasure 与 export SLA | 需产品/合规给出发起权限、二次验证和 SLA |
 | 审计、导出包和备份期限 | 分别配置，不复用内容保留期 |
 
-当前 session DELETE 仍把 `purge_after_ms` 保持为 `NULL`，`session.purge` 不可领取；30 天是已确认的后续实现参数，不是当前自动清理已启用。落地时仍须处理数据库时间、legal hold、canonical policy 与旧数据/滚动升级边界，并在激活执行前另行验收。
+当前 session DELETE 仍把 `purge_after_ms` 保持为 `NULL`，`session.purge` 不可领取；已确认的 30 天仅作为新普通 DELETE 来源的保守保留 floor 持久化，不是自动清理已启用。后续执行仍须重新核对数据库时间、legal hold、canonical policy、旧数据与滚动升级、其它数据域及恢复证据，并在激活前另行验收。
+
+`0051`只把已经写入的可信0050 origin/seal在MySQL层冻结：origin须随首次tombstone写入，BINARY owner身份、删除generation/time及event cursor一旦有origin就不可改；seal只可在旧行已有origin后写入且写成不可改。它不能证明来源真实、两次COMMIT或旧writer完整覆盖；无origin旧行仍unknown，T3f仍可删除整行。140-trigger相关集合的完整动作/marker由启动严格核对，迁移前须排空旧writer。`purge_after_ms=NULL`与物理清理默认关闭不变。
 
 ## 12. 验收矩阵
+
+`0044`之后另有真实MySQL `0044→0049→0050→0051` 历史升级夹具、三个冻结旧二进制升级后按当前完整marker链核对的夹具，以及普通DELETE来源/30天floor、0051 SQL write-once trigger与默认关闭恢复caller的Memory/MySQL测试；`0045`～`0048`没有DDL，其只读观察/非生产v3夹具另由真实MinIO套件验证。它们都不证明物理purge、telemetry真实grant或全域completion。实际最新测试数字与未通过项只以 [进度记录](../PROGRESS.md) 顶部和最后一节为准，下方较早矩阵描述不能覆盖它。
 
 当前还覆盖`0012`到`0016`的queue/quarantine/compensation/policy/evaluator语义、`0017`export request/job原子性、RR snapshot、真实core worker跨层发布、确定性制品、下载lease、TTL/撤销delete outbox与owner隔离，tenant T1/T2的admission/platform控制，`0019` T3a的DB-time queue、物理credential-store事务、receipt/cutover、回滚、response-loss重放和隔离，`0020` T3b的configured-fleet runtime fence、per-target/aggregate receipt、exact proof replay、并发lease、回滚和隔离，`0021` T3c的source/evidence clock rollback、分页结构receipt、contextCompaction/legacy approval兼容、关系topology swap、RR orphan/hold seal、阻塞INSERT跨lease全回滚、并发与隔离，以及`0022` T3d的固定33域、source/hold、全局owner closure与MySQL full-range phantom阻塞。`0023` T3e覆盖Memory/MySQL原子local cutover、usage去身份化、Blob/export exact outbox和physical ACK；`0024` T3f覆盖11域数据库projection原子清理、grave/create交错、rollback与exact replay；`0025` T3g覆盖Memory/MySQL ledger、真实Redis Lua同slot首次删除/existing-marker-only replay/writer防复活、gate-off marker ACK/seal、startup/periodic durable restore，以及cluster mixed-worker/mixed-namespace/active-fleet barrier；`0026`覆盖Memory/MySQL tracking cutover、writer CAS、永久slot/版本/双target、source/material/time tamper fail-closed、T3a inventory原子发布/回滚与terminal replay；`0027`覆盖共享S3同key envelope、条件PUT/CAS tombstone、write-once control和namespace guard；`0028`覆盖真实MySQL+MinIO离线prepare/copy/verify/cutover/abort/source-cleanup；`0029`覆盖Memory fake、真实MySQL materialize/lease/ACK/cutover/rollback；`0030`覆盖Memory/MySQL原子T1 publication、S3 create-only/CAS journal、runtime lineage、永久fence replay与恢复CLI；`0031`覆盖Memory/MySQL snapshot/catalog/source-binding/reservation/retention/eviction原子性、真实MinIO create-only immutable event chain + `If-Match` CAS authority head、event/head response-loss exact replay，以及`0030→0031`真实MySQL dormant历史升级。固定真实MySQL迁移fixtures从`0007`逐段升级到`0044`（`0043`无DDL），证明DDL中断/marker-loss可恢复、旧证据保持、migration不隐式执行、activation/freeze线性化与严格schema fingerprint；`0044`夹具为旧SQL形态，不等于冻结旧binary终态。以下矩阵中的真实provider/KMS执行、完整completion、物理backup生产和其它domain恢复仍是后续验收目标：
 
