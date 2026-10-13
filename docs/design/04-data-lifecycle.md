@@ -362,7 +362,7 @@ T3d seal的owner closure还要求Memory export/user-erasure/tenant-admission req
 
 | 决策 | 推荐默认值 |
 | --- | --- |
-| session DELETE grace/内容保留期 | 用户已确认按 30 天实现；自动执行默认关闭，启用前另行验收 |
+| session DELETE grace/内容保留期 | 用户已确认 30 天；`0050` 只封存 ordinary DELETE 的最低保留 floor，自动物理 purge 仍关闭，详见 [06-session-delete-grace.md](06-session-delete-grace.md) |
 | operational usage 保留期 | 至少覆盖账单争议窗口；具体期限由财务/合规给出 |
 | billing ledger 字段与期限 | 最小化字段，按财税义务确认 |
 | legal hold 与管理员恢复 | 支持 legal hold；普通用户不可恢复 DELETE |

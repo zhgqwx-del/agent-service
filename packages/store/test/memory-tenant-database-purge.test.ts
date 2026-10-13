@@ -1096,6 +1096,47 @@ describe("MemorySessionStore tenant database purge", () => {
     )).toEqual(closure);
   });
 
+  it("removes ordinary DELETE grace evidence with its canonical owner on T3f", async () => {
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW });
+    const tenantId = "tenant-database-ordinary-grace";
+    const target = installSession(store, tenantId, "ordinary-grace-user");
+    const source = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: async () => {
+        await target.install();
+        const atMs = 2_000;
+        await store.commitOrdinarySessionDelete({
+          sessionId: target.session.id, fence: 1,
+          lifecycle: { type: "tombstone", tenantId, userId: target.session.userId,
+            atMs, purgeAfterMs: null, deletionGeneration: 1,
+          },
+          events: [{ type: "session/deleted", sessionId: target.session.id,
+            emittedAtMs: atMs, deletionGeneration: 1 }],
+        });
+        await store.sealOrdinarySessionDeleteGrace(
+          tenantId, target.session.userId, target.session.id,
+        );
+        expect(await store.getOrdinarySessionDeleteGrace(
+          tenantId, target.session.userId, target.session.id,
+        )).toMatchObject({ state: "sealed", executionReady: false });
+      },
+    });
+    expect(await store.executeTenantDatabasePurge(source.authorization))
+      .toMatchObject({ localDatabasePurgeComplete: true, sessionContentDeleted: true });
+    expect(await store.getOrdinarySessionDeleteGrace(
+      tenantId, target.session.userId, target.session.id,
+    )).toBeNull();
+    await expect(store.sealOrdinarySessionDeleteGrace(
+      tenantId, target.session.userId, target.session.id,
+    )).resolves.toBeUndefined();
+    expect(await store.getOrdinarySessionDeleteGrace(
+      tenantId, target.session.userId, target.session.id,
+    )).toBeNull();
+    expect(store.sessions.has(target.session.id)).toBe(false);
+    expect(store.deleted.has(target.session.id)).toBe(false);
+    expect(await store.getTenantPurgeSessionGraveMarker(tenantId, target.session.id))
+      .toMatchObject({ sessionId: target.session.id, deletionGeneration: 1 });
+  });
+
   it("binds queued tenant/session telemetry jobs to live owners and T3f graves before deletion", async () => {
     const store = memoryStoreWithCredentialRolloutClock(
       { now: () => NOW }, { tenantTelemetryRefKey: TELEMETRY_REF_KEY },

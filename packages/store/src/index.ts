@@ -9,6 +9,7 @@ export * from "./erasure-usage.js";
 export * from "./legacy-tombstone.js";
 export * from "./usage-lifecycle.js";
 export * from "./retention-policy.js";
+export * from "./session-delete-grace.js";
 export * from "./erasure-purge-policy.js";
 export * from "./data-export.js";
 export * from "./tenant-credential-revocation.js";

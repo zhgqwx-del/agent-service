@@ -569,10 +569,18 @@ export interface SessionStore {
   getSession(tenantId: string, sessionId: string): Promise<Session | null>;
   /** Internal lifecycle lookup that also sees an owned tombstone; never expose directly over HTTP. */
   getSessionLifecycle(tenantId: string, userId: string, sessionId: string): Promise<SessionLifecycleRecord | null>;
+  /** Post-COMMIT, owner-scoped, exact replay of an ordinary DELETE grace seal. */
+  sealOrdinarySessionDeleteGrace(tenantId: string, userId: string, sessionId: string): Promise<void>;
+  /** Dormant bounded recovery primitive; no runtime caller or physical purge side effect. */
+  retryUnsealedOrdinarySessionDeleteGraceOrigins(limit: number): Promise<number>;
+  /** Diagnostic only; no state is ever returned as a purge permission. */
+  getOrdinarySessionDeleteGrace(tenantId: string, userId: string, sessionId: string): Promise<import("./session-delete-grace.js").OrdinarySessionDeleteGraceView | null>;
   listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }): Promise<Page<Session>>;
 
   /** The single fenced write path for anything that belongs to a session. */
   commit(batch: CommitBatch): Promise<CommitResult>;
+  /** Trusted ordinary API DELETE writer only; generic commit never accepts provenance input. */
+  commitOrdinarySessionDelete(batch: CommitBatch): Promise<CommitResult>;
 
   // ---- reads ----
   readEvents(sessionId: string, afterSeq: number, limit: number): Promise<PersistedEvent[]>;

@@ -626,6 +626,8 @@ verify() {
   MYSQL_MIGRATION_TEST_URL="${MYSQL_MIGRATION_TEST_URL:-${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}}" \
     pnpm run test:migrations
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:session-delete-grace-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-mysql
   pnpm run test:blob-storage-control-memory
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
@@ -659,6 +661,7 @@ verify() {
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-purge-execution-mysql
   pnpm run test:tenant-database-purge-memory
+  pnpm run test:session-delete-grace-memory
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-database-purge-mysql
   pnpm run test:tenant-redis-purge-memory

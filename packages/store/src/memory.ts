@@ -95,6 +95,14 @@ import {
   validateRetryLifecycleOutboxOptions,
 } from "./lifecycle-outbox.js";
 import {
+  assertNoCallerOrdinaryDeleteOrigin,
+  ordinarySessionDeleteGraceSeal,
+  ordinarySessionDeleteOriginSha256,
+  type OrdinarySessionDeleteGraceEvidence,
+  type OrdinarySessionDeleteGraceView,
+} from "./session-delete-grace.js";
+
+import {
   BLOB_STORAGE_FORMAT,
   BlobStateError,
   assertBlobBindingsMatch,
@@ -1154,6 +1162,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 
 /** In-memory store: reference semantics for tests. Single process only. */
 export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
+  private readonly ordinaryDeleteCommitBatches = new WeakSet<CommitBatch>();
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
   turns = new Map<string, Turn>();
@@ -1163,7 +1172,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   providers = new Map<string, MemoryProviderRecord>();
   apiKeys = new Map<string, { tenantId: string; keyId: string; scopes: ApiKeyScope[]; createdAtMs?: number; revokedAtMs?: number }>();
   idem = new Map<string, { value: IdempotencyReceiptValue | null; requestHash?: string; expiresAt: number }>();
-  deleted = new Map<string, { deletedAtMs: number; purgeAfterMs?: number; deletionGeneration: number }>();
+  deleted = new Map<string, {
+    deletedAtMs: number;
+    purgeAfterMs?: number;
+    deletionGeneration: number;
+    ordinaryDeleteGrace?: OrdinarySessionDeleteGraceEvidence;
+  }>();
   lifecycleOutbox = new Map<string, LifecycleOutboxRecord>();
   private nextLifecycleOutboxId = 1;
   blobManifests = new Map<string, BlobManifest>();
@@ -22746,6 +22760,114 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       deletionGeneration: tombstone?.deletionGeneration ?? 0,
     };
   }
+  private ordinaryDeleteGraceEvidence(
+    tenantId: string,
+    userId: string,
+    sessionId: string,
+  ): OrdinarySessionDeleteGraceEvidence | null {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.tenantId !== tenantId || session.userId !== userId) return null;
+    const tombstone = this.deleted.get(sessionId);
+    const evidence = tombstone?.ordinaryDeleteGrace;
+    if (!evidence) return null;
+    if (!tombstone || tombstone.purgeAfterMs !== undefined) throw new Error("ordinary DELETE source is invalid");
+    const lastEvent = this.events.get(sessionId)?.at(-1);
+    const tombstoned = this.lifecycleOutbox.get(this.lifecycleOutboxMapKey(
+      "session.tombstoned", sessionId, tombstone.deletionGeneration,
+    ));
+    const purge = this.lifecycleOutbox.get(this.lifecycleOutboxMapKey(
+      "session.purge", sessionId, tombstone.deletionGeneration,
+    ));
+    if (lastEvent?.type !== "session/deleted"
+      || lastEvent.deletionGeneration !== tombstone.deletionGeneration
+      || lastEvent.seq !== session.lastSeq
+      || tombstoned?.topic !== "session.tombstoned"
+      || tombstoned.aggregateId !== sessionId
+      || tombstoned.generation !== tombstone.deletionGeneration
+      || tombstoned.payload.sessionId !== sessionId
+      || tombstoned.payload.deletionGeneration !== tombstone.deletionGeneration
+      || tombstoned.payload.eventSeq !== lastEvent.seq
+      || purge?.topic !== "session.purge"
+      || purge.aggregateId !== sessionId
+      || purge.generation !== tombstone.deletionGeneration
+      || purge.payload.sessionId !== sessionId
+      || purge.payload.deletionGeneration !== tombstone.deletionGeneration
+      || purge.availableAtMs !== undefined
+      || purge.claimToken !== undefined
+      || purge.completedAtMs !== undefined
+      || purge.deadLetteredAtMs !== undefined) {
+      throw new Error("ordinary DELETE terminal source is invalid");
+    }
+    const expected = ordinarySessionDeleteOriginSha256({
+      tenantId, userId, sessionId,
+      deletionGeneration: tombstone.deletionGeneration,
+      deletedAtMs: tombstone.deletedAtMs,
+      eventSeq: lastEvent.seq,
+      observedDbMs: evidence.originObservedDbMs,
+    });
+    if (evidence.originSha256 !== expected) throw new Error("ordinary DELETE origin root is invalid");
+    return evidence;
+  }
+
+  async sealOrdinarySessionDeleteGrace(tenantId: string, userId: string, sessionId: string): Promise<void> {
+    const evidence = this.ordinaryDeleteGraceEvidence(tenantId, userId, sessionId);
+    if (!evidence) return;
+    if (evidence.sealObservedDbMs !== undefined) {
+      const exact = ordinarySessionDeleteGraceSeal(
+        evidence.originSha256, evidence.originObservedDbMs, evidence.sealObservedDbMs,
+      );
+      if (evidence.graceFloorDbMs !== exact.graceFloorDbMs
+        || evidence.sealSha256 !== exact.sealSha256) {
+        throw new Error("ordinary DELETE seal is invalid");
+      }
+      return;
+    }
+    const seal = ordinarySessionDeleteGraceSeal(
+      evidence.originSha256, evidence.originObservedDbMs, this.storeNowMs(),
+    );
+    // All validation completed before this single in-memory publication.
+    Object.assign(evidence, seal);
+  }
+
+  async retryUnsealedOrdinarySessionDeleteGraceOrigins(limit: number): Promise<number> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("ordinary DELETE recovery limit must be between 1 and 100");
+    }
+    const candidates = [...this.sessions.values()]
+      .filter((session) => {
+        const evidence = this.deleted.get(session.id)?.ordinaryDeleteGrace;
+        return evidence && evidence.sealObservedDbMs === undefined;
+      })
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .slice(0, limit);
+    for (const session of candidates) {
+      await this.sealOrdinarySessionDeleteGrace(session.tenantId, session.userId, session.id);
+    }
+    return candidates.length;
+  }
+
+  async getOrdinarySessionDeleteGrace(
+    tenantId: string, userId: string, sessionId: string,
+  ): Promise<OrdinarySessionDeleteGraceView | null> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.tenantId !== tenantId || session.userId !== userId) return null;
+    if (!this.deleted.has(sessionId)) return null;
+    const evidence = this.ordinaryDeleteGraceEvidence(tenantId, userId, sessionId);
+    if (!evidence || evidence.sealObservedDbMs === undefined) {
+      return { state: "unknown", executionReady: false, physicalPurgeEnabled: false };
+    }
+    const exact = ordinarySessionDeleteGraceSeal(
+      evidence.originSha256, evidence.originObservedDbMs, evidence.sealObservedDbMs,
+    );
+    if (evidence.graceFloorDbMs !== exact.graceFloorDbMs
+      || evidence.sealSha256 !== exact.sealSha256) {
+      throw new Error("ordinary DELETE seal is invalid");
+    }
+    return {
+      state: "sealed", graceFloorDbMs: exact.graceFloorDbMs,
+      executionReady: false, physicalPurgeEnabled: false,
+    };
+  }
   async listSessions(tenantId: string, opts: { userId?: string; cursor?: string; limit: number; includeArchived?: boolean }) {
     const rows = [...this.sessions.values()].filter(
       (s) => s.tenantId === tenantId && this.isSessionVisible(s.id) && (!opts.userId || s.userId === opts.userId) && (opts.includeArchived || !s.archivedAtMs),
@@ -24420,7 +24542,24 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return clone(manifest);
   }
 
+  async commitOrdinarySessionDelete(batch: CommitBatch): Promise<CommitResult> {
+    assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
+    if (batch.lifecycle?.type !== "tombstone" || batch.lifecycle.purgeAfterMs != null) {
+      throw new Error("ordinary DELETE requires an unscheduled tombstone");
+    }
+    assertTombstoneEvent(batch);
+    const marked = { ...batch };
+    this.ordinaryDeleteCommitBatches.add(marked);
+    try {
+      return await this.commit(marked);
+    } finally {
+      this.ordinaryDeleteCommitBatches.delete(marked);
+    }
+  }
+
   async commit(batch: CommitBatch): Promise<CommitResult> {
+    assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
+    const ordinaryDeleteGraceOrigin = this.ordinaryDeleteCommitBatches.has(batch);
     assertPureFenceClaim(batch);
     assertTombstoneEvent(batch);
     assertCommitResourceOwnership(batch);
@@ -24448,7 +24587,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new SessionVersionError(batch.sessionId, batch.expectedLastSeq, s.lastSeq);
     }
 
-    let stagedTombstone: { deletedAtMs: number; purgeAfterMs?: number; deletionGeneration: number } | undefined;
+    let stagedTombstone: {
+      deletedAtMs: number;
+      purgeAfterMs?: number;
+      deletionGeneration: number;
+      ordinaryDeleteGrace?: OrdinarySessionDeleteGraceEvidence;
+    } | undefined;
     if (batch.lifecycle?.type === "tombstone") {
       const transition = batch.lifecycle;
       const currentGeneration = this.deleted.get(batch.sessionId)?.deletionGeneration ?? 0;
@@ -24640,6 +24784,24 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           throw new Error("lifecycle outbox identity already exists");
         }
         stagedOutboxes.push([key, outbox]);
+      }
+      if (ordinaryDeleteGraceOrigin) {
+        if (stagedLifecycle.purgeAfterMs != null) {
+          throw new Error("ordinary DELETE grace cannot schedule physical purge");
+        }
+        const observedDbMs = this.storeNowMs();
+        stagedTombstone!.ordinaryDeleteGrace = {
+          originObservedDbMs: observedDbMs,
+          originSha256: ordinarySessionDeleteOriginSha256({
+            tenantId: s.tenantId,
+            userId: s.userId,
+            sessionId: s.id,
+            deletionGeneration: stagedLifecycle.deletionGeneration,
+            deletedAtMs: stagedLifecycle.atMs,
+            eventSeq: deletedEvent.seq,
+            observedDbMs,
+          }),
+        };
       }
     }
 

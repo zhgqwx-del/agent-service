@@ -68,6 +68,22 @@ function telemetryDigest(label: string): string {
   return createHash("sha256").update(label).digest("hex");
 }
 
+async function completeOrdinaryTombstoneOutbox(
+  store: MysqlSessionStore, sessionId: string,
+): Promise<void> {
+  const outbox = await store.getLifecycleOutbox("session.tombstoned", sessionId, 1);
+  if (!outbox) throw new Error("ordinary tombstone outbox is missing");
+  const nowMs = Math.max(Date.now(), outbox.availableAtMs ?? 0) + 1;
+  const claimToken = `ordinary-t3f-${randomUUID()}`;
+  const claimed = await store.claimLifecycleOutbox({
+    topics: ["session.tombstoned"], nowMs, limit: 100, leaseMs: 60_000, claimToken,
+  });
+  const exact = claimed.find((candidate) => candidate.outboxId === outbox.outboxId);
+  if (!exact || !await store.completeLifecycleOutbox(exact.outboxId, claimToken, nowMs)) {
+    throw new Error("ordinary tombstone outbox could not be completed");
+  }
+}
+
 async function activateTelemetryForT3f(store: MysqlSessionStore): Promise<void> {
   await store.activateTenantTelemetryLifecycle({
     expectedControlGeneration: 0,
@@ -1037,6 +1053,54 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
+    it("removes a sealed ordinary DELETE origin with its canonical session in T3f", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-grace-t3f-${randomUUID()}`;
+      const userId = `user-grace-t3f-${randomUUID()}`;
+      let ordinarySessionId = "";
+      try {
+        const source = await advanceToDatabasePurgeClaim(store, conn, tenantId, userId, {
+          beforeTenantErasure: async (sessionId) => {
+            ordinarySessionId = sessionId;
+            const atMs = Date.now();
+            await store.commitOrdinarySessionDelete({
+              sessionId, fence: 1,
+              lifecycle: { type: "tombstone", tenantId, userId, atMs,
+                purgeAfterMs: null, deletionGeneration: 1,
+              },
+              events: [{ type: "session/deleted", sessionId,
+                emittedAtMs: atMs, deletionGeneration: 1 }],
+            });
+            await store.sealOrdinarySessionDeleteGrace(tenantId, userId, sessionId);
+            await completeOrdinaryTombstoneOutbox(store, sessionId);
+            expect(await store.getOrdinarySessionDeleteGrace(tenantId, userId, sessionId))
+              .toMatchObject({ state: "sealed", executionReady: false });
+          },
+        });
+        expect(await store.executeTenantDatabasePurge(source.authorization)).toMatchObject({
+          localDatabasePurgeComplete: true, sessionContentDeleted: true,
+          allDomainsComplete: false, contentPurgeExecuted: false,
+        });
+        expect(await store.getOrdinarySessionDeleteGrace(tenantId, userId, ordinarySessionId))
+          .toBeNull();
+        await expect(store.sealOrdinarySessionDeleteGrace(tenantId, userId, ordinarySessionId))
+          .resolves.toBeUndefined();
+        expect(await store.getOrdinarySessionDeleteGrace(tenantId, userId, ordinarySessionId))
+          .toBeNull();
+        const [rows] = await conn.query<RowDataPacket[]>(
+          "SELECT COUNT(*) AS n FROM sessions WHERE tenant_id=? OR session_id=?",
+          [tenantId, ordinarySessionId],
+        );
+        expect(Number(rows[0]?.n)).toBe(0);
+        expect(await store.getTenantPurgeSessionGraveMarker(tenantId, ordinarySessionId))
+          .toMatchObject({ sessionId: ordinarySessionId, deletionGeneration: 1 });
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
     it("captures every telemetry phase from canonical tenant, user and session owners before T3f delete", async () => {
       const store = await MysqlSessionStore.connect({
         url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
@@ -1842,12 +1906,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8 });
       const conn = await mysql.createConnection(mysqlUrl);
       const tenantId = `tenant-database-rollback-${randomUUID()}`;
+      const userId = `rollback-user-${randomUUID()}`;
+      let ordinarySessionId = "";
       try {
         const source = await advanceToDatabasePurgeClaim(
           store,
           conn,
           tenantId,
-          `rollback-user-${randomUUID()}`,
+          userId,
+          {
+            beforeTenantErasure: async (sessionId) => {
+              ordinarySessionId = sessionId;
+              const atMs = Date.now();
+              await store.commitOrdinarySessionDelete({
+                sessionId, fence: 1,
+                lifecycle: { type: "tombstone", tenantId, userId, atMs,
+                  purgeAfterMs: null, deletionGeneration: 1 },
+                events: [{ type: "session/deleted", sessionId,
+                  emittedAtMs: atMs, deletionGeneration: 1 }],
+              });
+              await store.sealOrdinarySessionDeleteGrace(tenantId, userId, sessionId);
+              await completeOrdinaryTombstoneOutbox(store, sessionId);
+            },
+          },
         );
         const internal = store as unknown as {
           deleteTenantDatabasePurgeTargets: (...args: unknown[]) => Promise<void>;
@@ -1887,6 +1968,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
           graves: 0,
           phase: "queued",
         });
+        expect(await store.getOrdinarySessionDeleteGrace(tenantId, userId, ordinarySessionId))
+          .toMatchObject({ state: "sealed", executionReady: false });
       } finally {
         await conn.end();
         await store.close();

@@ -98,6 +98,12 @@ import {
   validateRetryLifecycleOutboxOptions,
 } from "../lifecycle-outbox.js";
 import {
+  assertNoCallerOrdinaryDeleteOrigin,
+  ordinarySessionDeleteGraceSeal,
+  ordinarySessionDeleteOriginSha256,
+  type OrdinarySessionDeleteGraceView,
+} from "../session-delete-grace.js";
+import {
   UsageIdentityConflictError,
   UsageLifecycleGenerationError,
   UsageReconciliationError,
@@ -943,6 +949,8 @@ const TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-plan-artifact-target";
 const TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME =
   "0044_tenant_telemetry_pregrant_intent.sql";
+const ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME =
+  "0050_ordinary_session_delete_grace.sql";
 const TENANT_TELEMETRY_PREGRANT_INTENT_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-pregrant-intent";
 const TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME =
@@ -8380,6 +8388,8 @@ export class MysqlSessionStore implements
   private tenantTelemetryTargetManifestSchemaInstalled = false;
   private tenantTelemetryPlanArtifactTargetSchemaInstalled = false;
   private tenantTelemetryPregrantIntentSchemaInstalled = false;
+  private ordinarySessionDeleteGraceSchemaInstalled = false;
+  private readonly ordinaryDeleteCommitBatches = new WeakSet<CommitBatch>();
 
   private constructor(
     private readonly pool: Pool,
@@ -9233,6 +9243,54 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertOrdinarySessionDeleteGraceFingerprint(
+    conn: PoolConnection,
+  ): Promise<void> {
+    const names = [
+      "ordinary_delete_origin_sha256",
+      "ordinary_delete_origin_observed_db_ms",
+      "ordinary_delete_seal_observed_db_ms",
+      "ordinary_delete_grace_floor_db_ms",
+      "ordinary_delete_seal_sha256",
+    ] as const;
+    const [rows] = await conn.query<Row[]>(
+      `SELECT column_name AS column_name,column_type AS column_type,
+              is_nullable AS is_nullable,column_default AS column_default,
+              character_set_name AS character_set_name,collation_name AS collation_name
+         FROM information_schema.columns
+         WHERE table_schema=DATABASE() AND table_name='sessions'
+           AND column_name IN (${names.map(() => "?").join(",")})`,
+      [...names],
+    );
+    if (rows.length !== names.length) throw new Error("0050 ordinary DELETE grace columns are missing");
+    for (const name of names) {
+      const row = rows.find((candidate) => candidate.column_name === name);
+      const hash = name.endsWith("sha256");
+      if (!row || String(row.column_type) !== (hash ? "char(64)" : "bigint")
+        || row.is_nullable !== "YES" || row.column_default != null
+        || (hash && (row.character_set_name !== "ascii" || row.collation_name !== "ascii_bin"))
+        || (!hash && (row.character_set_name != null || row.collation_name != null))) {
+        throw new Error(`0050 ordinary DELETE grace column fingerprint is invalid: ${name}`);
+      }
+    }
+    const [checks] = await conn.query<Row[]>(
+      `SELECT tc.enforced AS enforced,
+              SHA2(LOWER(REPLACE(REPLACE(REGEXP_REPLACE(cc.check_clause,
+                '[[:space:]]',''),CHAR(96),''),'_utf8mb4','')),256) AS clause_sha256
+         FROM information_schema.table_constraints tc
+         JOIN information_schema.check_constraints cc
+           ON cc.constraint_schema=tc.constraint_schema
+          AND cc.constraint_name=tc.constraint_name
+        WHERE tc.table_schema=DATABASE() AND tc.table_name='sessions'
+          AND tc.constraint_name='chk_sessions_ordinary_delete_grace_shape'
+          AND tc.constraint_type='CHECK'`,
+    );
+    if (checks.length !== 1 || checks[0]?.enforced !== "YES"
+      || checks[0]?.clause_sha256 !== "3fd5936f0ac9f5bd887d82bfac75f28e10120a3e40a10c60d47d0f9983904ba1") {
+      throw new Error("0050 ordinary DELETE grace CHECK fingerprint is invalid");
+    }
+  }
+
   private async reconcileLegacyTenantTelemetryLifecycleSubjects(
     conn: PoolConnection,
     acknowledgements: NonNullable<
@@ -9892,6 +9950,10 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)) {
         throw new Error("0049 capture v2 marker is missing its 0044 predecessor");
       }
+      if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
+        throw new Error("0050 ordinary DELETE grace marker is missing its 0049 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -9965,6 +10027,9 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
         await this.assertTenantTelemetryCaptureV2Fingerprint(conn, migrationsDir);
       }
+      if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
+        await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
+      }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
       );
@@ -10003,6 +10068,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryPregrantIntentSchemaInstalled = done.has(
         TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME,
+      );
+      this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
+        ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
       if (!skipTelemetryRuntimeAudit) {
         await this.assertTenantTelemetryRuntimeConfiguration(conn);
@@ -10066,6 +10134,10 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)) {
         throw new Error("0049 capture v2 marker is missing its 0044 predecessor");
       }
+      if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
+        throw new Error("0050 ordinary DELETE grace marker is missing its 0049 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
         if (f === TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME) {
@@ -10086,6 +10158,30 @@ export class MysqlSessionStore implements
             );
           }
           await this.assertTenantTelemetryPregrantIntentFingerprint(conn, dir);
+        }
+        if (f === ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME) {
+          if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
+            await this.assertTenantTelemetryCaptureV2Fingerprint(conn, dir);
+          } else {
+            await this.assertTenantTelemetryPregrantIntentFingerprint(conn, dir);
+          }
+          const [columns] = await conn.query<Row[]>(
+            `SELECT column_name AS column_name FROM information_schema.columns WHERE table_schema=DATABASE()
+               AND table_name='sessions' AND column_name IN
+               ('ordinary_delete_origin_sha256','ordinary_delete_origin_observed_db_ms',
+                'ordinary_delete_seal_observed_db_ms','ordinary_delete_grace_floor_db_ms',
+                'ordinary_delete_seal_sha256')`,
+          );
+          for (const column of columns) {
+            const name = String(column.column_name);
+            if (!/^[a-z0-9_]+$/.test(name)) throw new Error("unexpected 0050 column");
+            const [counts] = await conn.query<Row[]>(
+              `SELECT COUNT(*) AS n FROM sessions WHERE ${name} IS NOT NULL`,
+            );
+            if (storedSafeInteger(counts[0]?.n, "markerless 0050 evidence count") !== 0) {
+              throw new Error("0050 marker-loss replay with durable ordinary DELETE evidence is forbidden");
+            }
+          }
         }
         if (f === TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME) {
           const [rows] = await conn.query<Row[]>(
@@ -10404,6 +10500,9 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
         await this.assertTenantTelemetryCaptureV2Fingerprint(conn, dir);
       }
+      if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
+        await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
+      }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
       );
@@ -10442,6 +10541,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryPregrantIntentSchemaInstalled = done.has(
         TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME,
+      );
+      this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
+        ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
       await this.assertTenantTelemetryRuntimeConfiguration(conn);
     } finally {
@@ -35611,6 +35713,193 @@ export class MysqlSessionStore implements
     });
   }
 
+  private async readOrdinarySessionDeleteGrace(
+    conn: PoolConnection,
+    tenantId: string,
+    userId: string,
+    sessionId: string,
+    lock: boolean,
+  ): Promise<{ originSha256: string; originObservedDbMs: number; sealObservedDbMs?: number;
+    graceFloorDbMs?: number; sealSha256?: string } | null> {
+    const [sessions] = await conn.query<Row[]>(
+      `SELECT tenant_id,user_id,session_id,last_seq,deleted_at_ms,purge_after_ms,
+              deletion_generation,ordinary_delete_origin_sha256,
+              ordinary_delete_origin_observed_db_ms,ordinary_delete_seal_observed_db_ms,
+              ordinary_delete_grace_floor_db_ms,ordinary_delete_seal_sha256
+         FROM sessions WHERE session_id=? AND tenant_id=? AND user_id=?
+         ${lock ? "FOR UPDATE" : ""}`,
+      [sessionId, tenantId, userId],
+    );
+    const row = sessions[0];
+    if (!row) return null;
+    if (row.ordinary_delete_origin_sha256 == null) {
+      if (row.ordinary_delete_origin_observed_db_ms != null
+        || row.ordinary_delete_seal_observed_db_ms != null
+        || row.ordinary_delete_grace_floor_db_ms != null
+        || row.ordinary_delete_seal_sha256 != null) {
+        throw new Error("ordinary DELETE grace columns are partially populated");
+      }
+      return null;
+    }
+    if (row.deleted_at_ms == null || row.purge_after_ms != null) {
+      throw new Error("ordinary DELETE tombstone state is invalid");
+    }
+    const generation = storedSafeInteger(row.deletion_generation, "ordinary DELETE generation", 1);
+    const eventSeq = storedSafeInteger(row.last_seq, "ordinary DELETE event sequence", 1);
+    const deletedAtMs = storedSafeInteger(row.deleted_at_ms, "ordinary DELETE timestamp");
+    const originObservedDbMs = storedSafeInteger(
+      row.ordinary_delete_origin_observed_db_ms, "ordinary DELETE origin database time",
+    );
+    const [events] = await conn.query<Row[]>(
+      `SELECT seq,type,body FROM events WHERE session_id=? AND seq=? ${lock ? "FOR SHARE" : ""}`,
+      [sessionId, eventSeq],
+    );
+    const eventRow = events[0];
+    const event = eventRow ? parse<PersistedEvent>(eventRow.body) : null;
+    if (events.length !== 1 || eventRow?.type !== "session/deleted"
+      || event?.type !== "session/deleted" || event.sessionId !== sessionId
+      || event.seq !== eventSeq || event.deletionGeneration !== generation) {
+      throw new Error("ordinary DELETE terminal event is invalid");
+    }
+    const [outboxes] = await conn.query<Row[]>(
+      `SELECT topic,aggregate_id,generation,payload,available_at_ms,claim_token,
+              completed_at_ms,dead_lettered_at_ms
+         FROM lifecycle_outbox WHERE aggregate_id=? AND generation=?
+           AND topic IN ('session.tombstoned','session.purge') ORDER BY topic
+         ${lock ? "FOR SHARE" : ""}`,
+      [sessionId, generation],
+    );
+    const tombstoned = outboxes.find((candidate) => candidate.topic === "session.tombstoned");
+    const purge = outboxes.find((candidate) => candidate.topic === "session.purge");
+    const tombstonedPayload = tombstoned ? parse<Record<string, unknown>>(tombstoned.payload) : null;
+    const purgePayload = purge ? parse<Record<string, unknown>>(purge.payload) : null;
+    if (outboxes.length !== 2
+      || tombstoned?.aggregate_id !== sessionId
+      || storedSafeInteger(tombstoned.generation, "ordinary DELETE tombstoned generation") !== generation
+      || tombstonedPayload?.sessionId !== sessionId
+      || tombstonedPayload.deletionGeneration !== generation
+      || tombstonedPayload.eventSeq !== eventSeq
+      || purge?.aggregate_id !== sessionId
+      || storedSafeInteger(purge.generation, "ordinary DELETE purge generation") !== generation
+      || purgePayload?.sessionId !== sessionId
+      || purgePayload.deletionGeneration !== generation
+      || purge.available_at_ms != null || purge.claim_token != null
+      || purge.completed_at_ms != null || purge.dead_lettered_at_ms != null) {
+      throw new Error("ordinary DELETE outbox identity is invalid");
+    }
+    const originSha256 = ordinarySessionDeleteOriginSha256({
+      tenantId, userId, sessionId, deletionGeneration: generation,
+      deletedAtMs, eventSeq, observedDbMs: originObservedDbMs,
+    });
+    if (row.ordinary_delete_origin_sha256 !== originSha256) {
+      throw new Error("ordinary DELETE origin root is invalid");
+    }
+    const sealed = row.ordinary_delete_seal_observed_db_ms != null;
+    if (!sealed && (row.ordinary_delete_grace_floor_db_ms != null
+      || row.ordinary_delete_seal_sha256 != null)) {
+      throw new Error("ordinary DELETE seal is partially populated");
+    }
+    if (!sealed) return { originSha256, originObservedDbMs };
+    const sealObservedDbMs = storedSafeInteger(
+      row.ordinary_delete_seal_observed_db_ms, "ordinary DELETE seal database time",
+    );
+    const expectedSeal = ordinarySessionDeleteGraceSeal(
+      originSha256, originObservedDbMs, sealObservedDbMs,
+    );
+    if (storedSafeInteger(row.ordinary_delete_grace_floor_db_ms,
+      "ordinary DELETE grace floor") !== expectedSeal.graceFloorDbMs
+      || row.ordinary_delete_seal_sha256 !== expectedSeal.sealSha256) {
+      throw new Error("ordinary DELETE seal root is invalid");
+    }
+    return { originSha256, originObservedDbMs, ...expectedSeal };
+  }
+
+  async sealOrdinarySessionDeleteGrace(
+    tenantId: string, userId: string, sessionId: string,
+  ): Promise<void> {
+    if (!this.ordinarySessionDeleteGraceSchemaInstalled) return;
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.beginTransaction();
+      const evidence = await this.readOrdinarySessionDeleteGrace(conn, tenantId, userId, sessionId, true);
+      if (!evidence || evidence.sealObservedDbMs !== undefined) {
+        await conn.commit();
+        return;
+      }
+      // This statement begins after the first tombstone transaction committed and after every
+      // source row lock was obtained. The helper rounds the floored millisecond up by one.
+      const seal = ordinarySessionDeleteGraceSeal(
+        evidence.originSha256, evidence.originObservedDbMs, await this.databaseNow(conn),
+      );
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE sessions SET ordinary_delete_seal_observed_db_ms=?,
+             ordinary_delete_grace_floor_db_ms=?,ordinary_delete_seal_sha256=?
+           WHERE session_id=? AND tenant_id=? AND user_id=?
+             AND ordinary_delete_origin_sha256=?
+             AND ordinary_delete_seal_observed_db_ms IS NULL`,
+        [seal.sealObservedDbMs, seal.graceFloorDbMs, seal.sealSha256,
+          sessionId, tenantId, userId, evidence.originSha256],
+      );
+      if (updated.affectedRows !== 1) throw new Error("ordinary DELETE seal lost its source");
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
+  async retryUnsealedOrdinarySessionDeleteGraceOrigins(limit: number): Promise<number> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("ordinary DELETE recovery limit must be between 1 and 100");
+    }
+    if (!this.ordinarySessionDeleteGraceSchemaInstalled) return 0;
+    const [rows] = await this.pool.query<Row[]>(
+      `SELECT tenant_id,user_id,session_id FROM sessions
+         WHERE ordinary_delete_origin_sha256 IS NOT NULL
+           AND ordinary_delete_seal_observed_db_ms IS NULL
+         ORDER BY session_id LIMIT ?`,
+      [limit],
+    );
+    for (const row of rows) {
+      await this.sealOrdinarySessionDeleteGrace(
+        String(row.tenant_id), String(row.user_id), String(row.session_id),
+      );
+    }
+    return rows.length;
+  }
+
+  async getOrdinarySessionDeleteGrace(
+    tenantId: string, userId: string, sessionId: string,
+  ): Promise<OrdinarySessionDeleteGraceView | null> {
+    return this.withConsistentRead(async (conn) => {
+      if (!this.ordinarySessionDeleteGraceSchemaInstalled) {
+        const [rows] = await conn.query<Row[]>(
+          "SELECT session_id FROM sessions WHERE session_id=? AND tenant_id=? AND user_id=? AND deleted_at_ms IS NOT NULL",
+          [sessionId, tenantId, userId],
+        );
+        return rows.length ? { state: "unknown", executionReady: false, physicalPurgeEnabled: false } : null;
+      }
+      const evidence = await this.readOrdinarySessionDeleteGrace(conn, tenantId, userId, sessionId, false);
+      if (!evidence) {
+        const [rows] = await conn.query<Row[]>(
+          "SELECT session_id FROM sessions WHERE session_id=? AND tenant_id=? AND user_id=? AND deleted_at_ms IS NOT NULL",
+          [sessionId, tenantId, userId],
+        );
+        return rows.length ? { state: "unknown", executionReady: false, physicalPurgeEnabled: false } : null;
+      }
+      if (evidence.graceFloorDbMs === undefined) {
+        return { state: "unknown", executionReady: false, physicalPurgeEnabled: false };
+      }
+      return {
+        state: "sealed", graceFloorDbMs: evidence.graceFloorDbMs,
+        executionReady: false, physicalPurgeEnabled: false,
+      };
+    });
+  }
+
   private async lockErasureResolution(
     conn: PoolConnection,
     sessionId: string,
@@ -40963,7 +41252,24 @@ export class MysqlSessionStore implements
   }
 
   // ---------- fenced commit ----------
+  async commitOrdinarySessionDelete(batch: CommitBatch): Promise<CommitResult> {
+    assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
+    if (batch.lifecycle?.type !== "tombstone" || batch.lifecycle.purgeAfterMs != null) {
+      throw new Error("ordinary DELETE requires an unscheduled tombstone");
+    }
+    assertTombstoneEvent(batch);
+    const marked = { ...batch };
+    this.ordinaryDeleteCommitBatches.add(marked);
+    try {
+      return await this.commit(marked);
+    } finally {
+      this.ordinaryDeleteCommitBatches.delete(marked);
+    }
+  }
+
   async commit(batch: CommitBatch): Promise<CommitResult> {
+    assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
+    const ordinaryDeleteGraceOrigin = this.ordinaryDeleteCommitBatches.has(batch);
     assertPureFenceClaim(batch);
     assertTombstoneEvent(batch);
     assertCommitResourceOwnership(batch);
@@ -41022,6 +41328,14 @@ export class MysqlSessionStore implements
           [batch.sessionId],
         );
         if (children.length) throw new SessionHasChildrenError(batch.sessionId);
+        if (ordinaryDeleteGraceOrigin
+          && !this.ordinarySessionDeleteGraceSchemaInstalled) {
+          throw new Error("ordinary DELETE grace schema is not installed");
+        }
+        if (ordinaryDeleteGraceOrigin
+          && batch.lifecycle.purgeAfterMs != null) {
+          throw new Error("ordinary DELETE grace cannot schedule physical purge");
+        }
       }
 
       // A completed idempotency receipt and the first turn write share this transaction. There is no
@@ -41269,6 +41583,7 @@ export class MysqlSessionStore implements
 
       const sets = ["last_seq=?", "fence_token=?", "updated_at_ms=?"];
       const params: unknown[] = [seq, batch.fence, Date.now()];
+      let expectedOrdinaryOrigin: { sha256: string; observedDbMs: number } | undefined;
       const p = sessionPatch;
       if (p) {
         if (p.status !== undefined) { sets.push("status=?"); params.push(json(p.status)); }
@@ -41283,13 +41598,46 @@ export class MysqlSessionStore implements
         if (batch.lifecycle.type === "tombstone") {
           sets.push("deleted_at_ms=?", "purge_after_ms=?", "deletion_generation=?");
           params.push(batch.lifecycle.atMs, batch.lifecycle.purgeAfterMs ?? null, batch.lifecycle.deletionGeneration);
+          if (ordinaryDeleteGraceOrigin) {
+            const deletedEvent = events.at(-1);
+            if (deletedEvent?.type !== "session/deleted") {
+              throw new Error("ordinary DELETE terminal event is missing");
+            }
+            const observedDbMs = await this.databaseNow(conn);
+            const originSha256 = ordinarySessionDeleteOriginSha256({
+              tenantId, userId, sessionId: batch.sessionId,
+              deletionGeneration: batch.lifecycle.deletionGeneration,
+              deletedAtMs: batch.lifecycle.atMs,
+              eventSeq: deletedEvent.seq,
+              observedDbMs,
+            });
+            sets.push("ordinary_delete_origin_sha256=?", "ordinary_delete_origin_observed_db_ms=?");
+            params.push(originSha256, observedDbMs);
+            expectedOrdinaryOrigin = { sha256: originSha256, observedDbMs };
+          }
         } else {
           sets.push("archived_at_ms=?");
           params.push(batch.lifecycle.type === "archive" ? batch.lifecycle.atMs : null);
         }
       }
       params.push(batch.sessionId);
-      await conn.query(`UPDATE sessions SET ${sets.join(", ")} WHERE session_id=?`, params);
+      const [updatedSession] = await conn.query<mysql.ResultSetHeader>(
+        `UPDATE sessions SET ${sets.join(", ")} WHERE session_id=?`, params,
+      );
+      if (expectedOrdinaryOrigin) {
+        if (updatedSession.affectedRows !== 1) throw new SessionGoneError(batch.sessionId);
+        const [originRows] = await conn.query<Row[]>(
+          `SELECT ordinary_delete_origin_sha256,ordinary_delete_origin_observed_db_ms
+             FROM sessions WHERE session_id=? FOR UPDATE`,
+          [batch.sessionId],
+        );
+        if (originRows.length !== 1
+          || originRows[0]?.ordinary_delete_origin_sha256 !== expectedOrdinaryOrigin.sha256
+          || storedSafeInteger(originRows[0]?.ordinary_delete_origin_observed_db_ms,
+            "ordinary DELETE committed source database time") !== expectedOrdinaryOrigin.observedDbMs) {
+          throw new Error("ordinary DELETE origin was not published with its tombstone");
+        }
+      }
       await conn.commit();
       backfillAssignedSequences(batch, { items, turn, events });
       return {

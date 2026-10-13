@@ -529,6 +529,9 @@ describe("SessionHost", () => {
       session: { archivedAtMs: expect.any(Number), autoApprovedTools: [] },
     });
     expect(await h.store.getSession(principal.tenantId, h.session.id)).toBeNull();
+    expect(await h.store.getOrdinarySessionDeleteGrace(
+      principal.tenantId, principal.userId!, h.session.id,
+    )).toMatchObject({ state: "sealed", executionReady: false, physicalPurgeEnabled: false });
     expect(h.events.at(-1)).toMatchObject({
       type: "session/deleted",
       sessionId: h.session.id,
@@ -551,6 +554,32 @@ describe("SessionHost", () => {
     await expect(h.host.getSession(principal, h.session.id)).rejects.toMatchObject({ code: "not_found" });
     await expect(h.host.archiveSession(principal, h.session.id)).rejects.toMatchObject({ code: "not_found" });
     await expect(h.host.unarchiveSession(principal, h.session.id)).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  it("recovers a committed ordinary origin after a lost post-COMMIT seal response", async () => {
+    const h = await setup([]);
+    const exactSeal = h.store.sealOrdinarySessionDeleteGrace.bind(h.store);
+    let failOnce = true;
+    h.store.sealOrdinarySessionDeleteGrace = async (...args) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("injected post-commit seal failure");
+      }
+      await exactSeal(...args);
+    };
+    await expect(h.host.deleteSession(principal, h.session.id)).rejects.toThrow();
+    expect(await h.store.getOrdinarySessionDeleteGrace(
+      principal.tenantId, principal.userId!, h.session.id,
+    )).toMatchObject({ state: "unknown", executionReady: false });
+    expect((await h.store.readEvents(h.session.id, 0, 100))
+      .filter((event) => event.type === "session/deleted")).toHaveLength(1);
+    expect(h.events.filter((event) => event.type === "session/deleted")).toHaveLength(1);
+    await expect(h.host.deleteSession(principal, h.session.id)).resolves.toBeUndefined();
+    expect(await h.store.getOrdinarySessionDeleteGrace(
+      principal.tenantId, principal.userId!, h.session.id,
+    )).toMatchObject({ state: "sealed", executionReady: false });
+    expect((await h.store.readEvents(h.session.id, 0, 100))
+      .filter((event) => event.type === "session/deleted")).toHaveLength(1);
   });
 
   it("returns busy when DELETE races a locally active turn, then succeeds after interrupt", async () => {

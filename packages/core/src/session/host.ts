@@ -849,7 +849,10 @@ export class SessionHost {
     if (!lifecycle) throw new ApiError("not_found", "session not found");
     // A tombstone is idempotent for its owner during the retention window. Do not acquire a new
     // lease or append another event/outbox row for a retry whose 204 response was lost.
-    if (lifecycle.deletedAtMs !== undefined) return;
+    if (lifecycle.deletedAtMs !== undefined) {
+      await this.deps.store.sealOrdinarySessionDeleteGrace(principal.tenantId, principal.userId, sessionId);
+      return;
+    }
 
     let session = lifecycle.session;
     if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot delete while a turn is active");
@@ -869,7 +872,12 @@ export class SessionHost {
         this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, sessionId),
       );
       if (!lifecycle) throw new ApiError("not_found", "session not found");
-      if (lifecycle.deletedAtMs !== undefined) return;
+      if (lifecycle.deletedAtMs !== undefined) {
+        await leaseGuard.wait(this.deps.store.sealOrdinarySessionDeleteGrace(
+          principal.tenantId, principal.userId, sessionId,
+        ));
+        return;
+      }
       session = lifecycle.session;
       if (this.active.has(sessionId)) throw new ApiError("session_busy", "cannot delete while a turn is active");
 
@@ -888,7 +896,12 @@ export class SessionHost {
           this.deps.store.getSessionLifecycle(principal.tenantId, principal.userId, sessionId),
         );
         if (!lifecycle || lifecycle.deletedAtMs !== undefined) {
-          if (lifecycle?.deletedAtMs !== undefined) return;
+          if (lifecycle?.deletedAtMs !== undefined) {
+            await leaseGuard.wait(this.deps.store.sealOrdinarySessionDeleteGrace(
+              principal.tenantId, principal.userId, sessionId,
+            ));
+            return;
+          }
           throw new ApiError("not_found", "session not found");
         }
         session = lifecycle.session;
@@ -924,14 +937,14 @@ export class SessionHost {
       events.push({ type: "session/deleted", sessionId, emittedAtMs: now, deletionGeneration });
 
       leaseGuard.assertOwned();
-      const result = await leaseGuard.wait(this.deps.store.commit({
+      const result = await leaseGuard.wait(this.deps.store.commitOrdinarySessionDelete({
         sessionId,
         fence: lease.fence,
         lifecycle: {
           type: "tombstone",
           atMs: now,
-          // NULL is a deliberate safety gate: no retention policy has been approved, so no worker
-          // may interpret this tombstone as due for irreversible physical deletion.
+          // NULL is a deliberate safety gate: the ordinary-delete grace is a retention floor,
+          // not an execution deadline or authorization for irreversible physical deletion.
           purgeAfterMs: null,
           deletionGeneration,
           tenantId: session.tenantId,
@@ -942,7 +955,22 @@ export class SessionHost {
         events,
         sessionPatch: { autoApprovedTools: [] },
       }));
+      // This second database observation is strictly after the tombstone transaction committed.
+      // Failure leaves an unsealed, non-executable origin for exact owner retry/recovery.
+      let sealFailed = false;
+      let sealFailure: unknown;
+      try {
+        await leaseGuard.wait(this.deps.store.sealOrdinarySessionDeleteGrace(
+          principal.tenantId, principal.userId, sessionId,
+        ));
+      } catch (error) {
+        sealFailed = true;
+        sealFailure = error;
+      }
+      // Preserve the terminal event's direct publication even if post-COMMIT sealing failed.
+      // The durable tombstone/outbox still makes both operations exactly retryable.
       await this.publishAll(sessionId, result.events);
+      if (sealFailed) throw sealFailure;
     } catch (err) {
       const failure = leaseGuard.lost ?? err;
       if (failure instanceof SessionGoneError) {
@@ -952,7 +980,10 @@ export class SessionHost {
         const concurrent = await this.deps.store
           .getSessionLifecycle(principal.tenantId, principal.userId, sessionId)
           .catch(() => null);
-        if (concurrent?.deletedAtMs !== undefined) return;
+        if (concurrent?.deletedAtMs !== undefined) {
+          await this.deps.store.sealOrdinarySessionDeleteGrace(principal.tenantId, principal.userId, sessionId);
+          return;
+        }
       }
       if (failure instanceof SessionLifecycleBusyError) {
         throw new ApiError("session_busy", "cannot delete while a turn is active");
