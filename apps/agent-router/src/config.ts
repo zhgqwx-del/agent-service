@@ -191,6 +191,7 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     ROUTER_FORBIDDEN_RUNNER_SECRET_ENV.has(key)
     || key.startsWith("MYSQL_")
     || key.startsWith("S3_TEST_")
+    || key.startsWith("SESSION_DELETE_GRACE_RECOVERY_")
     || key.startsWith("TENANT_TELEMETRY_")
     || key.startsWith("TELEMETRY_LIFECYCLE_")
   ) && env[key] !== undefined);

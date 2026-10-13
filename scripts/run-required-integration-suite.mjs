@@ -9,7 +9,11 @@ if (!requested) throw new Error("usage: run-required-integration-suite.mjs <test
 
 const testFile = resolve(ROOT, requested);
 const relativeTestFile = relative(ROOT, testFile).split(sep).join("/");
-if (!relativeTestFile.startsWith("packages/store/test/") || !relativeTestFile.endsWith(".mysql.test.ts")) {
+const storeSuite = relativeTestFile.startsWith("packages/store/test/")
+  && relativeTestFile.endsWith(".mysql.test.ts");
+const runnerRecoverySuite = relativeTestFile
+  === "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts";
+if (!storeSuite && !runnerRecoverySuite) {
   throw new Error(`refusing non-MySQL integration suite: ${relativeTestFile}`);
 }
 

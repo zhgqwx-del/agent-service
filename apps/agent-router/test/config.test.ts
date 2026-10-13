@@ -2,6 +2,16 @@ import { describe, expect, it } from "vitest";
 import { loadRouterConfig } from "../src/config.js";
 
 describe("router configuration", () => {
+  it("rejects runner-only ordinary DELETE grace recovery configuration", () => {
+    for (const key of [
+      "SESSION_DELETE_GRACE_RECOVERY_ENABLED",
+      "SESSION_DELETE_GRACE_RECOVERY_POLL_MS",
+      "SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE",
+    ]) {
+      expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: "1" }))
+        .toThrow(/runner-only/);
+    }
+  });
   it("keeps tombstone off until deployment explicitly activates it", () => {
     const local = loadRouterConfig({ RUNNERS: "http://runner:8787" });
     expect(local.SESSION_TOMBSTONE_ENABLED).toBe(false);

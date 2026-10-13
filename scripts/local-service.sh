@@ -75,6 +75,7 @@ caller_redis_url="${REDIS_URL-}"
 caller_redis_prefix="${REDIS_PREFIX-}"
 caller_redis_namespace_id="${REDIS_NAMESPACE_ID-}"
 caller_session_tombstone_enabled="${SESSION_TOMBSTONE_ENABLED-}"
+caller_session_delete_grace_recovery_enabled="${SESSION_DELETE_GRACE_RECOVERY_ENABLED-}"
 caller_data_erasure_requests_enabled="${DATA_ERASURE_REQUESTS_ENABLED-}"
 caller_tenant_erasure_requests_enabled="${TENANT_ERASURE_REQUESTS_ENABLED-}"
 caller_tenant_erasure_operator_token="${TENANT_ERASURE_OPERATOR_TOKEN-}"
@@ -144,6 +145,7 @@ unset caller_env_index caller_env_name caller_mover_env_names caller_mover_env_w
 [ -n "$caller_redis_prefix" ] && REDIS_PREFIX="$caller_redis_prefix"
 [ -n "$caller_redis_namespace_id" ] && REDIS_NAMESPACE_ID="$caller_redis_namespace_id"
 [ -n "$caller_session_tombstone_enabled" ] && SESSION_TOMBSTONE_ENABLED="$caller_session_tombstone_enabled"
+[ -n "$caller_session_delete_grace_recovery_enabled" ] && SESSION_DELETE_GRACE_RECOVERY_ENABLED="$caller_session_delete_grace_recovery_enabled"
 [ -n "$caller_data_erasure_requests_enabled" ] && DATA_ERASURE_REQUESTS_ENABLED="$caller_data_erasure_requests_enabled"
 [ -n "$caller_tenant_erasure_requests_enabled" ] && TENANT_ERASURE_REQUESTS_ENABLED="$caller_tenant_erasure_requests_enabled"
 [ -n "$caller_tenant_erasure_operator_token" ] && TENANT_ERASURE_OPERATOR_TOKEN="$caller_tenant_erasure_operator_token"
@@ -418,6 +420,7 @@ start_apps() {
       BLOB_CLEANUP_ENABLED="${BLOB_CLEANUP_ENABLED:-1}" \
       BLOB_ATTACHMENTS_ENABLED="${BLOB_ATTACHMENTS_ENABLED:-1}" \
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
+      SESSION_DELETE_GRACE_RECOVERY_ENABLED="${SESSION_DELETE_GRACE_RECOVERY_ENABLED:-0}" \
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_ERASURE_REQUESTS_ENABLED="${TENANT_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_ERASURE_BARRIER_TIMEOUT_MS="${TENANT_ERASURE_BARRIER_TIMEOUT_MS:-2000}" \
@@ -451,6 +454,9 @@ start_apps() {
     echo "router: already running (pid $(sed -n '1p' "$ROUTER_PID_FILE"))"
   else
     nohup env -u TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED \
+      -u SESSION_DELETE_GRACE_RECOVERY_ENABLED \
+      -u SESSION_DELETE_GRACE_RECOVERY_POLL_MS \
+      -u SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE \
       -u CREDENTIAL_TARGET_EXECUTION_ADAPTER \
       -u TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED \
       -u TENANT_RUNTIME_DRAIN_ENABLED -u TENANT_RUNTIME_REVOCATION_WORKER_ENABLED \
@@ -582,6 +588,10 @@ verify() {
   # First-admin bootstrap is an explicit one-shot operator action, never an ambient verification
   # side effect. Keep both halves out of test/app-smoke subprocesses even if `.env` contains them.
   unset ADMIN_BOOTSTRAP_TENANT ADMIN_BOOTSTRAP_OUTPUT_FILE
+  # Standard verification must not inherit an operator's default-off recovery activation.
+  # Focused suites invoke the recovery caller explicitly against disposable test databases.
+  unset SESSION_DELETE_GRACE_RECOVERY_ENABLED SESSION_DELETE_GRACE_RECOVERY_POLL_MS
+  unset SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE
   # The standard verification stack is MySQL. Keep the memory-only 0029 fake out of application
   # subprocesses; the dedicated Memory tests construct it explicitly in-process.
   unset CREDENTIAL_TARGET_EXECUTION_ADAPTER
@@ -627,6 +637,9 @@ verify() {
     pnpm run test:migrations
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:session-delete-grace-mysql
+  pnpm run test:session-delete-grace-recovery-memory
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:session-delete-grace-recovery-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-mysql
   pnpm run test:blob-storage-control-memory

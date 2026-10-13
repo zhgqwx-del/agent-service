@@ -43,6 +43,7 @@ vi.mock("@hono/node-server", () => ({
 import {
   ErasureWorker,
   LegacyTombstoneCompensationWorker,
+  OrdinarySessionDeleteGraceRecovery,
   PurgePolicyEvaluator,
   TenantContentInventoryWorker,
   TenantCredentialTargetExecutionWorker,
@@ -868,6 +869,45 @@ describe("runner main blob wiring", () => {
     } finally {
       await runner?.close();
       start.mockRestore();
+      log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("wires only the default-off ordinary DELETE origin sealer into the runner lifecycle", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-delete-grace-recovery-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const start = vi.spyOn(OrdinarySessionDeleteGraceRecovery.prototype, "start");
+    const recover = vi.spyOn(MemorySessionStore.prototype,
+      "retryUnsealedOrdinarySessionDeleteGraceOrigins");
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      runner = await startRunner({
+        SECRETS_MASTER_KEY: MASTER_KEY,
+        RUNNER_PORT: "0",
+        RUNNER_ADDR: "127.0.0.1:0",
+        BLOB_DIR: blobDir,
+        SESSION_DELETE_GRACE_RECOVERY_ENABLED: "1",
+        SESSION_DELETE_GRACE_RECOVERY_POLL_MS: "60000",
+        SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE: "3",
+      });
+      expect(start).toHaveBeenCalledOnce();
+      await vi.waitFor(() => expect(recover).toHaveBeenCalledWith(3));
+      expect(runner.ordinarySessionDeleteGraceRecovery)
+        .toBeInstanceOf(OrdinarySessionDeleteGraceRecovery);
+      expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({
+        features: { dataPurgeExecution: false },
+      });
+      const stop = vi.spyOn(runner.ordinarySessionDeleteGraceRecovery!, "stop");
+      const hostDrain = vi.spyOn(runner.host, "drain");
+      await runner.close();
+      expect(stop).toHaveBeenCalledOnce();
+      expect(stop.mock.invocationCallOrder[0]).toBeLessThan(hostDrain.mock.invocationCallOrder[0]!);
+      runner = undefined;
+    } finally {
+      await runner?.close();
+      start.mockRestore();
+      recover.mockRestore();
       log.mockRestore();
       await rm(blobDir, { recursive: true, force: true });
     }

@@ -20,6 +20,8 @@
     "test:migrations": "node scripts/run-required-migration-suites.mjs",
     "test:session-delete-grace-memory": "node scripts/run-required-suite.mjs packages/store/test/session-delete-grace.memory.test.ts",
     "test:session-delete-grace-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/session-delete-grace.mysql.test.ts",
+    "test:session-delete-grace-recovery-memory": "node scripts/run-required-suite.mjs packages/core/test/ordinary-session-delete-grace-recovery.test.ts",
+    "test:session-delete-grace-recovery-mysql": "node scripts/run-required-integration-suite.mjs apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts",
     "test:tenant-telemetry-lifecycle": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-lifecycle.test.ts",
     "test:tenant-telemetry-lifecycle-memory": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-lifecycle.memory.test.ts",
     "test:tenant-telemetry-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-telemetry-lifecycle.mysql.test.ts",

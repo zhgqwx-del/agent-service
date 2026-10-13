@@ -12,6 +12,7 @@ import {
   FakeCredentialTargetExecutionAdapter,
   LegacyTombstoneCompensationWorker,
   LifecycleOutboxDispatcher,
+  OrdinarySessionDeleteGraceRecovery,
   PiEngine,
   PiSummariser,
   PurgePolicyEvaluator,
@@ -297,6 +298,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let tenantTelemetryWriterRuntime: TenantTelemetryWriterRuntime | undefined;
   let providerTenantTelemetry: TenantTelemetryApplicationDualWrite | undefined;
   let tenantTelemetryRetryTimer: ReturnType<typeof setInterval> | undefined;
+  let ordinarySessionDeleteGraceRecovery: OrdinarySessionDeleteGraceRecovery | undefined;
   const closeTenantRestoreJournal = (): Promise<void> => {
     if (tenantRestoreJournalClosePromise) return tenantRestoreJournalClosePromise;
     tenantRestoreJournalClosePromise = tenantRestoreJournalWorker !== undefined
@@ -994,6 +996,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       retryMaxMs: cfg.TENANT_DATABASE_PURGE_RETRY_MAX_MS,
     })
     : undefined;
+  ordinarySessionDeleteGraceRecovery = cfg.SESSION_DELETE_GRACE_RECOVERY_ENABLED
+    ? new OrdinarySessionDeleteGraceRecovery({ store, logger: runnerRuntimeLogger }, {
+      pollIntervalMs: cfg.SESSION_DELETE_GRACE_RECOVERY_POLL_MS,
+      batchSize: cfg.SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE,
+    })
+    : undefined;
   legacyTombstoneCompensationWorker?.start();
   erasureWorker?.start();
   purgePolicyEvaluator?.start();
@@ -1006,6 +1014,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   tenantPurgePlanWorker?.start();
   tenantPurgeExecutionWorker?.start();
   tenantDatabasePurgeWorker?.start();
+  ordinarySessionDeleteGraceRecovery?.start();
   tenantRedisPurgeWorker?.start();
   tenantTelemetryWriterRuntime.worker?.start();
 
@@ -1116,6 +1125,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         tenantPurgePlanWorker?.stop(),
         tenantPurgeExecutionWorker?.stop(),
         tenantDatabasePurgeWorker?.stop(),
+        ordinarySessionDeleteGraceRecovery?.stop(),
         tenantRedisPurgeWorker?.stop(),
       ]);
       await host.drain(30_000);
@@ -1179,6 +1189,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     cfg.TENANT_PURGE_PLAN_WORKER_ENABLED,
     cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED,
     cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED,
+    cfg.SESSION_DELETE_GRACE_RECOVERY_ENABLED,
     cfg.TENANT_REDIS_PURGE_WORKER_ENABLED,
     cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
     cfg.PURGE_POLICY_EVALUATOR_ENABLED,
@@ -1204,6 +1215,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantRuntimeRevocationWorker, tenantContentInventoryWorker, tenantPurgePlanWorker,
     tenantPurgeExecutionGate, tenantPurgeExecutionWorker,
     tenantDatabasePurgeGate, tenantDatabasePurgeWorker,
+    ordinarySessionDeleteGraceRecovery,
     tenantRedisPurgeGate, tenantRedisPurgeWorker, tenantRedisPurgeAdapter,
     tenantTelemetryWriterRuntime, providerTenantTelemetry,
     tenantRuntimeBootId,
@@ -1212,6 +1224,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   };
   } catch (error) {
     if (tenantTelemetryRetryTimer !== undefined) clearInterval(tenantTelemetryRetryTimer);
+    await ordinarySessionDeleteGraceRecovery?.stop();
     await providerTenantTelemetry?.close();
     await tenantTelemetryWriterRuntime?.worker?.stop();
     await closeTenantRestoreJournal();

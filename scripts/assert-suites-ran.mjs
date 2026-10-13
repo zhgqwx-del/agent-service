@@ -37,6 +37,8 @@ const requiredTestFiles = [
   "packages/core/test/host.test.ts",
   "packages/store/test/session-delete-grace.memory.test.ts",
   "packages/store/test/session-delete-grace.mysql.test.ts",
+  "packages/core/test/ordinary-session-delete-grace-recovery.test.ts",
+  "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts",
   "apps/agent-router/test/app.test.ts",
   "packages/store/test/blob-lifecycle.mysql.test.ts",
   "packages/store/test/blob-storage-control.memory.test.ts",

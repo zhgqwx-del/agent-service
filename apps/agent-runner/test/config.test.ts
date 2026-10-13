@@ -12,6 +12,23 @@ const productionEnv: NodeJS.ProcessEnv = {
 };
 
 describe("runner configuration", () => {
+  it("keeps ordinary DELETE origin recovery independent and bounded", () => {
+    const enabled = loadConfig({ SECRETS_MASTER_KEY: SECRET,
+      SESSION_DELETE_GRACE_RECOVERY_ENABLED: "1",
+      SESSION_DELETE_GRACE_RECOVERY_POLL_MS: "17",
+      SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE: "7" });
+    expect(enabled.SESSION_DELETE_GRACE_RECOVERY_ENABLED).toBe(true);
+    expect(enabled.SESSION_DELETE_GRACE_RECOVERY_POLL_MS).toBe(17);
+    expect(enabled.SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE).toBe(7);
+    for (const [key, value] of [
+      ["SESSION_DELETE_GRACE_RECOVERY_ENABLED", "true"],
+      ["SESSION_DELETE_GRACE_RECOVERY_POLL_MS", "0"],
+      ["SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE", "101"],
+    ] as const) {
+      expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, [key]: value })).toThrow();
+    }
+  });
+
   it("rejects one-shot backup-catalog authority in the long-running process", () => {
     for (const [key, value] of [
       ["BACKUP_CATALOG_ADAPTER", "s3"],
@@ -49,6 +66,9 @@ describe("runner configuration", () => {
     expect(cfg.blobStorage).toBeUndefined();
     expect(cfg.BLOB_ATTACHMENTS_ENABLED).toBe(false);
     expect(cfg.BLOB_CLEANUP_ENABLED).toBe(false);
+    expect(cfg.SESSION_DELETE_GRACE_RECOVERY_ENABLED).toBe(false);
+    expect(cfg.SESSION_DELETE_GRACE_RECOVERY_POLL_MS).toBe(30_000);
+    expect(cfg.SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE).toBe(25);
     expect(cfg.DATA_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.TENANT_ERASURE_REQUESTS_ENABLED).toBe(false);
     expect(cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED).toBe(false);

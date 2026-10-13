@@ -71,6 +71,13 @@ const Env = z.object({
   BLOB_CLEANUP_RETRY_BASE_MS: z.coerce.number().int().positive().default(250),
   BLOB_CLEANUP_RETRY_MAX_MS: z.coerce.number().int().positive().default(60_000),
   BLOB_CLEANUP_POISON_MAX_ATTEMPTS: z.coerce.number().int().positive().default(3),
+  /** Only seals committed 0050 ordinary DELETE origins; never schedules physical purge. */
+  SESSION_DELETE_GRACE_RECOVERY_ENABLED: z.enum(["0", "1"])
+    .default("0").transform((value) => value === "1"),
+  SESSION_DELETE_GRACE_RECOVERY_POLL_MS: z.coerce.number().int()
+    .min(1).max(300_000).default(30_000),
+  SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE: z.coerce.number().int()
+    .min(1).max(100).default(25),
   /** Durable user-erasure worker. Kept separate from request admission for drain/forward-fix. */
   ERASURE_WORKER_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /**
