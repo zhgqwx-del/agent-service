@@ -613,6 +613,7 @@ verify() {
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-disposition-mysql
   pnpm run test:tenant-telemetry-disposition-grant
+  pnpm run test:tenant-telemetry-disposition-journal-v3
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-disposition-grant-mysql
   AGENT_SERVICE_INTEGRATION=1 \
@@ -758,6 +759,8 @@ verify_s3() {
     node packages/store/scripts/bootstrap-s3.mjs
   env "${s3_test_env[@]}" S3_TELEMETRY_DISPOSITION_TEST_BUCKET="$telemetry_disposition_bucket" \
     pnpm run test:tenant-telemetry-disposition-s3
+  env "${s3_test_env[@]}" S3_TELEMETRY_DISPOSITION_TEST_BUCKET="$telemetry_disposition_bucket" \
+    pnpm run test:tenant-telemetry-disposition-journal-v3-s3
   env "${s3_test_env[@]}" \
     S3_TELEMETRY_DISPOSITION_TEST_BUCKET="$telemetry_disposition_bucket" \
     S3_TENANT_TELEMETRY_TEST_BUCKET="$tenant_telemetry_bucket" \
