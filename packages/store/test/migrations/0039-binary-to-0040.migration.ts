@@ -318,9 +318,9 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
       const [markers] = await afterConn.query<Row[]>(
         "SELECT name FROM schema_migrations ORDER BY name",
       );
-      expect(markers).toHaveLength(42);
+      expect(markers).toHaveLength(43);
       expect(markers.some((row) => row.name === MIGRATION_0040)).toBe(true);
-      expect(markers.at(-1)?.name).toBe("0042_tenant_telemetry_plan_artifact_target.sql");
+      expect(markers.at(-1)?.name).toBe("0044_tenant_telemetry_pregrant_intent.sql");
       for (const [table, orderBy] of [
         ["tenant_erasure_admissions", "request_id"],
         ["tenant_content_inventory_receipts", "request_id"],

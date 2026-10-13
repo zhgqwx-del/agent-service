@@ -14,7 +14,11 @@
 
 `0043`无新migration、服务或镜像：修复0042非零目标在T3e实时复核时的错误零目标重算，并提供T3f后只读的本地managed artifact来源候选。该诊断只返回`local_source_candidate`或`unknown`及content-free数量，固定`executionReady=false`、`externalAuthorityVerified=false`；不能当作grant、外部删除或全域完成证明。旧0042代码已写成blocked的非空T3e job不会自动解封。进入真实授权前还需版本化来源绑定、外部authority head/marker验真、恢复fence和物理ACK。
 
+`0044`完成版本化来源绑定的第一步：新增默认休眠、逐artifact的content-free pre-grant intent/claim。Memory以同步原子边界、MySQL以RR事务独立重验当前0039～0042、T3f grave和T1/hold/control/restore等本地来源；0043只读候选不能直接充当授权。intent绑定精确artifact group与来源receipt，claim按同一key/version CAS、DB-time lease及一次性token hash串行化；MySQL写入后若lease已过期会整事务回滚。`grantReady=false`固定，0037 grant硬拒、0042 logs/traces blocker、产品外部mutation/restore及全域completion不变。`0044`独立migration只增加两张账本表、guards与严格126-trigger启动指纹，不回填旧terminal、不联网或激活；升级需先排空旧writer，独立迁移后只运行0044-aware进程。历史升级夹具是在真实MySQL上的SQL-shaped 0042状态，不等同于冻结旧binary生成的非空terminal。完整本地verify与推送后CI以[进度记录](docs/PROGRESS.md)最后一节为准。
+
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
+
+后续交付决策：普通 session DELETE 按30天内容宽限期实现，自动物理清理默认关闭（当前`purge_after_ms`仍为`NULL`）；M4同时提供router/runner独立VM进程发布包和Linux OCI镜像。两种生产部署形态尚未交付或验收，详见[本地开发与CI指南](docs/operations/development-and-ci-guide.md)。
 
 ## 本机运行
 
@@ -66,7 +70,7 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0041 → 0042 的真实 MySQL 历史升级夹具
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0042 → 0044 的真实 MySQL 历史升级夹具（0043 code-only）
 # 以下单独列出的 S3 套件需先配置各自的 S3_TEST_* 测试环境；本地优先用 verify-s3 自动准备 MinIO 与 bucket。
 pnpm test:tenant-telemetry-lifecycle          # 0032/0033 content-free evidence helper
 pnpm test:tenant-telemetry-lifecycle-memory   # 0033 Memory activation/coverage/inventory原子语义

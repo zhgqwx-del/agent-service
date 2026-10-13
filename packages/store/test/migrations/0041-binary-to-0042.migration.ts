@@ -328,8 +328,9 @@ describe("frozen 0041 T3d terminal -> 0042 real MySQL upgrade", () => {
     const afterConn = await mysql.createConnection(url);
     try {
       const [markers] = await afterConn.query<Row[]>("SELECT name FROM schema_migrations ORDER BY name");
-      expect(markers).toHaveLength(42);
-      expect(markers.at(-1)?.name).toBe(MIGRATION_0042);
+      expect(markers).toHaveLength(43);
+      expect(markers.some((row) => row.name === MIGRATION_0042)).toBe(true);
+      expect(markers.at(-1)?.name).toBe("0044_tenant_telemetry_pregrant_intent.sql");
       for (const [table, orderBy] of OLD_TABLES) {
         expect(await rowDigest(afterConn, table, orderBy)).toBe(before.get(table));
       }
