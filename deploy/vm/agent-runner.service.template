@@ -1,0 +1,37 @@
+# Linux systemd example only. Manually install a verified Linux Node 24 release for this CPU arch;
+# verify its trusted manifest digest on the destination host before selecting this template.
+# Create the fixed unprivileged agent-runner account and host-managed 0600 configuration outside
+# the release. Do not install this template or enable destructive feature gates automatically.
+# The four dist maintenance CLIs are one-shot operator commands, not additional daemons.
+[Unit]
+Description=agent-service runner
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=agent-runner
+Group=agent-runner
+WorkingDirectory=/opt/agent-service/agent-runner/current
+Environment=NODE_ENV=production
+Environment=BLOB_DIR=/var/lib/agent-service/agent-runner/blobs
+EnvironmentFile=/etc/agent-service/agent-runner.env
+ExecStartPre=/usr/bin/node -e "process.exit(Number(process.versions.node.split('.')[0]) === 24 ? 0 : 1)"
+ExecStart=/usr/bin/node /opt/agent-service/agent-runner/current/dist/main.js
+StateDirectory=agent-service/agent-runner
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/agent-service/agent-runner
+
+[Install]
+WantedBy=multi-user.target

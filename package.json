@@ -12,6 +12,9 @@
   "scripts": {
     "build": "pnpm --filter @agent-service/sdk build && node scripts/build-app.mjs agent-runner && node scripts/build-app.mjs agent-router",
     "check:secrets": "node scripts/check-secrets.mjs",
+    "package:vm": "node scripts/package-vm-release.mjs",
+    "test:vm-release": "node scripts/run-required-suite.mjs test/vm-release.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/cli-entrypoint.test.ts",
+    "check:vm-release": "node scripts/check-vm-release.mjs",
     "generate:api": "node --import tsx scripts/generate-api.ts",
     "check:api": "node --import tsx scripts/generate-api.ts --check",
     "check:sdk": "node scripts/check-sdk-package.mjs",

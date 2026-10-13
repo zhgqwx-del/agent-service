@@ -1603,6 +1603,14 @@ agent-service/agent-router:ci
 
 ## 9. 从本地到未来生产的交付语义
 
+### VM进程包与镜像的区别
+
+M4候选现在增加`package:vm`、`test:vm-release`和`check:vm-release`，详细命令及安全边界见[VM进程发布包地基](local-and-deployment.md#vm-进程发布包地基)。VM目录包含同一router/runner JavaScript bundle、完整production依赖、迁移和对应systemd样例；容器镜像还封装Node与Linux文件系统。VM目标主机必须另有Node24，不能只复制一个`.js`文件或在目标上重新装依赖。
+
+应用本身不是独立ELF二进制，但真实production闭包中存在esbuild原生程序。因此VM包按Linux/macOS与x64/arm64构建和验真，不能把本机macOS包直接部署到Linux；Linux构建由Linux环境完成。常驻服务仍只有router与runner，runner四个维护CLI不变成新服务。`publishable=true`只表示清洁commit构建的可追溯候选，不是生产许可；`productionAccepted=false`固定，Windows/systemd实机验收及完整归档/签名/环境晋级仍缺。
+
+候选CI与本地verify分别新增必执行安全/快照测试和真实双发布目录plain Node smoke；CI要求clean commit，本地verify允许copied-byte dirty开发快照。该smoke使用独立临时目录及memory后端，不加载`.env`、触达MySQL/模型或安装服务。两包commit、实际输入/lock摘要必须一致；运行后重验完整清单未改变。新门禁仅在后续候选提交推送后执行，不属于已推送0053的Actions run，也不能用旧CI成功替代。实际单元通过、打包失败/修正及最终装配状态均以PROGRESS末节为准。
+
 0053仍只允许本地非生产启用，不能把本节的未来生产交付顺序当作其生产许可。升级前保持capture、ordinary usage及相关T3d/T3f gate关闭，真实摘流、停止并排空全部pre-0053 router/runner/writer和在途事务；独立migration安装160相关组合指纹（不是662全库trigger数），只启动0053-aware版本，禁止旧新writer热混跑。既有0049文件不可重写，后续只能forward-fix。默认control休眠与历史NULL/0 source不回填；active0030 primary是后续local activation前提，新的runtime epoch不能自动继承capture binding。原始failed-step提交、fresh fleet四worker边界、first create live检查与历史exact ACK权限仍需分别验证；局部writer ACK不解除T3d/T3f第六来源硬拒、usage来源删除禁令或全域completion。
 
 0031的外部catalog authority不是“所有对象都不可变”：event objects是create-only不可变链，另有一个固定key的可变`If-Match` CAS head作为唯一尾部；LIST不参与authority。启动会实际验证`If-None-Match: *`、正常CAS和陈旧ETag拒绝，event/head间响应丢失用精确下一sequence恢复。生产IAM需要允许受控operator对head做条件覆盖，同时禁止其它writer覆盖event/head；versioning、lifecycle和Object Lock保持关闭。CI/本地MinIO会执行这些协议测试，但不能替代managed存储/IAM验收。

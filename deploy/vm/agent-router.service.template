@@ -1,0 +1,35 @@
+# Linux systemd example only. Manually install a verified Linux Node 24 release for this CPU arch;
+# verify its trusted manifest digest on the destination host before selecting this template.
+# The router is the public API edge; the runner must remain on a private network. Keep each role's
+# host-managed 0600 configuration outside its release, with no runner-only secrets in this file.
+[Unit]
+Description=agent-service router
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=agent-router
+Group=agent-router
+WorkingDirectory=/opt/agent-service/agent-router/current
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/agent-service/agent-router.env
+ExecStartPre=/usr/bin/node -e "process.exit(Number(process.versions.node.split('.')[0]) === 24 ? 0 : 1)"
+ExecStart=/usr/bin/node /opt/agent-service/agent-router/current/dist/main.js
+StateDirectory=agent-service/agent-router
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/agent-service/agent-router
+
+[Install]
+WantedBy=multi-user.target

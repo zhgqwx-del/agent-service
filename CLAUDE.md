@@ -1,6 +1,8 @@
 # agent-service 项目记忆
 
-0053本批完整本地verify与verify-s3已退出0，主2331 passed/历史268 passed零skip/cluster28与独立T3g3/真实S3 14文件80 passed零skip，六入口build与source/bundled双服务装配均通过。新CI仍待；不得借本地成功开放上述删除、恢复或全域completion。
+M4 VM目录发布包地基正在独立worktree验证：同一Node24 bundle + 完整production依赖闭包，实际依赖含esbuild原生程序，所以发布包绑定Linux/macOS与CPU架构；不是独立应用ELF或OS磁盘镜像。候选单元/类型验证不能替代真实双包plain Node装配，productionAccepted=false固定。0054 SQL/实际删除仍待专项确认，M1未冻结、M3未开始；不安装systemd、不编造云参数。新状态以PROGRESS末节为准。
+
+0053已以`e41114392e028efff474b2c5ac13df3784b83228`推送main，完整本地verify与verify-s3已退出0：主2331 passed/历史268 passed零skip/cluster28与独立T3g3/真实S3 14文件80 passed零skip，六入口build与source/bundled双服务装配均通过。Actions `38465284562`test、runner image和router image均success，run已22:52Z完成；仍不得开放未闭环的删除、恢复或全域completion。0054仅在隔离worktree非破坏性开发；SQL guard/实际删除接线已暂停待专项确认，未迁移既有业务库、未合入或发布，纯/内存测试不代表真实数据库授权证明。
 
 本地MySQL备份和旧restore CLI现以可选受保护`TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`向source/target verify-store传同一exact raw 32-byte ref key；0033 active缺key/错key仍拒绝，独立制品加密key不替代它。direct CLI拒绝ambient应用ref-key（包括空值），前台wrapper加载dotenv后清除该输入、显式caller文件路径优先；长期进程不接operator文件。真实active0033组合结果只看PROGRESS，不外推active0053 capture的新epoch恢复，后者仍fail closed且不能自动rebind。
 

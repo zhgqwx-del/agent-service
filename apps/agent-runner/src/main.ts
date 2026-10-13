@@ -101,6 +101,7 @@ import { createLocalFakeCredentialTargetReferenceCapture } from
 import { reconcileBlobStorageControlForRuntime } from "./blob-storage-control.js";
 import { assertBlobStorageMigrationRuntimeReady } from "./blob-storage-migration-gate.js";
 import { loadConfig } from "./config.js";
+import { isDirectCliEntrypoint } from "./cli-entrypoint.js";
 import { RouterErasureSessionExecutor } from "./erasure-executor.js";
 import { RouterPurgePolicyEvaluationGate } from "./purge-policy-evaluation-gate.js";
 import { RouterTenantErasureAdmissionGate } from "./tenant-erasure-admission-gate.js";
@@ -1293,7 +1294,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file://").href) {
+if (isDirectCliEntrypoint(import.meta.url)) {
   startRunner().catch(() => {
     emitRunnerTelemetryEvent("runner.process.start_failed");
     process.exit(1);

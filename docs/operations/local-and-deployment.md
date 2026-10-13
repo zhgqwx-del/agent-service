@@ -1,6 +1,31 @@
 # 本地运维与后续部署契约
 
-当前阶段以本机可重复运行和自动验证为目标；预发、生产资源就绪后，再把相同的环境变量契约映射到独立云服务器或 Kubernetes Secret、ConfigMap 和 Service。M4 将同时交付虚拟机独立进程与容器镜像两种部署形态，复用 router/runner 协议和构建入口；两套可校验发布包、进程/容器托管及真实环境验收目前都未完成。
+当前阶段以本机可重复运行和自动验证为目标；预发、生产资源就绪后，再把相同的环境变量契约映射到独立云服务器或 Kubernetes Secret、ConfigMap 和 Service。M4同时支持虚拟机独立进程与容器镜像两种部署形态，复用router/runner协议和构建入口；Node24进程目录发布包地基正在本地验证，实际结果以PROGRESS为准。完整归档/签名/晋级、受控schema发布、进程/容器托管及真实环境验收仍未完成。
+
+## VM 进程发布包地基
+
+这里的“VM进程发布包”是部署到已有主机的Node24 ESM应用目录，不是ELF/Windows原生机器码，也不是操作系统或虚拟机磁盘镜像。router与runner可在不同VM或容器内独立部署；仍只有两个长期服务。容器形态已有两个Linux OCI构建入口，VM形态复用完全相同的bundle和运行协议。
+
+```bash
+# Node24和package.json固定的pnpm版本；离线cache缺包则失败，不隐式下载。
+pnpm test:vm-release
+pnpm check:vm-release             # clean commit构建并运行临时双包smoke
+pnpm check:vm-release --allow-dirty-development # 日常开发验证，不可用于晋级
+
+# OUTPUT必须是仓库外、父目录已存在的新绝对目录；不覆盖既有目录。
+pnpm package:vm --role agent-runner --output /absolute/new/runner-release
+pnpm package:vm --role agent-router --output /absolute/new/router-release
+```
+
+clean构建从精确Git commit的blob复制输入到独立快照；工作树实际dirty且显式允许时，只复制一次工作文件并对相同copied bytes计算摘要，manifest固定`publishable=false`。构建全部在私有快照内执行`offline / frozen-lockfile / ignore-scripts`依赖安装、既有esbuild入口及production deploy。发布目录仅包含`dist/`、完整目标平台production `node_modules/`、本角色`service/*.service.template`和`release-manifest.json`。runner仍是一个main加四个one-shot入口，router一个main；one-shot不能注册成daemon。
+
+manifest记录源码commit、lock/实际输入摘要、构建Node/pnpm/platform、严格target runtime与完整文件/软链接/目录权限清单；强制拒绝路径逃逸、敏感配置/私钥/数据库文件、特殊文件及特殊权限位。真实production闭包包括esbuild原生程序，不能声称跨OS/CPU通用；必须在目标Linux/macOS及x64/arm64环境构建，验真与运行主机也须匹配。native检查只核对有界ELF64/MachO64 header、program/load-command/segment结构、目标OS/CPU与完整文件摘要，截断、越界、未知/Windows格式或错误架构仍拒绝；这不是任意unsafe-native开关，也不是完整loader、NAPI/libc兼容或厂商真实性证明。实际功能须另经plain Node装配验证。第三方SDK合法`credentials`代码目录不能被误当密钥文件，但其每个后代仍完整检查，真实同名credentials文件/软链接及`.env`等继续拒绝。未来新增依赖须重新审查。发布输出不含`.env`，构建子进程不继承应用key/数据库/模型配置且不回显任意诊断。
+
+验真必须调用`scripts/lib/vm-release.mjs`的`verifyVmReleaseDirectory(directory, role, trustedManifestSha256)`，摘要从独立可信构建/晋级渠道取得，不能把包内自算摘要当认证。同一目录、manifest和完整依赖闭包应保持不变后再晋级，目标环境不运行pnpm或重新构建。目录清单不是归档签名、跨平台确定性构建或生产许可；`productionAccepted=false`固定。当前尚没有受控tar/zip发布、签名、registry/promotion job或自动安装器。
+
+systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝对路径、只读release/current布局和独立`/var/lib/agent-service/<role>`状态目录；配置从独立`/etc/agent-service/<role>.env`提供，建议0600，仅配置权限与职责匹配的变量。模板设置`StateDirectoryMode=0700`、`UMask=0077`和runner外置Blob目录；不会创建账号、安装unit、改当前release指针、执行DDL或启动真实服务。启动MySQL runner的现有自动migration行为并未因打包消失，生产无DDL账号/可信trigger只读桥仍需后续实现；schema cutover后的回滚须服从forward-fix，不能仅替换旧目录。
+
+`check:vm-release`只使用新临时目录、synthetic测试key和memory后端，先独立构建两套依赖闭包，再以plain Node运行四个CLI帮助入口与两个真实进程，验证readiness、协议、租户/平台认证边界、转发和canonical OpenAPI，停止后重新验真目录未被runtime修改；成功metadata保存于`.local-run/vm-release-proof.json`。`test:vm-release`要求逐JSON证明非零实际passed、零其它状态。CI默认拒绝dirty构建，本地`verify`显式允许dirty开发快照而不产生发布许可。Windows运行潜力不等于测试证明，systemd、跨VM、MySQL/TLS/IAM、容量、整体deadline及真实staging/production仍需独立验收；不会因此进入M3或冻结M1。
 
 ## 本地生命周期
 

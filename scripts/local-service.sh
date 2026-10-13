@@ -764,6 +764,10 @@ verify() {
     CLUSTER_REDIS_URL="${CLUSTER_REDIS_URL:-redis://127.0.0.1:6379/3}" \
     pnpm run test:tenant-redis-purge-cluster
   pnpm run build:check
+  pnpm run test:vm-release
+  # Development verify accepts a dirty copied-byte snapshot, never a publishable release.
+  # CI calls check:vm-release without this option and requires exact committed sources.
+  pnpm run check:vm-release --allow-dirty-development
 }
 
 verify_real() {

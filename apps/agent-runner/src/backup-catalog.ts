@@ -1,3 +1,5 @@
+import { isDirectCliEntrypoint } from "./cli-entrypoint.js";
+
 const HELP = `Usage: backup-catalog <command>
 
 Operate the authoritative, content-free backup catalog from the agent-runner bundle. This is an
@@ -88,7 +90,7 @@ export async function main(
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file://").href) {
+if (isDirectCliEntrypoint(import.meta.url)) {
   main().then(
     (status) => { process.exitCode = status; },
     () => {

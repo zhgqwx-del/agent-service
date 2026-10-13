@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# Two stages. The build stage bundles an app into a single file and creates a portable production
+# Two stages. The build stage bundles an app and creates a relocatable, platform-specific production
 # node_modules tree from the workspace lockfile. The runtime stage never resolves packages from the
 # network, so it cannot silently pick transitive versions different from those built and tested in CI.
 ARG APP=agent-runner
@@ -25,7 +25,8 @@ RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/resto
 RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/backup-catalog.js
 RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/telemetry-capture.js
 # The first install has populated pnpm's store. Deploy offline from the same frozen lockfile and skip
-# lifecycle scripts: all runtime dependencies are JavaScript-only and esbuild is build-stage-only.
+# lifecycle scripts. Preserve the complete production closure: transitive dependencies currently
+# also include a platform-native esbuild executable; the closure is not cross-OS/CPU portable.
 RUN pnpm --filter "./apps/${APP}" --prod --offline --ignore-scripts --trust-lockfile --frozen-lockfile deploy /app/deploy
 
 FROM node:${NODE_VERSION}-slim AS runtime

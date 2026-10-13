@@ -668,6 +668,12 @@ jobs:
       - name: Build distributable artifacts and boot plain Node bundles
         run: pnpm run build:check
 
+      - name: VM process release security and source snapshot suite (must execute)
+        run: pnpm run test:vm-release
+
+      - name: Build independent VM role packages and boot with plain Node (no external services)
+        run: pnpm run check:vm-release
+
       # Keep a separate, named proof that the runner's one-shot mover artifact exists and executes
       # under plain Node. build:check also runs this gate so local verification cannot omit it.
       - name: Runner Blob migration distributable CLI (must execute)

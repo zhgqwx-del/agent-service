@@ -6,6 +6,7 @@ import {
 } from "@agent-service/protocol";
 import { createRouterApp } from "./app.js";
 import { loadRouterConfig } from "./config.js";
+import { isDirectCliEntrypoint } from "./cli-entrypoint.js";
 import { RunnerRegistry } from "./registry.js";
 
 const ROUTER_TELEMETRY_LEVEL = {
@@ -152,7 +153,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   return { app, server, registry, cfg, close: shutdown };
 }
 
-if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file://").href) {
+if (isDirectCliEntrypoint(import.meta.url)) {
   startRouter().catch(() => {
     emitRouterTelemetryEvent("router.process.start_failed");
     process.exit(1);

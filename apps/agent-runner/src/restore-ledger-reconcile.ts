@@ -1,3 +1,5 @@
+import { isDirectCliEntrypoint } from "./cli-entrypoint.js";
+
 const HELP = `Usage: restore-ledger-reconcile <command>
 
 Reconcile the independent tenant restore journal before an agent-runner may serve a restored or
@@ -64,7 +66,7 @@ export async function main(
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file://").href) {
+if (isDirectCliEntrypoint(import.meta.url)) {
   main().then(
     (status) => { process.exitCode = status; },
     () => {

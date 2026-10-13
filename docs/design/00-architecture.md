@@ -1,5 +1,7 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
+> M4独立VM目录发布包候选复用现有六个Node24 ESM入口，附带完整production依赖、严格manifest及Linux非root systemd样例，不新增长期服务或镜像。实际依赖闭包含esbuild原生程序，目录包绑定Linux/macOS与x64/arm64，不能把JS应用等同跨OS通用闭包或独立ELF程序；`productionAccepted=false`固定。构建从冻结Git/copy-once源码进行，验真还要求独立可信摘要与匹配host；帮助/服务入口以真实文件身份识别current/path alias。实际双包/类型/必跑测试及完整验收状态只看PROGRESS，schema发布、生产无DDL账号、归档/签名/晋级及真实环境验收仍缺，M1不冻结/M3不开始。
+
 > 本地MySQL逻辑备份/旧restore CLI现接受保护的exact ref-key文件，供0033 active source/target startup audit使用；missing/wrong key仍安全拒绝。实际active0033组合证明只看PROGRESS，不能借inactive旧17例外推；active0053 capture与恢复后的新epoch尚不兼容，必须fail closed，不得自动rebind。
 
 > `0053`新增默认关闭、仅限本地的provider-step failure durable capture：首failed-step业务写集与source/member/spool/job/failure receipt原子提交，turn结束仍独立commit。控制激活绑定真实0030 primary runtime epoch、exact protected ref key和完整configured fleet；v1/traces capture保持inactive，active第六source继续阻断T3d/T3f及全域completion。新`telemetry-capture`为一次性前台CLI，产品Node入口增至六个，常驻服务/OCI镜像仍各两个。相关strict fingerprint160（全库662）；须排空旧writer、独立迁移后只启动0053-aware进程，不支持热混跑。完整验证以PROGRESS为准。

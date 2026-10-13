@@ -13,7 +13,8 @@ if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile.startsWith("packages/core/test/")
     || relativeTestFile.startsWith("packages/providers/test/")
     || relativeTestFile.startsWith("apps/agent-runner/test/")
-    || relativeTestFile.startsWith("apps/agent-router/test/"))
+    || relativeTestFile.startsWith("apps/agent-router/test/")
+    || relativeTestFile === "test/vm-release.test.ts")
   || !relativeTestFile.endsWith(".test.ts")) {
   throw new Error(`refusing test suite outside approved package tests: ${relativeTestFile}`);
 }
