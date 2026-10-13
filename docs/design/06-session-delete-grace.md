@@ -19,7 +19,11 @@
 
 ## 升级、测试和剩余门禁
 
-`0050` 是 expand-only nullable 列与 CHECK；不回填、不联网、不改变公开 API 或 bundle。后续恢复caller只是runner内嵌、默认关闭的代码接线，没有独立服务、进程、schema或镜像。它不增加现有 trigger 的数量；启动检查精确列形状与真实 MySQL 归一化后的完整 CHECK 摘要，同名但被放宽的约束也会拒绝，marker 丢失且已有 origin 时拒绝重放。对旧 DELETE writer 的新 schema 写入没有数据库强制双写：它只能保持 `unknown`，不能将 mixed-writer 状态称为完整覆盖。`0050` 尚未建立可供物理清理使用的 SQL-level write-once origin guard；新旧 writer 切换、最小权限和 schema drift 监控仍是部署门禁。
+`0050` 是 expand-only nullable 列与 CHECK；不回填、不联网、不改变公开 API 或 bundle。后续恢复caller只是runner内嵌、默认关闭的代码接线，没有独立服务、进程、schema或镜像。`0050` 本身不增加 trigger；启动检查精确列形状与真实 MySQL 归一化后的完整 CHECK 摘要，同名但被放宽的约束也会拒绝，marker 丢失且已有 origin 时拒绝重放。
+
+`0051` 再以独立additive `BEFORE UPDATE` trigger保护**已存在的可信0050证据**：origin只能与首次live→tombstone更新一起写入，不能给已删除而无来源的旧行补造；一旦非NULL，origin digest、DB时间和其绑定的owner/deletion generation/event cursor不可改变。seal只能在旧行版本已经有origin时从NULL写入，写成后seal时间、floor和digest均不可修改。这个trigger本身不能证明origin来自已COMMIT的上一事务；post-COMMIT保证仍由受信任store的两事务流程、行锁和DB时间复核提供。trigger允许原有普通DELETE首事务、post-COMMIT seal、无来源的user/tenant/legacy tombstone以及T3f按canonical owner删除整行；它不为旧writer补来源，也不阻止旧普通DELETE writer继续写出`unknown`。启动会核对trigger完整动作与schema/marker，marker丢失但精确trigger已安装可安全重放，变更动作会fail closed。0051 migration前必须先关闭DELETE流量并排空pre-0051 writer；严格指纹使旧binary不能在新schema安全重启，只能forward-fix。
+
+这**不是mixed-writer coverage cutover**。数据库仅凭同形的`session/deleted`/outbox无法区分旧普通DELETE、user erasure、tenant erasure或legacy compensation；若要在SQL层拒绝所有post-cutover无来源的普通DELETE，需要跨全部tombstone路径的可信来源分类、原子证据、旧writer停服和不可逆cutover，不能让caller自称“erasure”来绕过。直接拥有sessions DDL/UPDATE特权的主体仍可篡改trigger或伪造一条新来源，所以runtime与migration principal必须最小权限隔离并监控schema drift。保持所有无来源行`unknown`与`physicalPurgeEnabled=false`，不得借0051声称30天生命周期已完整覆盖或清理可执行。
 
 恢复caller可在0050 schema和新writer全部就绪后单独逐实例开启；开启前应排空pre-0050普通DELETE writer及在途请求，以免把旧writer产生的`unknown`误报为已覆盖。恢复只补已提交的可信origin，不能为旧行制造来源；关闭它不会缩短任何已封存floor或开放物理清理，但未封存行仍需后续安全收敛。
 

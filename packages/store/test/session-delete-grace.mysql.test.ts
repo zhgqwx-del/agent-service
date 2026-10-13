@@ -130,6 +130,120 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
+    it("rejects SQL rewrites and late backfill while preserving the legal post-COMMIT seal", async () => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const ordinary = mkSession(`tenant-grace-guard-${randomUUID()}`,
+        `user-grace-guard-${randomUUID()}`);
+      const simultaneous = mkSession(`tenant-grace-simultaneous-${randomUUID()}`,
+        `user-grace-simultaneous-${randomUUID()}`);
+      const legacy = mkSession(`tenant-grace-legacy-${randomUUID()}`,
+        `user-grace-legacy-${randomUUID()}`);
+      try {
+        await store.createSession(simultaneous);
+        const simultaneousAtMs = Date.now();
+        await expect(conn.query(
+          `UPDATE sessions SET deleted_at_ms=?,deletion_generation=1,
+                  ordinary_delete_origin_sha256=REPEAT('a',64),
+                  ordinary_delete_origin_observed_db_ms=?,
+                  ordinary_delete_seal_observed_db_ms=?,
+                  ordinary_delete_grace_floor_db_ms=?,
+                  ordinary_delete_seal_sha256=REPEAT('b',64)
+             WHERE session_id=?`,
+          [simultaneousAtMs, simultaneousAtMs, simultaneousAtMs,
+            simultaneousAtMs + 2_592_000_001, simultaneous.id],
+        )).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION" });
+        const [stillLive] = await conn.query<RowDataPacket[]>(
+          `SELECT deleted_at_ms,ordinary_delete_origin_sha256
+             FROM sessions WHERE session_id=?`, [simultaneous.id],
+        );
+        expect(stillLive[0]).toMatchObject({ deleted_at_ms: null,
+          ordinary_delete_origin_sha256: null });
+
+        await store.createSession(ordinary);
+        await ordinaryDelete(store, ordinary);
+        const [origin] = await conn.query<RowDataPacket[]>(
+          `SELECT title,last_seq,deletion_generation,
+                  ordinary_delete_origin_sha256 AS sha,
+                  ordinary_delete_origin_observed_db_ms AS observed_ms
+             FROM sessions WHERE session_id=?`, [ordinary.id],
+        );
+        expect(String(origin[0]?.sha)).toMatch(/^[0-9a-f]{64}$/);
+        await expect(conn.query(
+          `UPDATE sessions SET title='unauthorized rewrite',
+                  ordinary_delete_origin_sha256=REPEAT('a',64)
+             WHERE session_id=?`, [ordinary.id],
+        )).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION" });
+        await expect(conn.query(
+          `UPDATE sessions SET ordinary_delete_origin_observed_db_ms=? WHERE session_id=?`,
+          [Number(origin[0]?.observed_ms) + 1, ordinary.id],
+        )).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION" });
+        await expect(conn.query(
+          `UPDATE sessions SET user_id=UPPER(user_id) WHERE session_id=?`, [ordinary.id],
+        )).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION" });
+        await expect(conn.query(
+          `UPDATE sessions SET last_seq=last_seq+1 WHERE session_id=?`, [ordinary.id],
+        )).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION" });
+        await expect(conn.query(
+          `UPDATE sessions SET deletion_generation=deletion_generation+1 WHERE session_id=?`,
+          [ordinary.id],
+        )).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION" });
+        const [afterOrigin] = await conn.query<RowDataPacket[]>(
+          `SELECT title,user_id,last_seq,deletion_generation,
+                  ordinary_delete_origin_sha256 AS sha,
+                  ordinary_delete_origin_observed_db_ms AS observed_ms
+             FROM sessions WHERE session_id=?`, [ordinary.id],
+        );
+        expect(afterOrigin[0]).toMatchObject(origin[0]!);
+        expect(afterOrigin[0]?.user_id).toBe(ordinary.userId);
+
+        await store.sealOrdinarySessionDeleteGrace(
+          ordinary.tenantId, ordinary.userId, ordinary.id,
+        );
+        const [sealed] = await conn.query<RowDataPacket[]>(
+          `SELECT ordinary_delete_seal_observed_db_ms AS seal_ms,
+                  ordinary_delete_grace_floor_db_ms AS floor_ms,
+                  ordinary_delete_seal_sha256 AS seal_sha
+             FROM sessions WHERE session_id=?`, [ordinary.id],
+        );
+        expect(String(sealed[0]?.seal_sha)).toMatch(/^[0-9a-f]{64}$/);
+        await expect(conn.query(
+          `UPDATE sessions SET ordinary_delete_seal_observed_db_ms=?,
+                  ordinary_delete_grace_floor_db_ms=?,
+                  ordinary_delete_seal_sha256=REPEAT('b',64)
+             WHERE session_id=?`,
+          [Number(sealed[0]?.seal_ms) + 1, Number(sealed[0]?.floor_ms) + 1, ordinary.id],
+        )).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION" });
+        const [afterSeal] = await conn.query<RowDataPacket[]>(
+          `SELECT ordinary_delete_seal_observed_db_ms AS seal_ms,
+                  ordinary_delete_grace_floor_db_ms AS floor_ms,
+                  ordinary_delete_seal_sha256 AS seal_sha
+             FROM sessions WHERE session_id=?`, [ordinary.id],
+        );
+        expect(afterSeal[0]).toMatchObject(sealed[0]!);
+
+        await store.createSession(legacy);
+        const atMs = Date.now();
+        await store.commit({
+          sessionId: legacy.id, fence: 1,
+          lifecycle: { type: "tombstone", tenantId: legacy.tenantId, userId: legacy.userId,
+            atMs, purgeAfterMs: null, deletionGeneration: 1 },
+          events: [{ type: "session/deleted", sessionId: legacy.id,
+            emittedAtMs: atMs, deletionGeneration: 1 }],
+        });
+        await expect(conn.query(
+          `UPDATE sessions SET ordinary_delete_origin_sha256=REPEAT('c',64),
+                  ordinary_delete_origin_observed_db_ms=? WHERE session_id=?`,
+          [Date.now(), legacy.id],
+        )).rejects.toMatchObject({ code: "ER_SIGNAL_EXCEPTION" });
+        expect(await store.getOrdinarySessionDeleteGrace(legacy.tenantId, legacy.userId, legacy.id))
+          .toEqual({ state: "unknown", executionReady: false, physicalPurgeEnabled: false });
+      } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
     it("rejects forged generic provenance before any MySQL tombstone write", async () => {
       const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 2 });
       const session = mkSession(`tenant-grace-forge-${randomUUID()}`,

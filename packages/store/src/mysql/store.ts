@@ -951,6 +951,13 @@ const TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME =
   "0044_tenant_telemetry_pregrant_intent.sql";
 const ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME =
   "0050_ordinary_session_delete_grace.sql";
+const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME =
+  "0051_ordinary_session_delete_origin_guard.sql";
+const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME =
+  "trg_sessions_ordinary_delete_grace_bu";
+const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_PREFIX =
+  `CREATE TRIGGER ${ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME} `
+  + "BEFORE UPDATE ON sessions FOR EACH ROW ";
 const TENANT_TELEMETRY_PREGRANT_INTENT_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-pregrant-intent";
 const TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME =
@@ -1058,6 +1065,32 @@ async function executeMysqlMigrationStatement(
   migrationName: string,
   statement: string,
 ): Promise<void> {
+  if (migrationName === ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME
+    && statement.startsWith(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_PREFIX)) {
+    const expectedAction = statement.slice(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_PREFIX.length);
+    if (!expectedAction) throw new Error("0051 ordinary DELETE origin guard action is empty");
+    const [rows] = await conn.query<Row[]>(
+      `SELECT event_object_table AS table_name,action_timing AS timing,
+              event_manipulation AS manipulation,action_orientation AS orientation,
+              action_condition AS condition_value,action_statement AS statement_value
+         FROM information_schema.triggers
+        WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`,
+      [ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME],
+    );
+    if (rows.length === 0) {
+      await conn.query(statement);
+      return;
+    }
+    const existing = rows[0];
+    if (rows.length !== 1 || existing?.table_name !== "sessions"
+      || existing.timing !== "BEFORE" || existing.manipulation !== "UPDATE"
+      || existing.orientation !== "ROW" || existing.condition_value !== null
+      || canonicalMysqlTriggerActionStatement(String(existing.statement_value))
+        !== canonicalMysqlTriggerActionStatement(expectedAction)) {
+      throw new Error("0051 ordinary DELETE origin guard is not exact");
+    }
+    return;
+  }
   if (migrationName === TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME
     || migrationName === TENANT_TELEMETRY_SOURCE_ACCOUNTING_MIGRATION_NAME
     || migrationName === TENANT_TELEMETRY_TARGET_MANIFEST_MIGRATION_NAME
@@ -9189,6 +9222,7 @@ export class MysqlSessionStore implements
   private async assertTenantTelemetryCaptureV2Fingerprint(
     conn: PoolConnection,
     migrationsDir: string,
+    withOrdinaryDeleteOriginGuard = false,
   ): Promise<void> {
     let statements: string[];
     try {
@@ -9204,7 +9238,11 @@ export class MysqlSessionStore implements
       if (priorTriggerStatement.split(where).length !== 2) {
         throw new Error("0044 trigger predicate is not unique");
       }
-      const excluded = TENANT_TELEMETRY_CAPTURE_V2_TRIGGER_NAMES
+      const excluded = [
+        ...TENANT_TELEMETRY_CAPTURE_V2_TRIGGER_NAMES,
+        ...(withOrdinaryDeleteOriginGuard
+          ? [ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME] : []),
+      ]
         .map((name) => `'${name}'`).join(",");
       statements = [
         priorTriggerStatement.replace(
@@ -9288,6 +9326,40 @@ export class MysqlSessionStore implements
     if (checks.length !== 1 || checks[0]?.enforced !== "YES"
       || checks[0]?.clause_sha256 !== "3fd5936f0ac9f5bd887d82bfac75f28e10120a3e40a10c60d47d0f9983904ba1") {
       throw new Error("0050 ordinary DELETE grace CHECK fingerprint is invalid");
+    }
+  }
+
+  private async assertOrdinarySessionDeleteOriginGuardFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    const sql = await readFile(
+      join(migrationsDir, ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME), "utf8",
+    );
+    const statements = mysqlMigrationStatements(sql);
+    if (statements.length !== 1
+      || !statements[0]?.startsWith(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_PREFIX)) {
+      throw new Error("0051 ordinary DELETE origin guard migration source is invalid");
+    }
+    const expectedAction = statements[0].slice(
+      ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_PREFIX.length,
+    );
+    if (!expectedAction) throw new Error("0051 ordinary DELETE origin guard action is empty");
+    const [rows] = await conn.query<Row[]>(
+      `SELECT event_object_table AS table_name,action_timing AS timing,
+              event_manipulation AS manipulation,action_orientation AS orientation,
+              action_condition AS condition_value,action_statement AS statement_value
+         FROM information_schema.triggers
+        WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`,
+      [ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME],
+    );
+    const stored = rows[0];
+    if (rows.length !== 1 || stored?.table_name !== "sessions"
+      || stored.timing !== "BEFORE" || stored.manipulation !== "UPDATE"
+      || stored.orientation !== "ROW" || stored.condition_value !== null
+      || canonicalMysqlTriggerActionStatement(String(stored.statement_value))
+        !== canonicalMysqlTriggerActionStatement(expectedAction)) {
+      throw new Error("0051 ordinary DELETE origin guard fingerprint is invalid");
     }
   }
 
@@ -9954,6 +10026,10 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
         throw new Error("0050 ordinary DELETE grace marker is missing its 0049 predecessor");
       }
+      if (done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME)
+        && !done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
+        throw new Error("0051 ordinary DELETE origin guard marker is missing its 0050 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -10025,10 +10101,15 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryCaptureV2Fingerprint(conn, migrationsDir);
+        await this.assertTenantTelemetryCaptureV2Fingerprint(
+          conn, migrationsDir, done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME),
+        );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
         await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
+      }
+      if (done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME)) {
+        await this.assertOrdinarySessionDeleteOriginGuardFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -10138,8 +10219,23 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
         throw new Error("0050 ordinary DELETE grace marker is missing its 0049 predecessor");
       }
+      if (done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME)
+        && !done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
+        throw new Error("0051 ordinary DELETE origin guard marker is missing its 0050 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME) {
+          const [existingGuard] = await conn.query<Row[]>(
+            `SELECT trigger_name FROM information_schema.triggers
+               WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`,
+            [ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME],
+          );
+          await this.assertTenantTelemetryCaptureV2Fingerprint(
+            conn, dir, existingGuard.length === 1,
+          );
+          await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
+        }
         if (f === TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME) {
           const [footprint] = await conn.query<Row[]>(
             `SELECT (SELECT COUNT(*) FROM information_schema.tables
@@ -10498,10 +10594,15 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryCaptureV2Fingerprint(conn, dir);
+        await this.assertTenantTelemetryCaptureV2Fingerprint(
+          conn, dir, done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME),
+        );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
         await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
+      }
+      if (done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME)) {
+        await this.assertOrdinarySessionDeleteOriginGuardFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
