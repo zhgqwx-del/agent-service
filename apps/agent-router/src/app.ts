@@ -32,6 +32,9 @@ import {
   INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
   INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
   INTERNAL_TENANT_DATABASE_PURGE_READY_PATH,
+  INTERNAL_SESSION_USAGE_RETENTION_ACK_HEADER,
+  INTERNAL_SESSION_USAGE_RETENTION_ACK_VALUE,
+  INTERNAL_SESSION_USAGE_RETENTION_READY_PATH,
   INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER,
   INTERNAL_TENANT_REDIS_PURGE_ACK_VALUE,
   INTERNAL_TENANT_REDIS_PURGE_READY_PATH,
@@ -57,6 +60,7 @@ import {
   OPENAPI_DOCUMENT,
   PROTOCOL_VERSION,
   PURGE_POLICY_EVALUATOR_V1,
+  ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1,
   TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1,
   TENANT_CREDENTIAL_REVOCATION_STORE_V1,
   TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1,
@@ -132,6 +136,8 @@ export interface RouterAppDeps {
   tenantPurgeExecutionEnabled?: () => boolean;
   /** Independent activation gate for T3f local database-content deletion queue claims. */
   tenantDatabasePurgeEnabled?: () => boolean;
+  /** Independent default-off ordinary DELETE operational-usage barrier; not session content. */
+  ordinarySessionUsageRetentionEnabled?: () => boolean;
   /** Independent activation gate for T3g Redis session-state deletion queue claims. */
   tenantRedisPurgeEnabled?: () => boolean;
   /** Expected content-free namespace identity projected only after all runners match it. */
@@ -369,6 +375,12 @@ export function createRouterApp(deps: RouterAppDeps) {
     !!deps.internalRunnerToken
     && (deps.tenantRedisPurgeEnabled?.() ?? false)
     && deps.registry.allConfiguredSupportTenantRedisPurgeWorker()
+  );
+  const ordinarySessionUsageRetentionAvailable = () => (
+    !!deps.internalRunnerToken
+    && (deps.ready?.() ?? true)
+    && (deps.ordinarySessionUsageRetentionEnabled?.() ?? false)
+    && deps.registry.allConfiguredSupportOrdinarySessionUsageRetentionWorker()
   );
   const userDataExportReadable = () => (
     (deps.dataExportArtifactsEnabled?.() ?? false)
@@ -659,6 +671,10 @@ export function createRouterApp(deps: RouterAppDeps) {
                   ],
                 tenantPurgeExecutionWorker: tenantPurgeExecutionAvailable(),
                 tenantDatabasePurgeWorker: tenantDatabasePurgeAvailable(),
+                ordinarySessionUsageRetention:
+                  deps.registry.allConfiguredSupportOrdinarySessionUsageRetention()
+                    ? [ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1] : [],
+                ordinarySessionUsageRetentionWorker: ordinarySessionUsageRetentionAvailable(),
                 tenantRedisPurge: deps.registry.allConfiguredSupportTenantRedisPurge()
                   ? [TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1]
                   : [],
@@ -832,6 +848,27 @@ export function createRouterApp(deps: RouterAppDeps) {
       INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER,
       INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE,
     );
+    return c.body(null, 204);
+  });
+
+  /** Each ordinary usage boundary requires a fresh all-configured, non-sticky worker proof. */
+  app.get(INTERNAL_SESSION_USAGE_RETENTION_READY_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) {
+      return internalNotFound(c);
+    }
+    if (!(deps.ready?.() ?? true) || !(deps.ordinarySessionUsageRetentionEnabled?.() ?? false)) {
+      return c.body(null, 503);
+    }
+    try {
+      await deps.registry.refreshOrdinarySessionUsageRetention(
+        AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]),
+      );
+    } catch {
+      return c.body(null, 503);
+    }
+    if (!ordinarySessionUsageRetentionAvailable()) return c.body(null, 503);
+    c.header(INTERNAL_SESSION_USAGE_RETENTION_ACK_HEADER, INTERNAL_SESSION_USAGE_RETENTION_ACK_VALUE);
     return c.body(null, 204);
   });
 
@@ -1293,6 +1330,8 @@ export function createRouterApp(deps: RouterAppDeps) {
       || url.pathname.startsWith(`${INTERNAL_TENANT_PURGE_EXECUTION_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_DATABASE_PURGE_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_TENANT_DATABASE_PURGE_READY_PATH}/`)
+      || url.pathname === INTERNAL_SESSION_USAGE_RETENTION_READY_PATH
+      || url.pathname.startsWith(`${INTERNAL_SESSION_USAGE_RETENTION_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_REDIS_PURGE_READY_PATH
       || url.pathname.startsWith(`${INTERNAL_TENANT_REDIS_PURGE_READY_PATH}/`)
       || url.pathname === INTERNAL_TENANT_ERASURE_ADMISSION_READY_PATH

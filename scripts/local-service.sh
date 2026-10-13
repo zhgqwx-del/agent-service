@@ -6,13 +6,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# The one-shot migration/restore/backup commands are operator-authority surfaces. Preserve every
-# caller-provided setting, including an explicitly empty value, before loading local defaults. The
+# One-shot migration/restore/backup and usage-retention gates are authority surfaces. Preserve
+# every caller-provided setting, including an explicitly empty value, before loading local defaults. The
 # AWS SDK may use any exported AWS_* setting through its default credential/endpoint provider
 # chain, so preserve those caller values as well instead of letting .env silently retarget them.
 caller_mover_env_names=(
   NODE_ENV
   MYSQL_URL
+  SESSION_USAGE_RETENTION_ENABLED
+  SESSION_USAGE_RETENTION_WORKER_ENABLED
+  SESSION_USAGE_RETENTION_WORKER_POLL_MS
+  SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE
   MIGRATION_ID
   FLEET_DRAINED_EVIDENCE_SHA256
   ROLLBACK_WINDOW_MS
@@ -398,6 +402,7 @@ start_apps() {
       -u TENANT_PURGE_EXECUTION_ENABLED \
       -u TENANT_DATABASE_PURGE_ENABLED \
       -u TENANT_REDIS_PURGE_ENABLED \
+      -u SESSION_USAGE_RETENTION_ENABLED \
       -u TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED \
       -u RESTORE_JOURNAL_NAMESPACE_SHA256 \
       -u RESTORE_JOURNAL_TARGET_ROOT_SHA256 \
@@ -421,6 +426,7 @@ start_apps() {
       BLOB_ATTACHMENTS_ENABLED="${BLOB_ATTACHMENTS_ENABLED:-1}" \
       BLOB_MAX_BYTES="${BLOB_MAX_BYTES:-1000000}" \
       SESSION_DELETE_GRACE_RECOVERY_ENABLED="${SESSION_DELETE_GRACE_RECOVERY_ENABLED:-0}" \
+      SESSION_USAGE_RETENTION_WORKER_ENABLED="${SESSION_USAGE_RETENTION_WORKER_ENABLED:-0}" \
       DATA_ERASURE_REQUESTS_ENABLED="${DATA_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_ERASURE_REQUESTS_ENABLED="${TENANT_ERASURE_REQUESTS_ENABLED:-0}" \
       TENANT_ERASURE_BARRIER_TIMEOUT_MS="${TENANT_ERASURE_BARRIER_TIMEOUT_MS:-2000}" \
@@ -457,6 +463,9 @@ start_apps() {
       -u SESSION_DELETE_GRACE_RECOVERY_ENABLED \
       -u SESSION_DELETE_GRACE_RECOVERY_POLL_MS \
       -u SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE \
+      -u SESSION_USAGE_RETENTION_WORKER_ENABLED \
+      -u SESSION_USAGE_RETENTION_WORKER_POLL_MS \
+      -u SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE \
       -u CREDENTIAL_TARGET_EXECUTION_ADAPTER \
       -u TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED \
       -u TENANT_RUNTIME_DRAIN_ENABLED -u TENANT_RUNTIME_REVOCATION_WORKER_ENABLED \
@@ -515,6 +524,7 @@ start_apps() {
       TENANT_PURGE_EXECUTION_ENABLED="${TENANT_PURGE_EXECUTION_ENABLED:-0}" \
       TENANT_DATABASE_PURGE_ENABLED="${TENANT_DATABASE_PURGE_ENABLED:-0}" \
       TENANT_REDIS_PURGE_ENABLED="${TENANT_REDIS_PURGE_ENABLED:-0}" \
+      SESSION_USAGE_RETENTION_ENABLED="${SESSION_USAGE_RETENTION_ENABLED:-0}" \
       DATA_GOVERNANCE_MANAGEMENT_ENABLED="${DATA_GOVERNANCE_MANAGEMENT_ENABLED:-0}" \
       PURGE_POLICY_EVALUATOR_ENABLED="${PURGE_POLICY_EVALUATOR_ENABLED:-0}" \
       DATA_EXPORT_REQUESTS_ENABLED="${DATA_EXPORT_REQUESTS_ENABLED:-0}" \
@@ -592,6 +602,9 @@ verify() {
   # Focused suites invoke the recovery caller explicitly against disposable test databases.
   unset SESSION_DELETE_GRACE_RECOVERY_ENABLED SESSION_DELETE_GRACE_RECOVERY_POLL_MS
   unset SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE
+  # Retention is an explicit non-production destructive activation, never inherited by verify.
+  unset SESSION_USAGE_RETENTION_ENABLED SESSION_USAGE_RETENTION_WORKER_ENABLED
+  unset SESSION_USAGE_RETENTION_WORKER_POLL_MS SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE
   # The standard verification stack is MySQL. Keep the memory-only 0029 fake out of application
   # subprocesses; the dedicated Memory tests construct it explicitly in-process.
   unset CREDENTIAL_TARGET_EXECUTION_ADAPTER
@@ -640,6 +653,12 @@ verify() {
   pnpm run test:session-delete-grace-recovery-memory
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:session-delete-grace-recovery-mysql
+  pnpm run test:session-usage-retention-memory
+  pnpm run test:session-usage-retention-worker
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:session-usage-retention-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:session-usage-retention-worker-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:blob-mysql
   pnpm run test:blob-storage-control-memory
@@ -718,6 +737,9 @@ verify_real() {
 
 verify_s3() {
   require_tools
+  # Adapter smoke tests must not inherit an operator's unrelated destructive usage gate.
+  unset SESSION_USAGE_RETENTION_WORKER_ENABLED SESSION_USAGE_RETENTION_ENABLED
+  unset SESSION_USAGE_RETENTION_WORKER_POLL_MS SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE
   MINIO_ENABLED=1 deploy/local/infra.sh start
   local -a s3_test_env=(
     S3_TEST_ENDPOINT="${MINIO_ENDPOINT:-http://127.0.0.1:9000}"

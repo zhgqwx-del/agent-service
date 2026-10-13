@@ -1128,6 +1128,10 @@ export type components = {
                 readonly erasureJobControl?: readonly ("quarantine-v1" | "legacy-tombstone-compensation-v1")[];
                 readonly mcp: readonly ("streamable-http" | "stdio")[];
                 /** @default [] */
+                readonly ordinarySessionUsageRetention?: readonly "local-operational-usage-v1"[];
+                /** @default false */
+                readonly ordinarySessionUsageRetentionWorker?: boolean;
+                /** @default [] */
                 readonly purgePolicyEvaluation?: readonly "policy-evaluator-v1"[];
                 readonly replay: {
                     readonly hotWindowMs: number;

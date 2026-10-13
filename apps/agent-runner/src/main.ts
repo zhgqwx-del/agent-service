@@ -13,6 +13,7 @@ import {
   LegacyTombstoneCompensationWorker,
   LifecycleOutboxDispatcher,
   OrdinarySessionDeleteGraceRecovery,
+  OrdinarySessionUsageRetentionWorker,
   PiEngine,
   PiSummariser,
   PurgePolicyEvaluator,
@@ -86,6 +87,7 @@ import {
   type TenantRuntimeRevocationStore,
   type SessionStore,
   type UsageLifecycleStore,
+  type OrdinarySessionUsageRetentionStore,
   type UserDataExportCleanupStore,
   type UserDataExportJobStore,
   type UserDataExportRequestStore,
@@ -103,6 +105,7 @@ import { RouterTenantErasureAdmissionGate } from "./tenant-erasure-admission-gat
 import { RouterTenantCredentialRevocationGate } from "./tenant-credential-revocation-gate.js";
 import { RouterTenantCredentialTargetExecutionGate } from "./tenant-credential-target-execution-gate.js";
 import { RouterTenantDatabasePurgeGate } from "./tenant-database-purge-gate.js";
+import { RouterOrdinarySessionUsageRetentionGate } from "./ordinary-session-usage-retention-gate.js";
 import { RouterTenantRedisPurgeGate } from "./tenant-redis-purge-gate.js";
 import {
   createTenantRestoreJournalAdapters,
@@ -269,6 +272,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & LegacyTombstoneCompensationStore
     & RetentionPolicyStore
     & UsageLifecycleStore
+    & OrdinarySessionUsageRetentionStore
     & ErasureSessionStore
     & UserDataExportRequestStore
     & UserDataExportJobStore
@@ -299,6 +303,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let providerTenantTelemetry: TenantTelemetryApplicationDualWrite | undefined;
   let tenantTelemetryRetryTimer: ReturnType<typeof setInterval> | undefined;
   let ordinarySessionDeleteGraceRecovery: OrdinarySessionDeleteGraceRecovery | undefined;
+  let ordinarySessionUsageRetentionWorker: OrdinarySessionUsageRetentionWorker | undefined;
   const closeTenantRestoreJournal = (): Promise<void> => {
     if (tenantRestoreJournalClosePromise) return tenantRestoreJournalClosePromise;
     tenantRestoreJournalClosePromise = tenantRestoreJournalWorker !== undefined
@@ -1002,6 +1007,21 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       batchSize: cfg.SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE,
     })
     : undefined;
+  const ordinarySessionUsageRetentionGate = cfg.SESSION_USAGE_RETENTION_WORKER_ENABLED
+    ? new RouterOrdinarySessionUsageRetentionGate({
+      routerBaseUrl: cfg.ERASURE_ROUTER_URL!,
+      internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+      requestTimeoutMs: cfg.TENANT_ERASURE_BARRIER_TIMEOUT_MS,
+    }) : undefined;
+  ordinarySessionUsageRetentionWorker = ordinarySessionUsageRetentionGate
+    ? new OrdinarySessionUsageRetentionWorker({
+      store,
+      canExecute: () => ordinarySessionUsageRetentionGate.canExecute(),
+      logger: runnerRuntimeLogger,
+    }, {
+      pollIntervalMs: cfg.SESSION_USAGE_RETENTION_WORKER_POLL_MS,
+      batchSize: cfg.SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE,
+    }) : undefined;
   legacyTombstoneCompensationWorker?.start();
   erasureWorker?.start();
   purgePolicyEvaluator?.start();
@@ -1015,6 +1035,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   tenantPurgeExecutionWorker?.start();
   tenantDatabasePurgeWorker?.start();
   ordinarySessionDeleteGraceRecovery?.start();
+  ordinarySessionUsageRetentionWorker?.start();
   tenantRedisPurgeWorker?.start();
   tenantTelemetryWriterRuntime.worker?.start();
 
@@ -1082,6 +1103,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       tenantPurgeExecutionWorker !== undefined,
     tenantDatabasePurgeWorkerEnabled:
       tenantDatabasePurgeWorker !== undefined,
+    ordinarySessionUsageRetentionSupported: true,
+    ordinarySessionUsageRetentionWorkerEnabled: ordinarySessionUsageRetentionWorker !== undefined,
     tenantRedisPurgeSupported: tenantRedisPurgeAdapter !== undefined,
     tenantRedisPurgeWorkerEnabled: tenantRedisPurgeWorker !== undefined,
     tenantRedisPurgeNamespaceSha256: redisNamespaceSha256,
@@ -1126,6 +1149,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         tenantPurgeExecutionWorker?.stop(),
         tenantDatabasePurgeWorker?.stop(),
         ordinarySessionDeleteGraceRecovery?.stop(),
+        ordinarySessionUsageRetentionWorker?.stop(),
         tenantRedisPurgeWorker?.stop(),
       ]);
       await host.drain(30_000);
@@ -1190,6 +1214,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     cfg.TENANT_PURGE_EXECUTION_WORKER_ENABLED,
     cfg.TENANT_DATABASE_PURGE_WORKER_ENABLED,
     cfg.SESSION_DELETE_GRACE_RECOVERY_ENABLED,
+    cfg.SESSION_USAGE_RETENTION_WORKER_ENABLED,
     cfg.TENANT_REDIS_PURGE_WORKER_ENABLED,
     cfg.DATA_GOVERNANCE_MANAGEMENT_ENABLED,
     cfg.PURGE_POLICY_EVALUATOR_ENABLED,
@@ -1216,6 +1241,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantPurgeExecutionGate, tenantPurgeExecutionWorker,
     tenantDatabasePurgeGate, tenantDatabasePurgeWorker,
     ordinarySessionDeleteGraceRecovery,
+    ordinarySessionUsageRetentionGate, ordinarySessionUsageRetentionWorker,
     tenantRedisPurgeGate, tenantRedisPurgeWorker, tenantRedisPurgeAdapter,
     tenantTelemetryWriterRuntime, providerTenantTelemetry,
     tenantRuntimeBootId,
@@ -1225,6 +1251,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   } catch (error) {
     if (tenantTelemetryRetryTimer !== undefined) clearInterval(tenantTelemetryRetryTimer);
     await ordinarySessionDeleteGraceRecovery?.stop();
+    await ordinarySessionUsageRetentionWorker?.stop();
     await providerTenantTelemetry?.close();
     await tenantTelemetryWriterRuntime?.worker?.stop();
     await closeTenantRestoreJournal();

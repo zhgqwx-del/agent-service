@@ -11,6 +11,7 @@ import {
   INTERNAL_TENANT_RUNTIME_DRAIN_ACK_VALUE,
   INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH,
   PURGE_POLICY_EVALUATOR_V1,
+  ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
@@ -155,6 +156,9 @@ export class RunnerRegistry {
   private readonly redis?: Redis;
   private timer?: NodeJS.Timeout;
   private checkInFlight?: Promise<void>;
+  /** Serialized retention requests are separate from the tracker of an actual fleet probe. */
+  private ordinarySessionUsageRetentionQueue: Promise<void> = Promise.resolve();
+  private ordinarySessionUsageRetentionClosing = false;
 
   constructor(private readonly opts: RunnerRegistryOptions) {
     for (const url of opts.runners) {
@@ -193,6 +197,8 @@ export class RunnerRegistry {
 
   async close(): Promise<void> {
     clearInterval(this.timer);
+    this.ordinarySessionUsageRetentionClosing = true;
+    await this.ordinarySessionUsageRetentionQueue;
     await this.checkInFlight?.catch(() => {});
     await this.redis?.quit().catch(() => {});
   }
@@ -701,6 +707,22 @@ export class RunnerRegistry {
     ));
   }
 
+  /** Code-awareness alone conveys no ordinary usage deletion authority. */
+  allConfiguredSupportOrdinarySessionUsageRetention(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => (
+      target.healthy
+      && target.capabilities?.features.ordinarySessionUsageRetention.includes(
+        ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1,
+      ) === true
+    ));
+  }
+
+  allConfiguredSupportOrdinarySessionUsageRetentionWorker(): boolean {
+    return this.allConfiguredSupportOrdinarySessionUsageRetention()
+      && this.list().every((target) => target.capabilities?.features.ordinarySessionUsageRetentionWorker === true);
+  }
+
   /** Every configured runner must understand T3g and target this exact Redis namespace. */
   allConfiguredSupportTenantRedisPurge(): boolean {
     const expectedNamespace = this.opts.redisNamespaceSha256;
@@ -883,20 +905,60 @@ export class RunnerRegistry {
     await this.checkAll();
   }
 
-  private checkAll(): Promise<void> {
-    if (this.checkInFlight) return this.checkInFlight;
-    const check = this.checkAllOnce();
-    this.checkInFlight = check.finally(() => {
-      this.checkInFlight = undefined;
+  /** A retention boundary cannot inherit a probe that started before its own request. */
+  async refreshOrdinarySessionUsageRetention(signal = AbortSignal.timeout(5_000)): Promise<void> {
+    signal.throwIfAborted();
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      if (this.ordinarySessionUsageRetentionClosing) throw new Error("runner registry is closing");
+    };
+    assertCurrent();
+    const check = this.ordinarySessionUsageRetentionQueue.then(async () => {
+      assertCurrent(); // Expired queued requests never start or occupy an actual fleet probe.
+      while (this.checkInFlight) {
+        await this.checkInFlight.catch(() => {});
+        assertCurrent();
+      }
+      // No await between the empty tracker check and installing our own actual probe.
+      await this.beginActualProbe(signal);
+      assertCurrent();
     });
-    return this.checkInFlight;
+    this.ordinarySessionUsageRetentionQueue = check.catch(() => {});
+    // Only the independent queue tail swallows rejection; shared old refresh/periodic callers
+    // always begin or inherit a real checkAllOnce, never an expired request which did not probe.
+    let onAbort: (() => void) | undefined;
+    try {
+      await Promise.race([check, new Promise<never>((_, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      })]);
+      signal.throwIfAborted();
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
   }
 
-  private async checkAllOnce(): Promise<void> {
+  private checkAll(): Promise<void> {
+    if (this.checkInFlight) return this.checkInFlight;
+    return this.beginActualProbe();
+  }
+
+  private beginActualProbe(boundarySignal?: AbortSignal): Promise<void> {
+    const check = this.checkAllOnce(boundarySignal);
+    const tracked = check.finally(() => {
+      if (this.checkInFlight === tracked) this.checkInFlight = undefined;
+    });
+    this.checkInFlight = tracked;
+    return tracked;
+  }
+
+  private async checkAllOnce(boundarySignal?: AbortSignal): Promise<void> {
     await Promise.all(
       [...this.targets.values()].map(async (t) => {
         try {
-          const signal = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
+          const timeout = AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000);
+          const signal = boundarySignal ? AbortSignal.any([boundarySignal, timeout]) : timeout;
           const request = () => ({
             signal,
             redirect: "manual" as const,

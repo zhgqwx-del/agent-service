@@ -97,6 +97,9 @@ const Env = z.object({
   TENANT_DATABASE_PURGE_ENABLED: z.enum(["0", "1"])
     .default("0")
     .transform((value) => value === "1"),
+  /** Non-production only: independent ordinary DELETE operational-usage fleet barrier. */
+  SESSION_USAGE_RETENTION_ENABLED: z.enum(["0", "1"])
+    .default("0").transform((value) => value === "1"),
   /** Independent T3g Redis session-state deletion barrier. */
   TENANT_REDIS_PURGE_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -192,6 +195,7 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     || key.startsWith("MYSQL_")
     || key.startsWith("S3_TEST_")
     || key.startsWith("SESSION_DELETE_GRACE_RECOVERY_")
+    || key.startsWith("SESSION_USAGE_RETENTION_WORKER_")
     || key.startsWith("TENANT_TELEMETRY_")
     || key.startsWith("TELEMETRY_LIFECYCLE_")
   ) && env[key] !== undefined);
@@ -228,6 +232,9 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     throw new Error(`${runnerOnlyKey} is runner-only object-store authority and must not enter the router process`);
   }
   const c = Env.parse(env);
+  if (c.NODE_ENV === "production" && c.SESSION_USAGE_RETENTION_ENABLED) {
+    throw new Error("SESSION_USAGE_RETENTION_ENABLED=1 is unsupported in production");
+  }
   const runnerList = [...new Set(c.RUNNERS.split(",").map((s) => s.trim()).filter(Boolean).map(validateRunnerUrl))];
   const internalRouterToken = c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN;
   let blobStorage: BlobStorageCapability | undefined;

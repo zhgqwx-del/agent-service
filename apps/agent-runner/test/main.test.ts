@@ -44,6 +44,7 @@ import {
   ErasureWorker,
   LegacyTombstoneCompensationWorker,
   OrdinarySessionDeleteGraceRecovery,
+  OrdinarySessionUsageRetentionWorker,
   PurgePolicyEvaluator,
   TenantContentInventoryWorker,
   TenantCredentialTargetExecutionWorker,
@@ -909,6 +910,45 @@ describe("runner main blob wiring", () => {
       start.mockRestore();
       recover.mockRestore();
       log.mockRestore();
+      await rm(blobDir, { recursive: true, force: true });
+    }
+  });
+
+  it("constructs ordinary usage retention only when explicitly enabled and drains it before the host", async () => {
+    const blobDir = await mkdtemp(join(tmpdir(), "agent-runner-ordinary-usage-retention-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const start = vi.spyOn(OrdinarySessionUsageRetentionWorker.prototype, "start").mockImplementation(() => {});
+    let runner: Awaited<ReturnType<typeof startRunner>> | undefined;
+    try {
+      for (const enabled of [false, true]) {
+        runner = await startRunner({ SECRETS_MASTER_KEY: MASTER_KEY, INTERNAL_ROUTER_TOKEN: INTERNAL_TOKEN,
+          RUNNER_PORT: "0", RUNNER_ADDR: "127.0.0.1:0", BLOB_DIR: blobDir,
+          ERASURE_ROUTER_URL: "http://router.internal:8080",
+          ...(enabled ? { SESSION_USAGE_RETENTION_WORKER_ENABLED: "1", SESSION_USAGE_RETENTION_WORKER_POLL_MS: "60000" } : {}),
+        });
+        expect(await (await runner.app.request("/v1/capabilities")).json()).toMatchObject({ features: {
+          ordinarySessionUsageRetention: ["local-operational-usage-v1"],
+          ordinarySessionUsageRetentionWorker: enabled, dataPurgeExecution: false,
+        } });
+        if (!enabled) {
+          expect(runner.ordinarySessionUsageRetentionWorker).toBeUndefined();
+          expect(runner.ordinarySessionUsageRetentionGate).toBeUndefined();
+          expect(start).not.toHaveBeenCalled();
+          await runner.close(); runner = undefined;
+          continue;
+        }
+        expect(runner.ordinarySessionUsageRetentionWorker).toBeInstanceOf(OrdinarySessionUsageRetentionWorker);
+        expect(runner.ordinarySessionUsageRetentionGate).toBeDefined();
+        expect(start).toHaveBeenCalledOnce();
+        const stop = vi.spyOn(runner.ordinarySessionUsageRetentionWorker!, "stop");
+        const hostDrain = vi.spyOn(runner.host, "drain");
+        await runner.close();
+        expect(stop).toHaveBeenCalledOnce();
+        expect(stop.mock.invocationCallOrder[0]).toBeLessThan(hostDrain.mock.invocationCallOrder[0]!);
+        runner = undefined;
+      }
+    } finally {
+      await runner?.close(); start.mockRestore(); log.mockRestore();
       await rm(blobDir, { recursive: true, force: true });
     }
   });

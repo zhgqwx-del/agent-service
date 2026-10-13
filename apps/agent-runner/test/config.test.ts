@@ -12,6 +12,21 @@ const productionEnv: NodeJS.ProcessEnv = {
 };
 
 describe("runner configuration", () => {
+  it("keeps ordinary usage retention default-off, bounded, router-bound and non-production only", () => {
+    expect(loadConfig({ SECRETS_MASTER_KEY: SECRET }).SESSION_USAGE_RETENTION_WORKER_ENABLED).toBe(false);
+    expect(loadConfig({ SECRETS_MASTER_KEY: SECRET, ERASURE_ROUTER_URL: "http://router:8080",
+      SESSION_USAGE_RETENTION_WORKER_ENABLED: "1", SESSION_USAGE_RETENTION_WORKER_POLL_MS: "9",
+      SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE: "7" })).toMatchObject({
+        SESSION_USAGE_RETENTION_WORKER_ENABLED: true, SESSION_USAGE_RETENTION_WORKER_POLL_MS: 9,
+        SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE: 7,
+      });
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, SESSION_USAGE_RETENTION_WORKER_ENABLED: "1" })).toThrow(/ERASURE_ROUTER_URL/);
+    expect(() => loadConfig({ ...productionEnv, SESSION_USAGE_RETENTION_WORKER_ENABLED: "1" })).toThrow(/unsupported in production/);
+    expect(loadConfig(productionEnv).SESSION_USAGE_RETENTION_WORKER_ENABLED).toBe(false);
+    for (const [key, value] of [["SESSION_USAGE_RETENTION_WORKER_ENABLED", "true"], ["SESSION_USAGE_RETENTION_WORKER_POLL_MS", "0"], ["SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE", "101"]]) {
+      expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, [key!]: value })).toThrow();
+    }
+  });
   it("keeps ordinary DELETE origin recovery independent and bounded", () => {
     const enabled = loadConfig({ SECRETS_MASTER_KEY: SECRET,
       SESSION_DELETE_GRACE_RECOVERY_ENABLED: "1",

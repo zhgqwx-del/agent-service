@@ -151,6 +151,14 @@ export const INTERNAL_TENANT_DATABASE_PURGE_ACK_HEADER =
 export const INTERNAL_TENANT_DATABASE_PURGE_ACK_VALUE =
   "local-db-content-delete-v1" as const;
 
+/** One fresh proof permits only one ordinary DELETE operational-usage boundary, never content purge. */
+export const INTERNAL_SESSION_USAGE_RETENTION_READY_PATH =
+  "/_internal/ordinary-session-usage-retention-v1/ready" as const;
+export const INTERNAL_SESSION_USAGE_RETENTION_ACK_HEADER =
+  "x-agent-service-session-usage-retention" as const;
+export const INTERNAL_SESSION_USAGE_RETENTION_ACK_VALUE =
+  "local-operational-usage-v1" as const;
+
 /**
  * T3g removes the three session-scoped Redis domains and installs a permanent, content-free
  * Redis purge fence. This is deliberately independent from both the T3e local execution ACK and
@@ -485,6 +493,10 @@ export type TenantPurgeExecutionCapability = z.infer<
   typeof TenantPurgeExecutionCapability
 >;
 
+export const ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1 = "local-operational-usage-v1" as const;
+export const OrdinarySessionUsageRetentionCapability = z.literal(ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1);
+export type OrdinarySessionUsageRetentionCapability = z.infer<typeof OrdinarySessionUsageRetentionCapability>;
+
 export const TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1 =
   "session-state-delete-v1" as const;
 export const TenantRedisPurgeCapability = z.literal(
@@ -668,6 +680,10 @@ export const Capabilities = z.object({
     tenantPurgeExecutionWorker: z.boolean().default(false),
     /** Local T3f database-content worker activation; it has an independent router barrier. */
     tenantDatabasePurgeWorker: z.boolean().default(false),
+    /** Ordinary DELETE operational-usage only; absent on old runners, never advertises content purge. */
+    ordinarySessionUsageRetention: z.array(OrdinarySessionUsageRetentionCapability).max(1).default([]),
+    /** Local default-off worker; each action still requires its independent fresh router barrier. */
+    ordinarySessionUsageRetentionWorker: z.boolean().default(false),
     /** Additive T3g Redis lease/fence/stream deletion and permanent marker contract. */
     tenantRedisPurge: z.array(TenantRedisPurgeCapability).max(1).default([]),
     /** Local T3g worker activation; fleet execution additionally requires its router barrier. */

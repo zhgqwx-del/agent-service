@@ -11,14 +11,18 @@ const testFile = resolve(ROOT, requested);
 const relativeTestFile = relative(ROOT, testFile).split(sep).join("/");
 const storeSuite = relativeTestFile.startsWith("packages/store/test/")
   && relativeTestFile.endsWith(".mysql.test.ts");
-const runnerRecoverySuite = relativeTestFile
-  === "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts";
-if (!storeSuite && !runnerRecoverySuite) {
+const runnerLifecycleSuite = relativeTestFile
+  === "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts"
+  || relativeTestFile === "apps/agent-runner/test/ordinary-session-usage-retention.mysql.test.ts";
+if (!storeSuite && !runnerLifecycleSuite) {
   throw new Error(`refusing non-MySQL integration suite: ${relativeTestFile}`);
 }
 
 const reportDir = resolve(ROOT, ".local-run");
-const reportFile = resolve(reportDir, `${relativeTestFile.split("/").at(-1)}.json`);
+// Preserve existing store report names; runner files may share their basename with a store suite.
+// Keep both execution records instead of letting the later layer silently overwrite the first.
+const reportName = storeSuite ? relativeTestFile.split("/").at(-1) : relativeTestFile.replaceAll("/", "__");
+const reportFile = resolve(reportDir, `${reportName}.json`);
 await mkdir(reportDir, { recursive: true });
 
 const vitestEntrypoint = resolve(ROOT, "node_modules", "vitest", "vitest.mjs");

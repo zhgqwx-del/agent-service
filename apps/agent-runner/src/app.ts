@@ -66,6 +66,7 @@ import {
   TENANT_RESTORE_JOURNAL_INDEPENDENT_V1,
   TENANT_PURGE_EXECUTION_LOCAL_ACK_V1,
   TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1,
+  ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1,
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TENANT_RUNTIME_DRAIN_V1,
   TenantErasureCreateRequest,
@@ -212,6 +213,9 @@ export interface AppDeps {
   tenantPurgeExecutionWorkerEnabled?: boolean;
   /** Local T3f database-content worker activation; its router barrier remains independent. */
   tenantDatabasePurgeWorkerEnabled?: boolean;
+  /** Store implements the ordinary source/policy-bound operational usage contract. */
+  ordinarySessionUsageRetentionSupported?: boolean;
+  ordinarySessionUsageRetentionWorkerEnabled?: boolean;
   /** T3g code-awareness is advertised only when a concrete Redis purge adapter is wired. */
   tenantRedisPurgeSupported?: boolean;
   /** Local T3g worker activation; its router barrier remains independent. */
@@ -436,6 +440,10 @@ export function createApp(deps: AppDeps) {
         ],
         tenantPurgeExecutionWorker: deps.tenantPurgeExecutionWorkerEnabled === true,
         tenantDatabasePurgeWorker: deps.tenantDatabasePurgeWorkerEnabled === true,
+        ordinarySessionUsageRetention: deps.ordinarySessionUsageRetentionSupported === true
+          ? [ORDINARY_SESSION_USAGE_RETENTION_LOCAL_V1] : [],
+        ordinarySessionUsageRetentionWorker: deps.ordinarySessionUsageRetentionSupported === true
+          && deps.ordinarySessionUsageRetentionWorkerEnabled === true,
         tenantRedisPurge: tenantRedisPurgeSupported
           ? [TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1]
           : [],

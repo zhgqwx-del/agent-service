@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { isCanonicalId } from "@agent-service/protocol";
+import { assertPriorRetainedBillingFactProof, type PriorRetainedBillingFactProof } from "./ordinary-usage-retention.js";
 
 export const TENANT_DATABASE_PURGE_PREDELETE_ENTRY_SCOPE =
   "tenant-database-purge-predelete-entry-v1" as const;
@@ -396,6 +397,8 @@ export interface TenantDatabasePurgeDomainAck extends TenantDatabasePurgeIdentit
 }
 
 export interface TenantDatabasePurgeReceipt extends TenantDatabasePurgeSource {
+  /** 0052 v2 hash extension. Absent only on historical receipts; new stores explicitly seal empty. */
+  priorRetainedBillingFacts?: PriorRetainedBillingFactProof;
   scope: typeof TENANT_DATABASE_PURGE_RECEIPT_SCOPE;
   preDeleteReceiptSha256: string;
   preDeleteEntryCount: number;
@@ -442,6 +445,7 @@ export interface TenantPurgeSessionGraveMarker extends TenantDatabasePurgeIdenti
   t3cSessionReceiptSha256: string;
   preDeleteReceiptSha256: string;
   markedAtDbMs: number;
+  ordinaryUsageRetention?: { sourceSha256: string; receiptSha256: string | null };
   markerSha256: string;
 }
 
@@ -1183,7 +1187,7 @@ export function tenantDatabasePurgeSessionGraveMarkerSha256(marker: GraveMarkerB
   if (marker.markedAtDbMs < marker.deletedAtDbMs) {
     throw new Error("tenant purge grave marker predates the session deletion");
   }
-  return sha256([
+  const legacySha256 = sha256([
     "tenant-purge-session-grave-marker-v1",
     marker.scope,
     ...IDENTITY_KEYS.map((key) => marker[key]),
@@ -1195,6 +1199,12 @@ export function tenantDatabasePurgeSessionGraveMarkerSha256(marker: GraveMarkerB
     marker.preDeleteReceiptSha256,
     marker.markedAtDbMs,
   ]);
+  if (marker.ordinaryUsageRetention === undefined) return legacySha256;
+  exactKeys(marker.ordinaryUsageRetention, ["sourceSha256", "receiptSha256"], "grave ordinary usage retention");
+  digest(marker.ordinaryUsageRetention.sourceSha256, "grave ordinary usage source");
+  if (marker.ordinaryUsageRetention.receiptSha256 !== null) digest(marker.ordinaryUsageRetention.receiptSha256, "grave ordinary usage receipt");
+  return sha256(["tenant-purge-session-grave-marker-v2", legacySha256,
+    marker.ordinaryUsageRetention.sourceSha256, marker.ordinaryUsageRetention.receiptSha256]);
 }
 
 export function validateTenantDatabasePurgeSessionGraveMarker(
@@ -1211,6 +1221,7 @@ export function validateTenantDatabasePurgeSessionGraveMarker(
     "preDeleteReceiptSha256",
     "markedAtDbMs",
     "markerSha256",
+    ...(marker.ordinaryUsageRetention === undefined ? [] : ["ordinaryUsageRetention"]),
   ], "tenant purge session grave marker");
   const expected = tenantDatabasePurgeSessionGraveMarkerSha256(marker);
   digest(marker.markerSha256, "tenant purge session grave marker");
@@ -1303,7 +1314,7 @@ export function tenantDatabasePurgeReceiptSha256(receipt: ReceiptBody): string {
     || receipt.allDomainsComplete !== false || receipt.contentPurgeExecuted !== false) {
     throw new Error("tenant database purge receipt flags are invalid");
   }
-  return sha256([
+  const legacySha256 = sha256([
     "tenant-database-purge-v1",
     receipt.scope,
     ...SOURCE_KEYS.map((key) => receipt[key]),
@@ -1327,6 +1338,12 @@ export function tenantDatabasePurgeReceiptSha256(receipt: ReceiptBody): string {
     receipt.allDomainsComplete,
     receipt.contentPurgeExecuted,
   ]);
+  if (receipt.priorRetainedBillingFacts === undefined) return legacySha256;
+  assertPriorRetainedBillingFactProof(receipt, receipt.priorRetainedBillingFacts);
+  if (receipt.priorRetainedBillingFacts.facts.length > receipt.retainedBillingFactCount) {
+    throw new Error("prior retained billing bridge exceeds retained billing catalog");
+  }
+  return sha256(["tenant-database-purge-receipt-v2", legacySha256, receipt.priorRetainedBillingFacts.evidenceSha256]);
 }
 
 export function validateTenantDatabasePurgeReceipt(receipt: TenantDatabasePurgeReceipt): void {
@@ -1353,6 +1370,7 @@ export function validateTenantDatabasePurgeReceipt(receipt: TenantDatabasePurgeR
     "allDomainsComplete",
     "contentPurgeExecuted",
     "receiptSha256",
+    ...(receipt.priorRetainedBillingFacts === undefined ? [] : ["priorRetainedBillingFacts"]),
   ], "tenant database purge receipt");
   const expected = tenantDatabasePurgeReceiptSha256(receipt);
   digest(receipt.receiptSha256, "tenant database purge receipt");
@@ -1466,7 +1484,10 @@ export function validateTenantDatabasePurgeEvidenceBundle(
     "session_content",
     graveMarkers.map((marker) => tenantDatabasePurgeTargetSha256(
       "session_content",
-      [marker.sessionId, marker.t3cSessionReceiptSha256],
+      [marker.sessionId, marker.t3cSessionReceiptSha256, ...(marker.ordinaryUsageRetention === undefined ? [] : [
+        "ordinary-usage-retention-v2", marker.sessionId, marker.ordinaryUsageRetention.sourceSha256,
+        marker.ordinaryUsageRetention.receiptSha256,
+      ])],
     )),
   );
   if (preDeleteReceipt.sessionTargetRootSha256 !== sessionTargetRootSha256) {

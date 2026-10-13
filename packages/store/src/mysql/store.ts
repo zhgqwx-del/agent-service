@@ -103,6 +103,7 @@ import {
   ordinarySessionDeleteOriginSha256,
   type OrdinarySessionDeleteGraceView,
 } from "../session-delete-grace.js";
+import * as OrdinaryUsageRetention from "../ordinary-usage-retention.js";
 import {
   UsageIdentityConflictError,
   UsageLifecycleGenerationError,
@@ -953,6 +954,8 @@ const ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME =
   "0050_ordinary_session_delete_grace.sql";
 const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME =
   "0051_ordinary_session_delete_origin_guard.sql";
+const ORDINARY_USAGE_RETENTION_MIGRATION_NAME = "0052_ordinary_session_usage_retention.sql";
+const ORDINARY_USAGE_RETENTION_TRIGGER_NAMES = ["trg_sessions_usage_retention_bi", "trg_sessions_usage_retention_shape_bu", "trg_sessions_usage_retention_bu", "trg_t3f_prior_usage_retention_bi", "trg_session_grave_usage_retention_bi"];
 const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME =
   "trg_sessions_ordinary_delete_grace_bu";
 const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_PREFIX =
@@ -1065,6 +1068,18 @@ async function executeMysqlMigrationStatement(
   migrationName: string,
   statement: string,
 ): Promise<void> {
+  if (migrationName === ORDINARY_USAGE_RETENTION_MIGRATION_NAME && statement.startsWith("CREATE TRIGGER ")) {
+    const match = /^CREATE TRIGGER (\w+) BEFORE (INSERT|UPDATE) ON (\w+) FOR EACH ROW ([\s\S]+)$/.exec(statement);
+    if (!match) throw new Error("0052 ordinary usage retention trigger source is invalid");
+    const [rows] = await conn.query<Row[]>(
+      "SELECT action_statement AS action_statement,action_timing AS action_timing,event_manipulation AS event_manipulation,event_object_table AS event_object_table FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?", [match[1]],
+    );
+    if (rows.length === 0) { await conn.query(statement); return; }
+    if (rows.length !== 1 || rows[0]?.action_timing !== "BEFORE" || rows[0]?.event_manipulation !== match[2]
+      || rows[0]?.event_object_table !== match[3] || canonicalMysqlTriggerActionStatement(String(rows[0]?.action_statement))
+        !== canonicalMysqlTriggerActionStatement(match[4]!)) throw new Error("0052 ordinary usage retention trigger is not exact");
+    return;
+  }
   if (migrationName === ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME
     && statement.startsWith(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_PREFIX)) {
     const expectedAction = statement.slice(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_PREFIX.length);
@@ -5869,6 +5884,11 @@ function rowToTenantPurgeSessionGraveMarker(row: Row): TenantPurgeSessionGraveMa
       markedAtDbMs: storedSafeInteger(row.marked_at_db_ms, "stored grave marker timestamp"),
       markerSha256: String(row.marker_sha256),
     };
+    if (row.ordinary_usage_retention_source_sha256 == null && row.ordinary_usage_retention_receipt_sha256 != null) throw new Error("partial grave ordinary usage retention proof");
+    if (row.ordinary_usage_retention_source_sha256 != null) marker.ordinaryUsageRetention = {
+      sourceSha256: String(row.ordinary_usage_retention_source_sha256),
+      receiptSha256: row.ordinary_usage_retention_receipt_sha256 == null ? null : String(row.ordinary_usage_retention_receipt_sha256),
+    };
     validateTenantDatabasePurgeSessionGraveMarker(marker);
     return marker;
   } catch {
@@ -5913,6 +5933,15 @@ function rowToTenantDatabasePurgeReceipt(row: Row): TenantDatabasePurgeReceipt {
       contentPurgeExecuted: tenantCredentialBoolean(row.content_purge_executed, "stored content-purge flag") as false,
       receiptSha256: String(row.receipt_sha256),
     };
+    if ((row.prior_retained_billing_facts_json == null) !== (row.prior_retained_billing_facts_sha256 == null)) {
+      throw new Error("partial prior retained billing bridge");
+    }
+    if (row.prior_retained_billing_facts_json != null) {
+      receipt.priorRetainedBillingFacts = parse<OrdinaryUsageRetention.PriorRetainedBillingFactProof>(row.prior_retained_billing_facts_json);
+      if (receipt.priorRetainedBillingFacts.evidenceSha256 !== row.prior_retained_billing_facts_sha256) {
+        throw new Error("prior retained billing bridge digest changed");
+      }
+    }
     validateTenantDatabasePurgeReceipt(receipt);
     return receipt;
   } catch {
@@ -6618,12 +6647,14 @@ type MysqlTenantDatabasePurgeSession = {
   userId: string;
   deletionGeneration: number;
   deletedAtDbMs?: number;
+  ordinaryUsageRetention?: { sourceSha256: string; receiptSha256: string | null };
 };
 
 type MysqlTenantDatabasePurgeTargetState = {
   targets: Map<TenantDatabasePurgeDomain, TenantDatabasePurgeTargetEvidence>;
   sessions: MysqlTenantDatabasePurgeSession[];
   billingFacts: BillingUsageFact[];
+  priorRetainedBillingFacts: OrdinaryUsageRetention.PriorRetainedBillingFactProof["facts"];
 };
 
 function mysqlControlGeneration(value: unknown): {
@@ -8422,6 +8453,7 @@ export class MysqlSessionStore implements
   private tenantTelemetryPlanArtifactTargetSchemaInstalled = false;
   private tenantTelemetryPregrantIntentSchemaInstalled = false;
   private ordinarySessionDeleteGraceSchemaInstalled = false;
+  private ordinaryUsageRetentionSchemaInstalled = false;
   private readonly ordinaryDeleteCommitBatches = new WeakSet<CommitBatch>();
 
   private constructor(
@@ -9223,6 +9255,7 @@ export class MysqlSessionStore implements
     conn: PoolConnection,
     migrationsDir: string,
     withOrdinaryDeleteOriginGuard = false,
+    withOrdinaryUsageRetention = false,
   ): Promise<void> {
     let statements: string[];
     try {
@@ -9242,6 +9275,7 @@ export class MysqlSessionStore implements
         ...TENANT_TELEMETRY_CAPTURE_V2_TRIGGER_NAMES,
         ...(withOrdinaryDeleteOriginGuard
           ? [ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME] : []),
+        ...(withOrdinaryUsageRetention ? ORDINARY_USAGE_RETENTION_TRIGGER_NAMES : []),
       ]
         .map((name) => `'${name}'`).join(",");
       statements = [
@@ -9360,6 +9394,46 @@ export class MysqlSessionStore implements
       || canonicalMysqlTriggerActionStatement(String(stored.statement_value))
         !== canonicalMysqlTriggerActionStatement(expectedAction)) {
       throw new Error("0051 ordinary DELETE origin guard fingerprint is invalid");
+    }
+  }
+
+  private async assertOrdinaryUsageRetentionFingerprint(conn: PoolConnection, dir: string): Promise<void> {
+    const [columns] = await conn.query<Row[]>(
+      "SELECT column_name AS column_name,column_type AS column_type,is_nullable AS is_nullable,column_default AS column_default,character_set_name AS character_set_name,collation_name AS collation_name,extra AS extra,generation_expression AS generation_expression FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='sessions' AND column_name LIKE 'ordinary_usage_retention_%' ORDER BY ordinal_position",
+    );
+    const names = ["source_json", "source_sha256", "receipt_json", "receipt_sha256"].map((v) => `ordinary_usage_retention_${v}`);
+    if (columns.length !== 4 || columns.some((v, i) => v.column_name !== names[i] || v.is_nullable !== "YES"
+      || v.column_default !== null || v.extra !== "" || v.generation_expression !== ""
+      || (i % 2 === 0 ? v.column_type !== "json" || v.character_set_name !== null || v.collation_name !== null
+        : v.column_type !== "char(64)" || v.character_set_name !== "ascii" || v.collation_name !== "ascii_bin"))) {
+      throw new Error("0052 ordinary usage retention column fingerprint is invalid");
+    }
+    const expected = mysqlMigrationStatements(await readFile(join(dir, ORDINARY_USAGE_RETENTION_MIGRATION_NAME), "utf8"))
+      .filter((v) => v.startsWith("CREATE TRIGGER "));
+    for (const [table, names] of [
+      ["tenant_database_purge_receipts", ["prior_retained_billing_facts_json", "prior_retained_billing_facts_sha256"]],
+      ["tenant_purge_session_grave_markers", ["ordinary_usage_retention_source_sha256", "ordinary_usage_retention_receipt_sha256"]],
+    ] as const) {
+      const [overlay] = await conn.query<Row[]>(
+        "SELECT column_name AS name,column_type AS type,is_nullable AS nullable,column_default AS default_value,character_set_name AS charset_name,collation_name AS collation_name,extra AS extra,generation_expression AS generated_expression FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name IN (?,?) ORDER BY ordinal_position",
+        [table, ...names],
+      );
+      if (overlay.length !== 2 || overlay.some((v, i) => v.name !== names[i] || v.nullable !== "YES" || v.default_value !== null
+        || v.extra !== "" || v.generated_expression !== "" || (table === "tenant_database_purge_receipts" && i === 0
+          ? v.type !== "json" || v.charset_name !== null || v.collation_name !== null
+          : v.type !== "char(64)" || v.charset_name !== "ascii" || v.collation_name !== "ascii_bin"))) throw new Error("0052 T3f evidence column fingerprint is invalid");
+    }
+    if (expected.length !== 5) throw new Error("0052 ordinary usage retention trigger fingerprint source is invalid");
+    for (const statement of expected) {
+      const match = /^CREATE TRIGGER (\w+) BEFORE (INSERT|UPDATE) ON (\w+) FOR EACH ROW ([\s\S]+)$/.exec(statement)!;
+      const [triggers] = await conn.query<Row[]>(
+        "SELECT action_statement AS action_statement,action_timing AS action_timing,event_manipulation AS event_manipulation,event_object_table AS event_object_table,action_orientation AS action_orientation,action_condition AS action_condition FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?", [match[1]],
+      );
+      if (triggers.length !== 1 || triggers[0]?.action_timing !== "BEFORE" || triggers[0]?.event_manipulation !== match[2]
+        || triggers[0]?.event_object_table !== match[3] || triggers[0]?.action_orientation !== "ROW" || triggers[0]?.action_condition !== null
+        || canonicalMysqlTriggerActionStatement(String(triggers[0]?.action_statement)) !== canonicalMysqlTriggerActionStatement(match[4]!)) {
+        throw new Error("0052 ordinary usage retention trigger fingerprint is invalid");
+      }
     }
   }
 
@@ -10103,6 +10177,7 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
         await this.assertTenantTelemetryCaptureV2Fingerprint(
           conn, migrationsDir, done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME),
+          done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME),
         );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
@@ -10110,6 +10185,10 @@ export class MysqlSessionStore implements
       }
       if (done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME)) {
         await this.assertOrdinarySessionDeleteOriginGuardFingerprint(conn, migrationsDir);
+      }
+      if (done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME)) {
+        if (!done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME)) throw new Error("0052 retention marker is missing 0051 predecessor");
+        await this.assertOrdinaryUsageRetentionFingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -10150,6 +10229,7 @@ export class MysqlSessionStore implements
       this.tenantTelemetryPregrantIntentSchemaInstalled = done.has(
         TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME,
       );
+      this.ordinaryUsageRetentionSchemaInstalled = done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME);
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
@@ -10232,7 +10312,7 @@ export class MysqlSessionStore implements
             [ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME],
           );
           await this.assertTenantTelemetryCaptureV2Fingerprint(
-            conn, dir, existingGuard.length === 1,
+            conn, dir, existingGuard.length === 1, done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME),
           );
           await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
         }
@@ -10596,6 +10676,7 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
         await this.assertTenantTelemetryCaptureV2Fingerprint(
           conn, dir, done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME),
+          done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME),
         );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
@@ -10603,6 +10684,10 @@ export class MysqlSessionStore implements
       }
       if (done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME)) {
         await this.assertOrdinarySessionDeleteOriginGuardFingerprint(conn, dir);
+      }
+      if (done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME)) {
+        if (!done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME)) throw new Error("0052 retention marker is missing 0051 predecessor");
+        await this.assertOrdinaryUsageRetentionFingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -10643,6 +10728,7 @@ export class MysqlSessionStore implements
       this.tenantTelemetryPregrantIntentSchemaInstalled = done.has(
         TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME,
       );
+      this.ordinaryUsageRetentionSchemaInstalled = done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME);
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
@@ -22676,7 +22762,8 @@ export class MysqlSessionStore implements
       }
       case "session_content":
         for (const receipt of source.sessionReceipts) {
-          add(receipt.sessionId, receipt.receiptSha256);
+          const evidence = await this.ordinaryUsageRetentionCatalogTuple(conn, receipt.sessionId);
+          add(receipt.sessionId, receipt.receiptSha256, ...(evidence ?? []));
         }
         targetCount = source.contentReceipt.sessionReceiptCount
           + source.contentReceipt.contentRecordCount;
@@ -28055,7 +28142,7 @@ export class MysqlSessionStore implements
     lock: "" | "FOR SHARE" = "",
   ): Promise<TenantDatabasePurgeReceipt | null> {
     const [rows] = await executor.query<Row[]>(
-      `SELECT ${TENANT_DATABASE_PURGE_RECEIPT_COLUMNS}
+      `SELECT ${TENANT_DATABASE_PURGE_RECEIPT_COLUMNS}${this.ordinaryUsageRetentionSchemaInstalled ? ",prior_retained_billing_facts_json,prior_retained_billing_facts_sha256" : ""}
          FROM tenant_database_purge_receipts
         WHERE tenant_id=? AND request_id=? ${lock}`,
       [tenantId, requestId],
@@ -28073,7 +28160,7 @@ export class MysqlSessionStore implements
     lock: "" | "FOR SHARE" = "",
   ): Promise<TenantPurgeSessionGraveMarker[]> {
     const [rows] = await executor.query<Row[]>(
-      `SELECT ${TENANT_PURGE_SESSION_GRAVE_MARKER_COLUMNS}
+      `SELECT ${TENANT_PURGE_SESSION_GRAVE_MARKER_COLUMNS}${this.ordinaryUsageRetentionSchemaInstalled ? ",ordinary_usage_retention_source_sha256,ordinary_usage_retention_receipt_sha256" : ""}
          FROM tenant_purge_session_grave_markers
         WHERE tenant_id=? AND request_id=? AND database_purge_generation=?
         ORDER BY session_id ${lock}`,
@@ -28695,10 +28782,14 @@ export class MysqlSessionStore implements
         ...(deletedAtDbMs === undefined ? {} : { deletedAtDbMs }),
       };
     });
-    setTarget("session_content", sessions.map((session) => [
-      session.sessionId,
-      receiptBySession.get(session.sessionId)!.receiptSha256,
-    ]));
+    const sessionTargets: (string | number | boolean | null)[][] = [];
+    for (const session of sessions) {
+      const evidence = await this.ordinaryUsageRetentionCatalogTuple(conn, session.sessionId);
+      if (evidence) session.ordinaryUsageRetention = { sourceSha256: evidence[2], receiptSha256: evidence[3] };
+      sessionTargets.push([session.sessionId, receiptBySession.get(session.sessionId)!.receiptSha256,
+        ...(evidence ?? [])]);
+    }
+    setTarget("session_content", sessionTargets);
 
     const idempotencyRows = await rows(
       `SELECT user_id, session_id, idem_key, value FROM idempotency_keys
@@ -28921,7 +29012,8 @@ export class MysqlSessionStore implements
     if (targets.size !== TENANT_DATABASE_PURGE_DOMAINS.length) {
       throw new TenantErasureIntegrityError();
     }
-    return { targets, sessions, billingFacts };
+    const priorRetainedBillingFacts = await this.ordinaryUsageRetentionPriorBillingFacts(conn, job.tenantId, sessions);
+    return { targets, sessions, billingFacts, priorRetainedBillingFacts };
   }
 
   private async validateTenantDatabasePurgeReady(
@@ -29044,12 +29136,14 @@ export class MysqlSessionStore implements
     ));
     if (operationalAcks.length !== 1) throw new TenantDatabasePurgeEvidenceChangedError();
     const operationalAck = operationalAcks[0]!;
+    const currentFacts = OrdinaryUsageRetention.subtractPriorRetainedBillingFacts(job.tenantId,
+      targetState.billingFacts, targetState.priorRetainedBillingFacts);
     if (
-      targetState.billingFacts.length !== operationalAck.resultCount
+      currentFacts.length !== operationalAck.resultCount
       || tenantPurgeExecutionResultRootSha256(
         "operational_usage",
         "anonymize",
-        targetState.billingFacts.map((fact) => fact.factSha256),
+        currentFacts.map((fact) => fact.factSha256),
       ) !== operationalAck.resultRootSha256
     ) throw new TenantDatabasePurgeEvidenceChangedError();
     const [usageRows] = await conn.query<Row[]>(
@@ -29656,6 +29750,8 @@ export class MysqlSessionStore implements
         [job.tenantId],
       );
       const billingFacts = billingRows.map(rowToBillingUsageFact);
+      const currentFacts = OrdinaryUsageRetention.subtractPriorRetainedBillingFacts(job.tenantId,
+        billingFacts, bundle.receipt.priorRetainedBillingFacts?.facts ?? []);
       const operationalAcks = source.executionAcks.filter((ack) => (
         ack.domain === "operational_usage" && ack.ackKind === "anonymized" && ack.final
       ));
@@ -29665,11 +29761,11 @@ export class MysqlSessionStore implements
         || tenantDatabasePurgeBillingFactRootSha256(
           billingFacts.map((fact) => fact.factSha256),
         ) !== bundle.receipt.retainedBillingFactRootSha256
-        || billingFacts.length !== operationalAcks[0]!.resultCount
+        || currentFacts.length !== operationalAcks[0]!.resultCount
         || tenantPurgeExecutionResultRootSha256(
           "operational_usage",
           "anonymize",
-          billingFacts.map((fact) => fact.factSha256),
+          currentFacts.map((fact) => fact.factSha256),
         ) !== operationalAcks[0]!.resultRootSha256
       ) throw new TenantErasureIntegrityError();
       const [residueRows] = await conn.query<Row[]>(
@@ -30420,6 +30516,7 @@ export class MysqlSessionStore implements
           t3cSessionReceiptSha256: sessionReceipt.receiptSha256,
           preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
           markedAtDbMs: purgeAtMs,
+          ...(session.ordinaryUsageRetention === undefined ? {} : { ordinaryUsageRetention: session.ordinaryUsageRetention }),
         };
         return {
           ...body,
@@ -30505,8 +30602,8 @@ export class MysqlSessionStore implements
               plan_build_generation, execution_generation, database_purge_generation,
               deletion_generation, deleted_at_db_ms, owner_sha256,
               t3c_session_receipt_sha256, predelete_receipt_sha256, marked_at_db_ms,
-              marker_sha256)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              marker_sha256${this.ordinaryUsageRetentionSchemaInstalled ? ",ordinary_usage_retention_source_sha256,ordinary_usage_retention_receipt_sha256" : ""})
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?${this.ordinaryUsageRetentionSchemaInstalled ? ",?,?" : ""})`,
           [
             marker.scope, marker.sessionId, marker.tenantId, marker.requestId,
             marker.subjectGeneration, marker.planBuildGeneration,
@@ -30514,6 +30611,7 @@ export class MysqlSessionStore implements
             marker.deletionGeneration, marker.deletedAtDbMs, marker.ownerSha256,
             marker.t3cSessionReceiptSha256, marker.preDeleteReceiptSha256,
             marker.markedAtDbMs, marker.markerSha256,
+            ...(this.ordinaryUsageRetentionSchemaInstalled ? [marker.ordinaryUsageRetention?.sourceSha256 ?? null, marker.ordinaryUsageRetention?.receiptSha256 ?? null] : []),
           ],
         );
       }
@@ -30666,6 +30764,12 @@ export class MysqlSessionStore implements
       const receiptBody: Omit<TenantDatabasePurgeReceipt, "receiptSha256"> = {
         ...sourceFields,
         scope: TENANT_DATABASE_PURGE_RECEIPT_SCOPE,
+        ...(this.ordinaryUsageRetentionSchemaInstalled ? { priorRetainedBillingFacts: {
+          schemaVersion: 1 as const, facts: targetState.priorRetainedBillingFacts,
+          evidenceSha256: OrdinaryUsageRetention.priorRetainedBillingFactProofSha256({
+            ...sourceFields, preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+          }, targetState.priorRetainedBillingFacts),
+        } } : {}),
         preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
         preDeleteEntryCount: preDeleteEntries.length,
         preDeleteEntryRootSha256: entryRootSha256,
@@ -30706,8 +30810,8 @@ export class MysqlSessionStore implements
             store_db_timestamp_ms, completed_claim_attempt,
             completed_claim_token_sha256, local_database_purge_complete,
             session_content_deleted, all_domains_complete, content_purge_executed,
-            receipt_sha256)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            receipt_sha256${this.ordinaryUsageRetentionSchemaInstalled ? ",prior_retained_billing_facts_json,prior_retained_billing_facts_sha256" : ""})
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?${this.ordinaryUsageRetentionSchemaInstalled ? ",?,?" : ""})`,
         [
           receipt.scope, receipt.requestId, receipt.tenantId, receipt.subjectGeneration,
           receipt.planBuildGeneration, receipt.executionGeneration,
@@ -30725,6 +30829,7 @@ export class MysqlSessionStore implements
           receipt.completedClaimAttempt, receipt.completedClaimTokenSha256,
           receipt.localDatabasePurgeComplete, receipt.sessionContentDeleted,
           receipt.allDomainsComplete, receipt.contentPurgeExecuted, receipt.receiptSha256,
+          ...(this.ordinaryUsageRetentionSchemaInstalled ? [JSON.stringify(receipt.priorRetainedBillingFacts), receipt.priorRetainedBillingFacts!.evidenceSha256] : []),
         ],
       );
 
@@ -31073,7 +31178,7 @@ export class MysqlSessionStore implements
   ): Promise<TenantPurgeSessionGraveMarker | null> {
     return this.withConsistentRead(async (conn) => {
       const [rows] = await conn.query<Row[]>(
-        `SELECT ${TENANT_PURGE_SESSION_GRAVE_MARKER_COLUMNS}
+        `SELECT ${TENANT_PURGE_SESSION_GRAVE_MARKER_COLUMNS}${this.ordinaryUsageRetentionSchemaInstalled ? ",ordinary_usage_retention_source_sha256,ordinary_usage_retention_receipt_sha256" : ""}
            FROM tenant_purge_session_grave_markers
           WHERE tenant_id=? AND session_id=?`,
         [tenantId, sessionId],
@@ -41704,7 +41809,12 @@ export class MysqlSessionStore implements
             if (deletedEvent?.type !== "session/deleted") {
               throw new Error("ordinary DELETE terminal event is missing");
             }
+            const activePolicy = this.ordinaryUsageRetentionSchemaInstalled
+              ? await this.loadValidatedActiveRetentionPolicy(conn, tenantId, "FOR SHARE") : null;
             const observedDbMs = await this.databaseNow(conn);
+            if (activePolicy && observedDbMs < Math.max(activePolicy.control.updatedAtMs, activePolicy.policy.createdAtMs)) {
+              throw new Error("ordinary usage retention trusted clock precedes policy");
+            }
             const originSha256 = ordinarySessionDeleteOriginSha256({
               tenantId, userId, sessionId: batch.sessionId,
               deletionGeneration: batch.lifecycle.deletionGeneration,
@@ -41714,6 +41824,16 @@ export class MysqlSessionStore implements
             });
             sets.push("ordinary_delete_origin_sha256=?", "ordinary_delete_origin_observed_db_ms=?");
             params.push(originSha256, observedDbMs);
+            if (this.ordinaryUsageRetentionSchemaInstalled) {
+              const source: OrdinaryUsageRetention.OrdinarySessionUsageRetentionSource = {
+                schemaVersion: 2, originSha256, policyVersion: activePolicy?.policy.policyVersion ?? null,
+                policySha256: activePolicy?.policy.policySha256 ?? null,
+              };
+              sets.push("ordinary_usage_retention_source_json=?", "ordinary_usage_retention_source_sha256=?");
+              params.push(json(source), OrdinaryUsageRetention.ordinaryUsageRetentionSourceSha256({
+                tenantId, userId, sessionId: batch.sessionId, deletionGeneration: batch.lifecycle.deletionGeneration,
+              }, source));
+            }
             expectedOrdinaryOrigin = { sha256: originSha256, observedDbMs };
           }
         } else {
@@ -44596,6 +44716,208 @@ export class MysqlSessionStore implements
     } finally {
       conn.release();
     }
+  }
+
+  private async readOrdinaryUsageRetentionSource(conn: PoolConnection, sessionId: string): Promise<{
+    owner: OrdinaryUsageRetention.OrdinarySessionUsageRetentionCandidate;
+    source: OrdinaryUsageRetention.OrdinarySessionUsageRetentionSource;
+    sourceSha256: string;
+    receipt: OrdinaryUsageRetention.OrdinarySessionUsageRetentionReceipt | null;
+    receiptSha256: string | null;
+  } | null> {
+    if (!this.ordinaryUsageRetentionSchemaInstalled) return null;
+    const [rows] = await conn.query<Row[]>(
+      `SELECT tenant_id,user_id,session_id,deletion_generation,ordinary_delete_origin_sha256,ordinary_usage_retention_source_json,
+              ordinary_usage_retention_source_sha256,ordinary_usage_retention_receipt_json,
+              ordinary_usage_retention_receipt_sha256 FROM sessions WHERE session_id=? FOR SHARE`, [sessionId],
+    );
+    const row = rows[0];
+    if (!row) return null;
+    if (row.ordinary_usage_retention_source_json == null) {
+      if (row.ordinary_usage_retention_source_sha256 != null || row.ordinary_usage_retention_receipt_json != null
+        || row.ordinary_usage_retention_receipt_sha256 != null) throw new Error("ordinary usage retention partial source");
+      return null;
+    }
+    const owner = { tenantId: String(row.tenant_id), userId: String(row.user_id), sessionId: String(row.session_id),
+      deletionGeneration: storedSafeInteger(row.deletion_generation, "ordinary usage retention generation", 1) };
+    const source = parse<OrdinaryUsageRetention.OrdinarySessionUsageRetentionSource>(row.ordinary_usage_retention_source_json);
+    const sourceSha256 = OrdinaryUsageRetention.ordinaryUsageRetentionSourceSha256(owner, source);
+    if (sourceSha256 !== row.ordinary_usage_retention_source_sha256
+      || source.originSha256 !== row.ordinary_delete_origin_sha256) throw new Error("ordinary usage retention source root changed");
+    const receipt = row.ordinary_usage_retention_receipt_json == null ? null
+      : parse<OrdinaryUsageRetention.OrdinarySessionUsageRetentionReceipt>(row.ordinary_usage_retention_receipt_json);
+    const receiptSha256 = receipt ? OrdinaryUsageRetention.ordinaryUsageRetentionReceiptSha256(receipt) : null;
+    if (receiptSha256 !== row.ordinary_usage_retention_receipt_sha256
+      || (receipt && receipt.sourceSha256 !== sourceSha256)) throw new Error("ordinary usage retention receipt root changed");
+    return { owner, source, sourceSha256, receipt, receiptSha256 };
+  }
+
+  private async ordinaryUsageRetentionCatalogTuple(conn: PoolConnection, sessionId: string):
+    Promise<[string, string, string, string | null] | null> {
+    const evidence = await this.readOrdinaryUsageRetentionSource(conn, sessionId);
+    return evidence ? ["ordinary-usage-retention-v2", sessionId, evidence.sourceSha256, evidence.receiptSha256] : null;
+  }
+
+  private async ordinaryUsageRetentionPriorBillingFacts(conn: PoolConnection, tenantId: string,
+    sessions: readonly MysqlTenantDatabasePurgeSession[]): Promise<OrdinaryUsageRetention.PriorRetainedBillingFactProof["facts"]> {
+    const result: OrdinaryUsageRetention.PriorRetainedBillingFactProof["facts"] = [];
+    const seen = new Set<string>();
+    for (const session of sessions) {
+      const evidence = await this.readOrdinaryUsageRetentionSource(conn, session.sessionId);
+      if (!evidence?.receipt) continue;
+      const receipt = evidence.receipt;
+      const owner = { ...evidence.owner, nowMs: 0 };
+      const grace = await this.readOrdinarySessionDeleteGrace(conn, tenantId, session.userId, session.sessionId, true);
+      const deletion = evidence.source.policyVersion === null ? null
+        : await this.loadRetentionPolicyVersion(conn, tenantId, evidence.source.policyVersion, "FOR SHARE");
+      const originalCurrent = await this.loadRetentionPolicyVersion(conn, tenantId, receipt.currentPolicyVersion, "FOR SHARE");
+      const record = await this.lockUsageReconciliation(conn, owner);
+      if (evidence.owner.tenantId !== tenantId || evidence.owner.userId !== session.userId
+        || evidence.owner.deletionGeneration !== session.deletionGeneration || !grace || !deletion || !originalCurrent || !record
+        || record.status !== "anonymized" || record.anonymizedAtMs !== receipt.executedAtDbMs || record.verifiedAtMs > receipt.executedAtDbMs) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
+      OrdinaryUsageRetention.assertOrdinaryUsageRetentionReplay(evidence.source, evidence.sourceSha256,
+        grace, receipt, deletion, originalCurrent);
+      await this.assertNoOperationalUsage(conn, owner);
+      const facts: BillingUsageFact[] = [];
+      for (const identity of receipt.facts) {
+        if (seen.has(identity.usageId)) throw new TenantDatabasePurgeEvidenceChangedError();
+        seen.add(identity.usageId);
+        const [rows] = await conn.query<Row[]>(`SELECT ${BILLING_USAGE_COLUMNS} FROM billing_usage_facts WHERE usage_id=? FOR SHARE`, [identity.usageId]);
+        if (rows.length !== 1) throw new TenantDatabasePurgeEvidenceChangedError();
+        const fact = rowToBillingUsageFact(rows[0]!);
+        if (fact.tenantId !== tenantId) throw new TenantDatabasePurgeEvidenceChangedError();
+        facts.push(fact);
+      }
+      OrdinaryUsageRetention.assertOrdinaryUsageRetentionFacts(record, facts, receipt);
+      result.push(...receipt.facts);
+    }
+    return result.sort((a, b) => a.usageId < b.usageId ? -1 : a.usageId > b.usageId ? 1 : 0);
+  }
+
+  async listOrdinarySessionUsageRetentionCandidates(input: { afterSessionId?: string; limit: number }):
+    Promise<OrdinaryUsageRetention.OrdinarySessionUsageRetentionCandidate[]> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100) throw new Error("ordinary usage retention candidate limit is invalid");
+    if (!this.ordinaryUsageRetentionSchemaInstalled) return [];
+    return this.withConsistentRead(async (conn) => {
+      // This is intentionally only a candidate query: malformed proof is rejected separately per
+      // candidate by execute, never used as authority or allowed to starve another owner's scan.
+      const [rows] = await conn.query<Row[]>(
+        `SELECT s.tenant_id,s.user_id,s.session_id,s.deletion_generation FROM sessions s
+           JOIN retention_policy_versions d ON d.tenant_id=s.tenant_id
+            AND d.policy_version=JSON_UNQUOTE(JSON_EXTRACT(s.ordinary_usage_retention_source_json,'$.policyVersion'))
+           JOIN retention_policy_controls c ON c.tenant_id=s.tenant_id
+           JOIN retention_policy_versions p ON p.tenant_id=c.tenant_id AND p.policy_version=c.active_policy_version
+          WHERE s.session_id > ? AND s.ordinary_usage_retention_source_json IS NOT NULL
+            AND s.ordinary_usage_retention_receipt_json IS NULL AND s.ordinary_delete_grace_floor_db_ms IS NOT NULL
+            AND d.operational_usage_retention_ms IS NOT NULL
+            AND p.operational_usage_retention_ms IS NOT NULL
+            AND s.ordinary_delete_grace_floor_db_ms <= ?
+          ORDER BY s.session_id LIMIT ?`, [input.afterSessionId ?? "", await this.databaseNow(conn), input.limit],
+      );
+      return rows.map((row) => ({ tenantId: String(row.tenant_id), userId: String(row.user_id), sessionId: String(row.session_id),
+        deletionGeneration: storedSafeInteger(row.deletion_generation, "ordinary usage retention candidate generation", 1) }));
+    });
+  }
+
+  async executeOrdinarySessionUsageRetention(raw: OrdinaryUsageRetention.ExecuteOrdinarySessionUsageRetentionInput):
+    Promise<OrdinaryUsageRetention.OrdinarySessionUsageRetentionReceipt | null> {
+    const input = structuredClone(raw);
+    if (input.enabled !== true) throw new Error("ordinary usage retention is disabled");
+    if (!this.ordinaryUsageRetentionSchemaInstalled) return null;
+    const lifecycleInput = { ...input, nowMs: 0 };
+    validateReconcileSessionUsageInput(lifecycleInput);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.beginTransaction();
+      const held = await this.lockUsageLegalHold(conn, lifecycleInput); // tenant -> user -> session
+      await this.lockUsageLifecycleSession(conn, lifecycleInput);
+      const evidence = await this.readOrdinaryUsageRetentionSource(conn, input.sessionId);
+      const grace = await this.readOrdinarySessionDeleteGrace(conn, input.tenantId, input.userId, input.sessionId, true);
+      if (!evidence || !grace) { await conn.commit(); return null; }
+      if (evidence.source.originSha256 !== grace.originSha256) throw new Error("ordinary usage retention origin changed");
+      const record = await this.lockUsageReconciliation(conn, lifecycleInput);
+      if (!record || record.checksum !== input.expectedChecksum) throw new UsageReconciliationError("ordinary usage retention reconciliation does not match");
+      if (evidence.receipt) {
+        const receipt = evidence.receipt;
+        const deletion = evidence.source.policyVersion === null ? null
+          : await this.loadRetentionPolicyVersion(conn, input.tenantId, evidence.source.policyVersion, "FOR SHARE");
+        const originalCurrent = await this.loadRetentionPolicyVersion(conn, input.tenantId, receipt.currentPolicyVersion, "FOR SHARE");
+        if (!deletion || !originalCurrent) throw new Error("ordinary usage retention replay policy missing");
+        OrdinaryUsageRetention.assertOrdinaryUsageRetentionReplay(evidence.source, evidence.sourceSha256,
+          grace, receipt, deletion, originalCurrent);
+        if (record.status !== "anonymized" || record.anonymizedAtMs !== receipt.executedAtDbMs
+          || record.verifiedAtMs > receipt.executedAtDbMs
+          || receipt.checksum !== input.expectedChecksum || receipt.sealSha256 !== grace.sealSha256) {
+          throw new Error("ordinary usage retention exact replay changed");
+        }
+        await this.assertNoOperationalUsage(conn, lifecycleInput);
+        const facts: BillingUsageFact[] = [];
+        for (const identity of receipt.facts) {
+          const [rows] = await conn.query<Row[]>(`SELECT ${BILLING_USAGE_COLUMNS} FROM billing_usage_facts WHERE usage_id=? FOR SHARE`, [identity.usageId]);
+          if (rows.length !== 1) throw new Error("ordinary usage retention billing fact missing");
+          const fact = rowToBillingUsageFact(rows[0]!);
+          if (fact.tenantId !== input.tenantId) throw new Error("ordinary usage retention billing fact owner changed");
+          facts.push(fact);
+        }
+        OrdinaryUsageRetention.assertOrdinaryUsageRetentionFacts(record, facts, receipt);
+        await conn.commit();
+        return receipt;
+      }
+      await this.lockActiveSubjectGate(conn, input.tenantId, input.userId, 0, input.sessionId);
+      const [userErasure] = await conn.query<Row[]>(
+        "SELECT request_id FROM erasure_requests WHERE tenant_id=? AND subject_kind='user' AND subject_id=? LIMIT 1 FOR SHARE", [input.tenantId, input.userId],
+      );
+      const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+      if (userErasure.length || runtime.control.state !== "inactive") throw new Error("ordinary usage retention erasure/restore gate is closed");
+      if (record.status !== "verified") throw new Error("ordinary usage retention has no execution receipt");
+      if (evidence.source.policyVersion === null) { await conn.commit(); return null; }
+      const deletion = await this.loadRetentionPolicyVersion(conn, input.tenantId, evidence.source.policyVersion, "FOR SHARE");
+      const current = await this.loadValidatedActiveRetentionPolicy(conn, input.tenantId, "FOR SHARE");
+      if (!deletion || deletion.policySha256 !== evidence.source.policySha256) throw new Error("ordinary usage retention deletion policy missing");
+      if (!current) { await conn.commit(); return null; }
+      const deadline = OrdinaryUsageRetention.ordinaryUsageRetentionDeadline(grace, deletion, current.policy);
+      const { expected, actual } = await this.materializeBillingUsageFacts(conn, lifecycleInput, "verify");
+      actual.sort((a, b) => a.usageId < b.usageId ? -1 : a.usageId > b.usageId ? 1 : 0);
+      OrdinaryUsageRetention.assertOrdinaryUsageRetentionFacts(record, expected);
+      OrdinaryUsageRetention.assertOrdinaryUsageRetentionFacts(record, actual);
+      const [holdTimes] = await conn.query<Row[]>(
+        "SELECT updated_at_ms FROM legal_hold_controls WHERE tenant_id=? AND ((subject_kind='tenant' AND subject_id=?) OR (subject_kind='user' AND subject_id=?)) FOR SHARE",
+        [input.tenantId, input.tenantId, input.userId],
+      );
+      const highWater = Math.max(record.verifiedAtMs, grace.sealObservedDbMs ?? 0, deletion.createdAtMs,
+        current.policy.createdAtMs, current.control.updatedAtMs, ...holdTimes.map((v) => storedSafeInteger(v.updated_at_ms, "ordinary usage retention hold time")));
+      const now = await this.databaseNow(conn); // final observation after all potentially waiting locks
+      if (now < highWater) throw new Error("ordinary usage retention trusted clock regressed");
+      if (held || deadline === null || now < deadline) { await conn.commit(); return null; }
+      const receipt: OrdinaryUsageRetention.OrdinarySessionUsageRetentionReceipt = {
+        schemaVersion: 1, sourceSha256: evidence.sourceSha256, sealSha256: grace.sealSha256!,
+        deletionPolicySha256: deletion.policySha256, currentPolicySha256: current.policy.policySha256,
+        currentPolicyVersion: current.policy.policyVersion,
+        deadlineDbMs: deadline, executedAtDbMs: now, checksum: record.checksum,
+        facts: actual.map((v) => ({ usageId: v.usageId, factSha256: v.factSha256 })),
+        allDomainsComplete: false, contentPurgeExecuted: false,
+      };
+      const sha = OrdinaryUsageRetention.ordinaryUsageRetentionReceiptSha256(receipt);
+      const [deleted] = await conn.query<mysql.ResultSetHeader>("DELETE FROM usage_ledger WHERE tenant_id=? AND user_id=? AND session_id=?", [input.tenantId, input.userId, input.sessionId]);
+      if (deleted.affectedRows !== record.rowCount) throw new UsageReconciliationError("ordinary usage retention deleted row count changed");
+      const [updated] = await conn.query<mysql.ResultSetHeader>(
+        "UPDATE usage_reconciliations SET status='anonymized',anonymized_at_ms=? WHERE session_id=? AND deletion_generation=? AND status='verified' AND checksum=?",
+        [now, input.sessionId, input.deletionGeneration, input.expectedChecksum],
+      );
+      if (updated.affectedRows !== 1) throw new Error("ordinary usage retention reconciliation CAS failed");
+      const [sealed] = await conn.query<mysql.ResultSetHeader>(
+        "UPDATE sessions SET ordinary_usage_retention_receipt_json=?,ordinary_usage_retention_receipt_sha256=? WHERE session_id=? AND ordinary_usage_retention_receipt_json IS NULL",
+        [json(receipt), sha, input.sessionId],
+      );
+      if (sealed.affectedRows !== 1) throw new Error("ordinary usage retention receipt CAS failed");
+      if (await this.databaseNow(conn) < now) throw new Error("ordinary usage retention publish clock regressed");
+      await conn.commit();
+      return receipt;
+    } catch (error) { await conn.rollback(); throw error; }
+    finally { conn.release(); }
   }
 
   async anonymizeSessionUsage(input: AnonymizeSessionUsageInput): Promise<UsageReconciliationRecord> {

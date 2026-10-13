@@ -17,6 +17,7 @@ import {
   BLOB_STORAGE_FORMAT,
   TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
   EMPTY_TENANT_DATABASE_PURGE_DOMAIN_ACK_ROOT_SHA256,
+  ORDINARY_SESSION_DELETE_GRACE_MS,
   MemorySessionStore,
   SessionGoneError,
   TENANT_REDIS_PURGE_ADAPTER_PROTOCOL,
@@ -27,6 +28,7 @@ import {
   newErasureRequestId,
   newUserDataExportRequestId,
   newUsageId,
+  priorRetainedBillingFactProofSha256,
   subjectLifecycleKey,
   tenantDatabasePurgeBillingFactRootSha256,
   tenantDatabasePurgeBridgeSha256,
@@ -45,6 +47,8 @@ import {
   tenantDatabasePurgeTargetRootSha256,
   tenantDatabasePurgeTargetSha256,
   tenantErasureRequestHash,
+  tenantPurgePlanTargetRootSha256,
+  tenantPurgePlanTargetSha256,
   tenantRedisPurgeMarkerSha256,
   tenantTelemetryWriteAdapterEvidenceSha256,
   createTenantTelemetryOwnerClosureEntry,
@@ -140,7 +144,7 @@ function telemetryWriteAuthorization(claim: TenantTelemetryWriteClaim) {
 }
 
 interface CredentialRolloutClock {
-  advance(): void;
+  advance(milliseconds?: number): void;
   release(): void;
 }
 
@@ -158,7 +162,7 @@ function memoryStoreWithCredentialRolloutClock(
   };
   const store = new MemorySessionStore(clock, memoryOptions);
   credentialRolloutClocks.set(store, {
-    advance: () => { floorMs += 1; },
+    advance: (milliseconds = 1) => { floorMs += milliseconds; },
     release: () => { released = true; },
   });
   return store;
@@ -1022,6 +1026,13 @@ function fullyRehashT3fEvidence(
     retainedBillingFactRootSha256: options.retainedBillingFactRootSha256
       ?? oldReceipt.retainedBillingFactRootSha256,
   };
+  if (terminalBody.priorRetainedBillingFacts) {
+    terminalBody.priorRetainedBillingFacts = {
+      ...terminalBody.priorRetainedBillingFacts,
+      evidenceSha256: priorRetainedBillingFactProofSha256(terminalBody,
+        terminalBody.priorRetainedBillingFacts.facts),
+    };
+  }
   const receipt: TenantDatabasePurgeReceipt = {
     ...terminalBody,
     receiptSha256: tenantDatabasePurgeReceiptSha256(terminalBody),
@@ -1133,8 +1144,161 @@ describe("MemorySessionStore tenant database purge", () => {
     )).toBeNull();
     expect(store.sessions.has(target.session.id)).toBe(false);
     expect(store.deleted.has(target.session.id)).toBe(false);
-    expect(await store.getTenantPurgeSessionGraveMarker(tenantId, target.session.id))
-      .toMatchObject({ sessionId: target.session.id, deletionGeneration: 1 });
+    const grave = await store.getTenantPurgeSessionGraveMarker(tenantId, target.session.id);
+    expect(grave).toMatchObject({ sessionId: target.session.id, deletionGeneration: 1,
+      ordinaryUsageRetention: { sourceSha256: expect.stringMatching(/^[a-f0-9]{64}$/), receiptSha256: null } });
+    expect(grave?.markerSha256).toBe(tenantDatabasePurgeSessionGraveMarkerSha256(grave!));
+  });
+
+  it.each([false, true])("accounts and removes an ordinary usage receipt through T1-T3f (mixed/rollback=%s)", async (injectFailure) => {
+    const store = memoryStoreWithCredentialRolloutClock({ now: () => NOW },
+      { tenantRedisPurgeNamespaceSha256: "7".repeat(64) });
+    const tenantId = `tenant-database-ordinary-usage-${injectFailure}`;
+    const target = installSession(store, tenantId, "ordinary-usage-user");
+    const source = await advanceToDatabaseClaim(store, tenantId, {
+      beforeTenantErasure: async () => {
+        await target.install();
+        await store.commit({ sessionId: target.session.id, fence: 1,
+          usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1,
+            provider: "ordinary-provider", model: "ordinary-model",
+            usage: { ...emptyUsage(), inputTokens: 2, totalTokens: 2, costCNY: 1.25 },
+            createdAtMs: 1_100 }],
+        });
+        await store.commitOrdinarySessionDelete({ sessionId: target.session.id, fence: 2,
+          lifecycle: { type: "tombstone", tenantId, userId: target.session.userId,
+            atMs: 2_000, purgeAfterMs: null, deletionGeneration: 1 },
+          events: [{ type: "session/deleted", sessionId: target.session.id,
+            emittedAtMs: 2_000, deletionGeneration: 1 }],
+        });
+        await store.sealOrdinarySessionDeleteGrace(tenantId, target.session.userId, target.session.id);
+        const owner = { tenantId, userId: target.session.userId, sessionId: target.session.id,
+          deletionGeneration: 1 };
+        const reconciliation = await store.reconcileSessionUsage({ ...owner, nowMs: NOW });
+        credentialRolloutClock(store).advance(ORDINARY_SESSION_DELETE_GRACE_MS + 86_400_000);
+        expect(await store.executeOrdinarySessionUsageRetention({ ...owner,
+          expectedChecksum: reconciliation.checksum, enabled: true })).toMatchObject({
+          facts: [{ usageId: expect.any(String), factSha256: expect.any(String) }],
+          allDomainsComplete: false, contentPurgeExecuted: false,
+        });
+        if (injectFailure) {
+          // A different session remains operational until the tenant T3e cutover. The T3f proof
+          // must account for both the prior ordinary receipt and this independently authorized ACK.
+          const live = installSession(store, tenantId, "ordinary-usage-live-neighbor");
+          await live.install();
+          await store.commit({ sessionId: live.session.id, fence: 1,
+            usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1,
+              provider: "live-provider", model: "live-model",
+              usage: { ...emptyUsage(), outputTokens: 3, totalTokens: 3, costCNY: 2 },
+              createdAtMs: 1_200 }],
+          });
+        }
+      },
+    });
+    const evidence = structuredClone(store.deleted.get(target.session.id)!);
+    const billingBefore = structuredClone([...store.billingUsageFacts.values()]);
+    expect(store.usageLedger).toHaveLength(0);
+    expect(evidence.ordinaryUsageRetentionSourceSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(evidence.ordinaryUsageRetentionReceiptSha256).toMatch(/^[a-f0-9]{64}$/);
+    const sessionReceipts = await store.getTenantSessionContentReceipts(tenantId, source.request.requestId, 1);
+    const sessionReceipt = sessionReceipts.find((receipt) => receipt.sessionId === target.session.id);
+    expect(sessionReceipt?.sessionId).toBe(target.session.id);
+    const tuples = sessionReceipts.map((receipt) => [receipt.sessionId, receipt.receiptSha256,
+      ...(receipt.sessionId === target.session.id ? ["ordinary-usage-retention-v2", target.session.id,
+        evidence.ordinaryUsageRetentionSourceSha256!, evidence.ordinaryUsageRetentionReceiptSha256!] : [])]);
+    const planEntry = (await store.getTenantPurgePlanEntries(tenantId, source.request.requestId, 1))
+      .find((entry) => entry.domain === "session_content")!;
+    expect(planEntry.targetRootSha256).toBe(tenantPurgePlanTargetRootSha256("session_content",
+      tuples.map((tuple) => tenantPurgePlanTargetSha256("session_content", tuple))));
+    if (injectFailure) {
+      const before = tenantBusinessProjectionState(store, tenantId);
+      const priorFact = billingBefore.find((fact) => fact.usageId === evidence.ordinaryUsageRetentionReceipt!.facts[0]!.usageId)!;
+      for (const corruption of ["missing", "cross-tenant", "digest"] as const) {
+        const changed = { ...priorFact, ...(corruption === "cross-tenant" ? { tenantId: "another-tenant" } : {}),
+          factSha256: corruption === "digest" ? "f".repeat(64) : priorFact.factSha256 };
+        if (corruption === "cross-tenant") changed.factSha256 = computeBillingUsageFactSha256(changed);
+        if (corruption === "missing") store.billingUsageFacts.delete(priorFact.usageId);
+        else store.billingUsageFacts.set(priorFact.usageId, changed);
+        await expect(store.executeTenantDatabasePurge(source.authorization)).rejects.toThrow();
+        expect(store.deleted.get(target.session.id)).toEqual(evidence);
+        expect(store.tenantDatabasePurgeReceipts).toHaveLength(0);
+        expect(store.tenantPurgeSessionGraveMarkers).toHaveLength(0);
+        store.billingUsageFacts.clear();
+        for (const fact of billingBefore) store.billingUsageFacts.set(fact.usageId, structuredClone(fact));
+        expect(tenantBusinessProjectionState(store, tenantId)).toEqual(before);
+      }
+      store.tenantDatabasePurgeDomainAcks = new FailOnceMap();
+      await expect(store.executeTenantDatabasePurge(source.authorization))
+        .rejects.toThrow("injected database purge publication failure");
+      expect(tenantBusinessProjectionState(store, tenantId)).toEqual(before);
+      expect(store.deleted.get(target.session.id)).toEqual(evidence);
+      expect(store.tenantDatabasePurgeReceipts).toHaveLength(0);
+      expect(store.tenantPurgeSessionGraveMarkers).toHaveLength(0);
+    }
+    if (injectFailure) {
+      const originalExecute = store.executeTenantDatabasePurge.bind(store);
+      store.executeTenantDatabasePurge = async (authorization) => {
+        await originalExecute(authorization);
+        throw new Error("injected committed ordinary usage T3f response loss");
+      };
+      try {
+        await expect(store.executeTenantDatabasePurge(source.authorization))
+          .rejects.toThrow("injected committed ordinary usage T3f response loss");
+      } finally {
+        store.executeTenantDatabasePurge = originalExecute;
+      }
+    }
+    const terminal = await store.executeTenantDatabasePurge(source.authorization);
+    expect(terminal).toMatchObject({ localDatabasePurgeComplete: true, sessionContentDeleted: true,
+      retainedBillingFactCount: injectFailure ? 2 : 1, allDomainsComplete: false, contentPurgeExecuted: false });
+    expect(terminal?.priorRetainedBillingFacts?.facts).toEqual(evidence.ordinaryUsageRetentionReceipt!.facts);
+    expect(JSON.stringify(terminal?.priorRetainedBillingFacts)).not.toContain(target.session.id);
+    expect(JSON.stringify(terminal?.priorRetainedBillingFacts)).not.toContain(target.session.userId);
+    const contentEntry = (await store.getTenantDatabasePurgePreDeleteEntries(tenantId,
+      source.request.requestId, 1)).find((entry) => entry.domain === "session_content")!;
+    expect(contentEntry.preDeleteTargetRootSha256).toBe(tenantDatabasePurgeTargetRootSha256("session_content",
+      tuples.map((tuple) => tenantDatabasePurgeTargetSha256("session_content", tuple))));
+    expect(store.sessions.has(target.session.id)).toBe(false);
+    expect(store.deleted.has(target.session.id)).toBe(false);
+    expect(store.events.has(target.session.id)).toBe(false);
+    expect(store.usageReconciliations).toHaveLength(0);
+    expect([...store.billingUsageFacts.values()]).toEqual(billingBefore);
+    const grave = await store.getTenantPurgeSessionGraveMarker(tenantId, target.session.id);
+    expect(grave).toMatchObject({ sessionId: target.session.id, deletionGeneration: 1,
+      ordinaryUsageRetention: { sourceSha256: evidence.ordinaryUsageRetentionSourceSha256,
+        receiptSha256: evidence.ordinaryUsageRetentionReceiptSha256 } });
+    expect(grave?.markerSha256).toBe(tenantDatabasePurgeSessionGraveMarkerSha256(grave!));
+    expect(await store.executeTenantDatabasePurge(source.authorization)).toEqual(terminal);
+    if (injectFailure) {
+      for (const corruption of ["bridge-missing", "bridge-field", "bridge-digest", "bridge-fact",
+        "grave-source", "grave-receipt"] as const) {
+        const changedReceipt = structuredClone(terminal!);
+        const changedGrave = structuredClone(grave!);
+        if (corruption === "bridge-missing") delete changedReceipt.priorRetainedBillingFacts;
+        if (corruption === "bridge-field") Object.assign(changedReceipt.priorRetainedBillingFacts!, { extra: true });
+        if (corruption === "bridge-digest") changedReceipt.priorRetainedBillingFacts!.evidenceSha256 = "f".repeat(64);
+        if (corruption === "bridge-fact") changedReceipt.priorRetainedBillingFacts!.facts[0]!.factSha256 = "f".repeat(64);
+        if (corruption === "grave-source") changedGrave.ordinaryUsageRetention!.sourceSha256 = "f".repeat(64);
+        if (corruption === "grave-receipt") changedGrave.ordinaryUsageRetention!.receiptSha256 = "f".repeat(64);
+        store.tenantDatabasePurgeReceipts.set(source.request.requestId, changedReceipt);
+        store.tenantPurgeSessionGraveMarkers.set(target.session.id, changedGrave);
+        try {
+          await expect(store.executeTenantDatabasePurge(source.authorization)).rejects.toThrow();
+          expect(store.sessions.has(target.session.id)).toBe(false);
+          expect(store.deleted.has(target.session.id)).toBe(false);
+          expect([...store.billingUsageFacts.values()]).toEqual(billingBefore);
+        } finally {
+          store.tenantDatabasePurgeReceipts.set(source.request.requestId, structuredClone(terminal!));
+          store.tenantPurgeSessionGraveMarkers.set(target.session.id, structuredClone(grave!));
+        }
+      }
+    }
+    expect(await store.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
+    expect(await store.claimTenantRedisPurges({ limit: 10, leaseMs: 120_000,
+      claimToken: `ordinary-usage-redis-${injectFailure}` })).toHaveLength(1);
+    const redisTargets = await store.getTenantRedisPurgeTargets(tenantId, source.request.requestId, 1);
+    expect(redisTargets.find((targetRow) => targetRow.sessionId === target.session.id)?.graveMarkerSha256)
+      .toBe(grave?.markerSha256);
+    expect(await store.executeTenantDatabasePurge(source.authorization)).toEqual(terminal);
   });
 
   it("binds queued tenant/session telemetry jobs to live owners and T3f graves before deletion", async () => {

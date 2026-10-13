@@ -2,6 +2,20 @@ import { describe, expect, it } from "vitest";
 import { loadRouterConfig } from "../src/config.js";
 
 describe("router configuration", () => {
+  it("keeps ordinary usage retention default-off/non-production and rejects runner-only tuning", () => {
+    expect(loadRouterConfig({ RUNNERS: "http://runner:8787" }).SESSION_USAGE_RETENTION_ENABLED).toBe(false);
+    expect(loadRouterConfig({ RUNNERS: "http://runner:8787", SESSION_USAGE_RETENTION_ENABLED: "1" }).SESSION_USAGE_RETENTION_ENABLED).toBe(true);
+    expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", NODE_ENV: "production", SESSION_USAGE_RETENTION_ENABLED: "1" })).toThrow(/unsupported in production/);
+    expect(loadRouterConfig({ RUNNERS: "http://runner:8787", NODE_ENV: "production", INTERNAL_ROUTER_TOKEN: "production-internal-router-token-0001" }).SESSION_USAGE_RETENTION_ENABLED).toBe(false);
+    for (const key of ["SESSION_USAGE_RETENTION_WORKER_ENABLED", "SESSION_USAGE_RETENTION_WORKER_POLL_MS", "SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE"]) {
+      expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: "1" })).toThrow(/runner-only/);
+    }
+  });
+  it("deduplicates repeated normalized runner URLs without proving distinct process identity", () => {
+    const cfg = loadRouterConfig({ RUNNERS: "http://runner:8787/, http://runner:8787, http://runner:8787/",
+      SESSION_USAGE_RETENTION_ENABLED: "1" });
+    expect(cfg.runnerList).toEqual(["http://runner:8787"]);
+  });
   it("rejects runner-only ordinary DELETE grace recovery configuration", () => {
     for (const key of [
       "SESSION_DELETE_GRACE_RECOVERY_ENABLED",

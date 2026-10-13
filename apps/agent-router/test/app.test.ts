@@ -155,6 +155,8 @@ function fakeRegistry(
     purgeExecutionWorker?: boolean;
     databasePurge?: boolean;
     databasePurgeWorker?: boolean;
+    ordinaryUsageRetention?: boolean;
+    ordinaryUsageRetentionWorker?: boolean;
     redisPurge?: boolean;
     redisPurgeWorker?: boolean;
     exportReadable?: boolean;
@@ -267,6 +269,11 @@ function fakeRegistry(
       (opts.purgeExecution ?? false)
       && (opts.databasePurge ?? false)
       && (opts.databasePurgeWorker ?? false)
+    ),
+    refreshOrdinarySessionUsageRetention: async () => {},
+    allConfiguredSupportOrdinarySessionUsageRetention: () => opts.ordinaryUsageRetention ?? false,
+    allConfiguredSupportOrdinarySessionUsageRetentionWorker: () => (
+      (opts.ordinaryUsageRetention ?? false) && (opts.ordinaryUsageRetentionWorker ?? false)
     ),
     allConfiguredSupportTenantRedisPurge: () => opts.redisPurge ?? false,
     allConfiguredSupportTenantRedisPurgeWorker: () => (

@@ -101,6 +101,7 @@ import {
   type OrdinarySessionDeleteGraceEvidence,
   type OrdinarySessionDeleteGraceView,
 } from "./session-delete-grace.js";
+import * as OrdinaryUsageRetention from "./ordinary-usage-retention.js";
 
 import {
   BLOB_STORAGE_FORMAT,
@@ -1177,6 +1178,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     purgeAfterMs?: number;
     deletionGeneration: number;
     ordinaryDeleteGrace?: OrdinarySessionDeleteGraceEvidence;
+    ordinaryUsageRetentionSource?: OrdinaryUsageRetention.OrdinarySessionUsageRetentionSource;
+    ordinaryUsageRetentionSourceSha256?: string;
+    ordinaryUsageRetentionReceipt?: OrdinaryUsageRetention.OrdinarySessionUsageRetentionReceipt;
+    ordinaryUsageRetentionReceiptSha256?: string;
   }>();
   lifecycleOutbox = new Map<string, LifecycleOutboxRecord>();
   private nextLifecycleOutboxId = 1;
@@ -14449,7 +14454,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
             receipt.requestId === job.requestId
             && receipt.buildGeneration === job.buildGeneration
           ));
-        for (const receipt of receipts) add(receipt.sessionId, receipt.receiptSha256);
+        for (const receipt of receipts) {
+          const evidence = this.ordinaryUsageRetentionCatalogTuple(receipt.sessionId);
+          add(receipt.sessionId, receipt.receiptSha256, ...(evidence ?? []));
+        }
         targetCount = contentReceipt.sessionReceiptCount + contentReceipt.contentRecordCount;
         if (!Number.isSafeInteger(targetCount)) throw new TenantErasureIntegrityError();
         disposition = "delete";
@@ -18306,14 +18314,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
             && ack.final
           ));
           const operationalAck = operationalAcks[0];
+          const currentFacts = OrdinaryUsageRetention.subtractPriorRetainedBillingFacts(job.tenantId, facts,
+            bundle.receipt.priorRetainedBillingFacts?.facts ?? []);
           if (
             operationalAcks.length !== 1
             || !operationalAck
-            || operationalAck.resultCount !== facts.length
+            || operationalAck.resultCount !== currentFacts.length
             || operationalAck.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
               "operational_usage",
               "anonymize",
-              facts.map((fact) => fact.factSha256),
+              currentFacts.map((fact) => fact.factSha256),
             )
           ) throw new Error("tenant database purge billing facts do not match T3e");
           const closure = this.tenantTelemetryOwnerClosureReceipts.get(job.requestId);
@@ -18528,7 +18538,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           if (!receipt || receipt.tenantId !== job.tenantId) {
             throw new TenantDatabasePurgeEvidenceChangedError();
           }
-          add(sessionId, receipt.receiptSha256);
+          const evidence = this.ordinaryUsageRetentionCatalogTuple(sessionId);
+          add(sessionId, receipt.receiptSha256, ...(evidence ?? []));
         }
         break;
       }
@@ -19127,13 +19138,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const operationalAck = executionAcks.find((ack) => (
       ack.domain === "operational_usage" && ack.ackKind === "anonymized" && ack.final
     ));
-    if (!operationalAck || facts.length !== operationalAck.resultCount) {
+    const prior = this.ordinaryUsageRetentionPriorBillingFacts(tenantId);
+    const currentFacts = OrdinaryUsageRetention.subtractPriorRetainedBillingFacts(tenantId, facts, prior);
+    if (!operationalAck || currentFacts.length !== operationalAck.resultCount) {
       throw new TenantDatabasePurgeEvidenceChangedError();
     }
     if (operationalAck.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
         "operational_usage",
         "anonymize",
-        facts.map((fact) => fact.factSha256),
+        currentFacts.map((fact) => fact.factSha256),
       )) throw new TenantDatabasePurgeEvidenceChangedError();
   }
 
@@ -19682,6 +19695,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         .filter((fact) => fact.tenantId === current.tenantId)
         .sort((left, right) => left.usageId.localeCompare(right.usageId));
       for (const fact of billingFacts) assertBillingUsageFact(fact);
+      const priorRetainedFacts = this.ordinaryUsageRetentionPriorBillingFacts(current.tenantId);
       const billingFactRootSha256 = tenantDatabasePurgeBillingFactRootSha256(
         billingFacts.map((fact) => fact.factSha256),
       );
@@ -19722,6 +19736,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         const sessionReceipt = receiptBySession.get(session.id);
         if (!sessionReceipt) throw new TenantDatabasePurgeEvidenceChangedError();
         const tombstone = this.deleted.get(session.id);
+        const ordinaryTuple = this.ordinaryUsageRetentionCatalogTuple(session.id);
         const markerBody = {
           ...identity,
           scope: TENANT_PURGE_SESSION_GRAVE_MARKER_SCOPE,
@@ -19736,6 +19751,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           t3cSessionReceiptSha256: sessionReceipt.receiptSha256,
           preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
           markedAtDbMs: purgeAtMs,
+          ...(ordinaryTuple === null ? {} : { ordinaryUsageRetention: {
+            sourceSha256: ordinaryTuple[2], receiptSha256: ordinaryTuple[3],
+          } }),
         };
         graves.push(clone<TenantPurgeSessionGraveMarker>({
           ...markerBody,
@@ -19858,6 +19876,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       const receiptBody = {
         ...sourceFields,
         scope: TENANT_DATABASE_PURGE_RECEIPT_SCOPE,
+        priorRetainedBillingFacts: {
+          schemaVersion: 1 as const, facts: priorRetainedFacts,
+          evidenceSha256: OrdinaryUsageRetention.priorRetainedBillingFactProofSha256({
+            ...sourceFields, preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+          }, priorRetainedFacts),
+        },
         preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
         preDeleteEntryCount: preDeleteEntries.length,
         preDeleteEntryRootSha256: entryRootSha256,
@@ -24803,6 +24827,23 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
             observedDbMs,
           }),
         };
+        const policy = this.assertRetentionPolicyState(s.tenantId);
+        if (observedDbMs < policy.control.updatedAtMs
+          || observedDbMs < (policy.active?.createdAtMs ?? 0)) {
+          throw new Error("ordinary usage retention trusted clock precedes policy");
+        }
+        const source: OrdinaryUsageRetention.OrdinarySessionUsageRetentionSource = {
+          schemaVersion: 2, originSha256: stagedTombstone!.ordinaryDeleteGrace!.originSha256,
+          policyVersion: policy.active?.policyVersion ?? null,
+          policySha256: policy.active?.policySha256 ?? null,
+        };
+        Object.assign(stagedTombstone!, {
+          ordinaryUsageRetentionSource: source,
+          ordinaryUsageRetentionSourceSha256: OrdinaryUsageRetention.ordinaryUsageRetentionSourceSha256({
+            tenantId: s.tenantId, userId: s.userId, sessionId: s.id,
+            deletionGeneration: stagedLifecycle.deletionGeneration,
+          }, source),
+        });
       }
     }
 
@@ -26767,6 +26808,199 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     for (const [usageId, fact] of stagedNewFacts) this.billingUsageFacts.set(usageId, clone(fact));
     this.usageReconciliations.set(reconciliationKey, record);
     return clone(record);
+  }
+
+  private ordinaryUsageRetentionPriorBillingFacts(tenantId: string): OrdinaryUsageRetention.PriorRetainedBillingFactProof["facts"] {
+    const result: OrdinaryUsageRetention.PriorRetainedBillingFactProof["facts"] = [];
+    const seen = new Set<string>();
+    for (const [sessionId, session] of this.sessions) {
+      if (session.tenantId !== tenantId) continue;
+      const tombstone = this.deleted.get(sessionId);
+      this.ordinaryUsageRetentionCatalogTuple(sessionId);
+      const receipt = tombstone?.ordinaryUsageRetentionReceipt;
+      if (!receipt) continue;
+      const source = tombstone!.ordinaryUsageRetentionSource!;
+      const grace = this.ordinaryDeleteGraceEvidence(tenantId, session.userId, sessionId);
+      const deletion = source.policyVersion === null ? undefined : this.retentionPolicies.get(retentionPolicyKey(tenantId, source.policyVersion));
+      const originalCurrent = this.retentionPolicies.get(retentionPolicyKey(tenantId, receipt.currentPolicyVersion));
+      const owner = { tenantId, userId: session.userId, sessionId, deletionGeneration: tombstone!.deletionGeneration, nowMs: 0 };
+      const record = this.usageReconciliations.get(this.usageReconciliationMapKey(sessionId, owner.deletionGeneration));
+      if (!grace || !deletion || !originalCurrent || !record || record.status !== "anonymized"
+        || record.tenantId !== tenantId || record.userId !== session.userId || record.sessionId !== sessionId
+        || record.deletionGeneration !== owner.deletionGeneration || record.anonymizedAtMs !== receipt.executedAtDbMs
+        || record.verifiedAtMs > receipt.executedAtDbMs || this.usageRowsForLifecycle(this.usageLedger, owner).length) {
+        throw new Error("ordinary usage retention prior billing source changed");
+      }
+      validateRetentionPolicyVersionRecord(deletion); validateRetentionPolicyVersionRecord(originalCurrent);
+      OrdinaryUsageRetention.assertOrdinaryUsageRetentionReplay(source, tombstone!.ordinaryUsageRetentionSourceSha256!, grace, receipt, deletion, originalCurrent);
+      const facts = receipt.facts.map((identity) => {
+        if (seen.has(identity.usageId)) throw new Error("ordinary usage retention prior billing identity duplicated");
+        seen.add(identity.usageId);
+        const fact = this.billingUsageFacts.get(identity.usageId);
+        if (!fact || fact.tenantId !== tenantId) throw new Error("ordinary usage retention prior billing fact missing");
+        return fact;
+      });
+      OrdinaryUsageRetention.assertOrdinaryUsageRetentionFacts(record, facts, receipt);
+      result.push(...receipt.facts);
+    }
+    return result.sort((a, b) => a.usageId < b.usageId ? -1 : a.usageId > b.usageId ? 1 : 0).map(clone);
+  }
+
+  private ordinaryUsageRetentionCatalogTuple(sessionId: string): [string, string, string, string | null] | null {
+    const tombstone = this.deleted.get(sessionId);
+    const source = tombstone?.ordinaryUsageRetentionSource;
+    if (!source) {
+      if (tombstone?.ordinaryUsageRetentionSourceSha256 !== undefined || tombstone?.ordinaryUsageRetentionReceipt !== undefined
+        || tombstone?.ordinaryUsageRetentionReceiptSha256 !== undefined) throw new Error("ordinary usage retention partial source");
+      return null;
+    }
+    const session = this.sessions.get(sessionId);
+    if (!session || !tombstone || source.originSha256 !== tombstone.ordinaryDeleteGrace?.originSha256
+      || tombstone.ordinaryUsageRetentionSourceSha256 !==
+      OrdinaryUsageRetention.ordinaryUsageRetentionSourceSha256({ tenantId: session.tenantId,
+        userId: session.userId, sessionId, deletionGeneration: tombstone.deletionGeneration }, source)) {
+      throw new Error("ordinary usage retention catalog source is invalid");
+    }
+    const receipt = tombstone.ordinaryUsageRetentionReceipt;
+    if (receipt && (receipt.sourceSha256 !== tombstone.ordinaryUsageRetentionSourceSha256
+      || tombstone.ordinaryUsageRetentionReceiptSha256 !== OrdinaryUsageRetention.ordinaryUsageRetentionReceiptSha256(receipt))) {
+      throw new Error("ordinary usage retention catalog receipt is invalid");
+    }
+    if (!receipt && tombstone.ordinaryUsageRetentionReceiptSha256 !== undefined) {
+      throw new Error("ordinary usage retention catalog receipt is missing");
+    }
+    return ["ordinary-usage-retention-v2", sessionId, tombstone.ordinaryUsageRetentionSourceSha256!,
+      tombstone.ordinaryUsageRetentionReceiptSha256 ?? null];
+  }
+
+  async listOrdinarySessionUsageRetentionCandidates(input: { afterSessionId?: string; limit: number }):
+    Promise<OrdinaryUsageRetention.OrdinarySessionUsageRetentionCandidate[]> {
+    if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100) throw new Error("ordinary usage retention candidate limit is invalid");
+    const now = this.storeNowMs();
+    const candidates: OrdinaryUsageRetention.OrdinarySessionUsageRetentionCandidate[] = [];
+    for (const [sessionId, session] of [...this.sessions].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) {
+      if (input.afterSessionId !== undefined && sessionId <= input.afterSessionId) continue;
+      const deleted = this.deleted.get(sessionId);
+      const source = deleted?.ordinaryUsageRetentionSource;
+      if (!source || !deleted || deleted.ordinaryUsageRetentionReceipt || source.policyVersion === null) continue;
+      const deletion = this.retentionPolicies.get(retentionPolicyKey(session.tenantId, source.policyVersion));
+      const currentVersion = this.retentionPolicyControls.get(session.tenantId)?.activePolicyVersion;
+      const current = currentVersion ? this.retentionPolicies.get(retentionPolicyKey(session.tenantId, currentVersion)) : undefined;
+      if (deletion?.policy.operationalUsageRetentionMs === null || current?.policy.operationalUsageRetentionMs === null
+        || !current || deleted.ordinaryDeleteGrace?.graceFloorDbMs === undefined
+        || now < deleted.ordinaryDeleteGrace.graceFloorDbMs) continue;
+      candidates.push({ tenantId: session.tenantId, userId: session.userId, sessionId,
+        deletionGeneration: deleted.deletionGeneration });
+      if (candidates.length === input.limit) break;
+    }
+    return candidates;
+  }
+
+  async executeOrdinarySessionUsageRetention(raw: OrdinaryUsageRetention.ExecuteOrdinarySessionUsageRetentionInput):
+    Promise<OrdinaryUsageRetention.OrdinarySessionUsageRetentionReceipt | null> {
+    const input = clone(raw);
+    if (input.enabled !== true) throw new Error("ordinary usage retention is disabled");
+    const now = this.storeNowMs();
+    const lifecycleInput = { ...input, nowMs: now };
+    validateReconcileSessionUsageInput(lifecycleInput);
+    this.assertUsageLifecycleScope(lifecycleInput);
+    const tombstone = this.deleted.get(input.sessionId)!;
+    const source = tombstone.ordinaryUsageRetentionSource;
+    const grace = this.ordinaryDeleteGraceEvidence(input.tenantId, input.userId, input.sessionId);
+    this.ordinaryUsageRetentionCatalogTuple(input.sessionId);
+    if (!source || !grace) return null;
+    if (source.originSha256 !== grace.originSha256) throw new Error("ordinary usage retention origin changed");
+    const key = this.usageReconciliationMapKey(input.sessionId, input.deletionGeneration);
+    const record = this.usageReconciliations.get(key);
+    if (!record || record.tenantId !== input.tenantId || record.userId !== input.userId
+      || record.checksum !== input.expectedChecksum) throw new UsageReconciliationError("ordinary usage retention reconciliation does not match");
+    const rows = this.usageRowsForLifecycle(this.usageLedger, lifecycleInput);
+    // Canonical lifecycle/hold validation is still performed for exact replay, but a new hold
+    // cannot revoke an already committed, non-expanding receipt read.
+    const held = this.isUsageAnonymizationLegalHoldActive(lifecycleInput);
+    const existing = tombstone.ordinaryUsageRetentionReceipt;
+    if (existing) {
+      const deletion = source.policyVersion === null ? undefined
+        : this.retentionPolicies.get(retentionPolicyKey(input.tenantId, source.policyVersion));
+      const originalCurrent = this.retentionPolicies.get(retentionPolicyKey(input.tenantId, existing.currentPolicyVersion));
+      if (!deletion || !originalCurrent) throw new Error("ordinary usage retention replay policy missing");
+      validateRetentionPolicyVersionRecord(deletion);
+      validateRetentionPolicyVersionRecord(originalCurrent);
+      OrdinaryUsageRetention.assertOrdinaryUsageRetentionReplay(source, tombstone.ordinaryUsageRetentionSourceSha256!,
+        grace, existing, deletion, originalCurrent);
+      if (record.status !== "anonymized" || record.anonymizedAtMs !== existing.executedAtDbMs
+        || record.verifiedAtMs > existing.executedAtDbMs || rows.length || existing.checksum !== input.expectedChecksum
+        || existing.sealSha256 !== grace.sealSha256) throw new Error("ordinary usage retention exact replay changed");
+      const facts = existing.facts.map((v) => {
+        const fact = this.billingUsageFacts.get(v.usageId);
+        if (!fact || fact.tenantId !== input.tenantId) throw new Error("ordinary usage retention billing fact missing");
+        return fact;
+      });
+      OrdinaryUsageRetention.assertOrdinaryUsageRetentionFacts(record, facts, existing);
+      return clone(existing);
+    }
+    this.assertSubjectWritable(input.tenantId, input.userId);
+    if (!this.subjectRecord(input.tenantId, "tenant", input.tenantId)
+      || !this.subjectRecord(input.tenantId, "user", input.userId)
+      || [...this.erasureRequests.values()].some((v) => v.tenantId === input.tenantId
+        && v.subjectKind === "user" && v.subjectId === input.userId)
+      || this.readTenantRestoreRuntimeControl().state !== "inactive") {
+      throw new Error("ordinary usage retention erasure/restore gate is closed");
+    }
+    if (record.status !== "verified") throw new Error("ordinary usage retention has no execution receipt");
+    if (source.policyVersion === null) return null;
+    const deletion = this.retentionPolicies.get(retentionPolicyKey(input.tenantId, source.policyVersion));
+    const current = this.assertRetentionPolicyState(input.tenantId);
+    if (!deletion || deletion.policySha256 !== source.policySha256) throw new Error("ordinary usage retention deletion policy missing");
+    validateRetentionPolicyVersionRecord(deletion);
+    if (!current.active) return null;
+    const deadline = OrdinaryUsageRetention.ordinaryUsageRetentionDeadline(grace, deletion, current.active);
+    const highWater = Math.max(record.verifiedAtMs, grace.sealObservedDbMs ?? 0,
+      deletion.createdAtMs, current.active.createdAtMs, current.control.updatedAtMs,
+      this.assertLegalHoldState(input.tenantId, "tenant", input.tenantId).control.updatedAtMs,
+      this.assertLegalHoldState(input.tenantId, "user", input.userId).control.updatedAtMs);
+    if (now < highWater) throw new Error("ordinary usage retention trusted clock regressed");
+    if (held || deadline === null || now < deadline) return null;
+    const facts = rows.map((row) => {
+      if (!row.usageId) throw new UsageReconciliationError("ordinary usage retention usage ID missing");
+      const fact = this.billingUsageFacts.get(row.usageId);
+      const expected = billingUsageFactFromLedger({ ...row, usageId: row.usageId,
+        usage: normalizeHistoricalUsageCost(row.usage) });
+      if (!fact || !billingUsageFactContentEquals(fact, expected)) throw new Error("ordinary usage retention billing fact changed");
+      return fact;
+    }).sort((a, b) => a.usageId < b.usageId ? -1 : a.usageId > b.usageId ? 1 : 0);
+    OrdinaryUsageRetention.assertOrdinaryUsageRetentionFacts(record, facts);
+    const receipt: OrdinaryUsageRetention.OrdinarySessionUsageRetentionReceipt = {
+      schemaVersion: 1, sourceSha256: tombstone.ordinaryUsageRetentionSourceSha256!,
+      sealSha256: grace.sealSha256!, deletionPolicySha256: deletion.policySha256,
+      currentPolicySha256: current.active.policySha256, currentPolicyVersion: current.active.policyVersion,
+      deadlineDbMs: deadline, executedAtDbMs: now,
+      checksum: record.checksum, facts: facts.map((v) => ({ usageId: v.usageId, factSha256: v.factSha256 })),
+      allDomainsComplete: false, contentPurgeExecuted: false,
+    };
+    const sha = OrdinaryUsageRetention.ordinaryUsageRetentionReceiptSha256(receipt);
+    const remaining = this.usageLedger.filter((row) => row.sessionId !== input.sessionId);
+    const anonymized = clone<UsageReconciliationRecord>({ ...record, status: "anonymized", anonymizedAtMs: now });
+    const result = clone(receipt);
+    const previousLedger = this.usageLedger;
+    const previousReceipt = tombstone.ordinaryUsageRetentionReceipt;
+    const previousReceiptSha256 = tombstone.ordinaryUsageRetentionReceiptSha256;
+    try {
+      this.usageLedger = remaining;
+      this.usageReconciliations.set(key, anonymized);
+      tombstone.ordinaryUsageRetentionReceipt = receipt;
+      tombstone.ordinaryUsageRetentionReceiptSha256 = sha;
+    } catch (error) {
+      this.usageLedger = previousLedger;
+      // Bypass an injected Map.set failure during rollback, as in the other atomic publishers.
+      Map.prototype.set.call(this.usageReconciliations, key, record);
+      if (previousReceipt === undefined) delete tombstone.ordinaryUsageRetentionReceipt;
+      else tombstone.ordinaryUsageRetentionReceipt = previousReceipt;
+      if (previousReceiptSha256 === undefined) delete tombstone.ordinaryUsageRetentionReceiptSha256;
+      else tombstone.ordinaryUsageRetentionReceiptSha256 = previousReceiptSha256;
+      throw error;
+    }
+    return result;
   }
 
   async anonymizeSessionUsage(input: AnonymizeSessionUsageInput): Promise<UsageReconciliationRecord> {

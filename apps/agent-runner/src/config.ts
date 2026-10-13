@@ -78,6 +78,13 @@ const Env = z.object({
     .min(1).max(300_000).default(30_000),
   SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE: z.coerce.number().int()
     .min(1).max(100).default(25),
+  /** Non-production only: one policy/hold-gated operational usage domain, never session content. */
+  SESSION_USAGE_RETENTION_WORKER_ENABLED: z.enum(["0", "1"])
+    .default("0").transform((value) => value === "1"),
+  SESSION_USAGE_RETENTION_WORKER_POLL_MS: z.coerce.number().int()
+    .min(1).max(300_000).default(30_000),
+  SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE: z.coerce.number().int()
+    .min(1).max(100).default(25),
   /** Durable user-erasure worker. Kept separate from request admission for drain/forward-fix. */
   ERASURE_WORKER_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
   /**
@@ -831,6 +838,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const erasureRouterUrl = c.ERASURE_ROUTER_URL === undefined
     ? undefined
     : validateErasureRouterUrl(c.ERASURE_ROUTER_URL);
+  if (c.NODE_ENV === "production" && c.SESSION_USAGE_RETENTION_WORKER_ENABLED) {
+    throw new Error("SESSION_USAGE_RETENTION_WORKER_ENABLED=1 is unsupported in production");
+  }
   if (
     (
       c.ERASURE_WORKER_ENABLED
@@ -843,6 +853,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
       || c.TENANT_RUNTIME_REVOCATION_WORKER_ENABLED
       || c.TENANT_PURGE_EXECUTION_WORKER_ENABLED
       || c.TENANT_DATABASE_PURGE_WORKER_ENABLED
+      || c.SESSION_USAGE_RETENTION_WORKER_ENABLED
       || c.TENANT_REDIS_PURGE_WORKER_ENABLED
     )
     && erasureRouterUrl === undefined
@@ -857,6 +868,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
         + "TENANT_RUNTIME_REVOCATION_WORKER_ENABLED=1, or "
         + "TENANT_PURGE_EXECUTION_WORKER_ENABLED=1, or "
         + "TENANT_DATABASE_PURGE_WORKER_ENABLED=1, or "
+        + "SESSION_USAGE_RETENTION_WORKER_ENABLED=1, or "
         + "TENANT_REDIS_PURGE_WORKER_ENABLED=1",
     );
   }

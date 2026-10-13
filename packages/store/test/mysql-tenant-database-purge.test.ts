@@ -13,6 +13,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import {
   BLOB_STORAGE_FORMAT,
   EMPTY_TENANT_DATABASE_PURGE_DOMAIN_ACK_ROOT_SHA256,
+  ORDINARY_SESSION_DELETE_GRACE_MS,
   MysqlSessionStore,
   SessionGoneError,
   TenantDatabasePurgeEvidenceChangedError,
@@ -26,6 +27,8 @@ import {
   newErasureRequestId,
   newUserDataExportArtifactId,
   newUserDataExportRequestId,
+  newUsageId,
+  priorRetainedBillingFactProofSha256,
   computeBillingUsageFactSha256,
   tenantDatabasePurgeBillingFactRootSha256,
   tenantDatabasePurgeCutoverEvidenceSha256,
@@ -38,6 +41,10 @@ import {
   tenantDatabasePurgeSessionGraveMarkerRootSha256,
   tenantDatabasePurgeSessionGraveMarkerSha256,
   tenantErasureRequestHash,
+  tenantPurgePlanTargetRootSha256,
+  tenantPurgePlanTargetSha256,
+  tenantDatabasePurgeTargetRootSha256,
+  tenantDatabasePurgeTargetSha256,
   tenantTelemetryOwnerClosureEntryRootSha256,
   tenantTelemetryRefKeyIdSha256,
   tenantTelemetryWriteAdapterEvidenceSha256,
@@ -833,6 +840,13 @@ async function rewriteSelfConsistentT3fBillingEvidence(
     graveMarkerRootSha256: graveRootSha256,
     retainedBillingFactRootSha256: billingRootSha256,
   };
+  if (newTerminalBody.priorRetainedBillingFacts) {
+    newTerminalBody.priorRetainedBillingFacts = {
+      ...newTerminalBody.priorRetainedBillingFacts,
+      evidenceSha256: priorRetainedBillingFactProofSha256(newTerminalBody,
+        newTerminalBody.priorRetainedBillingFacts.facts),
+    };
+  }
   const newTerminalReceipt = {
     ...newTerminalBody,
     receiptSha256: tenantDatabasePurgeReceiptSha256(newTerminalBody),
@@ -908,12 +922,16 @@ async function rewriteSelfConsistentT3fBillingEvidence(
       `UPDATE tenant_database_purge_receipts
           SET predelete_receipt_sha256=?,domain_ack_root_sha256=?,
               grave_marker_root_sha256=?,retained_billing_fact_root_sha256=?,
+              prior_retained_billing_facts_json=?,prior_retained_billing_facts_sha256=?,
               receipt_sha256=? WHERE request_id=?`,
       [
         newPreDeleteReceipt.receiptSha256,
         domainAckRootSha256,
         graveRootSha256,
         billingRootSha256,
+        newTerminalReceipt.priorRetainedBillingFacts === undefined ? null
+          : JSON.stringify(newTerminalReceipt.priorRetainedBillingFacts),
+        newTerminalReceipt.priorRetainedBillingFacts?.evidenceSha256 ?? null,
         newTerminalReceipt.receiptSha256,
         requestId,
       ],
@@ -1096,6 +1114,292 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(await store.getTenantPurgeSessionGraveMarker(tenantId, ordinarySessionId))
           .toMatchObject({ sessionId: ordinarySessionId, deletionGeneration: 1 });
       } finally {
+        await conn.end();
+        await store.close();
+      }
+    });
+
+    it.each([false, true])("accounts and removes an ordinary usage receipt through T1-T3f (mixed/rollback=%s)", async (injectFailure) => {
+      const store = await MysqlSessionStore.connect({ url: mysqlUrl, connectionLimit: 8,
+        tenantRedisPurgeNamespaceSha256: "7".repeat(64) });
+      const conn = await mysql.createConnection(mysqlUrl);
+      const tenantId = `tenant-ordinary-usage-t3f-${randomUUID()}`;
+      const userId = `user-ordinary-usage-t3f-${randomUUID()}`;
+      // Each checkout still reads the real MySQL CURRENT_TIMESTAMP(3). Move only this disposable
+      // fixture's session clock; never rewrite protected origin/seal/retention evidence.
+      let clockMs = Date.now() + 100;
+      const pool = (store as unknown as { pool: { getConnection(): Promise<mysql.PoolConnection> } }).pool;
+      const originalCheckout = pool.getConnection.bind(pool);
+      pool.getConnection = async () => {
+        const connection = await originalCheckout();
+        clockMs += 5;
+        await connection.query("SET timestamp=?", [clockMs / 1000]);
+        return connection;
+      };
+      try {
+        const source = await advanceToDatabasePurgeClaim(store, conn, tenantId, userId, {
+          beforeTenantErasure: async (sessionId) => {
+            const atMs = Date.now();
+            await store.commitOrdinarySessionDelete({ sessionId, fence: 1,
+              lifecycle: { type: "tombstone", tenantId, userId, atMs,
+                purgeAfterMs: null, deletionGeneration: 1 },
+              events: [{ type: "session/deleted", sessionId, emittedAtMs: atMs,
+                deletionGeneration: 1 }],
+            });
+            await store.sealOrdinarySessionDeleteGrace(tenantId, userId, sessionId);
+            const owner = { tenantId, userId, sessionId, deletionGeneration: 1 };
+            const reconciliation = await store.reconcileSessionUsage({ ...owner, nowMs: atMs });
+            clockMs += ORDINARY_SESSION_DELETE_GRACE_MS + 86_400_000;
+            expect(await store.executeOrdinarySessionUsageRetention({ ...owner,
+              expectedChecksum: reconciliation.checksum, enabled: true })).toMatchObject({
+              facts: [{ usageId: expect.any(String), factSha256: expect.any(String) }],
+              allDomainsComplete: false, contentPurgeExecuted: false,
+            });
+            await completeOrdinaryTombstoneOutbox(store, sessionId);
+            if (injectFailure) {
+              const live = mkSession(tenantId, `ordinary-usage-live-${randomUUID()}`);
+              await store.createSession(live);
+              await store.commit({ sessionId: live.id, fence: 1,
+                usageEntries: [{ usageId: newUsageId(), turnId: newId("turn"), step: 1,
+                  provider: "live-provider", model: "live-model",
+                  usage: { ...emptyUsage(), outputTokens: 3, totalTokens: 3, costCNY: 2 },
+                  createdAtMs: Date.now() }],
+              });
+            }
+          },
+        });
+        const [proofRows] = await conn.query<RowDataPacket[]>(
+          `SELECT ordinary_usage_retention_source_json,ordinary_usage_retention_source_sha256,
+                  ordinary_usage_retention_receipt_json,ordinary_usage_retention_receipt_sha256
+             FROM sessions WHERE session_id=?`, [source.session.id],
+        );
+        const proofBefore = structuredClone(proofRows[0]!);
+        expect(proofBefore.ordinary_usage_retention_source_json).not.toBeNull();
+        expect(proofBefore.ordinary_usage_retention_receipt_json).not.toBeNull();
+        const ordinaryReceipt = typeof proofBefore.ordinary_usage_retention_receipt_json === "string"
+          ? JSON.parse(proofBefore.ordinary_usage_retention_receipt_json)
+          : proofBefore.ordinary_usage_retention_receipt_json;
+        const [billingBefore] = await conn.query<RowDataPacket[]>(
+          "SELECT * FROM billing_usage_facts WHERE tenant_id=? ORDER BY usage_id", [tenantId],
+        );
+        expect(billingBefore).toHaveLength(injectFailure ? 2 : 1);
+        const sessionReceipts = await store.getTenantSessionContentReceipts(tenantId, source.requestId, 1);
+        const sessionReceipt = sessionReceipts.find((receipt) => receipt.sessionId === source.session.id);
+        expect(sessionReceipt?.sessionId).toBe(source.session.id);
+        const tuples = sessionReceipts.map((receipt) => [receipt.sessionId, receipt.receiptSha256,
+          ...(receipt.sessionId === source.session.id ? ["ordinary-usage-retention-v2", source.session.id,
+            String(proofBefore.ordinary_usage_retention_source_sha256),
+            String(proofBefore.ordinary_usage_retention_receipt_sha256)] : [])]);
+        const planEntry = (await store.getTenantPurgePlanEntries(tenantId, source.requestId, 1))
+          .find((entry) => entry.domain === "session_content")!;
+        expect(planEntry.targetRootSha256).toBe(tenantPurgePlanTargetRootSha256("session_content",
+          tuples.map((tuple) => tenantPurgePlanTargetSha256("session_content", tuple))));
+        if (injectFailure) {
+          const priorFact = billingBefore.find((row) => row.usage_id === ordinaryReceipt.facts[0].usageId)!;
+          const crossTenantFactBody = {
+            usageId: String(priorFact.usage_id), tenantId: "another-tenant",
+            accountingPeriod: String(priorFact.accounting_period),
+            provider: String(priorFact.provider), model: String(priorFact.model),
+            inputTokens: Number(priorFact.input_tokens), outputTokens: Number(priorFact.output_tokens),
+            cacheReadTokens: Number(priorFact.cache_read_tokens),
+            cacheWriteTokens: Number(priorFact.cache_write_tokens),
+            reasoningTokens: Number(priorFact.reasoning_tokens), totalTokens: Number(priorFact.total_tokens),
+            ...(priorFact.cost_cny == null ? {} : { costCNY: Number(priorFact.cost_cny) }),
+            currency: "CNY" as const,
+          };
+          // These corruptions must be rejected at the source-boundary validation;
+          // they do not claim to exercise a later bridge-only authorization path.
+          for (const corruption of ["missing", "cross-tenant", "digest"] as const) {
+            if (corruption === "missing") {
+              await conn.query("DELETE FROM billing_usage_facts WHERE usage_id=?", [priorFact.usage_id]);
+            } else {
+              await conn.query("UPDATE billing_usage_facts SET tenant_id=?,fact_sha256=? WHERE usage_id=?", [
+                corruption === "cross-tenant" ? "another-tenant" : tenantId,
+                corruption === "cross-tenant" ? computeBillingUsageFactSha256(crossTenantFactBody) : "f".repeat(64),
+                priorFact.usage_id,
+              ]);
+            }
+            try {
+              await expect(store.executeTenantDatabasePurge(source.authorization)).rejects.toThrow();
+              const [proofAfterCorruption] = await conn.query<RowDataPacket[]>(
+                `SELECT ordinary_usage_retention_source_json,ordinary_usage_retention_source_sha256,
+                        ordinary_usage_retention_receipt_json,ordinary_usage_retention_receipt_sha256
+                   FROM sessions WHERE session_id=?`, [source.session.id],
+              );
+              expect(proofAfterCorruption).toEqual([proofBefore]);
+              expect(await store.getTenantDatabasePurgeReceipt(tenantId, source.requestId)).toBeNull();
+              expect(await store.getTenantPurgeSessionGraveMarker(tenantId, source.session.id)).toBeNull();
+            } finally {
+              if (corruption === "missing") {
+                await conn.query("INSERT INTO billing_usage_facts SET ?", [{ ...priorFact }]);
+              } else {
+                await conn.query("UPDATE billing_usage_facts SET tenant_id=?,fact_sha256=? WHERE usage_id=?", [
+                  priorFact.tenant_id, priorFact.fact_sha256, priorFact.usage_id,
+                ]);
+              }
+            }
+            const [billingAfterCorruption] = await conn.query<RowDataPacket[]>(
+              "SELECT * FROM billing_usage_facts WHERE tenant_id=? ORDER BY usage_id", [tenantId],
+            );
+            expect(billingAfterCorruption).toEqual(billingBefore);
+          }
+          const internal = store as unknown as { deleteTenantDatabasePurgeTargets(...args: unknown[]): Promise<void> };
+          const originalDelete = internal.deleteTenantDatabasePurgeTargets;
+          internal.deleteTenantDatabasePurgeTargets = async (...args) => {
+            await originalDelete.apply(store, args);
+            throw new Error("injected ordinary usage T3f destructive failure");
+          };
+          try {
+            await expect(store.executeTenantDatabasePurge(source.authorization))
+              .rejects.toThrow("injected ordinary usage T3f destructive failure");
+          } finally {
+            internal.deleteTenantDatabasePurgeTargets = originalDelete;
+          }
+          const [afterFailure] = await conn.query<RowDataPacket[]>(
+            `SELECT ordinary_usage_retention_source_json,ordinary_usage_retention_source_sha256,
+                    ordinary_usage_retention_receipt_json,ordinary_usage_retention_receipt_sha256
+               FROM sessions WHERE session_id=?`, [source.session.id],
+          );
+          expect(afterFailure).toEqual([proofBefore]);
+          const [billingAfterFailure] = await conn.query<RowDataPacket[]>(
+            "SELECT * FROM billing_usage_facts WHERE tenant_id=? ORDER BY usage_id", [tenantId],
+          );
+          expect(billingAfterFailure).toEqual(billingBefore);
+          expect(await store.getTenantDatabasePurgeReceipt(tenantId, source.requestId)).toBeNull();
+          expect(await store.getTenantPurgeSessionGraveMarker(tenantId, source.session.id)).toBeNull();
+        }
+        if (injectFailure) {
+          const originalExecute = store.executeTenantDatabasePurge.bind(store);
+          store.executeTenantDatabasePurge = async (authorization) => {
+            await originalExecute(authorization);
+            throw new Error("injected committed ordinary usage T3f response loss");
+          };
+          try {
+            await expect(store.executeTenantDatabasePurge(source.authorization))
+              .rejects.toThrow("injected committed ordinary usage T3f response loss");
+          } finally {
+            store.executeTenantDatabasePurge = originalExecute;
+          }
+        }
+        const terminal = await store.executeTenantDatabasePurge(source.authorization);
+        expect(terminal).toMatchObject({ localDatabasePurgeComplete: true, sessionContentDeleted: true,
+          retainedBillingFactCount: injectFailure ? 2 : 1, allDomainsComplete: false, contentPurgeExecuted: false });
+        expect(terminal?.priorRetainedBillingFacts?.facts).toEqual(ordinaryReceipt.facts);
+        expect(JSON.stringify(terminal?.priorRetainedBillingFacts)).not.toContain(source.session.id);
+        expect(JSON.stringify(terminal?.priorRetainedBillingFacts)).not.toContain(userId);
+        const contentEntry = (await store.getTenantDatabasePurgePreDeleteEntries(tenantId,
+          source.requestId, 1)).find((entry) => entry.domain === "session_content")!;
+        expect(contentEntry.preDeleteTargetRootSha256).toBe(tenantDatabasePurgeTargetRootSha256("session_content",
+          tuples.map((tuple) => tenantDatabasePurgeTargetSha256("session_content", tuple))));
+        const [remaining] = await conn.query<RowDataPacket[]>(
+          `SELECT (SELECT COUNT(*) FROM sessions WHERE session_id=?) AS sessions,
+                  (SELECT COUNT(*) FROM events WHERE session_id=?) AS events,
+                  (SELECT COUNT(*) FROM usage_reconciliations WHERE session_id=?) AS reconciliations,
+                  (SELECT COUNT(*) FROM usage_ledger WHERE session_id=?) AS operational`,
+          [source.session.id, source.session.id, source.session.id, source.session.id],
+        );
+        expect(remaining[0]).toMatchObject({ sessions: 0, events: 0, reconciliations: 0, operational: 0 });
+        const [billingAfter] = await conn.query<RowDataPacket[]>(
+          "SELECT * FROM billing_usage_facts WHERE tenant_id=? ORDER BY usage_id", [tenantId],
+        );
+        expect(billingAfter).toEqual(billingBefore);
+        const grave = await store.getTenantPurgeSessionGraveMarker(tenantId, source.session.id);
+        expect(grave).toMatchObject({ sessionId: source.session.id, deletionGeneration: 1,
+          ordinaryUsageRetention: { sourceSha256: proofBefore.ordinary_usage_retention_source_sha256,
+            receiptSha256: proofBefore.ordinary_usage_retention_receipt_sha256 } });
+        expect(grave?.markerSha256).toBe(tenantDatabasePurgeSessionGraveMarkerSha256(grave!));
+        expect(await store.executeTenantDatabasePurge(source.authorization)).toEqual(terminal);
+        if (injectFailure) {
+          await expect(conn.query(
+            `UPDATE tenant_database_purge_receipts
+                SET prior_retained_billing_facts_json=NULL,prior_retained_billing_facts_sha256=NULL
+              WHERE request_id=?`, [source.requestId],
+          )).rejects.toThrow(/append-only/);
+          await expect(conn.query(
+            `UPDATE tenant_purge_session_grave_markers
+                SET ordinary_usage_retention_source_sha256=? WHERE session_id=?`,
+            ["f".repeat(64), source.session.id],
+          )).rejects.toThrow(/append-only/);
+          expect(await store.executeTenantDatabasePurge(source.authorization)).toEqual(terminal);
+          const [updateGuards] = await conn.query<RowDataPacket[]>(
+            `SELECT trigger_name AS trigger_name FROM information_schema.triggers
+              WHERE trigger_schema=DATABASE() AND event_manipulation='UPDATE'
+                AND event_object_table IN ('tenant_database_purge_receipts','tenant_purge_session_grave_markers')`,
+          );
+          const savedGuards: { name: string; ddl: string }[] = [];
+          for (const guard of updateGuards) {
+            const name = String(guard.trigger_name ?? guard.TRIGGER_NAME);
+            if (!/^[a-zA-Z0-9_]+$/.test(name)) throw new Error("unsafe terminal fixture trigger name");
+            const [ddlRows] = await conn.query<RowDataPacket[]>(`SHOW CREATE TRIGGER \`${name}\``);
+            const ddl = ddlRows[0]?.["SQL Original Statement"];
+            if (typeof ddl !== "string" || !ddl.startsWith("CREATE ")) throw new Error("missing terminal fixture guard DDL");
+            savedGuards.push({ name, ddl });
+          }
+          expect(savedGuards.length).toBeGreaterThan(0);
+          const droppedGuards: typeof savedGuards = [];
+          // Privileged drift is simulated only in this disposable schema. Preserve the exact
+          // original CREATE statements and restore both data and guards even on assertion failure.
+          try {
+            for (const guard of savedGuards) {
+              await conn.query(`DROP TRIGGER \`${guard.name}\``);
+              droppedGuards.push(guard);
+            }
+            for (const corruption of ["bridge-missing", "bridge-digest", "bridge-fact",
+              "grave-source", "grave-receipt"] as const) {
+              const changedBridge = structuredClone(terminal!.priorRetainedBillingFacts!);
+              if (corruption === "bridge-digest") changedBridge.evidenceSha256 = "f".repeat(64);
+              if (corruption === "bridge-fact") changedBridge.facts[0]!.factSha256 = "f".repeat(64);
+              await conn.query(
+                `UPDATE tenant_database_purge_receipts
+                    SET prior_retained_billing_facts_json=?,prior_retained_billing_facts_sha256=?
+                  WHERE request_id=?`,
+                [corruption === "bridge-missing" ? null : JSON.stringify(changedBridge),
+                  corruption === "bridge-missing" ? null : changedBridge.evidenceSha256, source.requestId],
+              );
+              await conn.query(
+                `UPDATE tenant_purge_session_grave_markers
+                    SET ordinary_usage_retention_source_sha256=?,ordinary_usage_retention_receipt_sha256=?
+                  WHERE session_id=?`,
+                [corruption === "grave-source" ? "f".repeat(64) : grave!.ordinaryUsageRetention!.sourceSha256,
+                  corruption === "grave-receipt" ? "f".repeat(64) : grave!.ordinaryUsageRetention!.receiptSha256,
+                  source.session.id],
+              );
+              await expect(store.executeTenantDatabasePurge(source.authorization)).rejects.toThrow();
+              const [billingAfterDrift] = await conn.query<RowDataPacket[]>(
+                "SELECT * FROM billing_usage_facts WHERE tenant_id=? ORDER BY usage_id", [tenantId],
+              );
+              expect(billingAfterDrift).toEqual(billingBefore);
+            }
+          } finally {
+            if (droppedGuards.length === savedGuards.length) {
+              await conn.query(
+                `UPDATE tenant_database_purge_receipts
+                    SET prior_retained_billing_facts_json=?,prior_retained_billing_facts_sha256=?
+                  WHERE request_id=?`,
+                [JSON.stringify(terminal!.priorRetainedBillingFacts),
+                  terminal!.priorRetainedBillingFacts!.evidenceSha256, source.requestId],
+              );
+              await conn.query(
+                `UPDATE tenant_purge_session_grave_markers
+                    SET ordinary_usage_retention_source_sha256=?,ordinary_usage_retention_receipt_sha256=?
+                  WHERE session_id=?`,
+                [grave!.ordinaryUsageRetention!.sourceSha256, grave!.ordinaryUsageRetention!.receiptSha256,
+                  source.session.id],
+              );
+            }
+            for (const guard of droppedGuards) await conn.query(guard.ddl);
+          }
+          expect(await store.executeTenantDatabasePurge(source.authorization)).toEqual(terminal);
+        }
+        expect(await store.materializeTenantRedisPurgeJobs({ limit: 10 })).toBe(1);
+        expect(await store.claimTenantRedisPurges({ limit: 10, leaseMs: 120_000,
+          claimToken: `ordinary-usage-redis-${randomUUID()}` })).toHaveLength(1);
+        const redisTargets = await store.getTenantRedisPurgeTargets(tenantId, source.requestId, 1);
+        expect(redisTargets.find((targetRow) => targetRow.sessionId === source.session.id)?.graveMarkerSha256)
+          .toBe(grave?.markerSha256);
+        expect(await store.executeTenantDatabasePurge(source.authorization)).toEqual(terminal);
+      } finally {
+        pool.getConnection = originalCheckout;
         await conn.end();
         await store.close();
       }

@@ -386,6 +386,20 @@ jobs:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:session-delete-grace-mysql
 
+      # An actual policy/hold-gated destructive domain, with retained billing proof. Named JSON
+      # wrappers must prove Memory, real InnoDB and real runner worker cases executed without skips.
+      - name: Ordinary usage retention Memory and fleet/worker suites (must execute)
+        run: |
+          pnpm run test:session-usage-retention-memory
+          pnpm run test:session-usage-retention-worker
+
+      - name: Ordinary usage retention real MySQL and runner worker suites (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: |
+          pnpm run test:session-usage-retention-mysql
+          pnpm run test:session-usage-retention-worker-mysql
+
       # Usage reconciliation is a financial/content separation boundary. Keep explicit no-skip
       # evidence for transactional dual-write, conflict rollback, legal hold and anonymization.
       - name: Usage lifecycle real MySQL suite (must execute)
@@ -570,10 +584,11 @@ jobs:
       # compatibility, 0042 -> 0044 default-dormant source-bound intent/claim,
       # 0044 -> 0049 dormant capture-v2 schema guards, 0049 -> 0050,
       # ordinary DELETE grace evidence, and 0050 -> 0051 ordinary DELETE
-      # write-once guard all run against real MySQL.
+      # write-once guard and 0051 -> 0052 deletion-time policy/usage receipt plus
+      # anonymous T3f billing and grave-digest bridges all run against real MySQL.
       # Frozen 0038/0039/0040/0041 binaries produce genuine old terminal records before upgrade;
       # old-code startup must reject each new strict fingerprint.
-      - name: Historical MySQL migrations (0007 through 0051 + 0043 read compatibility, frozen terminals, no skips)
+      - name: Historical MySQL migrations (0007 through 0052 + 0043 read compatibility, frozen terminals, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -744,6 +759,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0049_tenant_telemetry_application_capture_v2.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0050_ordinary_session_delete_grace.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0051_ordinary_session_delete_origin_guard.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0052_ordinary_session_usage_retention.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

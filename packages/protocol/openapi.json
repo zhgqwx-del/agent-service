@@ -1168,6 +1168,21 @@
                 },
                 "type": "array"
               },
+              "ordinarySessionUsageRetention": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "local-operational-usage-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "ordinarySessionUsageRetentionWorker": {
+                "default": false,
+                "type": "boolean"
+              },
               "purgePolicyEvaluation": {
                 "default": [],
                 "items": {
