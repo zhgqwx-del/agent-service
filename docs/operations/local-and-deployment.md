@@ -4,6 +4,10 @@
 
 ## 本地生命周期
 
+0052新增ordinary session operational usage retention的本地执行能力，普通启动和验证仍默认关闭；它只去除operational ledger身份关联，不删除session内容、reconciliation或匿名账单。runner配置为`SESSION_USAGE_RETENTION_WORKER_ENABLED=0`、`SESSION_USAGE_RETENTION_WORKER_POLL_MS=30000`、`SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE=25`，router配置为`SESSION_USAGE_RETENTION_ENABLED=0`；production拒绝开启，runner/router互相拒绝或清除对方专属变量。学习验证优先使用四个named脚本`test:session-usage-retention-memory`、`test:session-usage-retention-mysql`、`test:session-usage-retention-worker`、`test:session-usage-retention-worker-mysql`与真实`0051→0052`历史夹具，不应手工SQL伪造policy/source/receipt或提前打开内容purge。T3f/grave的versioned摘要桥接使已保留billing事实在后续租户清理中继续可核对，旧v1 hash保持原值。完整结果以PROGRESS最后一节为准。
+
+BYOK删除边界：系统只清除自己保存的key，厂商侧撤销由客户负责；现有T3a只证明live数据库credential行清理，T3b只处理受跟踪runtime引用，备份/恢复仍是独立缺口。不能把现有0026 external blocker直接改成远端撤销成功，或启用0029 fake冒充真实provider adapter。
+
 前置条件：Node 24、pnpm 12、`.env` 已由 `.env.example` 创建并填写。
 
 ```bash
@@ -19,10 +23,10 @@ scripts/local-service.sh down        # 停应用和脚本拥有的本地基础�
 验证入口：
 
 ```bash
-scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 0007→0051 历史迁移 + credential/blob/restore/backup/telemetry/session grace专项 + cluster + SDK/应用构建产物
+scripts/local-service.sh verify       # secret/API drift/typecheck + 集成/coverage + 0007→0052 历史迁移 + credential/blob/restore/backup/telemetry/session grace专项 + cluster + SDK/应用构建产物
 scripts/local-service.sh verify-s3    # 启动本地MinIO，运行真实Blob、restore、catalog、telemetry S3、0028 mover及源码runner/router装配套件
 scripts/local-service.sh verify-real  # 使用本机 .env，仅跑真实模型 E2E
-pnpm test:migrations                  # 独立真实 MySQL：固定 0007→...→0044→0049→0050→0051 schema历史升级（0043/0045～0048无DDL）、冻结旧terminal与0042→0043代码兼容夹具；逐夹具证明实际执行且无skip
+pnpm test:migrations                  # 独立真实 MySQL：固定 0007→...→0044→0049→0050→0051→0052 schema历史升级（0043/0045～0048无DDL）、冻结旧terminal与0042→0043代码兼容夹具；逐夹具证明实际执行且无skip
 pnpm test:blob-mysql                  # 强制执行并验明 Blob ownership/绑定/cleanup 的独立真实 MySQL 套件
 pnpm test:blob-storage-control-memory # 强制执行0027 Memory cutover/回滚/并发语义
 pnpm test:blob-storage-control-mysql  # 强制执行0027真实InnoDB inventory/回滚/并发语义

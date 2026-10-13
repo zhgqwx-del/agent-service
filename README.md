@@ -20,6 +20,10 @@
 
 `0051`再新增独立MySQL write-once trigger：已有0050 origin只能随首次tombstone写入，写成后来源、BINARY owner身份、删除generation/time和event cursor不可变；seal仅能在旧行已有origin后写入并保持不可变。迁移可对精确已装trigger作create-only marker恢复，启动严格核对完整动作；相关启动指纹集合为140（不是全库trigger总数）（0049自身是139）。它不强制旧普通DELETE双写，也不证明两次COMMIT或来源真实；旧/erasure/legacy无origin仍为unknown，T3f仍可删除整行。`purge_after_ms=NULL`、`session.purge`不可领取，自动物理清理与全域completion继续关闭。0051真实MySQL历史夹具已纳入required wrapper与CI，完整结果以[进度记录](docs/PROGRESS.md)最新一节为准。
 
+`0052`新增默认关闭、仅限本地的普通session operational usage retention：新DELETE同事务绑定不可变policy；执行重验来源/seal、可信DB时间、30天与更长政策、hold、erasure/restore fence及账单事实，只清理operational usage ledger，session内容和匿名billing proof保留。runner/router双gate均默认0且production拒绝开启；T3f与grave新增摘要桥接，旧v1 hash不变。迁移八列/五guard使相关组合指纹为145（不是全库总数），必须先排空旧writer再独立迁移；旧DELETE不回填。它不开放`session.purge`、telemetry grant或全域completion，不增加服务/入口/镜像。完整verify与CI状态以[进度记录](docs/PROGRESS.md)最后一节为准。
+
+BYOK责任边界已确认：租户删除只清除本系统保存的key，厂商侧撤销由客户负责。T3a已有本地credential行删除，T3b处理受跟踪runtime引用；备份/恢复等剩余数据域仍须闭环，既有external blocker不会被静默改成远端撤销成功。
+
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
 交付决策：普通 session DELETE 已按30天建立默认休眠的保留证据，自动物理清理仍关闭（`purge_after_ms`仍为`NULL`）；M4同时提供router/runner独立VM进程发布包和Linux OCI镜像。两种生产部署形态尚未交付或验收，详见[本地开发与CI指南](docs/operations/development-and-ci-guide.md)。
@@ -57,6 +61,8 @@ unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID \
   TENANT_PURGE_EXECUTION_ENABLED TENANT_DATABASE_PURGE_ENABLED TENANT_REDIS_PURGE_ENABLED \
   SESSION_DELETE_GRACE_RECOVERY_ENABLED SESSION_DELETE_GRACE_RECOVERY_POLL_MS \
   SESSION_DELETE_GRACE_RECOVERY_BATCH_SIZE \
+  SESSION_USAGE_RETENTION_WORKER_ENABLED SESSION_USAGE_RETENTION_ENABLED \
+  SESSION_USAGE_RETENTION_WORKER_POLL_MS SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE \
   CREDENTIAL_TARGET_EXECUTION_ADAPTER TENANT_CREDENTIAL_TARGET_EXECUTION_WORKER_ENABLED \
   TENANT_CREDENTIAL_TARGET_EXECUTION_ENABLED \
   RESTORE_RUN_ID RESTORE_FLEET_STOPPED_ACK SOURCE_BACKUP_SHA256 RESTORE_REPLAY_PAGE_SIZE \

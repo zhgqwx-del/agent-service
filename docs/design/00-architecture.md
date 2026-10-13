@@ -10,6 +10,8 @@
 
 ## 0. 一页结论
 
+当前增量`0052`是ordinary session operational usage retention的本地执行切片，不是内容purge：新DELETE绑定immutable policy，原子执行核对owner/source/seal、DB time、宽限期/更长政策、hold、erasure/restore fence与独立billing facts，只移除operational ledger。T3f receipt与grave以versioned摘要桥接先前保留的匿名账单事实，legacy v1 hash不变；双gate默认0、production拒绝启用、旧记录不回填。八列/五guard的相关组合指纹为145（不是全库trigger总数），须独立迁移及排空旧writer；无新服务/入口/镜像。M1仍未冻结，完整结果看PROGRESS最新节。BYOK删除只清除本系统保存的key，客户负责厂商侧撤销；这项已确认责任须由后续versioned来源契约表达，不能重释0026历史blocker或伪造remote ACK。
+
 | 问题 | 结论 | 依据 |
 |---|---|---|
 | agent loop 用什么 | **内嵌 `@earendil-works/pi-ai` + `pi-agent-core`**（MIT），封在自研 `AgentEngine` 接口后面；保留自研 loop 作为第二实现 | research 04 §4、05 §4.2、01 §3.2 |
