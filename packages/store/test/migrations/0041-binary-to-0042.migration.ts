@@ -60,8 +60,10 @@ function processEnv(temp: string, extra: Record<string, string> = {}): NodeJS.Pr
 }
 
 async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
+  // Root test scripts may grow without changing the dependency graph. The lockfile and every
+  // workspace package manifest must still match before copying isolated installed dependencies.
   const manifests = [
-    "pnpm-lock.yaml", "pnpm-workspace.yaml", "package.json",
+    "pnpm-lock.yaml", "pnpm-workspace.yaml",
     "packages/core/package.json", "packages/protocol/package.json",
     "packages/providers/package.json", "packages/sdk/package.json",
     "packages/store/package.json", "packages/testkit/package.json",
@@ -73,6 +75,14 @@ async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
     if (!oldBytes.equals(currentBytes)) {
       throw new Error(`frozen 0041 dependency manifest changed: ${manifest}`);
     }
+  }
+  const rootFields = ["name", "private", "type", "version", "engines", "packageManager",
+    "dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] as const;
+  const oldRoot = JSON.parse(await readFile(join(oldCheckout, "package.json"), "utf8")) as Record<string, unknown>;
+  const currentRoot = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as Record<string, unknown>;
+  if (JSON.stringify(rootFields.map((field) => oldRoot[field] ?? null))
+    !== JSON.stringify(rootFields.map((field) => currentRoot[field] ?? null))) {
+    throw new Error("frozen 0041 root dependency manifest changed");
   }
   const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
   await cp(join(ROOT, "node_modules"), join(oldCheckout, "node_modules"), options);
@@ -328,9 +338,11 @@ describe("frozen 0041 T3d terminal -> 0042 real MySQL upgrade", () => {
     const afterConn = await mysql.createConnection(url);
     try {
       const [markers] = await afterConn.query<Row[]>("SELECT name FROM schema_migrations ORDER BY name");
-      expect(markers).toHaveLength(43);
+      // Keep the frozen 0041 pre-state exact; only the current upgrade tail grows over time.
+      const currentMigrations = (await readdir(join(ROOT, "packages/store/migrations")))
+        .filter((name) => name.endsWith(".sql")).sort();
+      expect(markers.map((row) => row.name)).toEqual(currentMigrations);
       expect(markers.some((row) => row.name === MIGRATION_0042)).toBe(true);
-      expect(markers.at(-1)?.name).toBe("0044_tenant_telemetry_pregrant_intent.sql");
       for (const [table, orderBy] of OLD_TABLES) {
         expect(await rowDigest(afterConn, table, orderBy)).toBe(before.get(table));
       }
