@@ -17,6 +17,8 @@ import {
   type TenantTelemetryLifecycleStore,
   type TenantTelemetryWriteAdapter,
   type TenantTelemetryWriterStore,
+  type TenantTelemetryPersistedProviderCaptureStore,
+  type TenantTelemetryPersistedProviderCaptureProof,
 } from "@agent-service/store";
 import type { RunnerConfig } from "./config.js";
 
@@ -29,6 +31,8 @@ export interface TenantTelemetryWriterRuntime {
   captureActive: boolean;
   adapter?: TenantTelemetryWriteAdapter;
   worker?: TenantTelemetryWriterWorker;
+  persistedCaptureActive?: boolean;
+  persistedCaptureBinding?: TenantTelemetryPersistedProviderCaptureProof;
 }
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
@@ -48,11 +52,27 @@ function localInsecureS3Endpoint(config: RunnerConfig): boolean {
 export async function reconcileTenantTelemetryWriterForStartup(
   store: TenantTelemetryLifecycleStore
     & TenantTelemetryApplicationCaptureStore
-    & TenantTelemetryWriterStore,
+    & TenantTelemetryWriterStore
+    & TenantTelemetryPersistedProviderCaptureStore,
   config: RunnerConfig,
   logger: Pick<Console, "warn">,
+  persistedProviderCapture?: {
+    requireFreshFleet(expected: TenantTelemetryPersistedProviderCaptureProof, boundary: "claim" | "reserve" | "create" | "ack"): Promise<TenantTelemetryPersistedProviderCaptureProof>;
+  },
 ): Promise<TenantTelemetryWriterRuntime> {
   const control = await store.getTenantTelemetryLifecycleControl();
+  const persistedCaptureControl = await store.getTenantTelemetryPersistedProviderCaptureControl();
+  let persistedCaptureBinding: TenantTelemetryPersistedProviderCaptureProof | undefined;
+  if (persistedCaptureControl.state === "active") {
+    if (config.NODE_ENV === "production" || !config.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED
+      || !persistedProviderCapture || config.TENANT_TELEMETRY_WRITER_ADAPTER !== "s3") {
+      throw new Error("active persisted provider capture requires the local keyed S3 writer and fresh fleet gate");
+    }
+    persistedCaptureBinding = await store.getTenantTelemetryPersistedProviderCaptureBinding() ?? undefined;
+    if (!persistedCaptureBinding) throw new Error("persisted provider capture primary runtime is unavailable");
+  } else if (config.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED) {
+    throw new Error("persisted provider capture must be activated offline before enabling its runtime gate");
+  }
   const applicationControls = await store.listTenantTelemetryApplicationDomainControls();
   if (applicationControls.length !== 2
     || applicationControls[0]?.domain !== "logs"
@@ -95,6 +115,9 @@ export async function reconcileTenantTelemetryWriterForStartup(
   const tracesControl = applicationControls[1]!;
   if (tracesControl.state === "active") {
     throw new Error("the current runner has no activated traces producer contract");
+  }
+  if (persistedCaptureBinding && logsControl.state !== "inactive") {
+    throw new Error("v1 and persisted provider capture cannot be active together");
   }
   if (logsControl.state === "active") {
     const logsTarget = targets.find((target) => target.domain === "logs");
@@ -197,7 +220,11 @@ export async function reconcileTenantTelemetryWriterForStartup(
     }
   }
   try {
-    const worker = new TenantTelemetryWriterWorker({ store, adapter, logger }, {
+    const worker = new TenantTelemetryWriterWorker({ store, adapter, logger,
+      ...(persistedCaptureBinding && persistedProviderCapture ? {
+        persistedProviderCapture: { store, requireFreshFleet: persistedProviderCapture.requireFreshFleet },
+      } : {}),
+    }, {
       pollIntervalMs: config.TENANT_TELEMETRY_WRITER_POLL_MS,
       leaseMs: config.TENANT_TELEMETRY_WRITER_LEASE_MS,
       batchSize: config.TENANT_TELEMETRY_WRITER_BATCH_SIZE,
@@ -211,6 +238,7 @@ export async function reconcileTenantTelemetryWriterForStartup(
       captureActive: logsControl.state === "active",
       adapter,
       worker,
+      ...(persistedCaptureBinding ? { persistedCaptureActive: true, persistedCaptureBinding } : {}),
     };
   } catch (error) {
     await adapter.close().catch(() => {});

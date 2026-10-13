@@ -16,7 +16,9 @@ import {
   SessionStatus as SessionStatusSchema,
   Turn as TurnSchema,
   isCanonicalId,
+  telemetryCaptureLogsSourceRefSha256,
 } from "@agent-service/protocol";
+import * as PersistedCapture from "../tenant-telemetry-persisted-provider-capture.js";
 import {
   CredentialSourceConflictError,
   FenceError,
@@ -956,6 +958,16 @@ const ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME =
 const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME =
   "0051_ordinary_session_delete_origin_guard.sql";
 const ORDINARY_USAGE_RETENTION_MIGRATION_NAME = "0052_ordinary_session_usage_retention.sql";
+const PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME = "0053_persisted_provider_failure_capture.sql";
+const PERSISTED_PROVIDER_CAPTURE_TRIGGER_NAMES = [
+  "trg_tt_capture_v2_activation_bi", "trg_tt_capture_v2_activation_bu", "trg_tt_capture_v2_activation_bd",
+  "trg_tt_capture_v2_failure_bi", "trg_tt_capture_v2_failure_bu", "trg_tt_capture_v2_failure_bd",
+  "trg_tt_capture_v2_subject_bi", "trg_tt_capture_v2_subject_bu",
+  "trg_tt_capture_v2_session_bi", "trg_tt_capture_v2_session_bu",
+  "trg_tt_capture_v2_items_bi", "trg_tt_capture_v2_items_bu",
+  "trg_tt_capture_v2_events_bi", "trg_tt_capture_v2_events_bu",
+  "trg_tt_capture_v2_usage_bd",
+] as const;
 const ORDINARY_USAGE_RETENTION_TRIGGER_NAMES = ["trg_sessions_usage_retention_bi", "trg_sessions_usage_retention_shape_bu", "trg_sessions_usage_retention_bu", "trg_t3f_prior_usage_retention_bi", "trg_session_grave_usage_retention_bi"];
 const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME =
   "trg_sessions_ordinary_delete_grace_bu";
@@ -1600,6 +1612,18 @@ function tenantTelemetryCaptureV2FingerprintStatement(
   if (statements.length !== 1
     || !statements[0]!.startsWith(`SET @tt_capture_v2_${marker}_ok=`)) {
     throw new Error(`0049 capture v2 ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
+function persistedProviderCaptureFingerprintStatement(migrationSql: string, marker: "schema" | "triggers"): string {
+  const startMarker = `-- agent-service-runtime-fingerprint:persisted-provider-capture-${marker}:start`;
+  const endMarker = `-- agent-service-runtime-fingerprint:persisted-provider-capture-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker), end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) throw new Error(`0053 ${marker} fingerprint markers are invalid`);
+  const statements = mysqlMigrationStatements(migrationSql.slice(start + startMarker.length, end));
+  if (statements.length !== 1 || !statements[0]!.startsWith(`SET @persisted_capture_${marker}_ok=`)) {
+    throw new Error(`0053 ${marker} fingerprint block is invalid`);
   }
   return statements[0]!;
 }
@@ -8352,6 +8376,8 @@ export interface MysqlStoreOptions {
   tenantRedisPurgeNamespaceSha256?: string;
   /** Stable 256-bit secret used only to derive content-free telemetry owner references. */
   tenantTelemetryRefKey?: Uint8Array;
+  /** Explicit non-production capability; never inferred from a database marker or an env epoch. */
+  tenantTelemetryPersistedProviderCaptureLocalOnly?: boolean;
   /**
    * Explicit, one-shot compatibility repair for an active 0033 database whose already committed
    * tenant T1 admissions predate atomic telemetry-subject publication.  This is deliberately not a
@@ -8414,6 +8440,7 @@ export class MysqlSessionStore implements
   TenantCredentialTargetExecutionStore,
   TenantTelemetryLifecycleStore,
   TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore,
+  PersistedCapture.TenantTelemetryPersistedProviderCaptureStore,
   TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore,
   TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore,
   TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore,
@@ -8458,12 +8485,19 @@ export class MysqlSessionStore implements
   private ordinarySessionDeleteGraceSchemaInstalled = false;
   private ordinaryUsageRetentionSchemaInstalled = false;
   private readonly ordinaryDeleteCommitBatches = new WeakSet<CommitBatch>();
+  private persistedProviderCaptureSchemaInstalled = false;
+  private readonly persistedProviderCaptureCommitContexts = new WeakMap<CommitBatch, {
+    input: PersistedCapture.CommitPersistedProviderStepFailureInput;
+    result?: PersistedCapture.CommitPersistedProviderStepFailureResult;
+  }>();
+  private readonly persistedProviderCaptureOperatorFences = new WeakSet<object>();
 
   private constructor(
     private readonly pool: Pool,
     private readonly tenantRedisPurgeNamespaceSha256?: string,
     private readonly tenantTelemetryRefKey?: Buffer,
     private readonly operationAbortScope?: { close(): Promise<void> },
+    private readonly tenantTelemetryPersistedProviderCaptureLocalOnly = false,
   ) {}
 
   /**
@@ -8536,6 +8570,7 @@ export class MysqlSessionStore implements
       opts.tenantRedisPurgeNamespaceSha256,
       tenantTelemetryRefKey,
       operationAbortScope,
+      opts.tenantTelemetryPersistedProviderCaptureLocalOnly === true,
     );
     try {
       const migrationsDir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir);
@@ -8552,6 +8587,18 @@ export class MysqlSessionStore implements
         );
       } else {
         await store.migrate(migrationsDir, opts.migrationLockTimeoutSeconds ?? 60);
+      }
+      if (opts.operationAbortSignal?.aborted) throw new Error("MySQL maintenance operation aborted");
+      const [captureMarkers] = await pool.query<Row[]>(
+        "SELECT name FROM schema_migrations WHERE BINARY name=BINARY ?",
+        [PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME],
+      );
+      store.persistedProviderCaptureSchemaInstalled = captureMarkers.length === 1;
+      if (store.persistedProviderCaptureSchemaInstalled) {
+        await store.withConsistentRead(async(conn) => {
+          await store.assertPersistedProviderCaptureProjection(conn);
+          await store.assertPersistedFailureGlobalRelations(conn);
+        });
       }
       if (opts.operationAbortSignal?.aborted) throw new Error("MySQL maintenance operation aborted");
       return store;
@@ -8817,6 +8864,7 @@ export class MysqlSessionStore implements
     conn: PoolConnection,
     migrationsDir: string,
     includeLegacyTriggerFingerprint = true,
+    withPersistedProviderCapture = false,
   ): Promise<void> {
     let fingerprintStatements: string[];
     try {
@@ -8838,6 +8886,20 @@ export class MysqlSessionStore implements
             )]
           : []),
       ];
+      if (withPersistedProviderCapture) {
+        // Only the exact additive 0053 column/check is removed from the immutable
+        // 0035 baseline view. The 0053 fingerprint independently verifies both.
+        let schema = fingerprintStatements[0]!;
+        for (const [before, after] of [
+          ["FROM information_schema.columns\n    WHERE table_schema=DATABASE()", "FROM information_schema.columns\n    WHERE BINARY column_name<>BINARY 'telemetry_logs_capture_v2_generation' AND table_schema=DATABASE()"],
+          ["WHERE tc.table_schema=DATABASE() AND tc.constraint_type='CHECK'", "WHERE BINARY tc.constraint_name<>BINARY 'chk_subject_capture_v2_generation' AND tc.table_schema=DATABASE() AND tc.constraint_type='CHECK'"],
+          ["FROM information_schema.table_constraints\n    WHERE table_schema=DATABASE()", "FROM information_schema.table_constraints\n    WHERE BINARY constraint_name<>BINARY 'chk_subject_capture_v2_generation' AND table_schema=DATABASE()"],
+        ]) {
+          if (schema.split(before!).length !== 2) throw new Error("0035 additive projection predicate is not unique");
+          schema = schema.replace(before!, after!);
+        }
+        fingerprintStatements[0] = schema;
+      }
     } catch (cause) {
       throw new Error(
         "0035 tenant telemetry application capture fingerprint source is invalid",
@@ -9274,7 +9336,12 @@ export class MysqlSessionStore implements
     migrationsDir: string,
     withOrdinaryDeleteOriginGuard = false,
     withOrdinaryUsageRetention = false,
+    withPersistedProviderCapture = false,
   ): Promise<void> {
+    if (withPersistedProviderCapture) {
+      await this.assertPersistedProviderCaptureFingerprint(conn, migrationsDir);
+      return;
+    }
     let statements: string[];
     try {
       const migrationSql = await readFile(
@@ -9330,6 +9397,35 @@ export class MysqlSessionStore implements
     } catch (cause) {
       failure ??= new Error("0049 capture v2 fingerprint session restore failed", { cause });
     }
+    if (failure) throw failure;
+  }
+
+  private async assertPersistedProviderCaptureFingerprint(conn: PoolConnection, migrationsDir: string): Promise<void> {
+    let statements: string[];
+    try {
+      const sql = await readFile(join(migrationsDir, PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME), "utf8");
+      const oldSql = await readFile(join(migrationsDir, TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME), "utf8");
+      const prior = tenantTelemetryPregrantIntentFingerprintStatement(oldSql, "triggers");
+      const where = "WHERE trigger_schema=DATABASE()";
+      if (prior.split(where).length !== 2) throw new Error("0044 trigger predicate is not unique");
+      const excluded = [...TENANT_TELEMETRY_CAPTURE_V2_TRIGGER_NAMES,
+        ...PERSISTED_PROVIDER_CAPTURE_TRIGGER_NAMES, ORDINARY_SESSION_DELETE_ORIGIN_GUARD_TRIGGER_NAME,
+        ...ORDINARY_USAGE_RETENTION_TRIGGER_NAMES].map((n) => `'${n}'`).join(",");
+      statements = [prior.replace(where, `${where} AND BINARY trigger_name NOT IN (${excluded})`),
+        persistedProviderCaptureFingerprintStatement(sql, "schema"), persistedProviderCaptureFingerprintStatement(sql, "triggers")];
+    } catch (cause) { throw new Error("0053 persisted provider capture fingerprint source is invalid", { cause }); }
+    let failure: Error | undefined;
+    try {
+      await conn.query("SET @persisted_capture_prev_gcml=@@SESSION.group_concat_max_len");
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>("SELECT @tt_pregrant_triggers_ok AS prior_ok,@persisted_capture_schema_ok AS schema_ok,@persisted_capture_triggers_ok AS trigger_ok");
+      if (Number(rows[0]?.prior_ok) !== 1 || Number(rows[0]?.schema_ok) !== 1 || Number(rows[0]?.trigger_ok) !== 1) {
+        throw new Error("stored schema/triggers do not match the 0053 fingerprint");
+      }
+    } catch (cause) { failure = new Error("0053 persisted provider capture fingerprint verification failed", { cause }); }
+    try { await conn.query("SET SESSION group_concat_max_len=@persisted_capture_prev_gcml"); }
+    catch (cause) { failure ??= new Error("0053 persisted provider capture fingerprint session restore failed", { cause }); }
     if (failure) throw failure;
   }
 
@@ -10122,6 +10218,10 @@ export class MysqlSessionStore implements
         && !done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
         throw new Error("0051 ordinary DELETE origin guard marker is missing its 0050 predecessor");
       }
+      if (done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME)
+        && !done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME)) {
+        throw new Error("0053 capture marker is missing its 0052 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -10151,6 +10251,7 @@ export class MysqlSessionStore implements
           conn,
           migrationsDir,
           !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME),
+          done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME),
         );
       }
       if (done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
@@ -10196,6 +10297,7 @@ export class MysqlSessionStore implements
         await this.assertTenantTelemetryCaptureV2Fingerprint(
           conn, migrationsDir, done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME),
           done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME),
+          done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME),
         );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
@@ -10248,6 +10350,7 @@ export class MysqlSessionStore implements
         TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME,
       );
       this.ordinaryUsageRetentionSchemaInstalled = done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME);
+      this.persistedProviderCaptureSchemaInstalled = done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME);
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
@@ -10321,8 +10424,28 @@ export class MysqlSessionStore implements
         && !done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
         throw new Error("0051 ordinary DELETE origin guard marker is missing its 0050 predecessor");
       }
+      if (done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME)
+        && !done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME)) {
+        throw new Error("0053 capture marker is missing its 0052 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME) {
+          if (!done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME)) throw new Error("0053 capture marker is missing its 0052 predecessor");
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN
+              ('tenant_telemetry_capture_v2_activation_receipts','tenant_telemetry_capture_v2_failure_commit_receipts'))
+            + (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND
+              ((table_name IN ('items','events') AND (column_name='telemetry_failure_classification' OR column_name LIKE 'telemetry_capture_v2_%'))
+                OR (table_name='subject_lifecycle' AND column_name='telemetry_logs_capture_v2_generation')))
+            + (SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE()
+              AND trigger_name IN (${PERSISTED_PROVIDER_CAPTURE_TRIGGER_NAMES.map(() => "?").join(",")})) AS n`, [...PERSISTED_PROVIDER_CAPTURE_TRIGGER_NAMES]);
+          if (storedSafeInteger(footprint[0]?.n, "markerless 0053 schema footprint") !== 0) {
+            throw new Error("0053 marker-loss or partial DDL requires controlled forward repair");
+          }
+          await this.assertTenantTelemetryCaptureV2Fingerprint(conn, dir, true, true);
+          await this.assertOrdinaryUsageRetentionFingerprint(conn, dir);
+        }
         if (f === ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME) {
           const [existingGuard] = await conn.query<Row[]>(
             `SELECT trigger_name FROM information_schema.triggers
@@ -10650,6 +10773,7 @@ export class MysqlSessionStore implements
       if (done.has(TENANT_TELEMETRY_APPLICATION_CAPTURE_MIGRATION_NAME)) {
         await this.assertTenantTelemetryApplicationCaptureSchemaFingerprint(
           conn, dir, !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME),
+          done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME),
         );
       }
       if (done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
@@ -10695,6 +10819,7 @@ export class MysqlSessionStore implements
         await this.assertTenantTelemetryCaptureV2Fingerprint(
           conn, dir, done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME),
           done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME),
+          done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME),
         );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
@@ -10747,6 +10872,7 @@ export class MysqlSessionStore implements
         TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME,
       );
       this.ordinaryUsageRetentionSchemaInstalled = done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME);
+      this.persistedProviderCaptureSchemaInstalled = done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME);
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
@@ -15626,21 +15752,18 @@ export class MysqlSessionStore implements
     // a control lock before the exact subject row exists.
     let inserted: mysql.ResultSetHeader;
     if (this.tenantTelemetryApplicationCaptureSchemaInstalled) {
-      const generationCandidates = [
-        [0, 0],
-        [1, 0],
-        [0, 1],
-        [1, 1],
-      ] as const;
+      const generationCandidates = this.persistedProviderCaptureSchemaInstalled
+        ? [[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]]
+        : [[0,0,0],[1,0,0],[0,1,0],[1,1,0]];
       let result: mysql.ResultSetHeader | undefined;
-      for (const [logsCaptureGeneration, tracesCaptureGeneration] of generationCandidates) {
+      for (const [logsCaptureGeneration, tracesCaptureGeneration, v2CaptureGeneration] of generationCandidates) {
         try {
           [result] = await conn.query<mysql.ResultSetHeader>(
             `INSERT IGNORE INTO subject_lifecycle
                (tenant_id, subject_kind, subject_id, state, generation, active_request_id,
                 legal_hold_at_ms, created_at_ms, updated_at_ms,
-                telemetry_logs_capture_generation,telemetry_traces_capture_generation)
-             VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?, ?, ?)`,
+                telemetry_logs_capture_generation,telemetry_traces_capture_generation${this.persistedProviderCaptureSchemaInstalled ? ",telemetry_logs_capture_v2_generation" : ""})
+             VALUES (?, 'tenant', ?, 'active', 0, NULL, NULL, ?, ?, ?, ?${this.persistedProviderCaptureSchemaInstalled ? ",?" : ""})`,
             [
               tenantId,
               tenantId,
@@ -15648,6 +15771,7 @@ export class MysqlSessionStore implements
               atMs,
               logsCaptureGeneration,
               tracesCaptureGeneration,
+              ...(this.persistedProviderCaptureSchemaInstalled ? [v2CaptureGeneration] : []),
             ],
           );
           break;
@@ -15655,8 +15779,8 @@ export class MysqlSessionStore implements
           const mysqlError = error as { code?: string; errno?: number; sqlMessage?: string };
           if (mysqlError.code !== "ER_SIGNAL_EXCEPTION"
             || mysqlError.errno !== 1644
-            || mysqlError.sqlMessage
-              !== "tenant telemetry application capture generation is stale") {
+            || (mysqlError.sqlMessage !== "tenant telemetry application capture generation is stale"
+              && mysqlError.sqlMessage !== "new capture v2 tenant requires the active epoch projection")) {
             throw error;
           }
         }
@@ -15730,6 +15854,10 @@ export class MysqlSessionStore implements
             coverageAtDbMs = Math.max(coverageAtDbMs, control.activatedAtDbMs);
           }
         }
+      }
+      if(this.persistedProviderCaptureSchemaInstalled){
+        const receipt=await this.readPersistedCaptureReceipt(conn,"FOR SHARE");
+        if(receipt)coverageAtDbMs=Math.max(coverageAtDbMs,receipt.activatedAtDbMs);
       }
       if (coverageAtDbMs !== storedSafeInteger(
         locked[0]!.created_at_ms,
@@ -26999,6 +27127,7 @@ export class MysqlSessionStore implements
       [state.job.tenantId],
     );
     if (rows.length !== domain.planTargetCount) throw new TenantPurgeExecutionEvidenceChangedError();
+    await this.assertNoPersistedProviderUsageDeletion(conn,{tenantId:state.job.tenantId});
     const resultSha256s: string[] = [];
     for (const row of rows) {
       let usageId = row.usage_id == null ? undefined : String(row.usage_id);
@@ -37948,6 +38077,24 @@ export class MysqlSessionStore implements
       );
       await this.insertTenantTelemetryApplicationCoverage(conn, coverage);
     }
+    await this.ensurePersistedCaptureCoverageForLifecycle(conn,tenantId,tenantCreatedAtDbMs,newlyCreated,lifecycleCoverage);
+  }
+
+  private async ensurePersistedCaptureCoverageForLifecycle(conn:PoolConnection,tenantId:string,at:number,newlyCreated:boolean,lifecycleCoverage:TenantTelemetryLifecycleCoverageRecord|null){
+    if(!this.persistedProviderCaptureSchemaInstalled)return;
+    // The exact canonical tenant is already locked; coverage is published before its business row.
+    const [controls]=await conn.query<Row[]>("SELECT * FROM tenant_telemetry_capture_v2_controls WHERE domain='logs' FOR SHARE");
+    const control=controls[0];
+    const coverage=await this.readPersistedCaptureCoverage(conn,tenantId,newlyCreated ? "" : "FOR SHARE");
+    if(control?.state === "inactive"){if(coverage)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();return;}
+    const receipt=await this.readPersistedCaptureReceipt(conn,"FOR SHARE");
+    const [rows]=await conn.query<Row[]>("SELECT telemetry_logs_capture_v2_generation FROM subject_lifecycle WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=? FOR SHARE",[tenantId,tenantId]);
+    if(!receipt || !lifecycleCoverage || rows.length !== 1)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const prerequisites=await this.capturePrerequisites(conn,"FOR SHARE");
+    if(prerequisites.runtimeEpochSha256 !== receipt.runtimeEpochSha256 || prerequisites.runtimeBindingSha256 !== receipt.runtimeBindingSha256)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    if(coverage){PersistedCapture.validatePersistedProviderCaptureCoverage(coverage);if(coverage.lifecycleCoverageEvidenceSha256 !== lifecycleCoverage.evidenceSha256 || Number(rows[0]!.telemetry_logs_capture_v2_generation) !== (coverage.captureStatus === "capture_since_cutover" ? 0 : 1))throw new PersistedCapture.PersistedProviderCaptureIntegrityError();return;}
+    if(!newlyCreated || Number(rows[0]!.telemetry_logs_capture_v2_generation) !== 1 || lifecycleCoverage.historyStatus !== "complete_since_creation")throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    await this.insertPersistedCaptureCoverage(conn,PersistedCapture.createPersistedProviderCaptureCoverage(lifecycleCoverage,Math.max(at,receipt.activatedAtDbMs,lifecycleCoverage.coverageStartedAtDbMs),false));
   }
 
   async registerTenantTelemetryCoverage(
@@ -39268,6 +39415,7 @@ export class MysqlSessionStore implements
     executor: Pool | PoolConnection,
     job: TenantTelemetryWriter.TenantTelemetryWriteJobRecord,
     lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+    verifyCapture = true,
   ): Promise<void> {
     try {
       TenantTelemetryWriter.validateTenantTelemetryWriteJobRecord(job);
@@ -39374,6 +39522,12 @@ export class MysqlSessionStore implements
             applicationBinding,
           },
         );
+      }
+      if(verifyCapture && job.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA){
+        if(!this.persistedProviderCaptureSchemaInstalled)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        const receipt=await this.readPersistedFailureReceipt(executor,job.tenantId,job.writeOperationSha256,lock);
+        if(!receipt)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        await this.verifyPersistedFailureProjection(executor,receipt,lock);
       }
       if (job.phase === "written") {
         if (payload || !ack || !inventory || !job.reservation
@@ -39492,6 +39646,7 @@ export class MysqlSessionStore implements
     input: Readonly<TenantTelemetryWriter.EnqueueTenantTelemetryArtifactInput>,
     payload: Readonly<TenantTelemetryWriter.TenantTelemetryArtifactPayload>,
     refKey: Buffer,
+    trustedPersistedProviderSource = false,
   ): Promise<{
       target: TenantTelemetryLifecycleTargetRecord;
       inventory: TenantTelemetryArtifactInventoryRecord;
@@ -39583,7 +39738,7 @@ export class MysqlSessionStore implements
             "tenant telemetry application capture coverage is missing",
           );
         }
-      } else if (applicationCoverage || coverage.historyStatus !== "complete_since_creation") {
+      } else if (applicationCoverage || (!trustedPersistedProviderSource && coverage.historyStatus !== "complete_since_creation")) {
         throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
           "legacy tenant telemetry writes require an active application capture cutover",
         );
@@ -39764,6 +39919,9 @@ export class MysqlSessionStore implements
     const refKey = this.requireTenantTelemetryRefKey();
     const { input: stagedInput, payload } =
       TenantTelemetryWriter.captureTrustedEnqueueTenantTelemetryArtifactInput(input, refKey);
+    if(stagedInput.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA)throw new PersistedCapture.PersistedProviderCaptureConflictError("provider source cannot be asserted by generic enqueue");
+    const captureControl = await this.getTenantTelemetryPersistedProviderCaptureControl();
+    if (stagedInput.domain === "logs" && captureControl.state === "active") throw new PersistedCapture.PersistedProviderCaptureConflictError("active capture logs require a trusted business-step transaction");
     for (let transactionAttempt = 0; transactionAttempt < 5; transactionAttempt += 1) {
       const conn = await this.pool.getConnection();
       try {
@@ -40091,20 +40249,30 @@ export class MysqlSessionStore implements
     this.requireTenantTelemetryWriterSchema();
     const conn = await this.pool.getConnection();
     try {
-      await conn.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      await conn.query(stagedOptions.captureMode === "include_v2"
+        ? "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+        : "SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
       await conn.beginTransaction();
+      if (stagedOptions.captureMode === "include_v2") {
+        const control = await this.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+        if (control.state !== "active") throw new PersistedCapture.PersistedProviderCaptureConflictError();
+        PersistedCapture.assertPersistedProviderCaptureExpectedProof(
+          PersistedCapture.persistedProviderCaptureProofFromReceipt(control.receipt), stagedOptions.freshProof,
+        );
+      }
       const nowMs = await this.databaseNow(conn);
       const [rows] = await conn.query<Row[]>(
         `SELECT write_operation_sha256
            FROM tenant_telemetry_write_jobs
          WHERE phase='queued' AND available_at_ms<=?
             AND (claim_token IS NULL OR lease_until_ms<=?)
+            AND (?='include_v2' OR BINARY JSON_UNQUOTE(JSON_EXTRACT(inventory_json,'$.sourceSchema'))<>BINARY 'provider-step-error-v2')
             AND EXISTS (SELECT 1 FROM tenant_telemetry_lifecycle_targets t
                          WHERE t.target_sha256=tenant_telemetry_write_jobs.target_sha256
                            AND t.adapter_protocol=?)
           ORDER BY created_at_ms,write_operation_sha256
           LIMIT ? FOR UPDATE SKIP LOCKED`,
-        [nowMs, nowMs, stagedOptions.adapterProtocol, stagedOptions.limit],
+        [nowMs, nowMs, stagedOptions.captureMode ?? "legacy_only", stagedOptions.adapterProtocol, stagedOptions.limit],
       );
       const claims: TenantTelemetryWriter.TenantTelemetryWriteClaim[] = [];
       for (const row of rows) {
@@ -40117,6 +40285,12 @@ export class MysqlSessionStore implements
           throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
         }
         await this.assertTenantTelemetryWriteJobRelations(conn, current, "FOR SHARE");
+        if (current.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA) {
+          if (stagedOptions.captureMode !== "include_v2") throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+          const receipt = await this.readPersistedFailureReceipt(conn, current.tenantId, current.writeOperationSha256, "FOR SHARE");
+          if (!receipt) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+          await this.verifyPersistedFailureProjection(conn, receipt, "FOR SHARE");
+        }
         const claimNowMs = await this.databaseNow(conn);
         if (current.availableAtMs > claimNowMs
           || (current.leaseUntilMs !== undefined && current.leaseUntilMs > claimNowMs)) {
@@ -40247,8 +40421,10 @@ export class MysqlSessionStore implements
   async reserveTenantTelemetryExternalMutation(
     authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
     adapterProtocol: string,
+    freshProof?: PersistedCapture.TenantTelemetryPersistedProviderCaptureProof,
   ): Promise<TenantTelemetryWriter.TenantTelemetryExternalMutationReservation | null> {
     const stagedAuthorization = structuredClone(authorization);
+    freshProof = freshProof === undefined ? undefined : structuredClone(freshProof);
     TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
     TenantTelemetryWriter.validateClaimTenantTelemetryWriteJobsOptions({
       limit: 1, leaseMs: 1, claimToken: stagedAuthorization.claimToken, adapterProtocol,
@@ -40257,6 +40433,9 @@ export class MysqlSessionStore implements
     const refKey = this.requireTenantTelemetryRefKey();
     const conn = await this.pool.getConnection();
     try {
+      if (this.persistedProviderCaptureSchemaInstalled) {
+        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
       await conn.beginTransaction();
       const hint = await this.readTenantTelemetryWriteJob(
         conn,
@@ -40266,6 +40445,11 @@ export class MysqlSessionStore implements
         || hint.target.adapterProtocol !== adapterProtocol) {
         await conn.commit();
         return null;
+      }
+      const isV2=hint.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA;
+      if(isV2){
+        await this.validatePersistedFailureProofInTransaction(conn,hint,freshProof);
+        try{await this.assertPersistedFailureLiveWriteGates(conn,hint);}catch(error){if(error instanceof PersistedCapture.PersistedProviderCaptureConflictError){await conn.commit();return null;}throw error;}
       }
       if (hint.reservation) {
         const current = await this.readTenantTelemetryWriteJob(
@@ -40393,11 +40577,11 @@ export class MysqlSessionStore implements
         || ownerHold.control.controlGeneration !== current.inventory.ownerHoldControlGeneration
         || ownerHold.control.activeProjectionSha256
           !== current.inventory.ownerHoldProjectionSha256
-        || restore.controlGeneration !== current.inventory.restoreControlGeneration
+        || (!isV2 && restore.controlGeneration !== current.inventory.restoreControlGeneration)
         || (restore.state === "active" ? restore.lineageKind : "inactive")
           !== current.inventory.restoreLineageKind
-        || (restore.state === "active" ? restore.updatedAtDbMs : 0)
-          !== current.inventory.restoreUpdatedAtDbMs
+        || (!isV2 && (restore.state === "active" ? restore.updatedAtDbMs : 0)
+          !== current.inventory.restoreUpdatedAtDbMs)
         || (restore.state === "active" ? restore.runtimeEpochSha256 : null)
           !== current.inventory.runtimeEpochSha256) {
         await conn.commit();
@@ -40578,14 +40762,19 @@ export class MysqlSessionStore implements
   async completeTenantTelemetryWrite(
     authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
     result: TenantTelemetryWriter.TenantTelemetryWriteAdapterResult,
+    freshProof?: PersistedCapture.TenantTelemetryPersistedProviderCaptureProof,
   ): Promise<TenantTelemetryWriter.TenantTelemetryWriteAck | null> {
     const stagedAuthorization = structuredClone(authorization);
     const stagedResult = structuredClone(result);
+    freshProof = freshProof === undefined ? undefined : structuredClone(freshProof);
     TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
     TenantTelemetryWriter.validateTenantTelemetryWriteAdapterResult(stagedResult);
     this.requireTenantTelemetryWriterSchema();
     const conn = await this.pool.getConnection();
     try {
+      if (this.persistedProviderCaptureSchemaInstalled) {
+        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
       await conn.beginTransaction();
       const current = await this.readTenantTelemetryWriteJob(
         conn,
@@ -40596,6 +40785,7 @@ export class MysqlSessionStore implements
         await conn.commit();
         return null;
       }
+      if(current.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA)await this.validatePersistedFailureProofInTransaction(conn,current,freshProof);
       if (current.phase === "written") {
         await this.assertTenantTelemetryWriteJobRelations(conn, current, "FOR SHARE");
         const ack = await this.readTenantTelemetryWriteAck(
@@ -41475,7 +41665,403 @@ export class MysqlSessionStore implements
     return existing;
   }
 
+  // ---------- persisted provider-step capture v2 (never a provider-provenance oracle) ----------
+  private async capturePrerequisites(
+    executor: Pool | PoolConnection, lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<PersistedCapture.TenantTelemetryPersistedProviderCapturePrerequisites> {
+    const journal = await this.loadTenantRestoreJournalControl(executor, lock);
+    const runtime = await this.assertTenantRestoreRuntimeProjection(executor, lock);
+    const binding = PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime.control, journal.control);
+    if (runtime.control.state !== "active") throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const [pending] = await executor.query<Row[]>(
+      `SELECT restore_run_id FROM tenant_restore_replay_runs WHERE phase IN ('prepared','replay_sealed') LIMIT 1 ${lock}`,
+    );
+    if (pending.length) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    return { runtimeEpochSha256: runtime.control.runtimeEpochSha256, runtimeBindingSha256: binding,
+      runtimeControlEvidenceSha256: runtime.control.evidenceSha256, runtimeControlGeneration: runtime.control.controlGeneration,
+      journalControlEvidenceSha256: runtime.control.controlEvidenceSha256,
+      journalTargetRootSha256: runtime.control.targetRootSha256, journalHeadRootSha256: runtime.control.verifiedHeadRootSha256 };
+  }
+
+  private async readPersistedCaptureReceipt(executor: Pool | PoolConnection, lock: "" | "FOR SHARE" | "FOR UPDATE" = "") {
+    const [rows] = await executor.query<Row[]>(`SELECT * FROM tenant_telemetry_capture_v2_activation_receipts ORDER BY domain ${lock}`);
+    if (!rows.length) return null;
+    if (rows.length !== 1 || rows[0]!.domain !== "logs") throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const receipt = parse<PersistedCapture.TenantTelemetryPersistedProviderCaptureActivationReceipt>(rows[0]!.receipt_json);
+    PersistedCapture.validatePersistedProviderCaptureActivationReceipt(receipt);
+    if (receipt.receiptSha256 !== rows[0]!.receipt_sha256 || receipt.requestSha256 !== rows[0]!.request_sha256
+      || receipt.receiptSha256 !== PersistedCapture.persistedProviderCaptureReceiptSha256(receipt)) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    return receipt;
+  }
+
+  private captureCoverageFromRow(row: Row): PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage {
+    const coverage: PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage = {
+      tenantId: String(row.tenant_id), domain: row.domain as "logs", scope: row.scope as "tenant-telemetry-capture-coverage-v2",
+      controlGeneration: Number(row.control_generation) as 1,
+      captureStatus: row.capture_status as PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage["captureStatus"],
+      preCutoverHistoryStatus: row.pre_cutover_history_status as PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage["preCutoverHistoryStatus"],
+      lifecycleCoverageEvidenceSha256: String(row.lifecycle_coverage_evidence_sha256), subjectRefSha256: String(row.subject_ref_sha256),
+      producerContractSha256: String(row.producer_contract_sha256), coverageStartedAtDbMs: Number(row.coverage_started_at_db_ms), evidenceSha256: String(row.evidence_sha256),
+    };
+    PersistedCapture.validatePersistedProviderCaptureCoverage(coverage);
+    if (coverage.evidenceSha256 !== PersistedCapture.persistedProviderCaptureCoverageSha256(coverage)
+      || coverage.domain !== "logs" || coverage.controlGeneration !== 1
+      || coverage.producerContractSha256 !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_CONTRACT_SHA256) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    return coverage;
+  }
+  private async readPersistedCaptureCoverage(executor: Pool | PoolConnection, tenantId: string, lock: "" | "FOR SHARE" | "FOR UPDATE" = "") {
+    const [rows] = await executor.query<Row[]>(`SELECT * FROM tenant_telemetry_capture_v2_coverages WHERE tenant_id=? AND domain='logs' ${lock}`, [tenantId]);
+    return rows[0] ? this.captureCoverageFromRow(rows[0]) : null;
+  }
+  private async insertPersistedCaptureCoverage(conn: PoolConnection, c: PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage) {
+    await conn.query(`INSERT INTO tenant_telemetry_capture_v2_coverages
+      (tenant_id,domain,scope,control_generation,capture_status,pre_cutover_history_status,lifecycle_coverage_evidence_sha256,subject_ref_sha256,producer_contract_sha256,coverage_started_at_db_ms,evidence_sha256)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`, [c.tenantId,c.domain,c.scope,c.controlGeneration,c.captureStatus,c.preCutoverHistoryStatus,c.lifecycleCoverageEvidenceSha256,c.subjectRefSha256,c.producerContractSha256,c.coverageStartedAtDbMs,c.evidenceSha256]);
+  }
+  private async assertPersistedProviderCaptureProjection(executor: Pool | PoolConnection, lock: "" | "FOR SHARE" | "FOR UPDATE" = ""):
+    Promise<PersistedCapture.TenantTelemetryPersistedProviderCaptureControl> {
+    if (!this.persistedProviderCaptureSchemaInstalled) return { domain: "logs", state: "inactive", controlGeneration: 0 };
+    const [controls] = await executor.query<Row[]>(`SELECT * FROM tenant_telemetry_capture_v2_controls ORDER BY domain ${lock}`);
+    const receipt = await this.readPersistedCaptureReceipt(executor, lock);
+    const logs = controls.find((c) => c.domain === "logs"), traces = controls.find((c) => c.domain === "traces");
+    if (controls.length !== 2 || !logs || !traces || traces.state !== "inactive" || Number(traces.control_generation) !== 0
+      || traces.activated_at_db_ms != null || logs.capture_protocol !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_PROTOCOL
+      || logs.producer_protocol !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_PRODUCER_PROTOCOL
+      || logs.producer_contract_sha256 !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_CONTRACT_SHA256) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    if (logs.state === "inactive") {
+      const [footprints] = await executor.query<Row[]>(`SELECT
+        (SELECT COUNT(*) FROM tenant_telemetry_capture_v2_coverages) AS coverage_count,
+        (SELECT COUNT(*) FROM tenant_telemetry_capture_v2_source_bindings) AS binding_count,
+        (SELECT COUNT(*) FROM tenant_telemetry_capture_v2_failure_commit_receipts) AS failure_count`);
+      if (receipt || Number(logs.control_generation) !== 0 || logs.activated_at_db_ms != null
+        || Object.values(footprints[0] ?? {}).some((n) => Number(n) !== 0)) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      return { domain: "logs", state: "inactive", controlGeneration: 0 };
+    }
+    if (!receipt || logs.state !== "active" || Number(logs.control_generation) !== 1 || Number(logs.activated_at_db_ms) !== receipt.activatedAtDbMs) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    const lifecycle = await this.readTenantTelemetryLifecycleControl(executor, lock);
+    const targets = await this.readTenantTelemetryLifecycleTargets(executor, lock);
+    const target = targets.find((t) => t.domain === "logs");
+    const v1 = await this.readTenantTelemetryApplicationDomainControls(executor, lock);
+    const current = await this.capturePrerequisites(executor, lock);
+    if (lifecycle.state !== "active" || lifecycle.activationEvidenceSha256 !== receipt.lifecycleControlEvidenceSha256
+      || lifecycle.refKeyIdSha256 !== receipt.refKeyIdSha256 || tenantTelemetryRefKeyIdSha256(this.requireTenantTelemetryRefKey()) !== receipt.refKeyIdSha256
+      || target?.targetSha256 !== receipt.logsTargetSha256 || target.receiptSha256 !== receipt.logsTargetReceiptSha256
+      || target.adapterProtocol !== "telemetry-s3-object-v1" || v1.some((c) => c.state !== "inactive")
+      || current.runtimeEpochSha256 !== receipt.runtimeEpochSha256 || current.runtimeBindingSha256 !== receipt.runtimeBindingSha256) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    const [tenantRows] = await executor.query<Row[]>(`SELECT tenant_id,telemetry_logs_capture_v2_generation FROM subject_lifecycle WHERE subject_kind='tenant' AND BINARY subject_id=BINARY tenant_id ORDER BY tenant_id ${lock}`);
+    const [coverageRows] = await executor.query<Row[]>(`SELECT * FROM tenant_telemetry_capture_v2_coverages ORDER BY tenant_id ${lock}`);
+    const coverages = coverageRows.map((c) => this.captureCoverageFromRow(c));
+    if (tenantRows.length !== coverages.length) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    for (const [index, row] of tenantRows.entries()) {
+      const coverage = coverages[index]!;
+      const lifecycleCoverage = await this.readTenantTelemetryLifecycleCoverage(executor, String(row.tenant_id), lock);
+      if (!lifecycleCoverage || coverage.tenantId !== row.tenant_id || coverage.lifecycleCoverageEvidenceSha256 !== lifecycleCoverage.evidenceSha256
+        || coverage.subjectRefSha256 !== lifecycleCoverage.subjectRefSha256
+        || coverage.coverageStartedAtDbMs < receipt.activatedAtDbMs
+        || Number(row.telemetry_logs_capture_v2_generation) !== (coverage.captureStatus === "capture_since_cutover" ? 0 : 1)) {
+        throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      }
+    }
+    const original = coverages.filter((c) => c.captureStatus === "capture_since_cutover");
+    if (original.length !== receipt.coverageCount || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-capture-coverage-root-v2", original) !== receipt.coverageRootSha256) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    const [legacyFailures]=await executor.query<Row[]>(`SELECT session_id,item_id,turn_id,seq,JSON_EXTRACT(body,'$.step') AS step FROM items WHERE type='agentMessage' AND status='failed' AND (telemetry_capture_v2_control_generation IS NULL OR telemetry_capture_v2_control_generation=0) ORDER BY item_id ${lock}`);
+    const failures=legacyFailures.map((r)=>({sessionId:r.session_id,itemId:r.item_id,turnId:r.turn_id,step:Number(r.step),seq:Number(r.seq)}));
+    const [legacyWrites]=await executor.query<Row[]>(`SELECT write_operation_sha256 FROM tenant_telemetry_write_jobs WHERE domain='logs' AND JSON_UNQUOTE(JSON_EXTRACT(inventory_json,'$.sourceSchema'))<>'provider-step-error-v2' ORDER BY write_operation_sha256 ${lock}`);
+    if(failures.length !== receipt.preCutoverFailureCount || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-capture-legacy-failures-v2",failures) !== receipt.preCutoverFailureRootSha256
+      || legacyWrites.length !== receipt.preCutoverWriteCount || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-capture-legacy-writes-v2",legacyWrites.map((r)=>String(r.write_operation_sha256))) !== receipt.preCutoverWriteRootSha256)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    return { domain: "logs", state: "active", controlGeneration: 1, activatedAtDbMs: receipt.activatedAtDbMs, activationEvidenceSha256: receipt.receiptSha256, receipt };
+  }
+  async getTenantTelemetryPersistedProviderCapturePrerequisites() { return this.withConsistentRead((conn) => this.capturePrerequisites(conn)); }
+  async getTenantTelemetryPersistedProviderCaptureControl() { return this.withConsistentRead((conn) => this.assertPersistedProviderCaptureProjection(conn)); }
+  async getTenantTelemetryPersistedProviderCaptureActivationReceipt() {
+    return this.withConsistentRead(async (conn) => { const control = await this.assertPersistedProviderCaptureProjection(conn); return control.state === "active" ? control.receipt : null; });
+  }
+  async getTenantTelemetryPersistedProviderCaptureBinding() {
+    return this.withConsistentRead(async (conn) => { const control = await this.assertPersistedProviderCaptureProjection(conn); return control.state === "active" ? PersistedCapture.persistedProviderCaptureProofFromReceipt(control.receipt) : null; });
+  }
+  async getTenantTelemetryPersistedProviderCaptureCoverage(tenantId: string) {
+    return this.withConsistentRead(async (conn) => { await this.assertPersistedProviderCaptureProjection(conn); return this.persistedProviderCaptureSchemaInstalled ? this.readPersistedCaptureCoverage(conn, tenantId) : null; });
+  }
+  private async readPersistedCaptureBinding(executor: Pool | PoolConnection, tenantId: string, operation: string, lock: "" | "FOR SHARE" | "FOR UPDATE" = "") {
+    const [rows] = await executor.query<Row[]>(`SELECT * FROM tenant_telemetry_capture_v2_source_bindings WHERE tenant_id=? AND write_operation_sha256=? ${lock}`, [tenantId,operation]);
+    if (!rows[0]) return null;
+    const r = rows[0];
+    const b: PersistedCapture.TenantTelemetryPersistedProviderCaptureSourceBinding = {
+      scope:r.scope as PersistedCapture.TenantTelemetryPersistedProviderCaptureSourceBinding["scope"], tenantId:String(r.tenant_id),domain:r.domain as "logs",controlGeneration:Number(r.control_generation) as 1,
+      writeOperationSha256:String(r.write_operation_sha256),coverageEvidenceSha256:String(r.coverage_evidence_sha256),producerContractSha256:String(r.producer_contract_sha256),
+      sourceSessionRefSha256:String(r.source_session_ref_sha256),sourceTurnRefSha256:String(r.source_turn_ref_sha256),sourceItemRefSha256:String(r.source_item_ref_sha256),sourceStepIndex:Number(r.source_step_index),sourceEventSeq:Number(r.source_event_seq),
+      ownerRefSha256:String(r.owner_ref_sha256),payloadSha256:String(r.payload_sha256),boundAtDbMs:Number(r.bound_at_db_ms),receiptSha256:String(r.receipt_sha256),
+    };
+    PersistedCapture.validatePersistedProviderCaptureSourceBinding(b);
+    if (b.receiptSha256 !== PersistedCapture.persistedProviderCaptureReceiptSha256(b)) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    return b;
+  }
+  async getTenantTelemetryPersistedProviderCaptureSourceBinding(tenantId: string, operation: string) {
+    return this.withConsistentRead(async (conn) => { await this.assertPersistedProviderCaptureProjection(conn); return this.persistedProviderCaptureSchemaInstalled ? this.readPersistedCaptureBinding(conn, tenantId, operation) : null; });
+  }
+
+  private async readPersistedFailureReceipt(executor: Pool | PoolConnection, tenantId: string, operation: string, lock: "" | "FOR SHARE" | "FOR UPDATE" = "") {
+    const [rows] = await executor.query<Row[]>(`SELECT * FROM tenant_telemetry_capture_v2_failure_commit_receipts WHERE tenant_id=? AND write_operation_sha256=? ${lock}`,[tenantId,operation]);
+    if (!rows[0]) return null;
+    const row=rows[0], receipt=parse<PersistedCapture.PersistedProviderStepFailureCommitReceipt>(row.receipt_json);
+    PersistedCapture.validatePersistedProviderFailureCommitReceipt(receipt);
+    const columns = {tenantId:row.tenant_id,writeOperationSha256:row.write_operation_sha256,sourceSessionRefSha256:row.source_session_ref_sha256,sourceTurnRefSha256:row.source_turn_ref_sha256,sourceItemRefSha256:row.source_item_ref_sha256,businessBatchSha256:row.business_batch_sha256,receiptSha256:row.receipt_sha256};
+    for (const [key,value] of Object.entries(columns)) if ((receipt as unknown as Record<string,unknown>)[key] !== value) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    for (const [key,column] of Object.entries({sourceStepIndex:"source_step_index",sourceEventSeq:"source_event_seq",fenceToken:"fence_token",beginLastSeq:"begin_last_seq",endLastSeq:"end_last_seq",eventCount:"event_count"})) if ((receipt as unknown as Record<string,unknown>)[key] !== Number(row[column])) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    return receipt;
+  }
+  private async receiptForPersistedFailureSource(executor: Pool | PoolConnection,input: PersistedCapture.VerifyPersistedProviderStepFailureSourceInput,lock: "" | "FOR SHARE" | "FOR UPDATE" = "") {
+    const key=this.requireTenantTelemetryRefKey();
+    const refs=[telemetryCaptureLogsSourceRefSha256("session",input.tenantId,input.sessionId,key),telemetryCaptureLogsSourceRefSha256("turn",input.tenantId,input.turnId,key),telemetryCaptureLogsSourceRefSha256("item",input.tenantId,input.itemId,key)];
+    const [rows]=await executor.query<Row[]>(`SELECT write_operation_sha256 FROM tenant_telemetry_capture_v2_failure_commit_receipts WHERE tenant_id=? AND source_session_ref_sha256=? AND source_turn_ref_sha256=? AND source_item_ref_sha256=? AND source_step_index=? ${lock}`,[input.tenantId,...refs,input.stepIndex]);
+    return rows[0] ? this.readPersistedFailureReceipt(executor,input.tenantId,String(rows[0].write_operation_sha256),lock) : null;
+  }
+  private async verifyPersistedFailureProjection(executor: Pool | PoolConnection, receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt,lock: "" | "FOR SHARE" | "FOR UPDATE" = ""): Promise<PersistedCapture.PersistedProviderStepFailureSourceVerification> {
+    PersistedCapture.validatePersistedProviderFailureCommitReceipt(receipt);
+    const control=await this.assertPersistedProviderCaptureProjection(executor,lock);
+    if (control.state !== "active" || control.activationEvidenceSha256 !== receipt.captureControlEvidenceSha256 || control.receipt.runtimeEpochSha256 !== receipt.runtimeEpochSha256 || control.receipt.runtimeBindingSha256 !== receipt.runtimeBindingSha256) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const key=this.requireTenantTelemetryRefKey();
+    const [sources]=await executor.query<Row[]>(`SELECT i.*,s.tenant_id,s.deleted_at_ms,s.user_id AS source_session_user_id,t.user_id AS source_turn_user_id,t.status AS source_turn_status,t.body AS turn_body FROM items i JOIN sessions s ON s.session_id=i.session_id JOIN turns t ON t.turn_id=i.turn_id AND t.session_id=i.session_id WHERE s.tenant_id=? AND i.telemetry_capture_v2_operation_sha256=? ${lock}`,[receipt.tenantId,receipt.writeOperationSha256]);
+    const source=sources[0];
+    // A normal tombstone retains the canonical owner and failed-step evidence. It
+    // does not revoke historical source verification or grant a new live write.
+    if (sources.length !== 1 || !source) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const item=parse<Item>(source.body),turn=parse<Turn>(source.turn_body);
+    // A streamed item retains its first item/started sequence; the receipt binds
+    // the later item/completed event, not a replacement item identity sequence.
+    if (item.type !== "agentMessage" || item.status !== "failed" || item.step !== receipt.sourceStepIndex || item.turnId !== turn.id || item.sessionId !== turn.sessionId
+      || !Number.isSafeInteger(item.seq) || item.seq < 1 || item.seq > receipt.sourceEventSeq
+      || source.user_id !== source.source_session_user_id || source.user_id !== source.source_turn_user_id
+      || source.item_id !== item.id || source.session_id !== item.sessionId || source.turn_id !== item.turnId
+      || source.type !== item.type || source.status !== item.status || Number(source.seq) !== item.seq
+      || Number(source.created_at_ms) !== item.createdAtMs || Number(source.completed_at_ms) !== item.completedAtMs || source.source_turn_status !== turn.status
+      || source.telemetry_failure_classification !== "provider_step_error" || Number(source.telemetry_capture_v2_control_generation) !== 1 || source.telemetry_capture_v2_failure_receipt_sha256 !== receipt.receiptSha256 || source.telemetry_capture_v2_business_batch_sha256 !== receipt.businessBatchSha256
+      || source.telemetry_capture_v2_session_ref_sha256 !== receipt.sourceSessionRefSha256 || source.telemetry_capture_v2_turn_ref_sha256 !== receipt.sourceTurnRefSha256 || source.telemetry_capture_v2_item_ref_sha256 !== receipt.sourceItemRefSha256
+      || telemetryCaptureLogsSourceRefSha256("session",receipt.tenantId,item.sessionId,key) !== receipt.sourceSessionRefSha256 || telemetryCaptureLogsSourceRefSha256("turn",receipt.tenantId,item.turnId,key) !== receipt.sourceTurnRefSha256 || telemetryCaptureLogsSourceRefSha256("item",receipt.tenantId,item.id,key) !== receipt.sourceItemRefSha256) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const [eventRows]=await executor.query<Row[]>(`SELECT * FROM events WHERE session_id=? AND seq>? AND seq<=? ORDER BY seq ${lock}`,[item.sessionId,receipt.beginLastSeq,receipt.endLastSeq]);
+    const events=eventRows.map((r)=>parse<PersistedEvent>(r.body));
+    const event=events.find((e)=>e.seq===receipt.sourceEventSeq);
+    const eventRow=eventRows.find((r)=>Number(r.seq)===receipt.sourceEventSeq);
+    if (events.length !== receipt.eventCount || PersistedCapture.persistedProviderCaptureEventRoot(events) !== receipt.eventRootSha256
+      || eventRows.some((row,index)=>Number(row.seq) !== receipt.beginLastSeq+index+1 || row.user_id !== source.source_session_user_id
+        || row.session_id !== item.sessionId || row.type !== events[index]?.type || events[index]?.sessionId !== item.sessionId || events[index]?.seq !== Number(row.seq))
+      || !event || event.type !== "item/completed" || PersistedCapture.persistedProviderCaptureCanonicalJson(event.item) !== PersistedCapture.persistedProviderCaptureCanonicalJson(item)
+      || eventRow?.telemetry_failure_classification !== "provider_step_error" || Number(eventRow.telemetry_capture_v2_control_generation) !== 1 || eventRow.telemetry_capture_v2_operation_sha256 !== receipt.writeOperationSha256 || eventRow.telemetry_capture_v2_failure_receipt_sha256 !== receipt.receiptSha256 || eventRow.telemetry_capture_v2_business_batch_sha256 !== receipt.businessBatchSha256
+      || eventRow.telemetry_capture_v2_session_ref_sha256 !== receipt.sourceSessionRefSha256 || eventRow.telemetry_capture_v2_turn_ref_sha256 !== receipt.sourceTurnRefSha256 || eventRow.telemetry_capture_v2_item_ref_sha256 !== receipt.sourceItemRefSha256) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const [usageRows]=await executor.query<Row[]>(`SELECT * FROM usage_ledger WHERE tenant_id=? AND user_id=? AND session_id=? AND turn_id=? AND step=? ${lock}`,[receipt.tenantId,source.user_id,item.sessionId,item.turnId,receipt.sourceStepIndex]);
+    const usage=usageRows[0];
+    if (usageRows.length !== 1 || !usage || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-usage-id-v2",usage.usage_id) !== receipt.usageIdSha256) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const [billingRows]=await executor.query<Row[]>(`SELECT ${BILLING_USAGE_COLUMNS} FROM billing_usage_facts WHERE usage_id=? ${lock}`,[usage.usage_id]);
+    if (billingRows.length !== 1) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const billing=rowToBillingUsageFact(billingRows[0]!);
+    const operational: UsageLedgerEntry & {usageId:string}={usageId:String(usage.usage_id),tenantId:String(usage.tenant_id),userId:String(usage.user_id),sessionId:String(usage.session_id),turnId:String(usage.turn_id),step:Number(usage.step),provider:String(usage.provider),model:String(usage.model),usage:parse(usage.usage_json),createdAtMs:Number(usage.created_at_ms)};
+    if (PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-billing-v2",billing) !== receipt.billingRootSha256
+      || PersistedCapture.persistedProviderCaptureCanonicalJson(billingUsageFactFromLedger(operational)) !== PersistedCapture.persistedProviderCaptureCanonicalJson(billing)) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const binding=await this.readPersistedCaptureBinding(executor,receipt.tenantId,receipt.writeOperationSha256,lock);
+    const coverage=await this.readPersistedCaptureCoverage(executor,receipt.tenantId,lock);
+    const member=await this.readTenantTelemetryArtifactMembership(executor,receipt.writeOperationSha256,lock);
+    const job=await this.readTenantTelemetryWriteJob(executor,receipt.writeOperationSha256,lock);
+    if (!binding || !coverage || !member || !job || binding.receiptSha256 !== receipt.bindingReceiptSha256 || binding.sourceSessionRefSha256 !== receipt.sourceSessionRefSha256 || binding.sourceTurnRefSha256 !== receipt.sourceTurnRefSha256 || binding.sourceItemRefSha256 !== receipt.sourceItemRefSha256 || binding.sourceStepIndex !== receipt.sourceStepIndex || binding.sourceEventSeq !== receipt.sourceEventSeq
+      || binding.coverageEvidenceSha256 !== coverage.evidenceSha256 || binding.ownerRefSha256 !== job.inventory.ownerRefSha256 || binding.payloadSha256 !== receipt.payloadSha256 || member.membershipSha256 !== receipt.membershipSha256 || member.applicationBindingReceiptSha256 !== null || member.ownerBindingSha256 !== TenantTelemetryArtifactMembership.tenantTelemetryArtifactOwnerBindingSha256({tenantId:receipt.tenantId,ownerKind:"session",ownerId:item.sessionId,ownerUserId:String(source.user_id)},key)
+      || job.inventory.sourceSchema !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA || job.inventory.payloadSha256 !== receipt.payloadSha256 || job.inventory.runtimeEpochSha256 !== receipt.runtimeEpochSha256 || job.inventory.ownerRefSha256 !== tenantTelemetryOwnerRefSha256("session",item.sessionId,key)) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    await this.assertTenantTelemetryWriteJobRelations(executor,job,lock,false);
+    const ack=await this.readTenantTelemetryWriteAck(executor,receipt.writeOperationSha256,lock);
+    const inventory=await this.readTenantTelemetryArtifactByExternalIdentity(executor,job.inventory.domain,job.inventory.artifactIdSha256,job.inventory.artifactGeneration,lock);
+    return {status:job.phase === "written" ? "source_verified_written" : job.phase === "blocked" ? "source_verified_blocked" : job.reservation ? "source_verified_reserved" : "source_verified_queued",sourceCount:1,failureCommitReceiptSha256:receipt.receiptSha256,sourceBindingReceiptSha256:binding.receiptSha256,writeOperationSha256:receipt.writeOperationSha256,membershipSha256:member.membershipSha256,writeAckReceiptSha256:ack?.receiptSha256 ?? null,inventoryReceiptSha256:inventory?.receiptSha256 ?? null,executionReady:false,allDomainsComplete:false};
+  }
+  async getTenantTelemetryPersistedProviderCaptureFailureCommitReceipt(input: PersistedCapture.VerifyPersistedProviderStepFailureSourceInput) {
+    input = structuredClone(input);
+    return this.withConsistentRead(async(conn)=>{ const control=await this.assertPersistedProviderCaptureProjection(conn); if (control.state === "inactive") return null; const receipt=await this.receiptForPersistedFailureSource(conn,input); if (receipt) await this.verifyPersistedFailureProjection(conn,receipt); return receipt; });
+  }
+  async verifyPersistedProviderStepFailureSource(input: PersistedCapture.VerifyPersistedProviderStepFailureSourceInput) {
+    input = structuredClone(input);
+    return this.withConsistentRead(async(conn)=>{const control=await this.assertPersistedProviderCaptureProjection(conn); if(input.freshProof){if(control.state !== "active") throw new PersistedCapture.PersistedProviderCaptureIntegrityError();PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(control.receipt),input.freshProof);} if(control.state === "inactive")return PersistedCapture.noPersistedProviderFailureSource();const receipt=await this.receiptForPersistedFailureSource(conn,input);return receipt ? this.verifyPersistedFailureProjection(conn,receipt) : PersistedCapture.noPersistedProviderFailureSource();});
+  }
+  async verifyPersistedProviderStepFailureWrite(tenantId:string,operation:string,freshProof:PersistedCapture.TenantTelemetryPersistedProviderCaptureProof,boundary?:PersistedCapture.PersistedProviderStepFailureWriteBoundary) {
+    PersistedCapture.validatePersistedProviderFailureWriteBoundary(boundary);
+    freshProof = structuredClone(freshProof);
+    return this.withConsistentRead(async(conn)=>{
+      const live=boundary === "reserve" || boundary === "create",lock=live ? "FOR SHARE" : "";
+      const control=await this.assertPersistedProviderCaptureProjection(conn,lock);
+      if(control.state !== "active")throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(control.receipt),freshProof);
+      const receipt=await this.readPersistedFailureReceipt(conn,tenantId,operation,lock);
+      if(!receipt)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      const verified=await this.verifyPersistedFailureProjection(conn,receipt,lock);
+      if(live){const job=await this.readTenantTelemetryWriteJob(conn,operation,"FOR SHARE");if(!job)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();await this.assertPersistedFailureLiveWriteGates(conn,job);}
+      return verified;
+    });
+  }
+  private async assertPersistedFailureLiveWriteGates(conn:PoolConnection,job:TenantTelemetryWriter.TenantTelemetryWriteJobRecord):Promise<void>{
+    const [sources]=await conn.query<Row[]>(`SELECT s.session_id,s.user_id FROM items i JOIN sessions s ON BINARY s.session_id=BINARY i.session_id
+      WHERE BINARY s.tenant_id=BINARY ? AND BINARY i.telemetry_capture_v2_operation_sha256=BINARY ?`,[job.tenantId,job.writeOperationSha256]);
+    if(sources.length !== 1)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const sessionId=String(sources[0]!.session_id),userId=String(sources[0]!.user_id);
+    const [tenantRows]=await conn.query<Row[]>(`SELECT ${SUBJECT_LIFECYCLE_COLUMNS} FROM subject_lifecycle WHERE BINARY tenant_id=BINARY ? AND subject_kind='tenant' AND BINARY subject_id=BINARY ? FOR SHARE`,[job.tenantId,job.tenantId]);
+    const admission=await this.loadTenantErasureAdmission(conn,job.tenantId,undefined,"FOR SHARE");
+    const fence=await this.loadTenantCredentialRevocationFence(conn,job.tenantId,undefined,"FOR SHARE");
+    const restoreFence=await this.loadTenantRestoreFence(conn,job.tenantId,"FOR SHARE");
+    const [userRows]=await conn.query<Row[]>(`SELECT ${SUBJECT_LIFECYCLE_COLUMNS} FROM subject_lifecycle WHERE BINARY tenant_id=BINARY ? AND subject_kind='user' AND BINARY subject_id=BINARY ? FOR SHARE`,[job.tenantId,userId]);
+    const [sessions]=await conn.query<Row[]>("SELECT tenant_id,user_id,deleted_at_ms FROM sessions WHERE BINARY session_id=BINARY ? FOR SHARE",[sessionId]);
+    const tenant=tenantRows[0] ? rowToSubjectLifecycle(tenantRows[0]) : undefined,user=userRows[0] ? rowToSubjectLifecycle(userRows[0]) : undefined,session=sessions[0];
+    const key=this.requireTenantTelemetryRefKey();
+    if(!tenant || tenant.state !== "active" || !user || user.state !== "active" || admission || fence || restoreFence || !session || session.deleted_at_ms != null
+      || session.tenant_id !== job.tenantId || session.user_id !== userId || tenantTelemetryOwnerRefSha256("session",sessionId,key) !== job.inventory.ownerRefSha256
+      || tenantTelemetryOwnerRefSha256("user",userId,key) !== job.inventory.holdSubjectRefSha256)throw new PersistedCapture.PersistedProviderCaptureConflictError("provider capture live owner is unavailable");
+    const retention=await this.loadValidatedActiveRetentionPolicy(conn,job.tenantId,"FOR SHARE");
+    const tenantHold=await this.loadLegalHoldContextForLifecycle(conn,job.tenantId,"tenant",job.tenantId,tenant,"FOR SHARE");
+    const ownerHold=await this.loadLegalHoldContextForLifecycle(conn,job.tenantId,"user",userId,user,"FOR SHARE");
+    const runtime=await this.loadTenantRestoreRuntimeControl(conn,"FOR SHARE");
+    if((retention?.control.controlGeneration ?? 0) !== job.inventory.retentionPolicyControlGeneration || (retention?.policy.policySha256 ?? null) !== job.inventory.retentionPolicySha256
+      || tenantHold.control.controlGeneration !== job.inventory.tenantHoldControlGeneration || tenantHold.control.activeProjectionSha256 !== job.inventory.tenantHoldProjectionSha256
+      || ownerHold.control.controlGeneration !== job.inventory.ownerHoldControlGeneration || ownerHold.control.activeProjectionSha256 !== job.inventory.ownerHoldProjectionSha256
+      || runtime.state !== "active" || runtime.lineageKind !== job.inventory.restoreLineageKind || runtime.runtimeEpochSha256 !== job.inventory.runtimeEpochSha256)throw new PersistedCapture.PersistedProviderCaptureConflictError("provider capture live write gates changed");
+  }
+  private async validatePersistedFailureProofInTransaction(conn:PoolConnection,job:TenantTelemetryWriter.TenantTelemetryWriteJobRecord,proof?:PersistedCapture.TenantTelemetryPersistedProviderCaptureProof){
+    if(!proof)throw new PersistedCapture.PersistedProviderCaptureConflictError("persisted provider writes require a fresh fleet gate");
+    const control=await this.assertPersistedProviderCaptureProjection(conn,"FOR SHARE");
+    if(control.state !== "active")throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(control.receipt),proof);
+    const receipt=await this.readPersistedFailureReceipt(conn,job.tenantId,job.writeOperationSha256,"FOR SHARE");
+    if(!receipt)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    await this.verifyPersistedFailureProjection(conn,receipt,"FOR SHARE");
+  }
+  private async assertPersistedFailureGlobalRelations(conn:PoolConnection){
+    const [rows]=await conn.query<Row[]>("SELECT tenant_id,write_operation_sha256 FROM tenant_telemetry_capture_v2_failure_commit_receipts ORDER BY write_operation_sha256");
+    for(const row of rows){const receipt=await this.readPersistedFailureReceipt(conn,String(row.tenant_id),String(row.write_operation_sha256));if(!receipt)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();await this.verifyPersistedFailureProjection(conn,receipt);}
+    const [orphans]=await conn.query<Row[]>(`SELECT
+      (SELECT COUNT(*) FROM tenant_telemetry_capture_v2_source_bindings b LEFT JOIN tenant_telemetry_capture_v2_failure_commit_receipts f ON f.write_operation_sha256=b.write_operation_sha256 WHERE f.write_operation_sha256 IS NULL) AS binding_count,
+      (SELECT COUNT(*) FROM items i LEFT JOIN tenant_telemetry_capture_v2_failure_commit_receipts f ON f.write_operation_sha256=i.telemetry_capture_v2_operation_sha256 WHERE i.telemetry_failure_classification='provider_step_error' AND f.write_operation_sha256 IS NULL) AS item_count,
+      (SELECT COUNT(*) FROM events e LEFT JOIN tenant_telemetry_capture_v2_failure_commit_receipts f ON f.write_operation_sha256=e.telemetry_capture_v2_operation_sha256 WHERE e.telemetry_failure_classification='provider_step_error' AND f.write_operation_sha256 IS NULL) AS event_count,
+      (SELECT COUNT(*) FROM tenant_telemetry_write_jobs j LEFT JOIN tenant_telemetry_capture_v2_failure_commit_receipts f ON f.write_operation_sha256=j.write_operation_sha256 WHERE JSON_UNQUOTE(JSON_EXTRACT(j.inventory_json,'$.sourceSchema'))='provider-step-error-v2' AND f.write_operation_sha256 IS NULL) AS job_count`);
+    if(Object.values(orphans[0] ?? {}).some((n)=>Number(n)!==0))throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+  }
+  private async assertNoPersistedProviderUsageDeletion(conn:PoolConnection,scope:{tenantId:string;userId?:string;sessionId?:string}):Promise<void>{
+    if(!this.persistedProviderCaptureSchemaInstalled)return;
+    const [rows]=await conn.query<Row[]>(`SELECT f.* FROM usage_ledger u
+      JOIN tenant_telemetry_capture_v2_failure_commit_receipts f ON BINARY f.tenant_id=BINARY u.tenant_id
+        AND BINARY JSON_UNQUOTE(JSON_EXTRACT(f.receipt_json,'$.usageIdSha256'))=BINARY SHA2(CONCAT('tenant-telemetry-step-usage-id-v2',CHAR(0),JSON_QUOTE(u.usage_id)),256)
+      WHERE BINARY u.tenant_id=BINARY ? ${scope.userId === undefined ? "" : "AND BINARY u.user_id=BINARY ?"} ${scope.sessionId === undefined ? "" : "AND BINARY u.session_id=BINARY ?"}
+      FOR SHARE`,[scope.tenantId,...(scope.userId === undefined ? [] : [scope.userId]),...(scope.sessionId === undefined ? [] : [scope.sessionId])]);
+    for(const row of rows)PersistedCapture.validatePersistedProviderFailureCommitReceipt(parse(row.receipt_json));
+    if(rows.length)throw new PersistedCapture.PersistedProviderCaptureConflictError("operational usage is retained by sealed provider-step capture");
+  }
+
+  async withTenantTelemetryCaptureOperatorFence<T>(
+    work: (fence: PersistedCapture.TenantTelemetryCaptureOperatorFence) => Promise<T>,
+    options: { timeoutMs: number; operationAbortSignal?: AbortSignal },
+  ): Promise<T> {
+    if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 3_600_000) throw new Error("invalid capture operator timeout");
+    const deadline = Date.now() + options.timeoutMs;
+    const conn = await this.pool.getConnection();
+    const lockName = "agent-service:migrate:";
+    let acquired = false;
+    const checkOwned = async () => {
+      if (options.operationAbortSignal?.aborted || Date.now() >= deadline) throw new Error("capture operator deadline expired");
+      const [rows] = await conn.query<Row[]>("SELECT IS_USED_LOCK(CONCAT(?,LEFT(SHA2(DATABASE(),256),32)))=CONNECTION_ID() AS owned", [lockName]);
+      if (Number(rows[0]?.owned) !== 1) throw new Error("capture operator fence was lost");
+    };
+    const fence: PersistedCapture.TenantTelemetryCaptureOperatorFence = Object.freeze({ scope:"tenant-telemetry-capture-operator-fence-v2", checkOwned });
+    const onAbort = () => conn.destroy();
+    try {
+      if (options.operationAbortSignal?.aborted) throw new Error("capture operator deadline expired");
+      options.operationAbortSignal?.addEventListener("abort", onAbort, { once:true });
+      const [rows] = await conn.query<Row[]>("SELECT GET_LOCK(CONCAT(?,LEFT(SHA2(DATABASE(),256),32)),?) AS acquired", [lockName, Math.max(1,Math.ceil((deadline-Date.now())/1000))]);
+      if (Number(rows[0]?.acquired) !== 1) throw new Error("capture operator fence is busy");
+      acquired = true;
+      this.persistedProviderCaptureOperatorFences.add(fence);
+      await checkOwned();
+      const result = await work(fence);
+      await checkOwned();
+      return result;
+    } finally {
+      this.persistedProviderCaptureOperatorFences.delete(fence);
+      options.operationAbortSignal?.removeEventListener("abort", onAbort);
+      if (acquired) await conn.query("SELECT RELEASE_LOCK(CONCAT(?,LEFT(SHA2(DATABASE(),256),32)))", [lockName]).catch(() => {});
+      conn.release();
+    }
+  }
+
+  async activateTenantTelemetryPersistedProviderCapture(input: PersistedCapture.ActivateTenantTelemetryPersistedProviderCaptureInput, fence: PersistedCapture.TenantTelemetryCaptureOperatorFence) {
+    if (!this.tenantTelemetryPersistedProviderCaptureLocalOnly || !this.persistedProviderCaptureSchemaInstalled || !this.persistedProviderCaptureOperatorFences.has(fence)) throw new Error("capture activation requires an owned local-only operator fence");
+    await fence.checkOwned();
+    const staged = structuredClone(input); PersistedCapture.validateActivatePersistedProviderCaptureInput(staged);
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"); await conn.beginTransaction();
+      const [tenantRows] = await conn.query<Row[]>(`SELECT tenant_id FROM subject_lifecycle WHERE subject_kind='tenant' AND BINARY subject_id=BINARY tenant_id ORDER BY tenant_id FOR UPDATE`);
+      const current = await this.assertPersistedProviderCaptureProjection(conn, "FOR UPDATE");
+      if (current.state === "active") {
+        if (current.receipt.requestSha256 !== PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-capture-activation-request-v2", staged)) throw new Error("capture activation request differs from its immutable receipt");
+        await fence.checkOwned(); await conn.commit(); return { control:current,receipt:current.receipt };
+      }
+      const lifecycle = await this.readTenantTelemetryLifecycleControl(conn,"FOR SHARE");
+      const targets = await this.readTenantTelemetryLifecycleTargets(conn,"FOR SHARE");
+      const target = targets.find((t) => t.domain === "logs");
+      const v1 = await this.readTenantTelemetryApplicationDomainControls(conn,"FOR SHARE");
+      if (lifecycle.state !== "active" || lifecycle.activationEvidenceSha256 !== staged.lifecycleControlEvidenceSha256
+        || lifecycle.refKeyIdSha256 !== tenantTelemetryRefKeyIdSha256(this.requireTenantTelemetryRefKey())
+        || target?.targetSha256 !== staged.logsTargetSha256 || target.receiptSha256 !== staged.logsTargetReceiptSha256
+        || target.adapterProtocol !== "telemetry-s3-object-v1" || v1.some((c) => c.state !== "inactive")) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      const prerequisites = await this.capturePrerequisites(conn,"FOR SHARE");
+      const coverages: PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage[] = [];
+      const runtime=await this.loadTenantRestoreRuntimeControl(conn,"FOR SHARE");
+      if(runtime.state !== "active")throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      const lifecycleCoverages = [];
+      for (const row of tenantRows) {
+        const coverage = await this.readTenantTelemetryLifecycleCoverage(conn,String(row.tenant_id),"FOR SHARE");
+        if (!coverage) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        lifecycleCoverages.push(coverage);
+      }
+      const at = Math.max(await this.databaseNow(conn), lifecycle.activatedAtDbMs, target.createdAtDbMs, runtime.updatedAtDbMs, ...lifecycleCoverages.map((coverage) => coverage.coverageStartedAtDbMs));
+      for (const coverage of lifecycleCoverages) coverages.push(PersistedCapture.createPersistedProviderCaptureCoverage(coverage,at,true));
+      const [failures] = await conn.query<Row[]>("SELECT i.session_id,i.turn_id,i.item_id,i.seq,JSON_EXTRACT(i.body,'$.step') AS step FROM items i WHERE i.type='agentMessage' AND i.status='failed' ORDER BY i.item_id FOR SHARE");
+      const [writes] = await conn.query<Row[]>("SELECT write_operation_sha256 FROM tenant_telemetry_write_jobs WHERE domain='logs' ORDER BY write_operation_sha256 FOR SHARE");
+      const receipt = PersistedCapture.createPersistedProviderCaptureActivationReceipt(staged, { ...prerequisites,refKeyIdSha256:lifecycle.refKeyIdSha256,coverages,preCutoverFailures:failures.map((r) => ({ sessionId:r.session_id,itemId:r.item_id,turnId:r.turn_id,step:Number(r.step),seq:Number(r.seq) })),preCutoverWrites:writes.map((r) => String(r.write_operation_sha256)),atMs:at });
+      for (const coverage of coverages) await this.insertPersistedCaptureCoverage(conn,coverage);
+      await conn.query("INSERT INTO tenant_telemetry_capture_v2_activation_receipts (domain,request_sha256,receipt_sha256,receipt_json) VALUES ('logs',?,?,?)",[receipt.requestSha256,receipt.receiptSha256,json(receipt)]);
+      await conn.query("UPDATE tenant_telemetry_capture_v2_controls SET state='active',control_generation=1,activated_at_db_ms=? WHERE domain='logs' AND state='inactive' AND control_generation=0",[receipt.activatedAtDbMs]);
+      const control = await this.assertPersistedProviderCaptureProjection(conn,"FOR SHARE");
+      if (control.state !== "active") throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      await fence.checkOwned(); await conn.commit(); return {control,receipt};
+    } catch (error) { await conn.rollback().catch(() => {}); throw error; } finally { conn.release(); }
+  }
+
   // ---------- fenced commit ----------
+  async commitPersistedProviderStepFailure(input: PersistedCapture.CommitPersistedProviderStepFailureInput): Promise<PersistedCapture.CommitPersistedProviderStepFailureResult> {
+    if (!this.tenantTelemetryPersistedProviderCaptureLocalOnly || !this.persistedProviderCaptureSchemaInstalled) throw new Error("persisted provider capture requires an explicit local-only capability");
+    const staged=PersistedCapture.captureTrustedPersistedProviderFailureInput(input,this.requireTenantTelemetryRefKey());
+    const context:{input:PersistedCapture.CommitPersistedProviderStepFailureInput;result?:PersistedCapture.CommitPersistedProviderStepFailureResult}={input:staged};
+    this.persistedProviderCaptureCommitContexts.set(staged.batch,context);
+    try {await this.commit(staged.batch);if(!context.result)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();return context.result;}
+    finally {this.persistedProviderCaptureCommitContexts.delete(staged.batch);}
+  }
+  private async insertPersistedFailureWriteSet(conn:PoolConnection,set:ReturnType<typeof PersistedCapture.createPersistedProviderFailureWriteSet>) {
+    const b=set.binding,j=set.job,p=set.payload,r=set.receipt;
+    await conn.query(`INSERT INTO tenant_telemetry_capture_v2_source_bindings
+      (write_operation_sha256,scope,tenant_id,domain,control_generation,coverage_evidence_sha256,producer_contract_sha256,source_session_ref_sha256,source_turn_ref_sha256,source_item_ref_sha256,source_step_index,source_event_seq,owner_ref_sha256,payload_sha256,bound_at_db_ms,receipt_sha256)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,[b.writeOperationSha256,b.scope,b.tenantId,b.domain,b.controlGeneration,b.coverageEvidenceSha256,b.producerContractSha256,b.sourceSessionRefSha256,b.sourceTurnRefSha256,b.sourceItemRefSha256,b.sourceStepIndex,b.sourceEventSeq,b.ownerRefSha256,b.payloadSha256,b.boundAtDbMs,b.receiptSha256]);
+    await this.insertTenantTelemetryArtifactMembership(conn,set.membership);
+    await conn.query(`INSERT INTO tenant_telemetry_write_jobs
+      (write_operation_sha256,tenant_id,protocol,phase,domain,target_sha256,inventory_sha256,artifact_id_sha256,artifact_generation,payload_sha256,manifest_sha256,inventory_json,record_count,payload_byte_length,available_at_ms,attempts,claim_token,lease_until_ms,last_error_code,write_ack_receipt_sha256,written_at_db_ms,completed_claim_attempt,completed_claim_token_sha256,blocked_at_db_ms,blocked_reason_code,created_at_ms,updated_at_ms)
+      VALUES (?,?,?,'queued',?,?,?,?,?,?,?,?,?,?,?,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,?)`,[j.writeOperationSha256,j.tenantId,j.protocol,j.inventory.domain,j.target.targetSha256,j.inventory.inventorySha256,j.inventory.artifactIdSha256,j.inventory.artifactGeneration,j.inventory.payloadSha256,j.inventory.manifestSha256,json(j.inventory),j.recordCount,j.payloadByteLength,j.availableAtMs,j.createdAtMs,j.updatedAtMs]);
+    await conn.query(`INSERT INTO tenant_telemetry_write_payloads (write_operation_sha256,tenant_id,domain,payload_json,payload_sha256,record_count,payload_byte_length,created_at_ms) VALUES (?,?,?,?,?,?,?,?)`,[p.writeOperationSha256,p.tenantId,p.payload.domain,TenantTelemetryWriter.tenantTelemetryArtifactPayloadCanonicalJson(p.payload),p.payloadSha256,p.recordCount,p.payloadByteLength,p.createdAtMs]);
+    await conn.query(`INSERT INTO tenant_telemetry_capture_v2_failure_commit_receipts
+      (write_operation_sha256,tenant_id,source_session_ref_sha256,source_turn_ref_sha256,source_item_ref_sha256,source_step_index,source_event_seq,fence_token,begin_last_seq,end_last_seq,event_count,business_batch_sha256,receipt_sha256,receipt_json)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,[r.writeOperationSha256,r.tenantId,r.sourceSessionRefSha256,r.sourceTurnRefSha256,r.sourceItemRefSha256,r.sourceStepIndex,r.sourceEventSeq,r.fenceToken,r.beginLastSeq,r.endLastSeq,r.eventCount,r.businessBatchSha256,r.receiptSha256,json(r)]);
+  }
   async commitOrdinarySessionDelete(batch: CommitBatch): Promise<CommitResult> {
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
     if (batch.lifecycle?.type !== "tombstone" || batch.lifecycle.purgeAfterMs != null) {
@@ -41492,6 +42078,7 @@ export class MysqlSessionStore implements
   }
 
   async commit(batch: CommitBatch): Promise<CommitResult> {
+    const captureContext=this.persistedProviderCaptureCommitContexts.get(batch);
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
     const ordinaryDeleteGraceOrigin = this.ordinaryDeleteCommitBatches.has(batch);
     assertPureFenceClaim(batch);
@@ -41500,6 +42087,11 @@ export class MysqlSessionStore implements
     assertBlobBindingsMatch(batch.items, batch.blobBindings);
     const conn = await this.pool.getConnection();
     try {
+      if (this.persistedProviderCaptureSchemaInstalled) {
+        // Capture's full-range source/coverage/restore checks require next-key
+        // protection even when the server or pooled session defaults to RC.
+        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
       await conn.beginTransaction();
       const [rows] = await conn.query<Row[]>(
         `SELECT tenant_id, user_id, status, last_seq, fence_token, usage_json, archived_at_ms,
@@ -41519,6 +42111,20 @@ export class MysqlSessionStore implements
       const currentFence = Number(head.fence_token);
       if (batch.fence < currentFence) throw new FenceError(batch.sessionId, batch.fence, currentFence);
       const currentLastSeq = Number(head.last_seq);
+      const captureControl=await this.assertPersistedProviderCaptureProjection(conn,"FOR SHARE");
+      if(captureContext){
+        if(captureControl.state !== "active" || captureContext.input.source.tenantId !== tenantId || captureContext.input.source.userId !== userId) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+        PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(captureControl.receipt),captureContext.input.freshProof);
+        const prior=await this.receiptForPersistedFailureSource(conn,{tenantId,sessionId:batch.sessionId,turnId:captureContext.input.source.turnId,itemId:captureContext.input.source.itemId,stepIndex:captureContext.input.source.stepIndex},"FOR SHARE");
+        if(prior){
+          await this.verifyPersistedFailureProjection(conn,prior,"FOR SHARE");
+          if(batch.fence !== currentFence || prior.fenceToken !== batch.fence || prior.businessBatchSha256 !== PersistedCapture.persistedProviderFailureBusinessBatchSha256(batch)
+            || prior.payloadSha256 !== TenantTelemetryWriter.tenantTelemetryArtifactPayloadSha256({schema:TenantTelemetryWriter.TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,domain:"logs",records:[captureContext.input.record]})) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+          const [original]=await conn.query<Row[]>("SELECT body FROM events WHERE session_id=? AND seq>? AND seq<=? ORDER BY seq FOR SHARE",[batch.sessionId,prior.beginLastSeq,prior.endLastSeq]);
+          const result={events:original.map((r)=>parse<PersistedEvent>(r.body)),lastSeq:prior.endLastSeq,failureCommitReceipt:prior,replayed:true};
+          await conn.commit();captureContext.result=result;return result;
+        }
+      }
       if (batch.expectedLastSeq !== undefined && batch.expectedLastSeq !== currentLastSeq) {
         throw new SessionVersionError(batch.sessionId, batch.expectedLastSeq, currentLastSeq);
       }
@@ -41726,13 +42332,39 @@ export class MysqlSessionStore implements
       }));
       assignItemSeqs(items, events, seq);
       assignTurnSeqEnd(turn, events, seq);
-      if (events.length) {
-        await conn.query(
-          "INSERT INTO events (session_id, seq, user_id, type, body, emitted_at_ms) VALUES ?",
-          [events.map((e) => [batch.sessionId, e.seq, userId, e.type, json(e), e.emittedAtMs])],
-        );
+      let captureWriteSet:ReturnType<typeof PersistedCapture.createPersistedProviderFailureWriteSet>|undefined;
+      if(captureContext){
+        const input=captureContext.input,key=this.requireTenantTelemetryRefKey();
+        const coverage=await this.readPersistedCaptureCoverage(conn,tenantId,"FOR SHARE");
+        if(!coverage)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        const payload=TenantTelemetryWriter.canonicalizeTenantTelemetryArtifactPayload({schema:TenantTelemetryWriter.TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,domain:"logs",records:[input.record]});
+        const staged=await this.stageTenantTelemetryWrite(conn,{tenantId,expectedControlGeneration:1,domain:"logs",artifactIdSha256:PersistedCapture.persistedProviderFailureArtifactSha256(input.source,batch.sessionId,input.freshProof,key),artifactGeneration:1,ownerKind:"session",ownerId:batch.sessionId,ownerUserId:userId,sourceSchema:PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA,sourceGeneration:1,sourceHighWaterDbMs:await this.databaseNow(conn),payload},payload,key,true);
+        captureWriteSet=PersistedCapture.createPersistedProviderFailureWriteSet({input,key,beginLastSeq:currentLastSeq,events,coverage,inventory:staged.inventory,target:staged.target,operationSha256:staged.operationSha256,billingRootSha256:PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-billing-v2",stagedUsage[0]!.billing)});
       }
-      for (const it of items ?? []) await upsertItem(conn, it, userId, existingResources.itemIds.has(it.id));
+      const privateProjections=new Map<string,SqlCaptureFailureProjection>();
+      if(this.persistedProviderCaptureSchemaInstalled){
+        for(const item of items ?? []){
+          const [priorItems]=await conn.query<Row[]>("SELECT * FROM items WHERE item_id=? AND session_id=? FOR UPDATE",[item.id,batch.sessionId]);
+          const prior=priorItems[0];
+          if(captureControl.state === "active" && prior?.type === "agentMessage" && prior.status === "failed" && (prior.telemetry_capture_v2_control_generation == null || Number(prior.telemetry_capture_v2_control_generation) === 0)
+            && PersistedCapture.persistedProviderCaptureCanonicalJson(parse(prior.body)) !== PersistedCapture.persistedProviderCaptureCanonicalJson(item))throw new PersistedCapture.PersistedProviderCaptureConflictError("pre-cutover failed item snapshot is immutable");
+          if(item.type !== "agentMessage" || item.status !== "failed")continue;
+          if(prior?.status === "failed"){
+            if(captureWriteSet || (prior.telemetry_failure_classification === "provider_step_error" && PersistedCapture.persistedProviderCaptureCanonicalJson(parse(prior.body)) !== PersistedCapture.persistedProviderCaptureCanonicalJson(item))) throw new PersistedCapture.PersistedProviderCaptureConflictError("first failed-step classification is immutable");
+            if(prior.telemetry_failure_classification)privateProjections.set(item.id,sqlCaptureProjectionFromRow(prior));
+            continue;
+          }
+          privateProjections.set(item.id,captureWriteSet && item.id === captureContext!.input.source.itemId ? sqlCaptureProjectionFromReceipt(captureWriteSet.receipt) : {classification:"runtime_unknown",generation:captureControl.state === "active" ? 1 : 0});
+        }
+      }
+      // New SQL guards independently match the event projection against its real canonical item.
+      if(this.persistedProviderCaptureSchemaInstalled)for(const it of items ?? [])await upsertItem(conn,it,userId,existingResources.itemIds.has(it.id),privateProjections.get(it.id));
+      if (events.length) {
+        if(this.persistedProviderCaptureSchemaInstalled){
+          await conn.query("INSERT INTO events (session_id,seq,user_id,type,body,emitted_at_ms,telemetry_failure_classification,telemetry_capture_v2_operation_sha256,telemetry_capture_v2_session_ref_sha256,telemetry_capture_v2_turn_ref_sha256,telemetry_capture_v2_item_ref_sha256,telemetry_capture_v2_failure_receipt_sha256,telemetry_capture_v2_business_batch_sha256,telemetry_capture_v2_control_generation) VALUES ?",[events.map((e)=>[batch.sessionId,e.seq,userId,e.type,json(e),e.emittedAtMs,...sqlCaptureProjectionValues(e.type === "item/completed" ? privateProjections.get(e.item.id) : undefined)])]);
+        }else await conn.query("INSERT INTO events (session_id, seq, user_id, type, body, emitted_at_ms) VALUES ?",[events.map((e) => [batch.sessionId, e.seq, userId, e.type, json(e), e.emittedAtMs])]);
+      }
+      if(!this.persistedProviderCaptureSchemaInstalled)for (const it of items ?? []) await upsertItem(conn, it, userId, existingResources.itemIds.has(it.id));
       for (const blobId of blobsToReady) {
         const binding = bindings.find((candidate) => candidate.blobId === blobId)!;
         const [updated] = await conn.query<mysql.ResultSetHeader>(
@@ -41805,6 +42437,7 @@ export class MysqlSessionStore implements
         );
       }
 
+      if(captureWriteSet)await this.insertPersistedFailureWriteSet(conn,captureWriteSet);
       const sets = ["last_seq=?", "fence_token=?", "updated_at_ms=?"];
       const params: unknown[] = [seq, batch.fence, Date.now()];
       let expectedOrdinaryOrigin: { sha256: string; observedDbMs: number } | undefined;
@@ -41879,6 +42512,7 @@ export class MysqlSessionStore implements
       }
       await conn.commit();
       backfillAssignedSequences(batch, { items, turn, events });
+      if(captureContext && captureWriteSet)captureContext.result={events,lastSeq:seq,failureCommitReceipt:captureWriteSet.receipt,replayed:false};
       return {
         events,
         lastSeq: seq,
@@ -44884,6 +45518,7 @@ export class MysqlSessionStore implements
         await conn.commit();
         return receipt;
       }
+      await this.assertNoPersistedProviderUsageDeletion(conn,input);
       await this.lockActiveSubjectGate(conn, input.tenantId, input.userId, 0, input.sessionId);
       const [userErasure] = await conn.query<Row[]>(
         "SELECT request_id FROM erasure_requests WHERE tenant_id=? AND subject_kind='user' AND subject_id=? LIMIT 1 FOR SHARE", [input.tenantId, input.userId],
@@ -44959,6 +45594,7 @@ export class MysqlSessionStore implements
         await conn.commit();
         return existing;
       }
+      await this.assertNoPersistedProviderUsageDeletion(conn,input);
       // A hold blocks only the destructive verified -> anonymized transition. If that transition
       // already committed but its response was lost, a later hold cannot restore operational rows
       // and must not make the same-checksum retry report a false failure.
@@ -53643,20 +54279,29 @@ export class MysqlSessionStore implements
   }
 }
 
-async function upsertItem(conn: PoolConnection, it: Item, userId: string, exists: boolean) {
+interface SqlCaptureFailureProjection {classification:"runtime_unknown"|"provider_step_error";generation:0|1;operationSha256?:string;sessionRefSha256?:string;turnRefSha256?:string;itemRefSha256?:string;failureReceiptSha256?:string;businessBatchSha256?:string}
+function sqlCaptureProjectionFromReceipt(r:PersistedCapture.PersistedProviderStepFailureCommitReceipt):SqlCaptureFailureProjection {
+  return {classification:"provider_step_error",generation:1,operationSha256:r.writeOperationSha256,sessionRefSha256:r.sourceSessionRefSha256,turnRefSha256:r.sourceTurnRefSha256,itemRefSha256:r.sourceItemRefSha256,failureReceiptSha256:r.receiptSha256,businessBatchSha256:r.businessBatchSha256};
+}
+function sqlCaptureProjectionFromRow(r:Row):SqlCaptureFailureProjection {
+  if((Number(r.telemetry_capture_v2_control_generation) !== 0 && Number(r.telemetry_capture_v2_control_generation) !== 1) || r.telemetry_capture_v2_control_generation == null)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+  return {classification:r.telemetry_failure_classification as SqlCaptureFailureProjection["classification"],generation:Number(r.telemetry_capture_v2_control_generation) as 0|1,...(r.telemetry_capture_v2_operation_sha256 == null ? {} : {operationSha256:String(r.telemetry_capture_v2_operation_sha256),sessionRefSha256:String(r.telemetry_capture_v2_session_ref_sha256),turnRefSha256:String(r.telemetry_capture_v2_turn_ref_sha256),itemRefSha256:String(r.telemetry_capture_v2_item_ref_sha256),failureReceiptSha256:String(r.telemetry_capture_v2_failure_receipt_sha256),businessBatchSha256:String(r.telemetry_capture_v2_business_batch_sha256)})};
+}
+function sqlCaptureProjectionValues(p?:SqlCaptureFailureProjection):(string|number|null)[]{return [p?.classification ?? null,p?.operationSha256 ?? null,p?.sessionRefSha256 ?? null,p?.turnRefSha256 ?? null,p?.itemRefSha256 ?? null,p?.failureReceiptSha256 ?? null,p?.businessBatchSha256 ?? null,p?.generation ?? null];}
+async function upsertItem(conn: PoolConnection, it: Item, userId: string, exists: boolean, projection?:SqlCaptureFailureProjection) {
   if (exists) {
     await conn.query(
-      `UPDATE items SET status=?, body=?, completed_at_ms=?
+      `UPDATE items SET status=?, body=?, completed_at_ms=? ${projection ? ",telemetry_failure_classification=?,telemetry_capture_v2_operation_sha256=?,telemetry_capture_v2_session_ref_sha256=?,telemetry_capture_v2_turn_ref_sha256=?,telemetry_capture_v2_item_ref_sha256=?,telemetry_capture_v2_failure_receipt_sha256=?,telemetry_capture_v2_business_batch_sha256=?,telemetry_capture_v2_control_generation=?" : ""}
         WHERE item_id=? AND session_id=? AND user_id=?`,
-      [it.status, json(it), it.completedAtMs ?? null, it.id, it.sessionId, userId],
+      [it.status, json(it), it.completedAtMs ?? null,...(projection ? sqlCaptureProjectionValues(projection) : []), it.id, it.sessionId, userId],
     );
     return;
   }
   await conn.query(
     `INSERT INTO items
-       (item_id, session_id, user_id, turn_id, seq, type, status, body, created_at_ms, completed_at_ms)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
-    [it.id, it.sessionId, userId, it.turnId, it.seq, it.type, it.status, json(it), it.createdAtMs, it.completedAtMs ?? null],
+       (item_id, session_id, user_id, turn_id, seq, type, status, body, created_at_ms, completed_at_ms ${projection ? ",telemetry_failure_classification,telemetry_capture_v2_operation_sha256,telemetry_capture_v2_session_ref_sha256,telemetry_capture_v2_turn_ref_sha256,telemetry_capture_v2_item_ref_sha256,telemetry_capture_v2_failure_receipt_sha256,telemetry_capture_v2_business_batch_sha256,telemetry_capture_v2_control_generation" : ""})
+     VALUES (?,?,?,?,?,?,?,?,?,?${projection ? ",?,?,?,?,?,?,?,?" : ""})`,
+    [it.id, it.sessionId, userId, it.turnId, it.seq, it.type, it.status, json(it), it.createdAtMs, it.completedAtMs ?? null,...(projection ? sqlCaptureProjectionValues(projection) : [])],
   );
 }
 async function upsertTurn(conn: PoolConnection, t: Turn, userId: string, exists: boolean) {

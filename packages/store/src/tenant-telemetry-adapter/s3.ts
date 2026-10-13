@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { runAbortableRequest } from "../operation-abort.js";
 import {
   DeleteObjectCommand,
   GetBucketLifecycleConfigurationCommand,
@@ -124,6 +125,8 @@ export interface S3TenantTelemetryWriteAdapterOptions
   credentials?: S3ClientConfig["credentials"];
   client?: S3Client;
   requestTimeoutMs?: number;
+  /** One-shot operator budget; cancellation is not proof that a sent mutation rolled back. */
+  operationAbortSignal?: AbortSignal;
   /** 0036 is not a product executor. Only disposable protocol tests may enable mutation. */
   nonProductionDispositionFixture?: true;
 }
@@ -569,6 +572,7 @@ async function readBoundedBody(
   body: unknown,
   contentLength: number | undefined,
   deadline: S3TenantTelemetryOperationDeadline,
+  operationSignal?: AbortSignal,
 ): Promise<Buffer> {
   if (contentLength !== undefined
     && (!Number.isSafeInteger(contentLength) || contentLength < 0
@@ -578,40 +582,27 @@ async function readBoundedBody(
   }
   const chunks: Buffer[] = [];
   let total = 0;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const remainingMs = deadline.remainingMs();
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      destroyBody(body);
-      reject(new TenantTelemetryWriteAdapterTemporaryError());
-    }, remainingMs);
-    timer.unref();
-  });
-  const read = (async () => {
-    for await (const chunk of bodyAsAsyncIterable(body)) {
-      if (!(chunk instanceof Uint8Array)) {
-        throw new TenantTelemetryWriteAdapterConflictError();
-      }
-      total += chunk.byteLength;
-      if (total > MAX_READ_BYTES) {
-        throw new TenantTelemetryWriteAdapterConflictError();
-      }
-      // Copy each chunk immediately. Some SDK/body implementations reuse a mutable backing
-      // buffer between iterator yields; retaining a view could otherwise change already-validated
-      // bytes before the final concatenation.
-      chunks.push(Buffer.from(chunk));
-    }
-  })();
-  void read.catch(() => undefined);
   try {
-    await Promise.race([read, timeout]);
+    await runAbortableRequest(async (signal) => {
+      const abort = () => destroyBody(body);
+      signal.addEventListener("abort", abort, { once: true });
+      try {
+        if (signal.aborted) throw Object.assign(new Error("response cancelled"), { name: "AbortError" });
+        for await (const chunk of bodyAsAsyncIterable(body)) {
+          if (signal.aborted) throw Object.assign(new Error("response cancelled"), { name: "AbortError" });
+          if (!(chunk instanceof Uint8Array)) throw new TenantTelemetryWriteAdapterConflictError();
+          total += chunk.byteLength;
+          if (total > MAX_READ_BYTES) throw new TenantTelemetryWriteAdapterConflictError();
+          // SDK iterators may reuse their mutable backing buffer between yields.
+          chunks.push(Buffer.from(chunk));
+        }
+      } finally { signal.removeEventListener("abort", abort); }
+    }, deadline.remainingMs(), operationSignal);
   } catch (error) {
     destroyBody(body);
     if (error instanceof TenantTelemetryWriteAdapterConflictError
       || error instanceof TenantTelemetryWriteAdapterTemporaryError) throw error;
     throw new TenantTelemetryWriteAdapterTemporaryError();
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
   }
   if (contentLength !== undefined && total !== contentLength) {
     throw new TenantTelemetryWriteAdapterConflictError();
@@ -630,12 +621,14 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
   private readonly client: S3Client;
   private readonly ownsClient: boolean;
   private readonly requestTimeoutMs: number;
+  private readonly operationAbortSignal?: AbortSignal;
   private readonly nonProductionDispositionFixture: boolean;
   private readonly expectedTargets = new Map<string, TenantTelemetryLifecycleTargetRecord>();
   private closed = false;
   private dispositionReady = false;
 
   constructor(options: S3TenantTelemetryWriteAdapterOptions) {
+    this.operationAbortSignal = options.operationAbortSignal;
     if (options.nonProductionDispositionFixture === true
       && process.env.NODE_ENV === "production") {
       throw new Error("tenant telemetry disposition fixture is forbidden in production");
@@ -718,7 +711,7 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
   }
 
   private assertOpen(): void {
-    if (this.closed) throw new TenantTelemetryWriteAdapterTemporaryError();
+    if (this.closed || this.operationAbortSignal?.aborted) throw new TenantTelemetryWriteAdapterTemporaryError();
   }
 
   private assertInput(input: TenantTelemetryWriteAdapterInput): CanonicalTenantTelemetryObject {
@@ -750,26 +743,7 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
     deadline: S3TenantTelemetryOperationDeadline,
     request: (abortSignal: AbortSignal) => Promise<Output>,
   ): Promise<Output> {
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const remainingMs = deadline.remainingMs();
-    const timeout = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
-        const error = Object.assign(new Error("S3 tenant telemetry request timed out"), {
-          name: "TimeoutError",
-        });
-        reject(error);
-        controller.abort(error);
-      }, remainingMs);
-      timer.unref();
-    });
-    const operation = Promise.resolve().then(() => request(controller.signal));
-    void operation.catch(() => undefined);
-    try {
-      return await Promise.race([operation, timeout]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    return runAbortableRequest(request, deadline.remainingMs(), this.operationAbortSignal);
   }
 
   private async readObject(
@@ -836,7 +810,7 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
       destroyBody(output.Body);
       return { status: "conflict" };
     }
-    const bytes = await readBoundedBody(output.Body, output.ContentLength, deadline);
+    const bytes = await readBoundedBody(output.Body, output.ContentLength, deadline, this.operationAbortSignal);
     if (!this.exactStoredObject(input, expected, bytes)) return { status: "conflict" };
     return {
       status: "exact",
@@ -991,7 +965,7 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
         && output.ContentType !== TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE) {
         throw new TenantTelemetryWriteAdapterConflictError();
       }
-      const bytes = await readBoundedBody(output.Body, output.ContentLength, deadline);
+      const bytes = await readBoundedBody(output.Body, output.ContentLength, deadline, this.operationAbortSignal);
       if (output.ContentType === TENANT_TELEMETRY_S3_TOMBSTONE_CONTENT_TYPE) {
         const bodyJson = decodeTenantTelemetryS3Tombstone(bytes);
         const parsed = JSON.parse(bodyJson) as Record<string, unknown>;
@@ -1135,7 +1109,7 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
       const original = await this.readObject(key, deadline);
       if (!original) throw new S3TenantTelemetrySafeError("S3 telemetry CAS probe disappeared");
       assertUnversionedEvidence(original);
-      const originalBytes = await readBoundedBody(original.Body, original.ContentLength, deadline);
+      const originalBytes = await readBoundedBody(original.Body, original.ContentLength, deadline, this.operationAbortSignal);
       if (original.ETag !== head.ETag || !originalBytes.equals(initial)) {
         throw new S3TenantTelemetrySafeError("S3 telemetry CAS probe was overwritten");
       }
@@ -1149,7 +1123,7 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
       const replaced = await this.readObject(key, deadline);
       if (!replaced) throw new S3TenantTelemetrySafeError("S3 telemetry CAS probe disappeared");
       assertUnversionedEvidence(replaced);
-      const replacedBytes = await readBoundedBody(replaced.Body, replaced.ContentLength, deadline);
+      const replacedBytes = await readBoundedBody(replaced.Body, replaced.ContentLength, deadline, this.operationAbortSignal);
       if (!replacedBytes.equals(replacement)) {
         throw new S3TenantTelemetrySafeError("S3 telemetry CAS probe did not replace the object");
       }
@@ -1297,7 +1271,7 @@ export class S3TenantTelemetryWriteAdapter implements TenantTelemetryWriteAdapte
         );
       }
       assertUnversionedEvidence(read);
-      const bytes = await readBoundedBody(read.Body, read.ContentLength, deadline);
+      const bytes = await readBoundedBody(read.Body, read.ContentLength, deadline, this.operationAbortSignal);
       if (!bytes.equals(initial)) {
         throw new S3TenantTelemetrySafeError(
           "S3 tenant telemetry startup probe conflicts",

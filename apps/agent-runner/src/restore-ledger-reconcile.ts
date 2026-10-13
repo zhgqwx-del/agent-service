@@ -15,6 +15,13 @@ Commands:
 
 Database, object-store, restore-run, backup and epoch settings are accepted only through
 environment variables. Command-line flags cannot carry a DSN, endpoint, path or credential.
+Active telemetry lifecycle databases require TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: the
+same protected owner-only regular file containing exactly 32 raw bytes (not hex) as on the source.
+Inactive databases may omit it. Missing/wrong keys fail closed during verify-only startup audit.
+Direct commands reject any ambient TENANT_TELEMETRY_REF_KEY, including empty; local-service.sh
+clears that application hex input for the foreground command only. This does not rebind active
+provider capture to another epoch: active provider-capture restore remains unsupported/fail closed.
+These legacy reconciliation commands still have no unified whole-operation deadline.
 
 Options:
   -h, --help  Show this help and exit.

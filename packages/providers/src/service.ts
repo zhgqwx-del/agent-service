@@ -69,6 +69,8 @@ export interface ProviderServiceOptions {
    * events use its producer-authenticated owner admission instead of process-only logging.
    */
   tenantTelemetry?: Pick<TenantTelemetryApplicationDualWrite, "warn">;
+  /** V2 logs are sourced by the failed-step business transaction, never by this fetch helper. */
+  persistedProviderFailureCaptureActive?: boolean;
 }
 
 /**
@@ -401,6 +403,7 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
             ...(signal ? { signal } : {}),
           });
         } catch (error) {
+          if (this.opts.persistedProviderFailureCaptureActive === true) throw error;
           const fields = { errorKind: telemetryErrorKind(error) } as const;
           try {
             if (this.opts.tenantTelemetry) {

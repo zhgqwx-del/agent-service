@@ -15,6 +15,9 @@ import {
   type TenantTelemetryWriteAuthorization,
   type TenantTelemetryWriteClaim,
   type TenantTelemetryWriterStore,
+  PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA,
+  type TenantTelemetryPersistedProviderCaptureStore,
+  type TenantTelemetryPersistedProviderCaptureProof,
 } from "@agent-service/store";
 
 export interface TenantTelemetryWriterWorkerOptions {
@@ -29,6 +32,12 @@ export interface TenantTelemetryWriterWorkerDeps {
   store: TenantTelemetryWriterStore;
   adapter: TenantTelemetryWriteAdapter;
   logger?: Pick<Console, "warn">;
+  /** V2 only. Legacy writer jobs retain their existing protocol; v2 never falls back to it. */
+  persistedProviderCapture?: {
+    store: Pick<TenantTelemetryPersistedProviderCaptureStore,
+      "getTenantTelemetryPersistedProviderCaptureBinding" | "verifyPersistedProviderStepFailureWrite">;
+    requireFreshFleet(expected: TenantTelemetryPersistedProviderCaptureProof, boundary: "claim" | "reserve" | "create" | "ack"): Promise<TenantTelemetryPersistedProviderCaptureProof>;
+  };
 }
 
 const DEFAULTS = {
@@ -80,8 +89,9 @@ function warnWithoutThrow(logger: Pick<Console, "warn">, message: string): void 
 
 /**
  * Publishes bounded, already-validated telemetry envelopes from the durable DB spool. There is no
- * destructive fleet gate: lease fencing plus immutable remote inspection close create races and
- * response-loss windows. Errors and backend details are never interpolated into process logs.
+ * destructive behavior: lease fencing plus immutable remote inspection close create races and
+ * response-loss windows. V2 provider sources also require a new all-configured observation at each
+ * claim/reserve/create/ACK boundary. Errors and backend details never enter process logs.
  */
 export class TenantTelemetryWriterWorker {
   private readonly opts: Required<TenantTelemetryWriterWorkerOptions>;
@@ -161,12 +171,28 @@ export class TenantTelemetryWriterWorker {
 
   private async runOnce(): Promise<number> {
     let claims: TenantTelemetryWriteClaim[];
+    let freshProof: TenantTelemetryPersistedProviderCaptureProof | undefined;
+    // A v2 cutover must not make its fleet gate a dependency of already-admitted v1/logs or
+    // traces jobs. Choose the claim scope before the store orders/LIMITs or changes any lease;
+    // without a fresh observation the store must leave every v2 job entirely untouched.
+    if (this.deps.persistedProviderCapture) {
+      try {
+        const expected = await this.deps.persistedProviderCapture.store.getTenantTelemetryPersistedProviderCaptureBinding();
+        if (expected) freshProof = await this.deps.persistedProviderCapture.requireFreshFleet(expected, "claim");
+      } catch {
+        warnWithoutThrow(this.log, "[tenant-telemetry-writer-worker] v2 claim gate unavailable");
+      }
+    }
+    if (this.shutdownRequested) return 0;
     try {
       claims = await this.deps.store.claimTenantTelemetryWriteJobs({
         limit: this.opts.batchSize,
         leaseMs: this.opts.leaseMs,
         claimToken: randomUUID(),
         adapterProtocol: this.deps.adapter.adapterProtocol,
+        ...(freshProof === undefined
+          ? { captureMode: "legacy_only" as const }
+          : { captureMode: "include_v2" as const, freshProof }),
       });
     } catch {
       warnWithoutThrow(this.log, "[tenant-telemetry-writer-worker] claim failed");
@@ -216,9 +242,11 @@ export class TenantTelemetryWriterWorker {
 
     if (!claim.reservation) {
       await this.requireRenew(auth);
+      const freshProof = await this.requireV2Boundary(claim, "reserve");
       const reservation = await this.deps.store.reserveTenantTelemetryExternalMutation(
         auth,
         this.deps.adapter.adapterProtocol,
+        freshProof,
       );
       if (!reservation) throw new TenantTelemetryWriteAdapterTemporaryError();
       claim = { ...claim, reservation };
@@ -238,6 +266,7 @@ export class TenantTelemetryWriterWorker {
     }
 
     await this.requireRenew(auth);
+    await this.requireV2Boundary(claim, "create");
     let result: TenantTelemetryWriteAdapterResult;
     try {
       result = await this.deps.adapter.createWrite(input);
@@ -270,7 +299,8 @@ export class TenantTelemetryWriterWorker {
     assertExactTenantTelemetryWriteAdapterResult(this.deps.adapter.adapterProtocol, input, result);
     await this.requireRenew(auth);
     try {
-      const ack = await this.deps.store.completeTenantTelemetryWrite(auth, result);
+      const freshProof = await this.requireV2Boundary(claim, "ack");
+      const ack = await this.deps.store.completeTenantTelemetryWrite(auth, result, freshProof);
       if (!ack) throw new TenantTelemetryWriteAdapterTemporaryError();
       this.assertAck(claim, result, ack);
       return true;
@@ -278,6 +308,7 @@ export class TenantTelemetryWriterWorker {
       if (blocksWrite(firstError)) throw firstError;
       // The DB transaction may have committed while its response was lost. Read the immutable ACK
       // first, then make one exact completion replay while the original claim identity is retained.
+      await this.requireV2Boundary(claim, "ack");
       const existing = await this.deps.store.getTenantTelemetryWriteAck(
         claim.tenantId,
         claim.writeOperationSha256,
@@ -287,7 +318,8 @@ export class TenantTelemetryWriterWorker {
         return true;
       }
       await this.requireRenew(auth);
-      const replay = await this.deps.store.completeTenantTelemetryWrite(auth, result);
+      const replayProof = await this.requireV2Boundary(claim, "ack");
+      const replay = await this.deps.store.completeTenantTelemetryWrite(auth, result, replayProof);
       if (!replay) throw firstError;
       this.assertAck(claim, result, replay);
       return true;
@@ -323,6 +355,19 @@ export class TenantTelemetryWriterWorker {
     if (!await this.deps.store.renewTenantTelemetryWrite(auth, { leaseMs: this.opts.leaseMs })) {
       throw new TenantTelemetryWriteAdapterTemporaryError();
     }
+  }
+
+  private async requireV2Boundary(claim: TenantTelemetryWriteClaim, boundary: "reserve" | "create" | "ack"): Promise<TenantTelemetryPersistedProviderCaptureProof | undefined> {
+    if (claim.inventory.sourceSchema !== PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA) return undefined;
+    const capture = this.deps.persistedProviderCapture;
+    if (!capture) throw new TenantTelemetryWriteAdapterTemporaryError();
+    const expected = await capture.store.getTenantTelemetryPersistedProviderCaptureBinding();
+    if (!expected) throw new TenantTelemetryWriteAdapterTemporaryError();
+    const proof = await capture.requireFreshFleet(expected, boundary);
+    const verified = await capture.store.verifyPersistedProviderStepFailureWrite(claim.tenantId, claim.writeOperationSha256, proof, boundary);
+    if (verified.sourceCount !== 1 || !verified.status.startsWith("source_verified_")
+      || verified.writeOperationSha256 !== claim.writeOperationSha256) throw new TenantTelemetryWriteIntegrityError();
+    return proof;
   }
 
   private async retry(claim: TenantTelemetryWriteClaim): Promise<boolean> {

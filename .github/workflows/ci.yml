@@ -115,6 +115,20 @@ jobs:
       - name: Tenant telemetry application capture unit suites (must execute)
         run: pnpm run test:tenant-telemetry-application-capture
 
+      - name: Local persisted provider capture operator unit suites (must execute)
+        run: pnpm run test:telemetry-capture-operator
+
+      - name: Backup and restore protected telemetry key compatibility suites (must execute)
+        run: pnpm run test:telemetry-operator-key-compatibility
+
+      - name: Persisted provider capture provenance and fresh fleet suites (must execute)
+        run: pnpm run test:persisted-provider-failure-capture
+
+      - name: Persisted provider capture real MySQL atomicity and isolation suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:persisted-provider-capture-mysql
+
       # 0034 persists a closed payload before any external mutation, then uses create-only
       # adapter inspection and a claim-bound ACK to publish inventory and remove the spool.
       # 0038 also requires each new job to carry an immutable same-transaction source
@@ -287,6 +301,21 @@ jobs:
           S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:tenant-telemetry-writer-s3
+
+      # The fixture drives original provider HTTP/stream failure through PiEngine/SessionHost,
+      # real MySQL failed-step commit and the existing worker into actual MinIO bytes/ACK.
+      # It proves local capture only: sixth-source erasure/grant remain hard denied.
+      - name: Persisted provider failure capture real MySQL and MinIO E2E (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_TENANT_TELEMETRY_TEST_BUCKET: agent-service-ci-tenant-telemetry
+          S3_RESTORE_JOURNAL_TEST_BUCKET: agent-service-ci-restore-journal
+          S3_TEST_FORCE_PATH_STYLE: "1"
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+        run: pnpm run test:telemetry-capture-mysql-s3
 
       # The fifth logical bucket exercises v1 fixture CAS, the v2 journal observer, and
       # the 0046 artifact observer under separate random prefixes and required no-skip files.
@@ -612,9 +641,11 @@ jobs:
       # ordinary DELETE grace evidence, and 0050 -> 0051 ordinary DELETE
       # write-once guard and 0051 -> 0052 deletion-time policy/usage receipt plus
       # anonymous T3f billing and grave-digest bridges all run against real MySQL.
+      # 0052 -> 0053 additionally preserves genuine old failed-step writes while installing
+      # default-off source-bound provider capture; frozen old writers must reject its fingerprint.
       # Frozen 0038/0039/0040/0041 binaries produce genuine old terminal records before upgrade;
       # old-code startup must reject each new strict fingerprint.
-      - name: Historical MySQL migrations (0007 through 0052 + 0043 read compatibility, frozen terminals, no skips)
+      - name: Historical MySQL migrations (0007 through 0053 + 0043 read compatibility, frozen terminals, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations
@@ -644,6 +675,9 @@ jobs:
 
       - name: Runner restore-ledger reconciliation distributable CLI (must execute)
         run: pnpm run check:restore-ledger-reconcile-artifact
+
+      - name: Runner telemetry capture distributable CLI (must execute)
+        run: pnpm run check:telemetry-capture-artifact
 
       - name: Runner authoritative backup catalog distributable CLI (must execute)
         run: pnpm run check:backup-catalog-artifact
@@ -727,6 +761,25 @@ jobs:
           docker run --rm --entrypoint node agent-service/agent-runner:ci \
             dist/backup-catalog.js --help | grep -F "Usage: backup-catalog"
 
+      - name: Execute the local-only telemetry capture CLI from the runner image
+        if: matrix.app == 'agent-runner'
+        run: |
+          docker run --rm --entrypoint node agent-service/agent-runner:ci \
+            dist/telemetry-capture.js --help | grep -F "Usage: telemetry-capture"
+
+      - name: Runner image operator entrypoints reject ambient application key authority
+        if: matrix.app == 'agent-runner'
+        run: |
+          set -euo pipefail
+          for entry in backup-catalog restore-ledger-reconcile; do
+            if output="$(docker run --rm -e TENANT_TELEMETRY_REF_KEY= --entrypoint node \
+              agent-service/agent-runner:ci "dist/${entry}.js" status 2>&1)"; then
+              echo "operator unexpectedly accepted ambient key authority" >&2
+              exit 1
+            fi
+            test "$output" = '{"status":"error","code":"invalid_configuration"}'
+          done
+
       # A container that starts but is unreachable, or reports healthy on the wrong port, is the exact
       # failure mode this step exists to catch.
       - name: Run the container and reach it from outside
@@ -786,6 +839,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0050_ordinary_session_delete_grace.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0051_ordinary_session_delete_origin_guard.sql
             mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0052_ordinary_session_usage_retention.sql
+            mysql -h 127.0.0.1 -uroot agent_service -e "select name from schema_migrations" | grep -q 0053_persisted_provider_failure_capture.sql
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

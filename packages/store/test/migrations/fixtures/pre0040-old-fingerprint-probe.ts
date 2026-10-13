@@ -1,14 +1,22 @@
 import { MysqlSessionStore } from "@agent-service/store";
 
 const mysqlUrl = process.env.MYSQL_URL;
-if (!mysqlUrl) throw new Error("old fingerprint probe requires MYSQL_URL");
-let rejectedBy0039Fingerprint = false;
+const stage = process.env.EXPECT_FINGERPRINT_STAGE;
+if (!mysqlUrl || !["target", "full-tail"].includes(stage ?? "")) {
+  throw new Error("old fingerprint probe requires fixed inputs");
+}
+const expectedMessage = stage === "target"
+  ? "0039 tenant telemetry owner closure fingerprint verification failed"
+  : "0035 tenant telemetry application capture schema fingerprint verification failed";
+let rejected = false;
 try {
-  const store = await MysqlSessionStore.connect({ url: mysqlUrl });
+  const store = await MysqlSessionStore.connect({ url: mysqlUrl, migrationMode: "verify" });
   await store.close();
 } catch (error) {
-  rejectedBy0039Fingerprint = error instanceof Error
-    && /0039 tenant telemetry owner closure fingerprint verification failed/.test(error.message);
+  rejected = error instanceof Error && error.message === expectedMessage;
+  if (!rejected) throw new Error("frozen 0039 verify failed outside its expected fingerprint");
 }
-if (!rejectedBy0039Fingerprint) throw new Error("frozen 0039 store did not reject 0040 schema");
-process.stdout.write("frozen-0039-fingerprint-rejected");
+if (!rejected) throw new Error("frozen 0039 store did not reject upgraded schema");
+process.stdout.write(stage === "target"
+  ? "frozen-0039-fingerprint-rejected"
+  : "frozen-0039-0035-fingerprint-rejected");

@@ -26,6 +26,7 @@ import {
   addUsage,
   emptyUsageAccumulator,
   isCanonicalId,
+  telemetryCaptureLogsSourceRefSha256,
 } from "@agent-service/protocol";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -102,6 +103,7 @@ import {
   type OrdinarySessionDeleteGraceView,
 } from "./session-delete-grace.js";
 import * as OrdinaryUsageRetention from "./ordinary-usage-retention.js";
+import * as PersistedCapture from "./tenant-telemetry-persisted-provider-capture.js";
 
 import {
   BLOB_STORAGE_FORMAT,
@@ -1565,6 +1567,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private nextUserDataExportDeleteOutboxId = 1;
   private readonly tenantBackupSchemaMigrationRootSha256: string;
   private readonly tenantTelemetryRefKey: Uint8Array | undefined;
+  private persistedProviderCaptureActivation: PersistedCapture.TenantTelemetryPersistedProviderCaptureActivationReceipt | undefined;
+  private readonly persistedProviderCaptureCoverages = new Map<string, PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage>();
+  private readonly persistedProviderCaptureBindings = new Map<string, PersistedCapture.TenantTelemetryPersistedProviderCaptureSourceBinding>();
+  private readonly persistedProviderFailureReceipts = new Map<string, PersistedCapture.PersistedProviderStepFailureCommitReceipt>();
+  private readonly persistedProviderFailureClasses = new Map<string, { classification: "runtime_unknown" | "provider_step_error"; generation: 0 | 1; operationSha256?: string }>();
+  private readonly persistedProviderCaptureCommitContexts = new WeakMap<CommitBatch, { input: PersistedCapture.CommitPersistedProviderStepFailureInput; result?: PersistedCapture.CommitPersistedProviderStepFailureResult }>();
+  private readonly persistedProviderCaptureStagedCoverages = new WeakMap<object, PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage>();
+  private readonly persistedProviderCaptureOperatorFences = new WeakSet<object>();
+  private persistedProviderCaptureOperatorBusy = false;
 
   constructor(
     private readonly storeClock: { now(): number } = { now: () => Date.now() },
@@ -1574,6 +1585,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       tenantBackupSchemaMigrationNames?: readonly string[];
       /** Stable, protected HMAC key for the default-dormant telemetry lifecycle reference backend. */
       tenantTelemetryRefKey?: Uint8Array;
+      /** Explicit local-only permission; active v2 capture remains forbidden in production. */
+      tenantTelemetryPersistedProviderCaptureLocalOnly?: boolean;
     } = {},
   ) {
     const namespace = memoryOptions.tenantRedisPurgeNamespaceSha256;
@@ -1596,6 +1609,263 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new Error("memory store clock must return a non-negative safe integer");
     }
     return nowMs;
+  }
+
+  private persistedProviderCapturePrerequisites(): PersistedCapture.TenantTelemetryPersistedProviderCapturePrerequisites {
+    const journal = this.readTenantRestoreJournalControl();
+    const runtime = this.readTenantRestoreRuntimeControl();
+    const binding = PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime, journal);
+    if (runtime.state !== "active" || journal.controlGeneration !== 1
+      || [...this.tenantRestoreReplayRuns.values()].some((run) => run.phase === "prepared" || run.phase === "replay_sealed")) {
+      throw new PersistedCapture.PersistedProviderCaptureConflictError("capture restore runtime is not ready");
+    }
+    return { runtimeEpochSha256: runtime.runtimeEpochSha256, runtimeBindingSha256: binding,
+      runtimeControlEvidenceSha256: runtime.evidenceSha256, runtimeControlGeneration: runtime.controlGeneration,
+      journalControlEvidenceSha256: journal.evidenceSha256, journalTargetRootSha256: journal.targetRootSha256,
+      journalHeadRootSha256: runtime.verifiedHeadRootSha256 };
+  }
+  async getTenantTelemetryPersistedProviderCapturePrerequisites() { return clone(this.persistedProviderCapturePrerequisites()); }
+
+  private assertMemoryPersistedProviderCaptureControl(): PersistedCapture.TenantTelemetryPersistedProviderCaptureActivationReceipt | undefined {
+    const receipt = this.persistedProviderCaptureActivation;
+    if (!receipt) {
+      if (this.persistedProviderCaptureCoverages.size || this.persistedProviderCaptureBindings.size || this.persistedProviderFailureReceipts.size) {
+        throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      }
+      return undefined;
+    }
+    PersistedCapture.validatePersistedProviderCaptureActivationReceipt(receipt);
+    const runtime = this.persistedProviderCapturePrerequisites();
+    const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
+    const target = this.tenantTelemetryLifecycleTargets.get("logs");
+    if (receipt.receiptSha256 !== PersistedCapture.persistedProviderCaptureReceiptSha256(receipt)
+      || lifecycle.state !== "active" || lifecycle.activationEvidenceSha256 !== receipt.lifecycleControlEvidenceSha256
+      || TenantTelemetry.tenantTelemetryRefKeyIdSha256(this.tenantTelemetryRefKeyForUse()) !== receipt.refKeyIdSha256
+      || !target || target.targetSha256 !== receipt.logsTargetSha256 || target.receiptSha256 !== receipt.logsTargetReceiptSha256
+      || runtime.runtimeEpochSha256 !== receipt.runtimeEpochSha256 || runtime.runtimeBindingSha256 !== receipt.runtimeBindingSha256
+      || TenantTelemetry.TENANT_TELEMETRY_DOMAINS.some((domain) => this.readMemoryTenantTelemetryApplicationDomainControl(domain).state !== "inactive")) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    const canonical = this.canonicalTenantTelemetryTenantIds();
+    if (canonical.length !== this.persistedProviderCaptureCoverages.size) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const old: PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage[] = [];
+    for (const tenantId of canonical) {
+      const coverage = this.persistedProviderCaptureCoverages.get(tenantId);
+      const source = this.tenantTelemetryLifecycleCoverages.get(tenantId);
+      if(coverage)PersistedCapture.validatePersistedProviderCaptureCoverage(coverage);
+      const { evidenceSha256, ...body } = coverage ?? {} as PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage;
+      if (!coverage || !source || coverage.tenantId !== tenantId || coverage.lifecycleCoverageEvidenceSha256 !== source.evidenceSha256
+        || coverage.subjectRefSha256 !== source.subjectRefSha256 || evidenceSha256 !== PersistedCapture.persistedProviderCaptureCoverageSha256(body)
+        || coverage.coverageStartedAtDbMs < receipt.activatedAtDbMs) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      if (coverage.captureStatus === "capture_since_cutover") old.push(coverage);
+    }
+    if (old.length !== receipt.coverageCount || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-capture-coverage-root-v2", old) !== receipt.coverageRootSha256) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    const legacyFailures=[...this.items.values()].filter((i)=>i.type === "agentMessage" && i.status === "failed" && (this.persistedProviderFailureClasses.get(i.id)?.generation ?? 0) === 0).map((i)=>({sessionId:i.sessionId,itemId:i.id,turnId:i.turnId,step:i.step,seq:i.seq})).sort((a,b)=>a.itemId < b.itemId ? -1 : 1);
+    const legacyWrites=[...this.tenantTelemetryWriteJobs.values()].filter((j)=>j.inventory.domain === "logs" && j.inventory.sourceSchema !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA).map((j)=>j.writeOperationSha256).sort();
+    if(legacyFailures.length !== receipt.preCutoverFailureCount || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-capture-legacy-failures-v2",legacyFailures) !== receipt.preCutoverFailureRootSha256
+      || legacyWrites.length !== receipt.preCutoverWriteCount || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-capture-legacy-writes-v2",legacyWrites) !== receipt.preCutoverWriteRootSha256)throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    return receipt;
+  }
+  async getTenantTelemetryPersistedProviderCaptureControl(): Promise<PersistedCapture.TenantTelemetryPersistedProviderCaptureControl> {
+    const receipt = this.assertMemoryPersistedProviderCaptureControl();
+    return receipt ? clone({ domain: "logs", state: "active", controlGeneration: 1, activatedAtDbMs: receipt.activatedAtDbMs,
+      activationEvidenceSha256: receipt.receiptSha256, receipt }) : { domain: "logs", state: "inactive", controlGeneration: 0 };
+  }
+  async getTenantTelemetryPersistedProviderCaptureBinding() {
+    const receipt = this.assertMemoryPersistedProviderCaptureControl();
+    return receipt ? PersistedCapture.persistedProviderCaptureProofFromReceipt(receipt) : null;
+  }
+  async getTenantTelemetryPersistedProviderCaptureActivationReceipt() { return clone(this.assertMemoryPersistedProviderCaptureControl() ?? null); }
+  async getTenantTelemetryPersistedProviderCaptureCoverage(tenantId: string) {
+    this.assertMemoryPersistedProviderCaptureControl();
+    return clone(this.persistedProviderCaptureCoverages.get(tenantId) ?? null);
+  }
+  async getTenantTelemetryPersistedProviderCaptureSourceBinding(tenantId: string, operationSha256: string) {
+    this.assertMemoryPersistedProviderCaptureControl();
+    const binding = this.persistedProviderCaptureBindings.get(operationSha256);
+    if(binding)PersistedCapture.validatePersistedProviderCaptureSourceBinding(binding);
+    return clone(binding?.tenantId === tenantId ? binding : null);
+  }
+  private persistedProviderFailureReceiptForSource(input: PersistedCapture.VerifyPersistedProviderStepFailureSourceInput) {
+    if (!Number.isSafeInteger(input.stepIndex) || input.stepIndex < 1) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const key = this.tenantTelemetryRefKeyForUse();
+    const refs = [telemetryCaptureLogsSourceRefSha256("session", input.tenantId, input.sessionId, key),
+      telemetryCaptureLogsSourceRefSha256("turn", input.tenantId, input.turnId, key), telemetryCaptureLogsSourceRefSha256("item", input.tenantId, input.itemId, key)];
+    return [...this.persistedProviderFailureReceipts.values()].find((r) => r.tenantId === input.tenantId
+      && r.sourceSessionRefSha256 === refs[0] && r.sourceTurnRefSha256 === refs[1] && r.sourceItemRefSha256 === refs[2] && r.sourceStepIndex === input.stepIndex);
+  }
+  async getTenantTelemetryPersistedProviderCaptureFailureCommitReceipt(input: PersistedCapture.VerifyPersistedProviderStepFailureSourceInput) {
+    input = clone(input);
+    if(!this.assertMemoryPersistedProviderCaptureControl())return null;
+    const receipt = this.persistedProviderFailureReceiptForSource(input);
+    if (receipt) this.verifyMemoryPersistedProviderFailure(receipt);
+    return clone(receipt ?? null);
+  }
+  private verifyMemoryPersistedProviderFailure(receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt): PersistedCapture.PersistedProviderStepFailureSourceVerification {
+    PersistedCapture.validatePersistedProviderFailureCommitReceipt(receipt);
+    const control = this.assertMemoryPersistedProviderCaptureControl();
+    const binding = this.persistedProviderCaptureBindings.get(receipt.writeOperationSha256);
+    const job = this.tenantTelemetryWriteJobs.get(receipt.writeOperationSha256);
+    const membership = this.tenantTelemetryArtifactMemberships.get(receipt.writeOperationSha256);
+    if(binding)PersistedCapture.validatePersistedProviderCaptureSourceBinding(binding);
+    if(membership)TenantTelemetryArtifactMembership.validateTenantTelemetryArtifactMembership(membership);
+    if(job)TenantTelemetryWriter.validateTenantTelemetryWriteJobRecord(job);
+    const key = this.tenantTelemetryRefKeyForUse();
+    const session = [...this.sessions.values()].find((s) => s.tenantId === receipt.tenantId
+      && telemetryCaptureLogsSourceRefSha256("session", s.tenantId, s.id, key) === receipt.sourceSessionRefSha256);
+    const item = [...this.items.values()].find((i) => i.type === "agentMessage" && i.status === "failed" && i.sessionId === session?.id
+      && telemetryCaptureLogsSourceRefSha256("item", receipt.tenantId, i.id, key) === receipt.sourceItemRefSha256);
+    const turn = item ? this.turns.get(item.turnId) : undefined;
+    const events = session ? (this.events.get(session.id) ?? []).filter((e) => e.seq > receipt.beginLastSeq && e.seq <= receipt.endLastSeq) : [];
+    const event = events.find((e) => e.seq === receipt.sourceEventSeq);
+    const usage = session ? this.usageLedger.find((u) => u.tenantId === receipt.tenantId && u.userId === session.userId
+      && u.sessionId === session.id && u.turnId === item?.turnId && u.step === receipt.sourceStepIndex) : undefined;
+    const billing = usage?.usageId ? this.billingUsageFacts.get(usage.usageId) : undefined;
+    if (!control || !binding || !job || !membership || !session || !item || !turn || turn.sessionId !== session.id || item.step !== receipt.sourceStepIndex
+      || !Number.isSafeInteger(item.seq) || item.seq < 1 || item.seq > receipt.sourceEventSeq
+      || telemetryCaptureLogsSourceRefSha256("turn", receipt.tenantId, item.turnId, key) !== receipt.sourceTurnRefSha256
+      || this.persistedProviderFailureClasses.get(item.id)?.generation !== 1
+      || this.persistedProviderFailureClasses.get(item.id)?.classification !== "provider_step_error"
+      || this.persistedProviderFailureClasses.get(item.id)?.operationSha256 !== receipt.writeOperationSha256
+      || !usage || !billing || !billingUsageFactContentEquals(billing, billingUsageFactFromLedger(usage as UsageLedgerEntry & { usageId: string }))
+      || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-usage-id-v2", usage.usageId) !== receipt.usageIdSha256
+      || PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-billing-v2", billing) !== receipt.billingRootSha256
+      || events.length !== receipt.eventCount || events.some((e, index) => e.seq !== receipt.beginLastSeq + index + 1)
+      || PersistedCapture.persistedProviderCaptureEventRoot(events) !== receipt.eventRootSha256
+      || event?.type !== "item/completed" || event.item.id !== item.id || PersistedCapture.persistedProviderCaptureCanonicalJson(event.item) !== PersistedCapture.persistedProviderCaptureCanonicalJson(item)
+      || receipt.receiptSha256 !== PersistedCapture.persistedProviderCaptureReceiptSha256(receipt)
+      || binding.receiptSha256 !== PersistedCapture.persistedProviderCaptureReceiptSha256(binding)
+      || receipt.bindingReceiptSha256 !== binding.receiptSha256 || receipt.membershipSha256 !== membership.membershipSha256
+      || receipt.payloadSha256 !== binding.payloadSha256 || receipt.payloadSha256 !== job.inventory.payloadSha256
+      || receipt.captureControlEvidenceSha256 !== control.receiptSha256 || receipt.runtimeEpochSha256 !== control.runtimeEpochSha256
+      || receipt.runtimeBindingSha256 !== control.runtimeBindingSha256 || membership.applicationBindingReceiptSha256 !== null
+      || job.inventory.ownerRefSha256 !== TenantTelemetry.tenantTelemetryOwnerRefSha256("session", session.id, key)
+      || binding.ownerRefSha256 !== job.inventory.ownerRefSha256 || job.inventory.sourceSchema !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    const coverage=this.persistedProviderCaptureCoverages.get(receipt.tenantId);
+    if(!coverage || binding.coverageEvidenceSha256 !== coverage.evidenceSha256 || binding.tenantId !== receipt.tenantId
+      || binding.sourceSessionRefSha256 !== receipt.sourceSessionRefSha256 || binding.sourceTurnRefSha256 !== receipt.sourceTurnRefSha256 || binding.sourceItemRefSha256 !== receipt.sourceItemRefSha256 || binding.sourceStepIndex !== receipt.sourceStepIndex || binding.sourceEventSeq !== receipt.sourceEventSeq
+      || membership.ownerBindingSha256 !== TenantTelemetryArtifactMembership.tenantTelemetryArtifactOwnerBindingSha256({tenantId:receipt.tenantId,ownerKind:"session",ownerId:session.id,ownerUserId:session.userId},key))throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const ack = this.tenantTelemetryWriteAcks.get(receipt.writeOperationSha256);
+    const inventory = this.tenantTelemetryArtifactInventories.get(this.tenantTelemetryArtifactMapKey("logs", job.inventory.artifactIdSha256, job.inventory.artifactGeneration));
+    const payload = this.tenantTelemetryWritePayloads.get(receipt.writeOperationSha256);
+    // The standalone receipt getter must verify these relations too; it may not rely
+    // on an unrelated public getter or the global writer scan having run beforehand.
+    if (job.phase === "written") {
+      if (payload || !ack || !inventory || !job.reservation) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      TenantTelemetryWriter.validateTenantTelemetryWriteAck(ack);
+      TenantTelemetry.validateTenantTelemetryArtifactInventory(inventory);
+      if (ack.tenantId !== job.tenantId || ack.writeOperationSha256 !== job.writeOperationSha256
+        || ack.receiptSha256 !== job.writeAckReceiptSha256 || ack.reservationReceiptSha256 !== job.reservation.receiptSha256
+        || ack.mutationStartedAtDbMs !== job.reservation.startedAtDbMs || ack.mutationStartedClaimAttempt !== job.reservation.startedClaimAttempt
+        || ack.mutationStartedClaimTokenSha256 !== job.reservation.startedClaimTokenSha256
+        || ack.inventoryReceiptSha256 !== job.inventory.receiptSha256 || inventory.receiptSha256 !== job.inventory.receiptSha256) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    } else {
+      if (!payload || ack || inventory) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      TenantTelemetryWriter.validateTenantTelemetryWritePayloadRecord(payload);
+      if (payload.tenantId !== job.tenantId || payload.writeOperationSha256 !== job.writeOperationSha256
+        || payload.payloadSha256 !== job.inventory.payloadSha256 || payload.recordCount !== job.recordCount
+        || payload.payloadByteLength !== job.payloadByteLength) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    return { status: job.phase === "written" ? "source_verified_written" : job.phase === "blocked" ? "source_verified_blocked" : job.reservation ? "source_verified_reserved" : "source_verified_queued",
+      sourceCount: 1, failureCommitReceiptSha256: receipt.receiptSha256, sourceBindingReceiptSha256: binding.receiptSha256,
+      writeOperationSha256: receipt.writeOperationSha256, membershipSha256: membership.membershipSha256,
+      writeAckReceiptSha256: ack?.receiptSha256 ?? null, inventoryReceiptSha256: inventory?.receiptSha256 ?? null,
+      executionReady: false, allDomainsComplete: false };
+  }
+  async verifyPersistedProviderStepFailureSource(input: PersistedCapture.VerifyPersistedProviderStepFailureSourceInput) {
+    input = clone(input);
+    const receipt = this.assertMemoryPersistedProviderCaptureControl();
+    if (input.freshProof) {
+      if (!receipt) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+      PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(receipt), input.freshProof);
+    }
+    if(!receipt)return PersistedCapture.noPersistedProviderFailureSource();
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const failure = this.persistedProviderFailureReceiptForSource(input);
+    return failure ? this.verifyMemoryPersistedProviderFailure(failure) : PersistedCapture.noPersistedProviderFailureSource();
+  }
+  async verifyPersistedProviderStepFailureWrite(tenantId: string, operation: string, freshProof: PersistedCapture.TenantTelemetryPersistedProviderCaptureProof, boundary?: PersistedCapture.PersistedProviderStepFailureWriteBoundary) {
+    PersistedCapture.validatePersistedProviderFailureWriteBoundary(boundary);
+    freshProof = clone(freshProof);
+    const control = this.assertMemoryPersistedProviderCaptureControl();
+    if (!control) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+    PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(control), freshProof);
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const receipt = this.persistedProviderFailureReceipts.get(operation);
+    if (!receipt || receipt.tenantId !== tenantId) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const verified=this.verifyMemoryPersistedProviderFailure(receipt);
+    if(boundary === "reserve" || boundary === "create")this.assertMemoryPersistedFailureLiveWriteGates(this.tenantTelemetryWriteJobs.get(operation)!);
+    return verified;
+  }
+  private assertMemoryPersistedFailureLiveWriteGates(job:TenantTelemetryWriter.TenantTelemetryWriteJobRecord):void{
+    const key=this.tenantTelemetryRefKeyForUse();
+    const session=[...this.sessions.values()].find((candidate)=>candidate.tenantId === job.tenantId && TenantTelemetry.tenantTelemetryOwnerRefSha256("session",candidate.id,key) === job.inventory.ownerRefSha256);
+    const tenant=this.subjectLifecycles.get(subjectLifecycleKey(job.tenantId,"tenant",job.tenantId));
+    const user=session ? this.subjectLifecycles.get(subjectLifecycleKey(job.tenantId,"user",session.userId)) : undefined;
+    if(!session || this.deleted.has(session.id) || !tenant || tenant.state !== "active" || !user || user.state !== "active" || !this.isSubjectActive(job.tenantId,session.userId)
+      || TenantTelemetry.tenantTelemetryOwnerRefSha256("user",session.userId,key) !== job.inventory.holdSubjectRefSha256)throw new PersistedCapture.PersistedProviderCaptureConflictError("provider capture live owner is unavailable");
+    const retention=this.assertRetentionPolicyState(job.tenantId).control;
+    const tenantHold=this.assertLegalHoldState(job.tenantId,"tenant",job.tenantId).control;
+    const ownerHold=this.assertLegalHoldState(job.tenantId,"user",session.userId).control;
+    const runtime=this.readTenantRestoreRuntimeControl();
+    if(retention.controlGeneration !== job.inventory.retentionPolicyControlGeneration || (retention.activePolicySha256 ?? null) !== job.inventory.retentionPolicySha256
+      || tenantHold.controlGeneration !== job.inventory.tenantHoldControlGeneration || tenantHold.activeProjectionSha256 !== job.inventory.tenantHoldProjectionSha256
+      || ownerHold.controlGeneration !== job.inventory.ownerHoldControlGeneration || ownerHold.activeProjectionSha256 !== job.inventory.ownerHoldProjectionSha256
+      || runtime.state !== "active" || runtime.lineageKind !== job.inventory.restoreLineageKind || runtime.runtimeEpochSha256 !== job.inventory.runtimeEpochSha256)throw new PersistedCapture.PersistedProviderCaptureConflictError("provider capture live write gates changed");
+  }
+  private assertNoPersistedProviderUsageDeletion(rows: readonly UsageLedgerEntry[]): void {
+    for (const row of rows) {
+      if (!row.usageId) continue;
+      const usageIdSha256=PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-usage-id-v2",row.usageId);
+      const receipt=[...this.persistedProviderFailureReceipts.values()].find((candidate)=>candidate.tenantId === row.tenantId && candidate.usageIdSha256 === usageIdSha256);
+      if(!receipt)continue;
+      PersistedCapture.validatePersistedProviderFailureCommitReceipt(receipt);
+      throw new PersistedCapture.PersistedProviderCaptureConflictError("operational usage is retained by sealed provider-step capture");
+    }
+  }
+  async withTenantTelemetryCaptureOperatorFence<T>(work: (fence: PersistedCapture.TenantTelemetryCaptureOperatorFence) => Promise<T>, options: { timeoutMs: number; operationAbortSignal?: AbortSignal }): Promise<T> {
+    if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || this.persistedProviderCaptureOperatorBusy) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+    this.persistedProviderCaptureOperatorBusy = true;
+    const deadline = Date.now() + options.timeoutMs;
+    const fence: PersistedCapture.TenantTelemetryCaptureOperatorFence = Object.freeze({ scope: "tenant-telemetry-capture-operator-fence-v2", checkOwned: async () => {
+      if (!this.persistedProviderCaptureOperatorFences.has(fence) || options.operationAbortSignal?.aborted || Date.now() >= deadline) throw new PersistedCapture.PersistedProviderCaptureConflictError("capture operator fence is no longer owned");
+    } });
+    this.persistedProviderCaptureOperatorFences.add(fence);
+    try { await fence.checkOwned(); const result=await work(fence); await fence.checkOwned(); return result; }
+    finally { this.persistedProviderCaptureOperatorFences.delete(fence); this.persistedProviderCaptureOperatorBusy = false; }
+  }
+  async activateTenantTelemetryPersistedProviderCapture(input: PersistedCapture.ActivateTenantTelemetryPersistedProviderCaptureInput, fence: PersistedCapture.TenantTelemetryCaptureOperatorFence) {
+    if (!this.persistedProviderCaptureOperatorFences.has(fence) || this.memoryOptions.tenantTelemetryPersistedProviderCaptureLocalOnly !== true) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+    await fence.checkOwned();
+    const captured = clone(input); PersistedCapture.validateActivatePersistedProviderCaptureInput(captured);
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const existing = this.assertMemoryPersistedProviderCaptureControl();
+    if (existing) {
+      if (existing.requestSha256 !== PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-capture-activation-request-v2", captured)) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+      return { control: (await this.getTenantTelemetryPersistedProviderCaptureControl()) as Extract<PersistedCapture.TenantTelemetryPersistedProviderCaptureControl, { state: "active" }>, receipt: clone(existing) };
+    }
+    const prerequisites = this.persistedProviderCapturePrerequisites();
+    const lifecycle = this.readMemoryTenantTelemetryLifecycleControl(); const target = this.tenantTelemetryLifecycleTargets.get("logs");
+    if (lifecycle.state !== "active" || lifecycle.activationEvidenceSha256 !== captured.lifecycleControlEvidenceSha256
+      || !target || target.adapterProtocol !== "telemetry-s3-object-v1" || target.targetSha256 !== captured.logsTargetSha256 || target.receiptSha256 !== captured.logsTargetReceiptSha256
+      || TenantTelemetry.TENANT_TELEMETRY_DOMAINS.some((d) => this.readMemoryTenantTelemetryApplicationDomainControl(d).state !== "inactive")) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+    const tenants = this.canonicalTenantTelemetryTenantIds();
+    const runtime=this.readTenantRestoreRuntimeControl();
+    if(runtime.state !== "active")throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const atMs = Math.max(this.storeNowMs(), lifecycle.activatedAtDbMs,target.createdAtDbMs,runtime.updatedAtDbMs, ...tenants.map((id) => this.tenantTelemetryLifecycleCoverages.get(id)!.coverageStartedAtDbMs));
+    const coverages = tenants.map((id) => PersistedCapture.createPersistedProviderCaptureCoverage(this.tenantTelemetryLifecycleCoverages.get(id)!, atMs, true));
+    const failures = [...this.items.values()].filter((i) => i.type === "agentMessage" && i.status === "failed").map((i) => ({ sessionId: i.sessionId, itemId: i.id, turnId: i.turnId, step: i.step, seq: i.seq })).sort((a, b) => a.itemId < b.itemId ? -1 : 1);
+    const writes = [...this.tenantTelemetryWriteJobs.values()].filter((j) => j.inventory.domain === "logs").map((j) => j.writeOperationSha256);
+    const receipt = clone(PersistedCapture.createPersistedProviderCaptureActivationReceipt(captured, { ...prerequisites,
+      refKeyIdSha256: TenantTelemetry.tenantTelemetryRefKeyIdSha256(this.tenantTelemetryRefKeyForUse()), coverages, preCutoverFailures: failures, preCutoverWrites: writes, atMs }));
+    const result={ control: { domain: "logs" as const, state: "active" as const, controlGeneration: 1 as const, activatedAtDbMs: atMs, activationEvidenceSha256: receipt.receiptSha256, receipt: clone(receipt) }, receipt: clone(receipt) };
+    for (const coverage of coverages) this.persistedProviderCaptureCoverages.set(coverage.tenantId, coverage);
+    this.persistedProviderCaptureActivation = receipt;
+    return result;
   }
 
   private tenantTelemetryArtifactMapKey(
@@ -1729,6 +1999,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         control.producerContractSha256,
       ));
     }
+    const v2 = this.assertMemoryPersistedProviderCaptureControl();
+    if (v2) {
+      const existing = this.persistedProviderCaptureCoverages.get(tenantId);
+      if (canonicalTenantExisted) {
+        if (!existing) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      } else {
+        if (existing || !lifecycleCoverage || tenantCreatedAtMs < v2.activatedAtDbMs) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        this.persistedProviderCaptureStagedCoverages.set(staged,
+          clone(PersistedCapture.createPersistedProviderCaptureCoverage(lifecycleCoverage, tenantCreatedAtMs, false)));
+      }
+    }
     return staged;
   }
 
@@ -1741,6 +2022,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         clone(coverage),
       );
     }
+    const v2 = this.persistedProviderCaptureStagedCoverages.get(coverages);
+    if (v2) this.persistedProviderCaptureCoverages.set(v2.tenantId, v2);
   }
 
   private canonicalTenantTelemetryTenantIds(): string[] {
@@ -2654,6 +2937,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         }
         membershipInventories.add(membership.inventorySha256);
       }
+      this.assertMemoryPersistedProviderCaptureControl();
+      for (const receipt of this.persistedProviderFailureReceipts.values()) this.verifyMemoryPersistedProviderFailure(receipt);
+      for (const [operation, binding] of this.persistedProviderCaptureBindings) {
+        if (operation !== binding.writeOperationSha256 || !this.persistedProviderFailureReceipts.has(operation)) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      }
+      for (const job of this.tenantTelemetryWriteJobs.values()) if (job.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA
+        && !this.persistedProviderFailureReceipts.has(job.writeOperationSha256)) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
     } catch (error) {
       if (error instanceof TenantTelemetryWriter.TenantTelemetryWriteIntegrityError) throw error;
       throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
@@ -2663,6 +2953,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private stageMemoryTenantTelemetryWrite(
     input: Readonly<TenantTelemetryWriter.EnqueueTenantTelemetryArtifactInput>,
     payload: Readonly<TenantTelemetryWriter.TenantTelemetryArtifactPayload>,
+    trustedPersistedProviderSource = false,
   ): {
       target: TenantTelemetry.TenantTelemetryLifecycleTargetRecord;
       inventory: TenantTelemetry.TenantTelemetryArtifactInventoryRecord;
@@ -2731,7 +3022,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           "tenant telemetry application capture coverage is missing",
         );
       }
-    } else if (coverage.historyStatus !== "complete_since_creation") {
+    } else if (!trustedPersistedProviderSource && coverage.historyStatus !== "complete_since_creation") {
       throw new TenantTelemetryWriter.TenantTelemetryWriteConflictError(
         "legacy tenant telemetry writes require an active application capture cutover",
       );
@@ -2908,6 +3199,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     applicationCoverages:
       TenantTelemetryApplicationCapture.TenantTelemetryApplicationCoverage[];
   } {
+    createdAtMs=Math.max(createdAtMs,this.persistedProviderCaptureActivation?.activatedAtDbMs ?? 0);
     const key = subjectLifecycleKey(tenantId, "tenant", tenantId);
     const existing = this.subjectLifecycles.get(key);
     const coverage = this.stageTenantTelemetryCoverageForTenantMutation(
@@ -3940,6 +4232,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     const coveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     try {
       if (tenantStage.lifecycle) {
         this.subjectLifecycles.set(tenantStage.key, tenantStage.lifecycle);
@@ -3960,6 +4253,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         applicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, coveragesBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
       restoreMapEntry(this.retentionPolicies, key, existed, prior);
@@ -4057,6 +4351,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     const coveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     try {
       if (tenantStage.lifecycle) {
         this.subjectLifecycles.set(tenantStage.key, tenantStage.lifecycle);
@@ -4078,6 +4373,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         applicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, coveragesBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
       restoreMapEntry(
@@ -7294,6 +7590,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const coverageExisted = this.tenantTelemetryLifecycleCoverages.has(input.tenantId);
     const priorCoverage = this.tenantTelemetryLifecycleCoverages.get(input.tenantId);
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     const priorExportState = this.captureUserDataExportState();
     try {
       if (stagedTenant) this.subjectLifecycles.set(tenantKey, stagedTenant);
@@ -7315,6 +7612,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         applicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapEntry(
         this.tenantTelemetryLifecycleCoverages,
         input.tenantId,
@@ -11038,6 +11336,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const restoreTargetsBefore = new Map(this.tenantRestoreJournalPublicationTargets);
     const coveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     const telemetrySubjectsBefore = new Map(this.tenantTelemetryLifecycleSubjects);
     try {
       this.tenantErasureAdmissions.set(stagedInput.requestId, stagedRequest);
@@ -11086,6 +11385,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         applicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, coveragesBefore);
       restoreMapSnapshot(this.tenantRestoreJournalPublicationTargets, restoreTargetsBefore);
       restoreMapSnapshot(this.tenantRestoreJournalPublicationJobs, restoreJobsBefore);
@@ -15433,6 +15733,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const stagedAuthorization = clone(authorization);
     validateTenantPurgePlanAuthorization(stagedAuthorization);
     const current = this.tenantPurgePlanJobs.get(stagedAuthorization.requestId);
+    if (current?.phase !== "plan_sealed" && this.persistedProviderCaptureActivation) throw new PersistedCapture.PersistedProviderCaptureConflictError("T3d cannot account for capture v2 source");
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
     validateTenantPurgePlanJobRecord(current);
     const existingEntries = this.tenantPurgePlanEntriesFor(current);
@@ -17295,6 +17596,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           || left.turnId.localeCompare(right.turnId)
           || left.step - right.step
         ));
+      this.assertNoPersistedProviderUsageDeletion(tenantUsageRows);
       const usageTargetHashes = tenantUsageRows.map((row) => tenantPurgePlanTargetSha256(
         "operational_usage",
         [row.usageId ?? null, row.sessionId, row.turnId, row.step],
@@ -19595,6 +19897,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateTenantDatabasePurgeAuthorization(stagedAuthorization);
     const initialNowMs = this.storeNowMs();
     const current = this.tenantDatabasePurgeJobs.get(stagedAuthorization.requestId);
+    if (current?.phase !== "database_purged" && this.persistedProviderCaptureActivation) throw new PersistedCapture.PersistedProviderCaptureConflictError("T3f cannot close capture v2 owner source");
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
     if (current.phase === "database_purged") {
       this.assertTenantDatabasePurgeGlobalRelations();
@@ -22631,6 +22934,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     const coveragesBefore = new Map(this.tenantTelemetryLifecycleCoverages);
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     try {
       if (tenantStage.lifecycle) {
         this.subjectLifecycles.set(tenantStage.key, tenantStage.lifecycle);
@@ -22650,6 +22954,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         applicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, coveragesBefore);
       throw error;
     }
@@ -22736,6 +23041,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const coverageExisted = this.tenantTelemetryLifecycleCoverages.has(session.tenantId);
     const priorCoverage = this.tenantTelemetryLifecycleCoverages.get(session.tenantId);
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     try {
       if (tenantStage.lifecycle ?? stagedTenant) {
         this.subjectLifecycles.set(tenantKey, (tenantStage.lifecycle ?? stagedTenant)!);
@@ -22755,6 +23061,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         applicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapEntry(this.events, session.id, eventsExisted, priorEvents);
       restoreMapEntry(this.sessions, session.id, sessionExisted, priorSession);
       restoreMapEntry(this.subjectLifecycles, userKey, userExisted, priorUser);
@@ -23600,6 +23907,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const refKey = this.tenantTelemetryRefKeyForUse();
     const { input: stagedInput, payload } =
       TenantTelemetryWriter.captureTrustedEnqueueTenantTelemetryArtifactInput(input, refKey);
+    if(stagedInput.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA)throw new PersistedCapture.PersistedProviderCaptureConflictError("provider source cannot be asserted by generic enqueue");
+    if (this.persistedProviderCaptureActivation && stagedInput.domain === "logs") throw new PersistedCapture.PersistedProviderCaptureConflictError("active persisted capture forbids generic logs admission");
     this.assertTenantTelemetryWriterGlobalRelations();
     const staged = this.stageMemoryTenantTelemetryWrite(stagedInput, payload);
     const applicationControl = this.readMemoryTenantTelemetryApplicationDomainControl(
@@ -23795,12 +24104,21 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const stagedOptions = clone(options);
     TenantTelemetryWriter.validateClaimTenantTelemetryWriteJobsOptions(stagedOptions);
     this.assertTenantTelemetryWriterGlobalRelations();
+    if (stagedOptions.captureMode === "include_v2") {
+      const control = this.assertMemoryPersistedProviderCaptureControl();
+      if (!control) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+      PersistedCapture.assertPersistedProviderCaptureExpectedProof(
+        PersistedCapture.persistedProviderCaptureProofFromReceipt(control), stagedOptions.freshProof,
+      );
+    }
     const nowMs = this.storeNowMs();
     const leaseUntilMs = stagedOptions.leaseMs > Number.MAX_SAFE_INTEGER - nowMs
       ? Number.MAX_SAFE_INTEGER
       : nowMs + stagedOptions.leaseMs;
     const candidates = [...this.tenantTelemetryWriteJobs.values()]
       .filter((job) => job.phase === "queued"
+        && (stagedOptions.captureMode === "include_v2"
+          || job.inventory.sourceSchema !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA)
         && job.target.adapterProtocol === stagedOptions.adapterProtocol
         && job.availableAtMs <= nowMs
         && (job.leaseUntilMs === undefined || job.leaseUntilMs <= nowMs))
@@ -23811,6 +24129,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const claims: TenantTelemetryWriter.TenantTelemetryWriteClaim[] = [];
     for (const current of candidates) {
       if (current.phase !== "queued") continue;
+      if (current.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA) {
+        const receipt = this.persistedProviderFailureReceipts.get(current.writeOperationSha256);
+        if (stagedOptions.captureMode !== "include_v2" || !receipt || receipt.tenantId !== current.tenantId) {
+          throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        }
+        this.verifyMemoryPersistedProviderFailure(receipt);
+      }
       const payload = this.tenantTelemetryWritePayloads.get(current.writeOperationSha256);
       if (!payload) throw new TenantTelemetryWriter.TenantTelemetryWriteIntegrityError();
       const next: TenantTelemetryWriter.TenantTelemetryWriteJobRecord = {
@@ -23913,8 +24238,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async reserveTenantTelemetryExternalMutation(
     authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
     adapterProtocol: string,
+    freshProof?: PersistedCapture.TenantTelemetryPersistedProviderCaptureProof,
   ): Promise<TenantTelemetryWriter.TenantTelemetryExternalMutationReservation | null> {
     const stagedAuthorization = clone(authorization);
+    freshProof = freshProof === undefined ? undefined : clone(freshProof);
     TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
     TenantTelemetryWriter.validateClaimTenantTelemetryWriteJobsOptions({
       limit: 1, leaseMs: 1, claimToken: stagedAuthorization.claimToken, adapterProtocol,
@@ -23924,9 +24251,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const current = this.tenantTelemetryWriteJobs.get(
       stagedAuthorization.writeOperationSha256,
     );
+    const isV2 = current?.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA;
+    if (isV2) {
+      if (!freshProof || !this.persistedProviderCaptureActivation) throw new PersistedCapture.PersistedProviderCaptureConflictError("v2 mutation requires a fresh configured-fleet identity");
+      PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(this.persistedProviderCaptureActivation), freshProof);
+      this.verifyMemoryPersistedProviderFailure(this.persistedProviderFailureReceipts.get(current.writeOperationSha256)!);
+    }
     if (!current || current.phase !== "queued"
       || !this.tenantTelemetryWriteAuthorizationMatches(current, stagedAuthorization, nowMs)
       || current.target.adapterProtocol !== adapterProtocol) return null;
+    if(isV2){try{this.assertMemoryPersistedFailureLiveWriteGates(current);}catch(error){if(error instanceof PersistedCapture.PersistedProviderCaptureConflictError)return null;throw error;}}
     if (current.reservation) return clone(current.reservation);
 
     const control = this.readMemoryTenantTelemetryLifecycleControl();
@@ -23989,11 +24323,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || tenantHold.activeProjectionSha256 !== current.inventory.tenantHoldProjectionSha256
       || ownerHold.controlGeneration !== current.inventory.ownerHoldControlGeneration
       || ownerHold.activeProjectionSha256 !== current.inventory.ownerHoldProjectionSha256
-      || runtime.controlGeneration !== current.inventory.restoreControlGeneration
+      || (!isV2 && runtime.controlGeneration !== current.inventory.restoreControlGeneration)
       || (runtime.state === "active" ? runtime.lineageKind : "inactive")
         !== current.inventory.restoreLineageKind
-      || (runtime.state === "active" ? runtime.updatedAtDbMs : 0)
-        !== current.inventory.restoreUpdatedAtDbMs
+      || (!isV2 && (runtime.state === "active" ? runtime.updatedAtDbMs : 0)
+        !== current.inventory.restoreUpdatedAtDbMs)
       || (runtime.state === "active" ? runtime.runtimeEpochSha256 : null)
         !== current.inventory.runtimeEpochSha256) return null;
 
@@ -24143,9 +24477,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async completeTenantTelemetryWrite(
     authorization: TenantTelemetryWriter.TenantTelemetryWriteAuthorization,
     result: TenantTelemetryWriter.TenantTelemetryWriteAdapterResult,
+    freshProof?: PersistedCapture.TenantTelemetryPersistedProviderCaptureProof,
   ): Promise<TenantTelemetryWriter.TenantTelemetryWriteAck | null> {
     const stagedAuthorization = clone(authorization);
     const stagedResult = clone(result);
+    freshProof = freshProof === undefined ? undefined : clone(freshProof);
     TenantTelemetryWriter.validateTenantTelemetryWriteAuthorization(stagedAuthorization);
     TenantTelemetryWriter.validateTenantTelemetryWriteAdapterResult(stagedResult);
     this.assertTenantTelemetryWriterGlobalRelations();
@@ -24153,6 +24489,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const current = this.tenantTelemetryWriteJobs.get(
       stagedAuthorization.writeOperationSha256,
     );
+    if (current?.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA) {
+      if (!freshProof || !this.persistedProviderCaptureActivation) throw new PersistedCapture.PersistedProviderCaptureConflictError("v2 ACK requires a fresh configured-fleet identity");
+      PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(this.persistedProviderCaptureActivation), freshProof);
+      this.verifyMemoryPersistedProviderFailure(this.persistedProviderFailureReceipts.get(current.writeOperationSha256)!);
+    }
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
     if (current.phase === "written") {
       const ack = this.tenantTelemetryWriteAcks.get(current.writeOperationSha256);
@@ -24582,9 +24923,22 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     }
   }
 
+  async commitPersistedProviderStepFailure(input: PersistedCapture.CommitPersistedProviderStepFailureInput): Promise<PersistedCapture.CommitPersistedProviderStepFailureResult> {
+    if (this.memoryOptions.tenantTelemetryPersistedProviderCaptureLocalOnly !== true) throw new PersistedCapture.PersistedProviderCaptureConflictError("persisted provider capture is local-only");
+    const captured = PersistedCapture.captureTrustedPersistedProviderFailureInput(input, this.tenantTelemetryRefKeyForUse());
+    const context: { input: PersistedCapture.CommitPersistedProviderStepFailureInput; result?: PersistedCapture.CommitPersistedProviderStepFailureResult } = { input: captured };
+    this.persistedProviderCaptureCommitContexts.set(captured.batch, context);
+    try {
+      await this.commit(captured.batch);
+      if (!context.result) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      return context.result;
+    } finally { this.persistedProviderCaptureCommitContexts.delete(captured.batch); }
+  }
+
   async commit(batch: CommitBatch): Promise<CommitResult> {
     assertNoCallerOrdinaryDeleteOrigin(batch.lifecycle);
     const ordinaryDeleteGraceOrigin = this.ordinaryDeleteCommitBatches.has(batch);
+    const captureContext = this.persistedProviderCaptureCommitContexts.get(batch);
     assertPureFenceClaim(batch);
     assertTombstoneEvent(batch);
     assertCommitResourceOwnership(batch);
@@ -24597,6 +24951,27 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new SessionGoneError(batch.sessionId);
     }
     if (batch.fence < s.fenceToken) throw new FenceError(batch.sessionId, batch.fence, s.fenceToken);
+    const captureControl = this.assertMemoryPersistedProviderCaptureControl();
+    if (captureContext) {
+      if (!captureControl || captureContext.input.source.tenantId !== s.tenantId || captureContext.input.source.userId !== s.userId
+        || this.tenantRestoreFences.has(s.tenantId)) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+      PersistedCapture.assertPersistedProviderCaptureExpectedProof(PersistedCapture.persistedProviderCaptureProofFromReceipt(captureControl), captureContext.input.freshProof);
+      const source = captureContext.input.source;
+      const original = this.persistedProviderFailureReceiptForSource({ tenantId: source.tenantId, sessionId: batch.sessionId, turnId: source.turnId, itemId: source.itemId, stepIndex: source.stepIndex });
+      if (original) {
+        this.verifyMemoryPersistedProviderFailure(original);
+        const job = this.tenantTelemetryWriteJobs.get(original.writeOperationSha256)!;
+        const payload = TenantTelemetryWriter.canonicalizeTenantTelemetryArtifactPayload({ schema: TenantTelemetryWriter.TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, domain: "logs", records: [captureContext.input.record] });
+        if (batch.fence !== original.fenceToken || s.fenceToken !== original.fenceToken
+          || original.businessBatchSha256 !== PersistedCapture.persistedProviderFailureBusinessBatchSha256(batch)
+          || original.payloadSha256 !== TenantTelemetryWriter.tenantTelemetryArtifactPayloadSha256(payload)
+          || job.inventory.runtimeEpochSha256 !== captureContext.input.freshProof.runtimeEpochSha256) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+        const events = (this.events.get(s.id) ?? []).filter((e) => e.seq > original.beginLastSeq && e.seq <= original.endLastSeq).map(clone);
+        const replay = { events, lastSeq: original.endLastSeq, failureCommitReceipt: clone(original), replayed: true };
+        captureContext.result = replay;
+        return replay;
+      }
+    }
     if (batch.lifecycle) {
       if (
         (batch.lifecycle.type === "archive" || batch.lifecycle.type === "tombstone")
@@ -24773,7 +25148,60 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     ));
     assignItemSeqs(stagedItems, stagedEvents, seq);
     assignTurnSeqEnd(stagedTurn, stagedEvents, seq);
+    const stagedFailureClasses = new Map<string, { classification: "runtime_unknown" | "provider_step_error"; generation:0|1; operationSha256?: string }>();
+    let captureWrite: ReturnType<typeof PersistedCapture.createPersistedProviderFailureWriteSet> | undefined;
+    if (captureContext) {
+      const input = captureContext.input;
+      const key = this.tenantTelemetryRefKeyForUse();
+      const sessionRef = telemetryCaptureLogsSourceRefSha256("session", s.tenantId, s.id, key);
+      const turnRef = telemetryCaptureLogsSourceRefSha256("turn", s.tenantId, input.source.turnId, key);
+      if ([...this.persistedProviderCaptureBindings.values()].some((b) => b.sourceSessionRefSha256 === sessionRef && b.sourceTurnRefSha256 === turnRef && b.sourceStepIndex === input.source.stepIndex)) throw new PersistedCapture.PersistedProviderCaptureConflictError("provider step already has a source");
+      const payload = TenantTelemetryWriter.canonicalizeTenantTelemetryArtifactPayload({ schema: TenantTelemetryWriter.TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, domain: "logs", records: [input.record] });
+      const now = this.storeNowMs();
+      const staged = this.stageMemoryTenantTelemetryWrite({ tenantId: s.tenantId, expectedControlGeneration: 1, domain: "logs",
+        artifactIdSha256: PersistedCapture.persistedProviderFailureArtifactSha256(input.source, s.id, input.freshProof, key), artifactGeneration: 1,
+        ownerKind: "session", ownerId: s.id, ownerUserId: s.userId, sourceSchema: PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA,
+        sourceGeneration: 1, sourceHighWaterDbMs: now, payload }, payload, true);
+      if (this.tenantTelemetryWriteJobs.has(staged.operationSha256)) throw new PersistedCapture.PersistedProviderCaptureConflictError();
+      const fact = [...stagedBillingFacts.values()][0];
+      if (!fact) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      captureWrite = PersistedCapture.createPersistedProviderFailureWriteSet({ input, key, beginLastSeq: s.lastSeq, events: stagedEvents,
+        coverage: this.persistedProviderCaptureCoverages.get(s.tenantId)!, inventory: staged.inventory, target: staged.target,
+        operationSha256: staged.operationSha256, billingRootSha256: PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-billing-v2", fact) });
+    }
+    for (const item of stagedItems) {
+      const existingLegacy=this.items.get(item.id);
+      const previousClass=this.persistedProviderFailureClasses.get(item.id);
+      if(captureControl && existingLegacy?.type === "agentMessage" && existingLegacy.status === "failed" && (previousClass?.generation ?? 0) === 0
+        && stagedEvents.some((event)=>event.type === "item/completed" && event.item.id === item.id))throw new PersistedCapture.PersistedProviderCaptureConflictError("pre-cutover failed item cannot gain a post-cutover completion event");
+      if(previousClass && (item.type !== "agentMessage" || item.status !== "failed"))throw new PersistedCapture.PersistedProviderCaptureConflictError("failed-step private classification is immutable");
+      if(existingLegacy?.type === "agentMessage" && existingLegacy.status === "failed"
+        && (previousClass?.classification === "provider_step_error" || (captureControl && (previousClass?.generation ?? 0) === 0))
+        && PersistedCapture.persistedProviderCaptureCanonicalJson(existingLegacy) !== PersistedCapture.persistedProviderCaptureCanonicalJson(item))throw new PersistedCapture.PersistedProviderCaptureConflictError("pre-cutover failed item snapshot is immutable");
+      if (item.type !== "agentMessage" || item.status !== "failed") continue;
+      const previous = this.items.get(item.id);
+      const classification = this.persistedProviderFailureClasses.get(item.id);
+      const isProvider = captureWrite && item.id === captureContext!.input.source.itemId;
+      if (classification) {
+        if (isProvider || (classification.classification === "provider_step_error"
+          && (PersistedCapture.persistedProviderCaptureCanonicalJson(previous) !== PersistedCapture.persistedProviderCaptureCanonicalJson(item)
+            || stagedEvents.some((e)=>e.type === "item/completed" && e.item.id === item.id)))) throw new PersistedCapture.PersistedProviderCaptureConflictError("failure classification and source are immutable");
+        continue;
+      }
+      if (previous?.status === "failed") {
+        if (isProvider) throw new PersistedCapture.PersistedProviderCaptureConflictError("legacy failed item cannot gain provider provenance");
+        continue;
+      }
+      stagedFailureClasses.set(item.id, isProvider ? { classification: "provider_step_error", generation:1, operationSha256: captureWrite!.job.writeOperationSha256 } : { classification: "runtime_unknown", generation:captureControl ? 1 : 0 });
+    }
+    if(captureControl)for(const event of stagedEvents){
+      if(event.type !== "item/completed" || event.item.type !== "agentMessage" || event.item.status !== "failed")continue;
+      const item=stagedItems.find((candidate)=>candidate.id === event.item.id);
+      const classification=stagedFailureClasses.get(event.item.id) ?? this.persistedProviderFailureClasses.get(event.item.id);
+      if(!item || item.type !== "agentMessage" || item.status !== "failed" || classification?.generation !== 1)throw new PersistedCapture.PersistedProviderCaptureConflictError("active failed completion requires its exact classified canonical item");
+    }
     const resultEvents = stagedEvents.map(clone);
+    const captureResult=captureWrite ? {events:resultEvents,lastSeq:seq,failureCommitReceipt:clone(captureWrite.receipt),replayed:false} : undefined;
     const stagedOutboxes: [string, LifecycleOutboxRecord][] = [];
     if (stagedLifecycle?.type === "tombstone") {
       const deletedEvent = stagedEvents.at(-1);
@@ -24860,6 +25288,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     for (const a of stagedApprovals) this.approvals.set(a.id, a);
     this.usageLedger.push(...stagedUsage);
     for (const [usageId, fact] of stagedBillingFacts) this.billingUsageFacts.set(usageId, fact);
+    for (const [itemId, classification] of stagedFailureClasses) this.persistedProviderFailureClasses.set(itemId, classification);
+    if (captureWrite) {
+      const operation = captureWrite.job.writeOperationSha256;
+      this.persistedProviderCaptureBindings.set(operation, captureWrite.binding);
+      this.persistedProviderFailureReceipts.set(operation, captureWrite.receipt);
+      this.tenantTelemetryArtifactMemberships.set(operation, captureWrite.membership);
+      this.tenantTelemetryWriteJobs.set(operation, captureWrite.job);
+      this.tenantTelemetryWritePayloads.set(operation, captureWrite.payload);
+      captureContext!.result = captureResult!;
+    }
     if (batch.idempotency && idemMapKey && stagedIdempotencyValue) {
       this.idem.set(idemMapKey, {
         value: stagedIdempotencyValue,
@@ -26051,6 +26489,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const telemetryApplicationCoveragesBefore = new Map(
       this.tenantTelemetryApplicationCoverages,
     );
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     try {
       if (tenantLifecycleStage.lifecycle) {
@@ -26098,6 +26537,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         telemetryApplicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapSnapshot(this.providers, providersBefore);
       restoreMapSnapshot(this.tenants, tenantsBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
@@ -26294,6 +26734,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const coverageExisted = this.tenantTelemetryLifecycleCoverages.has(tenantId);
     const priorCoverage = this.tenantTelemetryLifecycleCoverages.get(tenantId);
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     try {
       if (tenantLifecycleStage.lifecycle) {
@@ -26332,6 +26773,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         applicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapEntry(this.tenants, tenantId, tenantExisted, priorTenant);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
       restoreMapEntry(
@@ -26526,6 +26968,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const telemetryApplicationCoveragesBefore = new Map(
       this.tenantTelemetryApplicationCoverages,
     );
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     const lifecyclesBefore = new Map(this.subjectLifecycles);
     try {
       if (tenantLifecycleStage.lifecycle) {
@@ -26562,6 +27005,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         telemetryApplicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapSnapshot(this.tenants, tenantsBefore);
       restoreMapSnapshot(this.subjectLifecycles, lifecyclesBefore);
       restoreMapSnapshot(this.tenantCredentialTrackingSubjects, subjectsBefore);
@@ -26939,6 +27383,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       OrdinaryUsageRetention.assertOrdinaryUsageRetentionFacts(record, facts, existing);
       return clone(existing);
     }
+    this.assertNoPersistedProviderUsageDeletion(rows);
     this.assertSubjectWritable(input.tenantId, input.userId);
     if (!this.subjectRecord(input.tenantId, "tenant", input.tenantId)
       || !this.subjectRecord(input.tenantId, "user", input.userId)
@@ -27029,6 +27474,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (targetRows.length !== 0) throw new UsageReconciliationError("operational usage reappeared after anonymization");
       return clone(record);
     }
+    this.assertNoPersistedProviderUsageDeletion(targetRows);
     assertUsageAnonymizationAllowed(input, legalHoldActive);
     if (input.nowMs < record.verifiedAtMs) {
       throw new UsageReconciliationError("anonymization cannot precede verification");
@@ -27643,6 +28089,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const coverageExisted = this.tenantTelemetryLifecycleCoverages.has(stagedInput.tenantId);
     const priorCoverage = this.tenantTelemetryLifecycleCoverages.get(stagedInput.tenantId);
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
+    const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     try {
       if (!tenant) this.subjectLifecycles.set(tenantKey, clone(stagedTenant));
       if (tenantStage.coverage) {
@@ -27665,6 +28112,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         this.tenantTelemetryApplicationCoverages,
         applicationCoveragesBefore,
       );
+      restoreMapSnapshot(this.persistedProviderCaptureCoverages, persistedCaptureCoveragesBefore);
       restoreMapEntry(
         this.tenantTelemetryLifecycleCoverages,
         stagedInput.tenantId,

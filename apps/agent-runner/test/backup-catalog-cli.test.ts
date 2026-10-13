@@ -344,6 +344,50 @@ async function externalAvailability(
 }
 
 describe("backup catalog artifact CLI orchestration", () => {
+  it("passes one protected exact key to source and restored target, then zeroes only the operator buffer", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    const keys: Buffer[] = [];
+    const storeCopies: Buffer[] = [];
+    state.dependencies.readRefKey = async () => { const key = Buffer.alloc(32, 0x51); keys.push(key); return key; };
+    state.connectStore.mockImplementation(async (options) => {
+      expect(options.migrationMode).toBe("verify");
+      expect(options.tenantTelemetryRefKey instanceof Uint8Array).toBe(true);
+      const bytes = options.tenantTelemetryRefKey!;
+      expect(bytes.length).toBe(32);
+      expect(bytes.every((byte) => byte === 0x51), "exact protected bytes must reach each store").toBe(true);
+      storeCopies.push(Buffer.from(bytes));
+      return state.store;
+    });
+    const env = { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/protected-ref-key" };
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(env), state.dependencies);
+    state.connectStore.mockClear();
+    await runBackupCatalogCli(["restore-selected"], artifactEnv({ ...env,
+      RESTORE_RUN_ID, BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID,
+      BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/keyed_target",
+    }), state.dependencies);
+    expect(state.connectStore).toHaveBeenCalledTimes(2);
+    expect(artifacts.imported).toHaveBeenCalledOnce();
+    expect(keys.every((key) => key.every((byte) => byte === 0)), "operator buffers are zeroed after closure").toBe(true);
+    expect(storeCopies.every((key) => key.every((byte) => byte === 0x51)), "store-owned copies are not prematurely zeroed").toBe(true);
+    storeCopies.forEach((key) => key.fill(0));
+    expect(state.output.join("\n")).not.toContain("protected-ref-key");
+  });
+
+  it("bounds protected key acquisition with the artifact operation budget and zeroes a late reader result", async () => {
+    const state = createHarness();
+    const key = Buffer.alloc(32, 0x53);
+    state.dependencies.readRefKey = () => new Promise((resolve) => { setTimeout(() => resolve(key), 30); });
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv({
+      TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/bounded-ref-key", BACKUP_ARTIFACT_DEADLINE_MS: "10",
+    }), state.dependencies)).rejects.toThrow("operation_deadline");
+    expect(key.every((byte) => byte === 0), "late protected key must be zeroed").toBe(true);
+    expect(state.connectStore).not.toHaveBeenCalled();
+    expect(state.createCatalogAdapter).not.toHaveBeenCalled();
+    expect(state.output).toEqual([]);
+  });
+
   it("formats only a known deadline code and never exposes arbitrary core error text", () => {
     expect(formatBackupCatalogCliError(new MySqlBackupArtifactError("operation_deadline")))
       .toBe('{"status":"error","code":"operation_deadline"}');
@@ -640,6 +684,44 @@ describe("backup catalog artifact CLI orchestration", () => {
 });
 
 describe("backup catalog CLI", () => {
+  it("keeps inactive keyless status compatible and accepts a protected key without constructing S3", async () => {
+    const state = createHarness();
+    await runBackupCatalogCli(["status"], baseEnv(), state.dependencies);
+    expect(state.connectStore.mock.calls.at(-1)![0].tenantTelemetryRefKey).toBeUndefined();
+    const key = Buffer.alloc(32, 0x29);
+    state.dependencies.readRefKey = async () => key;
+    state.connectStore.mockImplementation(async (input) => {
+      expect(input.tenantTelemetryRefKey instanceof Uint8Array).toBe(true);
+      expect(input.tenantTelemetryRefKey!.every((byte) => byte === 0x29), "exact key required").toBe(true);
+      return state.store;
+    });
+    await runBackupCatalogCli(["status"], baseEnv({ TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/ref-key" }), state.dependencies);
+    expect(key.every((byte) => byte === 0), "operator buffer must be zeroed").toBe(true);
+    expect(state.createCatalogAdapter).not.toHaveBeenCalled();
+  });
+
+  it.each([{ TENANT_TELEMETRY_REF_KEY: "" }, { TENANT_TELEMETRY_REF_KEY: "private-key" },
+    { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "" }, { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "relative" }])(
+    "rejects ambient hex and invalid operator key authority before external resources %#", async (extra) => {
+      const state = createHarness();
+      const failure = await runBackupCatalogCli(["status"], baseEnv(extra), state.dependencies).catch((error: unknown) => error);
+      expect(formatBackupCatalogCliError(failure)).toBe('{"status":"error","code":"invalid_configuration"}');
+      expect(state.connectStore).not.toHaveBeenCalled();
+      expect(state.createCatalogAdapter).not.toHaveBeenCalled();
+    });
+
+  it("zeros the protected buffer when strict startup rejects and never emits success", async () => {
+    const state = createHarness();
+    const key = Buffer.alloc(32, 0x37);
+    state.dependencies.readRefKey = async () => key;
+    state.connectStore.mockImplementation(async () => { throw new Error("private-audit-details"); });
+    const failure = await runBackupCatalogCli(["status"], baseEnv({ TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/ref-key" }), state.dependencies)
+      .catch((error: unknown) => error);
+    expect(formatBackupCatalogCliError(failure)).toBe('{"status":"error","code":"operation_failed"}');
+    expect(key.every((byte) => byte === 0), "rejected startup must zero the operator buffer").toBe(true);
+    expect(state.output).toEqual([]);
+  });
+
   it("rejects invalid authority before loading config, constructing clients, or connecting", async () => {
     const state = createHarness();
     const privateMarker = "private-invalid-authority-marker";

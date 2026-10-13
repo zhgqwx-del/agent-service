@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 const RESTORE_AUTHORITY_ENV = [
   "NODE_ENV",
   "MYSQL_URL",
+  "TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE",
   "RESTORE_RUN_ID",
   "RESTORE_FLEET_STOPPED_ACK",
   "SOURCE_BACKUP_SHA256",
@@ -83,7 +84,7 @@ describe("local restore-ledger-reconcile wrapper", () => {
       dotenvValues.MYSQL_URL = "mysql://dotenv-user:dotenv-secret@dotenv-db/dotenv";
       await writeFile(
         join(root, ".env"),
-        `${RESTORE_AUTHORITY_ENV.map((name) => `${name}=${dotenvValues[name]}`).join("\n")}\n`,
+        `${RESTORE_AUTHORITY_ENV.map((name) => `${name}=${dotenvValues[name]}`).join("\n")}\nTENANT_TELEMETRY_REF_KEY=dotenv-application-hex\n`,
         { mode: 0o600 },
       );
 
@@ -101,6 +102,7 @@ if [ "\${1-}" != "--import" ] \
   printf 'unexpected restore wrapper arguments\\n' >&2
   exit 41
 fi
+test "\${TENANT_TELEMETRY_REF_KEY+x}" != x || exit 46
 for name in ${RESTORE_AUTHORITY_ENV.join(" ")}; do
   expected_name="TEST_EXPECT_\${name}"
   if [ "\${!name+x}" != x ] || [ "\${!name}" != "\${!expected_name}" ]; then
@@ -120,6 +122,7 @@ printf 'restore-wrapper-ok\\n'
       callerValues.NODE_ENV = "production";
       callerValues.MYSQL_URL = "mysql://caller-user:caller-secret@caller-db/caller";
       callerValues.RESTORE_REPLAY_PAGE_SIZE = "";
+      callerValues.TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE = "";
       callerValues.RESTORE_JOURNAL_S3_SESSION_TOKEN = "";
       callerValues.TENANT_RESTORE_JOURNAL_WORKER_ENABLED = "";
       callerValues.AWS_PROFILE = "";

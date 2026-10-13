@@ -118,7 +118,7 @@ function createHarness() {
   } as unknown as TenantRestoreJournalRuntimeConfig);
   let config = runtimeConfig("restore-cli-primary-epoch-v1");
   const output: string[] = [];
-  const connectStore = vi.fn(async () => store);
+  const connectStore = vi.fn(async (_options: Parameters<RestoreLedgerReconcileCliDependencies["connectStore"]>[0]) => store);
   const createAdapters = vi.fn(() => [adapter]);
   const loadJournalConfig = vi.fn(() => config);
   const dependencies: RestoreLedgerReconcileCliDependencies = {
@@ -161,6 +161,49 @@ async function prepareSealedRestore(
 }
 
 describe("restore-ledger-reconcile CLI", () => {
+  it("passes protected raw bytes into verify-only status and preserves an independent store-owned copy", async () => {
+    const state = createHarness();
+    const key = Buffer.alloc(32, 0x43);
+    let ownedCopy: Buffer | undefined;
+    state.dependencies.readRefKey = async () => key;
+    state.connectStore.mockImplementation(async (input) => {
+      expect(input.migrationMode).toBe("verify");
+      expect(input.tenantTelemetryRefKey instanceof Uint8Array).toBe(true);
+      expect(input.tenantTelemetryRefKey!.length).toBe(32);
+      expect(input.tenantTelemetryRefKey!.every((byte) => byte === 0x43), "exact protected key required").toBe(true);
+      ownedCopy = Buffer.from(input.tenantTelemetryRefKey!);
+      return state.store;
+    });
+    await runRestoreLedgerReconcileCli(["status"], baseEnv({ TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/ref-key" }), state.dependencies);
+    expect(key.every((byte) => byte === 0), "operator buffer must be zeroed").toBe(true);
+    expect(ownedCopy!.every((byte) => byte === 0x43), "store copy must remain valid until store closure").toBe(true);
+    ownedCopy!.fill(0);
+    expect(state.createAdapters).not.toHaveBeenCalled();
+    expect(state.output.join("\n")).not.toContain("ref-key");
+  });
+
+  it.each([{ TENANT_TELEMETRY_REF_KEY: "" }, { TENANT_TELEMETRY_REF_KEY: "private-key" },
+    { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "" }, { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "relative" }])(
+    "rejects ambient application key and invalid operator key input before connection %#", async (extra) => {
+      const state = createHarness();
+      const failure = await runRestoreLedgerReconcileCli(["status"], baseEnv(extra), state.dependencies).catch((error: unknown) => error);
+      expect(formatRestoreLedgerReconcileCliError(failure)).toBe('{"status":"error","code":"invalid_configuration"}');
+      expect(state.connectStore).not.toHaveBeenCalled();
+      expect(state.createAdapters).not.toHaveBeenCalled();
+    });
+
+  it("zeros its key and preserves fail-closed startup without leaking audit diagnostics", async () => {
+    const state = createHarness();
+    const key = Buffer.alloc(32, 0x47);
+    state.dependencies.readRefKey = async () => key;
+    state.connectStore.mockImplementation(async () => { throw new Error("private-DB-key-audit-details"); });
+    const failure = await runRestoreLedgerReconcileCli(["status"], baseEnv({ TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/ref-key" }), state.dependencies)
+      .catch((error: unknown) => error);
+    expect(formatRestoreLedgerReconcileCliError(failure)).toBe('{"status":"error","code":"operation_failed"}');
+    expect(key.every((byte) => byte === 0), "startup rejection must zero key").toBe(true);
+    expect(state.output).toEqual([]);
+  });
+
   it("activates an empty primary, replays a sealed rollback fence, and explicitly activates epoch N+1", async () => {
     const state = createHarness();
     await activatePrimary(state);

@@ -270,6 +270,79 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     });
   }, 180_000);
 
+  it("backs up active 0033 with a protected exact key, restores real bytes, and seals explicit restore-ledger verification", async () => independentFixture(async () => {
+    const keyFile = join(fixture.privateDirectory, "telemetry-ref-key.bin");
+    const wrongKeyFile = join(fixture.privateDirectory, "wrong-telemetry-ref-key.bin");
+    const refKey = randomBytes(32);
+    const wrongKey = randomBytes(32);
+    await writeFile(keyFile, refKey, { mode: 0o600, flag: "wx" });
+    await writeFile(wrongKeyFile, wrongKey, { mode: 0o600, flag: "wx" });
+    const keyedStoreAt = async <T>(url: string, action: (store: MysqlSessionStore) => Promise<T>): Promise<T> => {
+      const store = await MysqlSessionStore.connect({ url, connectionLimit: 2, migrationMode: "verify", tenantTelemetryRefKey: refKey });
+      try { return await action(store); } finally { await store.close(); }
+    };
+    try {
+      const activated = await keyedStoreAt(fixture.sourceUrl, (store) => store.activateTenantTelemetryLifecycle({
+        expectedControlGeneration: 0,
+        // These content-free lifecycle identities exercise 0033 startup audit only. This
+        // case does not configure a telemetry sink or activate application capture.
+        targets: (["logs", "traces"] as const).map((domain) => ({
+          domain, backendKind: "backup-fixture", adapterProtocol: "backup-active-telemetry-fixture-v1",
+          namespaceSha256: sha256(Buffer.from(`telemetry-namespace-${fixture.runId}-${domain}`)),
+          failureDomainSha256: sha256(Buffer.from(`telemetry-domain-${fixture.runId}-${domain}`)),
+        })),
+      }));
+      for (const badFile of [undefined, wrongKeyFile]) {
+        for (const restoreLedger of [false, true]) {
+          await failure(await fixture.command("status", { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: badFile }, {}, restoreLedger));
+        }
+      }
+      const backupId = newTenantBackupId();
+      const keyEnv = { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: keyFile, BACKUP_ID: backupId };
+      const created = await success(await fixture.command("create-artifact", keyEnv));
+      expect(created).toMatchObject({ command: "create-artifact", artifactVerified: true, backupId });
+      const ciphertext = await readFile(artifactPath(fixture, backupId));
+      expect(ciphertext.includes(refKey), "backup must not serialize a process-only ref key").toBe(false);
+      expect(await success(await fixture.command("verify-artifact", keyEnv))).toMatchObject({ artifactVerified: true });
+      const targetUrl = await fixture.newDatabase();
+      const restoreRunId = `restore_${randomUUID()}`;
+      const epochId = `active-telemetry-restored-${randomUUID()}`;
+      const restored = await fixture.command("restore-selected", { ...keyEnv,
+        RESTORE_RUN_ID: restoreRunId, BACKUP_RUNTIME_EPOCH_ID: epochId,
+        BACKUP_RESTORE_TARGET_MYSQL_URL: targetUrl,
+      });
+      expect(await success(restored)).toMatchObject({ restorePhase: "prepared", runtimeActivated: false });
+      const targetEnv = { ...keyEnv, MYSQL_URL: targetUrl, RESTORE_RUN_ID: restoreRunId,
+        BACKUP_RUNTIME_EPOCH_ID: epochId, SOURCE_BACKUP_SHA256: String(created.sourceBackupSha256) };
+      expect(await success(await fixture.command("replay-fences", targetEnv, {}, true))).toMatchObject({ restorePhase: "prepared" });
+      expect(await success(await fixture.command("verify", targetEnv, {}, true))).toMatchObject({ command: "verify", restorePhase: "replay_sealed" });
+      expect(await success(await fixture.command("status", targetEnv, {}, true))).toMatchObject({ restorePhase: "replay_sealed" });
+      await keyedStoreAt(targetUrl, async (store) => {
+        expect(await store.getTenantTelemetryLifecycleControl()).toEqual(activated.control);
+        expect(await store.listTenantTelemetryLifecycleTargets()).toEqual(activated.targets);
+        expect(await store.getTenantTelemetryLifecycleCoverage(fixture.tenantId)).toMatchObject({ historyStatus: "legacy_history_unknown" });
+        expect(await store.getTenantRestoreReplayRun(restoreRunId)).toMatchObject({ phase: "replay_sealed" });
+        expect(await store.getSession(fixture.tenantId, fixture.session.id)).toMatchObject({ metadata: { fixtureContent: fixture.payloadCanary } });
+        expect(await store.getTenantTelemetryPersistedProviderCaptureControl()).toMatchObject({ state: "inactive", controlGeneration: 0 });
+      });
+      const independent = await mysql.createConnection(targetUrl);
+      try {
+        const [rows] = await independent.query<RowDataPacket[]>(
+          "SELECT receipt_sha256,ref_key_id_sha256 FROM tenant_telemetry_activation_receipts WHERE singleton_id=1",
+        );
+        expect(rows).toEqual([{ receipt_sha256: activated.receipt.receiptSha256, ref_key_id_sha256: activated.receipt.refKeyIdSha256 }]);
+      } finally { await independent.end(); }
+      for (const badFile of [undefined, wrongKeyFile]) {
+        await failure(await fixture.command("status", { ...targetEnv, TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: badFile }, {}, true));
+      }
+      for (const result of [restored]) {
+        for (const key of [refKey, wrongKey]) for (const encoding of ["hex", "base64"] as const) {
+          expect((result.stdout + result.stderr).includes(key.toString(encoding)), "ref key must not appear in CLI output").toBe(false);
+        }
+      }
+    } finally { refKey.fill(0); wrongKey.fill(0); }
+  }), 240_000);
+
   it("reuses the identical artifact after a real external availability commit loses its response", async () => independentFixture(async () => {
     const newerBackupId = newTenantBackupId();
     const createAdapter = loseOneCatalogResponse(createTenantBackupCatalogAdapter, "publishAvailability");

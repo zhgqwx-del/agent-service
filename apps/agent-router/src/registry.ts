@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { Redis } from "ioredis";
 import {
   Capabilities,
@@ -29,6 +29,19 @@ import {
   tenantRuntimeFleetSha256,
   tenantRuntimeTargetSha256,
   type BlobStorageCapability,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_HEADER,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_VALUE,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_NONCE_HEADER,
+  PERSISTED_PROVIDER_CAPTURE_FLEET_PROTOCOL,
+  PersistedProviderCaptureRunnerReady,
+  awaitPersistedProviderCaptureResponse,
+  persistedProviderCaptureBindingsEqual,
+  persistedProviderCaptureConfiguredFleetRootSha256,
+  persistedProviderCaptureFleetObservationSha256,
+  readPersistedProviderCaptureJson,
+  type PersistedProviderCaptureFleetRequest,
+  type PersistedProviderCaptureFleetProof,
 } from "@agent-service/protocol";
 
 /**
@@ -71,6 +84,8 @@ export interface RunnerRegistryOptions {
   virtualNodes?: number;
   healthTimeoutMs?: number;
   redisCommandTimeoutMs?: number;
+  /** Test seam for direct private capture probes; never a routing/healthy-pool shortcut. */
+  captureFetchImpl?: typeof globalThis.fetch;
 }
 
 export interface TenantRuntimeDrainTarget {
@@ -159,6 +174,7 @@ export class RunnerRegistry {
   /** Serialized retention requests are separate from the tracker of an actual fleet probe. */
   private ordinarySessionUsageRetentionQueue: Promise<void> = Promise.resolve();
   private ordinarySessionUsageRetentionClosing = false;
+  private persistedProviderCaptureClosing = false;
 
   constructor(private readonly opts: RunnerRegistryOptions) {
     for (const url of opts.runners) {
@@ -198,6 +214,7 @@ export class RunnerRegistry {
   async close(): Promise<void> {
     clearInterval(this.timer);
     this.ordinarySessionUsageRetentionClosing = true;
+    this.persistedProviderCaptureClosing = true;
     await this.ordinarySessionUsageRetentionQueue;
     await this.checkInFlight?.catch(() => {});
     await this.redis?.quit().catch(() => {});
@@ -871,6 +888,53 @@ export class RunnerRegistry {
       fleetSha256: tenantRuntimeFleetSha256(sorted),
       targets: Object.freeze(sorted),
     });
+  }
+
+  /** Independent, nonce-bound all-configured probes. No health cache, sticky state or port fallback. */
+  async freshPersistedProviderCaptureSnapshot(request: PersistedProviderCaptureFleetRequest, signal: AbortSignal): Promise<{
+    proof: PersistedProviderCaptureFleetProof; fleetObservationSha256: string;
+  }> {
+    signal.throwIfAborted();
+    if (this.persistedProviderCaptureClosing || !this.opts.internalRouterToken) throw new Error("capture fleet is closed");
+    const configured = [...this.targets.values()];
+    if (!configured.length || configured.length > 100) throw new Error("capture fleet size is invalid");
+    const fetchImpl = this.opts.captureFetchImpl ?? globalThis.fetch;
+    const targets = await Promise.all(configured.map(async (target) => {
+      const boundarySignal = AbortSignal.any([signal, AbortSignal.timeout(this.opts.healthTimeoutMs ?? 2_000)]);
+      const nonce = randomBytes(32).toString("hex");
+      const response = await awaitPersistedProviderCaptureResponse(fetchImpl(
+        `${target.url}${INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH}`, {
+          method: "GET", redirect: "manual", signal: boundarySignal,
+          headers: {
+            [INTERNAL_ROUTER_TOKEN_HEADER]: this.opts.internalRouterToken!,
+            [INTERNAL_PERSISTED_PROVIDER_CAPTURE_NONCE_HEADER]: nonce,
+            [TRACEPARENT_HEADER]: outgoingTraceparent(),
+          },
+        },
+      ), boundarySignal);
+      if (response.status !== 200
+        || response.headers.get(INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_HEADER) !== INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_VALUE
+        || !response.headers.get("cache-control")?.split(",").some((value) => value.trim().toLowerCase() === "no-store")) {
+        void response.body?.cancel().catch(() => {});
+        throw new Error("configured capture target did not attest");
+      }
+      const ready = PersistedProviderCaptureRunnerReady.parse(await readPersistedProviderCaptureJson(response, boundarySignal));
+      if (ready.nonce !== nonce || ready.configuredFleetRootSha256 !== request.configuredFleetRootSha256
+        || !persistedProviderCaptureBindingsEqual(ready.binding, request.binding)) throw new Error("configured capture target identity drifted");
+      return { url: target.url, runnerId: ready.runnerId, bootId: ready.bootId };
+    }));
+    signal.throwIfAborted();
+    if (this.persistedProviderCaptureClosing
+      || new Set(targets.map((target) => target.runnerId)).size !== targets.length
+      || new Set(targets.map((target) => target.bootId)).size !== targets.length
+      || targets.filter((target) => target.runnerId === request.runnerId && target.bootId === request.bootId).length !== 1
+      || persistedProviderCaptureConfiguredFleetRootSha256(targets) !== request.configuredFleetRootSha256) {
+      throw new Error("configured capture fleet or requester identity is invalid");
+    }
+    return {
+      proof: { ...request.binding, protocol: PERSISTED_PROVIDER_CAPTURE_FLEET_PROTOCOL, configuredFleetRootSha256: request.configuredFleetRootSha256 },
+      fleetObservationSha256: persistedProviderCaptureFleetObservationSha256(targets),
+    };
   }
 
   /**

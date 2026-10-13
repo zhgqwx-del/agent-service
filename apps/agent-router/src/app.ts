@@ -91,6 +91,12 @@ import {
   tenantRuntimeTargetReceiptsSha256,
   withTraceContext,
   type StructuredTelemetry,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_FLEET_PATH,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_HEADER,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_VALUE,
+  PersistedProviderCaptureFleetRequest,
+  PersistedProviderCaptureFleetResponse,
+  readPersistedProviderCaptureJson,
 } from "@agent-service/protocol";
 import type { RunnerRegistry } from "./registry.js";
 
@@ -138,6 +144,7 @@ export interface RouterAppDeps {
   tenantDatabasePurgeEnabled?: () => boolean;
   /** Independent default-off ordinary DELETE operational-usage barrier; not session content. */
   ordinarySessionUsageRetentionEnabled?: () => boolean;
+  persistedProviderFailureCaptureFleetEnabled?: () => boolean;
   /** Independent activation gate for T3g Redis session-state deletion queue claims. */
   tenantRedisPurgeEnabled?: () => boolean;
   /** Expected content-free namespace identity projected only after all runners match it. */
@@ -850,6 +857,30 @@ export function createRouterApp(deps: RouterAppDeps) {
     );
     return c.body(null, 204);
   });
+
+  /** Each persisted provider boundary requires a fresh all-configured, non-sticky writer proof. */
+  app.post(INTERNAL_PERSISTED_PROVIDER_CAPTURE_FLEET_PATH, async (c) => {
+    privateInternalHeaders(c);
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRunnerToken)) return internalNotFound(c);
+    if (!(deps.ready?.() ?? true) || !(deps.persistedProviderFailureCaptureFleetEnabled?.() ?? false)) return c.body(null, 503);
+    const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]);
+    try {
+      const request = PersistedProviderCaptureFleetRequest.parse(await readPersistedProviderCaptureJson(new Response(c.req.raw.body, {
+        headers: c.req.raw.headers,
+      }), signal));
+      const snapshot = await deps.registry.freshPersistedProviderCaptureSnapshot(request, signal);
+      const result = PersistedProviderCaptureFleetResponse.parse({
+        nonce: request.nonce, runnerId: request.runnerId, bootId: request.bootId,
+        boundary: request.boundary, ...snapshot,
+      });
+      signal.throwIfAborted();
+      if (!(deps.ready?.() ?? true) || !(deps.persistedProviderFailureCaptureFleetEnabled?.() ?? false)) return c.body(null, 503);
+      c.header(INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_HEADER, INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_VALUE);
+      return c.json(result, 200);
+    } catch { return c.body(null, 503); }
+  });
+  app.all(INTERNAL_PERSISTED_PROVIDER_CAPTURE_FLEET_PATH, (c) => { privateInternalHeaders(c); return internalNotFound(c); });
+  app.all(`${INTERNAL_PERSISTED_PROVIDER_CAPTURE_FLEET_PATH}/*`, (c) => { privateInternalHeaders(c); return internalNotFound(c); });
 
   /** Each ordinary usage boundary requires a fresh all-configured, non-sticky worker proof. */
   app.get(INTERNAL_SESSION_USAGE_RETENTION_READY_PATH, async (c) => {

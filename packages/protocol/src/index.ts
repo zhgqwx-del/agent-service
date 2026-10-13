@@ -12,4 +12,5 @@ export * from "./lifecycle.js";
 export * from "./http.js";
 export * from "./telemetry.js";
 export * from "./telemetry-capture.js";
+export * from "./persisted-provider-capture.js";
 export * from "./openapi.generated.js";

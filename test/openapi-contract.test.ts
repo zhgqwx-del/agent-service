@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createRouterApp, type RouterAppDeps } from "../apps/agent-router/src/app.js";
 import { createApp, type AppDeps } from "../apps/agent-runner/src/app.js";
-import { Event, EventStreamEvent } from "../packages/protocol/src/index.js";
+import { Event, EventStreamEvent, INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH } from "../packages/protocol/src/index.js";
 
 const HTTP_METHODS = new Set(["delete", "get", "head", "options", "patch", "post", "put", "trace"]);
 const OPENAPI_FILE = new URL("../packages/protocol/openapi.json", import.meta.url);
@@ -82,6 +82,9 @@ function registeredOperations() {
   return routes
     .filter(({ method }) => HTTP_METHODS.has(method.toLowerCase()))
     .filter(({ path }) => !path.startsWith("/v1/_internal/"))
+    // The fresh capture probe is a private, token-authenticated runner control route outside
+    // the older /v1/_internal namespace. Exclude this exact route, not arbitrary ghost paths.
+    .filter(({ path }) => path !== INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH)
     .map(({ method, path }) => ({
       method: method.toUpperCase(),
       path: path.replace(/:([^/]+)/g, "{$1}"),
@@ -373,7 +376,7 @@ describe("committed OpenAPI contract", () => {
     expect(registeredKeys).toEqual(specKeys);
   });
 
-  it("keeps every versioned router-to-runner control route out of the public OpenAPI/SDK", () => {
+  it("keeps every router-to-runner control route out of the public OpenAPI/SDK", async () => {
     const routes = (runnerApp() as unknown as { routes: RegisteredRoute[] }).routes
       .filter(({ method }) => HTTP_METHODS.has(method.toLowerCase()))
       .map(({ method, path }) => ({ method: method.toUpperCase(), path }));
@@ -391,6 +394,15 @@ describe("committed OpenAPI contract", () => {
       method: "POST",
       path: "/v1/_internal/tenant-erasure-replay-v1",
     });
+    expect(routes).toContainEqual({
+      method: "GET",
+      path: INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH,
+    });
     expect(Object.keys(document.paths).some((path) => path.startsWith("/v1/_internal/"))).toBe(false);
+    expect(Object.keys(document.paths).some((path) => path.startsWith("/_internal/"))).toBe(false);
+    const sdkSchema = await readFile(new URL("../packages/sdk/src/generated/schema.ts", import.meta.url), "utf8");
+    expect(sdkSchema).not.toContain(INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH);
+    expect(sdkSchema).not.toContain("/v1/_internal/");
+    expect(sdkSchema).not.toContain("/_internal/");
   });
 });

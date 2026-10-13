@@ -12,6 +12,26 @@ const productionEnv: NodeJS.ProcessEnv = {
 };
 
 describe("runner configuration", () => {
+  it("keeps persisted provider capture local-only, default-off and tied to an explicit keyed S3 fleet", () => {
+    expect(loadConfig({ SECRETS_MASTER_KEY: SECRET }).PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED).toBe(false);
+    const enabled = {
+      SECRETS_MASTER_KEY: SECRET, STORE: "mysql", RUNNER_ID: "capture-runner-a",
+      ERASURE_ROUTER_URL: "http://router:8080", PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1",
+      TENANT_TELEMETRY_WRITER_ENABLED: "1", TENANT_TELEMETRY_WRITER_ADAPTER: "s3",
+      TENANT_TELEMETRY_REF_KEY: "12".repeat(32), TENANT_TELEMETRY_S3_NAMESPACE_ID: "capture-local",
+      TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID: "local-sink", TENANT_TELEMETRY_S3_BUCKET: "capture-local",
+      TENANT_TELEMETRY_S3_PRIVATE_BUCKET_ACK: "1",
+    };
+    expect(loadConfig(enabled).PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED).toBe(true);
+    for (const key of ["RUNNER_ID", "ERASURE_ROUTER_URL", "TENANT_TELEMETRY_REF_KEY"]) {
+      expect(() => loadConfig({ ...enabled, [key]: undefined })).toThrow(/persisted provider capture/);
+    }
+    expect(() => loadConfig({ ...enabled, STORE: "memory" })).toThrow(/persisted provider capture/);
+    expect(() => loadConfig({ ...productionEnv, PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1" })).toThrow(/local-only/);
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "true" })).toThrow();
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED: "0" })).toThrow(/router-only/);
+    expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, TELEMETRY_CAPTURE_COMMAND: "activate-logs" })).toThrow(/one-shot/);
+  });
   it("keeps ordinary usage retention default-off, bounded, router-bound and non-production only", () => {
     expect(loadConfig({ SECRETS_MASTER_KEY: SECRET }).SESSION_USAGE_RETENTION_WORKER_ENABLED).toBe(false);
     expect(loadConfig({ SECRETS_MASTER_KEY: SECRET, ERASURE_ROUTER_URL: "http://router:8080",
@@ -70,6 +90,8 @@ describe("runner configuration", () => {
       ["TELEMETRY_LIFECYCLE_COMMAND", "activate"],
       ["TELEMETRY_LIFECYCLE_OPERATOR_TOKEN", "do-not-enter-runner"],
       ["TELEMETRY_LIFECYCLE_S3_SECRET_ACCESS_KEY", "do-not-enter-runner"],
+      ["TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE", "/private/operator-only-ref-key"],
+      ["TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE", ""],
     ] as const) {
       expect(() => loadConfig({ SECRETS_MASTER_KEY: SECRET, [key]: value }))
         .toThrow(new RegExp(`${key} is one-shot telemetry-lifecycle authority`));

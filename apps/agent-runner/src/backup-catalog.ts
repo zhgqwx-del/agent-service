@@ -20,6 +20,11 @@ Commands:
 
 Database, object-store, backup, restore and evidence settings are accepted only through environment
 variables. Command-line flags cannot carry a DSN, endpoint, locator, path, header or credential.
+For an active telemetry lifecycle database, set TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE to the
+same protected owner-only regular file containing exactly 32 raw bytes (not hex) on source and
+restored target. Inactive databases may omit it. Missing/wrong keys fail closed during verify-only
+startup audit. Direct commands reject any ambient TENANT_TELEMETRY_REF_KEY, including empty;
+local-service.sh clears that application hex input for the foreground command only.
 
 The three artifact commands require BACKUP_ARTIFACT_LOCAL_ONLY_ACK=1, a private
 BACKUP_ARTIFACT_DIRECTORY and an independent, private 32-byte BACKUP_ARTIFACT_KEY_FILE.
@@ -39,6 +44,8 @@ or epoch is permanently refused, even with another artifact directory or empty t
 Preserve exact operation evidence for explicit manual forward-fix
 with prepare-restore and restore-ledger-reconcile. Source loss and automatic import resume are unsupported.
 publish-backup remains attestation-only and does not produce or authenticate artifact bytes.
+This key plumbing does not rebind active provider capture to a restored runtime epoch;
+active provider-capture restore is unsupported and remains fail closed.
 
 Options:
   -h, --help  Show this help and exit.

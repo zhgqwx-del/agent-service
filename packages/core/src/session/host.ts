@@ -29,6 +29,7 @@ import type {
   BlobManifestStore,
   BlobObject,
   CommitBatch,
+  CommitResult,
   ErasureSessionHead,
   ErasureSessionStore,
   ErasureWriteAuthorization,
@@ -54,6 +55,7 @@ import {
   newUsageId,
 } from "@agent-service/store";
 import type { AgentEngine, AssistantStepResult, BeforeToolCallDecision, EngineInputPart, EngineRun, EngineSink, EngineToolResult, ResolvedModel, Summariser } from "../engine/types.js";
+import { getPiProviderStepFailure, getPiProviderStepFailureMessage } from "../engine/pi.js";
 import { buildSystemPrompt, computeContextEpoch, sha256, stableStringify, type SkillSummary } from "../context/assemble.js";
 import { projectItems, projectItemsForPlanning, pruneToolResults } from "../context/history.js";
 import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptTokens } from "../context/compact.js";
@@ -145,6 +147,13 @@ export interface SessionHostDeps {
   logger?: Pick<Console, "info" | "warn" | "error">;
   /** Content-free ownership-loss signal for structured process telemetry. */
   onOwnershipLost?: () => void;
+  /** Present only after exact v2 startup reconciliation. Generic engine error text is not proof. */
+  persistedProviderFailureCapture?: {
+    commit(batch: CommitBatch, source: {
+      tenantId: string; userId: string; turnId: string; itemId: string;
+      stepIndex: number; failureKind: "provider_step_error";
+    }): Promise<CommitResult>;
+  };
 }
 
 /**
@@ -213,6 +222,12 @@ interface ActiveTurn {
   pendingSteers: EngineInputPart[][];
   /** makes timeout/drain/lease-loss cleanup safe when more than one stop signal races */
   finishPromise?: Promise<void>;
+  /** A done-only signal can replay the original step entry, never the terminal finish batch. */
+  capturedProviderFailureStep?: number;
+  preparedProviderFailureStep?: {
+    stepIndex: number;
+    commit: Promise<CommitResult>;
+  };
   /** Set only when a subject-erasure abort exceeded its configured local drain deadline. */
   erasureDrainTimedOut?: boolean;
   /** Covers queueing, preflight and engine execution until this turn has fully settled locally. */
@@ -1752,6 +1767,16 @@ export class SessionHost {
     } catch {
       result = { steps: state.step, aborted: state.abort.signal.aborted, error: "provider_error" };
     }
+    const failure = getPiProviderStepFailure(result);
+    const failedMessage = getPiProviderStepFailureMessage(result);
+    if (this.deps.persistedProviderFailureCapture && failure && failedMessage
+      && !state.fenced && state.capturedProviderFailureStep !== failure.stepIndex
+      && state.step === failure.stepIndex) {
+      // A typed, original provider result may reach done without its step callback finishing.
+      // Retry only that durable step admission; an ambiguous store outcome already fenced state,
+      // so it cannot reach this branch and we never execute another model request.
+      await sink.onAssistantMessage(failedMessage).catch(() => {});
+    }
     await this.finishTurn(state, result).catch(() => this.logTurnStop("error", "turn finish failed"));
   }
 
@@ -1948,6 +1973,31 @@ export class SessionHost {
       },
 
       onAssistantMessage: async (msg) => {
+        // Pi may synthesize another assistant error after a later listener/steer callback throws.
+        // The already-committed failed step is the immutable source; a same-step synthetic error
+        // must not replace its item timestamp or account for a second usage entry.
+        if (msg.stopReason === "error" && state.capturedProviderFailureStep === state.step) return;
+        const failure = getPiProviderStepFailure(msg);
+        const captureFailure = this.deps.persistedProviderFailureCapture !== undefined
+          && failure?.stepIndex === state.step && msg.stopReason === "error";
+        if (captureFailure && state.capturedProviderFailureStep === state.step) return;
+        if (captureFailure && state.preparedProviderFailureStep?.stepIndex === state.step) {
+          // Share the original admission, including timestamp, usageId, item ID and fence. Neither
+          // duplicate callbacks nor done-only settlement may manufacture a second business batch.
+          await state.preparedProviderFailureStep.commit;
+          return;
+        }
+        if (state.fenced) throw new FenceError(sessionId, state.fence, state.fence);
+        // Text deltas start persistence without awaiting it. Observe that original write before
+        // copying its item so a fast final callback retains the already-assigned item sequence.
+        if (state.agentItemStarted) await state.agentItemStarted;
+        if (state.fenced) throw new FenceError(sessionId, state.fence, state.fence);
+        if (msg.stopReason === "error" && state.capturedProviderFailureStep === state.step) return;
+        if (captureFailure && state.capturedProviderFailureStep === state.step) return;
+        if (captureFailure && state.preparedProviderFailureStep?.stepIndex === state.step) {
+          await state.preparedProviderFailureStep.commit;
+          return;
+        }
         const now = Date.now();
         if (msg.stopReason === "error" || msg.stopReason === "aborted" || (msg.stopReason === "length" && msg.toolCalls.length === 0)) {
           state.closingRequested = true;
@@ -1959,7 +2009,8 @@ export class SessionHost {
           items.push(item);
           events.push({ type: "item/completed", sessionId, emittedAtMs: now, item });
         }
-        if (msg.text || state.agentItemId) {
+        let finalAgentItem: Item | undefined;
+        if (msg.text || state.agentItemId || captureFailure) {
           // `msg.text` can come back empty on an aborted/errored step; keep what we already streamed.
           const text = msg.text || state.agentText;
           const prev = state.agentItem;
@@ -1967,6 +2018,7 @@ export class SessionHost {
             ? { ...prev, status: msg.stopReason === "error" ? "failed" : "completed", completedAtMs: now, type: "agentMessage", text, phase: "finalAnswer" }
             : { id: newId("item"), sessionId, turnId, seq: 0, step: state.step, status: msg.stopReason === "error" ? "failed" : "completed", createdAtMs: now, completedAtMs: now, type: "agentMessage", text, phase: "finalAnswer" };
           items.push(item);
+          finalAgentItem = item;
           events.push({ type: "item/completed", sessionId, emittedAtMs: now, item });
           if (text) state.lastText = text;
         }
@@ -2001,13 +2053,28 @@ export class SessionHost {
           stepUsage: msg.usage, turnUsage: nextTurnUsage, sessionUsage: nextSessionUsage,
           runtime: { provider: msg.provider, model: msg.model },
         });
-        await this.commit(state, {
+        const batch: Omit<CommitBatch, "sessionId" | "fence"> = {
           items,
           events,
           turn: nextTurn,
           usageEntries: [{ usageId: newUsageId(), turnId, step: state.step, provider: msg.provider, model: msg.model, usage: msg.usage, createdAtMs: now }],
           sessionPatch: { usage: nextSessionUsage },
-        });
+        };
+        const persistence = this.commit(state, batch, captureFailure && finalAgentItem ? {
+          tenantId: principal.tenantId, userId: principal.userId, turnId,
+          itemId: finalAgentItem.id, stepIndex: state.step, failureKind: "provider_step_error",
+        } : undefined);
+        if (captureFailure) state.preparedProviderFailureStep = { stepIndex: state.step, commit: persistence };
+        const committedStep = await persistence;
+        // Do not let the finish commit turn the old streaming object back into completed. Publish
+        // this canonical final state only after the first transaction actually succeeds.
+        if (finalAgentItem) {
+          const committed = committedStep.events.find((event) => event.type === "item/completed" && event.item.id === finalAgentItem!.id);
+          if (committed?.type === "item/completed") finalAgentItem = committed.item;
+          state.agentItem = finalAgentItem;
+          state.agentItemId = finalAgentItem.id;
+        }
+        if (captureFailure) state.capturedProviderFailureStep = state.step;
         state.stepUsage = msg.usage;
         state.turn.usage = nextTurnUsage;
         state.session.usage = nextSessionUsage;
@@ -2683,12 +2750,18 @@ export class SessionHost {
 
   // ---------------- commit + publish ----------------
 
-  private commit(state: ActiveTurn, batch: Omit<CommitBatch, "sessionId" | "fence">) {
+  private commit(state: ActiveTurn, batch: Omit<CommitBatch, "sessionId" | "fence">, providerFailureSource?: {
+    tenantId: string; userId: string; turnId: string; itemId: string;
+    stepIndex: number; failureKind: "provider_step_error";
+  }) {
     const run = async () => {
       if (state.fenced) throw new FenceError(state.session.id, state.fence, state.fence);
       state.leaseGuard.assertOwned();
       try {
-        const r = await this.deps.store.commit({ ...batch, sessionId: state.session.id, fence: state.fence });
+        const completeBatch = { ...batch, sessionId: state.session.id, fence: state.fence };
+        const r = providerFailureSource && this.deps.persistedProviderFailureCapture
+          ? await this.deps.persistedProviderFailureCapture.commit(completeBatch, providerFailureSource)
+          : await this.deps.store.commit(completeBatch);
         state.session.lastSeq = r.lastSeq;
         await this.publishAll(state.session.id, r.events);
         return r;

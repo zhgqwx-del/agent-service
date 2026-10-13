@@ -35,6 +35,18 @@ if (result.stderr.trim() !== "") {
 if (!result.stdout.includes("Usage: restore-ledger-reconcile")) {
   throw new Error("restore-ledger-reconcile --help did not emit its stable usage marker");
 }
+for (const prerequisite of ["TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE", "32 raw bytes (not hex)",
+  "Direct commands reject any ambient TENANT_TELEMETRY_REF_KEY", "no unified whole-operation deadline"]) {
+  if (!result.stdout.includes(prerequisite)) throw new Error("restore-ledger artifact omitted its protected key or deadline boundary");
+}
+const rejected = spawnSync(process.execPath, [artifact, "status"], {
+  cwd: ROOT, encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024,
+  env: { NODE_ENV: "test", PATH: process.env.PATH ?? "", TENANT_TELEMETRY_REF_KEY: "" },
+});
+if (rejected.error || rejected.signal || rejected.status !== 1 || rejected.stdout !== ""
+  || rejected.stderr !== '{"status":"error","code":"invalid_configuration"}\n') {
+  throw new Error("restore-ledger artifact did not safely reject ambient application key authority");
+}
 
 console.log(
   `runner restore-ledger-reconcile artifact executed under plain Node (${artifactStat.size} bytes)`,

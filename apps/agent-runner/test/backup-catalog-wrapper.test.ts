@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const CATALOG_PROCESS_AUTHORITY_ENV = [
+  "TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE",
   "BACKUP_CATALOG_ADAPTER",
   "BACKUP_CATALOG_DATABASE_NAMESPACE_ID",
   "BACKUP_CATALOG_NAMESPACE_ID",
@@ -107,7 +108,7 @@ describe("local backup-catalog wrapper", () => {
       );
       await writeFile(
         join(root, ".env"),
-        `${CATALOG_COMMAND_AUTHORITY_ENV.map((name) => `${name}=${dotenvValues[name]}`).join("\n")}\n`,
+        `${CATALOG_COMMAND_AUTHORITY_ENV.map((name) => `${name}=${dotenvValues[name]}`).join("\n")}\nTENANT_TELEMETRY_REF_KEY=dotenv-application-hex\n`,
         { mode: 0o600 },
       );
 
@@ -124,6 +125,7 @@ if [ "\${1-}" != "--import" ] \\
   printf 'unexpected backup-catalog wrapper arguments\\n' >&2
   exit 41
 fi
+test "\${TENANT_TELEMETRY_REF_KEY+x}" != x || exit 46
 for name in ${CATALOG_COMMAND_AUTHORITY_ENV.join(" ")}; do
   expected_name="TEST_EXPECT_\${name}"
   if [ "\${!name+x}" != x ] || [ "\${!name}" != "\${!expected_name}" ]; then
@@ -146,6 +148,7 @@ printf 'backup-catalog-wrapper-ok\\n'
       callerValues.BACKUP_CATALOG_S3_SECRET_ACCESS_KEY = "";
       callerValues.BACKUP_CATALOG_S3_SESSION_TOKEN = "";
       callerValues.BACKUP_ARTIFACT_KEY_FILE = "";
+      callerValues.TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE = "";
       callerValues.BACKUP_RESTORE_TARGET_MYSQL_URL = "";
       callerValues.AWS_PROFILE = "";
 

@@ -24,6 +24,7 @@ import {
   type TenantRestoreRuntimeControlRecord,
 } from "@agent-service/store";
 import { z } from "zod";
+import { readTelemetryCaptureRefKey, tenantTelemetryOperatorRefKeyPath } from "./telemetry-capture-ref-key.js";
 import {
   createTenantRestoreJournalAdapters,
   loadTenantRestoreJournalConfig,
@@ -78,6 +79,7 @@ export interface RestoreLedgerReconcileCliDependencies {
     url: string;
     connectionLimit: number;
     migrationMode: "verify";
+    tenantTelemetryRefKey?: Uint8Array;
   }): Promise<ReconcileStore>;
   loadJournalConfig(
     env: NodeJS.ProcessEnv,
@@ -85,6 +87,7 @@ export interface RestoreLedgerReconcileCliDependencies {
   ): TenantRestoreJournalRuntimeConfig | undefined;
   createAdapters(config: TenantRestoreJournalRuntimeConfig): readonly ReconcileAdapter[];
   writeLine(line: string): void;
+  readRefKey?: (path: string) => Promise<Buffer>;
 }
 
 const MysqlEnv = z.object({
@@ -145,6 +148,7 @@ const DEFAULT_DEPENDENCIES: RestoreLedgerReconcileCliDependencies = {
     url: options.url,
     connectionLimit: options.connectionLimit,
     migrationMode: options.migrationMode,
+    ...(options.tenantTelemetryRefKey === undefined ? {} : { tenantTelemetryRefKey: options.tenantTelemetryRefKey }),
   }),
   loadJournalConfig: (env, context) => loadTenantRestoreJournalConfig(env, context),
   createAdapters: (config) => createTenantRestoreJournalAdapters(config),
@@ -785,6 +789,9 @@ export async function runRestoreLedgerReconcileCli(
   dependencies: RestoreLedgerReconcileCliDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<number> {
   const command = parseCommand(argv);
+  let refKeyPath: string | undefined;
+  try { refKeyPath = tenantTelemetryOperatorRefKeyPath(env); }
+  catch { throw cliError("invalid_configuration"); }
   const mysql = MysqlEnv.parse(env);
   const restoreRunId = env.RESTORE_RUN_ID;
   if (restoreRunId !== undefined && !RESTORE_RUN_ID.test(restoreRunId)) {
@@ -813,12 +820,21 @@ export async function runRestoreLedgerReconcileCli(
   let store: ReconcileStore | undefined;
   let operationError: unknown;
   let summary: string | undefined;
+  let refKey: Buffer | undefined;
   try {
+    if (refKeyPath !== undefined) {
+      try {
+        refKey = await (dependencies.readRefKey ?? readTelemetryCaptureRefKey)(refKeyPath);
+        if (!(refKey instanceof Uint8Array) || refKey.length !== 32) throw cliError("invalid_configuration");
+      }
+      catch { throw cliError("invalid_configuration"); }
+    }
     for (const adapter of adapters) await adapter.validateStartup();
     store = await dependencies.connectStore({
       url: mysql.MYSQL_URL,
       connectionLimit: command === "status" ? 1 : 2,
       migrationMode: "verify",
+      ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
     });
 
     let run: TenantRestoreReplayRunRecord | null = restoreRunId === undefined
@@ -858,6 +874,7 @@ export async function runRestoreLedgerReconcileCli(
     closeSafely(store),
     ...adapters.map((adapter) => closeSafely(adapter)),
   ].filter((operation): operation is Promise<void> => operation !== undefined));
+  refKey?.fill(0);
   if (operationError !== undefined) throw operationError;
   if (closeResults.some((result) => result.status === "rejected") || summary === undefined) {
     throw cliError("operation_failed");

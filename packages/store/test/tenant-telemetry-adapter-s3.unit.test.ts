@@ -749,6 +749,61 @@ describe("S3TenantTelemetryWriteAdapter", () => {
     expect(startupClient.commands.some((command) => command instanceof PutObjectCommand)).toBe(false);
   });
 
+  it("forwards the operator cancellation to a stalled SDK request and refuses subsequent work", async () => {
+    const prepared = await preparedFixture();
+    const client = new FakeS3Client();
+    const controller = new AbortController();
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let requestSignal: AbortSignal | undefined;
+    const send = vi.spyOn(client, "send").mockImplementationOnce(async (_command, options) => {
+      requestSignal = options?.abortSignal;
+      entered();
+      // A broken provider need not settle for the outer native-request wrapper to be bounded.
+      return new Promise(() => {});
+    });
+    const sink = adapter(client, prepared.targets, { operationAbortSignal: controller.signal });
+    const pending = sink.validateStartup();
+    await started;controller.abort();
+    await expect(pending).rejects.toThrow("AbortError");
+    expect(requestSignal?.aborted).toBe(true);
+    await expect(sink.validateStartup()).rejects.toBeInstanceOf(TenantTelemetryWriteAdapterTemporaryError);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("destroys a stalled response body when the shared operator signal aborts", async () => {
+    const prepared = await preparedFixture();
+    const client = new FakeS3Client();
+    const controller = new AbortController();
+    const sink = adapter(client, prepared.targets, { operationAbortSignal: controller.signal });
+    await sink.createWrite(prepared.input);
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const body = new Readable({ read() { entered(); } });
+    client.getBodyFactory = () => body;
+    const pending = sink.inspectWrite(prepared.input);
+    await started;controller.abort();
+    await expect(pending).rejects.toBeInstanceOf(TenantTelemetryWriteAdapterTemporaryError);
+    expect(body.destroyed).toBe(true);
+  });
+
+  it("never interprets cancellation after a create-only PUT as remote rollback", async () => {
+    const prepared = await preparedFixture();
+    const client = new FakeS3Client();
+    const controller = new AbortController();
+    const send = client.send.bind(client);
+    vi.spyOn(client, "send").mockImplementation(async (command, options) => {
+      const result = await send(command, options);
+      if (command instanceof PutObjectCommand) controller.abort();
+      return result;
+    });
+    const sink = adapter(client, prepared.targets, { operationAbortSignal: controller.signal });
+    await expect(sink.createWrite(prepared.input)).rejects.toBeInstanceOf(TenantTelemetryWriteAdapterTemporaryError);
+    expect(client.state.objects.size).toBe(1);
+    expect(client.commands.filter((command) => command instanceof PutObjectCommand)).toHaveLength(1);
+    expect(client.commands.some((command) => command instanceof DeleteObjectCommand)).toBe(false);
+  });
+
   it("preflights reachability, versioning, lifecycle, Object Lock, and real If-None-Match", async () => {
     const prepared = await preparedFixture();
     const client = new FakeS3Client();

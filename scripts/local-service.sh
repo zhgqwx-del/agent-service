@@ -13,6 +13,7 @@ cd "$ROOT"
 caller_mover_env_names=(
   NODE_ENV
   MYSQL_URL
+  RUNNERS
   SESSION_USAGE_RETENTION_ENABLED
   SESSION_USAGE_RETENTION_WORKER_ENABLED
   SESSION_USAGE_RETENTION_WORKER_POLL_MS
@@ -59,7 +60,7 @@ caller_mover_env_names=(
 )
 while IFS= read -r caller_env_name; do
   case "$caller_env_name" in
-    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*)
+    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*)
       caller_mover_env_names+=("$caller_env_name")
       ;;
   esac
@@ -221,6 +222,16 @@ while IFS= read -r backup_catalog_env_name; do
   esac
 done < <(compgen -e)
 unset backup_catalog_env_name
+
+# Raw key paths and capture activation ACKs belong to the one-shot operator only.
+telemetry_capture_process_scrub=(-u AGENT_SERVICE_UNUSED_TELEMETRY_CAPTURE_ENV)
+while IFS= read -r telemetry_capture_env_name; do
+  case "$telemetry_capture_env_name" in
+    TELEMETRY_CAPTURE_*|TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE)
+      telemetry_capture_process_scrub+=(-u "$telemetry_capture_env_name") ;;
+  esac
+done < <(compgen -e)
+unset telemetry_capture_env_name
 
 # Telemetry sink/lifecycle settings are runner-only. Keep the router environment closed over the
 # whole prefix so adding a managed adapter option cannot accidentally leak its credentials or
@@ -411,6 +422,7 @@ start_apps() {
       -u TENANT_DATABASE_PURGE_ENABLED \
       -u TENANT_REDIS_PURGE_ENABLED \
       -u SESSION_USAGE_RETENTION_ENABLED \
+      -u PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED \
       -u TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED \
       -u RESTORE_JOURNAL_NAMESPACE_SHA256 \
       -u RESTORE_JOURNAL_TARGET_ROOT_SHA256 \
@@ -423,6 +435,7 @@ start_apps() {
       -u EXTERNAL_TOMBSTONE_SHA256 -u BACKUP_PHYSICAL_ABSENCE_ACK \
       -u RESTORE_REPLAY_PAGE_SIZE \
       "${backup_catalog_process_scrub[@]}" \
+      "${telemetry_capture_process_scrub[@]}" \
       "${cloud_credential_scrub[@]}" \
       "${runner_restore_journal_env[@]}" \
       "${runner_blob_env[@]}" \
@@ -481,6 +494,7 @@ start_apps() {
       -u TENANT_PURGE_PLAN_WORKER_ENABLED \
       -u TENANT_PURGE_EXECUTION_WORKER_ENABLED \
       -u TENANT_DATABASE_PURGE_WORKER_ENABLED \
+      -u PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED \
       -u TENANT_REDIS_PURGE_WORKER_ENABLED \
       -u RESTORE_JOURNAL_ADAPTER \
       -u RESTORE_JOURNAL_DATABASE_NAMESPACE_ID \
@@ -505,6 +519,7 @@ start_apps() {
       -u RESTORE_REPLAY_PAGE_SIZE \
       -u TENANT_RESTORE_JOURNAL_WORKER_ENABLED \
       "${tenant_telemetry_process_scrub[@]}" \
+      "${telemetry_capture_process_scrub[@]}" \
       -u TENANT_RESTORE_JOURNAL_WORKER_POLL_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_LEASE_MS \
       -u TENANT_RESTORE_JOURNAL_WORKER_BATCH_SIZE \
@@ -631,7 +646,7 @@ verify() {
   # values must not make the standard verification stack activate or publish local artifacts.
   while IFS= read -r tenant_telemetry_env_name; do
     case "$tenant_telemetry_env_name" in
-      TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*) unset "$tenant_telemetry_env_name" ;;
+      TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*|TELEMETRY_CAPTURE_*|PERSISTED_PROVIDER_FAILURE_CAPTURE_*) unset "$tenant_telemetry_env_name" ;;
     esac
   done < <(compgen -e)
   unset tenant_telemetry_env_name
@@ -645,6 +660,11 @@ verify() {
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-lifecycle-mysql
   pnpm run test:tenant-telemetry-application-capture
+  pnpm run test:telemetry-capture-operator
+  pnpm run test:telemetry-operator-key-compatibility
+  pnpm run test:persisted-provider-failure-capture
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:persisted-provider-capture-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-application-capture-mysql
   pnpm run test:tenant-telemetry-writer
@@ -817,6 +837,11 @@ verify_s3() {
     node packages/store/scripts/bootstrap-s3.mjs
   env "${s3_test_env[@]}" S3_TENANT_TELEMETRY_TEST_BUCKET="$tenant_telemetry_bucket" \
     pnpm run test:tenant-telemetry-writer-s3
+  env "${s3_test_env[@]}" \
+    S3_TENANT_TELEMETRY_TEST_BUCKET="$tenant_telemetry_bucket" \
+    S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
+    MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:telemetry-capture-mysql-s3
   local telemetry_disposition_bucket="${TELEMETRY_DISPOSITION_S3_BUCKET:-agent-service-local-telemetry-disposition}"
   [ "$telemetry_disposition_bucket" != "${MINIO_BUCKET:-agent-service-local}" ] \
     || die "TELEMETRY_DISPOSITION_S3_BUCKET must differ from the Blob bucket"
@@ -864,18 +889,25 @@ restore_ledger_reconcile() {
   require_tools
   # Foreground, one-shot recovery entrypoint. All database/object-store authority stays in the
   # environment; the wrapper never interpolates or prints those values.
-  node --import tsx apps/agent-runner/src/restore-ledger-reconcile.ts "$@"
+  env -u TENANT_TELEMETRY_REF_KEY node --import tsx apps/agent-runner/src/restore-ledger-reconcile.ts "$@"
 }
 
 backup_catalog() {
   require_tools
   # Foreground, one-shot backup authority. Configuration may come from the explicitly preserved
   # caller environment or `.env`; the wrapper never interpolates or prints any of those values.
-  node --import tsx apps/agent-runner/src/backup-catalog.ts "$@"
+  env -u TENANT_TELEMETRY_REF_KEY node --import tsx apps/agent-runner/src/backup-catalog.ts "$@"
+}
+
+telemetry_capture() {
+  require_tools
+  # Foreground one-shot; no environment, paths or secrets are echoed by the wrapper.
+  # The application hex key may live in .env. Only the protected raw file is operator authority.
+  env -u TENANT_TELEMETRY_REF_KEY node --import tsx apps/agent-runner/src/telemetry-capture.ts "$@"
 }
 
 usage() {
-  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|backup-catalog|down"
+  echo "usage: $0 start|stop|restart|status|logs|smoke|acceptance|verify|verify-s3|verify-real|cleanup-idempotency|blob-storage-migrate|restore-ledger-reconcile|backup-catalog|telemetry-capture|down"
 }
 
 case "${1:-}" in
@@ -893,6 +925,7 @@ case "${1:-}" in
   blob-storage-migrate) shift; blob_storage_migrate "$@" ;;
   restore-ledger-reconcile) shift; restore_ledger_reconcile "$@" ;;
   backup-catalog) shift; backup_catalog "$@" ;;
+  telemetry-capture) shift; telemetry_capture "$@" ;;
   down) stop_apps; infra stop ;;
   *) usage; exit 1 ;;
 esac

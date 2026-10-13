@@ -16,6 +16,10 @@ import {
   type TenantTelemetryLifecycleTargetRecord,
   type TenantTelemetryOwnerKind,
 } from "./tenant-telemetry-lifecycle.js";
+import {
+  validatePersistedProviderCaptureProof,
+  type TenantTelemetryPersistedProviderCaptureProof,
+} from "./tenant-telemetry-persisted-provider-capture.js";
 
 export const TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA =
   "agent-service.telemetry-artifact.v1" as const;
@@ -593,12 +597,18 @@ export interface TenantTelemetryWritePayloadRecord {
   createdAtMs: number;
 }
 
-export interface ClaimTenantTelemetryWriteJobsOptions {
+interface ClaimTenantTelemetryWriteJobsBaseOptions {
   limit: number;
   leaseMs: number;
   claimToken: string;
   adapterProtocol: string;
 }
+
+/** Omission is deliberately legacy-only: a writer without a fresh v2 gate cannot lease v2. */
+export type ClaimTenantTelemetryWriteJobsOptions = ClaimTenantTelemetryWriteJobsBaseOptions & (
+  | { captureMode?: "legacy_only"; freshProof?: never }
+  | { captureMode: "include_v2"; freshProof: TenantTelemetryPersistedProviderCaptureProof }
+);
 
 export interface RenewTenantTelemetryWriteOptions {
   leaseMs: number;
@@ -640,8 +650,16 @@ export function tenantTelemetryWriteClaimTokenSha256(value: string): string {
 export function validateClaimTenantTelemetryWriteJobsOptions(
   options: ClaimTenantTelemetryWriteJobsOptions,
 ): void {
-  exactKeys(options, ["limit", "leaseMs", "claimToken", "adapterProtocol"],
+  const keys = ["limit", "leaseMs", "claimToken", "adapterProtocol"];
+  if (Object.hasOwn(options, "captureMode")) keys.push("captureMode");
+  if (options.captureMode === "include_v2") keys.push("freshProof");
+  exactKeys(options, keys,
     "claim tenant telemetry write jobs options");
+  if (options.captureMode !== undefined && options.captureMode !== "legacy_only"
+    && options.captureMode !== "include_v2") {
+    throw new Error("tenant telemetry write claim capture mode is invalid");
+  }
+  if (options.captureMode === "include_v2") validatePersistedProviderCaptureProof(options.freshProof);
   positive(options.limit, "tenant telemetry write claim limit");
   if (options.limit > 100) throw new Error("tenant telemetry write claim limit exceeds 100");
   positive(options.leaseMs, "tenant telemetry write lease");
@@ -1100,6 +1118,7 @@ export interface TenantTelemetryWriterStore {
   reserveTenantTelemetryExternalMutation(
     authorization: TenantTelemetryWriteAuthorization,
     adapterProtocol: string,
+    freshProof?: import("./tenant-telemetry-persisted-provider-capture.js").TenantTelemetryPersistedProviderCaptureProof,
   ): Promise<TenantTelemetryExternalMutationReservation | null>;
   retryTenantTelemetryWrite(
     authorization: TenantTelemetryWriteAuthorization,
@@ -1112,6 +1131,7 @@ export interface TenantTelemetryWriterStore {
   completeTenantTelemetryWrite(
     authorization: TenantTelemetryWriteAuthorization,
     result: TenantTelemetryWriteAdapterResult,
+    freshProof?: import("./tenant-telemetry-persisted-provider-capture.js").TenantTelemetryPersistedProviderCaptureProof,
   ): Promise<TenantTelemetryWriteAck | null>;
   getTenantTelemetryWriteJob(
     tenantId: string,

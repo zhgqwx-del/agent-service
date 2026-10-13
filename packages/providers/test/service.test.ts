@@ -691,4 +691,21 @@ describe("ProviderService", () => {
 
     await expect(model.fetch!("https://provider.example/fail")).rejects.toBe(upstreamFailure);
   });
+
+  it("does not duplicate active v2 provider failure through stdout or the v1 fetch helper", async () => {
+    const upstreamFailure = new Error("private upstream exception");
+    const records: Readonly<StructuredTelemetryRecord>[] = [];
+    const warn = vi.fn();
+    const svc = new ProviderService({
+      store: new MemorySessionStore(), cipher: new LocalAesGcmCipher(KEY), assertBaseUrl,
+      platform: [ProviderService.preset("deepseek", "platform-key")], persistedProviderFailureCaptureActive: true,
+      telemetry: createStructuredTelemetry({ component: "provider", opaqueRefKey: Buffer.alloc(32, 10), sink: { write: (record) => records.push(record) } }),
+      tenantTelemetry: { warn },
+      fetch: async () => { throw upstreamFailure; },
+    });
+    const model = await svc.resolve({ tenantId: "tenant-private", userId: "user-private" }, { provider: "deepseek", model: "deepseek-chat" });
+    await expect(model.fetch!("https://provider.example/fail")).rejects.toBe(upstreamFailure);
+    expect(records).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
 });

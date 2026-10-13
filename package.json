@@ -31,6 +31,10 @@
     "test:tenant-telemetry-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-telemetry-lifecycle.mysql.test.ts",
     "test:tenant-telemetry-application-capture": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-application-capture.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-application-capture.memory.test.ts",
     "test:tenant-telemetry-application-capture-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-telemetry-application-capture.mysql.test.ts",
+    "test:telemetry-capture-operator": "node scripts/run-required-suite.mjs apps/agent-runner/test/telemetry-capture-ref-key.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/telemetry-capture-cli.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/telemetry-capture-wrapper.test.ts",
+    "test:persisted-provider-failure-capture": "node scripts/run-required-suite.mjs packages/core/test/pi-provider-failure.test.ts && node scripts/run-required-suite.mjs packages/core/test/host-persisted-provider-failure.test.ts && node scripts/run-required-suite.mjs packages/core/test/persisted-provider-failure-capture.test.ts && node scripts/run-required-suite.mjs packages/core/test/persisted-provider-capture-worker.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/persisted-provider-capture-gate.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/persisted-provider-capture-ready.test.ts && node scripts/run-required-suite.mjs apps/agent-router/test/persisted-provider-capture.test.ts",
+    "test:persisted-provider-capture-mysql": "node scripts/run-required-suite.mjs packages/store/test/persisted-provider-capture.mysql.test.ts",
+    "test:telemetry-capture-mysql-s3": "AGENT_SERVICE_TELEMETRY_CAPTURE_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/telemetry-capture.mysql-s3.test.ts",
     "test:tenant-telemetry-writer": "node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-writer.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-writer.memory.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-adapter-memory.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-adapter-http.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-adapter-filesystem.test.ts && node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-adapter-s3.unit.test.ts && node scripts/run-required-suite.mjs packages/core/test/tenant-telemetry-writer-worker.test.ts && node scripts/run-required-suite.mjs packages/core/test/tenant-telemetry-application-dual-write.test.ts && node scripts/run-required-suite.mjs packages/providers/test/telemetry-dual-write.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/tenant-telemetry-writer-config.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/config.test.ts && node scripts/run-required-suite.mjs apps/agent-router/test/config.test.ts",
     "test:tenant-telemetry-writer-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-telemetry-writer.mysql.test.ts",
     "test:tenant-telemetry-writer-s3": "AGENT_SERVICE_TENANT_TELEMETRY_S3_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/tenant-telemetry-adapter-s3.minio.test.ts",
@@ -55,6 +59,7 @@
     "test:backup-catalog-reconcile-mysql-s3": "AGENT_SERVICE_BACKUP_CATALOG_RECONCILE_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/backup-catalog-reconcile.mysql-s3.test.ts",
     "test:backup-catalog-restore-roundtrip-mysql-s3": "AGENT_SERVICE_BACKUP_CATALOG_RESTORE_ROUNDTRIP_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/backup-catalog-restore-roundtrip.mysql-s3.test.ts",
     "test:mysql-backup-artifact-mysql-s3": "AGENT_SERVICE_INTEGRATION=1 AGENT_SERVICE_MYSQL_BACKUP_ARTIFACT_INTEGRATION=1 node scripts/run-required-suite.mjs apps/agent-runner/test/mysql-backup-artifact.mysql-s3.test.ts",
+    "test:telemetry-operator-key-compatibility": "node scripts/run-required-suite.mjs apps/agent-runner/test/telemetry-capture-ref-key.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/backup-catalog-cli.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/restore-ledger-reconcile-cli.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/backup-catalog-wrapper.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/restore-ledger-reconcile-wrapper.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/telemetry-capture-wrapper.test.ts",
     "test:tenant-restore-journal-memory": "node scripts/run-required-suite.mjs packages/store/test/tenant-restore-journal.memory.test.ts",
     "test:tenant-restore-journal-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-restore-journal.mysql.test.ts",
     "test:tenant-backup-catalog-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/backup-catalog.mysql.test.ts",
@@ -102,11 +107,13 @@
     "maintenance:blob-storage-migrate": "scripts/local-service.sh blob-storage-migrate",
     "maintenance:restore-ledger-reconcile": "scripts/local-service.sh restore-ledger-reconcile",
     "maintenance:backup-catalog": "scripts/local-service.sh backup-catalog",
+    "maintenance:telemetry-capture": "scripts/local-service.sh telemetry-capture",
     "check:blob-storage-migrate-artifact": "node scripts/check-blob-storage-migrate-artifact.mjs",
     "check:restore-ledger-reconcile-artifact": "node scripts/check-restore-ledger-reconcile-artifact.mjs",
     "check:backup-catalog-artifact": "node scripts/check-backup-catalog-artifact.mjs",
+    "check:telemetry-capture-artifact": "node scripts/check-telemetry-capture-artifact.mjs",
     "test:cluster": "AGENT_SERVICE_CLUSTER=1 vitest run test/cluster",
-    "build:check": "pnpm build && pnpm run check:sdk && pnpm run check:blob-storage-migrate-artifact && pnpm run check:restore-ledger-reconcile-artifact && pnpm run check:backup-catalog-artifact && node scripts/check-dist-boot.mjs"
+    "build:check": "pnpm build && pnpm run check:sdk && pnpm run check:blob-storage-migrate-artifact && pnpm run check:restore-ledger-reconcile-artifact && pnpm run check:backup-catalog-artifact && pnpm run check:telemetry-capture-artifact && node scripts/check-dist-boot.mjs"
   },
   "devDependencies": {
     "@agent-service/testkit": "workspace:*",

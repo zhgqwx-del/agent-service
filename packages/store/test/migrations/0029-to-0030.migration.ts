@@ -594,35 +594,41 @@ describe("0029 -> 0030 tenant restore journal migration", () => {
     }
   });
 
-  it("converges from first, middle, and last CREATE TABLE auto-commit boundaries", async () => {
+  // Each boundary imports the frozen schema and upgrades the full current migration tail.
+  // Keep all three proofs independent under the unchanged per-test deadline, rather than
+  // charging three complete database upgrades to one 30-second test.
+  it.each([
+    { boundary: "first", createOrdinal: 0 },
+    { boundary: "middle", createOrdinal: 5 },
+    { boundary: "last", createOrdinal: 11 },
+  ])("converges from the $boundary CREATE TABLE auto-commit boundary", async ({ createOrdinal }) => {
     const all = statements(migrationSql);
     const createIndexes = all.flatMap((statement, index) => (
       statement.startsWith("CREATE TABLE IF NOT EXISTS tenant_restore_") ? [index] : []
     ));
     expect(createIndexes).toHaveLength(12);
-    for (const cutIndex of [createIndexes[0]!, createIndexes[5]!, createIndexes[11]!]) {
-      const database = databaseName();
-      await create0029(database);
-      const conn = await mysql.createConnection(databaseUrl(base, database));
-      try {
-        for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
-        await upgrade(database);
-        const [marker] = await conn.query<Row[]>(
-          "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
-          [MIGRATION_NAME],
-        );
-        expect(Number(marker[0]!.count), `cut ${cutIndex}`).toBe(1);
-        const [controls] = await conn.query<Row[]>(
-          `SELECT
-             (SELECT control_generation FROM tenant_restore_journal_control) AS journal_generation,
-             (SELECT control_generation FROM tenant_restore_runtime_control) AS runtime_generation`,
-        );
-        expect(Number(controls[0]!.journal_generation), `cut ${cutIndex}`).toBe(0);
-        expect(Number(controls[0]!.runtime_generation), `cut ${cutIndex}`).toBe(0);
-      } finally {
-        await conn.end();
-        await cleanup(database);
-      }
+    const cutIndex = createIndexes[createOrdinal]!;
+    const database = databaseName();
+    await create0029(database);
+    const conn = await mysql.createConnection(databaseUrl(base, database));
+    try {
+      for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
+      await upgrade(database);
+      const [marker] = await conn.query<Row[]>(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
+        [MIGRATION_NAME],
+      );
+      expect(Number(marker[0]!.count), `cut ${cutIndex}`).toBe(1);
+      const [controls] = await conn.query<Row[]>(
+        `SELECT
+           (SELECT control_generation FROM tenant_restore_journal_control) AS journal_generation,
+           (SELECT control_generation FROM tenant_restore_runtime_control) AS runtime_generation`,
+      );
+      expect(Number(controls[0]!.journal_generation), `cut ${cutIndex}`).toBe(0);
+      expect(Number(controls[0]!.runtime_generation), `cut ${cutIndex}`).toBe(0);
+    } finally {
+      await conn.end();
+      await cleanup(database);
     }
   });
 

@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { loadRouterConfig } from "../src/config.js";
 
 describe("router configuration", () => {
+  it("keeps persisted provider capture fleet admission default-off and separate from runner/operator authority", () => {
+    expect(loadRouterConfig({ RUNNERS: "http://runner:8787" }).PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED).toBe(false);
+    expect(loadRouterConfig({ RUNNERS: "http://runner:8787", PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED: "1" }).PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED).toBe(true);
+    expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", NODE_ENV: "production", PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED: "1" })).toThrow(/local-only/);
+    expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED: "true" })).toThrow();
+    expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "0" })).toThrow(/runner-only/);
+    expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", TELEMETRY_CAPTURE_COMMAND: "activate-logs" })).toThrow();
+  });
   it("keeps ordinary usage retention default-off/non-production and rejects runner-only tuning", () => {
     expect(loadRouterConfig({ RUNNERS: "http://runner:8787" }).SESSION_USAGE_RETENTION_ENABLED).toBe(false);
     expect(loadRouterConfig({ RUNNERS: "http://runner:8787", SESSION_USAGE_RETENTION_ENABLED: "1" }).SESSION_USAGE_RETENTION_ENABLED).toBe(true);

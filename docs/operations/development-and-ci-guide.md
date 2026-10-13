@@ -6,6 +6,10 @@
 
 里程碑完成度以 `docs/PROGRESS.md` 顶部快照和最后一节为准；本文只描述操作方式和交付产物，不替代进度记录。
 
+当前新增的`0053`是默认关闭、local-only的 persisted provider-step failure capture v2，不是完整telemetry生命周期或M3。原始provider stream失败的source、failed item/event/usage/billing、capture binding/receipt及0034 spool/membership在同一失败step业务COMMIT内提交；后续turn-terminal仍是原第二次COMMIT。runner `PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED` 和router `PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED`均默认`0`，production拒绝开启；只有受控CLI核对真实0030 active primary epoch/lineage、exact0033 key/target和configured-fleet root后才能激活v2 logs，0035 v1/traces保持inactive。T3d/T3f第六来源仍全局硬拒、tenant erasure被阻断，grant、外部处置/恢复和所有completion没有开放；sealed source usage不能由0052自动删除，旧NULL/0来源保持unknown。
+
+本地完整验证由`verify`加`verify-s3`组成：前者执行独立真实MySQL与真正旧0052 binary升级门禁，后者执行实际HTTP/SSE/socket故障→PiEngine/SessionHost→MySQL→0034worker→MinIO bytes/ACK，以及active0033 exact-key备份兼容。是否全部通过、实际用例数与CI链接仍只看PROGRESS及当次JSON，不把接线或历史结果当作本轮通过。构建现为六个JavaScript入口（runner五、router一），但长期服务和OCI镜像仍各两个。
+
 先明确“本地完成”和“整个架构实现”的区别：本地能够完整启动、通过测试并不等于 M1～M4 已全部完成，更不等于生产环境已经验收。当前 M0 完成、M2 本地/CI 范围冻结；M1未冻结，M3/M4主体未开始。`0034`默认关闭的writer已接runner，可选本地单runner filesystem或S3-compatible target；`0035`只有`provider.upstream_request_failed` logs exact producer contract，traces必须inactive。`0036`新增默认休眠的disposition迁移/原子control与S3 CAS-head journal、同keyCAS marker非生产协议夹具；`0037`轮换grant claim-hash hard-deny trigger并增加非生产grant-bound v2 Memory事件夹具；`0038`只为新受管write原子保存不可变逐项membership/source sidecar，旧write缺失为unknown；`0039`给新T3f补同事务、content-free的逐write owner-closure entry与零write也存在的aggregate receipt，旧terminal缺receipt保持unknown；`0040`～`0042`在新T3d plan同事务封存五类telemetry来源、逐source观察目标及精确逐artifact目录，legacy、未完成、孤立来源保持unknown；`0043`只补T3e复核和T3f后只读本地候选，`0044`新增默认休眠的逐artifact、版本化pre-grant intent/claim，固定`grantReady=false`；第五个同机MinIO bucket仍只证明0036协议。新T3d logs/traces可有非零目录target，但仍是不可执行blocker；没有telemetry disposition activation/worker/CLI、真实DB grant签发、产品v2 S3 mutation/ACK、marker验真、旧快照replay/startup gate或跨MySQL/S3端到端验证，外部处置默认拒绝。没有云资源仍可继续代码/协议/本地CI工作，但不能把本地MinIO当作云IAM/KMS、私有访问、独立故障域或生产容量证明。
 
 `0041`在上述`0040`来源账本之上，给新T3d同事务封存逐artifact观察目标集合和只读source-readiness。它精确覆盖每条0040 source；旧terminal、legacy/未完成/孤立source不补造，观察目标不是可执行target，readiness始终`executionReady=false`。完整T3d logs/traces仍是零执行target blocker，0037 grant与产品外部mutation继续硬拒。冻结0040旧二进制已在真实MySQL生成terminal后升级到0041，证明旧receipt保留且缺0041证据仍为unknown；该夹具没有非空telemetry artifact，不授予执行权。
@@ -29,11 +33,11 @@
 1. 现在按本文做阶段体验，确认已经实现的 router/runner、公开 API、SSE、持久化和运维手感，尽早发现交互问题；
 2. local/CI 范围的整体架构完成后，再做一次完整 walkthrough、真实模型验收和发布演练，作为进入 staging 前的系统验收。
 
-建议先读架构与可观测性文档，再启动普通router/runner主链路。telemetry writer默认关闭，普通`start`不会写filesystem sink；只有在可丢弃数据库、单runner私有目录和完整0033/0035受控activation条件下才可做专项实验，而仓库当前没有activation/operator CLI。日常学习应通过第6节的0034/0035定向测试观察该路径，不要手改control。
+建议先读架构与可观测性文档，再启动普通router/runner主链路。telemetry writer/capture默认关闭，普通`start`不会激活sink。日常学习优先运行第6节named测试；0053现有受控`telemetry-capture` CLI，但只可用于可丢弃库、实际停服排空、真实0030 primary与受保护key前提下的v2 logs，不要手改0033/0035/0049 control。
 
 ## 1. 服务、基础设施与代码库
 
-最新`0052`是仅限本地、默认关闭的ordinary session operational usage retention。只移除已核对的operational ledger并保留匿名billing facts、reconciliation和session内容，不等于完整删除。普通`start`无需开启；手动学习应运行四个named套件：`pnpm test:session-usage-retention-memory`、`pnpm test:session-usage-retention-mysql`、`pnpm test:session-usage-retention-worker`、`pnpm test:session-usage-retention-worker-mysql`，真实MySQLURL必须指向可丢弃测试库。worker已内嵌runner，不新增服务、JavaScript入口或镜像；production拒绝启用。BYOK删除也已确认只处理本系统副本，厂商侧撤销由客户负责；现有external blocker不能据此伪造远端撤销成功。
+`0052`是仅限本地、默认关闭的ordinary session operational usage retention。只移除已核对的operational ledger并保留匿名billing facts、reconciliation和session内容，不等于完整删除；0053绑定failed-step的source usage仍不可清理。普通`start`无需开启；手动学习应运行四个named套件：`pnpm test:session-usage-retention-memory`、`pnpm test:session-usage-retention-mysql`、`pnpm test:session-usage-retention-worker`、`pnpm test:session-usage-retention-worker-mysql`，真实MySQLURL必须指向可丢弃测试库。worker已内嵌runner，不新增服务、JavaScript入口或镜像；production拒绝启用。BYOK删除也已确认只处理本系统副本，厂商侧撤销由客户负责；现有external blocker不能据此伪造远端撤销成功。
 
 本项目当前只有两个应用服务：
 
@@ -41,7 +45,7 @@
 | --- | --- | --- | --- |
 | `agent-router` | `http://127.0.0.1:8080` | 是 | 对外入口、runner 发现、session owner 路由、SSE 透传和一次安全重路由 |
 | `agent-runner` | `http://127.0.0.1:8787` | 是 | 鉴权、Agent Runtime API、模型执行、session/turn/item/event/approval 与 Blob 生命周期 |
-| MySQL | `127.0.0.1:3306` | 是，外部基础设施 | 业务真相及生命周期证据；包含0032/0033 telemetry lifecycle、0034 writer、0035 application capture、0036默认休眠的disposition ledger、0037 grant hard-deny trigger、0038新write不可变membership/source sidecar，0039 T3f owner-closure、0040～0042 T3d source/观察目标/逐artifact plan目录、0044默认休眠的pre-grant intent/claim、0049硬拒启用的capture v2结构，以及0050 session行上的普通DELETE保留floor证据 |
+| MySQL | `127.0.0.1:3306` | 是，外部基础设施 | 业务真相及生命周期证据；包含0032/0033 telemetry lifecycle、0034 writer、0035 application capture、0036默认休眠的disposition ledger、0037 grant hard-deny trigger、0038新write不可变membership/source sidecar，0039 T3f owner-closure、0040～0042 T3d source/观察目标/逐artifact plan目录、0044默认休眠的pre-grant intent/claim、0049休眠capture v2结构与0053 default-off受控日志来源，以及0050/0051普通DELETE保留floor和0052 usage证据 |
 | Redis | `127.0.0.1:6379` | 是，外部基础设施 | lease hash内owner目录、fence、hot replay stream、瞬时event Pub/Sub及T3g永久purge marker |
 | MinIO | `http://127.0.0.1:9000` | 可选，外部基础设施 | 本地/CI的真实S3-compatible Blob、restore-journal、backup-catalog、telemetry writer及0036非生产journal协议测试面；五个独立bucket仍共享同机单实例，不是生产独立故障域，也不是第三个产品应用服务 |
 | `packages/sdk` | — | 否 | 供客户端使用的 TypeScript SDK |
@@ -97,7 +101,7 @@ scripts/build-local-minio.sh
 
 `0031`采用更窄的operator边界：全部`BACKUP_CATALOG_*`、`TENANT_BACKUP_CATALOG_*`及backup/restore/eviction operation变量都会从长期runner和router剥离，只在`pnpm maintenance:backup-catalog -- <command>`中恢复调用方显式值；router配置会拒绝这些变量泄漏。router仅从runner capability观察公开catalog namespace/target/runtime-binding digest，不持有S3 endpoint、credential、failure-domain原始ID或retention operator authority。catalog bucket必须与Blob和restore-journal bucket都不同；这些bucket以及后续独立telemetry测试bucket仍共享一个MinIO进程，不得解释为生产独立故障域。
 
-`0034` writer现已接runner，但`TENANT_TELEMETRY_WRITER_ENABLED`默认`0`。filesystem模式必须使用`STORE=mysql`、精确`TENANT_TELEMETRY_REF_KEY`、namespace/failure-domain identity、私有目录和single-runner ACK；该ACK不是自动证明，adapter没有OS lock，`NODE_ENV=production`会拒绝。S3模式使用独立`TENANT_TELEMETRY_S3_*` namespace/failure-domain、bucket/prefix、region/endpoint/addressing、private-ACK、timeout与runner-only credential；target identity不含credential。production custom endpoint必须为HTTPS，private-bucket ACK只可在独立访问/IAM审计后设置，不能把人工ACK当自动证明。0035 logs capture active时还必须匹配内置provider producer protocol/contract，traces active会使runner fail closed。仓库没有activation命令，普通`start`保持inactive；不要手改数据库尝试体验。当前只接`provider.upstream_request_failed` logs；任何writer ACK都不是删除、恢复或擦除完成。
+`0034` writer现已接runner，但`TENANT_TELEMETRY_WRITER_ENABLED`默认`0`。filesystem只适合独占本地root，single-runner ACK不是OS lock，production拒绝；0053 v2 capture只支持MySQL+S3 writer，不用filesystem作为替代。S3模式使用独立`TENANT_TELEMETRY_S3_*` identity、bucket/prefix、region/endpoint、private ACK和runner-only credential，target identity不含credential；private ACK不是自动证明。0035 v1与traces capture必须inactive；0053另有受控activation入口，普通`start`不会自动启用。唯一v2 producer为`provider.upstream_request_failed`，任何writer ACK都不是删除、恢复或全域完成。
 
 生产first-admin bootstrap不再把key写到stdout/stderr。只有runner可以同时接收`ADMIN_BOOTSTRAP_TENANT`与绝对路径`ADMIN_BOOTSTRAP_OUTPUT_FILE`；缺任一、路径非绝对、与`BOOTSTRAP_API_KEY`并用，或把output变量注入router都会fail closed。runner用create-only `wx`、`0600`写一行key，随后`fsync`文件和父目录，绝不覆盖既有文件，也不会创建父目录或记录tenant/path/key；同一路径并发writer只有一个成功。文件写入先于数据库提交：若随后store失败，文件会保留而进程失败，operator必须核对数据库状态，不能自动删除或覆盖唯一证据。这个文件只提供同一共享文件系统内的互斥，不是跨VM/容器singleton；只允许一个受控one-shot实例执行，验证key后导入真实Secret manager，撤掉两个变量并按安全策略处理文件。日常`start`不应在`.env`里长期保留这对变量；统一脚本的普通`start`和`verify`都会从runner/router子进程显式清除它们，router配置层也会拒绝残留。
 
@@ -151,7 +155,21 @@ curl -sS http://127.0.0.1:8080/v1/capabilities | python3 -m json.tool
 
 capability中的`blobStorage`应显示`shared=true`、generation 1以及不含endpoint/credential的backend与namespace digest。两个独立S3 client的跨实例可见性、并发相同/冲突create、put/delete竞态、重启后tombstone、prefix隔离和anonymous raw GET拒绝由`verify-s3`自动验证；同一命令还会执行`0028`真实MySQL+MinIO mover套件，并以独立临时MySQL库启动源码runner/router，核对`0027` write-once control、`0028` dormant ledger和exact namespace协商，证明对象存储凭据只进入runner。普通`smoke`只检查已经启动的应用入口，不替代这些协议与装配套件。体验后可以停服务，但不能在同一已激活数据库上改回filesystem；若需切回默认路径，使用新的可丢弃数据库而不是修改`blob_storage_control`。
 
-要手动观察telemetry S3 writer，当前安全入口是`verify-s3`：它会为测试子进程设置独立bucket及所需的`S3_TEST_*`变量；单独在新shell运行`pnpm test:tenant-telemetry-writer-s3`不会继承这些变量。真实MinIO文件使用第四个独立bucket和两个client验证`telemetry-s3-object-v1`的create-only、checksum envelope、cross-client exact replay、冲突不覆盖、positive bucket preflight与anonymous GET拒绝；bounded stream、response-loss、corruption和preflight负例属于`pnpm test:tenant-telemetry-writer`中的S3 unit故障注入。不要为了“看见对象”而手改0033/0035 control或在普通业务库打开writer：仓库尚无activation/operator CLI，`.env.example`中的`TENANT_TELEMETRY_S3_*`只记录runner配置契约，不构成activation授权。private ACK默认`0`；完成独立访问/IAM检查后必须显式改成`1`才能构造本地S3 writer，保持`0`会fail closed。该bucket与前三个bucket仍共享同机MinIO，也不构成云IAM/KMS或独立故障域证明。
+要手动观察telemetry S3 writer，首选`verify-s3`：它给测试子进程配置第四个独立bucket与`S3_TEST_*`，单独新shell不会继承。实际adapter与两个client核对create-only、checksum envelope、exact replay、冲突不覆盖、bucket preflight与anonymous GET拒绝；0053 named E2E另走真实provider故障、公开Runtime API及私有fresh fleet HTTP gate到真实MySQL/MinIO。不要手改control或在普通业务库打开writer；受控`telemetry-capture`用法见下节，`.env.example`本身不是授权。private ACK默认`0`，独立验证后才可显式`1`，同机不同bucket仍不构成云IAM/KMS或独立故障域证明。
+
+### 0053 本地 provider failure capture（默认关闭）
+
+完整门禁及启用流程见[本地受控capture](local-and-deployment.md#0053-本地受控-provider-failure-capture)。先运行`pnpm test:telemetry-capture-operator`、`pnpm test:telemetry-operator-key-compatibility`、`pnpm test:persisted-provider-failure-capture`；有可丢弃MySQL时再运行`pnpm test:persisted-provider-capture-mysql`，HTTP/MySQL/MinIO端到端由`verify-s3`中的`test:telemetry-capture-mysql-s3`执行。required JSON要求目标文件非零通过且零skip，test-only SIGKILL driver不发布。
+
+一次性`pnpm maintenance:telemetry-capture -- <command>`只有五command：`status`真只读DB；`preflight`会mutation content-free S3 probe并明确输出`capabilityProbe=true/mutatedProbeObjects=true`；`activate-lifecycle`提交0033双target/coverage/receipt；`activate-logs`只提交v2 logs activation；`verify-source`独立RR核对真实item/event/usage/billing/source/spool/member/reservation/ACK/inventory，只输出计数与摘要。所有连接verify-only、无DDL、local-only，shared timeout/AbortSignal覆盖原生MySQL和S3；取消不是DB/S3回滚保证。
+
+operator使用`TELEMETRY_CAPTURE_REF_KEY_FILE`：绝对路径、owner-only/current UID/single-link regular file、恰好32 raw bytes，不是hex；symlink/FIFO/读取期间身份变化均拒绝。旧backup/restore使用同reader的可选`TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`，0033 active必须exact。direct CLI存在应用hex `TENANT_TELEMETRY_REF_KEY`（包括空值）即拒绝；三个wrapper清除此应用变量且保持caller-first file输入，长期服务剥离operator file/全部`TELEMETRY_CAPTURE_*`。不得输出key、路径、原始source ID、URL、model正文或异常文本。
+
+activation之前必须真实停止/排空全部writer、独立迁移0053、完成0030 primary activation，并从DB核对exact epoch/lineage/journal target/head；环境自报epoch或inactive control无效。四个`TELEMETRY_CAPTURE_*_ACK=1`只分别声明local-only、fleet-stopped、legacy-writers-drained、producer-ready，配合exact configured-fleet root；不是自动停服/boot证明。启动后两role gate与真实私有HTTP请求每次重验全部configured直连origin、各自nonce、唯一runner/boot和key/target/control/epoch binding，不用healthy子集或cached proof。
+
+原provider failure的capture边界及0034worker `claim/reserve/create/ack`四边界均fail closed。首次create必须仍满足live owner；历史exact object/ACK仅可恢复原operation，不授予新create权限。v2 gate不可用时，worker仍能在LIMIT前筛选并领取legacy v1/traces队列，不把v2降级或让legacy被挡。绑定来源的usage/lastSeq不可静默部分提交、改写或自动清理；历史NULL/0不补造。
+
+0053相关组合启动指纹为160、当前全库trigger数为662，不能混为一个数字。必须全pre-0053 writer/在途事务排空后独立迁移，只运行新版本、禁止热混跑并forward-fix。真正`0052→0053`升级夹具钉住旧代码，编译并在真实MySQL提交旧failed-step后升级，证明旧来源unknown、新control默认休眠、DDL/marker/drift及旧binary拒绝新指纹，不能用fresh schema替代。capture active仍阻断T3d/T3f及tenant erasure；v1/traces、真实grant、外部处置/恢复与所有completion未开放，active capture新epoch恢复仍无自动rebind。
 
 ### 0030 独立 restore journal 本地演练（只用可丢弃数据库）
 
@@ -299,7 +317,7 @@ pnpm maintenance:backup-catalog -- reconcile
 
 ### 本地MySQL加密逻辑备份制品（只用可丢弃数据库）
 
-本轮只支持telemetry lifecycle inactive数据库。旧backup/restore CLI没有注入0033 active所需exact ref key，active状态安全拒绝；17例真实验证不能外推此配置。后续激活provider capture前须补受保护key接线和active状态备份/恢复测试。
+backup/restore CLI已补受保护exact ref-key文件接线：0033 inactive可无key，active必须以同一key审计source与实际import后的target，missing/wrong key仍拒绝。真实active0033制品create→restore-selected→restore-ledger replay/verify/getter用例已接必执行套件，验收结果只看PROGRESS及当次JSON，不沿用旧inactive测试结果。它不覆盖active capture跨epoch恢复，既有capture receipt与旧epoch绑定，恢复到新epoch仍fail closed、无自动rebind。具体权限、raw32byte格式和内存填零时机见[备份运维契约](local-and-deployment.md#本地mysql加密逻辑备份制品)。
 
 旧0031流程只保存operator-attested摘要；新增的`create-artifact`才真实调用MySQL 8 mysqldump生成InnoDB应用逻辑SQL，以独立key加密，并把已认证实际bytes的证据发布到同一catalog。`verify-artifact`认证完整制品及catalog/anchor，也可对账content-free投影，不能叫严格只读；`restore-selected`真实导入隔离空target，只到prepared。仍只有router/runner两个长期服务，仍使用既有`backup-catalog.js`入口，不新增migration或镜像。
 
@@ -404,6 +422,10 @@ pnpm test:tenant-telemetry-lifecycle
 pnpm test:tenant-telemetry-lifecycle-memory
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-telemetry-lifecycle-mysql
 pnpm test:tenant-telemetry-application-capture
+pnpm test:telemetry-capture-operator
+pnpm test:telemetry-operator-key-compatibility
+pnpm test:persisted-provider-failure-capture
+MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:persisted-provider-capture-mysql
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-telemetry-application-capture-mysql
 pnpm test:tenant-telemetry-writer
 MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:tenant-telemetry-writer-mysql
@@ -451,6 +473,13 @@ env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
   S3_TENANT_TELEMETRY_TEST_BUCKET="$S3_TENANT_TELEMETRY_TEST_BUCKET" \
   S3_TEST_ACCESS_KEY_ID="$S3_TEST_ACCESS_KEY_ID" S3_TEST_SECRET_ACCESS_KEY="$S3_TEST_SECRET_ACCESS_KEY" \
   S3_TEST_FORCE_PATH_STYLE="$S3_TEST_FORCE_PATH_STYLE" pnpm test:tenant-telemetry-writer-s3
+# 0053实际公开Runtime/private fresh fleet HTTP→MySQL→MinIO，复用第四个telemetry与restore bucket。
+env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
+  S3_TENANT_TELEMETRY_TEST_BUCKET="$S3_TENANT_TELEMETRY_TEST_BUCKET" \
+  S3_RESTORE_JOURNAL_TEST_BUCKET="$S3_RESTORE_JOURNAL_TEST_BUCKET" \
+  S3_TEST_ACCESS_KEY_ID="$S3_TEST_ACCESS_KEY_ID" S3_TEST_SECRET_ACCESS_KEY="$S3_TEST_SECRET_ACCESS_KEY" \
+  S3_TEST_FORCE_PATH_STYLE="$S3_TEST_FORCE_PATH_STYLE" \
+  MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:telemetry-capture-mysql-s3
 # 0036独立disposition journal使用第五个bucket；这仅是非生产协议夹具。
 env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
   S3_TELEMETRY_DISPOSITION_TEST_BUCKET="$S3_TELEMETRY_DISPOSITION_TEST_BUCKET" \
@@ -483,6 +512,14 @@ env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
   S3_TEST_FORCE_PATH_STYLE="$S3_TEST_FORCE_PATH_STYLE" \
   MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" \
   pnpm test:backup-catalog-restore-roundtrip-mysql-s3
+# 真实加密制品/active0033恢复审计还需已核验的绝对MySQL8工具路径。
+env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
+  S3_RESTORE_JOURNAL_TEST_BUCKET="$S3_RESTORE_JOURNAL_TEST_BUCKET" \
+  S3_BACKUP_CATALOG_TEST_BUCKET="$S3_BACKUP_CATALOG_TEST_BUCKET" \
+  S3_TEST_ACCESS_KEY_ID="$S3_TEST_ACCESS_KEY_ID" S3_TEST_SECRET_ACCESS_KEY="$S3_TEST_SECRET_ACCESS_KEY" \
+  S3_TEST_FORCE_PATH_STYLE="$S3_TEST_FORCE_PATH_STYLE" \
+  BACKUP_MYSQL_BINARY="$BACKUP_MYSQL_BINARY" BACKUP_MYSQLDUMP_BINARY="$BACKUP_MYSQLDUMP_BINARY" \
+  MYSQL_TEST_URL="mysql://root@127.0.0.1:3306/agent_service_test" pnpm test:mysql-backup-artifact-mysql-s3
 # 0028真实mover使用普通S3_TEST_BUCKET，并同时连接可丢弃MySQL测试库。
 env S3_TEST_ENDPOINT="$S3_TEST_ENDPOINT" S3_TEST_REGION="$S3_TEST_REGION" \
   S3_TEST_BUCKET="$S3_TEST_BUCKET" S3_TEST_ACCESS_KEY_ID="$S3_TEST_ACCESS_KEY_ID" \
@@ -848,7 +885,7 @@ generation `0` compensation 没有公开 API，也不应通过手工 SQL 在业�
 
 ### Tenant erasure T2/T3a/T3b/T3c/T3d/T3e/T3f/T3g、0026/0029/0030/0031/0032/0033/0034/0035 边界（只对可丢弃 tenant 体验）
 
-T2 已提供 router-only `POST /v1/tenant-erasure-requests` 和 `GET /v1/tenant-erasure-requests/{requestId}`，使用与 tenant API key/admin key 完全独立的 platform bearer。POST 会原子写入admission、tenant lifecycle gate、首条audit、credential fence和T3a job；T3a清除本地DB credential material，`0026`把删除前的coverage/slot/version/external-KMS target inventory以无敏感值sidecar绑定同一事务，T3b fence configured fleet，T3c建立DB-time owner清单，T3d把33域封存为不可执行plan。T3e同样没有公开API：runner内嵌worker在fresh all-configured barrier后，只原子去身份化operational usage、撤销export/释放snapshot pin、为Blob/export bytes写exact outbox，并在原cleanup worker真正完成这些outbox后seal physical ACK。T3f再从terminal T3e receipt建独立queue，在一个事务内清理固定11个本地数据库投影、保留匿名billing facts并写永久session grave。T3g最后从T3f grave及T3d Redis plan建立精确target，用真实Redis Lua删除lease/owner、fence与stream并写永久防复活marker。受信任的新provider写入可以为0026 external target建立受保护reference，`0029`据此提供default-dormant执行/ACK协议；但当前只有Memory fake，标准MySQL栈不启用，真实provider/KMS仍未执行。`0027`只证明Blob/export共享namespace和物理对象协议，`0028`只证明停服搬迁及pointer/control cutover，两者都不授予全域删除authority；`0030`为T1 fence提供独立journal、runtime lineage与恢复replay，`0031`再为恢复建立权威backup catalog、source binding和永久epoch reservation；`0032`安装安全telemetry入口与dormant logs/traces inventory，`0033`补原子activation receipt、canonical tenant coverage和immutable artifact inventory，`0034`补payload-before-sink spool、reservation、writer ACK/inventory基座并接入默认关闭的runner filesystem/S3 writer，`0035`增加分域producer capture；当前仅单一provider failure logs contract，没有activation CLI、traces producer、delete/CAS tombstone、external deletion journal或restore/retention。T3e/T3f/T3g及0029也始终固定`allDomainsComplete=false`、`contentPurgeExecuted=false`，0029还固定`kmsKeyExecutionComplete=false`。0031不创建物理backup，0032～0035也不证明backup内tenant erasure、logs/traces delete/restore、managed对象存储/IAM验收或全域completion。所有这些gate和已提交操作都不可当作可逆功能；`status=gated`不是`completed`。普通本地`start`保持writer/capture gate关闭，不会产生sink写入。
+T2 已提供 router-only `POST /v1/tenant-erasure-requests` 和 `GET /v1/tenant-erasure-requests/{requestId}`，使用与 tenant API key/admin key 完全独立的 platform bearer。POST 会原子写入admission、tenant lifecycle gate、首条audit、credential fence和T3a job；T3a清除本地DB credential material，`0026`把删除前的coverage/slot/version/external-KMS target inventory以无敏感值sidecar绑定同一事务，T3b fence configured fleet，T3c建立DB-time owner清单，T3d把33域封存为不可执行plan。T3e同样没有公开API：runner内嵌worker在fresh all-configured barrier后，只原子去身份化operational usage、撤销export/释放snapshot pin、为Blob/export bytes写exact outbox，并在原cleanup worker真正完成这些outbox后seal physical ACK。T3f再从terminal T3e receipt建独立queue，在一个事务内清理固定11个本地数据库投影、保留匿名billing facts并写永久session grave。T3g最后从T3f grave及T3d Redis plan建立精确target，用真实Redis Lua删除lease/owner、fence与stream并写永久防复活marker。受信任的新provider写入可以为0026 external target建立受保护reference，`0029`据此提供default-dormant执行/ACK协议；但当前只有Memory fake，标准MySQL栈不启用，真实provider/KMS仍未执行。`0027`只证明Blob/export共享namespace和物理对象协议，`0028`只证明停服搬迁及pointer/control cutover，两者都不授予全域删除authority；`0030`为T1 fence提供独立journal、runtime lineage与恢复replay，`0031`再为恢复建立权威backup catalog、source binding和永久epoch reservation；`0032`安装安全telemetry入口与dormant logs/traces inventory，`0033`补原子activation receipt、canonical tenant coverage和immutable artifact inventory，`0034`补payload-before-sink spool、reservation、writer ACK/inventory基座并接入默认关闭的runner filesystem/S3 writer，`0035`增加分域producer capture；当前仅单一provider failure logs contract，没有0035 v1 activation入口、traces producer、delete/CAS tombstone、external deletion journal或restore/retention。T3e/T3f/T3g及0029也始终固定`allDomainsComplete=false`、`contentPurgeExecuted=false`，0029还固定`kmsKeyExecutionComplete=false`。0031不创建物理backup，0032～0035也不证明backup内tenant erasure、logs/traces delete/restore、managed对象存储/IAM验收或全域completion。所有这些gate和已提交操作都不可当作可逆功能；`status=gated`不是`completed`。普通本地`start`保持writer/capture gate关闭，不会产生sink写入。
 
 **只能在可丢弃的本地数据库和tenant上执行以下步骤。** 最简单的做法是先停服务，在 `.env` 中把 `BOOTSTRAP_TENANT_ID` 改成专用演示 ID（例如 `t_tenant_erasure_demo`），确认现有本地数据可删除后再运行 `deploy/local/infra.sh reset-db`。该命令会重建本地业务/测试库并对本地 Redis 执行 `FLUSHALL`，不得对需保留的数据使用。若只体验T2逻辑fence，保持T3a～T3g execution/worker/endpoint开关为`0`；若要体验T3a～T3d，必须先确认tenant可丢弃，且 `.env` 中的`RUNNER_ID=runner-local-1`为显式稳定值、`RUNNERS`直连该单runner。先保持T3e/T3f/T3g六道gate为`0`完成并检查T3d plan；T3e会真实匿名化/撤销/调度删除，T3f会真实删除本地数据库投影，T3g会真实修改Redis并留下永久marker，只能按后文分阶段开启。多runner不能照抄这些本地命令。
 
@@ -1303,13 +1340,15 @@ scripts/local-service.sh smoke
 
 scripts/local-service.sh verify
 # 无真实模型费用；运行 secret/API drift/typecheck、MySQL/Redis 集成、
-# 包含0032～0049 telemetry evidence/activation/inventory/writer/capture/disposition/pre-grant/observer及grant Memory+真实MySQL套件、0050/0051普通DELETE宽限期及来源guard、0052本地ordinary usage执行、T3a～T3g、0026 credential lifecycle、0027 Blob control、0028 migration ledger/历史升级与mover artifact、0029 external-target、0030 restore-journal及0031 backup-catalog Memory/真实MySQL账本，以及policy/evaluator/erasure/export专项；真实MinIO协议只在verify-s3、
-# 0007→...→0044→0049→0050→0051→0052 历史schema迁移及冻结0042→0043代码兼容夹具、真实多进程 cluster（含T3g mixed-worker/namespace/active-fleet精确no-skip套件）、
-# SDK、router/runner长期入口与runner三个one-shot维护入口的构建/启动门禁
+# 包含telemetry/default-off 0053 capture provenance/operator/真实MySQL、0050/0051普通DELETE来源、0052本地usage、T3a～T3g及其它生命周期专项；真实MinIO协议只在verify-s3、
+# 0007→...→0044→0049→0050→0051→0052→0053 历史schema迁移及冻结0042→0043代码兼容夹具、真实多进程 cluster（含T3g mixed-worker/namespace/active-fleet精确no-skip套件）、
+# SDK、router/runner长期入口与runner四个one-shot维护入口的构建/启动门禁
 
 scripts/local-service.sh verify-s3
 # 无模型费用；显式启动本地MinIO，证明Blob、0028 mover、0030 restore-journal、0031 backup-catalog
 # 与telemetry writer、GET-only observer及非生产v3 journal真实S3套件零skip，
+# 实际provider HTTP/stream故障→公开Runtime/private fresh fleet gate→MySQL→MinIO bytes/ACK，
+# 加密backup create/import及active0033 exact key显式restore-ledger verify，
 # 并以临时MySQL运行源码runner/router装配smoke
 
 scripts/local-service.sh verify-real
@@ -1324,6 +1363,8 @@ scripts/local-service.sh acceptance
 0043无新migration，仍由`pnpm test:tenant-purge-plan-memory`、`pnpm test:tenant-purge-plan-mysql`、`pnpm test:tenant-purge-execution-mysql`和T3f定向套件覆盖只读候选与非零目标T3e live recheck。`pnpm test:migrations`还通过required manifest独立运行`packages/store/test/migrations/0042-binary-to-0043.migration.ts`：它在真实MySQL运行冻结的0042旧产品二进制，保留旧非空T3e阻断及零target T3f terminal，再用当前代码只读核对。夹具源钉在已发布的0042提交，不是根据当前工作树临时构造；required wrapper要求该文件实际执行、非skip且有断言。该测试证明代码级历史兼容，不代表0043增加schema，也不授权修复旧blocked job。单独定向运行时需使用迁移专用Vitest config和可丢弃的`MYSQL_MIGRATION_TEST_URL`，不要用默认Vitest扫描来推断它未运行。
 
 开发尚未提交的migration时，若同一个持久化`agent_service_test`已经记录该migration marker、SQL/trigger body随后又被修改，或DDL已部分自动提交但marker尚未写入，启动指纹应当fail closed；不要因此弱化指纹，也不要让runtime静默改写已应用migration。先确认目标确实是可丢弃且名称含`test`的测试库，再重建该库，或新建一个空测试库并通过`MYSQL_TEST_URL`运行验证；不得把这条开发期处置用于需保留的`agent_service`业务库。migration一旦发布即视为immutable，后续结构或trigger变化必须新增forward migration。
+
+如果旧测试库的来源或可丢弃性不明确，保留原库与失败报告，选择新的空隔离库；完整`verify`的基库名称须包含独立的`test`段（例如`agent_service_test_manual_20261013`，而不是`agent_service_capture_verify_20261013`；仅迁移定向夹具可接受独立`migration`段）。创建前先只读确认该名称不存在，不能用`CREATE DATABASE IF NOT EXISTS`把已有库当成空库。完整`verify`应显式设置`MYSQL_TEST_URL`与`MYSQL_MIGRATION_TEST_URL`指向同一新隔离基库；`CLUSTER_MYSQL_URL`仍使用另一专用、可丢弃的cluster库。后续`verify-s3`继续使用相同的`MYSQL_TEST_URL`。这些本地测试串行运行，不要让两个验证进程或手动体验服务同时写共享测试库；不能通过删marker、删guard、扩大超时或忽略skip来制造成功。
 
 使用自定义`MYSQL_TEST_URL`时，先显式创建其指向的空基库；历史迁移夹具会另建临时库，但`mysql-redis.test.ts`等conformance文件直接连接这个基库。cluster套件也有独立基库，若默认库曾被开发中的migration部分更新，应一起换成新的空库。选尚不存在、名称含`test`的可丢弃库，例如：
 
@@ -1343,7 +1384,7 @@ scripts/local-service.sh verify
 
 日常开发至少运行与修改范围匹配的定向测试；合并或里程碑冻结前运行完整 `verify`。真实模型路径只有在明确需要时运行，不能把未重跑的历史结果描述为本轮结果。
 
-手动体验不必等到 M1/M3/M4 全部完成：每个安全切片先做短smoke，能更早发现交互和运维问题；待整体架构的local/CI范围完成后，再按第3～6节做一次完整walkthrough作为阶段验收。policy/hold、non-destructive evaluator、异步user export、tenant T1/T2/T3a、`0026` versioned credential inventory、`0027` shared S3 namespace control、`0028` offline filesystem→S3 mover、T3b runtime drain、T3c owner inventory、T3d plan、T3e local usage/Blob/export execution/ACK、T3f本地数据库投影清理、T3g session-scoped Redis三域、0029 default-dormant协议/Memory fake/真实MySQL账本、`0030`独立journal/runtime lineage/永久恢复fence、`0031`权威backup catalog/source binding/runtime reservation/retention CLI，以及`0032`～`0035`安全telemetry入口、原子activation/inventory、default-dormant writer/reservation/ACK和S3-compatible write target均已有本地/CI代码；tenant流程、S3 cutover、backup catalog与restore演练都只能使用可丢弃数据，因为其中多条边界不可逆。0029 fake不是真实provider/KMS；0031不创建物理backup，本机MinIO也不是独立故障域；0035只接单一provider failure logs。traces、activation CLI、0036～0044可执行的外部disposition/delete/restore、真实DB grant签发、旧快照replay/startup gate及retention executor仍缺失；0037的v2 Memory夹具、0038新write sidecar和0039 T3f本地closure、0040/0041 T3d来源/观察目标、0042新plan目录、0043本地候选与0044 pre-grant intent/claim也不能替代可信DB授权、产品S3 mutation或旧快照恢复；非生产CAS tombstone/journal夹具不能替代这些能力，普通start保持inactive。当前尚未接线或未验收的还包括provider/KMS真实adapter、backup内tenant erasure/其它domain恢复证据、logs/traces完整执行生命周期、managed对象存储/IAM真实环境、大规模mover/restore维护窗口、全域completion proof、generic user物理purge、M3扩展和M4生产化，不能提前模拟成已存在。
+手动体验不必等到 M1/M3/M4 全部完成：每个安全切片先做短smoke，能更早发现交互和运维问题；待整体架构的local/CI范围完成后，再按第3～6节做一次完整walkthrough作为阶段验收。policy/hold、non-destructive evaluator、异步user export、tenant T1/T2/T3a、`0026` versioned credential inventory、`0027` shared S3 namespace control、`0028` offline filesystem→S3 mover、T3b runtime drain、T3c owner inventory、T3d plan、T3e local usage/Blob/export execution/ACK、T3f本地数据库投影清理、T3g session-scoped Redis三域、0029 default-dormant协议/Memory fake/真实MySQL账本、`0030`独立journal/runtime lineage/永久恢复fence、`0031`权威backup catalog/source binding/runtime reservation/retention CLI，以及`0032`～`0035`安全telemetry入口、原子activation/inventory、default-dormant writer/reservation/ACK和S3-compatible write target均已有本地/CI代码；tenant流程、S3 cutover、backup catalog与restore演练都只能使用可丢弃数据，因为其中多条边界不可逆。0029 fake不是真实provider/KMS；0031不创建物理backup，本机MinIO也不是独立故障域；0035只接单一provider failure logs。traces producer、0036～0044可执行的外部disposition/delete/restore、真实DB grant签发、旧快照replay/startup gate及retention executor仍缺失；0037的v2 Memory夹具、0038新write sidecar和0039 T3f本地closure、0040/0041 T3d来源/观察目标、0042新plan目录、0043本地候选与0044 pre-grant intent/claim也不能替代可信DB授权、产品S3 mutation或旧快照恢复；非生产CAS tombstone/journal夹具不能替代这些能力，普通start保持inactive。当前尚未接线或未验收的还包括provider/KMS真实adapter、backup内tenant erasure/其它domain恢复证据、logs/traces完整执行生命周期、managed对象存储/IAM真实环境、大规模mover/restore维护窗口、全域completion proof、generic user物理purge、M3扩展和M4生产化，不能提前模拟成已存在。
 
 ## 7. 本地源码进程与生产构建产物
 
@@ -1357,10 +1398,11 @@ source .env
 set +a
 for name in ${(k)parameters}; do
   case "$name" in
-    BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*) unset "$name" ;;
+    BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TELEMETRY_CAPTURE_*) unset "$name" ;;
   esac
 done
 unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID \
+  TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED \
   ADMIN_BOOTSTRAP_TENANT ADMIN_BOOTSTRAP_OUTPUT_FILE \
   TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED TENANT_RUNTIME_DRAIN_EXECUTION_ENABLED \
   TENANT_PURGE_EXECUTION_ENABLED TENANT_DATABASE_PURGE_ENABLED TENANT_REDIS_PURGE_ENABLED \
@@ -1390,10 +1432,11 @@ source .env
 set +a
 for name in ${(k)parameters}; do
   case "$name" in
-    MYSQL_*|S3_TEST_*|AWS_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*|SESSION_DELETE_GRACE_RECOVERY_*|SESSION_USAGE_RETENTION_*) unset "$name" ;;
+    MYSQL_*|S3_TEST_*|AWS_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*|TELEMETRY_CAPTURE_*|SESSION_DELETE_GRACE_RECOVERY_*|SESSION_USAGE_RETENTION_*) unset "$name" ;;
   esac
 done
 unset API_KEY API_BASE_URL DEFAULT_MODEL PLATFORM_PROVIDER \
+  PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED \
   SECRETS_MASTER_KEY BOOTSTRAP_API_KEY BOOTSTRAP_TENANT_ID \
   ADMIN_BOOTSTRAP_TENANT ADMIN_BOOTSTRAP_OUTPUT_FILE \
   TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED \
@@ -1447,22 +1490,23 @@ node scripts/build-app.mjs agent-runner
 node scripts/build-app.mjs agent-router
 ```
 
-SDK和两个应用的五个JavaScript入口分别生成：
+SDK与两个应用的六个JavaScript入口分别生成：
 
 - `packages/sdk/dist/` 中的 JavaScript、类型声明及 source maps；
 - `apps/agent-runner/dist/main.js`；
 - `apps/agent-runner/dist/blob-storage-migrate.js`；
 - `apps/agent-runner/dist/restore-ledger-reconcile.js`；
 - `apps/agent-runner/dist/backup-catalog.js`；
+- `apps/agent-runner/dist/telemetry-capture.js`；
 - `apps/agent-router/dist/main.js`；
 - 对应 source map、`dist/package.json` 和 SQL migrations。
 
-这些是 Node 24 的单文件 ESM bundle，不是 Windows `.exe` 或 Linux ELF 原生机器码。runner的四个入口由同一次`build-app.mjs agent-runner`构建；`main.js`是长期服务，`blob-storage-migrate.js`、`restore-ledger-reconcile.js`和`backup-catalog.js`都是显式调用的一次性维护CLI。构建会内联`@agent-service/*` workspace代码和runner所需的纯JavaScript AWS SDK完整闭包；MySQL、Redis等其余第三方依赖仍由production `node_modules`提供。因此单独复制任一`dist/*.js`仍不是完整的裸VM发布包。
+这些是 Node 24 的单文件 ESM bundle，不是 Windows `.exe` 或 Linux ELF 原生机器码。runner的五个入口由同一次`build-app.mjs agent-runner`构建；`main.js`是长期服务，`blob-storage-migrate.js`、`restore-ledger-reconcile.js`、`backup-catalog.js`和`telemetry-capture.js`都是显式调用的一次性维护CLI。构建会内联`@agent-service/*` workspace代码和runner所需的纯JavaScript AWS SDK完整闭包；MySQL、Redis等其余第三方依赖仍由production `node_modules`提供。因此单独复制任一`dist/*.js`仍不是完整的裸VM发布包。
 
 `pnpm build:check` 在 `pnpm build` 之后还会：
 
 1. 对 SDK 执行真实 `pnpm pack`，在隔离 consumer 中验证包名 import 和 TypeScript 声明；
-2. 分别以`pnpm check:blob-storage-migrate-artifact`、`pnpm check:restore-ledger-reconcile-artifact`与`pnpm check:backup-catalog-artifact`确认三个one-shot产物存在，并用原生Node执行各自稳定`--help`入口；
+2. 分别以`pnpm check:blob-storage-migrate-artifact`、`pnpm check:restore-ledger-reconcile-artifact`、`pnpm check:backup-catalog-artifact`与`pnpm check:telemetry-capture-artifact`确认四个one-shot产物存在，并用原生Node执行各自稳定`--help`入口；
 3. 用原生 Node（不使用 `tsx`）启动 runner/router bundle；
 4. 验证 readiness、capabilities、router 转发、两端 OpenAPI 精确一致，以及 router 保持 platform tenant-erasure 鉴权边界。
 
@@ -1477,12 +1521,12 @@ M4 的 VM 交付须增加带校验和的 `bundle + migrations + production node_
 | 形态 | 实际内容 | 适用场景 |
 | --- | --- | --- |
 | 本地源码进程 | `node --import tsx` 直接加载 `apps/*/src/main.ts` | 日常开发、调试；本节的直接启动和`local-service.sh start`不会自动热重载。包级`pnpm dev`使用`tsx watch`，但会整体加载`.env`，须先满足前述authority隔离要求 |
-| Node 应用 bundle | runner `main.js` + `blob-storage-migrate.js` + `restore-ledger-reconcile.js` + `backup-catalog.js`、router `main.js`，外加 production dependencies 与 migrations | 裸 Linux VM 上以两个长期进程运行；三个维护CLI只在受控维护时前台调用。仓库当前尚未生成完整发布归档/systemd 单元 |
-| Linux OCI 镜像 | Node 24 slim + 对应应用入口 + production dependencies + migrations；runner镜像额外包含三个one-shot CLI | staging/production 推荐交付物，可分别部署到不同 VM、容器平台或 Kubernetes workload |
+| Node 应用 bundle | runner `main.js` + `blob-storage-migrate.js` + `restore-ledger-reconcile.js` + `backup-catalog.js` + `telemetry-capture.js`、router `main.js`，外加 production dependencies 与 migrations | 裸 Linux VM 上以两个长期进程运行；四个维护CLI只在受控维护时前台调用。仓库当前尚未生成完整发布归档/systemd 单元 |
+| Linux OCI 镜像 | Node 24 slim + 对应应用入口 + production dependencies + migrations；runner镜像额外包含四个one-shot CLI | staging/production 推荐交付物，可分别部署到不同 VM、容器平台或 Kubernetes workload |
 
 因此“router/runner 不可变镜像”表示镜像内容在构建后不再修改、环境间使用同一 digest；它不是 Windows 镜像，也不是把 TypeScript 编译成 Linux ELF 或 Windows `.exe`。router 和 runner 确实是两套可独立启动、独立扩缩容、可部署到不同机器的 Node 应用，但镜像通常比手工分发裸 bundle 更容易保证 Node 版本、依赖、迁移与健康检查完全一致。若目标机器不能运行容器，可以部署完整 Node 发布归档；不能只复制一个 `main.js` 就称为完整发布。
 
-无论使用裸进程还是镜像，部署的产品应用仍然只有 router 和 runner。MySQL、Redis、S3-compatible对象存储和KMS是外部基础设施；SDK和内部workspace package不是常驻服务；各类dispatcher/worker在runner进程内运行，不需要额外部署第三个应用。mover、restore reconciler与backup-catalog CLI随runner发布，但只在受控维护窗口按需执行，不注册为额外常驻服务。local Compose/CI为验证S3协议构建MinIO基础设施，不会把它当成agent-service产品镜像发布。
+无论使用裸进程还是镜像，部署的产品应用仍然只有 router 和 runner。MySQL、Redis、S3-compatible对象存储和KMS是外部基础设施；SDK和内部workspace package不是常驻服务；各类dispatcher/worker在runner进程内运行，不需要额外部署第三个应用。mover、restore reconciler、backup-catalog与telemetry-capture CLI随runner发布，但只在受控维护窗口按需执行，不注册为额外常驻服务。local Compose/CI为验证S3协议构建MinIO基础设施，不会把它当成agent-service产品镜像发布。
 
 ## 8. GitHub Actions 构建与验证
 
@@ -1494,9 +1538,9 @@ GitHub 的主测试 job 固定启动最低支持版本 `mysql:8.0.26` 与 Redis 
 另外保留浮动 `mysql:8.0`，因此同一次 CI 同时覆盖最低 SQL 兼容下限和当前 MySQL 8
 镜像。主job还用Go 1.24.8从固定的官方MinIO源码commit构建临时server，分别bootstrap Blob、restore-journal、backup-catalog、tenant-telemetry writer与0036 disposition journal五个测试bucket；它们仍在同一CI MinIO实例中，只用于协议测试，不是独立故障域或云IAM/KMS证明。Blob、catalog与telemetry的真实协议套件会分别检查自己的对象拒绝anonymous raw GET。该临时server不是仓库产品产物，也不会push。随后执行：
 
-TypeScript 检查与发布构建不是同一件事。`pnpm typecheck` 先由根 `tsconfig.json` 引用并检查 `testkit`、`protocol`、`sdk`、`store`、`core`、`providers`、`agent-runner`、`agent-router` 八个 workspace，再由 `tsconfig.typecheck.json` 对各 workspace 的源码/测试及根 `test/`、`scripts/` 做 no-emit 检查。真正生成发布产物的根 `pnpm build` 则只执行 `scripts/build-sdk.mjs` 和两次 `scripts/build-app.mjs`：SDK 用 TypeScript 生成包内容，runner/router 用 esbuild 把内部 `@agent-service/*` workspace 内联进Node ESM bundle；runner构建有`main`、`blob-storage-migrate`、`restore-ledger-reconcile`和`backup-catalog`四个entry point，router只有`main`。MySQL、Redis等服务依赖继续 external，由production `node_modules`提供，而runner使用的纯JavaScript AWS SDK闭包会被完整打包，构建还会拒绝它泄漏为dist运行时裸import。入口分别是根 `package.json` 的 `typecheck`、`build`、`build:check`、三个`check:*artifact`脚本，以及 `scripts/build-sdk.mjs`、`scripts/build-app.mjs`、三个`check-*-artifact.mjs`和`scripts/check-dist-boot.mjs`。
+TypeScript 检查与发布构建不是同一件事。`pnpm typecheck` 先由根 `tsconfig.json` 引用并检查 `testkit`、`protocol`、`sdk`、`store`、`core`、`providers`、`agent-runner`、`agent-router` 八个 workspace，再由 `tsconfig.typecheck.json` 对各 workspace 的源码/测试及根 `test/`、`scripts/` 做 no-emit 检查。真正生成发布产物的根 `pnpm build` 则只执行 `scripts/build-sdk.mjs` 和两次 `scripts/build-app.mjs`：SDK 用 TypeScript 生成包内容，runner/router 用 esbuild 把内部 `@agent-service/*` workspace 内联进Node ESM bundle；runner构建有`main`、`blob-storage-migrate`、`restore-ledger-reconcile`、`backup-catalog`和`telemetry-capture`五个entry point，router只有`main`。MySQL、Redis等服务依赖继续 external，由production `node_modules`提供，而runner使用的纯JavaScript AWS SDK闭包会被完整打包，构建还会拒绝它泄漏为dist运行时裸import。入口分别是根 `package.json` 的 `typecheck`、`build`、`build:check`、四个`check:*artifact`脚本，以及 `scripts/build-sdk.mjs`、`scripts/build-app.mjs`、四个`check-*-artifact.mjs`和`scripts/check-dist-boot.mjs`。
 
-0032～0052在CI中有分层门禁：0032/0033 lifecycle、0034 writer、0035 application capture及0036/0037 disposition/grant分别运行Memory/真实MySQL或unit套件，required wrapper拒绝静默skip。真实MinIO的第四个bucket验证telemetry artifact writer/GET-only observer与同keyCAS marker，第五个bucket验证非生产journal v1/v2观察及v3 fixture/GET-only sealed-chain观察；同机bucket只证明协议，不证明跨MySQL/S3恢复、独立故障域或云IAM/KMS。0038～0042以T3f/T3d Memory/真实MySQL、历史升级及冻结旧二进制terminal夹具验证membership、owner closure、五类source、观察目标与逐artifact catalog；0043以T3e复核和冻结0042旧二进制测试代码兼容，0043本身无DDL。0044以Memory/真实InnoDB及SQL-shaped `0042→0044`夹具验证本地pre-grant intent/claim与严格126-trigger；0049以SQL-shaped `0044→0049`真实MySQL夹具验证default-dormant capture v2、13个hard-deny guards、139-trigger指纹及HMAC source ref协议，0050以Memory/真实MySQL及`0044→0049→0050`夹具验证普通DELETE来源/post-COMMIT 30天floor与严格CHECK；0051另以`0050→0051`真实MySQL历史夹具和0050 named MySQL suite验证write-once trigger、marker-loss重放与BINARY身份冻结，后续code-only恢复caller以Memory/真实MySQL named suite证明默认关闭、原子补seal与错误路径。0045～0048没有DDL，observer和v3 fixture都有unit/真实MinIO必执行套件。runner dist/image检查最新0049、0050、0051 marker只证明休眠schema安装，不等于capture、grant、外部删除/恢复、自动物理purge或全域completion已激活。
+0032～0053在CI中有分层门禁：0032/0033 lifecycle、0034 writer、0035 application capture及0036/0037 disposition/grant分别运行Memory/真实MySQL或unit套件，required wrapper拒绝静默skip。真实MinIO的第四个bucket验证telemetry artifact writer/GET-only observer与同keyCAS marker，第五个bucket验证非生产journal v1/v2观察及v3 fixture/GET-only sealed-chain观察；同机bucket只证明协议，不证明跨MySQL/S3恢复、独立故障域或云IAM/KMS。0038～0042以T3f/T3d Memory/真实MySQL、历史升级及冻结旧二进制terminal夹具验证membership、owner closure、五类source、观察目标与逐artifact catalog；0043以T3e复核和冻结0042旧二进制测试代码兼容，0043本身无DDL。0044以Memory/真实InnoDB及SQL-shaped `0042→0044`夹具验证本地pre-grant intent/claim与严格126-trigger；0049以SQL-shaped `0044→0049`真实MySQL夹具验证default-dormant capture v2、13个hard-deny guards、139-trigger指纹及HMAC source ref协议，0050以Memory/真实MySQL及`0044→0049→0050`夹具验证普通DELETE来源/post-COMMIT 30天floor与严格CHECK；0051另以`0050→0051`真实MySQL历史夹具和0050 named MySQL suite验证write-once trigger、marker-loss重放与BINARY身份冻结，后续code-only恢复caller以Memory/真实MySQL named suite证明默认关闭、原子补seal与错误路径。0045～0048没有DDL，observer和v3 fixture都有unit/真实MinIO必执行套件。runner dist/image检查完整marker链（含0052/0053）只证明休眠schema安装，不等于capture、grant、外部删除/恢复、自动物理purge或全域completion已激活。
 
 1. 凭据扫描；
 2. frozen-lockfile 安装；
@@ -1504,7 +1548,7 @@ TypeScript 检查与发布构建不是同一件事。`pnpm typecheck` 先由根 
 4. 源码与测试的 TypeScript 全量检查；
 5. 单元及 MySQL/Redis 集成测试和覆盖率门槛；
 6. 断言集成套件没有被环境错误静默 skip；
-7. 以单独、可见且不得 skip 的 `pnpm test:blob-mysql` 再跑 Blob ownership/绑定/cleanup 真实 MySQL 专项套件，并分别运行`test:blob-storage-control-memory`与`test:blob-storage-control-mysql`证明`0027`原子activation/回滚/并发实际执行；再以required wrapper执行`pnpm test:blob-s3`，证明真实MinIO文件实际运行而非因环境缺失静默skip，覆盖跨client可见性、并发create、put/delete race、无lifecycle规则保护的same-key tombstone、prefix隔离、anonymous读取拒绝及bootstrap不修改既有bucket policy；独立named no-skip的`pnpm test:blob-storage-migration-mysql-s3`用真实MySQL+MinIO覆盖`0028` prepare/copy/verify/cutover/abort/source-cleanup、双runtime gate、response-loss/restart、legacy raw+sidecar、非空MIME export delete、ordinary staging resume，以及在target写入中`KILL CONNECTION`后旧operator不写ACK、replacement等待control行锁并精确abort/tombstone的并发语义；`pnpm test:tenant-restore-journal-memory`与`pnpm test:tenant-restore-journal-mysql`分别强制执行`0030`原子publication/runtime/replay语义，与Blob不同名的restore bucket运行`pnpm test:restore-journal-s3`；`pnpm test:tenant-backup-catalog-mysql`强制执行`0031`真实InnoDB anchor/publish/source-binding/reservation/retention/eviction/rollback，并覆盖external resolution先于local terminal run时只镜像authority、精确重放后才投影，以及external eviction先镜像、local record replay后收口的语义；第三个不同名bucket运行`pnpm test:backup-catalog-s3`证明真实MinIO create-only immutable event chain、`If-Match` CAS authority head、LIST不判head、event/head response-loss恢复、exact replay及corruption/fork拒绝，`test:backup-catalog-reconcile-mysql-s3`证明分页验证并镜像完整external chain、缺local anchor不截断后继availability/eviction，同时selected restore仍要求exact local anchor；`test:backup-catalog-restore-roundtrip-mysql-s3`则用真实`mysqldump`/`mysql`和两个MinIO链证明旧快照恢复后必须重放相同0031 reservation并重建本地authority。第四个不同名bucket运行`pnpm test:tenant-telemetry-writer-s3`及`pnpm test:tenant-telemetry-artifact-observer-s3`，分别证明`telemetry-s3-object-v1`写入协议及GET-only data/tombstone观察；第五个不同名bucket运行`pnpm test:tenant-telemetry-disposition-s3`、非生产v3 fixture和v3 GET-only observer，证明各自独立的CAS-head/只读协议，不构成跨DB/S3恢复证明。wrapper测试另证明调用方显式one-shot环境变量优先于`.env`且不泄密。`build:check`之后再以dist runner/router和独立临时MySQL运行应用装配smoke，验证bundle内AWS SDK闭包、`0027`激活、`0028`/`0030`/`0031` dormant ledger/sidecar、`0032`～`0049` dormant telemetry schema/guards及0050 ordinary DELETE证据列与0051 write-once trigger、最新0049/0050/0051/0052 marker和exact Blob namespace协商，且credential不进入router/输出；新capture coverage/binding和pre-grant默认空表由独立历史迁移夹具验证。该smoke不激活或构造telemetry S3 writer，其装配边界由runner config测试证明；
+7. 以单独、可见且不得 skip 的 `pnpm test:blob-mysql` 再跑 Blob ownership/绑定/cleanup 真实 MySQL 专项套件，并分别运行`test:blob-storage-control-memory`与`test:blob-storage-control-mysql`证明`0027`原子activation/回滚/并发实际执行；再以required wrapper执行`pnpm test:blob-s3`，证明真实MinIO文件实际运行而非因环境缺失静默skip，覆盖跨client可见性、并发create、put/delete race、无lifecycle规则保护的same-key tombstone、prefix隔离、anonymous读取拒绝及bootstrap不修改既有bucket policy；独立named no-skip的`pnpm test:blob-storage-migration-mysql-s3`用真实MySQL+MinIO覆盖`0028` prepare/copy/verify/cutover/abort/source-cleanup、双runtime gate、response-loss/restart、legacy raw+sidecar、非空MIME export delete、ordinary staging resume，以及在target写入中`KILL CONNECTION`后旧operator不写ACK、replacement等待control行锁并精确abort/tombstone的并发语义；`pnpm test:tenant-restore-journal-memory`与`pnpm test:tenant-restore-journal-mysql`分别强制执行`0030`原子publication/runtime/replay语义，与Blob不同名的restore bucket运行`pnpm test:restore-journal-s3`；`pnpm test:tenant-backup-catalog-mysql`强制执行`0031`真实InnoDB anchor/publish/source-binding/reservation/retention/eviction/rollback，并覆盖external resolution先于local terminal run时只镜像authority、精确重放后才投影，以及external eviction先镜像、local record replay后收口的语义；第三个不同名bucket运行`pnpm test:backup-catalog-s3`证明真实MinIO create-only immutable event chain、`If-Match` CAS authority head、LIST不判head、event/head response-loss恢复、exact replay及corruption/fork拒绝，`test:backup-catalog-reconcile-mysql-s3`证明分页验证并镜像完整external chain、缺local anchor不截断后继availability/eviction，同时selected restore仍要求exact local anchor；`test:backup-catalog-restore-roundtrip-mysql-s3`则用真实`mysqldump`/`mysql`和两个MinIO链证明旧快照恢复后必须重放相同0031 reservation并重建本地authority。第四个不同名bucket运行`pnpm test:tenant-telemetry-writer-s3`及`pnpm test:tenant-telemetry-artifact-observer-s3`，分别证明`telemetry-s3-object-v1`写入协议及GET-only data/tombstone观察；第五个不同名bucket运行`pnpm test:tenant-telemetry-disposition-s3`、非生产v3 fixture和v3 GET-only observer，证明各自独立的CAS-head/只读协议，不构成跨DB/S3恢复证明。wrapper测试另证明调用方显式one-shot环境变量优先于`.env`且不泄密。`build:check`之后再以dist runner/router和独立临时MySQL运行应用装配smoke，验证bundle内AWS SDK闭包、`0027`激活、`0028`/`0030`/`0031` dormant ledger/sidecar、`0032`～`0049` dormant telemetry schema/guards及0050 ordinary DELETE证据列与0051 write-once trigger、最新0049/0050/0051/0052/0053 marker和exact Blob namespace协商，且credential不进入router/输出；新capture coverage/binding和pre-grant默认空表由独立历史迁移夹具验证。该smoke不激活或构造telemetry S3 writer，其装配边界由runner config测试证明；
 8. 以同样的独立门禁运行 lifecycle outbox 真实 MySQL 专项套件；
 9. 以 `pnpm test:usage-lifecycle-mysql` 强制执行 usage 双写、冲突回滚、reconcile、legal hold 和 anonymize 真实 MySQL 套件；
 10. 以 `pnpm test:subject-lifecycle-mysql` 强制执行 durable gate、request/audit 回滚、create 竞态和 Blob 写阻断；
@@ -1525,15 +1569,17 @@ TypeScript 检查与发布构建不是同一件事。`pnpm typecheck` 先由根 
 24. 分别强制运行 `test:erasure-job-mysql`、`test:erasure-session-mysql`、`test:erasure-catalog-mysql`、`test:erasure-usage-mysql`，证明 claim/lease/audit、固定动作/回滚、无正文 completeness scan 及 claim-bound usage/ABA 事务确实执行；
 25. 以独立、可见且不得 skip 的 `pnpm test:legacy-tombstone-mysql` 验证 generation-zero compensation 的一次性 cutover、claim/ABA、原子发布、失败回滚、owner/child 隔离与幂等重试；
 26. 以独立、可见且不得 skip 的 `pnpm test:user-data-export-mysql` 验证owner隔离、RR一致性snapshot、真实core worker跨层发布、claim/download/delete lease、TTL/撤销清理与失败回滚；
-27. 运行固定的真实MySQL历史链`0007 → ... → 0042 → 0044 → 0049 → 0050 → 0051 → 0052`，逐文件要求实际通过、零skip；精确必跑文件清单由`scripts/run-required-migration-suites.mjs`维护。`0007→0008`证明同内容usage重复可合并、冲突重复阻断且不丢账、legacy pending receipt保留。`0025→0031`覆盖credential、Blob/export、mover、外部target、restore与backup catalog的历史保持/默认休眠/DDL断点；`0031→0042`覆盖telemetry lifecycle、writer、capture、disposition、grant hard-deny、membership、owner closure、T3d source/观察目标/目录和严格指纹。冻结0039/0040/0041旧二进制terminal夹具保持各自精确旧schema与旧terminal前态，只将升级后marker断言改为与当前migration全集一致；根依赖字段、lockfile与workspace manifest仍严格相同，允许root测试脚本自然增长，不能将它解释为冻结旧binary覆盖新业务行为。冻结0041非空managed logs terminal夹具仍保留；旧terminal缺后续证据为unknown。`0042→0044`使用固定0042 SQL-shaped旧状态而非旧二进制非空T3f terminal，验证默认空pre-grant、旧证据、首DDL中断、marker-loss与126-trigger指纹；`0044→0049`也使用SQL-shaped旧状态验证默认休眠、13 guards、139-trigger指纹与跨tenant拒绝，0049不激活capture。`0044→0050`夹具从预置0044状态经0049升级至0050，验证旧tombstone不回填ordinary origin、部分DDL、同名CHECK drift与marker-loss fail closed。`0050→0051`另证明已seal与unknown旧行保留、精确trigger的create-only marker-loss重放及动作漂移拒绝，普通DELETE MySQL专项验证late backfill、BINARY owner/source改写和合法post-COMMIT seal；0043/0045～0048没有schema migration。
+27. 运行固定的真实MySQL历史链`0007 → ... → 0042 → 0044 → 0049 → 0050 → 0051 → 0052 → 0053`，逐文件要求实际通过、零skip；精确必跑文件清单由`scripts/run-required-migration-suites.mjs`维护。`0007→0008`证明同内容usage重复可合并、冲突重复阻断且不丢账、legacy pending receipt保留。`0025→0031`覆盖credential、Blob/export、mover、外部target、restore与backup catalog的历史保持/默认休眠/DDL断点；`0031→0042`覆盖telemetry lifecycle、writer、capture、disposition、grant hard-deny、membership、owner closure、T3d source/观察目标/目录和严格指纹。冻结0039/0040/0041旧二进制terminal夹具保持各自精确旧schema与旧terminal前态，只将升级后marker断言改为与当前migration全集一致；根依赖字段、lockfile与workspace manifest仍严格相同，允许root测试脚本自然增长，不能将它解释为冻结旧binary覆盖新业务行为。冻结0041非空managed logs terminal夹具仍保留；旧terminal缺后续证据为unknown。`0042→0044`使用固定0042 SQL-shaped旧状态而非旧二进制非空T3f terminal，验证默认空pre-grant、旧证据、首DDL中断、marker-loss与126-trigger指纹；`0044→0049`也使用SQL-shaped旧状态验证默认休眠、13 guards、139-trigger指纹与跨tenant拒绝，0049不激活capture。`0044→0050`夹具从预置0044状态经0049升级至0050，验证旧tombstone不回填ordinary origin、部分DDL、同名CHECK drift与marker-loss fail closed。`0050→0051`另证明已seal与unknown旧行保留、精确trigger的create-only marker-loss重放及动作漂移拒绝，普通DELETE MySQL专项验证late backfill、BINARY owner/source改写和合法post-COMMIT seal；0043/0045～0048没有schema migration。
     0043没有新的schema migration；同一required wrapper另强制运行冻结`0042-binary-to-0043.migration.ts`，在真实MySQL先执行旧产品二进制，再核对当前只读候选与旧blocked/零目标终态。它不是fresh-schema替代品，也不会自动恢复旧blocked job。
 28. broad cluster覆盖真实runner/router多进程接管及已经纳入的安全边界；另以精确JSON report运行`pnpm test:tenant-redis-purge-cluster`，明确证明mixed-worker、mixed-namespace与active exact fleet矩阵执行且零skip。它不能被描述成真实managed Redis Cluster或完整多runner全生命周期验收；
-29. `pnpm build:check`，并以单独named step再次执行`pnpm check:blob-storage-migrate-artifact`、`pnpm check:restore-ledger-reconcile-artifact`与`pnpm check:backup-catalog-artifact`，证明runner的三个one-shot维护入口都可由plain Node运行；
+29. `pnpm build:check`，并以单独named step再次执行`pnpm check:blob-storage-migrate-artifact`、`pnpm check:restore-ledger-reconcile-artifact`、`pnpm check:backup-catalog-artifact`与`pnpm check:telemetry-capture-artifact`，证明runner的四个one-shot维护入口都可由plain Node运行；
 30. 上传 coverage artifact。
 
 0052在CI另有可见的四个ordinary usage named step：proof+Memory、真实MySQL store、core/runner-client/router fleet gate、真实MySQL runner worker；required wrapper必须逐完整文件路径证明非零执行、全pass且零skip。store与runner的同名MySQL文件写入不同report路径，避免覆盖执行证据。历史wrapper新增真实`0051→0052`夹具，证明旧sealed来源不回填policy、marker-loss/DDL/drift拒绝和新旧指纹隔离；这是SQL-shaped旧状态，不是冻结0051 executable。runner image检查0052 marker，marker安装不等于自动内容purge或全域completion。
 
 MySQL和Redis是拉取的第三方service images；MinIO由固定官方源码临时构建。三者都是测试基础设施，不是本仓库构建或发布的产品服务。
+
+0053新增彼此独立、必须实际执行的operator/key兼容、七个app/core provenance/fleet文件、standalone真实MySQL和实际HTTP/MySQL/MinIO capture named step。真实backup artifact named step另包含active0033 exact-key source/target恢复审计；不会把仅inactive的旧验证外推。`run-required-suite.mjs`从本次JSON核对完整目标文件、非零passed且零非passed；历史manifest还与磁盘双向一致，明确包含`0052-to-0053.migration.ts`。后者从钉住提交归档、编译真正旧0052 store，在真实MySQL写旧失败step后升级；test-only IPC/SIGKILL和历史driver仍由secret scanner/typecheck检查，不进入构建或镜像，也未扩张coverage排除。数量和通过状态只以PROGRESS/本次报告为准，不硬编码在本指南。
 
 ### `image` matrix job 的两个运行实例
 
@@ -1551,11 +1597,13 @@ agent-service/agent-runner:ci
 agent-service/agent-router:ci
 ```
 
-每个产品镜像都包含 Node 24 slim、对应应用入口、迁移和 production dependencies，是 Linux OCI image，不是VM磁盘或原生机器码。GitHub Actions分别启动两个镜像并检查OpenAPI/healthcheck；镜像job不运行router与runner双容器转发，该端到端路径由`build:check`的dist双服务启动测试覆盖。runner镜像内迁移器必须写入包含最新`0049_tenant_telemetry_application_capture_v2.sql`、`0050_ordinary_session_delete_grace.sql`、`0051_ordinary_session_delete_origin_guard.sql`与`0052_ordinary_session_usage_retention.sql`的完整marker链，并用plain Node验证三个one-shot CLI的`--help`。生产first-admin bootstrap只通过create-only、`0600`输出文件交付，CI验证key格式与鉴权且日志不含key或tenant原值。marker只证明0044 pre-grant、0049 inactive capture v2 guards、0050普通DELETE保留证据列、0051 write-once guard及此前默认休眠schema已安装，不代表capture已激活、DB grant可信、CAS tombstone已执行、旧快照已安全恢复或任何物理purge已完成。产品构建仍只有router和runner两个长期服务、两个Linux OCI镜像、五个JavaScript入口：router `main.js`，runner `main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`和`backup-catalog.js`；本地MinIO基础设施镜像不进入产品matrix。
+每个产品镜像都包含 Node 24 slim、对应应用入口、迁移和 production dependencies，是 Linux OCI image，不是VM磁盘或原生机器码。GitHub Actions分别启动两个镜像并检查OpenAPI/healthcheck；镜像job不运行router与runner双容器转发，该端到端路径由`build:check`的dist双服务启动测试覆盖。runner镜像内迁移器必须写入包含最新`0049_tenant_telemetry_application_capture_v2.sql`、`0050_ordinary_session_delete_grace.sql`、`0051_ordinary_session_delete_origin_guard.sql`、`0052_ordinary_session_usage_retention.sql`与`0053_persisted_provider_failure_capture.sql`的完整marker链，并用plain Node验证四个one-shot CLI的`--help`。生产first-admin bootstrap只通过create-only、`0600`输出文件交付，CI验证key格式与鉴权且日志不含key或tenant原值。marker只证明0044 pre-grant、0049 inactive capture v2 guards、0050普通DELETE保留证据列、0051 write-once guard及此前默认休眠schema已安装，不代表capture已激活、DB grant可信、CAS tombstone已执行、旧快照已安全恢复或任何物理purge已完成。产品构建仍只有router和runner两个长期服务、两个Linux OCI镜像、六个JavaScript入口：router `main.js`，runner `main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`、`backup-catalog.js`和`telemetry-capture.js`；本地MinIO基础设施镜像不进入产品matrix。
 
 当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前明确上传的 GitHub Actions artifact 只有 coverage。
 
 ## 9. 从本地到未来生产的交付语义
+
+0053仍只允许本地非生产启用，不能把本节的未来生产交付顺序当作其生产许可。升级前保持capture、ordinary usage及相关T3d/T3f gate关闭，真实摘流、停止并排空全部pre-0053 router/runner/writer和在途事务；独立migration安装160相关组合指纹（不是662全库trigger数），只启动0053-aware版本，禁止旧新writer热混跑。既有0049文件不可重写，后续只能forward-fix。默认control休眠与历史NULL/0 source不回填；active0030 primary是后续local activation前提，新的runtime epoch不能自动继承capture binding。原始failed-step提交、fresh fleet四worker边界、first create live检查与历史exact ACK权限仍需分别验证；局部writer ACK不解除T3d/T3f第六来源硬拒、usage来源删除禁令或全域completion。
 
 0031的外部catalog authority不是“所有对象都不可变”：event objects是create-only不可变链，另有一个固定key的可变`If-Match` CAS head作为唯一尾部；LIST不参与authority。启动会实际验证`If-None-Match: *`、正常CAS和陈旧ETag拒绝，event/head间响应丢失用精确下一sequence恢复。生产IAM需要允许受控operator对head做条件覆盖，同时禁止其它writer覆盖event/head；versioning、lifecycle和Object Lock保持关闭。CI/本地MinIO会执行这些协议测试，但不能替代managed存储/IAM验收。
 
@@ -1575,7 +1623,7 @@ staging/production 不重新编译镜像。环境差异只通过受控配置和 
 
 VM 形态须在同一次 CI 构建中分别形成 router/runner 完整发布归档，固定 Node 24 runtime、production dependencies、迁移文件与每个文件的校验和/发布包身份；在 staging 验证后，将**同一发布包身份和校验和**晋级 production，不在环境中重新安装依赖或重新打包。systemd 单元、进程排空与一次性迁移/维护入口仍需按同一代码版本独立发布和验收。该发布包及其晋级流水线目前尚未实现。
 
-用户选择 M4 同时提供两种交付形态：容器部署使用分别发布的 router/runner Linux OCI 镜像及同一 digest 晋级；虚拟机部署使用相同的五个 Node.js 构建入口和受控 Node 24 runtime，分别以独立进程运行 router/runner。两种形态都必须复用同一协议、迁移门禁、配置/Secret 契约和验收；VM 的可校验发布包、进程托管/滚动步骤与容器的镜像签名、部署清单和环境晋级仍待 M4 实现，当前不能把源码开发脚本或 CI 测试镜像当作已交付的生产部署包。
+用户选择 M4 同时提供两种交付形态：容器部署使用分别发布的 router/runner Linux OCI 镜像及同一 digest 晋级；虚拟机部署使用相同的六个 Node.js 构建入口（runner main与四个one-shot、router main）和受控 Node 24 runtime，分别以独立进程运行 router/runner。两种形态都必须复用同一协议、迁移门禁、配置/Secret 契约和验收；VM 的可校验发布包、进程托管/滚动步骤与容器的镜像签名、部署清单和环境晋级仍待 M4 实现，当前不能把源码开发脚本或 CI 测试镜像当作已交付的生产部署包。
 
 这仍是目标流程，不是当前可直接执行的生产部署手册。现有runner连接默认会应用schema migration，而严格启动检查又依赖读取MySQL trigger元数据；本机MySQL 8.0.26实测`SELECT`-only账号无法通过`INFORMATION_SCHEMA.TRIGGERS`或definer view看到已有trigger，授予`TRIGGER`则也能删除它。M4还须先以受限definer procedure等可信只读桥接完成无DDL账号的严格指纹校验和真实MySQL回归，再交付独立一次性schema-migrate Job、生产verify-only启动及镜像入口。没有这些门禁和真实环境资源时，不应把当前CI镜像直接称为已完成的staging/production部署方案；详见[部署契约](local-and-deployment.md)。
 
@@ -1665,9 +1713,19 @@ T3b的回滚顺序是先关router execution gate，再让worker在当前job边�
 
 T3g的恢复能力需保持精确表述：same-MySQL projection只枚举已经写入durable target ACK的marker。正常marker-only窗口可由worker轮询中的existing-marker-only replay在gate关闭时收口；但marker尚无MySQL ACK且在worker成功replay并持久化ACK前又从Redis丢失时，首次existence bits仍无法恢复。MySQL与Redis一起恢复到旧snapshot也不受保护。restore keyset在大tenant下的扫描/重放性能、永久marker容量、普通live-session fence灾备及独立故障域ledger仍待设计/压测。自动测试使用真实standalone ioredis并验证same-slot grammar，但不是managed Redis Cluster、ACL、persistence或failover验收。
 
-当前ordinary user erasure/compensation/evaluator继续停在不可执行策略边界；export可生成、下载和清理临时制品。tenant T1/T2提供逻辑fence，T3a删除本地DB credential material，T3b证明configured fleet drain，T3c证明DB-time owner结构，T3d封存33域plan，T3e完成local operational usage与Blob/export子集及physical ACK，T3f清理11个本地数据库投影并留下永久session grave，T3g再清理session-scoped Redis lease/owner、fence与stream并写永久marker；`0027`提供共享Blob对象协议与namespace cutover，`0028`提供离线filesystem→S3搬迁账本、runtime gate与一次性CLI，`0029`提供default-dormant external-target协议、Memory fake和真实MySQL账本，`0030`提供独立T1 journal、runtime lineage、永久恢复fence与one-shot replay，`0031`提供权威backup catalog、snapshot lineage、retention、restore source binding和永久epoch reservation，`0032`提供safe structured telemetry/trace入口，`0033`提供default-dormant原子activation/coverage/artifact inventory store，`0034`提供payload-before-sink writer spool、reservation、Memory/MySQL/HTTP/filesystem/S3协议和ACK基座，`0035`提供分域application capture authority，`0036`新增default-dormant disposition迁移/原子control与非生产S3协议夹具，`0037`只新增grant hard-deny trigger/指纹与非生产v2 Memory协议，`0038`仅给新受管write新增不可变逐项membership/source sidecar，`0039`仅让新T3f同事务封存本地owner-closure entry/aggregate，`0040`～`0042`让新T3d同事务封存telemetry来源、观察目标与逐artifact精确plan目录，`0043`只读诊断本地来源候选，`0044`只封存默认休眠的source-bound pre-grant intent/claim。0029没有真实provider adapter，KMS固定未完成；0030/0031仍有单target、人工ACK、跨MySQL/S3 saga、缺少物理backup producer与真实故障域验收等已知边界；0035当前只接单一provider failure logs contract；没有activation CLI、traces producer或0036～0044外部delete/restore/retention executor。公开status仍为`gated`、`dataPurgeExecution=false`。backup内tenant erasure与其它domain恢复证据、logs/traces完整执行生命周期、managed对象存储/IAM环境验收、完整生产backup/restore、completion及generic user物理purge也尚未闭环；所以staging/production的相关admission/execution/worker gate默认都保持`0`，0031 control保持inactive且telemetry control保持generation 0，只有完成对应环境验收和后续实现才逐项激活。
+当前ordinary user erasure/compensation/evaluator继续停在不可执行策略边界；export可生成、下载和清理临时制品。tenant T1/T2提供逻辑fence，T3a删除本地DB credential material，T3b证明configured fleet drain，T3c证明DB-time owner结构，T3d封存33域plan，T3e完成local operational usage与Blob/export子集及physical ACK，T3f清理11个本地数据库投影并留下永久session grave，T3g再清理session-scoped Redis lease/owner、fence与stream并写永久marker；`0027`提供共享Blob对象协议与namespace cutover，`0028`提供离线filesystem→S3搬迁账本、runtime gate与一次性CLI，`0029`提供default-dormant external-target协议、Memory fake和真实MySQL账本，`0030`提供独立T1 journal、runtime lineage、永久恢复fence与one-shot replay，`0031`提供权威backup catalog、snapshot lineage、retention、restore source binding和永久epoch reservation，`0032`提供safe structured telemetry/trace入口，`0033`提供default-dormant原子activation/coverage/artifact inventory store，`0034`提供payload-before-sink writer spool、reservation、Memory/MySQL/HTTP/filesystem/S3协议和ACK基座，`0035`提供分域application capture authority，`0036`新增default-dormant disposition迁移/原子control与非生产S3协议夹具，`0037`只新增grant hard-deny trigger/指纹与非生产v2 Memory协议，`0038`仅给新受管write新增不可变逐项membership/source sidecar，`0039`仅让新T3f同事务封存本地owner-closure entry/aggregate，`0040`～`0042`让新T3d同事务封存telemetry来源、观察目标与逐artifact精确plan目录，`0043`只读诊断本地来源候选，`0044`只封存默认休眠的source-bound pre-grant intent/claim。0029没有真实provider adapter，KMS固定未完成；0030/0031仍有单target、人工ACK和跨MySQL/S3 saga等已知边界；本地加密MySQL逻辑producer已实现，backup-copy erasure、联合旧快照恢复与真实故障域验收仍缺；0035当前只接单一provider failure logs contract；0053只新增本地受控v2 logs capture operator，仍没有traces producer或0036～0044外部delete/restore/retention executor。公开status仍为`gated`、`dataPurgeExecution=false`。backup内tenant erasure与其它domain恢复证据、logs/traces完整执行生命周期、managed对象存储/IAM环境验收、完整生产backup/restore、completion及generic user物理purge也尚未闭环；所以staging/production的相关admission/execution/worker gate默认都保持`0`，0031 control保持inactive且telemetry control保持generation 0，只有完成对应环境验收和后续实现才逐项激活。
 
-没有云资源时，仍可完成业务代码、协议、迁移、Memory/MySQL/Redis实现、filesystem与S3-compatible Blob/telemetry writer行为、本地MinIO/多进程/容器测试、fake adapter、故障注入、指标定义和部署契约设计；T3a～T3g、`0027`～`0044`的本地/CI协议、账本、adapter、CLI或dormant inventory/writer切片都属于这一范围。以下结论必须等待真实环境：目标provider/KMS与managed对象存储/IAM的真实集成、独立restore/catalog/telemetry deletion journal故障域、真实物理backup producer、真实数据量下的filesystem搬迁/恢复维护窗口、云网络和权限正确性、IdP集成、Kubernetes或VM滚动发布、真实telemetry sink/告警链路、备份恢复目标、真实Redis Cluster/ACL/persistence/failover、云Redis灾备以及生产容量；这些属于M4环境集成而非本地替代品。仓库不会为这些未知参数编造可直接部署的Kubernetes、域名/TLS、bucket、telemetry backend或Secret配置；0031只是在本地/CI把catalog authority做成可审计协议，0032～0044及S3 writer也只把telemetry入口、default-dormant lifecycle/application activation、inventory和writer/reservation/ACK做成可验证基座，不能代替上述环境、物理备份或日志/追踪删除能力。
+没有云资源时，仍可完成业务代码、协议、迁移、Memory/MySQL/Redis实现、filesystem与S3-compatible Blob/telemetry行为、本地MinIO/多进程/容器测试、故障注入、指标定义和部署契约；本地加密MySQL逻辑backup producer和显式导入已经实现。没有云账号不解释当前grant返回零授权、active0053阻断T3d/T3f、user停在`awaiting_purge_policy`或`session.purge`不可领取：这些仍需产品实现，不能归为仅待环境验收。
+
+| 本地/CI仍须实现的闭环 | 不应冒充的完成证明 |
+| --- | --- |
+| BYOK/平台credential的versioned责任与ownership；共享key只清租户引用/ciphertext，KMS目标态的adapter/轮换/故障处理 | BYOK厂商撤销由客户负责；不能伪造revoked或销毁共享主密钥来宣称单租户erasure |
+| v2 source保留式T3d→T3e usage释放→T3f内容清理，以及telemetry可信授权、journal、实际sink处置/ACK、恢复防复活 | source、write ACK或非零target目录不是delete ACK；旧gap继续unknown |
+| active0053旧backup的显式新epoch许可及MySQL/Redis/Blob/telemetry联合恢复窗口 | active0033 key兼容测试不证明active0053 restore；同库ACK replay不证明联合旧快照安全 |
+| generic session/user内容purge及child-first执行/恢复/完成审计 | 30天floor与ordinary operational usage retention不是内容purge |
+| backup-copy责任/保留、受policy/hold约束的实际到期删除、durable intent和物理不存在ACK | 共享backup仍保留时不能称其字节已物理删除；内容30天不自动套用到backup/billing/audit |
+
+仍须等待真实环境验收的是managed IAM/private access、真实KMS权限/TLS/轮换、独立journal/catalog/sink故障域、云端备份复制/PITR、真实容量与锁等待、staging/production RPO/RTO和发布演练、IdP及真实Redis Cluster/ACL/persistence/failover等。对应adapter、配置契约和本地故障代码应先实现；不能把缺代码统称为M4云验收。仓库不编造Kubernetes、域名/TLS、bucket、telemetry backend或Secret参数；本地MinIO协议与加密逻辑backup也不证明独立故障域、完整生产DR或日志/追踪删除。下一批先完成同primary epoch、新tenant且全部v2 write在T1前ACK的来源保留式本地删除链，restore/new epoch和其它历史gap继续拒绝；后续再闭合显式恢复与外部处置。该顺序是规划，不是已交付能力。
 
 当前T3d全库RR/next-key扫描可能在规模下造成写阻塞/死锁、lease和容量压力，必须在staging用真实索引与数据量做锁超时/容量验证。结构损坏的queued job在逐候选隔离前可能饿死后续job，cursor重启还会重扫损坏前缀，但fail-closed且不会产生plan receipt或执行权，M4应增raw-key quarantine/skip。`0022` trigger fingerprint不校验action body，迁移夹具只显式模拟首个DDL auto-commit边界；预发需用无DDL/TRIGGER的runtime principal并扩展schema tamper/中断演练。
 

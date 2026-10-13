@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import {
   BlobCleanupWorker,
   createTenantTelemetryApplicationDualWrite,
+  createPersistedProviderFailureCapture,
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_CONTRACT_SHA256,
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_PROTOCOL,
   createFakeCredentialTargetExecutionAdapterState,
@@ -81,6 +82,7 @@ import {
   type TenantTelemetryLifecycleStore,
   type TenantTelemetryApplicationCaptureStore,
   type TenantTelemetryWriterStore,
+  type TenantTelemetryPersistedProviderCaptureStore,
   type TenantContentInventoryStore,
   type TenantPurgeExecutionStore,
   type TenantPurgePlanStore,
@@ -123,6 +125,7 @@ import {
   reconcileTenantTelemetryWriterForStartup,
   type TenantTelemetryWriterRuntime,
 } from "./tenant-telemetry-writer-config.js";
+import { RouterPersistedProviderCaptureGate } from "./persisted-provider-capture-gate.js";
 
 const RUNNER_TELEMETRY_LEVEL = {
   "runner.bootstrap.dev_key_skipped": "warn",
@@ -241,6 +244,7 @@ export async function writeAdminBootstrapOutputFile(
 
 export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const cfg = loadConfig(env);
+  const tenantRuntimeBootId = randomUUID();
   const tenantTelemetryRefKey = cfg.TENANT_TELEMETRY_REF_KEY === undefined
     ? undefined
     : Buffer.from(cfg.TENANT_TELEMETRY_REF_KEY, "hex");
@@ -279,6 +283,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & UserDataExportCleanupStore
     & TenantTelemetryLifecycleStore
     & TenantTelemetryApplicationCaptureStore
+    & TenantTelemetryPersistedProviderCaptureStore
     & TenantTelemetryWriterStore = cfg.STORE === "mysql"
     ? await MysqlSessionStore.connect({
       url: cfg.MYSQL_URL,
@@ -288,10 +293,16 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       ...(tenantTelemetryRefKey === undefined
         ? {}
         : { tenantTelemetryRefKey }),
+      ...(cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED && cfg.NODE_ENV !== "production"
+        ? { tenantTelemetryPersistedProviderCaptureLocalOnly: true } : {}),
     })
     : new MemorySessionStore(
       { now: () => Date.now() },
-      tenantTelemetryRefKey === undefined ? {} : { tenantTelemetryRefKey },
+      {
+        ...(tenantTelemetryRefKey === undefined ? {} : { tenantTelemetryRefKey }),
+        ...(cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED && cfg.NODE_ENV !== "production"
+          ? { tenantTelemetryPersistedProviderCaptureLocalOnly: true } : {}),
+      },
     );
 
   let tenantRestoreJournalWorker: TenantRestoreJournalPublicationWorker | undefined;
@@ -304,6 +315,11 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let tenantTelemetryRetryTimer: ReturnType<typeof setInterval> | undefined;
   let ordinarySessionDeleteGraceRecovery: OrdinarySessionDeleteGraceRecovery | undefined;
   let ordinarySessionUsageRetentionWorker: OrdinarySessionUsageRetentionWorker | undefined;
+  const persistedProviderCaptureGate = cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED
+    ? new RouterPersistedProviderCaptureGate({
+      routerBaseUrl: cfg.ERASURE_ROUTER_URL!, internalToken: cfg.INTERNAL_ROUTER_TOKEN,
+      runnerId: cfg.RUNNER_ID, bootId: tenantRuntimeBootId,
+    }) : undefined;
   const closeTenantRestoreJournal = (): Promise<void> => {
     if (tenantRestoreJournalClosePromise) return tenantRestoreJournalClosePromise;
     tenantRestoreJournalClosePromise = tenantRestoreJournalWorker !== undefined
@@ -665,6 +681,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       store,
       cfg,
       runnerRuntimeLogger,
+      persistedProviderCaptureGate ? {
+        requireFreshFleet: (expected, boundary) => persistedProviderCaptureGate.requireFreshFleet(expected, boundary),
+      } : undefined,
     );
   } catch (error) {
     await Promise.all([
@@ -678,7 +697,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     throw error;
   }
 
-  if (tenantTelemetryRefKey !== undefined) {
+  if (tenantTelemetryRefKey !== undefined && tenantTelemetryWriterRuntime.persistedCaptureActive !== true) {
     providerTenantTelemetry = createTenantTelemetryApplicationDualWrite({
       component: "provider",
       producerProtocol: TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_PROTOCOL,
@@ -724,6 +743,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     cipher,
     platform,
     tenantRuntime,
+    persistedProviderFailureCaptureActive: tenantTelemetryWriterRuntime.persistedCaptureActive === true,
     ...(providerTenantTelemetry === undefined
       ? {}
       : {
@@ -742,6 +762,12 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     store, erasureStore: store, lease, bus, providers, tools, blobs, tenantRuntime,
     logger: runnerRuntimeLogger,
     onOwnershipLost: () => emitRunnerTelemetryEvent("runner.runtime.ownership_lost"),
+    ...(tenantTelemetryWriterRuntime.persistedCaptureActive === true && persistedProviderCaptureGate && tenantTelemetryRefKey ? {
+      persistedProviderFailureCapture: createPersistedProviderFailureCapture({
+        store, opaqueRefKey: tenantTelemetryRefKey,
+        requireFreshFleet: (expected, boundary) => persistedProviderCaptureGate.requireFreshFleet(expected, boundary),
+      }),
+    } : {}),
     engine: new PiEngine(providers.models),
     summariser: new PiSummariser(providers.models),
     config: {
@@ -911,7 +937,6 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
           retryMaxMs: cfg.TENANT_CREDENTIAL_TARGET_EXECUTION_RETRY_MAX_MS,
         })
       : undefined;
-  const tenantRuntimeBootId = randomUUID();
   const tenantRuntimeDrain = new LocalTenantRuntimeDrain(store, tenantRuntime, {
     runnerId: cfg.RUNNER_ID,
     bootId: tenantRuntimeBootId,
@@ -1105,6 +1130,13 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       tenantDatabasePurgeWorker !== undefined,
     ordinarySessionUsageRetentionSupported: true,
     ordinarySessionUsageRetentionWorkerEnabled: ordinarySessionUsageRetentionWorker !== undefined,
+    ...(tenantTelemetryWriterRuntime.persistedCaptureActive === true ? {
+      persistedProviderCapture: {
+        bootId: tenantRuntimeBootId, localEnabled: cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED,
+        writerEnabled: tenantTelemetryWriterRuntime.worker !== undefined,
+        getBinding: () => store.getTenantTelemetryPersistedProviderCaptureBinding(),
+      },
+    } : {}),
     tenantRedisPurgeSupported: tenantRedisPurgeAdapter !== undefined,
     tenantRedisPurgeWorkerEnabled: tenantRedisPurgeWorker !== undefined,
     tenantRedisPurgeNamespaceSha256: redisNamespaceSha256,
@@ -1222,6 +1254,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     cfg.DATA_EXPORT_WORKER_ENABLED,
     cfg.DATA_EXPORT_CLEANUP_ENABLED,
     tenantTelemetryWriterRuntime.worker !== undefined,
+    cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED,
   ];
   const gateEnabledCount = gateStates.filter(Boolean).length;
   emitRunnerTelemetryEvent("runner.lifecycle.started", {
@@ -1244,6 +1277,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     ordinarySessionUsageRetentionGate, ordinarySessionUsageRetentionWorker,
     tenantRedisPurgeGate, tenantRedisPurgeWorker, tenantRedisPurgeAdapter,
     tenantTelemetryWriterRuntime, providerTenantTelemetry,
+    persistedProviderCaptureGate,
     tenantRuntimeBootId,
     blobs, blobStore, store, lease, bus, cfg,
     close: () => shutdown("close", false),

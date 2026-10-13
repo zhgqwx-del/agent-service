@@ -581,6 +581,8 @@ export interface SessionStore {
   commit(batch: CommitBatch): Promise<CommitResult>;
   /** Trusted ordinary API DELETE writer only; generic commit never accepts provenance input. */
   commitOrdinarySessionDelete(batch: CommitBatch): Promise<CommitResult>;
+  /** Trusted host only: provider provenance is checked at the real stream-result boundary. */
+  commitPersistedProviderStepFailure(input: import("./tenant-telemetry-persisted-provider-capture.js").CommitPersistedProviderStepFailureInput): Promise<import("./tenant-telemetry-persisted-provider-capture.js").CommitPersistedProviderStepFailureResult>;
 
   // ---- reads ----
   readEvents(sessionId: string, afterSeq: number, limit: number): Promise<PersistedEvent[]>;

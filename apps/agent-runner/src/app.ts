@@ -106,6 +106,17 @@ import {
   UserId,
 } from "@agent-service/protocol";
 import type { SessionHost, TenantRuntimeCoordinator, ToolRegistry } from "@agent-service/core";
+import {
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_HEADER,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_VALUE,
+  INTERNAL_PERSISTED_PROVIDER_CAPTURE_NONCE_HEADER,
+  PERSISTED_PROVIDER_CAPTURE_FLEET_PROTOCOL,
+  PersistedProviderCaptureBinding,
+  awaitPersistedProviderCaptureBoundary,
+  PersistedProviderCaptureFleetProof,
+  PersistedProviderCaptureRunnerReady,
+} from "@agent-service/protocol";
 import { ErasureLocalTurnFencedError, newId } from "@agent-service/core";
 import {
   BLOB_STORAGE_FORMAT,
@@ -216,6 +227,12 @@ export interface AppDeps {
   /** Store implements the ordinary source/policy-bound operational usage contract. */
   ordinarySessionUsageRetentionSupported?: boolean;
   ordinarySessionUsageRetentionWorkerEnabled?: boolean;
+  persistedProviderCapture?: {
+    bootId: string;
+    localEnabled: boolean;
+    writerEnabled: boolean;
+    getBinding(): Promise<PersistedProviderCaptureFleetProof | null>;
+  };
   /** T3g code-awareness is advertised only when a concrete Redis purge adapter is wired. */
   tenantRedisPurgeSupported?: boolean;
   /** Local T3g worker activation; its router barrier remains independent. */
@@ -466,6 +483,38 @@ export function createApp(deps: AppDeps) {
       },
     } satisfies Capabilities),
   );
+
+  app.use(INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH, privateResponseHeaders);
+  app.use(`${INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH}/*`, privateResponseHeaders);
+  app.get(INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH, async (c) => {
+    if (!internalTokenMatches(c.req.header(INTERNAL_ROUTER_TOKEN_HEADER), deps.internalRouterToken)) throw new ApiError("not_found", "not found");
+    const capture = deps.persistedProviderCapture;
+    const nonce = c.req.header(INTERNAL_PERSISTED_PROVIDER_CAPTURE_NONCE_HEADER);
+    if (!deps.ready() || !capture?.localEnabled || !capture.writerEnabled
+      || !nonce || !/^[0-9a-f]{64}$/.test(nonce)) return c.body(null, 503);
+    try {
+      // Unlike the startup summary, this view revalidates the actual DB control/receipt/primary
+      // epoch for every private probe. It never calls the router and cannot form a readiness loop.
+      const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]);
+      const full = PersistedProviderCaptureFleetProof.parse(await awaitPersistedProviderCaptureBoundary(capture.getBinding(), signal));
+      const binding = PersistedProviderCaptureBinding.parse(Object.fromEntries(
+        Object.keys(PersistedProviderCaptureBinding.shape).map((key) => [key, full[key as keyof typeof full]]),
+      ));
+      const result = PersistedProviderCaptureRunnerReady.parse({
+        protocolVersion: PROTOCOL_VERSION, service: "agent-runner",
+        capability: PERSISTED_PROVIDER_CAPTURE_FLEET_PROTOCOL,
+        runnerId: deps.runnerId, bootId: capture.bootId,
+        localEnabled: true, writerEnabled: true, nonce, binding,
+        configuredFleetRootSha256: full.configuredFleetRootSha256,
+      });
+      signal.throwIfAborted();
+      if (!deps.ready() || !capture.localEnabled || !capture.writerEnabled) return c.body(null, 503);
+      c.header(INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_HEADER, INTERNAL_PERSISTED_PROVIDER_CAPTURE_ACK_VALUE);
+      return c.json(result, 200);
+    } catch { return c.body(null, 503); }
+  });
+  app.all(INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH, () => { throw new ApiError("not_found", "not found"); });
+  app.all(`${INTERNAL_PERSISTED_PROVIDER_CAPTURE_READY_PATH}/*`, () => { throw new ApiError("not_found", "not found"); });
 
   const runtimeDrainReadyPath = INTERNAL_TENANT_RUNTIME_DRAIN_READY_PATH;
   const runtimeDrainExecutePath = INTERNAL_TENANT_RUNTIME_DRAIN_RUNNER_PATH;

@@ -128,6 +128,7 @@ const entryPoints = {
           "restore-ledger-reconcile.ts",
         ),
         "backup-catalog": resolve(ROOT, "apps", app, "src", "backup-catalog.ts"),
+        "telemetry-capture": resolve(ROOT, "apps", app, "src", "telemetry-capture.ts"),
       }
     : {}),
 };

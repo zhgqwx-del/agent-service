@@ -38,6 +38,7 @@ import {
 } from "@agent-service/store";
 import { z } from "zod";
 import * as mysqlArtifact from "./mysql-backup-artifact.js";
+import { readTelemetryCaptureRefKey, tenantTelemetryOperatorRefKeyPath } from "./telemetry-capture-ref-key.js";
 import {
   createTenantBackupCatalogAdapter,
   loadTenantBackupCatalogConfig,
@@ -109,6 +110,7 @@ export interface BackupCatalogCliDependencies {
     url: string;
     connectionLimit: number;
     migrationMode: "verify";
+    tenantTelemetryRefKey?: Uint8Array;
     operationAbortSignal?: AbortSignal;
   }): Promise<BackupCatalogCliStore>;
   loadCatalogConfig(
@@ -131,6 +133,7 @@ export interface BackupCatalogCliDependencies {
   artifactOperations?: Pick<typeof mysqlArtifact,
     "acquireMySqlBackupArtifactOperator" | "createMySqlBackupArtifact"
     | "verifyMySqlBackupArtifact" | "importVerifiedMySqlBackupArtifact">;
+  readRefKey?: (path: string) => Promise<Buffer>;
 }
 
 const MysqlEnv = z.object({
@@ -591,6 +594,7 @@ async function runArtifactCommand(
   command: "create-artifact" | "verify-artifact" | "restore-selected",
   env: NodeJS.ProcessEnv,
   dependencies: BackupCatalogCliDependencies,
+  refKeyPath: string | undefined,
 ): Promise<number> {
   // This is a restricted local vertical slice, not a production backup/DR operator.
   if (env.NODE_ENV === "production") throw cliError("invalid_configuration");
@@ -629,6 +633,7 @@ async function runArtifactCommand(
   let operationError: unknown;
   let reservationAttempted = false;
   let importAttempted = false;
+  let refKey: Buffer | undefined;
   const step: AsyncStep = async (operation) => {
     if (operator) await budget.run(() => operator!.assertHeld());
     const result = await budget.run(operation);
@@ -643,6 +648,16 @@ async function runArtifactCommand(
     })
     : error;
   try {
+    if (refKeyPath !== undefined) {
+      try {
+        refKey = await budget.run(() => (dependencies.readRefKey ?? readTelemetryCaptureRefKey)(refKeyPath),
+          async (lateKey) => { lateKey.fill(0); });
+        if (!(refKey instanceof Uint8Array) || refKey.length !== 32) throw cliError("invalid_configuration");
+      } catch (error) {
+        if (error instanceof BackupCatalogCliError) throw error;
+        throw cliError("invalid_configuration");
+      }
+    }
     const adapter = dependencies.createCatalogAdapter(config, { operationAbortSignal: budget.signal });
     adapterResource = adapter;
     const journalAdapters = journalConfig === undefined ? []
@@ -663,6 +678,7 @@ async function runArtifactCommand(
     store = await acquire(() => dependencies.connectStore({
       url: mysql.MYSQL_URL, connectionLimit: 2, migrationMode: "verify",
       operationAbortSignal: budget.signal,
+      ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
     }));
     const source = store!;
     const control = await step(() => source.getTenantBackupCatalogControl());
@@ -750,6 +766,7 @@ async function runArtifactCommand(
         targetStore = await acquire(() => dependencies.connectStore({
           url: selected.BACKUP_RESTORE_TARGET_MYSQL_URL, connectionLimit: 2, migrationMode: "verify",
           operationAbortSignal: budget.signal,
+          ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
         }));
         const target = targetStore!;
         const restoredAnchor = await step(() => target.getTenantBackupSnapshotAnchor(settings.BACKUP_ID));
@@ -786,7 +803,8 @@ async function runArtifactCommand(
   const released = drained ? await boundedCleanup(release) : false;
   // Uncooperative injected/custom work must not cause a lock release while it
   // can still mutate. Its late completion only disposes resources, never advances.
-  if (!drained) void settled.then(release).catch(() => {});
+  if (drained) refKey?.fill(0);
+  else void settled.then(async () => { try { await release(); } finally { refKey?.fill(0); } }).catch(() => {});
   if (operationError !== undefined) throw operationError;
   if (!nativeClosed || !drained || !released || summary === undefined) {
     throw withRestoreBoundary(cliError("operation_failed"));
@@ -806,8 +824,11 @@ export async function runBackupCatalogCli(
   dependencies: BackupCatalogCliDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<number> {
   const command = parseCommand(argv);
+  let refKeyPath: string | undefined;
+  try { refKeyPath = tenantTelemetryOperatorRefKeyPath(env); }
+  catch { throw cliError("invalid_configuration"); }
   if (command === "create-artifact" || command === "verify-artifact" || command === "restore-selected") {
-    return runArtifactCommand(command, env, dependencies);
+    return runArtifactCommand(command, env, dependencies, refKeyPath);
   }
   const mysql = MysqlEnv.parse(env);
   const pageSize = (command === "list" || command === "reconcile")
@@ -846,13 +867,22 @@ export async function runBackupCatalogCli(
   let store: BackupCatalogCliStore | undefined;
   let summary: string | undefined;
   let operationError: unknown;
+  let refKey: Buffer | undefined;
   try {
+    if (refKeyPath !== undefined) {
+      try {
+        refKey = await (dependencies.readRefKey ?? readTelemetryCaptureRefKey)(refKeyPath);
+        if (!(refKey instanceof Uint8Array) || refKey.length !== 32) throw cliError("invalid_configuration");
+      }
+      catch { throw cliError("invalid_configuration"); }
+    }
     if (catalogAdapter) await catalogAdapter.validateStartup();
     for (const adapter of journalAdapters) await adapter.validateStartup();
     store = await dependencies.connectStore({
       url: mysql.MYSQL_URL,
       connectionLimit: command === "status" || command === "list" ? 1 : 2,
       migrationMode: "verify",
+      ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
     });
     const control = await store.getTenantBackupCatalogControl();
     validateTenantBackupCatalogControlRecord(control);
@@ -1104,6 +1134,7 @@ export async function runBackupCatalogCli(
     closeSafely(catalogAdapter),
     ...journalAdapters.map((adapter) => closeSafely(adapter)),
   ].filter((operation): operation is Promise<void> => operation !== undefined));
+  refKey?.fill(0);
   if (operationError !== undefined) throw operationError;
   if (closeResults.some((result) => result.status === "rejected") || summary === undefined) {
     throw cliError("operation_failed");

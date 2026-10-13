@@ -18,10 +18,12 @@ import {
   s3TenantTelemetryTargetIdentity,
   tenantTelemetryFilesystemFailureDomainSha256,
   tenantTelemetryFilesystemNamespaceSha256,
+  type TenantTelemetryPersistedProviderCaptureProof,
 } from "@agent-service/store";
 import { loadConfig } from "../src/config.js";
 import { reconcileTenantTelemetryWriterForStartup } from
   "../src/tenant-telemetry-writer-config.js";
+import { activateMemoryPersistedProviderCapture } from "../../../packages/core/test/persisted-provider-capture-fixture.js";
 
 const MASTER_KEY = "88".repeat(32);
 const REF_KEY_HEX = "31".repeat(32);
@@ -159,6 +161,27 @@ async function activateCapture(
 }
 
 describe("tenant telemetry writer runner startup", () => {
+  it("requires offline v2 activation and fresh-gate assembly, but local startup does not recursively call the router", async () => {
+    const config = s3EnabledConfig({ RUNNER_ID: "unit-capture-startup", ERASURE_ROUTER_URL: "http://router:8080", PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: "1",
+      TENANT_TELEMETRY_S3_NAMESPACE_ID: "unit-capture", TENANT_TELEMETRY_S3_FAILURE_DOMAIN_ID: "unit-fake", TENANT_TELEMETRY_S3_BUCKET: "unit-capture",
+      TENANT_TELEMETRY_S3_PREFIX: "capture", TENANT_TELEMETRY_S3_ENDPOINT: undefined, TENANT_TELEMETRY_S3_FORCE_PATH_STYLE: "0" });
+    const store = new MemorySessionStore({ now: () => Date.now() }, { tenantTelemetryRefKey: Buffer.from(REF_KEY_HEX, "hex"), tenantTelemetryPersistedProviderCaptureLocalOnly: true });
+    const validateStartup = vi.spyOn(S3TenantTelemetryWriteAdapter.prototype, "validateStartup").mockResolvedValue();
+    const requireFreshFleet = vi.fn(async (expected: TenantTelemetryPersistedProviderCaptureProof) => expected);
+    await expect(reconcileTenantTelemetryWriterForStartup(store, config, { warn() {} }, { requireFreshFleet })).rejects.toThrow(/activated offline/);
+    expect(validateStartup).not.toHaveBeenCalled();
+    await activateMemoryPersistedProviderCapture(store);
+    await expect(reconcileTenantTelemetryWriterForStartup(store, { ...config, PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: false }, { warn() {} }, { requireFreshFleet })).rejects.toThrow(/local keyed S3 writer/);
+    await expect(reconcileTenantTelemetryWriterForStartup(store, config, { warn() {} })).rejects.toThrow(/fresh fleet gate/);
+    const runtime = await reconcileTenantTelemetryWriterForStartup(store, config, { warn() {} }, { requireFreshFleet });
+    expect(runtime).toMatchObject({ active: true, captureActive: false, persistedCaptureActive: true });
+    expect(runtime.persistedCaptureBinding).toEqual(await store.getTenantTelemetryPersistedProviderCaptureBinding());
+    expect(validateStartup).toHaveBeenCalledOnce();
+    expect(requireFreshFleet).not.toHaveBeenCalled();
+    await runtime.worker!.stop();
+    await store.close();
+  });
+
   it("leaves an inactive lifecycle dormant without creating the sink directory", async () => {
     const root = await rootPath();
     const store = new MemorySessionStore(

@@ -100,6 +100,9 @@ const Env = z.object({
   /** Non-production only: independent ordinary DELETE operational-usage fleet barrier. */
   SESSION_USAGE_RETENTION_ENABLED: z.enum(["0", "1"])
     .default("0").transform((value) => value === "1"),
+  /** Independent local-only fresh all-configured provider capture barrier. */
+  PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED: z.enum(["0", "1"])
+    .default("0").transform((value) => value === "1"),
   /** Independent T3g Redis session-state deletion barrier. */
   TENANT_REDIS_PURGE_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -198,6 +201,8 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     || key.startsWith("SESSION_USAGE_RETENTION_WORKER_")
     || key.startsWith("TENANT_TELEMETRY_")
     || key.startsWith("TELEMETRY_LIFECYCLE_")
+    || key.startsWith("TELEMETRY_CAPTURE_")
+    || key === "PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED"
   ) && env[key] !== undefined);
   if (runnerOnlySecretKey) {
     throw new Error(
@@ -236,6 +241,9 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   const c = Env.parse(env);
   if (c.NODE_ENV === "production" && c.SESSION_USAGE_RETENTION_ENABLED) {
     throw new Error("SESSION_USAGE_RETENTION_ENABLED=1 is unsupported in production");
+  }
+  if (c.NODE_ENV === "production" && c.PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED) {
+    throw new Error("PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED is local-only");
   }
   const runnerList = [...new Set(c.RUNNERS.split(",").map((s) => s.trim()).filter(Boolean).map(validateRunnerUrl))];
   const internalRouterToken = c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN;

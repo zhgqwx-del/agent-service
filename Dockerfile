@@ -23,6 +23,7 @@ RUN node scripts/build-app.mjs ${APP}
 RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/blob-storage-migrate.js
 RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/restore-ledger-reconcile.js
 RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/backup-catalog.js
+RUN test "${APP}" != "agent-runner" || test -s /app/apps/agent-runner/dist/telemetry-capture.js
 # The first install has populated pnpm's store. Deploy offline from the same frozen lockfile and skip
 # lifecycle scripts: all runtime dependencies are JavaScript-only and esbuild is build-stage-only.
 RUN pnpm --filter "./apps/${APP}" --prod --offline --ignore-scripts --trust-lockfile --frozen-lockfile deploy /app/deploy

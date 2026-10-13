@@ -269,6 +269,9 @@ const Env = z.object({
   DATA_EXPORT_DOWNLOAD_LEASE_MS: z.coerce.number().int().min(1_000).max(60_000).default(30_000),
   /** Exact 32-byte HMAC key bound by the generation-1 telemetry lifecycle control. */
   TENANT_TELEMETRY_REF_KEY: z.string().regex(/^[0-9a-f]{64}$/i).optional(),
+  /** Local-only, future-only failed provider step + spool atomic capture; never enables disposal. */
+  PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED: z.enum(["0", "1"])
+    .default("0").transform((value) => value === "1"),
   /** Embedded durable writer. Once lifecycle generation 1 is active every runner must enable it. */
   TENANT_TELEMETRY_WRITER_ENABLED: z.enum(["0", "1"])
     .default("0")
@@ -523,7 +526,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     );
   }
   const telemetryLifecycleAuthorityKey = Object.keys(env).find((key) => (
-    key.startsWith("TELEMETRY_LIFECYCLE_") && env[key] !== undefined
+    (key.startsWith("TELEMETRY_LIFECYCLE_") || key.startsWith("TELEMETRY_CAPTURE_")
+      || key === "TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE") && env[key] !== undefined
   ));
   if (telemetryLifecycleAuthorityKey) {
     throw new Error(
@@ -540,6 +544,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   }
   const c = Env.parse(env);
   const production = c.NODE_ENV === "production";
+  if (env.PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED !== undefined) {
+    throw new Error("PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED is router-only");
+  }
+  if (c.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED) {
+    if (production) throw new Error("PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED is local-only");
+    if (c.STORE !== "mysql" || !c.RUNNER_ID || !c.ERASURE_ROUTER_URL
+      || !c.TENANT_TELEMETRY_WRITER_ENABLED || c.TENANT_TELEMETRY_WRITER_ADAPTER !== "s3"
+      || !c.TENANT_TELEMETRY_REF_KEY) {
+      throw new Error("persisted provider capture requires MySQL, an explicit stable RUNNER_ID, router URL, and the keyed S3 writer");
+    }
+  }
   const s3Endpoint = c.BLOB_S3_ENDPOINT === undefined
     ? undefined
     : validateS3Endpoint(c.BLOB_S3_ENDPOINT, production);

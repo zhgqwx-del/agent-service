@@ -39,10 +39,22 @@ for (const prerequisite of [
   "BACKUP_MYSQL_BINARY/BACKUP_MYSQLDUMP_BINARY", "Install MySQL 8 mysql/mysqldump externally",
   "current runner image does not include these tools", "Production use is rejected",
   "publish-backup remains attestation-only",
+  "TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE", "32 raw bytes (not hex)",
+  "Direct commands reject any ambient TENANT_TELEMETRY_REF_KEY",
+  "active provider-capture restore is unsupported",
 ]) {
   if (!result.stdout.includes(prerequisite)) {
     throw new Error("backup-catalog --help omitted an artifact command or safety prerequisite");
   }
+}
+
+const rejected = spawnSync(process.execPath, [artifact, "status"], {
+  cwd: ROOT, encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024,
+  env: { NODE_ENV: "test", PATH: process.env.PATH ?? "", TENANT_TELEMETRY_REF_KEY: "" },
+});
+if (rejected.error || rejected.signal || rejected.status !== 1 || rejected.stdout !== ""
+  || rejected.stderr !== '{"status":"error","code":"invalid_configuration"}\n') {
+  throw new Error("backup-catalog artifact did not safely reject ambient application key authority");
 }
 
 console.log(`runner backup-catalog artifact executed under plain Node (${artifactStat.size} bytes)`);

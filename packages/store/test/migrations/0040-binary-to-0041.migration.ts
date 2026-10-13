@@ -164,6 +164,8 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
   let base: URL;
   let archiveRoot: string;
   let oldCheckout: string;
+  let targetMigrationsDir: string;
+  let targetMigrations: string[];
   const databases = new Set<string>();
 
   beforeAll(async () => {
@@ -172,6 +174,14 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
     adminUrl.pathname = "/";
     admin = await mysql.createConnection(adminUrl.toString());
     archiveRoot = await mkdtemp(join(tmpdir(), "agent-service-frozen-0040-"));
+    targetMigrationsDir = join(archiveRoot, "target-migrations");
+    await mkdir(targetMigrationsDir);
+    targetMigrations = (await readdir(join(ROOT, "packages/store/migrations")))
+      .filter((name) => name.endsWith(".sql") && name <= MIGRATION_0041).sort();
+    expect(targetMigrations.at(-1)).toBe(MIGRATION_0041);
+    for (const name of targetMigrations) {
+      await copyFile(join(ROOT, "packages/store/migrations", name), join(targetMigrationsDir, name));
+    }
     oldCheckout = join(archiveRoot, "checkout");
     await mkdir(oldCheckout);
     const archive = join(archiveRoot, "frozen-0040.tar");
@@ -244,7 +254,7 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
     const oldVerifyAccepted = await runFixed("old verify accepted", process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-verify-probe.ts",
     ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
-      EXPECT_0040_FINGERPRINT_REJECTION: "0" }), 15_000);
+      EXPECT_FINGERPRINT_STAGE: "accepted" }), 15_000);
     expect(oldVerifyAccepted === "frozen-0040-verify-accepted").toBe(true);
 
     const before = new Map<string, string>();
@@ -274,7 +284,26 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
       await conn.end();
     }
 
-    const upgraded = await MysqlSessionStore.connect({ url });
+    // Keep the original target-specific fingerprint proof independent of later migrations.
+    const targetStore = await MysqlSessionStore.connect({ url, migrationsDir: targetMigrationsDir });
+    await targetStore.close();
+    const targetConn = await mysql.createConnection(url);
+    try {
+      const [markers] = await targetConn.query<Row[]>("SELECT name FROM schema_migrations ORDER BY name");
+      expect(markers.map((row) => row.name)).toEqual(targetMigrations);
+      expect(markers.some((row) => String(row.name).startsWith("0053_"))).toBe(false);
+    } finally {
+      await targetConn.end();
+    }
+    const targetProbe = await runFixed("old target verify rejected", process.execPath, [
+      "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-verify-probe.ts",
+    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
+      EXPECT_FINGERPRINT_STAGE: "target" }), 15_000);
+    expect(targetProbe).toBe("frozen-0040-verify-fingerprint-rejected");
+
+    const upgraded = await MysqlSessionStore.connect({
+      url, migrationsDir: join(ROOT, "packages/store/migrations"),
+    });
     try {
       const plan = await upgraded.getTenantPurgePlanReceipt(
         oldResult.tenantId, oldResult.requestId,
@@ -343,7 +372,8 @@ describe("frozen 0040 T3d terminal -> 0041 real MySQL upgrade", () => {
     const oldVerifyRejected = await runFixed("old verify rejected", process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0041-old-verify-probe.ts",
     ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
-      EXPECT_0040_FINGERPRINT_REJECTION: "1" }), 15_000);
-    expect(oldVerifyRejected === "frozen-0040-verify-fingerprint-rejected").toBe(true);
+      EXPECT_FINGERPRINT_STAGE: "full-tail" }), 15_000);
+    // Genuine old code sees the 0053 subject column/CHECK in its strict 0035 fingerprint first.
+    expect(oldVerifyRejected).toBe("frozen-0040-verify-0035-fingerprint-rejected");
   }, 240_000);
 });

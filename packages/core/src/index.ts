@@ -1,6 +1,6 @@
 export * from "./ids.js";
 export * from "./engine/types.js";
-export { PiEngine, PiSummariser } from "./engine/pi.js";
+export { PiEngine, PiSummariser, getPiProviderStepFailure, type PiProviderStepFailure } from "./engine/pi.js";
 export * from "./context/assemble.js";
 export * from "./context/history.js";
 export * from "./context/compact.js";
@@ -31,3 +31,4 @@ export * from "./lifecycle/tenant-redis-purge-worker.js";
 export * from "./lifecycle/tenant-telemetry-writer-worker.js";
 export * from "./lifecycle/tenant-runtime-coordinator.js";
 export * from "./telemetry/tenant-telemetry-application-dual-write.js";
+export * from "./telemetry/persisted-provider-failure-capture.js";

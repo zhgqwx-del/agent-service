@@ -180,6 +180,8 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
   let base: URL;
   let archiveRoot: string;
   let oldCheckout: string;
+  let targetMigrationsDir: string;
+  let targetMigrations: string[];
   const databases = new Set<string>();
 
   beforeAll(async () => {
@@ -188,6 +190,14 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     adminUrl.pathname = "/";
     admin = await mysql.createConnection(adminUrl.toString());
     archiveRoot = await mkdtemp(join(tmpdir(), "agent-service-frozen-0039-"));
+    targetMigrationsDir = join(archiveRoot, "target-migrations");
+    await mkdir(targetMigrationsDir);
+    targetMigrations = (await readdir(join(ROOT, "packages/store/migrations")))
+      .filter((name) => name.endsWith(".sql") && name <= MIGRATION_0040).sort();
+    expect(targetMigrations.at(-1)).toBe(MIGRATION_0040);
+    for (const name of targetMigrations) {
+      await copyFile(join(ROOT, "packages/store/migrations", name), join(targetMigrationsDir, name));
+    }
     oldCheckout = join(archiveRoot, "checkout");
     await mkdir(oldCheckout);
     const archive = join(archiveRoot, "frozen-0039.tar");
@@ -283,7 +293,27 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
       await conn.end();
     }
 
-    const upgraded = await MysqlSessionStore.connect({ url });
+    // Preserve the original target-specific old-binary rejection before a later schema
+    // change can become the first rejected fingerprint. Only current SQL is used here.
+    const targetStore = await MysqlSessionStore.connect({ url, migrationsDir: targetMigrationsDir });
+    await targetStore.close();
+    const targetConn = await mysql.createConnection(url);
+    try {
+      const [markers] = await targetConn.query<Row[]>("SELECT name FROM schema_migrations ORDER BY name");
+      expect(markers.map((row) => row.name)).toEqual(targetMigrations);
+      expect(markers.some((row) => String(row.name).startsWith("0053_"))).toBe(false);
+    } finally {
+      await targetConn.end();
+    }
+    const targetProbe = await runFixed(process.execPath, [
+      "--import", "tsx", "packages/store/test/migrations/fixtures/pre0040-old-fingerprint-probe.ts",
+    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
+      EXPECT_FINGERPRINT_STAGE: "target" }), 15_000);
+    expect(targetProbe).toBe("frozen-0039-fingerprint-rejected");
+
+    const upgraded = await MysqlSessionStore.connect({
+      url, migrationsDir: join(ROOT, "packages/store/migrations"),
+    });
     try {
       const plan = await upgraded.getTenantPurgePlanReceipt(
         oldResult.tenantId, oldResult.requestId,
@@ -344,8 +374,11 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
 
     const oldStoreProbe = await runFixed(process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0040-old-fingerprint-probe.ts",
-    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url }), 15_000);
-    expect(oldStoreProbe === "frozen-0039-fingerprint-rejected").toBe(true);
+    ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
+      EXPECT_FINGERPRINT_STAGE: "full-tail" }), 15_000);
+    // 0053 adds a subject_lifecycle column/CHECK, so genuine old code rejects its
+    // strict 0035 schema fingerprint before reaching the already-proven 0039 guard.
+    expect(oldStoreProbe).toBe("frozen-0039-0035-fingerprint-rejected");
 
     // The frozen runner bundle, not a copied fingerprint SQL statement, must reject the new
     // trigger/schema shape before binding its listener. A bounded child prevents a false pass.

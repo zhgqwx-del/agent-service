@@ -6,6 +6,26 @@ import type { ToolContentPart, Usage } from "@agent-service/protocol";
 import type { RunnerTool } from "../tools/types.js";
 import type { AgentEngine, AssistantStepResult, EngineInputPart, EngineRun, EngineSink, EngineTurnParams, ResolvedModel, Summariser, TranscriptMessage } from "./types.js";
 
+export interface PiProviderStepFailure {
+  readonly failureKind: "provider_step_error";
+  readonly stepIndex: number;
+}
+
+// Wire fields are not provenance. Pi synthesizes an assistant error after any executor/listener
+// failure, including a rejected store commit. Only the original model stream result grants this
+// process-local classification; no exported marker lets a generic engine forge it.
+const providerStepFailures = new WeakMap<object, Readonly<PiProviderStepFailure>>();
+const providerFailureMessages = new WeakMap<object, AssistantStepResult>();
+
+export function getPiProviderStepFailure(value: unknown): Readonly<PiProviderStepFailure> | undefined {
+  return typeof value === "object" && value !== null ? providerStepFailures.get(value) : undefined;
+}
+
+/** Original in-memory failed step only; never an error string or a synthesized terminal turn. */
+export function getPiProviderStepFailureMessage(value: unknown): AssistantStepResult | undefined {
+  return typeof value === "object" && value !== null ? providerFailureMessages.get(value) : undefined;
+}
+
 /**
  * AgentEngine backed by @earendil-works/pi-agent-core's `Agent` class (route A in docs/design §6.1).
  * pi owns the loop (model call → tool batch → next call); the host owns everything else.
@@ -19,6 +39,9 @@ export class PiEngine implements AgentEngine {
     const provider = params.model.provider;
     let step = 0;
     let currentAssistant: AssistantStepResult | undefined;
+    const originalProviderFailures = new WeakMap<object, Readonly<PiProviderStepFailure>>();
+    let lastProviderFailure: Readonly<PiProviderStepFailure> | undefined;
+    let lastProviderFailureMessage: AssistantStepResult | undefined;
     let sawToolArgsDelta = new Map<number, string>();
     // Pi's afterToolCall runs before it emits tool_execution_end and, critically, before it appends
     // the result to the live transcript. Track those calls so the later lifecycle event is not
@@ -33,13 +56,34 @@ export class PiEngine implements AgentEngine {
         messages: params.history.map(toPiMessage),
         thinkingLevel: params.model.reasoning && params.model.reasoning !== "off" ? params.model.reasoning : "off",
       },
-      streamFn: (m, ctx, opts) =>
-        this.models.streamSimple(m, ctx, {
+      streamFn: (m, ctx, opts) => {
+        const streamStep = step;
+        const stream = this.models.streamSimple(m, ctx, {
           ...opts,
           fetch: params.model.fetch,
           headers: params.model.headers,
           maxTokens: params.maxOutputTokens,
-        }),
+        });
+        const originalResult = stream.result.bind(stream);
+        const result = async () => {
+          const message = await originalResult();
+          if (message.stopReason === "error" && Number.isSafeInteger(streamStep) && streamStep > 0) {
+            originalProviderFailures.set(message, Object.freeze({
+              failureKind: "provider_step_error", stepIndex: streamStep,
+            }));
+          }
+          return message;
+        };
+        // Preserve the provider stream and iterator. Bound methods retain EventStream state;
+        // this wrapper never classifies callback, auth, tool or store exceptions as upstream.
+        return new Proxy(stream, {
+          get(target, property) {
+            if (property === "result") return result;
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      },
       getApiKey: async (p) => (p === provider ? await params.model.apiKey() : undefined),
       toolExecution: "parallel",
       beforeToolCall: async ({ toolCall, args, assistantMessage }) => {
@@ -98,6 +142,13 @@ export class PiEngine implements AgentEngine {
         case "message_end":
           if (ev.message.role === "assistant") {
             currentAssistant = toStepResult(ev.message, params.model.priceKnown !== false);
+            const providerFailure = originalProviderFailures.get(ev.message);
+            if (providerFailure) {
+              providerStepFailures.set(currentAssistant, providerFailure);
+              lastProviderFailure = providerFailure;
+              lastProviderFailureMessage = currentAssistant;
+              providerFailureMessages.set(currentAssistant, currentAssistant);
+            }
             if (currentAssistant.stopReason === "error") lastError = "provider_error";
             if (currentAssistant.stopReason === "aborted") aborted = true;
             await sink.onAssistantMessage(currentAssistant);
@@ -142,7 +193,10 @@ export class PiEngine implements AgentEngine {
       } finally {
         params.signal.removeEventListener("abort", onAbort);
       }
-      return { steps: step, aborted: aborted || params.signal.aborted, error: lastError };
+      const result = { steps: step, aborted: aborted || params.signal.aborted, error: lastError };
+      if (lastProviderFailure) providerStepFailures.set(result, lastProviderFailure);
+      if (lastProviderFailureMessage) providerFailureMessages.set(result, lastProviderFailureMessage);
+      return result;
     })();
 
     return {

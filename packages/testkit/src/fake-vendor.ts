@@ -43,6 +43,12 @@ export interface ScriptedReply {
   dropAfterChunks?: number;
   /** respond with this status and body instead of streaming */
   httpError?: { status: number; body?: unknown; retryAfter?: string };
+  /** Send a real SSE error frame; no synthetic engine/logger failure is introduced. */
+  sseError?: unknown;
+  /** Let preceding chunks reach the client before the real SSE error frame. */
+  sseErrorDelayMs?: number;
+  /** Close a successful SSE response without any model chunks. */
+  emptyStream?: true;
   /** delay before the first chunk, ms */
   ttftMs?: number;
 }
@@ -135,6 +141,7 @@ export class FakeVendor {
       "cache-control": "no-cache",
       connection: "keep-alive",
     });
+    if (r.emptyStream) { res.end(); return; }
     let written = 0;
     let dropped = false;
     const send = (payload: unknown) => {
@@ -161,6 +168,13 @@ export class FakeVendor {
 
     for (const piece of split(r.reasoning ?? "", 3)) delta({ reasoning_content: piece });
     for (const piece of split(r.text ?? "", 4)) delta({ content: piece });
+
+    if (r.sseError !== undefined) {
+      if (r.sseErrorDelayMs) await sleep(r.sseErrorDelayMs);
+      send({ error: r.sseError });
+      res.end();
+      return;
+    }
 
     for (const [index, tc] of (r.toolCalls ?? []).entries()) {
       const pieces = split(tc.args, tc.argChunks ?? 4);
