@@ -53,6 +53,7 @@ const requiredTestFiles = [
   // 0043 is read-only on the unchanged 0042 schema; this proves genuine old-code compatibility.
   "packages/store/test/migrations/0042-binary-to-0043.migration.ts",
   "packages/store/test/migrations/0042-to-0044.migration.ts",
+  "packages/store/test/migrations/0044-to-0049.migration.ts",
 ];
 const discoveredTestFiles = (await readdir(migrationTestDir, { recursive: true }))
   .filter((name) => name.endsWith(".migration.ts"))

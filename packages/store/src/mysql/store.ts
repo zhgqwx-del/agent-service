@@ -945,6 +945,25 @@ const TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME =
   "0044_tenant_telemetry_pregrant_intent.sql";
 const TENANT_TELEMETRY_PREGRANT_INTENT_FINGERPRINT_MARKER_PREFIX =
   "agent-service-runtime-fingerprint:tenant-telemetry-pregrant-intent";
+const TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME =
+  "0049_tenant_telemetry_application_capture_v2.sql";
+const TENANT_TELEMETRY_CAPTURE_V2_FINGERPRINT_MARKER_PREFIX =
+  "agent-service-runtime-fingerprint:tenant-telemetry-capture-v2";
+const TENANT_TELEMETRY_CAPTURE_V2_TRIGGER_NAMES = [
+  "trg_tt_capture_v2_control_bi",
+  "trg_tt_capture_v2_control_bu",
+  "trg_tt_capture_v2_control_bd",
+  "trg_tt_capture_v2_coverage_bi",
+  "trg_tt_capture_v2_coverage_bu",
+  "trg_tt_capture_v2_coverage_bd",
+  "trg_tt_capture_v2_binding_bi",
+  "trg_tt_capture_v2_binding_bu",
+  "trg_tt_capture_v2_binding_bd",
+  "trg_tt_capture_v2_old_writer_bu",
+  "trg_tt_capture_v2_t3d_bu",
+  "trg_tt_capture_v2_t3f_bu",
+  "trg_tt_capture_v2_write_job_bi",
+] as const;
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME = "trg_tt_disposition_grant_bi_v2";
 const TENANT_TELEMETRY_GRANT_V2_TRIGGER_PREFIX =
   `CREATE TRIGGER ${TENANT_TELEMETRY_GRANT_V2_TRIGGER_NAME} `
@@ -1500,6 +1519,30 @@ function tenantTelemetryPregrantIntentFingerprintStatement(
   if (statements.length !== 1
     || !statements[0]!.startsWith(`SET @tt_pregrant_${marker}_ok=`)) {
     throw new Error(`0044 pregrant intent ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
+function tenantTelemetryCaptureV2FingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+): string {
+  const startMarker =
+    `-- ${TENANT_TELEMETRY_CAPTURE_V2_FINGERPRINT_MARKER_PREFIX}-${marker}:start`;
+  const endMarker =
+    `-- ${TENANT_TELEMETRY_CAPTURE_V2_FINGERPRINT_MARKER_PREFIX}-${marker}:end`;
+  const start = migrationSql.indexOf(startMarker);
+  const end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0049 capture v2 ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @tt_capture_v2_${marker}_ok=`)) {
+    throw new Error(`0049 capture v2 ${marker} fingerprint block is invalid`);
   }
   return statements[0]!;
 }
@@ -9133,6 +9176,63 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertTenantTelemetryCaptureV2Fingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let statements: string[];
+    try {
+      const migrationSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME), "utf8",
+      );
+      const pregrantSql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME), "utf8",
+      );
+      const priorTriggerStatement =
+        tenantTelemetryPregrantIntentFingerprintStatement(pregrantSql, "triggers");
+      const where = "WHERE trigger_schema=DATABASE()";
+      if (priorTriggerStatement.split(where).length !== 2) {
+        throw new Error("0044 trigger predicate is not unique");
+      }
+      const excluded = TENANT_TELEMETRY_CAPTURE_V2_TRIGGER_NAMES
+        .map((name) => `'${name}'`).join(",");
+      statements = [
+        priorTriggerStatement.replace(
+          where,
+          `${where} AND BINARY trigger_name NOT IN (${excluded})`,
+        ),
+        tenantTelemetryCaptureV2FingerprintStatement(migrationSql, "schema"),
+        tenantTelemetryCaptureV2FingerprintStatement(migrationSql, "triggers"),
+      ];
+    } catch (cause) {
+      throw new Error("0049 capture v2 fingerprint source is invalid", { cause });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query("SET @tt_capture_v2_prev_gcml=@@SESSION.group_concat_max_len");
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @tt_pregrant_triggers_ok AS prior_ok,"
+        + "@tt_capture_v2_schema_ok AS schema_ok,"
+        + "@tt_capture_v2_triggers_ok AS trigger_ok",
+      );
+      if (Number(rows[0]?.prior_ok) !== 1
+        || Number(rows[0]?.schema_ok) !== 1
+        || Number(rows[0]?.trigger_ok) !== 1) {
+        throw new Error("stored schema/triggers do not match the 0049 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error("0049 capture v2 fingerprint verification failed", { cause });
+    }
+    try {
+      await conn.query("SET SESSION group_concat_max_len=@tt_capture_v2_prev_gcml");
+    } catch (cause) {
+      failure ??= new Error("0049 capture v2 fingerprint session restore failed", { cause });
+    }
+    if (failure) throw failure;
+  }
+
   private async reconcileLegacyTenantTelemetryLifecycleSubjects(
     conn: PoolConnection,
     acknowledgements: NonNullable<
@@ -9788,6 +9888,10 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME)) {
         throw new Error("0044 pregrant intent marker is missing its 0042 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)) {
+        throw new Error("0049 capture v2 marker is missing its 0044 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -9854,7 +9958,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryPregrantIntentFingerprint(conn, migrationsDir);
+        await this.assertTenantTelemetryPregrantIntentFingerprint(
+          conn, migrationsDir, !done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryCaptureV2Fingerprint(conn, migrationsDir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
@@ -9953,8 +10062,31 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_PLAN_ARTIFACT_TARGET_MIGRATION_NAME)) {
         throw new Error("0044 pregrant intent marker is missing its 0042 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)) {
+        throw new Error("0049 capture v2 marker is missing its 0044 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME) {
+          const [footprint] = await conn.query<Row[]>(
+            `SELECT (SELECT COUNT(*) FROM information_schema.tables
+                        WHERE table_schema=DATABASE() AND table_name IN
+                          ('tenant_telemetry_capture_v2_controls',
+                           'tenant_telemetry_capture_v2_coverages',
+                           'tenant_telemetry_capture_v2_source_bindings'))
+                      + (SELECT COUNT(*) FROM information_schema.triggers
+                          WHERE trigger_schema=DATABASE()
+                            AND trigger_name LIKE 'trg_tt_capture_v2_%') AS n`,
+          );
+          if (storedSafeInteger(footprint[0]?.n,
+            "markerless 0049 schema/trigger footprint") !== 0) {
+            throw new Error(
+              "0049 marker-loss or partial DDL requires controlled forward repair",
+            );
+          }
+          await this.assertTenantTelemetryPregrantIntentFingerprint(conn, dir);
+        }
         if (f === TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME) {
           const [rows] = await conn.query<Row[]>(
             `SELECT COUNT(*) AS trigger_count FROM information_schema.triggers
@@ -10265,7 +10397,12 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_TELEMETRY_PREGRANT_INTENT_MIGRATION_NAME)) {
-        await this.assertTenantTelemetryPregrantIntentFingerprint(conn, dir);
+        await this.assertTenantTelemetryPregrantIntentFingerprint(
+          conn, dir, !done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME),
+        );
+      }
+      if (done.has(TENANT_TELEMETRY_CAPTURE_V2_MIGRATION_NAME)) {
+        await this.assertTenantTelemetryCaptureV2Fingerprint(conn, dir);
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",

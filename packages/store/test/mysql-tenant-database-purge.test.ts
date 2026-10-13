@@ -1388,7 +1388,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
-    it("refuses 0044 marker-loss migration replay once a durable intent and claim exist", async () => {
+    it("refuses 0044 marker loss under the newer 0049 predecessor guard", async () => {
       const store = await MysqlSessionStore.connect({
         url: mysqlUrl, connectionLimit: 12, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
       });
@@ -1416,7 +1416,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         expect(deleted.affectedRows).toBe(1);
         await expect(MysqlSessionStore.connect({
           url: mysqlUrl, tenantTelemetryRefKey: TELEMETRY_REF_KEY,
-        })).rejects.toThrow("0044 marker-loss replay with durable intent/claim is forbidden");
+        })).rejects.toThrow("0049 capture v2 marker is missing its 0044 predecessor");
         const [rows] = await conn.query<RowDataPacket[]>(
           `SELECT
              (SELECT COUNT(*) FROM tenant_telemetry_pregrant_intents WHERE tenant_id=?) AS intents,
