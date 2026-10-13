@@ -23,7 +23,9 @@ function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function writeInput(tenantId: string): EnqueueTenantTelemetryArtifactInput {
+function writeInput(
+  tenantId: string, artifactLabel = "artifact",
+): EnqueueTenantTelemetryArtifactInput {
   let record: Readonly<StructuredTelemetryRecord> | undefined;
   const telemetry = createStructuredTelemetry({
     component: "runner", opaqueRefKey: REF_KEY, now: () => 1_000,
@@ -35,7 +37,7 @@ function writeInput(tenantId: string): EnqueueTenantTelemetryArtifactInput {
   if (!record) throw new Error("trusted 0049 telemetry fixture did not emit");
   return {
     tenantId, expectedControlGeneration: 1, domain: "logs",
-    artifactIdSha256: digest(`0049:${tenantId}:artifact`), artifactGeneration: 1,
+    artifactIdSha256: digest(`0049:${tenantId}:${artifactLabel}`), artifactGeneration: 1,
     ownerKind: "tenant", ownerId: tenantId, ownerUserId: null,
     sourceSchema: "migration-fixture-v1", sourceGeneration: 1,
     sourceHighWaterDbMs: 0,
@@ -68,6 +70,90 @@ function migrationStatements(sql: string): string[] {
     .map((value) => value.trim()).filter(Boolean);
 }
 
+async function recreateFixtureTrigger(
+  conn: Connection, migration: string, trigger: string,
+): Promise<void> {
+  const sql = await readFile(join(MIGRATIONS_DIR, migration), "utf8");
+  const statement = migrationStatements(sql).find(
+    (value) => value.startsWith(`CREATE TRIGGER ${trigger} `),
+  );
+  if (!statement) throw new Error(`fixture trigger ${trigger} is missing from ${migration}`);
+  await conn.query(statement);
+}
+
+async function seedClaimedPlanJob(
+  conn: Connection, requestId: string, tenantId: string,
+): Promise<void> {
+  // Synthetic content-free jobs only exercise the SQL transition guard. They
+  // are rolled back and never represent upstream T1/T3 authorization.
+  await conn.query(
+    `INSERT INTO tenant_purge_plan_jobs (
+       request_id,tenant_id,subject_generation,t1_fence_sha256,t3a_receipt_sha256,
+       t3b_receipt_sha256,t3c_receipt_sha256,policy_version,policy_sha256,
+       policy_schema_version,build_generation,retention_anchor_db_ms,purge_not_before_db_ms,
+       source_evidence_db_ms,cursor_domain,scan_complete,plan_entry_count,
+       plan_entry_root_sha256,blocker_count,blocker_root_sha256,phase,available_at_ms,
+       attempts,claim_token,lease_until_ms,created_at_ms,updated_at_ms
+     ) VALUES (?,?,1,?,?,?,?,'policy-v1',?,1,1,1,1,1,'traces',TRUE,33,?,2,?,
+               'queued',10,1,'fixture-claim',100,1,10)`,
+    [requestId, tenantId, digest(`${requestId}:t1`), digest(`${requestId}:t3a`),
+      digest(`${requestId}:t3b`), digest(`${requestId}:t3c`),
+      digest(`${requestId}:policy`), digest(`${requestId}:entry-root`),
+      digest(`${requestId}:blocker-root`)],
+  );
+}
+
+async function sealPlanJob(conn: Connection, requestId: string): Promise<void> {
+  await conn.query(
+    `UPDATE tenant_purge_plan_jobs
+        SET phase='plan_sealed',available_at_ms=NULL,claim_token=NULL,lease_until_ms=NULL,
+            updated_at_ms=20,sealed_at_ms=20,completed_claim_attempt=1,
+            completed_claim_token_sha256=?,aggregate_receipt_sha256=?
+      WHERE request_id=?`,
+    [digest(`${requestId}:claim`), digest(`${requestId}:aggregate`), requestId],
+  );
+}
+
+async function seedClaimedDatabasePurgeJob(
+  conn: Connection, requestId: string, tenantId: string,
+): Promise<void> {
+  await conn.query(
+    `INSERT INTO tenant_database_purge_jobs
+       (request_id,tenant_id,subject_generation,plan_build_generation,
+        execution_generation,database_purge_generation,t3c_receipt_sha256,
+        plan_receipt_sha256,local_physical_ack_receipt_sha256,policy_sha256,
+        purge_not_before_db_ms,source_evidence_db_ms,phase,domain_count,
+        predelete_entry_count,predelete_entry_root_sha256,domain_ack_count,
+        domain_ack_root_sha256,unresolved_blocker_count,available_at_ms,
+        attempts,claim_token,lease_until_ms,created_at_ms,updated_at_ms)
+     VALUES (?,?,?,?,?,?,?,?,?, ?,1,1,'queued',11,0,?,0,?,0,10,1,'fixture-claim',100,1,10)`,
+    [requestId, tenantId, 1, 1, 1, 1,
+      digest(`${requestId}:t3c`), digest(`${requestId}:plan`),
+      digest(`${requestId}:t3e`), digest(`${requestId}:policy`),
+      "863bda0e079e55aa4c751d6a4c18860cac791985c34a27572c9294cf9f7a4396",
+      "776cd8a7449522e7b71b04cc502881af1ebc11600627bc15606f90c29fdfe552"],
+  );
+}
+
+async function sealDatabasePurgeJob(
+  conn: Connection, requestId: string,
+): Promise<void> {
+  await conn.query(
+    `UPDATE tenant_database_purge_jobs
+        SET phase='database_purged',predelete_entry_count=11,
+            predelete_entry_root_sha256=?,domain_ack_count=11,
+            domain_ack_root_sha256=?,predelete_receipt_sha256=?,
+            terminal_receipt_sha256=?,available_at_ms=NULL,claim_token=NULL,
+            lease_until_ms=NULL,last_error_code=NULL,updated_at_ms=20,
+            purged_at_db_ms=20,completed_claim_attempt=1,
+            completed_claim_token_sha256=?
+      WHERE request_id=?`,
+    [digest(`${requestId}:entries`), digest(`${requestId}:acks`),
+      digest(`${requestId}:predelete`), digest(`${requestId}:terminal`),
+      digest(`${requestId}:claim`), requestId],
+  );
+}
+
 describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () => {
   it("applies additive dormant schema to real MySQL", async () => {
     const base = safeBase(BASE_URL);
@@ -78,6 +164,7 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
     adminUrl.pathname = "/";
     const admin = await mysql.createConnection(adminUrl.toString());
     let conn: Connection | undefined;
+    let upgraded: MysqlSessionStore | undefined;
     let oldDir: string | undefined;
     let newDir: string | undefined;
     let created = false;
@@ -141,11 +228,12 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
       expect(oldMembership).toHaveLength(1);
       await conn.end();
       conn = undefined;
-      const upgraded = await MysqlSessionStore.connect({
+      upgraded = await MysqlSessionStore.connect({
         url: databaseUrl(base, name), migrationsDir: newDir,
         tenantTelemetryRefKey: REF_KEY,
       });
-      await upgraded.close();
+      await upgraded.createApiKey("tenant-pre0049-other", "key-pre0049-other",
+        digest("0049-other-key"));
       conn = await mysql.createConnection(databaseUrl(base, name));
       const [oldRowsAfter] = await conn.query<Row[]>(
         "SELECT tenant_id,key_id,key_hash FROM api_keys WHERE tenant_id='tenant-pre0049'",
@@ -222,6 +310,167 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
       expect(Number(footprint[0]?.coverages)).toBe(0);
       expect(Number(footprint[0]?.bindings)).toBe(0);
 
+      // All tampering below is confined to this disposable historical database.
+      // Temporarily remove only the listed fixture guards, then restore their
+      // exact published definitions and prove verify-only startup accepts them.
+      // The older terminal receipt guards must be absent to isolate the new
+      // 0049 blocker; synthetic terminal rows are rolled back, not published.
+      const dropped: Array<[string, string]> = [];
+      const dropFixtureTrigger = async (trigger: string, migration: string) => {
+        await conn!.query(`DROP TRIGGER \`${trigger}\``);
+        dropped.push([trigger, migration]);
+      };
+      let relaxedControlCheck = false;
+      try {
+        for (const [trigger, migration] of [
+          ["trg_tt_source_accounting_t3d_terminal_bu", "0040_tenant_telemetry_source_accounting.sql"],
+          ["trg_tt_target_manifest_t3d_terminal_bu", "0041_tenant_telemetry_target_manifest.sql"],
+          ["trg_tt_plan_artifact_target_t3d_terminal_bu", "0042_tenant_telemetry_plan_artifact_target.sql"],
+          ["trg_tt_owner_closure_t3f_terminal_bu", "0039_tenant_telemetry_owner_closure.sql"],
+          ["trg_tt_capture_v2_coverage_bi", MIGRATION_NAME],
+          ["trg_tt_capture_v2_coverage_bd", MIGRATION_NAME],
+          ["trg_tt_capture_v2_binding_bi", MIGRATION_NAME],
+          ["trg_tt_capture_v2_binding_bd", MIGRATION_NAME],
+          ["trg_tt_capture_v2_control_bu", MIGRATION_NAME],
+        ] as const) await dropFixtureTrigger(trigger, migration);
+        const [lifecycleCoverage] = await conn.query<Row[]>(
+          `SELECT evidence_sha256,subject_ref_sha256,history_status,coverage_started_at_db_ms
+             FROM tenant_telemetry_lifecycle_coverages WHERE tenant_id=?`,
+          ["tenant-pre0049"],
+        );
+        expect(lifecycleCoverage).toHaveLength(1);
+        expect(lifecycleCoverage[0]?.history_status).toBe("complete_since_creation");
+        const captureCoverageSha = digest("0049:injected:v2-coverage");
+        const producerContractSha = digest(
+          "provider.upstream_request_failed:durable-failed-step:v2",
+        );
+        await conn.query(
+          `INSERT INTO tenant_telemetry_capture_v2_coverages
+             (tenant_id,domain,scope,control_generation,capture_status,
+              pre_cutover_history_status,lifecycle_coverage_evidence_sha256,
+              subject_ref_sha256,producer_contract_sha256,
+              coverage_started_at_db_ms,evidence_sha256)
+           VALUES (?,'logs','tenant-telemetry-capture-coverage-v2',1,
+                   'capture_since_tenant_creation','pre_cutover_not_applicable',?,?,?,?,?)`,
+          ["tenant-pre0049", lifecycleCoverage[0]!.evidence_sha256,
+            lifecycleCoverage[0]!.subject_ref_sha256, producerContractSha,
+            lifecycleCoverage[0]!.coverage_started_at_db_ms, captureCoverageSha],
+        );
+        await conn.query(
+          `INSERT INTO tenant_telemetry_capture_v2_source_bindings
+             (write_operation_sha256,scope,tenant_id,domain,control_generation,
+              coverage_evidence_sha256,producer_contract_sha256,source_session_id,
+              source_turn_id,source_item_id,source_step_index,source_event_seq,
+              owner_ref_sha256,payload_sha256,bound_at_db_ms,receipt_sha256)
+           VALUES (?,'tenant-telemetry-capture-source-binding-v2',?,'logs',1,
+                   ?,?,'fixture-session','fixture-turn','fixture-item',0,1,?,?,1,?)`,
+          [oldJobs[0]!.write_operation_sha256, "tenant-pre0049",
+            captureCoverageSha, producerContractSha,
+            oldMembership[0]!.owner_ref_sha256, oldJobs[0]!.payload_sha256,
+            digest("0049:injected:v2-binding")],
+        );
+
+        await conn.query("SET FOREIGN_KEY_CHECKS=0");
+        await conn.beginTransaction();
+        try {
+          for (const tenant of ["tenant-pre0049", "tenant-pre0049-other"]) {
+            await seedClaimedPlanJob(conn, `request-0049-plan-${tenant}`, tenant);
+            await seedClaimedDatabasePurgeJob(conn, `request-0049-t3f-${tenant}`, tenant);
+          }
+          await expect(sealPlanJob(conn, "request-0049-plan-tenant-pre0049"))
+            .rejects.toThrow("T3d cannot account for capture v2 source");
+          await sealPlanJob(conn, "request-0049-plan-tenant-pre0049-other");
+          await expect(sealDatabasePurgeJob(conn, "request-0049-t3f-tenant-pre0049"))
+            .rejects.toThrow("T3f cannot close capture v2 owner source");
+          await sealDatabasePurgeJob(conn, "request-0049-t3f-tenant-pre0049-other");
+          const [phases] = await conn.query<Row[]>(
+            `SELECT tenant_id,phase FROM tenant_purge_plan_jobs
+               WHERE request_id LIKE 'request-0049-plan-%' ORDER BY tenant_id`,
+          );
+          expect(phases.map((row) => [row.tenant_id, row.phase]))
+            .toEqual([["tenant-pre0049", "queued"],
+              ["tenant-pre0049-other", "plan_sealed"]]);
+          const [dbPhases] = await conn.query<Row[]>(
+            `SELECT tenant_id,phase FROM tenant_database_purge_jobs
+               WHERE request_id LIKE 'request-0049-t3f-%' ORDER BY tenant_id`,
+          );
+          expect(dbPhases.map((row) => [row.tenant_id, row.phase]))
+            .toEqual([["tenant-pre0049", "queued"],
+              ["tenant-pre0049-other", "database_purged"]]);
+        } finally {
+          try {
+            await conn.rollback();
+          } finally {
+            await conn.query("SET FOREIGN_KEY_CHECKS=1");
+          }
+        }
+        const [rolledBack] = await conn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_purge_plan_jobs
+                    WHERE request_id LIKE 'request-0049-plan-%') AS plans,
+                  (SELECT COUNT(*) FROM tenant_database_purge_jobs
+                    WHERE request_id LIKE 'request-0049-t3f-%') AS purges`,
+        );
+        expect(Number(rolledBack[0]?.plans)).toBe(0);
+        expect(Number(rolledBack[0]?.purges)).toBe(0);
+
+        // A binding for one tenant does not suppress another tenant's normal
+        // managed write. An active v2 control, however, must stop every v1 job.
+        await upgraded.enqueueTenantTelemetryArtifact(writeInput("tenant-pre0049-other"));
+        await conn.query(
+          `ALTER TABLE tenant_telemetry_capture_v2_controls
+             ALTER CHECK chk_tt_capture_v2_control_shape NOT ENFORCED`,
+        );
+        relaxedControlCheck = true;
+        await conn.query(
+          `UPDATE tenant_telemetry_capture_v2_controls
+              SET state='active',control_generation=1,activated_at_db_ms=1
+            WHERE domain='logs'`,
+        );
+        const [writeCountsBefore] = await conn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_telemetry_write_jobs
+                    WHERE tenant_id='tenant-pre0049') AS jobs,
+                  (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships
+                    WHERE tenant_id='tenant-pre0049') AS memberships,
+                  (SELECT COUNT(*) FROM tenant_telemetry_write_payloads
+                    WHERE tenant_id='tenant-pre0049') AS payloads`,
+        );
+        await expect(upgraded.enqueueTenantTelemetryArtifact(
+          writeInput("tenant-pre0049", "active-control-probe"),
+        )).rejects.toThrow("capture v2 job path is disabled");
+        const [writeCountsAfter] = await conn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_telemetry_write_jobs
+                    WHERE tenant_id='tenant-pre0049') AS jobs,
+                  (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships
+                    WHERE tenant_id='tenant-pre0049') AS memberships,
+                  (SELECT COUNT(*) FROM tenant_telemetry_write_payloads
+                    WHERE tenant_id='tenant-pre0049') AS payloads`,
+        );
+        expect(writeCountsAfter).toEqual(writeCountsBefore);
+      } finally {
+        await conn.query("SET FOREIGN_KEY_CHECKS=1");
+        if (relaxedControlCheck) {
+          await conn.query(
+            `UPDATE tenant_telemetry_capture_v2_controls
+                SET state='inactive',control_generation=0,activated_at_db_ms=NULL
+              WHERE domain='logs'`,
+          );
+          await conn.query(
+            `ALTER TABLE tenant_telemetry_capture_v2_controls
+               ALTER CHECK chk_tt_capture_v2_control_shape ENFORCED`,
+          );
+        }
+        await conn.query("DELETE FROM tenant_telemetry_capture_v2_source_bindings");
+        await conn.query("DELETE FROM tenant_telemetry_capture_v2_coverages");
+        for (const [trigger, migration] of dropped.reverse()) {
+          await recreateFixtureTrigger(conn, migration, trigger);
+        }
+      }
+      const restored = await MysqlSessionStore.connect({
+        url: databaseUrl(base, name), migrationsDir: newDir,
+        tenantTelemetryRefKey: REF_KEY, migrationMode: "verify",
+      });
+      await restored.close();
+
       await conn.query("DROP TRIGGER trg_tt_capture_v2_binding_bi");
       await expect(MysqlSessionStore.connect({
         url: databaseUrl(base, name), migrationsDir: newDir,
@@ -275,6 +524,7 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
         tenantTelemetryRefKey: REF_KEY,
       })).rejects.toThrow("0049 marker-loss or partial DDL");
     } finally {
+      if (upgraded) await upgraded.close();
       if (conn) await conn.end();
       if (oldDir) await rm(oldDir, { recursive: true, force: true });
       if (newDir) await rm(newDir, { recursive: true, force: true });
