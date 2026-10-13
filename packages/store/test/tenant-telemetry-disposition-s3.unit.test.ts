@@ -62,6 +62,7 @@ function fakeState(): FakeState {
 
 class FakeS3Client {
   readonly commands: unknown[] = [];
+  readonly abortedCommands: unknown[] = [];
   readonly destroy = vi.fn();
   versioning: "Enabled" | "Suspended" | undefined;
   lifecycleRules: Array<Record<string, unknown>> = [];
@@ -96,6 +97,7 @@ class FakeS3Client {
       await new Promise<void>((resolve, reject) => {
         const abort = () => {
           clearTimeout(timer);
+          this.abortedCommands.push(command);
           reject(options?.abortSignal?.reason);
         };
         const timer = setTimeout(() => {
@@ -522,13 +524,30 @@ describe("S3TenantTelemetryDispositionAdapter unit contract", () => {
   });
 
   it("uses one whole-operation deadline across requests and sanitizes failures", async () => {
-    const slow = new FakeS3Client();
-    slow.delayEverySendMs = 35;
-    const slowFixture = fixture(slow, { operationTimeoutMs: 100 });
-    const started = Date.now();
-    await expect(slowFixture.adapter.authorizeDeletion(dispositionEvidence(13)))
-      .rejects.toThrow(/deadline|timed out/);
-    expect(Date.now() - started).toBeLessThan(250);
+    vi.useFakeTimers();
+    try {
+      const slow = new FakeS3Client();
+      slow.delayEverySendMs = 35;
+      const slowFixture = fixture(slow, { operationTimeoutMs: 100 });
+      const started = Date.now();
+      // The deadline may surface before a request or as the sanitized SDK timeout.
+      // Advance one shared clock instead of racing 35ms wall timers on a loaded host.
+      const rejection = expect(
+        slowFixture.adapter.authorizeDeletion(dispositionEvidence(13)),
+      ).rejects.toThrow(/deadline|timed out|TimeoutError/);
+      await vi.advanceTimersByTimeAsync(100);
+      await rejection;
+      expect(Date.now() - started).toBe(100);
+      expect(slow.commands).toHaveLength(3);
+      expect(slow.abortedCommands).toEqual([slow.commands[2]]);
+      expect(slow.state.objects.size).toBe(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(slow.commands).toHaveLength(3);
+      expect(slow.state.objects.size).toBe(0);
+      await slowFixture.adapter.close();
+    } finally {
+      vi.useRealTimers();
+    }
 
     const failed = fixture(new FakeS3Client());
     failed.client.rejectNext = serviceError(503, "ServiceUnavailable");
