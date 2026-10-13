@@ -65,6 +65,12 @@ function databaseUrl(base: URL, name: string): string {
   return url.toString();
 }
 
+function assertDisposableDatabaseName(name: string): void {
+  if (!/^agent_service_migration_test_0049_(?:partial_)?[0-9]+_[0-9a-f]{8}$/.test(name)) {
+    throw new Error("0049 fixture database name is not a disposable random target");
+  }
+}
+
 function migrationStatements(sql: string): string[] {
   return sql.replace(/^\s*--.*$/gm, "").split(/;\s*\n/)
     .map((value) => value.trim()).filter(Boolean);
@@ -160,6 +166,8 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
     const name = `agent_service_migration_test_0049_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
     const partialName =
       `agent_service_migration_test_0049_partial_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+    assertDisposableDatabaseName(name);
+    assertDisposableDatabaseName(partialName);
     const adminUrl = new URL(base);
     adminUrl.pathname = "/";
     const admin = await mysql.createConnection(adminUrl.toString());
@@ -169,6 +177,8 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
     let newDir: string | undefined;
     let created = false;
     let partialCreated = false;
+    let bodyFailed = false;
+    let bodyFailure: unknown;
     try {
       const [collision] = await admin.query<Row[]>(
         "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=?", [name],
@@ -523,14 +533,52 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
         url: databaseUrl(base, partialName), migrationsDir: newDir,
         tenantTelemetryRefKey: REF_KEY,
       })).rejects.toThrow("0049 marker-loss or partial DDL");
+    } catch (error) {
+      bodyFailed = true;
+      bodyFailure = error;
     } finally {
-      if (upgraded) await upgraded.close();
-      if (conn) await conn.end();
-      if (oldDir) await rm(oldDir, { recursive: true, force: true });
-      if (newDir) await rm(newDir, { recursive: true, force: true });
-      if (created) await admin.query(`DROP DATABASE \`${name}\``);
-      if (partialCreated) await admin.query(`DROP DATABASE \`${partialName}\``);
-      await admin.end();
+      const cleanupFailures: Error[] = [];
+      const attemptCleanup = async (label: string, operation: () => Promise<unknown>) => {
+        try {
+          await operation();
+        } catch (cause) {
+          cleanupFailures.push(new Error(`0049 fixture ${label} failed`, { cause }));
+        }
+      };
+      if (upgraded) {
+        const store = upgraded;
+        await attemptCleanup("store close", () => store.close());
+      }
+      if (conn) {
+        const connection = conn;
+        await attemptCleanup("connection close", () => connection.end());
+      }
+      if (oldDir) {
+        const directory = oldDir;
+        await attemptCleanup("old migration directory cleanup",
+          () => rm(directory, { recursive: true, force: true }));
+      }
+      if (newDir) {
+        const directory = newDir;
+        await attemptCleanup("new migration directory cleanup",
+          () => rm(directory, { recursive: true, force: true }));
+      }
+      // These two names were generated and strictly validated above, and only
+      // databases successfully created by this fixture may be dropped. Each
+      // DROP is independent of every earlier cleanup failure.
+      if (created) await attemptCleanup("historical database drop",
+        () => admin.query(`DROP DATABASE \`${name}\``));
+      if (partialCreated) await attemptCleanup("partial-DDL database drop",
+        () => admin.query(`DROP DATABASE \`${partialName}\``));
+      await attemptCleanup("admin connection close", () => admin.end());
+      if (bodyFailed && cleanupFailures.length > 0) {
+        throw new AggregateError([bodyFailure, ...cleanupFailures],
+          "0049 fixture and cleanup both failed");
+      }
+      if (bodyFailed) throw bodyFailure;
+      if (cleanupFailures.length > 0) {
+        throw new AggregateError(cleanupFailures, "0049 fixture cleanup failed");
+      }
     }
   }, 90_000);
 });
