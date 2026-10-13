@@ -84,9 +84,11 @@ CREATE TABLE IF NOT EXISTS tenant_telemetry_capture_v2_source_bindings (
   control_generation BIGINT UNSIGNED NOT NULL,
   coverage_evidence_sha256 CHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
   producer_contract_sha256 CHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
-  source_session_id VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
-  source_turn_id VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
-  source_item_id VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+  -- Future writers must derive these with the tenant-bound, kind-separated
+  -- telemetryCaptureLogsSourceRefSha256 HMAC protocol; raw IDs are never stored.
+  source_session_ref_sha256 CHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+  source_turn_ref_sha256 CHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+  source_item_ref_sha256 CHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
   source_step_index INT UNSIGNED NOT NULL,
   source_event_seq BIGINT UNSIGNED NOT NULL,
   owner_ref_sha256 CHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
@@ -95,7 +97,8 @@ CREATE TABLE IF NOT EXISTS tenant_telemetry_capture_v2_source_bindings (
   receipt_sha256 CHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
   PRIMARY KEY (write_operation_sha256),
   UNIQUE KEY uk_tt_capture_v2_binding_source
-    (source_session_id,source_turn_id,source_item_id,source_step_index),
+    (source_session_ref_sha256,source_turn_ref_sha256,
+     source_item_ref_sha256,source_step_index),
   UNIQUE KEY uk_tt_capture_v2_binding_receipt (receipt_sha256),
   KEY idx_tt_capture_v2_binding_tenant (tenant_id,domain,write_operation_sha256),
   KEY idx_tt_capture_v2_binding_coverage
@@ -111,9 +114,9 @@ CREATE TABLE IF NOT EXISTS tenant_telemetry_capture_v2_source_bindings (
     AND write_operation_sha256 REGEXP '^[0-9a-f]{64}$'
     AND coverage_evidence_sha256 REGEXP '^[0-9a-f]{64}$'
     AND producer_contract_sha256 REGEXP '^[0-9a-f]{64}$'
-    AND CHAR_LENGTH(source_session_id) BETWEEN 1 AND 64
-    AND CHAR_LENGTH(source_turn_id) BETWEEN 1 AND 64
-    AND CHAR_LENGTH(source_item_id) BETWEEN 1 AND 64
+    AND source_session_ref_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND source_turn_ref_sha256 REGEXP '^[0-9a-f]{64}$'
+    AND source_item_ref_sha256 REGEXP '^[0-9a-f]{64}$'
     AND source_event_seq>0
     AND owner_ref_sha256 REGEXP '^[0-9a-f]{64}$'
     AND payload_sha256 REGEXP '^[0-9a-f]{64}$'
@@ -139,18 +142,18 @@ CREATE TRIGGER trg_tt_capture_v2_old_writer_bu BEFORE UPDATE ON tenant_telemetry
 
 -- 0040/0039 do not account for this sixth source. Fail closed even if a
 -- privileged actor bypasses the dormant INSERT guards or control shape.
-CREATE TRIGGER trg_tt_capture_v2_t3d_bu BEFORE UPDATE ON tenant_purge_plan_jobs FOR EACH ROW BEGIN IF OLD.phase='queued' AND NEW.phase='plan_sealed' AND (EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_controls WHERE state<>'inactive' OR control_generation<>0) OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_source_bindings WHERE BINARY tenant_id=BINARY NEW.tenant_id)) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='T3d cannot account for capture v2 source'; END IF; END;
-CREATE TRIGGER trg_tt_capture_v2_t3f_bu BEFORE UPDATE ON tenant_database_purge_jobs FOR EACH ROW BEGIN IF OLD.phase='queued' AND NEW.phase='database_purged' AND (EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_controls WHERE state<>'inactive' OR control_generation<>0) OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_source_bindings WHERE BINARY tenant_id=BINARY NEW.tenant_id)) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='T3f cannot close capture v2 owner source'; END IF; END;
-CREATE TRIGGER trg_tt_capture_v2_write_job_bi BEFORE INSERT ON tenant_telemetry_write_jobs FOR EACH ROW BEGIN IF EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_controls WHERE state<>'inactive' OR control_generation<>0) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='capture v2 job path is disabled'; END IF; END;
+CREATE TRIGGER trg_tt_capture_v2_t3d_bu BEFORE UPDATE ON tenant_purge_plan_jobs FOR EACH ROW BEGIN IF OLD.phase='queued' AND NEW.phase='plan_sealed' AND (EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_controls WHERE state<>'inactive' OR control_generation<>0) OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_coverages WHERE BINARY tenant_id=BINARY NEW.tenant_id) OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_source_bindings WHERE BINARY tenant_id=BINARY NEW.tenant_id)) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='T3d cannot account for capture v2 source'; END IF; END;
+CREATE TRIGGER trg_tt_capture_v2_t3f_bu BEFORE UPDATE ON tenant_database_purge_jobs FOR EACH ROW BEGIN IF OLD.phase='queued' AND NEW.phase='database_purged' AND (EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_controls WHERE state<>'inactive' OR control_generation<>0) OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_coverages WHERE BINARY tenant_id=BINARY NEW.tenant_id) OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_source_bindings WHERE BINARY tenant_id=BINARY NEW.tenant_id)) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='T3f cannot close capture v2 owner source'; END IF; END;
+CREATE TRIGGER trg_tt_capture_v2_write_job_bi BEFORE INSERT ON tenant_telemetry_write_jobs FOR EACH ROW BEGIN IF EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_controls WHERE state<>'inactive' OR control_generation<>0) OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_coverages WHERE BINARY tenant_id=BINARY NEW.tenant_id) OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_source_bindings WHERE BINARY tenant_id=BINARY NEW.tenant_id) THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='capture v2 job path is disabled'; END IF; END;
 
 SET @tt_capture_v2_previous_group_concat_max_len=@@SESSION.group_concat_max_len;
 SET SESSION group_concat_max_len=1048576;
 -- agent-service-runtime-fingerprint:tenant-telemetry-capture-v2-schema:start
 SET @tt_capture_v2_schema_ok=(
   (SELECT COUNT(*)=3 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',table_name,table_type,IFNULL(engine,'-'),IFNULL(table_collation,'-')) ORDER BY table_name SEPARATOR '|'),256)='ba3e802f0546cf7a603d8b341bd8a2950b58f73b01b9580e9b246b74c63d4fd0' FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings'))
-  AND (SELECT COUNT(*)=35 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',table_name,LPAD(ordinal_position,3,'0'),column_name,LOWER(column_type),is_nullable,IF(column_default IS NULL,'<NULL>',CONCAT('<',column_default,'>')),IFNULL(character_set_name,'-'),IFNULL(extra,'-'),IFNULL(generation_expression,'-')) ORDER BY table_name,ordinal_position SEPARATOR '|'),256)='9d97355b7f4cd52fc5837e615dbfe935b45852ec14350f96f76d1af07e3ac319' FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings'))
-  AND (SELECT COUNT(*)=22 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',table_name,index_name,LPAD(seq_in_index,3,'0'),column_name,non_unique,index_type,IFNULL(collation,'-'),IFNULL(sub_part,'-'),IFNULL(nullable,'-')) ORDER BY table_name,index_name,seq_in_index SEPARATOR '|'),256)='1339664c326fe7016f6d7816a39678a4619f3be33a41b7c19a023584cc2ddb39' FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings'))
-  AND (SELECT COUNT(*)=3 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',constraint_name,LOWER(REPLACE(REPLACE(REGEXP_REPLACE(check_clause,'[[:space:]]',''),CHAR(96),''),'_utf8mb4',''))) ORDER BY constraint_name SEPARATOR '|'),256)='bd40c6bdd36c1a39f43d41417026ea6f596cd0ff15490d9b1c2e5577d060913b' FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name IN ('chk_tt_capture_v2_control_shape','chk_tt_capture_v2_coverage_shape','chk_tt_capture_v2_binding_shape'))
+  AND (SELECT COUNT(*)=35 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',table_name,LPAD(ordinal_position,3,'0'),column_name,LOWER(column_type),is_nullable,IF(column_default IS NULL,'<NULL>',CONCAT('<',column_default,'>')),IFNULL(character_set_name,'-'),IFNULL(extra,'-'),IFNULL(generation_expression,'-')) ORDER BY table_name,ordinal_position SEPARATOR '|'),256)='8d682237f0815b46e49b4dfe8b4c90f73977f3e217a34693c47dae259c470a25' FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings'))
+  AND (SELECT COUNT(*)=22 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',table_name,index_name,LPAD(seq_in_index,3,'0'),column_name,non_unique,index_type,IFNULL(collation,'-'),IFNULL(sub_part,'-'),IFNULL(nullable,'-')) ORDER BY table_name,index_name,seq_in_index SEPARATOR '|'),256)='aac2e6e3a2d50751acd92a5ea3f9deb51a7ef63ec64e6a27fb2a1fb1bcdb7124' FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings'))
+  AND (SELECT COUNT(*)=3 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',constraint_name,LOWER(REPLACE(REPLACE(REGEXP_REPLACE(check_clause,'[[:space:]]',''),CHAR(96),''),'_utf8mb4',''))) ORDER BY constraint_name SEPARATOR '|'),256)='22b417059671be5d35ae71466eba1bc3eb7089e29a1d7e8da58eb4a68602fa22' FROM information_schema.check_constraints WHERE constraint_schema=DATABASE() AND constraint_name IN ('chk_tt_capture_v2_control_shape','chk_tt_capture_v2_coverage_shape','chk_tt_capture_v2_binding_shape'))
   AND (SELECT COUNT(*)=13 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',table_name,constraint_name,constraint_type) ORDER BY table_name,constraint_name SEPARATOR '|'),256)='f7ae12d9e707ba8b5061e84015391a574eeed26dfe5cee6579213009e3b06528' FROM information_schema.table_constraints WHERE table_schema=DATABASE() AND table_name IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings'))
   AND (SELECT COUNT(*)=3 AND SUM(enforced='YES')=3 FROM information_schema.table_constraints WHERE table_schema=DATABASE() AND constraint_name IN ('chk_tt_capture_v2_control_shape','chk_tt_capture_v2_coverage_shape','chk_tt_capture_v2_binding_shape') AND constraint_type='CHECK')
   AND (SELECT COUNT(*)=3 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',table_name,constraint_name,referenced_table_name,update_rule,delete_rule) ORDER BY table_name,constraint_name SEPARATOR '|'),256)='d28a48ed49f17d60945530d5610ef317c940fe47fece2d98ae16c8920e26c2aa' FROM information_schema.referential_constraints WHERE constraint_schema=DATABASE() AND table_name IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings'))
@@ -168,7 +171,7 @@ DEALLOCATE PREPARE migration_stmt;
 
 -- agent-service-runtime-fingerprint:tenant-telemetry-capture-v2-triggers:start
 SET @tt_capture_v2_triggers_ok=(
-  (SELECT COUNT(*)=13 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',event_object_table,trigger_name,action_timing,event_manipulation,action_orientation,IFNULL(action_condition,'<NULL>'),LOWER(REPLACE(REPLACE(REGEXP_REPLACE(action_statement,'[[:space:]]',''),CHAR(96),''),'_utf8mb4',''))) ORDER BY event_object_table,trigger_name SEPARATOR '|'),256)='28e0df5eca009bd3826e330ea7cd75b6bc7187d055efd20eb935f14317d1f18e' FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name IN ('trg_tt_capture_v2_control_bi','trg_tt_capture_v2_control_bu','trg_tt_capture_v2_control_bd','trg_tt_capture_v2_coverage_bi','trg_tt_capture_v2_coverage_bu','trg_tt_capture_v2_coverage_bd','trg_tt_capture_v2_binding_bi','trg_tt_capture_v2_binding_bu','trg_tt_capture_v2_binding_bd','trg_tt_capture_v2_old_writer_bu','trg_tt_capture_v2_t3d_bu','trg_tt_capture_v2_t3f_bu','trg_tt_capture_v2_write_job_bi'))
+  (SELECT COUNT(*)=13 AND SHA2(GROUP_CONCAT(CONCAT_WS('~',event_object_table,trigger_name,action_timing,event_manipulation,action_orientation,IFNULL(action_condition,'<NULL>'),LOWER(REPLACE(REPLACE(REGEXP_REPLACE(action_statement,'[[:space:]]',''),CHAR(96),''),'_utf8mb4',''))) ORDER BY event_object_table,trigger_name SEPARATOR '|'),256)='5791712a27ce428ccaa11e753f6d469c5545bcc6c4f42da9ad460933d4f5b95f' FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name IN ('trg_tt_capture_v2_control_bi','trg_tt_capture_v2_control_bu','trg_tt_capture_v2_control_bd','trg_tt_capture_v2_coverage_bi','trg_tt_capture_v2_coverage_bu','trg_tt_capture_v2_coverage_bd','trg_tt_capture_v2_binding_bi','trg_tt_capture_v2_binding_bu','trg_tt_capture_v2_binding_bd','trg_tt_capture_v2_old_writer_bu','trg_tt_capture_v2_t3d_bu','trg_tt_capture_v2_t3f_bu','trg_tt_capture_v2_write_job_bi'))
   AND (SELECT COUNT(*)=9 FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND event_object_table IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings'))
 );
 -- agent-service-runtime-fingerprint:tenant-telemetry-capture-v2-triggers:end

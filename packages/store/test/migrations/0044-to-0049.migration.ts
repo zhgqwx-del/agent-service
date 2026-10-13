@@ -5,7 +5,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { describe, expect, it } from "vitest";
-import { createStructuredTelemetry, type StructuredTelemetryRecord } from "@agent-service/protocol";
+import {
+  createStructuredTelemetry, telemetryCaptureLogsSourceRefSha256,
+  type StructuredTelemetryRecord,
+} from "@agent-service/protocol";
 import {
   MysqlSessionStore, TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA,
   type EnqueueTenantTelemetryArtifactInput,
@@ -16,6 +19,7 @@ const MIGRATIONS_DIR = resolve(HERE, "../../migrations");
 const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 const REF_KEY = Buffer.alloc(32, 0x49);
+const SOURCE_UUID = "0199f7a6-1234-7abc-8def-0123456789ab";
 type Row = RowDataPacket;
 const MIGRATION_NAME = "0049_tenant_telemetry_application_capture_v2.sql";
 
@@ -266,6 +270,18 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
         "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN ('tenant_telemetry_capture_v2_controls','tenant_telemetry_capture_v2_coverages','tenant_telemetry_capture_v2_source_bindings')",
       );
       expect(Number(tables[0]?.n)).toBe(3);
+      const [sourceColumns] = await conn.query<Row[]>(
+        `SELECT column_name AS source_name FROM information_schema.columns
+           WHERE table_schema=DATABASE()
+             AND table_name='tenant_telemetry_capture_v2_source_bindings'
+             AND column_name IN
+               ('source_session_id','source_turn_id','source_item_id',
+                'source_session_ref_sha256','source_turn_ref_sha256',
+                'source_item_ref_sha256') ORDER BY column_name`,
+      );
+      expect(sourceColumns.map((row) => row.source_name)).toEqual([
+        "source_item_ref_sha256", "source_session_ref_sha256", "source_turn_ref_sha256",
+      ]);
       const [markers] = await conn.query<Row[]>(
         "SELECT name FROM schema_migrations WHERE name=?",
         [MIGRATION_NAME],
@@ -305,13 +321,17 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
       await expect(conn.query(
         `INSERT INTO tenant_telemetry_capture_v2_source_bindings
            (write_operation_sha256,scope,tenant_id,domain,control_generation,
-            coverage_evidence_sha256,producer_contract_sha256,source_session_id,
-            source_turn_id,source_item_id,source_step_index,source_event_seq,
+            coverage_evidence_sha256,producer_contract_sha256,source_session_ref_sha256,
+            source_turn_ref_sha256,source_item_ref_sha256,source_step_index,source_event_seq,
             owner_ref_sha256,payload_sha256,bound_at_db_ms,receipt_sha256)
          VALUES (?,'tenant-telemetry-capture-source-binding-v2',?,'logs',1,
-                 ?,?,'session-0049','turn-0049','item-0049',0,1,?,?,1,?)`,
+                 ?,?,?,?,?,0,1,?,?,1,?)`,
         [digest("v2-operation"),"tenant-pre0049",digest("v2-coverage"),
-          digest("contract"),digest("owner"),digest("payload"),digest("binding")],
+          digest("contract"),
+          telemetryCaptureLogsSourceRefSha256("session", "tenant-pre0049", `sess_${SOURCE_UUID}`, REF_KEY),
+          telemetryCaptureLogsSourceRefSha256("turn", "tenant-pre0049", `turn_${SOURCE_UUID}`, REF_KEY),
+          telemetryCaptureLogsSourceRefSha256("item", "tenant-pre0049", `item_${SOURCE_UUID}`, REF_KEY),
+          digest("owner"),digest("payload"),digest("binding")],
       )).rejects.toThrow("telemetry capture v2 source binding is disabled");
       const [footprint] = await conn.query<Row[]>(
         `SELECT (SELECT COUNT(*) FROM tenant_telemetry_capture_v2_coverages) AS coverages,
@@ -366,18 +386,131 @@ describe("0044 -> 0049 dormant telemetry capture v2 historical migration", () =>
             lifecycleCoverage[0]!.subject_ref_sha256, producerContractSha,
             lifecycleCoverage[0]!.coverage_started_at_db_ms, captureCoverageSha],
         );
+        // Coverage is itself an unaccounted v2 footprint. Even without any
+        // source binding, it must stop T3d/T3f and the old v1 job writer.
+        const [coverageOnlyWriteBefore] = await conn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_telemetry_write_jobs
+                    WHERE tenant_id='tenant-pre0049') AS jobs,
+                  (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships
+                    WHERE tenant_id='tenant-pre0049') AS memberships,
+                  (SELECT COUNT(*) FROM tenant_telemetry_write_payloads
+                    WHERE tenant_id='tenant-pre0049') AS payloads`,
+        );
+        await expect(upgraded.enqueueTenantTelemetryArtifact(
+          writeInput("tenant-pre0049", "coverage-only-probe"),
+        )).rejects.toThrow("capture v2 job path is disabled");
+        const [coverageOnlyWriteAfter] = await conn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_telemetry_write_jobs
+                    WHERE tenant_id='tenant-pre0049') AS jobs,
+                  (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships
+                    WHERE tenant_id='tenant-pre0049') AS memberships,
+                  (SELECT COUNT(*) FROM tenant_telemetry_write_payloads
+                    WHERE tenant_id='tenant-pre0049') AS payloads`,
+        );
+        expect(coverageOnlyWriteAfter).toEqual(coverageOnlyWriteBefore);
+        await conn.query("SET FOREIGN_KEY_CHECKS=0");
+        await conn.beginTransaction();
+        try {
+          await seedClaimedPlanJob(conn, "request-0049-coverage-plan", "tenant-pre0049");
+          await seedClaimedDatabasePurgeJob(conn, "request-0049-coverage-t3f", "tenant-pre0049");
+          await expect(sealPlanJob(conn, "request-0049-coverage-plan"))
+            .rejects.toThrow("T3d cannot account for capture v2 source");
+          await expect(sealDatabasePurgeJob(conn, "request-0049-coverage-t3f"))
+            .rejects.toThrow("T3f cannot close capture v2 owner source");
+        } finally {
+          try {
+            await conn.rollback();
+          } finally {
+            await conn.query("SET FOREIGN_KEY_CHECKS=1");
+          }
+        }
         await conn.query(
           `INSERT INTO tenant_telemetry_capture_v2_source_bindings
              (write_operation_sha256,scope,tenant_id,domain,control_generation,
-              coverage_evidence_sha256,producer_contract_sha256,source_session_id,
-              source_turn_id,source_item_id,source_step_index,source_event_seq,
+              coverage_evidence_sha256,producer_contract_sha256,source_session_ref_sha256,
+              source_turn_ref_sha256,source_item_ref_sha256,source_step_index,source_event_seq,
               owner_ref_sha256,payload_sha256,bound_at_db_ms,receipt_sha256)
            VALUES (?,'tenant-telemetry-capture-source-binding-v2',?,'logs',1,
-                   ?,?,'fixture-session','fixture-turn','fixture-item',0,1,?,?,1,?)`,
+                   ?,?,?,?,?,0,1,?,?,1,?)`,
           [oldJobs[0]!.write_operation_sha256, "tenant-pre0049",
             captureCoverageSha, producerContractSha,
+            telemetryCaptureLogsSourceRefSha256("session", "tenant-pre0049", `sess_${SOURCE_UUID}`, REF_KEY),
+            telemetryCaptureLogsSourceRefSha256("turn", "tenant-pre0049", `turn_${SOURCE_UUID}`, REF_KEY),
+            telemetryCaptureLogsSourceRefSha256("item", "tenant-pre0049", `item_${SOURCE_UUID}`, REF_KEY),
             oldMembership[0]!.owner_ref_sha256, oldJobs[0]!.payload_sha256,
             digest("0049:injected:v2-binding")],
+        );
+
+        // Simulate a privileged, orphaned binding on the disposable database.
+        // Each live guard must reject that source even without its FK coverage
+        // row; another tenant's normal v1 write remains unaffected.
+        await conn.query("SET FOREIGN_KEY_CHECKS=0");
+        try {
+          await conn.query(
+            "DELETE FROM tenant_telemetry_capture_v2_coverages WHERE tenant_id=? AND domain='logs'",
+            ["tenant-pre0049"],
+          );
+        } finally {
+          await conn.query("SET FOREIGN_KEY_CHECKS=1");
+        }
+        const [bindingOnlyFootprint] = await conn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_telemetry_capture_v2_coverages
+                    WHERE tenant_id='tenant-pre0049') AS coverages,
+                  (SELECT COUNT(*) FROM tenant_telemetry_capture_v2_source_bindings
+                    WHERE tenant_id='tenant-pre0049') AS bindings`,
+        );
+        expect(Number(bindingOnlyFootprint[0]?.coverages)).toBe(0);
+        expect(Number(bindingOnlyFootprint[0]?.bindings)).toBe(1);
+        const [bindingOnlyWriteBefore] = await conn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_telemetry_write_jobs
+                    WHERE tenant_id='tenant-pre0049') AS jobs,
+                  (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships
+                    WHERE tenant_id='tenant-pre0049') AS memberships,
+                  (SELECT COUNT(*) FROM tenant_telemetry_write_payloads
+                    WHERE tenant_id='tenant-pre0049') AS payloads`,
+        );
+        await expect(upgraded.enqueueTenantTelemetryArtifact(
+          writeInput("tenant-pre0049", "binding-only-probe"),
+        )).rejects.toThrow("capture v2 job path is disabled");
+        const [bindingOnlyWriteAfter] = await conn.query<Row[]>(
+          `SELECT (SELECT COUNT(*) FROM tenant_telemetry_write_jobs
+                    WHERE tenant_id='tenant-pre0049') AS jobs,
+                  (SELECT COUNT(*) FROM tenant_telemetry_artifact_memberships
+                    WHERE tenant_id='tenant-pre0049') AS memberships,
+                  (SELECT COUNT(*) FROM tenant_telemetry_write_payloads
+                    WHERE tenant_id='tenant-pre0049') AS payloads`,
+        );
+        expect(bindingOnlyWriteAfter).toEqual(bindingOnlyWriteBefore);
+        await upgraded.enqueueTenantTelemetryArtifact(
+          writeInput("tenant-pre0049-other", "binding-only-other"),
+        );
+        await conn.query("SET FOREIGN_KEY_CHECKS=0");
+        await conn.beginTransaction();
+        try {
+          await seedClaimedPlanJob(conn, "request-0049-binding-only-plan", "tenant-pre0049");
+          await seedClaimedDatabasePurgeJob(conn, "request-0049-binding-only-t3f", "tenant-pre0049");
+          await expect(sealPlanJob(conn, "request-0049-binding-only-plan"))
+            .rejects.toThrow("T3d cannot account for capture v2 source");
+          await expect(sealDatabasePurgeJob(conn, "request-0049-binding-only-t3f"))
+            .rejects.toThrow("T3f cannot close capture v2 owner source");
+        } finally {
+          try {
+            await conn.rollback();
+          } finally {
+            await conn.query("SET FOREIGN_KEY_CHECKS=1");
+          }
+        }
+        await conn.query(
+          `INSERT INTO tenant_telemetry_capture_v2_coverages
+             (tenant_id,domain,scope,control_generation,capture_status,
+              pre_cutover_history_status,lifecycle_coverage_evidence_sha256,
+              subject_ref_sha256,producer_contract_sha256,
+              coverage_started_at_db_ms,evidence_sha256)
+           VALUES (?,'logs','tenant-telemetry-capture-coverage-v2',1,
+                   'capture_since_tenant_creation','pre_cutover_not_applicable',?,?,?,?,?)`,
+          ["tenant-pre0049", lifecycleCoverage[0]!.evidence_sha256,
+            lifecycleCoverage[0]!.subject_ref_sha256, producerContractSha,
+            lifecycleCoverage[0]!.coverage_started_at_db_ms, captureCoverageSha],
         );
 
         await conn.query("SET FOREIGN_KEY_CHECKS=0");
