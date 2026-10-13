@@ -539,4 +539,29 @@ describe("S3TenantRestoreJournalAdapter unit contract", () => {
     expect(client.destroy).toHaveBeenCalledOnce();
     await expect(store.readHead()).rejects.toThrow("closed");
   });
+  it("cancels a stalled response body after SDK headers and sends no successor request", async () => {
+    const controller = new AbortController();
+    const client = new FakeS3Client();
+    const { store } = fixture(client, { operationAbortSignal: controller.signal });
+    const reading = vi.fn();
+    const body = new Readable({ read() { reading(); } });
+    const destroy = vi.spyOn(body, "destroy");
+    const nativeSend = client.send.bind(client);
+    const send = vi.spyOn(client, "send").mockImplementation(async (command, options) => (
+      command instanceof GetObjectCommand ? { Body: body } : nativeSend(command, options)
+    ));
+    // publishRecord first creates the immutable record, then verifies it by exact GET.
+    // Wait for body consumption, not merely for headers (readHead initially uses LIST).
+    const pending = store.publishRecord(record());
+    const rejected = expect(pending).rejects.toThrow(/cancelled|AbortError/);
+    void rejected.catch(() => {});
+    await vi.waitFor(() => expect(reading).toHaveBeenCalled());
+    controller.abort();
+    await rejected;
+    expect(destroy).toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(2);
+    await expect(store.readHead()).rejects.toThrow("aborted");
+    expect(send).toHaveBeenCalledTimes(2);
+    await store.close();
+  });
 });

@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
+import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "./operation-abort.js";
 import type { AgentDefinition, ApiKeyScope, Approval, EventInput, Item, PersistedEvent, ProviderConfig, Session, TenantAuthPolicy, Turn, UsageQuery } from "@agent-service/protocol";
 import {
   Approval as ApprovalSchema,
@@ -8339,6 +8340,8 @@ function isMysqlTransientLockError(error: unknown): boolean {
 export interface MysqlStoreOptions {
   url: string;
   connectionLimit?: number;
+  /** Optional one-shot operator cancellation, not a claim that an already sent COMMIT rolled back. */
+  operationAbortSignal?: AbortSignal;
   /** overrides migration discovery; useful in tests and unusual deployments */
   migrationsDir?: string;
   /** Apply missing migrations by default; maintenance modes remain DDL-free. */
@@ -8460,6 +8463,7 @@ export class MysqlSessionStore implements
     private readonly pool: Pool,
     private readonly tenantRedisPurgeNamespaceSha256?: string,
     private readonly tenantTelemetryRefKey?: Buffer,
+    private readonly operationAbortScope?: { close(): Promise<void> },
   ) {}
 
   /**
@@ -8486,6 +8490,7 @@ export class MysqlSessionStore implements
   }
 
   static async connect(opts: MysqlStoreOptions): Promise<MysqlSessionStore> {
+    if (opts.operationAbortSignal?.aborted) throw new Error("MySQL maintenance operation aborted");
     if (opts.tenantRedisPurgeNamespaceSha256 !== undefined
       && !/^[0-9a-f]{64}$/.test(opts.tenantRedisPurgeNamespaceSha256)) {
       throw new Error("tenant Redis purge namespace must be a lowercase SHA-256 digest");
@@ -8507,18 +8512,30 @@ export class MysqlSessionStore implements
         "tenant telemetry legacy subject reconcile requires its dedicated migration mode",
       );
     }
-    const pool = mysql.createPool({
-      uri: opts.url,
-      connectionLimit: opts.connectionLimit ?? 20,
-      supportBigNumbers: true,
-      bigNumberStrings: false,
-      namedPlaceholders: false,
-      timezone: "Z",
-    });
+    const operationAbortTransport = opts.operationAbortSignal === undefined ? undefined
+      : createMysqlOperationAbortTransport(opts.operationAbortSignal);
+    let pool: Pool;
+    try {
+      pool = mysql.createPool({
+        uri: opts.url,
+        connectionLimit: opts.connectionLimit ?? 20,
+        supportBigNumbers: true,
+        bigNumberStrings: false,
+        namedPlaceholders: false,
+        timezone: "Z",
+        ...(operationAbortTransport === undefined ? {} : { stream: operationAbortTransport.stream }),
+      });
+    } catch (error) {
+      operationAbortTransport?.close();
+      throw error;
+    }
+    const operationAbortScope = opts.operationAbortSignal === undefined ? undefined
+      : bindMysqlOperationAbort(pool, opts.operationAbortSignal, operationAbortTransport);
     const store = new MysqlSessionStore(
       pool,
       opts.tenantRedisPurgeNamespaceSha256,
       tenantTelemetryRefKey,
+      operationAbortScope,
     );
     try {
       const migrationsDir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir);
@@ -8536,10 +8553,11 @@ export class MysqlSessionStore implements
       } else {
         await store.migrate(migrationsDir, opts.migrationLockTimeoutSeconds ?? 60);
       }
+      if (opts.operationAbortSignal?.aborted) throw new Error("MySQL maintenance operation aborted");
       return store;
     } catch (err) {
       // A failed startup must not strand a pool (and its advisory-lock connection) in the process.
-      await pool.end().catch(() => {});
+      await store.close().catch(() => {});
       throw err;
     }
   }
@@ -53620,7 +53638,8 @@ export class MysqlSessionStore implements
   }
 
   async close() {
-    await this.pool.end();
+    if (this.operationAbortScope) await this.operationAbortScope.close();
+    else await this.pool.end();
   }
 }
 

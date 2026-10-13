@@ -240,7 +240,7 @@ TENANT_RESTORE_JOURNAL_EXECUTION_ENABLED=1 \
 
 之后tenant T1 materialize与journal publication之间使用durable queue、exact response-loss replay和fresh barrier收口；它不是跨MySQL/S3分布式事务。没有公开raw-journal API，手工只看content-free capability/status，记录链与故障语义由上述named suites验证。若只想重新体验，应新建可丢弃数据库与全新bucket/prefix/identity，不能手改已激活control或把原journal复用为空journal。
 
-数据库恢复演练必须在所有router、runner及旧writer都已摘流、停止并排空后进行；`RESTORE_FLEET_STOPPED_ACK=1`只是operator声明，不会自动杀掉进程。0031 active后先从权威catalog选择仍可恢复、未淘汰且当前数据库中保留exact local anchor的entry，以全新UUIDv4 `RESTORE_RUN_ID`执行`prepare-restore`并永久预留runtime epoch；必须把精确`BACKUP_ID`、run/epoch ID、source evidence及catalog/journal target identity安全保存在数据库故障域之外。物理恢复并升级/验证所选数据库快照后，先以完全相同的这些输入再次执行0031 `prepare-restore`，让external reservation exact replay并原子重建本地entry/binding/reservation/0030 run，才能进入0030 replay；active catalog会拒绝缺少该绑定的普通0030 `prepare`。如果恢复的旧快照不包含这个selected backup的exact anchor，prepare会fail closed；即使external reservation已经存在，也必须换回包含该anchor的快照，不能改用另一个backup或新operation绕过。该门禁只能排除早于/不含anchor的快照，无法区分正确的selected物理快照与仍包含该anchor的更晚合法快照；operator/backup producer必须用物理snapshot/provider evidence独立核验，这是当前P1级流程/attestation风险。0030使用的`SOURCE_BACKUP_SHA256`与`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`必须和该binding/reservation完全一致：
+数据库恢复演练必须在所有router、runner及旧writer都已摘流、停止并排空后进行；`RESTORE_FLEET_STOPPED_ACK=1`只是operator声明，不会自动杀掉进程。0031 active后先从权威catalog选择仍可恢复、未淘汰且当前数据库中保留exact local anchor的entry，以全新`restore_<UUIDv4>`格式的`RESTORE_RUN_ID`执行`prepare-restore`并永久预留runtime epoch；必须把精确`BACKUP_ID`、run/epoch ID、source evidence及catalog/journal target identity安全保存在数据库故障域之外。物理恢复并升级/验证所选数据库快照后，先以完全相同的这些输入再次执行0031 `prepare-restore`，让external reservation exact replay并原子重建本地entry/binding/reservation/0030 run，才能进入0030 replay；active catalog会拒绝缺少该绑定的普通0030 `prepare`。如果恢复的旧快照不包含这个selected backup的exact anchor，prepare会fail closed；即使external reservation已经存在，也必须换回包含该anchor的快照，不能改用另一个backup或新operation绕过。该门禁只能排除早于/不含anchor的快照，无法区分正确的selected物理快照与仍包含该anchor的更晚合法快照；operator/backup producer必须用物理snapshot/provider evidence独立核验，这是当前P1级流程/attestation风险。0030使用的`SOURCE_BACKUP_SHA256`与`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`必须和该binding/reservation完全一致：
 
 ```bash
 pnpm maintenance:restore-ledger-reconcile -- status
@@ -256,7 +256,7 @@ pnpm maintenance:restore-ledger-reconcile -- activate-runtime
 pnpm maintenance:restore-ledger-reconcile -- status
 ```
 
-恢复安全顺序固定为：冻结全部writer → 恢复前0031选择backup/预留epoch并安全保存精确输入 → 实际恢复/升级验证数据库 → 原ID/evidence再次0031 `prepare-restore`重建本地权威投影 → 0030 `replay-fences`把journal记录变成永久本地tenant fence → `verify`封存完整性证据 → 人工审阅 → `activate-runtime`提交新epoch → 0031 `resolve-restore`投影`activated`。`run`中的0030 prepare只能在第二次0031 prepare之后作为exact replay使用；不能从恢复出的旧快照直接跳到普通0030 prepare。需要逐步排障时可分别执行这些command；`verify`与`abort`是DB-only边界，`activate-runtime`仍会重读外部head。所有命令都使用verify-only store连接，不执行DDL：先要求随镜像发布的完整migration marker集合；0030 marker存在时还校验精确schema/trigger fingerprint，并在成功或失败后恢复临时修改的MySQL session `group_concat_max_len`。`abort`只允许在runtime activation前使用，且不能删除已重放的永久fence或使该epoch可复用；中止后还要把同一0031 reservation精确resolve为`aborted`。`resolve-restore`要求本地精确reservation和已terminal的0030 run；当前没有只凭external event处理孤立reservation的abort/resolution入口，因此缺少selected anchor的过早快照不能靠“外部abort”补救。激活后先让router gate保持`0`，以新epoch和精确三digest部署全量runner并通过startup preflight/fleet核对，再开放publisher gate，最后才考虑恢复其它破坏性gate。
+恢复安全顺序固定为：冻结全部writer → 恢复前0031选择backup/预留epoch并安全保存精确输入 → 实际恢复/升级验证数据库 → 原ID/evidence再次0031 `prepare-restore`重建本地权威投影 → 0030 `replay-fences`把journal记录变成永久本地tenant fence → `verify`封存完整性证据 → 人工审阅 → `activate-runtime`提交新epoch → 0031 `resolve-restore`投影`activated`。`run`中的0030 prepare只能在第二次0031 prepare之后作为exact replay使用；不能从恢复出的旧快照直接跳到普通0030 prepare。需要逐步排障时可分别执行这些command；`verify`与`abort`是DB-only边界，`activate-runtime`仍会重读外部head。上述restore-ledger命令都使用verify-only store连接，不执行DDL：先要求随镜像发布的完整migration marker集合；0030 marker存在时还校验精确schema/trigger fingerprint，并在成功或失败后恢复临时修改的MySQL session `group_concat_max_len`。`abort`只允许在runtime activation前使用，且不能删除已重放的永久fence或使该epoch可复用；中止后还要把同一0031 reservation精确resolve为`aborted`。`resolve-restore`要求本地精确reservation和已terminal的0030 run；当前没有只凭external event处理孤立reservation的abort/resolution入口，因此缺少selected anchor的过早快照不能靠“外部abort”补救。激活后先让router gate保持`0`，以新epoch和精确三digest部署全量runner并通过startup preflight/fleet核对，再开放publisher gate，最后才考虑恢复其它破坏性gate。
 
 这仍不是完整灾备闭环：journal和catalog当前都只支持单target；MySQL提交与S3写入靠saga/exact replay而非原子事务；独立故障域、fleet stopped、primary activation及物理backup创建/删除都含外部流程与人工ACK。当前journal adapter只有逐请求deadline，完整chain scan/restore operation没有统一deadline；分页scan每页从chain起点重验sealed prefix，整体对象读取复杂度为`O(n²)`，必须在staging按真实记录量验证请求数、费用、容量与维护窗口。0031消除了游离backup digest/epoch的来源协议缺口，但不创建备份、不证明backup内tenant erasure或云故障域；只有把这些残余风险及真实staging恢复演练收口后，才能称为生产恢复能力。
 
@@ -296,6 +296,35 @@ pnpm maintenance:backup-catalog -- reconcile
 `begin-backup`只固定当前schema/runtime/journal/Blob control lineage，不复制数据库。物理full backup、manifest和provider结果由外部producer/operator创建并独立验证；`publish-backup`只接收其声明的SHA-256摘要，adapter只验证摘要格式、catalog身份、外部事件链与exact replay并绑定attested digest，不读取backup bytes、manifest文件或provider响应内容。首次`prepare-restore`要求selected entry仍有exact local anchor，并把source binding、永久epoch reservation与0030 prepare原子提交；旧快照恢复后必须以相同ID/evidence再运行一次以重建这些本地投影。恢复了不含selected anchor的过早快照时必须换回包含该anchor的snapshot，不能因外部reservation已存在而改选backup或epoch；当前也没有external-only orphan reservation abort入口。应用无法区分正确的selected物理快照与仍包含该anchor的更晚合法快照，operator/backup producer仍须以物理snapshot/provider evidence独立核验，这是当前P1级流程/attestation风险。`prepare-eviction`会按MySQL时间重验retention、最少可恢复backup数、catalog head及活动reservation。eviction必须在prepare前摘流、停止并排空全部writer及其它catalog operator，持续经过外部物理删除，直到`record-eviction`成功提交；两次提供的`RESTORE_FLEET_STOPPED_ACK=1`都只是人工声明，不是进程探测。当前prepare不会持久化two-phase eviction intent，故该外部窗口仍是需后续账本闭合的风险。响应丢失只能用完全相同的ID/evidence重放，不能更换epoch、手填digest或把“准备删除”冒充“已物理不存在”。
 
 `reconcile`不是把external catalog当作数据库backup来“恢复一切”。它要求恢复库中仍有active且identity匹配的0031 control，验证并镜像完整content-free sealed chain；数据库中的external-event mirror是catalog sequence/hash head的唯一authority，任一local anchor缺失都不会截断后继event。availability event可直接重建recoverable entry，eviction可由已镜像availability、外部ACK和event前一head重建；resolution只有同时存在匹配本地reservation与terminal 0030 run时才推进本地reservation，否则只留下external authority并继续镜像。通用reconcile不会补造anchor、source binding/reservation或0030 run，selected restore仍必须通过`prepare-restore`验证exact local anchor。不含该anchor的过早快照应换回包含原selected backup anchor的快照并重放相同operation；仍含该anchor的更晚合法快照则只能由operator/backup producer通过物理证据排除，应用自身不能识别。两类场景都不能通过手改表或把external chain当成数据库bytes、业务行、0030 fence/journal或tenant erasure completion证据处理。
+
+### 本地MySQL加密逻辑备份制品（只用可丢弃数据库）
+
+本轮只支持telemetry lifecycle inactive数据库。旧backup/restore CLI没有注入0033 active所需exact ref key，active状态安全拒绝；17例真实验证不能外推此配置。后续激活provider capture前须补受保护key接线和active状态备份/恢复测试。
+
+旧0031流程只保存operator-attested摘要；新增的`create-artifact`才真实调用MySQL 8 mysqldump生成InnoDB应用逻辑SQL，以独立key加密，并把已认证实际bytes的证据发布到同一catalog。`verify-artifact`认证完整制品及catalog/anchor，也可对账content-free投影，不能叫严格只读；`restore-selected`真实导入隔离空target，只到prepared。仍只有router/runner两个长期服务，仍使用既有`backup-catalog.js`入口，不新增migration或镜像。
+
+先执行自动门禁：
+
+```bash
+scripts/local-service.sh verify-s3
+# 单独跑下面的真实套件需要自行注入其MySQL/MinIO/宿主工具测试配置。
+# pnpm test:mysql-backup-artifact-mysql-s3
+pnpm build:check
+```
+
+手工演练前请读`local-and-deployment.md`的“本地MySQL加密逻辑备份制品”，完成既有0030/0031本地activation，并真正停止/排空全部writer；ACK不是自动证明。通过受控环境设置canonical 0700 artifact目录、0600独立raw 32-byte key（不复用master key）、绝对宿主MySQL 8工具路径、local-only ACK及catalog/journal配置；恢复另需在线source、明确空且不同actual数据库tuple的target、`BACKUP_ID=backup_<UUIDv4>`、全新`RESTORE_RUN_ID=restore_<UUIDv4>`（小写，不是裸UUID）和never-used epoch。恢复前把`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`设为与`BACKUP_RUNTIME_EPOCH_ID`完全相同，或不显式提供由CLI注入；不能残留primary epoch。预算默认256 MiB/120秒、最大1 GiB/600秒，spool要预留约4倍上限。`NODE_ENV=production`拒绝运行；runner镜像没有mysql/mysqldump，镜像/Node的help通过不代表能实际backup。不得把DSN/key/SQL贴进终端输出、日志或录屏。
+
+```bash
+scripts/local-service.sh stop
+pnpm maintenance:backup-catalog -- create-artifact
+pnpm maintenance:backup-catalog -- verify-artifact
+# 新first attempt自行reserve；不要提前执行旧prepare-restore。
+pnpm maintenance:backup-catalog -- restore-selected
+```
+
+成功仅`prepared/runtimeActivated=false/fenceReplayComplete=false`。之后将operator source明确切到已导入target，明确提供新epoch的`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`，以同一run/epoch/evidence执行0030 `replay-fences → verify → status`，人工审阅，再单独activation和0031 resolution；不会自动切换应用或启动服务。任意已reserve run或epoch（含resolved）永久禁止重导，跨目录/new target/old source也不能绕过。导入DDL auto-COMMIT，故障可能留下部分目标；保留原ID/证据/现场，只有独立确认完整import且exact schema/anchor有效的target才可人工forward-fix；`SOURCE_BACKUP_SHA256`取已认证catalog/restore输出的`sourceBackupSha256`，不猜测，部分import不能直接prepare续接，禁止自动DROP、清空、重复导入或换epoch掩盖失败。
+
+schema-root v2只消除明确表/列charset-collation下已证冗余显示，独立真实套件还核对七类I_S与十类trigger字段；unknown/backslash DDL保持raw，可能安全拒绝其它合法schema。统一操作预算/native cancellation不撤销已发COMMIT/CAS；pending未settle不提前释放operator。真实套件required report必须非零、全部passed、零skip，CI新增具名MySQL+MinIO步骤及宿主MySQL 8版本检查；这不等于当前镜像含native工具，也不是生产DR。它不覆盖PITR、Blob/Redis联合旧快照、backup-copy erasure、任意schema或云故障域/IAM/KMS/RPO/RTO，M1仍未冻结。
 
 ### 离线 filesystem→S3 mover 手工演练（只用可丢弃数据）
 
@@ -1328,7 +1357,7 @@ source .env
 set +a
 for name in ${(k)parameters}; do
   case "$name" in
-    BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*) unset "$name" ;;
+    BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*) unset "$name" ;;
   esac
 done
 unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID \
@@ -1353,7 +1382,7 @@ unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID \
 node --import tsx apps/agent-runner/src/main.ts
 ```
 
-router 终端保留 platform 配置，但必须移除全部runner provider/MySQL/bootstrap/envelope/object-store/telemetry-writer authority。下面使用zsh按前缀清除任意`MYSQL_*`、`S3_TEST_*`、`AWS_*`、`BACKUP_CATALOG_*`、`TENANT_BACKUP_CATALOG_*`、`TENANT_TELEMETRY_*`和`TELEMETRY_LIFECYCLE_*`，只处理变量名且不会回显值；其余当前已知runner-only变量逐一清除：
+router 终端保留 platform 配置，但必须移除全部runner provider/MySQL/bootstrap/envelope/object-store/telemetry-writer authority。下面使用zsh按前缀清除任意`MYSQL_*`、`S3_TEST_*`、`AWS_*`、`BACKUP_CATALOG_*`、`TENANT_BACKUP_CATALOG_*`、`BACKUP_ARTIFACT_*`、`BACKUP_MYSQL*`、`BACKUP_RESTORE_*`、`TENANT_TELEMETRY_*`和`TELEMETRY_LIFECYCLE_*`，只处理变量名且不会回显值；其余当前已知runner-only变量逐一清除：
 
 ```zsh
 set -a
@@ -1361,7 +1390,7 @@ source .env
 set +a
 for name in ${(k)parameters}; do
   case "$name" in
-    MYSQL_*|S3_TEST_*|AWS_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*|SESSION_DELETE_GRACE_RECOVERY_*|SESSION_USAGE_RETENTION_*) unset "$name" ;;
+    MYSQL_*|S3_TEST_*|AWS_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*|TENANT_TELEMETRY_*|TELEMETRY_LIFECYCLE_*|SESSION_DELETE_GRACE_RECOVERY_*|SESSION_USAGE_RETENTION_*) unset "$name" ;;
   esac
 done
 unset API_KEY API_BASE_URL DEFAULT_MODEL PLATFORM_PROVIDER \

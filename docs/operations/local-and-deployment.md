@@ -195,7 +195,7 @@ Runner 必需配置：
 - `MIGRATION_ID`、`FLEET_DRAINED_EVIDENCE_SHA256`、`ROLLBACK_WINDOW_MS`、`SOURCE_CLEANUP_DELAY_MS`：仅供`0028`一次性mover的`prepare`/`run`使用。migration id必须稳定且每次attempt唯一；fleet digest是外部停服/排空证据的64位小写SHA-256，不是应用自动attestation；两个delay按MySQL时间解释且不可为负
 - `MAX_OBJECT_BYTES`：`0028`维护入口读取、复制和回验单对象的硬上限，默认64 MiB、最大1 GiB；它与普通runtime的`BLOB_MAX_BYTES`不是同一配置，超限会在发布inventory/target ACK前fail closed
 - `BLOB_MIGRATION_COMMIT`：只影响`run`命令，默认`0`并停在`verified`；显式设为`1`才在copy/verify后尝试cutover。即使为`1`也绝不自动执行`cleanup-source`
-- `RESTORE_RUN_ID`、`RESTORE_FLEET_STOPPED_ACK`、`SOURCE_BACKUP_SHA256`、`RESTORE_REPLAY_PAGE_SIZE`与`RESTORE_JOURNAL_PRIMARY_ACTIVATION_ACK`：只供0030 restore CLI及0031明确复用停服证明的operator命令。restore run必须是全新UUIDv4；fleet ACK是人工停服确认，不是自动attestation。primary activation必须同时提供primary-activation与fleet-stopped ACK，并显式声明`BLOB_STORE=filesystem`，或声明`BLOB_STORE=s3`及`BLOB_S3_BUCKET`；S3 Blob bucket必须与journal bucket不同，无法证明时在连接MySQL/S3前fail closed。0031的`prepare-eviction`与`record-eviction`也都要求该ACK，并要求从prepare前到record提交后持续停服。source digest必须与0031已选catalog entry/source binding完全一致；page size范围1–1000。这些变量会从长期runner/router进程中剥离，不能作为绕过0031的独立来源authority
+- `RESTORE_RUN_ID`、`RESTORE_FLEET_STOPPED_ACK`、`SOURCE_BACKUP_SHA256`、`RESTORE_REPLAY_PAGE_SIZE`与`RESTORE_JOURNAL_PRIMARY_ACTIVATION_ACK`：只供0030 restore CLI及0031明确复用停服证明的operator命令。restore run必须为全新、小写的`restore_<UUIDv4>`，不是裸UUID；fleet ACK是人工停服确认，不是自动attestation。primary activation必须同时提供primary-activation与fleet-stopped ACK，并显式声明`BLOB_STORE=filesystem`，或声明`BLOB_STORE=s3`及`BLOB_S3_BUCKET`；S3 Blob bucket必须与journal bucket不同，无法证明时在连接MySQL/S3前fail closed。0031的`prepare-eviction`与`record-eviction`也都要求该ACK，并要求从prepare前到record提交后持续停服。source digest必须与0031已选catalog entry/source binding完全一致；page size范围1–1000。这些变量会从长期runner/router进程中剥离，不能作为绕过0031的独立来源authority
 - `BACKUP_ID`、`BACKUP_RUNTIME_EPOCH_ID`及各backup/restore/eviction evidence变量：只供`0031`一次性CLI。ID和evidence必须来自受控backup系统/当次operation并在响应丢失后原样重试；不得通过命令行参数传DSN、endpoint、locator、header或credential，也不得把这些值注入长期router/runner
 - `BOOTSTRAP_API_KEY`仅限local/test；production必须拒绝该开发便利入口
 - `ADMIN_BOOTSTRAP_TENANT`与`ADMIN_BOOTSTRAP_OUTPUT_FILE`：first-admin只允许受控one-shot runner同时设置这两个变量；output path必须为operator预先准备目录中的绝对路径，并以create-only `wx`、`0600`、文件与父目录`fsync`写入唯一key，绝不覆盖既有文件，也不在日志中输出tenant、path或key。它与`BOOTSTRAP_API_KEY`互斥，router拒绝接收output-file变量。当前文件互斥只覆盖同一共享文件系统，不是跨VM/Pod singleton；多主机生产流程仍需后续独立CLI/Job加数据库singleton claim，不能把这两个变量注入所有常驻runner
@@ -208,7 +208,7 @@ first-admin文件在数据库写入前发布，是为避免“数据库已有有
 
 `0030` restore CLI使用同样的环境-only authority边界，命令行只接受`status`、`activate-journal`、`prepare`、`replay-fences`、`verify`、`activate-runtime`、`abort`或`run`。`status`不构造object-store client；`verify`和`abort`也是DB-only恢复边界；其余命令要求完整runner-only journal配置并执行外部startup检查。所有命令使用verify-only store连接，要求完整migration marker集合且不执行DDL；0030 marker存在时还校验精确schema/trigger fingerprint，并在成功或失败后恢复临时调整的MySQL session `group_concat_max_len`。restore S3 client忽略AWS环境变量/shared profile配置的endpoint；durable target identity绑定受控region及normalized custom endpoint或明确的standard-endpoint模式。统一脚本在读取`.env`前快照并恢复所有`RESTORE_JOURNAL_*`、`TENANT_RESTORE_JOURNAL_*`、restore-run/backup/ACK变量及`AWS_*`，显式空值同样优先，且输出只含content-free计数、phase和固定错误码。禁止在shell history、工单或日志中粘贴DSN、endpoint、credential或原始错误。
 
-`0031` backup-catalog CLI也只接受环境变量authority；命令行command固定为`status`、`activate`、`begin-backup`、`publish-backup`、`list`、`prepare-restore`、`resolve-restore`、`prepare-eviction`、`record-eviction`或`reconcile`。统一入口是`pnpm maintenance:backup-catalog -- <command>`。`status`和`list`只输出content-free identity/count/phase，绝不打印locator或credential；其它命令按各自边界要求完整catalog target、operation ID与evidence。统一脚本会在读取`.env`前快照并恢复全部`BACKUP_CATALOG_*`、`TENANT_BACKUP_CATALOG_*`和相关operation变量，显式空值同样优先；长期runner/router均动态剥离这些变量，router配置还会主动拒绝泄漏。catalog使用与Blob、journal不同名的S3-compatible bucket，不能复用二者；本地同机bucket分离不代表生产故障域独立。
+`0031` backup-catalog CLI也只接受环境变量authority；旧metadata command为`status`、`activate`、`begin-backup`、`publish-backup`、`list`、`prepare-restore`、`resolve-restore`、`prepare-eviction`、`record-eviction`或`reconcile`。统一入口是`pnpm maintenance:backup-catalog -- <command>`。`status`和`list`只输出content-free identity/count/phase，绝不打印locator或credential；其它命令按各自边界要求完整catalog target、operation ID与evidence。统一脚本会在读取`.env`前快照并恢复全部`BACKUP_CATALOG_*`、`TENANT_BACKUP_CATALOG_*`和相关operation变量，显式空值同样优先；长期runner/router均动态剥离这些变量，router配置还会主动拒绝泄漏。catalog使用与Blob、journal不同名的S3-compatible bucket，不能复用二者；本地同机bucket分离不代表生产故障域独立。 新增`create-artifact/verify-artifact/restore-selected`的local-only配置、真实DDL import与first-attempt边界见下文“本地MySQL加密逻辑备份制品”，不能套用旧命令的自动exact replay导入。
 
 Router 必需配置：
 
@@ -335,7 +335,7 @@ activation在同一个MySQL事务中建立journal control与primary runtime epoc
 恢复演练的安全顺序如下。所有ID、digest、DSN、endpoint和credential必须经受控环境/Secret注入，命令行只放固定command，任何步骤都不能回显原始配置：
 
 1. 摘流并停止全部router、runner和其它旧writer，等待active turn、worker claim、I/O与lease排空；从0031 authoritative catalog选择实际仍可恢复的backup。`RESTORE_FLEET_STOPPED_ACK=1`只是人工确认，CLI不会替operator完成停服。
-2. 在仍存活的catalog authority侧首次执行`prepare-restore`：为全新UUIDv4 `RESTORE_RUN_ID`绑定精确backup entry，并在外部catalog永久预留从未使用的`BACKUP_RUNTIME_EPOCH_ID`。把`BACKUP_ID`、`RESTORE_RUN_ID`、`BACKUP_RUNTIME_EPOCH_ID`、`SOURCE_BACKUP_SHA256`、publish evidence及精确catalog/journal target identity安全保存在数据库故障域之外；不得放入命令行、普通日志或工单正文。
+2. 在仍存活的catalog authority侧首次执行`prepare-restore`：为全新`restore_<UUIDv4>`格式的`RESTORE_RUN_ID`绑定精确backup entry，并在外部catalog永久预留从未使用的`BACKUP_RUNTIME_EPOCH_ID`。把`BACKUP_ID`、`RESTORE_RUN_ID`、`BACKUP_RUNTIME_EPOCH_ID`、`SOURCE_BACKUP_SHA256`、publish evidence及精确catalog/journal target identity安全保存在数据库故障域之外；不得放入命令行、普通日志或工单正文。
 3. 由backup producer/operator独立核验物理snapshot identity、manifest/provider evidence与source digest后，实际恢复该entry指向且包含selected backup exact local anchor的数据库制品，再由环境的独立migration Job把schema升级并验证到运行0030 CLI所需的完整版本。恢复出的selected快照不会包含步骤2新写的本地entry/binding/reservation/run，因此必须用步骤2完全相同的ID、source evidence、target identity和fleet-stopped ACK再次执行0031 `prepare-restore`；它会完整验证并镜像external catalog chain、从availability event重建entry、exact replay既有reservation，并原子重建binding/reservation/run。缺少所选anchor的更早/错误snapshot会fail closed，external mirror不会猜造anchor；但另一个更晚snapshot也可能仍含该anchor，应用不能仅凭anchor证明实际恢复bytes正确，物理核验不能省略。若缺anchor快照对应的external reservation已存在，当前也没有external-only orphan abort入口。active catalog会拒绝在这一步之前直接运行普通0030 `prepare`。restore CLI所有命令都使用verify-only连接，只读`schema_migrations`并在缺少任一随镜像发布的migration时fail closed，绝不获取migration lock、创建表或执行DDL；0030 marker存在时还必须通过精确schema/trigger fingerprint。`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`与`SOURCE_BACKUP_SHA256`必须和重建后的0031 binding/reservation一致，不能由operator另行选择。
 4. 执行`status`，再分阶段执行`replay-fences → verify`；也可使用`run`，但其中的0030 `prepare`此时只能是步骤3已重建run的exact replay。`replay-fences`把每条sealed record变成永久本地tenant fence；`verify`在全部entry精确入账后封存receipt。
 5. 人工审阅content-free计数、phase与外部恢复证据；确认无缺口后显式执行`activate-runtime`。该命令会再次读取外部head并要求未发生漂移，随后提交新的runtime lineage；`run`绝不会自动完成这一步。成功后以相同operation执行0031 `resolve-restore`投影`activated`；若在允许中止的边界停止，则先按0030规则abort，再把同一reservation精确resolve为`aborted`。两种phase都会永久烧毁epoch。
@@ -394,9 +394,47 @@ RESTORE_FLEET_STOPPED_ACK=1 pnpm maintenance:backup-catalog -- record-eviction
 pnpm maintenance:backup-catalog -- reconcile
 ```
 
-`begin-backup`先完整验证/镜像external event chain，再生成与当前schema/runtime/journal/Blob control及source catalog sequence/root精确绑定的anchor；它不复制数据库，`RESTORE_FLEET_STOPPED_ACK=1`也只是人工停写声明。`publish-backup`只校验摘要格式、target/chain identity并绑定operator-attested artifact manifest/provider evidence digest；adapter不读取或验证物理backup、manifest/provider内容，真实producer/operator必须在外部独立验证。首次`prepare-restore`要求selected backup仍有exact local anchor，并把catalog binding、永久epoch reservation和0030 prepare原子提交；selected旧快照恢复后用相同ID/evidence再执行一次，从mirror重建availability并重建其它本地投影。exact anchor会拒绝不含它的更早快照，但不能排除仍含anchor的更晚错误快照，物理snapshot/provider evidence仍由operator独立核验。`resolve-restore`只有在本地reservation与terminal 0030 run匹配时才建立本地phase，否则resolution只保留在external mirror。active 0031 trigger会阻止pre-0031 writer创建unbound 0030 run，但不允许旧writer继续混跑；执行所有catalog操作前仍须排空旧writer、保持fleet stopped并确保只有一个operator。`prepare-eviction`会重验DB time、active retention digest、最少可恢复backup数、catalog head与活动reservation；制品物理不存在必须由operator独立确认，adapter只校验/绑定content-free absence acknowledgement，再由`record-eviction`追加event和本地投影。两条eviction命令的`RESTORE_FLEET_STOPPED_ACK=1`只是operator声明，CLI不会停止或持续探测fleet；必须在prepare前人工摘流/排空全部writer及其它catalog operator，并保持到record成功提交后。当前prepare不写durable two-phase eviction intent，因此该窗口仍依赖运维隔离，未来需要独立账本闭合。任何command响应丢失都必须用相同operation ID和environment exact replay，不能换ID、手改digest或把“已请求删除”冒充“已物理不存在”。
+`begin-backup`先完整验证/镜像external event chain，再生成与当前schema/runtime/journal/Blob control及source catalog sequence/root精确绑定的anchor；它不复制数据库，`RESTORE_FLEET_STOPPED_ACK=1`也只是人工停写声明。`publish-backup`只校验摘要格式、target/chain identity并绑定operator-attested artifact manifest/provider evidence digest；adapter不读取或验证物理backup、manifest/provider内容，真实producer/operator必须在外部独立验证。首次`prepare-restore`要求selected backup仍有exact local anchor，并把catalog binding、永久epoch reservation和0030 prepare原子提交；selected旧快照恢复后用相同ID/evidence再执行一次，从mirror重建availability并重建其它本地投影。exact anchor会拒绝不含它的更早快照，但不能排除仍含anchor的更晚错误快照，物理snapshot/provider evidence仍由operator独立核验。`resolve-restore`只有在本地reservation与terminal 0030 run匹配时才建立本地phase，否则resolution只保留在external mirror。active 0031 trigger会阻止pre-0031 writer创建unbound 0030 run，但不允许旧writer继续混跑；执行所有catalog操作前仍须排空旧writer、保持fleet stopped并确保只有一个operator。`prepare-eviction`会重验DB time、active retention digest、最少可恢复backup数、catalog head与活动reservation；制品物理不存在必须由operator独立确认，adapter只校验/绑定content-free absence acknowledgement，再由`record-eviction`追加event和本地投影。两条eviction命令的`RESTORE_FLEET_STOPPED_ACK=1`只是operator声明，CLI不会停止或持续探测fleet；必须在prepare前人工摘流/排空全部writer及其它catalog operator，并保持到record成功提交后。当前prepare不写durable two-phase eviction intent，因此该窗口仍依赖运维隔离，未来需要独立账本闭合。上述旧metadata command响应丢失都必须用相同operation ID和environment exact replay，不能换ID、手改digest或把“已请求删除”冒充“已物理不存在”。
 
 `reconcile`只适用于恢复数据库仍保留active且identity匹配的0031 control、并希望用external sealed event chain核对或补齐catalog状态的场景。它会完整验证chain并把每个content-free event写入本地mirror；某个local anchor缺失不会阻断后继event的sequence/hash验证或镜像。availability与eviction acknowledgement可从mirror中的完整摘要重建本地投影；resolution只有在本地reservation与terminal 0030 run精确匹配时才投影，否则只保留external authority。selected backup仍必须有exact local anchor；若不含该anchor的旧快照对应的external reservation已经存在，必须由operator恢复并独立核验所选物理snapshot后按同一operation继续，当前不能仅凭external authority abort orphan reservation。anchor gate不能排除另一个仍含anchor的更晚错误快照。禁止手改SQL，或把mirror当成backup bytes、业务数据、anchor、source binding/reservation及0030 ledger的替代品。
+
+## 本地MySQL加密逻辑备份制品
+
+当前CLI未注入0033 active telemetry lifecycle要求的exact ref key，因此本切片仅支持telemetry lifecycle inactive的数据库；active状态会在verify-only启动时安全拒绝，不能绕过startup audit或手改control。支持受保护ref-key输入、active telemetry备份/恢复以及恢复后的key绑定仍是后续接线项，当前17例真实套件不证明这一状态。
+
+这是0052之后的code-only、受限本地producer，不是生产backup/DR。它扩展已有`backup-catalog.js`，不增加schema、常驻服务、入口或镜像。旧`begin-backup/publish-backup`流程继续仅绑定外部operator attestation；新的`create-artifact`读取真实MySQL 8 InnoDB应用逻辑SQL，认证实际bytes后才发布catalog availability。`verify-artifact`会认证制品、当前anchor与catalog证据，也可对账content-free控制投影，不是严格只读。
+
+手工体验只用可丢弃数据库，先完成0030/0031受控activation及上文catalog配置，并实际摘流、停止和排空全部writer。ACK、filesystem lock和MySQL named lock只能约束合作operator，不会替你停止任意应用或数据库writer。source必须在线；这不是主库已丢失时的external-only灾备。source/target都必须是稳定loopback MySQL 8，target为明确创建、为空且实际server UUID/database tuple不同的数据库；只换URL spelling不等于不同目标。
+
+额外配置通过受控环境注入，禁止在命令行、日志、录屏或工单回显DSN、key、SQL和credential：
+
+| 变量 | 契约 |
+| --- | --- |
+| `BACKUP_ARTIFACT_DIRECTORY` | canonical绝对路径、当前UID、0700私有目录和可信parent；不允许symlink |
+| `BACKUP_ARTIFACT_KEY_FILE` | 独立raw 32-byte二进制key、0600私有文件；不是hex文本，不复用`SECRETS_MASTER_KEY` |
+| `BACKUP_MYSQL_BINARY` / `BACKUP_MYSQLDUMP_BINARY` | 宿主机绝对可执行MySQL 8工具；runner镜像目前没有这两个工具 |
+| `BACKUP_ARTIFACT_MAX_BYTES` | 默认256 MiB、上限1 GiB；预留约4倍上限的本地spool空间及额外开销 |
+| `BACKUP_ARTIFACT_DEADLINE_MS` | 单次完整操作默认120000 ms、上限600000 ms |
+| `BACKUP_ARTIFACT_LOCAL_ONLY_ACK` | 显式`1`；`NODE_ENV=production`仍拒绝 |
+| `BACKUP_RESTORE_TARGET_MYSQL_URL` | 只为恢复提供的隔离空target，不得指向source或已有业务库 |
+
+`BACKUP_ID`须为`backup_<UUIDv4>`，`RESTORE_RUN_ID`须为全新`restore_<UUIDv4>`（均小写，不是裸UUID）。安全保存这些ID、never-used `BACKUP_RUNTIME_EPOCH_ID`、制品及catalog/journal identity。恢复前必须把`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`改为与`BACKUP_RUNTIME_EPOCH_ID`完全相同，或不显式提供让CLI注入；不可残留primary epoch，否则配置校验会拒绝。长期router/runner拒绝/剥离这些operator authority；显式caller值（包括空值）优先于`.env`，普通`local-service.sh verify/verify-s3`不会继承这些环境authority（`verify-artifact`本身仍要求制品配置）。新流程会自行建立anchor与reservation，不要先调用旧`prepare-restore`：
+
+```bash
+scripts/local-service.sh stop
+# source保持在线；受控配置已注入，create和restore要求RESTORE_FLEET_STOPPED_ACK=1。
+pnpm maintenance:backup-catalog -- create-artifact
+pnpm maintenance:backup-catalog -- verify-artifact
+pnpm maintenance:backup-catalog -- restore-selected
+```
+
+`create-artifact`以受保护defaults-file调用native mysqldump，不把password放argv或stderr；先校验同源anchor、完整marker/schema，再以AES-256-GCM、canonical manifest和create-only文件发布。恢复在完整认证之后、用同一持有的plaintext capability导入，不根据调用方摘要猜测bytes。schema-root v2只规范已证冗余utf8mb4列charset显示；literal/default/index/约束/trigger及其它bytes保持严格，unknown或backslash形态保持raw，可能安全拒绝其它合法schema。
+
+`restore-selected`先在新鲜external chain上永久reserve run/epoch，再真实执行DDL/DML导入，随后verify-only核对完整schema/anchor并同ID重建binding/run。它不是DDL-free；MySQL DDL auto-COMMIT意味着失败可能留下部分target。任意既有run或epoch（包括已resolved）都永久拒绝再次自动导入，不能换artifact目录、target或恢复旧source快照绕过。失败必须保留原ID、制品、reservation与事件现场，只有独立确认完整导入且exact schema/anchor有效的target才可按旧0031 prepare/0030 replay路径人工forward-fix；`SOURCE_BACKUP_SHA256`必须取已认证catalog/restore输出的`sourceBackupSha256`，不手填猜测，部分import不能直接续接；禁止自动DROP、清空、重导、换epoch掩盖事故或直接启动服务。
+
+成功只返回`restorePhase=prepared`、`runtimeActivated=false`、`fenceReplayComplete=false`和`requiresExplicitReplayAndActivation=true`。将后续operator的`MYSQL_URL`明确改到已导入target，保留同一run/epoch/evidence与外部target identity，明确提供新epoch的`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`，再分别执行`replay-fences → verify → status`、人工审阅、显式`activate-runtime`及0031 `resolve-restore`；新命令绝不自动执行这些步骤。旧restore-ledger及metadata catalog命令仍只验证已安装migration、不执行DDL。
+
+全操作单调deadline贯穿S3、native MySQL、child和文件spool；取消会终止受控socket/child，但已发送COMMIT或S3 CAS可能已成功，不是回滚证明。pending工作settle前不提前释放operator lock；超时可能遗留未发布spool/probe/orphan，不能宣称零残留。可信本机FS、同UID、endpoint稳定性及手工fleet停写仍是前提；不覆盖物理page/PITR、任意views/routines/events、Blob/Redis联合备份恢复、tenant backup-copy erasure、云IAM/KMS、独立故障域、RPO/RTO或容量。完整本地/CI实际执行证明以PROGRESS最新节为准，M1仍未冻结。
 
 ## 预发/生产资源就绪后的交付顺序
 

@@ -1,5 +1,9 @@
 # agent-service 项目记忆
 
+本地MySQL备份制品候选当前仅支持telemetry lifecycle inactive数据库；旧backup/restore CLI未传0033 active所需exact ref key，active会安全拒绝。不得绕过startup audit；真实17例不证明该组合，后续capture激活前须补受保护key接线及active备份恢复测试。
+
+0052之后的code-only本地MySQL备份制品producer扩展已有`backup-catalog`三条命令：`create-artifact`真实MySQL 8 InnoDB逻辑dump、独立32-byte受保护key的AES-GCM制品、同源anchor/schema与真实bytes验证后发布；`verify-artifact`认证制品与catalog（可对账content-free投影，非严格只读）；`restore-selected`在actual source/空且不同actual target tuple与filesystem/named locks下，先永久reserve，再真实DDL/DML导入、严格verify-only检查、同ID重建binding/run，最终仅prepared。只用于可信本机非production；source必须在线，现有runner镜像没有mysql/mysqldump宿主工具。schema-root v2只规范已证冗余utf8mb4列charset显示，literal/顺序/默认/约束/trigger保持严格，未知/反斜杠DDL可能被安全拒绝。全操作预算和原生取消不等于COMMIT/CAS回滚；资源与pending工作settle后才释放operator lock。恢复是first-attempt-only：禁止先旧prepare-restore；任何既有run或epoch永久拒绝重新导入，包括跨目录/目标及resolved，失败保留部分目标并人工forward-fix，不能自动DROP、清空、重导或激活。旧catalog metadata路径及restore-ledger CLI不执行DDL，新restore-selected的import例外必须明确。不新增schema/daemon/入口/镜像，不覆盖物理backup/PITR、Blob/Redis联合恢复、tenant backup-copy erasure、独立故障域或生产RPO/RTO；M1未冻结，最新验证以PROGRESS为准。
+
 最新增量`0052`实现默认关闭、production拒绝启用的ordinary session operational usage retention，不是内容purge。新trusted DELETE与origin同事务绑定不可变policy v2；Memory原子发布/MySQL RR执行独立重验owner/source/seal、DB time、30天与更长政策、hold、erasure/restore fence和billing proof，只移除operational ledger。新T3f prior-retained-billing bridge及grave的source/receipt摘要保持后续租户清理可核对，旧receipt/grave v1 hash不变，缺新证据不补造。八个nullable列/五个guard和相关145组合指纹要求pre-0052 writer/事务完全排空后独立迁移；全库trigger总数不是145。runner/router双gate均默认0；内嵌worker逐scan/reconcile/execute取fresh fleet ACK，候选和账单reconcile本身不授予删除许可。每session最多10000 facts且超限拒绝，tenant bridge仍需大JSON/锁等待容量验收；统一whole-operation deadline和自动证明fleet排空仍缺。实际验证状态以PROGRESS最新节为准。
 
 用户已确认BYOK租户删除只清除本系统保存的key，厂商侧撤销由客户负责。T3a已有本地live credential行删除事务、T3b撤销受跟踪runtime引用，但备份/恢复等全域证明仍缺；0026既有external blocker不能因这项确认被重释成远端撤销成功。后续须建立versioned责任来源/客户侧责任声明，不执行真实厂商撤销，也不得把0029 Memory fake当作证明。

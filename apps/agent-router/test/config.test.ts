@@ -322,6 +322,15 @@ describe("router configuration", () => {
       ["BACKUP_CATALOG_S3_ENDPOINT", "https://backup-catalog.internal"],
       ["BACKUP_CATALOG_S3_SECRET_ACCESS_KEY", "must-not-enter-router"],
       ["TENANT_BACKUP_CATALOG_TEST_ONLY", "must-not-enter-router"],
+      ["BACKUP_ARTIFACT_DIRECTORY", "/private/operator-artifacts"],
+      ["BACKUP_ARTIFACT_KEY_FILE", "/private/operator-key"],
+      ["BACKUP_MYSQL_BINARY", "/usr/bin/mysql"],
+      ["BACKUP_MYSQLDUMP_BINARY", "/usr/bin/mysqldump"],
+      ["BACKUP_ARTIFACT_MAX_BYTES", "10485760"],
+      ["BACKUP_ARTIFACT_DEADLINE_MS", "30000"],
+      ["BACKUP_ARTIFACT_LOCAL_ONLY_ACK", "1"],
+      ["BACKUP_RESTORE_TARGET_MYSQL_URL", "mysql://operator:do-not-print@127.0.0.1/test"],
+      ["BACKUP_ARTIFACT_KEY_FILE", ""],
     ] as const) {
       expect(() => loadRouterConfig({ RUNNERS: "http://runner:8787", [key]: value }))
         .toThrow(new RegExp(`${key} is one-shot backup-catalog authority`));

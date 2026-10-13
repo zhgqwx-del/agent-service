@@ -35,6 +35,10 @@ for (const [file, minLines, hint] of required) {
 const requiredTestFiles = [
   "packages/protocol/test/telemetry.test.ts",
   "packages/core/test/host.test.ts",
+  "apps/agent-runner/test/mysql-backup-artifact.unit.test.ts",
+  "packages/store/test/operation-abort.test.ts",
+  "packages/store/test/backup-catalog-s3.unit.test.ts",
+  "packages/store/test/restore-journal-s3.unit.test.ts",
   "packages/store/test/session-delete-grace.memory.test.ts",
   "packages/store/test/session-delete-grace.mysql.test.ts",
   "packages/core/test/ordinary-session-delete-grace-recovery.test.ts",

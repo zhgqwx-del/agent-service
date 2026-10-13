@@ -54,6 +54,7 @@
     "test:backup-catalog-s3": "AGENT_SERVICE_BACKUP_CATALOG_S3_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/backup-catalog-s3.minio.test.ts",
     "test:backup-catalog-reconcile-mysql-s3": "AGENT_SERVICE_BACKUP_CATALOG_RECONCILE_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/backup-catalog-reconcile.mysql-s3.test.ts",
     "test:backup-catalog-restore-roundtrip-mysql-s3": "AGENT_SERVICE_BACKUP_CATALOG_RESTORE_ROUNDTRIP_INTEGRATION=1 node scripts/run-required-suite.mjs packages/store/test/backup-catalog-restore-roundtrip.mysql-s3.test.ts",
+    "test:mysql-backup-artifact-mysql-s3": "AGENT_SERVICE_INTEGRATION=1 AGENT_SERVICE_MYSQL_BACKUP_ARTIFACT_INTEGRATION=1 node scripts/run-required-suite.mjs apps/agent-runner/test/mysql-backup-artifact.mysql-s3.test.ts",
     "test:tenant-restore-journal-memory": "node scripts/run-required-suite.mjs packages/store/test/tenant-restore-journal.memory.test.ts",
     "test:tenant-restore-journal-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-restore-journal.mysql.test.ts",
     "test:tenant-backup-catalog-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/backup-catalog.mysql.test.ts",

@@ -348,6 +348,18 @@ jobs:
       # Restore an actual mysqldump image that predates two external availability events and one
       # reservation. The required fixture proves the same 0031 operation reconstructs its local
       # authority before ordinary 0030 replay may seal and activate the restored runtime.
+      - name: Verify trusted host MySQL 8 artifact tools
+        run: |
+          mysql_binary="$(command -v mysql)"
+          mysqldump_binary="$(command -v mysqldump)"
+          [[ "$mysql_binary" = /* && -x "$mysql_binary" ]]
+          [[ "$mysqldump_binary" = /* && -x "$mysqldump_binary" ]]
+          "$mysql_binary" --no-defaults --version | grep -Eq 'Ver 8[.]|Distrib 8[.]'
+          "$mysqldump_binary" --no-defaults --version | grep -Eq 'Ver 8[.]|Distrib 8[.]'
+          echo "BACKUP_MYSQL_BINARY=$mysql_binary" >> "$GITHUB_ENV"
+          echo "BACKUP_MYSQLDUMP_BINARY=$mysqldump_binary" >> "$GITHUB_ENV"
+          echo "Trusted host MySQL 8 tools verified; runner image does not include these tools"
+
       - name: Backup catalog old-snapshot restore roundtrip (must execute)
         env:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
@@ -359,6 +371,20 @@ jobs:
           S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:backup-catalog-restore-roundtrip-mysql-s3
+
+      # This invokes the actual producer and encrypted-byte verifier, then imports only to
+      # disposable empty databases. Its independent required-suite report rejects skips/zero tests.
+      - name: MySQL encrypted backup artifact real MySQL + MinIO suite (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+          S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          S3_TEST_REGION: us-east-1
+          S3_BACKUP_CATALOG_TEST_BUCKET: agent-service-ci-backup-catalog
+          S3_RESTORE_JOURNAL_TEST_BUCKET: agent-service-ci-restore-journal
+          S3_TEST_ACCESS_KEY_ID: agentservice-ci
+          S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
+          S3_TEST_FORCE_PATH_STYLE: "1"
+        run: pnpm run test:mysql-backup-artifact-mysql-s3
 
       # The offline mover crosses both InnoDB and object-storage durability boundaries. Keep a
       # named proof with a fresh database and namespace per case; the wrapper rejects skips/zero tests.

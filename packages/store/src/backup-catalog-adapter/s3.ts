@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { runAbortableRequest } from "../operation-abort.js";
 import {
   GetBucketLifecycleConfigurationCommand,
   GetBucketVersioningCommand,
@@ -114,6 +115,8 @@ export interface S3TenantBackupCatalogAdapterOptions {
   credentials?: S3ClientConfig["credentials"];
   client?: S3Client;
   requestTimeoutMs?: number;
+  /** One-shot operator lifetime; cancellation does not prove a sent CAS was unapplied. */
+  operationAbortSignal?: AbortSignal;
   maxMutationAttempts?: number;
 }
 
@@ -356,45 +359,42 @@ async function readBoundedBody(
   body: unknown,
   contentLength: number | undefined,
   timeoutMs: number,
+  operationSignal?: AbortSignal,
 ): Promise<Buffer> {
   if (contentLength !== undefined
-    && (!Number.isSafeInteger(contentLength) || contentLength < 0
-      || contentLength > MAX_ENVELOPE_BYTES)) {
+    && (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > MAX_ENVELOPE_BYTES)) {
     destroyBody(body);
     throw new TenantBackupCatalogAdapterCorruptError();
   }
   const chunks: Buffer[] = [];
   let total = 0;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      destroyBody(body);
-      reject(new S3BackupCatalogSafeError("S3 tenant backup catalog response stream timed out"));
-    }, timeoutMs);
-    timer.unref();
-  });
-  const read = (async () => {
-    for await (const value of bodyAsAsyncIterable(body)) {
-      if (!(value instanceof Uint8Array)) throw new TenantBackupCatalogAdapterCorruptError();
-      total += value.byteLength;
-      if (total > MAX_ENVELOPE_BYTES) throw new TenantBackupCatalogAdapterCorruptError();
-      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
-    }
-  })();
-  void read.catch(() => undefined);
   try {
-    await Promise.race([read, timeout]);
+    await runAbortableRequest(async (signal) => {
+      const abort = () => destroyBody(body);
+      signal.addEventListener("abort", abort, { once: true });
+      try {
+        if (signal.aborted) throw Object.assign(new Error("response cancelled"), { name: "AbortError" });
+        for await (const value of bodyAsAsyncIterable(body)) {
+          if (signal.aborted) throw Object.assign(new Error("response cancelled"), { name: "AbortError" });
+          if (!(value instanceof Uint8Array)) throw new TenantBackupCatalogAdapterCorruptError();
+          total += value.byteLength;
+          if (total > MAX_ENVELOPE_BYTES) throw new TenantBackupCatalogAdapterCorruptError();
+          chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+        }
+      } finally { signal.removeEventListener("abort", abort); }
+    }, timeoutMs, operationSignal);
   } catch (error) {
     destroyBody(body);
-    if (error instanceof TenantBackupCatalogAdapterCorruptError
-      || error instanceof S3BackupCatalogSafeError) throw error;
+    if (error instanceof TenantBackupCatalogAdapterCorruptError || error instanceof S3BackupCatalogSafeError) throw error;
+    if ((error as { name?: string }).name === "TimeoutError") {
+      throw new S3BackupCatalogSafeError("S3 tenant backup catalog response stream timed out");
+    }
+    if ((error as { name?: string }).name === "AbortError") {
+      throw new S3BackupCatalogSafeError("S3 tenant backup catalog response stream cancelled");
+    }
     throw sanitizedS3Error("response stream", error);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
   }
-  if (contentLength !== undefined && total !== contentLength) {
-    throw new TenantBackupCatalogAdapterCorruptError();
-  }
+  if (contentLength !== undefined && total !== contentLength) throw new TenantBackupCatalogAdapterCorruptError();
   return Buffer.concat(chunks, total);
 }
 
@@ -415,8 +415,10 @@ export class S3TenantBackupCatalogAdapter implements TenantBackupCatalogAdapter 
   private readonly requestTimeoutMs: number;
   private readonly maxMutationAttempts: number;
   private closed = false;
+  private readonly operationAbortSignal?: AbortSignal;
 
   constructor(options: S3TenantBackupCatalogAdapterOptions) {
+    this.operationAbortSignal = options.operationAbortSignal;
     if (options.independentFailureDomain !== true) {
       throw new Error("S3 backup catalog requires an independent failure-domain acknowledgement");
     }
@@ -495,6 +497,7 @@ export class S3TenantBackupCatalogAdapter implements TenantBackupCatalogAdapter 
 
   private assertOpen(): void {
     if (this.closed) throw new Error("S3 backup catalog adapter is closed");
+    if (this.operationAbortSignal?.aborted) throw Object.assign(new Error("S3 maintenance operation aborted"), { name: "AbortError" });
   }
 
   private eventKey(sequence: number): string {
@@ -502,24 +505,8 @@ export class S3TenantBackupCatalogAdapter implements TenantBackupCatalogAdapter 
   }
 
   private async send<Output>(request: (abortSignal: AbortSignal) => Promise<Output>): Promise<Output> {
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<never>((_resolve, reject) => {
-      timer = setTimeout(() => {
-        const error = Object.assign(new Error("S3 backup catalog request timed out"), {
-          name: "TimeoutError",
-        });
-        reject(error);
-        controller.abort(error);
-      }, this.requestTimeoutMs);
-    });
-    const operation = Promise.resolve().then(() => request(controller.signal));
-    void operation.catch(() => undefined);
-    try {
-      return await Promise.race([operation, deadline]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    this.assertOpen();
+    return runAbortableRequest(request, this.requestTimeoutMs, this.operationAbortSignal);
   }
 
   private async readStoredPayload(
@@ -542,7 +529,7 @@ export class S3TenantBackupCatalogAdapter implements TenantBackupCatalogAdapter 
       destroyBody(output.Body);
       throw error;
     }
-    const body = await readBoundedBody(output.Body, output.ContentLength, this.requestTimeoutMs);
+    const body = await readBoundedBody(output.Body, output.ContentLength, this.requestTimeoutMs, this.operationAbortSignal);
     if (typeof output.ETag !== "string" || output.ETag.length < 1 || output.ETag.length > 512) {
       throw new TenantBackupCatalogAdapterCorruptError();
     }

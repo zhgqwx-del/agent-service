@@ -102,6 +102,8 @@ function cleanEnv() {
     if ([
       "AWS_",
       "MYSQL_",
+      "BACKUP_",
+      "TENANT_BACKUP_CATALOG_",
       "BLOB_",
       "MINIO_",
       "S3_TEST_",

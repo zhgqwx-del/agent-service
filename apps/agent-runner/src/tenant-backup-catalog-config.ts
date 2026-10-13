@@ -267,6 +267,7 @@ export function loadTenantBackupCatalogConfig(
 
 export function createTenantBackupCatalogAdapter(
   config: TenantBackupCatalogRuntimeConfig,
+  operation: { operationAbortSignal?: AbortSignal } = {},
 ): S3TenantBackupCatalogAdapter {
-  return new S3TenantBackupCatalogAdapter(config.options);
+  return new S3TenantBackupCatalogAdapter({ ...config.options, ...operation });
 }

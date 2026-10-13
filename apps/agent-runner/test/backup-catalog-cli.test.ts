@@ -20,6 +20,7 @@ import type { TenantBackupCatalogRuntimeConfig } from
   "../src/tenant-backup-catalog-config.js";
 import type { TenantRestoreJournalRuntimeConfig } from
   "../src/tenant-restore-journal-config.js";
+import { MySqlBackupArtifactError } from "../src/mysql-backup-artifact.js";
 
 const MYSQL_URL = "mysql://fixture@127.0.0.1:3306/agent_service_test";
 const PRIMARY_EPOCH_ID = "backup-cli-primary-epoch-v1";
@@ -85,6 +86,63 @@ function prepareRestoreEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     RESTORE_FLEET_STOPPED_ACK: "1",
     ...extra,
   });
+}
+
+function artifactEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return catalogEnv({
+    BACKUP_ID: BACKUP_ID_1,
+    BACKUP_ARTIFACT_LOCAL_ONLY_ACK: "1",
+    BACKUP_ARTIFACT_DIRECTORY: "/private/fixture-artifacts",
+    BACKUP_ARTIFACT_KEY_FILE: "/private/fixture-key",
+    BACKUP_MYSQL_BINARY: "/private/trusted/mysql",
+    BACKUP_MYSQLDUMP_BINARY: "/private/trusted/mysqldump",
+    RESTORE_FLEET_STOPPED_ACK: "1",
+    ...extra,
+  });
+}
+
+/** Orchestration-only fake; real bytes/MySQL behavior is covered by the separate MySQL/S3 suite. */
+function artifactHarness(state: Harness) {
+  type Api = NonNullable<BackupCatalogCliDependencies["artifactOperations"]>;
+  type Created = Awaited<ReturnType<Api["createMySqlBackupArtifact"]>>;
+  const evidence: Created["evidence"] = {
+    sourceSnapshotSha256: publishValues("actual-fixture").SOURCE_SNAPSHOT_SHA256,
+    sourceBackupSha256: publishValues("actual-fixture").SOURCE_BACKUP_SHA256,
+    artifactManifestSha256: publishValues("actual-fixture").BACKUP_ARTIFACT_MANIFEST_SHA256,
+    providerEvidenceSha256: publishValues("actual-fixture").BACKUP_PROVIDER_EVIDENCE_SHA256,
+  };
+  const calls: string[] = [];
+  const operator = Object.freeze({
+    sourceIdentitySha256: sha256("actual-source-tuple"),
+    targetIdentitySha256: sha256("actual-target-tuple"),
+    assertHeld: vi.fn(async () => {}),
+    close: vi.fn(async () => { calls.push("operator.close"); }),
+    bindRestoreOperation: vi.fn(async () => { calls.push("operator.bind"); }),
+    markRestorePrepared: vi.fn(async () => { calls.push("operator.prepared"); }),
+  });
+  const verifiedClose = vi.fn(async () => { calls.push("verified.close"); });
+  const manifest = (anchor: Created["manifest"]["anchor"]) => ({
+    backupId: anchor.backupId, anchor, schemaMigrationRootSha256: anchor.schemaMigrationRootSha256,
+  } as Created["manifest"]);
+  const acquire = vi.fn(async () => { calls.push("operator.acquire"); return operator; });
+  const create = vi.fn(async (input: Parameters<Api["createMySqlBackupArtifact"]>[0]) => {
+    calls.push("artifact.create");
+    return { disposition: "created" as const, manifest: manifest(input.anchor), evidence };
+  });
+  const verify = vi.fn(async (input: Parameters<Api["verifyMySqlBackupArtifact"]>[0]) => {
+    calls.push("artifact.verify");
+    const anchor = input.expectedAnchor!;
+    return { manifest: manifest(anchor), evidence, close: verifiedClose };
+  });
+  const imported = vi.fn(async () => { calls.push("artifact.import"); });
+  const operations = {
+    acquireMySqlBackupArtifactOperator: acquire,
+    createMySqlBackupArtifact: create,
+    verifyMySqlBackupArtifact: verify,
+    importVerifiedMySqlBackupArtifact: imported,
+  } as unknown as Api;
+  state.dependencies.artifactOperations = operations;
+  return { evidence, calls, operator, verifiedClose, acquire, create, verify, imported };
 }
 
 interface HarnessOptions {
@@ -179,7 +237,7 @@ function createHarness(options: HarnessOptions = {}) {
   } as unknown as TenantRestoreJournalRuntimeConfig);
 
   const output: string[] = [];
-  const connectStore = vi.fn(async () => store);
+  const connectStore = vi.fn(async (_options: Parameters<BackupCatalogCliDependencies["connectStore"]>[0]) => store);
   const loadCatalogConfig = vi.fn(() => catalogConfig);
   const createCatalogAdapter = vi.fn(() => catalogAdapter);
   const loadJournalConfig = vi.fn((env: NodeJS.ProcessEnv) => journalConfig(
@@ -284,6 +342,302 @@ async function externalAvailability(
     registeredAtDbMs,
   };
 }
+
+describe("backup catalog artifact CLI orchestration", () => {
+  it("formats only a known deadline code and never exposes arbitrary core error text", () => {
+    expect(formatBackupCatalogCliError(new MySqlBackupArtifactError("operation_deadline")))
+      .toBe('{"status":"error","code":"operation_deadline"}');
+    expect(formatBackupCatalogCliError(new MySqlBackupArtifactError("private-key-DSN-marker")))
+      .toBe('{"status":"error","code":"operation_failed"}');
+  });
+  it.each([
+    { NODE_ENV: "production" }, { BACKUP_ARTIFACT_LOCAL_ONLY_ACK: "0" },
+    { BACKUP_ARTIFACT_KEY_FILE: "relative-key" }, { BACKUP_ARTIFACT_DEADLINE_MS: "600001" },
+    { BACKUP_ARTIFACT_MAX_BYTES: "1073741825" }, { BACKUP_MYSQL_BINARY: "mysql" },
+    { RESTORE_FLEET_STOPPED_ACK: "0" },
+  ])("rejects local authority before connecting or acquiring an operator: %j", async (extra) => {
+    const state = createHarness();
+    const artifacts = artifactHarness(state);
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv(extra), state.dependencies)).rejects.toThrow();
+    expect(state.connectStore).not.toHaveBeenCalled();
+    expect(state.loadCatalogConfig).not.toHaveBeenCalled();
+    expect(artifacts.acquire).not.toHaveBeenCalled();
+  });
+
+  it("holds the operator from anchor through bytes authentication and publication", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    const anchor = vi.spyOn(state.store, "createTenantBackupSnapshotAnchor");
+    const publish = vi.spyOn(state.catalogAdapter, "publishAvailability");
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    expect(artifacts.acquire.mock.invocationCallOrder[0]).toBeLessThan(anchor.mock.invocationCallOrder[0]!);
+    expect(anchor.mock.invocationCallOrder[0]).toBeLessThan(artifacts.create.mock.invocationCallOrder[0]!);
+    expect(artifacts.verify.mock.invocationCallOrder[0]).toBeLessThan(publish.mock.invocationCallOrder[0]!);
+    expect(publish.mock.invocationCallOrder[0]).toBeLessThan(artifacts.operator.close.mock.invocationCallOrder[0]!);
+    expect(publish.mock.calls[0]![0]).toMatchObject(artifacts.evidence);
+    expect(JSON.parse(state.output.at(-1)!)).toMatchObject({ command: "create-artifact", artifactVerified: true, ...artifacts.evidence });
+    expect(state.output.join("\n")).not.toContain("/private/");
+    expect(artifacts.verifiedClose).toHaveBeenCalledOnce();
+  });
+
+  it("closes a constructed catalog client when the later journal factory fails", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    state.createJournalAdapters.mockImplementationOnce(() => { throw new Error("private-factory-config"); });
+    state.connectStore.mockClear();
+    const outputCount = state.output.length;
+    await expect(runBackupCatalogCli(["restore-selected"], artifactEnv({
+      RESTORE_RUN_ID, BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID,
+      BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target",
+    }), state.dependencies)).rejects.toThrow();
+    expect(state.catalogAdapter.close).toHaveBeenCalledTimes(2);
+    expect(state.connectStore).not.toHaveBeenCalled();
+    expect(artifacts.acquire).not.toHaveBeenCalled();
+    expect(state.output).toHaveLength(outputCount);
+  });
+
+  it("requires fresh availability before authenticating bytes", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    artifacts.verify.mockClear();
+    state.catalogAdapter.inspectAvailability = vi.fn(async () => null);
+    await expect(runBackupCatalogCli(["verify-artifact"], artifactEnv(), state.dependencies)).rejects.toThrow("catalog_conflict");
+    expect(artifacts.verify).not.toHaveBeenCalled();
+  });
+
+  it("refuses an actual sealed eviction even though inspectAvailability retains its historical entry", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    await createAndPublish(state, BACKUP_ID_2, "second-backup");
+    state.clock.value += 100;
+    const eviction = catalogEnv({ BACKUP_ID: BACKUP_ID_1, BACKUP_EVICTION_ID: EVICTION_ID,
+      RESTORE_FLEET_STOPPED_ACK: "1", BACKUP_PHYSICAL_ABSENCE_ACK: "1",
+      EXTERNAL_TOMBSTONE_SHA256: sha256("physical-absence") });
+    await runBackupCatalogCli(["prepare-eviction"], eviction, state.dependencies);
+    await runBackupCatalogCli(["record-eviction"], eviction, state.dependencies);
+    expect(await state.catalogAdapter.inspectAvailability(BACKUP_ID_1)).not.toBeNull();
+    artifacts.verify.mockClear();
+    await expect(runBackupCatalogCli(["verify-artifact"], artifactEnv(), state.dependencies)).rejects.toThrow("catalog_conflict");
+    expect(artifacts.verify).not.toHaveBeenCalled();
+  });
+
+  it("does not publish after whole-operation deadline expires in the producer", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    let elapsed = 0;
+    state.dependencies.now = () => elapsed;
+    artifacts.create.mockImplementationOnce(async (input) => {
+      elapsed = 11;
+      return { disposition: "created", manifest: { anchor: input.anchor } as Awaited<ReturnType<NonNullable<BackupCatalogCliDependencies["artifactOperations"]>["createMySqlBackupArtifact"]>>["manifest"], evidence: artifacts.evidence };
+    });
+    const publish = vi.spyOn(state.catalogAdapter, "publishAvailability");
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv({ BACKUP_ARTIFACT_DEADLINE_MS: "10" }), state.dependencies)).rejects.toThrow("operation_deadline");
+    expect(publish).not.toHaveBeenCalled();
+    expect(artifacts.verify).not.toHaveBeenCalled();
+    expect(artifacts.operator.close).toHaveBeenCalledOnce();
+  });
+
+  it("closes an operator acquired exactly as the deadline expires before connecting or writing an anchor", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    let elapsed = 0;
+    state.dependencies.now = () => elapsed;
+    state.connectStore.mockClear();
+    artifacts.acquire.mockImplementationOnce(async () => { elapsed = 11; return artifacts.operator; });
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv({ BACKUP_ARTIFACT_DEADLINE_MS: "10" }), state.dependencies)).rejects.toThrow("operation_deadline");
+    expect(artifacts.operator.close).toHaveBeenCalledOnce();
+    expect(state.connectStore).not.toHaveBeenCalled();
+    expect(artifacts.create).not.toHaveBeenCalled();
+  });
+
+  it("bounds an uncompleted adapter startup by actual wall time and starts no authority", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    state.connectStore.mockClear();
+    state.catalogAdapter.validateStartup = vi.fn(() => new Promise<void>(() => {}));
+    const started = performance.now();
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv({
+      BACKUP_ARTIFACT_DEADLINE_MS: "1000",
+    }), state.dependencies)).rejects.toThrow("operation_deadline");
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(state.catalogAdapter.validateStartup).toHaveBeenCalledOnce();
+    expect(artifacts.acquire).not.toHaveBeenCalled();
+    expect(state.connectStore).not.toHaveBeenCalled();
+  });
+
+  it("disposes a late store without releasing the operator lock while work is pending", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    let resolveStore!: (value: typeof state.store) => void;
+    state.connectStore.mockClear();
+    state.connectStore.mockImplementationOnce(() => new Promise((resolve) => { resolveStore = resolve; }));
+    const anchor = vi.spyOn(state.store, "createTenantBackupSnapshotAnchor");
+    const started = performance.now();
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv({
+      BACKUP_ARTIFACT_DEADLINE_MS: "1000",
+    }), state.dependencies)).rejects.toThrow("operation_deadline");
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(state.connectStore).toHaveBeenCalledOnce();
+    expect(artifacts.operator.close).not.toHaveBeenCalled();
+    expect(state.connectStore.mock.calls.at(-1)![0]).toMatchObject({ operationAbortSignal: expect.any(AbortSignal) });
+    expect(state.connectStore.mock.calls.at(-1)![0].operationAbortSignal!.aborted).toBe(true);
+    resolveStore(state.store);
+    await vi.waitFor(() => expect(artifacts.operator.close).toHaveBeenCalledOnce());
+    expect(anchor).not.toHaveBeenCalled();
+    expect(artifacts.create).not.toHaveBeenCalled();
+  });
+
+  it("bounds a never-resolving reservation and never imports after its deadline", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    state.catalogAdapter.reserveRestore = vi.fn(() => new Promise<never>(() => {}));
+    const started = performance.now();
+    let failure: unknown;
+    try {
+      await runBackupCatalogCli(["restore-selected"], artifactEnv({
+        RESTORE_RUN_ID, BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID,
+        BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target",
+        BACKUP_ARTIFACT_DEADLINE_MS: "1000",
+      }), state.dependencies);
+    } catch (error) { failure = error; }
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(state.catalogAdapter.reserveRestore).toHaveBeenCalledOnce();
+    expect(JSON.parse(formatBackupCatalogCliError(failure))).toMatchObject({
+      code: "operation_deadline", reservationMayBeConsumed: true,
+      targetMayContainPartialImport: false, requiresManualForwardFix: true,
+    });
+    expect(artifacts.imported).not.toHaveBeenCalled();
+    expect(artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+    // Only create's prior operator has closed; pending custom work retains the restore lock.
+    expect(artifacts.operator.close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["readHead", "scanEvents", "mirror", "publishAvailability"] as const)(
+    "bounds an uncompleted %s stage and never writes subsequent availability", async (stage) => {
+      const state = createHarness();
+      await activateCatalog(state);
+      const artifacts = artifactHarness(state);
+      await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+      const record = vi.spyOn(state.store, "recordTenantBackupCatalogAvailability");
+      const hung = vi.fn(() => new Promise<never>(() => {}));
+      if (stage === "readHead") state.catalogAdapter.readHead = hung;
+      else if (stage === "scanEvents") state.catalogAdapter.scanEvents = hung;
+      else if (stage === "mirror") vi.spyOn(state.store, "mirrorTenantBackupCatalogEvent")
+        .mockImplementation(hung);
+      else state.catalogAdapter.publishAvailability = hung;
+      const outputCount = state.output.length;
+      const started = performance.now();
+      await expect(runBackupCatalogCli(["create-artifact"], artifactEnv({
+        BACKUP_ID: BACKUP_ID_2, BACKUP_ARTIFACT_DEADLINE_MS: "1000",
+      }), state.dependencies)).rejects.toThrow("operation_deadline");
+      expect(performance.now() - started).toBeLessThan(2_000);
+      expect(hung).toHaveBeenCalledOnce();
+      expect(state.output).toHaveLength(outputCount);
+      expect(record).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not report success or record a published availability after the source lock is lost", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    let lost = false;
+    artifacts.operator.assertHeld.mockImplementation(async () => { if (lost) throw new Error("private-lock-loss"); });
+    const publish = state.catalogAdapter.publishAvailability;
+    state.catalogAdapter.publishAvailability = async (input) => {
+      const result = await publish(input);
+      lost = true;
+      return result;
+    };
+    const record = vi.spyOn(state.store, "recordTenantBackupCatalogAvailability");
+    const outputCount = state.output.length;
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies)).rejects.toThrow();
+    expect(await state.catalogDelegate.inspectAvailability(BACKUP_ID_1)).not.toBeNull();
+    expect(record).not.toHaveBeenCalled();
+    expect(state.output).toHaveLength(outputCount);
+  });
+
+  it.each(["run", "epoch"] as const)("rejects a previous permanent %s reservation even with another directory and target", async (reuse) => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    expect(Object.isFrozen(artifacts.operator)).toBe(true);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    const entry = await state.catalogAdapter.inspectAvailability(BACKUP_ID_1);
+    await state.catalogAdapter.reserveRestore({ backupId: BACKUP_ID_1, entrySha256: entry!.entrySha256,
+      restoreRunId: RESTORE_RUN_ID, runtimeEpochSha256: tenantRestoreRuntimeEpochSha256(RESTORE_EPOCH_ID) });
+    await expect(runBackupCatalogCli(["restore-selected"], artifactEnv({
+      BACKUP_ARTIFACT_DIRECTORY: "/private/another-fixture-artifacts",
+      RESTORE_RUN_ID: reuse === "run" ? RESTORE_RUN_ID : "restore_00000000-0000-4000-8000-000000000002",
+      BACKUP_RUNTIME_EPOCH_ID: reuse === "epoch" ? RESTORE_EPOCH_ID : "different-never-used-epoch",
+      BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/second_empty_target",
+    }), state.dependencies)).rejects.toThrow("catalog_conflict");
+    expect(artifacts.operator.assertHeld).toHaveBeenCalled();
+    expect(artifacts.operator.bindRestoreOperation).not.toHaveBeenCalled();
+    expect(artifacts.imported).not.toHaveBeenCalled();
+  });
+
+  it("reserves on source, imports held authentication and verifies the target before exact reprepare", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    const prepared = vi.spyOn(state.store, "prepareTenantRestoreReplayFromBackup");
+    state.connectStore.mockClear();
+    await runBackupCatalogCli(["restore-selected"], artifactEnv({
+      RESTORE_RUN_ID, BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID,
+      BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target",
+    }), state.dependencies);
+    expect(prepared).toHaveBeenCalledTimes(2);
+    expect(artifacts.operator.bindRestoreOperation.mock.invocationCallOrder[0]).toBeLessThan(prepared.mock.invocationCallOrder[0]!);
+    expect(prepared.mock.invocationCallOrder[0]).toBeLessThan(artifacts.imported.mock.invocationCallOrder[0]!);
+    expect(artifacts.imported.mock.invocationCallOrder[0]).toBeLessThan(state.connectStore.mock.invocationCallOrder[1]!);
+    expect(state.connectStore.mock.calls[1]![0]).toMatchObject({ migrationMode: "verify", url: "mysql://fixture@127.0.0.1:3306/isolated_target" });
+    expect(prepared.mock.invocationCallOrder[1]).toBeLessThan(artifacts.operator.markRestorePrepared.mock.invocationCallOrder[0]!);
+    expect(JSON.parse(state.output.at(-1)!)).toMatchObject({ command: "restore-selected", restorePhase: "prepared", runtimeActivated: false, fenceReplayComplete: false });
+  });
+
+  it("preserves reservation and closes held resources when post-import target verification fails", async () => {
+    const state = createHarness();
+    await activateCatalog(state);
+    const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    state.connectStore.mockImplementation(async (input?: { url: string }) => {
+      if (input?.url.includes("isolated_target")) throw new Error("private-target-DSN-and-key-marker");
+      return state.store;
+    });
+    const outputCount = state.output.length;
+    let failure: unknown;
+    try {
+      await runBackupCatalogCli(["restore-selected"], artifactEnv({
+        RESTORE_RUN_ID, BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID,
+        BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target",
+      }), state.dependencies);
+    } catch (error) { failure = error; }
+    expect(JSON.parse(formatBackupCatalogCliError(failure))).toEqual({
+      status: "error", code: "operation_failed", reservationMayBeConsumed: true,
+      targetMayContainPartialImport: true, requiresManualForwardFix: true, runtimeActivated: false,
+    });
+    expect(state.output).toHaveLength(outputCount);
+    expect(artifacts.imported).toHaveBeenCalledOnce();
+    expect(artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+    expect(await state.store.getTenantBackupRuntimeReservation(RESTORE_RUN_ID)).toMatchObject({ phase: "reserved" });
+    expect(artifacts.operator.close).toHaveBeenCalledTimes(2);
+    expect(artifacts.verifiedClose).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("backup catalog CLI", () => {
   it("rejects invalid authority before loading config, constructing clients, or connecting", async () => {

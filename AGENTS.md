@@ -1,5 +1,7 @@
 # agent-service 协作约定
 
+> 本地MySQL备份制品候选目前只支持telemetry lifecycle inactive数据库：旧backup/restore-ledger CLI未注入0033 active所需exact ref key，active启动安全拒绝。不得绕过audit或把17例inactive真实验证外推所有配置；provider capture激活前须补受保护key接线及active备份/恢复验收。
+
 ## 开始前先读
 
 1. `README.md`：运行方式、API 和当前里程碑摘要。
@@ -80,6 +82,9 @@
 - 0031的S3 authority准确结构是create-only不可变event objects加单一可变`If-Match` CAS head，而不是依赖LIST推断尾部。启动同时探测`If-None-Match: *`与陈旧ETag拒绝；生产IAM/兼容存储必须允许受控head条件覆盖并阻止其它writer覆盖event/head，忽略条件header时fail closed。
 
 ## 工作边界
+
+- 0052之后的code-only MySQL备份制品切片扩展既有`backup-catalog`为`create-artifact/verify-artifact/restore-selected`；只允许可信本机operator、MySQL 8 InnoDB应用逻辑全量SQL、独立32-byte key和隔离空目标。生产配置拒绝启用；不新增migration、常驻服务、入口或镜像。create校验真实dump并加密，verify认证实际bytes与catalog证据（可对账content-free控制投影，不是严格只读）；restore-selected真实执行DDL/DML导入，成功仅到prepared，绝不自动replay/activate。旧metadata命令和restore-ledger CLI仍verify-only，不执行DDL。第一次恢复前禁止先prepare-restore；任何已用run或epoch（包括resolved）都不能重新导入，失败保留reservation/部分目标并人工forward-fix，不自动清库或重试导入。
+- 制品schema-root v2仅规范真实string列、明确表默认utf8mb4和显式utf8mb4 collation下冗余CHARACTER SET显示；其它DDL/trigger保持严格，未知或反斜杠形态保持原字节，可能诚实拒绝其它合法schema。原生MySQL/S3取消使用统一操作预算，但已发COMMIT/CAS可能成功，不能声称取消等于回滚；未settle的工作不得提前释放operator lock。runner镜像没有mysql/mysqldump工具，plain Node/help验证不等于镜像内能做实际备份。全链验证和最新CI以PROGRESS为准；本地逻辑制品不证明PITR、Blob/Redis备份、联合灾备、独立故障域、云IAM/KMS、RPO/RTO或backup内tenant erasure，M1仍未冻结。
 
 - 当前先保证本机和 CI 可重复运行。staging/production 的 Kubernetes、云资源和拓扑要等用户提供真实参数后再生成。
 - 本机 `.env` 可用于用户明确允许的本地验证；不得提交、打印或写入文档/日志。

@@ -33,5 +33,16 @@ if (result.stderr.trim() !== "") {
 if (!result.stdout.includes("Usage: backup-catalog")) {
   throw new Error("backup-catalog --help did not emit its stable usage marker");
 }
+for (const prerequisite of [
+  "create-artifact", "verify-artifact", "restore-selected",
+  "BACKUP_ARTIFACT_LOCAL_ONLY_ACK=1", "BACKUP_ARTIFACT_KEY_FILE",
+  "BACKUP_MYSQL_BINARY/BACKUP_MYSQLDUMP_BINARY", "Install MySQL 8 mysql/mysqldump externally",
+  "current runner image does not include these tools", "Production use is rejected",
+  "publish-backup remains attestation-only",
+]) {
+  if (!result.stdout.includes(prerequisite)) {
+    throw new Error("backup-catalog --help omitted an artifact command or safety prerequisite");
+  }
+}
 
 console.log(`runner backup-catalog artifact executed under plain Node (${artifactStat.size} bytes)`);

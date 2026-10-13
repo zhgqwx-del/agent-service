@@ -216,6 +216,8 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   }
   const oneShotBackupCatalogKey = Object.keys(env).find((key) => (
     key.startsWith("BACKUP_CATALOG_") || key.startsWith("TENANT_BACKUP_CATALOG_")
+      || key.startsWith("BACKUP_ARTIFACT_") || key.startsWith("BACKUP_MYSQL")
+      || key.startsWith("BACKUP_RESTORE_")
   ) && env[key] !== undefined);
   if (oneShotBackupCatalogKey) {
     throw new Error(

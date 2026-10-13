@@ -257,6 +257,7 @@ export function loadTenantRestoreJournalConfig(
 
 export function createTenantRestoreJournalAdapters(
   config: TenantRestoreJournalRuntimeConfig,
+  operation: { operationAbortSignal?: AbortSignal } = {},
 ): readonly S3TenantRestoreJournalAdapter[] {
-  return config.targets.map((target) => new S3TenantRestoreJournalAdapter(target.options));
+  return config.targets.map((target) => new S3TenantRestoreJournalAdapter({ ...target.options, ...operation }));
 }

@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
   MysqlSessionStore,
@@ -36,6 +37,7 @@ import {
   type TenantRestoreReplaySealedTarget,
 } from "@agent-service/store";
 import { z } from "zod";
+import * as mysqlArtifact from "./mysql-backup-artifact.js";
 import {
   createTenantBackupCatalogAdapter,
   loadTenantBackupCatalogConfig,
@@ -52,6 +54,9 @@ const COMMANDS = [
   "activate",
   "begin-backup",
   "publish-backup",
+  "create-artifact",
+  "verify-artifact",
+  "restore-selected",
   "list",
   "prepare-restore",
   "resolve-restore",
@@ -76,10 +81,14 @@ type BackupCatalogCliErrorCode =
   | "catalog_corrupt"
   | "catalog_not_ready"
   | "journal_conflict"
+  | "operation_deadline"
   | "operation_failed";
 
 class BackupCatalogCliError extends Error {
-  constructor(readonly code: BackupCatalogCliErrorCode) {
+  constructor(
+    readonly code: BackupCatalogCliErrorCode,
+    readonly restoreBoundary?: { reservationMayBeConsumed: true; targetMayContainPartialImport: boolean },
+  ) {
     super(code);
     this.name = "BackupCatalogCliError";
   }
@@ -100,18 +109,28 @@ export interface BackupCatalogCliDependencies {
     url: string;
     connectionLimit: number;
     migrationMode: "verify";
+    operationAbortSignal?: AbortSignal;
   }): Promise<BackupCatalogCliStore>;
   loadCatalogConfig(
     env: NodeJS.ProcessEnv,
     context: Parameters<typeof loadTenantBackupCatalogConfig>[1],
   ): TenantBackupCatalogRuntimeConfig | undefined;
-  createCatalogAdapter(config: TenantBackupCatalogRuntimeConfig): TenantBackupCatalogAdapter;
+  createCatalogAdapter(config: TenantBackupCatalogRuntimeConfig, options?: {
+    operationAbortSignal?: AbortSignal;
+  }): TenantBackupCatalogAdapter;
   loadJournalConfig(
     env: NodeJS.ProcessEnv,
     context: Parameters<typeof loadTenantRestoreJournalConfig>[1],
   ): TenantRestoreJournalRuntimeConfig | undefined;
-  createJournalAdapters(config: TenantRestoreJournalRuntimeConfig): readonly RestoreAdapter[];
+  createJournalAdapters(config: TenantRestoreJournalRuntimeConfig, options?: {
+    operationAbortSignal?: AbortSignal;
+  }): readonly RestoreAdapter[];
   writeLine(line: string): void;
+  /** Test clock only; production uses a monotonic clock for the entire operation. */
+  now?: () => number;
+  artifactOperations?: Pick<typeof mysqlArtifact,
+    "acquireMySqlBackupArtifactOperator" | "createMySqlBackupArtifact"
+    | "verifyMySqlBackupArtifact" | "importVerifiedMySqlBackupArtifact">;
 }
 
 const MysqlEnv = z.object({
@@ -145,6 +164,96 @@ const PrepareRestoreEnv = BackupEnv.extend({
   SOURCE_BACKUP_SHA256: z.string().regex(SHA256),
   RESTORE_FLEET_STOPPED_ACK: z.literal("1"),
 });
+
+const ArtifactEnv = BackupEnv.extend({
+  BACKUP_ARTIFACT_LOCAL_ONLY_ACK: z.literal("1"),
+  BACKUP_ARTIFACT_DIRECTORY: z.string().min(1).max(4_096).refine(isAbsolute),
+  BACKUP_ARTIFACT_KEY_FILE: z.string().min(1).max(4_096).refine(isAbsolute),
+});
+const ArtifactToolsEnv = z.object({
+  BACKUP_MYSQL_BINARY: z.string().min(1).max(4_096).refine(isAbsolute),
+  BACKUP_MYSQLDUMP_BINARY: z.string().min(1).max(4_096).refine(isAbsolute),
+});
+const CreateArtifactEnv = ArtifactEnv.extend({ RESTORE_FLEET_STOPPED_ACK: z.literal("1") });
+const RestoreSelectedEnv = CreateArtifactEnv.extend({
+  RESTORE_RUN_ID: z.string().regex(RESTORE_RUN_ID),
+  BACKUP_RUNTIME_EPOCH_ID: z.string().regex(SAFE_ID),
+  BACKUP_RESTORE_TARGET_MYSQL_URL: MysqlEnv.shape.MYSQL_URL,
+});
+
+function boundedInteger(value: string | undefined, fallback: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (!/^[1-9][0-9]*$/.test(value)) throw cliError("invalid_configuration");
+  const result = Number(value);
+  if (!Number.isSafeInteger(result) || result > maximum) throw cliError("invalid_configuration");
+  return result;
+}
+
+function artifactBudget(env: NodeJS.ProcessEnv, dependencies: BackupCatalogCliDependencies) {
+  const maxBytes = boundedInteger(env.BACKUP_ARTIFACT_MAX_BYTES, 256 * 1_024 * 1_024, 1_024 * 1_024 * 1_024);
+  const timeoutMs = boundedInteger(env.BACKUP_ARTIFACT_DEADLINE_MS, 120_000, 600_000);
+  const now = dependencies.now ?? (() => performance.now());
+  const expiresAt = now() + timeoutMs;
+  const controller = new AbortController();
+  const pending = new Set<Promise<unknown>>();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const remaining = () => {
+    const value = Math.floor(expiresAt - now());
+    if (value <= 0 || controller.signal.aborted) {
+      controller.abort();
+      throw cliError("operation_deadline");
+    }
+    return value;
+  };
+  const run = async <T>(operation: () => Promise<T>, lateDispose?: (value: T) => Promise<void>): Promise<T> => {
+    const left = remaining();
+    // Keep one live deadline handle even if a custom dependency leaves only an
+    // unresolved promise. Arm lazily so synchronous configuration failures leak no timer.
+    deadlineTimer ??= setTimeout(() => controller.abort(), left);
+    let abandoned = false;
+    let removeAbortListener = () => {};
+    const interrupted = new Promise<never>((_, reject) => {
+      const onAbort = () => { abandoned = true; reject(cliError("operation_deadline")); };
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      removeAbortListener = () => controller.signal.removeEventListener("abort", onAbort);
+    });
+    const task = Promise.resolve().then(() => { remaining(); return operation(); }).then(async (value) => {
+      if (abandoned && lateDispose) await lateDispose(value);
+      return value;
+    });
+    pending.add(task);
+    void task.finally(() => pending.delete(task)).catch(() => {});
+    try {
+      const result = await Promise.race([task, interrupted]);
+      try { remaining(); } catch (error) {
+        if (lateDispose) await boundedCleanup(() => lateDispose(result));
+        throw error;
+      }
+      return result;
+    } catch (error) {
+      if (controller.signal.aborted) throw cliError("operation_deadline");
+      throw error;
+    } finally { removeAbortListener(); }
+  };
+  return { maxBytes, remaining, run, signal: controller.signal,
+    check: () => { remaining(); },
+    assertBeforeDeadline: () => { if (now() >= expiresAt) throw cliError("operation_deadline"); },
+    abort: () => { if (deadlineTimer) clearTimeout(deadlineTimer); controller.abort(); },
+    settled: () => Promise.allSettled([...pending]),
+  };
+}
+type AsyncStep = <T>(operation: () => Promise<T>) => Promise<T>;
+const unlimitedStep: AsyncStep = (operation) => operation();
+/** Cleanup has a separate small ceiling, never an unbounded wait after the operation deadline. */
+async function boundedCleanup(operation: () => Promise<unknown>): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation).then(() => true, () => false),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), 250); }),
+    ]);
+  } finally { if (timer) clearTimeout(timer); }
+}
 const ResolveRestoreEnv = z.object({
   RESTORE_RUN_ID: z.string().regex(RESTORE_RUN_ID),
   RESTORE_FLEET_STOPPED_ACK: z.literal("1"),
@@ -161,9 +270,9 @@ const RecordEvictionEnv = EvictionEnv.extend({
 const DEFAULT_DEPENDENCIES: BackupCatalogCliDependencies = {
   connectStore: (options) => MysqlSessionStore.connect(options),
   loadCatalogConfig: (env, context) => loadTenantBackupCatalogConfig(env, context),
-  createCatalogAdapter: (config) => createTenantBackupCatalogAdapter(config),
+  createCatalogAdapter: (config, options) => createTenantBackupCatalogAdapter(config, options),
   loadJournalConfig: (env, context) => loadTenantRestoreJournalConfig(env, context),
-  createJournalAdapters: (config) => createTenantRestoreJournalAdapters(config),
+  createJournalAdapters: (config, options) => createTenantRestoreJournalAdapters(config, options),
   writeLine: (line) => process.stdout.write(`${line}\n`),
 };
 
@@ -269,6 +378,7 @@ function sameDescriptor(
 async function readRestoreJournalHeads(
   config: TenantRestoreJournalRuntimeConfig,
   adapters: readonly RestoreAdapter[],
+  step: AsyncStep = unlimitedStep,
 ): Promise<TenantRestoreReplaySealedTarget[]> {
   if (adapters.length !== config.targets.length) throw cliError("invalid_configuration");
   const result: TenantRestoreReplaySealedTarget[] = [];
@@ -282,7 +392,7 @@ async function readRestoreJournalHeads(
       || adapter.failureDomainSha256 !== configured.descriptor.failureDomainSha256) {
       throw cliError("invalid_configuration");
     }
-    const head = await adapter.readHead();
+    const head = await step(() => adapter.readHead());
     validateTenantRestoreJournalRemoteHead(head);
     const sealed: TenantRestoreReplaySealedTarget = {
       ...configured.descriptor,
@@ -367,31 +477,45 @@ async function reconcileExternalChain(
   store: BackupCatalogCliStore,
   adapter: TenantBackupCatalogAdapter,
   pageSize: number,
+  step: AsyncStep = unlimitedStep,
+  selectedBackupId?: string,
+  firstRestore?: { restoreRunId: string; runtimeEpochSha256: string },
 ): Promise<{ eventCount: number; projectedCount: number }> {
-  const sealedHead = await adapter.readHead();
+  const sealedHead = await step(() => adapter.readHead());
   validateTenantBackupCatalogHead(sealedHead);
   let sequence = 0;
   let root = EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256;
   let eventCount = 0;
   let projectedCount = 0;
   while (sequence < sealedHead.catalogSequence) {
-    const page = await adapter.scanEvents({
+    const page = await step(() => adapter.scanEvents({
       afterCatalogSequence: sequence,
       afterCatalogEventRootSha256: root,
       sealedHead,
       limit: pageSize,
-    });
+    }));
     if (page.events.length === 0 && !page.complete) throw cliError("catalog_corrupt");
     for (const event of page.events) {
       validateTenantBackupCatalogAdapterEvent(event);
+      // inspectAvailability intentionally retains historical availability after eviction.
+      // A fresh sealed-chain read, not that historical row, decides recoverability.
+      if (selectedBackupId !== undefined && event.eventType === "backup_evicted"
+        && event.result.backupId === selectedBackupId) throw cliError("catalog_conflict");
+      // Permanent authority survives local-directory changes and resolution/abort.
+      // This command never resumes an old import; only its own second prepare may replay.
+      if (firstRestore && event.eventType === "restore_reserved"
+        && (event.result.restoreRunId === firstRestore.restoreRunId
+          || event.result.runtimeEpochSha256 === firstRestore.runtimeEpochSha256)) {
+        throw cliError("catalog_conflict");
+      }
       eventCount += 1;
-      const mirrored = await store.mirrorTenantBackupCatalogEvent({
+      const mirrored = await step(() => store.mirrorTenantBackupCatalogEvent({
         adapterProtocol: sealedHead.adapterProtocol,
         catalogNamespaceSha256: sealedHead.catalogNamespaceSha256,
         catalogTargetSha256: sealedHead.catalogTargetSha256,
         failureDomainSha256: sealedHead.failureDomainSha256,
         event,
-      });
+      }));
       validateTenantBackupCatalogAdapterEvent(mirrored.value);
       projectedCount += 1;
     }
@@ -411,12 +535,280 @@ function closeSafely(resource: { close(): Promise<void> } | undefined): Promise<
     : Promise.resolve().then(() => resource.close());
 }
 
+/** Shared 0031 orchestration; selected artifacts supply bytes-derived evidence, never argv evidence. */
+async function prepareSelectedRestore(
+  store: BackupCatalogCliStore,
+  adapter: TenantBackupCatalogAdapter,
+  config: TenantBackupCatalogRuntimeConfig,
+  journalConfig: TenantRestoreJournalRuntimeConfig,
+  journalAdapters: readonly RestoreAdapter[],
+  settings: { backupId: string; restoreRunId: string; epochId: string; sourceBackupSha256: string },
+  step: AsyncStep = unlimitedStep,
+) {
+  const control = await step(() => store.getTenantBackupCatalogControl());
+  assertCatalogIdentity(control, config);
+  const journal = await step(() => store.getTenantRestoreJournalControl());
+  validateTenantRestoreJournalControlRecord(journal);
+  if (journal.controlGeneration !== 1
+    || journal.evidenceSha256 !== control.journalControlEvidenceSha256
+    || journal.logicalDatabaseNamespaceSha256 !== config.logicalDatabaseNamespaceSha256) {
+    throw cliError("invalid_durable_state");
+  }
+  await reconcileExternalChain(store, adapter, DEFAULT_PAGE_SIZE, step);
+  const availability = await step(() => adapter.inspectAvailability(settings.backupId));
+  if (!availability || availability.sourceBackupSha256 !== settings.sourceBackupSha256) {
+    throw cliError("catalog_conflict");
+  }
+  const runtimeEpochSha256 = tenantRestoreRuntimeEpochSha256(settings.epochId);
+  if (runtimeEpochSha256 !== journalConfig.runtimeEpochSha256) {
+    throw cliError("invalid_configuration");
+  }
+  const entry = await step(() => store.preflightTenantRestoreReplayFromBackup({
+    backupId: settings.backupId,
+    restoreRunId: settings.restoreRunId,
+    runtimeEpochSha256,
+  }));
+  if (!exactAvailability(entry, availability)) throw cliError("invalid_durable_state");
+  const sealedTargets = await readRestoreJournalHeads(journalConfig, journalAdapters, step);
+  const reserved = await step(() => adapter.reserveRestore({
+    backupId: settings.backupId,
+    restoreRunId: settings.restoreRunId,
+    entrySha256: entry.entrySha256,
+    runtimeEpochSha256,
+  }));
+  const prepared = await step(() => store.prepareTenantRestoreReplayFromBackup({
+    backupId: settings.backupId,
+    restoreRunId: settings.restoreRunId,
+    runtimeEpochSha256,
+    controlEvidenceSha256: control.journalControlEvidenceSha256,
+    sealedTargets,
+    reservation: reserved,
+  }));
+  return prepared;
+}
+
+async function runArtifactCommand(
+  command: "create-artifact" | "verify-artifact" | "restore-selected",
+  env: NodeJS.ProcessEnv,
+  dependencies: BackupCatalogCliDependencies,
+): Promise<number> {
+  // This is a restricted local vertical slice, not a production backup/DR operator.
+  if (env.NODE_ENV === "production") throw cliError("invalid_configuration");
+  const mysql = MysqlEnv.parse(env);
+  const settings = ArtifactEnv.parse(env);
+  const restore = command === "restore-selected" ? RestoreSelectedEnv.parse(env) : undefined;
+  if (command === "create-artifact") CreateArtifactEnv.parse(env);
+  const tools = command === "verify-artifact" ? undefined : ArtifactToolsEnv.parse(env);
+  const budget = artifactBudget(env, dependencies);
+  const config = loadCatalogRuntimeConfig(env, dependencies, false);
+  const journalConfig = restore === undefined ? undefined
+    : loadRestoreRuntimeConfig(env, restore.BACKUP_RUNTIME_EPOCH_ID, dependencies);
+  if (journalConfig && journalConfig.logicalDatabaseNamespaceSha256 !== config.logicalDatabaseNamespaceSha256) {
+    throw cliError("invalid_configuration");
+  }
+  budget.check();
+  const operations = dependencies.artifactOperations ?? mysqlArtifact;
+  const common = {
+    artifactDirectory: settings.BACKUP_ARTIFACT_DIRECTORY,
+    keyFile: settings.BACKUP_ARTIFACT_KEY_FILE,
+    localOnlyAck: true as const,
+    maxBytes: budget.maxBytes,
+    operationAbortSignal: budget.signal,
+    ...(env.NODE_ENV === undefined ? {} : { nodeEnv: env.NODE_ENV }),
+  };
+  const binaries = tools === undefined ? undefined : {
+    mysql: tools.BACKUP_MYSQL_BINARY, mysqldump: tools.BACKUP_MYSQLDUMP_BINARY,
+  };
+  let store: BackupCatalogCliStore | undefined;
+  let adapterResource: TenantBackupCatalogAdapter | undefined;
+  let journalResources: readonly RestoreAdapter[] = [];
+  let targetStore: BackupCatalogCliStore | undefined;
+  let operator: Awaited<ReturnType<typeof operations.acquireMySqlBackupArtifactOperator>> | undefined;
+  let verified: Awaited<ReturnType<typeof operations.verifyMySqlBackupArtifact>> | undefined;
+  let summary: string | undefined;
+  let operationError: unknown;
+  let reservationAttempted = false;
+  let importAttempted = false;
+  const step: AsyncStep = async (operation) => {
+    if (operator) await budget.run(() => operator!.assertHeld());
+    const result = await budget.run(operation);
+    if (operator) await budget.run(() => operator!.assertHeld());
+    return result;
+  };
+  const acquire = <T extends { close(): Promise<void> }>(operation: () => Promise<T>) =>
+    budget.run(operation, (resource) => resource.close());
+  const withRestoreBoundary = (error: unknown): unknown => reservationAttempted
+    ? new BackupCatalogCliError(errorCode(error), {
+      reservationMayBeConsumed: true, targetMayContainPartialImport: importAttempted,
+    })
+    : error;
+  try {
+    const adapter = dependencies.createCatalogAdapter(config, { operationAbortSignal: budget.signal });
+    adapterResource = adapter;
+    const journalAdapters = journalConfig === undefined ? []
+      : Object.freeze([...dependencies.createJournalAdapters(journalConfig, { operationAbortSignal: budget.signal })]);
+    journalResources = journalAdapters;
+    await step(() => adapter.validateStartup());
+    for (const journalAdapter of journalAdapters) await step(() => journalAdapter.validateStartup());
+    if (command === "create-artifact") {
+      operator = await acquire(() => operations.acquireMySqlBackupArtifactOperator({
+        sourceUrl: mysql.MYSQL_URL,
+        artifactDirectory: common.artifactDirectory,
+        localOnlyAck: true, fleetStoppedAck: true,
+        deadlineMs: budget.remaining(),
+        operationAbortSignal: budget.signal,
+        ...(common.nodeEnv === undefined ? {} : { nodeEnv: common.nodeEnv }),
+      }));
+    }
+    store = await acquire(() => dependencies.connectStore({
+      url: mysql.MYSQL_URL, connectionLimit: 2, migrationMode: "verify",
+      operationAbortSignal: budget.signal,
+    }));
+    const source = store!;
+    const control = await step(() => source.getTenantBackupCatalogControl());
+    assertCatalogIdentity(control, config);
+    await reconcileExternalChain(source, adapter, DEFAULT_PAGE_SIZE, step, settings.BACKUP_ID);
+
+    if (command === "create-artifact") {
+      const anchored = await step(() => source.createTenantBackupSnapshotAnchor({
+        backupId: settings.BACKUP_ID, controlEvidenceSha256: control.evidenceSha256,
+      }));
+      const created = await step(() => operations.createMySqlBackupArtifact({
+        ...common, sourceUrl: mysql.MYSQL_URL, anchor: anchored.value, tools: binaries!,
+        fleetStoppedAck: true, deadlineMs: budget.remaining(), operator: operator!,
+      }));
+      verified = await acquire(() => operations.verifyMySqlBackupArtifact({
+        ...common, backupId: settings.BACKUP_ID, expectedAnchor: anchored.value,
+        expectedEvidence: created.evidence, deadlineMs: budget.remaining(),
+      }));
+      const published = await step(() => adapter.publishAvailability({
+        backupId: settings.BACKUP_ID, anchorSha256: anchored.value.anchorSha256,
+        ...verified!.evidence, controlEvidenceSha256: control.evidenceSha256,
+        logicalDatabaseNamespaceSha256: control.logicalDatabaseNamespaceSha256,
+        retentionPolicySha256: control.retentionPolicySha256,
+        retentionUntilDbMs: anchored.value.retentionUntilDbMs,
+        registeredAtDbMs: anchored.value.createdAtDbMs,
+      }));
+      const recorded = await step(() => source.recordTenantBackupCatalogAvailability(published));
+      if (!exactAvailability(recorded.value, published)) throw cliError("invalid_durable_state");
+      summary = JSON.stringify({
+        status: "ok", command, disposition: created.disposition, backupId: settings.BACKUP_ID,
+        artifactVerified: true, ...verified!.evidence, entrySha256: recorded.value.entrySha256,
+        catalogSequence: recorded.value.catalogSequence,
+      });
+    } else {
+      const availability = await step(() => adapter.inspectAvailability(settings.BACKUP_ID));
+      const entry = await step(() => source.getTenantBackupCatalogEntry(settings.BACKUP_ID));
+      const anchor = await step(() => source.getTenantBackupSnapshotAnchor(settings.BACKUP_ID));
+      if (!availability || !entry || !anchor || !exactAvailability(entry, availability)
+        || anchor.anchorSha256 !== entry.anchorSha256) throw cliError("catalog_conflict");
+      verified = await acquire(() => operations.verifyMySqlBackupArtifact({
+        ...common, backupId: settings.BACKUP_ID, expectedAnchor: anchor,
+        expectedEvidence: {
+          sourceSnapshotSha256: entry.sourceSnapshotSha256, sourceBackupSha256: entry.sourceBackupSha256,
+          artifactManifestSha256: entry.artifactManifestSha256, providerEvidenceSha256: entry.providerEvidenceSha256,
+        }, deadlineMs: budget.remaining(),
+      }));
+      if (command === "verify-artifact") {
+        summary = JSON.stringify({ status: "ok", command, backupId: settings.BACKUP_ID,
+          artifactVerified: true, ...verified!.evidence, entrySha256: entry.entrySha256 });
+      } else {
+        const selected = restore!;
+        operator = await acquire(() => operations.acquireMySqlBackupArtifactOperator({
+          sourceUrl: mysql.MYSQL_URL, targetUrl: selected.BACKUP_RESTORE_TARGET_MYSQL_URL,
+          artifactDirectory: common.artifactDirectory, localOnlyAck: true, fleetStoppedAck: true,
+          deadlineMs: budget.remaining(),
+          operationAbortSignal: budget.signal,
+          ...(common.nodeEnv === undefined ? {} : { nodeEnv: common.nodeEnv }),
+        }));
+        // Check permanent external authority under the actual source lock. A different
+        // artifact directory or target must not turn an old epoch into a new import.
+        await reconcileExternalChain(source, adapter, DEFAULT_PAGE_SIZE, step, settings.BACKUP_ID, {
+          restoreRunId: selected.RESTORE_RUN_ID, runtimeEpochSha256: journalConfig!.runtimeEpochSha256,
+        });
+        await step(() => operator!.bindRestoreOperation({
+          manifest: verified!.manifest, evidence: verified!.evidence,
+          restoreRunId: selected.RESTORE_RUN_ID,
+          runtimeEpochSha256: journalConfig!.runtimeEpochSha256,
+        }));
+        const prepare = { backupId: settings.BACKUP_ID, restoreRunId: selected.RESTORE_RUN_ID,
+          epochId: selected.BACKUP_RUNTIME_EPOCH_ID, sourceBackupSha256: verified!.evidence.sourceBackupSha256 };
+        reservationAttempted = true;
+        await prepareSelectedRestore(source, adapter, config, journalConfig!, journalAdapters, prepare, step);
+        // Recheck fresh external availability immediately before the irreversible DDL import.
+        await reconcileExternalChain(source, adapter, DEFAULT_PAGE_SIZE, step, settings.BACKUP_ID);
+        const fresh = await step(() => adapter.inspectAvailability(settings.BACKUP_ID));
+        if (!fresh || !exactAvailability(entry, fresh)) throw cliError("catalog_conflict");
+        importAttempted = true;
+        await step(() => operations.importVerifiedMySqlBackupArtifact(verified!, {
+          targetUrl: selected.BACKUP_RESTORE_TARGET_MYSQL_URL, tools: binaries!, operator: operator!,
+          restoreRunId: selected.RESTORE_RUN_ID, runtimeEpochSha256: journalConfig!.runtimeEpochSha256,
+          localOnlyAck: true, fleetStoppedAck: true, deadlineMs: budget.remaining(),
+          operationAbortSignal: budget.signal,
+          ...(common.nodeEnv === undefined ? {} : { nodeEnv: common.nodeEnv }),
+        }));
+        targetStore = await acquire(() => dependencies.connectStore({
+          url: selected.BACKUP_RESTORE_TARGET_MYSQL_URL, connectionLimit: 2, migrationMode: "verify",
+          operationAbortSignal: budget.signal,
+        }));
+        const target = targetStore!;
+        const restoredAnchor = await step(() => target.getTenantBackupSnapshotAnchor(settings.BACKUP_ID));
+        if (!restoredAnchor || restoredAnchor.anchorSha256 !== verified!.manifest.anchor.anchorSha256
+          || restoredAnchor.schemaMigrationRootSha256 !== verified!.manifest.schemaMigrationRootSha256) {
+          throw cliError("invalid_durable_state");
+        }
+        const prepared = await prepareSelectedRestore(target, adapter, config, journalConfig!, journalAdapters, prepare, step);
+        await step(() => operator!.markRestorePrepared(selected.RESTORE_RUN_ID));
+        summary = JSON.stringify({ status: "ok", command, backupId: settings.BACKUP_ID,
+          artifactVerified: true, ...verified!.evidence, restoreRunId: selected.RESTORE_RUN_ID,
+          restorePhase: prepared.value.replayRun.phase,
+          runtimeEpochSha256: prepared.value.reservation.runtimeEpochSha256,
+          reservationSha256: prepared.value.reservation.reservationSha256,
+          runtimeActivated: false, fenceReplayComplete: false, requiresExplicitReplayAndActivation: true });
+      }
+    }
+    budget.check();
+  } catch (error) {
+    operationError = withRestoreBoundary(error);
+  }
+  // Abort native clients before releasing the operator locks. In-flight COMMIT/CAS
+  // may already have succeeded: cancellation is not a rollback guarantee.
+  budget.abort();
+  const nativeClosed = await boundedCleanup(async () => {
+    await Promise.all([
+      closeSafely(targetStore), closeSafely(store), closeSafely(adapterResource),
+      ...journalResources.map((item) => closeSafely(item)),
+    ]);
+  });
+  const settled = budget.settled();
+  const drained = await boundedCleanup(() => settled);
+  const release = async () => { await Promise.all([closeSafely(verified), closeSafely(operator)]); };
+  const released = drained ? await boundedCleanup(release) : false;
+  // Uncooperative injected/custom work must not cause a lock release while it
+  // can still mutate. Its late completion only disposes resources, never advances.
+  if (!drained) void settled.then(release).catch(() => {});
+  if (operationError !== undefined) throw operationError;
+  if (!nativeClosed || !drained || !released || summary === undefined) {
+    throw withRestoreBoundary(cliError("operation_failed"));
+  }
+  try {
+    budget.assertBeforeDeadline();
+    dependencies.writeLine(summary);
+  } catch (error) {
+    throw withRestoreBoundary(error);
+  }
+  return 0;
+}
+
 export async function runBackupCatalogCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
   dependencies: BackupCatalogCliDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<number> {
   const command = parseCommand(argv);
+  if (command === "create-artifact" || command === "verify-artifact" || command === "restore-selected") {
+    return runArtifactCommand(command, env, dependencies);
+  }
   const mysql = MysqlEnv.parse(env);
   const pageSize = (command === "list" || command === "reconcile")
     ? parsePageSize(env)
@@ -595,49 +987,13 @@ export async function runBackupCatalogCli(
       });
     } else if (command === "prepare-restore") {
       const settings = prepareSettings!;
-      const config = catalogConfig!;
-      assertCatalogIdentity(control, config);
-      const journal = await store.getTenantRestoreJournalControl();
-      validateTenantRestoreJournalControlRecord(journal);
-      if (journal.controlGeneration !== 1
-        || journal.evidenceSha256 !== control.journalControlEvidenceSha256
-        || journal.logicalDatabaseNamespaceSha256 !== config.logicalDatabaseNamespaceSha256) {
-        throw cliError("invalid_durable_state");
-      }
-      await reconcileExternalChain(store, catalogAdapter!, pageSize);
-      const availability = await catalogAdapter!.inspectAvailability(settings.BACKUP_ID);
-      if (!availability || availability.sourceBackupSha256 !== settings.SOURCE_BACKUP_SHA256) {
-        throw cliError("catalog_conflict");
-      }
-      const runtimeEpochSha256 = tenantRestoreRuntimeEpochSha256(
-        settings.BACKUP_RUNTIME_EPOCH_ID,
+      const prepared = await prepareSelectedRestore(
+        store, catalogAdapter!, catalogConfig!, journalConfig!, journalAdapters,
+        { backupId: settings.BACKUP_ID, restoreRunId: settings.RESTORE_RUN_ID,
+          epochId: settings.BACKUP_RUNTIME_EPOCH_ID,
+          sourceBackupSha256: settings.SOURCE_BACKUP_SHA256 },
+        unlimitedStep,
       );
-      if (runtimeEpochSha256 !== journalConfig!.runtimeEpochSha256) {
-        throw cliError("invalid_configuration");
-      }
-      const entry = await store.preflightTenantRestoreReplayFromBackup({
-        backupId: settings.BACKUP_ID,
-        restoreRunId: settings.RESTORE_RUN_ID,
-        runtimeEpochSha256,
-      });
-      if (!exactAvailability(entry, availability)) {
-        throw cliError("invalid_durable_state");
-      }
-      const sealedTargets = await readRestoreJournalHeads(journalConfig!, journalAdapters);
-      const reserved = await catalogAdapter!.reserveRestore({
-        backupId: settings.BACKUP_ID,
-        restoreRunId: settings.RESTORE_RUN_ID,
-        entrySha256: entry.entrySha256,
-        runtimeEpochSha256,
-      });
-      const prepared = await store.prepareTenantRestoreReplayFromBackup({
-        backupId: settings.BACKUP_ID,
-        restoreRunId: settings.RESTORE_RUN_ID,
-        runtimeEpochSha256,
-        controlEvidenceSha256: control.journalControlEvidenceSha256,
-        sealedTargets,
-        reservation: reserved,
-      });
       summary = JSON.stringify({
         status: "ok",
         command,
@@ -758,6 +1114,9 @@ export async function runBackupCatalogCli(
 
 function errorCode(error: unknown): BackupCatalogCliErrorCode {
   if (error instanceof BackupCatalogCliError) return error.code;
+  if (error instanceof mysqlArtifact.MySqlBackupArtifactError && error.code === "operation_deadline") {
+    return "operation_deadline";
+  }
   if (error instanceof z.ZodError) return "invalid_configuration";
   if (error instanceof TenantBackupCatalogAdapterConflictError
     || error instanceof TenantBackupCatalogConflictError) return "catalog_conflict";
@@ -771,5 +1130,9 @@ function errorCode(error: unknown): BackupCatalogCliErrorCode {
 
 /** Fixed, content-free output; never stringify dependency errors, locators, or environment. */
 export function formatBackupCatalogCliError(error: unknown): string {
+  if (error instanceof BackupCatalogCliError && error.restoreBoundary) {
+    return JSON.stringify({ status: "error", code: error.code, ...error.restoreBoundary,
+      requiresManualForwardFix: true, runtimeActivated: false });
+  }
   return JSON.stringify({ status: "error", code: errorCode(error) });
 }

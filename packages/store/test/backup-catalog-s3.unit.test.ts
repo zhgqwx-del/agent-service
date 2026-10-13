@@ -640,4 +640,24 @@ describe("S3TenantBackupCatalogAdapter unit contract", () => {
     expect(stalled.client.destroy).toHaveBeenCalledOnce();
     await expect(stalled.store.readHead()).rejects.toThrow("closed");
   });
+  it("cancels a stalled response body after SDK headers and sends no successor request", async () => {
+    const controller = new AbortController();
+    const client = new FakeS3Client();
+    const { store } = fixture(client, { operationAbortSignal: controller.signal });
+    const reading = vi.fn();
+    const body = new Readable({ read() { reading(); } });
+    const destroy = vi.spyOn(body, "destroy");
+    const send = vi.spyOn(client, "send").mockResolvedValueOnce({ Body: body });
+    const pending = store.readHead();
+    const rejected = expect(pending).rejects.toThrow(/cancelled|AbortError/);
+    void rejected.catch(() => {});
+    await vi.waitFor(() => expect(reading).toHaveBeenCalled());
+    controller.abort();
+    await rejected;
+    expect(destroy).toHaveBeenCalled();
+    expect(send).toHaveBeenCalledOnce();
+    await expect(store.readHead()).rejects.toThrow("aborted");
+    expect(send).toHaveBeenCalledOnce();
+    await store.close();
+  });
 });

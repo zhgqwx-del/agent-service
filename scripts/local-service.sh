@@ -34,6 +34,14 @@ caller_mover_env_names=(
   BACKUP_EVICTION_ID
   EXTERNAL_TOMBSTONE_SHA256
   BACKUP_PHYSICAL_ABSENCE_ACK
+  BACKUP_ARTIFACT_DIRECTORY
+  BACKUP_ARTIFACT_KEY_FILE
+  BACKUP_MYSQL_BINARY
+  BACKUP_MYSQLDUMP_BINARY
+  BACKUP_ARTIFACT_MAX_BYTES
+  BACKUP_ARTIFACT_DEADLINE_MS
+  BACKUP_ARTIFACT_LOCAL_ONLY_ACK
+  BACKUP_RESTORE_TARGET_MYSQL_URL
   RESTORE_REPLAY_PAGE_SIZE
   BLOB_STORE
   BLOB_DIR
@@ -51,7 +59,7 @@ caller_mover_env_names=(
 )
 while IFS= read -r caller_env_name; do
   case "$caller_env_name" in
-    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*)
+    AWS_*|RESTORE_JOURNAL_*|TENANT_RESTORE_JOURNAL_*|BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*)
       caller_mover_env_names+=("$caller_env_name")
       ;;
   esac
@@ -207,7 +215,7 @@ unset caller_env_index caller_env_name caller_mover_env_names caller_mover_env_w
 backup_catalog_process_scrub=(-u AGENT_SERVICE_UNUSED_BACKUP_CATALOG_ENV)
 while IFS= read -r backup_catalog_env_name; do
   case "$backup_catalog_env_name" in
-    BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*)
+    BACKUP_CATALOG_*|TENANT_BACKUP_CATALOG_*|BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*)
       backup_catalog_process_scrub+=(-u "$backup_catalog_env_name")
       ;;
   esac
@@ -590,8 +598,18 @@ smoke() {
   echo "smoke: health, readiness, OpenAPI, router forwarding and auth rejection passed"
 }
 
+clear_backup_artifact_authority() {
+  local artifact_env_name
+  while IFS= read -r artifact_env_name; do
+    case "$artifact_env_name" in
+      BACKUP_ARTIFACT_*|BACKUP_MYSQL*|BACKUP_RESTORE_*) unset "$artifact_env_name" ;;
+    esac
+  done < <(compgen -e)
+}
+
 verify() {
   require_tools
+  clear_backup_artifact_authority
   # `.env` is loaded for the local workflow, but platform authority must never be inherited by a
   # runner spawned from a test harness. Tests use their own fixed, non-production router credential.
   unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
@@ -737,6 +755,7 @@ verify_real() {
 
 verify_s3() {
   require_tools
+  clear_backup_artifact_authority
   # Adapter smoke tests must not inherit an operator's unrelated destructive usage gate.
   unset SESSION_USAGE_RETENTION_WORKER_ENABLED SESSION_USAGE_RETENTION_ENABLED
   unset SESSION_USAGE_RETENTION_WORKER_POLL_MS SESSION_USAGE_RETENTION_WORKER_BATCH_SIZE
@@ -774,6 +793,19 @@ verify_s3() {
     S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:backup-catalog-restore-roundtrip-mysql-s3
+  local artifact_mysql_binary="${MYSQL:-$(command -v mysql || true)}"
+  local artifact_mysqldump_binary="${MYSQLDUMP:-$(command -v mysqldump || true)}"
+  [[ "$artifact_mysql_binary" = /* && -x "$artifact_mysql_binary" ]] \
+    || die "verify-s3 requires an absolute executable MySQL 8 mysql client"
+  [[ "$artifact_mysqldump_binary" = /* && -x "$artifact_mysqldump_binary" ]] \
+    || die "verify-s3 requires an absolute executable MySQL 8 mysqldump client"
+  env "${s3_test_env[@]}" \
+    S3_BACKUP_CATALOG_TEST_BUCKET="$backup_catalog_bucket" \
+    S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
+    MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    BACKUP_MYSQL_BINARY="$artifact_mysql_binary" \
+    BACKUP_MYSQLDUMP_BINARY="$artifact_mysqldump_binary" \
+    pnpm run test:mysql-backup-artifact-mysql-s3
   local tenant_telemetry_bucket="${TENANT_TELEMETRY_S3_BUCKET:-agent-service-local-tenant-telemetry}"
   [ "$tenant_telemetry_bucket" != "${MINIO_BUCKET:-agent-service-local}" ] \
     || die "TENANT_TELEMETRY_S3_BUCKET must differ from the Blob bucket"

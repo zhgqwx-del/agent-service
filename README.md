@@ -249,6 +249,14 @@ user data export 同样采用默认关闭的 writer gate。runner/router 都设�
 
 本地统一入口当前启动单个 router、单个 runner；默认把Blob写入runner独占的`.local-run/blobs`，也可按上文切换到本地MinIO。Blob上传另有`BLOB_ATTACHMENTS_ENABLED`显式gate，router还会检查全部健康runner的`blobAttachments`及共享storage capability。filesystem模式必须显式`BLOB_FILESYSTEM_SINGLE_RUNNER=1`，不能作为多VM/多Pod共享存储，production writer/cleanup继续fail closed；S3模式必须`STORE=mysql`、`BLOB_STORAGE_CONTROL_ENABLED=1`、全部fleet使用同一namespace digest，并由runner独占存储凭据，router只接收非密钥namespace/bucket/prefix身份。
 
+### 本地加密逻辑备份
+
+本地备份新增既有`backup-catalog`的`create-artifact/verify-artifact/restore-selected`，不是第三个服务。它用宿主机MySQL 8工具生成真实InnoDB应用逻辑SQL，使用独立受保护key加密，并把认证后的实际制品证据绑定到0031 catalog；隔离空目标上的真实导入只停在`prepared`，不会自动重放fence、激活或启动服务。`verify-artifact`可对账content-free catalog投影，不能称为严格只读；新`restore-selected`会执行DDL/DML，旧metadata命令及restore-ledger CLI仍不执行DDL。
+
+当前本地MySQL备份制品CLI只支持telemetry lifecycle inactive数据库；active 0033所需exact ref-key尚未接线，verify-only启动会安全拒绝，不可绕过审计。后续provider capture启用前须补兼容与真实恢复验收。
+
+这条路径明确拒绝production，source须在线，runner镜像不包含mysql/mysqldump工具。任何已reserve的run/epoch都不能再次自动导入；失败保留reservation/部分目标，按人工forward-fix续接。它不覆盖物理backup/PITR、Blob/Redis联合恢复、tenant backup-copy erasure、云故障域/IAM/KMS或生产RPO/RTO，M1仍未冻结。受控配置与安全步骤见`docs/operations/local-and-deployment.md`的“本地MySQL加密逻辑备份制品”，学习和手动演练见`docs/operations/development-and-ci-guide.md`；真实套件使用`pnpm test:mysql-backup-artifact-mysql-s3`，完整S3门禁使用`scripts/local-service.sh verify-s3`。
+
 ## API 速览（对外经 `apps/agent-router`）
 
 普通 runtime API 使用两层鉴权：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（trusted caller）或 runner 验证的端用户 token。tenant-erasure 两个 platform API 则使用完全独立的 platform bearer，不能复用 service key。入站 token header 不能占用 service/user/framing/hop-by-hop 保留头；即使数据库中存在升级前的坏策略，admin service key 仍可通过 `/v1/tenant/auth` 修复。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入；首次生产admin bootstrap必须同时设置`ADMIN_BOOTSTRAP_TENANT`与绝对路径`ADMIN_BOOTSTRAP_OUTPUT_FILE`，密钥只创建到`0600`文件且不会输出到进程日志，具体恢复边界见`docs/design/05-observability.md`。
