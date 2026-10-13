@@ -136,6 +136,9 @@ jobs:
       - name: Tenant telemetry disposition v3 journal protocol unit suite (must execute)
         run: pnpm run test:tenant-telemetry-disposition-journal-v3
 
+      - name: Tenant telemetry disposition v3 GET-only journal observer unit suite (must execute)
+        run: pnpm run test:tenant-telemetry-disposition-journal-v3-observer
+
       - name: Tenant telemetry artifact GET-only observer unit suite (must execute)
         run: pnpm run test:tenant-telemetry-artifact-observer
 
@@ -309,7 +312,9 @@ jobs:
           S3_TEST_ACCESS_KEY_ID: agentservice-ci
           S3_TEST_SECRET_ACCESS_KEY: agent-service-ci-minio-only-0001
           S3_TEST_FORCE_PATH_STYLE: "1"
-        run: pnpm run test:tenant-telemetry-disposition-journal-v3-s3
+        run: |
+          pnpm run test:tenant-telemetry-disposition-journal-v3-s3
+          pnpm run test:tenant-telemetry-disposition-journal-v3-observer-s3
 
       # Read real writer bytes in the fourth bucket, and fixture markers in the fifth;
       # both use separate random prefixes and the observer itself issues GET only.
