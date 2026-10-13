@@ -7,15 +7,16 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { MysqlSessionStore } from "../../src/index.js";
 
 const exec = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "../../../..");
 // Pin the published 0042 source, not HEAD: old product writers must create genuine evidence.
 const FROZEN_0042_COMMIT = "cefb498929854f9132611ba03ade0c495cb475b1";
+// Pin the published code-only reader as well: later migrations must not change what
+// 0043 accepted on an unmodified 0042 database.
+const PUBLISHED_0043_COMMIT = "6a20ca3d5aefaf61a53c65443305cdf2b3a2a160";
 const MIGRATION_0042 = "0042_tenant_telemetry_plan_artifact_target.sql";
-const REF_KEY = Buffer.alloc(32, 0x42);
 const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
 type Row = RowDataPacket;
@@ -60,7 +61,7 @@ function processEnv(temp: string, extra: Record<string, string> = {}): NodeJS.Pr
   };
 }
 
-async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
+async function copyInstalledDependencies(checkout: string, version: "0042" | "0043"): Promise<void> {
   const exactManifests = [
     "pnpm-lock.yaml", "pnpm-workspace.yaml",
     "packages/core/package.json", "packages/protocol/package.json",
@@ -69,39 +70,39 @@ async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
     "apps/agent-router/package.json", "apps/agent-runner/package.json",
   ];
   for (const manifest of exactManifests) {
-    const oldBytes = await readFile(join(oldCheckout, manifest));
+    const oldBytes = await readFile(join(checkout, manifest));
     const currentBytes = await readFile(join(ROOT, manifest));
     if (!oldBytes.equals(currentBytes)) {
-      throw new Error(`frozen 0042 dependency manifest changed: ${manifest}`);
+      throw new Error(`published ${version} dependency manifest changed: ${manifest}`);
     }
   }
   // A later named test script may change, but dependency/configuration fields may not.
-  const oldRoot = JSON.parse(await readFile(join(oldCheckout, "package.json"), "utf8")) as Record<string, unknown>;
+  const oldRoot = JSON.parse(await readFile(join(checkout, "package.json"), "utf8")) as Record<string, unknown>;
   const currentRoot = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as Record<string, unknown>;
   delete oldRoot.scripts;
   delete currentRoot.scripts;
   if (JSON.stringify(oldRoot) !== JSON.stringify(currentRoot)) {
-    throw new Error("frozen 0042 root dependency manifest changed");
+    throw new Error(`published ${version} root dependency manifest changed`);
   }
   const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
-  await cp(join(ROOT, "node_modules"), join(oldCheckout, "node_modules"), options);
+  await cp(join(ROOT, "node_modules"), join(checkout, "node_modules"), options);
   for (const project of [
     "packages/core", "packages/providers", "packages/protocol", "packages/sdk",
     "packages/store", "apps/agent-router", "apps/agent-runner",
   ]) {
-    await cp(join(ROOT, project, "node_modules"), join(oldCheckout, project, "node_modules"), options);
+    await cp(join(ROOT, project, "node_modules"), join(checkout, project, "node_modules"), options);
   }
-  const virtualStore = await lstat(join(oldCheckout, "node_modules/.pnpm"));
+  const virtualStore = await lstat(join(checkout, "node_modules/.pnpm"));
   if (!virtualStore.isDirectory() || virtualStore.isSymbolicLink()) {
-    throw new Error("frozen 0042 dependency store is not self-contained");
+    throw new Error(`published ${version} dependency store is not self-contained`);
   }
-  const realCheckout = await realpath(oldCheckout);
+  const realCheckout = await realpath(checkout);
   let workspaceLinks = 0;
   for (const project of [
     "", "node_modules/.pnpm", "packages/core", "packages/providers", "packages/protocol",
     "packages/sdk", "packages/store", "apps/agent-router", "apps/agent-runner",
   ]) {
-    const scope = join(oldCheckout, project, "node_modules/@agent-service");
+    const scope = join(checkout, project, "node_modules/@agent-service");
     const names = await readdir(scope).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return [];
       throw error;
@@ -111,12 +112,12 @@ async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
       const target = await readlink(link);
       const resolved = await realpath(link);
       if (target.startsWith("/") || !resolved.startsWith(realCheckout + sep)) {
-        throw new Error("frozen 0042 workspace dependency points outside its archive");
+        throw new Error(`published ${version} workspace dependency points outside its archive`);
       }
       workspaceLinks += 1;
     }
   }
-  if (workspaceLinks === 0) throw new Error("frozen 0042 workspace package links are missing");
+  if (workspaceLinks === 0) throw new Error(`published ${version} workspace package links are missing`);
 }
 
 async function runFixed(
@@ -173,6 +174,7 @@ describe("frozen 0042 binary -> code-only 0043 read compatibility", () => {
   let base: URL;
   let archiveRoot: string;
   let oldCheckout: string;
+  let publishedCheckout: string;
   const databases = new Set<string>();
 
   beforeAll(async () => {
@@ -207,10 +209,32 @@ describe("frozen 0042 binary -> code-only 0043 read compatibility", () => {
       join(driverDir, "pre0043-old-t3e-blocked-probe.ts"));
     await copyFile(join(HERE, "fixtures/pre0043-old-verify-probe.ts"),
       join(driverDir, "pre0043-old-verify-probe.ts"));
-    await copyInstalledDependencies(oldCheckout);
+    await copyInstalledDependencies(oldCheckout, "0042");
     await runFixed("old build", "pnpm", ["build"], oldCheckout,
       processEnv(archiveRoot), 180_000);
-  }, 420_000);
+
+    publishedCheckout = join(archiveRoot, "published-0043");
+    await mkdir(publishedCheckout);
+    const publishedArchive = join(archiveRoot, "published-0043.tar");
+    const publishedCommit = (await runFixed(
+      "resolve published 0043", "git", ["rev-parse", PUBLISHED_0043_COMMIT], ROOT,
+      processEnv(archiveRoot), 10_000,
+    )).trim();
+    expect(publishedCommit).toBe(PUBLISHED_0043_COMMIT);
+    await runFixed("published 0043 ancestry", "git", [
+      "merge-base", "--is-ancestor", PUBLISHED_0043_COMMIT, "HEAD",
+    ], ROOT, processEnv(archiveRoot), 10_000);
+    await runFixed("published 0043 archive", "git", [
+      "archive", "--format=tar", `--output=${publishedArchive}`, PUBLISHED_0043_COMMIT,
+    ], ROOT, processEnv(archiveRoot), 30_000);
+    await runFixed("published 0043 extract", "tar", ["-xf", publishedArchive, "-C", publishedCheckout],
+      ROOT, processEnv(archiveRoot), 30_000);
+    const publishedFixtureDir = join(publishedCheckout, "packages/store/test/migrations/fixtures");
+    await mkdir(publishedFixtureDir, { recursive: true });
+    await copyFile(join(HERE, "fixtures/pre0043-published-read-probe.ts"),
+      join(publishedFixtureDir, "pre0043-published-read-probe.ts"));
+    await copyInstalledDependencies(publishedCheckout, "0043");
+  }, 600_000);
 
   afterAll(async () => {
     if (admin) {
@@ -323,36 +347,19 @@ describe("frozen 0042 binary -> code-only 0043 read compatibility", () => {
       await conn.end();
     }
 
-    // 0043 is a pure reader: verify-only startup on the unchanged 0042 schema, with no marker,
-    // trigger rotation, backfill, grant, or external deletion side effect.
-    const current = await MysqlSessionStore.connect({
-      url, migrationMode: "verify", tenantTelemetryRefKey: REF_KEY,
-    });
-    try {
-      expect(await current.getTenantTelemetryPlanArtifactTargetReceipt(
-        t3d.tenantId, t3d.requestId,
-      )).toMatchObject({ receiptSha256: blocked.catalogReceiptSha256,
-        targetCount: 1, executionReady: false });
-      expect(await current.getTenantTelemetryPlanArtifactTargets(
-        t3d.tenantId, t3d.requestId,
-      )).toMatchObject([{ receiptSha256: blocked.targetReceiptSha256,
-        writeOperationSha256: t3d.writtenOperationSha256 }]);
-      expect(await current.getTenantTelemetryOwnerClosureReceipt(
-        t3d.tenantId, t3d.requestId,
-      )).toBeNull();
-      expect(await current.getTenantTelemetrySourceEligibility(
-        t3d.tenantId, t3d.requestId,
-      )).toEqual({ status: "unknown", managedArtifactCount: null,
-        executionReady: false, externalAuthorityVerified: false });
-      expect(await current.getTenantTelemetrySourceEligibility(
-        `foreign-${t3d.tenantId}`, t3d.requestId,
-      )).toBeNull();
-      expect(await current.getTenantTelemetrySourceEligibility(
-        t3d.tenantId, `erase_${randomUUID()}`,
-      )).toBeNull();
-    } finally {
-      await current.close();
-    }
+    // The published 0043 reader runs from its immutable archive. Current HEAD may require
+    // later schema markers and must not redefine this code-only compatibility contract.
+    const publishedRead = await runFixed("published 0043 nonempty read", process.execPath, [
+      "--import", "tsx", "packages/store/test/migrations/fixtures/pre0043-published-read-probe.ts",
+    ], publishedCheckout, processEnv(archiveRoot, {
+      MYSQL_URL: url, HISTORICAL_TENANT_ID: t3d.tenantId,
+      HISTORICAL_REQUEST_ID: t3d.requestId,
+      HISTORICAL_EXPECTED_STATUS: "unknown",
+      HISTORICAL_CATALOG_RECEIPT: blocked.catalogReceiptSha256,
+      HISTORICAL_TARGET_RECEIPT: blocked.targetReceiptSha256,
+      HISTORICAL_WRITE_OPERATION: t3d.writtenOperationSha256,
+    }), 30_000);
+    expect(publishedRead).toBe("published-0043-read-accepted");
 
     const afterConn = await mysql.createConnection(url);
     try {
@@ -462,32 +469,16 @@ describe("frozen 0042 binary -> code-only 0043 read compatibility", () => {
       await conn.end();
     }
 
-    const current = await MysqlSessionStore.connect({
-      url, migrationMode: "verify", tenantTelemetryRefKey: REF_KEY,
-    });
-    try {
-      expect(await current.getTenantTelemetryPlanArtifactTargetReceipt(
-        plan.tenantId, plan.requestId,
-      )).toMatchObject({ receiptSha256: plan.catalogReceiptSha256, targetCount: 0 });
-      expect(await current.getTenantTelemetryPlanArtifactTargets(
-        plan.tenantId, plan.requestId,
-      )).toEqual([]);
-      expect(await current.getTenantTelemetryOwnerClosureReceipt(
-        plan.tenantId, plan.requestId,
-      )).toMatchObject({ receiptSha256: terminal.closureReceiptSha256, entryCount: 0 });
-      expect(await current.getTenantTelemetrySourceEligibility(
-        plan.tenantId, plan.requestId,
-      )).toEqual({ status: "local_source_candidate", managedArtifactCount: 0,
-        executionReady: false, externalAuthorityVerified: false });
-      expect(await current.getTenantTelemetrySourceEligibility(
-        `foreign-${plan.tenantId}`, plan.requestId,
-      )).toBeNull();
-      expect(await current.getTenantTelemetrySourceEligibility(
-        plan.tenantId, `erase_${randomUUID()}`,
-      )).toBeNull();
-    } finally {
-      await current.close();
-    }
+    const publishedRead = await runFixed("published 0043 zero-target read", process.execPath, [
+      "--import", "tsx", "packages/store/test/migrations/fixtures/pre0043-published-read-probe.ts",
+    ], publishedCheckout, processEnv(archiveRoot, {
+      MYSQL_URL: url, HISTORICAL_TENANT_ID: plan.tenantId,
+      HISTORICAL_REQUEST_ID: plan.requestId,
+      HISTORICAL_EXPECTED_STATUS: "local_source_candidate",
+      HISTORICAL_CATALOG_RECEIPT: plan.catalogReceiptSha256,
+      HISTORICAL_CLOSURE_RECEIPT: terminal.closureReceiptSha256,
+    }), 30_000);
+    expect(publishedRead).toBe("published-0043-read-accepted");
 
     const afterConn = await mysql.createConnection(url);
     try {

@@ -90,6 +90,7 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
   let base: URL;
   let pre0041Dir: string;
   let through0041Dir: string;
+  let through0042Dir: string;
   let migrationSql: string;
   const disposableDatabases = new Set<string>();
 
@@ -100,6 +101,7 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
     admin = await mysql.createConnection(adminUrl.toString());
     pre0041Dir = await mkdtemp(join(tmpdir(), "agent-service-pre0041-"));
     through0041Dir = await mkdtemp(join(tmpdir(), "agent-service-through0041-"));
+    through0042Dir = await mkdtemp(join(tmpdir(), "agent-service-through0042-"));
     const names = (await readdir(MIGRATIONS_DIR))
       .filter((name) => /^00\d\d_.*\.sql$/.test(name) && Number(name.slice(0, 4)) <= 40)
       .sort();
@@ -113,10 +115,14 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
         .update(createHash("sha256").update(bytes).digest("hex")).update("\n");
       await copyFile(join(MIGRATIONS_DIR, name), join(pre0041Dir, name));
       await copyFile(join(MIGRATIONS_DIR, name), join(through0041Dir, name));
+      await copyFile(join(MIGRATIONS_DIR, name), join(through0042Dir, name));
     }
     expect(frozenChain.digest("hex")).toBe(FROZEN_0040_CHAIN_SHA256);
     migrationSql = await readFile(join(MIGRATIONS_DIR, MIGRATION_NAME), "utf8");
     await copyFile(join(MIGRATIONS_DIR, MIGRATION_NAME), join(through0041Dir, MIGRATION_NAME));
+    await copyFile(join(MIGRATIONS_DIR, MIGRATION_NAME), join(through0042Dir, MIGRATION_NAME));
+    await copyFile(join(MIGRATIONS_DIR, "0042_tenant_telemetry_plan_artifact_target.sql"),
+      join(through0042Dir, "0042_tenant_telemetry_plan_artifact_target.sql"));
   });
 
   afterAll(async () => {
@@ -128,6 +134,7 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
     }
     if (pre0041Dir) await rm(pre0041Dir, { recursive: true, force: true });
     if (through0041Dir) await rm(through0041Dir, { recursive: true, force: true });
+    if (through0042Dir) await rm(through0042Dir, { recursive: true, force: true });
   });
 
   async function create0040(database: string): Promise<void> {
@@ -455,9 +462,11 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
     try {
       await create0040(database);
       await upgrade(database);
-      // The current binary requires 0042; advance only this disposable database after
-      // the frozen 0040 -> 0041 upgrade before testing the retained 0041 projection.
-      const healthy = await MysqlSessionStore.connect({ url, tenantTelemetryRefKey: REF_KEY });
+      // Advance only this disposable database to 0042. The exact 119-trigger assertion
+      // must not silently start testing a later schema as the current binary evolves.
+      const healthy = await MysqlSessionStore.connect({
+        url, migrationsDir: through0042Dir, tenantTelemetryRefKey: REF_KEY,
+      });
       await healthy.close();
       conn = await mysql.createConnection(url);
       const [control] = await conn.query<Row[]>(
@@ -495,7 +504,9 @@ describe("0040 -> 0041 immutable telemetry T3d target-manifest historical migrat
       expect(Number(marker[0]?.n)).toBe(1);
       await conn.end();
       conn = undefined;
-      await expect(MysqlSessionStore.connect({ url, migrationMode: "verify" }))
+      await expect(MysqlSessionStore.connect({
+        url, migrationsDir: through0042Dir, migrationMode: "verify",
+      }))
         .rejects.toBeInstanceOf(TenantErasureIntegrityError);
     } finally {
       await conn?.end();
