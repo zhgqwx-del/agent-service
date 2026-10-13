@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentDefinition, Event } from "@agent-service/protocol";
 import { MemoryEventBus, MemoryLeaseStore, MemorySessionStore } from "@agent-service/store";
-import { PiEngine, SessionHost, StaticToolRegistry, newId, type RunnerTool } from "@agent-service/core";
+import { PiEngine, SessionHost, StaticToolRegistry, newId, type AgentEngine, type RunnerTool } from "@agent-service/core";
 import { FakeVendor, type CacheDialect, type ScriptedReply } from "@agent-service/testkit";
 import { LocalAesGcmCipher, ProviderService } from "../src/index.js";
 
@@ -54,9 +54,21 @@ async function harness(opts: { cacheDialect?: CacheDialect; reasoning?: boolean;
     approvalPolicy: "on-request", busyPolicy: "steer", sandbox: "none", metadata: {}, createdAtMs: Date.now(),
   };
   await store.createAgent(agent);
+  const steps: unknown[] = [];
+  const pi = new PiEngine(providers.models);
+  const engine: AgentEngine = {
+    name: pi.name,
+    start: (params, sink) => pi.start(params, {
+      ...sink,
+      onAssistantMessage: async (step) => {
+        steps.push(step);
+        await sink.onAssistantMessage(step);
+      },
+    }),
+  };
   const host = new SessionHost({
     store, lease: new MemoryLeaseStore(), bus: new MemoryEventBus(), providers,
-    engine: new PiEngine(providers.models), tools: new StaticToolRegistry([weather]),
+    engine, tools: new StaticToolRegistry([weather]),
     config: { runnerId: "r", runnerAddr: "local", leaseHoldMs: 10 },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
   });
@@ -73,7 +85,7 @@ async function harness(opts: { cacheDialect?: CacheDialect; reasoning?: boolean;
     }
     throw new Error("turn did not finish");
   };
-  return { store, host, session, events, run, vendor: vendor!, providers };
+  return { store, host, session, events, steps, run, vendor: vendor!, providers };
 }
 
 describe("domestic chat-completions dialects (fake vendor, no API key needed)", () => {
@@ -170,13 +182,18 @@ describe("domestic chat-completions dialects (fake vendor, no API key needed)", 
     expect(req.body.stream).toBe(true);
   });
 
-  it("surfaces a vendor 429 as a failed turn with the error recorded", async () => {
-    const h = await harness({ script: [{ httpError: { status: 429, retryAfter: "1", body: { error: { message: "rate limited" } } } }] });
+  it("surfaces a vendor 429 as a failed turn without exposing the raw response", async () => {
+    const h = await harness({ script: [{ httpError: { status: 429, retryAfter: "1", body: { error: { message: "rate limited Bearer sk-private" } } } }] });
     const turn = await h.run();
     expect(turn.status).toBe("failed");
     expect(turn.stopReason).toBe("error");
-    expect(`${turn.error?.message}`.toLowerCase()).toMatch(/429|rate/);
-    expect(h.events.some((e) => e.type === "error")).toBe(true);
+    expect(turn.error).toEqual({ code: "provider_error", message: "Provider request failed." });
+    expect(h.events.filter((e) => e.type === "error")).toMatchObject([
+      { code: "provider_error", message: "Provider request failed." },
+    ]);
+    const persistedEvents = await h.store.readEvents(h.session.id, 0, 1_000);
+    const persistedItems = await h.store.listItems(h.session.id, { limit: 100 });
+    expect(JSON.stringify({ turn, steps: h.steps, liveEvents: h.events, persistedEvents, persistedItems })).not.toContain("sk-private");
   });
 
   it("fails the turn cleanly when the vendor drops the socket mid-stream", async () => {

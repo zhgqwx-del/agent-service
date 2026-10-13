@@ -22,6 +22,7 @@ import {
   projectItems,
   sha256,
   stableStringify,
+  type AgentEngine,
   type ProviderResolver,
   type ResolvedModel,
   type RunnerTool,
@@ -93,6 +94,7 @@ interface SetupExtras {
   summariser?: Summariser;
   blobs?: SessionBlobService;
   logger?: Pick<Console, "info" | "warn" | "error">;
+  engine?: AgentEngine;
   onOwnershipLost?: () => void;
 }
 
@@ -135,7 +137,7 @@ async function setup(script: ScriptStep[], agentPatch: Partial<AgentDefinition> 
   };
   await store.createAgent(agent);
   const host = new SessionHost({
-    store, lease, bus, engine, providers: extras.providers ?? providers, summariser: extras.summariser, blobs: extras.blobs,
+    store, lease, bus, engine: extras.engine ?? engine, providers: extras.providers ?? providers, summariser: extras.summariser, blobs: extras.blobs,
     tools: new StaticToolRegistry([echoTool, dangerousTool, slowTool, circularDetailsTool, jsonPayloadTool]),
     config: { runnerId: "r1", runnerAddr: "127.0.0.1:1", leaseTtlMs: 2000, leaseHoldMs: 50, approvalTtlMs: 5000, ...cfg },
     logger: extras.logger ?? { info: () => {}, warn: () => {}, error: () => {} },
@@ -1458,6 +1460,25 @@ describe("SessionHost", () => {
     expect((await h.store.readEvents(h.session.id, 0, 1_000)).some((event) => event.type === "session/compacted")).toBe(false);
   });
 
+  it("does not log raw summariser exceptions while skipping compaction", async () => {
+    const untrusted = "Bearer sk-summary https://summary.invalid/private";
+    const logLines: string[] = [];
+    const record = (...values: unknown[]) => logLines.push(values.map(String).join(" "));
+    const h = await setup([{ text: "answer ".repeat(200) }], {}, {}, {
+      summariser: { summarise: async () => { throw new Error(untrusted); } },
+      logger: { info: record, warn: record, error: record },
+    });
+    for (let i = 0; i < 3; i++) {
+      await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: `question ${i} ${"detail ".repeat(200)}` }], stream: true, metadata: {} });
+      await waitIdle(h);
+    }
+
+    await expect(h.host.compactSession(principal, h.session.id)).resolves.toMatchObject({ compacted: false });
+    expect((await h.store.listItems(h.session.id, { limit: 1_000 })).some((item) => item.type === "contextCompaction")).toBe(false);
+    expect(logLines).toContain("compaction skipped after summariser failure");
+    expect(logLines.join(" ")).not.toContain(untrusted);
+  });
+
   it("busyPolicy=reject returns session_busy", async () => {
     const h = await setup([{ text: "x", delayMs: 300 }], { busyPolicy: "reject" });
     await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
@@ -1491,15 +1512,65 @@ describe("SessionHost", () => {
     await expect(h.host.getSession({ tenantId: "t_b", userId: "u_9" }, h.session.id)).rejects.toBeInstanceOf(ApiError);
   });
 
-  it("provider error fails the turn with an error event", async () => {
-    const h = await setup([{ stopReason: "error", errorMessage: "429 rate limited", usage: { costCNY: undefined } }]);
+  it("provider error fails the turn with a closed public error event", async () => {
+    const h = await setup([{ stopReason: "error", usage: { costCNY: undefined } }]);
     const r = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
     await waitIdle(h);
     const t = (await h.store.getTurn(h.session.id, r.turn.id))!;
     expect(t.status).toBe("failed");
     expect(t.stopReason).toBe("error");
-    expect(t.error?.message).toContain("429");
-    expect(h.events.some((e) => e.type === "error")).toBe(true);
+    expect(t.error).toEqual({ code: "provider_error", message: "Provider request failed." });
+    const persisted = await h.store.readEvents(h.session.id, 0, 1_000);
+    expect(persisted.filter((e) => e.type === "error")).toMatchObject([
+      { code: "provider_error", message: "Provider request failed.", turnId: r.turn.id },
+    ]);
+    expect(h.events.filter((e) => e.type === "error")).toMatchObject([
+      { code: "provider_error", message: "Provider request failed.", turnId: r.turn.id },
+    ]);
+  });
+
+  it("closes an engine exception before turn/event persistence and logs", async () => {
+    const untrusted = "Bearer sk-engine https://engine.invalid/private";
+    const logLines: string[] = [];
+    const record = (...values: unknown[]) => logLines.push(values.map(String).join(" "));
+    const h = await setup([], {}, {}, {
+      engine: { name: "throwing", start: () => { throw new Error(untrusted); } },
+      logger: { info: record, warn: record, error: record },
+    });
+    const r = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
+    await waitIdle(h);
+    const turn = await h.store.getTurn(h.session.id, r.turn.id);
+    const events = await h.store.readEvents(h.session.id, 0, 1_000);
+    expect(turn?.status).toBe("failed");
+    expect(turn?.error).toEqual({ code: "provider_error", message: "Provider request failed." });
+    expect(events.filter((e) => e.type === "error")).toMatchObject([
+      { code: "provider_error", message: "Provider request failed.", turnId: r.turn.id },
+    ]);
+    expect(JSON.stringify({ turn, events, logLines })).not.toContain(untrusted);
+  });
+
+  it("never trusts an engine's done.error text at the final persistence boundary", async () => {
+    const untrusted = "Bearer sk-done https://done.invalid/private";
+    const h = await setup([], {}, {}, {
+      engine: {
+        name: "untrusted-engine",
+        start: () => ({
+          steer: () => {},
+          interrupt: () => {},
+          // Simulate a faulty or older engine at runtime; the host is the final public boundary.
+          done: Promise.resolve({ steps: 0, aborted: false, error: untrusted as "provider_error" }),
+        }),
+      },
+    });
+    const r = await h.host.startTurn(principal, h.session.id, { input: [{ type: "text", text: "go" }], stream: true, metadata: {} });
+    await waitIdle(h);
+    const turn = await h.store.getTurn(h.session.id, r.turn.id);
+    const events = await h.store.readEvents(h.session.id, 0, 1_000);
+    expect(turn?.error).toEqual({ code: "provider_error", message: "Provider request failed." });
+    expect(events.filter((e) => e.type === "error")).toMatchObject([
+      { code: "provider_error", message: "Provider request failed.", turnId: r.turn.id },
+    ]);
+    expect(JSON.stringify({ turn, events })).not.toContain(untrusted);
   });
 
   it("replays events after a seq without duplicates or gaps and excludes filtered types", async () => {

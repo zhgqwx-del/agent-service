@@ -74,7 +74,7 @@ export class PiEngine implements AgentEngine {
     });
 
     let aborted = false;
-    let lastError: string | undefined;
+    let lastError: "provider_error" | undefined;
     agent.subscribe(async (ev: AgentEvent) => {
       switch (ev.type) {
         case "turn_start":
@@ -98,7 +98,7 @@ export class PiEngine implements AgentEngine {
         case "message_end":
           if (ev.message.role === "assistant") {
             currentAssistant = toStepResult(ev.message, params.model.priceKnown !== false);
-            if (currentAssistant.stopReason === "error") lastError = currentAssistant.errorMessage ?? "provider error";
+            if (currentAssistant.stopReason === "error") lastError = "provider_error";
             if (currentAssistant.stopReason === "aborted") aborted = true;
             await sink.onAssistantMessage(currentAssistant);
           }
@@ -136,8 +136,9 @@ export class PiEngine implements AgentEngine {
       try {
         await agent.prompt(toUserMessage(params.input));
         await agent.waitForIdle();
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : String(err);
+      } catch {
+        // The provider or transport exception can contain credentials, URLs and response bodies.
+        lastError = "provider_error";
       } finally {
         params.signal.removeEventListener("abort", onAbort);
       }
@@ -169,7 +170,7 @@ export class PiSummariser implements Summariser {
       },
     );
     if (msg.stopReason === "error" || msg.stopReason === "aborted") {
-      throw new Error(`summarisation failed: ${msg.errorMessage ?? msg.stopReason}`);
+      throw new Error("summarisation failed");
     }
     const res = toStepResult(msg, input.model.priceKnown !== false);
     return { text: res.text, usage: res.usage };
@@ -258,5 +259,7 @@ function toStepResult(msg: AssistantMessage, priceKnown = true): AssistantStepRe
     ...(priceKnown && u.cost?.total !== undefined ? { costCNY: u.cost.total } : {}),
   };
   const stop = msg.stopReason === "stop" || msg.stopReason === "length" || msg.stopReason === "toolUse" || msg.stopReason === "error" || msg.stopReason === "aborted" ? msg.stopReason : "stop";
-  return { text, reasoning, toolCalls, usage, stopReason: stop, errorMessage: msg.errorMessage, provider: msg.provider, model: msg.model };
+  // Pi's errorMessage can include provider response bodies, URLs, and credentials. It must not
+  // cross the engine/sink boundary where a future persistence path might accidentally capture it.
+  return { text, reasoning, toolCalls, usage, stopReason: stop, provider: msg.provider, model: msg.model };
 }

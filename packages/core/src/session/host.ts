@@ -69,6 +69,9 @@ import {
   type UploadedSessionBlob,
 } from "../blob/service.js";
 
+/** Public turn/event wording is fixed; provider and transport errors are untrusted data. */
+const PUBLIC_PROVIDER_ERROR_MESSAGE = "Provider request failed.";
+
 export interface ProviderResolver {
   resolve(principal: Principal, ref: { provider: string; model: string; reasoning?: "off" | "low" | "medium" | "high" }): Promise<ResolvedModel>;
 }
@@ -1746,10 +1749,10 @@ export class SessionHost {
       // Preserve write-ahead ordering, then feed every admitted input as soon as the engine exists.
       for (const input of state.pendingSteers.splice(0)) run.steer(input);
       result = await run.done;
-    } catch (err) {
-      result = { steps: state.step, aborted: state.abort.signal.aborted, error: err instanceof Error ? err.message : String(err) };
+    } catch {
+      result = { steps: state.step, aborted: state.abort.signal.aborted, error: "provider_error" };
     }
-    await this.finishTurn(state, result).catch((err) => this.log.error(`[session ${sessionId}] finishTurn failed`, err));
+    await this.finishTurn(state, result).catch(() => this.logTurnStop("error", "turn finish failed"));
   }
 
   private async durableToolResult(
@@ -2389,10 +2392,10 @@ export class SessionHost {
       });
       summary = leaseGuard ? await leaseGuard.wait(work) : await work;
       if (!summary.text.trim()) throw new Error("summariser returned nothing");
-    } catch (err) {
+    } catch {
       if (leaseGuard?.lost) throw leaseGuard.lost;
       // Compaction is an optimisation: if the summariser fails, carry on with the pruned transcript.
-      this.log.warn(`[session ${session.id}] compaction skipped: ${err instanceof Error ? err.message : err}`);
+      this.logTurnStop("warn", "compaction skipped after summariser failure");
       return undefined;
     }
 
@@ -2518,7 +2521,8 @@ export class SessionHost {
     turn.stopReason = stopReason;
     turn.completedAtMs = now;
     turn.partialText = stopReason !== "end_turn" && state.lastText ? state.lastText : undefined;
-    if (result.error) turn.error = { code: "provider_error", message: result.error };
+    // Keep this final boundary closed even if a stale or faulty engine returns untrusted text.
+    if (result.error) turn.error = { code: "provider_error", message: PUBLIC_PROVIDER_ERROR_MESSAGE };
 
     // an agentMessage that was streaming when we stopped must not stay inProgress
     const items: Item[] = [];
@@ -2551,15 +2555,15 @@ export class SessionHost {
         turn,
         items,
         events: [
-          ...(result.error ? [{ type: "error" as const, sessionId, emittedAtMs: now, code: "provider_error", message: result.error, turnId: turn.id }] : []),
+          ...(result.error ? [{ type: "error" as const, sessionId, emittedAtMs: now, code: "provider_error", message: PUBLIC_PROVIDER_ERROR_MESSAGE, turnId: turn.id }] : []),
           { type: "turn/completed", sessionId, emittedAtMs: now, turn, stopReason },
           { type: "session/status/changed", sessionId, emittedAtMs: now, status: { type: "idle" } },
         ],
         sessionPatch: { status: { type: "idle" }, usage: state.session.usage },
       });
       turn.seqEnd = r.lastSeq;
-    } catch (err) {
-      this.log.error(`[session ${sessionId}] could not persist turn end (${err instanceof Error ? err.message : err}); the next owner will repair`);
+    } catch {
+      this.logTurnStop("error", "turn end persistence failed; the next owner will repair");
     } finally {
       state.leaseGuard.stop();
       if (this.active.get(sessionId) === state) this.active.delete(sessionId);
@@ -2743,9 +2747,9 @@ export class SessionHost {
     if (err instanceof FenceError) this.reportOwnershipLost(state);
     if (wasReserved) void this.finishTurn(state, { steps: 0, aborted: true }).catch(() => {});
     if (err instanceof FenceError) {
-      if (!wasAlreadyFenced) this.logTurnStop("error", `[session ${state.session.id}] fenced out (${err.message}); aborting turn ${state.turn.id}`);
+      if (!wasAlreadyFenced) this.logTurnStop("error", "session fenced out; aborting turn");
     } else {
-      this.logTurnStop("error", `[session ${state.session.id}] commit failed`, err);
+      this.logTurnStop("error", "session commit failed");
     }
   }
 

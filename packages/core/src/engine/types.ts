@@ -63,7 +63,6 @@ export interface AssistantStepResult {
   toolCalls: { id: string; name: string; args: unknown }[];
   usage: Usage;
   stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
-  errorMessage?: string;
   provider: string;
   model: string;
 }
@@ -114,8 +113,8 @@ export interface EngineRun {
   /** inject a user message at the next step boundary */
   steer(input: EngineInputPart[]): void;
   interrupt(): void;
-  /** resolves when the engine loop has fully settled */
-  done: Promise<{ steps: number; aborted: boolean; error?: string }>;
+  /** Resolves with a closed failure signal; raw provider errors must never cross into durable state. */
+  done: Promise<{ steps: number; aborted: boolean; error?: "provider_error" }>;
 }
 
 export interface AgentEngine {

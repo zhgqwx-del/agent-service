@@ -7,7 +7,6 @@ export interface ScriptStep {
   reasoning?: string;
   toolCalls?: { name: string; args: unknown }[];
   stopReason?: AssistantStepResult["stopReason"];
-  errorMessage?: string;
   usage?: Partial<Usage>;
   /** pause this long before emitting the message (to let tests interrupt/steer mid-step) */
   delayMs?: number;
@@ -31,7 +30,7 @@ export class ScriptedEngine implements AgentEngine {
     let callSeq = 0;
     const done = (async () => {
       let step = 0;
-      let error: string | undefined;
+      let error: "provider_error" | undefined;
       let previousToolResults: EngineToolResult[] = [];
       for (const s of this.script) {
         if (interrupted || params.signal.aborted) break;
@@ -56,13 +55,12 @@ export class ScriptedEngine implements AgentEngine {
           // `costCNY: undefined` to exercise genuinely unpriced responses.
           usage,
           stopReason: s.stopReason ?? (toolCalls.length ? "toolUse" : "stop"),
-          errorMessage: s.errorMessage,
           provider: "fake",
           model: "fake-1",
         };
         await sink.onAssistantMessage(msg);
         if (msg.stopReason === "error") {
-          error = msg.errorMessage ?? "error";
+          error = "provider_error";
           break;
         }
         let terminate = false;
