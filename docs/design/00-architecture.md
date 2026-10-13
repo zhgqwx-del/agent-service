@@ -4,6 +4,8 @@
 >
 > 当前实现仍保持两个长期应用边界：对外入口是无状态`agent-router`，实际Agent Runtime和生命周期worker位于`agent-runner`。`0034`默认关闭的telemetry writer已接runner，可选本地单runner filesystem或S3-compatible target；`0035`只为`provider.upstream_request_failed` logs建立exact producer contract，traces必须inactive。`0036`为默认休眠的非生产disposition协议；`0037`继续硬拒真实grant，`0038`～`0041`依次封存新write membership、T3f owner/grave、T3d五类source与逐source观察目标。`0042`从同一次source/owner快照为**新**T3d plan封存逐artifact目录和logs/traces精确count/root；旧0041 terminal仍为原零target plan、缺catalog为unknown。`0043`无schema变更，仅修复新plan非零target的T3e实时复核并给terminal T3f后的本地来源提供只读候选诊断；候选固定`executionReady=false`、`externalAuthorityVerified=false`。`0044`新增默认休眠的逐artifact、版本化pre-grant intent/claim账本，在自身原子边界独立重验并绑定精确本地source与claim租约，两个记录均固定`grantReady=false`。新目录和pre-grant记录都不是执行许可，两域仍为`blocked_adapter_unconfigured`，真实grant和产品外部处置继续关闭；没有产品v2 S3 mutation、受控telemetry disposition activation/worker/CLI或旧快照恢复门禁。第五个同机MinIO bucket只证明0036协议，不证明云IAM/KMS和独立故障域。M1仍未冻结、M2冻结、M3/M4主体未开始；这些切片不新增常驻服务、进程、JavaScript入口或产品镜像。
 
+> 后续`0045`/`0046`/`0048`只增GET-only v2 journal、artifact及v3 journal观察器；`0047`是与产品路径分离的v3 CAS-head非生产夹具，观察或fixture事件均不能证明可信DB grant、physical ACK或restore fence。`0049`新增default-dormant persisted provider-step failure capture v2三表/13 guards、严格139-trigger指纹；logs预置单一producer但control保持inactive，coverage/binding及v2写路径硬拒，source身份使用tenant-bound、kind-separated keyed HMAC ref而非原始ID。`0050`为新普通session DELETE追加post-COMMIT可信数据库时间的30天保留floor，旧/erasure/legacy origin仍unknown；`purge_after_ms=NULL`、`session.purge`不可领取，自动物理清理没有开启。两项migration都不新增服务、JavaScript入口或OCI镜像，也不改变M1/M2/M3/M4判定。
+
 ---
 
 ## 0. 一页结论
@@ -358,7 +360,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 |---|---|---|
 | `tenants` / `api_keys` | | 当前鉴权真相；user identity 来自受信调用方或端用户 token，目前没有独立 `users` 表 |
 | `agent_versions` | `(tenant_id, agent_id, version)` | 当前定义快照，不可变；没有单独 `agents` row |
-| `sessions` | `session_id PK, tenant_id, user_id(分片键), agent_id, agent_version, status, fence_token, last_seq, last_compaction_seq, parent_session_id, archived_at_ms, deleted_at_ms, deletion_generation` | 当前投影与 lifecycle marker |
+| `sessions` | `session_id PK, tenant_id, user_id(分片键), agent_id, agent_version, status, fence_token, last_seq, last_compaction_seq, parent_session_id, archived_at_ms, deleted_at_ms, deletion_generation`，以及0050五个nullable ordinary DELETE origin/seal/floor证据列 | 当前投影与 lifecycle marker；0050只给新普通DELETE封存保守30天保留下限，不排期或执行purge，T3f删除session时证据同事务消失 |
 | `turns` | `turn_id PK, session_id, seq_start, seq_end, status, stop_reason, body(JSON), started_at_ms, completed_at_ms` | turn 完整资源保存在 `body` JSON |
 | `items` | `item_id PK, session_id, turn_id, seq, type, status, body(JSON)` | 完整消息历史；Blob 引用是 body 中的 opaque id，不保存物理 locator |
 | `events` | `(session_id, seq) PK, type, body(JSON), emitted_at_ms` | 当前 durable 里程碑事件；分区/外部归档仍是目标态 |
@@ -390,6 +392,7 @@ research 01 §3.1 的八条（合成 tool_result id 稳定、length 丢弃、换
 | `tenant_purge_plan_jobs` / `tenant_purge_plan_entries` / `tenant_purge_plan_receipts` | T1/T3a/T3b/T3c + immutable policy/DB-time deadline + 固定33域count/root/disposition/source hash + blocker root | `0022` T3d非破坏性全域计划；`plan_complete=TRUE`只表示目录完整，`execution_ready=FALSE`、`content_purge_executed=FALSE`固定禁止执行/完成 |
 | `tenant_telemetry_plan_artifact_targets` / `tenant_telemetry_plan_artifact_target_receipts` | 新T3d逐artifact content-free目标身份、logs/traces count/root、source/owner/ACK摘要与独立aggregate | `0042`默认休眠：与0040/0041及新plan terminal同一原子边界封存，MySQL append-only/terminal guard；旧0041 plan不回填，缺catalog为unknown。非零target仍是blocked，不授予grant/delete/restore/completion |
 | `tenant_telemetry_pregrant_intents` / `tenant_telemetry_pregrant_claims` | 逐artifact不可变本地source checkpoint及版本化、DB-time有界claim租约 | `0044`默认休眠：只从0042新plan精确catalog entry、0040/0041 receipt、0039 owner closure与T3f terminal/grave及当前T1/hold/control/restore gate建立；Memory/MySQL原子发布，MySQL append-only guards与严格126-trigger指纹。`grant_ready=0`，不签发0037 grant、不接触外部journal/marker、不授予删除或completion |
+| `tenant_telemetry_capture_v2_controls` / `tenant_telemetry_capture_v2_coverages` / `tenant_telemetry_capture_v2_source_bindings` | persisted provider-step failure capture v2双域control、future-only tenant coverage和逐write来源ref | `0049`默认休眠：logs预置唯一producer contract、traces无producer，control固定inactive/generation 0；coverage、binding及activation由SQL硬拒。未来source session/turn/item只准tenant-bound、kind-separated keyed HMAC ref，当前不回填旧v1、不接应用producer；13 guards/139-trigger严格指纹使异常footprint阻断旧T3d/T3f/v1 writer，不授予grant/delete/restore/completion |
 | `tenant_purge_execution_jobs` / `tenant_purge_execution_domains` / `tenant_purge_execution_domain_acks` | T3c/T3d source + execution generation/claim lease + 固定domain ACK chain | `0023` T3e本地受限执行账本；只记录operational usage、Blob/export outbox及export control/snapshot动作，不授予其余域或全局completion |
 | `tenant_purge_local_cutover_receipts` / `tenant_purge_local_physical_ack_receipts` / `tenant_purge_execution_cutover` | exact outbox roots + local/physical ACK roots + write-once cutover | local cutover固定`all_domains_complete=FALSE`、`content_purge_executed=FALSE`；只有精确outbox实际completed后才可seal physical receipt，dead-letter不是成功 |
 | `tenant_database_purge_jobs` / `tenant_database_purge_predelete_entries` / `tenant_database_purge_predelete_receipts` | T3c/T3d/T3e source + 11域pre-delete count/root + claim lease | `0024` T3f本地数据库投影清理；pre-delete目录、destructive action与terminal publication处于同一Memory原子发布或MySQL RR事务 |
@@ -532,6 +535,10 @@ T3d owner closure还包括Memory中export request、user erasure request与tenan
 
 `0044_tenant_telemetry_pregrant_intent.sql`完成上述本地pre-grant前置切片，但不改变0043候选或0042 blocker的含义。新intent逐artifact绑定0042 catalog entry/aggregate、0040 source、0041 manifest、0039 owner closure和T3f terminal receipt；同一版本只允许精确重放，claim以hash后的token、单调attempt和DB-time租约串行化，过期或数据库时钟倒退的晚期插入必须整事务回滚。Memory/MySQL每次prepare/get/claim仍重验当前本地source、T1/hold/control及restore状态；跨tenant、缺目录、历史零target或漂移返回无候选或fail closed。MySQL新增两张append-only表与七个guard，严格126-trigger fingerprint要求独立迁移前排空pre-0044进程，不能热混跑。`grantReady=false`固定不变；0037 hard-deny、产品外部mutation/restore拒绝和全域completion=false仍在，0044既不观察外部head，也不新增服务、进程、JavaScript入口或OCI镜像。
 
+`0045`与`0048`分别以GET-only观察v2 grant journal和v3 disposition journal的sealed chain，`0046`只读精确artifact data/同keytombstone；观察器只验证传入target/事件语法与内容，不提供DB grant、physical ACK、restore fence或external authority。`0047`另以独立v3 wire family构建source/claim/restore/terminal-bound事件及S3 create-only event/CAS-head非生产fixture，不能因为S3协议可测就接入产品mutation。它们没有migration、常驻进程、CLI、bundle或镜像。`0049`新增默认休眠的capture v2三表、13 guards和严格139-trigger指纹，固定control inactive，拒绝coverage、binding、v2 job和activation；旧T3d/T3f不能遗漏异常第六类来源。未来source ID只可作为tenant-bound、kind-separated keyed HMAC ref，不得持久化raw session/turn/item。发布必须先关相关gate并排空pre-0049 writer/事务，再独立迁移并只运行0049-aware进程；这不是完成应用capture或开放0037 grant。
+
+`0050`对普通session DELETE使用专用trusted store入口：首个Memory原子发布/MySQL事务把versioned origin、tombstone、terminal event和两条outbox一起提交；提交后第二事务锁定并重验精确owner/source，在所有锁等待结束后观测DB时间，以`observed + 1ms + 30天`封存保守最低保留floor。旧writer、erasure/legacy来源一律unknown；第二事务失败只留未seal origin，默认无人调用的有界恢复原语可以exact retry。五个nullable列与CHECK附在sessions row，T3f会随canonical owner删除证据；没有SQL级write-once origin guard，旧writer也不会在新schema被强制双写，故mixed-writer完整覆盖不能宣称。`purge_after_ms`继续NULL、`session.purge`不可领取，无自动清理、物理删除或completion；真正执行仍需更长canonical policy、hold及外部/恢复域ACK，并保持默认关闭。
+
 ### 8.2 Redis 键
 
 session key的实际grammar为`${prefix}:lease:{sid}`、`${prefix}:fence:{sid}`、`${prefix}:stream:{sid}`、`${prefix}:evt:{sid}`与`${prefix}:purge:{sid}`；`{sid}`是Redis Cluster hash tag，使T3g Lua涉及的key落在同一slot。owner目录直接保存在lease hash的`owner/addr/fence`字段，不存在独立`owner:{sid}` key。`evt`是瞬时Pub/Sub channel，不是持久清理domain；`purge`是无TTL、无正文的永久防复活marker。`REDIS_NAMESPACE_ID + REDIS_PREFIX`的SHA-256是rollout/restore身份承诺，URL故意不进入digest，因此operator必须保证它唯一、准确地代表logical cluster/database/prefix。未来的`quota:{scope}:{id}`、`keypool:{provider}`、`mcp:catalog:{principal}:{serverId}`仍是目标态且不属于T3g；幂等completed receipt是MySQL业务真相，不在Redis预留。
@@ -601,6 +608,8 @@ agent-service/
 | **M4 生产化**（原始估算 2–3 周，非当前承诺） | 配额/key 池/熔断；OTel + 指标；压测（单进程并发 turn 上限实测）；Streams 分片；VM 独立进程发布包与容器/k8s 交付；重池/exec-server 设计评审 | 单 runner 1,000 并发 turn 压测报告；`prompt_cache_hit_ratio` 面板；混沌测试（Redis 抖动、厂商 5xx）；VM/容器两种形态的同协议发布与回滚验收 |
 
 当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038～0042再依次补新write membership、T3f owner closure、T3d source/观察目标/逐artifact目录；0043/0044只补本地候选复核与不可扩权pre-grant intent/claim。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry delete/restore/retention、operator activation与任意业务事务crash-atomic dual-write仍缺失。物理backup producer、真实provider/KMS、generic user purge及全域completion也未闭环，所以M1尚未冻结；M3尚未正式开始，M4主体和云环境验收尚未开始。
+
+0045～0048增加的外部观察器与v3非生产journal不改变上述执行判定；0049的capture v2 control/coverage/binding仍被SQL硬拒，0050普通DELETE只封存post-COMMIT 30天保留下限，不开放自动物理清理。用户已选择M4同时交付独立VM进程发布包和Linux OCI镜像；当前仍只有两个候选OCI镜像、没有可校验VM发布包，也没有真实staging/production资源验收。
 
 ---
 

@@ -277,7 +277,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // The latest 0044 fingerprint covers all 126 triggers, including this 0037 guard.
         await expect(MysqlSessionStore.connect({
           url: f.url, tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toThrow("0044 pregrant intent fingerprint verification failed");
+        })).rejects.toThrow("0049 capture v2 fingerprint verification failed");
       } finally {
         await f.close();
       }

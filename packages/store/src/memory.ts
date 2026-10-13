@@ -22779,6 +22779,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       "session.purge", sessionId, tombstone.deletionGeneration,
     ));
     if (lastEvent?.type !== "session/deleted"
+      || lastEvent.sessionId !== sessionId
       || lastEvent.deletionGeneration !== tombstone.deletionGeneration
       || lastEvent.seq !== session.lastSeq
       || tombstoned?.topic !== "session.tombstoned"

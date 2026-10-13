@@ -202,5 +202,14 @@ describe("ordinary session DELETE grace MemoryStore", () => {
     await expect(store.sealOrdinarySessionDeleteGrace(
       session.tenantId, session.userId, session.id,
     )).rejects.toThrow(/source is invalid/);
+    purge.availableAtMs = undefined;
+    const events = (store as unknown as {
+      events: Map<string, Array<{ sessionId: string }>>;
+    }).events.get(session.id);
+    if (!events?.length) throw new Error("missing terminal event fixture");
+    events[events.length - 1]!.sessionId = "another-session";
+    await expect(store.sealOrdinarySessionDeleteGrace(
+      session.tenantId, session.userId, session.id,
+    )).rejects.toThrow(/terminal source is invalid/);
   });
 });

@@ -16,9 +16,11 @@
 
 `0044`完成版本化来源绑定的第一步：新增默认休眠、逐artifact的content-free pre-grant intent/claim。Memory以同步原子边界、MySQL以RR事务独立重验当前0039～0042、T3f grave和T1/hold/control/restore等本地来源；0043只读候选不能直接充当授权。intent绑定精确artifact group与来源receipt，claim按同一key/version CAS、DB-time lease及一次性token hash串行化；MySQL写入后若lease已过期会整事务回滚。`grantReady=false`固定，0037 grant硬拒、0042 logs/traces blocker、产品外部mutation/restore及全域completion不变。`0044`独立migration只增加两张账本表、guards与严格126-trigger启动指纹，不回填旧terminal、不联网或激活；升级需先排空旧writer，独立迁移后只运行0044-aware进程。历史升级夹具是在真实MySQL上的SQL-shaped 0042状态，不等同于冻结旧binary生成的非空terminal。完整本地verify与推送后CI以[进度记录](docs/PROGRESS.md)最后一节为准。
 
+`0045`/`0046`分别增加默认未接入产品路径、只执行GET的v2 grant-journal sealed-chain观察器和telemetry artifact对象观察器；观察到链或精确data/tombstone也不证明DB grant、物理ACK或恢复围栏。`0047`提供独立v3 disposition事件链及S3 CAS-head的**显式非生产夹具**，`0048`再增加只读v3 sealed-chain观察器；这些代码不替代0036/0037产品硬拒，也不会在普通启动中读写外部对象。`0049`新增default-dormant的persisted provider-step failure capture v2结构：logs控制保持inactive/generation 0、traces无producer，coverage与逐write source binding都由SQL guard硬拒；未来source session/turn/item仅可用tenant-bound、kind-separated keyed HMAC ref，不保存原始ID。三张表、13个新增guard及严格139-trigger指纹不激活producer、不回填v1或授予删除权；新T3d/T3f遇active或异常v2 footprint会fail closed。升级须先排空pre-0049 writer再独立迁移。`0050`只为**新普通session DELETE**建立30天宽限期的来源与post-COMMIT数据库时间floor：首事务把来源与tombstone/event/outbox原子写到session行，第二事务封存不早于commit后观测时刻加30天的下限；旧/erasure/legacy删除仍为unknown。尚无自动恢复调度或物理清理，`purge_after_ms`仍为`NULL`，`session.purge`仍不可领取。完整验证与CI状态以[进度记录](docs/PROGRESS.md)最新一节为准。
+
 测试分为纯单元/HTTP/假厂商、MySQL/Redis 集成、多进程集群和显式启用的真实模型 E2E；准确数量和覆盖率以当前 CI 输出为准，避免在 README 固化易过期数字。
 
-后续交付决策：普通 session DELETE 按30天内容宽限期实现，自动物理清理默认关闭（当前`purge_after_ms`仍为`NULL`）；M4同时提供router/runner独立VM进程发布包和Linux OCI镜像。两种生产部署形态尚未交付或验收，详见[本地开发与CI指南](docs/operations/development-and-ci-guide.md)。
+交付决策：普通 session DELETE 已按30天建立默认休眠的保留证据，自动物理清理仍关闭（`purge_after_ms`仍为`NULL`）；M4同时提供router/runner独立VM进程发布包和Linux OCI镜像。两种生产部署形态尚未交付或验收，详见[本地开发与CI指南](docs/operations/development-and-ci-guide.md)。
 
 ## 本机运行
 
@@ -70,7 +72,7 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0042 → 0044 的真实 MySQL 历史升级夹具（0043 code-only）
+pnpm test:migrations                          # 固定 0007 → 0008 → ... → 0042 → 0044 → 0049 → 0050 的真实 MySQL 历史升级夹具（0043/0045～0048 code-only）
 # 以下单独列出的 S3 套件需先配置各自的 S3_TEST_* 测试环境；本地优先用 verify-s3 自动准备 MinIO 与 bucket。
 pnpm test:tenant-telemetry-lifecycle          # 0032/0033 content-free evidence helper
 pnpm test:tenant-telemetry-lifecycle-memory   # 0033 Memory activation/coverage/inventory原子语义
@@ -82,14 +84,19 @@ pnpm test:tenant-telemetry-application-capture       # 0035 per-domain capture/M
 pnpm test:tenant-telemetry-application-capture-mysql # 0035真实InnoDB activation/coverage/binding/并发/回滚套件
 pnpm test:tenant-telemetry-disposition        # 0036默认休眠/Memory/非生产S3协议及故障注入
 pnpm test:tenant-telemetry-disposition-mysql  # 0036真实InnoDB激活事务回滚、并发与启动指纹
-pnpm test:tenant-telemetry-disposition-s3     # 0036真实MinIO独立journal CAS协议，需第五个测试bucket
+pnpm test:tenant-telemetry-disposition-s3     # 0036非生产journal CAS及0045 GET-only v2观察器，需第五个测试bucket
 pnpm test:tenant-telemetry-disposition-grant       # 0037非生产v2 grant-bound Memory journal协议；无产品mutation
 pnpm test:tenant-telemetry-disposition-grant-mysql # 0037真实InnoDB grant硬拒/trigger轮换/启动指纹
+pnpm test:tenant-telemetry-disposition-journal-v3 # 0047非生产v3事件链与S3 adapter unit夹具
+pnpm test:tenant-telemetry-disposition-journal-v3-observer # 0048 GET-only v3 sealed-chain观察器unit套件
+pnpm test:tenant-telemetry-artifact-observer # 0046 GET-only artifact观察器unit套件
+pnpm test:session-delete-grace-memory         # 0050 ordinary DELETE来源/30天floor Memory原子与回滚套件
+pnpm test:session-delete-grace-mysql          # 0050真实InnoDB post-COMMIT seal、并发/回滚/隔离套件
 pnpm test:blob-mysql                          # 强制执行并验明 ownership/绑定/cleanup 的真实 MySQL 专项套件
 pnpm test:blob-storage-control-memory         # 强制执行 0027 Memory write-once cutover/回滚/并发套件
 pnpm test:blob-storage-control-mysql          # 强制执行 0027 真实InnoDB inventory/回滚/并发套件
 pnpm test:blob-storage-migration-mysql-s3     # 强制执行 0028 真实MySQL + MinIO离线搬迁/回滚/重放套件
-scripts/local-service.sh verify-s3            # 真实S3协议、0028 mover、Blob应用装配、0034/0036 telemetry S3 required suites及dormant-schema检查
+scripts/local-service.sh verify-s3            # 真实S3协议、0028 mover、Blob应用装配、telemetry writer/observer/v3非生产fixture必执行套件及dormant-schema检查
 pnpm test:usage-lifecycle-mysql               # 强制执行 usage 双写/核对/匿名化真实 MySQL 专项套件
 pnpm test:subject-lifecycle-mysql             # 强制执行 subject gate/回滚/并发真实 MySQL 专项套件
 pnpm test:tenant-credential-revocation-mysql  # 强制执行 tenant 原子 fence、status proof、回滚、隔离和写入 race 真实 MySQL 套件
