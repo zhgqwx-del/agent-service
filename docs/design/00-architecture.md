@@ -1,6 +1,8 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> M4独立VM目录发布包候选复用现有六个Node24 ESM入口，附带完整production依赖、严格manifest及Linux非root systemd样例，不新增长期服务或镜像。实际依赖闭包含esbuild原生程序，目录包绑定Linux/macOS与x64/arm64，不能把JS应用等同跨OS通用闭包或独立ELF程序；`productionAccepted=false`固定。构建从冻结Git/copy-once源码进行，验真还要求独立可信摘要与匹配host；帮助/服务入口以真实文件身份识别current/path alias。实际双包/类型/必跑测试及完整验收状态只看PROGRESS，schema发布、生产无DDL账号、归档/签名/晋级及真实环境验收仍缺，M1不冻结/M3不开始。
+> 当前候选覆盖说明（2026-10-14）：M4目录d33完整verify与归档632的335定向/clean双tar装配分别已有本地证明；0054已与M4在本地集成，11个具名真实文件245 passed、零failed/skip（含当前521b SQL历史14例）。首次集成整树verify 31128却退出1：旧grant测试期待0053指纹错误，实际0054严格指纹已正确拒绝篡改；精确oracle修订后仍须从头完整重验，不能把245定向当整树成功。本批未推送、无新Linux CI或生产验收。0054只给同primary epoch、creation-complete新tenant、T1前全written/ACK且全部Blob/export域零的v2来源建立保留式本地删除桥；旧/未知来源、非零外部目标、新epoch恢复、0037 grant与外部处置不因此开放。四个协议false字段、default-off、M1未冻结/M2冻结/M3未开始不变。下文旧版本边界和历史表按其版本理解，最新结果只看PROGRESS顶部及末节。
+
+> M4独立VM目录发布包候选复用现有六个Node24 ESM入口，附带完整production依赖、严格manifest及Linux非root systemd样例，不新增长期服务或镜像。实际依赖闭包含esbuild原生程序，目录包绑定Linux/macOS与x64/arm64，不能把JS应用等同跨OS通用闭包或独立ELF程序；`productionAccepted=false`固定。构建从冻结Git/copy-once源码进行，验真还要求独立可信摘要与匹配host；帮助/服务入口以真实文件身份识别current/path alias。实际双包/类型/必跑测试及完整验收状态只看PROGRESS，schema发布、生产无DDL账号、签名/晋级及真实环境验收仍缺，M1不冻结/M3不开始。
 
 > 本地MySQL逻辑备份/旧restore CLI现接受保护的exact ref-key文件，供0033 active source/target startup audit使用；missing/wrong key仍安全拒绝。实际active0033组合证明只看PROGRESS，不能借inactive旧17例外推；active0053 capture与恢复后的新epoch尚不兼容，必须fail closed，不得自动rebind。
 
@@ -627,9 +629,9 @@ agent-service/
 | **M3 扩展性**（2–3 周） | 远程 MCP 注册与桥接；skills 上传/注入/guard；hooks/middleware + webhook hook；动态工具反向委托 | MCP 工具在 turn 中被调用并落 item；skill 目录注入去重；hook 超时 fail-open/closed 行为；SSRF 用例被拒 |
 | **M4 生产化**（原始估算 2–3 周，非当前承诺） | 配额/key 池/熔断；OTel + 指标；压测（单进程并发 turn 上限实测）；Streams 分片；VM 独立进程发布包与容器/k8s 交付；重池/exec-server 设计评审 | 单 runner 1,000 并发 turn 压测报告；`prompt_cache_hit_ratio` 面板；混沌测试（Redis 抖动、厂商 5xx）；VM/容器两种形态的同协议发布与回滚验收 |
 
-当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038～0042再依次补新write membership、T3f owner closure、T3d source/观察目标/逐artifact目录；0043/0044只补本地候选复核与不可扩权pre-grant intent/claim。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry delete/restore/retention、0035 v1 operator activation与任意业务事务crash-atomic dual-write仍缺失；已发布0053仅提供真实provider-step失败的受控本地v2 logs operator。本地加密MySQL逻辑backup producer已实现，但active0053新epoch恢复、backup-copy erasure、真实provider/KMS、generic user purge及全域completion仍未闭环，所以M1尚未冻结；M3尚未正式开始，M4主体尚未完成（目标平台VM目录包已有本地证明，归档仍在验证），云环境验收尚未开始。
+当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038～0042再依次补新write membership、T3f owner closure、T3d source/观察目标/逐artifact目录；0043/0044只补本地候选复核与不可扩权pre-grant intent/claim。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry delete/restore/retention、0035 v1 operator activation与任意业务事务crash-atomic dual-write仍缺失；已发布0053仅提供真实provider-step失败的受控本地v2 logs operator。本地加密MySQL逻辑backup producer已实现，但active0053新epoch恢复、backup-copy erasure、真实provider/KMS、generic user purge及全域completion仍未闭环，所以M1尚未冻结；M3尚未正式开始，M4主体尚未完成（VM目录与受限tar/独立工具已有本地候选证明，整合后完整验收与新Linux CI仍待），云环境验收尚未开始。
 
-0045～0048增加的外部观察器与v3非生产journal不改变上述执行判定；0049原始阶段的capture v2 control/coverage/binding被SQL硬拒；后续0053另以独立guard轮换支持受控本地logs，不开放traces或外部处置。0050普通DELETE只封存post-COMMIT 30天保留下限，后续默认关闭的runner恢复caller也只补可信未seal来源；0051以SQL trigger冻结已存在origin/seal，但不强制旧writer双写或开放自动物理清理。用户已选择M4同时交付独立VM进程发布包和Linux OCI镜像；两个候选OCI镜像已有CI构建/启动门禁，Node24目标平台目录包已完成macOS arm64双包验真与真实进程检查，受限tar归档和独立验真工具仍在本地开发。新VM代码尚未获得Linux CI或生产许可，签名/晋级、受控schema发布、托管运行及真实staging/production资源验收仍未完成。
+0045～0048增加的外部观察器与v3非生产journal不改变上述执行判定；0049原始阶段的capture v2 control/coverage/binding被SQL硬拒；后续0053另以独立guard轮换支持受控本地logs，不开放traces或外部处置。0050普通DELETE只封存post-COMMIT 30天保留下限，后续默认关闭的runner恢复caller也只补可信未seal来源；0051以SQL trigger冻结已存在origin/seal，但不强制旧writer双写或开放自动物理清理。用户已选择M4同时交付独立VM进程发布包和Linux OCI镜像；两个候选OCI镜像已有CI构建/启动门禁，Node24目标平台目录包已完成macOS arm64双包验真与真实进程检查，受限tar归档和独立验真工具候选已通过335定向与clean双tar真实装配，但不是签名、晋级或生产许可。新VM代码尚未获得Linux CI或生产许可，签名/晋级、受控schema发布、托管运行及真实staging/production资源验收仍未完成。
 
 ---
 

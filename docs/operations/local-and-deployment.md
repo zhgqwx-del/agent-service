@@ -1,6 +1,8 @@
 # 本地运维与后续部署契约
 
-当前阶段以本机可重复运行和自动验证为目标；预发、生产资源就绪后，再把相同的环境变量契约映射到独立云服务器或 Kubernetes Secret、ConfigMap 和 Service。M4同时支持虚拟机独立进程与容器镜像两种部署形态，复用router/runner协议和构建入口；Node24进程目录发布包地基正在本地验证，实际结果以PROGRESS为准。完整归档/签名/晋级、受控schema发布、进程/容器托管及真实环境验收仍未完成。
+> 当前候选覆盖说明（2026-10-14）：M4目录d33完整verify与归档632的335定向/clean双tar装配分别已有本地证明；0054已与M4在本地集成，11个具名真实文件245 passed、零failed/skip（含当前521b SQL历史14例）。首次集成整树verify 31128却退出1：旧grant测试期待0053指纹错误，实际0054严格指纹已正确拒绝篡改；精确oracle修订后仍须从头完整重验，不能把245定向当整树成功。本批未推送、无新Linux CI或生产验收。0054只给同primary epoch、creation-complete新tenant、T1前全written/ACK且全部Blob/export域零的v2来源建立保留式本地删除桥；旧/未知来源、非零外部目标、新epoch恢复、0037 grant与外部处置不因此开放。四个协议false字段、default-off、M1未冻结/M2冻结/M3未开始不变。下文旧版本边界和历史表按其版本理解，最新结果只看PROGRESS顶部及末节。
+
+当前阶段以本机可重复运行和自动验证为目标；预发、生产资源就绪后，再把相同的环境变量契约映射到独立云服务器或 Kubernetes Secret、ConfigMap 和 Service。M4同时支持虚拟机独立进程与容器镜像两种部署形态，复用router/runner协议和构建入口；Node24进程目录发布包地基正在本地验证，实际结果以PROGRESS为准。受限归档已有本地候选实现和clean装配证明；签名/晋级、受控schema发布、进程/容器托管及真实环境验收仍未完成。
 
 ## VM 进程发布包地基
 
@@ -21,7 +23,7 @@ clean构建从精确Git commit的blob复制输入到独立快照；工作树实�
 
 manifest记录源码commit、lock/实际输入摘要、构建Node/pnpm/platform、严格target runtime与完整文件/软链接/目录权限清单；强制拒绝路径逃逸、敏感配置/私钥/数据库文件、特殊文件及特殊权限位。真实production闭包包括esbuild原生程序，不能声称跨OS/CPU通用；必须在目标Linux/macOS及x64/arm64环境构建，验真与运行主机也须匹配。native检查只核对有界ELF64/MachO64 header、program/load-command/segment结构、目标OS/CPU与完整文件摘要，截断、越界、未知/Windows格式或错误架构仍拒绝；这不是任意unsafe-native开关，也不是完整loader、NAPI/libc兼容或厂商真实性证明。实际功能须另经plain Node装配验证。第三方SDK合法`credentials`代码目录不能被误当密钥文件，但其每个后代仍完整检查，真实同名credentials文件/软链接及`.env`等继续拒绝。未来新增依赖须重新审查。发布输出不含`.env`，构建子进程不继承应用key/数据库/模型配置且不回显任意诊断。
 
-验真复用`scripts/lib/vm-release.mjs`的`verifyVmReleaseDirectory(directory, role, trustedManifestSha256)`，摘要从独立可信构建/晋级渠道取得，不能把包内自算摘要当认证。同一目录、manifest和完整依赖闭包应保持不变后再晋级，目标环境不运行pnpm或重新构建。目录清单不是归档签名、跨平台确定性构建或生产许可；`productionAccepted=false`固定。受限tar运输与Node24独立工具正在本地验证，签名、registry/promotion job及自动安装器仍未实现。
+验真复用`scripts/lib/vm-release.mjs`的`verifyVmReleaseDirectory(directory, role, trustedManifestSha256)`，摘要从独立可信构建/晋级渠道取得，不能把包内自算摘要当认证。同一目录、manifest和完整依赖闭包应保持不变后再晋级，目标环境不运行pnpm或重新构建。目录清单不是归档签名、跨平台确定性构建或生产许可；`productionAccepted=false`固定。受限tar运输与Node24独立工具已有本地候选、335定向与clean双tar装配证明；签名、registry/promotion job及自动安装器仍未实现，整合后完整验证和新Linux CI尚待。
 
 ### 受限 tar 与独立工具（候选，验证状态见 PROGRESS）
 
@@ -547,7 +549,7 @@ pnpm maintenance:backup-catalog -- restore-selected
 5. 接入真实 IdP、日志、指标和告警后再开放预发流量。
 6. 生产环境重复同一流程，不复用 staging 的数据库、Redis、密钥或 service key。
 
-目标日常交付采用共同的前半段：本地开发与 `verify` → CI 全部门禁 → 同一次构建产生受控交付物 → staging 验收 → 将同一交付物身份晋级 production。容器形态分别按 router/runner 不可变 image digest 晋级；VM 形态分别按 router/runner 完整 Node 24 发布归档的校验和与发布包身份晋级，不在环境中重新安装依赖或重新打包。两种形态都不共享 staging/production 的数据库、Redis、对象存储、密钥或 service key；环境差异只来自受控配置和 Secret。当前 CI 只以 `load: true` 临时构建并启动候选镜像，没有 registry push、签名、持久 digest、可校验 VM 发布归档或 promotion job；这些仍是 M4/云资源就绪后的交付缺口。
+目标日常交付采用共同的前半段：本地开发与 `verify` → CI 全部门禁 → 同一次构建产生受控交付物 → staging 验收 → 将同一交付物身份晋级 production。容器形态分别按 router/runner 不可变 image digest 晋级；VM 形态分别按 router/runner 完整 Node 24 发布归档的校验和与发布包身份晋级，不在环境中重新安装依赖或重新打包。两种形态都不共享 staging/production 的数据库、Redis、对象存储、密钥或 service key；环境差异只来自受控配置和 Secret。容器job当前仍以 `load: true` 临时构建并启动候选镜像；VM受限tar与独立工具已在本地候选实现，CI候选也增加其验真与artifact留存步骤，但本批尚未获得新Linux CI结果。registry push、可信签名/attestation、持久交付身份的staging→production promotion与受控安装仍未实现，不应把这些缺代码项归成只等云资源。
 
 tombstone 是 protocol family `2026-10-08` 内的 additive capability；它没有为这次扩展提升 exact protocol version。router 不把 DELETE 发到旧公开路径，而是改写成带内部 token 的版本化 POST，并要求新 runner 回 ACK；即使错误地把共享 LB URL 配成 target 且探测/请求落到不同 Pod，旧 runner 也只会 404，不会执行旧删除语义。正确拓扑仍要求 `RUNNERS` 一项对应一个稳定实例。安全 rollout 顺序是：先在 API gateway 暂停精确 session DELETE（或把流量整体切到新 router 池）→ 发布新 router 且保持 `SESSION_TOMBSTONE_ENABLED=0` → 排空全部旧 router → 滚动新 runner → 核对配置中的每个健康 runner 都声明 `tombstone` → 将新 router 的 gate 设为 `1`。显式 gate、内部 token 与 router 的全健康 fleet capability 检查必须同时满足；升级窗口中其它 API 可继续提供，DELETE 返回可重试 `503 draining`。仅逐个替换 router 而不先阻断旧 router 的 DELETE 并不安全，因为旧进程没有这个 gate；runner 端口也必须通过网络策略保持内网不可直连。
 

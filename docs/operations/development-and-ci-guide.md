@@ -1,8 +1,10 @@
 # 本地开发、手动体验与 CI 构建指南
 
+> 当前候选覆盖说明（2026-10-14）：M4目录d33完整verify与归档632的335定向/clean双tar装配分别已有本地证明；0054已与M4在本地集成，11个具名真实文件245 passed、零failed/skip（含当前521b SQL历史14例）。首次集成整树verify 31128却退出1：旧grant测试期待0053指纹错误，实际0054严格指纹已正确拒绝篡改；精确oracle修订后仍须从头完整重验，不能把245定向当整树成功。本批未推送、无新Linux CI或生产验收。0054只给同primary epoch、creation-complete新tenant、T1前全written/ACK且全部Blob/export域零的v2来源建立保留式本地删除桥；旧/未知来源、非零外部目标、新epoch恢复、0037 grant与外部处置不因此开放。四个协议false字段、default-off、M1未冻结/M2冻结/M3未开始不变。下文旧版本边界和历史表按其版本理解，最新结果只看PROGRESS顶部及末节。
+
 本文是理解和操作当前 `agent-service` 的长期维护入口，回答三类问题：本地需要启动什么、怎样手动体验、GitHub Actions 实际构建和验证什么。
 
-快速入口：想马上看到系统运行，依次看[一次性准备](#2-一次性准备)、[启动与停止](#3-启动与停止完整本地栈)、[手动体验 API](#5-手动体验-agent-runtime)；想理解交付物，看[本地进程与构建产物](#7-本地源码进程与生产构建产物)、[GitHub Actions](#8-github-actions-构建与验证)和[环境晋级语义](#9-从本地到未来生产的交付语义)。目前 CI 只构建并测试两个 Linux OCI 镜像，不会推送到 registry，也尚无可直接用于预发/生产的签名、SBOM、digest 晋级或部署清单。
+快速入口：想马上看到系统运行，依次看[一次性准备](#2-一次性准备)、[启动与停止](#3-启动与停止完整本地栈)、[手动体验 API](#5-手动体验-agent-runtime)；想理解交付物，看[本地进程与构建产物](#7-本地源码进程与生产构建产物)、[GitHub Actions](#8-github-actions-构建与验证)和[环境晋级语义](#9-从本地到未来生产的交付语义)。已发布0053的CI构建并测试两个Linux OCI镜像；本地集成候选已新增VM目录/受限tar/独立工具的必跑测试、双服务smoke与artifact步骤，尚无本批新Linux CI结果。仍不推送registry，也没有可直接用于预发/生产的可信签名、SBOM、digest晋级或完整部署清单。
 
 里程碑完成度以 `docs/PROGRESS.md` 顶部快照和最后一节为准；本文只描述操作方式和交付产物，不替代进度记录。
 
@@ -1607,7 +1609,7 @@ agent-service/agent-router:ci
 
 M4候选现在增加`package:vm`、`test:vm-release`和`check:vm-release`，详细命令及安全边界见[VM进程发布包地基](local-and-deployment.md#vm-进程发布包地基)。VM目录包含同一router/runner JavaScript bundle、完整production依赖、迁移和对应systemd样例；容器镜像还封装Node与Linux文件系统。VM目标主机必须另有Node24，不能只复制一个`.js`文件或在目标上重新装依赖。
 
-应用本身不是独立ELF二进制，但真实production闭包中存在esbuild原生程序。因此VM包按Linux/macOS与x64/arm64构建和验真，不能把本机macOS包直接部署到Linux；Linux构建由Linux环境完成。常驻服务仍只有router与runner，runner四个维护CLI不变成新服务。`publishable=true`只表示清洁commit构建的可追溯候选，不是生产许可；`productionAccepted=false`固定，Windows/systemd实机验收及完整归档/签名/环境晋级仍缺。
+应用本身不是独立ELF二进制，但真实production闭包中存在esbuild原生程序。因此VM包按Linux/macOS与x64/arm64构建和验真，不能把本机macOS包直接部署到Linux；Linux构建由Linux环境完成。常驻服务仍只有router与runner，runner四个维护CLI不变成新服务。`publishable=true`只表示清洁commit构建的可追溯候选，不是生产许可；`productionAccepted=false`固定，Windows不在当前受支持target集合，systemd实机验收、签名/环境晋级仍缺；受限tar归档已有本地候选实现与clean装配证明。
 
 候选CI与本地verify分别新增必执行安全/快照测试和真实双发布目录plain Node smoke；CI要求clean commit，本地verify允许copied-byte dirty开发快照。该smoke使用独立临时目录及memory后端，不加载`.env`、触达MySQL/模型或安装服务。两包commit、实际输入/lock摘要必须一致；运行后重验完整清单未改变。新门禁仅在后续候选提交推送后执行，不属于已推送0053的Actions run，也不能用旧CI成功替代。实际单元通过、打包失败/修正及最终装配状态均以PROGRESS末节为准。
 
@@ -1629,9 +1631,9 @@ M4候选现在增加`package:vm`、`test:vm-release`和`check:vm-release`，详�
 
 staging/production 不重新编译镜像。环境差异只通过受控配置和 Secret 注入；两个环境不共享 MySQL、Redis、对象存储、密钥或 service key。
 
-VM形态须在同一次CI构建中分别形成router/runner完整发布归档，固定Node24 target runtime、production dependencies、迁移文件及每个文件校验和/发布包身份；staging验证后，将**同一发布包身份和校验和**晋级production，不在环境中重新安装依赖或重新打包。目标平台目录包已有本地证明，受限tar及独立Node24工具正在验证；工具必须先经独立可信tool摘要验证，归档与manifest同样使用外部可信摘要，包内sidecar不能自认证。候选CI artifact只保存测试通过的字节，不等于签名、生产许可或已实施晋级。systemd托管、进程排空与一次性迁移入口仍须独立发布/验收；见[VM发布包契约](local-and-deployment.md#vm-进程发布包地基)。
+VM形态须在同一次CI构建中分别形成router/runner完整发布归档，固定Node24 target runtime、production dependencies、迁移文件及每个文件校验和/发布包身份；staging验证后，将**同一发布包身份和校验和**晋级production，不在环境中重新安装依赖或重新打包。目标平台目录包及受限tar/独立Node24工具已有本地候选证明，整合后完整验收与新Linux CI尚待；工具必须先经独立可信tool摘要验证，归档与manifest同样使用外部可信摘要，包内sidecar不能自认证。候选CI artifact只保存测试通过的字节，不等于签名、生产许可或已实施晋级。systemd托管、进程排空与一次性迁移入口仍须独立发布/验收；见[VM发布包契约](local-and-deployment.md#vm-进程发布包地基)。
 
-用户选择M4同时提供两种交付形态：容器按router/runner Linux OCI同一digest晋级；虚拟机用相同六个应用入口（runner main与四one-shot、router main）和受控Node24 runtime，两个服务独立运行。两者复用协议、迁移门禁、配置/Secret与验收。VM目录验真已实现，归档运输仍在验证；进程托管/滚动与容器签名、部署清单、环境晋级仍待M4，不能把源码开发脚本、单平台本地目录包或CI测试镜像当成生产验收完成。归档工具是离线发布工具，不是新增产品daemon或镜像。
+用户选择M4同时提供两种交付形态：容器按router/runner Linux OCI同一digest晋级；虚拟机用相同六个应用入口（runner main与四one-shot、router main）和受控Node24 runtime，两个服务独立运行。两者复用协议、迁移门禁、配置/Secret与验收。VM目录验真和受限归档运输均已有本地候选实现与真实装配证明；进程托管/滚动与容器签名、部署清单、环境晋级仍待M4，不能把源码开发脚本、单平台本地目录包或CI测试镜像当成生产验收完成。归档工具是离线发布工具，不是新增产品daemon或镜像。
 
 这仍是目标流程，不是当前可直接执行的生产部署手册。现有runner连接默认会应用schema migration，而严格启动检查又依赖读取MySQL trigger元数据；本机MySQL 8.0.26实测`SELECT`-only账号无法通过`INFORMATION_SCHEMA.TRIGGERS`或definer view看到已有trigger，授予`TRIGGER`则也能删除它。M4还须先以受限definer procedure等可信只读桥接完成无DDL账号的严格指纹校验和真实MySQL回归，再交付独立一次性schema-migrate Job、生产verify-only启动及镜像入口。没有这些门禁和真实环境资源时，不应把当前CI镜像直接称为已完成的staging/production部署方案；详见[部署契约](local-and-deployment.md)。
 
@@ -1723,7 +1725,9 @@ T3g的恢复能力需保持精确表述：same-MySQL projection只枚举已经�
 
 当前ordinary user erasure/compensation/evaluator继续停在不可执行策略边界；export可生成、下载和清理临时制品。tenant T1/T2提供逻辑fence，T3a删除本地DB credential material，T3b证明configured fleet drain，T3c证明DB-time owner结构，T3d封存33域plan，T3e完成local operational usage与Blob/export子集及physical ACK，T3f清理11个本地数据库投影并留下永久session grave，T3g再清理session-scoped Redis lease/owner、fence与stream并写永久marker；`0027`提供共享Blob对象协议与namespace cutover，`0028`提供离线filesystem→S3搬迁账本、runtime gate与一次性CLI，`0029`提供default-dormant external-target协议、Memory fake和真实MySQL账本，`0030`提供独立T1 journal、runtime lineage、永久恢复fence与one-shot replay，`0031`提供权威backup catalog、snapshot lineage、retention、restore source binding和永久epoch reservation，`0032`提供safe structured telemetry/trace入口，`0033`提供default-dormant原子activation/coverage/artifact inventory store，`0034`提供payload-before-sink writer spool、reservation、Memory/MySQL/HTTP/filesystem/S3协议和ACK基座，`0035`提供分域application capture authority，`0036`新增default-dormant disposition迁移/原子control与非生产S3协议夹具，`0037`只新增grant hard-deny trigger/指纹与非生产v2 Memory协议，`0038`仅给新受管write新增不可变逐项membership/source sidecar，`0039`仅让新T3f同事务封存本地owner-closure entry/aggregate，`0040`～`0042`让新T3d同事务封存telemetry来源、观察目标与逐artifact精确plan目录，`0043`只读诊断本地来源候选，`0044`只封存默认休眠的source-bound pre-grant intent/claim。0029没有真实provider adapter，KMS固定未完成；0030/0031仍有单target、人工ACK和跨MySQL/S3 saga等已知边界；本地加密MySQL逻辑producer已实现，backup-copy erasure、联合旧快照恢复与真实故障域验收仍缺；0035当前只接单一provider failure logs contract；0053只新增本地受控v2 logs capture operator，仍没有traces producer或0036～0044外部delete/restore/retention executor。公开status仍为`gated`、`dataPurgeExecution=false`。backup内tenant erasure与其它domain恢复证据、logs/traces完整执行生命周期、managed对象存储/IAM环境验收、完整生产backup/restore、completion及generic user物理purge也尚未闭环；所以staging/production的相关admission/execution/worker gate默认都保持`0`，0031 control保持inactive且telemetry control保持generation 0，只有完成对应环境验收和后续实现才逐项激活。
 
-没有云资源时，仍可完成业务代码、协议、迁移、Memory/MySQL/Redis实现、filesystem与S3-compatible Blob/telemetry行为、本地MinIO/多进程/容器测试、故障注入、指标定义和部署契约；本地加密MySQL逻辑backup producer和显式导入已经实现。没有云账号不解释当前grant返回零授权、active0053阻断T3d/T3f、user停在`awaiting_purge_policy`或`session.purge`不可领取：这些仍需产品实现，不能归为仅待环境验收。
+没有云资源时，仍可完成业务代码、协议、迁移、Memory/MySQL/Redis实现、filesystem与S3-compatible Blob/telemetry行为、本地MinIO/多进程/容器测试、故障注入、指标定义和部署契约；本地加密MySQL逻辑backup producer和显式导入已经实现。没有云账号不解释当前grant返回零授权、已发布0053下缺受控桥时阻断T3d/T3f、user停在`awaiting_purge_policy`或`session.purge`不可领取：这些仍需产品实现，不能归为仅待环境验收。
+
+本表保留0053阶段的缺口分类原文。表中v2来源保留链已有上方所述0054本地有限候选，不再是“尚无实现”；它不覆盖mixed application-v1、未知/旧tenant、非零Blob/export、显式新epoch恢复、可信grant或实际telemetry处置，后续各项仍须独立实现和验收。
 
 | 本地/CI仍须实现的闭环 | 不应冒充的完成证明 |
 | --- | --- |
@@ -1733,7 +1737,7 @@ T3g的恢复能力需保持精确表述：same-MySQL projection只枚举已经�
 | generic session/user内容purge及child-first执行/恢复/完成审计 | 30天floor与ordinary operational usage retention不是内容purge |
 | backup-copy责任/保留、受policy/hold约束的实际到期删除、durable intent和物理不存在ACK | 共享backup仍保留时不能称其字节已物理删除；内容30天不自动套用到backup/billing/audit |
 
-仍须等待真实环境验收的是managed IAM/private access、真实KMS权限/TLS/轮换、独立journal/catalog/sink故障域、云端备份复制/PITR、真实容量与锁等待、staging/production RPO/RTO和发布演练、IdP及真实Redis Cluster/ACL/persistence/failover等。对应adapter、配置契约和本地故障代码应先实现；不能把缺代码统称为M4云验收。仓库不编造Kubernetes、域名/TLS、bucket、telemetry backend或Secret参数；本地MinIO协议与加密逻辑backup也不证明独立故障域、完整生产DR或日志/追踪删除。下一批先完成同primary epoch、新tenant且全部v2 write在T1前ACK的来源保留式本地删除链，restore/new epoch和其它历史gap继续拒绝；后续再闭合显式恢复与外部处置。该顺序是规划，不是已交付能力。
+仍须等待真实环境验收的是managed IAM/private access、真实KMS权限/TLS/轮换、独立journal/catalog/sink故障域、云端备份复制/PITR、真实容量与锁等待、staging/production RPO/RTO和发布演练、IdP及真实Redis Cluster/ACL/persistence/failover等。对应adapter、配置契约和本地故障代码应先实现；不能把缺代码统称为M4云验收。仓库不编造Kubernetes、域名/TLS、bucket、telemetry backend或Secret参数；本地MinIO协议与加密逻辑backup也不证明独立故障域、完整生产DR或日志/追踪删除。此前列为“下一批”的同primary epoch、新tenant且全部v2 write在T1前ACK的来源保留式本地链现已形成0054候选，并在全部Blob/export计划域为零的范围内通过具名定向验证；本集成树首次整树verify因精确旧错误字符串oracle退出1，修订后完整重验与新CI仍待，故不是已发布能力。restore/new epoch、其它历史gap、可信grant和外部处置继续拒绝，不能把剩余实现写成只等云验收。
 
 当前T3d全库RR/next-key扫描可能在规模下造成写阻塞/死锁、lease和容量压力，必须在staging用真实索引与数据量做锁超时/容量验证。结构损坏的queued job在逐候选隔离前可能饿死后续job，cursor重启还会重扫损坏前缀，但fail-closed且不会产生plan receipt或执行权，M4应增raw-key quarantine/skip。`0022` trigger fingerprint不校验action body，迁移夹具只显式模拟首个DDL auto-commit边界；预发需用无DDL/TRIGGER的runtime principal并扩展schema tamper/中断演练。
 

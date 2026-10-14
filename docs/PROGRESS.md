@@ -1,6 +1,6 @@
 # 进度记录
 
-> **最新优先快照（2026-10-14，52932退出0）**：0054本轮串行 required 已实际通过：7个纯/Memory文件166、完整MySQL纵向32、真实JSON MySQL25、session-budget MySQL8、当前SQL的历史升级14，合计11个真实文件245 passed、零failed/skip；API/typecheck退出0、secret scan664。当前full trigger digest为`521bb41cbc807bdb1b8321c1c21b577e64a5a02288326aea8915bfd4ece4ec7f`；旧94ad稿历史14通过只保留为历史，不替代本次重验。M4目录`d33eb59`完整verify已退出0，归档`632f901`另335定向与clean双tar装配通过，不能把父完整verify冒充归档或本集成树完整verify。main/origin仍为`e411143`；M4与0054候选已本地集成到`e282f02`（0054来源`24ac4e49`），四份状态文档整合待本地提交及整树verify；新Linux CI、合入main或推送均未完成。用户已于22:52Z明确恢复持续开发，不再以旧paused字段阻断已有授权；仍只允许新建隔离本地/CI库、不操作业务库；用户允许按需使用受保护`.env`，但本批未读取它或执行付费模型验证，不启外部对象删除或默认自动清理。0037 grant硬拒与本协议四个false字段不变；M1未冻结、M2冻结、M3未开始。
+> **最新集成检查点（2026-10-14T23:42Z）**：本地集成树包含M4目录/归档候选及0054；main/origin仍`e411143`，未合入/推送，新CI未运行。0054来源候选11文件245 passed零fail/skip；本集成树10个非历史文件又实际231 passed零fail/skip，API/typecheck退出0、secret scan678。整树verify首次31128于23:40:24Z退出1：旧grant MySQL文件4 passed/1 failed，实际0054指纹正确拒绝trigger篡改，测试却期待0053错误。失败报告已保留，最窄只更新comment和精确0054错误，不接受任意异常、不改产品或历史oracle；修后定向5 passed零fail/skip，第二次整树重验尚待终态。覆盖率、完整47文件历史链、cluster及本集成树clean发布包不能借此前父候选证明。CI已补0054镜像marker精确断言/180分钟预算；自动off、0037硬拒、全域completion=false不变，无业务库/外部对象操作或本批.env/付费模型调用。用户已明确恢复持续开发；M1未冻结、M2冻结、M3未开始。
 
 以下顶部旧快照原文属于历史记录，只有上方快照具有当前优先级；完成状态与未完成项还须对照本页末节。
 
@@ -1332,3 +1332,11 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - API check、typecheck均退出0，secret scan **664 files**；根dependency字段、lockfile与workspace manifest对精确e411143保持一致。新10个非历史文件与历史0054夹具均已注册required执行/零skip报告检查；CI test预算已由150延至180分钟，历史步骤显示名已改为through0054；不靠跳过测试提速，本批尚未推送或取得新CI结果。
 - M4原运行/VM目录/受限tar、独立工具、source/native target与学习FAQ增量全部保留。0054候选`24ac4e49b997d13658a50c4be01973842d862a8a`已cherry-pick至本地集成树`e282f02823c0a0be4acab6f96b1d15c291b7f906`，M4 d33/632保留；四份状态文档整合待本地提交，main/origin仍e411143、未合入或推送，本集成树整树verify与新Linux CI未开始/未完成，不借d33完整verify、632定向/clean双tar或0053旧CI替代。M1未冻结、M2冻结、M3未开始；default-off、全部Blob/export计划域零、no external outbox、0037 hard-deny与四false字段不变，active-capture新epoch恢复、trusted grant/telemetry外部处置、generic session/user purge、完整completion和云验收仍未闭环。
 - 本地代码集成后，0054 SQL只去除EOF四个空行：正式splitter的134条语句前后逐字一致、SHA256为`50f7581670b630903d8319e49c6816558e0eaed94148bacaaac79972da8d6a72`，full trigger digest仍为521b；最终SQL源码SHA256为`c04577186b0b8baf78274f33d2772dd082c69ef64c0adf5bc5b8befc138a70b9`。derive输入为d3cca源码，b074是写回实测常量后的format前源码；不把写回常量或格式变化冒充重新推导或新的DB验收。0054来源commit为`24ac4e49b997d13658a50c4be01973842d862a8a`（28 files，13821+/53-）；本地集成commit e282f02不等于main发布、整树verify或新CI通过。
+
+## 2026-10-14（M4与0054集成整树首轮：旧指纹oracle失败，未发布）
+
+- 集成分支`codex/m4-0054-integration`的文档整合已本地提交15cb1ae；独立review补充CI runner镜像必须精确具有0054 marker的只读断言，另本地提交ae018b3。仅改CI验收，不扩大产品权限。M4 transport实现及六入口相对632f901逐字未变，独立最终review没有其它新增P0–P2。
+- 整树session31128在23:26:43Z以clean15cb1ae开始，中途仅增加上述CI断言提交；使用新建`agent_service_test_m4_0054_20261014t2330`及`_cluster`，独立非持久化Redis（不复用会被cluster flush的已有Redis），未读取.env。结束时只清除这两新库/自建Redis，临时防idle-sleep进程也随之退出。
+- 前置check:secrets678、check:api/typecheck均通过。0054十个非历史JSON全部由root重新核对开始时间与逐assertion，231 passed/0failed/0skipped，其中完整MySQL32。不能把来源候选历史14通过冒充本次完整47文件wrapper。
+- 首轮verify于23:40:24Z明确退出1；`tenant-telemetry-disposition-grant.mysql.test.ts`实际4 passed/1 failed/0skip。真实特权fixture更改0037 trigger后，当前0054严格指纹正确拒绝启动；唯失败为旧测试只接受0053错误字符串。完整失败JSON另存保留；最窄只改注释和精确0054错误文字，产品guard、历史旧oracle和全部grant硬拒不改。修后session38784退出0、root逐JSON确认5 passed/0failed/0skipped；第二次整树尚待终态，不把前置成功写成完整verify成功。
+- 本批不合入main、不推送或取得新CI前仍是候选；默认自动清理、外部对象删除与0037授权均不开启，四false字段不变。M1仍有真实产品代码缺口，不是只等云资源；M2继续冻结，M3尚未开始。

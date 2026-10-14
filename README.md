@@ -1,6 +1,6 @@
 # agent-service
 
-> **本地集成候选检查点（2026-10-14，52932退出0）**：0054本轮串行 required 已实际通过：7个纯/Memory文件166、完整MySQL纵向32、真实JSON MySQL25、session-budget MySQL8、当前SQL的历史升级14，合计11个真实文件245 passed、零failed/skip；API/typecheck退出0、secret scan664。当前full trigger digest为`521bb41cbc807bdb1b8321c1c21b577e64a5a02288326aea8915bfd4ece4ec7f`；旧94ad稿历史14通过只保留为历史，不替代本次重验。M4目录`d33eb59`完整verify已退出0，归档`632f901`另335定向与clean双tar装配通过，不能把父完整verify冒充归档或本集成树完整verify。main/origin仍为`e411143`；M4与0054候选已本地集成到`e282f02`（0054来源`24ac4e49`），四份状态文档整合待本地提交及整树verify；新Linux CI、合入main或推送均未完成。用户已于22:52Z明确恢复持续开发，不再以旧paused字段阻断已有授权；仍只允许新建隔离本地/CI库、不操作业务库；用户允许按需使用受保护`.env`，但本批未读取它或执行付费模型验证，不启外部对象删除或默认自动清理。0037 grant硬拒与本协议四个false字段不变；M1未冻结、M2冻结、M3未开始。
+> **最新集成检查点（2026-10-14T23:42Z）**：本地集成树包含M4目录/归档候选及0054；main/origin仍`e411143`，未合入/推送，新CI未运行。0054来源候选11文件245 passed零fail/skip；本集成树10个非历史文件又实际231 passed零fail/skip，API/typecheck退出0、secret scan678。整树verify首次31128于23:40:24Z退出1：旧grant MySQL文件4 passed/1 failed，实际0054指纹正确拒绝trigger篡改，测试却期待0053错误。失败报告已保留，最窄只更新comment和精确0054错误，不接受任意异常、不改产品或历史oracle；修后定向5 passed零fail/skip，第二次整树重验尚待终态。覆盖率、完整47文件历史链、cluster及本集成树clean发布包不能借此前父候选证明。CI已补0054镜像marker精确断言/180分钟预算；自动off、0037硬拒、全域completion=false不变，无业务库/外部对象操作或本批.env/付费模型调用。用户已明确恢复持续开发；M1未冻结、M2冻结、M3未开始。
 
 以下M4原始说明与main回补候选快照为历史原文，仅保留当时事实；当前结论以上方检查点和PROGRESS末节为准。
 
