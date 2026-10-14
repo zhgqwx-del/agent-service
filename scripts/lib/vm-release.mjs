@@ -361,6 +361,20 @@ export async function validateVmReleasePayload(root, role, {
  * its own provenance after an attacker has changed both it and the payload.
  */
 export async function verifyVmReleaseDirectory(root, expectedRole, expectedManifestSha256) {
+  return verifyVmReleaseDirectoryInternal(root, expectedRole, expectedManifestSha256, false);
+}
+
+/**
+ * Complete verification while a newly extracted directory is still isolated at root mode 0700.
+ * Only that root mode differs from the independently authenticated inventory. The caller must
+ * separately restore and check its authenticated root mode before publishing a successful copy.
+ * This does not relax normal verification, alter the manifest, or authorize application startup.
+ */
+export async function verifyVmReleaseQuarantinedDirectory(root, expectedRole, expectedManifestSha256) {
+  return verifyVmReleaseDirectoryInternal(root, expectedRole, expectedManifestSha256, true);
+}
+
+async function verifyVmReleaseDirectoryInternal(root, expectedRole, expectedManifestSha256, quarantined) {
   const role = assertVmReleaseRole(expectedRole);
   if (typeof expectedManifestSha256 !== "string" || !/^[0-9a-f]{64}$/.test(expectedManifestSha256)) {
     throw new Error("trusted external manifest SHA-256 is required");
@@ -453,8 +467,25 @@ export async function verifyVmReleaseDirectory(root, expectedRole, expectedManif
       !== `pnpm --filter ./apps/${role} --prod --offline --ignore-scripts --trust-lockfile --frozen-lockfile deploy`) {
     throw new Error("invalid VM release build contract");
   }
+  if (quarantined) {
+    const isolatedRoot = await lstat(root);
+    if (!isolatedRoot.isDirectory() || isolatedRoot.isSymbolicLink()
+      || payloadMode(isolatedRoot, ".") !== "0700") {
+      throw new Error("quarantined VM release root must remain a real 0700 directory");
+    }
+  }
   const actual = await validateVmReleasePayload(root, role, { sealed: true, targetRuntime: manifest.targetRuntime });
-  if (JSON.stringify(manifest.files) !== JSON.stringify(actual)) {
+  let comparable = actual;
+  if (quarantined) {
+    const actualRoot = actual.find((entry) => entry.path === ".");
+    const expectedRoot = manifest.files.find((entry) => entry.path === ".");
+    if (actualRoot?.kind !== "directory" || actualRoot.mode !== "0700"
+      || expectedRoot?.kind !== "directory") {
+      throw new Error("quarantined VM release root must remain a real 0700 directory");
+    }
+    comparable = actual.map((entry) => entry.path === "." ? { ...entry, mode: expectedRoot.mode } : entry);
+  }
+  if (JSON.stringify(manifest.files) !== JSON.stringify(comparable)) {
     throw new Error("VM release payload differs from complete manifest inventory");
   }
   const migrationCount = actual.filter((entry) => entry.path.startsWith("dist/migrations/") && entry.kind === "file").length;

@@ -1,8 +1,8 @@
 # agent-service 协作约定
 
-M4独立VM目录发布包在隔离worktree开发，未发布/未生产验收，不推进M3或M1冻结。实际production依赖含esbuild原生程序，必须按目标Linux/macOS及CPU架构构建和验真，不能把Node应用等同完全跨平台的依赖闭包。只允许新临时目录、offline/frozen依赖与memory双服务验证；不安装systemd、改云资源或执行0054数据库删除。最新通过/失败状态只看PROGRESS末节。
+M4独立VM目录候选已完成macOS arm64 clean双包证明，受限tar/独立Node24工具仍在隔离worktree开发，未发布/未生产验收，不推进M3或M1冻结。完整production依赖含esbuild原生程序，绑定目标OS/CPU；归档、manifest与工具的预期摘要须来自独立可信渠道，包内proof不能自认证。只允许新目录和memory双服务验证，本M4发布切片不安装systemd、执行DDL或改云资源；0054按另行授权仅隔离测试库验证，不能借发布包自动放开删除；新Linux CI和各项通过/失败只看PROGRESS末节。
 
-> 0053已以`e41114392e028efff474b2c5ac13df3784b83228`推送main，完整本地verify和verify-s3已退出0：主2331 passed、历史46文件/268 passed零skip、cluster28/28与T3g3/3、真实S3 14文件/80 passed零skip。Actions `38465284562`test、runner image和router image均success，run已22:52Z完成。0054仅为独立未发布草稿；SQL guard与实际删除接线已暂停待专项确认，未执行其真实DB迁移/删除。M1不冻结；完整失败与重验事实仍以PROGRESS最新节为准。
+> 0053已以`e41114392e028efff474b2c5ac13df3784b83228`推送main，完整本地verify和verify-s3已退出0：主2331 passed、历史46文件/268 passed零skip、cluster28/28与T3g3/3、真实S3 14文件/80 passed零skip。Actions `38465284562`test、runner image和router image均success，run已22:52Z完成。0054仅为独立未发布草稿；用户已授权0054迁移/受保护DELETE实现及仅新隔离测试库验收；尚未执行其真实DB迁移/删除，不碰业务库、不启外部对象删除，自动清理默认关闭。M1不冻结；完整失败与重验事实仍以PROGRESS最新节为准。
 
 > 本地MySQL备份与旧restore-ledger CLI现接可选受保护的`TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`，供0033 active startup audit使用；source/target必须持有同一exact raw 32-byte ref key，missing/wrong key仍拒绝。它不同于制品加密key，不进入长期进程或stdout。active0033实际组合验证以PROGRESS为准，不能借inactive旧17例外推；active0053 capture的新epoch恢复尚未闭合，不得自动rebind或绕过audit。
 

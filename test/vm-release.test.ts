@@ -140,6 +140,7 @@ function setField(value: unknown, path: readonly string[], replacement: unknown)
 }
 const snapshotRootInputs = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "tsconfig.base.json", "tsconfig.json",
   "Dockerfile", ".dockerignore", "scripts/build-app.mjs", "scripts/package-vm-release.mjs", "scripts/lib/vm-release.mjs",
+  "scripts/vm-release-tool.mjs", "scripts/package-vm-transport.mjs", "scripts/lib/vm-release-archive.mjs",
   "deploy/vm/agent-runner.service.template", "deploy/vm/agent-router.service.template"] as const;
 async function snapshotFixture() {
   const sourceRoot = await tempRoot(), snapshotRoot = await tempRoot();

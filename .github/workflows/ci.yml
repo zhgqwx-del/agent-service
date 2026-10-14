@@ -672,7 +672,17 @@ jobs:
         run: pnpm run test:vm-release
 
       - name: Build independent VM role packages and boot with plain Node (no external services)
-        run: pnpm run check:vm-release
+        run: pnpm run check:vm-release --artifacts "$RUNNER_TEMP/agent-service-vm-releases"
+
+      # The trusted job log publishes all three raw digests; a sidecar alone is not authority.
+      # These are target-bound candidates, not signed production deployments or cloud resources.
+      - name: Preserve verified Node 24 VM transport candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-process-releases-linux-x64
+          path: ${{ runner.temp }}/agent-service-vm-releases/
+          if-no-files-found: error
+          retention-days: 14
 
       # Keep a separate, named proof that the runner's one-shot mover artifact exists and executes
       # under plain Node. build:check also runs this gate so local verification cannot omit it.

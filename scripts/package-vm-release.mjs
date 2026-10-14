@@ -37,6 +37,7 @@ const ROOT_INPUTS = Object.freeze([
   "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
   "tsconfig.base.json", "tsconfig.json", "Dockerfile", ".dockerignore",
   "scripts/build-app.mjs", "scripts/package-vm-release.mjs", "scripts/lib/vm-release.mjs",
+  "scripts/vm-release-tool.mjs", "scripts/package-vm-transport.mjs", "scripts/lib/vm-release-archive.mjs",
   "deploy/vm/agent-runner.service.template", "deploy/vm/agent-router.service.template",
 ]);
 const EXCLUDED_SOURCE_SEGMENTS = new Set([

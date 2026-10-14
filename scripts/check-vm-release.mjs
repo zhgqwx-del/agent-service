@@ -4,17 +4,37 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildVmRelease } from "./package-vm-release.mjs";
-import { verifyVmReleaseDirectory, VM_RELEASE_ENTRYPOINTS } from "./lib/vm-release.mjs";
+import { packageVmTransport } from "./package-vm-transport.mjs";
+import { sha256File, verifyVmReleaseDirectory, VM_RELEASE_ENTRYPOINTS } from "./lib/vm-release.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
-if (args.length > 1 || (args.length === 1 && args[0] !== "--allow-dirty-development")) {
-  throw new Error("usage: check-vm-release.mjs [--allow-dirty-development]");
+let allowDirtyDevelopment = false;
+let artifactDirectory;
+for (let i = 0; i < args.length; i += 1) {
+  if (args[i] === "--allow-dirty-development" && !allowDirtyDevelopment) allowDirtyDevelopment = true;
+  else if (args[i] === "--artifacts" && artifactDirectory === undefined && isAbsolute(args[i + 1] ?? "")) {
+    artifactDirectory = resolve(args[++i]);
+  } else throw new Error("usage: check-vm-release.mjs [--allow-dirty-development] [--artifacts <new-absolute-directory>]");
 }
-const allowDirtyDevelopment = args.length === 1;
+if (artifactDirectory !== undefined) {
+  try {
+    const parent = await realpath(dirname(artifactDirectory));
+    artifactDirectory = join(parent, artifactDirectory.slice(artifactDirectory.lastIndexOf(sep) + 1));
+    const fromRoot = relative(await realpath(ROOT), artifactDirectory);
+    if (fromRoot === "" || !fromRoot.startsWith(`..${sep}`) && fromRoot !== ".." && !isAbsolute(fromRoot)) {
+      throw new Error("VM transport artifact directory must be outside the source checkout");
+    }
+    // Reserve only a fresh directory. A failed invocation never overwrites an earlier release.
+    await mkdir(artifactDirectory, { mode: 0o700 });
+  } catch {
+    console.error("VM release verification failed (operation_failed, phase=artifact-directory)");
+    process.exit(1);
+  }
+}
 const TEST_MASTER_KEY = "77".repeat(32); // deterministic test-only key, never a configured credential
 const childEnv = { PATH: process.env.PATH ?? "", NODE_ENV: "test" };
 let failureDetail;
@@ -136,6 +156,47 @@ try {
     || JSON.stringify(releases[0].targetRuntime) !== JSON.stringify(releases[1].targetRuntime)) {
     throw new Error("VM role releases do not share the same source state");
   }
+  const transports = [];
+  const transportRoot = artifactDirectory ?? join(scratch, "transport-artifacts");
+  if (artifactDirectory === undefined) await mkdir(transportRoot, { mode: 0o700 });
+  for (const release of releases) {
+    phase = `archive-${release.role}`;
+    const transportOutput = join(transportRoot, release.role);
+    const proof = await packageVmTransport({ release: release.output, role: release.role,
+      manifestSha256: release.manifestSha256, output: transportOutput });
+    const archivePath = join(transportOutput, "release.tar");
+    const toolPath = join(transportOutput, "vm-release-tool.mjs");
+    // This expected digest comes directly from the trusted builder, not the archive or sidecar.
+    if (await sha256File(toolPath) !== proof.toolSha256) throw new Error("standalone VM verifier differs from trusted build bytes");
+    const unpacked = join(scratch, `unpacked-${release.role}`);
+    phase = `standalone-unpack-${release.role}`;
+    const invocation = spawnSync(process.execPath, [toolPath, "unpack", "--archive", archivePath,
+      "--role", release.role, "--archive-sha256", proof.archiveSha256,
+      "--manifest-sha256", release.manifestSha256, "--output", unpacked], {
+      // No source checkout, package manager, dependency tree or application configuration here.
+      cwd: scratch, env: childEnv, encoding: "utf8", timeout: 135_000, maxBuffer: 64 * 1024,
+    });
+    if (invocation.error || invocation.signal || invocation.status !== 0 || invocation.stderr !== "") {
+      throw new Error("standalone VM archive extraction failed");
+    }
+    const extractedProof = JSON.parse(invocation.stdout);
+    if (extractedProof.archiveSha256 !== proof.archiveSha256
+      || extractedProof.manifestSha256 !== release.manifestSha256
+      || extractedProof.role !== release.role || extractedProof.productionAccepted !== false) {
+      throw new Error("standalone VM extraction proof does not match trusted inputs");
+    }
+    await verifyVmReleaseDirectory(unpacked, release.role, release.manifestSha256);
+    // All following executable checks must use transported bytes, not the original build.
+    release.output = unpacked;
+    transports.push(proof);
+  }
+  if (transports[0].toolSha256 !== transports[1].toolSha256
+    || transports.some((proof, index) => proof.sourceCommit !== releases[index].sourceCommit
+      || proof.sourceDirty !== releases[index].sourceDirty
+      || proof.publishable !== releases[index].publishable
+      || proof.compiler.boundLockSha256 !== releases[index].lockSha256)) {
+    throw new Error("VM transports do not share the exact source/compiler-bound tool");
+  }
   const runnerRelease = releases[0];
   const routerRelease = releases[1];
   phase = "plain-node-one-shots";
@@ -188,19 +249,28 @@ try {
     // Runtime state must remain outside the immutable release directories.
     await verifyVmReleaseDirectory(release.output, release.role, release.manifestSha256);
   }
+  for (const proof of transports) {
+    const output = join(transportRoot, proof.role);
+    if (await sha256File(join(output, "release.tar")) !== proof.archiveSha256
+      || await sha256File(join(output, "vm-release-tool.mjs")) !== proof.toolSha256) {
+      throw new Error("VM transport artifacts changed during runtime verification");
+    }
+  }
   const report = {
     schema: "agent-service-vm-release-check-v1", completedAt: new Date().toISOString(),
     productionAccepted: false, allowDirtyDevelopment,
     roles: releases.map(({ role, sourceCommit, sourceDirty, inputSha256, lockSha256, targetRuntime, nativeFiles, publishable, manifestSha256, fileCount }) => (
       { role, sourceCommit, sourceDirty, inputSha256, lockSha256, targetRuntime, nativeFiles, publishable, manifestSha256, fileCount }
     )),
+    transports,
     oneShots, oneShotInvocations: ["canonical", "current-directory-symlink"],
     mainInvocations: ["current-directory-symlink"],
     runtime: ["runner-ready", "router-ready", "protocol-discovery", "tenant-auth", "platform-auth", "forwarding", "canonical-openapi", "immutable-after-stop"],
   };
   await mkdir(join(ROOT, ".local-run"), { recursive: true });
   await writeFile(join(ROOT, ".local-run/vm-release-proof.json"), `${JSON.stringify(report, null, 2)}\n`);
-  console.log("VM process releases passed: two independent dependency closures, four plain Node one-shots, readiness/auth/forwarding/OpenAPI and unchanged payloads");
+  console.log(`VM transport trusted build proof: ${JSON.stringify(transports)}`);
+  console.log("VM process releases passed: two transported dependency closures, standalone digest-bound extraction, four plain Node one-shots, readiness/auth/forwarding/OpenAPI and unchanged payloads");
 } catch {
   // Closed phase names aid diagnosis without exposing arbitrary subprocess output or errors.
   console.error(`VM release verification failed (operation_failed, phase=${phase})`);

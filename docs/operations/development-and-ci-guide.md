@@ -1514,14 +1514,14 @@ router拒绝raw restore-journal identity、endpoint与credential的配置边界�
 `apps/agent-router/test/config.test.ts`在常规测试套件中验证；当前dist boot只以清理过的
 环境启动bundle，不把这项源码配置测试冒充为发布产物运行时探针。
 
-M4 的 VM 交付须增加带校验和的 `bundle + migrations + production node_modules` 发布归档和 systemd 单元；当前尚未交付该归档，现有最完整、最可重复的候选产物是 OCI 镜像。
+M4的Node24目标平台目录包已实现`bundle + migrations + 完整production node_modules + manifest`及非root systemd样例，并实际验证macOS arm64双包；受限tar归档、独立Node验真与CI artifact保存仍为本地候选，具体通过状态看PROGRESS。签名/晋级、真实systemd/生产无DDL启动和Linux CI仍不能借两个既有OCI镜像的成功冒充完成。
 
 这里有三种容易混淆的运行/交付形态：
 
 | 形态 | 实际内容 | 适用场景 |
 | --- | --- | --- |
 | 本地源码进程 | `node --import tsx` 直接加载 `apps/*/src/main.ts` | 日常开发、调试；本节的直接启动和`local-service.sh start`不会自动热重载。包级`pnpm dev`使用`tsx watch`，但会整体加载`.env`，须先满足前述authority隔离要求 |
-| Node 应用 bundle | runner `main.js` + `blob-storage-migrate.js` + `restore-ledger-reconcile.js` + `backup-catalog.js` + `telemetry-capture.js`、router `main.js`，外加 production dependencies 与 migrations | 裸 Linux VM 上以两个长期进程运行；四个维护CLI只在受控维护时前台调用。仓库当前尚未生成完整发布归档/systemd 单元 |
+| Node 应用发布包 | runner `main.js` + `blob-storage-migrate.js` + `restore-ledger-reconcile.js` + `backup-catalog.js` + `telemetry-capture.js`、router `main.js`，外加目标OS/CPU完整production dependencies、migrations与manifest | 两个长期进程；四个维护CLI仅前台按需调用。目录包与systemd样例已有本地证明，受限tar/独立工具仍在验证，未完成签名/晋级或生产托管 |
 | Linux OCI 镜像 | Node 24 slim + 对应应用入口 + production dependencies + migrations；runner镜像额外包含四个one-shot CLI | staging/production 推荐交付物，可分别部署到不同 VM、容器平台或 Kubernetes workload |
 
 因此“router/runner 不可变镜像”表示镜像内容在构建后不再修改、环境间使用同一 digest；它不是 Windows 镜像，也不是把 TypeScript 编译成 Linux ELF 或 Windows `.exe`。router 和 runner 确实是两套可独立启动、独立扩缩容、可部署到不同机器的 Node 应用，但镜像通常比手工分发裸 bundle 更容易保证 Node 版本、依赖、迁移与健康检查完全一致。若目标机器不能运行容器，可以部署完整 Node 发布归档；不能只复制一个 `main.js` 就称为完整发布。
@@ -1629,9 +1629,9 @@ M4候选现在增加`package:vm`、`test:vm-release`和`check:vm-release`，详�
 
 staging/production 不重新编译镜像。环境差异只通过受控配置和 Secret 注入；两个环境不共享 MySQL、Redis、对象存储、密钥或 service key。
 
-VM 形态须在同一次 CI 构建中分别形成 router/runner 完整发布归档，固定 Node 24 runtime、production dependencies、迁移文件与每个文件的校验和/发布包身份；在 staging 验证后，将**同一发布包身份和校验和**晋级 production，不在环境中重新安装依赖或重新打包。systemd 单元、进程排空与一次性迁移/维护入口仍需按同一代码版本独立发布和验收。该发布包及其晋级流水线目前尚未实现。
+VM形态须在同一次CI构建中分别形成router/runner完整发布归档，固定Node24 target runtime、production dependencies、迁移文件及每个文件校验和/发布包身份；staging验证后，将**同一发布包身份和校验和**晋级production，不在环境中重新安装依赖或重新打包。目标平台目录包已有本地证明，受限tar及独立Node24工具正在验证；工具必须先经独立可信tool摘要验证，归档与manifest同样使用外部可信摘要，包内sidecar不能自认证。候选CI artifact只保存测试通过的字节，不等于签名、生产许可或已实施晋级。systemd托管、进程排空与一次性迁移入口仍须独立发布/验收；见[VM发布包契约](local-and-deployment.md#vm-进程发布包地基)。
 
-用户选择 M4 同时提供两种交付形态：容器部署使用分别发布的 router/runner Linux OCI 镜像及同一 digest 晋级；虚拟机部署使用相同的六个 Node.js 构建入口（runner main与四个one-shot、router main）和受控 Node 24 runtime，分别以独立进程运行 router/runner。两种形态都必须复用同一协议、迁移门禁、配置/Secret 契约和验收；VM 的可校验发布包、进程托管/滚动步骤与容器的镜像签名、部署清单和环境晋级仍待 M4 实现，当前不能把源码开发脚本或 CI 测试镜像当作已交付的生产部署包。
+用户选择M4同时提供两种交付形态：容器按router/runner Linux OCI同一digest晋级；虚拟机用相同六个应用入口（runner main与四one-shot、router main）和受控Node24 runtime，两个服务独立运行。两者复用协议、迁移门禁、配置/Secret与验收。VM目录验真已实现，归档运输仍在验证；进程托管/滚动与容器签名、部署清单、环境晋级仍待M4，不能把源码开发脚本、单平台本地目录包或CI测试镜像当成生产验收完成。归档工具是离线发布工具，不是新增产品daemon或镜像。
 
 这仍是目标流程，不是当前可直接执行的生产部署手册。现有runner连接默认会应用schema migration，而严格启动检查又依赖读取MySQL trigger元数据；本机MySQL 8.0.26实测`SELECT`-only账号无法通过`INFORMATION_SCHEMA.TRIGGERS`或definer view看到已有trigger，授予`TRIGGER`则也能删除它。M4还须先以受限definer procedure等可信只读桥接完成无DDL账号的严格指纹校验和真实MySQL回归，再交付独立一次性schema-migrate Job、生产verify-only启动及镜像入口。没有这些门禁和真实环境资源时，不应把当前CI镜像直接称为已完成的staging/production部署方案；详见[部署契约](local-and-deployment.md)。
 

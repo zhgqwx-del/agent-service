@@ -1,6 +1,6 @@
 # agent-service
 
-VM进程发布包地基在本地开发中：`pnpm package:vm --role agent-runner|agent-router --output <新绝对目录>`从冻结源码构建Node24 ESM bundle、完整production依赖闭包与对应systemd样例。依赖闭包含原生程序，必须按目标Linux/macOS与CPU架构构建/验真；应用不是独立ELF程序，发布包也不是虚拟机磁盘镜像。严格验真要求外部可信manifest摘要；工作树有改动的开发包不可发布。实际验证状态与失败记录见PROGRESS，使用边界见[VM发布包说明](docs/operations/local-and-deployment.md#vm-进程发布包地基)，尚不代表生产或Windows验收完成。
+VM目录与受限tar候选已通过macOS arm64双服务真实构建、独立工具解包及启动验证；`pnpm package:vm`构建目标平台Node24应用/完整依赖，`pnpm package:vm-transport`生成tar及单文件验真工具。tool/archive/manifest分别需要外部可信摘要，sidecar不能自认证；不是ELF或VM磁盘镜像，dirty开发包不可晋级，clean归档/新Linux CI及生产验收仍待。实际状态/失败看PROGRESS，操作契约见[VM发布包说明](docs/operations/local-and-deployment.md#vm-进程发布包地基)。
 
 0053已以`e411143`推送main，完整本地验收通过：主测试2331 passed、真实历史迁移268 passed且零skip、cluster 28/28与独立T3g 3/3、真实S3 14文件/80 passed且零skip，SDK/六入口构建与双服务装配均通过。[本次CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38465284562)test、runner image和router image均success，22:52Z完成；这不改变M1未冻结或默认关闭边界。0054仍是独立未发布草稿，不能据其纯/内存测试宣称删除闭环。
 

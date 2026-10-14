@@ -21,7 +21,32 @@ clean构建从精确Git commit的blob复制输入到独立快照；工作树实�
 
 manifest记录源码commit、lock/实际输入摘要、构建Node/pnpm/platform、严格target runtime与完整文件/软链接/目录权限清单；强制拒绝路径逃逸、敏感配置/私钥/数据库文件、特殊文件及特殊权限位。真实production闭包包括esbuild原生程序，不能声称跨OS/CPU通用；必须在目标Linux/macOS及x64/arm64环境构建，验真与运行主机也须匹配。native检查只核对有界ELF64/MachO64 header、program/load-command/segment结构、目标OS/CPU与完整文件摘要，截断、越界、未知/Windows格式或错误架构仍拒绝；这不是任意unsafe-native开关，也不是完整loader、NAPI/libc兼容或厂商真实性证明。实际功能须另经plain Node装配验证。第三方SDK合法`credentials`代码目录不能被误当密钥文件，但其每个后代仍完整检查，真实同名credentials文件/软链接及`.env`等继续拒绝。未来新增依赖须重新审查。发布输出不含`.env`，构建子进程不继承应用key/数据库/模型配置且不回显任意诊断。
 
-验真必须调用`scripts/lib/vm-release.mjs`的`verifyVmReleaseDirectory(directory, role, trustedManifestSha256)`，摘要从独立可信构建/晋级渠道取得，不能把包内自算摘要当认证。同一目录、manifest和完整依赖闭包应保持不变后再晋级，目标环境不运行pnpm或重新构建。目录清单不是归档签名、跨平台确定性构建或生产许可；`productionAccepted=false`固定。当前尚没有受控tar/zip发布、签名、registry/promotion job或自动安装器。
+验真复用`scripts/lib/vm-release.mjs`的`verifyVmReleaseDirectory(directory, role, trustedManifestSha256)`，摘要从独立可信构建/晋级渠道取得，不能把包内自算摘要当认证。同一目录、manifest和完整依赖闭包应保持不变后再晋级，目标环境不运行pnpm或重新构建。目录清单不是归档签名、跨平台确定性构建或生产许可；`productionAccepted=false`固定。受限tar运输与Node24独立工具正在本地验证，签名、registry/promotion job及自动安装器仍未实现。
+
+### 受限 tar 与独立工具（候选，验证状态见 PROGRESS）
+
+归档是无压缩USTAR、仅有限PAX `path/linkpath`扩展；不是VM磁盘镜像。只接纳普通文件、目录和安全相对软链接，不接纳hardlink、设备/FIFO、GNU/global PAX、特殊权限或未知元数据。默认数量、归档/单文件/manifest/路径大小预算不可由调用方放大；解包首先把归档复制到本次私有临时文件，在同次复制中核对外部归档摘要，再完整扫描结构、路径拓扑与预算，最后才创建新输出目录。文件与目录先于软链接创建；完整目录验真成功才返回receipt。失败不安装、不晋级，已创建的输出留在0700隔离状态供人工核对，不覆盖或自动删除operator目录。
+
+```bash
+# 在与目标OS/CPU匹配的构建主机；RELEASE目录须已通过可信manifest摘要验真。
+pnpm package:vm-transport --release /absolute/runner-release --role agent-runner \
+  --manifest-sha256 <独立可信manifest摘要> --output /absolute/new/runner-transport
+
+# 目标主机仅需Node24。先从独立可信构建渠道取得tool/archive/manifest三个摘要，
+# 用本机可信sha256sum（macOS可用shasum -a 256）核对工具原始字节，再执行它。
+sha256sum /absolute/runner-transport/vm-release-tool.mjs
+node /absolute/runner-transport/vm-release-tool.mjs unpack \
+  --archive /absolute/runner-transport/release.tar --role agent-runner \
+  --archive-sha256 <独立可信归档摘要> --manifest-sha256 <独立可信manifest摘要> \
+  --output /absolute/new/runner-release
+node /absolute/runner-transport/vm-release-tool.mjs verify \
+  --release /absolute/new/runner-release --role agent-runner \
+  --manifest-sha256 <独立可信manifest摘要>
+```
+
+同目录的`transport-proof.json`只是证据副本，**不能自行认证**工具或归档；攻击者同时替换sidecar、manifest和payload时，自算摘要仍没有可信来源。必须先信任构建渠道并人工/后续发布系统比较预期tool摘要，不能先执行未知工具让它验证自己。工具只用Node内置模块，无源码checkout、pnpm、网络、`.env`或数据库依赖；没有服务安装、DDL、current指针切换或应用启动权限。bundle的四个工具源码与root package/lock都必须逐字节匹配该release冻结input清单；闭合解析当前pnpm9 root importer，编译器实际版本须精确等于已绑定的esbuild0.28.2，错/旧安装会拒绝。编译子进程不继承应用密钥，proof记录受信任本机compiler入口的观察摘要；这不是完整冻结toolchain、vendor认证、抵抗恶意同UID替换或可复现构建证明。归档120秒deadline是共用计时的协作式检查，native文件系统I/O不能被它硬取消；成功副本也不是断电持久性或原子生产晋级证明。
+
+候选CI增加按role保存`release.tar`、`vm-release-tool.mjs`及proof的artifact步骤，并在受信任job日志记录三个原始摘要；当前新代码尚未运行Linux CI。artifact留存不是签名或production promotion。checker在临时无源码目录中调用已核对tool摘要的独立工具，把归档解包后再执行四CLI和router/runner双服务检查，不能仅测试原始构建目录。
 
 systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝对路径、只读release/current布局和独立`/var/lib/agent-service/<role>`状态目录；配置从独立`/etc/agent-service/<role>.env`提供，建议0600，仅配置权限与职责匹配的变量。模板设置`StateDirectoryMode=0700`、`UMask=0077`和runner外置Blob目录；不会创建账号、安装unit、改当前release指针、执行DDL或启动真实服务。启动MySQL runner的现有自动migration行为并未因打包消失，生产无DDL账号/可信trigger只读桥仍需后续实现；schema cutover后的回滚须服从forward-fix，不能仅替换旧目录。
 
