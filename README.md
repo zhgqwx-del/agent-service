@@ -1,6 +1,16 @@
 # agent-service
 
+> **本地集成候选检查点（2026-10-14，52932退出0）**：0054本轮串行 required 已实际通过：7个纯/Memory文件166、完整MySQL纵向32、真实JSON MySQL25、session-budget MySQL8、当前SQL的历史升级14，合计11个真实文件245 passed、零failed/skip；API/typecheck退出0、secret scan664。当前full trigger digest为`521bb41cbc807bdb1b8321c1c21b577e64a5a02288326aea8915bfd4ece4ec7f`；旧94ad稿历史14通过只保留为历史，不替代本次重验。M4目录`d33eb59`完整verify已退出0，归档`632f901`另335定向与clean双tar装配通过，不能把父完整verify冒充归档或本集成树完整verify。main/origin仍为`e411143`；M4与0054候选已本地集成到`e282f02`（0054来源`24ac4e49`），四份状态文档整合待本地提交及整树verify；新Linux CI、合入main或推送均未完成。用户已于22:52Z明确恢复持续开发，不再以旧paused字段阻断已有授权；仍只允许新建隔离本地/CI库、不操作业务库；用户允许按需使用受保护`.env`，但本批未读取它或执行付费模型验证，不启外部对象删除或默认自动清理。0037 grant硬拒与本协议四个false字段不变；M1未冻结、M2冻结、M3未开始。
+
+以下M4原始说明与main回补候选快照为历史原文，仅保留当时事实；当前结论以上方检查点和PROGRESS末节为准。
+
 VM目录与受限tar候选已通过macOS arm64双服务真实构建、独立工具解包及启动验证；`pnpm package:vm`构建目标平台Node24应用/完整依赖，`pnpm package:vm-transport`生成tar及单文件验真工具。tool/archive/manifest分别需要外部可信摘要，sidecar不能自认证；不是ELF或VM磁盘镜像，dirty开发包不可晋级，clean归档/新Linux CI及生产验收仍待。实际状态/失败看PROGRESS，操作契约见[VM发布包说明](docs/operations/local-and-deployment.md#vm-进程发布包地基)。
+
+### 历史候选快照（main回补，非当前状态）
+
+候选补充（2026-10-14T22:54:00Z）：0054已获正式Memory/MySQL四阶段/SQL代码与新隔离测试授权，未部署激活或操作业务库/外部对象。最新7具名纯/Memory166、真实JSONMySQL25、session-budget MySQL8、旧capture/T3c/T3d/T3f/T3g五Memory文件92均实际passed零fail/skip；typecheck08:38退出0/secrets664为检查点，之后新增测试仍待重验。独立DDL最新full94ad059348dd69ce8dda255881c19c4ab252728510356540383f877daa846108，全712 trigger/713496 bytes、自建库清除。完整31纵向首轮29passed/2failed/0skip；ordinary tombstone oracle修后定向通过，但T3d late rollback的原授权重试仍失败，08:44同连接70条件、源文件完整首IF/written EXISTS/nativeINNERcount first/retry均真，真实trigger仍拒绝，根因未定，不能宣称优化器问题或全套成功。双真实grave重签测试实际失败在UPDATE guard库存oracle（预期1/实际2），尚未证明HMAC负例；2过滤用例共0passed/2failed/30filtered，不计required执行。历史14例第二轮9passed/5failed/0skip：legacy、active旧written/reserved/pending及T1、marker/partial/drift通过，terminal与4rotation夹具修订已冻结但未重跑。main/origin仍e411143/M4 d33与632未合入发布，新整树verify/CI仍待。用户已于22:52Z明确恢复持续开发，按既有授权重启scope协作；历史14第三轮正执行，新的trigger内部与双grave测试待冻结/实测。UI旧paused字段不再当作缺少人类继续授权，不重复索要权限；未合入或推送。自动off、0037硬拒、全域completion=false、M1未冻结/M2冻结/M3未开始不变。
+
+开发中候选（2026-10-14）：M4目录候选`d33eb59`完整verify已退出0；受限tar/独立Node验真工具候选`632f901`另通过335定向和clean双服务装配。两者尚未合入本页对应的main，也没有新Linux CI/生产验收；目录完整verify不冒充归档完整verify。0054已获正式Memory/MySQL受保护删除路径的代码实现授权，仅新建隔离测试库验证；当前纯/Memory检查点已通过130项，真实MySQL仍待，未发布、不启外部对象删除或默认自动清理。新切片仅接受全部Blob/export计划目标精确零的本地闭合来源。候选最新状态以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。
 
 0053已以`e411143`推送main，完整本地验收通过：主测试2331 passed、真实历史迁移268 passed且零skip、cluster 28/28与独立T3g 3/3、真实S3 14文件/80 passed且零skip，SDK/六入口构建与双服务装配均通过。[本次CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38465284562)test、runner image和router image均success，22:52Z完成；这不改变M1未冻结或默认关闭边界。0054仍是独立未发布草稿，不能据其纯/内存测试宣称删除闭环。
 
