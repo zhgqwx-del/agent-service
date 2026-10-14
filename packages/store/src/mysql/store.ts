@@ -19,6 +19,12 @@ import {
   telemetryCaptureLogsSourceRefSha256,
 } from "@agent-service/protocol";
 import * as PersistedCapture from "../tenant-telemetry-persisted-provider-capture.js";
+import * as RetainedSource from "../tenant-telemetry-retained-source.js";
+import {
+  projectTenantTelemetryRetainedSourceGraph,
+  validateTenantTelemetryRetainedSourceProviderTargetRelations,
+  type TenantTelemetryRetainedSourceGraphInputs,
+} from "../tenant-telemetry-retained-source-projection.js";
 import {
   CredentialSourceConflictError,
   FenceError,
@@ -959,6 +965,109 @@ const ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME =
   "0051_ordinary_session_delete_origin_guard.sql";
 const ORDINARY_USAGE_RETENTION_MIGRATION_NAME = "0052_ordinary_session_usage_retention.sql";
 const PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME = "0053_persisted_provider_failure_capture.sql";
+const TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME =
+  "0054_tenant_telemetry_retained_source.sql";
+const TENANT_TELEMETRY_RETAINED_SOURCE_TABLE_NAMES = [
+  "tenant_telemetry_retained_source_t1_entries",
+  "tenant_telemetry_retained_source_t1_receipts",
+  "tenant_telemetry_retained_source_catalog_sources",
+  "tenant_telemetry_retained_source_catalog_targets",
+  "tenant_telemetry_retained_source_catalog_receipts",
+  "tenant_telemetry_retained_source_usage_entries",
+  "tenant_telemetry_retained_source_usage_receipts",
+  "tenant_telemetry_retained_source_canonical_entries",
+  "tenant_telemetry_retained_source_canonical_receipts",
+] as const;
+const TENANT_TELEMETRY_RETAINED_SOURCE_BOOTSTRAP_SHAPES = [
+  ["trg_tt_retained_t3d_catalog_bootstrap_a", "tenant_purge_plan_jobs", "UPDATE"],
+  ["trg_tt_retained_t3d_catalog_bootstrap_b", "tenant_purge_plan_jobs", "UPDATE"],
+  ["trg_tt_retained_t3d_capture_bootstrap_a", "tenant_purge_plan_jobs", "UPDATE"],
+  ["trg_tt_retained_t3d_capture_bootstrap_b", "tenant_purge_plan_jobs", "UPDATE"],
+  ["trg_tt_retained_t3f_capture_bootstrap_a", "tenant_database_purge_jobs", "UPDATE"],
+  ["trg_tt_retained_t3f_capture_bootstrap_b", "tenant_database_purge_jobs", "UPDATE"],
+  ["trg_tt_retained_usage_delete_bootstrap_a", "usage_ledger", "DELETE"],
+  ["trg_tt_retained_usage_delete_bootstrap_b", "usage_ledger", "DELETE"],
+] as const;
+type RetainedSourceEvidenceByFamily = {
+  t1_entries: RetainedSource.TenantTelemetryRetainedSourceT1CohortEntry;
+  t1_receipts: RetainedSource.TenantTelemetryRetainedSourceT1CohortReceipt;
+  catalog_sources: RetainedSource.TenantTelemetryRetainedSourceCatalogSourceEntry;
+  catalog_targets: RetainedSource.TenantTelemetryRetainedSourceCatalogEntry;
+  catalog_receipts: RetainedSource.TenantTelemetryRetainedSourceCatalogReceipt;
+  usage_entries: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry;
+  usage_receipts: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseReceipt;
+  canonical_entries: RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry;
+  canonical_receipts: RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureReceipt;
+};
+type RetainedSourceEvidenceFamily = keyof RetainedSourceEvidenceByFamily;
+type RetainedSourceEvidencePhase = "live" | "usage_released" | "canonical_closed";
+type RetainedSourceCatalogBundle = {
+  entries: RetainedSource.TenantTelemetryRetainedSourceCatalogEntry[];
+  sources: RetainedSource.TenantTelemetryRetainedSourceCatalogSourceEntry[];
+  receipt: RetainedSource.TenantTelemetryRetainedSourceCatalogReceipt;
+  proof: RetainedSource.TenantTelemetryRetainedSourceCatalogProof;
+};
+type RetainedSourceUsageBundle = {
+  entries: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry[];
+  receipt: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseReceipt;
+  proof: RetainedSource.TenantTelemetryRetainedSourceUsageProof;
+};
+type RetainedSourceUsageStage = {
+  catalog: RetainedSourceCatalogBundle;
+  entries: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry[];
+  retainedFacts: BillingUsageFact[];
+};
+type RetainedSourceCanonicalStage = {
+  catalog: RetainedSourceCatalogBundle;
+  usage: RetainedSourceUsageBundle;
+  entries: RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry[];
+};
+const RETAINED_SOURCE_EVIDENCE_VALIDATORS: Record<RetainedSourceEvidenceFamily,
+  (value: unknown) => void> = {
+  t1_entries: RetainedSource.validateTenantTelemetryRetainedSourceT1CohortEntry,
+  t1_receipts: RetainedSource.validateTenantTelemetryRetainedSourceT1CohortReceipt,
+  catalog_sources: RetainedSource.validateTenantTelemetryRetainedSourceCatalogSourceEntry,
+  catalog_targets: RetainedSource.validateTenantTelemetryRetainedSourceCatalogEntry,
+  catalog_receipts: RetainedSource.validateTenantTelemetryRetainedSourceCatalogReceipt,
+  usage_entries: RetainedSource.validateTenantTelemetryRetainedSourceUsageReleaseEntry,
+  usage_receipts: RetainedSource.validateTenantTelemetryRetainedSourceUsageReleaseReceipt,
+  canonical_entries: RetainedSource.validateTenantTelemetryRetainedSourceCanonicalClosureEntry,
+  canonical_receipts: RetainedSource.validateTenantTelemetryRetainedSourceCanonicalClosureReceipt,
+};
+/** Only fields of an already closed, validated internal codec can become SQL identifiers. */
+function retainedSourceEvidenceScalarProjection(
+  family: RetainedSourceEvidenceFamily,
+  value: RetainedSourceEvidenceByFamily[RetainedSourceEvidenceFamily],
+): Record<string, string | number | null> {
+  RETAINED_SOURCE_EVIDENCE_VALIDATORS[family](value);
+  const result: Record<string, string | number | null> = {};
+  const column = (key: string) => key === "preDeleteReceiptSha256"
+    ? "predelete_receipt_sha256" : key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+  const omittedSafety = new Set(["executionReady", "externalAuthorityVerified",
+    "allDomainsComplete", "contentPurgeExecuted"]);
+  for (const [key, child] of Object.entries(value)) {
+    if (omittedSafety.has(key) || key === "profile" || key === "source") continue;
+    if (child !== null && typeof child !== "string" && typeof child !== "number") {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    result[column(key)] = child;
+  }
+  if (family === "t1_receipts") {
+    result.profile_kind = (value as RetainedSource.TenantTelemetryRetainedSourceT1CohortReceipt)
+      .profile.kind;
+  }
+  if (family === "catalog_targets") {
+    const source = (value as RetainedSource.TenantTelemetryRetainedSourceCatalogEntry).source;
+    result.source_kind = source.kind;
+    const flattened = source as unknown as Record<string, string>;
+    for (const key of ["applicationBindingReceiptSha256", "applicationCoverageEvidenceSha256",
+      "sourceGroupRootSha256", "failureCommitReceiptSha256", "sourceBindingReceiptSha256",
+      "captureCoverageEvidenceSha256", "cohortEntryReceiptSha256"]) {
+      result[column(key)] = flattened[key] ?? null;
+    }
+  }
+  return result;
+}
 const PERSISTED_PROVIDER_CAPTURE_TRIGGER_NAMES = [
   "trg_tt_capture_v2_activation_bi", "trg_tt_capture_v2_activation_bu", "trg_tt_capture_v2_activation_bd",
   "trg_tt_capture_v2_failure_bi", "trg_tt_capture_v2_failure_bu", "trg_tt_capture_v2_failure_bd",
@@ -1081,6 +1190,26 @@ async function executeMysqlMigrationStatement(
   migrationName: string,
   statement: string,
 ): Promise<void> {
+  if (migrationName === TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME && statement.startsWith("CREATE TRIGGER ")) {
+    const shape = TENANT_TELEMETRY_RETAINED_SOURCE_BOOTSTRAP_SHAPES.find(([name]) => statement.startsWith(`CREATE TRIGGER ${name} `));
+    if (shape) {
+      const [name, table, manipulation] = shape;
+      const prefix = `CREATE TRIGGER ${name} BEFORE ${manipulation} ON ${table} FOR EACH ROW `;
+      if (!statement.startsWith(prefix) || statement.length === prefix.length) throw new Error("0054 bootstrap trigger source is invalid");
+      const [rows] = await conn.query<Row[]>(`SELECT event_object_table AS table_name,action_timing AS timing,
+        event_manipulation AS manipulation,action_orientation AS orientation,action_condition AS condition_value,
+        action_statement AS statement_value FROM information_schema.triggers
+        WHERE trigger_schema=DATABASE() AND BINARY trigger_name=BINARY ?`, [name]);
+      if (rows.length === 0) { await conn.query(statement); return; }
+      const existing = rows[0]!;
+      if (rows.length !== 1 || existing.table_name !== table || existing.timing !== "BEFORE"
+        || existing.manipulation !== manipulation || existing.orientation !== "ROW" || existing.condition_value !== null
+        || canonicalMysqlTriggerActionStatement(String(existing.statement_value)) !== canonicalMysqlTriggerActionStatement(statement.slice(prefix.length))) {
+        throw new Error("0054 surviving bootstrap trigger is not exact");
+      }
+      return;
+    }
+  }
   if (migrationName === ORDINARY_USAGE_RETENTION_MIGRATION_NAME && statement.startsWith("CREATE TRIGGER ")) {
     const match = /^CREATE TRIGGER (\w+) BEFORE (INSERT|UPDATE) ON (\w+) FOR EACH ROW ([\s\S]+)$/.exec(statement);
     if (!match) throw new Error("0052 ordinary usage retention trigger source is invalid");
@@ -1624,6 +1753,38 @@ function persistedProviderCaptureFingerprintStatement(migrationSql: string, mark
   const statements = mysqlMigrationStatements(migrationSql.slice(start + startMarker.length, end));
   if (statements.length !== 1 || !statements[0]!.startsWith(`SET @persisted_capture_${marker}_ok=`)) {
     throw new Error(`0053 ${marker} fingerprint block is invalid`);
+  }
+  return statements[0]!;
+}
+function tenantTelemetryRetainedSourceFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+): string {
+  const prefix = `-- agent-service-runtime-fingerprint:tenant-telemetry-retained-source-${marker}`;
+  const startMarker = `${prefix}:start`, endMarker = `${prefix}:end`;
+  const start = migrationSql.indexOf(startMarker), end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0054 ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(
+    migrationSql.slice(start + startMarker.length, end),
+  );
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @tt_retained_source_${marker}_ok=`)
+    // Fingerprints are exactly one SET expression, not a procedural block.
+    // The migration splitter also supports DELIMITER bodies and therefore does
+    // not split same-line semicolons: explicitly reject those here, before SQL.
+    || statements[0]!.includes(";")) {
+    throw new Error(`0054 ${marker} fingerprint block is invalid`);
+  }
+  const roots = statements[0]!.match(/'[0-9a-f]{64}'/g) ?? [];
+  if (roots.length === 0 || roots.some((root) => root === `'${"0".repeat(64)}'`)
+    || /DERIVE/.test(statements[0]!)) {
+    // Only inspect the extracted immutable metadata block, not legitimate empty business roots
+    // elsewhere in this migration. Normal connect must never derive or accept its own authority.
+    throw new Error(`0054 ${marker} fingerprint block is not committed`);
   }
   return statements[0]!;
 }
@@ -8486,6 +8647,8 @@ export class MysqlSessionStore implements
   private ordinaryUsageRetentionSchemaInstalled = false;
   private readonly ordinaryDeleteCommitBatches = new WeakSet<CommitBatch>();
   private persistedProviderCaptureSchemaInstalled = false;
+  private tenantTelemetryRetainedSourceSchemaInstalled = false;
+  private readonly retainedSourceRootBudgetDiscardedConnections = new WeakSet<PoolConnection>();
   private readonly persistedProviderCaptureCommitContexts = new WeakMap<CommitBatch, {
     input: PersistedCapture.CommitPersistedProviderStepFailureInput;
     result?: PersistedCapture.CommitPersistedProviderStepFailureResult;
@@ -8598,6 +8761,7 @@ export class MysqlSessionStore implements
         await store.withConsistentRead(async(conn) => {
           await store.assertPersistedProviderCaptureProjection(conn);
           await store.assertPersistedFailureGlobalRelations(conn);
+          await store.assertRetainedSourceGlobalRelations(conn);
         });
       }
       if (opts.operationAbortSignal?.aborted) throw new Error("MySQL maintenance operation aborted");
@@ -9337,7 +9501,12 @@ export class MysqlSessionStore implements
     withOrdinaryDeleteOriginGuard = false,
     withOrdinaryUsageRetention = false,
     withPersistedProviderCapture = false,
+    withRetainedSource = false,
   ): Promise<void> {
+    if (withRetainedSource) {
+      await this.assertTenantTelemetryRetainedSourceFingerprint(conn, migrationsDir);
+      return;
+    }
     if (withPersistedProviderCapture) {
       await this.assertPersistedProviderCaptureFingerprint(conn, migrationsDir);
       return;
@@ -9426,6 +9595,58 @@ export class MysqlSessionStore implements
     } catch (cause) { failure = new Error("0053 persisted provider capture fingerprint verification failed", { cause }); }
     try { await conn.query("SET SESSION group_concat_max_len=@persisted_capture_prev_gcml"); }
     catch (cause) { failure ??= new Error("0053 persisted provider capture fingerprint session restore failed", { cause }); }
+    if (failure) throw failure;
+  }
+
+  private async assertTenantTelemetryRetainedSourceFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let statements: string[];
+    try {
+      const previousSql = await readFile(
+        join(migrationsDir, PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME), "utf8",
+      );
+      const sql = await readFile(
+        join(migrationsDir, TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME), "utf8",
+      );
+      // 0054 changes named guards, not the published capture schema. Its combined
+      // trigger fingerprint must include every old guard and every precise rotation;
+      // removing the new prefix from the old digest would not verify that boundary.
+      statements = [
+        persistedProviderCaptureFingerprintStatement(previousSql, "schema"),
+        tenantTelemetryRetainedSourceFingerprintStatement(sql, "schema"),
+        tenantTelemetryRetainedSourceFingerprintStatement(sql, "triggers"),
+      ];
+    } catch (cause) {
+      throw new Error("0054 retained telemetry source fingerprint source is invalid", { cause });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query("SET @tt_retained_source_prev_gcml=@@SESSION.group_concat_max_len");
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @persisted_capture_schema_ok AS capture_schema_ok,"
+        + "@tt_retained_source_schema_ok AS schema_ok,"
+        + "@tt_retained_source_triggers_ok AS trigger_ok,"
+        + "(SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE()"
+        + " AND trigger_name IN (" + TENANT_TELEMETRY_RETAINED_SOURCE_BOOTSTRAP_SHAPES.map(() => "?").join(",") + ")) AS bootstrap_count",
+        TENANT_TELEMETRY_RETAINED_SOURCE_BOOTSTRAP_SHAPES.map(([name]) => name),
+      );
+      if (Number(rows[0]?.capture_schema_ok) !== 1
+        || Number(rows[0]?.schema_ok) !== 1 || Number(rows[0]?.trigger_ok) !== 1
+        || storedSafeInteger(rows[0]?.bootstrap_count, "retained source surviving bootstrap guard count") !== 0) {
+        throw new Error("stored schema/triggers do not match the 0054 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error("0054 retained telemetry source fingerprint verification failed", { cause });
+    }
+    try {
+      await conn.query("SET SESSION group_concat_max_len=@tt_retained_source_prev_gcml");
+    } catch (cause) {
+      failure ??= new Error("0054 retained telemetry source fingerprint session restore failed", { cause });
+    }
     if (failure) throw failure;
   }
 
@@ -9973,7 +10194,8 @@ export class MysqlSessionStore implements
            ON BINARY r.request_id=BINARY j.request_id
           AND BINARY r.tenant_id=BINARY j.tenant_id
         WHERE j.phase='plan_sealed' AND e.domain IN ('logs','traces')
-          AND e.target_count>0 AND r.request_id IS NULL LIMIT 1`,
+          AND e.target_count>0 AND r.request_id IS NULL
+          ${this.tenantTelemetryRetainedSourceSchemaInstalled ? "AND j.telemetry_retained_source_protocol IS NULL" : ""} LIMIT 1`,
     );
     if (missingNonzero[0]) throw new TenantErasureIntegrityError();
     const [orphans] = await conn.query<Row[]>(
@@ -10222,6 +10444,10 @@ export class MysqlSessionStore implements
         && !done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME)) {
         throw new Error("0053 capture marker is missing its 0052 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME)
+        && !done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME)) {
+        throw new Error("0054 retained source marker is missing its 0053 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -10298,6 +10524,7 @@ export class MysqlSessionStore implements
           conn, migrationsDir, done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME),
           done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME),
           done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME),
+          done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME),
         );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
@@ -10351,6 +10578,9 @@ export class MysqlSessionStore implements
       );
       this.ordinaryUsageRetentionSchemaInstalled = done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME);
       this.persistedProviderCaptureSchemaInstalled = done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME);
+      this.tenantTelemetryRetainedSourceSchemaInstalled = done.has(
+        TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME,
+      );
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
@@ -10365,6 +10595,14 @@ export class MysqlSessionStore implements
   async migrate(migrationsDir?: string, lockTimeoutSeconds = 60): Promise<void> {
     const dir = migrationsDir ?? (await MysqlSessionStore.resolveMigrationsDir());
     if (!Number.isInteger(lockTimeoutSeconds) || lockTimeoutSeconds < 0) throw new Error("migrationLockTimeoutSeconds must be a non-negative integer");
+    const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
+    if (files.includes(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME)) {
+      // Pure source validation precedes even schema_migrations creation and every
+      // predecessor DDL. An unfinished 0054 draft must not partially migrate a fresh DB.
+      const sql = await readFile(join(dir, TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME), "utf8");
+      tenantTelemetryRetainedSourceFingerprintStatement(sql, "schema");
+      tenantTelemetryRetainedSourceFingerprintStatement(sql, "triggers");
+    }
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -10391,7 +10629,6 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)) {
         throw new Error("0038 membership marker is missing its 0037 predecessor");
       }
-      const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
       if (done.has(TENANT_TELEMETRY_OWNER_CLOSURE_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_ARTIFACT_MEMBERSHIP_MIGRATION_NAME)) {
         throw new Error("0039 owner closure marker is missing its 0038 predecessor");
@@ -10428,8 +10665,38 @@ export class MysqlSessionStore implements
         && !done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME)) {
         throw new Error("0053 capture marker is missing its 0052 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME)
+        && !done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME)) {
+        throw new Error("0054 retained source marker is missing its 0053 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME) {
+          if (!done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME)) {
+            throw new Error("0054 retained source marker is missing its 0053 predecessor");
+          }
+          // Reject an unfinished migration source before any DDL auto-commit, not
+          // after writing a marker. Both complete fingerprint blocks are required.
+          const retainedSourceSql = await readFile(join(dir, f), "utf8");
+          tenantTelemetryRetainedSourceFingerprintStatement(retainedSourceSql, "schema");
+          tenantTelemetryRetainedSourceFingerprintStatement(retainedSourceSql, "triggers");
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables
+              WHERE table_schema=DATABASE() AND table_name IN
+                (${TENANT_TELEMETRY_RETAINED_SOURCE_TABLE_NAMES.map(() => "?").join(",")}))
+            + (SELECT COUNT(*) FROM information_schema.columns
+              WHERE table_schema=DATABASE()
+                AND table_name IN ('tenant_erasure_admissions','tenant_purge_plan_jobs')
+                AND column_name='telemetry_retained_source_protocol')
+            + (SELECT COUNT(*) FROM information_schema.triggers
+              WHERE trigger_schema=DATABASE() AND LEFT(trigger_name,16)='trg_tt_retained_') AS n`,
+          [...TENANT_TELEMETRY_RETAINED_SOURCE_TABLE_NAMES]);
+          if (storedSafeInteger(footprint[0]?.n, "markerless 0054 schema footprint") !== 0) {
+            throw new Error("0054 marker-loss or partial DDL requires controlled forward repair");
+          }
+          await this.assertPersistedProviderCaptureFingerprint(conn, dir);
+          await this.assertOrdinaryUsageRetentionFingerprint(conn, dir);
+        }
         if (f === PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME) {
           if (!done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME)) throw new Error("0053 capture marker is missing its 0052 predecessor");
           const [footprint] = await conn.query<Row[]>(`SELECT
@@ -10820,6 +11087,7 @@ export class MysqlSessionStore implements
           conn, dir, done.has(ORDINARY_SESSION_DELETE_ORIGIN_GUARD_MIGRATION_NAME),
           done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME),
           done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME),
+          done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME),
         );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
@@ -10873,6 +11141,9 @@ export class MysqlSessionStore implements
       );
       this.ordinaryUsageRetentionSchemaInstalled = done.has(ORDINARY_USAGE_RETENTION_MIGRATION_NAME);
       this.persistedProviderCaptureSchemaInstalled = done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME);
+      this.tenantTelemetryRetainedSourceSchemaInstalled = done.has(
+        TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME,
+      );
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
@@ -16326,7 +16597,14 @@ export class MysqlSessionStore implements
     input = structuredClone(input);
     validateRequestTenantErasureInput(input);
     const conn = await this.pool.getConnection();
+    let retainedRootBudget: number | undefined;
+    let transactionFailed = false;
     try {
+      // 0054 authoring is explicitly approved; execution remains behind the existing default-off
+      // tenant gates. One-transaction isolation applies only to this next transaction, not the pool.
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) {
+        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
       await conn.beginTransaction();
       await this.ensureTenantLifecycleRow(
         conn,
@@ -16402,6 +16680,7 @@ export class MysqlSessionStore implements
             replayFence ?? undefined,
             "FOR SHARE",
           );
+          await this.readRetainedSourceT1Bundle(conn, replay, "FOR SHARE");
           await conn.commit();
           return replay;
         }
@@ -16440,6 +16719,7 @@ export class MysqlSessionStore implements
           activeFence ?? undefined,
           "FOR SHARE",
         );
+        await this.readRetainedSourceT1Bundle(conn, active, "FOR SHARE");
         await conn.commit();
         return active;
       }
@@ -16535,14 +16815,20 @@ export class MysqlSessionStore implements
       validateErasureAuditChain(record, [audit]);
       validateTenantCredentialRevocationFence(fence);
 
+      const retainedSourceControl = this.tenantTelemetryRetainedSourceSchemaInstalled
+        ? await this.assertPersistedProviderCaptureProjection(conn, "FOR SHARE") : null;
+      const retainedSourceProtocol = retainedSourceControl?.state === "active"
+        ? RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL : null;
+      if (retainedSourceProtocol !== null) retainedRootBudget = await this.enterRetainedSourceRootBudget(conn);
+
       // Keep dormant tenant admission outside `erasure_requests`: frozen pre-0018 workers scan
       // NULL queue controls as poison, so sharing that table would not be rolling-upgrade safe.
       await conn.query(
         `INSERT INTO tenant_erasure_admissions
            (request_id, tenant_id, subject_generation, requested_by_key_id, idempotency_key,
             request_hash, created_at_ms, gated_at_ms, updated_at_ms, policy_version, policy_hash,
-            control_generation)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,0)`,
+            control_generation${this.tenantTelemetryRetainedSourceSchemaInstalled ? ",telemetry_retained_source_protocol" : ""})
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,0${this.tenantTelemetryRetainedSourceSchemaInstalled ? ",?" : ""})`,
         [
           record.requestId,
           record.tenantId,
@@ -16555,6 +16841,7 @@ export class MysqlSessionStore implements
           record.updatedAtMs,
           record.policyVersion ?? null,
           record.policyHash ?? null,
+          ...(this.tenantTelemetryRetainedSourceSchemaInstalled ? [retainedSourceProtocol] : []),
         ],
       );
       const [updated] = await conn.query<mysql.ResultSetHeader>(
@@ -16590,7 +16877,7 @@ export class MysqlSessionStore implements
           fence.evidenceSha256,
         ],
       );
-      const credentialJobNowMs = await this.databaseNow(conn);
+      let credentialJobNowMs = await this.databaseNow(conn);
       let telemetrySubject: TenantTelemetryLifecycleSubjectRecord | null = null;
       if (this.tenantTelemetrySchemaInstalled) {
         const telemetryControl = await this.readTenantTelemetryLifecycleControl(
@@ -16624,6 +16911,11 @@ export class MysqlSessionStore implements
           );
         }
       }
+      if (retainedSourceProtocol !== null) {
+        if (!telemetrySubject) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        const cohort = await this.captureRetainedSourceT1(conn, record, fence, telemetrySubject, credentialJobNowMs);
+        credentialJobNowMs = cohort.storeDbTimestampMs;
+      }
       await conn.query(
         `INSERT INTO tenant_credential_revocation_jobs
            (request_id, tenant_id, subject_generation, t1_fence_sha256, phase,
@@ -16649,13 +16941,18 @@ export class MysqlSessionStore implements
         audit,
         Math.max(credentialJobNowMs, record.gatedAtMs, fence.fencedAtMs),
       );
+      const retainedSourceT1 = await this.readRetainedSourceT1Bundle(conn, record, "FOR SHARE");
+      if (retainedSourceT1 && await this.databaseNow(conn) < retainedSourceT1.receipt.storeDbTimestampMs) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
       await conn.commit();
       return record;
     } catch (error) {
+      transactionFailed = true;
       await conn.rollback().catch(() => {});
       throw error;
     } finally {
-      conn.release();
+      await this.releaseRetainedSourceRootBudget(conn, retainedRootBudget, transactionFailed);
     }
   }
 
@@ -16707,6 +17004,7 @@ export class MysqlSessionStore implements
         admission,
         fence ?? undefined,
       );
+      await this.readRetainedSourceT1Bundle(conn, admission);
       return admission;
     });
   }
@@ -21465,25 +21763,27 @@ export class MysqlSessionStore implements
 
   private async loadTenantTelemetryTargetManifestEntries(
     executor: Pool | PoolConnection, tenantId: string, requestId: string,
+    lock: "" | "FOR SHARE" = "",
   ): Promise<TenantTelemetryTargetManifest.TenantTelemetryTargetManifestEntry[]> {
     if (!this.tenantTelemetryTargetManifestSchemaInstalled) return [];
     const [rows] = await executor.query<Row[]>(
       `SELECT ${TENANT_TELEMETRY_TARGET_MANIFEST_ENTRY_COLUMNS}
          FROM tenant_telemetry_target_manifest_entries
         WHERE BINARY tenant_id=BINARY ? AND BINARY request_id=BINARY ?
-        ORDER BY source_kind,source_identity_sha256`, [tenantId, requestId],
+        ORDER BY source_kind,source_identity_sha256 ${lock}`, [tenantId, requestId],
     );
     return rows.map(rowToTenantTelemetryTargetManifestEntry);
   }
 
   private async loadTenantTelemetryTargetManifestReceipt(
     executor: Pool | PoolConnection, tenantId: string, requestId: string,
+    lock: "" | "FOR SHARE" = "",
   ): Promise<TenantTelemetryTargetManifest.TenantTelemetryTargetManifestReceipt | null> {
     if (!this.tenantTelemetryTargetManifestSchemaInstalled) return null;
     const [rows] = await executor.query<Row[]>(
       `SELECT ${TENANT_TELEMETRY_TARGET_MANIFEST_RECEIPT_COLUMNS}
          FROM tenant_telemetry_target_manifest_receipts
-        WHERE BINARY tenant_id=BINARY ? AND BINARY request_id=BINARY ?`, [tenantId, requestId],
+        WHERE BINARY tenant_id=BINARY ? AND BINARY request_id=BINARY ? ${lock}`, [tenantId, requestId],
     );
     return rows[0] ? rowToTenantTelemetryTargetManifestReceipt(rows[0]) : null;
   }
@@ -21551,6 +21851,15 @@ export class MysqlSessionStore implements
   ): Promise<{ entries: TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTarget[];
     receipt: TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetReceipt } | null> {
     if (!this.tenantTelemetryPlanArtifactTargetSchemaInstalled) return null;
+    if (await this.readRetainedSourcePlanCohort(conn, job)) {
+      if (await this.loadTenantTelemetryPlanArtifactTargetReceipt(conn, job.tenantId, job.requestId)
+        || (await this.loadTenantTelemetryPlanArtifactTargets(conn, job.tenantId, job.requestId)).length !== 0) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      await this.validateRetainedSourceCatalogForPlan(conn, job, planReceipt);
+      // New family never materializes or reinterprets an old 0042 aggregate as completeness.
+      return null;
+    }
     const receipt = await this.loadTenantTelemetryPlanArtifactTargetReceipt(
       conn, job.tenantId, job.requestId,
     );
@@ -23761,6 +24070,10 @@ export class MysqlSessionStore implements
         };
         validateTenantPurgePlanJobRecord(job);
         await this.validateTenantPurgePlanSource(conn, job, true);
+        const admission = await this.loadTenantErasureAdmission(conn, tenantId, requestId, "FOR SHARE");
+        if (!admission) throw new TenantErasureIntegrityError();
+        const retainedCohort = await this.readRetainedSourceT1Bundle(conn, admission, "FOR SHARE");
+        const retainedProtocol = retainedCohort ? RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL : null;
         const [orphans] = await conn.query<Row[]>(
           `SELECT request_id FROM tenant_purge_plan_entries
             WHERE request_id=? OR tenant_id=? LIMIT 1 FOR SHARE`,
@@ -23782,9 +24095,9 @@ export class MysqlSessionStore implements
               blocker_count, blocker_root_sha256, phase, available_at_ms, attempts,
               claim_token, lease_until_ms, last_error_code, created_at_ms, updated_at_ms,
               sealed_at_ms, completed_claim_attempt, completed_claim_token_sha256,
-              aggregate_receipt_sha256, blocked_at_ms, blocked_reason_code)
+              aggregate_receipt_sha256, blocked_at_ms, blocked_reason_code${this.tenantTelemetryRetainedSourceSchemaInstalled ? ",telemetry_retained_source_protocol" : ""})
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,FALSE,?,?,?,?,'queued',?,0,
-                   NULL,NULL,NULL,?,?,NULL,NULL,NULL,NULL,NULL,NULL)`,
+                   NULL,NULL,NULL,?,?,NULL,NULL,NULL,NULL,NULL,NULL${this.tenantTelemetryRetainedSourceSchemaInstalled ? ",?" : ""})`,
           [
             job.requestId,
             job.tenantId,
@@ -23807,6 +24120,7 @@ export class MysqlSessionStore implements
             job.availableAtMs,
             job.createdAtMs,
             job.updatedAtMs,
+            ...(this.tenantTelemetryRetainedSourceSchemaInstalled ? [retainedProtocol] : []),
           ],
         );
         await conn.commit();
@@ -24204,11 +24518,21 @@ export class MysqlSessionStore implements
       if (now < current.sourceEvidenceDbMs) {
         throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
       }
+      const retainedCohort = await this.readRetainedSourcePlanCohort(conn, current);
+      let retainedTargets: { logs: TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[];
+        traces: TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[] } | undefined;
+      if (retainedCohort) {
+        if (retainedCohort.receipt.eligibility !== "eligible_retained") throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        const projection = await this.readRetainedSourceGraphProjection(conn);
+        retainedTargets = await this.retainedSourcePreplanTargets(conn, current, projection,
+          await this.verifiedTenantTelemetryLiveOwnerOperations(conn, current.tenantId, projection.sources.memberships));
+      }
       const existing = await this.validateTenantPurgePlanBuildState(
         conn,
         current,
         source,
         holdProof,
+        retainedTargets,
       );
       if (current.scanComplete) {
         const result: BuildTenantPurgePlanPageResult = {
@@ -24237,6 +24561,7 @@ export class MysqlSessionStore implements
           now,
           source,
           holdProof,
+          retainedTargets,
         ));
       }
       let planEntryRootSha256 = current.planEntryRootSha256;
@@ -24368,6 +24693,8 @@ export class MysqlSessionStore implements
     );
     if (!preflight) return null;
     const conn = await this.pool.getConnection();
+    let retainedRootBudget: number | undefined;
+    let transactionFailed = false;
     try {
       await this.beginTenantPurgePlanTransaction(conn);
       if (preflight.phase === "plan_sealed") {
@@ -24433,22 +24760,25 @@ export class MysqlSessionStore implements
         await conn.commit();
         return null;
       }
-      let entries = await this.validateTenantPurgePlanBuildState(
-        conn,
-        current,
-        source,
-        holdProof,
-      );
       // Freeze the five-source projection and canonical owner rows before computing either
       // telemetry T3d target root. These locks remain held through the terminal UPDATE;
       // 0040/0041/0042 reuse this exact projection, never a second post-receipt scan.
-      const telemetryProjection = await this.readTenantTelemetrySourceProjection(conn);
+      const retainedCohort = await this.readRetainedSourcePlanCohort(conn, current);
+      if (retainedCohort && retainedCohort.receipt.eligibility !== "eligible_retained") {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      if (retainedCohort) retainedRootBudget = await this.enterRetainedSourceRootBudget(conn);
+      const retainedProjection = retainedCohort ? await this.readRetainedSourceGraphProjection(conn) : null;
+      const telemetryProjection = retainedProjection ?? await this.readTenantTelemetrySourceProjection(conn);
       const liveOwnerOperations = await this.verifiedTenantTelemetryLiveOwnerOperations(
         conn, current.tenantId, telemetryProjection.sources.memberships,
       );
-      const preplanTelemetryTargets = TenantTelemetryPlanArtifactTarget
-        .projectTenantTelemetryPreplanTargets({ tenantId: current.tenantId,
+      const preplanTelemetryTargets = retainedProjection
+        ? await this.retainedSourcePreplanTargets(conn, current, retainedProjection, liveOwnerOperations)
+        : TenantTelemetryPlanArtifactTarget.projectTenantTelemetryPreplanTargets({ tenantId: current.tenantId,
           sources: telemetryProjection.sources, liveOwnerOperations });
+      let entries = await this.validateTenantPurgePlanBuildState(conn, current, source, holdProof,
+        retainedCohort ? preplanTelemetryTargets : undefined);
       let builtAtomically = false;
       if (!current.scanComplete) {
         // The production path seals an untouched build atomically. Historical partial builds
@@ -24822,6 +25152,15 @@ export class MysqlSessionStore implements
       if (!this.tenantTelemetryPlanArtifactTargetSchemaInstalled) {
         throw new TenantErasureIntegrityError();
       }
+      if (retainedProjection) {
+        const catalog = await this.stageRetainedSourceCatalog(conn, terminalJob, receipt, entries,
+          sourceSnapshot, manifestSnapshot, retainedProjection, liveOwnerOperations, sourceReceipt.storeDbTimestampMs);
+        // Source leaves do not depend on future targets; only the aggregate closes both sets.
+        // The original 0042 family is deliberately not emitted for the new tagged catalog.
+        for (const row of catalog.sources) await this.insertRetainedSourceEvidence(conn, "catalog_sources", row);
+        for (const row of catalog.entries) await this.insertRetainedSourceEvidence(conn, "catalog_targets", row);
+        await this.insertRetainedSourceEvidence(conn, "catalog_receipts", catalog.receipt);
+      } else {
       const targetSnapshot = TenantTelemetryPlanArtifactTarget
         .createTenantTelemetryPlanArtifactTargetSnapshot({
           job: terminalJob, planReceipt: receipt, planEntries: entries,
@@ -24867,6 +25206,7 @@ export class MysqlSessionStore implements
           targetReceipt.completedClaimTokenSha256, targetReceipt.executionReady,
           targetReceipt.receiptSha256],
       );
+      }
       // Full-range source reads and receipt inserts may wait on a concurrent writer. Recheck
       // lease after every write, and publish T3d + sidecar only if the same claim still owns it.
       const finalNow = await this.databaseNow(conn);
@@ -24903,13 +25243,23 @@ export class MysqlSessionStore implements
         ],
       );
       if (completed.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      if (retainedCohort) {
+        await this.validateRetainedSourceCatalogForPlan(conn, terminalJob, receipt);
+        await this.lockTenantPurgePlanHoldProof(conn, current.tenantId);
+        await this.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+        const commitNow = await this.databaseNow(conn);
+        if (commitNow < sourceReceipt.storeDbTimestampMs || !tenantPurgePlanAuthorizationMatches(current, authorization, commitNow)) {
+          throw new TenantPurgePlanEvidenceChangedError();
+        }
+      }
       await conn.commit();
       return receipt;
     } catch (error) {
+      transactionFailed = true;
       await conn.rollback().catch(() => {});
       throw error;
     } finally {
-      conn.release();
+      await this.releaseRetainedSourceRootBudget(conn, retainedRootBudget, transactionFailed);
     }
   }
 
@@ -25763,12 +26113,21 @@ export class MysqlSessionStore implements
         || job.purgeNotBeforeDbMs !== planJob.purgeNotBeforeDbMs
         || job.sourceEvidenceDbMs !== planReceipt.storeDbTimestampMs
       ) throw new Error("tenant purge execution source binding is invalid");
+      const retainedCohort = await this.readRetainedSourcePlanCohort(conn, planJob);
+      if (retainedCohort) await this.validateRetainedSourceCatalogForPlan(conn, planJob, planReceipt);
       if (requireLiveSource) {
         const holdProof = await this.lockTenantPurgePlanHoldProof(conn, job.tenantId);
         await this.lockAndValidateTenantPurgePlanGlobalRelations(conn);
         let telemetryTargets: { logs: TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[];
           traces: TenantTelemetryDisposition.TenantTelemetryDispositionPlanTarget[] } | undefined;
-        if (this.tenantTelemetryPlanArtifactTargetSchemaInstalled) {
+        if (retainedCohort) {
+          if (await this.readRetainedSourceEvidencePhase(conn, planJob) !== "live") {
+            throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+          }
+          const projection = await this.readRetainedSourceGraphProjection(conn);
+          telemetryTargets = await this.retainedSourcePreplanTargets(conn, planJob, projection,
+            await this.verifiedTenantTelemetryLiveOwnerOperations(conn, job.tenantId, projection.sources.memberships));
+        } else if (this.tenantTelemetryPlanArtifactTargetSchemaInstalled) {
           // 0042 T3d sealed these roots from the locked five-source projection. Recompute the
           // same source-valid tuples under fresh locks before T3e's live-plan comparison.
           // A pre-0042 zero-target plan has no catalog and keeps its legacy zero projection;
@@ -27117,7 +27476,8 @@ export class MysqlSessionStore implements
       acks: TenantPurgeExecutionDomainAck[];
     },
     atMs: number,
-  ): Promise<void> {
+    authorization: TenantPurgeExecutionAuthorization,
+  ): Promise<RetainedSourceUsageStage | null> {
     const domain = state.domains.get("operational_usage");
     if (!domain) throw new TenantErasureIntegrityError();
     const [rows] = await conn.query<Row[]>(
@@ -27127,7 +27487,14 @@ export class MysqlSessionStore implements
       [state.job.tenantId],
     );
     if (rows.length !== domain.planTargetCount) throw new TenantPurgeExecutionEvidenceChangedError();
-    await this.assertNoPersistedProviderUsageDeletion(conn,{tenantId:state.job.tenantId});
+    const retained = await this.stageRetainedSourceUsageRelease(conn, state.job, authorization, rows, atMs);
+    if (retained) {
+      // Each immutable leaf proves the actual source and retained billing fact before DELETE.
+      // The SQL delete guard independently requires this same queued claim and leaf.
+      for (const entry of retained.entries) await this.insertRetainedSourceEvidence(conn, "usage_entries", entry);
+    } else {
+      await this.assertNoPersistedProviderUsageDeletion(conn,{tenantId:state.job.tenantId});
+    }
     const resultSha256s: string[] = [];
     for (const row of rows) {
       let usageId = row.usage_id == null ? undefined : String(row.usage_id);
@@ -27196,6 +27563,7 @@ export class MysqlSessionStore implements
       atMs,
       final: true,
     });
+    return retained;
   }
 
   private async tenantPurgeExecutionBlobCutover(
@@ -27542,6 +27910,8 @@ export class MysqlSessionStore implements
     const staged = structuredClone(authorization);
     validateTenantPurgeExecutionAuthorization(staged);
     const conn = await this.pool.getConnection();
+    let retainedRootBudget: number | undefined;
+    let transactionFailed = false;
     try {
       await this.beginTenantPurgeExecutionTransaction(conn);
       const current = await this.loadTenantPurgeExecutionJob(
@@ -27564,6 +27934,9 @@ export class MysqlSessionStore implements
         return null;
       }
       const source = await this.validateTenantPurgeExecutionSource(conn, current, true);
+      if (await this.readRetainedSourcePlanCohort(conn, source.planJob)) {
+        retainedRootBudget = await this.enterRetainedSourceRootBudget(conn);
+      }
       const domains = await this.loadTenantPurgeExecutionDomains(
         conn,
         current.tenantId,
@@ -27599,7 +27972,7 @@ export class MysqlSessionStore implements
         domains: new Map(domains.map((domain) => [domain.domain, domain])),
         acks: [...priorAcks],
       };
-      await this.tenantPurgeExecutionUsageCutover(conn, state, now);
+      const retainedUsage = await this.tenantPurgeExecutionUsageCutover(conn, state, now, staged);
       const blobReferences = await this.tenantPurgeExecutionBlobCutover(conn, state, now);
       const exportReferences = await this.tenantPurgeExecutionExportCutover(conn, state, now);
       if (state.job.unresolvedBlockerCount < 0) throw new TenantErasureIntegrityError();
@@ -27713,6 +28086,7 @@ export class MysqlSessionStore implements
         );
         if (activated.affectedRows !== 1) throw new TenantErasureIntegrityError();
       }
+      if (retainedUsage) await this.publishRetainedSourceUsageRelease(conn, state.job, receipt, retainedUsage, state.acks);
       const updatedAtMs = Math.max(current.updatedAtMs, publishNow);
       const [updated] = await conn.query<mysql.ResultSetHeader>(
         `UPDATE tenant_purge_execution_jobs
@@ -27731,14 +28105,32 @@ export class MysqlSessionStore implements
         ],
       );
       if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      if (retainedUsage) {
+        await this.validateRetainedSourceCatalogForPlan(conn, source.planJob, source.planReceipt);
+        await this.lockTenantPurgePlanHoldProof(conn, current.tenantId);
+        await this.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+        const finalNow = await this.databaseNow(conn);
+        if (finalNow < receipt.storeDbTimestampMs || !tenantPurgeExecutionAuthorizationMatches(current, staged, finalNow)) {
+          throw new TenantPurgeExecutionEvidenceChangedError();
+        }
+      }
       await this.validateTenantPurgeExecutionCutoverState(conn);
+      // All existing publication and validation order above is unchanged. A locking
+      // validator can wait, so renew no authority: check the original queued claim once
+      // more with actual DB time immediately before this destructive transaction commits.
+      if (retainedUsage) {
+        const commitNow = await this.databaseNow(conn);
+        if (commitNow < Math.max(receipt.storeDbTimestampMs, current.sourceEvidenceDbMs, current.purgeNotBeforeDbMs)
+          || !tenantPurgeExecutionAuthorizationMatches(current, staged, commitNow)) throw new TenantPurgeExecutionEvidenceChangedError();
+      }
       await conn.commit();
       return receipt;
     } catch (error) {
+      transactionFailed = true;
       await conn.rollback().catch(() => {});
       throw error;
     } finally {
-      conn.release();
+      await this.releaseRetainedSourceRootBudget(conn, retainedRootBudget, transactionFailed);
     }
   }
 
@@ -28117,6 +28509,7 @@ export class MysqlSessionStore implements
     requestId: string,
   ): Promise<TenantPurgeExecutionJobRecord | null> {
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantPurgeExecutionJob(conn, tenantId, requestId);
       if (!job) return null;
       await this.validateTenantPurgeExecutionReadProof(conn, job);
@@ -28133,6 +28526,7 @@ export class MysqlSessionStore implements
       throw new Error("invalid tenant purge execution generation");
     }
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantPurgeExecutionJob(conn, tenantId, requestId);
       if (!job || job.executionGeneration !== executionGeneration) return [];
       const proof = await this.validateTenantPurgeExecutionReadProof(conn, job);
@@ -28149,6 +28543,7 @@ export class MysqlSessionStore implements
       throw new Error("invalid tenant purge execution generation");
     }
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantPurgeExecutionJob(conn, tenantId, requestId);
       if (!job || job.executionGeneration !== executionGeneration) return [];
       const proof = await this.validateTenantPurgeExecutionReadProof(conn, job);
@@ -28161,6 +28556,7 @@ export class MysqlSessionStore implements
     requestId: string,
   ): Promise<TenantPurgeLocalCutoverReceipt | null> {
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantPurgeExecutionJob(conn, tenantId, requestId);
       if (!job) {
         const orphan = await this.loadTenantPurgeLocalCutoverReceipt(conn, tenantId, requestId);
@@ -28177,6 +28573,7 @@ export class MysqlSessionStore implements
     requestId: string,
   ): Promise<TenantPurgeLocalPhysicalAckReceipt | null> {
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantPurgeExecutionJob(conn, tenantId, requestId);
       if (!job) {
         const orphan = await this.loadTenantPurgeLocalPhysicalReceipt(conn, tenantId, requestId);
@@ -28804,6 +29201,7 @@ export class MysqlSessionStore implements
         executionAcks,
       };
     } catch (error) {
+      if (isMysqlTransientLockError(error)) throw error;
       if (error instanceof TenantDatabasePurgeNotReadyError) throw error;
       if (error instanceof TenantPurgeExecutionNotReadyError) {
         throw new TenantDatabasePurgeNotReadyError(
@@ -30482,6 +30880,8 @@ export class MysqlSessionStore implements
     const staged = structuredClone(authorization);
     validateTenantDatabasePurgeAuthorization(staged);
     const conn = await this.pool.getConnection();
+    let retainedRootBudget: number | undefined;
+    let transactionFailed = false;
     try {
       await this.beginTenantDatabasePurgeTransaction(conn);
       const current = await this.loadTenantDatabasePurgeJob(
@@ -30521,6 +30921,7 @@ export class MysqlSessionStore implements
         throw new TenantDatabasePurgeEvidenceChangedError();
       }
       const source = await this.validateTenantDatabasePurgeSource(conn, current, true);
+      if (await this.readRetainedSourcePlanCohort(conn, source.planJob)) retainedRootBudget = await this.enterRetainedSourceRootBudget(conn);
       const { targetState } = await this.validateTenantDatabasePurgeReady(
         conn,
         current,
@@ -30790,6 +31191,11 @@ export class MysqlSessionStore implements
         );
       }
 
+      const retainedCanonical = await this.stageRetainedSourceCanonicalClosure(conn, current, staged,
+        preDeleteReceipt, graveMarkers, ownerClosureEntries, purgeAtMs);
+      if (retainedCanonical) {
+        for (const entry of retainedCanonical.entries) await this.insertRetainedSourceEvidence(conn, "canonical_entries", entry);
+      }
       await this.deleteTenantDatabasePurgeTargets(conn, current.tenantId, targetState.targets);
 
       const clearedProfileHash = tenantDatabasePurgeTargetSha256("tenant_profile", [
@@ -31022,6 +31428,8 @@ export class MysqlSessionStore implements
          VALUES (${closureReceiptValues.map(() => "?").join(",")})`,
         closureReceiptValues,
       );
+      if (retainedCanonical) await this.publishRetainedSourceCanonicalClosure(conn, current, retainedCanonical,
+        receipt, ownerClosureReceipt, ownerClosureEntries, graveMarkers);
 
       now = await this.databaseNow(conn);
       if (!tenantDatabasePurgeAuthorizationMatches(current, staged, now)) {
@@ -31108,14 +31516,33 @@ export class MysqlSessionStore implements
         ],
       );
       if (updated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      if (retainedCanonical) {
+        const planReceipt = await this.loadTenantPurgePlanReceipt(conn, current.tenantId, current.requestId, "FOR SHARE");
+        if (!planReceipt) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        await this.validateRetainedSourceCatalogForPlan(conn, source.planJob, planReceipt);
+        await this.lockTenantPurgePlanHoldProof(conn, current.tenantId);
+        await this.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+        const finalNow = await this.databaseNow(conn);
+        if (finalNow < receipt.storeDbTimestampMs || !tenantDatabasePurgeAuthorizationMatches(current, staged, finalNow)) {
+          throw new TenantDatabasePurgeEvidenceChangedError();
+        }
+      }
       await this.validateTenantDatabasePurgeCutoverState(conn, "FOR SHARE");
+      // Preserve every prior receipt/hold/runtime/cutover check; this final observation
+      // only narrows authorization after any late lock wait, never advances the old time.
+      if (retainedCanonical) {
+        const commitNow = await this.databaseNow(conn);
+        if (commitNow < Math.max(receipt.storeDbTimestampMs, current.sourceEvidenceDbMs, current.purgeNotBeforeDbMs)
+          || !tenantDatabasePurgeAuthorizationMatches(current, staged, commitNow)) throw new TenantDatabasePurgeEvidenceChangedError();
+      }
       await conn.commit();
       return receipt;
     } catch (error) {
+      transactionFailed = true;
       await conn.rollback().catch(() => {});
       throw error;
     } finally {
-      conn.release();
+      await this.releaseRetainedSourceRootBudget(conn, retainedRootBudget, transactionFailed);
     }
   }
 
@@ -31210,6 +31637,7 @@ export class MysqlSessionStore implements
     requestId: string,
   ): Promise<TenantDatabasePurgeJobRecord | null> {
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
       if (!job) return null;
       await this.validateTenantDatabasePurgeReadProof(conn, job);
@@ -31226,6 +31654,7 @@ export class MysqlSessionStore implements
       throw new Error("invalid tenant database purge generation");
     }
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
       if (!job || job.phase !== "database_purged"
         || job.databasePurgeGeneration !== databasePurgeGeneration) return [];
@@ -31239,6 +31668,7 @@ export class MysqlSessionStore implements
     requestId: string,
   ): Promise<TenantDatabasePurgePreDeleteReceipt | null> {
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
       if (!job || job.phase !== "database_purged") return null;
       const proof = await this.validateTenantDatabasePurgeReadProof(conn, job);
@@ -31255,6 +31685,7 @@ export class MysqlSessionStore implements
       throw new Error("invalid tenant database purge generation");
     }
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
       if (!job || job.phase !== "database_purged"
         || job.databasePurgeGeneration !== databasePurgeGeneration) return [];
@@ -31268,6 +31699,7 @@ export class MysqlSessionStore implements
     requestId: string,
   ): Promise<TenantDatabasePurgeReceipt | null> {
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
       if (!job || job.phase !== "database_purged") return null;
       const proof = await this.validateTenantDatabasePurgeReadProof(conn, job);
@@ -31280,6 +31712,7 @@ export class MysqlSessionStore implements
     requestId: string,
   ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt | null> {
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
       if (!job) {
         if (await this.loadTenantTelemetryOwnerClosureReceipt(conn, tenantId, requestId)
@@ -31301,6 +31734,7 @@ export class MysqlSessionStore implements
     requestId: string,
   ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[]> {
     return this.withConsistentRead(async (conn) => {
+      if (this.tenantTelemetryRetainedSourceSchemaInstalled) await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
       const job = await this.loadTenantDatabasePurgeJob(conn, tenantId, requestId);
       if (!job) {
         if (await this.loadTenantTelemetryOwnerClosureReceipt(conn, tenantId, requestId)
@@ -41665,6 +42099,1202 @@ export class MysqlSessionStore implements
     return existing;
   }
 
+  // ---------- retained-source evidence: private transaction writers, read-only capability ----------
+  private async readRetainedSourceProtocol(
+    conn: PoolConnection,
+    table: "tenant_erasure_admissions" | "tenant_purge_plan_jobs",
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<typeof RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL | null> {
+    if (!this.tenantTelemetryRetainedSourceSchemaInstalled) return null;
+    const [rows] = await conn.query<Row[]>(
+      `SELECT telemetry_retained_source_protocol FROM ${table}
+        WHERE BINARY tenant_id=BINARY ? AND BINARY request_id=BINARY ? ${lock}`,
+      [tenantId, requestId],
+    );
+    if (rows.length !== 1) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const protocol = rows[0]!.telemetry_retained_source_protocol;
+    if (protocol == null) return null;
+    if (protocol !== RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return protocol;
+  }
+
+  private async insertRetainedSourceEvidence<F extends RetainedSourceEvidenceFamily>(
+    conn: PoolConnection,
+    family: F,
+    value: RetainedSourceEvidenceByFamily[F],
+  ): Promise<void> {
+    if (!this.tenantTelemetryRetainedSourceSchemaInstalled) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const projection = retainedSourceEvidenceScalarProjection(family, value);
+    const columns = Object.keys(projection);
+    await conn.query(
+      `INSERT INTO tenant_telemetry_retained_source_${family}
+        (${columns.join(",")},receipt_json) VALUES (${columns.map(() => "?").join(",")},?)`,
+      [...Object.values(projection), JSON.stringify(value)],
+    );
+  }
+
+  private async readRetainedSourceEvidence<F extends RetainedSourceEvidenceFamily>(
+    conn: PoolConnection,
+    family: F,
+    tenantId: string,
+    requestId: string,
+    lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<RetainedSourceEvidenceByFamily[F][]> {
+    if (!this.tenantTelemetryRetainedSourceSchemaInstalled) return [];
+    const [rows] = await conn.query<Row[]>(
+      `SELECT * FROM tenant_telemetry_retained_source_${family}
+        WHERE BINARY tenant_id=BINARY ? AND BINARY request_id=BINARY ?
+        ORDER BY receipt_sha256 ${lock}`,
+      [tenantId, requestId],
+    );
+    return rows.map((row) => {
+      const value = parse<RetainedSourceEvidenceByFamily[F]>(row.receipt_json);
+      const projection = retainedSourceEvidenceScalarProjection(family, value);
+      if (value.tenantId !== tenantId || value.requestId !== requestId
+        || Object.keys(row).length !== Object.keys(projection).length + 1) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      for (const [column, expected] of Object.entries(projection)) {
+        const actual = typeof expected === "number"
+          ? storedSafeInteger(row[column], "retained source numeric projection")
+          : row[column];
+        if (actual !== expected) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      return value;
+    });
+  }
+
+  private async readRetainedSourceGraphProjection(conn: PoolConnection): Promise<{
+    sources: TenantTelemetryRetainedSourceGraphInputs; capturedAtDbMs: number;
+  }> {
+    const old = await this.readTenantTelemetrySourceProjection(conn);
+    // Do not tenant-filter these ranges. Every supplied physical row is validated before the
+    // shared projector selects a tenant, including cross-tenant operations and orphan rows.
+    const [bindingRows] = await conn.query<Row[]>(
+      "SELECT tenant_id,write_operation_sha256 FROM tenant_telemetry_capture_v2_source_bindings ORDER BY write_operation_sha256 FOR SHARE",
+    );
+    const [failureRows] = await conn.query<Row[]>(
+      "SELECT tenant_id,write_operation_sha256 FROM tenant_telemetry_capture_v2_failure_commit_receipts ORDER BY write_operation_sha256 FOR SHARE",
+    );
+    const providerBindings: PersistedCapture.TenantTelemetryPersistedProviderCaptureSourceBinding[] = [];
+    const providerFailureReceipts: PersistedCapture.PersistedProviderStepFailureCommitReceipt[] = [];
+    for (const row of bindingRows) {
+      const binding = await this.readPersistedCaptureBinding(conn, String(row.tenant_id), String(row.write_operation_sha256), "FOR SHARE");
+      if (!binding || binding.tenantId !== row.tenant_id || binding.writeOperationSha256 !== row.write_operation_sha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      providerBindings.push(binding);
+    }
+    for (const row of failureRows) {
+      const failure = await this.readPersistedFailureReceipt(conn, String(row.tenant_id), String(row.write_operation_sha256), "FOR SHARE");
+      if (!failure || failure.tenantId !== row.tenant_id || failure.writeOperationSha256 !== row.write_operation_sha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      providerFailureReceipts.push(failure);
+    }
+    return { sources: { ...old.sources, providerBindings, providerFailureReceipts },
+      capturedAtDbMs: await this.databaseNow(conn) };
+  }
+
+  private async readRetainedSourceT1Bundle(
+    conn: PoolConnection, admission: ErasureRequestRecord,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<{ receipt: RetainedSource.TenantTelemetryRetainedSourceT1CohortReceipt;
+    entries: RetainedSource.TenantTelemetryRetainedSourceT1CohortEntry[] } | null> {
+    const protocol = await this.readRetainedSourceProtocol(conn, "tenant_erasure_admissions", admission.tenantId, admission.requestId, lock);
+    if (!this.tenantTelemetryRetainedSourceSchemaInstalled) return null;
+    const entries = await this.readRetainedSourceEvidence(conn, "t1_entries", admission.tenantId, admission.requestId, lock);
+    const receipts = await this.readRetainedSourceEvidence(conn, "t1_receipts", admission.tenantId, admission.requestId, lock);
+    if (protocol === null) {
+      await this.assertRetainedSourceLookupAbsent(conn, admission.tenantId, admission.requestId);
+      return null;
+    }
+    if (receipts.length !== 1) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const receipt = receipts[0]!;
+    const fence = await this.loadTenantCredentialRevocationFence(conn, admission.tenantId, admission.requestId, lock);
+    const audit = await this.loadTenantErasureFirstAudit(conn, admission.requestId, lock);
+    const subject = await this.readTenantTelemetryLifecycleSubject(conn, admission.tenantId, admission.requestId, lock);
+    if (!fence || !audit || !subject || receipt.subjectGeneration !== admission.generation
+      || receipt.t1FenceSha256 !== fence.evidenceSha256 || receipt.tenantLifecycleSubjectEvidenceSha256 !== subject.receiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    validateTenantErasureImmutableT1Proof({ admission, fence, firstAudit: audit });
+    const lifecycle = await this.readTenantTelemetryLifecycleControl(conn, lock);
+    const coverage = await this.readTenantTelemetryLifecycleCoverage(conn, admission.tenantId, lock);
+    if (lifecycle.state !== "active" || !coverage) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    this.assertTenantTelemetryLifecycleSubjectBindings(subject, admission, fence, audit, coverage, lifecycle);
+    RetainedSource.validateTenantTelemetryRetainedSourceT1CohortProof(receipt, entries, receipt.profile);
+    const control = await this.assertPersistedProviderCaptureProjection(conn, lock);
+    if (control.state !== "active") throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    if (receipt.profile.kind === "eligible-primary") {
+      const original = receipt.profile.primaryBinding;
+      const current = await this.capturePrerequisites(conn, lock);
+      const captureCoverage = await this.readPersistedCaptureCoverage(conn, admission.tenantId, lock);
+      if (lifecycle.state !== "active" || !coverage || !captureCoverage
+        || original.captureControlEvidenceSha256 !== control.activationEvidenceSha256
+        || original.lifecycleControlEvidenceSha256 !== lifecycle.activationEvidenceSha256
+        || original.refKeyIdSha256 !== lifecycle.refKeyIdSha256
+        || original.logsTargetSha256 !== control.receipt.logsTargetSha256
+        || original.logsTargetReceiptSha256 !== control.receipt.logsTargetReceiptSha256
+        || original.runtimeEpochSha256 !== current.runtimeEpochSha256
+        || original.runtimeBindingSha256 !== current.runtimeBindingSha256
+        || original.lifecycleCoverageEvidenceSha256 !== coverage.evidenceSha256
+        || original.captureCoverageEvidenceSha256 !== captureCoverage.evidenceSha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+    return { receipt, entries };
+  }
+
+  private async enterRetainedSourceRootBudget(conn: PoolConnection): Promise<number> {
+    const [rows] = await conn.query<Row[]>("SELECT @@SESSION.group_concat_max_len AS root_budget");
+    if (rows.length !== 1) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const previous = storedSafeInteger(rows[0]!.root_budget, "retained source SQL root budget", 1);
+    try { await conn.query("SET SESSION group_concat_max_len=1048576"); }
+    catch (error) {
+      // The SET response can be lost after the server applied it. Restore before reuse, or
+      // permanently discard this exact connection; an unassigned return value is not rollback.
+      try { await conn.query("SET SESSION group_concat_max_len=?", [previous]); }
+      catch { this.retainedSourceRootBudgetDiscardedConnections.add(conn); conn.destroy(); }
+      throw error;
+    }
+    return previous;
+  }
+
+  private async releaseRetainedSourceRootBudget(conn: PoolConnection, previous: number | undefined,
+    transactionFailed: boolean): Promise<void> {
+    if (this.retainedSourceRootBudgetDiscardedConnections.has(conn)) return;
+    if (previous !== undefined) {
+      try { await conn.query("SET SESSION group_concat_max_len=?", [previous]); }
+      catch {
+        // Never return a connection with a changed session budget to another operation.
+        // A post-COMMIT restore failure is response loss, not evidence of remote rollback.
+        this.retainedSourceRootBudgetDiscardedConnections.add(conn); conn.destroy();
+        if (!transactionFailed) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        return;
+      }
+    }
+    conn.release();
+  }
+
+  async getTenantTelemetryRetainedSourceT1CohortEntries(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => {
+      const admission = await this.loadTenantErasureAdmission(conn, tenantId, requestId, "FOR SHARE");
+      if (!admission) await this.assertRetainedSourceLookupAbsent(conn, tenantId, requestId);
+      return admission ? (await this.readRetainedSourceT1Bundle(conn, admission, "FOR SHARE"))?.entries ?? [] : [];
+    });
+  }
+
+  async getTenantTelemetryRetainedSourceT1CohortReceipt(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => {
+      const admission = await this.loadTenantErasureAdmission(conn, tenantId, requestId, "FOR SHARE");
+      if (!admission) await this.assertRetainedSourceLookupAbsent(conn, tenantId, requestId);
+      return admission ? (await this.readRetainedSourceT1Bundle(conn, admission, "FOR SHARE"))?.receipt ?? null : null;
+    });
+  }
+
+  private async captureRetainedSourceT1(
+    conn: PoolConnection, admission: ErasureRequestRecord, fence: TenantCredentialRevocationFence,
+    subject: TenantTelemetryLifecycleSubjectRecord, acceptedAtDbMs: number,
+  ): Promise<RetainedSource.TenantTelemetryRetainedSourceT1CohortReceipt> {
+    const capture = await this.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+    const lifecycle = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
+    const coverage = await this.readTenantTelemetryLifecycleCoverage(conn, admission.tenantId, "FOR SHARE");
+    const captureCoverage = await this.readPersistedCaptureCoverage(conn, admission.tenantId, "FOR SHARE");
+    const runtime = await this.loadTenantRestoreRuntimeControl(conn, "FOR SHARE");
+    const { control: journal } = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+    const [tenants] = await conn.query<Row[]>("SELECT tenant_id,created_at_ms FROM tenants WHERE BINARY tenant_id=BINARY ? FOR SHARE", [admission.tenantId]);
+    if (capture.state !== "active" || lifecycle.state !== "active" || !coverage || !captureCoverage
+      || runtime.state !== "active" || runtime.lineageKind !== "primary" || tenants.length !== 1
+      || subject.tenantId !== admission.tenantId || subject.requestId !== admission.requestId
+      || subject.subjectGeneration !== admission.generation || subject.t1FenceSha256 !== fence.evidenceSha256
+      || captureCoverage.lifecycleCoverageEvidenceSha256 !== coverage.evidenceSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const tenantCreatedAtDbMs = storedSafeInteger(tenants[0]!.created_at_ms, "retained source tenant creation");
+    const runtimeBindingSha256 = PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime, journal);
+    const projection = await this.readRetainedSourceGraphProjection(conn);
+    const graph = projectTenantTelemetryRetainedSourceGraph({ tenantId: admission.tenantId, sources: projection.sources });
+    const base = { requestId: admission.requestId, tenantId: admission.tenantId,
+      subjectGeneration: admission.generation, t1FenceSha256: fence.evidenceSha256 };
+    // Generation 1 runtime_unknown is ordinary canonical content, not a managed source and
+    // never part of the immutable NULL/generation-0 pre-cutover failure set.
+    const [legacyRows] = await conn.query<Row[]>(`SELECT i.body,s.user_id,i.telemetry_failure_classification,i.telemetry_capture_v2_control_generation
+      FROM items i JOIN sessions s ON BINARY s.session_id=BINARY i.session_id
+      WHERE BINARY s.tenant_id=BINARY ? AND i.type='agentMessage' AND i.status='failed'
+        AND (i.telemetry_capture_v2_control_generation IS NULL OR i.telemetry_capture_v2_control_generation=0)
+      ORDER BY i.item_id FOR SHARE`, [admission.tenantId]);
+    const legacyDigests = legacyRows.map((row) => RetainedSource.tenantTelemetryRetainedSourceLegacyFailedItemSha256({
+      tenantId: admission.tenantId, userId: String(row.user_id), item: parse<Item>(row.body),
+      classification: row.telemetry_failure_classification === "runtime_unknown" ? "runtime_unknown" : null,
+      controlGeneration: row.telemetry_capture_v2_control_generation == null ? null : 0,
+    }));
+    // The full seven-source and pre-cutover ranges are now locked. Stamp their actual
+    // post-lock DB observation, not a time captured before an ACK/range lock could wait.
+    const lockedAtDbMs = await this.databaseNow(conn);
+    if (lockedAtDbMs < Math.max(acceptedAtDbMs, admission.gatedAtMs!, fence.fencedAtMs, subject.boundAtDbMs)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    acceptedAtDbMs = lockedAtDbMs;
+    const legacyFailedItemRootSha256 = RetainedSource.tenantTelemetryRetainedSourceLegacyFailedItemRootSha256(base, legacyDigests);
+    const reasons = RetainedSource.deriveTenantTelemetryRetainedSourceBlockedReasons({
+      lifecycleHistoryStatus: coverage.historyStatus, captureStatus: captureCoverage.captureStatus,
+      legacyFailedItemCount: legacyDigests.length, runtimeState: "primary", restorePending: false,
+    });
+    const controlProjectionSha256 = RetainedSource.tenantTelemetryRetainedSourceControlProjectionSha256({
+      captureState: "active", captureControlGeneration: 1, captureControlEvidenceSha256: capture.activationEvidenceSha256,
+      lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256, refKeyIdSha256: lifecycle.refKeyIdSha256,
+      logsTargetSha256: capture.receipt.logsTargetSha256, logsTargetReceiptSha256: capture.receipt.logsTargetReceiptSha256,
+      runtimeState: "primary", runtimeControlGeneration: runtime.controlGeneration,
+      runtimeControlEvidenceSha256: runtime.evidenceSha256, runtimeEpochSha256: runtime.runtimeEpochSha256, runtimeBindingSha256,
+    });
+    const profile: RetainedSource.TenantTelemetryRetainedSourceT1Profile = reasons.length === 0
+      ? { kind: "eligible-primary", primaryBinding: RetainedSource.buildTenantTelemetryRetainedSourcePrimaryBinding({
+          scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PRIMARY_SCOPE,
+          captureControlEvidenceSha256: capture.activationEvidenceSha256,
+          lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256, refKeyIdSha256: lifecycle.refKeyIdSha256,
+          logsTargetSha256: capture.receipt.logsTargetSha256, logsTargetReceiptSha256: capture.receipt.logsTargetReceiptSha256,
+          runtimeEpochSha256: runtime.runtimeEpochSha256, runtimeBindingSha256,
+          runtimeControlEvidenceSha256: runtime.evidenceSha256, runtimeControlGeneration: runtime.controlGeneration,
+          lifecycleCoverageEvidenceSha256: coverage.evidenceSha256, captureCoverageEvidenceSha256: captureCoverage.evidenceSha256,
+          lifecycleHistoryStatus: "complete_since_creation", captureStatus: "capture_since_tenant_creation",
+          lifecycleActivatedAtDbMs: lifecycle.activatedAtDbMs, captureActivatedAtDbMs: capture.activatedAtDbMs,
+          lifecycleCoverageStartedAtDbMs: coverage.coverageStartedAtDbMs,
+          captureCoverageStartedAtDbMs: captureCoverage.coverageStartedAtDbMs, tenantCreatedAtDbMs,
+        }), legacyFailedItemCount: 0, legacyFailedItemRootSha256 }
+      : { kind: "blocked-source", controlProjectionSha256, lifecycleCoverageEvidenceSha256: coverage.evidenceSha256,
+          captureCoverageEvidenceSha256: captureCoverage.evidenceSha256, runtimeEpochSha256: runtime.runtimeEpochSha256,
+          runtimeBindingSha256, legacyFailedItemCount: legacyDigests.length, legacyFailedItemRootSha256,
+          observedHighWaterDbMs: Math.max(tenantCreatedAtDbMs, acceptedAtDbMs, lifecycle.activatedAtDbMs,
+            coverage.coverageStartedAtDbMs, capture.activatedAtDbMs, captureCoverage.coverageStartedAtDbMs, runtime.updatedAtDbMs), reasons };
+    const identity = { ...base, t1ProfileSha256: RetainedSource.tenantTelemetryRetainedSourceT1ProfileSha256(profile) };
+    const groups = graph.groups.filter((group) => group.providerBinding || group.providerFailureReceipt
+      || group.job?.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA
+      || group.membership?.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA
+      || group.inventory?.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA
+      || group.ack && !group.job);
+    const entries: RetainedSource.TenantTelemetryRetainedSourceT1CohortEntry[] = [];
+    for (const group of groups) {
+      const job = group.job;
+      const complete = !!(group.providerFailureReceipt && group.providerBinding && group.membership && job);
+      const state: RetainedSource.TenantTelemetryRetainedSourceCohortState = !complete ? "unknown"
+        : job!.phase === "written" ? "written_ack" : job!.phase === "blocked" ? "blocked" : job!.reservation ? "reserved" : "pending";
+      if (complete) {
+        const verified = await this.verifyPersistedFailureLiveProjection(conn, group.providerFailureReceipt!, "FOR SHARE");
+        const expected = state === "written_ack" ? "source_verified_written" : state === "blocked" ? "source_verified_blocked"
+          : state === "reserved" ? "source_verified_reserved" : "source_verified_queued";
+        if (verified.status !== expected) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      entries.push(RetainedSource.buildTenantTelemetryRetainedSourceT1CohortEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_T1_ENTRY_SCOPE, ...identity,
+        sourceIdentitySha256: group.sourceIdentitySha256, state, writeOperationSha256: group.operationSha256,
+        failureCommitReceiptSha256: group.providerFailureReceipt?.receiptSha256 ?? null,
+        sourceBindingReceiptSha256: group.providerBinding?.receiptSha256 ?? null, membershipSha256: group.membership?.membershipSha256 ?? null,
+        writeJobEvidenceSha256: job ? TenantTelemetrySourceAccounting.tenantTelemetrySourceAccountingJobEvidenceSha256(job) : null,
+        reservationSha256: job?.reservation?.receiptSha256 ?? null, writeAckReceiptSha256: group.ack?.receiptSha256 ?? null,
+        inventorySha256: group.inventory?.inventorySha256 ?? null, inventoryReceiptSha256: group.inventory?.receiptSha256 ?? null,
+        payloadSha256: job?.inventory.payloadSha256 ?? null, sourceHighWaterDbMs: group.sourceHighWaterDbMs, capturedAtDbMs: acceptedAtDbMs,
+      }));
+    }
+    const profileHighWater = profile.kind === "eligible-primary" ? Math.max(tenantCreatedAtDbMs,
+      coverage.coverageStartedAtDbMs, captureCoverage.coverageStartedAtDbMs) : profile.observedHighWaterDbMs;
+    const highWater = Math.max(profileHighWater, ...entries.map((entry) => entry.sourceHighWaterDbMs));
+    if (acceptedAtDbMs < Math.max(highWater, fence.fencedAtMs)) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const count = (state: RetainedSource.TenantTelemetryRetainedSourceCohortState) => entries.filter((entry) => entry.state === state).length;
+    const root = (state?: RetainedSource.TenantTelemetryRetainedSourceCohortState) => RetainedSource.tenantTelemetryRetainedSourceT1CohortRootSha256(entries, state);
+    const receipt = RetainedSource.buildTenantTelemetryRetainedSourceT1CohortReceipt({
+      scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_T1_RECEIPT_SCOPE, ...identity, profile,
+      tenantLifecycleSubjectEvidenceSha256: subject.receiptSha256, entryCount: entries.length, entryRootSha256: root(),
+      writtenAckCount: count("written_ack"), writtenAckRootSha256: root("written_ack"), pendingCount: count("pending"), pendingRootSha256: root("pending"),
+      reservedCount: count("reserved"), reservedRootSha256: root("reserved"), blockedCount: count("blocked"), blockedRootSha256: root("blocked"),
+      unknownCount: count("unknown"), unknownRootSha256: root("unknown"),
+      eligibility: profile.kind === "eligible-primary" && entries.every((entry) => entry.state === "written_ack") ? "eligible_retained" : "blocked_source",
+      t1AcceptedAtDbMs: acceptedAtDbMs, sourceHighWaterDbMs: highWater, storeDbTimestampMs: acceptedAtDbMs,
+      executionReady: false, externalAuthorityVerified: false, allDomainsComplete: false, contentPurgeExecuted: false,
+    }, entries);
+    for (const entry of entries) await this.insertRetainedSourceEvidence(conn, "t1_entries", entry);
+    await this.insertRetainedSourceEvidence(conn, "t1_receipts", receipt);
+    return receipt;
+  }
+
+  private async readRetainedSourcePlanCohort(
+    conn: PoolConnection, job: TenantPurgePlanJobRecord,
+  ) {
+    const admission = await this.loadTenantErasureAdmission(conn, job.tenantId, job.requestId, "FOR SHARE");
+    if (!admission || admission.generation !== job.subjectGeneration) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const cohort = await this.readRetainedSourceT1Bundle(conn, admission, "FOR SHARE");
+    const protocol = await this.readRetainedSourceProtocol(conn, "tenant_purge_plan_jobs", job.tenantId, job.requestId, "FOR SHARE");
+    if ((cohort === null) !== (protocol === null) || cohort && cohort.receipt.t1FenceSha256 !== job.t1FenceSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return cohort;
+  }
+
+  private async retainedSourcePreplanTargets(
+    conn: PoolConnection, job: TenantPurgePlanJobRecord,
+    projection: { sources: TenantTelemetryRetainedSourceGraphInputs; capturedAtDbMs: number },
+    liveOwnerOperations: ReadonlySet<string>,
+  ) {
+    const result = TenantTelemetryPlanArtifactTarget.projectTenantTelemetryPreplanTargets({
+      tenantId: job.tenantId, sources: projection.sources, liveOwnerOperations,
+    });
+    const cohort = await this.readRetainedSourcePlanCohort(conn, job);
+    if (!cohort) return result;
+    if (cohort.receipt.eligibility !== "eligible_retained") {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const graph = projectTenantTelemetryRetainedSourceGraph({ tenantId: job.tenantId, sources: projection.sources });
+    const groups = new Map(graph.groups.filter((group) => group.operationSha256 !== null)
+      .map((group) => [group.operationSha256!, group]));
+    for (const frozen of cohort.entries) {
+      const group = frozen.writeOperationSha256 ? groups.get(frozen.writeOperationSha256) : undefined;
+      if (frozen.state !== "written_ack" || !group?.job || !group.inventory || !group.ack
+        || !group.membership || !group.providerBinding || !group.providerFailureReceipt
+        || !group.job.reservation || !liveOwnerOperations.has(group.job.writeOperationSha256)) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      if ((await this.verifyPersistedFailureLiveProjection(conn, group.providerFailureReceipt, "FOR SHARE")).status !== "source_verified_written") {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      result.logs.push({ domain: "logs", targetSha256: group.inventory.targetSha256,
+        artifactIdSha256: group.inventory.artifactIdSha256, artifactGeneration: group.inventory.artifactGeneration,
+        inventoryReceiptSha256: group.inventory.receiptSha256, writeAckReceiptSha256: group.ack.receiptSha256 });
+    }
+    for (const domain of ["logs", "traces"] as const) {
+      TenantTelemetryDisposition.tenantTelemetryDispositionInventoryTargetRootSha256(domain, result[domain]);
+    }
+    return result;
+  }
+
+  private async stageRetainedSourceCatalog(
+    conn: PoolConnection, job: TenantPurgePlanJobRecord, planReceipt: TenantPurgePlanReceipt,
+    planEntries: readonly TenantPurgePlanEntry[],
+    sourceSnapshot: { entries: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingEntry[];
+      receipt: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingReceipt },
+    manifestSnapshot: { entries: TenantTelemetryTargetManifest.TenantTelemetryTargetManifestEntry[];
+      receipt: TenantTelemetryTargetManifest.TenantTelemetryTargetManifestReceipt },
+    projection: { sources: TenantTelemetryRetainedSourceGraphInputs; capturedAtDbMs: number },
+    liveOwnerOperations: ReadonlySet<string>, capturedAtDbMs: number,
+  ): Promise<RetainedSourceCatalogBundle> {
+    const cohort = await this.readRetainedSourcePlanCohort(conn, job);
+    if (job.phase !== "plan_sealed" || !cohort || cohort.receipt.eligibility !== "eligible_retained"
+      || cohort.receipt.profile.kind !== "eligible-primary") {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const graph = projectTenantTelemetryRetainedSourceGraph({ tenantId: job.tenantId, sources: projection.sources });
+    const groups = new Map(graph.groups.filter((group) => group.operationSha256 !== null)
+      .map((group) => [group.operationSha256!, group]));
+    const applicationV1Targets = TenantTelemetryPlanArtifactTarget.projectTenantTelemetryPlanArtifactTargets({
+      job, planReceipt, planEntries, sourceEntries: sourceSnapshot.entries, sourceReceipt: sourceSnapshot.receipt,
+      manifestEntries: manifestSnapshot.entries, manifestReceipt: manifestSnapshot.receipt,
+      sources: projection.sources, liveOwnerOperations,
+    });
+    const identity = { requestId: job.requestId, tenantId: job.tenantId, subjectGeneration: job.subjectGeneration,
+      t1ProfileSha256: cohort.receipt.t1ProfileSha256, t1FenceSha256: job.t1FenceSha256 };
+    const entries: RetainedSource.TenantTelemetryRetainedSourceCatalogEntry[] = [];
+    for (const target of applicationV1Targets) {
+      const group = groups.get(target.writeOperationSha256);
+      if (!group?.job?.reservation || !group.inventory) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      const { scope: oldScope, buildGeneration: oldBuild, applicationBindingReceiptSha256,
+        applicationCoverageEvidenceSha256, sourceGroupRootSha256, receiptSha256: oldReceipt,
+        capturedAtDbMs: oldCaptured, ...common } = target;
+      void oldScope; void oldBuild; void oldReceipt;
+      entries.push(RetainedSource.buildTenantTelemetryRetainedSourceCatalogEntry({
+        ...common, ...identity, scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CATALOG_ENTRY_SCOPE,
+        planBuildGeneration: job.buildGeneration, cohortReceiptSha256: cohort.receipt.receiptSha256,
+        source: { kind: "application-v1", applicationBindingReceiptSha256,
+          applicationCoverageEvidenceSha256, sourceGroupRootSha256 },
+        writeJobEvidenceSha256: TenantTelemetrySourceAccounting.tenantTelemetrySourceAccountingJobEvidenceSha256(group.job),
+        reservationSha256: group.job.reservation.receiptSha256,
+        sourceHighWaterDbMs: Math.max(group.sourceHighWaterDbMs, oldCaptured), capturedAtDbMs,
+      }));
+    }
+    for (const frozen of cohort.entries) {
+      const group = frozen.writeOperationSha256 ? groups.get(frozen.writeOperationSha256) : undefined;
+      if (frozen.state !== "written_ack" || !group?.job?.reservation || !group.inventory || !group.ack
+        || !group.membership || !group.providerBinding || !group.providerFailureReceipt
+        || !liveOwnerOperations.has(group.job.writeOperationSha256)) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      if ((await this.verifyPersistedFailureLiveProjection(conn, group.providerFailureReceipt, "FOR SHARE")).status !== "source_verified_written") {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      const inventory = group.inventory, membership = group.membership, writeJob = group.job;
+      const artifactGroupSha256 = TenantTelemetryTargetManifest.tenantTelemetryTargetManifestArtifactGroupSha256(job.tenantId, "logs", inventory.inventorySha256);
+      const manifest = manifestSnapshot.entries.find((entry) => entry.sourceKind === "inventory"
+        && entry.sourceIdentitySha256 === inventory.inventorySha256 && entry.writeOperationSha256 === frozen.writeOperationSha256);
+      if (manifest?.artifactGroupSha256 !== artifactGroupSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      entries.push(RetainedSource.buildTenantTelemetryRetainedSourceCatalogEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CATALOG_ENTRY_SCOPE, ...identity,
+        planBuildGeneration: job.buildGeneration, cohortReceiptSha256: cohort.receipt.receiptSha256, domain: "logs",
+        source: { kind: "persisted-provider-v2", failureCommitReceiptSha256: group.providerFailureReceipt.receiptSha256,
+          sourceBindingReceiptSha256: group.providerBinding.receiptSha256,
+          captureCoverageEvidenceSha256: cohort.receipt.profile.primaryBinding.captureCoverageEvidenceSha256,
+          cohortEntryReceiptSha256: frozen.receiptSha256 }, artifactGroupSha256,
+        targetSha256: inventory.targetSha256, targetReceiptSha256: writeJob.target.receiptSha256,
+        artifactIdSha256: inventory.artifactIdSha256, artifactGeneration: inventory.artifactGeneration,
+        inventorySha256: inventory.inventorySha256, inventoryReceiptSha256: inventory.receiptSha256,
+        writeOperationSha256: writeJob.writeOperationSha256,
+        writeJobEvidenceSha256: TenantTelemetrySourceAccounting.tenantTelemetrySourceAccountingJobEvidenceSha256(writeJob),
+        reservationSha256: writeJob.reservation!.receiptSha256, writeAckReceiptSha256: group.ack.receiptSha256,
+        membershipSha256: membership.membershipSha256, payloadSha256: inventory.payloadSha256,
+        manifestSha256: inventory.manifestSha256, lifecycleCoverageEvidenceSha256: inventory.coverageEvidenceSha256,
+        ownerKind: membership.ownerKind, ownerRefSha256: membership.ownerRefSha256,
+        holdSubjectRefSha256: membership.holdSubjectRefSha256, ownerBindingSha256: membership.ownerBindingSha256,
+        liveOwnerClaimSha256: TenantTelemetryTargetManifest.tenantTelemetryLiveOwnerClaimSha256(membership),
+        sourceHighWaterDbMs: Math.max(group.sourceHighWaterDbMs, frozen.capturedAtDbMs), capturedAtDbMs,
+      }));
+    }
+    validateTenantTelemetryRetainedSourceProviderTargetRelations({ tenantId: job.tenantId,
+      refKeyIdSha256: cohort.receipt.profile.primaryBinding.refKeyIdSha256,
+      entries, sources: projection.sources });
+    const targetByOperation = new Map(entries.map((entry) => [entry.writeOperationSha256, entry]));
+    const groupByRow = new Map(graph.groups.flatMap((group) => group.observedRows.map((row) => [row, group.sourceIdentitySha256] as const)));
+    const sources = graph.observedRows.map((row) => {
+      const target = row.writeOperationSha256 === null ? undefined : targetByOperation.get(row.writeOperationSha256);
+      return RetainedSource.buildTenantTelemetryRetainedSourceCatalogSourceEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CATALOG_SOURCE_SCOPE, ...identity, ...row,
+        planBuildGeneration: job.buildGeneration, cohortReceiptSha256: cohort.receipt.receiptSha256,
+        artifactGroupSha256: target?.artifactGroupSha256 ?? groupByRow.get(row) ?? null,
+        catalogTargetEntryReceiptSha256: target?.receiptSha256 ?? null,
+        classification: target ? "accounted" : "unknown", capturedAtDbMs,
+      });
+    });
+    const countSource = (kind: RetainedSource.TenantTelemetryRetainedSourceRawKind) => sources.filter((entry) => entry.sourceKind === kind).length;
+    const sourceRoot = (kind?: RetainedSource.TenantTelemetryRetainedSourceRawKind | "unknown") => RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sources, kind);
+    const countTarget = (kind: "application-v1" | "persisted-provider-v2" | "logs" | "traces") => entries.filter((entry) => entry.source.kind === kind || entry.domain === kind).length;
+    const unknownGroups = RetainedSource.tenantTelemetryRetainedSourceCatalogUnknownGroups(sources);
+    const proof: RetainedSource.TenantTelemetryRetainedSourceCatalogProof = {
+      cohortReceipt: cohort.receipt, cohortEntries: cohort.entries, expectedProfile: cohort.receipt.profile,
+      legacyAnchors: { job, planReceipt, sourceEntries: sourceSnapshot.entries, sourceReceipt: sourceSnapshot.receipt,
+        manifestEntries: manifestSnapshot.entries, manifestReceipt: manifestSnapshot.receipt },
+      failureReceipts: projection.sources.providerFailureReceipts.filter((failure) => failure.tenantId === job.tenantId),
+      applicationV1Targets, observedSourceRows: graph.observedRows,
+    };
+    const receipt = RetainedSource.buildTenantTelemetryRetainedSourceCatalogReceipt({
+      scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CATALOG_RECEIPT_SCOPE, ...identity,
+      planBuildGeneration: job.buildGeneration, cohortReceiptSha256: cohort.receipt.receiptSha256,
+      t3cReceiptSha256: job.t3cReceiptSha256, planReceiptSha256: planReceipt.receiptSha256,
+      legacySourceAccountingReceiptSha256: sourceSnapshot.receipt.receiptSha256,
+      legacyTargetManifestReceiptSha256: manifestSnapshot.receipt.receiptSha256,
+      proofFamily: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL,
+      sourceCount: sources.length, sourceRootSha256: sourceRoot(),
+      inventoryCount: countSource("inventory"), inventoryRootSha256: sourceRoot("inventory"),
+      writeJobCount: countSource("write_job"), writeJobRootSha256: sourceRoot("write_job"),
+      writeAckCount: countSource("write_ack"), writeAckRootSha256: sourceRoot("write_ack"),
+      membershipCount: countSource("membership"), membershipRootSha256: sourceRoot("membership"),
+      applicationBindingCount: countSource("application_binding"), applicationBindingRootSha256: sourceRoot("application_binding"),
+      providerSourceBindingCount: countSource("provider_source_binding"), providerSourceBindingRootSha256: sourceRoot("provider_source_binding"),
+      providerFailureCommitCount: countSource("provider_failure_commit"), providerFailureCommitRootSha256: sourceRoot("provider_failure_commit"),
+      unknownSourceCount: sources.filter((entry) => entry.classification === "unknown").length, unknownSourceRootSha256: sourceRoot("unknown"),
+      entryCount: entries.length, entryRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogRootSha256(entries),
+      applicationV1Count: countTarget("application-v1"), applicationV1RootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogRootSha256(entries, "application-v1"),
+      persistedProviderV2Count: countTarget("persisted-provider-v2"), persistedProviderV2RootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogRootSha256(entries, "persisted-provider-v2"),
+      logsTargetCount: countTarget("logs"), logsTargetRootSha256: TenantTelemetryDisposition.tenantTelemetryDispositionInventoryTargetRootSha256("logs", RetainedSource.tenantTelemetryRetainedSourceCatalogPlanTargets(entries, "logs")),
+      tracesTargetCount: countTarget("traces"), tracesTargetRootSha256: TenantTelemetryDisposition.tenantTelemetryDispositionInventoryTargetRootSha256("traces", RetainedSource.tenantTelemetryRetainedSourceCatalogPlanTargets(entries, "traces")),
+      unknownGroupCount: unknownGroups.length, unknownGroupRootSha256: RetainedSource.tenantTelemetryRetainedSourceUnknownGroupRootSha256(unknownGroups),
+      sourceHighWaterDbMs: Math.max(cohort.receipt.storeDbTimestampMs, ...entries.map((entry) => entry.sourceHighWaterDbMs), ...sources.map((entry) => entry.sourceHighWaterDbMs)),
+      storeDbTimestampMs: capturedAtDbMs, completedClaimAttempt: planReceipt.completedClaimAttempt,
+      completedClaimTokenSha256: planReceipt.completedClaimTokenSha256,
+      executionReady: false, externalAuthorityVerified: false, allDomainsComplete: false, contentPurgeExecuted: false,
+    }, entries, sources, proof);
+    for (const domain of ["logs", "traces"] as const) {
+      const plan = planEntries.find((entry) => entry.domain === domain);
+      if (!plan || plan.disposition !== "blocked_adapter_unconfigured"
+        || plan.targetCount !== (domain === "logs" ? receipt.logsTargetCount : receipt.tracesTargetCount)
+        || plan.targetRootSha256 !== (domain === "logs" ? receipt.logsTargetRootSha256 : receipt.tracesTargetRootSha256)) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+    return { entries, sources, receipt, proof };
+  }
+
+  private async readRetainedSourceCatalogBundle(
+    conn: PoolConnection, job: TenantPurgePlanJobRecord, planReceipt: TenantPurgePlanReceipt,
+    phase: RetainedSourceEvidencePhase,
+  ): Promise<RetainedSourceCatalogBundle> {
+    const cohort = await this.readRetainedSourcePlanCohort(conn, job);
+    const receipts = await this.readRetainedSourceEvidence(conn, "catalog_receipts", job.tenantId, job.requestId, "FOR SHARE");
+    const entries = await this.readRetainedSourceEvidence(conn, "catalog_targets", job.tenantId, job.requestId, "FOR SHARE");
+    const sources = await this.readRetainedSourceEvidence(conn, "catalog_sources", job.tenantId, job.requestId, "FOR SHARE");
+    if (!cohort || cohort.receipt.eligibility !== "eligible_retained" || cohort.receipt.profile.kind !== "eligible-primary" || receipts.length !== 1) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const receipt = receipts[0]!;
+    const sourceReceipt = await this.loadTenantTelemetrySourceAccountingReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const sourceEntries = await this.loadTenantTelemetrySourceAccountingEntries(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const manifestReceipt = await this.loadTenantTelemetryTargetManifestReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const manifestEntries = await this.loadTenantTelemetryTargetManifestEntries(conn, job.tenantId, job.requestId, "FOR SHARE");
+    if (!sourceReceipt || !manifestReceipt || receipt.planBuildGeneration !== job.buildGeneration
+      || receipt.t3cReceiptSha256 !== job.t3cReceiptSha256 || receipt.planReceiptSha256 !== planReceipt.receiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const projection = await this.readRetainedSourceGraphProjection(conn);
+    const graph = projectTenantTelemetryRetainedSourceGraph({ tenantId: job.tenantId, sources: projection.sources });
+    validateTenantTelemetryRetainedSourceProviderTargetRelations({ tenantId: job.tenantId,
+      refKeyIdSha256: cohort.receipt.profile.primaryBinding.refKeyIdSha256, entries, sources: projection.sources });
+    TenantTelemetryTargetManifest.validateTenantTelemetryObservedTargetRelations(manifestEntries, projection.sources);
+    const planEntries = await this.loadTenantPurgePlanEntries(conn, job.tenantId, job.requestId, job.buildGeneration, "FOR SHARE");
+    let applicationV1Targets: TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTarget[];
+    if (phase === "live") {
+      applicationV1Targets = TenantTelemetryPlanArtifactTarget.projectTenantTelemetryPlanArtifactTargets({
+        job, planReceipt, planEntries, sourceEntries, sourceReceipt, manifestEntries, manifestReceipt,
+        sources: projection.sources,
+        liveOwnerOperations: await this.verifiedTenantTelemetryLiveOwnerOperations(conn, job.tenantId, projection.sources.memberships),
+      });
+      for (const entry of entries) {
+        if (entry.source.kind !== "persisted-provider-v2") continue;
+        const failure = projection.sources.providerFailureReceipts.find((candidate) => candidate.writeOperationSha256 === entry.writeOperationSha256);
+        if (!failure || failure.tenantId !== job.tenantId || failure.receiptSha256 !== entry.source.failureCommitReceiptSha256
+          || (await this.verifyPersistedFailureLiveProjection(conn, failure, "FOR SHARE")).status !== "source_verified_written") {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+      }
+    } else {
+      // Historical deletion is limited to the new-tenant, same-primary v2 path, never a
+      // generic exemption for an old target whose canonical live owner can no longer be proven.
+      if (receipt.applicationV1Count !== 0 || entries.some((entry) => entry.source.kind !== "persisted-provider-v2")) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      applicationV1Targets = [];
+    }
+    const proof: RetainedSource.TenantTelemetryRetainedSourceCatalogProof = {
+      cohortReceipt: cohort.receipt, cohortEntries: cohort.entries, expectedProfile: cohort.receipt.profile,
+      legacyAnchors: { job, planReceipt, sourceEntries, sourceReceipt, manifestEntries, manifestReceipt },
+      failureReceipts: projection.sources.providerFailureReceipts.filter((failure) => failure.tenantId === job.tenantId),
+      applicationV1Targets, observedSourceRows: graph.observedRows,
+    };
+    RetainedSource.validateTenantTelemetryRetainedSourceCatalogProof(receipt, entries, sources, proof);
+    for (const domain of ["logs", "traces"] as const) {
+      const plan = planEntries.find((entry) => entry.domain === domain);
+      if (!plan || plan.disposition !== "blocked_adapter_unconfigured"
+        || plan.targetCount !== (domain === "logs" ? receipt.logsTargetCount : receipt.tracesTargetCount)
+        || plan.targetRootSha256 !== (domain === "logs" ? receipt.logsTargetRootSha256 : receipt.tracesTargetRootSha256)) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+    return { receipt, entries, sources, proof };
+  }
+
+  private async validateRetainedSourceCatalogForPlan(
+    conn: PoolConnection, job: TenantPurgePlanJobRecord, planReceipt: TenantPurgePlanReceipt,
+  ): Promise<RetainedSourceCatalogBundle> {
+    const phase = await this.readRetainedSourceEvidencePhase(conn, job);
+    const catalog = await this.readRetainedSourceCatalogBundle(conn, job, planReceipt, phase);
+    if (phase === "live") return catalog;
+    const usage = await this.readRetainedSourceUsageEvidence(conn, job, planReceipt, catalog);
+    if (phase === "canonical_closed") {
+      await this.readRetainedSourceCanonicalEvidence(conn, job, catalog, usage);
+      return catalog;
+    }
+    for (const target of catalog.entries) {
+      const failure = catalog.proof.failureReceipts.find((row) => row.writeOperationSha256 === target.writeOperationSha256);
+      const released = usage.entries.find((row) => row.writeOperationSha256 === target.writeOperationSha256);
+      if (!failure || !released) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      await this.readRetainedSourceCanonicalLiveSnapshot(conn, failure, target, released);
+    }
+    return catalog;
+  }
+
+  private async readRetainedSourceEvidencePhase(conn: PoolConnection,
+    job: TenantPurgePlanJobRecord): Promise<RetainedSourceEvidencePhase> {
+    if (!await this.readRetainedSourcePlanCohort(conn, job)) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const usage = await this.readRetainedSourceEvidence(conn, "usage_receipts", job.tenantId, job.requestId, "FOR SHARE");
+    const usageEntries = await this.readRetainedSourceEvidence(conn, "usage_entries", job.tenantId, job.requestId, "FOR SHARE");
+    const canonical = await this.readRetainedSourceEvidence(conn, "canonical_receipts", job.tenantId, job.requestId, "FOR SHARE");
+    const canonicalEntries = await this.readRetainedSourceEvidence(conn, "canonical_entries", job.tenantId, job.requestId, "FOR SHARE");
+    const execution = await this.loadTenantPurgeExecutionJob(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const cutover = await this.loadTenantPurgeLocalCutoverReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const database = await this.loadTenantDatabasePurgeJob(conn, job.tenantId, job.requestId, "FOR SHARE");
+    if (database?.phase === "database_purged") {
+      const t3f = await this.loadTenantDatabasePurgeReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+      if (canonical.length !== 1 || usage.length !== 1 || !execution || !cutover || !t3f
+        || execution.localCutoverReceiptSha256 !== cutover.receiptSha256
+        || database.terminalReceiptSha256 !== t3f.receiptSha256
+        || canonical[0]!.t3fReceiptSha256 !== t3f.receiptSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      return "canonical_closed";
+    }
+    if (canonical.length || canonicalEntries.length) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    if (cutover || execution?.localCutoverReceiptSha256 !== undefined) {
+      if (usage.length !== 1 || !cutover || !execution
+        || execution.localCutoverReceiptSha256 !== cutover.receiptSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      return "usage_released";
+    }
+    if (usage.length || usageEntries.length) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    return "live";
+  }
+
+  private async readRetainedSourceUsageEvidence(conn: PoolConnection, job: TenantPurgePlanJobRecord,
+    planReceipt: TenantPurgePlanReceipt, catalog: RetainedSourceCatalogBundle): Promise<RetainedSourceUsageBundle> {
+    const execution = await this.loadTenantPurgeExecutionJob(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const cutover = await this.loadTenantPurgeLocalCutoverReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const receipts = await this.readRetainedSourceEvidence(conn, "usage_receipts", job.tenantId, job.requestId, "FOR SHARE");
+    const entries = await this.readRetainedSourceEvidence(conn, "usage_entries", job.tenantId, job.requestId, "FOR SHARE");
+    if (!execution || !cutover || receipts.length !== 1 || execution.localCutoverReceiptSha256 !== cutover.receiptSha256
+      || cutover.blobBytesTargetCount !== 0 || cutover.exportBytesTargetCount !== 0) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const planEntries = await this.loadTenantPurgePlanEntries(conn, job.tenantId, job.requestId, job.buildGeneration, "FOR SHARE");
+    this.assertRetainedSourceNoExternalTargets(planEntries);
+    const domains = await this.loadTenantPurgeExecutionDomains(conn, job.tenantId, job.requestId, execution.executionGeneration, "FOR SHARE");
+    const acks = await this.loadTenantPurgeExecutionAcks(conn, job.tenantId, job.requestId, execution.executionGeneration, "FOR SHARE");
+    const physical = await this.loadTenantPurgeLocalPhysicalReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    // Zero Blob/export targets are the explicit bounded vertical path. No deleted outbox
+    // timestamp is invented, and this does not reinterpret a telemetry ACK as physical deletion.
+    this.tenantPurgeExecutionProofState(execution, planEntries, domains, acks, cutover, physical);
+    const usagePlan = planEntries.find((entry) => entry.domain === "operational_usage");
+    const usageAcks = acks.filter((ack) => ack.domain === "operational_usage" && ack.ackKind === "anonymized" && ack.final);
+    if (!usagePlan || usageAcks.length !== 1 || execution.planReceiptSha256 !== planReceipt.receiptSha256
+      || cutover.operationalUsageTargetRootSha256 !== usagePlan.targetRootSha256
+      || cutover.operationalUsageTargetCount !== usagePlan.targetCount) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const usageAck = usageAcks[0]!;
+    if (usageAck.storeDbTimestampMs > cutover.storeDbTimestampMs
+      || entries.some((entry) => entry.releasedAtDbMs > usageAck.storeDbTimestampMs)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const [ledgerRows] = await conn.query<Row[]>("SELECT id FROM usage_ledger WHERE BINARY tenant_id=BINARY ? ORDER BY id FOR SHARE", [job.tenantId]);
+    if (ledgerRows.length !== 0) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const [billingRows] = await conn.query<Row[]>(`SELECT ${BILLING_USAGE_COLUMNS} FROM billing_usage_facts WHERE BINARY tenant_id=BINARY ? ORDER BY usage_id FOR SHARE`, [job.tenantId]);
+    const allFacts = billingRows.map(rowToBillingUsageFact);
+    const database = await this.loadTenantDatabasePurgeJob(conn, job.tenantId, job.requestId, "FOR SHARE");
+    let prior: OrdinaryUsageRetention.PriorRetainedBillingFactProof["facts"];
+    if (database?.phase === "database_purged") {
+      const bundle = await this.loadTenantDatabasePurgeBundle(conn, database);
+      validateTenantDatabasePurgeCompletionProof(database, bundle);
+      prior = bundle.receipt.priorRetainedBillingFacts?.facts ?? [];
+    } else {
+      const [sessionRows] = await conn.query<Row[]>("SELECT session_id,tenant_id,user_id,deletion_generation,deleted_at_ms FROM sessions WHERE BINARY tenant_id=BINARY ? ORDER BY session_id FOR SHARE", [job.tenantId]);
+      const sessions: MysqlTenantDatabasePurgeSession[] = sessionRows.map((row) => ({ sessionId: String(row.session_id),
+        tenantId: String(row.tenant_id), userId: String(row.user_id), deletionGeneration: storedSafeInteger(row.deletion_generation, "retained source session generation"),
+        ...(row.deleted_at_ms == null ? {} : { deletedAtDbMs: storedSafeInteger(row.deleted_at_ms, "retained source session deletion") }) }));
+      prior = await this.ordinaryUsageRetentionPriorBillingFacts(conn, job.tenantId, sessions);
+    }
+    const currentFacts = OrdinaryUsageRetention.subtractPriorRetainedBillingFacts(job.tenantId, allFacts, prior);
+    if (usageAck.resultCount !== currentFacts.length || usageAck.affectedCount !== usagePlan.targetCount
+      || usageAck.resultRootSha256 !== tenantPurgeExecutionResultRootSha256("operational_usage", "anonymize", currentFacts.map((fact) => fact.factSha256))) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const factByHash = new Map(allFacts.map((fact) => [PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-usage-id-v2", fact.usageId), fact]));
+    const retainedFacts = entries.map((entry) => {
+      const fact = factByHash.get(entry.usageIdSha256);
+      if (!fact || fact.tenantId !== job.tenantId) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      return fact;
+    });
+    const proof: RetainedSource.TenantTelemetryRetainedSourceUsageProof = {
+      catalogProof: catalog.proof, catalogReceipt: catalog.receipt, catalogEntries: catalog.entries, catalogSources: catalog.sources,
+      retainedBillingFacts: retainedFacts, anchors: { planBuildGeneration: job.buildGeneration,
+        executionGeneration: execution.executionGeneration, planReceiptSha256: planReceipt.receiptSha256,
+        operationalUsagePlanRootSha256: usagePlan.targetRootSha256, operationalUsageAckReceiptSha256: usageAck.receiptSha256,
+        localCutoverReceiptSha256: cutover.receiptSha256, completedClaimAttempt: cutover.completedClaimAttempt,
+        completedClaimTokenSha256: cutover.completedClaimTokenSha256, storeDbTimestampMs: cutover.storeDbTimestampMs },
+    };
+    RetainedSource.validateTenantTelemetryRetainedSourceUsageReleaseProof(receipts[0]!, entries, proof);
+    return { receipt: receipts[0]!, entries, proof };
+  }
+
+  private async stageRetainedSourceUsageRelease(conn: PoolConnection,
+    execution: Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }>,
+    authorization: TenantPurgeExecutionAuthorization, rows: readonly Row[], releasedAtDbMs: number,
+  ): Promise<RetainedSourceUsageStage | null> {
+    const job = await this.loadTenantPurgePlanJob(conn, execution.tenantId, execution.requestId, "FOR SHARE");
+    if (!job || job.phase !== "plan_sealed") throw new TenantErasureIntegrityError();
+    if (!await this.readRetainedSourcePlanCohort(conn, job)) return null;
+    if (await this.readRetainedSourceEvidencePhase(conn, job) !== "live") throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const planReceipt = await this.loadTenantPurgePlanReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    if (!planReceipt || execution.planReceiptSha256 !== planReceipt.receiptSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const catalog = await this.readRetainedSourceCatalogBundle(conn, job, planReceipt, "live");
+    const planEntries = await this.loadTenantPurgePlanEntries(conn, job.tenantId, job.requestId, job.buildGeneration, "FOR SHARE");
+    this.assertRetainedSourceNoExternalTargets(planEntries);
+    const usagePlan = planEntries.find((entry) => entry.domain === "operational_usage");
+    if (!usagePlan || catalog.receipt.unknownGroupCount !== 0 || catalog.receipt.applicationV1Count !== 0
+      ) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const byHash = new Map<string, Row>();
+    for (const row of rows) {
+      if (row.usage_id == null) continue;
+      const hash = PersistedCapture.persistedProviderCaptureSha256("tenant-telemetry-step-usage-id-v2", row.usage_id);
+      if (byHash.has(hash) || row.tenant_id !== job.tenantId) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      byHash.set(hash, row);
+    }
+    const entries: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry[] = [];
+    const retainedFacts: BillingUsageFact[] = [];
+    for (const target of catalog.entries) {
+      const failure = catalog.proof.failureReceipts.find((receipt) => receipt.writeOperationSha256 === target.writeOperationSha256);
+      const row = failure ? byHash.get(failure.usageIdSha256) : undefined;
+      if (target.source.kind !== "persisted-provider-v2" || !failure || !row || row.usage_id == null) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      const [facts] = await conn.query<Row[]>(`SELECT ${BILLING_USAGE_COLUMNS} FROM billing_usage_facts WHERE usage_id=? FOR SHARE`, [row.usage_id]);
+      if (facts.length !== 1) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      const fact = rowToBillingUsageFact(facts[0]!);
+      const operational: UsageLedgerEntry & { usageId: string } = { usageId: String(row.usage_id), tenantId: String(row.tenant_id),
+        userId: String(row.user_id), sessionId: String(row.session_id), turnId: String(row.turn_id), step: storedSafeInteger(row.step, "retained source usage step"),
+        provider: String(row.provider), model: String(row.model), usage: parse(row.usage_json), createdAtMs: storedSafeInteger(row.created_at_ms, "retained source usage time") };
+      if (fact.tenantId !== job.tenantId || !billingUsageFactContentEquals(fact, billingUsageFactFromLedger(operational))) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      retainedFacts.push(fact);
+      entries.push(RetainedSource.buildTenantTelemetryRetainedSourceUsageReleaseEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_USAGE_ENTRY_SCOPE, requestId: job.requestId,
+        tenantId: job.tenantId, subjectGeneration: job.subjectGeneration, t1ProfileSha256: catalog.receipt.t1ProfileSha256,
+        t1FenceSha256: job.t1FenceSha256, planBuildGeneration: job.buildGeneration, executionGeneration: execution.executionGeneration,
+        cohortReceiptSha256: catalog.receipt.cohortReceiptSha256, catalogEntryReceiptSha256: target.receiptSha256,
+        catalogReceiptSha256: catalog.receipt.receiptSha256, writeOperationSha256: target.writeOperationSha256,
+        failureCommitReceiptSha256: failure.receiptSha256, usageIdSha256: failure.usageIdSha256, billingRootSha256: failure.billingRootSha256,
+        retainedBillingFactSha256: fact.factSha256, planReceiptSha256: planReceipt.receiptSha256,
+        operationalUsagePlanRootSha256: usagePlan.targetRootSha256, completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256: tenantPurgeExecutionClaimTokenSha256(authorization.claimToken),
+        sourceHighWaterDbMs: Math.max(catalog.receipt.storeDbTimestampMs, failure.committedAtDbMs), releasedAtDbMs,
+      }));
+    }
+    return { catalog, entries, retainedFacts };
+  }
+
+  private assertRetainedSourceNoExternalTargets(entries: readonly TenantPurgePlanEntry[]): void {
+    if (entries.length !== TENANT_PURGE_PLAN_DOMAINS.length
+      || new Set(entries.map((entry) => entry.domain)).size !== TENANT_PURGE_PLAN_DOMAINS.length
+      || entries.some((entry) => !TENANT_PURGE_PLAN_DOMAINS.includes(entry.domain)
+        || ((entry.domain.startsWith("blob_") || entry.domain.startsWith("user_export_")) && entry.targetCount !== 0))) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+  }
+
+  private async publishRetainedSourceUsageRelease(conn: PoolConnection,
+    execution: Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }>, cutover: TenantPurgeLocalCutoverReceipt,
+    stage: RetainedSourceUsageStage, acks: readonly TenantPurgeExecutionDomainAck[]): Promise<void> {
+    const usageAcks = acks.filter((ack) => ack.domain === "operational_usage" && ack.ackKind === "anonymized" && ack.final);
+    if (usageAcks.length !== 1) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const usageAck = usageAcks[0]!;
+    const { catalog, entries, retainedFacts } = stage;
+    // Do not rewrite the old ACK timestamp to the later cutover/aggregate time.
+    // Bind the real receipt and require this new bridge's leaves to precede it.
+    if (usageAck.storeDbTimestampMs > cutover.storeDbTimestampMs
+      || entries.some((entry) => entry.releasedAtDbMs > usageAck.storeDbTimestampMs)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const proof: RetainedSource.TenantTelemetryRetainedSourceUsageProof = {
+      catalogProof: catalog.proof, catalogReceipt: catalog.receipt, catalogEntries: catalog.entries,
+      catalogSources: catalog.sources, retainedBillingFacts: retainedFacts,
+      anchors: { planBuildGeneration: execution.planBuildGeneration, executionGeneration: execution.executionGeneration,
+        planReceiptSha256: execution.planReceiptSha256, operationalUsagePlanRootSha256: cutover.operationalUsageTargetRootSha256,
+        operationalUsageAckReceiptSha256: usageAck.receiptSha256, localCutoverReceiptSha256: cutover.receiptSha256,
+        completedClaimAttempt: cutover.completedClaimAttempt, completedClaimTokenSha256: cutover.completedClaimTokenSha256,
+        storeDbTimestampMs: cutover.storeDbTimestampMs },
+    };
+    const receipt = RetainedSource.buildTenantTelemetryRetainedSourceUsageReleaseReceipt({
+      scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_USAGE_RECEIPT_SCOPE,
+      requestId: execution.requestId, tenantId: execution.tenantId, subjectGeneration: execution.subjectGeneration,
+      t1ProfileSha256: catalog.receipt.t1ProfileSha256, t1FenceSha256: catalog.receipt.t1FenceSha256,
+      planBuildGeneration: execution.planBuildGeneration, executionGeneration: execution.executionGeneration,
+      cohortReceiptSha256: catalog.receipt.cohortReceiptSha256, catalogReceiptSha256: catalog.receipt.receiptSha256,
+      planReceiptSha256: execution.planReceiptSha256, operationalUsagePlanRootSha256: cutover.operationalUsageTargetRootSha256,
+      operationalUsageAckReceiptSha256: usageAck.receiptSha256, localCutoverReceiptSha256: cutover.receiptSha256,
+      entryCount: entries.length, entryRootSha256: RetainedSource.tenantTelemetryRetainedSourceUsageReleaseRootSha256(entries),
+      retainedBillingFactCount: retainedFacts.length,
+      retainedBillingFactRootSha256: RetainedSource.tenantTelemetryRetainedSourceRetainedBillingRootSha256(entries),
+      sourceHighWaterDbMs: Math.max(catalog.receipt.storeDbTimestampMs, ...entries.map((entry) => entry.sourceHighWaterDbMs)),
+      storeDbTimestampMs: cutover.storeDbTimestampMs, completedClaimAttempt: cutover.completedClaimAttempt,
+      completedClaimTokenSha256: cutover.completedClaimTokenSha256,
+      executionReady: false, externalAuthorityVerified: false, allDomainsComplete: false, contentPurgeExecuted: false,
+    }, entries, proof);
+    await this.insertRetainedSourceEvidence(conn, "usage_receipts", receipt);
+  }
+
+  private async readRetainedSourceCanonicalLiveSnapshot(conn: PoolConnection,
+    receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt,
+    target: RetainedSource.TenantTelemetryRetainedSourceCatalogEntry,
+    released: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry,
+  ): Promise<RetainedSource.TenantTelemetryRetainedSourceCanonicalSnapshot> {
+    PersistedCapture.validatePersistedProviderFailureCommitReceipt(receipt);
+    if (target.source.kind !== "persisted-provider-v2" || target.ownerKind !== "session"
+      || target.writeOperationSha256 !== receipt.writeOperationSha256
+      || target.source.failureCommitReceiptSha256 !== receipt.receiptSha256
+      || released.writeOperationSha256 !== receipt.writeOperationSha256
+      || released.failureCommitReceiptSha256 !== receipt.receiptSha256
+      || released.usageIdSha256 !== receipt.usageIdSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const control = await this.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+    if (control.state !== "active" || control.activationEvidenceSha256 !== receipt.captureControlEvidenceSha256
+      || control.receipt.runtimeEpochSha256 !== receipt.runtimeEpochSha256
+      || control.receipt.runtimeBindingSha256 !== receipt.runtimeBindingSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const key = this.requireTenantTelemetryRefKey();
+    const [sources] = await conn.query<Row[]>(`SELECT i.*,s.tenant_id,s.user_id AS source_session_user_id,
+      t.user_id AS source_turn_user_id,t.status AS source_turn_status,t.body AS turn_body
+      FROM items i JOIN sessions s ON BINARY s.session_id=BINARY i.session_id
+      JOIN turns t ON BINARY t.turn_id=BINARY i.turn_id AND BINARY t.session_id=BINARY i.session_id
+      WHERE BINARY s.tenant_id=BINARY ? AND BINARY i.telemetry_capture_v2_operation_sha256=BINARY ? FOR SHARE`,
+    [receipt.tenantId, receipt.writeOperationSha256]);
+    const source = sources[0];
+    if (sources.length !== 1 || !source) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const item = parse<Item>(source.body), turn = parse<Turn>(source.turn_body);
+    if (source.tenant_id !== receipt.tenantId || item.type !== "agentMessage" || item.status !== "failed"
+      || item.step !== receipt.sourceStepIndex || item.turnId !== turn.id || item.sessionId !== turn.sessionId
+      || !Number.isSafeInteger(item.seq) || item.seq < 1 || item.seq > receipt.sourceEventSeq
+      || source.user_id !== source.source_session_user_id || source.user_id !== source.source_turn_user_id
+      || source.item_id !== item.id || source.session_id !== item.sessionId || source.turn_id !== item.turnId
+      || source.type !== item.type || source.status !== item.status || Number(source.seq) !== item.seq
+      || Number(source.created_at_ms) !== item.createdAtMs || Number(source.completed_at_ms) !== item.completedAtMs
+      || source.source_turn_status !== turn.status || source.telemetry_failure_classification !== "provider_step_error"
+      || Number(source.telemetry_capture_v2_control_generation) !== 1
+      || source.telemetry_capture_v2_failure_receipt_sha256 !== receipt.receiptSha256
+      || source.telemetry_capture_v2_business_batch_sha256 !== receipt.businessBatchSha256
+      || source.telemetry_capture_v2_session_ref_sha256 !== receipt.sourceSessionRefSha256
+      || source.telemetry_capture_v2_turn_ref_sha256 !== receipt.sourceTurnRefSha256
+      || source.telemetry_capture_v2_item_ref_sha256 !== receipt.sourceItemRefSha256
+      || telemetryCaptureLogsSourceRefSha256("session", receipt.tenantId, item.sessionId, key) !== receipt.sourceSessionRefSha256
+      || telemetryCaptureLogsSourceRefSha256("turn", receipt.tenantId, item.turnId, key) !== receipt.sourceTurnRefSha256
+      || telemetryCaptureLogsSourceRefSha256("item", receipt.tenantId, item.id, key) !== receipt.sourceItemRefSha256
+      || target.ownerRefSha256 !== tenantTelemetryOwnerRefSha256("session", item.sessionId, key)
+      || target.holdSubjectRefSha256 !== tenantTelemetryOwnerRefSha256("user", String(source.user_id), key)
+      || target.ownerBindingSha256 !== TenantTelemetryArtifactMembership.tenantTelemetryArtifactOwnerBindingSha256({
+        tenantId: receipt.tenantId, ownerKind: "session", ownerId: item.sessionId, ownerUserId: String(source.user_id),
+      }, key)) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const [eventRows] = await conn.query<Row[]>(`SELECT * FROM events WHERE BINARY session_id=BINARY ? AND seq>? AND seq<=? ORDER BY seq FOR SHARE`,
+      [item.sessionId, receipt.beginLastSeq, receipt.endLastSeq]);
+    const events = eventRows.map((row) => parse<PersistedEvent>(row.body));
+    const completed = events.find((event) => event.seq === receipt.sourceEventSeq);
+    const completedRow = eventRows.find((row) => Number(row.seq) === receipt.sourceEventSeq);
+    if (events.length !== receipt.eventCount || PersistedCapture.persistedProviderCaptureEventRoot(events) !== receipt.eventRootSha256
+      || eventRows.some((row, index) => Number(row.seq) !== receipt.beginLastSeq + index + 1
+        || row.user_id !== source.source_session_user_id || row.session_id !== item.sessionId
+        || row.type !== events[index]?.type || events[index]?.sessionId !== item.sessionId || events[index]?.seq !== Number(row.seq))
+      || completed?.type !== "item/completed"
+      || PersistedCapture.persistedProviderCaptureCanonicalJson(completed.item) !== PersistedCapture.persistedProviderCaptureCanonicalJson(item)
+      || completedRow?.telemetry_failure_classification !== "provider_step_error"
+      || Number(completedRow.telemetry_capture_v2_control_generation) !== 1
+      || completedRow.telemetry_capture_v2_operation_sha256 !== receipt.writeOperationSha256
+      || completedRow.telemetry_capture_v2_failure_receipt_sha256 !== receipt.receiptSha256
+      || completedRow.telemetry_capture_v2_business_batch_sha256 !== receipt.businessBatchSha256
+      || completedRow.telemetry_capture_v2_session_ref_sha256 !== receipt.sourceSessionRefSha256
+      || completedRow.telemetry_capture_v2_turn_ref_sha256 !== receipt.sourceTurnRefSha256
+      || completedRow.telemetry_capture_v2_item_ref_sha256 !== receipt.sourceItemRefSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return { writeOperationSha256: receipt.writeOperationSha256, item, events };
+  }
+
+  private async stageRetainedSourceCanonicalClosure(conn: PoolConnection,
+    database: Extract<TenantDatabasePurgeJobRecord, { phase: "queued" }>, authorization: TenantDatabasePurgeAuthorization,
+    preDeleteReceipt: TenantDatabasePurgePreDeleteReceipt, graves: readonly TenantPurgeSessionGraveMarker[],
+    owners: readonly TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[], capturedAtDbMs: number,
+  ): Promise<RetainedSourceCanonicalStage | null> {
+    const job = await this.loadTenantPurgePlanJob(conn, database.tenantId, database.requestId, "FOR SHARE");
+    if (!job || job.phase !== "plan_sealed") throw new TenantErasureIntegrityError();
+    if (!await this.readRetainedSourcePlanCohort(conn, job)) return null;
+    if (await this.readRetainedSourceEvidencePhase(conn, job) !== "usage_released") throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const planReceipt = await this.loadTenantPurgePlanReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    if (!planReceipt || planReceipt.receiptSha256 !== database.planReceiptSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const planEntries = await this.loadTenantPurgePlanEntries(conn, job.tenantId, job.requestId, job.buildGeneration, "FOR SHARE");
+    this.assertRetainedSourceNoExternalTargets(planEntries);
+    const catalog = await this.readRetainedSourceCatalogBundle(conn, job, planReceipt, "usage_released");
+    const usage = await this.readRetainedSourceUsageEvidence(conn, job, planReceipt, catalog);
+    const releasedByOperation = new Map(usage.entries.map((entry) => [entry.writeOperationSha256, entry]));
+    const ownersByOperation = new Map(owners.map((entry) => [entry.writeOperationSha256, entry]));
+    const gravesByHash = new Map(graves.map((marker) => [marker.markerSha256, marker]));
+    if (owners.length !== usage.entries.length || ownersByOperation.size !== owners.length
+      || releasedByOperation.size !== usage.entries.length || gravesByHash.size !== graves.length) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const entries: RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry[] = [];
+    for (const target of catalog.entries) {
+      const failure = catalog.proof.failureReceipts.find((receipt) => receipt.writeOperationSha256 === target.writeOperationSha256);
+      const released = releasedByOperation.get(target.writeOperationSha256);
+      const owner = ownersByOperation.get(target.writeOperationSha256);
+      const grave = owner?.sessionGraveMarkerSha256 ? gravesByHash.get(owner.sessionGraveMarkerSha256) : undefined;
+      if (target.source.kind !== "persisted-provider-v2" || !failure || !released || !owner || !grave
+        || owner.ownerKind !== "session" || owner.tenantId !== job.tenantId || owner.preDeleteReceiptSha256 !== preDeleteReceipt.receiptSha256
+        || owner.capturedAtDbMs !== capturedAtDbMs || grave.tenantId !== job.tenantId
+        || grave.preDeleteReceiptSha256 !== preDeleteReceipt.receiptSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      const snapshot = await this.readRetainedSourceCanonicalLiveSnapshot(conn, failure, target, released);
+      const entry = RetainedSource.buildTenantTelemetryRetainedSourceCanonicalClosureEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CANONICAL_ENTRY_SCOPE,
+        requestId: job.requestId, tenantId: job.tenantId, subjectGeneration: job.subjectGeneration,
+        t1ProfileSha256: catalog.receipt.t1ProfileSha256, t1FenceSha256: catalog.receipt.t1FenceSha256,
+        planBuildGeneration: database.planBuildGeneration, executionGeneration: database.executionGeneration,
+        databasePurgeGeneration: database.databasePurgeGeneration, cohortReceiptSha256: catalog.receipt.cohortReceiptSha256,
+        catalogReceiptSha256: catalog.receipt.receiptSha256, catalogEntryReceiptSha256: target.receiptSha256,
+        usageReleaseReceiptSha256: usage.receipt.receiptSha256, usageReleaseEntryReceiptSha256: released.receiptSha256,
+        writeOperationSha256: failure.writeOperationSha256, failureCommitReceiptSha256: failure.receiptSha256,
+        sourceBindingReceiptSha256: failure.bindingReceiptSha256, membershipSha256: failure.membershipSha256,
+        sourceSessionRefSha256: failure.sourceSessionRefSha256, sourceTurnRefSha256: failure.sourceTurnRefSha256,
+        sourceItemRefSha256: failure.sourceItemRefSha256, sourceStepIndex: failure.sourceStepIndex,
+        sourceEventSeq: failure.sourceEventSeq, beginLastSeq: failure.beginLastSeq, endLastSeq: failure.endLastSeq,
+        eventCount: failure.eventCount, eventRootSha256: failure.eventRootSha256, businessBatchSha256: failure.businessBatchSha256,
+        canonicalItemSha256: RetainedSource.tenantTelemetryRetainedSourceCanonicalItemSha256(snapshot.item),
+        canonicalOwnerProofSha256: owner.canonicalOwnerProofSha256, ownerBindingSha256: owner.ownerBindingSha256,
+        ownerClosureEntryReceiptSha256: owner.receiptSha256, sessionGraveMarkerSha256: grave.markerSha256,
+        preDeleteReceiptSha256: preDeleteReceipt.receiptSha256, completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256: tenantDatabasePurgeClaimTokenSha256(authorization.claimToken),
+        sourceHighWaterDbMs: Math.max(usage.receipt.storeDbTimestampMs, failure.committedAtDbMs), capturedAtDbMs,
+      });
+      RetainedSource.validateTenantTelemetryRetainedSourceCanonicalSnapshot(entry, snapshot, failure);
+      entries.push(entry);
+    }
+    return { catalog, usage, entries };
+  }
+
+  private async publishRetainedSourceCanonicalClosure(conn: PoolConnection, database: TenantDatabasePurgeJobRecord,
+    stage: RetainedSourceCanonicalStage, t3f: TenantDatabasePurgeReceipt,
+    ownerReceipt: TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt,
+    owners: readonly TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[], graves: readonly TenantPurgeSessionGraveMarker[],
+  ): Promise<void> {
+    const { catalog, usage, entries } = stage;
+    const proof: RetainedSource.TenantTelemetryRetainedSourceCanonicalProof = {
+      usageProof: usage.proof, usageReceipt: usage.receipt, usageEntries: usage.entries,
+      ownerClosureEntries: owners, graveMarkers: graves,
+      anchors: { planBuildGeneration: database.planBuildGeneration, executionGeneration: database.executionGeneration,
+        databasePurgeGeneration: database.databasePurgeGeneration, planReceiptSha256: database.planReceiptSha256,
+        localPhysicalAckReceiptSha256: database.localPhysicalAckReceiptSha256, preDeleteReceiptSha256: t3f.preDeleteReceiptSha256,
+        t3fReceiptSha256: t3f.receiptSha256, ownerClosureReceiptSha256: ownerReceipt.receiptSha256,
+        graveMarkerRootSha256: t3f.graveMarkerRootSha256, completedClaimAttempt: t3f.completedClaimAttempt,
+        completedClaimTokenSha256: t3f.completedClaimTokenSha256, storeDbTimestampMs: t3f.storeDbTimestampMs },
+    };
+    const receipt = RetainedSource.buildTenantTelemetryRetainedSourceCanonicalClosureReceipt({
+      scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CANONICAL_RECEIPT_SCOPE,
+      requestId: database.requestId, tenantId: database.tenantId, subjectGeneration: database.subjectGeneration,
+      t1ProfileSha256: catalog.receipt.t1ProfileSha256, t1FenceSha256: catalog.receipt.t1FenceSha256,
+      planBuildGeneration: database.planBuildGeneration, executionGeneration: database.executionGeneration,
+      databasePurgeGeneration: database.databasePurgeGeneration, cohortReceiptSha256: catalog.receipt.cohortReceiptSha256,
+      catalogReceiptSha256: catalog.receipt.receiptSha256, usageReleaseReceiptSha256: usage.receipt.receiptSha256,
+      planReceiptSha256: database.planReceiptSha256, localPhysicalAckReceiptSha256: database.localPhysicalAckReceiptSha256,
+      preDeleteReceiptSha256: t3f.preDeleteReceiptSha256, t3fReceiptSha256: t3f.receiptSha256,
+      ownerClosureReceiptSha256: ownerReceipt.receiptSha256, graveMarkerRootSha256: t3f.graveMarkerRootSha256,
+      entryCount: entries.length, entryRootSha256: RetainedSource.tenantTelemetryRetainedSourceCanonicalClosureRootSha256(entries),
+      sourceHighWaterDbMs: Math.max(usage.receipt.storeDbTimestampMs, ...entries.map((entry) => entry.sourceHighWaterDbMs)),
+      storeDbTimestampMs: t3f.storeDbTimestampMs, completedClaimAttempt: t3f.completedClaimAttempt,
+      completedClaimTokenSha256: t3f.completedClaimTokenSha256,
+      executionReady: false, externalAuthorityVerified: false, allDomainsComplete: false, contentPurgeExecuted: false,
+    }, entries, proof);
+    await this.insertRetainedSourceEvidence(conn, "canonical_receipts", receipt);
+  }
+
+  private async readRetainedSourceCanonicalEvidence(conn: PoolConnection, job: TenantPurgePlanJobRecord,
+    catalog: RetainedSourceCatalogBundle, usage: RetainedSourceUsageBundle) {
+    const database = await this.loadTenantDatabasePurgeJob(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const receipts = await this.readRetainedSourceEvidence(conn, "canonical_receipts", job.tenantId, job.requestId, "FOR SHARE");
+    const entries = await this.readRetainedSourceEvidence(conn, "canonical_entries", job.tenantId, job.requestId, "FOR SHARE");
+    if (!database || database.phase !== "database_purged" || receipts.length !== 1) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    this.assertRetainedSourceNoExternalTargets(await this.loadTenantPurgePlanEntries(conn, job.tenantId, job.requestId, job.buildGeneration, "FOR SHARE"));
+    // Raw loaders and pure old validators only: public T3f/T3e getters route back here.
+    const bundle = await this.loadTenantDatabasePurgeBundle(conn, database);
+    validateTenantDatabasePurgeCompletionProof(database, bundle);
+    const ownerReceipt = await this.loadTenantTelemetryOwnerClosureReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const owners = await this.loadTenantTelemetryOwnerClosureEntries(conn, job.tenantId, job.requestId, "FOR SHARE");
+    if (!ownerReceipt) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const { receiptSha256: _ownerHash, ...ownerBody } = ownerReceipt;
+    const expectedOwner = TenantTelemetryOwnerClosure.createTenantTelemetryOwnerClosureReceipt({ ...ownerBody, entries: owners });
+    if (expectedOwner.receiptSha256 !== ownerReceipt.receiptSha256 || ownerReceipt.t1FenceSha256 !== catalog.receipt.t1FenceSha256
+      || ownerReceipt.t3cReceiptSha256 !== database.t3cReceiptSha256 || ownerReceipt.planReceiptSha256 !== database.planReceiptSha256
+      || ownerReceipt.localPhysicalAckReceiptSha256 !== database.localPhysicalAckReceiptSha256
+      || ownerReceipt.preDeleteReceiptSha256 !== bundle.preDeleteReceipt.receiptSha256
+      || ownerReceipt.t3fReceiptSha256 !== bundle.receipt.receiptSha256 || ownerReceipt.graveMarkerRootSha256 !== bundle.receipt.graveMarkerRootSha256
+      || ownerReceipt.storeDbTimestampMs !== bundle.receipt.storeDbTimestampMs
+      || ownerReceipt.completedClaimAttempt !== bundle.receipt.completedClaimAttempt
+      || ownerReceipt.completedClaimTokenSha256 !== bundle.receipt.completedClaimTokenSha256
+      || owners.length !== catalog.entries.length) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    // Plain receipt hashes cannot prove which canonical session a re-signed grave
+    // belongs to. Preserve the old 0039 protected relation without calling its
+    // public/full validator, which would recurse back through this bridge.
+    const ownerRefKey = owners.length > 0 ? this.requireTenantTelemetryRefKey() : undefined;
+    const ownerKeyId = ownerRefKey ? tenantTelemetryRefKeyIdSha256(ownerRefKey) : undefined;
+    const ownerTenantRef = ownerRefKey ? tenantTelemetrySubjectRefForTenantSha256(job.tenantId, ownerRefKey) : undefined;
+    const ownerGraves = new Map(bundle.graveMarkers.map((grave) => [grave.markerSha256, grave] as const));
+    const ownerTargets = new Map(catalog.entries.map((target) => [target.writeOperationSha256, target] as const));
+    if (ownerGraves.size !== bundle.graveMarkers.length || ownerTargets.size !== catalog.entries.length) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    for (const owner of owners) {
+      const grave = owner.sessionGraveMarkerSha256 === null ? undefined : ownerGraves.get(owner.sessionGraveMarkerSha256);
+      const target = ownerTargets.get(owner.writeOperationSha256);
+      const membership = await this.readTenantTelemetryArtifactMembership(conn, owner.writeOperationSha256, "FOR SHARE");
+      if (!ownerRefKey || !grave || !target || !membership
+        || owner.ownerKind !== "session" || target.ownerKind !== "session" || membership.ownerKind !== "session"
+        || target.source.kind !== "persisted-provider-v2" || membership.sourceSchema !== PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA
+        || owner.tenantId !== job.tenantId || owner.requestId !== job.requestId
+        || owner.subjectGeneration !== database.subjectGeneration || owner.planBuildGeneration !== database.planBuildGeneration
+        || owner.executionGeneration !== database.executionGeneration || owner.databasePurgeGeneration !== database.databasePurgeGeneration
+        || owner.preDeleteReceiptSha256 !== bundle.preDeleteReceipt.receiptSha256
+        || owner.capturedAtDbMs !== bundle.receipt.storeDbTimestampMs
+        || grave.tenantId !== job.tenantId || grave.requestId !== job.requestId
+        || grave.subjectGeneration !== database.subjectGeneration || grave.planBuildGeneration !== database.planBuildGeneration
+        || grave.executionGeneration !== database.executionGeneration || grave.databasePurgeGeneration !== database.databasePurgeGeneration
+        || grave.preDeleteReceiptSha256 !== owner.preDeleteReceiptSha256
+        || grave.markerSha256 !== owner.sessionGraveMarkerSha256 || grave.markedAtDbMs !== owner.capturedAtDbMs
+        || tenantTelemetryOwnerRefSha256("session", grave.sessionId, ownerRefKey) !== owner.ownerRefSha256
+        || target.tenantId !== job.tenantId || target.requestId !== job.requestId
+        || membership.tenantId !== job.tenantId || membership.writeOperationSha256 !== owner.writeOperationSha256
+        || membership.tenantRefSha256 !== ownerTenantRef || membership.refKeyIdSha256 !== ownerKeyId
+        || owner.refKeyIdSha256 !== ownerKeyId || membership.inventoryCreatedAtDbMs > owner.capturedAtDbMs
+        || owner.membershipSha256 !== membership.membershipSha256 || owner.membershipSha256 !== target.membershipSha256
+        || owner.inventorySha256 !== membership.inventorySha256 || owner.inventorySha256 !== target.inventorySha256
+        || owner.ownerRefSha256 !== membership.ownerRefSha256 || owner.ownerRefSha256 !== target.ownerRefSha256
+        || owner.holdSubjectRefSha256 !== membership.holdSubjectRefSha256 || owner.holdSubjectRefSha256 !== target.holdSubjectRefSha256
+        || owner.ownerBindingSha256 !== membership.ownerBindingSha256 || owner.ownerBindingSha256 !== target.ownerBindingSha256
+        || owner.canonicalOwnerProofSha256 !== TenantTelemetryOwnerClosure.tenantTelemetryCanonicalOwnerProofSha256(owner)) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+    const contentJob = await this.loadTenantContentInventoryJob(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const contentReceipt = await this.loadTenantContentInventoryReceipt(conn, job.tenantId, job.requestId, "FOR SHARE");
+    const sessions = await this.loadTenantSessionContentReceipts(conn, job.tenantId, job.requestId, job.buildGeneration, "FOR SHARE");
+    if (!contentJob || contentJob.phase !== "inventory_sealed" || !contentReceipt) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    validateTenantContentInventoryCompletionProof(contentJob, sessions, contentReceipt);
+    if (contentReceipt.receiptSha256 !== database.t3cReceiptSha256 || sessions.length !== bundle.graveMarkers.length
+      || bundle.graveMarkers.some((grave) => sessions.find((source) => source.sessionId === grave.sessionId)?.receiptSha256 !== grave.t3cSessionReceiptSha256)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    // Lock the full tenant range, not merely original grave IDs, so a different-ID
+    // resurrection cannot hide behind an otherwise valid historical closure.
+    const [tenantSessions] = await conn.query<Row[]>("SELECT session_id FROM sessions FORCE INDEX (idx_sessions_tenant) WHERE BINARY tenant_id=BINARY ? ORDER BY session_id FOR SHARE", [job.tenantId]);
+    if (tenantSessions.length !== 0) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const [tenantRows] = await conn.query<Row[]>("SELECT name,auth_policy,auth_secret_cipher,auth_secret_key_id FROM tenants WHERE BINARY tenant_id=BINARY ? FOR SHARE", [job.tenantId]);
+    if (tenantRows.length !== 1 || Object.values(tenantRows[0]!).some((value) => value != null)) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    // Revalidate the actual old local T3f residue projection without calling its public
+    // getter (which calls this bridge). Retained billing/control evidence is not deleted.
+    for (const table of ["agent_versions", "idempotency_keys", "usage_reconciliations", "blob_objects",
+      "user_export_requests", "user_export_jobs", "user_export_artifacts", "user_export_artifact_parts",
+      "user_export_snapshot_records", "user_export_snapshot_blobs", "user_export_download_leases"] as const) {
+      const [rows] = await conn.query<Row[]>(`SELECT tenant_id FROM ${table} WHERE BINARY tenant_id=BINARY ? FOR SHARE`, [job.tenantId]);
+      if (rows.length !== 0) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    for (const grave of bundle.graveMarkers) {
+      for (const [table, column] of [["sessions", "session_id"], ["turns", "session_id"], ["items", "session_id"], ["events", "session_id"], ["approvals", "session_id"]] as const) {
+        const [rows] = await conn.query<Row[]>(`SELECT ${column} FROM ${table} WHERE BINARY ${column}=BINARY ? FOR SHARE`, [grave.sessionId]);
+        if (rows.length !== 0) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+    const [facts] = await conn.query<Row[]>(`SELECT ${BILLING_USAGE_COLUMNS} FROM billing_usage_facts WHERE BINARY tenant_id=BINARY ? ORDER BY usage_id FOR SHARE`, [job.tenantId]);
+    const billing = facts.map(rowToBillingUsageFact);
+    if (billing.length !== bundle.receipt.retainedBillingFactCount
+      || tenantDatabasePurgeBillingFactRootSha256(billing.map((fact) => fact.factSha256)) !== bundle.receipt.retainedBillingFactRootSha256) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    RetainedSource.validateTenantTelemetryRetainedSourceCanonicalClosureProof(receipts[0]!, entries, {
+      usageProof: usage.proof, usageReceipt: usage.receipt, usageEntries: usage.entries, ownerClosureEntries: owners,
+      graveMarkers: bundle.graveMarkers,
+      anchors: { planBuildGeneration: database.planBuildGeneration, executionGeneration: database.executionGeneration,
+        databasePurgeGeneration: database.databasePurgeGeneration, planReceiptSha256: database.planReceiptSha256,
+        localPhysicalAckReceiptSha256: database.localPhysicalAckReceiptSha256, preDeleteReceiptSha256: bundle.preDeleteReceipt.receiptSha256,
+        t3fReceiptSha256: bundle.receipt.receiptSha256, ownerClosureReceiptSha256: ownerReceipt.receiptSha256,
+        graveMarkerRootSha256: bundle.receipt.graveMarkerRootSha256, completedClaimAttempt: bundle.receipt.completedClaimAttempt,
+        completedClaimTokenSha256: bundle.receipt.completedClaimTokenSha256, storeDbTimestampMs: bundle.receipt.storeDbTimestampMs },
+    });
+    return { receipt: receipts[0]!, entries };
+  }
+
+  private async readRetainedSourceCatalogForLookup(conn: PoolConnection, tenantId: string, requestId: string) {
+    const job = await this.loadTenantPurgePlanJob(conn, tenantId, requestId, "FOR SHARE");
+    if (!job) {
+      const admission = await this.loadTenantErasureAdmission(conn, tenantId, requestId, "FOR SHARE");
+      if (!admission) await this.assertRetainedSourceLookupAbsent(conn, tenantId, requestId);
+      else {
+        await this.readRetainedSourceT1Bundle(conn, admission, "FOR SHARE");
+        // A genuine T1 cohort can predate T3d materialization. Downstream evidence
+        // cannot; distinguish this from a lost admission/family marker.
+        for (const family of ["catalog_sources", "catalog_targets", "catalog_receipts", "usage_entries", "usage_receipts", "canonical_entries", "canonical_receipts"] as const) {
+          if ((await this.readRetainedSourceEvidence(conn, family, tenantId, requestId, "FOR SHARE")).length) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+      }
+      return null;
+    }
+    const cohort = await this.readRetainedSourcePlanCohort(conn, job);
+    if (!cohort || job.phase !== "plan_sealed") {
+      for (const family of ["catalog_sources", "catalog_targets", "catalog_receipts", "usage_entries", "usage_receipts", "canonical_entries", "canonical_receipts"] as const) {
+        if ((await this.readRetainedSourceEvidence(conn, family, tenantId, requestId, "FOR SHARE")).length) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+      }
+      return null;
+    }
+    const planReceipt = await this.loadTenantPurgePlanReceipt(conn, tenantId, requestId, "FOR SHARE");
+    if (!planReceipt) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    validateTenantPurgePlanCompletionProof(job, await this.loadTenantPurgePlanEntries(conn, tenantId, requestId, job.buildGeneration, "FOR SHARE"), planReceipt);
+    return this.validateRetainedSourceCatalogForPlan(conn, job, planReceipt);
+  }
+
+  async getTenantTelemetryRetainedSourceCatalogSourceEntries(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => (await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId))?.sources ?? []);
+  }
+  async getTenantTelemetryRetainedSourceCatalogTargets(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => (await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId))?.entries ?? []);
+  }
+  async getTenantTelemetryRetainedSourceCatalogReceipt(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => (await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId))?.receipt ?? null);
+  }
+  private async assertRetainedSourceLookupAbsent(conn: PoolConnection, tenantId: string, requestId: string): Promise<void> {
+    for (const family of ["t1_entries", "t1_receipts", "catalog_sources", "catalog_targets", "catalog_receipts",
+      "usage_entries", "usage_receipts", "canonical_entries", "canonical_receipts"] as const) {
+      if ((await this.readRetainedSourceEvidence(conn, family, tenantId, requestId, "FOR SHARE")).length) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+  }
+  private async assertRetainedSourceGlobalRelations(conn: PoolConnection): Promise<void> {
+    if (!this.tenantTelemetryRetainedSourceSchemaInstalled) return;
+    const identities = new Map<string, { tenantId: string; requestId: string }>();
+    for (const family of ["t1_entries", "t1_receipts", "catalog_sources", "catalog_targets", "catalog_receipts",
+      "usage_entries", "usage_receipts", "canonical_entries", "canonical_receipts"] as const) {
+      const [rows] = await conn.query<Row[]>(`SELECT tenant_id,request_id FROM tenant_telemetry_retained_source_${family} ORDER BY tenant_id,request_id FOR SHARE`);
+      for (const row of rows) {
+        const tenantId = String(row.tenant_id), requestId = String(row.request_id);
+        identities.set(JSON.stringify([tenantId, requestId]), { tenantId, requestId });
+      }
+    }
+    for (const table of ["tenant_erasure_admissions", "tenant_purge_plan_jobs"] as const) {
+      const [rows] = await conn.query<Row[]>(`SELECT tenant_id,request_id FROM ${table} WHERE telemetry_retained_source_protocol IS NOT NULL ORDER BY tenant_id,request_id FOR SHARE`);
+      for (const row of rows) {
+        const tenantId = String(row.tenant_id), requestId = String(row.request_id);
+        identities.set(JSON.stringify([tenantId, requestId]), { tenantId, requestId });
+      }
+    }
+    for (const { tenantId, requestId } of identities.values()) {
+      const admission = await this.loadTenantErasureAdmission(conn, tenantId, requestId, "FOR SHARE");
+      if (!admission || !await this.readRetainedSourceT1Bundle(conn, admission, "FOR SHARE")) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      const job = await this.loadTenantPurgePlanJob(conn, tenantId, requestId, "FOR SHARE");
+      if (job) await this.readRetainedSourcePlanCohort(conn, job);
+      if (job?.phase === "plan_sealed") {
+        const receipt = await this.loadTenantPurgePlanReceipt(conn, tenantId, requestId, "FOR SHARE");
+        if (!receipt) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        await this.validateRetainedSourceCatalogForPlan(conn, job, receipt);
+      } else {
+        for (const family of ["catalog_sources", "catalog_targets", "catalog_receipts", "usage_entries", "usage_receipts", "canonical_entries", "canonical_receipts"] as const) {
+          if ((await this.readRetainedSourceEvidence(conn, family, tenantId, requestId, "FOR SHARE")).length) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+      }
+    }
+  }
+  private async readRetainedSourceUsageForLookup(conn: PoolConnection, tenantId: string, requestId: string) {
+    const catalog = await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
+    if (!catalog) return null;
+    const job = catalog.proof.legacyAnchors.job;
+    if (await this.readRetainedSourceEvidencePhase(conn, job) === "live") return null;
+    return this.readRetainedSourceUsageEvidence(conn, job, catalog.proof.legacyAnchors.planReceipt, catalog);
+  }
+  async getTenantTelemetryRetainedSourceUsageReleaseEntries(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => (await this.readRetainedSourceUsageForLookup(conn, tenantId, requestId))?.entries ?? []);
+  }
+  async getTenantTelemetryRetainedSourceUsageReleaseReceipt(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => (await this.readRetainedSourceUsageForLookup(conn, tenantId, requestId))?.receipt ?? null);
+  }
+  private async readRetainedSourceCanonicalForLookup(conn: PoolConnection, tenantId: string, requestId: string) {
+    const catalog = await this.readRetainedSourceCatalogForLookup(conn, tenantId, requestId);
+    if (!catalog) return null;
+    const job = catalog.proof.legacyAnchors.job;
+    if (await this.readRetainedSourceEvidencePhase(conn, job) !== "canonical_closed") return null;
+    const usage = await this.readRetainedSourceUsageEvidence(conn, job, catalog.proof.legacyAnchors.planReceipt, catalog);
+    return this.readRetainedSourceCanonicalEvidence(conn, job, catalog, usage);
+  }
+  async getTenantTelemetryRetainedSourceCanonicalClosureEntries(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => (await this.readRetainedSourceCanonicalForLookup(conn, tenantId, requestId))?.entries ?? []);
+  }
+  async getTenantTelemetryRetainedSourceCanonicalClosureReceipt(tenantId: string, requestId: string) {
+    return this.withConsistentRead(async (conn) => (await this.readRetainedSourceCanonicalForLookup(conn, tenantId, requestId))?.receipt ?? null);
+  }
+
   // ---------- persisted provider-step capture v2 (never a provider-provenance oracle) ----------
   private async capturePrerequisites(
     executor: Pool | PoolConnection, lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
@@ -41809,7 +43439,17 @@ export class MysqlSessionStore implements
     return b;
   }
   async getTenantTelemetryPersistedProviderCaptureSourceBinding(tenantId: string, operation: string) {
-    return this.withConsistentRead(async (conn) => { await this.assertPersistedProviderCaptureProjection(conn); return this.persistedProviderCaptureSchemaInstalled ? this.readPersistedCaptureBinding(conn, tenantId, operation) : null; });
+    return this.withConsistentRead(async (conn) => {
+      await this.assertPersistedProviderCaptureProjection(conn);
+      if (!this.persistedProviderCaptureSchemaInstalled) return null;
+      const binding = await this.readPersistedCaptureBinding(conn, tenantId, operation);
+      if (binding) {
+        const receipt = await this.readPersistedFailureReceipt(conn, tenantId, operation);
+        if (!receipt || receipt.bindingReceiptSha256 !== binding.receiptSha256) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        await this.verifyPersistedFailureProjection(conn, receipt);
+      }
+      return binding;
+    });
   }
 
   private async readPersistedFailureReceipt(executor: Pool | PoolConnection, tenantId: string, operation: string, lock: "" | "FOR SHARE" | "FOR UPDATE" = "") {
@@ -41828,7 +43468,65 @@ export class MysqlSessionStore implements
     const [rows]=await executor.query<Row[]>(`SELECT write_operation_sha256 FROM tenant_telemetry_capture_v2_failure_commit_receipts WHERE tenant_id=? AND source_session_ref_sha256=? AND source_turn_ref_sha256=? AND source_item_ref_sha256=? AND source_step_index=? ${lock}`,[input.tenantId,...refs,input.stepIndex]);
     return rows[0] ? this.readPersistedFailureReceipt(executor,input.tenantId,String(rows[0].write_operation_sha256),lock) : null;
   }
-  private async verifyPersistedFailureProjection(executor: Pool | PoolConnection, receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt,lock: "" | "FOR SHARE" | "FOR UPDATE" = ""): Promise<PersistedCapture.PersistedProviderStepFailureSourceVerification> {
+  private async verifyPersistedFailureProjection(executor: Pool | PoolConnection,
+    receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt, lock: "" | "FOR SHARE" | "FOR UPDATE" = "",
+  ): Promise<PersistedCapture.PersistedProviderStepFailureSourceVerification> {
+    if (!this.tenantTelemetryRetainedSourceSchemaInstalled) return this.verifyPersistedFailureLiveProjection(executor, receipt, lock);
+    // A pool is not an evidence snapshot. Re-enter once with one RR connection rather than
+    // accepting separately observed source/closure rows or casting away transaction scope.
+    if ("getConnection" in executor) return this.withConsistentRead((conn) => this.verifyPersistedFailureProjection(conn, receipt, lock));
+    // This set only deduplicates lookups; no membership/receipt-exists shortcut authorizes
+    // a source. Audit markers and every raw family so losing its target cannot downgrade a
+    // sealed new-family source to the old live-only check.
+    const requestIds = new Set<string>();
+    for (const table of ["tenant_erasure_admissions", "tenant_purge_plan_jobs"] as const) {
+      const [rows] = await executor.query<Row[]>(`SELECT tenant_id,request_id FROM ${table}
+        WHERE BINARY tenant_id=BINARY ? ORDER BY request_id FOR SHARE`, [receipt.tenantId]);
+      for (const row of rows) {
+        if (row.tenant_id !== receipt.tenantId) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        requestIds.add(String(row.request_id));
+      }
+    }
+    for (const family of ["t1_entries", "t1_receipts", "catalog_sources", "catalog_targets", "catalog_receipts",
+      "usage_entries", "usage_receipts", "canonical_entries", "canonical_receipts"] as const) {
+      const withOperation = family === "t1_entries" || family === "catalog_sources" || family === "catalog_targets"
+        || family === "usage_entries" || family === "canonical_entries";
+      const [rows] = await executor.query<Row[]>(`SELECT tenant_id,request_id FROM tenant_telemetry_retained_source_${family}
+        WHERE BINARY tenant_id=BINARY ?${withOperation ? " OR BINARY write_operation_sha256=BINARY ?" : ""}
+        ORDER BY request_id FOR SHARE`, [receipt.tenantId, ...(withOperation ? [receipt.writeOperationSha256] : [])]);
+      for (const row of rows) {
+        if (row.tenant_id !== receipt.tenantId) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+        requestIds.add(String(row.request_id));
+      }
+    }
+    let catalog: RetainedSourceCatalogBundle | null = null;
+    let phase: RetainedSourceEvidencePhase = "live";
+    for (const requestId of requestIds) {
+      // This private audit handles genuine T1/preplan absence and all three sealed phases.
+      // Its live provider loop calls only verifyPersistedFailureLiveProjection; historical
+      // bridges are raw bottom-up, never this wrapper or a public T3e/T3f getter.
+      const candidate = await this.readRetainedSourceCatalogForLookup(executor, receipt.tenantId, requestId);
+      if (!candidate) continue;
+      if (catalog) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      catalog = candidate;
+      phase = await this.readRetainedSourceEvidencePhase(executor, candidate.proof.legacyAnchors.job);
+    }
+    if (!catalog) return this.verifyPersistedFailureLiveProjection(executor, receipt, lock);
+    const target = catalog.entries.find((entry) => entry.writeOperationSha256 === receipt.writeOperationSha256);
+    const actualReceipt = catalog.proof.failureReceipts.find((entry) => entry.writeOperationSha256 === receipt.writeOperationSha256);
+    if (!target || target.source.kind !== "persisted-provider-v2" || !actualReceipt
+      || PersistedCapture.persistedProviderCaptureCanonicalJson(actualReceipt) !== PersistedCapture.persistedProviderCaptureCanonicalJson(receipt)) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    if (phase === "live") return this.verifyPersistedFailureLiveProjection(executor, receipt, lock);
+    // Historical read only. No reserve/create call uses this as a live-owner authorization.
+    return { status: "source_verified_written", sourceCount: 1, failureCommitReceiptSha256: receipt.receiptSha256,
+      sourceBindingReceiptSha256: target.source.sourceBindingReceiptSha256, writeOperationSha256: receipt.writeOperationSha256,
+      membershipSha256: target.membershipSha256, writeAckReceiptSha256: target.writeAckReceiptSha256,
+      inventoryReceiptSha256: target.inventoryReceiptSha256, executionReady: false, allDomainsComplete: false };
+  }
+
+  private async verifyPersistedFailureLiveProjection(executor: Pool | PoolConnection, receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt,lock: "" | "FOR SHARE" | "FOR UPDATE" = ""): Promise<PersistedCapture.PersistedProviderStepFailureSourceVerification> {
     PersistedCapture.validatePersistedProviderFailureCommitReceipt(receipt);
     const control=await this.assertPersistedProviderCaptureProjection(executor,lock);
     if (control.state !== "active" || control.activationEvidenceSha256 !== receipt.captureControlEvidenceSha256 || control.receipt.runtimeEpochSha256 !== receipt.runtimeEpochSha256 || control.receipt.runtimeBindingSha256 !== receipt.runtimeBindingSha256) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();

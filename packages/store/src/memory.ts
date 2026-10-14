@@ -104,6 +104,23 @@ import {
 } from "./session-delete-grace.js";
 import * as OrdinaryUsageRetention from "./ordinary-usage-retention.js";
 import * as PersistedCapture from "./tenant-telemetry-persisted-provider-capture.js";
+import * as RetainedSource from "./tenant-telemetry-retained-source.js";
+import {
+  projectTenantTelemetryRetainedSourceGraph,
+  validateTenantTelemetryRetainedSourceProviderTargetRelations,
+} from "./tenant-telemetry-retained-source-projection.js";
+
+type RetainedSourceAdmissionFamily = {
+  protocol: typeof RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL;
+  requestId: string;
+  tenantId: string;
+  subjectGeneration: number;
+  t1FenceSha256: string;
+  cohortReceiptSha256: string;
+  evidenceSha256: string;
+};
+type RetainedSourcePlanFamily = RetainedSourceAdmissionFamily;
+type RetainedSourceEvidencePhase = "live" | "usage_released" | "canonical_closed";
 
 import {
   BLOB_STORAGE_FORMAT,
@@ -1576,6 +1593,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private readonly persistedProviderCaptureStagedCoverages = new WeakMap<object, PersistedCapture.TenantTelemetryPersistedProviderCaptureCoverage>();
   private readonly persistedProviderCaptureOperatorFences = new WeakSet<object>();
   private persistedProviderCaptureOperatorBusy = false;
+  private readonly retainedSourceAdmissionFamilies = new Map<string, RetainedSourceAdmissionFamily>();
+  private readonly retainedSourcePlanFamilies = new Map<string, RetainedSourcePlanFamily>();
+  private readonly retainedSourceT1Entries = new Map<string, RetainedSource.TenantTelemetryRetainedSourceT1CohortEntry>();
+  private readonly retainedSourceT1Receipts = new Map<string, RetainedSource.TenantTelemetryRetainedSourceT1CohortReceipt>();
+  private readonly retainedSourceCatalogSources = new Map<string, RetainedSource.TenantTelemetryRetainedSourceCatalogSourceEntry>();
+  private readonly retainedSourceCatalogTargets = new Map<string, RetainedSource.TenantTelemetryRetainedSourceCatalogEntry>();
+  private readonly retainedSourceCatalogReceipts = new Map<string, RetainedSource.TenantTelemetryRetainedSourceCatalogReceipt>();
+  private readonly retainedSourceUsageEntries = new Map<string, RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry>();
+  private readonly retainedSourceUsageReceipts = new Map<string, RetainedSource.TenantTelemetryRetainedSourceUsageReleaseReceipt>();
+  private readonly retainedSourceCanonicalEntries = new Map<string, RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry>();
+  private readonly retainedSourceCanonicalReceipts = new Map<string, RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureReceipt>();
 
   constructor(
     private readonly storeClock: { now(): number } = { now: () => Date.now() },
@@ -1609,6 +1637,779 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new Error("memory store clock must return a non-negative safe integer");
     }
     return nowMs;
+  }
+
+  private retainedSourceAdmissionFamilyFor(
+    requestId: string,
+  ): RetainedSourceAdmissionFamily | null {
+    const marker = this.retainedSourceAdmissionFamilies.get(requestId);
+    if (!marker) {
+      if (this.retainedSourceT1Receipts.has(requestId)
+        || this.retainedSourceT1EntriesFor(requestId).length !== 0) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      return null;
+    }
+    const { evidenceSha256, ...body } = marker;
+    const cohort = this.retainedSourceT1Receipts.get(requestId);
+    if (marker.protocol !== RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL
+      || marker.requestId !== requestId
+      || !cohort
+      || cohort.requestId !== requestId
+      || cohort.tenantId !== marker.tenantId
+      || cohort.subjectGeneration !== marker.subjectGeneration
+      || cohort.t1FenceSha256 !== marker.t1FenceSha256
+      || cohort.receiptSha256 !== marker.cohortReceiptSha256
+      || evidenceSha256 !== RetainedSource.tenantTelemetryRetainedSourceSha256(
+        "tenant-telemetry-retained-source-admission-family-v1", body,
+      )) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    RetainedSource.validateTenantTelemetryRetainedSourceT1CohortProof(
+      cohort, this.retainedSourceT1EntriesFor(requestId), cohort.profile,
+    );
+    return marker;
+  }
+
+  private retainedSourcePlanFamilyFor(
+    requestId: string,
+  ): RetainedSourcePlanFamily | null {
+    const marker = this.retainedSourcePlanFamilies.get(requestId);
+    if (!marker) return null;
+    const { evidenceSha256, ...body } = marker;
+    const admission = this.retainedSourceAdmissionFamilyFor(requestId);
+    if (marker.protocol !== RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL
+      || marker.requestId !== requestId
+      || !admission
+      || marker.tenantId !== admission.tenantId
+      || marker.subjectGeneration !== admission.subjectGeneration
+      || marker.t1FenceSha256 !== admission.t1FenceSha256
+      || marker.cohortReceiptSha256 !== admission.cohortReceiptSha256
+      || evidenceSha256 !== RetainedSource.tenantTelemetryRetainedSourceSha256(
+        "tenant-telemetry-retained-source-plan-family-v1", body,
+      )) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    return marker;
+  }
+
+  // Public and worker reads of the old execution receipts must not silently
+  // downgrade a partially published 0054 request to the historical family.
+  // Keep this outside the old bundle/global validators: the canonical bridge
+  // deliberately reads those validators while checking its independent proof.
+  private auditRetainedSourceOuterBoundary(requestId: string): void {
+    const family = this.retainedSourcePlanFamilyFor(requestId);
+    if (!family) {
+      if (this.retainedSourceAdmissionFamilyFor(requestId)
+        || this.retainedSourceCatalogReceipts.has(requestId)
+        || this.retainedSourceCatalogSourcesFor(requestId).length !== 0
+        || this.retainedSourceCatalogTargetsFor(requestId).length !== 0
+        || this.retainedSourceUsageReceipts.has(requestId)
+        || this.retainedSourceUsageEntriesFor(requestId).length !== 0
+        || this.retainedSourceCanonicalReceipts.has(requestId)
+        || this.retainedSourceCanonicalEntriesFor(requestId).length !== 0) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      return;
+    }
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    const receipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!job || job.phase !== "plan_sealed" || !receipt
+      || job.tenantId !== family.tenantId
+      || receipt.tenantId !== family.tenantId) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    this.validateRetainedSourceCatalogForPlan(job, receipt);
+  }
+
+  private assertRetainedSourceNoExternalTargets(entries: TenantPurgePlanEntry[]): void {
+    const externalDomains = TENANT_PURGE_PLAN_DOMAINS.filter((domain) => (
+      domain.startsWith("blob_") || domain.startsWith("user_export_")
+    ));
+    for (const domain of externalDomains) {
+      const entry = entries.find((candidate) => candidate.domain === domain);
+      if (!entry || entry.targetCount !== 0) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+  }
+
+  private assertRetainedSourceEligiblePrimaryNow(requestId: string): void {
+    const cohort = this.retainedSourceT1Receipts.get(requestId);
+    const profile = cohort?.profile;
+    if (!cohort || cohort.eligibility !== "eligible_retained" || profile?.kind !== "eligible-primary") {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const primary = profile.primaryBinding;
+    const runtime = this.readTenantRestoreRuntimeControl();
+    const journal = this.readTenantRestoreJournalControl();
+    const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
+    const capture = this.assertMemoryPersistedProviderCaptureControl();
+    const lifecycleCoverage = this.tenantTelemetryLifecycleCoverages.get(cohort.tenantId);
+    const captureCoverage = this.persistedProviderCaptureCoverages.get(cohort.tenantId);
+    if (!capture || lifecycle.state !== "active" || !lifecycleCoverage || !captureCoverage
+      || runtime.state !== "active" || runtime.lineageKind !== "primary"
+      || runtime.runtimeEpochSha256 !== primary.runtimeEpochSha256
+      || PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime, journal)
+        !== primary.runtimeBindingSha256
+      || capture.receiptSha256 !== primary.captureControlEvidenceSha256
+      || capture.runtimeEpochSha256 !== primary.runtimeEpochSha256
+      || capture.runtimeBindingSha256 !== primary.runtimeBindingSha256
+      || capture.refKeyIdSha256 !== primary.refKeyIdSha256
+      || capture.logsTargetSha256 !== primary.logsTargetSha256
+      || capture.logsTargetReceiptSha256 !== primary.logsTargetReceiptSha256
+      || lifecycle.activationEvidenceSha256 !== primary.lifecycleControlEvidenceSha256
+      || lifecycle.refKeyIdSha256 !== primary.refKeyIdSha256
+      || lifecycleCoverage.evidenceSha256 !== primary.lifecycleCoverageEvidenceSha256
+      || captureCoverage.evidenceSha256 !== primary.captureCoverageEvidenceSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+  }
+
+  private retainedSourceT1EntriesFor(
+    requestId: string,
+  ): RetainedSource.TenantTelemetryRetainedSourceT1CohortEntry[] {
+    return [...this.retainedSourceT1Entries.values()]
+      .filter((entry) => entry.requestId === requestId)
+      .sort((a, b) => a.sourceIdentitySha256.localeCompare(b.sourceIdentitySha256));
+  }
+
+  private retainedSourceCatalogSourcesFor(requestId: string): RetainedSource.TenantTelemetryRetainedSourceCatalogSourceEntry[] {
+    return [...this.retainedSourceCatalogSources.values()]
+      .filter((entry) => entry.requestId === requestId)
+      .sort((a, b) => a.sourceKind.localeCompare(b.sourceKind)
+        || a.sourceIdentitySha256.localeCompare(b.sourceIdentitySha256));
+  }
+
+  private retainedSourceCatalogTargetsFor(requestId: string): RetainedSource.TenantTelemetryRetainedSourceCatalogEntry[] {
+    return [...this.retainedSourceCatalogTargets.values()]
+      .filter((entry) => entry.requestId === requestId)
+      .sort((a, b) => a.artifactGroupSha256.localeCompare(b.artifactGroupSha256));
+  }
+
+  private retainedSourceUsageEntriesFor(requestId: string): RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry[] {
+    return [...this.retainedSourceUsageEntries.values()]
+      .filter((entry) => entry.requestId === requestId)
+      .sort((a, b) => a.writeOperationSha256.localeCompare(b.writeOperationSha256));
+  }
+
+  private retainedSourceCanonicalEntriesFor(requestId: string): RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry[] {
+    return [...this.retainedSourceCanonicalEntries.values()]
+      .filter((entry) => entry.requestId === requestId)
+      .sort((a, b) => a.writeOperationSha256.localeCompare(b.writeOperationSha256));
+  }
+
+  async getTenantTelemetryRetainedSourceT1CohortEntries(tenantId: string, requestId: string) {
+    const marker = this.retainedSourceAdmissionFamilies.get(requestId);
+    if (!marker) {
+      if (this.retainedSourceT1Receipts.get(requestId)?.tenantId === tenantId
+        || this.retainedSourceT1EntriesFor(requestId).some((entry) => entry.tenantId === tenantId)) {
+        this.retainedSourceAdmissionFamilyFor(requestId);
+      }
+      return [];
+    }
+    if (marker.tenantId !== tenantId) return [];
+    this.retainedSourceAdmissionFamilyFor(requestId);
+    return this.retainedSourceT1EntriesFor(requestId).map(clone);
+  }
+
+  async getTenantTelemetryRetainedSourceT1CohortReceipt(tenantId: string, requestId: string) {
+    const marker = this.retainedSourceAdmissionFamilies.get(requestId);
+    if (!marker) {
+      if (this.retainedSourceT1Receipts.get(requestId)?.tenantId === tenantId
+        || this.retainedSourceT1EntriesFor(requestId).some((entry) => entry.tenantId === tenantId)) {
+        this.retainedSourceAdmissionFamilyFor(requestId);
+      }
+      return null;
+    }
+    if (marker.tenantId !== tenantId) return null;
+    this.retainedSourceAdmissionFamilyFor(requestId);
+    return clone(this.retainedSourceT1Receipts.get(requestId)!);
+  }
+
+  async getTenantTelemetryRetainedSourceCatalogSourceEntries(tenantId: string, requestId: string) {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "plan_sealed") return [];
+    const receipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!receipt) throw new TenantErasureIntegrityError();
+    if (!this.retainedSourcePlanFamilies.has(requestId)) {
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
+      return [];
+    }
+    this.validateRetainedSourceCatalogForPlan(job, receipt);
+    return this.retainedSourceCatalogSourcesFor(requestId).map(clone);
+  }
+
+  async getTenantTelemetryRetainedSourceCatalogTargets(tenantId: string, requestId: string) {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "plan_sealed") return [];
+    const receipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!receipt) throw new TenantErasureIntegrityError();
+    if (!this.retainedSourcePlanFamilies.has(requestId)) {
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
+      return [];
+    }
+    this.validateRetainedSourceCatalogForPlan(job, receipt);
+    return this.retainedSourceCatalogTargetsFor(requestId).map(clone);
+  }
+
+  async getTenantTelemetryRetainedSourceCatalogReceipt(tenantId: string, requestId: string) {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "plan_sealed") return null;
+    const receipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!receipt) throw new TenantErasureIntegrityError();
+    if (!this.retainedSourcePlanFamilies.has(requestId)) {
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
+      return null;
+    }
+    this.validateRetainedSourceCatalogForPlan(job, receipt);
+    return clone(this.retainedSourceCatalogReceipts.get(requestId)!);
+  }
+
+  async getTenantTelemetryRetainedSourceUsageReleaseEntries(tenantId: string, requestId: string) {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "plan_sealed") return [];
+    const planReceipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!planReceipt) throw new TenantErasureIntegrityError();
+    this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, planReceipt);
+    if (!this.retainedSourcePlanFamilies.has(requestId)) {
+      if (this.retainedSourceUsageReceipts.has(requestId)
+        || this.retainedSourceUsageEntriesFor(requestId).length) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      return [];
+    }
+    return this.retainedSourceUsageEntriesFor(requestId).map(clone);
+  }
+
+  async getTenantTelemetryRetainedSourceUsageReleaseReceipt(tenantId: string, requestId: string) {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "plan_sealed") return null;
+    const planReceipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!planReceipt) throw new TenantErasureIntegrityError();
+    this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, planReceipt);
+    if (!this.retainedSourcePlanFamilies.has(requestId)
+      && (this.retainedSourceUsageReceipts.has(requestId)
+        || this.retainedSourceUsageEntriesFor(requestId).length)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return clone(this.retainedSourceUsageReceipts.get(requestId) ?? null);
+  }
+
+  async getTenantTelemetryRetainedSourceCanonicalClosureEntries(tenantId: string, requestId: string) {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "plan_sealed") return [];
+    const planReceipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!planReceipt) throw new TenantErasureIntegrityError();
+    this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, planReceipt);
+    if (!this.retainedSourcePlanFamilies.has(requestId)
+      && (this.retainedSourceCanonicalReceipts.has(requestId)
+        || this.retainedSourceCanonicalEntriesFor(requestId).length)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return this.retainedSourceCanonicalEntriesFor(requestId).map(clone);
+  }
+
+  async getTenantTelemetryRetainedSourceCanonicalClosureReceipt(tenantId: string, requestId: string) {
+    const job = this.tenantPurgePlanJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId || job.phase !== "plan_sealed") return null;
+    const planReceipt = this.tenantPurgePlanReceipts.get(requestId);
+    if (!planReceipt) throw new TenantErasureIntegrityError();
+    this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, planReceipt);
+    if (!this.retainedSourcePlanFamilies.has(requestId)
+      && (this.retainedSourceCanonicalReceipts.has(requestId)
+        || this.retainedSourceCanonicalEntriesFor(requestId).length)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return clone(this.retainedSourceCanonicalReceipts.get(requestId) ?? null);
+  }
+
+  private stageRetainedSourceT1Cohort(
+    admission: ErasureRequestRecord,
+    fence: TenantCredentialRevocationFence,
+    subject: TenantTelemetry.TenantTelemetryLifecycleSubjectRecord,
+    acceptedAtDbMs: number,
+  ): {
+    family: RetainedSourceAdmissionFamily;
+    entries: RetainedSource.TenantTelemetryRetainedSourceT1CohortEntry[];
+    receipt: RetainedSource.TenantTelemetryRetainedSourceT1CohortReceipt;
+  } {
+    const tenant = this.tenants.get(admission.tenantId);
+    // T1 is still staged: read the already-published canonical birth, never the
+    // deleting state that this atomic publication will install later.
+    const canonicalTenant = this.subjectLifecycles.get(subjectLifecycleKey(admission.tenantId, "tenant", admission.tenantId));
+    if (!tenant || fence.requestId !== admission.requestId
+      || fence.subjectGeneration !== admission.generation) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
+    const lifecycleCoverage = this.tenantTelemetryLifecycleCoverages.get(admission.tenantId) ?? null;
+    const capture = this.assertMemoryPersistedProviderCaptureControl();
+    const captureCoverage = this.persistedProviderCaptureCoverages.get(admission.tenantId) ?? null;
+    const runtime = this.readTenantRestoreRuntimeControl();
+    const journal = this.readTenantRestoreJournalControl();
+    const restorePending = [...this.tenantRestoreReplayRuns.values()].some(
+      (run) => run.phase === "prepared" || run.phase === "replay_sealed",
+    );
+    if (!capture || lifecycle.state !== "active" || !lifecycleCoverage || !captureCoverage) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    this.tenantTelemetryTargetsForRead(lifecycle);
+    this.tenantTelemetryCoverageForRead(admission.tenantId, lifecycle);
+    PersistedCapture.validatePersistedProviderCaptureCoverage(captureCoverage);
+    if (capture.lifecycleControlEvidenceSha256 !== lifecycle.activationEvidenceSha256
+      || captureCoverage.lifecycleCoverageEvidenceSha256 !== lifecycleCoverage.evidenceSha256
+      || subject.requestId !== admission.requestId
+      || subject.tenantId !== admission.tenantId
+      || subject.subjectGeneration !== admission.generation
+      || subject.t1FenceSha256 !== fence.evidenceSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    if (runtime.state !== "active" || runtime.lineageKind !== "primary" || restorePending) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const runtimeState = "primary" as const;
+    const runtimeBindingSha256 = PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime, journal);
+    const controlProjection: RetainedSource.TenantTelemetryRetainedSourceControlProjection = {
+      captureState: capture ? "active" : "inactive",
+      captureControlGeneration: capture ? 1 : 0,
+      captureControlEvidenceSha256: capture?.receiptSha256 ?? null,
+      lifecycleControlEvidenceSha256: lifecycle.state === "active" ? lifecycle.activationEvidenceSha256 : null,
+      refKeyIdSha256: lifecycle.state === "active" ? lifecycle.refKeyIdSha256 : null,
+      logsTargetSha256: capture?.logsTargetSha256 ?? null,
+      logsTargetReceiptSha256: capture?.logsTargetReceiptSha256 ?? null,
+      runtimeState,
+      runtimeControlGeneration: runtime.controlGeneration,
+      runtimeControlEvidenceSha256: runtime.evidenceSha256,
+      runtimeEpochSha256: runtime.runtimeEpochSha256,
+      runtimeBindingSha256,
+    };
+    const controlProjectionSha256 = RetainedSource.tenantTelemetryRetainedSourceControlProjectionSha256(controlProjection);
+    const baseIdentity = {
+      requestId: admission.requestId,
+      tenantId: admission.tenantId,
+      subjectGeneration: admission.generation,
+      t1FenceSha256: fence.evidenceSha256,
+    };
+    const legacyFailedItemDigests: string[] = [];
+    for (const item of this.items.values()) {
+      if (item.type !== "agentMessage" || item.status !== "failed") continue;
+      const session = this.sessions.get(item.sessionId);
+      if (!session) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      if (session.tenantId !== admission.tenantId) continue;
+      const classification = this.persistedProviderFailureClasses.get(item.id);
+      if (classification?.generation === 1) {
+        if (classification.classification === "provider_step_error") {
+          const failure = classification.operationSha256
+            ? this.persistedProviderFailureReceipts.get(classification.operationSha256) : undefined;
+          if (!failure || failure.tenantId !== admission.tenantId
+            || failure.sourceSessionRefSha256 !== telemetryCaptureLogsSourceRefSha256(
+              "session", admission.tenantId, session.id, this.tenantTelemetryRefKeyForUse())
+            || failure.sourceTurnRefSha256 !== telemetryCaptureLogsSourceRefSha256(
+              "turn", admission.tenantId, item.turnId, this.tenantTelemetryRefKeyForUse())
+            || failure.sourceItemRefSha256 !== telemetryCaptureLogsSourceRefSha256(
+              "item", admission.tenantId, item.id, this.tenantTelemetryRefKeyForUse())
+            || failure.sourceStepIndex !== item.step
+            || this.verifyMemoryPersistedProviderFailure(failure).status === "not_found") {
+            throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+          }
+        } else if (classification.operationSha256 !== undefined) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        continue;
+      }
+      legacyFailedItemDigests.push(RetainedSource.tenantTelemetryRetainedSourceLegacyFailedItemSha256({
+        tenantId: admission.tenantId,
+        userId: session.userId,
+        item,
+        classification: classification?.classification === "runtime_unknown" ? "runtime_unknown" : null,
+        controlGeneration: classification?.generation === 0 ? 0 : null,
+      }));
+    }
+    const legacyFailedItemRootSha256 = RetainedSource.tenantTelemetryRetainedSourceLegacyFailedItemRootSha256(
+      baseIdentity, legacyFailedItemDigests,
+    );
+    const observations: RetainedSource.TenantTelemetryRetainedSourceProfileObservations = {
+      lifecycleHistoryStatus: lifecycleCoverage?.historyStatus ?? null,
+      captureStatus: captureCoverage?.captureStatus ?? null,
+      legacyFailedItemCount: legacyFailedItemDigests.length,
+      runtimeState,
+      restorePending,
+    };
+    const reasons = RetainedSource.deriveTenantTelemetryRetainedSourceBlockedReasons(observations);
+    const primaryEligible = lifecycleCoverage.historyStatus === "complete_since_creation"
+      && captureCoverage.captureStatus === "capture_since_tenant_creation"
+      && capture.runtimeEpochSha256 === runtime.runtimeEpochSha256
+      && capture.runtimeBindingSha256 === runtimeBindingSha256
+      && tenant.createdAtMs >= Math.max(lifecycle.activatedAtDbMs, capture.activatedAtDbMs)
+      && canonicalTenant !== undefined && canonicalTenant.tenantId === admission.tenantId
+      && canonicalTenant.subjectKind === "tenant" && canonicalTenant.subjectId === admission.tenantId
+      && Number.isSafeInteger(canonicalTenant.createdAtMs)
+      && canonicalTenant.createdAtMs >= Math.max(lifecycle.activatedAtDbMs, capture.activatedAtDbMs)
+      && lifecycleCoverage.coverageStartedAtDbMs === canonicalTenant.createdAtMs
+      && captureCoverage.coverageStartedAtDbMs === canonicalTenant.createdAtMs
+      && lifecycleCoverage.coverageStartedAtDbMs <= tenant.createdAtMs
+      && captureCoverage.coverageStartedAtDbMs <= tenant.createdAtMs
+      && reasons.length === 0;
+    const profile: RetainedSource.TenantTelemetryRetainedSourceT1Profile = primaryEligible
+      ? { kind: "eligible-primary", primaryBinding: RetainedSource.buildTenantTelemetryRetainedSourcePrimaryBinding({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PRIMARY_SCOPE,
+        captureControlEvidenceSha256: capture.receiptSha256,
+        lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256,
+        refKeyIdSha256: capture.refKeyIdSha256,
+        logsTargetSha256: capture.logsTargetSha256,
+        logsTargetReceiptSha256: capture.logsTargetReceiptSha256,
+        runtimeEpochSha256: runtime.runtimeEpochSha256,
+        runtimeBindingSha256,
+        runtimeControlEvidenceSha256: runtime.evidenceSha256,
+        runtimeControlGeneration: runtime.controlGeneration,
+        lifecycleCoverageEvidenceSha256: lifecycleCoverage.evidenceSha256,
+        captureCoverageEvidenceSha256: captureCoverage.evidenceSha256,
+        lifecycleHistoryStatus: "complete_since_creation",
+        captureStatus: "capture_since_tenant_creation",
+        lifecycleActivatedAtDbMs: lifecycle.activatedAtDbMs,
+        captureActivatedAtDbMs: capture.activatedAtDbMs,
+        lifecycleCoverageStartedAtDbMs: lifecycleCoverage.coverageStartedAtDbMs,
+        captureCoverageStartedAtDbMs: captureCoverage.coverageStartedAtDbMs,
+        tenantCreatedAtDbMs: tenant.createdAtMs,
+      }), legacyFailedItemCount: 0, legacyFailedItemRootSha256 }
+      : { kind: "blocked-source", controlProjectionSha256,
+        lifecycleCoverageEvidenceSha256: lifecycleCoverage?.evidenceSha256 ?? null,
+        captureCoverageEvidenceSha256: captureCoverage?.evidenceSha256 ?? null,
+        runtimeEpochSha256: runtime.runtimeEpochSha256,
+        runtimeBindingSha256, legacyFailedItemCount: legacyFailedItemDigests.length,
+        legacyFailedItemRootSha256,
+        observedHighWaterDbMs: Math.max(tenant.createdAtMs, acceptedAtDbMs,
+          lifecycle.state === "active" ? lifecycle.activatedAtDbMs : 0,
+          lifecycleCoverage?.coverageStartedAtDbMs ?? 0, capture?.activatedAtDbMs ?? 0,
+          captureCoverage?.coverageStartedAtDbMs ?? 0,
+          runtime.updatedAtDbMs),
+        reasons: reasons.sort() };
+    const t1ProfileSha256 = RetainedSource.tenantTelemetryRetainedSourceT1ProfileSha256(profile);
+    const identity = { ...baseIdentity, t1ProfileSha256 };
+    const graph = projectTenantTelemetryRetainedSourceGraph({ tenantId: admission.tenantId, sources: {
+      inventories: [...this.tenantTelemetryArtifactInventories.values()],
+      jobs: [...this.tenantTelemetryWriteJobs.values()],
+      acks: [...this.tenantTelemetryWriteAcks.values()],
+      memberships: [...this.tenantTelemetryArtifactMemberships.values()],
+      bindings: [...this.tenantTelemetryApplicationWriteBindings.values()],
+      providerBindings: [...this.persistedProviderCaptureBindings.values()],
+      providerFailureReceipts: [...this.persistedProviderFailureReceipts.values()],
+    } });
+    const entries = graph.groups.filter((group) => (
+      group.providerBinding !== undefined || group.providerFailureReceipt !== undefined
+      || group.job?.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA
+      || group.membership?.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA
+      || group.inventory?.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA
+      || (group.ack !== undefined && group.job === undefined)
+    )).map((group) => {
+      const job = group.job;
+      const complete = !!(group.providerFailureReceipt && group.providerBinding && group.membership && job);
+      const state: RetainedSource.TenantTelemetryRetainedSourceCohortState = !complete ? "unknown"
+        : job.phase === "written" ? "written_ack"
+          : job.phase === "blocked" ? "blocked" : job.reservation ? "reserved" : "pending";
+      if (complete && runtimeState === "primary" && !restorePending) {
+        const verification = this.verifyMemoryPersistedProviderFailure(group.providerFailureReceipt!);
+        const expected = state === "written_ack" ? "source_verified_written"
+          : state === "blocked" ? "source_verified_blocked"
+            : state === "reserved" ? "source_verified_reserved" : "source_verified_queued";
+        if (verification.status !== expected) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      return RetainedSource.buildTenantTelemetryRetainedSourceT1CohortEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_T1_ENTRY_SCOPE,
+        ...identity,
+        sourceIdentitySha256: group.sourceIdentitySha256,
+        state,
+        writeOperationSha256: group.operationSha256,
+        failureCommitReceiptSha256: group.providerFailureReceipt?.receiptSha256 ?? null,
+        sourceBindingReceiptSha256: group.providerBinding?.receiptSha256 ?? null,
+        membershipSha256: group.membership?.membershipSha256 ?? null,
+        writeJobEvidenceSha256: job ? TenantTelemetrySourceAccounting.tenantTelemetrySourceAccountingJobEvidenceSha256(job) : null,
+        reservationSha256: job?.reservation?.receiptSha256 ?? null,
+        writeAckReceiptSha256: group.ack?.receiptSha256 ?? null,
+        inventorySha256: group.inventory?.inventorySha256 ?? null,
+        inventoryReceiptSha256: group.inventory?.receiptSha256 ?? null,
+        payloadSha256: job?.inventory.payloadSha256 ?? null,
+        sourceHighWaterDbMs: group.sourceHighWaterDbMs,
+        capturedAtDbMs: Math.max(acceptedAtDbMs, group.sourceHighWaterDbMs),
+      });
+    });
+    const sourceHighWaterDbMs = Math.max(
+      profile.kind === "eligible-primary"
+        ? Math.max(profile.primaryBinding.tenantCreatedAtDbMs,
+          profile.primaryBinding.lifecycleCoverageStartedAtDbMs,
+          profile.primaryBinding.captureCoverageStartedAtDbMs)
+        : profile.observedHighWaterDbMs,
+      ...entries.map((entry) => entry.sourceHighWaterDbMs));
+    if (acceptedAtDbMs < Math.max(sourceHighWaterDbMs, fence.fencedAtMs)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const storeDbTimestampMs = acceptedAtDbMs;
+    // Rebuild entries with the single sealed boundary timestamp required by the codec.
+    const stampedEntries = entries.map((entry) => {
+      const { receiptSha256: ignored, ...body } = entry; void ignored;
+      return RetainedSource.buildTenantTelemetryRetainedSourceT1CohortEntry({ ...body, capturedAtDbMs: storeDbTimestampMs });
+    });
+    const count = (state: RetainedSource.TenantTelemetryRetainedSourceCohortState) =>
+      stampedEntries.filter((entry) => entry.state === state).length;
+    const receipt = RetainedSource.buildTenantTelemetryRetainedSourceT1CohortReceipt({
+      scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_T1_RECEIPT_SCOPE,
+      ...identity,
+      profile,
+      tenantLifecycleSubjectEvidenceSha256: subject.receiptSha256,
+      entryCount: stampedEntries.length,
+      entryRootSha256: RetainedSource.tenantTelemetryRetainedSourceT1CohortRootSha256(stampedEntries),
+      writtenAckCount: count("written_ack"),
+      writtenAckRootSha256: RetainedSource.tenantTelemetryRetainedSourceT1CohortRootSha256(stampedEntries, "written_ack"),
+      pendingCount: count("pending"),
+      pendingRootSha256: RetainedSource.tenantTelemetryRetainedSourceT1CohortRootSha256(stampedEntries, "pending"),
+      reservedCount: count("reserved"),
+      reservedRootSha256: RetainedSource.tenantTelemetryRetainedSourceT1CohortRootSha256(stampedEntries, "reserved"),
+      blockedCount: count("blocked"),
+      blockedRootSha256: RetainedSource.tenantTelemetryRetainedSourceT1CohortRootSha256(stampedEntries, "blocked"),
+      unknownCount: count("unknown"),
+      unknownRootSha256: RetainedSource.tenantTelemetryRetainedSourceT1CohortRootSha256(stampedEntries, "unknown"),
+      eligibility: profile.kind === "eligible-primary" && stampedEntries.every((entry) => entry.state === "written_ack")
+        ? "eligible_retained" : "blocked_source",
+      t1AcceptedAtDbMs: acceptedAtDbMs,
+      sourceHighWaterDbMs,
+      storeDbTimestampMs,
+      executionReady: false, externalAuthorityVerified: false,
+      allDomainsComplete: false, contentPurgeExecuted: false,
+    }, stampedEntries);
+    const familyBody = { protocol: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL,
+      requestId: admission.requestId, tenantId: admission.tenantId, subjectGeneration: admission.generation,
+      t1FenceSha256: fence.evidenceSha256, cohortReceiptSha256: receipt.receiptSha256 };
+    const family: RetainedSourceAdmissionFamily = { ...familyBody,
+      evidenceSha256: RetainedSource.tenantTelemetryRetainedSourceSha256(
+        "tenant-telemetry-retained-source-admission-family-v1", familyBody,
+      ) };
+    return { family, entries: stampedEntries, receipt };
+  }
+
+  private stageRetainedSourceCatalog(
+    job: TenantPurgePlanJobRecord,
+    planReceipt: TenantPurgePlanReceipt,
+    sourceSnapshot: ReturnType<typeof TenantTelemetrySourceAccounting.createTenantTelemetrySourceAccountingSnapshot>,
+    manifestSnapshot: ReturnType<typeof TenantTelemetryTargetManifest.createTenantTelemetryTargetManifestSnapshot>,
+    sources: TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingInputs & {
+      providerBindings: PersistedCapture.TenantTelemetryPersistedProviderCaptureSourceBinding[];
+      providerFailureReceipts: PersistedCapture.PersistedProviderStepFailureCommitReceipt[];
+    },
+    liveOwnerOperations: ReadonlySet<string>,
+    capturedAtDbMs: number,
+  ): {
+    entries: RetainedSource.TenantTelemetryRetainedSourceCatalogEntry[];
+    sourceEntries: RetainedSource.TenantTelemetryRetainedSourceCatalogSourceEntry[];
+    receipt: RetainedSource.TenantTelemetryRetainedSourceCatalogReceipt;
+  } {
+    if (job.phase !== "plan_sealed") throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const family = this.retainedSourcePlanFamilyFor(job.requestId);
+    const cohortReceipt = this.retainedSourceT1Receipts.get(job.requestId);
+    if (!family || !cohortReceipt || family.tenantId !== job.tenantId
+      || family.subjectGeneration !== job.subjectGeneration
+      || family.t1FenceSha256 !== job.t1FenceSha256
+      || cohortReceipt.receiptSha256 !== family.cohortReceiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const cohortEntries = this.retainedSourceT1EntriesFor(job.requestId);
+    RetainedSource.validateTenantTelemetryRetainedSourceT1CohortProof(
+      cohortReceipt, cohortEntries, cohortReceipt.profile,
+    );
+    const graph = projectTenantTelemetryRetainedSourceGraph({ tenantId: job.tenantId, sources });
+    const groups = new Map(graph.groups.filter((group) => group.operationSha256 !== null)
+      .map((group) => [group.operationSha256!, group]));
+    const applicationV1Targets = TenantTelemetryPlanArtifactTarget.projectTenantTelemetryPlanArtifactTargets({
+      job, planReceipt, planEntries: this.tenantPurgePlanEntriesFor(job),
+      sourceEntries: sourceSnapshot.entries, sourceReceipt: sourceSnapshot.receipt,
+      manifestEntries: manifestSnapshot.entries, manifestReceipt: manifestSnapshot.receipt,
+      sources, liveOwnerOperations,
+    });
+    const identity = { requestId: job.requestId, tenantId: job.tenantId,
+      subjectGeneration: job.subjectGeneration, t1ProfileSha256: cohortReceipt.t1ProfileSha256,
+      t1FenceSha256: job.t1FenceSha256 };
+    const entries: RetainedSource.TenantTelemetryRetainedSourceCatalogEntry[] = [];
+    for (const target of applicationV1Targets) {
+      const group = groups.get(target.writeOperationSha256);
+      const writeJob = group?.job;
+      const reservation = writeJob?.reservation;
+      if (!group || !group.inventory || !writeJob || !reservation
+        || target.artifactGroupSha256 !== TenantTelemetryTargetManifest.tenantTelemetryTargetManifestArtifactGroupSha256(
+          job.tenantId, target.domain, group.inventory.inventorySha256,
+        )) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      entries.push(RetainedSource.buildTenantTelemetryRetainedSourceCatalogEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CATALOG_ENTRY_SCOPE,
+        ...identity, planBuildGeneration: job.buildGeneration,
+        cohortReceiptSha256: cohortReceipt.receiptSha256, domain: target.domain,
+        source: { kind: "application-v1",
+          applicationBindingReceiptSha256: target.applicationBindingReceiptSha256,
+          applicationCoverageEvidenceSha256: target.applicationCoverageEvidenceSha256,
+          sourceGroupRootSha256: target.sourceGroupRootSha256 },
+        artifactGroupSha256: target.artifactGroupSha256,
+        targetSha256: target.targetSha256, targetReceiptSha256: target.targetReceiptSha256,
+        artifactIdSha256: target.artifactIdSha256, artifactGeneration: target.artifactGeneration,
+        inventorySha256: target.inventorySha256, inventoryReceiptSha256: target.inventoryReceiptSha256,
+        writeOperationSha256: target.writeOperationSha256,
+        writeJobEvidenceSha256: TenantTelemetrySourceAccounting.tenantTelemetrySourceAccountingJobEvidenceSha256(writeJob),
+        reservationSha256: reservation.receiptSha256,
+        writeAckReceiptSha256: target.writeAckReceiptSha256,
+        membershipSha256: target.membershipSha256, payloadSha256: target.payloadSha256,
+        manifestSha256: target.manifestSha256,
+        lifecycleCoverageEvidenceSha256: target.lifecycleCoverageEvidenceSha256,
+        ownerKind: target.ownerKind, ownerRefSha256: target.ownerRefSha256,
+        holdSubjectRefSha256: target.holdSubjectRefSha256,
+        ownerBindingSha256: target.ownerBindingSha256,
+        liveOwnerClaimSha256: target.liveOwnerClaimSha256,
+        sourceHighWaterDbMs: Math.max(group.sourceHighWaterDbMs, target.capturedAtDbMs),
+        capturedAtDbMs,
+      }));
+    }
+    if (cohortReceipt.eligibility === "eligible_retained") {
+      for (const frozen of cohortEntries) {
+        const group = frozen.writeOperationSha256 ? groups.get(frozen.writeOperationSha256) : undefined;
+        if (frozen.state !== "written_ack" || !group?.job || !group.inventory || !group.ack
+          || !group.membership || !group.providerBinding || !group.providerFailureReceipt
+          || !group.job.reservation || !liveOwnerOperations.has(group.job.writeOperationSha256)) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        const verification = this.verifyMemoryPersistedProviderFailure(group.providerFailureReceipt);
+        if (verification.status !== "source_verified_written") {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        const manifest = manifestSnapshot.entries.find((entry) =>
+          entry.sourceKind === "inventory"
+          && entry.sourceIdentitySha256 === group.inventory!.inventorySha256
+          && entry.writeOperationSha256 === frozen.writeOperationSha256);
+        const writeJob = group.job;
+        const reservation = writeJob.reservation;
+        const inventory = group.inventory;
+        const membership = group.membership;
+        if (!reservation) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        const artifactGroupSha256 = TenantTelemetryTargetManifest.tenantTelemetryTargetManifestArtifactGroupSha256(
+          job.tenantId, "logs", inventory.inventorySha256,
+        );
+        if (!manifest || manifest.artifactGroupSha256 !== artifactGroupSha256) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        entries.push(RetainedSource.buildTenantTelemetryRetainedSourceCatalogEntry({
+          scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CATALOG_ENTRY_SCOPE,
+          ...identity, planBuildGeneration: job.buildGeneration,
+          cohortReceiptSha256: cohortReceipt.receiptSha256, domain: "logs",
+          source: { kind: "persisted-provider-v2",
+            failureCommitReceiptSha256: group.providerFailureReceipt.receiptSha256,
+            sourceBindingReceiptSha256: group.providerBinding.receiptSha256,
+            captureCoverageEvidenceSha256: cohortReceipt.profile.kind === "eligible-primary"
+              ? cohortReceipt.profile.primaryBinding.captureCoverageEvidenceSha256
+              : (() => { throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError(); })(),
+            cohortEntryReceiptSha256: frozen.receiptSha256 },
+          artifactGroupSha256,
+          targetSha256: inventory.targetSha256, targetReceiptSha256: writeJob.target.receiptSha256,
+          artifactIdSha256: inventory.artifactIdSha256, artifactGeneration: inventory.artifactGeneration,
+          inventorySha256: inventory.inventorySha256, inventoryReceiptSha256: inventory.receiptSha256,
+          writeOperationSha256: writeJob.writeOperationSha256,
+          writeJobEvidenceSha256: TenantTelemetrySourceAccounting.tenantTelemetrySourceAccountingJobEvidenceSha256(writeJob),
+          reservationSha256: reservation.receiptSha256,
+          writeAckReceiptSha256: group.ack.receiptSha256,
+          membershipSha256: membership.membershipSha256, payloadSha256: inventory.payloadSha256,
+          manifestSha256: inventory.manifestSha256,
+          lifecycleCoverageEvidenceSha256: inventory.coverageEvidenceSha256,
+          ownerKind: membership.ownerKind, ownerRefSha256: membership.ownerRefSha256,
+          holdSubjectRefSha256: membership.holdSubjectRefSha256,
+          ownerBindingSha256: membership.ownerBindingSha256,
+          liveOwnerClaimSha256: TenantTelemetryTargetManifest.tenantTelemetryLiveOwnerClaimSha256(membership),
+          sourceHighWaterDbMs: Math.max(group.sourceHighWaterDbMs, frozen.capturedAtDbMs),
+          capturedAtDbMs,
+        }));
+      }
+    }
+    if (cohortReceipt.profile.kind !== "eligible-primary") {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    validateTenantTelemetryRetainedSourceProviderTargetRelations({
+      tenantId: job.tenantId,
+      refKeyIdSha256: cohortReceipt.profile.primaryBinding.refKeyIdSha256,
+      entries, sources,
+    });
+    const targetByOperation = new Map(entries.map((entry) => [entry.writeOperationSha256, entry]));
+    const groupByObservedRow = new Map(graph.groups.flatMap((group) =>
+      group.observedRows.map((row) => [row, group.sourceIdentitySha256] as const)));
+    const sourceEntries = graph.observedRows.map((row) => {
+      const target = row.writeOperationSha256 === null ? undefined : targetByOperation.get(row.writeOperationSha256);
+      const body = { scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CATALOG_SOURCE_SCOPE,
+        ...identity, ...row, planBuildGeneration: job.buildGeneration,
+        cohortReceiptSha256: cohortReceipt.receiptSha256,
+        artifactGroupSha256: target?.artifactGroupSha256
+          ?? groupByObservedRow.get(row) ?? null,
+        catalogTargetEntryReceiptSha256: target?.receiptSha256 ?? null,
+        classification: target ? "accounted" as const : "unknown" as const,
+        capturedAtDbMs };
+      return RetainedSource.buildTenantTelemetryRetainedSourceCatalogSourceEntry(body);
+    });
+    const sourceHighWaterDbMs = Math.max(cohortReceipt.storeDbTimestampMs,
+      ...entries.map((entry) => entry.sourceHighWaterDbMs),
+      ...sourceEntries.map((entry) => entry.sourceHighWaterDbMs));
+    if (capturedAtDbMs < sourceHighWaterDbMs) {
+      throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+    }
+    const countSource = (kind: RetainedSource.TenantTelemetryRetainedSourceRawKind) =>
+      sourceEntries.filter((entry) => entry.sourceKind === kind).length;
+    const countTarget = (kind: "application-v1" | "persisted-provider-v2" | "logs" | "traces") =>
+      entries.filter((entry) => entry.source.kind === kind || entry.domain === kind).length;
+    const unknownGroups = RetainedSource.tenantTelemetryRetainedSourceCatalogUnknownGroups(sourceEntries);
+    const receipt = RetainedSource.buildTenantTelemetryRetainedSourceCatalogReceipt({
+      scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CATALOG_RECEIPT_SCOPE,
+      ...identity, planBuildGeneration: job.buildGeneration,
+      cohortReceiptSha256: cohortReceipt.receiptSha256,
+      t3cReceiptSha256: job.t3cReceiptSha256,
+      planReceiptSha256: planReceipt.receiptSha256,
+      legacySourceAccountingReceiptSha256: sourceSnapshot.receipt.receiptSha256,
+      legacyTargetManifestReceiptSha256: manifestSnapshot.receipt.receiptSha256,
+      proofFamily: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_PROTOCOL,
+      sourceCount: sourceEntries.length,
+      sourceRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries),
+      inventoryCount: countSource("inventory"), inventoryRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries, "inventory"),
+      writeJobCount: countSource("write_job"), writeJobRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries, "write_job"),
+      writeAckCount: countSource("write_ack"), writeAckRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries, "write_ack"),
+      membershipCount: countSource("membership"), membershipRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries, "membership"),
+      applicationBindingCount: countSource("application_binding"), applicationBindingRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries, "application_binding"),
+      providerSourceBindingCount: countSource("provider_source_binding"), providerSourceBindingRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries, "provider_source_binding"),
+      providerFailureCommitCount: countSource("provider_failure_commit"), providerFailureCommitRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries, "provider_failure_commit"),
+      unknownSourceCount: sourceEntries.filter((entry) => entry.classification === "unknown").length,
+      unknownSourceRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogSourceRootSha256(sourceEntries, "unknown"),
+      entryCount: entries.length,
+      entryRootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogRootSha256(entries),
+      applicationV1Count: countTarget("application-v1"), applicationV1RootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogRootSha256(entries, "application-v1"),
+      persistedProviderV2Count: countTarget("persisted-provider-v2"), persistedProviderV2RootSha256: RetainedSource.tenantTelemetryRetainedSourceCatalogRootSha256(entries, "persisted-provider-v2"),
+      logsTargetCount: countTarget("logs"),
+      logsTargetRootSha256: TenantTelemetryDisposition.tenantTelemetryDispositionInventoryTargetRootSha256(
+        "logs", RetainedSource.tenantTelemetryRetainedSourceCatalogPlanTargets(entries, "logs")),
+      tracesTargetCount: countTarget("traces"),
+      tracesTargetRootSha256: TenantTelemetryDisposition.tenantTelemetryDispositionInventoryTargetRootSha256(
+        "traces", RetainedSource.tenantTelemetryRetainedSourceCatalogPlanTargets(entries, "traces")),
+      unknownGroupCount: unknownGroups.length,
+      unknownGroupRootSha256: RetainedSource.tenantTelemetryRetainedSourceUnknownGroupRootSha256(unknownGroups),
+      sourceHighWaterDbMs, storeDbTimestampMs: capturedAtDbMs,
+      completedClaimAttempt: planReceipt.completedClaimAttempt,
+      completedClaimTokenSha256: planReceipt.completedClaimTokenSha256,
+      executionReady: false, externalAuthorityVerified: false,
+      allDomainsComplete: false, contentPurgeExecuted: false,
+    }, entries, sourceEntries, {
+      cohortReceipt, cohortEntries, expectedProfile: cohortReceipt.profile,
+      legacyAnchors: {
+        job, planReceipt, sourceEntries: sourceSnapshot.entries,
+        sourceReceipt: sourceSnapshot.receipt,
+        manifestEntries: manifestSnapshot.entries, manifestReceipt: manifestSnapshot.receipt,
+      },
+      failureReceipts: sources.providerFailureReceipts.filter((failure) => failure.tenantId === job.tenantId),
+      applicationV1Targets, observedSourceRows: graph.observedRows,
+    });
+    for (const domain of ["logs", "traces"] as const) {
+      const planEntry = this.tenantPurgePlanEntriesFor(job).find((entry) => entry.domain === domain);
+      if (!planEntry || planEntry.disposition !== "blocked_adapter_unconfigured"
+        || planEntry.targetCount !== (domain === "logs" ? receipt.logsTargetCount : receipt.tracesTargetCount)
+        || planEntry.targetRootSha256 !== (domain === "logs" ? receipt.logsTargetRootSha256 : receipt.tracesTargetRootSha256)) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+    return { entries, sourceEntries, receipt };
   }
 
   private persistedProviderCapturePrerequisites(): PersistedCapture.TenantTelemetryPersistedProviderCapturePrerequisites {
@@ -1685,8 +2486,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async getTenantTelemetryPersistedProviderCaptureSourceBinding(tenantId: string, operationSha256: string) {
     this.assertMemoryPersistedProviderCaptureControl();
     const binding = this.persistedProviderCaptureBindings.get(operationSha256);
-    if(binding)PersistedCapture.validatePersistedProviderCaptureSourceBinding(binding);
-    return clone(binding?.tenantId === tenantId ? binding : null);
+    if (!binding || binding.tenantId !== tenantId) return null;
+    PersistedCapture.validatePersistedProviderCaptureSourceBinding(binding);
+    const failure = this.persistedProviderFailureReceipts.get(operationSha256);
+    if (!failure || failure.tenantId !== tenantId || failure.writeOperationSha256 !== operationSha256
+      || failure.bindingReceiptSha256 !== binding.receiptSha256) {
+      throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    }
+    this.verifyMemoryPersistedProviderFailure(failure);
+    return clone(binding);
   }
   private persistedProviderFailureReceiptForSource(input: PersistedCapture.VerifyPersistedProviderStepFailureSourceInput) {
     if (!Number.isSafeInteger(input.stepIndex) || input.stepIndex < 1) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
@@ -1703,7 +2511,131 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (receipt) this.verifyMemoryPersistedProviderFailure(receipt);
     return clone(receipt ?? null);
   }
-  private verifyMemoryPersistedProviderFailure(receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt): PersistedCapture.PersistedProviderStepFailureSourceVerification {
+  private verifyMemoryPersistedProviderFailure(
+    receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt,
+  ): PersistedCapture.PersistedProviderStepFailureSourceVerification {
+    PersistedCapture.validatePersistedProviderFailureCommitReceipt(receipt);
+    const actual = this.persistedProviderFailureReceipts.get(receipt.writeOperationSha256);
+    if (!actual || PersistedCapture.persistedProviderCaptureCanonicalJson(actual)
+      !== PersistedCapture.persistedProviderCaptureCanonicalJson(receipt)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    // Locate the immutable family from actual admissions/plans AND every raw
+    // evidence family. A missing target cannot downgrade a sealed source to the
+    // original live verifier. The set only deduplicates audits, never authorizes.
+    const requestIds = new Set<string>();
+    for (const rows of [this.tenantErasureAdmissions.values(), this.tenantPurgePlanJobs.values(),
+      this.retainedSourceAdmissionFamilies.values(), this.retainedSourcePlanFamilies.values()]) {
+      for (const row of rows) if (row.tenantId === receipt.tenantId) requestIds.add(row.requestId);
+    }
+    const rawFamilies = [this.retainedSourceT1Entries.values(), this.retainedSourceT1Receipts.values(),
+      this.retainedSourceCatalogSources.values(), this.retainedSourceCatalogTargets.values(),
+      this.retainedSourceCatalogReceipts.values(), this.retainedSourceUsageEntries.values(),
+      this.retainedSourceUsageReceipts.values(), this.retainedSourceCanonicalEntries.values(),
+      this.retainedSourceCanonicalReceipts.values()];
+    for (const rows of rawFamilies) {
+      for (const row of rows) {
+        const sameOperation = "writeOperationSha256" in row
+          && row.writeOperationSha256 === receipt.writeOperationSha256;
+        if (sameOperation && row.tenantId !== receipt.tenantId) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        if (row.tenantId === receipt.tenantId) requestIds.add(row.requestId);
+      }
+    }
+    let catalog: ReturnType<MemorySessionStore["retainedSourceCatalogProof"]> | undefined;
+    let phase: RetainedSourceEvidencePhase = "live";
+    for (const requestId of requestIds) {
+      const admission = this.tenantErasureAdmissions.get(requestId);
+      const planJob = this.tenantPurgePlanJobs.get(requestId);
+      const family = this.retainedSourceAdmissionFamilyFor(requestId);
+      const planFamily = this.retainedSourcePlanFamilyFor(requestId);
+      const downstream = this.retainedSourceCatalogSourcesFor(requestId).length !== 0
+        || this.retainedSourceCatalogTargetsFor(requestId).length !== 0
+        || this.retainedSourceCatalogReceipts.has(requestId)
+        || this.retainedSourceUsageEntriesFor(requestId).length !== 0
+        || this.retainedSourceUsageReceipts.has(requestId)
+        || this.retainedSourceCanonicalEntriesFor(requestId).length !== 0
+        || this.retainedSourceCanonicalReceipts.has(requestId);
+      if (!family) {
+        if (planFamily || downstream) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        continue; // Only a genuine old family with no new footprint remains live-only.
+      }
+      if (!admission || admission.tenantId !== receipt.tenantId || family.tenantId !== receipt.tenantId
+        || admission.requestId !== requestId || admission.generation !== family.subjectGeneration) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      this.assertTenantErasureAdmissionProof(admission,
+        this.subjectRecord(admission.tenantId, "tenant", admission.tenantId),
+        this.tenantCredentialRevocationFences.get(admission.tenantId));
+      if (!planJob) {
+        if (planFamily || downstream) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        continue; // Valid T1 precedes T3d materialization, never its source leaves.
+      }
+      if (!planFamily || planJob.tenantId !== receipt.tenantId
+        || planJob.subjectGeneration !== family.subjectGeneration
+        || planJob.t1FenceSha256 !== family.t1FenceSha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      if (planJob.phase !== "plan_sealed") {
+        if (downstream) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        continue;
+      }
+      const planReceipt = this.tenantPurgePlanReceipts.get(requestId);
+      if (!planReceipt || catalog) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      validateTenantPurgePlanCompletionProof(planJob, this.tenantPurgePlanEntriesFor(planJob), planReceipt);
+      this.assertRetainedSourceEligiblePrimaryNow(requestId);
+      phase = this.retainedSourceEvidencePhase(requestId);
+      const candidate = this.retainedSourceCatalogProof(planJob, planReceipt, phase);
+      if (phase !== "live") {
+        const usage = this.retainedSourceUsageEvidence(planJob, planReceipt, candidate);
+        if (phase === "canonical_closed") this.retainedSourceCanonicalEvidence(planJob, candidate, usage);
+        else {
+          for (const target of candidate.entries) {
+            const failure = this.persistedProviderFailureReceipts.get(target.writeOperationSha256);
+            const released = usage.entries.find((entry) => entry.writeOperationSha256 === target.writeOperationSha256);
+            if (!failure || !released) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+            this.retainedSourceCanonicalLiveSnapshot(failure, target, released);
+          }
+        }
+      }
+      catalog = candidate;
+    }
+    if (!catalog) return this.verifyMemoryPersistedProviderFailureLive(receipt);
+    const target = catalog.entries.find((entry) => entry.writeOperationSha256 === receipt.writeOperationSha256);
+    const recorded = catalog.proof.failureReceipts.find((entry) => entry.writeOperationSha256 === receipt.writeOperationSha256);
+    if (!target || target.source.kind !== "persisted-provider-v2" || !recorded
+      || PersistedCapture.persistedProviderCaptureCanonicalJson(recorded)
+        !== PersistedCapture.persistedProviderCaptureCanonicalJson(receipt)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    if (phase === "live") return this.verifyMemoryPersistedProviderFailureLive(receipt);
+    const job = this.tenantTelemetryWriteJobs.get(receipt.writeOperationSha256);
+    const ack = this.tenantTelemetryWriteAcks.get(receipt.writeOperationSha256);
+    const membership = this.tenantTelemetryArtifactMemberships.get(receipt.writeOperationSha256);
+    const binding = this.persistedProviderCaptureBindings.get(receipt.writeOperationSha256);
+    const inventory = job && this.tenantTelemetryArtifactInventories.get(this.tenantTelemetryArtifactMapKey(
+      "logs", job.inventory.artifactIdSha256, job.inventory.artifactGeneration,
+    ));
+    if (!job || job.phase !== "written" || !ack || !membership || !binding || !inventory
+      || ack.receiptSha256 !== job.writeAckReceiptSha256
+      || membership.membershipSha256 !== receipt.membershipSha256
+      || binding.receiptSha256 !== receipt.bindingReceiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return {
+      status: "source_verified_written", sourceCount: 1,
+      failureCommitReceiptSha256: receipt.receiptSha256,
+      sourceBindingReceiptSha256: binding.receiptSha256,
+      writeOperationSha256: receipt.writeOperationSha256,
+      membershipSha256: membership.membershipSha256,
+      writeAckReceiptSha256: ack.receiptSha256,
+      inventoryReceiptSha256: inventory.receiptSha256,
+      executionReady: false, allDomainsComplete: false,
+    };
+  }
+
+  private verifyMemoryPersistedProviderFailureLive(receipt: PersistedCapture.PersistedProviderStepFailureCommitReceipt): PersistedCapture.PersistedProviderStepFailureSourceVerification {
     PersistedCapture.validatePersistedProviderFailureCommitReceipt(receipt);
     const control = this.assertMemoryPersistedProviderCaptureControl();
     const binding = this.persistedProviderCaptureBindings.get(receipt.writeOperationSha256);
@@ -1797,6 +2729,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     this.assertTenantTelemetryWriterGlobalRelations();
     const receipt = this.persistedProviderFailureReceipts.get(operation);
     if (!receipt || receipt.tenantId !== tenantId) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    if (boundary === "reserve" || boundary === "create") {
+      for (const target of this.retainedSourceCatalogTargets.values()) {
+        if (target.tenantId === tenantId && target.writeOperationSha256 === operation
+          && this.retainedSourceEvidencePhase(target.requestId) !== "live") {
+          throw new PersistedCapture.PersistedProviderCaptureConflictError(
+            "historical provider source cannot authorize a new external write",
+          );
+        }
+      }
+    }
     const verified=this.verifyMemoryPersistedProviderFailure(receipt);
     if(boundary === "reserve" || boundary === "create")this.assertMemoryPersistedFailureLiveWriteGates(this.tenantTelemetryWriteJobs.get(operation)!);
     return verified;
@@ -11096,6 +12038,22 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     } catch {
       throw new TenantErasureIntegrityError();
     }
+    const family = this.retainedSourceAdmissionFamilyFor(admission.requestId);
+    if (family) {
+      if (family.tenantId !== admission.tenantId
+        || family.subjectGeneration !== admission.generation
+        || family.t1FenceSha256 !== fence?.evidenceSha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      const receipt = this.retainedSourceT1Receipts.get(admission.requestId)!;
+      const subject = this.tenantTelemetryLifecycleSubjects.get(admission.requestId);
+      if (!subject || receipt.tenantLifecycleSubjectEvidenceSha256 !== subject.receiptSha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    } else if (this.retainedSourceT1Receipts.has(admission.requestId)
+      || this.retainedSourceT1EntriesFor(admission.requestId).length > 0) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
   }
 
   private assertTenantErasureAdmissionPublicationProof(
@@ -11319,6 +12277,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         jobNowMs,
       );
     }
+    if (this.retainedSourceAdmissionFamilies.has(stagedInput.requestId)
+      || this.retainedSourceT1Receipts.has(stagedInput.requestId)
+      || this.retainedSourceT1EntriesFor(stagedInput.requestId).length > 0) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const stagedRetainedSourceT1 = this.assertMemoryPersistedProviderCaptureControl()
+      ? this.stageRetainedSourceT1Cohort(
+        stagedRequest, stagedFence, stagedTelemetrySubject!, jobNowMs,
+      ) : undefined;
 
     const tenantExisted = this.subjectLifecycles.has(tenantKey);
     const priorTenant = this.subjectLifecycles.get(tenantKey);
@@ -11338,10 +12305,22 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const applicationCoveragesBefore = new Map(this.tenantTelemetryApplicationCoverages);
     const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     const telemetrySubjectsBefore = new Map(this.tenantTelemetryLifecycleSubjects);
+    const retainedSourceFamiliesBefore = new Map(this.retainedSourceAdmissionFamilies);
+    const retainedSourceEntriesBefore = new Map(this.retainedSourceT1Entries);
+    const retainedSourceReceiptsBefore = new Map(this.retainedSourceT1Receipts);
     try {
       this.tenantErasureAdmissions.set(stagedInput.requestId, stagedRequest);
       this.erasureAuditEvents.set(stagedInput.requestId, [stagedAudit]);
       this.tenantCredentialRevocationFences.set(stagedInput.tenantId, stagedFence);
+      if (stagedRetainedSourceT1) {
+        this.retainedSourceAdmissionFamilies.set(stagedInput.requestId, stagedRetainedSourceT1.family);
+        this.retainedSourceT1Receipts.set(stagedInput.requestId, stagedRetainedSourceT1.receipt);
+        for (const entry of stagedRetainedSourceT1.entries) {
+          this.retainedSourceT1Entries.set(
+            JSON.stringify([entry.requestId, entry.sourceIdentitySha256]), entry,
+          );
+        }
+      }
       if (stagedTelemetrySubject) {
         this.tenantTelemetryLifecycleSubjects.set(
           stagedTelemetrySubject.requestId,
@@ -11380,6 +12359,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       );
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
+      restoreMapSnapshot(this.retainedSourceT1Receipts, retainedSourceReceiptsBefore);
+      restoreMapSnapshot(this.retainedSourceT1Entries, retainedSourceEntriesBefore);
+      restoreMapSnapshot(this.retainedSourceAdmissionFamilies, retainedSourceFamiliesBefore);
       restoreMapSnapshot(this.tenantTelemetryLifecycleSubjects, telemetrySubjectsBefore);
       restoreMapSnapshot(
         this.tenantTelemetryApplicationCoverages,
@@ -14512,6 +15494,24 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     job: TenantPurgePlanJobRecord,
     planReceipt: TenantPurgePlanReceipt,
   ): void {
+    if (this.retainedSourcePlanFamilyFor(job.requestId)) {
+      if (this.tenantTelemetryPlanArtifactTargetReceipts.has(job.requestId)
+        || this.tenantTelemetryPlanArtifactTargetsFor(job.requestId).length) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      this.validateRetainedSourceCatalogForPlan(job, planReceipt);
+      return;
+    }
+    if (this.retainedSourceAdmissionFamilyFor(job.requestId)
+      || this.retainedSourceCatalogReceipts.has(job.requestId)
+      || this.retainedSourceCatalogSourcesFor(job.requestId).length
+      || this.retainedSourceCatalogTargetsFor(job.requestId).length
+      || this.retainedSourceUsageReceipts.has(job.requestId)
+      || this.retainedSourceUsageEntriesFor(job.requestId).length
+      || this.retainedSourceCanonicalReceipts.has(job.requestId)
+      || this.retainedSourceCanonicalEntriesFor(job.requestId).length) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
     const targetReceipt = this.tenantTelemetryPlanArtifactTargetReceipts.get(job.requestId);
     const targetEntries = this.tenantTelemetryPlanArtifactTargetsFor(job.requestId);
     // A pre-0042 terminal has unknown catalog provenance, not a proven empty set.
@@ -14544,6 +15544,550 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     } catch {
       throw new TenantErasureIntegrityError();
     }
+  }
+
+  private retainedSourceCatalogProof(
+    job: TenantPurgePlanJobRecord,
+    planReceipt: TenantPurgePlanReceipt,
+    phase: RetainedSourceEvidencePhase,
+  ): {
+    receipt: RetainedSource.TenantTelemetryRetainedSourceCatalogReceipt;
+    entries: RetainedSource.TenantTelemetryRetainedSourceCatalogEntry[];
+    sources: RetainedSource.TenantTelemetryRetainedSourceCatalogSourceEntry[];
+    proof: RetainedSource.TenantTelemetryRetainedSourceCatalogProof;
+  } {
+    const family = this.retainedSourcePlanFamilyFor(job.requestId);
+    const catalog = this.retainedSourceCatalogReceipts.get(job.requestId);
+    const cohort = this.retainedSourceT1Receipts.get(job.requestId);
+    const sourceReceipt = this.tenantTelemetrySourceAccountingReceipts.get(job.requestId);
+    const manifestReceipt = this.tenantTelemetryTargetManifestReceipts.get(job.requestId);
+    if (!family || !catalog || !cohort || !sourceReceipt || !manifestReceipt
+      || family.tenantId !== job.tenantId || family.subjectGeneration !== job.subjectGeneration
+      || family.cohortReceiptSha256 !== cohort.receiptSha256
+      || catalog.planBuildGeneration !== job.buildGeneration
+      || catalog.t3cReceiptSha256 !== job.t3cReceiptSha256
+      || catalog.planReceiptSha256 !== planReceipt.receiptSha256
+      || catalog.legacySourceAccountingReceiptSha256 !== sourceReceipt.receiptSha256
+      || catalog.legacyTargetManifestReceiptSha256 !== manifestReceipt.receiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    this.validateTenantTelemetrySourceAccountingForPlan(job, planReceipt);
+    this.validateTenantTelemetryTargetManifestForPlan(job, planReceipt);
+    const entries = this.retainedSourceCatalogTargetsFor(job.requestId);
+    const sourceEntries = this.retainedSourceCatalogSourcesFor(job.requestId);
+    const telemetrySources = {
+      inventories: [...this.tenantTelemetryArtifactInventories.values()],
+      jobs: [...this.tenantTelemetryWriteJobs.values()],
+      acks: [...this.tenantTelemetryWriteAcks.values()],
+      memberships: [...this.tenantTelemetryArtifactMemberships.values()],
+      bindings: [...this.tenantTelemetryApplicationWriteBindings.values()],
+      providerBindings: [...this.persistedProviderCaptureBindings.values()],
+      providerFailureReceipts: [...this.persistedProviderFailureReceipts.values()],
+    };
+    const graph = projectTenantTelemetryRetainedSourceGraph({ tenantId: job.tenantId, sources: telemetrySources });
+    if (cohort.profile.kind !== "eligible-primary") {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    validateTenantTelemetryRetainedSourceProviderTargetRelations({
+      tenantId: job.tenantId,
+      refKeyIdSha256: cohort.profile.primaryBinding.refKeyIdSha256,
+      entries, sources: telemetrySources,
+    });
+    const legacySourceEntries = this.tenantTelemetrySourceAccountingEntriesFor(job.requestId);
+    const legacyManifestEntries = this.tenantTelemetryTargetManifestEntriesFor(job.requestId);
+    TenantTelemetryTargetManifest.validateTenantTelemetryObservedTargetRelations(
+      legacyManifestEntries, telemetrySources,
+    );
+    let applicationV1Targets: TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTarget[];
+    if (phase === "live") {
+      applicationV1Targets = TenantTelemetryPlanArtifactTarget.projectTenantTelemetryPlanArtifactTargets({
+        job, planReceipt, planEntries: this.tenantPurgePlanEntriesFor(job),
+        sourceEntries: legacySourceEntries, sourceReceipt,
+        manifestEntries: legacyManifestEntries, manifestReceipt,
+        sources: telemetrySources,
+        liveOwnerOperations: this.verifiedTenantTelemetryLiveOwnerOperations(job.tenantId),
+      });
+      for (const entry of entries) {
+        if (entry.source.kind !== "persisted-provider-v2") continue;
+        const failure = this.persistedProviderFailureReceipts.get(entry.writeOperationSha256);
+        if (!failure || failure.tenantId !== job.tenantId
+          || failure.receiptSha256 !== entry.source.failureCommitReceiptSha256
+          || this.verifyMemoryPersistedProviderFailureLive(failure).status !== "source_verified_written") {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+      }
+    } else {
+      // Only a tenant created after the v2 cutover can enter the destructive path.
+      // Its application-v1 control was inactive from creation; there is no historical
+      // v1 target to reconstruct from already deleted canonical owner rows.
+      if (catalog.applicationV1Count !== 0
+        || entries.some((entry) => entry.source.kind !== "persisted-provider-v2")) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      applicationV1Targets = [];
+    }
+    const proof: RetainedSource.TenantTelemetryRetainedSourceCatalogProof = {
+      cohortReceipt: cohort, cohortEntries: this.retainedSourceT1EntriesFor(job.requestId),
+      expectedProfile: cohort.profile,
+      legacyAnchors: {
+        job, planReceipt, sourceEntries: legacySourceEntries, sourceReceipt,
+        manifestEntries: legacyManifestEntries, manifestReceipt,
+      },
+      failureReceipts: telemetrySources.providerFailureReceipts.filter((row) => row.tenantId === job.tenantId),
+      applicationV1Targets,
+      observedSourceRows: graph.observedRows,
+    };
+    RetainedSource.validateTenantTelemetryRetainedSourceCatalogProof(catalog, entries, sourceEntries, proof);
+    for (const domain of ["logs", "traces"] as const) {
+      const planEntry = this.tenantPurgePlanEntriesFor(job).find((entry) => entry.domain === domain);
+      if (!planEntry || planEntry.disposition !== "blocked_adapter_unconfigured"
+        || planEntry.targetCount !== (domain === "logs" ? catalog.logsTargetCount : catalog.tracesTargetCount)
+        || planEntry.targetRootSha256 !== (domain === "logs" ? catalog.logsTargetRootSha256 : catalog.tracesTargetRootSha256)) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+    }
+    return { receipt: catalog, entries, sources: sourceEntries, proof };
+  }
+
+  private validateRetainedSourceCatalogForPlan(
+    job: TenantPurgePlanJobRecord,
+    planReceipt: TenantPurgePlanReceipt,
+  ): void {
+    const phase = this.retainedSourceEvidencePhase(job.requestId);
+    const catalog = this.retainedSourceCatalogProof(job, planReceipt, phase);
+    if (phase === "live") return;
+    const usage = this.retainedSourceUsageEvidence(job, planReceipt, catalog);
+    if (phase === "usage_released") {
+      const released = new Map(usage.entries.map((entry) => [entry.writeOperationSha256, entry] as const));
+      for (const target of catalog.entries) {
+        const failure = this.persistedProviderFailureReceipts.get(target.writeOperationSha256);
+        const usageEntry = released.get(target.writeOperationSha256);
+        if (!failure || !usageEntry) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        this.retainedSourceCanonicalLiveSnapshot(failure, target, usageEntry);
+      }
+    } else {
+      this.retainedSourceCanonicalEvidence(job, catalog, usage);
+    }
+  }
+
+  private retainedSourceEvidencePhase(requestId: string): RetainedSourceEvidencePhase {
+    if (!this.retainedSourcePlanFamilyFor(requestId)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const execution = this.tenantPurgeExecutionJobs.get(requestId);
+    const cutover = this.tenantPurgeLocalCutoverReceipts.get(requestId);
+    const database = this.tenantDatabasePurgeJobs.get(requestId);
+    const usage = this.retainedSourceUsageReceipts.get(requestId);
+    const canonical = this.retainedSourceCanonicalReceipts.get(requestId);
+    const usageEntries = this.retainedSourceUsageEntriesFor(requestId);
+    const canonicalEntries = this.retainedSourceCanonicalEntriesFor(requestId);
+    if (database?.phase === "database_purged") {
+      if (!usage || !canonical || !cutover || !execution
+        || execution.localCutoverReceiptSha256 !== cutover.receiptSha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      return "canonical_closed";
+    }
+    if (canonical || canonicalEntries.length !== 0) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    if (cutover || execution?.localCutoverReceiptSha256 !== undefined) {
+      if (!usage || !cutover || !execution
+        || execution.localCutoverReceiptSha256 !== cutover.receiptSha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      return "usage_released";
+    }
+    if (usage || usageEntries.length !== 0) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return "live";
+  }
+
+  private retainedSourceUsageEvidence(
+    job: TenantPurgePlanJobRecord,
+    planReceipt: TenantPurgePlanReceipt,
+    catalog: ReturnType<MemorySessionStore["retainedSourceCatalogProof"]>,
+  ): {
+    receipt: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseReceipt;
+    entries: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry[];
+    proof: RetainedSource.TenantTelemetryRetainedSourceUsageProof;
+  } {
+    const execution = this.tenantPurgeExecutionJobs.get(job.requestId);
+    const usageReceipt = this.retainedSourceUsageReceipts.get(job.requestId);
+    const cutover = this.tenantPurgeLocalCutoverReceipts.get(job.requestId);
+    if (!execution || !usageReceipt || !cutover
+      || execution.tenantId !== job.tenantId
+      || execution.localCutoverReceiptSha256 !== cutover.receiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const executionState = this.assertTenantPurgeExecutionState(execution, false);
+    const usagePlan = executionState.planEntries.find((entry) => entry.domain === "operational_usage");
+    const usageAcks = executionState.acks.filter((ack) => ack.domain === "operational_usage"
+      && ack.ackKind === "anonymized" && ack.final);
+    const usageAck = usageAcks[0];
+    if (!usagePlan || usageAcks.length !== 1 || !usageAck
+      || executionState.planReceipt.receiptSha256 !== planReceipt.receiptSha256
+      || cutover.operationalUsageTargetRootSha256 !== usagePlan.targetRootSha256
+      || cutover.operationalUsageTargetCount !== usagePlan.targetCount
+      || usageAck.affectedCount !== usagePlan.targetCount
+      || usageAck.planEntryReceiptSha256 !== usagePlan.receiptSha256
+      || this.usageLedger.some((row) => row.tenantId === job.tenantId)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const allFacts = [...this.billingUsageFacts.values()]
+      .filter((fact) => fact.tenantId === job.tenantId);
+    for (const fact of allFacts) assertBillingUsageFact(fact);
+    const currentFacts = OrdinaryUsageRetention.subtractPriorRetainedBillingFacts(
+      job.tenantId, allFacts, this.ordinaryUsageRetentionPriorBillingFacts(job.tenantId),
+    );
+    if (usageAck.resultCount !== currentFacts.length
+      || usageAck.resultRootSha256 !== tenantPurgeExecutionResultRootSha256(
+        "operational_usage", "anonymize", currentFacts.map((fact) => fact.factSha256),
+      )) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    const entries = this.retainedSourceUsageEntriesFor(job.requestId);
+    if (usageAck.storeDbTimestampMs > cutover.storeDbTimestampMs
+      || entries.some((entry) => entry.releasedAtDbMs > usageAck.storeDbTimestampMs)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const factByHash = new Map(allFacts.map((fact) => [PersistedCapture.persistedProviderCaptureSha256(
+      "tenant-telemetry-step-usage-id-v2", fact.usageId,
+    ), fact] as const));
+    const retainedFacts = entries.map((entry) => {
+      const fact = factByHash.get(entry.usageIdSha256);
+      if (!fact || fact.tenantId !== job.tenantId) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      return fact;
+    });
+    const proof: RetainedSource.TenantTelemetryRetainedSourceUsageProof = {
+      catalogProof: catalog.proof, catalogReceipt: catalog.receipt,
+      catalogEntries: catalog.entries, catalogSources: catalog.sources,
+      retainedBillingFacts: retainedFacts,
+      anchors: {
+        planBuildGeneration: job.buildGeneration,
+        executionGeneration: execution.executionGeneration,
+        planReceiptSha256: planReceipt.receiptSha256,
+        operationalUsagePlanRootSha256: usagePlan.targetRootSha256,
+        operationalUsageAckReceiptSha256: usageAck.receiptSha256,
+        localCutoverReceiptSha256: cutover.receiptSha256,
+        completedClaimAttempt: cutover.completedClaimAttempt,
+        completedClaimTokenSha256: cutover.completedClaimTokenSha256,
+        storeDbTimestampMs: cutover.storeDbTimestampMs,
+      },
+    };
+    RetainedSource.validateTenantTelemetryRetainedSourceUsageReleaseProof(usageReceipt, entries, proof);
+    return { receipt: usageReceipt, entries, proof };
+  }
+
+  private stageRetainedSourceUsageRelease(
+    execution: Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }>,
+    authorization: TenantPurgeExecutionAuthorization,
+    usagePlan: TenantPurgePlanEntry,
+    tenantUsageRows: readonly UsageLedgerEntry[],
+    releasedAtDbMs: number,
+  ): {
+    catalog: ReturnType<MemorySessionStore["retainedSourceCatalogProof"]>;
+    entries: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry[];
+    retainedFacts: BillingUsageFact[];
+  } {
+    if (this.retainedSourceEvidencePhase(execution.requestId) !== "live"
+      || usagePlan.domain !== "operational_usage") {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    this.assertRetainedSourceEligiblePrimaryNow(execution.requestId);
+    const planJob = this.tenantPurgePlanJobs.get(execution.requestId);
+    const planReceipt = this.tenantPurgePlanReceipts.get(execution.requestId);
+    if (!planJob || planJob.phase !== "plan_sealed" || !planReceipt
+      || planJob.tenantId !== execution.tenantId
+      || planReceipt.receiptSha256 !== execution.planReceiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const catalog = this.retainedSourceCatalogProof(planJob, planReceipt, "live");
+    if (catalog.proof.cohortReceipt.eligibility !== "eligible_retained"
+      || catalog.receipt.unknownGroupCount !== 0
+      || catalog.receipt.applicationV1Count !== 0
+      || catalog.entries.some((entry) => entry.source.kind !== "persisted-provider-v2")) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const usageByHash = new Map<string, UsageLedgerEntry>();
+    for (const row of tenantUsageRows) {
+      if (!row.usageId || row.tenantId !== execution.tenantId) {
+        // Legacy operational rows may be present; only a v2 source must have a
+        // stable id. They remain covered by the original whole-tenant plan.
+        continue;
+      }
+      const hash = PersistedCapture.persistedProviderCaptureSha256(
+        "tenant-telemetry-step-usage-id-v2", row.usageId,
+      );
+      if (usageByHash.has(hash)) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      usageByHash.set(hash, row);
+    }
+    const entries: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry[] = [];
+    const retainedFacts: BillingUsageFact[] = [];
+    for (const target of catalog.entries) {
+      if (target.source.kind !== "persisted-provider-v2") {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      const failure = this.persistedProviderFailureReceipts.get(target.writeOperationSha256);
+      const row = failure ? usageByHash.get(failure.usageIdSha256) : undefined;
+      const fact = row?.usageId ? this.billingUsageFacts.get(row.usageId) : undefined;
+      if (!failure || !row || !row.usageId || !fact
+        || failure.tenantId !== execution.tenantId
+        || target.source.failureCommitReceiptSha256 !== failure.receiptSha256
+        || !billingUsageFactContentEquals(fact, billingUsageFactFromLedger(
+          row as UsageLedgerEntry & { usageId: string },
+        ))) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      retainedFacts.push(fact);
+      entries.push(RetainedSource.buildTenantTelemetryRetainedSourceUsageReleaseEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_USAGE_ENTRY_SCOPE,
+        requestId: execution.requestId, tenantId: execution.tenantId,
+        subjectGeneration: execution.subjectGeneration,
+        t1ProfileSha256: catalog.receipt.t1ProfileSha256,
+        t1FenceSha256: catalog.receipt.t1FenceSha256,
+        planBuildGeneration: execution.planBuildGeneration,
+        executionGeneration: execution.executionGeneration,
+        cohortReceiptSha256: catalog.receipt.cohortReceiptSha256,
+        catalogEntryReceiptSha256: target.receiptSha256,
+        catalogReceiptSha256: catalog.receipt.receiptSha256,
+        writeOperationSha256: target.writeOperationSha256,
+        failureCommitReceiptSha256: failure.receiptSha256,
+        usageIdSha256: failure.usageIdSha256,
+        billingRootSha256: failure.billingRootSha256,
+        retainedBillingFactSha256: fact.factSha256,
+        planReceiptSha256: planReceipt.receiptSha256,
+        operationalUsagePlanRootSha256: usagePlan.targetRootSha256,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256: tenantPurgeExecutionClaimTokenSha256(authorization.claimToken),
+        sourceHighWaterDbMs: Math.max(catalog.receipt.storeDbTimestampMs, failure.committedAtDbMs),
+        releasedAtDbMs,
+      }));
+    }
+    return { catalog, entries, retainedFacts };
+  }
+
+  private retainedSourceCanonicalEvidence(
+    job: TenantPurgePlanJobRecord,
+    catalog: ReturnType<MemorySessionStore["retainedSourceCatalogProof"]>,
+    usage: ReturnType<MemorySessionStore["retainedSourceUsageEvidence"]>,
+  ): {
+    receipt: RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureReceipt;
+    entries: RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry[];
+  } {
+    const database = this.tenantDatabasePurgeJobs.get(job.requestId);
+    const canonicalReceipt = this.retainedSourceCanonicalReceipts.get(job.requestId);
+    if (!database || database.phase !== "database_purged" || !canonicalReceipt
+      || database.tenantId !== job.tenantId) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    this.assertRetainedSourceNoExternalTargets(this.tenantPurgePlanEntriesFor(job));
+    // This historical branch validates the original 0039 and T3f receipts without
+    // trying to reconstruct an already deleted canonical item or event.
+    this.assertTenantDatabasePurgeGlobalRelations();
+    const bundle = this.tenantDatabasePurgeBundle(database);
+    const closureReceipt = this.tenantTelemetryOwnerClosureReceipts.get(job.requestId);
+    if (!closureReceipt || bundle.receipt.receiptSha256 !== database.terminalReceiptSha256
+      || closureReceipt.t3fReceiptSha256 !== bundle.receipt.receiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const graves = bundle.graveMarkers;
+    const graveSessionIds = new Set(graves.map((marker) => marker.sessionId));
+    if ([...this.sessions.values()].some((session) => session.tenantId === job.tenantId)
+      || graves.some((marker) => this.sessions.has(marker.sessionId)
+      || this.deleted.has(marker.sessionId) || this.events.has(marker.sessionId))
+      || [...this.turns.values()].some((turn) => graveSessionIds.has(turn.sessionId))
+      || [...this.items.values()].some((item) => graveSessionIds.has(item.sessionId))
+      || [...this.approvals.values()].some((approval) => graveSessionIds.has(approval.sessionId))) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const entries = this.retainedSourceCanonicalEntriesFor(job.requestId);
+    RetainedSource.validateTenantTelemetryRetainedSourceCanonicalClosureProof(
+      canonicalReceipt, entries, {
+        usageProof: usage.proof,
+        usageReceipt: usage.receipt,
+        usageEntries: usage.entries,
+        ownerClosureEntries: this.tenantTelemetryOwnerClosureEntriesFor(job.requestId),
+        graveMarkers: graves,
+        anchors: {
+          planBuildGeneration: job.buildGeneration,
+          executionGeneration: database.executionGeneration,
+          databasePurgeGeneration: database.databasePurgeGeneration,
+          planReceiptSha256: catalog.receipt.planReceiptSha256,
+          localPhysicalAckReceiptSha256: database.localPhysicalAckReceiptSha256,
+          preDeleteReceiptSha256: bundle.preDeleteReceipt.receiptSha256,
+          t3fReceiptSha256: bundle.receipt.receiptSha256,
+          ownerClosureReceiptSha256: closureReceipt.receiptSha256,
+          graveMarkerRootSha256: bundle.receipt.graveMarkerRootSha256,
+          completedClaimAttempt: bundle.receipt.completedClaimAttempt,
+          completedClaimTokenSha256: bundle.receipt.completedClaimTokenSha256,
+          storeDbTimestampMs: bundle.receipt.storeDbTimestampMs,
+        },
+      },
+    );
+    return { receipt: canonicalReceipt, entries };
+  }
+
+  private retainedSourceCanonicalLiveSnapshot(
+    failure: PersistedCapture.PersistedProviderStepFailureCommitReceipt,
+    target: RetainedSource.TenantTelemetryRetainedSourceCatalogEntry,
+    released: RetainedSource.TenantTelemetryRetainedSourceUsageReleaseEntry,
+  ): RetainedSource.TenantTelemetryRetainedSourceCanonicalSnapshot {
+    if (target.source.kind !== "persisted-provider-v2"
+      || target.ownerKind !== "session" || target.writeOperationSha256 !== failure.writeOperationSha256
+      || released.writeOperationSha256 !== failure.writeOperationSha256
+      || released.failureCommitReceiptSha256 !== failure.receiptSha256
+      || target.source.failureCommitReceiptSha256 !== failure.receiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const key = this.tenantTelemetryRefKeyForUse();
+    const sessions = [...this.sessions.values()].filter((session) => session.tenantId === failure.tenantId
+      && telemetryCaptureLogsSourceRefSha256("session", failure.tenantId, session.id, key)
+        === failure.sourceSessionRefSha256);
+    const session = sessions[0];
+    if (sessions.length !== 1 || !session
+      || target.ownerRefSha256 !== TenantTelemetry.tenantTelemetryOwnerRefSha256("session", session.id, key)
+      || target.holdSubjectRefSha256 !== TenantTelemetry.tenantTelemetryOwnerRefSha256("user", session.userId, key)
+      || target.ownerBindingSha256 !== TenantTelemetryArtifactMembership
+        .tenantTelemetryArtifactOwnerBindingSha256({
+          tenantId: failure.tenantId, ownerKind: "session", ownerId: session.id,
+          ownerUserId: session.userId,
+        }, key)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const items = [...this.items.values()].filter((item) => item.sessionId === session.id
+      && item.type === "agentMessage" && item.status === "failed"
+      && telemetryCaptureLogsSourceRefSha256("item", failure.tenantId, item.id, key)
+        === failure.sourceItemRefSha256);
+    const item = items[0];
+    const turn = item ? this.turns.get(item.turnId) : undefined;
+    if (items.length !== 1 || !item || !turn || turn.sessionId !== session.id
+      || item.step !== failure.sourceStepIndex || item.seq > failure.sourceEventSeq
+      || telemetryCaptureLogsSourceRefSha256("turn", failure.tenantId, item.turnId, key)
+        !== failure.sourceTurnRefSha256
+      || this.persistedProviderFailureClasses.get(item.id)?.classification !== "provider_step_error"
+      || this.persistedProviderFailureClasses.get(item.id)?.generation !== 1
+      || this.persistedProviderFailureClasses.get(item.id)?.operationSha256 !== failure.writeOperationSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const events = (this.events.get(session.id) ?? []).filter((event) => (
+      event.seq > failure.beginLastSeq && event.seq <= failure.endLastSeq
+    ));
+    if (events.length !== failure.eventCount
+      || events.some((event, index) => event.sessionId !== session.id
+        || event.seq !== failure.beginLastSeq + index + 1)
+      || PersistedCapture.persistedProviderCaptureEventRoot(events) !== failure.eventRootSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const completed = events.find((event) => event.seq === failure.sourceEventSeq);
+    if (!completed || completed.type !== "item/completed"
+      || PersistedCapture.persistedProviderCaptureCanonicalJson(completed.item)
+        !== PersistedCapture.persistedProviderCaptureCanonicalJson(item)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return { writeOperationSha256: failure.writeOperationSha256, item, events };
+  }
+
+  private stageRetainedSourceCanonicalClosure(
+    database: Extract<TenantDatabasePurgeJobRecord, { phase: "queued" }>,
+    authorization: TenantDatabasePurgeAuthorization,
+    preDeleteReceipt: TenantDatabasePurgePreDeleteReceipt,
+    graves: readonly TenantPurgeSessionGraveMarker[],
+    ownerEntries: readonly TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[],
+    capturedAtDbMs: number,
+  ): {
+    catalog: ReturnType<MemorySessionStore["retainedSourceCatalogProof"]>;
+    usage: ReturnType<MemorySessionStore["retainedSourceUsageEvidence"]>;
+    entries: RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry[];
+  } {
+    if (this.retainedSourceEvidencePhase(database.requestId) !== "usage_released") {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    this.assertRetainedSourceEligiblePrimaryNow(database.requestId);
+    const planJob = this.tenantPurgePlanJobs.get(database.requestId);
+    const planReceipt = this.tenantPurgePlanReceipts.get(database.requestId);
+    if (!planJob || planJob.phase !== "plan_sealed" || !planReceipt
+      || planJob.tenantId !== database.tenantId
+      || planReceipt.receiptSha256 !== database.planReceiptSha256) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const catalog = this.retainedSourceCatalogProof(planJob, planReceipt, "usage_released");
+    const usage = this.retainedSourceUsageEvidence(planJob, planReceipt, catalog);
+    const releasedByOperation = new Map(usage.entries.map((entry) => [entry.writeOperationSha256, entry] as const));
+    const ownerByOperation = new Map(ownerEntries.map((entry) => [entry.writeOperationSha256, entry] as const));
+    const graveByHash = new Map(graves.map((marker) => [marker.markerSha256, marker] as const));
+    if (releasedByOperation.size !== usage.entries.length
+      || ownerByOperation.size !== ownerEntries.length
+      || ownerEntries.length !== usage.entries.length
+      || graveByHash.size !== graves.length) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    const entries: RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry[] = [];
+    for (const target of catalog.entries) {
+      if (target.source.kind !== "persisted-provider-v2") {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      const failure = this.persistedProviderFailureReceipts.get(target.writeOperationSha256);
+      const released = releasedByOperation.get(target.writeOperationSha256);
+      const owner = ownerByOperation.get(target.writeOperationSha256);
+      const grave = owner?.sessionGraveMarkerSha256
+        ? graveByHash.get(owner.sessionGraveMarkerSha256) : undefined;
+      if (!failure || !released || !owner || !grave || owner.ownerKind !== "session"
+        || owner.tenantId !== database.tenantId
+        || owner.preDeleteReceiptSha256 !== preDeleteReceipt.receiptSha256
+        || owner.capturedAtDbMs !== capturedAtDbMs
+        || grave.tenantId !== database.tenantId
+        || grave.preDeleteReceiptSha256 !== preDeleteReceipt.receiptSha256) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      const snapshot = this.retainedSourceCanonicalLiveSnapshot(failure, target, released);
+      const entry = RetainedSource.buildTenantTelemetryRetainedSourceCanonicalClosureEntry({
+        scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CANONICAL_ENTRY_SCOPE,
+        requestId: database.requestId, tenantId: database.tenantId,
+        subjectGeneration: database.subjectGeneration,
+        t1ProfileSha256: catalog.receipt.t1ProfileSha256,
+        t1FenceSha256: catalog.receipt.t1FenceSha256,
+        planBuildGeneration: database.planBuildGeneration,
+        executionGeneration: database.executionGeneration,
+        databasePurgeGeneration: database.databasePurgeGeneration,
+        cohortReceiptSha256: catalog.receipt.cohortReceiptSha256,
+        catalogReceiptSha256: catalog.receipt.receiptSha256,
+        catalogEntryReceiptSha256: target.receiptSha256,
+        usageReleaseReceiptSha256: usage.receipt.receiptSha256,
+        usageReleaseEntryReceiptSha256: released.receiptSha256,
+        writeOperationSha256: failure.writeOperationSha256,
+        failureCommitReceiptSha256: failure.receiptSha256,
+        sourceBindingReceiptSha256: failure.bindingReceiptSha256,
+        membershipSha256: failure.membershipSha256,
+        sourceSessionRefSha256: failure.sourceSessionRefSha256,
+        sourceTurnRefSha256: failure.sourceTurnRefSha256,
+        sourceItemRefSha256: failure.sourceItemRefSha256,
+        sourceStepIndex: failure.sourceStepIndex,
+        sourceEventSeq: failure.sourceEventSeq,
+        beginLastSeq: failure.beginLastSeq,
+        endLastSeq: failure.endLastSeq,
+        eventCount: failure.eventCount,
+        eventRootSha256: failure.eventRootSha256,
+        businessBatchSha256: failure.businessBatchSha256,
+        canonicalItemSha256: RetainedSource.tenantTelemetryRetainedSourceCanonicalItemSha256(snapshot.item),
+        canonicalOwnerProofSha256: owner.canonicalOwnerProofSha256,
+        ownerBindingSha256: owner.ownerBindingSha256,
+        ownerClosureEntryReceiptSha256: owner.receiptSha256,
+        sessionGraveMarkerSha256: grave.markerSha256,
+        preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+        completedClaimAttempt: authorization.claimAttempt,
+        completedClaimTokenSha256: tenantDatabasePurgeClaimTokenSha256(authorization.claimToken),
+        sourceHighWaterDbMs: Math.max(usage.receipt.storeDbTimestampMs, failure.committedAtDbMs),
+        capturedAtDbMs,
+      });
+      RetainedSource.validateTenantTelemetryRetainedSourceCanonicalSnapshot(entry, snapshot, failure);
+      entries.push(entry);
+    }
+    if (entries.length !== usage.entries.length) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
+    return { catalog, usage, entries };
   }
 
   private verifiedTenantTelemetryLiveOwnerOperations(
@@ -15248,8 +16792,18 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const entries = this.tenantPurgePlanEntriesFor(job);
     const catalogSealed = job.phase === "plan_sealed"
       && this.tenantTelemetryPlanArtifactTargetReceipts.has(job.requestId);
+    const retainedFamily = this.retainedSourcePlanFamilyFor(job.requestId);
     let currentTelemetryTargets = telemetryTargets;
-    if (catalogSealed) {
+    if (job.phase === "plan_sealed" && retainedFamily) {
+      const receipt = this.tenantPurgePlanReceipts.get(job.requestId);
+      if (!receipt) throw new TenantErasureIntegrityError();
+      this.validateRetainedSourceCatalogForPlan(job, receipt);
+      const targetEntries = this.retainedSourceCatalogTargetsFor(job.requestId);
+      currentTelemetryTargets = {
+        logs: RetainedSource.tenantTelemetryRetainedSourceCatalogPlanTargets(targetEntries, "logs"),
+        traces: RetainedSource.tenantTelemetryRetainedSourceCatalogPlanTargets(targetEntries, "traces"),
+      };
+    } else if (catalogSealed) {
       const receipt = this.tenantPurgePlanReceipts.get(job.requestId);
       if (!receipt) throw new TenantErasureIntegrityError();
       this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
@@ -15350,6 +16904,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       ))
       .sort((left, right) => left.requestId.localeCompare(right.requestId));
     const staged: TenantPurgePlanJobRecord[] = [];
+    const stagedFamilies: RetainedSourcePlanFamily[] = [];
     let sourceIntegrityConflict = false;
     let firstNotReady: TenantPurgePlanNotReadyError | undefined;
     for (const content of candidates) {
@@ -15400,6 +16955,23 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
             (existing) => existing.tenantId === job.tenantId,
           )
         ) throw new TenantErasureIntegrityError();
+        const admissionFamily = this.retainedSourceAdmissionFamilyFor(job.requestId);
+        if (admissionFamily) {
+          if (admissionFamily.tenantId !== job.tenantId
+            || admissionFamily.subjectGeneration !== job.subjectGeneration
+            || admissionFamily.t1FenceSha256 !== job.t1FenceSha256
+            || this.retainedSourcePlanFamilies.has(job.requestId)) {
+            throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+          }
+          const { evidenceSha256: ignored, ...body } = admissionFamily;
+          void ignored;
+          stagedFamilies.push({
+            ...body,
+            evidenceSha256: RetainedSource.tenantTelemetryRetainedSourceSha256(
+              "tenant-telemetry-retained-source-plan-family-v1", body,
+            ),
+          });
+        }
         staged.push(job);
       } catch (error) {
         if (error instanceof TenantPurgePlanNotReadyError) {
@@ -15410,10 +16982,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
     }
     const prior = new Map(this.tenantPurgePlanJobs);
+    const familiesBefore = new Map(this.retainedSourcePlanFamilies);
     try {
       for (const job of staged) this.tenantPurgePlanJobs.set(job.requestId, job);
+      for (const family of stagedFamilies) this.retainedSourcePlanFamilies.set(family.requestId, family);
     } catch (error) {
       restoreMapSnapshot(this.tenantPurgePlanJobs, prior);
+      restoreMapSnapshot(this.retainedSourcePlanFamilies, familiesBefore);
       throw error;
     }
     if (sourceIntegrityConflict) throw new TenantErasureIntegrityError();
@@ -15619,6 +17194,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       stagedAuthorization,
       nowMs,
     )) throw new TenantErasureIntegrityError();
+    if (this.retainedSourcePlanFamilyFor(current.requestId)) {
+      throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    }
     if (nowMs < current.retentionAnchorDbMs) {
       throw new TenantPurgePlanNotReadyError("trusted_clock_before_anchor");
     }
@@ -15733,8 +17311,18 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const stagedAuthorization = clone(authorization);
     validateTenantPurgePlanAuthorization(stagedAuthorization);
     const current = this.tenantPurgePlanJobs.get(stagedAuthorization.requestId);
-    if (current?.phase !== "plan_sealed" && this.persistedProviderCaptureActivation) throw new PersistedCapture.PersistedProviderCaptureConflictError("T3d cannot account for capture v2 source");
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    const retainedFamily = current ? this.retainedSourcePlanFamilyFor(current.requestId) : null;
+    if (current?.phase !== "plan_sealed" && this.persistedProviderCaptureActivation && !retainedFamily) {
+      throw new PersistedCapture.PersistedProviderCaptureConflictError("T3d cannot account for capture v2 source");
+    }
+    if (retainedFamily) {
+      const cohort = this.retainedSourceT1Receipts.get(current.requestId);
+      if (!cohort || cohort.eligibility !== "eligible_retained") {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      this.assertRetainedSourceEligiblePrimaryNow(current.requestId);
+    }
     validateTenantPurgePlanJobRecord(current);
     const existingEntries = this.tenantPurgePlanEntriesFor(current);
     if (current.phase === "plan_sealed") {
@@ -15783,13 +17371,46 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       memberships: [...this.tenantTelemetryArtifactMemberships.values()],
       bindings: [...this.tenantTelemetryApplicationWriteBindings.values()],
     };
+    const fullTelemetrySources = { ...telemetrySources,
+      providerBindings: [...this.persistedProviderCaptureBindings.values()],
+      providerFailureReceipts: [...this.persistedProviderFailureReceipts.values()] };
+    const fullGraph = retainedFamily ? projectTenantTelemetryRetainedSourceGraph({
+      tenantId: current.tenantId, sources: fullTelemetrySources,
+    }) : null;
     const liveOwnerOperations = this.verifiedTenantTelemetryLiveOwnerOperations(
       current.tenantId,
     );
-    const telemetryTargets = TenantTelemetryPlanArtifactTarget
+    const legacyTelemetryTargets = TenantTelemetryPlanArtifactTarget
       .projectTenantTelemetryPreplanTargets({
         tenantId: current.tenantId, sources: telemetrySources, liveOwnerOperations,
       });
+    const telemetryTargets = {
+      logs: [...legacyTelemetryTargets.logs], traces: [...legacyTelemetryTargets.traces],
+    };
+    if (retainedFamily) {
+      const cohort = this.retainedSourceT1Receipts.get(current.requestId);
+      if (!cohort || cohort.receiptSha256 !== retainedFamily.cohortReceiptSha256 || !fullGraph) {
+        throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+      }
+      if (cohort.eligibility === "eligible_retained") {
+        const byOperation = new Map(fullGraph.groups.filter((group) => group.operationSha256 !== null)
+          .map((group) => [group.operationSha256!, group]));
+        for (const frozen of this.retainedSourceT1EntriesFor(current.requestId)) {
+          const group = frozen.writeOperationSha256 ? byOperation.get(frozen.writeOperationSha256) : undefined;
+          if (frozen.state !== "written_ack" || !group?.job || !group.inventory || !group.ack
+            || !group.membership || !group.providerBinding || !group.providerFailureReceipt
+            || !group.job.reservation || !liveOwnerOperations.has(group.job.writeOperationSha256)
+            || this.verifyMemoryPersistedProviderFailure(group.providerFailureReceipt).status !== "source_verified_written") {
+            throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+          }
+          telemetryTargets.logs.push({ domain: "logs", targetSha256: group.inventory.targetSha256,
+            artifactIdSha256: group.inventory.artifactIdSha256,
+            artifactGeneration: group.inventory.artifactGeneration,
+            inventoryReceiptSha256: group.inventory.receiptSha256,
+            writeAckReceiptSha256: group.ack.receiptSha256 });
+        }
+      }
+    }
     let entries = this.assertTenantPurgePlanBuildState(
       current, source, holdProof, telemetryTargets,
     );
@@ -15911,6 +17532,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const manifestReceiptsBefore = new Map(this.tenantTelemetryTargetManifestReceipts);
     const targetEntriesBefore = new Map(this.tenantTelemetryPlanArtifactTargets);
     const targetReceiptsBefore = new Map(this.tenantTelemetryPlanArtifactTargetReceipts);
+    const retainedSourcesBefore = new Map(this.retainedSourceCatalogSources);
+    const retainedTargetsBefore = new Map(this.retainedSourceCatalogTargets);
+    const retainedReceiptsBefore = new Map(this.retainedSourceCatalogReceipts);
     try {
       if (this.tenantPurgePlanReceipts.has(working.requestId)) {
         throw new TenantErasureIntegrityError();
@@ -15936,6 +17560,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         restoreMapSnapshot(this.tenantTelemetryTargetManifestReceipts, manifestReceiptsBefore);
         restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargets, targetEntriesBefore);
         restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargetReceipts, targetReceiptsBefore);
+        restoreMapSnapshot(this.retainedSourceCatalogSources, retainedSourcesBefore);
+        restoreMapSnapshot(this.retainedSourceCatalogTargets, retainedTargetsBefore);
+        restoreMapSnapshot(this.retainedSourceCatalogReceipts, retainedReceiptsBefore);
         return null;
       }
       if (publishNowMs < latestCapturedAtDbMs) {
@@ -15985,13 +17612,17 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           sourceEntries: sourceSnapshot.entries, sourceReceipt: sourceSnapshot.receipt,
           sources: telemetrySources, liveOwnerOperations,
         });
-      const targetSnapshot = TenantTelemetryPlanArtifactTarget
+      const targetSnapshot = retainedFamily ? null : TenantTelemetryPlanArtifactTarget
         .createTenantTelemetryPlanArtifactTargetSnapshot({
           job: next, planReceipt: receipt, planEntries: entries,
           sourceEntries: sourceSnapshot.entries, sourceReceipt: sourceSnapshot.receipt,
           manifestEntries: manifestSnapshot.entries, manifestReceipt: manifestSnapshot.receipt,
           sources: telemetrySources, liveOwnerOperations,
         });
+      const retainedSnapshot = retainedFamily ? this.stageRetainedSourceCatalog(
+        next, receipt, sourceSnapshot, manifestSnapshot, fullTelemetrySources,
+        liveOwnerOperations, publishNowMs,
+      ) : null;
       if (this.tenantTelemetrySourceAccountingReceipts.has(next.requestId)
         || this.tenantTelemetrySourceAccountingEntriesFor(next.requestId).length !== 0) {
         throw new TenantErasureIntegrityError();
@@ -16025,15 +17656,59 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || this.tenantTelemetryPlanArtifactTargetsFor(next.requestId).length !== 0) {
         throw new TenantErasureIntegrityError();
       }
-      for (const targetEntry of targetSnapshot.entries) {
-        const key = JSON.stringify([targetEntry.requestId, targetEntry.artifactGroupSha256]);
-        if (this.tenantTelemetryPlanArtifactTargets.has(key)) {
-          throw new TenantErasureIntegrityError();
+      if (targetSnapshot) {
+        for (const targetEntry of targetSnapshot.entries) {
+          const key = JSON.stringify([targetEntry.requestId, targetEntry.artifactGroupSha256]);
+          if (this.tenantTelemetryPlanArtifactTargets.has(key)) {
+            throw new TenantErasureIntegrityError();
+          }
+          this.tenantTelemetryPlanArtifactTargets.set(key, targetEntry);
         }
-        this.tenantTelemetryPlanArtifactTargets.set(key, targetEntry);
+        this.tenantTelemetryPlanArtifactTargetReceipts.set(next.requestId, targetSnapshot.receipt);
       }
-      this.tenantTelemetryPlanArtifactTargetReceipts.set(next.requestId, targetSnapshot.receipt);
+      if (retainedSnapshot) {
+        if (this.retainedSourceCatalogReceipts.has(next.requestId)
+          || this.retainedSourceCatalogSourcesFor(next.requestId).length
+          || this.retainedSourceCatalogTargetsFor(next.requestId).length) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        for (const sourceEntry of retainedSnapshot.sourceEntries) {
+          const key = JSON.stringify([sourceEntry.requestId, sourceEntry.sourceKind, sourceEntry.sourceIdentitySha256]);
+          if (this.retainedSourceCatalogSources.has(key)) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+          this.retainedSourceCatalogSources.set(key, sourceEntry);
+        }
+        for (const targetEntry of retainedSnapshot.entries) {
+          const key = JSON.stringify([targetEntry.requestId, targetEntry.artifactGroupSha256]);
+          if (this.retainedSourceCatalogTargets.has(key)) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+          this.retainedSourceCatalogTargets.set(key, targetEntry);
+        }
+        this.retainedSourceCatalogReceipts.set(next.requestId, retainedSnapshot.receipt);
+      }
       this.tenantPurgePlanJobs.set(working.requestId, next);
+      this.validateTenantTelemetrySourceAccountingForPlan(next, receipt);
+      this.validateTenantTelemetryTargetManifestForPlan(next, receipt);
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(next, receipt);
+      const finalNowMs = this.storeNowMs();
+      if (!tenantPurgePlanAuthorizationMatches(working, stagedAuthorization, finalNowMs)) {
+        restoreMapSnapshot(this.tenantPurgePlanJobs, jobsBefore);
+        restoreMapSnapshot(this.tenantPurgePlanEntries, entriesBefore);
+        restoreMapSnapshot(this.tenantPurgePlanReceipts, receiptsBefore);
+        restoreMapSnapshot(this.tenantTelemetrySourceAccountingEntries, sourceEntriesBefore);
+        restoreMapSnapshot(this.tenantTelemetrySourceAccountingReceipts, sourceReceiptsBefore);
+        restoreMapSnapshot(this.tenantTelemetryTargetManifestEntries, manifestEntriesBefore);
+        restoreMapSnapshot(this.tenantTelemetryTargetManifestReceipts, manifestReceiptsBefore);
+        restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargets, targetEntriesBefore);
+        restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargetReceipts, targetReceiptsBefore);
+        restoreMapSnapshot(this.retainedSourceCatalogSources, retainedSourcesBefore);
+        restoreMapSnapshot(this.retainedSourceCatalogTargets, retainedTargetsBefore);
+        restoreMapSnapshot(this.retainedSourceCatalogReceipts, retainedReceiptsBefore);
+        return null;
+      }
+      if (finalNowMs < working.retentionAnchorDbMs
+        || finalNowMs < working.purgeNotBeforeDbMs
+        || finalNowMs < latestCapturedAtDbMs) {
+        throw new TenantPurgePlanNotReadyError("trusted_clock_before_evidence");
+      }
     } catch (error) {
       restoreMapSnapshot(this.tenantPurgePlanJobs, jobsBefore);
       restoreMapSnapshot(this.tenantPurgePlanEntries, entriesBefore);
@@ -16044,6 +17719,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       restoreMapSnapshot(this.tenantTelemetryTargetManifestReceipts, manifestReceiptsBefore);
       restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargets, targetEntriesBefore);
       restoreMapSnapshot(this.tenantTelemetryPlanArtifactTargetReceipts, targetReceiptsBefore);
+      restoreMapSnapshot(this.retainedSourceCatalogSources, retainedSourcesBefore);
+      restoreMapSnapshot(this.retainedSourceCatalogTargets, retainedTargetsBefore);
+      restoreMapSnapshot(this.retainedSourceCatalogReceipts, retainedReceiptsBefore);
       throw error;
     }
     return clone(receipt);
@@ -17102,6 +18780,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const domains: TenantPurgeExecutionDomainRecord[] = [];
     for (const planJob of candidates) {
       if (jobs.length >= stagedOptions.limit) break;
+      this.auditRetainedSourceOuterBoundary(planJob.requestId);
       const receipt = this.tenantPurgePlanReceipts.get(planJob.requestId);
       if (!receipt) throw new TenantErasureIntegrityError();
       const entries = this.tenantPurgePlanEntriesFor(planJob);
@@ -17222,6 +18901,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         throw new TenantErasureIntegrityError();
       }
       try {
+        this.auditRetainedSourceOuterBoundary(current.requestId);
         this.assertTenantPurgeExecutionState(
           current,
           current.localCutoverReceiptSha256 === undefined,
@@ -17281,6 +18961,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       stagedAuthorization,
       nowMs,
     )) return false;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
     this.assertTenantPurgeExecutionState(current, current.localCutoverReceiptSha256 === undefined);
     const next = clone<TenantPurgeExecutionJobRecord>({
       ...current,
@@ -17312,6 +18993,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       stagedAuthorization,
       nowMs,
     )) return false;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
     this.assertTenantPurgeExecutionState(current, current.localCutoverReceiptSha256 === undefined);
     const baseMs = Math.max(nowMs, current.createdAtMs, current.updatedAtMs, current.availableAtMs);
     const availableAtMs = stagedOptions.delayMs > Number.MAX_SAFE_INTEGER - baseMs
@@ -17355,6 +19037,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       stagedAuthorization,
       nowMs,
     )) return false;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
     const next = this.blockedTenantPurgeExecutionJob(current, nowMs, reason);
     try {
       this.tenantPurgeExecutionJobs.set(current.requestId, next);
@@ -17521,6 +19204,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       acks: copy(this.tenantPurgeExecutionDomainAcks),
       cutoverReceipts: copy(this.tenantPurgeLocalCutoverReceipts),
       physicalReceipts: copy(this.tenantPurgeLocalPhysicalAckReceipts),
+      retainedUsageEntries: copy(this.retainedSourceUsageEntries),
+      retainedUsageReceipts: copy(this.retainedSourceUsageReceipts),
       cutovers: copy(this.tenantPurgeExecutionCutovers),
       usageLedger: this.usageLedger.map(clone),
       billingFacts: copy(this.billingUsageFacts),
@@ -17539,6 +19224,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     restoreMapSnapshot(this.tenantPurgeExecutionDomainAcks, state.acks);
     restoreMapSnapshot(this.tenantPurgeLocalCutoverReceipts, state.cutoverReceipts);
     restoreMapSnapshot(this.tenantPurgeLocalPhysicalAckReceipts, state.physicalReceipts);
+    restoreMapSnapshot(this.retainedSourceUsageEntries, state.retainedUsageEntries);
+    restoreMapSnapshot(this.retainedSourceUsageReceipts, state.retainedUsageReceipts);
     restoreMapSnapshot(this.tenantPurgeExecutionCutovers, state.cutovers);
     this.usageLedger = state.usageLedger.map(clone);
     restoreMapSnapshot(this.billingUsageFacts, state.billingFacts);
@@ -17560,6 +19247,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       stagedAuthorization,
       initialNowMs,
     )) return null;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
     const existing = this.tenantPurgeLocalCutoverReceipts.get(current.requestId);
     if (existing) {
       this.assertTenantPurgeExecutionState(current, false);
@@ -17575,6 +19263,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const exportControlEntry = entryByDomain.get("user_export_control")!;
     const exportSnapshotEntry = entryByDomain.get("user_export_snapshots")!;
     const exportBytesEntry = entryByDomain.get("user_export_bytes")!;
+    const retainedSourceFamily = this.retainedSourcePlanFamilyFor(current.requestId);
+    if (retainedSourceFamily) this.assertRetainedSourceNoExternalTargets(state.planEntries);
     const atomicState = this.captureTenantPurgeExecutionAtomicState();
     try {
       const cutoverAtMs = this.storeNowMs();
@@ -17596,7 +19286,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           || left.turnId.localeCompare(right.turnId)
           || left.step - right.step
         ));
-      this.assertNoPersistedProviderUsageDeletion(tenantUsageRows);
+      if (!retainedSourceFamily) this.assertNoPersistedProviderUsageDeletion(tenantUsageRows);
       const usageTargetHashes = tenantUsageRows.map((row) => tenantPurgePlanTargetSha256(
         "operational_usage",
         [row.usageId ?? null, row.sessionId, row.turnId, row.step],
@@ -17648,6 +19338,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         if (!prior) this.billingUsageFacts.set(row.usageId, clone(fact));
         usageFactHashes.push((prior ?? fact).factSha256);
       }
+      const stagedRetainedUsage = retainedSourceFamily
+        ? this.stageRetainedSourceUsageRelease(
+          current, stagedAuthorization, operationalEntry, tenantUsageRows, cutoverAtMs,
+        ) : null;
       this.usageLedger = stagedLedger.filter((row) => row.tenantId !== current.tenantId);
 
       // Freeze each pre-cutover Blob target hash, then bind it to exactly one existing or newly
@@ -17941,6 +19635,63 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         receiptSha256: tenantPurgeLocalCutoverReceiptSha256(receiptBody),
       });
       validateTenantPurgeLocalCutoverReceipt(receipt);
+      const retainedUsageReceipt = stagedRetainedUsage ? (() => {
+        const operationalAcks = this.tenantPurgeExecutionAcksFor(working).filter((ack) => (
+          ack.domain === "operational_usage" && ack.ackKind === "anonymized" && ack.final
+        ));
+        const operationalAck = operationalAcks[0];
+        if (operationalAcks.length !== 1 || !operationalAck) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        const { catalog, entries, retainedFacts } = stagedRetainedUsage;
+        // The independently captured old ACK keeps its original logical time. New
+        // pre-DELETE leaves cannot postdate it; the aggregate still binds exact cutover.
+        if (operationalAck.storeDbTimestampMs > receipt.storeDbTimestampMs
+          || entries.some((entry) => entry.releasedAtDbMs > operationalAck.storeDbTimestampMs)) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        return RetainedSource.buildTenantTelemetryRetainedSourceUsageReleaseReceipt({
+          scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_USAGE_RECEIPT_SCOPE,
+          requestId: current.requestId, tenantId: current.tenantId,
+          subjectGeneration: current.subjectGeneration,
+          t1ProfileSha256: catalog.receipt.t1ProfileSha256,
+          t1FenceSha256: catalog.receipt.t1FenceSha256,
+          planBuildGeneration: current.planBuildGeneration,
+          executionGeneration: current.executionGeneration,
+          cohortReceiptSha256: catalog.receipt.cohortReceiptSha256,
+          catalogReceiptSha256: catalog.receipt.receiptSha256,
+          planReceiptSha256: current.planReceiptSha256,
+          operationalUsagePlanRootSha256: operationalEntry.targetRootSha256,
+          operationalUsageAckReceiptSha256: operationalAck.receiptSha256,
+          localCutoverReceiptSha256: receipt.receiptSha256,
+          entryCount: entries.length,
+          entryRootSha256: RetainedSource.tenantTelemetryRetainedSourceUsageReleaseRootSha256(entries),
+          retainedBillingFactCount: retainedFacts.length,
+          retainedBillingFactRootSha256: RetainedSource.tenantTelemetryRetainedSourceRetainedBillingRootSha256(entries),
+          sourceHighWaterDbMs: Math.max(catalog.receipt.storeDbTimestampMs,
+            ...entries.map((entry) => entry.sourceHighWaterDbMs)),
+          storeDbTimestampMs: cutoverAtMs,
+          completedClaimAttempt: stagedAuthorization.claimAttempt,
+          completedClaimTokenSha256: tenantPurgeExecutionClaimTokenSha256(stagedAuthorization.claimToken),
+          executionReady: false, externalAuthorityVerified: false,
+          allDomainsComplete: false, contentPurgeExecuted: false,
+        }, entries, {
+          catalogProof: catalog.proof, catalogReceipt: catalog.receipt,
+          catalogEntries: catalog.entries, catalogSources: catalog.sources,
+          retainedBillingFacts: retainedFacts,
+          anchors: {
+            planBuildGeneration: current.planBuildGeneration,
+            executionGeneration: current.executionGeneration,
+            planReceiptSha256: current.planReceiptSha256,
+            operationalUsagePlanRootSha256: operationalEntry.targetRootSha256,
+            operationalUsageAckReceiptSha256: operationalAck.receiptSha256,
+            localCutoverReceiptSha256: receipt.receiptSha256,
+            completedClaimAttempt: stagedAuthorization.claimAttempt,
+            completedClaimTokenSha256: tenantPurgeExecutionClaimTokenSha256(stagedAuthorization.claimToken),
+            storeDbTimestampMs: cutoverAtMs,
+          },
+        });
+      })() : null;
       const next = clone<Extract<TenantPurgeExecutionJobRecord, { phase: "queued" }>>({
         ...working,
         localCutoverReceiptSha256: receipt.receiptSha256,
@@ -17967,12 +19718,40 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         validateTenantPurgeExecutionCutoverRecord(activated);
         this.tenantPurgeExecutionCutovers.set(TENANT_PURGE_EXECUTION_CUTOVER_SINGLETON_ID, activated);
       }
+      if (stagedRetainedUsage && retainedUsageReceipt) {
+        if (this.retainedSourceUsageReceipts.has(current.requestId)
+          || this.retainedSourceUsageEntriesFor(current.requestId).length !== 0) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        for (const entry of stagedRetainedUsage.entries) {
+          const key = JSON.stringify([entry.requestId, entry.writeOperationSha256]);
+          if (this.retainedSourceUsageEntries.has(key)) {
+            throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+          }
+          this.retainedSourceUsageEntries.set(key, entry);
+        }
+        this.retainedSourceUsageReceipts.set(current.requestId, retainedUsageReceipt);
+      }
       const publishNowMs = this.storeNowMs();
       if (!tenantPurgeExecutionAuthorizationMatches(next, stagedAuthorization, publishNowMs)) {
         this.restoreTenantPurgeExecutionAtomicState(atomicState);
         return null;
       }
       this.tenantPurgePlanHoldProof(next.tenantId);
+      if (retainedUsageReceipt) {
+        const planJob = this.tenantPurgePlanJobs.get(next.requestId);
+        const planReceipt = this.tenantPurgePlanReceipts.get(next.requestId);
+        if (!planJob || !planReceipt) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        this.validateRetainedSourceCatalogForPlan(planJob, planReceipt);
+      }
+      const finalNowMs = this.storeNowMs();
+      if (!tenantPurgeExecutionAuthorizationMatches(current, stagedAuthorization, finalNowMs)) {
+        this.restoreTenantPurgeExecutionAtomicState(atomicState);
+        return null;
+      }
+      if (finalNowMs < current.purgeNotBeforeDbMs || finalNowMs < current.sourceEvidenceDbMs) {
+        throw new TenantPurgeExecutionEvidenceChangedError();
+      }
       return clone(receipt);
     } catch (error) {
       this.restoreTenantPurgeExecutionAtomicState(atomicState);
@@ -17995,6 +19774,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const initialNowMs = this.storeNowMs();
     const current = this.tenantPurgeExecutionJobs.get(stagedAuthorization.requestId);
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
     if (current.phase === "local_physical_acks_sealed") {
       this.assertTenantPurgeExecutionState(current, false);
       if (
@@ -18225,6 +20005,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   ): Promise<TenantPurgeExecutionJobRecord | null> {
     const job = this.tenantPurgeExecutionJobs.get(requestId);
     if (!job || job.tenantId !== tenantId) return null;
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantPurgeExecutionState(job, job.localCutoverReceiptSha256 === undefined);
     return clone(job);
   }
@@ -18240,6 +20021,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || job.tenantId !== tenantId
       || job.executionGeneration !== executionGeneration
     ) return [];
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     return this.assertTenantPurgeExecutionState(
       job,
       job.localCutoverReceiptSha256 === undefined,
@@ -18257,6 +20039,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || job.tenantId !== tenantId
       || job.executionGeneration !== executionGeneration
     ) return [];
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     return this.assertTenantPurgeExecutionState(
       job,
       job.localCutoverReceiptSha256 === undefined,
@@ -18271,6 +20054,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!receipt || receipt.tenantId !== tenantId) return null;
     const job = this.tenantPurgeExecutionJobs.get(requestId);
     if (!job) throw new TenantErasureIntegrityError();
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantPurgeExecutionState(job, false);
     return clone(receipt);
   }
@@ -18283,6 +20067,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!receipt || receipt.tenantId !== tenantId) return null;
     const job = this.tenantPurgeExecutionJobs.get(requestId);
     if (!job) throw new TenantErasureIntegrityError();
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantPurgeExecutionState(job, false);
     return clone(receipt);
   }
@@ -19511,6 +21296,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const staged: TenantDatabasePurgeJobRecord[] = [];
     for (const executionJob of candidates) {
       if (staged.length >= stagedOptions.limit) break;
+      this.auditRetainedSourceOuterBoundary(executionJob.requestId);
       const state = this.assertTenantPurgeExecutionState(executionJob, false);
       const physicalReceipt = this.tenantPurgeLocalPhysicalAckReceipts.get(executionJob.requestId);
       if (!physicalReceipt) throw new TenantErasureIntegrityError();
@@ -19601,6 +21387,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         throw new TenantErasureIntegrityError();
       }
       try {
+        this.auditRetainedSourceOuterBoundary(current.requestId);
         this.assertTenantDatabasePurgeSource(current);
       } catch (error) {
         if (error instanceof TenantDatabasePurgeNotReadyError) continue;
@@ -19655,6 +21442,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       stagedAuthorization,
       nowMs,
     )) return false;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
     this.assertTenantDatabasePurgeSource(current);
     const next = clone<TenantDatabasePurgeJobRecord>({
       ...current,
@@ -19686,6 +21474,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       stagedAuthorization,
       nowMs,
     )) return false;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
     this.assertTenantDatabasePurgeSource(current);
     const baseMs = Math.max(nowMs, current.createdAtMs, current.updatedAtMs, current.availableAtMs);
     const availableAtMs = stagedOptions.delayMs > Number.MAX_SAFE_INTEGER - baseMs
@@ -19729,6 +21518,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       stagedAuthorization,
       nowMs,
     )) return false;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
     const next = this.blockedTenantDatabasePurgeJob(current, nowMs, reason);
     try {
       this.tenantDatabasePurgeJobs.set(current.requestId, next);
@@ -19752,6 +21542,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       graves: copy(this.tenantPurgeSessionGraveMarkers),
       telemetryClosureEntries: copy(this.tenantTelemetryOwnerClosureEntries),
       telemetryClosureReceipts: copy(this.tenantTelemetryOwnerClosureReceipts),
+      retainedCanonicalEntries: copy(this.retainedSourceCanonicalEntries),
+      retainedCanonicalReceipts: copy(this.retainedSourceCanonicalReceipts),
+      failureClasses: copy(this.persistedProviderFailureClasses),
       cutovers: copy(this.tenantDatabasePurgeCutovers),
       tenants: copy(this.tenants),
       agents: copy(this.agents),
@@ -19783,6 +21576,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       state.telemetryClosureEntries);
     restoreMapSnapshot(this.tenantTelemetryOwnerClosureReceipts,
       state.telemetryClosureReceipts);
+    restoreMapSnapshot(this.retainedSourceCanonicalEntries, state.retainedCanonicalEntries);
+    restoreMapSnapshot(this.retainedSourceCanonicalReceipts, state.retainedCanonicalReceipts);
+    restoreMapSnapshot(this.persistedProviderFailureClasses, state.failureClasses);
     restoreMapSnapshot(this.tenantDatabasePurgeCutovers, state.cutovers);
     restoreMapSnapshot(this.tenants, state.tenants);
     restoreMapSnapshot(this.agents, state.agents);
@@ -19822,7 +21618,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (sessionIds.has(turn.sessionId)) this.turns.delete(key);
     }
     for (const [key, item] of [...this.items]) {
-      if (sessionIds.has(item.sessionId)) this.items.delete(key);
+      if (sessionIds.has(item.sessionId)) {
+        this.items.delete(key);
+        this.persistedProviderFailureClasses.delete(item.id);
+      }
     }
     for (const [key, approval] of [...this.approvals]) {
       if (sessionIds.has(approval.sessionId)) this.approvals.delete(key);
@@ -19897,8 +21696,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateTenantDatabasePurgeAuthorization(stagedAuthorization);
     const initialNowMs = this.storeNowMs();
     const current = this.tenantDatabasePurgeJobs.get(stagedAuthorization.requestId);
-    if (current?.phase !== "database_purged" && this.persistedProviderCaptureActivation) throw new PersistedCapture.PersistedProviderCaptureConflictError("T3f cannot close capture v2 owner source");
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    this.auditRetainedSourceOuterBoundary(current.requestId);
+    const retainedSourceFamily = this.retainedSourcePlanFamilyFor(current.requestId);
+    if (current?.phase !== "database_purged" && this.persistedProviderCaptureActivation
+      && (!retainedSourceFamily
+        || this.retainedSourceEvidencePhase(current.requestId) !== "usage_released")) {
+      throw new PersistedCapture.PersistedProviderCaptureConflictError("T3f cannot close capture v2 owner source");
+    }
     if (current.phase === "database_purged") {
       this.assertTenantDatabasePurgeGlobalRelations();
       const bundle = this.tenantDatabasePurgeBundle(current);
@@ -19916,6 +21721,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new TenantDatabasePurgeEvidenceChangedError();
     }
     const source = this.assertTenantDatabasePurgeSource(current);
+    if (retainedSourceFamily) this.assertRetainedSourceNoExternalTargets(source.planEntries);
     this.assertTenantDatabasePurgeReady(current, source);
     const atomicState = this.captureTenantDatabasePurgeAtomicState();
     try {
@@ -19930,6 +21736,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         throw new TenantDatabasePurgeEvidenceChangedError();
       }
       const freshSource = this.assertTenantDatabasePurgeSource(current);
+      if (retainedSourceFamily) this.assertRetainedSourceNoExternalTargets(freshSource.planEntries);
       this.assertTenantDatabasePurgeReady(current, freshSource);
       const identity = this.tenantDatabasePurgeIdentity(current);
       const sourceFields = this.tenantDatabasePurgeSource(current);
@@ -20073,6 +21880,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         graves,
         purgeAtMs,
       );
+      const stagedRetainedCanonical = retainedSourceFamily
+        ? this.stageRetainedSourceCanonicalClosure(
+          current, stagedAuthorization, preDeleteReceipt, graves,
+          telemetryClosureEntries, purgeAtMs,
+        ) : null;
       const billingEvidenceHashes = reconciliationEntry.preDeleteTargetCount === 0
         ? []
         : [tenantDatabasePurgeTargetSha256("billing_reconciliation", [
@@ -20232,6 +22044,57 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           completedClaimTokenSha256,
           entries: telemetryClosureEntries,
         });
+      const retainedCanonicalReceipt = stagedRetainedCanonical
+        ? RetainedSource.buildTenantTelemetryRetainedSourceCanonicalClosureReceipt({
+          scope: RetainedSource.TENANT_TELEMETRY_RETAINED_SOURCE_CANONICAL_RECEIPT_SCOPE,
+          requestId: current.requestId, tenantId: current.tenantId,
+          subjectGeneration: current.subjectGeneration,
+          t1ProfileSha256: stagedRetainedCanonical.catalog.receipt.t1ProfileSha256,
+          t1FenceSha256: stagedRetainedCanonical.catalog.receipt.t1FenceSha256,
+          planBuildGeneration: current.planBuildGeneration,
+          executionGeneration: current.executionGeneration,
+          databasePurgeGeneration: current.databasePurgeGeneration,
+          cohortReceiptSha256: stagedRetainedCanonical.catalog.receipt.cohortReceiptSha256,
+          catalogReceiptSha256: stagedRetainedCanonical.catalog.receipt.receiptSha256,
+          usageReleaseReceiptSha256: stagedRetainedCanonical.usage.receipt.receiptSha256,
+          planReceiptSha256: current.planReceiptSha256,
+          localPhysicalAckReceiptSha256: current.localPhysicalAckReceiptSha256,
+          preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+          t3fReceiptSha256: receipt.receiptSha256,
+          ownerClosureReceiptSha256: telemetryClosureReceipt.receiptSha256,
+          graveMarkerRootSha256: graveRootSha256,
+          entryCount: stagedRetainedCanonical.entries.length,
+          entryRootSha256: RetainedSource.tenantTelemetryRetainedSourceCanonicalClosureRootSha256(
+            stagedRetainedCanonical.entries,
+          ),
+          sourceHighWaterDbMs: Math.max(stagedRetainedCanonical.usage.receipt.storeDbTimestampMs,
+            ...stagedRetainedCanonical.entries.map((entry) => entry.sourceHighWaterDbMs)),
+          storeDbTimestampMs: purgeAtMs,
+          completedClaimAttempt: stagedAuthorization.claimAttempt,
+          completedClaimTokenSha256,
+          executionReady: false, externalAuthorityVerified: false,
+          allDomainsComplete: false, contentPurgeExecuted: false,
+        }, stagedRetainedCanonical.entries, {
+          usageProof: stagedRetainedCanonical.usage.proof,
+          usageReceipt: stagedRetainedCanonical.usage.receipt,
+          usageEntries: stagedRetainedCanonical.usage.entries,
+          ownerClosureEntries: telemetryClosureEntries,
+          graveMarkers: graves,
+          anchors: {
+            planBuildGeneration: current.planBuildGeneration,
+            executionGeneration: current.executionGeneration,
+            databasePurgeGeneration: current.databasePurgeGeneration,
+            planReceiptSha256: current.planReceiptSha256,
+            localPhysicalAckReceiptSha256: current.localPhysicalAckReceiptSha256,
+            preDeleteReceiptSha256: preDeleteReceipt.receiptSha256,
+            t3fReceiptSha256: receipt.receiptSha256,
+            ownerClosureReceiptSha256: telemetryClosureReceipt.receiptSha256,
+            graveMarkerRootSha256: graveRootSha256,
+            completedClaimAttempt: stagedAuthorization.claimAttempt,
+            completedClaimTokenSha256,
+            storeDbTimestampMs: purgeAtMs,
+          },
+        }) : null;
       const terminal = clone<TenantDatabasePurgeJobRecord>({
         ...sourceFields,
         phase: "database_purged",
@@ -20323,6 +22186,20 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         clone(telemetryClosureReceipt),
       );
       this.tenantDatabasePurgeJobs.set(current.requestId, terminal);
+      if (stagedRetainedCanonical && retainedCanonicalReceipt) {
+        if (this.retainedSourceCanonicalReceipts.has(current.requestId)
+          || this.retainedSourceCanonicalEntriesFor(current.requestId).length !== 0) {
+          throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+        }
+        for (const entry of stagedRetainedCanonical.entries) {
+          const key = JSON.stringify([entry.requestId, entry.writeOperationSha256]);
+          if (this.retainedSourceCanonicalEntries.has(key)) {
+            throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+          }
+          this.retainedSourceCanonicalEntries.set(key, entry);
+        }
+        this.retainedSourceCanonicalReceipts.set(current.requestId, retainedCanonicalReceipt);
+      }
       if (cutover.controlGeneration === 0) {
         const cutoverBody = {
           singletonId: TENANT_DATABASE_PURGE_CUTOVER_SINGLETON_ID,
@@ -20343,6 +22220,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
       this.assertTenantDatabasePurgeGlobalRelations();
       this.assertTenantPurgePlanGlobalRelations();
+      this.auditRetainedSourceOuterBoundary(current.requestId);
+      const finalNowMs = this.storeNowMs();
+      if (!tenantDatabasePurgeAuthorizationMatches(current, stagedAuthorization, finalNowMs)) {
+        this.restoreTenantDatabasePurgeAtomicState(atomicState);
+        return null;
+      }
+      if (finalNowMs < current.purgeNotBeforeDbMs
+        || finalNowMs < current.sourceEvidenceDbMs) {
+        throw new TenantDatabasePurgeEvidenceChangedError();
+      }
       return clone(receipt);
     } catch (error) {
       this.restoreTenantDatabasePurgeAtomicState(atomicState);
@@ -20356,6 +22243,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   ): Promise<TenantDatabasePurgeJobRecord | null> {
     const job = this.tenantDatabasePurgeJobs.get(requestId);
     if (!job || job.tenantId !== tenantId) return null;
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantDatabasePurgeSource(job);
     if (job.phase === "database_purged") {
       validateTenantDatabasePurgeCompletionProof(job, this.tenantDatabasePurgeBundle(job));
@@ -20375,6 +22263,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!job || job.tenantId !== tenantId
       || job.databasePurgeGeneration !== databasePurgeGeneration) return [];
     if (job.phase !== "database_purged") return [];
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantDatabasePurgeGlobalRelations();
     return this.tenantDatabasePurgeEntriesFor(job).map(clone);
   }
@@ -20385,6 +22274,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   ): Promise<TenantDatabasePurgePreDeleteReceipt | null> {
     const job = this.tenantDatabasePurgeJobs.get(requestId);
     if (!job || job.tenantId !== tenantId || job.phase !== "database_purged") return null;
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantDatabasePurgeGlobalRelations();
     return clone(this.tenantDatabasePurgeBundle(job).preDeleteReceipt);
   }
@@ -20398,6 +22288,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!job || job.tenantId !== tenantId
       || job.databasePurgeGeneration !== databasePurgeGeneration
       || job.phase !== "database_purged") return [];
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantDatabasePurgeGlobalRelations();
     return this.tenantDatabasePurgeAcksFor(job).map(clone);
   }
@@ -20408,6 +22299,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   ): Promise<TenantDatabasePurgeReceipt | null> {
     const job = this.tenantDatabasePurgeJobs.get(requestId);
     if (!job || job.tenantId !== tenantId || job.phase !== "database_purged") return null;
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantDatabasePurgeGlobalRelations();
     return clone(this.tenantDatabasePurgeBundle(job).receipt);
   }
@@ -20418,6 +22310,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureReceipt | null> {
     const job = this.tenantDatabasePurgeJobs.get(requestId);
     if (!job || job.tenantId !== tenantId || job.phase !== "database_purged") return null;
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantDatabasePurgeGlobalRelations();
     // A pre-0039 terminal T3f receipt has no closure receipt: unknown, not empty.
     return clone(this.tenantTelemetryOwnerClosureReceipts.get(requestId) ?? null);
@@ -20429,6 +22322,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   ): Promise<TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureEntry[]> {
     const job = this.tenantDatabasePurgeJobs.get(requestId);
     if (!job || job.tenantId !== tenantId || job.phase !== "database_purged") return [];
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantDatabasePurgeGlobalRelations();
     if (!this.tenantTelemetryOwnerClosureReceipts.has(requestId)) return [];
     return this.tenantTelemetryOwnerClosureEntriesFor(requestId).map(clone);
@@ -20446,6 +22340,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     if (!marker || marker.tenantId !== tenantId) return null;
     const job = this.tenantDatabasePurgeJobs.get(marker.requestId);
     if (!job || job.phase !== "database_purged") throw new TenantErasureIntegrityError();
+    this.auditRetainedSourceOuterBoundary(job.requestId);
     this.assertTenantDatabasePurgeGlobalRelations();
     return clone(marker);
   }
@@ -20827,6 +22722,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const targets: TenantRedisPurgeTarget[] = [];
     for (const databaseJob of candidates) {
       if (jobs.length >= stagedOptions.limit) break;
+      this.auditRetainedSourceOuterBoundary(databaseJob.requestId);
       const databaseBundle = this.tenantDatabasePurgeBundle(databaseJob);
       validateTenantDatabasePurgeCompletionProof(databaseJob, databaseBundle);
       const databaseReceipt = databaseBundle.receipt;
@@ -21003,6 +22899,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         throw new TenantErasureIntegrityError();
       }
       try {
+        this.auditRetainedSourceOuterBoundary(current.requestId);
         this.assertTenantRedisPurgeEvidence(current);
         this.assertTenantRedisPurgeReady(current);
       } catch (error) {

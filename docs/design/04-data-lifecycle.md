@@ -420,3 +420,55 @@ schema-root v2仅规范已有明确utf8mb4表默认与列collation时的冗余CH
 - 0044 pre-grant：Memory/真实MySQL定向套件验证新0042 catalog group的精确source-bound intent、版本/exact replay、跨tenant隔离、claim竞争与DB-time过期全回滚；独立`0042→0044`真实MySQL迁移夹具证明旧SQL链、默认休眠、partial-DDL/marker-loss与严格126-trigger指纹，且以required wrapper确认实际运行、零skip。它不运行冻结0042二进制、不签发grant、不接触外部authority，也不解除T3d blocker或completion=false。
 - rolling upgrade：additive capability、私有fleet barrier、部分回填重启和全旧实例 drain 后才激活新不变量已覆盖；固定N-1镜像的真实混版本canary仍留到M4发布编排。
 - 备份恢复：T3g已在runner开放监听前及周期性从同一MySQL projection重放已有durable ACK的Redis marker；未ACK exact marker只能由worker轮询中的existing-marker-only replay收口。0030在激活后把每个新T1 fence发布到外部journal，并以停服replay、永久fence、sealed receipt和runtime epoch gate防止这些已发布fence随旧数据库备份复活；0031进一步以snapshot anchor、operator-attested full-backup摘要、source binding、永久epoch reservation和retention/eviction账本约束恢复来源。Memory/MySQL/S3 adapter、CLI和真实MySQL升级夹具均有回归，但adapter只验证摘要/chain identity，不证明物理snapshot内容。它们仍不创建物理backup、不覆盖pre-activation或未发布T1、Redis未ACK首次bits、backup内tenant erasure及其它domain，且真实故障域/IAM/KMS/RPO/RTO和整链恢复未在staging验证，因此不能宣称完整灾备闭环。
+
+## 13. 0054 retained-source 本地协议（未发布候选，待最终验证）
+
+> 本节描述当前 `0054_tenant_telemetry_retained_source.sql` 与 Memory/MySQL 候选实现的有限合同，不替代前述已发布版本的边界。候选尚未发布、部署或自动启用；定向阶段成功不等于整树 `verify`、完整真实 MySQL 矩阵或新 CI 通过。最终结果及失败/重验记录以 [PROGRESS](../PROGRESS.md) 最新快照与末节为准。该切片不使 M1 冻结，也不开始 M3。
+
+协议名为 `tenant-telemetry-retained-source-v1`。九张独立证据表分别保存 T1 cohort entry/receipt、T3d raw source/tagged target/receipt、T3e usage release entry/receipt、T3f canonical closure entry/receipt；admission 与 plan job 各有一个不可变、可空的 protocol discriminator。它们只增加 content-free 来源证据，不重释旧 v1/0053 hash，不把 v2 binding 塞进 v1 application binding，也不提供手工写 proof 的公开 API。写入只能随下述真实业务边界发生，读取仍须独立验真。
+
+### 13.1 T1：出生来源与整个 managed-v2 cohort 同时封存
+
+新 family 只随合法 active 0053 capture 下的 T1 admission 创建，不能由迁移扫描补造。Memory 在同一同步原子发布中、MySQL 在同一显式 RR 事务中提交 admission、credential fence、首 audit、真实 0033 telemetry subject、cohort 和后续任务/publication。先锁定完整来源再取 DB 时间，封存时间不得早于 admission/fence/subject 或任何 source high-water；credential job 不得使用锁前旧时间倒退。
+
+`eligible-primary` 必须是 0033/0053 激活后具有 creation-complete coverage 的新 tenant，并绑定真实原始 active-primary 0030 epoch、static runtime binding、exact ref-key ID、lifecycle/capture control、logs target 与两份 coverage。出生时间取身份精确匹配的 canonical `subject_lifecycle.created_at_ms`：两份 creation coverage 的起点必须等于该 birth，birth 不早于两次 activation；tenant profile 可以稍后插入，但其创建时间不得早于 birth/coverage/activation。不能把 profile 插入时间反当作 coverage 必须更晚的依据。合法 journal publication 可以推进当前 head/control 证据，不能因此要求其永远等于 T1 的旧快照；原 epoch、static binding、key 与 target 仍不可替换。
+
+cohort 冻结的是整个 managed-v2 操作图，而非只挑已完成项：`written_ack`、`pending`、`reserved`、`blocked`、`unknown` 均有精确 count/root，零集合也显式 seal。只有出生来源完整且全部操作在 T1 线性化前已 written、reservation/不可变 DB ACK/源关系完整，才是 `eligible_retained`。旧 tenant、coverage gap、NULL/gen0 历史失败或不完整图只能形成诚实的 blocked profile/集合，不能伪造“零历史”；损坏的 active control/subject 本身仍直接拒绝，不能降格为合法 blocked proof。`runtime_unknown/gen1` 是普通 canonical 内容，不进入 NULL/gen0 pre-cutover root，也不能冒充 managed provider source。T1 后迟到的已有 reservation ACK 不会升级冻结资格，T1 后不能补新的 external create。
+
+### 13.2 T3d：七类物理来源与完整 33 域计划
+
+T3d 使用一次锁定的真实七源图：inventory、write job、write ACK、0038 membership、0035 application binding、v2 source binding、v2 failure-commit receipt。每个实际行都必须被计入，未完成、孤立或无法闭合的行必须诚实记为 unknown；不能只数目标或丢掉空缺类别。新 catalog 保留独立的 `application-v1` / `persisted-provider-v2` tagged 结构，同时对账完整旧 0040 source-accounting、0041 manifest、原 T3c/plan receipt 和 claim；旧五源 codec/CHECK/hash 不增加第六种枚举，新 family 不发行伪造的旧 0042 aggregate receipt。
+
+目标在 plan root 之前从实际 source/owner 投影，随后与完整 33 域 plan、旧 0040/0041 证据、新 source/target/aggregate 和 terminal 同一原子边界提交；空来源、空目标与各域零计数都必须有明确 root。旧 marker/receipt 不能凭存在代替真实源的双向集合、owner/hold/binding/manifest/payload/reservation/ACK 核验。blocked T1 cohort 不得 seal 新 family T3d terminal，迟到 ACK 不可解封。logs/traces 即使形成非零目录，仍是 `blocked_adapter_unconfigured`，不是可执行删除目标。
+
+tagged 类型和纯 codec 能表示 application-v1 不等于本批完成 mixed-source 生命周期：本批可执行的 retained-source 纵向路径限定新 tenant、原 primary、已冻结并闭合的 v2 来源；usage/canonical 历史分支要求 application-v1 target 为零且目录没有 unknown。旧 v1/legacy 或混合来源未满足这些条件时继续 unknown/fail closed，不提供通用 live-owner 豁免。
+
+### 13.3 T3e：释放 operational usage，独立保留 billing
+
+释放前在同一事务重验 source、canonical item/owner、原 plan、policy/hold/restore、当前 claim 与 DB-time lease，先写绑定 exact usage ID 摘要、原 failure/source/catalog、独立 billing fact 的不可变 pre-entry，再实际删除 operational `usage_ledger`。旧 T3e anonymized ACK/cutover 保持既有字段、哈希与时间语义；新 aggregate 在旧独立 ACK/cutover 已存在后、execution job publication 前封存。pre-entry 的 `releasedAtDbMs` 是 DELETE 前的逻辑准备时间，不是物理删除或 COMMIT 时刻；顺序必须是 source high-water ≤ pre-entry ≤ 实际旧 usage ACK ≤ cutover，cutover 时间/摘要精确绑定新 aggregate，不能事后改 immutable leaf 或旧时间以凑等式。
+
+billing facts 不删除：既核对 tenant 的实际保留事实与旧 ACK/root（包括 0052 prior-retained bridge 的独立扣除），又核对每个 v2 source 对应的精确子集。后续历史读取不能借匿名 billing row 替代已删除 ledger 的来源证明。任何晚期 receipt、源漂移、hold/restore 或最终 lease 校验失败必须回滚实际 DELETE 与全部旧/新发布。
+
+### 13.4 T3f：删除 canonical 之前封源，之后独立 closure
+
+同一原子边界按依赖顺序保存原 pre-delete 证明、真实 session grave、0039 owner leaf 与新 canonical pre-entry，再执行实际 canonical DELETE；之后才发布原 T3f terminal receipt、0039 aggregate、新 canonical aggregate 与 terminal job。新 leaf 绑定原 failed item、完整连续 event range/root、实际 source completion 内的 exact item snapshot、usage release、membership/owner binding 和当前 claim。流式 item 仍保留首次 started 的稳定正整数 seq，不改成较晚 completion seq。
+
+owner proof 不只验可重算 SHA：历史桥必须用同一受保护 ref key，将实际 grave 的 session ID 重新 HMAC，并与原 0039 owner、raw membership、catalog owner/ref/key/hold/binding 精确闭合。live session 的 `0/NULL` 只能映射为本次 grave 的 `1/markedAt`，markedAt 精确等于 pre-delete 时间；已有普通 tombstone 保留原 generation/deleted time，不重新发明一次普通 DELETE。最后还必须证明整个 tenant canonical session 范围为空、原 grave IDs 在任何 owner 下均未复生，并对账原 T3c/T3f/0039/grave、billing 与数据库残余集合；只查旧 ID 不存在或只验 receipt hash 不够。
+
+### 13.5 三态只读、零外部目标与发布门禁
+
+hot getter、startup、旧 T3e physical/read/replay、旧 T3f/owner-closure/read/replay 和 T3g 来源入口必须外层审计新 family；底层使用私有 raw/bottom-up validator，不能互调 public getter 形成递归，也不能用 `Map.has`、任意 receipt header 或 `allowMissingSource` 代替证明。
+
+- `live`：完整 cohort/catalog/raw 七源仍与真实 canonical item/event/operational usage 闭合。
+- `usage_released`：只有真实 usage release + 旧 ACK/cutover + 独立 billing 闭合后才允许 ledger 缺失；canonical item 与原 completion/event range 仍须完整匹配。
+- `canonical_closed`：只有真实 T3f/0039/grave/HMAC 与新 closure、完整 tenant 空集/残余证明闭合后才允许 canonical 缺失。历史 source 只返回 content-free 已验证状态，不授权 reserve/create 或重新开放 tenant。
+
+任一新 marker/entry/aggregate/backlink 缺失、跨 tenant/user/operation、root/tuple 漂移或 partial publication 均拒绝；不能在 target 丢失后回退到旧 live verifier。真实旧或 inactive family 的 NULL marker/旧 terminal 仍保持原语义、缺新证据只为 unknown，不回填；NULL 与任何新 family footprint 并存不能冒充 legacy。
+
+本批新 family 在首次 usage DELETE 或任何外部 outbox scheduling 之前，要求完整 33 域中**所有 `blob_` 与 `user_export_` 前缀域的 targetCount 精确为零**；T3f 和历史 closure 同样重验。不是仅检查 Blob/export bytes 两域。非零或未知必须在本地动作前阻断，不排新 external delete outbox、不启外部 DELETE worker。旧 family 的既有行为不由此重释；T3e physical ACK 仍只表示原 Blob/export 子集，不能冒充 logs/traces 物理 ACK。本协议的 `executionReady`、`externalAuthorityVerified`、`allDomainsComplete`、`contentPurgeExecuted` 四字段始终为 false，0037 grant、产品 telemetry 外部处置/恢复 hard-deny 均保持。
+
+migration 不回填、不激活 control、不联网、不执行业务 DELETE；沿用现有 default-off、本地受控 capture 与各阶段执行 gate，不新增自动清理许可或常驻服务。发布须先关闭相关 gate、排空**全部 pre-0054 writer 与在途事务**，独立执行 migration 并核对严格 schema/trigger 指纹，之后只运行 0054-aware binary、只 forward-fix，不能热混跑或删 marker 回退。四个 guard rotation 各以双 bootstrap 保护，所有 parent DELETE/root guard 安装完成后才移除八道临时 fence；DDL 仍有真实 auto-commit 前缀，markerless/partial footprint 必须拒绝普通 apply/verify，不能自动猜测剩余 DDL 或将任意 surviving guard 当作可信。历史四组各六切点是前缀/元数据/业务不变性观测，不是 24 个独立 SIGKILL 证明。
+
+新 family 的 SQL root 聚合固定上限为 **1 MiB**，超限 fail closed、不截断，也不能靠环境或放大 session budget 绕过；临时 session budget 必须恢复，恢复失败丢弃该连接，COMMIT 后响应丢失只能 exact replay，不能宣称远端回滚。全七源范围锁、跨 tenant 写阻塞、N+1/重复全图审计、大 JSON/packet/内存及 lease/死锁容量仍需专门压测；1205/1213 保持可重试，不永久伪装为完整性冲突。
+
+原 primary 的这条本地链不以前置完成 active-capture restore 为条件，也**不证明新 epoch 恢复已完成**。恢复后仍必须有独立 versioned backup/run/head/epoch 许可与 source-preservation/replay 协议，旧 receipt 不自动 rebind；丢失备份后新增 source 不能猜造。telemetry 对象保留、trusted grant、外部 marker/head、物理处置/retention/restore、真实 managed IAM/KMS 与独立故障域验收、普通 session/user purge 和全域 completion 均仍是后续工作。本地/历史 ACK 夹具只证明实际数据库状态，不能外推真实外部 sink 字节、fleet 排空或云验收。

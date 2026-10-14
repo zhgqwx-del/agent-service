@@ -665,6 +665,13 @@ verify() {
   pnpm run test:persisted-provider-failure-capture
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:persisted-provider-capture-mysql
+  pnpm run test:tenant-telemetry-retained-source
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-telemetry-retained-source-json-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-telemetry-retained-source-budget-mysql
+  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    pnpm run test:tenant-telemetry-retained-source-mysql
   MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:tenant-telemetry-application-capture-mysql
   pnpm run test:tenant-telemetry-writer

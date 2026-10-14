@@ -16,10 +16,10 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # The required lifecycle and frozen-migration matrices intentionally run serially against
-    # shared real services. The 0041/0042 frozen-binary fixtures add real historical upgrades
-    # to a job already near two hours; retain headroom without skipping any named proof.
-    timeout-minutes: 150
+    # Real-service and frozen-binary matrices intentionally run serially. The published
+    # baseline used 127 minutes; retain headroom for the 0054 and release-package proofs
+    # without skipping named suites or changing their per-operation deadlines.
+    timeout-minutes: 180
     env:
       MINIO_SOURCE_COMMIT: 07c3a429bfed433e49018cb0f78a52145d4bedeb
     services:
@@ -128,6 +128,26 @@ jobs:
         env:
           MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:persisted-provider-capture-mysql
+
+      - name: Retained telemetry source pure and Memory suites (must execute)
+        run: pnpm run test:tenant-telemetry-retained-source
+
+      - name: Retained telemetry MySQL JSON integer contract (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-telemetry-retained-source-json-mysql
+
+      - name: Retained telemetry MySQL bounded roots and connection cleanup (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-telemetry-retained-source-budget-mysql
+
+      # Only self-created, isolated MySQL databases are mutated. Fixture ACKs
+      # do not prove a durable S3 sink, real fleet or external disposition.
+      - name: Retained telemetry source real MySQL atomicity and RR suites (must execute)
+        env:
+          MYSQL_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
+        run: pnpm run test:tenant-telemetry-retained-source-mysql
 
       # 0034 persists a closed payload before any external mutation, then uses create-only
       # adapter inspection and a claim-bound ACK to publish inventory and remove the spool.
@@ -645,7 +665,7 @@ jobs:
       # default-off source-bound provider capture; frozen old writers must reject its fingerprint.
       # Frozen 0038/0039/0040/0041 binaries produce genuine old terminal records before upgrade;
       # old-code startup must reject each new strict fingerprint.
-      - name: Historical MySQL migrations (0007 through 0053 + 0043 read compatibility, frozen terminals, no skips)
+      - name: Historical MySQL migrations (0007 through 0054 + 0043 read compatibility, frozen terminals, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
         run: pnpm run test:migrations

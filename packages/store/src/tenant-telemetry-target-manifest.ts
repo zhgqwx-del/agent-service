@@ -22,6 +22,17 @@ export const TARGET_MANIFEST_RECEIPT_SCOPE = "tenant-telemetry-target-manifest-r
 const SHA256 = /^[0-9a-f]{64}$/;
 const digest = (value: unknown) => typeof value === "string" && SHA256.test(value);
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+/** Stable published group identity; this carries no owner or deletion authority. */
+export function tenantTelemetryTargetManifestArtifactGroupSha256(
+  tenantId: string, domain: TenantTelemetryDomain, inventorySha256: string,
+): string {
+  if (typeof tenantId !== "string" || tenantId.length < 1 || tenantId.length > 128
+    || (domain !== "logs" && domain !== "traces") || !digest(inventorySha256)) {
+    throw new Error("telemetry artifact group identity is invalid");
+  }
+  return hash(["tenant-telemetry-target-manifest-artifact-v1", tenantId,
+    domain, inventorySha256]);
+}
 const keys = (value: object, expected: readonly string[]) => {
   const actual = Object.keys(value).sort();
   const sorted = [...expected].sort();
@@ -252,8 +263,8 @@ export function validateTenantTelemetryTargetManifestProof(input: {
   for (const [, group] of groupsOf(entries)) {
     const first = group[0]!;
     const expectedGroupId = first.inventorySha256
-      ? hash(["tenant-telemetry-target-manifest-artifact-v1", first.tenantId,
-        first.domain, first.inventorySha256])
+      ? tenantTelemetryTargetManifestArtifactGroupSha256(first.tenantId,
+        first.domain, first.inventorySha256)
       : hash(["tenant-telemetry-target-manifest-orphan-v1", first.tenantId,
         first.domain, first.writeOperationSha256,
         first.sourceKind === "inventory" ? first.sourceIdentitySha256 : null]);
@@ -380,8 +391,8 @@ export function createTenantTelemetryTargetManifestSnapshot(input: {
     const candidate = inventoryId ? inventories.get(inventoryId) : undefined;
     const inventory = candidate?.domain === source.domain ? candidate : null;
     const groupId = inventory
-      ? hash(["tenant-telemetry-target-manifest-artifact-v1", job.tenantId,
-        source.domain, inventory.inventorySha256])
+      ? tenantTelemetryTargetManifestArtifactGroupSha256(job.tenantId,
+        source.domain, inventory.inventorySha256)
       : hash(["tenant-telemetry-target-manifest-orphan-v1", job.tenantId,
         source.domain, operation, source.sourceKind === "inventory"
           ? source.sourceIdentitySha256 : null]);
