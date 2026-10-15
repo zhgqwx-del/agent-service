@@ -1,5 +1,7 @@
 # agent-service
 
+0056恢复维护本地检查点（2026-10-15）：已接入仅指定run的维护facade、与0030 runtime同事务的只读history，以及v2制品prepare后的受限cold-open；不启用新epoch capture或旧pending续跑。共享/CI门禁三文件314项、最终CLI整文件66项、Memory整文件24项通过；真实MySQL六项正反例及独立RC→RR并发一项分段通过，冻结旧0055二进制的真实升级夹具3/3通过。最终typecheck、secret scan及diff检查已做；不是新功能包全量或CI通过。旧失败与实际报告见[进度](docs/PROGRESS.md)末节。下方12:37是此前`bbe5ab8`检查点的时间点状态，maintenance/history现已接入，其余新epoch写入/旧pending续跑及真实制品纵向验收仍待；main/CI未变。
+
 本worktree的M1恢复接线检查点（2026-10-15T12:37Z）：Memory/MySQL已实际封存49类来源及不可变叶子；加密备份v2把完整checkpoint纳入manifest/AAD，新dump先核对真实store与operator的server UUID/数据库绑定，再审计前后来源，v1字节兼容。0031选择/0030 prepare以显式checkpoint和独立sidecar原子绑定，缺证据不补造。Memory 46项、真实隔离MySQL 12项、冻结0054→0055历史4项及原0053→0054回归14项均通过；详细分段证据和失败记录见[进度](docs/PROGRESS.md)。这仍不是完整恢复能力：maintenance启动、原子历史receipt、新epoch显式写入及旧pending新claim续跑尚未接入，真实MySQL/MinIO制品纵向验收仍待。未运行本功能包全量或新CI，未合入/推送/部署/激活；main/origin2932318的[原CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38714666463)五项全绿仅证明原基线。M1未冻结、M2冻结、M3未开始，0037硬拒、0054原primary删除资格、自动清理off与全域completion=false不变。
 
 M4新增离线VM发布签名候选：`pnpm sign:vm-release`用显式受保护Ed25519文件签署clean发布的精确身份；独立工具的`inspect-signed`/`unpack-signed`核对可信公钥pin、选定role/commit、实际归档/manifest及工具自身字节，没有unsigned fallback。它不生成生产密钥、不安装或晋级环境；生产信任根、OCI签名与环境发布仍未完成。操作及边界见[离线VM发布签名](docs/operations/local-and-deployment.md#离线-vm-发布签名)。实际功能包/整树/CI结果只看PROGRESS，不能借旧验收背书。

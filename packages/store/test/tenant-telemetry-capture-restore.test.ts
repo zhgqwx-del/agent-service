@@ -6,6 +6,9 @@ import * as codec from "../src/tenant-telemetry-capture-restore.js";
 import { validatePreflightTenantRestoreReplayFromBackupInput } from "../src/backup-catalog.js";
 import { readTenantTelemetryCaptureCheckpointFromMysql } from "../src/mysql/tenant-telemetry-capture-checkpoint.js";
 import type { Connection } from "mysql2/promise";
+import * as RestoreJournal from "../src/tenant-restore-journal.js";
+import { validateTenantTelemetryCaptureRestoreMaintenanceSelector,
+  type TenantTelemetryCaptureRestoreMaintenanceSelector } from "../src/tenant-telemetry-capture-restore-store.js";
 
 // Pure, synthetic codec fixtures. None proves a database row, an actual backup,
 // a current source-valid operation, a physical object or an operator ACK.
@@ -175,6 +178,197 @@ describe("actual MySQL checkpoint reader boundary (pure driver doubles, not DB p
     const f = source();
     await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, "backup_' OR 1=1", key)).rejects.toThrow();
     expect(f.calls).toHaveLength(0);
+  });
+});
+
+/** Synthetic records constructed with the official 0030 evidence algorithms.
+ * These tests prove the shared identity/selector contract only, not a DB row,
+ * remote head, actual publisher, stopped fleet, maintenance facade or activation. */
+type RestoreRuntime = Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { lineageKind: "restore" }>;
+function officialRestoreRuntimeFixture(options: { restoreRunId?: string; runtimeEpochSha256?: string; sourceBackupSha256?: string } = {}) {
+  const target: RestoreJournal.TenantRestoreJournalTargetDescriptor = { targetOrdinal: 0,
+    targetSha256: h("shared-runtime-target"), failureDomainSha256: h("shared-runtime-domain"),
+    adapterProtocol: "memory-restore-journal-v1", journalNamespaceSha256: h("shared-runtime-journal") };
+  const journalBody = { singletonId: RestoreJournal.TENANT_RESTORE_JOURNAL_CONTROL_SINGLETON_ID, controlGeneration: 1 as const,
+    activatedAtDbMs: 800, protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL, adapterProtocol: target.adapterProtocol,
+    journalNamespaceSha256: target.journalNamespaceSha256, logicalDatabaseNamespaceSha256: h("shared-runtime-database"),
+    targetCount: 1, targetRootSha256: RestoreJournal.tenantRestoreJournalTargetRootSha256([target]) };
+  const journal = { ...journalBody, evidenceSha256: RestoreJournal.tenantRestoreJournalControlEvidenceSha256(journalBody) };
+  RestoreJournal.validateTenantRestoreJournalControlRecord(journal);
+  const head = { ...target, logicalDatabaseNamespaceSha256: journal.logicalDatabaseNamespaceSha256,
+    sealedRemoteSequence: 0, sealedHeadRootSha256: RestoreJournal.EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256 };
+  const headRoot = RestoreJournal.tenantRestoreReplaySealedTargetRootSha256([head]);
+  const primaryBody = { singletonId: RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID, state: "active" as const,
+    controlGeneration: 1, updateKind: "primary_activation" as const, activatedAtDbMs: 900, updatedAtDbMs: 900,
+    lineageKind: "primary" as const, runtimeEpochSha256: h("shared-runtime-original-primary"),
+    controlEvidenceSha256: journal.evidenceSha256, logicalDatabaseNamespaceSha256: journal.logicalDatabaseNamespaceSha256,
+    targetCount: journal.targetCount, targetRootSha256: journal.targetRootSha256, verifiedHeadRootSha256: headRoot,
+    previousControlEvidenceSha256: RestoreJournal.EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256 };
+  const primary = { ...primaryBody, evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(primaryBody) };
+  RestoreJournal.validateTenantRestoreRuntimeControlRecord(primary);
+  const replayBody = { scope: RestoreJournal.TENANT_RESTORE_REPLAY_RECEIPT_SCOPE, restoreRunId: options.restoreRunId ?? runId,
+    sourceBackupSha256: options.sourceBackupSha256 ?? h("shared-runtime-actual-backup"),
+    runtimeEpochSha256: options.runtimeEpochSha256 ?? h("shared-runtime-new-epoch"), controlEvidenceSha256: journal.evidenceSha256,
+    protocol: RestoreJournal.TENANT_RESTORE_JOURNAL_PROTOCOL, adapterProtocol: journal.adapterProtocol,
+    journalNamespaceSha256: journal.journalNamespaceSha256, logicalDatabaseNamespaceSha256: journal.logicalDatabaseNamespaceSha256,
+    targetCount: journal.targetCount, targetRootSha256: journal.targetRootSha256, sealedTargetRootSha256: headRoot,
+    entryCount: 0, entryRootSha256: RestoreJournal.EMPTY_TENANT_RESTORE_REPLAY_ENTRY_ROOT_SHA256,
+    fenceCount: 0, fenceRootSha256: RestoreJournal.EMPTY_TENANT_RESTORE_FENCE_ROOT_SHA256, storeDbTimestampMs: 1_050,
+    restoreFenceReplayComplete: true as const, physicalReplayComplete: false as const,
+    allDomainsComplete: false as const, contentPurgeExecuted: false as const };
+  const replay = { ...replayBody, receiptSha256: RestoreJournal.tenantRestoreReplayReceiptSha256(replayBody) };
+  RestoreJournal.validateTenantRestoreReplayReceipt(replay);
+  const runtimeBody = { singletonId: RestoreJournal.TENANT_RESTORE_RUNTIME_CONTROL_SINGLETON_ID, state: "active" as const,
+    controlGeneration: 2, updateKind: "restore_activation" as const, activatedAtDbMs: 1_100, updatedAtDbMs: 1_100,
+    lineageKind: "restore" as const, restoreRunId: replay.restoreRunId, replayReceiptSha256: replay.receiptSha256,
+    runtimeEpochSha256: replay.runtimeEpochSha256, controlEvidenceSha256: journal.evidenceSha256,
+    logicalDatabaseNamespaceSha256: journal.logicalDatabaseNamespaceSha256, targetCount: journal.targetCount,
+    targetRootSha256: journal.targetRootSha256, verifiedHeadRootSha256: replay.sealedTargetRootSha256,
+    previousControlEvidenceSha256: primary.evidenceSha256 };
+  const runtime: RestoreRuntime = { ...runtimeBody, evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(runtimeBody) };
+  RestoreJournal.validateTenantRestoreRuntimeControlRecord(runtime);
+  return { journal, primary, replay, runtime, target, head };
+}
+function officialRuntimeSuccessor(runtime: RestoreRuntime, verifiedHeadRootSha256: string): RestoreRuntime {
+  const { evidenceSha256, ...prior } = runtime;
+  const body = { ...prior, controlGeneration: prior.controlGeneration + 1, updateKind: "journal_head_advance" as const,
+    updatedAtDbMs: prior.updatedAtDbMs + 100, verifiedHeadRootSha256, previousControlEvidenceSha256: evidenceSha256 };
+  const successor = { ...body, evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(body) };
+  RestoreJournal.validateTenantRestoreRuntimeControlRecord(successor);
+  return successor;
+}
+function signedRuntimePatch(runtime: RestoreRuntime, patch: Partial<Omit<RestoreRuntime, "evidenceSha256">>): RestoreRuntime {
+  const { evidenceSha256: ignored, ...prior } = runtime; void ignored;
+  const body = { ...prior, ...patch };
+  const changed = { ...body, evidenceSha256: RestoreJournal.tenantRestoreRuntimeControlEvidenceSha256(body) };
+  RestoreJournal.validateTenantRestoreRuntimeControlRecord(changed);
+  return changed;
+}
+function maintenanceSelector(): TenantTelemetryCaptureRestoreMaintenanceSelector {
+  return { backupId, restoreRunId: runId, checkpointSha256: h("selected-checkpoint"), artifactManifestSha256: h("selected-manifest"),
+    sourceSnapshotSha256: h("selected-sql-bytes"), providerEvidenceSha256: h("selected-provider-proof"),
+    reservationSha256: h("selected-reservation"), reservationReceiptSha256: h("selected-external-reservation"),
+    fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" };
+}
+
+describe("shared restore-only runtime identity from official 0030 records", () => {
+  it("binds the exact validated restore activation, journal and replay identities", () => {
+    const f = officialRestoreRuntimeFixture();
+    expect(f.runtime.previousControlEvidenceSha256).toBe(f.primary.evidenceSha256);
+    expect(f.runtime.replayReceiptSha256).toBe(f.replay.receiptSha256);
+    expect(f.runtime.verifiedHeadRootSha256).toBe(f.replay.sealedTargetRootSha256);
+    expect(codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(f.runtime, f.journal)).toBe(proofHash(
+      "tenant-telemetry-capture-restore-runtime-binding-v1", { lineageKind: "restore", restoreRunId: f.runtime.restoreRunId,
+        replayReceiptSha256: f.replay.receiptSha256, runtimeEpochSha256: f.runtime.runtimeEpochSha256,
+        journalControlEvidenceSha256: f.journal.evidenceSha256, logicalDatabaseNamespaceSha256: f.runtime.logicalDatabaseNamespaceSha256,
+        journalTargetRootSha256: f.journal.targetRootSha256, targetCount: f.journal.targetCount }));
+  });
+  it("keeps identity across valid sequential head/publisher-control successors without making them write authority", () => {
+    const f = officialRestoreRuntimeFixture(), original = codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(f.runtime, f.journal);
+    const firstHead = { ...f.head, sealedRemoteSequence: 1, sealedHeadRootSha256: h("synthetic-published-head-one") };
+    const secondHead = { ...f.head, sealedRemoteSequence: 2, sealedHeadRootSha256: h("synthetic-published-head-two") };
+    const first = officialRuntimeSuccessor(f.runtime, RestoreJournal.tenantRestoreReplaySealedTargetRootSha256([firstHead]));
+    const second = officialRuntimeSuccessor(first, RestoreJournal.tenantRestoreReplaySealedTargetRootSha256([secondHead]));
+    expect(first.previousControlEvidenceSha256).toBe(f.runtime.evidenceSha256); expect(second.previousControlEvidenceSha256).toBe(first.evidenceSha256);
+    expect(second.controlGeneration).toBe(4); expect(second.updatedAtDbMs).toBe(1_300);
+    expect(new Set([f.runtime.evidenceSha256, first.evidenceSha256, second.evidenceSha256]).size).toBe(3);
+    for (const current of [first, second]) expect(codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(current, f.journal)).toBe(original);
+  });
+  it("rejects valid primary and inactive records instead of broadening the old primary binding contract", () => {
+    const f = officialRestoreRuntimeFixture();
+    const inactiveRuntime: RestoreJournal.TenantRestoreRuntimeControlRecord = { singletonId: 1, state: "inactive", controlGeneration: 0 };
+    const inactiveJournal: RestoreJournal.TenantRestoreJournalControlRecord = { singletonId: 1, controlGeneration: 0 };
+    RestoreJournal.validateTenantRestoreRuntimeControlRecord(inactiveRuntime); RestoreJournal.validateTenantRestoreJournalControlRecord(inactiveJournal);
+    rejected(() => codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(f.primary, f.journal));
+    rejected(() => codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(inactiveRuntime, f.journal));
+    rejected(() => codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(f.runtime, inactiveJournal));
+  });
+  it("rejects individually signed runtime records with a mismatched journal control, target, count or database", () => {
+    const f = officialRestoreRuntimeFixture();
+    for (const patch of [{ controlEvidenceSha256: h("other-journal-control") }, { targetRootSha256: h("other-journal-target-root") },
+      { targetCount: 2 }, { logicalDatabaseNamespaceSha256: h("other-database") }]) {
+      const changed = signedRuntimePatch(f.runtime, patch);
+      rejected(() => codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(changed, f.journal));
+    }
+  });
+  it.each(["run", "replay", "epoch"] as const)("changes identity for a different valid %s lineage", (kind) => {
+    const original = officialRestoreRuntimeFixture();
+    const changed = officialRestoreRuntimeFixture(kind === "run" ? { restoreRunId: otherRunId }
+      : kind === "replay" ? { sourceBackupSha256: h("different-replayed-backup") } : { runtimeEpochSha256: h("different-restored-epoch") });
+    expect(codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(changed.runtime, changed.journal))
+      .not.toBe(codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(original.runtime, original.journal));
+  });
+  it("authenticates official record evidence before hashing rather than trusting digest-looking fields", () => {
+    const f = officialRestoreRuntimeFixture();
+    rejected(() => codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(change(f.runtime, { evidenceSha256: h("forged-runtime") }), f.journal));
+    rejected(() => codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(f.runtime, change(f.journal, { evidenceSha256: h("forged-journal") })));
+    rejected(() => codec.tenantTelemetryCaptureRestoreRuntimeBindingSha256(change(f.runtime, { captureWriteAuthorized: true }), f.journal));
+  });
+});
+
+describe("shared exact-run maintenance selector closed input", () => {
+  it("accepts the complete typed plain and null-prototype selectors without changing their fields", () => {
+    const value = maintenanceSelector(), before = canonical(value);
+    expect(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value)).not.toThrow();
+    const nullPrototype: TenantTelemetryCaptureRestoreMaintenanceSelector = Object.assign(Object.create(null), value);
+    expect(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(nullPrototype)).not.toThrow();
+    expect(canonical(value)).toBe(before);
+  });
+  it("requires every one of the ten fields, including both explicit ACKs", () => {
+    for (const field of Object.keys(maintenanceSelector()) as (keyof TenantTelemetryCaptureRestoreMaintenanceSelector)[]) {
+      const value = maintenanceSelector(); Reflect.deleteProperty(value, field);
+      rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value));
+    }
+  });
+  it("rejects undefined in every known field rather than treating it as omission/default", () => {
+    for (const field of Object.keys(maintenanceSelector())) {
+      const value = maintenanceSelector(); Reflect.set(value, field, undefined);
+      rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value));
+    }
+  });
+  it("rejects extra string/symbol authority and non-enumerable fields", () => {
+    const extra = Object.assign(maintenanceSelector(), { skipAudit: true });
+    const symbol = maintenanceSelector(); Object.defineProperty(symbol, Symbol("write-authority"), { value: true, enumerable: true });
+    const hidden = maintenanceSelector(); Object.defineProperty(hidden, "checkpointSha256", { value: hidden.checkpointSha256, enumerable: false });
+    for (const value of [extra, symbol, hidden]) rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value));
+  });
+  it("requires canonical lowercase 64-hex strings for all six selected evidence digests", () => {
+    const fields = ["checkpointSha256", "artifactManifestSha256", "sourceSnapshotSha256", "providerEvidenceSha256", "reservationSha256", "reservationReceiptSha256"] as const;
+    for (const field of fields) for (const invalid of ["", "a".repeat(63), "a".repeat(65), "A".repeat(64), "g".repeat(64), null, 0]) {
+      const value = maintenanceSelector(); Reflect.set(value, field, invalid);
+      rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value));
+    }
+  });
+  it("requires v4 backup/run string IDs without invoking object or Symbol coercion", () => {
+    for (const field of ["backupId", "restoreRunId"] as const) {
+      for (const invalid of ["", field === "backupId" ? runId : backupId, "backup_00000000-0000-1000-8000-000000000001", Symbol("invalid-id")]) {
+        const value = maintenanceSelector(); Reflect.set(value, field, invalid);
+        rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value));
+      }
+      let coercions = 0;
+      const value = maintenanceSelector(); Reflect.set(value, field, { toString() { coercions += 1; return field === "backupId" ? backupId : runId; } });
+      rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value)); expect(coercions).toBe(0);
+    }
+  });
+  it("does not coerce ACKs or permit caller write/erase permission in their place", () => {
+    for (const field of ["fleetStoppedAck", "localOnlyAck"] as const) for (const invalid of [true, 1, "1", null, "production", "erase-authorized-v1"]) {
+      const value = maintenanceSelector(); Reflect.set(value, field, invalid);
+      rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value));
+    }
+  });
+  it("rejects accessors on every field without evaluating even one getter", () => {
+    for (const field of Object.keys(maintenanceSelector())) {
+      let reads = 0;
+      const value = maintenanceSelector(); Object.defineProperty(value, field, { enumerable: true, get() { reads += 1; throw new Error("getter must not execute"); } });
+      rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value)); expect(reads).toBe(0);
+    }
+  });
+  it("rejects custom/inherited prototypes and non-record carriers", () => {
+    const inherited: TenantTelemetryCaptureRestoreMaintenanceSelector = Object.create(maintenanceSelector());
+    const custom: TenantTelemetryCaptureRestoreMaintenanceSelector = Object.assign(Object.create({ inheritedAuthority: true }), maintenanceSelector());
+    for (const value of [inherited, custom, [], null, new Map(), new Date(0)]) {
+      rejected(() => validateTenantTelemetryCaptureRestoreMaintenanceSelector(value as TenantTelemetryCaptureRestoreMaintenanceSelector));
+    }
   });
 });
 

@@ -1,0 +1,685 @@
+import { createHash, randomUUID } from "node:crypto";
+import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import {
+  DEFAULT_AUTH_POLICY,
+  tenantRuntimeFleetSha256,
+  tenantRuntimeLocalReceiptSha256,
+  tenantRuntimeTargetReceiptsSha256,
+  tenantRuntimeTargetSha256,
+  type Turn,
+} from "@agent-service/protocol";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
+  EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
+  MysqlSessionStore,
+  TENANT_BACKUP_CATALOG_ENTRY_SCOPE,
+  TENANT_BACKUP_CATALOG_PROTOCOL,
+  TenantTelemetryCaptureRestoreIntegrityError,
+  newTenantBackupId,
+  newErasureRequestId,
+  tenantBackupAvailabilityOperationSha256,
+  tenantBackupAvailabilityReceiptSha256,
+  tenantBackupCatalogEntrySha256,
+  tenantBackupCatalogEventSha256,
+  tenantBackupCatalogNextEventRootSha256,
+  tenantBackupReservationReceiptSha256,
+  tenantBackupRuntimeReservationOperationSha256,
+  tenantRestoreRuntimeEpochSha256,
+  tenantErasureRequestHash,
+  tenantRestoreJournalNextRemoteHeadRootSha256,
+  tenantTelemetryWriteAdapterResult,
+  type TenantBackupCatalogEntry,
+  type TenantBackupCatalogEventProof,
+  type TenantBackupRuntimeReservationAdapterResult,
+  type TenantRestoreJournalRemoteEntry,
+  type TenantTelemetryCaptureRestoreMaintenanceSelector,
+} from "../src/index.js";
+import { activateCaptureFixture, captureRefKey, captureStepFixture } from "./persisted-provider-capture.fixture.js";
+
+const h = (value: string) => createHash("sha256").update(value).digest("hex");
+const BASE_MYSQL_URL = process.env.MYSQL_TEST_URL ?? "mysql://root@127.0.0.1:3306/agent_service_test";
+function disposableBase(raw: string): URL {
+  const url = new URL(raw);
+  const database = decodeURIComponent(url.pathname.split("/").filter(Boolean).at(-1) ?? "");
+  if (url.protocol !== "mysql:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)
+    || !/(?:^|[_-])test(?:$|[_-])/i.test(database)) {
+    throw new Error("MYSQL_TEST_URL must name a local disposable test database");
+  }
+  return url;
+}
+function databaseUrl(base: URL, database: string): string {
+  const url = new URL(base); url.pathname = `/${database}`; return url.toString();
+}
+function eventProof(sequence: number, previous: string,
+  eventType: "backup_recoverable" | "restore_reserved", operationSha256: string,
+  receiptSha256: string): TenantBackupCatalogEventProof {
+  const catalogEventSha256 = tenantBackupCatalogEventSha256({ eventType, operationSha256, receiptSha256 });
+  return { catalogSequence: sequence, previousCatalogEventRootSha256: previous, catalogEventSha256,
+    catalogEventRootSha256: tenantBackupCatalogNextEventRootSha256({
+      catalogSequence: sequence, previousCatalogEventRootSha256: previous, catalogEventSha256,
+    }) };
+}
+
+type RetainedSourcePhase = "fresh" | "live" | "usage_released" | "canonical_closed";
+function retainedPolicy() {
+  return { sessionContentRetentionMs: 0, userErasureGraceMs: 0,
+    operationalUsageRetentionMs: 0, idempotencyReceiptRetentionMs: 0,
+    billingFactRetentionMs: null, lifecycleAuditRetentionMs: null,
+    exportArtifactTtlMs: 60_000 };
+}
+
+function localFleetProof(source: {
+  requestId: string; tenantId: string; subjectGeneration: number; t3aReceiptSha256: string;
+}) {
+  const body = { targetSha256: tenantRuntimeTargetSha256("http://restore-maintenance-fixture.internal:8080"),
+    runnerId: "restore-maintenance-fixture-runner", bootId: "restore-maintenance-fixture-boot",
+    requestId: source.requestId, tenantId: source.tenantId,
+    subjectGeneration: source.subjectGeneration, t3aReceiptSha256: source.t3aReceiptSha256,
+    cacheEntryCountBefore: 1, cacheEntryCountAfter: 0 as const,
+    activeOperationCountBefore: 1, activeOperationCountAfter: 0 as const,
+    activeTurnCountBefore: 1, activeTurnCountAfter: 0 as const,
+    completedAtMs: Date.now() };
+  const targets = [{ ...body, receiptSha256: tenantRuntimeLocalReceiptSha256(body) }];
+  return { fleetSha256: tenantRuntimeFleetSha256(targets),
+    targetReceiptsSha256: tenantRuntimeTargetReceiptsSha256(targets), targets };
+}
+
+if (process.env.AGENT_SERVICE_INTEGRATION) {
+  describe("0056 capture restore maintenance: isolated real MySQL", () => {
+    let admin: Connection;
+    let base: URL;
+    const owned = new Set<string>();
+    beforeAll(async () => { base = disposableBase(BASE_MYSQL_URL);
+      admin = await mysql.createConnection(databaseUrl(base, "mysql")); });
+    afterAll(async () => { if (admin) { for (const name of owned) await admin.query(`DROP DATABASE \`${name}\``);
+      await admin.end(); } });
+
+    async function fixture() {
+      const name = `agent_service_mtc_test_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      const [existing] = await admin.query<RowDataPacket[]>(
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE BINARY SCHEMA_NAME=BINARY ?", [name]);
+      if (existing.length) throw new Error("isolated maintenance database already exists");
+      await admin.query(`CREATE DATABASE \`${name}\` CHARACTER SET utf8mb4`); owned.add(name);
+      const url = databaseUrl(base, name);
+      let store: MysqlSessionStore | undefined;
+      let conn: Connection | undefined;
+      try {
+        store = await MysqlSessionStore.connect({ url, connectionLimit: 4,
+          tenantTelemetryRefKey: captureRefKey,
+          tenantTelemetryPersistedProviderCaptureLocalOnly: true,
+          tenantTelemetryCaptureRestoreLocalOnly: true });
+        conn = await mysql.createConnection(url);
+        await activateCaptureFixture(store);
+        await store.activateBlobStorageControl({ expectedControlGeneration: 0,
+          storageBackend: "s3v1-restore-maintenance-fixture",
+          namespaceSha256: h("restore-maintenance-blob") });
+        const journal = await store.getTenantRestoreJournalControl();
+        if (journal.controlGeneration !== 1) throw new Error("fixture journal inactive");
+        await store.activateTenantBackupCatalogControl({ expectedControlGeneration: 0,
+          adapterProtocol: "mysql-authoritative-backup-catalog-v1",
+          catalogNamespaceSha256: h("restore-maintenance-catalog-namespace"),
+          catalogTargetSha256: h("restore-maintenance-catalog-target"),
+          failureDomainSha256: h("restore-maintenance-catalog-failure-domain"),
+          logicalDatabaseNamespaceSha256: "4".repeat(64),
+          journalControlEvidenceSha256: journal.evidenceSha256,
+          retentionPolicySha256: h("restore-maintenance-catalog-retention"),
+          minimumRetentionMs: 60_000, minimumRecoverableBackups: 1 });
+        return { name, url, store, conn, async close() {
+          await Promise.all([store?.close(), conn?.end()]);
+          await admin.query(`DROP DATABASE \`${name}\``); owned.delete(name);
+        } };
+      } catch (error) {
+        await Promise.all([store?.close(), conn?.end()]);
+        await admin.query(`DROP DATABASE \`${name}\``); owned.delete(name); throw error;
+      }
+    }
+
+    async function available(store: MysqlSessionStore): Promise<{ entry: TenantBackupCatalogEntry;
+      checkpointSha256: string }> {
+      const control = await store.getTenantBackupCatalogControl();
+      if (control.state !== "active") throw new Error("fixture catalog inactive");
+      const backupId = newTenantBackupId();
+      const anchor = (await store.createTenantBackupSnapshotAnchor({ backupId,
+        controlEvidenceSha256: control.evidenceSha256 })).value;
+      const sealed = await store.sealTenantTelemetryCaptureBackupCheckpoint({ backupId,
+        fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
+      if (!sealed || sealed.disposition !== "created" || sealed.value.checkpoint.families.length !== 49) {
+        throw new Error("fixture checkpoint not sealed");
+      }
+      const descriptor = { backupId, anchorSha256: anchor.anchorSha256,
+        sourceSnapshotSha256: h(`restore-maintenance-source-snapshot-${backupId}`),
+        sourceBackupSha256: h(`restore-maintenance-source-backup-${backupId}`),
+        artifactManifestSha256: h(`restore-maintenance-artifact-${backupId}`),
+        providerEvidenceSha256: h(`restore-maintenance-provider-${backupId}`),
+        controlEvidenceSha256: anchor.controlEvidenceSha256,
+        logicalDatabaseNamespaceSha256: anchor.logicalDatabaseNamespaceSha256,
+        retentionPolicySha256: control.retentionPolicySha256,
+        retentionUntilDbMs: anchor.retentionUntilDbMs, registeredAtDbMs: anchor.createdAtDbMs,
+        catalogNamespaceSha256: control.catalogNamespaceSha256,
+        catalogTargetSha256: control.catalogTargetSha256 };
+      const availabilityOperationSha256 = tenantBackupAvailabilityOperationSha256(descriptor);
+      const availabilityReceiptSha256 = tenantBackupAvailabilityReceiptSha256({
+        adapterProtocol: control.adapterProtocol, catalogNamespaceSha256: control.catalogNamespaceSha256,
+        catalogTargetSha256: control.catalogTargetSha256, failureDomainSha256: control.failureDomainSha256,
+      }, descriptor, availabilityOperationSha256);
+      const evidence = { adapterProtocol: control.adapterProtocol,
+        failureDomainSha256: control.failureDomainSha256, ...descriptor,
+        availabilityOperationSha256, availabilityReceiptSha256,
+        ...eventProof(1, EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
+          "backup_recoverable", availabilityOperationSha256, availabilityReceiptSha256) };
+      const entry = (await store.recordTenantBackupCatalogAvailability({ ...evidence,
+        entrySha256: tenantBackupCatalogEntrySha256({
+          scope: TENANT_BACKUP_CATALOG_ENTRY_SCOPE,
+          protocol: TENANT_BACKUP_CATALOG_PROTOCOL, ...evidence,
+        }),
+      })).value;
+      return { entry, checkpointSha256: sealed.value.checkpoint.checkpointSha256 };
+    }
+
+    async function advanceRetainedSource(
+      store: MysqlSessionStore,
+      conn: Connection,
+      step: Awaited<ReturnType<typeof captureStepFixture>>,
+      phase: Exclude<RetainedSourcePhase, "fresh">,
+    ): Promise<{ targetOrdinal: number; remoteEntry: TenantRestoreJournalRemoteEntry }> {
+      // The capture is a real business commit. The following ACK is a
+      // deliberately local, in-process adapter result, never S3 evidence.
+      const write = (await store.claimTenantTelemetryWriteJobs({ limit: 10, leaseMs: 120_000,
+        claimToken: `maintenance-write-${randomUUID()}`,
+        adapterProtocol: "telemetry-s3-object-v1", captureMode: "include_v2", freshProof: step.proof,
+      })).find((row) => row.tenantId === step.session.tenantId);
+      if (!write) throw new Error("genuine captured write claim missing");
+      const writeAuth = { tenantId: write.tenantId, writeOperationSha256: write.writeOperationSha256,
+        claimAttempt: write.claimAttempt, claimToken: write.claimToken };
+      expect(await store.reserveTenantTelemetryExternalMutation(
+        writeAuth, "telemetry-s3-object-v1", step.proof,
+      )).not.toBeNull();
+      const writeResult = tenantTelemetryWriteAdapterResult("telemetry-s3-object-v1", {
+        writeOperationSha256: write.writeOperationSha256, target: write.target,
+        inventory: write.inventory, payload: write.payload,
+      }, "already_present", true);
+      expect(await store.completeTenantTelemetryWrite(writeAuth, writeResult, step.proof)).not.toBeNull();
+      const turn: Turn = { ...step.turn, usage: step.batch.turn!.usage, status: "failed",
+        completedAtMs: Date.now(), stopReason: "error" };
+      expect((await store.commit({ sessionId: step.session.id, fence: 1, expectedLastSeq: 4,
+        turn, events: [
+          { type: "error", sessionId: step.session.id, emittedAtMs: turn.completedAtMs!,
+            code: "provider_error", message: "Provider request failed." },
+          { type: "turn/completed", sessionId: step.session.id, emittedAtMs: turn.completedAtMs!,
+            turn, stopReason: "error" },
+          { type: "session/status/changed", sessionId: step.session.id, emittedAtMs: turn.completedAtMs!,
+            status: { type: "idle" } },
+        ], sessionPatch: { status: { type: "idle" } },
+      })).lastSeq).toBe(7);
+      const request = { requestId: newErasureRequestId(), tenantId: step.session.tenantId,
+        requestedByKeyId: "maintenance-local-admin", idempotencyKey: `maintenance-${randomUUID()}`,
+        requestHash: tenantErasureRequestHash(step.session.tenantId), atMs: Date.now() };
+      await store.requestTenantErasure(request);
+      expect(await store.getTenantTelemetryRetainedSourceT1CohortReceipt(
+        request.tenantId, request.requestId,
+      )).toMatchObject({ eligibility: "eligible_retained", entryCount: 1, writtenAckCount: 1 });
+      const publication = (await store.claimTenantRestoreJournalPublications({
+        limit: 10, leaseMs: 120_000, claimToken: `maintenance-publication-${randomUUID()}`,
+      })).find((row) => row.requestId === request.requestId);
+      if (!publication) throw new Error("genuine T1 publication claim missing");
+      const publicationAuth = { requestId: publication.requestId, tenantId: publication.tenantId,
+        subjectGeneration: publication.subjectGeneration,
+        publicationGeneration: publication.publicationGeneration,
+        claimAttempt: publication.claimAttempt, claimToken: publication.claimToken };
+      const pending = await store.getTenantRestoreJournalPublicationRecord(publicationAuth, 0);
+      if (!pending) throw new Error("genuine T1 publication record missing");
+      const previousHeadRootSha256 = EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256;
+      const remoteEntry: TenantRestoreJournalRemoteEntry = {
+        targetSha256: pending.target.targetSha256,
+        remoteSequence: 1,
+        previousHeadRootSha256,
+        headRootSha256: tenantRestoreJournalNextRemoteHeadRootSha256({
+          previousHeadRootSha256, targetSha256: pending.target.targetSha256,
+          remoteSequence: 1, operationSha256: pending.record.operationSha256,
+          recordSha256: pending.record.recordSha256,
+        }), record: pending.record,
+      };
+      expect(await store.recordTenantRestoreJournalPublicationTargetAck(publicationAuth, {
+        adapterProtocol: pending.target.adapterProtocol,
+        journalNamespaceSha256: pending.target.journalNamespaceSha256,
+        logicalDatabaseNamespaceSha256: pending.target.logicalDatabaseNamespaceSha256,
+        ...remoteEntry, replayed: false,
+      })).not.toBeNull();
+      expect(await store.sealTenantRestoreJournalPublication(publicationAuth))
+        .toMatchObject({ restoreFencePublicationComplete: true });
+      const [headEvents] = await conn.query<RowDataPacket[]>(`SELECT update_kind FROM tenant_restore_runtime_events
+        WHERE singleton_id=1 ORDER BY control_generation`);
+      expect(headEvents.map((row) => row.update_kind)).toEqual([
+        "primary_activation", "journal_head_advance",
+      ]);
+      if (phase === "live") return { targetOrdinal: pending.target.targetOrdinal, remoteEntry };
+
+      const credential = (await store.claimTenantCredentialRevocations({ limit: 10, leaseMs: 120_000,
+        claimToken: `maintenance-credential-${randomUUID()}`,
+      })).find((row) => row.requestId === request.requestId);
+      if (!credential) throw new Error("genuine T3a claim missing");
+      expect(await store.revokeTenantCredentialMaterial({ requestId: credential.requestId,
+        tenantId: credential.tenantId, subjectGeneration: credential.subjectGeneration,
+        claimAttempt: credential.claimAttempt, claimToken: credential.claimToken })).not.toBeNull();
+      expect(await store.materializeTenantRuntimeRevocationJobs({ limit: 10 })).toBe(1);
+      const runtime = (await store.claimTenantRuntimeRevocations({ limit: 10, leaseMs: 120_000,
+        claimToken: `maintenance-runtime-${randomUUID()}`,
+      })).find((row) => row.requestId === request.requestId);
+      if (!runtime) throw new Error("genuine T3b claim missing");
+      expect(await store.completeTenantRuntimeRevocation({ requestId: runtime.requestId,
+        tenantId: runtime.tenantId, subjectGeneration: runtime.subjectGeneration,
+        claimAttempt: runtime.claimAttempt, claimToken: runtime.claimToken }, localFleetProof(runtime)))
+        .not.toBeNull();
+      expect(await store.materializeTenantContentInventoryJobs({ limit: 10 })).toBe(1);
+      const inventory = (await store.claimTenantContentInventories({ limit: 10, leaseMs: 120_000,
+        claimToken: `maintenance-inventory-${randomUUID()}`,
+      })).find((row) => row.requestId === request.requestId);
+      if (!inventory) throw new Error("genuine T3c claim missing");
+      const inventoryAuth = { requestId: inventory.requestId, tenantId: inventory.tenantId,
+        subjectGeneration: inventory.subjectGeneration, buildGeneration: inventory.buildGeneration,
+        claimAttempt: inventory.claimAttempt, claimToken: inventory.claimToken };
+      let done = false;
+      while (!done) done = (await store.buildTenantContentInventoryPage(inventoryAuth, { limit: 100 })).done;
+      expect(await store.sealTenantContentInventory(inventoryAuth)).not.toBeNull();
+      expect(await store.materializeTenantPurgePlanJobs({ limit: 10 })).toBe(1);
+      const plan = (await store.claimTenantPurgePlans({ limit: 10, leaseMs: 120_000,
+        claimToken: `maintenance-plan-${randomUUID()}`,
+      })).find((row) => row.requestId === request.requestId);
+      if (!plan) throw new Error("genuine T3d claim missing");
+      // MySQL T3d's final DB-millisecond floor is independent of caller time.
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      expect(await store.sealTenantPurgePlan({ requestId: plan.requestId, tenantId: plan.tenantId,
+        subjectGeneration: plan.subjectGeneration, buildGeneration: plan.buildGeneration,
+        claimAttempt: plan.claimAttempt, claimToken: plan.claimToken })).not.toBeNull();
+      expect(await store.getTenantTelemetryRetainedSourceCatalogReceipt(
+        request.tenantId, request.requestId,
+      )).toMatchObject({ sourceCount: 6, entryCount: 1, persistedProviderV2Count: 1 });
+      expect(await store.materializeTenantPurgeExecutionJobs({ limit: 10 })).toBe(1);
+      const execution = (await store.claimTenantPurgeExecutions({ limit: 10, leaseMs: 120_000,
+        claimToken: `maintenance-execution-${randomUUID()}`,
+      })).find((row) => row.requestId === request.requestId);
+      if (!execution) throw new Error("genuine T3e claim missing");
+      const executionAuth = { requestId: execution.requestId, tenantId: execution.tenantId,
+        subjectGeneration: execution.subjectGeneration, planBuildGeneration: execution.planBuildGeneration,
+        executionGeneration: execution.executionGeneration,
+        claimAttempt: execution.claimAttempt, claimToken: execution.claimToken };
+      expect(await store.executeTenantPurgeLocalCutover(executionAuth)).not.toBeNull();
+      const [ledger] = await conn.query<RowDataPacket[]>(
+        "SELECT COUNT(*) AS n FROM usage_ledger WHERE BINARY tenant_id=BINARY ?", [request.tenantId]);
+      expect(Number(ledger[0]?.n)).toBe(0);
+      expect(await store.getTenantTelemetryRetainedSourceUsageReleaseReceipt(
+        request.tenantId, request.requestId,
+      )).toMatchObject({ entryCount: 1, retainedBillingFactCount: 1,
+        allDomainsComplete: false, contentPurgeExecuted: false });
+      if (phase === "usage_released") return { targetOrdinal: pending.target.targetOrdinal, remoteEntry };
+
+      expect(await store.sealTenantPurgeLocalPhysicalAcks(executionAuth)).not.toBeNull();
+      expect(await store.materializeTenantDatabasePurgeJobs({ limit: 10 })).toBe(1);
+      const database = (await store.claimTenantDatabasePurges({ limit: 10, leaseMs: 120_000,
+        claimToken: `maintenance-database-${randomUUID()}`,
+      })).find((row) => row.requestId === request.requestId);
+      if (!database) throw new Error("genuine T3f claim missing");
+      expect(await store.executeTenantDatabasePurge({ requestId: database.requestId,
+        tenantId: database.tenantId, subjectGeneration: database.subjectGeneration,
+        planBuildGeneration: database.planBuildGeneration,
+        executionGeneration: database.executionGeneration,
+        databasePurgeGeneration: database.databasePurgeGeneration,
+        claimAttempt: database.claimAttempt, claimToken: database.claimToken })).not.toBeNull();
+      expect(await store.getTenantTelemetryRetainedSourceCanonicalClosureReceipt(
+        request.tenantId, request.requestId,
+      )).toMatchObject({ allDomainsComplete: false, contentPurgeExecuted: false });
+      const [sessions] = await conn.query<RowDataPacket[]>(
+        "SELECT COUNT(*) AS n FROM sessions WHERE BINARY tenant_id=BINARY ?", [request.tenantId]);
+      expect(Number(sessions[0]?.n)).toBe(0);
+      return { targetOrdinal: pending.target.targetOrdinal, remoteEntry };
+    }
+
+    async function prepared(store: MysqlSessionStore, conn?: Connection,
+      sourcePhase: RetainedSourcePhase = "fresh") {
+      // One genuine local business source makes the 49-family comparison
+      // nonempty. This fixture is not external S3/fleet proof.
+      const tenantId = `tenant-${randomUUID()}`, userId = `user-${randomUUID()}`;
+      if (sourcePhase !== "fresh") {
+        await store.createApiKey(tenantId, `key-${tenantId}`, `hash-${tenantId}`);
+        await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
+        await store.putRetentionPolicy({ tenantId, policyVersion: "maintenance-zero-day",
+          policy: retainedPolicy(), actorKeyId: "maintenance-local-policy-admin", atMs: Date.now() });
+        await store.activateRetentionPolicy({ tenantId, policyVersion: "maintenance-zero-day",
+          expectedControlGeneration: 0, actorKeyId: "maintenance-local-policy-admin", atMs: Date.now() });
+        await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+      }
+      const step = await captureStepFixture(store, { tenantId, userId });
+      await store.commitPersistedProviderStepFailure(step.input);
+      let publication: Awaited<ReturnType<typeof advanceRetainedSource>> | null = null;
+      if (sourcePhase !== "fresh") {
+        if (!conn) throw new Error("retained source fixture requires its own SQL connection");
+        publication = await advanceRetainedSource(store, conn, step, sourcePhase);
+      }
+      const { entry, checkpointSha256 } = await available(store);
+      const control = await store.getTenantBackupCatalogControl();
+      if (control.state !== "active") throw new Error("fixture catalog inactive");
+      const restoreRunId = `restore_${randomUUID()}`;
+      const runtimeEpochSha256 = tenantRestoreRuntimeEpochSha256(`maintenance-epoch-${restoreRunId}`);
+      const identity = { backupId: entry.backupId, restoreRunId, entrySha256: entry.entrySha256,
+        runtimeEpochSha256 };
+      const reservationOperationSha256 = tenantBackupRuntimeReservationOperationSha256(identity);
+      const reservationReceiptSha256 = tenantBackupReservationReceiptSha256({
+        adapterProtocol: control.adapterProtocol, catalogNamespaceSha256: control.catalogNamespaceSha256,
+        catalogTargetSha256: control.catalogTargetSha256, failureDomainSha256: control.failureDomainSha256,
+      }, identity, reservationOperationSha256);
+      const reservation: TenantBackupRuntimeReservationAdapterResult = {
+        adapterProtocol: control.adapterProtocol, catalogNamespaceSha256: control.catalogNamespaceSha256,
+        catalogTargetSha256: control.catalogTargetSha256, ...identity,
+        reservationOperationSha256, reservationReceiptSha256,
+        ...eventProof(2, entry.catalogEventRootSha256, "restore_reserved",
+          reservationOperationSha256, reservationReceiptSha256),
+      };
+      const input = { backupId: entry.backupId, restoreRunId, runtimeEpochSha256,
+        controlEvidenceSha256: control.journalControlEvidenceSha256,
+        sealedTargets: await store.getTenantRestoreRuntimeHeads(), reservation,
+        captureCheckpointSha256: checkpointSha256 };
+      const result = await store.prepareTenantRestoreReplayFromBackup(input);
+      expect(result.disposition).toBe("created");
+      const selector: TenantTelemetryCaptureRestoreMaintenanceSelector = {
+        backupId: entry.backupId, restoreRunId, checkpointSha256,
+        artifactManifestSha256: entry.artifactManifestSha256,
+        sourceSnapshotSha256: entry.sourceSnapshotSha256,
+        providerEvidenceSha256: entry.providerEvidenceSha256,
+        reservationSha256: result.value.reservation.reservationSha256,
+        reservationReceiptSha256: result.value.reservation.reservationReceiptSha256,
+        fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
+      };
+      return { selector, step, publication };
+    }
+
+    it("cold verify-only maintenance seals one exact run then atomically publishes immutable history with runtime activation", async () => {
+      const f = await fixture();
+      let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
+      try {
+        const { selector, step } = await prepared(f.store);
+        await expect(MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
+          tenantTelemetryRefKey: captureRefKey })).rejects.toThrow();
+        await expect(f.store.activateTenantRestoreRuntime({ restoreRunId: selector.restoreRunId,
+          expectedControlGeneration: 1 })).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
+          url: f.url, tenantTelemetryRefKey: captureRefKey, selector });
+        expect(Object.isFrozen(maintenance)).toBe(true);
+        expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.phase).toBe("prepared");
+        expect(await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt()).toBeNull();
+        await expect(maintenance.getTenantRestoreReplayRun(`restore_${randomUUID()}`))
+          .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        const replay = await maintenance.sealTenantRestoreReplay(selector.restoreRunId);
+        expect(replay).not.toBeNull();
+        expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.phase).toBe("replay_sealed");
+        const current = await maintenance.getTenantRestoreRuntimeControl();
+        if (current.state !== "active") throw new Error("fixture runtime inactive");
+        const activated = await maintenance.activateTenantRestoreRuntime({
+          restoreRunId: selector.restoreRunId, expectedControlGeneration: current.controlGeneration });
+        expect(activated.state).toBe("active");
+        const history = await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt();
+        expect(history).toMatchObject({ phase: "active", backupId: selector.backupId,
+          checkpointSha256: selector.checkpointSha256, restoreRunId: selector.restoreRunId,
+          historyReadOnly: true, writeAuthorized: false, executionReady: false,
+          externalAuthorityVerified: false, erasureAuthorized: false,
+          allDomainsComplete: false, contentPurgeExecuted: false });
+        const [rows] = await f.conn.query<RowDataPacket[]>(`SELECT history_receipt_sha256
+          FROM tenant_telemetry_capture_restore_history_receipts WHERE BINARY restore_run_id=BINARY ?`,
+        [selector.restoreRunId]);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.history_receipt_sha256).toBe(history!.receiptSha256);
+        expect(await maintenance.activateTenantRestoreRuntime({ restoreRunId: selector.restoreRunId,
+          expectedControlGeneration: current.controlGeneration })).toEqual(activated);
+        expect(await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt()).toEqual(history);
+        // The normal primary-only startup must not turn this historical receipt
+        // into permission to resume new provider writes or destructive T3e/T3f.
+        await expect(MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
+          tenantTelemetryRefKey: captureRefKey })).rejects.toThrow();
+        expect(step.session.tenantId).not.toBe(history!.backupId);
+      } finally { await maintenance?.close(); await f.close(); }
+    });
+
+    for (const sourcePhase of ["live", "usage_released", "canonical_closed"] as const) {
+      it(`seals actual ${sourcePhase} retained-source rows after a primary journal-head advance and restores historical read-only lineage`, async () => {
+        const f = await fixture();
+        let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
+        try {
+          const { selector, step, publication } = await prepared(f.store, f.conn, sourcePhase);
+          if (!publication) throw new Error("genuine primary publication entry missing");
+          const [prior] = await f.conn.query<RowDataPacket[]>(`SELECT control_generation,update_kind,lineage_kind
+            FROM tenant_restore_runtime_events ORDER BY control_generation`);
+          expect(prior.map((row) => row.update_kind)).toEqual([
+            "primary_activation", "journal_head_advance",
+          ]);
+          expect(prior.every((row) => row.lineage_kind === "primary")).toBe(true);
+          const [actual] = await f.conn.query<RowDataPacket[]>(`SELECT
+              (SELECT COUNT(*) FROM sessions WHERE BINARY tenant_id=BINARY ?) AS sessions,
+              (SELECT COUNT(*) FROM usage_ledger WHERE BINARY tenant_id=BINARY ?) AS operational_usage,
+              (SELECT COUNT(*) FROM billing_usage_facts WHERE BINARY tenant_id=BINARY ?) AS billing_facts,
+              (SELECT COUNT(*) FROM tenant_purge_session_grave_markers WHERE BINARY tenant_id=BINARY ?) AS graves`,
+          [step.session.tenantId, step.session.tenantId, step.session.tenantId, step.session.tenantId]);
+          expect(actual).toHaveLength(1);
+          expect(Number(actual[0]!.sessions)).toBe(sourcePhase === "canonical_closed" ? 0 : 1);
+          expect(Number(actual[0]!.operational_usage)).toBe(sourcePhase === "live" ? 1 : 0);
+          expect(Number(actual[0]!.billing_facts)).toBe(1);
+          expect(Number(actual[0]!.graves)).toBe(sourcePhase === "canonical_closed" ? 1 : 0);
+          maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
+            url: f.url, tenantTelemetryRefKey: captureRefKey, selector,
+          });
+          expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.phase).toBe("prepared");
+          if (sourcePhase === "live") {
+            let getterReads = 0;
+            await expect(maintenance.recordTenantRestoreReplayFence({
+              get restoreRunId() {
+                return getterReads++ === 0 ? selector.restoreRunId : `restore_${randomUUID()}`;
+              }, ...publication,
+            })).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+            expect(getterReads).toBe(0);
+            expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.entryCount).toBe(0);
+          }
+          // Replay the exact already-committed 0030 remote entry in ordinal
+          // order. A nonzero sealed primary head may never be sealed from a
+          // guessed zero-entry restore transcript.
+          expect(await maintenance.recordTenantRestoreReplayFence({
+            restoreRunId: selector.restoreRunId, ...publication,
+          })).toMatchObject({ remoteSequence: publication.remoteEntry.remoteSequence,
+            recordSha256: publication.remoteEntry.record.recordSha256 });
+          expect(await maintenance.sealTenantRestoreReplay(selector.restoreRunId)).not.toBeNull();
+          const runtime = await maintenance.getTenantRestoreRuntimeControl();
+          if (runtime.state !== "active" || runtime.lineageKind !== "primary") {
+            throw new Error("fixture original primary runtime missing");
+          }
+          if (sourcePhase === "live") {
+            let getterReads = 0;
+            await expect(maintenance.activateTenantRestoreRuntime({
+              get restoreRunId() {
+                return getterReads++ === 0 ? selector.restoreRunId : `restore_${randomUUID()}`;
+              }, expectedControlGeneration: runtime.controlGeneration,
+            })).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+            expect(getterReads).toBe(0);
+            expect((await maintenance.getTenantRestoreReplayRun(selector.restoreRunId))?.phase)
+              .toBe("replay_sealed");
+          }
+          const activated = await maintenance.activateTenantRestoreRuntime({
+            restoreRunId: selector.restoreRunId, expectedControlGeneration: runtime.controlGeneration,
+          });
+          if (activated.state !== "active") throw new Error("restore activation did not publish");
+          expect(activated.lineageKind).toBe("restore");
+          const history = await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt();
+          expect(history).toMatchObject({ backupId: selector.backupId,
+            restoreRunId: selector.restoreRunId, checkpointSha256: selector.checkpointSha256,
+            phase: "active", historyReadOnly: true, writeAuthorized: false,
+            executionReady: false, externalAuthorityVerified: false, erasureAuthorized: false,
+            allDomainsComplete: false, contentPurgeExecuted: false });
+          await maintenance.close(); maintenance = undefined;
+          maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
+            url: f.url, tenantTelemetryRefKey: captureRefKey, selector,
+          });
+          expect(await maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt()).toEqual(history);
+          await expect(MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
+            tenantTelemetryRefKey: captureRefKey })).rejects.toThrow();
+        } finally { await maintenance?.close(); await f.close(); }
+      });
+    }
+
+    it("two cold facades serialize the same run under effective RR even when their sessions default to RC", async () => {
+      const f = await fixture();
+      const facades: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>>[] = [];
+      const pools: ReturnType<typeof mysql.createPool>[] = [];
+      const sessionInitializers: Promise<void>[] = [];
+      let releaseBarrier = false;
+      let promises: Promise<{ ok: true; value: unknown } | { ok: false; error: unknown }>[] = [];
+      try {
+        const { selector } = await prepared(f.store);
+        const originalCreatePool = mysql.createPool.bind(mysql);
+        const spy = vi.spyOn(mysql, "createPool").mockImplementation((options) => {
+          const pool = originalCreatePool(options);
+          pools.push(pool);
+          // This is a private test-pool session default, never SET GLOBAL or
+          // a production store option. Native connection command ordering
+          // queues this initializer ahead of the factory's first query.
+          pool.pool.on("connection", (connection) => {
+            sessionInitializers.push(new Promise<void>((resolve, reject) => {
+              connection.query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", (error) => {
+                if (error) reject(error); else resolve();
+              });
+            }));
+          });
+          return pool;
+        });
+        try {
+          for (let index = 0; index < 2; index++) {
+            facades.push(await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
+              url: f.url, connectionLimit: 1, tenantTelemetryRefKey: captureRefKey, selector,
+            }));
+          }
+        } finally { spy.mockRestore(); }
+        expect(pools).toHaveLength(2);
+        await Promise.all(sessionInitializers);
+        for (const pool of pools) {
+          const own = await pool.getConnection();
+          try {
+            const [rows] = await own.query<RowDataPacket[]>(
+              "SELECT @@SESSION.transaction_isolation AS isolation_level");
+            expect(rows[0]?.isolation_level).toBe("READ-COMMITTED");
+          } finally { own.release(); }
+        }
+        expect(await facades[0]!.sealTenantRestoreReplay(selector.restoreRunId)).not.toBeNull();
+        const runtime = await facades[0]!.getTenantRestoreRuntimeControl();
+        if (runtime.state !== "active") throw new Error("fixture primary runtime missing");
+        await f.conn.beginTransaction();
+        const [held] = await f.conn.query<RowDataPacket[]>(`SELECT restore_run_id
+          FROM tenant_restore_replay_runs WHERE BINARY restore_run_id=BINARY ? FOR UPDATE`,
+        [selector.restoreRunId]);
+        expect(held).toHaveLength(1);
+        const input = { restoreRunId: selector.restoreRunId,
+          expectedControlGeneration: runtime.controlGeneration };
+        promises = facades.map((facade) => facade.activateTenantRestoreRuntime(input).then(
+          (value) => ({ ok: true as const, value }),
+          (error: unknown) => ({ ok: false as const, error }),
+        ));
+        const deadline = Date.now() + 10_000;
+        let observed = false;
+        while (Date.now() < deadline) {
+          const [waiters] = await admin.query<RowDataPacket[]>(`SELECT
+              COUNT(DISTINCT w.REQUESTING_THREAD_ID) AS waiting_transactions,
+              COUNT(DISTINCT CASE WHEN t.trx_isolation_level='REPEATABLE READ'
+                THEN w.REQUESTING_THREAD_ID END) AS rr_transactions
+            FROM performance_schema.data_lock_waits w
+            JOIN performance_schema.data_locks l
+              ON l.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID
+            JOIN performance_schema.threads p
+              ON p.THREAD_ID=w.REQUESTING_THREAD_ID
+            JOIN information_schema.innodb_trx t
+              ON t.trx_mysql_thread_id=p.PROCESSLIST_ID
+            WHERE BINARY l.OBJECT_SCHEMA=BINARY ?
+              AND BINARY l.OBJECT_NAME=BINARY 'tenant_restore_replay_runs'
+              AND BINARY l.INDEX_NAME=BINARY 'PRIMARY'`, [f.name]);
+          if (Number(waiters[0]?.waiting_transactions) === 2) {
+            expect(Number(waiters[0]?.rr_transactions)).toBe(2);
+            observed = true;
+            break;
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        }
+        expect(observed).toBe(true);
+        await f.conn.commit(); releaseBarrier = true;
+        const outcomes = await Promise.all(promises);
+        expect(outcomes.every((outcome) => outcome.ok)).toBe(true);
+        if (!outcomes[0]?.ok || !outcomes[1]?.ok) throw new Error("same-run activation did not converge");
+        expect(outcomes[0].value).toEqual(outcomes[1].value);
+        const firstHistory = await facades[0]!.getTenantTelemetryCaptureRestoreHistoryReceipt();
+        expect(firstHistory).not.toBeNull();
+        expect(await facades[1]!.getTenantTelemetryCaptureRestoreHistoryReceipt()).toEqual(firstHistory);
+        const [rows] = await f.conn.query<RowDataPacket[]>(`SELECT
+            (SELECT COUNT(*) FROM tenant_telemetry_capture_restore_history_receipts) AS history_count,
+            (SELECT COUNT(*) FROM tenant_restore_runtime_events
+              WHERE update_kind='restore_activation') AS activation_count`);
+        expect(Number(rows[0]?.history_count)).toBe(1);
+        expect(Number(rows[0]?.activation_count)).toBe(1);
+      } finally {
+        if (!releaseBarrier) await f.conn.rollback().catch(() => {});
+        if (promises.length) await Promise.allSettled(promises);
+        await Promise.all(facades.map((facade) => facade.close()));
+        await f.close();
+      }
+    });
+
+    it("rejects a wrong selected checkpoint or protected key before exposing the maintenance facade", async () => {
+      const f = await fixture();
+      try {
+        const { selector } = await prepared(f.store);
+        await expect(MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
+          url: f.url, tenantTelemetryRefKey: captureRefKey,
+          selector: { ...selector, checkpointSha256: h("wrong checkpoint") },
+        })).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
+        await expect(MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
+          url: f.url, tenantTelemetryRefKey: new Uint8Array(32).fill(7), selector,
+        })).rejects.toThrow();
+        const [rows] = await f.conn.query<RowDataPacket[]>(
+          "SELECT restore_run_id FROM tenant_telemetry_capture_restore_history_receipts");
+        expect(rows).toHaveLength(0);
+      } finally { await f.close(); }
+    });
+
+    it("a late history INSERT error rolls back actual runtime event, head, run and receipt together", async () => {
+      const f = await fixture();
+      let maintenance: Awaited<ReturnType<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>> | undefined;
+      const guard = "trg_test_mtc_history_late_reject";
+      try {
+        const { selector } = await prepared(f.store);
+        maintenance = await MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance({
+          url: f.url, tenantTelemetryRefKey: captureRefKey, selector });
+        expect(await maintenance.sealTenantRestoreReplay(selector.restoreRunId)).not.toBeNull();
+        const before = await maintenance.getTenantRestoreRuntimeControl();
+        if (before.state !== "active") throw new Error("fixture runtime inactive");
+        const [beforeEvents] = await f.conn.query<RowDataPacket[]>(
+          "SELECT COUNT(*) AS n FROM tenant_restore_runtime_events");
+        await f.conn.query(`CREATE TRIGGER \`${guard}\` BEFORE INSERT ON
+          tenant_telemetry_capture_restore_history_receipts FOR EACH ROW
+          SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='isolated late history reject'`);
+        await expect(maintenance.activateTenantRestoreRuntime({ restoreRunId: selector.restoreRunId,
+          expectedControlGeneration: before.controlGeneration })).rejects.toThrow();
+        const [afterEvents] = await f.conn.query<RowDataPacket[]>(
+          "SELECT COUNT(*) AS n FROM tenant_restore_runtime_events");
+        const [runRows] = await f.conn.query<RowDataPacket[]>(
+          "SELECT phase FROM tenant_restore_replay_runs WHERE BINARY restore_run_id=BINARY ?",
+        [selector.restoreRunId]);
+        const [historyRows] = await f.conn.query<RowDataPacket[]>(
+          "SELECT restore_run_id FROM tenant_telemetry_capture_restore_history_receipts");
+        expect(afterEvents).toEqual(beforeEvents);
+        expect(runRows).toHaveLength(1);
+        expect(runRows[0]!.phase).toBe("replay_sealed");
+        expect(historyRows).toHaveLength(0);
+        expect(await maintenance.getTenantRestoreRuntimeControl()).toEqual(before);
+      } finally {
+        await f.conn.query(`DROP TRIGGER IF EXISTS \`${guard}\``);
+        await maintenance?.close(); await f.close();
+      }
+    });
+  });
+} else {
+  describe.skip("0056 capture restore maintenance requires local MySQL integration", () => {
+    it("requires the explicit integration profile", () => {});
+  });
+}

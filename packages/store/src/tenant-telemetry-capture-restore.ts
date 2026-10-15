@@ -1,5 +1,9 @@
 import { createHash, createHmac } from "node:crypto";
 import { tenantTelemetryRefKeyIdSha256 } from "./tenant-telemetry-lifecycle.js";
+import {
+  validateTenantRestoreJournalControlRecord, validateTenantRestoreRuntimeControlRecord,
+  type TenantRestoreJournalControlRecord, type TenantRestoreRuntimeControlRecord,
+} from "./tenant-restore-journal.js";
 
 /**
  * Content-free codecs, NOT a database/source verifier or an operator capability.
@@ -329,6 +333,32 @@ function canonical(value: unknown): string {
 }
 function hash(scope: string, value: unknown): string {
   return createHash("sha256").update(scope).update("\0").update(canonical(value)).digest("hex");
+}
+
+/** Stable restore-lineage identity; does not broaden the published primary
+ * helper. The store must separately prove the immutable activation event and
+ * complete current runtime chain. Legitimate journal/head advancement must not
+ * change this identity, nor authorize capture writes without explicit cutover. */
+export function tenantTelemetryCaptureRestoreRuntimeBindingSha256(
+  runtime: TenantRestoreRuntimeControlRecord,
+  journal: TenantRestoreJournalControlRecord,
+): string {
+  try {
+    validateTenantRestoreRuntimeControlRecord(runtime);
+    validateTenantRestoreJournalControlRecord(journal);
+  } catch { reject(); }
+  requireValue(runtime.state === "active" && runtime.lineageKind === "restore" && journal.controlGeneration === 1);
+  if (runtime.state !== "active" || runtime.lineageKind !== "restore" || journal.controlGeneration !== 1) return reject();
+  requireValue(runtime.controlEvidenceSha256 === journal.evidenceSha256
+    && runtime.logicalDatabaseNamespaceSha256 === journal.logicalDatabaseNamespaceSha256
+    && runtime.targetRootSha256 === journal.targetRootSha256 && runtime.targetCount === journal.targetCount);
+  return hash("tenant-telemetry-capture-restore-runtime-binding-v1", {
+    lineageKind: "restore", restoreRunId: runtime.restoreRunId,
+    replayReceiptSha256: runtime.replayReceiptSha256, runtimeEpochSha256: runtime.runtimeEpochSha256,
+    journalControlEvidenceSha256: journal.evidenceSha256,
+    logicalDatabaseNamespaceSha256: runtime.logicalDatabaseNamespaceSha256,
+    journalTargetRootSha256: journal.targetRootSha256, targetCount: journal.targetCount,
+  });
 }
 function validateDigests(value: Record<string, unknown>, nullable: readonly string[] = []): void {
   for (const [key, child] of Object.entries(value)) {

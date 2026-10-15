@@ -36,6 +36,8 @@ import {
   type TenantRestoreJournalAdapter,
   type TenantRestoreReplaySealedTarget,
   type TenantTelemetryCaptureBackupCheckpointStore,
+  type TenantTelemetryCaptureRestoreMaintenance,
+  type MysqlTenantTelemetryCaptureRestoreMaintenanceOptions,
 } from "@agent-service/store";
 import { z } from "zod";
 import * as mysqlArtifact from "./mysql-backup-artifact.js";
@@ -116,6 +118,9 @@ export interface BackupCatalogCliDependencies {
     tenantTelemetryCaptureRestoreLocalOnly?: boolean;
     operationAbortSignal?: AbortSignal;
   }): Promise<BackupCatalogCliStore>;
+  connectCaptureRestoreMaintenance?(
+    options: MysqlTenantTelemetryCaptureRestoreMaintenanceOptions,
+  ): Promise<TenantTelemetryCaptureRestoreMaintenance>;
   loadCatalogConfig(
     env: NodeJS.ProcessEnv,
     context: Parameters<typeof loadTenantBackupCatalogConfig>[1],
@@ -202,6 +207,11 @@ function artifactBudget(env: NodeJS.ProcessEnv, dependencies: BackupCatalogCliDe
   const expiresAt = now() + timeoutMs;
   const controller = new AbortController();
   const pending = new Set<Promise<unknown>>();
+  const track = <T>(task: Promise<T>): Promise<T> => {
+    pending.add(task);
+    void task.then(() => pending.delete(task), () => pending.delete(task));
+    return task;
+  };
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const remaining = () => {
     const value = Math.floor(expiresAt - now());
@@ -223,16 +233,19 @@ function artifactBudget(env: NodeJS.ProcessEnv, dependencies: BackupCatalogCliDe
       controller.signal.addEventListener("abort", onAbort, { once: true });
       removeAbortListener = () => controller.signal.removeEventListener("abort", onAbort);
     });
-    const task = Promise.resolve().then(() => { remaining(); return operation(); }).then(async (value) => {
+    const task = track(Promise.resolve().then(() => { remaining(); return operation(); }).then(async (value) => {
       if (abandoned && lateDispose) await lateDispose(value);
       return value;
-    });
-    pending.add(task);
-    void task.finally(() => pending.delete(task)).catch(() => {});
+    }));
     try {
       const result = await Promise.race([task, interrupted]);
       try { remaining(); } catch (error) {
-        if (lateDispose) await boundedCleanup(() => lateDispose(result));
+        if (lateDispose) {
+          // The operation has already settled, so this disposal is not part of
+          // task. Keep it in the same settlement barrier as all native closes.
+          const disposal = track(Promise.resolve().then(() => lateDispose(result)));
+          await boundedCleanup(() => disposal);
+        }
         throw error;
       }
       return result;
@@ -245,12 +258,13 @@ function artifactBudget(env: NodeJS.ProcessEnv, dependencies: BackupCatalogCliDe
     check: () => { remaining(); },
     assertBeforeDeadline: () => { if (now() >= expiresAt) throw cliError("operation_deadline"); },
     abort: () => { if (deadlineTimer) clearTimeout(deadlineTimer); controller.abort(); },
+    trackCleanup: (operation: () => Promise<void>) => track(Promise.resolve().then(operation)),
     settled: () => Promise.allSettled([...pending]),
   };
 }
 type AsyncStep = <T>(operation: () => Promise<T>) => Promise<T>;
 const unlimitedStep: AsyncStep = (operation) => operation();
-/** Cleanup has a separate small ceiling, never an unbounded wait after the operation deadline. */
+/** Only the foreground wait is bounded; ownership remains with the real cleanup promise. */
 async function boundedCleanup(operation: () => Promise<unknown>): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -259,6 +273,13 @@ async function boundedCleanup(operation: () => Promise<unknown>): Promise<boolea
       new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), 250); }),
     ]);
   } finally { if (timer) clearTimeout(timer); }
+}
+/** Settlement is a resource barrier, not a first-rejection race. A rejected
+ * close remains a failure, not proof of transport cancellation, and cannot
+ * hide another close that is still live. */
+async function closeAllSettled(resources: readonly ({ close(): Promise<void> } | undefined)[]): Promise<void> {
+  const results = await Promise.allSettled(resources.map((resource) => closeSafely(resource)));
+  if (results.some((result) => result.status === "rejected")) throw cliError("operation_failed");
 }
 const ResolveRestoreEnv = z.object({
   RESTORE_RUN_ID: z.string().regex(RESTORE_RUN_ID),
@@ -275,6 +296,7 @@ const RecordEvictionEnv = EvictionEnv.extend({
 
 const DEFAULT_DEPENDENCIES: BackupCatalogCliDependencies = {
   connectStore: (options) => MysqlSessionStore.connect(options),
+  connectCaptureRestoreMaintenance: (options) => MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options),
   loadCatalogConfig: (env, context) => loadTenantBackupCatalogConfig(env, context),
   createCatalogAdapter: (config, options) => createTenantBackupCatalogAdapter(config, options),
   loadJournalConfig: (env, context) => loadTenantRestoreJournalConfig(env, context),
@@ -632,6 +654,7 @@ async function runArtifactCommand(
   let adapterResource: TenantBackupCatalogAdapter | undefined;
   let journalResources: readonly RestoreAdapter[] = [];
   let targetStore: BackupCatalogCliStore | undefined;
+  let targetMaintenance: TenantTelemetryCaptureRestoreMaintenance | undefined;
   let operator: Awaited<ReturnType<typeof operations.acquireMySqlBackupArtifactOperator>> | undefined;
   let verified: Awaited<ReturnType<typeof operations.verifyMySqlBackupArtifact>> | undefined;
   let summary: string | undefined;
@@ -753,6 +776,13 @@ async function runArtifactCommand(
           artifactVerified: true, ...verified!.evidence, entrySha256: entry.entrySha256 });
       } else {
         const selected = restore!;
+        // A selected v2 target must remain auditable after prepare makes normal
+        // runtime startup fail closed. Require this capability before consuming
+        // the external epoch or importing any bytes, not after the fact.
+        if (verified.manifest.version === 2
+          && (refKey === undefined || !dependencies.connectCaptureRestoreMaintenance)) {
+          throw cliError("invalid_configuration");
+        }
         operator = await acquire(() => operations.acquireMySqlBackupArtifactOperator({
           sourceUrl: mysql.MYSQL_URL, targetUrl: selected.BACKUP_RESTORE_TARGET_MYSQL_URL,
           artifactDirectory: common.artifactDirectory, localOnlyAck: true, fleetStoppedAck: true,
@@ -801,6 +831,35 @@ async function runArtifactCommand(
           throw cliError("invalid_durable_state");
         }
         const prepared = await prepareSelectedRestore(target, adapter, config, journalConfig!, journalAdapters, prepare, step);
+        if (verified.manifest.version === 2) {
+          const checkpointSha256 = verified.manifest.captureCheckpoint.checkpointSha256;
+          // Drop the pre-prepare general store, then cold-open only an exact-run
+          // facade while the authenticated artifact and operator locks remain
+          // held. This does not replay fences, activate runtime, or grant writes.
+          await step(() => target.close());
+          targetStore = undefined;
+          targetMaintenance = await acquire(() => dependencies.connectCaptureRestoreMaintenance!({
+            url: selected.BACKUP_RESTORE_TARGET_MYSQL_URL, connectionLimit: 2,
+            tenantTelemetryRefKey: refKey!, operationAbortSignal: budget.signal,
+            selector: {
+              backupId: settings.BACKUP_ID, restoreRunId: selected.RESTORE_RUN_ID,
+              checkpointSha256,
+              artifactManifestSha256: verified!.evidence.artifactManifestSha256,
+              sourceSnapshotSha256: verified!.evidence.sourceSnapshotSha256,
+              providerEvidenceSha256: verified!.evidence.providerEvidenceSha256,
+              reservationSha256: prepared.value.reservation.reservationSha256,
+              reservationReceiptSha256: prepared.value.reservation.reservationReceiptSha256,
+              fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1",
+            },
+          }));
+          const maintenance = targetMaintenance;
+          const boundRun = await step(() => maintenance.getTenantRestoreReplayRun(selected.RESTORE_RUN_ID));
+          if (!boundRun || boundRun.phase !== "prepared"
+            || boundRun.runtimeEpochSha256 !== prepared.value.reservation.runtimeEpochSha256
+            || await step(() => maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt()) !== null) {
+            throw cliError("invalid_durable_state");
+          }
+        }
         await step(() => operator!.markRestorePrepared(selected.RESTORE_RUN_ID));
         summary = JSON.stringify({ status: "ok", command, backupId: settings.BACKUP_ID,
           artifactVerified: true, ...verified!.evidence, restoreRunId: selected.RESTORE_RUN_ID,
@@ -817,20 +876,25 @@ async function runArtifactCommand(
   // Abort native clients before releasing the operator locks. In-flight COMMIT/CAS
   // may already have succeeded: cancellation is not a rollback guarantee.
   budget.abort();
-  const nativeClosed = await boundedCleanup(async () => {
-    await Promise.all([
-      closeSafely(targetStore), closeSafely(store), closeSafely(adapterResource),
-      ...journalResources.map((item) => closeSafely(item)),
-    ]);
-  });
+  const nativeClose = budget.trackCleanup(() => closeAllSettled([
+    targetMaintenance, targetStore, store, adapterResource, ...journalResources,
+  ]));
+  const nativeClosed = await boundedCleanup(() => nativeClose);
   const settled = budget.settled();
   const drained = await boundedCleanup(() => settled);
-  const release = async () => { await Promise.all([closeSafely(verified), closeSafely(operator)]); };
-  const released = drained ? await boundedCleanup(release) : false;
-  // Uncooperative injected/custom work must not cause a lock release while it
-  // can still mutate. Its late completion only disposes resources, never advances.
-  if (drained) refKey?.fill(0);
-  else void settled.then(async () => { try { await release(); } finally { refKey?.fill(0); } }).catch(() => {});
+  const release = () => closeAllSettled([verified, operator]);
+  let released = false;
+  if (drained) {
+    const releasing = release();
+    released = await boundedCleanup(() => releasing);
+    if (released) refKey?.fill(0);
+    else void releasing.finally(() => refKey?.fill(0)).catch(() => {});
+  } else {
+    // A 250ms foreground cleanup ceiling is not permission to release locks.
+    // Both successful and rejected native closes must settle, as must every
+    // abandoned operation's late disposal, before this release can start.
+    void settled.then(async () => { try { await release(); } finally { refKey?.fill(0); } }).catch(() => {});
+  }
   if (operationError !== undefined) throw operationError;
   if (!nativeClosed || !drained || !released || summary === undefined) {
     throw withRestoreBoundary(cliError("operation_failed"));

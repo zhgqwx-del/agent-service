@@ -476,3 +476,13 @@ migration 不回填、不激活 control、不联网、不执行业务 DELETE；�
 新 family 的 SQL root 聚合固定上限为 **1 MiB**，超限 fail closed、不截断，也不能靠环境或放大 session budget 绕过；临时 session budget 必须恢复，恢复失败丢弃该连接，COMMIT 后响应丢失只能 exact replay，不能宣称远端回滚。全七源范围锁、跨 tenant 写阻塞、N+1/重复全图审计、大 JSON/packet/内存及 lease/死锁容量仍需专门压测；1205/1213 保持可重试，不永久伪装为完整性冲突。
 
 原 primary 的这条本地链不以前置完成 active-capture restore 为条件，也**不证明新 epoch 恢复已完成**。恢复后仍必须有独立 versioned backup/run/head/epoch 许可与 source-preservation/replay 协议，旧 receipt 不自动 rebind；丢失备份后新增 source 不能猜造。telemetry 对象保留、trusted grant、外部 marker/head、物理处置/retention/restore、真实 managed IAM/KMS 与独立故障域验收、普通 session/user purge 和全域 completion 均仍是后续工作。本地/历史 ACK 夹具只证明实际数据库状态，不能外推真实外部 sink 字节、fleet 排空或云验收。
+
+## 14. 0055/0056 active-capture 恢复的本地实现边界（未发布）
+
+0055 将来源封存与删除资格分开：Memory/MySQL 从真实来源生成固定49类 checkpoint 及不可变逐行 keyed HMAC 叶子，合法 queued/reserved/written/blocked/legacy-unknown 都可以被备份，不以0054的“完整ACK、零unknown”作为备份前提。Memory语义 envelope 与 MySQL物理行 envelope 不互认。新 MySQL 加密制品 v2 在 manifest 与 GCM AAD 中绑定完整 checkpoint；新 dump 在 seal 前确认实际 store pool 与 operator 的 server UUID/database 相同，再检查导出窗口前后来源不漂移。已有制品 exact replay 只验证认证字节和不可变历史，不因今日 catalog head 前进而重新 seal。v1字节与旧收据不改。
+
+0031 的显式选定 checkpoint 与真实 source binding/reservation、0030 prepare、新0055 sidecar 在同一原子边界提交，缺证据不补造。0056 提供只面向该 run 的冻结维护 facade，不暴露一般 SessionStore、prepare、primary activation 或 capture/deletion 方法。factory 独立 verify-only cold-open；caller selector 只是期望身份，不能代替实际 checkpoint、0031/0030 和来源关系校验。MySQL维护 mutation 每次显式RR、先锁指定run再锁49类来源，Memory则在同步原子边界复核；输入只clone一次并对同一副本验run。
+
+0030 activation 与0056只读 history receipt 同事务发布，晚期失败回滚全部 runtime/head/event/run/history。history 绑定真实不可变 `restore_activation` event；后续 publisher 合法推进 current generation/head 不会重签历史。旧 activation/failure/source/write receipt 和 reservation descriptor 都不改。历史只读结果不授予新写、旧 operation recovery 或0054删除许可；普通 active-capture pending 与新epoch普通启动仍 fail closed。当前实际 CLI 消费者仅为 backup-v2 prepare 后的受限 cold-read，不提供已可用的 capture 新epoch恢复操作命令。
+
+0055/0056 是加法式迁移，但严格 schema/trigger 指纹使旧 binary 不能在新 schema 启动：必须先停服排空旧 writer/事务，再独立迁移，只启新 binary、forward-fix，不允许热混跑或删除 marker。定向真实 MySQL/旧二进制历史夹具只证明所覆盖数据库状态；完整加密 MySQL/MinIO 导入→replay→activation→新写/旧pending续跑仍待验收，新epoch显式cutover/逐operation新claim消费者尚未实现。没有新增常驻服务、JavaScript入口或镜像；0037硬拒、外部删除/自动清理关闭和全部全域completion=false保持。实际通过/失败与发布状态以 PROGRESS 最新节为准。

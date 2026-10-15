@@ -10,6 +10,7 @@ import {
   type TenantBackupCatalogAdapter,
   type TenantRestoreJournalAdapter,
   type TenantRestoreJournalTargetDescriptor,
+  type TenantTelemetryCaptureRestoreMaintenance,
 } from "@agent-service/store";
 import {
   formatBackupCatalogCliError,
@@ -304,6 +305,72 @@ async function activateCatalog(state: Harness): Promise<void> {
   await runBackupCatalogCli(["activate"], activateEnv(), state.dependencies);
 }
 
+/** Orchestration only: inactive Memory delegates and partial artifact metadata
+ * do NOT prove 0056 source audit, a real GCM FD, MySQL pool or maintenance grant. */
+async function v2MaintenanceHarness() {
+  const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+  await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+  artifacts.operator.close.mockClear(); artifacts.verifiedClose.mockClear(); state.storeClose.mockClear();
+  // Distinct close identities are necessary: a shared Memory store's generic
+  // close spy alone could not prove that the TARGET was closed before reopen.
+  const targetClose = vi.fn(async () => {});
+  const targetStore = new Proxy(state.store, { get(target, property) {
+    if (property === "close") return targetClose;
+    const value: unknown = Reflect.get(target, property, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } });
+  state.connectStore.mockImplementation(async (options) => options.url === "mysql://fixture@127.0.0.1:3306/isolated_target" ? targetStore : state.store);
+  const checkpointSha256 = sha256("selected-v2-checkpoint");
+  artifacts.verify.mockImplementationOnce(async (input) => ({
+    manifest: { version: 2, anchor: input.expectedAnchor!, schemaMigrationRootSha256: input.expectedAnchor!.schemaMigrationRootSha256,
+      captureCheckpoint: { checkpointSha256 } } as never,
+    evidence: artifacts.evidence, close: artifacts.verifiedClose,
+  }));
+  const preflightDelegate = state.store.preflightTenantRestoreReplayFromBackup.bind(state.store);
+  const prepareDelegate = state.store.prepareTenantRestoreReplayFromBackup.bind(state.store);
+  const preflight = vi.spyOn(state.store, "preflightTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
+    expect(input.captureCheckpointSha256).toBe(checkpointSha256);
+    const { captureCheckpointSha256: _hash, ...legacy } = input; return preflightDelegate(legacy);
+  });
+  const prepare = vi.spyOn(state.store, "prepareTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
+    expect(input.captureCheckpointSha256).toBe(checkpointSha256);
+    const { captureCheckpointSha256: _hash, ...legacy } = input; return prepareDelegate(legacy);
+  });
+  const reserve = vi.spyOn(state.catalogAdapter, "reserveRestore");
+  const observed: string[] = [];
+  const assertHeldResources = (stage: string) => {
+    expect(targetClose).toHaveBeenCalledOnce();
+    expect(state.storeClose).not.toHaveBeenCalled();
+    expect(artifacts.verifiedClose).not.toHaveBeenCalled();
+    expect(artifacts.operator.close).not.toHaveBeenCalled();
+    observed.push(stage);
+  };
+  const unused = async (): Promise<never> => { throw new Error("unexpected maintenance mutation"); };
+  const maintenance = Object.freeze({
+    getTenantRestoreReplayRun: vi.fn((runId: string) => { assertHeldResources("run"); return state.store.getTenantRestoreReplayRun(runId); }),
+    getTenantTelemetryCaptureRestoreHistoryReceipt: vi.fn(async (): ReturnType<TenantTelemetryCaptureRestoreMaintenance["getTenantTelemetryCaptureRestoreHistoryReceipt"]> => {
+      assertHeldResources("history"); return null;
+    }),
+    getTenantRestoreReplaySealedTargets: unused, listTenantRestoreReplayEntries: unused,
+    recordTenantRestoreReplayFence: unused, sealTenantRestoreReplay: unused,
+    abortTenantRestoreReplay: unused, getTenantRestoreReplayReceipt: unused,
+    getTenantRestoreRuntimeControl: unused, getTenantRestoreRuntimeHeads: unused,
+    activateTenantRestoreRuntime: unused, getTenantRestoreJournalControl: unused,
+    getTenantRestoreJournalControlTargets: unused, close: vi.fn(async () => {}),
+  } satisfies TenantTelemetryCaptureRestoreMaintenance);
+  const connectMaintenance = vi.fn(async (_options: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureRestoreMaintenance"]>>[0]): Promise<TenantTelemetryCaptureRestoreMaintenance> => {
+    assertHeldResources("factory"); return maintenance;
+  });
+  state.dependencies.connectCaptureRestoreMaintenance = connectMaintenance;
+  const refKey = Buffer.alloc(32, 17);
+  state.dependencies.readRefKey = async () => refKey;
+  const restoreEnv = (extra: NodeJS.ProcessEnv = {}) => artifactEnv({ RESTORE_RUN_ID,
+    BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID, BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target",
+    TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/fixture-ref-key", ...extra });
+  return { state, artifacts, checkpointSha256, preflight, prepare, reserve, maintenance, connectMaintenance,
+    assertHeldResources, observed, refKey, restoreEnv, targetClose };
+}
+
 async function createAndPublish(
   state: Harness,
   backupId: string,
@@ -480,34 +547,306 @@ describe("backup catalog artifact CLI orchestration", () => {
     expect(artifacts.imported).not.toHaveBeenCalled();
   });
 
-  it("passes only the authenticated selected-v2 hash into preflight before external reservation and same target reprepare", async () => {
-    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
-    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
-    const checkpointSha256 = sha256("selected-v2-checkpoint");
-    artifacts.verify.mockImplementationOnce(async (input) => ({
-      manifest: { version: 2, anchor: input.expectedAnchor!, schemaMigrationRootSha256: input.expectedAnchor!.schemaMigrationRootSha256,
-        captureCheckpoint: { checkpointSha256 } } as never,
-      evidence: artifacts.evidence, close: artifacts.verifiedClose,
-    }));
-    const preflightDelegate = state.store.preflightTenantRestoreReplayFromBackup.bind(state.store);
-    const prepareDelegate = state.store.prepareTenantRestoreReplayFromBackup.bind(state.store);
-    // Deliberately isolate field propagation from active-store authorization:
-    // this fixture has inactive capture, so delegate the old inactive payload.
-    const preflight = vi.spyOn(state.store, "preflightTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
-      expect(input.captureCheckpointSha256).toBe(checkpointSha256);
-      const { captureCheckpointSha256: _hash, ...legacy } = input; return preflightDelegate(legacy);
+  it.each(["success", "cold_open_error"] as const)("binds authenticated v2 to reservation and cold target maintenance: %s", async (outcome) => {
+    const { state, artifacts, checkpointSha256, preflight, prepare, reserve, maintenance, connectMaintenance,
+      assertHeldResources, observed, restoreEnv, targetClose } = await v2MaintenanceHarness();
+    if (outcome === "cold_open_error") connectMaintenance.mockImplementationOnce(async () => {
+      assertHeldResources("factory"); throw new Error("private-cold-target-audit");
     });
-    const prepare = vi.spyOn(state.store, "prepareTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
-      expect(input.captureCheckpointSha256).toBe(checkpointSha256);
-      const { captureCheckpointSha256: _hash, ...legacy } = input; return prepareDelegate(legacy);
-    });
-    const reserve = vi.spyOn(state.catalogAdapter, "reserveRestore");
-    await runBackupCatalogCli(["restore-selected"], artifactEnv({ RESTORE_RUN_ID,
-      BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID, BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target" }), state.dependencies);
+    const invocation = runBackupCatalogCli(["restore-selected"], restoreEnv(), state.dependencies);
+    if (outcome === "cold_open_error") {
+      await expect(invocation).rejects.toMatchObject({ code: "operation_failed",
+        restoreBoundary: { reservationMayBeConsumed: true, targetMayContainPartialImport: true } });
+    } else await expect(invocation).resolves.toBe(0);
     expect(preflight).toHaveBeenCalledTimes(2); expect(prepare).toHaveBeenCalledTimes(2);
     expect(preflight.mock.invocationCallOrder[0]).toBeLessThan(reserve.mock.invocationCallOrder[0]!);
     expect(preflight.mock.invocationCallOrder[1]).toBeLessThan(reserve.mock.invocationCallOrder[1]!);
     expect(prepare.mock.invocationCallOrder[1]).toBeGreaterThan(artifacts.imported.mock.invocationCallOrder[0]!);
+    expect(connectMaintenance).toHaveBeenCalledOnce();
+    expect(connectMaintenance).toHaveBeenCalledWith({
+      url: "mysql://fixture@127.0.0.1:3306/isolated_target", connectionLimit: 2,
+      tenantTelemetryRefKey: expect.any(Buffer), operationAbortSignal: expect.any(AbortSignal),
+      selector: { backupId: BACKUP_ID_1, restoreRunId: RESTORE_RUN_ID, checkpointSha256,
+        artifactManifestSha256: artifacts.evidence.artifactManifestSha256,
+        sourceSnapshotSha256: artifacts.evidence.sourceSnapshotSha256,
+        providerEvidenceSha256: artifacts.evidence.providerEvidenceSha256,
+        reservationSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        reservationReceiptSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+        fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" },
+    });
+    expect(connectMaintenance.mock.invocationCallOrder[0]).toBeGreaterThan(prepare.mock.invocationCallOrder[1]!);
+    expect(targetClose.mock.invocationCallOrder[0]).toBeLessThan(connectMaintenance.mock.invocationCallOrder[0]!);
+    if (outcome === "cold_open_error") {
+      expect(maintenance.getTenantRestoreReplayRun).not.toHaveBeenCalled();
+      expect(maintenance.close).not.toHaveBeenCalled();
+      expect(artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+      expect(artifacts.imported).toHaveBeenCalledOnce();
+      expect(artifacts.verifiedClose).toHaveBeenCalledOnce();
+      expect(observed).toEqual(["factory"]);
+      return;
+    }
+    expect(maintenance.getTenantRestoreReplayRun).toHaveBeenCalledWith(RESTORE_RUN_ID);
+    expect(maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt).toHaveBeenCalledOnce();
+    expect(maintenance.close).toHaveBeenCalledOnce();
+    expect(observed).toEqual(["factory", "run", "history"]);
+    expect(artifacts.operator.markRestorePrepared.mock.invocationCallOrder[0])
+      .toBeGreaterThan(maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt.mock.invocationCallOrder[0]!);
+  });
+
+  it.each(["factory", "ref_key"] as const)("rejects selected v2 without %s before reservation or import", async (missing) => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    artifacts.verify.mockImplementationOnce(async (input) => ({
+      manifest: { version: 2, anchor: input.expectedAnchor!,
+        captureCheckpoint: { checkpointSha256: sha256("selected-v2-checkpoint") } } as never,
+      evidence: artifacts.evidence, close: artifacts.verifiedClose,
+    }));
+    state.dependencies.readRefKey = async () => Buffer.alloc(32, 17);
+    state.dependencies.connectCaptureRestoreMaintenance = vi.fn(async () => { throw new Error("must not connect"); });
+    if (missing === "factory") delete state.dependencies.connectCaptureRestoreMaintenance;
+    const reserve = vi.spyOn(state.catalogAdapter, "reserveRestore");
+    await expect(runBackupCatalogCli(["restore-selected"], artifactEnv({ RESTORE_RUN_ID,
+      BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID,
+      BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target",
+      ...(missing === "ref_key" ? {} : { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/fixture-ref-key" }),
+    }), state.dependencies)).rejects.toMatchObject({ code: "invalid_configuration" });
+    expect(reserve).not.toHaveBeenCalled(); expect(artifacts.imported).not.toHaveBeenCalled();
+    expect(artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+  });
+
+  it("owns a late maintenance factory result and retains GCM/operator/key until its cleanup settles", async () => {
+    const h = await v2MaintenanceHarness();
+    let elapsed = 0;
+    h.state.dependencies.now = () => elapsed;
+    let resolveFactory: ((value: TenantTelemetryCaptureRestoreMaintenance) => void) | undefined;
+    let entered!: () => void;
+    const factoryEntered = new Promise<void>((resolve) => { entered = resolve; });
+    h.connectMaintenance.mockImplementationOnce((options) => {
+      h.assertHeldResources("factory");
+      expect(options.operationAbortSignal?.aborted).toBe(false);
+      entered();
+      return new Promise<TenantTelemetryCaptureRestoreMaintenance>((resolve) => { resolveFactory = resolve; });
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outputBefore = h.state.output.length;
+      // Real artifactBudget code owns the timer/race. Only its clock/timer
+      // transport is synthetic; no alternate timeout implementation is used.
+      const invocation = runBackupCatalogCli(["restore-selected"], h.restoreEnv({ BACKUP_ARTIFACT_DEADLINE_MS: "1000" }), h.state.dependencies);
+      const settled = invocation.then(() => ({ unexpectedSuccess: true }), (error: unknown) => ({ error }));
+      await factoryEntered;
+      expect(h.targetClose.mock.invocationCallOrder[0]).toBeLessThan(h.connectMaintenance.mock.invocationCallOrder[0]!);
+      elapsed = 1_001;
+      await vi.advanceTimersByTimeAsync(1_001);
+      await vi.advanceTimersByTimeAsync(250); // Existing cleanup ceiling, not a widened operation budget.
+      await expect(settled).resolves.toMatchObject({ error: { code: "operation_deadline",
+        restoreBoundary: { reservationMayBeConsumed: true, targetMayContainPartialImport: true } } });
+      expect(h.connectMaintenance.mock.calls[0]![0].operationAbortSignal?.aborted).toBe(true);
+      expect(h.artifacts.imported).toHaveBeenCalledOnce(); expect(h.prepare).toHaveBeenCalledTimes(2);
+      expect(h.maintenance.close).not.toHaveBeenCalled();
+      expect(h.maintenance.getTenantRestoreReplayRun).not.toHaveBeenCalled();
+      expect(h.artifacts.operator.close).not.toHaveBeenCalled(); expect(h.artifacts.verifiedClose).not.toHaveBeenCalled();
+      expect(h.refKey.every((byte) => byte === 17), "pending factory must retain its operator key").toBe(true);
+      expect(h.state.output).toHaveLength(outputBefore); expect(h.artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+      resolveFactory!(h.maintenance);
+      await vi.waitFor(() => {
+        expect(h.maintenance.close).toHaveBeenCalledOnce(); expect(h.artifacts.operator.close).toHaveBeenCalledOnce();
+        expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce(); expect(h.refKey.every((byte) => byte === 0)).toBe(true);
+      });
+      expect(h.maintenance.close.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.operator.close.mock.invocationCallOrder[0]!);
+      expect(h.maintenance.close.mock.invocationCallOrder[0]).toBeLessThan(h.artifacts.verifiedClose.mock.invocationCallOrder[0]!);
+      expect(h.maintenance.getTenantRestoreReplayRun).not.toHaveBeenCalled();
+      expect(h.artifacts.operator.markRestorePrepared).not.toHaveBeenCalled(); expect(h.state.output).toHaveLength(outputBefore);
+    } finally {
+      resolveFactory?.(h.maintenance);
+      await vi.runAllTimersAsync(); vi.useRealTimers();
+    }
+  });
+
+  it("aborts a hung maintenance history getter without releasing held resources or continuing when it later resolves", async () => {
+    const h = await v2MaintenanceHarness();
+    let elapsed = 0;
+    h.state.dependencies.now = () => elapsed;
+    let resolveRead: ((value: null) => void) | undefined;
+    let entered!: () => void;
+    const historyEntered = new Promise<void>((resolve) => { entered = resolve; });
+    h.maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt.mockImplementationOnce(() => {
+      h.assertHeldResources("history"); entered();
+      return new Promise<null>((resolve) => { resolveRead = resolve; });
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outputBefore = h.state.output.length;
+      const invocation = runBackupCatalogCli(["restore-selected"], h.restoreEnv({ BACKUP_ARTIFACT_DEADLINE_MS: "1000" }), h.state.dependencies);
+      const settled = invocation.then(() => ({ unexpectedSuccess: true }), (error: unknown) => ({ error }));
+      await historyEntered;
+      expect(h.observed).toEqual(["factory", "run", "history"]);
+      elapsed = 1_001;
+      await vi.advanceTimersByTimeAsync(1_001);
+      await vi.advanceTimersByTimeAsync(250);
+      await expect(settled).resolves.toMatchObject({ error: { code: "operation_deadline",
+        restoreBoundary: { reservationMayBeConsumed: true, targetMayContainPartialImport: true } } });
+      expect(h.connectMaintenance.mock.calls[0]![0].operationAbortSignal?.aborted).toBe(true);
+      // The native facade is asked to cancel/close, but this deliberately
+      // uncooperative getter still owns the lock/FD until its promise settles.
+      expect(h.maintenance.close).toHaveBeenCalledOnce();
+      expect(h.artifacts.operator.close).not.toHaveBeenCalled(); expect(h.artifacts.verifiedClose).not.toHaveBeenCalled();
+      expect(h.refKey.every((byte) => byte === 17), "pending getter must retain its operator key").toBe(true);
+      expect(h.artifacts.operator.markRestorePrepared).not.toHaveBeenCalled(); expect(h.state.output).toHaveLength(outputBefore);
+      resolveRead!(null);
+      await vi.waitFor(() => {
+        expect(h.artifacts.operator.close).toHaveBeenCalledOnce(); expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+        expect(h.refKey.every((byte) => byte === 0)).toBe(true);
+      });
+      expect(h.maintenance.close).toHaveBeenCalledOnce(); expect(h.maintenance.getTenantRestoreReplayRun).toHaveBeenCalledOnce();
+      expect(h.maintenance.getTenantTelemetryCaptureRestoreHistoryReceipt).toHaveBeenCalledOnce();
+      expect(h.artifacts.imported).toHaveBeenCalledOnce(); expect(h.artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+      expect(h.state.output).toHaveLength(outputBefore);
+    } finally {
+      resolveRead?.(null);
+      await vi.runAllTimersAsync(); vi.useRealTimers();
+    }
+  });
+
+  it("keeps the operator and key held when maintenance close itself exceeds the foreground cleanup ceiling", async () => {
+    const h = await v2MaintenanceHarness();
+    let resolveClose: (() => void) | undefined;
+    let closeEntered!: () => void;
+    const closeStarted = new Promise<void>((resolve) => { closeEntered = resolve; });
+    h.maintenance.close.mockImplementationOnce(() => {
+      closeEntered();
+      return new Promise<void>((resolve) => { resolveClose = resolve; });
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outputBefore = h.state.output.length;
+      const invocation = runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies);
+      const settled = invocation.then(() => ({ unexpectedSuccess: true }), (error: unknown) => ({ error }));
+      await closeStarted;
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(settled).resolves.toMatchObject({ error: { code: "operation_failed" } });
+      expect(h.artifacts.operator.close).not.toHaveBeenCalled();
+      expect(h.artifacts.verifiedClose).not.toHaveBeenCalled();
+      expect(h.refKey.every((byte) => byte === 17)).toBe(true);
+      expect(h.state.output).toHaveLength(outputBefore);
+      resolveClose!();
+      await vi.waitFor(() => {
+        expect(h.artifacts.operator.close).toHaveBeenCalledOnce();
+        expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+        expect(h.refKey.every((byte) => byte === 0)).toBe(true);
+      });
+    } finally {
+      resolveClose?.();
+      await vi.runAllTimersAsync(); vi.useRealTimers();
+    }
+  });
+
+  it("waits for every native close even when one rejects before a maintenance close settles", async () => {
+    const h = await v2MaintenanceHarness();
+    let resolveClose: (() => void) | undefined;
+    let closeEntered!: () => void;
+    const closeStarted = new Promise<void>((resolve) => { closeEntered = resolve; });
+    h.maintenance.close.mockImplementationOnce(() => {
+      closeEntered();
+      return new Promise<void>((resolve) => { resolveClose = resolve; });
+    });
+    h.state.storeClose.mockRejectedValueOnce(new Error("private native close rejection"));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outputBefore = h.state.output.length;
+      const invocation = runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies);
+      const settled = invocation.then(() => ({ unexpectedSuccess: true }), (error: unknown) => ({ error }));
+      await closeStarted;
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(settled).resolves.toMatchObject({ error: { code: "operation_failed" } });
+      expect(h.state.storeClose).toHaveBeenCalledOnce();
+      expect(h.artifacts.operator.close).not.toHaveBeenCalled();
+      expect(h.artifacts.verifiedClose).not.toHaveBeenCalled();
+      expect(h.refKey.every((byte) => byte === 17)).toBe(true);
+      expect(h.state.output).toHaveLength(outputBefore);
+      resolveClose!();
+      await vi.waitFor(() => {
+        expect(h.artifacts.operator.close).toHaveBeenCalledOnce();
+        expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+        expect(h.refKey.every((byte) => byte === 0)).toBe(true);
+      });
+    } finally {
+      resolveClose?.();
+      await vi.runAllTimersAsync(); vi.useRealTimers();
+    }
+  });
+
+  it("tracks an after-result deadline disposal until its maintenance close settles", async () => {
+    const h = await v2MaintenanceHarness();
+    let elapsed = 0;
+    h.state.dependencies.now = () => elapsed;
+    let resolveClose: (() => void) | undefined;
+    let closeEntered!: () => void;
+    const closeStarted = new Promise<void>((resolve) => { closeEntered = resolve; });
+    h.maintenance.close.mockImplementationOnce(() => {
+      closeEntered();
+      return new Promise<void>((resolve) => { resolveClose = resolve; });
+    });
+    h.connectMaintenance.mockImplementationOnce(async (options) => {
+      h.assertHeldResources("factory");
+      expect(options.operationAbortSignal?.aborted).toBe(false);
+      elapsed = 1_001;
+      return h.maintenance;
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outputBefore = h.state.output.length;
+      const invocation = runBackupCatalogCli(["restore-selected"], h.restoreEnv({
+        BACKUP_ARTIFACT_DEADLINE_MS: "1000",
+      }), h.state.dependencies);
+      const settled = invocation.then(() => ({ unexpectedSuccess: true }), (error: unknown) => ({ error }));
+      await closeStarted;
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(settled).resolves.toMatchObject({ error: { code: "operation_deadline" } });
+      expect(h.maintenance.close).toHaveBeenCalledOnce();
+      expect(h.artifacts.operator.close).not.toHaveBeenCalled();
+      expect(h.artifacts.verifiedClose).not.toHaveBeenCalled();
+      expect(h.refKey.every((byte) => byte === 17)).toBe(true);
+      expect(h.state.output).toHaveLength(outputBefore);
+      resolveClose!();
+      await vi.waitFor(() => {
+        expect(h.artifacts.operator.close).toHaveBeenCalledOnce();
+        expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+        expect(h.refKey.every((byte) => byte === 0)).toBe(true);
+      });
+    } finally {
+      resolveClose?.();
+      await vi.runAllTimersAsync(); vi.useRealTimers();
+    }
+  });
+
+  it("does not zero the protected key while operator release itself remains pending", async () => {
+    const h = await v2MaintenanceHarness();
+    let resolveRelease: (() => void) | undefined;
+    let releaseEntered!: () => void;
+    const releaseStarted = new Promise<void>((resolve) => { releaseEntered = resolve; });
+    h.artifacts.operator.close.mockImplementationOnce(() => {
+      releaseEntered();
+      return new Promise<void>((resolve) => { resolveRelease = resolve; });
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const outputBefore = h.state.output.length;
+      const invocation = runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies);
+      const settled = invocation.then(() => ({ unexpectedSuccess: true }), (error: unknown) => ({ error }));
+      await releaseStarted;
+      await vi.advanceTimersByTimeAsync(250);
+      await expect(settled).resolves.toMatchObject({ error: { code: "operation_failed" } });
+      expect(h.maintenance.close).toHaveBeenCalledOnce();
+      expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
+      expect(h.refKey.every((byte) => byte === 17)).toBe(true);
+      expect(h.state.output).toHaveLength(outputBefore);
+      resolveRelease!();
+      await vi.waitFor(() => expect(h.refKey.every((byte) => byte === 0)).toBe(true));
+    } finally {
+      resolveRelease?.();
+      await vi.runAllTimersAsync(); vi.useRealTimers();
+    }
   });
 
   it("does not infer selected-v1 authority from an unrelated existing checkpoint before reserve/import", async () => {

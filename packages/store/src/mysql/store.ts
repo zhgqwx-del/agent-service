@@ -25,9 +25,13 @@ import * as CaptureRestore from "../tenant-telemetry-capture-restore.js";
 import type {
   TenantTelemetryCaptureBackupCheckpointRecord,
   TenantTelemetryCaptureBackupCheckpointStore,
+  TenantTelemetryCaptureRestoreMaintenance,
+  TenantTelemetryCaptureRestoreMaintenanceSelector,
+  MysqlTenantTelemetryCaptureRestoreMaintenanceOptions,
   SealTenantTelemetryCaptureBackupCheckpointInput,
   AssertTenantTelemetryCaptureBackupCheckpointUnchangedInput,
 } from "../tenant-telemetry-capture-restore-store.js";
+import { validateTenantTelemetryCaptureRestoreMaintenanceSelector } from "../tenant-telemetry-capture-restore-store.js";
 import {
   projectTenantTelemetryRetainedSourceGraph,
   validateTenantTelemetryRetainedSourceProviderTargetRelations,
@@ -1000,6 +1004,14 @@ const TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME =
   "0054_tenant_telemetry_retained_source.sql";
 const TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME =
   "0055_tenant_telemetry_capture_backup_checkpoint.sql";
+const TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME =
+  "0056_tenant_telemetry_capture_restore_history.sql";
+const TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_TABLE_NAME =
+  "tenant_telemetry_capture_restore_history_receipts";
+const TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_TRIGGER_NAMES = [
+  "trg_tt_capture_restore_history_immutable_update",
+  "trg_tt_capture_restore_history_immutable_delete",
+] as const;
 const TENANT_TELEMETRY_CAPTURE_CHECKPOINT_TABLE_NAMES = [
   "tenant_telemetry_capture_backup_checkpoints",
   "tenant_telemetry_capture_backup_checkpoint_leaves",
@@ -1856,6 +1868,31 @@ function tenantTelemetryCaptureCheckpointFingerprintStatement(
   if (!roots.length || roots.some((root) => root === `'${"0".repeat(64)}'`)
     || /DERIVE/.test(statements[0]!)) {
     throw new Error(`0055 ${marker} fingerprint block is not committed`);
+  }
+  return statements[0]!;
+}
+function tenantTelemetryCaptureRestoreHistoryFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+): string {
+  const prefix = `-- agent-service-runtime-fingerprint:tenant-telemetry-capture-restore-history-${marker}`;
+  const startMarker = `${prefix}:start`, endMarker = `${prefix}:end`;
+  const start = migrationSql.indexOf(startMarker), end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0056 ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(migrationSql.slice(start + startMarker.length, end));
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @tt_capture_restore_history_${marker}_ok=`)
+    || statements[0]!.includes(";")) {
+    throw new Error(`0056 ${marker} fingerprint block is invalid`);
+  }
+  const roots = statements[0]!.match(/'[0-9a-f]{64}'/g) ?? [];
+  if (!roots.length || roots.some((root) => root === `'${"0".repeat(64)}'`)
+    || /DERIVE/.test(statements[0]!)) {
+    throw new Error(`0056 ${marker} fingerprint block is not committed`);
   }
   return statements[0]!;
 }
@@ -8789,6 +8826,10 @@ export class MysqlSessionStore implements
   private persistedProviderCaptureSchemaInstalled = false;
   private tenantTelemetryRetainedSourceSchemaInstalled = false;
   private tenantTelemetryCaptureCheckpointSchemaInstalled = false;
+  private tenantTelemetryCaptureRestoreHistorySchemaInstalled = false;
+  /** Set only on the privately owned, verify-only maintenance instance. Never a
+   * general connect option or a way to skip the ordinary 0053 startup audit. */
+  private captureRestoreMaintenanceSelector?: TenantTelemetryCaptureRestoreMaintenanceSelector;
   private readonly retainedSourceRootBudgetDiscardedConnections = new WeakSet<PoolConnection>();
   private readonly persistedProviderCaptureCommitContexts = new WeakMap<CommitBatch, {
     input: PersistedCapture.CommitPersistedProviderStepFailureInput;
@@ -8908,7 +8949,10 @@ export class MysqlSessionStore implements
         });
       }
       if (store.tenantTelemetryCaptureCheckpointSchemaInstalled) {
-        await store.withConsistentRead((conn) => store.assertCaptureCheckpointHistoricalProjection(conn));
+        await store.withConsistentRead(async (conn) => {
+          await store.assertCaptureCheckpointHistoricalProjection(conn);
+          await store.assertCaptureRestoreHistoryHistoricalProjection(conn);
+        });
       }
       if (opts.operationAbortSignal?.aborted) throw new Error("MySQL maintenance operation aborted");
       connectedMysqlStorePools.set(store, pool);
@@ -8918,6 +8962,143 @@ export class MysqlSessionStore implements
       await store.close().catch(() => {});
       throw err;
     }
+  }
+
+  static async connectTenantTelemetryCaptureRestoreMaintenance(
+    opts: MysqlTenantTelemetryCaptureRestoreMaintenanceOptions,
+  ): Promise<TenantTelemetryCaptureRestoreMaintenance> {
+    if (process.env.NODE_ENV === "production" || opts.operationAbortSignal?.aborted) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    validateTenantTelemetryCaptureRestoreMaintenanceSelector(opts.selector);
+    const selector = structuredClone(opts.selector);
+    const refKey = Buffer.from(opts.tenantTelemetryRefKey);
+    tenantTelemetryRefKeyIdSha256(refKey);
+    const transport = opts.operationAbortSignal === undefined ? undefined
+      : createMysqlOperationAbortTransport(opts.operationAbortSignal);
+    let pool: Pool;
+    try {
+      pool = mysql.createPool({ uri: opts.url, connectionLimit: opts.connectionLimit ?? 20,
+        supportBigNumbers: true, bigNumberStrings: false, namedPlaceholders: false,
+        timezone: "Z", ...(transport ? { stream: transport.stream } : {}) });
+    } catch (cause) { transport?.close(); refKey.fill(0); throw cause; }
+    const abortScope = opts.operationAbortSignal === undefined ? undefined
+      : bindMysqlOperationAbort(pool, opts.operationAbortSignal, transport);
+    const store = new MysqlSessionStore(pool, undefined, refKey, abortScope, false, true);
+    store.captureRestoreMaintenanceSelector = selector;
+    try {
+      const dir = await MysqlSessionStore.resolveMigrationsDir(opts.migrationsDir);
+      // Only the private maintenance factory may defer the primary-oriented
+      // ordinary runtime projection. Strict schema/trigger verification still
+      // runs, followed immediately by the exact historical source audit below.
+      await store.verifyMigrations(dir, true);
+      if (!store.tenantTelemetryCaptureRestoreHistorySchemaInstalled
+        || !store.tenantTelemetryCaptureCheckpointSchemaInstalled) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      await store.withCurrentMaintenanceRead(async (conn) => {
+        const selected = await store.loadTenantRestoreReplayRun(conn, selector.restoreRunId, "FOR SHARE");
+        if (!selected) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        if (selected.run.phase === "active") {
+          // Once activation has committed, history is an immutable source
+          // binding. Its read does not grant any renewed 49-family write or
+          // deletion authority over a later runtime epoch.
+          await store.assertSelectedCaptureRestoreHistoricalReceipt(conn);
+        } else {
+          await store.assertCaptureRestoreMaintenanceContext(conn);
+          await store.assertCaptureCheckpointHistoricalProjection(conn);
+          await store.assertCaptureRestoreHistoryHistoricalProjection(conn);
+        }
+        // verifyMigrations deliberately defers the ordinary primary-epoch
+        // runtime audit. Restore that audit's independent, out-of-checkpoint
+        // hard-deny families explicitly: the 49 source leaves do not contain
+        // 0036/0037 grant or 0044 pregrant ledgers. Never treat an immutable
+        // checkpoint hash as evidence that these current tables are empty.
+        await store.assertTenantTelemetryDispositionProjection(conn);
+        await store.assertTenantTelemetryPregrantIntentProjection(conn, true);
+      });
+      if (opts.operationAbortSignal?.aborted) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      let closed = false;
+      const exactRun = (runId: string): void => {
+        if (closed || runId !== selector.restoreRunId) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+      };
+      const exactInputRun = (input: object): void => {
+        if (closed || !input || typeof input !== "object") {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(input, "restoreRunId");
+        if (!descriptor || !("value" in descriptor)
+          || descriptor.value !== selector.restoreRunId) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+      };
+      const guardedRead = async <T>(fn: (conn: PoolConnection, context: Awaited<ReturnType<
+        MysqlSessionStore["assertCaptureRestoreMaintenanceContext"]>>) => Promise<T>): Promise<T> => {
+        if (closed) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        return store.withCurrentMaintenanceRead(async (conn) => {
+          const context = await store.assertCaptureRestoreMaintenanceContext(conn);
+          return fn(conn, context);
+        });
+      };
+      const guardedWrite = <T>(fn: () => Promise<T>): Promise<T> => {
+        if (closed) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        // Every mutator independently rechecks the exact context in its OWN RR
+        // transaction, immediately before its original source and CAS reads.
+        return fn();
+      };
+      const evidence = async (conn: PoolConnection) => {
+        const loaded = await store.loadTenantRestoreReplayRun(conn, selector.restoreRunId, "FOR SHARE");
+        if (!loaded) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        return store.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
+      };
+      const facade: TenantTelemetryCaptureRestoreMaintenance = {
+        getTenantRestoreReplayRun: async (runId) => { exactRun(runId); return guardedRead(async (_conn, context) => context.run); },
+        getTenantRestoreReplaySealedTargets: async (runId) => { exactRun(runId); return guardedRead(async (conn) => (await evidence(conn)).targets); },
+        listTenantRestoreReplayEntries: async (runId, options) => { exactRun(runId); return guardedRead(async (conn) => {
+          if (Object.keys(options).some((key) => key !== "limit" && key !== "afterReplayOrdinal")
+            || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1_000
+            || (options.afterReplayOrdinal !== undefined
+              && (!Number.isSafeInteger(options.afterReplayOrdinal) || options.afterReplayOrdinal < 0))) {
+            throw new Error("invalid tenant restore replay entry list options");
+          }
+          return (await evidence(conn)).entries
+            .filter((entry) => entry.replayOrdinal > (options.afterReplayOrdinal ?? 0)).slice(0, options.limit);
+        }); },
+        // Input-bearing mutators validate the cloned value inside their own
+        // transaction boundary. Reading an accessor here and again during
+        // structuredClone would permit an exact-run TOCTOU substitution.
+        recordTenantRestoreReplayFence: async (input) => {
+          exactInputRun(input);
+          return guardedWrite(() => store.recordTenantRestoreReplayFence(input));
+        },
+        sealTenantRestoreReplay: async (runId) => { exactRun(runId); return guardedWrite(() => store.sealTenantRestoreReplay(runId)); },
+        abortTenantRestoreReplay: async (runId) => { exactRun(runId); return guardedWrite(() => store.abortTenantRestoreReplay(runId)); },
+        getTenantRestoreReplayReceipt: async (runId) => { exactRun(runId); return guardedRead(async (conn) => (await evidence(conn)).receipt ?? null); },
+        getTenantRestoreRuntimeControl: () => guardedRead(async (_conn, context) => context.runtime),
+        getTenantRestoreRuntimeHeads: () => guardedRead(async (conn) => (await store.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE")).heads),
+        activateTenantRestoreRuntime: async (input) => {
+          exactInputRun(input);
+          return guardedWrite(() => store.activateTenantRestoreRuntime(input));
+        },
+        getTenantRestoreJournalControl: () => guardedRead(async (conn) => (await store.loadTenantRestoreJournalControl(conn, "FOR SHARE")).control),
+        getTenantRestoreJournalControlTargets: () => guardedRead(async (conn) => (await store.loadTenantRestoreJournalControl(conn, "FOR SHARE")).targets),
+        getTenantTelemetryCaptureRestoreHistoryReceipt: async () => {
+          if (closed) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+          return store.withCurrentMaintenanceRead(async (conn) => {
+            const selected = await store.loadTenantRestoreReplayRun(conn, selector.restoreRunId, "FOR SHARE");
+            if (!selected) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+            if (selected.run.phase === "active") {
+              return store.assertSelectedCaptureRestoreHistoricalReceipt(conn);
+            }
+            return (await store.assertCaptureRestoreMaintenanceContext(conn)).history;
+          });
+        },
+        close: async () => { if (!closed) { closed = true; await store.close(); } },
+      };
+      return Object.freeze(facade);
+    } catch (cause) { await store.close().catch(() => {}); throw cause; }
   }
 
   private async assertTenantRestoreJournalSchemaFingerprint(
@@ -9650,10 +9831,12 @@ export class MysqlSessionStore implements
     withPersistedProviderCapture = false,
     withRetainedSource = false,
     withCaptureCheckpoint = false,
+    withRestoreHistory = false,
   ): Promise<void> {
     if (withRetainedSource) {
       await this.assertTenantTelemetryRetainedSourceFingerprint(conn, migrationsDir, withCaptureCheckpoint);
-      if (withCaptureCheckpoint) await this.assertTenantTelemetryCaptureCheckpointFingerprint(conn, migrationsDir);
+      if (withCaptureCheckpoint) await this.assertTenantTelemetryCaptureCheckpointFingerprint(conn, migrationsDir, !withRestoreHistory);
+      if (withRestoreHistory) await this.assertTenantTelemetryCaptureRestoreHistoryFingerprint(conn, migrationsDir);
       return;
     }
     if (withPersistedProviderCapture) {
@@ -9804,14 +9987,13 @@ export class MysqlSessionStore implements
   private async assertTenantTelemetryCaptureCheckpointFingerprint(
     conn: PoolConnection,
     migrationsDir: string,
+    includeTriggers = true,
   ): Promise<void> {
     let statements: string[];
     try {
       const sql = await readFile(join(migrationsDir, TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME), "utf8");
-      statements = [
-        tenantTelemetryCaptureCheckpointFingerprintStatement(sql, "schema"),
-        tenantTelemetryCaptureCheckpointFingerprintStatement(sql, "triggers"),
-      ];
+      statements = [tenantTelemetryCaptureCheckpointFingerprintStatement(sql, "schema")];
+      if (includeTriggers) statements.push(tenantTelemetryCaptureCheckpointFingerprintStatement(sql, "triggers"));
     } catch (cause) {
       throw new Error("0055 capture checkpoint fingerprint source is invalid", { cause });
     }
@@ -9823,7 +10005,7 @@ export class MysqlSessionStore implements
       const [rows] = await conn.query<Row[]>(
         "SELECT @tt_capture_checkpoint_schema_ok AS schema_ok,@tt_capture_checkpoint_triggers_ok AS triggers_ok",
       );
-      if (Number(rows[0]?.schema_ok) !== 1 || Number(rows[0]?.triggers_ok) !== 1) {
+      if (Number(rows[0]?.schema_ok) !== 1 || (includeTriggers && Number(rows[0]?.triggers_ok) !== 1)) {
         throw new Error("stored schema/triggers do not match the 0055 fingerprint");
       }
     } catch (cause) {
@@ -9831,6 +10013,39 @@ export class MysqlSessionStore implements
     }
     try { await conn.query("SET SESSION group_concat_max_len=@tt_capture_checkpoint_prev_gcml"); }
     catch (cause) { failure ??= new Error("0055 capture checkpoint fingerprint session restore failed", { cause }); }
+    if (failure) throw failure;
+  }
+
+  private async assertTenantTelemetryCaptureRestoreHistoryFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let statements: string[];
+    try {
+      const sql = await readFile(join(migrationsDir, TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME), "utf8");
+      statements = [
+        tenantTelemetryCaptureRestoreHistoryFingerprintStatement(sql, "schema"),
+        tenantTelemetryCaptureRestoreHistoryFingerprintStatement(sql, "triggers"),
+      ];
+    } catch (cause) {
+      throw new Error("0056 restore history fingerprint source is invalid", { cause });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query("SET @tt_capture_restore_history_prev_gcml=@@SESSION.group_concat_max_len");
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @tt_capture_restore_history_schema_ok AS schema_ok,@tt_capture_restore_history_triggers_ok AS triggers_ok",
+      );
+      if (Number(rows[0]?.schema_ok) !== 1 || Number(rows[0]?.triggers_ok) !== 1) {
+        throw new Error("stored schema/triggers do not match the 0056 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error("0056 restore history fingerprint verification failed", { cause });
+    }
+    try { await conn.query("SET SESSION group_concat_max_len=@tt_capture_restore_history_prev_gcml"); }
+    catch (cause) { failure ??= new Error("0056 restore history fingerprint session restore failed", { cause }); }
     if (failure) throw failure;
   }
 
@@ -10636,6 +10851,10 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME)) {
         throw new Error("0055 capture checkpoint marker is missing its 0054 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME)) {
+        throw new Error("0056 restore history marker is missing its 0055 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -10714,6 +10933,7 @@ export class MysqlSessionStore implements
           done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME),
           done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME),
           done.has(TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME),
+          done.has(TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME),
         );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
@@ -10773,6 +10993,9 @@ export class MysqlSessionStore implements
       this.tenantTelemetryCaptureCheckpointSchemaInstalled = done.has(
         TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME,
       );
+      this.tenantTelemetryCaptureRestoreHistorySchemaInstalled = done.has(
+        TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME,
+      );
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
       );
@@ -10801,6 +11024,11 @@ export class MysqlSessionStore implements
       const sql = await readFile(join(dir, TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME), "utf8");
       tenantTelemetryCaptureCheckpointFingerprintStatement(sql, "schema");
       tenantTelemetryCaptureCheckpointFingerprintStatement(sql, "triggers");
+    }
+    if (files.includes(TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME)) {
+      const sql = await readFile(join(dir, TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME), "utf8");
+      tenantTelemetryCaptureRestoreHistoryFingerprintStatement(sql, "schema");
+      tenantTelemetryCaptureRestoreHistoryFingerprintStatement(sql, "triggers");
     }
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
@@ -10872,8 +11100,28 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME)) {
         throw new Error("0055 capture checkpoint marker is missing its 0054 predecessor");
       }
+      if (done.has(TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME)) {
+        throw new Error("0056 restore history marker is missing its 0055 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME) {
+          if (!done.has(TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME)) {
+            throw new Error("0056 restore history migration requires 0055");
+          }
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()
+              AND table_name=?)
+            + (SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE()
+              AND trigger_name IN (${TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_TRIGGER_NAMES.map(() => "?").join(",")})) AS n`,
+          [TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_TABLE_NAME,
+            ...TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_TRIGGER_NAMES]);
+          if (storedSafeInteger(footprint[0]?.n, "markerless 0056 schema footprint") !== 0) {
+            throw new Error("0056 marker-loss or partial DDL requires controlled forward repair");
+          }
+          await this.assertTenantTelemetryCaptureCheckpointFingerprint(conn, dir);
+        }
         if (f === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME) {
           if (!done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME)) {
             throw new Error("0055 capture checkpoint migration requires 0054");
@@ -11308,6 +11556,7 @@ export class MysqlSessionStore implements
           done.has(PERSISTED_PROVIDER_CAPTURE_MIGRATION_NAME),
           done.has(TENANT_TELEMETRY_RETAINED_SOURCE_MIGRATION_NAME),
           done.has(TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME),
+          done.has(TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME),
         );
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
@@ -11366,6 +11615,9 @@ export class MysqlSessionStore implements
       );
       this.tenantTelemetryCaptureCheckpointSchemaInstalled = done.has(
         TENANT_TELEMETRY_CAPTURE_CHECKPOINT_MIGRATION_NAME,
+      );
+      this.tenantTelemetryCaptureRestoreHistorySchemaInstalled = done.has(
+        TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME,
       );
       this.ordinarySessionDeleteGraceSchemaInstalled = done.has(
         ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME,
@@ -44467,6 +44719,25 @@ export class MysqlSessionStore implements
     }
   }
 
+  private async withCurrentMaintenanceRead<T>(work: (conn: PoolConnection) => Promise<T>): Promise<T> {
+    const conn = await this.pool.getConnection();
+    try {
+      // Unlike the ordinary snapshot reader, the exact-run maintenance audit
+      // must acquire its complete current 49-family source ranges before any
+      // nonlocking 0030/0031 projection establishes an RR read view.
+      await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await conn.beginTransaction();
+      const result = await work(conn);
+      await conn.commit();
+      return result;
+    } catch (error) {
+      await conn.rollback().catch(() => {});
+      throw error;
+    } finally {
+      conn.release();
+    }
+  }
+
   private usageProjectionSummarySql(groupColumns: string): string {
     const owned = USAGE_OWNER_MATCH;
     const ownedNumber = (field: string) => `CASE WHEN ${owned} THEN ${usageJsonNumber(field)} ELSE 0 END`;
@@ -49436,6 +49707,277 @@ export class MysqlSessionStore implements
     }
   }
 
+  private async readCaptureRestoreHistoryReceipt(
+    conn: PoolConnection,
+    restoreRunId: string,
+    checkpoint: CaptureRestore.TenantTelemetryCaptureBackupCheckpoint,
+    lock: "" | "FOR SHARE" = "FOR SHARE",
+  ): Promise<CaptureRestore.TenantTelemetryCaptureRestoreHistoryReceipt | null> {
+    if (!this.tenantTelemetryCaptureRestoreHistorySchemaInstalled) return null;
+    const [rows] = await conn.query<Row[]>(`SELECT * FROM tenant_telemetry_capture_restore_history_receipts
+      WHERE BINARY restore_run_id=BINARY ? ${lock}`, [restoreRunId]);
+    if (!rows.length) return null;
+    if (rows.length !== 1) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    const row = rows[0]!;
+    const receipt = parse<CaptureRestore.TenantTelemetryCaptureRestoreHistoryReceipt>(row.receipt_json);
+    CaptureRestore.validateTenantTelemetryCaptureRestoreHistoryReceipt(receipt, checkpoint, this.requireTenantTelemetryRefKey());
+    if (receipt.restoreRunId !== row.restore_run_id || receipt.backupId !== row.backup_id
+      || receipt.checkpointSha256 !== row.checkpoint_sha256
+      || receipt.artifactManifestSha256 !== row.artifact_manifest_sha256
+      || receipt.sourceSnapshotSha256 !== row.source_snapshot_sha256
+      || receipt.providerEvidenceSha256 !== row.provider_evidence_sha256
+      || receipt.runtimeEpochSha256 !== row.runtime_epoch_sha256
+      || receipt.receiptSha256 !== row.history_receipt_sha256
+      || receipt.activatedAtDbMs !== storedSafeInteger(row.activated_at_db_ms, "capture restore history activation")) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return receipt;
+  }
+
+  private async readCaptureRestoreRuntimeEvent(
+    conn: PoolConnection,
+    generation: number,
+    lock: "" | "FOR SHARE" = "FOR SHARE",
+  ): Promise<Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }> | null> {
+    const [rows] = await conn.query<Row[]>(`SELECT ${TENANT_RESTORE_RUNTIME_CONTROL_COLUMNS}
+      FROM (SELECT singleton_id,'active' AS state,control_generation,update_kind,lineage_kind,
+        activated_at_db_ms,updated_at_db_ms,restore_run_id,replay_receipt_sha256,runtime_epoch_sha256,
+        control_evidence_sha256,logical_database_namespace_sha256,target_count,target_root_sha256,
+        verified_head_root_sha256,previous_control_evidence_sha256,evidence_sha256
+        FROM tenant_restore_runtime_events WHERE singleton_id=1 AND control_generation=?) e ${lock}`,
+    [generation]);
+    if (!rows.length) return null;
+    if (rows.length !== 1) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    const event = rowToTenantRestoreRuntimeControl(rows[0]!);
+    if (event.state !== "active" || event.controlGeneration !== generation) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return event;
+  }
+
+  private async assertCaptureRestoreHistoryHistoricalProjection(conn: PoolConnection): Promise<void> {
+    if (!this.tenantTelemetryCaptureRestoreHistorySchemaInstalled) return;
+    const [rows] = await conn.query<Row[]>(`SELECT restore_run_id,backup_id
+      FROM tenant_telemetry_capture_restore_history_receipts ORDER BY restore_run_id FOR SHARE`);
+    if (!rows.length) return;
+    const key = this.requireTenantTelemetryRefKey();
+    const catalog = await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE");
+    const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+    const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+    if (rows.length !== 1 || runtime.control.state !== "active"
+      || runtime.control.lineageKind !== "restore") {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const runId = String(rows[0]!.restore_run_id), backupId = String(rows[0]!.backup_id);
+    const checkpoint = await readTenantTelemetryCaptureCheckpointFromMysql(conn, backupId, key, "FOR SHARE");
+    const sidecar = await this.readCaptureRestoreBackupBinding(conn, runId, "FOR SHARE");
+    const binding = catalog.bindings.get(runId), reservation = catalog.reservations.get(runId);
+    const run = catalog.replayRuns.get(runId);
+    const loaded = await this.loadTenantRestoreReplayRun(conn, runId, "FOR SHARE");
+    if (!checkpoint || !sidecar || !binding || !reservation || !run || !loaded
+      || run.phase !== "active" || loaded.run.phase !== "active"
+      || sidecar.backupId !== backupId || sidecar.checkpointSha256 !== checkpoint.checkpoint.checkpointSha256
+      || sidecar.sourceBindingSha256 !== binding.bindingSha256
+      || sidecar.reservationSha256 !== reservation.reservationSha256
+      || sidecar.reservationReceiptSha256 !== reservation.reservationReceiptSha256
+      || runtime.control.restoreRunId !== runId || runtime.control.runtimeEpochSha256 !== run.runtimeEpochSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const evidence = await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
+    const history = await this.readCaptureRestoreHistoryReceipt(conn, runId, checkpoint.checkpoint, "FOR SHARE");
+    const activated = history ? await this.readCaptureRestoreRuntimeEvent(conn, history.runtimeControlGeneration) : null;
+    if (!evidence.receipt || !history || !activated || activated.lineageKind !== "restore"
+      || activated.updateKind !== "restore_activation" || activated.restoreRunId !== runId
+      || activated.runtimeEpochSha256 !== run.runtimeEpochSha256
+      || runtime.control.controlGeneration < activated.controlGeneration) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    CaptureRestore.assertTenantTelemetryCaptureRestoreActivationBinding(history, {
+      backupId, anchorSha256: checkpoint.checkpoint.anchorSha256,
+      checkpointSha256: checkpoint.checkpoint.checkpointSha256,
+      artifactManifestSha256: binding.artifactManifestSha256,
+      sourceSnapshotSha256: binding.sourceSnapshotSha256,
+      providerEvidenceSha256: binding.providerEvidenceSha256,
+      sourceBindingSha256: binding.bindingSha256,
+      reservationSha256: reservation.reservationSha256,
+      reservationReceiptSha256: reservation.reservationReceiptSha256,
+      restoreRunId: runId, runtimeEpochSha256: run.runtimeEpochSha256,
+      runtimeBindingSha256: CaptureRestore.tenantTelemetryCaptureRestoreRuntimeBindingSha256(activated, journal.control),
+      runtimeControlEvidenceSha256: activated.evidenceSha256,
+      runtimeControlGeneration: activated.controlGeneration,
+      replayReceiptSha256: evidence.receipt.receiptSha256,
+      sealedJournalHeadRootSha256: run.sealedTargetRootSha256,
+      activatedAtDbMs: activated.activatedAtDbMs,
+    });
+  }
+
+  /** Read-only post-activation route. It validates the stored 0055 source,
+   * 0031 selection, 0030 immutable activation event and current event chain,
+   * but deliberately does not reclassify later physical 49-family rows as the
+   * original backup snapshot. No mutator calls this route for authorization. */
+  private async assertSelectedCaptureRestoreHistoricalReceipt(
+    conn: PoolConnection,
+  ): Promise<CaptureRestore.TenantTelemetryCaptureRestoreHistoryReceipt> {
+    const selector = this.captureRestoreMaintenanceSelector;
+    if (!selector || !this.tenantTelemetryCaptureRestoreLocalOnly) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    await this.assertCaptureCheckpointHistoricalProjection(conn);
+    await this.assertCaptureRestoreHistoryHistoricalProjection(conn);
+    const checkpoint = await readTenantTelemetryCaptureCheckpointFromMysql(
+      conn, selector.backupId, this.requireTenantTelemetryRefKey(), "FOR SHARE",
+    );
+    const history = checkpoint ? await this.readCaptureRestoreHistoryReceipt(
+      conn, selector.restoreRunId, checkpoint.checkpoint, "FOR SHARE",
+    ) : null;
+    if (!history || history.backupId !== selector.backupId
+      || history.restoreRunId !== selector.restoreRunId
+      || history.checkpointSha256 !== selector.checkpointSha256
+      || history.artifactManifestSha256 !== selector.artifactManifestSha256
+      || history.sourceSnapshotSha256 !== selector.sourceSnapshotSha256
+      || history.providerEvidenceSha256 !== selector.providerEvidenceSha256
+      || history.reservationSha256 !== selector.reservationSha256
+      || history.reservationReceiptSha256 !== selector.reservationReceiptSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return history;
+  }
+
+  /** Only the privately owned verify-only facade calls this historical source
+   * audit. The ordinary capture projection continues to require the primary
+   * runtime and rejects pending or restored epochs. The original 0055 seal
+   * validated all 49 complete families; compare freshly locked physical rows
+   * with its keyed immutable root, never a caller-supplied JSON projection. */
+  private async assertCaptureRestoreMaintenanceContext(conn: PoolConnection): Promise<{
+    checkpoint: CaptureRestore.TenantTelemetryCaptureBackupCheckpoint;
+    run: RestoreJournal.TenantRestoreReplayRunRecord;
+    runtime: RestoreJournal.TenantRestoreRuntimeControlRecord;
+    history: CaptureRestore.TenantTelemetryCaptureRestoreHistoryReceipt | null;
+  }> {
+    const selector = this.captureRestoreMaintenanceSelector;
+    if (!selector || !this.tenantTelemetryCaptureRestoreLocalOnly
+      || !this.tenantTelemetryCaptureRestoreHistorySchemaInstalled) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const key = this.requireTenantTelemetryRefKey();
+    // All 49 current ranges are read before any nonlocking catalog projection
+    // can establish an older RR read view. 0030/0031 are deliberately outside
+    // this immutable capture-source set and may advance during replay.
+    const leaves = await this.captureCheckpointLeaves(conn, key);
+    const stored = await readTenantTelemetryCaptureCheckpointFromMysql(
+      conn, selector.backupId, key, "FOR SHARE",
+    );
+    if (!stored || stored.checkpoint.checkpointSha256 !== selector.checkpointSha256
+      || stored.checkpoint.sourceRuntimeLineageKind !== "primary") {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    CaptureRestore.assertTenantTelemetryCaptureCheckpointLeaves(stored.checkpoint, leaves, key);
+    const checkpoint = stored.checkpoint;
+    const sidecar = await this.readCaptureRestoreBackupBinding(conn, selector.restoreRunId, "FOR SHARE");
+    const catalog = await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE");
+    const binding = catalog.bindings.get(selector.restoreRunId);
+    const reservation = catalog.reservations.get(selector.restoreRunId);
+    const entry = catalog.entries.get(selector.backupId);
+    const anchor = catalog.anchors.get(selector.backupId);
+    const run = catalog.replayRuns.get(selector.restoreRunId);
+    if (!sidecar || !binding || !reservation || !entry || !anchor || !run
+      || (run.phase !== "prepared" && run.phase !== "replay_sealed" && run.phase !== "active")
+      || sidecar.backupId !== selector.backupId || binding.backupId !== selector.backupId
+      || reservation.backupId !== selector.backupId
+      || sidecar.checkpointSha256 !== selector.checkpointSha256
+      || sidecar.artifactManifestSha256 !== selector.artifactManifestSha256
+      || sidecar.sourceSnapshotSha256 !== selector.sourceSnapshotSha256
+      || sidecar.providerEvidenceSha256 !== selector.providerEvidenceSha256
+      || sidecar.reservationSha256 !== selector.reservationSha256
+      || sidecar.reservationReceiptSha256 !== selector.reservationReceiptSha256
+      || sidecar.sourceBindingSha256 !== binding.bindingSha256
+      || sidecar.boundAtDbMs !== binding.boundAtDbMs
+      || binding.entrySha256 !== entry.entrySha256
+      || binding.artifactManifestSha256 !== selector.artifactManifestSha256
+      || binding.sourceSnapshotSha256 !== selector.sourceSnapshotSha256
+      || binding.providerEvidenceSha256 !== selector.providerEvidenceSha256
+      || binding.anchorSha256 !== checkpoint.anchorSha256
+      || reservation.reservationSha256 !== selector.reservationSha256
+      || reservation.reservationReceiptSha256 !== selector.reservationReceiptSha256
+      || reservation.bindingSha256 !== binding.bindingSha256
+      || run.runtimeEpochSha256 !== reservation.runtimeEpochSha256
+      || anchor.anchorSha256 !== checkpoint.anchorSha256
+      || entry.anchorSha256 !== checkpoint.anchorSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const loaded = await this.loadTenantRestoreReplayRun(conn, selector.restoreRunId, "FOR SHARE");
+    if (!loaded || loaded.run.phase !== run.phase
+      || loaded.run.runtimeEpochSha256 !== run.runtimeEpochSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const evidence = await this.loadTenantRestoreReplayEvidence(conn, loaded, "FOR SHARE");
+    const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+    const runtimeProjection = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+    const runtime = runtimeProjection.control;
+    const original = await this.readCaptureRestoreRuntimeEvent(conn, checkpoint.sourceRuntimeControlGeneration);
+    const captureReceipt = await this.readPersistedCaptureReceipt(conn, "FOR SHARE");
+    const [captureControls] = await conn.query<Row[]>(`SELECT domain,state,control_generation,activated_at_db_ms
+      FROM tenant_telemetry_capture_v2_controls ORDER BY domain FOR SHARE`);
+    const lifecycle = await this.readTenantTelemetryLifecycleControl(conn, "FOR SHARE");
+    const targets = await this.readTenantTelemetryLifecycleTargets(conn, "FOR SHARE");
+    const logsTarget = targets.find((target) => target.domain === "logs");
+    if (!original || original.lineageKind !== "primary"
+      || original.runtimeEpochSha256 !== checkpoint.sourceRuntimeEpochSha256
+      || original.evidenceSha256 !== checkpoint.sourceRuntimeControlEvidenceSha256
+      || PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(original, journal.control)
+        !== checkpoint.sourceRuntimeBindingSha256
+      || !captureReceipt || captureReceipt.receiptSha256 !== checkpoint.originalCaptureActivationReceiptSha256
+      || captureReceipt.runtimeEpochSha256 !== original.runtimeEpochSha256
+      || captureReceipt.runtimeBindingSha256 !== checkpoint.sourceRuntimeBindingSha256
+      || captureReceipt.refKeyIdSha256 !== tenantTelemetryRefKeyIdSha256(key)
+      || captureControls.length !== 2 || captureControls[0]?.domain !== "logs"
+      || captureControls[0]?.state !== "active" || Number(captureControls[0]?.control_generation) !== 1
+      || captureControls[1]?.domain !== "traces" || captureControls[1]?.state !== "inactive"
+      || Number(captureControls[1]?.control_generation) !== 0
+      || lifecycle.state !== "active" || lifecycle.refKeyIdSha256 !== checkpoint.refKeyIdSha256
+      || lifecycle.activationEvidenceSha256 !== checkpoint.lifecycleControlEvidenceSha256
+      || logsTarget?.targetSha256 !== checkpoint.logsTargetSha256
+      || logsTarget.receiptSha256 !== checkpoint.logsTargetReceiptSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const history = await this.readCaptureRestoreHistoryReceipt(conn, selector.restoreRunId, checkpoint);
+    if (run.phase === "active") {
+      if (!history || !evidence.receipt || runtime.state !== "active"
+        || runtime.lineageKind !== "restore" || runtime.restoreRunId !== selector.restoreRunId
+        || runtime.runtimeEpochSha256 !== run.runtimeEpochSha256) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      const activation = await this.readCaptureRestoreRuntimeEvent(conn, history.runtimeControlGeneration);
+      if (!activation || activation.lineageKind !== "restore"
+        || activation.updateKind !== "restore_activation"
+        || activation.restoreRunId !== selector.restoreRunId
+        || activation.runtimeEpochSha256 !== run.runtimeEpochSha256
+        || runtime.controlGeneration < activation.controlGeneration) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      CaptureRestore.assertTenantTelemetryCaptureRestoreActivationBinding(history, {
+        backupId: selector.backupId, anchorSha256: checkpoint.anchorSha256,
+        checkpointSha256: checkpoint.checkpointSha256,
+        artifactManifestSha256: binding.artifactManifestSha256,
+        sourceSnapshotSha256: binding.sourceSnapshotSha256,
+        providerEvidenceSha256: binding.providerEvidenceSha256,
+        sourceBindingSha256: binding.bindingSha256,
+        reservationSha256: reservation.reservationSha256,
+        reservationReceiptSha256: reservation.reservationReceiptSha256,
+        restoreRunId: run.restoreRunId, runtimeEpochSha256: run.runtimeEpochSha256,
+        runtimeBindingSha256: CaptureRestore.tenantTelemetryCaptureRestoreRuntimeBindingSha256(activation, journal.control),
+        runtimeControlEvidenceSha256: activation.evidenceSha256,
+        runtimeControlGeneration: activation.controlGeneration,
+        replayReceiptSha256: evidence.receipt.receiptSha256,
+        sealedJournalHeadRootSha256: run.sealedTargetRootSha256,
+        activatedAtDbMs: activation.activatedAtDbMs,
+      });
+    } else if (history || runtime.state !== "active" || runtime.lineageKind !== "primary") {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return { checkpoint, run, runtime, history };
+  }
+
   private async selectedCaptureCheckpointForRestore(
     conn: PoolConnection,
     backupId: string,
@@ -52379,9 +52921,24 @@ export class MysqlSessionStore implements
   ): Promise<RestoreJournal.TenantRestoreReplayEntry | null> {
     input = structuredClone(input);
     RestoreJournal.validateRecordTenantRestoreReplayFenceInput(input);
+    if (this.captureRestoreMaintenanceSelector
+      && input.restoreRunId !== this.captureRestoreMaintenanceSelector.restoreRunId) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
     const conn = await this.pool.getConnection();
     try {
+      if (this.captureRestoreMaintenanceSelector) {
+        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
       await conn.beginTransaction();
+      if (this.captureRestoreMaintenanceSelector) {
+        // Serialize exact-run transitions before reading any of the 49 source
+        // ranges. Rechecking this row later never upgrades a shared lock.
+        if (!await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE")) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+        await this.assertCaptureRestoreMaintenanceContext(conn);
+      }
       const loaded = await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE");
       if (!loaded || loaded.run.phase !== "prepared") {
         await conn.commit();
@@ -52590,7 +53147,16 @@ export class MysqlSessionStore implements
   ): Promise<RestoreJournal.TenantRestoreReplayReceipt | null> {
     const conn = await this.pool.getConnection();
     try {
+      if (this.captureRestoreMaintenanceSelector) {
+        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
       await conn.beginTransaction();
+      if (this.captureRestoreMaintenanceSelector) {
+        if (!await this.loadTenantRestoreReplayRun(conn, restoreRunId, "FOR UPDATE")) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+        await this.assertCaptureRestoreMaintenanceContext(conn);
+      }
       if (this.tenantBackupCatalogSchemaInstalled) {
         await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
       }
@@ -52663,7 +53229,16 @@ export class MysqlSessionStore implements
   async abortTenantRestoreReplay(restoreRunId: string): Promise<boolean> {
     const conn = await this.pool.getConnection();
     try {
+      if (this.captureRestoreMaintenanceSelector) {
+        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
       await conn.beginTransaction();
+      if (this.captureRestoreMaintenanceSelector) {
+        if (!await this.loadTenantRestoreReplayRun(conn, restoreRunId, "FOR UPDATE")) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+        await this.assertCaptureRestoreMaintenanceContext(conn);
+      }
       if (this.tenantBackupCatalogSchemaInstalled) {
         await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
       }
@@ -52714,13 +53289,33 @@ export class MysqlSessionStore implements
   ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
     input = structuredClone(input);
     RestoreJournal.validateActivateTenantRestoreRuntimeInput(input);
+    if (this.captureRestoreMaintenanceSelector
+      && input.restoreRunId !== this.captureRestoreMaintenanceSelector.restoreRunId) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
     const conn = await this.pool.getConnection();
     try {
+      if (this.captureRestoreMaintenanceSelector) {
+        await conn.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
       await conn.beginTransaction();
+      let maintenance: Awaited<ReturnType<MysqlSessionStore["assertCaptureRestoreMaintenanceContext"]>> | null = null;
+      if (this.captureRestoreMaintenanceSelector) {
+        if (!await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE")) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+        maintenance = await this.assertCaptureRestoreMaintenanceContext(conn);
+      }
       if (this.tenantBackupCatalogSchemaInstalled) {
         await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
       }
       const loaded = await this.loadTenantRestoreReplayRun(conn, input.restoreRunId, "FOR UPDATE");
+      if (!maintenance && this.tenantTelemetryCaptureCheckpointSchemaInstalled
+        && await this.readCaptureRestoreBackupBinding(conn, input.restoreRunId, "FOR SHARE")) {
+        // 0055-selected active capture cannot be activated by the ordinary
+        // generic replay store: it needs the exact-run history publication.
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
       if (!loaded || (loaded.run.phase !== "replay_sealed" && loaded.run.phase !== "active")) {
         throw new TenantErasureIntegrityError();
       }
@@ -52889,12 +53484,61 @@ export class MysqlSessionStore implements
         ],
       );
       if (controlUpdate.affectedRows !== 1) throw new TenantErasureIntegrityError();
-      await conn.query(
+      const [runUpdate] = await conn.query<mysql.ResultSetHeader>(
         `UPDATE tenant_restore_replay_runs
             SET phase='active', activated_at_db_ms=?, updated_at_db_ms=?
           WHERE restore_run_id=? AND phase='replay_sealed'`,
         [nowMs, Math.max(loaded.run.updatedAtDbMs, nowMs), loaded.run.restoreRunId],
       );
+      if (maintenance) {
+        if (runUpdate.affectedRows !== 1) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+        const selector = this.captureRestoreMaintenanceSelector!;
+        const sidecar = await this.readCaptureRestoreBackupBinding(conn, selector.restoreRunId, "FOR SHARE");
+        const catalog = await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE");
+        const binding = catalog.bindings.get(selector.restoreRunId);
+        const reservation = catalog.reservations.get(selector.restoreRunId);
+        const journal = await this.loadTenantRestoreJournalControl(conn, "FOR SHARE");
+        if (!sidecar || !binding || !reservation || !receipt
+          || sidecar.checkpointSha256 !== maintenance.checkpoint.checkpointSha256
+          || binding.bindingSha256 !== sidecar.sourceBindingSha256
+          || reservation.reservationSha256 !== sidecar.reservationSha256) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+        const history = CaptureRestore.createTenantTelemetryCaptureRestoreHistoryReceipt({
+          backupId: selector.backupId,
+          anchorSha256: maintenance.checkpoint.anchorSha256,
+          checkpointSha256: maintenance.checkpoint.checkpointSha256,
+          artifactManifestSha256: binding.artifactManifestSha256,
+          sourceSnapshotSha256: binding.sourceSnapshotSha256,
+          providerEvidenceSha256: binding.providerEvidenceSha256,
+          sourceBindingSha256: binding.bindingSha256,
+          reservationSha256: reservation.reservationSha256,
+          reservationReceiptSha256: reservation.reservationReceiptSha256,
+          restoreRunId: loaded.run.restoreRunId,
+          runtimeEpochSha256: activated.runtimeEpochSha256,
+          runtimeBindingSha256: CaptureRestore.tenantTelemetryCaptureRestoreRuntimeBindingSha256(activated, journal.control),
+          runtimeControlEvidenceSha256: activated.evidenceSha256,
+          runtimeControlGeneration: activated.controlGeneration,
+          replayReceiptSha256: receipt.receiptSha256,
+          sealedJournalHeadRootSha256: loaded.run.sealedTargetRootSha256,
+          activatedAtDbMs: activated.activatedAtDbMs,
+        }, maintenance.checkpoint, this.requireTenantTelemetryRefKey());
+        await conn.query(`INSERT INTO tenant_telemetry_capture_restore_history_receipts
+          (restore_run_id,backup_id,checkpoint_sha256,artifact_manifest_sha256,
+           source_snapshot_sha256,provider_evidence_sha256,runtime_epoch_sha256,
+           history_receipt_sha256,activated_at_db_ms,receipt_json)
+          VALUES (?,?,?,?,?,?,?,?,?,?)`, [history.restoreRunId, history.backupId,
+          history.checkpointSha256, history.artifactManifestSha256,
+          history.sourceSnapshotSha256, history.providerEvidenceSha256,
+          history.runtimeEpochSha256, history.receiptSha256, history.activatedAtDbMs, json(history)]);
+        const storedHistory = await this.readCaptureRestoreHistoryReceipt(
+          conn, selector.restoreRunId, maintenance.checkpoint, "FOR SHARE");
+        if (!storedHistory || storedHistory.receiptSha256 !== history.receiptSha256) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+      }
       await conn.commit();
       return activated;
     } catch (error) {

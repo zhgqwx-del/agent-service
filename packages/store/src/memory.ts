@@ -866,7 +866,9 @@ import * as BackupCatalog from "./backup-catalog.js";
 import * as CaptureRestore from "./tenant-telemetry-capture-restore.js";
 import type { TenantTelemetryCaptureBackupCheckpointRecord, TenantTelemetryCaptureBackupCheckpointStore,
   SealTenantTelemetryCaptureBackupCheckpointInput, AssertTenantTelemetryCaptureBackupCheckpointUnchangedInput,
-  TenantTelemetryCaptureRestoreBackupBinding } from "./tenant-telemetry-capture-restore-store.js";
+  TenantTelemetryCaptureRestoreBackupBinding, TenantTelemetryCaptureRestoreMaintenanceSelector,
+  TenantTelemetryCaptureRestoreMaintenance } from "./tenant-telemetry-capture-restore-store.js";
+import { validateTenantTelemetryCaptureRestoreMaintenanceSelector } from "./tenant-telemetry-capture-restore-store.js";
 import * as BackupCatalogAdapter from "./backup-catalog-adapter/common.js";
 import * as TenantTelemetry from "./tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "./tenant-telemetry-writer.js";
@@ -917,6 +919,11 @@ interface MemoryTenantCredentialTargetReference {
   ciphertext: Buffer;
 }
 
+type MemoryCaptureRestoreMaintenanceContext = {
+  selector: Readonly<TenantTelemetryCaptureRestoreMaintenanceSelector>;
+  record: TenantTelemetryCaptureBackupCheckpointRecord;
+  originalRuntime: Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>;
+};
 const clone = <T>(v: T): T => structuredClone(v);
 
 function sameTenantRestorePublicationIdentity(
@@ -1610,6 +1617,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private readonly retainedSourceCanonicalReceipts = new Map<string, RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureReceipt>();
   private readonly tenantTelemetryCaptureBackupCheckpoints = new Map<string, TenantTelemetryCaptureBackupCheckpointRecord>();
   private readonly tenantTelemetryCaptureRestoreBackupBindings = new Map<string, TenantTelemetryCaptureRestoreBackupBinding>();
+  private readonly tenantTelemetryCaptureRestoreHistories = new Map<string, CaptureRestore.TenantTelemetryCaptureRestoreHistoryReceipt>();
+  // This context exists only inside synchronous, private source READ audits.
+  // It is never exposed, retained across await, or used for destructive eligibility.
+  private captureRestoreMaintenanceReadContext?: MemoryCaptureRestoreMaintenanceContext;
 
   constructor(
     private readonly storeClock: { now(): number } = { now: () => Date.now() },
@@ -1787,7 +1798,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   /** Memory semantics only, deliberately backend-bound. A MySQL logical artifact must NEVER
    * substitute these envelopes for mysql-v1 physical rows or claim cross-backend root equality.
    * No await occurs between source validation, collection and the eventual atomic publication. */
-  private collectMemoryCaptureBackupCheckpoint(backupId: string): TenantTelemetryCaptureBackupCheckpointRecord | null {
+  private collectMemoryCaptureBackupCheckpoint(backupId: string,
+    maintenance?: MemoryCaptureRestoreMaintenanceContext): TenantTelemetryCaptureBackupCheckpointRecord | null {
     this.assertTenantTelemetryWriterGlobalRelations();
     const capture = this.assertMemoryPersistedProviderCaptureControl();
     if (!capture) {
@@ -1809,11 +1821,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const key = this.tenantTelemetryRefKeyForUse();
     const anchor = this.tenantBackupSnapshotAnchors.get(backupId);
     const catalog = this.readTenantBackupCatalogControl();
-    const runtime = this.readTenantRestoreRuntimeControl();
+    const runtime = maintenance?.originalRuntime ?? this.readTenantRestoreRuntimeControl();
     const journal = this.readTenantRestoreJournalControl();
     const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
     const blob = this.readMemoryBlobStorageControl();
-    const head = this.tenantBackupCatalogHeadForRead();
+    const head = maintenance && anchor ? { catalogSequence: anchor.sourceCatalogSequence,
+      catalogEventRootSha256: anchor.sourceCatalogEventRootSha256 } : this.tenantBackupCatalogHeadForRead();
     if (!anchor || catalog.state !== "active" || runtime.state !== "active" || runtime.lineageKind !== "primary"
       || journal.controlGeneration !== 1 || lifecycle.state !== "active" || blob.controlGeneration !== 1
       || anchor.backupId !== backupId || anchor.controlEvidenceSha256 !== catalog.evidenceSha256
@@ -2051,6 +2064,159 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       !== PersistedCapture.persistedProviderCaptureCanonicalJson(expected)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
   }
 
+  private memoryCaptureHistoryActivationBinding(context: MemoryCaptureRestoreMaintenanceContext,
+    event: Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>)
+    : CaptureRestore.TenantTelemetryCaptureRestoreActivationBinding {
+    const { selector, record } = context;
+    const entry = this.tenantBackupCatalogEntries.get(selector.backupId);
+    const binding = this.tenantBackupRestoreSourceBindings.get(selector.restoreRunId);
+    const reservation = this.tenantBackupRuntimeReservations.get(selector.restoreRunId);
+    const run = this.tenantRestoreReplayRuns.get(selector.restoreRunId);
+    const receipt = run && this.assertTenantRestoreReplayRunEvidence(run).receipt;
+    const journal = this.readTenantRestoreJournalControl();
+    if (!entry || !binding || !reservation || !run || !receipt
+      || event.lineageKind !== "restore" || event.updateKind !== "restore_activation"
+      || event.restoreRunId !== selector.restoreRunId || event.runtimeEpochSha256 !== run.runtimeEpochSha256
+      || event.replayReceiptSha256 !== receipt.receiptSha256
+      || event.verifiedHeadRootSha256 !== run.sealedTargetRootSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return { backupId: selector.backupId, anchorSha256: record.checkpoint.anchorSha256,
+      checkpointSha256: record.checkpoint.checkpointSha256,
+      artifactManifestSha256: entry.artifactManifestSha256, sourceSnapshotSha256: entry.sourceSnapshotSha256,
+      providerEvidenceSha256: entry.providerEvidenceSha256, sourceBindingSha256: binding.bindingSha256,
+      reservationSha256: reservation.reservationSha256, reservationReceiptSha256: reservation.reservationReceiptSha256,
+      restoreRunId: selector.restoreRunId, runtimeEpochSha256: event.runtimeEpochSha256,
+      runtimeBindingSha256: CaptureRestore.tenantTelemetryCaptureRestoreRuntimeBindingSha256(event, journal),
+      runtimeControlEvidenceSha256: event.evidenceSha256, runtimeControlGeneration: event.controlGeneration,
+      replayReceiptSha256: receipt.receiptSha256, sealedJournalHeadRootSha256: run.sealedTargetRootSha256,
+      activatedAtDbMs: event.activatedAtDbMs };
+  }
+
+  private memoryCaptureMaintenanceContext(selector: Readonly<TenantTelemetryCaptureRestoreMaintenanceSelector>)
+    : MemoryCaptureRestoreMaintenanceContext {
+    validateTenantTelemetryCaptureRestoreMaintenanceSelector(selector);
+    if (this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly !== true || process.env.NODE_ENV === "production") {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    this.assertTenantBackupCatalogGlobalRelations();
+    this.assertTenantRestoreReplayGlobalRelations();
+    const entry = this.tenantBackupCatalogEntries.get(selector.backupId);
+    const anchor = this.tenantBackupSnapshotAnchors.get(selector.backupId);
+    const binding = this.tenantBackupRestoreSourceBindings.get(selector.restoreRunId);
+    const reservation = this.tenantBackupRuntimeReservations.get(selector.restoreRunId);
+    const run = this.tenantRestoreReplayRuns.get(selector.restoreRunId);
+    if (!entry || !anchor || !binding || !reservation || !run
+      || !["prepared", "replay_sealed", "active"].includes(run.phase)
+      || entry.artifactManifestSha256 !== selector.artifactManifestSha256
+      || entry.sourceSnapshotSha256 !== selector.sourceSnapshotSha256
+      || entry.providerEvidenceSha256 !== selector.providerEvidenceSha256
+      || binding.restoreRunId !== selector.restoreRunId || binding.backupId !== selector.backupId
+      || binding.entrySha256 !== entry.entrySha256 || binding.anchorSha256 !== anchor.anchorSha256
+      || binding.runtimeEpochSha256 !== run.runtimeEpochSha256
+      || run.sourceBackupSha256 !== entry.sourceBackupSha256
+      || reservation.restoreRunId !== selector.restoreRunId || reservation.backupId !== selector.backupId
+      || reservation.bindingSha256 !== binding.bindingSha256 || reservation.entrySha256 !== entry.entrySha256
+      || reservation.reservationSha256 !== selector.reservationSha256
+      || reservation.reservationReceiptSha256 !== selector.reservationReceiptSha256
+      || [...this.tenantRestoreReplayRuns.values()].some((candidate) => candidate.restoreRunId !== selector.restoreRunId
+        && (candidate.phase === "prepared" || candidate.phase === "replay_sealed"))) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const record = this.selectMemoryCaptureRestoreCheckpoint(entry, anchor, selector.checkpointSha256);
+    if (!record) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    this.assertMemoryCaptureRestoreBackupBinding(record, entry, binding, reservation);
+    const originalRuntime = this.tenantRestoreRuntimeControlEvents.get(record.checkpoint.sourceRuntimeControlGeneration);
+    const current = this.readTenantRestoreRuntimeControl(); // Reconstructs the complete real immutable event/head chain.
+    const journal = this.readTenantRestoreJournalControl();
+    if (!originalRuntime || originalRuntime.lineageKind !== "primary"
+      || originalRuntime.evidenceSha256 !== record.checkpoint.sourceRuntimeControlEvidenceSha256
+      || originalRuntime.runtimeEpochSha256 !== record.checkpoint.sourceRuntimeEpochSha256
+      || originalRuntime.verifiedHeadRootSha256 !== record.checkpoint.journalHeadRootSha256
+      || PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(originalRuntime, journal)
+        !== record.checkpoint.sourceRuntimeBindingSha256 || current.state !== "active") {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const context = { selector, record, originalRuntime };
+    const history = this.tenantTelemetryCaptureRestoreHistories.get(selector.restoreRunId);
+    // This consumer is an original-primary -> one exact restore lineage. It
+    // cannot turn an unrelated history footprint into a second restore permit.
+    if ([...this.tenantTelemetryCaptureRestoreHistories.keys()].some((key) => key !== selector.restoreRunId)) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    if (run.phase === "active") {
+      if (!history || current.lineageKind !== "restore" || current.restoreRunId !== run.restoreRunId
+        || current.runtimeEpochSha256 !== run.runtimeEpochSha256 || current.replayReceiptSha256 !== run.terminalReceiptSha256) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      const activation = this.tenantRestoreRuntimeControlEvents.get(history.runtimeControlGeneration);
+      if (!activation || current.controlGeneration < activation.controlGeneration) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      CaptureRestore.validateTenantTelemetryCaptureRestoreHistoryReceipt(history, record.checkpoint, this.tenantTelemetryRefKeyForUse());
+      CaptureRestore.assertTenantTelemetryCaptureRestoreActivationBinding(history,
+        this.memoryCaptureHistoryActivationBinding(context, activation));
+    } else if (history || current.lineageKind !== "primary"
+      || current.runtimeEpochSha256 !== originalRuntime.runtimeEpochSha256
+      || PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(current, journal)
+        !== record.checkpoint.sourceRuntimeBindingSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return context;
+  }
+
+  private auditMemoryCaptureMaintenanceSources(context: MemoryCaptureRestoreMaintenanceContext): void {
+    const previous = this.captureRestoreMaintenanceReadContext;
+    try {
+      this.captureRestoreMaintenanceReadContext = context;
+      const actual = this.collectMemoryCaptureBackupCheckpoint(context.selector.backupId, context);
+      if (!actual) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      CaptureRestore.assertTenantTelemetryCaptureBackupCheckpointUnchanged(context.record.checkpoint,
+        actual.checkpoint, this.tenantTelemetryRefKeyForUse());
+    } finally { this.captureRestoreMaintenanceReadContext = previous; }
+  }
+
+  async openTenantTelemetryCaptureRestoreMaintenance(selector: TenantTelemetryCaptureRestoreMaintenanceSelector)
+    : Promise<TenantTelemetryCaptureRestoreMaintenance> {
+    validateTenantTelemetryCaptureRestoreMaintenanceSelector(selector);
+    const selected = Object.freeze(clone(selector));
+    let closed = false;
+    const checked = (runId = selected.restoreRunId) => {
+      if (closed || runId !== selected.restoreRunId) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      const context = this.memoryCaptureMaintenanceContext(selected);
+      this.auditMemoryCaptureMaintenanceSources(context);
+      return context;
+    };
+    checked();
+    return Object.freeze({
+      getTenantRestoreReplayRun: async (id: string) => { checked(id); return this.getTenantRestoreReplayRun(id); },
+      getTenantRestoreReplaySealedTargets: async (id: string) => { checked(id); return this.getTenantRestoreReplaySealedTargets(id); },
+      listTenantRestoreReplayEntries: async (id: string, options: RestoreJournal.ListTenantRestoreReplayEntriesOptions) => {
+        checked(id); return this.listTenantRestoreReplayEntries(id, options);
+      },
+      recordTenantRestoreReplayFence: async (input: RestoreJournal.RecordTenantRestoreReplayFenceInput) => {
+        const staged = clone(input);
+        checked(staged.restoreRunId); return this.recordTenantRestoreReplayFence(staged);
+      },
+      sealTenantRestoreReplay: async (id: string) => { checked(id); return this.sealTenantRestoreReplay(id); },
+      abortTenantRestoreReplay: async (id: string) => { checked(id); return this.abortTenantRestoreReplay(id); },
+      getTenantRestoreReplayReceipt: async (id: string) => { checked(id); return this.getTenantRestoreReplayReceipt(id); },
+      getTenantRestoreRuntimeControl: async () => { checked(); return this.getTenantRestoreRuntimeControl(); },
+      getTenantRestoreRuntimeHeads: async () => { checked(); return this.getTenantRestoreRuntimeHeads(); },
+      getTenantRestoreJournalControl: async () => { checked(); return this.getTenantRestoreJournalControl(); },
+      getTenantRestoreJournalControlTargets: async () => { checked(); return this.getTenantRestoreJournalControlTargets(); },
+      activateTenantRestoreRuntime: async (input: RestoreJournal.ActivateTenantRestoreRuntimeInput) => {
+        const staged = clone(input);
+        const context = checked(staged.restoreRunId);
+        return this.activateTenantRestoreRuntimeSync(staged, context);
+      },
+      getTenantTelemetryCaptureRestoreHistoryReceipt: async () => {
+        checked(); return clone(this.tenantTelemetryCaptureRestoreHistories.get(selected.restoreRunId) ?? null);
+      },
+      close: async () => { closed = true; },
+    });
+  }
+
   private retainedSourceAdmissionFamilyFor(
     requestId: string,
   ): RetainedSourceAdmissionFamily | null {
@@ -2143,13 +2309,23 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   private assertRetainedSourceEligiblePrimaryNow(requestId: string): void {
+    if (this.captureRestoreMaintenanceReadContext) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
+    this.assertRetainedSourcePrimaryBindings(requestId, this.readTenantRestoreRuntimeControl());
+  }
+
+  private assertRetainedSourceReadLineage(requestId: string): void {
+    this.assertRetainedSourcePrimaryBindings(requestId,
+      this.captureRestoreMaintenanceReadContext?.originalRuntime ?? this.readTenantRestoreRuntimeControl());
+  }
+
+  private assertRetainedSourcePrimaryBindings(requestId: string,
+    runtime: RestoreJournal.TenantRestoreRuntimeControlRecord): void {
     const cohort = this.retainedSourceT1Receipts.get(requestId);
     const profile = cohort?.profile;
     if (!cohort || cohort.eligibility !== "eligible_retained" || profile?.kind !== "eligible-primary") {
       throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
     }
     const primary = profile.primaryBinding;
-    const runtime = this.readTenantRestoreRuntimeControl();
     const journal = this.readTenantRestoreJournalControl();
     const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
     const capture = this.assertMemoryPersistedProviderCaptureControl();
@@ -2826,10 +3002,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
 
   private persistedProviderCapturePrerequisites(): PersistedCapture.TenantTelemetryPersistedProviderCapturePrerequisites {
     const journal = this.readTenantRestoreJournalControl();
-    const runtime = this.readTenantRestoreRuntimeControl();
+    const runtime = this.captureRestoreMaintenanceReadContext?.originalRuntime ?? this.readTenantRestoreRuntimeControl();
     const binding = PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime, journal);
     if (runtime.state !== "active" || journal.controlGeneration !== 1
-      || [...this.tenantRestoreReplayRuns.values()].some((run) => run.phase === "prepared" || run.phase === "replay_sealed")) {
+      || (!this.captureRestoreMaintenanceReadContext
+        && [...this.tenantRestoreReplayRuns.values()].some((run) => run.phase === "prepared" || run.phase === "replay_sealed"))) {
       throw new PersistedCapture.PersistedProviderCaptureConflictError("capture restore runtime is not ready");
     }
     return { runtimeEpochSha256: runtime.runtimeEpochSha256, runtimeBindingSha256: binding,
@@ -2996,7 +3173,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       const planReceipt = this.tenantPurgePlanReceipts.get(requestId);
       if (!planReceipt || catalog) throw new RetainedSource.TenantTelemetryRetainedSourceIntegrityError();
       validateTenantPurgePlanCompletionProof(planJob, this.tenantPurgePlanEntriesFor(planJob), planReceipt);
-      this.assertRetainedSourceEligiblePrimaryNow(requestId);
+      this.assertRetainedSourceReadLineage(requestId);
       phase = this.retainedSourceEvidencePhase(requestId);
       const candidate = this.retainedSourceCatalogProof(planJob, planReceipt, phase);
       if (phase !== "live") {
@@ -12234,6 +12411,16 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   async activateTenantRestoreRuntime(
     input: RestoreJournal.ActivateTenantRestoreRuntimeInput,
   ): Promise<RestoreJournal.TenantRestoreRuntimeControlRecord> {
+    const binding = this.tenantBackupRestoreSourceBindings.get(input.restoreRunId);
+    if (this.tenantTelemetryCaptureRestoreBackupBindings.has(input.restoreRunId)
+      || (binding && this.tenantTelemetryCaptureBackupCheckpoints.has(binding.backupId))) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return this.activateTenantRestoreRuntimeSync(input);
+  }
+
+  private activateTenantRestoreRuntimeSync(input: RestoreJournal.ActivateTenantRestoreRuntimeInput,
+    maintenance?: MemoryCaptureRestoreMaintenanceContext): RestoreJournal.TenantRestoreRuntimeControlRecord {
     const stagedInput = clone(input);
     RestoreJournal.validateActivateTenantRestoreRuntimeInput(stagedInput);
     this.assertTenantRestoreReplayGlobalRelations();
@@ -12303,6 +12490,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const headsBefore = new Map(this.tenantRestoreRuntimeHeads);
     const eventsBefore = new Map(this.tenantRestoreRuntimeControlEvents);
     const runsBefore = new Map(this.tenantRestoreReplayRuns);
+    const historiesBefore = new Map(this.tenantTelemetryCaptureRestoreHistories);
+    const history = maintenance ? clone(CaptureRestore.createTenantTelemetryCaptureRestoreHistoryReceipt(
+      this.memoryCaptureHistoryActivationBinding(maintenance, activated), maintenance.record.checkpoint,
+      this.tenantTelemetryRefKeyForUse())) : undefined;
+    const outbound = clone(activated); // Prepare every outbound value before publishing any runtime/history row.
     try {
       this.tenantRestoreRuntimeHeads.clear();
       for (const target of evidence.targets) {
@@ -12314,16 +12506,19 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         activated,
       );
       this.tenantRestoreReplayRuns.set(run.restoreRunId, activeRun);
+      if (history) this.tenantTelemetryCaptureRestoreHistories.set(run.restoreRunId, history);
       this.assertTenantRestoreReplayRunEvidence(activeRun);
       this.readTenantRestoreRuntimeControl();
+      if (maintenance) this.auditMemoryCaptureMaintenanceSources(this.memoryCaptureMaintenanceContext(maintenance.selector));
     } catch (error) {
       restoreMapSnapshot(this.tenantRestoreRuntimeControls, controlsBefore);
       restoreMapSnapshot(this.tenantRestoreRuntimeHeads, headsBefore);
       restoreMapSnapshot(this.tenantRestoreRuntimeControlEvents, eventsBefore);
       restoreMapSnapshot(this.tenantRestoreReplayRuns, runsBefore);
+      restoreMapSnapshot(this.tenantTelemetryCaptureRestoreHistories, historiesBefore);
       throw error;
     }
-    return clone(activated);
+    return outbound;
   }
 
   async getTenantRestoreRuntimeControl(

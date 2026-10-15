@@ -1,5 +1,11 @@
 # agent-service 协作约定
 
+## 当前未发布0056本地检查点（2026-10-15）
+
+- `bbe5ab8`之后的exact-run maintenance/history与backup-v2 cold-open已实际接入，但不是完整新epoch恢复或新写授权。0056只加history表/2不可变guard，真实新隔离库校准720-trigger；旧0055不改，禁止混跑旧writer。
+- 共享/CI门禁三文件314passed、最终CLI整文件66passed、Memory新整文件24passed；真实MySQL六个正反例及独立RC→RR并发一项分段通过，不能冒称最终整文件7/7。冻结bbe5旧binary的0055→0056历史夹具3/3和最终typecheck通过；首轮2+4/次轮6+1 SQL、两轮历史oracle及测试union失败保留PROGRESS。CLI native close/lateDispose、operator/verified release都必须真正all-settle后才释放锁/key，250ms只限制前台等待，close失败不是成功取消证明。不要为文档或检查点重跑已通过的定向/full套件；完整纵向功能包冻结后再一次全量/相关S3，较大阶段一次CI。
+- 历史receipt必须绑定真实immutable restore_activation event及合法currentchain，不能用publisher后的mutable generation重签；只读历史getter不授予mutation/新capture/旧operation recovery。普通pending和new-epoch普通启动仍拒、0054 destructive仍same original primary-only，0037/外部删除/自动清理off/completion=false保持。root唯一执行器，作者冻结后不改；main/origin293及其旧CI不为dirty新草稿背书。
+
 ## 本worktree的最新M1开发检查点（2026-10-15）
 
 - 原2932318的Actions38714666463五项全success，旧watch61689已exit0；不再等待或重启。用户已授权提前编码与后续新隔离MySQL/MinIO验证，root唯一执行测试/构建/DB/Git；author只编写和只读审查，freeze后不得擅改。仍不合入、推送、部署或激活当前未闭环纵向包。
