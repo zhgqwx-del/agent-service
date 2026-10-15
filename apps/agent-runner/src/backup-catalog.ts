@@ -61,6 +61,7 @@ operator ref key. Ordinary startup remains fail closed before the separate captu
 activate-capture-selected additionally requires TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK=1,
 the four TELEMETRY_CAPTURE_LOCAL_ONLY/FLEET_STOPPED/LEGACY_WRITERS_DRAINED/PRODUCER_READY_ACK=1
 declarations and TELEMETRY_CAPTURE_CONFIGURED_FLEET_ROOT_SHA256. History alone never grants writes.
+Catalog resolution stays explicit.
 resolve-selected separately requires BACKUP_RESTORE_CATALOG_RESOLUTION_ACK=1. It authenticates
 the full external catalog chain, already active exact target run and committed capture cutover before its external CAS
 and local projection; it never activates runtime/capture or grants ordinary writer authority.
