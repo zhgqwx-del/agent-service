@@ -1,5 +1,9 @@
 # agent-service
 
+最新本地候选（2026-10-15）：新增[单 runner 并发基线工具](docs/operations/runner-load-benchmark.md)，真实 MySQL/独立 Redis/FakeVendor 下 1000 个 turn 全部正常完成，SSE 与数据库已提交峰值均为 1000，持久化对账及清理通过。压测同时发现并修复不同 session 首写的缺键 gap-lock 死锁；新增真实回归 6 项及相关既有 MySQL 35 项通过。工具37项、CLI53项、必跑清单31项、typecheck通过；候选required=127（已发布2932318为124）、62旧group不变。以上限 macOS arm64/Node24/假模型，不是全量、Linux CI或生产容量验收；本候选尚未推送。
+
+用户已允许在独立 worktree 提前编写 M1 精确备份/新 epoch 恢复代码及纯测试；不合入、部署或激活，真实服务测试不争用，发布仍须当前阶段 CI 全绿。共享契约正在开发，恢复能力尚未闭环，M1未冻结、M2冻结、M3未开始。最新证据以PROGRESS顶部和末节为准，下方旧“CI绿后才编码”的开始时序不再适用。
+
 M4新增离线VM发布签名候选：`pnpm sign:vm-release`用显式受保护Ed25519文件签署clean发布的精确身份；独立工具的`inspect-signed`/`unpack-signed`核对可信公钥pin、选定role/commit、实际归档/manifest及工具自身字节，没有unsigned fallback。它不生成生产密钥、不安装或晋级环境；生产信任根、OCI签名与环境发布仍未完成。操作及边界见[离线VM发布签名](docs/operations/local-and-deployment.md#离线-vm-发布签名)。实际功能包/整树/CI结果只看PROGRESS，不能借旧验收背书。
 
 验证节奏：日常先跑相关定向测试，多个相关改动形成一个功能包后再做完整本地验收，较大阶段集中推送并等待CI。`pnpm test:coverage`合并同环境具名专项与主coverage，保留逐文件非零/零skip及coverage门槛；历史、S3、cluster和实际发布包装配独立验收。新driver首轮真实失败与局部复验均记录于PROGRESS，不把旧报告当新版本通过，也尚未宣称完整提速比例。方法见[分层验证路径](docs/operations/development-and-ci-guide.md#6-分层验证路径)。

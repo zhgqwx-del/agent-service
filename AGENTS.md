@@ -1,5 +1,12 @@
 # agent-service 协作约定
 
+## 最新开发检查点（2026-10-15，本地候选）
+
+- M4 `benchmark:runner` 已完成一次真实本地1000/1000 FakeVendor基线：双峰值1000、1000正常turn、2000items/1000usage与billing/9000events对账、cleanup通过，82.479秒；只限darwin/arm64/Node24，不是生产SLO/容量或新整树验收。操作见`docs/operations/runner-load-benchmark.md`。
+- 压测复现的资源首次INSERT缺键死锁已定向修复：RR非锁定probe后，existing raw PK与reference-only仍current锁定并核owner/type；仅本batch实际INSERT缺ID不预取gap，plain INSERT全局唯一键冲突整笔回滚，不UPSERT/重试/切RC。0053 prior只读精确existing项；所有source/hold/capture门禁不变。真实MySQL6新+8Blob/隔离+27capture通过，pure37/CLI53/manifest31/typecheck通过；候选required127、原62group不变，完整功能包verify/CI尚待。
+- 用户已明确允许独立M1 worktree提前编码与纯测试；不合入、部署或激活，真实MySQL/MinIO不与当前任务争用，发布仍须当前阶段CI全绿。旧“CI全绿前禁止编码”仅开始时序被覆盖，不放宽任何执行权限；旧receipt不可改写、0054primary-only删除资格、0037/外部删除/自动清理off与completion=false保持。M1契约不是恢复能力完成，后续必须纵向接入实际backup/restore/store/worker。
+- main/origin仍2932318；同Actions38714666463两个image及history成功，history独立证明47文件306passed零skip，core仍运行，聚合test未完成。上述候选未推送，不取消/重启长CI，也不借293证明候选通过；最新事实见PROGRESS末节。
+
 ## 开发与验证节奏（2026-10-15）
 
 - CI并行候选仅把完整history wrapper移至独立runner/MySQL/Redis；core、history、image矩阵均success，原名`test`聚合才成功。core/history仍为180分钟，各例deadline和47文件清单不变；main-required=124，62个group不变。67eaa2d全量exit1保留，0039原失败未复现/原因未知；集群在76+唯一补丁复验3/3后保存1d3be15，clean1d3另补T3g/SDK/六入口/双VM后置通过，不重启整轮、不放宽watchdog或跳过业务断言。开发VM profile未执行签名；分段不是全量绿，最终新SHA仍须完整五个CI检查，事实只看PROGRESS末节。

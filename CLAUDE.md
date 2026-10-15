@@ -1,5 +1,11 @@
 # agent-service 项目记忆
 
+最新本地候选（2026-10-15）：M4 runner-load在真实MySQL/自有非持久Redis/FakeVendor下1000/1000正常完成，SSE/MySQL峰值均1000、DB694次采样，对账和cleanup通过，实际82.479秒，runner RSS峰值440025088 bytes。它不是模型TTFT/SLO、持续负载或生产验收。首次两轮10-turn各1成功/9个HTTP失败；新双连接barrier红测精确复现ER_LOCK_DEADLOCK，原失败均保留。最窄RR缺键锁修复后真实6新+8Blob/隔离+27capture=41项零fail/skip，pure37/CLI53/manifest31/typecheck通过；候选required127/原62group。还没有本候选整树verify/新CI，不能借旧成功背书；操作见`docs/operations/runner-load-benchmark.md`。
+
+用户新确认允许独立M1恢复worktree提前编码和纯测试，覆盖下方旧的开始时序；不合入/部署/激活，真实服务测试不争用，发布仍要求当前阶段CI全绿。checkpoint/history/current epoch cutover/pending recovery共享契约已开始开发，尚未被真实消费者接线验证，不是恢复完成。旧receipt不得改写，合法pending/reserved/legacyunknown须备份保留而不能升级为完整；历史read、新epoch新写和旧pending恢复授权必须分离，0054primary-only destructive资格/0037/外部删除/自动清理off/completion=false不变。M1未冻结/M2冻结/M3未开始。
+
+已发布main/origin仍clean2932318，同Actions38714666463两个image/history成功，history47文件306passed零skip已下载核对，core仍运行、聚合test未完成；不重启/取消CI，也不为本地小改再次push。完整证据与本地未发布状态见PROGRESS顶部和末节。
+
 CI-only并行候选把完整历史wrapper移至独立runner及自有MySQL/Redis，不减少用例或改变deadline；core/history保留180分钟。原名`test`以always与exact三项needs汇总，只有core、history、两个image全success才通过。main-required=124、62group不变。67eaa2d全量exit1保留，0039原失败未复现/原因未知；只复验失败及受影响部分、补未执行后置。集群在76+唯一补丁上3/3通过后保存1d3be15，clean1d3另补T3g/SDK/六入口/实际双VM后置通过，开发VM profile未执行签名，不借分段称全量通过。最终新SHA五个CI检查仍须全绿；原业务断言、默认gate、0037及completion=false不变，最新状态只看PROGRESS末节。
 
 M4离线VM签名候选复用既有受限tar/独立Node工具：`sign:vm-release`只以显式owner-only Ed25519文件签署clean/publishable精确制品；`inspect-signed`/`unpack-signed`以独立SPKI pin、选定role/commit及执行工具自身hash验证，没有unsigned fallback。三新测试文件加入main-required为123，62个旧group不变，原VM group扩为七文件。它不生成产品key、不自动安装、部署、吊销或晋级，不改变M1/0037/自动清理/恢复门禁。最新失败与相关复验只看PROGRESS；不能把旧e278或817结果当新候选全量/CI通过。

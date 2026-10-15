@@ -1347,6 +1347,8 @@ quarantine是数据库完整性故障路径，不应通过普通手工体验故�
 
 ## 6. 分层验证路径
 
+本地并发测量见[单runner基线](runner-load-benchmark.md)：工具测试随相关改动跑，1000并发实测按功能包执行，不为每轮文档/诊断重复。当前M4候选必跑清单为127（2932318的124加两份工具测试及一份真实MySQL并发回归）；旧62group不变。下段124描述已发布基线，不能用其报告证明三个新增文件执行。用户另允许独立M1恢复代码提前开发/纯测试，真实服务不争用，发布仍要求现阶段CI全绿。
+
 ### 日常迭代与阶段验收（验证去重候选，2026-10-15）
 
 不必每次小改动都运行数小时全量。每轮先做`pnpm typecheck`及相关`pnpm test:<专项>`；涉及SQL、事务、删除、鉴权或租户边界时，当轮仍须执行相关真实MySQL/Redis/MinIO及并发、回滚、隔离负例。连续多轮定向通过后，在一个可验收功能包的代码/接口冻结点运行完整`verify`，触及S3/备份/恢复时还须`verify-s3`。全量失败先定位并定向修复，再对最终候选补齐完整验收，不用失败前的旧报告证明新代码通过。
@@ -1575,7 +1577,7 @@ M4的Node24目标平台目录包已实现`bundle + migrations + 完整production
 ### `test-core`：主测试与实际构建
 
 1. 凭据扫描、frozen-lockfile安装、OpenAPI/生成SDK漂移与源码/测试typecheck。
-2. `pnpm test:coverage`只跑一次main profile。独占本轮JSON与真实子进程退出状态证明每个required文件唯一、非零、全passed；具名group仅是同一执行的子集，不再另外重复跑同profile的几十个named命令，coverage门槛不变。当前manifest包含124文件（含本次CI汇总回归），62个旧group不变；数量和实际通过只看PROGRESS/当次报告。
+2. `pnpm test:coverage`只跑一次main profile。独占本轮JSON与真实子进程退出状态证明每个required文件唯一、非零、全passed；具名group仅是同一执行的子集，不再另外重复跑同profile的几十个named命令，coverage门槛不变。已发布2932318的manifest为124文件（含CI汇总回归），本地M4压测/并发回归候选为127；62个旧group不变，数量和实际通过只看PROGRESS/当次报告。
 3. 保留全部需要专用flag的真实S3/MinIO套件：Blob、mover、restore journal、backup catalog/reconcile/旧快照roundtrip/加密制品、managed telemetry writer、真实HTTP→PiEngine→MySQL→MinIO capture、GET-only observer及非生产journal。五bucket共享同机MinIO，只证明协议，不证明云IAM/KMS或独立故障域。
 4. broad cluster运行真实多进程接管与隔离；另保留T3g cluster exact报告，证明mixed-worker/namespace/fleet矩阵零skip。它不是managed Redis Cluster灾备证明。
 5. `pnpm build:check`构建SDK、runner/router bundle并启动plain Node；四个维护CLI另有具名artifact检查；dist runner/router还在临时MySQL/MinIO上做应用装配smoke，凭据只给runner。

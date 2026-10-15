@@ -42030,39 +42030,76 @@ export class MysqlSessionStore implements
     const turnIds = [...turnReferences].sort();
     if (turnIds.length) {
       const placeholders = turnIds.map(() => "?").join(",");
-      const [rows] = await conn.query<Row[]>(
-        `SELECT turn_id, session_id, user_id
-           FROM turns WHERE turn_id IN (${placeholders})
-          ORDER BY turn_id FOR UPDATE`,
+      const [visible] = await conn.query<Row[]>(
+        `SELECT turn_id FROM turns WHERE turn_id IN (${placeholders}) ORDER BY turn_id`,
         turnIds,
       );
-      for (const row of rows) {
-        if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
-          throw new Error("turn identity conflicts with another session owner");
+      const visibleIds = new Set(visible.map((row) => String(row.turn_id)));
+      // A missing globally keyed row must not take an RR next-key lock before its INSERT:
+      // distinct sessions can otherwise hold compatible gap locks and deadlock on insert intention.
+      // Reference-only ids retain the original current locking read. A concurrent first writer of
+      // the same id is still rejected by the unique INSERT, never converted into an UPDATE.
+      const lockIds = [...new Set([
+        ...visibleIds,
+        ...turnIds.filter((id) => id !== batch.turn?.id),
+      ])].sort();
+      if (lockIds.length) {
+        const lockedPlaceholders = lockIds.map(() => "?").join(",");
+        const [rows] = await conn.query<Row[]>(
+          `SELECT turn_id, session_id, user_id
+             FROM turns WHERE turn_id IN (${lockedPlaceholders})
+            ORDER BY turn_id FOR UPDATE`,
+          lockIds,
+        );
+        const lockedIds = new Set(rows.map((row) => String(row.turn_id)));
+        if ([...visibleIds].some((id) => !lockedIds.has(id))) {
+          throw new Error("observed turn disappeared before its identity lock");
         }
-        if (batch.turn?.id === row.turn_id) existing.turnIds.add(String(row.turn_id));
+        for (const row of rows) {
+          if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
+            throw new Error("turn identity conflicts with another session owner");
+          }
+          if (batch.turn?.id === row.turn_id) existing.turnIds.add(String(row.turn_id));
+        }
       }
     }
 
     const itemIds = [...itemReferences].sort();
     if (itemIds.length) {
       const placeholders = itemIds.map(() => "?").join(",");
-      const [rows] = await conn.query<Row[]>(
-        `SELECT item_id, session_id, user_id, turn_id, type
-           FROM items WHERE item_id IN (${placeholders})
-          ORDER BY item_id FOR UPDATE`,
+      const [visible] = await conn.query<Row[]>(
+        `SELECT item_id FROM items WHERE item_id IN (${placeholders}) ORDER BY item_id`,
         itemIds,
       );
-      for (const row of rows) {
-        if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
-          throw new Error("item identity conflicts with another session owner");
+      const visibleIds = new Set(visible.map((row) => String(row.item_id)));
+      const writtenIds = new Set((batch.items ?? []).map((item) => item.id));
+      const lockIds = [...new Set([
+        ...visibleIds,
+        ...itemIds.filter((id) => !writtenIds.has(id)),
+      ])].sort();
+      if (lockIds.length) {
+        const lockedPlaceholders = lockIds.map(() => "?").join(",");
+        const [rows] = await conn.query<Row[]>(
+          `SELECT item_id, session_id, user_id, turn_id, type
+             FROM items WHERE item_id IN (${lockedPlaceholders})
+            ORDER BY item_id FOR UPDATE`,
+          lockIds,
+        );
+        const lockedIds = new Set(rows.map((row) => String(row.item_id)));
+        if ([...visibleIds].some((id) => !lockedIds.has(id))) {
+          throw new Error("observed item disappeared before its identity lock");
         }
-        const incoming = observedItems.get(String(row.item_id));
-        if (incoming) {
-          if (row.turn_id !== incoming.turnId || row.type !== incoming.type) {
-            throw new Error("item identity cannot change its turn or type");
+        for (const row of rows) {
+          if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
+            throw new Error("item identity conflicts with another session owner");
           }
-          existing.itemIds.add(String(row.item_id));
+          const incoming = observedItems.get(String(row.item_id));
+          if (incoming) {
+            if (row.turn_id !== incoming.turnId || row.type !== incoming.type) {
+              throw new Error("item identity cannot change its turn or type");
+            }
+            existing.itemIds.add(String(row.item_id));
+          }
         }
       }
     }
@@ -42070,28 +42107,45 @@ export class MysqlSessionStore implements
     const approvalIds = [...observedApprovals.keys()].sort();
     if (approvalIds.length) {
       const placeholders = approvalIds.map(() => "?").join(",");
-      const [rows] = await conn.query<Row[]>(
-        `SELECT approval_id, session_id, user_id, turn_id, body
-           FROM approvals WHERE approval_id IN (${placeholders})
-          ORDER BY approval_id FOR UPDATE`,
+      const [visible] = await conn.query<Row[]>(
+        `SELECT approval_id FROM approvals WHERE approval_id IN (${placeholders}) ORDER BY approval_id`,
         approvalIds,
       );
-      for (const row of rows) {
-        if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
-          throw new Error("approval identity conflicts with another session owner");
+      const visibleIds = new Set(visible.map((row) => String(row.approval_id)));
+      const writtenIds = new Set((batch.approvals ?? []).map((approval) => approval.id));
+      const lockIds = [...new Set([
+        ...visibleIds,
+        ...approvalIds.filter((id) => !writtenIds.has(id)),
+      ])].sort();
+      if (lockIds.length) {
+        const lockedPlaceholders = lockIds.map(() => "?").join(",");
+        const [rows] = await conn.query<Row[]>(
+          `SELECT approval_id, session_id, user_id, turn_id, body
+             FROM approvals WHERE approval_id IN (${lockedPlaceholders})
+            ORDER BY approval_id FOR UPDATE`,
+          lockIds,
+        );
+        const lockedIds = new Set(rows.map((row) => String(row.approval_id)));
+        if ([...visibleIds].some((id) => !lockedIds.has(id))) {
+          throw new Error("observed approval disappeared before its identity lock");
         }
-        const incoming = observedApprovals.get(String(row.approval_id));
-        const stored = parse<Approval>(row.body);
-        if (
-          !incoming
-          || row.turn_id !== incoming.turnId
-          || stored.itemId !== incoming.itemId
-          || stored.toolCallId !== incoming.toolCallId
-        ) {
-          throw new Error("approval identity cannot change its turn, item or tool call");
-        }
-        if (batch.approvals?.some((approval) => approval.id === row.approval_id)) {
-          existing.approvalIds.add(String(row.approval_id));
+        for (const row of rows) {
+          if (row.session_id !== batch.sessionId || row.user_id !== owner.userId) {
+            throw new Error("approval identity conflicts with another session owner");
+          }
+          const incoming = observedApprovals.get(String(row.approval_id));
+          const stored = parse<Approval>(row.body);
+          if (
+            !incoming
+            || row.turn_id !== incoming.turnId
+            || stored.itemId !== incoming.itemId
+            || stored.toolCallId !== incoming.toolCallId
+          ) {
+            throw new Error("approval identity cannot change its turn, item or tool call");
+          }
+          if (writtenIds.has(String(row.approval_id))) {
+            existing.approvalIds.add(String(row.approval_id));
+          }
         }
       }
     }
@@ -44042,8 +44096,15 @@ export class MysqlSessionStore implements
       const privateProjections=new Map<string,SqlCaptureFailureProjection>();
       if(this.persistedProviderCaptureSchemaInstalled){
         for(const item of items ?? []){
-          const [priorItems]=await conn.query<Row[]>("SELECT * FROM items WHERE item_id=? AND session_id=? FOR UPDATE",[item.id,batch.sessionId]);
-          const prior=priorItems[0];
+          let prior:Row|undefined;
+          if(existingResources.itemIds.has(item.id)){
+            const [priorItems]=await conn.query<Row[]>("SELECT * FROM items WHERE item_id=? AND session_id=? FOR UPDATE",[item.id,batch.sessionId]);
+            if(priorItems.length!==1 || priorItems[0]!.item_id!==item.id || priorItems[0]!.session_id!==batch.sessionId
+              || priorItems[0]!.user_id!==userId || priorItems[0]!.turn_id!==item.turnId || priorItems[0]!.type!==item.type){
+              throw new PersistedCapture.PersistedProviderCaptureIntegrityError("existing item changed before capture projection");
+            }
+            prior=priorItems[0];
+          }
           if(captureControl.state === "active" && prior?.type === "agentMessage" && prior.status === "failed" && (prior.telemetry_capture_v2_control_generation == null || Number(prior.telemetry_capture_v2_control_generation) === 0)
             && PersistedCapture.persistedProviderCaptureCanonicalJson(parse(prior.body)) !== PersistedCapture.persistedProviderCaptureCanonicalJson(item))throw new PersistedCapture.PersistedProviderCaptureConflictError("pre-cutover failed item snapshot is immutable");
           if(item.type !== "agentMessage" || item.status !== "failed")continue;
