@@ -1,6 +1,6 @@
 # agent-service 项目记忆
 
-CI-only并行候选把完整历史wrapper移至独立runner及自有MySQL/Redis，不减少用例或改变每例deadline；core/history保留180分钟job上限。原名`test`以always与exact三项needs汇总，只有core、history、image矩阵全success才通过。新CI回归使候选main-required为124，62个group不变；实际三文件264 passed零fail/skip、typecheck/scan通过，但新Actions未运行、不宣称提速。固定clean67eaa2d的集中全量自07:40Z运行且required=123，源码树不变；CI-only/文档修改不重启它，也不能把它当成新增CI回归的执行证据。最新状态以PROGRESS末节为准。
+CI-only并行候选把完整历史wrapper移至独立runner及自有MySQL/Redis，不减少用例或改变每例deadline；core/history保留180分钟job上限。原名`test`以always与exact三项needs汇总，只有core、history、image矩阵全success才通过。候选main-required为124、62group不变，三文件264定向通过，新Actions未运行。固定67eaa2d（required123）主3604 passed，但集中verify于08:48Z因冻结0039 build准备失败退出1，history287 passed/1 skipped；原预算整文件19项后续通过（原真实旧binary用例1/纯诊断18），原失败未复现、原因未知。新增诊断只输出闭合stage/退出/信号/耗时，不回显子进程日志或参数，不改产品源码或业务断言。后置另补、不重启全量，分段不冒称新SHA整树通过，最终CI仍必须完整执行；最新状态以PROGRESS末节为准。
 
 M4离线VM签名候选复用既有受限tar/独立Node工具：`sign:vm-release`只以显式owner-only Ed25519文件签署clean/publishable精确制品；`inspect-signed`/`unpack-signed`以独立SPKI pin、选定role/commit及执行工具自身hash验证，没有unsigned fallback。三新测试文件加入main-required为123，62个旧group不变，原VM group扩为七文件。它不生成产品key、不自动安装、部署、吊销或晋级，不改变M1/0037/自动清理/恢复门禁。最新失败与相关复验只看PROGRESS；不能把旧e278或817结果当新候选全量/CI通过。
 

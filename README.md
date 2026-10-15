@@ -4,7 +4,7 @@ M4新增离线VM发布签名候选：`pnpm sign:vm-release`用显式受保护Ed2
 
 验证节奏：日常先跑相关定向测试，多个相关改动形成一个功能包后再做完整本地验收，较大阶段集中推送并等待CI。`pnpm test:coverage`合并同环境具名专项与主coverage，保留逐文件非零/零skip及coverage门槛；历史、S3、cluster和实际发布包装配独立验收。新driver首轮真实失败与局部复验均记录于PROGRESS，不把旧报告当新版本通过，也尚未宣称完整提速比例。方法见[分层验证路径](docs/operations/development-and-ci-guide.md#6-分层验证路径)。
 
-CI并行候选将完整历史迁移移至独立runner；`test-core`、`test-history`及router/runner两个image检查全部成功，原名`test`汇总门禁才成功。没有减少历史用例、放宽每例deadline或共享测试库。CI门禁/清单定向三文件264项、typecheck及扫描通过，但新Actions尚未运行，不宣称已提速。固定clean `67eaa2d`的集中全量仍在独立树运行（required=123）；本次CI-only回归使候选清单为124，不能借前者证明新增测试执行。构建内容与学习入口见[GitHub Actions说明](docs/operations/development-and-ci-guide.md#8-github-actions-构建与验证)。
+CI并行候选将完整历史迁移移至独立runner；`test-core`、`test-history`及router/runner两个image检查全部成功，原名`test`汇总门禁才成功。没有减少历史用例、放宽每例deadline或共享测试库。CI门禁/清单定向三文件264项通过，新Actions尚未运行，不宣称已提速。固定clean `67eaa2d`主套件3604 passed，但整轮在冻结0039构建准备阶段退出1；随后原预算单文件19项通过（真实旧binary用例1、纯诊断18），原失败原因尚未复现。候选required为124、旧67为123，分段证明不冒称新SHA整树通过；后置及最终CI见PROGRESS。构建内容与学习入口见[GitHub Actions说明](docs/operations/development-and-ci-guide.md#8-github-actions-构建与验证)。
 
 M4新增本地候选：router与runner在各自原端口提供默认关闭的受保护`GET/HEAD /metrics`，只统计进程与固定低基数HTTP聚合，不保存owner、URL、正文或secret，也不新增服务、迁移或镜像。独立运维token不得充当业务凭证或被router转发；时延统计止于响应头就绪，不代表SSE完整寿命。五个新文件153项与兼容/验证工具合计10文件388项定向通过，实际bundle双服务默认关闭/启用鉴权装配通过；完整新verify/CI尚待。配置与手动体验见[部署契约](docs/operations/local-and-deployment.md#受保护的-l0-runtime-metrics)，不是完整可观测性或生产验收。
 

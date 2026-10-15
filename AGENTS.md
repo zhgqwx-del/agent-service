@@ -2,7 +2,7 @@
 
 ## 开发与验证节奏（2026-10-15）
 
-- CI并行候选仅把原完整history wrapper移至独立runner/MySQL/Redis；core、history、image矩阵均成功，原名`test`聚合才成功，failure/cancelled/skipped均拒绝。core/history仍为180分钟job上限，每例deadline和47文件历史清单不变。新增CI回归使候选main-required为124，62个group不变；实际264定向/typecheck/scan通过，新Actions未执行、不宣称已提速。固定clean67eaa2d的集中全量仍在另一只读树运行且required=123，不因CI-only/文档修正重启，不把旧报告冒充新回归执行。
+- CI并行候选仅把原完整history wrapper移至独立runner/MySQL/Redis；core、history、image矩阵均成功，原名`test`聚合才成功，failure/cancelled/skipped均拒绝。core/history仍为180分钟job上限，各例deadline和47文件清单不变。新增CI回归使候选main-required为124，62个group不变，实际264定向通过。固定67eaa2d主3604 passed，但整轮因0039旧build准备失败退出1、history287 passed/1 skipped；原预算整文件19项复验通过，其中只有1项是真实旧binary业务用例、18项为诊断。原失败未复现/原因未知，不能写已修复或借分段冒称整树通过；未执行的后置另补，最终新SHA仍须完整CI。不开第二轮全量、不放宽预算/跳过/旧业务断言，最新事实只看PROGRESS末节。
 - M4离线VM签名是复用既有归档/独立Node工具的候选，只新增离线发布脚本，不增加常驻服务、应用dist入口、schema或产品镜像。只签clean/publishable字节；Ed25519 private file须当前owner、0400/0600、regular/single-link，不能用.env/参数传key bytes或回显。consumer以独立可信SPKI pin、role/commit及自身import.meta.url hash核验全部元数据后才创建输出，失败不fallback。不是生产trustroot、key管理/吊销、freshness、环境晋级或安装；dirty-development验收必须明确未执行签名。新增三测试文件纳入main-required（123）及原VM group（62个group不变），不能只靠pure codec证明实际双包消费。
 - 该签名代码d671632的真实clean双包已于07:35Z在darwin/arm64/Node24通过，profile为ephemeral-test-only且productionAccepted=false；它不是最终文档commit的制品或整树/Linux CI证明，最新结果只看PROGRESS末节。
 - 日常小改动先做类型检查和影响范围内定向测试；SQL/事务/删除/鉴权改动仍立即做对应真实服务、并发/回滚/隔离负例。可积累多轮已定向验证的相关修改，一个功能包冻结后才做完整`verify`及相关`verify-s3`；发布门禁不省略。

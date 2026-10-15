@@ -113,20 +113,70 @@ async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
   if (workspaceLinks === 0) throw new Error("frozen 0039 workspace package links are missing");
 }
 
+const FIXTURE_STAGES = [
+  "resolve-commit", "archive", "extract", "old-build", "old-worker",
+  "target-fingerprint", "full-tail-fingerprint",
+] as const;
+type FixtureStage = typeof FIXTURE_STAGES[number];
+const FIXTURE_SIGNALS = new Set([
+  "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT", "SIGBUS", "SIGFPE",
+  "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE", "SIGALRM", "SIGTERM",
+  "SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG",
+  "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR",
+  "SIGSYS", "SIGINFO",
+]);
+const FIXTURE_SPAWN_CODES = new Set([
+  "ENOENT", "EACCES", "EPERM", "EAGAIN", "ENOMEM", "EMFILE", "ENFILE", "ENOSPC",
+  "EIO", "ENOEXEC", "ENAMETOOLONG", "ENOTDIR",
+]);
+
+function ownFailureData(error: unknown, key: string): unknown {
+  if (typeof error !== "object" || error === null) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    return descriptor && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function fixedFailure(stage: FixtureStage, error: unknown, elapsed: unknown): Error {
+  if (!FIXTURE_STAGES.includes(stage)) throw new Error("invalid frozen 0039 fixture stage");
+  const code = ownFailureData(error, "code");
+  const rawSignal = ownFailureData(error, "signal");
+  const signal = typeof rawSignal === "string" && FIXTURE_SIGNALS.has(rawSignal)
+    ? rawSignal : null;
+  const exitStatus = typeof code === "number" && Number.isSafeInteger(code)
+    && code >= 0 && code <= 255 ? code : null;
+  const kind = code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ? "max-buffer"
+    : typeof code === "string" && FIXTURE_SPAWN_CODES.has(code) ? `spawn-${code}`
+    : signal !== null ? "signal"
+    : exitStatus !== null ? "exit"
+    : ownFailureData(error, "killed") === true ? "killed"
+    : "unknown";
+  const elapsedMs = typeof elapsed === "number" && Number.isSafeInteger(elapsed)
+    && elapsed >= 0 ? elapsed : null;
+  // Never copy error.message/stack/cause, command, arguments, stdout, stderr or environment.
+  // A killed child is not proof of a timeout; only report observed closed metadata.
+  return new Error(`frozen 0039 fixture stage failed: ${stage} ${JSON.stringify({
+    exitStatus, signal, kind, elapsedMs,
+  })}`);
+}
+
 async function runFixed(
+  stage: FixtureStage,
   file: string,
   args: string[],
   cwd: string,
   env: NodeJS.ProcessEnv,
   timeout = 180_000,
 ): Promise<string> {
+  const startedAt = performance.now();
   try {
     const result = await exec(file, args, { cwd, env, timeout, maxBuffer: 8 * 1024 * 1024 });
     return result.stdout;
-  } catch {
-    // A failed package manager or frozen process may include DSN/credential material in stderr.
-    // Keep diagnostic output fixed and content-free in CI logs.
-    throw new Error(`frozen 0039 fixture stage failed: ${file} ${args[0] ?? ""}`);
+  } catch (error) {
+    throw fixedFailure(stage, error, Math.floor(performance.now() - startedAt));
   }
 }
 
@@ -206,12 +256,14 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     await mkdir(oldCheckout);
     const archive = join(archiveRoot, "frozen-0039.tar");
     const resolvedCommit = (await runFixed(
-      "git", ["rev-parse", FROZEN_0039_COMMIT], ROOT, processEnv(archiveRoot), 10_000,
+      "resolve-commit", "git", ["rev-parse", FROZEN_0039_COMMIT], ROOT,
+      processEnv(archiveRoot), 10_000,
     )).trim();
     expect(resolvedCommit).toBe(FROZEN_0039_COMMIT);
-    await runFixed("git", ["archive", "--format=tar", `--output=${archive}`, FROZEN_0039_COMMIT],
-      ROOT, processEnv(archiveRoot), 30_000);
-    await runFixed("tar", ["-xf", archive, "-C", oldCheckout], ROOT,
+    await runFixed("archive", "git", [
+      "archive", "--format=tar", `--output=${archive}`, FROZEN_0039_COMMIT,
+    ], ROOT, processEnv(archiveRoot), 30_000);
+    await runFixed("extract", "tar", ["-xf", archive, "-C", oldCheckout], ROOT,
       processEnv(archiveRoot), 30_000);
     const driverDir = join(oldCheckout, "packages/store/test/migrations/fixtures");
     await mkdir(driverDir, { recursive: true });
@@ -220,7 +272,7 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     await copyFile(join(HERE, "fixtures/pre0040-old-fingerprint-probe.ts"),
       join(driverDir, "pre0040-old-fingerprint-probe.ts"));
     await copyInstalledDependencies(oldCheckout);
-    await runFixed("pnpm", ["build"], oldCheckout, processEnv(archiveRoot), 180_000);
+    await runFixed("old-build", "pnpm", ["build"], oldCheckout, processEnv(archiveRoot), 180_000);
   }, 420_000);
 
   afterAll(async () => {
@@ -246,7 +298,7 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     await admin.query(`CREATE DATABASE \`${database}\` CHARACTER SET utf8mb4`);
     databases.add(database);
     const url = databaseUrl(base, database);
-    const stdout = await runFixed(process.execPath,
+    const stdout = await runFixed("old-worker", process.execPath,
       ["--import", "tsx", "packages/store/test/migrations/fixtures/pre0040-old-plan-driver.ts"],
       oldCheckout,
       processEnv(archiveRoot, { MYSQL_URL: url }), 180_000);
@@ -312,7 +364,7 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     } finally {
       await targetConn.end();
     }
-    const targetProbe = await runFixed(process.execPath, [
+    const targetProbe = await runFixed("target-fingerprint", process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0040-old-fingerprint-probe.ts",
     ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
       EXPECT_FINGERPRINT_STAGE: "target" }), 15_000);
@@ -383,7 +435,7 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
       await afterConn.end();
     }
 
-    const oldStoreProbe = await runFixed(process.execPath, [
+    const oldStoreProbe = await runFixed("full-tail-fingerprint", process.execPath, [
       "--import", "tsx", "packages/store/test/migrations/fixtures/pre0040-old-fingerprint-probe.ts",
     ], oldCheckout, processEnv(archiveRoot, { MYSQL_URL: url,
       EXPECT_FINGERPRINT_STAGE: "full-tail" }), 15_000);
@@ -413,4 +465,75 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     expect(`${frozenStartup.stdout}${frozenStartup.stderr}`
       .includes('"code":"runner.process.start_failed"')).toBe(true);
   }, 240_000);
+});
+
+describe("frozen 0039 content-free subprocess failure diagnostics", () => {
+  it("does not retain credential-shaped child output or exception content", () => {
+    const sensitive = "mysql://fixture-user:fixture-password@127.0.0.1/test?api_key=fixture-key";
+    const error = Object.assign(new Error(sensitive), {
+      code: 1, signal: null, stdout: sensitive, stderr: sensitive, cmd: sensitive,
+      args: [sensitive], cause: new Error(sensitive), env: { API_KEY: sensitive },
+    });
+    const diagnostic = fixedFailure("old-build", error, 17);
+    expect(diagnostic.message).toBe('frozen 0039 fixture stage failed: old-build '
+      + '{"exitStatus":1,"signal":null,"kind":"exit","elapsedMs":17}');
+    expect(diagnostic.stack?.includes(sensitive)).toBe(false);
+    expect(Object.hasOwn(diagnostic, "cause")).toBe(false);
+  });
+
+  it("prioritizes the actual max-buffer code over kill or signal observations", () => {
+    expect(fixedFailure("old-build", {
+      code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", signal: "SIGTERM", killed: true,
+    }, 12).message).toBe('frozen 0039 fixture stage failed: old-build '
+      + '{"exitStatus":null,"signal":"SIGTERM","kind":"max-buffer","elapsedMs":12}');
+  });
+
+  it("does not relabel a killed child as a timeout", () => {
+    expect(fixedFailure("old-build", { killed: true }, 12).message).toBe(
+      'frozen 0039 fixture stage failed: old-build '
+      + '{"exitStatus":null,"signal":null,"kind":"killed","elapsedMs":12}',
+    );
+  });
+
+  it("retains only allowlisted spawn and signal classifications", () => {
+    expect(fixedFailure("old-build", { code: "ENOENT" }, 12).message).toContain(
+      '"exitStatus":null,"signal":null,"kind":"spawn-ENOENT"',
+    );
+    expect(fixedFailure("old-build", { signal: "SIGKILL" }, 12).message).toContain(
+      '"exitStatus":null,"signal":"SIGKILL","kind":"signal"',
+    );
+    expect(fixedFailure("old-build", {
+      code: "credential-shaped-unknown-code", signal: "credential-shaped-unknown-signal",
+    }, 12).message).toBe('frozen 0039 fixture stage failed: old-build '
+      + '{"exitStatus":null,"signal":null,"kind":"unknown","elapsedMs":12}');
+  });
+
+  it.each([NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "12"])(
+    "does not serialize unsafe elapsed observation %s", (elapsed) => {
+      expect(fixedFailure("old-build", { code: 1 }, elapsed).message).toContain('"elapsedMs":null');
+    },
+  );
+
+  it.each([NaN, Infinity, -1, 1.5, 256, Number.MAX_SAFE_INTEGER + 1, "1"])(
+    "does not treat unsafe exit observation %s as an exit status", (code) => {
+      expect(fixedFailure("old-build", { code }, 12).message).toContain(
+        '"exitStatus":null,"signal":null,"kind":"unknown"',
+      );
+    },
+  );
+
+  it("does not invoke error accessors or inherit diagnostic fields", () => {
+    let reads = 0;
+    const error = Object.create({ code: 1, signal: "SIGTERM", killed: true }) as object;
+    for (const key of ["code", "signal", "killed", "message", "stdout", "stderr"]) {
+      Object.defineProperty(error, key, { get() { reads += 1; throw new Error("do not read"); } });
+    }
+    expect(fixedFailure("old-build", error, 12).message).toContain(
+      '"exitStatus":null,"signal":null,"kind":"unknown"',
+    );
+    expect(reads).toBe(0);
+    expect(fixedFailure("old-build", Object.create({ code: 1 }), 12).message).toContain(
+      '"exitStatus":null,"signal":null,"kind":"unknown"',
+    );
+  });
 });
