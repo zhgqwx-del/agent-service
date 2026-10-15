@@ -618,6 +618,7 @@ describe("tenant-erasure platform control", () => {
       { path: "/v1/agents%2Fencoded", authorization: `bearer ${TENANT_ERASURE_OPERATOR_TOKEN}` },
       { path: "/v1/agents%2Fspaces", authorization: `Bearer  ${TENANT_ERASURE_OPERATOR_TOKEN}` },
       { path: "/v1/agents%2Ftab", authorization: `Bearer\t${TENANT_ERASURE_OPERATOR_TOKEN}` },
+      { path: "/v1/agents%2Fnbsp", authorization: `Bearer\u00a0${TENANT_ERASURE_OPERATOR_TOKEN}` },
       {
         path: "/v1/agents%2Fcombined-auth",
         authorization: `Bearer tenant-key, Bearer ${TENANT_ERASURE_OPERATOR_TOKEN}`,

@@ -2,6 +2,8 @@
 
 开发中的验证优化候选：日常修改先跑相关定向测试，一个功能包冻结后再做完整本地验收，较大阶段集中推送并等待CI。`pnpm test:coverage`将同环境的具名专项与主coverage合并为一次执行，仍强制逐文件非零/零skip证明；历史迁移、S3、cluster与实际发布包装配继续独立执行。当前仅工具定向119项及静态检查通过，候选整树/新CI尚待，不能据此宣称M1已闭环。方法见[分层验证路径](docs/operations/development-and-ci-guide.md#6-分层验证路径)。
 
+M4新增本地候选：router与runner在各自原端口提供默认关闭的受保护`GET/HEAD /metrics`，只统计进程与固定低基数HTTP聚合，不保存owner、URL、正文或secret，也不新增服务、迁移或镜像。独立运维token不得充当业务凭证或被router转发；时延统计止于响应头就绪，不代表SSE完整寿命。五个新文件153项与兼容/验证工具合计10文件388项定向通过，实际bundle双服务默认关闭/启用鉴权装配通过；完整新verify/CI尚待。配置与手动体验见[部署契约](docs/operations/local-and-deployment.md#受保护的-l0-runtime-metrics)，不是完整可观测性或生产验收。
+
 > **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
 
 以下M4原始说明与main回补候选快照为历史原文，仅保留当时事实；当前结论以上方检查点和PROGRESS末节为准。
@@ -24,7 +26,7 @@ VM目录与受限tar候选已通过macOS arm64双服务真实构建、独立工�
 - **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`/`0037`仍是默认休眠的非生产disposition协议与真实grant硬拒；`0038`～`0041`依次封存新受管write membership、T3f owner closure、T3d五类source和观察目标。`0042`再为**新**T3d plan从同一次source/owner快照构建逐artifact目标目录，把logs/traces的精确count/root写入33域plan entry，并与0040/0041账本、独立catalog receipt及terminal在一个Memory原子发布或MySQL事务中封存。legacy、未完成、孤立来源保持unknown，旧0041 terminal缺catalog不能重释为新目标。新目标仍为`blocked_adapter_unconfigured`，不是删除许可；真实grant、产品外部mutation/restore和全域completion仍关闭。第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS或独立故障域。真实provider/KMS、generic user物理purge、backup-copy erasure/联合恢复、telemetry delete/restore/retention与全域completion仍未闭环；本地加密MySQL逻辑backup producer已实现，所以M1未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
 - **M3 扩展性**（MCP、skills、hooks）：尚未正式开始，已有动态工具反向委托等前置地基。
-- **M4 生产化**（配额、可观测性、限流）：主体尚未开始；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0042默认休眠基座已具备，但还没有真实managed环境验收、完整telemetry执行生命周期、metrics/SLO/alert、限流/配额或生产环境验收。
+- **M4 生产化**（配额、可观测性、限流）：尚未整体完成；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0042默认休眠基座与VM发布包已有实现，新增默认关闭的L0 runtime metrics仍为本地候选。真实managed环境验收、完整telemetry执行生命周期、OTel/collector/dashboard/SLO/alert、限流/配额或生产环境验收仍缺。
 
 `0040`/`0041`封存source与观察目标，`0042`仅让新plan拥有精确、不可变的logs/traces逐artifact目标count/root；目录条目含受保护身份和来源摘要，不含原始owner或外部locator。旧terminal缺0042 receipt仍是`unknown`，不能借0041观察目标推断其T3d目标。即使新plan有非零目标，两域仍保持blocker，`executionReady=false`；0037 grant硬拒、外部删除/恢复与全域completion门禁不变。最新验证与剩余工作以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。
 

@@ -1,6 +1,7 @@
 import {
   blobS3Backend,
   blobS3NamespaceSha256,
+  validateRuntimeMetricsToken,
   type BlobStorageCapability,
 } from "@agent-service/protocol";
 import { z } from "zod";
@@ -117,6 +118,10 @@ const Env = z.object({
     .transform((value) => value === "1"),
   SHUTDOWN_GRACE_MS: z.coerce.number().int().nonnegative().default(10_000),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  /** Process-local, low-cardinality operational metrics; never tenant-labelled. */
+  METRICS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  /** Independent read-only scrape credential, not a router/erasure/API authority. */
+  METRICS_BEARER_TOKEN: z.string().optional(),
   NODE_ENV: z.string().optional(),
 });
 export type RouterConfig = Omit<z.infer<typeof Env>, "INTERNAL_ROUTER_TOKEN"> & {
@@ -239,6 +244,13 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     throw new Error(`${runnerOnlyKey} is runner-only object-store authority and must not enter the router process`);
   }
   const c = Env.parse(env);
+  if (c.METRICS_ENABLED || c.METRICS_BEARER_TOKEN !== undefined) {
+    validateRuntimeMetricsToken(c.METRICS_BEARER_TOKEN, [
+      c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
+      c.ROUTER_ADMIN_TOKEN, c.TENANT_ERASURE_OPERATOR_TOKEN,
+      env.API_KEY, env.BOOTSTRAP_API_KEY, env.SECRETS_MASTER_KEY,
+    ]);
+  }
   if (c.NODE_ENV === "production" && c.SESSION_USAGE_RETENTION_ENABLED) {
     throw new Error("SESSION_USAGE_RETENTION_ENABLED=1 is unsupported in production");
   }

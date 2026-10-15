@@ -90,7 +90,15 @@ URL、provider ID、locator、异常 message/stack 或 secret 交给 process log
 - stdout/trace exporter 已接入 durable inventory，或 retention/legal hold 已形成可执行处置策略；
 - 任意应用event都已双写到durable spool；当前只有一个provider failure logs contract；
 - log/trace 物理删除、ACK 或 restore replay 已实现；
-- dashboard、metrics、SLO、alert、sampling、容量或成本治理已实现。
+- OTel/collector、dashboard、SLO、alert、sampling、容量或成本治理已实现；下述有限L0进程指标不等于完整metrics平台。
+
+### 受保护的 L0 runtime metrics
+
+router与runner在各自现有端口提供默认关闭的`GET`/`HEAD /metrics`，由各自进程就地终止，router不把scrape代理到runner。`METRICS_ENABLED=0`时该路径返回`404`；开启前必须单独配置`METRICS_BEARER_TOKEN`。token限32～256位ASCII字母、数字及`._~-`，不得与业务、internal、admin等高权限token相同。只有精确的`Authorization: Bearer <token>`（scheme不区分大小写、其后单个ASCII空格、token大小写敏感）可读取；不能用query或`X-Internal`授权。开启后缺失/错误凭据返回`401`，已授权的非`GET`/`HEAD`返回`405`；scrape响应禁止缓存。预置token但不开指标时，非metrics路径仍会拒绝该受保护凭据被当作业务凭据使用或转发。这个宽deny-only检查不授予scrape权限，也不改变原有业务鉴权。
+
+Prometheus文本仅含固定`component`、`method`、`route`、`status_class`标签：16个闭合route类、8个标准method加`other`、5个HTTP status class加`other`，每role最多864个completed组合和144个in-progress组合。没有tenant/user/session/provider/model、原URL/path/query、trace、error、header、secret或任意调用方标签。`agent_service_http_requests_total`记录header-ready时完成请求数，`agent_service_http_handlers_in_progress`只计响应头尚未就绪的handler；`agent_service_http_response_headers_duration_seconds`是固定桶直方图，测到响应头就绪，不是SSE流寿命、active turn或provider耗时。进程量只有uptime、RSS和heap gauge，以及`agent_service_process_cpu_user_seconds_total`、`agent_service_process_cpu_system_seconds_total`累计counter。全部只在进程内存中，重启清零；没有新SQL、outbox、durable inventory、daemon、入口或镜像。
+
+这是M4的有限本地观测能力，不授权M1的0037 grant、外部对象删除、自动清理或任何默认关闭的生命周期gate。staging/production仍需另行设计受控网络/TLS、独立采集鉴权、规模和容量；OTel/exporter、collector、dashboard、SLO、告警、quota以及provider/turn级指标未实现。
 
 ## 3. 入口事件目录
 
@@ -541,7 +549,7 @@ encryption key或 owner inventory。任何 endpoint、bucket、index、project�
 M1 为数据生命周期闭环需要完成的是：安全字段契约、owner inventory、adapter target/ACK、retention/
 legal-hold重验、restore replay、tenant/user erasure proof以及保持 fail-closed 的 completion聚合。
 
-M4 才完成完整生产可观测性：统一 logger/tracer、OTel SDK/exporter、metrics、dashboard、SLO、alert、
+M4 才完成完整生产可观测性：统一 logger/tracer、OTel SDK/exporter、完整metrics采集、dashboard、SLO、alert、
 sampling、quota/rate-limit信号、collector拓扑、容量/成本、registry promotion、Kubernetes配置和真实环境
 演练。M1 的 lifecycle proof不能被描述为完整 observability；M4 的 dashboard/trace可见性也不能替代
 M1 的 durable deletion authority。

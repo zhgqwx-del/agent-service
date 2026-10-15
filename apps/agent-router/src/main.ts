@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import {
   createEphemeralStructuredTelemetry,
+  createRuntimeMetrics,
   tenantRedisNamespaceSha256,
   type StructuredTelemetryFields,
 } from "@agent-service/protocol";
@@ -70,6 +71,11 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
   const app = createRouterApp({
     registry,
     telemetry: routerProcessTelemetry,
+    ...(cfg.METRICS_BEARER_TOKEN === undefined ? {} : {
+      metrics: { bearerToken: cfg.METRICS_BEARER_TOKEN,
+        ...(cfg.METRICS_ENABLED ? { registry: createRuntimeMetrics("router") } : {}),
+      },
+    }),
     maxAttempts: cfg.MAX_ATTEMPTS,
     maxBodyBytes: cfg.MAX_BODY_BYTES,
     maxBlobBytes: cfg.BLOB_MAX_BYTES,

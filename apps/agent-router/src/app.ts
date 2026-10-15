@@ -83,6 +83,11 @@ import {
   USER_DATA_EXPORT_ARTIFACT_NDJSON_V1,
   UserErasureDrainRequest,
   createEphemeralStructuredTelemetry,
+  RUNTIME_METRICS_CONTENT_TYPE,
+  runtimeMetricsTokenMatches,
+  authorizationContainsProtectedBearerToken,
+  validateRuntimeMetricsToken,
+  type RuntimeMetrics,
   isCanonicalId,
   outgoingTraceparent,
   startBoundaryTraceContext,
@@ -161,6 +166,8 @@ export interface RouterAppDeps {
   fetchImpl?: typeof globalThis.fetch;
   /** Structured, allowlisted telemetry. Omit to use a process-local opaque-ref key and JSON console sink. */
   telemetry?: StructuredTelemetry;
+  /** Explicit process-local operational registry plus independent read-only scrape credential. */
+  metrics?: { registry?: RuntimeMetrics; bearerToken: string };
   /** @deprecated Compatibility sink used only to serialize structured telemetry records. */
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -268,9 +275,7 @@ function authorizationContainsBearerToken(
   // Fetch/Node can combine duplicate Authorization fields with commas. Public platform auth stays
   // strict (one credential only), while the generic proxy must detect the protected credential in
   // every combined challenge so it can never reach a runner in a malformed header.
-  return authorization?.split(",").some((value) => (
-    bearerTokenMatches(value.trim(), expected)
-  )) ?? false;
+  return authorizationContainsProtectedBearerToken(authorization, expected);
 }
 
 /**
@@ -308,6 +313,53 @@ function internalNotFound(c: { json: (body: object, status: 404) => Response }):
  */
 export function createRouterApp(deps: RouterAppDeps) {
   const app = new Hono();
+  const metrics = deps.metrics?.registry;
+  const metricsToken = deps.metrics?.bearerToken;
+  if (deps.metrics !== undefined) {
+    validateRuntimeMetricsToken(metricsToken, [
+      deps.internalRunnerToken, deps.adminToken, deps.tenantErasureOperatorToken,
+    ]);
+    if (metrics !== undefined && (typeof metrics.beginRequest !== "function" || typeof metrics.render !== "function")) {
+      throw new Error("invalid operational metrics registry");
+    }
+    app.use("*", async (c, next) => {
+      if (c.req.path === "/metrics" || c.req.path.startsWith("/metrics/")) return next();
+      // A read-only scrape credential must never become a business/upstream bearer token.
+      if (metricsToken && authorizationContainsProtectedBearerToken(c.req.header("Authorization"), metricsToken)) {
+        c.header("Cache-Control", "no-store");
+        return c.text("forbidden", 403);
+      }
+      if (!metrics) return next();
+      let complete: ((status: number) => void) | undefined;
+      try { complete = metrics.beginRequest(c.req.method, c.req.path); } catch { /* Observation never changes runtime. */ }
+      try { await next(); } finally {
+        try { complete?.(c.res.status); } catch { /* No error/URL/subject logging on observer failure. */ }
+      }
+    });
+  }
+  // Always terminate this exact path locally: a disabled/wrong-method scrape must not proxy.
+  app.all("/metrics", (c) => {
+    c.header("Cache-Control", "no-store");
+    c.header("X-Content-Type-Options", "nosniff");
+    if (!metrics || !metricsToken) return c.req.method === "HEAD" ? c.body(null, 404) : c.text("not found", 404);
+    if (!runtimeMetricsTokenMatches(c.req.header("Authorization"), metricsToken)) {
+      c.header("WWW-Authenticate", "Bearer");
+      return c.req.method === "HEAD" ? c.body(null, 401) : c.text("unauthorized", 401);
+    }
+    if (c.req.method !== "GET" && c.req.method !== "HEAD") {
+      c.header("Allow", "GET, HEAD");
+      return c.text("method not allowed", 405);
+    }
+    c.header("Content-Type", RUNTIME_METRICS_CONTENT_TYPE);
+    try {
+      const body = metrics.render();
+      return c.req.method === "HEAD" ? c.body(null) : c.body(body);
+    } catch { return c.req.method === "HEAD" ? c.body(null, 503) : c.text("metrics unavailable", 503); }
+  });
+  app.all("/metrics/*", (c) => {
+    c.header("Cache-Control", "no-store");
+    return c.req.method === "HEAD" ? c.body(null, 404) : c.text("not found", 404);
+  });
   const telemetry = deps.telemetry
     ?? createEphemeralStructuredTelemetry("router", deps.logger ?? console);
   const maxAttempts = deps.maxAttempts ?? 2;

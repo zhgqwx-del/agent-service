@@ -76,6 +76,19 @@ scripts/local-service.sh stop        # 只停应用，保留 MySQL/Redis/MinIO
 scripts/local-service.sh down        # 停应用和脚本拥有的本地基础设施
 ```
 
+### 受保护的 L0 runtime metrics
+
+router与runner在各自现有端口分别提供`GET`/`HEAD /metrics`，不新增进程或端口，默认`METRICS_ENABLED=0`并返回`404`。要手动体验，先在本机受保护的`.env`中为`METRICS_BEARER_TOKEN`配置独立于业务/internal/admin凭据的32～256位ASCII token，再设置`METRICS_ENABLED=1`并重启本地服务；不要在终端命令、日志、工单或文档中打印真实token。`local-service`共用一份`.env`，两role可用同一运维token；独立部署时可按role分别配置，不要求两role必然不同。token预置但开关仍为`0`时，指标不可读，但该凭据在其它路径仍受防转发拒绝保护。
+
+scrape只接受`Authorization: Bearer <token>`（scheme大小写不敏感、单个ASCII空格、token大小写敏感），不能用query或`X-Internal`代替。开启后缺失/错误凭据为`401`，已授权的非`GET`/`HEAD`为`405`；响应`Cache-Control: no-store`，`HEAD`不返回指标正文。可由操作者在受控渠道准备权限`0600`的curl配置文件，其中`header = "Authorization: Bearer <replace-privately>"`只作格式占位，真实值仅写入该文件、不得回显；然后分别检查：
+
+```bash
+curl --config /absolute/protected-metrics-curl.conf -i http://127.0.0.1:8080/metrics
+curl --config /absolute/protected-metrics-curl.conf -I http://127.0.0.1:8787/metrics
+```
+
+指标只有进程内的闭合低基数HTTP/进程量，重启后计数清零；header-ready时延和in-progress handler不是SSE流寿命或active turn。此开关不启用0054/0037、外部对象删除或任何自动清理gate，也不证明生产网络/TLS、独立采集授权、容量、collector/dashboard/SLO/告警已经验收。
+
 验证入口：
 
 ```bash

@@ -39,6 +39,7 @@ import {
 import {
   consoleTelemetrySink,
   createEphemeralStructuredTelemetry,
+  createRuntimeMetrics,
   tenantRedisNamespaceSha256,
   type StructuredTelemetry,
   type StructuredTelemetryFields,
@@ -1069,6 +1070,11 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   const app = createApp({
     store, host, providers, tools,
     telemetry: runnerProcessTelemetry,
+    ...(cfg.METRICS_BEARER_TOKEN === undefined ? {} : {
+      metrics: { bearerToken: cfg.METRICS_BEARER_TOKEN,
+        ...(cfg.METRICS_ENABLED ? { registry: createRuntimeMetrics("runner") } : {}),
+      },
+    }),
     runnerId: cfg.RUNNER_ID,
     internalRouterToken: cfg.INTERNAL_ROUTER_TOKEN,
     heartbeatMs: cfg.SSE_HEARTBEAT_MS,

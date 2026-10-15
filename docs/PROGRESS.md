@@ -1,6 +1,6 @@
 # 进度记录
 
-> **开发检查点（2026-10-15T05:26Z）**：用户要求减少每小轮数小时全量和远程CI等待，现已形成验证去重候选（未发布）：旧86个main-required完整保留、补27个遗漏具名文件及2工具回归，共115；同环境62组旧命令以一次coverage的精确文件结果出具子集证明，不再重复执行。工具两文件119 passed/0failed/0skipped、API/typecheck、secrets684及shell语法通过；候选完整verify与新CI未执行，旧817c144的CI仍独立验收中，不能借旧报告证明新driver通过。日常定向、阶段末全量、较大阶段集中push的节奏不缩减M1/M3/M4目标或任何默认关闭门禁。详细范围与下一验收包见末节。
+> **开发检查点（2026-10-15T06:08Z）**：分层验证与M4 L0 metrics均为本地未发布候选。router/runner原端口增加default-off受保护GET/HEAD /metrics，固定低基数进程/HTTP聚合；独立token禁止业务使用/转发，不涉及owner inventory/SQL/外部删除或M1恢复授权。06:01:45Z定向10文件388 passed/0failed/0skipped，五个新metrics文件153项；API/typecheck、最新六入口build与实际bundle默认关闭/启用鉴权装配通过。主required清单为120（原115加五metrics），62旧group仍只从同次coverage出具子集证明。完整新verify/CI未执行，旧817c144的Actions38676454476仍在历史迁移、两个image success，不能借其证明新代码。后续日常定向、功能包末全量、较大阶段集中push，不缩减M1/M3/M4目标或默认关闭门禁。详细范围与失败/复测事实见末节。
 
 > **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
 
@@ -1382,3 +1382,12 @@ M1运行核心单独标为已可用，不再把“有新账本/guard”计作生
 M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个新增凭据/Blob来源必须从首版接入tenant/user隔离、T1/restore fence和现有生命周期，不能先留裸secret或让固定目录漏域。M4最终清单保持安全发布运行（独立schema/无DDL runtime桥、VM/OCI托管与签名晋级）、配额/key池/熔断治理、可观测性/容量/分片与故障演练三个包，复用已有发布地基而非重造。此盘点不擅自修改现有M1闭环前正式进入M3的顺序；可独立事项的并行安排须不突破安全前置。
 
 云IAM/KMS、真实TLS/拓扑、独立故障域、managed Redis Cluster与预发/生产RPO/RTO及滚动验收单列为待资源的环境工作，不能用本地MinIO代替；对应本地adapter、配置契约和故障代码仍属于原目标。整体预计工期尚无可靠数据，不能用迁移编号、测试数量或本轮CI剩余时间换算完成百分比；每个包报告实际功能、未完成项与耗时后再修正估计。M1仍未冻结，M2冻结，M3未开始，完整目标保持active。
+
+## 2026-10-15（M4 L0 runtime metrics 本地候选；定向通过、未发布）
+
+- 等待0054既有CI期间推进独立M4能力，没有提前实现条件尚未满足的新epoch恢复。router与runner在各自原HTTP端口增加GET/HEAD /metrics，METRICS_ENABLED默认0；启用需要独立32～256字符运维token，不允许与已知业务/internal/admin/master等凭证复用。预置但未enable时仍404且防止该token进入其它路径；启用时未授权401、其它方法405，整个metrics路径族本地终止并no-store，不转发。没有新daemon、migration、产品入口或镜像。
+- protocol registry只保存闭合component/method/route/status_class聚合，16 routes×9 methods×6 status最多864 completed/144 active series；不保存owner、原始path/query/header、URL、错误正文、业务内容或secret。计数、histogram和handlers止于响应头就绪，不衡量SSE body完整寿命或active turns；另有uptime/RSS/heap gauge及CPU user/system counter。数据只驻进程内、重启清零，无持久化/owner inventory、collector、OTel exporter、dashboard、SLO、alert、quota或provider/turn指标；不能推进M1 deletion/completion。
+- 独立安全review发现P2：严格scrape matcher不能同时充当防转发检查，否则多空格/tab/NBSP/combined Authorization会绕过。已新增独立deny-only containment helper，两角色及既有router平台凭证防转发使用宽松检测；scrape授权仍严格单ASCII空格、scheme大小写不敏感且token大小写敏感。open-unclosed-stream与begin/finish抛错测试证明不等待body、不改变普通请求；复核无剩余P0–P2，仅为静态结论。
+- 先前定向报告runtime-metrics-final-20261015.json为386 passed/2 failed，两个失败均是新增测试把合法mixed-case Bearer scheme误期望401；只给两份测试逐case标注正确scrape状态，未改变授权实现或放宽其它负例。失败报告保留。最终新报告runtime-metrics-recheck-20261015.json的startTime=2026-10-15T06:01:45.864Z，10文件388 passed、0failed、0pending/skip，逐文件非零且全部passed；其中新五文件153、旧两config52、旧router app64和验证工具119是总数子集，不重复计数，实际运行约4.86秒。
+- 最新typecheck与API漂移退出0；六入口build11337退出0后，plain Node双服务check-dist-boot8001也退出0，证明实际bundle的默认metrics404、启用后的独立role鉴权、GET/HEAD、方法/no-store和业务路径拒绝，且输出没有测试token。全部使用隔离memory/临时loopback，无.env、真实模型、业务MySQL/Redis或外部对象操作。required清单新增五个实际文件为120，62个旧group不变，日常test:runtime-metrics只作快速定向入口。
+- 当前主树在本地checkpoint1e76d65之上开发，origin/main仍817c144；新功能和去重driver尚未完整verify/新CI，未为这轮定向修补单独push。旧Actions38676454476截至06:04Z仍在历史迁移，两个image success，不能提前写全绿。待功能包冻结后集中整树验收；原0054发布验收条件、M1未冻结/M2冻结/M3未开始、0037 hard-deny、外部对象删除/自动清理关闭和全域completion=false均保持。

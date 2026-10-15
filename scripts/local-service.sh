@@ -12,6 +12,8 @@ cd "$ROOT"
 # chain, so preserve those caller values as well instead of letting .env silently retarget them.
 caller_mover_env_names=(
   NODE_ENV
+  METRICS_ENABLED
+  METRICS_BEARER_TOKEN
   MYSQL_URL
   RUNNERS
   SESSION_USAGE_RETENTION_ENABLED

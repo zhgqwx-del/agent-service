@@ -79,6 +79,11 @@ import {
   TRACEPARENT_HEADER,
   isCanonicalId,
   createEphemeralStructuredTelemetry,
+  RUNTIME_METRICS_CONTENT_TYPE,
+  runtimeMetricsTokenMatches,
+  authorizationContainsProtectedBearerToken,
+  validateRuntimeMetricsToken,
+  type RuntimeMetrics,
   startTraceContext,
   telemetryErrorKind,
   withTraceContext,
@@ -263,6 +268,8 @@ export interface AppDeps {
   assertPublicUrl?: (url: string) => Promise<void>;
   /** Structured, allowlisted telemetry. Omit to use a process-local opaque-ref key and JSON console sink. */
   telemetry?: StructuredTelemetry;
+  /** Process-local aggregate metrics; no durable owner/tenant telemetry or execution authority. */
+  metrics?: { registry?: RuntimeMetrics; bearerToken: string };
 }
 
 const parse = async <T extends z.ZodTypeAny>(schema: T, body: unknown): Promise<z.infer<T>> => {
@@ -302,6 +309,49 @@ function governanceApiError(error: unknown): never {
 
 export function createApp(deps: AppDeps) {
   const app = new Hono<AuthEnv>();
+  const metrics = deps.metrics?.registry;
+  const metricsToken = deps.metrics?.bearerToken;
+  if (deps.metrics !== undefined) {
+    validateRuntimeMetricsToken(metricsToken, [deps.internalRouterToken]);
+    if (metrics !== undefined && (typeof metrics.beginRequest !== "function" || typeof metrics.render !== "function")) {
+      throw new Error("invalid operational metrics registry");
+    }
+    app.use("*", async (c, next) => {
+      if (c.req.path === "/metrics" || c.req.path.startsWith("/metrics/")) return next();
+      if (metricsToken && authorizationContainsProtectedBearerToken(c.req.header("Authorization"), metricsToken)) {
+        c.header("Cache-Control", "no-store");
+        return c.text("forbidden", 403);
+      }
+      if (!metrics) return next();
+      let complete: ((status: number) => void) | undefined;
+      try { complete = metrics.beginRequest(c.req.method, c.req.path); } catch { /* Observation never changes runtime. */ }
+      try { await next(); } finally {
+        try { complete?.(c.res.status); } catch { /* Never log error/URL/subject from an observer. */ }
+      }
+    });
+  }
+  app.all("/metrics", (c) => {
+    c.header("Cache-Control", "no-store");
+    c.header("X-Content-Type-Options", "nosniff");
+    if (!metrics || !metricsToken) return c.req.method === "HEAD" ? c.body(null, 404) : c.text("not found", 404);
+    if (!runtimeMetricsTokenMatches(c.req.header("Authorization"), metricsToken)) {
+      c.header("WWW-Authenticate", "Bearer");
+      return c.req.method === "HEAD" ? c.body(null, 401) : c.text("unauthorized", 401);
+    }
+    if (c.req.method !== "GET" && c.req.method !== "HEAD") {
+      c.header("Allow", "GET, HEAD");
+      return c.text("method not allowed", 405);
+    }
+    c.header("Content-Type", RUNTIME_METRICS_CONTENT_TYPE);
+    try {
+      const body = metrics.render();
+      return c.req.method === "HEAD" ? c.body(null) : c.body(body);
+    } catch { return c.req.method === "HEAD" ? c.body(null, 503) : c.text("metrics unavailable", 503); }
+  });
+  app.all("/metrics/*", (c) => {
+    c.header("Cache-Control", "no-store");
+    return c.req.method === "HEAD" ? c.body(null, 404) : c.text("not found", 404);
+  });
   const telemetry = deps.telemetry ?? createEphemeralStructuredTelemetry("runner");
   const tenantRedisPurgeSupported = deps.tenantRedisPurgeSupported === true
     && /^[0-9a-f]{64}$/.test(deps.tenantRedisPurgeNamespaceSha256 ?? "");

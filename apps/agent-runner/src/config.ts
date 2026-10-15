@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import {
   blobS3Backend,
   blobS3NamespaceSha256,
+  validateRuntimeMetricsToken,
   type BlobStorageCapability,
 } from "@agent-service/protocol";
 import { z } from "zod";
@@ -15,6 +16,9 @@ import {
 export const ERASURE_REQUEST_TIMEOUT_MARGIN_MS = 1_000;
 
 const Env = z.object({
+  /** Process-local operational metrics, separate from durable owner telemetry. */
+  METRICS_ENABLED: z.enum(["0", "1"]).default("0").transform((value) => value === "1"),
+  METRICS_BEARER_TOKEN: z.string().optional(),
   RUNNER_PORT: z.coerce.number().int().default(8787),
   RUNNER_HOST: z.string().default("127.0.0.1"),
   /** Must be unique among simultaneously running replicas. Production gets a UUID when omitted. */
@@ -543,6 +547,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     );
   }
   const c = Env.parse(env);
+  if (c.METRICS_ENABLED || c.METRICS_BEARER_TOKEN !== undefined) {
+    validateRuntimeMetricsToken(c.METRICS_BEARER_TOKEN, [
+      c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN,
+      c.BOOTSTRAP_API_KEY, env.API_KEY, env.SECRETS_MASTER_KEY,
+      env.ROUTER_ADMIN_TOKEN, env.TENANT_ERASURE_OPERATOR_TOKEN,
+    ]);
+  }
   const production = c.NODE_ENV === "production";
   if (env.PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED !== undefined) {
     throw new Error("PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED is router-only");
