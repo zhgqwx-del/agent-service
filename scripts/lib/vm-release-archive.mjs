@@ -629,3 +629,53 @@ export async function unpackVmReleaseArchive(options) {
     throw error;
   }
 }
+
+function immutableManifestCopy(manifest, ctx) {
+  // The scan owns its parsed JSON. Return a separate, deeply frozen value so a caller cannot
+  // accidentally mutate the evidence it receives while assembling a transport signature.
+  const copy = structuredClone(manifest);
+  const pending = [copy];
+  while (pending.length > 0) {
+    ctx.check();
+    const value = pending.pop();
+    if (value === null || typeof value !== "object") continue;
+    for (const child of Object.values(value)) pending.push(child);
+    Object.freeze(value);
+  }
+  return copy;
+}
+
+/**
+ * Inspect an existing archive against an independently trusted directory-manifest digest.
+ * This reads every archive body from one private, fixed-byte copy and never extracts or creates
+ * a caller-visible output. It does not independently validate the manifest's closed provenance
+ * or native payload: the signing caller must first verify its source release directory.
+ */
+export async function inspectVmReleaseArchive(options) {
+  const { archive, role: requestedRole, manifestSha256: requestedManifestSha, limits } =
+    checkedOptions(options, ["archive", "role", "manifestSha256"]);
+  const ctx = context(limits), role = assertVmReleaseRole(requestedRole);
+  const manifestSha256 = checkedSha(requestedManifestSha, "manifest");
+  const source = absolute(archive, "archive");
+  const scratch = await fs.mkdtemp(join(tmpdir(), "agent-service-vm-archive-"));
+  let archiveHandle, result;
+  try {
+    await fs.chmod(scratch, 0o700);
+    archiveHandle = await fs.open(join(scratch, "archive.tar"), "wx+", 0o600);
+    const copied = await fixedArchiveCopy(source, archiveHandle, ctx);
+    // Keep the same opened private copy for the entire body, topology and manifest scan.
+    const { entries, manifest } = await scan(archiveHandle, copied.archiveBytes, manifestSha256, role, ctx);
+    result = {
+      receipt: receipt(role, manifest.targetRuntime, manifestSha256, copied.archiveSha256,
+        copied.archiveBytes, entries.length),
+      manifest: immutableManifestCopy(manifest, ctx),
+    };
+  } finally {
+    try { await archiveHandle?.close(); } finally {
+      // This invocation's exact private scratch is the only recursive cleanup target.
+      await fs.rm(scratch, { recursive: true, force: true });
+    }
+  }
+  ctx.check();
+  return result;
+}

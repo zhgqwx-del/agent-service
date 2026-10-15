@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+M4离线VM签名候选复用既有受限tar/独立Node工具：`sign:vm-release`只以显式owner-only Ed25519文件签署clean/publishable精确制品；`inspect-signed`/`unpack-signed`以独立SPKI pin、选定role/commit及执行工具自身hash验证，没有unsigned fallback。三新测试文件加入main-required为123，62个旧group不变，原VM group扩为七文件。它不生成产品key、不自动安装、部署、吊销或晋级，不改变M1/0037/自动清理/恢复门禁。最新失败与相关复验只看PROGRESS；不能把旧e278或817结果当新候选全量/CI通过。
+
 开发节奏已按用户效率要求调整：小改动做定向验证，真实SQL/删除/权限负例不延后；功能包冻结后全量，本地/CI较大阶段集中提交推送，不每轮重复等待GitHub。验证去重候选保留旧86个main-required、补27个遗漏具名文件、2个工具回归和5个metrics文件，共120；62个具名group只从同一次主coverage报告出具子集证明。独立S3/history/cluster/实际bundle与VM装配保留。当前M4默认关闭的L0 runtime metrics候选在router/runner原端口提供受保护GET/HEAD /metrics：固定标签、仅进程内HTTP/资源聚合、独立token防业务使用/转发，计时止于响应头；不新增schema/服务/入口/镜像，不影响M1门禁。五新文件153项与兼容/工具合计10文件388 passed零fail/skip、API/typecheck与实际bundle装配通过。候选整树verify或新CI尚待，不借817c144旧代码的CI为其背书；默认关闭/0037硬拒与M1未冻结/M2冻结/M3未开始不变，详见PROGRESS末节。
 
 **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。

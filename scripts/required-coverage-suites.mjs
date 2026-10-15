@@ -119,6 +119,9 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "test/required-coverage-manifest.test.ts",
   "test/required-suite-proof.test.ts",
   "test/vm-release-archive.test.ts",
+  "test/vm-release-sign-cli.test.ts",
+  "test/vm-release-signature.test.ts",
+  "test/vm-release-signed.test.ts",
   "test/vm-release-tool.test.ts",
   "test/vm-release.test.ts"
 ]);
@@ -349,7 +352,10 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
     "test/vm-release.test.ts",
     "apps/agent-runner/test/cli-entrypoint.test.ts",
     "test/vm-release-archive.test.ts",
-    "test/vm-release-tool.test.ts"
+    "test/vm-release-tool.test.ts",
+    "test/vm-release-signature.test.ts",
+    "test/vm-release-signed.test.ts",
+    "test/vm-release-sign-cli.test.ts"
   ],
   "test:tenant-telemetry-artifact-observer": [
     "packages/store/test/tenant-telemetry-artifact-observer.unit.test.ts"

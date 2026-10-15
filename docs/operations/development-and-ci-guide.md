@@ -1,10 +1,12 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 本地集成验收（2026-10-15）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
+> 离线VM签名候选（2026-10-15，未发布验收）：私钥格式正则触发的secret-scanner边界误报已等价改写、未加白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770、proof工具119），API/typecheck通过。实际clean双包、整树和新CI仍待。required新增3文件至123、62个旧group不变，VM group现为7文件。原817 CI test失败/两个image成功；b575集中全量实际3164 passed/5 failed、后置未跑，不能称新全量或CI全绿。详细事实只看PROGRESS末节。
+
+> 历史本地集成验收（2026-10-15，非上述签名候选验收）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
 
 本文是理解和操作当前 `agent-service` 的长期维护入口，回答三类问题：本地需要启动什么、怎样手动体验、GitHub Actions 实际构建和验证什么。
 
-快速入口：想马上看到系统运行，依次看[一次性准备](#2-一次性准备)、[启动与停止](#3-启动与停止完整本地栈)、[手动体验 API](#5-手动体验-agent-runtime)；想理解交付物，看[本地进程与构建产物](#7-本地源码进程与生产构建产物)、[GitHub Actions](#8-github-actions-构建与验证)和[环境晋级语义](#9-从本地到未来生产的交付语义)。已发布0053的CI构建并测试两个Linux OCI镜像；本地集成候选已新增VM目录/受限tar/独立工具的必跑测试、双服务smoke与artifact步骤，尚无本批新Linux CI结果。仍不推送registry，也没有可直接用于预发/生产的可信签名、SBOM、digest晋级或完整部署清单。
+快速入口：想马上看到系统运行，依次看[一次性准备](#2-一次性准备)、[启动与停止](#3-启动与停止完整本地栈)、[手动体验 API](#5-手动体验-agent-runtime)；想理解交付物，看[本地进程与构建产物](#7-本地源码进程与生产构建产物)、[GitHub Actions](#8-github-actions-构建与验证)和[环境晋级语义](#9-从本地到未来生产的交付语义)。既有CI构建并测试两个Linux OCI镜像；本地新增VM目录/受限tar/独立工具及离线签名候选，未取得本批新Linux CI验收。仍不推送registry，也没有生产签名信任根/密钥管理、OCI签名、SBOM、digest晋级或完整部署清单；离线签名不是生产许可。
 
 里程碑完成度以 `docs/PROGRESS.md` 顶部快照和最后一节为准；本文只描述操作方式和交付产物，不替代进度记录。
 
@@ -1349,11 +1351,11 @@ quarantine是数据库完整性故障路径，不应通过普通手工体验故�
 
 不必每次小改动都运行数小时全量。每轮先做`pnpm typecheck`及相关`pnpm test:<专项>`；涉及SQL、事务、删除、鉴权或租户边界时，当轮仍须执行相关真实MySQL/Redis/MinIO及并发、回滚、隔离负例。连续多轮定向通过后，在一个可验收功能包的代码/接口冻结点运行完整`verify`，触及S3/备份/恢复时还须`verify-s3`。全量失败先定位并定向修复，再对最终候选补齐完整验收，不用失败前的旧报告证明新代码通过。
 
-本候选新增`pnpm test:verification-tools`用于纯校验器/清单回归；`pnpm test:coverage`是主套件单次执行入口，必须先准备独立可丢弃MySQL/Redis测试环境，它不是无基础设施的快速测试。入口不接受过滤参数，强制真实integration profile，以独占`.local-run/coverage-attempt-*/tests.json`绑定本轮子进程退出结果和时间，再校验120个required文件（原115加本轮5个L0 metrics文件）各唯一、非零test case且全部passed，以及原coverage阈值。旧便利路径`.local-run/verify-tests.json`仅在成功后更新，不可单独当新执行证明。62个旧具名命令映射仍供审计，group数字是主执行的子集，不另加到总数；所有原定向命令保留供开发使用。
+本候选新增`pnpm test:verification-tools`用于纯校验器/清单回归；`pnpm test:coverage`是主套件单次执行入口，必须先准备独立可丢弃MySQL/Redis测试环境，它不是无基础设施的快速测试。入口不接受过滤参数，强制真实integration profile，以独占`.local-run/coverage-attempt-*/tests.json`绑定本轮子进程退出结果和时间，再校验123个required文件（原115、5个L0 metrics文件和3个离线签名文件）各唯一、非零test case且全部passed，以及原coverage阈值。旧便利路径`.local-run/verify-tests.json`仅在成功后更新，不可单独当新执行证明。62个旧具名命令映射仍供审计，group数字是主执行的子集，不另加到总数；VM group现含7文件，所有原定向命令保留供开发使用。
 
 只移除环境与覆盖目标等价的重复执行：S3专用flag/MinIO、历史独立config/冻结binary、真实多进程cluster/T3g、SDK、实际bundle与clean VM双包/归档启动仍分别验收。并行重型CI须先隔离每个job的MySQL/Redis/目录，当前本机共享测试资源不能盲开并发。CI在较大阶段集中推送后验收，避免连续push取消长任务；不能拿本地macOS或旧SHA的绿灯代替最终Linux/发布提交证明。
 
-当前L0指标候选已有10个定向文件388 passed、零fail/skip（其中5个新增文件153项），API检查与实际bundle装配smoke通过；这不是新driver的完整`verify`或GitHub CI终态。旧工具119项另有定向结果，完整新driver/整树验收仍待最终冻结候选；尚未测得端到端节省比例，不承诺倍数。本节优先解释下方旧“具名wrapper”描述：日常独立命令仍使用wrapper，main阶段改由同次coverage生成逐文件/具名group证明，不降低必跑范围。
+L0指标候选曾有10个定向文件388 passed、零fail/skip（其中5个新增文件153项），API检查与实际bundle装配smoke通过；这不是新driver的完整`verify`或GitHub CI终态。本轮签名相关9文件889 passed（VM七文件770、proof工具119）在私钥格式正则等价修订后已最终复验、零fail/skip，仍只是定向检查点；实际clean双包尚待。当前完整尝试的失败见顶部/PROGRESS，不能用定向通过补称后置已执行。尚未测得端到端节省比例，不承诺倍数。本节优先解释下方旧“具名wrapper”描述：日常独立命令仍使用wrapper，main阶段改由同次coverage生成逐文件/具名group证明，不降低必跑范围。
 
 ```bash
 scripts/local-service.sh smoke
@@ -1535,14 +1537,14 @@ router拒绝raw restore-journal identity、endpoint与credential的配置边界�
 `apps/agent-router/test/config.test.ts`在常规测试套件中验证；当前dist boot只以清理过的
 环境启动bundle，不把这项源码配置测试冒充为发布产物运行时探针。
 
-M4的Node24目标平台目录包已实现`bundle + migrations + 完整production node_modules + manifest`及非root systemd样例，并实际验证macOS arm64双包；受限tar归档、独立Node验真与CI artifact保存仍为本地候选，具体通过状态看PROGRESS。签名/晋级、真实systemd/生产无DDL启动和Linux CI仍不能借两个既有OCI镜像的成功冒充完成。
+M4的Node24目标平台目录包已实现`bundle + migrations + 完整production node_modules + manifest`及非root systemd样例，并具有macOS arm64双包历史证明；受限tar、独立Node工具与离线VM签名现为本地候选，具体通过状态看PROGRESS。生产信任根/密钥管理、OCI签名、环境晋级、真实systemd/生产无DDL启动和本批Linux CI仍不能借既有OCI镜像的成功冒充完成。
 
 这里有三种容易混淆的运行/交付形态：
 
 | 形态 | 实际内容 | 适用场景 |
 | --- | --- | --- |
 | 本地源码进程 | `node --import tsx` 直接加载 `apps/*/src/main.ts` | 日常开发、调试；本节的直接启动和`local-service.sh start`不会自动热重载。包级`pnpm dev`使用`tsx watch`，但会整体加载`.env`，须先满足前述authority隔离要求 |
-| Node 应用发布包 | runner `main.js` + `blob-storage-migrate.js` + `restore-ledger-reconcile.js` + `backup-catalog.js` + `telemetry-capture.js`、router `main.js`，外加目标OS/CPU完整production dependencies、migrations与manifest | 两个长期进程；四个维护CLI仅前台按需调用。目录包与systemd样例已有本地证明，受限tar/独立工具仍在验证，未完成签名/晋级或生产托管 |
+| Node 应用发布包 | runner `main.js` + `blob-storage-migrate.js` + `restore-ledger-reconcile.js` + `backup-catalog.js` + `telemetry-capture.js`、router `main.js`，外加目标OS/CPU完整production dependencies、migrations与manifest | 两个长期进程；四个维护CLI仅前台按需调用。目录包/systemd样例已有本地证明；受限tar/独立工具及离线VM签名为候选，生产信任根/环境晋级或生产托管未完成 |
 | Linux OCI 镜像 | Node 24 slim + 对应应用入口 + production dependencies + migrations；runner镜像额外包含四个one-shot CLI | staging/production 推荐交付物，可分别部署到不同 VM、容器平台或 Kubernetes workload |
 
 因此“router/runner 不可变镜像”表示镜像内容在构建后不再修改、环境间使用同一 digest；它不是 Windows 镜像，也不是把 TypeScript 编译成 Linux ELF 或 Windows `.exe`。router 和 runner 确实是两套可独立启动、独立扩缩容、可部署到不同机器的 Node 应用，但镜像通常比手工分发裸 bundle 更容易保证 Node 版本、依赖、迁移与健康检查完全一致。若目标机器不能运行容器，可以部署完整 Node 发布归档；不能只复制一个 `main.js` 就称为完整发布。
@@ -1620,17 +1622,21 @@ agent-service/agent-router:ci
 
 每个产品镜像都包含 Node 24 slim、对应应用入口、迁移和 production dependencies，是 Linux OCI image，不是VM磁盘或原生机器码。GitHub Actions分别启动两个镜像并检查OpenAPI/healthcheck；镜像job不运行router与runner双容器转发，该端到端路径由`build:check`的dist双服务启动测试覆盖。runner镜像内迁移器必须写入包含最新`0049_tenant_telemetry_application_capture_v2.sql`、`0050_ordinary_session_delete_grace.sql`、`0051_ordinary_session_delete_origin_guard.sql`、`0052_ordinary_session_usage_retention.sql`、`0053_persisted_provider_failure_capture.sql`及`0054_tenant_telemetry_retained_source.sql`的完整marker链（0054另用精确COUNT=1断言），并用plain Node验证四个one-shot CLI的`--help`。生产first-admin bootstrap只通过create-only、`0600`输出文件交付，CI验证key格式与鉴权且日志不含key或tenant原值。marker只证明0044 pre-grant、0049 inactive capture v2 guards、0050普通DELETE保留证据列、0051 write-once guard及此前默认休眠schema已安装，不代表capture已激活、DB grant可信、CAS tombstone已执行、旧快照已安全恢复或任何物理purge已完成。产品构建仍只有router和runner两个长期服务、两个Linux OCI镜像、六个JavaScript入口：router `main.js`，runner `main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`、`backup-catalog.js`和`telemetry-capture.js`；本地MinIO基础设施镜像不进入产品matrix。
 
-当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前配置上传coverage及验收通过的VM双role归档、独立工具和proof（VM artifact保留14天）；是否实际生成必须核对main对应run，artifact仍不是签名或生产晋级。
+当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前配置上传coverage及验收通过的VM双role归档、独立工具和proof（VM artifact保留14天）；是否实际生成必须核对main对应run。签名候选的CI/checker仅使用ephemeral-test-only密钥，dirty-development profile明确未执行签名；artifact或测试签名都不是生产trust root/密钥管理或环境晋级。
 
 ## 9. 从本地到未来生产的交付语义
 
 ### VM进程包与镜像的区别
 
-M4候选现在增加`package:vm`、`test:vm-release`和`check:vm-release`，详细命令及安全边界见[VM进程发布包地基](local-and-deployment.md#vm-进程发布包地基)。VM目录包含同一router/runner JavaScript bundle、完整production依赖、迁移和对应systemd样例；容器镜像还封装Node与Linux文件系统。VM目标主机必须另有Node24，不能只复制一个`.js`文件或在目标上重新装依赖。
+M4候选提供`package:vm`、`package:vm-transport`、`sign:vm-release`、`test:vm-release`和`check:vm-release`，详细命令及安全边界见[VM进程发布包地基](local-and-deployment.md#vm-进程发布包地基)。VM目录包含同一router/runner JavaScript bundle、完整production依赖、迁移和对应systemd样例；容器镜像还封装Node与Linux文件系统。VM目标主机必须另有Node24，不能只复制一个`.js`文件或在目标上重新装依赖。
 
-应用本身不是独立ELF二进制，但真实production闭包中存在esbuild原生程序。因此VM包按Linux/macOS与x64/arm64构建和验真，不能把本机macOS包直接部署到Linux；Linux构建由Linux环境完成。常驻服务仍只有router与runner，runner四个维护CLI不变成新服务。`publishable=true`只表示清洁commit构建的可追溯候选，不是生产许可；`productionAccepted=false`固定，Windows不在当前受支持target集合，systemd实机验收、签名/环境晋级仍缺；受限tar归档已有本地候选实现与clean装配证明。
+应用本身不是独立ELF二进制，但真实production闭包中存在esbuild原生程序。因此VM包按Linux/macOS与x64/arm64构建和验真，不能把本机macOS包直接部署到Linux；Linux构建由Linux环境完成。常驻服务仍只有router与runner，runner四个维护CLI不变成新服务。`publishable=true`只表示清洁commit构建的可追溯候选，不是生产许可；`productionAccepted=false`固定，Windows不在当前受支持target集合。受限tar及离线VM签名已有本地候选；systemd实机验收、生产签名信任根/密钥管理、OCI签名与环境晋级仍缺。
 
-候选CI与本地verify分别新增必执行安全/快照测试和真实双发布目录plain Node smoke；CI要求clean commit，本地verify允许copied-byte dirty开发快照。该smoke使用独立临时目录及memory后端，不加载`.env`、触达MySQL/模型或安装服务。两包commit、实际输入/lock摘要必须一致；运行后重验完整清单未改变。新门禁仅在后续候选提交推送后执行，不属于已推送0053的Actions run，也不能用旧CI成功替代。实际单元通过、打包失败/修正及最终装配状态均以PROGRESS末节为准。
+离线签名的学习顺序是：先在可信构建主机形成clean/目标平台匹配的release与tar，再以`sign:vm-release`的八个显式flag和owner-only Ed25519私钥文件签名；目标主机先通过独立受信任的`RELEASE_TOOL_SHA256` bootstrap工具，再用预先提供的SPKI DER公钥pin、选定role与精确`RELEASE_SOURCE_COMMIT`运行`inspect-signed`/`unpack-signed`。完整占位绝对路径命令见[离线VM发布签名](local-and-deployment.md#离线-vm-发布签名)。不要运行未知tool让它认证自身，不从待验证sidecar自算值替代authority；signed命令没有`--tool`覆盖或unsigned fallback。签名绑定copied inputs/lock、manifest/archive/tool、target runtime与归档规模，output创建前完整核对，解包再次以签名archive hash认证同次私有copy；失败不变成安装、DDL、应用启动或晋级许可。
+
+独立bundle冻结原四个工具源码加`vm-release-signature.mjs`、`vm-release-signed.mjs`共六源，并逐字节绑定release input清单与未变的root依赖字段/lock；不新增依赖、应用dist入口、常驻服务或镜像。sign/inspect/unpack各有协作式120秒预算，工具自hash预算独立；native FS不能硬取消，仍要求可信本机/受控parent，不抗恶意same-UID替换。此能力不管理生产key、不证明freshness/revocation/通用防重放或生产trust root；OCI签名、自动promotion、托管与真实环境验收仍另行交付。CI/checker只生成临时测试key，dirty profile明确不签名。
+
+候选CI与本地verify分别包含必执行安全/快照测试和真实双发布目录plain Node smoke；CI要求clean commit，本地verify允许copied-byte dirty开发快照，后者不会获得签名许可。该smoke使用独立临时目录及memory后端，不加载`.env`、触达MySQL/模型或安装服务。两包commit、实际输入/lock摘要必须一致；运行后重验完整清单未改变。本轮私钥格式正则修订后的9文件相关重验已通过，但实际clean双包尚待，不能用旧CI成功替代。实际单元通过、打包失败/修正及最终装配状态均以PROGRESS末节为准。
 
 0053仍只允许本地非生产启用，不能把本节的未来生产交付顺序当作其生产许可。升级前保持capture、ordinary usage及相关T3d/T3f gate关闭，真实摘流、停止并排空全部pre-0053 router/runner/writer和在途事务；独立migration安装160相关组合指纹（不是662全库trigger数），只启动0053-aware版本，禁止旧新writer热混跑。既有0049文件不可重写，后续只能forward-fix。默认control休眠与历史NULL/0 source不回填；active0030 primary是后续local activation前提，新的runtime epoch不能自动继承capture binding。原始failed-step提交、fresh fleet四worker边界、first create live检查与历史exact ACK权限仍需分别验证；局部writer ACK不解除T3d/T3f第六来源硬拒、usage来源删除禁令或全域completion。
 
@@ -1650,9 +1656,9 @@ M4候选现在增加`package:vm`、`test:vm-release`和`check:vm-release`，详�
 
 staging/production 不重新编译镜像。环境差异只通过受控配置和 Secret 注入；两个环境不共享 MySQL、Redis、对象存储、密钥或 service key。
 
-VM形态须在同一次CI构建中分别形成router/runner完整发布归档，固定Node24 target runtime、production dependencies、迁移文件及每个文件校验和/发布包身份；staging验证后，将**同一发布包身份和校验和**晋级production，不在环境中重新安装依赖或重新打包。目标平台目录包及受限tar/独立Node24工具已有本地候选证明，本地完整集成验收已通过，Linux CI由main对应run独立验收；工具必须先经独立可信tool摘要验证，归档与manifest同样使用外部可信摘要，包内sidecar不能自认证。候选CI artifact只保存测试通过的字节，不等于签名、生产许可或已实施晋级。systemd托管、进程排空与一次性迁移入口仍须独立发布/验收；见[VM发布包契约](local-and-deployment.md#vm-进程发布包地基)。
+VM形态须在同一次CI构建中分别形成router/runner完整发布归档，固定Node24 target runtime、production dependencies、迁移文件及每个文件校验和/发布包身份；staging验证后，将**同一发布包身份和校验和**晋级production，不在环境中重新安装依赖或重新打包。目录/受限tar/独立工具已有历史本地证明，离线签名候选不能借旧完整验收或其它SHA的Linux CI成绩发布。工具必须先经独立可信tool摘要验证；无签名模式仍需外部可信archive/manifest摘要，signed模式则需独立公钥pin/选定role/commit并完整验证签名中的同一provenance，包内sidecar不能自认证。候选artifact及ephemeral测试签名不是生产trust root、生产许可或已实施晋级。systemd托管、进程排空与一次性迁移入口仍须独立发布/验收；见[VM发布包契约](local-and-deployment.md#vm-进程发布包地基)。
 
-用户选择M4同时提供两种交付形态：容器按router/runner Linux OCI同一digest晋级；虚拟机用相同六个应用入口（runner main与四one-shot、router main）和受控Node24 runtime，两个服务独立运行。两者复用协议、迁移门禁、配置/Secret与验收。VM目录验真和受限归档运输均已有本地候选实现与真实装配证明；进程托管/滚动与容器签名、部署清单、环境晋级仍待M4，不能把源码开发脚本、单平台本地目录包或CI测试镜像当成生产验收完成。归档工具是离线发布工具，不是新增产品daemon或镜像。
+用户选择M4同时提供两种交付形态：容器按router/runner Linux OCI同一digest晋级；虚拟机用相同六个应用入口（runner main与四one-shot、router main）和受控Node24 runtime，两个服务独立运行。两者复用协议、迁移门禁、配置/Secret与验收。VM目录验真、受限归档运输与离线签名已有本地候选；本轮最终装配仍待，进程托管/滚动、生产trust root与容器签名、部署清单、环境晋级仍待M4，不能把源码开发脚本、单平台本地目录包或CI测试镜像当成生产验收完成。归档/签名是离线发布工具，不是新增产品daemon或镜像。
 
 这仍是目标流程，不是当前可直接执行的生产部署手册。现有runner连接默认会应用schema migration，而严格启动检查又依赖读取MySQL trigger元数据；本机MySQL 8.0.26实测`SELECT`-only账号无法通过`INFORMATION_SCHEMA.TRIGGERS`或definer view看到已有trigger，授予`TRIGGER`则也能删除它。M4还须先以受限definer procedure等可信只读桥接完成无DDL账号的严格指纹校验和真实MySQL回归，再交付独立一次性schema-migrate Job、生产verify-only启动及镜像入口。没有这些门禁和真实环境资源时，不应把当前CI镜像直接称为已完成的staging/production部署方案；详见[部署契约](local-and-deployment.md)。
 

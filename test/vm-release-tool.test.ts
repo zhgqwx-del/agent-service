@@ -1,6 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,18 +21,31 @@ interface TransportApi {
   packageVmTransport(input: { release: string; role: Role; manifestSha256: string; output: string }): Promise<Json>;
   deriveVmTransportCompilerContract(packageBytes: Uint8Array, lockBytes: Uint8Array): { version: string };
 }
+interface SignatureApi {
+  vmReleasePublicKeySha256(key: unknown): string;
+  createVmReleaseSignature(statement: unknown, privateKey: unknown, pin: unknown): unknown;
+  serializeVmReleaseSignature(envelope: unknown): Buffer;
+}
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const SOURCES = ["scripts/lib/vm-release-archive.mjs", "scripts/lib/vm-release.mjs",
+  "scripts/lib/vm-release-signature.mjs", "scripts/lib/vm-release-signed.mjs",
   "scripts/package-vm-transport.mjs", "scripts/vm-release-tool.mjs"].sort();
+const ENTRYPOINTS: Record<Role, readonly string[]> = {
+  "agent-router": ["main.js"],
+  "agent-runner": ["main.js", "blob-storage-migrate.js", "restore-ledger-reconcile.js", "backup-catalog.js", "telemetry-capture.js"],
+};
 const sha = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const owned = new Set<string>();
 let release: ReleaseApi;
 let tool: ToolApi;
 let transport: TransportApi;
+let signature: SignatureApi;
 beforeAll(async () => {
   release = await import(new URL("../scripts/lib/vm-release.mjs", import.meta.url).href) as ReleaseApi;
   tool = await import(new URL("../scripts/vm-release-tool.mjs", import.meta.url).href) as ToolApi;
   transport = await import(new URL("../scripts/package-vm-transport.mjs", import.meta.url).href) as TransportApi;
+  const importedSignature: unknown = await import(new URL("../scripts/lib/vm-release-signature.mjs", import.meta.url).href);
+  signature = importedSignature as SignatureApi;
 });
 afterEach(async () => {
   for (const directory of owned) {
@@ -45,18 +58,20 @@ async function temp() {
   owned.add(directory);
   return directory;
 }
-async function fixture() {
+async function fixture(role: Role = "agent-router") {
   const root = join(await temp(), "source-release");
   await mkdir(join(root, "dist/migrations"), { recursive: true });
   await mkdir(join(root, "node_modules/fixture"), { recursive: true });
   await mkdir(join(root, "service"));
   await chmod(root, 0o755);
-  await writeFile(join(root, "dist/main.js"), 'export const fixture = true;\n');
-  await writeFile(join(root, "dist/main.js.map"), '{}\n');
+  for (const entrypoint of ENTRYPOINTS[role]) {
+    await writeFile(join(root, "dist", entrypoint), 'export const fixture = true;\n');
+    await writeFile(join(root, "dist", `${entrypoint}.map`), '{}\n');
+  }
   await writeFile(join(root, "dist/package.json"), '{"type":"module"}\n');
   await writeFile(join(root, "dist/migrations/0001_fixture.sql"), 'SELECT 1;\n');
   await writeFile(join(root, "node_modules/fixture/index.js"), 'export {};\n');
-  await writeFile(join(root, "service/agent-router.service.template"), '[Service]\n');
+  await writeFile(join(root, "service", `${role}.service.template`), '[Service]\n');
   const sourceInputs = await Promise.all(SOURCES.map(async (path) => {
     const bytes = await readFile(join(ROOT, path));
     return { path, sha256: sha(bytes), size: bytes.length };
@@ -67,7 +82,7 @@ async function fixture() {
     { path: "package.json", sha256: sha(packageBytes), size: packageBytes.length }]
     .sort((a, b) => a.path.localeCompare(b.path, "en"));
   const manifest = {
-    schema: "agent-service-vm-release-v1", role: "agent-router" as const,
+    schema: "agent-service-vm-release-v1", role,
     releaseKind: "node24-platform-process-directory", productionAccepted: false, publishable: true,
     targetRuntime: { nodeMajor: 24, platform: process.platform, arch: process.arch },
     source: { sourceCommit: "b".repeat(40), sourceDirty: false, lockSha256: sha(lock),
@@ -75,9 +90,9 @@ async function fixture() {
       buildRuntime: { node: process.versions.node, platform: process.platform, arch: process.arch } },
     build: { installContract: "pnpm install --offline --frozen-lockfile --ignore-scripts",
       bundler: "scripts/build-app.mjs",
-      dependencyClosure: "pnpm --filter ./apps/agent-router --prod --offline --ignore-scripts --trust-lockfile --frozen-lockfile deploy",
-      entrypoints: ["dist/main.js"], migrationCount: 1 },
-    files: await release.validateVmReleasePayload(root, "agent-router"),
+      dependencyClosure: `pnpm --filter ./apps/${role} --prod --offline --ignore-scripts --trust-lockfile --frozen-lockfile deploy`,
+      entrypoints: ENTRYPOINTS[role].map((entrypoint) => `dist/${entrypoint}`), migrationCount: 1 },
+    files: await release.validateVmReleasePayload(root, role),
   };
   const seal = async () => {
     const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
@@ -86,13 +101,72 @@ async function fixture() {
     return sha(bytes);
   };
   const manifestSha256 = await seal();
-  await release.verifyVmReleaseDirectory(root, "agent-router", manifestSha256);
+  await release.verifyVmReleaseDirectory(root, role, manifestSha256);
   return { root, manifest, manifestSha256, seal };
 }
 function invoke(toolPath: string, cwd: string, args: string[]) {
   return spawnSync(process.execPath, [toolPath, ...args], {
     cwd, env: { PATH: "", NODE_ENV: "test" }, encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024,
   });
+}
+
+const SIGNED_COMMANDS = ["inspect-signed", "unpack-signed"] as const;
+type SignedCommand = typeof SIGNED_COMMANDS[number];
+const SIGNED_FLAGS = ["--archive", "--role", "--signature", "--public-key", "--public-key-sha256", "--source-commit"];
+function signedArgs(command: SignedCommand, input: {
+  archive: string; role: Role; signature: string; publicKey: string; publicKeySha256: string; sourceCommit: string;
+}, output?: string): string[] {
+  return [command, "--archive", input.archive, "--role", input.role, "--signature", input.signature,
+    "--public-key", input.publicKey, "--public-key-sha256", input.publicKeySha256,
+    "--source-commit", input.sourceCommit, ...(command === "unpack-signed" ? ["--output", output ?? "/new-release"] : [])];
+}
+function parseOnlySignedInput(role: Role = "agent-router") {
+  return { archive: "/release.tar", role, signature: "/release-signature.json", publicKey: "/public-key.pem",
+    publicKeySha256: "a".repeat(64), sourceCommit: "b".repeat(40) };
+}
+function proofDigest(proof: Json, field: string): string {
+  const value = proof[field];
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) throw new Error("invalid test transport digest");
+  return value;
+}
+function proofCount(proof: Json, field: string): number {
+  const value = proof[field];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new Error("invalid test transport count");
+  return value;
+}
+async function signedFixture(role: Role) {
+  const f = await fixture(role);
+  const transportOutput = join(await temp(), "signed-transport");
+  const proof = await transport.packageVmTransport({ release: f.root, role,
+    manifestSha256: f.manifestSha256, output: transportOutput });
+  const toolPath = join(transportOutput, "vm-release-tool.mjs");
+  const archive = join(transportOutput, "release.tar");
+  const keys = generateKeyPairSync("ed25519");
+  const publicKeySha256 = signature.vmReleasePublicKeySha256(keys.publicKey);
+  const keyDirectory = await temp();
+  const publicKey = join(keyDirectory, "ephemeral-public-key.pem");
+  const signaturePath = join(keyDirectory, "release-signature.json");
+  // Only this generated public key is written. Private fixture material stays in
+  // memory, is never logged/asserted as text, and is not a product signing key.
+  await writeFile(publicKey, keys.publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600, flag: "wx" });
+  const statement = { schema: "agent-service-vm-release-statement-v1", role,
+    sourceCommit: f.manifest.source.sourceCommit, inputSha256: f.manifest.source.inputSha256,
+    lockSha256: f.manifest.source.lockSha256, manifestSha256: f.manifestSha256,
+    archiveSha256: proofDigest(proof, "archiveSha256"), toolSha256: proofDigest(proof, "toolSha256"),
+    targetRuntime: f.manifest.targetRuntime, archiveBytes: proofCount(proof, "archiveBytes"),
+    entryCount: proofCount(proof, "entryCount"), sourceDirty: false, publishable: true, productionAccepted: false };
+  const writeSignature = async (value: unknown, exclusive = false) => {
+    const envelope = signature.createVmReleaseSignature(value, keys.privateKey, publicKeySha256);
+    const bytes = signature.serializeVmReleaseSignature(envelope);
+    await writeFile(signaturePath, bytes, { mode: 0o600, flag: exclusive ? "wx" : "w" });
+    return bytes;
+  };
+  await writeSignature(statement, true);
+  expect(proofDigest(proof, "toolSha256")).toBe(sha(await readFile(toolPath)));
+  expect(proofDigest(proof, "archiveSha256")).toBe(sha(await readFile(archive)));
+  return { ...f, proof, toolPath, archive, statement, writeSignature,
+    consumer: { archive, role, signature: signaturePath, publicKey, publicKeySha256,
+      sourceCommit: f.manifest.source.sourceCommit } };
 }
 
 describe("closed VM transport CLI", () => {
@@ -120,6 +194,44 @@ describe("closed VM transport CLI", () => {
   });
   it.each([null, {}, "verify", ["verify", 1], ["verify", null]].map((args) => ({ args })))("rejects non-string argument shape $args", ({ args }) => {
     expect(() => tool.parseVmReleaseToolArgs(args)).toThrow();
+  });
+
+  it.each(SIGNED_COMMANDS.flatMap((command) => (["agent-router", "agent-runner"] as const).map((role) => ({ command, role })) ))(
+    "parses exact signed $command $role authority with no unsigned fallback", ({ command, role }) => {
+      const input = parseOnlySignedInput(role);
+      expect(tool.parseVmReleaseToolArgs(signedArgs(command, input))).toEqual({ command, ...input,
+        ...(command === "unpack-signed" ? { output: "/new-release" } : {}) });
+    });
+
+  it.each(SIGNED_COMMANDS.flatMap((command) => [...SIGNED_FLAGS, ...(command === "unpack-signed" ? ["--output"] : [])]
+    .map((flag) => ({ command, flag }))))("rejects missing signed $command $flag", ({ command, flag }) => {
+      const args = signedArgs(command, parseOnlySignedInput());
+      args.splice(args.indexOf(flag), 2);
+      expect(() => tool.parseVmReleaseToolArgs(args)).toThrow();
+    });
+
+  it.each(SIGNED_COMMANDS.flatMap((command) => [...SIGNED_FLAGS, ...(command === "unpack-signed" ? ["--output"] : [])]
+    .map((flag) => ({ command, flag }))))("rejects duplicate signed $command $flag including empty duplicate", ({ command, flag }) => {
+      const args = signedArgs(command, parseOnlySignedInput());
+      expect(() => tool.parseVmReleaseToolArgs([...args, flag, args[args.indexOf(flag) + 1]!])).toThrow();
+      expect(() => tool.parseVmReleaseToolArgs([...args, flag, ""])).toThrow();
+    });
+
+  it.each(SIGNED_COMMANDS.flatMap((command) => [
+    ["--archive", "relative.tar"], ["--signature", "signature.json"], ["--public-key", "public.pem"],
+    ["--role", "runner"], ["--public-key-sha256", "A".repeat(64)], ["--public-key-sha256", "a".repeat(63)],
+    ["--source-commit", "B".repeat(40)], ["--source-commit", "b".repeat(39)],
+    ["--archive", ""], ["--signature", ""], ["--public-key", ""], ["--public-key-sha256", ""], ["--source-commit", ""],
+    ...(command === "unpack-signed" ? [["--output", "relative"], ["--output", ""]] : []),
+  ].map(([flag, value]) => ({ command, flag: flag!, value: value! }))))("rejects noncanonical signed $command $flag=$value", ({ command, flag, value }) => {
+    const args = signedArgs(command, parseOnlySignedInput());
+    args[args.indexOf(flag) + 1] = value;
+    expect(() => tool.parseVmReleaseToolArgs(args)).toThrow();
+  });
+
+  it.each(SIGNED_COMMANDS.flatMap((command) => ["--tool", "--archive-sha256", "--manifest-sha256", "--release", "--allow-unsigned", "--unknown"]
+    .map((flag) => ({ command, flag }))))("rejects cross-authority/unknown signed $command $flag", ({ command, flag }) => {
+    expect(() => tool.parseVmReleaseToolArgs([...signedArgs(command, parseOnlySignedInput()), flag, "/untrusted"])).toThrow();
   });
 });
 
@@ -272,5 +384,106 @@ describe("standalone trusted VM transport artifact", () => {
   ])("rejects duplicate/ambiguous package keys $label instead of trusting JSON last-wins", async ({ text }) => {
     const lock = await readFile(join(ROOT, "pnpm-lock.yaml"));
     expect(() => transport.deriveVmTransportCompilerContract(Buffer.from(text), lock)).toThrow();
+  });
+});
+
+describe("signed standalone VM release consumer", () => {
+  it.each(["agent-router", "agent-runner"] as const)("inspects and unpacks a real signed %s tiny tar with only the standalone bundle", async (role) => {
+    const f = await signedFixture(role);
+    const cwd = await temp();
+    const output = join(cwd, "signed-release");
+    const help = invoke(f.toolPath, cwd, ["--help"]);
+    expect(help.error).toBeUndefined(); expect(help.status).toBe(0); expect(help.stderr).toBe("");
+    expect(help.stdout).toContain("inspect-signed"); expect(help.stdout).toContain("unpack-signed");
+    expect(help.stdout).toContain("--public-key-sha256"); expect(help.stdout).toContain("--source-commit");
+    const inspected = invoke(f.toolPath, cwd, signedArgs("inspect-signed", f.consumer));
+    expect(inspected.error).toBeUndefined(); expect(inspected.status).toBe(0); expect(inspected.stderr).toBe("");
+    const signatureSha256 = sha(await readFile(f.consumer.signature));
+    expect(JSON.parse(inspected.stdout)).toMatchObject({ schema: "agent-service-vm-release-signed-inspection-v1",
+      statement: f.statement, publicKeySha256: f.consumer.publicKeySha256, signatureSha256,
+      signatureVerified: true, productionAccepted: false,
+      receipt: { role, manifestSha256: f.manifestSha256, archiveSha256: f.statement.archiveSha256,
+        archiveBytes: f.statement.archiveBytes, entryCount: f.statement.entryCount, productionAccepted: false } });
+    await expect(lstat(output)).rejects.toMatchObject({ code: "ENOENT" });
+    const unpacked = invoke(f.toolPath, cwd, signedArgs("unpack-signed", f.consumer, output));
+    expect(unpacked.error).toBeUndefined(); expect(unpacked.status).toBe(0); expect(unpacked.stderr).toBe("");
+    expect(JSON.parse(unpacked.stdout)).toMatchObject({ schema: "agent-service-vm-release-signed-extraction-v1",
+      statement: f.statement, signatureSha256, publicKeySha256: f.consumer.publicKeySha256,
+      signatureVerified: true, productionAccepted: false,
+      receipt: { role, manifestSha256: f.manifestSha256, archiveSha256: f.statement.archiveSha256,
+        archiveBytes: f.statement.archiveBytes, entryCount: f.statement.entryCount, productionAccepted: false } });
+    await release.verifyVmReleaseDirectory(output, role, f.manifestSha256);
+    for (const entrypoint of ENTRYPOINTS[role]) {
+      expect(await readFile(join(output, "dist", entrypoint))).toEqual(await readFile(join(f.root, "dist", entrypoint)));
+    }
+    expect((await lstat(f.consumer.publicKey)).mode & 0o777).toBe(0o600);
+    expect((await lstat(f.consumer.signature)).mode & 0o777).toBe(0o600);
+    expect(sha(await readFile(f.toolPath))).toBe(f.statement.toolSha256);
+    expect(sha(await readFile(f.archive))).toBe(f.statement.archiveSha256);
+  });
+
+  it.each((["agent-router", "agent-runner"] as const).flatMap((role) => [
+    "wrong-pin", "wrong-public-key", "wrong-role", "wrong-commit", "self-tool-hash", "signature-tamper",
+  ].map((kind) => ({ role, kind }))))("rejects $role $kind before either signed command creates output", async ({ role, kind }) => {
+    const f = await signedFixture(role);
+    const cwd = await temp();
+    const consumer = { ...f.consumer };
+    let toolPath = f.toolPath;
+    if (kind === "wrong-pin") consumer.publicKeySha256 = sha("untrusted test key pin");
+    else if (kind === "wrong-public-key") {
+      const other = generateKeyPairSync("ed25519");
+      const publicKey = join(cwd, "different-public-key.pem");
+      await writeFile(publicKey, other.publicKey.export({ type: "spki", format: "pem" }), { mode: 0o600, flag: "wx" });
+      consumer.publicKey = publicKey;
+    } else if (kind === "wrong-role") consumer.role = role === "agent-runner" ? "agent-router" : "agent-runner";
+    else if (kind === "wrong-commit") consumer.sourceCommit = "c".repeat(40);
+    else if (kind === "self-tool-hash") {
+      // The altered consumer is still executable and equivalent JS, but its
+      // actual import.meta.url bytes must not inherit the old signed digest.
+      toolPath = join(cwd, "altered-vm-release-tool.mjs");
+      await writeFile(toolPath, Buffer.concat([await readFile(f.toolPath), Buffer.from("\n// altered fixture consumer bytes\n")]), { mode: 0o600, flag: "wx" });
+      expect(sha(await readFile(toolPath))).not.toBe(f.statement.toolSha256);
+    } else {
+      const parsed: unknown = JSON.parse(await readFile(consumer.signature, "utf8"));
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)
+        || !("signature" in parsed) || typeof parsed.signature !== "string") throw new Error("invalid fixture signature envelope");
+      const signatureBytes = Buffer.from(parsed.signature, "base64");
+      signatureBytes[0] = signatureBytes[0]! ^ 1;
+      await writeFile(consumer.signature, signature.serializeVmReleaseSignature({ ...parsed, signature: signatureBytes.toString("base64") }));
+    }
+    for (const command of SIGNED_COMMANDS) {
+      const output = join(cwd, `${command}-not-created`);
+      const result = invoke(toolPath, cwd, signedArgs(command, consumer, output));
+      expect(result.error).toBeUndefined(); expect(result.status).toBe(1); expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("vm-release-tool failed (operation_failed)\n");
+      expect(result.stderr).not.toContain(cwd);
+      expect(result.stderr).not.toContain(consumer.publicKeySha256);
+      await expect(lstat(output)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it.each(["agent-router", "agent-runner"] as const)("binds direct API %s to its own source tool bytes and rejects open input keys", async (role) => {
+    const f = await signedFixture(role);
+    // The imported source API is a different executable consumer from the
+    // independent bundle; sign its actual bytes, never supply a tool override.
+    const sourceToolSha256 = sha(await readFile(join(ROOT, "scripts/vm-release-tool.mjs")));
+    const sourceStatement = { ...f.statement, toolSha256: sourceToolSha256 };
+    await f.writeSignature(sourceStatement);
+    const result = await tool.runVmReleaseTool({ command: "inspect-signed", ...f.consumer });
+    expect(result).toMatchObject({ schema: "agent-service-vm-release-signed-inspection-v1",
+      statement: sourceStatement, signatureVerified: true, productionAccepted: false });
+    const cwd = await temp();
+    for (const command of SIGNED_COMMANDS) {
+      for (const extra of ["tool", "toolSha256", "manifestSha256", "archiveSha256", "allowUnsigned", "unexpected"]) {
+        const output = join(cwd, `${command}-${extra}-not-created`);
+        const input = { command, ...f.consumer, ...(command === "unpack-signed" ? { output } : {}), [extra]: "/untrusted" };
+        await expect(tool.runVmReleaseTool(input)).rejects.toThrow(/^vm-release-tool failed \(operation_failed\)$/);
+        await expect(lstat(output)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+    }
+    // No fallback to unsigned execution when the selected signature fails.
+    await f.writeSignature(f.statement);
+    await expect(tool.runVmReleaseTool({ command: "inspect-signed", ...f.consumer }))
+      .rejects.toThrow(/^vm-release-tool failed \(operation_failed\)$/);
   });
 });

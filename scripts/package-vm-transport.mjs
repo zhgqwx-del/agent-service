@@ -15,6 +15,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const VM_TRANSPORT_FILES = Object.freeze({ archive: "release.tar", tool: "vm-release-tool.mjs", proof: "transport-proof.json" });
 const SOURCE_PATHS = Object.freeze([
   "scripts/lib/vm-release-archive.mjs", "scripts/lib/vm-release.mjs",
+  "scripts/lib/vm-release-signature.mjs", "scripts/lib/vm-release-signed.mjs",
   "scripts/package-vm-transport.mjs", "scripts/vm-release-tool.mjs",
 ]);
 const BUILD_INPUT_PATHS = Object.freeze(["package.json", "pnpm-lock.yaml"]);
@@ -30,7 +31,7 @@ const HELP = `Usage: package-vm-transport --release <absolute-directory> --role 
 
 Package an already verified target-specific Node 24 release without rebuilding the application.
 The new private directory contains release.tar, vm-release-tool.mjs and transport-proof.json.
-The tool and all four source inputs must exactly match the verified release's frozen input hashes.
+The tool's full source inputs must exactly match the verified release's frozen input hashes.
 Obtain tool, archive and manifest digests through an independent trusted channel; the proof does
 not authenticate itself. Never overwrites output or installs/starts a service. Production remains
 unaccepted. -h/--help opens no release, output or build resource.
@@ -245,14 +246,14 @@ async function captureSources(manifest) {
 const BUNDLE_DRIVER = String.raw`
 import { builtinModules } from "node:module";
 import { posix } from "node:path";
-const names = ["scripts/lib/vm-release-archive.mjs", "scripts/lib/vm-release.mjs", "scripts/package-vm-transport.mjs", "scripts/vm-release-tool.mjs"];
+const names = ["scripts/lib/vm-release-archive.mjs", "scripts/lib/vm-release.mjs", "scripts/lib/vm-release-signature.mjs", "scripts/lib/vm-release-signed.mjs", "scripts/package-vm-transport.mjs", "scripts/vm-release-tool.mjs"];
 const chunks = []; let total = 0;
 for await (const part of process.stdin) { total += part.length; if (total > 25165824) throw new Error("input bounded"); chunks.push(part); }
 const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 if (input === null || typeof input !== "object" || Array.isArray(input)
   || Object.keys(input).sort().join("\0") !== ["esbuildModuleUrl", "expectedCompilerVersion", "sources"].sort().join("\0")
   || typeof input.esbuildModuleUrl !== "string" || input.expectedCompilerVersion !== "0.28.2"
-  || !Array.isArray(input.sources) || input.sources.length !== 4) throw new Error("input invalid");
+  || !Array.isArray(input.sources) || input.sources.length !== 6) throw new Error("input invalid");
 const url = new URL(input.esbuildModuleUrl);
 if (url.protocol !== "file:" || url.search || url.hash) throw new Error("compiler invalid");
 const sources = new Map();
@@ -330,7 +331,7 @@ async function bundleTool(sources, compiler) {
   let result;
   try { result = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { throw failed(); }
   const builtin = new Set(builtinModules.map((name) => name.startsWith("node:") ? name : `node:${name}`));
-  const closure = SOURCE_PATHS.filter((path) => path !== "scripts/package-vm-transport.mjs");
+  const closure = SOURCE_PATHS.filter((path) => path !== "scripts/package-vm-transport.mjs").sort();
   if (!exact(result, ["toolBase64", "externalImports", "inputPaths", "compilerVersion"])
     || result.compilerVersion !== compiler.version
     || typeof result.toolBase64 !== "string" || !Array.isArray(result.externalImports)

@@ -1,10 +1,12 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
+> M4离线签名候选（2026-10-15）：复用受限tar/manifest和独立Node工具，以受保护Ed25519文件签署exact clean release statement；consumer必须同时持有独立可信SPKI DER pin与选定role/commit，并核对实际归档、manifest和执行工具自身hash。全部signed metadata在输出创建前闭合，第二次解包读取重新验归档摘要，无unsigned fallback。新增离线脚本不是新的应用dist入口，长期router/runner、六入口和两个镜像不变；不生成产品key、不执行DDL/服务安装/环境晋级，不代表生产trustroot、OCI签名、freshness或吊销。操作见[离线VM签名](../operations/local-and-deployment.md#离线-vm-发布签名)，实际验收见PROGRESS，M1和恢复门禁不变。
+
 > M4本地候选补充（2026-10-15）：受保护的L0 runtime metrics复用router/runner各自HTTP端口，`METRICS_ENABLED=0`默认关闭；独立只读token只用于GET/HEAD /metrics，禁止进入业务路径或upstream。固定低基数进程/HTTP聚合仅驻内存，不属于owner telemetry inventory，也不是SSE完整寿命、turn指标或完整OTel平台；不新增schema、进程、JavaScript入口或镜像。定向与实际bundle证明、尚待整树/CI状态及M1门禁均以PROGRESS最新节为准；协议见[可观测性设计](05-observability.md#受保护的-l0-runtime-metrics)。
 
 > 本地集成验收（2026-10-15）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
 
-> M4独立VM目录发布包候选复用现有六个Node24 ESM入口，附带完整production依赖、严格manifest及Linux非root systemd样例，不新增长期服务或镜像。实际依赖闭包含esbuild原生程序，目录包绑定Linux/macOS与x64/arm64，不能把JS应用等同跨OS通用闭包或独立ELF程序；`productionAccepted=false`固定。构建从冻结Git/copy-once源码进行，验真还要求独立可信摘要与匹配host；帮助/服务入口以真实文件身份识别current/path alias。实际双包/类型/必跑测试及完整验收状态只看PROGRESS，schema发布、生产无DDL账号、签名/晋级及真实环境验收仍缺，M1不冻结/M3不开始。
+> M4独立VM目录发布包候选复用现有六个Node24 ESM入口，附带完整production依赖、严格manifest及Linux非root systemd样例，不新增长期服务或镜像。实际依赖闭包含esbuild原生程序，目录包绑定Linux/macOS与x64/arm64，不能把JS应用等同跨OS通用闭包或独立ELF程序；`productionAccepted=false`固定。构建从冻结Git/copy-once源码进行，验真还要求独立可信摘要与匹配host；帮助/服务入口以真实文件身份识别current/path alias。VM离线签名候选见上方；实际双包/类型/必跑测试及完整验收状态只看PROGRESS，schema发布、生产无DDL账号、OCI签名/环境晋级及真实环境验收仍缺，M1不冻结/M3不开始。
 
 > 本地MySQL逻辑备份/旧restore CLI现接受保护的exact ref-key文件，供0033 active source/target startup audit使用；missing/wrong key仍安全拒绝。实际active0033组合证明只看PROGRESS，不能借inactive旧17例外推；active0053 capture与恢复后的新epoch尚不兼容，必须fail closed，不得自动rebind。
 

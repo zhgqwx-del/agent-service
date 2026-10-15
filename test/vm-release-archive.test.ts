@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -32,6 +32,8 @@ interface ArchiveApi {
     limits?: ArchiveLimits }): Promise<ArchiveReceipt>;
   unpackVmReleaseArchive(input: { archive: string; role: Role; archiveSha256: string;
     manifestSha256: string; output: string; limits?: ArchiveLimits }): Promise<ArchiveReceipt>;
+  inspectVmReleaseArchive(input: { archive: string; role: Role; manifestSha256: string;
+    limits?: ArchiveLimits }): Promise<{ receipt: ArchiveReceipt; manifest: unknown }>;
 }
 const sha = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
 const ownedRoots = new Set<string>();
@@ -430,4 +432,101 @@ describe("VM release tar transport", () => {
       }
     },
   );
+});
+
+describe("read-only VM release archive inspection", () => {
+  it.each(["agent-router", "agent-runner"] as const)("checks complete %s tar bytes against its trusted manifest without extracting", async (role) => {
+    const f = await fixture(role), packed = await pack(f);
+    const originalArchive = await readFile(packed.archive);
+    const originalManifest = await readFile(join(f.root, "release-manifest.json"));
+    const originalPayload = await readFile(join(f.root, f.longPath));
+    const archiveDirectoryBefore = await readdir(dirname(packed.archive));
+    const inspected = await archiveApi.inspectVmReleaseArchive({ archive: packed.archive, role,
+      manifestSha256: f.manifestSha256 });
+    expect(inspected.receipt).toEqual(packed.receipt);
+    expect(inspected.receipt.archiveSha256).toBe(sha(originalArchive));
+    expect(inspected.manifest).toEqual(f.manifest);
+    expect(inspected.manifest).not.toBe(f.manifest);
+    expect(Object.isFrozen(inspected.manifest)).toBe(true);
+    const immutable = inspected.manifest as { source: object; files: object[] };
+    expect(Object.isFrozen(immutable.source)).toBe(true);
+    expect(Object.isFrozen(immutable.files)).toBe(true);
+    expect(Object.isFrozen(immutable.files[0])).toBe(true);
+    expect(await readFile(packed.archive)).toEqual(originalArchive);
+    expect(await readFile(join(f.root, "release-manifest.json"))).toEqual(originalManifest);
+    expect(await readFile(join(f.root, f.longPath))).toEqual(originalPayload);
+    expect(await readdir(dirname(packed.archive))).toEqual(archiveDirectoryBefore);
+  });
+
+  it("hashes the actual tar bytes even when two valid tar encodings carry the same manifest and inventory", async () => {
+    const f = await fixture("agent-router"), packed = await pack(f);
+    const extraZeroBlock = Buffer.concat([await readFile(packed.archive), Buffer.alloc(512)]);
+    const otherArchive = await archivePath();
+    await writeFile(otherArchive, extraZeroBlock);
+    const original = await archiveApi.inspectVmReleaseArchive({ archive: packed.archive,
+      role: f.role, manifestSha256: f.manifestSha256 });
+    const changed = await archiveApi.inspectVmReleaseArchive({ archive: otherArchive,
+      role: f.role, manifestSha256: f.manifestSha256 });
+    expect(changed.manifest).toEqual(original.manifest);
+    expect(changed.receipt.entryCount).toBe(original.receipt.entryCount);
+    expect(changed.receipt.archiveBytes).toBe(original.receipt.archiveBytes + 512);
+    expect(changed.receipt.archiveSha256).toBe(sha(extraZeroBlock));
+    expect(changed.receipt.archiveSha256).not.toBe(original.receipt.archiveSha256);
+  });
+
+  it("rejects an untrusted manifest, wrong role, truncated archive and unsafe topology without altering input", async () => {
+    const f = await fixture("agent-router"), packed = await pack(f);
+    const original = await readFile(packed.archive);
+    await expect(archiveApi.inspectVmReleaseArchive({ archive: packed.archive, role: f.role,
+      manifestSha256: "0".repeat(64) })).rejects.toThrow();
+    await expect(archiveApi.inspectVmReleaseArchive({ archive: packed.archive, role: "agent-runner",
+      manifestSha256: f.manifestSha256 })).rejects.toThrow();
+    const truncated = await archivePath();
+    await writeFile(truncated, original.subarray(0, original.length - 1));
+    await expect(archiveApi.inspectVmReleaseArchive({ archive: truncated, role: f.role,
+      manifestSha256: f.manifestSha256 })).rejects.toThrow();
+    const link = requireHeader(original, (row) => row.name === "node_modules/fixture-alias");
+    const unsafe = mutateHeader(original, link, (copy, offset) => {
+      writeTarField(copy, offset + 157, 100, "../../outside");
+    });
+    const unsafeArchive = await archivePath();
+    await writeFile(unsafeArchive, unsafe);
+    await expect(archiveApi.inspectVmReleaseArchive({ archive: unsafeArchive, role: f.role,
+      manifestSha256: f.manifestSha256 })).rejects.toThrow();
+    expect(await readFile(packed.archive)).toEqual(original);
+    expect(await readFile(truncated)).toEqual(original.subarray(0, original.length - 1));
+    expect(await readFile(unsafeArchive)).toEqual(unsafe);
+  });
+
+  it("enforces the existing closed safety budgets and refuses caller output options", async () => {
+    const f = await fixture("agent-router"), packed = await pack(f);
+    const bytes = await readFile(packed.archive);
+    for (const limits of [{ entryCount: 1 }, { archiveBytes: bytes.length - 1 }, { fileBytes: 1 },
+      { manifestBytes: 1 }, { metadataBytes: 1 }, { pathBytes: 1 }, { entryCount: 100_001 },
+      { unknown: 1 }]) {
+      await expect(archiveApi.inspectVmReleaseArchive({ archive: packed.archive, role: f.role,
+        manifestSha256: f.manifestSha256, limits: limits as ArchiveLimits })).rejects.toThrow();
+    }
+    const output = await outputPath();
+    await expect(archiveApi.inspectVmReleaseArchive({ archive: packed.archive, role: f.role,
+      manifestSha256: f.manifestSha256, output } as never)).rejects.toThrow();
+    await expect(lstat(output)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("cleans only its exact private scratch on success and failure", async () => {
+    const f = await fixture("agent-router"), packed = await pack(f);
+    const scratchParent = await tempRoot();
+    const moduleUrl = new URL("../scripts/lib/vm-release-archive.mjs", import.meta.url).href;
+    const child = `import { inspectVmReleaseArchive } from ${JSON.stringify(moduleUrl)};\n`
+      + `import { tmpdir } from 'node:os';\n`
+      + `const input = ${JSON.stringify({ archive: packed.archive, role: f.role, manifestSha256: f.manifestSha256 })};\n`
+      + `const good = await inspectVmReleaseArchive(input);\n`
+      + `let badRejected = false;\n`
+      + `try { await inspectVmReleaseArchive({ ...input, manifestSha256: '0'.repeat(64) }); } catch { badRejected = true; }\n`
+      + `process.stdout.write(JSON.stringify({ scratchParent: tmpdir(), archiveSha256: good.receipt.archiveSha256, badRejected }));\n`;
+    const { stdout } = await runLocal(process.execPath, ["--input-type=module", "-e", child],
+      { env: { ...process.env, TMPDIR: scratchParent }, timeout: 10_000 });
+    expect(JSON.parse(stdout)).toEqual({ scratchParent, archiveSha256: packed.archiveSha256, badRejected: true });
+    expect(await readdir(scratchParent)).toEqual([]);
+  });
 });

@@ -1,7 +1,8 @@
 // Build independent role directories and execute only their production dependency closure.
 // This gate does not load .env, connect to a database, install a service, or contact a provider.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, lstat, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { generateKeyPairSync } from "node:crypto";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -9,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { buildVmRelease } from "./package-vm-release.mjs";
 import { packageVmTransport } from "./package-vm-transport.mjs";
 import { sha256File, verifyVmReleaseDirectory, VM_RELEASE_ENTRYPOINTS } from "./lib/vm-release.mjs";
+import { vmReleasePublicKeySha256 } from "./lib/vm-release-signature.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
@@ -131,6 +133,23 @@ function checkOneShot(release, entrypoint, invocationDirectory = release.output)
   }
 }
 
+function offlineCommand(script, args, cwd, succeeds = true) {
+  const result = spawnSync(process.execPath, [script, ...args], {
+    cwd, env: childEnv, encoding: "utf8", timeout: 135_000, maxBuffer: 64 * 1024,
+  });
+  if (result.error || result.signal || result.status !== (succeeds ? 0 : 1)
+    || succeeds && result.stderr !== "" || !succeeds && (result.stdout !== ""
+      || result.stderr !== "vm-release-tool failed (operation_failed)\n")) {
+    throw new Error("VM signed transport command failed its closed contract");
+  }
+  return succeeds ? JSON.parse(result.stdout) : undefined;
+}
+
+async function requireAbsent(path) {
+  try { await lstat(path); } catch (error) { if (error.code === "ENOENT") return; throw error; }
+  throw new Error("rejected signed transport created output");
+}
+
 const scratch = await mkdtemp(join(tmpdir(), "agent-service-vm-check-"));
 let runner;
 let router;
@@ -157,6 +176,19 @@ try {
     throw new Error("VM role releases do not share the same source state");
   }
   const transports = [];
+  const signatureChecks = [];
+  // Ephemeral validation keys are never a release/CI signing authority and are not retained in
+  // --artifacts. No production key is generated, loaded from ambient config, or printed.
+  let signing;
+  if (!allowDirtyDevelopment) {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const privatePath = join(scratch, "test-signing-private.pem"), publicPath = join(scratch, "test-signing-public.pem");
+    const privateBytes = privateKey.export({ type: "pkcs8", format: "pem" });
+    try { await writeFile(privatePath, privateBytes, { flag: "wx", mode: 0o600 }); }
+    finally { if (Buffer.isBuffer(privateBytes)) privateBytes.fill(0); }
+    await writeFile(publicPath, publicKey.export({ type: "spki", format: "pem" }), { flag: "wx", mode: 0o600 });
+    signing = { privatePath, publicPath, publicKeySha256: vmReleasePublicKeySha256(publicKey) };
+  }
   const transportRoot = artifactDirectory ?? join(scratch, "transport-artifacts");
   if (artifactDirectory === undefined) await mkdir(transportRoot, { mode: 0o700 });
   for (const release of releases) {
@@ -186,8 +218,59 @@ try {
       throw new Error("standalone VM extraction proof does not match trusted inputs");
     }
     await verifyVmReleaseDirectory(unpacked, release.role, release.manifestSha256);
+    let executableOutput = unpacked;
+    if (signing !== undefined) {
+      phase = `sign-${release.role}`;
+      const signature = join(scratch, `test-${release.role}-signature.json`);
+      const signed = offlineCommand(join(ROOT, "scripts/sign-vm-release.mjs"), [
+        "--release", release.output, "--role", release.role,
+        "--manifest-sha256", release.manifestSha256, "--archive", archivePath,
+        "--tool", toolPath, "--private-key", signing.privatePath,
+        "--public-key-sha256", signing.publicKeySha256, "--output", signature,
+      ], scratch);
+      if (signed.schema !== "agent-service-vm-release-signing-receipt-v1"
+        || signed.sourceCommit !== release.sourceCommit || signed.role !== release.role
+        || signed.publicKeySha256 !== signing.publicKeySha256
+        || signed.toolSha256 !== proof.toolSha256 || signed.archiveSha256 !== proof.archiveSha256
+        || signed.manifestSha256 !== release.manifestSha256 || signed.productionAccepted !== false) {
+        throw new Error("VM signature receipt differs from trusted build inputs");
+      }
+      const selectors = ["--archive", archivePath, "--role", release.role, "--signature", signature,
+        "--public-key", signing.publicPath, "--public-key-sha256", signing.publicKeySha256,
+        "--source-commit", release.sourceCommit];
+      phase = `standalone-signed-inspect-${release.role}`;
+      const inspected = offlineCommand(toolPath, ["inspect-signed", ...selectors], scratch);
+      const signedOutput = join(scratch, `signed-unpacked-${release.role}`);
+      phase = `standalone-signed-unpack-${release.role}`;
+      const extracted = offlineCommand(toolPath, ["unpack-signed", ...selectors, "--output", signedOutput], scratch);
+      for (const receipt of [inspected, extracted]) {
+        if (receipt.signatureVerified !== true || receipt.productionAccepted !== false
+          || receipt.publicKeySha256 !== signing.publicKeySha256
+          || receipt.signatureSha256 !== signed.signatureSha256
+          || receipt.statement.sourceCommit !== release.sourceCommit || receipt.statement.role !== release.role
+          || receipt.statement.toolSha256 !== proof.toolSha256
+          || receipt.receipt.archiveSha256 !== proof.archiveSha256
+          || receipt.receipt.manifestSha256 !== release.manifestSha256) {
+          throw new Error("VM signed consumer receipt differs from trusted selection");
+        }
+      }
+      phase = `standalone-signed-rejection-${release.role}`;
+      for (const [field, value] of [["--public-key-sha256", "0".repeat(64)],
+        ["--source-commit", release.sourceCommit === "0".repeat(40) ? "1".repeat(40) : "0".repeat(40)]]) {
+        const wrong = [...selectors]; wrong[wrong.indexOf(field) + 1] = value;
+        const rejectedOutput = join(scratch, `rejected-${release.role}-${field.slice(2)}`);
+        offlineCommand(toolPath, ["unpack-signed", ...wrong, "--output", rejectedOutput], scratch, false);
+        await requireAbsent(rejectedOutput);
+      }
+      await verifyVmReleaseDirectory(signedOutput, release.role, release.manifestSha256);
+      executableOutput = signedOutput;
+      signatureChecks.push({ role: release.role, authority: "ephemeral-test-only", signatureVerified: true,
+        signatureSha256: signed.signatureSha256, publicKeySha256: signing.publicKeySha256,
+        selectedCommit: release.sourceCommit, consumerToolSha256: proof.toolSha256,
+        productionAccepted: false });
+    }
     // All following executable checks must use transported bytes, not the original build.
-    release.output = unpacked;
+    release.output = executableOutput;
     transports.push(proof);
   }
   if (transports[0].toolSha256 !== transports[1].toolSha256
@@ -263,6 +346,8 @@ try {
       { role, sourceCommit, sourceDirty, inputSha256, lockSha256, targetRuntime, nativeFiles, publishable, manifestSha256, fileCount }
     )),
     transports,
+    signatureChecks,
+    signatureProfile: signing === undefined ? "not-executed-dirty-development" : "ephemeral-test-only",
     oneShots, oneShotInvocations: ["canonical", "current-directory-symlink"],
     mainInvocations: ["current-directory-symlink"],
     runtime: ["runner-ready", "router-ready", "protocol-discovery", "tenant-auth", "platform-auth", "forwarding", "canonical-openapi", "immutable-after-stop"],
@@ -270,7 +355,7 @@ try {
   await mkdir(join(ROOT, ".local-run"), { recursive: true });
   await writeFile(join(ROOT, ".local-run/vm-release-proof.json"), `${JSON.stringify(report, null, 2)}\n`);
   console.log(`VM transport trusted build proof: ${JSON.stringify(transports)}`);
-  console.log("VM process releases passed: two transported dependency closures, standalone digest-bound extraction, four plain Node one-shots, readiness/auth/forwarding/OpenAPI and unchanged payloads");
+  console.log(`VM process releases passed: two transported dependency closures, standalone digest-bound extraction, signature profile ${report.signatureProfile}, four plain Node one-shots, readiness/auth/forwarding/OpenAPI and unchanged payloads`);
 } catch {
   // Closed phase names aid diagnosis without exposing arbitrary subprocess output or errors.
   console.error(`VM release verification failed (operation_failed, phase=${phase})`);

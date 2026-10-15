@@ -1,6 +1,8 @@
 # agent-service
 
-开发中的验证优化候选：日常修改先跑相关定向测试，一个功能包冻结后再做完整本地验收，较大阶段集中推送并等待CI。`pnpm test:coverage`将同环境的具名专项与主coverage合并为一次执行，仍强制逐文件非零/零skip证明；历史迁移、S3、cluster与实际发布包装配继续独立执行。当前仅工具定向119项及静态检查通过，候选整树/新CI尚待，不能据此宣称M1已闭环。方法见[分层验证路径](docs/operations/development-and-ci-guide.md#6-分层验证路径)。
+M4新增离线VM发布签名候选：`pnpm sign:vm-release`用显式受保护Ed25519文件签署clean发布的精确身份；独立工具的`inspect-signed`/`unpack-signed`核对可信公钥pin、选定role/commit、实际归档/manifest及工具自身字节，没有unsigned fallback。它不生成生产密钥、不安装或晋级环境；生产信任根、OCI签名与环境发布仍未完成。操作及边界见[离线VM发布签名](docs/operations/local-and-deployment.md#离线-vm-发布签名)。实际功能包/整树/CI结果只看PROGRESS，不能借旧验收背书。
+
+验证节奏：日常先跑相关定向测试，多个相关改动形成一个功能包后再做完整本地验收，较大阶段集中推送并等待CI。`pnpm test:coverage`合并同环境具名专项与主coverage，保留逐文件非零/零skip及coverage门槛；历史、S3、cluster和实际发布包装配独立验收。新driver首轮真实失败与局部复验均记录于PROGRESS，不把旧报告当新版本通过，也尚未宣称完整提速比例。方法见[分层验证路径](docs/operations/development-and-ci-guide.md#6-分层验证路径)。
 
 M4新增本地候选：router与runner在各自原端口提供默认关闭的受保护`GET/HEAD /metrics`，只统计进程与固定低基数HTTP聚合，不保存owner、URL、正文或secret，也不新增服务、迁移或镜像。独立运维token不得充当业务凭证或被router转发；时延统计止于响应头就绪，不代表SSE完整寿命。五个新文件153项与兼容/验证工具合计10文件388项定向通过，实际bundle双服务默认关闭/启用鉴权装配通过；完整新verify/CI尚待。配置与手动体验见[部署契约](docs/operations/local-and-deployment.md#受保护的-l0-runtime-metrics)，不是完整可观测性或生产验收。
 

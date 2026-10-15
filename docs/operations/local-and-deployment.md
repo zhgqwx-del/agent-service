@@ -1,8 +1,10 @@
 # 本地运维与后续部署契约
 
-> 本地集成验收（2026-10-15）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
+> 离线VM签名候选（2026-10-15，未发布验收）：新增显式签名及signed inspect/unpack，独立SPKI公钥pin、选定role/commit与实际工具字节共同约束release。私钥格式正则的secret-scanner边界误报已等价改写、无白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770与proof工具119），API/typecheck通过。实际clean双包、整树和新CI仍待。原817 CI的test失败、两image成功；b575集中全量实际3164 passed/5 failed且后置未执行，不能写成全绿。完整事实只看PROGRESS末节。
 
-当前阶段以本机可重复运行和自动验证为目标；预发、生产资源就绪后，再把相同的环境变量契约映射到独立云服务器或 Kubernetes Secret、ConfigMap 和 Service。M4同时支持虚拟机独立进程与容器镜像两种部署形态，复用router/runner协议和构建入口；Node24目录/归档已通过macOS arm64本地集成验收，实际结果以PROGRESS为准。受限归档已有本地候选实现和clean装配证明；签名/晋级、受控schema发布、进程/容器托管及真实环境验收仍未完成。
+> 历史本地集成验收（2026-10-15，非上述签名候选验收）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
+
+当前阶段以本机可重复运行和自动验证为目标；预发、生产资源就绪后，再把相同的环境变量契约映射到独立云服务器或 Kubernetes Secret、ConfigMap 和 Service。M4同时支持虚拟机独立进程与容器镜像两种部署形态，复用router/runner协议和构建入口；Node24目录/归档已有macOS arm64本地集成验收，实际结果以PROGRESS为准。离线VM签名新增本地候选；生产信任根/密钥管理、OCI签名、环境晋级、受控schema发布、进程/容器托管及真实环境验收仍未完成。
 
 ## VM 进程发布包地基
 
@@ -23,7 +25,7 @@ clean构建从精确Git commit的blob复制输入到独立快照；工作树实�
 
 manifest记录源码commit、lock/实际输入摘要、构建Node/pnpm/platform、严格target runtime与完整文件/软链接/目录权限清单；强制拒绝路径逃逸、敏感配置/私钥/数据库文件、特殊文件及特殊权限位。真实production闭包包括esbuild原生程序，不能声称跨OS/CPU通用；必须在目标Linux/macOS及x64/arm64环境构建，验真与运行主机也须匹配。native检查只核对有界ELF64/MachO64 header、program/load-command/segment结构、目标OS/CPU与完整文件摘要，截断、越界、未知/Windows格式或错误架构仍拒绝；这不是任意unsafe-native开关，也不是完整loader、NAPI/libc兼容或厂商真实性证明。实际功能须另经plain Node装配验证。第三方SDK合法`credentials`代码目录不能被误当密钥文件，但其每个后代仍完整检查，真实同名credentials文件/软链接及`.env`等继续拒绝。未来新增依赖须重新审查。发布输出不含`.env`，构建子进程不继承应用key/数据库/模型配置且不回显任意诊断。
 
-验真复用`scripts/lib/vm-release.mjs`的`verifyVmReleaseDirectory(directory, role, trustedManifestSha256)`，摘要从独立可信构建/晋级渠道取得，不能把包内自算摘要当认证。同一目录、manifest和完整依赖闭包应保持不变后再晋级，目标环境不运行pnpm或重新构建。目录清单不是归档签名、跨平台确定性构建或生产许可；`productionAccepted=false`固定。受限tar运输与Node24独立工具已有本地候选、335定向与clean双tar装配证明；签名、registry/promotion job及自动安装器仍未实现，本地完整集成验证已通过，新Linux CI以main对应run验收。
+验真复用`scripts/lib/vm-release.mjs`的`verifyVmReleaseDirectory(directory, role, trustedManifestSha256)`，摘要从独立可信构建/晋级渠道取得，不能把包内自算摘要当认证。同一目录、manifest和完整依赖闭包应保持不变后再晋级，目标环境不运行pnpm或重新构建。目录清单本身不是归档签名、跨平台确定性构建或生产许可；`productionAccepted=false`固定。受限tar运输与Node24独立工具具有先前335定向和clean双tar装配证明；本轮离线VM签名候选见下节，不借先前完整集成验证证明其已验收。registry/promotion job及自动安装器仍未实现，新Linux CI以main对应run验收。
 
 ### 受限 tar 与独立工具（候选，验证状态见 PROGRESS）
 
@@ -46,9 +48,44 @@ node /absolute/runner-transport/vm-release-tool.mjs verify \
   --manifest-sha256 <独立可信manifest摘要>
 ```
 
-同目录的`transport-proof.json`只是证据副本，**不能自行认证**工具或归档；攻击者同时替换sidecar、manifest和payload时，自算摘要仍没有可信来源。必须先信任构建渠道并人工/后续发布系统比较预期tool摘要，不能先执行未知工具让它验证自己。工具只用Node内置模块，无源码checkout、pnpm、网络、`.env`或数据库依赖；没有服务安装、DDL、current指针切换或应用启动权限。bundle的四个工具源码与root package/lock都必须逐字节匹配该release冻结input清单；闭合解析当前pnpm9 root importer，编译器实际版本须精确等于已绑定的esbuild0.28.2，错/旧安装会拒绝。编译子进程不继承应用密钥，proof记录受信任本机compiler入口的观察摘要；这不是完整冻结toolchain、vendor认证、抵抗恶意同UID替换或可复现构建证明。归档120秒deadline是共用计时的协作式检查，native文件系统I/O不能被它硬取消；成功副本也不是断电持久性或原子生产晋级证明。
+同目录的`transport-proof.json`只是证据副本，**不能自行认证**工具或归档；攻击者同时替换sidecar、manifest和payload时，自算摘要仍没有可信来源。必须先信任构建渠道并人工/后续发布系统比较预期tool摘要，不能先执行未知工具让它验证自己。工具只用Node内置模块，无源码checkout、pnpm、网络、`.env`或数据库依赖；没有服务安装、DDL、current指针切换或应用启动权限。bundle现冻结六个源码：原`vm-release.mjs`、`vm-release-archive.mjs`、`package-vm-transport.mjs`、`vm-release-tool.mjs`，加`vm-release-signature.mjs`与`vm-release-signed.mjs`；六者与root package/lock都必须逐字节匹配该release冻结input清单。root依赖字段/lock不因签名增加依赖；闭合解析当前pnpm9 root importer，编译器实际版本须精确等于已绑定的esbuild0.28.2，错/旧安装会拒绝。编译子进程不继承应用密钥，proof记录受信任本机compiler入口的观察摘要；这不是完整冻结toolchain、vendor认证、抵抗恶意同UID替换或可复现构建证明。归档120秒deadline是共用计时的协作式检查，native文件系统I/O不能被它硬取消；成功副本也不是断电持久性或原子生产晋级证明。
 
-候选CI增加按role保存`release.tar`、`vm-release-tool.mjs`及proof的artifact步骤，并在受信任job日志记录三个原始摘要；本地macOS证明不能代替main对应的Linux CI结果。artifact留存不是签名或production promotion。checker在临时无源码目录中调用已核对tool摘要的独立工具，把归档解包后再执行四CLI和router/runner双服务检查，不能仅测试原始构建目录。
+候选CI增加按role保存`release.tar`、`vm-release-tool.mjs`及proof的artifact步骤，并在受信任job日志记录三个原始摘要；本地macOS证明不能代替main对应的Linux CI结果。artifact留存本身不是签名或production promotion。checker在临时无源码目录中调用已核对tool摘要的独立工具，把归档解包后再执行四CLI和router/runner双服务检查，不能仅测试原始构建目录；本轮clean profile增加的签名只使用ephemeral-test-only密钥，dirty-development profile明确不执行签名，不能由CI测试签名形成生产trust root。
+
+### 离线 VM 发布签名
+
+`pnpm sign:vm-release`是可信构建主机上显式调用的离线脚本，恰好要求八个flag：`--release`、`--role`、`--manifest-sha256`、`--archive`、`--tool`、`--private-key`、`--public-key-sha256`、`--output`。只接纳clean/publishable且目标OS/CPU匹配的Node24 release；私钥须为当前operator拥有、无软/硬链接的单链接普通Ed25519 PKCS8 PEM文件，权限精确`0400`或`0600`。新输出create-only，父目录须真实存在、由operator拥有且group/other不可写，并位于release之外；脚本不生成生产key、不发现`.env`，不把key复制入release或日志。
+
+以下绝对路径均为占位。`RELEASE_MANIFEST_SHA256`、`RELEASE_TOOL_SHA256`、`RELEASE_PUBLIC_KEY_SHA256`与`RELEASE_SOURCE_COMMIT`须事先经独立受信任渠道提供并核对；公钥pin是canonical SPKI DER的SHA-256，不是PEM文本摘要。不能从待验证目录的sidecar自算值替代这些authority。签名必须由可信签名环境及其代码执行；目标消费前仍须先bootstrap可信tool，**不能先运行未知tool让它认证自己**。
+
+```bash
+# 可信构建/签名主机：八个显式flag，不把private key正文放入命令行。
+pnpm sign:vm-release \
+  --release /absolute/verified/runner-release --role agent-runner \
+  --manifest-sha256 "${RELEASE_MANIFEST_SHA256:?}" \
+  --archive /absolute/runner-transport/release.tar \
+  --tool /absolute/runner-transport/vm-release-tool.mjs \
+  --private-key /absolute/protected/release-signing-key.pem \
+  --public-key-sha256 "${RELEASE_PUBLIC_KEY_SHA256:?}" \
+  --output /absolute/new/release-signature.json
+
+# Node24目标主机：先用本机可信校验程序比较预期tool原始字节，再运行它。
+# macOS可用shasum -a 256 --check替代sha256sum --check。
+printf '%s  %s\n' "${RELEASE_TOOL_SHA256:?}" /absolute/runner-transport/vm-release-tool.mjs | sha256sum --check && \
+node /absolute/runner-transport/vm-release-tool.mjs inspect-signed \
+  --archive /absolute/runner-transport/release.tar --role agent-runner \
+  --signature /absolute/release-signature.json --public-key /absolute/protected/release-public-key.pem \
+  --public-key-sha256 "${RELEASE_PUBLIC_KEY_SHA256:?}" --source-commit "${RELEASE_SOURCE_COMMIT:?}" && \
+node /absolute/runner-transport/vm-release-tool.mjs unpack-signed \
+  --archive /absolute/runner-transport/release.tar --role agent-runner \
+  --signature /absolute/release-signature.json --public-key /absolute/protected/release-public-key.pem \
+  --public-key-sha256 "${RELEASE_PUBLIC_KEY_SHA256:?}" --source-commit "${RELEASE_SOURCE_COMMIT:?}" \
+  --output /absolute/new/runner-release
+```
+
+两条signed命令都不接受caller-selected `--tool`或unsigned fallback；它们读取正在执行的`import.meta.url`实际工具字节，核对签名中的tool摘要。闭合Ed25519签名还绑定role/精确commit、copied inputs/lock、manifest/archive/tool摘要、target runtime、归档字节数/entry count及clean/publishable/`productionAccepted=false`。完整signed provenance在创建输出前核对；解包再以签名中的归档摘要认证第二次私有copy，不能继承第一次读取的TOCTOU权威。签名失败不创建解包目录；后续归档/目录验真失败仍按既有0700隔离留存合同处理，绝不安装、执行DDL、启动应用或晋级。
+
+这是offline脚本能力，不增加六个应用dist入口、两个常驻服务或两个OCI镜像。签名不证明freshness、撤销、密钥管理/生产信任根、OCI签名、自动promotion、生产验收或任意重放防护；caller选择的精确commit只是选定release约束。sign/inspect/unpack各有协作式120秒operation预算，消费工具自hash另有独立预算；native文件系统I/O不能被硬取消，受控parent/可信本机及非恶意same-UID仍是前提。最终相关重验、实际clean双包与新CI状态以PROGRESS末节为准，不借旧335或本轮定向889当完整发布通过。
 
 systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝对路径、只读release/current布局和独立`/var/lib/agent-service/<role>`状态目录；配置从独立`/etc/agent-service/<role>.env`提供，建议0600，仅配置权限与职责匹配的变量。模板设置`StateDirectoryMode=0700`、`UMask=0077`和runner外置Blob目录；不会创建账号、安装unit、改当前release指针、执行DDL或启动真实服务。启动MySQL runner的现有自动migration行为并未因打包消失，生产无DDL账号/可信trigger只读桥仍需后续实现；schema cutover后的回滚须服从forward-fix，不能仅替换旧目录。
 
@@ -562,7 +599,7 @@ pnpm maintenance:backup-catalog -- restore-selected
 5. 接入真实 IdP、日志、指标和告警后再开放预发流量。
 6. 生产环境重复同一流程，不复用 staging 的数据库、Redis、密钥或 service key。
 
-目标日常交付采用共同的前半段：本地开发与 `verify` → CI 全部门禁 → 同一次构建产生受控交付物 → staging 验收 → 将同一交付物身份晋级 production。容器形态分别按 router/runner 不可变 image digest 晋级；VM 形态分别按 router/runner 完整 Node 24 发布归档的校验和与发布包身份晋级，不在环境中重新安装依赖或重新打包。两种形态都不共享 staging/production 的数据库、Redis、对象存储、密钥或 service key；环境差异只来自受控配置和 Secret。容器job当前仍以 `load: true` 临时构建并启动候选镜像；VM受限tar与独立工具已在本地候选实现，CI候选也增加其验真与artifact留存步骤，本地证明不能替代main对应Linux CI结果。registry push、可信签名/attestation、持久交付身份的staging→production promotion与受控安装仍未实现，不应把这些缺代码项归成只等云资源。
+目标日常交付采用共同的前半段：本地开发与 `verify` → CI 全部门禁 → 同一次构建产生受控交付物 → staging 验收 → 将同一交付物身份晋级 production。容器形态分别按 router/runner 不可变 image digest 晋级；VM 形态分别按 router/runner 完整 Node 24 发布归档的校验和与发布包身份晋级，不在环境中重新安装依赖或重新打包。两种形态都不共享 staging/production 的数据库、Redis、对象存储、密钥或 service key；环境差异只来自受控配置和 Secret。容器job当前仍以 `load: true` 临时构建并启动候选镜像；VM受限tar、独立工具与离线签名已在本地候选实现，CI候选也增加验真与artifact留存，本地证明不能替代main对应Linux CI结果。registry push、生产签名信任根/密钥管理、OCI签名/attestation、持久交付身份的staging→production promotion与受控安装仍未实现，不应把这些缺代码项归成只等云资源。
 
 tombstone 是 protocol family `2026-10-08` 内的 additive capability；它没有为这次扩展提升 exact protocol version。router 不把 DELETE 发到旧公开路径，而是改写成带内部 token 的版本化 POST，并要求新 runner 回 ACK；即使错误地把共享 LB URL 配成 target 且探测/请求落到不同 Pod，旧 runner 也只会 404，不会执行旧删除语义。正确拓扑仍要求 `RUNNERS` 一项对应一个稳定实例。安全 rollout 顺序是：先在 API gateway 暂停精确 session DELETE（或把流量整体切到新 router 池）→ 发布新 router 且保持 `SESSION_TOMBSTONE_ENABLED=0` → 排空全部旧 router → 滚动新 runner → 核对配置中的每个健康 runner 都声明 `tombstone` → 将新 router 的 gate 设为 `1`。显式 gate、内部 token 与 router 的全健康 fleet capability 检查必须同时满足；升级窗口中其它 API 可继续提供，DELETE 返回可重试 `503 draining`。仅逐个替换 router 而不先阻断旧 router 的 DELETE 并不安全，因为旧进程没有这个 gate；runner 端口也必须通过网络策略保持内网不可直连。
 
