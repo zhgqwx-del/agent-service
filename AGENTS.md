@@ -1,12 +1,14 @@
 # agent-service 协作约定
 
-## 当前本地集成候选（2026-10-15T17:05Z）
+## 当前本地集成候选（2026-10-15T18:22Z）
 
-修复后受影响范围定向已实际通过：4 文件 / 54 passed / 零 fail 或 skip，typecheck、secret scan727 与 diffcheck 通过，详见 [PROGRESS](docs/PROGRESS.md) 末节。下方 `aad57d3` 整轮退出1的事实保留；当前不是全量或新CI通过，相关历史、cluster、build、VM、S3 将以干净修复提交继续，暂未开始，main仍293。
+修复提交 `695220d` 的受影响范围 4 文件 / 54 项通过；随后真实历史 50 文件 / 318 项通过。`1a183c8` 的 cluster 8 文件 / 28 项、独立 T3g 3 项、真实 MySQL/MinIO 15 文件 / 81 项、六入口构建/SDK及 clean VM 发布包检查均通过，全部定向项零失败或跳过。typecheck、secret scan727 与 diffcheck 通过，详见 [PROGRESS](docs/PROGRESS.md) 末节。下方 `aad57d3` 整轮退出1的事实保留；这些是明确源码下的分段验收，不是一次全量 coverage 成功，新 SHA 的 GitHub CI 尚待。
 
 本地组合候选 `aad57d3` 已合并 M1 `d4c4060` 与 M4 `11bbf7b`，未合入 main 或推送；main/origin 仍为 `2932318`，其[旧 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38714666463)只证明原基线。2026-10-15 16:17Z～17:05:49Z 的本轮完整 verify 退出 **1**：主测试 4174 passed / 17 failed / 82 expected skipped；API、typecheck、secret scan 727 通过，后续历史、cluster、build 未执行，不能宣称 coverage 或 required 文件证明通过。失败与此前独立定向证据见 [PROGRESS](docs/PROGRESS.md) 顶部和最后一节。
 
 ## 开发与验证节奏
+
+当前下一消费者是再次真实备份/恢复到又一新 epoch；独立 worktree 的提前编码/纯测试不等于交付，当前阶段 CI 全绿前不得合入。旧 schema 原生 artifact 的跨迁移导入/升级/续跑仍缺，格式或历史重放兼容不能代替其验收；不得自动重导、删除部分目标或隐式执行 DDL。
 
 - 每轮小改动先做类型检查与影响范围定向测试；SQL、事务、删除、鉴权的正确性改动立即做真实服务及并发/回滚/隔离负例。
 - 多轮相关且已定向验证的修改形成 coherent 功能包，冻结后做一次完整 `verify` 及相关 `verify-s3`；独立历史、S3、cluster、SDK、实际 bundle/VM 门禁不省略。
