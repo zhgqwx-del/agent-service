@@ -197,4 +197,3 @@ catch (error) {
     code: diagnostic(error, "code", CODES, "none"), name: diagnostic(error, "name", NAMES, "other") })}\n`);
   process.exitCode = 1;
 }
-

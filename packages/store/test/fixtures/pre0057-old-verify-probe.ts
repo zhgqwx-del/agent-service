@@ -39,4 +39,3 @@ if (outcome !== expected) {
   process.exitCode = 1;
 }
 else process.stdout.write(outcome === "fingerprint" ? "frozen-0056-verify-fingerprint-rejected" : "frozen-0056-verify-pending-rejected");
-

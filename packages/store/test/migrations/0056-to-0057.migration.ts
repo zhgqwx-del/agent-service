@@ -427,4 +427,3 @@ describe("0056 -> 0057 exact frozen-source capture restore historical MySQL upgr
     } finally { await conn.end(); }
   }, 150_000);
 });
-
