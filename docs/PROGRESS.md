@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前快照（2026-10-15T07:29Z）**：main本地检查点229b4fc、origin仍817c144（原CI test失败/两image成功），未新增push。b575集中verify主阶段3164 passed/5 fixture failed后退出1；局部修复175/175通过，不冒充新全量。M4离线VM签名已在独立分支接入真实standalone消费，最终相关九文件889 passed/零fail或skip（七VM770、proof119）、typecheck/API及secrets696通过，实际clean双包和新整树/CI仍待。三份真实历史JSON46/46通过，但额外本地title matcher退出1，完整正式wrapper留在下一冻结全量复验。常驻服务/应用dist入口/OCI镜像仍为2/6/2；生产信任根、OCI签名/晋级与M1生命周期尚未闭合。M2冻结、M3未开始，下一M1恢复仍等发布验收全绿，0037/外部处置/自动清理关闭不变。完整失败及本轮证据见末节。
+> **当前快照（2026-10-15T07:38Z）**：main本地229b4fc、origin仍817c144（原CI test失败/两image成功），未新增push。b575集中verify主阶段3164 passed/5 fixture failed后退出1；局部修复175/175通过，不冒充新全量。M4离线VM签名在独立clean代码d671632已完成最终九文件889 passed/零fail或skip（七VM770、proof119）、typecheck/API/secrets696，且07:35:46Z实际clean双角色签名→独立工具消费→签名解包目录启动全部通过；这是darwin/arm64/Node24及ephemeral-test-only，不是生产签名或新整树/Linux CI。三份真实历史JSON46/46通过，但额外本地title matcher退出1，完整正式wrapper留到本功能包冻结后集中全量复验。常驻服务/应用dist入口/OCI镜像仍为2/6/2；生产信任根、OCI签名/晋级与M1生命周期尚未闭合。M2冻结、M3未开始，下一M1恢复仍等发布验收全绿，0037/外部处置/自动清理关闭不变。完整失败及本轮证据见末节。
 
 > **当前检查点（2026-10-15T07:14Z）**：固定clean `b575523`的集中verify已于06:54:47Z退出1，而非仍在运行。主测试实际3164 passed/5 failed/81预期profile跳过（234文件，218 passed/1 failed/15 skipped）；五个失败全在VM夹具对宿主保留setgid位的前置断言，未到产品拒绝校验，后置history/cluster/build/VM没有执行。独立诊断确认macOS会清除该位；只提取现有纯mode检查供确定性测试复用，特殊位拒绝规则不变，真实FS保留/清位两条路径均明确验证，临时目录先解析真实父路径。最新单文件175 passed/零fail或skip、typecheck通过，不冒充新整树通过。三份真实历史修复已在clean `1a54991`独立执行（预期46例，尚无终态）；另一隔离M4签名候选仅有纯crypto/临时tar/独立bundle定向519 passed和proof工具119 passed、类型检查通过，尚未合入或做实际clean双包验收。不重启全量、不触发新CI；M1恢复前置及所有默认关闭门禁保持。详细失败与局部重验见末节。
 
@@ -1420,3 +1420,9 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 格式等价改动后的最终独占报告 `m4-signature-final-focused-20261015.json`已真实退出0：07:28:39Z开始、8.15秒，九文件889 passed/0failed/0pending；逐文件为175/43/134/188/59/95/76/88/31，无skip/todo，不能与上一轮重复累计。API漂移检查亦退出0；实际clean双包仍待，未据此推进发布或生产许可。
 - clean `1a54991`的三份真实历史定向于07:11:57Z开始、07:17:14Z完成，原始JSON `history-boundary-focused-20261015-faeee873/tests.json`为3文件46 passed/0failed/0pending（15/13/18），9个独立CREATE边界各约6.3～7.0秒。额外本地guard却exit1：它把Vitest `$boundary`标题错期望为不带引号，实际是`'first'/'middle'/'last'`；原log/JSON保留。只修ignored guard的精确标题及下一次child exit/phase诊断，未重跑46份真实DB工作、不把wrapper1写成0；主仓库正式history runner无此额外标题匹配，下一冻结整树仍须执行完整47文件wrapper。
 - 本功能包尚未main合入/推送，原817 CI test失败/两image成功与b575 verify失败记录不变。较大阶段集中完整验收与CI，不因每个纯fixture/文档修正重启数小时流程；下一M1恢复仍等发布全绿，M1未冻结、M2冻结、M3未开始及所有默认关闭授权边界保持。
+
+### 本功能包真实clean双包验收（07:35Z）
+
+- 本地代码检查点 `d671632a26f42cee146e3e27384cb46834aecde3`（独立签名分支，非main发布）保持clean，严格 `pnpm check:vm-release --artifacts /private/tmp/agent-service-vm-signature-20261015-Oo2auK/verified` 于07:35:46.954Z完成、实际进程exit0。两角色均为exact d671632、sourceDirty=false/publishable=true、darwin/arm64/Node24，productionAccepted=false。实际runner tar265991680 bytes/39369 entries，router20651008 bytes/3428 entries；tool两角色字节摘要一致。
+- 不仅是pure codec或tiny fixture：真实完整production依赖闭包经独立工具按外部摘要解包，再以本轮临时Ed25519 key实际签署，独立bundle执行signed inspect/unpack，wrong pin/selected commit拒绝且不创建output；后续四one-shot/current alias、router/runner main readiness、协议、租户/平台auth、转发、canonical OpenAPI与stop后完整目录不变全部使用签名解包目录。临时私钥只在owned scratch、未进入保留归档或源码、结束随本次scratch清理；signatureProfile精确ephemeral-test-only，不是CI/生产发布trustroot。
+- root用Node24独立重读新报告并逐项核对commit/clean/两签名/实际工具身份/false字段，另存 `vm-release-proof.signature-d671632-20261015.json`，防止后续便利路径覆盖。首次只读后处理误用了终端默认旧Node而失败于builtin module解析，未重新构建或改产品，改用明确Node24后校验退出0。不能把旧d33便利报告误判成本轮；完整verify与新Linux CI仍待最终文档冻结版本，后续只文档commit也不把d671包伪称其新commit制品。

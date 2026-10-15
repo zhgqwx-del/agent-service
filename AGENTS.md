@@ -3,6 +3,7 @@
 ## 开发与验证节奏（2026-10-15）
 
 - M4离线VM签名是复用既有归档/独立Node工具的候选，只新增离线发布脚本，不增加常驻服务、应用dist入口、schema或产品镜像。只签clean/publishable字节；Ed25519 private file须当前owner、0400/0600、regular/single-link，不能用.env/参数传key bytes或回显。consumer以独立可信SPKI pin、role/commit及自身import.meta.url hash核验全部元数据后才创建输出，失败不fallback。不是生产trustroot、key管理/吊销、freshness、环境晋级或安装；dirty-development验收必须明确未执行签名。新增三测试文件纳入main-required（123）及原VM group（62个group不变），不能只靠pure codec证明实际双包消费。
+- 该签名代码d671632的真实clean双包已于07:35Z在darwin/arm64/Node24通过，profile为ephemeral-test-only且productionAccepted=false；它不是最终文档commit的制品或整树/Linux CI证明，最新结果只看PROGRESS末节。
 - 日常小改动先做类型检查和影响范围内定向测试；SQL/事务/删除/鉴权改动仍立即做对应真实服务、并发/回滚/隔离负例。可积累多轮已定向验证的相关修改，一个功能包冻结后才做完整`verify`及相关`verify-s3`；发布门禁不省略。
 - GitHub CI在较大阶段集中推送后验收，不为每个小补丁/文档更新反复push、取消并重跑长CI。主coverage候选入口为`pnpm test:coverage`，以本轮独占JSON、真实子进程退出状态、exact文件/零skip及原coverage门槛证明执行；具名group是同次执行的子集，不重复计数。历史迁移、S3、cluster、SDK和实际bundle/VM装配仍独立执行。该去重改造的整树验收状态只看PROGRESS末节，不借旧报告。
 - 此流程调整不缩减整体架构目标，不改变M1未冻结/M2冻结/M3未开始，也不授权开启任何默认关闭的删除、grant或恢复能力。

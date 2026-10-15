@@ -1,6 +1,6 @@
 # 本地运维与后续部署契约
 
-> 离线VM签名候选（2026-10-15，未发布验收）：新增显式签名及signed inspect/unpack，独立SPKI公钥pin、选定role/commit与实际工具字节共同约束release。私钥格式正则的secret-scanner边界误报已等价改写、无白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770与proof工具119），API/typecheck通过。实际clean双包、整树和新CI仍待。原817 CI的test失败、两image成功；b575集中全量实际3164 passed/5 failed且后置未执行，不能写成全绿。完整事实只看PROGRESS末节。
+> 离线VM签名候选（2026-10-15，未发布验收）：新增显式签名及signed inspect/unpack，独立SPKI公钥pin、选定role/commit与实际工具字节共同约束release。私钥格式正则的secret-scanner边界误报已等价改写、无白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770与proof工具119），API/typecheck通过。代码提交d671632的darwin/arm64/Node24 clean双包于07:35:46.954Z实际通过，仅ephemeral-test-only签名、productionAccepted=false；最终文档提交的整树和新Linux CI仍待。原817 CI的test失败、两image成功；b575集中全量实际3164 passed/5 failed且后置未执行，不能写成全绿。完整事实只看PROGRESS末节。
 
 > 历史本地集成验收（2026-10-15，非上述签名候选验收）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
 
@@ -86,6 +86,8 @@ node /absolute/runner-transport/vm-release-tool.mjs unpack-signed \
 两条signed命令都不接受caller-selected `--tool`或unsigned fallback；它们读取正在执行的`import.meta.url`实际工具字节，核对签名中的tool摘要。闭合Ed25519签名还绑定role/精确commit、copied inputs/lock、manifest/archive/tool摘要、target runtime、归档字节数/entry count及clean/publishable/`productionAccepted=false`。完整signed provenance在创建输出前核对；解包再以签名中的归档摘要认证第二次私有copy，不能继承第一次读取的TOCTOU权威。签名失败不创建解包目录；后续归档/目录验真失败仍按既有0700隔离留存合同处理，绝不安装、执行DDL、启动应用或晋级。
 
 这是offline脚本能力，不增加六个应用dist入口、两个常驻服务或两个OCI镜像。签名不证明freshness、撤销、密钥管理/生产信任根、OCI签名、自动promotion、生产验收或任意重放防护；caller选择的精确commit只是选定release约束。sign/inspect/unpack各有协作式120秒operation预算，消费工具自hash另有独立预算；native文件系统I/O不能被硬取消，受控parent/可信本机及非恶意same-UID仍是前提。最终相关重验、实际clean双包与新CI状态以PROGRESS末节为准，不借旧335或本轮定向889当完整发布通过。
+
+本轮严格clean双包装配已实际通过：代码提交`d671632a26f42cee146e3e27384cb46834aecde3`，完成时间`2026-10-15T07:35:46.954Z`，target为darwin/arm64/Node24。两role均`sourceDirty=false`、`publishable=true`、`signatureProfile=ephemeral-test-only`、`productionAccepted=false`；双sign→独立bundle的inspect/unpack、wrong pin/commit拒绝且无output、四个one-shot的current alias及双main readiness/auth/forward/OpenAPI、停止后目录不变均通过。报告另存`.local-run/vm-release-proof.signature-d671632-20261015.json`，本次临时归档位于`/private/tmp/agent-service-vm-signature-20261015-Oo2auK/verified`，不是长期发布地址或生产信任根。后续文档commit会改变HEAD；此证明仅绑定上述代码commit，不是最终新SHA完整verify或Linux CI通过，整树/新CI仍待。
 
 systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝对路径、只读release/current布局和独立`/var/lib/agent-service/<role>`状态目录；配置从独立`/etc/agent-service/<role>.env`提供，建议0600，仅配置权限与职责匹配的变量。模板设置`StateDirectoryMode=0700`、`UMask=0077`和runner外置Blob目录；不会创建账号、安装unit、改当前release指针、执行DDL或启动真实服务。启动MySQL runner的现有自动migration行为并未因打包消失，生产无DDL账号/可信trigger只读桥仍需后续实现；schema cutover后的回滚须服从forward-fix，不能仅替换旧目录。
 
