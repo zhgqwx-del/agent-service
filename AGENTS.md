@@ -1,6 +1,6 @@
 # agent-service 协作约定
 
-> **最新集成检查点（2026-10-14T23:42Z）**：本地集成树包含M4目录/归档候选及0054；main/origin仍`e411143`，未合入/推送，新CI未运行。0054来源候选11文件245 passed零fail/skip；本集成树10个非历史文件又实际231 passed零fail/skip，API/typecheck退出0、secret scan678。整树verify首次31128于23:40:24Z退出1：旧grant MySQL文件4 passed/1 failed，实际0054指纹正确拒绝trigger篡改，测试却期待0053错误。失败报告已保留，最窄只更新comment和精确0054错误，不接受任意异常、不改产品或历史oracle；修后定向5 passed零fail/skip，第二次整树重验尚待终态。覆盖率、完整47文件历史链、cluster及本集成树clean发布包不能借此前父候选证明。CI已补0054镜像marker精确断言/180分钟预算；自动off、0037硬拒、全域completion=false不变，无业务库/外部对象操作或本批.env/付费模型调用。用户已明确恢复持续开发；M1未冻结、M2冻结、M3未开始。
+> **最新集成检查点（2026-10-15T01:17Z）**：第二轮整树verify退出1的历史夹具问题已仅在测试层修复；三个真实冻结旧二进制夹具实际3/3、零fail/skip，全部旧列全行hash不变，0054两新列NULL、九新表为空。secret scan679、API/typecheck与diff check均通过；独立产品/CI复核无新增P0–P2。产品代码和0054 SQL未变。R2主coverage实际2897 passed/0 failed（227文件、81预期跳过）；其47文件历史实际279 passed/3 failed报告仍保留，不能改写为282 passed。第三轮完整verify待重验，后置cluster/SDK/clean双tar尚无本集成树终态；main/origin仍e411143、未发布/新CI未运行。用户已授权0054发布验收通过后实施停服exact-backup的新epoch active-capture/保留来源恢复，当前不提前实现。0037硬拒、外部删除/自动清理关闭、全域completion=false不变；M1未冻结、M2冻结、M3未开始。
 
 以下M4原始说明与main回补候选快照为历史原文，仅保留当时事实；当前结论以上方检查点和PROGRESS末节为准。
 

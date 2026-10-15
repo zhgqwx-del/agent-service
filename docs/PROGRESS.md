@@ -1,6 +1,6 @@
 # 进度记录
 
-> **最新集成检查点（2026-10-14T23:42Z）**：本地集成树包含M4目录/归档候选及0054；main/origin仍`e411143`，未合入/推送，新CI未运行。0054来源候选11文件245 passed零fail/skip；本集成树10个非历史文件又实际231 passed零fail/skip，API/typecheck退出0、secret scan678。整树verify首次31128于23:40:24Z退出1：旧grant MySQL文件4 passed/1 failed，实际0054指纹正确拒绝trigger篡改，测试却期待0053错误。失败报告已保留，最窄只更新comment和精确0054错误，不接受任意异常、不改产品或历史oracle；修后定向5 passed零fail/skip，第二次整树重验尚待终态。覆盖率、完整47文件历史链、cluster及本集成树clean发布包不能借此前父候选证明。CI已补0054镜像marker精确断言/180分钟预算；自动off、0037硬拒、全域completion=false不变，无业务库/外部对象操作或本批.env/付费模型调用。用户已明确恢复持续开发；M1未冻结、M2冻结、M3未开始。
+> **最新集成检查点（2026-10-15T01:17Z）**：第二轮整树verify退出1的历史夹具问题已仅在测试层修复；三个真实冻结旧二进制夹具实际3/3、零fail/skip，全部旧列全行hash不变，0054两新列NULL、九新表为空。secret scan679、API/typecheck与diff check均通过；独立产品/CI复核无新增P0–P2。产品代码和0054 SQL未变。R2主coverage实际2897 passed/0 failed（227文件、81预期跳过）；其47文件历史实际279 passed/3 failed报告仍保留，不能改写为282 passed。第三轮完整verify待重验，后置cluster/SDK/clean双tar尚无本集成树终态；main/origin仍e411143、未发布/新CI未运行。用户已授权0054发布验收通过后实施停服exact-backup的新epoch active-capture/保留来源恢复，当前不提前实现。0037硬拒、外部删除/自动清理关闭、全域completion=false不变；M1未冻结、M2冻结、M3未开始。
 
 以下顶部旧快照原文属于历史记录，只有上方快照具有当前优先级；完成状态与未完成项还须对照本页末节。
 
@@ -1340,3 +1340,16 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - 前置check:secrets678、check:api/typecheck均通过。0054十个非历史JSON全部由root重新核对开始时间与逐assertion，231 passed/0failed/0skipped，其中完整MySQL32。不能把来源候选历史14通过冒充本次完整47文件wrapper。
 - 首轮verify于23:40:24Z明确退出1；`tenant-telemetry-disposition-grant.mysql.test.ts`实际4 passed/1 failed/0skip。真实特权fixture更改0037 trigger后，当前0054严格指纹正确拒绝启动；唯失败为旧测试只接受0053错误字符串。完整失败JSON另存保留；最窄只改注释和精确0054错误文字，产品guard、历史旧oracle和全部grant硬拒不改。修后session38784退出0、root逐JSON确认5 passed/0failed/0skipped；第二次整树尚待终态，不把前置成功写成完整verify成功。
 - 本批不合入main、不推送或取得新CI前仍是候选；默认自动清理、外部对象删除与0037授权均不开启，四false字段不变。M1仍有真实产品代码缺口，不是只等云资源；M2继续冻结，M3尚未开始。
+
+## 2026-10-15（M4与0054集成第二轮：旧快照列投影失败，未发布）
+
+- clean `1802662` 的完整verify于2026-10-14T23:44:05.944Z启动、2026-10-15T01:06:35.294Z明确退出1。主coverage 227文件（212执行/15预期跳过）、2897 passed/0 failed/81预期跳过，四项80.21/76.24/87.24/83.03；0054十文件231、M4四文件335均逐JSON确认零fail/skip。前置secret scan678、API/typecheck通过。
+- 真实历史wrapper完整执行47文件：44文件通过，279 passed/3 failed/0 skipped。仅冻结0039→0040、0040→0041、0041→0042三个旧binary夹具失败于升级后的整行哈希；0054给admission/plan job增加nullable协议列，SELECT *序列化后增加NULL属性。旧binary、旧schema、旧terminal与目标专属拒绝此前已执行；完整旧字段不变仍须窄修复后证明，不改固定哈希、不删旧证据断言。失败JSON另存`migration-tests.full-verify-r2-failed-20261015t0106.json`，原完整命令日志保留。后置named/cluster/SDK/clean双归档未进入，整树不记通过。
+- 结束只清除本轮初始不存在的两个隔离库、非持久化Redis61977及临时防idle-sleep进程；不操作已有业务库、已有Redis或外部对象，不读.env、不调用付费模型。main/origin仍e411143，尚未合入/推送或得到新CI。
+- 人类于00:59Z明确授权：0054发布验收通过后，可实现active capture/保留来源的停服、精确备份恢复到新epoch产品代码，并只在全新隔离MySQL/MinIO测试；旧收据不可改，0037 grant/外部对象删除/自动清理仍关闭。当前只读预研，不在0054验收前开始下一产品改动。M1仍未冻结、M2冻结、M3未开始。
+
+### 冻结旧列投影修复的真实重验（01:16Z）
+
+- 只修改三个历史测试并新增共享测试helper：升级前按真实旧schema的ORDINAL_POSITION封存全部列，前后明确SELECT同一列集合并按原顺序比较所有旧行SHA256；缺列即SQL失败，失配带表名。另验证两父表0054列确实存在且全部NULL、九张新表全库为空。固定旧commit、依赖、旧binary、原收据/33域/目标专属及full-tail指纹拒绝、隔离与unknown断言未改，不更新固定hash、不跳过用例。产品与SQL无修改。
+- root session77077实际退出0，三个冻结旧binary的真实MySQL夹具3 files/3 passed/0failed/0skipped，JSON逐文件exact-name与全部assertion确认；开始01:13:40Z、结束01:16:26Z。新报告`frozen-0039-0040-0041-projection-r3-20261015t0114.json`独立保留，不覆盖R2失败报告。secret scan679、API/typecheck、diff check退出0；两路只读产品/CI与夹具review无新增P0–P2。
+- 这只证明三个定向夹具，不是完整47历史wrapper或整树verify通过。下一以干净本地提交执行第三轮完整verify；尚未合入main、推送或得到新CI，不开放任何门禁。

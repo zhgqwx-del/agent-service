@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "../../src/index.js";
+import { assertNo0054FrozenLegacyFootprint, captureFrozenLegacyColumns } from "./fixtures/frozen-legacy-row-snapshot.js";
 
 const exec = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -129,13 +130,16 @@ async function runFixed(
   }
 }
 
-async function rowDigest(conn: Connection, table: string, orderBy: string): Promise<string> {
+async function rowDigest(
+  conn: Connection, table: string, orderBy: string, columns: readonly string[],
+): Promise<string> {
   const allowed = new Set([
     "tenant_erasure_admissions", "tenant_content_inventory_receipts",
     "tenant_purge_plan_jobs", "tenant_purge_plan_entries", "tenant_purge_plan_receipts",
   ]);
   if (!allowed.has(table)) throw new Error("unsafe snapshot table");
-  const [rows] = await conn.query<Row[]>(`SELECT * FROM \`${table}\` ORDER BY ${orderBy}`);
+  const projection = columns.map((column) => `\`${column}\``).join(",");
+  const [rows] = await conn.query<Row[]>(`SELECT ${projection} FROM \`${table}\` ORDER BY ${orderBy}`);
   return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 }
 
@@ -267,6 +271,7 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
     await assertFrozenRunnerStarts(oldCheckout, archiveRoot, url);
     const conn = await mysql.createConnection(url);
     const before = new Map<string, string>();
+    const frozenColumns = new Map<string, readonly string[]>();
     try {
       const [markers] = await conn.query<Row[]>(
         "SELECT name FROM schema_migrations ORDER BY name",
@@ -287,7 +292,9 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
         ["tenant_purge_plan_entries", "request_id,domain"],
         ["tenant_purge_plan_receipts", "request_id"],
       ] as const) {
-        before.set(table, await rowDigest(conn, table, orderBy));
+        const columns = await captureFrozenLegacyColumns(conn, table);
+        frozenColumns.set(table, columns);
+        before.set(table, await rowDigest(conn, table, orderBy, columns));
       }
     } finally {
       await conn.end();
@@ -361,8 +368,12 @@ describe("frozen 0039 worker terminal -> 0040 real MySQL upgrade", () => {
         ["tenant_purge_plan_entries", "request_id,domain"],
         ["tenant_purge_plan_receipts", "request_id"],
       ] as const) {
-        expect(await rowDigest(afterConn, table, orderBy)).toBe(before.get(table));
+        const columns = frozenColumns.get(table);
+        if (!columns) throw new Error(`frozen snapshot columns missing: ${table}`);
+        expect(await rowDigest(afterConn, table, orderBy, columns),
+          `frozen historical rows changed: ${table}`).toBe(before.get(table));
       }
+      await assertNo0054FrozenLegacyFootprint(afterConn);
       const [newRows] = await afterConn.query<Row[]>(
         `SELECT (SELECT COUNT(*) FROM tenant_telemetry_source_accounting_entries) AS entries,
                 (SELECT COUNT(*) FROM tenant_telemetry_source_accounting_receipts) AS receipts`,

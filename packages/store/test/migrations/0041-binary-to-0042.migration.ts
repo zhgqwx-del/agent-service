@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "../../src/index.js";
+import { assertNo0054FrozenLegacyFootprint, captureFrozenLegacyColumns } from "./fixtures/frozen-legacy-row-snapshot.js";
 
 const exec = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -133,7 +134,9 @@ async function runFixed(
   }
 }
 
-async function rowDigest(conn: Connection, table: string, orderBy: string): Promise<string> {
+async function rowDigest(
+  conn: Connection, table: string, orderBy: string, columns: readonly string[],
+): Promise<string> {
   const allowed = new Set([
     "tenant_erasure_admissions", "tenant_content_inventory_receipts",
     "tenant_purge_plan_jobs", "tenant_purge_plan_entries", "tenant_purge_plan_receipts",
@@ -141,7 +144,8 @@ async function rowDigest(conn: Connection, table: string, orderBy: string): Prom
     "tenant_telemetry_target_manifest_entries", "tenant_telemetry_target_manifest_receipts",
   ]);
   if (!allowed.has(table)) throw new Error("unsafe snapshot table");
-  const [rows] = await conn.query<Row[]>(`SELECT * FROM \`${table}\` ORDER BY ${orderBy}`);
+  const projection = columns.map((column) => `\`${column}\``).join(",");
+  const [rows] = await conn.query<Row[]>(`SELECT ${projection} FROM \`${table}\` ORDER BY ${orderBy}`);
   return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 }
 
@@ -259,6 +263,7 @@ describe("frozen 0041 T3d terminal -> 0042 real MySQL upgrade", () => {
     expect(oldVerifyAccepted).toBe("frozen-0041-verify-accepted");
 
     const before = new Map<string, string>();
+    const frozenColumns = new Map<string, readonly string[]>();
     const conn = await mysql.createConnection(url);
     try {
       const [markers] = await conn.query<Row[]>("SELECT name FROM schema_migrations ORDER BY name");
@@ -302,7 +307,9 @@ describe("frozen 0041 T3d terminal -> 0042 real MySQL upgrade", () => {
       expect(written[0]?.phase).toBe("written");
       expect(written[0]?.write_ack_receipt_sha256).toBe(oldResult.writtenAckReceiptSha256);
       for (const [table, orderBy] of OLD_TABLES) {
-        before.set(table, await rowDigest(conn, table, orderBy));
+        const columns = await captureFrozenLegacyColumns(conn, table);
+        frozenColumns.set(table, columns);
+        before.set(table, await rowDigest(conn, table, orderBy, columns));
       }
     } finally {
       await conn.end();
@@ -375,8 +382,12 @@ describe("frozen 0041 T3d terminal -> 0042 real MySQL upgrade", () => {
       expect(markers.map((row) => row.name)).toEqual(currentMigrations);
       expect(markers.some((row) => row.name === MIGRATION_0042)).toBe(true);
       for (const [table, orderBy] of OLD_TABLES) {
-        expect(await rowDigest(afterConn, table, orderBy)).toBe(before.get(table));
+        const columns = frozenColumns.get(table);
+        if (!columns) throw new Error(`frozen snapshot columns missing: ${table}`);
+        expect(await rowDigest(afterConn, table, orderBy, columns),
+          `frozen historical rows changed: ${table}`).toBe(before.get(table));
       }
+      await assertNo0054FrozenLegacyFootprint(afterConn);
       const [newRows] = await afterConn.query<Row[]>(
         `SELECT (SELECT COUNT(*) FROM tenant_telemetry_plan_artifact_targets) AS entries,
                 (SELECT COUNT(*) FROM tenant_telemetry_plan_artifact_target_receipts) AS receipts`,
