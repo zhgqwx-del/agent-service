@@ -1,5 +1,7 @@
 # agent-service
 
+本worktree的M1恢复开发检查点（2026-10-15）：新增49类物理投影checkpoint、历史读取、新epoch显式cutover和逐operation新claim恢复的共享契约，最终纯测试101项、typecheck与scan700通过。当前没有接入Memory/MySQL、加密manifest、0030/0031或worker，不能据此调用实际新epoch恢复/执行或宣称M1冻结。main/origin2932318的原Actions38714666463已五项全绿；新契约未推送，不借原CI背书。用户允许本独立树提前编码/纯测试，不合入、部署或激活，默认关闭和全域completion=false保持。
+
 M4新增离线VM发布签名候选：`pnpm sign:vm-release`用显式受保护Ed25519文件签署clean发布的精确身份；独立工具的`inspect-signed`/`unpack-signed`核对可信公钥pin、选定role/commit、实际归档/manifest及工具自身字节，没有unsigned fallback。它不生成生产密钥、不安装或晋级环境；生产信任根、OCI签名与环境发布仍未完成。操作及边界见[离线VM发布签名](docs/operations/local-and-deployment.md#离线-vm-发布签名)。实际功能包/整树/CI结果只看PROGRESS，不能借旧验收背书。
 
 验证节奏：日常先跑相关定向测试，多个相关改动形成一个功能包后再做完整本地验收，较大阶段集中推送并等待CI。`pnpm test:coverage`合并同环境具名专项与主coverage，保留逐文件非零/零skip及coverage门槛；历史、S3、cluster和实际发布包装配独立验收。新driver首轮真实失败与局部复验均记录于PROGRESS，不把旧报告当新版本通过，也尚未宣称完整提速比例。方法见[分层验证路径](docs/operations/development-and-ci-guide.md#6-分层验证路径)。

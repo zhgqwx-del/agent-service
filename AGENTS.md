@@ -1,5 +1,11 @@
 # agent-service 协作约定
 
+## 本worktree的最新M1开发检查点（2026-10-15）
+
+- 用户明确允许独立树提前编码及纯测试，覆盖下方旧“CI全绿前不得编码”的开始时序；现原2932318的Actions38714666463也已五项全success，watch61689已exit0不再等待。仍不得合入、部署或激活，真实MySQL/MinIO只由root统一隔离执行，不争用资源。
+- 仅新`tenant-telemetry-capture-restore.ts`及其纯测试，source34e9029c/test26a69158，最终101passed零fail/skip、typecheck/scan700/diffcheck通过；49固定投影对应47个当前DDL真实表，checkpoint保留合法pending/reserved/written/legacyunknown。四契约只是必要完整性/lineage条件，不是真实DB/source授权，尚未被Memory/MySQL/backup/restore/worker消费。
+- 下一包必须一次纵向接入checkpoint与dump前后对账、新加密manifest/AAD、0031来源/预留与0030prepare/replay/activation、历史读、新epoch新写及旧operation新claim恢复。旧receipt/descriptor不可改写、旧claim不得复活；reserved-before-create也须exact descriptor继续而不是永久ACK-only。不得以纯codec/小样本替代完整恢复闭环，0054primary-only删除资格、0037grant、外部删除/自动清理off与completion=false保持。M1未冻结/M2冻结/M3未开始。
+
 ## 开发与验证节奏（2026-10-15）
 
 - CI并行候选仅把完整history wrapper移至独立runner/MySQL/Redis；core、history、image矩阵均success，原名`test`聚合才成功。core/history仍为180分钟，各例deadline和47文件清单不变；main-required=124，62个group不变。67eaa2d全量exit1保留，0039原失败未复现/原因未知；集群在76+唯一补丁复验3/3后保存1d3be15，clean1d3另补T3g/SDK/六入口/双VM后置通过，不重启整轮、不放宽watchdog或跳过业务断言。开发VM profile未执行签名；分段不是全量绿，最终新SHA仍须完整五个CI检查，事实只看PROGRESS末节。

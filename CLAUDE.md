@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+最新独立M1 worktree（2026-10-15）：用户允许提前编码/纯测试，当前原main293的CI38714666463已五项success（11:06:31Z），watch61689terminal0不用再poll；新模块未推送/合入，不借旧CI背书。四共享契约source34e9029c/test26a69158最终101纯项、typecheck/scan700/diffcheck通过，覆盖49固定投影、empty/合法unknown/pending/reserved/written、原primary与恢复lineage、manifest/0030/31独立context、newclaim和BOM canonical负例。当前没有实际store/backup/restore/worker消费者，不是恢复能力完成；下一步真实纵向接线，不再重复只读规划或为了此纯层启动全量。旧receipt不重签、旧claim不复活，0054primary-only destructive资格及0037/外部删除/自动清理off/completion=false不放开。
+
 CI-only并行候选把完整历史wrapper移至独立runner及自有MySQL/Redis，不减少用例或改变deadline；core/history保留180分钟。原名`test`以always与exact三项needs汇总，只有core、history、两个image全success才通过。main-required=124、62group不变。67eaa2d全量exit1保留，0039原失败未复现/原因未知；只复验失败及受影响部分、补未执行后置。集群在76+唯一补丁上3/3通过后保存1d3be15，clean1d3另补T3g/SDK/六入口/实际双VM后置通过，开发VM profile未执行签名，不借分段称全量通过。最终新SHA五个CI检查仍须全绿；原业务断言、默认gate、0037及completion=false不变，最新状态只看PROGRESS末节。
 
 M4离线VM签名候选复用既有受限tar/独立Node工具：`sign:vm-release`只以显式owner-only Ed25519文件签署clean/publishable精确制品；`inspect-signed`/`unpack-signed`以独立SPKI pin、选定role/commit及执行工具自身hash验证，没有unsigned fallback。三新测试文件加入main-required为123，62个旧group不变，原VM group扩为七文件。它不生成产品key、不自动安装、部署、吊销或晋级，不改变M1/0037/自动清理/恢复门禁。最新失败与相关复验只看PROGRESS；不能把旧e278或817结果当新候选全量/CI通过。
