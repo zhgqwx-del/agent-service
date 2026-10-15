@@ -543,7 +543,12 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         );
         expect(events).toMatchObject([{ STATUS: "DISABLED", future_schedule: 1 }]);
       }
-      const producer = vi.fn(artifactOperations.createMySqlBackupArtifact);
+      const producer = vi.fn(async (options: Parameters<typeof artifactOperations.createMySqlBackupArtifact>[0]) => {
+        // Exercise the real CLI-to-producer connection. An unrelated Memory/null
+        // fake cannot stand in for the actual source checkpoint store.
+        expect(options.captureCheckpointStore).toBeInstanceOf(MysqlSessionStore);
+        return artifactOperations.createMySqlBackupArtifact(options);
+      });
       const result = await fixture.command("create-artifact", { BACKUP_ID: backupId }, {
         artifactOperations: { ...artifactOperations, createMySqlBackupArtifact: producer },
       });

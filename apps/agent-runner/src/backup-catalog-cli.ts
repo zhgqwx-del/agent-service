@@ -35,6 +35,7 @@ import {
   type TenantRestoreJournalStore,
   type TenantRestoreJournalAdapter,
   type TenantRestoreReplaySealedTarget,
+  type TenantTelemetryCaptureBackupCheckpointStore,
 } from "@agent-service/store";
 import { z } from "zod";
 import * as mysqlArtifact from "./mysql-backup-artifact.js";
@@ -96,6 +97,7 @@ class BackupCatalogCliError extends Error {
 }
 
 type BackupCatalogCliStore = TenantBackupCatalogStore
+  & TenantTelemetryCaptureBackupCheckpointStore
   & TenantRestoreJournalStore
   & RestoreReplayStore
   & BlobStorageControlStore
@@ -111,6 +113,7 @@ export interface BackupCatalogCliDependencies {
     connectionLimit: number;
     migrationMode: "verify";
     tenantTelemetryRefKey?: Uint8Array;
+    tenantTelemetryCaptureRestoreLocalOnly?: boolean;
     operationAbortSignal?: AbortSignal;
   }): Promise<BackupCatalogCliStore>;
   loadCatalogConfig(
@@ -545,7 +548,7 @@ async function prepareSelectedRestore(
   config: TenantBackupCatalogRuntimeConfig,
   journalConfig: TenantRestoreJournalRuntimeConfig,
   journalAdapters: readonly RestoreAdapter[],
-  settings: { backupId: string; restoreRunId: string; epochId: string; sourceBackupSha256: string },
+  settings: { backupId: string; restoreRunId: string; epochId: string; sourceBackupSha256: string; captureCheckpointSha256?: string },
   step: AsyncStep = unlimitedStep,
 ) {
   const control = await step(() => store.getTenantBackupCatalogControl());
@@ -570,6 +573,7 @@ async function prepareSelectedRestore(
     backupId: settings.backupId,
     restoreRunId: settings.restoreRunId,
     runtimeEpochSha256,
+    ...(settings.captureCheckpointSha256 === undefined ? {} : { captureCheckpointSha256: settings.captureCheckpointSha256 }),
   }));
   if (!exactAvailability(entry, availability)) throw cliError("invalid_durable_state");
   const sealedTargets = await readRestoreJournalHeads(journalConfig, journalAdapters, step);
@@ -586,6 +590,7 @@ async function prepareSelectedRestore(
     controlEvidenceSha256: control.journalControlEvidenceSha256,
     sealedTargets,
     reservation: reserved,
+    ...(settings.captureCheckpointSha256 === undefined ? {} : { captureCheckpointSha256: settings.captureCheckpointSha256 }),
   }));
   return prepared;
 }
@@ -634,6 +639,7 @@ async function runArtifactCommand(
   let reservationAttempted = false;
   let importAttempted = false;
   let refKey: Buffer | undefined;
+  const artifactOptions = () => ({ ...common, ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }) });
   const step: AsyncStep = async (operation) => {
     if (operator) await budget.run(() => operator!.assertHeld());
     const result = await budget.run(operation);
@@ -672,11 +678,13 @@ async function runArtifactCommand(
         localOnlyAck: true, fleetStoppedAck: true,
         deadlineMs: budget.remaining(),
         operationAbortSignal: budget.signal,
+        ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
         ...(common.nodeEnv === undefined ? {} : { nodeEnv: common.nodeEnv }),
       }));
     }
     store = await acquire(() => dependencies.connectStore({
       url: mysql.MYSQL_URL, connectionLimit: 2, migrationMode: "verify",
+      tenantTelemetryCaptureRestoreLocalOnly: true,
       operationAbortSignal: budget.signal,
       ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
     }));
@@ -690,13 +698,28 @@ async function runArtifactCommand(
         backupId: settings.BACKUP_ID, controlEvidenceSha256: control.evidenceSha256,
       }));
       const created = await step(() => operations.createMySqlBackupArtifact({
-        ...common, sourceUrl: mysql.MYSQL_URL, anchor: anchored.value, tools: binaries!,
+        ...artifactOptions(), sourceUrl: mysql.MYSQL_URL, anchor: anchored.value, tools: binaries!,
+        captureCheckpointStore: source,
         fleetStoppedAck: true, deadlineMs: budget.remaining(), operator: operator!,
       }));
       verified = await acquire(() => operations.verifyMySqlBackupArtifact({
-        ...common, backupId: settings.BACKUP_ID, expectedAnchor: anchored.value,
+        ...artifactOptions(), backupId: settings.BACKUP_ID, expectedAnchor: anchored.value,
         expectedEvidence: created.evidence, deadlineMs: budget.remaining(),
       }));
+      // Only new bytes need a current-source publication gate. Exact replay
+      // already verified historical actual bytes/checkpoint in the producer;
+      // its own prior availability event legitimately advanced catalog head.
+      if (created.disposition !== "exact_replay") {
+        const captureInput = { backupId: settings.BACKUP_ID, fleetStoppedAck: "fleet-stopped-v1" as const,
+          localOnlyAck: "local-only-v1" as const };
+        if (verified.manifest.version === 2) {
+          const checkpointSha256 = verified.manifest.captureCheckpoint.checkpointSha256;
+          await step(() => source.assertTenantTelemetryCaptureBackupCheckpointUnchanged({ ...captureInput,
+            checkpointSha256 }));
+        } else if (await step(() => source.sealTenantTelemetryCaptureBackupCheckpoint(captureInput)) !== null) {
+          throw cliError("invalid_durable_state");
+        }
+      }
       const published = await step(() => adapter.publishAvailability({
         backupId: settings.BACKUP_ID, anchorSha256: anchored.value.anchorSha256,
         ...verified!.evidence, controlEvidenceSha256: control.evidenceSha256,
@@ -719,7 +742,7 @@ async function runArtifactCommand(
       if (!availability || !entry || !anchor || !exactAvailability(entry, availability)
         || anchor.anchorSha256 !== entry.anchorSha256) throw cliError("catalog_conflict");
       verified = await acquire(() => operations.verifyMySqlBackupArtifact({
-        ...common, backupId: settings.BACKUP_ID, expectedAnchor: anchor,
+        ...artifactOptions(), backupId: settings.BACKUP_ID, expectedAnchor: anchor,
         expectedEvidence: {
           sourceSnapshotSha256: entry.sourceSnapshotSha256, sourceBackupSha256: entry.sourceBackupSha256,
           artifactManifestSha256: entry.artifactManifestSha256, providerEvidenceSha256: entry.providerEvidenceSha256,
@@ -735,6 +758,7 @@ async function runArtifactCommand(
           artifactDirectory: common.artifactDirectory, localOnlyAck: true, fleetStoppedAck: true,
           deadlineMs: budget.remaining(),
           operationAbortSignal: budget.signal,
+          ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
           ...(common.nodeEnv === undefined ? {} : { nodeEnv: common.nodeEnv }),
         }));
         // Check permanent external authority under the actual source lock. A different
@@ -748,7 +772,8 @@ async function runArtifactCommand(
           runtimeEpochSha256: journalConfig!.runtimeEpochSha256,
         }));
         const prepare = { backupId: settings.BACKUP_ID, restoreRunId: selected.RESTORE_RUN_ID,
-          epochId: selected.BACKUP_RUNTIME_EPOCH_ID, sourceBackupSha256: verified!.evidence.sourceBackupSha256 };
+          epochId: selected.BACKUP_RUNTIME_EPOCH_ID, sourceBackupSha256: verified!.evidence.sourceBackupSha256,
+          ...(verified.manifest.version === 2 ? { captureCheckpointSha256: verified.manifest.captureCheckpoint.checkpointSha256 } : {}) };
         reservationAttempted = true;
         await prepareSelectedRestore(source, adapter, config, journalConfig!, journalAdapters, prepare, step);
         // Recheck fresh external availability immediately before the irreversible DDL import.
@@ -765,6 +790,7 @@ async function runArtifactCommand(
         }));
         targetStore = await acquire(() => dependencies.connectStore({
           url: selected.BACKUP_RESTORE_TARGET_MYSQL_URL, connectionLimit: 2, migrationMode: "verify",
+          tenantTelemetryCaptureRestoreLocalOnly: true,
           operationAbortSignal: budget.signal,
           ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }),
         }));

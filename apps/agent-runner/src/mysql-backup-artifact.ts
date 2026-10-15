@@ -8,13 +8,22 @@ import { pipeline } from "node:stream/promises";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import {
   tenantBackupSchemaMigrationRootSha256, validateTenantBackupSnapshotAnchor,
+  assertTenantTelemetryCaptureCheckpointLeaves,
+  assertMysqlSessionStoreDatabaseBinding,
+  readTenantTelemetryCaptureCheckpointFromMysql,
+  PERSISTED_PROVIDER_CAPTURE_PROTOCOL, PERSISTED_PROVIDER_CAPTURE_PRODUCER_PROTOCOL, PERSISTED_PROVIDER_CAPTURE_CONTRACT_SHA256,
+  TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SQL,
   type TenantBackupSnapshotAnchor,
+  type TenantTelemetryCaptureBackupCheckpoint,
+  type TenantTelemetryCaptureBackupCheckpointStore,
 } from "@agent-service/store";
 import {
   MYSQL_BACKUP_ARTIFACT_MAGIC, MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT,
   MYSQL_BACKUP_ARTIFACT_PRODUCER_VERSION, MYSQL_BACKUP_ARTIFACT_SCOPE, MYSQL_BACKUP_ARTIFACT_SCHEMA_SCOPE,
+  MYSQL_BACKUP_ARTIFACT_V2_MAGIC, MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT,
+  MYSQL_BACKUP_ARTIFACT_V2_PRODUCER_VERSION, MYSQL_BACKUP_ARTIFACT_V2_SCOPE,
   MySqlBackupArtifactError, artifactAad, artifactEvidence, artifactFailure,
-  assertArtifactEvidence, canonicalJson, canonicalMySqlBackupTableDefinition, decodeArtifactManifest, encodeArtifactManifest, sha256,
+  assertArtifactCaptureCheckpoint, assertArtifactEvidence, canonicalJson, canonicalMySqlBackupTableDefinition, decodeArtifactManifest, encodeArtifactManifest, sha256,
   type ArtifactEvidence, type MySqlBackupArtifactManifest, type MySqlBackupArtifactImportDiagnostic,
 } from "./mysql-backup-artifact-codec.js";
 
@@ -28,6 +37,8 @@ export interface MySqlBackupArtifactOptions {
   localOnlyAck: true;
   nodeEnv?: string;
   operationAbortSignal?: AbortSignal;
+  /** Protected operator ref key, distinct from the artifact encryption key. Never serialized. */
+  tenantTelemetryRefKey?: Uint8Array;
 }
 export interface MySqlBackupArtifactOperatorOptions extends MySqlBackupArtifactOptions {
   sourceUrl: string;
@@ -53,6 +64,8 @@ export interface CreateMySqlBackupArtifactOptions extends MySqlBackupArtifactOpt
   maxBytes: number;
   fleetStoppedAck: true;
   operator?: MySqlBackupArtifactOperator;
+  /** The actual source store; only its verified-null result permits the legacy v1 envelope. */
+  captureCheckpointStore: TenantTelemetryCaptureBackupCheckpointStore;
 }
 export interface VerifyMySqlBackupArtifactOptions extends MySqlBackupArtifactOptions {
   backupId: string;
@@ -136,12 +149,13 @@ class Deadline {
 
 type SqlRow = RowDataPacket & Record<string, unknown>;
 interface DatabaseAddress { host: string; port: number; user: string; password: string; database: string }
-interface DatabaseIdentity { identitySha256: string; serverVersion: string; database: string }
+interface DatabaseIdentity { identitySha256: string; serverUuid: string; serverVersion: string; database: string }
 interface LockedDatabase { url: string; connection: Connection; identity: DatabaseIdentity; lockName: string }
 interface OperatorState {
   directory: string; workDirectory: string; lockPath: string; lockHandle: FileHandle;
   deadline: Deadline; source: LockedDatabase; target?: LockedDatabase;
   closed: boolean; bindings: Map<string, RestoreOperationBinding>;
+  tenantTelemetryRefKey?: Buffer;
 }
 interface RestoreOperationBinding {
   scope: "mysql-logical-full-artifact-restore-operation-v1";
@@ -161,6 +175,11 @@ function safety(options: { localOnlyAck: true; nodeEnv?: string; fleetStoppedAck
 }
 function byteLimit(maxBytes: number): void {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1_073_741_824) artifactFailure("artifact_limit_invalid");
+}
+function copyRefKey(key: Uint8Array | undefined): Buffer | undefined {
+  if (key === undefined) return;
+  if (!(key instanceof Uint8Array) || key.length !== 32) artifactFailure("capture_ref_key_required");
+  return Buffer.from(key);
 }
 function backupName(backupId: string): string {
   if (!/^backup_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(backupId)) artifactFailure("backup_id_invalid");
@@ -302,7 +321,8 @@ async function identify(connection: Connection, deadline: Deadline): Promise<Dat
     || typeof row.version !== "string" || !/^8\.\d+\.\d+[a-zA-Z0-9.+_-]*$/.test(row.version)
     || typeof row.database_name !== "string" || !/^[a-zA-Z0-9_]{1,64}$/.test(row.database_name)) artifactFailure("server_version_invalid");
   return { identitySha256: sha256(canonicalJson({ scope: "mysql-physical-database-identity-v1",
-    serverUuid: row.server_uuid.toLowerCase(), database: row.database_name })), serverVersion: row.version, database: row.database_name };
+    serverUuid: row.server_uuid.toLowerCase(), database: row.database_name })), serverUuid: row.server_uuid.toLowerCase(),
+  serverVersion: row.version, database: row.database_name };
 }
 async function assertLock(database: LockedDatabase, deadline: Deadline): Promise<void> {
   const result = await rows(database.connection, "SELECT IS_USED_LOCK(?) = CONNECTION_ID() AS owned", [database.lockName], deadline);
@@ -360,7 +380,10 @@ async function safeRestoreOperation(action: () => Promise<void>): Promise<void> 
 export async function acquireMySqlBackupArtifactOperator(options: MySqlBackupArtifactOperatorOptions): Promise<MySqlBackupArtifactOperator> {
   options = { ...options };
   safety(options, true);
-  const deadline = new Deadline(options.deadlineMs, undefined, options.operationAbortSignal);
+  const refKey = copyRefKey(options.tenantTelemetryRefKey);
+  let deadline: Deadline;
+  try { deadline = new Deadline(options.deadlineMs, undefined, options.operationAbortSignal); }
+  catch (error) { refKey?.fill(0); throw error; }
   let operationDirectory: string | undefined;
   let lockHandle: FileHandle | undefined;
   let lockPath: string | undefined;
@@ -392,7 +415,7 @@ export async function acquireMySqlBackupArtifactOperator(options: MySqlBackupArt
     }
     if (target) await assertEmpty(target, deadline);
     const state: OperatorState = { directory, workDirectory: operationDirectory, lockPath, lockHandle, deadline, source, target,
-      closed: false, bindings: new Map() };
+      closed: false, bindings: new Map(), tenantTelemetryRefKey: refKey };
     const operator: MySqlBackupArtifactOperator = Object.freeze({
       sourceIdentitySha256: source.identity.identitySha256,
       targetIdentitySha256: target?.identity.identitySha256,
@@ -411,7 +434,7 @@ export async function acquireMySqlBackupArtifactOperator(options: MySqlBackupArt
           operatorState(operator);
           if (!state.target || !/^[0-9a-f]{64}$/.test(input.runtimeEpochSha256)) artifactFailure("restore_operation_invalid");
           restoreName(input.restoreRunId);
-          encodeArtifactManifest(input.manifest, 1_073_741_824);
+          encodeArtifactManifest(input.manifest, 1_073_741_824, state.tenantTelemetryRefKey);
           assertArtifactEvidence(artifactEvidence(input.manifest, input.evidence.sourceBackupSha256), input.evidence);
           if (input.manifest.sourceIdentitySha256 !== state.source.identity.identitySha256) artifactFailure("source_identity_mismatch");
           await assertEmpty(state.target, deadline);
@@ -439,6 +462,7 @@ export async function acquireMySqlBackupArtifactOperator(options: MySqlBackupArt
       async close(): Promise<void> {
         if (state.closed) return;
         state.closed = true;
+        state.tenantTelemetryRefKey?.fill(0);
         deadline.dispose();
         for (const database of databases) database.connection.destroy();
         await discardCreatedFile(lockPath!, lockHandle!);
@@ -449,6 +473,7 @@ export async function acquireMySqlBackupArtifactOperator(options: MySqlBackupArt
     operators.set(operator, state);
     return operator;
   } catch (error) {
+    refKey?.fill(0);
     for (const database of databases) database.connection.destroy();
     deadline.dispose();
     if (lockHandle && lockPath) await discardCreatedFile(lockPath, lockHandle);
@@ -545,6 +570,48 @@ async function inspectSource(database: LockedDatabase, anchor: TenantBackupSnaps
   return { identity, schemaSha256: sha256(canonicalJson({ scope: MYSQL_BACKUP_ARTIFACT_SCHEMA_SCOPE, schema })) };
 }
 
+/** v1 means verified inactive on this actual source, never merely no checkpoint. */
+async function assertActualInactiveCapture(database: LockedDatabase, deadline: Deadline): Promise<void> {
+  const controls = await rows(database.connection, `SELECT domain,scope,control_generation,state,capture_protocol,
+    producer_protocol,producer_contract_sha256,activated_at_db_ms FROM tenant_telemetry_capture_v2_controls ORDER BY BINARY domain`, [], deadline);
+  if (controls.length !== 2 || controls[0]?.domain !== "logs" || controls[1]?.domain !== "traces"
+    || controls.some((control) => control.scope !== "tenant-telemetry-capture-control-v2" || control.state !== "inactive"
+      || (control.control_generation !== 0 && control.control_generation !== "0") || control.activated_at_db_ms !== null
+      || control.capture_protocol !== PERSISTED_PROVIDER_CAPTURE_PROTOCOL)
+    || controls[0]!.producer_protocol !== PERSISTED_PROVIDER_CAPTURE_PRODUCER_PROTOCOL
+    || controls[0]!.producer_contract_sha256 !== PERSISTED_PROVIDER_CAPTURE_CONTRACT_SHA256
+    || controls[1]!.producer_protocol !== null || controls[1]!.producer_contract_sha256 !== null) artifactFailure("capture_inactive_source_invalid");
+  // An active legacy v1 application producer remains legal here. Only v2
+  // footprints/private gen1 and retained/checkpoint authority forbid v1 backup.
+  const zeroTables = ["tenant_telemetry_capture_v2_activation_receipts", "tenant_telemetry_capture_v2_coverages",
+    "tenant_telemetry_capture_v2_source_bindings", "tenant_telemetry_capture_v2_failure_commit_receipts",
+    ...TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SQL.filter((projection) => projection.family.startsWith("retained_")).flatMap((projection) => projection.tables),
+    "tenant_telemetry_capture_backup_checkpoints", "tenant_telemetry_capture_backup_checkpoint_leaves"];
+  const predicates = zeroTables.map((table) => `SELECT COUNT(*) FROM ${sqlIdentifier(table)}`);
+  predicates.push("SELECT COUNT(*) FROM tenant_telemetry_artifact_inventory WHERE source_schema='provider-step-error-v2'",
+    "SELECT COUNT(*) FROM tenant_telemetry_write_jobs WHERE JSON_UNQUOTE(JSON_EXTRACT(inventory_json,'$.sourceSchema'))='provider-step-error-v2'",
+    "SELECT COUNT(*) FROM subject_lifecycle WHERE telemetry_logs_capture_v2_generation<>0");
+  for (const table of ["items", "events"]) predicates.push(`SELECT COUNT(*) FROM ${table} WHERE
+    (telemetry_capture_v2_control_generation IS NOT NULL AND telemetry_capture_v2_control_generation<>0)
+    OR telemetry_capture_v2_operation_sha256 IS NOT NULL OR telemetry_capture_v2_session_ref_sha256 IS NOT NULL
+    OR telemetry_capture_v2_turn_ref_sha256 IS NOT NULL OR telemetry_capture_v2_item_ref_sha256 IS NOT NULL
+    OR telemetry_capture_v2_failure_receipt_sha256 IS NOT NULL OR telemetry_capture_v2_business_batch_sha256 IS NOT NULL
+    OR (telemetry_failure_classification IS NOT NULL AND (telemetry_failure_classification<>'runtime_unknown'
+      OR telemetry_capture_v2_control_generation IS NULL))`);
+  const names = predicates.map((_predicate, index) => `capture_inactive_footprint_${index}`);
+  const footprint = await rows(database.connection, `SELECT ${predicates.map((predicate, index) => `(${predicate}) AS ${names[index]}`).join(",")}`, [], deadline);
+  if (footprint.length !== 1 || Object.keys(footprint[0]!).sort().join("\0") !== [...names].sort().join("\0")
+    || names.some((name) => footprint[0]![name] !== 0 && footprint[0]![name] !== "0")) artifactFailure("capture_inactive_source_invalid");
+}
+
+async function assertActualHistoricalCheckpoint(database: LockedDatabase, checkpoint: TenantTelemetryCaptureBackupCheckpoint,
+  refKey: Uint8Array | undefined, deadline: Deadline): Promise<void> {
+  if (!(refKey instanceof Uint8Array) || refKey.length !== 32) artifactFailure("capture_ref_key_required");
+  const actual = await deadline.bound(readTenantTelemetryCaptureCheckpointFromMysql(database.connection, checkpoint.backupId, refKey),
+    () => database.connection.destroy());
+  if (!actual || canonicalJson(actual.checkpoint) !== canonicalJson(checkpoint)) artifactFailure("capture_checkpoint_source_mismatch");
+}
+
 function counted(maximum: number): { stream: Transform; result(): { bytes: number; sha256: string } } {
   let bytes = 0;
   const hash = createHash("sha256");
@@ -628,7 +695,10 @@ export async function verifyMySqlBackupArtifact(options: VerifyMySqlBackupArtifa
   options = { ...options, expectedAnchor: options.expectedAnchor && cloneAnchor(options.expectedAnchor),
     expectedEvidence: options.expectedEvidence && { ...options.expectedEvidence } };
   safety(options); byteLimit(options.maxBytes); backupName(options.backupId);
-  const deadline = new Deadline(options.deadlineMs, undefined, options.operationAbortSignal);
+  const refKey = copyRefKey(options.tenantTelemetryRefKey);
+  let deadline: Deadline;
+  try { deadline = new Deadline(options.deadlineMs, undefined, options.operationAbortSignal); }
+  catch (error) { refKey?.fill(0); throw error; }
   let verificationDirectory: string | undefined;
   let artifact: FileHandle | undefined;
   let spool: FileHandle | undefined;
@@ -636,15 +706,18 @@ export async function verifyMySqlBackupArtifact(options: VerifyMySqlBackupArtifa
   try {
     const directory = await privateDirectory(options.artifactDirectory, deadline);
     artifact = await privateFile(join(directory, backupName(options.backupId)), deadline,
-      options.maxBytes + MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT + 12);
+      options.maxBytes + MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT + 12);
     const header = Buffer.alloc(12);
     if ((await deadline.bound(artifact.read(header, 0, 12, 0))).bytesRead !== 12
-      || !header.subarray(0, 8).equals(MYSQL_BACKUP_ARTIFACT_MAGIC)) artifactFailure("artifact_format_invalid");
+      || (!header.subarray(0, 8).equals(MYSQL_BACKUP_ARTIFACT_MAGIC)
+        && !header.subarray(0, 8).equals(MYSQL_BACKUP_ARTIFACT_V2_MAGIC))) artifactFailure("artifact_format_invalid");
+    const v2 = header.subarray(0, 8).equals(MYSQL_BACKUP_ARTIFACT_V2_MAGIC);
     const length = header.readUInt32BE(8);
-    if (length < 1 || length > MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT) artifactFailure("manifest_limit");
+    if (length < 1 || length > (v2 ? MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT : MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT)) artifactFailure("manifest_limit");
     const bytes = Buffer.alloc(length);
     if ((await deadline.bound(artifact.read(bytes, 0, length, 12))).bytesRead !== length) artifactFailure("artifact_format_invalid");
-    const manifest = decodeArtifactManifest(bytes, options.maxBytes);
+    const manifest = decodeArtifactManifest(bytes, options.maxBytes, refKey);
+    if ((manifest.version === 2) !== v2) artifactFailure("artifact_format_invalid");
     if (manifest.backupId !== options.backupId) artifactFailure("backup_id_mismatch");
     if (options.expectedAnchor && canonicalJson(manifest.anchor) !== canonicalJson(options.expectedAnchor)) artifactFailure("anchor_mismatch");
     const info = await artifact.stat();
@@ -692,7 +765,7 @@ export async function verifyMySqlBackupArtifact(options: VerifyMySqlBackupArtifa
     if (error instanceof MySqlBackupArtifactError) throw error;
     return artifactFailure("artifact_unavailable");
   } finally {
-    deadline.dispose(); key?.fill(0);
+    deadline.dispose(); key?.fill(0); refKey?.fill(0);
     await artifact?.close().catch(() => {}); await spool?.close().catch(() => {});
     if (verificationDirectory) await rm(verificationDirectory, { recursive: true, force: true }).catch(() => {});
   }
@@ -705,10 +778,19 @@ export async function createMySqlBackupArtifact(options: CreateMySqlBackupArtifa
   safety(options, true); byteLimit(options.maxBytes);
   try { validateTenantBackupSnapshotAnchor(options.anchor); } catch { artifactFailure("source_anchor_invalid"); }
   backupName(options.anchor.backupId);
+  if (!options.captureCheckpointStore || typeof options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint !== "function"
+    || typeof options.captureCheckpointStore.assertTenantTelemetryCaptureBackupCheckpointUnchanged !== "function") artifactFailure("capture_checkpoint_store_required");
+  const refKey = copyRefKey(options.tenantTelemetryRefKey);
+  options = { ...options, ...(refKey === undefined ? {} : { tenantTelemetryRefKey: refKey }) };
   const ownedOperator = options.operator === undefined;
-  const operator = options.operator ?? await acquireMySqlBackupArtifactOperator(options);
-  const state = operatorState(operator);
-  const deadline = new Deadline(options.deadlineMs, state.deadline, options.operationAbortSignal);
+  let operator: MySqlBackupArtifactOperator;
+  try { operator = options.operator ?? await acquireMySqlBackupArtifactOperator(options); }
+  catch (error) { refKey?.fill(0); throw error; }
+  let state: OperatorState; let deadline: Deadline;
+  try {
+    state = operatorState(operator);
+    deadline = new Deadline(options.deadlineMs, state.deadline, options.operationAbortSignal);
+  } catch (error) { refKey?.fill(0); if (ownedOperator) await operator.close(); throw error; }
   let key: Buffer | undefined; let plain: FileHandle | undefined; let encrypted: FileHandle | undefined;
   let packed: FileHandle | undefined; let temporary: string | undefined; let credentials: string | undefined;
   try {
@@ -716,18 +798,66 @@ export async function createMySqlBackupArtifact(options: CreateMySqlBackupArtifa
     const before = await inspectSource(state.source, options.anchor, deadline);
     const destination = join(state.directory, backupName(options.anchor.backupId));
     try {
-      const existing = await privateFile(destination, deadline, options.maxBytes + MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT + 12);
+      const existing = await privateFile(destination, deadline, options.maxBytes + MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT + 12);
       await existing.close();
       const verified = await verifyMySqlBackupArtifact({ ...options, backupId: options.anchor.backupId,
         expectedAnchor: options.anchor, deadlineMs: deadline.check() });
       try {
         if (verified.manifest.sourceIdentitySha256 !== before.identity.identitySha256
           || verified.manifest.schemaSha256 !== before.schemaSha256) artifactFailure("source_identity_mismatch");
-        await inspectSource(state.source, options.anchor, deadline);
+        // This operation creates no new dump. Catalog/source rows may have
+        // legitimately advanced since publication; authenticate immutable
+        // history instead of trying to reseal today's source as the old dump.
+        if (verified.manifest.version === 2) await assertActualHistoricalCheckpoint(state.source,
+          verified.manifest.captureCheckpoint, refKey, deadline);
+        if (canonicalJson(await inspectSource(state.source, options.anchor, deadline)) !== canonicalJson(before)) artifactFailure("source_changed");
         await operator.assertHeld();
         return { disposition: "exact_replay", manifest: verified.manifest, evidence: verified.evidence };
       } finally { await verified.close(); }
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    // The store derives and persists the complete physical projection. A digest
+    // supplied by an operator/caller is never substituted for this source read.
+    const checkpointStore = options.captureCheckpointStore;
+    // A historical checkpoint alone cannot prove that this store's live audit
+    // reads the locked database: another database may contain the same history.
+    // The store module recognizes only a successful, unclosed MySQL instance
+    // and rechecks its own pool connection's actual server/database identity.
+    await assertMysqlSessionStoreDatabaseBinding(checkpointStore, {
+      serverUuid: before.identity.serverUuid, database: before.identity.database,
+    }, { timeoutMs: deadline.check(), operationAbortSignal: deadline.controller.signal });
+    deadline.check();
+    const sealInput = { backupId: options.anchor.backupId, fleetStoppedAck: "fleet-stopped-v1" as const, localOnlyAck: "local-only-v1" as const };
+    deadline.check();
+    const sealed = await checkpointStore.sealTenantTelemetryCaptureBackupCheckpoint(sealInput);
+    deadline.check();
+    let checkpoint: TenantTelemetryCaptureBackupCheckpoint | undefined;
+    if (sealed !== null) {
+      const record = structuredClone(sealed.value);
+      assertArtifactCaptureCheckpoint(record.checkpoint, options.anchor, refKey);
+      try { assertTenantTelemetryCaptureCheckpointLeaves(record.checkpoint, record.leaves, refKey!); }
+      catch { artifactFailure("capture_checkpoint_invalid"); }
+      checkpoint = record.checkpoint;
+    }
+    const assertActualCheckpoint = async () => {
+      if (!checkpoint) { await assertActualInactiveCapture(state.source, deadline); return; }
+      deadline.check();
+      await assertActualHistoricalCheckpoint(state.source, checkpoint, refKey, deadline);
+      deadline.check();
+      // read... validates every physical header column and all actual leaf roots.
+      // A caller-owned Memory/wrong-DB store cannot substitute an authentic-looking
+      // checkpoint for the rows that will enter this operator's actual dump.
+    };
+    await assertActualCheckpoint();
+    const assertCheckpointUnchanged = async () => {
+      deadline.check();
+      // Wait for the actual store operation to settle before releasing operator
+      // locks, even if its inherited whole-operation abort has already fired.
+      if (checkpoint) await checkpointStore.assertTenantTelemetryCaptureBackupCheckpointUnchanged({ ...sealInput,
+        checkpointSha256: checkpoint.checkpointSha256 });
+      else if (await checkpointStore.sealTenantTelemetryCaptureBackupCheckpoint(sealInput) !== null) artifactFailure("capture_checkpoint_changed");
+      await assertActualCheckpoint();
+      deadline.check();
+    };
     const mysqlPath = await toolPath(options.tools.mysql, deadline);
     const dumpPath = await toolPath(options.tools.mysqldump, deadline);
     const mysqlVersion = await toolVersion(mysqlPath, state.workDirectory, deadline);
@@ -757,17 +887,21 @@ export async function createMySqlBackupArtifact(options: CreateMySqlBackupArtifa
     if (!plaintext.bytes) artifactFailure("dump_empty");
     const after = await inspectSource(state.source, options.anchor, deadline);
     if (canonicalJson(before) !== canonicalJson(after)) artifactFailure("source_changed");
+    await assertCheckpointUnchanged();
     key = await keyBytes(options.keyFile, deadline);
     const nonce = randomBytes(12);
-    const manifest: MySqlBackupArtifactManifest = {
-      scope: MYSQL_BACKUP_ARTIFACT_SCOPE, version: 1, backupId: options.anchor.backupId, anchor: structuredClone(options.anchor),
+    const body = {
+      backupId: options.anchor.backupId, anchor: structuredClone(options.anchor),
       schemaMigrationRootSha256: options.anchor.schemaMigrationRootSha256, sourceIdentitySha256: before.identity.identitySha256,
-      schemaSha256: before.schemaSha256, producerVersion: MYSQL_BACKUP_ARTIFACT_PRODUCER_VERSION,
+      schemaSha256: before.schemaSha256,
       mysqlVersion, mysqldumpVersion, serverVersion: before.identity.serverVersion,
       plaintextBytes: plaintext.bytes, plaintextSha256: plaintext.sha256,
       ciphertextBytes: plaintext.bytes, ciphertextSha256: "0".repeat(64),
-      encryption: { algorithm: "aes-256-gcm", nonceHex: nonce.toString("hex"), authTagHex: "0".repeat(32) },
+      encryption: { algorithm: "aes-256-gcm" as const, nonceHex: nonce.toString("hex"), authTagHex: "0".repeat(32) },
     };
+    const manifest: MySqlBackupArtifactManifest = checkpoint
+      ? { ...body, scope: MYSQL_BACKUP_ARTIFACT_V2_SCOPE, version: 2, producerVersion: MYSQL_BACKUP_ARTIFACT_V2_PRODUCER_VERSION, captureCheckpoint: checkpoint }
+      : { ...body, scope: MYSQL_BACKUP_ARTIFACT_SCOPE, version: 1, producerVersion: MYSQL_BACKUP_ARTIFACT_PRODUCER_VERSION };
     encrypted = await unlinkedSpool(state.workDirectory, deadline);
     const cipher = createCipheriv("aes-256-gcm", key, nonce); cipher.setAAD(artifactAad(manifest));
     const counter = counted(options.maxBytes);
@@ -776,15 +910,16 @@ export async function createMySqlBackupArtifact(options: CreateMySqlBackupArtifa
     const encryptedDigest = counter.result();
     manifest.ciphertextBytes = encryptedDigest.bytes; manifest.ciphertextSha256 = encryptedDigest.sha256;
     manifest.encryption.authTagHex = cipher.getAuthTag().toString("hex");
-    const manifestBytes = encodeArtifactManifest(manifest, options.maxBytes);
-    const header = Buffer.alloc(12); MYSQL_BACKUP_ARTIFACT_MAGIC.copy(header); header.writeUInt32BE(manifestBytes.length, 8);
+    const manifestBytes = encodeArtifactManifest(manifest, options.maxBytes, refKey);
+    const header = Buffer.alloc(12); (manifest.version === 2 ? MYSQL_BACKUP_ARTIFACT_V2_MAGIC : MYSQL_BACKUP_ARTIFACT_MAGIC).copy(header); header.writeUInt32BE(manifestBytes.length, 8);
     temporary = join(state.workDirectory, `artifact-${randomUUID()}`);
     packed = await createdFile(temporary, "wx+", deadline);
     await deadline.bound(packed.writeFile(Buffer.concat([header, manifestBytes])));
     await pipeline(heldRead(encrypted), heldWrite(packed, 12 + manifestBytes.length), { signal: deadline.controller.signal });
     await deadline.bound(packed.sync());
-    const digest = await hashFile(packed, options.maxBytes + MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT + 12, deadline);
+    const digest = await hashFile(packed, options.maxBytes + MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT + 12, deadline);
     await assertLock(state.source, deadline);
+    await assertCheckpointUnchanged();
     // Atomic create-only publication: EEXIST is never replaced, even after a partially observed failure.
     await deadline.bound(link(temporary, destination));
     await deadline.bound(unlink(temporary)); temporary = undefined;
@@ -798,7 +933,7 @@ export async function createMySqlBackupArtifact(options: CreateMySqlBackupArtifa
     if (error instanceof MySqlBackupArtifactError) throw error;
     return artifactFailure("artifact_create_failed");
   } finally {
-    deadline.dispose(); key?.fill(0);
+    deadline.dispose(); key?.fill(0); refKey?.fill(0);
     await plain?.close().catch(() => {}); await encrypted?.close().catch(() => {}); await packed?.close().catch(() => {});
     if (credentials) await unlink(credentials).catch(() => {});
     if (temporary) await unlink(temporary).catch(() => {});

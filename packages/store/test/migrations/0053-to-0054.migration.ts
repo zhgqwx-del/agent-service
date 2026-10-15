@@ -293,7 +293,10 @@ describe("0053 -> 0054 exact frozen-source historical MySQL upgrade", () => {
     await runFixed("extract own archive", "tar", ["-xf", tar, "-C", checkout], ROOT, isolatedEnv(archiveRoot), 30_000);
     oldNames = (await readdir(join(checkout, "packages/store/migrations"))).filter((name) => name.endsWith(".sql")).sort();
     expect(oldNames.at(-1)).toBe("0053_persisted_provider_failure_capture.sql");
-    currentNames = (await readdir(MIGRATIONS)).filter((name) => /^00\d\d_.*\.sql$/.test(name)).sort();
+    // This fixture proves the exact 0054 boundary (including its 712 guards),
+    // not a later tail. Newer boundaries have their own historical fixtures.
+    currentNames = (await readdir(MIGRATIONS))
+      .filter((name) => /^00\d\d_.*\.sql$/.test(name) && Number(name.slice(0, 4)) <= 54).sort();
     expect(currentNames).toEqual([...oldNames, MIGRATION]);
     for (const name of oldNames) {
       const frozen = await readFile(join(checkout, "packages/store/migrations", name));

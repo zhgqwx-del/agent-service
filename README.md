@@ -1,6 +1,6 @@
 # agent-service
 
-本worktree的M1恢复开发检查点（2026-10-15）：新增49类物理投影checkpoint、历史读取、新epoch显式cutover和逐operation新claim恢复的共享契约，最终纯测试101项、typecheck与scan700通过。当前没有接入Memory/MySQL、加密manifest、0030/0031或worker，不能据此调用实际新epoch恢复/执行或宣称M1冻结。main/origin2932318的原Actions38714666463已五项全绿；新契约未推送，不借原CI背书。用户允许本独立树提前编码/纯测试，不合入、部署或激活，默认关闭和全域completion=false保持。
+本worktree的M1恢复接线检查点（2026-10-15T12:37Z）：Memory/MySQL已实际封存49类来源及不可变叶子；加密备份v2把完整checkpoint纳入manifest/AAD，新dump先核对真实store与operator的server UUID/数据库绑定，再审计前后来源，v1字节兼容。0031选择/0030 prepare以显式checkpoint和独立sidecar原子绑定，缺证据不补造。Memory 46项、真实隔离MySQL 12项、冻结0054→0055历史4项及原0053→0054回归14项均通过；详细分段证据和失败记录见[进度](docs/PROGRESS.md)。这仍不是完整恢复能力：maintenance启动、原子历史receipt、新epoch显式写入及旧pending新claim续跑尚未接入，真实MySQL/MinIO制品纵向验收仍待。未运行本功能包全量或新CI，未合入/推送/部署/激活；main/origin2932318的[原CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38714666463)五项全绿仅证明原基线。M1未冻结、M2冻结、M3未开始，0037硬拒、0054原primary删除资格、自动清理off与全域completion=false不变。
 
 M4新增离线VM发布签名候选：`pnpm sign:vm-release`用显式受保护Ed25519文件签署clean发布的精确身份；独立工具的`inspect-signed`/`unpack-signed`核对可信公钥pin、选定role/commit、实际归档/manifest及工具自身字节，没有unsigned fallback。它不生成生产密钥、不安装或晋级环境；生产信任根、OCI签名与环境发布仍未完成。操作及边界见[离线VM发布签名](docs/operations/local-and-deployment.md#离线-vm-发布签名)。实际功能包/整树/CI结果只看PROGRESS，不能借旧验收背书。
 

@@ -29,6 +29,8 @@ export * from "./tenant-telemetry-writer.js";
 export * from "./tenant-telemetry-application-capture.js";
 export * from "./tenant-telemetry-persisted-provider-capture.js";
 export * from "./tenant-telemetry-retained-source.js";
+export * from "./tenant-telemetry-capture-restore.js";
+export * from "./tenant-telemetry-capture-restore-store.js";
 export * from "./tenant-telemetry-artifact-membership.js";
 export * from "./tenant-telemetry-owner-closure.js";
 export * from "./tenant-telemetry-source-accounting.js";
@@ -54,7 +56,8 @@ export * from "./restore-journal/common.js";
 export * from "./restore-journal/memory.js";
 export * from "./restore-journal/s3.js";
 export * from "./memory.js";
-export { MysqlSessionStore, type MysqlStoreOptions } from "./mysql/store.js";
+export { MysqlSessionStore, assertMysqlSessionStoreDatabaseBinding, type MysqlStoreOptions } from "./mysql/store.js";
+export { readTenantTelemetryCaptureCheckpointFromMysql } from "./mysql/tenant-telemetry-capture-checkpoint.js";
 export {
   MysqlBlobStorageMigrationCoordinator,
   type MysqlBlobStorageMigrationCoordinatorOptions,

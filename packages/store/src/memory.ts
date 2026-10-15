@@ -863,6 +863,10 @@ import {
 } from "./tenant-credential-target-execution.js";
 import * as RestoreJournal from "./tenant-restore-journal.js";
 import * as BackupCatalog from "./backup-catalog.js";
+import * as CaptureRestore from "./tenant-telemetry-capture-restore.js";
+import type { TenantTelemetryCaptureBackupCheckpointRecord, TenantTelemetryCaptureBackupCheckpointStore,
+  SealTenantTelemetryCaptureBackupCheckpointInput, AssertTenantTelemetryCaptureBackupCheckpointUnchangedInput,
+  TenantTelemetryCaptureRestoreBackupBinding } from "./tenant-telemetry-capture-restore-store.js";
 import * as BackupCatalogAdapter from "./backup-catalog-adapter/common.js";
 import * as TenantTelemetry from "./tenant-telemetry-lifecycle.js";
 import * as TenantTelemetryWriter from "./tenant-telemetry-writer.js";
@@ -1181,7 +1185,7 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 }
 
 /** In-memory store: reference semantics for tests. Single process only. */
-export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore {
+export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore, TenantTelemetryCaptureBackupCheckpointStore {
   private readonly ordinaryDeleteCommitBatches = new WeakSet<CommitBatch>();
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
@@ -1604,6 +1608,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private readonly retainedSourceUsageReceipts = new Map<string, RetainedSource.TenantTelemetryRetainedSourceUsageReleaseReceipt>();
   private readonly retainedSourceCanonicalEntries = new Map<string, RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureEntry>();
   private readonly retainedSourceCanonicalReceipts = new Map<string, RetainedSource.TenantTelemetryRetainedSourceCanonicalClosureReceipt>();
+  private readonly tenantTelemetryCaptureBackupCheckpoints = new Map<string, TenantTelemetryCaptureBackupCheckpointRecord>();
+  private readonly tenantTelemetryCaptureRestoreBackupBindings = new Map<string, TenantTelemetryCaptureRestoreBackupBinding>();
 
   constructor(
     private readonly storeClock: { now(): number } = { now: () => Date.now() },
@@ -1615,6 +1621,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       tenantTelemetryRefKey?: Uint8Array;
       /** Explicit local-only permission; active v2 capture remains forbidden in production. */
       tenantTelemetryPersistedProviderCaptureLocalOnly?: boolean;
+      /** Stopped-fleet local reference checkpoint only; never a MySQL artifact or restore permission. */
+      tenantTelemetryCaptureRestoreLocalOnly?: boolean;
     } = {},
   ) {
     const namespace = memoryOptions.tenantRedisPurgeNamespaceSha256;
@@ -1637,6 +1645,410 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       throw new Error("memory store clock must return a non-negative safe integer");
     }
     return nowMs;
+  }
+
+  private validateMemoryCaptureCheckpointRequest(input: SealTenantTelemetryCaptureBackupCheckpointInput,
+    unchanged = false): void {
+    const keys = Object.keys(input).sort();
+    const expected = ["backupId", "fleetStoppedAck", "localOnlyAck", ...(unchanged ? ["checkpointSha256"] : [])].sort();
+    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])
+      || !/^backup_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.backupId)
+      || input.fleetStoppedAck !== "fleet-stopped-v1" || input.localOnlyAck !== "local-only-v1"
+      || (unchanged && !/^[0-9a-f]{64}$/.test((input as AssertTenantTelemetryCaptureBackupCheckpointUnchangedInput).checkpointSha256))) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+  }
+
+  /** Actual persisted columns only: never recurse into user metadata or treat lease/expiry as a source timestamp. */
+  private memoryCaptureCheckpointHighWater(value: unknown): number {
+    if (value === null || typeof value !== "object") return 0;
+    const names = ["createdAtMs", "updatedAtMs", "createdAtDbMs", "updatedAtDbMs", "emittedAtMs", "completedAtMs",
+      "storeDbTimestampMs", "activatedAtDbMs", "boundAtDbMs", "startedAtDbMs", "sourceHighWaterDbMs",
+      "coverageStartedAtDbMs", "capturedAtDbMs", "acceptedAtDbMs", "t1AcceptedAtDbMs", "markedAtDbMs",
+      "releasedAtDbMs", "deletedAtMs", "deletedAtDbMs", "reservedAtDbMs"];
+    let high = 0;
+    for (const name of names) {
+      const field: unknown = (value as Record<string, unknown>)[name];
+      if (field === undefined || field === null) continue;
+      if (typeof field !== "number" || !Number.isSafeInteger(field) || field < 0) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      high = Math.max(high, field);
+    }
+    return high;
+  }
+
+  private auditMemoryCaptureCheckpointSources(): void {
+    this.assertTenantContentGlobalRelations();
+    this.assertTenantPurgePlanGlobalRelations();
+    this.assertTenantDatabasePurgeGlobalRelations();
+    this.assertTenantRestoreJournalGlobalRelations();
+    this.assertTenantRestoreReplayGlobalRelations();
+    this.assertTenantBackupCatalogGlobalRelations();
+    this.assertTenantTelemetryWriterGlobalRelations();
+    // The item envelope commits the private projection only when the item exists.
+    // Audit the reverse direction too, so an orphan projection cannot disappear
+    // from all 49 physical-source families or from the unchanged comparison.
+    for (const [itemId, projection] of this.persistedProviderFailureClasses) {
+      const item = this.items.get(itemId);
+      if (!projection || typeof projection !== "object" || !item || item.id !== itemId
+        || item.type !== "agentMessage" || item.status !== "failed"
+        || (projection.generation !== 0 && projection.generation !== 1)
+        || (projection.classification !== "runtime_unknown" && projection.classification !== "provider_step_error")) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      const expectedKeys = projection.classification === "provider_step_error"
+        ? "classification,generation,operationSha256" : "classification,generation";
+      if (Object.keys(projection).sort().join(",") !== expectedKeys) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+      if (projection.classification === "runtime_unknown") continue; // Genuine gen0/gen1 unknown is retained, not upgraded.
+      const session = this.sessions.get(item.sessionId);
+      const operation = projection.operationSha256;
+      const failure = operation && this.persistedProviderFailureReceipts.get(operation);
+      const binding = operation && this.persistedProviderCaptureBindings.get(operation);
+      const job = operation && this.tenantTelemetryWriteJobs.get(operation);
+      const key = this.tenantTelemetryRefKeyForUse();
+      if (projection.generation !== 1 || typeof operation !== "string" || !/^[0-9a-f]{64}$/.test(operation)
+        || !session || !failure || !binding || !job || failure.tenantId !== session.tenantId
+        || failure.writeOperationSha256 !== operation || binding.writeOperationSha256 !== operation
+        || binding.tenantId !== session.tenantId || job.writeOperationSha256 !== operation || job.tenantId !== session.tenantId
+        || failure.bindingReceiptSha256 !== binding.receiptSha256
+        || failure.sourceSessionRefSha256 !== telemetryCaptureLogsSourceRefSha256("session", session.tenantId, session.id, key)
+        || failure.sourceTurnRefSha256 !== telemetryCaptureLogsSourceRefSha256("turn", session.tenantId, item.turnId, key)
+        || failure.sourceItemRefSha256 !== telemetryCaptureLogsSourceRefSha256("item", session.tenantId, item.id, key)
+        || failure.sourceStepIndex !== item.step
+        || this.verifyMemoryPersistedProviderFailure(failure).status === "not_found") {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+    }
+    for (const [usageId, fact] of this.billingUsageFacts) {
+      assertBillingUsageFact(fact);
+      if (usageId !== fact.usageId) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    for (const row of this.usageLedger) {
+      UsageSchema.parse(row.usage);
+      const turn = this.turns.get(row.turnId);
+      const session = this.sessions.get(row.sessionId);
+      if (!session || row.tenantId !== session.tenantId || row.userId !== session.userId
+        || (turn !== undefined && turn.sessionId !== row.sessionId)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      if (row.usageId !== undefined) {
+        const fact = this.billingUsageFacts.get(row.usageId);
+        if (!isUsageId(row.usageId) || !fact || !billingUsageFactContentEquals(fact,
+          billingUsageFactFromLedger(row as UsageLedgerEntry & { usageId: string }))) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+      }
+    }
+    // Audit every sidecar, including a stray row not reachable from a provider receipt.
+    const oldPlans = new Set<string>();
+    for (const rows of [this.tenantTelemetrySourceAccountingEntries, this.tenantTelemetrySourceAccountingReceipts,
+      this.tenantTelemetryTargetManifestEntries, this.tenantTelemetryTargetManifestReceipts,
+      this.tenantTelemetryPlanArtifactTargets, this.tenantTelemetryPlanArtifactTargetReceipts] as const) {
+      for (const row of rows.values()) oldPlans.add(row.requestId);
+    }
+    for (const requestId of oldPlans) {
+      const job = this.tenantPurgePlanJobs.get(requestId), receipt = this.tenantPurgePlanReceipts.get(requestId);
+      if (!job || job.phase !== "plan_sealed" || !receipt) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      this.validateTenantTelemetrySourceAccountingForPlan(job, receipt);
+      this.validateTenantTelemetryTargetManifestForPlan(job, receipt);
+      this.validateTenantTelemetryPlanArtifactTargetsForPlan(job, receipt);
+    }
+    const cohorts = new Set([...this.retainedSourceAdmissionFamilies.keys(), ...this.retainedSourceT1Receipts.keys(),
+      ...[...this.retainedSourceT1Entries.values()].map((row) => row.requestId)]);
+    for (const requestId of cohorts) {
+      const family = this.retainedSourceAdmissionFamilyFor(requestId);
+      const admission = this.tenantErasureAdmissions.get(requestId);
+      const fence = admission && this.tenantCredentialRevocationFences.get(admission.tenantId);
+      const subject = this.tenantTelemetryLifecycleSubjects.get(requestId);
+      const cohort = this.retainedSourceT1Receipts.get(requestId);
+      if (!family || !admission || !fence || !subject || !cohort || family.tenantId !== admission.tenantId
+        || family.subjectGeneration !== admission.generation || family.t1FenceSha256 !== fence.evidenceSha256
+        || cohort.tenantLifecycleSubjectEvidenceSha256 !== subject.receiptSha256) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+    }
+    const retainedPlans = new Set(this.retainedSourcePlanFamilies.keys());
+    for (const rows of [this.retainedSourceCatalogSources, this.retainedSourceCatalogTargets, this.retainedSourceCatalogReceipts,
+      this.retainedSourceUsageEntries, this.retainedSourceUsageReceipts,
+      this.retainedSourceCanonicalEntries, this.retainedSourceCanonicalReceipts] as const) {
+      for (const row of rows.values()) retainedPlans.add(row.requestId);
+    }
+    for (const requestId of retainedPlans) this.auditRetainedSourceOuterBoundary(requestId);
+    const closures = new Set([...this.tenantTelemetryOwnerClosureReceipts.keys(),
+      ...[...this.tenantTelemetryOwnerClosureEntries.values()].map((row) => row.requestId)]);
+    for (const requestId of closures) {
+      const job = this.tenantDatabasePurgeJobs.get(requestId);
+      if (!job || job.phase !== "database_purged") throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      this.tenantDatabasePurgeBundle(job);
+    }
+  }
+
+  /** Memory semantics only, deliberately backend-bound. A MySQL logical artifact must NEVER
+   * substitute these envelopes for mysql-v1 physical rows or claim cross-backend root equality.
+   * No await occurs between source validation, collection and the eventual atomic publication. */
+  private collectMemoryCaptureBackupCheckpoint(backupId: string): TenantTelemetryCaptureBackupCheckpointRecord | null {
+    this.assertTenantTelemetryWriterGlobalRelations();
+    const capture = this.assertMemoryPersistedProviderCaptureControl();
+    if (!capture) {
+      const v2Footprint = this.tenantTelemetryCaptureBackupCheckpoints.size !== 0
+        || this.retainedSourceAdmissionFamilies.size !== 0 || this.retainedSourcePlanFamilies.size !== 0
+        || [this.retainedSourceT1Entries, this.retainedSourceT1Receipts, this.retainedSourceCatalogSources,
+          this.retainedSourceCatalogTargets, this.retainedSourceCatalogReceipts, this.retainedSourceUsageEntries,
+          this.retainedSourceUsageReceipts, this.retainedSourceCanonicalEntries, this.retainedSourceCanonicalReceipts]
+          .some((rows) => rows.size !== 0)
+        || [...this.persistedProviderFailureClasses.values()].some((row) => row.generation !== 0 || row.classification !== "runtime_unknown")
+        || [...this.tenantTelemetryWriteJobs.values()].some((row) => row.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA);
+      if (v2Footprint) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      return null;
+    }
+    if (this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly !== true || process.env.NODE_ENV === "production") {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    this.auditMemoryCaptureCheckpointSources();
+    const key = this.tenantTelemetryRefKeyForUse();
+    const anchor = this.tenantBackupSnapshotAnchors.get(backupId);
+    const catalog = this.readTenantBackupCatalogControl();
+    const runtime = this.readTenantRestoreRuntimeControl();
+    const journal = this.readTenantRestoreJournalControl();
+    const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
+    const blob = this.readMemoryBlobStorageControl();
+    const head = this.tenantBackupCatalogHeadForRead();
+    if (!anchor || catalog.state !== "active" || runtime.state !== "active" || runtime.lineageKind !== "primary"
+      || journal.controlGeneration !== 1 || lifecycle.state !== "active" || blob.controlGeneration !== 1
+      || anchor.backupId !== backupId || anchor.controlEvidenceSha256 !== catalog.evidenceSha256
+      || anchor.sourceRuntimeEpochSha256 !== runtime.runtimeEpochSha256
+      || anchor.sourceRuntimeControlGeneration !== runtime.controlGeneration
+      || anchor.sourceRuntimeControlEvidenceSha256 !== runtime.evidenceSha256
+      || anchor.sourceRuntimeHeadRootSha256 !== runtime.verifiedHeadRootSha256
+      || anchor.sourceCatalogSequence !== head.catalogSequence || anchor.sourceCatalogEventRootSha256 !== head.catalogEventRootSha256
+      || anchor.schemaMigrationRootSha256 !== this.tenantBackupSchemaMigrationRootSha256
+      || anchor.blobStorageControlEvidenceSha256 !== blob.evidenceSha256
+      || anchor.journalControlEvidenceSha256 !== journal.evidenceSha256
+      || anchor.logicalDatabaseNamespaceSha256 !== runtime.logicalDatabaseNamespaceSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    BackupCatalog.validateTenantBackupSnapshotAnchor(anchor);
+    type Family = CaptureRestore.TenantTelemetryCaptureCheckpointFamily;
+    type State = CaptureRestore.TenantTelemetryCaptureCheckpointState;
+    type Knowledge = CaptureRestore.TenantTelemetryCaptureCheckpointKnowledge;
+    const grouped = new Map<Family, CaptureRestore.TenantTelemetryCaptureCheckpointLeaf[]>(
+      CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_FAMILIES.map((family) => [family, []]));
+    const highWater = (row: unknown) => this.memoryCaptureCheckpointHighWater(row);
+    const add = (family: Family, identity: unknown, row: unknown, state: State = "record",
+      knowledge: Knowledge = "validated_projection", water = highWater(row), operation = false) => {
+      const recordBytes = Buffer.from(PersistedCapture.persistedProviderCaptureCanonicalJson({ backend: "memory-v1", physicalKey: identity, record: row }), "utf8");
+      const identityRefSha256 = operation
+        ? CaptureRestore.tenantTelemetryCaptureCheckpointOperationIdentity(family, String(identity), key)
+        : CaptureRestore.tenantTelemetryCaptureCheckpointOpaqueDigest(family, "identity",
+          Buffer.from(PersistedCapture.persistedProviderCaptureCanonicalJson({ backend: "memory-v1", physicalKey: identity }), "utf8"), key);
+      const leaf = { family, identityRefSha256,
+        recordHmacSha256: CaptureRestore.tenantTelemetryCaptureCheckpointOpaqueDigest(family, "record", recordBytes, key),
+        knowledge, state, sourceHighWaterDbMs: water };
+      CaptureRestore.validateTenantTelemetryCaptureCheckpointLeaf(leaf);
+      grouped.get(family)!.push(leaf);
+    };
+    const maps: readonly [Family, ReadonlyMap<unknown, unknown>][] = [
+      ["lifecycle_target", this.tenantTelemetryLifecycleTargets], ["lifecycle_activation", this.tenantTelemetryLifecycleActivationReceipts],
+      ["lifecycle_subject", this.tenantTelemetryLifecycleSubjects], ["application_activation", this.tenantTelemetryApplicationActivationReceipts],
+      ["application_coverage", this.tenantTelemetryApplicationCoverages], ["capture_coverage", this.persistedProviderCaptureCoverages],
+      ["canonical_turn", this.turns], ["canonical_approval", this.approvals], ["canonical_subject", this.subjectLifecycles],
+      ["canonical_tenant", this.tenants], ["billing_fact", this.billingUsageFacts], ["usage_reconciliation", this.usageReconciliations],
+      ["owner_closure_entry", this.tenantTelemetryOwnerClosureEntries], ["owner_closure_receipt", this.tenantTelemetryOwnerClosureReceipts],
+      ["session_grave", this.tenantPurgeSessionGraveMarkers], ["source_accounting_entry", this.tenantTelemetrySourceAccountingEntries],
+      ["source_accounting_receipt", this.tenantTelemetrySourceAccountingReceipts], ["target_manifest_entry", this.tenantTelemetryTargetManifestEntries],
+      ["target_manifest_receipt", this.tenantTelemetryTargetManifestReceipts], ["plan_artifact_target", this.tenantTelemetryPlanArtifactTargets],
+      ["plan_artifact_target_receipt", this.tenantTelemetryPlanArtifactTargetReceipts], ["retained_t1_entry", this.retainedSourceT1Entries],
+      ["retained_t1_receipt", this.retainedSourceT1Receipts], ["retained_catalog_source", this.retainedSourceCatalogSources],
+      ["retained_catalog_target", this.retainedSourceCatalogTargets], ["retained_catalog_receipt", this.retainedSourceCatalogReceipts],
+      ["retained_usage_entry", this.retainedSourceUsageEntries], ["retained_usage_receipt", this.retainedSourceUsageReceipts],
+      ["retained_canonical_entry", this.retainedSourceCanonicalEntries], ["retained_canonical_receipt", this.retainedSourceCanonicalReceipts],
+    ];
+    for (const [family, rows] of maps) for (const [identity, row] of rows) add(family, identity, row);
+    add("lifecycle_control", 1, lifecycle, "active");
+    for (const [domain, control] of this.tenantTelemetryApplicationDomainControls) add("application_control", domain, control, control.state);
+    add("capture_control", "logs", { domain: "logs", state: "active", controlGeneration: 1,
+      activatedAtDbMs: capture.activatedAtDbMs, activationEvidenceSha256: capture.receiptSha256 }, "active");
+    // Memory's fixed inactive traces control is part of the same two-domain protocol, not a new activation.
+    add("capture_control", "traces", { domain: "traces", state: "inactive", controlGeneration: 0 }, "inactive");
+    add("capture_activation", "logs", capture);
+    for (const [identity, row] of this.tenantTelemetryLifecycleCoverages) add("lifecycle_coverage", identity, row, "record",
+      row.historyStatus === "legacy_history_unknown" ? "legacy_unknown" : "validated_projection");
+    const operations: readonly [Family, ReadonlyMap<string, unknown>][] = [
+      ["write_ack", this.tenantTelemetryWriteAcks], ["membership", this.tenantTelemetryArtifactMemberships],
+      ["application_binding", this.tenantTelemetryApplicationWriteBindings], ["provider_source_binding", this.persistedProviderCaptureBindings],
+      ["provider_failure_commit", this.persistedProviderFailureReceipts],
+    ];
+    for (const [family, rows] of operations) for (const [operation, row] of rows) {
+      add(family, operation, row, "record", this.persistedProviderFailureReceipts.has(operation) ? "validated_projection" : "legacy_unknown", highWater(row), true);
+    }
+    for (const [identity, row] of this.tenantTelemetryArtifactInventories) add("inventory", identity, row);
+    for (const [operation, row] of this.tenantTelemetryWriteJobs) {
+      const knowledge = this.persistedProviderFailureReceipts.has(operation) ? "validated_projection" : "legacy_unknown";
+      const water = Math.max(highWater(row), highWater(row.inventory), highWater(row.reservation));
+      add("write_job", operation, row, row.phase === "queued" && row.reservation ? "reserved" : row.phase, knowledge, water, true);
+      if (row.reservation) add("write_reservation", operation, { tenantId: row.tenantId, writeOperationSha256: operation,
+        inventory: row.inventory, target: row.target, reservation: row.reservation }, "reserved", knowledge, water, true);
+    }
+    for (const [operation, row] of this.tenantTelemetryWritePayloads) add("write_payload", operation, row, "spooled",
+      this.persistedProviderFailureReceipts.has(operation) ? "validated_projection" : "legacy_unknown", highWater(row), true);
+    for (const [identity, row] of this.sessions) add("canonical_session", identity, { session: row, deleted: this.deleted.get(identity) ?? null },
+      "record", "validated_projection", Math.max(highWater(row), highWater(this.deleted.get(identity))));
+    for (const [identity, row] of this.items) {
+      const projection = this.persistedProviderFailureClasses.get(identity) ?? null;
+      add("canonical_item", identity, { item: row, privateProjection: projection }, "record", "validated_projection", highWater(row));
+      if (row.type === "agentMessage" && row.status === "failed" && (projection?.generation ?? 0) === 0) {
+        add("legacy_failure", ["item", identity], { item: row, privateProjection: projection }, "legacy_unknown", "legacy_unknown", highWater(row));
+      }
+    }
+    for (const [sessionId, rows] of this.events) for (const row of rows) {
+      const projection = row.type === "item/completed" ? this.persistedProviderFailureClasses.get(row.item.id) ?? null : null;
+      add("canonical_event", [sessionId, row.seq], { event: row, privateProjection: projection }, "record", "validated_projection", highWater(row));
+      if (row.type === "item/completed" && row.item.type === "agentMessage" && row.item.status === "failed"
+        && (projection?.generation ?? 0) === 0) add("legacy_failure", ["event", sessionId, row.seq],
+        { event: row, privateProjection: projection }, "legacy_unknown", "legacy_unknown", highWater(row));
+    }
+    for (const [index, row] of this.usageLedger.entries()) add("operational_usage", [index, row.usageId ?? null], row,
+      "record", row.usageId === undefined || !this.turns.has(row.turnId) ? "legacy_unknown" : "validated_projection");
+    const leaves = CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_FAMILIES.flatMap((family) => grouped.get(family)!);
+    const controlHighWaterDbMs = Math.max(highWater(capture), highWater(lifecycle), highWater(runtime), highWater(journal), highWater(catalog), highWater(blob));
+    const checkpoint = CaptureRestore.createTenantTelemetryCaptureBackupCheckpoint({ backupId, anchorSha256: anchor.anchorSha256,
+      anchorCreatedAtDbMs: anchor.createdAtDbMs, controlHighWaterDbMs,
+      logicalDatabaseNamespaceSha256: runtime.logicalDatabaseNamespaceSha256, schemaMigrationRootSha256: this.tenantBackupSchemaMigrationRootSha256,
+      sourceRuntimeLineageKind: "primary", sourceRuntimeEpochSha256: runtime.runtimeEpochSha256,
+      sourceRuntimeBindingSha256: PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime, journal),
+      sourceRuntimeControlEvidenceSha256: runtime.evidenceSha256, sourceRuntimeControlGeneration: runtime.controlGeneration,
+      sourceHistoryReceiptSha256: null, sourceCaptureCutoverReceiptSha256: null,
+      originalRuntimeEpochSha256: capture.runtimeEpochSha256, originalRuntimeBindingSha256: capture.runtimeBindingSha256,
+      originalCaptureActivationReceiptSha256: capture.receiptSha256, refKeyIdSha256: capture.refKeyIdSha256,
+      lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256, captureControlEvidenceSha256: capture.receiptSha256,
+      logsTargetSha256: capture.logsTargetSha256, logsTargetReceiptSha256: capture.logsTargetReceiptSha256,
+      journalControlEvidenceSha256: journal.evidenceSha256, journalTargetRootSha256: journal.targetRootSha256,
+      journalHeadRootSha256: runtime.verifiedHeadRootSha256, catalogControlEvidenceSha256: catalog.evidenceSha256,
+      catalogHeadSequence: head.catalogSequence, catalogHeadRootSha256: head.catalogEventRootSha256,
+      blobStorageControlEvidenceSha256: blob.evidenceSha256, sealedAtDbMs: this.storeNowMs() }, leaves, key);
+    return { checkpoint, leaves };
+  }
+
+  async sealTenantTelemetryCaptureBackupCheckpoint(input: SealTenantTelemetryCaptureBackupCheckpointInput)
+    : Promise<BackupCatalog.ExactReplay<TenantTelemetryCaptureBackupCheckpointRecord> | null> {
+    this.validateMemoryCaptureCheckpointRequest(input);
+    const staged = this.collectMemoryCaptureBackupCheckpoint(input.backupId);
+    if (!staged) return null;
+    const previous = this.tenantTelemetryCaptureBackupCheckpoints.get(input.backupId);
+    if (previous) {
+      this.validateMemoryCaptureCheckpointRecord(input.backupId, previous);
+      CaptureRestore.assertTenantTelemetryCaptureBackupCheckpointUnchanged(previous.checkpoint, staged.checkpoint, this.tenantTelemetryRefKeyForUse());
+      return { disposition: "exact_replay", value: clone(previous) };
+    }
+    const stored = clone(staged);
+    this.validateMemoryCaptureCheckpointRecord(input.backupId, stored);
+    const outbound = clone(stored); // A serialization failure must precede the atomic publication.
+    try { this.tenantTelemetryCaptureBackupCheckpoints.set(input.backupId, stored); }
+    catch (error) { Map.prototype.delete.call(this.tenantTelemetryCaptureBackupCheckpoints, input.backupId); throw error; }
+    return { disposition: "created", value: outbound };
+  }
+
+  private validateMemoryCaptureCheckpointRecord(backupId: string, record: TenantTelemetryCaptureBackupCheckpointRecord): void {
+    if (Object.keys(record).sort().join(",") !== "checkpoint,leaves" || record.checkpoint.backupId !== backupId) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    CaptureRestore.assertTenantTelemetryCaptureCheckpointLeaves(record.checkpoint, record.leaves, this.tenantTelemetryRefKeyForUse());
+  }
+  async getTenantTelemetryCaptureBackupCheckpoint(backupId: string): Promise<TenantTelemetryCaptureBackupCheckpointRecord | null> {
+    const record = this.tenantTelemetryCaptureBackupCheckpoints.get(backupId);
+    if (!record) return null;
+    // Historical read intentionally does not run mutable active-primary/source audits.
+    this.validateMemoryCaptureCheckpointRecord(backupId, record);
+    return clone(record);
+  }
+  async assertTenantTelemetryCaptureBackupCheckpointUnchanged(input: AssertTenantTelemetryCaptureBackupCheckpointUnchangedInput): Promise<void> {
+    this.validateMemoryCaptureCheckpointRequest(input, true);
+    const prior = this.tenantTelemetryCaptureBackupCheckpoints.get(input.backupId);
+    if (!prior || prior.checkpoint.checkpointSha256 !== input.checkpointSha256) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    this.validateMemoryCaptureCheckpointRecord(input.backupId, prior);
+    const current = this.collectMemoryCaptureBackupCheckpoint(input.backupId);
+    if (!current) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    CaptureRestore.assertTenantTelemetryCaptureBackupCheckpointUnchanged(prior.checkpoint, current.checkpoint, this.tenantTelemetryRefKeyForUse());
+  }
+
+  /** The authenticated artifact reader must explicitly pass its v2 field. The v1 catalog's
+   * manifest digest alone cannot prove a manifest version; never discover permission by backup ID.
+   * This validates immutable selection, not live unchanged, runtime activation or write authority. */
+  private selectMemoryCaptureRestoreCheckpoint(entry: BackupCatalog.TenantBackupCatalogEntry,
+    anchor: BackupCatalog.TenantBackupSnapshotAnchor, selected: string | undefined): TenantTelemetryCaptureBackupCheckpointRecord | null {
+    const activation = this.persistedProviderCaptureActivation;
+    if (!activation) {
+      this.assertTenantTelemetryWriterGlobalRelations();
+      if (selected !== undefined || this.tenantTelemetryCaptureBackupCheckpoints.size !== 0
+        || this.tenantTelemetryCaptureRestoreBackupBindings.size !== 0) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      return null;
+    }
+    if (this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly !== true || process.env.NODE_ENV === "production"
+      || typeof selected !== "string" || !/^[0-9a-f]{64}$/.test(selected)) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    PersistedCapture.validatePersistedProviderCaptureActivationReceipt(activation);
+    const record = this.tenantTelemetryCaptureBackupCheckpoints.get(entry.backupId);
+    if (!record) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    this.validateMemoryCaptureCheckpointRecord(entry.backupId, record);
+    const checkpoint = record.checkpoint;
+    const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
+    const target = this.tenantTelemetryLifecycleTargets.get("logs");
+    if (checkpoint.checkpointSha256 !== selected || checkpoint.backupId !== anchor.backupId
+      || checkpoint.anchorSha256 !== anchor.anchorSha256 || entry.anchorSha256 !== anchor.anchorSha256
+      || checkpoint.sourceRuntimeLineageKind !== "primary"
+      || checkpoint.anchorCreatedAtDbMs !== anchor.createdAtDbMs
+      || checkpoint.logicalDatabaseNamespaceSha256 !== anchor.logicalDatabaseNamespaceSha256
+      || checkpoint.schemaMigrationRootSha256 !== anchor.schemaMigrationRootSha256
+      || checkpoint.sourceRuntimeEpochSha256 !== anchor.sourceRuntimeEpochSha256
+      || checkpoint.sourceRuntimeControlEvidenceSha256 !== anchor.sourceRuntimeControlEvidenceSha256
+      || checkpoint.sourceRuntimeControlGeneration !== anchor.sourceRuntimeControlGeneration
+      || checkpoint.journalHeadRootSha256 !== anchor.sourceRuntimeHeadRootSha256
+      || checkpoint.journalControlEvidenceSha256 !== anchor.journalControlEvidenceSha256
+      || checkpoint.blobStorageControlEvidenceSha256 !== anchor.blobStorageControlEvidenceSha256
+      || checkpoint.originalCaptureActivationReceiptSha256 !== activation.receiptSha256
+      || checkpoint.captureControlEvidenceSha256 !== activation.receiptSha256
+      || checkpoint.originalRuntimeEpochSha256 !== activation.runtimeEpochSha256
+      || checkpoint.originalRuntimeBindingSha256 !== activation.runtimeBindingSha256
+      || checkpoint.refKeyIdSha256 !== activation.refKeyIdSha256
+      || lifecycle.state !== "active" || lifecycle.activationEvidenceSha256 !== checkpoint.lifecycleControlEvidenceSha256
+      || lifecycle.refKeyIdSha256 !== checkpoint.refKeyIdSha256
+      || !target || target.targetSha256 !== checkpoint.logsTargetSha256 || target.receiptSha256 !== checkpoint.logsTargetReceiptSha256
+      || activation.logsTargetSha256 !== checkpoint.logsTargetSha256 || activation.logsTargetReceiptSha256 !== checkpoint.logsTargetReceiptSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return record;
+  }
+
+  private memoryCaptureRestoreBackupBinding(record: TenantTelemetryCaptureBackupCheckpointRecord,
+    entry: BackupCatalog.TenantBackupCatalogEntry, binding: BackupCatalog.TenantBackupRestoreSourceBinding,
+    reservation: BackupCatalog.TenantBackupRuntimeReservation): TenantTelemetryCaptureRestoreBackupBinding {
+    if (record.checkpoint.backupId !== entry.backupId || record.checkpoint.anchorSha256 !== entry.anchorSha256
+      || binding.backupId !== entry.backupId || binding.entrySha256 !== entry.entrySha256
+      || reservation.restoreRunId !== binding.restoreRunId || reservation.backupId !== entry.backupId
+      || reservation.bindingSha256 !== binding.bindingSha256 || reservation.entrySha256 !== entry.entrySha256
+      || reservation.reservationReceiptSha256 !== binding.reservationReceiptSha256
+      || binding.boundAtDbMs < record.checkpoint.sealedAtDbMs || reservation.reservedAtDbMs !== binding.boundAtDbMs) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return { restoreRunId: binding.restoreRunId, backupId: entry.backupId,
+      checkpointSha256: record.checkpoint.checkpointSha256, artifactManifestSha256: entry.artifactManifestSha256,
+      sourceSnapshotSha256: entry.sourceSnapshotSha256, providerEvidenceSha256: entry.providerEvidenceSha256,
+      sourceBindingSha256: binding.bindingSha256, reservationSha256: reservation.reservationSha256,
+      reservationReceiptSha256: reservation.reservationReceiptSha256, boundAtDbMs: binding.boundAtDbMs };
+  }
+  private assertMemoryCaptureRestoreBackupBinding(record: TenantTelemetryCaptureBackupCheckpointRecord | null,
+    entry: BackupCatalog.TenantBackupCatalogEntry, binding: BackupCatalog.TenantBackupRestoreSourceBinding,
+    reservation: BackupCatalog.TenantBackupRuntimeReservation): void {
+    const existing = this.tenantTelemetryCaptureRestoreBackupBindings.get(binding.restoreRunId);
+    if (!record) {
+      if (existing) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      return;
+    }
+    const expected = this.memoryCaptureRestoreBackupBinding(record, entry, binding, reservation);
+    if (!existing || PersistedCapture.persistedProviderCaptureCanonicalJson(existing)
+      !== PersistedCapture.persistedProviderCaptureCanonicalJson(expected)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
   }
 
   private retainedSourceAdmissionFamilyFor(
@@ -9217,6 +9629,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         && event.result.backupId === staged.backupId)) {
       throw new BackupCatalog.TenantBackupCatalogNotReadyError("backup_not_recoverable");
     }
+    const selectedCheckpoint = this.selectMemoryCaptureRestoreCheckpoint(entry, anchor, staged.captureCheckpointSha256);
     const activeReservations = new Map<string, Extract<
       BackupCatalog.TenantBackupCatalogExternalEvent,
       { eventType: "restore_reserved" }
@@ -9249,7 +9662,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || reservation.runtimeEpochSha256 !== staged.runtimeEpochSha256) {
         throw new BackupCatalog.TenantBackupCatalogConflictError();
       }
+      this.assertMemoryCaptureRestoreBackupBinding(selectedCheckpoint, entry, binding, reservation);
       return clone(entry);
+    }
+    if (this.tenantTelemetryCaptureRestoreBackupBindings.has(staged.restoreRunId)) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
     const requestedIdentityWasUsed = events.some((event) => event.eventType === "restore_reserved"
       && (event.result.restoreRunId === staged.restoreRunId
@@ -9279,12 +9696,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const keys = Object.keys(staged).sort();
     const expectedKeys = [
       "backupId", "controlEvidenceSha256", "reservation", "restoreRunId", "runtimeEpochSha256",
-      "sealedTargets",
-    ];
+      "sealedTargets", ...(Object.hasOwn(staged, "captureCheckpointSha256") ? ["captureCheckpointSha256"] : []),
+    ].sort();
     if (keys.length !== expectedKeys.length
       || keys.some((key, index) => key !== expectedKeys[index])) {
       throw new Error("tenant backup restore prepare input has unknown or missing fields");
     }
+    BackupCatalog.validatePreflightTenantRestoreReplayFromBackupInput({ backupId: staged.backupId,
+      restoreRunId: staged.restoreRunId, runtimeEpochSha256: staged.runtimeEpochSha256,
+      ...(Object.hasOwn(staged, "captureCheckpointSha256") ? { captureCheckpointSha256: staged.captureCheckpointSha256 } : {}) });
     BackupCatalog.validateTenantBackupRuntimeReservationAdapterResult(staged.reservation);
     const control = this.readTenantBackupCatalogControl();
     if (control.state !== "active" || staged.controlEvidenceSha256 !== control.journalControlEvidenceSha256) {
@@ -9300,6 +9720,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     ))) {
       throw new BackupCatalog.TenantBackupCatalogNotReadyError("backup_not_recoverable");
     }
+    const selectedCheckpoint = this.selectMemoryCaptureRestoreCheckpoint(entry, anchor, staged.captureCheckpointSha256);
     const adapter = staged.reservation;
     if (adapter.adapterProtocol !== control.adapterProtocol
       || adapter.catalogNamespaceSha256 !== control.catalogNamespaceSha256
@@ -9330,6 +9751,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || existingReservation.catalogEventSha256 !== adapter.catalogEventSha256) {
         throw new BackupCatalog.TenantBackupCatalogConflictError();
       }
+      this.assertMemoryCaptureRestoreBackupBinding(selectedCheckpoint, entry, existingBinding, existingReservation);
       const run = this.prepareTenantRestoreReplaySync({
         restoreRunId: staged.restoreRunId,
         sourceBackupSha256: entry.sourceBackupSha256,
@@ -9345,6 +9767,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           replayRun: run,
         },
       };
+    }
+    if (this.tenantTelemetryCaptureRestoreBackupBindings.has(staged.restoreRunId)) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
     if (this.tenantRestoreReplayRuns.has(staged.restoreRunId)
       || [...this.tenantRestoreReplayRuns.values()].some((run) => (
@@ -9408,11 +9833,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       phase: "reserved",
     };
     BackupCatalog.validateTenantBackupRuntimeReservation(reservation);
+    const checkpointBinding = selectedCheckpoint
+      ? this.memoryCaptureRestoreBackupBinding(selectedCheckpoint, entry, binding, reservation) : null;
     const bindingsBefore = new Map(this.tenantBackupRestoreSourceBindings);
     const reservationsBefore = new Map(this.tenantBackupRuntimeReservations);
     const eventsBefore = new Map(this.tenantBackupCatalogExternalEvents);
     const runsBefore = new Map(this.tenantRestoreReplayRuns);
     const targetsBefore = new Map(this.tenantRestoreReplaySealedTargets);
+    const captureBindingsBefore = new Map(this.tenantTelemetryCaptureRestoreBackupBindings);
     try {
       this.mirrorTenantBackupCatalogEventSync({
         adapterProtocol: control.adapterProtocol,
@@ -9430,7 +9858,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         controlEvidenceSha256: staged.controlEvidenceSha256,
         sealedTargets: staged.sealedTargets,
       }, true);
+      if (checkpointBinding) this.tenantTelemetryCaptureRestoreBackupBindings.set(staged.restoreRunId, checkpointBinding);
       this.assertTenantBackupCatalogGlobalRelations();
+      this.assertMemoryCaptureRestoreBackupBinding(selectedCheckpoint, entry, binding, reservation);
       return {
         disposition: "created",
         value: { binding: clone(binding), reservation: clone(reservation), replayRun },
@@ -9441,6 +9871,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       restoreMapSnapshot(this.tenantBackupCatalogExternalEvents, eventsBefore);
       restoreMapSnapshot(this.tenantRestoreReplayRuns, runsBefore);
       restoreMapSnapshot(this.tenantRestoreReplaySealedTargets, targetsBefore);
+      restoreMapSnapshot(this.tenantTelemetryCaptureRestoreBackupBindings, captureBindingsBefore);
       throw error;
     }
   }

@@ -10,15 +10,21 @@ import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256, EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
   tenantBackupSchemaMigrationRootSha256, tenantBackupSnapshotAnchorSha256,
   tenantRestoreReplaySealedTargetRootSha256,
+  tenantRestoreJournalTargetRootSha256, tenantTelemetryRefKeyIdSha256,
+  createTenantTelemetryCaptureBackupCheckpoint, tenantTelemetryCaptureCheckpointOpaqueDigest,
+  assertMysqlSessionStoreDatabaseBinding,
+  PERSISTED_PROVIDER_CAPTURE_PROTOCOL, PERSISTED_PROVIDER_CAPTURE_PRODUCER_PROTOCOL, PERSISTED_PROVIDER_CAPTURE_CONTRACT_SHA256,
   type TenantBackupSnapshotAnchor,
+  type TenantTelemetryCaptureCheckpointLeaf, type TenantTelemetryCaptureBackupCheckpointRecord,
+  type TenantTelemetryCaptureBackupCheckpointStore,
 } from "@agent-service/store";
 import {
   acquireMySqlBackupArtifactOperator, createMySqlBackupArtifact, importVerifiedMySqlBackupArtifact,
   verifyMySqlBackupArtifact, type CreateMySqlBackupArtifactOptions,
 } from "../src/mysql-backup-artifact.js";
 import {
-  MYSQL_BACKUP_ARTIFACT_MAGIC,
-  artifactEvidence, canonicalJson, canonicalMySqlBackupTableDefinition, decodeArtifactManifest, sha256,
+  MYSQL_BACKUP_ARTIFACT_MAGIC, MYSQL_BACKUP_ARTIFACT_V2_MAGIC,
+  artifactAad, artifactEvidence, canonicalJson, canonicalMySqlBackupTableDefinition, decodeArtifactManifest, encodeArtifactManifest, sha256,
   type MySqlBackupArtifactManifest,
 } from "../src/mysql-backup-artifact-codec.js";
 
@@ -32,6 +38,16 @@ const state = vi.hoisted(() => ({
   fsDelay: undefined as { kind: "open" | "mkdir" | "mkdtemp"; path: string } | undefined,
   fsEntered: false, fsResource: undefined as unknown, resumeFs: undefined as (() => void) | undefined,
   abortOpen: undefined as { path: string; abort: () => void } | undefined,
+  captureRecord: undefined as { checkpoint: Record<string, unknown>; leaves: Array<Record<string, unknown>> } | undefined,
+  inactiveFootprint: 0, missingInactiveResult: false, invalidInactiveControls: false,
+}));
+// Only the connection-brand/identity helper is a driver double here. These
+// unit tests prove orchestration/cancellation/bytes, not a real MySQL pool,
+// WeakMap brand or SQL identity check; the store SQL suite proves that boundary.
+vi.mock("@agent-service/store", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@agent-service/store")>(),
+  assertMysqlSessionStoreDatabaseBinding: vi.fn(async (_store: unknown, _expected: { serverUuid: string; database: string },
+    _options: { timeoutMs: number; operationAbortSignal?: AbortSignal }): Promise<void> => {}),
 }));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const filesystem = await importOriginal<typeof import("node:fs/promises")>();
@@ -55,8 +71,27 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 vi.mock("mysql2/promise", () => ({ default: { createConnection: vi.fn(async (config: { database: string }) => ({
   destroy: vi.fn(() => { state.destroyedDatabases.push(config.database); }),
-  query: vi.fn(async (options: { sql: string }, values: unknown[]) => {
-    const sql = options.sql;
+  query: vi.fn(async (options: { sql: string } | string, values: unknown[]) => {
+    const sql = typeof options === "string" ? options : options.sql;
+    if (sql.includes("AS capture_inactive_footprint_")) return [state.missingInactiveResult ? [] : [Object.fromEntries(
+      [...sql.matchAll(/\((SELECT COUNT\(\*\)[\s\S]*?)\) AS (capture_inactive_footprint_[0-9]+)/g)].map((match) => [match[2]!,
+        state.inactiveFootprint || (state.captureRecord && /FROM `tenant_telemetry_capture_backup_checkpoint(?:s|_leaves)`/.test(match[1]!) ? 1 : 0)]))]];
+    if (sql.includes("FROM tenant_telemetry_capture_v2_controls")) return [state.invalidInactiveControls ? [] : [
+      { domain: "logs", scope: "tenant-telemetry-capture-control-v2", control_generation: 0, state: "inactive",
+        capture_protocol: PERSISTED_PROVIDER_CAPTURE_PROTOCOL, producer_protocol: PERSISTED_PROVIDER_CAPTURE_PRODUCER_PROTOCOL,
+        producer_contract_sha256: PERSISTED_PROVIDER_CAPTURE_CONTRACT_SHA256, activated_at_db_ms: null },
+      { domain: "traces", scope: "tenant-telemetry-capture-control-v2", control_generation: 0, state: "inactive",
+        capture_protocol: PERSISTED_PROVIDER_CAPTURE_PROTOCOL, producer_protocol: null, producer_contract_sha256: null, activated_at_db_ms: null },
+    ]];
+    if (sql.includes("FROM tenant_telemetry_capture_backup_checkpoints")) {
+      const cp = state.captureRecord?.checkpoint;
+      return [cp ? [{ backup_id: cp.backupId, anchor_sha256: cp.anchorSha256, checkpoint_sha256: cp.checkpointSha256,
+        ref_key_id_sha256: cp.refKeyIdSha256, sealed_at_db_ms: cp.sealedAtDbMs, checkpoint_json: cp }] : []];
+    }
+    if (sql.includes("FROM tenant_telemetry_capture_backup_checkpoint_leaves")) return [(state.captureRecord?.leaves ?? []).map((leaf) => ({
+      backup_id: BACKUP, family: leaf.family, identity_ref_sha256: leaf.identityRefSha256, record_hmac_sha256: leaf.recordHmacSha256,
+      knowledge: leaf.knowledge, state: leaf.state, source_high_water_db_ms: leaf.sourceHighWaterDbMs,
+    }))];
     if (sql.includes("@@server_uuid")) return [[{ server_uuid: state.changedSourceIdentity && config.database === "source_test"
       ? "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" : "11111111-1111-1111-1111-111111111111", version: "8.0.26", database_name: config.database }]];
     if (sql.includes("GET_LOCK")) return [[{ acquired: 1 }]];
@@ -127,11 +162,15 @@ let keyFile: string;
 let key: Buffer;
 let options: CreateMySqlBackupArtifactOptions;
 beforeEach(async () => {
+  vi.mocked(assertMysqlSessionStoreDatabaseBinding).mockReset().mockResolvedValue(undefined);
   directory = await realpath(await mkdtemp(join(tmpdir(), "mysql-backup-artifact-unit-")));
   key = randomBytes(32); keyFile = join(directory, "key"); await writeFile(keyFile, key, { mode: 0o600 });
   // Paths are checked as real, non-writable executables; spawn itself is mocked.
   const tool = join(directory, "mysql-tool"); await writeFile(tool, "unit fixture", { mode: 0o700 });
   options = { artifactDirectory: directory, sourceUrl: SOURCE, anchor: anchor(), keyFile,
+    captureCheckpointStore: { sealTenantTelemetryCaptureBackupCheckpoint: vi.fn(async () => null),
+      getTenantTelemetryCaptureBackupCheckpoint: vi.fn(async () => null),
+      assertTenantTelemetryCaptureBackupCheckpointUnchanged: vi.fn(async () => {}) },
     tools: { mysql: tool, mysqldump: tool }, maxBytes: 1024 * 1024, deadlineMs: 5000, localOnlyAck: true, fleetStoppedAck: true };
   Object.assign(state, { anchorRow: row(options.anchor), calls: [], imported: Buffer.alloc(0), targetObjects: 0,
     dumpBytes: Buffer.from("CREATE TABLE sample (id INT);\nINSERT INTO sample VALUES (1);\n"),
@@ -139,7 +178,7 @@ beforeEach(async () => {
     schemaChanged: false, lostLock: false });
   Object.assign(state, { view: false, routine: false, event: false, myisam: false, sourceQualified: false,
     destroyedDatabases: [], killDestroyedCount: -1, fsDelay: undefined, fsEntered: false, fsResource: undefined,
-    resumeFs: undefined, abortOpen: undefined });
+    resumeFs: undefined, abortOpen: undefined, captureRecord: undefined, inactiveFootprint: 0, missingInactiveResult: false, invalidInactiveControls: false });
 });
 afterEach(async () => { state.resumeFs?.(); key.fill(0); await rm(directory, { recursive: true, force: true }); });
 
@@ -148,10 +187,50 @@ async function verify(expectedEvidence?: Awaited<ReturnType<typeof createMySqlBa
 }
 async function rewriteManifest(mutate: (manifest: MySqlBackupArtifactManifest) => void): Promise<void> {
   const path = join(directory, `${BACKUP}.asmbak`); const data = await readFile(path);
-  const length = data.readUInt32BE(8); const manifest = decodeArtifactManifest(data.subarray(12, 12 + length), options.maxBytes);
+  const length = data.readUInt32BE(8); const manifest = decodeArtifactManifest(data.subarray(12, 12 + length), options.maxBytes, options.tenantTelemetryRefKey);
   mutate(manifest); const bytes = Buffer.from(canonicalJson(manifest)); const header = Buffer.alloc(12);
-  MYSQL_BACKUP_ARTIFACT_MAGIC.copy(header); header.writeUInt32BE(bytes.length, 8);
+  data.subarray(0, 8).copy(header); header.writeUInt32BE(bytes.length, 8);
   await writeFile(path, Buffer.concat([header, bytes, data.subarray(12 + length)]), { mode: 0o600 });
+}
+
+/** Synthetic store projection fixture; only the real MySQL suite proves its DB provenance. */
+function activeCheckpoint(): TenantTelemetryCaptureBackupCheckpointRecord {
+  const refKey = Buffer.alloc(32, 0x61); options.tenantTelemetryRefKey = refKey;
+  const a = options.anchor;
+  const leaves: TenantTelemetryCaptureCheckpointLeaf[] = [
+    { family: "write_job", state: "queued", knowledge: "validated_projection" },
+    { family: "write_job", state: "reserved", knowledge: "validated_projection" },
+    { family: "write_job", state: "written", knowledge: "validated_projection" },
+    { family: "write_payload", state: "spooled", knowledge: "validated_projection" },
+    { family: "legacy_failure", state: "legacy_unknown", knowledge: "legacy_unknown" },
+  ].map((row, index) => ({ ...row, sourceHighWaterDbMs: 1_000,
+    identityRefSha256: tenantTelemetryCaptureCheckpointOpaqueDigest(row.family as TenantTelemetryCaptureCheckpointLeaf["family"], "identity", Buffer.from(`row-${index}`), refKey),
+    recordHmacSha256: tenantTelemetryCaptureCheckpointOpaqueDigest(row.family as TenantTelemetryCaptureCheckpointLeaf["family"], "record", Buffer.from(`record-${index}`), refKey),
+  })) as TenantTelemetryCaptureCheckpointLeaf[];
+  const checkpoint = createTenantTelemetryCaptureBackupCheckpoint({ backupId: a.backupId, anchorSha256: a.anchorSha256,
+    anchorCreatedAtDbMs: a.createdAtDbMs, controlHighWaterDbMs: 1_000, logicalDatabaseNamespaceSha256: a.logicalDatabaseNamespaceSha256,
+    schemaMigrationRootSha256: a.schemaMigrationRootSha256, sourceRuntimeLineageKind: "primary",
+    sourceRuntimeEpochSha256: a.sourceRuntimeEpochSha256, sourceRuntimeBindingSha256: digest("1"),
+    sourceRuntimeControlEvidenceSha256: a.sourceRuntimeControlEvidenceSha256, sourceRuntimeControlGeneration: a.sourceRuntimeControlGeneration,
+    sourceHistoryReceiptSha256: null, sourceCaptureCutoverReceiptSha256: null,
+    originalRuntimeEpochSha256: a.sourceRuntimeEpochSha256, originalRuntimeBindingSha256: digest("1"),
+    originalCaptureActivationReceiptSha256: digest("2"), refKeyIdSha256: tenantTelemetryRefKeyIdSha256(refKey),
+    lifecycleControlEvidenceSha256: digest("3"), captureControlEvidenceSha256: digest("4"),
+    logsTargetSha256: digest("5"), logsTargetReceiptSha256: digest("6"), journalControlEvidenceSha256: a.journalControlEvidenceSha256,
+    journalTargetRootSha256: tenantRestoreJournalTargetRootSha256(a.sourceRuntimeHeads.map((head) => ({ targetOrdinal: head.targetOrdinal,
+      targetSha256: head.targetSha256, failureDomainSha256: head.failureDomainSha256, adapterProtocol: head.adapterProtocol,
+      journalNamespaceSha256: head.journalNamespaceSha256 }))), journalHeadRootSha256: a.sourceRuntimeHeadRootSha256,
+    catalogControlEvidenceSha256: a.controlEvidenceSha256, catalogHeadSequence: a.sourceCatalogSequence,
+    catalogHeadRootSha256: a.sourceCatalogEventRootSha256, blobStorageControlEvidenceSha256: a.blobStorageControlEvidenceSha256,
+    sealedAtDbMs: 1_100 }, leaves, refKey);
+  options.captureCheckpointStore = {
+    sealTenantTelemetryCaptureBackupCheckpoint: vi.fn(async (): ReturnType<TenantTelemetryCaptureBackupCheckpointStore["sealTenantTelemetryCaptureBackupCheckpoint"]> =>
+      ({ disposition: "created", value: { checkpoint, leaves } })),
+    getTenantTelemetryCaptureBackupCheckpoint: vi.fn(async () => ({ checkpoint, leaves })),
+    assertTenantTelemetryCaptureBackupCheckpointUnchanged: vi.fn(async () => {}),
+  };
+  state.captureRecord = { checkpoint, leaves } as unknown as NonNullable<typeof state.captureRecord>;
+  return { checkpoint, leaves };
 }
 
 describe("MySQL full logical schema v2 table definition contract", () => {
@@ -240,6 +319,181 @@ describe("MySQL full logical schema v2 table definition contract", () => {
 });
 
 describe("MySQL encrypted backup artifact core", () => {
+  it("preserves the exact v1 envelope, AAD and provider-evidence algorithms for verified-inactive sources", async () => {
+    const created = await createMySqlBackupArtifact(options);
+    expect(created.manifest.version).toBe(1);
+    const bytes = await readFile(join(directory, `${BACKUP}.asmbak`));
+    expect(bytes.subarray(0, 8)).toEqual(MYSQL_BACKUP_ARTIFACT_MAGIC);
+    expect(encodeArtifactManifest(created.manifest, options.maxBytes)).toEqual(Buffer.from(canonicalJson(created.manifest)));
+    const { ciphertextBytes: _bytes, ciphertextSha256: _hash, encryption, ...body } = created.manifest;
+    expect(artifactAad(created.manifest)).toEqual(Buffer.from(canonicalJson({ ...body,
+      encryption: { algorithm: encryption.algorithm, nonceHex: encryption.nonceHex } })));
+    expect(created.evidence.providerEvidenceSha256).toBe(sha256(canonicalJson({
+      scope: "mysql-logical-full-artifact-provider-evidence-v1", backupId: BACKUP,
+      anchorSha256: created.manifest.anchor.anchorSha256, sourceIdentitySha256: created.manifest.sourceIdentitySha256,
+      schemaMigrationRootSha256: created.manifest.schemaMigrationRootSha256, schemaSha256: created.manifest.schemaSha256,
+      sourceSnapshotSha256: created.manifest.plaintextSha256, sourceBackupSha256: sha256(bytes),
+      artifactManifestSha256: sha256(canonicalJson(created.manifest)),
+    })));
+    expect(options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint).toHaveBeenCalledTimes(3);
+  });
+
+  it("seals before the dump, authenticates all 49 families including pending/reserved/unknown, and checks drift before publication", async () => {
+    const record = activeCheckpoint(); const store = options.captureCheckpointStore;
+    const seal = vi.mocked(store.sealTenantTelemetryCaptureBackupCheckpoint);
+    const unchanged = vi.mocked(store.assertTenantTelemetryCaptureBackupCheckpointUnchanged);
+    seal.mockImplementation(async () => {
+      expect(state.calls.some((call) => call.args.includes("--single-transaction"))).toBe(false);
+      return { disposition: "created", value: record };
+    });
+    unchanged.mockImplementation(async (input) => {
+      expect(state.calls.some((call) => call.args.includes("--single-transaction"))).toBe(true);
+      expect(input.checkpointSha256).toBe(record.checkpoint.checkpointSha256);
+      await expect(stat(join(directory, `${BACKUP}.asmbak`))).rejects.toHaveProperty("code", "ENOENT");
+    });
+    const created = await createMySqlBackupArtifact(options);
+    expect(created.manifest).toMatchObject({ version: 2, scope: "mysql-logical-full-artifact-v2", captureCheckpoint: record.checkpoint });
+    expect(created.manifest.version === 2 && created.manifest.captureCheckpoint.families).toHaveLength(49);
+    expect(created.manifest.version === 2 && created.manifest.captureCheckpoint.legacyUnknownCount).toBe(1);
+    expect(canonicalJson(created.manifest)).not.toContain("record-0");
+    const bytes = await readFile(join(directory, `${BACKUP}.asmbak`));
+    expect(bytes.subarray(0, 8)).toEqual(MYSQL_BACKUP_ARTIFACT_V2_MAGIC);
+    expect(created.evidence.sourceBackupSha256).toBe(sha256(bytes));
+    expect(unchanged).toHaveBeenCalledTimes(2);
+    // A historical authenticated artifact remains verifiable after the live
+    // source changes. Verification must never call the current-source audit.
+    unchanged.mockClear().mockRejectedValue(new Error("source-now-changed")); seal.mockClear();
+    const verified = await verify(created.evidence); await verified.close();
+    expect(unchanged).not.toHaveBeenCalled(); expect(seal).not.toHaveBeenCalled();
+  });
+
+  it.each([1, 2])("authenticates existing v%s bytes without resealing after publication advances live catalog/source head", async (version) => {
+    if (version === 2) activeCheckpoint();
+    const created = await createMySqlBackupArtifact(options);
+    const original = await readFile(join(directory, `${BACKUP}.asmbak`));
+    // The private driver models the live-store audit refusing the now-advanced
+    // catalog/source. The original immutable checkpoint remains in actual SQL.
+    const seal = vi.mocked(options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint)
+      .mockClear().mockRejectedValue(new Error("catalog-head-advanced-after-publish"));
+    const unchanged = vi.mocked(options.captureCheckpointStore.assertTenantTelemetryCaptureBackupCheckpointUnchanged)
+      .mockClear().mockRejectedValue(new Error("live-source-advanced-after-publish"));
+    const binding = vi.mocked(assertMysqlSessionStoreDatabaseBinding).mockClear().mockRejectedValue(new Error("live-store-now-unavailable"));
+    state.invalidInactiveControls = true; state.inactiveFootprint = 1;
+    state.dumpBytes = Buffer.from("later-live-source-that-must-not-replace-the-original-dump");
+    const replay = await createMySqlBackupArtifact(options);
+    expect(replay).toEqual({ ...created, disposition: "exact_replay" });
+    expect(seal).not.toHaveBeenCalled(); expect(unchanged).not.toHaveBeenCalled();
+    expect(binding).not.toHaveBeenCalled();
+    expect(state.calls.filter((call) => call.args.includes("--single-transaction"))).toHaveLength(1);
+    await expect(readFile(join(directory, `${BACKUP}.asmbak`))).resolves.toEqual(original);
+  });
+
+  it("still rejects missing actual historical checkpoint/leaves on existing v2 replay without replacing bytes or redumping", async () => {
+    activeCheckpoint(); await createMySqlBackupArtifact(options);
+    const path = join(directory, `${BACKUP}.asmbak`); const original = await readFile(path);
+    const seal = vi.mocked(options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint).mockClear();
+    state.captureRecord = undefined;
+    await expect(createMySqlBackupArtifact(options)).rejects.toHaveProperty("code", "capture_checkpoint_source_mismatch");
+    expect(seal).not.toHaveBeenCalled();
+    expect(state.calls.filter((call) => call.args.includes("--single-transaction"))).toHaveLength(1);
+    await expect(readFile(path)).resolves.toEqual(original);
+  });
+
+  it("requires an actual checkpoint store and a correct protected key rather than silently creating an active v1 artifact", async () => {
+    await expect(createMySqlBackupArtifact({ ...options, captureCheckpointStore: undefined as never }))
+      .rejects.toHaveProperty("code", "capture_checkpoint_store_required");
+    activeCheckpoint(); delete options.tenantTelemetryRefKey;
+    await expect(createMySqlBackupArtifact(options)).rejects.toHaveProperty("code", "capture_ref_key_required");
+    expect(state.calls).toHaveLength(0);
+    await expect(stat(join(directory, `${BACKUP}.asmbak`))).rejects.toHaveProperty("code", "ENOENT");
+  });
+
+  it.each([1, 2])("rejects failed source-store binding before any v%s seal, dump or artifact publication", async (version) => {
+    if (version === 2) activeCheckpoint(); // Even identical historical rows cannot substitute for live source binding.
+    const seal = vi.mocked(options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint);
+    const binding = vi.mocked(assertMysqlSessionStoreDatabaseBinding).mockRejectedValueOnce(new Error("unit-driver-wrong-database"));
+    await expect(createMySqlBackupArtifact(options)).rejects.toHaveProperty("code", "artifact_create_failed");
+    expect(binding).toHaveBeenCalledOnce(); expect(seal).not.toHaveBeenCalled(); expect(state.calls).toHaveLength(0);
+    expect(binding.mock.calls[0]![0]).toBe(options.captureCheckpointStore);
+    await expect(stat(join(directory, `${BACKUP}.asmbak`))).rejects.toHaveProperty("code", "ENOENT");
+  });
+
+  it("passes the actual locked source UUID/database and bounded operation signal to binding before seal", async () => {
+    const binding = vi.mocked(assertMysqlSessionStoreDatabaseBinding);
+    binding.mockImplementationOnce(async (_store, expected, context) => {
+      expect(expected).toEqual({ serverUuid: "11111111-1111-1111-1111-111111111111", database: "source_test" });
+      expect(context.timeoutMs).toBeGreaterThan(0); expect(context.timeoutMs).toBeLessThanOrEqual(options.deadlineMs);
+      expect(context.operationAbortSignal).toBeInstanceOf(AbortSignal);
+      expect(state.calls).toHaveLength(0);
+      expect(options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint).not.toHaveBeenCalled();
+    });
+    await createMySqlBackupArtifact(options);
+    expect(binding).toHaveBeenCalledOnce();
+    expect(binding.mock.calls[0]![0]).toBe(options.captureCheckpointStore);
+    expect(binding.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint).mock.invocationCallOrder[0]!);
+  });
+
+  it.each(["footprint", "empty_result", "missing_control"])("rejects a false inactive store result against actual MySQL %s", async (kind) => {
+    if (kind === "footprint") state.inactiveFootprint = 1;
+    if (kind === "empty_result") state.missingInactiveResult = true;
+    if (kind === "missing_control") state.invalidInactiveControls = true;
+    await expect(createMySqlBackupArtifact(options)).rejects.toHaveProperty("code", "capture_inactive_source_invalid");
+    expect(state.calls).toHaveLength(0);
+    await expect(stat(join(directory, `${BACKUP}.asmbak`))).rejects.toHaveProperty("code", "ENOENT");
+  });
+
+  it("rejects a caller-owned store whose checkpoint is absent or different in the actual locked MySQL source", async () => {
+    activeCheckpoint(); state.captureRecord = undefined;
+    await expect(createMySqlBackupArtifact(options)).rejects.toHaveProperty("code", "capture_checkpoint_source_mismatch");
+    expect(state.calls).toHaveLength(0);
+    await expect(stat(join(directory, `${BACKUP}.asmbak`))).rejects.toHaveProperty("code", "ENOENT");
+  });
+
+  it("rejects omitted actual leaves, source drift and inactive-to-active transition before any artifact publication", async () => {
+    const record = activeCheckpoint();
+    vi.mocked(options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint)
+      .mockResolvedValueOnce({ disposition: "created", value: { ...record, leaves: [] } });
+    await expect(createMySqlBackupArtifact(options)).rejects.toHaveProperty("code", "capture_checkpoint_invalid");
+    expect(state.calls).toHaveLength(0);
+    vi.mocked(options.captureCheckpointStore.assertTenantTelemetryCaptureBackupCheckpointUnchanged)
+      .mockRejectedValueOnce(new Error("private-source-drift"));
+    await expect(createMySqlBackupArtifact(options)).rejects.toHaveProperty("code", "artifact_create_failed");
+    await expect(stat(join(directory, `${BACKUP}.asmbak`))).rejects.toHaveProperty("code", "ENOENT");
+    vi.mocked(options.captureCheckpointStore.sealTenantTelemetryCaptureBackupCheckpoint).mockResolvedValueOnce(null);
+    state.captureRecord = undefined;
+    await expect(createMySqlBackupArtifact(options)).rejects.toHaveProperty("code", "capture_checkpoint_changed");
+    await expect(stat(join(directory, `${BACKUP}.asmbak`))).rejects.toHaveProperty("code", "ENOENT");
+  });
+
+  it("rejects v2 checkpoint/AAD tampering, missing/wrong ref keys and magic downgrade without importing", async () => {
+    activeCheckpoint(); await createMySqlBackupArtifact(options);
+    const path = join(directory, `${BACKUP}.asmbak`); const original = await readFile(path);
+    await expect(verifyMySqlBackupArtifact({ ...options, tenantTelemetryRefKey: undefined, backupId: BACKUP }))
+      .rejects.toHaveProperty("code", "capture_ref_key_required");
+    await expect(verifyMySqlBackupArtifact({ ...options, tenantTelemetryRefKey: Buffer.alloc(32, 0x62), backupId: BACKUP }))
+      .rejects.toHaveProperty("code", "capture_checkpoint_invalid");
+    await rewriteManifest((manifest) => {
+      if (manifest.version !== 2) throw new Error("expected v2 fixture");
+      const { checkpointSha256: _hash, ...body } = manifest.captureCheckpoint;
+      body.logsTargetSha256 = digest("7");
+      manifest.captureCheckpoint = { ...body, checkpointSha256: sha256(`${body.scope}\0${canonicalJson(body)}`) };
+    });
+    await expect(verify()).rejects.toHaveProperty("code", "authentication_failed");
+    const downgraded = Buffer.from(original); MYSQL_BACKUP_ARTIFACT_MAGIC.copy(downgraded);
+    await writeFile(path, downgraded); await expect(verify()).rejects.toHaveProperty("code", "artifact_format_invalid");
+    expect(state.imported).toHaveLength(0);
+  });
+
+  it("binds v2 restore operations to the exact checkpoint and protected key before importing held authenticated bytes", async () => {
+    activeCheckpoint(); const created = await createMySqlBackupArtifact(options); const verified = await verify(created.evidence);
+    const operator = await acquireMySqlBackupArtifactOperator({ ...options, targetUrl: TARGET });
+    try {
+      await operator.bindRestoreOperation({ manifest: verified.manifest, evidence: verified.evidence, restoreRunId: RUN, runtimeEpochSha256: epoch });
+      await importVerifiedMySqlBackupArtifact(verified, { ...options, targetUrl: TARGET, operator, restoreRunId: RUN, runtimeEpochSha256: epoch });
+      expect(state.imported).toEqual(state.dumpBytes);
+    } finally { await operator.close(); await verified.close(); }
+  });
+
   it("creates real authenticated bytes, derives all evidence, and exact replay actually verifies", async () => {
     const created = await createMySqlBackupArtifact(options);
     expect(created.disposition).toBe("created");

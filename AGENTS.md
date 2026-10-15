@@ -2,9 +2,10 @@
 
 ## 本worktree的最新M1开发检查点（2026-10-15）
 
-- 用户明确允许独立树提前编码及纯测试，覆盖下方旧“CI全绿前不得编码”的开始时序；现原2932318的Actions38714666463也已五项全success，watch61689已exit0不再等待。仍不得合入、部署或激活，真实MySQL/MinIO只由root统一隔离执行，不争用资源。
-- 仅新`tenant-telemetry-capture-restore.ts`及其纯测试，source34e9029c/test26a69158，最终101passed零fail/skip、typecheck/scan700/diffcheck通过；49固定投影对应47个当前DDL真实表，checkpoint保留合法pending/reserved/written/legacyunknown。四契约只是必要完整性/lineage条件，不是真实DB/source授权，尚未被Memory/MySQL/backup/restore/worker消费。
-- 下一包必须一次纵向接入checkpoint与dump前后对账、新加密manifest/AAD、0031来源/预留与0030prepare/replay/activation、历史读、新epoch新写及旧operation新claim恢复。旧receipt/descriptor不可改写、旧claim不得复活；reserved-before-create也须exact descriptor继续而不是永久ACK-only。不得以纯codec/小样本替代完整恢复闭环，0054primary-only删除资格、0037grant、外部删除/自动清理off与completion=false保持。M1未冻结/M2冻结/M3未开始。
+- 原2932318的Actions38714666463五项全success，旧watch61689已exit0；不再等待或重启。用户已授权提前编码与后续新隔离MySQL/MinIO验证，root唯一执行测试/构建/DB/Git；author只编写和只读审查，freeze后不得擅改。仍不合入、推送、部署或激活当前未闭环纵向包。
+- 实际Memory/MySQL checkpoint及0031/0030 prepare sidecar已接线；49-family保留合法queued/reserved/written/legacyunknown，不套用0054全ACK删除资格。Memory backend envelope不与MySQL物理备份互认。新dump要求实际来源锁定、完整关系审计及前后零漂移；已有加密制品exact replay只验实际字节/不可变历史checkpoint，不重新seal或要求今日head不变。
+- 未发布0055增加3表/6不可变guard，真实隔离MySQL从49-marker基线校准718-trigger完整指纹；只新增schema，不激活/回填/联网。新旧严格指纹不兼容，后续发布仍须停服排空旧writer、独立迁移、只启新binary并forward-fix，不能热混用。最终真实SQL整文件12passed、Memory46passed、历史0054→0055四项和原0053→0054十四项通过；首轮夹具/负例前态失败保留在PROGRESS，不是全量或CI通过。新dump必须先通过成功connect且未close真实store的module-private pool身份核对，不能让同历史wrong-DB store替实际源做live审计；历史artifact重放不添加live依赖。usage引用存在的实际turn时须同session，synthetic/missing legacy turn保持unknown兼容。
+- 下一消费者是严格maintenance-only启动、0030 activation同事务history、新epoch显式cutover与旧pending新claim/renew/reserve/create/ACK。普通pending启动仍硬拒，禁止generic skipAudit/allowMissingSource或重签旧activation。真实MySQL/MinIO制品端到端尚待；不新增服务、JS入口或镜像。0054primary-only删除资格、0037grant、外部删除/自动清理off及completion=false保持。M1未冻结/M2冻结/M3未开始；本树尚未合入独立M4并发修复/压测工具，不能混用其证明。
 
 ## 开发与验证节奏（2026-10-15）
 

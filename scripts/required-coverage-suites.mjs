@@ -88,6 +88,9 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/store/test/tenant-telemetry-application-capture.mysql.test.ts",
   "packages/store/test/tenant-telemetry-application-capture.test.ts",
   "packages/store/test/tenant-telemetry-artifact-observer.unit.test.ts",
+  "packages/store/test/tenant-telemetry-capture-restore.test.ts",
+  "packages/store/test/tenant-telemetry-capture-checkpoint.memory.test.ts",
+  "packages/store/test/tenant-telemetry-capture-checkpoint.mysql.test.ts",
   "packages/store/test/tenant-telemetry-disposition-adapter-memory.test.ts",
   "packages/store/test/tenant-telemetry-disposition-grant-v2-memory-fixture.test.ts",
   "packages/store/test/tenant-telemetry-disposition-grant.mysql.test.ts",
@@ -130,6 +133,13 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:tenant-telemetry-capture-restore": [
+    "packages/store/test/tenant-telemetry-capture-restore.test.ts",
+    "packages/store/test/tenant-telemetry-capture-checkpoint.memory.test.ts"
+  ],
+  "test:tenant-telemetry-capture-restore-mysql": [
+    "packages/store/test/tenant-telemetry-capture-checkpoint.mysql.test.ts"
+  ],
   "test:tenant-telemetry-lifecycle": [
     "packages/store/test/tenant-telemetry-lifecycle.test.ts"
   ],

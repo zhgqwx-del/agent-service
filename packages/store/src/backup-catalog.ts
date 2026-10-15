@@ -869,22 +869,29 @@ export interface PrepareTenantRestoreReplayFromBackupInput {
   controlEvidenceSha256: string;
   sealedTargets: TenantRestoreReplaySealedTarget[];
   reservation: TenantBackupRuntimeReservationAdapterResult;
+  /** Only present for an authenticated v2 artifact; never infer from live control. */
+  captureCheckpointSha256?: string;
 }
 
 export interface PreflightTenantRestoreReplayFromBackupInput {
   backupId: string;
   restoreRunId: string;
   runtimeEpochSha256: string;
+  /** Absence is v1, not permission to discover or synthesize a checkpoint. */
+  captureCheckpointSha256?: string;
 }
 
 export function validatePreflightTenantRestoreReplayFromBackupInput(
   input: PreflightTenantRestoreReplayFromBackupInput,
 ): void {
-  exactKeys(input, ["backupId", "restoreRunId", "runtimeEpochSha256"],
+  const hasCheckpoint = Object.hasOwn(input, "captureCheckpointSha256");
+  exactKeys(input, ["backupId", "restoreRunId", "runtimeEpochSha256",
+    ...(hasCheckpoint ? ["captureCheckpointSha256"] : [])],
     "tenant backup restore preflight input");
   backupId(input.backupId);
   restoreRunId(input.restoreRunId);
   digest(input.runtimeEpochSha256, "tenant backup restore preflight epoch");
+  if (hasCheckpoint) digest(input.captureCheckpointSha256!, "tenant backup restore capture checkpoint");
 }
 
 export interface PrepareTenantRestoreReplayFromBackupValue {

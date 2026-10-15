@@ -122,12 +122,13 @@ function artifactHarness(state: Harness) {
   });
   const verifiedClose = vi.fn(async () => { calls.push("verified.close"); });
   const manifest = (anchor: Created["manifest"]["anchor"]) => ({
+    version: 1, scope: "mysql-logical-full-artifact-v1",
     backupId: anchor.backupId, anchor, schemaMigrationRootSha256: anchor.schemaMigrationRootSha256,
   } as Created["manifest"]);
   const acquire = vi.fn(async () => { calls.push("operator.acquire"); return operator; });
-  const create = vi.fn(async (input: Parameters<Api["createMySqlBackupArtifact"]>[0]) => {
+  const create = vi.fn(async (input: Parameters<Api["createMySqlBackupArtifact"]>[0]): Promise<Created> => {
     calls.push("artifact.create");
-    return { disposition: "created" as const, manifest: manifest(input.anchor), evidence };
+    return { disposition: "created", manifest: manifest(input.anchor), evidence };
   });
   const verify = vi.fn(async (input: Parameters<Api["verifyMySqlBackupArtifact"]>[0]) => {
     calls.push("artifact.verify");
@@ -420,9 +421,109 @@ describe("backup catalog artifact CLI orchestration", () => {
     expect(artifacts.verify.mock.invocationCallOrder[0]).toBeLessThan(publish.mock.invocationCallOrder[0]!);
     expect(publish.mock.invocationCallOrder[0]).toBeLessThan(artifacts.operator.close.mock.invocationCallOrder[0]!);
     expect(publish.mock.calls[0]![0]).toMatchObject(artifacts.evidence);
+    expect(artifacts.create.mock.calls[0]![0].captureCheckpointStore).toBe(state.store);
+    expect(state.connectStore.mock.calls.at(-1)![0].tenantTelemetryCaptureRestoreLocalOnly).toBe(true);
     expect(JSON.parse(state.output.at(-1)!)).toMatchObject({ command: "create-artifact", artifactVerified: true, ...artifacts.evidence });
     expect(state.output.join("\n")).not.toContain("/private/");
     expect(artifacts.verifiedClose).toHaveBeenCalledOnce();
+  });
+
+  it("rechecks a v2 source after bytes authentication and refuses external publication on drift", async () => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    // Orchestration-only fixture: actual checkpoint/leaf authentication is covered
+    // by the artifact pipeline and isolated MySQL tests, not this partial mock.
+    const checkpointSha256 = sha256("actual-sealed-checkpoint");
+    artifacts.verify.mockImplementationOnce(async (input) => ({
+      manifest: { version: 2, anchor: input.expectedAnchor!, captureCheckpoint: { checkpointSha256 } } as never,
+      evidence: artifacts.evidence, close: artifacts.verifiedClose,
+    }));
+    const unchanged = vi.spyOn(state.store, "assertTenantTelemetryCaptureBackupCheckpointUnchanged")
+      .mockRejectedValueOnce(new Error("private-live-source-drift"));
+    const publish = vi.spyOn(state.catalogAdapter, "publishAvailability");
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies)).rejects.toThrow();
+    expect(unchanged).toHaveBeenCalledWith({ backupId: BACKUP_ID_1, checkpointSha256,
+      fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
+    expect(artifacts.verify.mock.invocationCallOrder[0]).toBeLessThan(unchanged.mock.invocationCallOrder[0]!);
+    expect(publish).not.toHaveBeenCalled(); expect(artifacts.verifiedClose).toHaveBeenCalledOnce();
+  });
+
+  it.each([1, 2])("replays already-published v%s exact evidence despite current source/catalog head drift", async (version) => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    const publishedBefore = await state.catalogAdapter.inspectAvailability(BACKUP_ID_1);
+    const headBefore = await state.catalogAdapter.readHead();
+    expect(headBefore.catalogSequence).toBeGreaterThan(0);
+    const manifest = (anchor: Parameters<typeof artifacts.create>[0]["anchor"]) => ({ version, anchor,
+      schemaMigrationRootSha256: anchor.schemaMigrationRootSha256,
+      ...(version === 2 ? { captureCheckpoint: { checkpointSha256: sha256("historical-checkpoint") } } : {}),
+    } as never);
+    // The real producer independently authenticates actual historical SQL leaves;
+    // these mocks isolate CLI's exact-replay publication ordering only.
+    artifacts.create.mockImplementationOnce(async (input) => ({ disposition: "exact_replay", manifest: manifest(input.anchor), evidence: artifacts.evidence }));
+    artifacts.verify.mockImplementationOnce(async (input) => ({ manifest: manifest(input.expectedAnchor!), evidence: artifacts.evidence, close: artifacts.verifiedClose }));
+    const seal = vi.spyOn(state.store, "sealTenantTelemetryCaptureBackupCheckpoint").mockRejectedValue(new Error("current-head-advanced"));
+    const unchanged = vi.spyOn(state.store, "assertTenantTelemetryCaptureBackupCheckpointUnchanged").mockRejectedValue(new Error("current-source-drift"));
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies)).resolves.toBe(0);
+    expect(seal).not.toHaveBeenCalled(); expect(unchanged).not.toHaveBeenCalled();
+    expect(await state.catalogAdapter.inspectAvailability(BACKUP_ID_1)).toEqual(publishedBefore);
+    expect(await state.catalogAdapter.readHead()).toEqual(headBefore);
+    expect(JSON.parse(state.output.at(-1)!)).toMatchObject({ disposition: "exact_replay", artifactVerified: true, ...artifacts.evidence });
+  });
+
+  it("does not make historical verify-artifact depend on the current mutable source checkpoint", async () => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    const seal = vi.spyOn(state.store, "sealTenantTelemetryCaptureBackupCheckpoint").mockRejectedValue(new Error("source-now-changed"));
+    const unchanged = vi.spyOn(state.store, "assertTenantTelemetryCaptureBackupCheckpointUnchanged").mockRejectedValue(new Error("source-now-changed"));
+    await expect(runBackupCatalogCli(["verify-artifact"], artifactEnv(), state.dependencies)).resolves.toBe(0);
+    expect(seal).not.toHaveBeenCalled(); expect(unchanged).not.toHaveBeenCalled();
+    expect(artifacts.imported).not.toHaveBeenCalled();
+  });
+
+  it("passes only the authenticated selected-v2 hash into preflight before external reservation and same target reprepare", async () => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    const checkpointSha256 = sha256("selected-v2-checkpoint");
+    artifacts.verify.mockImplementationOnce(async (input) => ({
+      manifest: { version: 2, anchor: input.expectedAnchor!, schemaMigrationRootSha256: input.expectedAnchor!.schemaMigrationRootSha256,
+        captureCheckpoint: { checkpointSha256 } } as never,
+      evidence: artifacts.evidence, close: artifacts.verifiedClose,
+    }));
+    const preflightDelegate = state.store.preflightTenantRestoreReplayFromBackup.bind(state.store);
+    const prepareDelegate = state.store.prepareTenantRestoreReplayFromBackup.bind(state.store);
+    // Deliberately isolate field propagation from active-store authorization:
+    // this fixture has inactive capture, so delegate the old inactive payload.
+    const preflight = vi.spyOn(state.store, "preflightTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
+      expect(input.captureCheckpointSha256).toBe(checkpointSha256);
+      const { captureCheckpointSha256: _hash, ...legacy } = input; return preflightDelegate(legacy);
+    });
+    const prepare = vi.spyOn(state.store, "prepareTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
+      expect(input.captureCheckpointSha256).toBe(checkpointSha256);
+      const { captureCheckpointSha256: _hash, ...legacy } = input; return prepareDelegate(legacy);
+    });
+    const reserve = vi.spyOn(state.catalogAdapter, "reserveRestore");
+    await runBackupCatalogCli(["restore-selected"], artifactEnv({ RESTORE_RUN_ID,
+      BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID, BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target" }), state.dependencies);
+    expect(preflight).toHaveBeenCalledTimes(2); expect(prepare).toHaveBeenCalledTimes(2);
+    expect(preflight.mock.invocationCallOrder[0]).toBeLessThan(reserve.mock.invocationCallOrder[0]!);
+    expect(preflight.mock.invocationCallOrder[1]).toBeLessThan(reserve.mock.invocationCallOrder[1]!);
+    expect(prepare.mock.invocationCallOrder[1]).toBeGreaterThan(artifacts.imported.mock.invocationCallOrder[0]!);
+  });
+
+  it("does not infer selected-v1 authority from an unrelated existing checkpoint before reserve/import", async () => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
+    const historical = vi.spyOn(state.store, "getTenantTelemetryCaptureBackupCheckpoint").mockResolvedValue({
+      checkpoint: { checkpointSha256: sha256("unselected-live-checkpoint") }, leaves: [],
+    } as never);
+    const preflight = vi.spyOn(state.store, "preflightTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
+      expect(input.captureCheckpointSha256).toBeUndefined(); throw new Error("active-source-requires-selected-v2-checkpoint");
+    });
+    const reserve = vi.spyOn(state.catalogAdapter, "reserveRestore");
+    await expect(runBackupCatalogCli(["restore-selected"], artifactEnv({ RESTORE_RUN_ID,
+      BACKUP_RUNTIME_EPOCH_ID: RESTORE_EPOCH_ID, BACKUP_RESTORE_TARGET_MYSQL_URL: "mysql://fixture@127.0.0.1:3306/isolated_target" }), state.dependencies)).rejects.toThrow();
+    expect(preflight).toHaveBeenCalledOnce(); expect(historical).not.toHaveBeenCalled();
+    expect(reserve).not.toHaveBeenCalled(); expect(artifacts.imported).not.toHaveBeenCalled();
   });
 
   it("closes a constructed catalog client when the later journal factory fails", async () => {
@@ -649,6 +750,7 @@ describe("backup catalog artifact CLI orchestration", () => {
     expect(prepared.mock.invocationCallOrder[0]).toBeLessThan(artifacts.imported.mock.invocationCallOrder[0]!);
     expect(artifacts.imported.mock.invocationCallOrder[0]).toBeLessThan(state.connectStore.mock.invocationCallOrder[1]!);
     expect(state.connectStore.mock.calls[1]![0]).toMatchObject({ migrationMode: "verify", url: "mysql://fixture@127.0.0.1:3306/isolated_target" });
+    expect(state.connectStore.mock.calls.map(([options]) => options.tenantTelemetryCaptureRestoreLocalOnly)).toEqual([true, true]);
     expect(prepared.mock.invocationCallOrder[1]).toBeLessThan(artifacts.operator.markRestorePrepared.mock.invocationCallOrder[0]!);
     expect(JSON.parse(state.output.at(-1)!)).toMatchObject({ command: "restore-selected", restorePhase: "prepared", runtimeActivated: false, fenceReplayComplete: false });
   });
@@ -688,6 +790,7 @@ describe("backup catalog CLI", () => {
     const state = createHarness();
     await runBackupCatalogCli(["status"], baseEnv(), state.dependencies);
     expect(state.connectStore.mock.calls.at(-1)![0].tenantTelemetryRefKey).toBeUndefined();
+    expect(state.connectStore.mock.calls.at(-1)![0].tenantTelemetryCaptureRestoreLocalOnly).toBeUndefined();
     const key = Buffer.alloc(32, 0x29);
     state.dependencies.readRefKey = async () => key;
     state.connectStore.mockImplementation(async (input) => {

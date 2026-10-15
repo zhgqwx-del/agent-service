@@ -3,6 +3,9 @@ import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { tenantTelemetryRefKeyIdSha256 } from "../src/tenant-telemetry-lifecycle.js";
 import * as codec from "../src/tenant-telemetry-capture-restore.js";
+import { validatePreflightTenantRestoreReplayFromBackupInput } from "../src/backup-catalog.js";
+import { readTenantTelemetryCaptureCheckpointFromMysql } from "../src/mysql/tenant-telemetry-capture-checkpoint.js";
+import type { Connection } from "mysql2/promise";
 
 // Pure, synthetic codec fixtures. None proves a database row, an actual backup,
 // a current source-valid operation, a physical object or an operator ACK.
@@ -106,6 +109,74 @@ function fixture(options: FixtureOptions = {}) {
 const rejected = (work: () => unknown) => expect(work).toThrow(codec.TenantTelemetryCaptureRestoreIntegrityError);
 const createPermit = (f: ReturnType<typeof fixture>, input = f.recoveryInput) =>
   codec.createTenantTelemetryCaptureOperationRecoveryPermit(input, f.cutover, f.history, f.checkpoint, f.leaves, key);
+
+describe("actual MySQL checkpoint reader boundary (pure driver doubles, not DB proof)", () => {
+  function source() {
+    const f = fixture();
+    const header = { backup_id: backupId, anchor_sha256: f.checkpoint.anchorSha256,
+      checkpoint_sha256: f.checkpoint.checkpointSha256, ref_key_id_sha256: f.checkpoint.refKeyIdSha256,
+      sealed_at_db_ms: f.checkpoint.sealedAtDbMs, checkpoint_json: f.checkpoint };
+    const rows = f.leaves.map((row) => ({ backup_id: backupId, family: row.family,
+      identity_ref_sha256: row.identityRefSha256, record_hmac_sha256: row.recordHmacSha256,
+      knowledge: row.knowledge, state: row.state, source_high_water_db_ms: row.sourceHighWaterDbMs }));
+    const calls: { sql: string; parameters: unknown[] }[] = [];
+    let headers: unknown[] = [header], leaves: unknown[] = rows;
+    const executor = { async query(sql: string, parameters: unknown[]) {
+      calls.push({ sql, parameters });
+      return [sql.includes("FROM tenant_telemetry_capture_backup_checkpoint_leaves") ? leaves : headers, []];
+    } } as unknown as Connection;
+    return { ...f, header, rows, executor, calls,
+      setHeaders: (value: unknown[]) => { headers = value; },
+      setLeaves: (value: unknown[]) => { leaves = value; } };
+  }
+  it("reads every persisted leaf from the supplied connection and returns an isolated snapshot", async () => {
+    const f = source();
+    const result = await readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key);
+    expect(result).toEqual({ checkpoint: f.checkpoint, leaves: f.leaves });
+    expect(result!.checkpoint).not.toBe(f.checkpoint);
+    expect(f.calls).toHaveLength(2);
+    for (const call of f.calls) {
+      expect(call.parameters).toEqual([backupId]);
+      expect(call.sql).not.toContain(backupId);
+    }
+    expect(f.calls[1]!.sql).toContain(`LIMIT ${codec.TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES + 1}`);
+  });
+  it("does not interpret missing historic header and leaves as verified inactive capture", async () => {
+    const f = source(); f.setHeaders([]); f.setLeaves([]);
+    expect(await readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key)).toBeNull();
+  });
+  it("rejects orphan leaves rather than treating a missing header as no capture", async () => {
+    const f = source(); f.setHeaders([]);
+    await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key)).rejects.toThrow();
+  });
+  it("binds the JSON backup ID independently of matching outer row columns", async () => {
+    const f = source(); const other = codec.createTenantTelemetryCaptureBackupCheckpoint({ ...header(),
+      backupId: "backup_00000000-0000-4000-8000-000000000004" }, f.leaves, key);
+    f.setHeaders([{ ...f.header, checkpoint_json: other, checkpoint_sha256: other.checkpointSha256 }]);
+    await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key)).rejects.toThrow();
+  });
+  it.each(["anchor_sha256", "checkpoint_sha256", "ref_key_id_sha256", "backup_id"] as const)(
+    "rejects the changed physical header column %s", async (column) => {
+      const f = source(); f.setHeaders([{ ...f.header, [column]: h("changed-header-column") }]);
+      await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key)).rejects.toThrow();
+    },
+  );
+  it("requires the independent protected key and rejects a missing original leaf", async () => {
+    const f = source();
+    await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, wrongKey)).rejects.toThrow();
+    f.setLeaves(f.rows.slice(1));
+    await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key)).rejects.toThrow();
+  });
+  it("rejects a duplicate source leaf even when the copied row is otherwise exact", async () => {
+    const f = source(); f.setLeaves([...f.rows, f.rows[0]!]);
+    await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key)).rejects.toThrow();
+  });
+  it("rejects malformed backup IDs before sending any SQL", async () => {
+    const f = source();
+    await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, "backup_' OR 1=1", key)).rejects.toThrow();
+    expect(f.calls).toHaveLength(0);
+  });
+});
 
 describe("capture restore fixed physical projection contract", () => {
   it("contains exactly 49 distinct families, real existing SQL tables and explicit special subprojections", () => {
@@ -231,6 +302,34 @@ describe("capture restore fixed physical projection contract", () => {
     expect(checkpoint.originalRuntimeEpochSha256).toBe(header().originalRuntimeEpochSha256);
     rejected(() => codec.createTenantTelemetryCaptureBackupCheckpoint({ ...restored, sourceHistoryReceiptSha256: null }, [], key));
     rejected(() => codec.createTenantTelemetryCaptureBackupCheckpoint({ ...restored, sourceCaptureCutoverReceiptSha256: null }, [], key));
+  });
+});
+
+describe("authenticated-artifact capture checkpoint selection", () => {
+  const base = {
+    backupId: "backup_00000000-0000-4000-8000-000000000001",
+    restoreRunId: "restore_00000000-0000-4000-8000-000000000002",
+    runtimeEpochSha256: h("selection-new-epoch"),
+  };
+  it("preserves the exact legacy v1 input shape", () => {
+    expect(() => validatePreflightTenantRestoreReplayFromBackupInput(base)).not.toThrow();
+  });
+  it("accepts a v2 digest as syntax, not evidence of an authenticated artifact", () => {
+    expect(() => validatePreflightTenantRestoreReplayFromBackupInput({
+      ...base, captureCheckpointSha256: h("selected-authenticated-checkpoint"),
+    })).not.toThrow();
+  });
+  it.each([undefined, null, "", "A".repeat(64), "0".repeat(63), 1])(
+    "does not downgrade an explicit invalid checkpoint %j into a v1 selection", (captureCheckpointSha256) => {
+      expect(() => validatePreflightTenantRestoreReplayFromBackupInput({
+        ...base, captureCheckpointSha256,
+      } as unknown as Parameters<typeof validatePreflightTenantRestoreReplayFromBackupInput>[0])).toThrow();
+    },
+  );
+  it("rejects caller authority fields instead of accepting a supplied snapshot", () => {
+    expect(() => validatePreflightTenantRestoreReplayFromBackupInput({
+      ...base, captureCheckpointSha256: h("checkpoint"), sourceVerified: true,
+    } as unknown as Parameters<typeof validatePreflightTenantRestoreReplayFromBackupInput>[0])).toThrow();
   });
 });
 
