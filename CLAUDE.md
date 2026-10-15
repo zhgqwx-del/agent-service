@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+开发节奏已按用户效率要求调整：小改动做定向验证，真实SQL/删除/权限负例不延后；功能包冻结后全量，本地/CI较大阶段集中提交推送，不每轮重复等待GitHub。当前验证去重候选保留旧86个main-required、补27个遗漏具名文件及2个工具回归，共115；62个具名group只从同一次主coverage报告出具子集证明。独立S3/history/cluster/实际bundle与VM装配保留，默认关闭/0037硬拒与M1/M2/M3结论不变。工具定向119 passed、API/typecheck/secrets684通过；尚未执行候选整树verify或新CI，不借817c144旧代码的CI为其背书，详见PROGRESS末节。
+
 **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
 
 以下M4原始说明与main回补候选快照为历史原文，仅保留当时事实；当前结论以上方检查点和PROGRESS末节为准。

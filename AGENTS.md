@@ -1,5 +1,11 @@
 # agent-service 协作约定
 
+## 开发与验证节奏（2026-10-15）
+
+- 日常小改动先做类型检查和影响范围内定向测试；SQL/事务/删除/鉴权改动仍立即做对应真实服务、并发/回滚/隔离负例。可积累多轮已定向验证的相关修改，一个功能包冻结后才做完整`verify`及相关`verify-s3`；发布门禁不省略。
+- GitHub CI在较大阶段集中推送后验收，不为每个小补丁/文档更新反复push、取消并重跑长CI。主coverage候选入口为`pnpm test:coverage`，以本轮独占JSON、真实子进程退出状态、exact文件/零skip及原coverage门槛证明执行；具名group是同次执行的子集，不重复计数。历史迁移、S3、cluster、SDK和实际bundle/VM装配仍独立执行。该去重改造的整树验收状态只看PROGRESS末节，不借旧报告。
+- 此流程调整不缩减整体架构目标，不改变M1未冻结/M2冻结/M3未开始，也不授权开启任何默认关闭的删除、grant或恢复能力。
+
 > **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
 
 以下M4原始说明与main回补候选快照为历史原文，仅保留当时事实；当前结论以上方检查点和PROGRESS末节为准。

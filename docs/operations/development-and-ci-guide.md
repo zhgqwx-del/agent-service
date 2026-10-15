@@ -1336,6 +1336,16 @@ quarantine是数据库完整性故障路径，不应通过普通手工体验故�
 
 ## 6. 分层验证路径
 
+### 日常迭代与阶段验收（验证去重候选，2026-10-15）
+
+不必每次小改动都运行数小时全量。每轮先做`pnpm typecheck`及相关`pnpm test:<专项>`；涉及SQL、事务、删除、鉴权或租户边界时，当轮仍须执行相关真实MySQL/Redis/MinIO及并发、回滚、隔离负例。连续多轮定向通过后，在一个可验收功能包的代码/接口冻结点运行完整`verify`，触及S3/备份/恢复时还须`verify-s3`。全量失败先定位并定向修复，再对最终候选补齐完整验收，不用失败前的旧报告证明新代码通过。
+
+本候选新增`pnpm test:verification-tools`用于纯校验器/清单回归；`pnpm test:coverage`是主套件单次执行入口，必须先准备独立可丢弃MySQL/Redis测试环境，它不是无基础设施的快速测试。入口不接受过滤参数，强制真实integration profile，以独占`.local-run/coverage-attempt-*/tests.json`绑定本轮子进程退出结果和时间，再校验115个required文件各唯一、非零test case且全部passed，以及原coverage阈值。旧便利路径`.local-run/verify-tests.json`仅在成功后更新，不可单独当新执行证明。62个旧具名命令映射仍供审计，group数字是主执行的子集，不另加到总数；所有原定向命令保留供开发使用。
+
+只移除环境与覆盖目标等价的重复执行：S3专用flag/MinIO、历史独立config/冻结binary、真实多进程cluster/T3g、SDK、实际bundle与clean VM双包/归档启动仍分别验收。并行重型CI须先隔离每个job的MySQL/Redis/目录，当前本机共享测试资源不能盲开并发。CI在较大阶段集中推送后验收，避免连续push取消长任务；不能拿本地macOS或旧SHA的绿灯代替最终Linux/发布提交证明。
+
+当前去重候选只有工具119项和静态检查通过，完整新driver/整树验收尚待下一功能阶段；尚未测得端到端节省比例，不承诺倍数。本节优先解释下方旧“具名wrapper”描述：日常独立命令仍使用wrapper，main阶段改由同次coverage生成逐文件/具名group证明，不降低必跑范围。
+
 ```bash
 scripts/local-service.sh smoke
 # 无真实模型费用；检查正在运行的服务和路由

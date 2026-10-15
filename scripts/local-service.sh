@@ -655,114 +655,14 @@ verify() {
   pnpm run check:secrets
   pnpm run check:api
   pnpm typecheck
-  pnpm run test:tenant-telemetry-lifecycle
-  pnpm run test:tenant-telemetry-lifecycle-memory
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-telemetry-lifecycle-mysql
-  pnpm run test:tenant-telemetry-application-capture
-  pnpm run test:telemetry-capture-operator
-  pnpm run test:telemetry-operator-key-compatibility
-  pnpm run test:persisted-provider-failure-capture
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:persisted-provider-capture-mysql
-  pnpm run test:tenant-telemetry-retained-source
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-telemetry-retained-source-json-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-telemetry-retained-source-budget-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-telemetry-retained-source-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-telemetry-application-capture-mysql
-  pnpm run test:tenant-telemetry-writer
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-telemetry-writer-mysql
-  pnpm run test:tenant-telemetry-disposition
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-telemetry-disposition-mysql
-  pnpm run test:tenant-telemetry-disposition-grant
-  pnpm run test:tenant-telemetry-disposition-journal-v3
-  pnpm run test:tenant-telemetry-disposition-journal-v3-observer
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-telemetry-disposition-grant-mysql
+  # Execute ordinary main-profile suites once. The driver emits exact, non-skipped
+  # file/group proofs; standalone named commands remain available for development.
   AGENT_SERVICE_INTEGRATION=1 \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \
-    pnpm vitest run --coverage --exclude 'test/cluster/**' \
-      --reporter=default --reporter=json --outputFile.json="$STATE_DIR/verify-tests.json"
-  AGENT_SERVICE_TEST_REPORT="$STATE_DIR/verify-tests.json" node scripts/assert-suites-ran.mjs
+    pnpm run test:coverage
   MYSQL_MIGRATION_TEST_URL="${MYSQL_MIGRATION_TEST_URL:-${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}}" \
     pnpm run test:migrations
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:session-delete-grace-mysql
-  pnpm run test:session-delete-grace-recovery-memory
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:session-delete-grace-recovery-mysql
-  pnpm run test:session-usage-retention-memory
-  pnpm run test:session-usage-retention-worker
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:session-usage-retention-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:session-usage-retention-worker-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:blob-mysql
-  pnpm run test:blob-storage-control-memory
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:blob-storage-control-mysql
-  pnpm run test:tenant-restore-journal-memory
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-restore-journal-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-backup-catalog-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:outbox-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:usage-lifecycle-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:subject-lifecycle-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-credential-revocation-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-credential-physical-revocation-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-credential-lifecycle-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-credential-target-execution-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-runtime-revocation-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-content-inventory-mysql
-  pnpm run test:tenant-purge-plan-memory
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-purge-plan-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-purge-execution-mysql
-  pnpm run test:tenant-database-purge-memory
-  pnpm run test:session-delete-grace-memory
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:tenant-database-purge-mysql
-  pnpm run test:tenant-redis-purge-memory
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \
-    pnpm run test:tenant-redis-purge-mysql
-  REDIS_TEST_URL="${REDIS_TEST_URL:-redis://127.0.0.1:6379/1}" \
-    pnpm run test:tenant-redis-purge-redis
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:retention-policy-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:erasure-purge-policy-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:erasure-job-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:erasure-session-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:erasure-catalog-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:erasure-usage-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:legacy-tombstone-mysql
-  MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
-    pnpm run test:user-data-export-mysql
   AGENT_SERVICE_CLUSTER=1 \
     CLUSTER_MYSQL_URL="${CLUSTER_MYSQL_URL:-mysql://root@127.0.0.1:3306/agent_service_cluster}" \
     CLUSTER_REDIS_URL="${CLUSTER_REDIS_URL:-redis://127.0.0.1:6379/3}" \
@@ -771,7 +671,6 @@ verify() {
     CLUSTER_REDIS_URL="${CLUSTER_REDIS_URL:-redis://127.0.0.1:6379/3}" \
     pnpm run test:tenant-redis-purge-cluster
   pnpm run build:check
-  pnpm run test:vm-release
   # Development verify accepts a dirty copied-byte snapshot, never a publishable release.
   # CI calls check:vm-release without this option and requires exact committed sources.
   pnpm run check:vm-release --allow-dirty-development

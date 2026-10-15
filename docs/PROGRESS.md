@@ -1,5 +1,7 @@
 # 进度记录
 
+> **开发检查点（2026-10-15T05:26Z）**：用户要求减少每小轮数小时全量和远程CI等待，现已形成验证去重候选（未发布）：旧86个main-required完整保留、补27个遗漏具名文件及2工具回归，共115；同环境62组旧命令以一次coverage的精确文件结果出具子集证明，不再重复执行。工具两文件119 passed/0failed/0skipped、API/typecheck、secrets684及shell语法通过；候选完整verify与新CI未执行，旧817c144的CI仍独立验收中，不能借旧报告证明新driver通过。日常定向、阶段末全量、较大阶段集中push的节奏不缩减M1/M3/M4目标或任何默认关闭门禁。详细范围与下一验收包见末节。
+
 > **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
 
 以下顶部旧快照原文属于历史记录，只有上方快照具有当前优先级；完成状态与未完成项还须对照本页末节。
@@ -1364,3 +1366,19 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - 最终两路产品/CI及额外真实S3/加密backup源码兼容review无新增P0–P2；本轮没有重跑MinIO或付费模型，不把静态审查、0054本地fake ACK或旧e411 CI冒充实际S3/新CI通过。对应Linux CI与两个image job必须以main本批提交的实际run验收。文档提交仅校准当前状态/旧版本例外；发布前核对完整diff、diff --check、工作树和main原四份文档/两旧stash，保护后仅fast-forward并推送，不force/reset。
 - 0054产品/SQL自e278前冻结后未变：同primary、creation-complete新tenant、T1前全written/ACK，且全部Blob/export计划域精确零，才有本地T1/T3d/T3e/T3f保留桥。旧receipt不可改，pending/reserved/legacy/mixed/unknown、新epoch、真实grant及外部处置继续拒绝。rollout须先关gate、排空全部pre-0054 writer与在途事务，再独立迁移并核对712-trigger严格指纹，只新writer/forward-fix；不能热混跑或删marker。
 - 当前仍有实质代码缺口：active capture/来源保留的新epoch恢复、可信telemetry授权/外部处置与恢复证明、generic user/session物理purge、完整completion，以及M3主体和M4托管/无DDL runtime bridge/签名晋级/可观测性等，不能写成只缺云资源。全范围锁/规模争用、1MiB容量与人工排空证明仍需staging验证。M1未冻结、M2继续冻结、M3未开始。用户已授权下一停服exact-backup恢复代码及全新隔离MySQL/MinIO测试，但正式实施必须在本批发布验收通过之后，当前只读设计，未提前实现。
+
+## 2026-10-15（分层验证与去重候选；尚未整树验收或发布）
+
+- 用户指出任务已持续五天，要求减少小改动的全量/远程CI频次。只读盘点确认近期主要是M1扩展生命周期的实现、修复、历史兼容和反复验收，另有M4发布包地基，M3主体仍未开始；不是核心Runtime一直不可用，也不是全部只差云资源。上一完整本地verify实际约116分钟。后续以可验收功能包而非每个小修补作为全量边界，SQL/事务/删除/权限仍即时做真实定向负例；较大阶段集中push并等待CI，不减少最终发布门禁。
+- 新main driver以mkdtemp独占JSON、真实Vitest子进程exit0和本轮时间窗口校验结果；禁止调用方过滤参数。原coverage全局阈值及MySQL/Redis/Pi实现底线不变。清单完整保留旧86文件、补27个此前只靠具名重跑保证的文件，并新增两工具回归，共115。62个旧命令/102唯一文件的精确映射仍在仓库，主报告逐文件必须唯一、非零test case、全passed；path suffix冒名、越界、别名/重复、missing、skip/todo、failed、旧report和异常结构均拒绝。group是同一执行的子集，不重复计总数。
+- local verify移除61次、CI移除59次同环境普通具名调用，但package定向脚本全部保留。主coverage继续相同integration/MySQL/Redis/串行配置；14个专用S3文件、历史独立config/冻结binary、cluster与T3g、SDK、实际bundle和VM双包/归档/启动仍独立。未改产品源码、SQL、默认gate、migration或依赖/lock；未操作业务库/外部对象。CI重型并行拆分留作后续独立资源优化，本批不盲并发。
+- root实际执行两工具文件，JSON startTime为2026-10-15T05:24:21.867Z：88+31=119 passed/0failed/0skipped，每文件exact且无nonPassed。typecheck、API check、secret scan684、shell语法通过；独立只读review无新增P0–P2，遗留旧CI注释已校准。这里只证明纯校验器/静态清单，不是新的真实DB、driver全量或CI通过。新整树验证会随下一功能阶段运行，当前未为工具小改动单独push或触发新CI。
+- 已发布817c144与旧R3证明仍独立保留；Actions38676454476的两个image已success，test尚在运行，必须以该run实际终态验收。下一active-capture停服/精确备份/新epoch产品实现已有明确授权，但仍等此批全绿后开始，不能因效率要求跳过条件。
+
+### 有限交付包与退出标准（不缩减整体目标）
+
+M1运行核心单独标为已可用，不再把“有新账本/guard”计作生命周期功能包完成。剩余M1按四个有依赖的端到端包推进：①已授权的在线source停服、实际加密备份→隔离导入→新epoch历史来源审计，旧收据不改且普通续写仍安全门控；②现有受管S3 logs的可信来源授权→真实对象处置→物理ACK→旧快照防复活，不能解开0037却没有独立授权/恢复证明；③普通session/user内容purge，30天与更长policy/hold、usage/billing、Blob/export及受管来源均闭合，不能拿capture默认off推断历史来源为零；④backup-copy保留/删除intent/真实不存在ACK、BYOK本系统责任与支持域恢复/completion汇总。每包须有真实Memory/隔离MySQL/MinIO纵向、并发/回滚/response-loss/历史升级和required执行证据，未知或不支持域仍不可写完成。
+
+M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个新增凭据/Blob来源必须从首版接入tenant/user隔离、T1/restore fence和现有生命周期，不能先留裸secret或让固定目录漏域。M4最终清单保持安全发布运行（独立schema/无DDL runtime桥、VM/OCI托管与签名晋级）、配额/key池/熔断治理、可观测性/容量/分片与故障演练三个包，复用已有发布地基而非重造。此盘点不擅自修改现有M1闭环前正式进入M3的顺序；可独立事项的并行安排须不突破安全前置。
+
+云IAM/KMS、真实TLS/拓扑、独立故障域、managed Redis Cluster与预发/生产RPO/RTO及滚动验收单列为待资源的环境工作，不能用本地MinIO代替；对应本地adapter、配置契约和故障代码仍属于原目标。整体预计工期尚无可靠数据，不能用迁移编号、测试数量或本轮CI剩余时间换算完成百分比；每个包报告实际功能、未完成项与耗时后再修正估计。M1仍未冻结，M2冻结，M3未开始，完整目标保持active。
