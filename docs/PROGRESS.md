@@ -1,5 +1,11 @@
 # 进度记录
 
+> **当前修复后定向检查点（2026-10-15）**：受影响4文件真实54 passed / 零fail或skip（旧provider27、新epoch8、旧writer14、grant5），250.76s，报告 `.local-run/m1m4-0057-count-guard-targeted-20261015.json`；typecheck、secret scan727、diffcheck通过。未发布0057的两处outer EXISTS保留原完整WHERE，改用两个COUNT局部变量再以`>0`/`IS NOT TRUE`判断；旧0053、原27测试、NULL/BINARY/owner/RR条件未改。实际观测为同事务完整native谓词/见证均true而原SP判断false拒绝，具体MySQL内部原因未证明。独立新库校准已完成并清理；本次不是完整verify或CI通过，下方aad整轮exit1保留，历史/cluster/build/VM/S3将以干净修复提交继续、暂未开始。main/origin仍293，尚无新的修复提交SHA，安全门禁不变；精确记录见末节。
+
+> **当前本地组合验收（2026-10-15T17:05:49Z）**：冻结 `aad57d3`（M1 `d4c4060` + M4 `11bbf7b`）的本轮完整 verify 自16:17Z运行至17:05:49Z，真实退出 **1**。主阶段248文件（230 passed / 2 failed / 16 expected skipped）、4273项（4174 passed / 17 failed / 82 expected skipped）；API、typecheck、secret scan727通过。失败为16项旧provider集成用例报告同一native SQL atomic-write guard错误，及1项fresh-schema grant错误oracle不匹配；未据此宣称根因已定位或已修复。主driver在成功proof前退出，不宣称coverage或required文件证明通过；后续history/cluster/build未执行，完整verify-s3/新CI亦未完成。required133/64groups、history50仅登记。main/origin仍293，原CI只证明293；候选未合入main/推送。此前独立定向通过继续保留但不拼成此次全量成功，完整记录见本页末节。M1未冻结/M2冻结/M3未开始及全部默认关闭/0037/0054原primary/completion=false不变。
+
+以下保留历史时间点快照，不覆盖本条最新终态。
+
 > **当前本地集成候选（2026-10-15）**：本分支合并M1检查点`d4c4060`与M4 `11bbf7b`，未合入main或推送；main/origin仍293。仅四facts文档冲突，双方历史保留，代码/manifest自动合并；组合源码待实际定向和一次集中全量，不把下方两树旧证明混作通过。M1未冻结/M2冻结/M3未开始与所有默认门禁不变。最新事实见末节。
 
 > **当前0057未发布纵向候选（2026-10-15T16:10Z）**：真实Pi/HTTP/GCM/MySQL/MinIO完整新epoch纵向1/1、Memory维护51、CLI编排107、真实冻结0056历史5例分别零fail/skip通过。新seal逐operation分类与旧unknown兼容已实际验证；显式`resolve-selected`仅指定active run，未赋普通writer权限。双RR空领取真实复现后，单logs PK预锁的source67d17a9最终MySQL整8/8通过，含实际并发、晚期回滚和written-token冷审计；最终typecheck与secret scan721通过。source2ac上的纵向成功不冒称source67d新全量；当前仍本地b8后未发布，main/origin293及M4未改。完整verify/verify-s3/新CI仍待，不合入/发布或推进M1冻结，所有默认门禁保持。失败、分段与实际report见末节。
@@ -1574,3 +1580,18 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 仅README/AGENTS/CLAUDE/PROGRESS顶部/末节发生文字冲突，保留双方时间点证据并增加本最新状态。MySQL源码和coverage/package自动合并，M4真实缺键INSERT锁修复不替换M1新epoch/permit/gate；组合树仍须独立审查、定向及一次完整verify/相关S3。
 - M4合并前1000-turn仅darwin/arm64/Node24/FakeVendor，不能外推新组合树或生产容量；不因文档或合并重跑原1000。M1合并前真实纵向1、SQL8、Memory51、CLI107、历史5与旧writer14同样不冒称组合整树通过。main/origin仍clean293、旧CI五绿只证明293；M1未冻结、M2冻结、M3未开始，0037/0054原primary/外部删除及自动off/production拒/全域false保持。
 - 合并后MySQL源`0af08ea7`经独立交叉review无新增确定P0–P2，首写唯一INSERT/owner/current reference锁与M1 trusted failure/fence/gate保持。23610整包typecheck与scan735退出0。38887/`m1-m4-combined-targeted-20261015.json`实际3纯文件121passed，但6个MySQL case因root隔离调用未提供该文件必需的MYSQL_TEST_URL而hook未执行、进程exit1；JSON没有hook正文，结论来自显式空环境与fixture首行校验，不把6skip称成功。仅补loopback test基址后11873/`m1-m4-combined-commit-concurrency-20261015.json`整6passed/零fail或skip，产品和时限未改，未重复已过121。当前required133/64group、history50已精确登记；CI镜像新增0057 marker精确COUNT=1检查，不等于CI已执行。接下来冻结组合源码，只做一次完整verify/相关verify-s3，再按阶段发布，避免本地与CI反复全量。
+
+## 2026-10-15（aad57d3 组合完整 verify 退出1，保留通过结果与未执行门禁）
+
+- 冻结clean `aad57d3` 已在本地组合M1 `d4c4060` 与M4 `11bbf7b`；main/origin仍 `2932318`，未合入/推送候选。原Actions `38714666463` 只证明293，不能给本组合背书。root以独立Redis6393与三个新隔离base DB执行本轮完整 `scripts/local-service.sh verify`，16:17Z开始、17:05:49Z真实退出1；原完整日志保留为 `.local-run/m1m4-aad57d3-full-verify-20261015.log`，不覆盖或丢弃失败记录。
+- API、typecheck与secret scan **727 files** 通过。主测试实际 **248 files：230 passed / 2 failed / 16 expected skipped；4273 tests：4174 passed / 17 failed / 82 expected skipped**。16项旧provider集成用例报告同一native SQL atomic-write guard错误，另1项fresh-schema grant错误oracle不匹配；以上是观测分类，不据此猜测更深根因、宣称完成修复或放宽产品/测试门禁。
+- 主coverage driver因测试失败在成功coverage/required文件proof之前退出；不能写coverage门槛通过、required133逐文件通过或64group全部成功。**history、cluster、build及后置门禁未执行**；history50是已注册的真实历史文件清单，不是本轮运行结果。完整 `verify-s3` 和最终新SHA的CI仍待，不能将单条真实S3纵向或旧CI算作该门禁通过。
+- 本轮4174项通过与此前各独立定向/真实历史/纵向/压测结果均保留其实际源码、时间和profile，不被整轮失败抹去，也不拼成一次新的全量成功。下一步按既定节奏定位并修复失败、只复验失败与受影响范围、补未执行门禁；功能包最终发布证据需对应实际源码/提交。不得降低coverage阈值、放大deadline、跳过用例或泛化错误oracle来凑绿，较大阶段再集中一次push和完整CI。
+- 入口文档README/AGENTS/CLAUDE只压缩重复顶部capsule，协议正文未改；详细旧事实仍保留在本PROGRESS历史各节。M1未冻结、M2冻结、M3未开始；默认off/local-only与production拒绝、0037 grant硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭和全域completion=false保持。旧CP/receipt/descriptor不重签、unknown不提升，受保护32-byte ref key与artifact加密key分离。五个selected continuation仍须独立ACK、heldGCM/实际target锁/完整externalchain；runtime freshfleet与operator非ordinarywriter边界不变。停服排空旧writer、独立迁移/strictfingerprint/forward-fix，以及VM独立可信clean/pin/no-fallback约定均未改变。
+
+## 2026-10-15（0057 COUNT guard修订后54项定向通过，后置门禁尚待）
+
+- `aad57d3`完整verify退出1及原报告保留，不被本次定向成功覆盖。原失败路径已实际观察到：同事务完整native谓词与见证均true，原SP判断却false并拒绝；这证明了本机对照现象，不证明具体MySQL内部原因。仅未发布0057的两个outer EXISTS改为原完整WHERE的两个COUNT局部变量，再检查`>0`与`IS NOT TRUE`；已发布0053、原27个provider测试及NULL/BINARY/owner/RR语义未变，不靠弱化oracle或扩大期限通过。
+- 首次deriver在连接数据库前因`;\n`拆句格式拒绝；修正格式后，root以session61563在fresh UUID隔离库实际校准，cleanup=true。结果为全库728 triggers、SQL 724527 bytes、full root `d6d52a52ed47c0ffbee162506530e2025304c384360f278cc530c9847d91b44e`，其余7根不变；不操作业务库、不借此激活控制或执行业务删除。
+- session5766真实terminal0：4文件 **54 passed / 0 failed / 0 skipped**，耗时250.76s，组成是旧provider27、新epoch8、旧writer14、grant5；独占报告为 `.local-run/m1m4-0057-count-guard-targeted-20261015.json`。session81263 typecheck退出0，secret scan727通过，diffcheck clean；这些是修复后受影响范围证据，不是新完整coverage、全量verify或CI通过。
+- 相关历史、cluster、build、VM、S3门禁将以干净修复提交继续，当前尚未开始；新修复提交SHA尚未生成，main/origin仍293，未合入/推送。M1未冻结/M2冻结/M3未开始，default-off/local-only/production拒绝、0037硬拒、0054原primary-only、外部删除/自动清理off及completion=false均保持。

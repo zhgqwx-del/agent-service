@@ -185,7 +185,7 @@ CREATE TRIGGER trg_tt_capture_v2_write_job_bi BEFORE INSERT ON tenant_telemetry_
     OR EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_source_bindings WHERE BINARY tenant_id=BINARY NEW.tenant_id)
   THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='inactive capture v2 has unexpected write evidence'; END IF; END;
 CREATE TRIGGER trg_tt_capture_v2_failure_bi BEFORE INSERT ON tenant_telemetry_capture_v2_failure_commit_receipts FOR EACH ROW BEGIN
-  IF (EXISTS (SELECT 1 FROM tenant_telemetry_capture_v2_source_bindings b
+  DECLARE source_match_count BIGINT UNSIGNED; DECLARE business_match_count BIGINT UNSIGNED; SELECT COUNT(*) INTO source_match_count FROM tenant_telemetry_capture_v2_source_bindings b
       JOIN tenant_telemetry_artifact_memberships m ON BINARY m.write_operation_sha256=BINARY b.write_operation_sha256
       JOIN tenant_telemetry_write_jobs j ON BINARY j.write_operation_sha256=BINARY b.write_operation_sha256
       JOIN tenant_telemetry_write_payloads p ON BINARY p.write_operation_sha256=BINARY j.write_operation_sha256
@@ -212,8 +212,7 @@ CREATE TRIGGER trg_tt_capture_v2_failure_bi BEFORE INSERT ON tenant_telemetry_ca
           AND BINARY x.runtime_epoch_sha256=BINARY JSON_UNQUOTE(JSON_EXTRACT(NEW.receipt_json,'$.runtimeEpochSha256'))
           AND BINARY JSON_UNQUOTE(JSON_EXTRACT(x.receipt_json,'$.runtimeBindingSha256'))=BINARY JSON_UNQUOTE(JSON_EXTRACT(NEW.receipt_json,'$.runtimeBindingSha256'))
           AND BINARY JSON_UNQUOTE(JSON_EXTRACT(x.receipt_json,'$.originalCaptureActivationReceiptSha256'))=BINARY a.receipt_sha256))
-        AND JSON_EXTRACT(NEW.receipt_json,'$.committedAtDbMs')=b.bound_at_db_ms)
-    AND EXISTS (SELECT 1 FROM sessions s JOIN items i ON BINARY i.session_id=BINARY s.session_id AND BINARY i.user_id=BINARY s.user_id
+        AND JSON_EXTRACT(NEW.receipt_json,'$.committedAtDbMs')=b.bound_at_db_ms; SELECT COUNT(*) INTO business_match_count FROM sessions s JOIN items i ON BINARY i.session_id=BINARY s.session_id AND BINARY i.user_id=BINARY s.user_id
       JOIN events e ON BINARY e.session_id=BINARY s.session_id AND BINARY e.user_id=BINARY s.user_id AND e.seq=NEW.source_event_seq
       WHERE BINARY s.tenant_id=BINARY NEW.tenant_id AND s.last_seq=NEW.begin_last_seq AND s.fence_token<=NEW.fence_token
         AND i.telemetry_failure_classification='provider_step_error' AND e.telemetry_failure_classification='provider_step_error'
@@ -243,11 +242,10 @@ CREATE TRIGGER trg_tt_capture_v2_failure_bi BEFORE INSERT ON tenant_telemetry_ca
               AND BINARY JSON_UNQUOTE(JSON_EXTRACT(v.body,'$.turnId'))=BINARY i.turn_id
               AND JSON_EXTRACT(v.body,'$.step')=NEW.source_step_index
               AND JSON_EXTRACT(v.body,'$.stepUsage')=u.usage_json))
-        AND (SELECT COUNT(*) FROM events x WHERE BINARY x.session_id=BINARY s.session_id AND x.seq>NEW.begin_last_seq AND x.seq<=NEW.end_last_seq)=NEW.event_count)
-  ) IS NOT TRUE THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='capture v2 failure receipt requires an exact atomic write set'; END IF; END;
+        AND (SELECT COUNT(*) FROM events x WHERE BINARY x.session_id=BINARY s.session_id AND x.seq>NEW.begin_last_seq AND x.seq<=NEW.end_last_seq)=NEW.event_count; IF (source_match_count>0 AND business_match_count>0) IS NOT TRUE THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='capture v2 failure receipt requires an exact atomic write set'; END IF; END;
 
--- The zero sentinels below make the source unpublishable until the complete
--- two-table and whole-trigger shape is independently derived on real MySQL.
+-- Pin the complete two-table and whole-trigger shapes independently derived
+-- on real MySQL; a later guard edit requires a new isolated derivation.
 SET @tt_capture_epoch_cutover_previous_gcml=@@SESSION.group_concat_max_len;
 SET SESSION group_concat_max_len=1048576;
 -- agent-service-runtime-fingerprint:tenant-telemetry-capture-epoch-cutover-schema:start
@@ -272,7 +270,7 @@ SET @tt_capture_epoch_cutover_triggers_ok=(
   SELECT COUNT(*)=728 AND COUNT(DISTINCT trigger_name)=728
     AND SUM(trigger_name IN ('trg_tt_capture_epoch_cutover_bi','trg_tt_capture_epoch_cutover_bu','trg_tt_capture_epoch_cutover_bd','trg_tt_capture_recovery_permit_bi','trg_tt_capture_recovery_permit_bu','trg_tt_capture_recovery_permit_bd','trg_tt_capture_recovery_write_job_bu','trg_tt_capture_recovery_write_ack_bi'))=8
     AND SUM(OCTET_LENGTH(CONCAT_WS('~',event_object_table,trigger_name,action_timing,event_manipulation,action_orientation,IFNULL(action_condition,'<NULL>'),LOWER(REPLACE(REPLACE(REGEXP_REPLACE(action_statement,'[[:space:]]',''),CHAR(96),''),'_utf8mb4','')))))+COUNT(*)-1<=@@SESSION.group_concat_max_len
-    AND SHA2(GROUP_CONCAT(CONCAT_WS('~',event_object_table,trigger_name,action_timing,event_manipulation,action_orientation,IFNULL(action_condition,'<NULL>'),LOWER(REPLACE(REPLACE(REGEXP_REPLACE(action_statement,'[[:space:]]',''),CHAR(96),''),'_utf8mb4',''))) ORDER BY event_object_table,trigger_name SEPARATOR '|'),256)='067fe0a235f77d976fb3239f71ac351619cb56abeff46d3f57f8d1cde8c5e03f'
+    AND SHA2(GROUP_CONCAT(CONCAT_WS('~',event_object_table,trigger_name,action_timing,event_manipulation,action_orientation,IFNULL(action_condition,'<NULL>'),LOWER(REPLACE(REPLACE(REGEXP_REPLACE(action_statement,'[[:space:]]',''),CHAR(96),''),'_utf8mb4',''))) ORDER BY event_object_table,trigger_name SEPARATOR '|'),256)='d6d52a52ed47c0ffbee162506530e2025304c384360f278cc530c9847d91b44e'
   FROM information_schema.triggers WHERE trigger_schema=DATABASE()
 );
 -- agent-service-runtime-fingerprint:tenant-telemetry-capture-epoch-cutover-triggers:end

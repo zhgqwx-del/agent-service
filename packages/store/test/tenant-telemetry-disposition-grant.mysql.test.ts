@@ -274,11 +274,11 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
              ON tenant_telemetry_disposition_authorization_grants FOR EACH ROW
            BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='tampered'; END`,
         );
-        // This fresh-schema fixture uses the current 0054 combined fingerprint,
+        // This fresh-schema fixture uses the current 0057 combined fingerprint,
         // which still covers this 0037 guard. Historical-schema oracles stay unchanged.
         await expect(MysqlSessionStore.connect({
           url: f.url, tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toThrow("0054 retained telemetry source fingerprint verification failed");
+        })).rejects.toThrow("0057 capture epoch cutover fingerprint verification failed");
       } finally {
         await f.close();
       }
