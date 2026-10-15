@@ -1,6 +1,6 @@
 # agent-service
 
-> **最新集成检查点（2026-10-15T01:17Z）**：第二轮整树verify退出1的历史夹具问题已仅在测试层修复；三个真实冻结旧二进制夹具实际3/3、零fail/skip，全部旧列全行hash不变，0054两新列NULL、九新表为空。secret scan679、API/typecheck与diff check均通过；独立产品/CI复核无新增P0–P2。产品代码和0054 SQL未变。R2主coverage实际2897 passed/0 failed（227文件、81预期跳过）；其47文件历史实际279 passed/3 failed报告仍保留，不能改写为282 passed。第三轮完整verify待重验，后置cluster/SDK/clean双tar尚无本集成树终态；main/origin仍e411143、未发布/新CI未运行。用户已授权0054发布验收通过后实施停服exact-backup的新epoch active-capture/保留来源恢复，当前不提前实现。0037硬拒、外部删除/自动清理关闭、全域completion=false不变；M1未冻结、M2冻结、M3未开始。
+> **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
 
 以下M4原始说明与main回补候选快照为历史原文，仅保留当时事实；当前结论以上方检查点和PROGRESS末节为准。
 
@@ -38,7 +38,9 @@ VM目录与受限tar候选已通过macOS arm64双服务真实构建、独立工�
 
 `0053`补默认关闭、仅限本地的 persisted provider-step failure capture。真实 Pi provider 失败的首个 failed-step business commit，把 item/event、usage/billing、source binding、membership、spool/job 和 failure receipt 原子提交；之后才单独结束 turn，精确重放不追加 seq 或重复计费。人工确认全旧 writer 排空后，五命令一次性 `telemetry-capture` CLI 可分别检查、预检和激活 lifecycle / logs；必须绑定真实 `0030` primary runtime epoch、受保护的 exact ref key 和完整 configured fleet。runner 的 `PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED` 与 router 的 `PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED` 均默认 `0`，production 拒绝启用；v1 application capture 与 traces capture 保持 inactive。每个 v2 capture/claim/reserve/create/ACK 边界重新校验完整 fleet，既有 v1 队列不受 v2 gate 阻断。普通 DELETE 可保留历史来源核验、已外部提交的 exact ACK，但不能据此新建 sink 对象；sealed source 的 operational usage 暂不可删除。旧 NULL/gen0 失败仍是 unknown，不能升级成受管 source。
 
-这是新的受限写入切片，不是 telemetry 删除或恢复闭环：active v2 仍阻断 T3d/T3f，不解除 grant、产品外部处置或全域 completion 门禁，也不自动重绑定恢复后的 epoch。必须先排空 pre-0053 writer，独立迁移后只运行新 binary 并 forward-fix；当前相关组合指纹为 `160`，不是全库 trigger 总数。产品仍只有两个长期服务和两个 Linux OCI 镜像；新 CLI 使 Node JavaScript 入口增至六个，不新增 daemon。完整本地/CI验证以[进度记录](docs/PROGRESS.md)最新节为准。
+0053阶段的原始边界（0054有限例外见下一段）：这是新的受限写入切片，不是 telemetry 删除或恢复闭环：active v2 仍阻断 T3d/T3f，不解除 grant、产品外部处置或全域 completion 门禁，也不自动重绑定恢复后的 epoch。必须先排空 pre-0053 writer，独立迁移后只运行新 binary 并 forward-fix；当前相关组合指纹为 `160`，不是全库 trigger 总数。产品仍只有两个长期服务和两个 Linux OCI 镜像；新 CLI 使 Node JavaScript 入口增至六个，不新增 daemon。完整本地/CI验证以[进度记录](docs/PROGRESS.md)最新节为准。
+
+`0054`增加默认休眠的来源保留式本地链：仅同一primary epoch、creation-complete新tenant、T1前全部v2 write已written/ACK，且33域中全部Blob/export计划目标精确为零，才允许T1冻结来源、T3d封存七源与目录、T3e清理已核对operational usage、T3f清理本地canonical内容并保留billing/owner/grave证据。历史读取必须逐层核验live、usage_released或canonical_closed，不以缺源或旧NULL marker补造授权。旧收据不改、sink对象不删、0037 grant/全域completion不开放；pending/reserved、legacy/mixed/未知来源和新epoch继续拒绝。全库严格712-trigger升级必须先关gate、排空全部pre-0054 writer及在途事务，独立迁移后仅运行新代码并forward-fix；本轮未迁移日常业务库或部署激活，不新增服务或JS入口。
 
 BYOK责任边界已确认：租户删除只清除本系统保存的key，厂商侧撤销由客户负责。T3a已有本地credential行删除，T3b处理受跟踪runtime引用；备份/恢复等剩余数据域仍须闭环，既有external blocker不会被静默改成远端撤销成功。
 
@@ -47,6 +49,8 @@ BYOK责任边界已确认：租户删除只清除本系统保存的key，厂商�
 交付决策：普通 session DELETE 已按30天建立默认休眠的保留证据，自动物理清理仍关闭（`purge_after_ms`仍为`NULL`）；M4同时提供router/runner独立VM进程发布包和Linux OCI镜像。两种生产部署形态尚未交付或验收，详见[本地开发与CI指南](docs/operations/development-and-ci-guide.md)。
 
 ## 本机运行
+
+升级已有本机数据库也须先排空全部旧writer/在途事务、按独立迁移门禁升级；本轮未操作您的日常库。下面start适用于受控初始化或已完成迁移的环境，不是0054热滚动升级步骤；新隔离环境和配置清理见学习指南。
 
 ```bash
 # 依赖：Node 24（fnm）、pnpm 12、MySQL 8（已有）、Redis（deploy/local/install 说明见 infra.sh 头部）
@@ -100,7 +104,7 @@ scripts/local-service.sh acceptance              # 明确经公开入口 agent-r
 # 测试（四层，前三层不需要任何 API key）
 pnpm test                                     # 单元 + 方言（假厂商）
 AGENT_SERVICE_INTEGRATION=1 pnpm test         # + MySQL/Redis 一致性套件（两个后端跑同一套契约）
-pnpm test:migrations                          # 真实历史升级至0053；含冻结0052旧binary的失败写入、业务保持和旧指纹拒绝，逐file零skip
+pnpm test:migrations                          # 真实历史升级至0054；含冻结旧binary、业务保持和旧指纹拒绝，逐file零skip
 # 以下单独列出的 S3 套件需先配置各自的 S3_TEST_* 测试环境；本地优先用 verify-s3 自动准备 MinIO 与 bucket。
 pnpm test:tenant-telemetry-lifecycle          # 0032/0033 content-free evidence helper
 pnpm test:tenant-telemetry-lifecycle-memory   # 0033 Memory activation/coverage/inventory原子语义

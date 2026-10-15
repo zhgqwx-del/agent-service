@@ -1,6 +1,6 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 当前候选覆盖说明（2026-10-14）：M4目录d33完整verify与归档632的335定向/clean双tar装配分别已有本地证明；0054已与M4在本地集成，11个具名真实文件245 passed、零failed/skip（含当前521b SQL历史14例）。首次集成整树verify 31128却退出1：旧grant测试期待0053指纹错误，实际0054严格指纹已正确拒绝篡改；精确oracle修订后仍须从头完整重验，不能把245定向当整树成功。本批未推送、无新Linux CI或生产验收。0054只给同primary epoch、creation-complete新tenant、T1前全written/ACK且全部Blob/export域零的v2来源建立保留式本地删除桥；旧/未知来源、非零外部目标、新epoch恢复、0037 grant与外部处置不因此开放。四个协议false字段、default-off、M1未冻结/M2冻结/M3未开始不变。下文旧版本边界和历史表按其版本理解，最新结果只看PROGRESS顶部及末节。
+> 本地集成验收（2026-10-15）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
 
 本文是理解和操作当前 `agent-service` 的长期维护入口，回答三类问题：本地需要启动什么、怎样手动体验、GitHub Actions 实际构建和验证什么。
 
@@ -8,7 +8,7 @@
 
 里程碑完成度以 `docs/PROGRESS.md` 顶部快照和最后一节为准；本文只描述操作方式和交付产物，不替代进度记录。
 
-当前新增的`0053`是默认关闭、local-only的 persisted provider-step failure capture v2，不是完整telemetry生命周期或M3。原始provider stream失败的source、failed item/event/usage/billing、capture binding/receipt及0034 spool/membership在同一失败step业务COMMIT内提交；后续turn-terminal仍是原第二次COMMIT。runner `PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED` 和router `PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED`均默认`0`，production拒绝开启；只有受控CLI核对真实0030 active primary epoch/lineage、exact0033 key/target和configured-fleet root后才能激活v2 logs，0035 v1/traces保持inactive。T3d/T3f第六来源仍全局硬拒、tenant erasure被阻断，grant、外部处置/恢复和所有completion没有开放；sealed source usage不能由0052自动删除，旧NULL/0来源保持unknown。
+`0053`阶段的原始合同是默认关闭、local-only的 persisted provider-step failure capture v2，不是完整telemetry生命周期或M3。原始provider stream失败的source、failed item/event/usage/billing、capture binding/receipt及0034 spool/membership在同一失败step业务COMMIT内提交；后续turn-terminal仍是原第二次COMMIT。runner `PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED` 和router `PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED`均默认`0`，production拒绝开启；只有受控CLI核对真实0030 active primary epoch/lineage、exact0033 key/target和configured-fleet root后才能激活v2 logs，0035 v1/traces保持inactive。T3d/T3f第六来源仍全局硬拒、tenant erasure被阻断，grant、外部处置/恢复和所有completion没有开放；sealed source usage不能由0052自动删除，旧NULL/0来源保持unknown。 0054仅对顶部所述完整新来源提供本地保留桥，不放开其它来源或新epoch。
 
 本地完整验证由`verify`加`verify-s3`组成：前者执行独立真实MySQL与真正旧0052 binary升级门禁，后者执行实际HTTP/SSE/socket故障→PiEngine/SessionHost→MySQL→0034worker→MinIO bytes/ACK，以及active0033 exact-key备份兼容。是否全部通过、实际用例数与CI链接仍只看PROGRESS及当次JSON，不把接线或历史结果当作本轮通过。构建现为六个JavaScript入口（runner五、router一），但长期服务和OCI镜像仍各两个。
 
@@ -1599,9 +1599,9 @@ agent-service/agent-runner:ci
 agent-service/agent-router:ci
 ```
 
-每个产品镜像都包含 Node 24 slim、对应应用入口、迁移和 production dependencies，是 Linux OCI image，不是VM磁盘或原生机器码。GitHub Actions分别启动两个镜像并检查OpenAPI/healthcheck；镜像job不运行router与runner双容器转发，该端到端路径由`build:check`的dist双服务启动测试覆盖。runner镜像内迁移器必须写入包含最新`0049_tenant_telemetry_application_capture_v2.sql`、`0050_ordinary_session_delete_grace.sql`、`0051_ordinary_session_delete_origin_guard.sql`、`0052_ordinary_session_usage_retention.sql`与`0053_persisted_provider_failure_capture.sql`的完整marker链，并用plain Node验证四个one-shot CLI的`--help`。生产first-admin bootstrap只通过create-only、`0600`输出文件交付，CI验证key格式与鉴权且日志不含key或tenant原值。marker只证明0044 pre-grant、0049 inactive capture v2 guards、0050普通DELETE保留证据列、0051 write-once guard及此前默认休眠schema已安装，不代表capture已激活、DB grant可信、CAS tombstone已执行、旧快照已安全恢复或任何物理purge已完成。产品构建仍只有router和runner两个长期服务、两个Linux OCI镜像、六个JavaScript入口：router `main.js`，runner `main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`、`backup-catalog.js`和`telemetry-capture.js`；本地MinIO基础设施镜像不进入产品matrix。
+每个产品镜像都包含 Node 24 slim、对应应用入口、迁移和 production dependencies，是 Linux OCI image，不是VM磁盘或原生机器码。GitHub Actions分别启动两个镜像并检查OpenAPI/healthcheck；镜像job不运行router与runner双容器转发，该端到端路径由`build:check`的dist双服务启动测试覆盖。runner镜像内迁移器必须写入包含最新`0049_tenant_telemetry_application_capture_v2.sql`、`0050_ordinary_session_delete_grace.sql`、`0051_ordinary_session_delete_origin_guard.sql`、`0052_ordinary_session_usage_retention.sql`、`0053_persisted_provider_failure_capture.sql`及`0054_tenant_telemetry_retained_source.sql`的完整marker链（0054另用精确COUNT=1断言），并用plain Node验证四个one-shot CLI的`--help`。生产first-admin bootstrap只通过create-only、`0600`输出文件交付，CI验证key格式与鉴权且日志不含key或tenant原值。marker只证明0044 pre-grant、0049 inactive capture v2 guards、0050普通DELETE保留证据列、0051 write-once guard及此前默认休眠schema已安装，不代表capture已激活、DB grant可信、CAS tombstone已执行、旧快照已安全恢复或任何物理purge已完成。产品构建仍只有router和runner两个长期服务、两个Linux OCI镜像、六个JavaScript入口：router `main.js`，runner `main.js`、`blob-storage-migrate.js`、`restore-ledger-reconcile.js`、`backup-catalog.js`和`telemetry-capture.js`；本地MinIO基础设施镜像不进入产品matrix。
 
-当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前明确上传的 GitHub Actions artifact 只有 coverage。
+当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前配置上传coverage及验收通过的VM双role归档、独立工具和proof（VM artifact保留14天）；是否实际生成必须核对main对应run，artifact仍不是签名或生产晋级。
 
 ## 9. 从本地到未来生产的交付语义
 
@@ -1631,7 +1631,7 @@ M4候选现在增加`package:vm`、`test:vm-release`和`check:vm-release`，详�
 
 staging/production 不重新编译镜像。环境差异只通过受控配置和 Secret 注入；两个环境不共享 MySQL、Redis、对象存储、密钥或 service key。
 
-VM形态须在同一次CI构建中分别形成router/runner完整发布归档，固定Node24 target runtime、production dependencies、迁移文件及每个文件校验和/发布包身份；staging验证后，将**同一发布包身份和校验和**晋级production，不在环境中重新安装依赖或重新打包。目标平台目录包及受限tar/独立Node24工具已有本地候选证明，整合后完整验收与新Linux CI尚待；工具必须先经独立可信tool摘要验证，归档与manifest同样使用外部可信摘要，包内sidecar不能自认证。候选CI artifact只保存测试通过的字节，不等于签名、生产许可或已实施晋级。systemd托管、进程排空与一次性迁移入口仍须独立发布/验收；见[VM发布包契约](local-and-deployment.md#vm-进程发布包地基)。
+VM形态须在同一次CI构建中分别形成router/runner完整发布归档，固定Node24 target runtime、production dependencies、迁移文件及每个文件校验和/发布包身份；staging验证后，将**同一发布包身份和校验和**晋级production，不在环境中重新安装依赖或重新打包。目标平台目录包及受限tar/独立Node24工具已有本地候选证明，本地完整集成验收已通过，Linux CI由main对应run独立验收；工具必须先经独立可信tool摘要验证，归档与manifest同样使用外部可信摘要，包内sidecar不能自认证。候选CI artifact只保存测试通过的字节，不等于签名、生产许可或已实施晋级。systemd托管、进程排空与一次性迁移入口仍须独立发布/验收；见[VM发布包契约](local-and-deployment.md#vm-进程发布包地基)。
 
 用户选择M4同时提供两种交付形态：容器按router/runner Linux OCI同一digest晋级；虚拟机用相同六个应用入口（runner main与四one-shot、router main）和受控Node24 runtime，两个服务独立运行。两者复用协议、迁移门禁、配置/Secret与验收。VM目录验真和受限归档运输均已有本地候选实现与真实装配证明；进程托管/滚动与容器签名、部署清单、环境晋级仍待M4，不能把源码开发脚本、单平台本地目录包或CI测试镜像当成生产验收完成。归档工具是离线发布工具，不是新增产品daemon或镜像。
 
@@ -1737,7 +1737,7 @@ T3g的恢复能力需保持精确表述：same-MySQL projection只枚举已经�
 | generic session/user内容purge及child-first执行/恢复/完成审计 | 30天floor与ordinary operational usage retention不是内容purge |
 | backup-copy责任/保留、受policy/hold约束的实际到期删除、durable intent和物理不存在ACK | 共享backup仍保留时不能称其字节已物理删除；内容30天不自动套用到backup/billing/audit |
 
-仍须等待真实环境验收的是managed IAM/private access、真实KMS权限/TLS/轮换、独立journal/catalog/sink故障域、云端备份复制/PITR、真实容量与锁等待、staging/production RPO/RTO和发布演练、IdP及真实Redis Cluster/ACL/persistence/failover等。对应adapter、配置契约和本地故障代码应先实现；不能把缺代码统称为M4云验收。仓库不编造Kubernetes、域名/TLS、bucket、telemetry backend或Secret参数；本地MinIO协议与加密逻辑backup也不证明独立故障域、完整生产DR或日志/追踪删除。此前列为“下一批”的同primary epoch、新tenant且全部v2 write在T1前ACK的来源保留式本地链现已形成0054候选，并在全部Blob/export计划域为零的范围内通过具名定向验证；本集成树首次整树verify因精确旧错误字符串oracle退出1，修订后完整重验与新CI仍待，故不是已发布能力。restore/new epoch、其它历史gap、可信grant和外部处置继续拒绝，不能把剩余实现写成只等云验收。
+仍须等待真实环境验收的是managed IAM/private access、真实KMS权限/TLS/轮换、独立journal/catalog/sink故障域、云端备份复制/PITR、真实容量与锁等待、staging/production RPO/RTO和发布演练、IdP及真实Redis Cluster/ACL/persistence/failover等。对应adapter、配置契约和本地故障代码应先实现；不能把缺代码统称为M4云验收。仓库不编造Kubernetes、域名/TLS、bucket、telemetry backend或Secret参数；本地MinIO协议与加密逻辑backup也不证明独立故障域、完整生产DR或日志/追踪删除。此前列为“下一批”的同primary epoch、新tenant且全部v2 write在T1前ACK的来源保留式本地链现已形成0054候选，并在全部Blob/export计划域为零的范围内通过完整本地集成verify；前两次失败及仅测试修复记录保留，第三次主2897和真实历史47文件282零skip已通过。发布commit及其Linux CI仍须以main对应run的实际终态核对，不能从本地成功推断生产许可。restore/new epoch、其它历史gap、可信grant和外部处置继续拒绝，不能把剩余实现写成只等云验收。
 
 当前T3d全库RR/next-key扫描可能在规模下造成写阻塞/死锁、lease和容量压力，必须在staging用真实索引与数据量做锁超时/容量验证。结构损坏的queued job在逐候选隔离前可能饿死后续job，cursor重启还会重扫损坏前缀，但fail-closed且不会产生plan receipt或执行权，M4应增raw-key quarantine/skip。`0022` trigger fingerprint不校验action body，迁移夹具只显式模拟首个DDL auto-commit边界；预发需用无DDL/TRIGGER的runtime principal并扩展schema tamper/中断演练。
 

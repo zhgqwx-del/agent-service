@@ -1,6 +1,6 @@
 # 进度记录
 
-> **最新集成检查点（2026-10-15T01:17Z）**：第二轮整树verify退出1的历史夹具问题已仅在测试层修复；三个真实冻结旧二进制夹具实际3/3、零fail/skip，全部旧列全行hash不变，0054两新列NULL、九新表为空。secret scan679、API/typecheck与diff check均通过；独立产品/CI复核无新增P0–P2。产品代码和0054 SQL未变。R2主coverage实际2897 passed/0 failed（227文件、81预期跳过）；其47文件历史实际279 passed/3 failed报告仍保留，不能改写为282 passed。第三轮完整verify待重验，后置cluster/SDK/clean双tar尚无本集成树终态；main/origin仍e411143、未发布/新CI未运行。用户已授权0054发布验收通过后实施停服exact-backup的新epoch active-capture/保留来源恢复，当前不提前实现。0037硬拒、外部删除/自动清理关闭、全域completion=false不变；M1未冻结、M2冻结、M3未开始。
+> **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
 
 以下顶部旧快照原文属于历史记录，只有上方快照具有当前优先级；完成状态与未完成项还须对照本页末节。
 
@@ -1353,3 +1353,14 @@ M2 的**本地/CI 代码范围正式冻结**，本轮没有提前进入 M3。该
 - 只修改三个历史测试并新增共享测试helper：升级前按真实旧schema的ORDINAL_POSITION封存全部列，前后明确SELECT同一列集合并按原顺序比较所有旧行SHA256；缺列即SQL失败，失配带表名。另验证两父表0054列确实存在且全部NULL、九张新表全库为空。固定旧commit、依赖、旧binary、原收据/33域/目标专属及full-tail指纹拒绝、隔离与unknown断言未改，不更新固定hash、不跳过用例。产品与SQL无修改。
 - root session77077实际退出0，三个冻结旧binary的真实MySQL夹具3 files/3 passed/0failed/0skipped，JSON逐文件exact-name与全部assertion确认；开始01:13:40Z、结束01:16:26Z。新报告`frozen-0039-0040-0041-projection-r3-20261015t0114.json`独立保留，不覆盖R2失败报告。secret scan679、API/typecheck、diff check退出0；两路只读产品/CI与夹具review无新增P0–P2。
 - 这只证明三个定向夹具，不是完整47历史wrapper或整树verify通过。下一以干净本地提交执行第三轮完整verify；尚未合入main、推送或得到新CI，不开放任何门禁。
+
+## 2026-10-15（M4与0054完整本地集成验收通过）
+
+- 干净代码提交`e278eaded08ca19ecaaf6a92c295f21f1ebc2585`的第三轮`scripts/local-service.sh verify`于01:17:51.260Z启动、03:13:49.831Z明确退出 **0**；前两轮失败报告原文与JSON保留，不改写为通过。此次仅使用初始不存在的两个隔离MySQL库、自建非持久化Redis60010与临时idle-sleep guard；结束只清理这些自建资源，不读.env/付费模型，不迁移日常业务库、不操作已有Redis或外部对象。目录标签0119不是实际开始时间。
+- check:secrets **679 files**、check:api、typecheck均通过。主coverage于01:31:11.502Z开始、02:11:35.572Z产出JSON：**227文件（212执行/15预期跳过）、2897 passed/0failed/81预期跳过**，四项 **80.21/76.24/87.24/83.03**；required脚本及root逐assertion核对均通过。0054十个非历史文件231与M4四文件335是主套件内子集，前置/后置重复执行不重复计入总数；原main JSON未修改。
+- 完整历史wrapper于02:11:36.490Z开始、02:37:56.844Z产出JSON，**47文件/282 passed/0failed/0skipped**，磁盘发现与required清单双向精确一致，每文件非零passed且无nonPassed；0007→0008两例、三个冻结0039/0040/0041旧binary各1例和0053→0054十四例均真实执行。成功报告另存`migration-tests.full-verify-r3-passed-20261015t0238.json`，R2 279/3失败另存报告保持；旧字段全行hash不变、0054两新列NULL/九新表空由真实旧binary升级重验。
+- 全部前后置具名门禁通过；root重读本次新JSON均无failed/nonPassed。cluster **8文件/28 passed**，独立T3g **3 passed**；SDK installed runtime/types与18文件archive通过，runner五/router一共六JavaScript入口及source/bundled readiness、auth、forward、OpenAPI均通过。不是六个常驻服务或原生ELF/Windows二进制；长期服务和OCI镜像仍各两个。
+- VM后置四具名文件 **174+76+37+48=335 passed**。实际双服务tar经独立digest-bound工具解包、完整依赖验真、四one-shot与双main启动；proof完成03:13:44.929Z，两role sourceCommit均精确e278ead、sourceDirty=false、publishable=true，目标darwin/arm64/Node24、productionAccepted=false。runner归档265955840 bytes/router20614656 bytes；三摘要必须来自独立可信构建渠道，sidecar不能自认证。local verify虽允许dirty-development，实际此轮来源是clean；最终文档提交仍须另外以strict clean HEAD重建绑定证明，不借e278证明替代最终HEAD。
+- 最终两路产品/CI及额外真实S3/加密backup源码兼容review无新增P0–P2；本轮没有重跑MinIO或付费模型，不把静态审查、0054本地fake ACK或旧e411 CI冒充实际S3/新CI通过。对应Linux CI与两个image job必须以main本批提交的实际run验收。文档提交仅校准当前状态/旧版本例外；发布前核对完整diff、diff --check、工作树和main原四份文档/两旧stash，保护后仅fast-forward并推送，不force/reset。
+- 0054产品/SQL自e278前冻结后未变：同primary、creation-complete新tenant、T1前全written/ACK，且全部Blob/export计划域精确零，才有本地T1/T3d/T3e/T3f保留桥。旧receipt不可改，pending/reserved/legacy/mixed/unknown、新epoch、真实grant及外部处置继续拒绝。rollout须先关gate、排空全部pre-0054 writer与在途事务，再独立迁移并核对712-trigger严格指纹，只新writer/forward-fix；不能热混跑或删marker。
+- 当前仍有实质代码缺口：active capture/来源保留的新epoch恢复、可信telemetry授权/外部处置与恢复证明、generic user/session物理purge、完整completion，以及M3主体和M4托管/无DDL runtime bridge/签名晋级/可观测性等，不能写成只缺云资源。全范围锁/规模争用、1MiB容量与人工排空证明仍需staging验证。M1未冻结、M2继续冻结、M3未开始。用户已授权下一停服exact-backup恢复代码及全新隔离MySQL/MinIO测试，但正式实施必须在本批发布验收通过之后，当前只读设计，未提前实现。

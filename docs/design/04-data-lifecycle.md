@@ -2,13 +2,17 @@
 
 > 组合边界：本地MySQL备份/旧restore CLI现接0033 active所需exact protected ref-key文件；source与target必须同key，缺失/漂移仍拒绝。实际active0033组合证明以PROGRESS为准，旧17例inactive证明不外推。active0053 capture的新epoch恢复仍未闭合，不能自动rebind或绕过startup audit。
 
+> 本地集成验收（2026-10-15）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
+
+> 以下为0053阶段的历史状态与逐版本合同；0054有限新来源例外见第13节，不能据旧段落否定它，也不能将例外推广到其它来源。
+
 > 状态：**包括`0053`本地候选，本地/CI已有Archive、Blob/usage/governance/export、tenant-erasure T1～T3g及credential/restore/backup/telemetry的多个受限切片，但完整tenant erasure仍未闭环，所有全域completion保持false**（2026-10-13）。`0034`默认关闭的telemetry writer已接runner，可用本地单runner filesystem或S3-compatible target；`0035`只为`provider.upstream_request_failed` logs建立exact capture，traces必须inactive。`0036`/`0037`仍为非生产disposition协议及真实grant硬拒；`0038`～`0041`依次封存新write membership、T3f owner closure、T3d source与观察目标；`0042`只给新plan封存logs/traces逐artifact精确target count/root；`0043`修复新plan非零target的T3e实时复核并增加T3f后只读本地候选；`0044`只把精确逐artifact本地source封存为默认休眠、版本化的pre-grant intent/claim，固定`grantReady=false`。旧0041 terminal保留零target plan且缺catalog为unknown，新plan两域即使非零仍为blocker；0043候选也固定`executionReady=false`、`externalAuthorityVerified=false`。第五个同机MinIO bucket只证明0036协议，不证明云IAM/KMS、独立故障域或跨MySQL/S3端到端恢复。没有受控telemetry disposition activation/执行器、可信DB grant、产品v2 S3 mutation、外部marker验真、最新head恢复门禁或全域completion，因此M1未冻结，M2冻结，M3/M4主体未开始。
 
 ## 1. 当前实现与缺口
 
 `0053`在普通默认关闭路径之外提供受限本地logs capture。真实provider失败的首个failed-step business commit原子包含item/event、usage/billing、v2 source binding、membership、spool/job与failure receipt；之后才结束turn。source只保存tenant-bound、kind-separated keyed refs，不存原始source ID、错误正文或URL；输入必须先证明由真实安全logger生成的原始冻结record及exact owner/producer key，不能靠clone或literal伪造。旧NULL/gen0失败仍unknown，post-cutover runtime_unknown/gen1不得凭倒填时间转为legacy。Memory同步原子发布/MySQL显式RR、独立来源核验及严格SQL closure都不能被普通commit冒充授权。
 
-source存在不等于继续写入许可。reserve/create必须重新核对live owner、T1、当前policy/hold与runtime/fleet；普通DELETE后历史source仍可验证，已发生external create的exact reservation/claim/result可以ACK收口，但不能新建对象。sealed source所依赖的operational usage暂时保留：ordinary retention、legacy匿名化及T3e不得删它，SQL current-read guard也阻止旧RR read view看不到新receipt后删除。没有受控来源释放/telemetry处置协议，不能将超过30天解释成自动可删。
+0053阶段原始保留边界（0054有限桥接见第13节）：source存在不等于继续写入许可。reserve/create必须重新核对live owner、T1、当前policy/hold与runtime/fleet；普通DELETE后历史source仍可验证，已发生external create的exact reservation/claim/result可以ACK收口，但不能新建对象。sealed source所依赖的operational usage暂时保留：ordinary retention、legacy匿名化及T3e不得删它，SQL current-read guard也阻止旧RR read view看不到新receipt后删除。没有受控来源释放/telemetry处置协议，不能将超过30天解释成自动可删。
 
 激活仅允许真实0030 primary runtime、exact ref key、canonical coverage及人工fleet/旧writer排空ACK。runner/router两gate默认0、production拒绝；每个v2 capture/claim/reserve/create/ACK取fresh全fleet proof，既有v1队列在LIMIT前与v2分离，v2 gate失败不消耗v2 lease或挡住v1。v1/traces capture保持inactive。active/异常第六source仍阻断T3d/T3f，0037 grant、产品external disposition/restore和全域completion均未放开；backup跨epoch不能自动恢复activecapture。迁移两表/17私有列/15新guard及相关160指纹须先排空旧writer/事务再独立安装；不是热滚动兼容或云环境验收。DB检查至HTTP create仍有TOCTOU、全范围锁/审计容量及DEFINER/sql_mode特权漂移尚需后续门禁；五命令一次性CLI不新增常驻服务/镜像。完整实际验证见PROGRESS最新节。
 
@@ -421,9 +425,9 @@ schema-root v2仅规范已有明确utf8mb4表默认与列collation时的冗余CH
 - rolling upgrade：additive capability、私有fleet barrier、部分回填重启和全旧实例 drain 后才激活新不变量已覆盖；固定N-1镜像的真实混版本canary仍留到M4发布编排。
 - 备份恢复：T3g已在runner开放监听前及周期性从同一MySQL projection重放已有durable ACK的Redis marker；未ACK exact marker只能由worker轮询中的existing-marker-only replay收口。0030在激活后把每个新T1 fence发布到外部journal，并以停服replay、永久fence、sealed receipt和runtime epoch gate防止这些已发布fence随旧数据库备份复活；0031进一步以snapshot anchor、operator-attested full-backup摘要、source binding、永久epoch reservation和retention/eviction账本约束恢复来源。Memory/MySQL/S3 adapter、CLI和真实MySQL升级夹具均有回归，但adapter只验证摘要/chain identity，不证明物理snapshot内容。它们仍不创建物理backup、不覆盖pre-activation或未发布T1、Redis未ACK首次bits、backup内tenant erasure及其它domain，且真实故障域/IAM/KMS/RPO/RTO和整链恢复未在staging验证，因此不能宣称完整灾备闭环。
 
-## 13. 0054 retained-source 本地协议（未发布候选，待最终验证）
+## 13. 0054 retained-source 本地协议（本地集成验收通过）
 
-> 本节描述当前 `0054_tenant_telemetry_retained_source.sql` 与 Memory/MySQL 候选实现的有限合同，不替代前述已发布版本的边界。候选尚未发布、部署或自动启用；定向阶段成功不等于整树 `verify`、完整真实 MySQL 矩阵或新 CI 通过。最终结果及失败/重验记录以 [PROGRESS](../PROGRESS.md) 最新快照与末节为准。该切片不使 M1 冻结，也不开始 M3。
+> 本节描述0054 Memory/MySQL有限合同。干净e278ead已通过完整本地verify，含47文件真实历史矩阵及当前0053→0054十四例；旧失败与重验均保留。代码发布不等于部署或自动启用，main对应Linux CI必须独立验收，最终状态以[PROGRESS](../PROGRESS.md)与对应Actions run为准。它不使M1冻结，也不开始M3；新epoch恢复、可信grant、外部处置及全域completion仍未闭环。
 
 协议名为 `tenant-telemetry-retained-source-v1`。九张独立证据表分别保存 T1 cohort entry/receipt、T3d raw source/tagged target/receipt、T3e usage release entry/receipt、T3f canonical closure entry/receipt；admission 与 plan job 各有一个不可变、可空的 protocol discriminator。它们只增加 content-free 来源证据，不重释旧 v1/0053 hash，不把 v2 binding 塞进 v1 application binding，也不提供手工写 proof 的公开 API。写入只能随下述真实业务边界发生，读取仍须独立验真。
 
