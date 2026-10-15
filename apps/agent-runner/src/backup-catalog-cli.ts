@@ -22,6 +22,7 @@ import {
   validateTenantRestoreReplayRunRecord,
   validateTenantRestoreReplaySealedTarget,
   validateTenantRestoreRuntimeControlRecord,
+  validateTenantTelemetryCaptureEpochCutoverReceipt,
   type BlobStorageControlStore,
   type RestoreReplayStore,
   type TenantBackupCatalogAdapter,
@@ -35,12 +36,17 @@ import {
   type TenantRestoreJournalStore,
   type TenantRestoreJournalAdapter,
   type TenantRestoreReplaySealedTarget,
+  type TenantRestoreReplayRunRecord,
   type TenantTelemetryCaptureBackupCheckpointStore,
   type TenantTelemetryCaptureRestoreMaintenance,
   type MysqlTenantTelemetryCaptureRestoreMaintenanceOptions,
+  type MysqlTenantTelemetryCaptureArtifactRestoreMaintenanceOptions,
 } from "@agent-service/store";
 import { z } from "zod";
 import * as mysqlArtifact from "./mysql-backup-artifact.js";
+import { SelectedRestoreError, readSelectedRestoreCatalog, readSelectedRestoreContext,
+  replaySelectedRestore, verifySelectedRestore, activateSelectedRestore,
+  readActivatedSelectedRestore, assertSelectedRestoreFreshHeads, resolveSelectedRestore } from "./backup-selected-restore.js";
 import { readTelemetryCaptureRefKey, tenantTelemetryOperatorRefKeyPath } from "./telemetry-capture-ref-key.js";
 import {
   createTenantBackupCatalogAdapter,
@@ -61,6 +67,11 @@ const COMMANDS = [
   "create-artifact",
   "verify-artifact",
   "restore-selected",
+  "replay-selected",
+  "verify-selected",
+  "activate-selected",
+  "activate-capture-selected",
+  "resolve-selected",
   "list",
   "prepare-restore",
   "resolve-restore",
@@ -69,6 +80,8 @@ const COMMANDS = [
   "reconcile",
 ] as const;
 type BackupCatalogCommand = (typeof COMMANDS)[number];
+const SELECTED_COMMANDS = ["replay-selected", "verify-selected", "activate-selected", "activate-capture-selected", "resolve-selected"] as const;
+type SelectedArtifactCommand = typeof SELECTED_COMMANDS[number];
 
 const BACKUP_ID = /^backup_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const EVICTION_ID = /^backup_evict_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -85,6 +98,7 @@ type BackupCatalogCliErrorCode =
   | "catalog_corrupt"
   | "catalog_not_ready"
   | "journal_conflict"
+  | "runtime_head_changed"
   | "operation_deadline"
   | "operation_failed";
 
@@ -92,6 +106,8 @@ class BackupCatalogCliError extends Error {
   constructor(
     readonly code: BackupCatalogCliErrorCode,
     readonly restoreBoundary?: { reservationMayBeConsumed: true; targetMayContainPartialImport: boolean },
+    readonly selectedBoundary?: { restoreMutationMayBeCommitted: true; runtimeActivationMayBeCommitted: boolean;
+      captureActivationMayBeCommitted: boolean; catalogResolutionMayBeCommitted?: true },
   ) {
     super(code);
     this.name = "BackupCatalogCliError";
@@ -120,6 +136,9 @@ export interface BackupCatalogCliDependencies {
   }): Promise<BackupCatalogCliStore>;
   connectCaptureRestoreMaintenance?(
     options: MysqlTenantTelemetryCaptureRestoreMaintenanceOptions,
+  ): Promise<TenantTelemetryCaptureRestoreMaintenance>;
+  connectCaptureArtifactRestoreMaintenance?(
+    options: MysqlTenantTelemetryCaptureArtifactRestoreMaintenanceOptions,
   ): Promise<TenantTelemetryCaptureRestoreMaintenance>;
   loadCatalogConfig(
     env: NodeJS.ProcessEnv,
@@ -190,6 +209,19 @@ const RestoreSelectedEnv = CreateArtifactEnv.extend({
   RESTORE_RUN_ID: z.string().regex(RESTORE_RUN_ID),
   BACKUP_RUNTIME_EPOCH_ID: z.string().regex(SAFE_ID),
   BACKUP_RESTORE_TARGET_MYSQL_URL: MysqlEnv.shape.MYSQL_URL,
+});
+const SelectedContinuationEnv = CreateArtifactEnv.extend({
+  RESTORE_RUN_ID: z.string().regex(RESTORE_RUN_ID),
+  BACKUP_RUNTIME_EPOCH_ID: z.string().regex(SAFE_ID),
+  BACKUP_RESTORE_TARGET_MYSQL_URL: MysqlEnv.shape.MYSQL_URL,
+});
+const SelectedCaptureAcks = z.object({
+  TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK: z.literal("1"),
+  TELEMETRY_CAPTURE_LOCAL_ONLY_ACK: z.literal("1"),
+  TELEMETRY_CAPTURE_FLEET_STOPPED_ACK: z.literal("1"),
+  TELEMETRY_CAPTURE_LEGACY_WRITERS_DRAINED_ACK: z.literal("1"),
+  TELEMETRY_CAPTURE_PRODUCER_READY_ACK: z.literal("1"),
+  TELEMETRY_CAPTURE_CONFIGURED_FLEET_ROOT_SHA256: z.string().regex(SHA256),
 });
 
 function boundedInteger(value: string | undefined, fallback: number, maximum: number): number {
@@ -297,6 +329,7 @@ const RecordEvictionEnv = EvictionEnv.extend({
 const DEFAULT_DEPENDENCIES: BackupCatalogCliDependencies = {
   connectStore: (options) => MysqlSessionStore.connect(options),
   connectCaptureRestoreMaintenance: (options) => MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options),
+  connectCaptureArtifactRestoreMaintenance: (options) => MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options),
   loadCatalogConfig: (env, context) => loadTenantBackupCatalogConfig(env, context),
   createCatalogAdapter: (config, options) => createTenantBackupCatalogAdapter(config, options),
   loadJournalConfig: (env, context) => loadTenantRestoreJournalConfig(env, context),
@@ -908,6 +941,171 @@ async function runArtifactCommand(
   return 0;
 }
 
+/** Continue an ALREADY imported authenticated v2 selection. No ordinary source
+ * or target SessionStore is opened; no reserve, prepare, import or implicit
+ * runtime/capture activation is available in this branch. */
+async function runSelectedContinuation(command: SelectedArtifactCommand, env: NodeJS.ProcessEnv,
+  dependencies: BackupCatalogCliDependencies, refKeyPath: string | undefined): Promise<number> {
+  if (env.NODE_ENV === "production" || refKeyPath === undefined || !dependencies.connectCaptureArtifactRestoreMaintenance) {
+    throw cliError("invalid_configuration");
+  }
+  const settings = SelectedContinuationEnv.parse(env);
+  const ack = command === "replay-selected" ? "BACKUP_RESTORE_REPLAY_ACK"
+    : command === "verify-selected" ? "BACKUP_RESTORE_VERIFY_ACK"
+      : command === "activate-selected" ? "BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK"
+        : command === "resolve-selected" ? "BACKUP_RESTORE_CATALOG_RESOLUTION_ACK" : undefined;
+  if (ack !== undefined && env[ack] !== "1") throw cliError("invalid_configuration");
+  const capture = command === "activate-capture-selected" ? SelectedCaptureAcks.parse(env) : undefined;
+  // Validate all acknowledgements/configuration before key reads or adapters'
+  // startup probes, which may perform conditional external test writes.
+  const budget = artifactBudget(env, dependencies), pageSize = parsePageSize(env);
+  const config = loadCatalogRuntimeConfig(env, dependencies, false);
+  const journalConfig = loadRestoreRuntimeConfig(env, settings.BACKUP_RUNTIME_EPOCH_ID, dependencies);
+  if (config.logicalDatabaseNamespaceSha256 !== journalConfig.logicalDatabaseNamespaceSha256) throw cliError("invalid_configuration");
+  const replayPageSize = boundedInteger(env.RESTORE_REPLAY_PAGE_SIZE, DEFAULT_PAGE_SIZE, 1_000);
+  const operations = dependencies.artifactOperations ?? mysqlArtifact;
+  let refKey: Buffer | undefined;
+  let operator: Awaited<ReturnType<typeof operations.acquireMySqlBackupArtifactOperator>> | undefined;
+  let verified: Awaited<ReturnType<typeof operations.verifyMySqlBackupArtifact>> | undefined;
+  let maintenance: TenantTelemetryCaptureRestoreMaintenance | undefined;
+  let adapter: TenantBackupCatalogAdapter | undefined;
+  let journalAdapters: readonly RestoreAdapter[] = [];
+  let summary: string | undefined, operationError: unknown;
+  let mutationAttempted = false;
+  const boundary = (error: unknown) => mutationAttempted
+    ? new BackupCatalogCliError(errorCode(error), undefined, { restoreMutationMayBeCommitted: true,
+      runtimeActivationMayBeCommitted: command === "activate-selected", captureActivationMayBeCommitted: command === "activate-capture-selected",
+      ...(command === "resolve-selected" ? { catalogResolutionMayBeCommitted: true as const } : {}) })
+    : error;
+  const acquire = <T extends { close(): Promise<void> }>(operation: () => Promise<T>) => budget.run(operation, (value) => value.close());
+  const step: AsyncStep = async (operation) => {
+    if (operator) await budget.run(() => operator!.assertHeld());
+    const value = await budget.run(operation);
+    if (operator) await budget.run(() => operator!.assertHeld());
+    return value;
+  };
+  const beforeMutation = () => { mutationAttempted = true; };
+  try {
+    refKey = await budget.run(() => (dependencies.readRefKey ?? readTelemetryCaptureRefKey)(refKeyPath), async (late) => { late.fill(0); });
+    if (!(refKey instanceof Uint8Array) || refKey.length !== 32) throw cliError("invalid_configuration");
+    // sourceUrl intentionally means the sole EXISTING target database here.
+    // Passing targetUrl would grant the empty-target import operator shape.
+    // No old-source DB is read or expected to pass ordinary pending startup.
+    operator = await acquire(() => operations.acquireMySqlBackupArtifactOperator({
+      sourceUrl: settings.BACKUP_RESTORE_TARGET_MYSQL_URL,
+      artifactDirectory: settings.BACKUP_ARTIFACT_DIRECTORY, tenantTelemetryRefKey: refKey!,
+      localOnlyAck: true, fleetStoppedAck: true, deadlineMs: budget.remaining(), operationAbortSignal: budget.signal,
+      ...(env.NODE_ENV === undefined ? {} : { nodeEnv: env.NODE_ENV }),
+    }));
+    verified = await acquire(() => operations.verifyMySqlBackupArtifact({
+      artifactDirectory: settings.BACKUP_ARTIFACT_DIRECTORY, keyFile: settings.BACKUP_ARTIFACT_KEY_FILE,
+      backupId: settings.BACKUP_ID, tenantTelemetryRefKey: refKey!, localOnlyAck: true,
+      maxBytes: budget.maxBytes, deadlineMs: budget.remaining(), operationAbortSignal: budget.signal,
+      ...(env.NODE_ENV === undefined ? {} : { nodeEnv: env.NODE_ENV }),
+    }));
+    await step(async () => {}); // Recheck operator ownership after actual-byte authentication.
+    if (verified.manifest.version !== 2 || verified.manifest.backupId !== settings.BACKUP_ID
+      || verified.manifest.anchor.logicalDatabaseNamespaceSha256 !== config.logicalDatabaseNamespaceSha256) {
+      throw cliError("invalid_durable_state");
+    }
+    const authenticated = verified;
+    const checkpointSha256 = verified.manifest.captureCheckpoint.checkpointSha256;
+    maintenance = await acquire(() => dependencies.connectCaptureArtifactRestoreMaintenance!({
+      url: settings.BACKUP_RESTORE_TARGET_MYSQL_URL, connectionLimit: 2,
+      tenantTelemetryRefKey: refKey!, operationAbortSignal: budget.signal,
+      selection: { backupId: settings.BACKUP_ID, restoreRunId: settings.RESTORE_RUN_ID,
+        checkpointSha256,
+        artifactManifestSha256: authenticated.evidence.artifactManifestSha256,
+        sourceSnapshotSha256: authenticated.evidence.sourceSnapshotSha256,
+        providerEvidenceSha256: authenticated.evidence.providerEvidenceSha256,
+        fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" },
+    }));
+    const target = maintenance;
+    const methods = ["getTenantRestoreReplayRun", "getTenantRestoreReplaySealedTargets", "getTenantRestoreReplayReceipt",
+      "getTenantRestoreRuntimeControl", "getTenantRestoreRuntimeHeads", "getTenantRestoreJournalControl",
+      "getTenantRestoreJournalControlTargets", "getTenantBackupRestoreSourceBinding", "getTenantBackupRuntimeReservation",
+      "getTenantTelemetryCaptureRestoreHistoryReceipt", "close",
+      ...(command === "replay-selected" ? ["recordTenantRestoreReplayFence"] : []),
+      ...(command === "verify-selected" ? ["sealTenantRestoreReplay"] : []),
+      ...(command === "activate-selected" ? ["activateTenantRestoreRuntime"] : []),
+      ...(command === "resolve-selected" ? ["resolveTenantBackupRuntimeReservation", "getTenantTelemetryCaptureEpochCutoverReceipt"] : []),
+      ...(capture ? ["activateTenantTelemetryCaptureRestoredEpoch", "getTenantTelemetryCaptureEpochCutoverReceipt"] : [])];
+    if (methods.some((method) => typeof Reflect.get(target, method) !== "function")) throw cliError("invalid_configuration");
+    // Missing facade capability must fail before external startup probe writes.
+    adapter = dependencies.createCatalogAdapter(config, { operationAbortSignal: budget.signal });
+    journalAdapters = Object.freeze([...dependencies.createJournalAdapters(journalConfig, { operationAbortSignal: budget.signal })]);
+    await step(() => adapter!.validateStartup());
+    for (const journal of journalAdapters) await step(() => journal.validateStartup());
+    const external = await readSelectedRestoreCatalog(adapter, config, authenticated, settings.RESTORE_RUN_ID,
+      journalConfig.runtimeEpochSha256, pageSize, step);
+    const context = await readSelectedRestoreContext(target, journalConfig, authenticated, external, settings.RESTORE_RUN_ID, step);
+    let run: TenantRestoreReplayRunRecord = context.run;
+    let captureWritesAuthorized = false;
+    let resolved: Awaited<ReturnType<TenantTelemetryCaptureRestoreMaintenance["resolveTenantBackupRuntimeReservation"]>> | undefined;
+    if (command === "replay-selected") run = await replaySelectedRestore(target, context, journalConfig,
+      journalAdapters, replayPageSize, step, beforeMutation);
+    else if (command === "verify-selected") run = await verifySelectedRestore(target, context, step, beforeMutation);
+    else if (command === "activate-selected") run = await activateSelectedRestore(target, context, journalConfig,
+      journalAdapters, authenticated, refKey, step, beforeMutation);
+    else if (command === "resolve-selected") resolved = await resolveSelectedRestore(target, context, adapter, config,
+      journalConfig, journalAdapters, authenticated, refKey, pageSize, step, beforeMutation);
+    else {
+      run = await readActivatedSelectedRestore(target, context, authenticated, refKey, step);
+      await assertSelectedRestoreFreshHeads(context, journalConfig, journalAdapters, step);
+      const input = { expectedRuntimeEpochSha256: journalConfig.runtimeEpochSha256,
+        configuredFleetRootSha256: capture!.TELEMETRY_CAPTURE_CONFIGURED_FLEET_ROOT_SHA256,
+        legacyWritersDrainedAck: "legacy-writers-drained-v1" as const,
+        producerReadyAck: "provider-step-error-v2-ready-v1" as const };
+      beforeMutation();
+      let returned: Awaited<ReturnType<TenantTelemetryCaptureRestoreMaintenance["activateTenantTelemetryCaptureRestoredEpoch"]>> | undefined;
+      try { returned = await step(() => target.activateTenantTelemetryCaptureRestoredEpoch(input)); }
+      catch { /* Durable exact receipt, not a response discriminator, decides success. */ }
+      const receipt = await step(() => target.getTenantTelemetryCaptureEpochCutoverReceipt());
+      const history = await step(() => target.getTenantTelemetryCaptureRestoreHistoryReceipt());
+      if (!receipt || !history || authenticated.manifest.version !== 2) throw cliError("invalid_durable_state");
+      validateTenantTelemetryCaptureEpochCutoverReceipt(receipt, history, authenticated.manifest.captureCheckpoint, refKey);
+      if (returned) {
+        validateTenantTelemetryCaptureEpochCutoverReceipt(returned, history, authenticated.manifest.captureCheckpoint, refKey);
+        if (returned.receiptSha256 !== receipt.receiptSha256) throw cliError("invalid_durable_state");
+      }
+      if (receipt.runtimeEpochSha256 !== input.expectedRuntimeEpochSha256
+        || receipt.configuredFleetRootSha256 !== input.configuredFleetRootSha256) throw cliError("invalid_durable_state");
+      await assertSelectedRestoreFreshHeads(context, journalConfig, journalAdapters, step);
+      captureWritesAuthorized = true;
+    }
+    if (run.phase === "aborted") throw cliError("invalid_durable_state");
+    budget.check();
+    summary = JSON.stringify({ status: "ok", command, backupId: settings.BACKUP_ID, restoreRunId: settings.RESTORE_RUN_ID,
+      artifactVerified: true, restorePhase: run.phase, runtimeEpochSha256: run.runtimeEpochSha256,
+      fenceReplayComplete: run.entryCount === run.expectedEntryCount, runtimeActivated: run.phase === "active",
+      // Non-capture commands do not claim the current absence of a previously
+      // committed cutover. They only report what this invocation confirmed.
+      captureCutoverConfirmed: captureWritesAuthorized,
+      ...(captureWritesAuthorized ? { captureWritesAuthorized: true } : {}), historicalOperationRecoveryAuthorized: false,
+      ...(resolved ? { catalogResolutionConfirmed: true, disposition: resolved.disposition, phase: resolved.value.phase,
+        reservationSha256: resolved.value.reservationSha256,
+        resolutionCatalogSequence: resolved.value.phase === "activated" ? resolved.value.resolutionCatalogSequence : null } : {}),
+      requiresExplicitCatalogResolution: resolved === undefined && run.phase === "active" && context.reservation.phase !== "activated",
+      allDomainsComplete: false, contentPurgeExecuted: false, importAttempted: false });
+  } catch (error) { operationError = boundary(error); }
+  // Same settlement barrier as first import: abort is not rollback, and a
+  // rejected close does not allow another live operation to outlast the locks.
+  budget.abort();
+  const nativeClose = budget.trackCleanup(() => closeAllSettled([maintenance, adapter, ...journalAdapters]));
+  const nativeClosed = await boundedCleanup(() => nativeClose);
+  const settled = budget.settled(), drained = await boundedCleanup(() => settled);
+  const release = () => closeAllSettled([verified, operator]);
+  let released = false;
+  if (drained) {
+    const releasing = release(); released = await boundedCleanup(() => releasing);
+    if (released) refKey?.fill(0); else void releasing.finally(() => refKey?.fill(0)).catch(() => {});
+  } else void settled.then(async () => { try { await release(); } finally { refKey?.fill(0); } }).catch(() => {});
+  if (operationError !== undefined) throw operationError;
+  if (!nativeClosed || !drained || !released || summary === undefined) throw boundary(cliError("operation_failed"));
+  try { budget.assertBeforeDeadline(); dependencies.writeLine(summary); } catch (error) { throw boundary(error); }
+  return 0;
+}
+
 export async function runBackupCatalogCli(
   argv: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
@@ -917,6 +1115,9 @@ export async function runBackupCatalogCli(
   let refKeyPath: string | undefined;
   try { refKeyPath = tenantTelemetryOperatorRefKeyPath(env); }
   catch { throw cliError("invalid_configuration"); }
+  if ((SELECTED_COMMANDS as readonly string[]).includes(command)) {
+    return runSelectedContinuation(command as SelectedArtifactCommand, env, dependencies, refKeyPath);
+  }
   if (command === "create-artifact" || command === "verify-artifact" || command === "restore-selected") {
     return runArtifactCommand(command, env, dependencies, refKeyPath);
   }
@@ -1235,6 +1436,7 @@ export async function runBackupCatalogCli(
 
 function errorCode(error: unknown): BackupCatalogCliErrorCode {
   if (error instanceof BackupCatalogCliError) return error.code;
+  if (error instanceof SelectedRestoreError) return error.code;
   if (error instanceof mysqlArtifact.MySqlBackupArtifactError && error.code === "operation_deadline") {
     return "operation_deadline";
   }
@@ -1251,6 +1453,10 @@ function errorCode(error: unknown): BackupCatalogCliErrorCode {
 
 /** Fixed, content-free output; never stringify dependency errors, locators, or environment. */
 export function formatBackupCatalogCliError(error: unknown): string {
+  if (error instanceof BackupCatalogCliError && error.selectedBoundary) {
+    return JSON.stringify({ status: "error", code: error.code, ...error.selectedBoundary,
+      requiresExactReplay: true, importAttempted: false, requiresManualForwardFixIfReplayFails: true });
+  }
   if (error instanceof BackupCatalogCliError && error.restoreBoundary) {
     return JSON.stringify({ status: "error", code: error.code, ...error.restoreBoundary,
       requiresManualForwardFix: true, runtimeActivated: false });

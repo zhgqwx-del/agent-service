@@ -485,4 +485,20 @@ migration 不回填、不激活 control、不联网、不执行业务 DELETE；�
 
 0030 activation 与0056只读 history receipt 同事务发布，晚期失败回滚全部 runtime/head/event/run/history。history 绑定真实不可变 `restore_activation` event；后续 publisher 合法推进 current generation/head 不会重签历史。旧 activation/failure/source/write receipt 和 reservation descriptor 都不改。历史只读结果不授予新写、旧 operation recovery 或0054删除许可；普通 active-capture pending 与新epoch普通启动仍 fail closed。当前实际 CLI 消费者仅为 backup-v2 prepare 后的受限 cold-read，不提供已可用的 capture 新epoch恢复操作命令。
 
-0055/0056 是加法式迁移，但严格 schema/trigger 指纹使旧 binary 不能在新 schema 启动：必须先停服排空旧 writer/事务，再独立迁移，只启新 binary、forward-fix，不允许热混跑或删除 marker。定向真实 MySQL/旧二进制历史夹具只证明所覆盖数据库状态；完整加密 MySQL/MinIO 导入→replay→activation→新写/旧pending续跑仍待验收，新epoch显式cutover/逐operation新claim消费者尚未实现。没有新增常驻服务、JavaScript入口或镜像；0037硬拒、外部删除/自动清理关闭和全部全域completion=false保持。实际通过/失败与发布状态以 PROGRESS 最新节为准。
+0055/0056 是加法式迁移，但严格 schema/trigger 指纹使旧 binary 不能在新 schema 启动：必须先停服排空旧 writer/事务，再独立迁移，只启新 binary、forward-fix，不允许热混跑或删除 marker。以上是0056的历史实现边界；后续0057消费者见下一节，不能用0056旧验收为其背书。没有新增常驻服务、JavaScript入口或镜像；0037硬拒、外部删除/自动清理关闭和全部全域completion=false保持。实际通过/失败与发布状态以 PROGRESS 最新节为准。
+
+## 15. 0057 显式新 epoch capture 与旧 pending 恢复（未发布候选）
+
+候选把0030 runtime activation、0056只读历史和0057写入cutover分成不同权限。runtime active/history可读不代表capture可写；首次cutover必须在同一Memory原子边界或MySQL显式RR事务中重新锁定并核对选定checkpoint、当前49类来源、0031 binding/reservation、真实0030 activation及完整owner/source关系。新cutover收据另绑定新epoch、configured fleet、旧writer排空与producer就绪ACK。旧0053 activation/coverage/failure、原checkpoint叶和reservation descriptor不重签；新failure receipt改为绑定实际cutover receipt与新epoch。
+
+普通runner只需要既有本地capture gate与受保护ref key，不能因此获得operator restore权限。维护factory/activation仍独立要求exact run、受保护authenticated-v2制品和本地停服ACK；operator-only只能维护历史，不能借该flag claim/renew/reserve/create/ACK。cutover后的历史读取须证明immutable history、实际cutover和当前完整source/recovery链，允许合法新写/claim/ACK，不再永久要求当前49类投影等于导入前快照。首次cutover前仍要求精确冻结集合；不得提供通用skip-audit或allow-missing-source开关。
+
+旧validated-v2 pending仅可由新的attempt/token领取，同时原子发行逐operation不可变permit。permit从原checkpoint的真实job叶开始，绑定immutable job descriptor、实际latest predecessor、reservation-at-issue及原reservation授权来源；同一predecessor只能有一个successor。原queued的第一次新claim可以创建一次reservation；重试后的claim沿用同一R，不改变“原checkpoint为queued”的事实。initial lease与固定ceiling分离，实际lease须在ceiling内且按DB时间有效；超限续租不能截短后谎报成功。permit INSERT、job CAS及临COMMIT lease尾检任何一步失败均回滚，reserve/ACK也须在可能阻塞的SQL之后再验真实DB时间。
+
+live owner/T1/policy/hold关闭后，已有reservation只可降为ACK-only：外部exact对象存在才可精确收ACK，对象缺失只能重试，不能reserve/create。旧epoch的legacy/unknown非v2 job在排序/LIMIT前排除，并在旧authorization直接入口再次拒绝；保留其原数据不等于赋予执行权。新epoch合法capture和原primary/inactive的普通writer行为保持区分，不能为恢复门禁破坏日常v1队列。
+
+已有`backup-catalog`增加五个显式continuation命令：`replay-selected`、`verify-selected`、`activate-selected`、`activate-capture-selected`和`resolve-selected`。它们继续持有真实认证GCM制品与target/operator锁，校验外部catalog/journal的实际sealed链和fresh head，只在已导入目标继续指定run，不重新reserve/import/prepare；每条命令各自要求独立ACK。`resolve-selected`另需`BACKUP_RESTORE_CATALOG_RESOLUTION_ACK=1`，仅实际active+capture cutover后的run可投影为activated；CAS前验证实际history/cutover，CAS后完整读链核对event，再由exact facade同事务收口本地reservation，response-loss只能显式exact retry。它不为operator赋普通capture写权限、不提供本批v2 abort或自动resolution；旧generic `resolve-restore`保留v1行为。helper不新增JavaScript入口，长期服务/入口/镜像仍为2/6/2。
+
+新seal只有在49类锁定且真实逐operation source/member/owner/usage/billing完整审计后，才将其新增v2 membership作为validated；tenant的旧历史仍unknown。原sealed CP按实际受保护selector和完整物理身份/HMAC/state/highwater集合保留原knowledge，不能提升旧unknown或重签；旧unknown required源在首cutover INSERT前拒绝。MySQL include_v2领取在全图共享审计之前用实际logs control PK排他锁串行批次，避免两个RR审计互持job共享锁后都被`SKIP LOCKED`跳过。原审计、CAS与末租期校验不变；legacy-only仍RC。它不是吞吐提升：provider session→control与claim control→session反序仍可能触发1205/1213，必须原生透传并整事务回滚重试。
+
+0057增加两张append-only表、8新guard并轮换0053的subject/binding/job/failure四个BI；完整真实指纹为728 trigger。必须先关闭相关gate、停服排空全部pre-0057 writer/事务，再独立迁移、只启动0057-aware binary并forward-fix，不能热混跑。冻结0056旧binary的5例真实升级、真实SQL8例、Memory维护51、CLI107及独立Pi→GCM→新epoch→MinIO纵向1例分别已通过，失败与源码分段见PROGRESS，不能冒称新整包verify/verify-s3/CI或生产验收。重复备份/再次恢复后的epoch链、其它domain联合恢复、backup-copy erasure及全域completion仍不得据本切片宣称闭环；0054 restored destructive仍拒，0037/外部删除/自动清理及production gate不放开。

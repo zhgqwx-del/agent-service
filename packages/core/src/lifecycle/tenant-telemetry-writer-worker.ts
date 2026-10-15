@@ -240,6 +240,14 @@ export class TenantTelemetryWriterWorker {
       return this.completeWithExactReplay(auth, claim, input, inspected.result);
     }
 
+    // A restored reservation may be restricted to acknowledging already-present
+    // exact bytes. Absence is retryable, never permission to reserve or create.
+    // The store independently validates the current durable permit at each
+    // mutation boundary; this claim projection only narrows the worker branch.
+    if (claim.captureRecovery?.recoveryMode === "reserved_ack_only") {
+      throw new TenantTelemetryWriteAdapterTemporaryError();
+    }
+
     if (!claim.reservation) {
       await this.requireRenew(auth);
       const freshProof = await this.requireV2Boundary(claim, "reserve");

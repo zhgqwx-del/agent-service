@@ -754,6 +754,14 @@ verify_s3() {
     S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
     MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
     pnpm run test:telemetry-capture-mysql-s3
+  env "${s3_test_env[@]}" \
+    S3_TENANT_TELEMETRY_TEST_BUCKET="$tenant_telemetry_bucket" \
+    S3_BACKUP_CATALOG_TEST_BUCKET="$backup_catalog_bucket" \
+    S3_RESTORE_JOURNAL_TEST_BUCKET="$restore_journal_bucket" \
+    MYSQL_TEST_URL="${MYSQL_TEST_URL:-mysql://root@127.0.0.1:3306/agent_service_test}" \
+    BACKUP_MYSQL_BINARY="$artifact_mysql_binary" \
+    BACKUP_MYSQLDUMP_BINARY="$artifact_mysqldump_binary" \
+    pnpm run test:telemetry-capture-restore-mysql-s3
   local telemetry_disposition_bucket="${TELEMETRY_DISPOSITION_S3_BUCKET:-agent-service-local-telemetry-disposition}"
   [ "$telemetry_disposition_bucket" != "${MINIO_BUCKET:-agent-service-local}" ] \
     || die "TELEMETRY_DISPOSITION_S3_BUCKET must differ from the Blob bucket"

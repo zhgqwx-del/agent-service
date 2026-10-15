@@ -13,6 +13,11 @@ Commands:
   create-artifact    Local-only: dump, encrypt, authenticate and publish an actual MySQL artifact.
   verify-artifact    Local-only: authenticate artifact bytes against fresh recoverable catalog evidence.
   restore-selected   Local-only: import authenticated bytes into an isolated empty database; leave prepared.
+  replay-selected    Local-only: authenticate the same v2 artifact and replay the selected run's fences.
+  verify-selected    Local-only: explicitly seal and verify the selected run's replay receipt.
+  activate-selected  Local-only: explicitly activate the selected runtime and its read-only capture history.
+  activate-capture-selected  Local-only: independently authorize capture in that exact restored epoch.
+  resolve-selected   Local-only: explicitly resolve that authenticated v2 run's active reservation as activated.
   list               List recoverable backup identities; never prints locators or credentials.
   prepare-restore    Select one exact backup and reserve a permanently unique runtime epoch.
   resolve-restore    Project an externally confirmed activated/aborted restore reservation.
@@ -28,7 +33,8 @@ restored target. Inactive databases may omit it. Missing/wrong keys fail closed 
 startup audit. Direct commands reject any ambient TENANT_TELEMETRY_REF_KEY, including empty;
 local-service.sh clears that application hex input for the foreground command only.
 
-The three artifact commands require BACKUP_ARTIFACT_LOCAL_ONLY_ACK=1, a private
+Artifact creation, verification, initial restore and selected continuation commands require
+BACKUP_ARTIFACT_LOCAL_ONLY_ACK=1, a private
 BACKUP_ARTIFACT_DIRECTORY and an independent, private 32-byte BACKUP_ARTIFACT_KEY_FILE.
 Create/restore additionally require RESTORE_FLEET_STOPPED_ACK=1 and explicitly trusted absolute
 BACKUP_MYSQL_BINARY/BACKUP_MYSQLDUMP_BINARY paths. Install MySQL 8 mysql/mysqldump externally:
@@ -46,8 +52,21 @@ or epoch is permanently refused, even with another artifact directory or empty t
 Preserve exact operation evidence for explicit manual forward-fix
 with prepare-restore and restore-ledger-reconcile. Source loss and automatic import resume are unsupported.
 publish-backup remains attestation-only and does not produce or authenticate artifact bytes.
-This key plumbing does not rebind active provider capture to a restored runtime epoch;
-active provider-capture restore is unsupported and remains fail closed.
+For active provider capture, the five selected continuation commands authenticate the same
+v2 artifact, the existing target's exact binding/reservation, external authority and history.
+They never import again or reserve a new epoch. replay-selected requires BACKUP_RESTORE_REPLAY_ACK=1;
+verify-selected requires BACKUP_RESTORE_VERIFY_ACK=1; activate-selected independently requires
+BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK=1. All require RESTORE_FLEET_STOPPED_ACK=1 and the protected
+operator ref key. Ordinary startup remains fail closed before the separate capture cutover.
+activate-capture-selected additionally requires TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK=1,
+the four TELEMETRY_CAPTURE_LOCAL_ONLY/FLEET_STOPPED/LEGACY_WRITERS_DRAINED/PRODUCER_READY_ACK=1
+declarations and TELEMETRY_CAPTURE_CONFIGURED_FLEET_ROOT_SHA256. History alone never grants writes.
+resolve-selected separately requires BACKUP_RESTORE_CATALOG_RESOLUTION_ACK=1. It authenticates
+the full external catalog chain, already active exact target run and committed capture cutover before its external CAS
+and local projection; it never activates runtime/capture or grants ordinary writer authority.
+Response loss requires an explicit retry with exactly the same artifact/run/epoch identities.
+Legacy resolve-restore is unchanged; selected v2 resolution uses resolve-selected, never a fallback.
+No command claims all-domain completion.
 
 Options:
   -h, --help  Show this help and exit.

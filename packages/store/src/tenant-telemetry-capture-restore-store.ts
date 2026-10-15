@@ -1,8 +1,10 @@
 import type { ExactReplay } from "./backup-catalog.js";
+import type { TenantBackupCatalogStore } from "./backup-catalog.js";
 import type {
   TenantTelemetryCaptureBackupCheckpoint,
   TenantTelemetryCaptureCheckpointLeaf,
   TenantTelemetryCaptureRestoreHistoryReceipt,
+  TenantTelemetryCaptureEpochCutoverReceipt,
 } from "./tenant-telemetry-capture-restore.js";
 import { TenantTelemetryCaptureRestoreIntegrityError } from "./tenant-telemetry-capture-restore.js";
 import type { RestoreReplayStore, TenantRestoreJournalStore } from "./tenant-restore-journal.js";
@@ -47,8 +49,32 @@ export function validateTenantTelemetryCaptureRestoreMaintenanceSelector(
     || value.fleetStoppedAck !== "fleet-stopped-v1" || value.localOnlyAck !== "local-only-v1") fail();
 }
 
-/** Exact-run only: no general SessionStore, prepare, primary activation, write
- * proof, cutover or deletion methods are exposed. Every run-bearing argument
+export interface ActivateTenantTelemetryCaptureRestoredEpochInput {
+  expectedRuntimeEpochSha256: string;
+  configuredFleetRootSha256: string;
+  legacyWritersDrainedAck: "legacy-writers-drained-v1";
+  producerReadyAck: "provider-step-error-v2-ready-v1";
+}
+
+export function validateActivateTenantTelemetryCaptureRestoredEpochInput(value: ActivateTenantTelemetryCaptureRestoredEpochInput): void {
+  function fail(): never { throw new TenantTelemetryCaptureRestoreIntegrityError(); }
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail();
+  const keys = ["expectedRuntimeEpochSha256", "configuredFleetRootSha256", "legacyWritersDrainedAck", "producerReadyAck"];
+  const actual = Reflect.ownKeys(value);
+  if (actual.length !== keys.length || actual.some((key) => typeof key !== "string" || !keys.includes(key))) fail();
+  for (const key of actual) {
+    const field = Object.getOwnPropertyDescriptor(value, key);
+    if (!field || !("value" in field) || !field.enumerable) fail();
+    if (typeof key === "string" && key.endsWith("Sha256")
+      && (typeof field.value !== "string" || !/^[0-9a-f]{64}$/.test(field.value))) fail();
+  }
+  if (value.legacyWritersDrainedAck !== "legacy-writers-drained-v1"
+    || value.producerReadyAck !== "provider-step-error-v2-ready-v1") fail();
+}
+
+/** Exact-run only: no general SessionStore, prepare, primary activation or
+ * deletion methods are exposed. Every run-bearing argument
  * must still match the privately held selector on every call. */
 export type TenantTelemetryCaptureRestoreMaintenance = Pick<RestoreReplayStore,
   "getTenantRestoreReplayRun" | "getTenantRestoreReplaySealedTargets"
@@ -58,8 +84,13 @@ export type TenantTelemetryCaptureRestoreMaintenance = Pick<RestoreReplayStore,
   | "getTenantRestoreRuntimeHeads" | "activateTenantRestoreRuntime"
 > & Pick<TenantRestoreJournalStore,
   "getTenantRestoreJournalControl" | "getTenantRestoreJournalControlTargets"
+> & Pick<TenantBackupCatalogStore,
+  "getTenantBackupRestoreSourceBinding" | "getTenantBackupRuntimeReservation"
+  | "resolveTenantBackupRuntimeReservation"
 > & {
   getTenantTelemetryCaptureRestoreHistoryReceipt(): Promise<TenantTelemetryCaptureRestoreHistoryReceipt | null>;
+  activateTenantTelemetryCaptureRestoredEpoch(input: ActivateTenantTelemetryCaptureRestoredEpochInput): Promise<TenantTelemetryCaptureEpochCutoverReceipt>;
+  getTenantTelemetryCaptureEpochCutoverReceipt(): Promise<TenantTelemetryCaptureEpochCutoverReceipt | null>;
   close(): Promise<void>;
 };
 
@@ -71,6 +102,15 @@ export interface MysqlTenantTelemetryCaptureRestoreMaintenanceOptions {
   operationAbortSignal?: AbortSignal;
   selector: TenantTelemetryCaptureRestoreMaintenanceSelector;
 }
+
+/** Artifact identity is already authenticated by the held GCM reader. The
+ * private factory must derive both reservation digests from the actual target,
+ * then invoke the full exact-run selector audit; this is not a proof shortcut. */
+export type MysqlTenantTelemetryCaptureArtifactRestoreMaintenanceOptions =
+  Omit<MysqlTenantTelemetryCaptureRestoreMaintenanceOptions, "selector"> & {
+    selection: Omit<TenantTelemetryCaptureRestoreMaintenanceSelector,
+      "reservationSha256" | "reservationReceiptSha256">;
+  };
 
 /** The store, never the caller, derives these leaves from the complete source. */
 export interface TenantTelemetryCaptureBackupCheckpointRecord {

@@ -1,5 +1,7 @@
 # agent-service
 
+当前0057未发布纵向候选（2026-10-15）：真实Pi/HTTP→加密MySQL备份→新epoch恢复→显式capture/catalog切换→三种旧pending实际MinIO ACK→新Pi失败与普通冷重连的独立纵向用例已1/1通过。Memory维护51、CLI编排107、真实冻结0056历史升级5例、最终MySQL8例及旧writer兼容14例分别通过；旧unknown checkpoint不提升、不重签。双并发空领取已由v2单行串行门修复，租约、全图审计与回滚断言不变；潜在死锁/容量仍需评估。`resolve-selected`仅按指定run显式收口，不赋普通writer权限。当前尚未完整verify/verify-s3或新CI，不合入/发布或推进M1冻结；准确分段与失败见[PROGRESS](docs/PROGRESS.md)末节。
+
 0056恢复维护本地检查点（2026-10-15）：已接入仅指定run的维护facade、与0030 runtime同事务的只读history，以及v2制品prepare后的受限cold-open；不启用新epoch capture或旧pending续跑。共享/CI门禁三文件314项、最终CLI整文件66项、Memory整文件24项通过；真实MySQL六项正反例及独立RC→RR并发一项分段通过，冻结旧0055二进制的真实升级夹具3/3通过。最终typecheck、secret scan及diff检查已做；不是新功能包全量或CI通过。旧失败与实际报告见[进度](docs/PROGRESS.md)末节。下方12:37是此前`bbe5ab8`检查点的时间点状态，maintenance/history现已接入，其余新epoch写入/旧pending续跑及真实制品纵向验收仍待；main/CI未变。
 
 本worktree的M1恢复接线检查点（2026-10-15T12:37Z）：Memory/MySQL已实际封存49类来源及不可变叶子；加密备份v2把完整checkpoint纳入manifest/AAD，新dump先核对真实store与operator的server UUID/数据库绑定，再审计前后来源，v1字节兼容。0031选择/0030 prepare以显式checkpoint和独立sidecar原子绑定，缺证据不补造。Memory 46项、真实隔离MySQL 12项、冻结0054→0055历史4项及原0053→0054回归14项均通过；详细分段证据和失败记录见[进度](docs/PROGRESS.md)。这仍不是完整恢复能力：maintenance启动、原子历史receipt、新epoch显式写入及旧pending新claim续跑尚未接入，真实MySQL/MinIO制品纵向验收仍待。未运行本功能包全量或新CI，未合入/推送/部署/激活；main/origin2932318的[原CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38714666463)五项全绿仅证明原基线。M1未冻结、M2冻结、M3未开始，0037硬拒、0054原primary删除资格、自动清理off与全域completion=false不变。

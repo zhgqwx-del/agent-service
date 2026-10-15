@@ -1,5 +1,11 @@
 # agent-service 协作约定
 
+## 当前0057未发布纵向候选（2026-10-15）
+
+- 当前候选基于本地`b8b8984`，main/origin293与独立M4不变；root唯一测试/构建/DB/Git执行器。0057隔离DDL728trigger/8根真实校准；真实Pi/HTTP/GCM/MySQL/MinIO完整新epoch纵向1/1、Memory维护51、CLI编排107、冻结0056旧binary历史5例、最终MySQL8例及旧writer14例分别整文件通过，不当完整verify/CI或生产验收。
+- 新epoch proof由actual cutover/history/runtime生成（captureControlEvidenceSha256=cutover receipt），旧0053 receipt/coverage/descriptor不改。旧CP字段永远描述原snapshot；逐claim successor/原descriptor/明确reservationAtIssue/原authorizing permit和有界lease ceiling一起核对，不能复活旧claim或永久强制49行不变。0054 T1恢复后只能诚实blocked，destructive仍original-primary-only，0037/外部删除/自动清理off及completion=false不变。
+- 新seal完整49锁和真实逐operation全链审计后才分类membership；旧CP逐叶physical identity/HMAC/state/time精确相同才保留原knowledge，不提升unknown或重签。首cutover提前拒未知required源。显式resolve-selected只该active run的activated catalog投影，独立ACK、heldGCM/targetlock/budget、history/cutover/全externalchain，不给operator普通writer gate；旧generic不变。SQL整8首轮6pass/2fail保留PROGRESS；最终source67d以include_v2首logs PK X串行门通过整8/8，legacy-only RC与1205/1213原生回滚不动，不称吞吐优化/无死锁。之前shared142/worker22与注册177/wrapper2保持当时证明；登记130/64group/50历史不当执行。源冻结后集中全量/相关S3，较大阶段一次CI，不先合入或发布。
+
 ## 当前未发布0056本地检查点（2026-10-15）
 
 - `bbe5ab8`之后的exact-run maintenance/history与backup-v2 cold-open已实际接入，但不是完整新epoch恢复或新写授权。0056只加history表/2不可变guard，真实新隔离库校准720-trigger；旧0055不改，禁止混跑旧writer。

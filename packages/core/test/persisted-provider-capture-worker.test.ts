@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createStructuredTelemetry, emptyUsage, type Item, type StructuredTelemetryRecord, type Turn } from "@agent-service/protocol";
 import { EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256, MemorySessionStore, S3_TENANT_TELEMETRY_WRITE_ADAPTER_PROTOCOL,
   TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, newUsageId, s3TenantTelemetryTargetIdentity, tenantTelemetryWriteAdapterResult,
-  type TenantTelemetryWriteAdapter, type TenantTelemetryWriteAdapterInput, type TenantTelemetryPersistedProviderCaptureProof } from "@agent-service/store";
+  type TenantTelemetryWriteAdapter, type TenantTelemetryWriteAdapterInput, type TenantTelemetryWriteClaim,
+  type TenantTelemetryPersistedProviderCaptureProof } from "@agent-service/store";
 import { createPersistedProviderFailureCapture, newId, TenantTelemetryWriterWorker } from "../src/index.js";
 
 const key = new Uint8Array(32).fill(43);
@@ -81,6 +82,7 @@ async function fixture(failAt?: string, responseLoss?: "sink" | "database", mixe
   const reserveOriginal = store.reserveTenantTelemetryExternalMutation.bind(store);
   const reserve = vi.spyOn(store, "reserveTenantTelemetryExternalMutation");
   const complete = vi.spyOn(store, "completeTenantTelemetryWrite");
+  const claimOriginal = store.claimTenantTelemetryWriteJobs.bind(store);
   const claim = vi.spyOn(store, "claimTenantTelemetryWriteJobs");
   let gateFailure = failAt;
   if (responseLoss === "database") {
@@ -92,7 +94,7 @@ async function fixture(failAt?: string, responseLoss?: "sink" | "database", mixe
     async requireFreshFleet(expected, boundary) { calls.push(`fresh-${boundary}`); if (boundary === gateFailure) throw new Error("unit configured target offline"); return expected; },
   } }, { leaseMs: 1000, batchSize: 1, retryBaseMs: 10, retryMaxMs: 100 });
   closers.push(async () => { await worker.stop(); await store.close(); });
-  return { store, worker, adapter, calls, operation, tenantId, present, reserve, reserveOriginal, complete, claim, legacyOperations,
+  return { store, worker, adapter, calls, operation, tenantId, present, reserve, reserveOriginal, complete, claim, claimOriginal, legacyOperations,
     setGateFailure(boundary?: string) { gateFailure = boundary; },
     advanceTime(delta: number) { now += delta; },
     async deleteOwner() {
@@ -110,7 +112,98 @@ async function fixture(failAt?: string, responseLoss?: "sink" | "database", mixe
     } };
 }
 
+/** Only worker control-flow is under test here: the returned claim's recovery
+ * projection is injected onto an actual PRIMARY source/claim. This is not a
+ * restored epoch, a durable recovery permit, a real S3 ACK or fleet proof.
+ * Real restore authorization is independently covered by the store/vertical
+ * suites. Keeping that distinction makes a branch test useful without letting
+ * a fake permit stand in for source validation. */
+async function recoveryBranchFixture(
+  recoveryMode: NonNullable<TenantTelemetryWriteClaim["captureRecovery"]>["recoveryMode"],
+  remotePresent = false,
+  responseLoss?: "sink" | "database",
+) {
+  const h = await fixture(undefined, responseLoss);
+  const proof = await h.store.getTenantTelemetryPersistedProviderCaptureBinding();
+  if (!proof) throw new Error("worker branch fixture has no active primary binding");
+  let originalReservation: TenantTelemetryWriteClaim["reservation"];
+  if (recoveryMode !== "resume_queued") {
+    const [seed] = await h.claimOriginal({ limit: 1, leaseMs: 1_000,
+      claimToken: "worker-recovery-seed-claim-token", adapterProtocol: h.adapter.adapterProtocol,
+      captureMode: "include_v2", freshProof: proof });
+    if (!seed) throw new Error("worker branch fixture has no seed claim");
+    const seedAuth = { tenantId: seed.tenantId, writeOperationSha256: seed.writeOperationSha256,
+      claimAttempt: seed.claimAttempt, claimToken: seed.claimToken };
+    const reservation = await h.reserveOriginal(seedAuth, h.adapter.adapterProtocol, proof);
+    if (!reservation) throw new Error("worker branch fixture has no reservation");
+    originalReservation = structuredClone(reservation);
+    if (remotePresent) h.present.set(seed.writeOperationSha256, {
+      writeOperationSha256: seed.writeOperationSha256, target: seed.target,
+      inventory: seed.inventory, payload: seed.payload,
+    });
+    expect(await h.store.retryTenantTelemetryWrite(seedAuth, { delayMs: 10, errorCode: "temporary_failure" })).toBe(true);
+    h.advanceTime(11);
+  }
+  h.claim.mockImplementationOnce(async (options) => (await h.claimOriginal(options)).map((claim) => ({
+    ...claim,
+    captureRecovery: { permitReceiptSha256: D("c"), recoveryMode,
+      claimLeaseCeilingMs: claim.leaseUntilMs + 5_000 },
+  })));
+  h.calls.length = 0;
+  return { ...h, originalReservation };
+}
+
 describe("persisted provider source writer fresh boundaries", () => {
+  it("retries an absent ACK-only recovery object without reserving, creating or acknowledging", async () => {
+    const h = await recoveryBranchFixture("reserved_ack_only");
+    const retry = vi.spyOn(h.store, "retryTenantTelemetryWrite");
+    expect(await h.worker.processOnce()).toBe(0);
+    expect(h.calls).toEqual(["fresh-claim", "inspect"]);
+    expect(h.reserve).not.toHaveBeenCalled(); expect(h.complete).not.toHaveBeenCalled();
+    expect(h.present.size).toBe(0); expect(retry).toHaveBeenCalledOnce();
+    const queued = await h.store.getTenantTelemetryWriteJob(h.tenantId, h.operation);
+    expect(queued).toMatchObject({ phase: "queued", attempts: 2, reservation: h.originalReservation });
+    expect(queued?.claimToken).toBeUndefined();
+  });
+
+  it.each([undefined, "database"] as const)("acknowledges an exact ACK-only recovery object without another create (loss=%s)", async (loss) => {
+    const h = await recoveryBranchFixture("reserved_ack_only", true, loss);
+    expect(await h.worker.processOnce()).toBe(1);
+    expect(h.reserve).not.toHaveBeenCalled(); expect(h.present.size).toBe(1);
+    expect(h.calls.filter((call) => call === "external-create")).toHaveLength(0);
+    expect(h.calls.filter((call) => call === "fresh-ack")).toHaveLength(loss === "database" ? 2 : 1);
+    const ack = await h.store.getTenantTelemetryWriteAck(h.tenantId, h.operation);
+    expect(ack?.reservationReceiptSha256).toBe(h.originalReservation?.receiptSha256);
+  });
+
+  it("resumes a reserved-before-create object using the existing immutable reservation", async () => {
+    const h = await recoveryBranchFixture("resume_reserved");
+    expect(await h.worker.processOnce()).toBe(1);
+    expect(h.calls).toEqual(["fresh-claim", "inspect", "fresh-create", "external-create", "fresh-ack"]);
+    expect(h.reserve).not.toHaveBeenCalled();
+    expect((await h.store.getTenantTelemetryWriteJob(h.tenantId, h.operation))?.reservation).toEqual(h.originalReservation);
+    expect((await h.store.getTenantTelemetryWriteAck(h.tenantId, h.operation))?.reservationReceiptSha256)
+      .toBe(h.originalReservation?.receiptSha256);
+  });
+
+  it("keeps a recovered queued claim's branch metadata after first reserve and continues create/ACK", async () => {
+    const h = await recoveryBranchFixture("resume_queued");
+    expect(await h.worker.processOnce()).toBe(1);
+    expect(h.calls).toEqual(["fresh-claim", "inspect", "fresh-reserve", "inspect", "fresh-create", "external-create", "fresh-ack"]);
+    expect(h.reserve).toHaveBeenCalledOnce(); expect(h.complete).toHaveBeenCalledOnce();
+    expect(await h.store.getTenantTelemetryWriteAck(h.tenantId, h.operation)).not.toBeNull();
+  });
+
+  it.each(["create", "ack"] as const)("rechecks the %s fleet boundary while resuming an existing reservation", async (boundary) => {
+    const h = await recoveryBranchFixture("resume_reserved");
+    h.setGateFailure(boundary);
+    expect(await h.worker.processOnce()).toBe(0);
+    expect(h.reserve).not.toHaveBeenCalled(); expect(h.complete).not.toHaveBeenCalled();
+    expect(h.calls).toContain(`fresh-${boundary}`);
+    expect(h.present.size).toBe(boundary === "ack" ? 1 : 0);
+    expect((await h.store.getTenantTelemetryWriteJob(h.tenantId, h.operation))?.reservation).toEqual(h.originalReservation);
+  });
+
   it("requires separate observations at claim, reserve, create and ACK, passing the current tuple to each store transaction", async () => {
     const h = await fixture();
     expect(await h.worker.processOnce()).toBe(1);

@@ -97,16 +97,21 @@ function fixture(options: FixtureOptions = {}) {
     inventorySha256: h("original-inventory"), payloadSha256: h("original-payload"), manifestSha256: h("original-manifest"),
     membershipSha256: h("original-membership"), sourceBindingReceiptSha256: h("original-source-binding"), failureCommitReceiptSha256: h("original-failure"),
     originalJobState: state === "reserved" ? "reserved" : "queued", originalJobEvidenceHmacSha256: evidence("write_job"),
+    originalJobDescriptorSha256: h("original-job-descriptor"),
     originalPayloadEvidenceHmacSha256: evidence("write_payload"), originalMembershipEvidenceHmacSha256: evidence("membership"),
     originalSourceBindingEvidenceHmacSha256: evidence("provider_source_binding"), originalFailureEvidenceHmacSha256: evidence("provider_failure_commit"),
     originalReservationReceiptSha256: state === "reserved" ? h("original-reservation-receipt") : null,
     originalReservationEvidenceHmacSha256: state === "reserved" ? evidence("write_reservation") : null,
     originalReservationClaimAttempt: state === "reserved" ? 2 : null, originalReservationClaimTokenSha256: state === "reserved" ? h("reservation-old-token") : null,
     previousClaimAttempt: 3, previousClaimTokenSha256: h("previous-claim-token"), previousClaimLeaseUntilMs: 1_300,
-    newClaimAttempt: 4, newClaimTokenSha256: h("new-claim-token"), newClaimLeaseUntilMs: 2_400, issuedAtDbMs: 1_400,
+    newClaimAttempt: 4, newClaimTokenSha256: h("new-claim-token"), newClaimLeaseUntilMs: 2_400, claimLeaseCeilingMs: 2_400,
+    previousPermitReceiptSha256: null,
+    reservationAtIssue: state === "reserved" ? { origin: "checkpoint", receiptSha256: h("original-reservation-receipt"),
+      startedAtDbMs: 1_000, startedClaimAttempt: 2, startedClaimTokenSha256: h("reservation-old-token") } : { origin: "none" },
+    issuedAtDbMs: 1_400,
     recoveryMode: state === "reserved" ? "resume_reserved" : "resume_queued" };
   const context = { key, checkpoint, history, cutover, originalLeaves: leaves, activationBinding: binding,
-    recoveryBinding: { input: recoveryInput, storeDbTimestampMs: 1_500 } };
+    recoveryBinding: { input: recoveryInput, claimLeaseUntilMs: recoveryInput.newClaimLeaseUntilMs, storeDbTimestampMs: 1_500 } };
   return { leaves, checkpoint, binding, history, cutoverInput, cutover, recoveryInput, context };
 }
 const rejected = (work: () => unknown) => expect(work).toThrow(codec.TenantTelemetryCaptureRestoreIntegrityError);
@@ -649,13 +654,68 @@ describe("exact pending-operation recovery inclusion and new-claim fencing", () 
     codec.assertTenantTelemetryCaptureOperationRecoveryBinding(permit, f.context.recoveryBinding);
     for (const field of ["tenantRefSha256", "ownerRefSha256", "sourceItemRefSha256", "inventorySha256", "payloadSha256", "manifestSha256",
       "membershipSha256", "sourceBindingReceiptSha256", "failureCommitReceiptSha256", "newClaimTokenSha256"] as const) {
-      const current = { input: { ...f.recoveryInput, [field]: h(`different-current-${field}`) }, storeDbTimestampMs: 1_500 };
+      const current = { input: { ...f.recoveryInput, [field]: h(`different-current-${field}`) }, claimLeaseUntilMs: 2_400, storeDbTimestampMs: 1_500 };
       rejected(() => codec.assertTenantTelemetryCaptureOperationRecoveryBinding(permit, current));
     }
     rejected(() => codec.assertTenantTelemetryCaptureOperationRecoveryBinding(permit, { ...f.context.recoveryBinding, storeDbTimestampMs: 2_400 }));
     rejected(() => codec.assertTenantTelemetryCaptureOperationRecoveryBinding(permit, { ...f.context.recoveryBinding, storeDbTimestampMs: 1_399 }));
     const context: codec.TenantTelemetryCaptureRestoreRecordContext = { ...f.context }; delete context.recoveryBinding;
     rejected(() => codec.encodeTenantTelemetryCaptureRestoreRecord(permit, context));
+  });
+});
+
+describe("recovery permit predecessor and reservation-at-issue chain (pure fixtures only)", () => {
+  function chain() {
+    const f = fixture(), first = createPermit(f);
+    const input: codec.TenantTelemetryCaptureOperationRecoveryInput = { ...f.recoveryInput,
+      previousPermitReceiptSha256: first.receiptSha256, previousClaimAttempt: first.newClaimAttempt,
+      previousClaimTokenSha256: first.newClaimTokenSha256, previousClaimLeaseUntilMs: 2_400,
+      newClaimAttempt: 5, newClaimTokenSha256: h("p2-token"), newClaimLeaseUntilMs: 3_500,
+      claimLeaseCeilingMs: 4_000, issuedAtDbMs: 2_500, recoveryMode: "resume_reserved",
+      reservationAtIssue: { origin: "recovery-permit", receiptSha256: h("p1-created-reservation"),
+        startedAtDbMs: 1_500, startedClaimAttempt: first.newClaimAttempt, startedClaimTokenSha256: first.newClaimTokenSha256,
+        authorizingPermitReceiptSha256: first.receiptSha256 } };
+    const links = { previousPermit: first, reservationAuthorizer: first };
+    const second = codec.createTenantTelemetryCaptureOperationRecoveryPermit(input, f.cutover, f.history, f.checkpoint, f.leaves, key, links);
+    return { f, first, input, links, second };
+  }
+  it("preserves snapshot queued/null reservation while P2 resumes the exact R authorized by P1", () => {
+    const { f, second, links } = chain();
+    expect(second.originalJobState).toBe("queued"); expect(second.originalReservationReceiptSha256).toBeNull();
+    expect(second.newReservationAuthorized).toBe(false); expect(second.newExternalCreateAuthorized).toBe(true);
+    codec.validateTenantTelemetryCaptureOperationRecoveryPermit(second, f.cutover, f.history, f.checkpoint, f.leaves, key, links);
+  });
+  it("requires actual predecessor/authorizer context rather than trusting valid rehashed link digests", () => {
+    const { f, second, links } = chain();
+    rejected(() => codec.validateTenantTelemetryCaptureOperationRecoveryPermit(second, f.cutover, f.history, f.checkpoint, f.leaves, key));
+    for (const patch of [{ previousPermitReceiptSha256: h("different-predecessor") },
+      { originalJobDescriptorSha256: h("changed-descriptor") }, { newClaimAttempt: 6 }]) {
+      rejected(() => codec.validateTenantTelemetryCaptureOperationRecoveryPermit(reseal(second, patch), f.cutover, f.history, f.checkpoint, f.leaves, key, links));
+    }
+    const wrongR = { ...second.reservationAtIssue, startedClaimTokenSha256: h("other-token") };
+    rejected(() => codec.validateTenantTelemetryCaptureOperationRecoveryPermit(reseal(second, { reservationAtIssue: wrongR }), f.cutover, f.history, f.checkpoint, f.leaves, key, links));
+  });
+  it("extends P3 from latest P2 without replacing P1 reservation or original checkpoint evidence", () => {
+    const { f, first, second, input } = chain();
+    const third = codec.createTenantTelemetryCaptureOperationRecoveryPermit({ ...input,
+      previousPermitReceiptSha256: second.receiptSha256, previousClaimAttempt: second.newClaimAttempt,
+      previousClaimTokenSha256: second.newClaimTokenSha256, previousClaimLeaseUntilMs: 3_500,
+      newClaimAttempt: 6, newClaimTokenSha256: h("p3-token"), newClaimLeaseUntilMs: 5_000,
+      claimLeaseCeilingMs: 5_500, issuedAtDbMs: 4_001 }, f.cutover, f.history, f.checkpoint, f.leaves, key,
+    { previousPermit: second, reservationAuthorizer: first });
+    expect(third.originalJobEvidenceHmacSha256).toBe(first.originalJobEvidenceHmacSha256);
+    expect(third.reservationAtIssue).toEqual(second.reservationAtIssue);
+    rejected(() => codec.validateTenantTelemetryCaptureOperationRecoveryPermit(reseal(third,
+      { reservationAtIssue: { ...third.reservationAtIssue, receiptSha256: h("replacement-reservation") } }),
+    f.cutover, f.history, f.checkpoint, f.leaves, key, { previousPermit: second, reservationAuthorizer: first }));
+  });
+  it("allows a current renewed lease below the fixed ceiling but rejects expiry/ceiling drift", () => {
+    const f = fixture(), permit = createPermit(f, { ...f.recoveryInput, claimLeaseCeilingMs: 3_000 });
+    const current = { input: { ...f.recoveryInput, claimLeaseCeilingMs: 3_000 }, claimLeaseUntilMs: 2_800, storeDbTimestampMs: 2_700 };
+    codec.assertTenantTelemetryCaptureOperationRecoveryBinding(permit, current);
+    rejected(() => codec.assertTenantTelemetryCaptureOperationRecoveryBinding(permit, { ...current, claimLeaseUntilMs: 3_001 }));
+    rejected(() => codec.assertTenantTelemetryCaptureOperationRecoveryBinding(permit, { ...current, claimLeaseUntilMs: 2_399 }));
+    rejected(() => codec.assertTenantTelemetryCaptureOperationRecoveryBinding(permit, { ...current, storeDbTimestampMs: 2_800 }));
   });
 });
 

@@ -35,13 +35,17 @@ if (!result.stdout.includes("Usage: backup-catalog")) {
 }
 for (const prerequisite of [
   "create-artifact", "verify-artifact", "restore-selected",
+  "replay-selected", "verify-selected", "activate-selected", "activate-capture-selected", "resolve-selected",
   "BACKUP_ARTIFACT_LOCAL_ONLY_ACK=1", "BACKUP_ARTIFACT_KEY_FILE",
   "BACKUP_MYSQL_BINARY/BACKUP_MYSQLDUMP_BINARY", "Install MySQL 8 mysql/mysqldump externally",
   "current runner image does not include these tools", "Production use is rejected",
   "publish-backup remains attestation-only",
   "TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE", "32 raw bytes (not hex)",
   "Direct commands reject any ambient TENANT_TELEMETRY_REF_KEY",
-  "active provider-capture restore is unsupported",
+  "BACKUP_RESTORE_REPLAY_ACK=1", "BACKUP_RESTORE_VERIFY_ACK=1",
+  "BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK=1", "TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK=1",
+  "BACKUP_RESTORE_CATALOG_RESOLUTION_ACK=1",
+  "History alone never grants writes", "Catalog resolution stays explicit",
 ]) {
   if (!result.stdout.includes(prerequisite)) {
     throw new Error("backup-catalog --help omitted an artifact command or safety prerequisite");

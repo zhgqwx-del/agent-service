@@ -1,5 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { tenantTelemetryRefKeyIdSha256 } from "./tenant-telemetry-lifecycle.js";
+import { validateTenantTelemetryWriteJobRecord, type TenantTelemetryWriteJobRecord } from "./tenant-telemetry-writer.js";
 import {
   validateTenantRestoreJournalControlRecord, validateTenantRestoreRuntimeControlRecord,
   type TenantRestoreJournalControlRecord, type TenantRestoreRuntimeControlRecord,
@@ -260,6 +261,7 @@ export interface TenantTelemetryCaptureOperationRecoveryInput {
   failureCommitReceiptSha256: string;
   originalJobState: "queued" | "reserved";
   originalJobEvidenceHmacSha256: string;
+  originalJobDescriptorSha256: string;
   originalPayloadEvidenceHmacSha256: string;
   originalMembershipEvidenceHmacSha256: string;
   originalSourceBindingEvidenceHmacSha256: string;
@@ -274,10 +276,21 @@ export interface TenantTelemetryCaptureOperationRecoveryInput {
   newClaimAttempt: number;
   newClaimTokenSha256: string;
   newClaimLeaseUntilMs: number;
+  claimLeaseCeilingMs: number;
+  previousPermitReceiptSha256: string | null;
+  reservationAtIssue: TenantTelemetryCaptureRecoveryReservationAtIssue;
   issuedAtDbMs: number;
   /** The consumer must still recheck current T1/owner/policy/hold/fleet at every
    * boundary. ACK-only never allows a new reserve or external create. */
   recoveryMode: "resume_queued" | "resume_reserved" | "reserved_ack_only";
+}
+export type TenantTelemetryCaptureRecoveryReservationAtIssue =
+  | { origin: "none" }
+  | { origin: "checkpoint"; receiptSha256: string; startedAtDbMs: number; startedClaimAttempt: number; startedClaimTokenSha256: string }
+  | { origin: "recovery-permit"; receiptSha256: string; startedAtDbMs: number; startedClaimAttempt: number; startedClaimTokenSha256: string; authorizingPermitReceiptSha256: string };
+export interface TenantTelemetryCaptureRecoveryPermitLinks {
+  previousPermit: TenantTelemetryCaptureOperationRecoveryPermit | null;
+  reservationAuthorizer: TenantTelemetryCaptureOperationRecoveryPermit | null;
 }
 export interface TenantTelemetryCaptureOperationRecoveryPermit extends TenantTelemetryCaptureOperationRecoveryInput, CaptureRestoreSafety {
   scope: typeof TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE;
@@ -333,6 +346,18 @@ function canonical(value: unknown): string {
 }
 function hash(scope: string, value: unknown): string {
   return createHash("sha256").update(scope).update("\0").update(canonical(value)).digest("hex");
+}
+
+/** Full immutable job descriptor, independently reconstructed from the actual
+ * validated row. All claim/phase/retry/reservation/ACK fields are intentionally
+ * excluded; genesis first binds the complete pre-claim row to its checkpoint. */
+export function tenantTelemetryCaptureRecoveryJobDescriptorSha256(job: TenantTelemetryWriteJobRecord): string {
+  validateTenantTelemetryWriteJobRecord(job);
+  return hash("tenant-telemetry-capture-recovery-job-descriptor-v1", {
+    writeOperationSha256: job.writeOperationSha256, tenantId: job.tenantId, protocol: job.protocol,
+    target: job.target, inventory: job.inventory, recordCount: job.recordCount,
+    payloadByteLength: job.payloadByteLength, createdAtMs: job.createdAtMs,
+  });
 }
 
 /** Stable restore-lineage identity; does not broaden the published primary
@@ -602,19 +627,38 @@ export function createTenantTelemetryCaptureEpochCutoverReceipt(
   const result = { ...body, receiptSha256: hash(body.scope, body) };
   validateTenantTelemetryCaptureEpochCutoverReceipt(result, history, checkpoint, key); return Object.freeze(result);
 }
+/** The original immutable producer identity remains transitively bound by the
+ * cutover; the current proof's control identity is the cutover receipt itself.
+ * The exact new epoch, stable restore binding and freshly configured fleet are
+ * authorized by the cutover; this never rewrites the published primary hash. */
+export function tenantTelemetryCaptureRestoredEpochProof(
+  cutover: TenantTelemetryCaptureEpochCutoverReceipt,
+  history: TenantTelemetryCaptureRestoreHistoryReceipt,
+  checkpoint: TenantTelemetryCaptureBackupCheckpoint,
+  key: Uint8Array,
+): import("./tenant-telemetry-persisted-provider-capture.js").TenantTelemetryPersistedProviderCaptureProof {
+  validateTenantTelemetryCaptureEpochCutoverReceipt(cutover, history, checkpoint, key);
+  return Object.freeze({ protocol: "persisted-provider-capture-fleet-v2" as const,
+    configuredFleetRootSha256: cutover.configuredFleetRootSha256,
+    captureControlEvidenceSha256: cutover.receiptSha256,
+    refKeyIdSha256: cutover.refKeyIdSha256, logsTargetSha256: cutover.logsTargetSha256,
+    logsTargetReceiptSha256: cutover.logsTargetReceiptSha256,
+    runtimeEpochSha256: cutover.runtimeEpochSha256, runtimeBindingSha256: cutover.runtimeBindingSha256 });
+}
 const RECOVERY_INPUT_KEYS = ["cutoverReceiptSha256", "historyReceiptSha256", "checkpointSha256", "restoreRunId", "runtimeEpochSha256",
   "writeOperationSha256", "tenantRefSha256", "ownerRefSha256", "sourceSessionRefSha256", "sourceTurnRefSha256", "sourceItemRefSha256", "sourceStepIndex",
   "inventorySha256", "payloadSha256", "manifestSha256", "membershipSha256", "sourceBindingReceiptSha256", "failureCommitReceiptSha256", "originalJobState",
-  "originalJobEvidenceHmacSha256", "originalPayloadEvidenceHmacSha256", "originalMembershipEvidenceHmacSha256", "originalSourceBindingEvidenceHmacSha256",
+  "originalJobEvidenceHmacSha256", "originalJobDescriptorSha256", "originalPayloadEvidenceHmacSha256", "originalMembershipEvidenceHmacSha256", "originalSourceBindingEvidenceHmacSha256",
   "originalFailureEvidenceHmacSha256", "originalReservationReceiptSha256", "originalReservationEvidenceHmacSha256", "originalReservationClaimAttempt",
   "originalReservationClaimTokenSha256", "previousClaimAttempt", "previousClaimTokenSha256", "previousClaimLeaseUntilMs", "newClaimAttempt",
-  "newClaimTokenSha256", "newClaimLeaseUntilMs", "issuedAtDbMs", "recoveryMode"] as const;
-const NULL_RECOVERY_DIGESTS = ["originalReservationReceiptSha256", "originalReservationEvidenceHmacSha256", "originalReservationClaimTokenSha256", "previousClaimTokenSha256"];
+  "newClaimTokenSha256", "newClaimLeaseUntilMs", "claimLeaseCeilingMs", "previousPermitReceiptSha256", "reservationAtIssue", "issuedAtDbMs", "recoveryMode"] as const;
+const NULL_RECOVERY_DIGESTS = ["originalReservationReceiptSha256", "originalReservationEvidenceHmacSha256", "originalReservationClaimTokenSha256", "previousClaimTokenSha256", "previousPermitReceiptSha256"];
 function validateRecoveryInput(value: TenantTelemetryCaptureOperationRecoveryInput): void {
   closed(value, RECOVERY_INPUT_KEYS); validateDigests(value, NULL_RECOVERY_DIGESTS); restoreRunId(value.restoreRunId);
-  integer(value.sourceStepIndex, 1); integer(value.previousClaimAttempt); integer(value.newClaimAttempt, 1); integer(value.issuedAtDbMs); integer(value.newClaimLeaseUntilMs);
-  requireValue((value.originalJobState === "queued" || value.originalJobState === "reserved") && value.newClaimAttempt > value.previousClaimAttempt
-    && value.newClaimLeaseUntilMs > value.issuedAtDbMs && value.newClaimLeaseUntilMs - value.issuedAtDbMs <= TENANT_TELEMETRY_CAPTURE_RECOVERY_MAX_LEASE_MS
+  integer(value.sourceStepIndex, 1); integer(value.previousClaimAttempt); integer(value.newClaimAttempt, 1); integer(value.issuedAtDbMs); integer(value.newClaimLeaseUntilMs); integer(value.claimLeaseCeilingMs);
+  requireValue((value.originalJobState === "queued" || value.originalJobState === "reserved") && value.newClaimAttempt === value.previousClaimAttempt + 1
+    && value.newClaimLeaseUntilMs > value.issuedAtDbMs && value.newClaimLeaseUntilMs <= value.claimLeaseCeilingMs
+    && value.claimLeaseCeilingMs - value.issuedAtDbMs <= TENANT_TELEMETRY_CAPTURE_RECOVERY_MAX_LEASE_MS
     && (value.recoveryMode === "resume_queued" || value.recoveryMode === "resume_reserved" || value.recoveryMode === "reserved_ack_only"));
   requireValue((value.previousClaimTokenSha256 === null) === (value.previousClaimLeaseUntilMs === null));
   if (value.previousClaimTokenSha256 !== null) {
@@ -622,7 +666,7 @@ function validateRecoveryInput(value: TenantTelemetryCaptureOperationRecoveryInp
       && value.newClaimTokenSha256 !== value.previousClaimTokenSha256);
   }
   if (value.originalReservationReceiptSha256 === null) {
-    requireValue(value.originalJobState === "queued" && value.recoveryMode === "resume_queued" && value.originalReservationEvidenceHmacSha256 === null
+    requireValue(value.originalJobState === "queued" && value.originalReservationEvidenceHmacSha256 === null
       && value.originalReservationClaimAttempt === null && value.originalReservationClaimTokenSha256 === null);
   } else {
     requireValue(value.originalJobState === "reserved" && (value.recoveryMode === "resume_reserved" || value.recoveryMode === "reserved_ack_only")
@@ -631,19 +675,43 @@ function validateRecoveryInput(value: TenantTelemetryCaptureOperationRecoveryInp
     requireValue(value.previousClaimAttempt >= value.originalReservationClaimAttempt && value.newClaimAttempt > value.originalReservationClaimAttempt
       && value.newClaimTokenSha256 !== value.originalReservationClaimTokenSha256);
   }
+  const reservation = value.reservationAtIssue;
+  requireValue(!!reservation && typeof reservation === "object");
+  if (reservation.origin === "none") {
+    closed(reservation, ["origin"]);
+    requireValue(value.originalReservationReceiptSha256 === null && value.recoveryMode === "resume_queued");
+  } else {
+    requireValue(reservation.origin === "checkpoint" || reservation.origin === "recovery-permit");
+    closed(reservation, ["origin", "receiptSha256", "startedAtDbMs", "startedClaimAttempt", "startedClaimTokenSha256",
+      ...(reservation.origin === "recovery-permit" ? ["authorizingPermitReceiptSha256"] : [])]);
+    digest(reservation.receiptSha256); digest(reservation.startedClaimTokenSha256);
+    integer(reservation.startedAtDbMs); integer(reservation.startedClaimAttempt, 1);
+    requireValue(reservation.startedAtDbMs <= value.issuedAtDbMs && reservation.startedClaimAttempt < value.newClaimAttempt
+      && reservation.startedClaimTokenSha256 !== value.newClaimTokenSha256
+      && (value.recoveryMode === "resume_reserved" || value.recoveryMode === "reserved_ack_only"));
+    if (reservation.origin === "checkpoint") {
+      requireValue(reservation.receiptSha256 === value.originalReservationReceiptSha256
+        && reservation.startedClaimAttempt === value.originalReservationClaimAttempt
+        && reservation.startedClaimTokenSha256 === value.originalReservationClaimTokenSha256);
+    } else {
+      digest(reservation.authorizingPermitReceiptSha256);
+      requireValue(value.originalReservationReceiptSha256 === null && value.previousPermitReceiptSha256 !== null);
+    }
+  }
 }
 const RECOVERY_KEYS = ["scope", "protocol", "phase", ...RECOVERY_INPUT_KEYS, "sourceKind", "newReservationAuthorized", "newExternalCreateAuthorized", ...SAFETY_KEYS, "receiptSha256"] as const;
 export function validateTenantTelemetryCaptureOperationRecoveryPermit(
   value: TenantTelemetryCaptureOperationRecoveryPermit, cutover: TenantTelemetryCaptureEpochCutoverReceipt,
   history: TenantTelemetryCaptureRestoreHistoryReceipt, checkpoint: TenantTelemetryCaptureBackupCheckpoint,
   originalLeaves: readonly TenantTelemetryCaptureCheckpointLeaf[], key: Uint8Array,
+  links?: TenantTelemetryCaptureRecoveryPermitLinks,
 ): void {
   closed(value, RECOVERY_KEYS); validateTenantTelemetryCaptureEpochCutoverReceipt(cutover, history, checkpoint, key);
   assertTenantTelemetryCaptureCheckpointLeaves(checkpoint, originalLeaves, key); validateSafety(value);
   validateRecoveryInput(Object.fromEntries(RECOVERY_INPUT_KEYS.map((name) => [name, value[name]])) as unknown as TenantTelemetryCaptureOperationRecoveryInput);
   requireValue(value.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE && value.protocol === TENANT_TELEMETRY_CAPTURE_RESTORE_PROTOCOL
     && value.phase === "leased" && value.sourceKind === "persisted-provider-v2"
-    && value.newReservationAuthorized === (value.recoveryMode === "resume_queued") && value.newExternalCreateAuthorized === (value.recoveryMode !== "reserved_ack_only")
+    && value.newReservationAuthorized === (value.reservationAtIssue.origin === "none") && value.newExternalCreateAuthorized === (value.recoveryMode !== "reserved_ack_only")
     && value.cutoverReceiptSha256 === cutover.receiptSha256 && value.historyReceiptSha256 === history.receiptSha256 && value.checkpointSha256 === checkpoint.checkpointSha256
     && value.restoreRunId === cutover.restoreRunId && value.runtimeEpochSha256 === cutover.runtimeEpochSha256 && value.issuedAtDbMs >= cutover.activatedAtDbMs);
   const required: [TenantTelemetryCaptureCheckpointFamily, string, TenantTelemetryCaptureCheckpointState][] = [
@@ -661,6 +729,46 @@ export function validateTenantTelemetryCaptureOperationRecoveryPermit(
     && leaf.identityRefSha256 === tenantTelemetryCaptureCheckpointOperationIdentity("write_ack", value.writeOperationSha256, key)));
   if (value.originalReservationReceiptSha256 === null) requireValue(!originalLeaves.some((leaf) => leaf.family === "write_reservation"
     && leaf.identityRefSha256 === tenantTelemetryCaptureCheckpointOperationIdentity("write_reservation", value.writeOperationSha256, key)));
+  const previous = links?.previousPermit ?? null;
+  if (links) closed(links, ["previousPermit", "reservationAuthorizer"]);
+  const assertLinkShape = (record: TenantTelemetryCaptureOperationRecoveryPermit): void => {
+    closed(record, RECOVERY_KEYS); validateSafety(record);
+    validateRecoveryInput(Object.fromEntries(RECOVERY_INPUT_KEYS.map((name) => [name, record[name]])) as unknown as TenantTelemetryCaptureOperationRecoveryInput);
+    requireValue(record.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE && record.protocol === TENANT_TELEMETRY_CAPTURE_RESTORE_PROTOCOL
+      && record.phase === "leased" && record.sourceKind === "persisted-provider-v2"
+      && record.newReservationAuthorized === (record.reservationAtIssue.origin === "none")
+      && record.newExternalCreateAuthorized === (record.recoveryMode !== "reserved_ack_only")
+      && record.receiptSha256 === receiptHash(record, "receiptSha256"));
+  };
+  const variable = new Set<string>(["previousPermitReceiptSha256", "reservationAtIssue", "previousClaimAttempt", "previousClaimTokenSha256",
+    "previousClaimLeaseUntilMs", "newClaimAttempt", "newClaimTokenSha256", "newClaimLeaseUntilMs", "claimLeaseCeilingMs", "issuedAtDbMs", "recoveryMode"]);
+  const assertSameOriginal = (record: TenantTelemetryCaptureOperationRecoveryPermit): void => {
+    for (const field of RECOVERY_INPUT_KEYS) if (!variable.has(field)) requireValue(canonical(record[field]) === canonical(value[field]));
+  };
+  requireValue((previous === null) === (value.previousPermitReceiptSha256 === null));
+  if (previous) {
+    assertLinkShape(previous); assertSameOriginal(previous);
+    requireValue(previous.receiptSha256 === value.previousPermitReceiptSha256
+      && previous.writeOperationSha256 === value.writeOperationSha256
+      && previous.checkpointSha256 === value.checkpointSha256 && previous.cutoverReceiptSha256 === value.cutoverReceiptSha256
+      && previous.newClaimAttempt === value.previousClaimAttempt && previous.issuedAtDbMs <= value.issuedAtDbMs);
+    for (const field of ["originalJobState", "originalJobEvidenceHmacSha256", "originalJobDescriptorSha256", "originalPayloadEvidenceHmacSha256", "originalMembershipEvidenceHmacSha256",
+      "originalSourceBindingEvidenceHmacSha256", "originalFailureEvidenceHmacSha256", "originalReservationReceiptSha256", "originalReservationEvidenceHmacSha256",
+      "originalReservationClaimAttempt", "originalReservationClaimTokenSha256"] as const) requireValue(previous[field] === value[field]);
+    if (previous.reservationAtIssue.origin !== "none") requireValue(canonical(previous.reservationAtIssue) === canonical(value.reservationAtIssue));
+  }
+  if (value.reservationAtIssue.origin === "recovery-permit") {
+    const authorizer = links?.reservationAuthorizer;
+    const reservation = value.reservationAtIssue;
+    requireValue(authorizer);
+    assertLinkShape(authorizer); assertSameOriginal(authorizer);
+    requireValue(authorizer.receiptSha256 === reservation.authorizingPermitReceiptSha256
+      && authorizer.writeOperationSha256 === value.writeOperationSha256 && authorizer.cutoverReceiptSha256 === value.cutoverReceiptSha256
+      && authorizer.checkpointSha256 === value.checkpointSha256 && authorizer.newReservationAuthorized
+      && authorizer.newClaimAttempt === reservation.startedClaimAttempt && authorizer.newClaimTokenSha256 === reservation.startedClaimTokenSha256
+      && authorizer.issuedAtDbMs <= reservation.startedAtDbMs && reservation.startedAtDbMs < authorizer.claimLeaseCeilingMs
+      && authorizer.newClaimAttempt <= value.previousClaimAttempt);
+  } else requireValue(!links?.reservationAuthorizer);
   requireValue(value.receiptSha256 === receiptHash(value, "receiptSha256"));
 }
 /** This receipt is a necessary original-snapshot inclusion/lineage guard, not
@@ -678,27 +786,31 @@ export function createTenantTelemetryCaptureOperationRecoveryPermit(
   input: TenantTelemetryCaptureOperationRecoveryInput, cutover: TenantTelemetryCaptureEpochCutoverReceipt,
   history: TenantTelemetryCaptureRestoreHistoryReceipt, checkpoint: TenantTelemetryCaptureBackupCheckpoint,
   originalLeaves: readonly TenantTelemetryCaptureCheckpointLeaf[], key: Uint8Array,
+  links?: TenantTelemetryCaptureRecoveryPermitLinks,
 ): TenantTelemetryCaptureOperationRecoveryPermit {
   validateRecoveryInput(input);
   const body = { scope: TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE, protocol: TENANT_TELEMETRY_CAPTURE_RESTORE_PROTOCOL, phase: "leased" as const,
-    ...input, sourceKind: "persisted-provider-v2" as const, newReservationAuthorized: input.recoveryMode === "resume_queued",
+    ...input, sourceKind: "persisted-provider-v2" as const, newReservationAuthorized: input.reservationAtIssue.origin === "none",
     newExternalCreateAuthorized: input.recoveryMode !== "reserved_ack_only", ...SAFETY };
   const result = { ...body, receiptSha256: hash(body.scope, body) };
-  validateTenantTelemetryCaptureOperationRecoveryPermit(result, cutover, history, checkpoint, originalLeaves, key); return Object.freeze(result);
+  validateTenantTelemetryCaptureOperationRecoveryPermit(result, cutover, history, checkpoint, originalLeaves, key, links); return Object.freeze(result);
 }
 export interface TenantTelemetryCaptureRecoveryCurrentBinding {
   /** Independently reconstructed original source/descriptor/reservation and the
    * atomically installed new claim; never copied from the received permit. */
   input: TenantTelemetryCaptureOperationRecoveryInput;
+  claimLeaseUntilMs: number;
   storeDbTimestampMs: number;
 }
 export function assertTenantTelemetryCaptureOperationRecoveryBinding(
   permit: TenantTelemetryCaptureOperationRecoveryPermit, current: TenantTelemetryCaptureRecoveryCurrentBinding,
 ): void {
-  closed(permit, RECOVERY_KEYS); closed(current, ["input", "storeDbTimestampMs"]);
+  closed(permit, RECOVERY_KEYS); closed(current, ["input", "claimLeaseUntilMs", "storeDbTimestampMs"]);
   validateRecoveryInput(current.input); integer(current.storeDbTimestampMs);
-  for (const field of RECOVERY_INPUT_KEYS) requireValue(permit[field] === current.input[field]);
-  requireValue(current.storeDbTimestampMs >= permit.issuedAtDbMs && current.storeDbTimestampMs < permit.newClaimLeaseUntilMs);
+  for (const field of RECOVERY_INPUT_KEYS) requireValue(canonical(permit[field]) === canonical(current.input[field]));
+  integer(current.claimLeaseUntilMs);
+  requireValue(current.claimLeaseUntilMs >= permit.newClaimLeaseUntilMs && current.claimLeaseUntilMs <= permit.claimLeaseCeilingMs
+    && current.storeDbTimestampMs >= permit.issuedAtDbMs && current.storeDbTimestampMs < current.claimLeaseUntilMs);
 }
 
 export type TenantTelemetryCaptureRestoreWireRecord = TenantTelemetryCaptureBackupCheckpoint | TenantTelemetryCaptureRestoreHistoryReceipt
@@ -710,6 +822,7 @@ export interface TenantTelemetryCaptureRestoreRecordContext {
   cutover?: TenantTelemetryCaptureEpochCutoverReceipt;
   originalLeaves?: readonly TenantTelemetryCaptureCheckpointLeaf[];
   recoveryBinding?: TenantTelemetryCaptureRecoveryCurrentBinding;
+  recoveryLinks?: TenantTelemetryCaptureRecoveryPermitLinks;
   /** Actual immutable 0031/0030 activation projection, never read from the wire
    * being decoded. A later journal-head advancement must be independently
    * checked against the runtime event chain; it does not rewrite this binding. */
@@ -720,7 +833,7 @@ export function validateTenantTelemetryCaptureRestoreRecord(
 ): asserts value is TenantTelemetryCaptureRestoreWireRecord {
   requireValue(context !== null && typeof context === "object");
   closed(context, Object.keys(context));
-  requireValue(Object.keys(context).every((key) => ["key", "checkpoint", "history", "cutover", "originalLeaves", "activationBinding", "recoveryBinding"].includes(key)));
+  requireValue(Object.keys(context).every((key) => ["key", "checkpoint", "history", "cutover", "originalLeaves", "activationBinding", "recoveryBinding", "recoveryLinks"].includes(key)));
   requireValue(value !== null && typeof value === "object" && !Array.isArray(value));
   closed(value, Object.keys(value));
   if (value.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE) {
@@ -741,7 +854,7 @@ export function validateTenantTelemetryCaptureRestoreRecord(
   requireValue(value.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE && context.cutover !== undefined && context.originalLeaves !== undefined && context.recoveryBinding !== undefined);
   const permit = value as unknown as TenantTelemetryCaptureOperationRecoveryPermit;
   validateTenantTelemetryCaptureOperationRecoveryPermit(permit,
-    context.cutover, context.history, context.checkpoint, context.originalLeaves, context.key);
+    context.cutover, context.history, context.checkpoint, context.originalLeaves, context.key, context.recoveryLinks);
   assertTenantTelemetryCaptureOperationRecoveryBinding(permit, context.recoveryBinding);
 }
 /** Full closed-schema/integrity and independently supplied context validation;

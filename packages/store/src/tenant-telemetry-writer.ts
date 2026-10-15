@@ -633,6 +633,11 @@ export interface TenantTelemetryWriteClaim {
   claimToken: string;
   leaseUntilMs: number;
   reservation?: TenantTelemetryExternalMutationReservation;
+  captureRecovery?: {
+    permitReceiptSha256: string;
+    recoveryMode: "resume_queued" | "resume_reserved" | "reserved_ack_only";
+    claimLeaseCeilingMs: number;
+  };
 }
 
 export interface TenantTelemetryWriteAuthorization {
@@ -710,6 +715,7 @@ export function validateTenantTelemetryWriteClaim(claim: TenantTelemetryWriteCla
     "claimToken",
     "leaseUntilMs",
     ...(claim.reservation === undefined ? [] : ["reservation"]),
+    ...(claim.captureRecovery === undefined ? [] : ["captureRecovery"]),
   ], "tenant telemetry write claim");
   validateTenantTelemetryWriteAuthorization({
     writeOperationSha256: claim.writeOperationSha256,
@@ -735,6 +741,17 @@ export function validateTenantTelemetryWriteClaim(claim: TenantTelemetryWriteCla
     throw new Error("tenant telemetry write claim bindings are invalid");
   }
   timestamp(claim.leaseUntilMs, "tenant telemetry write claim lease");
+  if (claim.captureRecovery !== undefined) {
+    exactKeys(claim.captureRecovery, ["permitReceiptSha256", "recoveryMode", "claimLeaseCeilingMs"], "tenant telemetry recovery claim");
+    digest(claim.captureRecovery.permitReceiptSha256, "tenant telemetry recovery permit");
+    timestamp(claim.captureRecovery.claimLeaseCeilingMs, "tenant telemetry recovery ceiling");
+    if (!["resume_queued", "resume_reserved", "reserved_ack_only"].includes(claim.captureRecovery.recoveryMode)
+      || claim.inventory.sourceSchema !== "provider-step-error-v2"
+      || claim.leaseUntilMs > claim.captureRecovery.claimLeaseCeilingMs
+      || (claim.captureRecovery.recoveryMode !== "resume_queued" && !claim.reservation)) {
+      throw new Error("tenant telemetry recovery claim binding is invalid");
+    }
+  }
   if (claim.reservation !== undefined) {
     validateTenantTelemetryExternalMutationReservation(claim.reservation);
     if (claim.reservation.writeOperationSha256 !== claim.writeOperationSha256
