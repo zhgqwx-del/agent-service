@@ -35,7 +35,7 @@ describe("ProviderService credential target reference capture", () => {
   it("captures via trusted injection, protects independently, and passes only protected data", async () => {
     const store = new MemorySessionStore();
     await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
-    const write = vi.spyOn(store, "upsertProviderConfig");
+    const write = vi.spyOn(store, "upsertProviderConfigWithResponsibility");
     const captures: ProviderCredentialTargetReferenceContext[] = [];
     const protectedInputs: Buffer[] = [];
     const svc = new ProviderService({
@@ -85,10 +85,13 @@ describe("ProviderService credential target reference capture", () => {
     expect(JSON.stringify(result)).not.toContain("server-owned-management-id");
     expect(JSON.stringify(result)).not.toContain("attacker-controlled-locator");
 
-    const calls = write.mock.calls as unknown as Array<unknown[]>;
+    const calls = write.mock.calls;
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toHaveLength(4);
-    const target = calls[0]![3] as Record<string, unknown>;
+    expect(calls[0]).toHaveLength(1);
+    expect(Object.keys(calls[0]![0]).sort()).toEqual([
+      "config", "expectedSourceRevision", "secret", "secretAdmission", "targetReference",
+    ]);
+    const target = calls[0]![0].targetReference;
     const ciphertext = Buffer.from("sealed:server-owned-management-id");
     expect(target).toEqual({
       domain: "external_credential",
@@ -105,7 +108,7 @@ describe("ProviderService credential target reference capture", () => {
 
   it("preserves the blocker path when capture is absent or returns no trusted mapping", async () => {
     const store = new MemorySessionStore();
-    const write = vi.spyOn(store, "upsertProviderConfig");
+    const write = vi.spyOn(store, "upsertProviderConfigWithResponsibility");
     const capture = vi.fn(async () => undefined);
     const protect = vi.fn(async () => ({
       ciphertext: Buffer.from("unused"),
@@ -122,16 +125,24 @@ describe("ProviderService credential target reference capture", () => {
     await svc.upsertTenantProvider("tenant-blocked", provider());
     expect(capture).toHaveBeenCalledOnce();
     expect(protect).not.toHaveBeenCalled();
-    expect((write.mock.calls as unknown as Array<unknown[]>)[0]).toHaveLength(3);
+    expect(write).toHaveBeenCalledOnce();
+    expect(write.mock.calls[0]).toHaveLength(1);
+    expect(Object.keys(write.mock.calls[0]![0]).sort()).toEqual([
+      "config", "expectedSourceRevision", "secret", "secretAdmission",
+    ]);
 
     const noFactoryStore = new MemorySessionStore();
-    const noFactoryWrite = vi.spyOn(noFactoryStore, "upsertProviderConfig");
+    const noFactoryWrite = vi.spyOn(noFactoryStore, "upsertProviderConfigWithResponsibility");
     await new ProviderService({
       store: noFactoryStore,
       cipher: new LocalAesGcmCipher(KEY),
       assertBaseUrl,
     }).upsertTenantProvider("tenant-no-factory", provider());
-    expect((noFactoryWrite.mock.calls as unknown as Array<unknown[]>)[0]).toHaveLength(3);
+    expect(noFactoryWrite).toHaveBeenCalledOnce();
+    expect(noFactoryWrite.mock.calls[0]).toHaveLength(1);
+    expect(Object.keys(noFactoryWrite.mock.calls[0]![0]).sort()).toEqual([
+      "config", "expectedSourceRevision", "secret", "secretAdmission",
+    ]);
   });
 
   it("does not call trusted capture for a credential-free provider", async () => {
@@ -163,7 +174,7 @@ describe("ProviderService credential target reference capture", () => {
 
   it("fails atomically when trusted capture protection fails", async () => {
     const store = new MemorySessionStore();
-    const write = vi.spyOn(store, "upsertProviderConfig");
+    const write = vi.spyOn(store, "upsertProviderConfigWithResponsibility");
     const source = Buffer.from("server-owned-management-id");
     const svc = new ProviderService({
       store,
@@ -202,7 +213,7 @@ describe("ProviderService credential target reference capture", () => {
 
   it("replaces trusted factory errors with a content-free failure", async () => {
     const store = new MemorySessionStore();
-    const write = vi.spyOn(store, "upsertProviderConfig");
+    const write = vi.spyOn(store, "upsertProviderConfigWithResponsibility");
     const svc = new ProviderService({
       store,
       cipher: new LocalAesGcmCipher(KEY),

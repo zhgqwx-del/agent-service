@@ -72,6 +72,7 @@ import {
   TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1,
   TenantErasureCreateRequest,
   TenantErasureRequest,
+  TenantErasureStatusResponse,
   TenantErasureRequestHeaders,
   TenantErasureRequestParams,
   TenantErasureRequestQuery,
@@ -589,7 +590,9 @@ export function createRouterApp(deps: RouterAppDeps) {
         } catch {
           return tenantErasureUnavailable(c);
         }
-        const parsed = TenantErasureRequest.safeParse(projection);
+        const parsed = input.mode === "status"
+          ? TenantErasureStatusResponse.safeParse(projection)
+          : TenantErasureRequest.safeParse(projection);
         if (
           !parsed.success
           || parsed.data.tenantId !== input.expectedTenantId

@@ -1,5 +1,11 @@
 # 进度记录
 
+> **0058前置进展补记（2026-10-15T22:37Z）**：另一树有界trigger batch后原180秒完整双跳首次通过（178638.82ms），含newPi/finalcold/cleanup，独立资源复查零fixture库/三对象前缀残留。仅约1.36秒余量，不能称稳定提速或整包通过；300秒未答不再阻断本地后续。0059本树仍未整合0058前置、八指纹为零、八个SQL病例未跑，无DB/历史/完整verify/新CI；原55项与全部失败不变，不借0058定向证据替代本包验收。备份责任关系独立审计仍待，见末节与设计05。
+
+> **当前最终窄修检查点（2026-10-15T22:19Z）**：SQL责任source发布已追加真实active cutover条件，修复inactive也生成managed version时可能错误发来源的唯一确定P2；两次bounded静态review未报其它确定P0–P2，静态关闭不等于DB验收。最终55159 typecheck exit0、scan737/diffcheck0；原55项及重验子集不重复运行或累计。0059仍为三表/八guard/八个已编写SQL病例、缺0058前置且八指纹为零，全部SQL病例未跑；无DB/历史/完整verify/新CI，不可发布。22:14及所有失败证据保留如下及末节；main仍clean3414，0058树和全部安全边界未动。
+
+> **当前独立预编码（2026-10-15T22:14Z）**：`codex/m1-byok-responsibility`（base3414）已接通Memory/Provider/T3a/T3b/tenant GET责任链；正式named四文件55项逐非零proof、零失败/跳过，最后类型修订后37项重验通过，另73项重验含子集不相加。最终typecheck、API/SDK、scan737与diffcheck通过；原pure来源缺口、fixture及类型失败保留，详见末节。0059三独立表/八guard/七个已编写SQL病例仍缺0058前置，八指纹为零；未执行DB/历史/完整verify/新CI，不可发布、不合入/部署/激活。required139/66groups与历史50仅登记。main仍clean3414，旧五绿不证明新包；另树0058保持原180秒双跳超时/300秒请求待答，字节未动。M1未冻结/M2冻结/M3未开始及全部默认安全门禁不变；下方保留历史快照。
+
 > **当前分段验收终态（2026-10-15T18:22Z）**：`695220d` 修复后受影响4文件54项及真实历史50文件318项通过；`1a183c8` 的cluster8文件28项、独立T3g3项、真实MySQL/MinIO15文件81项全部通过且零fail/skip，SDK/六JS入口/实际双服务构建与clean VM发布包检查通过。typecheck、scan727、diffcheck通过。下面`aad57d3`原完整verify退出1及其报告仍保留，不把分段结果拼成一次coverage成功；尚无最终新SHA CI。main/origin仍293，待本次文档检查点后集中发布。下一M1重复备份恢复仅在独立树提前编码/纯测试，不合入；旧schema原生制品跨迁移恢复仍是本地未闭环项。M1未冻结/M2冻结/M3未开始，全部默认关闭与0037/0054原primary/completion=false门禁不变。精确证据见末节。
 
 > **当前修复后定向检查点（2026-10-15）**：受影响4文件真实54 passed / 零fail或skip（旧provider27、新epoch8、旧writer14、grant5），250.76s，报告 `.local-run/m1m4-0057-count-guard-targeted-20261015.json`；typecheck、secret scan727、diffcheck通过。未发布0057的两处outer EXISTS保留原完整WHERE，改用两个COUNT局部变量再以`>0`/`IS NOT TRUE`判断；旧0053、原27测试、NULL/BINARY/owner/RR条件未改。实际观测为同事务完整native谓词/见证均true而原SP判断false拒绝，具体MySQL内部原因未证明。独立新库校准已完成并清理；本次不是完整verify或CI通过，下方aad整轮exit1保留，历史/cluster/build/VM/S3将以干净修复提交继续、暂未开始。main/origin仍293，尚无新的修复提交SHA，安全门禁不变；精确记录见末节。
@@ -1608,3 +1614,31 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 本批按“原完整失败保留→54项受影响复验→补未执行门禁”发布，不重启同一轮全量，也不声称本地coverage/required133/64group的整轮成功。最终文档提交只改变事实记录，待main集中推送后以最终SHA GitHub五检查实际成功作为CI结论；旧Actions38714666463只证明293。所有祖先保留，不squash破坏冻结旧binary夹具。
 - 优先级仍是M1：下一消费者为primary→restore1产生新真实失败/保留旧pending→第二次实际加密备份→fresh DB/never-used epoch2→五selected命令→旧许可精确续跑及新Pi/cold启动。独立worktree已按授权提前编码/纯测试，未合入；首轮最终27-family纯+Memory两文件215项为203 passed/12 failed，失败报告单独保留，负例若未到破坏断言不得算有效。它不是当前发布81项中的用例或交付证明。
 - 明确本地残余：旧schema原生制品跨新增迁移的import→upgrade→continuation尚未闭环；旧格式/receipt/历史重放兼容不等于该流程成功，当前restore-selected可能先消耗epoch/导入部分目标再被verify-only拒绝，禁止自动重导、清空或隐式DDL。下一批将先增加真实source schema的reserve/import前拒绝，完整跨schema恢复仍需独立设计验收。generic session/user物理purge、可信telemetry外部grant/delete/ACK/restore、backup-copy与跨域证明仍缺；真实provider/KMS/managed IAM/TLS/Secret/独立故障域/Redis Cluster与容量/RPO-RTO留待相应实现及staging验收，不凭本机MinIO代替。M1未冻结、M2仍正式冻结、M3未开始。
+
+## 2026-10-15T21:50Z（BYOK责任独立纵向预编码，未验证或发布）
+
+- 上一goal轮实际补齐0058 source3016完整MySQL10/10和冻结旧binary历史4/4，原180秒双跳仍超时，末尾newPi/finalcold未验收。该树全部代码/迁移/预算冻结，报告与清理证据保留；本轮不重复无变化双跳，不把goal自动续跑当300秒授权。
+- root只读核对已附属、空闲且clean3414的`capture-v2-atomic` worktree后，创建独立`codex/m1-byok-responsibility`，原发布分支保留，main未改；不新增worktree或挤占数据库。下一有限消费者按已确认BYOK责任：本系统清自身副本，厂商侧客户负责，但旧blocker/unknown和远端ACK绝不改写。
+- 真实写路径审计确认：`secret=undefined`沿用旧密文，普通配置编辑仍产生managed_v1；二者不能证明旧key属于BYOK。新增来源必须由实际新apiKey加密路径产生原对象admission，绑定exact CAS/envelope；沿用只继承精确前版已验证材料，header/endpoint与shared keys独立。trusted remote target不能由BYOK分类豁免。
+- 三作者分别实现shared/Memory、MySQL/0059草稿、ProviderService/现tenant GET只读消费；已开始源码编辑。root维护[合同](design/05-credential-responsibility.md)并统一测试/整合。0059只增加独立family，不改旧receipt或49/27物理row shape；须先整合真实0058并实测指纹，当前不安装草稿schema，也不声称独立发布能力。
+- 本轮尚无新包类型/纯测试/真实DB/功能包/新CI通过结论，不以文档或计划代替真实纵向交付。M1未冻结/M2冻结/M3未开始、0037硬拒、0054原primary-only、外部删除与自动清理off及全部completion=false保持。
+
+## 2026-10-15T22:14Z（BYOK责任真实Memory纵向与只读GET定向通过，MySQL草稿不可发布）
+
+- 独立`codex/m1-byok-responsibility`基于已发布3414，已接Memory/Provider真实新secret原对象admission、0026 CAS/version责任sidecar、T3a精确版本snapshot、T3b及tenant GET只读消费；不是只有codec/空Map。旧receipt/target disposition及49/27物理行形状不改，不回填或提升unknown。共享module冻结`8b4fc1a5c8454a854bacc4e44a228f57c77920bab2ef4e2741622553b2d725dd`；MySQL SQL冻结`da596…`，仍为0059三独立表/八guard/七个已编写病例、八指纹全零，缺真实0058前置；没有执行DB/历史/完整verify/新CI，不可发布，不合入、部署或激活。
+- 正式named session22398真实exit0，四个独占JSON为**27 shared + 13 Memory + 5 Provider + 10 HTTP = 55 passed / 0 failed / 0 skipped**，root逐文件核对非零required proof。最后两处仅test类型/closed JSON parse补正后session53757重验27 shared与10 HTTP共37项通过，是原55子集，不另加。独立protocol21项通过；session16173四文件73项为27 shared + 5 Provider + 10 HTTP + 31 manifest，亦属重验含子集，不能与55或37相加。
+- 首版纯16项虽绿，root仍发现snapshot仅同count未绑定exact版本/root的缺口；补实际版本集合/既有root及逐entry关系后19项通过，后续target/version与requestId严格校验后为27项。首绿不证明当时source闭合。session47064的40 passed / 13 failed报告保留：13项新Provider/HTTP夹具未seal participants，负例未到变异；仅补夹具注册后startup seal，未放宽产品gate或原断言。
+- typecheck首轮7845 exit2为锁literal类型，第二轮56183 exit2为五处test类型；原失败日志保留，最终19025 exit0。generate/check API exit0；checkSDK23441 exit0，真实离线18文件包及独立runtime/types消费通过。scan737 exit0、diffcheck0已记录，最终文档后由root复核；不把SDK或静态成功冒充DB/全量验收。required139 unique/66groups、历史50均仅登记。
+- 本轮无真实DB、模型调用或环境激活；main仍clean3414，旧五项CI只证明原发布。另一树0058仍冻结：原180秒双跳超时，300秒请求待答，本包未改变其字节或预算。未记录尚在进行的交叉review终态。M1未冻结/M2冻结/M3未开始，默认off/local-only与production拒绝、0037硬拒、0054原primary-only destructive、外部删除/自动清理off和全域completion=false均保持；客户责任不是remote ACK，tracked refs dropped_not_zeroized不是内存清零，backup/其它副本保持unknown。
+
+## 2026-10-15T22:19Z（inactive责任发布窄修冻结，最终静态检查通过）
+
+- bounded静态review发现唯一确定P2：普通0026 inactive路径也会生成managed version，新SQL责任source发布却未要求真实cutover active。仅追加active条件并编写inactive真实SQL回归，草稿现为三独立表/八guard/八个已编写病例；全部SQL病例未执行。修后store冻结`44f5328e0f14383dbaa10e3bc0c2539bd876acbc4ab09acefa9f4778581102e4`，SQL测试冻结`507645fdcb638fe4ddfd824b563e96d655fbed65362da33f07660f4864b1611c`。两次有限静态review确认该项已静态关闭，未报其它确定P0–P2；不把review当真实事务或DB证明。
+- session55159最终typecheck真实exit0，日志`.local-run/m1-byok-responsibility-inactive-fix-typecheck-20261015.log`；29829c scan737 exit0、8f4a9e diffcheck0。原55项具名proof、37/73项含子集重验与protocol/API/SDK证据不重复累计，Memory/HTTP已有inactive用例；22:14及原失败记录保持原文。
+- 0059八指纹仍全零且缺真实0058前置，尚无DB/历史/完整verify/新CI，不能发布、合入或部署激活。main仍clean3414，旧五绿只证明原基线；0058另一树继续冻结原180秒超时/300秒请求待答，未修改。required139/66groups、历史50仍只是登记；M1未冻结/M2冻结/M3未开始，0037/0054原primary-only/默认off/外删与自动off/completion=false等边界不变。
+
+## 2026-10-15T22:37Z（0058首个完整双跳通过，不代替0059责任验收）
+
+- 另一树有界trigger batch源`461d…`/test`3f93…`的unit66、typecheck/scan734/diffcheck通过，store仍3016、S3 test仍e6a8；真实整库schema/trigger往返为1pass/17filtered，新增双跳为1pass/1filtered，均单个实际文件的selected执行，不能称完整18或2例通过。双跳178638.821709ms，在原180秒首次完成newPi/finalcold/cleanup；仅约1.36秒余量、有CI风险，不证明稳定提速或整包通过。首次launcher缺两个public bucket字段导致0pass/18pending、无case/DB，原失败保留；只补launcher后通过，详见0058树PROGRESS与`m1-repeat-restore-trigger-batch-{unit,roundtrip-configured,twohop-configured}-20261015.json`。
+- 22:36:38.759Z独立资源报告为remainingFixtureDatabases=0，三个namespace各count0/truncated=false。300秒请求未答，但原180秒已完整通过，不再以待答阻断本地后续；原CLI120/lease/断言不变。0058完整verify/verify-s3/最终commit/push/新CI未执行，0059本树未整合前置且八根0/八SQL病例未跑；本包无新增验证，不改变原55项、失败或main3414基线。
+- 通用整库dump按实际schema收集0059物理表，不代表49/27固定族证明新责任关系。后续须在真实备份窗口及恢复目标独立完整审计责任source→版本/target、T3a精确集合与T1/T3b/readiness关系，并做真实恢复证明；这项仍待，不能从物理表存在推导责任成功，不新造CP3或重签旧根。0037/0054原primary-only/off/外删与自动off/completion=false及M1未冻结/M2冻结/M3未开始不变。

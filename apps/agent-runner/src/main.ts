@@ -75,6 +75,7 @@ import {
   type RestoreReplayStore,
   type SubjectLifecycleStore,
   type TenantCredentialRevocationStore,
+  type TenantCredentialResponsibilityStore,
   type TenantCredentialTargetExecutionStore,
   type TenantBackupCatalogStore,
   type TenantDatabasePurgeStore,
@@ -261,6 +262,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     & BlobStorageControlStore
     & SubjectLifecycleStore
     & TenantCredentialRevocationStore
+    & TenantCredentialResponsibilityStore
     & TenantCredentialTargetExecutionStore
     & TenantBackupCatalogStore
     & TenantDatabasePurgeStore
@@ -1096,6 +1098,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantErasureRequestsEnabled: cfg.TENANT_ERASURE_REQUESTS_ENABLED,
     tenantErasureAdmissionGate,
     tenantCredentialRevocation: store,
+    tenantCredentialResponsibility: store,
     tenantCredentialRevocationWorkerEnabled:
       cfg.TENANT_CREDENTIAL_REVOCATION_WORKER_ENABLED,
     tenantCredentialLifecycleTrackingActive: async () => (

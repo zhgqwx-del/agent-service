@@ -554,6 +554,26 @@ import {
   type TenantCredentialVersion,
 } from "../credential-lifecycle.js";
 import {
+  assertProviderByokSecretAdmission,
+  assertTenantCredentialResponsibilitySourceRelations,
+  createTenantCredentialResponsibilitySnapshotEntry,
+  createTenantCredentialResponsibilitySnapshotReceipt,
+  createTenantCredentialResponsibilitySource,
+  providerByokSecretEnvelopeSha256,
+  tenantCredentialResponsibilityVersionIdentitySha256,
+  TenantCredentialResponsibilityIntegrityError,
+  validateTenantCredentialResponsibilitySnapshotEntry,
+  validateTenantCredentialResponsibilitySnapshotReceipt,
+  validateTenantCredentialResponsibilitySource,
+  validateTenantCredentialResponsibilityReadiness,
+  type TenantCredentialResponsibilitySource,
+  type TenantCredentialResponsibilitySnapshotEntry,
+  type TenantCredentialResponsibilitySnapshotReceipt,
+  type TenantCredentialResponsibilityReadiness,
+  type TenantCredentialResponsibilityStore,
+  type UpsertProviderConfigWithResponsibilityInput,
+} from "../credential-responsibility.js";
+import {
   TENANT_RUNTIME_REVOCATION_EXTERNAL_DISPOSITION,
   TENANT_RUNTIME_REVOCATION_MEMORY_DISPOSITION,
   TENANT_RUNTIME_REVOCATION_RECEIPT_SCOPE,
@@ -1012,6 +1032,24 @@ const TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME =
   "0056_tenant_telemetry_capture_restore_history.sql";
 const TENANT_TELEMETRY_CAPTURE_EPOCH_CUTOVER_MIGRATION_NAME =
   "0057_tenant_telemetry_capture_epoch_cutover.sql";
+const TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME =
+  "0059_credential_responsibility.sql";
+const TENANT_TELEMETRY_CAPTURE_REPEAT_RESTORE_MIGRATION_NAME =
+  "0058_tenant_telemetry_capture_repeat_restore.sql";
+const TENANT_CREDENTIAL_RESPONSIBILITY_TABLE_NAMES = [
+  "tenant_credential_responsibility_sources",
+  "tenant_credential_responsibility_entries",
+  "tenant_credential_responsibility_receipts",
+] as const;
+const TENANT_CREDENTIAL_RESPONSIBILITY_TRIGGER_NAMES = [
+  "trg_credential_responsibility_t3a_bu",
+  "trg_credential_responsibility_sources_bu",
+  "trg_credential_responsibility_sources_bd",
+  "trg_credential_responsibility_entries_bu",
+  "trg_credential_responsibility_entries_bd",
+  "trg_credential_responsibility_receipts_bu",
+  "trg_credential_responsibility_receipts_bd",
+] as const;
 const TENANT_TELEMETRY_CAPTURE_EPOCH_CUTOVER_TABLE_NAMES = [
   "tenant_telemetry_capture_epoch_cutovers",
   "tenant_telemetry_capture_recovery_permits",
@@ -1938,6 +1976,31 @@ function tenantTelemetryCaptureEpochCutoverFingerprintStatement(
   if (!roots.length || roots.some((root) => root === `'${"0".repeat(64)}'`)
     || /DERIVE/.test(statements[0]!)) {
     throw new Error(`0057 ${marker} fingerprint block is not committed`);
+  }
+  return statements[0]!;
+}
+function tenantCredentialResponsibilityFingerprintStatement(
+  migrationSql: string,
+  marker: "schema" | "triggers",
+): string {
+  const prefix = `-- agent-service-runtime-fingerprint:tenant-credential-responsibility-${marker}`;
+  const startMarker = `${prefix}:start`, endMarker = `${prefix}:end`;
+  const start = migrationSql.indexOf(startMarker), end = migrationSql.indexOf(endMarker);
+  if (start < 0 || end <= start
+    || migrationSql.indexOf(startMarker, start + startMarker.length) >= 0
+    || migrationSql.indexOf(endMarker, end + endMarker.length) >= 0) {
+    throw new Error(`0059 ${marker} fingerprint markers are invalid`);
+  }
+  const statements = mysqlMigrationStatements(migrationSql.slice(start + startMarker.length, end));
+  if (statements.length !== 1
+    || !statements[0]!.startsWith(`SET @credential_responsibility_${marker}_ok=`)
+    || statements[0]!.includes(";")) {
+    throw new Error(`0059 ${marker} fingerprint block is invalid`);
+  }
+  const roots = statements[0]!.match(/'[0-9a-f]{64}'/g) ?? [];
+  if (!roots.length || roots.some((root) => root === `'${"0".repeat(64)}'`)
+    || /DERIVE/.test(statements[0]!)) {
+    throw new Error(`0059 ${marker} fingerprint block is not committed`);
   }
   return statements[0]!;
 }
@@ -8812,6 +8875,7 @@ export class MysqlSessionStore implements
   RetentionPolicyStore,
   ErasurePolicyEvaluationStore,
   CredentialLifecycleStore,
+  TenantCredentialResponsibilityStore,
   TenantCredentialRevocationStore,
   TenantRuntimeRevocationStore,
   TenantContentInventoryStore,
@@ -8853,6 +8917,7 @@ export class MysqlSessionStore implements
    * paths accidentally query columns that did not exist at that point in history.
    */
   private credentialLifecycleSchemaInstalled = false;
+  private credentialResponsibilitySchemaInstalled = false;
   private tenantRestoreJournalSchemaInstalled = false;
   private tenantBackupCatalogSchemaInstalled = false;
   private tenantTelemetrySchemaInstalled = false;
@@ -8993,6 +9058,11 @@ export class MysqlSessionStore implements
           await store.assertPersistedFailureGlobalRelations(conn);
           await store.assertRetainedSourceGlobalRelations(conn);
           await store.assertCaptureRecoveryGlobalRelations(conn);
+        });
+      }
+      if (store.credentialResponsibilitySchemaInstalled) {
+        await store.withConsistentRead(async (conn) => {
+          await store.assertTenantCredentialResponsibilityProjection(conn);
         });
       }
       if (store.tenantTelemetryCaptureCheckpointSchemaInstalled) {
@@ -10251,6 +10321,39 @@ export class MysqlSessionStore implements
     if (failure) throw failure;
   }
 
+  private async assertTenantCredentialResponsibilityFingerprint(
+    conn: PoolConnection,
+    migrationsDir: string,
+  ): Promise<void> {
+    let statements: string[];
+    try {
+      const sql = await readFile(join(migrationsDir, TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME), "utf8");
+      statements = [
+        tenantCredentialResponsibilityFingerprintStatement(sql, "schema"),
+        tenantCredentialResponsibilityFingerprintStatement(sql, "triggers"),
+      ];
+    } catch (cause) {
+      throw new Error("0059 credential responsibility fingerprint source is invalid", { cause });
+    }
+    let failure: Error | undefined;
+    try {
+      await conn.query("SET @credential_responsibility_prev_gcml=@@SESSION.group_concat_max_len");
+      await conn.query("SET SESSION group_concat_max_len=1048576");
+      for (const statement of statements) await conn.query(statement);
+      const [rows] = await conn.query<Row[]>(
+        "SELECT @credential_responsibility_schema_ok AS schema_ok,@credential_responsibility_triggers_ok AS triggers_ok",
+      );
+      if (Number(rows[0]?.schema_ok) !== 1 || Number(rows[0]?.triggers_ok) !== 1) {
+        throw new Error("stored schema/triggers do not match the 0059 fingerprint");
+      }
+    } catch (cause) {
+      failure = new Error("0059 credential responsibility fingerprint verification failed", { cause });
+    }
+    try { await conn.query("SET SESSION group_concat_max_len=@credential_responsibility_prev_gcml"); }
+    catch (cause) { failure ??= new Error("0059 credential responsibility fingerprint session restore failed", { cause }); }
+    if (failure) throw failure;
+  }
+
   private async assertOrdinarySessionDeleteGraceFingerprint(
     conn: PoolConnection,
   ): Promise<void> {
@@ -11061,6 +11164,10 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME)) {
         throw new Error("0057 capture epoch cutover marker is missing its 0056 predecessor");
       }
+      if (done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_CAPTURE_REPEAT_RESTORE_MIGRATION_NAME)) {
+        throw new Error("0059 credential responsibility marker is missing its 0058 predecessor");
+      }
       const missing = files.filter((file) => !done.has(file));
       if (missing.length > 0) {
         throw new Error(`database schema is missing required migrations: ${missing.join(", ")}`);
@@ -11143,6 +11250,9 @@ export class MysqlSessionStore implements
           done.has(TENANT_TELEMETRY_CAPTURE_EPOCH_CUTOVER_MIGRATION_NAME),
         );
       }
+      if (done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)) {
+        await this.assertTenantCredentialResponsibilityFingerprint(conn, migrationsDir);
+      }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
         await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
       }
@@ -11155,6 +11265,9 @@ export class MysqlSessionStore implements
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
+      );
+      this.credentialResponsibilitySchemaInstalled = done.has(
+        TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME,
       );
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
@@ -11245,6 +11358,11 @@ export class MysqlSessionStore implements
       tenantTelemetryCaptureEpochCutoverFingerprintStatement(sql, "schema");
       tenantTelemetryCaptureEpochCutoverFingerprintStatement(sql, "triggers");
     }
+    if (files.includes(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)) {
+      const sql = await readFile(join(dir, TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME), "utf8");
+      tenantCredentialResponsibilityFingerprintStatement(sql, "schema");
+      tenantCredentialResponsibilityFingerprintStatement(sql, "triggers");
+    }
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -11323,8 +11441,30 @@ export class MysqlSessionStore implements
         && !done.has(TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME)) {
         throw new Error("0057 capture epoch cutover marker is missing its 0056 predecessor");
       }
+      if (done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)
+        && !done.has(TENANT_TELEMETRY_CAPTURE_REPEAT_RESTORE_MIGRATION_NAME)) {
+        throw new Error("0059 credential responsibility marker is missing its 0058 predecessor");
+      }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME
+          && !done.has(TENANT_TELEMETRY_CAPTURE_REPEAT_RESTORE_MIGRATION_NAME)) {
+          // Checked before executing the first 0059 DDL. This independent
+          // pre-authoring tree intentionally cannot publish before 0058 lands.
+          throw new Error("0059 credential responsibility migration requires 0058");
+        }
+        if (f === TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME) {
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()
+              AND table_name IN (${TENANT_CREDENTIAL_RESPONSIBILITY_TABLE_NAMES.map(() => "?").join(",")}))
+            + (SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE()
+              AND trigger_name IN (${TENANT_CREDENTIAL_RESPONSIBILITY_TRIGGER_NAMES.map(() => "?").join(",")})) AS n`,
+          [...TENANT_CREDENTIAL_RESPONSIBILITY_TABLE_NAMES,
+            ...TENANT_CREDENTIAL_RESPONSIBILITY_TRIGGER_NAMES]);
+          if (storedSafeInteger(footprint[0]?.n, "markerless 0059 schema footprint") !== 0) {
+            throw new Error("0059 marker-loss or partial DDL requires controlled forward repair");
+          }
+        }
         if (f === TENANT_TELEMETRY_CAPTURE_EPOCH_CUTOVER_MIGRATION_NAME) {
           if (!done.has(TENANT_TELEMETRY_CAPTURE_RESTORE_HISTORY_MIGRATION_NAME)) {
             throw new Error("0057 capture epoch cutover migration requires 0056");
@@ -11807,6 +11947,9 @@ export class MysqlSessionStore implements
       }
       this.credentialLifecycleSchemaInstalled = done.has(
         "0026_credential_lifecycle_inventory.sql",
+      );
+      this.credentialResponsibilitySchemaInstalled = done.has(
+        TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME,
       );
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
@@ -18819,6 +18962,60 @@ export class MysqlSessionStore implements
             inventory.authSecretPresentBefore, inventory.authSourcePointerPresentBefore,
             inventory.storeDbTimestampMs, inventory.receiptSha256],
         );
+        if (this.credentialResponsibilitySchemaInstalled) {
+          const entries: TenantCredentialResponsibilitySnapshotEntry[] = [];
+          for (const version of snapshot.versions) {
+            const source = version.slotKind === "provider_binding"
+              ? await this.loadTenantCredentialResponsibilitySource(
+                conn, authorization.tenantId, version.credentialVersionId, "FOR SHARE",
+              ) : null;
+            const entry = createTenantCredentialResponsibilitySnapshotEntry({
+              requestId: authorization.requestId,
+              tenantId: authorization.tenantId,
+              subjectGeneration: authorization.subjectGeneration,
+              t1FenceSha256: current.t1FenceSha256,
+              version,
+              source,
+              capturedAtDbMs: completionAtMs,
+            });
+            await conn.query(
+              `INSERT INTO tenant_credential_responsibility_entries
+                 (request_id, tenant_id, credential_version_id, subject_generation,
+                  t1_fence_sha256, slot_kind, slot_id_sha256, version_identity_sha256,
+                  version_evidence_sha256, responsibility_source_sha256, source_kind,
+                  captured_at_db_ms, receipt_sha256, entry_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              [entry.requestId, entry.tenantId, entry.credentialVersionId,
+                entry.subjectGeneration, entry.t1FenceSha256, entry.slotKind,
+                entry.slotIdSha256, entry.versionIdentitySha256, entry.versionEvidenceSha256,
+                entry.responsibilitySourceReceiptSha256, entry.sourceKind,
+                entry.capturedAtDbMs, entry.receiptSha256, json(entry)],
+            );
+            entries.push(entry);
+          }
+          const responsibility = createTenantCredentialResponsibilitySnapshotReceipt({
+            t1FenceSha256: current.t1FenceSha256,
+            inventory,
+            versions: snapshot.versions,
+            entries,
+          });
+          await conn.query(
+            `INSERT INTO tenant_credential_responsibility_receipts
+               (request_id, tenant_id, subject_generation, t1_fence_sha256,
+                t3a_receipt_sha256, inventory_receipt_sha256, version_count,
+                version_root_sha256, entry_count, entry_root_sha256,
+                captured_at_db_ms, receipt_sha256, receipt_json)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [responsibility.requestId, responsibility.tenantId,
+              responsibility.subjectGeneration, responsibility.t1FenceSha256,
+              responsibility.t3aReceiptSha256,
+              responsibility.credentialInventoryReceiptSha256,
+              responsibility.versionCount, responsibility.versionRootSha256,
+              responsibility.entryCount, responsibility.entryRootSha256,
+              responsibility.capturedAtDbMs, responsibility.receiptSha256,
+              json(responsibility)],
+          );
+        }
       }
       const [completed] = await conn.query<mysql.ResultSetHeader>(
         `UPDATE tenant_credential_revocation_jobs
@@ -18862,6 +19059,15 @@ export class MysqlSessionStore implements
           ],
         );
         if (activated.affectedRows !== 1) throw new TenantErasureIntegrityError();
+      }
+
+      if (this.credentialResponsibilitySchemaInstalled
+        && !tenantCredentialRevocationAuthorizationMatches(
+          current, authorization, await this.databaseNow(conn),
+        )) {
+        // A slow responsibility snapshot must not publish a T3a receipt after its
+        // original claim expired. All old/new receipts and local DELETEs roll back.
+        throw new TenantErasureIntegrityError();
       }
 
       await conn.commit();
@@ -45821,6 +46027,87 @@ export class MysqlSessionStore implements
     return version;
   }
 
+  private async loadTenantCredentialResponsibilitySource(
+    conn: PoolConnection,
+    tenantId: string,
+    credentialVersionId: string,
+    lock = "",
+    seen = new Set<string>(),
+  ): Promise<TenantCredentialResponsibilitySource | null> {
+    if (!this.credentialResponsibilitySchemaInstalled) return null;
+    if (seen.has(credentialVersionId) || seen.size > 10_000) {
+      throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    seen.add(credentialVersionId);
+    const [rows] = await conn.query<Row[]>(
+      `SELECT tenant_id, credential_version_id, slot_id_sha256, source_revision,
+              receipt_sha256, source_json, recorded_at_db_ms
+         FROM tenant_credential_responsibility_sources
+        WHERE tenant_id=? AND credential_version_id=? ${lock}`,
+      [tenantId, credentialVersionId],
+    );
+    if (rows.length === 0) return null;
+    if (rows.length !== 1) throw new TenantCredentialResponsibilityIntegrityError();
+    const row = rows[0]!;
+    let source: TenantCredentialResponsibilitySource;
+    try {
+      source = parse<TenantCredentialResponsibilitySource>(row.source_json);
+      validateTenantCredentialResponsibilitySource(source);
+      if (source.tenantId !== tenantId || source.credentialVersionId !== credentialVersionId
+        || String(row.tenant_id) !== source.tenantId
+        || String(row.credential_version_id) !== source.credentialVersionId
+        || String(row.slot_id_sha256) !== source.slotIdSha256
+        || storedSafeInteger(row.source_revision, "credential responsibility revision", 1)
+          !== source.sourceRevision
+        || String(row.receipt_sha256) !== source.receiptSha256
+        || storedSafeInteger(row.recorded_at_db_ms, "credential responsibility timestamp")
+          !== source.recordedAtDbMs) throw new Error("responsibility source row mismatch");
+    } catch {
+      throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    const version = await this.loadTenantCredentialVersion(conn, tenantId, credentialVersionId, lock);
+    const [targetRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_CREDENTIAL_TARGET_DISPOSITION_COLUMNS}
+         FROM tenant_credential_target_dispositions
+        WHERE tenant_id=? AND credential_version_id=? AND domain='external_credential' ${lock}`,
+      [tenantId, credentialVersionId],
+    );
+    if (targetRows.length !== 1) throw new TenantCredentialResponsibilityIntegrityError();
+    const target = rowToTenantCredentialTargetDisposition(targetRows[0]!);
+    const previous = source.inheritedFromCredentialVersionId === null ? null
+      : await this.loadTenantCredentialResponsibilitySource(
+        conn, tenantId, source.inheritedFromCredentialVersionId, lock, seen,
+      );
+    try {
+      assertTenantCredentialResponsibilitySourceRelations(
+        source, version, target, previous ?? undefined,
+      );
+      if (targetRows[0]!.target_reference_cipher != null
+        && createHash("sha256").update(Buffer.from(targetRows[0]!.target_reference_cipher))
+          .digest("hex") !== target.targetReferenceCipherSha256) {
+        throw new Error("responsibility target ciphertext mismatch");
+      }
+    } catch {
+      throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    return source;
+  }
+
+  private async insertTenantCredentialResponsibilitySource(
+    conn: PoolConnection,
+    source: TenantCredentialResponsibilitySource,
+  ): Promise<void> {
+    validateTenantCredentialResponsibilitySource(source);
+    await conn.query(
+      `INSERT INTO tenant_credential_responsibility_sources
+         (tenant_id, credential_version_id, slot_id_sha256, source_revision,
+          receipt_sha256, source_json, recorded_at_db_ms)
+       VALUES (?,?,?,?,?,?,?)`,
+      [source.tenantId, source.credentialVersionId, source.slotIdSha256,
+        source.sourceRevision, source.receiptSha256, json(source), source.recordedAtDbMs],
+    );
+  }
+
   private async retireTenantCredentialVersion(
     conn: PoolConnection,
     tenantId: string,
@@ -46716,6 +47003,304 @@ export class MysqlSessionStore implements
     });
   }
 
+  private async loadTenantCredentialResponsibilitySnapshot(
+    conn: PoolConnection,
+    tenantId: string,
+    requestId: string,
+    t3aReceipt: TenantCredentialRevocationReceipt,
+    lock: "" | "FOR SHARE" = "",
+  ): Promise<TenantCredentialResponsibilitySnapshotReceipt | null> {
+    if (!this.credentialResponsibilitySchemaInstalled) return null;
+    const [receiptRows] = await conn.query<Row[]>(
+      `SELECT request_id, tenant_id, subject_generation, t1_fence_sha256,
+              t3a_receipt_sha256, inventory_receipt_sha256, version_count,
+              version_root_sha256, entry_count, entry_root_sha256,
+              captured_at_db_ms, receipt_sha256, receipt_json
+         FROM tenant_credential_responsibility_receipts
+        WHERE request_id=? ${lock}`,
+      [requestId],
+    );
+    if (receiptRows.length === 0) {
+      const [orphanRows] = await conn.query<Row[]>(
+        `SELECT credential_version_id FROM tenant_credential_responsibility_entries
+          WHERE request_id=? LIMIT 1 ${lock}`,
+        [requestId],
+      );
+      if (orphanRows.length > 0) throw new TenantCredentialResponsibilityIntegrityError();
+      return null;
+    }
+    if (receiptRows.length !== 1) throw new TenantCredentialResponsibilityIntegrityError();
+    const raw = receiptRows[0]!;
+    let receipt: TenantCredentialResponsibilitySnapshotReceipt;
+    try {
+      receipt = parse<TenantCredentialResponsibilitySnapshotReceipt>(raw.receipt_json);
+      validateTenantCredentialResponsibilitySnapshotReceipt(receipt);
+      if (receipt.tenantId !== tenantId || receipt.requestId !== requestId
+        || String(raw.tenant_id) !== receipt.tenantId
+        || String(raw.request_id) !== receipt.requestId
+        || storedSafeInteger(raw.subject_generation, "credential responsibility generation", 1)
+          !== receipt.subjectGeneration
+        || String(raw.t1_fence_sha256) !== receipt.t1FenceSha256
+        || String(raw.t3a_receipt_sha256) !== receipt.t3aReceiptSha256
+        || String(raw.inventory_receipt_sha256) !== receipt.credentialInventoryReceiptSha256
+        || storedSafeInteger(raw.version_count, "credential responsibility version count")
+          !== receipt.versionCount
+        || String(raw.version_root_sha256) !== receipt.versionRootSha256
+        || storedSafeInteger(raw.entry_count, "credential responsibility entry count")
+          !== receipt.entryCount
+        || String(raw.entry_root_sha256) !== receipt.entryRootSha256
+        || storedSafeInteger(raw.captured_at_db_ms, "credential responsibility captured time")
+          !== receipt.capturedAtDbMs
+        || String(raw.receipt_sha256) !== receipt.receiptSha256
+        || receipt.t3aReceiptSha256 !== t3aReceipt.receiptSha256) {
+        throw new Error("credential responsibility receipt row mismatch");
+      }
+    } catch {
+      throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    const inventory = await this.loadTenantCredentialInventoryReceipt(
+      conn, tenantId, requestId, lock,
+    );
+    if (!inventory) throw new TenantCredentialResponsibilityIntegrityError();
+    await this.validateTenantCredentialInventoryReadProof(conn, inventory, t3aReceipt);
+    const snapshot = await this.loadTenantCredentialLifecycleSnapshot(conn, tenantId, lock);
+    const [entryRows] = await conn.query<Row[]>(
+      `SELECT request_id, tenant_id, credential_version_id, subject_generation,
+              t1_fence_sha256, slot_kind, slot_id_sha256, version_identity_sha256,
+              version_evidence_sha256, responsibility_source_sha256, source_kind,
+              captured_at_db_ms, receipt_sha256, entry_json
+         FROM tenant_credential_responsibility_entries
+        WHERE request_id=? ORDER BY credential_version_id ${lock}`,
+      [requestId],
+    );
+    const entries: TenantCredentialResponsibilitySnapshotEntry[] = [];
+    const versions = new Map(snapshot.versions.map((version) => [version.credentialVersionId, version]));
+    if (entryRows.length !== snapshot.versions.length) {
+      throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    for (const row of entryRows) {
+      let entry: TenantCredentialResponsibilitySnapshotEntry;
+      try {
+        entry = parse<TenantCredentialResponsibilitySnapshotEntry>(row.entry_json);
+        validateTenantCredentialResponsibilitySnapshotEntry(entry);
+        if (entry.requestId !== requestId || entry.tenantId !== tenantId
+          || String(row.request_id) !== entry.requestId
+          || String(row.tenant_id) !== entry.tenantId
+          || String(row.credential_version_id) !== entry.credentialVersionId
+          || storedSafeInteger(row.subject_generation, "responsibility entry generation", 1)
+            !== entry.subjectGeneration
+          || String(row.t1_fence_sha256) !== entry.t1FenceSha256
+          || String(row.slot_kind) !== entry.slotKind
+          || String(row.slot_id_sha256) !== entry.slotIdSha256
+          || String(row.version_identity_sha256) !== entry.versionIdentitySha256
+          || String(row.version_evidence_sha256) !== entry.versionEvidenceSha256
+          || (row.responsibility_source_sha256 == null ? null
+            : String(row.responsibility_source_sha256))
+            !== entry.responsibilitySourceReceiptSha256
+          || String(row.source_kind) !== entry.sourceKind
+          || storedSafeInteger(row.captured_at_db_ms, "responsibility entry captured time")
+            !== entry.capturedAtDbMs
+          || String(row.receipt_sha256) !== entry.receiptSha256) {
+          throw new Error("responsibility entry row mismatch");
+        }
+      } catch {
+        throw new TenantCredentialResponsibilityIntegrityError();
+      }
+      const version = versions.get(entry.credentialVersionId);
+      if (!version) throw new TenantCredentialResponsibilityIntegrityError();
+      const source = version.slotKind === "provider_binding"
+        ? await this.loadTenantCredentialResponsibilitySource(
+          conn, tenantId, version.credentialVersionId, lock,
+        ) : null;
+      const expected = createTenantCredentialResponsibilitySnapshotEntry({
+        requestId, tenantId, subjectGeneration: receipt.subjectGeneration,
+        t1FenceSha256: receipt.t1FenceSha256, version, source,
+        capturedAtDbMs: receipt.capturedAtDbMs,
+      });
+      if (entry.receiptSha256 !== expected.receiptSha256) {
+        throw new TenantCredentialResponsibilityIntegrityError();
+      }
+      entries.push(entry);
+    }
+    const expected = createTenantCredentialResponsibilitySnapshotReceipt({
+      t1FenceSha256: receipt.t1FenceSha256,
+      inventory,
+      versions: snapshot.versions,
+      entries,
+    });
+    if (expected.receiptSha256 !== receipt.receiptSha256) {
+      throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    return receipt;
+  }
+
+  private async assertTenantCredentialResponsibilityProjection(
+    conn: PoolConnection,
+  ): Promise<void> {
+    if (!this.credentialResponsibilitySchemaInstalled) return;
+    const [sourceRows] = await conn.query<Row[]>(
+      `SELECT tenant_id, credential_version_id
+         FROM tenant_credential_responsibility_sources
+        ORDER BY tenant_id, credential_version_id`,
+    );
+    for (const row of sourceRows) {
+      if (!await this.loadTenantCredentialResponsibilitySource(
+        conn, String(row.tenant_id), String(row.credential_version_id),
+      )) throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    const [liveRows] = await conn.query<Row[]>(
+      `SELECT p.tenant_id, p.credential_version_id,
+              p.credential_write_generation, p.secret_cipher, p.secret_key_id
+         FROM provider_configs p
+         JOIN tenant_credential_responsibility_sources s
+           ON BINARY s.tenant_id=BINARY p.tenant_id
+          AND BINARY s.credential_version_id=BINARY p.credential_version_id
+        ORDER BY p.tenant_id, p.provider_id`,
+    );
+    for (const row of liveRows) {
+      const source = await this.loadTenantCredentialResponsibilitySource(
+        conn, String(row.tenant_id), String(row.credential_version_id),
+      );
+      if (!source || source.sourceRevision !== storedSafeInteger(
+        row.credential_write_generation, "credential responsibility live revision", 1,
+      ) || source.secretEnvelopeSha256 !== (row.secret_cipher == null ? null
+        : providerByokSecretEnvelopeSha256({
+          ciphertext: Buffer.from(row.secret_cipher), keyId: String(row.secret_key_id),
+        }))) throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    const [orphanEntries] = await conn.query<Row[]>(
+      `SELECT e.request_id FROM tenant_credential_responsibility_entries e
+         LEFT JOIN tenant_credential_responsibility_receipts r
+           ON BINARY r.request_id=BINARY e.request_id
+          AND BINARY r.tenant_id=BINARY e.tenant_id
+        WHERE r.request_id IS NULL LIMIT 1`,
+    );
+    if (orphanEntries.length > 0) throw new TenantCredentialResponsibilityIntegrityError();
+    const [receiptRows] = await conn.query<Row[]>(
+      `SELECT tenant_id, request_id
+         FROM tenant_credential_responsibility_receipts
+        ORDER BY request_id`,
+    );
+    for (const row of receiptRows) {
+      const tenantId = String(row.tenant_id), requestId = String(row.request_id);
+      const job = await this.loadTenantCredentialRevocationJob(conn, tenantId, requestId);
+      if (!job) throw new TenantCredentialResponsibilityIntegrityError();
+      const t3a = await this.validateTenantCredentialRevocationReadProof(conn, job);
+      if (!t3a || !await this.loadTenantCredentialResponsibilitySnapshot(
+        conn, tenantId, requestId, t3a,
+      )) throw new TenantCredentialResponsibilityIntegrityError();
+    }
+  }
+
+  async getTenantCredentialResponsibilityReadiness(
+    tenantId: string,
+    requestId: string,
+  ): Promise<TenantCredentialResponsibilityReadiness | null> {
+    if (!tenantId || tenantId.length > 128 || !requestId || requestId.length > 64) {
+      throw new TenantCredentialResponsibilityIntegrityError();
+    }
+    return this.withConsistentRead(async (conn) => {
+      const admission = await this.loadTenantErasureAdmission(conn, tenantId, requestId);
+      if (!admission) return null;
+      const fence = await this.loadTenantCredentialRevocationFence(
+        conn, tenantId, requestId,
+      );
+      const firstAudit = await this.loadTenantErasureFirstAudit(conn, requestId);
+      const [lifecycleRows] = await conn.query<Row[]>(
+        `SELECT ${SUBJECT_LIFECYCLE_COLUMNS}
+           FROM subject_lifecycle
+          WHERE tenant_id=? AND subject_kind='tenant' AND subject_id=?`,
+        [tenantId, tenantId],
+      );
+      if (!fence || !firstAudit) throw new TenantCredentialResponsibilityIntegrityError();
+      try {
+        validateTenantErasureAdmissionProof({
+          admission,
+          lifecycle: lifecycleRows[0] ? rowToSubjectLifecycle(lifecycleRows[0]) : undefined,
+          fence,
+          firstAudit,
+        });
+      } catch {
+        throw new TenantCredentialResponsibilityIntegrityError();
+      }
+      const t3aJob = await this.loadTenantCredentialRevocationJob(conn, tenantId, requestId);
+      const t3a = t3aJob === null ? null
+        : await this.validateTenantCredentialRevocationReadProof(conn, t3aJob);
+      if (t3a === null && this.credentialResponsibilitySchemaInstalled) {
+        const [footprint] = await conn.query<Row[]>(
+          `SELECT
+             (SELECT COUNT(*) FROM tenant_credential_responsibility_receipts
+               WHERE request_id=?)
+             + (SELECT COUNT(*) FROM tenant_credential_responsibility_entries
+               WHERE request_id=?) AS n`,
+          [requestId, requestId],
+        );
+        if (storedSafeInteger(footprint[0]?.n,
+          "unbacked credential responsibility snapshot footprint") !== 0) {
+          throw new TenantCredentialResponsibilityIntegrityError();
+        }
+      }
+      const responsibility = t3a === null ? null
+        : await this.loadTenantCredentialResponsibilitySnapshot(
+          conn, tenantId, requestId, t3a,
+        );
+      const inventory = await this.loadTenantCredentialInventoryReceipt(
+        conn, tenantId, requestId,
+      );
+      if (t3a === null && inventory !== null) {
+        throw new TenantCredentialResponsibilityIntegrityError();
+      }
+      const t3bJob = await this.loadTenantRuntimeRevocationJob(conn, tenantId, requestId);
+      const t3b = t3bJob === null ? null
+        : await this.validateTenantRuntimeRevocationReadProof(conn, t3bJob);
+      if (t3b && !t3a) throw new TenantCredentialResponsibilityIntegrityError();
+      const [materialRows] = await conn.query<Row[]>(
+        `SELECT
+           (SELECT COUNT(*) FROM api_keys WHERE tenant_id=?) AS api_keys,
+           (SELECT COUNT(*) FROM provider_configs WHERE tenant_id=?) AS providers,
+           (SELECT COUNT(*) FROM tenants WHERE tenant_id=?
+             AND (auth_policy IS NOT NULL OR auth_secret_cipher IS NOT NULL
+               OR auth_secret_key_id IS NOT NULL)) AS tenant_auth`,
+        [tenantId, tenantId, tenantId],
+      );
+      const materialPresent = ["api_keys", "providers", "tenant_auth"].some(
+        (field) => storedSafeInteger(
+          materialRows[0]?.[field], "credential responsibility live source count",
+        ) !== 0,
+      );
+      if (t3a && materialPresent) throw new TenantCredentialResponsibilityIntegrityError();
+      const localDatabase = t3a ? "cleared" as const : "not_cleared" as const;
+      const trackedRuntimeReferences = t3b ? "dropped_not_zeroized" as const
+        : t3a ? "not_drained" as const : "unknown" as const;
+      const observed = responsibility !== null && inventory !== null
+        && inventory.legacyHistoryUnknownSubjectCount === 0
+        && responsibility.unknownMaterialCount === 0;
+      const remoteCredentials = !observed ? "unknown" as const
+        : responsibility.customerManagedApiKeyCount > 0
+          ? "customer_responsibility_recorded" as const : "not_applicable" as const;
+      const status = !observed ? "unknown" as const
+        : t3b === null ? "awaiting_runtime_drain" as const
+        : "local_responsibility_observed" as const;
+      const readiness: TenantCredentialResponsibilityReadiness = {
+        schema: "tenant-credential-responsibility-readiness-v1",
+        tenantId, requestId, status, t1FenceSha256: fence.evidenceSha256,
+        t3aReceiptSha256: t3a?.receiptSha256 ?? null,
+        t3bReceiptSha256: t3b?.receiptSha256 ?? null,
+        responsibilityReceiptSha256: responsibility?.receiptSha256 ?? null,
+        localDatabase, trackedRuntimeReferences, remoteCredentials,
+        sharedKeys: "platform_shared_not_tenant_deletable",
+        backupCopies: "unknown", otherCopies: "unknown",
+        versionCount: responsibility?.versionCount ?? null,
+        customerManagedApiKeyCount: responsibility?.customerManagedApiKeyCount ?? null,
+        unknownMaterialCount: responsibility?.unknownMaterialCount ?? null,
+        executionReady: false, externalAuthorityVerified: false,
+        allDomainsComplete: false, contentPurgeExecuted: false,
+      };
+      validateTenantCredentialResponsibilityReadiness(readiness);
+      return readiness;
+    });
+  }
+
   // ---------- provider configs ----------
   async upsertProviderConfig(
     cfg: ProviderConfig,
@@ -46723,6 +47308,63 @@ export class MysqlSessionStore implements
     expectedSourceRevision?: number | null,
     targetReference?: ProviderCredentialTargetReferenceWrite,
   ): Promise<ProviderConfig> {
+    return this.upsertProviderConfigCore(cfg, secret, expectedSourceRevision, targetReference);
+  }
+
+  async upsertProviderConfigWithResponsibility(
+    input: UpsertProviderConfigWithResponsibilityInput,
+  ): Promise<ProviderConfig> {
+    const invalid = () => { throw new TenantCredentialResponsibilityIntegrityError(); };
+    if (!this.credentialResponsibilitySchemaInstalled || !input || typeof input !== "object"
+      || Array.isArray(input)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(input))) invalid();
+    const keys = Reflect.ownKeys(input);
+    const allowed = ["config", "secret", "expectedSourceRevision", "targetReference", "secretAdmission"];
+    if (!keys.includes("config") || !keys.includes("expectedSourceRevision")) invalid();
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (typeof key !== "string" || !allowed.includes(key) || !descriptor
+        || !("value" in descriptor) || !descriptor.enumerable) invalid();
+    }
+    const config = input.config;
+    if (!config || typeof config !== "object") invalid();
+    for (const name of ["tenantId", "id"] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(config, name);
+      if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") invalid();
+    }
+    const expected = input.expectedSourceRevision;
+    if (expected !== null && (!Number.isSafeInteger(expected) || expected < 0)) invalid();
+    if ((input.secret !== undefined) !== (input.secretAdmission !== undefined)) invalid();
+    if (input.secret !== undefined) {
+      // Verify the original encrypted object and original token before any clone or DB query.
+      assertProviderByokSecretAdmission(input.secretAdmission!, {
+        tenantId: config.tenantId, providerId: config.id,
+        expectedSourceRevision: expected, secret: input.secret,
+      });
+    }
+    return this.upsertProviderConfigCore(
+      ProviderConfigSchema.parse(config), input.secret,
+      expected, input.targetReference,
+      input.secretAdmission, true,
+    );
+  }
+
+  private async upsertProviderConfigCore(
+    cfg: ProviderConfig,
+    secret?: { ciphertext: Buffer; keyId: string },
+    expectedSourceRevision?: number | null,
+    targetReference?: ProviderCredentialTargetReferenceWrite,
+    secretAdmission?: UpsertProviderConfigWithResponsibilityInput["secretAdmission"],
+    recordResponsibility = false,
+  ): Promise<ProviderConfig> {
+    const newSecretAdmissionSha256 = secretAdmission === undefined ? null
+      : assertProviderByokSecretAdmission(secretAdmission, {
+        tenantId: cfg.tenantId, providerId: cfg.id,
+        expectedSourceRevision: expectedSourceRevision!, secret: secret!,
+      });
+    const stagedSecret = secretAdmission === undefined ? secret : {
+      ciphertext: Buffer.from(secret!.ciphertext), keyId: secret!.keyId,
+    };
     const stagedTargetReference = targetReference === undefined ? undefined : {
       ...targetReference,
       targetReferenceCipher: Buffer.from(targetReference.targetReferenceCipher),
@@ -46846,7 +47488,7 @@ export class MysqlSessionStore implements
             ciphertext: Buffer.from(providerRow.secret_cipher),
             keyId: String(providerRow.secret_key_id),
           };
-      const finalSecret = secret ?? existingSecret;
+      const finalSecret = stagedSecret ?? existingSecret;
       const finalConfig = ProviderConfigSchema.parse({
         ...cfg,
         createdAtMs: existingConfig?.createdAtMs ?? cfg.createdAtMs,
@@ -46918,6 +47560,35 @@ export class MysqlSessionStore implements
         : undefined;
       const writeGeneration = (slot?.writeGeneration ?? 0) + 1;
       if (!Number.isSafeInteger(writeGeneration)) throw new TenantErasureIntegrityError();
+      if (recordResponsibility && cutover.controlGeneration === 1 && currentVersion !== undefined) {
+        const [targetRows] = await conn.query<Row[]>(
+          `SELECT ${TENANT_CREDENTIAL_TARGET_DISPOSITION_COLUMNS}
+             FROM tenant_credential_target_dispositions
+            WHERE tenant_id=? AND credential_version_id=? AND domain='external_credential'
+            FOR SHARE`,
+          [cfg.tenantId, currentVersion.credentialVersionId],
+        );
+        if (targetRows.length !== 1) throw new TenantCredentialResponsibilityIntegrityError();
+        const previous = oldVersionId === undefined ? null
+          : await this.loadTenantCredentialResponsibilitySource(
+            conn, cfg.tenantId, oldVersionId, "FOR SHARE",
+          );
+        const source = createTenantCredentialResponsibilitySource({
+          version: currentVersion,
+          externalTarget: rowToTenantCredentialTargetDisposition(targetRows[0]!),
+          sourceRevision: writeGeneration,
+          expectedSourceRevision: existingRevision,
+          secretEnvelopeSha256: finalSecret === undefined
+            ? null : providerByokSecretEnvelopeSha256(finalSecret),
+          newSecretAdmissionSha256,
+          ...(previous === null ? {} : { previousSource: previous }),
+        });
+        if (source.apiKeySource === "inherited_byok"
+          && oldVersionId !== source.inheritedFromCredentialVersionId) {
+          throw new TenantCredentialResponsibilityIntegrityError();
+        }
+        await this.insertTenantCredentialResponsibilitySource(conn, source);
+      }
       await this.writeTenantCredentialProviderSlot(conn, {
         tenantId: cfg.tenantId,
         slotIdSha256,
@@ -47010,6 +47681,16 @@ export class MysqlSessionStore implements
           );
         }
       }
+      if (this.credentialResponsibilitySchemaInstalled && r.credential_version_id != null) {
+        const source = await this.loadTenantCredentialResponsibilitySource(
+          conn, tenantId, String(r.credential_version_id),
+        );
+        if (source && (source.sourceRevision !== credentialSourceRevision
+          || source.secretEnvelopeSha256 !== (r.secret_cipher == null ? null
+            : providerByokSecretEnvelopeSha256({
+              ciphertext: Buffer.from(r.secret_cipher), keyId: String(r.secret_key_id),
+            })))) throw new TenantCredentialResponsibilityIntegrityError();
+      }
       return {
         config,
         secret: r.secret_cipher
@@ -47075,6 +47756,18 @@ export class MysqlSessionStore implements
               secretPresent: row.secret_cipher != null,
               row,
             });
+          }
+          if (this.credentialResponsibilitySchemaInstalled
+            && row.credential_version_id != null) {
+            const source = await this.loadTenantCredentialResponsibilitySource(
+              conn, tenantId, String(row.credential_version_id),
+            );
+            if (source && (source.sourceRevision !== storedSafeInteger(
+              row.credential_write_generation, "stored provider responsibility revision", 1,
+            ) || source.secretEnvelopeSha256 !== (row.secret_cipher == null ? null
+              : providerByokSecretEnvelopeSha256({
+                ciphertext: Buffer.from(row.secret_cipher), keyId: String(row.secret_key_id),
+              })))) throw new TenantCredentialResponsibilityIntegrityError();
           }
         }
       }

@@ -482,6 +482,7 @@ import {
   type TenantCredentialTrackingSubject,
   type TenantCredentialVersion,
 } from "./credential-lifecycle.js";
+import * as CredentialResponsibility from "./credential-responsibility.js";
 import {
   TENANT_CREDENTIAL_REVOCATION_EXTERNAL_DISPOSITION,
   TENANT_CREDENTIAL_REVOCATION_RECEIPT_SCOPE,
@@ -1250,6 +1251,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     MemoryTenantCredentialTargetReference
   >();
   tenantCredentialInventoryReceipts = new Map<string, TenantCredentialInventoryReceipt>();
+  tenantCredentialResponsibilitySources = new Map<string, CredentialResponsibility.TenantCredentialResponsibilitySource>();
+  tenantCredentialResponsibilitySnapshotEntries = new Map<string, CredentialResponsibility.TenantCredentialResponsibilitySnapshotEntry[]>();
+  tenantCredentialResponsibilitySnapshotReceipts = new Map<string, CredentialResponsibility.TenantCredentialResponsibilitySnapshotReceipt>();
   tenantCredentialTargetExecutionJobs = new Map<
     string,
     TenantCredentialTargetExecutionJobRecord
@@ -13864,6 +13868,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           || inventory.t3aReceiptSha256 !== receipt.receiptSha256
         ) throw new TenantErasureIntegrityError();
       }
+      this.assertMemoryCredentialResponsibilitySnapshot(current.tenantId, current.requestId);
       return tenantCredentialRevocationCompletionMatchesAuthorization(current, stagedAuthorization)
         && tenantCredentialRevocationReceiptMatchesAuthorization(receipt, stagedAuthorization)
         ? clone(receipt)
@@ -13896,6 +13901,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const cutover = this.readTenantCredentialRevocationCutover(true);
     const trackingCutover = this.readMemoryTenantCredentialTrackingCutover();
     const trackingActive = trackingCutover.controlGeneration === 1;
+    if (trackingActive) this.assertMemoryCredentialResponsibilitySources();
     const lifecycleHighWater = trackingActive
       ? this.tenantCredentialLifecycleHighWater(current.tenantId)
       : undefined;
@@ -14133,6 +14139,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     validateTenantCredentialRevocationCutoverRecord(stagedCutover);
 
     let stagedInventoryReceipt: TenantCredentialInventoryReceipt | undefined;
+    let stagedResponsibilityEntries: CredentialResponsibility.TenantCredentialResponsibilitySnapshotEntry[] | undefined;
+    let stagedResponsibilityReceipt: CredentialResponsibility.TenantCredentialResponsibilitySnapshotReceipt | undefined;
     if (trackingActive) {
       if (trackingCutover.evidenceSha256 === undefined) {
         throw new TenantErasureIntegrityError();
@@ -14187,7 +14195,24 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         receiptSha256: tenantCredentialInventoryReceiptSha256(inventoryBody),
       });
       validateTenantCredentialInventoryReceipt(stagedInventoryReceipt);
+      if (this.tenantCredentialResponsibilitySnapshotEntries.has(current.requestId)
+        || this.tenantCredentialResponsibilitySnapshotReceipts.has(current.requestId)) {
+        throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+      }
+      // Include every real 0026 version, not only versions with new provenance.
+      // No receipt is manufactured for inactive tracking or historical terminals.
+      stagedResponsibilityEntries = snapshot.versions.map((version) =>
+        CredentialResponsibility.createTenantCredentialResponsibilitySnapshotEntry({
+          requestId: current.requestId, tenantId: current.tenantId, subjectGeneration: current.subjectGeneration,
+          t1FenceSha256: current.t1FenceSha256, version,
+          source: this.assertMemoryCredentialResponsibilitySource(version.credentialVersionId), capturedAtDbMs: nowMs,
+        }));
+      stagedResponsibilityReceipt = CredentialResponsibility.createTenantCredentialResponsibilitySnapshotReceipt({
+        t1FenceSha256: current.t1FenceSha256, inventory: stagedInventoryReceipt,
+        versions: snapshot.versions, entries: stagedResponsibilityEntries,
+      });
     }
+    const outwardReceipt = clone(stagedReceipt);
 
     const apiKeysBefore = new Map(this.apiKeys);
     const providersBefore = new Map(this.providers);
@@ -14198,6 +14223,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const jobsBefore = new Map(this.tenantCredentialRevocationJobs);
     const receiptsBefore = new Map(this.tenantCredentialRevocationReceipts);
     const cutoversBefore = new Map(this.tenantCredentialRevocationCutovers);
+    const responsibilityEntriesBefore = new Map(this.tenantCredentialResponsibilitySnapshotEntries);
+    const responsibilityReceiptsBefore = new Map(this.tenantCredentialResponsibilitySnapshotReceipts);
     try {
       for (const [key] of apiKeyTargets) this.apiKeys.delete(key);
       for (const [key] of providerTargets) this.providers.delete(key);
@@ -14223,10 +14250,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
           stagedInventoryReceipt,
         );
       }
+      if (stagedResponsibilityEntries && stagedResponsibilityReceipt) {
+        this.tenantCredentialResponsibilitySnapshotEntries.set(current.requestId, stagedResponsibilityEntries);
+        this.tenantCredentialResponsibilitySnapshotReceipts.set(current.requestId, stagedResponsibilityReceipt);
+      }
       if (cutover.controlGeneration === 0) {
         this.tenantCredentialRevocationCutovers.set(1, stagedCutover);
       }
       this.tenantCredentialRevocationJobs.set(current.requestId, stagedJob);
+      if (stagedResponsibilityReceipt) this.assertMemoryCredentialResponsibilitySnapshot(current.tenantId, current.requestId);
     } catch (error) {
       restoreMapSnapshot(this.apiKeys, apiKeysBefore);
       restoreMapSnapshot(this.providers, providersBefore);
@@ -14237,9 +14269,11 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       restoreMapSnapshot(this.tenantCredentialRevocationJobs, jobsBefore);
       restoreMapSnapshot(this.tenantCredentialRevocationReceipts, receiptsBefore);
       restoreMapSnapshot(this.tenantCredentialRevocationCutovers, cutoversBefore);
+      restoreMapSnapshot(this.tenantCredentialResponsibilitySnapshotEntries, responsibilityEntriesBefore);
+      restoreMapSnapshot(this.tenantCredentialResponsibilitySnapshotReceipts, responsibilityReceiptsBefore);
       throw error;
     }
-    return clone(stagedReceipt);
+    return outwardReceipt;
   }
 
   async getTenantCredentialRevocationJob(
@@ -29342,14 +29376,190 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return this.tenantCredentialTargetExecutionJobs.size > 0;
   }
 
+  /** Bottom-up actual 0026 version/target/source chain, never source-map presence alone. */
+  private assertMemoryCredentialResponsibilitySource(
+    credentialVersionId: string, visiting = new Set<string>(),
+  ): CredentialResponsibility.TenantCredentialResponsibilitySource | null {
+    const source = this.tenantCredentialResponsibilitySources.get(credentialVersionId);
+    if (!source) return null;
+    if (visiting.has(credentialVersionId) || source.credentialVersionId !== credentialVersionId) {
+      throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+    }
+    visiting.add(credentialVersionId);
+    try {
+      const version = this.tenantCredentialVersions.get(credentialVersionId);
+      const target = this.tenantCredentialTargetDispositions.get(tenantCredentialTargetKey(credentialVersionId, "external_credential"));
+      if (!version || !target) throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+      const previous = source.inheritedFromCredentialVersionId === null ? null
+        : this.assertMemoryCredentialResponsibilitySource(source.inheritedFromCredentialVersionId, visiting);
+      CredentialResponsibility.assertTenantCredentialResponsibilitySourceRelations(source, version, target, previous ?? undefined);
+      if (previous) {
+        const retired = this.tenantCredentialVersions.get(previous.credentialVersionId);
+        if (!retired || retired.retireReason !== "replaced" || retired.retiredAtDbMs !== source.recordedAtDbMs) {
+          throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+        }
+      }
+      return source;
+    } finally { visiting.delete(credentialVersionId); }
+  }
+
+  private assertMemoryCredentialResponsibilitySources(): void {
+    if (this.tenantCredentialResponsibilitySources.size > 0 && !this.tenantCredentialTrackingActive()) {
+      throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+    }
+    for (const id of this.tenantCredentialResponsibilitySources.keys()) this.assertMemoryCredentialResponsibilitySource(id);
+    for (const provider of this.providers.values()) {
+      if (provider.credentialVersionId === undefined) continue;
+      const source = this.tenantCredentialResponsibilitySources.get(provider.credentialVersionId);
+      if (!source) continue; // A genuine old/legacy path is unknown, never silently upgraded.
+      if (source.tenantId !== provider.config.tenantId
+        || source.slotIdSha256 !== tenantCredentialSlotIdSha256(provider.config.tenantId, "provider_binding", provider.config.id)
+        || source.sourceRevision !== provider.credentialSourceRevision
+        || source.secretEnvelopeSha256 !== (provider.secret === undefined ? null
+          : CredentialResponsibility.providerByokSecretEnvelopeSha256(provider.secret))) {
+        throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+      }
+    }
+  }
+
+  private assertMemoryCredentialResponsibilitySnapshot(
+    tenantId: string, requestId: string,
+  ): CredentialResponsibility.TenantCredentialResponsibilitySnapshotReceipt | null {
+    const receipt = this.tenantCredentialResponsibilitySnapshotReceipts.get(requestId);
+    const entries = this.tenantCredentialResponsibilitySnapshotEntries.get(requestId);
+    if (!receipt) {
+      if (entries !== undefined) throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+      return null; // No snapshot is unknown even for a true historical terminal or an empty inventory.
+    }
+    if (receipt.tenantId !== tenantId || !entries) throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+    this.assertMemoryCredentialResponsibilitySources();
+    const inventory = this.tenantCredentialInventoryReceipts.get(requestId);
+    const job = this.tenantCredentialRevocationJobs.get(requestId);
+    const t3a = this.tenantCredentialRevocationReceipts.get(requestId);
+    if (!inventory || !job || !t3a || job.tenantId !== tenantId || job.phase !== "credential_store_revoked") {
+      throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+    }
+    this.assertTenantCredentialRevocationSource(job);
+    validateTenantCredentialRevocationCompletionProof(job, t3a);
+    const snapshot = this.assertTenantCredentialInventoryReceipt(inventory);
+    const actualEntries = snapshot.versions.map((version) => CredentialResponsibility.createTenantCredentialResponsibilitySnapshotEntry({
+      requestId, tenantId, subjectGeneration: job.subjectGeneration, t1FenceSha256: job.t1FenceSha256,
+      version, source: this.assertMemoryCredentialResponsibilitySource(version.credentialVersionId),
+      capturedAtDbMs: inventory.storeDbTimestampMs,
+    }));
+    const expected = CredentialResponsibility.createTenantCredentialResponsibilitySnapshotReceipt({
+      t1FenceSha256: job.t1FenceSha256, inventory, versions: snapshot.versions, entries: actualEntries,
+    });
+    CredentialResponsibility.validateTenantCredentialResponsibilitySnapshotReceipt(receipt);
+    for (const entry of entries) CredentialResponsibility.validateTenantCredentialResponsibilitySnapshotEntry(entry);
+    if (receipt.receiptSha256 !== expected.receiptSha256
+      || CredentialResponsibility.tenantCredentialResponsibilitySnapshotEntryRootSha256(entries) !== expected.entryRootSha256
+      || entries.length !== actualEntries.length) throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+    return receipt;
+  }
+
+  async getTenantCredentialResponsibilityReadiness(
+    tenantId: string, requestId: string,
+  ): Promise<CredentialResponsibility.TenantCredentialResponsibilityReadiness | null> {
+    const admission = this.tenantErasureAdmissions.get(requestId);
+    if (!admission || admission.tenantId !== tenantId) return null;
+    const job = this.tenantCredentialRevocationJobs.get(requestId);
+    if (!job || job.tenantId !== tenantId) throw new TenantErasureIntegrityError();
+    this.assertTenantCredentialRevocationSource(job);
+    const t3a = this.tenantCredentialRevocationReceipts.get(requestId);
+    if ((job.phase === "credential_store_revoked") !== (t3a !== undefined)) throw new TenantErasureIntegrityError();
+    if (t3a) {
+      validateTenantCredentialRevocationCompletionProof(job, t3a);
+      const tenant = this.tenants.get(tenantId);
+      if (!tenant || tenant.tenantId !== tenantId || tenant.authPolicy !== undefined || tenant.authSecret !== undefined
+        || [...this.apiKeys.values()].some((row) => row.tenantId === tenantId)
+        || [...this.providers.values()].some((row) => row.config.tenantId === tenantId)) throw new TenantErasureIntegrityError();
+    }
+    const runtimeJob = this.tenantRuntimeRevocationJobs.get(requestId);
+    const t3b = this.tenantRuntimeRevocationReceipts.get(requestId);
+    if (runtimeJob) {
+      if (runtimeJob.tenantId !== tenantId) throw new TenantErasureIntegrityError();
+      this.assertTenantRuntimeRevocationSource(runtimeJob, runtimeJob.phase !== "configured_fleet_quiesced");
+      if ((runtimeJob.phase === "configured_fleet_quiesced") !== (t3b !== undefined)) throw new TenantErasureIntegrityError();
+      if (t3b) validateTenantRuntimeRevocationCompletionProof(runtimeJob,
+        [...this.tenantRuntimeRevocationTargetReceipts.values()].filter((row) => row.requestId === requestId), t3b);
+    } else if (t3b) throw new TenantErasureIntegrityError();
+    const snapshot = this.assertMemoryCredentialResponsibilitySnapshot(tenantId, requestId);
+    const inventory = this.tenantCredentialInventoryReceipts.get(requestId);
+    const observed = snapshot !== null && inventory?.legacyHistoryUnknownSubjectCount === 0
+      && snapshot.unknownMaterialCount === 0;
+    const readiness: CredentialResponsibility.TenantCredentialResponsibilityReadiness = {
+      schema: "tenant-credential-responsibility-readiness-v1", tenantId, requestId,
+      status: !observed ? "unknown" : !t3a ? "awaiting_local_clear"
+        : !t3b ? "awaiting_runtime_drain" : "local_responsibility_observed",
+      t1FenceSha256: job.t1FenceSha256, t3aReceiptSha256: t3a?.receiptSha256 ?? null,
+      t3bReceiptSha256: t3b?.receiptSha256 ?? null, responsibilityReceiptSha256: snapshot?.receiptSha256 ?? null,
+      localDatabase: t3a ? "cleared" : "not_cleared",
+      trackedRuntimeReferences: t3b ? "dropped_not_zeroized" : "not_drained",
+      remoteCredentials: !observed ? "unknown" : snapshot.customerManagedApiKeyCount > 0
+        ? "customer_responsibility_recorded" : "not_applicable",
+      sharedKeys: "platform_shared_not_tenant_deletable", backupCopies: "unknown", otherCopies: "unknown",
+      versionCount: snapshot?.versionCount ?? null, customerManagedApiKeyCount: snapshot?.customerManagedApiKeyCount ?? null,
+      unknownMaterialCount: snapshot?.unknownMaterialCount ?? null,
+      executionReady: false, externalAuthorityVerified: false, allDomainsComplete: false, contentPurgeExecuted: false,
+    };
+    CredentialResponsibility.validateTenantCredentialResponsibilityReadiness(readiness);
+    return clone(readiness);
+  }
+
   async upsertProviderConfig(
     cfg: ProviderConfig,
     secret?: { ciphertext: Buffer; keyId: string },
     expectedSourceRevision?: number | null,
     targetReference?: ProviderCredentialTargetReferenceWrite,
   ): Promise<ProviderConfig> {
+    return this.upsertProviderConfigCore(cfg, secret, expectedSourceRevision, targetReference);
+  }
+
+  async upsertProviderConfigWithResponsibility(
+    input: CredentialResponsibility.UpsertProviderConfigWithResponsibilityInput,
+  ): Promise<ProviderConfig> {
+    const invalid = () => { throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError(); };
+    if (!input || typeof input !== "object" || Array.isArray(input)
+      || ![Object.prototype, null].includes(Object.getPrototypeOf(input))) invalid();
+    const keys = Reflect.ownKeys(input);
+    const allowed = ["config", "secret", "expectedSourceRevision", "targetReference", "secretAdmission"];
+    if (!keys.includes("config") || !keys.includes("expectedSourceRevision")) invalid();
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      if (typeof key !== "string" || !allowed.includes(key) || !descriptor
+        || !("value" in descriptor) || !descriptor.enumerable) invalid();
+    }
+    const config = input.config;
+    if (!config || typeof config !== "object") invalid();
+    for (const name of ["tenantId", "id"] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(config, name);
+      if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string") invalid();
+    }
+    const expected = input.expectedSourceRevision;
+    if (expected !== null && (!Number.isSafeInteger(expected) || expected < 0)) invalid();
+    if ((input.secret !== undefined) !== (input.secretAdmission !== undefined)) invalid();
+    // This must precede cloneCredentialSecret/structuredClone. Public literals,
+    // cloned tokens and an equal-but-different secret object are never authority.
+    const admissionSha256 = input.secret === undefined ? null
+      : CredentialResponsibility.assertProviderByokSecretAdmission(input.secretAdmission!, {
+        tenantId: config.tenantId, providerId: config.id, expectedSourceRevision: expected, secret: input.secret,
+      });
+    return this.upsertProviderConfigCore(config, input.secret, expected, input.targetReference,
+      { tenantId: config.tenantId, providerId: config.id, admissionSha256 });
+  }
+
+  private async upsertProviderConfigCore(
+    cfg: ProviderConfig, secret?: { ciphertext: Buffer; keyId: string },
+    expectedSourceRevision?: number | null, targetReference?: ProviderCredentialTargetReferenceWrite,
+    responsibility?: { tenantId: string; providerId: string; admissionSha256: string | null },
+  ): Promise<ProviderConfig> {
     const stagedConfig = clone(cfg);
     const stagedSecret = secret === undefined ? undefined : cloneCredentialSecret(secret);
+    if (responsibility && (stagedConfig.tenantId !== responsibility.tenantId
+      || stagedConfig.id !== responsibility.providerId)) {
+      throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+    }
     const stagedTargetReference = targetReference === undefined ? undefined : {
       ...targetReference,
       targetReferenceCipher: Buffer.from(targetReference.targetReferenceCipher),
@@ -29362,6 +29572,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const tenantKnownBefore = this.tenantKnownToCredentialStore(stagedConfig.tenantId);
     const key = providerConfigKey(stagedConfig.tenantId, stagedConfig.id);
     const prev = this.providers.get(key);
+    if (responsibility) this.assertMemoryCredentialResponsibilitySources();
     const slotIdSha256 = tenantCredentialSlotIdSha256(
       stagedConfig.tenantId,
       "provider_binding",
@@ -29494,6 +29705,24 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       credentialSourceRevision: nextRevision,
       ...(currentCredentialVersionId === undefined ? {} : { credentialVersionId: currentCredentialVersionId }),
     };
+    let stagedResponsibility: CredentialResponsibility.TenantCredentialResponsibilitySource | undefined;
+    if (responsibility && created) {
+      const externalTarget = created.targets.find((target) => target.domain === "external_credential");
+      if (!externalTarget) throw new CredentialResponsibility.TenantCredentialResponsibilityIntegrityError();
+      const previousSource = prev?.credentialVersionId === undefined ? undefined
+        : this.assertMemoryCredentialResponsibilitySource(prev.credentialVersionId) ?? undefined;
+      stagedResponsibility = CredentialResponsibility.createTenantCredentialResponsibilitySource({
+        version: created.version, externalTarget, sourceRevision: nextRevision,
+        expectedSourceRevision: expectedSourceRevision ?? null,
+        secretEnvelopeSha256: finalSecret === undefined ? null
+          : CredentialResponsibility.providerByokSecretEnvelopeSha256(finalSecret),
+        newSecretAdmissionSha256: responsibility.admissionSha256,
+        ...(previousSource === undefined ? {} : { previousSource }),
+      });
+    }
+    // Prepare the response before any publication; response-clone failure must
+    // not leave a successful credential/CAS/sidecar behind a rejected promise.
+    const outbound = clone(stagedConfig);
 
     const providersBefore = new Map(this.providers);
     const tenantsBefore = new Map(this.tenants);
@@ -29508,6 +29737,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     );
     const persistedCaptureCoveragesBefore = new Map(this.persistedProviderCaptureCoverages);
     const lifecyclesBefore = new Map(this.subjectLifecycles);
+    const responsibilityBefore = new Map(this.tenantCredentialResponsibilitySources);
     try {
       if (tenantLifecycleStage.lifecycle) {
         this.subjectLifecycles.set(tenantLifecycleStage.key, tenantLifecycleStage.lifecycle);
@@ -29548,6 +29778,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
       this.tenantCredentialProviderSlots.set(slotIdSha256, stagedSlot);
       this.providers.set(key, stagedProvider);
+      if (stagedResponsibility) this.tenantCredentialResponsibilitySources.set(
+        stagedResponsibility.credentialVersionId, stagedResponsibility,
+      );
+      if (responsibility) this.assertMemoryCredentialResponsibilitySources();
       this.assertTenantTelemetryLifecycleGlobalRelations();
     } catch (error) {
       restoreMapSnapshot(
@@ -29567,9 +29801,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         targetReferencesBefore,
       );
       restoreMapSnapshot(this.tenantTelemetryLifecycleCoverages, telemetryCoveragesBefore);
+      restoreMapSnapshot(this.tenantCredentialResponsibilitySources, responsibilityBefore);
       throw error;
     }
-    return clone(stagedConfig);
+    return outbound;
   }
   async getProviderConfig(tenantId: string, providerId: string) {
     if (!this.isTenantActive(tenantId)) return null;

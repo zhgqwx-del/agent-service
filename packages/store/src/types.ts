@@ -600,6 +600,10 @@ export interface SessionStore {
   getApproval(sessionId: string, approvalId: string): Promise<Approval | null>;
 
   // ---- provider configs (BYOK) ----
+  /** Trusted new-secret provenance is checked before cloning; responsibility is separate from revocation authority. */
+  upsertProviderConfigWithResponsibility(
+    input: import("./credential-responsibility.js").UpsertProviderConfigWithResponsibilityInput,
+  ): Promise<ProviderConfig>;
   upsertProviderConfig(
     cfg: ProviderConfig,
     secret?: { ciphertext: Buffer; keyId: string },

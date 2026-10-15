@@ -14,6 +14,7 @@ import {
 } from "@agent-service/protocol";
 import {
   CredentialSourceConflictError,
+  createProviderByokSecretAdmission,
   SubjectDeletingError,
   type SessionStore,
 } from "@agent-service/store";
@@ -233,14 +234,18 @@ export class ProviderService implements ProviderResolver, TenantRuntimeParticipa
         await this.assertTenantGeneration(tenantId, generation);
         try {
           const expectedRevision = existing?.credentialSourceRevision ?? absentSourceRevision;
-          const stored = targetReference === undefined
-            ? await this.opts.store.upsertProviderConfig(config, secret, expectedRevision)
-            : await this.opts.store.upsertProviderConfig(
-                config,
-                secret,
-                expectedRevision,
-                targetReference,
-              );
+          // Only a newly accepted API key has server-observed BYOK provenance.
+          // Rebuild the original-object admission for each exact CAS attempt;
+          // a config-only update must not relabel an inherited legacy secret.
+          const secretAdmission = secret === undefined ? undefined
+            : createProviderByokSecretAdmission({ tenantId, providerId: config.id,
+                expectedSourceRevision: expectedRevision, secret });
+          const stored = await this.opts.store.upsertProviderConfigWithResponsibility({
+            config,
+            expectedSourceRevision: expectedRevision,
+            ...(secret === undefined ? {} : { secret, secretAdmission }),
+            ...(targetReference === undefined ? {} : { targetReference }),
+          });
           runtimeLease?.assertOpen();
           return stored;
         } catch (error) {

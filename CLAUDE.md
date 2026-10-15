@@ -1,5 +1,11 @@
 # agent-service 项目记忆
 
+## 当前独立预编码（2026-10-15T22:37Z补记）
+
+独立 `codex/m1-byok-responsibility` 基于已发布3414，Memory/Provider/T3a/T3b/tenant GET责任链已接；正式具名55项零失败/跳过，37与73项重验含原子集、不另累计。SQL inactive 来源发布窄修后最终typecheck/scan737/diffcheck通过；两次有限静态review未报其它确定P0–P2，不代替实测。原API/SDK通过与失败/修复报告见 [PROGRESS](docs/PROGRESS.md) 末节。required139/66groups、历史50只是登记，未执行本包DB/历史/完整verify/新CI。
+
+0059仍是三独立表/八guard/八个已编写SQL病例、八指纹为零且未整合0058前置的不可发布草稿，不合入/部署/激活，见`docs/design/05-credential-responsibility.md`。另一树0058经有界trigger batch首次原180秒完整双跳通过（178638.82ms），仅约1.36秒余量，完整verify/verify-s3/新CI仍待；300秒未答不再阻断本地后续，不替代0059真实DB及备份责任审计。main仍clean3414。config-only不提升legacy，新key不提升其它材料或豁免受管target，shared key不可单租户销毁；旧收据/unknown、0037/0054原primary-only/外删与自动off/completion=false保持。M1未冻结/M2冻结/M3未开始；root唯一验证执行器，下方是历史快照。
+
 ## 当前状态（2026-10-15T18:22Z）
 
 修复提交 `695220d` 的受影响范围 4 文件 / 54 项通过；随后真实历史 50 文件 / 318 项通过。`1a183c8` 的 cluster 8 文件 / 28 项、独立 T3g 3 项、真实 MySQL/MinIO 15 文件 / 81 项、六入口构建/SDK及 clean VM 发布包检查均通过，全部定向项零失败或跳过。typecheck、secret scan727 与 diffcheck 通过，详见 [PROGRESS](docs/PROGRESS.md) 末节。下方 `aad57d3` 整轮退出1的事实保留；这些是明确源码下的分段验收，不是一次全量 coverage 成功，新 SHA 的 GitHub CI 尚待。

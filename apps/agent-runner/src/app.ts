@@ -73,6 +73,8 @@ import {
   TenantErasureRequestHeaders,
   TenantErasureRequestParams,
   TenantErasureRequestQuery,
+  TenantErasureStatusResponse,
+  TenantCredentialResponsibilityStatus,
   TenantRuntimeDrainReady,
   TenantRuntimeDrainRunnerRequest,
   TenantRuntimeRevocationLocalReceipt,
@@ -143,6 +145,7 @@ import {
   newUserDataExportRequestId,
   newErasureRequestId,
   tenantErasureRequestHash,
+  validateTenantCredentialResponsibilityReadiness,
   userDataExportIdempotencyKeySha256,
   userDataExportManifestSha256,
   userDataExportRequestHash,
@@ -154,6 +157,8 @@ import {
   type SessionStore,
   type SubjectLifecycleStore,
   type TenantCredentialRevocationStore,
+  type TenantCredentialResponsibilityReadiness,
+  type TenantCredentialResponsibilityStore,
   type UserDataExportRequestRecord,
   type UserDataExportRequestStore,
 } from "@agent-service/store";
@@ -246,6 +251,8 @@ export interface AppDeps {
   tenantRedisPurgeNamespaceSha256?: string;
   /** Narrow T3a store surface; its presence is the code-awareness signal advertised to routers. */
   tenantCredentialRevocation?: TenantCredentialRevocationStore;
+  /** Read-only responsibility evidence; never authorizes remote credential/KMS mutation. */
+  tenantCredentialResponsibility?: TenantCredentialResponsibilityStore;
   /** Narrow T3b runtime surface; main owns the coordinator and per-process boot identity. */
   tenantRuntimeDrain?: {
     bootId: string;
@@ -878,7 +885,21 @@ export function createApp(deps: AppDeps) {
     ]);
     const record = await deps.subjectLifecycle.getTenantErasureRequest(tenantId, requestId);
     if (!record) throw new ApiError("not_found", "tenant erasure request not found");
-    return c.json(publicTenantErasureRequest(record));
+    let credentialResponsibility: TenantCredentialResponsibilityStatus | undefined;
+    if (deps.tenantCredentialResponsibility) {
+      const readiness = await deps.tenantCredentialResponsibility
+        .getTenantCredentialResponsibilityReadiness(tenantId, requestId);
+      if (!readiness) throw new ApiError("draining", "tenant credential responsibility is unavailable");
+      validateTenantCredentialResponsibilityReadiness(readiness);
+      if (readiness.tenantId !== tenantId || readiness.requestId !== requestId) {
+        throw new ApiError("draining", "tenant credential responsibility is unavailable");
+      }
+      credentialResponsibility = publicTenantCredentialResponsibility(readiness);
+    }
+    return c.json(TenantErasureStatusResponse.parse({
+      ...publicTenantErasureRequest(record),
+      ...(credentialResponsibility === undefined ? {} : { credentialResponsibility }),
+    }));
   });
   app.all(tenantErasureControlPath, (c) => {
     throw new ApiError("not_found", "not found");
@@ -1714,6 +1735,30 @@ function publicTenantErasureRequest(
     createdAtMs: record.createdAtMs,
     updatedAtMs: record.updatedAtMs,
   };
+}
+
+function publicTenantCredentialResponsibility(
+  value: TenantCredentialResponsibilityReadiness,
+): TenantCredentialResponsibilityStatus {
+  // Deliberately enumerate the projection: private tenant/version/fence/receipt
+  // tuples are checked above, but none belongs in this public observation.
+  return TenantCredentialResponsibilityStatus.parse({
+    schema: "tenant-credential-responsibility-status-v1",
+    status: value.status,
+    localDatabase: value.localDatabase,
+    trackedRuntimeReferences: value.trackedRuntimeReferences,
+    remoteCredentials: value.remoteCredentials,
+    sharedKeys: value.sharedKeys,
+    backupCopies: value.backupCopies,
+    otherCopies: value.otherCopies,
+    versionCount: value.versionCount,
+    customerManagedApiKeyCount: value.customerManagedApiKeyCount,
+    unknownMaterialCount: value.unknownMaterialCount,
+    executionReady: value.executionReady,
+    externalAuthorityVerified: value.externalAuthorityVerified,
+    allDomainsComplete: value.allDomainsComplete,
+    contentPurgeExecuted: value.contentPurgeExecuted,
+  });
 }
 
 function publicUserDataExportRequest(record: UserDataExportRequestRecord): DataExportRequest {

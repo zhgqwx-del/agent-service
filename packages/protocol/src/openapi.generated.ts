@@ -8184,6 +8184,185 @@ export const OPENAPI_DOCUMENT = {
         ],
         "type": "object"
       },
+      "TenantErasureStatusResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "credentialResponsibility": {
+            "additionalProperties": false,
+            "properties": {
+              "allDomainsComplete": {
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              },
+              "backupCopies": {
+                "enum": [
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              "contentPurgeExecuted": {
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              },
+              "customerManagedApiKeyCount": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "executionReady": {
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              },
+              "externalAuthorityVerified": {
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              },
+              "localDatabase": {
+                "enum": [
+                  "unknown",
+                  "not_cleared",
+                  "cleared"
+                ],
+                "type": "string"
+              },
+              "otherCopies": {
+                "enum": [
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              "remoteCredentials": {
+                "enum": [
+                  "unknown",
+                  "customer_responsibility_recorded",
+                  "not_applicable"
+                ],
+                "type": "string"
+              },
+              "schema": {
+                "enum": [
+                  "tenant-credential-responsibility-status-v1"
+                ],
+                "type": "string"
+              },
+              "sharedKeys": {
+                "enum": [
+                  "platform_shared_not_tenant_deletable"
+                ],
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "unknown",
+                  "awaiting_local_clear",
+                  "awaiting_runtime_drain",
+                  "local_responsibility_observed"
+                ],
+                "type": "string"
+              },
+              "trackedRuntimeReferences": {
+                "enum": [
+                  "unknown",
+                  "not_drained",
+                  "dropped_not_zeroized"
+                ],
+                "type": "string"
+              },
+              "unknownMaterialCount": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "versionCount": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "schema",
+              "status",
+              "localDatabase",
+              "trackedRuntimeReferences",
+              "remoteCredentials",
+              "sharedKeys",
+              "backupCopies",
+              "otherCopies",
+              "versionCount",
+              "customerManagedApiKeyCount",
+              "unknownMaterialCount",
+              "executionReady",
+              "externalAuthorityVerified",
+              "allDomainsComplete",
+              "contentPurgeExecuted"
+            ],
+            "type": "object"
+          },
+          "generation": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^erase_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "tenant"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "gated"
+            ],
+            "type": "string"
+          },
+          "tenantId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "updatedAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "tenantId",
+          "generation",
+          "status",
+          "createdAtMs",
+          "updatedAtMs"
+        ],
+        "type": "object"
+      },
       "ToolList": {
         "properties": {
           "data": {
@@ -13246,7 +13425,7 @@ export const OPENAPI_DOCUMENT = {
     },
     "/v1/tenant-erasure-requests/{requestId}": {
       "get": {
-        "description": "Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed.",
+        "description": "Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed. The optional versioned credentialResponsibility observation distinguishes local credential clearing, tracked runtime reference disposal and customer responsibility for vendor revocation; absence means unknown. It is not a remote ACK, permission to destroy shared keys, backup-copy proof or global erasure completion.",
         "operationId": "getTenantErasureRequest",
         "parameters": [
           {
@@ -13274,11 +13453,11 @@ export const OPENAPI_DOCUMENT = {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TenantErasureRequest"
+                  "$ref": "#/components/schemas/TenantErasureStatusResponse"
                 }
               }
             },
-            "description": "Tenant erasure request status.",
+            "description": "Tenant erasure request status; optional credential responsibility is observation only.",
             "headers": {
               "Cache-Control": {
                 "description": "Prevents storage of this sensitive lifecycle response.",

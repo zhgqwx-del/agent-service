@@ -1,5 +1,7 @@
 # 本地开发、手动体验与 CI 构建指南
 
+> 本 worktree 当前是 `0059` BYOK责任的独立预编码分支，不用于普通启动或部署；草稿迁移尚未整合真实0058前置或校准。需要手动体验时使用已发布main3414，当前分支状态只看PROGRESS顶部/末节。新责任设计见[BYOK责任合同](../design/05-credential-responsibility.md)，不新增服务/进程/JS入口/镜像；下方旧候选验收数字不代表本包通过。
+
 > 离线VM签名候选（2026-10-15，未发布验收）：私钥格式正则触发的secret-scanner边界误报已等价改写、未加白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770、proof工具119），API/typecheck通过。代码提交d671632的darwin/arm64/Node24 clean双包于07:35:46.954Z实际通过，仅ephemeral-test-only签名、productionAccepted=false；最终文档提交的整树和新Linux CI仍待。required新增3文件至123、62个旧group不变，VM group现为7文件。原817 CI test失败/两个image成功；b575集中全量实际3164 passed/5 failed、后置未跑，不能称新全量或CI全绿。详细事实只看PROGRESS末节。
 
 > 历史本地集成验收（2026-10-15，非上述签名候选验收）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。

@@ -11,6 +11,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "apps/agent-runner/test/backup-catalog-wrapper.test.ts",
   "apps/agent-runner/test/cli-entrypoint.test.ts",
   "apps/agent-runner/test/config.test.ts",
+  "apps/agent-runner/test/credential-responsibility-http.test.ts",
   "apps/agent-runner/test/mysql-backup-artifact.unit.test.ts",
   "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts",
   "apps/agent-runner/test/ordinary-session-usage-retention-gate.test.ts",
@@ -38,14 +39,19 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/core/test/tenant-telemetry-application-dual-write.test.ts",
   "packages/core/test/tenant-telemetry-writer-worker.test.ts",
   "packages/protocol/test/telemetry.test.ts",
+  "packages/protocol/test/credential-responsibility-status.test.ts",
   "packages/protocol/test/runtime-metrics.test.ts",
   "packages/providers/test/telemetry-dual-write.test.ts",
+  "packages/providers/test/credential-responsibility-service.test.ts",
   "packages/store/test/backup-catalog-s3.unit.test.ts",
   "packages/store/test/backup-catalog.mysql.test.ts",
   "packages/store/test/blob-lifecycle.mysql.test.ts",
   "packages/store/test/blob-storage-control.memory.test.ts",
   "packages/store/test/blob-storage-control.mysql.test.ts",
   "packages/store/test/commit-concurrency.mysql.test.ts",
+  "packages/store/test/credential-responsibility.test.ts",
+  "packages/store/test/credential-responsibility.memory.test.ts",
+  "packages/store/test/tenant-credential-responsibility.mysql.test.ts",
   "packages/store/test/erasure-catalog.mysql.test.ts",
   "packages/store/test/erasure-job.mysql.test.ts",
   "packages/store/test/erasure-purge-policy.mysql.test.ts",
@@ -307,6 +313,15 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
   ],
   "test:tenant-credential-lifecycle-mysql": [
     "packages/store/test/tenant-credential-lifecycle.mysql.test.ts"
+  ],
+  "test:credential-responsibility-memory": [
+    "packages/store/test/credential-responsibility.test.ts",
+    "packages/store/test/credential-responsibility.memory.test.ts",
+    "packages/providers/test/credential-responsibility-service.test.ts",
+    "apps/agent-runner/test/credential-responsibility-http.test.ts"
+  ],
+  "test:credential-responsibility-mysql": [
+    "packages/store/test/tenant-credential-responsibility.mysql.test.ts"
   ],
   "test:tenant-credential-target-execution-mysql": [
     "packages/store/test/tenant-credential-target-execution.mysql.test.ts"

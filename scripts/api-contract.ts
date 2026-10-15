@@ -76,6 +76,7 @@ import {
   StartTurnQuery,
   TenantErasureCreateRequest,
   TenantErasureRequest,
+  TenantErasureStatusResponse,
   TenantErasureRequestHeaders,
   TenantErasureRequestParams,
   TenantErasureRequestQuery,
@@ -225,6 +226,7 @@ export function buildOpenApiDocument() {
     erasureRequest: registry.register("ErasureRequest", ErasureRequest),
     tenantErasureCreate: registry.register("TenantErasureCreateRequest", TenantErasureCreateRequest),
     tenantErasureRequest: registry.register("TenantErasureRequest", TenantErasureRequest),
+    tenantErasureStatus: registry.register("TenantErasureStatusResponse", TenantErasureStatusResponse),
     dataExportRequest: registry.register("DataExportRequest", DataExportRequest),
     retentionPolicyPut: registry.register("RetentionPolicyPutRequest", RetentionPolicyPutRequest),
     retentionPolicyActivate: registry.register("RetentionPolicyActivateRequest", RetentionPolicyActivateRequest),
@@ -713,14 +715,14 @@ export function buildOpenApiDocument() {
     operationId: "getTenantErasureRequest",
     tags: ["Platform data lifecycle"],
     summary: "Read a tenant erasure request",
-    description: "Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed.",
+    description: "Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed. The optional versioned credentialResponsibility observation distinguishes local credential clearing, tracked runtime reference disposal and customer responsibility for vendor revocation; absence means unknown. It is not a remote ACK, permission to destroy shared keys, backup-copy proof or global erasure completion.",
     security: platformSecurity,
     request: {
       params: TenantErasureRequestParams,
       query: TenantErasureRequestQuery,
     },
     responses: {
-      200: privateJsonResponse(schemas.tenantErasureRequest, "Tenant erasure request status."),
+      200: privateJsonResponse(schemas.tenantErasureStatus, "Tenant erasure request status; optional credential responsibility is observation only."),
       default: privateJsonResponse(schemas.error, "Error response."),
     },
   });

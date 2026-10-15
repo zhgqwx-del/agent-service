@@ -86,6 +86,8 @@
     "test:tenant-credential-revocation-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-revocation.mysql.test.ts && node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-revocation-races.mysql.test.ts",
     "test:tenant-credential-physical-revocation-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-physical-revocation.mysql.test.ts",
     "test:tenant-credential-lifecycle-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-lifecycle.mysql.test.ts",
+    "test:credential-responsibility-memory": "node scripts/run-required-suite.mjs packages/store/test/credential-responsibility.test.ts && node scripts/run-required-suite.mjs packages/store/test/credential-responsibility.memory.test.ts && node scripts/run-required-suite.mjs packages/providers/test/credential-responsibility-service.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/credential-responsibility-http.test.ts",
+    "test:credential-responsibility-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-responsibility.mysql.test.ts",
     "test:tenant-credential-target-execution-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-credential-target-execution.mysql.test.ts",
     "test:tenant-runtime-revocation-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-runtime-revocation.mysql.test.ts",
     "test:tenant-content-inventory-mysql": "node scripts/run-required-integration-suite.mjs packages/store/test/tenant-content-inventory.mysql.test.ts",

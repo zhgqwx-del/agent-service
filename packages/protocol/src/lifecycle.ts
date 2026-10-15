@@ -64,6 +64,57 @@ export const TenantErasureRequest = z.object({
 }).strict();
 export type TenantErasureRequest = z.infer<typeof TenantErasureRequest>;
 
+/** Content-free observation only: customer responsibility is not a remote revocation ACK. */
+export const TenantCredentialResponsibilityStatus = z.object({
+  schema: z.literal("tenant-credential-responsibility-status-v1"),
+  status: z.enum(["unknown", "awaiting_local_clear", "awaiting_runtime_drain", "local_responsibility_observed"]),
+  localDatabase: z.enum(["unknown", "not_cleared", "cleared"]),
+  trackedRuntimeReferences: z.enum(["unknown", "not_drained", "dropped_not_zeroized"]),
+  remoteCredentials: z.enum(["unknown", "customer_responsibility_recorded", "not_applicable"]),
+  sharedKeys: z.literal("platform_shared_not_tenant_deletable"),
+  backupCopies: z.literal("unknown"),
+  otherCopies: z.literal("unknown"),
+  versionCount: SafeNonnegativeInteger.nullable(),
+  customerManagedApiKeyCount: SafeNonnegativeInteger.nullable(),
+  unknownMaterialCount: SafeNonnegativeInteger.nullable(),
+  executionReady: z.literal(false),
+  externalAuthorityVerified: z.literal(false),
+  allDomainsComplete: z.literal(false),
+  contentPurgeExecuted: z.literal(false),
+}).strict().superRefine((value, ctx) => {
+  const counts = [value.versionCount, value.customerManagedApiKeyCount, value.unknownMaterialCount];
+  if (counts.some((count) => count === null) && counts.some((count) => count !== null)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "credential responsibility counts are partially unknown" });
+  }
+  if (value.status === "local_responsibility_observed"
+    && (value.localDatabase !== "cleared"
+      || value.trackedRuntimeReferences !== "dropped_not_zeroized"
+      || value.versionCount === null || value.customerManagedApiKeyCount === null
+      || value.unknownMaterialCount !== 0 || value.remoteCredentials === "unknown")) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "credential responsibility observation is incomplete" });
+  }
+  if (value.remoteCredentials === "customer_responsibility_recorded"
+    && (value.versionCount === null || value.customerManagedApiKeyCount === null || value.customerManagedApiKeyCount === 0
+      || value.unknownMaterialCount !== 0)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "customer responsibility lacks a captured source" });
+  }
+  if (value.remoteCredentials === "not_applicable"
+    && (value.customerManagedApiKeyCount !== 0 || value.unknownMaterialCount !== 0)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "credential absence has not been established" });
+  }
+  if (value.customerManagedApiKeyCount !== null && value.versionCount !== null
+    && value.customerManagedApiKeyCount > value.versionCount) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "credential responsibility counts disagree" });
+  }
+});
+export type TenantCredentialResponsibilityStatus = z.infer<typeof TenantCredentialResponsibilityStatus>;
+
+/** GET-only extension. Missing on an older runner means unknown, never zero or success. */
+export const TenantErasureStatusResponse = TenantErasureRequest.extend({
+  credentialResponsibility: TenantCredentialResponsibilityStatus.optional(),
+}).strict();
+export type TenantErasureStatusResponse = z.infer<typeof TenantErasureStatusResponse>;
+
 // ---------- asynchronous user data export ----------
 
 export const DataExportRequestId = z.string().regex(

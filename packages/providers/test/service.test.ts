@@ -90,20 +90,18 @@ describe("ProviderService", () => {
     };
     await svc.upsertTenantProvider("t_cas", { ...base, apiKey: "first-secret" });
 
-    const delegate = store.upsertProviderConfig.bind(store);
+    const legacyWrite = store.upsertProviderConfig.bind(store);
+    const delegate = store.upsertProviderConfigWithResponsibility.bind(store);
     const concurrentSecret = {
       ciphertext: await cipher.encrypt("concurrent-secret"),
       keyId: cipher.keyId,
     };
     let injected = false;
-    const write = vi.spyOn(store, "upsertProviderConfig").mockImplementation(async (
-      config,
-      secret,
-      expectedSourceRevision,
-    ) => {
+    const write = vi.spyOn(store, "upsertProviderConfigWithResponsibility").mockImplementation(async (input) => {
+      const { config, expectedSourceRevision } = input;
       if (!injected) {
         injected = true;
-        await delegate(
+        await legacyWrite(
           { ...config, name: "concurrent", updatedAtMs: config.updatedAtMs + 1 },
           concurrentSecret,
           expectedSourceRevision,
@@ -115,7 +113,7 @@ describe("ProviderService", () => {
             .credentialSourceRevision,
         );
       }
-      return delegate(config, secret, expectedSourceRevision);
+      return delegate(input);
     });
 
     const result = await svc.upsertTenantProvider("t_cas", { ...base, name: "request" });

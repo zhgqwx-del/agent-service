@@ -21,6 +21,7 @@ export * from "./tenant-purge-execution.js";
 export * from "./tenant-database-purge.js";
 export * from "./tenant-redis-purge.js";
 export * from "./credential-lifecycle.js";
+export * from "./credential-responsibility.js";
 export * from "./tenant-credential-target-execution.js";
 export * from "./tenant-restore-journal.js";
 export * from "./backup-catalog.js";

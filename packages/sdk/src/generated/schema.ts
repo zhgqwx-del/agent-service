@@ -730,7 +730,7 @@ export type paths = {
         };
         /**
          * Read a tenant erasure request
-         * @description Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed.
+         * @description Uses the independent platform operator credential and remains available when new tenant-erasure admission is closed. The optional versioned credentialResponsibility observation distinguishes local credential clearing, tracked runtime reference disposal and customer responsibility for vendor revocation; absence means unknown. It is not a remote ACK, permission to destroy shared keys, backup-copy proof or global erasure completion.
          */
         readonly get: operations["getTenantErasureRequest"];
         readonly put?: never;
@@ -2799,6 +2799,46 @@ export type components = {
             readonly tenantId: string;
             readonly updatedAtMs: number;
         };
+        readonly TenantErasureStatusResponse: {
+            readonly createdAtMs: number;
+            readonly credentialResponsibility?: {
+                /** @enum {boolean} */
+                readonly allDomainsComplete: false;
+                /** @enum {string} */
+                readonly backupCopies: "unknown";
+                /** @enum {boolean} */
+                readonly contentPurgeExecuted: false;
+                readonly customerManagedApiKeyCount: number | null;
+                /** @enum {boolean} */
+                readonly executionReady: false;
+                /** @enum {boolean} */
+                readonly externalAuthorityVerified: false;
+                /** @enum {string} */
+                readonly localDatabase: "unknown" | "not_cleared" | "cleared";
+                /** @enum {string} */
+                readonly otherCopies: "unknown";
+                /** @enum {string} */
+                readonly remoteCredentials: "unknown" | "customer_responsibility_recorded" | "not_applicable";
+                /** @enum {string} */
+                readonly schema: "tenant-credential-responsibility-status-v1";
+                /** @enum {string} */
+                readonly sharedKeys: "platform_shared_not_tenant_deletable";
+                /** @enum {string} */
+                readonly status: "unknown" | "awaiting_local_clear" | "awaiting_runtime_drain" | "local_responsibility_observed";
+                /** @enum {string} */
+                readonly trackedRuntimeReferences: "unknown" | "not_drained" | "dropped_not_zeroized";
+                readonly unknownMaterialCount: number | null;
+                readonly versionCount: number | null;
+            };
+            readonly generation: number;
+            readonly id: string;
+            /** @enum {string} */
+            readonly scope: "tenant";
+            /** @enum {string} */
+            readonly status: "gated";
+            readonly tenantId: string;
+            readonly updatedAtMs: number;
+        };
         readonly ToolList: {
             readonly data: readonly {
                 readonly concurrencySafe?: boolean;
@@ -3136,6 +3176,7 @@ export type SchemaTenantAuthState = components['schemas']['TenantAuthState'];
 export type SchemaTenantAuthUpdateRequest = components['schemas']['TenantAuthUpdateRequest'];
 export type SchemaTenantErasureCreateRequest = components['schemas']['TenantErasureCreateRequest'];
 export type SchemaTenantErasureRequest = components['schemas']['TenantErasureRequest'];
+export type SchemaTenantErasureStatusResponse = components['schemas']['TenantErasureStatusResponse'];
 export type SchemaToolList = components['schemas']['ToolList'];
 export type SchemaToolOutputPayload = components['schemas']['ToolOutputPayload'];
 export type SchemaTurn = components['schemas']['Turn'];
@@ -4951,7 +4992,7 @@ export interface operations {
         };
         readonly requestBody?: never;
         readonly responses: {
-            /** @description Tenant erasure request status. */
+            /** @description Tenant erasure request status; optional credential responsibility is observation only. */
             readonly 200: {
                 headers: {
                     /** @description Prevents storage of this sensitive lifecycle response. */
@@ -4961,7 +5002,7 @@ export interface operations {
                     readonly [name: string]: unknown;
                 };
                 content: {
-                    readonly "application/json": components["schemas"]["TenantErasureRequest"];
+                    readonly "application/json": components["schemas"]["TenantErasureStatusResponse"];
                 };
             };
             /** @description Error response. */
