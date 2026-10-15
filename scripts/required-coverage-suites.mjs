@@ -116,6 +116,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/store/test/tenant-telemetry-writer.test.ts",
   "packages/store/test/usage-lifecycle.mysql.test.ts",
   "packages/store/test/user-data-export.mysql.test.ts",
+  "test/ci-required-jobs.test.ts",
   "test/required-coverage-manifest.test.ts",
   "test/required-suite-proof.test.ts",
   "test/vm-release-archive.test.ts",

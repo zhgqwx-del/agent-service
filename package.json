@@ -23,7 +23,7 @@
     "typecheck": "tsc -b tsconfig.json && tsc -p tsconfig.typecheck.json",
     "test": "vitest run",
     "test:coverage": "node scripts/run-required-coverage.mjs",
-    "test:verification-tools": "vitest run test/required-suite-proof.test.ts test/required-coverage-manifest.test.ts",
+    "test:verification-tools": "vitest run test/required-suite-proof.test.ts test/required-coverage-manifest.test.ts test/ci-required-jobs.test.ts",
     "test:runtime-metrics": "vitest run packages/protocol/test/runtime-metrics.test.ts apps/agent-runner/test/runtime-metrics.test.ts apps/agent-router/test/runtime-metrics.test.ts apps/agent-runner/test/runtime-metrics-config.test.ts apps/agent-router/test/runtime-metrics-config.test.ts",
     "test:migrations": "node scripts/run-required-migration-suites.mjs",
     "test:session-delete-grace-memory": "node scripts/run-required-suite.mjs packages/store/test/session-delete-grace.memory.test.ts",

@@ -4,6 +4,8 @@ M4新增离线VM发布签名候选：`pnpm sign:vm-release`用显式受保护Ed2
 
 验证节奏：日常先跑相关定向测试，多个相关改动形成一个功能包后再做完整本地验收，较大阶段集中推送并等待CI。`pnpm test:coverage`合并同环境具名专项与主coverage，保留逐文件非零/零skip及coverage门槛；历史、S3、cluster和实际发布包装配独立验收。新driver首轮真实失败与局部复验均记录于PROGRESS，不把旧报告当新版本通过，也尚未宣称完整提速比例。方法见[分层验证路径](docs/operations/development-and-ci-guide.md#6-分层验证路径)。
 
+CI并行候选将完整历史迁移移至独立runner；`test-core`、`test-history`及router/runner两个image检查全部成功，原名`test`汇总门禁才成功。没有减少历史用例、放宽每例deadline或共享测试库。CI门禁/清单定向三文件264项、typecheck及扫描通过，但新Actions尚未运行，不宣称已提速。固定clean `67eaa2d`的集中全量仍在独立树运行（required=123）；本次CI-only回归使候选清单为124，不能借前者证明新增测试执行。构建内容与学习入口见[GitHub Actions说明](docs/operations/development-and-ci-guide.md#8-github-actions-构建与验证)。
+
 M4新增本地候选：router与runner在各自原端口提供默认关闭的受保护`GET/HEAD /metrics`，只统计进程与固定低基数HTTP聚合，不保存owner、URL、正文或secret，也不新增服务、迁移或镜像。独立运维token不得充当业务凭证或被router转发；时延统计止于响应头就绪，不代表SSE完整寿命。五个新文件153项与兼容/验证工具合计10文件388项定向通过，实际bundle双服务默认关闭/启用鉴权装配通过；完整新verify/CI尚待。配置与手动体验见[部署契约](docs/operations/local-and-deployment.md#受保护的-l0-runtime-metrics)，不是完整可观测性或生产验收。
 
 > **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。

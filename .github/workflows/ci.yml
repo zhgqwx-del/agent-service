@@ -14,11 +14,10 @@ env:
   SECRETS_MASTER_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
 
 jobs:
-  test:
+  test-core:
     runs-on: ubuntu-latest
-    # Real-service and frozen-binary matrices intentionally run serially. The published
-    # baseline used 127 minutes; retain headroom for the 0054 and release-package proofs
-    # without skipping named suites or changing their per-operation deadlines.
+    # Main/S3/process checks retain serial resource ownership within this runner. Historical
+    # upgrades use a separate runner below: parallel wall time, never shared test databases.
     timeout-minutes: 180
     env:
       MINIO_SOURCE_COMMIT: 07c3a429bfed433e49018cb0f78a52145d4bedeb
@@ -299,13 +298,6 @@ jobs:
           S3_TEST_FORCE_PATH_STYLE: "1"
         run: pnpm run test:blob-storage-migration-mysql-s3
 
-      # Frozen historical schemas/binaries use their own configuration and databases.
-      # Their mandatory zero-skip proof is independent of the fresh-schema coverage run.
-      - name: Historical MySQL migrations (0007 through 0054 + 0043 read compatibility, frozen terminals, no skips)
-        env:
-          MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test
-        run: pnpm run test:migrations
-
       - name: Cluster tests (real processes)
         env:
           AGENT_SERVICE_CLUSTER: "1"
@@ -373,6 +365,56 @@ jobs:
         with:
           name: coverage
           path: coverage/
+          retention-days: 7
+
+  # An independent runner owns its services and disposable schemas. This is the same complete
+  # zero-skip wrapper, not a selection or concurrent rewrite of individual DDL cases.
+  test-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    services:
+      mysql:
+        image: mysql:8.0.26
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: agent_service
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Reject committed credentials
+        run: node scripts/check-secrets.mjs
+      - run: pnpm install --frozen-lockfile
+      - name: Create isolated historical test database
+        run: mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE agent_service_test_history CHARACTER SET utf8mb4;"
+      - name: Historical MySQL migrations (0007 through 0054 + 0043 read compatibility, frozen terminals, no skips)
+        env:
+          MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test_history
+        run: pnpm run test:migrations
+      - name: Preserve historical execution proof
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historical-migration-proof
+          path: .local-run/migration-tests.json
+          if-no-files-found: error
           retention-days: 7
 
   # The production image is part of the contract, so it is built and started here. Every one of the
@@ -528,3 +570,21 @@ jobs:
               -d '{"name":"ci","instructions":"x","model":{"provider":"dashscope","model":"qwen-plus"}}' >/dev/null
           fi
           docker rm -f app
+
+  # Preserve the original required check identity. Neither skipped/cancelled dependencies nor
+  # a failed image matrix may yield a green aggregate. All three direct dependencies are needed:
+  # https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#needs-context
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: ${{ always() }}
+    needs: [test-core, test-history, image]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - name: Require every test and image job to succeed
+        env:
+          AGENT_SERVICE_CI_NEEDS_JSON: ${{ toJSON(needs) }}
+        run: node scripts/assert-ci-required-jobs.mjs

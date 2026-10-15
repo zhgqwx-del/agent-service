@@ -1,5 +1,7 @@
 # 本地运维与后续部署契约
 
+> CI并行候选（2026-10-15）：完整历史迁移移至独立runner/自有MySQL与Redis，主套件和两个image不删减，原名`test`只在全部成功时通过。core/history仍保留180分钟job上限、每例deadline不变；定向264项/typecheck/scan通过，新Actions与提速收益仍待。固定clean67eaa2d完整verify仍运行，不为CI-only/文档调整重启。该调整不改变部署拓扑、六入口/两服务/两镜像或默认关闭门禁；细节见[CI学习材料](development-and-ci-guide.md#8-github-actions-构建与验证)。
+
 > 离线VM签名候选（2026-10-15，未发布验收）：新增显式签名及signed inspect/unpack，独立SPKI公钥pin、选定role/commit与实际工具字节共同约束release。私钥格式正则的secret-scanner边界误报已等价改写、无白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770与proof工具119），API/typecheck通过。代码提交d671632的darwin/arm64/Node24 clean双包于07:35:46.954Z实际通过，仅ephemeral-test-only签名、productionAccepted=false；最终文档提交的整树和新Linux CI仍待。原817 CI的test失败、两image成功；b575集中全量实际3164 passed/5 failed且后置未执行，不能写成全绿。完整事实只看PROGRESS末节。
 
 > 历史本地集成验收（2026-10-15，非上述签名候选验收）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。

@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+CI-only并行候选把完整历史wrapper移至独立runner及自有MySQL/Redis，不减少用例或改变每例deadline；core/history保留180分钟job上限。原名`test`以always与exact三项needs汇总，只有core、history、image矩阵全success才通过。新CI回归使候选main-required为124，62个group不变；实际三文件264 passed零fail/skip、typecheck/scan通过，但新Actions未运行、不宣称提速。固定clean67eaa2d的集中全量自07:40Z运行且required=123，源码树不变；CI-only/文档修改不重启它，也不能把它当成新增CI回归的执行证据。最新状态以PROGRESS末节为准。
+
 M4离线VM签名候选复用既有受限tar/独立Node工具：`sign:vm-release`只以显式owner-only Ed25519文件签署clean/publishable精确制品；`inspect-signed`/`unpack-signed`以独立SPKI pin、选定role/commit及执行工具自身hash验证，没有unsigned fallback。三新测试文件加入main-required为123，62个旧group不变，原VM group扩为七文件。它不生成产品key、不自动安装、部署、吊销或晋级，不改变M1/0037/自动清理/恢复门禁。最新失败与相关复验只看PROGRESS；不能把旧e278或817结果当新候选全量/CI通过。
 
 代码d671632的严格clean真实双包于07:35:46Z实际exit0，两role exact commit/clean/publishable、实际sign/独立tool消费/签名解包目录boot均通过，仅darwin/arm64/Node24与ephemeral-test-only、productionAccepted=false。相关最终九文件889及scan696/API/typecheck通过；阶段整树与新Linux CI仍待，不为文档状态更新再重跑局部DB或把旧包冒称最终SHA制品。
