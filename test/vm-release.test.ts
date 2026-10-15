@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -28,6 +28,7 @@ interface ReleaseApi {
   VM_RELEASE_ROLES: readonly Role[];
   VM_RELEASE_ENTRYPOINTS: Readonly<Record<Role, readonly string[]>>;
   assertVmReleaseRole(role: unknown): Role;
+  vmReleaseModeHasSpecialBits(mode: unknown): boolean;
   sha256File(path: string): Promise<string>;
   inventoryVmReleasePayload(root: string, options?: { excludeManifest?: boolean }): Promise<FileEntry[]>;
   validateVmReleasePayload(root: string, role: unknown, options?: { sealed?: boolean }): Promise<FileEntry[]>;
@@ -62,7 +63,7 @@ afterEach(async () => {
 });
 
 async function tempRoot() {
-  const root = await mkdtemp(join(tmpdir(), "agent-service-vm-release-test-"));
+  const root = await mkdtemp(join(await realpath(tmpdir()), "agent-service-vm-release-test-"));
   ownedRoots.add(root); return root;
 }
 /** Complete bounded synthetic headers/segment tables, never executed or claimed as vendor proof. */
@@ -160,6 +161,18 @@ async function rewrite(f: Awaited<ReturnType<typeof seal>>, change: (manifest: M
 }
 
 describe("closed VM process release contract", () => {
+  it("deterministically rejects every special mode bit and combination independently of host chmod behavior", () => {
+    for (const ordinary of [0, 0o644, 0o755, 0o100644, 0o40755]) {
+      expect(release.vmReleaseModeHasSpecialBits(ordinary)).toBe(false);
+      for (const special of [0o1000, 0o2000, 0o3000, 0o4000, 0o5000, 0o6000, 0o7000]) {
+        expect(release.vmReleaseModeHasSpecialBits(ordinary | special)).toBe(true);
+      }
+    }
+    for (const invalid of [-1, 1.5, NaN, Infinity, 0x1_0000_0000, "2048", [0o2000], null, undefined, 1n]) {
+      expect(() => release.vmReleaseModeHasSpecialBits(invalid)).toThrow();
+    }
+  });
+
   it("defines exactly two roles, router one and runner five JavaScript entrypoints", () => {
     expect(release.VM_RELEASE_ROLES).toEqual(["agent-router", "agent-runner"]);
     expect(release.VM_RELEASE_ENTRYPOINTS["agent-router"]).toEqual(["main.js"]);
@@ -250,22 +263,41 @@ describe("closed VM process release contract", () => {
     ["file", 0o4000], ["file", 0o2000], ["file", 0o1000],
     ["directory", 0o4000], ["directory", 0o2000], ["directory", 0o1000],
     ["root", 0o4000], ["root", 0o2000], ["root", 0o1000],
-  ] as const)("rejects privileged %s permission bit %i instead of masking it out of inventory", async (kind, bit) => {
+  ] as const)("rejects host-retained privileged %s permission bit %i and recognizes a host-cleared bit", async (kind, bit) => {
     const root = await payload("agent-router");
     const path = kind === "root" ? root : kind === "directory" ? join(root, "node_modules", "fixture-package")
       : join(root, "node_modules", "fixture-package", "index.js");
-    await chmod(path, bit | (kind === "file" ? 0o644 : 0o755));
-    expect((await lstat(path)).mode & 0o7000).toBe(bit);
-    await expect(release.inventoryVmReleasePayload(root)).rejects.toThrow("special permission bits");
+    const ordinaryMode = kind === "file" ? 0o644 : 0o755;
+    await chmod(path, bit | ordinaryMode);
+    const observed = (await lstat(path)).mode;
+    expect(observed & 0o777).toBe(ordinaryMode);
+    if ((observed & 0o7000) === bit) {
+      await expect(release.inventoryVmReleasePayload(root)).rejects.toThrow("special permission bits");
+    } else {
+      // Some hosts clear setgid on chmod for an ordinary owner/group. That is not a rejection
+      // proof; the pure mode contract above covers this exact bit deterministically.
+      expect(observed & 0o7000).toBe(0);
+      const inventory = await release.inventoryVmReleasePayload(root);
+      expect(inventory.some((entry) => entry.path === (kind === "root" ? "."
+        : kind === "directory" ? "node_modules/fixture-package"
+          : "node_modules/fixture-package/index.js") && entry.mode === ordinaryMode.toString(8).padStart(4, "0"))).toBe(true);
+      await expect(release.validateVmReleasePayload(root, "agent-router")).resolves.toEqual(inventory);
+    }
   });
 
-  it.each([0o4000, 0o2000, 0o1000])("rejects privileged manifest permission bit %i even when its independent trusted byte digest is unchanged", async (bit) => {
+  it.each([0o4000, 0o2000, 0o1000])("rejects host-retained privileged manifest permission bit %i while preserving its independent digest", async (bit) => {
     const f = await seal(await payload("agent-router"), "agent-router");
     const path = join(f.root, "release-manifest.json");
     await chmod(path, 0o644 | bit);
-    expect((await lstat(path)).mode & 0o7000).toBe(bit);
+    const observed = (await lstat(path)).mode;
+    expect(observed & 0o777).toBe(0o644);
     expect(await release.sha256File(path)).toBe(f.trustedDigest);
-    await expect(release.verifyVmReleaseDirectory(f.root, f.role, f.trustedDigest)).rejects.toThrow("special permission bits");
+    if ((observed & 0o7000) === bit) {
+      await expect(release.verifyVmReleaseDirectory(f.root, f.role, f.trustedDigest)).rejects.toThrow("special permission bits");
+    } else {
+      expect(observed & 0o7000).toBe(0);
+      await expect(release.verifyVmReleaseDirectory(f.root, f.role, f.trustedDigest)).resolves.toEqual(f.manifest);
+    }
   });
 
   it("rejects ordinary manifest permission drift independently from the unchanged trusted byte digest", async () => {
@@ -610,12 +642,22 @@ describe("closed VM process release contract", () => {
     await expect(builder.captureVmReleaseWorkingInputs(f.sourceRoot, f.snapshotRoot)).rejects.toThrow();
   });
 
-  it.each([0o4000, 0o2000, 0o1000])("rejects privileged source file mode %i before admitting its bytes", async (bit) => {
+  it.each([0o4000, 0o2000, 0o1000])("rejects host-retained privileged source file mode %i before admitting its bytes", async (bit) => {
     const f = await snapshotFixture();
     const path = join(f.sourceRoot, "apps", "agent-router", "src", "main.ts");
     await chmod(path, bit | 0o644);
-    expect((await lstat(path)).mode & 0o7000).toBe(bit);
-    await expect(builder.captureVmReleaseWorkingInputs(f.sourceRoot, f.snapshotRoot)).rejects.toThrow("special permission bits");
+    const observed = (await lstat(path)).mode;
+    expect(observed & 0o777).toBe(0o644);
+    if ((observed & 0o7000) === bit) {
+      await expect(builder.captureVmReleaseWorkingInputs(f.sourceRoot, f.snapshotRoot)).rejects.toThrow("special permission bits");
+    } else {
+      expect(observed & 0o7000).toBe(0);
+      const captured = await builder.captureVmReleaseWorkingInputs(f.sourceRoot, f.snapshotRoot);
+      const sourceBytes = await readFile(path);
+      expect(captured.inputFiles.some((entry) => entry.path === "apps/agent-router/src/main.ts"
+        && entry.sha256 === sha(sourceBytes))).toBe(true);
+      expect(await readFile(join(f.snapshotRoot, "apps", "agent-router", "src", "main.ts"))).toEqual(sourceBytes);
+    }
   });
 
   it("rejects a selected FIFO source by its actual nonregular type before open/read can block", async () => {

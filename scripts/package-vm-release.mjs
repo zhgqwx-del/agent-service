@@ -13,6 +13,7 @@ import {
   sha256File,
   validateVmReleasePayload,
   verifyVmReleaseDirectory,
+  vmReleaseModeHasSpecialBits,
   VM_RELEASE_ENTRYPOINTS,
 } from "./lib/vm-release.mjs";
 
@@ -131,7 +132,7 @@ async function listWorkingInputPaths(root) {
       return;
     }
     assertSourcePath(path);
-    if (!stats.isFile() || (stats.mode & 0o7000) !== 0) {
+    if (!stats.isFile() || vmReleaseModeHasSpecialBits(stats.mode)) {
       throw new Error("source input must be a regular file without special permission bits");
     }
     paths.push(path);
@@ -146,7 +147,7 @@ async function listWorkingInputPaths(root) {
   for (const path of ROOT_INPUTS) {
     assertSourcePath(path);
     const stats = await lstat(join(root, path));
-    if (!stats.isFile() || (stats.mode & 0o7000) !== 0) {
+    if (!stats.isFile() || vmReleaseModeHasSpecialBits(stats.mode)) {
       throw new Error("required source input must be a regular file without special permission bits");
     }
   }
@@ -226,7 +227,7 @@ export async function captureVmReleaseWorkingInputs(sourceRoot, snapshotRoot) {
     let executable;
     try {
       const stats = await sourceHandle.stat();
-      if (!stats.isFile() || (stats.mode & 0o7000) !== 0 || stats.size > 64 * 1024 * 1024) {
+      if (!stats.isFile() || vmReleaseModeHasSpecialBits(stats.mode) || stats.size > 64 * 1024 * 1024) {
         throw new Error("working build input must be a bounded regular file without special permission bits");
       }
       executable = (stats.mode & 0o111) !== 0;

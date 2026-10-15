@@ -211,8 +211,16 @@ async function inspectNativeFile(path, stats, targetRuntime) {
   }
 }
 
+/** Pure mode check, also usable when a host filesystem refuses to retain a special bit. */
+export function vmReleaseModeHasSpecialBits(mode) {
+  if (!Number.isSafeInteger(mode) || mode < 0 || mode > 0xffffffff) {
+    throw new Error("invalid VM release filesystem mode");
+  }
+  return (mode & 0o7000) !== 0;
+}
+
 function payloadMode(stats, path) {
-  if ((stats.mode & 0o7000) !== 0) {
+  if (vmReleaseModeHasSpecialBits(stats.mode)) {
     throw new Error(`special permission bits are forbidden in VM release payload: ${path}`);
   }
   return (stats.mode & 0o777).toString(8).padStart(4, "0");

@@ -1,5 +1,7 @@
 # 进度记录
 
+> **当前检查点（2026-10-15T07:14Z）**：固定clean `b575523`的集中verify已于06:54:47Z退出1，而非仍在运行。主测试实际3164 passed/5 failed/81预期profile跳过（234文件，218 passed/1 failed/15 skipped）；五个失败全在VM夹具对宿主保留setgid位的前置断言，未到产品拒绝校验，后置history/cluster/build/VM没有执行。独立诊断确认macOS会清除该位；只提取现有纯mode检查供确定性测试复用，特殊位拒绝规则不变，真实FS保留/清位两条路径均明确验证，临时目录先解析真实父路径。最新单文件175 passed/零fail或skip、typecheck通过，不冒充新整树通过。三份真实历史修复已在clean `1a54991`独立执行（预期46例，尚无终态）；另一隔离M4签名候选仅有纯crypto/临时tar/独立bundle定向519 passed和proof工具119 passed、类型检查通过，尚未合入或做实际clean双包验收。不重启全量、不触发新CI；M1恢复前置及所有默认关闭门禁保持。详细失败与局部重验见末节。
+
 > **开发检查点（2026-10-15T06:26Z）**：分层验证1e76d65与M4 L0 metrics b575523为本地未发布检查点，origin/main仍817c144。指标10文件388 passed零fail/skip、API/typecheck/secrets690与实际bundle装配通过；集中完整verify自06:12Z在固定clean b575523、无.env集成树和新隔离资源运行，尚无终态。原817的Actions38676454476已真实failure：两个image success，history为47文件/279 passed/3 failed，三个三边界串行用例各超过默认30秒；不是job超时或观察网络失败。main仅将三份测试的每个边界改为独立it.each、保留30秒及全部真实升级/断言/清理，尚待实际定向重验；不重启未改源码的b575全量，最终新SHA仍须CI。required=120、62旧group不变，日常定向/功能包末全量/较大阶段集中push，不缩减M1/M3/M4目标或默认关闭门禁；下一恢复实现仍等发布验收完成。详细范围与失败/复测事实见末节。
 
 > **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
@@ -1398,3 +1400,11 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - root比对实际旧R3 JSON：三用例合并耗时分别26.239/20.399/19.585秒；每个内部循环都重建三份独立旧库并升级完整当前tail。CI相邻0029→0030已经拆成独立it.each，三次边界约10.505/11.105/10.398秒均通过。由此定位为累计工作共享单例deadline的夹具粒度问题；不据此证明未来Linux结果，也不改变产品事务、DDL或安全门禁。
 - 本地最窄修复只把上述三文件的三边界注册为独立it.each：0028的CREATE数1/4/7、0029的CREATE ordinal0/2/4且逐例检查5个表、0031的ordinal0/3/6且逐例检查7个表；原完整seed/部分DDL/升级/marker/control/全部断言/finally清理保留。仍串行、默认每例30秒，不加timeout/skip/retry或减少真实数据库工作。预计三文件15/13/18共46例、全集47文件288例，只是清单预期，尚未实际通过；这不是原始执行时长提速。
 - 指标已于b575523061f85c58662c8b848d07f4cb3768935e保存本地检查点，尚未push。集中verify guard在另一既有clean、无.env的精确b575树自06:12:20.707Z运行，使用新随机测试库与自有Redis61305，同时验收指标和去重driver；不为这三份测试结构修正重启整轮。等本轮退出后再以新隔离环境专跑变更三文件，最终CI验收新提交。任何报告都须区分b575固定全量、后续定向和最终SHA；不能把旧或分段结果写成新SHA整树通过。0054发布尚未完成，已授权的下一恢复产品代码仍未开始；长期目标active、M1未冻结/M2冻结/M3未开始及全部默认关闭边界不变。
+
+## 2026-10-15（集中verify真实失败后的局部复验，不重启整轮）
+
+- 固定clean `b575523`于06:54:47.948Z真实退出1，guard于06:54:48Z确认只清理本轮新建两测试库和自有Redis61305。主阶段实际耗时2524秒，234文件（218 passed/1 failed/15预期跳过）、3164 passed/5 failed/81预期profile跳过；失败原始JSON是独占的 `coverage-attempt-lbVOfx/tests.json`，不从旧便利报告借绿。新driver尚未取得完整通过，不能报告整树提速幅度或后置执行。
+- 五个失败均在 `test/vm-release.test.ts` 的file/directory/root/manifest/source setgid前置断言：请求0o2000，真实lstat观察为0。独立临时文件诊断表明本机自有uid/gid下也会清位；不是产品接受了危险权限。提取 `vmReleaseModeHasSpecialBits` 复用原判断，确定性覆盖普通type bits、三特殊位与全部组合及非法输入；宿主真实保留位时正式inventory/verify/source capture仍必须拒绝，宿主清位时明确验证普通mode及成功路径，不跳过、不伪造真实stat，也不弱化产品权限规则。
+- 首次单文件定向174 passed/1 failed/零skip，原五失败均已消失；新发现是清空环境后macOS `/tmp`别名导致existing-output负例提前命中真实parent拒绝。只把fixture的tmpdir解析为真实目录，产品parent规则和原expected-existing断言保留。新独立报告 `vm-release-mode-canonical-recheck-20261015.json` 175 passed/0failed/0pending，实际07:13:26Z开始、耗时1.44秒；先前失败报告保留，不把定向称整树通过。
+- 原CI三份历史夹具的独立重验于07:11:57Z开始：clean `1a54991`、无.env，每例创建并清理各自UUID隔离库，默认30秒不变，预期3文件46例与9个独立DDL边界；尚待真实终态。只有此类相关真实DB检查在当前轮执行，不为了局部夹具修复立即重跑数小时全部套件。
+- 独立M4签名候选复用既有tar/manifest/独立Node工具，没有新schema、daemon、runtime入口或镜像。当前实际crypto188、IO59、archive43、独立bundle工具134、signer CLI95共519 passed/零fail或skip，mandatory-proof自身119 passed及类型检查通过；仅说明局部候选，不是main合入、clean真实双包、整树、Linux CI、可信生产签名或环境晋级。临时测试密钥不作为发布authority，不使用.env或产品密钥。下一M1 active-capture恢复实现仍等0054发布验收全绿；M1未冻结、M2冻结、M3未开始与0037/自动清理/外部处置关闭不变。
