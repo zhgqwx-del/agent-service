@@ -483,6 +483,52 @@ describe("S3TenantBackupCatalogAdapter unit contract", () => {
     })).rejects.toBeInstanceOf(TenantBackupCatalogAdapterConflictError);
   });
 
+  it("observes only an already committed source head without genesis, pending repair, LIST, or CAS", async () => {
+    const empty = fixture();
+    await expect(empty.store.readHeadForBackupSourceObservation()).rejects.toThrow("chain is corrupt");
+    expect(empty.client.commands.every((command) => command instanceof GetObjectCommand)).toBe(true);
+    expect(empty.client.objects.size).toBe(0);
+
+    const committed = fixture();
+    await committed.store.publishAvailability(availability(217));
+    const before = committed.client.commands.length;
+    const expected = await committed.store.readHeadForBackupSourceObservation();
+    expect(expected.catalogSequence).toBe(1);
+    expect(committed.client.commands.slice(before).every((command) => command instanceof GetObjectCommand)).toBe(true);
+
+    const pending = fixture();
+    await pending.store.readHead();
+    pending.client.rejectNextPutFor = (key) => key.endsWith("/authority/head-v2");
+    await expect(pending.store.publishAvailability(availability(218)))
+      .rejects.toThrow("head compare-and-swap failed");
+    const pendingBefore = pending.client.commands.length;
+    await expect(pending.store.readHeadForBackupSourceObservation()).rejects.toThrow("chain is corrupt");
+    expect(pending.client.commands.slice(pendingBefore).every((command) => command instanceof GetObjectCommand)).toBe(true);
+    const headKey = `${BUCKET}/${PREFIX}/targets/${TARGET_SHA256}/authority/head-v2`;
+    expect(pending.client.objects.get(headKey)).toBeDefined();
+    expect(await pending.store.readHead()).toMatchObject({ catalogSequence: 1 });
+  });
+
+  it("rejects an unchanged head body with a changed physical ETag during observation", async () => {
+    const { client, store } = fixture();
+    await store.publishAvailability(availability(219));
+    const headKey = `${BUCKET}/${PREFIX}/targets/${TARGET_SHA256}/authority/head-v2`;
+    const originalSend = client.send.bind(client);
+    let headReads = 0;
+    vi.spyOn(client, "send").mockImplementation(async (command, options) => {
+      if (command instanceof GetObjectCommand && command.input.Key?.endsWith("/authority/head-v2")
+        && ++headReads === 2) {
+        const row = client.objects.get(headKey);
+        if (row) row.etag = `"${digest("changed-observation")}"`;
+      }
+      return originalSend(command, options);
+    });
+    const before = client.commands.length;
+    await expect(store.readHeadForBackupSourceObservation()).rejects.toThrow("chain is corrupt");
+    expect(headReads).toBe(2);
+    expect(client.commands.slice(before).every((command) => command instanceof GetObjectCommand)).toBe(true);
+  });
+
   it("burns runtime epochs and blocks eviction until reservation resolution", async () => {
     const { store } = fixture();
     const source = availability(301);

@@ -6,11 +6,12 @@ type Executor = Connection | Pool | PoolConnection;
 type Row = RowDataPacket;
 
 /**
- * Read the immutable 0055 snapshot from the *actual* MySQL source, rather
- * than accepting a checkpoint returned by an unrelated caller-owned store.
- * This validates historical rows, all 49 family roots and the protected ref
- * key, but intentionally makes no claim that today's mutable source is the
- * same as the pre-dump snapshot. The producer must compare that separately.
+ * Read an immutable checkpoint from the *actual* MySQL source, rather than
+ * accepting a caller-owned projection. The published v1 record keeps its
+ * original 49-family bytes. A v2 record additionally requires every sealed
+ * lineage leaf and its separate 27-family protected root. Neither historical
+ * root claims that today's mutable source is still the pre-dump snapshot;
+ * the producer must independently compare the locked current source.
  */
 export async function readTenantTelemetryCaptureCheckpointFromMysql(
   executor: Executor,
@@ -34,7 +35,21 @@ export async function readTenantTelemetryCaptureCheckpointFromMysql(
       LIMIT ${CaptureRestore.TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES + 1} ${lock}`,
     [backupId],
   );
-  if (!headers.length && !leafRows.length) return null;
+  // A v1 checkpoint must not silently ignore an orphan 0058 lineage row, and
+  // a missing header must not hide one either. The metadata probe permits the
+  // published pre-0058 schema to keep reading its unchanged v1 bytes.
+  const [lineageTables] = await executor.query<Row[]>(`SELECT COUNT(*) AS n FROM information_schema.tables
+    WHERE table_schema=DATABASE() AND BINARY table_name=BINARY 'tenant_telemetry_capture_checkpoint_lineage_leaves'
+      AND table_type='BASE TABLE'`);
+  const lineageInstalled = Number(lineageTables[0]?.n) === 1;
+  const [lineageRows] = lineageInstalled ? await executor.query<Row[]>(
+    `SELECT backup_id,family,identity_ref_sha256,record_hmac_sha256,source_high_water_db_ms
+       FROM tenant_telemetry_capture_checkpoint_lineage_leaves
+      WHERE BINARY backup_id=BINARY ? ORDER BY family,identity_ref_sha256
+      LIMIT ${CaptureRestore.TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES + 1} ${lock}`,
+    [backupId],
+  ) : [[] as Row[]];
+  if (!headers.length && !leafRows.length && !lineageRows.length) return null;
   if (headers.length !== 1 || leafRows.length > CaptureRestore.TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES) {
     throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
   }
@@ -67,5 +82,23 @@ export async function readTenantTelemetryCaptureCheckpointFromMysql(
     };
   });
   CaptureRestore.assertTenantTelemetryCaptureCheckpointLeaves(checkpoint, leaves, refKey);
-  return { checkpoint: structuredClone(checkpoint), leaves: structuredClone(leaves) };
+  if (checkpoint.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) {
+    if (lineageRows.length !== 0) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    return { checkpoint: structuredClone(checkpoint), leaves: structuredClone(leaves) };
+  }
+  if (!lineageInstalled || lineageRows.length > CaptureRestore.TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES) {
+    throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+  }
+  const lineageLeaves: CaptureRestore.TenantTelemetryCaptureLineageLeaf[] = lineageRows.map((row) => {
+    if (row.backup_id !== backupId) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    return {
+      family: row.family as CaptureRestore.TenantTelemetryCaptureLineageFamily,
+      identityRefSha256: String(row.identity_ref_sha256),
+      recordHmacSha256: String(row.record_hmac_sha256),
+      sourceHighWaterDbMs: Number(row.source_high_water_db_ms),
+    };
+  });
+  CaptureRestore.assertTenantTelemetryCaptureLineageLeaves(checkpoint.lineage, lineageLeaves, refKey);
+  return { checkpoint: structuredClone(checkpoint), leaves: structuredClone(leaves),
+    lineageLeaves: structuredClone(lineageLeaves) };
 }

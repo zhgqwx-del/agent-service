@@ -557,11 +557,11 @@ pnpm maintenance:backup-catalog -- reconcile
 
 ## 本地MySQL加密逻辑备份制品
 
-`backup-catalog`与`restore-ledger-reconcile`使用共享的受保护raw key文件接线：0033 lifecycle inactive时可不配置；active时必须提供`TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`，source及物理恢复后的target均用完全相同的key执行verify-only startup audit，缺失、错误或receipt/coverage漂移仍fail closed，绝不绕过审计。单独提供该文件不授权active provider capture跨epoch写入，也不自动rebind旧receipt；0057未发布候选的独立受限流程见下文。验收只看PROGRESS，不沿用旧inactive结果。
+`backup-catalog`与`restore-ledger-reconcile`使用共享的受保护raw key文件接线：0033 lifecycle inactive时可不配置；active时必须提供`TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE`，source及物理恢复后的target均用完全相同的key执行verify-only startup audit，缺失、错误或receipt/coverage漂移仍fail closed，绝不绕过审计。单独提供该文件不授权active provider capture跨epoch写入，也不自动rebind旧receipt；0057已实现的单次受限流程与0058重复恢复候选分列如下。验收只看PROGRESS，不沿用旧inactive结果。
 
 文件须为绝对路径、当前UID所有、单hard-link且owner-only的regular file，内容恰好32 raw bytes（不是64字符hex），不得是symlink或FIFO；reader以nonblocking/no-follow打开并在读取前后复核文件身份，错误输出只使用闭合类别，operator临时buffer在资源关闭后清零。此key与`BACKUP_ARTIFACT_KEY_FILE`的制品加密key独立；保留它不等于保存到数据库或制品中。应用仍使用`TENANT_TELEMETRY_REF_KEY` hex配置，direct CLI只要发现该变量存在（包括空值）即拒绝；三个foreground wrapper会清除此应用输入，保留受控file变量且不改`.env`，长期router/runner剥离operator file路径。不要回显key、文件路径、环境或数据库错误。旧restore-ledger及catalog metadata命令仍没有统一whole-operation deadline，本次key兼容接线不扩展其保证。
 
-这是0052之后的code-only、受限本地producer，不是生产backup/DR。它扩展已有`backup-catalog.js`，不增加schema、常驻服务、入口或镜像。旧`begin-backup/publish-backup`流程继续仅绑定外部operator attestation；新的`create-artifact`读取真实MySQL 8 InnoDB应用逻辑SQL，认证实际bytes后才发布catalog availability。`verify-artifact`会认证制品、当前anchor与catalog证据，也可对账content-free控制投影，不是严格只读。
+最初的producer是0052之后的code-only、受限本地切片，不是生产backup/DR；后续capture恢复依赖独立的0055～0057证据schema，0058再扩展重复恢复候选，不能把“CLI不自动迁移”解释成没有schema依赖。它们均扩展已有`backup-catalog.js`，不新增常驻服务、产品入口或镜像。旧`begin-backup/publish-backup`流程继续仅绑定外部operator attestation；新的`create-artifact`读取真实MySQL 8 InnoDB应用逻辑SQL，认证实际bytes后才发布catalog availability。`verify-artifact`会认证制品、当前anchor与catalog证据，也可对账content-free控制投影，不是严格只读。
 
 手工体验只用可丢弃数据库，先完成0030/0031受控activation及上文catalog配置，并实际摘流、停止和排空全部writer。ACK、filesystem lock和MySQL named lock只能约束合作operator，不会替你停止任意应用或数据库writer。创建/验证制品和首次`restore-selected`要求source在线；这不是主库已丢失时的external-only首次恢复。source/target都必须是稳定loopback MySQL 8，首次导入的target须明确创建、为空且实际server UUID/database tuple不同；只换URL spelling不等于不同目标。导入后的五个selected continuation只连接同一已导入的target，不要求旧source仍在线，也不要求或允许清空target。
 
@@ -592,7 +592,7 @@ pnpm maintenance:backup-catalog -- restore-selected
 
 `restore-selected`先在新鲜external chain上永久reserve run/epoch，再真实执行DDL/DML导入，随后verify-only核对完整schema/anchor并同ID重建binding/run。它不是DDL-free；MySQL DDL auto-COMMIT意味着失败可能留下部分target。任意既有run或epoch（包括已resolved）都永久拒绝再次自动导入，不能换artifact目录、target或恢复旧source快照绕过。失败必须保留原ID、制品、reservation与事件现场，只有独立确认完整导入且exact schema/anchor有效的target才可按旧0031 prepare/0030 replay路径人工forward-fix；`SOURCE_BACKUP_SHA256`必须取已认证catalog/restore输出的`sourceBackupSha256`，不手填猜测，部分import不能直接续接；禁止自动DROP、清空、重导、换epoch掩盖事故或直接启动服务。
 
-### 0057 active-capture 新epoch流程（未发布、本地隔离候选）
+### 0057 active-capture 新epoch流程（单次已实现，仅限本地隔离）
 
 已激活0053的来源使用认证v2制品和49类checkpoint；不能走普通connect或旧generic命令绕过pending门禁。完整导入只到prepared，随后保持停服，保留同一制品/key、backup/run/epoch/target及catalog/journal配置，分别运行：
 
@@ -607,11 +607,23 @@ BACKUP_RESTORE_CATALOG_RESOLUTION_ACK=1 pnpm maintenance:backup-catalog -- resol
 
 以上还各自要求既有artifact local-only、`RESTORE_FLEET_STOPPED_ACK=1`及受保护operator ref-key；capture cutover另需local-only/fleet-stopped/legacy-writers-drained/producer-ready四项ACK和真实configured fleet root，完整变量以`backup-catalog --help`为准。命令持有认证GCM和target锁、使用统一预算，独立验证实际外部链/新head、0031 selection与0030历史，不重新import/reserve/prepare、不自动激活或切换应用。`resolve-selected`只收口实际active+capture-cutover后的该run为activated，不授予普通writer能力，不实现本批v2 abort；旧v1 `resolve-restore`保留原行为。响应丢失不得换ID或猜成功，只显式同命令exact retry。
 
-新epoch普通runner仍须独立既有capture gate、受保护ref-key及每边界fresh fleet proof。旧pending仅完整validated-v2叶可获新attempt/token/permit；legacy/unknown不升权，旧CP/root、旧receipt与reservation descriptor不重签。0054 restored destructive仍拒。真实本地纵向定向已通过，但重复备份/再次恢复、其它domain联合灾备、生产IAM/KMS/故障域及整包发布验收仍未闭环；不要把本节当生产操作许可。
+新epoch普通runner仍须独立既有capture gate、受保护ref-key及每边界fresh fleet proof。旧pending仅完整validated-v2叶可获新attempt/token/permit；legacy/unknown不升权，旧CP/root、旧receipt与reservation descriptor不重签。0054 restored destructive仍拒。0057单次纵向已定向通过；0058已有下节所述分段真实双跳，仍未整包验收。其它domain联合灾备及生产IAM/KMS/故障域仍未闭环，不要把本节当生产操作许可。
 
 首次`restore-selected`成功只返回`restorePhase=prepared`、`runtimeActivated=false`、`fenceReplayComplete=false`和`requiresExplicitReplayAndActivation=true`，不会自动执行后续步骤。仅inactive capture的旧v1恢复继续使用旧operator：将其`MYSQL_URL`明确改到已导入target，保留同一run/epoch/evidence与外部target identity，明确提供新epoch的`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`，再分别执行`replay-fences → verify → status`、人工审阅、显式`activate-runtime`及0031 `resolve-restore`。active capture的v2恢复只按上节五个selected命令分别授权，不得改走旧generic路径。旧restore-ledger及metadata catalog命令仍只验证已安装migration、不执行DDL。
 
 全操作单调deadline贯穿S3、native MySQL、child和文件spool；取消会终止受控socket/child，但已发送COMMIT或S3 CAS可能已成功，不是回滚证明。pending工作settle前不提前释放operator lock；超时可能遗留未发布spool/probe/orphan，不能宣称零残留。可信本机FS、同UID、endpoint稳定性及手工fleet停写仍是前提；不覆盖物理page/PITR、任意views/routines/events、Blob/Redis联合备份恢复、tenant backup-copy erasure、云IAM/KMS、独立故障域、RPO/RTO或容量。完整本地/CI实际执行证明以PROGRESS最新节为准，M1仍未冻结。
+
+### 0058 重复备份／恢复（分段纵向通过，未整包验收）
+
+以下是尚未完整验收的有限工作流，不是可用于业务库的操作教程：在同一已独立迁移的schema下，primary生成backup1（checkpoint v1／`ASMYSQL2`）→fresh DB1／never-used epoch1完成上述五个selected步骤→停服后从该restore1来源生成真正的新backup2（checkpoint v2／`ASMYSQL3`）→另一fresh DB2／never-used epoch2再执行同样步骤。每次使用各自的新backup/run/epoch ID，不能把旧制品exact replay当作第二次备份，也不能复用首次导入目标。每次`restore-selected`仍只到prepared，不自动activate、resolve或切换应用。
+
+候选的受保护artifact路径使用独立backup-source maintenance facade，核对实际pool/server UUID/database、0030/0031与49类来源；CP2另绑定27类真实祖先投影，完整叶子由实际SQL dump携带并在导入后重验，不凭caller hash补证。新dump前后观察实际来源epoch、DB heads及外部catalog/journal完整链；source epoch来自服务端，不借用下一target的epoch配置。合法queued/reserved/written及legacy-unknown均可备份，unknown不提升；旧CP、history/cutover、P1、原reservation descriptor与对象bytes不重签。恢复后只能以新claim和精确P2续跑原operation，不能复活旧token。
+
+source维护、exact-run恢复维护与普通runner写入三种权限分开。source prepare成功后禁止继续读/镜像该已fenced source；导入前只重新验证完整外部chain、selected availability及同一reservation，随后在target重建exact prepare。普通capture仍须独立runtime gate和fresh configured-fleet proof；operator不因维护factory而获得claim/reserve/create/ACK能力。已有制品exact replay只认证实际bytes与不可变历史，不重新seal或要求今日head未变。
+
+0058候选还在实际source锁下、任何planned journal／外部reserve／import之前，将完整source migration root与认证manifest的anchor精确比较；不同即拒。`ASMYSQL1/2`旧bytes与历史读取兼容，不等于旧schema制品可import→upgrade→continuation；这条跨schema原生恢复仍缺，禁止自动DDL、重导或清空部分target。命令仍复用现有create/verify/restore与五个selected命令，没有新CLI、daemon、服务、JS入口或镜像，VM与容器交付边界仍为2/6/2。
+
+0058八根已在隔离MySQL校准；完整SQL/冻结旧binary历史/单跳证据保留。有界trigger batch后，22:37的真实完整双跳在原180秒首次通过（178638.82ms），含newPi/finalcold/cleanup，独立资源复查零fixture库/三对象前缀残留。仅约1.36秒余量，仍有CI风险，不称稳定提速或整包通过；原超时与启动器配置失败均保留。300秒请求仍未答，原180/CLI120/lease/断言未变，不再据此阻断本地后续；完整verify/verify-s3、最终commit/push/新CI尚未执行。main3414五绿只证明原发布；默认off/local-only与production拒绝、0037、0054原primary-only、外删与自动off/completion=false不变，详见[PROGRESS](../PROGRESS.md)顶部及末节。
 
 ## 预发/生产资源就绪后的交付顺序
 

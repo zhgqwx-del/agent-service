@@ -1299,6 +1299,29 @@ export class S3TenantBackupCatalogAdapter implements TenantBackupCatalogAdapter 
     return clone(result);
   }
 
+  /** GET-only source-backup observation. Unlike readHead(), this cannot
+   * initialize genesis or advance a pending event. The caller receives only
+   * an already committed, complete head with an unchanged physical ETag. */
+  async readHeadForBackupSourceObservation(): Promise<TenantBackupCatalogHead> {
+    this.assertOpen();
+    const first = await this.readHeadObject();
+    if (!first) throw new TenantBackupCatalogAdapterCorruptError();
+    const events = await this.readChainThrough(first.head.catalogSequence);
+    if (!sameHead(this.head(events), first.head)) {
+      throw new TenantBackupCatalogAdapterCorruptError();
+    }
+    if (first.head.catalogSequence < Number.MAX_SAFE_INTEGER
+      && await this.readStoredEvent(first.head.catalogSequence + 1)) {
+      throw new TenantBackupCatalogAdapterCorruptError();
+    }
+    const second = await this.readHeadObject();
+    if (!second || second.etag !== first.etag || !sameHead(second.head, first.head)) {
+      throw new TenantBackupCatalogAdapterCorruptError();
+    }
+    validateTenantBackupCatalogHead(second.head);
+    return clone(second.head);
+  }
+
   async scanEvents(
     options: ScanTenantBackupCatalogEventsOptions,
   ): Promise<ScanTenantBackupCatalogEventsResult> {

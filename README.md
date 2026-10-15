@@ -1,10 +1,12 @@
 # agent-service
 
-## 当前状态（2026-10-15T18:22Z）
+## 当前状态（2026-10-15T22:37Z，原180秒双跳首次完整通过）
 
-修复提交 `695220d` 的受影响范围 4 文件 / 54 项通过；随后真实历史 50 文件 / 318 项通过。`1a183c8` 的 cluster 8 文件 / 28 项、独立 T3g 3 项、真实 MySQL/MinIO 15 文件 / 81 项、六入口构建/SDK及 clean VM 发布包检查均通过，全部定向项零失败或跳过。typecheck、secret scan727 与 diffcheck 通过，详见 [PROGRESS](docs/PROGRESS.md) 末节。下方 `aad57d3` 整轮退出1的事实保留；这些是明确源码下的分段验收，不是一次全量 coverage 成功，新 SHA 的 GitHub CI 尚待。
+发布基线 main/origin `3414b43` 的[本次 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38785600946) 已在20:03 UTC五项全成功：主测试4191通过/82预期跳过，历史50文件318项零失败或跳过，真实S3、cluster、构建/VM与两个镜像均通过。required133文件/64组的同次执行证明已核对。原本地`aad57d3`整轮失败与修复后的分段报告保留，不把它们重写成一次本地全量成功；详见[PROGRESS](docs/PROGRESS.md)。
 
-本地组合候选 `aad57d3` 已合并 M1 `d4c4060` 与 M4 `11bbf7b`，未合入 main 或推送；main/origin 仍为 `2932318`，其[旧 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38714666463)只证明原基线。2026-10-15 16:17Z～17:05:49Z 的本轮完整 verify 退出 **1**：主测试 4174 passed / 17 failed / 82 expected skipped；API、typecheck、secret scan 727 通过，后续历史、cluster、build 未执行，不能宣称 coverage 或 required 文件证明通过。失败与此前独立定向证据见 [PROGRESS](docs/PROGRESS.md) 顶部和最后一节。
+本分支 `0058` 仍未提交、合入main或完成整包验收。store `301621c7` 的完整MySQL10项、冻结旧binary历史4项及shared纯166项证据保留；有界trigger batch源 `461d…` / test `3f93…` 的unit66项、typecheck、scan734/diffcheck通过，真实整库schema/trigger往返1项及新增双跳1项定向通过，过滤项不算执行。详见[PROGRESS末节](docs/PROGRESS.md)。
+
+原超时和启动器缺配置的失败均保留；本次双跳在原180秒内首次完整通过，178638.82ms，含newPi、finalcold和cleanup，独立资源复查零fixture库/对象前缀残留。余量仅约1.36秒，仍有CI风险，不能称稳定提速或整包通过。300秒请求仍未答，原180/CLI120/lease/断言未变；完整verify/verify-s3、最终commit/push与新CI尚未执行。
 
 M1 未冻结、M2 冻结、M3 未开始；默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
 
@@ -14,7 +16,7 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 
 日常体验/构建与部署学习见[开发与 CI 指南](docs/operations/development-and-ci-guide.md)，精确备份恢复边界见[数据生命周期 §15](docs/design/04-data-lifecycle.md#15-0057-显式新-epoch-capture-与旧-pending-恢复未发布候选)。历史验收数字统一保留在 PROGRESS；下方产品说明不是本轮通过证明。
 
-下一优先项是第二次实际备份再恢复到又一个新 epoch，并保持完整祖先与旧 pending 许可；独立 worktree 仅提前编码/纯测试，尚未交付。旧 schema 的原生制品跨新增迁移恢复也仍未闭环：格式/历史读取兼容不等于导入后升级可续跑，当前失败可能留下已消耗 epoch 与部分目标，禁止自动重导或自动 DDL。以上仍属本地 M1 工作，不是等待云资源即可自动完成。
+下一验收是第二次实际备份再恢复到又一个新 epoch，并保持完整祖先与旧 pending 许可；独立 worktree 的提前编码/纯测试不等于交付。候选已增加实际source schema的reserve/import前拒绝，但旧 schema 原生制品跨迁移的import→upgrade→continuation仍未实现；不能把拒绝或格式/历史读取兼容当作恢复成功，禁止自动重导、清空部分目标或隐式 DDL。以上仍属本地 M1 工作，不是等待云资源即可自动完成。
 
 分布式、多租户的 agent API 服务：无状态 `agent-router` + 有状态 `agent-runner`（类 `opencode serve`）。当前已实现会话/turn/SSE、BYOK、租约与 fencing、多节点路由和接管；MCP、skills、plugins/hooks 属于后续 M3。设计见 `docs/design/00-architecture.md`，调研见 `docs/research/`。
 

@@ -1,6 +1,8 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> M4本地测量增量（2026-10-15，未发布候选）：已有一个实际runner dist在真实MySQL/独立Redis/FakeVendor下完成1000并发基线，SSE与已提交inProgress峰值均1000，全部正常turn、usage/billing/item/event与seq对账及清理通过。它只补本地可复现实测，不证明真实模型SLO、持续压力、云容量或M4整体完成；方法见[基线文档](../operations/runner-load-benchmark.md)，源身份/失败与结果见PROGRESS。用户已允许M1精确备份/新epoch恢复在独立树提前编码与纯测试，不合入/部署/激活；旧执行权限和发布CI门禁保持。
+> 当前恢复边界（2026-10-15T22:37Z）：0055～0057单次恢复已随main3414发布且对应CI五绿。0058候选的真实SQL/历史/单跳证据保留；有界trigger batch后原180秒完整双跳首次通过，含新Pi、finalcold与cleanup，178638.82ms，仅约1.36秒余量。该单次定向不证明稳定提速、完整锁行为或整包验收；完整verify/verify-s3/新CI仍待，候选未合入。0054原primary-only、0037、外部删除/自动off、completion=false及M1未冻结/M2冻结/M3未开始不变；精确证据及旧失败见[PROGRESS](../PROGRESS.md)与[数据生命周期§14～16](04-data-lifecycle.md)。
+
+> M4本地测量增量（2026-10-15，历史候选检查点）：已有一个实际runner dist在真实MySQL/独立Redis/FakeVendor下完成1000并发基线，SSE与已提交inProgress峰值均1000，全部正常turn、usage/billing/item/event与seq对账及清理通过。它只补本地可复现实测，不证明真实模型SLO、持续压力、云容量或M4整体完成；方法见[基线文档](../operations/runner-load-benchmark.md)，源身份/失败与结果见PROGRESS。
 
 > M4离线签名候选（2026-10-15）：复用受限tar/manifest和独立Node工具，以受保护Ed25519文件签署exact clean release statement；consumer必须同时持有独立可信SPKI DER pin与选定role/commit，并核对实际归档、manifest和执行工具自身hash。全部signed metadata在输出创建前闭合，第二次解包读取重新验归档摘要，无unsigned fallback。新增离线脚本不是新的应用dist入口，长期router/runner、六入口和两个镜像不变；不生成产品key、不执行DDL/服务安装/环境晋级，不代表生产trustroot、OCI签名、freshness或吊销。操作见[离线VM签名](../operations/local-and-deployment.md#离线-vm-发布签名)，实际验收见PROGRESS，M1和恢复门禁不变。
 
@@ -10,7 +12,7 @@
 
 > M4独立VM目录发布包候选复用现有六个Node24 ESM入口，附带完整production依赖、严格manifest及Linux非root systemd样例，不新增长期服务或镜像。实际依赖闭包含esbuild原生程序，目录包绑定Linux/macOS与x64/arm64，不能把JS应用等同跨OS通用闭包或独立ELF程序；`productionAccepted=false`固定。构建从冻结Git/copy-once源码进行，验真还要求独立可信摘要与匹配host；帮助/服务入口以真实文件身份识别current/path alias。VM离线签名候选见上方；实际双包/类型/必跑测试及完整验收状态只看PROGRESS，schema发布、生产无DDL账号、OCI签名/环境晋级及真实环境验收仍缺，M1不冻结/M3不开始。
 
-> 本地MySQL逻辑备份/旧restore CLI现接受保护的exact ref-key文件，供0033 active source/target startup audit使用；missing/wrong key仍安全拒绝。实际active0033组合证明只看PROGRESS，不能借inactive旧17例外推；active0053 capture与恢复后的新epoch尚不兼容，必须fail closed，不得自动rebind。
+> 本地MySQL逻辑备份与selected continuation使用同一受保护exact 32-byte ref key，且与制品加密key分离；missing/wrong key仍拒绝。0055～0057已补active0053/0054三态来源的单次受控新epoch路径，但必须实际checkpoint、0031 reservation/binding、0030 replay/activation、独立cutover与fresh fleet逐层验真，不是自动rebind或startup audit豁免；operator不获得普通writer权限。旧inactive/active0033证明不代替这条纵向，当前结果见PROGRESS。
 
 > `0053`新增默认关闭、仅限本地的provider-step failure durable capture：首failed-step业务写集与source/member/spool/job/failure receipt原子提交，turn结束仍独立commit。控制激活绑定真实0030 primary runtime epoch、exact protected ref key和完整configured fleet；v1/traces capture保持inactive，active第六source继续阻断T3d/T3f及全域completion。新`telemetry-capture`为一次性前台CLI，产品Node入口增至六个，常驻服务/OCI镜像仍各两个。相关strict fingerprint160（全库662）；须排空旧writer、独立迁移后只启动0053-aware进程，不支持热混跑。完整验证以PROGRESS为准。
 
@@ -635,7 +637,7 @@ agent-service/
 | **M3 扩展性**（2–3 周） | 远程 MCP 注册与桥接；skills 上传/注入/guard；hooks/middleware + webhook hook；动态工具反向委托 | MCP 工具在 turn 中被调用并落 item；skill 目录注入去重；hook 超时 fail-open/closed 行为；SSRF 用例被拒 |
 | **M4 生产化**（原始估算 2–3 周，非当前承诺） | 配额/key 池/熔断；OTel + 指标；压测（单进程并发 turn 上限实测）；Streams 分片；VM 独立进程发布包与容器/k8s 交付；重池/exec-server 设计评审 | 单 runner 1,000 并发 turn 压测报告；`prompt_cache_hit_ratio` 面板；混沌测试（Redis 抖动、厂商 5xx）；VM/容器两种形态的同协议发布与回滚验收 |
 
-当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038～0042再依次补新write membership、T3f owner closure、T3d source/观察目标/逐artifact目录；0043/0044只补本地候选复核与不可扩权pre-grant intent/claim。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry delete/restore/retention、0035 v1 operator activation与任意业务事务crash-atomic dual-write仍缺失；已发布0053仅提供真实provider-step失败的受控本地v2 logs operator。本地加密MySQL逻辑backup producer已实现，但active0053新epoch恢复、backup-copy erasure、真实provider/KMS、generic user purge及全域completion仍未闭环，所以M1尚未冻结；M3尚未正式开始，M4主体尚未完成（VM目录与受限tar/独立工具已有本地候选证明，本地完整集成验收已通过，Linux CI由main对应run独立验收），云环境验收尚未开始。
+当前判定不按上表原始工期推断：M2的本地/CI代码范围已冻结。0034 writer已接runner并支持本地filesystem或`telemetry-s3-object-v1` S3-compatible adapter；0035已建立per-domain capture与provider failure logs exact contract；0038～0042再依次补新write membership、T3f owner closure、T3d source/观察目标/逐artifact目录；0043/0044只补本地候选复核与不可扩权pre-grant intent/claim。S3 adapter已经闭合managed-capable写入协议，但traces、真实managed云环境验收、telemetry处置/retention、0035 v1 operator activation与任意业务事务crash-atomic dual-write仍缺失。已发布0053提供受控本地v2 logs；0055～0057已在实际加密MySQL制品上接通单次新epoch历史审计、显式新capture及原validated-v2 pending恢复，有本地分段真实验证，`3414b43`对应CI五job现已全部success。0058重复备份/多跳恢复仍是未合入候选：CP2另封固定27族lineage，独立v2 permit保留旧CP/49-family根、P1与原reservation，不能凭新hash重释旧unknown；八根已校准，SQL/历史/单跳已有分段证据，有界trigger batch后原180秒完整双跳首次通过但仅约1.36秒余量，整包verify/verify-s3/新CI仍待，不宣称稳定提速。旧schema原生制品跨迁移导入/升级/续跑、backup-copy erasure、真实provider/KMS、generic user purge与全域completion仍未闭环，所以M1尚未冻结、M3未开始；M4主体与云环境验收亦未整体完成。当前候选与历史验收不能相互背书，详见PROGRESS及数据生命周期§14～16。
 
 0045～0048增加的外部观察器与v3非生产journal不改变上述执行判定；0049原始阶段的capture v2 control/coverage/binding被SQL硬拒；后续0053另以独立guard轮换支持受控本地logs，不开放traces或外部处置。0050普通DELETE只封存post-COMMIT 30天保留下限，后续默认关闭的runner恢复caller也只补可信未seal来源；0051以SQL trigger冻结已存在origin/seal，但不强制旧writer双写或开放自动物理清理。用户已选择M4同时交付独立VM进程发布包和Linux OCI镜像；两个候选OCI镜像已有CI构建/启动门禁，Node24目标平台目录包已完成macOS arm64双包验真与真实进程检查，受限tar归档和独立验真工具候选已通过335定向与clean双tar真实装配，但不是签名、晋级或生产许可。本地VM证明不能替代main对应Linux CI或生产许可，签名/晋级、受控schema发布、托管运行及真实staging/production资源验收仍未完成。
 

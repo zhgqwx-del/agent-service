@@ -23,6 +23,107 @@ export const TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE = "tenant-telemetry-
 export const TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES = 100_000;
 export const TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_BYTES = 1_048_576;
 export const TENANT_TELEMETRY_CAPTURE_RECOVERY_MAX_LEASE_MS = 300_000;
+export const TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL = "tenant-telemetry-capture-restore-v2" as const;
+export const TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE = "tenant-telemetry-capture-backup-checkpoint-v2" as const;
+export const TENANT_TELEMETRY_CAPTURE_LINEAGE_SCOPE = "tenant-telemetry-capture-checkpoint-lineage-v1" as const;
+export const TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE = "tenant-telemetry-capture-operation-recovery-v2" as const;
+
+/** Separate physical inventory: NEVER append these to the published 49-family
+ * v1 projection. A frontier is still fully frozen during the dump window. After
+ * import its transition must be proved by the actual 0030/0031 event/run chain;
+ * the annotation is not permission to omit a row or skip an audit.
+ * Only this backupId's rows in the first three tables are self-excluded. */
+export const TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL = Object.freeze([
+  { family: "checkpoint", table: "tenant_telemetry_capture_backup_checkpoints", evolution: "immutable", excludeSelectedBackup: true },
+  { family: "checkpoint_leaf", table: "tenant_telemetry_capture_backup_checkpoint_leaves", evolution: "immutable", excludeSelectedBackup: true },
+  { family: "checkpoint_lineage_leaf", table: "tenant_telemetry_capture_checkpoint_lineage_leaves", evolution: "immutable", excludeSelectedBackup: true },
+  { family: "restore_binding", table: "tenant_telemetry_capture_restore_bindings", evolution: "immutable", excludeSelectedBackup: false },
+  { family: "restore_history", table: "tenant_telemetry_capture_restore_history_receipts", evolution: "immutable", excludeSelectedBackup: false },
+  { family: "epoch_cutover", table: "tenant_telemetry_capture_epoch_cutovers", evolution: "immutable", excludeSelectedBackup: false },
+  { family: "recovery_permit", table: "tenant_telemetry_capture_recovery_permits", evolution: "immutable", excludeSelectedBackup: false },
+  { family: "recovery_permit_v2", table: "tenant_telemetry_capture_recovery_permits_v2", evolution: "immutable", excludeSelectedBackup: false },
+  { family: "journal_control", table: "tenant_restore_journal_control", evolution: "frontier", excludeSelectedBackup: false },
+  { family: "journal_job", table: "tenant_restore_journal_jobs", evolution: "frontier", excludeSelectedBackup: false },
+  { family: "journal_target", table: "tenant_restore_journal_targets", evolution: "append", excludeSelectedBackup: false },
+  { family: "journal_ack", table: "tenant_restore_journal_target_acks", evolution: "append", excludeSelectedBackup: false },
+  { family: "journal_receipt", table: "tenant_restore_journal_receipts", evolution: "append", excludeSelectedBackup: false },
+  { family: "replay_run", table: "tenant_restore_replay_runs", evolution: "frontier", excludeSelectedBackup: false },
+  { family: "restore_fence", table: "tenant_restore_fences", evolution: "append", excludeSelectedBackup: false },
+  { family: "replay_entry", table: "tenant_restore_replay_entries", evolution: "append", excludeSelectedBackup: false },
+  { family: "runtime_control", table: "tenant_restore_runtime_control", evolution: "frontier", excludeSelectedBackup: false },
+  { family: "runtime_head", table: "tenant_restore_runtime_heads", evolution: "frontier", excludeSelectedBackup: false },
+  { family: "runtime_known_entry", table: "tenant_restore_runtime_known_entries", evolution: "append", excludeSelectedBackup: false },
+  { family: "runtime_event", table: "tenant_restore_runtime_events", evolution: "append", excludeSelectedBackup: false },
+  { family: "catalog_control", table: "backup_catalog_control", evolution: "frontier", excludeSelectedBackup: false },
+  { family: "catalog_event", table: "backup_catalog_external_events", evolution: "append", excludeSelectedBackup: false },
+  { family: "catalog_anchor", table: "backup_snapshot_anchors", evolution: "append", excludeSelectedBackup: false },
+  { family: "catalog_entry", table: "backup_catalog_entries", evolution: "immutable", excludeSelectedBackup: false },
+  { family: "catalog_source_binding", table: "backup_restore_source_bindings", evolution: "immutable", excludeSelectedBackup: false },
+  { family: "catalog_reservation", table: "backup_runtime_reservations", evolution: "frontier", excludeSelectedBackup: false },
+  { family: "catalog_eviction", table: "backup_catalog_evictions", evolution: "append", excludeSelectedBackup: false },
+] as const);
+for (const projection of TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL) Object.freeze(projection);
+export type TenantTelemetryCaptureLineageFamily = (typeof TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL)[number]["family"];
+export const TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES = Object.freeze(TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL.map((row) => row.family));
+export interface TenantTelemetryCaptureLineageLeaf {
+  family: TenantTelemetryCaptureLineageFamily;
+  identityRefSha256: string;
+  recordHmacSha256: string;
+  sourceHighWaterDbMs: number;
+}
+export interface TenantTelemetryCaptureLineageFamilySummary {
+  family: TenantTelemetryCaptureLineageFamily;
+  rowCount: number;
+  sourceHighWaterDbMs: number;
+  rootSha256: string;
+}
+export interface TenantTelemetryCaptureLineageHeader {
+  backupId: string;
+  anchorSha256: string;
+  refKeyIdSha256: string;
+  sourceRestoreRunId: string;
+  sourceCheckpointSha256: string;
+  sourceHistoryReceiptSha256: string;
+  sourceCaptureCutoverReceiptSha256: string;
+  sourceRuntimeEpochSha256: string;
+  sourceRuntimeBindingSha256: string;
+  sourceRuntimeControlEvidenceSha256: string;
+  sourceRuntimeControlGeneration: number;
+  sealedAtDbMs: number;
+}
+/** Each link is reconstructed from actual independently validated records.
+ * Inclusion binds those exact records to the authenticated full backup; it is
+ * not a substitute for the backend's real 0030/0031 ancestry verification. */
+export interface TenantTelemetryCaptureLineageAncestor {
+  restoreRunId: string;
+  checkpointSha256: string;
+  historyReceiptSha256: string;
+  cutoverReceiptSha256: string | null;
+  runtimeEpochSha256: string;
+  runtimeBindingSha256: string;
+  runtimeControlGeneration: number;
+  checkpointIdentityRefSha256: string;
+  checkpointRecordHmacSha256: string;
+  historyIdentityRefSha256: string;
+  historyRecordHmacSha256: string;
+  cutoverIdentityRefSha256: string | null;
+  cutoverRecordHmacSha256: string | null;
+  restoreBindingIdentityRefSha256: string;
+  restoreBindingRecordHmacSha256: string;
+  runtimeEventIdentityRefSha256: string;
+  runtimeEventRecordHmacSha256: string;
+}
+export interface TenantTelemetryCaptureLineageCapsule extends TenantTelemetryCaptureLineageHeader {
+  scope: typeof TENANT_TELEMETRY_CAPTURE_LINEAGE_SCOPE;
+  protocol: typeof TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL;
+  families: readonly TenantTelemetryCaptureLineageFamilySummary[];
+  ancestors: readonly TenantTelemetryCaptureLineageAncestor[];
+  ancestorRootSha256: string;
+  observedRowCount: number;
+  sourceHighWaterDbMs: number;
+  projectionRootSha256: string;
+  capsuleSha256: string;
+}
 
 /** Fixed SQL projection inventory. No family may be omitted, even when empty.
  * `all_rows` means the whole physical table, not only the selected tenant or
@@ -161,9 +262,7 @@ interface CaptureRestoreSafety {
 }
 const SAFETY = Object.freeze({ executionReady: false, externalAuthorityVerified: false,
   erasureAuthorized: false, allDomainsComplete: false, contentPurgeExecuted: false } as const);
-export interface TenantTelemetryCaptureBackupCheckpoint extends TenantTelemetryCaptureBackupCheckpointHeader, CaptureRestoreSafety {
-  scope: typeof TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE;
-  protocol: typeof TENANT_TELEMETRY_CAPTURE_RESTORE_PROTOCOL;
+interface TenantTelemetryCaptureBackupCheckpointBody extends TenantTelemetryCaptureBackupCheckpointHeader, CaptureRestoreSafety {
   phase: "sealed_before_dump";
   families: readonly TenantTelemetryCaptureCheckpointFamilySummary[];
   observedRowCount: number;
@@ -172,6 +271,16 @@ export interface TenantTelemetryCaptureBackupCheckpoint extends TenantTelemetryC
   projectionRootSha256: string;
   checkpointSha256: string;
 }
+export interface TenantTelemetryCaptureBackupCheckpointV1 extends TenantTelemetryCaptureBackupCheckpointBody {
+  scope: typeof TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE;
+  protocol: typeof TENANT_TELEMETRY_CAPTURE_RESTORE_PROTOCOL;
+}
+export interface TenantTelemetryCaptureBackupCheckpointV2 extends TenantTelemetryCaptureBackupCheckpointBody {
+  scope: typeof TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE;
+  protocol: typeof TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL;
+  lineage: TenantTelemetryCaptureLineageCapsule;
+}
+export type TenantTelemetryCaptureBackupCheckpoint = TenantTelemetryCaptureBackupCheckpointV1 | TenantTelemetryCaptureBackupCheckpointV2;
 /** All values below must be independently read from the exact verified artifact,
  * 0031 binding/reservation and active 0030 run/runtime by the transaction caller.
  * This closed projection does not replace those original validators. */
@@ -300,6 +409,41 @@ export interface TenantTelemetryCaptureOperationRecoveryPermit extends TenantTel
   newReservationAuthorized: boolean;
   newExternalCreateAuthorized: boolean;
   receiptSha256: string;
+}
+/** The original fields stay bound to the genesis checkpoint. The separately
+ * named snapshot fields describe inclusion in THIS authenticated full backup;
+ * a later snapshot must never rewrite P1 or reset its predecessor to null. */
+export interface TenantTelemetryCaptureOperationRecoveryInputV2 extends TenantTelemetryCaptureOperationRecoveryInput {
+  genesisCheckpointSha256: string;
+  snapshotJobState: "queued" | "reserved";
+  snapshotJobEvidenceHmacSha256: string;
+  snapshotReservationReceiptSha256: string | null;
+  snapshotReservationEvidenceHmacSha256: string | null;
+  /** Required for a cross-cutover predecessor, null for a newly issued permit
+   * in the current epoch (which cannot have been in its own earlier backup). */
+  predecessorLineageEvidenceHmacSha256: string | null;
+  reservationAuthorizerLineageEvidenceHmacSha256: string | null;
+}
+export interface TenantTelemetryCaptureOperationRecoveryPermitV2 extends TenantTelemetryCaptureOperationRecoveryInputV2, CaptureRestoreSafety {
+  scope: typeof TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE;
+  protocol: typeof TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL;
+  phase: "leased";
+  sourceKind: "persisted-provider-v2";
+  newReservationAuthorized: boolean;
+  newExternalCreateAuthorized: boolean;
+  receiptSha256: string;
+}
+export type TenantTelemetryCaptureAnyRecoveryPermit = TenantTelemetryCaptureOperationRecoveryPermit | TenantTelemetryCaptureOperationRecoveryPermitV2;
+export interface TenantTelemetryCaptureRecoveryContext {
+  cutover: TenantTelemetryCaptureEpochCutoverReceipt;
+  history: TenantTelemetryCaptureRestoreHistoryReceipt;
+  checkpoint: TenantTelemetryCaptureBackupCheckpoint;
+  leaves: readonly TenantTelemetryCaptureCheckpointLeaf[];
+  lineageLeaves?: readonly TenantTelemetryCaptureLineageLeaf[];
+}
+export interface TenantTelemetryCaptureRecoveryChainRecord {
+  permit: TenantTelemetryCaptureAnyRecoveryPermit;
+  context: TenantTelemetryCaptureRecoveryContext;
 }
 
 export class TenantTelemetryCaptureRestoreIntegrityError extends Error {
@@ -459,6 +603,126 @@ function summarize(leaves: readonly TenantTelemetryCaptureCheckpointLeaf[]): Ten
     return { family, rowCount: rows.length, legacyUnknownCount: unknown, states, sourceHighWaterDbMs: highWater, rootSha256: familyRoot(family, rows) };
   });
 }
+const LINEAGE_HEADER_KEYS = ["backupId", "anchorSha256", "refKeyIdSha256", "sourceRestoreRunId", "sourceCheckpointSha256",
+  "sourceHistoryReceiptSha256", "sourceCaptureCutoverReceiptSha256", "sourceRuntimeEpochSha256", "sourceRuntimeBindingSha256",
+  "sourceRuntimeControlEvidenceSha256", "sourceRuntimeControlGeneration", "sealedAtDbMs"] as const;
+const LINEAGE_KEYS = ["scope", "protocol", ...LINEAGE_HEADER_KEYS, "families", "ancestors", "ancestorRootSha256", "observedRowCount", "sourceHighWaterDbMs",
+  "projectionRootSha256", "capsuleSha256"] as const;
+const LINEAGE_ANCESTOR_KEYS = ["restoreRunId", "checkpointSha256", "historyReceiptSha256", "cutoverReceiptSha256", "runtimeEpochSha256",
+  "runtimeBindingSha256", "runtimeControlGeneration", "checkpointIdentityRefSha256", "checkpointRecordHmacSha256", "historyIdentityRefSha256",
+  "historyRecordHmacSha256", "cutoverIdentityRefSha256", "cutoverRecordHmacSha256", "restoreBindingIdentityRefSha256", "restoreBindingRecordHmacSha256",
+  "runtimeEventIdentityRefSha256", "runtimeEventRecordHmacSha256"] as const;
+function validateLineageAncestors(value: TenantTelemetryCaptureLineageCapsule): void {
+  array(value.ancestors, TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES);
+  requireValue(value.ancestors.length === value.families.find((row) => row.family === "restore_history")?.rowCount);
+  const ids = new Set<string>(); const epochs = new Set<string>(); let previous = "";
+  for (const ancestor of value.ancestors) {
+    closed(ancestor, LINEAGE_ANCESTOR_KEYS); restoreRunId(ancestor.restoreRunId);
+    validateDigests(ancestor, ["cutoverReceiptSha256", "cutoverIdentityRefSha256", "cutoverRecordHmacSha256"]);
+    integer(ancestor.runtimeControlGeneration, 1);
+    requireValue(ancestor.restoreRunId > previous && !ids.has(ancestor.restoreRunId) && !epochs.has(ancestor.runtimeEpochSha256)
+      && (ancestor.cutoverReceiptSha256 === null) === (ancestor.cutoverIdentityRefSha256 === null)
+      && (ancestor.cutoverReceiptSha256 === null) === (ancestor.cutoverRecordHmacSha256 === null));
+    previous = ancestor.restoreRunId; ids.add(ancestor.restoreRunId); epochs.add(ancestor.runtimeEpochSha256);
+  }
+  const source = value.ancestors.find((ancestor) => ancestor.restoreRunId === value.sourceRestoreRunId);
+  requireValue(source && source.checkpointSha256 === value.sourceCheckpointSha256
+    && source.historyReceiptSha256 === value.sourceHistoryReceiptSha256 && source.cutoverReceiptSha256 === value.sourceCaptureCutoverReceiptSha256
+    && source.runtimeEpochSha256 === value.sourceRuntimeEpochSha256 && source.runtimeBindingSha256 === value.sourceRuntimeBindingSha256
+    && source.runtimeControlGeneration <= value.sourceRuntimeControlGeneration
+    && value.ancestorRootSha256 === hash("tenant-telemetry-capture-lineage-ancestors-v1", value.ancestors));
+}
+function validateLineageHeader(value: TenantTelemetryCaptureLineageHeader): void {
+  closed(value, LINEAGE_HEADER_KEYS); backupId(value.backupId); restoreRunId(value.sourceRestoreRunId); validateDigests(value);
+  integer(value.sourceRuntimeControlGeneration, 1); integer(value.sealedAtDbMs);
+}
+export function tenantTelemetryCaptureLineageOpaqueDigest(
+  family: TenantTelemetryCaptureLineageFamily, purpose: "identity" | "record", sourceBytes: Uint8Array, key: Uint8Array,
+): string {
+  requireValue(TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES.includes(family) && (purpose === "identity" || purpose === "record"));
+  requireValue(key instanceof Uint8Array && key.byteLength === 32 && sourceBytes instanceof Uint8Array
+    && sourceBytes.byteLength > 0 && sourceBytes.byteLength <= TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_BYTES);
+  return createHmac("sha256", key).update("agent-service/tenant-telemetry-capture-lineage-ref/v1\0")
+    .update(family).update("\0").update(purpose).update("\0").update(sourceBytes).digest("hex");
+}
+export function validateTenantTelemetryCaptureLineageLeaf(value: TenantTelemetryCaptureLineageLeaf): void {
+  closed(value, ["family", "identityRefSha256", "recordHmacSha256", "sourceHighWaterDbMs"]);
+  requireValue(TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES.includes(value.family));
+  digest(value.identityRefSha256); digest(value.recordHmacSha256); integer(value.sourceHighWaterDbMs);
+}
+function summarizeLineage(leaves: readonly TenantTelemetryCaptureLineageLeaf[]): TenantTelemetryCaptureLineageFamilySummary[] {
+  array(leaves, TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES);
+  const seen = new Set<string>();
+  const grouped = new Map<TenantTelemetryCaptureLineageFamily, TenantTelemetryCaptureLineageLeaf[]>();
+  for (const leaf of leaves) {
+    validateTenantTelemetryCaptureLineageLeaf(leaf);
+    const id = `${leaf.family}:${leaf.identityRefSha256}`; requireValue(!seen.has(id)); seen.add(id);
+    const rows = grouped.get(leaf.family) ?? []; rows.push({ ...leaf }); grouped.set(leaf.family, rows);
+  }
+  return TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES.map((family) => {
+    const rows = (grouped.get(family) ?? []).sort((left, right) => left.identityRefSha256 < right.identityRefSha256 ? -1 : left.identityRefSha256 > right.identityRefSha256 ? 1 : 0);
+    return { family, rowCount: rows.length, sourceHighWaterDbMs: rows.reduce((water, row) => Math.max(water, row.sourceHighWaterDbMs), 0),
+      rootSha256: hash("tenant-telemetry-capture-lineage-family-v1", { family, leaves: rows }) };
+  });
+}
+export function validateTenantTelemetryCaptureLineageCapsule(value: TenantTelemetryCaptureLineageCapsule, key: Uint8Array): void {
+  closed(value, LINEAGE_KEYS); keyMatches(value, key);
+  validateLineageHeader(Object.fromEntries(LINEAGE_HEADER_KEYS.map((name) => [name, value[name]])) as unknown as TenantTelemetryCaptureLineageHeader);
+  requireValue(value.scope === TENANT_TELEMETRY_CAPTURE_LINEAGE_SCOPE && value.protocol === TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL);
+  array(value.families, TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES.length);
+  requireValue(value.families.length === TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES.length);
+  let count = 0; let water = 0;
+  for (const [index, summary] of value.families.entries()) {
+    closed(summary, ["family", "rowCount", "sourceHighWaterDbMs", "rootSha256"]);
+    requireValue(summary.family === TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES[index]);
+    integer(summary.rowCount, 0, TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES); integer(summary.sourceHighWaterDbMs); digest(summary.rootSha256);
+    const empty = hash("tenant-telemetry-capture-lineage-family-v1", { family: summary.family, leaves: [] });
+    requireValue(summary.rowCount === 0 ? summary.sourceHighWaterDbMs === 0 && summary.rootSha256 === empty : summary.rootSha256 !== empty);
+    count += summary.rowCount; water = Math.max(water, summary.sourceHighWaterDbMs);
+  }
+  integer(count, 0, TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES);
+  requireValue(value.observedRowCount === count && value.sourceHighWaterDbMs === water && value.sealedAtDbMs >= water
+    && value.projectionRootSha256 === hash("tenant-telemetry-capture-lineage-projection-v1", value.families));
+  validateLineageAncestors(value);
+  digest(value.capsuleSha256);
+  const { capsuleSha256: ignored, ...body } = value; void ignored;
+  requireValue(value.capsuleSha256 === hash(TENANT_TELEMETRY_CAPTURE_LINEAGE_SCOPE, body));
+}
+export function createTenantTelemetryCaptureLineageCapsule(
+  header: TenantTelemetryCaptureLineageHeader, leaves: readonly TenantTelemetryCaptureLineageLeaf[],
+  ancestors: readonly TenantTelemetryCaptureLineageAncestor[], key: Uint8Array,
+): TenantTelemetryCaptureLineageCapsule {
+  validateLineageHeader(header); keyMatches(header, key);
+  array(ancestors, TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES);
+  for (const ancestor of ancestors) closed(ancestor, LINEAGE_ANCESTOR_KEYS);
+  const stagedAncestors = [...ancestors].map((row) => ({ ...row })).sort((left, right) => left.restoreRunId < right.restoreRunId ? -1 : left.restoreRunId > right.restoreRunId ? 1 : 0);
+  const families = summarizeLineage(leaves);
+  const body = { scope: TENANT_TELEMETRY_CAPTURE_LINEAGE_SCOPE, protocol: TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL,
+    ...header, families, ancestors: stagedAncestors, ancestorRootSha256: hash("tenant-telemetry-capture-lineage-ancestors-v1", stagedAncestors), observedRowCount: leaves.length,
+    sourceHighWaterDbMs: families.reduce((water, row) => Math.max(water, row.sourceHighWaterDbMs), 0),
+    projectionRootSha256: hash("tenant-telemetry-capture-lineage-projection-v1", families) };
+  const result = { ...body, capsuleSha256: hash(body.scope, body) };
+  validateTenantTelemetryCaptureLineageCapsule(result, key);
+  for (const family of families) Object.freeze(family); Object.freeze(families);
+  for (const ancestor of stagedAncestors) Object.freeze(ancestor); Object.freeze(stagedAncestors);
+  return Object.freeze(result);
+}
+export function assertTenantTelemetryCaptureLineageLeaves(
+  capsule: TenantTelemetryCaptureLineageCapsule, leaves: readonly TenantTelemetryCaptureLineageLeaf[], key: Uint8Array,
+): void {
+  validateTenantTelemetryCaptureLineageCapsule(capsule, key);
+  requireValue(canonical(summarizeLineage(leaves)) === canonical(capsule.families));
+  for (const ancestor of capsule.ancestors) for (const [family, identity, evidence] of [
+    ["checkpoint", ancestor.checkpointIdentityRefSha256, ancestor.checkpointRecordHmacSha256],
+    ["restore_history", ancestor.historyIdentityRefSha256, ancestor.historyRecordHmacSha256],
+    ["restore_binding", ancestor.restoreBindingIdentityRefSha256, ancestor.restoreBindingRecordHmacSha256],
+    ["runtime_event", ancestor.runtimeEventIdentityRefSha256, ancestor.runtimeEventRecordHmacSha256],
+    ...(ancestor.cutoverReceiptSha256 === null ? [] : [["epoch_cutover", ancestor.cutoverIdentityRefSha256, ancestor.cutoverRecordHmacSha256]]),
+  ]) {
+    const rows = leaves.filter((row) => row.family === family && row.identityRefSha256 === identity);
+    requireValue(rows.length === 1 && rows[0]!.recordHmacSha256 === evidence);
+  }
+}
 const HEADER_KEYS = ["backupId", "anchorSha256", "anchorCreatedAtDbMs", "controlHighWaterDbMs", "logicalDatabaseNamespaceSha256", "schemaMigrationRootSha256",
   "sourceRuntimeLineageKind", "sourceRuntimeEpochSha256", "sourceRuntimeBindingSha256", "sourceRuntimeControlEvidenceSha256",
   "sourceRuntimeControlGeneration", "sourceHistoryReceiptSha256", "sourceCaptureCutoverReceiptSha256", "originalRuntimeEpochSha256",
@@ -486,8 +750,14 @@ function receiptHash(value: Record<string, unknown>, field: "checkpointSha256" |
 const CHECKPOINT_KEYS = ["scope", "protocol", "phase", ...HEADER_KEYS, "families", "observedRowCount", "legacyUnknownCount",
   "sourceHighWaterDbMs", "projectionRootSha256", ...SAFETY_KEYS, "checkpointSha256"] as const;
 export function validateTenantTelemetryCaptureBackupCheckpoint(value: TenantTelemetryCaptureBackupCheckpoint, key: Uint8Array): void {
-  closed(value, CHECKPOINT_KEYS);
-  requireValue(value.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE && value.protocol === TENANT_TELEMETRY_CAPTURE_RESTORE_PROTOCOL && value.phase === "sealed_before_dump");
+  requireValue(value !== null && typeof value === "object");
+  const scopeDescriptor = Object.getOwnPropertyDescriptor(value, "scope");
+  requireValue(scopeDescriptor && "value" in scopeDescriptor);
+  const v2 = scopeDescriptor.value === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE;
+  closed(value, v2 ? [...CHECKPOINT_KEYS, "lineage"] : CHECKPOINT_KEYS);
+  requireValue((v2 ? value.protocol === TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL
+    : value.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE && value.protocol === TENANT_TELEMETRY_CAPTURE_RESTORE_PROTOCOL)
+    && value.phase === "sealed_before_dump");
   const header = Object.fromEntries(HEADER_KEYS.map((name) => [name, value[name]])) as unknown as TenantTelemetryCaptureBackupCheckpointHeader;
   validateHeader(header); keyMatches(value, key); validateSafety(value);
   array(value.families, TENANT_TELEMETRY_CAPTURE_CHECKPOINT_FAMILIES.length);
@@ -514,10 +784,19 @@ export function validateTenantTelemetryCaptureBackupCheckpoint(value: TenantTele
   digest(value.projectionRootSha256); digest(value.checkpointSha256);
   requireValue(value.projectionRootSha256 === hash("tenant-telemetry-capture-checkpoint-projection-v1", value.families)
     && value.checkpointSha256 === receiptHash(value, "checkpointSha256"));
+  if (value.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) {
+    validateTenantTelemetryCaptureLineageCapsule(value.lineage, key);
+    requireValue(value.sourceRuntimeLineageKind === "restore");
+    for (const field of ["backupId", "anchorSha256", "refKeyIdSha256", "sourceHistoryReceiptSha256", "sourceCaptureCutoverReceiptSha256",
+      "sourceRuntimeEpochSha256", "sourceRuntimeBindingSha256", "sourceRuntimeControlEvidenceSha256", "sourceRuntimeControlGeneration"] as const) {
+      requireValue(value[field] === value.lineage[field]);
+    }
+    requireValue(value.sealedAtDbMs >= value.lineage.sealedAtDbMs && value.controlHighWaterDbMs >= value.lineage.sourceHighWaterDbMs);
+  }
 }
 export function createTenantTelemetryCaptureBackupCheckpoint(
   header: TenantTelemetryCaptureBackupCheckpointHeader, leaves: readonly TenantTelemetryCaptureCheckpointLeaf[], key: Uint8Array,
-): TenantTelemetryCaptureBackupCheckpoint {
+): TenantTelemetryCaptureBackupCheckpointV1 {
   validateHeader(header); keyMatches(header, key); const families = summarize(leaves);
   const body = { scope: TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE, protocol: TENANT_TELEMETRY_CAPTURE_RESTORE_PROTOCOL,
     phase: "sealed_before_dump" as const, ...header, families,
@@ -528,6 +807,18 @@ export function createTenantTelemetryCaptureBackupCheckpoint(
   validateTenantTelemetryCaptureBackupCheckpoint(result, key);
   for (const summary of families) { Object.freeze(summary.states); Object.freeze(summary); } Object.freeze(families);
   return Object.freeze(result);
+}
+export function createTenantTelemetryCaptureBackupCheckpointV2(
+  header: TenantTelemetryCaptureBackupCheckpointHeader, leaves: readonly TenantTelemetryCaptureCheckpointLeaf[],
+  lineage: TenantTelemetryCaptureLineageCapsule, lineageLeaves: readonly TenantTelemetryCaptureLineageLeaf[], key: Uint8Array,
+): TenantTelemetryCaptureBackupCheckpointV2 {
+  assertTenantTelemetryCaptureLineageLeaves(lineage, lineageLeaves, key);
+  const original = createTenantTelemetryCaptureBackupCheckpoint(header, leaves, key);
+  const { checkpointSha256: ignored, ...base } = original; void ignored;
+  const body = { ...base, scope: TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE,
+    protocol: TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL, lineage };
+  const result = { ...body, checkpointSha256: hash(body.scope, body) };
+  validateTenantTelemetryCaptureBackupCheckpoint(result, key); return Object.freeze(result);
 }
 export function assertTenantTelemetryCaptureCheckpointLeaves(
   checkpoint: TenantTelemetryCaptureBackupCheckpoint, leaves: readonly TenantTelemetryCaptureCheckpointLeaf[], key: Uint8Array,
@@ -544,7 +835,12 @@ export function assertTenantTelemetryCaptureBackupCheckpointUnchanged(
   requireValue(after.sealedAtDbMs >= before.sealedAtDbMs);
   const { sealedAtDbMs: a, checkpointSha256: b, ...left } = before; void a; void b;
   const { sealedAtDbMs: c, checkpointSha256: d, ...right } = after; void c; void d;
-  requireValue(canonical(left) === canonical(right));
+  const comparable = (value: typeof left) => {
+    if (value.scope !== TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) return value;
+    const { sealedAtDbMs: observed, capsuleSha256: digest, ...lineage } = value.lineage; void observed; void digest;
+    return { ...value, lineage };
+  };
+  requireValue(canonical(comparable(left)) === canonical(comparable(right)));
 }
 const ORIGINAL_KEYS = ["originalRuntimeEpochSha256", "originalRuntimeBindingSha256", "originalCaptureActivationReceiptSha256", "refKeyIdSha256",
   "lifecycleControlEvidenceSha256", "captureControlEvidenceSha256", "logsTargetSha256", "logsTargetReceiptSha256"] as const;
@@ -795,6 +1091,166 @@ export function createTenantTelemetryCaptureOperationRecoveryPermit(
   const result = { ...body, receiptSha256: hash(body.scope, body) };
   validateTenantTelemetryCaptureOperationRecoveryPermit(result, cutover, history, checkpoint, originalLeaves, key, links); return Object.freeze(result);
 }
+const RECOVERY_V2_FIELDS = ["genesisCheckpointSha256", "snapshotJobState", "snapshotJobEvidenceHmacSha256",
+  "snapshotReservationReceiptSha256", "snapshotReservationEvidenceHmacSha256", "predecessorLineageEvidenceHmacSha256",
+  "reservationAuthorizerLineageEvidenceHmacSha256"] as const;
+const RECOVERY_V2_INPUT_KEYS = [...RECOVERY_INPUT_KEYS, ...RECOVERY_V2_FIELDS] as const;
+const RECOVERY_V2_KEYS = [...RECOVERY_KEYS, ...RECOVERY_V2_FIELDS] as const;
+function validateRecoveryInputV2(value: TenantTelemetryCaptureOperationRecoveryInputV2): void {
+  closed(value, RECOVERY_V2_INPUT_KEYS);
+  validateRecoveryInput(Object.fromEntries(RECOVERY_INPUT_KEYS.map((field) => [field, value[field]])) as unknown as TenantTelemetryCaptureOperationRecoveryInput);
+  digest(value.genesisCheckpointSha256); digest(value.snapshotJobEvidenceHmacSha256);
+  requireValue(value.snapshotJobState === "queued" || value.snapshotJobState === "reserved");
+  for (const field of ["snapshotReservationReceiptSha256", "snapshotReservationEvidenceHmacSha256", "predecessorLineageEvidenceHmacSha256", "reservationAuthorizerLineageEvidenceHmacSha256"] as const) {
+    if (value[field] !== null) digest(value[field]);
+  }
+  requireValue((value.snapshotReservationReceiptSha256 === null) === (value.snapshotReservationEvidenceHmacSha256 === null)
+    && (value.snapshotJobState === "reserved") === (value.snapshotReservationReceiptSha256 !== null));
+}
+export function tenantTelemetryCaptureLineagePermitIdentitySha256(receiptSha256: string, key: Uint8Array, version: 1 | 2 = 1): string {
+  digest(receiptSha256);
+  requireValue(version === 1 || version === 2);
+  return tenantTelemetryCaptureLineageOpaqueDigest(version === 1 ? "recovery_permit" : "recovery_permit_v2", "identity", Buffer.from(receiptSha256, "ascii"), key);
+}
+function validateRecoveryContext(context: TenantTelemetryCaptureRecoveryContext, key: Uint8Array): void {
+  requireValue(context !== null && typeof context === "object");
+  closed(context, ["cutover", "history", "checkpoint", "leaves", ...(Object.hasOwn(context, "lineageLeaves") ? ["lineageLeaves"] : [])]);
+  validateTenantTelemetryCaptureEpochCutoverReceipt(context.cutover, context.history, context.checkpoint, key);
+  assertTenantTelemetryCaptureCheckpointLeaves(context.checkpoint, context.leaves, key);
+  if (context.checkpoint.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) {
+    requireValue(context.lineageLeaves !== undefined);
+    assertTenantTelemetryCaptureLineageLeaves(context.checkpoint.lineage, context.lineageLeaves, key);
+  } else requireValue(context.lineageLeaves === undefined);
+}
+function validateRecoveryV2One(value: TenantTelemetryCaptureOperationRecoveryPermitV2,
+  context: TenantTelemetryCaptureRecoveryContext, key: Uint8Array, ancestors: readonly TenantTelemetryCaptureRecoveryChainRecord[]): void {
+  closed(value, RECOVERY_V2_KEYS); validateSafety(value); validateRecoveryContext(context, key);
+  validateRecoveryInputV2(Object.fromEntries(RECOVERY_V2_INPUT_KEYS.map((field) => [field, value[field]])) as unknown as TenantTelemetryCaptureOperationRecoveryInputV2);
+  const checkpoint = context.checkpoint;
+  requireValue(checkpoint.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE);
+  if (checkpoint.scope !== TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) return reject();
+  requireValue(value.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE && value.protocol === TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL
+    && value.phase === "leased" && value.sourceKind === "persisted-provider-v2"
+    && value.newReservationAuthorized === (value.reservationAtIssue.origin === "none")
+    && value.newExternalCreateAuthorized === (value.recoveryMode !== "reserved_ack_only")
+    && value.cutoverReceiptSha256 === context.cutover.receiptSha256 && value.historyReceiptSha256 === context.history.receiptSha256
+    && value.checkpointSha256 === checkpoint.checkpointSha256 && value.restoreRunId === context.cutover.restoreRunId
+    && value.runtimeEpochSha256 === context.cutover.runtimeEpochSha256 && value.issuedAtDbMs >= context.cutover.activatedAtDbMs);
+  const previousRecord = ancestors.at(-1);
+  const previous = previousRecord?.permit ?? null;
+  const assertAncestor = (record: TenantTelemetryCaptureRecoveryChainRecord, evidence: string | null): void => {
+    const selected = record.permit;
+    const ancestor = checkpoint.lineage.ancestors.find((row) => row.restoreRunId === selected.restoreRunId);
+    requireValue(ancestor && ancestor.runtimeEpochSha256 === selected.runtimeEpochSha256
+      && ancestor.cutoverReceiptSha256 === selected.cutoverReceiptSha256 && ancestor.historyReceiptSha256 === selected.historyReceiptSha256
+      && ancestor.checkpointSha256 === selected.checkpointSha256
+      && ancestor.runtimeBindingSha256 === record.context.cutover.runtimeBindingSha256
+      && ancestor.runtimeControlGeneration === record.context.history.runtimeControlGeneration);
+    const version = selected.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE ? 2 : 1;
+    const rows = context.lineageLeaves!.filter((row) => row.family === (version === 1 ? "recovery_permit" : "recovery_permit_v2")
+      && row.identityRefSha256 === tenantTelemetryCaptureLineagePermitIdentitySha256(selected.receiptSha256, key, version));
+    requireValue(evidence !== null && rows.length === 1 && rows[0]!.recordHmacSha256 === evidence);
+  };
+  requireValue((previous === null) === (value.previousPermitReceiptSha256 === null));
+  const first = ancestors[0];
+  const genesis = first ? first.permit.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE
+    ? first.permit.genesisCheckpointSha256 : first.context.checkpoint.checkpointSha256 : checkpoint.checkpointSha256;
+  requireValue(value.genesisCheckpointSha256 === genesis);
+  const origin = ancestors.find((record) => record.context.checkpoint.checkpointSha256 === genesis)?.context ?? context;
+  requireValue(origin.checkpoint.checkpointSha256 === genesis);
+  const leaf = (selected: TenantTelemetryCaptureRecoveryContext, family: TenantTelemetryCaptureCheckpointFamily,
+    evidence: string | null, state: TenantTelemetryCaptureCheckpointState): void => {
+    const identity = tenantTelemetryCaptureCheckpointOperationIdentity(family, value.writeOperationSha256, key);
+    const rows = selected.leaves.filter((row) => row.family === family && row.identityRefSha256 === identity);
+    if (evidence === null) { requireValue(rows.length === 0); return; }
+    requireValue(rows.length === 1 && rows[0]!.recordHmacSha256 === evidence && rows[0]!.knowledge === "validated_projection" && rows[0]!.state === state);
+  };
+  leaf(origin, "write_job", value.originalJobEvidenceHmacSha256, value.originalJobState);
+  leaf(origin, "write_reservation", value.originalReservationEvidenceHmacSha256, "reserved");
+  for (const [family, evidence, state] of [
+    ["write_payload", value.originalPayloadEvidenceHmacSha256, "spooled"],
+    ["membership", value.originalMembershipEvidenceHmacSha256, "record"],
+    ["provider_source_binding", value.originalSourceBindingEvidenceHmacSha256, "record"],
+    ["provider_failure_commit", value.originalFailureEvidenceHmacSha256, "record"],
+  ] as const) { leaf(origin, family, evidence, state); leaf(context, family, evidence, state); }
+  leaf(origin, "write_ack", null, "record"); leaf(context, "write_ack", null, "record");
+  leaf(context, "write_job", value.snapshotJobEvidenceHmacSha256, value.snapshotJobState);
+  leaf(context, "write_reservation", value.snapshotReservationEvidenceHmacSha256, "reserved");
+  if (previous) {
+    requireValue(previous.receiptSha256 === value.previousPermitReceiptSha256 && previous.writeOperationSha256 === value.writeOperationSha256
+      && previous.newClaimAttempt === value.previousClaimAttempt && previous.issuedAtDbMs <= value.issuedAtDbMs);
+    for (const field of ["writeOperationSha256", "tenantRefSha256", "ownerRefSha256", "sourceSessionRefSha256", "sourceTurnRefSha256", "sourceItemRefSha256",
+      "sourceStepIndex", "inventorySha256", "payloadSha256", "manifestSha256", "membershipSha256", "sourceBindingReceiptSha256", "failureCommitReceiptSha256",
+      "originalJobState", "originalJobEvidenceHmacSha256", "originalJobDescriptorSha256", "originalPayloadEvidenceHmacSha256", "originalMembershipEvidenceHmacSha256",
+      "originalSourceBindingEvidenceHmacSha256", "originalFailureEvidenceHmacSha256", "originalReservationReceiptSha256", "originalReservationEvidenceHmacSha256",
+      "originalReservationClaimAttempt", "originalReservationClaimTokenSha256"] as const) requireValue(value[field] === previous[field]);
+    if (previous.cutoverReceiptSha256 !== value.cutoverReceiptSha256) {
+      assertAncestor(previousRecord!, value.predecessorLineageEvidenceHmacSha256);
+    } else {
+      requireValue(value.predecessorLineageEvidenceHmacSha256 === null && previous.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE);
+      if (previous.scope !== TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE) return reject();
+      for (const field of ["genesisCheckpointSha256", "snapshotJobState", "snapshotJobEvidenceHmacSha256",
+        "snapshotReservationReceiptSha256", "snapshotReservationEvidenceHmacSha256"] as const) requireValue(value[field] === previous[field]);
+    }
+    if (previous.reservationAtIssue.origin !== "none") requireValue(canonical(value.reservationAtIssue) === canonical(previous.reservationAtIssue));
+  } else {
+    requireValue(value.predecessorLineageEvidenceHmacSha256 === null && value.originalJobState === value.snapshotJobState
+      && value.originalJobEvidenceHmacSha256 === value.snapshotJobEvidenceHmacSha256
+      && value.originalReservationReceiptSha256 === value.snapshotReservationReceiptSha256
+      && value.originalReservationEvidenceHmacSha256 === value.snapshotReservationEvidenceHmacSha256);
+  }
+  const reservation = value.reservationAtIssue;
+  if (reservation.origin === "recovery-permit") {
+    const authorizerRecord = ancestors.find((record) => record.permit.receiptSha256 === reservation.authorizingPermitReceiptSha256);
+    const authorizer = authorizerRecord?.permit;
+    requireValue(authorizer && authorizer.newReservationAuthorized && authorizer.writeOperationSha256 === value.writeOperationSha256
+      && authorizer.originalJobDescriptorSha256 === value.originalJobDescriptorSha256
+      && authorizer.newClaimAttempt === reservation.startedClaimAttempt && authorizer.newClaimTokenSha256 === reservation.startedClaimTokenSha256
+      && authorizer.issuedAtDbMs <= reservation.startedAtDbMs && reservation.startedAtDbMs < authorizer.claimLeaseCeilingMs
+      && authorizer.newClaimAttempt <= value.previousClaimAttempt);
+    if (authorizer.cutoverReceiptSha256 !== value.cutoverReceiptSha256) assertAncestor(authorizerRecord!, value.reservationAuthorizerLineageEvidenceHmacSha256);
+    else requireValue(value.reservationAuthorizerLineageEvidenceHmacSha256 === null);
+  } else requireValue(value.reservationAuthorizerLineageEvidenceHmacSha256 === null);
+  if (value.snapshotReservationReceiptSha256 !== null) requireValue(reservation.origin !== "none"
+    && reservation.receiptSha256 === value.snapshotReservationReceiptSha256);
+  requireValue(value.receiptSha256 === receiptHash(value, "receiptSha256"));
+}
+function validateRecoveryAncestors(records: readonly TenantTelemetryCaptureRecoveryChainRecord[], operation: string, key: Uint8Array): void {
+  array(records, TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES);
+  const verified: TenantTelemetryCaptureRecoveryChainRecord[] = [];
+  for (const record of records) {
+    closed(record, ["permit", "context"]); validateRecoveryContext(record.context, key);
+    requireValue(record.permit.writeOperationSha256 === operation);
+    if (record.permit.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE) validateRecoveryV2One(record.permit, record.context, key, verified);
+    else {
+      const previous = verified.at(-1)?.permit ?? null;
+      if (previous !== null && previous.scope !== TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE) return reject();
+      const reservation = record.permit.reservationAtIssue;
+      const authorizer = reservation.origin === "recovery-permit"
+        ? verified.find((row) => row.permit.receiptSha256 === reservation.authorizingPermitReceiptSha256)?.permit ?? null : null;
+      if (authorizer !== null && authorizer.scope !== TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE) return reject();
+      validateTenantTelemetryCaptureOperationRecoveryPermit(record.permit, record.context.cutover, record.context.history,
+        record.context.checkpoint, record.context.leaves, key, { previousPermit: previous, reservationAuthorizer: authorizer });
+    }
+    verified.push(record);
+  }
+}
+/** Every ancestor context is supplied from actual independently audited stored
+ * rows, not from an embedded self-authenticating receipt. This verifies the
+ * closed cross-context chain and authenticated snapshot inclusion, not SQL. */
+export function validateTenantTelemetryCaptureOperationRecoveryPermitV2(value: TenantTelemetryCaptureOperationRecoveryPermitV2,
+  context: TenantTelemetryCaptureRecoveryContext, key: Uint8Array, ancestors: readonly TenantTelemetryCaptureRecoveryChainRecord[]): void {
+  validateRecoveryAncestors(ancestors, value.writeOperationSha256, key); validateRecoveryV2One(value, context, key, ancestors);
+}
+export function createTenantTelemetryCaptureOperationRecoveryPermitV2(input: TenantTelemetryCaptureOperationRecoveryInputV2,
+  context: TenantTelemetryCaptureRecoveryContext, key: Uint8Array, ancestors: readonly TenantTelemetryCaptureRecoveryChainRecord[]): TenantTelemetryCaptureOperationRecoveryPermitV2 {
+  validateRecoveryInputV2(input);
+  const body = { scope: TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE, protocol: TENANT_TELEMETRY_CAPTURE_RESTORE_V2_PROTOCOL,
+    phase: "leased" as const, ...input, sourceKind: "persisted-provider-v2" as const,
+    newReservationAuthorized: input.reservationAtIssue.origin === "none", newExternalCreateAuthorized: input.recoveryMode !== "reserved_ack_only", ...SAFETY };
+  const result = { ...body, receiptSha256: hash(body.scope, body) };
+  validateTenantTelemetryCaptureOperationRecoveryPermitV2(result, context, key, ancestors); return Object.freeze(result);
+}
 export interface TenantTelemetryCaptureRecoveryCurrentBinding {
   /** Independently reconstructed original source/descriptor/reservation and the
    * atomically installed new claim; never copied from the received permit. */
@@ -803,18 +1259,26 @@ export interface TenantTelemetryCaptureRecoveryCurrentBinding {
   storeDbTimestampMs: number;
 }
 export function assertTenantTelemetryCaptureOperationRecoveryBinding(
-  permit: TenantTelemetryCaptureOperationRecoveryPermit, current: TenantTelemetryCaptureRecoveryCurrentBinding,
+  permit: TenantTelemetryCaptureAnyRecoveryPermit, current: TenantTelemetryCaptureRecoveryCurrentBinding,
 ): void {
-  closed(permit, RECOVERY_KEYS); closed(current, ["input", "claimLeaseUntilMs", "storeDbTimestampMs"]);
-  validateRecoveryInput(current.input); integer(current.storeDbTimestampMs);
-  for (const field of RECOVERY_INPUT_KEYS) requireValue(canonical(permit[field]) === canonical(current.input[field]));
+  closed(current, ["input", "claimLeaseUntilMs", "storeDbTimestampMs"]);
+  if (permit.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE) {
+    closed(permit, RECOVERY_V2_KEYS);
+    const input = current.input as TenantTelemetryCaptureOperationRecoveryInputV2;
+    validateRecoveryInputV2(input);
+    for (const field of RECOVERY_V2_INPUT_KEYS) requireValue(canonical(permit[field]) === canonical(input[field]));
+  } else {
+    closed(permit, RECOVERY_KEYS); validateRecoveryInput(current.input);
+    for (const field of RECOVERY_INPUT_KEYS) requireValue(canonical(permit[field]) === canonical(current.input[field]));
+  }
+  integer(current.storeDbTimestampMs);
   integer(current.claimLeaseUntilMs);
   requireValue(current.claimLeaseUntilMs >= permit.newClaimLeaseUntilMs && current.claimLeaseUntilMs <= permit.claimLeaseCeilingMs
     && current.storeDbTimestampMs >= permit.issuedAtDbMs && current.storeDbTimestampMs < current.claimLeaseUntilMs);
 }
 
 export type TenantTelemetryCaptureRestoreWireRecord = TenantTelemetryCaptureBackupCheckpoint | TenantTelemetryCaptureRestoreHistoryReceipt
-  | TenantTelemetryCaptureEpochCutoverReceipt | TenantTelemetryCaptureOperationRecoveryPermit;
+  | TenantTelemetryCaptureEpochCutoverReceipt | TenantTelemetryCaptureAnyRecoveryPermit;
 export interface TenantTelemetryCaptureRestoreRecordContext {
   key: Uint8Array;
   checkpoint?: TenantTelemetryCaptureBackupCheckpoint;
@@ -823,6 +1287,8 @@ export interface TenantTelemetryCaptureRestoreRecordContext {
   originalLeaves?: readonly TenantTelemetryCaptureCheckpointLeaf[];
   recoveryBinding?: TenantTelemetryCaptureRecoveryCurrentBinding;
   recoveryLinks?: TenantTelemetryCaptureRecoveryPermitLinks;
+  recoveryChain?: readonly TenantTelemetryCaptureRecoveryChainRecord[];
+  lineageLeaves?: readonly TenantTelemetryCaptureLineageLeaf[];
   /** Actual immutable 0031/0030 activation projection, never read from the wire
    * being decoded. A later journal-head advancement must be independently
    * checked against the runtime event chain; it does not rewrite this binding. */
@@ -833,10 +1299,10 @@ export function validateTenantTelemetryCaptureRestoreRecord(
 ): asserts value is TenantTelemetryCaptureRestoreWireRecord {
   requireValue(context !== null && typeof context === "object");
   closed(context, Object.keys(context));
-  requireValue(Object.keys(context).every((key) => ["key", "checkpoint", "history", "cutover", "originalLeaves", "activationBinding", "recoveryBinding", "recoveryLinks"].includes(key)));
+  requireValue(Object.keys(context).every((key) => ["key", "checkpoint", "history", "cutover", "originalLeaves", "activationBinding", "recoveryBinding", "recoveryLinks", "recoveryChain", "lineageLeaves"].includes(key)));
   requireValue(value !== null && typeof value === "object" && !Array.isArray(value));
   closed(value, Object.keys(value));
-  if (value.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE) {
+  if (value.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE || value.scope === TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) {
     validateTenantTelemetryCaptureBackupCheckpoint(value as unknown as TenantTelemetryCaptureBackupCheckpoint, context.key); return;
   }
   requireValue(context.checkpoint !== undefined && context.activationBinding !== undefined);
@@ -851,9 +1317,15 @@ export function validateTenantTelemetryCaptureRestoreRecord(
     validateTenantTelemetryCaptureEpochCutoverReceipt(value as unknown as TenantTelemetryCaptureEpochCutoverReceipt,
       context.history, context.checkpoint, context.key); return;
   }
-  requireValue(value.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE && context.cutover !== undefined && context.originalLeaves !== undefined && context.recoveryBinding !== undefined);
-  const permit = value as unknown as TenantTelemetryCaptureOperationRecoveryPermit;
-  validateTenantTelemetryCaptureOperationRecoveryPermit(permit,
+  requireValue((value.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE || value.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE)
+    && context.cutover !== undefined && context.originalLeaves !== undefined && context.recoveryBinding !== undefined);
+  const permit = value as unknown as TenantTelemetryCaptureAnyRecoveryPermit;
+  if (permit.scope === TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE) {
+    requireValue(context.recoveryChain !== undefined);
+    validateTenantTelemetryCaptureOperationRecoveryPermitV2(permit, { cutover: context.cutover, history: context.history,
+      checkpoint: context.checkpoint, leaves: context.originalLeaves,
+      ...(context.lineageLeaves === undefined ? {} : { lineageLeaves: context.lineageLeaves }) }, context.key, context.recoveryChain);
+  } else validateTenantTelemetryCaptureOperationRecoveryPermit(permit,
     context.cutover, context.history, context.checkpoint, context.originalLeaves, context.key, context.recoveryLinks);
   assertTenantTelemetryCaptureOperationRecoveryBinding(permit, context.recoveryBinding);
 }

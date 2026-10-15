@@ -12,6 +12,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "apps/agent-runner/test/cli-entrypoint.test.ts",
   "apps/agent-runner/test/config.test.ts",
   "apps/agent-runner/test/mysql-backup-artifact.unit.test.ts",
+  "apps/agent-runner/test/mysql-backup-artifact-source-observer.test.ts",
   "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts",
   "apps/agent-runner/test/ordinary-session-usage-retention-gate.test.ts",
   "apps/agent-runner/test/ordinary-session-usage-retention.mysql.test.ts",
@@ -24,6 +25,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "apps/agent-runner/test/telemetry-capture-cli.test.ts",
   "apps/agent-runner/test/telemetry-capture-ref-key.test.ts",
   "apps/agent-runner/test/telemetry-capture-wrapper.test.ts",
+  "apps/agent-runner/test/tenant-restore-journal-config.test.ts",
   "apps/agent-runner/test/tenant-redis-purge-gate.test.ts",
   "apps/agent-runner/test/tenant-telemetry-writer-config.test.ts",
   "packages/core/test/erasure-worker.mysql.test.ts",
@@ -95,6 +97,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/store/test/tenant-telemetry-capture-restore-maintenance.memory.test.ts",
   "packages/store/test/tenant-telemetry-capture-restore-maintenance.mysql.test.ts",
   "packages/store/test/tenant-telemetry-capture-epoch-cutover.mysql.test.ts",
+  "packages/store/test/tenant-telemetry-capture-repeat-restore.mysql.test.ts",
   "packages/store/test/tenant-telemetry-disposition-adapter-memory.test.ts",
   "packages/store/test/tenant-telemetry-disposition-grant-v2-memory-fixture.test.ts",
   "packages/store/test/tenant-telemetry-disposition-grant.mysql.test.ts",
@@ -139,6 +142,13 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:mysql-backup-source-observer": [
+    "apps/agent-runner/test/mysql-backup-artifact-source-observer.test.ts",
+    "apps/agent-runner/test/tenant-restore-journal-config.test.ts"
+  ],
+  "test:tenant-telemetry-capture-repeat-restore-mysql": [
+    "packages/store/test/tenant-telemetry-capture-repeat-restore.mysql.test.ts"
+  ],
   "test:tenant-telemetry-capture-restore": [
     "packages/store/test/tenant-telemetry-capture-restore.test.ts",
     "packages/store/test/tenant-telemetry-capture-checkpoint.memory.test.ts",

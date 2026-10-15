@@ -285,7 +285,7 @@ export async function assertSelectedRestoreFreshHeads(context: Context, config: 
 export async function readActivatedSelectedRestore(store: TenantTelemetryCaptureRestoreMaintenance, context: Context,
   verified: VerifiedMySqlBackupArtifact, key: Uint8Array, step: SelectedRestoreStep,
   previous?: TenantRestoreRuntimeControlRecord): Promise<TenantRestoreReplayRunRecord> {
-  if (verified.manifest.version !== 2) fail();
+  if (verified.manifest.version === 1) fail();
   const control = context.control;
   asDurable(() => validateTenantRestoreJournalControlRecord(control));
   if (control.controlGeneration !== 1) fail();
@@ -351,7 +351,7 @@ export async function resolveSelectedRestore(store: TenantTelemetryCaptureRestor
   await readActivatedSelectedRestore(store, context, verified, key, step);
   const history = await step(() => store.getTenantTelemetryCaptureRestoreHistoryReceipt());
   const cutover = await step(() => store.getTenantTelemetryCaptureEpochCutoverReceipt());
-  if (verified.manifest.version !== 2 || !history || !cutover) fail();
+  if (verified.manifest.version === 1 || !history || !cutover) fail();
   const checkpoint = verified.manifest.captureCheckpoint;
   asDurable(() => { validateTenantTelemetryCaptureRestoreHistoryReceipt(history, checkpoint, key);
     validateTenantTelemetryCaptureEpochCutoverReceipt(cutover, history, checkpoint, key); });

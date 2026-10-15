@@ -5,9 +5,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemorySessionStore, MemoryTenantBackupCatalogAdapter, newErasureRequestId, newTenantBackupId,
   tenantErasureRequestHash, tenantRestoreJournalNextRemoteHeadRootSha256,
   EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256, tenantTelemetryWriteAdapterResult,
-  TenantTelemetryCaptureRestoreIntegrityError, type TenantTelemetryCaptureRestoreMaintenanceSelector,
+  tenantTelemetryWriteClaimTokenSha256,
+  TenantTelemetryCaptureRestoreIntegrityError, TenantErasureIntegrityError, type TenantTelemetryCaptureRestoreMaintenanceSelector,
   type TenantTelemetryCaptureRestoreHistoryReceipt } from "../src/index.js";
 import type { TenantTelemetryCaptureOperationRecoveryPermit } from "../src/tenant-telemetry-capture-restore.js";
+import * as CaptureRestore from "../src/tenant-telemetry-capture-restore.js";
+import * as RestoreJournal from "../src/tenant-restore-journal.js";
 import { activateCaptureFixture, captureRefKey, captureStepFixture, uncapturedStepFixture } from "./persisted-provider-capture.fixture.js";
 
 // Actual Memory atomic consumers; journal/catalog/fleet/sink descriptors below
@@ -232,6 +235,260 @@ async function recoveryClaim(f: Awaited<ReturnType<typeof cutoverFixture>>, toke
 }
 const writeAuth = (claim: { tenantId: string; writeOperationSha256: string; claimAttempt: number; claimToken: string }) => ({
   tenantId: claim.tenantId, writeOperationSha256: claim.writeOperationSha256, claimAttempt: claim.claimAttempt, claimToken: claim.claimToken,
+});
+
+function repeatPermits(store: MemorySessionStore): Map<string, CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit> {
+  const value: unknown = Reflect.get(store, "tenantTelemetryCaptureRecoveryPermits");
+  if (!(value instanceof Map)) throw new Error("repeat fixture permit map missing");
+  return value as Map<string, CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit>;
+}
+function checkpointRecords(store: MemorySessionStore) {
+  const value: unknown = Reflect.get(store, "tenantTelemetryCaptureBackupCheckpoints");
+  if (!(value instanceof Map)) throw new Error("repeat fixture checkpoint map missing");
+  return value as Map<string, import("../src/tenant-telemetry-capture-restore-store.js").TenantTelemetryCaptureBackupCheckpointRecord>;
+}
+function importedMemorySnapshot(source: MemorySessionStore) {
+  const target = independentlyConfiguredMemoryState(source, { tenantTelemetryRefKey: captureRefKey,
+    tenantTelemetryPersistedProviderCaptureLocalOnly: true, tenantTelemetryCaptureRestoreLocalOnly: true });
+  for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(source))) {
+    if (descriptor.value instanceof Map || Array.isArray(descriptor.value)) Object.defineProperty(target, name,
+      { ...descriptor, value: structuredClone(descriptor.value) });
+  }
+  return target;
+}
+/** Real Memory protocol calls with an isolated durable-map copy at the dump
+ * point. This is NOT GCM/MySQL/S3 or a proof of stopped processes/external bytes. */
+async function repeatCycle(source: Awaited<ReturnType<typeof cutoverFixture>>) {
+  const old = await source.store.openTenantTelemetryCaptureRestoreMaintenance(source.selector);
+  const resolution = await source.adapter.resolveRestore({ restoreRunId: source.selector.restoreRunId,
+    reservationReceiptSha256: source.selector.reservationReceiptSha256, phase: "activated" });
+  await old.resolveTenantBackupRuntimeReservation(resolution);
+  const facade = await source.store.openTenantTelemetryCaptureBackupSourceMaintenance({ fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
+  for (const forbidden of ["commit", "claimTenantTelemetryWriteJobs", "reserveTenantTelemetryExternalMutation", "completeTenantTelemetryWrite",
+    "activateTenantTelemetryCaptureRestoredEpoch"]) expect(Object.hasOwn(facade, forbidden)).toBe(false);
+  expect(Object.isFrozen(facade)).toBe(true);
+  const control = await facade.getTenantBackupCatalogControl();
+  if (control.state !== "active") throw new Error("repeat fixture catalog inactive");
+  const journal = await facade.getTenantRestoreJournalControl();
+  if (journal.controlGeneration !== 1) throw new Error("repeat fixture journal inactive");
+  const backupId = newTenantBackupId();
+  const anchor = (await facade.createTenantBackupSnapshotAnchor({ backupId, controlEvidenceSha256: control.evidenceSha256 })).value;
+  const captureInput = { backupId, fleetStoppedAck: "fleet-stopped-v1" as const, localOnlyAck: "local-only-v1" as const };
+  const record = must(await facade.sealTenantTelemetryCaptureBackupCheckpoint(captureInput)).value;
+  expect(record.checkpoint.scope).toBe(CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE);
+  await facade.assertTenantTelemetryCaptureBackupCheckpointUnchanged({ ...captureInput, checkpointSha256: record.checkpoint.checkpointSha256 });
+  const target = importedMemorySnapshot(source.store); // Before availability/reservation/run publication.
+  const availability = await source.adapter.publishAvailability({ backupId, anchorSha256: anchor.anchorSha256,
+    sourceSnapshotSha256: sha(`repeat-snapshot-${backupId}`), sourceBackupSha256: sha(`repeat-backup-${backupId}`),
+    artifactManifestSha256: sha(`repeat-manifest-${backupId}`), providerEvidenceSha256: sha(`repeat-provider-${backupId}`),
+    controlEvidenceSha256: control.evidenceSha256, logicalDatabaseNamespaceSha256: journal.logicalDatabaseNamespaceSha256,
+    retentionPolicySha256: control.retentionPolicySha256, retentionUntilDbMs: anchor.retentionUntilDbMs, registeredAtDbMs: anchor.createdAtDbMs });
+  const entry = (await facade.recordTenantBackupCatalogAvailability(availability)).value;
+  const restoreRunId = `restore_${randomUUID()}`, runtimeEpochSha256 = sha(`repeat-runtime-${restoreRunId}`);
+  await facade.preflightTenantRestoreReplayFromBackup({ backupId, restoreRunId, runtimeEpochSha256,
+    captureCheckpointSha256: record.checkpoint.checkpointSha256 });
+  const reservation = await source.adapter.reserveRestore({ backupId, restoreRunId, entrySha256: entry.entrySha256, runtimeEpochSha256 });
+  const prepare = { backupId, restoreRunId, runtimeEpochSha256, controlEvidenceSha256: journal.evidenceSha256,
+    sealedTargets: await facade.getTenantRestoreRuntimeHeads(), reservation, captureCheckpointSha256: record.checkpoint.checkpointSha256 };
+  const sourcePrepared = await facade.prepareTenantRestoreReplayFromBackup(prepare);
+  await target.recordTenantBackupCatalogAvailability(availability);
+  const prepared = await target.prepareTenantRestoreReplayFromBackup(prepare);
+  expect(prepared.value).toEqual(sourcePrepared.value);
+  // The selected operator may inspect/replay this successor's exact source
+  // snapshot, while an ordinary writer must still reject the pending restore.
+  await expect(ordinaryRuntime(target).getTenantTelemetryPersistedProviderCaptureBinding()).rejects.toThrow(TenantTelemetryCaptureRestoreIntegrityError);
+  const selector: TenantTelemetryCaptureRestoreMaintenanceSelector = { backupId, restoreRunId, checkpointSha256: record.checkpoint.checkpointSha256,
+    artifactManifestSha256: entry.artifactManifestSha256, sourceSnapshotSha256: entry.sourceSnapshotSha256, providerEvidenceSha256: entry.providerEvidenceSha256,
+    reservationSha256: prepared.value.reservation.reservationSha256, reservationReceiptSha256: reservation.reservationReceiptSha256,
+    fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" };
+  const maintenance = await target.openTenantTelemetryCaptureRestoreMaintenance(selector);
+  for (const remoteEntry of source.remoteEntries) await maintenance.recordTenantRestoreReplayFence({ restoreRunId, targetOrdinal: 0, remoteEntry });
+  await maintenance.sealTenantRestoreReplay(restoreRunId);
+  const previous = await maintenance.getTenantRestoreRuntimeControl();
+  const runtime = await maintenance.activateTenantRestoreRuntime({ restoreRunId, expectedControlGeneration: previous.controlGeneration });
+  if (runtime.state !== "active") throw new Error("repeat fixture runtime inactive");
+  const input = { expectedRuntimeEpochSha256: runtime.runtimeEpochSha256, configuredFleetRootSha256: sha(`repeat-fleet-${restoreRunId}`),
+    legacyWritersDrainedAck: "legacy-writers-drained-v1" as const, producerReadyAck: "provider-step-error-v2-ready-v1" as const };
+  const cutover = await maintenance.activateTenantTelemetryCaptureRestoredEpoch(input);
+  const proof = must(await target.getTenantTelemetryPersistedProviderCaptureBinding());
+  await old.close(); await facade.close();
+  return { ...source, store: target, selector, record, maintenance, input, cutover, proof };
+}
+
+describe("Memory actual repeated full-backup and exact multi-epoch consumers", () => {
+  it("retains the unique actual fence installation while later runs record exact replays", async () => {
+    const f1 = await cutoverFixture("live");
+    const now = Date.now() + 1_000; vi.spyOn(Date, "now").mockReturnValue(now);
+    const original = must([...f1.store.tenantRestoreFences.values()][0]);
+    const first = [...f1.store.tenantRestoreReplayEntries.values()].filter((entry) => entry.fenceSha256 === original.fenceSha256);
+    expect(first).toHaveLength(1); expect(first[0]!.fenceDisposition).toBe("installed");
+    expect(first[0]!.restoreRunId).toBe(original.restoreRunId);
+    const f2 = await repeatCycle(f1);
+    const all = [...f2.store.tenantRestoreReplayEntries.values()].filter((entry) => entry.fenceSha256 === original.fenceSha256);
+    expect(all.filter((entry) => entry.fenceDisposition === "installed")).toEqual(first);
+    const later = all.filter((entry) => entry.restoreRunId === f2.selector.restoreRunId);
+    expect(later).toHaveLength(1); expect(later[0]!.fenceDisposition).toBe("exact_replay");
+    expect(later[0]!.storeDbTimestampMs).toBeGreaterThanOrEqual(original.installedAtDbMs);
+    expect(f2.store.tenantRestoreFences.get(original.tenantId)).toEqual(original);
+    expect((await f2.maintenance.getTenantRestoreReplayRun(f2.selector.restoreRunId))?.phase).toBe("active");
+    await f2.maintenance.close(); await f1.maintenance.close(); await f1.adapter.close();
+  });
+
+  it("rejects a real fence whose original installed entry was resealed as exact_replay", async () => {
+    const f = await fixture("live");
+    const maintenance = await f.store.openTenantTelemetryCaptureRestoreMaintenance(f.selector);
+    const installed = must(await maintenance.recordTenantRestoreReplayFence({ restoreRunId: f.selector.restoreRunId,
+      targetOrdinal: 0, remoteEntry: must(f.remoteEntries[0]) }));
+    expect(installed.fenceDisposition).toBe("installed");
+    const run = must(await maintenance.getTenantRestoreReplayRun(f.selector.restoreRunId));
+    expect(run.phase).toBe("prepared");
+    const [entryKey] = must([...f.store.tenantRestoreReplayEntries].find(([, entry]) => entry.entrySha256 === installed.entrySha256));
+    const { entrySha256: originalHash, ...body } = installed; void originalHash;
+    const changedBody = { ...body, fenceDisposition: "exact_replay" as const };
+    const changed = { ...changedBody, entrySha256: RestoreJournal.tenantRestoreReplayEntrySha256(changedBody) };
+    RestoreJournal.validateTenantRestoreReplayEntry(changed);
+    f.store.tenantRestoreReplayEntries.set(entryKey, changed);
+    const entries = [...f.store.tenantRestoreReplayEntries.values()].filter((entry) => entry.restoreRunId === run.restoreRunId);
+    const nextRun = { ...run, entryRootSha256: RestoreJournal.tenantRestoreReplayEntryRootSha256(entries) };
+    RestoreJournal.validateTenantRestoreReplayRunRecord(nextRun);
+    f.store.tenantRestoreReplayRuns.set(run.restoreRunId, nextRun);
+    // Both official hashes and the prepared run's complete entry/fence roots
+    // are valid. The missing original installed provenance is the only loss.
+    expect(entries).toHaveLength(1);
+    expect(entries.filter((entry) => entry.fenceDisposition === "installed")).toHaveLength(0);
+    expect(nextRun.fenceRootSha256).toBe(RestoreJournal.tenantRestoreFenceRootSha256([...f.store.tenantRestoreFences.values()]));
+    await expect(maintenance.getTenantRestoreReplayRun(run.restoreRunId)).rejects.toThrow(TenantErasureIntegrityError);
+    await expect(f.store.openTenantTelemetryCaptureRestoreMaintenance(f.selector)).rejects.toThrow(TenantErasureIntegrityError);
+    expect(f.store.tenantRestoreReplayRuns.get(run.restoreRunId)).toEqual(nextRun);
+    await maintenance.close(); await f.adapter.close();
+  });
+
+  it("preserves a live old lease in CP2 and reclaims only after expiry with the original reservation", async () => {
+    const f1 = await cutoverFixture(); let now = Date.now() + 1_000; vi.spyOn(Date, "now").mockImplementation(() => now);
+    const claim1 = await recoveryClaim(f1, "repeat-p1", 1_000);
+    const reservation = must(await f1.store.reserveTenantTelemetryExternalMutation(writeAuth(claim1), "telemetry-s3-object-v1", f1.proof));
+    expect(reservation.receiptSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(reservation.startedClaimAttempt).toBe(claim1.claimAttempt);
+    expect(reservation.startedClaimTokenSha256).toBe(tenantTelemetryWriteClaimTokenSha256(claim1.claimToken));
+    expect(must(f1.store.tenantTelemetryWriteJobs.get(claim1.writeOperationSha256)?.reservation)).toEqual(reservation);
+    const p1 = must(repeatPermits(f1.store).get(claim1.captureRecovery!.permitReceiptSha256));
+    const originalBytes = JSON.stringify([f1.record, p1, reservation]);
+    const f2 = await repeatCycle(f1);
+    expect(await f2.store.claimTenantTelemetryWriteJobs({ limit: 10, leaseMs: 1_000, claimToken: "not-before-old-expiry",
+      adapterProtocol: "telemetry-s3-object-v1", captureMode: "include_v2", freshProof: f2.proof })).toEqual([]);
+    now += 2_000;
+    const claim2 = await recoveryClaim(f2, "repeat-p2", 1_000);
+    const p2 = must(repeatPermits(f2.store).get(claim2.captureRecovery!.permitReceiptSha256));
+    expect(p2).toMatchObject({ scope: CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE,
+      previousPermitReceiptSha256: p1.receiptSha256, originalJobState: "queued", snapshotJobState: "reserved", newReservationAuthorized: false });
+    const reservation2 = must(await f2.store.reserveTenantTelemetryExternalMutation(writeAuth(claim2), "telemetry-s3-object-v1", f2.proof));
+    expect(reservation2).toEqual(reservation);
+    expect(await f2.store.completeTenantTelemetryWrite(writeAuth(claim2), tenantTelemetryWriteAdapterResult("telemetry-s3-object-v1",
+      { writeOperationSha256: claim2.writeOperationSha256, target: claim2.target, inventory: claim2.inventory, payload: claim2.payload }, "already_present", true), f2.proof)).not.toBeNull();
+    expect(JSON.stringify([must(await f2.store.getTenantTelemetryCaptureBackupCheckpoint(f1.selector.backupId)),
+      must(repeatPermits(f2.store).get(p1.receiptSha256)),
+      must(f2.store.tenantTelemetryWriteJobs.get(claim2.writeOperationSha256)?.reservation)])).toBe(originalBytes);
+    const cold = ordinaryRuntime(f2.store);
+    expect(await cold.getTenantTelemetryPersistedProviderCaptureBinding()).toEqual(f2.proof);
+    await f2.maintenance.close(); await f1.maintenance.close(); await f1.adapter.close();
+  });
+
+  it.each([false, true])("keeps P1→P2→P3 or an explicitly proved skip-hop (skip=%s) without resetting genesis", async (skip) => {
+    const f1 = await cutoverFixture(); let now = Date.now() + 1_000; vi.spyOn(Date, "now").mockImplementation(() => now);
+    const claim1 = await recoveryClaim(f1, "three-p1", 1_000);
+    const reservation = must(await f1.store.reserveTenantTelemetryExternalMutation(writeAuth(claim1), "telemetry-s3-object-v1", f1.proof));
+    expect(reservation.receiptSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(reservation.startedClaimAttempt).toBe(claim1.claimAttempt);
+    expect(reservation.startedClaimTokenSha256).toBe(tenantTelemetryWriteClaimTokenSha256(claim1.claimToken));
+    expect(must(f1.store.tenantTelemetryWriteJobs.get(claim1.writeOperationSha256)?.reservation)).toEqual(reservation);
+    const p1 = must(repeatPermits(f1.store).get(claim1.captureRecovery!.permitReceiptSha256));
+    const originalBytes = JSON.stringify([f1.record, p1, reservation]);
+    const f2 = await repeatCycle(f1); now += 2_000;
+    const claim2 = skip ? null : await recoveryClaim(f2, "three-p2", 1_000);
+    const p2 = claim2 ? must(repeatPermits(f2.store).get(claim2.captureRecovery!.permitReceiptSha256)) : null;
+    const reservation2 = claim2
+      ? must(await f2.store.reserveTenantTelemetryExternalMutation(writeAuth(claim2), "telemetry-s3-object-v1", f2.proof))
+      : must(f2.store.tenantTelemetryWriteJobs.get(claim1.writeOperationSha256)?.reservation);
+    expect(reservation2).toEqual(reservation);
+    const f3 = await repeatCycle(f2); now += 2_000;
+    const claim3 = await recoveryClaim(f3, "three-p3", 1_000);
+    const p3 = must(repeatPermits(f3.store).get(claim3.captureRecovery!.permitReceiptSha256));
+    expect(p3).toMatchObject({ scope: CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE,
+      previousPermitReceiptSha256: p2?.receiptSha256 ?? p1.receiptSha256, genesisCheckpointSha256: f1.record.checkpoint.checkpointSha256,
+      originalJobDescriptorSha256: p1.originalJobDescriptorSha256, newReservationAuthorized: false });
+    const reservation3 = must(await f3.store.reserveTenantTelemetryExternalMutation(writeAuth(claim3), "telemetry-s3-object-v1", f3.proof));
+    expect(reservation3).toEqual(reservation);
+    expect(repeatPermits(f3.store).size).toBe(skip ? 2 : 3);
+    expect(await f3.store.getTenantTelemetryCaptureBackupCheckpoint(f1.selector.backupId)).toEqual(f1.record);
+    expect(await f3.store.getTenantTelemetryCaptureBackupCheckpoint(f2.selector.backupId)).toEqual(f2.record);
+    expect(JSON.stringify([must(await f3.store.getTenantTelemetryCaptureBackupCheckpoint(f1.selector.backupId)),
+      must(repeatPermits(f3.store).get(p1.receiptSha256)),
+      must(f3.store.tenantTelemetryWriteJobs.get(claim3.writeOperationSha256)?.reservation)])).toBe(originalBytes);
+    await f3.maintenance.close(); await f2.maintenance.close(); await f1.maintenance.close(); await f1.adapter.close();
+  });
+
+  it("uses CP2 as genesis for a new restore1 failure while preserving old written P1", async () => {
+    const f1 = await cutoverFixture(); let now = Date.now() + 1_000; vi.spyOn(Date, "now").mockImplementation(() => now);
+    const claim1 = await recoveryClaim(f1, "written-p1", 1_000);
+    await f1.store.reserveTenantTelemetryExternalMutation(writeAuth(claim1), "telemetry-s3-object-v1", f1.proof);
+    await f1.store.completeTenantTelemetryWrite(writeAuth(claim1), tenantTelemetryWriteAdapterResult("telemetry-s3-object-v1",
+      { writeOperationSha256: claim1.writeOperationSha256, target: claim1.target, inventory: claim1.inventory, payload: claim1.payload }, "already_present", true), f1.proof);
+    const newer = await captureStepFixture(f1.store, { tenantId: `repeat-new-${randomUUID()}`, userId: "repeat-new-user" });
+    const newCommit = await f1.store.commitPersistedProviderStepFailure(newer.input);
+    await f1.store.commit({ sessionId: newer.session.id, fence: 1, turn: { ...newer.batch.turn!, status: "failed", stopReason: "error", completedAtMs: now },
+      sessionPatch: { status: { type: "idle" } } });
+    const f2 = await repeatCycle(f1); now += 2_000;
+    const claims = await f2.store.claimTenantTelemetryWriteJobs({ limit: 10, leaseMs: 1_000, claimToken: "new-genesis",
+      adapterProtocol: "telemetry-s3-object-v1", captureMode: "include_v2", freshProof: f2.proof });
+    expect(claims.map((row) => row.writeOperationSha256)).toEqual([newCommit.failureCommitReceipt.writeOperationSha256]);
+    const claim = must(claims[0]), permit = must(repeatPermits(f2.store).get(claim.captureRecovery!.permitReceiptSha256));
+    expect(permit).toMatchObject({ genesisCheckpointSha256: f2.record.checkpoint.checkpointSha256, previousPermitReceiptSha256: null,
+      scope: CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE, newReservationAuthorized: true });
+    expect(repeatPermits(f2.store).size).toBe(2); // old written P1 is audited, never reissued.
+    await f2.maintenance.close(); await f1.maintenance.close(); await f1.adapter.close();
+  });
+
+  it.each(["checkpoint", "history", "binding", "permit"] as const)("rejects missing actual ancestor %s without granting a new claim", async (kind) => {
+    const f1 = await cutoverFixture(); let now = Date.now() + 1_000; vi.spyOn(Date, "now").mockImplementation(() => now);
+    const claim = await recoveryClaim(f1, "missing-ancestor-p1", 1_000);
+    await f1.store.reserveTenantTelemetryExternalMutation(writeAuth(claim), "telemetry-s3-object-v1", f1.proof);
+    const f2 = await repeatCycle(f1); now += 2_000;
+    if (kind === "checkpoint") checkpointRecords(f2.store).delete(f1.selector.backupId);
+    else if (kind === "history") histories(f2.store).delete(f1.selector.restoreRunId);
+    else if (kind === "permit") repeatPermits(f2.store).delete(claim.captureRecovery!.permitReceiptSha256);
+    else {
+      const rows: unknown = Reflect.get(f2.store, "tenantTelemetryCaptureRestoreBackupBindings");
+      if (!(rows instanceof Map)) throw new Error("repeat fixture binding map missing"); rows.delete(f1.selector.restoreRunId);
+    }
+    const attempts = f2.store.tenantTelemetryWriteJobs.get(claim.writeOperationSha256)!.attempts;
+    await expect(f2.store.getTenantTelemetryPersistedProviderCaptureBinding()).rejects.toThrow();
+    await expect(f2.store.claimTenantTelemetryWriteJobs({ limit: 10, leaseMs: 1_000, claimToken: "must-not-publish",
+      adapterProtocol: "telemetry-s3-object-v1", captureMode: "include_v2", freshProof: f2.proof })).rejects.toThrow();
+    expect(f2.store.tenantTelemetryWriteJobs.get(claim.writeOperationSha256)!.attempts).toBe(attempts);
+    await f2.maintenance.close(); await f1.maintenance.close(); await f1.adapter.close();
+  });
+
+  it.each(["foreign_run_same_epoch", "foreign_tenant_ref", "orphan_operation"] as const)("rejects self-resealed %s instead of treating an epoch or hash as authority", async (kind) => {
+    const f1 = await cutoverFixture(); let now = Date.now() + 1_000; vi.spyOn(Date, "now").mockImplementation(() => now);
+    const claim = await recoveryClaim(f1, "foreign-ancestor-p1", 1_000);
+    await f1.store.reserveTenantTelemetryExternalMutation(writeAuth(claim), "telemetry-s3-object-v1", f1.proof);
+    const f2 = await repeatCycle(f1); now += 2_000;
+    const rows = repeatPermits(f2.store), original = must(rows.get(claim.captureRecovery!.permitReceiptSha256));
+    const { receiptSha256: oldHash, ...body } = original;
+    const changed = { ...body, ...(kind === "foreign_run_same_epoch" ? { restoreRunId: `restore_${randomUUID()}` }
+      : kind === "foreign_tenant_ref" ? { tenantRefSha256: sha("different-tenant-ref") } : { writeOperationSha256: sha("orphan-operation") }) };
+    const canonical = (value: unknown): string => value === null || typeof value !== "object" ? JSON.stringify(value)
+      : Array.isArray(value) ? `[${value.map(canonical).join(",")}]` : `{${Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+        .map(([key, child]) => `${JSON.stringify(key)}:${canonical(child)}`).join(",")}}`;
+    const replacement = { ...changed, receiptSha256: createHash("sha256").update(original.scope).update("\0").update(canonical(changed)).digest("hex") };
+    rows.delete(oldHash); rows.set(replacement.receiptSha256, replacement);
+    const attempts = f2.store.tenantTelemetryWriteJobs.get(claim.writeOperationSha256)!.attempts;
+    await expect(f2.store.getTenantTelemetryPersistedProviderCaptureBinding()).rejects.toThrow();
+    await expect(f2.store.claimTenantTelemetryWriteJobs({ limit: 10, leaseMs: 1_000, claimToken: "foreign-must-not-publish",
+      adapterProtocol: "telemetry-s3-object-v1", captureMode: "include_v2", freshProof: f2.proof })).rejects.toThrow();
+    expect(f2.store.tenantTelemetryWriteJobs.get(claim.writeOperationSha256)!.attempts).toBe(attempts);
+    await f2.maintenance.close(); await f1.maintenance.close(); await f1.adapter.close();
+  });
 });
 
 describe("Memory restored epoch cutover and actual pending-operation recovery", () => {

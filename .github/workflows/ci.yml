@@ -417,7 +417,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Create isolated historical test database
         run: mysql -h 127.0.0.1 -uroot -e "CREATE DATABASE agent_service_test_history CHARACTER SET utf8mb4;"
-      - name: Historical MySQL migrations (0007 through 0056 + 0043 read compatibility, frozen terminals, no skips)
+      - name: Historical MySQL migrations and frozen binaries (all registered files, no skips)
         env:
           MYSQL_MIGRATION_TEST_URL: mysql://root@127.0.0.1:3306/agent_service_test_history
         run: pnpm run test:migrations
@@ -568,6 +568,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0055_tenant_telemetry_capture_backup_checkpoint.sql'" | grep -Fxq 1
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0056_tenant_telemetry_capture_restore_history.sql'" | grep -Fxq 1
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0057_tenant_telemetry_capture_epoch_cutover.sql'" | grep -Fxq 1
+            mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0058_tenant_telemetry_capture_repeat_restore.sql'" | grep -Fxq 1
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

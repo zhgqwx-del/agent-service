@@ -8,18 +8,24 @@ import {
   tenantRestoreLogicalDatabaseNamespaceSha256,
   tenantRestoreRuntimeEpochSha256,
   createTenantTelemetryCaptureBackupCheckpoint,
+  createTenantTelemetryCaptureBackupCheckpointV2, createTenantTelemetryCaptureLineageCapsule,
+  tenantTelemetryCaptureLineageOpaqueDigest,
   createTenantTelemetryCaptureRestoreHistoryReceipt,
   createTenantTelemetryCaptureEpochCutoverReceipt,
   tenantTelemetryCaptureRestoreRuntimeBindingSha256,
   tenantTelemetryRefKeyIdSha256,
   newErasureRequestId,
   tenantErasureRequestHash,
+  tenantBackupEvictionOperationSha256, tenantBackupEvictionPlanSha256,
   type TenantBackupCatalogAdapter,
   type TenantRestoreJournalAdapter,
   type TenantRestoreJournalTargetDescriptor,
   type TenantTelemetryCaptureRestoreMaintenance,
   type TenantTelemetryCaptureRestoreHistoryReceipt,
   type TenantTelemetryCaptureEpochCutoverReceipt,
+  type TenantTelemetryCaptureBackupSourceMaintenance,
+  type TenantTelemetryCaptureBackupCheckpointHeader, type TenantTelemetryCaptureLineageLeaf,
+  type TenantTelemetryCaptureLineageAncestor,
 } from "@agent-service/store";
 import {
   formatBackupCatalogCliError,
@@ -108,6 +114,33 @@ function artifactEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     BACKUP_MYSQLDUMP_BINARY: "/private/trusted/mysqldump",
     RESTORE_FLEET_STOPPED_ACK: "1",
     ...extra,
+  });
+}
+
+/** Closed orchestration double, NOT a branded/connected MySQL facade. No
+ * SessionStore/writer method is exposed or cast into this restricted surface. */
+function sourceFacadeDouble(source: Awaited<ReturnType<BackupCatalogCliDependencies["connectStore"]>>,
+  beforeUse: () => void = () => {}): TenantTelemetryCaptureBackupSourceMaintenance {
+  const checked = <Args extends unknown[], Result>(operation: (...args: Args) => Promise<Result>) =>
+    async (...args: Args): Promise<Result> => { beforeUse(); return operation(...args); };
+  return Object.freeze({
+    sealTenantTelemetryCaptureBackupCheckpoint: checked(source.sealTenantTelemetryCaptureBackupCheckpoint.bind(source)),
+    getTenantTelemetryCaptureBackupCheckpoint: checked(source.getTenantTelemetryCaptureBackupCheckpoint.bind(source)),
+    assertTenantTelemetryCaptureBackupCheckpointUnchanged: checked(source.assertTenantTelemetryCaptureBackupCheckpointUnchanged.bind(source)),
+    getTenantBackupCatalogControl: checked(source.getTenantBackupCatalogControl.bind(source)),
+    createTenantBackupSnapshotAnchor: checked(source.createTenantBackupSnapshotAnchor.bind(source)),
+    getTenantBackupSnapshotAnchor: checked(source.getTenantBackupSnapshotAnchor.bind(source)),
+    recordTenantBackupCatalogAvailability: checked(source.recordTenantBackupCatalogAvailability.bind(source)),
+    mirrorTenantBackupCatalogEvent: checked(source.mirrorTenantBackupCatalogEvent.bind(source)),
+    getTenantBackupCatalogEntry: checked(source.getTenantBackupCatalogEntry.bind(source)),
+    listRecoverableTenantBackups: checked(source.listRecoverableTenantBackups.bind(source)),
+    preflightTenantRestoreReplayFromBackup: checked(source.preflightTenantRestoreReplayFromBackup.bind(source)),
+    prepareTenantRestoreReplayFromBackup: checked(source.prepareTenantRestoreReplayFromBackup.bind(source)),
+    getTenantRestoreJournalControl: checked(source.getTenantRestoreJournalControl.bind(source)),
+    getTenantRestoreJournalControlTargets: checked(source.getTenantRestoreJournalControlTargets.bind(source)),
+    getTenantRestoreRuntimeControl: checked(source.getTenantRestoreRuntimeControl.bind(source)),
+    getTenantRestoreRuntimeHeads: checked(source.getTenantRestoreRuntimeHeads.bind(source)),
+    getBlobStorageControl: checked(source.getBlobStorageControl.bind(source)), close: source.close.bind(source),
   });
 }
 
@@ -265,6 +298,11 @@ function createHarness(options: HarnessOptions = {}) {
       createJournalAdapters as BackupCatalogCliDependencies["createJournalAdapters"],
     writeLine: (line) => output.push(line),
   };
+  const connectCaptureBackupSourceMaintenance = vi.fn(async (input: Parameters<NonNullable<BackupCatalogCliDependencies["connectCaptureBackupSourceMaintenance"]>>[0]) =>
+    sourceFacadeDouble(await connectStore({ url: input.url, connectionLimit: input.connectionLimit ?? 2, migrationMode: "verify",
+      tenantTelemetryCaptureRestoreLocalOnly: true, tenantTelemetryRefKey: input.tenantTelemetryRefKey,
+      ...(input.operationAbortSignal === undefined ? {} : { operationAbortSignal: input.operationAbortSignal }) })));
+  dependencies.connectCaptureBackupSourceMaintenance = connectCaptureBackupSourceMaintenance;
   return {
     clock,
     store,
@@ -282,6 +320,7 @@ function createHarness(options: HarnessOptions = {}) {
     loadJournalConfig,
     createJournalAdapters,
     dependencies,
+    connectCaptureBackupSourceMaintenance,
   };
 }
 
@@ -316,7 +355,7 @@ async function activateCatalog(state: Harness): Promise<void> {
 
 /** Orchestration only: inactive Memory delegates and partial artifact metadata
  * do NOT prove 0056 source audit, a real GCM FD, MySQL pool or maintenance grant. */
-async function v2MaintenanceHarness() {
+async function v2MaintenanceHarness(version: 1 | 2 | 3 = 2) {
   const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
   await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
   artifacts.operator.close.mockClear(); artifacts.verifiedClose.mockClear(); state.storeClose.mockClear();
@@ -331,18 +370,19 @@ async function v2MaintenanceHarness() {
   state.connectStore.mockImplementation(async (options) => options.url === "mysql://fixture@127.0.0.1:3306/isolated_target" ? targetStore : state.store);
   const checkpointSha256 = sha256("selected-v2-checkpoint");
   artifacts.verify.mockImplementationOnce(async (input) => ({
-    manifest: { version: 2, anchor: input.expectedAnchor!, schemaMigrationRootSha256: input.expectedAnchor!.schemaMigrationRootSha256,
-      captureCheckpoint: { checkpointSha256 } } as never,
+    manifest: { version, scope: `mysql-logical-full-artifact-v${version}`, backupId: input.expectedAnchor!.backupId,
+      anchor: input.expectedAnchor!, schemaMigrationRootSha256: input.expectedAnchor!.schemaMigrationRootSha256,
+      ...(version === 1 ? {} : { captureCheckpoint: { checkpointSha256 } }) } as never,
     evidence: artifacts.evidence, close: artifacts.verifiedClose,
   }));
   const preflightDelegate = state.store.preflightTenantRestoreReplayFromBackup.bind(state.store);
   const prepareDelegate = state.store.prepareTenantRestoreReplayFromBackup.bind(state.store);
   const preflight = vi.spyOn(state.store, "preflightTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
-    expect(input.captureCheckpointSha256).toBe(checkpointSha256);
+    expect(input.captureCheckpointSha256).toBe(version === 1 ? undefined : checkpointSha256);
     const { captureCheckpointSha256: _hash, ...legacy } = input; return preflightDelegate(legacy);
   });
   const prepare = vi.spyOn(state.store, "prepareTenantRestoreReplayFromBackup").mockImplementation(async (input) => {
-    expect(input.captureCheckpointSha256).toBe(checkpointSha256);
+    expect(input.captureCheckpointSha256).toBe(version === 1 ? undefined : checkpointSha256);
     const { captureCheckpointSha256: _hash, ...legacy } = input; return prepareDelegate(legacy);
   });
   const reserve = vi.spyOn(state.catalogAdapter, "reserveRestore");
@@ -383,6 +423,32 @@ async function v2MaintenanceHarness() {
     assertHeldResources, observed, refKey, restoreEnv, targetClose };
 }
 
+/** Cause-specific orchestration fixture. After the real Memory prepare returns,
+ * EVERY source facade operation (except cleanup close) throws. The target uses
+ * its separate facade. This is not a SQL pending-gate or GCM/source-audit proof. */
+async function postPrepareFencedSourceHarness(version: 1 | 2 | 3,
+  afterPrepare?: (prepared: Awaited<ReturnType<TenantTelemetryCaptureBackupSourceMaintenance["prepareTenantRestoreReplayFromBackup"]>>,
+    state: Harness) => Promise<Awaited<ReturnType<TenantTelemetryCaptureBackupSourceMaintenance["prepareTenantRestoreReplayFromBackup"]>>>) {
+  const h = await v2MaintenanceHarness(version);
+  let fenced = false;
+  const useAfterFence = vi.fn(() => {});
+  const base = sourceFacadeDouble(h.state.store, () => {
+    if (fenced) { useAfterFence(); throw new Error("fixture_pending_source_forbids_every_operation"); }
+  });
+  const source = Object.freeze({ ...base,
+    async prepareTenantRestoreReplayFromBackup(input: Parameters<typeof base.prepareTenantRestoreReplayFromBackup>[0]) {
+      const prepared = await base.prepareTenantRestoreReplayFromBackup(input);
+      fenced = true;
+      return afterPrepare ? afterPrepare(prepared, h.state) : prepared;
+    },
+  } satisfies TenantTelemetryCaptureBackupSourceMaintenance);
+  const connect = h.state.connectCaptureBackupSourceMaintenance.getMockImplementation();
+  if (!connect) throw new Error("source_facade_fixture_factory_missing");
+  h.state.connectCaptureBackupSourceMaintenance.mockImplementation((input) => input.url === MYSQL_URL
+    ? Promise.resolve(source) : connect(input));
+  return { ...h, source, useAfterFence, isFenced: () => fenced };
+}
+
 async function createAndPublish(
   state: Harness,
   backupId: string,
@@ -401,7 +467,7 @@ const SELECTED_TARGET_URL = "mysql://fixture@127.0.0.1:3306/existing_selected_ta
  * codec outputs below do NOT prove GCM bytes, active-capture source audit, MySQL
  * bootstrap/locks, a configured stopped fleet, external durability or cutover.
  * The GCM reader/bootstrap/capture facade are deliberately injected stubs. */
-async function selectedContinuationHarness() {
+async function selectedContinuationHarness(version: 2 | 3 = 2) {
   const state = createHarness(); await activateCatalog(state);
   const requestId = newErasureRequestId(), tenantId = "selection-fence-tenant";
   await state.store.createApiKey(tenantId, "selection-key", "selection-not-a-secret");
@@ -426,7 +492,7 @@ async function selectedContinuationHarness() {
     throw new Error("selection fixture control missing");
   }
   const key = Buffer.alloc(32, 0x43), originalBinding = sha256("selection-fixture-original-binding");
-  const checkpoint = createTenantTelemetryCaptureBackupCheckpoint({ backupId: BACKUP_ID_1, anchorSha256: anchor.anchorSha256,
+  const checkpointHeader: TenantTelemetryCaptureBackupCheckpointHeader = { backupId: BACKUP_ID_1, anchorSha256: anchor.anchorSha256,
     anchorCreatedAtDbMs: anchor.createdAtDbMs, controlHighWaterDbMs: state.clock.value,
     logicalDatabaseNamespaceSha256: anchor.logicalDatabaseNamespaceSha256, schemaMigrationRootSha256: anchor.schemaMigrationRootSha256,
     sourceRuntimeLineageKind: "primary", sourceRuntimeEpochSha256: runtime.runtimeEpochSha256,
@@ -439,14 +505,57 @@ async function selectedContinuationHarness() {
     journalControlEvidenceSha256: journal.evidenceSha256, journalTargetRootSha256: journal.targetRootSha256,
     journalHeadRootSha256: runtime.verifiedHeadRootSha256, catalogControlEvidenceSha256: anchor.controlEvidenceSha256,
     catalogHeadSequence: anchor.sourceCatalogSequence, catalogHeadRootSha256: anchor.sourceCatalogEventRootSha256,
-    blobStorageControlEvidenceSha256: blob.evidenceSha256, sealedAtDbMs: state.clock.value }, [], key);
+    blobStorageControlEvidenceSha256: blob.evidenceSha256, sealedAtDbMs: state.clock.value };
+  const checkpoint = createTenantTelemetryCaptureBackupCheckpoint(checkpointHeader, [], key);
+  if (version === 3) {
+    // Synthetic ancestry is deliberately codec-only. The actual store factory
+    // must reject caller-created ancestry; this harness stubs that boundary.
+    checkpointHeader.sourceRuntimeLineageKind = "restore";
+    checkpointHeader.sourceHistoryReceiptSha256 = sha256("synthetic-source-history");
+    checkpointHeader.sourceCaptureCutoverReceiptSha256 = sha256("synthetic-source-cutover");
+    checkpointHeader.originalRuntimeEpochSha256 = sha256("synthetic-genesis-epoch");
+    checkpointHeader.originalRuntimeBindingSha256 = sha256("synthetic-genesis-binding");
+    const families = ["checkpoint", "restore_history", "epoch_cutover", "restore_binding", "runtime_event"] as const;
+    const lineageLeaves: TenantTelemetryCaptureLineageLeaf[] = families.map((family) => ({ family,
+      identityRefSha256: tenantTelemetryCaptureLineageOpaqueDigest(family, "identity", Buffer.from(`synthetic-${family}`), key),
+      recordHmacSha256: tenantTelemetryCaptureLineageOpaqueDigest(family, "record", Buffer.from(`synthetic-record-${family}`), key),
+      sourceHighWaterDbMs: state.clock.value }));
+    const leaf = (family: typeof families[number]) => lineageLeaves.find((row) => row.family === family)!;
+    const ancestor: TenantTelemetryCaptureLineageAncestor = { restoreRunId: "restore_00000000-0000-4000-8000-000000000000",
+      checkpointSha256: sha256("synthetic-source-checkpoint"), historyReceiptSha256: checkpointHeader.sourceHistoryReceiptSha256,
+      cutoverReceiptSha256: checkpointHeader.sourceCaptureCutoverReceiptSha256, runtimeEpochSha256: checkpointHeader.sourceRuntimeEpochSha256,
+      runtimeBindingSha256: checkpointHeader.sourceRuntimeBindingSha256, runtimeControlGeneration: checkpointHeader.sourceRuntimeControlGeneration,
+      checkpointIdentityRefSha256: leaf("checkpoint").identityRefSha256, checkpointRecordHmacSha256: leaf("checkpoint").recordHmacSha256,
+      historyIdentityRefSha256: leaf("restore_history").identityRefSha256, historyRecordHmacSha256: leaf("restore_history").recordHmacSha256,
+      cutoverIdentityRefSha256: leaf("epoch_cutover").identityRefSha256, cutoverRecordHmacSha256: leaf("epoch_cutover").recordHmacSha256,
+      restoreBindingIdentityRefSha256: leaf("restore_binding").identityRefSha256, restoreBindingRecordHmacSha256: leaf("restore_binding").recordHmacSha256,
+      runtimeEventIdentityRefSha256: leaf("runtime_event").identityRefSha256, runtimeEventRecordHmacSha256: leaf("runtime_event").recordHmacSha256 };
+    const lineage = createTenantTelemetryCaptureLineageCapsule({ backupId: BACKUP_ID_1, anchorSha256: anchor.anchorSha256,
+      refKeyIdSha256: checkpointHeader.refKeyIdSha256, sourceRestoreRunId: ancestor.restoreRunId, sourceCheckpointSha256: ancestor.checkpointSha256,
+      sourceHistoryReceiptSha256: ancestor.historyReceiptSha256, sourceCaptureCutoverReceiptSha256: checkpointHeader.sourceCaptureCutoverReceiptSha256,
+      sourceRuntimeEpochSha256: checkpointHeader.sourceRuntimeEpochSha256, sourceRuntimeBindingSha256: checkpointHeader.sourceRuntimeBindingSha256,
+      sourceRuntimeControlEvidenceSha256: checkpointHeader.sourceRuntimeControlEvidenceSha256,
+      sourceRuntimeControlGeneration: checkpointHeader.sourceRuntimeControlGeneration, sealedAtDbMs: state.clock.value }, lineageLeaves, [ancestor], key);
+    // Explicit union instead of asserting a CP2 record into the legacy CP1 type.
+    return finishSelectedContinuationHarness(state, artifacts, anchor, entry, journal, key,
+      createTenantTelemetryCaptureBackupCheckpointV2(checkpointHeader, [], lineage, lineageLeaves, key), version);
+  }
+  return finishSelectedContinuationHarness(state, artifacts, anchor, entry, journal, key, checkpoint, version);
+}
+
+async function finishSelectedContinuationHarness(state: Harness, artifacts: ReturnType<typeof artifactHarness>,
+  anchor: NonNullable<Awaited<ReturnType<Harness["store"]["getTenantBackupSnapshotAnchor"]>>>,
+  entry: NonNullable<Awaited<ReturnType<Harness["store"]["getTenantBackupCatalogEntry"]>>>,
+  journal: Extract<Awaited<ReturnType<Harness["store"]["getTenantRestoreJournalControl"]>>, { controlGeneration: 1 }>,
+  key: Buffer,
+  checkpoint: import("@agent-service/store").TenantTelemetryCaptureBackupCheckpoint, version: 2 | 3) {
   const externalReservation = await state.catalogDelegate.reserveRestore({ backupId: BACKUP_ID_1,
     restoreRunId: RESTORE_RUN_ID, entrySha256: entry.entrySha256, runtimeEpochSha256: tenantRestoreRuntimeEpochSha256(RESTORE_EPOCH_ID) });
   const prepared = await state.store.prepareTenantRestoreReplayFromBackup({ backupId: BACKUP_ID_1, restoreRunId: RESTORE_RUN_ID,
     runtimeEpochSha256: externalReservation.runtimeEpochSha256, controlEvidenceSha256: journal.evidenceSha256,
     sealedTargets: await state.store.getTenantRestoreRuntimeHeads(), reservation: externalReservation });
   type Api = NonNullable<BackupCatalogCliDependencies["artifactOperations"]>;
-  const manifest = { version: 2, scope: "mysql-logical-full-artifact-v2", backupId: BACKUP_ID_1,
+  const manifest = { version, scope: `mysql-logical-full-artifact-v${version}`, backupId: BACKUP_ID_1,
     anchor, schemaMigrationRootSha256: anchor.schemaMigrationRootSha256, captureCheckpoint: checkpoint
   } as Awaited<ReturnType<Api["verifyMySqlBackupArtifact"]>>["manifest"];
   artifacts.verify.mockImplementation(async () => ({ manifest, evidence: artifacts.evidence, close: artifacts.verifiedClose }));
@@ -553,9 +662,9 @@ async function externalAvailability(
   };
 }
 
-describe("authenticated-v2 selected continuation CLI orchestration (not source-audit proof)", () => {
-  it("separates replay, seal, runtime activation and explicit capture cutover without reserve/import/general startup", async () => {
-    const h = await selectedContinuationHarness();
+describe("authenticated capture selected continuation CLI orchestration (not source-audit proof)", () => {
+  it.each([2, 3] as const)("separates ASMYSQL%s replay, seal, runtime activation and explicit capture cutover without reserve/import/general startup", async (version) => {
+    const h = await selectedContinuationHarness(version);
     const reserve = vi.spyOn(h.state.catalogAdapter, "reserveRestore"), prepare = vi.spyOn(h.state.store, "prepareTenantRestoreReplayFromBackup");
     await h.invoke("replay-selected", { SOURCE_BACKUP_SHA256: sha256("caller-hash-must-be-ignored") });
     expect(h.maintenance.recordTenantRestoreReplayFence).toHaveBeenCalledOnce();
@@ -769,17 +878,17 @@ describe("authenticated-v2 selected continuation CLI orchestration (not source-a
   });
 });
 
-describe("explicit authenticated-v2 selected catalog resolution (orchestration doubles only)", () => {
-  const activeSelection = async (capture = true) => {
-    const h = await selectedContinuationHarness();
+describe("explicit authenticated capture selected catalog resolution (orchestration doubles only)", () => {
+  const activeSelection = async (capture = true, version: 2 | 3 = 2) => {
+    const h = await selectedContinuationHarness(version);
     await h.invoke("replay-selected"); await h.invoke("verify-selected"); await h.invoke("activate-selected");
     if (capture) await h.invoke("activate-capture-selected");
     h.maintenance.activateTenantRestoreRuntime.mockClear(); h.maintenance.activateTenantTelemetryCaptureRestoredEpoch.mockClear();
     return h;
   };
 
-  it("independently resolves external CAS then exact local projection under held GCM/target ownership, and replays exactly", async () => {
-    const h = await activeSelection();
+  it.each([2, 3] as const)("independently resolves ASMYSQL%s external CAS then exact local projection under held GCM/target ownership, and replays exactly", async (version) => {
+    const h = await activeSelection(true, version);
     const reserve = vi.spyOn(h.state.catalogAdapter, "reserveRestore");
     const prepare = vi.spyOn(h.state.store, "prepareTenantRestoreReplayFromBackup");
     const scan = vi.spyOn(h.state.catalogAdapter, "scanEvents");
@@ -874,8 +983,8 @@ describe("explicit authenticated-v2 selected catalog resolution (orchestration d
     expect(cas).not.toHaveBeenCalled(); expect(h.maintenance.resolveTenantBackupRuntimeReservation).not.toHaveBeenCalled();
   });
 
-  it("returns ambiguous external response loss and needs an explicit identical retry, without duplicate resolution", async () => {
-    const h = await activeSelection();
+  it.each([2, 3] as const)("returns ASMYSQL%s ambiguous external response loss and needs an explicit identical retry, without duplicate resolution", async (version) => {
+    const h = await activeSelection(true, version);
     const cas = vi.spyOn(h.state.catalogAdapter, "resolveRestore").mockImplementationOnce(async (input) => {
       await h.state.catalogDelegate.resolveRestore(input); throw new Error(RESPONSE_LOSS_MARKER);
     });
@@ -1063,7 +1172,7 @@ describe("backup catalog artifact CLI orchestration", () => {
     expect(publish).not.toHaveBeenCalled(); expect(artifacts.verifiedClose).toHaveBeenCalledOnce();
   });
 
-  it.each([1, 2])("replays already-published v%s exact evidence despite current source/catalog head drift", async (version) => {
+  it.each([1, 2, 3])("replays already-published v%s exact evidence despite current source/catalog head drift", async (version) => {
     const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
     await runBackupCatalogCli(["create-artifact"], artifactEnv(), state.dependencies);
     const publishedBefore = await state.catalogAdapter.inspectAvailability(BACKUP_ID_1);
@@ -1071,7 +1180,7 @@ describe("backup catalog artifact CLI orchestration", () => {
     expect(headBefore.catalogSequence).toBeGreaterThan(0);
     const manifest = (anchor: Parameters<typeof artifacts.create>[0]["anchor"]) => ({ version, anchor,
       schemaMigrationRootSha256: anchor.schemaMigrationRootSha256,
-      ...(version === 2 ? { captureCheckpoint: { checkpointSha256: sha256("historical-checkpoint") } } : {}),
+      ...(version !== 1 ? { captureCheckpoint: { checkpointSha256: sha256("historical-checkpoint") } } : {}),
     } as never);
     // The real producer independently authenticates actual historical SQL leaves;
     // these mocks isolate CLI's exact-replay publication ordering only.
@@ -1084,6 +1193,149 @@ describe("backup catalog artifact CLI orchestration", () => {
     expect(await state.catalogAdapter.inspectAvailability(BACKUP_ID_1)).toEqual(publishedBefore);
     expect(await state.catalogAdapter.readHead()).toEqual(headBefore);
     expect(JSON.parse(state.output.at(-1)!)).toMatchObject({ disposition: "exact_replay", artifactVerified: true, ...artifacts.evidence });
+  });
+
+  it("uses only the closed source-maintenance capability for protected artifact commands, without enabling normal capture writes", async () => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    const rawKey = Buffer.alloc(32, 23); state.dependencies.readRefKey = async () => rawKey;
+    await runBackupCatalogCli(["create-artifact"], artifactEnv({ TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/source-ref-key" }), state.dependencies);
+    expect(state.connectCaptureBackupSourceMaintenance).toHaveBeenCalledOnce();
+    const input = state.connectCaptureBackupSourceMaintenance.mock.calls[0]![0];
+    expect(input).toMatchObject({ url: MYSQL_URL, fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" });
+    expect(input).not.toHaveProperty("tenantTelemetryCaptureLocalOnly");
+    expect(input).not.toHaveProperty("tenantTelemetryCaptureRestoreLocalOnly");
+    const source = artifacts.create.mock.calls[0]![0].captureCheckpointStore;
+    expect(source).not.toBe(state.store); expect(Object.isFrozen(source)).toBe(true);
+    expect(source).not.toHaveProperty("createSession"); expect(source).not.toHaveProperty("claimTenantTelemetryWrites");
+    expect(rawKey).toEqual(Buffer.alloc(32));
+  });
+
+  it("refuses a protected source missing its restricted factory before adapters, operator, seal or import, without ordinary fallback", async () => {
+    const state = createHarness(); await activateCatalog(state); const artifacts = artifactHarness(state);
+    const rawKey = Buffer.alloc(32, 24); state.dependencies.readRefKey = async () => rawKey;
+    delete state.dependencies.connectCaptureBackupSourceMaintenance;
+    state.connectStore.mockClear(); state.createCatalogAdapter.mockClear();
+    const seal = vi.spyOn(state.store, "sealTenantTelemetryCaptureBackupCheckpoint");
+    await expect(runBackupCatalogCli(["create-artifact"], artifactEnv({ TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: "/private/source-ref-key" }), state.dependencies))
+      .rejects.toThrow("invalid_configuration");
+    expect(state.connectStore).not.toHaveBeenCalled(); expect(state.createCatalogAdapter).not.toHaveBeenCalled();
+    expect(artifacts.acquire).not.toHaveBeenCalled(); expect(artifacts.create).not.toHaveBeenCalled();
+    expect(artifacts.imported).not.toHaveBeenCalled(); expect(seal).not.toHaveBeenCalled();
+    expect(rawKey).toEqual(Buffer.alloc(32));
+  });
+
+  it.each([1, 2, 3] as const)("imports ASMYSQL%s after source prepare fences every source read/mirror, using only the complete fresh external chain", async (version) => {
+    const h = await postPrepareFencedSourceHarness(version);
+    const head = vi.spyOn(h.state.catalogAdapter, "readHead"), scan = vi.spyOn(h.state.catalogAdapter, "scanEvents");
+    await expect(runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies)).resolves.toBe(0);
+    expect(h.isFenced()).toBe(true); expect(h.useAfterFence).not.toHaveBeenCalled();
+    expect(h.prepare).toHaveBeenCalledTimes(2); expect(h.artifacts.imported).toHaveBeenCalledOnce();
+    const preparedOrder = h.prepare.mock.invocationCallOrder[0]!, importOrder = h.artifacts.imported.mock.invocationCallOrder[0]!;
+    expect(head.mock.invocationCallOrder.filter((order) => order > preparedOrder && order < importOrder).length).toBe(2);
+    expect(scan.mock.invocationCallOrder.filter((order) => order > preparedOrder && order < importOrder).length).toBeGreaterThan(0);
+    expect(h.artifacts.operator.markRestorePrepared).toHaveBeenCalledOnce();
+    if (version === 1) expect(h.connectMaintenance).not.toHaveBeenCalled();
+    else expect(h.connectMaintenance).toHaveBeenCalledOnce();
+    expect(JSON.parse(h.state.output.at(-1)!)).toMatchObject({ restorePhase: "prepared", runtimeActivated: false });
+  });
+
+  it("rejects a changed final authority head after fenced-source full-chain scan, before import", async () => {
+    const h = await postPrepareFencedSourceHarness(3);
+    // A genuine earlier fixture head, not an invented digest. Only adapter I/O
+    // is stubbed to model a stale final observation; no SQL/S3 claim is made.
+    const stale = await h.state.catalogDelegate.readHead();
+    let postPrepareHeads = 0;
+    vi.spyOn(h.state.catalogAdapter, "readHead").mockImplementation(async () => {
+      if (h.isFenced() && ++postPrepareHeads === 2) return stale;
+      return h.state.catalogDelegate.readHead();
+    });
+    const scan = vi.spyOn(h.state.catalogAdapter, "scanEvents");
+    await expect(runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies)).rejects.toMatchObject({
+      code: "catalog_conflict", restoreBoundary: { reservationMayBeConsumed: true, targetMayContainPartialImport: false },
+    });
+    expect(postPrepareHeads).toBe(2); expect(h.prepare).toHaveBeenCalledOnce();
+    expect(scan.mock.invocationCallOrder.some((order) => order > h.prepare.mock.invocationCallOrder[0]!)).toBe(true);
+    expect(h.useAfterFence).not.toHaveBeenCalled(); expect(h.artifacts.imported).not.toHaveBeenCalled();
+    expect(h.connectMaintenance).not.toHaveBeenCalled(); expect(h.artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+  });
+
+  it("rejects an exact external reservation that differs from the source prepare result, without consulting fenced source", async () => {
+    // Deliberately corrupt only the returned orchestration response. The actual
+    // Memory reservation/chain stay intact; this is NOT a valid DB receipt.
+    const h = await postPrepareFencedSourceHarness(3, async (prepared) => ({ ...prepared, value: {
+      ...prepared.value, reservation: { ...prepared.value.reservation,
+        reservationReceiptSha256: sha256("different-prepare-response-reservation") },
+    } }));
+    await expect(runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies)).rejects.toMatchObject({
+      code: "catalog_conflict", restoreBoundary: { reservationMayBeConsumed: true, targetMayContainPartialImport: false },
+    });
+    expect(h.prepare).toHaveBeenCalledOnce(); expect(h.useAfterFence).not.toHaveBeenCalled();
+    expect(h.artifacts.imported).not.toHaveBeenCalled(); expect(h.connectMaintenance).not.toHaveBeenCalled();
+    expect(h.artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+  });
+
+  it("rejects a post-prepare evicted backup from its complete external chain even though historical availability remains", async () => {
+    const h = await postPrepareFencedSourceHarness(3, async (prepared, state) => {
+      const reservation = prepared.value.reservation;
+      // Only the explicit non-production Memory adapter is advanced here. No
+      // real restore activation, physical deletion or DB authority is forged.
+      await state.catalogDelegate.resolveRestore({ restoreRunId: RESTORE_RUN_ID,
+        reservationReceiptSha256: reservation.reservationReceiptSha256, phase: "activated" });
+      const availability = await state.catalogDelegate.inspectAvailability(BACKUP_ID_1);
+      if (!availability) throw new Error("fixture_availability_missing");
+      const head = await state.catalogDelegate.readHead();
+      const source = { evictionId: EVICTION_ID, backupId: BACKUP_ID_1, anchorSha256: availability.anchorSha256,
+        entrySha256: availability.entrySha256, sourceSnapshotSha256: availability.sourceSnapshotSha256,
+        sourceBackupSha256: availability.sourceBackupSha256, artifactManifestSha256: availability.artifactManifestSha256,
+        providerEvidenceSha256: availability.providerEvidenceSha256, controlEvidenceSha256: availability.controlEvidenceSha256,
+        retentionPolicySha256: availability.retentionPolicySha256, retentionUntilDbMs: availability.retentionUntilDbMs,
+        expectedCatalogSequence: head.catalogSequence, expectedCatalogEventRootSha256: head.catalogEventRootSha256 };
+      const operation = { ...source, evictionOperationSha256: tenantBackupEvictionOperationSha256(source) };
+      await state.catalogDelegate.recordEviction({ plan: { ...operation, planSha256: tenantBackupEvictionPlanSha256(operation) },
+        externalTombstoneSha256: sha256("fixture-only-post-prepare-eviction"), observedAbsent: true });
+      return prepared;
+    });
+    await expect(runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies)).rejects.toMatchObject({
+      code: "catalog_conflict", restoreBoundary: { reservationMayBeConsumed: true, targetMayContainPartialImport: false },
+    });
+    expect(await h.state.catalogDelegate.inspectAvailability(BACKUP_ID_1)).not.toBeNull();
+    expect(h.prepare).toHaveBeenCalledOnce(); expect(h.useAfterFence).not.toHaveBeenCalled();
+    expect(h.artifacts.imported).not.toHaveBeenCalled(); expect(h.connectMaintenance).not.toHaveBeenCalled();
+  });
+
+  it("does not import after another explicit operator resolved the newly reserved external run", async () => {
+    const h = await postPrepareFencedSourceHarness(3, async (prepared, state) => {
+      await state.catalogDelegate.resolveRestore({ restoreRunId: RESTORE_RUN_ID,
+        reservationReceiptSha256: prepared.value.reservation.reservationReceiptSha256, phase: "activated" });
+      return prepared;
+    });
+    await expect(runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies)).rejects.toMatchObject({
+      code: "catalog_conflict", restoreBoundary: { reservationMayBeConsumed: true, targetMayContainPartialImport: false },
+    });
+    expect(h.prepare).toHaveBeenCalledOnce(); expect(h.useAfterFence).not.toHaveBeenCalled();
+    expect(h.artifacts.imported).not.toHaveBeenCalled(); expect(h.connectMaintenance).not.toHaveBeenCalled();
+  });
+
+  it("passes authenticated ASMYSQL3 checkpoint identity through both actual-preflight boundaries and the cold exact-run selector (orchestration only)", async () => {
+    const h = await v2MaintenanceHarness(3);
+    await runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies);
+    expect(h.preflight).toHaveBeenCalledTimes(2); expect(h.prepare).toHaveBeenCalledTimes(2);
+    expect(h.reserve).toHaveBeenCalledTimes(2); expect(h.artifacts.imported).toHaveBeenCalledOnce();
+    expect(h.connectMaintenance.mock.calls[0]![0].selector.checkpointSha256).toBe(h.checkpointSha256);
+    expect(h.targetClose.mock.invocationCallOrder[0]).toBeLessThan(h.connectMaintenance.mock.invocationCallOrder[0]!);
+    expect(JSON.parse(h.state.output.at(-1)!)).toMatchObject({ restorePhase: "prepared", runtimeActivated: false,
+      fenceReplayComplete: false, requiresExplicitReplayAndActivation: true });
+  });
+
+  it("does not reserve or import after the actual operator rejects historical schema support before planned journal (orchestration only)", async () => {
+    const h = await v2MaintenanceHarness(3);
+    h.artifacts.operator.bindRestoreOperation.mockRejectedValueOnce(new MySqlBackupArtifactError("source_migration_mismatch"));
+    await expect(runBackupCatalogCli(["restore-selected"], h.restoreEnv(), h.state.dependencies)).rejects.toThrow();
+    expect(h.artifacts.operator.bindRestoreOperation).toHaveBeenCalledOnce();
+    expect(h.reserve).not.toHaveBeenCalled(); expect(h.preflight).not.toHaveBeenCalled(); expect(h.prepare).not.toHaveBeenCalled();
+    expect(h.artifacts.imported).not.toHaveBeenCalled(); expect(h.connectMaintenance).not.toHaveBeenCalled();
+    expect(h.artifacts.operator.markRestorePrepared).not.toHaveBeenCalled();
+    expect(h.artifacts.operator.close).toHaveBeenCalledOnce(); expect(h.artifacts.verifiedClose).toHaveBeenCalledOnce();
   });
 
   it("does not make historical verify-artifact depend on the current mutable source checkpoint", async () => {

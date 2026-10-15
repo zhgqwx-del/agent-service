@@ -6,6 +6,8 @@ import {
 import {
   createTenantRestoreJournalAdapters,
   loadTenantRestoreJournalConfig,
+  loadTenantRestoreJournalSourceObservationConfig,
+  createTenantRestoreJournalSourceObservationAdapters,
 } from "../src/tenant-restore-journal-config.js";
 
 const base = {
@@ -26,6 +28,39 @@ const base = {
 const localContext = { production: false, store: "mysql" as const };
 
 describe("tenant restore journal runtime configuration", () => {
+  it("keeps source observation epoch separate from the required ordinary/target raw epoch", async () => {
+    const sourceEpoch = "a".repeat(64);
+    const config = loadTenantRestoreJournalSourceObservationConfig({ ...base, RESTORE_JOURNAL_RUNTIME_EPOCH_ID: undefined }, localContext, sourceEpoch)!;
+    const ordinary = loadTenantRestoreJournalConfig(base, localContext)!;
+    expect(config).toMatchObject({ purpose: "backup-source-head-observation-v1", sourceRuntimeEpochSha256: sourceEpoch });
+    expect(config).not.toHaveProperty("runtimeEpochSha256");
+    expect(config.targets).toEqual(ordinary.targets);
+    expect(config.targetRootSha256).toBe(ordinary.targetRootSha256);
+    const target2 = loadTenantRestoreJournalSourceObservationConfig({ ...base, RESTORE_JOURNAL_RUNTIME_EPOCH_ID: "future-target2" }, localContext, sourceEpoch)!;
+    expect(target2).toEqual(config);
+    expect(() => loadTenantRestoreJournalConfig({ ...base, RESTORE_JOURNAL_RUNTIME_EPOCH_ID: undefined }, localContext)).toThrow(/RUNTIME_EPOCH_ID/);
+    const adapters = createTenantRestoreJournalSourceObservationAdapters(config);
+    expect(adapters[0]?.targetSha256).toBe(config.targets[0].descriptor.targetSha256);
+    await Promise.all(adapters.map((adapter) => adapter.close()));
+  });
+
+  it("rejects malformed source digest and preserves all common transport/production safety checks", () => {
+    for (const digest of ["", "a".repeat(63), "A".repeat(64), "not-a-digest"]) {
+      expect(() => loadTenantRestoreJournalSourceObservationConfig(base, localContext, digest)).toThrow(/epoch digest/);
+    }
+    const digest = "a".repeat(64);
+    expect(() => loadTenantRestoreJournalSourceObservationConfig({ ...base, RESTORE_JOURNAL_INDEPENDENT_FAILURE_DOMAIN_ACK: "0" }, localContext, digest)).toThrow(/INDEPENDENT_FAILURE_DOMAIN_ACK/);
+    expect(() => loadTenantRestoreJournalSourceObservationConfig(base, { production: true, store: "mysql" }, digest)).toThrow(/PRIVATE_BUCKET_ACK/);
+    expect(() => loadTenantRestoreJournalSourceObservationConfig(base, { ...localContext, store: "memory" }, digest)).toThrow(/STORE=mysql/);
+    expect(() => loadTenantRestoreJournalSourceObservationConfig(base, { ...localContext, blobS3Bucket: base.RESTORE_JOURNAL_S3_BUCKET }, digest)).toThrow(/distinct from BLOB_S3_BUCKET/);
+  });
+
+  it("keeps source observation dormant and cannot supply a fake purpose to the source adapter assembly", () => {
+    expect(loadTenantRestoreJournalSourceObservationConfig({}, localContext, "a".repeat(64))).toBeUndefined();
+    const config = loadTenantRestoreJournalSourceObservationConfig(base, localContext, "a".repeat(64))!;
+    const invalid = { ...config }; Reflect.set(invalid, "purpose", "runtime");
+    expect(() => createTenantRestoreJournalSourceObservationAdapters(invalid)).toThrow(/purpose/);
+  });
   it("is default-dormant and rejects stray target settings", () => {
     expect(loadTenantRestoreJournalConfig({}, localContext)).toBeUndefined();
     expect(() => loadTenantRestoreJournalConfig({

@@ -88,6 +88,15 @@ export interface TenantRestoreJournalRuntimeConfig {
   }];
 }
 
+/** Read-only source observation, deliberately NOT a runtime/prepare config.
+ * The digest is read from the restricted actual source store, then compared
+ * again on every observation; no raw target2 epoch or placeholder is used. */
+export interface TenantRestoreJournalSourceObservationConfig extends Omit<TenantRestoreJournalRuntimeConfig, "runtimeEpochSha256"> {
+  purpose: "backup-source-head-observation-v1";
+  sourceRuntimeEpochSha256: string;
+}
+type JournalTransportConfig = Omit<TenantRestoreJournalRuntimeConfig, "runtimeEpochSha256">;
+
 export interface LoadTenantRestoreJournalConfigOptions {
   production: boolean;
   store: "memory" | "mysql";
@@ -147,6 +156,30 @@ export function loadTenantRestoreJournalConfig(
   context: LoadTenantRestoreJournalConfigOptions,
 ): TenantRestoreJournalRuntimeConfig | undefined {
   const parsed: ParsedRestoreJournalEnv = RestoreJournalEnv.parse(env);
+  if (parsed.RESTORE_JOURNAL_ADAPTER !== undefined && !parsed.RESTORE_JOURNAL_RUNTIME_EPOCH_ID) {
+    throw new Error("RESTORE_JOURNAL_RUNTIME_EPOCH_ID is required");
+  }
+  const transport = loadJournalTransportConfig(parsed, context, env);
+  if (!transport) return undefined;
+  return { ...transport, runtimeEpochSha256: tenantRestoreRuntimeEpochSha256(parsed.RESTORE_JOURNAL_RUNTIME_EPOCH_ID!) };
+}
+
+export function loadTenantRestoreJournalSourceObservationConfig(
+  env: NodeJS.ProcessEnv,
+  context: LoadTenantRestoreJournalConfigOptions,
+  actualSourceRuntimeEpochSha256: string,
+): TenantRestoreJournalSourceObservationConfig | undefined {
+  if (typeof actualSourceRuntimeEpochSha256 !== "string" || !/^[0-9a-f]{64}$/.test(actualSourceRuntimeEpochSha256)) {
+    throw new Error("Actual source runtime epoch digest is invalid");
+  }
+  const transport = loadJournalTransportConfig(RestoreJournalEnv.parse(env), context, env);
+  return transport && { ...transport, purpose: "backup-source-head-observation-v1", sourceRuntimeEpochSha256: actualSourceRuntimeEpochSha256 };
+}
+
+/** Only transport/target identity is shared. Neither caller can suppress the
+ * other's epoch contract or turn a source observation into activation input. */
+function loadJournalTransportConfig(parsed: ParsedRestoreJournalEnv,
+  context: LoadTenantRestoreJournalConfigOptions, env: NodeJS.ProcessEnv): JournalTransportConfig | undefined {
   if (parsed.RESTORE_JOURNAL_ADAPTER === undefined) {
     if (hasDisabledTargetSetting(env)) {
       throw new Error(
@@ -165,14 +198,12 @@ export function loadTenantRestoreJournalConfig(
     );
   }
   const databaseNamespaceId = parsed.RESTORE_JOURNAL_DATABASE_NAMESPACE_ID;
-  const runtimeEpochId = parsed.RESTORE_JOURNAL_RUNTIME_EPOCH_ID;
   const namespaceId = parsed.RESTORE_JOURNAL_NAMESPACE_ID;
   const failureDomainId = parsed.RESTORE_JOURNAL_FAILURE_DOMAIN_ID;
   const rawBucket = parsed.RESTORE_JOURNAL_S3_BUCKET;
-  if (!databaseNamespaceId || !runtimeEpochId || !namespaceId || !failureDomainId || !rawBucket) {
+  if (!databaseNamespaceId || !namespaceId || !failureDomainId || !rawBucket) {
     throw new Error(
-      "RESTORE_JOURNAL_DATABASE_NAMESPACE_ID, RESTORE_JOURNAL_RUNTIME_EPOCH_ID, "
-        + "RESTORE_JOURNAL_NAMESPACE_ID, RESTORE_JOURNAL_FAILURE_DOMAIN_ID, and "
+      "RESTORE_JOURNAL_DATABASE_NAMESPACE_ID, RESTORE_JOURNAL_NAMESPACE_ID, RESTORE_JOURNAL_FAILURE_DOMAIN_ID, and "
         + "RESTORE_JOURNAL_S3_BUCKET are required",
     );
   }
@@ -203,7 +234,6 @@ export function loadTenantRestoreJournalConfig(
   const logicalDatabaseNamespaceSha256 = tenantRestoreLogicalDatabaseNamespaceSha256(
     databaseNamespaceId,
   );
-  const runtimeEpochSha256 = tenantRestoreRuntimeEpochSha256(runtimeEpochId);
   const journalNamespaceSha256 = s3TenantRestoreJournalNamespaceSha256(namespaceId);
   const failureDomainSha256 = s3TenantRestoreJournalFailureDomainSha256(failureDomainId);
   const targetSha256 = s3TenantRestoreJournalTargetSha256({
@@ -249,7 +279,6 @@ export function loadTenantRestoreJournalConfig(
     adapterProtocol: S3_TENANT_RESTORE_JOURNAL_PROTOCOL,
     journalNamespaceSha256,
     logicalDatabaseNamespaceSha256,
-    runtimeEpochSha256,
     targetRootSha256: tenantRestoreJournalTargetRootSha256([descriptor]),
     targets: [{ descriptor, options }],
   };
@@ -259,5 +288,13 @@ export function createTenantRestoreJournalAdapters(
   config: TenantRestoreJournalRuntimeConfig,
   operation: { operationAbortSignal?: AbortSignal } = {},
 ): readonly S3TenantRestoreJournalAdapter[] {
+  return config.targets.map((target) => new S3TenantRestoreJournalAdapter({ ...target.options, ...operation }));
+}
+
+export function createTenantRestoreJournalSourceObservationAdapters(
+  config: TenantRestoreJournalSourceObservationConfig,
+  operation: { operationAbortSignal?: AbortSignal } = {},
+): readonly S3TenantRestoreJournalAdapter[] {
+  if (config.purpose !== "backup-source-head-observation-v1") throw new Error("Invalid source observation purpose");
   return config.targets.map((target) => new S3TenantRestoreJournalAdapter({ ...target.options, ...operation }));
 }

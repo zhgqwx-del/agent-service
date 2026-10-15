@@ -1,20 +1,20 @@
 # agent-service 协作约定
 
-## 当前本地集成候选（2026-10-15T18:22Z）
+## 当前开发与发布状态（2026-10-15T22:37Z）
 
-修复提交 `695220d` 的受影响范围 4 文件 / 54 项通过；随后真实历史 50 文件 / 318 项通过。`1a183c8` 的 cluster 8 文件 / 28 项、独立 T3g 3 项、真实 MySQL/MinIO 15 文件 / 81 项、六入口构建/SDK及 clean VM 发布包检查均通过，全部定向项零失败或跳过。typecheck、secret scan727 与 diffcheck 通过，详见 [PROGRESS](docs/PROGRESS.md) 末节。下方 `aad57d3` 整轮退出1的事实保留；这些是明确源码下的分段验收，不是一次全量 coverage 成功，新 SHA 的 GitHub CI 尚待。
+发布基线 main/origin `3414b43` 的[本次CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38785600946)已在20:03 UTC五项全成功。主4191通过/82预期跳过、required133/64组证明、历史50文件318项零skip及真实S3/cluster/构建/VM/两镜像均已核对；原本地`aad57d3`整轮失败与修复后分段仍保留在[PROGRESS](docs/PROGRESS.md)，不改写成一次本地全量成功。
 
-本地组合候选 `aad57d3` 已合并 M1 `d4c4060` 与 M4 `11bbf7b`，未合入 main 或推送；main/origin 仍为 `2932318`，其[旧 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38714666463)只证明原基线。2026-10-15 16:17Z～17:05:49Z 的本轮完整 verify 退出 **1**：主测试 4174 passed / 17 failed / 82 expected skipped；API、typecheck、secret scan 727 通过，后续历史、cluster、build 未执行，不能宣称 coverage 或 required 文件证明通过。失败与此前独立定向证据见 [PROGRESS](docs/PROGRESS.md) 顶部和最后一节。
+本分支`0058`候选未提交/合入main、未部署或激活。store `301621c7` 的完整MySQL10/冻结旧binary历史4/shared纯166证据保留；有界trigger batch源 `461d…` / test `3f93…` 新unit66、typecheck、scan734/diffcheck通过，真实整库schema/trigger往返及原180秒完整双跳各1项通过，过滤项不计执行。双跳178638.82ms含newPi/finalcold/cleanup，独立资源复查零fixture库/三对象前缀残留；仅约1.36秒余量，有CI风险，不证明稳定提速或整包成功。原超时及启动器配置失败保留，300秒仍待答，原180/CLI120/lease/断言不变；完整verify/verify-s3、最终commit/push/新CI未执行，详见[PROGRESS末节](docs/PROGRESS.md)。startup scope不跨连接/事务、不替代来源审计；恢复后T1仍blocked-source/runtime_not_primary，0054原primary-only、旧49/v1与unknown边界不变。
 
 ## 开发与验证节奏
 
-当前下一消费者是再次真实备份/恢复到又一新 epoch；独立 worktree 的提前编码/纯测试不等于交付，当前阶段 CI 全绿前不得合入。旧 schema 原生 artifact 的跨迁移导入/升级/续跑仍缺，格式或历史重放兼容不能代替其验收；不得自动重导、删除部分目标或隐式执行 DDL。
+当前下一消费者是再次真实备份/恢复到又一新epoch；上一发布CI全绿已满足真实隔离验证前置，仍须完成本候选自身定向与功能包门禁后才可合入。旧schema原生artifact的跨迁移导入/升级/续跑仍缺，格式或历史重放兼容不能代替其验收；不得自动重导、删除部分目标或隐式执行DDL。
 
 - 每轮小改动先做类型检查与影响范围定向测试；SQL、事务、删除、鉴权的正确性改动立即做真实服务及并发/回滚/隔离负例。
 - 多轮相关且已定向验证的修改形成 coherent 功能包，冻结后做一次完整 `verify` 及相关 `verify-s3`；独立历史、S3、cluster、SDK、实际 bundle/VM 门禁不省略。
 - 完整运行失败时保留原报告和其中已通过的结果，只修缺陷、复验失败及受影响范围，并补剩余门禁；分段结果不拼成一次全量成功。最终发布证据必须对应实际源码/提交。
 - 较大阶段集中提交推送一次并等最终 SHA 的完整 CI，不为小补丁反复 push/取消长 CI；不降低 coverage 阈值、放大 deadline、跳过用例或泛化错误 oracle。
-- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。当前 required133 / 64 groups、历史50是登记清单，不等于本轮已执行；root 统一 test/build/DB/Git，author 冻结后不擅改。
+- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。已发布main的清单为required133 / 64 groups、历史50；本分支候选为required136 / 66 groups、历史51，新增登记不等于执行证明。root统一test/build/DB/Git，author冻结后不擅改。
 
 ## 不变的安全与交付边界
 

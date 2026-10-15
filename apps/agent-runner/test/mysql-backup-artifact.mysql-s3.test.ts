@@ -886,6 +886,13 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         }
         return MysqlSessionStore.connect(options);
       },
+      connectCaptureBackupSourceMaintenance: async (options) => {
+        if (options.url === targetUrl) {
+          targetConnectFailureInjected = true;
+          throw new Error(`private-post-import-${fixture.payloadCanary}`);
+        }
+        return MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options);
+      },
     });
     await failure(crashed);
     const schemaDifference = crashed.failureDiagnostic?.productCode === "target_schema_mismatch"

@@ -4,24 +4,29 @@ import type { AddressInfo } from "node:net";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DeleteObjectsCommand, GetObjectCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
-import mysql, { type RowDataPacket } from "mysql2/promise";
+import mysql, { type RowDataPacket, type ResultSetHeader } from "mysql2/promise";
 import { describe, expect, it, vi } from "vitest";
 import { createStructuredTelemetry, INTERNAL_PERSISTED_PROVIDER_CAPTURE_FLEET_PATH,
   PersistedProviderCaptureFleetRequest, PersistedProviderCaptureFleetResponse,
   persistedProviderCaptureConfiguredFleetRootSha256, type AgentDefinition } from "@agent-service/protocol";
 import { LocalAesGcmCipher, ProviderService } from "../../providers/src/index.js";
 import { FakeVendor } from "../../testkit/src/index.js";
-import { PiEngine, SessionHost, StaticToolRegistry, createPersistedProviderFailureCapture, newId,
+import { PiEngine, SessionHost, StaticToolRegistry, TenantRestoreJournalPublicationWorker,
+  createPersistedProviderFailureCapture, newId,
   type TenantTelemetryWriterWorker } from "../../core/src/index.js";
 import { MemoryEventBus, MemoryLeaseStore, MysqlSessionStore, tenantTelemetryS3ArtifactObjectKey,
   TENANT_TELEMETRY_ARTIFACT_PAYLOAD_SCHEMA, TenantTelemetryCaptureRestoreIntegrityError,
   tenantTelemetryWriteAdapterResult,
   tenantTelemetryArtifactPayloadCanonicalJson, tenantTelemetryArtifactPayloadSha256,
+  canonicalizeTenantTelemetryArtifactPayload,
   tenantTelemetryCaptureRecoveryJobDescriptorSha256, tenantTelemetryWriteClaimTokenSha256,
   readTenantTelemetryCaptureCheckpointFromMysql, tenantTelemetryCaptureCheckpointOperationIdentity,
   validateTenantTelemetryCaptureEpochCutoverReceipt, validateTenantTelemetryCaptureOperationRecoveryPermit,
+  validateTenantTelemetryCaptureOperationRecoveryPermitV2, TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES,
+  S3TenantBackupCatalogAdapter, S3TenantRestoreJournalAdapter, newErasureRequestId, tenantErasureRequestHash,
   type TenantTelemetryCaptureEpochCutoverReceipt, type TenantTelemetryCaptureRestoreHistoryReceipt,
   type TenantTelemetryCaptureOperationRecoveryPermit, type TenantTelemetryWriteClaim, type TenantTelemetryWriteJobRecord,
+  type TenantTelemetryCaptureOperationRecoveryPermitV2, type TenantTelemetryCaptureRecoveryContext,
   type TenantTelemetryPersistedProviderCaptureProof } from "../src/index.js";
 import { decodeTenantTelemetryS3Envelope } from "../src/tenant-telemetry-adapter/s3-codec.js";
 import { MySqlBackupArtifactFixture, backupArtifactIntegrationEnabled } from "./mysql-backup-artifact-test-helper.js";
@@ -34,8 +39,10 @@ import { runTelemetryCaptureCli } from "../../../apps/agent-runner/src/telemetry
 import { readTelemetryCaptureRefKey } from "../../../apps/agent-runner/src/telemetry-capture-ref-key.js";
 import { S3TenantTelemetryWriteAdapter } from "../src/index.js";
 import { reconcileTenantTelemetryWriterForStartup } from "../../../apps/agent-runner/src/tenant-telemetry-writer-config.js";
+import { createTenantRestoreJournalAdapters, loadTenantRestoreJournalConfig } from "../../../apps/agent-runner/src/tenant-restore-journal-config.js";
 import { createRouterApp } from "../../../apps/agent-router/src/app.js";
 import { RunnerRegistry } from "../../../apps/agent-router/src/registry.js";
+import * as artifactOperations from "../../../apps/agent-runner/src/mysql-backup-artifact.js";
 
 // Same explicit native-backup and capture gates as the two constituent suites.
 // The full required S3 driver must enable both and reject a skipped file.
@@ -81,7 +88,20 @@ async function closeHttp(server: Server | undefined) {
 }
 
 suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", () => {
-  it("restores queued and both reserved windows into a new epoch, resumes exact bytes, and captures a new real Pi failure", async () => {
+  async function exerciseCaptureRestore(repeatRestore: boolean) {
+    const diagnosticStartedAt = performance.now();
+    type RepeatRestoreStage = "fixture_source_begin" | "fixture_source_ready" | "primary_backup_complete"
+      | "restore1_ready" | "cp2_created" | "restore2_selected" | "second_five_commands_complete"
+      | "runtime2_open" | "p2_claims_ack_complete" | "new_pi2_written" | "final_cold_complete"
+      | "cleanup_begin" | "cleanup_end";
+    const markRepeatStage = (stage: RepeatRestoreStage) => {
+      if (!repeatRestore) return;
+      // Closed names and monotonic elapsed time only: never log fixture IDs,
+      // endpoints, database rows, dependency errors, or any key material.
+      try { console.error(JSON.stringify({ stage,
+        elapsedMs: Math.max(0, Math.floor(performance.now() - diagnosticStartedAt)) })); }
+      catch { /* Diagnostic output must not replace the real test outcome. */ }
+    };
     const databaseBase = new URL(required("MYSQL_TEST_URL")), endpoint = new URL(required("S3_TEST_ENDPOINT"));
     if (!['127.0.0.1', 'localhost', '[::1]'].includes(databaseBase.hostname)
       || !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname)
@@ -97,7 +117,8 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     const prefix = `capture-restore-tests/${fixture.runId}`;
     const bucket = required("S3_TENANT_TELEMETRY_TEST_BUCKET");
     const failures: unknown[] = [], output: string[] = [], exchanges: { boundary: string; epoch: string }[] = [];
-    const vendor = new FakeVendor({ expectApiKey: vendorKey }).script(...Array.from({ length: 4 }, () => ({
+    let bodyFailed = false;
+    const vendor = new FakeVendor({ expectApiKey: vendorKey }).script(...Array.from({ length: repeatRestore ? 5 : 4 }, () => ({
       httpError: { status: 429, retryAfter: "0", body: { error: { message: privateError } } },
     })));
     let runner: Awaited<ReturnType<typeof httpSurface>> | undefined;
@@ -111,6 +132,13 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
     let effectiveProof: TenantTelemetryPersistedProviderCaptureProof;
     let captureGate: RouterPersistedProviderCaptureGate;
     let cutoverDiagnostic = "not_called";
+    // A transparent spy delegates every scan to the actual S3 adapter. It is
+    // present only in the independent repeat case, never a synthetic chain.
+    const journalScan = repeatRestore ? vi.spyOn(S3TenantRestoreJournalAdapter.prototype, "scanRecords") : undefined;
+    let journalPublication: { tenantId: string; requestId: string; recordSha256: string;
+      operationSha256: string; publicationReceiptSha256: string;
+      heads: Awaited<ReturnType<MysqlSessionStore["getTenantRestoreRuntimeHeads"]>> } | undefined;
+    let firstJournalFenceSha256: string | undefined;
     const legacyClaims: TenantTelemetryWriteClaim[] = [];
     const legacyJobs = new Map<string, TenantTelemetryWriteJobRecord>();
     const telemetry = createStructuredTelemetry({ component: "runner", opaqueRefKey: refKey,
@@ -129,6 +157,74 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       expect(result.stderr).toBe("");
       output.push(result.stdout);
     };
+    function assertNonemptyJournalScanSince(callCount: number) {
+      if (!journalScan) throw new Error("repeat_journal_scan_observer_missing");
+      expect(journalScan.mock.calls.slice(callCount).some(([options]) =>
+        options.sealedHead.remoteSequence === 1 && options.afterRemoteSequence === 0),
+      "actual S3 sealed-prefix scan must include the published record").toBe(true);
+    }
+    async function publishNonemptyJournal() {
+      const source = store!;
+      const config = loadTenantRestoreJournalConfig(fixture.journalEnv(), { production: false, store: "mysql" });
+      if (!config) throw new Error("repeat_journal_configuration_missing");
+      const adapters = createTenantRestoreJournalAdapters(config);
+      // This fixture invokes the formal worker explicitly, without starting a
+      // daemon. Actual store authorization, S3 publication, ACK and seal remain
+      // untouched; the local execution gate only checks this real primary.
+      const publisher = new TenantRestoreJournalPublicationWorker({ store: source, adapters, logger,
+        canExecute: async () => {
+          const [control, runtime] = await Promise.all([
+            source.getTenantRestoreJournalControl(), source.getTenantRestoreRuntimeControl(),
+          ]);
+          return control.controlGeneration === 1 && runtime.state === "active"
+            && runtime.lineageKind === "primary" && runtime.runtimeEpochSha256 === effectiveProof!.runtimeEpochSha256;
+        } });
+      try {
+        const tenantId = `${fixture.tenantId}-journal`, requestId = newErasureRequestId();
+        await source.createApiKey(tenantId, "journal-source-key", createHash("sha256").update(randomBytes(32)).digest("hex"));
+        expect(await source.getTenantRestoreRuntimeHeads()).toMatchObject([{ sealedRemoteSequence: 0 }]);
+        expect(await source.requestTenantErasure({ tenantId, requestId, requestedByKeyId: "journal-source-key",
+          idempotencyKey: `capture-restore-journal-${randomUUID()}`, requestHash: tenantErasureRequestHash(tenantId),
+          atMs: Date.now() })).toMatchObject({ status: "gated", generation: 1 });
+        expect(await source.getTenantRestoreJournalPublicationJob(tenantId, requestId))
+          .toMatchObject({ phase: "queued", targetAckCount: 0 });
+        expect(await publisher.processOnce()).toBe(1);
+        expect(await source.getTenantRestoreJournalPublicationJob(tenantId, requestId))
+          .toMatchObject({ phase: "published", targetAckCount: 1, remoteCommitCount: 1 });
+        const bundle = await source.getTenantRestoreJournalPublicationBundle(tenantId, requestId);
+        expect(bundle?.targetAcks).toHaveLength(1);
+        expect(bundle?.receipt).toMatchObject({ restoreFencePublicationComplete: true, allDomainsComplete: false });
+        const ack = bundle?.targetAcks[0], receipt = bundle?.receipt;
+        if (!ack || !receipt) throw new Error("repeat_journal_publication_missing");
+        const heads = await source.getTenantRestoreRuntimeHeads();
+        expect(heads).toHaveLength(1); expect(heads[0]).toMatchObject({ sealedRemoteSequence: 1,
+          sealedHeadRootSha256: ack.headRootSha256, targetSha256: ack.targetSha256 });
+        journalPublication = { tenantId, requestId, recordSha256: ack.recordSha256,
+          operationSha256: ack.operationSha256, publicationReceiptSha256: receipt.receiptSha256, heads };
+      } finally { await publisher.stop(); }
+    }
+    async function assertRestoredNonemptyJournal(restoreRunId: string) {
+      if (!journalPublication) throw new Error("repeat_journal_publication_missing");
+      const source = store!, published = journalPublication;
+      expect(await source.getTenantRestoreRuntimeHeads()).toEqual(published.heads);
+      expect(await source.getTenantRestoreReplaySealedTargets(restoreRunId)).toEqual(published.heads);
+      const run = await source.getTenantRestoreReplayRun(restoreRunId);
+      expect(run).toMatchObject({ phase: "active", expectedEntryCount: 1, entryCount: 1, fenceCount: 1 });
+      const entries = await source.listTenantRestoreReplayEntries(restoreRunId, { limit: 10 });
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({ restoreRunId, remoteSequence: 1, requestId: published.requestId,
+        tenantId: published.tenantId, recordSha256: published.recordSha256, operationSha256: published.operationSha256 });
+      expect(await source.getTenantRestoreReplayReceipt(restoreRunId)).toMatchObject({ entryCount: 1, fenceCount: 1,
+        receiptSha256: run?.terminalReceiptSha256, restoreFenceReplayComplete: true, allDomainsComplete: false });
+      const fence = await source.getTenantRestoreFence(published.tenantId);
+      expect(fence).toMatchObject({ requestId: published.requestId, recordSha256: published.recordSha256,
+        operationSha256: published.operationSha256, sourceRemoteSequence: 1 });
+      if (!fence) throw new Error("repeat_journal_restore_fence_missing");
+      if (firstJournalFenceSha256) expect(fence.fenceSha256).toBe(firstJournalFenceSha256);
+      else firstJournalFenceSha256 = fence.fenceSha256;
+      expect((await source.getTenantRestoreJournalPublicationBundle(published.tenantId, published.requestId))?.receipt?.receiptSha256)
+        .toBe(published.publicationReceiptSha256);
+    }
     async function stopRuntime() {
       const closeFailures: unknown[] = [];
       runner?.setHandler(async () => new Response(null, { status: 503 }));
@@ -243,6 +339,46 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       return { sessionId, turnId, itemId: item.id, operation: source.writeOperationSha256!,
         failureReceipt: source.failureCommitReceiptSha256 };
     }
+    async function firstRestoreAudit(url: string) {
+      const connection = await mysql.createConnection(url);
+      try {
+        const record = await readTenantTelemetryCaptureCheckpointFromMysql(connection, fixture.backupId, refKey);
+        if (!record || record.checkpoint.scope !== "tenant-telemetry-capture-backup-checkpoint-v1") throw new Error("first_checkpoint_missing");
+        const [histories] = await connection.query<RowDataPacket[]>(
+          "SELECT receipt_json FROM tenant_telemetry_capture_restore_history_receipts WHERE restore_run_id=?", [fixture.restoreRunId]);
+        const [cutovers] = await connection.query<RowDataPacket[]>(
+          "SELECT receipt_json FROM tenant_telemetry_capture_epoch_cutovers WHERE restore_run_id=?", [fixture.restoreRunId]);
+        const [permits] = await connection.query<RowDataPacket[]>(
+          "SELECT write_operation_sha256,new_claim_attempt,permit_receipt_sha256,receipt_json FROM tenant_telemetry_capture_recovery_permits WHERE restore_run_id=? ORDER BY BINARY write_operation_sha256", [fixture.restoreRunId]);
+        expect(histories).toHaveLength(1); expect(cutovers).toHaveLength(1); expect(permits).toHaveLength(3);
+        const json = (value: unknown) => typeof value === "string" ? JSON.parse(value) : value;
+        const history = json(histories[0]!.receipt_json) as TenantTelemetryCaptureRestoreHistoryReceipt;
+        const cutover = json(cutovers[0]!.receipt_json) as TenantTelemetryCaptureEpochCutoverReceipt;
+        validateTenantTelemetryCaptureEpochCutoverReceipt(cutover, history, record.checkpoint, refKey);
+        const byOperation = new Map<string, TenantTelemetryCaptureOperationRecoveryPermit>();
+        for (const row of permits) {
+          const permit = json(row.receipt_json) as TenantTelemetryCaptureOperationRecoveryPermit;
+          validateTenantTelemetryCaptureOperationRecoveryPermit(permit, cutover, history, record.checkpoint, record.leaves, refKey);
+          expect(row.permit_receipt_sha256).toBe(permit.receiptSha256); expect(Number(row.new_claim_attempt)).toBe(2);
+          byOperation.set(String(row.write_operation_sha256), permit);
+        }
+        const context: TenantTelemetryCaptureRecoveryContext = { checkpoint: record.checkpoint, leaves: record.leaves, history, cutover };
+        // Exact logical rows, not only receipt counts. Never print these rows;
+        // failure diagnostics expose only their content-free comparison digest.
+        const fingerprint = createHash("sha256").update(JSON.stringify({ record, histories, cutovers, permits })).digest("hex");
+        return { record, history, cutover, byOperation, context, fingerprint };
+      } finally { await connection.end(); }
+    }
+    async function persistedPayloadJson(url: string, operation: string): Promise<string> {
+      const connection = await mysql.createConnection(url);
+      try {
+        const [rows] = await connection.query<RowDataPacket[]>(
+          "SELECT payload_json FROM tenant_telemetry_write_payloads WHERE tenant_id=? AND write_operation_sha256=?", [fixture.tenantId, operation]);
+        expect(rows).toHaveLength(1);
+        const parsed: unknown = typeof rows[0]!.payload_json === "string" ? JSON.parse(rows[0]!.payload_json) : rows[0]!.payload_json;
+        return tenantTelemetryArtifactPayloadCanonicalJson(canonicalizeTenantTelemetryArtifactPayload(parsed));
+      } finally { await connection.end(); }
+    }
     const dependencies = {
       connectStore: async (options: Parameters<typeof MysqlSessionStore.connect>[0]) => {
         try { return await MysqlSessionStore.connect(options); }
@@ -257,6 +393,8 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       },
       connectCaptureRestoreMaintenance: (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>[0]) =>
         MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options),
+      connectCaptureBackupSourceMaintenance: (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) =>
+        MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options),
       connectCaptureArtifactRestoreMaintenance: async (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[0]) => {
         const actual = await MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options);
         async function observe<T>(stage: string, action: () => Promise<T>): Promise<T> {
@@ -285,6 +423,7 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       },
     };
     try {
+      markRepeatStage("fixture_source_begin");
       await fixture.setup();
       independent = new S3Client({ endpoint: required("S3_TEST_ENDPOINT"), region: required("S3_TEST_REGION"),
         forcePathStyle: required("S3_TEST_FORCE_PATH_STYLE") === "1", credentials: {
@@ -392,6 +531,10 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       for (const legacy of legacyClaims) legacyJobs.set(legacy.writeOperationSha256,
         (await store!.getTenantTelemetryWriteJob(legacy.tenantId, legacy.writeOperationSha256))!);
       const originalEpoch = effectiveProof!.runtimeEpochSha256;
+      // Only the new repeat case adds a separate real T1 subject. The main
+      // tenant and all pending telemetry windows remain exactly as before.
+      if (repeatRestore) await publishNonemptyJournal();
+      markRepeatStage("fixture_source_ready");
       await stopRuntime(); // No business writer remains across the dump/import/cutover window.
       const keyEnv = { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: keyFile };
       const created = await fixture.command("create-artifact", keyEnv, dependencies); closedFailure(created);
@@ -418,13 +561,22 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       for (const privateValue of [prompt, fixture.payloadCanary, refKey.toString("hex"), masterKey]) {
         expect(encrypted.includes(Buffer.from(privateValue)), "encrypted artifact must not expose private source material").toBe(false);
       }
+      markRepeatStage("primary_backup_complete");
       const targetUrl = await fixture.newDatabase();
+      let activeTargetUrl = targetUrl, activeBackupId = fixture.backupId, activeRunId = fixture.restoreRunId;
+      const observedTargetUrls = [targetUrl];
+      let priorAudit: Awaited<ReturnType<typeof firstRestoreAudit>> | undefined;
+      let priorRecoveryClaims: TenantTelemetryWriteClaim[] = [];
+      let restoredSource: Awaited<ReturnType<typeof failureTurn>> | undefined;
+      let restoredSourceBytes: Buffer | undefined;
       const continuation = { ...keyEnv, RESTORE_RUN_ID: fixture.restoreRunId,
         BACKUP_RUNTIME_EPOCH_ID: fixture.restoredEpochId, BACKUP_RESTORE_TARGET_MYSQL_URL: targetUrl };
       closedFailure(await fixture.command("restore-selected", continuation, dependencies));
       await expect(MysqlSessionStore.connect({ url: targetUrl, migrationMode: "verify", tenantTelemetryRefKey: refKey,
         tenantTelemetryPersistedProviderCaptureLocalOnly: true })).rejects.toThrow();
+      const firstReplayScanStart = journalScan?.mock.calls.length ?? 0;
       closedFailure(await fixture.command("replay-selected", { ...continuation, BACKUP_RESTORE_REPLAY_ACK: "1" }, dependencies));
+      if (repeatRestore) assertNonemptyJournalScanSince(firstReplayScanStart);
       closedFailure(await fixture.command("verify-selected", { ...continuation, BACKUP_RESTORE_VERIFY_ACK: "1" }, dependencies));
       closedFailure(await fixture.command("activate-selected", { ...continuation, BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK: "1" }, dependencies));
       // History alone is not current write authority. Ordinary cold startup
@@ -439,6 +591,133 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
         BACKUP_RESTORE_CATALOG_RESOLUTION_ACK: "1" }, dependencies));
       await startRuntime(targetUrl);
       expect(effectiveProof!.runtimeEpochSha256).not.toBe(originalEpoch);
+      markRepeatStage("restore1_ready");
+      if (repeatRestore) {
+        await assertRestoredNonemptyJournal(fixture.restoreRunId);
+        const firstEpoch = effectiveProof!.runtimeEpochSha256;
+        const firstClaimProof = await captureGate!.requireFreshFleet(effectiveProof!, "claim");
+        const firstClaims = await store!.claimTenantTelemetryWriteJobs({ limit: 3, leaseMs: 300_000,
+          claimToken: randomUUID(), adapterProtocol: sink!.adapterProtocol, captureMode: "include_v2", freshProof: firstClaimProof });
+        priorRecoveryClaims = firstClaims;
+        expect(new Set(firstClaims.map((claim) => claim.writeOperationSha256))).toEqual(new Set(originals.map((source) => source.operation)));
+        for (const claim of firstClaims) {
+          expect(claim.claimAttempt).toBe(2); expect(claim.captureRecovery).toBeDefined();
+          if (originalReservations.has(claim.writeOperationSha256)) expect(claim.reservation).toEqual(originalReservations.get(claim.writeOperationSha256));
+          expect(claim.claimToken).not.toBe(claims.find((old) => old.writeOperationSha256 === claim.writeOperationSha256)!.claimToken);
+        }
+        // Hold the real P1 claims, so this actual worker can only write the new
+        // current-epoch Pi failure, not accidentally ACK the inherited queue.
+        restoredSource = await failureTurn(agent.id);
+        const restoredPayloadJson = await persistedPayloadJson(targetUrl, restoredSource.operation);
+        expect(await worker!.processOnce()).toBe(1);
+        const currentJob = (await store!.getTenantTelemetryWriteJob(fixture.tenantId, restoredSource.operation))!;
+        expect(currentJob.phase).toBe("written");
+        const currentKey = tenantTelemetryS3ArtifactObjectKey(prefix, { domain: currentJob.inventory.domain,
+          targetSha256: currentJob.target.targetSha256, artifactIdSha256: currentJob.inventory.artifactIdSha256,
+          artifactGeneration: currentJob.inventory.artifactGeneration });
+        const currentObject = await independent.send(new GetObjectCommand({ Bucket: bucket, Key: currentKey }));
+        restoredSourceBytes = Buffer.from(await currentObject.Body!.transformToByteArray());
+        const restoredEnvelope = decodeTenantTelemetryS3Envelope(restoredSourceBytes);
+        expect(restoredEnvelope.payloadJson).toBe(restoredPayloadJson);
+        expect(tenantTelemetryArtifactPayloadSha256(canonicalizeTenantTelemetryArtifactPayload(JSON.parse(restoredEnvelope.payloadJson))))
+          .toBe(currentJob.inventory.payloadSha256);
+        output.push(restoredEnvelope.metadataJson, restoredEnvelope.payloadJson);
+        expect(await store!.getTenantTelemetryWriteAck(fixture.tenantId, restoredSource.operation)).not.toBeNull();
+        for (const claim of firstClaims) {
+          expect(Date.now()).toBeLessThan(claim.leaseUntilMs);
+          expect(await store!.retryTenantTelemetryWrite({ tenantId: claim.tenantId, writeOperationSha256: claim.writeOperationSha256,
+            claimAttempt: claim.claimAttempt, claimToken: claim.claimToken }, { delayMs: 0, errorCode: "temporary_failure" })).toBe(true);
+          const pending = (await store!.getTenantTelemetryWriteJob(claim.tenantId, claim.writeOperationSha256))!;
+          expect(pending).toMatchObject({ phase: "queued", attempts: 2 });
+          expect(await store!.getTenantTelemetryWriteAck(claim.tenantId, claim.writeOperationSha256)).toBeNull();
+          expect(tenantTelemetryCaptureRecoveryJobDescriptorSha256(pending))
+            .toBe(tenantTelemetryCaptureRecoveryJobDescriptorSha256(originalJobs.get(claim.writeOperationSha256)!));
+        }
+        await stopRuntime();
+        priorAudit = await firstRestoreAudit(targetUrl);
+        expect(priorAudit.record.checkpoint.legacyUnknownCount).toBeGreaterThan(0);
+        const backup2 = `backup_${randomUUID()}`, run2 = `restore_${randomUUID()}`, epoch2 = `capture-restore-second-${randomUUID()}`;
+        const source2 = { ...keyEnv, MYSQL_URL: targetUrl, BACKUP_ID: backup2 };
+        const backupSourceScanStart = journalScan!.mock.calls.length;
+        closedFailure(await fixture.command("create-artifact", source2, dependencies));
+        assertNonemptyJournalScanSince(backupSourceScanStart);
+        const encrypted2 = await readFile(join(fixture.artifactDirectory, `${backup2}.asmbak`));
+        expect(encrypted2.subarray(0, 8).toString("ascii")).toBe("ASMYSQL3");
+        const sourceReader2 = await mysql.createConnection(targetUrl);
+        try {
+          const record2 = await readTenantTelemetryCaptureCheckpointFromMysql(sourceReader2, backup2, refKey);
+          if (!record2 || record2.checkpoint.scope !== "tenant-telemetry-capture-backup-checkpoint-v2" || !record2.lineageLeaves) throw new Error("second_checkpoint_missing");
+          expect(record2.checkpoint.lineage.families.map((family) => family.family)).toEqual([...TENANT_TELEMETRY_CAPTURE_LINEAGE_FAMILIES]);
+          expect(record2.checkpoint.lineage.sourceRestoreRunId).toBe(fixture.restoreRunId);
+          expect(record2.checkpoint.lineage.sourceCheckpointSha256).toBe(priorAudit.record.checkpoint.checkpointSha256);
+          expect(record2.checkpoint.lineage.sourceHistoryReceiptSha256).toBe(priorAudit.history.receiptSha256);
+          expect(record2.checkpoint.lineage.sourceCaptureCutoverReceiptSha256).toBe(priorAudit.cutover.receiptSha256);
+          expect(record2.checkpoint.sourceRuntimeEpochSha256).toBe(firstEpoch);
+          expect(record2.checkpoint.lineage.families.find((family) => family.family === "recovery_permit")!.rowCount).toBe(3);
+          expect(record2.checkpoint.lineage.families.find((family) => family.family === "recovery_permit_v2")!.rowCount).toBe(0);
+          for (const unknown of priorAudit.record.leaves.filter((leaf) => leaf.knowledge === "legacy_unknown")) {
+            expect(record2.leaves.find((leaf) => leaf.family === unknown.family && leaf.identityRefSha256 === unknown.identityRefSha256)?.knowledge).toBe("legacy_unknown");
+          }
+        } finally { await sourceReader2.end(); }
+        expect((await firstRestoreAudit(targetUrl)).fingerprint).toBe(priorAudit.fingerprint);
+        expect(await readFile(join(fixture.artifactDirectory, `${fixture.backupId}.asmbak`))).toEqual(encrypted);
+        const replay2 = await fixture.command("create-artifact", source2, dependencies); closedFailure(replay2);
+        expect(JSON.parse(replay2.stdout)).toMatchObject({ disposition: "exact_replay", artifactVerified: true });
+        expect(await readFile(join(fixture.artifactDirectory, `${backup2}.asmbak`))).toEqual(encrypted2);
+        markRepeatStage("cp2_created");
+        const secondTarget = await fixture.newDatabase(); observedTargetUrls.push(secondTarget);
+        const selected2 = { ...source2, RESTORE_RUN_ID: run2, BACKUP_RUNTIME_EPOCH_ID: epoch2, BACKUP_RESTORE_TARGET_MYSQL_URL: secondTarget };
+        // A real current-source marker loss must refuse before external epoch
+        // reservation or native import; restore exact marker bytes afterwards.
+        const reserveAttempt = vi.spyOn(S3TenantBackupCatalogAdapter.prototype, "reserveRestore");
+        const importAttempt = vi.fn(artifactOperations.importVerifiedMySqlBackupArtifact);
+        const markerConnection = await mysql.createConnection(targetUrl);
+        let marker: RowDataPacket | undefined;
+        let markerDeleted = false;
+        try {
+          const missingFactory = { ...dependencies,
+            artifactOperations: { ...artifactOperations, importVerifiedMySqlBackupArtifact: importAttempt } };
+          Reflect.set(missingFactory, "connectCaptureBackupSourceMaintenance", undefined);
+          const missing = await fixture.command("restore-selected", selected2, missingFactory);
+          expect(missing.status).toBe(1); expect(JSON.parse(missing.stderr)).toMatchObject({ code: "invalid_configuration" });
+          expect(reserveAttempt).not.toHaveBeenCalled(); expect(importAttempt).not.toHaveBeenCalled(); output.push(missing.stderr);
+          const [markers] = await markerConnection.query<RowDataPacket[]>("SELECT name,applied_at_ms FROM schema_migrations WHERE name LIKE '0058%' ORDER BY name");
+          expect(markers).toHaveLength(1); marker = markers[0]!;
+          const [deleted] = await markerConnection.query<ResultSetHeader>("DELETE FROM schema_migrations WHERE name=?", [marker.name]);
+          markerDeleted = deleted.affectedRows === 1; expect(deleted.affectedRows).toBe(1);
+          const rejected = await fixture.command("restore-selected", selected2, { ...dependencies,
+            artifactOperations: { ...artifactOperations, importVerifiedMySqlBackupArtifact: importAttempt } });
+          expect(rejected.status).toBe(1); expect(reserveAttempt).not.toHaveBeenCalled(); expect(importAttempt).not.toHaveBeenCalled();
+          expect(JSON.parse(rejected.stderr)).not.toHaveProperty("reservationMayBeConsumed");
+          expect(JSON.parse(rejected.stderr)).not.toHaveProperty("targetMayContainPartialImport"); output.push(rejected.stderr);
+          expect(await fixture.tableNames(secondTarget)).toEqual([]);
+        } finally {
+          try {
+            if (marker && markerDeleted) await markerConnection.query("INSERT INTO schema_migrations(name,applied_at_ms) VALUES(?,?)", [marker.name, marker.applied_at_ms]);
+          } finally { try { await markerConnection.end(); } finally { reserveAttempt.mockRestore(); } }
+        }
+        closedFailure(await fixture.command("restore-selected", selected2, dependencies));
+        markRepeatStage("restore2_selected");
+        await expect(MysqlSessionStore.connect({ url: secondTarget, migrationMode: "verify", tenantTelemetryRefKey: refKey,
+          tenantTelemetryPersistedProviderCaptureLocalOnly: true })).rejects.toThrow();
+        const secondReplayScanStart = journalScan!.mock.calls.length;
+        closedFailure(await fixture.command("replay-selected", { ...selected2, BACKUP_RESTORE_REPLAY_ACK: "1" }, dependencies));
+        assertNonemptyJournalScanSince(secondReplayScanStart);
+        closedFailure(await fixture.command("verify-selected", { ...selected2, BACKUP_RESTORE_VERIFY_ACK: "1" }, dependencies));
+        closedFailure(await fixture.command("activate-selected", { ...selected2, BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK: "1" }, dependencies));
+        await expect(MysqlSessionStore.connect({ url: secondTarget, migrationMode: "verify", tenantTelemetryRefKey: refKey,
+          tenantTelemetryPersistedProviderCaptureLocalOnly: true })).rejects.toThrow();
+        closedFailure(await fixture.command("activate-capture-selected", { ...selected2, ...captureEnv,
+          TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK: "1" }, dependencies));
+        closedFailure(await fixture.command("resolve-selected", { ...selected2, BACKUP_RESTORE_CATALOG_RESOLUTION_ACK: "1" }, dependencies));
+        markRepeatStage("second_five_commands_complete");
+        expect((await firstRestoreAudit(secondTarget)).fingerprint).toBe(priorAudit.fingerprint);
+        await startRuntime(secondTarget);
+        await assertRestoredNonemptyJournal(run2);
+        expect(effectiveProof!.runtimeEpochSha256).not.toBe(firstEpoch); expect(effectiveProof!.runtimeEpochSha256).not.toBe(originalEpoch);
+        activeTargetUrl = secondTarget; activeBackupId = backup2; activeRunId = run2;
+        markRepeatStage("runtime2_open");
+      }
       // Selection cannot consume even a limit=1 lease on a due unknown source;
       // a still-live old reservation also cannot bypass selection by direct API.
       expect(await store!.claimTenantTelemetryWriteJobs({ limit: 1, leaseMs: 30_000,
@@ -455,7 +734,27 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       await expect(store!.completeTenantTelemetryWrite(oldAuthorization, forgedAck))
         .rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
       const create = vi.spyOn(sink!, "createWrite"), reserve = vi.spyOn(store!, "reserveTenantTelemetryExternalMutation");
+      const delegatedClaim = store!.claimTenantTelemetryWriteJobs.bind(store!);
       const claimObserver = vi.spyOn(store!, "claimTenantTelemetryWriteJobs");
+      if (repeatRestore) claimObserver.mockImplementationOnce(async (options) => {
+        // Transparent real-DB boundary: do not replace claims/results. While
+        // the new P2 lease is actually live, prove the still-unexpired old P1
+        // token cannot renew it or change ANY current job projection.
+        const values = await delegatedClaim(options);
+        for (const claim of values) {
+          const old = priorRecoveryClaims.find((value) => value.writeOperationSha256 === claim.writeOperationSha256);
+          if (!old) throw new Error("second_claim_predecessor_missing");
+          expect(claim.claimAttempt).toBe(3); expect(Date.now()).toBeLessThan(claim.leaseUntilMs);
+          expect(Date.now()).toBeLessThan(old.leaseUntilMs);
+          const before = await store!.getTenantTelemetryWriteJob(claim.tenantId, claim.writeOperationSha256);
+          expect(await store!.renewTenantTelemetryWrite({ tenantId: old.tenantId, writeOperationSha256: old.writeOperationSha256,
+            claimAttempt: old.claimAttempt, claimToken: old.claimToken }, { leaseMs: 1_000 })).toBe(false);
+          const after = await store!.getTenantTelemetryWriteJob(claim.tenantId, claim.writeOperationSha256);
+          expect(createHash("sha256").update(JSON.stringify(after)).digest("hex"))
+            .toBe(createHash("sha256").update(JSON.stringify(before)).digest("hex"));
+        }
+        return values;
+      });
       expect(await worker!.processOnce()).toBe(3);
       expect(create).toHaveBeenCalledTimes(2); expect(reserve).toHaveBeenCalledTimes(1);
       expect(claimObserver).toHaveBeenCalledOnce();
@@ -475,38 +774,56 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       expect(recoveryClaims).toHaveLength(3);
       // Independent physical ledger oracle: written/ACK alone would also pass
       // if a buggy restore path simply bypassed every recovery permit.
-      const reader = await mysql.createConnection(targetUrl);
+      const reader = await mysql.createConnection(activeTargetUrl);
       try {
+        const permitTable = repeatRestore ? "tenant_telemetry_capture_recovery_permits_v2" : "tenant_telemetry_capture_recovery_permits";
         const [permitRows] = await reader.query<RowDataPacket[]>(
-          "SELECT write_operation_sha256,new_claim_attempt,permit_receipt_sha256,receipt_json FROM tenant_telemetry_capture_recovery_permits WHERE restore_run_id=? ORDER BY BINARY write_operation_sha256",
-          [fixture.restoreRunId]);
+          `SELECT write_operation_sha256,new_claim_attempt,permit_receipt_sha256,receipt_json FROM ${permitTable} WHERE restore_run_id=? ORDER BY BINARY write_operation_sha256`,
+          [activeRunId]);
         const [historyRows] = await reader.query<RowDataPacket[]>(
-          "SELECT receipt_json FROM tenant_telemetry_capture_restore_history_receipts WHERE restore_run_id=?", [fixture.restoreRunId]);
+          "SELECT receipt_json FROM tenant_telemetry_capture_restore_history_receipts WHERE restore_run_id=?", [activeRunId]);
         const [cutoverRows] = await reader.query<RowDataPacket[]>(
-          "SELECT receipt_json FROM tenant_telemetry_capture_epoch_cutovers WHERE restore_run_id=?", [fixture.restoreRunId]);
+          "SELECT receipt_json FROM tenant_telemetry_capture_epoch_cutovers WHERE restore_run_id=?", [activeRunId]);
         expect(permitRows).toHaveLength(3); expect(historyRows).toHaveLength(1); expect(cutoverRows).toHaveLength(1);
         const json = (value: unknown) => typeof value === "string" ? JSON.parse(value) : value;
         const history = json(historyRows[0]!.receipt_json) as TenantTelemetryCaptureRestoreHistoryReceipt;
         const cutover = json(cutoverRows[0]!.receipt_json) as TenantTelemetryCaptureEpochCutoverReceipt;
-        const checkpoint = await readTenantTelemetryCaptureCheckpointFromMysql(reader, fixture.backupId, refKey);
+        const checkpoint = await readTenantTelemetryCaptureCheckpointFromMysql(reader, activeBackupId, refKey);
         expect(checkpoint).not.toBeNull();
         if (!checkpoint) throw new Error("fixture actual capture checkpoint is missing");
         validateTenantTelemetryCaptureEpochCutoverReceipt(cutover, history, checkpoint.checkpoint, refKey);
         expect(effectiveProof!.captureControlEvidenceSha256).toBe(cutover.receiptSha256);
         for (const row of permitRows) {
-          const permit = json(row.receipt_json) as TenantTelemetryCaptureOperationRecoveryPermit;
-          validateTenantTelemetryCaptureOperationRecoveryPermit(permit, cutover, history, checkpoint.checkpoint, checkpoint.leaves, refKey);
+          const permit = json(row.receipt_json) as TenantTelemetryCaptureOperationRecoveryPermit | TenantTelemetryCaptureOperationRecoveryPermitV2;
+          if (repeatRestore) {
+            if (!priorAudit || permit.scope !== "tenant-telemetry-capture-operation-recovery-v2" || !checkpoint.lineageLeaves) throw new Error("second_permit_context_missing");
+            const previous = priorAudit.byOperation.get(String(row.write_operation_sha256));
+            if (!previous) throw new Error("first_permit_missing");
+            validateTenantTelemetryCaptureOperationRecoveryPermitV2(permit, { checkpoint: checkpoint.checkpoint,
+              leaves: checkpoint.leaves, lineageLeaves: checkpoint.lineageLeaves, history, cutover }, refKey,
+              [{ permit: previous, context: priorAudit.context }]);
+            expect(permit).toMatchObject({ genesisCheckpointSha256: priorAudit.record.checkpoint.checkpointSha256,
+              checkpointSha256: checkpoint.checkpoint.checkpointSha256,
+              previousPermitReceiptSha256: previous.receiptSha256,
+              snapshotReservationReceiptSha256: originalReservations.get(permit.writeOperationSha256)?.receiptSha256 ?? null });
+            expect(permit.predecessorLineageEvidenceHmacSha256).toMatch(/^[0-9a-f]{64}$/);
+            expect(permit.newClaimTokenSha256).not.toBe(previous.newClaimTokenSha256);
+          } else {
+            if (permit.scope !== "tenant-telemetry-capture-operation-recovery-v1") throw new Error("first_permit_scope_invalid");
+            validateTenantTelemetryCaptureOperationRecoveryPermit(permit, cutover, history, checkpoint.checkpoint, checkpoint.leaves, refKey);
+          }
           const claim = recoveryClaims.find((value) => value.writeOperationSha256 === row.write_operation_sha256)!;
           const original = claims.find((value) => value.writeOperationSha256 === row.write_operation_sha256)!;
           expect(claim).toBeDefined(); expect(original).toBeDefined();
-          expect(permit).toMatchObject({ restoreRunId: fixture.restoreRunId, runtimeEpochSha256: effectiveProof!.runtimeEpochSha256,
-            writeOperationSha256: claim.writeOperationSha256, newClaimAttempt: 2, previousClaimAttempt: 1,
-            previousPermitReceiptSha256: null, newClaimTokenSha256: tenantTelemetryWriteClaimTokenSha256(claim.claimToken),
+          expect(permit).toMatchObject({ restoreRunId: activeRunId, runtimeEpochSha256: effectiveProof!.runtimeEpochSha256,
+            writeOperationSha256: claim.writeOperationSha256, newClaimAttempt: repeatRestore ? 3 : 2, previousClaimAttempt: repeatRestore ? 2 : 1,
+            previousPermitReceiptSha256: repeatRestore ? priorAudit!.byOperation.get(claim.writeOperationSha256)!.receiptSha256 : null,
+            newClaimTokenSha256: tenantTelemetryWriteClaimTokenSha256(claim.claimToken),
             inventorySha256: original.inventory.inventorySha256, payloadSha256: original.inventory.payloadSha256,
             manifestSha256: original.inventory.manifestSha256,
             originalJobDescriptorSha256: tenantTelemetryCaptureRecoveryJobDescriptorSha256(originalJobs.get(claim.writeOperationSha256)!),
             recoveryMode: originalReservations.has(claim.writeOperationSha256) ? "resume_reserved" : "resume_queued" });
-          expect(row.permit_receipt_sha256).toBe(permit.receiptSha256); expect(Number(row.new_claim_attempt)).toBe(2);
+          expect(row.permit_receipt_sha256).toBe(permit.receiptSha256); expect(Number(row.new_claim_attempt)).toBe(repeatRestore ? 3 : 2);
           expect(claim.captureRecovery).toEqual({ permitReceiptSha256: permit.receiptSha256,
             recoveryMode: permit.recoveryMode, claimLeaseCeilingMs: permit.claimLeaseCeilingMs });
           const ack = (await store!.getTenantTelemetryWriteAck(fixture.tenantId, claim.writeOperationSha256))!;
@@ -517,7 +834,9 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       for (const source of originals) {
         const job = (await store!.getTenantTelemetryWriteJob(fixture.tenantId, source.operation))!;
         const ack = (await store!.getTenantTelemetryWriteAck(fixture.tenantId, source.operation))!;
-        expect(job).toMatchObject({ phase: "written", attempts: 2 });
+        expect(job).toMatchObject({ phase: "written", attempts: repeatRestore ? 3 : 2 });
+        expect(tenantTelemetryCaptureRecoveryJobDescriptorSha256(job))
+          .toBe(tenantTelemetryCaptureRecoveryJobDescriptorSha256(originalJobs.get(source.operation)!));
         if (originalReservations.has(source.operation)) expect(job.reservation).toEqual(originalReservations.get(source.operation));
         expect(ack.reservationReceiptSha256).toBe(job.reservation!.receiptSha256);
         const objectKey = tenantTelemetryS3ArtifactObjectKey(prefix, { domain: job.inventory.domain,
@@ -537,22 +856,51 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
           turnId: source.turnId, itemId: source.itemId, stepIndex: 1, freshProof: effectiveProof! }))
           .toMatchObject({ status: "source_verified_written", failureCommitReceiptSha256: source.failureReceipt });
       }
+      markRepeatStage("p2_claims_ack_complete");
+      if (repeatRestore) {
+        if (!priorAudit || !restoredSource || !restoredSourceBytes) throw new Error("second_restore_history_missing");
+        expect((await firstRestoreAudit(activeTargetUrl)).fingerprint).toBe(priorAudit.fingerprint);
+        const priorJob = (await store!.getTenantTelemetryWriteJob(fixture.tenantId, restoredSource.operation))!;
+        expect(priorJob.phase).toBe("written");
+        expect(await store!.getTenantTelemetryWriteAck(fixture.tenantId, restoredSource.operation)).not.toBeNull();
+        const key = tenantTelemetryS3ArtifactObjectKey(prefix, { domain: priorJob.inventory.domain, targetSha256: priorJob.target.targetSha256,
+          artifactIdSha256: priorJob.inventory.artifactIdSha256, artifactGeneration: priorJob.inventory.artifactGeneration });
+        const object = await independent.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+        expect(Buffer.from(await object.Body!.transformToByteArray()).equals(restoredSourceBytes)).toBe(true);
+      }
       const newSource = await failureTurn(agent.id);
+      const newPayloadJson = repeatRestore ? await persistedPayloadJson(activeTargetUrl, newSource.operation) : undefined;
       expect(await worker!.processOnce()).toBe(1);
       expect(await store!.getTenantTelemetryWriteAck(fixture.tenantId, newSource.operation)).not.toBeNull();
-      expect(vendor.requests).toHaveLength(4);
+      if (repeatRestore) {
+        const job = (await store!.getTenantTelemetryWriteJob(fixture.tenantId, newSource.operation))!;
+        const key = tenantTelemetryS3ArtifactObjectKey(prefix, { domain: job.inventory.domain, targetSha256: job.target.targetSha256,
+          artifactIdSha256: job.inventory.artifactIdSha256, artifactGeneration: job.inventory.artifactGeneration });
+        const object = await independent.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+        const envelope = decodeTenantTelemetryS3Envelope(Buffer.from(await object.Body!.transformToByteArray()));
+        expect(envelope.payloadJson).toBe(newPayloadJson); output.push(envelope.metadataJson, envelope.payloadJson);
+      }
+      markRepeatStage("new_pi2_written");
+      expect(vendor.requests).toHaveLength(repeatRestore ? 5 : 4);
       const newBoundaries = exchanges.filter((entry) => entry.epoch === effectiveProof!.runtimeEpochSha256);
       expect(new Set(newBoundaries.map((entry) => entry.boundary))).toEqual(new Set(["capture", "claim", "reserve", "create", "ack"]));
-      await stopRuntime(); await startRuntime(targetUrl); // Actual normal cold reconnect after permitted source/job changes.
+      await stopRuntime(); await startRuntime(activeTargetUrl); // Actual normal cold reconnect after permitted source/job changes.
       expect(await store!.getTenantRestoreRuntimeControl()).toMatchObject({ state: "active", lineageKind: "restore" });
       expect(await store!.getTenantTelemetryWriteAck(fixture.tenantId, newSource.operation)).not.toBeNull();
+      if (repeatRestore) await assertRestoredNonemptyJournal(activeRunId);
       const allOutput = output.join("\n");
       for (const forbidden of [fixture.tenantId, fixture.userId, fixture.payloadCanary, prompt, privateError,
-        refKey.toString("hex"), masterKey, runtimeKey, vendorKey, internalToken, fixture.sourceUrl, targetUrl,
+        refKey.toString("hex"), masterKey, runtimeKey, vendorKey, internalToken, fixture.sourceUrl, ...observedTargetUrls,
         required("S3_TEST_SECRET_ACCESS_KEY")]) {
         expect(allOutput.includes(forbidden), "closed pipeline output must not contain private material").toBe(false);
       }
+      markRepeatStage("final_cold_complete");
+    } catch (error) {
+      bodyFailed = true;
+      throw error;
     } finally {
+      markRepeatStage("cleanup_begin");
+      journalScan?.mockRestore();
       for (const close of [stopRuntime, () => vendor.stop(), () => closeHttp(router?.server), () => closeHttp(runner?.server)]) {
         try { await close(); } catch (error) { failures.push(error); }
       }
@@ -574,7 +922,19 @@ suite("capture restore actual encrypted MySQL artifact / HTTP fleet / MinIO", ()
       }
       refKey.fill(0);
       try { await fixture.cleanup(); } catch (error) { failures.push(error); }
-      if (failures.length) throw new Error("capture_restore_vertical_cleanup_failed");
+      markRepeatStage("cleanup_end");
+      if (failures.length) {
+        if (!bodyFailed) throw new Error("capture_restore_vertical_cleanup_failed");
+        // Preserve the original failing assertion/stack. Cleanup is still attempted
+        // in full and reported without printing dependency errors or private rows.
+        console.error("capture_restore_vertical_cleanup_failed_after_primary_failure");
+      }
     }
-  }, 180_000);
+  }
+  it("restores queued and both reserved windows into a new epoch, resumes exact bytes, and captures a new real Pi failure",
+    () => exerciseCaptureRestore(false), 180_000);
+  // Independent case/budget, not a relaxation of the original single-hop case
+  // or any CLI's 120s whole-operation limit. No service/DB is run at author time.
+  it("backs up an active restored epoch with pending P1 reservations and restores real ASMYSQL3 ancestry into a second fresh epoch",
+    () => exerciseCaptureRestore(true), 180_000);
 });
