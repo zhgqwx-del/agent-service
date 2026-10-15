@@ -1,6 +1,6 @@
 # 本地运维与后续部署契约
 
-> CI并行候选（2026-10-15）：完整历史迁移移至独立runner/自有MySQL与Redis，主套件和两个image不删减，原名`test`只在全部成功时通过。core/history保留180分钟job上限、各例deadline不变；定向264项通过，新Actions与提速收益仍待。固定67eaa2d主3604 passed，但整轮因0039旧build准备失败退出1；原预算单文件后续19项通过（真实旧binary1/纯诊断18），原失败未复现，后置及最终CI以PROGRESS为准，不重启整轮或借分段宣称整树通过。部署拓扑、六入口/两服务/两镜像或默认关闭门禁均不变；细节见[CI学习材料](development-and-ci-guide.md#8-github-actions-构建与验证)。
+> CI并行候选（2026-10-15）：完整历史迁移移至独立runner/自有MySQL与Redis，主套件和两个image不删减，原名`test`只在全部成功时通过，预算不变。67eaa2d全量exit1及原构建失败原因未知的记录保留；只定向修复、复验失败部分并补后置，未重启整轮。最新1d3be15的T3g、SDK/六入口、实际双VM包均通过，开发profile未执行签名；分段不是新全量或Linux CI通过证明。部署拓扑、六入口/两服务/两镜像及默认关闭门禁不变；最终exact SHA的五个CI检查和实测收益以[PROGRESS](../PROGRESS.md)为准，流程见[CI学习材料](development-and-ci-guide.md#8-github-actions-构建与验证)。
 
 > 离线VM签名候选（2026-10-15，未发布验收）：新增显式签名及signed inspect/unpack，独立SPKI公钥pin、选定role/commit与实际工具字节共同约束release。私钥格式正则的secret-scanner边界误报已等价改写、无白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770与proof工具119），API/typecheck通过。代码提交d671632的darwin/arm64/Node24 clean双包于07:35:46.954Z实际通过，仅ephemeral-test-only签名、productionAccepted=false；最终文档提交的整树和新Linux CI仍待。原817 CI的test失败、两image成功；b575集中全量实际3164 passed/5 failed且后置未执行，不能写成全绿。完整事实只看PROGRESS末节。
 

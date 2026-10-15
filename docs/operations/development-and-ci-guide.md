@@ -1353,6 +1353,8 @@ quarantine是数据库完整性故障路径，不应通过普通手工体验故�
 
 全量中断时，原exit1和失败报告必须保留；按变更风险重验失败/依赖项，并补齐未执行的后置。只改测试诊断/CI/文档且产品源码未变时，不机械重跑数小时前已通过的全部产品套件，但必须明确各段source commit、实际case和未执行范围，不能把这些拼成一次成功的`verify`。较大阶段最终推送的exact SHA仍须完整CI，全套SQL/安全门禁不因本地分段省略；原原因未知的构建故障也不能仅因重跑通过就称已修复。
 
+实际例子：67eaa2d集中verify约68分钟后因冻结旧binary构建准备失败退出1；随后只复验该整文件，再补后置。后置暴露的SIGKILL集群场景只调整真实lease前置，保留120秒watchdog、固定4秒retry观察和原deadline/owner/fence/最终闭合断言；新SHA整文件3项约51秒通过，1d3be15其余T3g/SDK/构建/实际VM后置约151秒退出0。数据库查询异常与观察超时分开、只输出固定分类和数值。以上是分段证据，不是一次全量通过，也不能据此推导CI节省比例；完整失败与证明范围见PROGRESS末节。
+
 本候选新增`pnpm test:verification-tools`用于纯校验器/清单回归；`pnpm test:coverage`是主套件单次执行入口，必须先准备独立可丢弃MySQL/Redis测试环境，它不是无基础设施的快速测试。入口不接受过滤参数，强制真实integration profile，以独占`.local-run/coverage-attempt-*/tests.json`绑定本轮子进程退出结果和时间，再校验124个required文件（原115、5个L0 metrics、3个离线签名和1个CI汇总回归文件）各唯一、非零test case且全部passed，以及原coverage阈值。旧便利路径`.local-run/verify-tests.json`仅在成功后更新，不可单独当新执行证明。62个旧具名命令映射仍供审计，group数字是主执行的子集，不另加到总数；VM group现含7文件，所有原定向命令保留供开发使用。
 
 只移除环境与覆盖目标等价的重复执行：S3专用flag/MinIO、历史独立config/冻结binary、真实多进程cluster/T3g、SDK、实际bundle与clean VM双包/归档启动仍分别验收。并行重型CI须先隔离每个job的MySQL/Redis/目录，当前本机共享测试资源不能盲开并发。CI在较大阶段集中推送后验收，避免连续push取消长任务；不能拿本地macOS或旧SHA的绿灯代替最终Linux/发布提交证明。
