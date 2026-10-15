@@ -17,6 +17,8 @@
     "test:vm-release": "node scripts/run-required-suite.mjs test/vm-release.test.ts && node scripts/run-required-suite.mjs apps/agent-runner/test/cli-entrypoint.test.ts && node scripts/run-required-suite.mjs test/vm-release-archive.test.ts && node scripts/run-required-suite.mjs test/vm-release-tool.test.ts && node scripts/run-required-suite.mjs test/vm-release-signature.test.ts && node scripts/run-required-suite.mjs test/vm-release-signed.test.ts && node scripts/run-required-suite.mjs test/vm-release-sign-cli.test.ts",
     "sign:vm-release": "node scripts/sign-vm-release.mjs",
     "check:vm-release": "node scripts/check-vm-release.mjs",
+    "benchmark:runner": "node --import tsx scripts/benchmark-runner.ts",
+    "test:runner-load": "vitest run test/runner-load.test.ts test/runner-load-cli.test.ts",
     "generate:api": "node --import tsx scripts/generate-api.ts",
     "check:api": "node --import tsx scripts/generate-api.ts --check",
     "check:sdk": "node scripts/check-sdk-package.mjs",

@@ -321,9 +321,9 @@ pnpm maintenance:backup-catalog -- reconcile
 
 ### 本地MySQL加密逻辑备份制品（只用可丢弃数据库）
 
-backup/restore CLI已补受保护exact ref-key文件接线：0033 inactive可无key，active必须以同一key审计source与实际import后的target，missing/wrong key仍拒绝。真实active0033制品create→restore-selected→restore-ledger replay/verify/getter用例已接必执行套件，验收结果只看PROGRESS及当次JSON，不沿用旧inactive测试结果。它不覆盖active capture跨epoch恢复，既有capture receipt与旧epoch绑定，恢复到新epoch仍fail closed、无自动rebind。具体权限、raw32byte格式和内存填零时机见[备份运维契约](local-and-deployment.md#本地mysql加密逻辑备份制品)。
+backup/restore CLI的受保护exact ref-key文件接线要求0033 active时以同一key审计source与实际target，missing/wrong key仍拒绝；单独持有key不授权active capture跨epoch写入。0057未发布候选另提供五个显式selected continuation及独立ACK：replay、verify、runtime activation、capture cutover、catalog resolution；旧receipt不自动rebind。真实Pi/GCM/MySQL/MinIO纵向已定向通过，但不是整包发布或生产DR，实际证据只看PROGRESS。具体权限、raw32byte格式、内存填零及操作序列见[备份运维契约](local-and-deployment.md#本地mysql加密逻辑备份制品)。
 
-旧0031流程只保存operator-attested摘要；新增的`create-artifact`才真实调用MySQL 8 mysqldump生成InnoDB应用逻辑SQL，以独立key加密，并把已认证实际bytes的证据发布到同一catalog。`verify-artifact`认证完整制品及catalog/anchor，也可对账content-free投影，不能叫严格只读；`restore-selected`真实导入隔离空target，只到prepared。仍只有router/runner两个长期服务，仍使用既有`backup-catalog.js`入口，不新增migration或镜像。
+旧0031流程只保存operator-attested摘要；`create-artifact`才真实调用MySQL 8 mysqldump生成InnoDB应用逻辑SQL，以独立key加密，并把已认证实际bytes的证据发布到同一catalog。`verify-artifact`认证完整制品及catalog/anchor，也可对账content-free投影，不能叫严格只读；`restore-selected`真实导入隔离空target，只到prepared。0055–0057增加恢复证据schema，不新增长期服务、JavaScript入口或镜像，仍复用`backup-catalog.js`。
 
 先执行自动门禁：
 
@@ -344,7 +344,7 @@ pnpm maintenance:backup-catalog -- verify-artifact
 pnpm maintenance:backup-catalog -- restore-selected
 ```
 
-成功仅`prepared/runtimeActivated=false/fenceReplayComplete=false`。之后将operator source明确切到已导入target，明确提供新epoch的`RESTORE_JOURNAL_RUNTIME_EPOCH_ID`，以同一run/epoch/evidence执行0030 `replay-fences → verify → status`，人工审阅，再单独activation和0031 resolution；不会自动切换应用或启动服务。任意已reserve run或epoch（含resolved）永久禁止重导，跨目录/new target/old source也不能绕过。导入DDL auto-COMMIT，故障可能留下部分目标；保留原ID/证据/现场，只有独立确认完整import且exact schema/anchor有效的target才可人工forward-fix；`SOURCE_BACKUP_SHA256`取已认证catalog/restore输出的`sourceBackupSha256`，不猜测，部分import不能直接prepare续接，禁止自动DROP、清空、重复导入或换epoch掩盖失败。
+成功仅`prepared/runtimeActivated=false/fenceReplayComplete=false`。inactive capture的旧v1恢复继续按0030 `replay-fences → verify → status`、人工审阅、activation与0031 resolution执行；active capture的v2必须按运维契约的0057五个selected命令分别授权，不能用普通connect绕过。均保留同一run/epoch/evidence，不自动切换应用或启动服务。任意已reserve run或epoch（含resolved）永久禁止重导，跨目录/new target/old source也不能绕过。导入DDL auto-COMMIT，故障可能留下部分目标；保留原ID/证据/现场，只有独立确认完整import且exact schema/anchor有效的target才可人工forward-fix；`SOURCE_BACKUP_SHA256`取已认证catalog/restore输出的`sourceBackupSha256`，不猜测，部分import不能直接prepare续接，禁止自动DROP、清空、重复导入或换epoch掩盖失败。
 
 schema-root v2只消除明确表/列charset-collation下已证冗余显示，独立真实套件还核对七类I_S与十类trigger字段；unknown/backslash DDL保持raw，可能安全拒绝其它合法schema。统一操作预算/native cancellation不撤销已发COMMIT/CAS；pending未settle不提前释放operator。真实套件required report必须非零、全部passed、零skip，CI新增具名MySQL+MinIO步骤及宿主MySQL 8版本检查；这不等于当前镜像含native工具，也不是生产DR。它不覆盖PITR、Blob/Redis联合旧快照、backup-copy erasure、任意schema或云故障域/IAM/KMS/RPO/RTO，M1仍未冻结。
 
@@ -1347,6 +1347,8 @@ quarantine是数据库完整性故障路径，不应通过普通手工体验故�
 
 ## 6. 分层验证路径
 
+本地并发测量见[单runner基线](runner-load-benchmark.md)：工具测试随相关改动跑，1000并发实测按功能包执行，不为每轮文档/诊断重复。当前M4候选必跑清单为127（2932318的124加两份工具测试及一份真实MySQL并发回归）；旧62group不变。下段124描述已发布基线，不能用其报告证明三个新增文件执行。用户另允许独立M1恢复代码提前开发/纯测试，真实服务不争用，发布仍要求现阶段CI全绿。
+
 ### 日常迭代与阶段验收（验证去重候选，2026-10-15）
 
 不必每次小改动都运行数小时全量。每轮先做`pnpm typecheck`及相关`pnpm test:<专项>`；涉及SQL、事务、删除、鉴权或租户边界时，当轮仍须执行相关真实MySQL/Redis/MinIO及并发、回滚、隔离负例。连续多轮定向通过后，在一个可验收功能包的代码/接口冻结点运行完整`verify`，触及S3/备份/恢复时还须`verify-s3`。全量失败先定位并定向修复，再对最终候选补齐完整验收，不用失败前的旧报告证明新代码通过。
@@ -1575,7 +1577,7 @@ M4的Node24目标平台目录包已实现`bundle + migrations + 完整production
 ### `test-core`：主测试与实际构建
 
 1. 凭据扫描、frozen-lockfile安装、OpenAPI/生成SDK漂移与源码/测试typecheck。
-2. `pnpm test:coverage`只跑一次main profile。独占本轮JSON与真实子进程退出状态证明每个required文件唯一、非零、全passed；具名group仅是同一执行的子集，不再另外重复跑同profile的几十个named命令，coverage门槛不变。当前manifest包含124文件（含本次CI汇总回归），62个旧group不变；数量和实际通过只看PROGRESS/当次报告。
+2. `pnpm test:coverage`只跑一次main profile。独占本轮JSON与真实子进程退出状态证明每个required文件唯一、非零、全passed；具名group仅是同一执行的子集，不再另外重复跑同profile的几十个named命令，coverage门槛不变。已发布2932318的manifest为124文件（含CI汇总回归），本地M4压测/并发回归候选为127；62个旧group不变，数量和实际通过只看PROGRESS/当次报告。
 3. 保留全部需要专用flag的真实S3/MinIO套件：Blob、mover、restore journal、backup catalog/reconcile/旧快照roundtrip/加密制品、managed telemetry writer、真实HTTP→PiEngine→MySQL→MinIO capture、GET-only observer及非生产journal。五bucket共享同机MinIO，只证明协议，不证明云IAM/KMS或独立故障域。
 4. broad cluster运行真实多进程接管与隔离；另保留T3g cluster exact报告，证明mixed-worker/namespace/fleet矩阵零skip。它不是managed Redis Cluster灾备证明。
 5. `pnpm build:check`构建SDK、runner/router bundle并启动plain Node；四个维护CLI另有具名artifact检查；dist runner/router还在临时MySQL/MinIO上做应用装配smoke，凭据只给runner。

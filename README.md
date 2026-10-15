@@ -1,10 +1,16 @@
 # agent-service
 
+当前集成候选：已在独立本地分支合并0057检查点`d4c4060`与M4并发工具`11bbf7b`，代码自动合并；尚未合入main或推送。下方各项数字是合并前独立证明，组合树须另做集中验证，不能互相背书。M1未冻结、M2冻结、M3未开始，所有默认关闭门禁保持。
+
 当前0057未发布纵向候选（2026-10-15）：真实Pi/HTTP→加密MySQL备份→新epoch恢复→显式capture/catalog切换→三种旧pending实际MinIO ACK→新Pi失败与普通冷重连的独立纵向用例已1/1通过。Memory维护51、CLI编排107、真实冻结0056历史升级5例、最终MySQL8例及旧writer兼容14例分别通过；旧unknown checkpoint不提升、不重签。双并发空领取已由v2单行串行门修复，租约、全图审计与回滚断言不变；潜在死锁/容量仍需评估。`resolve-selected`仅按指定run显式收口，不赋普通writer权限。当前尚未完整verify/verify-s3或新CI，不合入/发布或推进M1冻结；准确分段与失败见[PROGRESS](docs/PROGRESS.md)末节。
 
 0056恢复维护本地检查点（2026-10-15）：已接入仅指定run的维护facade、与0030 runtime同事务的只读history，以及v2制品prepare后的受限cold-open；不启用新epoch capture或旧pending续跑。共享/CI门禁三文件314项、最终CLI整文件66项、Memory整文件24项通过；真实MySQL六项正反例及独立RC→RR并发一项分段通过，冻结旧0055二进制的真实升级夹具3/3通过。最终typecheck、secret scan及diff检查已做；不是新功能包全量或CI通过。旧失败与实际报告见[进度](docs/PROGRESS.md)末节。下方12:37是此前`bbe5ab8`检查点的时间点状态，maintenance/history现已接入，其余新epoch写入/旧pending续跑及真实制品纵向验收仍待；main/CI未变。
 
 本worktree的M1恢复接线检查点（2026-10-15T12:37Z）：Memory/MySQL已实际封存49类来源及不可变叶子；加密备份v2把完整checkpoint纳入manifest/AAD，新dump先核对真实store与operator的server UUID/数据库绑定，再审计前后来源，v1字节兼容。0031选择/0030 prepare以显式checkpoint和独立sidecar原子绑定，缺证据不补造。Memory 46项、真实隔离MySQL 12项、冻结0054→0055历史4项及原0053→0054回归14项均通过；详细分段证据和失败记录见[进度](docs/PROGRESS.md)。这仍不是完整恢复能力：maintenance启动、原子历史receipt、新epoch显式写入及旧pending新claim续跑尚未接入，真实MySQL/MinIO制品纵向验收仍待。未运行本功能包全量或新CI，未合入/推送/部署/激活；main/origin2932318的[原CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38714666463)五项全绿仅证明原基线。M1未冻结、M2冻结、M3未开始，0037硬拒、0054原primary删除资格、自动清理off与全域completion=false不变。
+M4合并前独立检查点（历史）：
+最新本地候选（2026-10-15）：新增[单 runner 并发基线工具](docs/operations/runner-load-benchmark.md)，真实 MySQL/独立 Redis/FakeVendor 下 1000 个 turn 全部正常完成，SSE 与数据库已提交峰值均为 1000，持久化对账及清理通过。压测同时发现并修复不同 session 首写的缺键 gap-lock 死锁；新增真实回归 6 项及相关既有 MySQL 35 项通过。工具37项、CLI53项、必跑清单31项、typecheck通过；候选required=127（已发布2932318为124）、62旧group不变。以上限 macOS arm64/Node24/假模型，不是全量、Linux CI或生产容量验收；本候选尚未推送。
+
+用户已允许在独立 worktree 提前编写 M1 精确备份/新 epoch 恢复代码及纯测试；不合入、部署或激活，真实服务测试不争用，发布仍须当前阶段 CI 全绿。共享契约正在开发，恢复能力尚未闭环，M1未冻结、M2冻结、M3未开始。最新证据以PROGRESS顶部和末节为准，下方旧“CI绿后才编码”的开始时序不再适用。
 
 M4新增离线VM发布签名候选：`pnpm sign:vm-release`用显式受保护Ed25519文件签署clean发布的精确身份；独立工具的`inspect-signed`/`unpack-signed`核对可信公钥pin、选定role/commit、实际归档/manifest及工具自身字节，没有unsigned fallback。它不生成生产密钥、不安装或晋级环境；生产信任根、OCI签名与环境发布仍未完成。操作及边界见[离线VM发布签名](docs/operations/local-and-deployment.md#离线-vm-发布签名)。实际功能包/整树/CI结果只看PROGRESS，不能借旧验收背书。
 

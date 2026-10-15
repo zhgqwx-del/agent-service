@@ -1,5 +1,7 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
+> M4本地测量增量（2026-10-15，未发布候选）：已有一个实际runner dist在真实MySQL/独立Redis/FakeVendor下完成1000并发基线，SSE与已提交inProgress峰值均1000，全部正常turn、usage/billing/item/event与seq对账及清理通过。它只补本地可复现实测，不证明真实模型SLO、持续压力、云容量或M4整体完成；方法见[基线文档](../operations/runner-load-benchmark.md)，源身份/失败与结果见PROGRESS。用户已允许M1精确备份/新epoch恢复在独立树提前编码与纯测试，不合入/部署/激活；旧执行权限和发布CI门禁保持。
+
 > M4离线签名候选（2026-10-15）：复用受限tar/manifest和独立Node工具，以受保护Ed25519文件签署exact clean release statement；consumer必须同时持有独立可信SPKI DER pin与选定role/commit，并核对实际归档、manifest和执行工具自身hash。全部signed metadata在输出创建前闭合，第二次解包读取重新验归档摘要，无unsigned fallback。新增离线脚本不是新的应用dist入口，长期router/runner、六入口和两个镜像不变；不生成产品key、不执行DDL/服务安装/环境晋级，不代表生产trustroot、OCI签名、freshness或吊销。操作见[离线VM签名](../operations/local-and-deployment.md#离线-vm-发布签名)，实际验收见PROGRESS，M1和恢复门禁不变。
 
 > M4本地候选补充（2026-10-15）：受保护的L0 runtime metrics复用router/runner各自HTTP端口，`METRICS_ENABLED=0`默认关闭；独立只读token只用于GET/HEAD /metrics，禁止进入业务路径或upstream。固定低基数进程/HTTP聚合仅驻内存，不属于owner telemetry inventory，也不是SSE完整寿命、turn指标或完整OTel平台；不新增schema、进程、JavaScript入口或镜像。定向与实际bundle证明、尚待整树/CI状态及M1门禁均以PROGRESS最新节为准；协议见[可观测性设计](05-observability.md#受保护的-l0-runtime-metrics)。

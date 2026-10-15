@@ -1,5 +1,10 @@
 # agent-service 协作约定
 
+## 当前本地集成候选
+
+- 本分支已合并M1 d4c4060与M4 11bbf7b，不是合入main或推送。四facts文档保留双方原时间点证据，代码/manifest自动合并；组合树仍待定向与一次集中全量，不能借各自旧报告声称通过。
+- root唯一test/build/DB/Git；冻结后author不改。保持全部默认off、0037硬拒、0054 restored destructive拒与completion=false；M1未冻结/M2冻结/M3未开始。不重复已绿纯/历史或1000压测，仅验证合并影响后集中全量/相关S3，较大阶段一次CI。
+
 ## 当前0057未发布纵向候选（2026-10-15）
 
 - 当前候选基于本地`b8b8984`，main/origin293与独立M4不变；root唯一测试/构建/DB/Git执行器。0057隔离DDL728trigger/8根真实校准；真实Pi/HTTP/GCM/MySQL/MinIO完整新epoch纵向1/1、Memory维护51、CLI编排107、冻结0056旧binary历史5例、最终MySQL8例及旧writer14例分别整文件通过，不当完整verify/CI或生产验收。
@@ -18,6 +23,13 @@
 - 实际Memory/MySQL checkpoint及0031/0030 prepare sidecar已接线；49-family保留合法queued/reserved/written/legacyunknown，不套用0054全ACK删除资格。Memory backend envelope不与MySQL物理备份互认。新dump要求实际来源锁定、完整关系审计及前后零漂移；已有加密制品exact replay只验实际字节/不可变历史checkpoint，不重新seal或要求今日head不变。
 - 未发布0055增加3表/6不可变guard，真实隔离MySQL从49-marker基线校准718-trigger完整指纹；只新增schema，不激活/回填/联网。新旧严格指纹不兼容，后续发布仍须停服排空旧writer、独立迁移、只启新binary并forward-fix，不能热混用。最终真实SQL整文件12passed、Memory46passed、历史0054→0055四项和原0053→0054十四项通过；首轮夹具/负例前态失败保留在PROGRESS，不是全量或CI通过。新dump必须先通过成功connect且未close真实store的module-private pool身份核对，不能让同历史wrong-DB store替实际源做live审计；历史artifact重放不添加live依赖。usage引用存在的实际turn时须同session，synthetic/missing legacy turn保持unknown兼容。
 - 下一消费者是严格maintenance-only启动、0030 activation同事务history、新epoch显式cutover与旧pending新claim/renew/reserve/create/ACK。普通pending启动仍硬拒，禁止generic skipAudit/allowMissingSource或重签旧activation。真实MySQL/MinIO制品端到端尚待；不新增服务、JS入口或镜像。0054primary-only删除资格、0037grant、外部删除/自动清理off及completion=false保持。M1未冻结/M2冻结/M3未开始；本树尚未合入独立M4并发修复/压测工具，不能混用其证明。
+## M4合并前独立历史（不覆盖上方最新状态）
+## 最新开发检查点（2026-10-15，本地候选）
+
+- M4 `benchmark:runner` 已完成一次真实本地1000/1000 FakeVendor基线：双峰值1000、1000正常turn、2000items/1000usage与billing/9000events对账、cleanup通过，82.479秒；只限darwin/arm64/Node24，不是生产SLO/容量或新整树验收。操作见`docs/operations/runner-load-benchmark.md`。
+- 压测复现的资源首次INSERT缺键死锁已定向修复：RR非锁定probe后，existing raw PK与reference-only仍current锁定并核owner/type；仅本batch实际INSERT缺ID不预取gap，plain INSERT全局唯一键冲突整笔回滚，不UPSERT/重试/切RC。0053 prior只读精确existing项；所有source/hold/capture门禁不变。真实MySQL6新+8Blob/隔离+27capture通过，pure37/CLI53/manifest31/typecheck通过；候选required127、原62group不变，完整功能包verify/CI尚待。
+- 用户已明确允许独立M1 worktree提前编码与纯测试；不合入、部署或激活，真实MySQL/MinIO不与当前任务争用，发布仍须当前阶段CI全绿。旧“CI全绿前禁止编码”仅开始时序被覆盖，不放宽任何执行权限；旧receipt不可改写、0054primary-only删除资格、0037/外部删除/自动清理off与completion=false保持。M1契约不是恢复能力完成，后续必须纵向接入实际backup/restore/store/worker。
+- main/origin仍2932318；同Actions38714666463两个image及history成功，history独立证明47文件306passed零skip，core仍运行，聚合test未完成。上述候选未推送，不取消/重启长CI，也不借293证明候选通过；最新事实见PROGRESS末节。
 
 ## 开发与验证节奏（2026-10-15）
 
