@@ -318,7 +318,13 @@ describe("0028 -> 0029 tenant credential target execution migration", () => {
     }
   });
 
-  it("converges from first, middle, and last CREATE TABLE auto-commit boundaries", async () => {
+  // Keep the three independent database upgrades separate under the original per-test deadline.
+  // Every case still derives and checks the full CREATE TABLE inventory before applying its prefix.
+  it.each([
+    { boundary: "first", createOrdinal: 0 },
+    { boundary: "middle", createOrdinal: 2 },
+    { boundary: "last", createOrdinal: 4 },
+  ])("converges from the $boundary CREATE TABLE auto-commit boundary", async ({ createOrdinal }) => {
     const all = statements(migrationSql);
     const createIndexes = all.flatMap((statement, index) => (
       statement.startsWith("CREATE TABLE IF NOT EXISTS tenant_credential_target_execution_")
@@ -326,26 +332,25 @@ describe("0028 -> 0029 tenant credential target execution migration", () => {
         : []
     ));
     expect(createIndexes).toHaveLength(5);
-    for (const cutIndex of [createIndexes[0]!, createIndexes[2]!, createIndexes[4]!]) {
-      const database = databaseName();
-      await create0028(database);
-      const conn = await mysql.createConnection(databaseUrl(base, database));
-      try {
-        for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
-        await upgrade(database);
-        const [marker] = await conn.query<Row[]>(
-          "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
-          [MIGRATION_NAME],
-        );
-        expect(Number(marker[0]!.count), `cut ${cutIndex}`).toBe(1);
-        const [control] = await conn.query<Row[]>(
-          "SELECT control_generation FROM tenant_credential_target_execution_cutover",
-        );
-        expect(Number(control[0]!.control_generation), `cut ${cutIndex}`).toBe(0);
-      } finally {
-        await conn.end();
-        await cleanup(database);
-      }
+    const cutIndex = createIndexes[createOrdinal]!;
+    const database = databaseName();
+    await create0028(database);
+    const conn = await mysql.createConnection(databaseUrl(base, database));
+    try {
+      for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
+      await upgrade(database);
+      const [marker] = await conn.query<Row[]>(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
+        [MIGRATION_NAME],
+      );
+      expect(Number(marker[0]!.count), `cut ${cutIndex}`).toBe(1);
+      const [control] = await conn.query<Row[]>(
+        "SELECT control_generation FROM tenant_credential_target_execution_cutover",
+      );
+      expect(Number(control[0]!.control_generation), `cut ${cutIndex}`).toBe(0);
+    } finally {
+      await conn.end();
+      await cleanup(database);
     }
   });
 

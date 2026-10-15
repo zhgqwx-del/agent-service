@@ -617,28 +617,32 @@ describe("0027 -> 0028 Blob storage migration ledger", () => {
     }
   });
 
-  it("converges from first, middle, and last CREATE TABLE auto-commit boundaries", async () => {
-    for (const boundary of [1, 4, 7]) {
-      const database = databaseName();
-      await create0027(database);
-      const conn = await mysql.createConnection(databaseUrl(base, database));
-      let store: MysqlSessionStore | undefined;
-      try {
-        for (const statement of createTableStatements.slice(0, boundary)) {
-          await conn.query(statement);
-        }
-        const [before] = await conn.query<Row[]>(
-          "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
-          [MIGRATION_NAME],
-        );
-        expect(Number(before[0]!.count), `boundary ${boundary}`).toBe(0);
-        store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
-        await expectInstalled(conn);
-      } finally {
-        await store?.close();
-        await conn.end();
-        await cleanup(database);
+  // Each boundary seeds an independent old database and upgrades the complete current tail.
+  // Give each proof the unchanged per-test deadline instead of sharing it across three upgrades.
+  it.each([
+    { boundary: "first", createCount: 1 },
+    { boundary: "middle", createCount: 4 },
+    { boundary: "last", createCount: 7 },
+  ])("converges from the $boundary CREATE TABLE auto-commit boundary", async ({ createCount: boundary }) => {
+    const database = databaseName();
+    await create0027(database);
+    const conn = await mysql.createConnection(databaseUrl(base, database));
+    let store: MysqlSessionStore | undefined;
+    try {
+      for (const statement of createTableStatements.slice(0, boundary)) {
+        await conn.query(statement);
       }
+      const [before] = await conn.query<Row[]>(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
+        [MIGRATION_NAME],
+      );
+      expect(Number(before[0]!.count), `boundary ${boundary}`).toBe(0);
+      store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+      await expectInstalled(conn);
+    } finally {
+      await store?.close();
+      await conn.end();
+      await cleanup(database);
     }
   });
 

@@ -1,6 +1,6 @@
 # 进度记录
 
-> **开发检查点（2026-10-15T06:08Z）**：分层验证与M4 L0 metrics均为本地未发布候选。router/runner原端口增加default-off受保护GET/HEAD /metrics，固定低基数进程/HTTP聚合；独立token禁止业务使用/转发，不涉及owner inventory/SQL/外部删除或M1恢复授权。06:01:45Z定向10文件388 passed/0failed/0skipped，五个新metrics文件153项；API/typecheck、最新六入口build与实际bundle默认关闭/启用鉴权装配通过。主required清单为120（原115加五metrics），62旧group仍只从同次coverage出具子集证明。完整新verify/CI未执行，旧817c144的Actions38676454476仍在历史迁移、两个image success，不能借其证明新代码。后续日常定向、功能包末全量、较大阶段集中push，不缩减M1/M3/M4目标或默认关闭门禁。详细范围与失败/复测事实见末节。
+> **开发检查点（2026-10-15T06:26Z）**：分层验证1e76d65与M4 L0 metrics b575523为本地未发布检查点，origin/main仍817c144。指标10文件388 passed零fail/skip、API/typecheck/secrets690与实际bundle装配通过；集中完整verify自06:12Z在固定clean b575523、无.env集成树和新隔离资源运行，尚无终态。原817的Actions38676454476已真实failure：两个image success，history为47文件/279 passed/3 failed，三个三边界串行用例各超过默认30秒；不是job超时或观察网络失败。main仅将三份测试的每个边界改为独立it.each、保留30秒及全部真实升级/断言/清理，尚待实际定向重验；不重启未改源码的b575全量，最终新SHA仍须CI。required=120、62旧group不变，日常定向/功能包末全量/较大阶段集中push，不缩减M1/M3/M4目标或默认关闭门禁；下一恢复实现仍等发布验收完成。详细范围与失败/复测事实见末节。
 
 > **最新本地集成验收（2026-10-15T03:14Z）**：干净代码提交`e278ead`的完整`verify`于03:13:49Z退出0：主2897 passed/0failed（227文件，212执行/15预期跳过，81预期跳过）；真实历史47文件/282 passed/零fail或skip；cluster28与独立T3g3、API/typecheck、secret scan679、SDK18文件、六JS入口及VM四文件335均通过。实际macOS arm64/Node24双tar来源clean、publishable=true，但productionAccepted=false；不据此宣称Linux CI或生产验收。发布提交与CI终态以main对应Actions run为准，本地通过不是CI通过证明。0054只开放同primary、新完整来源、T1前全ACK且Blob/export计划域全零的保留式本地链；旧/未知来源、restore新epoch、0037 grant、外部对象删除与自动清理仍关闭，四false不变。M1未冻结、M2冻结、M3未开始；下一恢复实现已获授权，但必须等本批发布验收完成后开展。
 
@@ -1391,3 +1391,10 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 先前定向报告runtime-metrics-final-20261015.json为386 passed/2 failed，两个失败均是新增测试把合法mixed-case Bearer scheme误期望401；只给两份测试逐case标注正确scrape状态，未改变授权实现或放宽其它负例。失败报告保留。最终新报告runtime-metrics-recheck-20261015.json的startTime=2026-10-15T06:01:45.864Z，10文件388 passed、0failed、0pending/skip，逐文件非零且全部passed；其中新五文件153、旧两config52、旧router app64和验证工具119是总数子集，不重复计数，实际运行约4.86秒。
 - 最新typecheck与API漂移退出0；六入口build11337退出0后，plain Node双服务check-dist-boot8001也退出0，证明实际bundle的默认metrics404、启用后的独立role鉴权、GET/HEAD、方法/no-store和业务路径拒绝，且输出没有测试token。全部使用隔离memory/临时loopback，无.env、真实模型、业务MySQL/Redis或外部对象操作。required清单新增五个实际文件为120，62个旧group不变，日常test:runtime-metrics只作快速定向入口。
 - 当前主树在本地checkpoint1e76d65之上开发，origin/main仍817c144；新功能和去重driver尚未完整verify/新CI，未为这轮定向修补单独push。旧Actions38676454476截至06:04Z仍在历史迁移，两个image success，不能提前写全绿。待功能包冻结后集中整树验收；原0054发布验收条件、M1未冻结/M2冻结/M3未开始、0037 hard-deny、外部对象删除/自动清理关闭和全域completion=false均保持。
+
+## 2026-10-15（原发布 CI 历史夹具超时定位；定向修复待验）
+
+- 原发布817c144的Actions38676454476于06:19:53Z结束，test为failure、两个image为success。history实际47文件中44 passed/3 failed，279个测试passed/3 failed；三处均为0027→0028、0028→0029、0030→0031的first/middle/last CREATE TABLE边界合并用例超过默认30000ms，没有报告SQL断言失败。整体test约171分钟，不是180分钟job watchdog。history失败后的cluster/build/VM后置不能视作已执行；先前观察连接重置也没有改变该真实结论。
+- root比对实际旧R3 JSON：三用例合并耗时分别26.239/20.399/19.585秒；每个内部循环都重建三份独立旧库并升级完整当前tail。CI相邻0029→0030已经拆成独立it.each，三次边界约10.505/11.105/10.398秒均通过。由此定位为累计工作共享单例deadline的夹具粒度问题；不据此证明未来Linux结果，也不改变产品事务、DDL或安全门禁。
+- 本地最窄修复只把上述三文件的三边界注册为独立it.each：0028的CREATE数1/4/7、0029的CREATE ordinal0/2/4且逐例检查5个表、0031的ordinal0/3/6且逐例检查7个表；原完整seed/部分DDL/升级/marker/control/全部断言/finally清理保留。仍串行、默认每例30秒，不加timeout/skip/retry或减少真实数据库工作。预计三文件15/13/18共46例、全集47文件288例，只是清单预期，尚未实际通过；这不是原始执行时长提速。
+- 指标已于b575523061f85c58662c8b848d07f4cb3768935e保存本地检查点，尚未push。集中verify guard在另一既有clean、无.env的精确b575树自06:12:20.707Z运行，使用新随机测试库与自有Redis61305，同时验收指标和去重driver；不为这三份测试结构修正重启整轮。等本轮退出后再以新隔离环境专跑变更三文件，最终CI验收新提交。任何报告都须区分b575固定全量、后续定向和最终SHA；不能把旧或分段结果写成新SHA整树通过。0054发布尚未完成，已授权的下一恢复产品代码仍未开始；长期目标active、M1未冻结/M2冻结/M3未开始及全部默认关闭边界不变。

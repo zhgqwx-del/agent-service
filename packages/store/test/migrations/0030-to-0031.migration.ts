@@ -652,32 +652,37 @@ describe("0030 -> 0031 authoritative backup catalog migration", () => {
     }
   });
 
-  it("converges from first, middle, and last CREATE TABLE auto-commit boundaries", async () => {
+  // Each boundary owns a fresh old-schema database and the complete upgrade/cleanup path.
+  // Separate tests preserve the default deadline without batching three independent upgrades.
+  it.each([
+    { boundary: "first", createOrdinal: 0 },
+    { boundary: "middle", createOrdinal: 3 },
+    { boundary: "last", createOrdinal: 6 },
+  ])("converges from the $boundary CREATE TABLE auto-commit boundary", async ({ createOrdinal }) => {
     const all = statements(migrationSql);
     const createIndexes = all.flatMap((statement, index) => (
       statement.startsWith("CREATE TABLE IF NOT EXISTS backup_") ? [index] : []
     ));
     expect(createIndexes).toHaveLength(7);
-    for (const cutIndex of [createIndexes[0]!, createIndexes[3]!, createIndexes[6]!]) {
-      const database = databaseName();
-      await create0030(database);
-      const conn = await mysql.createConnection(databaseUrl(base, database));
-      try {
-        for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
-        await upgrade(database);
-        const [marker] = await conn.query<Row[]>(
-          "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
-          [MIGRATION_NAME],
-        );
-        expect(Number(marker[0]!.count), `cut ${cutIndex}`).toBe(1);
-        const [control] = await conn.query<Row[]>(
-          "SELECT state,control_generation FROM backup_catalog_control WHERE singleton_id=1",
-        );
-        expect(control[0]).toMatchObject({ state: "inactive", control_generation: 0 });
-      } finally {
-        await conn.end();
-        await cleanup(database);
-      }
+    const cutIndex = createIndexes[createOrdinal]!;
+    const database = databaseName();
+    await create0030(database);
+    const conn = await mysql.createConnection(databaseUrl(base, database));
+    try {
+      for (const statement of all.slice(0, cutIndex + 1)) await conn.query(statement);
+      await upgrade(database);
+      const [marker] = await conn.query<Row[]>(
+        "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?",
+        [MIGRATION_NAME],
+      );
+      expect(Number(marker[0]!.count), `cut ${cutIndex}`).toBe(1);
+      const [control] = await conn.query<Row[]>(
+        "SELECT state,control_generation FROM backup_catalog_control WHERE singleton_id=1",
+      );
+      expect(control[0]).toMatchObject({ state: "inactive", control_generation: 0 });
+    } finally {
+      await conn.end();
+      await cleanup(database);
     }
   });
 
