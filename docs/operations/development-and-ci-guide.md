@@ -323,7 +323,7 @@ pnpm maintenance:backup-catalog -- reconcile
 
 ### 本地MySQL加密逻辑备份制品（只用可丢弃数据库）
 
-backup/restore CLI的受保护exact ref-key文件接线要求0033 active时以同一key审计source与实际target，missing/wrong key仍拒绝；单独持有key不授权active capture跨epoch写入。0057未发布候选另提供五个显式selected continuation及独立ACK：replay、verify、runtime activation、capture cutover、catalog resolution；旧receipt不自动rebind。真实Pi/GCM/MySQL/MinIO纵向已定向通过，但不是整包发布或生产DR，实际证据只看PROGRESS。具体权限、raw32byte格式、内存填零及操作序列见[备份运维契约](local-and-deployment.md#本地mysql加密逻辑备份制品)。
+backup/restore CLI的受保护exact ref-key文件接线要求0033 active时以同一key审计source与实际target，missing/wrong key仍拒绝；单独持有key不授权active capture跨epoch写入。0057已实现一次恢复后的五个显式selected continuation及独立ACK：replay、verify、runtime activation、capture cutover、catalog resolution；旧receipt不自动rebind。真实Pi/GCM/MySQL/MinIO单次纵向已定向通过，但不是生产DR；原发布3414b43的本次CI已于2026-10-15T20:03:08Z五个job全部success，不代表0058候选通过。具体权限、raw32byte格式、内存填零及操作序列见[备份运维契约](local-and-deployment.md#本地mysql加密逻辑备份制品)，最新证据只看PROGRESS。
 
 旧0031流程只保存operator-attested摘要；`create-artifact`才真实调用MySQL 8 mysqldump生成InnoDB应用逻辑SQL，以独立key加密，并把已认证实际bytes的证据发布到同一catalog。`verify-artifact`认证完整制品及catalog/anchor，也可对账content-free投影，不能叫严格只读；`restore-selected`真实导入隔离空target，只到prepared。0055–0057增加恢复证据schema，不新增长期服务、JavaScript入口或镜像，仍复用`backup-catalog.js`。
 
@@ -349,6 +349,10 @@ pnpm maintenance:backup-catalog -- restore-selected
 成功仅`prepared/runtimeActivated=false/fenceReplayComplete=false`。inactive capture的旧v1恢复继续按0030 `replay-fences → verify → status`、人工审阅、activation与0031 resolution执行；active capture的v2必须按运维契约的0057五个selected命令分别授权，不能用普通connect绕过。均保留同一run/epoch/evidence，不自动切换应用或启动服务。任意已reserve run或epoch（含resolved）永久禁止重导，跨目录/new target/old source也不能绕过。导入DDL auto-COMMIT，故障可能留下部分目标；保留原ID/证据/现场，只有独立确认完整import且exact schema/anchor有效的target才可人工forward-fix；`SOURCE_BACKUP_SHA256`取已认证catalog/restore输出的`sourceBackupSha256`，不猜测，部分import不能直接prepare续接，禁止自动DROP、清空、重复导入或换epoch掩盖失败。
 
 schema-root v2只消除明确表/列charset-collation下已证冗余显示，独立真实套件还核对七类I_S与十类trigger字段；unknown/backslash DDL保持raw，可能安全拒绝其它合法schema。统一操作预算/native cancellation不撤销已发COMMIT/CAS；pending未settle不提前释放operator。真实套件required report必须非零、全部passed、零skip，CI新增具名MySQL+MinIO步骤及宿主MySQL 8版本检查；这不等于当前镜像含native工具，也不是生产DR。它不覆盖PITR、Blob/Redis联合旧快照、backup-copy erasure、任意schema或云故障域/IAM/KMS/RPO/RTO，M1仍未冻结。
+
+0058候选尚待完整验收的链是：primary真正backup1→fresh DB1／never-used epoch1单次恢复→该restore1产生新failure并保留合法旧pending→真正新backup2→另一fresh DB2／never-used epoch2再恢复。backup1的checkpoint v1／`ASMYSQL2`不改；backup2用checkpoint v2／`ASMYSQL3`绑定49类来源及27类实际祖先投影，旧CP、P1、descriptor与unknown语义不重释。两次都复用现有五个selected命令，仍仅两服务／六JS入口／两镜像，不新增CLI或daemon；VM与容器形态不变。
+
+受保护source使用独立backup-source maintenance，prepared target使用exact-run maintenance，普通runner写入另需runtime gate和fresh fleet proof，三者不能互相借权。source prepare后不再读取/镜像fenced source，导入前以完整外部链及exact reservation复核；历史制品exact replay不要求今日head未变。候选还在reserve/import之前核实际source migration root与认证anchor，拒绝不匹配；这不是旧schema原生import→upgrade→continuation的实现。0058八个fingerprint根已真实校准并填入，受影响SQL、冻结旧二进制历史与单跳分别已有实测；新增双跳到达第二次恢复及P2 claim／ACK，但原180秒总预算两次超时，最终新Pi、再次冷启动与清理未获完整证明。最新只读启动审计去重的纯测试及局部SQL定向不能替代双跳或整包验收；300秒预算只是在询问用户，当前180秒、各CLI预算及全部门禁不变。分段证据不能拼成一次通过，本节不构成激活许可；具体报告见[PROGRESS](../PROGRESS.md)顶部与末节，操作边界见[0058运维说明](local-and-deployment.md#0058-重复备份恢复候选尚未真实验收)。默认关闭、production拒绝、0037／0054删除门禁、外部删除／自动清理关闭和completion=false不变。
 
 ### 离线 filesystem→S3 mover 手工演练（只用可丢弃数据）
 
@@ -1616,6 +1620,8 @@ agent-service/agent-router:ci
 
 当前 workflow 使用 `load: true` 供本 job 启动验证，没有把镜像 push 到 registry。SDK `.tgz` 也是临时验证后删除；当前配置上传coverage及验收通过的VM双role归档、独立工具和proof（VM artifact保留14天）；是否实际生成必须核对main对应run。签名候选的CI/checker仅使用ephemeral-test-only密钥，dirty-development profile明确未执行签名；artifact或测试签名都不是生产trust root/密钥管理或环境晋级。
 
+上述0057 marker链对应已推送3414b43的镜像合同；0058独立候选的workflow另登记`0058_tenant_telemetry_capture_repeat_restore.sql`精确`COUNT=1`检查，新schema指纹虽已真实校准，新镜像仍未验收，登记与校准不能充当实际构建/功能通过证明。新增迁移不改变两个产品image与六入口，默认休眠marker也不是恢复或删除许可。
+
 ## 9. 从本地到未来生产的交付语义
 
 ### VM进程包与镜像的区别
@@ -1744,17 +1750,17 @@ T3g的恢复能力需保持精确表述：same-MySQL projection只枚举已经�
 
 没有云资源时，仍可完成业务代码、协议、迁移、Memory/MySQL/Redis实现、filesystem与S3-compatible Blob/telemetry行为、本地MinIO/多进程/容器测试、故障注入、指标定义和部署契约；本地加密MySQL逻辑backup producer和显式导入已经实现。没有云账号不解释当前grant返回零授权、已发布0053下缺受控桥时阻断T3d/T3f、user停在`awaiting_purge_policy`或`session.purge`不可领取：这些仍需产品实现，不能归为仅待环境验收。
 
-本表保留0053阶段的缺口分类原文。表中v2来源保留链已有上方所述0054本地有限候选，不再是“尚无实现”；它不覆盖mixed application-v1、未知/旧tenant、非零Blob/export、显式新epoch恢复、可信grant或实际telemetry处置，后续各项仍须独立实现和验收。
+本表延续0053阶段的缺口分类，但0054同primary保留链和0057受控单次新epoch恢复已不能再列为“尚无实现”；两者不覆盖mixed application-v1、未知/旧tenant、非零Blob/export或联合灾备。0058重复恢复仍是未完成真实验收的候选，可信grant与实际telemetry处置仍须独立实现。
 
 | 本地/CI仍须实现的闭环 | 不应冒充的完成证明 |
 | --- | --- |
 | BYOK/平台credential的versioned责任与ownership；共享key只清租户引用/ciphertext，KMS目标态的adapter/轮换/故障处理 | BYOK厂商撤销由客户负责；不能伪造revoked或销毁共享主密钥来宣称单租户erasure |
 | v2 source保留式T3d→T3e usage释放→T3f内容清理，以及telemetry可信授权、journal、实际sink处置/ACK、恢复防复活 | source、write ACK或非零target目录不是delete ACK；旧gap继续unknown |
-| active0053旧backup的显式新epoch许可及MySQL/Redis/Blob/telemetry联合恢复窗口 | active0033 key兼容测试不证明active0053 restore；同库ACK replay不证明联合旧快照安全 |
+| 重复备份/再次恢复的epoch及pending祖先链、旧schema原生升级续跑、MySQL/Redis/Blob/telemetry联合恢复窗口 | 0057已实现本地单次；0058 CP2/ASMYSQL3尚待真实SQL/历史/双跳，格式兼容与同库ACK不证明跨schema或联合旧快照安全 |
 | generic session/user内容purge及child-first执行/恢复/完成审计 | 30天floor与ordinary operational usage retention不是内容purge |
 | backup-copy责任/保留、受policy/hold约束的实际到期删除、durable intent和物理不存在ACK | 共享backup仍保留时不能称其字节已物理删除；内容30天不自动套用到backup/billing/audit |
 
-仍须等待真实环境验收的是managed IAM/private access、真实KMS权限/TLS/轮换、独立journal/catalog/sink故障域、云端备份复制/PITR、真实容量与锁等待、staging/production RPO/RTO和发布演练、IdP及真实Redis Cluster/ACL/persistence/failover等。对应adapter、配置契约和本地故障代码应先实现；不能把缺代码统称为M4云验收。仓库不编造Kubernetes、域名/TLS、bucket、telemetry backend或Secret参数；本地MinIO协议与加密逻辑backup也不证明独立故障域、完整生产DR或日志/追踪删除。此前列为“下一批”的同primary epoch、新tenant且全部v2 write在T1前ACK的来源保留式本地链现已形成0054候选，并在全部Blob/export计划域为零的范围内通过完整本地集成verify；前两次失败及仅测试修复记录保留，第三次主2897和真实历史47文件282零skip已通过。发布commit及其Linux CI仍须以main对应run的实际终态核对，不能从本地成功推断生产许可。restore/new epoch、其它历史gap、可信grant和外部处置继续拒绝，不能把剩余实现写成只等云验收。
+仍须等待真实环境验收的是managed IAM/private access、真实KMS权限/TLS/轮换、独立journal/catalog/sink故障域、云端备份复制/PITR、真实容量与锁等待、staging/production RPO/RTO和发布演练、IdP及真实Redis Cluster/ACL/persistence/failover等。对应adapter、配置契约和本地故障代码应先实现；不能把缺代码统称为M4云验收。仓库不编造Kubernetes、域名/TLS、bucket、telemetry backend或Secret参数；本地MinIO协议与加密逻辑backup也不证明独立故障域、完整生产DR或日志/追踪删除。此前列为“下一批”的同primary epoch、新tenant且全部v2 write在T1前ACK的来源保留式本地链现已形成0054候选，并在全部Blob/export计划域为零的范围内通过完整本地集成verify；前两次失败及仅测试修复记录保留，第三次主2897和真实历史47文件282零skip已通过。发布commit及其Linux CI仍须以main对应run的实际终态核对，不能从本地成功推断生产许可。0054 destructive仍拒绝restore/new epoch；0057受限单次恢复不放开这一删除门禁，0058重复恢复候选、其它历史gap、可信grant和外部处置也不能写成只等云验收。
 
 当前T3d全库RR/next-key扫描可能在规模下造成写阻塞/死锁、lease和容量压力，必须在staging用真实索引与数据量做锁超时/容量验证。结构损坏的queued job在逐候选隔离前可能饿死后续job，cursor重启还会重扫损坏前缀，但fail-closed且不会产生plan receipt或执行权，M4应增raw-key quarantine/skip。`0022` trigger fingerprint不校验action body，迁移夹具只显式模拟首个DDL auto-commit边界；预发需用无DDL/TRIGGER的runtime principal并扩展schema tamper/中断演练。
 

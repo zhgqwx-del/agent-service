@@ -310,8 +310,15 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       const tenantId = `tenant-legacy-history-${randomUUID()}`;
       try {
         await store.upsertProviderConfig(provider(tenantId, { apiKeyRef: undefined }));
+        expect((await store.getProviderConfig(tenantId, "provider"))?.credentialSourceRevision)
+          .toBe(1);
         await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
-        await trustedWrite(store, provider(tenantId), 1, secret("post-cutover"));
+        // The real 0026 activation republishes each legacy slot under a new
+        // CAS revision. Observe that boundary rather than reusing revision 1.
+        const activated = await store.getProviderConfig(tenantId, "provider");
+        expect(activated?.credentialSourceRevision).toBe(2);
+        await trustedWrite(store, provider(tenantId), activated!.credentialSourceRevision!,
+          secret("post-cutover"));
         const r = await requestAndClaim(store, tenantId);
         await store.revokeTenantCredentialMaterial(credentialAuthorization(r.claim));
         const readiness = await store.getTenantCredentialResponsibilityReadiness(

@@ -1,16 +1,24 @@
 # agent-service
 
-## 当前独立预编码（2026-10-15T22:37Z补记）
+## 当前本地整合候选（2026-10-15，定向后待完整验收）
+
+本树已整合本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`，尚未合入main或push；冻结检查点commit以独占全量日志sourceCommit为准。main仍clean3414，原CI只证明旧SHA。0059已真实校准三表/八guard/八非零根、全743trigger；首整SQL8为7pass/1夹具CAS失败，修后仅该例1pass/7filtered，不拼成同次8/8。
+
+组合named四纯55项、capture三纯276项及真实冻结LOCAL24d旧binary→0059历史3项通过；新增BYOK真MySQL/MinIO selected3pass/18filtered、95.50秒，实际full import与恢复精确743guards后的业务损坏拒绝均已执行，首两轮夹具失败保留。维护投影store5f3d7bf有限静态review无确定P0–P2，不代表架构完成或可发布。最后两处test夹具修后typecheck、secret scan747及diffcheck通过；完整verify/verify-s3/新CI尚待。下一步是冻结coherent功能包后做一次完整verify与相关verify-s3；分段不累计，登记required142/68groups、历史52不等于执行52文件。0058原180秒双跳仅约1.36秒余量的CI风险/300秒待答及全部预算、安全门禁不变；M1未冻结/M2冻结/M3未开始，详见[PROGRESS](docs/PROGRESS.md)。
+
+### BYOK WIP检查点历史（22:37，整合前）
 
 本树 `codex/m1-byok-responsibility` 基于已发布 `3414b43`，Memory/Provider/T3a/T3b/tenant GET 责任链代码已接通。正式具名验证实际 55 项零失败/跳过，重验子集不累计；SQL inactive 来源发布窄修后最终 typecheck、scan737 与 diffcheck 通过，API/SDK 通过记录保留。两次有限静态review未报其它确定P0–P2，不代替实测；原失败与精确证据见 [PROGRESS](docs/PROGRESS.md) 末节和[有限合同](docs/design/05-credential-responsibility.md)。
 
 `0059` 仍是三独立表/八guard/八个已编写SQL病例、未整合真实 `0058` 前置且八指纹为零的 MySQL 草稿；本包未执行DB/历史/完整verify/新CI，不可发布，不合入、部署或激活。另一树0058在有界trigger batch后首次原180秒完整双跳通过（178638.82ms），仅约1.36秒余量、整包门禁仍待；300秒未答不再阻断本地后续，不能借其定向通过替0059验收。main仍clean3414，M1未冻结/M2冻结/M3未开始及全部安全门禁不变，详见PROGRESS；下方为历史快照。
 
-## 当前状态（2026-10-15T18:22Z）
+### 0058检查点历史（22:37，本地24d5ae4、未发布）
 
-修复提交 `695220d` 的受影响范围 4 文件 / 54 项通过；随后真实历史 50 文件 / 318 项通过。`1a183c8` 的 cluster 8 文件 / 28 项、独立 T3g 3 项、真实 MySQL/MinIO 15 文件 / 81 项、六入口构建/SDK及 clean VM 发布包检查均通过，全部定向项零失败或跳过。typecheck、secret scan727 与 diffcheck 通过，详见 [PROGRESS](docs/PROGRESS.md) 末节。下方 `aad57d3` 整轮退出1的事实保留；这些是明确源码下的分段验收，不是一次全量 coverage 成功，新 SHA 的 GitHub CI 尚待。
+发布基线 main/origin `3414b43` 的[本次 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38785600946) 已在20:03 UTC五项全成功：主测试4191通过/82预期跳过，历史50文件318项零失败或跳过，真实S3、cluster、构建/VM与两个镜像均通过。required133文件/64组的同次执行证明已核对。原本地`aad57d3`整轮失败与修复后的分段报告保留，不把它们重写成一次本地全量成功；详见[PROGRESS](docs/PROGRESS.md)。
 
-本地组合候选 `aad57d3` 已合并 M1 `d4c4060` 与 M4 `11bbf7b`，未合入 main 或推送；main/origin 仍为 `2932318`，其[旧 CI](https://github.com/zhgqwx-del/agent-service/actions/runs/38714666463)只证明原基线。2026-10-15 16:17Z～17:05:49Z 的本轮完整 verify 退出 **1**：主测试 4174 passed / 17 failed / 82 expected skipped；API、typecheck、secret scan 727 通过，后续历史、cluster、build 未执行，不能宣称 coverage 或 required 文件证明通过。失败与此前独立定向证据见 [PROGRESS](docs/PROGRESS.md) 顶部和最后一节。
+`0058`已保存本地检查点24d5ae4，未合入main或完成整包验收。store `301621c7` 的完整MySQL10项、冻结旧binary历史4项及shared纯166项证据保留；有界trigger batch源 `461d…` / test `3f93…` 的unit66项、typecheck、scan734/diffcheck通过，真实整库schema/trigger往返1项及新增双跳1项定向通过，过滤项不算执行。详见[PROGRESS末节](docs/PROGRESS.md)。
+
+原超时和启动器缺配置的失败均保留；本次双跳在原180秒内首次完整通过，178638.82ms，含newPi、finalcold和cleanup，独立资源复查零fixture库/对象前缀残留。余量仅约1.36秒，仍有CI风险，不能称稳定提速或整包通过。300秒请求仍未答，原180/CLI120/lease/断言未变；完整verify/verify-s3、push与新CI尚未执行。
 
 M1 未冻结、M2 冻结、M3 未开始；默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
 
@@ -20,7 +28,7 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 
 日常体验/构建与部署学习见[开发与 CI 指南](docs/operations/development-and-ci-guide.md)，精确备份恢复边界见[数据生命周期 §15](docs/design/04-data-lifecycle.md#15-0057-显式新-epoch-capture-与旧-pending-恢复未发布候选)。历史验收数字统一保留在 PROGRESS；下方产品说明不是本轮通过证明。
 
-下一优先项是第二次实际备份再恢复到又一个新 epoch，并保持完整祖先与旧 pending 许可；独立 worktree 仅提前编码/纯测试，尚未交付。旧 schema 的原生制品跨新增迁移恢复也仍未闭环：格式/历史读取兼容不等于导入后升级可续跑，当前失败可能留下已消耗 epoch 与部分目标，禁止自动重导或自动 DDL。以上仍属本地 M1 工作，不是等待云资源即可自动完成。
+下一验收是第二次实际备份再恢复到又一个新 epoch，并保持完整祖先与旧 pending 许可；独立 worktree 的提前编码/纯测试不等于交付。候选已增加实际source schema的reserve/import前拒绝，但旧 schema 原生制品跨迁移的import→upgrade→continuation仍未实现；不能把拒绝或格式/历史读取兼容当作恢复成功，禁止自动重导、清空部分目标或隐式 DDL。以上仍属本地 M1 工作，不是等待云资源即可自动完成。
 
 分布式、多租户的 agent API 服务：无状态 `agent-router` + 有状态 `agent-runner`（类 `opencode serve`）。当前已实现会话/turn/SSE、BYOK、租约与 fencing、多节点路由和接管；MCP、skills、plugins/hooks 属于后续 M3。设计见 `docs/design/00-architecture.md`，调研见 `docs/research/`。
 

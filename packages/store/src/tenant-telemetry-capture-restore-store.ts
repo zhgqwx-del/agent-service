@@ -5,9 +5,11 @@ import type {
   TenantTelemetryCaptureCheckpointLeaf,
   TenantTelemetryCaptureRestoreHistoryReceipt,
   TenantTelemetryCaptureEpochCutoverReceipt,
+  TenantTelemetryCaptureLineageLeaf,
 } from "./tenant-telemetry-capture-restore.js";
 import { TenantTelemetryCaptureRestoreIntegrityError } from "./tenant-telemetry-capture-restore.js";
 import type { RestoreReplayStore, TenantRestoreJournalStore } from "./tenant-restore-journal.js";
+import type { BlobStorageControlStore } from "./blob-storage-control.js";
 
 /** Expected identities from an authenticated artifact and its actual 0031
  * reservation. The store must independently read every durable relation;
@@ -116,7 +118,28 @@ export type MysqlTenantTelemetryCaptureArtifactRestoreMaintenanceOptions =
 export interface TenantTelemetryCaptureBackupCheckpointRecord {
   checkpoint: TenantTelemetryCaptureBackupCheckpoint;
   leaves: readonly TenantTelemetryCaptureCheckpointLeaf[];
+  /** Required iff checkpoint.scope is v2; absent for every published v1 row.
+   * Runtime validation must enforce the closed discriminated record shape. */
+  lineageLeaves?: readonly TenantTelemetryCaptureLineageLeaf[];
 }
+
+export interface TenantTelemetryCaptureBackupSourceMaintenanceInput {
+  fleetStoppedAck: "fleet-stopped-v1";
+  localOnlyAck: "local-only-v1";
+}
+/** A real, closed, frozen facade with private actual-pool identity. A TypeScript
+ * Pick or caller wrapper is NOT evidence of database or operator authority. No
+ * capture/claim/reserve/create/ACK or ordinary SessionStore method is exposed. */
+export type TenantTelemetryCaptureBackupSourceMaintenance = TenantTelemetryCaptureBackupCheckpointStore
+  & Pick<TenantBackupCatalogStore, "getTenantBackupCatalogControl" | "createTenantBackupSnapshotAnchor"
+    | "getTenantBackupSnapshotAnchor" | "recordTenantBackupCatalogAvailability" | "mirrorTenantBackupCatalogEvent"
+    | "getTenantBackupCatalogEntry" | "listRecoverableTenantBackups" | "preflightTenantRestoreReplayFromBackup"
+    | "prepareTenantRestoreReplayFromBackup">
+  & Pick<TenantRestoreJournalStore, "getTenantRestoreJournalControl" | "getTenantRestoreJournalControlTargets">
+  & Pick<RestoreReplayStore, "getTenantRestoreRuntimeControl" | "getTenantRestoreRuntimeHeads">
+  & Pick<BlobStorageControlStore, "getBlobStorageControl"> & { close(): Promise<void> };
+export type MysqlTenantTelemetryCaptureBackupSourceMaintenanceOptions =
+  Omit<MysqlTenantTelemetryCaptureRestoreMaintenanceOptions, "selector"> & TenantTelemetryCaptureBackupSourceMaintenanceInput;
 
 /**
  * Additional immutable linkage, committed together with 0031 binding/reservation

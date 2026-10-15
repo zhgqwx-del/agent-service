@@ -1,10 +1,10 @@
 # 数据生命周期设计
 
-> 组合边界：本地MySQL备份/旧restore CLI现接0033 active所需exact protected ref-key文件；source与target必须同key，缺失/漂移仍拒绝。实际active0033组合证明以PROGRESS为准，旧17例inactive证明不外推。active0053 capture的新epoch恢复仍未闭合，不能自动rebind或绕过startup audit。
+> 当前恢复边界（2026-10-15T22:37Z）：0055～0057已随main3414发布且对应CI五绿；source/target须同一受保护exact ref key，并与制品key分离，不能自动rebind、重签旧收据或绕过审计。0058真实SQL/历史/单跳证据保留，有界trigger batch后原180秒完整双跳首次通过，含新Pi/finalcold/cleanup，178638.82ms，仅约1.36秒余量；不证明稳定提速或整包验收，完整verify/verify-s3/新CI仍待，见§16与[PROGRESS](../PROGRESS.md)。0037/0054原primary-only destructive/外部删除与自动清理off/completion=false、M1未冻结/M2冻结/M3未开始均不变。
 
 > 本地集成验收（2026-10-15）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。
 
-> 以下为0053阶段的历史状态与逐版本合同；0054有限新来源例外见第13节，不能据旧段落否定它，也不能将例外推广到其它来源。
+> 以下保留0053阶段的历史状态与逐版本合同；0054有限新来源例外见§13，0055～0057单次恢复分层见§14～15，0058候选见§16。旧文中的“恢复未实现”不覆盖后续已实现的受控capture路径；0054原primary-only删除资格则从未被这些恢复协议放宽。
 
 > 状态：**包括`0053`本地候选，本地/CI已有Archive、Blob/usage/governance/export、tenant-erasure T1～T3g及credential/restore/backup/telemetry的多个受限切片，但完整tenant erasure仍未闭环，所有全域completion保持false**（2026-10-13）。`0034`默认关闭的telemetry writer已接runner，可用本地单runner filesystem或S3-compatible target；`0035`只为`provider.upstream_request_failed` logs建立exact capture，traces必须inactive。`0036`/`0037`仍为非生产disposition协议及真实grant硬拒；`0038`～`0041`依次封存新write membership、T3f owner closure、T3d source与观察目标；`0042`只给新plan封存logs/traces逐artifact精确target count/root；`0043`修复新plan非零target的T3e实时复核并增加T3f后只读本地候选；`0044`只把精确逐artifact本地source封存为默认休眠、版本化的pre-grant intent/claim，固定`grantReady=false`。旧0041 terminal保留零target plan且缺catalog为unknown，新plan两域即使非零仍为blocker；0043候选也固定`executionReady=false`、`externalAuthorityVerified=false`。第五个同机MinIO bucket只证明0036协议，不证明云IAM/KMS、独立故障域或跨MySQL/S3端到端恢复。没有受控telemetry disposition activation/执行器、可信DB grant、产品v2 S3 mutation、外部marker验真、最新head恢复门禁或全域completion，因此M1未冻结，M2冻结，M3/M4主体未开始。
 
@@ -427,7 +427,7 @@ schema-root v2仅规范已有明确utf8mb4表默认与列collation时的冗余CH
 
 ## 13. 0054 retained-source 本地协议（本地集成验收通过）
 
-> 本节描述0054 Memory/MySQL有限合同。干净e278ead已通过完整本地verify，含47文件真实历史矩阵及当前0053→0054十四例；旧失败与重验均保留。代码发布不等于部署或自动启用，main对应Linux CI必须独立验收，最终状态以[PROGRESS](../PROGRESS.md)与对应Actions run为准。它不使M1冻结，也不开始M3；新epoch恢复、可信grant、外部处置及全域completion仍未闭环。
+> 本节描述0054 Memory/MySQL有限合同。干净e278ead的历史完整本地verify及旧失败记录保留，代码发布不等于部署或自动启用，最终状态以[PROGRESS](../PROGRESS.md)与对应Actions run为准。后续§14～15补充capture来源的单次新epoch恢复，但不使0054 destructive获得恢复后资格；可信grant、外部处置与全域completion仍未闭环，M1不冻结、M3不开始。
 
 协议名为 `tenant-telemetry-retained-source-v1`。九张独立证据表分别保存 T1 cohort entry/receipt、T3d raw source/tagged target/receipt、T3e usage release entry/receipt、T3f canonical closure entry/receipt；admission 与 plan job 各有一个不可变、可空的 protocol discriminator。它们只增加 content-free 来源证据，不重释旧 v1/0053 hash，不把 v2 binding 塞进 v1 application binding，也不提供手工写 proof 的公开 API。写入只能随下述真实业务边界发生，读取仍须独立验真。
 
@@ -475,21 +475,25 @@ migration 不回填、不激活 control、不联网、不执行业务 DELETE；�
 
 新 family 的 SQL root 聚合固定上限为 **1 MiB**，超限 fail closed、不截断，也不能靠环境或放大 session budget 绕过；临时 session budget 必须恢复，恢复失败丢弃该连接，COMMIT 后响应丢失只能 exact replay，不能宣称远端回滚。全七源范围锁、跨 tenant 写阻塞、N+1/重复全图审计、大 JSON/packet/内存及 lease/死锁容量仍需专门压测；1205/1213 保持可重试，不永久伪装为完整性冲突。
 
-原 primary 的这条本地链不以前置完成 active-capture restore 为条件，也**不证明新 epoch 恢复已完成**。恢复后仍必须有独立 versioned backup/run/head/epoch 许可与 source-preservation/replay 协议，旧 receipt 不自动 rebind；丢失备份后新增 source 不能猜造。telemetry 对象保留、trusted grant、外部 marker/head、物理处置/retention/restore、真实 managed IAM/KMS 与独立故障域验收、普通 session/user purge 和全域 completion 均仍是后续工作。本地/历史 ACK 夹具只证明实际数据库状态，不能外推真实外部 sink 字节、fleet 排空或云验收。
+原 primary 的这条本地链不以前置完成 active-capture restore 为条件，也**不证明新 epoch 恢复已完成**。后续§14～15的独立versioned backup/run/head/epoch许可与source-preservation/replay只补capture恢复，旧receipt不自动rebind，0054 destructive仍保持original-primary-only；丢失备份后新增source不能猜造。trusted grant、外部marker/head及物理处置/retention、其它domain联合恢复、真实managed IAM/KMS与独立故障域验收、普通session/user purge及全域completion仍是后续工作。本地/历史ACK夹具只证明实际数据库状态，不能外推真实外部sink字节、fleet排空或云验收。
 
-## 14. 0055/0056 active-capture 恢复的本地实现边界（未发布）
+<a id="14-00550056-active-capture-恢复的本地实现边界未发布"></a>
+
+## 14. 0055/0056 来源封存与只读历史（已发布的分层协议）
 
 0055 将来源封存与删除资格分开：Memory/MySQL 从真实来源生成固定49类 checkpoint 及不可变逐行 keyed HMAC 叶子，合法 queued/reserved/written/blocked/legacy-unknown 都可以被备份，不以0054的“完整ACK、零unknown”作为备份前提。Memory语义 envelope 与 MySQL物理行 envelope 不互认。新 MySQL 加密制品 v2 在 manifest 与 GCM AAD 中绑定完整 checkpoint；新 dump 在 seal 前确认实际 store pool 与 operator 的 server UUID/database 相同，再检查导出窗口前后来源不漂移。已有制品 exact replay 只验证认证字节和不可变历史，不因今日 catalog head 前进而重新 seal。v1字节与旧收据不改。
 
 0031 的显式选定 checkpoint 与真实 source binding/reservation、0030 prepare、新0055 sidecar 在同一原子边界提交，缺证据不补造。0056 提供只面向该 run 的冻结维护 facade，不暴露一般 SessionStore、prepare、primary activation 或 capture/deletion 方法。factory 独立 verify-only cold-open；caller selector 只是期望身份，不能代替实际 checkpoint、0031/0030 和来源关系校验。MySQL维护 mutation 每次显式RR、先锁指定run再锁49类来源，Memory则在同步原子边界复核；输入只clone一次并对同一副本验run。
 
-0030 activation 与0056只读 history receipt 同事务发布，晚期失败回滚全部 runtime/head/event/run/history。history 绑定真实不可变 `restore_activation` event；后续 publisher 合法推进 current generation/head 不会重签历史。旧 activation/failure/source/write receipt 和 reservation descriptor 都不改。历史只读结果不授予新写、旧 operation recovery 或0054删除许可；普通 active-capture pending 与新epoch普通启动仍 fail closed。当前实际 CLI 消费者仅为 backup-v2 prepare 后的受限 cold-read，不提供已可用的 capture 新epoch恢复操作命令。
+0030 activation 与0056只读 history receipt 同事务发布，晚期失败回滚全部 runtime/head/event/run/history。history 绑定真实不可变 `restore_activation` event；后续 publisher 合法推进 current generation/head 不会重签历史。旧 activation/failure/source/write receipt 和 reservation descriptor 都不改。历史只读结果不授予新写、旧 operation recovery 或0054删除许可；单凭0056时，普通 active-capture pending 与新epoch普通启动仍 fail closed。在0056历史实现阶段，CLI只消费backup-v2 prepare后的受限cold-read；后续显式操作与writer授权由0057另行闭合，见下一节，不能把只读history当作写许可。
 
 0055/0056 是加法式迁移，但严格 schema/trigger 指纹使旧 binary 不能在新 schema 启动：必须先停服排空旧 writer/事务，再独立迁移，只启新 binary、forward-fix，不允许热混跑或删除 marker。以上是0056的历史实现边界；后续0057消费者见下一节，不能用0056旧验收为其背书。没有新增常驻服务、JavaScript入口或镜像；0037硬拒、外部删除/自动清理关闭和全部全域completion=false保持。实际通过/失败与发布状态以 PROGRESS 最新节为准。
 
-## 15. 0057 显式新 epoch capture 与旧 pending 恢复（未发布候选）
+<a id="15-0057-显式新-epoch-capture-与旧-pending-恢复未发布候选"></a>
 
-候选把0030 runtime activation、0056只读历史和0057写入cutover分成不同权限。runtime active/history可读不代表capture可写；首次cutover必须在同一Memory原子边界或MySQL显式RR事务中重新锁定并核对选定checkpoint、当前49类来源、0031 binding/reservation、真实0030 activation及完整owner/source关系。新cutover收据另绑定新epoch、configured fleet、旧writer排空与producer就绪ACK。旧0053 activation/coverage/failure、原checkpoint叶和reservation descriptor不重签；新failure receipt改为绑定实际cutover receipt与新epoch。
+## 15. 0057 显式新 epoch capture 与旧 pending 恢复（已发布）
+
+实现把0030 runtime activation、0056只读历史和0057写入cutover分成不同权限。runtime active/history可读不代表capture可写；首次cutover必须在同一Memory原子边界或MySQL显式RR事务中重新锁定并核对选定checkpoint、当前49类来源、0031 binding/reservation、真实0030 activation及完整owner/source关系。新cutover收据另绑定新epoch、configured fleet、旧writer排空与producer就绪ACK。旧0053 activation/coverage/failure、原checkpoint叶和reservation descriptor不重签；新failure receipt改为绑定实际cutover receipt与新epoch。
 
 普通runner只需要既有本地capture gate与受保护ref key，不能因此获得operator restore权限。维护factory/activation仍独立要求exact run、受保护authenticated-v2制品和本地停服ACK；operator-only只能维护历史，不能借该flag claim/renew/reserve/create/ACK。cutover后的历史读取须证明immutable history、实际cutover和当前完整source/recovery链，允许合法新写/claim/ACK，不再永久要求当前49类投影等于导入前快照。首次cutover前仍要求精确冻结集合；不得提供通用skip-audit或allow-missing-source开关。
 
@@ -501,4 +505,16 @@ live owner/T1/policy/hold关闭后，已有reservation只可降为ACK-only：外
 
 新seal只有在49类锁定且真实逐operation source/member/owner/usage/billing完整审计后，才将其新增v2 membership作为validated；tenant的旧历史仍unknown。原sealed CP按实际受保护selector和完整物理身份/HMAC/state/highwater集合保留原knowledge，不能提升旧unknown或重签；旧unknown required源在首cutover INSERT前拒绝。MySQL include_v2领取在全图共享审计之前用实际logs control PK排他锁串行批次，避免两个RR审计互持job共享锁后都被`SKIP LOCKED`跳过。原审计、CAS与末租期校验不变；legacy-only仍RC。它不是吞吐提升：provider session→control与claim control→session反序仍可能触发1205/1213，必须原生透传并整事务回滚重试。
 
-0057增加两张append-only表、8新guard并轮换0053的subject/binding/job/failure四个BI；完整真实指纹为728 trigger。必须先关闭相关gate、停服排空全部pre-0057 writer/事务，再独立迁移、只启动0057-aware binary并forward-fix，不能热混跑。冻结0056旧binary的5例真实升级、真实SQL8例、Memory维护51、CLI107及独立Pi→GCM→新epoch→MinIO纵向1例分别已通过，失败与源码分段见PROGRESS，不能冒称新整包verify/verify-s3/CI或生产验收。重复备份/再次恢复后的epoch链、其它domain联合恢复、backup-copy erasure及全域completion仍不得据本切片宣称闭环；0054 restored destructive仍拒，0037/外部删除/自动清理及production gate不放开。
+0057增加两张append-only表、8新guard并轮换0053的subject/binding/job/failure四个BI；完整真实指纹为728 trigger。必须先关闭相关gate、停服排空全部pre-0057 writer/事务，再独立迁移、只启动0057-aware binary并forward-fix，不能热混跑。0055～0057已随main `3414b43` 推送；对应Memory/MySQL/冻结旧binary/CLI及Pi→GCM→新epoch→MinIO单次纵向已有本地分段验证，后续历史、cluster、构建/VM与相关S3门禁的实际源码和原失败均见PROGRESS。该SHA对应CI五job已全部success；本地分段仍不拼成一次完整coverage成功，更不等于生产验收或0058通过。0057自身不闭合再次备份后的epoch链（下一候选见§16）、其它domain联合恢复、backup-copy erasure及全域completion；0054 restored destructive仍拒，0037/外部删除/自动清理及production gate不放开。
+
+## 16. 0058 重复备份与多跳恢复候选（未验收）
+
+本树候选的目标是：primary→restore1保留旧pending并产生新失败→实际新backup2→fresh DB/never-used epoch2→显式continuation、原reservation精确续跑及新capture/cold startup。隔离指纹校准、真实SQL单套、历史及原单跳已有分段证据，原失败与过滤复验均保留，不拼成同一源码的一次全量成功。有界trigger batch后新增双跳在原180秒首次完整通过（178638.82ms），包括第二份ASMYSQL3、空库导入、五continuation、P2 ACK、新Pi/finalcold及cleanup；仅约1.36秒余量，有CI风险，不能称稳定提速或整包通过。300秒请求仍未答，未改180/CLI120/lease/断言，也不再以该请求阻断本地后续；完整verify/verify-s3/新CI未执行，候选未合入或部署/激活，见[PROGRESS](../PROGRESS.md)。
+
+只读startup优化仅在普通connect既有RR事务中建立私有nonce scope，按完整CP2输入与protected ref key身份去重已完整成功的void来源审计；不缓存失败、inflight或mutable返回对象，不跨connection/事务复用，逐operation检查仍执行。scope定向只证明所测边界，不证明完整MySQL锁行为或独立性能收益；后续有界trigger batch的双跳单次通过另列PROGRESS，不把组合效果归因于scope，也未用缓存替代来源授权。
+
+候选CP2使用独立scope/domain与必需lineage capsule，不改已发布CP v1的49类投影、旧root、receipt或descriptor。另封固定27个表级family，每族均显式count/root（含空集），以真实物理key和整行keyed HMAC覆盖此前checkpoint/叶、0030/0031来源、0056 history及v1/v2两种permit账本；只精确排除本backup自身的header/49叶/lineage叶，不整族过滤祖先。ASMYSQL3的新manifest/GCM AAD绑定CP2及capsule，ASMYSQL1/2字节和旧AAD语义不变。封存/导出窗口须真实全来源审计并前后零漂移；恢复后frontier的合法0030/0031增量必须由实际不可变event/run链独立证明，不能永久要求旧物理快照等于今日，也不能只凭epoch、时间或高水位放过变化。
+
+v2 permit另用append-only表，跨旧P1→新P2/P3保留genesis descriptor、实际latest predecessor和原R授权来源；原job快照与本次CP2快照分开，ancestor tuple及predecessor/authorizer的实际inclusion都须逐层验证，不reset为null、不重签旧许可。合法queued/reserved/legacy-unknown仍可被完整备份，unknown不因进入capsule而获得恢复执行或0054删除资格；当前选定backup必须recoverable，但不另要求所有祖先physical artifact永远存在。
+
+source维护必须是真实factory创建的closed/frozen facade并绑定actual pool，不能返回一般SessionStore或grant普通capture flag。恢复source的观察使用实际source runtime（不拿target2 epoch替代）、完整catalog/journal链和fresh head；预算包装不得替代真实读取结果。selected源prepare后已被原子fence，后续只能核外部完整authority与exact open reservation，不能继续读/mirror已fenced source。旧schema制品的显式跨迁移import→upgrade→continuation仍不在本候选验收内，必须在reserve/import前检查实际source schema并拒绝不支持路径，不能自动重导、清空部分target或隐式升级。0037、0054原primary-only destructive、全部默认关闭/production拒绝、外部删除/自动清理off和completion=false保持；不新增服务、JavaScript入口或镜像，也不推进M1冻结或M3。

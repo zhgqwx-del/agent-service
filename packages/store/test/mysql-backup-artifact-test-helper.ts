@@ -661,6 +661,8 @@ export class MySqlBackupArtifactFixture {
     };
     const dependencies: BackupCatalogCliDependencies = {
       connectStore: (options) => MysqlSessionStore.connect(options),
+      connectCaptureBackupSourceMaintenance: (options) =>
+        MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options),
       loadCatalogConfig: (env, context) => loadTenantBackupCatalogConfig(env, context),
       createCatalogAdapter: (config, operation) => createTenantBackupCatalogAdapter(config, operation),
       loadJournalConfig: (env, context) => loadTenantRestoreJournalConfig(env, context),

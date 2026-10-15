@@ -1,15 +1,27 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import mysql, { type RowDataPacket } from "mysql2/promise";
+import mysql, { type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { TenantRestoreJournalPublicationWorker } from "@agent-service/core";
+import { TenantRestoreJournalPublicationWorker, TenantRuntimeCoordinator } from "@agent-service/core";
+import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
+import {
+  DEFAULT_AUTH_POLICY,
+  persistedProviderCaptureConfiguredFleetRootSha256,
+  tenantRuntimeFleetSha256,
+  tenantRuntimeLocalReceiptSha256,
+  tenantRuntimeTargetReceiptsSha256,
+  tenantRuntimeTargetSha256,
+} from "@agent-service/protocol";
 import {
   MysqlSessionStore,
+  TenantCredentialResponsibilityIntegrityError,
   newErasureRequestId,
   newTenantBackupEvictionId,
   newTenantBackupId,
   tenantErasureRequestHash,
+  s3TenantTelemetryTargetIdentity,
+  readTenantTelemetryCaptureCheckpointFromMysql,
   type TenantBackupRuntimeReservation,
 } from "@agent-service/store";
 import {
@@ -21,6 +33,7 @@ import {
   loadTenantRestoreJournalConfig,
 } from "../src/tenant-restore-journal-config.js";
 import * as artifactOperations from "../src/mysql-backup-artifact.js";
+import type { BackupCatalogCliDependencies } from "../src/backup-catalog-cli.js";
 import {
   MySqlBackupArtifactFixture,
   backupArtifactIntegrationEnabled,
@@ -157,6 +170,179 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
     }
   }
 
+  // These are actual MySQL rows, not a new checkpoint family or a replacement
+  // responsibility codec. Only opaque digests/counts can reach assertion output.
+  const responsibilityTables = [
+    "tenant_credential_responsibility_sources", "tenant_credential_responsibility_entries",
+    "tenant_credential_responsibility_receipts", "tenant_credential_versions",
+    "tenant_credential_target_dispositions", "tenant_credential_provider_slots",
+    "tenant_credential_inventory_receipts", "tenant_credential_revocation_fences",
+    "tenant_credential_revocation_jobs", "tenant_credential_revocation_receipts",
+    "tenant_erasure_admissions", "tenant_runtime_revocation_jobs",
+    "tenant_runtime_revocation_target_receipts", "tenant_runtime_revocation_receipts",
+  ] as const;
+
+  async function responsibilityRows(url: string, tenantId: string) {
+    const connection = await mysql.createConnection(url);
+    try {
+      const rows = await Promise.all(responsibilityTables.map(async (table) => {
+        const [columns] = await connection.query<RowDataPacket[]>(
+          "SELECT COLUMN_NAME AS name FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME='PRIMARY' ORDER BY SEQ_IN_INDEX",
+          [table],
+        );
+        const names = columns.map((column) => {
+          if (typeof column.name !== "string" || !/^[a-z_][a-z0-9_]*$/.test(column.name)) {
+            throw new Error("responsibility_fixture_primary_key_invalid");
+          }
+          return `\`${column.name}\``;
+        });
+        if (!names.length) throw new Error("responsibility_fixture_primary_key_missing");
+        const [actual] = await connection.query<RowDataPacket[]>(
+          `SELECT * FROM \`${table}\` WHERE tenant_id=? ORDER BY ${names.join(",")}`, [tenantId],
+        );
+        return [table, { count: actual.length, sha256: sha256(Buffer.from(JSON.stringify(actual))) }] as const;
+      }));
+      return Object.fromEntries(rows);
+    } finally { await connection.end(); }
+  }
+
+  async function checkpointRows(url: string, backupId: string) {
+    const connection = await mysql.createConnection(url);
+    try {
+      const [header] = await connection.query<RowDataPacket[]>(
+        "SELECT * FROM tenant_telemetry_capture_backup_checkpoints WHERE backup_id=?", [backupId],
+      );
+      const [leaves] = await connection.query<RowDataPacket[]>(
+        "SELECT * FROM tenant_telemetry_capture_backup_checkpoint_leaves WHERE backup_id=? ORDER BY family,identity_ref_sha256", [backupId],
+      );
+      const [lineage] = await connection.query<RowDataPacket[]>(
+        "SELECT * FROM tenant_telemetry_capture_checkpoint_lineage_leaves WHERE backup_id=? ORDER BY family,identity_ref_sha256", [backupId],
+      );
+      expect(header).toHaveLength(1);
+      expect(leaves.length).toBeGreaterThan(0);
+      return { header: sha256(Buffer.from(JSON.stringify(header))),
+        leaves: sha256(Buffer.from(JSON.stringify(leaves))),
+        lineage: sha256(Buffer.from(JSON.stringify(lineage))) };
+    } finally { await connection.end(); }
+  }
+
+  async function nonemptyResponsibilitySource() {
+    const refKey = randomBytes(32), keyFile = join(fixture.privateDirectory, "byok-ref-key.bin");
+    await writeFile(keyFile, refKey, { mode: 0o600, flag: "wx" });
+    const tenantId = `${fixture.tenantId}-byok`, requestId = newErasureRequestId();
+    const origin = "http://127.0.0.1:18080";
+    const fleetRoot = persistedProviderCaptureConfiguredFleetRootSha256([
+      { url: origin, runnerId: "byok-artifact-fixture-runner" },
+    ]);
+    const options = { url: fixture.sourceUrl, connectionLimit: 2, migrationMode: "verify" as const,
+      tenantTelemetryRefKey: refKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true,
+      tenantTelemetryCaptureRestoreLocalOnly: true };
+    const store = await MysqlSessionStore.connect(options);
+    let publisher: TenantRestoreJournalPublicationWorker | undefined;
+    try {
+      await store.activateTenantCredentialTrackingCutover({ expectedControlGeneration: 0 });
+      // The real primary/journal already exists. Activate only the empty capture
+      // substrate; no telemetry object or provider-management request is made.
+      await store.activateTenantTelemetryLifecycle({ expectedControlGeneration: 0,
+        targets: (["logs", "traces"] as const).map((domain) => ({ domain,
+          ...s3TenantTelemetryTargetIdentity({ namespaceId: `byok-${fixture.runId}`,
+            failureDomainId: `fixture-${fixture.runId}`, bucket: fixture.catalogBucket,
+            prefix: `${fixture.catalogPrefix}/telemetry`, region: process.env.S3_TEST_REGION!,
+            endpoint: process.env.S3_TEST_ENDPOINT!,
+            forcePathStyle: process.env.S3_TEST_FORCE_PATH_STYLE === "1", domain,
+            allowInsecureHttpForLocalTest: true }) })) });
+      const lifecycle = await store.getTenantTelemetryLifecycleControl();
+      if (lifecycle.state !== "active") throw new Error("responsibility_fixture_lifecycle_missing");
+      const logs = (await store.listTenantTelemetryLifecycleTargets()).find((target) => target.domain === "logs");
+      if (!logs) throw new Error("responsibility_fixture_logs_target_missing");
+      await store.withTenantTelemetryCaptureOperatorFence((fence) => store.activateTenantTelemetryPersistedProviderCapture({
+        expectedControlGeneration: 0, lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256,
+        logsTargetSha256: logs.targetSha256, logsTargetReceiptSha256: logs.receiptSha256,
+        configuredFleetRootSha256: fleetRoot, fleetStoppedAck: "fleet-stopped-v1",
+        legacyWritersDrainedAck: "legacy-writers-drained-v1", producerReadyAck: "provider-step-error-v2-ready-v1",
+        localOnlyAck: "local-only-v1",
+      }, fence), { timeoutMs: 5_000 });
+      await store.setTenantAuth(tenantId, DEFAULT_AUTH_POLICY);
+      const coordinator = new TenantRuntimeCoordinator();
+      const outbound = vi.fn<typeof fetch>(async () => { throw new Error("unexpected_byok_fixture_fetch"); });
+      const cipher = new LocalAesGcmCipher(randomBytes(32).toString("hex"), "byok-shared-envelope-fixture");
+      const providers = new ProviderService({ store, cipher, tenantRuntime: coordinator, fetch: outbound,
+        assertBaseUrl: async () => {} });
+      coordinator.sealParticipants();
+      const apiKey = `byok-fixture-${randomUUID()}`;
+      await providers.upsertTenantProvider(tenantId, { id: "byok", api: "openai-completions",
+        baseUrl: "https://byok-artifact.invalid/v1", headers: {}, quota: {}, fallback: [], apiKey,
+        models: [{ id: "model", contextWindow: 1_000, maxOutputTokens: 10, input: ["text"], reasoning: false }] });
+      const model = await providers.resolve({ tenantId, userId: "byok-fixture-user" }, { provider: "byok", model: "model" });
+      expect((await model.apiKey()) === apiKey, "actual encrypted provider key must roundtrip").toBe(true);
+      const journalConfig = loadTenantRestoreJournalConfig(fixture.journalEnv(), { production: false, store: "mysql" });
+      if (!journalConfig) throw new Error("responsibility_fixture_journal_missing");
+      publisher = new TenantRestoreJournalPublicationWorker({ store,
+        adapters: createTenantRestoreJournalAdapters(journalConfig), canExecute: async () => true,
+        logger: { warn: () => {} } });
+      expect(await store.requestTenantErasure({ tenantId, requestId, requestedByKeyId: "byok-fixture-operator",
+        idempotencyKey: `byok-artifact-${randomUUID()}`, requestHash: tenantErasureRequestHash(tenantId), atMs: Date.now() }))
+        .toMatchObject({ status: "gated", generation: 1 });
+      expect(await publisher.processOnce()).toBe(1);
+      expect((await store.getTenantRestoreJournalPublicationBundle(tenantId, requestId))?.receipt)
+        .toMatchObject({ restoreFencePublicationComplete: true, allDomainsComplete: false });
+      let credentialClaim: Awaited<ReturnType<MysqlSessionStore["claimTenantCredentialRevocations"]>>[number] | undefined;
+      const due = Date.now() + 2_000;
+      while (!credentialClaim && Date.now() < due) {
+        credentialClaim = (await store.claimTenantCredentialRevocations({ limit: 10, leaseMs: 120_000,
+          claimToken: `byok-artifact-${randomUUID()}` })).find((claim) => claim.requestId === requestId);
+        if (!credentialClaim) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      if (!credentialClaim) throw new Error("responsibility_fixture_t3a_claim_missing");
+      const t3a = await store.revokeTenantCredentialMaterial({ tenantId, requestId,
+        subjectGeneration: credentialClaim.subjectGeneration, claimAttempt: credentialClaim.claimAttempt,
+        claimToken: credentialClaim.claimToken });
+      expect(t3a).not.toBeNull();
+      expect(await store.materializeTenantRuntimeRevocationJobs({ limit: 10 })).toBe(1);
+      const runtimeClaim = (await store.claimTenantRuntimeRevocations({ limit: 10, leaseMs: 120_000,
+        claimToken: `byok-runtime-${randomUUID()}` })).find((claim) => claim.requestId === requestId);
+      if (!runtimeClaim || !t3a) throw new Error("responsibility_fixture_t3b_claim_missing");
+      // Actual ProviderService participant drain, not a zeroed cache fixture.
+      // This is one in-process test runner, not an HTTP/fresh-fleet or zeroization claim.
+      const local = await coordinator.drain({ tenantId, requestId,
+        subjectGeneration: runtimeClaim.subjectGeneration, t3aReceiptSha256: t3a.receiptSha256 }, 1_000);
+      // The local model/cipher variables are not erased or asserted zeroized.
+      // Only the coordinator's actually registered references are evidenced.
+      expect(local.cacheEntryCountBefore).toBeGreaterThan(0);
+      expect([local.cacheEntryCountAfter, local.activeOperationCountAfter, local.activeTurnCountAfter]).toEqual([0, 0, 0]);
+      const body = { tenantId, requestId, subjectGeneration: runtimeClaim.subjectGeneration,
+        t3aReceiptSha256: t3a.receiptSha256, targetSha256: tenantRuntimeTargetSha256(origin),
+        runnerId: "byok-artifact-fixture-runner", bootId: "byok-artifact-fixture-boot",
+        cacheEntryCountBefore: local.cacheEntryCountBefore, cacheEntryCountAfter: 0 as const,
+        activeOperationCountBefore: local.activeOperationCountBefore, activeOperationCountAfter: 0 as const,
+        activeTurnCountBefore: local.activeTurnCountBefore, activeTurnCountAfter: 0 as const, completedAtMs: local.completedAtMs };
+      const targets = [{ ...body, receiptSha256: tenantRuntimeLocalReceiptSha256(body) }];
+      const t3b = await store.completeTenantRuntimeRevocation({ tenantId, requestId,
+        subjectGeneration: runtimeClaim.subjectGeneration, claimAttempt: runtimeClaim.claimAttempt,
+        claimToken: runtimeClaim.claimToken }, { targets, fleetSha256: tenantRuntimeFleetSha256(targets),
+        targetReceiptsSha256: tenantRuntimeTargetReceiptsSha256(targets) });
+      expect(t3b).not.toBeNull();
+      const readiness = await store.getTenantCredentialResponsibilityReadiness(tenantId, requestId);
+      expect(readiness).toMatchObject({ status: "local_responsibility_observed", localDatabase: "cleared",
+        trackedRuntimeReferences: "dropped_not_zeroized", remoteCredentials: "customer_responsibility_recorded",
+        customerManagedApiKeyCount: 1, unknownMaterialCount: 0, backupCopies: "unknown", otherCopies: "unknown",
+        t3aReceiptSha256: t3a.receiptSha256, t3bReceiptSha256: t3b!.receiptSha256,
+        executionReady: false, externalAuthorityVerified: false, allDomainsComplete: false, contentPurgeExecuted: false });
+      expect(readiness!.versionCount).toBeGreaterThan(0);
+      expect(outbound).not.toHaveBeenCalled();
+      const raw = await responsibilityRows(fixture.sourceUrl, tenantId);
+      expect(raw.tenant_credential_responsibility_sources?.count).toBe(1);
+      expect(raw.tenant_credential_responsibility_entries?.count).toBe(readiness!.versionCount);
+      expect(raw.tenant_credential_responsibility_receipts?.count).toBe(1);
+      for (const table of responsibilityTables) {
+        expect(raw[table]?.count, "actual responsibility/T1/T3a/T3b evidence must be nonempty").toBeGreaterThan(0);
+      }
+      const env = { TENANT_TELEMETRY_OPERATOR_REF_KEY_FILE: keyFile };
+      return { tenantId, requestId, readiness, raw, refKey, fleetRoot, env };
+    } catch (error) { refKey.fill(0); throw error; }
+    finally { try { await publisher?.stop(); } finally { await store.close(); } }
+  }
+
   async function refusedBeforeImport(extra: NodeJS.ProcessEnv, reason:
     "authentication_failed" | "artifact_length_mismatch" | "manifest_invalid" | "evidence_mismatch" | "catalog"
   ): Promise<void> {
@@ -239,6 +425,227 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
   }, 180_000);
 
   afterAll(async () => { await fixture?.cleanup(); }, 60_000);
+
+  it("preserves nonempty BYOK responsibility bytes through real backup, fresh import, selected maintenance and ordinary cold readiness", async () => independentFixture(async () => {
+    const source = await nonemptyResponsibilitySource();
+    const backupId = newTenantBackupId(), targetUrl = await fixture.newDatabase();
+    const maintenance = vi.fn((options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance>[0]) =>
+      MysqlSessionStore.connectTenantTelemetryCaptureArtifactRestoreMaintenance(options));
+    const dependencies: Partial<BackupCatalogCliDependencies> = {
+      connectCaptureArtifactRestoreMaintenance: maintenance,
+      connectCaptureRestoreMaintenance: (options) => MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options),
+    };
+    try {
+      const created = await success(await fixture.command("create-artifact", {
+        ...source.env, BACKUP_ID: backupId,
+      }, dependencies));
+      expect(created).toMatchObject({ backupId, artifactVerified: true });
+      expect(await responsibilityRows(fixture.sourceUrl, source.tenantId)).toEqual(source.raw);
+      const encrypted = await readFile(artifactPath(fixture, backupId));
+      expect(encrypted.subarray(0, 8).toString("ascii")).toBe("ASMYSQL2");
+      expect(encrypted.includes(source.refKey), "protected ref key must not be present in ciphertext output").toBe(false);
+      const originalCheckpoint = await checkpointRows(fixture.sourceUrl, backupId);
+      const reader = await mysql.createConnection(fixture.sourceUrl);
+      try {
+        const actual = await readTenantTelemetryCaptureCheckpointFromMysql(reader, backupId, source.refKey);
+        expect(actual?.checkpoint.scope).toBe("tenant-telemetry-capture-backup-checkpoint-v1");
+        expect(actual?.checkpoint.families).toHaveLength(49);
+        // 0059 is covered by the actual full dump and its own complete business
+        // audit, not by reinterpreting any of the immutable 49/27 old families.
+        expect(actual?.lineageLeaves ?? []).toEqual([]);
+      } finally { await reader.end(); }
+
+      const selected = { ...source.env, BACKUP_ID: backupId, RESTORE_RUN_ID: fixture.restoreRunId,
+        BACKUP_RUNTIME_EPOCH_ID: fixture.restoredEpochId, BACKUP_RESTORE_TARGET_MYSQL_URL: targetUrl };
+      expect(await success(await fixture.command("restore-selected", selected, dependencies)))
+        .toMatchObject({ backupId, restorePhase: "prepared", runtimeActivated: false });
+      // Independent native SELECTs prove every persisted old/new row survived
+      // the real dump/import byte-for-byte, before any maintenance continuation.
+      expect(await responsibilityRows(targetUrl, source.tenantId)).toEqual(source.raw);
+      expect(await checkpointRows(targetUrl, backupId)).toEqual(originalCheckpoint);
+      const restoredSchema = await fixture.schemaDifference(await fixture.schemaSnapshot(), targetUrl);
+      expect(restoredSchema).toMatchObject({ missingTables: 0, extraTables: 0, missingTriggers: 0, extraTriggers: 0 });
+      expect(Object.values(restoredSchema.metadataTableMismatchCounts)).toEqual([0, 0, 0, 0, 0, 0, 0]);
+      expect(Object.values(restoredSchema.triggerFieldMismatchCounts)).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+      await success(await fixture.command("replay-selected", { ...selected, BACKUP_RESTORE_REPLAY_ACK: "1" }, dependencies));
+      await success(await fixture.command("verify-selected", { ...selected, BACKUP_RESTORE_VERIFY_ACK: "1" }, dependencies));
+      await success(await fixture.command("activate-selected", { ...selected, BACKUP_RESTORE_RUNTIME_ACTIVATION_ACK: "1" }, dependencies));
+      const options = { url: targetUrl, connectionLimit: 2, migrationMode: "verify" as const,
+        tenantTelemetryRefKey: source.refKey, tenantTelemetryPersistedProviderCaptureLocalOnly: true };
+      // Read-only history is not ordinary runtime authority before capture cutover.
+      await expect(MysqlSessionStore.connect(options)).rejects.toThrow();
+      await success(await fixture.command("activate-capture-selected", { ...selected,
+        TELEMETRY_CAPTURE_RESTORED_EPOCH_ACTIVATION_ACK: "1", TELEMETRY_CAPTURE_LOCAL_ONLY_ACK: "1",
+        TELEMETRY_CAPTURE_FLEET_STOPPED_ACK: "1", TELEMETRY_CAPTURE_LEGACY_WRITERS_DRAINED_ACK: "1",
+        TELEMETRY_CAPTURE_PRODUCER_READY_ACK: "1", TELEMETRY_CAPTURE_CONFIGURED_FLEET_ROOT_SHA256: source.fleetRoot,
+      }, dependencies));
+      await success(await fixture.command("resolve-selected", { ...selected,
+        BACKUP_RESTORE_CATALOG_RESOLUTION_ACK: "1" }, dependencies));
+      expect(maintenance).toHaveBeenCalledTimes(5);
+      const cold = await MysqlSessionStore.connect(options);
+      try {
+        expect(await cold.getTenantRestoreReplayRun(fixture.restoreRunId)).toMatchObject({ phase: "active" });
+        expect(await cold.getTenantBackupRuntimeReservation(fixture.restoreRunId)).toMatchObject({ phase: "activated" });
+        expect(await cold.getTenantCredentialResponsibilityReadiness(source.tenantId, source.requestId)).toEqual(source.readiness);
+        expect((await cold.getProviderConfig(source.tenantId, "byok")) === null,
+          "cleared provider must not reappear after physical restore").toBe(true);
+        expect(await cold.getTenantCredentialResponsibilityReadiness(fixture.tenantId, source.requestId)).toBeNull();
+      } finally { await cold.close(); }
+      // New runtime/history rows may advance. The original CP/root and all
+      // responsibility/T1/T3a/T3b immutable evidence may not be re-signed.
+      expect(await responsibilityRows(targetUrl, source.tenantId)).toEqual(source.raw);
+      expect(await checkpointRows(targetUrl, backupId)).toEqual(originalCheckpoint);
+    } finally { source.refKey.fill(0); }
+  }), 180_000);
+
+  it("rejects a missing actual 0059 guard after a valid nonempty BYOK baseline before publishing any new artifact", async () => independentFixture(async () => {
+    const source = await nonemptyResponsibilitySource();
+    const backupId = newTenantBackupId();
+    const options = { url: fixture.sourceUrl, connectionLimit: 2, tenantTelemetryRefKey: source.refKey,
+      fleetStoppedAck: "fleet-stopped-v1" as const, localOnlyAck: "local-only-v1" as const };
+    const connection = await mysql.createConnection(fixture.sourceUrl);
+    try {
+      // The exact factory must pass before the single causal schema mutation.
+      // This prevents a setup failure from masquerading as the negative oracle.
+      const valid = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options);
+      await valid.close();
+      expect(await responsibilityRows(fixture.sourceUrl, source.tenantId)).toEqual(source.raw);
+      const [guards] = await connection.query<RowDataPacket[]>(
+        "SELECT TRIGGER_NAME AS name FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME='trg_credential_responsibility_sources_bu'",
+      );
+      expect(guards).toHaveLength(1);
+      // Privileged tamper only in this owned disposable DB. No product method
+      // obtains DDL authority and the fixture later drops only its own database.
+      await connection.query("DROP TRIGGER trg_credential_responsibility_sources_bu");
+      await expect(MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options))
+        .rejects.toThrow("0059 credential responsibility fingerprint verification failed");
+      const sourceFactory = vi.fn((input: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) =>
+        MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(input));
+      const createArtifact = vi.fn(artifactOperations.createMySqlBackupArtifact);
+      const importArtifact = vi.fn(artifactOperations.importVerifiedMySqlBackupArtifact);
+      await failure(await fixture.command("create-artifact", { ...source.env, BACKUP_ID: backupId }, {
+        connectCaptureBackupSourceMaintenance: sourceFactory,
+        artifactOperations: { ...artifactOperations, createMySqlBackupArtifact: createArtifact,
+          importVerifiedMySqlBackupArtifact: importArtifact },
+      }));
+      expect(sourceFactory).toHaveBeenCalledOnce();
+      expect(createArtifact).not.toHaveBeenCalled();
+      expect(importArtifact).not.toHaveBeenCalled();
+      for (const table of ["backup_snapshot_anchors", "backup_catalog_entries", "tenant_telemetry_capture_backup_checkpoints"] as const) {
+        const [rows] = await connection.query<RowDataPacket[]>(`SELECT COUNT(*) AS n FROM \`${table}\` WHERE backup_id=?`, [backupId]);
+        expect(Number(rows[0]?.n)).toBe(0);
+      }
+      await expect(stat(artifactPath(fixture, backupId))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await responsibilityRows(fixture.sourceUrl, source.tenantId)).toEqual(source.raw);
+    } finally { await connection.end(); source.refKey.fill(0); }
+  }), 180_000);
+
+  it("rejects corrupted BYOK business evidence after a real full import with exact guards before target prepare", async () => independentFixture(async () => {
+    const source = await nonemptyResponsibilitySource();
+    const backupId = newTenantBackupId(), targetUrl = await fixture.newDatabase();
+    let importCompleted = false, mutationCount = 0, guardRestoredExactly = false;
+    let targetResponsibilityRejected = false;
+    let importedMarkersSha256 = "", restoredMarkersSha256 = "";
+    try {
+      await success(await fixture.command("create-artifact", { ...source.env, BACKUP_ID: backupId }));
+      const originalArtifactSha256 = sha256(await readFile(artifactPath(fixture, backupId)));
+      expect(await responsibilityRows(fixture.sourceUrl, source.tenantId)).toEqual(source.raw);
+      const importArtifact = vi.fn(async (...args: Parameters<typeof artifactOperations.importVerifiedMySqlBackupArtifact>) => {
+        // The product imports authenticated bytes and verifies its actual schema
+        // first. The only mutation is afterwards in this exact owned target,
+        // before the CLI cold-opens its target source-maintenance factory.
+        const result = await artifactOperations.importVerifiedMySqlBackupArtifact(...args);
+        importCompleted = true;
+        const before = await fixture.schemaSnapshot(targetUrl);
+        const connection = await mysql.createConnection(targetUrl);
+        try {
+          const [markers] = await connection.query<RowDataPacket[]>("SELECT * FROM schema_migrations ORDER BY BINARY name");
+          importedMarkersSha256 = sha256(Buffer.from(JSON.stringify(markers)));
+          const [definitions] = await connection.query<RowDataPacket[]>(
+            "SHOW CREATE TRIGGER trg_credential_responsibility_sources_bu",
+          );
+          const definition = definitions[0];
+          const ddl: unknown = definition?.["SQL Original Statement"];
+          const sqlMode: unknown = definition?.sql_mode;
+          const charset: unknown = definition?.character_set_client;
+          const collation: unknown = definition?.collation_connection;
+          if (typeof ddl !== "string" || typeof sqlMode !== "string"
+            || typeof charset !== "string" || typeof collation !== "string") {
+            throw new Error("byok_fixture_original_trigger_metadata_missing");
+          }
+          await connection.query("DROP TRIGGER trg_credential_responsibility_sources_bu");
+          const [changed] = await connection.query<ResultSetHeader>(
+            "UPDATE tenant_credential_responsibility_sources SET source_json=JSON_SET(source_json,'$.secretEnvelopeSha256',?) WHERE tenant_id=?",
+            ["0".repeat(64), source.tenantId],
+          );
+          mutationCount = changed.affectedRows;
+          // Restore the actual original definition under its exact recorded
+          // parser metadata, not a fabricated guard/fingerprint or a bypass.
+          await connection.query("SET SESSION sql_mode=?", [sqlMode]);
+          await connection.query("SET SESSION character_set_client=?, collation_connection=?", [charset, collation]);
+          await connection.query(ddl);
+          const [restoredMarkers] = await connection.query<RowDataPacket[]>("SELECT * FROM schema_migrations ORDER BY BINARY name");
+          restoredMarkersSha256 = sha256(Buffer.from(JSON.stringify(restoredMarkers)));
+        } finally { await connection.end(); }
+        const after = await fixture.schemaSnapshot(targetUrl);
+        guardRestoredExactly = before.triggers.size === 743 && after.triggers.size === 743
+          && before.schemaSha256 === after.schemaSha256;
+        return result;
+      });
+      const targetFactory = vi.fn(async (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) => {
+        try { return await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options); }
+        catch (error) {
+          // This exact factory first runs the real committed strict schema
+          // verifier. The distinct business-integrity error proves it reached
+          // 0059 projection after that verifier, not a source/setup schema error.
+          if (options.url === targetUrl && error instanceof TenantCredentialResponsibilityIntegrityError) {
+            targetResponsibilityRejected = true;
+          }
+          throw error;
+        }
+      });
+      const exactMaintenance = vi.fn((options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance>[0]) =>
+        MysqlSessionStore.connectTenantTelemetryCaptureRestoreMaintenance(options));
+      const rejected = await fixture.command("restore-selected", { ...source.env, BACKUP_ID: backupId,
+        RESTORE_RUN_ID: fixture.restoreRunId, BACKUP_RUNTIME_EPOCH_ID: fixture.restoredEpochId,
+        BACKUP_RESTORE_TARGET_MYSQL_URL: targetUrl,
+      }, { connectCaptureBackupSourceMaintenance: targetFactory,
+        connectCaptureRestoreMaintenance: exactMaintenance,
+        artifactOperations: { ...artifactOperations, importVerifiedMySqlBackupArtifact: importArtifact } });
+      await failure(rejected);
+      expect(JSON.parse(rejected.stderr)).toMatchObject({ reservationMayBeConsumed: true,
+        targetMayContainPartialImport: true, requiresManualForwardFix: true, runtimeActivated: false });
+
+      expect(importArtifact).toHaveBeenCalledOnce();
+      expect(importCompleted, "actual native import and its schema verification must finish").toBe(true);
+      expect(mutationCount).toBe(1);
+      expect(guardRestoredExactly, "all 743 original guards and schema must be byte-equivalent after tamper").toBe(true);
+      expect(importedMarkersSha256).toMatch(SHA256);
+      expect(restoredMarkersSha256).toBe(importedMarkersSha256);
+      expect(targetFactory.mock.calls.filter(([options]) => options.url === targetUrl)).toHaveLength(1);
+      expect(targetResponsibilityRejected, "actual target projection, not schema/setup, must reject the sidecar").toBe(true);
+      expect(exactMaintenance).not.toHaveBeenCalled();
+      const target = await mysql.createConnection(targetUrl);
+      try {
+        for (const table of ["tenant_restore_replay_runs", "backup_restore_source_bindings", "backup_runtime_reservations",
+          "tenant_telemetry_capture_restore_bindings", "tenant_telemetry_capture_restore_history_receipts", "tenant_telemetry_capture_epoch_cutovers"] as const) {
+          const [rows] = await target.query<RowDataPacket[]>(`SELECT COUNT(*) AS n FROM \`${table}\` WHERE restore_run_id=?`, [fixture.restoreRunId]);
+          expect(Number(rows[0]?.n), "target prepare/activation must not advance after business rejection").toBe(0);
+        }
+      } finally { await target.end(); }
+      expect((await fixture.tableNames(targetUrl)).length, "failed target remains physically imported for explicit forward-fix").toBeGreaterThan(0);
+      const corrupted = await responsibilityRows(targetUrl, source.tenantId);
+      expect(corrupted.tenant_credential_responsibility_sources?.sha256)
+        .not.toBe(source.raw.tenant_credential_responsibility_sources?.sha256);
+      for (const table of responsibilityTables.filter((table) => table !== "tenant_credential_responsibility_sources")) {
+        expect(corrupted[table], "original receipts/version/T1/T3a/T3b must remain unmodified").toEqual(source.raw[table]);
+      }
+      expect(sha256(await readFile(artifactPath(fixture, backupId)))).toBe(originalArtifactSha256);
+      // No retry, re-import, target clearing or automatic repair is attempted.
+      // The pre-existing fixture cleanup owns the final disposable DB removal.
+    } finally { source.refKey.fill(0); }
+  }), 180_000);
 
   it("creates a real encrypted full artifact, binds actual digests, and verifies it without plaintext output", async () => {
     expect(baseline).toMatchObject({
@@ -885,6 +1292,13 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
           throw new Error(`private-post-import-${fixture.payloadCanary}`);
         }
         return MysqlSessionStore.connect(options);
+      },
+      connectCaptureBackupSourceMaintenance: async (options) => {
+        if (options.url === targetUrl) {
+          targetConnectFailureInjected = true;
+          throw new Error(`private-post-import-${fixture.payloadCanary}`);
+        }
+        return MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options);
       },
     });
     await failure(crashed);

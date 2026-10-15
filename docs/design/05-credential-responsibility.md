@@ -1,8 +1,8 @@
 # BYOK 本系统责任来源与只读状态
 
-> 2026-10-15T22:19Z：独立 `codex/m1-byok-responsibility`（base已发布3414）的Memory/Provider/T3a/T3b/tenant GET责任链代码已接；正式具名55项零失败/跳过，重验子集不累计。SQL inactive责任source发布窄修后最终typecheck/scan737/diffcheck通过；两次bounded静态review未报其它确定P0–P2，不代替DB验收。原API/SDK、22:14和失败证据保留于[PROGRESS](../PROGRESS.md)末节。MySQL0059仍是三独立表/八guard/八个已编写SQL病例的草稿，全部SQL病例未跑：八指纹为零、缺真实0058前置，未执行DB/历史/完整verify/新CI；不可发布、不合入/部署/激活。本文仍是有限合同，不是全包验收证明。
+> 当前组合定向检查点（2026-10-15）：本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合，未合main/push，冻结检查点commit以独占全量日志sourceCommit为准。0059三表/八guard/八非零根/全743trigger已真实校准；SQL首整8为7pass/1夹具CAS失败，修后仅失败例1pass/7filtered，不称同次8/8。组合named四纯55项、capture三纯276项各零fail/skip，真实冻结LOCAL24d旧binary→0059历史3项通过，不称发布0058；新增BYOK真MySQL/MinIO selected3pass/18filtered、95.50秒，实际非空full import/维护续接/cold和恢复743guards后target业务拒绝均执行，首两轮0pass/3夹具失败保留。旧49/27、T1/T3a/T3b与责任rows保持；四处维护责任投影store5f3d7bf静态review无确定P0–P2，不替代功能包验收。精确报告见[PROGRESS](../PROGRESS.md)，下方合同/历史边界保留。
 
-> 22:37Z补记：另一树0058经有界trigger batch首次原180秒完整双跳通过（178638.82ms），含newPi/finalcold/cleanup，仅约1.36秒余量，整包verify/verify-s3/新CI仍待；300秒未答不再阻断本地后续。0059仍未整合该前置、八根0/八SQL病例未跑，不借其定向证据替代本包验收。main仍clean3414，M1未冻结/M2冻结/M3未开始；0037、0054原primary-only destructive、外删/自动off、旧收据不重签/unknown不提升及completion=false不变。
+> 最后两处test夹具修后typecheck、secret scan747及diffcheck通过；完整verify/verify-s3/新CI尚待，不可称可发布或生产验收。组合登记required142 unique/68groups、历史52仅登记。当前下一步coherent功能包冻结后一次完整verify及相关verify-s3，不再无界追加小切片。0058原180秒178638.82ms仅约1.36秒余量的CI风险与300秒待答保留，预算/断言不变；main仍clean3414、旧五CI仅证明旧SHA。M1未冻结/M2冻结/M3未开始，0037/0054原primary-only/外删自动off/旧收据不重签/unknown不提升/completion=false不变。
 
 ## 责任范围
 
@@ -52,4 +52,4 @@ T3a 在清除 live credential、退休版本和封存既有 inventory/receipt �
 - 不调用厂商管理 API，不影响邻租户或共享平台 key，状态鉴权和 no-store 保持；
 - 整合后的真实 MySQL、历史升级及备份恢复，以及对应源码的功能包验证与最终 CI。
 
-当前只允许独立预编码和纯测试；root 统一运行验证、安排迁移整合/指纹校准和真实数据库测试。通过本包仍不等于 M1 冻结，更不等于 M3/M4 或生产环境验收完成。
+当前下一步是冻结已接通的coherent组合功能包，由root统一做一次完整verify及相关verify-s3并补齐剩余发布门禁；不再把独立预编码或新增休眠层当交付。通过本有限包仍不等于M1冻结，更不等于M3/M4或生产环境验收完成。

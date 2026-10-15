@@ -868,7 +868,8 @@ import * as CaptureRestore from "./tenant-telemetry-capture-restore.js";
 import type { TenantTelemetryCaptureBackupCheckpointRecord, TenantTelemetryCaptureBackupCheckpointStore,
   SealTenantTelemetryCaptureBackupCheckpointInput, AssertTenantTelemetryCaptureBackupCheckpointUnchangedInput,
   TenantTelemetryCaptureRestoreBackupBinding, TenantTelemetryCaptureRestoreMaintenanceSelector,
-  ActivateTenantTelemetryCaptureRestoredEpochInput,
+  ActivateTenantTelemetryCaptureRestoredEpochInput, TenantTelemetryCaptureBackupSourceMaintenance,
+  TenantTelemetryCaptureBackupSourceMaintenanceInput,
   TenantTelemetryCaptureRestoreMaintenance } from "./tenant-telemetry-capture-restore-store.js";
 import { validateTenantTelemetryCaptureRestoreMaintenanceSelector, validateActivateTenantTelemetryCaptureRestoredEpochInput } from "./tenant-telemetry-capture-restore-store.js";
 import * as BackupCatalogAdapter from "./backup-catalog-adapter/common.js";
@@ -925,6 +926,7 @@ type MemoryCaptureRestoreMaintenanceContext = {
   selector: Readonly<TenantTelemetryCaptureRestoreMaintenanceSelector>;
   record: TenantTelemetryCaptureBackupCheckpointRecord;
   originalRuntime: Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>;
+  sourceRuntime: Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>;
 };
 const clone = <T>(v: T): T => structuredClone(v);
 
@@ -1624,10 +1626,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private readonly tenantTelemetryCaptureRestoreBackupBindings = new Map<string, TenantTelemetryCaptureRestoreBackupBinding>();
   private readonly tenantTelemetryCaptureRestoreHistories = new Map<string, CaptureRestore.TenantTelemetryCaptureRestoreHistoryReceipt>();
   private readonly tenantTelemetryCaptureEpochCutovers = new Map<string, CaptureRestore.TenantTelemetryCaptureEpochCutoverReceipt>();
-  private readonly tenantTelemetryCaptureRecoveryPermits = new Map<string, CaptureRestore.TenantTelemetryCaptureOperationRecoveryPermit>();
+  private readonly tenantTelemetryCaptureRecoveryPermits = new Map<string, CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit>();
   // This context exists only inside synchronous, private source READ audits.
   // It is never exposed, retained across await, or used for destructive eligibility.
   private captureRestoreMaintenanceReadContext?: MemoryCaptureRestoreMaintenanceContext;
+  /** Synchronous recursion detection only, never durable proof or permission. */
+  private readonly captureLineageAuditing = new Set<string>();
 
   constructor(
     private readonly storeClock: { now(): number } = { now: () => Date.now() },
@@ -1684,6 +1688,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       "storeDbTimestampMs", "activatedAtDbMs", "boundAtDbMs", "startedAtDbMs", "sourceHighWaterDbMs",
       "coverageStartedAtDbMs", "capturedAtDbMs", "acceptedAtDbMs", "t1AcceptedAtDbMs", "markedAtDbMs",
       "releasedAtDbMs", "deletedAtMs", "deletedAtDbMs", "reservedAtDbMs"];
+    names.push("sealedAtDbMs", "issuedAtDbMs");
     let high = 0;
     for (const name of names) {
       const field: unknown = (value as Record<string, unknown>)[name];
@@ -1828,13 +1833,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const key = this.tenantTelemetryRefKeyForUse();
     const anchor = this.tenantBackupSnapshotAnchors.get(backupId);
     const catalog = this.readTenantBackupCatalogControl();
-    const runtime = maintenance?.originalRuntime ?? this.readTenantRestoreRuntimeControl();
+    const runtime = maintenance?.sourceRuntime ?? this.readTenantRestoreRuntimeControl();
     const journal = this.readTenantRestoreJournalControl();
     const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
     const blob = this.readMemoryBlobStorageControl();
     const head = maintenance && anchor ? { catalogSequence: anchor.sourceCatalogSequence,
       catalogEventRootSha256: anchor.sourceCatalogEventRootSha256 } : this.tenantBackupCatalogHeadForRead();
-    if (!anchor || catalog.state !== "active" || runtime.state !== "active" || runtime.lineageKind !== "primary"
+    if (!anchor || catalog.state !== "active" || runtime.state !== "active"
       || journal.controlGeneration !== 1 || lifecycle.state !== "active" || blob.controlGeneration !== 1
       || anchor.backupId !== backupId || anchor.controlEvidenceSha256 !== catalog.evidenceSha256
       || anchor.sourceRuntimeEpochSha256 !== runtime.runtimeEpochSha256
@@ -1931,14 +1936,22 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     for (const [index, row] of this.usageLedger.entries()) add("operational_usage", [index, row.usageId ?? null], row,
       "record", row.usageId === undefined || !this.turns.has(row.turnId) ? "legacy_unknown" : "validated_projection");
     const leaves = CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_FAMILIES.flatMap((family) => grouped.get(family)!);
-    const controlHighWaterDbMs = Math.max(highWater(capture), highWater(lifecycle), highWater(runtime), highWater(journal), highWater(catalog), highWater(blob));
-    const checkpoint = CaptureRestore.createTenantTelemetryCaptureBackupCheckpoint({ backupId, anchorSha256: anchor.anchorSha256,
+    const restored = runtime.lineageKind === "restore" && !maintenance ? this.memoryRestoredCaptureContext() : null;
+    const lineage = runtime.lineageKind === "restore" ? maintenance
+      ? maintenance.record.checkpoint.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE
+        ? { capsule: maintenance.record.checkpoint.lineage, leaves: maintenance.record.lineageLeaves! } : null
+      : restored ? this.collectMemoryCaptureLineage(backupId, anchor, restored) : null : null;
+    if (runtime.lineageKind === "restore" && !lineage) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    const controlHighWaterDbMs = Math.max(highWater(capture), highWater(lifecycle), highWater(runtime), highWater(journal), highWater(catalog), highWater(blob), lineage?.capsule.sourceHighWaterDbMs ?? 0);
+    const header: CaptureRestore.TenantTelemetryCaptureBackupCheckpointHeader = { backupId, anchorSha256: anchor.anchorSha256,
       anchorCreatedAtDbMs: anchor.createdAtDbMs, controlHighWaterDbMs,
       logicalDatabaseNamespaceSha256: runtime.logicalDatabaseNamespaceSha256, schemaMigrationRootSha256: this.tenantBackupSchemaMigrationRootSha256,
-      sourceRuntimeLineageKind: "primary", sourceRuntimeEpochSha256: runtime.runtimeEpochSha256,
-      sourceRuntimeBindingSha256: PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime, journal),
+      sourceRuntimeLineageKind: runtime.lineageKind, sourceRuntimeEpochSha256: runtime.runtimeEpochSha256,
+      sourceRuntimeBindingSha256: runtime.lineageKind === "primary" ? PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(runtime, journal)
+        : CaptureRestore.tenantTelemetryCaptureRestoreRuntimeBindingSha256(runtime, journal),
       sourceRuntimeControlEvidenceSha256: runtime.evidenceSha256, sourceRuntimeControlGeneration: runtime.controlGeneration,
-      sourceHistoryReceiptSha256: null, sourceCaptureCutoverReceiptSha256: null,
+      sourceHistoryReceiptSha256: lineage?.capsule.sourceHistoryReceiptSha256 ?? null,
+      sourceCaptureCutoverReceiptSha256: lineage?.capsule.sourceCaptureCutoverReceiptSha256 ?? null,
       originalRuntimeEpochSha256: capture.runtimeEpochSha256, originalRuntimeBindingSha256: capture.runtimeBindingSha256,
       originalCaptureActivationReceiptSha256: capture.receiptSha256, refKeyIdSha256: capture.refKeyIdSha256,
       lifecycleControlEvidenceSha256: lifecycle.activationEvidenceSha256, captureControlEvidenceSha256: capture.receiptSha256,
@@ -1946,8 +1959,128 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       journalControlEvidenceSha256: journal.evidenceSha256, journalTargetRootSha256: journal.targetRootSha256,
       journalHeadRootSha256: runtime.verifiedHeadRootSha256, catalogControlEvidenceSha256: catalog.evidenceSha256,
       catalogHeadSequence: head.catalogSequence, catalogHeadRootSha256: head.catalogEventRootSha256,
-      blobStorageControlEvidenceSha256: blob.evidenceSha256, sealedAtDbMs: this.storeNowMs() }, leaves, key);
-    return { checkpoint, leaves };
+      blobStorageControlEvidenceSha256: blob.evidenceSha256, sealedAtDbMs: this.storeNowMs() };
+    const checkpoint = lineage ? CaptureRestore.createTenantTelemetryCaptureBackupCheckpointV2(header, leaves, lineage.capsule, lineage.leaves, key)
+      : CaptureRestore.createTenantTelemetryCaptureBackupCheckpoint(header, leaves, key);
+    return { checkpoint, leaves, ...(lineage ? { lineageLeaves: lineage.leaves } : {}) };
+  }
+
+  /** Backend-bound per-row source, never caller supplied. All 27 physical
+   * families are represented even when empty. Only this new backup's own rows
+   * are excluded; earlier checkpoints and their complete leaves remain. */
+  private memoryCaptureLineageRows(backupId: string) {
+    type Family = CaptureRestore.TenantTelemetryCaptureLineageFamily;
+    const key = this.tenantTelemetryRefKeyForUse();
+    const leaves: CaptureRestore.TenantTelemetryCaptureLineageLeaf[] = [];
+    const index = new Map<string, CaptureRestore.TenantTelemetryCaptureLineageLeaf>();
+    const add = (family: Family, physicalKey: unknown, record: unknown) => {
+      const id = PersistedCapture.persistedProviderCaptureCanonicalJson(physicalKey);
+      const identityRefSha256 = (family === "recovery_permit" || family === "recovery_permit_v2") && typeof physicalKey === "string"
+        ? CaptureRestore.tenantTelemetryCaptureLineagePermitIdentitySha256(physicalKey, key, family === "recovery_permit_v2" ? 2 : 1)
+        : CaptureRestore.tenantTelemetryCaptureLineageOpaqueDigest(family, "identity",
+          Buffer.from(PersistedCapture.persistedProviderCaptureCanonicalJson({ backend: "memory-v1", physicalKey })), key);
+      const leaf = { family, identityRefSha256, recordHmacSha256: CaptureRestore.tenantTelemetryCaptureLineageOpaqueDigest(family, "record",
+        Buffer.from(PersistedCapture.persistedProviderCaptureCanonicalJson({ backend: "memory-v1", physicalKey, record })), key),
+        sourceHighWaterDbMs: this.memoryCaptureCheckpointHighWater(record) };
+      CaptureRestore.validateTenantTelemetryCaptureLineageLeaf(leaf);
+      if (index.has(`${family}:${id}`)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      index.set(`${family}:${id}`, leaf); leaves.push(leaf);
+    };
+    for (const [id, record] of this.tenantTelemetryCaptureBackupCheckpoints) {
+      this.validateMemoryCaptureCheckpointRecord(id, record);
+      if (id === backupId) continue;
+      add("checkpoint", id, record.checkpoint);
+      for (const leaf of record.leaves) add("checkpoint_leaf", [id, leaf.family, leaf.identityRefSha256], leaf);
+      for (const leaf of record.lineageLeaves ?? []) add("checkpoint_lineage_leaf", [id, leaf.family, leaf.identityRefSha256], leaf);
+    }
+    const rows: readonly [Family, Iterable<readonly [unknown, unknown]>][] = [
+      ["restore_binding", this.tenantTelemetryCaptureRestoreBackupBindings], ["restore_history", this.tenantTelemetryCaptureRestoreHistories],
+      ["epoch_cutover", this.tenantTelemetryCaptureEpochCutovers],
+      ["journal_job", this.tenantRestoreJournalPublicationJobs], ["journal_target", this.tenantRestoreJournalPublicationTargets],
+      ["journal_ack", this.tenantRestoreJournalPublicationTargetAcks], ["journal_receipt", this.tenantRestoreJournalPublicationReceipts],
+      ["restore_fence", this.tenantRestoreFences], ["replay_entry", this.tenantRestoreReplayEntries],
+      ["runtime_control", this.tenantRestoreRuntimeControls], ["runtime_head", this.tenantRestoreRuntimeHeads],
+      ["runtime_known_entry", this.tenantRestoreRuntimeKnownEntries], ["runtime_event", this.tenantRestoreRuntimeControlEvents],
+      ["catalog_event", this.tenantBackupCatalogExternalEvents], ["catalog_anchor", this.tenantBackupSnapshotAnchors],
+      ["catalog_entry", this.tenantBackupCatalogEntries], ["catalog_source_binding", this.tenantBackupRestoreSourceBindings],
+      ["catalog_reservation", this.tenantBackupRuntimeReservations], ["catalog_eviction", this.tenantBackupCatalogEvictions],
+    ];
+    for (const [family, source] of rows) for (const [id, row] of source) add(family, id, row);
+    for (const [id, row] of this.tenantTelemetryCaptureRecoveryPermits) add(
+      row.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE ? "recovery_permit_v2" : "recovery_permit", id, row);
+    for (const [id, control] of this.tenantRestoreJournalControls) add("journal_control", id,
+      { ...control, targets: [...this.tenantRestoreJournalControlTargets] });
+    for (const [id, control] of this.tenantBackupCatalogControls) add("catalog_control", id,
+      { ...control, head: this.tenantBackupCatalogHeadForRead() });
+    for (const [id, run] of this.tenantRestoreReplayRuns) add("replay_run", id,
+      { ...run, sealedTargets: [...this.tenantRestoreReplaySealedTargets].filter(([rowKey, row]) => rowKey === this.tenantRestoreReplaySealedTargetKey(id, row.targetOrdinal)),
+        receipt: this.tenantRestoreReplayReceipts.get(id) ?? null });
+    return { leaves, lookup: (family: Family, physicalKey: unknown) => {
+      const result = index.get(`${family}:${PersistedCapture.persistedProviderCaptureCanonicalJson(physicalKey)}`);
+      if (!result) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError(); return result;
+    } };
+  }
+
+  private collectMemoryCaptureLineage(backupId: string, anchor: BackupCatalog.TenantBackupSnapshotAnchor,
+    context: ReturnType<MemorySessionStore["memoryRestoredCaptureContext"]> & {}) {
+    if (!context.cutover) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    const rows = this.memoryCaptureLineageRows(backupId);
+    const ancestors: CaptureRestore.TenantTelemetryCaptureLineageAncestor[] = [];
+    for (const [id, history] of this.tenantTelemetryCaptureRestoreHistories) {
+      const actual = this.memoryCaptureHistoricalContext(id, "operator");
+      const cutover = this.tenantTelemetryCaptureEpochCutovers.get(id) ?? null;
+      const checkpoint = rows.lookup("checkpoint", actual.record.checkpoint.backupId), historical = rows.lookup("restore_history", id),
+        binding = rows.lookup("restore_binding", id), event = rows.lookup("runtime_event", history.runtimeControlGeneration),
+        cutoverLeaf = cutover ? rows.lookup("epoch_cutover", id) : null;
+      ancestors.push({ restoreRunId: id, checkpointSha256: actual.record.checkpoint.checkpointSha256,
+        historyReceiptSha256: history.receiptSha256, cutoverReceiptSha256: cutover?.receiptSha256 ?? null,
+        runtimeEpochSha256: history.runtimeEpochSha256, runtimeBindingSha256: history.runtimeBindingSha256,
+        runtimeControlGeneration: history.runtimeControlGeneration,
+        checkpointIdentityRefSha256: checkpoint.identityRefSha256, checkpointRecordHmacSha256: checkpoint.recordHmacSha256,
+        historyIdentityRefSha256: historical.identityRefSha256, historyRecordHmacSha256: historical.recordHmacSha256,
+        cutoverIdentityRefSha256: cutoverLeaf?.identityRefSha256 ?? null, cutoverRecordHmacSha256: cutoverLeaf?.recordHmacSha256 ?? null,
+        restoreBindingIdentityRefSha256: binding.identityRefSha256, restoreBindingRecordHmacSha256: binding.recordHmacSha256,
+        runtimeEventIdentityRefSha256: event.identityRefSha256, runtimeEventRecordHmacSha256: event.recordHmacSha256 });
+    }
+    const capsule = CaptureRestore.createTenantTelemetryCaptureLineageCapsule({ backupId, anchorSha256: anchor.anchorSha256,
+      refKeyIdSha256: this.persistedProviderCaptureActivation!.refKeyIdSha256, sourceRestoreRunId: context.selector.restoreRunId,
+      sourceCheckpointSha256: context.record.checkpoint.checkpointSha256, sourceHistoryReceiptSha256: context.history.receiptSha256,
+      sourceCaptureCutoverReceiptSha256: context.cutover.receiptSha256, sourceRuntimeEpochSha256: context.runtime.runtimeEpochSha256,
+      sourceRuntimeBindingSha256: context.cutover.runtimeBindingSha256, sourceRuntimeControlEvidenceSha256: context.runtime.evidenceSha256,
+      sourceRuntimeControlGeneration: context.runtime.controlGeneration, sealedAtDbMs: this.storeNowMs() }, rows.leaves, ancestors, this.tenantTelemetryRefKeyForUse());
+    return { capsule, leaves: rows.leaves };
+  }
+
+  private auditMemoryCaptureLineageSnapshot(context: MemoryCaptureRestoreMaintenanceContext): void {
+    this.auditMemoryCaptureLineageRecord(context.record);
+  }
+  private auditMemoryCaptureLineageRecord(record: TenantTelemetryCaptureBackupCheckpointRecord): void {
+    const checkpoint = record.checkpoint;
+    if (checkpoint.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) return;
+    if (this.captureLineageAuditing.has(checkpoint.backupId)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    this.captureLineageAuditing.add(checkpoint.backupId);
+    try {
+    this.validateMemoryCaptureCheckpointRecord(checkpoint.backupId, record);
+    // Real validators reconstruct every mutable projector from its immutable
+    // event/run authority; snapshot HMAC is never a replacement for that proof.
+    this.assertTenantRestoreJournalGlobalRelations(); this.assertTenantRestoreReplayGlobalRelations();
+    this.assertTenantBackupCatalogGlobalRelations(); this.readTenantRestoreRuntimeControl();
+    const current = this.memoryCaptureLineageRows(checkpoint.backupId);
+    const actual = new Map(current.leaves.map((row) => [`${row.family}:${row.identityRefSha256}`, row]));
+    for (const leaf of record.lineageLeaves!) {
+      const row = actual.get(`${leaf.family}:${leaf.identityRefSha256}`);
+      const spec = CaptureRestore.TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL.find((candidate) => candidate.family === leaf.family)!;
+      if (!row || (spec.evolution !== "frontier" && row.recordHmacSha256 !== leaf.recordHmacSha256)
+        || row.sourceHighWaterDbMs < leaf.sourceHighWaterDbMs) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    // All linked immutable rows, including the activation event itself, must
+    // still be the exact rows authenticated in the selected artifact.
+    for (const ancestor of checkpoint.lineage.ancestors) {
+      const actualContext = this.memoryCaptureHistoricalContext(ancestor.restoreRunId,
+        this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly === true ? "operator" : "runtime");
+      if (actualContext.record.checkpoint.checkpointSha256 !== ancestor.checkpointSha256) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    } finally { this.captureLineageAuditing.delete(checkpoint.backupId); }
   }
 
   async sealTenantTelemetryCaptureBackupCheckpoint(input: SealTenantTelemetryCaptureBackupCheckpointInput)
@@ -1970,10 +2103,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   private validateMemoryCaptureCheckpointRecord(backupId: string, record: TenantTelemetryCaptureBackupCheckpointRecord): void {
-    if (Object.keys(record).sort().join(",") !== "checkpoint,leaves" || record.checkpoint.backupId !== backupId) {
+    const v2 = record.checkpoint.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE;
+    if (Object.keys(record).sort().join(",") !== (v2 ? "checkpoint,leaves,lineageLeaves" : "checkpoint,leaves") || record.checkpoint.backupId !== backupId) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
     CaptureRestore.assertTenantTelemetryCaptureCheckpointLeaves(record.checkpoint, record.leaves, this.tenantTelemetryRefKeyForUse());
+    if (v2) {
+      if (record.checkpoint.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE || !record.lineageLeaves) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      CaptureRestore.assertTenantTelemetryCaptureLineageLeaves(record.checkpoint.lineage, record.lineageLeaves, this.tenantTelemetryRefKeyForUse());
+    }
   }
   async getTenantTelemetryCaptureBackupCheckpoint(backupId: string): Promise<TenantTelemetryCaptureBackupCheckpointRecord | null> {
     const record = this.tenantTelemetryCaptureBackupCheckpoints.get(backupId);
@@ -1990,6 +2128,67 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const current = this.collectMemoryCaptureBackupCheckpoint(input.backupId);
     if (!current) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     CaptureRestore.assertTenantTelemetryCaptureBackupCheckpointUnchanged(prior.checkpoint, current.checkpoint, this.tenantTelemetryRefKeyForUse());
+  }
+
+  async openTenantTelemetryCaptureBackupSourceMaintenance(input: TenantTelemetryCaptureBackupSourceMaintenanceInput)
+    : Promise<TenantTelemetryCaptureBackupSourceMaintenance> {
+    if (!input || typeof input !== "object" || ![Object.prototype, null].includes(Object.getPrototypeOf(input))
+      || Reflect.ownKeys(input).length !== 2 || Reflect.ownKeys(input).some((name) => name !== "fleetStoppedAck" && name !== "localOnlyAck")) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    for (const name of ["fleetStoppedAck", "localOnlyAck"] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(input, name);
+      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    if (input.fleetStoppedAck !== "fleet-stopped-v1" || input.localOnlyAck !== "local-only-v1"
+      || this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly !== true || process.env.NODE_ENV === "production") {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    let closed = false;
+    const checked = (prepareRunId?: string) => {
+      if (closed) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      this.assertTenantBackupCatalogGlobalRelations(); this.assertTenantRestoreReplayGlobalRelations();
+      const pending = [...this.tenantRestoreReplayRuns.values()].filter((run) => run.phase === "prepared" || run.phase === "replay_sealed");
+      if (pending.length !== 0) {
+        if (pending.length !== 1 || pending[0]!.restoreRunId !== prepareRunId) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        const sidecar = this.tenantTelemetryCaptureRestoreBackupBindings.get(prepareRunId!);
+        if (!sidecar) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        const selector = { backupId: sidecar.backupId, restoreRunId: sidecar.restoreRunId, checkpointSha256: sidecar.checkpointSha256,
+          artifactManifestSha256: sidecar.artifactManifestSha256, sourceSnapshotSha256: sidecar.sourceSnapshotSha256,
+          providerEvidenceSha256: sidecar.providerEvidenceSha256, reservationSha256: sidecar.reservationSha256,
+          reservationReceiptSha256: sidecar.reservationReceiptSha256, fleetStoppedAck: "fleet-stopped-v1" as const, localOnlyAck: "local-only-v1" as const };
+        this.auditMemoryCaptureMaintenanceSources(this.memoryCaptureMaintenanceContext(selector));
+      } else {
+        const runtime = this.readTenantRestoreRuntimeControl();
+        if (runtime.state !== "active") throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        if (runtime.lineageKind === "restore") {
+          const context = this.memoryRestoredCaptureContext();
+          if (!context?.cutover) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+          this.auditMemoryCaptureRestoredSources(context);
+        } else this.auditMemoryCaptureCheckpointSources();
+      }
+    };
+    checked();
+    return Object.freeze({
+      getTenantBackupCatalogControl: async () => { checked(); return this.getTenantBackupCatalogControl(); },
+      createTenantBackupSnapshotAnchor: async (value: BackupCatalog.CreateTenantBackupSnapshotAnchorInput) => { checked(); return this.createTenantBackupSnapshotAnchor(value); },
+      getTenantBackupSnapshotAnchor: async (id: string) => { checked(); return this.getTenantBackupSnapshotAnchor(id); },
+      recordTenantBackupCatalogAvailability: async (value: BackupCatalog.TenantBackupAvailabilityAdapterResult) => { checked(); return this.recordTenantBackupCatalogAvailability(value); },
+      mirrorTenantBackupCatalogEvent: async (value: BackupCatalog.MirrorTenantBackupCatalogEventInput) => { checked(); return this.mirrorTenantBackupCatalogEvent(value); },
+      getTenantBackupCatalogEntry: async (id: string) => { checked(); return this.getTenantBackupCatalogEntry(id); },
+      listRecoverableTenantBackups: async (value: { limit: number; afterBackupId?: string }) => { checked(); return this.listRecoverableTenantBackups(value); },
+      preflightTenantRestoreReplayFromBackup: async (value: BackupCatalog.PreflightTenantRestoreReplayFromBackupInput) => { checked(value.restoreRunId); return this.preflightTenantRestoreReplayFromBackup(value); },
+      prepareTenantRestoreReplayFromBackup: async (value: BackupCatalog.PrepareTenantRestoreReplayFromBackupInput) => { checked(value.restoreRunId); return this.prepareTenantRestoreReplayFromBackup(value); },
+      getTenantRestoreJournalControl: async () => { checked(); return this.getTenantRestoreJournalControl(); },
+      getTenantRestoreJournalControlTargets: async () => { checked(); return this.getTenantRestoreJournalControlTargets(); },
+      getTenantRestoreRuntimeControl: async () => { checked(); return this.getTenantRestoreRuntimeControl(); },
+      getTenantRestoreRuntimeHeads: async () => { checked(); return this.getTenantRestoreRuntimeHeads(); },
+      getBlobStorageControl: async () => { checked(); return this.getBlobStorageControl(); },
+      sealTenantTelemetryCaptureBackupCheckpoint: async (value: SealTenantTelemetryCaptureBackupCheckpointInput) => { checked(); return this.sealTenantTelemetryCaptureBackupCheckpoint(value); },
+      getTenantTelemetryCaptureBackupCheckpoint: async (id: string) => { checked(); return this.getTenantTelemetryCaptureBackupCheckpoint(id); },
+      assertTenantTelemetryCaptureBackupCheckpointUnchanged: async (value: AssertTenantTelemetryCaptureBackupCheckpointUnchangedInput) => { checked(); return this.assertTenantTelemetryCaptureBackupCheckpointUnchanged(value); },
+      close: async () => { closed = true; },
+    });
   }
 
   /** The authenticated artifact reader must explicitly pass its v2 field. The v1 catalog's
@@ -2014,12 +2213,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const record = this.tenantTelemetryCaptureBackupCheckpoints.get(entry.backupId);
     if (!record) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     this.validateMemoryCaptureCheckpointRecord(entry.backupId, record);
+    this.auditMemoryCaptureLineageRecord(record);
     const checkpoint = record.checkpoint;
     const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
     const target = this.tenantTelemetryLifecycleTargets.get("logs");
     if (checkpoint.checkpointSha256 !== selected || checkpoint.backupId !== anchor.backupId
       || checkpoint.anchorSha256 !== anchor.anchorSha256 || entry.anchorSha256 !== anchor.anchorSha256
-      || checkpoint.sourceRuntimeLineageKind !== "primary"
+      || (checkpoint.sourceRuntimeLineageKind !== "primary" && checkpoint.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE)
       || checkpoint.anchorCreatedAtDbMs !== anchor.createdAtDbMs
       || checkpoint.logicalDatabaseNamespaceSha256 !== anchor.logicalDatabaseNamespaceSha256
       || checkpoint.schemaMigrationRootSha256 !== anchor.schemaMigrationRootSha256
@@ -2103,7 +2303,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   private memoryCaptureMaintenanceContext(selector: Readonly<TenantTelemetryCaptureRestoreMaintenanceSelector>,
-    purpose: "operator" | "runtime" = "operator")
+    purpose: "operator" | "runtime" = "operator", historical = false, visiting: ReadonlySet<string> = new Set())
     : MemoryCaptureRestoreMaintenanceContext {
     validateTenantTelemetryCaptureRestoreMaintenanceSelector(selector);
     if (process.env.NODE_ENV === "production"
@@ -2111,6 +2311,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         : this.memoryOptions.tenantTelemetryPersistedProviderCaptureLocalOnly !== true)) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
+    if (visiting.has(selector.restoreRunId)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    const path = new Set(visiting); path.add(selector.restoreRunId);
     this.assertTenantBackupCatalogGlobalRelations();
     this.assertTenantRestoreReplayGlobalRelations();
     const entry = this.tenantBackupCatalogEntries.get(selector.backupId);
@@ -2131,34 +2333,48 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       || reservation.bindingSha256 !== binding.bindingSha256 || reservation.entrySha256 !== entry.entrySha256
       || reservation.reservationSha256 !== selector.reservationSha256
       || reservation.reservationReceiptSha256 !== selector.reservationReceiptSha256
-      || [...this.tenantRestoreReplayRuns.values()].some((candidate) => candidate.restoreRunId !== selector.restoreRunId
-        && (candidate.phase === "prepared" || candidate.phase === "replay_sealed"))) {
+      || (!historical && [...this.tenantRestoreReplayRuns.values()].some((candidate) => candidate.restoreRunId !== selector.restoreRunId
+        && (candidate.phase === "prepared" || candidate.phase === "replay_sealed")))) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
     const record = this.selectMemoryCaptureRestoreCheckpoint(entry, anchor, selector.checkpointSha256, purpose);
     if (!record) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     this.assertMemoryCaptureRestoreBackupBinding(record, entry, binding, reservation);
-    const originalRuntime = this.tenantRestoreRuntimeControlEvents.get(record.checkpoint.sourceRuntimeControlGeneration);
+    const sourceRuntime = this.tenantRestoreRuntimeControlEvents.get(record.checkpoint.sourceRuntimeControlGeneration);
     const current = this.readTenantRestoreRuntimeControl(); // Reconstructs the complete real immutable event/head chain.
     const journal = this.readTenantRestoreJournalControl();
-    if (!originalRuntime || originalRuntime.lineageKind !== "primary"
-      || originalRuntime.evidenceSha256 !== record.checkpoint.sourceRuntimeControlEvidenceSha256
-      || originalRuntime.runtimeEpochSha256 !== record.checkpoint.sourceRuntimeEpochSha256
-      || originalRuntime.verifiedHeadRootSha256 !== record.checkpoint.journalHeadRootSha256
-      || PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(originalRuntime, journal)
+    const originalRuntime = [...this.tenantRestoreRuntimeControlEvents.values()].find((event) => event.lineageKind === "primary"
+      && event.runtimeEpochSha256 === record.checkpoint.originalRuntimeEpochSha256
+      && PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(event, journal) === record.checkpoint.originalRuntimeBindingSha256);
+    if (!sourceRuntime || !originalRuntime || sourceRuntime.lineageKind !== record.checkpoint.sourceRuntimeLineageKind
+      || sourceRuntime.evidenceSha256 !== record.checkpoint.sourceRuntimeControlEvidenceSha256
+      || sourceRuntime.runtimeEpochSha256 !== record.checkpoint.sourceRuntimeEpochSha256
+      || sourceRuntime.verifiedHeadRootSha256 !== record.checkpoint.journalHeadRootSha256
+      || (sourceRuntime.lineageKind === "primary" ? PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(sourceRuntime, journal)
+        : CaptureRestore.tenantTelemetryCaptureRestoreRuntimeBindingSha256(sourceRuntime, journal))
         !== record.checkpoint.sourceRuntimeBindingSha256 || current.state !== "active") {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
-    const context = { selector, record, originalRuntime };
+    const context = { selector, record, originalRuntime, sourceRuntime };
     const history = this.tenantTelemetryCaptureRestoreHistories.get(selector.restoreRunId);
-    // This consumer is an original-primary -> one exact restore lineage. It
-    // cannot turn an unrelated history footprint into a second restore permit.
-    if ([...this.tenantTelemetryCaptureRestoreHistories.keys()].some((key) => key !== selector.restoreRunId)) {
-      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    if (record.checkpoint.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) {
+      const lineage = record.checkpoint.lineage;
+      if (sourceRuntime.lineageKind !== "restore" || sourceRuntime.restoreRunId !== lineage.sourceRestoreRunId) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      for (const ancestor of lineage.ancestors) {
+        const actual = this.memoryCaptureHistoricalContext(ancestor.restoreRunId, purpose, path);
+        const priorHistory = this.tenantTelemetryCaptureRestoreHistories.get(ancestor.restoreRunId);
+        const priorCutover = this.tenantTelemetryCaptureEpochCutovers.get(ancestor.restoreRunId) ?? null;
+        if (!priorHistory || priorHistory.checkpointSha256 !== ancestor.checkpointSha256
+          || priorHistory.receiptSha256 !== ancestor.historyReceiptSha256 || (priorCutover?.receiptSha256 ?? null) !== ancestor.cutoverReceiptSha256
+          || priorHistory.runtimeEpochSha256 !== ancestor.runtimeEpochSha256 || priorHistory.runtimeBindingSha256 !== ancestor.runtimeBindingSha256
+          || priorHistory.runtimeControlGeneration !== ancestor.runtimeControlGeneration
+          || priorHistory.runtimeControlGeneration > sourceRuntime.controlGeneration
+          || actual.record.checkpoint.checkpointSha256 !== ancestor.checkpointSha256) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
     }
     if (run.phase === "active") {
-      if (!history || current.lineageKind !== "restore" || current.restoreRunId !== run.restoreRunId
-        || current.runtimeEpochSha256 !== run.runtimeEpochSha256 || current.replayReceiptSha256 !== run.terminalReceiptSha256) {
+      if (!history || (!historical && (current.lineageKind !== "restore" || current.restoreRunId !== run.restoreRunId
+        || current.runtimeEpochSha256 !== run.runtimeEpochSha256 || current.replayReceiptSha256 !== run.terminalReceiptSha256))) {
         throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
       }
       const activation = this.tenantRestoreRuntimeControlEvents.get(history.runtimeControlGeneration);
@@ -2168,13 +2384,14 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       CaptureRestore.validateTenantTelemetryCaptureRestoreHistoryReceipt(history, record.checkpoint, this.tenantTelemetryRefKeyForUse());
       CaptureRestore.assertTenantTelemetryCaptureRestoreActivationBinding(history,
         this.memoryCaptureHistoryActivationBinding(context, activation));
-    } else if (history || current.lineageKind !== "primary"
-      || current.runtimeEpochSha256 !== originalRuntime.runtimeEpochSha256
-      || PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(current, journal)
+    } else if (historical || history || current.lineageKind !== sourceRuntime.lineageKind
+      || current.runtimeEpochSha256 !== sourceRuntime.runtimeEpochSha256
+      || (current.lineageKind === "primary" ? PersistedCapture.persistedProviderCaptureRuntimeBindingSha256(current, journal)
+        : CaptureRestore.tenantTelemetryCaptureRestoreRuntimeBindingSha256(current, journal))
         !== record.checkpoint.sourceRuntimeBindingSha256) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
-    if (purpose === "runtime") {
+    if (purpose === "runtime" && !historical) {
       // This private branch is reachable only from the actual-current-epoch
       // resolver, never a caller selector or a facade. It cannot open pending
       // history or manufacture operator permission from a normal capture flag.
@@ -2189,6 +2406,22 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return context;
   }
 
+  private memoryCaptureHistoricalContext(restoreRunId: string, purpose: "operator" | "runtime", visiting: ReadonlySet<string> = new Set()) {
+    const sidecar = this.tenantTelemetryCaptureRestoreBackupBindings.get(restoreRunId);
+    if (!sidecar) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    const selector: TenantTelemetryCaptureRestoreMaintenanceSelector = { backupId: sidecar.backupId, restoreRunId,
+      checkpointSha256: sidecar.checkpointSha256, artifactManifestSha256: sidecar.artifactManifestSha256,
+      sourceSnapshotSha256: sidecar.sourceSnapshotSha256, providerEvidenceSha256: sidecar.providerEvidenceSha256,
+      reservationSha256: sidecar.reservationSha256, reservationReceiptSha256: sidecar.reservationReceiptSha256,
+      fleetStoppedAck: "fleet-stopped-v1", localOnlyAck: "local-only-v1" };
+    const context = this.memoryCaptureMaintenanceContext(selector, purpose, true, visiting);
+    const history = this.tenantTelemetryCaptureRestoreHistories.get(restoreRunId);
+    const cutover = this.tenantTelemetryCaptureEpochCutovers.get(restoreRunId);
+    if (!history) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    if (cutover) CaptureRestore.validateTenantTelemetryCaptureEpochCutoverReceipt(cutover, history, context.record.checkpoint, this.tenantTelemetryRefKeyForUse());
+    return context;
+  }
+
   private auditMemoryCaptureMaintenanceSources(context: MemoryCaptureRestoreMaintenanceContext): void {
     const previous = this.captureRestoreMaintenanceReadContext;
     try {
@@ -2197,6 +2430,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (!actual) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
       CaptureRestore.assertTenantTelemetryCaptureBackupCheckpointUnchanged(context.record.checkpoint,
         actual.checkpoint, this.tenantTelemetryRefKeyForUse());
+      this.auditMemoryCaptureLineageSnapshot(context);
     } finally { this.captureRestoreMaintenanceReadContext = previous; }
   }
 
@@ -2220,7 +2454,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly === true ? "operator" : "runtime");
     const history = this.tenantTelemetryCaptureRestoreHistories.get(runtime.restoreRunId);
     const cutover = this.tenantTelemetryCaptureEpochCutovers.get(runtime.restoreRunId) ?? null;
-    if ([...this.tenantTelemetryCaptureEpochCutovers.keys()].some((id) => id !== runtime.restoreRunId)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    for (const id of new Set([...this.tenantTelemetryCaptureRestoreHistories.keys(), ...this.tenantTelemetryCaptureEpochCutovers.keys()])) {
+      if (id !== runtime.restoreRunId) this.memoryCaptureHistoricalContext(id,
+        this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly === true ? "operator" : "runtime");
+    }
     if (!history || (requireCutover && !cutover)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     if (cutover) {
       CaptureRestore.validateTenantTelemetryCaptureEpochCutoverReceipt(cutover, history, context.record.checkpoint, this.tenantTelemetryRefKeyForUse());
@@ -2255,6 +2492,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     // Revalidate actual current source/canonical/owner/0054 relations. Whole-49
     // equality was the pre-cutover freeze, not a ban on later legitimate writes.
     this.auditMemoryCaptureCheckpointSources();
+    this.auditMemoryCaptureLineageSnapshot(context);
     type Family = CaptureRestore.TenantTelemetryCaptureCheckpointFamily;
     const sources: readonly [Family, ReadonlyMap<string, unknown>, boolean][] = [
       ["membership", this.tenantTelemetryArtifactMemberships, true], ["application_binding", this.tenantTelemetryApplicationWriteBindings, true],
@@ -2299,7 +2537,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     }
     for (const [receipt, permit] of this.tenantTelemetryCaptureRecoveryPermits) {
       const job = this.tenantTelemetryWriteJobs.get(permit.writeOperationSha256);
-      if (receipt !== permit.receiptSha256 || !job || permit.restoreRunId !== selected.selector.restoreRunId) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      if (receipt !== permit.receiptSha256 || !job) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      this.memoryCaptureRecoveryContextForPermit(permit, selected);
       this.auditMemoryCaptureRecoveryJob(job);
     }
   }
@@ -2333,10 +2572,30 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
       return;
     }
-    const restored = this.memoryRestoredCaptureContext();
-    if (!restored?.cutover || receipt.captureControlEvidenceSha256 !== restored.cutover.receiptSha256
-      || receipt.runtimeEpochSha256 !== restored.cutover.runtimeEpochSha256 || receipt.runtimeBindingSha256 !== restored.cutover.runtimeBindingSha256
-      || receipt.committedAtDbMs < restored.cutover.activatedAtDbMs) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const restored = this.captureRestoreMaintenanceReadContext ?? this.memoryRestoredCaptureContext();
+    const matching = [...this.tenantTelemetryCaptureEpochCutovers.values()].filter((row) => row.receiptSha256 === receipt.captureControlEvidenceSha256);
+    const cutover = matching[0];
+    if (!restored || matching.length !== 1 || !cutover || cutover.runtimeEpochSha256 !== receipt.runtimeEpochSha256
+      || cutover.runtimeBindingSha256 !== receipt.runtimeBindingSha256 || receipt.committedAtDbMs < cutover.activatedAtDbMs) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    const actual = this.memoryCaptureHistoricalContext(cutover.restoreRunId,
+      this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly === true ? "operator" : "runtime");
+    const history = this.tenantTelemetryCaptureRestoreHistories.get(cutover.restoreRunId);
+    if (!history || history.checkpointSha256 !== actual.record.checkpoint.checkpointSha256
+      || history.receiptSha256 !== cutover.historyReceiptSha256 || history.runtimeEpochSha256 !== receipt.runtimeEpochSha256
+      || history.runtimeBindingSha256 !== receipt.runtimeBindingSha256) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+    if (cutover.restoreRunId !== restored.selector.restoreRunId) {
+      const cp = restored.record.checkpoint;
+      if (cp.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      const ancestor = cp.lineage.ancestors.find((row) => row.restoreRunId === cutover.restoreRunId);
+      if (!ancestor || ancestor.checkpointSha256 !== history.checkpointSha256 || ancestor.historyReceiptSha256 !== history.receiptSha256
+        || ancestor.cutoverReceiptSha256 !== cutover.receiptSha256 || ancestor.runtimeEpochSha256 !== receipt.runtimeEpochSha256
+        || ancestor.runtimeBindingSha256 !== receipt.runtimeBindingSha256 || ancestor.runtimeControlGeneration !== history.runtimeControlGeneration) {
+        throw new PersistedCapture.PersistedProviderCaptureIntegrityError();
+      }
+      this.memoryCheckpointOperationLeaf(restored, "provider_failure_commit", receipt.writeOperationSha256, receipt);
+      this.memoryCheckpointOperationLeaf(restored, "provider_source_binding", receipt.writeOperationSha256, this.persistedProviderCaptureBindings.get(receipt.writeOperationSha256));
+      this.memoryCheckpointOperationLeaf(restored, "membership", receipt.writeOperationSha256, this.tenantTelemetryArtifactMemberships.get(receipt.writeOperationSha256));
+    }
   }
 
   private activateMemoryCaptureRestoredEpoch(context: MemoryCaptureRestoreMaintenanceContext,
@@ -2386,17 +2645,24 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     let closed = false;
     const checked = (runId = selected.restoreRunId, live = true) => {
       if (closed || runId !== selected.restoreRunId) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
-      const context = this.memoryCaptureMaintenanceContext(selected);
+      const runtime = this.readTenantRestoreRuntimeControl();
+      const historical = runtime.state === "active" && runtime.lineageKind === "restore" && runtime.restoreRunId !== selected.restoreRunId
+        && this.tenantRestoreReplayRuns.get(selected.restoreRunId)?.phase === "active";
+      if (historical && live) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      const context = this.memoryCaptureMaintenanceContext(selected, "operator", historical);
       const current = this.readTenantRestoreRuntimeControl();
-      if (current.state === "active" && current.lineageKind === "restore" && this.memoryRestoredCaptureContext(false)?.cutover) {
+      if (historical) this.auditMemoryCaptureLineageSnapshot(context);
+      else if (current.state === "active" && current.lineageKind === "restore" && current.restoreRunId === selected.restoreRunId
+        && this.tenantTelemetryCaptureEpochCutovers.get(selected.restoreRunId)) {
+        // Only the selected already-active run can use its post-cutover audit.
+        // A newly prepared successor still has the old source epoch active:
+        // audit its exact selected CP/source event, not the ordinary writer
+        // resolver (which must continue rejecting every pending restore).
         this.auditMemoryCaptureRestoredSources(context);
-      } else if (live) this.auditMemoryCaptureMaintenanceSources(context);
+      } else this.auditMemoryCaptureMaintenanceSources(context);
       return context;
     };
-    const initial = checked(selected.restoreRunId, false);
-    const restored = this.readTenantRestoreRuntimeControl();
-    if (restored.state !== "active" || restored.lineageKind !== "restore"
-      || !this.memoryRestoredCaptureContext(false)?.cutover) this.auditMemoryCaptureMaintenanceSources(initial);
+    checked(selected.restoreRunId, false);
     return Object.freeze({
       getTenantRestoreReplayRun: async (id: string) => { checked(id); return this.getTenantRestoreReplayRun(id); },
       getTenantRestoreReplaySealedTargets: async (id: string) => { checked(id); return this.getTenantRestoreReplaySealedTargets(id); },
@@ -2432,7 +2698,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         validateActivateTenantTelemetryCaptureRestoredEpochInput(input);
         const staged = clone(input); return this.activateMemoryCaptureRestoredEpoch(checked(selected.restoreRunId, false), staged);
       },
-      getTenantTelemetryCaptureEpochCutoverReceipt: async () => { checked(selected.restoreRunId, false); return this.getTenantTelemetryCaptureEpochCutoverReceipt(); },
+      getTenantTelemetryCaptureEpochCutoverReceipt: async () => { checked(selected.restoreRunId, false); return clone(this.tenantTelemetryCaptureEpochCutovers.get(selected.restoreRunId) ?? null); },
       close: async () => { closed = true; },
     });
   }
@@ -3599,7 +3865,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const rows = [...this.tenantTelemetryCaptureRecoveryPermits.entries()]
       .filter(([, row]) => row.writeOperationSha256 === job.writeOperationSha256)
       .sort(([, a], [, b]) => a.newClaimAttempt - b.newClaimAttempt);
-    const chain: CaptureRestore.TenantTelemetryCaptureOperationRecoveryPermit[] = [];
+    const chain: CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit[] = [];
+    const records: CaptureRestore.TenantTelemetryCaptureRecoveryChainRecord[] = [];
     for (const [mapKey, row] of rows) {
       const previous = chain.at(-1) ?? null;
       const atIssue = row.reservationAtIssue;
@@ -3609,16 +3876,73 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || row.originalJobDescriptorSha256 !== CaptureRestore.tenantTelemetryCaptureRecoveryJobDescriptorSha256(job)) {
         throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
       }
-      CaptureRestore.validateTenantTelemetryCaptureOperationRecoveryPermit(row, context.cutover, context.history,
-        context.record.checkpoint, context.record.leaves, this.tenantTelemetryRefKeyForUse(),
-        { previousPermit: previous, reservationAuthorizer: authorizer });
+      const actual = this.memoryCaptureRecoveryContextForPermit(row, context);
+      if (row.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE) {
+        CaptureRestore.validateTenantTelemetryCaptureOperationRecoveryPermitV2(row, actual, this.tenantTelemetryRefKeyForUse(), records);
+      } else {
+        if ((previous && previous.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE)
+          || (authorizer && authorizer.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        CaptureRestore.validateTenantTelemetryCaptureOperationRecoveryPermit(row, actual.cutover, actual.history,
+          actual.checkpoint, actual.leaves, this.tenantTelemetryRefKeyForUse(), { previousPermit: previous, reservationAuthorizer: authorizer });
+      }
       chain.push(row);
+      records.push({ permit: row, context: actual });
     }
-    return { context, chain };
+    return { context, chain, records };
+  }
+
+  /** Stronger than a single-current-run test: EVERY permit is bound to its own
+   * actual run/sidecar/CP/history/cutover/activation. An older permit must also
+   * be an exact immutable row included in the selected CP2 ancestor closure.
+   * Equal epochs or a caller-provided ancestor list never establish this. */
+  private memoryCaptureRecoveryContextForPermit(permit: CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit,
+    current: NonNullable<ReturnType<MemorySessionStore["memoryRestoredCaptureContext"]>>): CaptureRestore.TenantTelemetryCaptureRecoveryContext {
+    const job = this.tenantTelemetryWriteJobs.get(permit.writeOperationSha256);
+    const member = this.tenantTelemetryArtifactMemberships.get(permit.writeOperationSha256);
+    const binding = this.persistedProviderCaptureBindings.get(permit.writeOperationSha256);
+    const failure = this.persistedProviderFailureReceipts.get(permit.writeOperationSha256);
+    if (!job || !member || !binding || !failure || job.tenantId !== member.tenantId || job.tenantId !== binding.tenantId || job.tenantId !== failure.tenantId
+      || permit.tenantRefSha256 !== job.inventory.tenantRefSha256 || permit.ownerRefSha256 !== job.inventory.ownerRefSha256
+      || permit.sourceSessionRefSha256 !== failure.sourceSessionRefSha256 || permit.sourceTurnRefSha256 !== failure.sourceTurnRefSha256
+      || permit.sourceItemRefSha256 !== failure.sourceItemRefSha256 || permit.sourceStepIndex !== failure.sourceStepIndex
+      || permit.inventorySha256 !== job.inventory.inventorySha256 || permit.payloadSha256 !== job.inventory.payloadSha256
+      || permit.manifestSha256 !== job.inventory.manifestSha256 || permit.membershipSha256 !== member.membershipSha256
+      || permit.sourceBindingReceiptSha256 !== binding.receiptSha256 || permit.failureCommitReceiptSha256 !== failure.receiptSha256
+      || permit.originalJobDescriptorSha256 !== CaptureRestore.tenantTelemetryCaptureRecoveryJobDescriptorSha256(job)) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const actual = this.memoryCaptureHistoricalContext(permit.restoreRunId,
+      this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly === true ? "operator" : "runtime");
+    const history = this.tenantTelemetryCaptureRestoreHistories.get(permit.restoreRunId);
+    const cutover = this.tenantTelemetryCaptureEpochCutovers.get(permit.restoreRunId);
+    if (!history || !cutover || history.restoreRunId !== permit.restoreRunId || cutover.restoreRunId !== permit.restoreRunId
+      || permit.checkpointSha256 !== actual.record.checkpoint.checkpointSha256 || permit.historyReceiptSha256 !== history.receiptSha256
+      || permit.cutoverReceiptSha256 !== cutover.receiptSha256 || permit.runtimeEpochSha256 !== cutover.runtimeEpochSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    if (permit.restoreRunId !== current.selector.restoreRunId) {
+      const cp = current.record.checkpoint;
+      if (cp.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE || !current.record.lineageLeaves) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      const ancestor = cp.lineage.ancestors.find((row) => row.restoreRunId === permit.restoreRunId);
+      const version = permit.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE ? 2 : 1;
+      const family = version === 1 ? "recovery_permit" : "recovery_permit_v2";
+      const identity = CaptureRestore.tenantTelemetryCaptureLineagePermitIdentitySha256(permit.receiptSha256, this.tenantTelemetryRefKeyForUse(), version);
+      const rows = current.record.lineageLeaves.filter((row) => row.family === family && row.identityRefSha256 === identity);
+      const actualEvidence = CaptureRestore.tenantTelemetryCaptureLineageOpaqueDigest(family, "record",
+        Buffer.from(PersistedCapture.persistedProviderCaptureCanonicalJson({ backend: "memory-v1", physicalKey: permit.receiptSha256, record: permit })), this.tenantTelemetryRefKeyForUse());
+      if (!ancestor || ancestor.checkpointSha256 !== permit.checkpointSha256 || ancestor.historyReceiptSha256 !== history.receiptSha256
+        || ancestor.cutoverReceiptSha256 !== cutover.receiptSha256 || ancestor.runtimeEpochSha256 !== permit.runtimeEpochSha256
+        || ancestor.runtimeBindingSha256 !== cutover.runtimeBindingSha256 || ancestor.runtimeControlGeneration !== history.runtimeControlGeneration
+        || rows.length !== 1 || rows[0]!.recordHmacSha256 !== actualEvidence) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    } else if (current.cutover?.receiptSha256 !== cutover.receiptSha256 || current.history.receiptSha256 !== history.receiptSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    return { cutover, history, checkpoint: actual.record.checkpoint, leaves: actual.record.leaves,
+      ...(actual.record.lineageLeaves ? { lineageLeaves: actual.record.lineageLeaves } : {}) };
   }
 
   private auditMemoryCaptureRecoveryJob(job: TenantTelemetryWriter.TenantTelemetryWriteJobRecord,
-    requireLease = false): CaptureRestore.TenantTelemetryCaptureOperationRecoveryPermit | null {
+    requireLease = false): CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit | null {
     if (requireLease && job.inventory.sourceSchema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA) {
       const runtime = this.readTenantRestoreRuntimeControl();
       if (runtime.state === "active" && runtime.lineageKind === "restore"
@@ -3635,6 +3959,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (requireLease) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
       return null;
     }
+    if (requireLease && latest.restoreRunId !== context.selector.restoreRunId) throw new PersistedCapture.PersistedProviderCaptureConflictError("recovered capture claim is not current");
     const expectedAttempt = job.phase === "written" ? job.completedClaimAttempt : job.attempts;
     const token = job.phase === "written" ? job.completedClaimTokenSha256
       : job.phase === "queued" && job.claimToken ? TenantTelemetryWriter.tenantTelemetryWriteClaimTokenSha256(job.claimToken) : null;
@@ -3665,7 +3990,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   }
 
   private stageMemoryCaptureRecoveryPermit(job: Extract<TenantTelemetryWriter.TenantTelemetryWriteJobRecord, { phase: "queued" }>,
-    claimToken: string, leaseUntilMs: number, nowMs: number): CaptureRestore.TenantTelemetryCaptureOperationRecoveryPermit | null {
+    claimToken: string, leaseUntilMs: number, nowMs: number): CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit | null {
     const selected = this.memoryCaptureRecoveryChain(job);
     if (!selected) return null;
     const { context, chain } = selected;
@@ -3687,11 +4012,23 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       && leaf.identityRefSha256 === CaptureRestore.tenantTelemetryCaptureCheckpointOperationIdentity("write_reservation", operation, this.tenantTelemetryRefKeyForUse()));
     const reservation = job.reservation;
     let atIssue: CaptureRestore.TenantTelemetryCaptureRecoveryReservationAtIssue = { origin: "none" };
-    let authorizer: CaptureRestore.TenantTelemetryCaptureOperationRecoveryPermit | null = null;
+    let authorizer: CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit | null = null;
     if (reservation) {
       const tuple = { receiptSha256: reservation.receiptSha256, startedAtDbMs: reservation.startedAtDbMs,
         startedClaimAttempt: reservation.startedClaimAttempt, startedClaimTokenSha256: reservation.startedClaimTokenSha256 };
-      if (reservationLeaf) {
+      if (previous) {
+        if (previous.reservationAtIssue.origin !== "none") atIssue = clone(previous.reservationAtIssue);
+        else {
+          authorizer = chain.find((row) => row.newClaimAttempt === reservation.startedClaimAttempt
+            && row.newClaimTokenSha256 === reservation.startedClaimTokenSha256 && row.newReservationAuthorized) ?? null;
+          if (!authorizer) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+          atIssue = { origin: "recovery-permit", ...tuple, authorizingPermitReceiptSha256: authorizer.receiptSha256 };
+        }
+        if (atIssue.origin === "recovery-permit") {
+          const authorizingReceipt = atIssue.authorizingPermitReceiptSha256;
+          authorizer = chain.find((row) => row.receiptSha256 === authorizingReceipt) ?? null;
+        }
+      } else if (reservationLeaf) {
         this.memoryCheckpointOperationLeaf(context, "write_reservation", operation, { tenantId: job.tenantId, writeOperationSha256: operation,
           inventory: job.inventory, target: job.target, reservation });
         atIssue = { origin: "checkpoint", ...tuple };
@@ -3717,7 +4054,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       originalReservationClaimAttempt: reservationLeaf ? reservation!.startedClaimAttempt : null,
       originalReservationClaimTokenSha256: reservationLeaf ? reservation!.startedClaimTokenSha256 : null,
     };
-    return CaptureRestore.createTenantTelemetryCaptureOperationRecoveryPermit({
+    const input: CaptureRestore.TenantTelemetryCaptureOperationRecoveryInput = {
       cutoverReceiptSha256: context.cutover.receiptSha256, historyReceiptSha256: context.history.receiptSha256,
       checkpointSha256: context.record.checkpoint.checkpointSha256, restoreRunId: context.selector.restoreRunId,
       runtimeEpochSha256: context.runtime.runtimeEpochSha256, writeOperationSha256: operation,
@@ -3726,7 +4063,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       sourceItemRefSha256: failure.sourceItemRefSha256, sourceStepIndex: failure.sourceStepIndex,
       inventorySha256: job.inventory.inventorySha256, payloadSha256: job.inventory.payloadSha256, manifestSha256: job.inventory.manifestSha256,
       membershipSha256: membership.membershipSha256, sourceBindingReceiptSha256: binding.receiptSha256, failureCommitReceiptSha256: failure.receiptSha256,
-      originalJobState: jobLeaf.state, originalJobEvidenceHmacSha256: jobLeaf.recordHmacSha256,
+      originalJobState: previous?.originalJobState ?? jobLeaf.state, originalJobEvidenceHmacSha256: previous?.originalJobEvidenceHmacSha256 ?? jobLeaf.recordHmacSha256,
       originalJobDescriptorSha256: CaptureRestore.tenantTelemetryCaptureRecoveryJobDescriptorSha256(job),
       originalPayloadEvidenceHmacSha256: payloadLeaf.recordHmacSha256, originalMembershipEvidenceHmacSha256: memberLeaf.recordHmacSha256,
       originalSourceBindingEvidenceHmacSha256: sourceLeaf.recordHmacSha256, originalFailureEvidenceHmacSha256: failureLeaf.recordHmacSha256,
@@ -3737,8 +4074,32 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       claimLeaseCeilingMs: Math.min(Number.MAX_SAFE_INTEGER, nowMs + CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_MAX_LEASE_MS),
       previousPermitReceiptSha256: previous?.receiptSha256 ?? null, reservationAtIssue: atIssue, issuedAtDbMs: nowMs,
       recoveryMode: reservation ? live ? "resume_reserved" : "reserved_ack_only" : "resume_queued",
-    }, context.cutover, context.history, context.record.checkpoint, context.record.leaves, this.tenantTelemetryRefKeyForUse(),
-    { previousPermit: previous, reservationAuthorizer: authorizer });
+    };
+    if (context.record.checkpoint.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) {
+      const sameSnapshot = previous?.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE
+        && previous.cutoverReceiptSha256 === context.cutover.receiptSha256 ? previous : null;
+      const lineageEvidence = (permit: CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit | null) => {
+        if (!permit || permit.restoreRunId === context.selector.restoreRunId) return null;
+        this.memoryCaptureRecoveryContextForPermit(permit, context);
+        const version = permit.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE ? 2 : 1;
+        return context.record.lineageLeaves!.find((leaf) => leaf.family === (version === 1 ? "recovery_permit" : "recovery_permit_v2")
+          && leaf.identityRefSha256 === CaptureRestore.tenantTelemetryCaptureLineagePermitIdentitySha256(permit.receiptSha256, this.tenantTelemetryRefKeyForUse(), version))!.recordHmacSha256;
+      };
+      return CaptureRestore.createTenantTelemetryCaptureOperationRecoveryPermitV2({ ...input,
+        genesisCheckpointSha256: previous ? previous.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_V2_SCOPE
+          ? previous.genesisCheckpointSha256 : previous.checkpointSha256 : context.record.checkpoint.checkpointSha256,
+        snapshotJobState: sameSnapshot?.snapshotJobState ?? jobLeaf.state,
+        snapshotJobEvidenceHmacSha256: sameSnapshot?.snapshotJobEvidenceHmacSha256 ?? jobLeaf.recordHmacSha256,
+        snapshotReservationReceiptSha256: sameSnapshot ? sameSnapshot.snapshotReservationReceiptSha256 : reservationLeaf ? reservation!.receiptSha256 : null,
+        snapshotReservationEvidenceHmacSha256: sameSnapshot ? sameSnapshot.snapshotReservationEvidenceHmacSha256 : reservationLeaf?.recordHmacSha256 ?? null,
+        predecessorLineageEvidenceHmacSha256: lineageEvidence(previous), reservationAuthorizerLineageEvidenceHmacSha256: lineageEvidence(authorizer),
+      }, { cutover: context.cutover, history: context.history, checkpoint: context.record.checkpoint, leaves: context.record.leaves,
+        lineageLeaves: context.record.lineageLeaves! }, this.tenantTelemetryRefKeyForUse(), selected.records);
+    }
+    if ((previous && previous.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE)
+      || (authorizer && authorizer.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_RECOVERY_PERMIT_SCOPE)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    return CaptureRestore.createTenantTelemetryCaptureOperationRecoveryPermit(input, context.cutover, context.history, context.record.checkpoint,
+      context.record.leaves, this.tenantTelemetryRefKeyForUse(), { previousPermit: previous, reservationAuthorizer: authorizer });
   }
 
   private assertMemoryPersistedFailureLiveWriteGates(job:TenantTelemetryWriter.TenantTelemetryWriteJobRecord, recoveryCandidate = false):void{
@@ -11878,7 +12239,19 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     for (const entry of entries) {
       const fence = this.tenantRestoreFences.get(entry.tenantId);
       if (!fence || fence.fenceSha256 !== entry.fenceSha256
-        || fence.recordSha256 !== entry.recordSha256) {
+        || fence.recordSha256 !== entry.recordSha256
+        || fence.logicalDatabaseNamespaceSha256 !== entry.logicalDatabaseNamespaceSha256
+        || fence.requestId !== entry.requestId || fence.tenantId !== entry.tenantId
+        || fence.subjectGeneration !== entry.subjectGeneration
+        || fence.t1FenceSha256 !== entry.t1FenceSha256
+        || fence.operationSha256 !== entry.operationSha256
+        || entry.storeDbTimestampMs < fence.installedAtDbMs
+        || (entry.fenceDisposition === "installed" && (
+          entry.restoreRunId !== fence.restoreRunId
+          || entry.targetSha256 !== fence.sourceTargetSha256
+          || entry.remoteSequence !== fence.sourceRemoteSequence
+          || entry.headRootSha256 !== fence.sourceHeadRootSha256
+        ))) {
         throw new TenantErasureIntegrityError();
       }
       unique.set(fence.tenantId, fence);
@@ -12461,10 +12834,15 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       }
       for (const [tenantId, fence] of this.tenantRestoreFences) {
         RestoreJournal.validateTenantRestoreFence(fence);
+        const installed = [...this.tenantRestoreReplayEntries.values()].filter((entry) => (
+          entry.tenantId === tenantId && entry.fenceSha256 === fence.fenceSha256
+          && entry.fenceDisposition === "installed"
+        ));
+        const originalRun = this.tenantRestoreReplayRuns.get(fence.restoreRunId);
         if (tenantId !== fence.tenantId
-          || ![...this.tenantRestoreReplayEntries.values()].some(
-            (entry) => entry.tenantId === tenantId && entry.fenceSha256 === fence.fenceSha256,
-          )) {
+          || installed.length !== 1 || !originalRun
+          || originalRun.createdAtDbMs > fence.installedAtDbMs
+          || installed[0]!.storeDbTimestampMs > originalRun.updatedAtDbMs) {
           throw new Error("orphan tenant restore fence");
         }
       }
@@ -27142,7 +27520,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         || left.writeOperationSha256.localeCompare(right.writeOperationSha256))
       .slice(0, stagedOptions.limit);
     const staged: TenantTelemetryWriter.TenantTelemetryWriteJobRecord[] = [];
-    const stagedPermits: CaptureRestore.TenantTelemetryCaptureOperationRecoveryPermit[] = [];
+    const stagedPermits: CaptureRestore.TenantTelemetryCaptureAnyRecoveryPermit[] = [];
     const claims: TenantTelemetryWriter.TenantTelemetryWriteClaim[] = [];
     for (const current of candidates) {
       if (current.phase !== "queued") continue;

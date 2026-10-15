@@ -4,8 +4,12 @@ import {
   validateTenantTelemetryCaptureBackupCheckpoint,
   tenantRestoreJournalTargetRootSha256,
   TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_BYTES,
+  TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE,
+  TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE,
   type TenantBackupSnapshotAnchor,
   type TenantTelemetryCaptureBackupCheckpoint,
+  type TenantTelemetryCaptureBackupCheckpointV1,
+  type TenantTelemetryCaptureBackupCheckpointV2,
 } from "@agent-service/store";
 
 export const MYSQL_BACKUP_ARTIFACT_SCOPE = "mysql-logical-full-artifact-v1" as const;
@@ -18,7 +22,14 @@ export const MYSQL_BACKUP_ARTIFACT_V2_PRODUCER_VERSION = "agent-service-mysql-ba
 // v1 remains byte-compatible at 64 KiB. v2 has an explicit checkpoint budget;
 // all 49 family summaries are embedded, never a truncated selection of leaves.
 export const MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT = MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT + TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_BYTES;
-// Separate schema-root contract, unchanged for both artifact envelope versions.
+export const MYSQL_BACKUP_ARTIFACT_V3_SCOPE = "mysql-logical-full-artifact-v3" as const;
+export const MYSQL_BACKUP_ARTIFACT_V3_MAGIC = Buffer.from("ASMYSQL3", "ascii");
+export const MYSQL_BACKUP_ARTIFACT_V3_PRODUCER_VERSION = "agent-service-mysql-backup-artifact/3";
+// CP2 embeds the complete 49 summaries plus the separate fixed ancestry
+// capsule, not their leaves. The shared closed checkpoint still has its 1 MiB
+// bound; no ancestor may be silently dropped to fit the envelope.
+export const MYSQL_BACKUP_ARTIFACT_V3_MANIFEST_LIMIT = MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT + TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_BYTES;
+// Separate schema-root contract, unchanged for all artifact envelope versions.
 export const MYSQL_BACKUP_ARTIFACT_SCHEMA_SCOPE = "mysql-full-logical-schema-v2";
 
 export interface ArtifactEvidence {
@@ -50,9 +61,15 @@ export interface MySqlBackupArtifactManifestV2 extends Omit<MySqlBackupArtifactM
   scope: typeof MYSQL_BACKUP_ARTIFACT_V2_SCOPE;
   version: 2;
   producerVersion: typeof MYSQL_BACKUP_ARTIFACT_V2_PRODUCER_VERSION;
-  captureCheckpoint: TenantTelemetryCaptureBackupCheckpoint;
+  captureCheckpoint: TenantTelemetryCaptureBackupCheckpointV1;
 }
-export type MySqlBackupArtifactManifest = MySqlBackupArtifactManifestV1 | MySqlBackupArtifactManifestV2;
+export interface MySqlBackupArtifactManifestV3 extends Omit<MySqlBackupArtifactManifestV1, "scope" | "version" | "producerVersion"> {
+  scope: typeof MYSQL_BACKUP_ARTIFACT_V3_SCOPE;
+  version: 3;
+  producerVersion: typeof MYSQL_BACKUP_ARTIFACT_V3_PRODUCER_VERSION;
+  captureCheckpoint: TenantTelemetryCaptureBackupCheckpointV2;
+}
+export type MySqlBackupArtifactManifest = MySqlBackupArtifactManifestV1 | MySqlBackupArtifactManifestV2 | MySqlBackupArtifactManifestV3;
 
 export interface MySqlBackupArtifactImportDiagnostic {
   readonly phase: "native_import" | "lock_recheck" | "schema_inspection" | "schema_digest" | "import_completed_journal";
@@ -252,17 +269,27 @@ export function assertArtifactCaptureCheckpoint(checkpoint: TenantTelemetryCaptu
 export function validateMySqlBackupArtifactManifest(value: unknown, maxBytes: number,
   tenantTelemetryRefKey?: Uint8Array): asserts value is MySqlBackupArtifactManifest {
   const v2 = !!value && typeof value === "object" && (value as { version?: unknown }).version === 2;
+  const v3 = !!value && typeof value === "object" && (value as { version?: unknown }).version === 3;
   exactKeys(value, ["scope", "version", "backupId", "anchor", "schemaMigrationRootSha256",
     "sourceIdentitySha256", "schemaSha256", "producerVersion", "mysqlVersion", "mysqldumpVersion",
     "serverVersion", "plaintextBytes", "plaintextSha256", "ciphertextBytes", "ciphertextSha256", "encryption",
-    ...(v2 ? ["captureCheckpoint"] : [])]);
-  if (v2 ? value.scope !== MYSQL_BACKUP_ARTIFACT_V2_SCOPE || value.producerVersion !== MYSQL_BACKUP_ARTIFACT_V2_PRODUCER_VERSION
+    ...(v2 || v3 ? ["captureCheckpoint"] : [])]);
+  if (v3 ? value.scope !== MYSQL_BACKUP_ARTIFACT_V3_SCOPE || value.producerVersion !== MYSQL_BACKUP_ARTIFACT_V3_PRODUCER_VERSION
+    : v2 ? value.scope !== MYSQL_BACKUP_ARTIFACT_V2_SCOPE || value.producerVersion !== MYSQL_BACKUP_ARTIFACT_V2_PRODUCER_VERSION
     : value.scope !== MYSQL_BACKUP_ARTIFACT_SCOPE || value.version !== 1
       || value.producerVersion !== MYSQL_BACKUP_ARTIFACT_PRODUCER_VERSION) artifactFailure("manifest_invalid");
   try { validateTenantBackupSnapshotAnchor(value.anchor as TenantBackupSnapshotAnchor); }
   catch { artifactFailure("manifest_invalid"); }
   const anchor = value.anchor as TenantBackupSnapshotAnchor;
-  if (v2) assertArtifactCaptureCheckpoint(value.captureCheckpoint as TenantTelemetryCaptureBackupCheckpoint, anchor, tenantTelemetryRefKey);
+  if (v2 || v3) {
+    const checkpoint = value.captureCheckpoint as TenantTelemetryCaptureBackupCheckpoint;
+    assertArtifactCaptureCheckpoint(checkpoint, anchor, tenantTelemetryRefKey);
+    // The old v2 wire contract must never acquire new ancestry semantics merely
+    // because the shared reader now accepts a discriminated checkpoint union.
+    if (checkpoint.scope !== (v3 ? TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE : TENANT_TELEMETRY_CAPTURE_CHECKPOINT_SCOPE)) {
+      artifactFailure("capture_checkpoint_version_mismatch");
+    }
+  }
   if (value.backupId !== anchor.backupId || value.schemaMigrationRootSha256 !== anchor.schemaMigrationRootSha256) {
     artifactFailure("manifest_invalid");
   }
@@ -293,16 +320,16 @@ export function artifactAad(manifest: MySqlBackupArtifactManifest): Buffer {
 export function encodeArtifactManifest(manifest: MySqlBackupArtifactManifest, maxBytes: number, tenantTelemetryRefKey?: Uint8Array): Buffer {
   validateMySqlBackupArtifactManifest(manifest, maxBytes, tenantTelemetryRefKey);
   const bytes = Buffer.from(canonicalJson(manifest));
-  if (bytes.length > (manifest.version === 2 ? MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT : MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT)) artifactFailure("manifest_limit");
+  if (bytes.length > manifestLimit(manifest.version)) artifactFailure("manifest_limit");
   return bytes;
 }
 
 export function decodeArtifactManifest(bytes: Buffer, maxBytes: number, tenantTelemetryRefKey?: Uint8Array): MySqlBackupArtifactManifest {
-  if (!bytes.length || bytes.length > MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT) artifactFailure("manifest_limit");
+  if (!bytes.length || bytes.length > Math.max(MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT, MYSQL_BACKUP_ARTIFACT_V3_MANIFEST_LIMIT)) artifactFailure("manifest_limit");
   let value: unknown;
   try { value = JSON.parse(bytes.toString("utf8")); } catch { return artifactFailure("manifest_invalid"); }
   validateMySqlBackupArtifactManifest(value, maxBytes, tenantTelemetryRefKey);
-  if (value.version === 1 && bytes.length > MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT) artifactFailure("manifest_limit");
+  if (bytes.length > manifestLimit(value.version)) artifactFailure("manifest_limit");
   if (!Buffer.from(canonicalJson(value)).equals(bytes)) artifactFailure("manifest_noncanonical");
   return value;
 }
@@ -315,13 +342,20 @@ export function artifactEvidence(manifest: MySqlBackupArtifactManifest, sourceBa
     sourceBackupSha256,
     artifactManifestSha256,
     providerEvidenceSha256: sha256(canonicalJson({
-      scope: manifest.version === 2 ? "mysql-logical-full-artifact-provider-evidence-v2" : "mysql-logical-full-artifact-provider-evidence-v1", backupId: manifest.backupId,
+      scope: manifest.version === 3 ? "mysql-logical-full-artifact-provider-evidence-v3"
+        : manifest.version === 2 ? "mysql-logical-full-artifact-provider-evidence-v2" : "mysql-logical-full-artifact-provider-evidence-v1", backupId: manifest.backupId,
       anchorSha256: manifest.anchor.anchorSha256, sourceIdentitySha256: manifest.sourceIdentitySha256,
       schemaMigrationRootSha256: manifest.schemaMigrationRootSha256, schemaSha256: manifest.schemaSha256,
       sourceSnapshotSha256: manifest.plaintextSha256, sourceBackupSha256, artifactManifestSha256,
-      ...(manifest.version === 2 ? { captureCheckpointSha256: manifest.captureCheckpoint.checkpointSha256 } : {}),
+      ...(manifest.version !== 1 ? { captureCheckpointSha256: manifest.captureCheckpoint.checkpointSha256 } : {}),
+      ...(manifest.version === 3 ? { captureLineageCapsuleSha256: manifest.captureCheckpoint.lineage.capsuleSha256 } : {}),
     })),
   };
+}
+
+function manifestLimit(version: MySqlBackupArtifactManifest["version"]): number {
+  return version === 3 ? MYSQL_BACKUP_ARTIFACT_V3_MANIFEST_LIMIT
+    : version === 2 ? MYSQL_BACKUP_ARTIFACT_V2_MANIFEST_LIMIT : MYSQL_BACKUP_ARTIFACT_MANIFEST_LIMIT;
 }
 
 export function assertArtifactEvidence(actual: ArtifactEvidence, expected: ArtifactEvidence): void {

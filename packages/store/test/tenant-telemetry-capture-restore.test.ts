@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { tenantTelemetryRefKeyIdSha256 } from "../src/tenant-telemetry-lifecycle.js";
 import * as codec from "../src/tenant-telemetry-capture-restore.js";
 import { validatePreflightTenantRestoreReplayFromBackupInput } from "../src/backup-catalog.js";
 import { readTenantTelemetryCaptureCheckpointFromMysql } from "../src/mysql/tenant-telemetry-capture-checkpoint.js";
-import type { Connection } from "mysql2/promise";
+import type { Connection, PoolConnection } from "mysql2/promise";
+import { MysqlSessionStore } from "../src/mysql/store.js";
 import * as RestoreJournal from "../src/tenant-restore-journal.js";
 import { validateTenantTelemetryCaptureRestoreMaintenanceSelector,
+  type TenantTelemetryCaptureBackupCheckpointRecord,
   type TenantTelemetryCaptureRestoreMaintenanceSelector } from "../src/tenant-telemetry-capture-restore-store.js";
 
 // Pure, synthetic codec fixtures. None proves a database row, an actual backup,
@@ -118,8 +120,121 @@ const rejected = (work: () => unknown) => expect(work).toThrow(codec.TenantTelem
 const createPermit = (f: ReturnType<typeof fixture>, input = f.recoveryInput) =>
   codec.createTenantTelemetryCaptureOperationRecoveryPermit(input, f.cutover, f.history, f.checkpoint, f.leaves, key);
 
+/** Synthetic full-backup inclusion, not database ancestry or a physical dump. */
+function repeatFixture(options: { wrongAncestorBinding?: boolean } = {}) {
+  const first = fixture();
+  const p1 = createPermit(first);
+  const recordLeaf = (family: codec.TenantTelemetryCaptureLineageFamily, label: string): codec.TenantTelemetryCaptureLineageLeaf => ({
+    family, identityRefSha256: codec.tenantTelemetryCaptureLineageOpaqueDigest(family, "identity", Buffer.from(label), key),
+    recordHmacSha256: codec.tenantTelemetryCaptureLineageOpaqueDigest(family, "record", Buffer.from(`synthetic-${label}`), key), sourceHighWaterDbMs: 1_400,
+  });
+  const cpLeaf = recordLeaf("checkpoint", "first-cp"), historyLeaf = recordLeaf("restore_history", "first-history"),
+    cutoverLeaf = recordLeaf("epoch_cutover", "first-cutover"), bindingLeaf = recordLeaf("restore_binding", "first-binding"),
+    eventLeaf = recordLeaf("runtime_event", "first-activation"), permitLeaf = { ...recordLeaf("recovery_permit", "first-permit"),
+      identityRefSha256: codec.tenantTelemetryCaptureLineagePermitIdentitySha256(p1.receiptSha256, key) };
+  const lineageLeaves = [cpLeaf, historyLeaf, cutoverLeaf, bindingLeaf, eventLeaf, permitLeaf];
+  const sourceBinding = options.wrongAncestorBinding ? h("self-consistent-wrong-ancestor-binding") : first.history.runtimeBindingSha256;
+  const ancestor: codec.TenantTelemetryCaptureLineageAncestor = { restoreRunId: runId, checkpointSha256: first.checkpoint.checkpointSha256,
+    historyReceiptSha256: first.history.receiptSha256, cutoverReceiptSha256: first.cutover.receiptSha256,
+    runtimeEpochSha256: first.history.runtimeEpochSha256, runtimeBindingSha256: sourceBinding, runtimeControlGeneration: 2,
+    checkpointIdentityRefSha256: cpLeaf.identityRefSha256, checkpointRecordHmacSha256: cpLeaf.recordHmacSha256,
+    historyIdentityRefSha256: historyLeaf.identityRefSha256, historyRecordHmacSha256: historyLeaf.recordHmacSha256,
+    cutoverIdentityRefSha256: cutoverLeaf.identityRefSha256, cutoverRecordHmacSha256: cutoverLeaf.recordHmacSha256,
+    restoreBindingIdentityRefSha256: bindingLeaf.identityRefSha256, restoreBindingRecordHmacSha256: bindingLeaf.recordHmacSha256,
+    runtimeEventIdentityRefSha256: eventLeaf.identityRefSha256, runtimeEventRecordHmacSha256: eventLeaf.recordHmacSha256 };
+  const backup2 = "backup_00000000-0000-4000-8000-000000000004";
+  const snapshotJob = { ...first.leaves.find((row) => row.family === "write_job")!, state: "reserved" as const, recordHmacSha256: h("snapshot-reserved-job") };
+  const reservationLeaf = operationLeaf("write_reservation", "reserved");
+  const leaves = [...first.leaves.filter((row) => row.family !== "write_job"), snapshotJob, reservationLeaf];
+  const lineage = codec.createTenantTelemetryCaptureLineageCapsule({ backupId: backup2, anchorSha256: h("second-anchor"),
+    refKeyIdSha256: first.checkpoint.refKeyIdSha256, sourceRestoreRunId: runId, sourceCheckpointSha256: first.checkpoint.checkpointSha256,
+    sourceHistoryReceiptSha256: first.history.receiptSha256, sourceCaptureCutoverReceiptSha256: first.cutover.receiptSha256,
+    sourceRuntimeEpochSha256: first.history.runtimeEpochSha256, sourceRuntimeBindingSha256: sourceBinding,
+    sourceRuntimeControlEvidenceSha256: first.history.runtimeControlEvidenceSha256, sourceRuntimeControlGeneration: 2,
+    sealedAtDbMs: 2_700 }, lineageLeaves, [ancestor], key);
+  const cp2 = codec.createTenantTelemetryCaptureBackupCheckpointV2({ ...header(), backupId: backup2, anchorSha256: h("second-anchor"),
+    anchorCreatedAtDbMs: 2_500, controlHighWaterDbMs: 2_600, sourceRuntimeLineageKind: "restore",
+    sourceRuntimeEpochSha256: first.history.runtimeEpochSha256, sourceRuntimeBindingSha256: sourceBinding,
+    sourceRuntimeControlEvidenceSha256: first.history.runtimeControlEvidenceSha256, sourceRuntimeControlGeneration: 2,
+    sourceHistoryReceiptSha256: first.history.receiptSha256, sourceCaptureCutoverReceiptSha256: first.cutover.receiptSha256, sealedAtDbMs: 2_700 },
+  leaves, lineage, lineageLeaves, key);
+  const activation = { ...first.binding, backupId: backup2, anchorSha256: cp2.anchorSha256, checkpointSha256: cp2.checkpointSha256,
+    restoreRunId: otherRunId, runtimeEpochSha256: h("second-epoch"), runtimeBindingSha256: h("second-binding"),
+    runtimeControlEvidenceSha256: h("second-control"), runtimeControlGeneration: 3, activatedAtDbMs: 3_000 };
+  const history = codec.createTenantTelemetryCaptureRestoreHistoryReceipt(activation, cp2, key);
+  const cutover = codec.createTenantTelemetryCaptureEpochCutoverReceipt({ ...first.cutoverInput, historyReceiptSha256: history.receiptSha256,
+    restoreRunId: otherRunId, runtimeEpochSha256: history.runtimeEpochSha256, runtimeBindingSha256: history.runtimeBindingSha256,
+    runtimeControlEvidenceSha256: history.runtimeControlEvidenceSha256, runtimeControlGeneration: 3, activatedAtDbMs: 3_100 }, history, cp2, key);
+  const input: codec.TenantTelemetryCaptureOperationRecoveryInputV2 = { ...first.recoveryInput,
+    cutoverReceiptSha256: cutover.receiptSha256, historyReceiptSha256: history.receiptSha256, checkpointSha256: cp2.checkpointSha256,
+    restoreRunId: otherRunId, runtimeEpochSha256: history.runtimeEpochSha256, previousClaimAttempt: p1.newClaimAttempt,
+    previousClaimTokenSha256: p1.newClaimTokenSha256, previousClaimLeaseUntilMs: p1.newClaimLeaseUntilMs,
+    newClaimAttempt: p1.newClaimAttempt + 1, newClaimTokenSha256: h("second-claim"), newClaimLeaseUntilMs: 4_000, claimLeaseCeilingMs: 4_000,
+    issuedAtDbMs: 3_300, previousPermitReceiptSha256: p1.receiptSha256, recoveryMode: "resume_reserved",
+    reservationAtIssue: { origin: "recovery-permit", receiptSha256: h("first-permit-reservation"), startedAtDbMs: 1_600,
+      startedClaimAttempt: p1.newClaimAttempt, startedClaimTokenSha256: p1.newClaimTokenSha256, authorizingPermitReceiptSha256: p1.receiptSha256 },
+    genesisCheckpointSha256: first.checkpoint.checkpointSha256, snapshotJobState: "reserved", snapshotJobEvidenceHmacSha256: snapshotJob.recordHmacSha256,
+    snapshotReservationReceiptSha256: h("first-permit-reservation"), snapshotReservationEvidenceHmacSha256: reservationLeaf.recordHmacSha256,
+    predecessorLineageEvidenceHmacSha256: permitLeaf.recordHmacSha256, reservationAuthorizerLineageEvidenceHmacSha256: permitLeaf.recordHmacSha256 };
+  const context: codec.TenantTelemetryCaptureRecoveryContext = { checkpoint: cp2, leaves, lineageLeaves, history, cutover };
+  const ancestors: codec.TenantTelemetryCaptureRecoveryChainRecord[] = [{ permit: p1,
+    context: { checkpoint: first.checkpoint, leaves: first.leaves, history: first.history, cutover: first.cutover } }];
+  return { first, p1, leaves, lineage, lineageLeaves, ancestor, cp2, history, cutover, input, context, ancestors };
+}
+
+describe("versioned repeat-capture backup and cross-checkpoint recovery codec", () => {
+  it("keeps the published 49 families separate from the complete 27 physical lineage tables", () => {
+    expect(codec.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_FAMILIES).toHaveLength(49);
+    expect(codec.TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL).toHaveLength(27);
+    expect(new Set(codec.TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL.map((row) => row.table)).size).toBe(27);
+    expect(codec.TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL.filter((row) => row.excludeSelectedBackup).map((row) => row.family))
+      .toEqual(["checkpoint", "checkpoint_leaf", "checkpoint_lineage_leaf"]);
+  });
+  it("binds the full second snapshot plus immutable ancestor inclusions without rewriting CP1 or P1", () => {
+    const f = repeatFixture(); const before = JSON.stringify([f.first.checkpoint, f.p1]);
+    const result = codec.createTenantTelemetryCaptureOperationRecoveryPermitV2(f.input, f.context, key, f.ancestors);
+    expect(result).toMatchObject({ previousPermitReceiptSha256: f.p1.receiptSha256, genesisCheckpointSha256: f.first.checkpoint.checkpointSha256,
+      originalJobState: "queued", snapshotJobState: "reserved", newReservationAuthorized: false, newExternalCreateAuthorized: true });
+    expect(f.cp2.lineage.families).toHaveLength(27);
+    expect(JSON.stringify([f.first.checkpoint, f.p1])).toBe(before);
+    codec.assertTenantTelemetryCaptureLineageLeaves(f.lineage, [...f.lineageLeaves].reverse(), key);
+  });
+  it("does not accept a self-resealed wrong ancestor static binding", () => {
+    const f = repeatFixture({ wrongAncestorBinding: true });
+    rejected(() => codec.createTenantTelemetryCaptureOperationRecoveryPermitV2(f.input, f.context, key, f.ancestors));
+  });
+  it.each(["genesisCheckpointSha256", "snapshotJobEvidenceHmacSha256", "snapshotReservationEvidenceHmacSha256",
+    "predecessorLineageEvidenceHmacSha256", "reservationAuthorizerLineageEvidenceHmacSha256"] as const)("rejects independently replaced %s even after resealing", (field) => {
+    const f = repeatFixture(); rejected(() => codec.createTenantTelemetryCaptureOperationRecoveryPermitV2({ ...f.input, [field]: h("replacement") }, f.context, key, f.ancestors));
+  });
+  it("does not reset a cross-generation predecessor to a new genesis", () => {
+    const f = repeatFixture(); rejected(() => codec.createTenantTelemetryCaptureOperationRecoveryPermitV2({ ...f.input,
+      previousPermitReceiptSha256: null, predecessorLineageEvidenceHmacSha256: null }, f.context, key, f.ancestors));
+  });
+  it("requires both immutable history and actual permit inclusion, not only a supplied ancestor array", () => {
+    const f = repeatFixture();
+    rejected(() => codec.assertTenantTelemetryCaptureLineageLeaves(f.lineage, f.lineageLeaves.filter((row) => row.family !== "restore_history"), key));
+    rejected(() => codec.validateTenantTelemetryCaptureOperationRecoveryPermitV2(
+      codec.createTenantTelemetryCaptureOperationRecoveryPermitV2(f.input, f.context, key, f.ancestors),
+      { ...f.context, lineageLeaves: f.lineageLeaves.filter((row) => row.family !== "recovery_permit") }, key, f.ancestors));
+  });
+  it("rejects duplicate raw identities and explicit missing-empty summaries", () => {
+    const f = repeatFixture();
+    rejected(() => codec.assertTenantTelemetryCaptureLineageLeaves(f.lineage, [...f.lineageLeaves, f.lineageLeaves[0]!], key));
+    rejected(() => codec.validateTenantTelemetryCaptureLineageCapsule(reseal(f.lineage,
+      { families: f.lineage.families.slice(1) }, "capsuleSha256"), key));
+  });
+});
+
 describe("actual MySQL checkpoint reader boundary (pure driver doubles, not DB proof)", () => {
-  function source() {
+  const normalizeSql = (sql: string) => sql.replace(/\s+/g, " ").trim();
+  const readerSql = {
+    header: "SELECT backup_id,anchor_sha256,checkpoint_sha256,ref_key_id_sha256,sealed_at_db_ms,checkpoint_json FROM tenant_telemetry_capture_backup_checkpoints WHERE BINARY backup_id=BINARY ?",
+    leaves: `SELECT backup_id,family,identity_ref_sha256,record_hmac_sha256,knowledge,state,source_high_water_db_ms FROM tenant_telemetry_capture_backup_checkpoint_leaves WHERE BINARY backup_id=BINARY ? ORDER BY family,identity_ref_sha256 LIMIT ${codec.TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES + 1}`,
+    lineageTable: "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema=DATABASE() AND BINARY table_name=BINARY 'tenant_telemetry_capture_checkpoint_lineage_leaves' AND table_type='BASE TABLE'",
+    lineage: `SELECT backup_id,family,identity_ref_sha256,record_hmac_sha256,source_high_water_db_ms FROM tenant_telemetry_capture_checkpoint_lineage_leaves WHERE BINARY backup_id=BINARY ? ORDER BY family,identity_ref_sha256 LIMIT ${codec.TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES + 1}`,
+  };
+  function source(lineageInstalled = false) {
     const f = fixture();
     const header = { backup_id: backupId, anchor_sha256: f.checkpoint.anchorSha256,
       checkpoint_sha256: f.checkpoint.checkpointSha256, ref_key_id_sha256: f.checkpoint.refKeyIdSha256,
@@ -127,27 +242,52 @@ describe("actual MySQL checkpoint reader boundary (pure driver doubles, not DB p
     const rows = f.leaves.map((row) => ({ backup_id: backupId, family: row.family,
       identity_ref_sha256: row.identityRefSha256, record_hmac_sha256: row.recordHmacSha256,
       knowledge: row.knowledge, state: row.state, source_high_water_db_ms: row.sourceHighWaterDbMs }));
-    const calls: { sql: string; parameters: unknown[] }[] = [];
-    let headers: unknown[] = [header], leaves: unknown[] = rows;
-    const executor = { async query(sql: string, parameters: unknown[]) {
-      calls.push({ sql, parameters });
-      return [sql.includes("FROM tenant_telemetry_capture_backup_checkpoint_leaves") ? leaves : headers, []];
+    const calls: { sql: string; parameters: unknown[] | undefined }[] = [];
+    let headers: unknown[] = [header], leaves: unknown[] = rows, lineageRows: unknown[] = [];
+    const executor = { async query(sql: string, parameters?: unknown[]) {
+      const normalized = normalizeSql(sql);
+      calls.push({ sql: normalized, parameters });
+      if (normalized === readerSql.header) return [headers, []];
+      if (normalized === readerSql.leaves) return [leaves, []];
+      if (normalized === readerSql.lineageTable) return [[{ n: lineageInstalled ? 1 : 0 }], []];
+      if (normalized === readerSql.lineage && lineageInstalled) return [lineageRows, []];
+      throw new Error("unexpected checkpoint reader fixture SQL");
     } } as unknown as Connection;
     return { ...f, header, rows, executor, calls,
       setHeaders: (value: unknown[]) => { headers = value; },
-      setLeaves: (value: unknown[]) => { leaves = value; } };
+      setLeaves: (value: unknown[]) => { leaves = value; },
+      setLineageRows: (value: unknown[]) => { lineageRows = value; } };
   }
   it("reads every persisted leaf from the supplied connection and returns an isolated snapshot", async () => {
     const f = source();
     const result = await readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key);
     expect(result).toEqual({ checkpoint: f.checkpoint, leaves: f.leaves });
     expect(result!.checkpoint).not.toBe(f.checkpoint);
-    expect(f.calls).toHaveLength(2);
-    for (const call of f.calls) {
-      expect(call.parameters).toEqual([backupId]);
-      expect(call.sql).not.toContain(backupId);
-    }
-    expect(f.calls[1]!.sql).toContain(`LIMIT ${codec.TENANT_TELEMETRY_CAPTURE_RESTORE_MAX_LEAVES + 1}`);
+    // Published pre-0058 schema: header + all 49 leaves + an actual metadata
+    // presence query, not a fabricated lineage row or permissive SQL fallback.
+    expect(f.calls).toEqual([
+      { sql: readerSql.header, parameters: [backupId] },
+      { sql: readerSql.leaves, parameters: [backupId] },
+      { sql: readerSql.lineageTable, parameters: undefined },
+    ]);
+  });
+  it("reads the empty lineage table explicitly for an unchanged v1 checkpoint on a newer schema", async () => {
+    const f = source(true);
+    expect(await readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key))
+      .toEqual({ checkpoint: f.checkpoint, leaves: f.leaves });
+    expect(f.calls).toEqual([
+      { sql: readerSql.header, parameters: [backupId] },
+      { sql: readerSql.leaves, parameters: [backupId] },
+      { sql: readerSql.lineageTable, parameters: undefined },
+      { sql: readerSql.lineage, parameters: [backupId] },
+    ]);
+  });
+  it("does not hide an orphan lineage row behind an old v1 checkpoint", async () => {
+    const f = source(true);
+    f.setLineageRows([{ backup_id: backupId, family: "restore_history", identity_ref_sha256: h("orphan-lineage-id"),
+      record_hmac_sha256: h("orphan-lineage-row"), source_high_water_db_ms: 950 }]);
+    await expect(readTenantTelemetryCaptureCheckpointFromMysql(f.executor, backupId, key)).rejects.toThrow();
+    expect(f.calls).toHaveLength(4);
   });
   it("does not interpret missing historic header and leaves as verified inactive capture", async () => {
     const f = source(); f.setHeaders([]); f.setLeaves([]);
@@ -755,5 +895,197 @@ describe("closed canonical capture-restore transport", () => {
     rejected(() => codec.decodeTenantTelemetryCaptureRestoreRecord(Buffer.from(canonical(change(f.history, { receiptSha256: h("forged") }))), f.context));
     const all = Buffer.from(codec.encodeTenantTelemetryCaptureRestoreRecord(f.checkpoint, f.context)).toString("utf8");
     expect(all).not.toContain("unrelated-legacy-gap"); expect(all).not.toContain("previous-claim-token");
+  });
+});
+
+describe("ordinary-startup CP2 audit frame lifetime (pure doubles, not MySQL lock proof)", () => {
+  interface AuditFrame { nonce: symbol; includedKeys: Set<string> }
+  interface PrivateAuditStore {
+    startupCaptureAuditFrames: WeakMap<PoolConnection, AuditFrame>;
+    withStartupCaptureAuditFrame<T>(connection: PoolConnection, work: () => Promise<T>): Promise<T>;
+    assertStoredCaptureCheckpointLineageIncluded(connection: PoolConnection,
+      record: TenantTelemetryCaptureBackupCheckpointRecord, refKey: Buffer): Promise<void>;
+    assertCaptureLineageCurrentRelations(connection: PoolConnection): Promise<void>;
+    captureCheckpointLineageLeaves(connection: PoolConnection, selectedBackup: string,
+      refKey: Buffer): Promise<codec.TenantTelemetryCaptureLineageLeaf[]>;
+    assertStoredCaptureCheckpointLineageAncestors(connection: PoolConnection,
+      record: TenantTelemetryCaptureBackupCheckpointRecord, refKey: Buffer): Promise<void>;
+  }
+  function auditFixture() {
+    const f = repeatFixture();
+    const record: TenantTelemetryCaptureBackupCheckpointRecord = {
+      checkpoint: f.cp2, leaves: clone(f.leaves), lineageLeaves: clone(f.lineageLeaves),
+    };
+    codec.assertTenantTelemetryCaptureCheckpointLeaves(record.checkpoint, record.leaves, key);
+    codec.assertTenantTelemetryCaptureLineageLeaves(f.lineage, f.lineageLeaves, key);
+    const query = vi.fn(() => { throw new Error("pure audit fixture must not issue SQL"); });
+    const connection = Object.freeze({ query }) as unknown as PoolConnection;
+    const getConnection = vi.fn(() => { throw new Error("pure audit fixture must not acquire a connection"); });
+    // Invoke only the actual constructor's in-memory initialization. The three
+    // source readers below are transparent call-boundary doubles, not evidence
+    // of a database, a row lock, an ancestor, or a valid alternate protected key.
+    const store = Reflect.construct(MysqlSessionStore, [{ getConnection }]) as unknown as PrivateAuditStore;
+    const current = vi.spyOn(store, "assertCaptureLineageCurrentRelations").mockResolvedValue(undefined);
+    const leaves = vi.spyOn(store, "captureCheckpointLineageLeaves")
+      .mockImplementation(async () => clone(f.lineageLeaves));
+    const ancestors = vi.spyOn(store, "assertStoredCaptureCheckpointLineageAncestors").mockResolvedValue(undefined);
+    const audit = (value = record, refKey = key, conn = connection) =>
+      store.assertStoredCaptureCheckpointLineageIncluded(conn, value, refKey);
+    const frame = <T>(work: () => Promise<T>, conn = connection) =>
+      store.withStartupCaptureAuditFrame(conn, work);
+    const noIo = () => { expect(query).not.toHaveBeenCalled(); expect(getConnection).not.toHaveBeenCalled(); };
+    return { store, connection, record, current, leaves, ancestors, audit, frame, noIo };
+  }
+
+  it("reuses only a fully completed void audit for the exact input within one frame", async () => {
+    const f = auditFixture();
+    expect(await f.frame(async () => {
+      expect(await f.audit()).toBeUndefined();
+      expect(await f.audit(clone(f.record))).toBeUndefined();
+      expect(await f.audit()).toBeUndefined();
+      expect(f.store.startupCaptureAuditFrames.get(f.connection)?.includedKeys.size).toBe(1);
+      return "callback_result";
+    })).toBe("callback_result");
+    expect(f.current).toHaveBeenCalledExactlyOnceWith(f.connection);
+    expect(f.leaves).toHaveBeenCalledExactlyOnceWith(f.connection, f.record.checkpoint.backupId, key);
+    expect(f.ancestors).toHaveBeenCalledExactlyOnceWith(f.connection, f.record, key);
+    expect(f.store.startupCaptureAuditFrames.has(f.connection)).toBe(false);
+    f.noIo();
+  });
+
+  it.each(["checkpoint", "49-leaf input", "27-leaf input", "protected key"] as const)(
+    "does not reuse a success for a different %s", async (changed) => {
+      const f = auditFixture();
+      const alternate = clone(f.record);
+      let refKey = key;
+      if (changed === "checkpoint") {
+        alternate.checkpoint = reseal(alternate.checkpoint,
+          { sealedAtDbMs: alternate.checkpoint.sealedAtDbMs + 1 }, "checkpointSha256");
+        codec.validateTenantTelemetryCaptureBackupCheckpoint(alternate.checkpoint, key);
+        expect(alternate.checkpoint.checkpointSha256).not.toBe(f.record.checkpoint.checkpointSha256);
+      } else if (changed === "49-leaf input") {
+        alternate.leaves = [...alternate.leaves].reverse();
+        codec.assertTenantTelemetryCaptureCheckpointLeaves(alternate.checkpoint, alternate.leaves, key);
+      } else if (changed === "27-leaf input") {
+        alternate.lineageLeaves = [...alternate.lineageLeaves!].reverse();
+        if (alternate.checkpoint.scope !== codec.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) {
+          throw new Error("pure fixture requires CP2");
+        }
+        codec.assertTenantTelemetryCaptureLineageLeaves(alternate.checkpoint.lineage, alternate.lineageLeaves, key);
+      } else refKey = wrongKey;
+      await f.frame(async () => {
+        await f.audit();
+        await f.audit(alternate, refKey);
+        await f.audit(alternate, refKey);
+        expect(f.current).toHaveBeenCalledTimes(2);
+        expect(f.leaves).toHaveBeenCalledTimes(2);
+        expect(f.ancestors).toHaveBeenCalledTimes(2);
+      });
+      f.noIo();
+    });
+
+  it("does not cache a late ancestor failure or a partially completed audit", async () => {
+    const f = auditFixture();
+    const failure = new codec.TenantTelemetryCaptureRestoreIntegrityError();
+    f.ancestors.mockRejectedValueOnce(failure);
+    await f.frame(async () => {
+      await expect(f.audit()).rejects.toBe(failure);
+      expect(f.store.startupCaptureAuditFrames.get(f.connection)?.includedKeys.size).toBe(0);
+      await expect(f.audit()).resolves.toBeUndefined();
+      await f.audit();
+      expect(f.current).toHaveBeenCalledTimes(2);
+      expect(f.leaves).toHaveBeenCalledTimes(2);
+      expect(f.ancestors).toHaveBeenCalledTimes(2);
+    });
+    f.noIo();
+  });
+
+  it("revalidates on a fresh transaction frame and every unscoped later read using the same pooled connection", async () => {
+    const f = auditFixture();
+    let firstNonce: symbol | undefined;
+    await f.frame(async () => {
+      firstNonce = f.store.startupCaptureAuditFrames.get(f.connection)?.nonce;
+      expect(typeof firstNonce).toBe("symbol");
+      await f.audit(); await f.audit();
+    });
+    expect(f.store.startupCaptureAuditFrames.has(f.connection)).toBe(false);
+    await f.frame(async () => {
+      expect(f.store.startupCaptureAuditFrames.get(f.connection)?.nonce).not.toBe(firstNonce);
+      expect(f.store.startupCaptureAuditFrames.get(f.connection)?.includedKeys.size).toBe(0);
+      await f.audit(); await f.audit();
+    });
+    // Getter call sites do not create this private startup scope. In particular,
+    // using the same pooled connection outside it is never reusable evidence.
+    await f.audit(); await f.audit();
+    expect(f.current).toHaveBeenCalledTimes(4);
+    expect(f.leaves).toHaveBeenCalledTimes(4);
+    expect(f.ancestors).toHaveBeenCalledTimes(4);
+    f.noIo();
+  });
+
+  it("revokes successful evidence when the enclosing work rejects, before connection reuse", async () => {
+    const f = auditFixture();
+    const failure = new codec.TenantTelemetryCaptureRestoreIntegrityError();
+    await expect(f.frame(async () => { await f.audit(); throw failure; })).rejects.toBe(failure);
+    expect(f.store.startupCaptureAuditFrames.has(f.connection)).toBe(false);
+    await f.audit();
+    await f.frame(async () => { await f.audit(); await f.audit(); });
+    expect(f.current).toHaveBeenCalledTimes(3);
+    expect(f.ancestors).toHaveBeenCalledTimes(3);
+    f.noIo();
+  });
+
+  it("rejects nested or concurrent frames for one connection without revoking its existing nonce", async () => {
+    const f = auditFixture();
+    const forbiddenWork = vi.fn(async () => {});
+    await f.frame(async () => {
+      const nonce = f.store.startupCaptureAuditFrames.get(f.connection)?.nonce;
+      await f.audit();
+      await expect(f.frame(forbiddenWork)).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+      expect(forbiddenWork).not.toHaveBeenCalled();
+      expect(f.store.startupCaptureAuditFrames.get(f.connection)?.nonce).toBe(nonce);
+      await f.audit();
+      expect(f.current).toHaveBeenCalledTimes(1);
+      const otherConnection = Object.freeze({}) as unknown as PoolConnection;
+      await f.frame(async () => {
+        expect(f.store.startupCaptureAuditFrames.get(otherConnection)?.nonce).not.toBe(nonce);
+        await f.audit(f.record, key, otherConnection);
+        await f.audit(f.record, key, otherConnection);
+      }, otherConnection);
+      expect(f.store.startupCaptureAuditFrames.has(otherConnection)).toBe(false);
+      expect(f.current).toHaveBeenCalledTimes(2);
+    });
+    f.noIo();
+  });
+
+  it("does not treat an in-flight audit as a completed success", async () => {
+    const f = auditFixture();
+    let release: () => void = () => { throw new Error("pure fixture gate is not initialized"); };
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    f.current.mockImplementation(() => gate);
+    await f.frame(async () => {
+      const first = f.audit(), second = f.audit();
+      expect(f.current).toHaveBeenCalledTimes(2);
+      expect(f.store.startupCaptureAuditFrames.get(f.connection)?.includedKeys.size).toBe(0);
+      release();
+      await Promise.all([first, second]);
+      expect(f.leaves).toHaveBeenCalledTimes(2);
+      expect(f.ancestors).toHaveBeenCalledTimes(2);
+      await f.audit();
+      expect(f.current).toHaveBeenCalledTimes(2);
+    });
+    f.noIo();
+  });
+
+  it("does not memoize the published v1 early-return path as a completed CP2 source audit", async () => {
+    const f = auditFixture(), primary = fixture();
+    const record = { checkpoint: primary.checkpoint, leaves: primary.leaves };
+    await f.frame(async () => {
+      await f.audit(record); await f.audit(record);
+      expect(f.store.startupCaptureAuditFrames.get(f.connection)?.includedKeys.size).toBe(0);
+    });
+    expect(f.current).not.toHaveBeenCalled(); expect(f.leaves).not.toHaveBeenCalled();
+    expect(f.ancestors).not.toHaveBeenCalled();
+    f.noIo();
   });
 });
