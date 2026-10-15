@@ -421,10 +421,12 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
   }, 120_000);
 
   it("recovers after the active owner is SIGKILLed with a live drain claim", async () => {
+    // Construct a still-owned lease long enough to observe a bounded retry, rather than extending
+    // either the test watchdog or the final-state wait. The retry observation itself stays fixed.
+    const retryObservationMs = 4_000; // executor 2s + poll 500ms + max backoff 500ms + margin 1s
     cluster = await startCluster({
       ...workerClusterOptions,
-      // Leave ample room on slower CI hosts to observe at least one bounded retry before expiry.
-      leaseTtlMs: 4_000,
+      leaseTtlMs: 12_000,
       script: [{ text: "too late from crashed owner", ttftMs: 8_000 }],
     });
     const [workerRunner, ownerRunner] = cluster.runners;
@@ -452,33 +454,99 @@ describe.skipIf(!enabled)("cluster: durable user erasure worker", () => {
 
     // Freeze the active owner during the deterministic gap between phases, then wait until the
     // surviving worker holds a live drain claim before simulating an ungraceful machine loss.
+    const pausedAt = performance.now();
+    let claimObservedAt: number | undefined;
+    let killStartedAt: number | undefined;
+    let killFinishedAt: number | undefined;
+    let retryObservedFrom: number | undefined;
+    let remainingTtlAtKillMs: number | undefined;
+    let lastObservedRow: ErasureRow | undefined;
+    const diagnosticInteger = (value: unknown): number | null => (
+      typeof value === "number" && Number.isSafeInteger(value) ? value : null
+    );
+    const observationFailure = (
+      phase: "claim" | "retry",
+      kind: "timeout" | "probe_error",
+    ): Error => {
+      const now = performance.now();
+      const wallNow = Date.now();
+      const availableAt = diagnosticInteger(lastObservedRow?.available_at_ms);
+      const claimLeaseUntil = diagnosticInteger(lastObservedRow?.lease_until_ms);
+      // No original error, status, request/session identity, token or process output is retained.
+      return new Error(`cluster erasure SIGKILL observation failed ${JSON.stringify({
+        phase,
+        kind,
+        elapsedSincePauseMs: diagnosticInteger(Math.floor(now - pausedAt)),
+        pauseToClaimMs: claimObservedAt === undefined ? null
+          : diagnosticInteger(Math.floor(claimObservedAt - pausedAt)),
+        claimToKillMs: claimObservedAt === undefined || killStartedAt === undefined ? null
+          : diagnosticInteger(Math.floor(killStartedAt - claimObservedAt)),
+        killElapsedMs: killStartedAt === undefined || killFinishedAt === undefined ? null
+          : diagnosticInteger(Math.floor(killFinishedAt - killStartedAt)),
+        retryObservationElapsedMs: retryObservedFrom === undefined ? null
+          : diagnosticInteger(Math.floor(now - retryObservedFrom)),
+        remainingTtlAtKillMs: diagnosticInteger(remainingTtlAtKillMs),
+        lastAttempts: diagnosticInteger(lastObservedRow?.attempts),
+        lastClaimed: lastObservedRow?.claimed === 0 || lastObservedRow?.claimed === 1
+          ? lastObservedRow.claimed : null,
+        lastAvailableDelayMs: availableAt === null ? null
+          : diagnosticInteger(availableAt - wallNow),
+        lastClaimLeaseDelayMs: claimLeaseUntil === null ? null
+          : diagnosticInteger(claimLeaseUntil - wallNow),
+      })}`);
+    };
     ownerRunner!.pause();
     const claimed = await waitForErasureRow(
       request.id,
-      (row) => row.status === "draining" && Number(row.claimed) === 1,
+      (row) => {
+        lastObservedRow = row;
+        return row.status === "draining" && Number(row.claimed) === 1;
+      },
       "live drain claim against frozen owner",
-    );
+    ).catch((error: unknown) => {
+      throw observationFailure("claim", error instanceof Error
+        && error.message === "timeout waiting for live drain claim against frozen owner"
+        ? "timeout" : "probe_error");
+    });
+    claimObservedAt = performance.now();
     const [activeBeforeCrash] = await queryDb<{ status: string }>(
       "SELECT status FROM turns WHERE session_id=? ORDER BY started_at_ms DESC LIMIT 1",
       [session.id],
     );
     expect(activeBeforeCrash?.status).toBe("inProgress");
+    killStartedAt = performance.now();
     ownerRunner!.kill();
     await ownerRunner!.exited;
+    killFinishedAt = performance.now();
     slow.cancel();
 
     const leaseKey = `as:lease:{${session.id}}`;
     const leaseDeadline = Number(await cluster.redis.call("PEXPIRETIME", leaseKey));
+    remainingTtlAtKillMs = Number(await cluster.redis.pttl(leaseKey));
+    expect(remainingTtlAtKillMs).toBeGreaterThan(5_000);
     expect(leaseDeadline).toBeGreaterThan(Date.now());
+    retryObservedFrom = performance.now();
     await waitForErasureRow(
       request.id,
-      (row) => row.status === "draining" && row.attempts > Number(claimed.attempts),
+      (row) => {
+        lastObservedRow = row;
+        return row.status === "draining" && row.attempts > Number(claimed.attempts);
+      },
       "drain retry before the dead owner's session lease expires",
-      Math.max(250, leaseDeadline - Date.now() - 50),
-    );
+      retryObservationMs,
+    ).catch((error: unknown) => {
+      throw observationFailure("retry", error instanceof Error
+        && error.message === "timeout waiting for drain retry before the dead owner's session lease expires"
+        ? "timeout" : "probe_error");
+    });
+    expect(Date.now()).toBeLessThan(leaseDeadline);
     // The retry cadence is shorter than the session TTL. A conflicting runner must not refresh the
     // dead owner's absolute deadline; only natural expiry may open the higher-fence takeover path.
     expect(Number(await cluster.redis.call("PEXPIRETIME", leaseKey))).toBe(leaseDeadline);
+    // assertOwner only reads the Redis owner address; it cannot acquire or refresh this lease.
+    await assertOwner(cluster, session.id, ownerRunner!);
+    expect(Number(await cluster.redis.get(`as:fence:{${session.id}}`))).toBe(fenceBefore);
+    expect(Date.now()).toBeLessThan(leaseDeadline);
 
     await expectFinalNonPurgeState(request.id, [session], workerRunner!.url);
     const [finalRequest] = await queryDb<{ attempts: number }>(
