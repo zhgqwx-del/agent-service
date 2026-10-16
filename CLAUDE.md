@@ -4,6 +4,8 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
+用户已明确批准仅完整R2双跳it采用300秒预算；single-hop180/CLI120/lease/生产时限和全部恢复/ACK/新Pi/冷启动/cleanup断言不改。仅改该测试期限，待真实整文件复验；没有新通过/CI结论，下方“待用户答/原180不改”是此前时点。继续当前包收口，不加新能力或产品缓存。
+
 15:02Z补记：原超时fixture精确3库/17同run对象/3空桶已按普通隔离夹具清理，库复核0；加密目录/key及失败报告保留，未动业务库/共享服务。14:53只读正常冷启动约2.9秒、0059审计约4毫秒，不构成测试通过或新缓存依据；诊断曾安全读取并置零fixture ref-key，清理不读key/.env。全部验证终态，原180/CLI120不改、300秒待用户答、未push；下方为此前事实，见PROGRESS末节。
 
 最新分段（14:42Z）：release clean302435a含f1 pristine恢复启动窄修与GET sidecar单测试修。定向真实1/SQL7/纯195、typecheck/scan748已过；完整S3原8文件55pass、file9另1pass/R2180s timeout，tail27080独立6文件28pass+sourceassembly、exit0。cluster原8文件27pass1fail，GET精确15字段修后27471受影响整file3+正式T3g3过，owned资源正常清。302新build与strictclean双role VM各exit0，仅Darwin arm64/Node24及ephemeral-test-only签名，非生产验收。300秒单慢测选择待答，原180/CLI120不改；未push/最终SHA CI未开始，不拼全绿。原超时S3三个owned非空桶与内部fixture残留待精确核对；native跨迁移/高级生命周期仍未完成P2，M3优先及原安全边界不变。详见PROGRESS末节；下方为此前事实。

@@ -1,5 +1,7 @@
 # 进度记录
 
+> **用户预算选择已确认（2026-10-16）**：明确允许仅完整R2双跳it采用300秒总预算；原single-hop180、所有CLI120、lease/生产时限及全部真实恢复/ACK/新Pi/冷启动/清理断言不变。这里只改测试期限并准备真实整文件复验，不新增通过/CI证明；下方“待用户答/原180不改”保留历史时间点，不再据此阻断当前包收口。发布后先体验、M3、必要M4，再P2的顺序不变。
+
 > **诊断与隔离清理补记（2026-10-16T15:02Z）**：只读正常cold connect约2.9秒、0059审计约4毫秒，不是R2完整验收或新增cache依据。原超时fixture精确3测试库、17同run对象和3空桶已清理，库复核0；加密制品目录/key及原失败报告保留，未动业务库/共享服务。全部验证终态，300秒选择仍待用户答，原180/CLI120未改、未push；下方14:47/14:42状态仅保留当时时点，精确证据见末节。
 
 > **最新分段验收（2026-10-16T14:42Z）**：clean302435a含f1 pristine恢复启动窄修与GET sidecar单测试修；定向真实1/SQL7/纯195、typecheck/scan748通过。完整S3原8文件55pass、file9另1pass/R2180s timeout，tail27080独立补6文件28pass+sourceassembly、exit0；cluster原27pass/1fail，精确字段修后受影响整file3+正式T3g3过。302新build与严格clean双role VM均exit0，签名仅ephemeral-test-only、非生产验收。300秒单慢测预算选择待答，180/CLI120未改；main仍3414，未push/最终CI未开始，不拼全绿。原超时S3三owned非空桶与内部fixture残留待核；M1未冻/M2冻/M3未始，native跨迁移/高级生命周期未完成P2与M3优先排序不变；精确事实见末节。
@@ -1803,3 +1805,8 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 精确清理脚本`/private/tmp/agent-service-owned-r2-cleanup-20261016.mjs`先node--check0，普通sandbox的ps被EPERM拒绝、未连接DB；随后两次inspect各exit1、零删除，分别因JavaScript误比binary tenant ID及未纳入原测试明确创建的legacy tenant。只调整本次临时清理脚本为SQL精确计数和固定主/legacy/journal三类，不改产品或测试oracle；失败报告原样保留。第三次只读inspect实际exit0，确认3库/17对象；核无Vitest、相关CLI、原worker PID及native mysql/mysqldump进程，每库零连接且无其它default DB下包含该库名的活跃SQL，全部对象严格属于固定run三个前缀，桶无versioning状态。独立静态审查只支持普通fixture清理，不提升为产品grant或GCM认证。
 - `57109`实际cleanup exit0：仅删除`agent_service_backup_artifact_test_59434_4fa72bee_{1,2,3}`三库、固定`as-test-20261016-5ab4cd30216f-{telemetry,catalog,journal}`三桶中的17对象，再校空删除三桶，最终SCHEMATA中这三库为0。对象逐桶重查精确前缀/数量与无versioning，删库前逐库重查无相关进程/连接/活跃SQL；原launcher先证absent再创建桶的日志、run tenant/anchor与fixture源码共同限定范围，不扫描删除其它资源。独占`.local-run/m1-r2-owned-{inspect,inspect-v2,inspect-v3,cleanup}-20261016.json`保留，cleanup complete=true。已删除的是不可原地撤销的临时测试数据；`/private/tmp/agent-service-backup-artifact-e2e-jzfzis`加密制品/key目录、所有原失败报告及其它临时目录保留，没有业务库/共享服务/云资源操作，也不声称全机零残留。
 - 这不是R2复验、完整S3或最终CI成功；原180秒超时和全部断言不改，300秒选择仍未得到用户回答。release仅更新四facts docs，未合main/推送或启动新CI，M1未冻/M2冻/M3未开始；按已确认优先级收口当前包后体验、M3、必要M4，P2不取消。全部验证/诊断已终态，不盲重跑同字节或将cleanup移出计时来制造180秒通过；0037/0054、旧receipt/unknown、default-off/production拒绝和completion=false不变。
+
+## 2026-10-16：用户明确允许单条完整R2采用300秒，真实复验待执行
+
+- 用户已回答“允许单条慢测300秒（推荐）”。仅将`telemetry-capture-restore.mysql-s3.test.ts`中`exerciseCaptureRestore(true)`的it预算180000→300000，注释说明完整两次真实恢复含最终cold/cleanup；single-hop仍180000，CLI120、lease、生产超时及所有恢复/ACK/newPi/冷启动/清理和安全断言均不改。没有skip/filter、拆case、移走cleanup、产品缓存或新增能力；原180秒通过/超时和分段报告全部保留。
+- 四facts顶部同步该选择，历史“待用户答/原180不改”不再作为当前阻断。准备在冻结clean检查点、全新隔离MySQL/MinIO资源上执行正式required wrapper的完整2例文件，无.env或真实模型调用；截至本条未启动，不预写通过。之后根据实际结果集中提交/推送main并等待最终SHA全部CI；保留0058冻结binary依赖的24d祖先，不合入native或CI分片P2候选。
