@@ -8,6 +8,7 @@ import { readTenantTelemetryCaptureCheckpointFromMysql } from "../src/mysql/tena
 import type { Connection, PoolConnection } from "mysql2/promise";
 import { MysqlSessionStore } from "../src/mysql/store.js";
 import * as RestoreJournal from "../src/tenant-restore-journal.js";
+import * as BackupCatalog from "../src/backup-catalog.js";
 import { validateTenantTelemetryCaptureRestoreMaintenanceSelector,
   type TenantTelemetryCaptureBackupCheckpointRecord,
   type TenantTelemetryCaptureRestoreMaintenanceSelector } from "../src/tenant-telemetry-capture-restore-store.js";
@@ -1087,5 +1088,305 @@ describe("ordinary-startup CP2 audit frame lifetime (pure doubles, not MySQL loc
     expect(f.current).not.toHaveBeenCalled(); expect(f.leaves).not.toHaveBeenCalled();
     expect(f.ancestors).not.toHaveBeenCalled();
     f.noIo();
+  });
+});
+
+describe("pristine dormant restore startup exception (pure SQL doubles, not database proof)", () => {
+  type SqlRow = Record<string, unknown>;
+  interface StubRestoreRun {
+    restoreRunId: string; phase: "active"; runtimeEpochSha256: string;
+  }
+  interface StartupAuditStore {
+    tenantTelemetryCaptureEpochCutoverSchemaInstalled: boolean;
+    tenantTelemetryCaptureRepeatRestoreSchemaInstalled: boolean;
+    assertCaptureRecoveryGlobalRelations(conn: PoolConnection, auditOnly?: boolean,
+      startupPristineDormantRestore?: boolean): Promise<void>;
+    activeCaptureEpochCutover(conn: PoolConnection, lock: string): Promise<null>;
+    requireTenantTelemetryRefKey(): Buffer;
+    assertTenantRestoreRuntimeProjection(conn: PoolConnection, lock: string): Promise<{
+      control: { state: "active"; lineageKind: "restore"; restoreRunId: string; runtimeEpochSha256: string };
+      heads: unknown[];
+    }>;
+    assertPersistedProviderCaptureProjection(conn: PoolConnection, lock: string): Promise<{
+      domain: "logs"; state: "inactive"; controlGeneration: 0;
+    }>;
+    assertTenantBackupCatalogProjection(conn: PoolConnection, lock: string): Promise<{
+      control: { state: "active" };
+      replayRuns: Map<string, StubRestoreRun>;
+      bindings: Map<string, BackupCatalog.TenantBackupRestoreSourceBinding>;
+      reservations: Map<string, BackupCatalog.TenantBackupRuntimeReservation>;
+    }>;
+    loadTenantRestoreReplayRun(conn: PoolConnection, restoreRunId: string,
+      lock: string): Promise<{ run: StubRestoreRun; row: SqlRow } | null>;
+    assertPersistedFailureGlobalRelations(conn: PoolConnection): Promise<Map<string, unknown>>;
+    assertTenantTelemetryWriterProjection(conn: PoolConnection): Promise<void>;
+  }
+  const emptyFamilies = [
+    "tenant_telemetry_capture_v2_activation_receipts",
+    "tenant_telemetry_capture_v2_coverages",
+    "tenant_telemetry_capture_v2_source_bindings",
+    "tenant_telemetry_capture_v2_failure_commit_receipts",
+    "tenant_telemetry_capture_backup_checkpoints",
+    "tenant_telemetry_capture_backup_checkpoint_leaves",
+    "tenant_telemetry_capture_restore_bindings",
+    "tenant_telemetry_capture_restore_history_receipts",
+    "tenant_telemetry_capture_epoch_cutovers",
+    "tenant_telemetry_capture_recovery_permits",
+    "tenant_telemetry_capture_checkpoint_lineage_leaves",
+    "tenant_telemetry_capture_recovery_permits_v2",
+  ] as const;
+  const materialFields = [
+    "telemetry_capture_v2_operation_sha256",
+    "telemetry_capture_v2_session_ref_sha256",
+    "telemetry_capture_v2_turn_ref_sha256",
+    "telemetry_capture_v2_item_ref_sha256",
+    "telemetry_capture_v2_failure_receipt_sha256",
+    "telemetry_capture_v2_business_batch_sha256",
+  ] as const;
+  const runtimeProbeSql = "SELECT state,lineage_kind FROM tenant_restore_runtime_control WHERE singleton_id=1";
+  const captureProbeSql = "SELECT state FROM tenant_telemetry_capture_v2_controls WHERE domain='logs'";
+  const bindingSql = "SELECT restore_run_id,backup_id,scope,protocol,"
+    + "anchor_sha256,entry_sha256,source_snapshot_sha256,source_backup_sha256,"
+    + "artifact_manifest_sha256,provider_evidence_sha256,control_evidence_sha256,"
+    + "journal_control_evidence_sha256,sealed_target_root_sha256,runtime_epoch_sha256,"
+    + "reservation_receipt_sha256,selected_catalog_sequence,selected_catalog_event_root_sha256,"
+    + "bound_at_db_ms,binding_sha256 FROM backup_restore_source_bindings"
+    + " WHERE BINARY restore_run_id=BINARY ? FOR SHARE";
+  const reservationSql = "SELECT runtime_epoch_sha256,restore_run_id,backup_id,"
+    + "scope,protocol,entry_sha256,binding_sha256,reservation_operation_sha256,"
+    + "reservation_receipt_sha256,catalog_sequence,previous_catalog_event_root_sha256,"
+    + "catalog_event_root_sha256,catalog_event_sha256,phase,reserved_at_db_ms,"
+    + "resolution_operation_sha256,resolution_receipt_sha256,resolution_catalog_sequence,"
+    + "resolution_previous_catalog_event_root_sha256,resolution_catalog_event_root_sha256,"
+    + "resolution_catalog_event_sha256,resolved_at_db_ms,reservation_sha256"
+    + " FROM backup_runtime_reservations WHERE BINARY restore_run_id=BINARY ? FOR SHARE";
+  const subjectsSql = "SELECT telemetry_logs_capture_v2_generation FROM subject_lifecycle"
+    + " ORDER BY tenant_id,subject_kind,subject_id FOR SHARE";
+  const materialSql = (table: "items" | "events") =>
+    "SELECT telemetry_failure_classification,telemetry_capture_v2_control_generation,"
+    + materialFields.join(",") + " FROM " + table + " ORDER BY "
+    + (table === "items" ? "item_id" : "session_id,seq") + " FOR SHARE";
+  const jobsSql = "SELECT JSON_UNQUOTE(JSON_EXTRACT(inventory_json,'$.sourceSchema')) AS source_schema"
+    + " FROM tenant_telemetry_write_jobs ORDER BY write_operation_sha256 FOR SHARE";
+  const membershipsSql = "SELECT source_schema FROM tenant_telemetry_artifact_memberships"
+    + " ORDER BY write_operation_sha256 FOR SHARE";
+  const familySql = (table: string) => "SELECT 1 AS occupied FROM " + table + " FOR SHARE";
+  const sqlKey = (sql: string) => sql.replace(/\s+/g, "").toLowerCase();
+  const sqlRow = (record: object): SqlRow => Object.fromEntries(Object.entries(record)
+    .map(([field, value]) => [field.replace(/[A-Z]/g, (letter) => "_" + letter.toLowerCase()), value]));
+
+  function startupFixture() {
+    const epoch = h("pristine-startup-restored-epoch");
+    const reservationReceipt = h("pristine-startup-reservation-receipt");
+    const selectedRoot = h("pristine-startup-selected-head");
+    const bindingBody = {
+      scope: BackupCatalog.TENANT_BACKUP_RESTORE_BINDING_SCOPE,
+      protocol: BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+      restoreRunId: runId, backupId,
+      anchorSha256: h("pristine-startup-anchor"), entrySha256: h("pristine-startup-entry"),
+      sourceSnapshotSha256: h("pristine-startup-snapshot"),
+      sourceBackupSha256: h("pristine-startup-backup"),
+      artifactManifestSha256: h("pristine-startup-manifest"),
+      providerEvidenceSha256: h("pristine-startup-provider"),
+      controlEvidenceSha256: h("pristine-startup-catalog-control"),
+      journalControlEvidenceSha256: h("pristine-startup-journal-control"),
+      sealedTargetRootSha256: h("pristine-startup-sealed-targets"),
+      runtimeEpochSha256: epoch, reservationReceiptSha256: reservationReceipt,
+      selectedCatalogSequence: 1, selectedCatalogEventRootSha256: selectedRoot, boundAtDbMs: 100,
+    };
+    const binding = { ...bindingBody,
+      bindingSha256: BackupCatalog.tenantBackupRestoreSourceBindingSha256(bindingBody) };
+    const reservationOperation = BackupCatalog.tenantBackupRuntimeReservationOperationSha256({
+      backupId, restoreRunId: runId, entrySha256: binding.entrySha256, runtimeEpochSha256: epoch,
+    });
+    const catalogEventSha256 = BackupCatalog.tenantBackupCatalogEventSha256({
+      eventType: "restore_reserved", operationSha256: reservationOperation, receiptSha256: reservationReceipt,
+    });
+    const reservationBody = {
+      scope: BackupCatalog.TENANT_BACKUP_RUNTIME_RESERVATION_SCOPE,
+      protocol: BackupCatalog.TENANT_BACKUP_CATALOG_PROTOCOL,
+      restoreRunId: runId, backupId, entrySha256: binding.entrySha256,
+      bindingSha256: binding.bindingSha256, runtimeEpochSha256: epoch,
+      reservationOperationSha256: reservationOperation, reservationReceiptSha256: reservationReceipt,
+      catalogSequence: 2, previousCatalogEventRootSha256: selectedRoot, catalogEventSha256,
+      catalogEventRootSha256: BackupCatalog.tenantBackupCatalogNextEventRootSha256({
+        catalogSequence: 2, previousCatalogEventRootSha256: selectedRoot, catalogEventSha256,
+      }),
+      reservedAtDbMs: 101,
+    };
+    const reservation = { ...reservationBody, phase: "reserved" as const,
+      reservationSha256: BackupCatalog.tenantBackupRuntimeReservationSha256(reservationBody) };
+    BackupCatalog.validateTenantBackupRestoreSourceBinding(binding);
+    BackupCatalog.validateTenantBackupRuntimeReservation(reservation);
+    const run: StubRestoreRun = { restoreRunId: runId, phase: "active", runtimeEpochSha256: epoch };
+    const catalog = { control: { state: "active" as const },
+      replayRuns: new Map([[runId, run]]), bindings: new Map([[runId, binding]]),
+      reservations: new Map<string, BackupCatalog.TenantBackupRuntimeReservation>([[runId, reservation]]) };
+    const reservationRow = sqlRow(reservation);
+    for (const field of ["resolution_operation_sha256", "resolution_receipt_sha256",
+      "resolution_catalog_sequence", "resolution_previous_catalog_event_root_sha256",
+      "resolution_catalog_event_root_sha256", "resolution_catalog_event_sha256", "resolved_at_db_ms"]) {
+      reservationRow[field] = null;
+    }
+    const responses = new Map<string, SqlRow[]>([
+      [sqlKey(runtimeProbeSql), [{ state: "active", lineage_kind: "restore" }]],
+      [sqlKey(captureProbeSql), [{ state: "inactive" }]],
+      [sqlKey(bindingSql), [sqlRow(binding)]],
+      [sqlKey(reservationSql), [reservationRow]],
+      ...emptyFamilies.map((table): [string, SqlRow[]] => [sqlKey(familySql(table)), []]),
+      [sqlKey(subjectsSql), [{ telemetry_logs_capture_v2_generation: 0 }]],
+      [sqlKey(materialSql("items")), [{ telemetry_failure_classification: null,
+        telemetry_capture_v2_control_generation: null,
+        ...Object.fromEntries(materialFields.map((field) => [field, null])) }]],
+      [sqlKey(materialSql("events")), [{ telemetry_failure_classification: "runtime_unknown",
+        telemetry_capture_v2_control_generation: 0,
+        ...Object.fromEntries(materialFields.map((field) => [field, null])) }]],
+      [sqlKey(jobsSql), [{ source_schema: "legacy-fixture-v1" }]],
+      [sqlKey(membershipsSql), [{ source_schema: "legacy-fixture-v1" }]],
+    ]);
+    const query = vi.fn(async (sql: string, parameters?: unknown[]) => {
+      const selected = sqlKey(sql);
+      if (!/^\s*SELECT\b/i.test(sql) || !responses.has(selected)) {
+        throw new Error("unexpected or mutating dormant-startup fixture SQL");
+      }
+      if (selected === sqlKey(bindingSql) || selected === sqlKey(reservationSql)) {
+        expect(parameters).toEqual([runId]);
+      } else expect(parameters).toBeUndefined();
+      return [structuredClone(responses.get(selected)), []];
+    });
+    const connection = Object.freeze({ query }) as unknown as PoolConnection;
+    const getConnection = vi.fn(() => { throw new Error("pure startup fixture must not acquire a connection"); });
+    // The actual store/global audit and both exact-row codecs run. The complete runtime,
+    // capture and catalog proof readers below are explicit doubles: this is neither an
+    // actual MySQL transaction/range-lock proof nor external restore authorization.
+    const store = Reflect.construct(MysqlSessionStore, [{ getConnection }]) as unknown as StartupAuditStore;
+    store.tenantTelemetryCaptureEpochCutoverSchemaInstalled = true;
+    store.tenantTelemetryCaptureRepeatRestoreSchemaInstalled = true;
+    const strictFailure = new Error("strict-capture-audit-delegate-sentinel");
+    const strict = vi.spyOn(store, "activeCaptureEpochCutover").mockRejectedValue(strictFailure);
+    const protectedKey = vi.spyOn(store, "requireTenantTelemetryRefKey")
+      .mockImplementation(() => { throw new Error("pristine startup must not read a protected key"); });
+    const runtime = vi.spyOn(store, "assertTenantRestoreRuntimeProjection").mockResolvedValue({
+      control: { state: "active", lineageKind: "restore", restoreRunId: runId, runtimeEpochSha256: epoch },
+      heads: [],
+    });
+    const capture = vi.spyOn(store, "assertPersistedProviderCaptureProjection").mockResolvedValue({
+      domain: "logs", state: "inactive", controlGeneration: 0,
+    });
+    const catalogProof = vi.spyOn(store, "assertTenantBackupCatalogProjection").mockResolvedValue(catalog);
+    const currentRun = vi.spyOn(store, "loadTenantRestoreReplayRun").mockResolvedValue({ run, row: {} });
+    const failures = vi.spyOn(store, "assertPersistedFailureGlobalRelations").mockResolvedValue(new Map());
+    const writer = vi.spyOn(store, "assertTenantTelemetryWriterProjection").mockResolvedValue(undefined);
+    const audit = (startup = true, auditOnly = false) =>
+      store.assertCaptureRecoveryGlobalRelations(connection, auditOnly, startup);
+    const setRows = (sql: string, rows: SqlRow[]) => { responses.set(sqlKey(sql), rows); };
+    const noAuthority = () => {
+      expect(protectedKey).not.toHaveBeenCalled(); expect(getConnection).not.toHaveBeenCalled();
+    };
+    return { store, connection, responses, query, strict, strictFailure, runtime, capture,
+      catalogProof, currentRun, failures, writer, audit, setRows, noAuthority };
+  }
+
+  it("accepts only the explicit startup path after every exact current and empty-family read", async () => {
+    const f = startupFixture();
+    await expect(f.audit()).resolves.toBeUndefined();
+    expect(f.query.mock.calls.map(([sql]) => sqlKey(sql))).toEqual([...f.responses.keys()]);
+    expect(f.runtime).toHaveBeenCalledExactlyOnceWith(f.connection, "FOR SHARE");
+    expect(f.capture).toHaveBeenCalledExactlyOnceWith(f.connection, "FOR SHARE");
+    expect(f.catalogProof).toHaveBeenCalledExactlyOnceWith(f.connection, "FOR SHARE");
+    expect(f.currentRun).toHaveBeenCalledExactlyOnceWith(f.connection, runId, "FOR SHARE");
+    expect(f.failures).toHaveBeenCalledExactlyOnceWith(f.connection);
+    expect(f.writer).toHaveBeenCalledExactlyOnceWith(f.connection);
+    expect(f.strict).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it.each([false, true])("does not waive the existing non-startup audit (auditOnly=%s)", async (auditOnly) => {
+    const f = startupFixture();
+    await expect(f.audit(false, auditOnly)).rejects.toBe(f.strictFailure);
+    expect(f.strict).toHaveBeenCalledExactlyOnceWith(f.connection, "FOR SHARE");
+    expect(f.query).not.toHaveBeenCalled(); expect(f.capture).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it("does not waive active capture and invokes the original strict delegate", async () => {
+    const f = startupFixture();
+    f.setRows(captureProbeSql, [{ state: "active" }]);
+    await expect(f.audit()).rejects.toBe(f.strictFailure);
+    expect(f.strict).toHaveBeenCalledExactlyOnceWith(f.connection, "FOR SHARE");
+    expect(f.runtime).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it.each(emptyFamilies)("rejects any occupied %s instead of interpreting missing current cutover as pristine", async (table) => {
+    const f = startupFixture();
+    f.setRows(familySql(table), [{ occupied: 1 }]);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.query).toHaveBeenCalledWith(familySql(table));
+    expect(f.strict).not.toHaveBeenCalled(); expect(f.writer).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it.each([runtimeProbeSql, captureProbeSql])("rejects a missing control probe rather than accepting empty evidence: %s", async (sql) => {
+    const f = startupFixture();
+    f.setRows(sql, []);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.strict).not.toHaveBeenCalled(); expect(f.runtime).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it("propagates malformed inactive control proof instead of trusting the cheap inactive probe", async () => {
+    const f = startupFixture();
+    const invalid = new codec.TenantTelemetryCaptureRestoreIntegrityError();
+    f.capture.mockRejectedValue(invalid);
+    await expect(f.audit()).rejects.toBe(invalid);
+    expect(f.capture).toHaveBeenCalledExactlyOnceWith(f.connection, "FOR SHARE");
+    expect(f.strict).not.toHaveBeenCalled(); expect(f.catalogProof).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it.each([bindingSql, reservationSql])("rejects a missing current selected row despite its snapshot projection: %s", async (sql) => {
+    const f = startupFixture();
+    f.setRows(sql, []);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.strict).not.toHaveBeenCalled(); expect(f.failures).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it.each(["items", "events"] as const)("rejects runtime_unknown with NULL generation in %s", async (table) => {
+    const f = startupFixture();
+    f.setRows(materialSql(table), [{ telemetry_failure_classification: "runtime_unknown",
+      telemetry_capture_v2_control_generation: null,
+      ...Object.fromEntries(materialFields.map((field) => [field, null])) }]);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.strict).not.toHaveBeenCalled(); expect(f.failures).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it("rejects private source material even when classification and generation are legacy NULL", async () => {
+    const f = startupFixture();
+    f.setRows(materialSql("items"), [{ telemetry_failure_classification: null,
+      telemetry_capture_v2_control_generation: null,
+      ...Object.fromEntries(materialFields.map((field) => [field, null])),
+      telemetry_capture_v2_operation_sha256: h("nonpristine-source") }]);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.strict).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it.each([null, 1, "invalid"])("rejects a malformed or nonzero subject generation: %s", async (generation) => {
+    const f = startupFixture();
+    f.setRows(subjectsSql, [{ telemetry_logs_capture_v2_generation: generation }]);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.strict).not.toHaveBeenCalled();
+    f.noAuthority();
+  });
+
+  it.each([jobsSql, membershipsSql])("rejects a v2 source in an otherwise empty projection: %s", async (sql) => {
+    const f = startupFixture();
+    f.setRows(sql, [{ source_schema: "provider-step-error-v2" }]);
+    await expect(f.audit()).rejects.toBeInstanceOf(codec.TenantTelemetryCaptureRestoreIntegrityError);
+    expect(f.strict).not.toHaveBeenCalled(); expect(f.failures).not.toHaveBeenCalled();
+    f.noAuthority();
   });
 });

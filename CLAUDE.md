@@ -4,6 +4,8 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
+最新发布阻断窄修（14:07Z）：真实S3发现never-enabled capture的普通恢复误拒startup。仅ordinary startup只读RR新增strict pristine分支，完整runtime/catalog、inactive双control、12类空证据及source/orphan核对，public cutover与写授权不变。真实S3整文件1pass、maintenance整文件7pass（并发/回滚及active缺cutover仍拒）、纯整文件195pass、typecheck/scan748通过；原失败保留，不冒充整包全绿。完整S3/cluster、新源码build/VM与最终SHA CI仍待；native跨迁移WIP及高级生命周期/灾备后置P2但未完成，详见PROGRESS末节；下方为此前分段事实。
+
 最新收口：348历史整轮52文件318pass/7fail/0skip，exit1保留；仅两个历史夹具修后整文件复验2文件28pass/0fail/0skip，typecheck、secret scan748及diffcheck0。0026重放回归真实旧阶段并保留完整新tail升级，CHECK/FK验证精确schema原因；0030正式codec/合法run/真实getter预验及同来源正控避免负例假绿。产品代码、旧migration和门禁不改，不把分段拼全量成功；完整S3、cluster与最终SHA CI仍待，权威路径见PROGRESS末节。
 
 本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合main/push；main仍clean `3414b43`。`354b`源码的完整verify `92378`退出1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项通过，但该轮history、cluster、build、VM未执行；原CI及旧定向不能证明新整包成功。0059三表/八guard/八非零根、全743trigger已真实校准，不再是缺0058前置的零根草稿。

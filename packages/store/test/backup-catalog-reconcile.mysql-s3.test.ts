@@ -13,6 +13,7 @@ import {
   EMPTY_TENANT_BACKUP_CATALOG_EVENT_ROOT_SHA256,
   EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
   MysqlSessionStore,
+  TenantTelemetryCaptureRestoreIntegrityError,
   newTenantBackupId,
   tenantRestoreRuntimeEpochSha256,
   type TenantBackupSnapshotAnchor,
@@ -431,7 +432,47 @@ describeIntegration("backup-catalog CLI reconcile with real MySQL and MinIO", ()
         .toMatchObject({ phase: "reserved" });
       expect(await store.getTenantRestoreReplayRun(restoreRunId))
         .toMatchObject({ phase: "active" });
+      expect(await store.getTenantTelemetryPersistedProviderCaptureControl())
+        .toEqual({ domain: "logs", state: "inactive", controlGeneration: 0 });
+      for (const table of [
+        "tenant_telemetry_capture_v2_activation_receipts",
+        "tenant_telemetry_capture_v2_coverages",
+        "tenant_telemetry_capture_v2_source_bindings",
+        "tenant_telemetry_capture_v2_failure_commit_receipts",
+        "tenant_telemetry_capture_backup_checkpoints",
+        "tenant_telemetry_capture_backup_checkpoint_leaves",
+        "tenant_telemetry_capture_restore_bindings",
+        "tenant_telemetry_capture_restore_history_receipts",
+        "tenant_telemetry_capture_epoch_cutovers",
+        "tenant_telemetry_capture_recovery_permits",
+        "tenant_telemetry_capture_checkpoint_lineage_leaves",
+        "tenant_telemetry_capture_recovery_permits_v2",
+      ] as const) {
+        const [rows] = await admin!.query(
+          `SELECT COUNT(*) AS count FROM \`${database}\`.${table}`,
+        );
+        expect(rows, table).toEqual([{ count: 0 }]);
+      }
       await store.close();
+
+      // A catalog-only restore has never enabled provider capture. Cold startup must not
+      // require a capture-specific cutover; keep errors closed rather than logging SQL,
+      // dependency errors, URLs, identifiers or credentials when this regresses.
+      let restoredColdStartup: "ok" | "capture_restore_integrity" | "other_failure";
+      try {
+        const cold = await MysqlSessionStore.connect({
+          url: mysqlUrl,
+          connectionLimit: 2,
+          migrationMode: "verify",
+        });
+        await cold.close();
+        restoredColdStartup = "ok";
+      } catch (error) {
+        restoredColdStartup = error instanceof TenantTelemetryCaptureRestoreIntegrityError
+          ? "capture_restore_integrity"
+          : "other_failure";
+      }
+      expect(restoredColdStartup).toBe("ok");
 
       const resolutionRecovery = runReconcile();
       if (resolutionRecovery.error) throw resolutionRecovery.error;

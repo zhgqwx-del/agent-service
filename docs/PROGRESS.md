@@ -1,5 +1,7 @@
 # 进度记录
 
+> **最新窄修验证（2026-10-16T14:07Z）**：真实S3验收发现never-enabled capture的普通0030/0031恢复误拒startup，已作仅ordinary startup只读RR可达的strict pristine修复，公开cutover/写授权不变。实际MySQL/MinIO整文件1pass、MySQL maintenance整文件7pass、纯整文件195pass、typecheck与scan748通过；原S3失败和负例错误层次失败报告独立保留。完整S3、cluster、新源码build/VM及最终SHA CI仍待，不能称整包通过；main仍3414、尚未push。native跨迁移WIP及高级生命周期/灾备按新顺序后置P2而非已完成；详见新末节。
+
 > **最新验证（2026-10-16）**：348历史矩阵52文件已终态，318pass/7fail/0skip、exit1；两个历史夹具修后完整2文件28pass/0fail/0skip，typecheck、scan748与diffcheck0，产品代码/旧SQL未改。原失败与修后分段分别保留，不称修后整轮成功；完整S3、cluster和最终SHA CI仍待，详见末节。
 
 > **权威开发顺序更新（用户确认，2026-10-16）**：长期全架构Goal不缩减；当前功能包只修发布阻断并补齐剩余门禁/最终SHA CI → 尽早本地手动体验 → M3 MCP/skills/hooks真实纵向（安全随功能）→ 必要M4本地可验发布/迁移/运行、基础quota/观测 → P2完整生命周期/灾备；真实云验收待资源。M1未闭环/未冻结、M2冻结、M3当前尚未开始，但不再以M1全部闭环作为M3启动条件。可本地运行功能版不等于全架构/生产完成，原代码/native WIP与未验事项保留；不改变下方任何验证数字、失败事实、阈值/期限/oracle或安全授权。
@@ -1772,3 +1774,12 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 37703整树typecheck exit0；secret scan748与`git diff --check` exit0。有界独立复核分别检查历史阶段/字段保持与真实getter、负例因果和事务回滚；0030草稿曾被发现journal参数不一致而可假绿，已在真实复验前修正并加正控。没有产品写路径、旧migration、依赖/lock或schema更改，租户隔离、严格启动指纹与已有滚动/排空合同不变；静态review不替代运行证明。根与两个作者均未运行并发DB/S3/build。
 - 两个本轮owned base库只读复核均为0；另观察到44个全局migration-test命名库，多数表创建于10月9～13日且不在本轮created集合，未删除或据此声称全机无历史残留。sandbox首个元数据查询被EPERM拒绝后，仅对同一只读查询申请正常本机访问并完成；没有重启测试或操作业务库。
 - 下一步补完整`verify-s3`、cluster及最终SHA完整CI，继续保留本机分段与整轮的区别，不盲重跑已完成的独立历史阶段。c12产品源码的clean build/VM分段仍只证明c12；当前包尚未推送或完成发布。原完整主阶段coverage失败仍保留，最终coverage/required/history全部执行须由最终SHA CI证明。按用户新顺序，发布后本地体验，再M3与必要M4，native WIP及高级生命周期/灾备后置但不取消；0037/0054、旧receipt/unknown、默认off/production拒绝、外删自动off与completion=false不变。
+
+## 2026-10-16：普通备份恢复的pristine-capture启动回归窄修
+
+- 完整`verify-s3`的`69527`在clean `4f04c6a6a3e78a5f2b40866d1c2f0f9deae1252a`上于13:38:36.521Z开始、13:39:04.727Z退出1。前三文件20项通过；第四个真实`backup-catalog-reconcile.mysql-s3.test.ts`在普通restore激活后的第三次CLI reconcile返回operation_failed，余下11文件和源码应用装配未执行。原报告位于`.local-run/m1-s3-20261016-99fdaa35c3f9/`。未启用capture且从无checkpoint/history/cutover的合法0030/0031恢复，被新增ordinary startup全局审计错误要求capture cutover。
+- 在产品修复前，以同一真实MySQL/MinIO整文件加入closed-error cold-connect断言，`45320`实际0pass/1fail/0skip，精确为capture_restore_integrity，保留`.local-run/m1-reconcile-before-fix-20261016-350bc9b05902/`。修复只改MySQL ordinary startup调用和私有只读审计：便宜probe只能排除候选，接受必须在同RR事务以current FOR SHARE重建journal/runtime/catalog及选定run/binding/reservation、完整inactive双control、12类全空capture证据，核subject gen0、item/event成对classification/generation与material全NULL、job/member无v2及原有source/writer孤儿关系。public activeCaptureEpochCutover、getter/claim/reserve/ACK和写授权均不改，无migration/DDL、外部操作、持久豁免或新服务。
+- `58288`修后真实整文件于13:59:35.309Z开始、13:59:58.256Z退出0，1pass/0fail/0skip、源码diff全程不变；明确SQL证明inactive和全部12证据表为空，cold startup及第三/第四次无ref-key CLI reconcile均通过。独占报告`.local-run/m1-reconcile-after-fix-20261016-22b1e59450f9/`保留。本次自建base与空bucket已清理，未操作业务库或共享历史残留。
+- 新反例先由`15384`执行完整真实maintenance文件，6pass/1fail/0skip：cold startup在更早writer审计把同一missing-cutover来源错误包装为TenantTelemetryWriteIntegrityError，原测试错期待CaptureRestoreIntegrity。原JSON另存`.local-run/m1-dormant-startup-20261016/maintenance-before-oracle-fix.json`，不泛化toThrow。窄修测试保留精确cold WriterError，同时在同一真实store实际只读RR事务调用新global audit，精确要求CaptureRestoreIntegrity，无spy、无DDL或新fixture；`79751`完整7pass/0fail/0skip，含既有并发串行化与晚期INSERT全回滚，报告为同目录`maintenance-after-oracle-fix.json`。
+- `43455`纯整文件195pass/0fail/0skip，其中新增29项只证明分支与SQL调用合同，不当作数据库锁证明；报告`pure-195.json`。`66491`secret scan748与整树typecheck均exit0，diffcheck0；有界独立P0/P1静态review未发现其它确定发布阻断。源码SHA256：store `0f260393499cd12591fb5fb71801716385301377bde568fba43918aa085dbf88`；真实S3测试`46a81a443e1c8cb183d331d30fe2a2580f7caf16679a39f434548f2215c78360`，maintenance `8bc6b53f38399cc3a41cd685e03bedd7b173dfeebd57a49e4d7e92d09b9b410c`，pure `74b0e33498fc2b7e7576c29a5cba807ddd89fe7ee9863d6ebd0a2b930fd74d9a`。未读.env或真实模型key。
+- 仍待完整S3、cluster、新源码build/VM及最终SHA完整CI；不把上述分段拼成整轮绿，不重跑已完成的全部历史矩阵。旧c12的build/VM不证明本次产品修复。native旧制品跨迁移及高级生命周期/灾备保留为未完成P2，当前包不再扩展；发布后先本地体验、M3、必要M4。M1未冻结、M2冻结、M3未开始，0037 hard-deny、0054 original-primary-only destructive、旧receipt/unknown、default-off/production拒绝、外删自动off及completion=false均保持。

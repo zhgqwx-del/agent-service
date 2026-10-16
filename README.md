@@ -4,6 +4,8 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
+最新发布阻断窄修（14:07Z）：真实S3验收发现从未启用capture的普通0030/0031恢复被新增启动审计误拒。现仅在普通启动的只读RR事务中，完整验证runtime/catalog、inactive双控制、全部capture证据为空及来源/孤儿检查后允许该pristine状态；公开cutover与写入授权不变。真实MySQL/MinIO整文件1/1、真实maintenance整文件7/7（含并发/回滚与active缺cutover拒绝）、纯测试整文件195/195、typecheck及scan748通过。原失败与修后分段均保留，不是整包全绿；完整S3、cluster、新源码build/VM和最终SHA CI仍待。native旧制品跨迁移WIP与高级生命周期/灾备按新顺序后置P2，不冒称已交付，详见[PROGRESS](docs/PROGRESS.md)末节。
+
 最新收口：`348778d` 的真实历史整轮已执行52文件，318 passed / 7 failed / 0 skipped，退出1，原报告保留。仅修两个历史夹具后，完整两文件复验28 passed / 0 failed / 0 skipped；typecheck、secret scan748与diffcheck通过。没有修改产品代码、旧迁移或安全门禁；这不是一次修后全量成功，完整S3、cluster与最终SHA CI仍待，详见[PROGRESS](docs/PROGRESS.md)末节。
 
 本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合入main或push；main仍为clean `3414b43`，其CI只证明旧SHA。`354b`源码的完整verify `92378`真实退出**1**：主测试4382 passed / 2 failed / 86预期profile skipped，256文件为238 passed / 2 failed / 16 skipped。0059 SQL整8项在该轮通过；那一轮历史、cluster、build、VM后置未运行，不存在该轮完整coverage/required或发布通过证明。0059三表/八guard/八非零根及743-trigger已真实校准，不再是缺0058前置或零根草稿。

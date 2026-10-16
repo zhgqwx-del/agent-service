@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
+import mysql, { type Connection, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import {
   DEFAULT_AUTH_POLICY,
   tenantRuntimeFleetSha256,
@@ -16,6 +16,7 @@ import {
   TENANT_BACKUP_CATALOG_ENTRY_SCOPE,
   TENANT_BACKUP_CATALOG_PROTOCOL,
   TenantTelemetryCaptureRestoreIntegrityError,
+  TenantTelemetryWriteIntegrityError,
   newTenantBackupId,
   newErasureRequestId,
   tenantBackupAvailabilityOperationSha256,
@@ -435,6 +436,34 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
         // into permission to resume new provider writes or destructive T3e/T3f.
         await expect(MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
           tenantTelemetryRefKey: captureRefKey })).rejects.toThrow();
+        // A real active capture/history is not a pristine pre-capture restore. Even with the
+        // correct protected key and ordinary local capture gate, its missing explicit cutover
+        // must remain a cold-start failure rather than taking the dormant-startup exception.
+        const [captureControls] = await f.conn.query<RowDataPacket[]>(
+          "SELECT state,control_generation FROM tenant_telemetry_capture_v2_controls WHERE domain='logs'",
+        );
+        expect(captureControls).toEqual([expect.objectContaining({ state: "active", control_generation: 1 })]);
+        const [cutovers] = await f.conn.query<RowDataPacket[]>(
+          "SELECT restore_run_id FROM tenant_telemetry_capture_epoch_cutovers WHERE BINARY restore_run_id=BINARY ?",
+          [selector.restoreRunId],
+        );
+        expect(cutovers).toHaveLength(0);
+        await expect(MysqlSessionStore.connect({ url: f.url, migrationMode: "verify",
+          tenantTelemetryRefKey: captureRefKey,
+          tenantTelemetryPersistedProviderCaptureLocalOnly: true,
+        })).rejects.toBeInstanceOf(TenantTelemetryWriteIntegrityError);
+        // Ordinary startup's earlier writer audit wraps the same missing-cutover source
+        // failure. Independently invoke the actual startup global audit on this real store
+        // in its real read-only RR scope, so that wrapper cannot hide a false exemption.
+        // No proof reader, query, protected key or cutover guard is mocked or replaced.
+        const startupAudit = f.store as unknown as {
+          withConsistentRead<T>(work: (conn: PoolConnection) => Promise<T>): Promise<T>;
+          assertCaptureRecoveryGlobalRelations(conn: PoolConnection, auditOnly: boolean,
+            startupPristineDormantRestore: boolean): Promise<void>;
+        };
+        await expect(startupAudit.withConsistentRead((conn) =>
+          startupAudit.assertCaptureRecoveryGlobalRelations(conn, false, true),
+        )).rejects.toBeInstanceOf(TenantTelemetryCaptureRestoreIntegrityError);
         expect(step.session.tenantId).not.toBe(history!.backupId);
       } finally { await maintenance?.close(); await f.close(); }
     });

@@ -9149,7 +9149,7 @@ export class MysqlSessionStore implements
           await store.assertPersistedProviderCaptureProjection(conn);
           await store.assertPersistedFailureGlobalRelations(conn);
           await store.assertRetainedSourceGlobalRelations(conn);
-          await store.assertCaptureRecoveryGlobalRelations(conn);
+          await store.assertCaptureRecoveryGlobalRelations(conn, false, true);
         }));
       }
       if (store.credentialResponsibilitySchemaInstalled) {
@@ -52869,14 +52869,163 @@ export class MysqlSessionStore implements
     return { version: 1, restored, leaves: record.leaves, original, permits, latest };
   }
 
+  /** The ordinary startup-only exception for a pristine pre-capture 0030/0031
+   * restore. A cheap MVCC probe only declines this path; it never grants it.
+   * Acceptance uses current, locking reads of the journal/runtime and every
+   * capture source range in the same read-only RR transaction. No caller can
+   * use this result to claim, publish, reserve, ACK or obtain a capture proof. */
+  private async assertPristineDormantCaptureRestoreAtStartup(
+    conn: PoolConnection,
+  ): Promise<boolean> {
+    const [runtimeProbe] = await conn.query<Row[]>(
+      "SELECT state,lineage_kind FROM tenant_restore_runtime_control WHERE singleton_id=1",
+    );
+    const [captureProbe] = await conn.query<Row[]>(
+      "SELECT state FROM tenant_telemetry_capture_v2_controls WHERE domain='logs'",
+    );
+    if (runtimeProbe.length !== 1 || captureProbe.length !== 1) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    if (runtimeProbe[0]!.state !== "active" || runtimeProbe[0]!.lineage_kind !== "restore"
+      || captureProbe[0]!.state !== "inactive") return false;
+
+    // Preserve the existing 0030 J -> R order. This reconstructs the whole
+    // immutable activation chain, not merely the raw runtime state probe.
+    const runtime = await this.assertTenantRestoreRuntimeProjection(conn, "FOR SHARE");
+    if (runtime.control.state !== "active" || runtime.control.lineageKind !== "restore"
+      || !runtime.control.restoreRunId) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const control = await this.assertPersistedProviderCaptureProjection(conn, "FOR SHARE");
+    if (control.state !== "inactive") return false;
+    const catalog = await this.assertTenantBackupCatalogProjection(conn, "FOR SHARE");
+    const runId = runtime.control.restoreRunId;
+    const run = catalog.replayRuns.get(runId);
+    const binding = catalog.bindings.get(runId);
+    const reservation = catalog.reservations.get(runId);
+    if (catalog.control.state !== "active" || !run || !binding || !reservation
+      || run.phase !== "active" || reservation.phase === "aborted"
+      || run.runtimeEpochSha256 !== runtime.control.runtimeEpochSha256
+      || binding.runtimeEpochSha256 !== runtime.control.runtimeEpochSha256
+      || reservation.runtimeEpochSha256 !== runtime.control.runtimeEpochSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    // The catalog projector above validates all 0031 relations from this RR
+    // view. Also require current exact rows for the selected mutable run and
+    // reservation (and its immutable binding), rather than accepting only the
+    // snapshot that the cheap probes established before these range locks.
+    const currentRun = await this.loadTenantRestoreReplayRun(conn, runId, "FOR SHARE");
+    const [bindingRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_BACKUP_RESTORE_BINDING_COLUMNS}
+         FROM backup_restore_source_bindings WHERE BINARY restore_run_id=BINARY ? FOR SHARE`,
+      [runId],
+    );
+    const [reservationRows] = await conn.query<Row[]>(
+      `SELECT ${TENANT_BACKUP_RUNTIME_RESERVATION_COLUMNS}
+         FROM backup_runtime_reservations WHERE BINARY restore_run_id=BINARY ? FOR SHARE`,
+      [runId],
+    );
+    if (!currentRun || currentRun.run.phase !== "active"
+      || currentRun.run.runtimeEpochSha256 !== run.runtimeEpochSha256
+      || bindingRows.length !== 1 || reservationRows.length !== 1
+      || rowToTenantBackupRestoreSourceBinding(bindingRows[0]!).bindingSha256 !== binding.bindingSha256
+      || rowToTenantBackupRuntimeReservation(reservationRows[0]!).reservationSha256
+        !== reservation.reservationSha256) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+
+    // A full fixed-order locking scan of each empty family also holds its
+    // InnoDB empty-range gap until this READ ONLY RR transaction ends. Neither
+    // a missing current cutover nor a zero count from an old MVCC view is proof.
+    const emptyFamilies = [
+      "tenant_telemetry_capture_v2_activation_receipts",
+      "tenant_telemetry_capture_v2_coverages",
+      "tenant_telemetry_capture_v2_source_bindings",
+      "tenant_telemetry_capture_v2_failure_commit_receipts",
+      "tenant_telemetry_capture_backup_checkpoints",
+      "tenant_telemetry_capture_backup_checkpoint_leaves",
+      "tenant_telemetry_capture_restore_bindings",
+      "tenant_telemetry_capture_restore_history_receipts",
+      "tenant_telemetry_capture_epoch_cutovers",
+      "tenant_telemetry_capture_recovery_permits",
+      ...(this.tenantTelemetryCaptureRepeatRestoreSchemaInstalled
+        ? ["tenant_telemetry_capture_checkpoint_lineage_leaves",
+          "tenant_telemetry_capture_recovery_permits_v2"]
+        : []),
+    ] as const;
+    for (const table of emptyFamilies) {
+      const [rows] = await conn.query<Row[]>("SELECT 1 AS occupied FROM " + table + " FOR SHARE");
+      if (rows.length !== 0) {
+        throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+      }
+    }
+
+    const [subjects] = await conn.query<Row[]>(
+      "SELECT telemetry_logs_capture_v2_generation FROM subject_lifecycle"
+        + " ORDER BY tenant_id,subject_kind,subject_id FOR SHARE",
+    );
+    if (subjects.some((row) => row.telemetry_logs_capture_v2_generation == null
+      || Number(row.telemetry_logs_capture_v2_generation) !== 0)) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    const materialFields = [
+      "telemetry_capture_v2_operation_sha256",
+      "telemetry_capture_v2_session_ref_sha256",
+      "telemetry_capture_v2_turn_ref_sha256",
+      "telemetry_capture_v2_item_ref_sha256",
+      "telemetry_capture_v2_failure_receipt_sha256",
+      "telemetry_capture_v2_business_batch_sha256",
+    ] as const;
+    for (const [table, order] of [
+      ["items", "item_id"],
+      ["events", "session_id,seq"],
+    ] as const) {
+      const [rows] = await conn.query<Row[]>(
+        "SELECT telemetry_failure_classification,telemetry_capture_v2_control_generation,"
+          + materialFields.join(",") + " FROM " + table + " ORDER BY " + order + " FOR SHARE",
+      );
+      for (const row of rows) {
+        const classification = row.telemetry_failure_classification;
+        const generation = row.telemetry_capture_v2_control_generation;
+        if (!((classification == null && generation == null)
+          || (classification === "runtime_unknown" && generation != null
+            && Number(generation) === 0))
+          || materialFields.some((field) => row[field] != null)) {
+          throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+      }
+    }
+    const [jobs] = await conn.query<Row[]>(
+      "SELECT JSON_UNQUOTE(JSON_EXTRACT(inventory_json,'$.sourceSchema')) AS source_schema"
+        + " FROM tenant_telemetry_write_jobs ORDER BY write_operation_sha256 FOR SHARE",
+    );
+    const [memberships] = await conn.query<Row[]>(
+      "SELECT source_schema FROM tenant_telemetry_artifact_memberships"
+        + " ORDER BY write_operation_sha256 FOR SHARE",
+    );
+    if ([...jobs, ...memberships].some((row) =>
+      row.source_schema === PersistedCapture.PERSISTED_PROVIDER_CAPTURE_SOURCE_SCHEMA)) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    // Do not assume this private helper's caller already ran either global
+    // orphan audit; v1 jobs/ACK/payload remain subject to their original checks.
+    if ((await this.assertPersistedFailureGlobalRelations(conn)).size !== 0) {
+      throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    }
+    await this.assertTenantTelemetryWriterProjection(conn);
+    return true;
+  }
+
   /** A read-only, bottom-up audit for the restored epoch. A permit row alone
    * never authorizes a writer: every old-v2 job is checked against its actual
    * checkpointed physical source and the complete successor chain; orphan or
    * new-epoch permits are rejected independently. This route grants no claim. */
   private async assertCaptureRecoveryGlobalRelations(
-    conn: PoolConnection, auditOnly = false,
+    conn: PoolConnection, auditOnly = false, startupPristineDormantRestore = false,
   ): Promise<void> {
     if (!this.tenantTelemetryCaptureEpochCutoverSchemaInstalled) return;
+    if (startupPristineDormantRestore
+      && await this.assertPristineDormantCaptureRestoreAtStartup(conn)) return;
     const restored = await this.activeCaptureEpochCutover(conn, "FOR SHARE");
     const [permitRows] = await conn.query<Row[]>(`SELECT write_operation_sha256,new_claim_attempt,permit_receipt_sha256
       FROM tenant_telemetry_capture_recovery_permits ORDER BY write_operation_sha256 FOR SHARE`);
