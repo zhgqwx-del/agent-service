@@ -1,6 +1,10 @@
 # agent-service
 
+> 开发顺序更新（用户确认，2026-10-16）：长期M1～M4全架构目标不缩减。先只修当前功能包的发布阻断，补齐剩余门禁并等待最终SHA CI；随后尽早本地手动体验，推进M3 MCP/skills/hooks真实纵向（安全随功能），再补必要M4本地可验的发布/迁移/运行、基础quota与观测；完整生命周期/灾备列为后续P2，真实云验收待资源。M1仍未闭环/未冻结、M2冻结、M3当前尚未开始，但不再要求M1全部闭环才能启动M3。可本地运行的功能版不等于全架构或生产完成；原安全边界及已完成代码/native WIP保留，详见[PROGRESS](docs/PROGRESS.md)。
+
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
+
+最新收口：`348778d` 的真实历史整轮已执行52文件，318 passed / 7 failed / 0 skipped，退出1，原报告保留。仅修两个历史夹具后，完整两文件复验28 passed / 0 failed / 0 skipped；typecheck、secret scan748与diffcheck通过。没有修改产品代码、旧迁移或安全门禁；这不是一次修后全量成功，完整S3、cluster与最终SHA CI仍待，详见[PROGRESS](docs/PROGRESS.md)末节。
 
 本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合入main或push；main仍为clean `3414b43`，其CI只证明旧SHA。`354b`源码的完整verify `92378`真实退出**1**：主测试4382 passed / 2 failed / 86预期profile skipped，256文件为238 passed / 2 failed / 16 skipped。0059 SQL整8项在该轮通过；那一轮历史、cluster、build、VM后置未运行，不存在该轮完整coverage/required或发布通过证明。0059三表/八guard/八非零根及743-trigger已真实校准，不再是缺0058前置或零根草稿。
 
@@ -28,7 +32,7 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 
 日常体验/构建与部署学习见[开发与 CI 指南](docs/operations/development-and-ci-guide.md)，精确备份恢复边界见[数据生命周期 §15](docs/design/04-data-lifecycle.md#15-0057-显式新-epoch-capture-与旧-pending-恢复未发布候选)。历史验收数字统一保留在 PROGRESS；下方产品说明不是本轮通过证明。
 
-下一验收是第二次实际备份再恢复到又一个新 epoch，并保持完整祖先与旧 pending 许可；独立 worktree 的提前编码/纯测试不等于交付。候选已增加实际source schema的reserve/import前拒绝，但旧 schema 原生制品跨迁移的import→upgrade→continuation仍未实现；不能把拒绝或格式/历史读取兼容当作恢复成功，禁止自动重导、清空部分目标或隐式 DDL。以上仍属本地 M1 工作，不是等待云资源即可自动完成。
+当前先完成本功能包发布与最终SHA CI，再进行本地手动体验及M3纵向；不再为完整生命周期/灾备持续追加本包范围。重复恢复及旧schema原生制品import→独立upgrade→continuation的已实现代码、WIP与待验边界继续保留，不因后置就视为完成或删除；格式/历史读取兼容仍不是完整恢复证明，禁止自动重导、清空部分目标或隐式DDL。默认off不能掩盖普通路径、启动或迁移正确性问题，相关发布阻断仍须先修复。
 
 分布式、多租户的 agent API 服务：无状态 `agent-router` + 有状态 `agent-runner`（类 `opencode serve`）。当前已实现会话/turn/SSE、BYOK、租约与 fencing、多节点路由和接管；MCP、skills、plugins/hooks 属于后续 M3。设计见 `docs/design/00-architecture.md`，调研见 `docs/research/`。
 

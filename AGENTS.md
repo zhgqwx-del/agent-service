@@ -1,6 +1,14 @@
 # agent-service 协作约定
 
+## 权威开发顺序（用户确认，2026-10-16）
+
+长期全架构Goal不缩减：当前功能包仅修发布阻断并完成剩余门禁/最终SHA CI → 尽早本地手动体验 → M3 MCP/skills/hooks真实纵向（安全随功能）→ 必要M4本地可验发布/迁移/运行、基础quota/观测 → P2完整生命周期/灾备；真实云验收等待资源。M1未闭环/未冻结、M2冻结、M3当前尚未开始，但M1全部闭环不再是进入M3的前提。下文版本历史中“先M1闭环再M3”的旧排序仅在优先级上由本节替代，协议与历史验收不改。
+
+本地可运行功能版不等于全架构/生产完成；保留已完成代码、native WIP及未验收事项。全部P0、普通路径和启动/迁移正确性仍是发布门禁，不能用default-off掩盖；0037硬拒、0054 original-primary-only destructive、旧receipt不重签/unknown不提升、production拒绝、外部删除与自动清理off、completion=false不变。验证节奏、阈值/期限/oracle及root统一执行边界不变，不因顺序调整新增删除或部署授权。
+
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
+
+最新历史收口：`348778d` 整轮52文件实际318pass/7fail/0skip、exit1，原报告独立保留。两个历史夹具修后完整复验2文件28pass/0fail/0skip，typecheck、scan748与diffcheck0；0026 marker-replay在真实through0026阶段验证后再推进最新tail，CHECK/FK要求精确schema cause；0030用正式codec、合法旧run与升级前真实getter预验，保留逐行比较和unbound负例的同证据正控。产品/旧SQL未改，不拼成全量绿；完整S3、cluster和最终SHA CI待验，具体报告见PROGRESS末节。
 
 本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合main/push；main仍clean `3414b43`，原CI仅证明旧SHA。`354b`源码的完整verify `92378`真实exit1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项在该轮通过；那一轮history、cluster、build、VM后置未运行，不得写成整包coverage/required通过。0059三表、八guard、八个非零根与全库743trigger已真实校准，不再是缺0058前置或零根草稿。
 
@@ -20,7 +28,7 @@ config-only/secret沿用不能提升legacy，新key不提升header/endpoint或�
 
 ## 开发与验证节奏
 
-当前下一步是冻结已接通的coherent组合功能包，做一次完整verify与相关verify-s3，再以实际源码完成剩余发布门禁；不继续无界追加小切片。旧schema原生artifact跨迁移导入/升级/续跑仍缺，格式或历史重放兼容不能代替其验收；不得自动重导、删除部分目标或隐式执行DDL。
+当前只修本功能包发布阻断，按既有失败处理规则复验受影响范围并补齐剩余门禁/最终SHA CI，不无界追加新切片；随后按顶部权威顺序推进。完整生命周期及native恢复WIP后置但不取消，未验能力仍诚实标未完成；不得自动重导、删除部分目标或隐式执行DDL。
 
 - 每轮小改动先做类型检查与影响范围定向测试；SQL、事务、删除、鉴权的正确性改动立即做真实服务及并发/回滚/隔离负例。
 - 多轮相关且已定向验证的修改形成 coherent 功能包，冻结后做一次完整 `verify` 及相关 `verify-s3`；独立历史、S3、cluster、SDK、实际 bundle/VM 门禁不省略。

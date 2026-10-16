@@ -1,5 +1,9 @@
 # 进度记录
 
+> **最新验证（2026-10-16）**：348历史矩阵52文件已终态，318pass/7fail/0skip、exit1；两个历史夹具修后完整2文件28pass/0fail/0skip，typecheck、scan748与diffcheck0，产品代码/旧SQL未改。原失败与修后分段分别保留，不称修后整轮成功；完整S3、cluster和最终SHA CI仍待，详见末节。
+
+> **权威开发顺序更新（用户确认，2026-10-16）**：长期全架构Goal不缩减；当前功能包只修发布阻断并补齐剩余门禁/最终SHA CI → 尽早本地手动体验 → M3 MCP/skills/hooks真实纵向（安全随功能）→ 必要M4本地可验发布/迁移/运行、基础quota/观测 → P2完整生命周期/灾备；真实云验收待资源。M1未闭环/未冻结、M2冻结、M3当前尚未开始，但不再以M1全部闭环作为M3启动条件。可本地运行功能版不等于全架构/生产完成，原代码/native WIP与未验事项保留；不改变下方任何验证数字、失败事实、阈值/期限/oracle或安全授权。
+
 > **当前本地功能包（2026-10-16，c12分段门禁）**：本地0058与BYOK整合已形成干净提交`c12cb43ae02b9252891a41c429c40bb7293bef8a`，未合main或推送；main仍为`3414b43`，旧CI不为新包背书。`354b`源码的完整verify `92378`退出**1**：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip；0059 SQL整8项在该轮通过，该轮history、cluster、build、VM后置未执行。两失败的后续分段复验分别为fresh-schema 0037正式required `69221` 1文件5pass，以及新源码`68142` 3文件237pass与独立`9192` checkpoint Memory 1文件46pass；两报告不拼为同次4文件。原native定向8项虽达到断言、63项filtered，进程仍因全仓coverage floors不足exit1。`45834` typecheck、required清单纯证明2文件119pass、secret scan748/diffcheck0为分段证据；required143文件/68组仅登记。**当前c12另已真实通过**`83919`的`pnpm build:check`及`36915`无allowdirty的`pnpm check:vm-release`：六JS入口、SDK/CLI产物与双role clean可发布VM均按各自门禁核对；签名仅`ephemeral-test-only`，`productionAccepted=false`。这不补写原`92378`结果，也不是完整coverage或整包全绿；完整history、cluster、`verify-s3`、旧schema原生跨迁移续跑及最终SHA新CI仍待。M1未冻结/M2冻结/M3未开始，0037/0054原primary-only、默认off/production拒绝、外部删除与自动清理off、全域completion=false不变；精确事实见新末节。
 
 以下为历史时间点快照；旧“源码冲突/缺前置/零根/未跑DB”不覆盖上述最新定向状态，历史通过与失败仍按原源码保留。
@@ -1751,3 +1755,20 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - `83919`实际执行`pnpm build:check`并exit0：runner五个与router一个JavaScript入口，SDK十八文件的可安装runtime/types/archive，四个CLI plain-Node artifacts，以及dist readiness/auth/forward/OpenAPI与独立metrics边界均通过。原始日志`m1-c12-build-check-20261016.log`保留。
 - `36915`严格执行`pnpm check:vm-release`（无allowdirty）并exit0，报告完成时间`2026-10-16T12:31:38.459Z`。双role同一c12、`dirty=false`、`publishable=true`，目标runtime为Darwin arm64/Node24；两个签名均已验证，但仅为`ephemeral-test-only`，`productionAccepted=false`。四个one-shot入口的canonical与symlink两种调用方式，以及readiness/auth/forward/OpenAPI和停后immutable检查均通过。原始报告`m1-c12-vm-release-proof-20261016.json`与同前缀VM日志保留。
 - 当前仍缺完整coverage、history、cluster、完整`verify-s3`及新CI的同一最终SHA验收；M1未冻结，原全量失败不可改写。另一独立native恢复WIP与SDK/Body drain仅有其自身typecheck和六份100项纯测试证据，尚无真实MySQL/MinIO旧制品纵向验收，不属于c12通过范围；原0037/0054、默认off与production拒绝、外部删除/自动清理关闭及`completion=false`均不变。
+
+## 2026-10-16：用户确认开发顺序调整，长期全架构目标不缩减
+
+- 当前功能包只修发布阻断，保留原失败及已通过结果，完成失败/受影响复验、剩余门禁和最终SHA CI；不借新优先级跳测试、降阈值、加期限或弱化oracle。本条只记决策，不新增任何动态运行状态或通过证明。
+- 此后尽早本地手动体验，再做M3 MCP/skills/hooks完整纵向及随功能所需安全；随后推进必要M4本地可验证的发布/迁移/运行、基础quota和观测。完整生命周期/灾备作为后续P2继续完成，真实云验收等实际资源；不删除已实现代码/native WIP，不把已有缺口改名为完成或仅剩云参数。
+- M1未闭环且未冻结、M2冻结、M3目前尚未开始；取消的是“M1全部生命周期闭环后才可M3”的先后依赖，不是长期架构目标。本地可运行功能版与全架构/生产完成分别验收。
+- P0及普通路径、启动、迁移正确性始终须先解决，default-off不是豁免。0037 grant硬拒、0054 original-primary-only destructive、旧CP/receipt/descriptor不重签与unknown不提升、local-only/production拒绝、外部删除/自动清理off及completion=false保持；此次决策不额外签发删除、外部处置或部署权限。既有版本合同、历史快照及失败报告原样保留；其中旧顺序由本条仅就优先级覆盖。
+
+## 2026-10-16：完整历史发现两组夹具边界问题，受影响文件已真实复验
+
+- 唯一完整历史矩阵`84406`在干净`348778d5a5ff7948ed9c1cd2b2ff17aaf7c79ea2`上执行52注册文件，12:50:09.192Z开始、13:25:26.356Z退出1，2117.353秒；真实325项中318pass/7fail/0skip，50文件pass、2文件fail，源码全程clean。独占原始报告`.local-run/m1-history-20261016-b1d17760/migration-tests.original.json`和`history-command.log`保留，不覆盖原354b主阶段失败或借旧CI背书。
+- `0025→0026`四个positive replay失败发生在先升级至0059、再删0026 marker的跨代状态；0059八个新credential-responsibility guards落入旧0026前缀，旧57触发器严格检查拒绝65，不是正常首次顺序升级失败。六个相关marker-loss用例现限定在冻结0001～0025加原样0026的真实历史阶段，保留57/19/19、rotation、write-once和旧writer拒绝；第一个合法legacy用例重放后仍完整推进当前tail，并核旧provider/tenant字段及marker全集。CHECK/FK负例还要求`ER_NO_SUCH_TABLE`与精确`__invalid_credential_lifecycle_schema__`，不能由无关trigger错误遮蔽而假绿。已发布0026和0059 SQL/hash均不改。
+- `0030→0031`三个失败前态使用了合成journal/runtime摘要；最终栈确认新普通启动审计在`loadTenantRestoreJournalControl→assertTenantRestoreRuntimeProjection`拒绝。仅这三个升级前来源改为正式0030 codec、合法UUID与真实空entry/fence根和receipt；升级前在冻结0030 schema通过真实公共getter核journal/runtime/heads/run/receipt，再保留或增加升级前后逐行完整比较。两个unbound旧run负例绑定同一真实journal证据；prepared分支另在事务内合法abort后证明同来源catalog可激活，随后回滚并核原行，防止错误原因假绿。正式旧guard不允许replay_sealed→aborted，因此不伪造该正控；其阻断与回滚断言保留。它仍是SQL-shaped历史前态，不冒称旧binary生成。
+- 修后`28739`在全新隔离MySQL基库中执行两个完整文件，13:29:04.911Z开始、13:32:26.753Z退出0，201.842秒；0026为10pass、0030为18pass，同次共28pass/0fail/0skip，无过滤。独占`.local-run/m1-history-fixture-recheck-20261016-de701498de/tests.json`与`command.log`保留，JSON startTime=`1792157345192`。两TS源码SHA256分别为`072ac3b5782554694d6033d8032a3e5502ff672d5fc8653765f0d226c21fd92f`、`eca6b770dd33b2426834bf085a411d8ac8a632b7230ee7bd2714fef00079ba56`；整轮前后实际diff SHA256均为`3090bb2b2ade842804410710be39af3ef083d0fa1e963196cab488bcff5e85e8`。这是修后分段，不把旧318与新28累计为一次整轮通过。
+- 37703整树typecheck exit0；secret scan748与`git diff --check` exit0。有界独立复核分别检查历史阶段/字段保持与真实getter、负例因果和事务回滚；0030草稿曾被发现journal参数不一致而可假绿，已在真实复验前修正并加正控。没有产品写路径、旧migration、依赖/lock或schema更改，租户隔离、严格启动指纹与已有滚动/排空合同不变；静态review不替代运行证明。根与两个作者均未运行并发DB/S3/build。
+- 两个本轮owned base库只读复核均为0；另观察到44个全局migration-test命名库，多数表创建于10月9～13日且不在本轮created集合，未删除或据此声称全机无历史残留。sandbox首个元数据查询被EPERM拒绝后，仅对同一只读查询申请正常本机访问并完成；没有重启测试或操作业务库。
+- 下一步补完整`verify-s3`、cluster及最终SHA完整CI，继续保留本机分段与整轮的区别，不盲重跑已完成的独立历史阶段。c12产品源码的clean build/VM分段仍只证明c12；当前包尚未推送或完成发布。原完整主阶段coverage失败仍保留，最终coverage/required/history全部执行须由最终SHA CI证明。按用户新顺序，发布后本地体验，再M3与必要M4，native WIP及高级生命周期/灾备后置但不取消；0037/0054、旧receipt/unknown、默认off/production拒绝、外删自动off与completion=false不变。

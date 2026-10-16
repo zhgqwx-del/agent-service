@@ -5,7 +5,20 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { MysqlSessionStore } from "../../src/index.js";
+import {
+  EMPTY_TENANT_RESTORE_FENCE_ROOT_SHA256,
+  EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
+  EMPTY_TENANT_RESTORE_REPLAY_ENTRY_ROOT_SHA256,
+  EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256,
+  MysqlSessionStore,
+  TENANT_RESTORE_JOURNAL_PROTOCOL,
+  TENANT_RESTORE_REPLAY_RECEIPT_SCOPE,
+  tenantRestoreJournalControlEvidenceSha256,
+  tenantRestoreJournalTargetRootSha256,
+  tenantRestoreReplayReceiptSha256,
+  tenantRestoreReplaySealedTargetRootSha256,
+  tenantRestoreRuntimeControlEvidenceSha256,
+} from "../../src/index.js";
 
 const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_URL
   ?? "mysql://root@127.0.0.1:3306/agent_service_test";
@@ -19,6 +32,84 @@ const EMPTY_RUNTIME_CONTROL_EVIDENCE_SHA256 =
 const EMPTY_BACKUP_CATALOG_EVENT_ROOT_SHA256 =
   "bab7b17930d82572302c510c686e061ae9bd0de44ff19c83c483f45524b24e81";
 const BACKUP_ID = "backup_00000000-0000-4000-8000-000000000031";
+const FORMAL_0030_TARGET = {
+  targetOrdinal: 0,
+  targetSha256: "7".repeat(64),
+  failureDomainSha256: "8".repeat(64),
+  adapterProtocol: "memory-journal-v1",
+  journalNamespaceSha256: "4".repeat(64),
+};
+const FORMAL_0030_HEAD = {
+  ...FORMAL_0030_TARGET,
+  logicalDatabaseNamespaceSha256: "5".repeat(64),
+  sealedRemoteSequence: 0,
+  sealedHeadRootSha256: EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256,
+};
+const FORMAL_0030_TARGET_ROOT = tenantRestoreJournalTargetRootSha256([FORMAL_0030_TARGET]);
+const FORMAL_0030_HEAD_ROOT = tenantRestoreReplaySealedTargetRootSha256([FORMAL_0030_HEAD]);
+const FORMAL_0030_JOURNAL_BODY = {
+  singletonId: 1 as const,
+  controlGeneration: 1 as const,
+  activatedAtDbMs: 20,
+  protocol: TENANT_RESTORE_JOURNAL_PROTOCOL,
+  adapterProtocol: FORMAL_0030_TARGET.adapterProtocol,
+  journalNamespaceSha256: FORMAL_0030_TARGET.journalNamespaceSha256,
+  logicalDatabaseNamespaceSha256: FORMAL_0030_HEAD.logicalDatabaseNamespaceSha256,
+  targetCount: 1,
+  targetRootSha256: FORMAL_0030_TARGET_ROOT,
+};
+const FORMAL_0030_JOURNAL = {
+  ...FORMAL_0030_JOURNAL_BODY,
+  evidenceSha256: tenantRestoreJournalControlEvidenceSha256(FORMAL_0030_JOURNAL_BODY),
+};
+const FORMAL_0030_RUNTIME_BODY = {
+  singletonId: 1 as const,
+  state: "active" as const,
+  controlGeneration: 1,
+  updateKind: "primary_activation" as const,
+  activatedAtDbMs: 20,
+  updatedAtDbMs: 20,
+  lineageKind: "primary" as const,
+  runtimeEpochSha256: "a".repeat(64),
+  controlEvidenceSha256: FORMAL_0030_JOURNAL.evidenceSha256,
+  logicalDatabaseNamespaceSha256: FORMAL_0030_HEAD.logicalDatabaseNamespaceSha256,
+  targetCount: 1,
+  targetRootSha256: FORMAL_0030_TARGET_ROOT,
+  verifiedHeadRootSha256: FORMAL_0030_HEAD_ROOT,
+  previousControlEvidenceSha256: EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256,
+};
+const FORMAL_0030_RUNTIME = {
+  ...FORMAL_0030_RUNTIME_BODY,
+  evidenceSha256: tenantRestoreRuntimeControlEvidenceSha256(FORMAL_0030_RUNTIME_BODY),
+};
+const FORMAL_0030_SOURCE_BACKUP = "1".repeat(64);
+
+function formal0030ReplayReceipt(restoreRunId: string, runtimeEpochSha256: string) {
+  const body = {
+    scope: TENANT_RESTORE_REPLAY_RECEIPT_SCOPE,
+    restoreRunId,
+    sourceBackupSha256: FORMAL_0030_SOURCE_BACKUP,
+    runtimeEpochSha256,
+    controlEvidenceSha256: FORMAL_0030_JOURNAL.evidenceSha256,
+    protocol: TENANT_RESTORE_JOURNAL_PROTOCOL,
+    adapterProtocol: FORMAL_0030_TARGET.adapterProtocol,
+    journalNamespaceSha256: FORMAL_0030_TARGET.journalNamespaceSha256,
+    logicalDatabaseNamespaceSha256: FORMAL_0030_HEAD.logicalDatabaseNamespaceSha256,
+    targetCount: 1,
+    targetRootSha256: FORMAL_0030_TARGET_ROOT,
+    sealedTargetRootSha256: FORMAL_0030_HEAD_ROOT,
+    entryCount: 0,
+    entryRootSha256: EMPTY_TENANT_RESTORE_REPLAY_ENTRY_ROOT_SHA256,
+    fenceCount: 0,
+    fenceRootSha256: EMPTY_TENANT_RESTORE_FENCE_ROOT_SHA256,
+    storeDbTimestampMs: 31,
+    restoreFenceReplayComplete: true as const,
+    physicalReplayComplete: false as const,
+    allDomainsComplete: false as const,
+    contentPurgeExecuted: false as const,
+  };
+  return { ...body, receiptSha256: tenantRestoreReplayReceiptSha256(body) };
+}
 
 const FROZEN_0030_MIGRATIONS = [
   ["0001_init.sql", "4ddae03c6822ae65b8defc65d7c1a96f053f2b56e5442ac7ca9aacb2331d5026"],
@@ -199,6 +290,176 @@ describe("0030 -> 0031 authoritative backup catalog migration", () => {
     }
   }
 
+  // Only the three pre-upgrade rows below use this formal 0030 source. The older
+  // SQL-shaped negative cases keep their exact deliberately synthetic witnesses.
+  async function activateFormal0030Controls(conn: Connection): Promise<void> {
+    expect(EMPTY_REMOTE_HEAD_ROOT_SHA256)
+      .toBe(EMPTY_TENANT_RESTORE_JOURNAL_REMOTE_HEAD_ROOT_SHA256);
+    expect(EMPTY_RUNTIME_CONTROL_EVIDENCE_SHA256)
+      .toBe(EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256);
+    await conn.beginTransaction();
+    try {
+      await conn.query(
+        `INSERT INTO tenant_restore_runtime_heads
+           (singleton_id,target_ordinal,target_sha256,failure_domain_sha256,
+            adapter_protocol,journal_namespace_sha256,logical_database_namespace_sha256,
+            remote_sequence,head_root_sha256,checkpoint_control_generation,
+            runtime_epoch_sha256,updated_at_db_ms)
+         VALUES (1,0,REPEAT('7',64),REPEAT('8',64),'memory-journal-v1',REPEAT('4',64),
+                 REPEAT('5',64),0,?,1,REPEAT('a',64),20)`,
+        [FORMAL_0030_HEAD.sealedHeadRootSha256],
+      );
+      await conn.query(
+        `INSERT INTO tenant_restore_runtime_events
+           (singleton_id,control_generation,update_kind,lineage_kind,
+            activated_at_db_ms,updated_at_db_ms,restore_run_id,replay_receipt_sha256,
+            runtime_epoch_sha256,activation_epoch_sha256,control_evidence_sha256,
+            logical_database_namespace_sha256,target_count,target_root_sha256,
+            verified_head_root_sha256,previous_control_evidence_sha256,evidence_sha256)
+         VALUES (1,1,'primary_activation','primary',20,20,NULL,NULL,
+                 REPEAT('a',64),REPEAT('a',64),?,REPEAT('5',64),1,?,?,?,?)`,
+        [FORMAL_0030_JOURNAL.evidenceSha256, FORMAL_0030_TARGET_ROOT,
+          FORMAL_0030_HEAD_ROOT, EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256,
+          FORMAL_0030_RUNTIME.evidenceSha256],
+      );
+      await conn.query(
+        `UPDATE tenant_restore_runtime_control
+            SET state='active',control_generation=1,update_kind='primary_activation',
+                lineage_kind='primary',activated_at_db_ms=20,updated_at_db_ms=20,
+                restore_run_id=NULL,replay_receipt_sha256=NULL,
+                runtime_epoch_sha256=REPEAT('a',64),control_evidence_sha256=?,
+                logical_database_namespace_sha256=REPEAT('5',64),target_count=1,
+                target_root_sha256=?,verified_head_root_sha256=?,
+                previous_control_evidence_sha256=?,evidence_sha256=?
+          WHERE singleton_id=1`,
+        [FORMAL_0030_JOURNAL.evidenceSha256, FORMAL_0030_TARGET_ROOT,
+          FORMAL_0030_HEAD_ROOT, EMPTY_TENANT_RESTORE_RUNTIME_CONTROL_EVIDENCE_SHA256,
+          FORMAL_0030_RUNTIME.evidenceSha256],
+      );
+      await conn.query(
+        `UPDATE tenant_restore_journal_control
+            SET control_generation=1,activated_at_db_ms=20,
+                protocol='tenant-restore-journal-v1',adapter_protocol='memory-journal-v1',
+                journal_namespace_sha256=REPEAT('4',64),
+                logical_database_namespace_sha256=REPEAT('5',64),target_count=1,
+                target_root_sha256=?,
+                target_catalog_json=JSON_ARRAY(JSON_OBJECT(
+                  'targetOrdinal',0,'targetSha256',REPEAT('7',64),
+                  'failureDomainSha256',REPEAT('8',64),
+                  'adapterProtocol','memory-journal-v1',
+                  'journalNamespaceSha256',REPEAT('4',64))),
+                evidence_sha256=?
+          WHERE singleton_id=1`,
+        [FORMAL_0030_TARGET_ROOT, FORMAL_0030_JOURNAL.evidenceSha256],
+      );
+      await conn.commit();
+    } catch (error) {
+      await conn.rollback();
+      throw error;
+    }
+  }
+
+  async function createFormalLegacyReplayRun(
+    conn: Connection,
+    input: { restoreRunId: string; runtimeEpochSha256: string; phase: LegacyRunPhase },
+  ): Promise<void> {
+    await conn.query(
+      `INSERT INTO tenant_restore_replay_runs
+         (restore_run_id,source_backup_sha256,runtime_epoch_sha256,protocol,
+          control_evidence_sha256,adapter_protocol,journal_namespace_sha256,
+          logical_database_namespace_sha256,target_count,target_root_sha256,
+          sealed_target_catalog_json,sealed_target_root_sha256,expected_entry_count,
+          entry_count,entry_root_sha256,fence_count,fence_root_sha256,phase,
+          created_at_db_ms,updated_at_db_ms,terminal_receipt_sha256,sealed_at_db_ms,
+          activated_at_db_ms,aborted_at_db_ms)
+       VALUES (?,?,?,'tenant-restore-journal-v1',?,
+               'memory-journal-v1',REPEAT('4',64),REPEAT('5',64),1,?,
+               JSON_ARRAY(JSON_OBJECT(
+                 'targetOrdinal',0,'targetSha256',REPEAT('7',64),
+                 'failureDomainSha256',REPEAT('8',64),
+                 'adapterProtocol','memory-journal-v1',
+                 'journalNamespaceSha256',REPEAT('4',64),
+                 'logicalDatabaseNamespaceSha256',REPEAT('5',64),
+                 'sealedRemoteSequence',0,'sealedHeadRootSha256',?)),
+               ?,0,0,?,0,?,'prepared',30,30,NULL,NULL,NULL,NULL)`,
+      [input.restoreRunId, FORMAL_0030_SOURCE_BACKUP, input.runtimeEpochSha256,
+        FORMAL_0030_JOURNAL.evidenceSha256, FORMAL_0030_TARGET_ROOT,
+        FORMAL_0030_HEAD.sealedHeadRootSha256, FORMAL_0030_HEAD_ROOT,
+        EMPTY_TENANT_RESTORE_REPLAY_ENTRY_ROOT_SHA256,
+        EMPTY_TENANT_RESTORE_FENCE_ROOT_SHA256],
+    );
+    if (input.phase === "replay_sealed") {
+      const receipt = formal0030ReplayReceipt(input.restoreRunId, input.runtimeEpochSha256);
+      await conn.query(
+        `UPDATE tenant_restore_replay_runs
+            SET phase='replay_sealed',updated_at_db_ms=31,terminal_receipt_sha256=?,
+                sealed_at_db_ms=31
+          WHERE restore_run_id=?`,
+        [receipt.receiptSha256, input.restoreRunId],
+      );
+    } else if (input.phase === "aborted") {
+      await conn.query(
+        `UPDATE tenant_restore_replay_runs
+            SET phase='aborted',updated_at_db_ms=31,aborted_at_db_ms=31
+          WHERE restore_run_id=?`,
+        [input.restoreRunId],
+      );
+    }
+  }
+
+  async function assertFormal0030Source(
+    database: string,
+    input: { restoreRunId: string; runtimeEpochSha256: string; phase: LegacyRunPhase },
+  ): Promise<void> {
+    const source = await MysqlSessionStore.connect({
+      url: databaseUrl(base, database),
+      migrationsDir: pre0031Dir,
+    });
+    try {
+      expect(await source.getTenantRestoreJournalControl()).toEqual(FORMAL_0030_JOURNAL);
+      expect(await source.getTenantRestoreJournalControlTargets()).toEqual([FORMAL_0030_TARGET]);
+      expect(await source.getTenantRestoreRuntimeControl()).toEqual(FORMAL_0030_RUNTIME);
+      expect(await source.getTenantRestoreRuntimeHeads()).toEqual([FORMAL_0030_HEAD]);
+      const expectedRun = {
+        restoreRunId: input.restoreRunId,
+        sourceBackupSha256: FORMAL_0030_SOURCE_BACKUP,
+        runtimeEpochSha256: input.runtimeEpochSha256,
+        protocol: TENANT_RESTORE_JOURNAL_PROTOCOL,
+        controlEvidenceSha256: FORMAL_0030_JOURNAL.evidenceSha256,
+        adapterProtocol: FORMAL_0030_TARGET.adapterProtocol,
+        journalNamespaceSha256: FORMAL_0030_TARGET.journalNamespaceSha256,
+        logicalDatabaseNamespaceSha256: FORMAL_0030_HEAD.logicalDatabaseNamespaceSha256,
+        targetCount: 1,
+        targetRootSha256: FORMAL_0030_TARGET_ROOT,
+        sealedTargetRootSha256: FORMAL_0030_HEAD_ROOT,
+        expectedEntryCount: 0,
+        entryCount: 0,
+        entryRootSha256: EMPTY_TENANT_RESTORE_REPLAY_ENTRY_ROOT_SHA256,
+        fenceCount: 0,
+        fenceRootSha256: EMPTY_TENANT_RESTORE_FENCE_ROOT_SHA256,
+        phase: input.phase,
+        createdAtDbMs: 30,
+        updatedAtDbMs: input.phase === "prepared" ? 30 : 31,
+        ...(input.phase === "aborted" ? { abortedAtDbMs: 31 } : {}),
+        ...(input.phase === "replay_sealed" ? {
+          terminalReceiptSha256:
+            formal0030ReplayReceipt(input.restoreRunId, input.runtimeEpochSha256).receiptSha256,
+          sealedAtDbMs: 31,
+        } : {}),
+      };
+      expect(await source.getTenantRestoreReplayRun(input.restoreRunId)).toEqual(expectedRun);
+      expect(await source.getTenantRestoreReplaySealedTargets(input.restoreRunId))
+        .toEqual([FORMAL_0030_HEAD]);
+      expect(await source.getTenantRestoreReplayReceipt(input.restoreRunId)).toEqual(
+        input.phase === "replay_sealed"
+          ? formal0030ReplayReceipt(input.restoreRunId, input.runtimeEpochSha256)
+          : null,
+      );
+    } finally {
+      await source.close();
+    }
+  }
+
   async function createLegacyReplayRun(
     conn: Connection,
     input: {
@@ -264,6 +525,7 @@ describe("0030 -> 0031 authoritative backup catalog migration", () => {
   async function activateCatalogControl(
     conn: Connection,
     protocol: string | null = "tenant-backup-catalog-v1",
+    journalControlEvidenceSha256 = "9".repeat(64),
   ): Promise<void> {
     await conn.query(
       `UPDATE backup_catalog_control
@@ -272,12 +534,12 @@ describe("0030 -> 0031 authoritative backup catalog migration", () => {
               catalog_namespace_sha256=REPEAT('d',64),catalog_target_sha256=REPEAT('e',64),
               failure_domain_sha256=REPEAT('f',64),
               logical_database_namespace_sha256=REPEAT('5',64),
-              journal_control_evidence_sha256=REPEAT('9',64),
+             journal_control_evidence_sha256=?,
               retention_policy_sha256=REPEAT('1',64),minimum_retention_ms=10,
               minimum_recoverable_backups=1,
               activated_at_db_ms=40,evidence_sha256=REPEAT('0',64)
         WHERE singleton_id=1`,
-      [protocol],
+     [protocol, journalControlEvidenceSha256],
     );
   }
 
@@ -601,15 +863,20 @@ describe("0030 -> 0031 authoritative backup catalog migration", () => {
     const database = databaseName();
     await create0030(database);
     const conn = await mysql.createConnection(databaseUrl(base, database));
+    const restoreRunId = "restore_00000000-0000-4000-8000-000000000035";
     try {
-      await activate0030Controls(conn);
-      await createLegacyReplayRun(conn, {
-        restoreRunId: "restore_legacy_preserved",
+      await activateFormal0030Controls(conn);
+      await createFormalLegacyReplayRun(conn, {
+        restoreRunId,
         runtimeEpochSha256: "d".repeat(64),
         phase: "aborted",
       });
+      await assertFormal0030Source(database, {
+        restoreRunId, runtimeEpochSha256: "d".repeat(64), phase: "aborted",
+      });
       const [beforeRun] = await conn.query<Row[]>(
-        "SELECT * FROM tenant_restore_replay_runs WHERE restore_run_id='restore_legacy_preserved'",
+        "SELECT * FROM tenant_restore_replay_runs WHERE restore_run_id=?",
+        [restoreRunId],
       );
       const [beforeJournal] = await conn.query<Row[]>(
         "SELECT * FROM tenant_restore_journal_control WHERE singleton_id=1",
@@ -621,7 +888,8 @@ describe("0030 -> 0031 authoritative backup catalog migration", () => {
       await upgrade(database);
 
       const [afterRun] = await conn.query<Row[]>(
-        "SELECT * FROM tenant_restore_replay_runs WHERE restore_run_id='restore_legacy_preserved'",
+        "SELECT * FROM tenant_restore_replay_runs WHERE restore_run_id=?",
+        [restoreRunId],
       );
       const [afterJournal] = await conn.query<Row[]>(
         "SELECT * FROM tenant_restore_journal_control WHERE singleton_id=1",
@@ -893,21 +1161,84 @@ describe("0030 -> 0031 authoritative backup catalog migration", () => {
       await create0030(database);
       const conn = await mysql.createConnection(databaseUrl(base, database));
       try {
-        await activate0030Controls(conn);
-        await createLegacyReplayRun(conn, {
-          restoreRunId: `restore_legacy_unbound_${phase}`,
-          runtimeEpochSha256: (phase === "prepared" ? "d" : "e").repeat(64),
+        const restoreRunId = phase === "prepared"
+          ? "restore_00000000-0000-4000-8000-000000000036"
+          : "restore_00000000-0000-4000-8000-000000000037";
+        const runtimeEpochSha256 = (phase === "prepared" ? "d" : "e").repeat(64);
+        await activateFormal0030Controls(conn);
+        await createFormalLegacyReplayRun(conn, {
+          restoreRunId,
+          runtimeEpochSha256,
           phase,
         });
+        await assertFormal0030Source(database, { restoreRunId, runtimeEpochSha256, phase });
+        const [beforeRun] = await conn.query<Row[]>(
+          "SELECT * FROM tenant_restore_replay_runs WHERE restore_run_id=?",
+          [restoreRunId],
+        );
+        const [beforeJournal] = await conn.query<Row[]>(
+          "SELECT * FROM tenant_restore_journal_control WHERE singleton_id=1",
+        );
+        const [beforeRuntime] = await conn.query<Row[]>(
+          "SELECT * FROM tenant_restore_runtime_control WHERE singleton_id=1",
+        );
         await upgrade(database);
+        const [afterRun] = await conn.query<Row[]>(
+          "SELECT * FROM tenant_restore_replay_runs WHERE restore_run_id=?",
+          [restoreRunId],
+        );
+        const [afterJournal] = await conn.query<Row[]>(
+          "SELECT * FROM tenant_restore_journal_control WHERE singleton_id=1",
+        );
+        const [afterRuntime] = await conn.query<Row[]>(
+          "SELECT * FROM tenant_restore_runtime_control WHERE singleton_id=1",
+        );
+        expect(afterRun).toEqual(beforeRun);
+        expect(afterJournal).toEqual(beforeJournal);
+        expect(afterRuntime).toEqual(beforeRuntime);
         await activateBlobStorageControl(conn);
         await conn.beginTransaction();
-        await expect(activateCatalogControl(conn)).rejects.toThrow(/activation is not permitted/);
+        await expect(activateCatalogControl(
+          conn, "tenant-backup-catalog-v1", FORMAL_0030_JOURNAL.evidenceSha256,
+        )).rejects.toThrow(/activation is not permitted/);
         await conn.rollback();
         const [control] = await conn.query<Row[]>(
           "SELECT state,control_generation FROM backup_catalog_control WHERE singleton_id=1",
         );
         expect(control[0]).toMatchObject({ state: "inactive", control_generation: 0 });
+        if (phase === "prepared") {
+          // The frozen 0030 trigger permits prepared -> aborted. In one transaction,
+          // remove only that live unbound blocker and prove the same actual journal,
+          // runtime and Blob sources allow catalog activation; then roll back both
+          // changes so the original legacy row and control remain byte-identical.
+          await conn.beginTransaction();
+          try {
+            await conn.query(
+              `UPDATE tenant_restore_replay_runs
+                  SET phase='aborted',updated_at_db_ms=32,aborted_at_db_ms=32
+                WHERE restore_run_id=? AND phase='prepared'`,
+              [restoreRunId],
+            );
+            await activateCatalogControl(
+              conn, "tenant-backup-catalog-v1", FORMAL_0030_JOURNAL.evidenceSha256,
+            );
+            const [active] = await conn.query<Row[]>(
+              "SELECT state,control_generation FROM backup_catalog_control WHERE singleton_id=1",
+            );
+            expect(active[0]).toMatchObject({ state: "active", control_generation: 1 });
+          } finally {
+            await conn.rollback();
+          }
+          const [postControl] = await conn.query<Row[]>(
+            "SELECT state,control_generation FROM backup_catalog_control WHERE singleton_id=1",
+          );
+          const [postRun] = await conn.query<Row[]>(
+            "SELECT * FROM tenant_restore_replay_runs WHERE restore_run_id=?",
+            [restoreRunId],
+          );
+          expect(postControl[0]).toMatchObject({ state: "inactive", control_generation: 0 });
+          expect(postRun).toEqual(beforeRun);
+        }
       } finally {
         await conn.end();
         await cleanup(database);

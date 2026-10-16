@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,8 @@ const BASE_URL = process.env.MYSQL_MIGRATION_TEST_URL ?? process.env.MYSQL_TEST_
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = resolve(HERE, "../../migrations");
 const MIGRATION_NAME = "0026_credential_lifecycle_inventory.sql";
+// Same immutable 0026 bytes as FROZEN_0030_MIGRATIONS in 0030-to-0031.migration.ts.
+const FROZEN_0026_SHA256 = "75c67a6c430189674653d486a3d747c4ba99811c2ec967fc6990e2e40780895e";
 const FROZEN_0025_MIGRATIONS = [
   ["0001_init.sql", "4ddae03c6822ae65b8defc65d7c1a96f053f2b56e5442ac7ca9aacb2331d5026"],
   ["0002_auto_approved.sql", "d71b98781d5637762f840e33baeb2f423d7b2275fa309c9a433ec7c75b83b3a9"],
@@ -65,10 +67,21 @@ async function expectReject(promise: Promise<unknown>, pattern: RegExp): Promise
   await expect(promise).rejects.toThrow(pattern);
 }
 
+async function expect0026SchemaReject(promise: Promise<unknown>): Promise<void> {
+  await expect(promise).rejects.toMatchObject({
+    message: expect.stringMatching(/0026_credential_lifecycle_inventory\.sql failed/),
+    cause: {
+      code: "ER_NO_SUCH_TABLE",
+      sqlMessage: expect.stringContaining("__invalid_credential_lifecycle_schema__"),
+    },
+  });
+}
+
 describe("0025 -> 0026 credential lifecycle migration", () => {
   let admin: Connection;
   let base: URL;
   let pre0026Dir: string;
+  let through0026Dir: string;
 
   beforeAll(async () => {
     base = disposableBase(BASE_URL);
@@ -76,16 +89,22 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
     adminUrl.pathname = "/";
     admin = await mysql.createConnection(adminUrl.toString());
     pre0026Dir = await mkdtemp(join(tmpdir(), "agent-service-pre0026-"));
+    through0026Dir = await mkdtemp(join(tmpdir(), "agent-service-through0026-"));
     for (const [file, expectedSha256] of FROZEN_0025_MIGRATIONS) {
       const bytes = await readFile(join(MIGRATIONS_DIR, file));
       expect(createHash("sha256").update(bytes).digest("hex"), file).toBe(expectedSha256);
       await copyFile(join(MIGRATIONS_DIR, file), join(pre0026Dir, file));
+      await copyFile(join(MIGRATIONS_DIR, file), join(through0026Dir, file));
     }
+    const bytes0026 = await readFile(join(MIGRATIONS_DIR, MIGRATION_NAME));
+    expect(createHash("sha256").update(bytes0026).digest("hex"), MIGRATION_NAME).toBe(FROZEN_0026_SHA256);
+    await copyFile(join(MIGRATIONS_DIR, MIGRATION_NAME), join(through0026Dir, MIGRATION_NAME));
   });
 
   afterAll(async () => {
     await admin?.end();
     if (pre0026Dir) await rm(pre0026Dir, { recursive: true, force: true });
+    if (through0026Dir) await rm(through0026Dir, { recursive: true, force: true });
   });
 
   async function create0025(database: string): Promise<void> {
@@ -105,6 +124,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
     const database = databaseName();
     await create0025(database);
     const conn = await mysql.createConnection(databaseUrl(base, database));
+    let store: MysqlSessionStore | undefined;
     try {
       await conn.query(
         `INSERT INTO tenants
@@ -118,7 +138,10 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
                  X'0304','legacy-key',1,1)`,
       );
 
-      const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+      // Replay belongs to the real 0026 recovery phase, before later migrations add guards.
+      store = await MysqlSessionStore.connect({
+        url: databaseUrl(base, database), migrationsDir: through0026Dir,
+      });
       const [cutover] = await conn.query<Row[]>(
         "SELECT * FROM tenant_credential_tracking_cutover WHERE singleton_id=1",
       );
@@ -157,7 +180,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
           WHERE tenant_id='tenant-pre0026' AND provider_id='provider-pre0026'`,
       );
       await conn.query("DELETE FROM schema_migrations WHERE name=?", [MIGRATION_NAME]);
-      await store.migrate(MIGRATIONS_DIR);
+      await store.migrate(through0026Dir);
       const [markers] = await conn.query<Row[]>(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?", [MIGRATION_NAME],
       );
@@ -186,8 +209,37 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
               OR trigger_name LIKE 'trg_tenant_auth_credential\\_%')`,
       );
       expect(Number(allCredentialTriggers[0]!.count)).toBe(57);
+
+      // Only after historical recovery succeeds, advance the same database through the full
+      // current tail. Preserve legacy source values and their dormant 0026 projections exactly.
+      const providerSourceSql = "SELECT tenant_id,provider_id,config,secret_cipher,secret_key_id,"
+        + "created_at_ms,updated_at_ms,credential_slot_id_sha256,"
+        + "credential_write_generation,credential_version_id FROM provider_configs"
+        + " WHERE tenant_id='tenant-pre0026' AND provider_id='provider-pre0026'";
+      const tenantSourceSql = "SELECT tenant_id,name,created_at_ms,auth_policy,"
+        + "auth_secret_cipher,auth_secret_key_id,auth_write_generation,"
+        + "auth_credential_version_id,auth_credential_updated_at_db_ms"
+        + " FROM tenants WHERE tenant_id='tenant-pre0026'";
+      const [beforeTailProvider] = await conn.query<Row[]>(providerSourceSql);
+      const [beforeTailTenant] = await conn.query<Row[]>(tenantSourceSql);
       await store.close();
+      store = undefined;
+      const current = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+      try {
+        const [afterTailProvider] = await conn.query<Row[]>(providerSourceSql);
+        const [afterTailTenant] = await conn.query<Row[]>(tenantSourceSql);
+        expect(afterTailProvider).toEqual(beforeTailProvider);
+        expect(afterTailTenant).toEqual(beforeTailTenant);
+        const [currentMarkers] = await conn.query<Row[]>(
+          "SELECT name FROM schema_migrations ORDER BY name",
+        );
+        const currentFiles = (await readdir(MIGRATIONS_DIR)).filter((file) => file.endsWith(".sql")).sort();
+        expect(currentMarkers.map((row) => String(row.name))).toEqual(currentFiles);
+      } finally {
+        await current.close();
+      }
     } finally {
+      await store?.close();
       await conn.end();
       await cleanup(database);
     }
@@ -304,17 +356,16 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
   it("rejects a weakened same-name CHECK constraint before recording a replay marker", async () => {
     const database = databaseName();
     await create0025(database);
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    const store = await MysqlSessionStore.connect({
+      url: databaseUrl(base, database), migrationsDir: through0026Dir,
+    });
     const conn = await mysql.createConnection(databaseUrl(base, database));
     try {
       await conn.query(
         "ALTER TABLE tenant_credential_versions DROP CHECK chk_credential_version_material",
       );
       await conn.query("DELETE FROM schema_migrations WHERE name=?", [MIGRATION_NAME]);
-      await expectReject(
-        store.migrate(MIGRATIONS_DIR),
-        /0026_credential_lifecycle_inventory\.sql failed/,
-      );
+      await expect0026SchemaReject(store.migrate(through0026Dir));
       const [markers] = await conn.query<Row[]>(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?", [MIGRATION_NAME],
       );
@@ -363,7 +414,9 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
   it("rejects a same-name foreign key with a weakened delete rule", async () => {
     const database = databaseName();
     await create0025(database);
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    const store = await MysqlSessionStore.connect({
+      url: databaseUrl(base, database), migrationsDir: through0026Dir,
+    });
     const conn = await mysql.createConnection(databaseUrl(base, database));
     try {
       await conn.query(
@@ -377,10 +430,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
            ON UPDATE RESTRICT ON DELETE CASCADE`,
       );
       await conn.query("DELETE FROM schema_migrations WHERE name=?", [MIGRATION_NAME]);
-      await expectReject(
-        store.migrate(MIGRATIONS_DIR),
-        /0026_credential_lifecycle_inventory\.sql failed/,
-      );
+      await expect0026SchemaReject(store.migrate(through0026Dir));
       const [markers] = await conn.query<Row[]>(
         "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?", [MIGRATION_NAME],
       );
@@ -401,7 +451,9 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
   it("remains fail-closed and repairs a same-name trigger body on marker-loss replay", async () => {
     const database = databaseName();
     await create0025(database);
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    const store = await MysqlSessionStore.connect({
+      url: databaseUrl(base, database), migrationsDir: through0026Dir,
+    });
     const conn = await mysql.createConnection(databaseUrl(base, database));
     try {
       await conn.query(
@@ -427,7 +479,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       ), /untracked provider insert/);
 
       await conn.query("DELETE FROM schema_migrations WHERE name=?", [MIGRATION_NAME]);
-      await store.migrate(MIGRATIONS_DIR);
+      await store.migrate(through0026Dir);
       const [canonical] = await conn.query<Row[]>(
         `SELECT COUNT(*) AS count FROM information_schema.triggers
           WHERE trigger_schema=DATABASE()
@@ -452,7 +504,9 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
   it("keeps an active source guard at each marker-loss trigger rotation boundary", async () => {
     const database = databaseName();
     await create0025(database);
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    const store = await MysqlSessionStore.connect({
+      url: databaseUrl(base, database), migrationsDir: through0026Dir,
+    });
     const conn = await mysql.createConnection(databaseUrl(base, database));
     const rejectOldProvider = async (tenant: string): Promise<void> => {
       await expectReject(conn.query(
@@ -484,7 +538,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
         await rejectOldProvider(tenant);
 
         // A restart replays the complete migration from the exact DDL auto-commit boundary.
-        await store.migrate(MIGRATIONS_DIR);
+        await store.migrate(through0026Dir);
         const [markers] = await conn.query<Row[]>(
           "SELECT COUNT(*) AS count FROM schema_migrations WHERE name=?", [MIGRATION_NAME],
         );
@@ -508,7 +562,9 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
   it("keeps active cutover write-once and rejects the old provider/auth writers after replay", async () => {
     const database = databaseName();
     await create0025(database);
-    const store = await MysqlSessionStore.connect({ url: databaseUrl(base, database) });
+    const store = await MysqlSessionStore.connect({
+      url: databaseUrl(base, database), migrationsDir: through0026Dir,
+    });
     const conn = await mysql.createConnection(databaseUrl(base, database));
     try {
       await conn.query(
@@ -537,7 +593,7 @@ describe("0025 -> 0026 credential lifecycle migration", () => {
       ), /write-once/);
 
       await conn.query("DELETE FROM schema_migrations WHERE name=?", [MIGRATION_NAME]);
-      await store.migrate(MIGRATIONS_DIR);
+      await store.migrate(through0026Dir);
       const [cutover] = await conn.query<Row[]>(
         "SELECT control_generation,activated_at_db_ms FROM tenant_credential_tracking_cutover",
       );

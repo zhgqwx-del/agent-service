@@ -1,5 +1,7 @@
 # 数据生命周期设计
 
+> 开发顺序更新（用户确认，2026-10-16）：完整生命周期/灾备继续属于长期全架构目标，但不再要求M1全部闭环才启动M3。先完成当前功能包发布阻断/剩余门禁/最终SHA CI，尽早本地体验，再M3 MCP/skills/hooks纵向（安全随功能）与必要M4本地可验发布/迁移/运行、基础quota/观测，本文剩余完整生命周期/灾备列后续P2，真实云验收待资源。M1未闭环/未冻结、M2冻结、M3当前未开始；下方旧“先M1闭环再M3”只在优先级上被本条覆盖，旧协议/失败/代码/native WIP保留。default-off不豁免P0或普通路径、启动/迁移正确性；0037硬拒、0054原primary-only destructive、旧receipt不重签/unknown不提升、外删自动off、production拒绝与completion=false不变。本地功能版不是全架构或生产完成，详见[PROGRESS](../PROGRESS.md)。
+
 > 当前恢复边界（2026-10-15T22:37Z）：0055～0057已随main3414发布且对应CI五绿；source/target须同一受保护exact ref key，并与制品key分离，不能自动rebind、重签旧收据或绕过审计。0058真实SQL/历史/单跳证据保留，有界trigger batch后原180秒完整双跳首次通过，含新Pi/finalcold/cleanup，178638.82ms，仅约1.36秒余量；不证明稳定提速或整包验收，完整verify/verify-s3/新CI仍待，见§16与[PROGRESS](../PROGRESS.md)。0037/0054原primary-only destructive/外部删除与自动清理off/completion=false、M1未冻结/M2冻结/M3未开始均不变。
 
 > 本地集成验收（2026-10-15）：M4目录/受限tar与0054在干净代码提交e278ead通过完整verify；主2897、真实历史47文件282零skip、cluster28与独立T3g3、SDK/六JS入口及VM335/实际clean双tar均通过。该本地证明限macOS arm64/Node24，不替代main对应Linux CI或生产验收；发布/CI实际状态以main及对应Actions run为准。0054只给同primary、新完整tenant、T1前全written/ACK、全部Blob/export计划域零的v2来源建立保留式本地删除桥；legacy/mixed/未知来源和新epoch恢复仍拒绝。0037 hard-deny、外部对象删除/自动清理关闭、四false与M1未冻结/M2冻结/M3未开始不变。较早版本表保留历史边界，完整结果看PROGRESS顶部及末节。

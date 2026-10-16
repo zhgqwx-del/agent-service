@@ -1,6 +1,10 @@
 # agent-service 项目记忆
 
+> 权威顺序更新（用户确认，2026-10-16）：长期全架构Goal不缩减；先完成当前功能包发布阻断/剩余门禁/最终SHA CI，再尽早本地手动体验，推进M3 MCP/skills/hooks纵向（安全随功能），之后必要M4本地可验发布/迁移/运行、基础quota/观测，完整生命周期/灾备后置P2，云验收待资源。M1未闭环/未冻结、M2冻结、M3当前未开始，但不再以M1全部闭环阻止M3。旧文中的先后顺序据此覆盖，旧事实/代码/native WIP不删；本地功能版不是全架构/生产完成。P0和普通路径/启动/迁移正确性不因default-off豁免，0037/0054/旧receipt/unknown/production拒绝/外删自动off/completion=false等边界不变，详见[PROGRESS](docs/PROGRESS.md)。
+
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
+
+最新收口：348历史整轮52文件318pass/7fail/0skip，exit1保留；仅两个历史夹具修后整文件复验2文件28pass/0fail/0skip，typecheck、secret scan748及diffcheck0。0026重放回归真实旧阶段并保留完整新tail升级，CHECK/FK验证精确schema原因；0030正式codec/合法run/真实getter预验及同来源正控避免负例假绿。产品代码、旧migration和门禁不改，不把分段拼全量成功；完整S3、cluster与最终SHA CI仍待，权威路径见PROGRESS末节。
 
 本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合main/push；main仍clean `3414b43`。`354b`源码的完整verify `92378`退出1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项通过，但该轮history、cluster、build、VM未执行；原CI及旧定向不能证明新整包成功。0059三表/八guard/八非零根、全743trigger已真实校准，不再是缺0058前置的零根草稿。
 
@@ -26,7 +30,7 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 
 验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。已发布main清单为required133/64groups、历史50；组合候选required143 unique/68groups、历史52仅登记，不是执行证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
 
-下一步是冻结当前coherent组合包做一次完整verify与相关verify-s3，补齐剩余发布门禁，不再无界追加小切片。旧schema原生artifact跨迁移导入/升级/续跑仍缺；格式与历史读取兼容不是该能力证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不提前进入M3。
+下一步仅修当前coherent功能包发布阻断，保留失败与已过结果，复验失败/受影响范围并补齐剩余门禁及最终SHA CI，随后本地体验与M3纵向。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
 
 `0053`是默认关闭、production拒绝的本地persisted provider-step failure capture，不是删除/恢复completion。真实Pi原provider失败才具进程内provenance；首failed-step item/event、usage/billing、v2 binding/membership/spool/job/receipt在Memory原子发布/MySQL显式RR中收口，之后另结束turn；runtime/tool/store/listener等失败保持unknown。精确重放保留原seq/usageId，ambiguous Host commit只fence不自动重跑模型。旧NULL/gen0不回填，post-cutover unknown/gen1不能凭回填时间混作legacy。激活须真实0030 primary epoch、exact key、coverage及人工fleet/旧writer排空ACK，v1/traces capture仍inactive。新增五命令telemetry-capture一次性CLI是第六JS入口，仍仅router/runner两常驻服务与两镜像。
 
