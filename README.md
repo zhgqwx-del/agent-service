@@ -4,7 +4,9 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
-最新发布阻断窄修（14:07Z）：真实S3验收发现从未启用capture的普通0030/0031恢复被新增启动审计误拒。现仅在普通启动的只读RR事务中，完整验证runtime/catalog、inactive双控制、全部capture证据为空及来源/孤儿检查后允许该pristine状态；公开cutover与写入授权不变。真实MySQL/MinIO整文件1/1、真实maintenance整文件7/7（含并发/回滚与active缺cutover拒绝）、纯测试整文件195/195、typecheck及scan748通过。原失败与修后分段均保留，不是整包全绿；完整S3、cluster、新源码build/VM和最终SHA CI仍待。native旧制品跨迁移WIP与高级生命周期/灾备按新顺序后置P2，不冒称已交付，详见[PROGRESS](docs/PROGRESS.md)末节。
+14:47补记：本轮超时残留已只读关联为同一fixture的3测试库、3桶17个测试对象及1个受保护临时制品目录，暂留失败样本、未删除；元数据关联不等于制品认证或删除授权，无业务/云资源操作。目前无运行中的验证，等待单条慢测预算选择，未推送。
+
+最新分段验收（14:42Z）：普通never-enabled capture恢复的严格pristine启动窄修已保留，真实定向1/1、maintenance7/7、纯195/195、typecheck/scan748通过。当前本地检查点为clean `302435a`；完整S3在其父源码`f1da901`有一项原180秒双跳慢测超时，此前8文件55项通过、恢复文件另1项通过；未跑的后置已在302独立补6文件28项及源码装配通过。完整cluster在f1为27pass/1fail（旧GET断言遗漏0059新增状态字段），精确补齐15字段后302仅受影响整文件3/3与正式T3g3/3通过。302新源码build及严格clean双role VM通过，后者仅Darwin arm64/Node24、ephemeral-test-only签名，非生产验收。单条慢测300秒预算选择尚待用户确认，当前180/CLI120不改；未推送、最终SHA CI未开始，不拼成整轮全绿。native跨迁移与高级生命周期/灾备仍为未完成P2；长期目标及M3优先顺序不变，详见[PROGRESS](docs/PROGRESS.md)末节。
 
 最新收口：`348778d` 的真实历史整轮已执行52文件，318 passed / 7 failed / 0 skipped，退出1，原报告保留。仅修两个历史夹具后，完整两文件复验28 passed / 0 failed / 0 skipped；typecheck、secret scan748与diffcheck通过。没有修改产品代码、旧迁移或安全门禁；这不是一次修后全量成功，完整S3、cluster与最终SHA CI仍待，详见[PROGRESS](docs/PROGRESS.md)末节。
 

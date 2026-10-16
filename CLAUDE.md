@@ -4,7 +4,9 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
-最新发布阻断窄修（14:07Z）：真实S3发现never-enabled capture的普通恢复误拒startup。仅ordinary startup只读RR新增strict pristine分支，完整runtime/catalog、inactive双control、12类空证据及source/orphan核对，public cutover与写授权不变。真实S3整文件1pass、maintenance整文件7pass（并发/回滚及active缺cutover仍拒）、纯整文件195pass、typecheck/scan748通过；原失败保留，不冒充整包全绿。完整S3/cluster、新源码build/VM与最终SHA CI仍待；native跨迁移WIP及高级生命周期/灾备后置P2但未完成，详见PROGRESS末节；下方为此前分段事实。
+14:47补记：超时残留已只读关联为同一fixture的3测试库/3桶17对象/1受保护临时制品目录，作为失败样本保留，未删。未读取key/SQL/对象正文，metadata不等于认证或删除授权；没有运行中的验证，慢测预算待用户答、未push，下方“待核”保留14:42事实。
+
+最新分段（14:42Z）：release clean302435a含f1 pristine恢复启动窄修与GET sidecar单测试修。定向真实1/SQL7/纯195、typecheck/scan748已过；完整S3原8文件55pass、file9另1pass/R2180s timeout，tail27080独立6文件28pass+sourceassembly、exit0。cluster原8文件27pass1fail，GET精确15字段修后27471受影响整file3+正式T3g3过，owned资源正常清。302新build与strictclean双role VM各exit0，仅Darwin arm64/Node24及ephemeral-test-only签名，非生产验收。300秒单慢测选择待答，原180/CLI120不改；未push/最终SHA CI未开始，不拼全绿。原超时S3三个owned非空桶与内部fixture残留待精确核对；native跨迁移/高级生命周期仍未完成P2，M3优先及原安全边界不变。详见PROGRESS末节；下方为此前事实。
 
 最新收口：348历史整轮52文件318pass/7fail/0skip，exit1保留；仅两个历史夹具修后整文件复验2文件28pass/0fail/0skip，typecheck、secret scan748及diffcheck0。0026重放回归真实旧阶段并保留完整新tail升级，CHECK/FK验证精确schema原因；0030正式codec/合法run/真实getter预验及同来源正控避免负例假绿。产品代码、旧migration和门禁不改，不把分段拼全量成功；完整S3、cluster与最终SHA CI仍待，权威路径见PROGRESS末节。
 
