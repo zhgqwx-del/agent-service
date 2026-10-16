@@ -2,9 +2,9 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
-本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合，未合main/push；main仍clean `3414b43`，原CI仅证明旧SHA。`354b`源码的完整verify `92378`真实exit1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项在该轮通过；history、cluster、build、VM等后置未运行，不得写成整包coverage/required通过。0059三表、八guard、八个非零根与全库743trigger已真实校准，不再是缺0058前置或零根草稿。
+本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合main/push；main仍clean `3414b43`，原CI仅证明旧SHA。`354b`源码的完整verify `92378`真实exit1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项在该轮通过；那一轮history、cluster、build、VM后置未运行，不得写成整包coverage/required通过。0059三表、八guard、八个非零根与全库743trigger已真实校准，不再是缺0058前置或零根草稿。
 
-两失败是当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳原30秒timeout。前者test-only窄修的正式required定向`69221`已1文件5pass；后者新源码由`68142`实际3文件237pass（shared166、maintenance64、scope7）及独立`9192`精确checkpoint Memory 1文件46pass复验，均零失败/跳过，不拼为一次4文件证明。原native定向8项达到断言、63项filtered，但coverage进程因全仓floors不足exit1；原完整verify仍exit1。`45834`typecheck、清单纯证明2文件119pass、secret scan748与diffcheck0通过，仅为分段证据。`verify-s3`、本轮未执行history/cluster/build/VM及最终SHA新CI仍待；旧schema原生artifact跨迁移续跑仍缺。新telemetry产品链虽已授权，须此包验收发布后另行实施。M1未冻结/M2冻结/M3未开始，默认off/production拒绝、0037 grant硬拒、0054 original-primary-only destructive、外部删除/自动清理off及completion=false不变。root统一执行测试/DB/build/Git，作者冻结后不擅改；精确事实见[PROGRESS](docs/PROGRESS.md)顶部与末节。
+两失败是当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳原30秒timeout。前者test-only窄修的正式required定向`69221`已1文件5pass；后者新源码由`68142`实际3文件237pass（shared166、maintenance64、scope7）及独立`9192`精确checkpoint Memory 1文件46pass复验，均零失败/跳过，不拼为一次4文件证明。原native定向8项达到断言、63项filtered，但coverage进程因全仓floors不足exit1；原完整verify仍exit1。`45834`typecheck、清单纯证明2文件119pass、secret scan748与diffcheck0通过，仅为分段证据。`c12cb43`后续`build:check`及无allowdirty clean VM双role检查分别exit0，六JS入口、SDK18文件/四CLI与Darwin arm64 Node24双包已验；两签名仅ephemeral-test-only、productionAccepted=false。完整coverage、history、cluster、完整`verify-s3`及最终SHA新CI仍待；旧schema原生artifact跨迁移续跑仍缺。新telemetry产品链虽已授权，须此包验收发布后另行实施。M1未冻结/M2冻结/M3未开始，默认off/production拒绝、0037 grant硬拒、0054 original-primary-only destructive、外部删除/自动清理off及completion=false不变。root统一执行测试/DB/build/Git，作者冻结后不擅改；精确事实见[PROGRESS](docs/PROGRESS.md)顶部与末节。
 
 ### BYOK WIP检查点历史（22:37，整合前）
 

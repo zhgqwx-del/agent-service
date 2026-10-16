@@ -1,8 +1,8 @@
 # BYOK 本系统责任来源与只读状态
 
-> 当前整合候选（2026-10-16，失败范围分段复验）：本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合但未合main/push；main仍clean`3414b43`。0059三表/八guard/八非零根及743-trigger已真实校准；`354b`源码完整verify `92378`退出1，主4382pass/2fail/86预期profile skip，0059 SQL整8项在该轮通过，而history/cluster/build/VM未运行。两失败为当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳30秒timeout。前者正式required定向`69221`已1文件5pass；后者新源码`68142`实际3文件237pass（shared166、maintenance64、scope7），独立`9192`精确checkpoint Memory 1文件46pass，均零失败/跳过，不拼同次4文件。原native定向8项达到断言、63项过滤，coverage进程仍因全仓floors不足退出1；原full仍exit1。最新typecheck、清单纯证明、secret scan/diffcheck是分段证据，不替代完整验收。精确证据与旧失败见[PROGRESS](../PROGRESS.md)顶部/末节，下方合同不因本轮结果改写。
+> 当前整合候选（2026-10-16，分段复验）：本地0058与BYOK整合已形成干净提交`c12cb43ae02b9252891a41c429c40bb7293bef8a`，未合main/push；main仍为`3414b43`。0059三表/八guard/八非零根及743-trigger已真实校准。`354b`源码完整verify `92378`退出1，主4382pass/2fail/86预期profile skip，0059 SQL整8项在该轮通过，该轮history/cluster/build/VM未运行；两失败后有fresh-schema 0037正式required `69221` 1文件5pass、`68142` 3文件237pass及独立`9192` checkpoint Memory 1文件46pass，不拼为全量成功。原native定向8项达到断言、63项过滤，但coverage进程因全仓floors不足退出1。当前c12另外独立通过`83919`的`pnpm build:check`和`36915`无allowdirty的`pnpm check:vm-release`；双role签名仅`ephemeral-test-only`、`productionAccepted=false`。最新typecheck、清单纯证明、secret scan/diffcheck仍是分段证据；精确证据与旧失败见[PROGRESS](../PROGRESS.md)顶部/末节，下方合同不因本轮结果改写。
 
-> 完整`verify-s3`、本轮未执行后置、旧schema原生跨迁移续跑及最终SHA新CI尚待；组合required143 unique/68groups、历史52仅登记。0058原180秒双跳178638.82ms的约1.36秒余量仍是风险，300秒请求未答且预算/断言不变。M1未冻结/M2冻结/M3未开始，0037/0054 original-primary-only、外部删除与自动清理关闭、旧收据不重签、unknown不提升、completion=false不变；这不是发布或生产验收。
+> 完整coverage、history、cluster、`verify-s3`、旧schema原生跨迁移续跑及最终SHA新CI尚待；组合required143 unique/68groups、历史52仅登记。c12的build/VM已另行通过，但不是`92378`当轮后置通过。0058原180秒双跳178638.82ms的约1.36秒余量仍是风险，300秒请求未答且预算/断言不变。M1未冻结/M2冻结/M3未开始，0037/0054 original-primary-only、外部删除与自动清理关闭、旧收据不重签、unknown不提升、completion=false不变；这不是发布或生产验收。
 
 ## 责任范围
 

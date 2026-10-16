@@ -2,9 +2,9 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
-本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合，未合main/push；main仍clean `3414b43`。`354b`源码的完整verify `92378`退出1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项通过，但history、cluster、build、VM未执行；原CI及旧定向不能证明新整包成功。0059三表/八guard/八非零根、全743trigger已真实校准，不再是缺0058前置的零根草稿。
+本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合main/push；main仍clean `3414b43`。`354b`源码的完整verify `92378`退出1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项通过，但该轮history、cluster、build、VM未执行；原CI及旧定向不能证明新整包成功。0059三表/八guard/八非零根、全743trigger已真实校准，不再是缺0058前置的零根草稿。
 
-两处失败是当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳原30秒timeout。正式required定向`69221`已1文件5pass；新源码的`68142`实际3文件237pass（shared166、maintenance64、scope7），独立`9192`另验checkpoint Memory 1文件46pass，均零失败/跳过，不合并成同次四文件结果。原native定向8项达到断言、63项filtered，但coverage进程因全仓floors不足exit1；原全量exit1不改写。`45834`typecheck、required清单纯证明2文件119pass、secret scan748/diffcheck0为后续分段检查，不能取代完整coverage。完整`verify-s3`、未执行history/cluster/build/VM与最终SHA新CI仍待；旧schema原生artifact跨迁移续跑仍缺。新telemetry产品链授权在此包验收发布后另做；默认off/production拒绝、0037/0054原primary-only、外部删除与自动清理关闭、completion=false，M1未冻结/M2冻结/M3未开始。精确报告见[PROGRESS](docs/PROGRESS.md)顶部与末节。
+两处失败是当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳原30秒timeout。正式required定向`69221`已1文件5pass；新源码的`68142`实际3文件237pass（shared166、maintenance64、scope7），独立`9192`另验checkpoint Memory 1文件46pass，均零失败/跳过，不合并成同次四文件结果。原native定向8项达到断言、63项filtered，但coverage进程因全仓floors不足exit1；原全量exit1不改写。`45834`typecheck、required清单纯证明2文件119pass、secret scan748/diffcheck0为后续分段检查，不能取代完整coverage。`c12cb43`后置`build:check`与无allowdirty clean VM双role发布包检查已各自exit0；两签名仅ephemeral-test-only、productionAccepted=false。完整coverage、history、cluster、完整`verify-s3`及最终SHA新CI仍待；旧schema原生artifact跨迁移续跑仍缺。新telemetry产品链授权在此包验收发布后另做；默认off/production拒绝、0037/0054原primary-only、外部删除与自动清理关闭、completion=false，M1未冻结/M2冻结/M3未开始。精确报告见[PROGRESS](docs/PROGRESS.md)顶部与末节。
 
 ### BYOK WIP检查点历史（22:37，整合前）
 

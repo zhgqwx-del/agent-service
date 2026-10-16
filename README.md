@@ -2,9 +2,9 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
-本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合，但未合入main或push；main仍为clean `3414b43`，其CI只证明旧SHA。`354b`源码的本轮完整verify `92378`真实退出**1**：主测试4382 passed / 2 failed / 86预期profile skipped，256文件为238 passed / 2 failed / 16 skipped。0059 SQL整8项在该轮通过；历史、cluster、build、VM等后置未运行，不存在本轮完整coverage/required或发布通过证明。0059三表/八guard/八非零根及743-trigger已真实校准，不再是缺0058前置或零根草稿。
+本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合为本地clean提交`c12cb43`，未合入main或push；main仍为clean `3414b43`，其CI只证明旧SHA。`354b`源码的完整verify `92378`真实退出**1**：主测试4382 passed / 2 failed / 86预期profile skipped，256文件为238 passed / 2 failed / 16 skipped。0059 SQL整8项在该轮通过；那一轮历史、cluster、build、VM后置未运行，不存在该轮完整coverage/required或发布通过证明。0059三表/八guard/八非零根及743-trigger已真实校准，不再是缺0058前置或零根草稿。
 
-两处主失败分别是当前fresh-schema 0037套件的错误oracle（并非历史迁移套件），以及Memory三跳只读链在原30秒预算下超时。前者test-only窄修后的正式required定向`69221`已exit0、1文件5pass；后者新源码的`68142`实际3文件237pass（shared166、maintenance64、scope7），另由`9192`独立精确运行checkpoint Memory 1文件46pass，均零失败/跳过，不能拼称同次4文件283项。此前native定向8项达到断言、63项过滤，但coverage进程因全仓阈值不足exit1；原完整verify仍exit1。当前typecheck`45834`通过、required登记143文件/68组且清单纯证明2文件119pass、secret scan748与diffcheck0，不代替完整coverage。完整`verify-s3`、history/cluster/build/VM等后置及最终SHA新CI仍待；旧schema原生制品跨迁移续跑也未交付。M1未冻结/M2冻结/M3未开始，默认off、production拒绝、0037 grant硬拒、0054原primary-only destructive、外部删除/自动清理关闭及completion=false不变，详见[PROGRESS](docs/PROGRESS.md)顶部与末节。
+两处主失败分别是当前fresh-schema 0037套件的错误oracle（并非历史迁移套件），以及Memory三跳只读链在原30秒预算下超时。前者test-only窄修后的正式required定向`69221`已exit0、1文件5pass；后者新源码的`68142`实际3文件237pass（shared166、maintenance64、scope7），另由`9192`独立精确运行checkpoint Memory 1文件46pass，均零失败/跳过，不能拼称同次4文件283项。此前native定向8项达到断言、63项过滤，但coverage进程因全仓阈值不足exit1；原完整verify仍exit1。typecheck`45834`通过、required登记143文件/68组且清单纯证明2文件119pass、secret scan748与diffcheck0，不代替完整coverage。`c12cb43`后续`build:check`及无allowdirty的双role clean VM发布包检查已分别exit0：六JS入口、SDK18文件/四CLI与Darwin arm64 Node24双包均验；两签名仅ephemeral-test-only、productionAccepted=false。完整coverage、history、cluster、完整`verify-s3`及最终SHA新CI仍待；旧schema原生制品跨迁移续跑也未交付。M1未冻结/M2冻结/M3未开始，默认off、production拒绝、0037 grant硬拒、0054原primary-only destructive、外部删除/自动清理关闭及completion=false不变，详见[PROGRESS](docs/PROGRESS.md)顶部与末节。
 
 ### BYOK WIP检查点历史（22:37，整合前）
 

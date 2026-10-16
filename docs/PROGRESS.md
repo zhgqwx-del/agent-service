@@ -1,6 +1,6 @@
 # 进度记录
 
-> **当前本地功能包（2026-10-16，失败范围分段复验）**：本地0058`24d5ae4`与BYOK WIP`21a5fe8`已整合，未合main或推送；main仍clean`3414b43`，旧CI不为新包背书。`354b`源码的完整verify `92378`退出**1**：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip；0059 SQL整8项在这轮通过，history、cluster、build、VM等后置未执行。两失败分别为当前fresh-schema 0037套件错误oracle（非历史迁移套件）与Memory64三跳原30秒timeout。前者正式required定向`69221`已1文件5pass；后者新源码`68142`实际3文件237pass（shared166、maintenance64、scope7），另由`9192`独立精确运行checkpoint Memory 1文件46pass，均零失败/跳过；两份报告不拼为同次4文件。原native定向8项虽达到断言、63项filtered，进程仍因全仓coverage floors不足exit1。最新`45834`typecheck通过，required143文件/68组仅登记、清单纯证明2文件119pass，secret scan748/diffcheck0；这不是完整coverage/required执行或整包通过。0059三表/八guard/八非零根/完整743-trigger已真实校准；`verify-s3`、未运行后置、旧schema原生跨迁移续跑及最终SHA新CI仍待。M1未冻结/M2冻结/M3未开始，0037/0054原primary-only、默认off/production拒绝、外部删除与自动清理off、全域completion=false不变；精确事实见新末节。
+> **当前本地功能包（2026-10-16，c12分段门禁）**：本地0058与BYOK整合已形成干净提交`c12cb43ae02b9252891a41c429c40bb7293bef8a`，未合main或推送；main仍为`3414b43`，旧CI不为新包背书。`354b`源码的完整verify `92378`退出**1**：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip；0059 SQL整8项在该轮通过，该轮history、cluster、build、VM后置未执行。两失败的后续分段复验分别为fresh-schema 0037正式required `69221` 1文件5pass，以及新源码`68142` 3文件237pass与独立`9192` checkpoint Memory 1文件46pass；两报告不拼为同次4文件。原native定向8项虽达到断言、63项filtered，进程仍因全仓coverage floors不足exit1。`45834` typecheck、required清单纯证明2文件119pass、secret scan748/diffcheck0为分段证据；required143文件/68组仅登记。**当前c12另已真实通过**`83919`的`pnpm build:check`及`36915`无allowdirty的`pnpm check:vm-release`：六JS入口、SDK/CLI产物与双role clean可发布VM均按各自门禁核对；签名仅`ephemeral-test-only`，`productionAccepted=false`。这不补写原`92378`结果，也不是完整coverage或整包全绿；完整history、cluster、`verify-s3`、旧schema原生跨迁移续跑及最终SHA新CI仍待。M1未冻结/M2冻结/M3未开始，0037/0054原primary-only、默认off/production拒绝、外部删除与自动清理off、全域completion=false不变；精确事实见新末节。
 
 以下为历史时间点快照；旧“源码冲突/缺前置/零根/未跑DB”不覆盖上述最新定向状态，历史通过与失败仍按原源码保留。
 
@@ -1744,3 +1744,10 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 已授权提前编码的旧原生制品恢复在`/Users/zhangguoqiang/.codex/worktrees/m4-schema-job/agent-service`、`codex/m1-native-artifact-upgrade`，基于`354b`的未提交WIP。包括target-only held GCM/import operator、固定0057/0058受限显式schema升级factory及source-free import授权消费者；目前没有真实纵向验证、CLI接线或runtime epoch retirement消费者，不能视为可合入、可激活或独立灾备已完成。其作者不得自行运行DB/S3/build或扩大当前release范围。
 - 完整verify的独占日志为`.local-run/m1-byok-repeat-full-20261015-42ff5ee7/verify-command.log`，原主JSON为`.local-run/coverage-attempt-AmKD9Z/tests.json`。本轮定向报告名见上节；这些ignored证据没有随Git提交，交接要保留本机路径。只读资源复核已确认原owned两库为0、grant fixture库为0、原owned Redis58120不再监听，磁盘仍约13GiB可用；没有授权清理其它binlog或业务数据。
 - 恢复工作先检查`git status`/`git worktree list`、本节与顶部快照，统一由一个root执行验证和Git；先完成当前包剩余门禁与发布，再启动新telemetry产品链。不要重复重建已终态失败的`92378`、改写原report、把分段合成为全量成功，或在用户未回答前放宽双跳180秒/单CLI120秒预算。
+
+## 2026-10-16：c12 clean构建与双role VM分段门禁
+
+- 本节实际验收源码为干净提交`c12cb43ae02b9252891a41c429c40bb7293bef8a`；后续文档检查点不改变该产品源码，main仍为`3414b43`，未合入或推送。原`354b`完整verify `92378`的exit1及当时未执行build/VM仍是历史事实，以下是新源码、另起的分段门禁，不把它们拼成一次全量通过。
+- `83919`实际执行`pnpm build:check`并exit0：runner五个与router一个JavaScript入口，SDK十八文件的可安装runtime/types/archive，四个CLI plain-Node artifacts，以及dist readiness/auth/forward/OpenAPI与独立metrics边界均通过。原始日志`m1-c12-build-check-20261016.log`保留。
+- `36915`严格执行`pnpm check:vm-release`（无allowdirty）并exit0，报告完成时间`2026-10-16T12:31:38.459Z`。双role同一c12、`dirty=false`、`publishable=true`，目标runtime为Darwin arm64/Node24；两个签名均已验证，但仅为`ephemeral-test-only`，`productionAccepted=false`。四个one-shot入口的canonical与symlink两种调用方式，以及readiness/auth/forward/OpenAPI和停后immutable检查均通过。原始报告`m1-c12-vm-release-proof-20261016.json`与同前缀VM日志保留。
+- 当前仍缺完整coverage、history、cluster、完整`verify-s3`及新CI的同一最终SHA验收；M1未冻结，原全量失败不可改写。另一独立native恢复WIP与SDK/Body drain仅有其自身typecheck和六份100项纯测试证据，尚无真实MySQL/MinIO旧制品纵向验收，不属于c12通过范围；原0037/0054、默认off与production拒绝、外部删除/自动清理关闭及`completion=false`均不变。
