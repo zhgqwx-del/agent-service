@@ -8,7 +8,7 @@
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
-14:47补记：超时残留已只读关联到同一fixture的3测试库/3桶17对象/1受保护临时制品目录，保留失败样本、不删；metadata不等于认证/删除授权，没有key/SQL/对象正文读取。所有验证进程已终态，单慢测预算待用户答、未push；下文“待核”是14:42时间点状态。
+15:02Z补记：原超时fixture的精确3库/17同run对象/3空桶已按普通隔离夹具清理，库复核0；加密目录/key/原失败报告保留，业务库及共享服务未动。14:53 verify-only冷启动约2.9秒、0059审计约4毫秒，仅诊断不是测试证明；不据此跨事务缓存、拆case或把cleanup移出180秒。所有验证已终态，单慢测300秒预算待用户答，原180/CLI120不变、未push；下方为此前时间点事实，精确结果见PROGRESS末节。
 
 最新分段（14:42Z）：release clean302435a包含f1 pristine恢复启动窄修与GET sidecar单测试修；定向真实1/SQL7/纯195、typecheck/scan748已过。完整S381885原8文件55pass、file9另1pass/R2180s timeout，后置tail27080已独立6文件28pass+sourceassembly、exit0。cluster原47148为8文件27pass1fail（GET遗漏0059 sidecar）；精确15字段whole toEqual补后27471只跑受影响整file3+正式T3g3，complete/cleanup=true。302的新build62201与strictclean VM94817各exit0，Darwin arm64/Node24、双role publishable、签名仅ephemeral-test-only/productionAccepted=false。300秒单慢测选择待用户答，原180/CLI120不改；未push/最终CI未开始，不拼全绿。原S3三个owned非空桶及内部fixture残留仍待精确核对，不能冒称全机清理。native跨迁移/高级生命周期P2、M3优先与原安全边界不变；下方为此前事实，详见PROGRESS末节。
 
