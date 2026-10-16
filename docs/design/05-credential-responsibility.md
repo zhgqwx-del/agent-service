@@ -1,8 +1,8 @@
 # BYOK 本系统责任来源与只读状态
 
-> 当前组合定向检查点（2026-10-15）：本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合，未合main/push，冻结检查点commit以独占全量日志sourceCommit为准。0059三表/八guard/八非零根/全743trigger已真实校准；SQL首整8为7pass/1夹具CAS失败，修后仅失败例1pass/7filtered，不称同次8/8。组合named四纯55项、capture三纯276项各零fail/skip，真实冻结LOCAL24d旧binary→0059历史3项通过，不称发布0058；新增BYOK真MySQL/MinIO selected3pass/18filtered、95.50秒，实际非空full import/维护续接/cold和恢复743guards后target业务拒绝均执行，首两轮0pass/3夹具失败保留。旧49/27、T1/T3a/T3b与责任rows保持；四处维护责任投影store5f3d7bf静态review无确定P0–P2，不替代功能包验收。精确报告见[PROGRESS](../PROGRESS.md)，下方合同/历史边界保留。
+> 当前整合候选（2026-10-16，失败范围分段复验）：本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合但未合main/push；main仍clean`3414b43`。0059三表/八guard/八非零根及743-trigger已真实校准；`354b`源码完整verify `92378`退出1，主4382pass/2fail/86预期profile skip，0059 SQL整8项在该轮通过，而history/cluster/build/VM未运行。两失败为当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳30秒timeout。前者正式required定向`69221`已1文件5pass；后者新源码`68142`实际3文件237pass（shared166、maintenance64、scope7），独立`9192`精确checkpoint Memory 1文件46pass，均零失败/跳过，不拼同次4文件。原native定向8项达到断言、63项过滤，coverage进程仍因全仓floors不足退出1；原full仍exit1。最新typecheck、清单纯证明、secret scan/diffcheck是分段证据，不替代完整验收。精确证据与旧失败见[PROGRESS](../PROGRESS.md)顶部/末节，下方合同不因本轮结果改写。
 
-> 最后两处test夹具修后typecheck、secret scan747及diffcheck通过；完整verify/verify-s3/新CI尚待，不可称可发布或生产验收。组合登记required142 unique/68groups、历史52仅登记。当前下一步coherent功能包冻结后一次完整verify及相关verify-s3，不再无界追加小切片。0058原180秒178638.82ms仅约1.36秒余量的CI风险与300秒待答保留，预算/断言不变；main仍clean3414、旧五CI仅证明旧SHA。M1未冻结/M2冻结/M3未开始，0037/0054原primary-only/外删自动off/旧收据不重签/unknown不提升/completion=false不变。
+> 完整`verify-s3`、本轮未执行后置、旧schema原生跨迁移续跑及最终SHA新CI尚待；组合required143 unique/68groups、历史52仅登记。0058原180秒双跳178638.82ms的约1.36秒余量仍是风险，300秒请求未答且预算/断言不变。M1未冻结/M2冻结/M3未开始，0037/0054 original-primary-only、外部删除与自动清理关闭、旧收据不重签、unknown不提升、completion=false不变；这不是发布或生产验收。
 
 ## 责任范围
 
@@ -33,7 +33,7 @@ T3a 在清除 live credential、退休版本和封存既有 inventory/receipt �
 
 新 schema 使用独立 family，不能追加到已发布 CP1 固定49族或重算其旧根。后续实际备份/恢复必须证明新表随真实 schema 制品保持，并由 startup/readiness 验真；旧 schema 原生制品跨迁移恢复不是本包已交付能力。
 
-独立审计边界：现有generic整库dump按实际schema包含0059物理表，但固定49/27族并不证明这些新表的责任关系；物理收集不能替代完整业务审计。后续须在真实备份窗口及恢复目标核对source与0026实际version/target、T3a精确版本集合及T1/T3b/readiness的完整关系，并执行真实恢复证明；当前尚待，不能声称责任证据已随备份恢复验收，也不为此另造CP3、重算旧根或提升unknown。
+独立审计边界：generic整库dump按实际schema包含0059物理表，但固定49/27族并不证明这些新表的责任关系；物理收集不能替代完整业务审计。现有source factory、exact-run/artifact维护入口及checkpoint inactive/active四处已接完整责任投影审计，真实MySQL/MinIO selected3项已验证非空责任full import、cold readiness及恢复目标743 guards还原后篡改sidecar的业务拒绝。它们不等于本包完整`verify`/`verify-s3`、旧schema原生跨迁移恢复或生产灾备验收；不为此另造CP3、重算旧根或提升unknown。
 
 ## Tenant 只读消费
 

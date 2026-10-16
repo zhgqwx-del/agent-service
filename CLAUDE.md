@@ -1,10 +1,10 @@
 # agent-service 项目记忆
 
-## 当前本地整合候选（2026-10-15，定向后待完整验收）
+## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
-本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已在`codex/m1-credential-responsibility-integration`整合，未合main/push；冻结检查点commit以独占全量日志sourceCommit为准。main仍clean3414，原五绿只证明旧SHA。0059真实校准三表/八guard/八非零根、全743trigger；SQL首整8为7pass/1夹具CAS失败，修后仅失败例1pass/7filtered，不称同次8/8。
+本地0058 `24d5ae4` + BYOK WIP `21a5fe8`已整合，未合main/push；main仍clean `3414b43`。`354b`源码的完整verify `92378`退出1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项通过，但history、cluster、build、VM未执行；原CI及旧定向不能证明新整包成功。0059三表/八guard/八非零根、全743trigger已真实校准，不再是缺0058前置的零根草稿。
 
-组合named四纯55项、capture三纯276项各零fail/skip；冻结LOCAL24d旧binary→0059历史3项通过，不冒称已发布0058。新增BYOK真MySQL/MinIO selected3pass/18filtered、95.50秒，包含真实full import及恢复743guards后target业务拒绝，首两轮0pass/3夹具失败均保留。四处维护责任投影store5f3d7bf静态review无确定P0–P2，不替代实测。最后两处test夹具修后typecheck、secret scan747及diffcheck通过；完整verify/verify-s3/新CI尚待。下一步coherent功能包冻结后一次完整verify/相关verify-s3，不再无界追加小切片；分段不累计，0058双跳原180秒仅约1.36秒余量、300秒仍未答且预算不改。M1未冻结/M2冻结/M3未开始及所有安全门禁不变，详见[PROGRESS](docs/PROGRESS.md)。
+两处失败是当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳原30秒timeout。正式required定向`69221`已1文件5pass；新源码的`68142`实际3文件237pass（shared166、maintenance64、scope7），独立`9192`另验checkpoint Memory 1文件46pass，均零失败/跳过，不合并成同次四文件结果。原native定向8项达到断言、63项filtered，但coverage进程因全仓floors不足exit1；原全量exit1不改写。`45834`typecheck、required清单纯证明2文件119pass、secret scan748/diffcheck0为后续分段检查，不能取代完整coverage。完整`verify-s3`、未执行history/cluster/build/VM与最终SHA新CI仍待；旧schema原生artifact跨迁移续跑仍缺。新telemetry产品链授权在此包验收发布后另做；默认off/production拒绝、0037/0054原primary-only、外部删除与自动清理关闭、completion=false，M1未冻结/M2冻结/M3未开始。精确报告见[PROGRESS](docs/PROGRESS.md)顶部与末节。
 
 ### BYOK WIP检查点历史（22:37，整合前）
 
@@ -24,7 +24,7 @@ M1 未冻结、M2 冻结、M3 未开始；默认 off、local-only / production �
 
 VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/SPKI pin 与选定 role/commit；未知工具不能自认证，失败无 unsigned fallback。它不等于生产信任根、环境晋级或云验收；长期服务/产品 JS 入口/镜像仍为 2/6/2。
 
-验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。已发布main清单为required133/64groups、历史50；组合候选required142 unique/68groups、历史52仅登记，不是52文件执行证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
+验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。已发布main清单为required133/64groups、历史50；组合候选required143 unique/68groups、历史52仅登记，不是执行证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
 
 下一步是冻结当前coherent组合包做一次完整verify与相关verify-s3，补齐剩余发布门禁，不再无界追加小切片。旧schema原生artifact跨迁移导入/升级/续跑仍缺；格式与历史读取兼容不是该能力证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不提前进入M3。
 

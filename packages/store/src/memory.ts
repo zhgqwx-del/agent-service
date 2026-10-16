@@ -29,6 +29,7 @@ import {
   telemetryCaptureLogsSourceRefSha256,
 } from "@agent-service/protocol";
 import { createHash, randomUUID } from "node:crypto";
+import { isProxy } from "node:util/types";
 import {
   BlobConflictError,
   BlobTooLargeError,
@@ -928,7 +929,52 @@ type MemoryCaptureRestoreMaintenanceContext = {
   originalRuntime: Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>;
   sourceRuntime: Extract<RestoreJournal.TenantRestoreRuntimeControlRecord, { state: "active" }>;
 };
+type MemoryCaptureReadAuditSelection = {
+  selector: Readonly<TenantTelemetryCaptureRestoreMaintenanceSelector> | null;
+  purpose: "operator" | "runtime";
+  historical: boolean;
+};
 const clone = <T>(v: T): T => structuredClone(v);
+
+/** Only inspect own data descriptors while forming a private read-memo key.
+ * JSON.stringify would invoke an untrusted getter or toJSON before the actual
+ * source validator has had a chance to reject the record. */
+function canonicalMemoryCaptureReadAuditData(value: unknown, seen = new Set<object>()): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+  if (typeof value !== "object" || isProxy(value) || seen.has(value)) throw new Error("invalid capture read audit data");
+  const array = Array.isArray(value);
+  const prototype = Object.getPrototypeOf(value);
+  if (array ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) {
+    throw new Error("invalid capture read audit data");
+  }
+  seen.add(value);
+  try {
+    const keys = Reflect.ownKeys(value);
+    if (array) {
+      const length = Object.getOwnPropertyDescriptor(value, "length")?.value;
+      if (!Number.isSafeInteger(length) || length < 0 || keys.length !== length + 1) {
+        throw new Error("invalid capture read audit data");
+      }
+      const children: string[] = [];
+      for (let index = 0; index < length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) throw new Error("invalid capture read audit data");
+        children.push(canonicalMemoryCaptureReadAuditData(descriptor.value, seen));
+      }
+      return `[${children.join(",")}]`;
+    }
+    if (keys.some((key) => typeof key !== "string")) throw new Error("invalid capture read audit data");
+    const fields: string[] = [];
+    for (const key of (keys as string[]).sort()) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value")) throw new Error("invalid capture read audit data");
+      fields.push(`${JSON.stringify(key)}:${canonicalMemoryCaptureReadAuditData(descriptor.value, seen)}`);
+    }
+    return `{${fields.join(",")}}`;
+  } finally { seen.delete(value); }
+}
 
 function sameTenantRestorePublicationIdentity(
   left: RestoreJournal.TenantRestoreJournalPublicationIdentity,
@@ -1632,6 +1678,50 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private captureRestoreMaintenanceReadContext?: MemoryCaptureRestoreMaintenanceContext;
   /** Synchronous recursion detection only, never durable proof or permission. */
   private readonly captureLineageAuditing = new Set<string>();
+  /** An ephemeral, successful-void-only memo. It exists solely inside one
+   * synchronous private read chain, never across a Promise or a Map write. */
+  private captureReadAuditFrame?: {
+    nonce: symbol;
+    keyIds: WeakMap<object, number>;
+    nextKeyId: number;
+    succeeded: Set<string>;
+    inflight: Set<string>;
+  };
+
+  private withMemoryCaptureReadAuditFrame<T>(read: () => T): T {
+    if (this.captureReadAuditFrame) return read();
+    const frame = { nonce: Symbol("memory-capture-read"), keyIds: new WeakMap<object, number>(),
+      nextKeyId: 0, succeeded: new Set<string>(), inflight: new Set<string>() };
+    this.captureReadAuditFrame = frame;
+    try { return read(); }
+    finally {
+      frame.succeeded.clear(); frame.inflight.clear();
+      if (this.captureReadAuditFrame === frame) this.captureReadAuditFrame = undefined;
+    }
+  }
+
+  private memoSuccessfulMemoryCaptureReadAudit(kind: "checkpoint" | "lineage", input: unknown, audit: () => void): void {
+    const frame = this.captureReadAuditFrame;
+    if (!frame) { audit(); return; }
+    const refKey = this.tenantTelemetryRefKeyForUse();
+    let keyId = frame.keyIds.get(refKey);
+    if (keyId === undefined) { keyId = ++frame.nextKeyId; frame.keyIds.set(refKey, keyId); }
+    // Re-hash the complete current record/context and actual key bytes on
+    // every lookup: an in-place mutation cannot turn an earlier success into
+    // authority. The digest and frame are never persisted or exposed.
+    let inputSha256: string;
+    try {
+      inputSha256 = createHash("sha256").update(kind).update("\0").update(refKey).update("\0")
+        .update(canonicalMemoryCaptureReadAuditData({ input,
+          maintenanceReadContext: this.captureRestoreMaintenanceReadContext ?? null })).digest("hex");
+    } catch { throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError(); }
+    const key = `${keyId}:${inputSha256}`;
+    if (frame.inflight.has(key)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+    if (frame.succeeded.has(key)) return;
+    frame.inflight.add(key);
+    try { audit(); frame.succeeded.add(key); }
+    finally { frame.inflight.delete(key); }
+  }
 
   constructor(
     private readonly storeClock: { now(): number } = { now: () => Date.now() },
@@ -2051,36 +2141,40 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return { capsule, leaves: rows.leaves };
   }
 
-  private auditMemoryCaptureLineageSnapshot(context: MemoryCaptureRestoreMaintenanceContext): void {
-    this.auditMemoryCaptureLineageRecord(context.record);
+  private auditMemoryCaptureLineageSnapshot(context: MemoryCaptureRestoreMaintenanceContext, historical = false): void {
+    this.auditMemoryCaptureLineageRecord(context.record, { selector: context.selector,
+      purpose: this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly === true ? "operator" : "runtime", historical });
   }
-  private auditMemoryCaptureLineageRecord(record: TenantTelemetryCaptureBackupCheckpointRecord): void {
+  private auditMemoryCaptureLineageRecord(record: TenantTelemetryCaptureBackupCheckpointRecord,
+    selection: MemoryCaptureReadAuditSelection): void {
     const checkpoint = record.checkpoint;
     if (checkpoint.scope !== CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE) return;
     if (this.captureLineageAuditing.has(checkpoint.backupId)) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
-    this.captureLineageAuditing.add(checkpoint.backupId);
-    try {
-    this.validateMemoryCaptureCheckpointRecord(checkpoint.backupId, record);
-    // Real validators reconstruct every mutable projector from its immutable
-    // event/run authority; snapshot HMAC is never a replacement for that proof.
-    this.assertTenantRestoreJournalGlobalRelations(); this.assertTenantRestoreReplayGlobalRelations();
-    this.assertTenantBackupCatalogGlobalRelations(); this.readTenantRestoreRuntimeControl();
-    const current = this.memoryCaptureLineageRows(checkpoint.backupId);
-    const actual = new Map(current.leaves.map((row) => [`${row.family}:${row.identityRefSha256}`, row]));
-    for (const leaf of record.lineageLeaves!) {
-      const row = actual.get(`${leaf.family}:${leaf.identityRefSha256}`);
-      const spec = CaptureRestore.TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL.find((candidate) => candidate.family === leaf.family)!;
-      if (!row || (spec.evolution !== "frontier" && row.recordHmacSha256 !== leaf.recordHmacSha256)
-        || row.sourceHighWaterDbMs < leaf.sourceHighWaterDbMs) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
-    }
-    // All linked immutable rows, including the activation event itself, must
-    // still be the exact rows authenticated in the selected artifact.
-    for (const ancestor of checkpoint.lineage.ancestors) {
-      const actualContext = this.memoryCaptureHistoricalContext(ancestor.restoreRunId,
-        this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly === true ? "operator" : "runtime");
-      if (actualContext.record.checkpoint.checkpointSha256 !== ancestor.checkpointSha256) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
-    }
-    } finally { this.captureLineageAuditing.delete(checkpoint.backupId); }
+    this.memoSuccessfulMemoryCaptureReadAudit("lineage", { record, selection }, () => {
+      this.captureLineageAuditing.add(checkpoint.backupId);
+      try {
+        this.validateMemoryCaptureCheckpointRecord(checkpoint.backupId, record, selection);
+        // Real validators reconstruct every mutable projector from its immutable
+        // event/run authority; snapshot HMAC is never a replacement for that proof.
+        this.assertTenantRestoreJournalGlobalRelations(); this.assertTenantRestoreReplayGlobalRelations();
+        this.assertTenantBackupCatalogGlobalRelations(); this.readTenantRestoreRuntimeControl();
+        const current = this.memoryCaptureLineageRows(checkpoint.backupId);
+        const actual = new Map(current.leaves.map((row) => [`${row.family}:${row.identityRefSha256}`, row]));
+        for (const leaf of record.lineageLeaves!) {
+          const row = actual.get(`${leaf.family}:${leaf.identityRefSha256}`);
+          const spec = CaptureRestore.TENANT_TELEMETRY_CAPTURE_LINEAGE_SQL.find((candidate) => candidate.family === leaf.family)!;
+          if (!row || (spec.evolution !== "frontier" && row.recordHmacSha256 !== leaf.recordHmacSha256)
+            || row.sourceHighWaterDbMs < leaf.sourceHighWaterDbMs) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+        // All linked immutable rows, including the activation event itself, must
+        // still be the exact rows authenticated in the selected artifact.
+        for (const ancestor of checkpoint.lineage.ancestors) {
+          const actualContext = this.memoryCaptureHistoricalContext(ancestor.restoreRunId,
+            this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly === true ? "operator" : "runtime");
+          if (actualContext.record.checkpoint.checkpointSha256 !== ancestor.checkpointSha256) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
+        }
+      } finally { this.captureLineageAuditing.delete(checkpoint.backupId); }
+    });
   }
 
   async sealTenantTelemetryCaptureBackupCheckpoint(input: SealTenantTelemetryCaptureBackupCheckpointInput)
@@ -2102,7 +2196,13 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     return { disposition: "created", value: outbound };
   }
 
-  private validateMemoryCaptureCheckpointRecord(backupId: string, record: TenantTelemetryCaptureBackupCheckpointRecord): void {
+  private validateMemoryCaptureCheckpointRecord(backupId: string, record: TenantTelemetryCaptureBackupCheckpointRecord,
+    selection?: MemoryCaptureReadAuditSelection): void {
+    if (!selection) { this.validateMemoryCaptureCheckpointRecordUnmemoized(backupId, record); return; }
+    this.memoSuccessfulMemoryCaptureReadAudit("checkpoint", { backupId, record, selection },
+      () => this.validateMemoryCaptureCheckpointRecordUnmemoized(backupId, record));
+  }
+  private validateMemoryCaptureCheckpointRecordUnmemoized(backupId: string, record: TenantTelemetryCaptureBackupCheckpointRecord): void {
     const v2 = record.checkpoint.scope === CaptureRestore.TENANT_TELEMETRY_CAPTURE_CHECKPOINT_V2_SCOPE;
     if (Object.keys(record).sort().join(",") !== (v2 ? "checkpoint,leaves,lineageLeaves" : "checkpoint,leaves") || record.checkpoint.backupId !== backupId) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
@@ -2196,7 +2296,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
    * This validates immutable selection, not live unchanged, runtime activation or write authority. */
   private selectMemoryCaptureRestoreCheckpoint(entry: BackupCatalog.TenantBackupCatalogEntry,
     anchor: BackupCatalog.TenantBackupSnapshotAnchor, selected: string | undefined,
-    purpose: "operator" | "runtime" = "operator"): TenantTelemetryCaptureBackupCheckpointRecord | null {
+    purpose: "operator" | "runtime" = "operator",
+    auditSelection?: { selector: Readonly<TenantTelemetryCaptureRestoreMaintenanceSelector>; historical: boolean })
+    : TenantTelemetryCaptureBackupCheckpointRecord | null {
     const activation = this.persistedProviderCaptureActivation;
     if (!activation) {
       this.assertTenantTelemetryWriterGlobalRelations();
@@ -2212,8 +2314,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     PersistedCapture.validatePersistedProviderCaptureActivationReceipt(activation);
     const record = this.tenantTelemetryCaptureBackupCheckpoints.get(entry.backupId);
     if (!record) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
-    this.validateMemoryCaptureCheckpointRecord(entry.backupId, record);
-    this.auditMemoryCaptureLineageRecord(record);
+    const selection: MemoryCaptureReadAuditSelection = { selector: auditSelection?.selector ?? null,
+      purpose, historical: auditSelection?.historical ?? false };
+    this.validateMemoryCaptureCheckpointRecord(entry.backupId, record, selection);
+    this.auditMemoryCaptureLineageRecord(record, selection);
     const checkpoint = record.checkpoint;
     const lifecycle = this.readMemoryTenantTelemetryLifecycleControl();
     const target = this.tenantTelemetryLifecycleTargets.get("logs");
@@ -2305,6 +2409,12 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   private memoryCaptureMaintenanceContext(selector: Readonly<TenantTelemetryCaptureRestoreMaintenanceSelector>,
     purpose: "operator" | "runtime" = "operator", historical = false, visiting: ReadonlySet<string> = new Set())
     : MemoryCaptureRestoreMaintenanceContext {
+    return this.withMemoryCaptureReadAuditFrame(() =>
+      this.memoryCaptureMaintenanceContextRead(selector, purpose, historical, visiting));
+  }
+  private memoryCaptureMaintenanceContextRead(selector: Readonly<TenantTelemetryCaptureRestoreMaintenanceSelector>,
+    purpose: "operator" | "runtime", historical: boolean, visiting: ReadonlySet<string>)
+    : MemoryCaptureRestoreMaintenanceContext {
     validateTenantTelemetryCaptureRestoreMaintenanceSelector(selector);
     if (process.env.NODE_ENV === "production"
       || (purpose === "operator" ? this.memoryOptions.tenantTelemetryCaptureRestoreLocalOnly !== true
@@ -2337,7 +2447,8 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
         && (candidate.phase === "prepared" || candidate.phase === "replay_sealed")))) {
       throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     }
-    const record = this.selectMemoryCaptureRestoreCheckpoint(entry, anchor, selector.checkpointSha256, purpose);
+    const record = this.selectMemoryCaptureRestoreCheckpoint(entry, anchor, selector.checkpointSha256, purpose,
+      { selector, historical });
     if (!record) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
     this.assertMemoryCaptureRestoreBackupBinding(record, entry, binding, reservation);
     const sourceRuntime = this.tenantRestoreRuntimeControlEvents.get(record.checkpoint.sourceRuntimeControlGeneration);
@@ -2437,6 +2548,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
   /** Actual immutable history is read authority only. A separate stored
    * cutover is required before this context can supply the current writer tuple. */
   private memoryRestoredCaptureContext(requireCutover = true) {
+    return this.withMemoryCaptureReadAuditFrame(() => this.memoryRestoredCaptureContextRead(requireCutover));
+  }
+  private memoryRestoredCaptureContextRead(requireCutover: boolean) {
     const runtime = this.readTenantRestoreRuntimeControl();
     if (runtime.state !== "active" || runtime.lineageKind !== "restore" || !runtime.restoreRunId) {
       if (this.tenantTelemetryCaptureEpochCutovers.size || this.tenantTelemetryCaptureRecoveryPermits.size) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
@@ -2651,7 +2765,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       if (historical && live) throw new CaptureRestore.TenantTelemetryCaptureRestoreIntegrityError();
       const context = this.memoryCaptureMaintenanceContext(selected, "operator", historical);
       const current = this.readTenantRestoreRuntimeControl();
-      if (historical) this.auditMemoryCaptureLineageSnapshot(context);
+      if (historical) this.auditMemoryCaptureLineageSnapshot(context, true);
       else if (current.state === "active" && current.lineageKind === "restore" && current.restoreRunId === selected.restoreRunId
         && this.tenantTelemetryCaptureEpochCutovers.get(selected.restoreRunId)) {
         // Only the selected already-active run can use its post-cutover audit.
@@ -3575,6 +3689,9 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
       activationEvidenceSha256: receipt.receiptSha256, receipt }) : { domain: "logs", state: "inactive", controlGeneration: 0 };
   }
   async getTenantTelemetryPersistedProviderCaptureBinding() {
+    return this.withMemoryCaptureReadAuditFrame(() => this.getTenantTelemetryPersistedProviderCaptureBindingRead());
+  }
+  private getTenantTelemetryPersistedProviderCaptureBindingRead() {
     const receipt = this.assertMemoryPersistedProviderCaptureControl();
     if (!receipt) return null;
     const context = this.captureRestoreMaintenanceReadContext ? null : this.memoryRestoredCaptureContext();

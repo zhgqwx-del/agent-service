@@ -101,6 +101,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/store/test/tenant-telemetry-capture-checkpoint.memory.test.ts",
   "packages/store/test/tenant-telemetry-capture-checkpoint.mysql.test.ts",
   "packages/store/test/tenant-telemetry-capture-restore-maintenance.memory.test.ts",
+  "packages/store/test/tenant-telemetry-capture-readonly-scope.test.ts",
   "packages/store/test/tenant-telemetry-capture-restore-maintenance.mysql.test.ts",
   "packages/store/test/tenant-telemetry-capture-epoch-cutover.mysql.test.ts",
   "packages/store/test/tenant-telemetry-capture-repeat-restore.mysql.test.ts",
@@ -158,7 +159,8 @@ export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
   "test:tenant-telemetry-capture-restore": [
     "packages/store/test/tenant-telemetry-capture-restore.test.ts",
     "packages/store/test/tenant-telemetry-capture-checkpoint.memory.test.ts",
-    "packages/store/test/tenant-telemetry-capture-restore-maintenance.memory.test.ts"
+    "packages/store/test/tenant-telemetry-capture-restore-maintenance.memory.test.ts",
+    "packages/store/test/tenant-telemetry-capture-readonly-scope.test.ts"
   ],
   "test:tenant-telemetry-capture-restore-mysql": [
     "packages/store/test/tenant-telemetry-capture-checkpoint.mysql.test.ts",

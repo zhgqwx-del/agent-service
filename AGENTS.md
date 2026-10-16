@@ -1,10 +1,10 @@
 # agent-service 协作约定
 
-## 当前本地整合候选（2026-10-15，定向后待完整验收）
+## 当前本地整合候选（2026-10-16，失败范围已分段复验）
 
-本树已整合本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`，尚未合入main或push；冻结检查点commit以独占全量日志的sourceCommit为准。main仍clean3414，原五CI仅证明旧SHA。0059已真实校准三表/八guard/八个非零根/全库743trigger；SQL首整8项为7pass/1夹具CAS失败，修夹具后仅该例1pass/7filtered，不称同次8/8。
+本地0058 `24d5ae4` 与BYOK WIP `21a5fe8`已整合，未合main/push；main仍clean `3414b43`，原CI仅证明旧SHA。`354b`源码的完整verify `92378`真实exit1：主4382pass/2fail/86预期profile skip，256文件238pass/2fail/16skip。0059 SQL整8项在该轮通过；history、cluster、build、VM等后置未运行，不得写成整包coverage/required通过。0059三表、八guard、八个非零根与全库743trigger已真实校准，不再是缺0058前置或零根草稿。
 
-组合named四纯55项、capture三纯276项各零fail/skip；真实冻结LOCAL24d旧binary→0059历史3项通过，不称发布0058。新增BYOK真实MySQL/MinIO selected3pass/18filtered、95.50秒，非空责任full import/维护续接/cold及恢复743guards后业务损坏的target拒绝均到达断言；前两轮0pass/3夹具失败保留。四处维护投影接线store5f3d7bf静态review无确定P0–P2，不代替实测；最后两处test夹具修后typecheck、secret scan747及diffcheck通过，完整verify/verify-s3/新CI尚待。当前先冻结coherent功能包做一次完整verify及相关verify-s3，不继续无限小切片。旧分段不累计，0058原180秒178638.82ms的约1.36秒余量仍有CI风险、300秒未答且预算不改。M1未冻结/M2冻结/M3未开始与0037/0054原primary-only/off/completion=false等边界不变，详见[PROGRESS](docs/PROGRESS.md)。
+两失败是当前fresh-schema 0037套件错误oracle（不是历史迁移套件）及Memory64三跳原30秒timeout。前者test-only窄修的正式required定向`69221`已1文件5pass；后者新源码由`68142`实际3文件237pass（shared166、maintenance64、scope7）及独立`9192`精确checkpoint Memory 1文件46pass复验，均零失败/跳过，不拼为一次4文件证明。原native定向8项达到断言、63项filtered，但coverage进程因全仓floors不足exit1；原完整verify仍exit1。`45834`typecheck、清单纯证明2文件119pass、secret scan748与diffcheck0通过，仅为分段证据。`verify-s3`、本轮未执行history/cluster/build/VM及最终SHA新CI仍待；旧schema原生artifact跨迁移续跑仍缺。新telemetry产品链虽已授权，须此包验收发布后另行实施。M1未冻结/M2冻结/M3未开始，默认off/production拒绝、0037 grant硬拒、0054 original-primary-only destructive、外部删除/自动清理off及completion=false不变。root统一执行测试/DB/build/Git，作者冻结后不擅改；精确事实见[PROGRESS](docs/PROGRESS.md)顶部与末节。
 
 ### BYOK WIP检查点历史（22:37，整合前）
 
@@ -26,7 +26,7 @@ config-only/secret沿用不能提升legacy，新key不提升header/endpoint或�
 - 多轮相关且已定向验证的修改形成 coherent 功能包，冻结后做一次完整 `verify` 及相关 `verify-s3`；独立历史、S3、cluster、SDK、实际 bundle/VM 门禁不省略。
 - 完整运行失败时保留原报告和其中已通过的结果，只修缺陷、复验失败及受影响范围，并补剩余门禁；分段结果不拼成一次全量成功。最终发布证据必须对应实际源码/提交。
 - 较大阶段集中提交推送一次并等最终 SHA 的完整 CI，不为小补丁反复 push/取消长 CI；不降低 coverage 阈值、放大 deadline、跳过用例或泛化错误 oracle。
-- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。已发布main登记required133/64groups、历史50；本次组合登记required142 unique/68groups、历史52，仅登记不等于52文件已执行。root统一test/build/DB/Git，author冻结后不擅改。
+- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。已发布main登记required133/64groups、历史50；本次组合登记required143 unique/68groups、历史52，仅登记不等于执行。root统一test/build/DB/Git，author冻结后不擅改。
 
 ## 不变的安全与交付边界
 

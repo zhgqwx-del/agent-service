@@ -1,6 +1,6 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 本 worktree 当前是 `0059` BYOK责任的独立预编码分支，不用于普通启动或部署；草稿迁移尚未整合真实0058前置或校准。需要手动体验时使用已发布main3414，当前分支状态只看PROGRESS顶部/末节。新责任设计见[BYOK责任合同](../design/05-credential-responsibility.md)，不新增服务/进程/JS入口/镜像；下方旧候选验收数字不代表本包通过。
+> 本 worktree 是0058与0059的本地整合候选（2026-10-16），未合main/push，不用于普通启动或部署；main仍clean`3414b43`。0059已整合0058前置并真实校准三表/八guard/八非零根及743-trigger，不再是零根草稿。`354b`源码完整verify `92378`退出1：主4382pass/2fail/86预期profile skip；0059 SQL整8项在该轮通过，history/cluster/build/VM后置未运行。当前fresh-schema 0037套件错误oracle（非历史迁移套件）的正式required定向`69221`已1文件5pass；Memory新源码`68142`实际3文件237pass和独立`9192` checkpoint Memory 1文件46pass均零失败/跳过，不可合并成一次4文件结果。原native定向coverage进程仍exit1；完整coverage、`verify-s3`、后置门禁及新CI待验。手动体验仍用已发布main；当前事实看[PROGRESS](../PROGRESS.md)顶部/末节，责任合同见[BYOK责任合同](../design/05-credential-responsibility.md)。本候选不新增服务/进程/JS入口/镜像。
 
 > 离线VM签名候选（2026-10-15，未发布验收）：私钥格式正则触发的secret-scanner边界误报已等价改写、未加白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770、proof工具119），API/typecheck通过。代码提交d671632的darwin/arm64/Node24 clean双包于07:35:46.954Z实际通过，仅ephemeral-test-only签名、productionAccepted=false；最终文档提交的整树和新Linux CI仍待。required新增3文件至123、62个旧group不变，VM group现为7文件。原817 CI test失败/两个image成功；b575集中全量实际3164 passed/5 failed、后置未跑，不能称新全量或CI全绿。详细事实只看PROGRESS末节。
 
@@ -352,7 +352,7 @@ schema-root v2只消除明确表/列charset-collation下已证冗余显示，独
 
 0058候选尚待完整验收的链是：primary真正backup1→fresh DB1／never-used epoch1单次恢复→该restore1产生新failure并保留合法旧pending→真正新backup2→另一fresh DB2／never-used epoch2再恢复。backup1的checkpoint v1／`ASMYSQL2`不改；backup2用checkpoint v2／`ASMYSQL3`绑定49类来源及27类实际祖先投影，旧CP、P1、descriptor与unknown语义不重释。两次都复用现有五个selected命令，仍仅两服务／六JS入口／两镜像，不新增CLI或daemon；VM与容器形态不变。
 
-受保护source使用独立backup-source maintenance，prepared target使用exact-run maintenance，普通runner写入另需runtime gate和fresh fleet proof，三者不能互相借权。source prepare后不再读取/镜像fenced source，导入前以完整外部链及exact reservation复核；历史制品exact replay不要求今日head未变。候选还在reserve/import之前核实际source migration root与认证anchor，拒绝不匹配；这不是旧schema原生import→upgrade→continuation的实现。0058八个fingerprint根已真实校准并填入，受影响SQL、冻结旧二进制历史与单跳分别已有实测；新增双跳到达第二次恢复及P2 claim／ACK，但原180秒总预算两次超时，最终新Pi、再次冷启动与清理未获完整证明。最新只读启动审计去重的纯测试及局部SQL定向不能替代双跳或整包验收；300秒预算只是在询问用户，当前180秒、各CLI预算及全部门禁不变。分段证据不能拼成一次通过，本节不构成激活许可；具体报告见[PROGRESS](../PROGRESS.md)顶部与末节，操作边界见[0058运维说明](local-and-deployment.md#0058-重复备份恢复候选尚未真实验收)。默认关闭、production拒绝、0037／0054删除门禁、外部删除／自动清理关闭和completion=false不变。
+受保护source使用独立backup-source maintenance，prepared target使用exact-run maintenance，普通runner写入另需runtime gate和fresh fleet proof，三者不能互相借权。source prepare后不再读取/镜像fenced source，导入前以完整外部链及exact reservation复核；历史制品exact replay不要求今日head未变。候选还在reserve/import之前核实际source migration root与认证anchor，拒绝不匹配；这不是旧schema原生import→upgrade→continuation的实现。0058八个fingerprint根已真实校准并填入，冻结旧二进制历史、单跳及一次原180秒完整双跳178638.82ms已有各自定向实测，但双跳仅约1.36秒余量，不证明稳定时延或本包成功。0059责任维护四入口已接完整审计；真实MySQL/MinIO selected3项到达非空责任full import/cold及恢复743guards后业务损坏拒绝。`354b`完整verify仍exit1；其后fresh-schema 0037定向5项、Memory实际3文件237项及另一次checkpoint46项分别通过，新只读scope的native定向8项达到断言但coverage进程因全仓floors退出1。组合required143文件/68组只是登记，清单纯证明2文件119项及typecheck、secret scan/diffcheck均不代替完整主coverage；history/cluster/build/VM后置、完整`verify-s3`与最终SHA新CI也未验。300秒预算只是在询问用户，当前180秒、各CLI预算及全部门禁不变；分段证据不能拼成一次通过。本节不构成激活许可，报告见[PROGRESS](../PROGRESS.md)顶部与末节，操作边界见[0058运维说明](local-and-deployment.md#0058-重复备份恢复候选尚未真实验收)。默认关闭、production拒绝、0037／0054删除门禁、外部删除／自动清理关闭和completion=false不变。
 
 ### 离线 filesystem→S3 mover 手工演练（只用可丢弃数据）
 
