@@ -4,6 +4,7 @@ import {
   INTERNAL_TENANT_ERASURE_ACTOR_HEADER,
   INTERNAL_TENANT_ERASURE_CONTROL_PATH_PREFIX,
   INTERNAL_TENANT_ERASURE_REPLAY_PATH,
+  type TenantErasureStatusResponse,
 } from "../../packages/protocol/src/index.js";
 import {
   api,
@@ -106,13 +107,35 @@ describe.skipIf(!enabled)("cluster: platform tenant-erasure admission", () => {
       audit_type: "erasure/gated",
     });
 
-    const status = await api<TenantErasureResponse>(
+    const status = await api<TenantErasureStatusResponse>(
       cluster.router.url,
       `/v1/tenant-erasure-requests/${request.id}?tenantId=t_cluster`,
       { headers: platformHeaders() },
     );
     expect(status.status).toBe(200);
-    expect(status.body).toEqual(request);
+    // GET adds the closed 0059 observation; admission/replay POST above keeps its exact
+    // seven-field contract. No worker has cleared credentials or established remote scope.
+    const expectedStatus: TenantErasureStatusResponse = {
+      ...request,
+      credentialResponsibility: {
+        schema: "tenant-credential-responsibility-status-v1",
+        status: "unknown",
+        localDatabase: "not_cleared",
+        trackedRuntimeReferences: "unknown",
+        remoteCredentials: "unknown",
+        sharedKeys: "platform_shared_not_tenant_deletable",
+        backupCopies: "unknown",
+        otherCopies: "unknown",
+        versionCount: null,
+        customerManagedApiKeyCount: null,
+        unknownMaterialCount: null,
+        executionReady: false,
+        externalAuthorityVerified: false,
+        allDomainsComplete: false,
+        contentPurgeExecuted: false,
+      },
+    };
+    expect(status.body).toEqual(expectedStatus);
     expect(status.headers.get("cache-control")).toBe("no-store");
     expect(status.headers.get("x-content-type-options")).toBe("nosniff");
     expect(status.headers.get("x-agent-service-tenant-erasure-route")).toBeNull();
