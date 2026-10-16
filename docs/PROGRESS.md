@@ -1,6 +1,6 @@
 # 进度记录
 
-> **用户预算选择已确认（2026-10-16）**：明确允许仅完整R2双跳it采用300秒总预算；原single-hop180、所有CLI120、lease/生产时限及全部真实恢复/ACK/新Pi/冷启动/清理断言不变。这里只改测试期限并准备真实整文件复验，不新增通过/CI证明；下方“待用户答/原180不改”保留历史时间点，不再据此阻断当前包收口。发布后先体验、M3、必要M4，再P2的顺序不变。
+> **最新本地收口（2026-10-16T16:02Z）**：用户批准仅完整R2 it300秒后，clean1e21d20在全新隔离MySQL/MinIO执行正式整文件2pass/0fail/0skip，single55.923秒、R2187.924秒，含最终cold/cleanup；专属base及3空桶清理完成。single180/CLI120/lease/生产时限和全部断言不变。当前包失败受影响与剩余本地门禁已分段收口，不拼一次全量绿；最终main SHA必须以完整coverage/required/history/S3/cluster/镜像的5项Checks为准，不借旧CI。下方待答/待复验均为历史时点，精确证据见末节；收口后先体验、M3、必要M4，再P2。
 
 > **诊断与隔离清理补记（2026-10-16T15:02Z）**：只读正常cold connect约2.9秒、0059审计约4毫秒，不是R2完整验收或新增cache依据。原超时fixture精确3测试库、17同run对象和3空桶已清理，库复核0；加密制品目录/key及原失败报告保留，未动业务库/共享服务。全部验证终态，300秒选择仍待用户答，原180/CLI120未改、未push；下方14:47/14:42状态仅保留当时时点，精确证据见末节。
 
@@ -1810,3 +1810,11 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 
 - 用户已回答“允许单条慢测300秒（推荐）”。仅将`telemetry-capture-restore.mysql-s3.test.ts`中`exerciseCaptureRestore(true)`的it预算180000→300000，注释说明完整两次真实恢复含最终cold/cleanup；single-hop仍180000，CLI120、lease、生产超时及所有恢复/ACK/newPi/冷启动/清理和安全断言均不改。没有skip/filter、拆case、移走cleanup、产品缓存或新增能力；原180秒通过/超时和分段报告全部保留。
 - 四facts顶部同步该选择，历史“待用户答/原180不改”不再作为当前阻断。准备在冻结clean检查点、全新隔离MySQL/MinIO资源上执行正式required wrapper的完整2例文件，无.env或真实模型调用；截至本条未启动，不预写通过。之后根据实际结果集中提交/推送main并等待最终SHA全部CI；保留0058冻结binary依赖的24d祖先，不合入native或CI分片P2候选。
+
+## 2026-10-16T16:02Z：获准300秒后的正式完整恢复文件通过，本地收口待最终Checks
+
+- clean检查点`1e21d2017688ae3c78972f1456df8a8def44288f`只将R2完整it180→300及注释/授权文档更新；64188 typecheck实际exit0、scan748与diff/stagedcheck0。独立只读终审确认single-hop180、CLI120、lease/生产期限、全部断言/cleanup位置和skip/filter均不变，无产品代码或迁移改动；原完整失败与既有分段报告全部保留。
+- `27317`在全新隔离MySQL/MinIO上执行正式`pnpm test:telemetry-capture-restore-mysql-s3`整文件，无filter，15:58:02.403Z开始、16:02:09.773Z launcher exit0。实际JSON startTime1792166282759、exact file、两条passed逐项核对，2pass/0fail/0pending/0todo；single55923.381708ms、R2187924.452916ms。R2新Pi180869ms、最终cold184758ms、cleanup_end187922ms，确实不是180秒内完成，也不声称性能优化。原重建/ACK/物理字节、新Pi、fresh cold、安全输出及清理断言均真实执行。
+- 独占`.local-run/m1-r2-approved-recheck-20261016-fe42a0262f89/{launcher.jsonl,required-two-case-report.json,result.json}`保留，旧报告另存preexisting-required-report。最终临时launcher SHA256为`b18e5d4d4ce0844ef45d2b95bb4d3a5765922ae34718fe8da97e73ce48aa5e47`，只记录闭合stage/elapsed和元数据，不打印raw依赖输出或key。此前四次launcher在fresh bucket preflight因冻结credential对象与SDK不兼容而exit1，均未创建资源或执行病例；修正临时launcher后实际运行，不改产品/S3协议或oracle，不能把这些启动失败当恢复病例红或通过。
+- suite两个case的finally正常完成；launcher只删除自己创建且已校空的3桶与随机base`agent_service_test_r2_20261016_fe42a0262f89`，result suitePassed=true/cleanupDeferred=false/deletedBaseDatabase=true/deletedEmptyBuckets=3，源码前后clean同SHA。没读.env/真实模型key、没调用付费模型或操作业务库/共享服务；此前57109清理的旧失败样本加密目录和报告仍保留，不能称全机无残留。
+- 本包主阶段失败影响、历史两组夹具、普通pristine恢复、cluster GET oracle、S3后置与R2、最新产品build/严格VM均有各自实际分段证据，不重复跑已过完整本地全量，也不拼成一次本地coverage成功。接下来集中发布并核对最终main提交的test-core/test-history/两个image/test共5项Checks；本记录只记提交前真实事实，不预写CI结果。main发布需保留24d冻结历史祖先，不squash或合入native/CI分片P2；M1未冻/M2冻/M3未始，发布后尽早体验→M3→必要M4→P2，0037/0054/旧receipt/unknown/default-off/completion门禁不变。
