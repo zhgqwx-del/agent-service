@@ -40,10 +40,10 @@ const DATA_GOVERNANCE_V1 = [
 ] as const;
 
 describe("RunnerRegistry owner address mapping", () => {
-  it.each(["mcp", "skills"] as const)("intersects %s across every configured runner instead of only the healthy subset", async (feature) => {
+  it.each(["mcp", "skills", "hooks"] as const)("intersects %s across every configured runner instead of only the healthy subset", async (feature) => {
     let secondState: "active" | "missing" | "stale" | "unhealthy" | "empty" = "active";
-    const supports = (registry: RunnerRegistry) => feature === "mcp"
-      ? registry.allConfiguredSupportMcp() : registry.allConfiguredSupportSkills();
+    const supports = (registry: RunnerRegistry) => feature === "mcp" ? registry.allConfiguredSupportMcp()
+      : feature === "skills" ? registry.allConfiguredSupportSkills() : registry.allConfiguredSupportHooks();
     const supportedValue = feature === "mcp" ? ["streamable-http"] : true;
     const unsupportedValue = feature === "mcp" ? [] : false;
     const capabilities = (supported: boolean, protocolVersion: string = PROTOCOL_VERSION) => ({
@@ -57,6 +57,7 @@ describe("RunnerRegistry owner address mapping", () => {
         dynamicTools: true,
         mcp: feature === "mcp" && supported ? ["streamable-http"] : [],
         skills: feature === "skills" && supported,
+        hooks: feature === "hooks" && supported,
         sandbox: ["none"],
         byok: true,
       },

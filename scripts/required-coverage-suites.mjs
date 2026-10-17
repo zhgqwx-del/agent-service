@@ -14,6 +14,10 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "apps/agent-runner/test/cli-entrypoint.test.ts",
   "apps/agent-runner/test/config.test.ts",
   "apps/agent-runner/test/credential-responsibility-http.test.ts",
+  "apps/agent-runner/test/hooks-config.test.ts",
+  "apps/agent-runner/test/hooks-runtime.test.ts",
+  "apps/agent-runner/test/hooks-vertical.test.ts",
+  "apps/agent-runner/test/hooks-vertical.mysql.test.ts",
   "apps/agent-runner/test/mcp-config.test.ts",
   "apps/agent-runner/test/mcp-vertical.test.ts",
   "apps/agent-runner/test/mcp-vertical.mysql.test.ts",
@@ -49,6 +53,9 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/core/test/skills-static.test.ts",
   "packages/core/test/host-skills.test.ts",
   "packages/core/test/assemble-skills.test.ts",
+  "packages/core/test/tool-hooks.test.ts",
+  "packages/core/test/host-hooks.test.ts",
+  "packages/protocol/test/hooks-contract.test.ts",
   "packages/protocol/test/skills-contract.test.ts",
   "packages/core/test/ordinary-session-delete-grace-recovery.test.ts",
   "packages/core/test/ordinary-session-usage-retention-worker.test.ts",
@@ -168,6 +175,15 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:hooks": [
+    "packages/core/test/tool-hooks.test.ts",
+    "packages/core/test/host-hooks.test.ts",
+    "packages/protocol/test/hooks-contract.test.ts",
+    "apps/agent-runner/test/hooks-config.test.ts",
+    "apps/agent-runner/test/hooks-runtime.test.ts",
+    "apps/agent-runner/test/hooks-vertical.test.ts"
+  ],
+  "test:hooks-mysql": ["apps/agent-runner/test/hooks-vertical.mysql.test.ts"],
   "test:mcp": [
     "packages/core/test/mcp-http.test.ts",
     "packages/core/test/mcp-service.test.ts",

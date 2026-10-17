@@ -1,0 +1,94 @@
+# M3 tool hooks：固定 operator 策略与观察
+
+状态：独立 hooks 候选，尚未发布。正式六文件182项、共享MCP/skills十四文件357项、既有Host/config两文件117项均定向通过；类型、API生成一致性、secret scan及SDK/六入口实际构建与默认dist冒烟也通过。此前Unicode正控、测试夹具和类型失败保留。这不是一次完整验证：真实MySQL、hooks-enabled plain-Node调用、完整verify与最终SHA CI尚待，不表示整体M3或生产验收完成。批次及后续状态以 [PROGRESS](../PROGRESS.md) 为准。
+
+## 1. 范围、配置与 owner
+
+本切片只实现 `preToolUse` 与 `postToolUse`。operator 固定配置三种闭合定义：
+
+| kind | phase | 行为 |
+| --- | --- | --- |
+| `deny-tools` | `preToolUse` | 精确工具名命中即拒绝，否则继续；不改写参数 |
+| `observe-tool-result` | `postToolUse` | 只报告 canonical 结果的成功/错误布尔状态 |
+| `webhook` | 两者之一 | 固定 endpoint 的匿名 JSON POST；pre 收 allow/deny，post 仅收 ACK |
+
+不加载租户代码、动态模块或脚本，不支持任意 callback 配置、上传/注册 API、LLM/参数改写、结果正文检查或其它生命周期 hook。策略不能增加工具可见性、突破原审批或借 `readOnly` 扩权；webhook 也没有工具参数可供规则判断。
+
+默认 `HOOKS_ENABLED=0`、`HOOKS_CONFIG_JSON=[]`。配置即使只预置、未启用也必须合法；启用须非空。最多 8 个不同 hook id，每项 1～64 个不同精确 `(tenantId,userId)` subject；`deny-tools` 有 1～64 个不同工具名。id/工具名为 `[A-Za-z0-9_-]{1,64}`，没有模式匹配或通配规则。tenant/user 复用共享 Principal 语法；Unicode tenant 不按 128 UTF-8 字节误拒。字面 tenant `*` 也只可能匹配这个完整身份，不代表其它租户。
+
+operator JSON 是闭合 schema，拒绝未知字段、错误 phase/kind、重复 id/subject/tool，以及重复 JSON key（包括转义后同名）。原始配置最多 64 KiB；不接受内联 key、headers、Authorization、客户端、代理、动态模块或 redirect 配置。`HOOKS_` 未知环境字段也拒绝，不读取 `.env`。配置按给定 hook 顺序执行；subject 的排序使用与 locale 无关的精确全序，不规范化或合并不同 Unicode 身份。
+
+`HOOKS_TIMEOUT_MS` 是整个 phase 的预算，默认 1500，operator 范围 100～5000 ms；不是每 hook 重置。`HOOKS_MAX_CONCURRENT_PER_USER` 默认 2、范围 1～8，按完整 tenant/user tuple 计数。配置与 ACL 被复制并冻结；不把远端响应放入跨请求缓存。
+
+## 2. Host 执行与提交顺序
+
+Host 在 unknown tool、停止/失权状态与工具调用次数上限检查之后、审批申请与真实 execution-start 写前标记之前执行 pre。包括已有 session grant 的调用在内，每次实际执行仍经过当前 pre 策略。hook allow 只允许继续原 gate，不等于审批通过；MCP 的 mandatory approval、scope 与不明结果后撤销 grant 的逻辑不变。
+
+pre 按顺序运行，首个 deny、授权/验证错误、超时或取消即不执行工具，其余 hook 记为 skipped，不继续出站。hook 返回后重验 lease、tenant runtime 与 turn 状态；report 和 started COMMIT 进入原串行写链后，在真正调用 store 的边界再次检查。迟到的 allow 不能让已中断或失权的调用写入 started 后继续执行。
+
+post 只针对确实有 started 标记、工具身份匹配且 canonical tool-result 已 COMMIT 的调用，不观察未知/被阻止工具的合成结果。传入的 `isError` 来自最终实际保存/交给 engine 的 canonical 结果，包含序列化或 Blob 存储失败后的固定错误，而不是原始工具输出。
+
+同 turn 的兼容回调以 toolCallId 和 name/isError/JSON-safe payload 身份登记一个 promise，登记发生在异步工作开始前；重复的相同结果复用它，不重复 COMMIT 或发 post，不同身份拒绝。原结果 JSON round-trip、字节上限、Blob 卸载及 canonical engine transcript 语义保留，不把 storage marker 当作结果正文。
+
+post callback 的错误是 observer fail-open，不改写已经保存的工具结果；后续本地 observer 可继续，但 phase 已取消/耗尽后不再发新 I/O。只有 callback 调用位于 fail-open catch 内，store/report COMMIT 错误及后继 owner/fence 检查不被吞掉；它们仍能停止失权 writer 或下一模型步骤。
+
+`hook/completed` 事件仅含原 EventBase 与 session/turn/toolCall 关联、hookId、phase、kind、outcome、configSha256。outcome 闭合为 `allowed`、`denied`、`tool_success`、`tool_error`、`acknowledged`、`failed`、`cancelled`、`timed_out`、`skipped`。不记录 reason 正文、参数、结果、endpoint、key 或远端错误。wire invocationId 不加入此事件。
+
+## 3. Webhook MAC 与匿名 HTTP
+
+每项 webhook 使用 operator 独立提供的 raw 32-byte HMAC key。JSON/env 只存 `signingKeyFile` 的绝对路径，不接受 key 内容；loader 复用的只是 protected-file reader，不是 telemetry/ref/artifact/master key 或其授权。文件必须 owner-owned、owner-only、regular、单链接；以 no-follow/nonblocking FD 读取并核对读取前后身份、大小与时间，恰好 32 字节。0400/0600 可读，群组可读、symlink、hardlink、目录及错误长度拒绝。错误为固定文本，不输出 path/key/native cause。
+
+loader 顺序读取文件，失败不返回部分 service；core 在构造时复制 key，再 best-effort 清临时 buffer，close 后也 best-effort 清自己的副本。这不是可靠 zeroization 或其它内存/备份副本销毁证明。key 的生成、分发、保管与轮换由 operator 负责，不是本切片新增的租户凭据执行能力。
+
+请求为闭合 `agent-service-tool-hook-request-v1`：
+
+```text
+schema, hookId, phase, invocationId, configSha256,
+refs {tenant,user,session,turn,toolCall},
+tool {name,kind,readOnly}, isError, requestSha256, macSha256
+```
+
+invocationId 是每次随机的 16-byte hex；refs 为 key 和 kind/domain 分离的 opaque HMAC，绑定真实 owner/session/turn/call，不发送原始身份。pre 的 isError 必须 null，post 必须 boolean。tool kind 只可为 builtin/mcp/dynamic/skill；session/turn/call 文本有界，toolCallId 最多 256 字节。没有 args、结果正文、headers、key 或 URL 字段；opaque refs 仍可在同 key 范围内关联，不能称为完全不可关联。
+
+固定字段顺序的 payload 以独立 request-digest domain 求 SHA-256，再对 payload 加 requestSha256 的闭合对象用 request-MAC domain 求 HMAC-SHA256；domain 与 JSON 之间包含 NUL。响应为闭合 `agent-service-tool-hook-response-v1`：
+
+```text
+schema, hookId, phase, invocationId, configSha256,
+requestSha256, decision, macSha256
+```
+
+响应须 exact 绑定本次 hook/phase/invocation/config/request digest，并以独立 response-MAC domain 验证；pre decision 只能 allow/deny，post 只能 ack。digest/MAC 为小写 64hex，比较使用 timing-safe equality。body MAC 不是非对称签名、远端执行收据或生命周期 grant。
+
+operator 可复用 `validateToolHookWebhookRequest(value,key)` 和 `createToolHookWebhookResponse(request,decision,key)`：前者验证完整闭合对象/digest/MAC并返回冻结副本，后者会再次认证请求并检查 phase/decision，不接受自称已解析的伪外壳。接收方仍须先对原始 JSON 执行有界、严格 UTF-8 与 duplicate-key 检查；JS 对象本身无法证明原 wire 没有重复字段。精确 domain 和编码以 [service 实现](../../packages/core/src/hooks/service.ts) 为准，不自行换编码或把任意 JSON.stringify 顺序视为同一 MAC。
+
+出站只产生固定 `content-type: application/json` 与 `accept: application/json` 应用 headers，MAC 放在 body。复用原匿名 MCP HTTP substrate，不修改其 header/鉴权合同：固定公网 HTTPS endpoint，拒绝 credentials/query/fragment、代理、重定向、压缩 body 与非允许 header；逐次检查所有 DNS 地址并将选定地址 pin 到实际 socket，保留 TLS/SNI 身份检查。没有全局 dispatcher、远端资源抓取或自动 retry。请求最多 16 KiB，响应最多 8 KiB；只接受 HTTP 200/application-json、严格 UTF-8、闭合字段及无重复/转义重复 key 的响应。坏响应/response loss 对 pre 是拒绝，对 post 是失败报告，均不重试。
+
+loopback HTTP 只供显式非生产 fixture，同时要求 `HOOKS_ALLOW_LOOPBACK_FOR_TESTS=1`、`NODE_ENV=test`、原 `MCP_ALLOW_LOOPBACK_FOR_TESTS=1` 与 core 的显式 test option。production 不能打开此豁免；parser 接受 HTTPS 名称不代表 DNS 已验真，实际请求才执行原出站检查。允许配置生产 HTTPS 不等于本候选已完成生产验收。
+
+## 4. 取消、drain 与配置版本边界
+
+每 phase 持有真实 tenant runtime `provider` operation lease，signal 合并 caller、service close 与租户 fence。runner 注入的 fresh authorizer 在执行/I/O 前后按实际 owner 重查 tenant runtime 与 user lifecycle；代建 session 不借用创建者 ACL。不可取消的授权读取必须实际 settle，HTTP 则在 finally 等待 owned request/socket 真正关闭，再归还 lease。close 同步禁止新操作、abort 自有在途并等待其完成；不能把 Promise 已取消当作 I/O 已排空。
+
+phase 预算控制后续 admission/dispatch；实际安全关停或不可取消的授权等待可以超过该预算，不承诺硬截止返回。网络断开/超时也不能证明远端没收到或没执行；没有自动重试、exactly-once、durable webhook outbox、崩溃补发或 webhook 远端回滚保证。post 结果已提交与报告/远端 ACK 之间可有故障空窗，缺事件不能补造成成功观察。
+
+`version(owner)` 同步返回适用 immutable 配置的 digest；disabled/无精确匹配返回 undefined，不改变原无 hooks epoch 编码。适用策略版本进入 contextEpoch，变化在下一 turn 产生 content-free policy/catalog notice；它不泄露配置正文，也不单独授执行权。close 不把适用策略静默变成 undefined，关闭后的 pre 仍拒绝。
+
+当前移除边界：若最后一个扩展就是 hooks，随后 disabled 或移出该 owner，Host 的旧普通 session 可以保留原 contextEpoch，而不额外写一份“已移除”状态；实际调用按当前配置不再运行该 hook。它不是 fleet-wide 即时撤销、清除旧 grants 或删除历史事件的协议。配置/key/ACL 更新须按 whole-fleet 停服排空、统一配置后重启处理；不可用某台 runner 的 epoch 当作独立全 fleet 权威。
+
+## 5. 本地配置与交付边界
+
+只体验 builtin 策略无需 keyfile 或 webhook。给现有本地 runner 预置以下示例，并让 agent 显式允许实际内置工具 `current_time`、使用与 ACL 一致的真实 owner：
+
+```dotenv
+HOOKS_ENABLED=1
+HOOKS_CONFIG_JSON='[{"id":"deny-time","phase":"preToolUse","kind":"deny-tools","subjects":[{"tenantId":"tenant-example","userId":"user-example"}],"tools":["current_time"]},{"id":"observe","phase":"postToolUse","kind":"observe-tool-result","subjects":[{"tenantId":"tenant-example","userId":"user-example"}]}]'
+HOOKS_TIMEOUT_MS=1500
+HOOKS_MAX_CONCURRENT_PER_USER=2
+HOOKS_ALLOW_LOOPBACK_FOR_TESTS=0
+```
+
+命中时 pre denied，工具无 started/执行，也无该调用的 post；将 deny 清单改为其它工具后，current_time 仍经过原审批，再由 observer 记录 canonical 成功/错误。内置 hook 本身不联网；若通过真实模型 turn 触发，模型调用仍可能收费。无模型/外部网络的现有 parser/loader 测试可用 `pnpm exec vitest run apps/agent-runner/test/hooks-config.test.ts apps/agent-runner/test/hooks-runtime.test.ts`，它们不是 SQL 或实际发布包证明，不新增产品 fake 模式。
+
+本包不新增 SQL、常驻服务、JavaScript 产品入口或镜像，仍为 router/runner 两服务、六入口、两镜像。router capability 取全部 configured、当前健康且明确支持 hooks 的 runner 交集；missing/stale/unhealthy/任一不支持均不能按 healthy subset 宣告可用。
+
+M1 未冻结、M2 冻结，M3 仅推进此有限增量。0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变。hooks 不签发 grant、不完成 erasure/灾备，也不以默认 off 掩盖普通启动、迁移或运行正确性缺陷。

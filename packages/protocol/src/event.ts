@@ -18,6 +18,16 @@ const envelope = {
 const persisted = { ...envelope, seq: z.number().int().nonnegative() };
 const live = { ...envelope, seq: z.undefined().optional() };
 
+/** Content-free hook status only, never an execution grant or a webhook payload. */
+export const ToolHookStatus = z.object({
+  hookId: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+  phase: z.enum(["preToolUse", "postToolUse"]),
+  kind: z.enum(["deny-tools", "observe-tool-result", "webhook"]),
+  outcome: z.enum(["allowed", "denied", "tool_success", "tool_error", "acknowledged", "failed", "cancelled", "skipped", "timed_out"]),
+  configSha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+export type ToolHookStatus = z.infer<typeof ToolHookStatus>;
+
 export const Event = z.discriminatedUnion("type", [
   z.object({ ...persisted, type: z.literal("session/created") }),
   z.object({ ...persisted, type: z.literal("session/status/changed"), status: SessionStatus }),
@@ -45,6 +55,14 @@ export const Event = z.discriminatedUnion("type", [
 
   z.object({ ...persisted, type: z.literal("approval/requested"), approval: Approval }),
   z.object({ ...persisted, type: z.literal("approval/resolved"), approval: Approval }),
+
+  z.object({
+    ...persisted,
+    type: z.literal("hook/completed"),
+    turnId: idSchema("turn"),
+    toolCallId: z.string().min(1).max(256),
+    ...ToolHookStatus.shape,
+  }).strict(),
 
   z.object({
     ...persisted,

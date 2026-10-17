@@ -176,6 +176,7 @@ export interface AppDeps {
   mcpEnabled?: boolean;
   /** Operator-mounted static SKILL.md subset only; no installation or script execution. */
   skillsEnabled?: boolean;
+  hooksEnabled?: boolean;
   runnerId: string;
   internalRouterToken: string;
   heartbeatMs: number;
@@ -539,6 +540,7 @@ export function createApp(deps: AppDeps) {
         dynamicTools: true,
         mcp: deps.mcpEnabled === true ? ["streamable-http"] : [],
         skills: deps.skillsEnabled === true,
+        hooks: deps.hooksEnabled === true,
         sandbox: ["none"],
         byok: true,
       },

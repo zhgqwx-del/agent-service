@@ -697,6 +697,8 @@ export const Capabilities = z.object({
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),
+    /** Optional for legacy peers; absence is never support for operator tool hooks. */
+    hooks: z.boolean().optional(),
     sandbox: z.array(z.enum(["none"])),
     byok: z.boolean(),
   }),

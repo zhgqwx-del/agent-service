@@ -2,13 +2,19 @@
 
 > 当前状态（2026-10-16，优先于下方历史检查点）：已发布 main `6fdb63c` 的最终 CI 五项全绿，已自动完成独立 router/runner/MySQL/Redis 的确定性本地体验；不代表用户已亲自完成手工验收。当前工作树开发 M3.1a MCP，尚未发布，新能力不能借旧 CI 背书。先交付本地功能版，依次 M3、必要 M4、未完 P2；完整架构目标不取消，M1 未冻结不再阻挡 M3。实际证据只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
 
+## M3 候选的 skills/hooks 如何验证
+
+`pnpm test:skills` 验证真实固定 SKILL.md 的解析、owner ACL、Host 与 Memory 调用链；`pnpm test:hooks` 验证闭合策略/MAC、配置/keyfile、取消/COMMIT 边界及实际 Memory runner/router 纵向。两者不读取 `.env` 或调用付费模型；带 `-mysql` 的正式命令需要 loopback `MYSQL_TEST_URL`，只新建随机隔离库并在停服冷读与成功清理后通过。不要把命令已登记、分段通过或旧 CI 当作当前候选整包验收，最新事实看 PROGRESS。
+
+配置、手动观察点及未完范围分别见 [静态 skills](../design/07-skills.md) 与 [tool hooks](../design/08-tool-hooks.md)。这些能力仍在 runner 内，不增加服务、二进制或镜像；router capability 是全部 configured 健康 fleet 的显式支持交集。静态 skill 不执行 Markdown 中脚本，pre-hook allow 不代替 MCP 审批，post-hook 在 canonical 结果提交后才观察。默认关闭，部署策略与 key 变更须整 fleet 停服排空。
+
 ## 正在开发的 MCP 如何验证
 
 本小节仅描述当前候选，不是已发布能力承诺。`pnpm test:mcp` 用真实本地 MCP HTTP 服务及确定性 FakeVendor 验证工具发现、强制审批、持久结果和 SSE；不读 `.env`、不调用付费模型。`pnpm test:mcp-mysql` 还需要仅指向 loopback 测试环境的 `MYSQL_TEST_URL`，自行创建新随机库，停服、冷连接核验后清理，不操作 URL 原库。
 
 实际配置按 [MCP 设计](../design/06-mcp.md) 与 `.env.example`：operator 固定匿名 HTTPS endpoint、精确 tenant/user ACL，agent 的 `mcpServers` 只引用 server id。默认关闭，完整 fleet 排空升级并保持配置一致后才能启用；不存在注册 API、OAuth 或任意 URL/header/command 输入。所有 MCP 工具即使自称只读或 agent 使用 `approvalPolicy=never`，仍须审批。
 
-体验时检查 `toolCall.kind=mcp`、审批资源与持久 `toolResult`，结果提交后才进入下一模型步骤；本服务 SSE seq/after 回放不是上游 MCP session。`acceptForSession` 授权在远端派发前持久化暂停，仅成功结果提交后恢复；结果不明或失败必须重新确认，不能无声重试有副作用工具。当前尚不提供远端 progress、2025 兼容、动态注册/OAuth、共享池与 skills/hooks，不能称完整 M3。
+体验时检查 `toolCall.kind=mcp`、审批资源与持久 `toolResult`，结果提交后才进入下一模型步骤；本服务 SSE seq/after 回放不是上游 MCP session。`acceptForSession` 授权在远端派发前持久化暂停，仅成功结果提交后恢复；结果不明或失败必须重新确认，不能无声重试有副作用工具。当前尚不提供远端 progress、2025 兼容、动态注册/OAuth或共享池；静态 skills/有限 hooks 另按上节验收，不能称完整 M3。
 
 历史候选、失败与分段验证统一见[PROGRESS](../PROGRESS.md)，本指南不以旧检查点的测试数量说明当前状态。
 

@@ -6,6 +6,7 @@ import {
   BlobCleanupWorker,
   ConfiguredMcpToolSource,
   ConfiguredStaticSkillSource,
+  type ConfiguredToolHookService,
   createTenantTelemetryApplicationDualWrite,
   createPersistedProviderFailureCapture,
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_CONTRACT_SHA256,
@@ -100,6 +101,7 @@ import {
 } from "@agent-service/store";
 import { createApp } from "./app.js";
 import { generateApiKey, hashApiKey } from "./auth.js";
+import { createConfiguredToolHooks } from "./hooks-runtime.js";
 import { createLocalFakeCredentialTargetReferenceCapture } from
   "./credential-target-reference-local.js";
 import { reconcileBlobStorageControlForRuntime } from "./blob-storage-control.js";
@@ -322,6 +324,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let ordinarySessionDeleteGraceRecovery: OrdinarySessionDeleteGraceRecovery | undefined;
   let ordinarySessionUsageRetentionWorker: OrdinarySessionUsageRetentionWorker | undefined;
   let skills: ConfiguredStaticSkillSource | undefined;
+  let hooks: ConfiguredToolHookService | undefined;
+  let hooksInitializationFailed = false;
+  let closeHookBootstrapResources: (() => Promise<void>) | undefined;
   const persistedProviderCaptureGate = cfg.PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED
     ? new RouterPersistedProviderCaptureGate({
       routerBaseUrl: cfg.ERASURE_ROUTER_URL!, internalToken: cfg.INTERNAL_ROUTER_TOKEN,
@@ -791,8 +796,25 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       }
     },
   }) : undefined;
+  closeHookBootstrapResources = async () => {
+    await Promise.allSettled([store.close(), lease.close(), bus.close(), tenantRedisPurgeAdapter?.close(),
+      blobStore instanceof S3BlobStore ? blobStore.close() : undefined]);
+  };
+  try {
+    hooks = await createConfiguredToolHooks(cfg.hooks, { tenantRuntime, authorizeSubject: async (principal) => {
+      const tenant = await store.getTenantRuntimeState(principal.tenantId);
+      const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
+      if (tenant.state !== "active" || user && user.state !== "active") {
+        throw new SubjectDeletingError(principal.tenantId, principal.userId);
+      }
+    } });
+  } catch (error) {
+    hooksInitializationFailed = true;
+    await mcp?.close();
+    throw error;
+  }
   const host = new SessionHost({
-    store, erasureStore: store, lease, bus, providers, tools, mcp, skills, blobs, tenantRuntime,
+    store, erasureStore: store, lease, bus, providers, tools, mcp, skills, hooks, blobs, tenantRuntime,
     logger: runnerRuntimeLogger,
     onOwnershipLost: () => emitRunnerTelemetryEvent("runner.runtime.ownership_lost"),
     ...(tenantTelemetryWriterRuntime.persistedCaptureActive === true && persistedProviderCaptureGate && tenantTelemetryRefKey ? {
@@ -1100,6 +1122,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let ready = true;
   const app = createApp({
     store, host, providers, tools, mcpEnabled: mcp?.enabled === true, skillsEnabled: skills?.enabled === true,
+    hooksEnabled: hooks?.enabled === true,
     telemetry: runnerProcessTelemetry,
     ...(cfg.METRICS_BEARER_TOKEN === undefined ? {} : {
       metrics: { bearerToken: cfg.METRICS_BEARER_TOKEN,
@@ -1223,7 +1246,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         ordinarySessionUsageRetentionWorker?.stop(),
         tenantRedisPurgeWorker?.stop(),
       ]);
-      await Promise.all([host.drain(30_000), mcp?.close(), skills?.close()]);
+      await Promise.all([host.drain(30_000), mcp?.close(), skills?.close(), hooks?.close()]);
       if (tenantTelemetryRetryTimer !== undefined) {
         clearInterval(tenantTelemetryRetryTimer);
         tenantTelemetryRetryTimer = undefined;
@@ -1318,17 +1341,25 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
     tenantTelemetryWriterRuntime, providerTenantTelemetry,
     persistedProviderCaptureGate,
     tenantRuntimeBootId,
-    blobs, blobStore, store, lease, bus, skills, cfg,
+    blobs, blobStore, store, lease, bus, skills, hooks, cfg,
     close: () => shutdown("close", false),
   };
   } catch (error) {
-    if (tenantTelemetryRetryTimer !== undefined) clearInterval(tenantTelemetryRetryTimer);
-    await skills?.close();
-    await ordinarySessionDeleteGraceRecovery?.stop();
-    await ordinarySessionUsageRetentionWorker?.stop();
-    await providerTenantTelemetry?.close();
-    await tenantTelemetryWriterRuntime?.worker?.stop();
-    await closeTenantRestoreJournal();
+    await hooks?.close();
+    // A new protected hook-key/config failure can happen after store/lease/bus creation,
+    // before any listener or later runtime worker exists. Do not leave these owned pools open
+    // when an embedding caller catches startup failure instead of exiting the OS process.
+    try {
+      if (tenantTelemetryRetryTimer !== undefined) clearInterval(tenantTelemetryRetryTimer);
+      await skills?.close();
+      await ordinarySessionDeleteGraceRecovery?.stop();
+      await ordinarySessionUsageRetentionWorker?.stop();
+      await providerTenantTelemetry?.close();
+      await tenantTelemetryWriterRuntime?.worker?.stop();
+      await closeTenantRestoreJournal();
+    } finally {
+      if (hooksInitializationFailed) await closeHookBootstrapResources?.();
+    }
     throw error;
   }
 }

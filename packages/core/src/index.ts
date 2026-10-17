@@ -34,3 +34,5 @@ export * from "./lifecycle/tenant-telemetry-writer-worker.js";
 export * from "./lifecycle/tenant-runtime-coordinator.js";
 export * from "./telemetry/tenant-telemetry-application-dual-write.js";
 export * from "./telemetry/persisted-provider-failure-capture.js";
+export * from "./hooks/types.js";
+export * from "./hooks/service.js";

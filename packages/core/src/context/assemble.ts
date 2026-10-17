@@ -68,12 +68,15 @@ export function computeContextEpoch(input: {
   systemPrompt: string;
   tools: RunnerTool[];
   skills?: readonly SkillSummary[];
+  /** Only applicable, enabled operator hook policies participate; old encodings stay unchanged. */
+  hooksSha256?: string;
 }): string {
   return sha256(
     stableStringify({
       agent: `${input.agentId}@${input.agentVersion}`,
       prompt: sha256(input.systemPrompt),
       tools: toolSetFingerprint(input.tools),
+      ...(input.hooksSha256 === undefined ? {} : { hooksSha256: input.hooksSha256 }),
       // Keep the original list-only/builtin epoch encoding. Versioned static skills additionally
       // bind the actual file bytes and invocation/dependency metadata, not only their names.
       skills: (input.skills ?? []).map((s) => s.versionSha256 === undefined ? s.name : {

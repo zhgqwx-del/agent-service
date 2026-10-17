@@ -311,6 +311,12 @@ export class RunnerRegistry {
       && target.capabilities?.features.skills === true);
   }
 
+  allConfiguredSupportHooks(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => target.healthy
+      && target.capabilities?.features.hooks === true);
+  }
+
   /** Revalidate the concrete destination immediately before a capability-gated write is sent. */
   supportsLifecycle(url: string, feature: Capabilities["features"]["sessionLifecycle"][number]): boolean {
     const target = this.targets.get(url.replace(/\/+$/, ""));

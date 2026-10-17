@@ -1158,6 +1158,9 @@ export const OPENAPI_DOCUMENT = {
                 "maxItems": 2,
                 "type": "array"
               },
+              "hooks": {
+                "type": "boolean"
+              },
               "mcp": {
                 "items": {
                   "enum": [
@@ -4654,6 +4657,88 @@ export const OPENAPI_DOCUMENT = {
             "type": "object"
           },
           {
+            "additionalProperties": false,
+            "properties": {
+              "configSha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "emittedAtMs": {
+                "type": "integer"
+              },
+              "hookId": {
+                "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "deny-tools",
+                  "observe-tool-result",
+                  "webhook"
+                ],
+                "type": "string"
+              },
+              "outcome": {
+                "enum": [
+                  "allowed",
+                  "denied",
+                  "tool_success",
+                  "tool_error",
+                  "acknowledged",
+                  "failed",
+                  "cancelled",
+                  "skipped",
+                  "timed_out"
+                ],
+                "type": "string"
+              },
+              "phase": {
+                "enum": [
+                  "preToolUse",
+                  "postToolUse"
+                ],
+                "type": "string"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sessionId": {
+                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "toolCallId": {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              "turnId": {
+                "pattern": "^turn_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "hook/completed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionId",
+              "emittedAtMs",
+              "seq",
+              "type",
+              "turnId",
+              "toolCallId",
+              "hookId",
+              "phase",
+              "kind",
+              "outcome",
+              "configSha256"
+            ],
+            "type": "object"
+          },
+          {
             "properties": {
               "emittedAtMs": {
                 "type": "integer"
@@ -4879,10 +4964,6 @@ export const OPENAPI_DOCUMENT = {
               "message": {
                 "type": "string"
               },
-              "seq": {
-                "minimum": 0,
-                "type": "integer"
-              },
               "sessionId": {
                 "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                 "type": "string"
@@ -4901,7 +4982,6 @@ export const OPENAPI_DOCUMENT = {
             "required": [
               "sessionId",
               "emittedAtMs",
-              "seq",
               "type",
               "code",
               "message"
@@ -5019,29 +5099,6 @@ export const OPENAPI_DOCUMENT = {
               "turnId",
               "toolCallId",
               "delta"
-            ],
-            "type": "object"
-          },
-          {
-            "properties": {
-              "emittedAtMs": {
-                "type": "integer"
-              },
-              "sessionId": {
-                "pattern": "^sess_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-                "type": "string"
-              },
-              "type": {
-                "enum": [
-                  "heartbeat"
-                ],
-                "type": "string"
-              }
-            },
-            "required": [
-              "sessionId",
-              "emittedAtMs",
-              "type"
             ],
             "type": "object"
           }

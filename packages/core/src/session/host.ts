@@ -64,6 +64,7 @@ import { newId } from "../ids.js";
 import type { RunnerTool, ToolRegistry } from "../tools/types.js";
 import type { McpToolSource } from "../mcp/service.js";
 import type { LoadedStaticSkill, StaticSkillLoadInput } from "../skills/static.js";
+import type { ToolHookContext, ToolHookReport, ToolHookService } from "../hooks/types.js";
 import { DynamicToolBridge } from "../tools/dynamic.js";
 import type { TenantRuntimeCoordinator, TenantRuntimeLease } from "../lifecycle/tenant-runtime-coordinator.js";
 import {
@@ -150,6 +151,7 @@ export interface SessionHostDeps {
   mcp?: McpToolSource;
   providers: ProviderResolver;
   skills?: SkillSource;
+  hooks?: ToolHookService;
   /** Shared runner-local T3b fence. Omitted while the T3b worker is disabled. */
   tenantRuntime?: TenantRuntimeCoordinator;
   config: SessionHostConfig;
@@ -183,6 +185,8 @@ interface SkillBudget {
   /** Exact durable history plus conservative in-flight reservations, shared by every producer. */
   contexts: Map<string, ResolvedSkillContext>;
 }
+
+type PreparedToolOutput = { ok: true; payload: ToolOutputPayload; serialized: string } | { ok: false };
 
 interface ActiveTurn {
   turn: Turn;
@@ -225,6 +229,7 @@ interface ActiveTurn {
   skills: readonly SkillSummary[];
   toolNames: readonly string[];
   skillBudget: SkillBudget;
+  hooksSha256?: string;
   leaseGuard: LeaseGuard;
   wallClockTimer?: NodeJS.Timeout;
   startedAt: number;
@@ -406,6 +411,7 @@ export class SessionHost {
     const skills = await this.listSkills(owner, agent, signal);
     this.mountSkillTool(owner, agent, skills, tools, { remainingTokens: 0, contexts: new Map() });
     const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
+    const hooksSha256 = this.toolHooksVersion(owner);
     const now = Date.now();
     const session: Session = {
       id: newId("sess"),
@@ -417,7 +423,7 @@ export class SessionHost {
       title: req.title,
       parentSessionId: req.parentSessionId,
       lastSeq: 0,
-      contextEpoch: computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills }),
+      contextEpoch: computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills, hooksSha256 }),
       fenceToken: 0,
       usage: emptyUsageAccumulator(),
       autoApprovedTools: [],
@@ -456,6 +462,39 @@ export class SessionHost {
       throw new ApiError("invalid_request", "tool names collide");
     }
     return tools;
+  }
+
+  private toolHooksVersion(owner: Principal): string | undefined {
+    if (!this.deps.hooks?.enabled) return undefined;
+    const version = this.deps.hooks.version({ tenantId: owner.tenantId, userId: owner.userId });
+    if (version !== undefined && !/^[a-f0-9]{64}$/.test(version)) throw new ApiError("invalid_request", "Tool hooks are unavailable.");
+    return version;
+  }
+
+  private toolHookContext(state: ActiveTurn, tool: RunnerTool, toolCallId: string): ToolHookContext {
+    return { owner: { tenantId: state.session.tenantId, userId: state.session.userId },
+      sessionId: state.session.id, turnId: state.turn.id, toolCallId,
+      tool: { name: tool.name, kind: tool.kind, readOnly: tool.readOnly === true } };
+  }
+
+  private assertToolHooksOpen(state: ActiveTurn): void {
+    state.leaseGuard.assertOwned(); state.tenantRuntimeLease?.assertOpen();
+    if (state.fenced || state.abort.signal.aborted || state.closingRequested || isTurnClosing(state)) {
+      throw new ApiError("draining", "Tool hooks are unavailable.");
+    }
+  }
+
+  private toolHookSignal(state: ActiveTurn): AbortSignal {
+    return AbortSignal.any([state.abort.signal, ...(state.tenantRuntimeLease ? [state.tenantRuntimeLease.signal] : [])]);
+  }
+
+  private async commitToolHookReports(state: ActiveTurn, toolCallId: string, reports: readonly ToolHookReport[]): Promise<void> {
+    this.assertToolHooksOpen(state);
+    if (!reports.length) return;
+    await this.commit(state, { events: reports.map(report => ({ type: "hook/completed" as const,
+      sessionId: state.session.id, turnId: state.turn.id, toolCallId, emittedAtMs: Date.now(),
+      hookId: report.hookId, phase: report.phase, kind: report.kind, outcome: report.outcome, configSha256: report.configSha256 })) }, undefined, true);
+    this.assertToolHooksOpen(state);
   }
 
   private async listSkills(owner: Principal, agent: AgentDefinition, signal: AbortSignal): Promise<readonly SkillSummary[]> {
@@ -1727,9 +1766,10 @@ export class SessionHost {
     runtimeLease?.assertOpen();
     const systemPrompt = buildSystemPrompt(agent, skills, !!this.deps.skills?.load);
     const limits = mergeLimits(agent.limits, req.limits);
-    const hasExtensions = agent.mcpServers.length > 0 || agent.skills.length > 0;
+    const hooksSha256 = this.toolHooksVersion(principal);
+    const hasExtensions = agent.mcpServers.length > 0 || agent.skills.length > 0 || hooksSha256 !== undefined;
     const contextEpoch = hasExtensions
-      ? computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills })
+      ? computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills, hooksSha256 })
       : session.contextEpoch;
     const catalogChanged = contextEpoch !== session.contextEpoch;
     const currentGrantScopes = new Set(tools.map((tool) => tool.approvalScope ?? tool.name));
@@ -1805,7 +1845,8 @@ export class SessionHost {
     };
     const userItem: Item = { id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input,
       ...(resolvedInput.skillContexts.length ? { skillContexts: resolvedInput.skillContexts } : {}) };
-    const catalogMessage = agent.skills.length ? "Tool or skill catalog changed; loaded skill snapshots remain bound to their original versions."
+    const catalogMessage = hooksSha256 !== undefined ? "Tool policy or catalog changed; current tool policies apply before every execution."
+      : agent.skills.length ? "Tool or skill catalog changed; loaded skill snapshots remain bound to their original versions."
       : "Remote tool catalog changed; previous approvals do not apply to changed tools.";
     const catalogNotice: ItemOf<"systemNotice"> | undefined = catalogChanged ? {
       id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed",
@@ -1818,7 +1859,7 @@ export class SessionHost {
       toolCallItems: new Map(), pendingApprovals: new Map(),
       autoApproved: new Set(autoApprovedTools),
       mcpGrantResumptions: new Map(),
-      skills, toolNames: tools.map(tool => tool.name), skillBudget,
+      skills, toolNames: tools.map(tool => tool.name), skillBudget, hooksSha256,
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
       phase: "reserved", closingRequested: false, steerChain: Promise.resolve(), pendingSteers: [],
@@ -1876,7 +1917,7 @@ export class SessionHost {
           { type: "turn/started", sessionId, emittedAtMs: now, turn },
           ...(catalogNotice ? [
             { type: "item/completed" as const, sessionId, emittedAtMs: now, item: catalogNotice },
-            { type: "warning" as const, sessionId, emittedAtMs: now, code: agent.skills.length ? "skill_catalog_changed" : "mcp_catalog_changed", message: catalogMessage },
+            { type: "warning" as const, sessionId, emittedAtMs: now, code: hooksSha256 !== undefined ? "hook_policy_changed" : agent.skills.length ? "skill_catalog_changed" : "mcp_catalog_changed", message: catalogMessage },
           ] : []),
           ...(repairWarning ? [{ type: "warning" as const, sessionId, emittedAtMs: now, ...repairWarning }] : []),
           { type: "item/completed", sessionId, emittedAtMs: now, item: userItem },
@@ -1985,11 +2026,24 @@ export class SessionHost {
     await this.finishTurn(state, result).catch(() => this.logTurnStop("error", "turn finish failed"));
   }
 
+  /** One JSON round trip only, also used for hook-enabled duplicate-result identity. */
+  private prepareToolOutput(result: EngineToolResult): PreparedToolOutput {
+    try {
+      const raw = JSON.stringify({ content: result.content, details: result.details });
+      const parsed = ToolOutputPayload.safeParse(JSON.parse(raw));
+      if (!parsed.success) return { ok: false };
+      const payload = parsed.data;
+      if (result.details !== undefined && payload.details === undefined) payload.details = {};
+      return { ok: true, payload, serialized: JSON.stringify(payload) };
+    } catch { return { ok: false }; }
+  }
+
   private async durableToolResult(
     principal: Principal,
     state: ActiveTurn,
     result: EngineToolResult,
     now: number,
+    prepared: PreparedToolOutput = this.prepareToolOutput(result),
   ): Promise<{ item: Extract<Item, { type: "toolResult" }>; blobBindings: BlobBinding[]; canonical: EngineToolResult }> {
     const base = {
       id: newId("item"),
@@ -2028,23 +2082,13 @@ export class SessionHost {
     // The round trip is intentional. Database JSON columns and blob payloads observe JSON values,
     // so the live Pi transcript must consume that same representation (undefined fields removed,
     // non-finite numbers normalized, and custom toJSON behavior applied) rather than the raw object.
-    let serialized: string;
-    let payload: ToolOutputPayload;
-    try {
-      const raw = JSON.stringify({ content: result.content, details: result.details });
-      const parsed = ToolOutputPayload.safeParse(JSON.parse(raw));
-      if (!parsed.success) throw new Error("invalid tool output payload");
-      payload = parsed.data;
-      // A non-undefined value whose toJSON() omitted itself must not leak back into Pi via the
-      // dependency's nullish override semantics. Normalize that rare case to an empty JSON object.
-      if (result.details !== undefined && payload.details === undefined) payload.details = {};
-      serialized = JSON.stringify(payload);
-    } catch {
+    if (!prepared.ok) {
       return failed(
         "TOOL_OUTPUT_NOT_SERIALIZABLE",
         "TOOL_OUTPUT_NOT_SERIALIZABLE: the tool output could not be durably recorded.",
       );
     }
+    const { payload, serialized } = prepared;
 
     const canonical: EngineToolResult = {
       toolCallId: result.toolCallId,
@@ -2112,9 +2156,10 @@ export class SessionHost {
     const turnId = state.turn.id;
     const toolByName = new Map(tools.map((t) => [t.name, t]));
     const live = (e: Event) => void this.deps.bus.publish(sessionId, e).catch(() => {});
-    const persistToolResult = async (r: EngineToolResult): Promise<EngineToolResult> => {
+    const resultWork = new Map<string, { identity: string | undefined; promise: Promise<EngineToolResult> }>();
+    const persistResultOnce = async (r: EngineToolResult, prepared?: PreparedToolOutput): Promise<EngineToolResult> => {
       const now = Date.now();
-      const durable = await this.durableToolResult(principal, state, r, now);
+      const durable = await this.durableToolResult(principal, state, r, now, prepared);
       const call = state.toolCallItems.get(r.toolCallId);
       const items: Item[] = [];
       const events: EventInput[] = [];
@@ -2140,7 +2185,40 @@ export class SessionHost {
       });
       if (resume) state.autoApproved.add(resume);
       state.mcpGrantResumptions.delete(r.toolCallId);
+      if (state.hooksSha256 !== undefined && tool && call?.startedAtMs !== undefined && call.name === r.name) {
+        this.assertToolHooksOpen(state);
+        let reports: readonly ToolHookReport[] = [];
+        try {
+          reports = await this.deps.hooks!.postToolUse({ ...this.toolHookContext(state, tool, r.toolCallId),
+            isError: durable.canonical.isError }, this.toolHookSignal(state));
+        } catch {
+          // Callback failures are observer fail-open. Store/report COMMIT and ownership checks
+          // deliberately live outside this catch and must still stop an invalid writer.
+        }
+        this.assertToolHooksOpen(state);
+        await this.commitToolHookReports(state, r.toolCallId, reports);
+      }
       return durable.canonical;
+    };
+    const persistToolResult = async (r: EngineToolResult): Promise<EngineToolResult> => {
+      if (state.hooksSha256 === undefined) return persistResultOnce(r);
+      const { toolCallId, name, isError } = r;
+      const prepared = this.prepareToolOutput(r);
+      const identity = prepared.ok ? sha256(stableStringify({ name, isError, payload: prepared.payload })) : undefined;
+      const previous = resultWork.get(toolCallId);
+      if (previous) {
+        if (identity === undefined || previous.identity !== identity) throw new ApiError("invalid_request", "Tool result identity conflict.");
+        this.assertToolHooksOpen(state);
+        const canonical = await previous.promise;
+        this.assertToolHooksOpen(state); return canonical;
+      }
+      // Schedule work only after publishing the promise, so concurrent compatibility callbacks
+      // cannot start another canonical COMMIT or observer. Rejections are not retried implicitly.
+      const staged = { toolCallId, name, isError, content: prepared.ok ? prepared.payload.content : [],
+        details: prepared.ok ? prepared.payload.details : undefined };
+      const promise = Promise.resolve().then(() => persistResultOnce(staged, prepared));
+      resultWork.set(toolCallId, { identity, promise });
+      return promise;
     };
 
     return {
@@ -2353,7 +2431,20 @@ export class SessionHost {
       await state.steerChain;
       return { allow: false, reason: "tool call limit reached", interrupt: true };
     }
+    if (state.hooksSha256 !== undefined) {
+      this.assertToolHooksOpen(state);
+      let decision: Awaited<ReturnType<ToolHookService["preToolUse"]>>;
+      try { decision = await this.deps.hooks!.preToolUse(this.toolHookContext(state, tool, call.id), this.toolHookSignal(state)); }
+      catch {
+        this.assertToolHooksOpen(state);
+        return { allow: false, reason: "Tool blocked by hook policy." };
+      }
+      this.assertToolHooksOpen(state);
+      await this.commitToolHookReports(state, call.id, decision.reports);
+      if (!decision.allow) return { allow: false, reason: "Tool blocked by hook policy." };
+    }
     const markStarted = async () => {
+      if (state.hooksSha256 !== undefined) this.assertToolHooksOpen(state);
       if (!item) {
         if (tool.kind === "mcp") throw new ApiError("internal_error", "remote tool write-ahead is missing");
         return;
@@ -2368,8 +2459,9 @@ export class SessionHost {
       await this.commit(state, {
         items: [item],
         ...(suspend ? { sessionPatch: { autoApprovedTools: [...state.autoApproved] } } : {}),
-      });
+      }, undefined, state.hooksSha256 !== undefined);
       if (suspend) state.mcpGrantResumptions.set(call.id, scope);
+      if (state.hooksSha256 !== undefined) this.assertToolHooksOpen(state);
     };
     const policy = state.agent.approvalPolicy;
     const needs = tool.mandatoryApproval === true
@@ -3023,8 +3115,11 @@ export class SessionHost {
   private commit(state: ActiveTurn, batch: Omit<CommitBatch, "sessionId" | "fence">, providerFailureSource?: {
     tenantId: string; userId: string; turnId: string; itemId: string;
     stepIndex: number; failureKind: "provider_step_error";
-  }) {
+  }, requireOpenToolHook = false) {
     const run = async () => {
+      // A hook/report may have queued behind another COMMIT before cancellation closed admission.
+      // Recheck at the real write boundary, not only before enqueueing it.
+      if (requireOpenToolHook) this.assertToolHooksOpen(state);
       if (state.fenced) throw new FenceError(state.session.id, state.fence, state.fence);
       state.leaseGuard.assertOwned();
       try {

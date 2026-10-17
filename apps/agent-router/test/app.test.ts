@@ -2,6 +2,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  Capabilities,
   INTERNAL_ERASURE_DRAIN_ACK_HEADER,
   INTERNAL_ERASURE_DRAIN_ACK_VALUE,
   INTERNAL_ERASURE_DRAIN_LOCAL_FENCED_HEADER,
@@ -125,6 +126,7 @@ function fakeRegistry(
     healthy?: (url: string) => boolean;
     mcp?: boolean;
     skills?: boolean;
+    hooks?: boolean;
     tombstone?: boolean;
     targetTombstone?: boolean;
     blobs?: boolean;
@@ -190,6 +192,8 @@ function fakeRegistry(
     allConfiguredSupportMcp: () => targets.length > 0 && (opts.mcp ?? false)
       && list().every((target) => target.healthy),
     allConfiguredSupportSkills: () => targets.length > 0 && (opts.skills ?? false)
+      && list().every((target) => target.healthy),
+    allConfiguredSupportHooks: () => targets.length > 0 && (opts.hooks ?? false)
       && list().every((target) => target.healthy),
     supportsLifecycle: () => opts.targetTombstone ?? opts.tombstone ?? true,
     allHealthySupportBlobAttachments: () => opts.blobs ?? true,
@@ -2484,6 +2488,19 @@ describe("operational endpoints", () => {
     ready = false;
     expect((await app.request("/readyz")).status).toBe(503);
     expect((await app.request("/healthz")).status).toBe(200); // liveness stays up while draining
+  });
+
+  it("advertises operator hooks only when the entire configured fleet explicitly supports them", async () => {
+    const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner",
+      features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true,
+        sessionLifecycle: [], dynamicTools: true, mcp: [], skills: false, hooks: true, sandbox: ["none"], byok: true } }) }));
+    for (const supported of [true, false]) {
+      const app = createRouterApp({ registry: fakeRegistry([a.url], { hooks: supported }), logger: silent });
+      const response = await app.request("/v1/capabilities");
+      expect(response.status).toBe(200);
+      const capabilities = Capabilities.parse(await response.json());
+      expect(capabilities.features.hooks).toBe(supported);
+    }
   });
 
   it("answers capabilities from a runner rather than inventing them", async () => {

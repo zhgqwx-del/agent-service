@@ -1126,6 +1126,7 @@ export type components = {
                 readonly dynamicTools: boolean;
                 /** @default [] */
                 readonly erasureJobControl?: readonly ("quarantine-v1" | "legacy-tombstone-compensation-v1")[];
+                readonly hooks?: boolean;
                 readonly mcp: readonly ("streamable-http" | "stdio")[];
                 /** @default [] */
                 readonly ordinarySessionUsageRetention?: readonly "local-operational-usage-v1"[];
@@ -1927,6 +1928,22 @@ export type components = {
             /** @enum {string} */
             readonly type: "approval/resolved";
         } | {
+            readonly configSha256: string;
+            readonly emittedAtMs: number;
+            readonly hookId: string;
+            /** @enum {string} */
+            readonly kind: "deny-tools" | "observe-tool-result" | "webhook";
+            /** @enum {string} */
+            readonly outcome: "allowed" | "denied" | "tool_success" | "tool_error" | "acknowledged" | "failed" | "cancelled" | "skipped" | "timed_out";
+            /** @enum {string} */
+            readonly phase: "preToolUse" | "postToolUse";
+            readonly seq: number;
+            readonly sessionId: string;
+            readonly toolCallId: string;
+            readonly turnId: string;
+            /** @enum {string} */
+            readonly type: "hook/completed";
+        } | {
             readonly emittedAtMs: number;
             readonly runtime: {
                 readonly model: string;
@@ -1986,7 +2003,6 @@ export type components = {
             readonly code: string;
             readonly emittedAtMs: number;
             readonly message: string;
-            readonly seq: number;
             readonly sessionId: string;
             readonly turnId?: string;
             /** @enum {string} */
@@ -2016,11 +2032,6 @@ export type components = {
             readonly turnId: string;
             /** @enum {string} */
             readonly type: "item/toolCall/argsDelta";
-        } | {
-            readonly emittedAtMs: number;
-            readonly sessionId: string;
-            /** @enum {string} */
-            readonly type: "heartbeat";
         };
         /** @enum {string} */
         readonly ExcludableEventType: "item/reasoning/delta" | "item/toolCall/argsDelta" | "item/agentMessage/delta" | "usage/updated" | "heartbeat";

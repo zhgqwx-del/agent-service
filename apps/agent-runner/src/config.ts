@@ -9,6 +9,7 @@ import {
 import { z } from "zod";
 import { loadMcpConfig } from "./mcp-config.js";
 import { parseStaticSkillsConfig } from "./skills-config.js";
+import { loadToolHooksConfig } from "./hooks-config.js";
 import {
   loadTenantRestoreJournalConfig,
   type TenantRestoreJournalRuntimeConfig,
@@ -375,6 +376,7 @@ function loadStaticSkillsRuntimeConfig(env: NodeJS.ProcessEnv): StaticSkillsRunt
 export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOKEN"> & {
   mcp: ReturnType<typeof loadMcpConfig>;
   skills: StaticSkillsRuntimeConfig;
+  hooks: ReturnType<typeof loadToolHooksConfig>;
   RUNNER_ID: string;
   INTERNAL_ROUTER_TOKEN: string;
   runnerAddr: string;
@@ -1078,6 +1080,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     ...c,
     mcp: loadMcpConfig(env),
     skills: loadStaticSkillsRuntimeConfig(env),
+    hooks: loadToolHooksConfig(env),
     BLOB_S3_ENDPOINT: s3Endpoint,
     TENANT_TELEMETRY_S3_ENDPOINT: tenantTelemetryS3Endpoint,
     TENANT_TELEMETRY_S3_BUCKET: tenantTelemetryS3Bucket,
