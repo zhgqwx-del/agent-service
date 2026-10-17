@@ -65,6 +65,7 @@ export interface RunnerTarget {
 }
 
 export interface RunnerRegistryOptions {
+  skillRegistryStorage?: Capabilities["features"]["skillRegistryStorage"];
   runners: string[];
   /** Shared only with runners; required for fresh private runtime-drain identity probes. */
   internalRouterToken?: string;
@@ -309,6 +310,17 @@ export class RunnerRegistry {
     const configured = this.list();
     return configured.length > 0 && configured.every((target) => target.healthy
       && target.capabilities?.features.skills === true);
+  }
+
+  allConfiguredSupportSkillRegistry(): boolean {
+    const expected = this.opts.skillRegistryStorage, configured = this.list();
+    return !!expected && configured.length > 0 && (expected.shared || configured.length === 1)
+      && configured.every(target => {
+        const actual = target.capabilities?.features.skillRegistryStorage;
+        return target.healthy && target.capabilities?.features.skillRegistry.includes("managed-skill-registry-v1")
+          && !!actual && actual.backend === expected.backend && actual.shared === expected.shared
+          && actual.namespaceSha256 === expected.namespaceSha256 && this.matchesConfiguredBlobStorage(target);
+      });
   }
 
   allConfiguredSupportHooks(): boolean {
@@ -990,6 +1002,14 @@ export class RunnerRegistry {
 
   /** A retention boundary cannot inherit a probe that started before its own request. */
   async refreshOrdinarySessionUsageRetention(signal = AbortSignal.timeout(5_000)): Promise<void> {
+    return this.refreshFeatureBoundary(signal);
+  }
+
+  async refreshSkillRegistry(signal = AbortSignal.timeout(5_000)): Promise<void> {
+    return this.refreshFeatureBoundary(signal);
+  }
+
+  private async refreshFeatureBoundary(signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
     const assertCurrent = () => {
       signal.throwIfAborted();

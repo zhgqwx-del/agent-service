@@ -1,5 +1,7 @@
 # 本地运维与后续部署契约
 
+> 受管 skills 注册包候选（2026-10-17，优先于下方历史候选状态）：本包尚未提交、未完成整包验收，默认 `SKILL_REGISTRY_ENABLED=0`。只有验收后才可在全新隔离本地 MySQL 库与独占 Blob namespace 手动启用；不要把现业务 `MYSQL_URL` 交给带自动迁移的 runner。它不增加服务、入口、CLI 或镜像；合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)，隔离体验步骤见[学习指南](development-and-ci-guide.md#受管-skills-注册包验收后的隔离体验)。下方旧提交/失败证据保留，不替代当前候选或最终 SHA CI。
+
 > M3 受限切片配置（2026-10-17）：MCP、静态skills、tool hooks各自使用默认关闭的operator配置，随runner发布，须whole-fleet停服排空后统一变更。参见 [MCP](../design/06-mcp.md)、[skills](../design/07-skills.md)、[hooks](../design/08-tool-hooks.md)。它们不增加服务或镜像；hook key只由独立受保护文件提供，不写入环境JSON。本地分段不能代替当前SHA发布门禁，更不是云/生产启用验收；精确证据看PROGRESS，发布状态核对当前main Checks。
 
 > 当前状态（2026-10-16，优先于下方历史候选说明）：已发布 main `6fdb63c` 的五项 CI 全绿，隔离本地体验完成；当前工作树的 M3.1a MCP 尚为未发布候选，不能借旧 CI 背书。部署仍是 router/runner 两个独立服务，提供 OS/架构匹配、含 Node 生产依赖的 VM 目录包及两个容器镜像；不是 Windows/Linux 系统镜像或单文件原生二进制。云资源、生产信任根及真实环境验收仍待用户提供；MCP 不新增长期服务或产品入口，默认关闭，配置/完整未完范围见 [MCP 设计](../design/06-mcp.md)。
@@ -102,6 +104,22 @@ systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝�
 `check:vm-release`只使用新临时目录、synthetic测试key和memory后端，先独立构建两套依赖闭包，再以plain Node运行四个CLI帮助入口与两个真实进程，验证readiness、协议、租户/平台认证边界、转发和canonical OpenAPI，停止后重新验真目录未被runtime修改；成功metadata保存于`.local-run/vm-release-proof.json`。`test:vm-release`要求逐JSON证明非零实际passed、零其它状态。CI默认拒绝dirty构建，本地`verify`显式允许dirty开发快照而不产生发布许可。Windows运行潜力不等于测试证明，systemd、跨VM、MySQL/TLS/IAM、容量、整体deadline及真实staging/production仍需独立验收；不会因此进入M3或冻结M1。
 
 ## 本地生命周期
+
+### 受管 skills 的隔离启用边界（候选，验收后使用）
+
+`SKILLS_ENABLED` 仍控制旧 operator 静态 mount；新 `SKILL_REGISTRY_ENABLED` 在 router/runner 各自默认 `0`，两者不能互相代替。`0060` 是独立 metadata 域，包只接收一个不超过 64 KiB UTF-8 的 `SKILL.md`，不执行脚本或抓取引用。升级要求关闭 gate、全部旧 writer 停服排空、独立迁移并核对严格指纹，再运行统一新版本；禁止热混跑、删 marker/guard 或让普通启动自动修复业务库。
+
+验收后的首次体验须由操作者确认一个此前不存在的新可丢弃数据库和独占 Blob namespace，使用受保护配置，不回显 DSN/key/token。filesystem 模式还需显式 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`、`BLOB_NAMESPACE_ID` 与私有目录，router configured runner 数量恰好为一，production 拒绝；ID 只是一项 operator 声明，不证明跨 VM 的物理共享。多 runner 走已有受控共享 S3 namespace/control，router 对全部 configured 地址做 fresh capability/storage identity 核对；缺配置、旧版本、不健康实例或 namespace 分歧均拒绝，不选 healthy subset 降级。云 IAM/TLS/容量与实际预发/生产验收待资源，不在这里生成云参数。
+
+权限和学习观察点：
+
+- user-own `POST/GET/DELETE /v1/skills` 由 `requireUser` 的实际身份授权，普通 runtime key 即可，不要求 admin；tenant scope 管理读写要求同 tenant admin，不能在正文指定其它 tenant/user。
+- 平台 `/v1/platform/skills` 只在 router 消费独立 `SKILL_REGISTRY_OPERATOR_TOKEN`，通过既有可信 internal token 的版本化私有渠道转发。这个 token 不能重用 tenant-erasure/operator、internal、metrics 或普通业务凭据，绝不进入 runner；runner 会主动拒绝 ambient 同名变量。普通 verify 清除该 token 并保持 registry gate 关闭；专项测试自行闭合启用。
+- agent 使用显式 `registry:<lower-kebab-name>` selector，旧 mount id 保持原义；最多 8 个。user > tenant > platform，session 代建按实际 owner 解析。turn start 的 `skillOverrides:[{name,versionId}]` 只 pin 已挂载且授权的 immutable version，不扩权；steer 不接受替换 override。显式输入/模型结果中的精确 snapshot 随业务 COMMIT 持久化，回放和 compaction 不重读当前文件。
+- `GET /v1/skills/export` 仅 actual user-own，独立版本化 profile，包含已发布历史/已逻辑删除内容；后续页必须带原 cursor/snapshot digest，漂移返回 `409` 重启。响应不含 locator、upload token 或 backend，固定 `physicalErasureComplete=false`，不重释旧 NDJSON 制品。
+- DELETE 需精确 permanent revision 与 `Idempotency-Key`；它撤销该 generation 的后续消费，不做物理清理或自动释放 stage/历史配额。物理 package purge、namespace 搬迁、backup/restore 覆盖是未完成 P2；registry footprint 会阻断未覆盖该域的新 T3d/T3f，旧 Blob activation/mover 也不能遗漏它后切换 namespace。旧 receipt/unknown/completion 门禁不变。
+
+候选测试入口为 `pnpm test:skills`、`pnpm test:skills-mysql`、新增 `pnpm test:skills-s3` 和独立历史迁移。真实 MySQL/Fs/Pi 或 MySQL+MinIO 证据不能由 Memory/mock、命令登记或旧 CI 代替；后续完整 verify/verify-s3、cluster、dist、VM 与最终 SHA 的 CI 仍须分别核验。本包仍只有 router/runner 两个常驻服务、六个 JS 发布入口、四个 one-shot CLI、两个产品镜像和两种角色 VM 包；不是新增 skills 服务。
 
 `0053`补充默认关闭、仅限非生产本地的 persisted provider-step failure capture v2。只有真实模型 stream 的失败来源可在原 failed-step 业务 COMMIT 内，与 item/completed、usage/billing、连续 event seq、source/binding/receipt 和0034 spool/membership 一起原子提交；不是独立 logger，也不改变 SessionHost 后续 turn-terminal 第二次 COMMIT/interrupt 语义。runner `PERSISTED_PROVIDER_FAILURE_CAPTURE_ENABLED` 与 router `PERSISTED_PROVIDER_FAILURE_CAPTURE_FLEET_ENABLED` 均默认 `0`，production 拒绝开启。需先以受控 operator 激活0033 lifecycle与v2 logs，精确绑定已真实激活的0030 primary runtime epoch/lineage、protected key、logs target及configured-fleet root；只设置环境变量或generation-0 control不能满足前提。0035 v1及traces必须inactive。
 

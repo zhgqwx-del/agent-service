@@ -6,6 +6,10 @@ import {
   type RouteConfig,
 } from "@asteasolutions/zod-to-openapi";
 import {
+  SkillInstallRequest, PlatformSkillInstallRequest, SkillDeleteRequest, PlatformSkillDeleteRequest,
+  SkillListQuery, PlatformSkillListQuery, SkillScopeQuery, SkillVersionsQuery, PlatformSkillVersionsQuery,
+  SkillNameParams, SkillVersionParams, SkillRegistryHeaders, SkillVersionResponse, InstalledSkillResponse,
+  SkillListResponse, SkillVersionsResponse, SkillDocumentResponse, SkillExportQuery, SkillExportResponse,
   AgentDefinitionRequest,
   AgentDefinitionResponse,
   AgentIdParams,
@@ -219,9 +223,23 @@ export function buildOpenApiDocument() {
     bearerFormat: "AgentServicePlatformOperatorToken",
     description: "Platform lifecycle operator credential. It is independent from every tenant service API key.",
   });
+  registry.registerComponent("securitySchemes", "SkillRegistryOperatorToken", {
+    type: "http", scheme: "bearer", bearerFormat: "SkillRegistryOperatorToken",
+    description: "Independent router-only platform skill registry authority; never a tenant erasure or runtime credential.",
+  });
 
   const schemas = {
     error: registry.register("ErrorBody", ErrorBody),
+    skillInstall: registry.register("SkillInstallRequest", SkillInstallRequest),
+    platformSkillInstall: registry.register("PlatformSkillInstallRequest", PlatformSkillInstallRequest),
+    skillDelete: registry.register("SkillDeleteRequest", SkillDeleteRequest),
+    platformSkillDelete: registry.register("PlatformSkillDeleteRequest", PlatformSkillDeleteRequest),
+    skillVersion: registry.register("SkillVersionResponse", SkillVersionResponse),
+    installedSkill: registry.register("InstalledSkillResponse", InstalledSkillResponse),
+    skillList: registry.register("SkillListResponse", SkillListResponse),
+    skillVersions: registry.register("SkillVersionsResponse", SkillVersionsResponse),
+    skillDocument: registry.register("SkillDocumentResponse", SkillDocumentResponse),
+    skillExport: registry.register("SkillExportResponse", SkillExportResponse),
     event: registry.register("Event", EventStreamEvent),
     erasureRequest: registry.register("ErasureRequest", ErasureRequest),
     tenantErasureCreate: registry.register("TenantErasureCreateRequest", TenantErasureCreateRequest),
@@ -283,6 +301,40 @@ export function buildOpenApiDocument() {
   };
 
   // ---------- unauthenticated global surface ----------
+  // Managed skill packages remain separate from session Blob uploads and static operator mounts.
+  for (const platform of [false, true]) {
+    const path = platform ? "/v1/platform/skills" : "/v1/skills";
+    const suffix = platform ? "PlatformSkill" : "Skill";
+    const security = platform ? [{ SkillRegistryOperatorToken: [] }] : [...userSecurity, ...serviceSecurity];
+    const scopeQuery = platform ? undefined : SkillScopeQuery;
+    register({ method: "post", path, operationId: `install${suffix}`, tags: ["Skills"], security,
+      summary: "Install a scanned SKILL.md-only immutable version with exact revision CAS",
+      request: { headers: SkillRegistryHeaders, body: jsonBody(platform ? schemas.platformSkillInstall : schemas.skillInstall, "SKILL.md document; no files, paths or scripts.") },
+      responses: { 201: jsonResponse(schemas.skillVersion, "Published immutable version."), default: errorResponse } });
+    register({ method: "get", path, operationId: `list${suffix}s`, tags: ["Skills"], security,
+      summary: "List installations; tenant scope requires an admin key",
+      request: { query: platform ? PlatformSkillListQuery : SkillListQuery },
+      responses: { 200: jsonResponse(schemas.skillList, "Scope-isolated installations."), default: errorResponse } });
+    register({ method: "get", path: `${path}/{name}`, operationId: `get${suffix}`, tags: ["Skills"], security,
+      summary: "Read installation revision metadata without storage authority",
+      request: { params: SkillNameParams, ...(scopeQuery ? { query: scopeQuery } : {}) },
+      responses: { 200: jsonResponse(schemas.installedSkill, "Installation, including a logical deletion revision."), default: errorResponse } });
+    register({ method: "delete", path: `${path}/{name}`, operationId: `delete${suffix}`, tags: ["Skills"], security,
+      summary: "Logically delete an installation with exact revision CAS; not physical erasure",
+      request: { params: SkillNameParams, headers: SkillRegistryHeaders, body: jsonBody(platform ? schemas.platformSkillDelete : schemas.skillDelete, "Exact expected revision.") },
+      responses: { 200: jsonResponse(schemas.installedSkill, "Deleted installation revision."), default: errorResponse } });
+    register({ method: "get", path: `${path}/{name}/versions`, operationId: `list${suffix}Versions`, tags: ["Skills"], security,
+      summary: "List authorized immutable versions",
+      request: { params: SkillNameParams, query: platform ? PlatformSkillVersionsQuery : SkillVersionsQuery },
+      responses: { 200: jsonResponse(schemas.skillVersions, "Bounded immutable version page."), default: errorResponse } });
+    register({ method: "get", path: `${path}/{name}/versions/{versionId}`, operationId: `read${suffix}Version`, tags: ["Skills"], security,
+      summary: "Read authorized SKILL.md bytes and version metadata",
+      request: { params: SkillVersionParams, ...(scopeQuery ? { query: scopeQuery } : {}) },
+      responses: { 200: jsonResponse(schemas.skillDocument, "Exact checked document."), default: errorResponse } });
+  }
+  register({ method: "get", path: "/v1/skills/export", operationId: "exportUserSkills", tags: ["Skills"], security: userSecurity,
+    summary: "Export only the current authenticated user's registry snapshot; continuation is digest-bound",
+    request: { query: SkillExportQuery }, responses: { 200: jsonResponse(schemas.skillExport, "Versioned snapshot page; physical erasure remains incomplete."), default: errorResponse } });
 
   register({
     method: "get",
@@ -1010,8 +1062,8 @@ export function buildOpenApiDocument() {
     responses: { 200: jsonResponse(schemas.approval, "Resolved approval."), default: errorResponse },
   });
 
-  if (operationIds.size !== 55) {
-    throw new Error(`expected 55 public OpenAPI operations, registered ${operationIds.size}`);
+  if (operationIds.size !== 68) {
+    throw new Error(`expected 68 public OpenAPI operations, registered ${operationIds.size}`);
   }
 
   const document = new OpenApiGeneratorV31(registry.definitions).generateDocument({

@@ -34,8 +34,8 @@ export const AgentDefinition = z.object({
   tools: z.array(externalId).default([]),
   /** mcp server ids mounted for this agent */
   mcpServers: z.array(externalId).default([]),
-  /** Operator skill mount ids, not frontmatter names or paths. Historical snapshots stay readable;
-   * current HTTP writes use the bounded distinct-id grammar and actual-owner mount authorization. */
+  /** Exact legacy operator mount ids or explicit registry:<name> selectors. Historical snapshots
+   * stay readable; current HTTP writes use bounded selectors and actual-owner authorization. */
   skills: z.array(externalId).default([]),
   limits: Limits.default({}),
   approvalPolicy: ApprovalPolicy.default("on-request"),

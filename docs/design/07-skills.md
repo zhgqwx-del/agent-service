@@ -1,4 +1,6 @@
-# M3 静态 skills：operator Markdown 切片
+# M3 skills：静态挂载与受管注册包
+
+> 当前候选（2026-10-17，未发布验收）：下述静态挂载是已通过 ad92 CI 的初始范围；新增受管注册包的产品代码和测试已落，边界见第 6 节。纯定向 14 文件 352 项及类型检查通过，0060 已在隔离真实 MySQL 校准；真实纵向、历史升级与整包验收仍待。不能以旧静态切片的 CI 背书新增注册能力。
 
 状态：本地受限切片已实现，真实regular文件、协议/配置、Memory/Host、真实MySQL提交时序/停服冷读及plain-Node调用均已有分段验证；整合检查点25d0e6a的正式MySQL纵向再次通过。共享Principal语法保留合法Unicode tenant，129字符及非法UserId仍拒绝。完整发布状态只认当前main exact-SHA CI，精确证据看 [PROGRESS](../PROGRESS.md)。本节不表示整体M3、生产或完整生命周期验收完成。
 
@@ -78,3 +80,45 @@ YAML 的 Node CommonJS entry 随闭包打入 ESM；发布脚本提供仅允许�
 本切片不新增 SQL、常驻服务、JavaScript 产品入口或镜像；仍是 router/runner 两服务、六入口、两镜像。租户上传、版本存储/包分发、三级覆盖、安装 guard、webhook/hooks、脚本与隔离重池属于后续独立消费者，不能据本模块存在宣称已完成。
 
 M1 仍未冻结、M2 冻结，M3 只交付有界增量。0037 hard-deny、0054 original-primary-only destructive、旧 receipt/unknown 不提升、外部删除/自动清理关闭与全域 completion=false 不变；该文本能力不扩大原 M1/P2 权限或灾备承诺。
+
+## 6. 受管注册包候选：独立版本域
+
+本包接入独立 MySQL metadata 与对象包，不把技能伪装成 session、`input_image` 或 `tool_output`。当前可安装包只含一个 `SKILL.md`；引用、代码块和模板均为文本，不执行脚本、不下载 references。`SKILL_REGISTRY_ENABLED=0` 默认关闭，和旧 `SKILLS_ENABLED` 分开；它不新增服务、进程、JavaScript 发布入口或镜像。
+
+### 选择与调用
+
+旧 agent `skills` 中的 operator mount id 保持原义；新注册名显式写作 `registry:review-change`。最多 8 个 selector，静态和注册源解析成同名时拒绝歧义。正常解析优先级为 user > tenant > platform；turn start 可带 `skillOverrides:[{name,versionId}]`，只选择已挂载同名、当前授权 generation 中的不可变版本，形成 request > user > tenant > platform。它不是新权限或新挂载，也不接受目录、URL 或原始指令正文。
+
+session 代建仍按实际 session owner 解析。override 进入请求幂等 hash、实际显式输入和模型 `skill` 工具；steer 沿用已接受 turn 的选择，不接受中途替换 override。调用标志、dependencies、typed snapshot、Blob 水合、历史回放及 compaction 预算仍按第 3～4 节执行。
+
+### 安装、并发与权限
+
+`POST /v1/skills` 接受闭合的 `{scope,document,expectedRevision}`，变更还须 `Idempotency-Key`。user scope 只需实际用户身份，不强制 admin；tenant scope 只许同 tenant admin。平台管理位于独立 `/v1/platform/skills`，只由 router 验证专用 `SKILL_REGISTRY_OPERATOR_TOKEN`，通过 versioned 私有 route 转发；runner 拒绝该环境变量，也不接收平台 bearer。服务端原始 access/admission 对象不是 HTTP 可序列化权限，更不能代替此前的真实认证。
+
+安装依次严格解析、扫描原始内容、提交独立 staging、create-only 写对象、读回核对实际 bytes，再原子发布 immutable version 与 current pointer。对象键为服务端 opaque 小写安全片段，不使用 `SKILL.md` 作为底层键。版本绑定完整文档摘要、metadata、scope/owner、parser/guard profile、backend 与 namespace。失败保留精确 stage 供同 key 重试；ready replay 不重建已丢失对象。
+
+registry 操作含 export 在显式 S3 I/O settlement scope 中保留 provider 租约，原请求/响应流超时后仍等待底层 SDK、迟到 Body 和实际 reader 结清，`close()` 不提前报告排空。不同 scope 不全局串行，原非 scope S3 请求期限与全局 close 不变。底层不响应取消可能使排空超期；本地结清不证明远端 mutation 已取消或回滚，仍需精确 staging/replay 协议。
+
+slot 的 revision/generation 永久保留。`expectedRevision=0` 只允许从未存在的 slot；删除/重建须精确当前 revision，旧 generation 的 stage、版本和 replay 不得复活。Memory 采用完整图片的单次原子发布；新 registry MySQL 事务采用 RC + exact owner-control X 锁串行所有同 owner 读写，子行仍为 current locking reads，避免不同 owner 空区间的 RR gap 死锁。旧 M1 的 RR 事务不改。mutation 的 DB time 在 owner 锁等待后采样；1205/1213 只返回固定可重试 503，不自动重试或回显 SQL。
+
+每 owner 最多 256 个 slot、每 slot 最多 128 个版本、全部已 admission 包（包括 stage/历史）累计最多 8 MiB，分页最多 100。未完成 stage 和逻辑删除 bytes 不自动释放该容量；这是当前保守配额，不是物理清理完成证明。
+
+### 安装 guard
+
+固定翻译 [Hermes skills_guard.py](https://github.com/NousResearch/hermes-agent/blob/ee472a7fdbbc55924f91ab122dbaa29bd07668b0/tools/skills_guard.py) 的 SKILL.md 适用规则，源 SHA256 为 `9534cf7b658ec0cb6c85dc2c35fa08a4b46a3a1284be1bbe3c4af2deeb4df7a0`，保留 MIT 归属。`skills-guard-v1` 的 high/critical 阻断，medium/low 仅信息；没有 trust/ignore/force 绕过。结果只保留 rule id、severity、category 和行号，不回显匹配正文。
+
+本地翻译额外采用线性空白/Unicode 字符类规范化与行、word、boundary、finding 工作量上限，超限阻断而非截断后放行；原文 digest、行号与 invisible 检查不变。它是保守启发式，不宣称与 Python 对任意输入完全等价，也不证明文本安全，更不授予工具或执行能力。
+
+### 分发、导出与逻辑删除
+
+独立 `managed-skill-registry-v1` capability 与 storage identity 需要全部 configured runner 的 fresh 探测一致，不能用旧 `skills=true` 或 healthy subset 代替。filesystem 只允许显式本地单 runner + `BLOB_FILESYSTEM_SINGLE_RUNNER=1` + `BLOB_NAMESPACE_ID`，production 拒绝；该 ID 是 operator 声明，不证明其它主机同路径。多 runner 复用已受控的共享 S3 adapter/namespace，真实云 IAM/TLS/容量验收仍待资源。存在 registry footprint 时，旧 Blob activation/mover 不得忽略新域后切换 backend/namespace；当前拒绝，而非假称已支持迁移这些包。
+
+`DELETE /v1/skills/:name` 逻辑删除后，新 runtime list/load/override 均不可使用该 generation。tenant/user erasure gate 同样阻止后续读取与发布。受管 bytes 物理清理尚未实现，不扩写旧33域 plan/旧 receipt；非空 registry 域会阻断未覆盖它的新 T3d/T3f，而不是静默跳过或推进全域 completion。
+
+用户通过 `GET /v1/skills/export` 导出独立 `user-skill-registry-export-v1` 分页：仅实际 user-own，包含全部当前/已删除 slot 与已发布历史版本的原始文档，排除未提交 stage。每页最多 25 个版本；后续 cursor 必须携带原 `snapshotSha256`，完整 owner projection 前后不一致返回 409 重启，不混页。响应无 owner ID、locator、upload token 或 backend，显式 `physicalErasureComplete=false`。这是 registry 域补充导出，不改写旧 `ndjson-v1` 制品，也不是 durable snapshot pin；并发变更可使分页需重启。
+
+### 发布与待验收
+
+`0060` 为 expand-only 的 5 表/20 guard，不回填、联网、激活或删除。严格全库 fingerprint 变化要求先关闭 gate、完全排空 pre-0060 writer，再独立迁移并运行新代码；不能热混跑、删 marker/guard，失败只 forward-fix。独立真实升级 fixture 的前态为 SQL-shaped 0059，不冒称冻结旧二进制。
+
+安装/调用/导出/删除、真实 MySQL 事务与 MySQL+MinIO 双客户端、API/SDK、历史升级和完整门禁需各自实际执行后才验收；当前进度只认 PROGRESS 末节。物理 package purge、namespace 搬迁、backup/restore 覆盖与云环境证据继续明确后置，旧 completion/unknown 和删除授权边界不变。

@@ -272,6 +272,76 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/platform/skills": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** List installations; tenant scope requires an admin key */
+        readonly get: operations["listPlatformSkills"];
+        readonly put?: never;
+        /** Install a scanned SKILL.md-only immutable version with exact revision CAS */
+        readonly post: operations["installPlatformSkill"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/platform/skills/{name}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read installation revision metadata without storage authority */
+        readonly get: operations["getPlatformSkill"];
+        readonly put?: never;
+        readonly post?: never;
+        /** Logically delete an installation with exact revision CAS; not physical erasure */
+        readonly delete: operations["deletePlatformSkill"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/platform/skills/{name}/versions": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** List authorized immutable versions */
+        readonly get: operations["listPlatformSkillVersions"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/platform/skills/{name}/versions/{versionId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read authorized SKILL.md bytes and version metadata */
+        readonly get: operations["readPlatformSkillVersion"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/providers": {
         readonly parameters: {
             readonly query?: never;
@@ -701,6 +771,93 @@ export type paths = {
         readonly patch?: never;
         readonly trace?: never;
     };
+    readonly "/v1/skills": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** List installations; tenant scope requires an admin key */
+        readonly get: operations["listSkills"];
+        readonly put?: never;
+        /** Install a scanned SKILL.md-only immutable version with exact revision CAS */
+        readonly post: operations["installSkill"];
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/skills/{name}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read installation revision metadata without storage authority */
+        readonly get: operations["getSkill"];
+        readonly put?: never;
+        readonly post?: never;
+        /** Logically delete an installation with exact revision CAS; not physical erasure */
+        readonly delete: operations["deleteSkill"];
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/skills/{name}/versions": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** List authorized immutable versions */
+        readonly get: operations["listSkillVersions"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/skills/{name}/versions/{versionId}": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Read authorized SKILL.md bytes and version metadata */
+        readonly get: operations["readSkillVersion"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
+    readonly "/v1/skills/export": {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** Export only the current authenticated user's registry snapshot; continuation is digest-bound */
+        readonly get: operations["exportUserSkills"];
+        readonly put?: never;
+        readonly post?: never;
+        readonly delete?: never;
+        readonly options?: never;
+        readonly head?: never;
+        readonly patch?: never;
+        readonly trace?: never;
+    };
     readonly "/v1/tenant-erasure-requests": {
         readonly parameters: {
             readonly query?: never;
@@ -935,7 +1092,7 @@ export type components = {
             readonly name: string;
             /** @enum {string} */
             readonly sandbox: "none";
-            /** @description Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled. */
+            /** @description Persisted exact operator ids or explicit registry:<name> selectors, checked for the actual session owner. Historical records remain readable while skills are disabled. */
             readonly skills: readonly string[];
             readonly tenantId: string;
             readonly tools: readonly string[];
@@ -985,10 +1142,10 @@ export type components = {
              */
             readonly sandbox?: "none";
             /**
-             * @description Requires configured static skills support. These are exact operator mount ids, not paths; no upload, registration, scripts, or tool authorization are accepted here.
+             * @description Exact operator mount ids or registry:<name>; registry selection requires managed-skill-registry-v1. No filesystem path or additional tool authorization is accepted.
              * @default []
              */
-            readonly skills?: readonly string[];
+            readonly skills?: readonly (string)[];
             /** @default [] */
             readonly tools?: readonly string[];
         };
@@ -1023,7 +1180,7 @@ export type components = {
                 readonly name: string;
                 /** @enum {string} */
                 readonly sandbox: "none";
-                /** @description Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled. */
+                /** @description Persisted exact operator ids or explicit registry:<name> selectors, checked for the actual session owner. Historical records remain readable while skills are disabled. */
                 readonly skills: readonly string[];
                 readonly tenantId: string;
                 readonly tools: readonly string[];
@@ -1141,6 +1298,14 @@ export type components = {
                 };
                 readonly sandbox: readonly "none"[];
                 readonly sessionLifecycle: readonly ("archive" | "unarchive" | "tombstone" | "purge")[];
+                /** @default [] */
+                readonly skillRegistry?: readonly "managed-skill-registry-v1"[];
+                /** @default null */
+                readonly skillRegistryStorage?: {
+                    readonly backend: string;
+                    readonly namespaceSha256: string;
+                    readonly shared: boolean;
+                } | null;
                 readonly skills: boolean;
                 /** @enum {boolean} */
                 readonly streaming: true;
@@ -2041,6 +2206,19 @@ export type components = {
         };
         /** @enum {string} */
         readonly ExcludableEventType: "item/reasoning/delta" | "item/toolCall/argsDelta" | "item/agentMessage/delta" | "usage/updated" | "heartbeat";
+        readonly InstalledSkillResponse: {
+            readonly createdAtMs: number;
+            /** Format: uuid */
+            readonly currentVersionId: string | null;
+            readonly generation: number;
+            readonly name: string;
+            readonly revision: number;
+            /** @enum {string} */
+            readonly scope: "platform" | "tenant" | "user";
+            /** @enum {string} */
+            readonly state: "active" | "deleted";
+            readonly updatedAtMs: number;
+        };
         readonly ItemListResponse: {
             readonly data: readonly ({
                 readonly completedAtMs?: number;
@@ -2301,6 +2479,13 @@ export type components = {
             readonly paths: {
                 readonly [key: string]: unknown;
             };
+        };
+        readonly PlatformSkillDeleteRequest: {
+            readonly expectedRevision: number;
+        };
+        readonly PlatformSkillInstallRequest: {
+            readonly document: string;
+            readonly expectedRevision: number;
         };
         readonly ProviderConfig: {
             /** @enum {string} */
@@ -2667,6 +2852,156 @@ export type components = {
             }[];
             readonly nextCursor: string | null;
         };
+        readonly SkillDeleteRequest: {
+            readonly expectedRevision: number;
+            /** @enum {string} */
+            readonly scope: "tenant" | "user";
+        };
+        readonly SkillDocumentResponse: {
+            readonly document: string;
+            readonly version: {
+                readonly createdAtMs: number;
+                readonly generation: number;
+                readonly metadata: {
+                    readonly dependencies: {
+                        readonly tools: readonly string[];
+                    };
+                    readonly description: string;
+                    readonly disableModelInvocation: boolean;
+                    readonly name: string;
+                    readonly userInvocable: boolean;
+                    readonly whenToUse: string | null;
+                };
+                readonly name: string;
+                readonly revision: number;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+                readonly sha256: string;
+                readonly sizeBytes: number;
+                /** Format: uuid */
+                readonly versionId: string;
+                readonly versionSha256: string;
+            };
+        };
+        readonly SkillExportResponse: {
+            /** Format: uuid */
+            readonly nextCursor: string | null;
+            /** @enum {boolean} */
+            readonly physicalErasureComplete: false;
+            /** @enum {string} */
+            readonly schema: "user-skill-registry-export-v1";
+            /** @enum {string} */
+            readonly scope: "user";
+            readonly slots: readonly {
+                readonly createdAtMs: number;
+                /** Format: uuid */
+                readonly currentVersionId: string | null;
+                readonly generation: number;
+                readonly name: string;
+                readonly revision: number;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+                /** @enum {string} */
+                readonly state: "active" | "deleted";
+                readonly updatedAtMs: number;
+            }[];
+            readonly snapshotSha256: string;
+            readonly versions: readonly {
+                readonly createdAtMs: number;
+                readonly document: string;
+                readonly generation: number;
+                readonly metadata: {
+                    readonly dependencies: {
+                        readonly tools: readonly string[];
+                    };
+                    readonly description: string;
+                    readonly disableModelInvocation: boolean;
+                    readonly name: string;
+                    readonly userInvocable: boolean;
+                    readonly whenToUse: string | null;
+                };
+                readonly name: string;
+                readonly revision: number;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+                readonly sha256: string;
+                readonly sizeBytes: number;
+                /** Format: uuid */
+                readonly versionId: string;
+                readonly versionSha256: string;
+            }[];
+        };
+        readonly SkillInstallRequest: {
+            readonly document: string;
+            readonly expectedRevision: number;
+            /** @enum {string} */
+            readonly scope: "tenant" | "user";
+        };
+        readonly SkillListResponse: {
+            readonly data: readonly {
+                readonly createdAtMs: number;
+                /** Format: uuid */
+                readonly currentVersionId: string | null;
+                readonly generation: number;
+                readonly name: string;
+                readonly revision: number;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+                /** @enum {string} */
+                readonly state: "active" | "deleted";
+                readonly updatedAtMs: number;
+            }[];
+            readonly nextCursor: string | null;
+        };
+        readonly SkillVersionResponse: {
+            readonly createdAtMs: number;
+            readonly generation: number;
+            readonly metadata: {
+                readonly dependencies: {
+                    readonly tools: readonly string[];
+                };
+                readonly description: string;
+                readonly disableModelInvocation: boolean;
+                readonly name: string;
+                readonly userInvocable: boolean;
+                readonly whenToUse: string | null;
+            };
+            readonly name: string;
+            readonly revision: number;
+            /** @enum {string} */
+            readonly scope: "platform" | "tenant" | "user";
+            readonly sha256: string;
+            readonly sizeBytes: number;
+            /** Format: uuid */
+            readonly versionId: string;
+            readonly versionSha256: string;
+        };
+        readonly SkillVersionsResponse: {
+            readonly data: readonly {
+                readonly createdAtMs: number;
+                readonly generation: number;
+                readonly metadata: {
+                    readonly dependencies: {
+                        readonly tools: readonly string[];
+                    };
+                    readonly description: string;
+                    readonly disableModelInvocation: boolean;
+                    readonly name: string;
+                    readonly userInvocable: boolean;
+                    readonly whenToUse: string | null;
+                };
+                readonly name: string;
+                readonly revision: number;
+                /** @enum {string} */
+                readonly scope: "platform" | "tenant" | "user";
+                readonly sha256: string;
+                readonly sizeBytes: number;
+                /** Format: uuid */
+                readonly versionId: string;
+                readonly versionSha256: string;
+            }[];
+            readonly nextCursor: string | null;
+        };
         readonly StartTurnRequest: {
             /** @enum {string} */
             readonly busyPolicy?: "steer" | "reject";
@@ -2711,6 +3046,11 @@ export type components = {
                 /** @enum {string} */
                 readonly reasoning?: "off" | "low" | "medium" | "high";
             };
+            readonly skillOverrides?: readonly {
+                readonly name: string;
+                /** Format: uuid */
+                readonly versionId: string;
+            }[];
             /** @default true */
             readonly stream?: boolean;
         };
@@ -3231,6 +3571,7 @@ export type SchemaErasureRequest = components['schemas']['ErasureRequest'];
 export type SchemaErrorBody = components['schemas']['ErrorBody'];
 export type SchemaEvent = components['schemas']['Event'];
 export type SchemaExcludableEventType = components['schemas']['ExcludableEventType'];
+export type SchemaInstalledSkillResponse = components['schemas']['InstalledSkillResponse'];
 export type SchemaItemListResponse = components['schemas']['ItemListResponse'];
 export type SchemaLegalHold = components['schemas']['LegalHold'];
 export type SchemaLegalHoldReleaseRequest = components['schemas']['LegalHoldReleaseRequest'];
@@ -3238,6 +3579,8 @@ export type SchemaLegalHoldSetRequest = components['schemas']['LegalHoldSetReque
 export type SchemaModelList = components['schemas']['ModelList'];
 export type SchemaOkResponse = components['schemas']['OkResponse'];
 export type SchemaOpenApiDocument = components['schemas']['OpenApiDocument'];
+export type SchemaPlatformSkillDeleteRequest = components['schemas']['PlatformSkillDeleteRequest'];
+export type SchemaPlatformSkillInstallRequest = components['schemas']['PlatformSkillInstallRequest'];
 export type SchemaProviderConfig = components['schemas']['ProviderConfig'];
 export type SchemaProviderList = components['schemas']['ProviderList'];
 export type SchemaResumeSessionResponse = components['schemas']['ResumeSessionResponse'];
@@ -3246,6 +3589,13 @@ export type SchemaRetentionPolicyActivateRequest = components['schemas']['Retent
 export type SchemaRetentionPolicyPutRequest = components['schemas']['RetentionPolicyPutRequest'];
 export type SchemaSession = components['schemas']['Session'];
 export type SchemaSessionPage = components['schemas']['SessionPage'];
+export type SchemaSkillDeleteRequest = components['schemas']['SkillDeleteRequest'];
+export type SchemaSkillDocumentResponse = components['schemas']['SkillDocumentResponse'];
+export type SchemaSkillExportResponse = components['schemas']['SkillExportResponse'];
+export type SchemaSkillInstallRequest = components['schemas']['SkillInstallRequest'];
+export type SchemaSkillListResponse = components['schemas']['SkillListResponse'];
+export type SchemaSkillVersionResponse = components['schemas']['SkillVersionResponse'];
+export type SchemaSkillVersionsResponse = components['schemas']['SkillVersionsResponse'];
 export type SchemaStartTurnRequest = components['schemas']['StartTurnRequest'];
 export type SchemaSteerRequest = components['schemas']['SteerRequest'];
 export type SchemaTenantAuthState = components['schemas']['TenantAuthState'];
@@ -3903,6 +4253,209 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["ModelList"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly listPlatformSkills: {
+        readonly parameters: {
+            readonly query?: {
+                readonly cursor?: string;
+                readonly limit?: number;
+            };
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Scope-isolated installations. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillListResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly installPlatformSkill: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** @description SKILL.md document; no files, paths or scripts. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["PlatformSkillInstallRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Published immutable version. */
+            readonly 201: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillVersionResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getPlatformSkill: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Installation, including a logical deletion revision. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["InstalledSkillResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly deletePlatformSkill: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Exact expected revision. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["PlatformSkillDeleteRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Deleted installation revision. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["InstalledSkillResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly listPlatformSkillVersions: {
+        readonly parameters: {
+            readonly query?: {
+                readonly cursor?: string;
+                readonly limit?: number;
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Bounded immutable version page. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillVersionsResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly readPlatformSkillVersion: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+                readonly versionId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Exact checked document. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillDocumentResponse"];
                 };
             };
             /** @description Error response. */
@@ -4998,6 +5551,248 @@ export interface operations {
                 };
                 content: {
                     readonly "application/json": components["schemas"]["Session"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly listSkills: {
+        readonly parameters: {
+            readonly query: {
+                readonly cursor?: string;
+                readonly limit?: number;
+                readonly scope: "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Scope-isolated installations. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillListResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly installSkill: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        /** @description SKILL.md document; no files, paths or scripts. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["SkillInstallRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Published immutable version. */
+            readonly 201: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillVersionResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly getSkill: {
+        readonly parameters: {
+            readonly query: {
+                readonly scope: "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Installation, including a logical deletion revision. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["InstalledSkillResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly deleteSkill: {
+        readonly parameters: {
+            readonly query?: never;
+            readonly header: {
+                readonly "idempotency-key": string;
+            };
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        /** @description Exact expected revision. */
+        readonly requestBody: {
+            readonly content: {
+                readonly "application/json": components["schemas"]["SkillDeleteRequest"];
+            };
+        };
+        readonly responses: {
+            /** @description Deleted installation revision. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["InstalledSkillResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly listSkillVersions: {
+        readonly parameters: {
+            readonly query: {
+                readonly cursor?: string;
+                readonly limit?: number;
+                readonly scope: "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Bounded immutable version page. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillVersionsResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly readSkillVersion: {
+        readonly parameters: {
+            readonly query: {
+                readonly scope: "tenant" | "user";
+            };
+            readonly header?: never;
+            readonly path: {
+                readonly name: string;
+                readonly versionId: string;
+            };
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Exact checked document. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillDocumentResponse"];
+                };
+            };
+            /** @description Error response. */
+            readonly default: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    readonly exportUserSkills: {
+        readonly parameters: {
+            readonly query?: {
+                readonly cursor?: string;
+                readonly limit?: number;
+                readonly snapshotSha256?: string;
+            };
+            readonly header?: never;
+            readonly path?: never;
+            readonly cookie?: never;
+        };
+        readonly requestBody?: never;
+        readonly responses: {
+            /** @description Versioned snapshot page; physical erasure remains incomplete. */
+            readonly 200: {
+                headers: {
+                    readonly [name: string]: unknown;
+                };
+                content: {
+                    readonly "application/json": components["schemas"]["SkillExportResponse"];
                 };
             };
             /** @description Error response. */

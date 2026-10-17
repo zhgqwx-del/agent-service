@@ -1,6 +1,10 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import {
+  MANAGED_SKILL_REGISTRY_V1,
+  INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX,
+  INTERNAL_SKILL_REGISTRY_ACK_HEADER,
+  INTERNAL_SKILL_REGISTRY_ACK_VALUE,
   Capabilities,
   DATA_GOVERNANCE_CANONICAL_RETENTION_V1,
   DATA_GOVERNANCE_MULTI_LEGAL_HOLD_V1,
@@ -107,6 +111,8 @@ import {
 import type { RunnerRegistry } from "./registry.js";
 
 export interface RouterAppDeps {
+  skillRegistryEnabled?: () => boolean;
+  skillRegistryOperatorToken?: string;
   registry: RunnerRegistry;
   /** total attempts per request, including the first (2 = one re-route on 409) */
   maxAttempts?: number;
@@ -652,6 +658,9 @@ export function createRouterApp(deps: RouterAppDeps) {
                 sessionLifecycle: lifecycle,
                 mcp: deps.registry.allConfiguredSupportMcp() ? ["streamable-http"] : [],
                 skills: deps.registry.allConfiguredSupportSkills(),
+                skillRegistry: deps.skillRegistryEnabled?.() && deps.registry.allConfiguredSupportSkillRegistry() ? [MANAGED_SKILL_REGISTRY_V1] : [],
+                skillRegistryStorage: deps.skillRegistryEnabled?.() && deps.registry.allConfiguredSupportSkillRegistry()
+                  ? parsed.data.features.skillRegistryStorage : null,
                 hooks: deps.registry.allConfiguredSupportHooks(),
                 blobAttachments: parsed.data.features.blobAttachments && blobAttachmentsAvailable(),
                 dataErasureRequests: parsed.data.features.dataErasureRequests && erasureRequestsAvailable(),
@@ -1398,10 +1407,64 @@ export function createRouterApp(deps: RouterAppDeps) {
     }, 503);
   });
 
+  const skillRegistryUnavailable = (c: Context) => c.json({ error: {
+    code: "draining", message: "Skill registry is unavailable while the runner fleet is upgrading", retryable: true,
+  } }, 503);
+  const freshSkillRegistry = async (c: Context): Promise<boolean> => {
+    if (!(deps.ready?.() ?? true) || !deps.skillRegistryEnabled?.()) return false;
+    try {
+      await deps.registry.refreshSkillRegistry(AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(5_000)]));
+      return (deps.ready?.() ?? true) && deps.skillRegistryEnabled?.() === true && deps.registry.allConfiguredSupportSkillRegistry();
+    } catch { return false; }
+  };
+  const publicPlatformSkills = "/v1/platform/skills";
+  const platformSkillProxy = async (c: Context): Promise<Response> => {
+    privateInternalHeaders(c);
+    const authorization = c.req.header("authorization");
+    if (!deps.skillRegistryOperatorToken || !authorizationContainsBearerToken(authorization, deps.skillRegistryOperatorToken)
+      || authorization !== `Bearer ${deps.skillRegistryOperatorToken}` || !deps.internalRunnerToken) {
+      return c.json({ error: { code: "not_found", message: "not found" } }, 404);
+    }
+    const suffix = new URL(c.req.url).pathname.slice(publicPlatformSkills.length);
+    if (!["GET", "POST", "DELETE"].includes(c.req.method)
+      || !/^(?:|\/[a-z0-9]+(?:-[a-z0-9]+)*(?:\/versions(?:\/[0-9a-f-]{36})?)?)$/.test(suffix)
+      || c.req.method === "POST" && suffix !== "" || c.req.method === "DELETE" && !/^\/[^/]+$/.test(suffix)) {
+      return c.json({ error: { code: "not_found", message: "not found" } }, 404);
+    }
+    if (!await freshSkillRegistry(c)) return skillRegistryUnavailable(c);
+    let data: Uint8Array | undefined;
+    if (c.req.method !== "GET") {
+      const read = await readCapped(c.req.raw.body, Math.min(maxBodyBytes, 400_000));
+      if (!read.ok) return c.json({ error: { code: "invalid_request", message: "Skill request failed." } }, 400);
+      data = read.bytes;
+    }
+    const target = deps.registry.anyHealthy();
+    if (!target || !deps.registry.allConfiguredSupportSkillRegistry()) return skillRegistryUnavailable(c);
+    const url = new URL(c.req.url); url.pathname = `${INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX}${suffix}`;
+    const headers = new Headers({ [INTERNAL_ROUTER_TOKEN_HEADER]: deps.internalRunnerToken });
+    if (c.req.method !== "GET") {
+      headers.set("content-type", "application/json");
+      const idem = c.req.header("idempotency-key"); if (idem) headers.set("idempotency-key", idem);
+    }
+    try {
+      const response = await forward(target, url, c.req.method, headers, data, deps.upstreamHeaderTimeoutMs);
+      if (response.headers.get(INTERNAL_SKILL_REGISTRY_ACK_HEADER) !== INTERNAL_SKILL_REGISTRY_ACK_VALUE) {
+        await response.body?.cancel().catch(() => {}); return skillRegistryUnavailable(c);
+      }
+      const result = streamBack(response); result.headers.set("Cache-Control", "no-store");
+      result.headers.set("X-Content-Type-Options", "nosniff"); return result;
+    } catch { return skillRegistryUnavailable(c); }
+  };
+  app.all(publicPlatformSkills, platformSkillProxy);
+  app.all(`${publicPlatformSkills}/*`, platformSkillProxy);
+
   app.all("*", async (c) => {
     const url = new URL(c.req.url);
+    if (/^\/v1\/skills(?:\/|$)/.test(url.pathname)) privateInternalHeaders(c);
     if (
-      url.pathname === INTERNAL_TOMBSTONE_PATH_PREFIX
+      url.pathname === INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX
+      || url.pathname.startsWith(`${INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX}/`)
+      || url.pathname === INTERNAL_TOMBSTONE_PATH_PREFIX
       || url.pathname.startsWith(`${INTERNAL_TOMBSTONE_PATH_PREFIX}/`)
       || url.pathname === INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX
       || url.pathname.startsWith(`${INTERNAL_ERASURE_DRAIN_RUNNER_PATH_PREFIX}/`)
@@ -1437,6 +1500,7 @@ export function createRouterApp(deps: RouterAppDeps) {
     // tenant-control paths fail at the router edge rather than forwarding Authorization to a runner.
     if (
       isTenantErasurePathFamily(url.pathname)
+      || authorizationContainsBearerToken(c.req.header("authorization"), deps.skillRegistryOperatorToken)
       || authorizationContainsBearerToken(
         c.req.header("authorization"),
         deps.tenantErasureOperatorToken,
@@ -1564,6 +1628,21 @@ export function createRouterApp(deps: RouterAppDeps) {
       body = read.bytes;
     }
 
+    const registryManagement = /^\/v1\/skills(?:\/|$)/.test(url.pathname);
+    const gatedRuntimeAdmission = method === "POST" && (url.pathname === "/v1/sessions" || /^\/v1\/sessions\/[^/]+\/turns$/.test(url.pathname));
+    let explicitlyUsesRegistry = false;
+    if (body && ((method === "POST" || method === "PUT") && /^\/v1\/agents(?:\/[^/]+)?$/.test(url.pathname) || gatedRuntimeAdmission)) {
+      try {
+        const input = JSON.parse(new TextDecoder().decode(body));
+        explicitlyUsesRegistry = Array.isArray(input.skills) && input.skills.some((id: unknown) => typeof id === "string" && id.startsWith("registry:"))
+          || Object.hasOwn(input, "skillOverrides");
+      } catch { /* The runner retains normal malformed-body validation. */ }
+    }
+    const requiresSkillRegistry = registryManagement || explicitlyUsesRegistry || gatedRuntimeAdmission && deps.skillRegistryEnabled?.() === true;
+    if (requiresSkillRegistry) {
+      if (!await freshSkillRegistry(c)) return skillRegistryUnavailable(c);
+    }
+
     // Never send a capability-gated destructive request to the legacy public DELETE route. If a
     // configured target is accidentally a load-balancer and chooses an old pod after a new-pod
     // health probe, the versioned path fails closed instead of executing the old delete semantics.
@@ -1583,6 +1662,9 @@ export function createRouterApp(deps: RouterAppDeps) {
       // owner() and every upstream attempt cross an async boundary. Revalidate both the fleet and
       // the selected destination here so a health probe cannot admit an old runner between the
       // entry gate above and the irreversible lifecycle write.
+      if (requiresSkillRegistry && (!(deps.ready?.() ?? true) || !deps.skillRegistryEnabled?.() || !deps.registry.allConfiguredSupportSkillRegistry())) {
+        return skillRegistryUnavailable(c);
+      }
       if (
         isTombstoneDelete
         && (!tombstoneAvailable() || !deps.registry.supportsLifecycle(target, "tombstone"))
@@ -1723,6 +1805,7 @@ export function createRouterApp(deps: RouterAppDeps) {
         || isDataExportStatus
         || isDataExportDownload
         || isDataGovernanceManagement
+        || registryManagement
       ) {
         // New runners already send these headers. Reassert them at the public edge so a proxying
         // regression or an unexpected upstream error can never make this identity-scoped route cacheable.

@@ -90,6 +90,7 @@ const MARKER_UPDATE_TRIGGERS = {
     "trg_tt_plan_artifact_target_t3d_terminal_bu",
     "trg_tt_capture_v2_t3d_bu",
     "trg_tt_retained_plan_bu",
+    "trg_skill_registry_t3d_bu",
   ],
 } as const;
 const EVIDENCE_DELETE_GUARDS = {

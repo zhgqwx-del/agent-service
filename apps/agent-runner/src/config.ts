@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute } from "node:path";
 import {
+  skillRegistryFilesystemNamespaceSha256,
+  type SkillRegistryStorageCapability,
   blobS3Backend,
   blobS3NamespaceSha256,
   validateRuntimeMetricsToken,
@@ -341,6 +343,7 @@ const Env = z.object({
   INTERNAL_ROUTER_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
   NODE_ENV: z.string().optional(),
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(1_000_000),
+  SKILL_REGISTRY_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
   /** platform provider preset enabled for all tenants, keyed from API_KEY */
   PLATFORM_PROVIDER: z.string().default("dashscope"),
   API_KEY: z.string().optional(),
@@ -384,6 +387,7 @@ export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOK
   dataExportArtifactsReadable: boolean;
   /** Present only for a cross-runner object namespace whose exact identity can be fleet-checked. */
   blobStorage?: BlobStorageCapability;
+  skillRegistryStorage?: SkillRegistryStorageCapability;
   /** Independent append-only restore journal; physical locators remain runner-local. */
   tenantRestoreJournal?: TenantRestoreJournalRuntimeConfig;
 };
@@ -540,6 +544,9 @@ function firstConfiguredKey(
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
+  if (env.SKILL_REGISTRY_OPERATOR_TOKEN !== undefined) {
+    throw new Error("SKILL_REGISTRY_OPERATOR_TOKEN is router-only");
+  }
   const backupCatalogAuthorityKey = Object.keys(env).find((key) => (
     key.startsWith("BACKUP_CATALOG_") || key.startsWith("TENANT_BACKUP_CATALOG_")
       || key.startsWith("BACKUP_ARTIFACT_") || key.startsWith("BACKUP_MYSQL")
@@ -690,6 +697,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   }
   if (c.BLOB_STORE === "s3" && !c.BLOB_STORAGE_CONTROL_ENABLED) {
     throw new Error("BLOB_STORAGE_CONTROL_ENABLED=1 is required when BLOB_STORE=s3");
+  }
+  let skillRegistryStorage: SkillRegistryStorageCapability | undefined;
+  if (c.SKILL_REGISTRY_ENABLED) {
+    if (c.BLOB_STORE === "s3" && blobStorage) {
+      const { backend, shared, namespaceSha256 } = blobStorage; skillRegistryStorage = { backend, shared, namespaceSha256 };
+    } else {
+      if (!c.BLOB_FILESYSTEM_SINGLE_RUNNER || !c.BLOB_NAMESPACE_ID || production) {
+        throw new Error("Filesystem skill registry requires an explicit single local runner and namespace");
+      }
+      skillRegistryStorage = { backend: "filesystem-v1", shared: false,
+        namespaceSha256: skillRegistryFilesystemNamespaceSha256(c.BLOB_NAMESPACE_ID) };
+    }
   }
   if (c.BLOB_STORE === "s3" && c.STORE !== "mysql") {
     throw new Error("STORE=mysql is required when BLOB_STORE=s3 so the storage cutover is durable");
@@ -1091,6 +1110,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
     dataExportArtifactsReadable:
       c.BLOB_STORE === "s3" || (!production && c.BLOB_FILESYSTEM_SINGLE_RUNNER),
     ...(blobStorage === undefined ? {} : { blobStorage }),
+    ...(skillRegistryStorage === undefined ? {} : { skillRegistryStorage }),
     ...(tenantRestoreJournal === undefined ? {} : { tenantRestoreJournal }),
   };
 }

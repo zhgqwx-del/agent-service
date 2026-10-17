@@ -422,7 +422,7 @@ export const OPENAPI_DOCUMENT = {
             "type": "string"
           },
           "skills": {
-            "description": "Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled.",
+            "description": "Persisted exact operator ids or explicit registry:<name> selectors, checked for the actual session owner. Historical records remain readable while skills are disabled.",
             "items": {
               "maxLength": 128,
               "minLength": 1,
@@ -578,10 +578,19 @@ export const OPENAPI_DOCUMENT = {
           },
           "skills": {
             "default": [],
-            "description": "Requires configured static skills support. These are exact operator mount ids, not paths; no upload, registration, scripts, or tool authorization are accepted here.",
+            "description": "Exact operator mount ids or registry:<name>; registry selection requires managed-skill-registry-v1. No filesystem path or additional tool authorization is accepted.",
             "items": {
-              "pattern": "^[A-Za-z0-9_-]{1,64}$",
-              "type": "string"
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                  "type": "string"
+                },
+                {
+                  "maxLength": 73,
+                  "pattern": "^registry:[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                }
+              ]
             },
             "maxItems": 8,
             "type": "array"
@@ -715,7 +724,7 @@ export const OPENAPI_DOCUMENT = {
                   "type": "string"
                 },
                 "skills": {
-                  "description": "Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled.",
+                  "description": "Persisted exact operator ids or explicit registry:<name> selectors, checked for the actual session owner. Historical records remain readable while skills are disabled.",
                   "items": {
                     "maxLength": 128,
                     "minLength": 1,
@@ -1235,6 +1244,43 @@ export const OPENAPI_DOCUMENT = {
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "skillRegistry": {
+                "default": [],
+                "items": {
+                  "enum": [
+                    "managed-skill-registry-v1"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 1,
+                "type": "array"
+              },
+              "skillRegistryStorage": {
+                "additionalProperties": false,
+                "default": null,
+                "properties": {
+                  "backend": {
+                    "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                    "type": "string"
+                  },
+                  "namespaceSha256": {
+                    "pattern": "^[a-f0-9]{64}$",
+                    "type": "string"
+                  },
+                  "shared": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "backend",
+                  "shared",
+                  "namespaceSha256"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
               },
               "skills": {
                 "type": "boolean"
@@ -5142,6 +5188,71 @@ export const OPENAPI_DOCUMENT = {
         ],
         "type": "string"
       },
+      "InstalledSkillResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "currentVersionId": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation": {
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991,
+            "minimum": -9007199254740991,
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          },
+          "revision": {
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991,
+            "minimum": -9007199254740991,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "platform",
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "deleted"
+            ],
+            "type": "string"
+          },
+          "updatedAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scope",
+          "name",
+          "revision",
+          "generation",
+          "state",
+          "currentVersionId",
+          "createdAtMs",
+          "updatedAtMs"
+        ],
+        "type": "object"
+      },
       "ItemListResponse": {
         "properties": {
           "data": {
@@ -6305,6 +6416,40 @@ export const OPENAPI_DOCUMENT = {
           "openapi",
           "info",
           "paths"
+        ],
+        "type": "object"
+      },
+      "PlatformSkillDeleteRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "PlatformSkillInstallRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "document": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "document",
+          "expectedRevision"
         ],
         "type": "object"
       },
@@ -7885,6 +8030,771 @@ export const OPENAPI_DOCUMENT = {
         ],
         "type": "object"
       },
+      "SkillDeleteRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "SkillDocumentResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "document": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "additionalProperties": false,
+            "properties": {
+              "createdAtMs": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "generation": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "metadata": {
+                "additionalProperties": false,
+                "properties": {
+                  "dependencies": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "tools": {
+                        "items": {
+                          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                          "type": "string"
+                        },
+                        "maxItems": 64,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "tools"
+                    ],
+                    "type": "object"
+                  },
+                  "description": {
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "disableModelInvocation": {
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "maxLength": 64,
+                    "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                    "type": "string"
+                  },
+                  "userInvocable": {
+                    "type": "boolean"
+                  },
+                  "whenToUse": {
+                    "maxLength": 1024,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "name",
+                  "description",
+                  "whenToUse",
+                  "disableModelInvocation",
+                  "userInvocable",
+                  "dependencies"
+                ],
+                "type": "object"
+              },
+              "name": {
+                "maxLength": 64,
+                "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                "type": "string"
+              },
+              "revision": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "scope": {
+                "enum": [
+                  "platform",
+                  "tenant",
+                  "user"
+                ],
+                "type": "string"
+              },
+              "sha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              },
+              "sizeBytes": {
+                "exclusiveMinimum": 0,
+                "maximum": 65536,
+                "type": "integer"
+              },
+              "versionId": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "versionSha256": {
+                "pattern": "^[a-f0-9]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "scope",
+              "name",
+              "versionId",
+              "versionSha256",
+              "revision",
+              "generation",
+              "metadata",
+              "sha256",
+              "sizeBytes",
+              "createdAtMs"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "version",
+          "document"
+        ],
+        "type": "object"
+      },
+      "SkillExportResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "nextCursor": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "physicalErasureComplete": {
+            "enum": [
+              false
+            ],
+            "type": "boolean"
+          },
+          "schema": {
+            "enum": [
+              "user-skill-registry-export-v1"
+            ],
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "user"
+            ],
+            "type": "string"
+          },
+          "slots": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "createdAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "currentVersionId": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "generation": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "name": {
+                  "maxLength": 64,
+                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                },
+                "revision": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "scope": {
+                  "enum": [
+                    "platform",
+                    "tenant",
+                    "user"
+                  ],
+                  "type": "string"
+                },
+                "state": {
+                  "enum": [
+                    "active",
+                    "deleted"
+                  ],
+                  "type": "string"
+                },
+                "updatedAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "scope",
+                "name",
+                "revision",
+                "generation",
+                "state",
+                "currentVersionId",
+                "createdAtMs",
+                "updatedAtMs"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "snapshotSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "createdAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "document": {
+                  "maxLength": 65536,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "generation": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "metadata": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "dependencies": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "tools": {
+                          "items": {
+                            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                            "type": "string"
+                          },
+                          "maxItems": 64,
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "tools"
+                      ],
+                      "type": "object"
+                    },
+                    "description": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "disableModelInvocation": {
+                      "type": "boolean"
+                    },
+                    "name": {
+                      "maxLength": 64,
+                      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                      "type": "string"
+                    },
+                    "userInvocable": {
+                      "type": "boolean"
+                    },
+                    "whenToUse": {
+                      "maxLength": 1024,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "description",
+                    "whenToUse",
+                    "disableModelInvocation",
+                    "userInvocable",
+                    "dependencies"
+                  ],
+                  "type": "object"
+                },
+                "name": {
+                  "maxLength": 64,
+                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                },
+                "revision": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "scope": {
+                  "enum": [
+                    "platform",
+                    "tenant",
+                    "user"
+                  ],
+                  "type": "string"
+                },
+                "sha256": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "sizeBytes": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 65536,
+                  "type": "integer"
+                },
+                "versionId": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "versionSha256": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "name",
+                "versionId",
+                "versionSha256",
+                "revision",
+                "generation",
+                "metadata",
+                "sha256",
+                "sizeBytes",
+                "createdAtMs",
+                "document"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema",
+          "snapshotSha256",
+          "scope",
+          "slots",
+          "versions",
+          "nextCursor",
+          "physicalErasureComplete"
+        ],
+        "type": "object"
+      },
+      "SkillInstallRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "document": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "type": "string"
+          },
+          "expectedRevision": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "document",
+          "expectedRevision"
+        ],
+        "type": "object"
+      },
+      "SkillListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "createdAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "currentVersionId": {
+                  "format": "uuid",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "generation": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "name": {
+                  "maxLength": 64,
+                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                },
+                "revision": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "scope": {
+                  "enum": [
+                    "platform",
+                    "tenant",
+                    "user"
+                  ],
+                  "type": "string"
+                },
+                "state": {
+                  "enum": [
+                    "active",
+                    "deleted"
+                  ],
+                  "type": "string"
+                },
+                "updatedAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "scope",
+                "name",
+                "revision",
+                "generation",
+                "state",
+                "currentVersionId",
+                "createdAtMs",
+                "updatedAtMs"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "nextCursor"
+        ],
+        "type": "object"
+      },
+      "SkillVersionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "createdAtMs": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991,
+            "minimum": -9007199254740991,
+            "type": "integer"
+          },
+          "metadata": {
+            "additionalProperties": false,
+            "properties": {
+              "dependencies": {
+                "additionalProperties": false,
+                "properties": {
+                  "tools": {
+                    "items": {
+                      "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                      "type": "string"
+                    },
+                    "maxItems": 64,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "tools"
+                ],
+                "type": "object"
+              },
+              "description": {
+                "maxLength": 1024,
+                "minLength": 1,
+                "type": "string"
+              },
+              "disableModelInvocation": {
+                "type": "boolean"
+              },
+              "name": {
+                "maxLength": 64,
+                "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                "type": "string"
+              },
+              "userInvocable": {
+                "type": "boolean"
+              },
+              "whenToUse": {
+                "maxLength": 1024,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "description",
+              "whenToUse",
+              "disableModelInvocation",
+              "userInvocable",
+              "dependencies"
+            ],
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 64,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+            "type": "string"
+          },
+          "revision": {
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991,
+            "minimum": -9007199254740991,
+            "type": "integer"
+          },
+          "scope": {
+            "enum": [
+              "platform",
+              "tenant",
+              "user"
+            ],
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "sizeBytes": {
+            "exclusiveMinimum": 0,
+            "maximum": 65536,
+            "type": "integer"
+          },
+          "versionId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "versionSha256": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "name",
+          "versionId",
+          "versionSha256",
+          "revision",
+          "generation",
+          "metadata",
+          "sha256",
+          "sizeBytes",
+          "createdAtMs"
+        ],
+        "type": "object"
+      },
+      "SkillVersionsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "createdAtMs": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "generation": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "metadata": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "dependencies": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "tools": {
+                          "items": {
+                            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                            "type": "string"
+                          },
+                          "maxItems": 64,
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "tools"
+                      ],
+                      "type": "object"
+                    },
+                    "description": {
+                      "maxLength": 1024,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "disableModelInvocation": {
+                      "type": "boolean"
+                    },
+                    "name": {
+                      "maxLength": 64,
+                      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                      "type": "string"
+                    },
+                    "userInvocable": {
+                      "type": "boolean"
+                    },
+                    "whenToUse": {
+                      "maxLength": 1024,
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "description",
+                    "whenToUse",
+                    "disableModelInvocation",
+                    "userInvocable",
+                    "dependencies"
+                  ],
+                  "type": "object"
+                },
+                "name": {
+                  "maxLength": 64,
+                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                },
+                "revision": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "scope": {
+                  "enum": [
+                    "platform",
+                    "tenant",
+                    "user"
+                  ],
+                  "type": "string"
+                },
+                "sha256": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                },
+                "sizeBytes": {
+                  "exclusiveMinimum": 0,
+                  "maximum": 65536,
+                  "type": "integer"
+                },
+                "versionId": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "versionSha256": {
+                  "pattern": "^[a-f0-9]{64}$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "scope",
+                "name",
+                "versionId",
+                "versionSha256",
+                "revision",
+                "generation",
+                "metadata",
+                "sha256",
+                "sizeBytes",
+                "createdAtMs"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "nextCursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "data",
+          "nextCursor"
+        ],
+        "type": "object"
+      },
       "StartTurnRequest": {
         "properties": {
           "busyPolicy": {
@@ -8056,6 +8966,29 @@ export const OPENAPI_DOCUMENT = {
               }
             },
             "type": "object"
+          },
+          "skillOverrides": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "maxLength": 64,
+                  "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                  "type": "string"
+                },
+                "versionId": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "versionId"
+              ],
+              "type": "object"
+            },
+            "maxItems": 8,
+            "type": "array"
           },
           "stream": {
             "default": true,
@@ -9894,6 +10827,12 @@ export const OPENAPI_DOCUMENT = {
         "scheme": "bearer",
         "type": "http"
       },
+      "SkillRegistryOperatorToken": {
+        "bearerFormat": "SkillRegistryOperatorToken",
+        "description": "Independent router-only platform skill registry authority; never a tenant erasure or runtime credential.",
+        "scheme": "bearer",
+        "type": "http"
+      },
       "TrustedCallerUser": {
         "description": "User identity asserted by a trusted tenant backend.",
         "in": "header",
@@ -11277,6 +12216,363 @@ export const OPENAPI_DOCUMENT = {
         "summary": "List models visible to the tenant",
         "tags": [
           "Catalog"
+        ]
+      }
+    },
+    "/v1/platform/skills": {
+      "get": {
+        "operationId": "listPlatformSkills",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillListResponse"
+                }
+              }
+            },
+            "description": "Scope-isolated installations."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "SkillRegistryOperatorToken": []
+          }
+        ],
+        "summary": "List installations; tenant scope requires an admin key",
+        "tags": [
+          "Skills"
+        ]
+      },
+      "post": {
+        "operationId": "installPlatformSkill",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformSkillInstallRequest"
+              }
+            }
+          },
+          "description": "SKILL.md document; no files, paths or scripts.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillVersionResponse"
+                }
+              }
+            },
+            "description": "Published immutable version."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "SkillRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Install a scanned SKILL.md-only immutable version with exact revision CAS",
+        "tags": [
+          "Skills"
+        ]
+      }
+    },
+    "/v1/platform/skills/{name}": {
+      "delete": {
+        "operationId": "deletePlatformSkill",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlatformSkillDeleteRequest"
+              }
+            }
+          },
+          "description": "Exact expected revision.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillResponse"
+                }
+              }
+            },
+            "description": "Deleted installation revision."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "SkillRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Logically delete an installation with exact revision CAS; not physical erasure",
+        "tags": [
+          "Skills"
+        ]
+      },
+      "get": {
+        "operationId": "getPlatformSkill",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillResponse"
+                }
+              }
+            },
+            "description": "Installation, including a logical deletion revision."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "SkillRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Read installation revision metadata without storage authority",
+        "tags": [
+          "Skills"
+        ]
+      }
+    },
+    "/v1/platform/skills/{name}/versions": {
+      "get": {
+        "operationId": "listPlatformSkillVersions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillVersionsResponse"
+                }
+              }
+            },
+            "description": "Bounded immutable version page."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "SkillRegistryOperatorToken": []
+          }
+        ],
+        "summary": "List authorized immutable versions",
+        "tags": [
+          "Skills"
+        ]
+      }
+    },
+    "/v1/platform/skills/{name}/versions/{versionId}": {
+      "get": {
+        "operationId": "readPlatformSkillVersion",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "versionId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillDocumentResponse"
+                }
+              }
+            },
+            "description": "Exact checked document."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "SkillRegistryOperatorToken": []
+          }
+        ],
+        "summary": "Read authorized SKILL.md bytes and version metadata",
+        "tags": [
+          "Skills"
         ]
       }
     },
@@ -13706,6 +15002,531 @@ export const OPENAPI_DOCUMENT = {
         "summary": "Restore an archived session",
         "tags": [
           "Sessions"
+        ]
+      }
+    },
+    "/v1/skills": {
+      "get": {
+        "operationId": "listSkills",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillListResponse"
+                }
+              }
+            },
+            "description": "Scope-isolated installations."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "List installations; tenant scope requires an admin key",
+        "tags": [
+          "Skills"
+        ]
+      },
+      "post": {
+        "operationId": "installSkill",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillInstallRequest"
+              }
+            }
+          },
+          "description": "SKILL.md document; no files, paths or scripts.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillVersionResponse"
+                }
+              }
+            },
+            "description": "Published immutable version."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Install a scanned SKILL.md-only immutable version with exact revision CAS",
+        "tags": [
+          "Skills"
+        ]
+      }
+    },
+    "/v1/skills/export": {
+      "get": {
+        "operationId": "exportUserSkills",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 10,
+              "maximum": 25,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "snapshotSha256",
+            "required": false,
+            "schema": {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillExportResponse"
+                }
+              }
+            },
+            "description": "Versioned snapshot page; physical erasure remains incomplete."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Export only the current authenticated user's registry snapshot; continuation is digest-bound",
+        "tags": [
+          "Skills"
+        ]
+      }
+    },
+    "/v1/skills/{name}": {
+      "delete": {
+        "operationId": "deleteSkill",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "idempotency-key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillDeleteRequest"
+              }
+            }
+          },
+          "description": "Exact expected revision.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillResponse"
+                }
+              }
+            },
+            "description": "Deleted installation revision."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Logically delete an installation with exact revision CAS; not physical erasure",
+        "tags": [
+          "Skills"
+        ]
+      },
+      "get": {
+        "operationId": "getSkill",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstalledSkillResponse"
+                }
+              }
+            },
+            "description": "Installation, including a logical deletion revision."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read installation revision metadata without storage authority",
+        "tags": [
+          "Skills"
+        ]
+      }
+    },
+    "/v1/skills/{name}/versions": {
+      "get": {
+        "operationId": "listSkillVersions",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillVersionsResponse"
+                }
+              }
+            },
+            "description": "Bounded immutable version page."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "List authorized immutable versions",
+        "tags": [
+          "Skills"
+        ]
+      }
+    },
+    "/v1/skills/{name}/versions/{versionId}": {
+      "get": {
+        "operationId": "readSkillVersion",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "versionId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "tenant",
+                "user"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillDocumentResponse"
+                }
+              }
+            },
+            "description": "Exact checked document."
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Error response."
+          }
+        },
+        "security": [
+          {
+            "ServiceApiKey": [],
+            "TrustedCallerUser": []
+          },
+          {
+            "EndUserToken": [],
+            "ServiceApiKey": []
+          },
+          {
+            "ServiceApiKey": []
+          }
+        ],
+        "summary": "Read authorized SKILL.md bytes and version metadata",
+        "tags": [
+          "Skills"
         ]
       }
     },

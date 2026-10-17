@@ -6,6 +6,8 @@ import {
   BlobCleanupWorker,
   ConfiguredMcpToolSource,
   ConfiguredStaticSkillSource,
+  RegisteredSkillService,
+  type StaticSkillSource,
   type ConfiguredToolHookService,
   createTenantTelemetryApplicationDualWrite,
   createPersistedProviderFailureCapture,
@@ -323,7 +325,8 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   let tenantTelemetryRetryTimer: ReturnType<typeof setInterval> | undefined;
   let ordinarySessionDeleteGraceRecovery: OrdinarySessionDeleteGraceRecovery | undefined;
   let ordinarySessionUsageRetentionWorker: OrdinarySessionUsageRetentionWorker | undefined;
-  let skills: ConfiguredStaticSkillSource | undefined;
+  let skills: StaticSkillSource | undefined;
+  let skillRegistry: RegisteredSkillService | undefined;
   let hooks: ConfiguredToolHookService | undefined;
   let hooksInitializationFailed = false;
   let closeHookBootstrapResources: (() => Promise<void>) | undefined;
@@ -801,6 +804,25 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       blobStore instanceof S3BlobStore ? blobStore.close() : undefined]);
   };
   try {
+    if (cfg.SKILL_REGISTRY_ENABLED) {
+      if (!cfg.skillRegistryStorage) throw new Error("Skill registry storage is unavailable");
+      skillRegistry = new RegisteredSkillService({ store, blobs: blobStore,
+        namespaceSha256: cfg.skillRegistryStorage.namespaceSha256,
+        legacySource: skills, tenantRuntime,
+        authorizeTenant: async tenantId => {
+          if ((await store.getTenantRuntimeState(tenantId)).state !== "active") throw new SubjectDeletingError(tenantId, "skill-registry-admin");
+        },
+        authorizeSubject: async principal => {
+          const tenant = await store.getTenantRuntimeState(principal.tenantId);
+          const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
+          if (tenant.state !== "active" || user && user.state !== "active") throw new SubjectDeletingError(principal.tenantId, principal.userId);
+        } });
+      skills = skillRegistry;
+    }
+  } catch (error) {
+    hooksInitializationFailed = true; await mcp?.close(); await skills?.close(); throw error;
+  }
+  try {
     hooks = await createConfiguredToolHooks(cfg.hooks, { tenantRuntime, authorizeSubject: async (principal) => {
       const tenant = await store.getTenantRuntimeState(principal.tenantId);
       const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
@@ -811,6 +833,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
   } catch (error) {
     hooksInitializationFailed = true;
     await mcp?.close();
+    await skills?.close();
     throw error;
   }
   const host = new SessionHost({
@@ -1121,7 +1144,9 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
 
   let ready = true;
   const app = createApp({
-    store, host, providers, tools, mcpEnabled: mcp?.enabled === true, skillsEnabled: skills?.enabled === true,
+    store, host, providers, tools, mcpEnabled: mcp?.enabled === true, skillsEnabled: cfg.skills.enabled,
+    skillRegistryEnabled: cfg.SKILL_REGISTRY_ENABLED, skillRegistry,
+    skillRegistryStorage: cfg.skillRegistryStorage,
     hooksEnabled: hooks?.enabled === true,
     telemetry: runnerProcessTelemetry,
     ...(cfg.METRICS_BEARER_TOKEN === undefined ? {} : {

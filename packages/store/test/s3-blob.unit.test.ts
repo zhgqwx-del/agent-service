@@ -18,7 +18,7 @@ import {
   BlobTooLargeError,
   S3BlobStore,
 } from "../src/index.js";
-import { BLOB_ENVELOPE_HEADER_BYTES } from "../src/blob/envelope.js";
+import { BLOB_ENVELOPE_HEADER_BYTES, encodeBlobTombstoneEnvelope } from "../src/blob/envelope.js";
 
 const MAX_BYTES = 1024 * 1024;
 const MIGRATION_OWNER_SHA256 = "a".repeat(64);
@@ -166,6 +166,13 @@ function makeStore(client = new FakeS3Client(), overrides: Partial<ConstructorPa
     ...overrides,
   };
   return { client, store: new S3BlobStore(options) };
+}
+
+function settlementGate<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
 }
 
 describe("S3BlobStore unit contract", () => {
@@ -1027,5 +1034,160 @@ describe("S3BlobStore unit contract", () => {
     store.destroy();
     expect(client.destroy).toHaveBeenCalledTimes(1);
     await expect(store.get("objects/closed", { maxBytes: MAX_BYTES })).rejects.toThrow("closed");
+  });
+});
+
+describe("S3BlobStore opt-in local I/O settlement", () => {
+  it.each(["resolve", "reject"] as const)("retains a timed-out scope until the actual SDK promise %s settles", async outcome => {
+    vi.useFakeTimers();
+    const { client, store } = makeStore(new FakeS3Client(), { requestTimeoutMs: 100 });
+    const entered = settlementGate(), sdk = settlementGate<Record<string, unknown>>();
+    vi.spyOn(client, "send").mockImplementationOnce(async () => { entered.resolve(); return sdk.promise; });
+    let settled = false;
+    const result = store.withIoSettlement(() => store.get("objects/scoped-sdk", { maxBytes: MAX_BYTES }))
+      .then(value => { settled = true; return value; }, (error: unknown) => { settled = true; return error; });
+    try {
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(101);
+      expect(settled).toBe(false);
+      if (outcome === "resolve") sdk.resolve({ Body: Buffer.alloc(0) });
+      else sdk.reject(new Error("late private transport failure"));
+      const error = await result;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe("S3 blob read failed (TimeoutError)");
+      expect(settled).toBe(true);
+    } finally {
+      sdk.resolve({ Body: Buffer.alloc(0) }); await result; await store.close(); vi.useRealTimers();
+    }
+  });
+
+  it("destroys late GET headers but waits for the actual Node Body close", async () => {
+    vi.useFakeTimers();
+    const { client, store } = makeStore(new FakeS3Client(), { requestTimeoutMs: 100 });
+    const entered = settlementGate(), sdk = settlementGate<Record<string, unknown>>();
+    const destroyEntered = settlementGate(), releaseClose = settlementGate();
+    const body = new Readable({
+      read() { /* transport has not produced data */ },
+      destroy(_error, callback) { destroyEntered.resolve(); void releaseClose.promise.then(() => callback(null)); },
+    });
+    vi.spyOn(client, "send").mockImplementationOnce(async () => { entered.resolve(); return sdk.promise; });
+    let settled = false;
+    const result = store.withIoSettlement(() => store.get("objects/late-headers", { maxBytes: MAX_BYTES }))
+      .then(value => { settled = true; return value; }, (error: unknown) => { settled = true; return error; });
+    try {
+      await entered.promise; await vi.advanceTimersByTimeAsync(101);
+      expect(settled).toBe(false);
+      sdk.resolve({ Body: body, ContentLength: 0 }); await destroyEntered.promise;
+      expect(body.destroyed).toBe(true); expect(body.closed).toBe(false); expect(settled).toBe(false);
+      releaseClose.resolve();
+      const error = await result;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe("S3 blob read failed (TimeoutError)");
+      expect(body.closed).toBe(true); expect(settled).toBe(true);
+    } finally {
+      sdk.resolve({ Body: body }); releaseClose.resolve(); await result; await store.close(); vi.useRealTimers();
+    }
+  });
+
+  it.each(["data", "tombstone"] as const)("waits for an actual %s Body iterator after destroy did not settle it", async kind => {
+    vi.useFakeTimers();
+    const { client, store } = makeStore(new FakeS3Client(), { requestTimeoutMs: 100 });
+    const key = "objects/scoped-body";
+    if (kind === "data") await store.putIfAbsent(key, "value", { uploadToken: "scope-seed", maxBytes: MAX_BYTES });
+    else client.seed(store.bucket, `${store.prefix}/${key}`, encodeBlobTombstoneEnvelope());
+    const entered = settlementGate(), release = settlementGate(), iteratorSettled = settlementGate();
+    const destroy = vi.fn();
+    client.getBodyFactory = bytes => ({
+      destroy,
+      async *[Symbol.asyncIterator]() {
+        entered.resolve();
+        try { await release.promise; yield bytes; } finally { iteratorSettled.resolve(); }
+      },
+    });
+    let settled = false;
+    const result = store.withIoSettlement(async () => kind === "data"
+      ? await store.get(key, { maxBytes: MAX_BYTES }) : await store.delete(key, { uploadToken: "scope-delete" }))
+      .then(value => { settled = true; return value; }, (error: unknown) => { settled = true; return error; });
+    try {
+      await entered.promise; await vi.advanceTimersByTimeAsync(101);
+      expect(destroy).toHaveBeenCalled(); expect(settled).toBe(false);
+      release.resolve(); await iteratorSettled.promise;
+      const error = await result;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe("S3 blob response stream timed out");
+      expect(settled).toBe(true);
+    } finally { release.resolve(); await result; await store.close(); vi.useRealTimers(); }
+  });
+
+  it("destroys an invalid-length response before rejecting and waits for its actual close", async () => {
+    const { client, store } = makeStore();
+    await store.putIfAbsent("objects/invalid-length-scope", "value", { uploadToken: "length-seed", maxBytes: MAX_BYTES });
+    const destroyEntered = settlementGate(), releaseClose = settlementGate();
+    const body = new Readable({
+      read() { /* invalid metadata must not consume this response */ },
+      destroy(_error, callback) { destroyEntered.resolve(); void releaseClose.promise.then(() => callback(null)); },
+    });
+    client.getContentLength = -1; client.getBodyFactory = () => body;
+    let settled = false;
+    const result = store.withIoSettlement(() => store.get("objects/invalid-length-scope", { maxBytes: MAX_BYTES }))
+      .then(value => { settled = true; return value; }, (error: unknown) => { settled = true; return error; });
+    try {
+      await destroyEntered.promise;
+      expect(body.destroyed).toBe(true); expect(body.closed).toBe(false); expect(settled).toBe(false);
+      releaseClose.resolve();
+      const error = await result;
+      expect(error).toBeInstanceOf(Error); expect((error as Error).message).toBe("invalid S3 blob content length");
+      expect(body.closed).toBe(true); expect(settled).toBe(true);
+    } finally { releaseClose.resolve(); await result; await store.close(); }
+  });
+
+  it("does not serialize independent scopes and preserves successful return values", async () => {
+    const { client, store } = makeStore();
+    const entered = settlementGate(), sdk = settlementGate<Record<string, unknown>>();
+    vi.spyOn(client, "send").mockImplementationOnce(async () => { entered.resolve(); return sdk.promise; });
+    let firstSettled = false;
+    const first = store.withIoSettlement(() => store.get("objects/first-scope", { maxBytes: MAX_BYTES }))
+      .then(value => { firstSettled = true; return value; });
+    try {
+      await entered.promise;
+      const second = await store.withIoSettlement(async () => {
+        expect(await store.get("objects/second-scope", { maxBytes: MAX_BYTES })).toBeNull();
+        return 7;
+      });
+      expect(second).toBe(7); expect(firstSettled).toBe(false);
+      sdk.reject(serviceError(404, "NoSuchKey")); expect(await first).toBeNull();
+    } finally { sdk.reject(serviceError(404, "NoSuchKey")); await first; await store.close(); }
+  });
+
+  it("retains an unawaited nested scope and preserves the original work failure", async () => {
+    const { client, store } = makeStore();
+    const entered = settlementGate(), sdk = settlementGate<Record<string, unknown>>();
+    vi.spyOn(client, "send").mockImplementationOnce(async () => { entered.resolve(); return sdk.promise; });
+    const failure = new Error("fixed work failure");
+    let settled = false, nested: Promise<unknown> | undefined;
+    const result = store.withIoSettlement(async () => {
+      nested = store.withIoSettlement(() => store.get("objects/nested-scope", { maxBytes: MAX_BYTES }));
+      await entered.promise; throw failure;
+    }).then(value => { settled = true; return value; }, (error: unknown) => { settled = true; return error; });
+    try {
+      await entered.promise; await Promise.resolve(); expect(settled).toBe(false);
+      sdk.reject(serviceError(404, "NoSuchKey"));
+      expect(await result).toBe(failure); expect(await nested).toBeNull();
+    } finally { sdk.reject(serviceError(404, "NoSuchKey")); await result; await nested; await store.close(); }
+  });
+
+  it("fences a detached continuation after its own scope ended without fencing the adapter", async () => {
+    const { client, store } = makeStore();
+    const release = settlementGate();
+    let detached!: Promise<unknown>;
+    await store.withIoSettlement(async () => {
+      detached = release.promise.then(() => store.get("objects/ended-scope", { maxBytes: MAX_BYTES }))
+        .catch((error: unknown) => error);
+    });
+    try {
+      release.resolve(); expect(await detached).toBeInstanceOf(Error); expect(client.commands).toHaveLength(0);
+      expect(await store.get("objects/unscoped", { maxBytes: MAX_BYTES })).toBeNull();
+      expect(client.commands).toHaveLength(1);
+    } finally { release.resolve(); await detached; await store.close(); }
   });
 });

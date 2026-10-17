@@ -1,4 +1,6 @@
 import {
+  skillRegistryFilesystemNamespaceSha256,
+  type SkillRegistryStorageCapability,
   blobS3Backend,
   blobS3NamespaceSha256,
   validateRuntimeMetricsToken,
@@ -21,6 +23,8 @@ const Env = z.object({
   // Keep this default identical to agent-runner. If the router accepts a body the runner rejects,
   // the runner may close the upload and an ordinary client error is misreported as a 502.
   MAX_BODY_BYTES: z.coerce.number().int().positive().default(1_000_000),
+  SKILL_REGISTRY_ENABLED: z.enum(["0", "1"]).default("0").transform(value => value === "1"),
+  SKILL_REGISTRY_OPERATOR_TOKEN: z.string().regex(/^[A-Za-z0-9._~-]{32,256}$/).optional(),
   /** Must match the runner's raw blob ceiling; applies only to the binary upload route. */
   BLOB_MAX_BYTES: z.coerce.number().int().positive().default(1_000_000),
   BLOB_STORE: z.enum(["filesystem", "s3"]).default("filesystem"),
@@ -131,6 +135,7 @@ export type RouterConfig = Omit<z.infer<typeof Env>, "INTERNAL_ROUTER_TOKEN"> & 
   dataExportArtifactsReadable: boolean;
   /** Expected full namespace identity; used to reject split-brain runner configurations. */
   blobStorage?: BlobStorageCapability;
+  skillRegistryStorage?: SkillRegistryStorageCapability;
 };
 
 const LOCAL_INTERNAL_ROUTER_TOKEN = "agent-service-local-router-token-v1";
@@ -259,6 +264,11 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
   }
   const runnerList = [...new Set(c.RUNNERS.split(",").map((s) => s.trim()).filter(Boolean).map(validateRunnerUrl))];
   const internalRouterToken = c.INTERNAL_ROUTER_TOKEN ?? LOCAL_INTERNAL_ROUTER_TOKEN;
+  if (c.SKILL_REGISTRY_OPERATOR_TOKEN && [internalRouterToken, c.ROUTER_ADMIN_TOKEN,
+    c.TENANT_ERASURE_OPERATOR_TOKEN, c.METRICS_BEARER_TOKEN, env.API_KEY, env.BOOTSTRAP_API_KEY,
+    env.SECRETS_MASTER_KEY].includes(c.SKILL_REGISTRY_OPERATOR_TOKEN)) {
+    throw new Error("SKILL_REGISTRY_OPERATOR_TOKEN must have independent authority");
+  }
   let blobStorage: BlobStorageCapability | undefined;
   if (c.BLOB_STORE === "s3") {
     if (!c.BLOB_NAMESPACE_ID) throw new Error("BLOB_NAMESPACE_ID is required when BLOB_STORE=s3");
@@ -285,6 +295,18 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
     throw new Error("BLOB_STORAGE_CONTROL_ENABLED must be 0 when BLOB_STORE=filesystem");
   }
   if (!runnerList.length) throw new Error("RUNNERS must list at least one runner base url");
+  let skillRegistryStorage: SkillRegistryStorageCapability | undefined;
+  if (c.SKILL_REGISTRY_ENABLED) {
+    if (c.BLOB_STORE === "s3" && blobStorage) {
+      const { backend, shared, namespaceSha256 } = blobStorage; skillRegistryStorage = { backend, shared, namespaceSha256 };
+    } else {
+      if (!c.BLOB_FILESYSTEM_SINGLE_RUNNER || runnerList.length !== 1 || !c.BLOB_NAMESPACE_ID || c.NODE_ENV === "production") {
+        throw new Error("Filesystem skill registry requires an explicit single local runner and namespace");
+      }
+      skillRegistryStorage = { backend: "filesystem-v1", shared: false,
+        namespaceSha256: skillRegistryFilesystemNamespaceSha256(c.BLOB_NAMESPACE_ID) };
+    }
+  }
   if (runnerList.length > 100) throw new Error("RUNNERS must list at most 100 runner base urls");
   if (c.NODE_ENV === "production" && !c.INTERNAL_ROUTER_TOKEN) {
     throw new Error("INTERNAL_ROUTER_TOKEN is required in production");
@@ -379,5 +401,6 @@ export function loadRouterConfig(env: NodeJS.ProcessEnv = process.env): RouterCo
       c.BLOB_STORE === "s3"
       || (c.NODE_ENV !== "production" && c.BLOB_FILESYSTEM_SINGLE_RUNNER),
     ...(blobStorage === undefined ? {} : { blobStorage }),
+    ...(skillRegistryStorage === undefined ? {} : { skillRegistryStorage }),
   };
 }

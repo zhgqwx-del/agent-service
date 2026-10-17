@@ -63,7 +63,7 @@ import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptT
 import { newId } from "../ids.js";
 import type { RunnerTool, ToolRegistry } from "../tools/types.js";
 import type { McpToolSource } from "../mcp/service.js";
-import type { LoadedStaticSkill, StaticSkillLoadInput } from "../skills/static.js";
+import type { LoadedStaticSkill, SkillResolution, StaticSkillLoadInput } from "../skills/static.js";
 import type { ToolHookContext, ToolHookReport, ToolHookService } from "../hooks/types.js";
 import { DynamicToolBridge } from "../tools/dynamic.js";
 import type { TenantRuntimeCoordinator, TenantRuntimeLease } from "../lifecycle/tenant-runtime-coordinator.js";
@@ -84,10 +84,10 @@ export interface ProviderResolver {
 
 export interface SkillSource {
   readonly enabled?: boolean;
-  validateMounts?(principal: Principal, ids: readonly string[]): void;
-  list(principal: Principal, names: string[], signal: AbortSignal): Promise<readonly SkillSummary[]>;
+  validateMounts?(principal: Principal, ids: readonly string[]): void | Promise<void>;
+  list(principal: Principal, names: string[], signal: AbortSignal, resolution?: SkillResolution): Promise<readonly SkillSummary[]>;
   /** List-only legacy providers remain metadata-only; missing load never enables execution. */
-  load?(principal: Principal, ids: readonly string[], input: StaticSkillLoadInput, signal: AbortSignal): Promise<LoadedStaticSkill>;
+  load?(principal: Principal, ids: readonly string[], input: StaticSkillLoadInput, signal: AbortSignal, resolution?: SkillResolution): Promise<LoadedStaticSkill>;
 }
 
 /**
@@ -227,6 +227,8 @@ interface ActiveTurn {
   /** In-memory resumption only; a crash must leave the durable MCP grant suspended. */
   mcpGrantResumptions: Map<string, string>;
   skills: readonly SkillSummary[];
+  /** Accepted once at turn start; steer cannot replace the immutable selection. */
+  skillResolution?: SkillResolution;
   toolNames: readonly string[];
   skillBudget: SkillBudget;
   hooksSha256?: string;
@@ -284,6 +286,28 @@ interface CompactionResult {
 function turnRequestHash(req: StartTurnRequest): string {
   const { stream: _stream, ...resource } = req;
   return sha256(stableStringify(resource));
+}
+
+function isSkillSelector(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(value) || /^registry:[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value) && value.length <= 73;
+}
+function turnSkillResolution(req: StartTurnRequest): SkillResolution | undefined {
+  if (req.skillOverrides === undefined) return undefined;
+  const values = req.skillOverrides;
+  if (!Array.isArray(values) || values.length > 8 || new Set(values.map(v => v.name)).size !== values.length) {
+    throw new ApiError("invalid_request", "Skill request failed.");
+  }
+  const overrides = values.map(value => {
+    if (!value || Object.getPrototypeOf(value) !== Object.prototype || Reflect.ownKeys(value).length !== 2
+      || !Object.hasOwn(value, "name") || !Object.hasOwn(value, "versionId")
+      || Object.values(Object.getOwnPropertyDescriptors(value)).some(d => !("value" in d) || !d.enumerable)
+      || typeof value.name !== "string" || value.name.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value.name)
+      || typeof value.versionId !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value.versionId)) {
+      throw new ApiError("invalid_request", "Skill request failed.");
+    }
+    return Object.freeze({ name: value.name, versionId: value.versionId });
+  });
+  return Object.freeze({ overrides: Object.freeze(overrides) });
 }
 
 /** Validate once for both a new turn and busyPolicy/public steer paths. */
@@ -497,20 +521,26 @@ export class SessionHost {
     this.assertToolHooksOpen(state);
   }
 
-  private async listSkills(owner: Principal, agent: AgentDefinition, signal: AbortSignal): Promise<readonly SkillSummary[]> {
-    if (!agent.skills.length) return [];
+  private async listSkills(owner: Principal, agent: AgentDefinition, signal: AbortSignal, resolution?: SkillResolution): Promise<readonly SkillSummary[]> {
+    if (!agent.skills.length) {
+      if (resolution?.overrides.length) throw new ApiError("invalid_request", "Skill request failed.");
+      return [];
+    }
     if (agent.skills.length > 8 || new Set(agent.skills).size !== agent.skills.length
-      || agent.skills.some(id => !/^[A-Za-z0-9_-]{1,64}$/.test(id))) throw new ApiError("invalid_request", "Skill request failed.");
+      || agent.skills.some(id => !isSkillSelector(id))) throw new ApiError("invalid_request", "Skill request failed.");
+    if (resolution?.overrides.some(override => !agent.skills.includes(`registry:${override.name}`))) {
+      throw new ApiError("invalid_request", "Skill request failed.");
+    }
     const source = this.deps.skills;
     if (!source || source.enabled === false) throw new ApiError("invalid_request", "Skills are not configured.");
-    source.validateMounts?.(owner, agent.skills);
-    return source.list(owner, agent.skills, signal);
+    await source.validateMounts?.(owner, agent.skills);
+    return source.list(owner, agent.skills, signal, resolution);
   }
 
   private hasExecutableSkills(agent: AgentDefinition): boolean {
     return !!this.deps.skills?.load && this.deps.skills.enabled !== false && agent.skills.length > 0
       && agent.skills.length <= 8 && new Set(agent.skills).size === agent.skills.length
-      && agent.skills.every(id => /^[A-Za-z0-9_-]{1,64}$/.test(id));
+      && agent.skills.every(isSkillSelector);
   }
 
   private assertSkillDependencies(skills: readonly SkillSummary[], tools: readonly string[]): void {
@@ -546,7 +576,7 @@ export class SessionHost {
   }
 
   private mountSkillTool(owner: Principal, agent: AgentDefinition, skills: readonly SkillSummary[], tools: RunnerTool[],
-    budget: SkillBudget): void {
+    budget: SkillBudget, resolution?: SkillResolution): void {
     if (!this.deps.skills?.load || !skills.some(skill => skill.disableModelInvocation !== true)) return;
     const source = this.deps.skills;
     tools.push({ name: "skill", description: "Load a mounted static skill's instructions. This grants no additional tools or permissions.",
@@ -561,7 +591,7 @@ export class SessionHost {
           const summary = skills.find(skill => skill.name === name && skill.disableModelInvocation !== true);
           if (!summary?.versionSha256) throw new Error("Skill request failed.");
           const loaded = await source.load!(owner, agent.skills, { name: summary.name, invocation: "model",
-            availableTools: tools.map(tool => tool.name), expectedVersionSha256: summary.versionSha256 }, context.signal);
+            availableTools: tools.map(tool => tool.name), expectedVersionSha256: summary.versionSha256 }, context.signal, resolution);
           const skillContext = this.snapshotSkill(loaded, summary), text = renderSkillContext(skillContext);
           const tokens = estimateTokens(text);
           if (tokens > budget.remainingTokens) throw new Error("Skill context budget exceeded.");
@@ -575,7 +605,7 @@ export class SessionHost {
   }
 
   private async resolveSkillInput(owner: Principal, agent: AgentDefinition, catalog: readonly SkillSummary[],
-    tools: readonly string[], parts: ExecutableInputPart[], signal: AbortSignal, budget: SkillBudget): Promise<{
+    tools: readonly string[], parts: ExecutableInputPart[], signal: AbortSignal, budget: SkillBudget, resolution?: SkillResolution): Promise<{
       input: (InputPart & { type: "text" | "image" })[]; skillContexts: ResolvedSkillContext[];
     }> {
     const input: (InputPart & { type: "text" | "image" })[] = [], skillContexts: ResolvedSkillContext[] = [];
@@ -587,7 +617,7 @@ export class SessionHost {
         throw new ApiError("not_found", "Skill not found.");
       }
       const loaded = await this.deps.skills.load(owner, agent.skills, { name: part.name, invocation: "user",
-        availableTools: tools, expectedVersionSha256: summary.versionSha256 }, signal);
+        availableTools: tools, expectedVersionSha256: summary.versionSha256 }, signal, resolution);
       const context = this.snapshotSkill(loaded, summary);
       this.reserveSkillContexts(budget, [context]);
       skillContexts.push(context); input.push({ type: "text", text: renderSkillContext(context, part.args) });
@@ -1639,6 +1669,7 @@ export class SessionHost {
     // Busy handling: the truth is the session status in the store (survives restarts), the active map is our local view.
     if (local) {
       if (busyPolicy === "steer") {
+        if (req.skillOverrides !== undefined) throw new ApiError("invalid_request", "Skill overrides cannot change an active turn.");
         const idempotency: IdempotencyReceiptInput | undefined = opts.idempotencyKey ? {
           scope: { tenantId: session.tenantId, userId: session.userId, sessionId },
           key: opts.idempotencyKey,
@@ -1756,9 +1787,10 @@ export class SessionHost {
       ...await leaseGuard.wait(this.resolveTools(principal, agent, extensionSignal)),
       ...(req.dynamicTools ?? []).map((d) => this.dynamicTools.asTool(d, this.cfg.dynamicToolTimeoutMs)),
     ];
-    const skills = await leaseGuard.wait(this.listSkills(principal, agent, extensionSignal));
+    const skillResolution = turnSkillResolution(req);
+    const skills = await leaseGuard.wait(this.listSkills(principal, agent, extensionSignal, skillResolution));
     const skillBudget: SkillBudget = { remainingTokens: 0, contexts: new Map() };
-    this.mountSkillTool(principal, agent, skills, tools, skillBudget);
+    this.mountSkillTool(principal, agent, skills, tools, skillBudget, skillResolution);
     if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
       throw new ApiError("invalid_request", "tool names collide");
     }
@@ -1787,7 +1819,7 @@ export class SessionHost {
     this.reserveSkillContexts(skillBudget, collectResolvedSkillContexts(snapshotItems));
     runtimeLease?.assertOpen();
     const resolvedInput = await leaseGuard.wait(this.resolveSkillInput(principal, agent, skills,
-      tools.map(tool => tool.name), input, extensionSignal, skillBudget));
+      tools.map(tool => tool.name), input, extensionSignal, skillBudget, skillResolution));
     const engineInput = await leaseGuard.wait(
       this.materializeSubmittedInput(principal, sessionId, resolvedInput.input, hydrationBudget),
     );
@@ -1859,7 +1891,7 @@ export class SessionHost {
       toolCallItems: new Map(), pendingApprovals: new Map(),
       autoApproved: new Set(autoApprovedTools),
       mcpGrantResumptions: new Map(),
-      skills, toolNames: tools.map(tool => tool.name), skillBudget, hooksSha256,
+      skills, skillResolution, toolNames: tools.map(tool => tool.name), skillBudget, hooksSha256,
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
       phase: "reserved", closingRequested: false, steerChain: Promise.resolve(), pendingSteers: [],
@@ -2629,7 +2661,7 @@ export class SessionHost {
       const resolved = await state.leaseGuard.wait(this.resolveSkillInput(
         { tenantId: state.session.tenantId, userId: state.session.userId }, state.agent, state.skills,
         state.toolNames, input, AbortSignal.any([state.abort.signal,
-          ...(state.tenantRuntimeLease ? [state.tenantRuntimeLease.signal] : [])]), state.skillBudget));
+          ...(state.tenantRuntimeLease ? [state.tenantRuntimeLease.signal] : [])]), state.skillBudget, state.skillResolution));
       const skillTokens = resolved.input.reduce((total, part) => total + (part.type === "text" ? estimateTokens(part.text) : 0), 0);
       if (resolved.skillContexts.length && skillTokens > state.skillBudget.remainingTokens) throw new ApiError("invalid_request", "Skill context budget exceeded.");
       if (resolved.skillContexts.length) state.skillBudget.remainingTokens -= skillTokens;

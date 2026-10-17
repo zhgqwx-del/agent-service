@@ -1,14 +1,16 @@
 # agent-service
 
-> 发布门禁更新（2026-10-17）：`4300b5e` 的[第三轮CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39018209424)已终态失败：主5017项、原coverage/required证明、真实S3、历史及双镜像通过，唯一失败是Cluster旧聚合负例30秒超时；后置门禁在该CI未执行，不能称全绿。获准拆分后正式完整4项真实验证已零fail/skip通过，两个负例各默认30秒、503/无ACK及body内成功stop保留。最终类型及五纯276项通过；本提交收口测试拆分与CI fail-fast顺序调整，发布仍须本提交全部Checks成功，不预写通过。原失败、归档边界、保留的隔离库、本地build/VM及精确证据见[PROGRESS末节](docs/PROGRESS.md)。
+> 当前开发（2026-10-17）：受管 skills 包的本地门禁已按失败/影响范围分段收口：历史53文件329项、cluster/build/开发态VM、脚本6文件532项、两BYOK场景及S3尾部9文件42项/源码装配均有通过证据。原主失败、原S3失败与未产出coverage的事实不改，不拼一次完整verify绿；最终SHA的完整CI仍待，当前尚未发布。精确证据见[PROGRESS末节](docs/PROGRESS.md)，合同见[skills设计第6节](docs/design/07-skills.md)。
 
-> **当前实现（2026-10-17）**：M3 已实现三个受限、默认关闭的本地功能切片：[固定匿名 HTTP MCP](docs/design/06-mcp.md)、[owner-scoped 静态 Markdown skills](docs/design/07-skills.md)、[工具前策略与结果提交后 hooks](docs/design/08-tool-hooks.md)。它们内嵌 runner，不增加服务或镜像；对外 API 仍由 router 暴露。本轮已完成定向、真实 MySQL 停服冷读及实际构建/dist 分段验证；完整发布门禁以[当前 main 的 CI Checks](https://github.com/zhgqwx-del/agent-service/actions/workflows/ci.yml)为准，不预写通过。M1 未冻结、M2 冻结，完整 M3（注册/OAuth、三级 skills 包等）与必要 M4 仍未完成，精确证据见[PROGRESS](docs/PROGRESS.md)。
+> 已发布基线：`ad92ed0eb8aa52d80b95db05ea13ac2c82dbfb32` 的[CI39027150157](https://github.com/zhgqwx-del/agent-service/actions/runs/39027150157)五个job全部通过，下载Linux VM字节也已独立核验。它只背书此前受限MCP/静态skills/有限hooks包，不背书当前新增注册能力。完整M3/M4、M1冻结和生产仍未完成；旧失败证据保留。
+
+> **当前实现（2026-10-17）**：M3 已实现三个受限、默认关闭的本地功能切片：[固定匿名 HTTP MCP](docs/design/06-mcp.md)、[owner-scoped 静态 Markdown skills](docs/design/07-skills.md)、[工具前策略与结果提交后 hooks](docs/design/08-tool-hooks.md)。它们内嵌 runner，不增加服务或镜像；对外 API 仍由 router 暴露。该受限包已通过上述exact-SHA完整CI及下载字节审计。M1 未冻结、M2 冻结，完整 M3（注册/OAuth、三级 skills 包等）与必要 M4 仍未完成，精确证据见[PROGRESS](docs/PROGRESS.md)。
 
 > 开发顺序更新（用户确认，2026-10-16）：长期M1～M4全架构目标不缩减。先只修当前功能包的发布阻断，补齐剩余门禁并等待最终SHA CI；随后尽早本地手动体验，推进M3 MCP/skills/hooks真实纵向（安全随功能），再补必要M4本地可验的发布/迁移/运行、基础quota与观测；完整生命周期/灾备列为后续P2，真实云验收待资源。M1仍未闭环/未冻结、M2冻结、M3已进入受限MCP候选、未整体完成，但不再要求M1全部闭环才能启动M3。可本地运行的功能版不等于全架构或生产完成；原安全边界及已完成代码/native WIP保留，详见[PROGRESS](docs/PROGRESS.md)。
 
 原完整 verify 的失败及两库保留；修复/受影响范围、52 文件 325 项历史升级、cluster 28 加独立 T3g 3 项、严格双角色 VM 均已有各自通过证据，不能拼作一次本地全量成功。整合检查点 `25d0e6a` 的 MCP/skills/hooks 三个正式 MySQL 纵向又各 1 项通过。VM 仅测试签名、非生产验收；此前 `6fdb63c` 的五绿和本地体验不背书新源码，最终 SHA 仍须 CI 全绿。手动启动、观察点与 CI 构建说明统一见[开发与 CI 指南](docs/operations/development-and-ci-guide.md)。
 
-M1 未冻结、M2 冻结、M3 已开始但未完成；默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
+M1 未冻结、M2 冻结、M3 已开始但未完成；既有生命周期 gate 的默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。受管 skills 独立默认关闭，其 filesystem 仅限本地单 runner、production 拒绝；受控共享 S3 不受该 filesystem 限制，但尚未完成真实云验收。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
 
 五个显式 continuation 命令 `replay-selected`、`verify-selected`、`activate-selected`、`activate-capture-selected`、`resolve-selected` 均须 exact run、独立 ACK、held GCM、实际 target/operator 锁和完整外部链验真；runtime 写入仍须 fresh configured-fleet proof，operator 不获得 ordinary writer 权限。旧 writer 必须停服排空，独立迁移并核对 strict fingerprint，只能 forward-fix，不热混跑或删 marker。
 
@@ -25,7 +27,7 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 - **M0 调研**：完成。
 - **M1 单节点 runner MVP**：核心运行链路及多项本地生命周期切片已完成，但完整数据生命周期仍未闭环。`0034` durable writer已接runner并支持默认关闭的本地filesystem或S3-compatible target；`0035`只实现`provider.upstream_request_failed`的logs exact contract，traces必须inactive。`0036`/`0037`仍是默认休眠的非生产disposition协议与真实grant硬拒；`0038`～`0041`依次封存新受管write membership、T3f owner closure、T3d五类source和观察目标。`0042`再为**新**T3d plan从同一次source/owner快照构建逐artifact目标目录，把logs/traces的精确count/root写入33域plan entry，并与0040/0041账本、独立catalog receipt及terminal在一个Memory原子发布或MySQL事务中封存。legacy、未完成、孤立来源保持unknown，旧0041 terminal缺catalog不能重释为新目标。新目标仍为`blocked_adapter_unconfigured`，不是删除许可；真实grant、产品外部mutation/restore和全域completion仍关闭。第四、第五个本地MinIO bucket只证明0034/0036协议，不能代表云IAM/KMS或独立故障域。真实provider/KMS、generic user物理purge、backup-copy erasure/联合恢复、telemetry delete/restore/retention与全域completion仍未闭环；本地加密MySQL逻辑backup producer已实现，所以M1未冻结。
 - **M2 router + 多节点**：`agent-router`、租约/fence、owner 目录、drain、原子 session 创建与真实多进程接管测试均已实现并通过自动验收；本地/CI 代码范围已正式冻结，生产 Kubernetes/云资源部署在环境参数明确后单独交付。
-- **M3 扩展性**（MCP、skills、hooks）：固定匿名HTTP MCP、owner-scoped静态skills和有限operator工具hooks已有实现与本地分段验证；完整注册/OAuth、三级skill包与插件平台仍待，不能称整体完成；当前main发布状态以exact-SHA CI为准。
+- **M3 扩展性**（MCP、skills、hooks）：固定匿名HTTP MCP、owner-scoped静态skills和有限operator工具hooks已有发布基线；本轮另实现三级scope、不可变版本与请求选择的受管SKILL.md注册包，最终CI待。完整MCP注册/OAuth、脚本隔离与完整hooks/插件平台等仍待，不能称整体完成；当前main发布状态以exact-SHA CI为准。
 - **M4 生产化**（配额、可观测性、限流）：尚未整体完成；Docker、CI、本地运维、安全结构化遥测/trace入口、0032～0042默认休眠基座与VM发布包已有实现，默认关闭的L0 runtime metrics与双VM包已随发布基线验证。真实managed环境验收、完整telemetry执行生命周期、OTel/collector/dashboard/SLO/alert、限流/配额或生产环境验收仍缺。
 
 `0040`/`0041`封存source与观察目标，`0042`仅让新plan拥有精确、不可变的logs/traces逐artifact目标count/root；目录条目含受保护身份和来源摘要，不含原始owner或外部locator。旧terminal缺0042 receipt仍是`unknown`，不能借0041观察目标推断其T3d目标。即使新plan有非零目标，两域仍保持blocker，`executionReady=false`；0037 grant硬拒、外部删除/恢复与全域completion门禁不变。最新验证与剩余工作以[进度记录](docs/PROGRESS.md)顶部和最后一节为准。
@@ -289,7 +291,7 @@ user data export 同样采用默认关闭的 writer gate。runner/router 都设�
 
 ## API 速览（对外经 `apps/agent-router`）
 
-普通 runtime API 使用两层鉴权：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（trusted caller）或 runner 验证的端用户 token。tenant-erasure 两个 platform API 则使用完全独立的 platform bearer，不能复用 service key。入站 token header 不能占用 service/user/framing/hop-by-hop 保留头；即使数据库中存在升级前的坏策略，admin service key 仍可通过 `/v1/tenant/auth` 修复。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入；首次生产admin bootstrap必须同时设置`ADMIN_BOOTSTRAP_TENANT`与绝对路径`ADMIN_BOOTSTRAP_OUTPUT_FILE`，密钥只创建到`0600`文件且不会输出到进程日志，具体恢复边界见`docs/design/05-observability.md`。
+普通 runtime API 使用两层鉴权：`Authorization: Bearer <service api key>`（→ tenant）+ `X-User-Id`（trusted caller）或 runner 验证的端用户 token。tenant-erasure 两个 platform API 则使用完全独立的 platform bearer，不能复用 service key。平台 skills 的 `/v1/platform/skills` 使用另一独立的 router-only `SKILL_REGISTRY_OPERATOR_TOKEN`，也不能复用 erasure token；user/tenant skills 的权限见[skills设计第6节](docs/design/07-skills.md#6-受管注册包候选独立版本域)。入站 token header 不能占用 service/user/framing/hop-by-hop 保留头；即使数据库中存在升级前的坏策略，admin service key 仍可通过 `/v1/tenant/auth` 修复。开发用 key 由 `BOOTSTRAP_API_KEY`（默认 `dev-key`）注入；首次生产admin bootstrap必须同时设置`ADMIN_BOOTSTRAP_TENANT`与绝对路径`ADMIN_BOOTSTRAP_OUTPUT_FILE`，密钥只创建到`0600`文件且不会输出到进程日志，具体恢复边界见`docs/design/05-observability.md`。
 
 ```bash
 BASE=http://127.0.0.1:8080

@@ -5,6 +5,9 @@ import { dirname, join } from "node:path";
 import mysql, { type Pool, type PoolConnection, type RowDataPacket } from "mysql2/promise";
 import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "./operation-abort.js";
 import { readTenantTelemetryCaptureCheckpointFromMysql } from "./tenant-telemetry-capture-checkpoint.js";
+import * as SkillRegistry from "../skills.js";
+import { MysqlSkillRegistry, assertMysqlSkillRegistryProjection, assertMysqlSkillRegistryFingerprint,
+  skillRegistryFingerprintStatement, SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_TABLES, SKILL_REGISTRY_TRIGGERS } from "./skills-registry.js";
 import type { AgentDefinition, ApiKeyScope, Approval, EventInput, Item, PersistedEvent, ProviderConfig, Session, TenantAuthPolicy, Turn, UsageQuery } from "@agent-service/protocol";
 import {
   Approval as ApprovalSchema,
@@ -8998,6 +9001,7 @@ export class MysqlSessionStore implements
    */
   private credentialLifecycleSchemaInstalled = false;
   private credentialResponsibilitySchemaInstalled = false;
+  private skillRegistrySchemaInstalled = false;
   private tenantRestoreJournalSchemaInstalled = false;
   private tenantBackupCatalogSchemaInstalled = false;
   private tenantTelemetrySchemaInstalled = false;
@@ -9157,6 +9161,7 @@ export class MysqlSessionStore implements
           await store.assertTenantCredentialResponsibilityProjection(conn);
         });
       }
+      if (store.skillRegistrySchemaInstalled) await store.withConsistentRead(assertMysqlSkillRegistryProjection);
       if (store.tenantTelemetryCaptureCheckpointSchemaInstalled) {
         await store.withConsistentRead(async (conn) => {
           await store.assertCaptureCheckpointHistoricalProjection(conn);
@@ -10605,13 +10610,14 @@ export class MysqlSessionStore implements
   private async assertTenantCredentialResponsibilityFingerprint(
     conn: PoolConnection,
     migrationsDir: string,
+    includeTriggers = true,
   ): Promise<void> {
     let statements: string[];
     try {
       const sql = await readFile(join(migrationsDir, TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME), "utf8");
       statements = [
         tenantCredentialResponsibilityFingerprintStatement(sql, "schema"),
-        tenantCredentialResponsibilityFingerprintStatement(sql, "triggers"),
+        ...(includeTriggers ? [tenantCredentialResponsibilityFingerprintStatement(sql, "triggers")] : []),
       ];
     } catch (cause) {
       throw new Error("0059 credential responsibility fingerprint source is invalid", { cause });
@@ -10624,7 +10630,7 @@ export class MysqlSessionStore implements
       const [rows] = await conn.query<Row[]>(
         "SELECT @credential_responsibility_schema_ok AS schema_ok,@credential_responsibility_triggers_ok AS triggers_ok",
       );
-      if (Number(rows[0]?.schema_ok) !== 1 || Number(rows[0]?.triggers_ok) !== 1) {
+      if (Number(rows[0]?.schema_ok) !== 1 || (includeTriggers && Number(rows[0]?.triggers_ok) !== 1)) {
         throw new Error("stored schema/triggers do not match the 0059 fingerprint");
       }
     } catch (cause) {
@@ -11538,7 +11544,11 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)) {
-        await this.assertTenantCredentialResponsibilityFingerprint(conn, migrationsDir);
+        await this.assertTenantCredentialResponsibilityFingerprint(conn, migrationsDir, !done.has(SKILL_REGISTRY_MIGRATION));
+      }
+      if (done.has(SKILL_REGISTRY_MIGRATION)) {
+        if (!done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)) throw new SkillRegistry.SkillRegistryIntegrityError();
+        await assertMysqlSkillRegistryFingerprint(conn, migrationsDir);
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
         await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
@@ -11556,6 +11566,7 @@ export class MysqlSessionStore implements
       this.credentialResponsibilitySchemaInstalled = done.has(
         TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME,
       );
+      this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
@@ -11661,6 +11672,10 @@ export class MysqlSessionStore implements
       tenantCredentialResponsibilityFingerprintStatement(sql, "schema");
       tenantCredentialResponsibilityFingerprintStatement(sql, "triggers");
     }
+    if (files.includes(SKILL_REGISTRY_MIGRATION)) {
+      const sql = await readFile(join(dir, SKILL_REGISTRY_MIGRATION), "utf8");
+      skillRegistryFingerprintStatement(sql, "schema"); skillRegistryFingerprintStatement(sql, "triggers");
+    }
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -11749,6 +11764,15 @@ export class MysqlSessionStore implements
       }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === SKILL_REGISTRY_MIGRATION) {
+          if (!done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)) throw new SkillRegistry.SkillRegistryIntegrityError();
+          const [footprint] = await conn.query<Row[]>(`SELECT
+            (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN (${SKILL_REGISTRY_TABLES.map(() => "?").join(",")}))
+            + (SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND trigger_name IN (${SKILL_REGISTRY_TRIGGERS.map(() => "?").join(",")})) AS n`,
+          [...SKILL_REGISTRY_TABLES, ...SKILL_REGISTRY_TRIGGERS]);
+          if (Number(footprint[0]?.n) !== 0) throw new SkillRegistry.SkillRegistryIntegrityError();
+          await this.assertTenantCredentialResponsibilityFingerprint(conn, dir);
+        }
         if (f === TENANT_TELEMETRY_CAPTURE_REPEAT_RESTORE_MIGRATION_NAME) {
           if (!done.has(TENANT_TELEMETRY_CAPTURE_EPOCH_CUTOVER_MIGRATION_NAME)) {
             throw new Error("0058 repeat restore migration requires 0057");
@@ -12256,7 +12280,11 @@ export class MysqlSessionStore implements
         );
       }
       if (done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)) {
-        await this.assertTenantCredentialResponsibilityFingerprint(conn, dir);
+        await this.assertTenantCredentialResponsibilityFingerprint(conn, dir, !done.has(SKILL_REGISTRY_MIGRATION));
+      }
+      if (done.has(SKILL_REGISTRY_MIGRATION)) {
+        if (!done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)) throw new SkillRegistry.SkillRegistryIntegrityError();
+        await assertMysqlSkillRegistryFingerprint(conn, dir);
       }
       if (done.has(ORDINARY_SESSION_DELETE_GRACE_MIGRATION_NAME)) {
         await this.assertOrdinarySessionDeleteGraceFingerprint(conn);
@@ -12274,6 +12302,7 @@ export class MysqlSessionStore implements
       this.credentialResponsibilitySchemaInstalled = done.has(
         TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME,
       );
+      this.skillRegistrySchemaInstalled = done.has(SKILL_REGISTRY_MIGRATION);
       this.tenantRestoreJournalSchemaInstalled = done.has(
         TENANT_RESTORE_JOURNAL_MIGRATION_NAME,
       );
@@ -25943,6 +25972,7 @@ export class MysqlSessionStore implements
     let transactionFailed = false;
     try {
       await this.beginTenantPurgePlanTransaction(conn);
+      if (preflight.phase !== "plan_sealed") await this.assertSkillRegistryTenantPurgeSupported(conn, preflight.tenantId);
       if (preflight.phase === "plan_sealed") {
         await this.validateTenantPurgePlanSource(conn, preflight, false);
         const terminal = await this.loadTenantPurgePlanJob(
@@ -32140,6 +32170,7 @@ export class MysqlSessionStore implements
         await conn.commit();
         return null;
       }
+      if (current.phase !== "database_purged") await this.assertSkillRegistryTenantPurgeSupported(conn, current.tenantId);
       // Hold the singleton for the full transaction. Once this transaction has staged its
       // terminal receipt, re-reading the still-inactive row through the general validator
       // would (correctly for an external reader, incorrectly for this atomic writer) see a
@@ -37567,6 +37598,37 @@ export class MysqlSessionStore implements
   }
 
   // ---------- agents ----------
+  private skillRegistry(): MysqlSkillRegistry {
+    if (!this.skillRegistrySchemaInstalled) throw new SkillRegistry.SkillRegistryIntegrityError();
+    return new MysqlSkillRegistry(this.pool, async (conn, principal, owner, now, authority) => {
+      const migration = await this.lockBlobStorageMigrationActivationContext(conn);
+      if (migration && !["inactive", "aborted", "source_cleaned"].includes(migration.phase)) throw new SkillRegistry.SkillRegistryIntegrityError();
+      await this.readBlobStorageControl(conn, "FOR SHARE");
+      const subjects: SkillRegistry.SkillRegistryPrincipal[] = authority === "user_self" ? [{ tenantId: principal.tenantId, userId: principal.userId }] : [];
+      if (owner.scope === "user") subjects.push({ tenantId: owner.tenantId!, userId: owner.userId! });
+      subjects.sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : JSON.stringify(a) > JSON.stringify(b) ? 1 : 0);
+      const seen = new Set<string>();
+      for (const subject of subjects) if (!seen.has(JSON.stringify(subject))) {
+        seen.add(JSON.stringify(subject)); await this.lockActiveSubjectGate(conn, subject.tenantId, subject.userId, now);
+      }
+      if (owner.scope === "tenant") await this.lockActiveTenantGate(conn, owner.tenantId!, now);
+    });
+  }
+  prepareSkillInstallation(input: SkillRegistry.PrepareSkillInstallationInput) { return this.skillRegistry().prepareSkillInstallation(input); }
+  publishSkillInstallation(input: SkillRegistry.PublishSkillInstallationInput) { return this.skillRegistry().publishSkillInstallation(input); }
+  listSkillSlots(input: SkillRegistry.ListSkillSlotsInput) { return this.skillRegistry().listSkillSlots(input); }
+  listSkillVersions(input: SkillRegistry.ListSkillVersionsInput) { return this.skillRegistry().listSkillVersions(input); }
+  getSkillSlot(input: SkillRegistry.GetSkillSlotInput) { return this.skillRegistry().getSkillSlot(input); }
+  getReadableSkillVersion(input: SkillRegistry.GetReadableSkillVersionInput) { return this.skillRegistry().getReadableSkillVersion(input); }
+  deleteSkillSlot(input: SkillRegistry.DeleteSkillSlotInput) { return this.skillRegistry().deleteSkillSlot(input); }
+  listUserSkillExportSnapshot(input: SkillRegistry.SkillRegistryOwnerInput) { return this.skillRegistry().listUserSkillExportSnapshot(input); }
+
+  private async assertSkillRegistryTenantPurgeSupported(conn: PoolConnection, tenantId: string): Promise<void> {
+    if (!this.skillRegistrySchemaInstalled) return;
+    const [rows] = await conn.query<Row[]>("SELECT owner_sha256 FROM skill_registry_owners WHERE BINARY JSON_UNQUOTE(JSON_EXTRACT(owner_json,'$.tenantId'))=BINARY ? ORDER BY owner_sha256 FOR SHARE", [tenantId]);
+    if (rows.length) throw new SkillRegistry.SkillRegistryLifecycleBlockedError();
+  }
+
   async createAgent(def: AgentDefinition) {
     const conn = await this.pool.getConnection();
     try {
@@ -43023,6 +43085,10 @@ export class MysqlSessionStore implements
       // and ordinary activation cannot each publish half of an unrecoverable split-brain state.
       const migrationContext = await this.lockBlobStorageMigrationActivationContext(conn);
       const current = await this.readBlobStorageControl(conn, "FOR UPDATE");
+      if (this.skillRegistrySchemaInstalled && (current.controlGeneration !== 1 || current.storageBackend !== stagedInput.storageBackend || current.namespaceSha256 !== stagedInput.namespaceSha256)) {
+        const [registryOwners] = await conn.query<Row[]>("SELECT owner_sha256 FROM skill_registry_owners ORDER BY owner_sha256 FOR SHARE");
+        if (registryOwners.length) throw new BlobStorageControlConflictError();
+      }
       if (current.controlGeneration === 1) {
         if (
           current.storageBackend !== stagedInput.storageBackend

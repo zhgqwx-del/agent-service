@@ -165,6 +165,9 @@ import {
 import { redactProviderConfig, type ProviderService } from "@agent-service/providers";
 import { assertMayActAs, authMiddleware, generateApiKey, hashApiKey, requireAdmin, requireUser, TenantPolicyCache, type AuthEnv } from "./auth.js";
 import { needsSecret, validateAuthPolicy } from "./auth-policy.js";
+import { registerSkillRegistryRoutes } from "./skill-registry-routes.js";
+import type { RegisteredSkillService } from "@agent-service/core";
+import { MANAGED_SKILL_REGISTRY_V1 } from "@agent-service/protocol";
 import { sseResponse } from "./sse.js";
 
 export interface AppDeps {
@@ -176,6 +179,9 @@ export interface AppDeps {
   mcpEnabled?: boolean;
   /** Operator-mounted static SKILL.md subset only; no installation or script execution. */
   skillsEnabled?: boolean;
+  skillRegistryEnabled?: boolean;
+  skillRegistry?: RegisteredSkillService;
+  skillRegistryStorage?: Capabilities["features"]["skillRegistryStorage"];
   hooksEnabled?: boolean;
   runnerId: string;
   internalRouterToken: string;
@@ -540,6 +546,8 @@ export function createApp(deps: AppDeps) {
         dynamicTools: true,
         mcp: deps.mcpEnabled === true ? ["streamable-http"] : [],
         skills: deps.skillsEnabled === true,
+        skillRegistry: deps.skillRegistryEnabled === true && deps.skillRegistry ? [MANAGED_SKILL_REGISTRY_V1] : [],
+        skillRegistryStorage: deps.skillRegistryEnabled === true && deps.skillRegistry ? deps.skillRegistryStorage ?? null : null,
         hooks: deps.hooksEnabled === true,
         sandbox: ["none"],
         byok: true,
@@ -918,6 +926,8 @@ export function createApp(deps: AppDeps) {
   });
 
   const v1 = new Hono<AuthEnv>();
+  v1.use("/skills", privateResponseHeaders);
+  v1.use("/skills/*", privateResponseHeaders);
   // Blob bytes and hydrated tool output are user data. Apply these headers before auth/id
   // validation so success and every error response share the same cache and sniffing policy.
   v1.use("/sessions/:id/blobs", privateResponseHeaders);
@@ -964,12 +974,17 @@ export function createApp(deps: AppDeps) {
     tenantRuntime: deps.tenantRuntime,
   }));
 
+  registerSkillRegistryRoutes(v1, app, { service: deps.skillRegistry,
+    enabled: deps.skillRegistryEnabled === true, maxBodyBytes: deps.maxBodyBytes,
+    internalTokenMatches: supplied => internalTokenMatches(supplied, deps.internalRouterToken) });
+
   // ---------- agents ----------
   v1.post("/agents", async (c) => {
     requireAdmin(c);
     const input = await parse(AgentDefinitionRequest, await json(c));
     if (input.mcpServers.length && deps.mcpEnabled !== true) throw new ApiError("invalid_request", "MCP is not configured");
-    if (input.skills.length && deps.skillsEnabled !== true) throw new ApiError("invalid_request", "Skills are not configured");
+    if (input.skills.some(value => value.startsWith("registry:")) && deps.skillRegistryEnabled !== true) throw new ApiError("invalid_request", "Skill registry is not configured");
+    if (input.skills.some(value => !value.startsWith("registry:")) && deps.skillsEnabled !== true) throw new ApiError("invalid_request", "Skills are not configured");
     const def = AgentDefinition.parse({ ...input, id: newId("agt"), tenantId: c.get("tenantId"), version: 1, createdAtMs: Date.now() });
     await deps.store.createAgent(def);
     return c.json(def, 201);
@@ -993,7 +1008,8 @@ export function createApp(deps: AppDeps) {
     if (!prev) throw new ApiError("not_found", "agent not found");
     const input = await parse(AgentDefinitionRequest, await json(c));
     if (input.mcpServers.length && deps.mcpEnabled !== true) throw new ApiError("invalid_request", "MCP is not configured");
-    if (input.skills.length && deps.skillsEnabled !== true) throw new ApiError("invalid_request", "Skills are not configured");
+    if (input.skills.some(value => value.startsWith("registry:")) && deps.skillRegistryEnabled !== true) throw new ApiError("invalid_request", "Skill registry is not configured");
+    if (input.skills.some(value => !value.startsWith("registry:")) && deps.skillsEnabled !== true) throw new ApiError("invalid_request", "Skills are not configured");
     const def = AgentDefinition.parse({ ...input, id: prev.id, tenantId: prev.tenantId, version: prev.version + 1, createdAtMs: Date.now() });
     await deps.store.createAgent(def);
     return c.json(def);
@@ -1252,7 +1268,9 @@ export function createApp(deps: AppDeps) {
   });
   v1.post("/sessions/:id/turns/:turnId/interrupt", async (c) => c.json(await deps.host.interrupt(requireUser(c), c.req.param("id"), c.req.param("turnId"))));
   v1.post("/sessions/:id/turns/:turnId/steer", async (c) => {
-    const req = await parse(TurnSteerRequest, await json(c));
+    const raw = await json(c);
+    if (raw && typeof raw === "object" && "skillOverrides" in raw) throw new ApiError("invalid_request", "Skill overrides cannot change an active turn");
+    const req = await parse(TurnSteerRequest, raw);
     await deps.host.steer(requireUser(c), c.req.param("id"), c.req.param("turnId"), req);
     return c.json({ ok: true }, 202);
   });

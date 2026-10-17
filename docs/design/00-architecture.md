@@ -1,5 +1,7 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
+> 受管 skills 候选（2026-10-17，未发布验收）：`0060` 独立 metadata/对象包、不可变版本/CAS、platform/tenant/user 与已挂载名的 request version override、安装 guard、Host 双调用、独立 user 导出与逻辑删除已实际落代码，合同见 [07 第6节](07-skills.md)。纯定向、真实 MySQL/Fs HTTP 及 MySQL/MinIO 双客户端已有分段通过，完整验收仍以 PROGRESS 末节为准；旧受限包的 CI 不背书此候选。它内嵌既有 router/runner，仍两服务/六入口/两镜像，不增加技能微服务；物理 purge/迁移/恢复及完整 M3/M4/生产不因此完成。
+
 > M3 本地增量（2026-10-17，发布状态看当前main Checks）：固定匿名HTTP MCP、owner-scoped静态Markdown skills、固定operator工具前策略/提交后观察已有受限实现；合同见 [06](06-mcp.md)、[07](07-skills.md)、[08](08-tool-hooks.md)，分段证据见PROGRESS。这不是完整动态注册/OAuth、三级skills包或任意插件平台。它们内嵌runner；router只公开API/全部configured fleet能力交集，仍两常驻服务、六产品入口、两镜像，不新增微服务。
 
 > 当前状态（2026-10-16，优先于下方历史候选说明）：main `6fdb63c` 的最终五项 CI 全绿，已完成隔离本地 router/runner/MySQL/Redis 确定性体验。当前工作树进入 M3.1a MCP 候选，尚未发布或完成新 CI；范围与未完清单见 [MCP 设计](06-mcp.md)，实际验证只看 [PROGRESS](../PROGRESS.md) 顶部及末节。M1 未冻结不再阻挡 M3，按用户确认顺序推进 M3、必要 M4、剩余 P2。对外 API 仍由 router 暴露，runtime/MCP 执行在 runner；常驻服务及镜像仍各两个。
@@ -221,7 +223,7 @@ runner 处理 `POST /sessions/{id}/turns` 的顺序：
 | 审批 | `GET /v1/sessions/{id}/approvals?pending=true`，`POST /v1/sessions/{id}/approvals/{approvalId}` `{decision}` | decision ∈ `accept | acceptForSession | decline | cancel`；资源含 `expiresAt`、`availableDecisions[]` |
 | Provider / 模型 | `GET /v1/providers`，`GET /v1/models`，`POST/PUT/DELETE /v1/providers/{id}`（租户 BYOK） | BYOK 配置形状见 §7.4 |
 | MCP | `POST/GET/DELETE /v1/mcp-servers`，`GET /v1/mcp-servers/{id}/tools`，`POST .../refresh` | 租户级或用户级；`transport: streamable-http | stdio(重池)` |
-| Skills | `POST/GET/DELETE /v1/skills`（上传 SKILL.md 包），`GET /v1/skills/{name}` | 来源三级：platform / tenant / user |
+| Skills | user/tenant 管理走 `/v1/skills`；platform 管理仅走 `/v1/platform/skills`；不可变版本与独立用户导出见[skills §6](07-skills.md#6-受管注册包候选独立版本域) | 来源三级；user-own 用实际用户身份、tenant 需同租户 admin、platform 用独立 router-only `SKILL_REGISTRY_OPERATOR_TOKEN`，不能复用 tenant/erasure bearer |
 | 工具 | `GET /v1/tools` | 当前 principal 可见的内置 + MCP + 动态工具目录 |
 | 用量 | `GET /v1/usage?sessionId|userId&from&to` | 来自 `usage_ledger` |
 | User data export | `POST /v1/data-export-requests`，`GET /v1/data-export-requests/{requestId}`，`GET .../{requestId}/download` | admin + user + Idempotency-Key；异步生成 owner-scoped `ndjson-v1` 临时制品，request gate默认关闭 |

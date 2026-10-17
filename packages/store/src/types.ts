@@ -16,6 +16,7 @@ import type {
 import { blobBindingsFromItems, type BlobBinding } from "./blob-lifecycle.js";
 import type { TenantRuntimeState } from "./subject-lifecycle.js";
 import type { ProviderCredentialTargetReferenceWrite } from "./credential-lifecycle.js";
+import type { SkillRegistryStore } from "./skills.js";
 
 export interface ApiKeyRecord {
   keyId: string;
@@ -551,7 +552,7 @@ export class IdempotencyPendingError extends Error {
   }
 }
 
-export interface SessionStore {
+export interface SessionStore extends SkillRegistryStore {
   /** O(1) tenant gate used by authentication/provider code and ordinary tenant-scoped writes. */
   getTenantRuntimeState(tenantId: string): Promise<TenantRuntimeState>;
 
@@ -766,6 +767,12 @@ export interface BlobStore {
   readonly shared?: boolean;
   /** Stable, non-secret identity of the configured shared namespace, when one exists. */
   readonly namespaceSha256?: string;
+  /**
+   * Opt-in ownership boundary for callers which must retain a runtime lease until actual local
+   * adapter I/O settles, including work left pending by a request/body timeout. This does not
+   * change operation deadlines or prove a remote mutation was cancelled or rolled back.
+   */
+  withIoSettlement?<T>(work: () => Promise<T>): Promise<T>;
   /**
    * Create-only write. An exact byte/content-type retry is idempotent; a non-identical value at the
    * same server-generated key fails with BlobConflictError and is never overwritten.

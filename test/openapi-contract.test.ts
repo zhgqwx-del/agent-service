@@ -109,12 +109,16 @@ describe("committed OpenAPI contract", () => {
     const operations = specOperations();
     const operationIds = operations.map(({ operationId }) => operationId);
 
-    expect(operations).toHaveLength(55);
+    expect(operations).toHaveLength(68);
     expect(operationIds.every((operationId) => typeof operationId === "string" && operationId.length > 0)).toBe(true);
     expect(new Set(operationIds).size).toBe(operationIds.length);
 
     const paths = Object.keys(document.paths);
-    expect(paths.filter((path) => /\/(?:mcp-servers|skills|plugins|hooks)(?:\/|$)/i.test(path))).toEqual([]);
+    expect(paths.filter((path) => /\/(?:mcp-servers|plugins|hooks)(?:\/|$)/i.test(path))).toEqual([]);
+    expect(paths.filter((path) => /\/skills(?:\/|$)/.test(path)).sort()).toEqual([
+      "/v1/platform/skills", "/v1/platform/skills/{name}", "/v1/platform/skills/{name}/versions", "/v1/platform/skills/{name}/versions/{versionId}",
+      "/v1/skills", "/v1/skills/export", "/v1/skills/{name}", "/v1/skills/{name}/versions", "/v1/skills/{name}/versions/{versionId}",
+    ].sort());
     expect(paths).not.toContain("/_router/targets");
     expect(paths).not.toContain("/v1/agents/{id}/versions");
     expect(paths).not.toContain("/v1/sessions/{id}/fork");
@@ -393,7 +397,7 @@ describe("committed OpenAPI contract", () => {
     }
   });
 
-  it("matches all 52 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
+  it("matches all 59 tenant-runtime runner routes plus the OpenAPI route in both directions", () => {
     const registered = registeredOperations();
     const registeredKeys = registered.map(operationKey).sort();
     // Tenant erasure is an edge-owned platform control plane. The router authenticates its
@@ -401,13 +405,32 @@ describe("committed OpenAPI contract", () => {
     // runners intentionally do not register those two public paths.
     const specKeys = specOperations()
       .filter(({ path }) => !path.startsWith("/v1/tenant-erasure-requests"))
+      .filter(({ path }) => !path.startsWith("/v1/platform/skills"))
       .map(operationKey)
       .sort();
 
-    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(52);
-    expect(registered).toHaveLength(53);
+    expect(registered.filter(({ path }) => path !== "/openapi.json")).toHaveLength(59);
+    expect(registered).toHaveLength(60);
     expect(new Set(registeredKeys).size).toBe(registeredKeys.length);
     expect(registeredKeys).toEqual(specKeys);
+  });
+
+  it("publishes registry CAS, immutable selection and the separate platform operator credential exactly", () => {
+    for (const path of ["/v1/skills", "/v1/platform/skills"]) {
+      expect(document.paths[path]?.post?.parameters).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "idempotency-key", in: "header", required: true }),
+      ]));
+    }
+    expect(document.paths["/v1/platform/skills"]?.post?.security).toEqual([{ SkillRegistryOperatorToken: [] }]);
+    expect(document.components?.securitySchemes?.SkillRegistryOperatorToken).toMatchObject({ type: "http", scheme: "bearer" });
+    expect(document.components?.schemas?.SkillInstallRequest).toMatchObject({ additionalProperties: false,
+      required: ["scope", "document", "expectedRevision"], properties: { scope: { enum: ["tenant", "user"] }, expectedRevision: { minimum: 0 } } });
+    expect(document.components?.schemas?.StartTurnRequest).toMatchObject({ properties: { skillOverrides: { maxItems: 8,
+      items: { additionalProperties: false, required: ["name", "versionId"], properties: { versionId: { format: "uuid" } } } } } });
+    expect(document.components?.schemas?.SteerRequest).not.toHaveProperty("properties.skillOverrides");
+    expect(document.components?.schemas?.SkillExportResponse).toMatchObject({ additionalProperties: false,
+      properties: { schema: { enum: ["user-skill-registry-export-v1"] }, scope: { enum: ["user"] }, physicalErasureComplete: { enum: [false] } } });
+    expect(document.paths["/v1/skills/export"]?.get?.parameters?.some(p => p.name === "scope")).toBe(false);
   });
 
   it("keeps every router-to-runner control route out of the public OpenAPI/SDK", async () => {

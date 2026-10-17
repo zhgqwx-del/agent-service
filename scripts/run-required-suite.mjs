@@ -13,12 +13,16 @@ if (!(relativeTestFile.startsWith("packages/store/test/")
     || relativeTestFile.startsWith("packages/core/test/")
     || relativeTestFile.startsWith("packages/providers/test/")
     || relativeTestFile.startsWith("packages/protocol/test/")
+    || relativeTestFile === "packages/sdk/test/skills.test.ts"
     || relativeTestFile.startsWith("apps/agent-runner/test/")
     || relativeTestFile.startsWith("apps/agent-router/test/")
     || relativeTestFile === "test/openapi-contract.test.ts"
     || relativeTestFile === "test/vm-release.test.ts"
     || relativeTestFile === "test/vm-release-archive.test.ts"
-    || relativeTestFile === "test/vm-release-tool.test.ts")
+    || relativeTestFile === "test/vm-release-tool.test.ts"
+    || relativeTestFile === "test/vm-release-signature.test.ts"
+    || relativeTestFile === "test/vm-release-signed.test.ts"
+    || relativeTestFile === "test/vm-release-sign-cli.test.ts")
   || !relativeTestFile.endsWith(".test.ts")) {
   throw new Error(`refusing test suite outside approved package tests: ${relativeTestFile}`);
 }

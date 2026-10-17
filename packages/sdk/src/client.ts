@@ -32,6 +32,23 @@ export type AgentServicePlatformPaths = Pick<
 >;
 export type AgentServicePlatformClient = Client<AgentServicePlatformPaths>;
 
+export interface AgentServiceSkillRegistryOperatorClientOptions extends Omit<ClientOptions, "headers"> {
+  baseUrl: string;
+  skillRegistryOperatorToken: string;
+  headers?: ClientOptions["headers"];
+}
+export type AgentServiceSkillRegistryOperatorPaths = Pick<paths,
+  "/v1/platform/skills" | "/v1/platform/skills/{name}" | "/v1/platform/skills/{name}/versions" | "/v1/platform/skills/{name}/versions/{versionId}">;
+export type AgentServiceSkillRegistryOperatorClient = Client<AgentServiceSkillRegistryOperatorPaths>;
+
+/** This token cannot authenticate tenant erasure or ordinary runtime requests. */
+export function createAgentServiceSkillRegistryOperatorClient(options: AgentServiceSkillRegistryOperatorClientOptions): AgentServiceSkillRegistryOperatorClient {
+  const { skillRegistryOperatorToken, headers, ...clientOptions } = options;
+  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(skillRegistryOperatorToken)) throw new TypeError("Invalid skill registry operator token");
+  return createOpenApiClient<AgentServiceSkillRegistryOperatorPaths>({ ...clientOptions,
+    headers: mergeHeaders(headers, { Authorization: `Bearer ${skillRegistryOperatorToken}` }) });
+}
+
 export type AgentServiceEvent = components["schemas"]["Event"];
 export type ExcludableEventType = components["schemas"]["ExcludableEventType"];
 export type StartTurnInput = components["schemas"]["StartTurnRequest"];
@@ -129,6 +146,43 @@ export interface ItemOutputResult {
   response: Response;
   data: ItemOutput;
 }
+
+export type SkillInstallInput = components["schemas"]["SkillInstallRequest"];
+export type SkillDeleteInput = components["schemas"]["SkillDeleteRequest"];
+export type SkillVersion = components["schemas"]["SkillVersionResponse"];
+export type InstalledSkill = components["schemas"]["InstalledSkillResponse"];
+export type SkillPage = components["schemas"]["SkillListResponse"];
+export type SkillVersions = components["schemas"]["SkillVersionsResponse"];
+export type SkillDocument = components["schemas"]["SkillDocumentResponse"];
+export type UserSkillExport = components["schemas"]["SkillExportResponse"];
+export interface SkillPageQuery { scope: "user" | "tenant"; limit?: number; cursor?: string }
+export interface SkillExportOptions { limit?: number; cursor?: string; snapshotSha256?: string }
+
+async function skillRequest<T>(options: AgentServiceRequestOptions, path: string, method: "GET" | "POST" | "DELETE",
+  query?: Record<string, string | number | undefined>, body?: unknown, idempotencyKey?: string): Promise<{ response: Response; data: T }> {
+  const url = endpoint(options.baseUrl, path);
+  for (const [key, value] of Object.entries(query ?? {})) if (value !== undefined) url.searchParams.set(key, String(value));
+  const response = await (options.fetch ?? globalThis.fetch)(url, { method, signal: options.signal,
+    headers: requestHeaders(options, { Accept: "application/json", ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      ...(idempotencyKey === undefined ? {} : { "Idempotency-Key": idempotencyKey }) }),
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+  if (!response.ok) throw await responseError(response);
+  return { response, data: await response.json() as T };
+}
+export const installSkill = (options: AgentServiceRequestOptions, input: SkillInstallInput, idempotencyKey: string) =>
+  skillRequest<SkillVersion>(options, "/v1/skills", "POST", undefined, input, idempotencyKey);
+export const listInstalledSkills = (options: AgentServiceRequestOptions, query: SkillPageQuery) =>
+  skillRequest<SkillPage>(options, "/v1/skills", "GET", { ...query });
+export const getInstalledSkill = (options: AgentServiceRequestOptions, name: string, scope: "user" | "tenant") =>
+  skillRequest<InstalledSkill>(options, `/v1/skills/${encodeURIComponent(name)}`, "GET", { scope });
+export const deleteInstalledSkill = (options: AgentServiceRequestOptions, name: string, input: SkillDeleteInput, idempotencyKey: string) =>
+  skillRequest<InstalledSkill>(options, `/v1/skills/${encodeURIComponent(name)}`, "DELETE", undefined, input, idempotencyKey);
+export const listSkillVersions = (options: AgentServiceRequestOptions, name: string, query: SkillPageQuery) =>
+  skillRequest<SkillVersions>(options, `/v1/skills/${encodeURIComponent(name)}/versions`, "GET", { ...query });
+export const readSkillVersion = (options: AgentServiceRequestOptions, name: string, versionId: string, scope: "user" | "tenant") =>
+  skillRequest<SkillDocument>(options, `/v1/skills/${encodeURIComponent(name)}/versions/${encodeURIComponent(versionId)}`, "GET", { scope });
+export const exportUserSkills = (options: AgentServiceRequestOptions, query: SkillExportOptions = {}) =>
+  skillRequest<UserSkillExport>(options, "/v1/skills/export", "GET", { ...query });
 
 export type StartTurnStreamResult =
   | ({ kind: "events" } & EventStreamResult)

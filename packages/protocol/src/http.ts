@@ -14,6 +14,7 @@ import {
   TenantAuthPolicyInput,
 } from "./auth.js";
 import { Capabilities } from "./capabilities.js";
+import { SkillMountSelectors } from "./skill.js";
 import {
   Limits,
   Pagination,
@@ -205,7 +206,7 @@ export const AgentDefinitionResponse = AgentDefinition.extend({
   tools: z.array(externalId),
   // Keep historical response records compatible; current requests use the bounded mount grammar.
   mcpServers: z.array(externalId).describe("Operator-configured MCP server ids; checked for the actual session owner."),
-  skills: z.array(externalId).describe("Persisted operator skill mount ids; checked for the actual session owner. Historical records remain readable while skills are disabled."),
+  skills: z.array(externalId).describe("Persisted exact operator ids or explicit registry:<name> selectors, checked for the actual session owner. Historical records remain readable while skills are disabled."),
   limits: Limits,
   approvalPolicy: ApprovalPolicy,
   busyPolicy: BusyPolicy,
@@ -402,9 +403,7 @@ export const AgentDefinitionRequest = AgentDefinitionInput.extend({
   mcpServers: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,64}$/)).max(8)
     .refine((ids) => new Set(ids).size === ids.length, "MCP server ids must be distinct")
     .default([]).describe("Requires configured MCP support. Only exact operator-authorized mounts are executable; no registration or credentials are accepted here."),
-  skills: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,64}$/)).max(8)
-    .refine((ids) => new Set(ids).size === ids.length, "Skill mount ids must be distinct")
-    .default([]).describe("Requires configured static skills support. These are exact operator mount ids, not paths; no upload, registration, scripts, or tool authorization are accepted here."),
+  skills: SkillMountSelectors.default([]).describe("Exact operator mount ids or registry:<name>; registry selection requires managed-skill-registry-v1. No filesystem path or additional tool authorization is accepted."),
 });
 export const ApiKeyCreateRequest = CreateApiKeyRequest;
 export const TenantAuthUpdateRequest = TenantAuthPolicyInput;

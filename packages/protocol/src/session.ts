@@ -2,6 +2,7 @@ import { z } from "zod";
 import { externalId, idSchema, Limits, StopReason, Usage, UserId } from "./common.js";
 import { BusyPolicy, ModelRef } from "./agent.js";
 import { InputPart } from "./item.js";
+import { SkillOverrides } from "./skill.js";
 
 export const SessionStatus = z.discriminatedUnion("type", [
   z.object({ type: z.literal("idle") }),
@@ -102,6 +103,8 @@ export const StartTurnRequest = z.object({
   limits: Limits.optional(),
   busyPolicy: BusyPolicy.optional(),
   dynamicTools: z.array(DynamicToolDeclaration).max(64).optional(),
+  /** Authorized immutable registry versions only; no document, path or additional tool authority. */
+  skillOverrides: SkillOverrides.optional(),
   /** true (default): respond with SSE; false: 202 + turn object, consume via GET .../events */
   stream: z.boolean().default(true),
   metadata: z.record(z.unknown()).default({}),

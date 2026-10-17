@@ -442,6 +442,25 @@ export class MysqlBlobStorageMigrationCoordinator {
     for (const sql of locks) await conn.query(sql);
   }
 
+  /** The v1 mover has no registry-package inventory/ACK protocol. Do not silently
+   * switch the global namespace while leaving these independent objects behind.
+   * Registry writers hold the migration-control shared lock before owner admission;
+   * this current, full-range locking read also closes empty-owner admission races.
+   * Historical pre-0060 fixtures remain supported without assuming the new table.
+   */
+  private async rejectSkillRegistryFootprint(conn: PoolConnection): Promise<void> {
+    const [markers] = await conn.query<Row[]>(
+      "SELECT name FROM schema_migrations WHERE name='0060_skill_registry.sql'",
+    );
+    if (markers.length === 0) return;
+    const [owners] = await conn.query<Row[]>(
+      "SELECT owner_sha256 FROM skill_registry_owners ORDER BY owner_sha256 FOR UPDATE",
+    );
+    if (owners.length > 0) {
+      throw new BlobStorageMigrationConflictError("skill registry packages require a version-aware storage migration");
+    }
+  }
+
   async freeze(input: BeginBlobStorageMigrationInput): Promise<BlobStorageMigrationControlRecord> {
     await this.assertExclusiveOperator();
     validateBeginBlobStorageMigrationInput(input);
@@ -450,6 +469,7 @@ export class MysqlBlobStorageMigrationCoordinator {
       await conn.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
       await conn.beginTransaction();
       const current = await this.readControl(conn, "FOR UPDATE");
+      await this.rejectSkillRegistryFootprint(conn);
       if (current.controlGeneration !== input.expectedControlGeneration) {
         throw new BlobStorageMigrationConflictError("blob migration generation changed");
       }
@@ -1882,6 +1902,7 @@ export class MysqlBlobStorageMigrationCoordinator {
         || !control.fleetDrainedEvidenceSha256) {
         throw new BlobStorageMigrationConflictError("blob migration phase changed before cutover");
       }
+      await this.rejectSkillRegistryFootprint(conn);
       await this.assertExclusiveOperator();
       const [blobRows] = await conn.query<Row[]>(
         `SELECT control_generation FROM blob_storage_control

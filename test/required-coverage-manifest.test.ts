@@ -156,6 +156,43 @@ describe("required main-coverage manifest", () => {
     expect(driver).toContain('relativeTestFile === "test/openapi-contract.test.ts"');
   });
 
+  it("admits exact focused skills SDK and signed VM suites without opening other paths", async () => {
+    const file = "packages/sdk/test/skills.test.ts";
+    const signedVm = ["test/vm-release-signature.test.ts", "test/vm-release-signed.test.ts", "test/vm-release-sign-cli.test.ts"];
+    for (const [command, expected] of [["test:skills", [file]], ["test:vm-release", signedVm]] as const) {
+      for (const target of expected) {
+        expect(requiredScriptFiles(packageScripts[command]!)).toContain(target);
+        expect(manifest.REQUIRED_COVERAGE_GROUPS[command]).toContain(target);
+      }
+    }
+    const driver = await readFile(resolve(ROOT, "scripts/run-required-suite.mjs"), "utf8");
+    // Evaluate only the real driver's closed path clauses, without spawning Vitest or executing it.
+    const guard = /\nif \(!\(([\s\S]+?)\)\s*\|\| !relativeTestFile\.endsWith\("\.test\.ts"\)\) \{/.exec(driver);
+    if (!guard) throw new Error("required-suite path guard is not the expected closed policy");
+    const clauses = guard[1]!.split(/\s*\|\|\s*/).map((source) => {
+      const prefix = /^relativeTestFile\.startsWith\("([^"]+)"\)$/.exec(source.trim());
+      const exact = /^relativeTestFile === "([^"]+)"$/.exec(source.trim());
+      if (!prefix && !exact) throw new Error("required-suite path clause is not a literal policy");
+      return { prefix: prefix?.[1], exact: exact?.[1] };
+    });
+    const admitted = (path: string) => path.endsWith(".test.ts") && clauses.some(clause =>
+      clause.prefix !== undefined ? path.startsWith(clause.prefix) : path === clause.exact);
+    for (const target of [file, ...signedVm]) expect(admitted(target), target).toBe(true);
+    for (const other of ["packages/sdk/test/client.test.ts", "packages/sdk/test/other.test.ts",
+      "packages/sdk/test/skills-extra.test.ts", "packages/sdk/test/nested/skills.test.ts", "packages/sdk/test/skills.test.ts.extra",
+      "test/vm-release-signature-extra.test.ts", "test/vm-release-signed-copy.test.ts", "test/vm-release-sign-cli-extra.test.ts",
+      "test/nested/vm-release-signature.test.ts", "test/unknown.test.ts"]) {
+      expect(admitted(other), other).toBe(false);
+    }
+    expect(clauses.filter(clause => clause.exact?.startsWith("packages/sdk/"))).toEqual([{ prefix: undefined, exact: file }]);
+    for (const target of signedVm) expect(clauses.filter(clause => clause.exact === target)).toEqual([{ prefix: undefined, exact: target }]);
+    // All literal focused-driver destinations must satisfy the same real policy, not just this gate.
+    const allLiteralTargets = Object.values(packageScripts).flatMap(script =>
+      [...script.matchAll(/(?:^|[\s&])node scripts\/run-required-suite\.mjs ([A-Za-z0-9/._-]+\.test\.ts)(?=\s|$)/g)].map(match => match[1]!));
+    expect(allLiteralTargets.length).toBeGreaterThan(0);
+    for (const target of allLiteralTargets) expect(admitted(target), target).toBe(true);
+  });
+
   it.each(["CI", "local"] as const)("%s runs main coverage once without re-executing equivalent groups", (surface) => {
     const commands = pnpmCommands(surface === "CI" ? ciSource : localSource);
     expect(commands.filter((command) => command.name === "test:coverage")).toHaveLength(1);

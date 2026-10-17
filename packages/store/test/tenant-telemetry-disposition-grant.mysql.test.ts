@@ -4,9 +4,11 @@ import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   MysqlSessionStore,
+  SkillRegistryIntegrityError,
   tenantTelemetryDispositionClaimTokenSha256,
   type TenantTelemetryDispositionAuthorization,
 } from "../src/index.js";
+import { skillRegistryFingerprintStatement } from "../src/mysql/skills-registry.js";
 
 type Row = RowDataPacket;
 const digest = (label: string) => createHash("sha256").update(label).digest("hex");
@@ -268,17 +270,40 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it("rejects post-marker trigger body drift on startup", async () => {
       const f = await fixture();
       try {
-        await f.conn.query("DROP TRIGGER trg_tt_disposition_grant_bi_v2");
-        await f.conn.query(
-          `CREATE TRIGGER trg_tt_disposition_grant_bi_v2 BEFORE INSERT
-             ON tenant_telemetry_disposition_authorization_grants FOR EACH ROW
-           BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='tampered'; END`,
-        );
-        // This fresh-schema fixture uses the current 0059 combined fingerprint,
-        // which still covers this 0037 guard. Historical-schema oracles stay unchanged.
-        await expect(MysqlSessionStore.connect({
-          url: f.url, tenantTelemetryRefKey: REF_KEY,
-        })).rejects.toThrow("0059 credential responsibility fingerprint verification failed");
+        const sql = await readFile(new URL("../migrations/0060_skill_registry.sql", import.meta.url), "utf8");
+        const schema = skillRegistryFingerprintStatement(sql, "schema");
+        const triggers = skillRegistryFingerprintStatement(sql, "triggers");
+        await f.conn.query("SET @grant_drift_test_gcml=@@SESSION.group_concat_max_len");
+        try {
+          await f.conn.query("SET SESSION group_concat_max_len=1048576");
+          const fingerprint = async (triggersOk: 0 | 1) => {
+            await f.conn.query(schema);
+            await f.conn.query(triggers);
+            const [rows] = await f.conn.query<Row[]>(
+              "SELECT @skill_registry_schema_ok AS schema_ok,@skill_registry_triggers_ok AS triggers_ok",
+            );
+            expect(Number(rows[0]?.schema_ok)).toBe(1);
+            expect(Number(rows[0]?.triggers_ok)).toBe(triggersOk);
+          };
+          await fingerprint(1);
+          await f.conn.query("DROP TRIGGER trg_tt_disposition_grant_bi_v2");
+          await f.conn.query(
+            `CREATE TRIGGER trg_tt_disposition_grant_bi_v2 BEFORE INSERT
+               ON tenant_telemetry_disposition_authorization_grants FOR EACH ROW
+             BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='tampered'; END`,
+          );
+          await fingerprint(0);
+          // Fresh 0060 uses its combined trigger root, including this 0037 guard.
+          // Historical-schema oracles and every dormant grant assertion stay unchanged.
+          const startup = MysqlSessionStore.connect({ url: f.url, tenantTelemetryRefKey: REF_KEY })
+            .then(async (unexpectedlyOpened) => { await unexpectedlyOpened.close(); });
+          await expect(startup).rejects.toBeInstanceOf(SkillRegistryIntegrityError);
+          await expect(startup).rejects.toMatchObject({
+            name: "SkillRegistryIntegrityError", message: "skill registry evidence is invalid",
+          });
+        } finally {
+          await f.conn.query("SET SESSION group_concat_max_len=@grant_drift_test_gcml");
+        }
       } finally {
         await f.close();
       }

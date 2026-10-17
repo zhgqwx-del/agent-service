@@ -16,6 +16,8 @@ caller_mover_env_names=(
   METRICS_BEARER_TOKEN
   MYSQL_URL
   RUNNERS
+  SKILL_REGISTRY_ENABLED
+  SKILL_REGISTRY_OPERATOR_TOKEN
   SESSION_USAGE_RETENTION_ENABLED
   SESSION_USAGE_RETENTION_WORKER_ENABLED
   SESSION_USAGE_RETENTION_WORKER_POLL_MS
@@ -415,6 +417,7 @@ start_apps() {
     # local stack, so explicitly scrub it from the runner process rather than relying on app config
     # to ignore an authority it must never possess.
     nohup env -u TENANT_ERASURE_OPERATOR_TOKEN -u TENANT_ERASURE_OPERATOR_ID \
+      -u SKILL_REGISTRY_OPERATOR_TOKEN \
       -u ADMIN_BOOTSTRAP_TENANT -u ADMIN_BOOTSTRAP_OUTPUT_FILE \
       -u TENANT_CREDENTIAL_REVOCATION_EXECUTION_ENABLED \
       -u CREDENTIAL_TARGET_EXECUTION_ADAPTER \
@@ -630,6 +633,8 @@ verify() {
   # `.env` is loaded for the local workflow, but platform authority must never be inherited by a
   # runner spawned from a test harness. Tests use their own fixed, non-production router credential.
   unset TENANT_ERASURE_OPERATOR_TOKEN TENANT_ERASURE_OPERATOR_ID
+  unset SKILL_REGISTRY_OPERATOR_TOKEN
+  export SKILL_REGISTRY_ENABLED=0
   # First-admin bootstrap is an explicit one-shot operator action, never an ambient verification
   # side effect. Keep both halves out of test/app-smoke subprocesses even if `.env` contains them.
   unset ADMIN_BOOTSTRAP_TENANT ADMIN_BOOTSTRAP_OUTPUT_FILE
@@ -701,6 +706,7 @@ verify_s3() {
     S3_TEST_FORCE_PATH_STYLE=1
   )
   env "${s3_test_env[@]}" pnpm run test:blob-s3
+  env "${s3_test_env[@]}" pnpm run test:skills-s3
   local restore_journal_bucket="${RESTORE_JOURNAL_S3_BUCKET:-agent-service-local-restore-journal}"
   [ "$restore_journal_bucket" != "${MINIO_BUCKET:-agent-service-local}" ] \
     || die "RESTORE_JOURNAL_S3_BUCKET must differ from the Blob bucket"

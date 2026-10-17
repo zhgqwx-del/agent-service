@@ -30,6 +30,7 @@ import {
 } from "@agent-service/protocol";
 import { createHash, randomUUID } from "node:crypto";
 import { isProxy } from "node:util/types";
+import * as SkillRegistry from "./skills.js";
 import {
   BlobConflictError,
   BlobTooLargeError,
@@ -1243,6 +1244,73 @@ function isValidReadyPurgeBlobManifest(mapKey: string, manifest: BlobManifest): 
 
 /** In-memory store: reference semantics for tests. Single process only. */
 export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, BlobManifestStore, BlobCleanupStore, BlobStorageControlStore, UsageLifecycleStore, SubjectLifecycleStore, ErasureJobStore, ErasureJobMaintenanceStore, ErasureSessionStore, ErasureSessionCatalogStore, ErasureUsageReconciliationStore, LegacyTombstoneCompensationStore, RetentionPolicyStore, ErasurePolicyEvaluationStore, UserDataExportRequestStore, UserDataExportJobStore, UserDataExportCleanupStore, TenantCredentialRevocationStore, TenantRuntimeRevocationStore, TenantContentInventoryStore, TenantPurgePlanStore, TenantPurgeExecutionStore, TenantDatabasePurgeStore, TenantRedisPurgeStore, CredentialLifecycleStore, TenantCredentialTargetExecutionStore, RestoreJournal.TenantRestoreJournalStore, RestoreJournal.RestoreReplayStore, BackupCatalog.TenantBackupCatalogStore, TenantTelemetry.TenantTelemetryLifecycleStore, TenantTelemetryWriter.TenantTelemetryWriterStore, TenantTelemetryApplicationCapture.TenantTelemetryApplicationCaptureStore, TenantTelemetryArtifactMembership.TenantTelemetryArtifactMembershipStore, TenantTelemetryOwnerClosure.TenantTelemetryOwnerClosureStore, TenantTelemetrySourceAccounting.TenantTelemetrySourceAccountingStore, TenantTelemetryTargetManifest.TenantTelemetryTargetManifestStore, TenantTelemetryPlanArtifactTarget.TenantTelemetryPlanArtifactTargetStore, TenantTelemetrySourceEligibility.TenantTelemetrySourceEligibilityStore, TenantTelemetryPregrantIntent.TenantTelemetryPregrantIntentStore, TenantTelemetryDisposition.TenantTelemetryDispositionStore, TenantTelemetryCaptureBackupCheckpointStore {
+  private readonly skillRegistryImages = new Map<string, SkillRegistry.SkillRegistryImage>();
+  private publishSkillRegistryImage(key: string, image: SkillRegistry.SkillRegistryImage): void {
+    const previous = this.skillRegistryImages.get(key);
+    try { this.skillRegistryImages.set(key, image); }
+    catch (error) {
+      if (previous) Map.prototype.set.call(this.skillRegistryImages, key, previous);
+      else Map.prototype.delete.call(this.skillRegistryImages, key);
+      throw error;
+    }
+  }
+
+  private skillRegistryContext<T extends SkillRegistry.SkillRegistryOwnerInput>(input: T, fields: readonly string[], manage: boolean) {
+    const checked = SkillRegistry.skillRegistryInput(input, fields, manage);
+    if (checked.authority === "user_self") this.assertSubjectWritable(checked.principal.tenantId, checked.principal.userId);
+    if (input.owner.scope === "tenant") this.assertTenantWritable(input.owner.tenantId!);
+    if (input.owner.scope === "user") this.assertSubjectWritable(input.owner.tenantId!, input.owner.userId!);
+    const key = SkillRegistry.skillOwnerKey(checked.input.owner);
+    const current = this.skillRegistryImages.get(key) ?? SkillRegistry.emptySkillRegistryImage();
+    SkillRegistry.assertSkillRegistryImage(current, checked.input.owner);
+    return { input: checked.input, key, image: clone(current) };
+  }
+
+  async prepareSkillInstallation(input: SkillRegistry.PrepareSkillInstallationInput): Promise<SkillRegistry.SkillInstallation> {
+    const ctx = this.skillRegistryContext(input, ["access", "owner", "name", "expectedRevision", "idempotencyKey", "admission", "backend", "storageNamespaceSha256"], true);
+    const result = SkillRegistry.prepareSkillRegistryImage(ctx.image, ctx.input, this.storeNowMs());
+    const outbound = clone(result); SkillRegistry.assertSkillRegistryImage(ctx.image, ctx.input.owner);
+    this.publishSkillRegistryImage(ctx.key, ctx.image); return outbound;
+  }
+  async publishSkillInstallation(input: SkillRegistry.PublishSkillInstallationInput): Promise<SkillRegistry.SkillVersion> {
+    const ctx = this.skillRegistryContext(input, ["access", "owner", "installationId", "uploadToken", "descriptor"], true);
+    const result = SkillRegistry.publishSkillRegistryImage(ctx.image, ctx.input, this.storeNowMs());
+    const outbound = clone(result); SkillRegistry.assertSkillRegistryImage(ctx.image, ctx.input.owner);
+    this.publishSkillRegistryImage(ctx.key, ctx.image); return outbound;
+  }
+  async listSkillSlots(input: SkillRegistry.ListSkillSlotsInput): Promise<SkillRegistry.SkillSlotPage> {
+    const ctx = this.skillRegistryContext(input, ["access", "owner", "limit", "cursor"], false);
+    return clone(SkillRegistry.listSkillRegistryImage(ctx.image, ctx.input));
+  }
+  async getSkillSlot(input: SkillRegistry.GetSkillSlotInput): Promise<SkillRegistry.SkillSlot | null> {
+    const ctx = this.skillRegistryContext(input, ["access", "owner", "name"], false);
+    return clone(ctx.image.slots.find(x => x.slotId === SkillRegistry.skillSlotId(ctx.input.owner, ctx.input.name)) ?? null);
+  }
+  async getReadableSkillVersion(input: SkillRegistry.GetReadableSkillVersionInput): Promise<SkillRegistry.SkillVersion | null> {
+    const ctx = this.skillRegistryContext(input, ["access", "owner", "name", "versionId"], false);
+    return clone(SkillRegistry.readSkillRegistryImage(ctx.image, ctx.input));
+  }
+  async listSkillVersions(input: SkillRegistry.ListSkillVersionsInput): Promise<SkillRegistry.SkillVersionPage> {
+    const ctx = this.skillRegistryContext(input, ["access", "owner", "name", "cursor", "limit"], false);
+    return clone(SkillRegistry.listSkillRegistryVersions(ctx.image, ctx.input));
+  }
+  async deleteSkillSlot(input: SkillRegistry.DeleteSkillSlotInput): Promise<SkillRegistry.SkillSlot> {
+    const ctx = this.skillRegistryContext(input, ["access", "owner", "name", "expectedRevision", "idempotencyKey"], true);
+    const result = SkillRegistry.deleteSkillRegistryImage(ctx.image, ctx.input, this.storeNowMs());
+    const outbound = clone(result); SkillRegistry.assertSkillRegistryImage(ctx.image, ctx.input.owner);
+    this.publishSkillRegistryImage(ctx.key, ctx.image); return outbound;
+  }
+  async listUserSkillExportSnapshot(input: SkillRegistry.SkillRegistryOwnerInput): Promise<SkillRegistry.UserSkillExportSnapshot> {
+    SkillRegistry.assertSkillExportOwner(input);
+    const ctx = this.skillRegistryContext(input, ["access", "owner"], false);
+    return clone(SkillRegistry.exportSkillRegistryImage(ctx.image, ctx.input.owner));
+  }
+  private assertSkillRegistryTenantPurgeSupported(tenantId: string): void {
+    for (const image of this.skillRegistryImages.values()) if (image.slots.some(slot => slot.owner.tenantId === tenantId)) {
+      throw new SkillRegistry.SkillRegistryLifecycleBlockedError();
+    }
+  }
+
   private readonly ordinaryDeleteCommitBatches = new WeakSet<CommitBatch>();
   agents = new Map<string, AgentDefinition>();
   sessions = new Map<string, Session>();
@@ -18923,6 +18991,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const current = this.tenantPurgePlanJobs.get(stagedAuthorization.requestId);
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
     const retainedFamily = current ? this.retainedSourcePlanFamilyFor(current.requestId) : null;
+    if (current.phase !== "plan_sealed") this.assertSkillRegistryTenantPurgeSupported(current.tenantId);
     if (current?.phase !== "plan_sealed" && this.persistedProviderCaptureActivation && !retainedFamily) {
       throw new PersistedCapture.PersistedProviderCaptureConflictError("T3d cannot account for capture v2 source");
     }
@@ -23307,6 +23376,7 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const initialNowMs = this.storeNowMs();
     const current = this.tenantDatabasePurgeJobs.get(stagedAuthorization.requestId);
     if (!current || current.tenantId !== stagedAuthorization.tenantId) return null;
+    if (current.phase !== "database_purged") this.assertSkillRegistryTenantPurgeSupported(current.tenantId);
     this.auditRetainedSourceOuterBoundary(current.requestId);
     const retainedSourceFamily = this.retainedSourcePlanFamilyFor(current.requestId);
     if (current?.phase !== "database_purged" && this.persistedProviderCaptureActivation
@@ -28267,6 +28337,10 @@ export class MemorySessionStore implements SessionStore, LifecycleOutboxStore, B
     const stagedInput = clone(input);
     validateActivateBlobStorageControlInput(stagedInput);
     const current = this.readMemoryBlobStorageControl();
+    if (this.skillRegistryImages.size > 0 && (current.controlGeneration !== 1 ||
+      current.storageBackend !== stagedInput.storageBackend || current.namespaceSha256 !== stagedInput.namespaceSha256)) {
+      throw new BlobStorageControlConflictError();
+    }
     if (current.controlGeneration === 1) {
       if (
         current.storageBackend !== stagedInput.storageBackend

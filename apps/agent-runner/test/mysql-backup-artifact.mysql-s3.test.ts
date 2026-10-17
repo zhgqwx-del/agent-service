@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import mysql, { type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
+import mysql, { type Connection, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { TenantRestoreJournalPublicationWorker, TenantRuntimeCoordinator } from "@agent-service/core";
 import { LocalAesGcmCipher, ProviderService } from "@agent-service/providers";
@@ -15,6 +15,7 @@ import {
 } from "@agent-service/protocol";
 import {
   MysqlSessionStore,
+  SkillRegistryIntegrityError,
   TenantCredentialResponsibilityIntegrityError,
   newErasureRequestId,
   newTenantBackupEvictionId,
@@ -24,6 +25,7 @@ import {
   readTenantTelemetryCaptureCheckpointFromMysql,
   type TenantBackupRuntimeReservation,
 } from "@agent-service/store";
+import { skillRegistryFingerprintStatement } from "../../../packages/store/src/mysql/skills-registry.js";
 import {
   createTenantBackupCatalogAdapter,
   loadTenantBackupCatalogConfig,
@@ -48,6 +50,37 @@ const SHA256 = /^[0-9a-f]{64}$/;
 
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** Current full trigger authority is 0060; 0059's original schema remains independently exact. */
+async function assertCurrentByokSchema(connection: Connection, triggersOk: 0 | 1): Promise<void> {
+  const [currentSql, responsibilitySql] = await Promise.all([
+    readFile(new URL("../../../packages/store/migrations/0060_skill_registry.sql", import.meta.url), "utf8"),
+    readFile(new URL("../../../packages/store/migrations/0059_credential_responsibility.sql", import.meta.url), "utf8"),
+  ]);
+  const start = "-- agent-service-runtime-fingerprint:tenant-credential-responsibility-schema:start";
+  const end = "-- agent-service-runtime-fingerprint:tenant-credential-responsibility-schema:end";
+  const a = responsibilitySql.indexOf(start), b = responsibilitySql.indexOf(end);
+  if (a < 0 || b <= a || responsibilitySql.indexOf(start, a + start.length) >= 0 || responsibilitySql.indexOf(end, b + end.length) >= 0) {
+    throw new Error("byok_fixture_schema_fingerprint_invalid");
+  }
+  const responsibilitySchema = responsibilitySql.slice(a + start.length, b).trim().replace(/;$/, "");
+  if (!responsibilitySchema.startsWith("SET @credential_responsibility_schema_ok=") || responsibilitySchema.includes(";")) {
+    throw new Error("byok_fixture_schema_fingerprint_invalid");
+  }
+  const schema = skillRegistryFingerprintStatement(currentSql, "schema");
+  const triggers = skillRegistryFingerprintStatement(currentSql, "triggers");
+  await connection.query("SET @byok_fixture_previous_gcml=@@SESSION.group_concat_max_len");
+  try {
+    await connection.query("SET SESSION group_concat_max_len=1048576");
+    for (const statement of [responsibilitySchema, schema, triggers]) await connection.query(statement);
+    const [rows] = await connection.query<RowDataPacket[]>(
+      "SELECT @credential_responsibility_schema_ok AS responsibility_schema_ok,@skill_registry_schema_ok AS schema_ok,@skill_registry_triggers_ok AS triggers_ok",
+    );
+    expect(Number(rows[0]?.responsibility_schema_ok)).toBe(1);
+    expect(Number(rows[0]?.schema_ok)).toBe(1);
+    expect(Number(rows[0]?.triggers_ok)).toBe(triggersOk);
+  } finally { await connection.query("SET SESSION group_concat_max_len=@byok_fixture_previous_gcml"); }
 }
 
 function artifactPath(fixture: MySqlBackupArtifactFixture, backupId = fixture.backupId): string {
@@ -510,6 +543,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       // This prevents a setup failure from masquerading as the negative oracle.
       const valid = await MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options);
       await valid.close();
+      await assertCurrentByokSchema(connection, 1);
       expect(await responsibilityRows(fixture.sourceUrl, source.tenantId)).toEqual(source.raw);
       const [guards] = await connection.query<RowDataPacket[]>(
         "SELECT TRIGGER_NAME AS name FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME='trg_credential_responsibility_sources_bu'",
@@ -518,8 +552,13 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       // Privileged tamper only in this owned disposable DB. No product method
       // obtains DDL authority and the fixture later drops only its own database.
       await connection.query("DROP TRIGGER trg_credential_responsibility_sources_bu");
-      await expect(MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options))
-        .rejects.toThrow("0059 credential responsibility fingerprint verification failed");
+      await assertCurrentByokSchema(connection, 0);
+      const rejectedSource = MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(options)
+        .then(async (unexpectedlyOpened) => { await unexpectedlyOpened.close(); });
+      await expect(rejectedSource).rejects.toBeInstanceOf(SkillRegistryIntegrityError);
+      await expect(rejectedSource).rejects.toMatchObject({
+        name: "SkillRegistryIntegrityError", message: "skill registry evidence is invalid",
+      });
       const sourceFactory = vi.fn((input: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) =>
         MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance(input));
       const createArtifact = vi.fn(artifactOperations.createMySqlBackupArtifact);
@@ -560,6 +599,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
         const before = await fixture.schemaSnapshot(targetUrl);
         const connection = await mysql.createConnection(targetUrl);
         try {
+          await assertCurrentByokSchema(connection, 1);
           const [markers] = await connection.query<RowDataPacket[]>("SELECT * FROM schema_migrations ORDER BY BINARY name");
           importedMarkersSha256 = sha256(Buffer.from(JSON.stringify(markers)));
           const [definitions] = await connection.query<RowDataPacket[]>(
@@ -585,12 +625,14 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
           await connection.query("SET SESSION sql_mode=?", [sqlMode]);
           await connection.query("SET SESSION character_set_client=?, collation_connection=?", [charset, collation]);
           await connection.query(ddl);
+          await assertCurrentByokSchema(connection, 1);
           const [restoredMarkers] = await connection.query<RowDataPacket[]>("SELECT * FROM schema_migrations ORDER BY BINARY name");
           restoredMarkersSha256 = sha256(Buffer.from(JSON.stringify(restoredMarkers)));
         } finally { await connection.end(); }
         const after = await fixture.schemaSnapshot(targetUrl);
-        guardRestoredExactly = before.triggers.size === 743 && after.triggers.size === 743
-          && before.schemaSha256 === after.schemaSha256;
+        guardRestoredExactly = before.triggers.size > 0 && after.triggers.size === before.triggers.size
+          && before.schemaSha256 === after.schemaSha256
+          && JSON.stringify([...before.triggers]) === JSON.stringify([...after.triggers]);
         return result;
       });
       const targetFactory = vi.fn(async (options: Parameters<typeof MysqlSessionStore.connectTenantTelemetryCaptureBackupSourceMaintenance>[0]) => {
@@ -599,7 +641,9 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
           // This exact factory first runs the real committed strict schema
           // verifier. The distinct business-integrity error proves it reached
           // 0059 projection after that verifier, not a source/setup schema error.
-          if (options.url === targetUrl && error instanceof TenantCredentialResponsibilityIntegrityError) {
+          if (options.url === targetUrl && error instanceof TenantCredentialResponsibilityIntegrityError
+            && error.name === "TenantCredentialResponsibilityIntegrityError"
+            && error.message === "tenant credential responsibility evidence is invalid") {
             targetResponsibilityRejected = true;
           }
           throw error;
@@ -620,7 +664,7 @@ describeIntegration("product MySQL backup artifacts with real MySQL and MinIO", 
       expect(importArtifact).toHaveBeenCalledOnce();
       expect(importCompleted, "actual native import and its schema verification must finish").toBe(true);
       expect(mutationCount).toBe(1);
-      expect(guardRestoredExactly, "all 743 original guards and schema must be byte-equivalent after tamper").toBe(true);
+      expect(guardRestoredExactly, "all current committed guards and schema must be byte-equivalent after tamper").toBe(true);
       expect(importedMarkersSha256).toMatch(SHA256);
       expect(restoredMarkersSha256).toBe(importedMarkersSha256);
       expect(targetFactory.mock.calls.filter(([options]) => options.url === targetUrl)).toHaveLength(1);

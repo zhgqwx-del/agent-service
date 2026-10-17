@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, join, normalize, parse, sep } from "node:path";
 import { ApiError, Principal } from "@agent-service/protocol";
-import { isAlias, isMap, isScalar, isSeq, parseDocument, visit } from "yaml";
+import { parseSkillDocument } from "./document.js";
 import type { TenantRuntimeCoordinator } from "../lifecycle/tenant-runtime-coordinator.js";
 
 export interface StaticSkillMount {
@@ -34,11 +34,15 @@ export interface StaticSkillLoadInput {
   readonly availableTools: readonly string[];
   readonly expectedVersionSha256: string;
 }
+/** Request-local immutable registry versions; never an extra mount or permission. */
+export interface SkillResolution {
+  readonly overrides: readonly Readonly<{ name: string; versionId: string }>[];
+}
 export interface StaticSkillSource {
   readonly enabled: boolean;
-  validateMounts(principal: Principal, ids: readonly string[]): void;
-  list(principal: Principal, ids: readonly string[], signal: AbortSignal): Promise<readonly StaticSkillSummary[]>;
-  load(principal: Principal, ids: readonly string[], input: StaticSkillLoadInput, signal: AbortSignal): Promise<LoadedStaticSkill>;
+  validateMounts(principal: Principal, ids: readonly string[]): void | Promise<void>;
+  list(principal: Principal, ids: readonly string[], signal: AbortSignal, resolution?: SkillResolution): Promise<readonly StaticSkillSummary[]>;
+  load(principal: Principal, ids: readonly string[], input: StaticSkillLoadInput, signal: AbortSignal, resolution?: SkillResolution): Promise<LoadedStaticSkill>;
   close(): Promise<void>;
 }
 export interface StaticSkillSourceOptions {
@@ -52,7 +56,7 @@ export interface StaticSkillSourceOptions {
 export type ConfiguredStaticSkillSourceOptions = StaticSkillSourceOptions;
 
 const MESSAGE = "Skill request failed.";
-const MAX_FILE = 65_536, MAX_BODY = 32_768, MAX_FRONTMATTER = 16_384;
+const MAX_FILE = 65_536;
 const MAX_CATALOG_BYTES = 16_384;
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 const NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -84,17 +88,6 @@ function text(value: unknown, maximum: number, multiline = false): string {
     || (!multiline && /[\r\n\t<>]/.test(value))) bad();
   return value;
 }
-/** Validate the original YAML scalar before folding legal whitespace. This
- * accepts ordinary folded/literal blocks without hiding control characters,
- * markup or an oversized scalar behind normalization. File hashes stay raw. */
-function summary(value: unknown): string {
-  if (typeof value !== "string" || Buffer.byteLength(value) > 1024
-    || Buffer.from(value, "utf8").toString("utf8") !== value
-    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f<>]/.test(value)) bad();
-  const normalized = value.replace(/[ \t\r\n\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/g, " ").trim();
-  if (!normalized) bad();
-  return normalized;
-}
 function identifier(value: unknown): string {
   if (typeof value !== "string" || !ID.test(value)) bad();
   return value;
@@ -120,56 +113,12 @@ function positive(value: unknown, fallback: number, maximum: number): number {
   return value;
 }
 
-/** YAML 1.2 with a deliberately closed application schema, not arbitrary YAML:
- * no aliases/anchors/tags/directives/merge keys, complex keys or nested metadata.
- * The real parser is silent; its diagnostics and document content never escape. */
+/** The shared parser preserves the original operator-static digest and ACL binding. */
 function document(bytes: Uint8Array, mount: StaticSkillMount): LoadedStaticSkill {
-  let source: string;
-  try { source = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); } catch { return bad(); }
-  if (source.startsWith("\ufeff") || source.includes("\u0000") || /\r(?!\n)/.test(source)) bad();
-  const normalized = source.replace(/\r\n/g, "\n");
-  if (!normalized.startsWith("---\n")) bad();
-  const end = normalized.indexOf("\n---\n", 4);
-  if (end < 0) bad();
-  const header = normalized.slice(4, end), body = normalized.slice(end + 5);
-  if (Buffer.byteLength(header) > MAX_FRONTMATTER || !body.trim() || Buffer.byteLength(body) > MAX_BODY
-    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(body)) bad();
-  const doc = parseDocument(header, { version: "1.2", schema: "core", strict: true, uniqueKeys: true,
-    stringKeys: true, prettyErrors: false, logLevel: "silent", merge: false, resolveKnownTags: false });
-  if (doc.errors.length || doc.warnings.length || doc.directives.yaml.explicit || doc.directives.docStart || doc.directives.docEnd
-    || Object.keys(doc.directives.tags).some(key => key !== "!!") || !isMap(doc.contents)) bad();
-  let nodes = 0;
-  visit(doc, (_key, node, path) => {
-    if (++nodes > 192 || path.length > 8 || isAlias(node)) bad();
-    if (isMap(node) || isSeq(node) || isScalar(node)) {
-      if (node.anchor || node.tag) bad();
-    }
-    if (isMap(node)) for (const pair of node.items) {
-      if (!isScalar(pair.key) || typeof pair.key.value !== "string" || ["__proto__", "prototype", "constructor", "<<"].includes(pair.key.value)) bad();
-    }
-  });
-  const raw: unknown = doc.toJS({ maxAliasCount: 0 });
-  const r = plain(raw);
-  closed(r, ["name", "description", "whenToUse", "disable-model-invocation", "user-invocable", "metadata", "dependencies"], ["name", "description"]);
-  const name = text(r.name, 64); if (!NAME.test(name)) bad();
-  const description = summary(r.description);
-  const whenToUse = r.whenToUse === undefined ? null : summary(r.whenToUse);
-  for (const key of ["disable-model-invocation", "user-invocable"]) if (r[key] !== undefined && typeof r[key] !== "boolean") bad();
-  if (r.metadata !== undefined) {
-    const metadata = plain(r.metadata); if (Object.keys(metadata).length > 16) bad();
-    for (const [key, value] of Object.entries(metadata)) { identifier(key); text(value, 256); }
-  }
-  const dependencies = r.dependencies === undefined ? {} : plain(r.dependencies);
-  closed(dependencies, ["tools"]);
-  const tools = dependencies.tools === undefined ? [] : array(dependencies.tools, 32).map(identifier);
-  if (new Set(tools).size !== tools.length) bad();
-  tools.sort();
-  const contentSha256 = hash(bytes);
+  const parsed = parseSkillDocument(bytes);
   const versionSha256 = hash(JSON.stringify({ scope: "operator-static-skill-v1", id: mount.id,
-    subjects: mount.subjects.map(ownerKey).sort(), contentSha256 }));
-  return freeze({ id: mount.id, name, description, whenToUse, contentSha256, versionSha256,
-    disableModelInvocation: r["disable-model-invocation"] === true, userInvocable: r["user-invocable"] !== false,
-    dependencies: { tools }, body });
+    subjects: mount.subjects.map(ownerKey).sort(), contentSha256: parsed.contentSha256 }));
+  return freeze({ id: mount.id, ...parsed.metadata, contentSha256: parsed.contentSha256, versionSha256, body: parsed.body });
 }
 
 type Operation = { abort: AbortController; done: Promise<void> };

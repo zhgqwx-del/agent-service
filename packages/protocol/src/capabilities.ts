@@ -7,6 +7,19 @@ import { ErasureRequestId } from "./lifecycle.js";
 // family stable lets a new router health-check old runners while it withholds DELETE until every
 // healthy target advertises the new lifecycle capability.
 export const PROTOCOL_VERSION = "2026-10-08" as const;
+export const MANAGED_SKILL_REGISTRY_V1 = "managed-skill-registry-v1" as const;
+export const INTERNAL_SKILL_REGISTRY_PLATFORM_PREFIX = "/v1/_internal/skill-registry-platform-v1" as const;
+export const INTERNAL_SKILL_REGISTRY_ACK_HEADER = "x-agent-service-skill-registry" as const;
+export const INTERNAL_SKILL_REGISTRY_ACK_VALUE = "platform-registry-v1" as const;
+export function skillRegistryFilesystemNamespaceSha256(namespaceId: string): string {
+  if (!/^[A-Za-z0-9._:-]{1,128}$/.test(namespaceId)) throw new Error("Invalid skill registry namespace");
+  return createHash("sha256").update("skill-registry-filesystem-namespace-v1\0").update(namespaceId).digest("hex");
+}
+export const SkillRegistryStorageCapability = z.object({
+  backend: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), shared: z.boolean(),
+  namespaceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
+export type SkillRegistryStorageCapability = z.infer<typeof SkillRegistryStorageCapability>;
 
 /**
  * Versioned runner-only route used by the router for destructive lifecycle traffic. An older
@@ -697,6 +710,9 @@ export const Capabilities = z.object({
     dynamicTools: z.boolean(),
     mcp: z.array(z.enum(["streamable-http", "stdio"])),
     skills: z.boolean(),
+    /** Legacy skills=true is not registry authority; older peers normalize to an empty list. */
+    skillRegistry: z.array(z.literal(MANAGED_SKILL_REGISTRY_V1)).max(1).default([]),
+    skillRegistryStorage: SkillRegistryStorageCapability.nullable().default(null),
     /** Optional for legacy peers; absence is never support for operator tool hooks. */
     hooks: z.boolean().optional(),
     sandbox: z.array(z.enum(["none"])),

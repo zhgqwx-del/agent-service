@@ -1,4 +1,7 @@
 import { randomBytes } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { Readable } from "node:stream";
+import { finished } from "node:stream/promises";
 import { blobS3Backend, blobS3NamespaceSha256 } from "@agent-service/protocol";
 import {
   DeleteObjectCommand,
@@ -100,6 +103,12 @@ type ExactObjectState =
     etag?: string;
     migrationOwnerSha256?: string;
   };
+
+interface IoSettlementScope {
+  readonly pending: Set<Promise<unknown>>;
+  closed: boolean;
+}
+type IoTaskTracker = <T>(work: () => Promise<T>) => Promise<T>;
 
 function errorStatus(error: unknown) {
   if (!error || typeof error !== "object") return undefined;
@@ -215,7 +224,24 @@ function destroyBody(body: unknown) {
   }
 }
 
-async function withBodyDeadline<T>(body: unknown, timeoutMs: number, read: () => Promise<T>): Promise<T> {
+/** Only a scoped late response is discarded here; ordinary request timeout semantics stay intact. */
+async function settleDiscardedBody(body: unknown): Promise<void> {
+  if (body === undefined || body === null || body instanceof Uint8Array) return;
+  if (body instanceof Readable) {
+    // Register before destroy: calling destroy alone does not prove native stream settlement.
+    const settled = finished(body, { cleanup: true, readable: true, writable: false });
+    destroyBody(body);
+    await settled.catch(() => undefined);
+    return;
+  }
+  // Non-Node async iterable fixtures/adapters have no native close event. Keep ownership until
+  // the actual iterator settles, even if their destroy method does not complete cancellation.
+  const settled = (async () => { for await (const _chunk of bodyAsAsyncIterable(body)) { /* discard */ } })();
+  destroyBody(body);
+  await settled.catch(() => undefined);
+}
+
+async function withBodyDeadline<T>(body: unknown, timeoutMs: number, read: () => Promise<T>, track?: IoTaskTracker): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
@@ -225,7 +251,7 @@ async function withBodyDeadline<T>(body: unknown, timeoutMs: number, read: () =>
     timer.unref();
   });
   try {
-    return await Promise.race([read(), timeout]);
+    return await Promise.race([track ? track(read) : read(), timeout]);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -238,8 +264,11 @@ async function readBoundedEnvelope(
   contentLength: number | undefined,
   maxBytes: number,
   timeoutMs: number,
+  track?: IoTaskTracker,
 ) {
-  const declaredLength = assertSafeContentLength(contentLength);
+  let declaredLength: number | undefined;
+  try { declaredLength = assertSafeContentLength(contentLength); }
+  catch (error) { destroyBody(body); throw error; }
   if (declaredLength !== undefined && declaredLength < BLOB_ENVELOPE_HEADER_BYTES) {
     destroyBody(body);
     throw new Error("invalid blob envelope length");
@@ -287,7 +316,7 @@ async function readBoundedEnvelope(
           envelopeBytes += available;
         }
       }
-    });
+    }, track);
   } catch (error) {
     destroyBody(body);
     if (isSafeBlobStreamError(error)) throw error;
@@ -303,8 +332,11 @@ async function readExactBody(
   contentLength: number | undefined,
   expected: number,
   timeoutMs: number,
+  track?: IoTaskTracker,
 ) {
-  const declaredLength = assertSafeContentLength(contentLength);
+  let declaredLength: number | undefined;
+  try { declaredLength = assertSafeContentLength(contentLength); }
+  catch (error) { destroyBody(body); throw error; }
   if (declaredLength !== undefined && declaredLength !== expected) {
     destroyBody(body);
     throw new Error("S3 object changed while being read");
@@ -319,7 +351,7 @@ async function readExactBody(
         Buffer.from(value.buffer, value.byteOffset, value.byteLength).copy(result, offset);
         offset += value.byteLength;
       }
-    });
+    }, track);
   } catch (error) {
     destroyBody(body);
     if (isSafeBlobStreamError(error)) throw error;
@@ -343,6 +375,7 @@ export class S3BlobStore implements BlobMigrationStore {
   private readonly client: S3Client;
   private readonly maxMutationAttempts: number;
   private readonly requestTimeoutMs: number;
+  private readonly ioSettlementScopes = new AsyncLocalStorage<IoSettlementScope>();
   private closed = false;
 
   constructor(options: S3BlobStoreOptions) {
@@ -381,13 +414,42 @@ export class S3BlobStore implements BlobMigrationStore {
     });
   }
 
+  /** Per-call async ownership, never a store-wide mutex or a change to public request deadlines. */
+  withIoSettlement<T>(work: () => Promise<T>): Promise<T> {
+    this.assertOpen();
+    const scope: IoSettlementScope = { pending: new Set(), closed: false };
+    // A nested scope is itself owned by its parent, including when a caller does not await it.
+    return this.trackIoTask(() => this.ioSettlementScopes.run(scope, async () => {
+      try { return await work(); }
+      finally {
+        // A settling SDK task may create a Body task or another scoped request. Re-snapshot until
+        // no actual task remains; all insertion/removal and the final fence are synchronous.
+        while (scope.pending.size) await Promise.allSettled([...scope.pending]);
+        scope.closed = true;
+      }
+    }));
+  }
+
+  private trackIoTask<T>(work: () => Promise<T>): Promise<T> {
+    const scope = this.ioSettlementScopes.getStore();
+    if (!scope) return work();
+    if (scope.closed) return Promise.reject(new S3BlobSafeError("S3 blob I/O scope is closed"));
+    const task = Promise.resolve().then(work);
+    scope.pending.add(task);
+    void task.then(() => scope.pending.delete(task), () => scope.pending.delete(task));
+    return task;
+  }
+
   private async send<Output>(
     request: (abortSignal: AbortSignal) => Promise<Output>,
   ): Promise<Output> {
     const controller = new AbortController();
+    const scope = this.ioSettlementScopes.getStore();
+    let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
+        timedOut = true;
         const error = Object.assign(
           new Error(`S3 blob request timed out after ${this.requestTimeoutMs}ms`),
           { name: "TimeoutError" },
@@ -398,7 +460,23 @@ export class S3BlobStore implements BlobMigrationStore {
         controller.abort(error);
       }, this.requestTimeoutMs);
     });
-    const operation = Promise.resolve().then(() => request(controller.signal));
+    const operation = this.trackIoTask(() => Promise.resolve().then(async () => {
+      const output = await request(controller.signal);
+      if (scope && output && typeof output === "object" && "Body" in output) {
+        const body = output.Body;
+        if (timedOut) {
+          // Headers can arrive after the request race rejected. The abandoned response is still
+          // ours: destroy and await its real Body settlement instead of losing that ownership.
+          await this.trackIoTask(() => settleDiscardedBody(body));
+        } else if (body instanceof Readable) {
+          // Observe the native response immediately, before a later reader continuation can run.
+          // The actual iterator is independently tracked by withBodyDeadline below.
+          void this.trackIoTask(() => finished(body, { cleanup: true, readable: true, writable: false })
+            .then(() => undefined, () => undefined));
+        }
+      }
+      return output;
+    }));
     // Promise.race observes late settlement already; this explicit sink documents and preserves
     // that invariant if the race implementation is refactored later.
     void operation.catch(() => undefined);
@@ -444,6 +522,7 @@ export class S3BlobStore implements BlobMigrationStore {
       output.ContentLength,
       maxBytes,
       this.requestTimeoutMs,
+      work => this.trackIoTask(work),
     );
     const decoded = decodeBlobEnvelope(storageKey, envelope, maxBytes);
     return decoded.kind === "tombstone"
@@ -723,6 +802,7 @@ export class S3BlobStore implements BlobMigrationStore {
       output.ContentLength,
       tombstone.length,
       this.requestTimeoutMs,
+      work => this.trackIoTask(work),
     );
     return bytes.equals(tombstone)
       ? { kind: "tombstone", etag: output.ETag }

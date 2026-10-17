@@ -1,8 +1,10 @@
 # agent-service 协作约定
 
-> 最新发布阻断（2026-10-17）：4300b5e第三CI39018209424已completed/failure；主5017pass/86精确profile skip、required170 unique/3947实际pass/75groups及原coverage门槛、S3、历史325与双image已过，唯一Cluster旧聚合负例超时，后置门禁在该CI未到，不是全绿。获准拆分后的正式完整4项真实验证已4pass/零fail或skip，原配置/503/noACK及body内成功stop保留；额外归档guard失败不是测试失败，隔离库保留、不宣称零残留。94074最终类型0、70865五纯276pass/零skip；本提交集中收口上述7文件，发布仍等exact-SHA完整CI。前置Cluster+T3g仅fail-fast，下一skills提前编码仍未答、未实施；已批准预算与全部安全边界保持，事实见PROGRESS末节。
+> 当前实际工作（2026-10-17）：skills本地门禁已分段收口；94376真实exit0，尾部9文件42项与source assembly通过并独立审计。原主5322/2/87、无coverage及原S3失败保留，不拼一次完整verify绿；完整21项备份文件仍须最终CI。当前无live测试、未commit/push/新CI，下一集中提交main并等exact-SHA全部Checks。root唯一执行，作者仅静态，不重复已过长矩阵；不读.env/不触业务库与真实云，不改旧33域/receipt/completion，registry物理生命周期P2。
 
-> 当前阶段（2026-10-17）：M3 的固定匿名 HTTP MCP、静态 Markdown skills、固定 operator 工具前策略/提交后 hooks 已实现并完成本地分段验证，详见设计06～08与PROGRESS末节。它们不是完整注册/OAuth、三级 skill 包或插件平台；M1未冻结、M2冻结，完整M3与必要M4仍待。发布是否通过只认当前main exact-SHA Checks，不借6fdb旧CI或拼接本地全量绿。root唯一运行测试、DB、build与Git，作者只写与静态审查；不扩P2、不触业务库/真实云，不解0037/0054/旧receipt/default-off/completion门禁。
+> 已发布验收基线（2026-10-17）：main `ad92ed0` 的CI39027150157五job全部success且core/history/下载VM bytes独立核验完成，没有live watch。受限MCP/静态skills/有限hooks包闭合，不代表新增skills、完整M3/M4或生产完成；旧三次失败和保留库不改写。当前新skills实证只认本页顶部及PROGRESS末节。
+
+> 当前阶段（2026-10-17）：M3 的固定匿名 HTTP MCP、静态 Markdown skills、固定 operator 工具前策略/提交后 hooks 已实现并通过ad92 exact-SHA完整CI，详见设计06～08与PROGRESS末节。它们不是完整注册/OAuth、三级 skill 包或插件平台；M1未冻结、M2冻结，完整M3与必要M4仍待。发布证据仍须绑定实际源码，不借旧CI或拼接本地全量绿。root唯一运行测试、DB、build与Git，作者只写与静态审查；不扩P2、不触业务库/真实云，不解0037/0054/旧receipt/default-off/completion门禁。
 
 ## 权威开发顺序（用户确认，2026-10-16）
 
@@ -12,7 +14,7 @@
 
 ## 验收证据与当前工作
 
-上一完整CI基线为`6fdb63c`。原MCP verify失败与两库保留；失败范围真实MySQL25/VM134已复验，完整历史52文件325、cluster28+T3g3、两次严格实际VM均分段通过。MCP/skills/hooks已整合，`25d0e6a`三正式MySQL纵向各1项通过，停服/cold与清理均执行。memo按真实call item去重、长Unicode tenant按共享Principal语法收口，红绿证据保留。只补受影响门禁，不重启小时级已过主矩阵；最终main须完整coverage/required/history/S3/cluster/build/VM/双image的全部Checks，不把登记170文件/75组当执行证明。详细源身份、边界和报告只看PROGRESS。
+当前完整CI基线为`ad92ed0`，本次coverage/required/history/S3/cluster/build/VM/双image全部Checks及下载字节已独立审计。原MCP verify失败、三次CI失败、保留测试库及修复后的分段证据仍保留，不回写为一次本地verify绿；登记数量也不代替实际逐文件证明。后续仍按定向→coherent包完整门禁→最终SHA CI的节奏，不为文档嵌入CIID单独push或重复已过长矩阵。详细源身份、边界和报告只看PROGRESS。
 
 每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。已批准的预算例外仅R2完整双跳it300秒、两条完整三epoch Memory it60秒、Blob8独立场景各默认30秒（合计上限高于旧聚合90秒），以及Cluster混合worker/异namespace拆为两个具名case各默认30秒（合计上限可高于旧聚合30秒，成功stop仍在body内，失败fallback hook不变）；single-hop180、SQL观察10、CLI120、lease/生产期限及全部断言不变。
 
@@ -21,10 +23,11 @@
 当前只修本功能包发布阻断，按既有失败处理规则复验受影响范围并补齐剩余门禁/最终SHA CI，不无界追加新切片；随后按顶部权威顺序推进。完整生命周期及native恢复WIP后置但不取消，未验能力仍诚实标未完成；不得自动重导、删除部分目标或隐式执行DDL。
 
 - 每轮小改动先做类型检查与影响范围定向测试；SQL、事务、删除、鉴权的正确性改动立即做真实服务及并发/回滚/隔离负例。
+- 新迁移改变全库 trigger 根时，冻结前先排查 fresh-current-schema 测试中的旧固定数量与校验器错误类型，按正式新根和完整前后证据定向验证；不得盲改冻结历史前态、放宽完整集合或改成泛化错误 oracle。
 - 多轮相关且已定向验证的修改形成 coherent 功能包，冻结后做一次完整 `verify` 及相关 `verify-s3`；独立历史、S3、cluster、SDK、实际 bundle/VM 门禁不省略。
 - 完整运行失败时保留原报告和其中已通过的结果，只修缺陷、复验失败及受影响范围，并补剩余门禁；分段结果不拼成一次全量成功。最终发布证据必须对应实际源码/提交。
 - 较大阶段集中提交推送一次并等最终 SHA 的完整 CI，不为小补丁反复 push/取消长 CI；不降低 coverage 阈值、放大 deadline、跳过用例或泛化错误 oracle。
-- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。上一完整CI基线证明required143/68groups、历史52；本次M3修后登记required170 unique/75groups、历史52，登记不等于执行。root统一test/build/DB/Git，author冻结后不擅改。
+- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。ad92完整CI基线证明required170 unique/75groups、历史52；当前skills登记required185 unique/75groups、历史53，登记不是本次主套件全绿证明，最终CI须逐文件核验。root统一test/build/DB/Git，author冻结后不擅改。
 
 ## 不变的安全与交付边界
 

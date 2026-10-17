@@ -56,6 +56,7 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     redisPrefix: cfg.REDIS_PREFIX,
     redisNamespaceSha256,
     ...(cfg.blobStorage === undefined ? {} : { blobStorage: cfg.blobStorage }),
+    ...(cfg.skillRegistryStorage === undefined ? {} : { skillRegistryStorage: cfg.skillRegistryStorage }),
     ...(cfg.RESTORE_JOURNAL_NAMESPACE_SHA256 === undefined
       ? {}
       : {
@@ -83,6 +84,8 @@ export async function startRouter(env: NodeJS.ProcessEnv = process.env) {
     adminToken: cfg.ROUTER_ADMIN_TOKEN,
     ready: () => ready,
     internalRunnerToken: cfg.INTERNAL_ROUTER_TOKEN,
+    skillRegistryEnabled: () => cfg.SKILL_REGISTRY_ENABLED,
+    skillRegistryOperatorToken: cfg.SKILL_REGISTRY_OPERATOR_TOKEN,
     tombstoneEnabled: () => cfg.SESSION_TOMBSTONE_ENABLED,
     blobAttachmentsEnabled: () => cfg.BLOB_ATTACHMENTS_ENABLED,
     erasureRequestsEnabled: () => cfg.DATA_ERASURE_REQUESTS_ENABLED,

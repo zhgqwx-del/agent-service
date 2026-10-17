@@ -15,6 +15,7 @@ const runnerLifecycleSuite = relativeTestFile
   === "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/mcp-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/skills-vertical.mysql.test.ts"
+  || relativeTestFile === "apps/agent-runner/test/skills-registry-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/hooks-vertical.mysql.test.ts"
   || relativeTestFile === "apps/agent-runner/test/ordinary-session-usage-retention.mysql.test.ts";
 if (!storeSuite && !runnerLifecycleSuite) {

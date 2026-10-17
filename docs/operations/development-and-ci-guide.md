@@ -1,12 +1,75 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 当前实现（2026-10-17，优先于下方历史检查点）：M3已提供固定匿名HTTP MCP、静态skills及有限tool hooks，配置和观察方法见下文/设计06～08；定向、真实MySQL和实际dist有分段证据，发布状态仍须核对当前main的CI Checks。此前6fdb版已自动完成双服务/MySQL/Redis确定性体验，不代表用户亲自完成手工验收。先交付本地功能版，再完整M3、必要M4、未完P2；M1未冻结不阻挡M3，实际结果只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
+> 当前说明（2026-10-17，优先于下方历史检查点）：已发布的 M3 受限基线包含固定匿名 HTTP MCP、静态 skills 与有限 tool hooks；本轮增加的受管 skills 注册包仍是未提交、未完成整包验收的候选，不能借旧 CI 宣称已发布。以下新增体验步骤只在候选验收后、全新隔离本地数据库和独占 Blob namespace 中执行，不在现业务库启动自动 DDL。先本地功能版，再完整 M3、必要 M4 与未完 P2；实际证据只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
+
+## 没有云资源时，哪些本地开发还未完成
+
+本地能完整运行已有功能，不等于整个架构已实现；剩余工作也不只是填写云参数。以下为当前代码盘点，不是已完成验收或本轮新增范围，后续按 coherent 功能包交付：
+
+| 范围 | 本地仍需完成的产品能力 | 本地可用的验收方式 |
+| --- | --- | --- |
+| 完整 MCP | 当前仍为固定匿名 HTTP；注册管理、OAuth/凭据、跨 runner 池与失效/刷新、兼容矩阵和相应恢复隔离仍待。skills 注册候选也不代表完整 M3 或插件平台完成。 | 本地 OAuth/MCP 服务、FakeVendor、真实 MySQL/Redis、多 runner 与故障注入；设计见[06-mcp](../design/06-mcp.md)。 |
+| M4 资源治理 | 单 turn 已有成本/步数/时间安全阀，但 provider 的 quota/fallback 配置不等于已接通三级配额、key 池、熔断和 failover；当前 `ProviderService.resolve()` 仍选单份凭据。 | 真实 Redis 原子 admission、多 runner 竞争、取消/崩溃后的槽位收口、429/5xx 与准确 usage；结果不明的副作用不能自动重放。 |
+| M4 观测与容量 | 已有低基数进程/HTTP 指标，但 HTTP 时长只到响应头，不是完整 SSE/turn/provider 时长；受控 OTel、cache-hit 面板、SLO/告警、持续负载/故障及 Streams 分片仍待。 | 本地 collector/dashboard、FakeVendor、真实 Redis 故障与持久对账；本机压测证明本机容量，不替代目标环境容量/SLO。 |
+| M4 发布与运行 | 双 VM/OCI 验证已有地基，但普通 runner 仍可能自动 apply migration；独立迁移执行器、最小权限且严格验真 runtime、受控安装/切换、OCI 签名/digest 晋级及完整部署契约仍待。 | 隔离 MySQL 权限与历史升级、多进程 drain/接管、同制品 VM/容器启动；发布默认关闭与 test-only 签名不等于生产许可。 |
+
+M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等原设计要求仍保留，不因本表省略而取消；P2 不再无限前置阻止 M3/M4。真实云 IAM/KMS/TLS、托管数据库/Redis 的权限与 failover、目标网络/Secret、跨故障域恢复和生产容量仍须资源到位后另验。无云不妨碍上述产品代码和本地验收，不能用本地替身签收真实环境。完整范围见[架构里程碑](../design/00-architecture.md#11-里程碑与验收)，当前通过证据仍只认 PROGRESS。
 
 ## M3 受限切片的 skills/hooks 如何验证
 
 `pnpm test:skills` 验证真实固定 SKILL.md 的解析、owner ACL、Host 与 Memory 调用链；`pnpm test:hooks` 验证闭合策略/MAC、配置/keyfile、取消/COMMIT 边界及实际 Memory runner/router 纵向。两者不读取 `.env` 或调用付费模型；带 `-mysql` 的正式命令需要 loopback `MYSQL_TEST_URL`，只新建随机隔离库并在停服冷读与成功清理后通过。不要把命令已登记、分段通过或旧 CI 当作当前候选整包验收，最新事实看 PROGRESS。
 
 配置、手动观察点及未完范围分别见 [静态 skills](../design/07-skills.md) 与 [tool hooks](../design/08-tool-hooks.md)。这些能力仍在 runner 内，不增加服务、二进制或镜像；router capability 是全部 configured 健康 fleet 的显式支持交集。静态 skill 不执行 Markdown 中脚本，pre-hook allow 不代替 MCP 审批，post-hook 在 canonical 结果提交后才观察。默认关闭，部署策略与 key 变更须整 fleet 停服排空。
+
+## 受管 skills 注册包：验收后的隔离体验
+
+完整合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)。这里是候选的学习方法，不是当前生产启用或迁移指令；旧 operator `SKILLS_ENABLED`/mount id 仍保持原义，注册域另由 `SKILL_REGISTRY_ENABLED=0` 默认关闭。
+
+先满足三个前提：本包相应定向/真实服务及最终发布门禁已验收；人工确认选定的是新建且此前不存在的可丢弃 MySQL 库、独占的本地 Blob namespace；关闭 gate、停服排空旧 writer 后按受控流程独立完成迁移。`0060` 严格指纹变化不能热混跑，也不能删 marker/guard 令启动变绿。普通 runner 连接的自动迁移仍有 DDL 权限，因此不要把已有业务 `MYSQL_URL` 交给这次体验。本文不提供覆盖旧库、隐式重建或自动迁移业务库的命令。
+
+验收后在隔离配置中同时给 router/runner 显式设置 `SKILL_REGISTRY_ENABLED=1`：
+
+- 本机 filesystem 还要求 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`、明确 `BLOB_NAMESPACE_ID`、私有独占 Blob 目录，router 恰好配置一个 runner；production 拒绝这个形态。ID 是 operator 声明，不证明两台机器的同路径共享。
+- 多 runner 必须使用已受控的共享 S3 adapter/namespace；全部 configured runner 必须 fresh 健康且支持 `managed-skill-registry-v1`、storage identity 完全相同，不能只取 healthy subset 或旧 `skills=true`。现有 Blob control/迁移门禁继续有效，不编造云 endpoint、IAM 或 Secret。
+- 平台管理凭据只配置到 router 的独立 `SKILL_REGISTRY_OPERATOR_TOKEN`，不重用 tenant-erasure、runtime、internal 或 metrics 凭据；runner 对该环境变量存在即拒绝。普通 `verify` 清除平台 token 并固定 registry gate 关闭，专项测试自行闭合启用。
+
+先通过 router `GET /v1/capabilities` 观察独立 `features.skillRegistry` 与 `skillRegistryStorage`。registry gate 开启时，session create/turn start 也经过 fresh 全 configured fleet admission；混版本、缺配置或 namespace 不一致返回可重试 `503`，不降级为无技能执行。
+
+为避免把凭据放进 shell history 或录屏，准备私有、权限 `0600` 的 curl 配置文件：runtime 配置使用真实 tenant service key 与 `X-User-Id`；tenant 管理使用同 tenant admin key；platform 配置只使用专用平台 bearer、只访问 router。下面文件路径都是格式占位，真实 token 不写入本文、请求正文或仓库。
+
+1. 以普通 runtime key、实际用户身份安装 user-own 文档，无需 admin。准备私有 JSON 请求文件，仅含 `{scope,document,expectedRevision}`；例如文档是一个带 `name: review-change`、`description` frontmatter 的 `SKILL.md`，初创使用 `scope:"user"`、`expectedRevision:0`。再调用：
+
+   ```bash
+   curl --config /absolute/protected/runtime-alice.curl.conf \
+     --header 'Idempotency-Key: learn-skill-install-v1' \
+     --json @/absolute/private/skill-install.json http://127.0.0.1:8080/v1/skills
+   curl --config /absolute/protected/runtime-alice.curl.conf \
+     'http://127.0.0.1:8080/v1/skills?scope=user'
+   ```
+
+   记录返回的安全 `name`、`versionId`、`revision`；同 key/同请求可 exact replay，改变内容或 revision 冲突返回 `409`。只接受一个 `SKILL.md` 文本、最多 64 KiB UTF-8；不上传目录、不执行代码、不下载 references。另一个 user 或 tenant 不能读取这个 user scope。
+
+2. 按精确 scope 查看 `GET /v1/skills/review-change?scope=user`、`GET /v1/skills/review-change/versions?scope=user` 和 `GET /v1/skills/review-change/versions/<versionId>?scope=user`。tenant scope 的管理读写均需同 tenant admin；普通 runtime key 使用 `scope=tenant` 应为 `403`。平台 CRUD 使用独立 `/v1/platform/skills`，由 router 终结专用 bearer 并转成版本化私有渠道，不能把这个 bearer 直接交给 runner 或 tenant-erasure API。
+
+3. admin 创建 agent 时使用 `skills:["registry:review-change"]`，不要把旧 mount id 改成注册名。解析优先级为 user > tenant > platform；最多 8 个 selector，同名静态/注册源冲突会拒绝。创建 session 后，以该 session 实际 owner 发起 turn，例如：
+
+   ```json
+   {
+     "input": [{"type":"skill","name":"review-change","args":"literal user arguments"}],
+     "skillOverrides": [{"name":"review-change","versionId":"<已获授权的不可变版本 UUID>"}],
+     "stream": false
+   }
+   ```
+
+   override 只选择已经挂载、仍授权的同名 generation 版本，不增加权限；省略时采用当前优先级。trusted caller 代建仍按实际 session owner 解析，不借用 caller 的 user skill。steer 只能沿用已接受的 turn 目录，不能中途改 override。显式输入持久化精确正文/版本 snapshot；模型调用 `skill` 工具时应看到真实 `toolCall.kind=skill`、持久 `toolResult`，再进入下一模型步骤，resume/SSE 回放和 compaction 不重读当前文档。手动真实模型 turn 会产生所配置 provider 的费用；`test:skills*` 则用本地确定性替身，不调用付费模型。
+
+4. 以实际 user-own runtime 身份调用 `GET /v1/skills/export?limit=10`。它不接受 tenant/platform scope 切换，返回独立 `user-skill-registry-export-v1`，包含该用户当前/已逻辑删除 slot 与已发布历史文档，不含未提交 stage。后页同时传原 `nextCursor` 和 `snapshotSha256`；并发变更导致 `409` 时重新从第一页开始，不能混合不同 snapshot。每页最多 25 个版本，`physicalErasureComplete` 固定 `false`；此格式不改写旧 `ndjson-v1` 导出。
+
+5. `DELETE /v1/skills/review-change` 仍需独立 `Idempotency-Key` 与 `{scope:"user",expectedRevision:<当前revision>}`。删除只是 logical delete：该 generation 的新 list/load/override 不可使用，旧 version 的 scope=user 读取应为 `404`；已获授权的 tenant/platform 同名源仍可按优先级解析。删除后再导出仍应保留历史文档；重建须使用永久最新 revision，不是重新填 `0`。
+
+物理 package purge、namespace 搬迁、备份/恢复覆盖继续是明确的 P2，不由 DELETE 或旧 Blob cleanup worker完成。已 admission 的 stage/历史 bytes 仍计配额（每 owner 256 slot、每 slot 128 version、累计 8 MiB），不会因逻辑删除自动释放。存在 registry footprint 时，新 T3d/T3f 对未覆盖的新域诚实阻断，不静默跳过或推进旧 completion；旧 mover 也不得遗漏包后切换 namespace。体验结束先停止自有服务，保留失败证据；不要用手工 SQL 删除 registry 行或旧 guard 当作清理方法。
+
+专项入口是 `pnpm test:skills`、`pnpm test:skills-mysql`、新增 `pnpm test:skills-s3` 与 `pnpm test:migrations`。真实服务套件只允许 loopback 测试配置、新随机隔离 schema/独占 namespace；每个门禁仍需原始 JSON/退出码证明非零、零 skip，登记不等于执行。MySQL/Fs 纵向使用生产 Hono Request/Host/Pi 与实际 FakeVendor HTTP，不冒称独立监听或两个 OS 进程；S3 套件另验证实际共享对象和双客户端。最终完整 verify、verify-s3、历史、cluster、SDK/dist、VM 和 exact-SHA CI 仍待整包验收。
 
 ## 正在开发的 MCP 如何验证
 
@@ -18,7 +81,7 @@
 
 历史候选、失败与分段验证统一见[PROGRESS](../PROGRESS.md)，本指南不以旧检查点的测试数量说明当前状态。
 
-当前验收提醒（2026-10-17）：MCP完整verify原失败保留，失败/受影响范围已分段复验，尚须完成后置门禁和最终SHA CI。静态skills已在独立`54d8abb`形成可测候选，未合入发布；hooks仅独立WIP，先暂停新增。下文的本地启动指引只描述实际所在提交，不因另一个工作树已有代码就宣称本机main全功能可用。
+历史验收提醒（2026-10-17 较早时点，保留原失败事实，不代表上方候选当前状态）：MCP完整verify原失败保留，失败/受影响范围曾分段复验；静态skills曾在独立`54d8abb`形成未合入候选，hooks当时为独立WIP。下文较早本地启动和 CI 数量说明均须结合实际所在提交及 PROGRESS，不因另一个工作树已有代码或旧报告而宣称本机 main 全功能可用。
 
 本文是理解和操作当前 `agent-service` 的长期维护入口，回答三类问题：本地需要启动什么、怎样手动体验、GitHub Actions 实际构建和验证什么。
 
@@ -48,7 +111,7 @@
 
 0034对active 0033历史有一个特殊、默认拒绝的升级分支：credential-job数据库guard会让仍在运行的0033 writer整笔T1事务回滚，阻止继续产生“有admission、无telemetry subject”；升级前已经存在的gap则让普通startup fail closed。guard轮换使用scoped bootstrap twin，仓库迁移器只对固定bootstrap执行exact verify-or-create，再drop/recreate primary并移除bootstrap；因此独立migration Job必须复用仓库迁移器语义，不能用朴素SQL splitter制造无guard窗口。当前只有`MysqlSessionStore.connect()`的DDL-free `migrationMode: "reconcile-telemetry-subjects"`可处理历史gap，没有产品CLI或`local-service`命令。使用前必须真实关闭tenant-erasure admission、排空pre-0034 writer并停止全部应用writer，持有active control的精确32-byte ref key，并提供三个固定ACK：`tenant-erasure-admission-closed-v1`、`pre-0034-telemetry-writers-drained-v1`、`all-application-writers-stopped-v1`。这些ACK只是人工声明；修复使用migration named lock和SERIALIZABLE全量原子事务，任一异常全回滚。不要把这段说明改写成可在在线业务库直接执行的普通启动步骤。
 
-没有云资源时仍可以继续实现并验证：业务与协议代码、Memory/MySQL/Redis 语义、迁移、故障注入、进程和 OCI 镜像、local/CI 自动化、部署契约，以及能够用本地替身证明的安全边界。以下工作不能被本地MinIO等测试替身冒充为“已完成”：云数据库和云 Redis 的权限/故障行为、managed对象存储与IAM/KMS、域名/TLS、Secret 注入、Kubernetes 或 VM 网络拓扑、真实滚动升级、告警链路、备份恢复与容量压测。它们需要后续真实资源，届时应把环境参数补进部署层，而不是现在编造参数。
+没有云资源时仍可以继续实现并验证：业务与协议代码、Memory/MySQL/Redis 语义、迁移、故障注入、进程和 OCI 镜像、local/CI 自动化、部署契约，以及能够用本地替身证明的安全边界。本地也能验证恢复协议、进程切换、告警规则和本机容量；它们不替代云数据库/Redis权限与故障行为、managed对象存储/IAM/KMS、真实域名/TLS与Secret注入、目标Kubernetes/VM网络、托管滚动升级、告警送达、跨故障域恢复和生产容量的验收。后者需要真实资源，届时把参数补进部署层，而不是现在编造参数。
 
 手动体验应该分两次进行，而不是二选一：
 
@@ -1582,6 +1645,8 @@ M4的Node24目标平台目录包已实现`bundle + migrations + 完整production
 ## 8. GitHub Actions 构建与验证
 
 `.github/workflows/ci.yml` 对 push 到 `main` 和 pull request 运行。
+
+受管 skills 本轮候选把 `test:skills-s3` 登记为 `test-core` 独立 MySQL+MinIO 必执行步骤；主 profile 的 protocol/SDK/API/core/store 及 MySQL 纵向由实际 required manifest/group 证明，`0059→0060` 还需独立历史夹具。新登记、fresh-schema 或旧 SHA CI 都不能代替这些文件真实执行；本包尚无最终提交/全 CI 成功结论。下方旧提交数字与原失败保留为时间点说明，当前数量只认 PROGRESS 和当次原始报告。构建仍是 router/runner 两服务、六个 JS 入口、四个 one-shot CLI、两个 OCI image 和双 role VM 包；registry 安装/读取/导出都在既有服务内，不新增部署服务或镜像。
 
 ### 并行 job 与最终汇总门禁（候选，真实 CI 结果见 PROGRESS）
 
