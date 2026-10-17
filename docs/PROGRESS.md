@@ -1903,3 +1903,10 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - MySQL候选仅改RR单case：保真实持锁连接和exact run，捕获两个实际native connection/thread ID，query/callback完整delegate并观察dispatch/pending，按已知身份分开核真实RR、PRIMARY等待及到holder的阻塞图；原10s从operation发起前开始且包括dispatch，默认case30s不变。释放前两请求须持续pending，释放后仍双成功/同结果/单history与activation，finally回滚/settle/close保留；失败只有固定分类，不吐raw异常。旧四视图inner-join可能漏采样，但不能把可能性当本次确证原因。`41303`正式整7项真实MySQLpass/零skip、78.01秒（case合计75.96秒），RR case9.694秒；新random库均成功清理。
 - 两份test-only diff经根逐行和独立窄审，无新增确定问题；`38329`类型0、scan792与diffcheck0。三个fresh JSON逐canonical file/非空全passed/root报告startTime核验并exclusive归档`.local-run/m3-ci2-targeted-20261017/`，Memory profile进程1单列；报告hash及source身份与case/全局门槛区别保留在根审计输出。没有产品代码/迁移SQL、schema、依赖或CI配置修改，不需要再构建相同产品字节，不重跑本地长verify/history/cluster/真实模型，也无.env/业务库或云动作。
 - 两项async选择待用户确认、尚未实施：A是否把Blob8独立场景拆为8个具名it、各沿用默认30s（合计最大预算高于原聚合90s，所有独立新库/断言不减）；B是否仅两完整三epoch Memory it60s（其它Memory30s、SQL10s、CLI/lease/生产期限不变）。未答不替用户选择、不开第三次长CI；先保留已验证的原预算候选，待选择后集中收口并推最终SHA全部CI。M1未冻、M2保持冻结、M3受限实现但整体未完、M4主体未完，原安全与completion门禁不变。
+
+## 2026-10-17T08:28Z：RR探针的真实RC负控（非正式套件绿）
+
+- 继续前核对primary clean `d5206da5e3bb8ac5547b80710db2981c3ac0948d`、仅本地检查点ahead1；前轮是实际进展，不把已终态CI当仍在等待。预算两项尚未获答，保持Blob聚合90s、Memory30s、SQL观察10s及全局floor不变，不加能力或开启新长CI。
+- 为核对测试有效性，只用ignored临时setup/config与原正式RR case作一次mutation诊断；正式test源码SHA仍为`c561752b7132f10550c8c7cdd518438e15674d44f56cdc08896b42e5ad8a0eab`，产品/正式case/预算均不改。临时native seam仅作用于新`agent_service_mtc_test_*`两single-connection facade，在真实exact-run持锁SELECT返回后arm，把两条原生SET TRANSACTION RR改成实际RC；其它SQL与callback真实delegate，不伪造isolation或锁等待元数据。
+- `13900`真实MySQL诊断进程**预期exit1**、11.83秒：barrier acquired、2次实际RR→RC替换、2条actual exact-run SELECT均有计数；唯一selected case精确失败于`READ COMMITTED`不等于`REPEATABLE READ`断言，case9.791秒，不是timeout、startup或注入未生效。其余6项因诊断filter未运行，不能算正式required suite或全量通过；此前正式全7通过另有独立报告。原JSON/log及`rr-probe-negative-20261017-proof.json`保留在`.local-run/`。
+- 独立读报告核实1failed/0passed/6filtered和精确失败消息；首个日志审计未去ANSI故提前拒绝，修解析后只重读同一报告、未重跑测试。新自有库已不存在，对应会话和metadata lock均零，正式源码hash前后一致，工作树没有产品或测试修改。该负控只证明当前RR oracle会拒绝真实错误隔离，不能消除慢CI/聚合预算风险或把原CI改成绿；下一步仍等已有两项选择后集中收口。
