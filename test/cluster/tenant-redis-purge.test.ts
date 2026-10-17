@@ -12,6 +12,7 @@ import {
   INTERNAL_ROUTER_TOKEN,
   startCluster,
   type Cluster,
+  type ClusterOptions,
 } from "./harness.js";
 
 const enabled = !!process.env.AGENT_SERVICE_CLUSTER;
@@ -68,30 +69,30 @@ describe.skipIf(!enabled)("cluster: tenant Redis purge rollout", () => {
     expect(barrier.headers.get("cache-control")).toContain("no-store");
   });
 
-  it("fails closed when one configured worker is disabled or targets another namespace", async () => {
-    cluster = await startCluster({
+  const mismatchedFleets: Array<{ label: string; options: ClusterOptions }> = [
+    { label: "worker disabled", options: {
       runners: 2,
       tenantRedisPurgeEnabled: true,
       tenantRedisPurgeWorkerEnabled: true,
       tenantRedisPurgeWorkerEnabledForRunner: (runnerNumber) => runnerNumber === 1,
-    });
-    const mixedWorkers = await redisPurgeBarrier(cluster.router.url);
-    expect(mixedWorkers.status).toBe(503);
-    expect(mixedWorkers.headers.get(INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER)).toBeNull();
-    await cluster.stop();
-    cluster = undefined;
-
-    cluster = await startCluster({
+    } },
+    { label: "namespace mismatch", options: {
       runners: 2,
       tenantRedisPurgeEnabled: true,
       tenantRedisPurgeWorkerEnabled: true,
       runnerEnv: (runnerNumber): Record<string, string> => runnerNumber === 2
         ? { REDIS_NAMESPACE_ID: "different-cluster-namespace" }
         : {},
-    });
-    const mixedNamespaces = await redisPurgeBarrier(cluster.router.url);
-    expect(mixedNamespaces.status).toBe(503);
-    expect(mixedNamespaces.headers.get(INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER)).toBeNull();
+    } },
+  ];
+  it.each(mismatchedFleets)("fails closed for a configured fleet: $label", async ({ options }) => {
+    cluster = await startCluster(options);
+    const barrier = await redisPurgeBarrier(cluster.router.url);
+    expect(barrier.status).toBe(503);
+    expect(barrier.headers.get(INTERNAL_TENANT_REDIS_PURGE_ACK_HEADER)).toBeNull();
+    // Keep successful cleanup inside each independent scenario's default budget.
+    await cluster.stop();
+    cluster = undefined;
   });
 
   it("ACKs only an active all-configured fleet bound to the exact namespace", async () => {

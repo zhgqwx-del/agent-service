@@ -311,6 +311,23 @@ describe("repository CI job split cannot skip required work", () => {
   it("keeps independent supported-floor core/history jobs and an always-running exact final gate", () => {
     expect(() => assertWorkflow(workflow, nodeVersion)).not.toThrow();
   });
+  it("runs both unchanged cluster gates before the long coverage and S3 matrix", () => {
+    const core = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2).find((job) => job.name === "test-core")!;
+    const all = steps(core);
+    const cluster = exactCommand(all, "pnpm vitest run test/cluster");
+    const rollout = exactCommand(all, "pnpm run test:tenant-redis-purge-cluster");
+    const coverage = exactCommand(all, "pnpm run test:coverage");
+    expect(all.indexOf(cluster)).toBeLessThan(all.indexOf(rollout));
+    expect(all.indexOf(rollout)).toBeLessThan(all.indexOf(coverage));
+    expect(all.indexOf(coverage)).toBeLessThan(all.indexOf(exactCommand(all, "pnpm run test:blob-s3")));
+    expect(scalar(env(core, cluster).get("AGENT_SERVICE_CLUSTER"))).toBe("1");
+    for (const step of [cluster, rollout]) {
+      expect(scalar(env(core, step).get("CLUSTER_MYSQL_URL"))).toBe("mysql://root@127.0.0.1:3306/agent_service_cluster");
+      expect(scalar(env(core, step).get("CLUSTER_REDIS_URL"))).toBe("redis://127.0.0.1:6379/3");
+    }
+    expect(scalar(env(core, coverage).get("MYSQL_TEST_URL"))).toBe("mysql://root@127.0.0.1:3306/agent_service_test");
+    expect(scalar(env(core, coverage).get("REDIS_TEST_URL"))).toBe("redis://127.0.0.1:6379/1");
+  });
   it.each([
     ["core job false", (text: string) => text.replace("  test-core:\n", "  test-core:\n    if: false\n")],
     ["history job false", (text: string) => text.replace("  test-history:\n", "  test-history:\n    if: false\n")],
