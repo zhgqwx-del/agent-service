@@ -1,6 +1,6 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> M3 本地增量（2026-10-17，未发布）：固定匿名 HTTP MCP、owner-scoped 静态 Markdown skills、固定 operator 工具前策略/提交后观察已形成候选实现；合同分别见 [06](06-mcp.md)、[07](07-skills.md)、[08](08-tool-hooks.md)。这不是完整动态注册/OAuth、三级 skills 包或任意插件平台，尚有分段与最终 CI 门禁，以 PROGRESS 为准。它们内嵌 runner；router 只公开 API/全部 configured fleet 能力交集，仍两常驻服务、六产品入口、两镜像，不新增微服务。
+> M3 本地增量（2026-10-17，发布状态看当前main Checks）：固定匿名HTTP MCP、owner-scoped静态Markdown skills、固定operator工具前策略/提交后观察已有受限实现；合同见 [06](06-mcp.md)、[07](07-skills.md)、[08](08-tool-hooks.md)，分段证据见PROGRESS。这不是完整动态注册/OAuth、三级skills包或任意插件平台。它们内嵌runner；router只公开API/全部configured fleet能力交集，仍两常驻服务、六产品入口、两镜像，不新增微服务。
 
 > 当前状态（2026-10-16，优先于下方历史候选说明）：main `6fdb63c` 的最终五项 CI 全绿，已完成隔离本地 router/runner/MySQL/Redis 确定性体验。当前工作树进入 M3.1a MCP 候选，尚未发布或完成新 CI；范围与未完清单见 [MCP 设计](06-mcp.md)，实际验证只看 [PROGRESS](../PROGRESS.md) 顶部及末节。M1 未冻结不再阻挡 M3，按用户确认顺序推进 M3、必要 M4、剩余 P2。对外 API 仍由 router 暴露，runtime/MCP 执行在 runner；常驻服务及镜像仍各两个。
 

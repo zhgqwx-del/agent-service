@@ -1,12 +1,12 @@
 # agent-service 项目记忆
 
-> 当前阶段（2026-10-17）：main6fdb63c与最终CI38929175733五项已全过，发布版隔离体验已过。MCP本地5427a8e完整verify已exit1，失败/受影响范围已分段复验，继续后置history/cluster/build/严格VM和最终CI，不重启小时级全量。skills独立54d8abb与hooks独立草稿未合入/推送，后者暂停新增。M1未冻结/M2冻结/M3未完成；看PROGRESS顶部与末节。root唯一运行测试/DB/build/Git，原删除/恢复门禁不变。
+> 当前阶段（2026-10-17）：固定匿名HTTP MCP、静态skills、operator工具hooks已整合，M3有限纵向的本地定向/真实SQL/构建与dist有分段证据；不等于完整M3或生产验收。M1未冻结/M2冻结，先交付本地功能版再必要M4和未完P2。原full失败与两库保留，历史52文件325和cluster28+3已补过，不再重复长套件；最终main exact-SHA CI仍是整包门禁。root唯一执行测试/DB/build/Git，原删除/恢复门禁不变，事实看PROGRESS顶部与末节。
 
 > 权威顺序更新（用户确认，2026-10-16）：长期全架构Goal不缩减；先完成当前功能包发布阻断/剩余门禁/最终SHA CI，再尽早本地手动体验，推进M3 MCP/skills/hooks纵向（安全随功能），之后必要M4本地可验发布/迁移/运行、基础quota/观测，完整生命周期/灾备后置P2，云验收待资源。M1未闭环/未冻结、M2冻结、M3已开始但未完成，但不再以M1全部闭环阻止M3。旧文中的先后顺序据此覆盖，旧事实/代码/native WIP不删；本地功能版不是全架构/生产完成。P0和普通路径/启动/迁移正确性不因default-off豁免，0037/0054/旧receipt/unknown/production拒绝/外删自动off/completion=false等边界不变，详见[PROGRESS](docs/PROGRESS.md)。
 
 ## 当前验证与后续工作
 
-M3.1a本地`5427a8e`完整verify仍exit1：4608pass/10fail/111skip，含0054 JSON beforeAll阻断25项；不能全称预期skip。库名修后真实25项、VM夹具修后134项已分段通过，产品权限/guard/预算不改。clean `9ff3bf3` 严格双角色实际VM已过（测试签名/非生产），release clean5427正独占跑52文件历史，cluster和最终SHA CI待完成；原失败两库/报告保留，不重启小时级主矩阵。独立skills54的真实MySQL1、正式158、MCP199、API/build/dist已过；hooks独立WIP纯/Memory已过但SQL/build/完整验收待。均未合入/发布，不借分段/旧SHA/旧CI背书。
+原`5427a8e` full仍为4608pass/10fail/111skip，含25个beforeAll阻断，绝非全量成功或全为预期skip。其失败范围与后置历史/cluster已分段补过；`25d0e6a`上正式MCP/skills/hooks真实MySQL各1项通过，严格cold/提交时序及清理实际执行。新memo曾误吞跨step复用ID，实际15pass/2fail红后按write-ahead item身份窄修，115受影响项过；MCP/skills同类Unicode Principal误拒也实际红后192项过，语法/隔离/ASCII摘要不放宽。类型/API/scan792、build:check与hooks plain-Node双进程通过。所有源身份/重叠/原失败见PROGRESS，最终当前main必须全部CI Checks成功，不借旧CI或拼本地全量绿。
 
 完整时间点事实、原失败及后续分段均保留在`docs/PROGRESS.md`和Git历史，本文只留当前合同。历史夹具需要祖先`24d5ae4`，不得squash丢失；用户只允许R2完整it300秒，single-hop180/CLI120/lease/生产限制和全部断言不变。不自动清理保留的失败制品或扩大数据库删除范围。
 
@@ -16,7 +16,7 @@ M1 未冻结、M2 冻结、M3 已开始但未完成；默认 off、local-only / 
 
 VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/SPKI pin 与选定 role/commit；未知工具不能自认证，失败无 unsigned fallback。它不等于生产信任根、环境晋级或云验收；长期服务/产品 JS 入口/镜像仍为 2/6/2。
 
-验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。已发布main证明required143/68groups、历史52；MCP候选登记required154 unique/71groups、历史52，不是执行证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
+验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。上一已发布main证明required143/68groups、历史52；M3整包登记required169 unique/75groups、历史52，不是执行证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
 
 下一步仅修当前coherent功能包发布阻断，保留失败与已过结果，复验失败/受影响范围并补齐剩余门禁及最终SHA CI，随后本地体验与M3纵向。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
 
@@ -28,11 +28,13 @@ VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/
 
 普通usage子切片`0052`实现默认关闭、production拒绝启用的ordinary session operational usage retention，不是内容purge。新trusted DELETE与origin同事务绑定不可变policy v2；Memory原子发布/MySQL RR执行独立重验owner/source/seal、DB time、30天与更长政策、hold、erasure/restore fence和billing proof，只移除operational ledger。新T3f prior-retained-billing bridge及grave的source/receipt摘要保持后续租户清理可核对，旧receipt/grave v1 hash不变，缺新证据不补造。八个nullable列/五个guard和相关145组合指纹要求pre-0052 writer/事务完全排空后独立迁移；全库trigger总数不是145。runner/router双gate均默认0；内嵌worker逐scan/reconcile/execute取fresh fleet ACK，候选和账单reconcile本身不授予删除许可。每session最多10000 facts且超限拒绝，tenant bridge仍需大JSON/锁等待容量验收；统一whole-operation deadline和自动证明fleet排空仍缺。实际验证状态以PROGRESS最新节为准。
 
-用户已确认BYOK租户删除只清除本系统保存的key，厂商侧撤销由客户负责。T3a已有本地live credential行删除事务、T3b撤销受跟踪runtime引用，但备份/恢复等全域证明仍缺；0026既有external blocker不能因这项确认被重释成远端撤销成功。后续须建立versioned责任来源/客户侧责任声明，不执行真实厂商撤销，也不得把0029 Memory fake当作证明。
+用户已确认BYOK租户删除只清除本系统保存的key，厂商侧撤销由客户负责。0059已有versioned责任来源/客户侧责任声明，T3a已有本地live credential行删除、T3b撤销受跟踪runtime引用，但备份/恢复等全域证明仍缺；0026既有external blocker不能据此重释成远端撤销成功。不执行真实厂商撤销，不把0029 Memory fake当作证明。
 
 用户已确认普通 session DELETE 的内容宽限期按30天实现，自动物理清理默认关闭；`0050`只为新普通DELETE建立来源及post-COMMIT数据库时间floor。后续runner内嵌的未seal来源恢复caller由独立`SESSION_DELETE_GRACE_RECOVERY_ENABLED=0`默认关闭gate控制，仅exact补seal，不排期、领取或执行purge；当前 `purge_after_ms=NULL`、`session.purge`不可领取，不能写成已启用。M4将同时交付VM独立进程发布包和容器镜像；云环境验收仍待资源。
 
 开始工作前读取 `AGENTS.md`，并以仓库内的 `README.md`、`docs/PROGRESS.md` 顶部与最后一节、`docs/design/00-architecture.md`、`docs/design/04-data-lifecycle.md` 和 `docs/operations/local-and-deployment.md` 为事实来源；本地启动、手动体验、源码/镜像产物与GitHub Actions学习材料统一维护在`docs/operations/development-and-ci-guide.md`。`docs/review/` 与 `docs/research/` 是历史快照，不能用其中的旧测试数量、缺陷或下一步覆盖当前状态。
+
+## 0042 阶段背景（历史状态；当前实现与验收以顶部为准）
 
 当前检查点是：M0完成、M2本地/CI范围正式冻结；M1已有核心运行范围及多个本地生命周期切片，但完整数据生命周期仍未闭环，M3/M4主体未开始。`0034` durable writer已接runner并支持默认关闭的filesystem或S3-compatible adapter；`0035`只为`provider.upstream_request_failed` logs提供精确producer contract，traces必须inactive。`0036`/`0037`仍为默认休眠非生产处置协议与真实grant硬拒；`0038`～`0041`依次封存新write membership、T3f owner/grave closure、T3d五类source及逐source观察目标。`0042`从同一次锁定的source/owner快照为**新**T3d plan建立精确logs/traces逐artifact target count/root，连同0040/0041及独立catalog receipt在同一Memory原子发布/MySQL RR事务中封存；旧0041 terminal维持原零target plan、缺catalog为unknown，不回填。新target仍`blocked_adapter_unconfigured`、`executionReady=false`，不是grant、locator或删除许可。本地/CI第五个MinIO bucket只证明0036协议，不证明云IAM/KMS或独立故障域。没有产品v2 S3 mutation/ACK、可信DB grant verifier、marker验真、最新外部head恢复核对、旧快照replay/startup gate或跨MySQL/S3端到端证明，也没有telemetry disposition activation/worker/CLI，外部处置入口默认拒绝。不能宣称0042已完成telemetry删除/恢复/retention或全域completion；真实provider/KMS、其它domain恢复/erasure proof和generic user物理purge仍缺失，M1未冻结。
 

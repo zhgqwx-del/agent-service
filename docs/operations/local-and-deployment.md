@@ -1,6 +1,6 @@
 # 本地运维与后续部署契约
 
-> M3 候选配置（2026-10-17）：MCP、静态 skills、tool hooks 分别使用默认关闭的 operator 配置，随 runner 发布并须 whole-fleet 停服排空后统一变更。参见 [MCP](../design/06-mcp.md)、[skills](../design/07-skills.md)、[hooks](../design/08-tool-hooks.md)。它们不增加部署服务或镜像；hook key 只由独立受保护文件提供，不把 key 写入环境 JSON。本地/CI 分段结果不代表已发布、云验收或生产启用；精确状态以 PROGRESS 为准。
+> M3 受限切片配置（2026-10-17）：MCP、静态skills、tool hooks各自使用默认关闭的operator配置，随runner发布，须whole-fleet停服排空后统一变更。参见 [MCP](../design/06-mcp.md)、[skills](../design/07-skills.md)、[hooks](../design/08-tool-hooks.md)。它们不增加服务或镜像；hook key只由独立受保护文件提供，不写入环境JSON。本地分段不能代替当前SHA发布门禁，更不是云/生产启用验收；精确证据看PROGRESS，发布状态核对当前main Checks。
 
 > 当前状态（2026-10-16，优先于下方历史候选说明）：已发布 main `6fdb63c` 的五项 CI 全绿，隔离本地体验完成；当前工作树的 M3.1a MCP 尚为未发布候选，不能借旧 CI 背书。部署仍是 router/runner 两个独立服务，提供 OS/架构匹配、含 Node 生产依赖的 VM 目录包及两个容器镜像；不是 Windows/Linux 系统镜像或单文件原生二进制。云资源、生产信任根及真实环境验收仍待用户提供；MCP 不新增长期服务或产品入口，默认关闭，配置/完整未完范围见 [MCP 设计](../design/06-mcp.md)。
 

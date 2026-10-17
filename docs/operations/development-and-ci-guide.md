@@ -1,8 +1,8 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 当前状态（2026-10-16，优先于下方历史检查点）：已发布 main `6fdb63c` 的最终 CI 五项全绿，已自动完成独立 router/runner/MySQL/Redis 的确定性本地体验；不代表用户已亲自完成手工验收。当前工作树开发 M3.1a MCP，尚未发布，新能力不能借旧 CI 背书。先交付本地功能版，依次 M3、必要 M4、未完 P2；完整架构目标不取消，M1 未冻结不再阻挡 M3。实际证据只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
+> 当前实现（2026-10-17，优先于下方历史检查点）：M3已提供固定匿名HTTP MCP、静态skills及有限tool hooks，配置和观察方法见下文/设计06～08；定向、真实MySQL和实际dist有分段证据，发布状态仍须核对当前main的CI Checks。此前6fdb版已自动完成双服务/MySQL/Redis确定性体验，不代表用户亲自完成手工验收。先交付本地功能版，再完整M3、必要M4、未完P2；M1未冻结不阻挡M3，实际结果只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
 
-## M3 候选的 skills/hooks 如何验证
+## M3 受限切片的 skills/hooks 如何验证
 
 `pnpm test:skills` 验证真实固定 SKILL.md 的解析、owner ACL、Host 与 Memory 调用链；`pnpm test:hooks` 验证闭合策略/MAC、配置/keyfile、取消/COMMIT 边界及实际 Memory runner/router 纵向。两者不读取 `.env` 或调用付费模型；带 `-mysql` 的正式命令需要 loopback `MYSQL_TEST_URL`，只新建随机隔离库并在停服冷读与成功清理后通过。不要把命令已登记、分段通过或旧 CI 当作当前候选整包验收，最新事实看 PROGRESS。
 

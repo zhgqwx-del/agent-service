@@ -1,6 +1,6 @@
 # M3 tool hooks：固定 operator 策略与观察
 
-状态：独立 hooks 候选，尚未发布。正式六文件182项、共享MCP/skills十四文件357项、既有Host/config两文件117项均定向通过；类型、API生成一致性、secret scan及SDK/六入口实际构建与默认dist冒烟也通过。此前Unicode正控、测试夹具和类型失败保留。这不是一次完整验证：真实MySQL、hooks-enabled plain-Node调用、完整verify与最终SHA CI尚待，不表示整体M3或生产验收完成。批次及后续状态以 [PROGRESS](../PROGRESS.md) 为准。
+状态：本地受限切片已实现，core/Host/协议/配置/Memory、真实MySQL提交时序与停服冷读、hooks-enabled plain-Node双进程均已有分段验证，类型/API/secret scan及实际构建通过。跨step复用toolCallId的memo正确性缺陷有实际红绿闭合；此前Unicode正控、夹具和类型失败保留，不拼一次全量成功。完整发布状态只认当前main exact-SHA CI，不表示整体M3或生产验收完成。批次及后续状态以 [PROGRESS](../PROGRESS.md) 为准。
 
 ## 1. 范围、配置与 owner
 

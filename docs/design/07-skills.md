@@ -1,6 +1,6 @@
 # M3 静态 skills：operator Markdown 切片
 
-状态：独立 skills 候选，尚未发布。真实文件 source、纯协议/配置与 Memory/Host 纵向已由 root 定向验证；本切片的真实 MySQL 纵向、新 SHA 完整验证及新 CI 尚未执行。已有 MCP/旧版本的通过不背书本候选，精确进度看 [PROGRESS](../PROGRESS.md)。本节不表示整体 M3、生产或完整生命周期验收完成。
+状态：本地受限切片已实现，真实regular文件、协议/配置、Memory/Host、真实MySQL提交时序/停服冷读及plain-Node调用均已有分段验证；整合检查点25d0e6a的正式MySQL纵向再次通过。共享Principal语法保留合法Unicode tenant，129字符及非法UserId仍拒绝。完整发布状态只认当前main exact-SHA CI，精确证据看 [PROGRESS](../PROGRESS.md)。本节不表示整体M3、生产或完整生命周期验收完成。
 
 ## 1. 范围与信任边界
 
