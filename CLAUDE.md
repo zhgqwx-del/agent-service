@@ -1,6 +1,6 @@
 # agent-service 项目记忆
 
-> 当前实际工作（2026-10-17）：skills本地门禁已分段收口；94376真实exit0，尾部9文件42项与source assembly通过并独立审计。原主5322/2/87、无coverage及原S3失败保留，不拼一次完整verify绿；完整21项备份文件仍须最终CI。当前无live测试、未commit/push/新CI，下一集中提交main并等exact-SHA全部Checks。root唯一执行，不读.env；旧33域/NDJSON/receipt/物理清理不重释，不重复旧ad92 CI。
+> 发布前实际快照（2026-10-17）：skills main `d74f7fa` 的CI39048326358已terminal failure，唯一1213已实证为跨owner的原生record-lock环。0061前向迁移已隔离校准，九guard只增索引前筛、原安全残余及0060字节不改；marker严格单根，部分DDL/marker-loss拒绝自动续跑。env-free冻结820文件下pure163、skills MySQL13（原12全保留）、grant5、历史8、skills S3 1、完整backup21及source装配通过，type/API/build/SDK/四CLI亦通过，独立review无确定P0–P2；最终提交完整CI仍须验收。root唯一执行，作者只写/静态；不重试、放宽并发oracle或改预算。原失败/无coverage不改绿，旧33域/NDJSON/receipt/defaultoff/completion及registry生命周期P2不变，不读.env/不触业务库或云；下一MCP实现待本包发布收口。实时提交/CI终态只看PROGRESS顶部及末节。
 
 > 已发布验收基线（2026-10-17）：main `ad92ed0` 的CI39027150157五job全绿且core/history/下载VM字节独立核验，无live watch。受限MCP/静态skills/有限hooks包闭合，不是新增skills、完整M3/M4/全架构/生产完成；旧失败保留。新增coherent WIP随整包提交，精确进度看PROGRESS末节。
 
@@ -20,7 +20,7 @@ M1 未冻结、M2 冻结、M3 已开始但未完成；既有生命周期 gate �
 
 VM 发布仍绑定目标 OS/CPU、clean/publishable 字节、独立可信摘要/SPKI pin 与选定 role/commit；未知工具不能自认证，失败无 unsigned fallback。它不等于生产信任根、环境晋级或云验收；长期服务/产品 JS 入口/镜像仍为 2/6/2。
 
-验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。ad92完整CI基线证明required170 unique/75groups、历史52；当前skills登记required185 unique/75groups、历史53，不是本次主套件全绿证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
+验证按“每改动定向；SQL 正确性立即真实验；功能包冻结后全量；失败保留已过结果、修复/受影响复验并补余下门禁；较大阶段一次 CI”执行，不降低阈值、放大期限或弱化 oracle。ad92完整CI基线证明required170 unique/75groups、历史52；当前skills/0061登记required185 unique/75groups、历史54，不是本次主套件全绿证明。不把分段、旧SHA或旧CI说成新全量通过。详细时间点历史统一查PROGRESS；以下协议正文保留，不作为最新验收数字来源。
 
 下一步仅修当前coherent功能包发布阻断，保留失败与已过结果，复验失败/受影响范围并补齐剩余门禁及最终SHA CI，随后本地体验与M3纵向。旧schema原生artifact跨迁移恢复及完整生命周期后置但不取消、不冒称完成；格式/历史读取兼容仍非完整恢复证明，失败可能消耗epoch并留下部分目标，禁止自动重导/清空或隐式DDL。M1仍未冻结，不再要求其全部闭环后才能启动M3。
 

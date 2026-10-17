@@ -4,6 +4,13 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export const SKILL_REGISTRY_MIGRATION = "0060_skill_registry.sql";
+export const SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION = "0061_skill_registry_native_lookup.sql";
+export const SKILL_REGISTRY_NATIVE_LOOKUP_TRIGGERS = [
+  "trg_skill_registry_slots_bi", "trg_skill_registry_slots_bu",
+  "trg_skill_registry_installations_bi", "trg_skill_registry_installations_bu",
+  "trg_skill_registry_versions_bi", "trg_skill_registry_deletions_bi",
+  "trg_skill_registry_slots_gate_bi", "trg_skill_registry_slots_gate_bu", "trg_skill_registry_versions_gate_bi",
+] as const;
 export const SKILL_REGISTRY_TABLES = ["skill_registry_owners", "skill_registry_slots", "skill_registry_installations", "skill_registry_versions", "skill_registry_deletions"] as const;
 export const SKILL_REGISTRY_TRIGGERS = [...SKILL_REGISTRY_TABLES.flatMap(table => ["bi", "bu", "bd"].map(suffix => `trg_${table}_${suffix}`)), "trg_skill_registry_t3d_bu", "trg_skill_registry_t3f_bu", "trg_skill_registry_slots_gate_bi", "trg_skill_registry_slots_gate_bu", "trg_skill_registry_versions_gate_bi"];
 export function skillRegistryFingerprintStatement(sql: string, kind: "schema" | "triggers"): string {
@@ -16,9 +23,26 @@ export function skillRegistryFingerprintStatement(sql: string, kind: "schema" | 
     roots.length !== (kind === "schema" ? 7 : 1) || roots.some(x => x === `'${"0".repeat(64)}'`)) fail();
   return statement;
 }
+/** Actual markers select one trigger contract; a different root is never a fallback. */
+export async function readMysqlSkillRegistryFingerprintStatements(conn: Pick<PoolConnection, "query">, directory: string): Promise<{
+  schema: string; triggers: string; triggerMigration: string;
+}> {
+  const [rows] = await conn.query<Row[]>("SELECT name FROM schema_migrations WHERE name IN (?,?) ORDER BY name",
+    [SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION]);
+  const names = rows.map(row => row.name);
+  if (names.filter(name => name === SKILL_REGISTRY_MIGRATION).length !== 1
+    || names.some(name => name !== SKILL_REGISTRY_MIGRATION && name !== SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
+    || new Set(names).size !== names.length) fail();
+  const triggerMigration = names.includes(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)
+    ? SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION : SKILL_REGISTRY_MIGRATION;
+  const schemaSql = await readFile(join(directory, SKILL_REGISTRY_MIGRATION), "utf8");
+  const triggerSql = triggerMigration === SKILL_REGISTRY_MIGRATION ? schemaSql : await readFile(join(directory, triggerMigration), "utf8");
+  return { schema: skillRegistryFingerprintStatement(schemaSql, "schema"),
+    triggers: skillRegistryFingerprintStatement(triggerSql, "triggers"), triggerMigration };
+}
 export async function assertMysqlSkillRegistryFingerprint(conn: PoolConnection, directory: string) {
-  const sql = await readFile(join(directory, SKILL_REGISTRY_MIGRATION), "utf8");
-  const statements = [skillRegistryFingerprintStatement(sql, "schema"), skillRegistryFingerprintStatement(sql, "triggers")];
+  const selected = await readMysqlSkillRegistryFingerprintStatements(conn, directory);
+  const statements = [selected.schema, selected.triggers];
   await conn.query("SET @skill_registry_previous_gcml=@@SESSION.group_concat_max_len");
   try {
     await conn.query("SET SESSION group_concat_max_len=1048576");

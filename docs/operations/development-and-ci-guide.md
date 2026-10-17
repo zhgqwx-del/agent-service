@@ -1,6 +1,6 @@
 # 本地开发、手动体验与 CI 构建指南
 
-> 当前说明（2026-10-17，优先于下方历史检查点）：已发布的 M3 受限基线包含固定匿名 HTTP MCP、静态 skills 与有限 tool hooks；本轮增加的受管 skills 注册包仍是未提交、未完成整包验收的候选，不能借旧 CI 宣称已发布。以下新增体验步骤只在候选验收后、全新隔离本地数据库和独占 Blob namespace 中执行，不在现业务库启动自动 DDL。先本地功能版，再完整 M3、必要 M4 与未完 P2；实际证据只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
+> 当前说明（2026-10-17，优先于下方历史检查点）：已发布的 M3 受限基线包含固定匿名 HTTP MCP、静态 skills 与有限 tool hooks；受管 skills 注册包 `d74f7fa` 的最终 CI 因不同 owner 并发创建的真实 MySQL 1213 失败，0061 前向修复已本地定向通过，仍须最终 SHA CI，不能借旧 CI 宣称发布完成。以下体验步骤只在验收后、全新隔离本地数据库和独占 Blob namespace 中执行，不在现业务库启动自动 DDL。先本地功能版，再完整 M3、必要 M4 与未完 P2；实际证据只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
 
 ## 没有云资源时，哪些本地开发还未完成
 
@@ -25,7 +25,7 @@ M1 的未完数据生命周期、完整 skills/hooks 及重池/exec-server 等�
 
 完整合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)。这里是候选的学习方法，不是当前生产启用或迁移指令；旧 operator `SKILLS_ENABLED`/mount id 仍保持原义，注册域另由 `SKILL_REGISTRY_ENABLED=0` 默认关闭。
 
-先满足三个前提：本包相应定向/真实服务及最终发布门禁已验收；人工确认选定的是新建且此前不存在的可丢弃 MySQL 库、独占的本地 Blob namespace；关闭 gate、停服排空旧 writer 后按受控流程独立完成迁移。`0060` 严格指纹变化不能热混跑，也不能删 marker/guard 令启动变绿。普通 runner 连接的自动迁移仍有 DDL 权限，因此不要把已有业务 `MYSQL_URL` 交给这次体验。本文不提供覆盖旧库、隐式重建或自动迁移业务库的命令。
+先满足三个前提：本包相应定向/真实服务及最终发布门禁已验收；人工确认选定的是新建且此前不存在的可丢弃 MySQL 库、独占的本地 Blob namespace；关闭 gate、停服排空全部 pre-0061 writer 后按受控流程独立完成迁移。0060 原字节不改，0061 仅收窄九个 native point guard 的索引查找；严格指纹按实际 marker 选择唯一根，不能热混跑，也不能删 marker/guard 令启动变绿。部分 DDL 或 marker 丢失会拒绝自动续迁移，只能受控 forward-fix，详见[运维契约](local-and-deployment.md#受管-skills-的隔离启用边界候选验收后使用)。普通 runner 连接的自动迁移仍有 DDL 权限，因此不要把已有业务 `MYSQL_URL` 交给这次体验。本文不提供覆盖旧库、隐式重建或自动迁移业务库的命令。
 
 验收后在隔离配置中同时给 router/runner 显式设置 `SKILL_REGISTRY_ENABLED=1`：
 

@@ -7,7 +7,8 @@ import { bindMysqlOperationAbort, createMysqlOperationAbortTransport } from "./o
 import { readTenantTelemetryCaptureCheckpointFromMysql } from "./tenant-telemetry-capture-checkpoint.js";
 import * as SkillRegistry from "../skills.js";
 import { MysqlSkillRegistry, assertMysqlSkillRegistryProjection, assertMysqlSkillRegistryFingerprint,
-  skillRegistryFingerprintStatement, SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_TABLES, SKILL_REGISTRY_TRIGGERS } from "./skills-registry.js";
+  skillRegistryFingerprintStatement, SKILL_REGISTRY_MIGRATION, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION,
+  SKILL_REGISTRY_TABLES, SKILL_REGISTRY_TRIGGERS } from "./skills-registry.js";
 import type { AgentDefinition, ApiKeyScope, Approval, EventInput, Item, PersistedEvent, ProviderConfig, Session, TenantAuthPolicy, Turn, UsageQuery } from "@agent-service/protocol";
 import {
   Approval as ApprovalSchema,
@@ -11391,6 +11392,9 @@ export class MysqlSessionStore implements
     try {
       const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
       const done = new Set(applied.map((row) => row.name as string));
+      if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
+        throw new SkillRegistry.SkillRegistryIntegrityError();
+      }
       if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
@@ -11676,6 +11680,12 @@ export class MysqlSessionStore implements
       const sql = await readFile(join(dir, SKILL_REGISTRY_MIGRATION), "utf8");
       skillRegistryFingerprintStatement(sql, "schema"); skillRegistryFingerprintStatement(sql, "triggers");
     }
+    if (files.includes(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION)) {
+      // DDL auto-commits: an uncalibrated forward-fix must fail before any
+      // predecessor DDL, not after an otherwise valid 0060 installation.
+      const sql = await readFile(join(dir, SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION), "utf8");
+      skillRegistryFingerprintStatement(sql, "triggers");
+    }
     // MySQL DDL auto-commits, so a transaction cannot serialize migrations. A named lock held by one
     // dedicated connection prevents two cold-starting runners from both observing a migration as
     // pending and racing the same ALTER TABLE. The database hash keeps independent schemas separate.
@@ -11694,6 +11704,9 @@ export class MysqlSessionStore implements
       );
       const [applied] = await conn.query<Row[]>("SELECT name FROM schema_migrations");
       const done = new Set(applied.map((r) => r.name as string));
+      if (done.has(SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) && !done.has(SKILL_REGISTRY_MIGRATION)) {
+        throw new SkillRegistry.SkillRegistryIntegrityError();
+      }
       if (done.has(TENANT_TELEMETRY_GRANT_GUARD_MIGRATION_NAME)
         && !done.has(TENANT_TELEMETRY_DISPOSITION_MIGRATION_NAME)) {
         throw new Error("0037 grant guard marker is missing its 0036 predecessor");
@@ -11764,6 +11777,12 @@ export class MysqlSessionStore implements
       }
       for (const f of files) {
         if (done.has(f)) continue;
+        if (f === SKILL_REGISTRY_NATIVE_LOOKUP_MIGRATION) {
+          if (!done.has(SKILL_REGISTRY_MIGRATION)) throw new SkillRegistry.SkillRegistryIntegrityError();
+          // Still marker-bound to 0060 here. Any temporary guard, partially
+          // rotated body or marker-loss 0061 schema fails; never replay its DDL.
+          await assertMysqlSkillRegistryFingerprint(conn, dir);
+        }
         if (f === SKILL_REGISTRY_MIGRATION) {
           if (!done.has(TENANT_CREDENTIAL_RESPONSIBILITY_MIGRATION_NAME)) throw new SkillRegistry.SkillRegistryIntegrityError();
           const [footprint] = await conn.query<Row[]>(`SELECT

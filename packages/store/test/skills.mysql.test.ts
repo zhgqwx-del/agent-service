@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import mysql, { type Connection, type Pool, type RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { blobS3Backend } from "@agent-service/protocol";
 import { MysqlSessionStore } from "../src/mysql/store.js";
 import { MysqlBlobStorageMigrationCoordinator } from "../src/mysql/blob-storage-migration.js";
@@ -72,7 +72,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) describe("skill registry isolated rea
   },120_000);
   afterAll(async ({},suite) => {
     const deadline=performance.now()+120_000;
-    const allPassed=setupComplete&&suite.tasks.length===12&&suite.tasks.every(task=>task.type==="test"&&task.mode==="run"&&task.result?.state==="pass"&&
+    const allPassed=setupComplete&&suite.tasks.length===13&&suite.tasks.every(task=>task.type==="test"&&task.mode==="run"&&task.result?.state==="pass"&&
       !task.result.errors?.length&&(task.result.retryCount??0)===0&&(task.result.repeatCount??0)===0&&typeof task.result.duration==="number"&&Number.isFinite(task.result.duration)&&task.result.duration>=0&&task.result.duration<=30_000);
     let removed=false;
     try {
@@ -124,6 +124,72 @@ if (process.env.AGENT_SERVICE_INTEGRATION) describe("skill registry isolated rea
     expect(first.owner).toEqual(left.owner);expect(last.owner).toEqual(right.owner);
     expect(await second.getReadableSkillVersion({access:left.access,owner:left.owner,name:"example",versionId:null})).toEqual(first);
     expect(await store.getReadableSkillVersion({access:right.access,owner:right.owner,name:"example",versionId:null})).toEqual(last);
+  });
+  it("native slot and lifecycle point lookups do not wait on another owner's exact owner and state-index X records",async()=>{
+    // The 0060 incident held both types of records, not merely an unrelated user's
+    // PRIMARY lock. Keep this deterministic counterexample separate from the old pair case.
+    const candidates=[fixture(),fixture()].sort((a,b)=>{
+      const x=skillRegistryDigest("skill-registry-owner-v1",a.owner),y=skillRegistryDigest("skill-registry-owner-v1",b.owner);
+      return x<y?-1:x>y?1:0;
+    });
+    const foreign=candidates[0]!,target=candidates[1]!;
+    const foreignStage=await store.prepareSkillInstallation(foreign.prepare()),foreignVersion=await foreign.publish(foreignStage);
+    expect(await second.getReadableSkillVersion({access:foreign.access,owner:foreign.owner,name:"example",versionId:null})).toEqual(foreignVersion);
+    const foreignSha=skillRegistryDigest("skill-registry-owner-v1",foreign.owner);
+    const [subjects]=await inspect.query<RowDataPacket[]>("SELECT state,updated_at_ms,subject_kind,subject_id FROM subject_lifecycle WHERE tenant_id=? ORDER BY subject_kind",[foreign.tenantId]);
+    expect(subjects).toHaveLength(2);
+    const holder=await (Reflect.get(store,"pool") as Pool).getConnection(),pool=Reflect.get(second,"pool") as Pool;
+    const acquire=pool.getConnection.bind(pool);
+    let pending:Promise<SkillInstallation>|undefined,targetId=0,slotDispatched=false,slotCompleted=false,settled=false;
+    let restore:()=>void=()=>{};
+    try {
+      await holder.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");await holder.beginTransaction();
+      await holder.query("SELECT owner_sha256 FROM skill_registry_owners WHERE owner_sha256=? FOR UPDATE",[foreignSha]);
+      for(const row of subjects)await holder.query(`SELECT tenant_id FROM subject_lifecycle FORCE INDEX (idx_subject_lifecycle_state)
+        WHERE state=? AND updated_at_ms=? AND tenant_id=? AND subject_kind=? AND subject_id=? FOR UPDATE`,
+      [row.state,row.updated_at_ms,foreign.tenantId,row.subject_kind,row.subject_id]);
+      const [locks]=await inspect.query<RowDataPacket[]>(`SELECT l.OBJECT_NAME AS name,l.INDEX_NAME AS idx,l.LOCK_MODE AS mode
+        FROM performance_schema.data_locks l JOIN performance_schema.threads t ON t.THREAD_ID=l.THREAD_ID
+        WHERE l.OBJECT_SCHEMA=? AND t.PROCESSLIST_ID=? AND l.LOCK_TYPE='RECORD' AND l.LOCK_STATUS='GRANTED'`,[database,holder.threadId]);
+      expect(locks.filter(row=>row.name==="skill_registry_owners"&&row.idx==="PRIMARY"&&String(row.mode).startsWith("X"))).not.toHaveLength(0);
+      expect(locks.filter(row=>row.name==="subject_lifecycle"&&row.idx==="idx_subject_lifecycle_state"&&String(row.mode).startsWith("X"))).toHaveLength(2);
+      const spy=vi.spyOn(pool,"getConnection").mockImplementationOnce(async()=>{
+        const connection=await acquire(),query=connection.query.bind(connection);targetId=connection.threadId;
+        return new Proxy(connection,{get(real,key){
+          if(key==="query")return async(...args:unknown[])=>{
+            const slot=typeof args[0]==="string"&&/^INSERT INTO skill_registry_slots\b/.test(args[0]);
+            if(slot)slotDispatched=true;
+            const result=await Reflect.apply(query,connection,args);
+            if(slot)slotCompleted=true;
+            return result;
+          };
+          const value=Reflect.get(real,key,real);return typeof value==="function"?value.bind(real):value;
+        }});
+      });restore=()=>spy.mockRestore();
+      pending=second.prepareSkillInstallation(target.prepare());
+      void pending.then(()=>{settled=true;},()=>{settled=true;});
+      const deadline=Date.now()+5_000;
+      while(!settled&&Date.now()<deadline){
+        if(targetId){
+          const [edges]=await inspect.query<RowDataPacket[]>(`SELECT COUNT(*) AS n FROM performance_schema.data_lock_waits w
+            JOIN performance_schema.data_locks r ON r.ENGINE_LOCK_ID=w.REQUESTING_ENGINE_LOCK_ID AND r.ENGINE=w.ENGINE
+            JOIN performance_schema.data_locks b ON b.ENGINE_LOCK_ID=w.BLOCKING_ENGINE_LOCK_ID AND b.ENGINE=w.ENGINE
+            JOIN performance_schema.threads rt ON rt.THREAD_ID=r.THREAD_ID JOIN performance_schema.threads bt ON bt.THREAD_ID=b.THREAD_ID
+            WHERE r.OBJECT_SCHEMA=? AND b.OBJECT_SCHEMA=? AND rt.PROCESSLIST_ID=? AND bt.PROCESSLIST_ID=?`,[database,database,targetId,holder.threadId]);
+          expect(Number(edges[0]?.n),"a different owner's exact native records must not block this operation").toBe(0);
+        }
+        if(!settled)await new Promise<void>(resolve=>setTimeout(resolve,10));
+      }
+      expect(settled,"the actual INSERT must settle while the unrelated native X records remain held").toBe(true);
+      const staged=await pending;expect(staged.state).toBe("staging");
+      expect(slotDispatched).toBe(true);expect(slotCompleted).toBe(true);
+      // Only now release the foreign native records, then consume the real stage normally.
+      await holder.rollback();
+      const published=await target.publish(staged);
+      expect(await store.getReadableSkillVersion({access:target.access,owner:target.owner,name:"example",versionId:null})).toEqual(published);
+    }finally{
+      await holder.rollback().catch(()=>{});holder.release();await pending?.catch(()=>{});restore();
+    }
   });
   it("samples mutation DB time after a proven owner-lock wait and intervening native publication",async()=>{
     const f=fixture(),first=await store.prepareSkillInstallation(f.prepare());

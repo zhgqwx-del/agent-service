@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type ResultSetHeader, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { TenantRestoreJournalPublicationWorker, TenantRuntimeCoordinator } from "@agent-service/core";
@@ -25,7 +26,7 @@ import {
   readTenantTelemetryCaptureCheckpointFromMysql,
   type TenantBackupRuntimeReservation,
 } from "@agent-service/store";
-import { skillRegistryFingerprintStatement } from "../../../packages/store/src/mysql/skills-registry.js";
+import { readMysqlSkillRegistryFingerprintStatements } from "../../../packages/store/src/mysql/skills-registry.js";
 import {
   createTenantBackupCatalogAdapter,
   loadTenantBackupCatalogConfig,
@@ -52,10 +53,10 @@ function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-/** Current full trigger authority is 0060; 0059's original schema remains independently exact. */
+/** The exact applied marker selects the current trigger root; 0059's schema stays independently exact. */
 async function assertCurrentByokSchema(connection: Connection, triggersOk: 0 | 1): Promise<void> {
-  const [currentSql, responsibilitySql] = await Promise.all([
-    readFile(new URL("../../../packages/store/migrations/0060_skill_registry.sql", import.meta.url), "utf8"),
+  const [{ schema, triggers }, responsibilitySql] = await Promise.all([
+    readMysqlSkillRegistryFingerprintStatements(connection, fileURLToPath(new URL("../../../packages/store/migrations/", import.meta.url))),
     readFile(new URL("../../../packages/store/migrations/0059_credential_responsibility.sql", import.meta.url), "utf8"),
   ]);
   const start = "-- agent-service-runtime-fingerprint:tenant-credential-responsibility-schema:start";
@@ -68,8 +69,6 @@ async function assertCurrentByokSchema(connection: Connection, triggersOk: 0 | 1
   if (!responsibilitySchema.startsWith("SET @credential_responsibility_schema_ok=") || responsibilitySchema.includes(";")) {
     throw new Error("byok_fixture_schema_fingerprint_invalid");
   }
-  const schema = skillRegistryFingerprintStatement(currentSql, "schema");
-  const triggers = skillRegistryFingerprintStatement(currentSql, "triggers");
   await connection.query("SET @byok_fixture_previous_gcml=@@SESSION.group_concat_max_len");
   try {
     await connection.query("SET SESSION group_concat_max_len=1048576");

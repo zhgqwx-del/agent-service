@@ -1,6 +1,6 @@
 # agent-service
 
-> 当前开发（2026-10-17）：受管 skills 包的本地门禁已按失败/影响范围分段收口：历史53文件329项、cluster/build/开发态VM、脚本6文件532项、两BYOK场景及S3尾部9文件42项/源码装配均有通过证据。原主失败、原S3失败与未产出coverage的事实不改，不拼一次完整verify绿；最终SHA的完整CI仍待，当前尚未发布。精确证据见[PROGRESS末节](docs/PROGRESS.md)，合同见[skills设计第6节](docs/design/07-skills.md)。
+> 发布前快照（2026-10-17）：受管 skills main `d74f7fa` 的[CI39048326358](https://github.com/zhgqwx-del/agent-service/actions/runs/39048326358)因不同 owner 并发创建的真实 MySQL 1213 失败。已复现原生 record-lock 环，新增前向迁移 `0061`，不改已发布 `0060` 或加自动重试；隔离定向纯163、skills MySQL13、授权边界5、历史升级8、skills S3 1及完整备份21项均通过，构建/SDK/四CLI/真实S3装配亦通过。最终提交CI仍须验收，不以分段结果宣称一次全量通过。原失败保留，精确发布状态见[PROGRESS末节](docs/PROGRESS.md)及[skills设计第6节](docs/design/07-skills.md)。
 
 > 已发布基线：`ad92ed0eb8aa52d80b95db05ea13ac2c82dbfb32` 的[CI39027150157](https://github.com/zhgqwx-del/agent-service/actions/runs/39027150157)五个job全部通过，下载Linux VM字节也已独立核验。它只背书此前受限MCP/静态skills/有限hooks包，不背书当前新增注册能力。完整M3/M4、M1冻结和生产仍未完成；旧失败证据保留。
 

@@ -1,6 +1,6 @@
 # agent-service 协作约定
 
-> 当前实际工作（2026-10-17）：skills本地门禁已分段收口；94376真实exit0，尾部9文件42项与source assembly通过并独立审计。原主5322/2/87、无coverage及原S3失败保留，不拼一次完整verify绿；完整21项备份文件仍须最终CI。当前无live测试、未commit/push/新CI，下一集中提交main并等exact-SHA全部Checks。root唯一执行，作者仅静态，不重复已过长矩阵；不读.env/不触业务库与真实云，不改旧33域/receipt/completion，registry物理生命周期P2。
+> 发布前实际快照（2026-10-17）：skills main `d74f7fa` 的CI39048326358已terminal failure，唯一1213已实证为跨owner的原生record-lock环。0061前向迁移已隔离校准，九guard只增索引前筛、原安全残余及0060字节不改；marker严格单根，部分DDL/marker-loss拒绝自动续跑。env-free冻结820文件下pure163、skills MySQL13（原12全保留）、grant5、历史8、skills S3 1、完整backup21及source装配通过，type/API/build/SDK/四CLI亦通过，独立review无确定P0–P2；最终提交完整CI仍须验收。root唯一执行，作者只写/静态；不重试、放宽并发oracle或改预算。原失败/无coverage不改绿，旧33域/receipt/defaultoff/completion及registry生命周期P2不变，不读.env/不触业务库或云；下一MCP实现待本包发布收口。实时提交/CI终态只看PROGRESS顶部及末节。
 
 > 已发布验收基线（2026-10-17）：main `ad92ed0` 的CI39027150157五job全部success且core/history/下载VM bytes独立核验完成，没有live watch。受限MCP/静态skills/有限hooks包闭合，不代表新增skills、完整M3/M4或生产完成；旧三次失败和保留库不改写。当前新skills实证只认本页顶部及PROGRESS末节。
 
@@ -27,7 +27,7 @@
 - 多轮相关且已定向验证的修改形成 coherent 功能包，冻结后做一次完整 `verify` 及相关 `verify-s3`；独立历史、S3、cluster、SDK、实际 bundle/VM 门禁不省略。
 - 完整运行失败时保留原报告和其中已通过的结果，只修缺陷、复验失败及受影响范围，并补剩余门禁；分段结果不拼成一次全量成功。最终发布证据必须对应实际源码/提交。
 - 较大阶段集中提交推送一次并等最终 SHA 的完整 CI，不为小补丁反复 push/取消长 CI；不降低 coverage 阈值、放大 deadline、跳过用例或泛化错误 oracle。
-- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。ad92完整CI基线证明required170 unique/75groups、历史52；当前skills登记required185 unique/75groups、历史53，登记不是本次主套件全绿证明，最终CI须逐文件核验。root统一test/build/DB/Git，author冻结后不擅改。
+- 主 coverage 的具名 group 只从同次独占 JSON 出具子集证明，不重复计数。ad92完整CI基线证明required170 unique/75groups、历史52；当前skills/0061登记required185 unique/75groups、历史54，登记不是本次主套件全绿证明，最终CI须逐文件核验。root统一test/build/DB/Git，author冻结后不擅改。
 
 ## 不变的安全与交付边界
 

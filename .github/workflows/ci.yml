@@ -584,6 +584,7 @@ jobs:
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0058_tenant_telemetry_capture_repeat_restore.sql'" | grep -Fxq 1
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0059_credential_responsibility.sql'" | grep -Fxq 1
             mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0060_skill_registry.sql'" | grep -Fxq 1
+            mysql -h 127.0.0.1 -uroot agent_service -Nse "SELECT COUNT(*) FROM schema_migrations WHERE name = '0061_skill_registry_native_lookup.sql'" | grep -Fxq 1
             # Exercise the production-safe one-time bootstrap path. Do not weaken the production
             # guard by injecting BOOTSTRAP_API_KEY. The secret is read from the create-only 0600
             # file inside the container and must never be present in docker logs.

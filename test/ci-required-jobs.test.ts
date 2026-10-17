@@ -239,7 +239,10 @@ const CORE_COMMANDS = ["pnpm run test:coverage", "pnpm run test:blob-s3", "pnpm 
   'pnpm run check:vm-release --artifacts "$RUNNER_TEMP/agent-service-vm-releases"',
   "pnpm run check:blob-storage-migrate-artifact", "pnpm run check:restore-ledger-reconcile-artifact",
   "pnpm run check:telemetry-capture-artifact", "pnpm run check:backup-catalog-artifact", "pnpm run test:app-s3-smoke"];
-const SKILL_REGISTRY_IMAGE_MARKER = "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0060_skill_registry.sql'\" | grep -Fxq 1";
+const SKILL_REGISTRY_IMAGE_MARKERS = [
+  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0060_skill_registry.sql'\" | grep -Fxq 1",
+  "mysql -h 127.0.0.1 -uroot agent_service -Nse \"SELECT COUNT(*) FROM schema_migrations WHERE name = '0061_skill_registry_native_lookup.sql'\" | grep -Fxq 1",
+] as const;
 
 /** Deliberately NOT a YAML parser: close this repository's fixed indentation/layout.
  * New YAML forms require reviewing this grammar, not silently ignoring control keys. */
@@ -298,12 +301,14 @@ function assertWorkflow(source: string, version: string) {
   const matrix = section(image.lines, "strategy", 4).filter(meaningful);
   if (JSON.stringify(matrix) !== JSON.stringify(["      matrix:", "        app: [agent-runner, agent-router]"])) invalidWorkflow();
   if (fieldsAt(blocksAt(section(image.lines, "services", 4), 6).find((entry) => entry.name === "mysql")!.lines, 8).get("image") !== "mysql:8.0") invalidWorkflow();
-  const imageSmoke = exactCommand(steps(image), SKILL_REGISTRY_IMAGE_MARKER);
-  const markerIndex = imageSmoke.run.indexOf(SKILL_REGISTRY_IMAGE_MARKER);
-  const runnerBranchIndex = imageSmoke.run.lastIndexOf('if [ "${{ matrix.app }}" = "agent-runner" ]; then', markerIndex);
-  if (imageSmoke.fields.get("name") !== "Run the container and reach it from outside"
-    || imageSmoke.run[0] !== "set -euo pipefail" || runnerBranchIndex < 0
-    || !imageSmoke.run.slice(runnerBranchIndex + 1, markerIndex).every((line) => line.startsWith("mysql "))) invalidWorkflow();
+  const imageSteps = steps(image), imageSmoke = exactCommand(imageSteps, SKILL_REGISTRY_IMAGE_MARKERS[0]);
+  for (const marker of SKILL_REGISTRY_IMAGE_MARKERS) {
+    const markerIndex = imageSmoke.run.indexOf(marker);
+    const runnerBranchIndex = imageSmoke.run.lastIndexOf('if [ "${{ matrix.app }}" = "agent-runner" ]; then', markerIndex);
+    if (exactCommand(imageSteps, marker) !== imageSmoke || imageSmoke.fields.get("name") !== "Run the container and reach it from outside"
+      || imageSmoke.run[0] !== "set -euo pipefail" || runnerBranchIndex < 0
+      || !imageSmoke.run.slice(runnerBranchIndex + 1, markerIndex).every((line) => line.startsWith("mysql "))) invalidWorkflow();
+  }
   const gateFields = fieldsAt(gate.lines, 4);
   if (!/^(?:\$\{\{\s*)?always\(\)(?:\s*\}\})?$/.test(gateFields.get("if") ?? "")
     || gateFields.get("needs") !== "[test-core, test-history, image]") invalidWorkflow();
@@ -335,11 +340,11 @@ describe("repository CI job split cannot skip required work", () => {
     expect(scalar(env(core, coverage).get("MYSQL_TEST_URL"))).toBe("mysql://root@127.0.0.1:3306/agent_service_test");
     expect(scalar(env(core, coverage).get("REDIS_TEST_URL"))).toBe("redis://127.0.0.1:6379/1");
   });
-  it("requires the exact skills migration marker check inside the actual runner image smoke", () => {
+  it.each(SKILL_REGISTRY_IMAGE_MARKERS)("requires the exact skills marker inside the actual runner image smoke: %s", (marker) => {
     const image = blocksAt(section(workflow.split(/\r?\n/), "jobs", 0), 2).find((job) => job.name === "image")!;
-    const smoke = exactCommand(steps(image), SKILL_REGISTRY_IMAGE_MARKER);
+    const smoke = exactCommand(steps(image), marker);
     expect(smoke.fields.get("name")).toBe("Run the container and reach it from outside");
-    const changed = workflow.replace(`            ${SKILL_REGISTRY_IMAGE_MARKER}\n`, "");
+    const changed = workflow.replace(`            ${marker}\n`, "");
     expect(changed).not.toBe(workflow);
     expect(() => assertWorkflow(changed, nodeVersion)).toThrow();
   });

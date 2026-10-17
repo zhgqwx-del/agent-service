@@ -1,6 +1,6 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
-> 受管 skills 候选（2026-10-17，未发布验收）：`0060` 独立 metadata/对象包、不可变版本/CAS、platform/tenant/user 与已挂载名的 request version override、安装 guard、Host 双调用、独立 user 导出与逻辑删除已实际落代码，合同见 [07 第6节](07-skills.md)。纯定向、真实 MySQL/Fs HTTP 及 MySQL/MinIO 双客户端已有分段通过，完整验收仍以 PROGRESS 末节为准；旧受限包的 CI 不背书此候选。它内嵌既有 router/runner，仍两服务/六入口/两镜像，不增加技能微服务；物理 purge/迁移/恢复及完整 M3/M4/生产不因此完成。
+> 受管 skills 候选（2026-10-17，未发布验收）：`0060` 独立 metadata/对象包、不可变版本/CAS、platform/tenant/user 与已挂载名的 request version override、安装 guard、Host 双调用、独立 user 导出与逻辑删除已实际落代码，合同见 [07 第6节](07-skills.md)。`d74f7fa` CI 的跨 owner 原生记录锁环由前向迁移0061收窄九个 point guard 查找修复，0060字节与原安全残余不改；真实 MySQL13及历史8等本地定向通过，最终提交CI仍须验收。旧受限包的 CI 不背书此候选。它内嵌既有 router/runner，仍两服务/六入口/两镜像，不增加技能微服务；物理 purge/迁移/恢复及完整 M3/M4/生产不因此完成。
 
 > M3 本地增量（2026-10-17，发布状态看当前main Checks）：固定匿名HTTP MCP、owner-scoped静态Markdown skills、固定operator工具前策略/提交后观察已有受限实现；合同见 [06](06-mcp.md)、[07](07-skills.md)、[08](08-tool-hooks.md)，分段证据见PROGRESS。这不是完整动态注册/OAuth、三级skills包或任意插件平台。它们内嵌runner；router只公开API/全部configured fleet能力交集，仍两常驻服务、六产品入口、两镜像，不新增微服务。
 

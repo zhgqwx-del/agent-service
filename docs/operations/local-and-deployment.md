@@ -1,6 +1,6 @@
 # 本地运维与后续部署契约
 
-> 受管 skills 注册包候选（2026-10-17，优先于下方历史候选状态）：本包尚未提交、未完成整包验收，默认 `SKILL_REGISTRY_ENABLED=0`。只有验收后才可在全新隔离本地 MySQL 库与独占 Blob namespace 手动启用；不要把现业务 `MYSQL_URL` 交给带自动迁移的 runner。它不增加服务、入口、CLI 或镜像；合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)，隔离体验步骤见[学习指南](development-and-ci-guide.md#受管-skills-注册包验收后的隔离体验)。下方旧提交/失败证据保留，不替代当前候选或最终 SHA CI。
+> 受管 skills 注册包发布前快照（2026-10-17，优先于下方历史候选状态）：`d74f7fa` CI 唯一失败为不同新 owner prepare 的真实 1213 记录锁环；0061 forward-only 修复已本地校准和定向通过，仍须最终 SHA CI，不能以本地快照宣称发布完成，默认 `SKILL_REGISTRY_ENABLED=0`。只有验收后才可在全新隔离本地 MySQL 库与独占 Blob namespace 手动启用；不要把现业务 `MYSQL_URL` 交给带自动迁移的 runner。它不增加服务、入口、CLI 或镜像；合同见 [skills 设计第 6 节](../design/07-skills.md#6-受管注册包候选独立版本域)，隔离体验步骤见[学习指南](development-and-ci-guide.md#受管-skills-注册包验收后的隔离体验)，精确发布状态见 [PROGRESS](../PROGRESS.md)。下方旧提交/失败证据保留，不替代最终 SHA CI。
 
 > M3 受限切片配置（2026-10-17）：MCP、静态skills、tool hooks各自使用默认关闭的operator配置，随runner发布，须whole-fleet停服排空后统一变更。参见 [MCP](../design/06-mcp.md)、[skills](../design/07-skills.md)、[hooks](../design/08-tool-hooks.md)。它们不增加服务或镜像；hook key只由独立受保护文件提供，不写入环境JSON。本地分段不能代替当前SHA发布门禁，更不是云/生产启用验收；精确证据看PROGRESS，发布状态核对当前main Checks。
 
@@ -108,6 +108,8 @@ systemd模板仅提供Linux非root样例：手工核对专用账号、Node24绝�
 ### 受管 skills 的隔离启用边界（候选，验收后使用）
 
 `SKILLS_ENABLED` 仍控制旧 operator 静态 mount；新 `SKILL_REGISTRY_ENABLED` 在 router/runner 各自默认 `0`，两者不能互相代替。`0060` 是独立 metadata 域，包只接收一个不超过 64 KiB UTF-8 的 `SKILL.md`，不执行脚本或抓取引用。升级要求关闭 gate、全部旧 writer 停服排空、独立迁移并核对严格指纹，再运行统一新版本；禁止热混跑、删 marker/guard 或让普通启动自动修复业务库。
+
+0061 rollout 必须完整排空 pre-0061 writer 后独立迁移。0060 原 SQL 字节不变；0061 的 9 个 point guard 仅增可索引 PK/unique 等值前筛，保留全部原 BINARY/NULL/owner/active/fence 安全残余，仍为 5 表/20 registry guard、全库 763 trigger。迁移核旧完整根、临时 deny 保护轮换、清除临时 guard 后核新完整根再写 marker；启动只按实际 marker 选择单一 trigger 根，schema 仍核 0060。partial DDL/marker-loss 一律拒启动、不自动续 DDL，只能 forward-fix。本地真实 MySQL 13 项保留原 12 项并增加固定 foreign-record-lock 回归，非空 0060→0061 与 0059→current 历史各 4 项通过，未增加 retry 或超时；这些不替代最终 SHA CI。
 
 验收后的首次体验须由操作者确认一个此前不存在的新可丢弃数据库和独占 Blob namespace，使用受保护配置，不回显 DSN/key/token。filesystem 模式还需显式 `BLOB_FILESYSTEM_SINGLE_RUNNER=1`、`BLOB_NAMESPACE_ID` 与私有目录，router configured runner 数量恰好为一，production 拒绝；ID 只是一项 operator 声明，不证明跨 VM 的物理共享。多 runner 走已有受控共享 S3 namespace/control，router 对全部 configured 地址做 fresh capability/storage identity 核对；缺配置、旧版本、不健康实例或 namespace 分歧均拒绝，不选 healthy subset 降级。云 IAM/TLS/容量与实际预发/生产验收待资源，不在这里生成云参数。
 

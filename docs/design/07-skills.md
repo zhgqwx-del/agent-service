@@ -1,6 +1,6 @@
 # M3 skills：静态挂载与受管注册包
 
-> 当前候选（2026-10-17，未发布验收）：下述静态挂载是已通过 ad92 CI 的初始范围；新增受管注册包的产品代码和测试已落，边界见第 6 节。纯定向 14 文件 352 项及类型检查通过，0060 已在隔离真实 MySQL 校准；真实纵向、历史升级与整包验收仍待。不能以旧静态切片的 CI 背书新增注册能力。
+> 当前候选（2026-10-17，发布前快照）：下述静态挂载是已通过 ad92 CI 的初始范围；受管注册包已有真实纵向与历史分段证据。`d74f7fa` 的 CI 唯一失败为不同新 owner 并发 prepare 的 1213，真实锁图确认是 owner/subject 索引记录的 S/X 锁环，不是 gap。`0061` forward-only 修复已完成本地校准和受影响定向，仍须最终 SHA CI；rollout 见第 6 节，精确发布状态见 [PROGRESS](../PROGRESS.md)，不能用此本地快照替代发布验收。
 
 状态：本地受限切片已实现，真实regular文件、协议/配置、Memory/Host、真实MySQL提交时序/停服冷读及plain-Node调用均已有分段验证；整合检查点25d0e6a的正式MySQL纵向再次通过。共享Principal语法保留合法Unicode tenant，129字符及非法UserId仍拒绝。完整发布状态只认当前main exact-SHA CI，精确证据看 [PROGRESS](../PROGRESS.md)。本节不表示整体M3、生产或完整生命周期验收完成。
 
@@ -99,7 +99,7 @@ session 代建仍按实际 session owner 解析。override 进入请求幂等 ha
 
 registry 操作含 export 在显式 S3 I/O settlement scope 中保留 provider 租约，原请求/响应流超时后仍等待底层 SDK、迟到 Body 和实际 reader 结清，`close()` 不提前报告排空。不同 scope 不全局串行，原非 scope S3 请求期限与全局 close 不变。底层不响应取消可能使排空超期；本地结清不证明远端 mutation 已取消或回滚，仍需精确 staging/replay 协议。
 
-slot 的 revision/generation 永久保留。`expectedRevision=0` 只允许从未存在的 slot；删除/重建须精确当前 revision，旧 generation 的 stage、版本和 replay 不得复活。Memory 采用完整图片的单次原子发布；新 registry MySQL 事务采用 RC + exact owner-control X 锁串行所有同 owner 读写，子行仍为 current locking reads，避免不同 owner 空区间的 RR gap 死锁。旧 M1 的 RR 事务不改。mutation 的 DB time 在 owner 锁等待后采样；1205/1213 只返回固定可重试 503，不自动重试或回显 SQL。
+slot 的 revision/generation 永久保留。`expectedRevision=0` 只允许从未存在的 slot；删除/重建须精确当前 revision，旧 generation 的 stage、版本和 replay 不得复活。Memory 采用完整图片的单次原子发布；新 registry MySQL 事务采用 RC + exact owner-control X 锁串行所有同 owner 读写，子行仍为 current locking reads。RC 本身不能消除 native trigger 的跨 owner 记录扫描锁环；`0061` 另以精确索引前筛收窄这些查找。旧 M1 的 RR 事务不改。mutation 的 DB time 在 owner 锁等待后采样；1205/1213 只返回固定可重试 503，不自动重试或回显 SQL。
 
 每 owner 最多 256 个 slot、每 slot 最多 128 个版本、全部已 admission 包（包括 stage/历史）累计最多 8 MiB，分页最多 100。未完成 stage 和逻辑删除 bytes 不自动释放该容量；这是当前保守配额，不是物理清理完成证明。
 
@@ -119,6 +119,8 @@ slot 的 revision/generation 永久保留。`expectedRevision=0` 只允许从未
 
 ### 发布与待验收
 
-`0060` 为 expand-only 的 5 表/20 guard，不回填、联网、激活或删除。严格全库 fingerprint 变化要求先关闭 gate、完全排空 pre-0060 writer，再独立迁移并运行新代码；不能热混跑、删 marker/guard，失败只 forward-fix。独立真实升级 fixture 的前态为 SQL-shaped 0059，不冒称冻结旧二进制。
+`0060` 为 expand-only 的 5 表/20 guard，不回填、联网、激活或删除；其已发布 SQL 字节不改。`0061` 仅轮换 9 个 point-relationship guard，为 owner/slot/installation/version 及 lifecycle/fence 查找增加可索引的完整 PK/unique 等值前筛，保留全部原 BINARY、NULL、owner、metadata、active 和 fence 拒绝残余；5 表、20 个 registry guard 与全库 763 trigger 的数量不变。
 
-安装/调用/导出/删除、真实 MySQL 事务与 MySQL+MinIO 双客户端、API/SDK、历史升级和完整门禁需各自实际执行后才验收；当前进度只认 PROGRESS 末节。物理 package purge、namespace 搬迁、backup/restore 覆盖与云环境证据继续明确后置，旧 completion/unknown 和删除授权边界不变。
+升级须关闭 gate、完整停服排空全部 pre-0061 writer，再独立迁移并只启动统一新版本。迁移先核完整 0060 前态，以临时 deny 保护轮换，移除临时 guard 后验证唯一精确新根，最后写 marker；schema 仍按 0060 核验，trigger 严格按实际 marker 选择单一根，不接受任选旧/新根。partial DDL 或 marker-loss 拒绝启动和自动续 DDL，不能热混跑、删 marker/guard 或自动修复，只能受控 forward-fix。
+
+本地已通过保留原 12 项的新版真实 MySQL 13 项，其中新增固定 foreign owner/subject record-lock 回归，不靠重试、概率循环或增加超时；非空原 0060 prefix→0061 历史 4 项及 0059→current 历史 4 项也已通过。历史前态按实际 SQL prefix 与产品生成行证明，不冒称冻结旧二进制。它们是分段证据，不替代尚未完成的新提交/最终 SHA CI；当前进度只认 PROGRESS 末节。物理 package purge、namespace 搬迁、backup/restore 覆盖与云环境证据继续明确后置，旧 completion/unknown、receipt 与 native 恢复边界不变。

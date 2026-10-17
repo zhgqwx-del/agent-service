@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { createSkillPackageAdmission, assertSkillPackageAdmission, createSkillRegistryAccess,
   assertSkillRegistryAccess, validateSkillOwner, SkillRegistryIntegrityError,
   type SkillOwner, type SkillPackageMetadata } from "../src/skills.js";
+import { SKILL_REGISTRY_NATIVE_LOOKUP_TRIGGERS, skillRegistryFingerprintStatement } from "../src/mysql/skills-registry.js";
 
 const owner: SkillOwner = { scope: "user", tenantId: "tenant", userId: "user" };
 const metadata: SkillPackageMetadata = { name: "example", description: "Example", whenToUse: null,
@@ -47,5 +49,44 @@ describe("skill registry closed server admissions", () => {
     let calls = 0;
     const value = { ...owner, get userId() { calls++; throw new Error("secret-canary"); } };
     expect(() => validateSkillOwner(value)).toThrow("skill registry evidence is invalid"); expect(calls).toBe(0);
+  });
+});
+
+describe("0061 native key lookup contract", () => {
+  it("rotates exactly nine point guards without removing any 0060 rejection predicate", async () => {
+    const oldSql = await readFile(new URL("../migrations/0060_skill_registry.sql", import.meta.url), "utf8");
+    const newSql = await readFile(new URL("../migrations/0061_skill_registry_native_lookup.sql", import.meta.url), "utf8");
+    const definitions = (sql: string) => new Map([...sql.matchAll(/^CREATE TRIGGER (\w+) ([^\n]+)$/gm)].map(match => [match[1]!, match[0]]));
+    const oldGuards = definitions(oldSql), next = definitions(newSql);
+    const permanent = [...next.keys()].filter(name => !name.endsWith("_block"));
+    expect(permanent.sort()).toEqual([...SKILL_REGISTRY_NATIVE_LOOKUP_TRIGGERS].sort());
+    const prefixes = [
+      "o.owner_sha256=NEW.owner_sha256 AND ", "i.installation_id=v.installation_id AND ",
+      "v.version_id=NEW.current_version_id AND ", "s.slot_id=NEW.slot_id AND ",
+      "v.version_id=NEW.version_id AND ", "s.slot_id=i.slot_id AND ", "i.installation_id=NEW.installation_id AND ",
+      "t.tenant_id=JSON_UNQUOTE(JSON_EXTRACT(o.owner_json,'$.tenantId')) AND t.subject_id=JSON_UNQUOTE(JSON_EXTRACT(o.owner_json,'$.tenantId')) AND ",
+      "u.tenant_id=JSON_UNQUOTE(JSON_EXTRACT(o.owner_json,'$.tenantId')) AND u.subject_id=JSON_UNQUOTE(JSON_EXTRACT(o.owner_json,'$.userId')) AND ",
+      ...["a", "f", "r"].map(alias => `${alias}.tenant_id=JSON_UNQUOTE(JSON_EXTRACT(o.owner_json,'$.tenantId')) AND `),
+    ];
+    for (const name of SKILL_REGISTRY_NATIVE_LOOKUP_TRIGGERS) {
+      const actual = next.get(name)!;
+      expect(actual === oldGuards.get(name)).toBe(false);
+      const stripped = prefixes.reduce((sql, prefix) => sql.replaceAll(prefix, ""), actual);
+      expect(stripped).toBe(oldGuards.get(name));
+    }
+    expect([...next.keys()].filter(name => name.endsWith("_block"))).toHaveLength(3);
+    expect(newSql.includes("DROP TRIGGER IF EXISTS")).toBe(false);
+    expect(newSql.includes("CREATE TABLE")).toBe(false);
+    expect(newSql.lastIndexOf("DROP TRIGGER trg_skill_registry_native_lookup_")).toBeLessThan(newSql.indexOf("-- agent-service-runtime-fingerprint:skill-registry-triggers:start"));
+    expect(newSql.includes("COUNT(*)=763")).toBe(true);
+    expect(newSql.includes("SUM(trigger_name LIKE 'trg_skill_registry_%')=20")).toBe(true);
+  });
+  it("rejects an uncalibrated or duplicate 0061 post-root rather than accepting the old full root", async () => {
+    const source = await readFile(new URL("../migrations/0061_skill_registry_native_lookup.sql", import.meta.url), "utf8");
+    const start = source.indexOf("-- agent-service-runtime-fingerprint:skill-registry-triggers:start");
+    expect(start).toBeGreaterThan(0);
+    const zero = source.slice(0, start) + source.slice(start).replace(/'[0-9a-f]{64}'/, `'${"0".repeat(64)}'`);
+    expect(() => skillRegistryFingerprintStatement(zero, "triggers")).toThrow(SkillRegistryIntegrityError);
+    expect(() => skillRegistryFingerprintStatement(source + "\n-- agent-service-runtime-fingerprint:skill-registry-triggers:end", "triggers")).toThrow(SkillRegistryIntegrityError);
   });
 });

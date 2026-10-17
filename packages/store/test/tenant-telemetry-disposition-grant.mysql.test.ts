@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -8,7 +9,7 @@ import {
   tenantTelemetryDispositionClaimTokenSha256,
   type TenantTelemetryDispositionAuthorization,
 } from "../src/index.js";
-import { skillRegistryFingerprintStatement } from "../src/mysql/skills-registry.js";
+import { readMysqlSkillRegistryFingerprintStatements } from "../src/mysql/skills-registry.js";
 
 type Row = RowDataPacket;
 const digest = (label: string) => createHash("sha256").update(label).digest("hex");
@@ -270,9 +271,9 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
     it("rejects post-marker trigger body drift on startup", async () => {
       const f = await fixture();
       try {
-        const sql = await readFile(new URL("../migrations/0060_skill_registry.sql", import.meta.url), "utf8");
-        const schema = skillRegistryFingerprintStatement(sql, "schema");
-        const triggers = skillRegistryFingerprintStatement(sql, "triggers");
+        const { schema, triggers } = await readMysqlSkillRegistryFingerprintStatements(
+          f.conn, fileURLToPath(new URL("../migrations/", import.meta.url)),
+        );
         await f.conn.query("SET @grant_drift_test_gcml=@@SESSION.group_concat_max_len");
         try {
           await f.conn.query("SET SESSION group_concat_max_len=1048576");
@@ -293,7 +294,7 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
              BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='tampered'; END`,
           );
           await fingerprint(0);
-          // Fresh 0060 uses its combined trigger root, including this 0037 guard.
+          // The applied current marker selects the combined root, including this 0037 guard.
           // Historical-schema oracles and every dormant grant assertion stay unchanged.
           const startup = MysqlSessionStore.connect({ url: f.url, tenantTelemetryRefKey: REF_KEY })
             .then(async (unexpectedlyOpened) => { await unexpectedlyOpened.close(); });
