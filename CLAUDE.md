@@ -1,6 +1,6 @@
 # agent-service 项目记忆
 
-> 最新发布阻断（2026-10-17）：main abe1f0e第二CI39010411975仍4fail（主5006pass/86预期skip）；OpenAPI过，旧Blob聚合/两Memory期限与SQL RR取证失败。历史325、双image过，后置主门禁未到。仅收口测试确定性，原预算保留；formal SQL7、Memory profile64断言过但后者全局coverage未过，不能拼全量绿。两项预算选择未答不得代选；required170/75只登记，修后仍需exact-SHA完整CI，不重复本地长矩阵或加新能力。
+> 最新发布阻断（2026-10-17）：已推送abe1f0e第二CI39010411975仍4fail（主5006pass/86预期skip），历史325、双image过，后置主门禁未到。用户已批准并落实Blob8独立具名用例各默认30s、仅两完整三epoch Memory用例60s；原断言、其它预算、SQL观察10s、CLI/lease/生产期限不变。formal SQL7及Memory profile64断言已有证据，后者全局coverage未过仍保留；修后定向结果看PROGRESS末节，不能拼全量绿。required170/75只登记，集中提交后仍需exact-SHA完整CI，不再等待已答授权、不重复本地长矩阵或加新能力。
 
 > 当前阶段（2026-10-17）：固定匿名HTTP MCP、静态skills、operator工具hooks已整合，M3有限纵向的本地定向/真实SQL/构建与dist有分段证据；不等于完整M3或生产验收。M1未冻结/M2冻结，先交付本地功能版再必要M4和未完P2。原full失败与两库保留，历史52文件325和cluster28+3已补过，不再重复长套件；最终main exact-SHA CI仍是整包门禁。root唯一执行测试/DB/build/Git，原删除/恢复门禁不变，事实看PROGRESS顶部与末节。
 
@@ -10,7 +10,7 @@
 
 原`5427a8e` full仍为4608pass/10fail/111skip，含25个beforeAll阻断，绝非全量成功或全为预期skip。其失败范围与后置历史/cluster已分段补过；`25d0e6a`上正式MCP/skills/hooks真实MySQL各1项通过，严格cold/提交时序及清理实际执行。新memo曾误吞跨step复用ID，实际15pass/2fail红后按write-ahead item身份窄修，115受影响项过；MCP/skills同类Unicode Principal误拒也实际红后192项过，语法/隔离/ASCII摘要不放宽。类型/API/scan792、build:check与hooks plain-Node双进程通过。所有源身份/重叠/原失败见PROGRESS，最终当前main必须全部CI Checks成功，不借旧CI或拼本地全量绿。
 
-完整时间点事实、原失败及后续分段均保留在`docs/PROGRESS.md`和Git历史，本文只留当前合同。历史夹具需要祖先`24d5ae4`，不得squash丢失；用户只允许R2完整it300秒，single-hop180/CLI120/lease/生产限制和全部断言不变。不自动清理保留的失败制品或扩大数据库删除范围。
+完整时间点事实、原失败及后续分段均保留在`docs/PROGRESS.md`和Git历史，本文只留当前合同。历史夹具需要祖先`24d5ae4`，不得squash丢失；已批准预算例外仅R2完整it300秒、两条完整三epoch Memory it60秒，以及Blob8独立场景拆为具名用例各默认30秒（合计上限高于旧聚合90秒）。single-hop180/SQL观察10/CLI120/lease/生产限制和全部断言不变。不自动清理保留的失败制品或扩大数据库删除范围。
 
 M1 未冻结、M2 冻结、M3 已开始但未完成；默认 off、local-only / production 拒绝、0037 grant 硬拒、0054 original-primary-only destructive、外部删除/自动清理关闭及 completion=false 不变。旧 CP/receipt/descriptor 不重签，unknown 不提升；受保护 exact 32-byte ref key 与 artifact 加密 key 分离，禁止回显或提交。
 

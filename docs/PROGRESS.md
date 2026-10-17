@@ -1,6 +1,6 @@
 # 进度记录
 
-> **最新发布阻断（2026-10-17T08:20Z）**：main `abe1f0e` 第二最终CI39010411975仍failure，主5006pass/4fail/86预期skip；OpenAPI修复过，旧Blob聚合90s/两Memory多跳30s及SQL RR取证失败。历史52/325与双image过，后置主门禁仍未到。当前test-only确定化保原预算，正式SQL7与Memory64断言定向过；Memory profile进程仍因非全项目coverage未达原阈值exit1，不称全量绿。两项预算选择待答，未答不得调整；原失败与分段证据保留，不重跑小时本地主矩阵，详见末节。
+> **最新发布收口（2026-10-17）**：已推送 `abe1f0e` 第二最终CI39010411975仍failure，主5006pass/4fail/86预期skip，历史52/325与双image过，后置主门禁未到。用户已批准并落实Blob8独立具名用例各默认30s、仅两完整三epoch Memory用例60s；原断言、其它预算、SQL观察10s、CLI/lease/生产期限不变。正式SQL7和Memory64断言已有定向证据，修后本轮结果见末节；原Memory profile因非全项目coverage未达原阈值exit1仍保留，不称全量绿。两项授权已答，不再等待；只收口本包并集中提交最终SHA完整CI，不重复小时本地主矩阵或增加能力，原失败与分段证据均保留。
 
 > **最新本地验收记录（2026-10-17T05:20Z，发布前快照）**：MCP/静态skills/有限hooks已整合至功能检查点`25d0e6a`，同SHA正式真实MySQL三纵向各1项通过；类型/API/scan792/build与plain-Node功能调用有分段证据。原full `13160`仍exit1，4608pass/10fail/111skip（25项beforeAll阻断）；失败范围VM134/SQL25已复验，后置完整历史52文件325与cluster28+独立T3g3均exit0且自有资源已清理。严格双VM仅测试签名/非生产；后发现的memo和Principal正确性缺陷均有实际红绿闭合。原报告及两失败库保留，不拼全量绿、不重复长验证。最终发布以当前main exact-SHA的全部GitHub Checks为准；本快照不预填提交后的CI状态，精确证据见末节，旧“正在执行/未合入”均为此前时点。
 
@@ -1910,3 +1910,11 @@ M3最终清单保持远程MCP、Skills和Hooks三个可用端到端包；每个�
 - 为核对测试有效性，只用ignored临时setup/config与原正式RR case作一次mutation诊断；正式test源码SHA仍为`c561752b7132f10550c8c7cdd518438e15674d44f56cdc08896b42e5ad8a0eab`，产品/正式case/预算均不改。临时native seam仅作用于新`agent_service_mtc_test_*`两single-connection facade，在真实exact-run持锁SELECT返回后arm，把两条原生SET TRANSACTION RR改成实际RC；其它SQL与callback真实delegate，不伪造isolation或锁等待元数据。
 - `13900`真实MySQL诊断进程**预期exit1**、11.83秒：barrier acquired、2次实际RR→RC替换、2条actual exact-run SELECT均有计数；唯一selected case精确失败于`READ COMMITTED`不等于`REPEATABLE READ`断言，case9.791秒，不是timeout、startup或注入未生效。其余6项因诊断filter未运行，不能算正式required suite或全量通过；此前正式全7通过另有独立报告。原JSON/log及`rr-probe-negative-20261017-proof.json`保留在`.local-run/`。
 - 独立读报告核实1failed/0passed/6filtered和精确失败消息；首个日志审计未去ANSI故提前拒绝，修解析后只重读同一报告、未重跑测试。新自有库已不存在，对应会话和metadata lock均零，正式源码hash前后一致，工作树没有产品或测试修改。该负控只证明当前RR oracle会拒绝真实错误隔离，不能消除慢CI/聚合预算风险或把原CI改成绿；下一步仍等已有两项选择后集中收口。
+
+## 2026-10-17T08:39Z：两项已获准的测试预算调整及最终CI候选
+
+- 用户已明确回答并批准两项选择，不再等待或重复请求：Blob的8种独立来源从一个聚合90秒it拆成8个具名it.each、每条沿用既有默认30秒（总上限可高于原90秒）；仅Memory完整P1→P2→P3/skip-hop两条it.each用例60秒。其它Memory默认30秒、SQL观察10秒、single-hop180秒、CLI120秒、lease和生产期限不变；此前R2完整双跳300秒例外也不扩散。
+- Blob保持8种arrange的SQL/值/顺序，每项独立fixture完整新建/迁移随机隔离库，保留产品拒绝、直接SQL绕过拒绝、generation 0精确状态与finally清理；其余4项不变。Memory相对392f2b8只有该it.each结尾增加60_000，其它字节不变，先前注入时钟/去重改进保留。根与独立只读复核均未见断言、隔离、事务回滚、真实消费者或关闭语义削弱；没有产品、迁移、依赖、CI配置或发布行为变化。
+- `77731`正式Memory整文件真实**64pass/0fail/0skip**、exit0，85.63秒；两多跳case18.333/13.805秒。`35923`正式Blob真实MySQL整文件**12pass/0fail/0skip**、exit0，113.18秒；8个拆分case各7.719～9.549秒，required驱动确认全部实际执行。每项原finally均完成；只用新随机测试库，不读.env、不访问业务库或启用云/外部对象删除。JSON逐canonical file、非空、全passed及8个唯一场景核对后独占归档`.local-run/m3-ci2-approved-20261017/`，含对应source/report SHA256与startTime；Memory source01abd710、Blob sourcebbb3195c。
+- `19519`类型检查exit0，API生成一致性和secret scan792通过，`git diff --check`无误。此前正式SQL全7正控与真实RC负控证据保持，不为这两处预算/用例组织调整再跑未改的SQL/history/cluster或小时级本地verify；产品字节仍是abe上已真实build:check通过的相同产物，本轮不重建相同字节、不调用付费模型。
+- 当前只把此前确定化候选、真实RC负控记录和本轮已批准调整集中正常提交/push main，保留历史祖先和前两次CI失败；最终提交仍必须等待原完整coverage/floors、required170文件/75组、历史、S3、cluster、build/VM与双image全部Checks，不用本轮76项定向拼全量绿，也不提前填写最终CI通过。M1未冻结/M2冻结/M3有限切片已实现但整体未完/M4主体未完，0037/0054 original-primary-only、旧receipt/unknown/default-off/completion及真实云边界不变。

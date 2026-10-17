@@ -448,7 +448,7 @@ describe("Memory actual repeated full-backup and exact multi-epoch consumers", (
       must(repeatPermits(f3.store).get(p1.receiptSha256)),
       must(f3.store.tenantTelemetryWriteJobs.get(claim3.writeOperationSha256)?.reservation)])).toBe(originalBytes);
     await f3.maintenance.close(); await f2.maintenance.close(); await f1.maintenance.close(); await f1.adapter.close();
-  });
+  }, 60_000);
 
   it("uses CP2 as genesis for a new restore1 failure while preserving old written P1", async () => {
     const f1 = await cutoverFixture(); let now = Date.now() + 1_000; vi.spyOn(Date, "now").mockImplementation(() => now);

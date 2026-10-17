@@ -1,6 +1,6 @@
 # agent-service
 
-> 发布门禁更新（2026-10-17）：main `abe1f0e` 的[第二轮CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39010411975)仍失败：OpenAPI修复已过，主5006通过/4失败/86预期profile跳过；历史325和双镜像通过，但后置主门禁未到。当前只收口旧Blob聚合期限、Memory多跳耗时和SQL锁等待取证，不加能力或重复本地长矩阵；定向结果不拼全量绿。测试预算两项选择待用户确认，未擅改；精确结果与当前候选看PROGRESS末节。
+> 发布门禁更新（2026-10-17）：已推送 `abe1f0e` 的[第二轮CI](https://github.com/zhgqwx-del/agent-service/actions/runs/39010411975)仍失败：OpenAPI修复已过，主5006通过/4失败/86预期profile跳过；历史325和双镜像通过，但后置主门禁未到。用户已批准并落实两项测试调整：Blob的8个独立建库场景拆为具名用例、各沿用默认30秒；仅两条完整三epoch Memory用例60秒。全部断言、其它预算和生产期限不变；SQL锁等待取证也已定向验证。当前只收口本包并集中提交最终CI，不加能力或重复本地长矩阵；定向结果不拼全量绿，精确证据看PROGRESS末节。
 
 > **当前实现（2026-10-17）**：M3 已实现三个受限、默认关闭的本地功能切片：[固定匿名 HTTP MCP](docs/design/06-mcp.md)、[owner-scoped 静态 Markdown skills](docs/design/07-skills.md)、[工具前策略与结果提交后 hooks](docs/design/08-tool-hooks.md)。它们内嵌 runner，不增加服务或镜像；对外 API 仍由 router 暴露。本轮已完成定向、真实 MySQL 停服冷读及实际构建/dist 分段验证；完整发布门禁以[当前 main 的 CI Checks](https://github.com/zhgqwx-del/agent-service/actions/workflows/ci.yml)为准，不预写通过。M1 未冻结、M2 冻结，完整 M3（注册/OAuth、三级 skills 包等）与必要 M4 仍未完成，精确证据见[PROGRESS](docs/PROGRESS.md)。
 

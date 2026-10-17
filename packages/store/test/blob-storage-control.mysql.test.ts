@@ -241,25 +241,25 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
       }
     });
 
-    it("blocks every live or uncompleted foreign backend before publishing generation 1", async () => {
-      const arrangements: Array<(conn: Connection) => Promise<void>> = [
-        (conn) => insertBlob(conn, "live-blob", "filesystem-v1"),
-        (conn) => insertArtifact(conn, "live-artifact", "filesystem-v1"),
-        async (conn) => {
+    // Each independent source gets its own fresh schema and default test budget.
+    const arrangements: Array<{ label: string; arrange: (conn: Connection) => Promise<void> }> = [
+      { label: "live foreign Blob", arrange: (conn) => insertBlob(conn, "live-blob", "filesystem-v1") },
+      { label: "live foreign export artifact", arrange: (conn) => insertArtifact(conn, "live-artifact", "filesystem-v1") },
+      { label: "live foreign export part", arrange: async (conn) => {
           await insertArtifact(conn, "live-part", BACKEND);
           await insertPart(conn, "live-part", "filesystem-v1");
-        },
-        (conn) => insertSnapshotBlob(conn, "legacy-pin", BACKEND, null),
-        (conn) => insertSnapshotBlob(conn, "wrong-pin", "filesystem-v1", NAMESPACE),
-        async (conn) => {
+        } },
+      { label: "unreleased snapshot pin with missing namespace", arrange: (conn) => insertSnapshotBlob(conn, "legacy-pin", BACKEND, null) },
+      { label: "unreleased foreign snapshot pin", arrange: (conn) => insertSnapshotBlob(conn, "wrong-pin", "filesystem-v1", NAMESPACE) },
+      { label: "uncompleted foreign Blob delete", arrange: async (conn) => {
           await insertBlob(conn, "pending-blob", "filesystem-v1", "deleted");
           await conn.query(
             `INSERT INTO blob_delete_outbox
                (blob_id,generation,available_at_ms,attempts,created_at_ms)
              VALUES ('blob-pending-blob',1,1,0,1)`,
           );
-        },
-        async (conn) => {
+        } },
+      { label: "uncompleted foreign export delete", arrange: async (conn) => {
           await conn.query(
             `INSERT INTO user_export_artifact_delete_outbox
                (artifact_id,part_number,request_id,build_generation,deletion_generation,
@@ -269,8 +269,8 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
                      'data_exports/pending-export','upload-pending-export',1,0,1)`,
             ["filesystem-v1", BLOB_STORAGE_FORMAT],
           );
-        },
-        async (conn) => {
+        } },
+      { label: "dead-lettered foreign export delete", arrange: async (conn) => {
           await conn.query(
             `INSERT INTO user_export_artifact_delete_outbox
                (artifact_id,part_number,request_id,build_generation,deletion_generation,
@@ -281,30 +281,29 @@ if (process.env.AGENT_SERVICE_INTEGRATION) {
                      'controlled terminal retry failure',2,1)`,
             ["filesystem-v1", BLOB_STORAGE_FORMAT],
           );
-        },
-      ];
-      for (const arrange of arrangements) {
-        const ctx = await fixture();
-        try {
-          await arrange(ctx.conn);
-          await expect(ctx.store.activateBlobStorageControl(activation()))
-            .rejects.toBeInstanceOf(BlobStorageControlConflictError);
-          await expect(ctx.conn.query(
-            `UPDATE blob_storage_control
+        } },
+    ];
+    it.each(arrangements)("blocks every live or uncompleted foreign backend before publishing generation 1: $label", async ({ arrange }) => {
+      const ctx = await fixture();
+      try {
+        await arrange(ctx.conn);
+        await expect(ctx.store.activateBlobStorageControl(activation()))
+          .rejects.toBeInstanceOf(BlobStorageControlConflictError);
+        await expect(ctx.conn.query(
+          `UPDATE blob_storage_control
                 SET control_generation=1,storage_backend=?,namespace_sha256=?,
                     activated_at_db_ms=1,evidence_sha256=?
               WHERE singleton_id=1`,
-            [BACKEND, NAMESPACE, "f".repeat(64)],
-          )).rejects.toThrow(/inventory conflicts|snapshot conflicts|dead-letter/);
-          expect(await ctx.store.getBlobStorageControl()).toEqual({
-            singletonId: 1,
-            controlGeneration: 0,
-          });
-        } finally {
-          await ctx.close();
-        }
+          [BACKEND, NAMESPACE, "f".repeat(64)],
+        )).rejects.toThrow(/inventory conflicts|snapshot conflicts|dead-letter/);
+        expect(await ctx.store.getBlobStorageControl()).toEqual({
+          singletonId: 1,
+          controlGeneration: 0,
+        });
+      } finally {
+        await ctx.close();
       }
-    }, 90_000);
+    });
 
     it("makes activation and all inventory checks one rollback boundary", async () => {
       const ctx = await fixture();

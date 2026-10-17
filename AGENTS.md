@@ -1,6 +1,6 @@
 # agent-service 协作约定
 
-> 最新发布阻断（2026-10-17）：main abe1f0e第二CI39010411975主5006pass/4fail/86预期skip，OpenAPI过、旧Blob聚合90s/两Memory30s/SQL RR取证失败；历史325与双image过，后置主门禁未到。当前只修测试确定性并保原预算，formal SQL7和Memory64断言已定向过，Memory profile全局coverage未过；两项预算选择未答不得调整。required170/75groups只登记，修后仍须完整CI；不重跑本地小时矩阵或拼分段全绿，详细边界见PROGRESS末节。
+> 最新发布阻断（2026-10-17）：已推送abe1f0e第二CI39010411975主5006pass/4fail/86预期skip，历史325与双image过，后置主门禁未到。用户已批准并落实Blob8独立具名用例各默认30s、仅两完整三epoch Memory用例60s；原断言、其它预算、SQL观察10s、CLI/lease/生产期限不变。此前formal SQL7与Memory64断言已定向过，Memory profile不达全项目coverage仍如实保留；修后定向结果看PROGRESS末节。required170/75groups只登记，最终SHA仍须完整CI；不重复本地小时矩阵、不拼分段全绿、不再等待已回答的授权。
 
 > 当前阶段（2026-10-17）：M3 的固定匿名 HTTP MCP、静态 Markdown skills、固定 operator 工具前策略/提交后 hooks 已实现并完成本地分段验证，详见设计06～08与PROGRESS末节。它们不是完整注册/OAuth、三级 skill 包或插件平台；M1未冻结、M2冻结，完整M3与必要M4仍待。发布是否通过只认当前main exact-SHA Checks，不借6fdb旧CI或拼接本地全量绿。root唯一运行测试、DB、build与Git，作者只写与静态审查；不扩P2、不触业务库/真实云，不解0037/0054/旧receipt/default-off/completion门禁。
 
@@ -12,9 +12,9 @@
 
 ## 验收证据与当前工作
 
-上一完整CI基线为`6fdb63c`。原MCP verify失败与两库保留；失败范围真实MySQL25/VM134已复验，完整历史52文件325、cluster28+T3g3、两次严格实际VM均分段通过。MCP/skills/hooks已整合，`25d0e6a`三正式MySQL纵向各1项通过，停服/cold与清理均执行。memo按真实call item去重、长Unicode tenant按共享Principal语法收口，红绿证据保留。只补受影响门禁，不重启小时级已过主矩阵；最终main须完整coverage/required/history/S3/cluster/build/VM/双image的全部Checks，不把登记169文件/75组当执行证明。详细源身份、边界和报告只看PROGRESS。
+上一完整CI基线为`6fdb63c`。原MCP verify失败与两库保留；失败范围真实MySQL25/VM134已复验，完整历史52文件325、cluster28+T3g3、两次严格实际VM均分段通过。MCP/skills/hooks已整合，`25d0e6a`三正式MySQL纵向各1项通过，停服/cold与清理均执行。memo按真实call item去重、长Unicode tenant按共享Principal语法收口，红绿证据保留。只补受影响门禁，不重启小时级已过主矩阵；最终main须完整coverage/required/history/S3/cluster/build/VM/双image的全部Checks，不把登记170文件/75组当执行证明。详细源身份、边界和报告只看PROGRESS。
 
-每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。仅R2完整双跳it获准300秒，single-hop180、CLI120、lease/生产期限及全部断言不变。
+每次运行的失败、分段、耗时、精确报告和清理状态统一保留在`docs/PROGRESS.md`，不在本约定重复旧“待答/未push/未开始M3”快照。保留历史Git祖先`24d5ae4`供真实旧二进制夹具使用，不能squash丢失；保留失败报告及尚需保留的加密测试制品，不凭目录名广删。已批准的预算例外仅R2完整双跳it300秒、两条完整三epoch Memory it60秒，以及Blob8独立场景拆为具名用例各默认30秒（合计上限高于旧聚合90秒）；single-hop180、SQL观察10、CLI120、lease/生产期限及全部断言不变。
 
 ## 开发与验证节奏
 
