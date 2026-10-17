@@ -27,6 +27,10 @@ export interface RunnerTool {
   kind: ToolKind;
   /** true = ask under `on-request` policy; read-only tools stay auto-allowed under `untrusted` when `readOnly` */
   needsApproval?: boolean;
+  /** Untrusted remote tools cannot opt out through the agent's `never` policy. */
+  mandatoryApproval?: boolean;
+  /** Server-owned grant identity; binds a remote catalog/configuration and the exact owner. */
+  approvalScope?: string;
   readOnly?: boolean;
   /** may run concurrently with other tool calls in the same batch (default true for readOnly tools) */
   concurrencySafe?: boolean;

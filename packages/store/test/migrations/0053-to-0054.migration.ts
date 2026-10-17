@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "../../src/index.js";
 import { derive0054SourcePlan } from "../fixtures/derive0054-fingerprint.js";
+import { installFrozenDependencies } from "./fixtures/frozen-dependencies.js";
 
 const exec = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -104,23 +105,8 @@ async function runFixed(stage: string, file: string, args: string[], cwd: string
 async function copyIsolatedDependencies(checkout: string) {
   const projects = ["packages/core", "packages/protocol", "packages/providers", "packages/sdk",
     "packages/store", "packages/testkit", "apps/agent-router", "apps/agent-runner"];
-  for (const path of ["pnpm-lock.yaml", "pnpm-workspace.yaml", ...projects.map((path) => `${path}/package.json`)]) {
-    if (!(await readFile(join(checkout, path))).equals(await readFile(join(ROOT, path)))) {
-      throw new Error(`frozen 0053 dependency manifest changed: ${path}`);
-    }
-  }
-  const fields = ["name", "private", "type", "version", "engines", "packageManager", "dependencies",
-    "devDependencies", "optionalDependencies", "peerDependencies"];
-  const oldRoot = JSON.parse(await readFile(join(checkout, "package.json"), "utf8")) as Record<string, unknown>;
-  const currentRoot = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as Record<string, unknown>;
-  if (JSON.stringify(fields.map((field) => oldRoot[field] ?? null))
-    !== JSON.stringify(fields.map((field) => currentRoot[field] ?? null))) {
-    throw new Error("frozen 0053 root dependency contract changed");
-  }
-  const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
-  await cp(join(ROOT, "node_modules"), join(checkout, "node_modules"), options);
+  await installFrozenDependencies(ROOT, checkout);
   const linkedProjects = projects.filter((project) => project !== "packages/testkit");
-  for (const project of linkedProjects) await cp(join(ROOT, project, "node_modules"), join(checkout, project, "node_modules"), options);
   const virtualStore = await lstat(join(checkout, "node_modules/.pnpm"));
   if (!virtualStore.isDirectory() || virtualStore.isSymbolicLink()) throw new Error("frozen 0053 dependencies are not isolated");
   const realCheckout = await realpath(checkout);

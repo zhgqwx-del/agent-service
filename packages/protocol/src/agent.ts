@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { externalId, idSchema, Limits } from "./common.js";
 
-/** `untrusted`: every non-read tool needs approval. `on-request`: only tools flagged `needsApproval`. `never`: auto-allow. */
+/** `untrusted`: every non-read tool needs approval. `on-request`: flagged tools. `never`: auto-allow ordinary tools; mandatory untrusted MCP approval still applies. */
 export const ApprovalPolicy = z.enum(["untrusted", "on-request", "never"]);
 export type ApprovalPolicy = z.infer<typeof ApprovalPolicy>;
 

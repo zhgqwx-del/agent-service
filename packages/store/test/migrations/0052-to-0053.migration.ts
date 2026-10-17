@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { installFrozenDependencies } from "./fixtures/frozen-dependencies.js";
 import { emptyUsage, type Item, type Turn } from "@agent-service/protocol";
 import { MysqlSessionStore } from "../../src/index.js";
 import { mkSession, newId } from "../conformance.js";
@@ -44,23 +45,8 @@ async function runFixed(stage: string, file: string, args: string[], cwd: string
 }
 
 async function copyIsolatedDependencies(checkout: string): Promise<void> {
-  const manifests = ["pnpm-lock.yaml", "pnpm-workspace.yaml", ...[
-    "packages/core", "packages/protocol", "packages/providers", "packages/sdk", "packages/store",
-    "packages/testkit", "apps/agent-router", "apps/agent-runner",
-  ].map((path) => `${path}/package.json`)];
-  for (const path of manifests) if (!(await readFile(join(checkout, path))).equals(await readFile(join(ROOT, path)))) {
-    throw new Error(`frozen 0052 dependency manifest changed: ${path}`);
-  }
-  const fields = ["name", "private", "type", "version", "engines", "packageManager", "dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
-  const oldRoot = JSON.parse(await readFile(join(checkout, "package.json"), "utf8")) as Record<string, unknown>;
-  const liveRoot = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as Record<string, unknown>;
-  if (JSON.stringify(fields.map((field) => oldRoot[field] ?? null)) !== JSON.stringify(fields.map((field) => liveRoot[field] ?? null))) {
-    throw new Error("frozen 0052 root dependency manifest changed");
-  }
-  const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
-  await cp(join(ROOT, "node_modules"), join(checkout, "node_modules"), options);
+  await installFrozenDependencies(ROOT, checkout);
   const projects = ["packages/core", "packages/providers", "packages/protocol", "packages/sdk", "packages/store", "apps/agent-router", "apps/agent-runner"];
-  for (const project of projects) await cp(join(ROOT, project, "node_modules"), join(checkout, project, "node_modules"), options);
   const virtualStore = await lstat(join(checkout, "node_modules/.pnpm"));
   if (!virtualStore.isDirectory() || virtualStore.isSymbolicLink()) throw new Error("frozen 0052 dependency store is not isolated");
   const realCheckout = await realpath(checkout);

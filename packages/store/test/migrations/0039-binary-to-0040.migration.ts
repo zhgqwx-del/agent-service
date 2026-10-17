@@ -1,6 +1,6 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -9,6 +9,7 @@ import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "../../src/index.js";
 import { assertNo0054FrozenLegacyFootprint, captureFrozenLegacyColumns } from "./fixtures/frozen-legacy-row-snapshot.js";
+import { installFrozenDependencies } from "./fixtures/frozen-dependencies.js";
 
 const exec = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -60,31 +61,7 @@ function processEnv(temp: string, extra: Record<string, string> = {}): NodeJS.Pr
 }
 
 async function copyInstalledDependencies(oldCheckout: string): Promise<void> {
-  // The frozen revision has the same lockfile and dependency declarations as this checkout.
-  // Reuse its already-installed packages without giving old code access to the real HOME,
-  // pnpm cache, network, or current source packages through workspace symlinks.
-  const frozenLock = await readFile(join(oldCheckout, "pnpm-lock.yaml"));
-  const currentLock = await readFile(join(ROOT, "pnpm-lock.yaml"));
-  if (!frozenLock.equals(currentLock)) throw new Error("frozen 0039 dependency lock changed");
-  for (const manifest of [
-    "pnpm-workspace.yaml", "packages/core/package.json", "packages/protocol/package.json",
-    "packages/providers/package.json", "packages/sdk/package.json", "packages/store/package.json",
-    "packages/testkit/package.json", "apps/agent-router/package.json",
-    "apps/agent-runner/package.json",
-  ]) {
-    const frozen = await readFile(join(oldCheckout, manifest));
-    const current = await readFile(join(ROOT, manifest));
-    if (!frozen.equals(current)) throw new Error(`frozen 0039 dependency manifest changed: ${manifest}`);
-  }
-  const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
-  await cp(join(ROOT, "node_modules"), join(oldCheckout, "node_modules"), options);
-  for (const project of [
-    "packages/core", "packages/providers", "packages/protocol", "packages/sdk",
-    "packages/store", "apps/agent-router", "apps/agent-runner",
-  ]) {
-    await cp(join(ROOT, project, "node_modules"), join(oldCheckout, project, "node_modules"),
-      options);
-  }
+  await installFrozenDependencies(ROOT, oldCheckout);
   const virtualStore = await lstat(join(oldCheckout, "node_modules/.pnpm"));
   if (!virtualStore.isDirectory() || virtualStore.isSymbolicLink()) {
     throw new Error("frozen 0039 dependency store is not self-contained");

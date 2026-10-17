@@ -1,8 +1,10 @@
 # agent-service
 
+> **当前事实（2026-10-16）**：收口包已发布 main `6fdb63c`，[最终 CI 五项全绿](https://github.com/zhgqwx-del/agent-service/actions/runs/38929175733)：主4420、历史325、S3 85、cluster28加独立T3g3通过，双镜像与VM通过。随后在该版完成无.env、无付费模型的真实双服务隔离体验（11.424秒，鉴权、CRUD、turn/SSE、owner隔离、seq回放及落盘，自有资源已清）。现 `codex/m3-mcp`开始M3.1a operator-only/no-auth/modern HTTP MCP候选，尚未发布或完成M3。M1未冻结/M2冻结，注册/OAuth、skills/hooks、必要M4仍待。下方整合候选记录均为此前时点；详见[PROGRESS](docs/PROGRESS.md)与[MCP增量合同](docs/design/06-mcp.md)。
+
 > 开发顺序更新（用户确认，2026-10-16）：长期M1～M4全架构目标不缩减。先只修当前功能包的发布阻断，补齐剩余门禁并等待最终SHA CI；随后尽早本地手动体验，推进M3 MCP/skills/hooks真实纵向（安全随功能），再补必要M4本地可验的发布/迁移/运行、基础quota与观测；完整生命周期/灾备列为后续P2，真实云验收待资源。M1仍未闭环/未冻结、M2冻结、M3当前尚未开始，但不再要求M1全部闭环才能启动M3。可本地运行的功能版不等于全架构或生产完成；原安全边界及已完成代码/native WIP保留，详见[PROGRESS](docs/PROGRESS.md)。
 
-## 当前本地整合候选（2026-10-16，失败范围已分段复验）
+## 此前整合候选记录（历史时点，最终发布状态以上方为准）
 
 最新本地收口（2026-10-16T16:02Z）：用户批准仅R2完整双跳300秒后，clean `1e21d20` 的正式真实MySQL/MinIO整文件 **2 passed / 0 failed / 0 skipped**，单跳55.923秒、双跳187.924秒，包含最终cold与cleanup；本次专属base及3空桶清理完成。single-hop180/CLI120/lease/生产限制与全部断言不变，无.env或真实模型调用。本包已完成失败受影响复验及剩余本地分段门禁；原全量失败保留，不拼成本地一次全绿。发布仍必须核对最终main提交的全部GitHub Checks，不能用旧CI替代；下方待答/待复验为此前时点，精确证据见PROGRESS末节。
 

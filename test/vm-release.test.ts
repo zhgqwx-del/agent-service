@@ -141,6 +141,7 @@ function setField(value: unknown, path: readonly string[], replacement: unknown)
 }
 const snapshotRootInputs = ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "tsconfig.base.json", "tsconfig.json",
   "Dockerfile", ".dockerignore", "scripts/build-app.mjs", "scripts/package-vm-release.mjs", "scripts/lib/vm-release.mjs",
+  "scripts/lib/bundled-dependency-policy.mjs",
   "scripts/vm-release-tool.mjs", "scripts/package-vm-transport.mjs", "scripts/lib/vm-release-archive.mjs",
   "scripts/lib/vm-release-signature.mjs", "scripts/lib/vm-release-signed.mjs",
   "deploy/vm/agent-runner.service.template", "deploy/vm/agent-router.service.template"] as const;

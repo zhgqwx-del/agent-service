@@ -1,7 +1,9 @@
 // Main-profile files previously enforced by the broad checker or equivalent named commands.
 // S3, historical migration, cluster and actual artifact checks remain independent profiles.
 export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
+  "test/build-dependency-policy.test.ts",
   "apps/agent-router/test/app.test.ts",
+  "apps/agent-router/test/registry.test.ts",
   "apps/agent-router/test/config.test.ts",
   "apps/agent-router/test/ordinary-session-usage-retention.test.ts",
   "apps/agent-router/test/persisted-provider-capture.test.ts",
@@ -12,6 +14,9 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "apps/agent-runner/test/cli-entrypoint.test.ts",
   "apps/agent-runner/test/config.test.ts",
   "apps/agent-runner/test/credential-responsibility-http.test.ts",
+  "apps/agent-runner/test/mcp-config.test.ts",
+  "apps/agent-runner/test/mcp-vertical.test.ts",
+  "apps/agent-runner/test/mcp-vertical.mysql.test.ts",
   "apps/agent-runner/test/mysql-backup-artifact.unit.test.ts",
   "apps/agent-runner/test/mysql-backup-artifact-source-observer.test.ts",
   "apps/agent-runner/test/ordinary-session-delete-grace-recovery.mysql.test.ts",
@@ -32,6 +37,11 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/core/test/erasure-worker.mysql.test.ts",
   "packages/core/test/host-persisted-provider-failure.test.ts",
   "packages/core/test/host.test.ts",
+  "packages/core/test/host-mcp.test.ts",
+  "packages/core/test/host-mcp-grant-recovery.test.ts",
+  "packages/core/test/mcp-http.test.ts",
+  "packages/core/test/mcp-service.test.ts",
+  "packages/core/test/mcp-sdk-compat.test.ts",
   "packages/core/test/ordinary-session-delete-grace-recovery.test.ts",
   "packages/core/test/ordinary-session-usage-retention-worker.test.ts",
   "packages/core/test/persisted-provider-capture-worker.test.ts",
@@ -52,6 +62,7 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
   "packages/store/test/blob-storage-control.mysql.test.ts",
   "packages/store/test/commit-concurrency.mysql.test.ts",
   "packages/store/test/credential-responsibility.test.ts",
+  "packages/store/test/frozen-dependencies.test.ts",
   "packages/store/test/credential-responsibility.memory.test.ts",
   "packages/store/test/tenant-credential-responsibility.mysql.test.ts",
   "packages/store/test/erasure-catalog.mysql.test.ts",
@@ -149,6 +160,17 @@ export const REQUIRED_COVERAGE_TEST_FILES = Object.freeze([
 // Preserve the removed named-command -> exact files mapping as visible proof groups.
 // Overlapping groups never add duplicate cases to the unique-file execution total.
 export const REQUIRED_COVERAGE_GROUPS = Object.freeze({
+  "test:mcp": [
+    "packages/core/test/mcp-http.test.ts",
+    "packages/core/test/mcp-service.test.ts",
+    "packages/core/test/mcp-sdk-compat.test.ts",
+    "packages/core/test/host-mcp.test.ts",
+    "packages/core/test/host-mcp-grant-recovery.test.ts",
+    "apps/agent-runner/test/mcp-config.test.ts",
+    "apps/agent-runner/test/mcp-vertical.test.ts"
+  ],
+  "test:mcp-mysql": ["apps/agent-runner/test/mcp-vertical.mysql.test.ts"],
+  "test:frozen-dependencies": ["packages/store/test/frozen-dependencies.test.ts"],
   "test:mysql-backup-source-observer": [
     "apps/agent-runner/test/mysql-backup-artifact-source-observer.test.ts",
     "apps/agent-runner/test/tenant-restore-journal-config.test.ts"

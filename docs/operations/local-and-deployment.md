@@ -1,5 +1,7 @@
 # 本地运维与后续部署契约
 
+> 当前状态（2026-10-16，优先于下方历史候选说明）：已发布 main `6fdb63c` 的五项 CI 全绿，隔离本地体验完成；当前工作树的 M3.1a MCP 尚为未发布候选，不能借旧 CI 背书。部署仍是 router/runner 两个独立服务，提供 OS/架构匹配、含 Node 生产依赖的 VM 目录包及两个容器镜像；不是 Windows/Linux 系统镜像或单文件原生二进制。云资源、生产信任根及真实环境验收仍待用户提供；MCP 不新增长期服务或产品入口，默认关闭，配置/完整未完范围见 [MCP 设计](../design/06-mcp.md)。
+
 > M4本地并发基线候选（2026-10-15，未发布）：`benchmark:runner`复用实际runner dist、真实新隔离MySQL和自有Redis/FakeVendor，1000/1000正常turn、双峰值1000、持久化对账和清理通过；修复了压测复现的RR缺键INSERT死锁，保留原owner/回滚/来源门禁。不新增服务、产品入口或镜像，不使用.env/真实模型，不是持续负载、Linux CI或生产容量验收。运行命令、报告及限制见[压测学习材料](runner-load-benchmark.md)，精确源版本和证据见PROGRESS末节。
 
 > CI并行候选（2026-10-15）：完整历史迁移移至独立runner/自有MySQL与Redis，主套件和两个image不删减，原名`test`只在全部成功时通过，预算不变。67eaa2d全量exit1及原构建失败原因未知的记录保留；只定向修复、复验失败部分并补后置，未重启整轮。最新1d3be15的T3g、SDK/六入口、实际双VM包均通过，开发profile未执行签名；分段不是新全量或Linux CI通过证明。部署拓扑、六入口/两服务/两镜像及默认关闭门禁不变；最终exact SHA的五个CI检查和实测收益以[PROGRESS](../PROGRESS.md)为准，流程见[CI学习材料](development-and-ci-guide.md#8-github-actions-构建与验证)。

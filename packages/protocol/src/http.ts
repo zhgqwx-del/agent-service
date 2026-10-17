@@ -204,9 +204,8 @@ const DisabledExtensionIds = z.array(externalId).max(0).default([]).describe(
 export const AgentDefinitionResponse = AgentDefinition.extend({
   instructions: z.string().max(200_000),
   tools: z.array(externalId),
-  // Older runners accepted these reserved fields. Keep responses compatible with persisted records,
-  // while current create/update requests below require them to be empty until M3 is enabled.
-  mcpServers: z.array(externalId).describe("Persisted extension ids; inactive while capabilities.mcp is empty."),
+  // Keep historical response records compatible; current requests use the bounded mount grammar.
+  mcpServers: z.array(externalId).describe("Operator-configured MCP server ids; checked for the actual session owner."),
   skills: z.array(externalId).describe("Persisted skill ids; inactive while capabilities.skills is false."),
   limits: Limits,
   approvalPolicy: ApprovalPolicy,
@@ -393,7 +392,9 @@ export type UsageListResponse = z.infer<typeof UsageListResponse>;
 // ---------- request aliases (kept here to make the complete HTTP surface discoverable) ----------
 
 export const AgentDefinitionRequest = AgentDefinitionInput.extend({
-  mcpServers: DisabledExtensionIds,
+  mcpServers: z.array(z.string().regex(/^[A-Za-z0-9_-]{1,64}$/)).max(8)
+    .refine((ids) => new Set(ids).size === ids.length, "MCP server ids must be distinct")
+    .default([]).describe("Requires configured MCP support. Only exact operator-authorized mounts are executable; no registration or credentials are accepted here."),
   skills: DisabledExtensionIds,
 });
 export const ApiKeyCreateRequest = CreateApiKeyRequest;

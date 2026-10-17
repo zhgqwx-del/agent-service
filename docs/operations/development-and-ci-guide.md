@@ -1,5 +1,15 @@
 # 本地开发、手动体验与 CI 构建指南
 
+> 当前状态（2026-10-16，优先于下方历史检查点）：已发布 main `6fdb63c` 的最终 CI 五项全绿，已自动完成独立 router/runner/MySQL/Redis 的确定性本地体验；不代表用户已亲自完成手工验收。当前工作树开发 M3.1a MCP，尚未发布，新能力不能借旧 CI 背书。先交付本地功能版，依次 M3、必要 M4、未完 P2；完整架构目标不取消，M1 未冻结不再阻挡 M3。实际证据只看 [PROGRESS](../PROGRESS.md) 顶部及末节。
+
+## 正在开发的 MCP 如何验证
+
+本小节仅描述当前候选，不是已发布能力承诺。`pnpm test:mcp` 用真实本地 MCP HTTP 服务及确定性 FakeVendor 验证工具发现、强制审批、持久结果和 SSE；不读 `.env`、不调用付费模型。`pnpm test:mcp-mysql` 还需要仅指向 loopback 测试环境的 `MYSQL_TEST_URL`，自行创建新随机库，停服、冷连接核验后清理，不操作 URL 原库。
+
+实际配置按 [MCP 设计](../design/06-mcp.md) 与 `.env.example`：operator 固定匿名 HTTPS endpoint、精确 tenant/user ACL，agent 的 `mcpServers` 只引用 server id。默认关闭，完整 fleet 排空升级并保持配置一致后才能启用；不存在注册 API、OAuth 或任意 URL/header/command 输入。所有 MCP 工具即使自称只读或 agent 使用 `approvalPolicy=never`，仍须审批。
+
+体验时检查 `toolCall.kind=mcp`、审批资源与持久 `toolResult`，结果提交后才进入下一模型步骤；本服务 SSE seq/after 回放不是上游 MCP session。`acceptForSession` 授权在远端派发前持久化暂停，仅成功结果提交后恢复；结果不明或失败必须重新确认，不能无声重试有副作用工具。当前尚不提供远端 progress、2025 兼容、动态注册/OAuth、共享池与 skills/hooks，不能称完整 M3。
+
 > 本 worktree 是0058与0059的本地整合候选（2026-10-16），当前为干净提交`c12cb43ae02b9252891a41c429c40bb7293bef8a`，未合main/push，不用于普通启动或部署；main仍为`3414b43`。0059已整合0058前置并真实校准三表/八guard/八非零根及743-trigger，不再是零根草稿。`354b`源码完整verify `92378`退出1：主4382pass/2fail/86预期profile skip；0059 SQL整8项在该轮通过，history/cluster/build/VM后置在该轮未运行。后续fresh-schema 0037正式required `69221`已1文件5pass；Memory新源码`68142`实际3文件237pass和独立`9192` checkpoint Memory 1文件46pass均零失败/跳过，不可合并成一次4文件结果。c12另有`83919`的`pnpm build:check`与`36915`无allowdirty的`pnpm check:vm-release`真实通过；VM双签名仅`ephemeral-test-only`、`productionAccepted=false`。原native定向coverage进程仍exit1；完整coverage、history、cluster、`verify-s3`及新CI待验。手动体验仍用已发布main；当前事实看[PROGRESS](../PROGRESS.md)顶部/末节，责任合同见[BYOK责任合同](../design/05-credential-responsibility.md)。本候选不新增服务/进程/JS入口/镜像。
 
 > 离线VM签名候选（2026-10-15，未发布验收）：私钥格式正则触发的secret-scanner边界误报已等价改写、未加白名单，scan696通过；其后最终相关9文件于07:28:39Z实际889 passed、零fail/skip（7个VM文件770、proof工具119），API/typecheck通过。代码提交d671632的darwin/arm64/Node24 clean双包于07:35:46.954Z实际通过，仅ephemeral-test-only签名、productionAccepted=false；最终文档提交的整树和新Linux CI仍待。required新增3文件至123、62个旧group不变，VM group现为7文件。原817 CI test失败/两个image成功；b575集中全量实际3164 passed/5 failed、后置未跑，不能称新全量或CI全绿。详细事实只看PROGRESS末节。

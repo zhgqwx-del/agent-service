@@ -40,7 +40,10 @@ export function buildSystemPrompt(agent: AgentDefinition, skills: SkillSummary[]
 /** Sorted, schema-only view of the tool set so ordering/execute functions never affect the epoch. */
 export function toolSetFingerprint(tools: RunnerTool[]): string {
   const view = [...tools]
-    .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters, kind: t.kind }))
+    .map((t) => ({
+      name: t.name, description: t.description, parameters: t.parameters, kind: t.kind,
+      ...(t.approvalScope === undefined ? {} : { approvalScope: t.approvalScope }),
+    }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return sha256(stableStringify(view));
 }

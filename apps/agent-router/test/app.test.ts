@@ -123,6 +123,7 @@ function fakeRegistry(
     owner?: string | (() => string | undefined);
     leaseOwnerPresent?: boolean | (() => boolean | undefined);
     healthy?: (url: string) => boolean;
+    mcp?: boolean;
     tombstone?: boolean;
     targetTombstone?: boolean;
     blobs?: boolean;
@@ -185,6 +186,8 @@ function fakeRegistry(
       return healthy.length ? healthy[rr++ % healthy.length]!.url : undefined;
     },
     allHealthySupportLifecycle: () => opts.tombstone ?? true,
+    allConfiguredSupportMcp: () => targets.length > 0 && (opts.mcp ?? false)
+      && list().every((target) => target.healthy),
     supportsLifecycle: () => opts.targetTombstone ?? opts.tombstone ?? true,
     allHealthySupportBlobAttachments: () => opts.blobs ?? true,
     supportsBlobAttachments: () => opts.targetBlobs ?? opts.blobs ?? true,
@@ -2484,6 +2487,7 @@ describe("operational endpoints", () => {
     const a = await upstream(() => ({ body: JSON.stringify({ protocolVersion: PROTOCOL_VERSION, service: "agent-runner", features: { streaming: true, replay: { persistedEvents: true, hotWindowMs: 1 }, approvals: true, sessionLifecycle: ["archive", "unarchive", "tombstone", "purge"], blobAttachments: true, dataErasureRequests: true, userErasureWorker: ["drain-v1"], erasureJobControl: ["quarantine-v1", "legacy-tombstone-compensation-v1"], dataGovernance: ["canonical-retention-v1", "multi-legal-hold-v1"], dataGovernanceManagement: true, purgePolicyEvaluation: ["policy-evaluator-v1"], dataPurgeExecution: false, tenantCredentialRevocation: [TENANT_CREDENTIAL_REVOCATION_STORE_V1], tenantCredentialRevocationWorker: true, tenantCredentialLifecycle: [TENANT_CREDENTIAL_LIFECYCLE_VERSIONED_TARGET_LEDGER_V1], tenantCredentialLifecycleTrackingActive: true, tenantCredentialTargetExecution: [TENANT_CREDENTIAL_TARGET_EXECUTION_EXTERNAL_V1], tenantCredentialTargetExecutionWorker: true, tenantPurgeExecution: [TENANT_PURGE_EXECUTION_LOCAL_ACK_V1, TENANT_PURGE_EXECUTION_LOCAL_DB_CONTENT_DELETE_V1], tenantPurgeExecutionWorker: true, tenantDatabasePurgeWorker: true, tenantRedisPurge: [TENANT_REDIS_PURGE_SESSION_STATE_DELETE_V1], tenantRedisPurgeWorker: true, tenantRedisPurgeNamespaceSha256: "a".repeat(64), dynamicTools: true, mcp: ["streamable-http"], skills: true, sandbox: ["none"], byok: true } }) }));
     const app = createRouterApp({
       registry: fakeRegistry([a.url], {
+        mcp: true,
         blobs: true,
         worker: true,
         purgePolicyEvaluation: true,

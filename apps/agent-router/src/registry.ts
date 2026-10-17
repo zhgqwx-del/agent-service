@@ -298,6 +298,13 @@ export class RunnerRegistry {
     return healthy.length > 0 && healthy.every((target) => target.capabilities?.features.sessionLifecycle.includes(feature));
   }
 
+  /** This slice is offline-cutover only; never advertise a randomly selected runner's MCP alone. */
+  allConfiguredSupportMcp(): boolean {
+    const configured = this.list();
+    return configured.length > 0 && configured.every((target) => target.healthy
+      && target.capabilities?.features.mcp.includes("streamable-http"));
+  }
+
   /** Revalidate the concrete destination immediately before a capability-gated write is sent. */
   supportsLifecycle(url: string, feature: Capabilities["features"]["sessionLifecycle"][number]): boolean {
     const target = this.targets.get(url.replace(/\/+$/, ""));

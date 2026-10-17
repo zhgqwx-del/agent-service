@@ -921,7 +921,7 @@ export type components = {
                 readonly maxToolCalls?: number;
                 readonly maxWallClockMs?: number;
             };
-            /** @description Persisted extension ids; inactive while capabilities.mcp is empty. */
+            /** @description Operator-configured MCP server ids; checked for the actual session owner. */
             readonly mcpServers: readonly string[];
             readonly metadata: {
                 readonly [key: string]: unknown;
@@ -964,7 +964,7 @@ export type components = {
                 readonly maxWallClockMs?: number;
             };
             /**
-             * @description Reserved for M3. The current service requires this array to be empty.
+             * @description Requires configured MCP support. Only exact operator-authorized mounts are executable; no registration or credentials are accepted here.
              * @default []
              */
             readonly mcpServers?: readonly string[];
@@ -1009,7 +1009,7 @@ export type components = {
                     readonly maxToolCalls?: number;
                     readonly maxWallClockMs?: number;
                 };
-                /** @description Persisted extension ids; inactive while capabilities.mcp is empty. */
+                /** @description Operator-configured MCP server ids; checked for the actual session owner. */
                 readonly mcpServers: readonly string[];
                 readonly metadata: {
                     readonly [key: string]: unknown;

@@ -3,7 +3,7 @@ import type { AssistantMessage, ImageContent, Message, Model, TextContent, ToolC
 import { createModels, type Models } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import type { ToolContentPart, Usage } from "@agent-service/protocol";
-import type { RunnerTool } from "../tools/types.js";
+import type { RunnerTool, ToolResult } from "../tools/types.js";
 import type { AgentEngine, AssistantStepResult, EngineInputPart, EngineRun, EngineSink, EngineTurnParams, ResolvedModel, Summariser, TranscriptMessage } from "./types.js";
 
 export interface PiProviderStepFailure {
@@ -39,6 +39,9 @@ export class PiEngine implements AgentEngine {
     const provider = params.model.provider;
     let step = 0;
     let currentAssistant: AssistantStepResult | undefined;
+    // Pi represents tool failures as thrown Errors and otherwise loses structured details. Keep
+    // only this turn's actual MCP failure so outcome-unknown survives into the durable result.
+    const mcpFailures = new Map<string, ToolResult>();
     const originalProviderFailures = new WeakMap<object, Readonly<PiProviderStepFailure>>();
     let lastProviderFailure: Readonly<PiProviderStepFailure> | undefined;
     let lastProviderFailureMessage: AssistantStepResult | undefined;
@@ -52,7 +55,7 @@ export class PiEngine implements AgentEngine {
       initialState: {
         systemPrompt: params.systemPrompt,
         model,
-        tools: params.tools.map((t) => toAgentTool(t, params.toolContext)),
+        tools: params.tools.map((t) => toAgentTool(t, params.toolContext, (id, result) => mcpFailures.set(id, result))),
         messages: params.history.map(toPiMessage),
         thinkingLevel: params.model.reasoning && params.model.reasoning !== "off" ? params.model.reasoning : "off",
       },
@@ -94,12 +97,14 @@ export class PiEngine implements AgentEngine {
         return { block: true, reason: decision.reason, terminate: decision.interrupt === true };
       },
       afterToolCall: async ({ toolCall, result, isError }) => {
+        const mcpFailure = mcpFailures.get(toolCall.id);
+        mcpFailures.delete(toolCall.id);
         const canonical = await sink.afterToolCall({
           toolCallId: toolCall.id,
           name: toolCall.name,
-          content: toProtocolContent(result.content ?? []),
-          isError,
-          details: result.details,
+          content: mcpFailure?.content ?? toProtocolContent(result.content ?? []),
+          isError: mcpFailure ? true : isError,
+          details: mcpFailure?.details ?? result.details,
         });
         finalizedThroughSink.add(toolCall.id);
         return {
@@ -233,7 +238,7 @@ export class PiSummariser implements Summariser {
 
 // ---------- conversions ----------
 
-function toAgentTool(tool: RunnerTool, ctx: EngineTurnParams["toolContext"]): AgentTool<any> {
+function toAgentTool(tool: RunnerTool, ctx: EngineTurnParams["toolContext"], onMcpFailure?: (id: string, result: ToolResult) => void): AgentTool<any> {
   return {
     name: tool.name,
     label: tool.name,
@@ -247,7 +252,10 @@ function toAgentTool(tool: RunnerTool, ctx: EngineTurnParams["toolContext"]): Ag
         signal: signal ?? new AbortController().signal,
         onProgress: (text) => onUpdate?.({ content: [{ type: "text", text }], details: {} }),
       });
-      if (res.isError) throw new ToolError(res.content.map((c) => (c.type === "text" ? c.text : "")).join("\n"));
+      if (res.isError) {
+        if (tool.kind === "mcp") onMcpFailure?.(toolCallId, res);
+        throw new ToolError(res.content.map((c) => (c.type === "text" ? c.text : "")).join("\n"));
+      }
       return { content: toPiContent(res.content), details: (res.details ?? {}) as any };
     },
   };

@@ -1,5 +1,7 @@
 # agent-router / agent-runner 架构方案（v0.1，2026-09-22）
 
+> 当前状态（2026-10-16，优先于下方历史候选说明）：main `6fdb63c` 的最终五项 CI 全绿，已完成隔离本地 router/runner/MySQL/Redis 确定性体验。当前工作树进入 M3.1a MCP 候选，尚未发布或完成新 CI；范围与未完清单见 [MCP 设计](06-mcp.md)，实际验证只看 [PROGRESS](../PROGRESS.md) 顶部及末节。M1 未冻结不再阻挡 M3，按用户确认顺序推进 M3、必要 M4、剩余 P2。对外 API 仍由 router 暴露，runtime/MCP 执行在 runner；常驻服务及镜像仍各两个。
+
 > 当前恢复边界（2026-10-15T22:37Z）：0055～0057单次恢复已随main3414发布且对应CI五绿。0058候选的真实SQL/历史/单跳证据保留；有界trigger batch后原180秒完整双跳首次通过，含新Pi、finalcold与cleanup，178638.82ms，仅约1.36秒余量。该单次定向不证明稳定提速、完整锁行为或整包验收；完整verify/verify-s3/新CI仍待，候选未合入。0054原primary-only、0037、外部删除/自动off、completion=false及M1未冻结/M2冻结/M3未开始不变；精确证据及旧失败见[PROGRESS](../PROGRESS.md)与[数据生命周期§14～16](04-data-lifecycle.md)。
 
 > M4本地测量增量（2026-10-15，历史候选检查点）：已有一个实际runner dist在真实MySQL/独立Redis/FakeVendor下完成1000并发基线，SSE与已提交inProgress峰值均1000，全部正常turn、usage/billing/item/event与seq对账及清理通过。它只补本地可复现实测，不证明真实模型SLO、持续压力、云容量或M4整体完成；方法见[基线文档](../operations/runner-load-benchmark.md)，源身份/失败与结果见PROGRESS。

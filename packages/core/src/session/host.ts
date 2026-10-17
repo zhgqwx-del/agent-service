@@ -61,6 +61,7 @@ import { projectItems, projectItemsForPlanning, pruneToolResults } from "../cont
 import { COMPACTION_SYSTEM_PROMPT, planCompaction, renderForSummary, transcriptTokens } from "../context/compact.js";
 import { newId } from "../ids.js";
 import type { RunnerTool, ToolRegistry } from "../tools/types.js";
+import type { McpToolSource } from "../mcp/service.js";
 import { DynamicToolBridge } from "../tools/dynamic.js";
 import type { TenantRuntimeCoordinator, TenantRuntimeLease } from "../lifecycle/tenant-runtime-coordinator.js";
 import {
@@ -139,6 +140,8 @@ export interface SessionHostDeps {
   bus: EventBus;
   engine: AgentEngine;
   tools: ToolRegistry;
+  /** Principal-scoped, bounded remote discovery; never part of the global builtin registry. */
+  mcp?: McpToolSource;
   providers: ProviderResolver;
   skills?: SkillSource;
   /** Shared runner-local T3b fence. Omitted while the T3b worker is disabled. */
@@ -205,6 +208,8 @@ interface ActiveTurn {
   toolCallItems: Map<string, ItemOf<"toolCall">>;
   pendingApprovals: Map<string, { resolve: (d: ApprovalDecision) => void; timer: NodeJS.Timeout }>;
   autoApproved: Set<string>;
+  /** In-memory resumption only; a crash must leave the durable MCP grant suspended. */
+  mcpGrantResumptions: Map<string, string>;
   leaseGuard: LeaseGuard;
   wallClockTimer?: NodeJS.Timeout;
   startedAt: number;
@@ -371,8 +376,11 @@ export class SessionHost {
       // indistinguishable to avoid turning this relationship check into an existence oracle.
       if (!parent || parent.userId !== targetUserId) throw new ApiError("not_found", "parent session not found");
     }
-    const tools = this.deps.tools.resolve(agent.tools);
-    const skills = this.deps.skills ? await this.deps.skills.list(principal, agent.skills) : [];
+    // Delegated creation must resolve extensions as the actual session owner, not the trusted
+    // caller. Otherwise a caller's catalog could be pinned into another user's session.
+    const owner = { tenantId: principal.tenantId, userId: targetUserId };
+    const tools = await this.resolveTools(owner, agent, AbortSignal.timeout(30_000));
+    const skills = this.deps.skills ? await this.deps.skills.list(owner, agent.skills) : [];
     const systemPrompt = buildSystemPrompt(agent, skills);
     const now = Date.now();
     const session: Session = {
@@ -411,6 +419,19 @@ export class SessionHost {
     }
     await this.publishAll(session.id, r.events);
     return { ...session, lastSeq: r.lastSeq };
+  }
+
+  private async resolveTools(principal: Principal, agent: AgentDefinition, signal: AbortSignal): Promise<RunnerTool[]> {
+    const builtin = this.deps.tools.resolve(agent.tools);
+    if (!agent.mcpServers.length) return builtin;
+    if (!this.deps.mcp?.enabled) throw new ApiError("invalid_request", "MCP is not configured");
+    this.deps.mcp.validateMounts(principal, agent.mcpServers);
+    const remote = await this.deps.mcp.resolve(principal, agent.mcpServers, signal);
+    const tools = [...builtin, ...remote];
+    if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
+      throw new ApiError("invalid_request", "tool names collide");
+    }
+    return tools;
   }
 
   /**
@@ -1551,13 +1572,27 @@ export class SessionHost {
       throw new ApiError("invalid_request", `model ${model.model} does not support image input`);
     }
     const tools: RunnerTool[] = [
-      ...this.deps.tools.resolve(agent.tools),
+      ...await leaseGuard.wait(this.resolveTools(principal, agent, AbortSignal.any([
+        leaseGuard.abort.signal,
+        ...(runtimeLease ? [runtimeLease.signal] : []),
+      ]))),
       ...(req.dynamicTools ?? []).map((d) => this.dynamicTools.asTool(d, this.cfg.dynamicToolTimeoutMs)),
     ];
+    if (new Set(tools.map((tool) => tool.name)).size !== tools.length) {
+      throw new ApiError("invalid_request", "tool names collide");
+    }
     const skills = this.deps.skills ? await leaseGuard.wait(this.deps.skills.list(principal, agent.skills)) : [];
     runtimeLease?.assertOpen();
     const systemPrompt = buildSystemPrompt(agent, skills);
     const limits = mergeLimits(agent.limits, req.limits);
+    const contextEpoch = agent.mcpServers.length
+      ? computeContextEpoch({ agentId: agent.id, agentVersion: agent.version, systemPrompt, tools, skills })
+      : session.contextEpoch;
+    const catalogChanged = contextEpoch !== session.contextEpoch;
+    const currentGrantScopes = new Set(tools.map((tool) => tool.approvalScope ?? tool.name));
+    const autoApprovedTools = agent.mcpServers.length
+      ? session.autoApprovedTools.filter((scope) => currentGrantScopes.has(scope))
+      : session.autoApprovedTools;
     let repairWarning: { code: string; message: string } | undefined;
 
     // One request-local byte budget covers everything sent to the main model. Materialize the
@@ -1617,11 +1652,18 @@ export class SessionHost {
       metadata: req.metadata,
     };
     const userItem: Item = { id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed", createdAtMs: now, completedAtMs: now, type: "userMessage", content: req.input };
+    const catalogMessage = "Remote tool catalog changed; previous approvals do not apply to changed tools.";
+    const catalogNotice: ItemOf<"systemNotice"> | undefined = catalogChanged ? {
+      id: newId("item"), sessionId, turnId: turn.id, seq: 0, status: "completed",
+      createdAtMs: now, completedAtMs: now, type: "systemNotice", kind: "toolsChanged", text: catalogMessage,
+    } : undefined;
+    if (catalogNotice) history.push({ role: "user", content: [{ type: "text", text: `[system notice: toolsChanged] ${catalogMessage}` }] });
     const state: ActiveTurn = {
       turn, session, agent, modelInput: model.input, hydrationBudget, fence, abort: leaseGuard.abort, leaseGuard, limits,
       stepUsage: emptyUsage(), step: 0, toolCalls: 0, agentText: "", reasoningText: "", lastText: "",
       toolCallItems: new Map(), pendingApprovals: new Map(),
-      autoApproved: new Set(session.autoApprovedTools),
+      autoApproved: new Set(autoApprovedTools),
+      mcpGrantResumptions: new Map(),
       startedAt: now, done: Promise.resolve(), resolveDone: () => {}, chain: Promise.resolve(),
       agentItem: undefined, agentItemStarted: undefined, deltaChain: undefined,
       phase: "reserved", closingRequested: false, steerChain: Promise.resolve(), pendingSteers: [],
@@ -1666,7 +1708,7 @@ export class SessionHost {
       leaseGuard.assertOwned();
       await this.commit(state, {
         turn,
-        items: [userItem],
+        items: [...(catalogNotice ? [catalogNotice] : []), userItem],
         blobBindings: this.inputBlobBindings(req.input, userItem.id),
         idempotency: opts.idempotencyKey ? {
           scope: { tenantId: session.tenantId, userId: session.userId, sessionId },
@@ -1677,11 +1719,18 @@ export class SessionHost {
         } : undefined,
         events: [
           { type: "turn/started", sessionId, emittedAtMs: now, turn },
+          ...(catalogNotice ? [
+            { type: "item/completed" as const, sessionId, emittedAtMs: now, item: catalogNotice },
+            { type: "warning" as const, sessionId, emittedAtMs: now, code: "mcp_catalog_changed", message: catalogMessage },
+          ] : []),
           ...(repairWarning ? [{ type: "warning" as const, sessionId, emittedAtMs: now, ...repairWarning }] : []),
           { type: "item/completed", sessionId, emittedAtMs: now, item: userItem },
           { type: "session/status/changed", sessionId, emittedAtMs: now, status: { type: "active", turnId: turn.id, activeFlags: [] } },
         ],
-        sessionPatch: { status: { type: "active", turnId: turn.id, activeFlags: [] } },
+        sessionPatch: {
+          status: { type: "active", turnId: turn.id, activeFlags: [] },
+          ...(agent.mcpServers.length ? { contextEpoch, autoApprovedTools } : {}),
+        },
       });
       runtimeLease?.assertOpen();
       leaseGuard.assertOwned();
@@ -1921,7 +1970,20 @@ export class SessionHost {
       }
       items.push(durable.item);
       events.push({ type: "item/completed", sessionId, emittedAtMs: now, item: durable.item });
-      await this.commit(state, { items, events, blobBindings: durable.blobBindings });
+      const tool = toolByName.get(r.name);
+      // Unknown remote outcomes (and all other failed MCP executions) invalidate reusable grants.
+      // A model's next attempt must obtain new explicit consent, never silently replay a side effect.
+      const revoke = durable.canonical.isError && tool?.kind === "mcp" && !!call?.startedAtMs;
+      if (revoke) state.autoApproved.delete(tool.approvalScope ?? tool.name);
+      const resume = !durable.canonical.isError ? state.mcpGrantResumptions.get(r.toolCallId) : undefined;
+      const nextGrants = new Set(state.autoApproved);
+      if (resume) nextGrants.add(resume);
+      await this.commit(state, {
+        items, events, blobBindings: durable.blobBindings,
+        ...(revoke || resume ? { sessionPatch: { autoApprovedTools: [...nextGrants] } } : {}),
+      });
+      if (resume) state.autoApproved.add(resume);
+      state.mcpGrantResumptions.delete(r.toolCallId);
       return durable.canonical;
     };
 
@@ -2136,13 +2198,28 @@ export class SessionHost {
       return { allow: false, reason: "tool call limit reached", interrupt: true };
     }
     const markStarted = async () => {
-      if (!item) return;
+      if (!item) {
+        if (tool.kind === "mcp") throw new ApiError("internal_error", "remote tool write-ahead is missing");
+        return;
+      }
       item.startedAtMs = Date.now();
-      await this.commit(state, { items: [item] });
+      const scope = tool.approvalScope ?? tool.name;
+      const suspend = tool.kind === "mcp" && state.autoApproved.has(scope);
+      if (suspend) state.autoApproved.delete(scope);
+      // The grant is consumed in the SAME write-ahead commit, before any remote side effect. Only
+      // a successful durable result below may restore it; process loss cannot retain permission to
+      // silently retry an unknown outcome on a different Host.
+      await this.commit(state, {
+        items: [item],
+        ...(suspend ? { sessionPatch: { autoApprovedTools: [...state.autoApproved] } } : {}),
+      });
+      if (suspend) state.mcpGrantResumptions.set(call.id, scope);
     };
     const policy = state.agent.approvalPolicy;
-    const needs = policy === "never" ? false : policy === "untrusted" ? !tool.readOnly : !!tool.needsApproval;
-    if (!needs || state.autoApproved.has(tool.name)) {
+    const needs = tool.mandatoryApproval === true
+      || (policy === "never" ? false : policy === "untrusted" ? !tool.readOnly : !!tool.needsApproval);
+    const approvalScope = tool.approvalScope ?? tool.name;
+    if (!needs || state.autoApproved.has(approvalScope)) {
       await markStarted();
       return { allow: true };
     }
@@ -2200,7 +2277,7 @@ export class SessionHost {
     const finalApproval: Approval = { ...approval, status: expired ? "expired" : "resolved", decision, resolvedAtMs: resolvedAt, decidedBy: expired ? "system:timeout" : principal.userId };
     const doneItem: Item = { ...reqItem, status: decision === "accept" || decision === "acceptForSession" ? "completed" : "declined", completedAtMs: resolvedAt };
     const back = { type: "active" as const, turnId: state.turn.id, activeFlags: [] as ("waitingOnApproval" | "waitingOnUserInput")[] };
-    if (decision === "acceptForSession") state.autoApproved.add(tool.name);
+    if (decision === "acceptForSession") state.autoApproved.add(approvalScope);
     await this.commit(state, {
       approvals: [finalApproval], items: [doneItem],
       events: [

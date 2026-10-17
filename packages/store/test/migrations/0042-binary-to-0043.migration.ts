@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { installFrozenDependencies } from "./fixtures/frozen-dependencies.js";
 
 const exec = promisify(execFile);
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -62,36 +63,7 @@ function processEnv(temp: string, extra: Record<string, string> = {}): NodeJS.Pr
 }
 
 async function copyInstalledDependencies(checkout: string, version: "0042" | "0043"): Promise<void> {
-  const exactManifests = [
-    "pnpm-lock.yaml", "pnpm-workspace.yaml",
-    "packages/core/package.json", "packages/protocol/package.json",
-    "packages/providers/package.json", "packages/sdk/package.json",
-    "packages/store/package.json", "packages/testkit/package.json",
-    "apps/agent-router/package.json", "apps/agent-runner/package.json",
-  ];
-  for (const manifest of exactManifests) {
-    const oldBytes = await readFile(join(checkout, manifest));
-    const currentBytes = await readFile(join(ROOT, manifest));
-    if (!oldBytes.equals(currentBytes)) {
-      throw new Error(`published ${version} dependency manifest changed: ${manifest}`);
-    }
-  }
-  // A later named test script may change, but dependency/configuration fields may not.
-  const oldRoot = JSON.parse(await readFile(join(checkout, "package.json"), "utf8")) as Record<string, unknown>;
-  const currentRoot = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as Record<string, unknown>;
-  delete oldRoot.scripts;
-  delete currentRoot.scripts;
-  if (JSON.stringify(oldRoot) !== JSON.stringify(currentRoot)) {
-    throw new Error(`published ${version} root dependency manifest changed`);
-  }
-  const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
-  await cp(join(ROOT, "node_modules"), join(checkout, "node_modules"), options);
-  for (const project of [
-    "packages/core", "packages/providers", "packages/protocol", "packages/sdk",
-    "packages/store", "apps/agent-router", "apps/agent-runner",
-  ]) {
-    await cp(join(ROOT, project, "node_modules"), join(checkout, project, "node_modules"), options);
-  }
+  await installFrozenDependencies(ROOT, checkout);
   const virtualStore = await lstat(join(checkout, "node_modules/.pnpm"));
   if (!virtualStore.isDirectory() || virtualStore.isSymbolicLink()) {
     throw new Error(`published ${version} dependency store is not self-contained`);

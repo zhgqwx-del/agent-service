@@ -172,6 +172,8 @@ export interface AppDeps {
   host: SessionHost;
   providers: ProviderService;
   tools: ToolRegistry;
+  /** Operator-configured anonymous MCP subset, not registration/OAuth support. */
+  mcpEnabled?: boolean;
   runnerId: string;
   internalRouterToken: string;
   heartbeatMs: number;
@@ -533,7 +535,7 @@ export function createApp(deps: AppDeps) {
         tenantRuntimeDrainEndpoint: deps.tenantRuntimeDrain !== undefined
           && deps.tenantRuntimeDrainEnabled === true,
         dynamicTools: true,
-        mcp: [],
+        mcp: deps.mcpEnabled === true ? ["streamable-http"] : [],
         skills: false,
         sandbox: ["none"],
         byok: true,
@@ -962,6 +964,7 @@ export function createApp(deps: AppDeps) {
   v1.post("/agents", async (c) => {
     requireAdmin(c);
     const input = await parse(AgentDefinitionRequest, await json(c));
+    if (input.mcpServers.length && deps.mcpEnabled !== true) throw new ApiError("invalid_request", "MCP is not configured");
     const def = AgentDefinition.parse({ ...input, id: newId("agt"), tenantId: c.get("tenantId"), version: 1, createdAtMs: Date.now() });
     await deps.store.createAgent(def);
     return c.json(def, 201);
@@ -984,6 +987,7 @@ export function createApp(deps: AppDeps) {
     const prev = await deps.store.getAgent(c.get("tenantId"), c.req.param("id"));
     if (!prev) throw new ApiError("not_found", "agent not found");
     const input = await parse(AgentDefinitionRequest, await json(c));
+    if (input.mcpServers.length && deps.mcpEnabled !== true) throw new ApiError("invalid_request", "MCP is not configured");
     const def = AgentDefinition.parse({ ...input, id: prev.id, tenantId: prev.tenantId, version: prev.version + 1, createdAtMs: Date.now() });
     await deps.store.createAgent(def);
     return c.json(def);

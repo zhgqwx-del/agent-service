@@ -370,7 +370,7 @@ export const OPENAPI_DOCUMENT = {
             "type": "object"
           },
           "mcpServers": {
-            "description": "Persisted extension ids; inactive while capabilities.mcp is empty.",
+            "description": "Operator-configured MCP server ids; checked for the actual session owner.",
             "items": {
               "maxLength": 128,
               "minLength": 1,
@@ -523,13 +523,12 @@ export const OPENAPI_DOCUMENT = {
           },
           "mcpServers": {
             "default": [],
-            "description": "Reserved for M3. The current service requires this array to be empty.",
+            "description": "Requires configured MCP support. Only exact operator-authorized mounts are executable; no registration or credentials are accepted here.",
             "items": {
-              "maxLength": 128,
-              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_-]{1,64}$",
               "type": "string"
             },
-            "maxItems": 0,
+            "maxItems": 8,
             "type": "array"
           },
           "metadata": {
@@ -665,7 +664,7 @@ export const OPENAPI_DOCUMENT = {
                   "type": "object"
                 },
                 "mcpServers": {
-                  "description": "Persisted extension ids; inactive while capabilities.mcp is empty.",
+                  "description": "Operator-configured MCP server ids; checked for the actual session owner.",
                   "items": {
                     "maxLength": 128,
                     "minLength": 1,

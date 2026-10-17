@@ -7,6 +7,7 @@ import {
   type BlobStorageCapability,
 } from "@agent-service/protocol";
 import { z } from "zod";
+import { loadMcpConfig } from "./mcp-config.js";
 import {
   loadTenantRestoreJournalConfig,
   type TenantRestoreJournalRuntimeConfig,
@@ -356,6 +357,7 @@ const Env = z.object({
 });
 type ParsedConfig = z.infer<typeof Env>;
 export type RunnerConfig = Omit<ParsedConfig, "RUNNER_ID" | "INTERNAL_ROUTER_TOKEN"> & {
+  mcp: ReturnType<typeof loadMcpConfig>;
   RUNNER_ID: string;
   INTERNAL_ROUTER_TOKEN: string;
   runnerAddr: string;
@@ -1057,6 +1059,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RunnerConfig {
   const runnerId = c.RUNNER_ID ?? (production ? `runner-${randomUUID()}` : `runner-${process.pid}`);
   return {
     ...c,
+    mcp: loadMcpConfig(env),
     BLOB_S3_ENDPOINT: s3Endpoint,
     TENANT_TELEMETRY_S3_ENDPOINT: tenantTelemetryS3Endpoint,
     TENANT_TELEMETRY_S3_BUCKET: tenantTelemetryS3Bucket,

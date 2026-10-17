@@ -650,6 +650,7 @@ export function createRouterApp(deps: RouterAppDeps) {
               features: {
                 ...parsed.data.features,
                 sessionLifecycle: lifecycle,
+                mcp: deps.registry.allConfiguredSupportMcp() ? ["streamable-http"] : [],
                 blobAttachments: parsed.data.features.blobAttachments && blobAttachmentsAvailable(),
                 dataErasureRequests: parsed.data.features.dataErasureRequests && erasureRequestsAvailable(),
                 userErasureWorker: deps.internalRunnerToken

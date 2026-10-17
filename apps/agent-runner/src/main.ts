@@ -4,6 +4,7 @@ import { open } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
   BlobCleanupWorker,
+  ConfiguredMcpToolSource,
   createTenantTelemetryApplicationDualWrite,
   createPersistedProviderFailureCapture,
   TENANT_TELEMETRY_PROVIDER_LOG_PRODUCER_CONTRACT_SHA256,
@@ -762,8 +763,21 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
       : {}),
   });
   const tools = new StaticToolRegistry(builtinTools);
+  const mcp = cfg.mcp.enabled ? new ConfiguredMcpToolSource({
+    servers: cfg.mcp.servers, timeoutMs: cfg.mcp.timeoutMs,
+    maxConcurrentPerUser: cfg.mcp.maxConcurrentPerUser,
+    allowLoopbackForTests: cfg.mcp.allowLoopbackForTests,
+    tenantRuntime,
+    authorizeSubject: async (principal) => {
+      const tenant = await store.getTenantRuntimeState(principal.tenantId);
+      const user = await store.getSubjectLifecycle(principal.tenantId, "user", principal.userId);
+      if (tenant.state !== "active" || (user && user.state !== "active")) {
+        throw new SubjectDeletingError(principal.tenantId, principal.userId);
+      }
+    },
+  }) : undefined;
   const host = new SessionHost({
-    store, erasureStore: store, lease, bus, providers, tools, blobs, tenantRuntime,
+    store, erasureStore: store, lease, bus, providers, tools, mcp, blobs, tenantRuntime,
     logger: runnerRuntimeLogger,
     onOwnershipLost: () => emitRunnerTelemetryEvent("runner.runtime.ownership_lost"),
     ...(tenantTelemetryWriterRuntime.persistedCaptureActive === true && persistedProviderCaptureGate && tenantTelemetryRefKey ? {
@@ -1070,7 +1084,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
 
   let ready = true;
   const app = createApp({
-    store, host, providers, tools,
+    store, host, providers, tools, mcpEnabled: mcp?.enabled === true,
     telemetry: runnerProcessTelemetry,
     ...(cfg.METRICS_BEARER_TOKEN === undefined ? {} : {
       metrics: { bearerToken: cfg.METRICS_BEARER_TOKEN,
@@ -1194,7 +1208,7 @@ export async function startRunner(env: NodeJS.ProcessEnv = process.env) {
         ordinarySessionUsageRetentionWorker?.stop(),
         tenantRedisPurgeWorker?.stop(),
       ]);
-      await host.drain(30_000);
+      await Promise.all([host.drain(30_000), mcp?.close()]);
       if (tenantTelemetryRetryTimer !== undefined) {
         clearInterval(tenantTelemetryRetryTimer);
         tenantTelemetryRetryTimer = undefined;

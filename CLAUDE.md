@@ -1,5 +1,7 @@
 # agent-service 项目记忆
 
+> 当前阶段（2026-10-16）：main6fdb63c收口包与最终CI38929175733五项已全过，发布版无付费模型的双服务隔离体验11.424秒通过并清理自有资源。primary `codex/m3-mcp`现开始M3.1a operator-only/no-auth/modern HTTP MCP候选，未提交/推送，旧CI不背书新源码；不等于完整MCP或M3。按用户顺序继续M3→必要M4→未完成P2，M1未冻结/M2冻结。旧“本包待CI/尚不能M3”是历史；看PROGRESS顶部与末节。root唯一运行测试/DB/build/Git，原删除/恢复门禁不变。
+
 > 权威顺序更新（用户确认，2026-10-16）：长期全架构Goal不缩减；先完成当前功能包发布阻断/剩余门禁/最终SHA CI，再尽早本地手动体验，推进M3 MCP/skills/hooks纵向（安全随功能），之后必要M4本地可验发布/迁移/运行、基础quota/观测，完整生命周期/灾备后置P2，云验收待资源。M1未闭环/未冻结、M2冻结、M3当前未开始，但不再以M1全部闭环阻止M3。旧文中的先后顺序据此覆盖，旧事实/代码/native WIP不删；本地功能版不是全架构/生产完成。P0和普通路径/启动/迁移正确性不因default-off豁免，0037/0054/旧receipt/unknown/production拒绝/外删自动off/completion=false等边界不变，详见[PROGRESS](docs/PROGRESS.md)。
 
 ## 当前本地整合候选（2026-10-16，失败范围已分段复验）

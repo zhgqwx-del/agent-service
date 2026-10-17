@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-  copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, writeFile,
+  copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { describe, expect, it } from "vitest";
 import { MysqlSessionStore } from "../../src/index.js";
+import { installFrozenDependencies } from "./fixtures/frozen-dependencies.js";
 
 // A published pre-0039 revision, not a copy of the current implementation. CI checkout must
 // retain history so git archive can obtain exactly these old source bytes without network access.
@@ -122,29 +123,6 @@ async function frozenWorkspace(directory: string, temp: string): Promise<void> {
     ROOT, env, 30_000);
   await rm(archive);
 
-  const frozenManifests = [
-    "pnpm-lock.yaml", "pnpm-workspace.yaml",
-    "packages/core/package.json", "packages/protocol/package.json",
-    "packages/providers/package.json", "packages/sdk/package.json",
-    "packages/store/package.json", "packages/testkit/package.json",
-    "apps/agent-router/package.json", "apps/agent-runner/package.json",
-  ];
-  for (const manifest of frozenManifests) {
-    const oldBytes = await readFile(join(directory, manifest));
-    const currentBytes = await readFile(join(ROOT, manifest));
-    if (!oldBytes.equals(currentBytes)) {
-      throw new Error(`frozen 0038 dependency manifest ${manifest} has changed`);
-    }
-  }
-  // Later milestones may register new test scripts in the root manifest without
-  // changing the frozen dependency graph. Compare every other root field exactly.
-  const oldRootPackage = JSON.parse(await readFile(join(directory, "package.json"), "utf8")) as Record<string, unknown>;
-  const currentRootPackage = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as Record<string, unknown>;
-  delete oldRootPackage.scripts;
-  delete currentRootPackage.scripts;
-  if (JSON.stringify(oldRootPackage) !== JSON.stringify(currentRootPackage)) {
-    throw new Error("frozen 0038 root dependency manifest has changed");
-  }
   const oldPackage = JSON.parse(await readFile(join(directory, "package.json"), "utf8")) as {
     packageManager?: string;
   };
@@ -212,19 +190,7 @@ if (rejected !== expectedRejection) {
 }
 
 async function copyInstalledDependencies(directory: string): Promise<void> {
-  // CI installs the current lockfile normally. Both lockfile bytes and packageManager are checked
-  // above, so copy only installed dependencies into the archived tree without network or install
-  // scripts. Preserve relative workspace symlinks: frozen source imports must resolve within that
-  // archived tree, never through current source packages.
-  const options = { recursive: true, verbatimSymlinks: true, force: false, errorOnExist: true };
-  await cp(join(ROOT, "node_modules"), join(directory, "node_modules"), options);
-  for (const project of [
-    "packages/core", "packages/providers", "packages/protocol", "packages/sdk",
-    "packages/store", "apps/agent-router", "apps/agent-runner",
-  ]) {
-    await cp(join(ROOT, project, "node_modules"), join(directory, project, "node_modules"),
-      options);
-  }
+  await installFrozenDependencies(ROOT, directory);
   const virtualStore = await lstat(join(directory, "node_modules/.pnpm"));
   if (!virtualStore.isDirectory() || virtualStore.isSymbolicLink()) {
     throw new Error("frozen 0038 dependency store is not self-contained");

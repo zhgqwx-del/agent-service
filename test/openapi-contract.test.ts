@@ -177,7 +177,7 @@ describe("committed OpenAPI contract", () => {
       },
     });
     expect(document.components?.schemas?.AgentDefinitionRequest).toMatchObject({
-      properties: { mcpServers: { maxItems: 0 }, skills: { maxItems: 0 } },
+      properties: { mcpServers: { maxItems: 8 }, skills: { maxItems: 0 } },
     });
     expect(document.paths["/v1/retention-policies/{policyVersion}"]?.put?.parameters).toEqual(
       expect.arrayContaining([

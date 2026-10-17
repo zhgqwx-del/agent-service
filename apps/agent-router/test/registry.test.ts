@@ -40,6 +40,72 @@ const DATA_GOVERNANCE_V1 = [
 ] as const;
 
 describe("RunnerRegistry owner address mapping", () => {
+  it("intersects MCP across every configured runner instead of only the healthy subset", async () => {
+    let secondState: "active" | "missing" | "stale" | "unhealthy" | "empty" = "active";
+    const capabilities = (mcp: string[], protocolVersion: string = PROTOCOL_VERSION) => ({
+      protocolVersion,
+      service: "agent-runner",
+      features: {
+        streaming: true,
+        replay: { persistedEvents: true, hotWindowMs: 1 },
+        approvals: true,
+        sessionLifecycle: ["archive", "unarchive", "tombstone"],
+        dynamicTools: true,
+        mcp,
+        skills: false,
+        sandbox: ["none"],
+        byok: true,
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === "http://current/readyz") return new Response("ready");
+      if (url === "http://current/v1/capabilities") return Response.json(capabilities(["streamable-http"]));
+      if (url === "http://second/readyz") {
+        return new Response(secondState === "unhealthy" ? "down" : "ready", {
+          status: secondState === "unhealthy" ? 503 : 200,
+        });
+      }
+      if (url === "http://second/v1/capabilities") {
+        if (secondState === "missing") return new Response("not found", { status: 404 });
+        return Response.json(capabilities(secondState === "empty" ? [] : ["streamable-http"],
+          secondState === "stale" ? "2026-09-22" : PROTOCOL_VERSION));
+      }
+      return new Response("not found", { status: 404 });
+    }));
+    const empty = new RunnerRegistry({ runners: [] });
+    expect(empty.allConfiguredSupportMcp()).toBe(false);
+    await empty.close();
+    const registry = new RunnerRegistry({ runners: ["http://current", "http://second"], healthIntervalMs: 60_000 });
+    try {
+      // Configured but as-yet unobserved targets are not a supporting fleet.
+      expect(registry.allConfiguredSupportMcp()).toBe(false);
+      registry.start();
+      await registry.waitForFirstProbe();
+      expect(registry.allConfiguredSupportMcp()).toBe(true);
+      for (const state of ["missing", "stale", "unhealthy", "empty"] as const) {
+        secondState = "active";
+        await registry.refresh();
+        expect(registry.list().every(target => target.healthy)).toBe(true);
+        expect(registry.allConfiguredSupportMcp()).toBe(true);
+        secondState = state;
+        await registry.refresh();
+        const first = registry.list().find(target => target.url === "http://current");
+        const second = registry.list().find(target => target.url === "http://second");
+        expect(first?.healthy, state).toBe(true);
+        expect(first?.capabilities?.features.mcp, state).toEqual(["streamable-http"]);
+        expect(second?.healthy, state).toBe(state === "empty");
+        // An older successful observation must not survive a failed/missing or
+        // stale-protocol probe; an explicit [] remains healthy but unsupported.
+        expect(second?.capabilities?.features.mcp, state).toEqual(state === "empty" ? [] : undefined);
+        expect(registry.allConfiguredSupportMcp(), state).toBe(false);
+      }
+      secondState = "active";
+      await registry.refresh();
+      expect(registry.allConfiguredSupportMcp()).toBe(true);
+    } finally { await registry.close(); }
+  });
+
   it("maps an exact advertised address when runners share the same port", async () => {
     const registry = new RunnerRegistry({ runners: ["http://runner-a:8787", "http://runner-b:8787/"] });
     expect(registry.toUrl("runner-a:8787")).toBe("http://runner-a:8787");

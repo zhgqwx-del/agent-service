@@ -5,9 +5,10 @@
 // inline workspace packages, selectively bundle pure-JavaScript runtime closures, and leave the
 // remaining third-party dependencies external.
 import { build } from "esbuild";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { bundledDependencyLeaks, canonicalMetafileInputs, matchesPackageRoot } from "./lib/bundled-dependency-policy.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const app = process.argv[2];
@@ -18,11 +19,7 @@ if (!app) throw new Error("usage: node scripts/build-app.mjs <apps/dir-name>");
 // no longer resolve from the declaring workspace package's node_modules tree. Keep this list narrow:
 // server dependencies such as mysql2 and ioredis intentionally remain external and are supplied by
 // the app's production node_modules tree.
-const BUNDLED_DEPENDENCY_ROOTS = ["@aws-sdk/client-s3"];
-
-function matchesPackageRoot(specifier, root) {
-  return specifier === root || specifier.startsWith(`${root}/`);
-}
+const BUNDLED_DEPENDENCY_ROOTS = ["@aws-sdk/client-s3", "@modelcontextprotocol/client"];
 
 function packageRootForPath(path) {
   const marker = `${sep}node_modules${sep}`;
@@ -44,7 +41,11 @@ const externalizeThirdParty = {
   name: "externalize-third-party",
   setup(b) {
     const bundledPackageRoots = new Set();
-    const bundledBareSpecifiers = new Set(BUNDLED_DEPENDENCY_ROOTS);
+    const realpaths = new Map();
+    const canonical = (path) => {
+      if (!realpaths.has(path)) realpaths.set(path, realpath(path));
+      return realpaths.get(path);
+    };
 
     b.onResolve({ filter: /^[^./]|^\.\.?\//, namespace: "file" }, async (args) => {
       if (args.pluginData?.skipThirdPartyPolicy === true) return null;
@@ -54,8 +55,9 @@ const externalizeThirdParty = {
       if (args.path.startsWith("node:")) return { path: args.path, external: true };
       if (args.path.startsWith("@agent-service/")) return null; // inline ours
 
+      const importer = await canonical(args.importer);
       const importerIsBundled = [...bundledPackageRoots].some((root) => (
-        args.importer === root || args.importer.startsWith(`${root}${sep}`)
+        importer === root || importer.startsWith(`${root}${sep}`)
       ));
       const dependencyIsBundled = BUNDLED_DEPENDENCY_ROOTS.some((root) => (
         matchesPackageRoot(args.path, root)
@@ -79,9 +81,9 @@ const externalizeThirdParty = {
             warnings: resolvedDependency.warnings,
           };
         }
-        const packageRoot = packageRootForPath(resolvedDependency.path);
-        if (packageRoot) bundledPackageRoots.add(packageRoot);
-        bundledBareSpecifiers.add(args.path);
+        const packageRoot = packageRootForPath(await canonical(resolvedDependency.path));
+        if (!packageRoot) return { errors: [{ text: "bundled dependency resolved outside a package root" }] };
+        bundledPackageRoots.add(packageRoot);
         return {
           path: resolvedDependency.path,
           namespace: resolvedDependency.namespace,
@@ -93,15 +95,13 @@ const externalizeThirdParty = {
       return { path: args.path, external: true };
     });
 
-    b.onEnd((result) => {
+    b.onEnd(async (result) => {
       if (!result.metafile) return;
-      const leakedImports = Object.values(result.metafile.outputs)
-        .flatMap((output) => output.imports)
-        .filter((entry) => entry.external && [...bundledBareSpecifiers].some((specifier) => (
-          matchesPackageRoot(entry.path, specifier)
-          || matchesPackageRoot(specifier, entry.path)
-        )))
-        .map((entry) => entry.path);
+      const inputRealpaths = await canonicalMetafileInputs(result.metafile, b.initialOptions.absWorkingDir ?? process.cwd());
+      const leakedImports = bundledDependencyLeaks({
+        metafile: result.metafile, inputRealpaths, bundledPackageRoots,
+        declaredRoots: BUNDLED_DEPENDENCY_ROOTS,
+      }).map((edge) => edge.specifier);
       if (leakedImports.length > 0) {
         return {
           errors: [{
@@ -136,6 +136,7 @@ const entryPoints = {
 await rm(distDir, { recursive: true, force: true });
 await mkdir(distDir, { recursive: true });
 const result = await build({
+  absWorkingDir: ROOT,
   entryPoints,
   outdir: distDir,
   entryNames: "[name]",
